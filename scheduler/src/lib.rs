@@ -94,6 +94,8 @@ pub mod priority;
 pub mod stackful;
 pub mod steal;
 mod user_policy;
+pub mod workqueue;
+mod workqueue_tests;
 
 #[cfg(feature = "hrtick")]
 mod hrtick;
@@ -104,7 +106,10 @@ mod pmu;
 #[cfg(feature = "instruction-quantum")]
 mod instructions;
 
+mod strand_tests;
 mod tests;
+#[cfg(feature = "kernel-test")]
+mod tmigr_race_tests;
 
 pub use accounting::{
     hardirq_cycles, interrupt_account_enter, nmi_cycles, InterruptAccountGuard, InterruptKind,
@@ -250,6 +255,8 @@ struct ParkedTasks {
     slots: alloc::vec::Vec<ParkedEntry>,
     free: Option<usize>,
     len: usize,
+    /// Parked tasks that are idle workers ([`WakeCell::idle_worker`]).
+    idle_workers: usize,
     capped: alloc::vec::Vec<usize>,
 }
 
@@ -266,12 +273,18 @@ impl ParkedTasks {
             slots: alloc::vec::Vec::new(),
             free: None,
             len: 0,
+            idle_workers: 0,
             capped: alloc::vec::Vec::new(),
         }
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Parked tasks that are work: all but idle workers.
+    fn busy_len(&self) -> usize {
+        self.len - self.idle_workers
     }
 
     fn values(&self) -> impl Iterator<Item = &ParkedSlot> {
@@ -333,6 +346,9 @@ impl ParkedTasks {
             self.capped.push(index);
             PARKED_CAPPED_COUNT[cpu].store(self.capped.len(), Ordering::Release);
         }
+        if entry.slot.awake.idle_worker.load(Ordering::Acquire) {
+            self.idle_workers += 1;
+        }
         self.slots[index].task = Some(entry);
         self.len += 1;
         index
@@ -362,6 +378,10 @@ impl ParkedTasks {
         entry.next_free = self.free;
         self.free = Some(index);
         self.len -= 1;
+        // Stable while parked: only the task itself changes it, when it runs.
+        if task.slot.awake.idle_worker.load(Ordering::Acquire) {
+            self.idle_workers -= 1;
+        }
         Some(task)
     }
 
@@ -400,6 +420,7 @@ impl ParkedTasks {
         self.slots.clear();
         self.free = None;
         self.len = 0;
+        self.idle_workers = 0;
         self.capped.clear();
     }
 }
@@ -554,12 +575,14 @@ static LIVE_USER_ADDRESS_SPACES: IrqSafeSpinLock<LiveUserAddressSpaces> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 fn register_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    narf_memory::as_origin::note_owner(address_space, id.raw());
     let mut live = LIVE_USER_ADDRESS_SPACES.lock();
     debug_assert!(live.iter().all(|(existing, _)| *existing != id));
     live.push((id, address_space.clone()));
 }
 
 fn replace_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    narf_memory::as_origin::note_owner(address_space, id.raw());
     if let Some((_, existing)) = LIVE_USER_ADDRESS_SPACES
         .lock()
         .iter_mut()
@@ -577,10 +600,64 @@ fn live_user_address_space(id: TaskId) -> Option<Arc<AddressSpace>> {
         .map(|(_, address_space)| address_space.clone())
 }
 
-fn unregister_live_user_address_space(id: TaskId) {
-    LIVE_USER_ADDRESS_SPACES
-        .lock()
-        .retain(|(existing, _)| *existing != id);
+/// Remove `id`'s registry entry, returning the address space it named. The
+/// entry is the task's user reference (`mm_users`): it is taken at spawn and
+/// moved by exec in step with `scheduler_attach_user_task`, so whoever takes
+/// it out owns the matching detach.
+fn take_live_user_address_space(id: TaskId) -> Option<Arc<AddressSpace>> {
+    let mut live = LIVE_USER_ADDRESS_SPACES.lock();
+    let at = live.iter().position(|(existing, _)| *existing == id)?;
+    Some(live.swap_remove(at).1)
+}
+
+/// Linux `mmput`: drop one user of `space`; the last one tears it down.
+fn mmput(space: &Arc<AddressSpace>) {
+    if space.scheduler_detach_user_task() {
+        let start = narf_time::monotonic_ns();
+        space.exit_mmap();
+        note_exit_mmap_ns(narf_time::monotonic_ns().saturating_sub(start));
+    }
+}
+
+static EXIT_MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_IN_TASK: AtomicU64 = AtomicU64::new(0);
+
+fn note_exit_mmap_ns(ns: u64) {
+    EXIT_MMAP_COUNT.fetch_add(1, Ordering::Relaxed);
+    EXIT_MMAP_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+    EXIT_MMAP_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// `(count, total ns, max ns, run in the exiting task)` of the `exit_mmap`
+/// teardowns the scheduler has run (`/proc/narf/pgtables`).
+pub fn exit_mmap_stats() -> (u64, u64, u64, u64) {
+    (
+        EXIT_MMAP_COUNT.load(Ordering::Relaxed),
+        EXIT_MMAP_TOTAL_NS.load(Ordering::Relaxed),
+        EXIT_MMAP_MAX_NS.load(Ordering::Relaxed),
+        EXIT_MMAP_IN_TASK.load(Ordering::Relaxed),
+    )
+}
+
+/// Linux `exit_mm`: the exiting task `id` gives up its address space — its
+/// user reference (`mm_users`) goes now, in its own context, and when it was
+/// the last one `exit_mmap` runs here, before the exit is reported to the
+/// parent, not later in the executor when the slot is dropped. The task must
+/// not touch user memory afterwards; its root stays installed (lazy active
+/// root) until it switches away. Returns whether the task had one to give up
+/// (a second call, or a task without a user space, is a no-op).
+pub fn exit_mm(id: TaskId) -> bool {
+    let Some(space) = take_live_user_address_space(id) else {
+        return false;
+    };
+    let before = EXIT_MMAP_COUNT.load(Ordering::Relaxed);
+    mmput(&space);
+    if EXIT_MMAP_COUNT.load(Ordering::Relaxed) != before {
+        EXIT_MMAP_IN_TASK.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 // Task-id selection is a cold management operation. Dispatch retains the
@@ -616,18 +693,30 @@ pub fn transfer_task_cap(
 
 impl Drop for TaskSlot {
     fn drop(&mut self) {
-        unregister_live_user_address_space(self.id);
+        // The task's user reference, unless its exit already gave it up
+        // (`exit_mm`). The registry entry, not `addr_space`, is the one
+        // `scheduler_attach_user_task` paired with: an exec moves it at once,
+        // while the slot's own field follows at the next reconciliation.
+        let user = take_live_user_address_space(self.id);
         #[cfg(feature = "native-ring")]
         {
             self.authority.retire();
             authority::unregister(self.id);
         }
-        if let Some(address_space) = self.addr_space.as_ref() {
+        if let Some(address_space) = user.as_ref() {
             // Final slot drop is the execution-liveness boundary for this MM:
             // the future cannot be polled again after Drop begins. Passive Arc
             // owners may outlive it, but no task represented by this slot can
             // fault or enter a VMA critical section after this decrement.
-            address_space.scheduler_detach_user_task();
+            //
+            // The last user is Linux `mmput` reaching zero `mm_users`: tear the
+            // mappings and page tables down now (`exit_mmap`), not when the
+            // last passive `Arc` happens to drop — a zombie's bookkeeping, a
+            // lazily active root or a leaked reference would otherwise keep
+            // the whole process image alive. A task that exits through the
+            // user exit path has already done this in its own context
+            // (`exit_mm`); this covers every other end of a user slot.
+            mmput(address_space);
         }
         unregister_task_affinity(self.id);
         if self.user_scheduling.is_some() {
@@ -1163,6 +1252,16 @@ pub(crate) fn tick_preemption_required(current: u64, now: u64, slice_expired: bo
 /// run-queue and is no longer findable by id). Returns `None`
 /// when the active task is kernel-only (no AS) or the executor
 /// isn't currently polling.
+/// Mark the task that owns `waker` as an idle worker (or not) — call it
+/// before returning `Pending` to park idle, and with `false` once woken.
+/// A CPU whose only parked tasks are idle workers counts as empty for
+/// [`run_until_empty`]. No effect for a waker that is not a task's.
+pub fn set_idle_worker(waker: &Waker, idle: bool) {
+    if let Some(cell) = scheduler_wake_cell(waker) {
+        cell.idle_worker.store(idle, Ordering::Release);
+    }
+}
+
 pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     active_user_as_slot().lock().clone()
 }
@@ -1186,6 +1285,13 @@ pub(crate) struct WakeCell {
     /// activation_queued; the consumer reads next before releasing that claim.
     activation_queued: AtomicBool,
     wake_next: AtomicPtr<WakeCell>,
+    /// Which public inbox list this node is on: [`ParkedWakeHead::stamp`] of
+    /// the list at the moment it was linked, or 0. Written under that list's
+    /// gate when the node is linked and when it is unlinked. A detach does not
+    /// touch the nodes; it moves the list's generation on, so every detached
+    /// node's stamp stops matching. Read under a list's gate, it says whether
+    /// the node is on that list without walking it.
+    wake_list: AtomicU64,
     /// The owning task's id, so the raw waker can name it as its CPU's
     /// wake-next buddy (see [`record_wake_next`]). Immutable after creation.
     task: u64,
@@ -1219,6 +1325,12 @@ pub(crate) struct WakeCell {
     /// executor, where ordinary affinity and CPU-lifecycle validation plus the
     /// normal migration enqueue path still own placement.
     sync_requeue_cpu: AtomicU32,
+    /// The task is an idle worker waiting for work (a workqueue worker
+    /// parked on its pool's idle list, Linux `WORKER_IDLE`). Set by the task
+    /// itself before it parks, cleared when it runs again, so it is stable
+    /// while parked. A parked idle worker is not work: `run_until_empty`
+    /// treats a CPU whose only parked tasks are idle workers as empty.
+    idle_worker: AtomicBool,
 }
 
 impl WakeCell {
@@ -1325,7 +1437,9 @@ fn try_sync_wake_affine(home: u32, cell: *const WakeCell) -> Option<u32> {
             return None;
         }
         let id = entry.slot.id;
-        slots.take(index, id).map(|entry| entry.slot)
+        let slot = slots.take(index, id)?.slot;
+        unlink_parked_wake(source, &slot.awake);
+        Some(slot)
     })??;
 
     enqueue_on(current, slot, policy::TaskEnqueueReason::Migrated);
@@ -1509,11 +1623,13 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         parked_location: AtomicUsize::new(NOT_PARKED),
         activation_queued: AtomicBool::new(false),
         wake_next: AtomicPtr::new(core::ptr::null_mut()),
+        wake_list: AtomicU64::new(0),
         task: id.raw(),
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
         user_rt: AtomicBool::new(false),
+        idle_worker: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(direct_eligible),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
@@ -1547,6 +1663,18 @@ static WAKE_PRESSURE: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS
     [const { core::sync::atomic::AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
 
 static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
+
+/// "The CPU is halted in a `block_on` bridge, not in its executor." The
+/// bridge (`bridge_idle_wait`) publishes `CPU_HALTED` like the executor's
+/// idle path — so a waker IPIs it through the unchanged `resched_remote`
+/// handshake and its HLT is broken by the wake, not by the CPU's next
+/// unrelated interrupt — and this flag beside it. Wake-time placement
+/// (`cpu_halted_and_schedulable`) reads both: a halted executor will run
+/// whatever is migrated to it; a CPU parked in `block_on` — outside its
+/// executor, possibly for the whole of a boot-time mount — will not, and a
+/// task moved there could be the very one the bridged future waits for.
+static BRIDGE_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Wake delivery is distinct from a policy-approved preemption. The producer
@@ -2332,7 +2460,25 @@ struct SchedulerTelemetry {
     resched_sent: AtomicU64,
     resched_skip: AtomicU64,
     forward_progress: AtomicU64,
-    _pad: [u8; 40],
+    /// Scheduling points this CPU's top-level executor has passed (a round
+    /// started, a polled task returned, a direct handoff). Written only by
+    /// the owning CPU (see [`note_sched_pass`]).
+    sched_passes: AtomicU64,
+    /// `sched_passes + 1` as this CPU's timer tick last saw it while wakes
+    /// were staged here (see [`kick_idle_balance_from_tick`]). Owner-only.
+    staged_tick_pass: AtomicU64,
+    /// Staged wakes this CPU pulled from other CPUs as an idle thief.
+    staged_pulls: AtomicU64,
+    /// Back-off state of this CPU's idle-balance kick during one stall: the
+    /// number of entries staged at the last stalled tick in the high half,
+    /// stalled ticks since that number last changed in the low half (see
+    /// [`staged_kick_backoff`]). Owner-only, written from its tick.
+    staged_kick: AtomicU64,
+    /// Cycle stamp of this CPU's latest scheduling point (see
+    /// [`note_sched_pass`]). Owner-written; wakers, enqueuers and idle thieves
+    /// read it to tell a CPU that is not rescheduling from one that is
+    /// ([`cpu_not_rescheduling`]).
+    sched_pass_cycles: AtomicU64,
 }
 
 impl SchedulerTelemetry {
@@ -2341,7 +2487,11 @@ impl SchedulerTelemetry {
             resched_sent: AtomicU64::new(0),
             resched_skip: AtomicU64::new(0),
             forward_progress: AtomicU64::new(0),
-            _pad: [0; 40],
+            sched_passes: AtomicU64::new(0),
+            staged_tick_pass: AtomicU64::new(0),
+            staged_pulls: AtomicU64::new(0),
+            staged_kick: AtomicU64::new(0),
+            sched_pass_cycles: AtomicU64::new(0),
         }
     }
 }
@@ -2372,6 +2522,50 @@ pub fn note_forward_progress() {
     local_scheduler_telemetry()
         .forward_progress
         .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one scheduling point on `cpu`: a dispatch round started, a polled
+/// task returned to the executor, or one task handed the CPU directly to
+/// another. Only the owning CPU writes the counter and its time stamp, so
+/// plain loads/stores are enough and no locked instruction is issued.
+#[inline]
+pub(crate) fn note_sched_pass(cpu: usize) {
+    if let Some(telemetry) = SCHEDULER_TELEMETRY.get(cpu) {
+        let passes = telemetry.sched_passes.load(Ordering::Relaxed);
+        telemetry
+            .sched_passes
+            .store(passes.wrapping_add(1), Ordering::Relaxed);
+        telemetry
+            .sched_pass_cycles
+            .store(narf_time::now_cycles(), Ordering::Relaxed);
+    }
+}
+
+/// How long a CPU that is awake may go without passing a scheduling point
+/// before wakers, enqueuers and idle thieves stop treating it as about to run
+/// what is queued for it. One millisecond: far longer than a healthy executor
+/// takes between scheduling points, and far shorter than any wait a user would
+/// notice.
+const NOT_RESCHEDULING_NS: u64 = 1_000_000;
+
+/// Whether `cpu` is awake but has passed no scheduling point for
+/// [`NOT_RESCHEDULING_NS`]: inside a long task poll or kernel section, or
+/// stuck in executor maintenance, possibly with interrupts masked. Work
+/// queued there waits for it, and a reschedule IPI does not help when its
+/// interrupts are masked. A halted CPU is not counted: an IPI wakes it.
+///
+/// Reads the halted flag and the owner's pass stamp (two loads on lines the
+/// owner writes); never blocks. The answer is advisory: whoever acts on it
+/// re-checks ownership under the usual locks.
+#[inline]
+fn cpu_not_rescheduling(cpu: usize, now: u64) -> bool {
+    let (Some(halted), Some(telemetry)) = (CPU_HALTED.get(cpu), SCHEDULER_TELEMETRY.get(cpu))
+    else {
+        return false;
+    };
+    !halted.load(Ordering::Acquire)
+        && now.saturating_sub(telemetry.sched_pass_cycles.load(Ordering::Relaxed))
+            >= narf_time::ns_to_cycles(NOT_RESCHEDULING_NS)
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
@@ -2504,10 +2698,15 @@ fn resched_remote(target_cpu: u32) {
     // Publish the reschedule request BEFORE the Dekker fence so a target that
     // commits to halt after this point observes it in its halt-commit check
     // (see NEED_RESCHED). Authoritative even when the IPI below is skipped.
-    NEED_RESCHED[target_cpu as usize].store(true, Ordering::Release);
+    let already_requested = NEED_RESCHED[target_cpu as usize].swap(true, Ordering::AcqRel);
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
-    if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
+    // A request that was already pending on a halted target has its IPI on
+    // the way (Linux `set_nr_and_not_polling` sends only on the first setter):
+    // the halt commit consumes the flag before halting, so a set flag on a
+    // halted CPU was set after its commit, and that setter saw it halted and
+    // sends. A second IPI for the same request is a wake storm, not a wake.
+    if already_requested || !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
         local_scheduler_telemetry()
             .resched_skip
             .fetch_add(1, Ordering::Relaxed);
@@ -2539,6 +2738,198 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
         .resched_sent
         .fetch_add(1, Ordering::Relaxed);
     send_resched_ipi(target_cpu);
+}
+
+/// Timer-tick half of the idle balance: ask one idle CPU to come and look
+/// (Linux `sched_balance_trigger` -> `nohz_balancer_kick` -> `kick_ilb`).
+///
+/// An idle CPU pulls staged wakes only when it runs a balance pass, and a
+/// halted CPU with nothing queued may not run one for a long time. So the CPU
+/// that is holding the wakes speaks up: when its tick finds wakes staged and
+/// its executor has passed no scheduling point since the previous tick that
+/// found the same, it sends one reschedule kick to a halted CPU that could run
+/// one of them. The kick carries no task; the woken CPU's ordinary steal pass
+/// decides what, if anything, it may take. A CPU making progress (its pass
+/// counter moves between ticks) drains its own inbox and never kicks.
+///
+/// The kick is aimed and rationed, as Linux's is (`find_new_ilb` picks from
+/// the idle housekeeping CPUs, and `NOHZ_BALANCE_KICK` keeps a pending kick
+/// from being repeated):
+///
+/// - The target must be allowed to run at least one of the staged tasks
+///   ([`staged_pull_mask`]); if no other CPU is, nothing is sent. Wakes pinned
+///   to this CPU, and nodes whose task has gone back to sleep, kick nobody.
+/// - The target must be schedulable: online, halted, and `Active`/`Idle`. A
+///   logically offlined CPU also publishes itself halted and stays in the
+///   online bitmap, but it parks without running a steal pass.
+/// - A target whose `NEED_RESCHED` is still set has a kick (or a wake) on its
+///   way that it has not consumed yet; it is not kicked again.
+/// - Within one stall the kick backs off ([`staged_kick_backoff`]): stalled
+///   ticks 1, 2, 4, 8, … send, and a change in the number of staged entries
+///   starts over. A thief that came and could take nothing (the task was
+///   cache-hot, throttled, or refused by the steal strategy) is therefore not
+///   woken again every tick for as long as the stall lasts.
+///
+/// A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
+/// gives it two looks at the staged work: one on waking and one before it
+/// halts again.
+///
+/// Runs in the tick's hard-IRQ context on the busy CPU. Until a kick is due it
+/// loads only this CPU's own gauges and counters. A due kick reads this CPU's
+/// staged entries under `try_lock`s — the tick cannot have interrupted a
+/// holder on its own CPU, since those locks mask interrupts — and then other
+/// CPUs' halted flags and states. With tickless idle a halted CPU has no
+/// periodic tick of its own, so a kick is what starts its steal pass. A CPU
+/// with interrupts masked takes no tick and sends no kick, so this is only the
+/// second line: wakers and enqueuers already moved the work or kicked an idle
+/// CPU for it ([`wake_place_and_kick`], [`kick_idle_puller`]).
+pub(crate) fn kick_idle_balance_from_tick() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= narf_lib::percpu::MAX_CPUS || !wake_list_pending(cpu) {
+        return;
+    }
+    let telemetry = &SCHEDULER_TELEMETRY[cpu];
+    let passes = telemetry.sched_passes.load(Ordering::Relaxed);
+    if !staged_wakes_stalled(&telemetry.staged_tick_pass, passes) {
+        // First sighting at this pass count: if a stall follows, it is new.
+        telemetry.staged_kick.store(0, Ordering::Relaxed);
+        return;
+    }
+    if !STEAL_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let staged = WAKE_INBOX_LEN[cpu]
+        .load(Ordering::Relaxed)
+        .saturating_add(PARKED_WAKE_INBOX[cpu].len.load(Ordering::Relaxed));
+    let (state, due) = staged_kick_backoff(
+        telemetry.staged_kick.load(Ordering::Relaxed),
+        staged.min(u32::MAX as usize) as u32,
+    );
+    telemetry.staged_kick.store(state, Ordering::Relaxed);
+    if !due {
+        return;
+    }
+    let candidates = staged_pull_mask(cpu) & narf_lib::smp::online_bitmap();
+    if candidates == 0 {
+        return;
+    }
+    let ready = |target: usize| {
+        CPU_HALTED[target].load(Ordering::Relaxed)
+            && !NEED_RESCHED[target].load(Ordering::Relaxed)
+            && matches!(
+                policy::cpu_state(CpuId(target as u32)),
+                CpuState::Active | CpuState::Idle
+            )
+    };
+    if let Some(target) = idle_balance_kick_target(cpu, candidates, ready) {
+        resched_remote(target);
+    }
+}
+
+/// Advance the kick's back-off for one more stalled tick that found `staged`
+/// entries, and say whether this tick sends.
+///
+/// `state` packs the entry count seen at the previous stalled tick (high half)
+/// and the stalled ticks since it last changed (low half); zero is a fresh
+/// stall. Ticks 1, 2, 4, 8, … of an unchanged count send. A changed count —
+/// something new was staged, or a thief took something — restarts at 1, so new
+/// work is advertised at once while a set nobody could take is advertised
+/// only logarithmically often.
+#[inline]
+fn staged_kick_backoff(state: u64, staged: u32) -> (u64, bool) {
+    let seen = (state >> 32) as u32;
+    let ticks = state as u32;
+    let ticks = if seen == staged {
+        ticks.saturating_add(1)
+    } else {
+        1
+    };
+    (
+        (u64::from(staged) << 32) | u64::from(ticks),
+        ticks.is_power_of_two(),
+    )
+}
+
+/// CPUs other than `cpu` that may run at least one of the wakes staged on
+/// `cpu`: the union of the hard affinity masks of its staged, runnable tasks,
+/// looking at up to [`STAGED_STEAL_SCAN`] entries in each holding place.
+///
+/// For the tick-side kick on `cpu` itself, so everything is `try_lock`: a lock
+/// that another CPU holds this instant just contributes nothing this tick.
+/// User tasks count only when they may run off their boot CPU, mirroring
+/// `StealStrategy::allow_steal`. Cache-hot and throttled tasks are not
+/// filtered here; the thief judges those, and the back-off absorbs a kick
+/// that finds nothing to take. Under the gate this only reads: the token, the
+/// parked slot it names, and that slot's flags and mask.
+fn staged_pull_mask(cpu: usize) -> u64 {
+    let user_smp = user_task_smp_enabled();
+    let mut mask = 0u64;
+    let mut consider = |slot: &TaskSlot| {
+        if slot.awake.executor_runnable() && (user_smp || slot.addr_space.is_none()) {
+            mask |= slot.spec.affinity.allowed.bits();
+        }
+    };
+    if let Some(inbox) = WAKE_INBOX[cpu].try_lock() {
+        for (slot, _) in inbox.iter().take(STAGED_STEAL_SCAN) {
+            consider(slot);
+        }
+    }
+    if let Some(parked) = PARKED[cpu].try_lock() {
+        let inbox = &PARKED_WAKE_INBOX[cpu];
+        if let (Some(slots), Some(_gate)) = (parked.as_ref(), inbox.gate.try_lock()) {
+            let mut node = inbox.head.load(Ordering::Relaxed);
+            for _ in 0..STAGED_STEAL_SCAN {
+                if node.is_null() {
+                    break;
+                }
+                // SAFETY: linked under the gate, hence kept alive by the
+                // inbox's reference; links change only under the gate.
+                let cell = unsafe { &*node };
+                if let Some((_, entry)) = slots.for_cell(cpu, cell) {
+                    consider(&entry.slot);
+                }
+                node = cell.wake_next.load(Ordering::Relaxed);
+            }
+        }
+    }
+    mask & !(1u64 << cpu)
+}
+
+/// Whether a tick that found wakes staged has seen this scheduling-pass count
+/// at an earlier such tick, i.e. the executor went a whole tick period without
+/// a scheduling point. The first sighting only records the count, giving the
+/// executor one period to reach a boundary on its own. `seen` holds
+/// `passes + 1` so that zero means "nothing recorded".
+#[inline]
+fn staged_wakes_stalled(seen: &AtomicU64, passes: u64) -> bool {
+    let stamp = passes.wrapping_add(1);
+    if seen.load(Ordering::Relaxed) == stamp {
+        return true;
+    }
+    seen.store(stamp, Ordering::Relaxed);
+    false
+}
+
+/// The halted online CPU to kick from `cpu`: nearest higher-numbered first,
+/// wrapping, so kicks from different busy CPUs do not all land on the
+/// lowest-numbered idle one.
+#[inline]
+fn idle_balance_kick_target(
+    cpu: usize,
+    online: u64,
+    halted: impl Fn(usize) -> bool,
+) -> Option<u32> {
+    const _: () = assert!(narf_lib::percpu::MAX_CPUS <= u64::BITS as usize);
+    let first = (cpu as u32 + 1) % u64::BITS;
+    let mut candidates = (online & !(1u64 << cpu)).rotate_right(first);
+    while candidates != 0 {
+        let target = (candidates.trailing_zeros() + first) % u64::BITS;
+        candidates &= candidates - 1;
+        if halted(target as usize) {
+            return Some(target);
+        }
+    }
+    None
 }
 
 /// Linux `kick_process()`: if `task` is running on ANOTHER CPU right now,
@@ -2577,6 +2968,13 @@ fn send_resched_ipi(target_cpu: u32) {
 
 pub(crate) struct TaskSlot {
     user_scheduling: Option<user_policy::UserSlot>,
+    /// What the task runs: the future's type name, set at spawn. Diagnostic
+    /// only (`task_origins`): names a task that has no pid, comm or registry
+    /// entry, such as a kernel helper a soak finds accumulating.
+    pub(crate) origin: &'static str,
+    /// Where it was spawned (`spawn`'s caller; for the other spawn wrappers,
+    /// the wrapper). Diagnostic only, with `origin`.
+    pub(crate) site: &'static core::panic::Location<'static>,
     /// Why the policy selected this dispatch; copied into its runtime event.
     pub(crate) dispatch_reason: policy::DispatchReason,
     task: BoxedTask,
@@ -2682,6 +3080,10 @@ impl core::fmt::Debug for TaskSlot {
 /// or any other scheduler-owned data is touched.
 #[inline]
 fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
+    // A task may read RCU-protected data: if this CPU has been idle since its
+    // last poll, it rejoins the grace-period census first (Linux
+    // `rcu_eqs_exit`). One load when it was not idle.
+    narf_rcu::exit_idle();
     #[cfg(feature = "native-ring")]
     let _authority = authority::CurrentGuard::enter(&slot.authority);
     let executor_domain = narf_memory::save_domain_state();
@@ -2957,6 +3359,10 @@ pub fn init() {
     // byte-for-byte. Idempotent for the same reason the wave D/E
     // installs are.
     steal::install_default_if_unset();
+    // `workqueue_init`: the boot CPU's worker pools and the system
+    // workqueues. Other CPUs' pools are created on first use; workers are
+    // created when work is queued.
+    workqueue::workqueue_init();
 }
 
 /// Test-only hook: clear every ready queue without re-running
@@ -2965,6 +3371,9 @@ pub fn init() {
 /// touching the one-shot `INITIALIZED` flag in `init`.
 #[doc(hidden)]
 pub fn __reset_queues_for_test() {
+    // The worker tasks of every pool go with the queues: the next use of a
+    // workqueue creates fresh pools.
+    workqueue::__reset_for_test();
     for (cpu, q) in READY.iter().enumerate() {
         blocking::reset(cpu);
         if let Some(d) = q.lock().as_mut() {
@@ -3283,6 +3692,9 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             slots.remove(&id)
         };
         if let Some(entry) = parked {
+            // A wake may already have staged this task's activation node on
+            // the CPU it is leaving; take the node along.
+            unlink_parked_wake(cpu, &entry.slot.awake);
             let target = target_cpu_for_affinity(affinity, cpu);
             enqueue_on(target, entry.slot, policy::TaskEnqueueReason::Migrated);
             return Ok(());
@@ -3659,6 +4071,11 @@ fn user_ap_affinity() -> Affinity {
 /// `push_back`/`pop_front` — never across a policy callback or a blocking op — so
 /// its cross-core critical section is a small fraction of the policy slot's, and
 /// it is a leaf lock (never held while acquiring another), so it cannot deadlock.
+///
+/// The owner is not the only consumer. An idle CPU's balance pass may remove
+/// one entry under a `try_lock` and a scan bounded by [`STAGED_STEAL_SCAN`]
+/// (`try_steal_staged`), so a task enqueued here is not hostage to this CPU
+/// reaching an executor boundary.
 static WAKE_INBOX: [IrqSafeSpinLock<VecDeque<(TaskSlot, policy::TaskEnqueueReason)>>;
     narf_lib::percpu::MAX_CPUS] =
     [const { IrqSafeSpinLock::new(VecDeque::new()) }; narf_lib::percpu::MAX_CPUS];
@@ -3678,10 +4095,29 @@ static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
 /// storage and an exited task's waker cannot leave a dangling link. Repeated
 /// wakes coalesce. Running tasks have no parked token; poll return observes
 /// their wake bit and enqueues them directly.
+///
+/// A node on this public list belongs to a task parked on this CPU, or to one
+/// that was reaped from here and will never be woken again: whoever takes a
+/// task out of `PARKED[cpu]` to run it calls `unlink_parked_wake` before
+/// enqueueing it. That includes the owner's drain. The drain has detached the
+/// node it is processing, but it releases that node's claim before it takes
+/// the slot, and a wake in between links the cell here again. Otherwise the
+/// node's claim would swallow the task's next wake until this CPU drained.
+///
+/// What a taker cannot unlink is a node sitting in the owner's detached,
+/// private batch. The owner's drain is already running and releases or
+/// forwards it (`activate_drained_wake`), so that state ends without anyone
+/// reaching a scheduling point.
+///
+/// The list is singly linked and every link changes under `gate`, which is
+/// what lets `unlink_parked_wake`, and an idle thief looking for candidates,
+/// walk it.
 #[repr(align(64))]
 struct ParkedWakeHead {
     head: AtomicPtr<WakeCell>,
     len: AtomicUsize,
+    /// Counts detaches of the public list. Changed only under `gate`.
+    generation: AtomicU64,
     /// Leaf lock: publish/detach only, never held over a parked/run-queue lock,
     /// policy callback, allocation, or task teardown.
     gate: IrqSafeSpinLock<()>,
@@ -3690,10 +4126,24 @@ static PARKED_WAKE_INBOX: [ParkedWakeHead; narf_lib::percpu::MAX_CPUS] = [const 
     ParkedWakeHead {
         head: AtomicPtr::new(core::ptr::null_mut()),
         len: AtomicUsize::new(0),
+        generation: AtomicU64::new(0),
         gate: IrqSafeSpinLock::new(()),
     }
 };
     narf_lib::percpu::MAX_CPUS];
+
+impl ParkedWakeHead {
+    /// Identifies `cpu`'s public list as it stands: its CPU and how many
+    /// times it has been detached, never 0. Call with the gate held. A node
+    /// carries the stamp of the list it was linked on
+    /// ([`WakeCell::wake_list`]); the two agree exactly while the node is
+    /// still on that list.
+    #[inline]
+    fn stamp(&self, cpu: usize) -> u64 {
+        const _: () = assert!(narf_lib::percpu::MAX_CPUS <= 256);
+        ((self.generation.load(Ordering::Relaxed) + 1) << 8) | cpu as u64
+    }
+}
 /// Return the CPU notified for this publication. Placement must still notify a
 /// different destination, but need not kick the queued node's owner twice.
 fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
@@ -3736,6 +4186,7 @@ fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
                 unsafe { Arc::increment_strong_count(ptr) };
                 cell.wake_next
                     .store(inbox.head.load(Ordering::Relaxed), Ordering::Relaxed);
+                cell.wake_list.store(inbox.stamp(cpu), Ordering::Relaxed);
                 inbox.len.fetch_add(1, Ordering::Release);
                 inbox.head.store(ptr, Ordering::Release);
             }
@@ -3796,7 +4247,11 @@ fn try_activate_parked_local(cell: &WakeCell) -> bool {
                 return false;
             }
             let id = entry.slot.id;
-            slots.take(index, id).expect("validated parked wake owner")
+            let entry = slots.take(index, id).expect("validated parked wake owner");
+            // An earlier wake (one that arrived under a direct-handoff claim)
+            // may have staged a node this activation supersedes.
+            unlink_parked_wake(cpu, cell);
+            entry
         };
         publish_possible_class(cpu, entry.slot.spec.class.rank());
         publish_class_fifo_shape(cpu, &entry.slot);
@@ -3821,6 +4276,12 @@ fn take_parked_wake_batch(cpu: usize) -> *mut WakeCell {
     let mut batch = {
         let inbox = &PARKED_WAKE_INBOX[cpu];
         let _gate = inbox.gate.lock();
+        // The nodes leave the public list together: one store retires the
+        // stamp they all carry.
+        let generation = inbox.generation.load(Ordering::Relaxed);
+        inbox
+            .generation
+            .store(generation.wrapping_add(1), Ordering::Relaxed);
         inbox.head.swap(core::ptr::null_mut(), Ordering::Acquire)
     };
     let mut ordered = core::ptr::null_mut();
@@ -3834,6 +4295,70 @@ fn take_parked_wake_batch(cpu: usize) -> *mut WakeCell {
         batch = next;
     }
     ordered
+}
+
+/// Remove `cell`'s activation node from `cpu`'s inbox if it is still linked
+/// there, releasing its claim and the inbox's `Arc`.
+///
+/// For a caller that has just taken the woken task out of `PARKED[cpu]` and
+/// has not yet enqueued it elsewhere. The owner would discard the node at its
+/// next drain anyway, but until then the node's claim makes every later wake
+/// of the task coalesce into it (`parked_wake_push` returns on a set
+/// `activation_queued`). A task that slept again on its new CPU would then
+/// wait for its old home to reach an executor boundary. With the slot in the
+/// caller's hands the parked token is `NOT_PARKED`, so no producer can link
+/// the node again while this runs.
+///
+/// A node the owner has already detached is not on the list; the owner's drain
+/// releases it. Links change only under the gate, and a linked node is pinned
+/// by the inbox's reference, so the walk reads live nodes. The caller's slot
+/// holds its own reference: the one dropped here is never the last.
+///
+/// The list is walked only when the node is on it. A claim can be set while
+/// the node is somewhere else — in the owner's detached batch, or claimed by
+/// a producer that has not linked it yet — and callers hold `PARKED[cpu]`
+/// (some also the ready queue and the policy slot) with interrupts masked, so
+/// walking a long list to find nothing there is not acceptable. The node's
+/// stamp settles it in one comparison under the gate. When the node is on the
+/// list the walk stops at it; freshly staged nodes are at the front.
+fn unlink_parked_wake(cpu: usize, cell: &WakeCell) {
+    // No claim, no node: the task was asleep and unwoken, or already drained.
+    if !cell.activation_queued.load(Ordering::SeqCst) {
+        return;
+    }
+    let target = core::ptr::from_ref(cell).cast_mut();
+    let inbox = &PARKED_WAKE_INBOX[cpu];
+    {
+        let _gate = inbox.gate.lock();
+        if cell.wake_list.load(Ordering::Relaxed) != inbox.stamp(cpu) {
+            return;
+        }
+        let mut prev: *mut WakeCell = core::ptr::null_mut();
+        let mut node = inbox.head.load(Ordering::Relaxed);
+        while !node.is_null() && node != target {
+            prev = node;
+            // SAFETY: linked under the gate, hence pinned by the inbox's Arc.
+            node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
+        }
+        if node.is_null() {
+            // The stamp said the node is here; a list that disagrees is
+            // corrupt. Leave it as found rather than guess.
+            debug_assert!(false, "activation node stamped for a list it is not on");
+            return;
+        }
+        let next = cell.wake_next.load(Ordering::Relaxed);
+        if prev.is_null() {
+            inbox.head.store(next, Ordering::Release);
+        } else {
+            // SAFETY: `prev` is a linked node, pinned as above.
+            unsafe { (*prev).wake_next.store(next, Ordering::Relaxed) };
+        }
+        cell.wake_list.store(0, Ordering::Relaxed);
+        inbox.len.fetch_sub(1, Ordering::Release);
+    }
+    cell.activation_queued.store(false, Ordering::SeqCst);
+    // SAFETY: the unlinked node carried exactly one inbox-owned reference.
+    unsafe { Arc::decrement_strong_count(target.cast_const()) };
 }
 
 fn reset_parked_wakes(cpu: usize) {
@@ -3964,50 +4489,71 @@ fn drain_parked_wakes(cpu: usize) -> usize {
     while !batch.is_null() {
         // SAFETY: the detached node owns exactly one inbox Arc reference.
         let cell = unsafe { Arc::from_raw(batch) };
-        // Read next BEFORE releasing the claim: another CPU may immediately
-        // requeue this node and overwrite wake_next after the release.
-        batch = cell.wake_next.load(Ordering::Relaxed);
-        PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
-        cell.activation_queued.store(false, Ordering::SeqCst);
-        let token = cell.parked_location.load(Ordering::SeqCst);
-        if token == NOT_PARKED {
-            continue;
-        }
-        let home = token % narf_lib::percpu::MAX_CPUS;
-        if home != cpu {
-            // A queued activation can outlive a migration and a subsequent
-            // sleep. Route the pinned node to its current parked owner.
-            let notified = parked_wake_push(&cell);
-            notify_wake_cpu_once(cell.cpu.load(Ordering::Acquire), notified);
-            continue;
-        }
-        let id = TaskId(cell.task);
-        let index = token / narf_lib::percpu::MAX_CPUS;
-        let parked = {
-            let mut parked = PARKED[cpu].lock();
-            parked.as_mut().and_then(|slots| {
-                let task = slots.slots.get(index)?.task.as_ref()?;
-                // A stale id cannot claim a reused index, and an in-flight
-                // direct transfer keeps ownership until its release path
-                // re-stages any wake that arrived while it was claimed.
-                if task.slot.id != id
-                    || !task.slot.awake.flag.load(Ordering::SeqCst)
-                    || task.slot.awake.direct_claimed.load(Ordering::SeqCst)
-                {
-                    return None;
-                }
-                slots.take(index, id)
-            })
-        };
-        let Some(parked) = parked else {
-            // A running/migrated task has already left parked ownership, or
-            // a stale token names a task which has since gone back to sleep.
-            continue;
-        };
-        enqueue_on(cpu, parked.slot, parked.reason);
-        activated += 1;
+        batch = release_drained_wake(cpu, &cell);
+        activated += activate_drained_wake(cpu, &cell);
     }
     activated
+}
+
+/// First half of draining one detached node: give up its claim and return the
+/// next node of the batch. From here on a wake of the task can claim the cell
+/// and link it again — on this CPU's public list, if the task is still parked
+/// here — so [`activate_drained_wake`] must not assume the cell is unlinked.
+#[inline]
+fn release_drained_wake(cpu: usize, cell: &WakeCell) -> *mut WakeCell {
+    // Read next BEFORE releasing the claim: another CPU may immediately
+    // requeue this node and overwrite wake_next after the release.
+    let next = cell.wake_next.load(Ordering::Relaxed);
+    PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
+    cell.activation_queued.store(false, Ordering::SeqCst);
+    next
+}
+
+/// Second half: activate the task the released node named, if it is parked on
+/// `cpu` and has been woken; forward the node if the task now sleeps elsewhere.
+#[inline]
+fn activate_drained_wake(cpu: usize, cell: &WakeCell) -> usize {
+    let token = cell.parked_location.load(Ordering::SeqCst);
+    if token == NOT_PARKED {
+        return 0;
+    }
+    let home = token % narf_lib::percpu::MAX_CPUS;
+    if home != cpu {
+        // A queued activation can outlive a migration and a subsequent
+        // sleep. Route the pinned node to its current parked owner.
+        let notified = parked_wake_push(cell);
+        notify_wake_cpu_once(cell.cpu.load(Ordering::Acquire), notified);
+        return 0;
+    }
+    let id = TaskId(cell.task);
+    let index = token / narf_lib::percpu::MAX_CPUS;
+    let parked = {
+        let mut parked = PARKED[cpu].lock();
+        parked.as_mut().and_then(|slots| {
+            let task = slots.slots.get(index)?.task.as_ref()?;
+            // A stale id cannot claim a reused index, and an in-flight
+            // direct transfer keeps ownership until its release path
+            // re-stages any wake that arrived while it was claimed.
+            if task.slot.id != id
+                || !task.slot.awake.flag.load(Ordering::SeqCst)
+                || task.slot.awake.direct_claimed.load(Ordering::SeqCst)
+            {
+                return None;
+            }
+            slots.take(index, id)
+        })
+    };
+    let Some(parked) = parked else {
+        // A running/migrated task has already left parked ownership, or
+        // a stale token names a task which has since gone back to sleep.
+        return 0;
+    };
+    // The claim was released before the slot was taken, so a wake in between
+    // may have linked this cell on the public list again. One load when it
+    // did not.
+    unlink_parked_wake(cpu, &parked.slot.awake);
+    enqueue_on(cpu, parked.slot, parked.reason);
+    1
 }
 
 /// Publish parked ownership, then recheck the wake after the SeqCst token
@@ -4025,7 +4571,10 @@ fn park_slot(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) -> O
         .slot
         .awake;
     if cell.flag.load(Ordering::SeqCst) && !cell.direct_claimed.load(Ordering::Acquire) {
-        slots.take(index, id)
+        let entry = slots.take(index, id)?;
+        // The racing waker may have seen the token and staged a node here.
+        unlink_parked_wake(cpu, &entry.slot.awake);
+        Some(entry)
     } else {
         None
     }
@@ -4104,7 +4653,23 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         policy::CpuState::Active | policy::CpuState::Idle
     );
     if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
+        // A target that is awake but not rescheduling drains its inbox only
+        // when it gets back to its executor, and an IPI does not bring that
+        // closer when its interrupts are masked. Linux has the enqueuer kick
+        // an idle CPU for such a backlog (`nohz_balancer_kick` → `kick_ilb`);
+        // here the enqueuer does it, since the target's own tick may never
+        // come. The target still gets its reschedule request (no IPI: it is
+        // not halted), so this is still at most one IPI per enqueue.
+        let allowed = slot.spec.affinity.allowed.bits();
+        let pullable = user_task_smp_enabled() || slot.addr_space.is_none();
         wake_list_push(cpu, slot, reason);
+        if pullable
+            && cpu_not_rescheduling(cpu, narf_time::now_cycles())
+            && kick_idle_puller(cpu, allowed & !(1u64 << cpu))
+        {
+            resched_remote(cpu as u32);
+            return;
+        }
         notify_wake_cpu(cpu as u32);
         return;
     }
@@ -4212,6 +4777,7 @@ fn notify_cpu_active(cpu: usize) {
 ///
 /// Returns the `TaskId` stamped on the newly-created task — `donate_to`
 /// and future `cancel`/`join` primitives name the task by this id.
+#[track_caller]
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> TaskId {
     spawn_with_spec(f, TaskSpec::unthrottled())
 }
@@ -4220,6 +4786,7 @@ pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> TaskId {
 /// `budget_cap` makes the task always-runnable; a live cap is
 /// epoch-checked on every round and the task drops when the cap is
 /// revoked.
+#[track_caller]
 pub fn spawn_with_spec<F>(f: F, spec: TaskSpec) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -4233,6 +4800,7 @@ where
 /// `StackfulOptions::domain` (the same value stamped into the
 /// stackful `domain_byte`) so authority and `current_domain()`
 /// agree from the task's first poll.
+#[track_caller]
 fn spawn_with_spec_in_domain<F>(f: F, spec: TaskSpec, domain: DomainId) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -4258,6 +4826,8 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: core::any::type_name::<F>(),
+        site: core::panic::Location::caller(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(f),
@@ -4325,6 +4895,8 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: core::any::type_name::<F>(),
+        site: core::panic::Location::caller(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
@@ -4612,6 +5184,8 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: "user task",
+        site: core::panic::Location::caller(),
         user_scheduling: Some(user_scheduling),
         dispatch_reason: policy::DispatchReason::Policy,
         task,
@@ -4725,6 +5299,43 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
             out.extend(parked.keys().copied());
         }
     }
+    // Each queue is locked only for its own scan, so a task that moves while
+    // the scan runs — stolen to a later CPU's queue, or parked after its
+    // ready queue was read — is seen twice. Report each task once, as
+    // Linux's task-list walk does (`/proc`, loadavg's total).
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Every queued or parked task with the type name of the future it runs,
+/// for diagnostics (`/proc/narf/tasks`). Same snapshot semantics as
+/// [`all_task_ids`].
+pub fn task_origins() -> alloc::vec::Vec<(
+    TaskId,
+    &'static str,
+    &'static core::panic::Location<'static>,
+)> {
+    let mut out = alloc::vec::Vec::new();
+    for q in READY.iter() {
+        let g = q.lock();
+        if let Some(ref dq) = *g {
+            for slot in dq.iter() {
+                out.push((slot.id, slot.origin, slot.site));
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            for (id, entry) in parked.iter() {
+                out.push((*id, entry.slot.origin, entry.slot.site));
+            }
+        }
+    }
+    // One entry per task; see `all_task_ids`.
+    out.sort_unstable_by_key(|entry| entry.0);
+    out.dedup_by_key(|entry| entry.0);
     out
 }
 
@@ -4825,8 +5436,12 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         // Drop (or, in synthetic contexts that bypass the epilogue, by
         // `__test_clear_published_address_space`). The ready-queue path
         // below tolerates a missing previous AS the same way.
+        // An exec that displaced the last user of the old space is its
+        // `mmput` (Linux `exec_mmap`): the caller no longer touches the old
+        // image, and the teardown's invalidation covers this CPU, which still
+        // runs on the old root until the new one is activated.
         if let Some(previous) = previous_active.as_ref() {
-            previous.scheduler_detach_user_task();
+            mmput(previous);
         }
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
@@ -4855,7 +5470,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             // lock is released; the reaper waker may itself touch scheduler
             // state.
             if let Some(previous) = prev.as_ref() {
-                previous.scheduler_detach_user_task();
+                mmput(previous);
             }
             return prev;
         }
@@ -4874,7 +5489,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         };
         if let Some(prev) = replaced {
             if let Some(previous) = prev.as_ref() {
-                previous.scheduler_detach_user_task();
+                mmput(previous);
             }
             return prev;
         }
@@ -5084,6 +5699,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                     .as_mut()
                     .and_then(|parked| parked.remove(&target));
                 let entry = entry?;
+                unlink_parked_wake(cpu, &entry.slot.awake);
                 activated_reason = Some(entry.reason);
                 ready.push_back(entry.slot);
                 ready.len() - 1
@@ -5583,7 +6199,9 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
             return None;
         }
         let id = entry.slot.id;
-        slots.take(index, id).map(|entry| entry.slot)
+        let slot = slots.take(index, id)?.slot;
+        unlink_parked_wake(source, &slot.awake);
+        Some(slot)
     });
     match moved {
         Some(Some(slot)) => {
@@ -5605,57 +6223,80 @@ fn notify_wake_cpu_once(cpu: u32, notified: Option<u32>) {
     }
 }
 
-/// Wake-time placement + kick — NARF's `ttwu_queue` mechanism, split exactly
-/// like Linux: the POLICY decides WHERE (`Scheduler::select_task_rq`, the
-/// analogue of `sched_class->select_task_rq`), and the scheduler CORE performs
-/// the mechanical migrate + enqueue + IPI (`set_task_cpu` + `ttwu_queue`).
+/// Wake-time placement + kick — NARF's `try_to_wake_up` → `select_task_rq` →
+/// `ttwu_queue`, split like Linux: the POLICY decides WHERE
+/// (`Scheduler::select_task_rq`, the analogue of `sched_class->select_task_rq`)
+/// and the scheduler CORE performs the mechanical migrate + enqueue + IPI
+/// (`set_task_cpu` + `ttwu_queue_wakelist`).
 ///
-/// On a wake whose `home` (prev_cpu) is BUSY, ask the policy for an
-/// affinity-permitted destination; if it names a different CPU, move the slot
-/// and let `enqueue_on` kick it. This is a PUSH at wake time — it does NOT rely
-/// on the idle sibling later PULLING the task via work-stealing (Linux uses
-/// stealing only in the periodic/newidle balancer, never on the wake path). If
-/// no idle sibling is offered, keep the task on `home` and `resched_remote(home)`
-/// (an idle home is woken by its IPI; a busy home runs it at its next round).
+/// `home` is the wakee's previous CPU. What happens depends on what it is
+/// doing (Linux `select_idle_sibling`: keep `prev` when it is idle, else find
+/// an idle sibling):
 ///
-/// Runs in the raw-waker path (possibly IRQ context): allocation-light,
-/// non-blocking (`try_lock`), bounded CPU scan. Any migrate contention falls
-/// back to the plain `home` kick, so a wake is never dropped.
+/// - **Halted**: keep the task there and IPI it (`resched_remote`). Under
+///   tickless idle the IPI is what wakes it; no tick is waited for.
+/// - **Awake, running no task, rescheduling** (between polls, or spinning on
+///   an empty queue): keep it; the executor picks the wake up at its next
+///   round, cache-hot. Only a backlog of fresh wakes since its last round
+///   (`WAKE_PRESSURE` ≥ 2) asks for an idle sibling.
+/// - **Running another task** (Linux: `prev` is busy): ask for an idle,
+///   allowed sibling and move the task there.
+/// - **Not rescheduling** ([`cpu_not_rescheduling`]: awake, no scheduling
+///   point for `NOT_RESCHEDULING_NS`, perhaps with interrupts masked, so an
+///   IPI to it does nothing): the task must not stay. Move it to an idle
+///   sibling; if it cannot be moved from here (a contended queue, or a slot
+///   the wake-time move does not take), IPI that idle CPU instead, and its
+///   steal pass pulls the wake (Linux `kick_ilb`): the stalled CPU's own tick
+///   is not relied on, since it may take none.
+///
+/// For a busy or stalled `home` the core falls back to `select_idle_sibling`
+/// when the policy names no CPU, so a policy without a placement model cannot
+/// strand a wake. A wake whose `home` is the waker's own CPU keeps today's
+/// shape (the waker returns to that executor), as does a self-wake.
+///
+/// At most one IPI per wake: to the halted `home`, to the destination of a
+/// move (`enqueue_on`'s first-entry kick), or to the idle CPU asked to pull.
+/// A reschedule request to an awake `home` sends none.
+///
+/// Runs in the raw-waker path (possibly IRQ context): allocation-free,
+/// non-blocking (`try_lock`), bounded CPU scan. Any contention falls back to
+/// the plain kick, so a wake is never dropped.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Option<u32>) {
-    // A self-rearm is not newly runnable peer work.
-    if CURRENT_TASK
-        .get(home as usize)
-        .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
+    // A self-rearm is not newly runnable peer work. A bridge waker has no
+    // task id: zero also means no task is running, so it is never a self-wake.
+    if task != TaskId::NONE.raw()
+        && CURRENT_TASK
+            .get(home as usize)
+            .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
     {
         return;
     }
-    // Placement is only actionable with migration enabled and a BUSY home. An
-    // idle home is already being IPI'd to run the task itself (the cache-warm,
-    // hot ping-pong path) — never migrate off an idle home.
+    let h = home as usize;
     if !STEAL_ENABLED.load(Ordering::Acquire)
-        || (home as usize) >= CPU_HALTED.len()
-        || CPU_HALTED[home as usize].load(Ordering::SeqCst)
+        || h >= CPU_HALTED.len()
+        || CPU_HALTED[h].load(Ordering::SeqCst)
     {
         notify_wake_cpu_once(home, notified);
         return;
     }
-    // Home is awake, but "not halted" is NOT the same as "backlogged": an
-    // executor spinning on an empty queue picks a kicked wake up immediately
-    // and cache-hot, while migration pays a cross-queue move plus — for a
-    // halted destination — a full HLT wakeup. Migrate only when home has a
-    // REAL backlog: at least one OTHER fresh wake since home's executor last
-    // began a dispatch round (the exit-storm shape placement exists for —
-    // wakes arriving faster than dispatch — crosses this on its second
-    // queued wake). `WAKE_PRESSURE[home]` counts this wake too (the waker
-    // bumped it before dispatching here), so `< 2` means "only this wake":
-    // kick home. Without a backlog gate the futexbench5 cold-wake chain
-    // regressed 3.7 -> 9.5 µs/wake — every wake whose home happened to be
-    // polling was pushed to a HALTED sibling and paid its HLT latency. The
-    // counter replaces this gate's first shape (a READY[home] lock + slot
-    // scan per wake), whose lock acquisition was itself worth ~1.5 µs on
-    // the cold-wake path.
-    if WAKE_PRESSURE[home as usize].load(Ordering::Acquire) < 2 {
+    let me = narf_lib::percpu::current_cpu();
+    let remote = h != me;
+    let not_rescheduling = remote && cpu_not_rescheduling(h, narf_time::now_cycles());
+    let running_other = remote && {
+        let current = CURRENT_TASK[h].0.load(Ordering::Acquire);
+        current != TaskId::NONE.raw() && current != task
+    };
+    // Home is awake, but "not halted" is NOT the same as "busy": an executor
+    // spinning on an empty queue picks a kicked wake up immediately and
+    // cache-hot, while migration pays a cross-queue move plus — for a halted
+    // destination — a full HLT wakeup. Without a task running there, migrate
+    // only on a REAL backlog: at least one OTHER fresh wake since home's
+    // executor last began a dispatch round. `WAKE_PRESSURE[home]` counts this
+    // wake too, so `< 2` means "only this wake". Without that gate the
+    // futexbench5 cold-wake chain regressed 3.7 -> 9.5 µs/wake.
+    let backlog = WAKE_PRESSURE[h].load(Ordering::Acquire) >= 2;
+    if !not_rescheduling && !running_other && !backlog {
         notify_wake_cpu_once(home, notified);
         return;
     }
@@ -5673,28 +6314,116 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
     let allowed = |c: CpuId| allowed_set.is_none_or(|set| set.contains(c));
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
     let is_idle = |c: crate::affinity::CpuId| {
-        (c.0 as usize) < CPU_HALTED.len()
-            && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
+        cpu_halted_and_schedulable(c.0 as usize)
             && !wake_notification_pending(c.0 as usize)
             && !wake_list_pending(c.0 as usize)
     };
     let home_id = crate::affinity::CpuId(home);
-    let waker = crate::affinity::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let waker = crate::affinity::CpuId(me as u32);
     let target = policy::try_with_scheduler(home_id, |scheduler| {
         scheduler.and_then(|s| s.select_task_rq(home_id, waker, &is_online, &is_idle, &allowed))
     })
-    .flatten();
-    match target {
-        Some(t) if t.0 != home && allowed(t) => {
-            // CORE mechanism: migrate to the policy-selected CPU; on success
-            // `enqueue_on` kicked it. Any contention → kick `home` so the wake
-            // still lands (never dropped).
-            if !try_migrate_wakee_to(home, t.0, cell) {
-                notify_wake_cpu_once(home, notified);
-            }
-        }
-        _ => notify_wake_cpu_once(home, notified),
+    .flatten()
+    .or_else(|| {
+        (not_rescheduling || running_other)
+            .then(|| policy::select_idle_sibling(home_id, waker, &is_online, &is_idle, &allowed))
+            .flatten()
+    });
+    let Some(t) = target.filter(|t| t.0 != home && allowed(*t)) else {
+        notify_wake_cpu_once(home, notified);
+        return;
+    };
+    // CORE mechanism: move to the selected idle CPU; on success `enqueue_on`
+    // kicked it.
+    if try_migrate_wakee_to(home, t.0, cell) {
+        note_wake_placement(WakePlacement::Moved);
+        return;
     }
+    // Not moved. A busy home that is rescheduling runs it at its next round.
+    notify_wake_cpu_once(home, notified);
+    if not_rescheduling {
+        // A stalled home does not: ask the idle CPU to come and pull it. The
+        // pull's own rules apply (`try_steal_staged`); a stalled victim lifts
+        // its floor and its cache-hot window.
+        notify_wake_cpu_once(t.0, notified);
+        note_wake_placement(WakePlacement::PullKick);
+    }
+}
+
+/// Whether `cpu` is halted in the executor's idle path and will run a steal
+/// pass when kicked: halted, and `Active` or `Idle` (a logically offlined CPU
+/// also publishes itself halted but parks without stealing).
+#[inline]
+fn cpu_halted_and_schedulable(cpu: usize) -> bool {
+    cpu < CPU_HALTED.len()
+        && CPU_HALTED[cpu].load(Ordering::SeqCst)
+        && !BRIDGE_HALTED[cpu].load(Ordering::SeqCst)
+        && matches!(
+            policy::cpu_state(CpuId(cpu as u32)),
+            CpuState::Active | CpuState::Idle
+        )
+}
+
+/// Enqueuer-side half of the idle kick: `victim` was just given a runnable
+/// task (`allowed` is its hard affinity) and is not rescheduling, so the task
+/// would wait for it. IPI the nearest halted, schedulable, allowed CPU whose
+/// last kick has been consumed, so its steal pass pulls the task (Linux
+/// `nohz_balancer_kick` → `kick_ilb`, issued here by the enqueuer because the
+/// victim's own tick may never come). Returns whether a CPU was kicked.
+fn kick_idle_puller(victim: usize, allowed: u64) -> bool {
+    if !STEAL_ENABLED.load(Ordering::Acquire) || victim >= narf_lib::percpu::MAX_CPUS {
+        return false;
+    }
+    let candidates = narf_lib::smp::online_bitmap() & allowed;
+    let ready = |target: usize| {
+        cpu_halted_and_schedulable(target) && !NEED_RESCHED[target].load(Ordering::Relaxed)
+    };
+    match idle_balance_kick_target(victim, candidates, ready) {
+        Some(target) => {
+            resched_remote(target);
+            note_wake_placement(WakePlacement::PullKick);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How a wake or enqueue avoided a CPU that would have held it.
+#[derive(Clone, Copy)]
+enum WakePlacement {
+    /// Moved at wake time to an idle CPU.
+    Moved,
+    /// An idle CPU was IPI'd to pull it.
+    PullKick,
+}
+
+#[cfg(feature = "kernel-test")]
+static WAKE_PLACEMENTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[inline]
+fn note_wake_placement(kind: WakePlacement) {
+    #[cfg(feature = "kernel-test")]
+    WAKE_PLACEMENTS[kind as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(feature = "kernel-test"))]
+    let _ = kind;
+}
+
+/// `(moved at wake time, idle CPUs kicked to pull)` since boot.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_wake_placements() -> (u64, u64) {
+    (
+        WAKE_PLACEMENTS[WakePlacement::Moved as usize].load(Ordering::Relaxed),
+        WAKE_PLACEMENTS[WakePlacement::PullKick as usize].load(Ordering::Relaxed),
+    )
+}
+
+/// Reschedule IPIs `cpu` has sent since boot.
+#[doc(hidden)]
+pub fn __test_resched_ipis_sent(cpu: usize) -> u64 {
+    SCHEDULER_TELEMETRY.get(cpu).map_or(0, |telemetry| {
+        telemetry.resched_sent.load(Ordering::Relaxed)
+    })
 }
 
 unsafe fn drop_raw(data: *const ()) {
@@ -6118,6 +6847,77 @@ fn idle_wait(next_deadline: Option<u64>) {
     credit_idle_since(narf_lib::percpu::current_cpu(), t0);
 }
 
+/// The `block_on` bridge's halt: `idle_wait(None)` made race-free the way
+/// the executor's idle commit is.
+///
+/// Two wakes used to be lost here, each costing the bridged future a wait
+/// until this CPU's next unrelated interrupt (on a tickless CPU, the next
+/// armed timer):
+///
+/// 1. Same-CPU IRQ-before-HLT: the awake check and the `hlt` ran with IRQs
+///    enabled, so a device interrupt that completed the future's wait in
+///    between was serviced, then the CPU halted anyway (the executor's
+///    "BUG FIX (intermittent permanent SMP wedge)" race, in a second
+///    place). An NVMe completion lands right after the poll that posted
+///    it — inside that window often enough to stall whole boot mounts.
+/// 2. Cross-CPU wake without a kick: `resched_remote` sends its IPI only
+///    to a CPU published as halted, and the bridge published nothing, so a
+///    wake from another CPU's interrupt or task set the awake flag and
+///    left this CPU in `hlt`.
+///
+/// Linux parity: a task blocked in `wait_for_completion` lets its CPU
+/// idle through the scheduler, whose idle entry is `sti;hlt` after
+/// `need_resched()` under `local_irq_disable()` and whose
+/// `TIF_POLLING_NRFLAG` / `set_nr_and_not_polling` handshake makes
+/// `try_to_wake_up` IPI an idle CPU. Here: IRQs masked, `CPU_HALTED` (and
+/// [`BRIDGE_HALTED`], for placement) published, SeqCst fence, re-check of
+/// the awake flag and the `NEED_RESCHED` request (consumed, as the
+/// executor's commit consumes it), then `idle_halt_then_disable`
+/// (`sti;hlt;cli`) so an IPI or device IRQ that raced into the window is
+/// taken by the halt itself. The waker's side is `resched_remote`,
+/// unchanged: flag, fence, load `CPU_HALTED` → IPI.
+///
+/// Off a reliable tick, or with IRQs already masked, the old bounded spin
+/// stays (nothing to race against: no `hlt`).
+// Out of line: `block_on_inner` is a generic `#[inline]` and inlines into
+// every caller's frame; the halt path is cold and must not add to those
+// frames (the kernel stack-frame budget caught it in six drivers).
+#[inline(never)]
+fn bridge_idle_wait(awake: &WakeCell) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= BRIDGE_HALTED.len() || !narf_time::tick_reliable() || !narf_arch::interrupts_enabled()
+    {
+        idle_wait(None);
+        return;
+    }
+    let t0 = narf_time::now_cycles();
+    // SAFETY: re-enabled below on every path; masking IRQs across the
+    // check and the halt is what closes race 1.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    // Placement flag first, so no waker ever observes "halted executor"
+    // without "in a bridge" for this CPU.
+    BRIDGE_HALTED[cpu].store(true, Ordering::SeqCst);
+    CPU_HALTED[cpu].store(true, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let woke = awake.flag.load(Ordering::SeqCst) || NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
+    if !woke {
+        // SAFETY: IRQs are masked (above) and the final check passed;
+        // returns with IRQs masked.
+        unsafe {
+            narf_arch::idle_halt_then_disable();
+        }
+    }
+    CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+    BRIDGE_HALTED[cpu].store(false, Ordering::SeqCst);
+    // SAFETY: restores the enabled state this function was entered with.
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
+    credit_idle_since(cpu, t0);
+}
+
 #[inline]
 fn idle_wait_inner(next_deadline: Option<u64>) {
     if narf_time::tick_reliable() {
@@ -6326,6 +7126,9 @@ pub fn run_until_empty() {
     let mut address_space_handoff = AddressSpaceHandoff::default();
 
     loop {
+        // One owner-CPU store: this CPU's executor is still passing through
+        // its scheduling loop.
+        note_sched_pass(cpu);
         // Logical hot-unplug publishes Draining before inspecting/migrating
         // the queue. Stop dispatching new slots so the control CPU observes a
         // stable quiescent queue; an already-running slot makes the operation
@@ -6492,6 +7295,8 @@ pub fn run_until_empty() {
                 *active = slot.addr_space.take();
             }
             let poll_result = poll_with_domain(&mut slot, &mut ctx);
+            // The polled task returned to the executor: a scheduling point.
+            note_sched_pass(cpu);
             let borrowed = budget_dispatch.is_some_and(|view| {
                 clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
             });
@@ -6660,11 +7465,14 @@ pub fn run_until_empty() {
         // Sleeping residents still require timer-wheel and sleep-pump service
         // below. Returning to run_forever's truly-empty halt would bypass that
         // maintenance and could strand a deadline with no runnable slot.
+        // Idle workqueue workers waiting for work are not residents with
+        // work to do: a CPU parking only those is empty (they are woken by a
+        // queueing, which re-enters the executor like any wake).
         let local_empty = ready_empty
             && PARKED[cpu]
                 .lock()
                 .as_ref()
-                .is_none_or(|parked| parked.len() == 0);
+                .is_none_or(|parked| parked.busy_len() == 0);
         if !local_dispatchable {
             if try_steal_one(cpu) {
                 continue;
@@ -6961,6 +7769,7 @@ pub fn run_until_empty() {
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
                 if race_free_halt {
                     // SAFETY: restore the IRQ state we masked above; a wake is
                     // already pending so we loop straight back to polling.
@@ -6994,6 +7803,7 @@ pub fn run_until_empty() {
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
                 // SAFETY: restore the IRQ state to the idle path's natural
                 // enabled state (it was enabled before we masked it).
                 unsafe {
@@ -7014,6 +7824,7 @@ pub fn run_until_empty() {
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
             }
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
@@ -7057,6 +7868,12 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
         if narf_time::now_cycles() >= d {
             return true;
         }
+    }
+    // This CPU is the timer migrator of a group whose idle CPU has a due
+    // global timer (`tmigr_requires_handle_remote`): the executor round runs
+    // it, so a CPU-bound task must yield as for its own timers.
+    if narf_time::timer_migration::requires_handle_remote() {
+        return true;
     }
     // A cross-core wake is staged for this CPU (Linux `rq->wake_list`).
     if wake_list_pending(cpu) {
@@ -7320,25 +8137,59 @@ fn try_steal_one(cpu: usize) -> bool {
         None => return false,
     };
 
-    let max = narf_lib::percpu::MAX_CPUS;
     let online = narf_lib::smp::online_bitmap() & !(1u64 << cpu);
+    try_steal_among(cpu, strategy.as_ref(), online, narf_lib::smp::is_online)
+}
 
+/// One steal search by `cpu` under `strategy` over the victims in `online`,
+/// each re-checked with `still_online` just before it is probed. The body of
+/// [`try_steal_one`], separate so the strand smokes can aim a policy at a CPU
+/// index that is not really online.
+fn try_steal_among(
+    cpu: usize,
+    strategy: &dyn crate::steal::StealStrategy,
+    online: u64,
+    still_online: impl Fn(u32) -> bool,
+) -> bool {
+    let max = narf_lib::percpu::MAX_CPUS;
     let thief = crate::affinity::CpuId(cpu as u32);
-    let idle = |id| policy::cpu_state(id) == CpuState::Idle;
+    // Wakes staged on a victim (its wake inbox and woken parked tasks) are
+    // runnable work a thief may pull (`try_steal_staged`), so the policies'
+    // hints count them: a CPU holding staged wakes is not an idle CPU that
+    // will serve them itself — it may be stuck in executor maintenance with
+    // its state still `Idle` — and its queued load includes them, as
+    // `select_fork_cpu` counts them. Without this a policy that skips idle or
+    // empty-queued donors would never visit a stalled CPU whose only work is
+    // staged. Two gauge loads per hint; the pull itself re-checks everything.
+    let staged = |cpu: usize| {
+        WAKE_INBOX_LEN
+            .get(cpu)
+            .map_or(0, |len| len.load(Ordering::Acquire))
+            .saturating_add(
+                PARKED_WAKE_INBOX
+                    .get(cpu)
+                    .map_or(0, |inbox| inbox.len.load(Ordering::Acquire)),
+            )
+    };
+    let idle = |id: CpuId| policy::cpu_state(id) == CpuState::Idle && staged(id.0 as usize) == 0;
+    // The owner's dispatch scan republishes the peer hint from its ready
+    // queue alone and can clear it over a wake staged just after its drain.
     let runnable = |id: CpuId| {
         RUNNABLE_STATE
             .get(id.0 as usize)
             .is_some_and(|state| state.peer.load(Ordering::Acquire))
+            || staged(id.0 as usize) != 0
     };
     let node = |id: CpuId| narf_acpi::cpu_node(id.0);
     let queued = |id: CpuId| {
         // Two-choice policies sample only their candidates. No global scan or
         // new enqueue counter; locks are released before the policy visits.
-        READY
+        let ready = READY
             .get(id.0 as usize)?
             .try_lock()?
             .as_ref()
-            .map(|q| q.len())
+            .map(|q| q.len())?;
+        Some(ready.saturating_add(staged(id.0 as usize)))
     };
     let context = steal::StealContext::new(
         online,
@@ -7351,12 +8202,8 @@ fn try_steal_one(cpu: usize) -> bool {
     );
     let mut moved = false;
     strategy.visit_victims(thief, &context, &mut |victim| {
-        if !moved
-            && (victim.0 as usize) < max
-            && victim != thief
-            && narf_lib::smp::is_online(victim.0)
-        {
-            moved = try_steal_from(victim.0 as usize, cpu, strategy.as_ref());
+        if !moved && (victim.0 as usize) < max && victim != thief && still_online(victim.0) {
+            moved = try_steal_from(victim.0 as usize, cpu, strategy);
         }
         moved
     });
@@ -7394,6 +8241,10 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
     // makes "skip a contended victim" correct: the slot stays for the lock
     // holder or another thief. `None` (slot contended) => this victim yields
     // nothing, same as an empty/contended queue.
+    //
+    // Set once the ready queue has been scanned: how many of its slots could be
+    // dispatched now. Left `None` when a lock was contended.
+    let mut ready_dispatchable = None;
     let stolen = policy::try_with_scheduler(victim_id, |scheduler| {
         // Non-blocking: a contended victim queue is skipped, never spun
         // on. Spinning here holds IRQs masked (IrqSafeSpinLock), which on
@@ -7434,6 +8285,7 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
                 }
             }
         }
+        ready_dispatchable = Some(dispatchable);
         if !victim_has_stealable_surplus(victim_running, dispatchable) {
             return None;
         }
@@ -7481,7 +8333,374 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
         return true;
     }
-    false
+    // The ready queue offered nothing. If it was actually examined (not just
+    // contended, which means its owner or another thief is at it right now),
+    // look at the wakes the victim has staged but not yet activated.
+    match ready_dispatchable {
+        Some(dispatchable) => try_steal_staged(victim, cpu, strategy, dispatchable),
+        None => false,
+    }
+}
+
+/// Most staged entries one pull judges in each holding place. It bounds how
+/// long a thief keeps a victim's inbox lock or gate, both of which wakers take
+/// with interrupts masked.
+///
+/// The window is not fixed at the front. A pull that judges a full window and
+/// takes nothing starts the next pull on that victim one window further on,
+/// and wraps at the end (`StagedWatch::{inbox_skip, parked_skip}`), so entries
+/// no thief may take — pinned to the victim, cache-hot, throttled, directly
+/// claimed, or stale — do not hide the entries behind them however long the
+/// victim stays stalled. The two holding places are ordered differently: the
+/// wake inbox is a queue and is scanned oldest first; the parked-wake list is
+/// a stack and is scanned newest first.
+const STAGED_STEAL_SCAN: usize = 32;
+
+/// How far down a victim's parked-wake list the window may start. The thief
+/// has to walk to the window under the gate, one pointer per node, so the
+/// reach is bounded: the newest `STAGED_PARKED_REACH + STAGED_STEAL_SCAN`
+/// (128) nodes are reachable by successive pulls, older ones only once newer
+/// ones have left. The wake inbox is indexed and has no such bound.
+const STAGED_PARKED_REACH: usize = 3 * STAGED_STEAL_SCAN;
+
+/// Where the next pull on one victim starts in each of its holding places.
+/// Thieves write it, the victim never touches it, so it costs the victim's
+/// scheduling paths nothing; a thief reaches it only for a victim whose ready
+/// queue offered nothing. Concurrent thieves race benignly.
+#[repr(align(64))]
+struct StagedWatch {
+    /// Where the next pull's window starts in the victim's wake inbox,
+    /// counted from the oldest entry.
+    inbox_skip: AtomicUsize,
+    /// The same for its parked-wake list, counted from the newest node.
+    parked_skip: AtomicUsize,
+}
+
+static STAGED_WATCH: [StagedWatch; narf_lib::percpu::MAX_CPUS] = [const {
+    StagedWatch {
+        inbox_skip: AtomicUsize::new(0),
+        parked_skip: AtomicUsize::new(0),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+/// Where this pull's window starts in a holding place of `len` entries, given
+/// where the last fruitless pull left `cursor`. A cursor past the end, or past
+/// `reach`, starts over at the front.
+#[inline]
+fn staged_window_start(cursor: &AtomicUsize, len: usize, reach: usize) -> usize {
+    let start = cursor.load(Ordering::Relaxed);
+    if start >= len || start > reach {
+        0
+    } else {
+        start
+    }
+}
+
+/// Leave `cursor` for the next pull. A pull that took an entry keeps its
+/// window: the entry behind the taken one has moved into it. One that took
+/// nothing moves a window on, or back to the front when there is no further
+/// window within `len` and `reach`.
+#[inline]
+fn staged_window_advance(cursor: &AtomicUsize, start: usize, len: usize, reach: usize, took: bool) {
+    let moved_on = start.saturating_add(STAGED_STEAL_SCAN);
+    let next = if took {
+        start
+    } else if moved_on < len && moved_on <= reach {
+        moved_on
+    } else {
+        0
+    };
+    if cursor.load(Ordering::Relaxed) != next {
+        cursor.store(next, Ordering::Relaxed);
+    }
+}
+
+impl StagedWatch {
+    /// Nothing is staged: the windows start over at the front.
+    #[inline]
+    fn forget(&self) {
+        if self.inbox_skip.load(Ordering::Relaxed) != 0 {
+            self.inbox_skip.store(0, Ordering::Relaxed);
+        }
+        if self.parked_skip.load(Ordering::Relaxed) != 0 {
+            self.parked_skip.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Idle balance over woken tasks `victim` has not activated yet (Linux
+/// `sched_balance_newidle`, extended to what Linux would already have on the
+/// run queue).
+///
+/// A woken task is in one of three places: `READY[victim]`, `WAKE_INBOX[victim]`
+/// (another CPU enqueued it) or `PARKED[victim]` with a node on
+/// `PARKED_WAKE_INBOX[victim]` (it was asleep). Only the owner moves the last
+/// two into `READY`, at an executor boundary. While the owner is inside a
+/// non-yielding section those tasks are runnable but unreachable, so an idle
+/// thief takes one directly.
+///
+/// The rules are the ready-queue steal's, unchanged: the task must be
+/// dispatchable, permitted by the strategy (hard affinity at least), outside
+/// the cache-hot window, and the victim must keep one runnable or running task
+/// — with staged wakes now counted as runnable, as `select_fork_cpu` already
+/// counts them. A healthy CPU that is idle with a single staged wake is
+/// therefore left to take it itself; it has been kicked. A victim that is not
+/// rescheduling ([`cpu_not_rescheduling`]) keeps neither its last wake nor a
+/// hot one: nothing it holds runs until it comes back. The count is of
+/// tasks: the parked-wake gauge counts nodes, and a node can outlive its wake,
+/// so the woken sleepers are judged first and the floor is applied to what
+/// they turn out to be before anything is taken from either place.
+///
+/// The parked case decides ownership under `PARKED[victim]`, the lock the
+/// owner's drain, a direct-handoff claim and wake-time placement all take, so
+/// exactly one of them gets the slot. The staged nodes only say where to look:
+/// they are pinned under the inbox gate, which is released before anything is
+/// evaluated, so the gate stays a leaf held for pointer work alone. Whatever
+/// happened to a node in between, the parked set is the authority — a node
+/// whose task has left, gone back to sleep or been claimed selects nothing.
+///
+/// An idle CPU never waits on a victim: the wake inbox, the gate (to pin) and
+/// the parked set are all only tried, and a contended one ends the attempt.
+/// The single exception comes after the decision. Once the thief has taken a
+/// parked slot it must unlink that task's node before the task runs anywhere,
+/// and for that it waits for the gate — a leaf whose holders link, unlink or
+/// pin and release without taking another lock or calling out — holding no
+/// other lock of the victim while it does.
+///
+/// The wake-inbox case has to judge slots in place, so the eligibility checks
+/// (budget view, steal strategy) run under the inbox lock, as the ready-queue
+/// steal runs them under the ready-queue lock. No scheduler ownership lock is
+/// taken while it is held.
+fn try_steal_staged(
+    victim: usize,
+    cpu: usize,
+    strategy: &dyn crate::steal::StealStrategy,
+    ready_dispatchable: usize,
+) -> bool {
+    let enqueued = WAKE_INBOX_LEN[victim].load(Ordering::Acquire);
+    let woken = PARKED_WAKE_INBOX[victim].len.load(Ordering::Acquire);
+    let watch = &STAGED_WATCH[victim];
+    if enqueued == 0 && woken == 0 {
+        watch.forget();
+        return false;
+    }
+    let victim_id = crate::affinity::CpuId(victim as u32);
+    let now = narf_time::now_cycles();
+    let running = cpu_running_task(victim_id);
+    // Awake and past no scheduling point for `NOT_RESCHEDULING_NS`, by the
+    // victim's own pass stamp: inside a long poll or kernel section, or stuck
+    // in executor maintenance (deferred destructors, slab drain, sleep pumps,
+    // timer wheel, where `CURRENT_TASK` is clear), possibly with interrupts
+    // masked. What is staged there waits for it.
+    let stalled = cpu_not_rescheduling(victim, now);
+    // The floor: taking one task must leave the victim a runnable or running
+    // one. With `runnable` staged-or-queued tasks that holds when there are
+    // two, or one and the victim is busy — running a task, or stalled. A
+    // healthy idle CPU keeps its last wake; it has been kicked and is about
+    // to run it.
+    let floor_allows = |runnable: usize| runnable > 1 || (runnable == 1 && (running || stalled));
+    // First on the gauges, without a lock. They can only overcount — a node
+    // is counted whether or not its task is still runnable — so a refusal
+    // here is final, and an acceptance is checked again below against the
+    // tasks themselves.
+    if !floor_allows(
+        ready_dispatchable
+            .saturating_add(enqueued)
+            .saturating_add(woken),
+    ) {
+        return false;
+    }
+    let thief = crate::affinity::CpuId(cpu as u32);
+    let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
+    // The cache-hot window protects a warm cache the task would get back
+    // shortly. A stalled victim gives it nothing back: the task waits however
+    // warm its cache is (Linux likewise migrates a hot task once balancing on
+    // its behalf keeps failing, `nr_balance_failed > cache_nice_tries`).
+    let stealable = |slot: &TaskSlot| {
+        slot_is_dispatchable(slot, now)
+            && (stalled
+                || !task_is_migration_hot(
+                    slot.awake.last_run_cycles.load(Ordering::Acquire),
+                    now,
+                    migration_cost,
+                ))
+            && strategy.allow_steal(thief, &crate::policy::TaskMeta::from_slot_at(slot, now))
+    };
+
+    // Woken parked tasks first, found through their activation nodes: judging
+    // them is also what turns the node count into a task count, which the
+    // floor needs before anything is taken from either place.
+    if woken != 0 {
+        let mut pinned = [core::ptr::null::<WakeCell>(); STAGED_STEAL_SCAN];
+        let mut count = 0;
+        let start = staged_window_start(&watch.parked_skip, woken, STAGED_PARKED_REACH);
+        {
+            let inbox = &PARKED_WAKE_INBOX[victim];
+            // Like every other lock on the victim, the gate is only tried: a
+            // waker or another thief is at this inbox right now, and an idle
+            // CPU never spins on a victim.
+            let Some(_gate) = inbox.gate.try_lock() else {
+                return false;
+            };
+            let mut node = inbox.head.load(Ordering::Relaxed).cast_const();
+            // Walk to the window. `woken` was read before the gate, so the
+            // list may have become shorter; then the window is empty and the
+            // cursor goes back to the front below.
+            for _ in 0..start {
+                if node.is_null() {
+                    break;
+                }
+                // SAFETY: linked under the gate, hence kept alive by the
+                // inbox's reference; links change only under the gate.
+                node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
+            }
+            while !node.is_null() && count < STAGED_STEAL_SCAN {
+                // SAFETY: a node linked under the gate is kept alive by the
+                // inbox's reference; this takes one more for the thief, so
+                // the cell outlives the gate whatever the owner's drain does
+                // next. Links change only under the gate.
+                unsafe {
+                    Arc::increment_strong_count(node);
+                    pinned[count] = node;
+                    node = (*node).wake_next.load(Ordering::Relaxed);
+                }
+                count += 1;
+            }
+        }
+        // `None`: the parked set is contended and nothing could be counted.
+        // Otherwise whether the floor allows a take, and the slot taken.
+        let judged = PARKED[victim].try_lock().map(|mut parked| {
+            let Some(slots) = parked.as_mut() else {
+                return (false, None);
+            };
+            let mut real = 0usize;
+            let mut candidate = None;
+            for node in &pinned[..count] {
+                // SAFETY: pinned above until the loop after this lock scope.
+                let cell = unsafe { &**node };
+                // `for_cell` matches the token, the task id and the cell
+                // itself, so a node whose task has left selects nothing.
+                let Some((index, entry)) = slots.for_cell(victim, cell) else {
+                    continue;
+                };
+                // A node can outlive its wake: the task ran under a direct
+                // handoff and sleeps again, or is being run that way now.
+                if !entry.slot.awake.executor_runnable() {
+                    continue;
+                }
+                real += 1;
+                if candidate.is_none() && stealable(&entry.slot) {
+                    candidate = Some((index, entry.slot.id, *node));
+                }
+            }
+            // Nodes outside this window are taken at face value.
+            let runnable = ready_dispatchable
+                .saturating_add(enqueued)
+                .saturating_add(real)
+                .saturating_add(woken.saturating_sub(count));
+            if !floor_allows(runnable) {
+                return (false, None);
+            }
+            let taken =
+                candidate.and_then(|(index, id, node)| Some((slots.take(index, id)?.slot, node)));
+            (true, taken)
+        });
+        // The slot is the thief's now and its parked token is clear, so
+        // nothing can link the node again; take it off the victim's list
+        // before the task goes anywhere. This is the one acquisition on the
+        // victim that waits. By now it cannot be skipped — the task must not
+        // run with its node left behind — and what it waits for is a leaf:
+        // whoever holds the gate links or unlinks a node, or pins a window,
+        // and lets go without taking another lock or calling out.
+        // `PARKED[victim]` is no longer held while it waits.
+        let judged = judged.map(|(allowed, taken)| {
+            let slot = taken.map(|(slot, node)| {
+                // SAFETY: still pinned; the pins are dropped just below.
+                unlink_parked_wake(victim, unsafe { &*node });
+                slot
+            });
+            (allowed, slot)
+        });
+        // Outside every lock: a pin can be the last reference to a cell whose
+        // task exited after the gate was released.
+        for node in &pinned[..count] {
+            // SAFETY: each entry holds the reference taken under the gate.
+            unsafe { Arc::decrement_strong_count(*node) };
+        }
+        let Some((allowed, taken)) = judged else {
+            return false;
+        };
+        if !allowed {
+            return false;
+        }
+        // An empty window means the list ended before it; count it as the end.
+        let seen_len = if count == 0 { 0 } else { woken };
+        staged_window_advance(
+            &watch.parked_skip,
+            start,
+            seen_len,
+            STAGED_PARKED_REACH,
+            taken.is_some(),
+        );
+        if let Some(slot) = taken {
+            note_staged_pull();
+            enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
+            return true;
+        }
+    }
+
+    // Cross-CPU enqueues. Every entry is a runnable task, so the gauge the
+    // floor was checked against is exact for this place. The victim has not
+    // admitted these yet (its policy sees them at drain), so there is no
+    // dequeue to report; the thief admits the task as the victim would have.
+    if enqueued == 0 {
+        return false;
+    }
+    let taken = WAKE_INBOX[victim].try_lock().and_then(|mut inbox| {
+        let len = inbox.len();
+        let start = staged_window_start(&watch.inbox_skip, len, usize::MAX);
+        let position = inbox
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(STAGED_STEAL_SCAN)
+            .find_map(|(position, (slot, _))| stealable(slot).then_some(position));
+        staged_window_advance(
+            &watch.inbox_skip,
+            start,
+            len,
+            usize::MAX,
+            position.is_some(),
+        );
+        let taken = inbox.remove(position?);
+        WAKE_INBOX_LEN[victim].store(inbox.len(), Ordering::Release);
+        taken
+    });
+    let Some((slot, reason)) = taken else {
+        return false;
+    };
+    let reason = match reason {
+        policy::TaskEnqueueReason::Admitted => policy::TaskEnqueueReason::Admitted,
+        _ => policy::TaskEnqueueReason::Migrated,
+    };
+    note_staged_pull();
+    enqueue_on(cpu, slot, reason);
+    true
+}
+
+#[inline]
+fn note_staged_pull() {
+    let pulls = &local_scheduler_telemetry().staged_pulls;
+    pulls.store(
+        pulls.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
+/// Staged wakes pulled by idle CPUs since boot, summed over CPUs.
+#[doc(hidden)]
+pub fn __test_staged_pulls() -> u64 {
+    sum_scheduler_telemetry(|telemetry| &telemetry.staged_pulls)
 }
 
 /// Worker-AP entry: the per-CPU run loop that an AP enters after
@@ -7522,6 +8741,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
     if matches!(state_after_publish, CpuState::Active | CpuState::Idle) {
         CPU_HALTED[cpu].store(false, Ordering::SeqCst);
         narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+        narf_rcu::exit_idle();
         if interrupts_were_enabled {
             // SAFETY: restores the state masked above.
             unsafe { narf_arch::enable_interrupts() };
@@ -7546,6 +8766,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
     }
     CPU_HALTED[cpu].store(false, Ordering::SeqCst);
     narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+    narf_rcu::exit_idle();
     if interrupts_were_enabled {
         // SAFETY: restores the state masked above.
         unsafe { narf_arch::enable_interrupts() };
@@ -7654,6 +8875,7 @@ pub fn run_forever() -> ! {
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
             if race_free_halt {
                 // SAFETY: restore the IRQ state we masked above; work is
                 // already queued so we loop straight back to polling.
@@ -7677,6 +8899,7 @@ pub fn run_forever() -> ! {
             }
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
             // SAFETY: restore the enabled state this idle path runs with.
             unsafe {
                 narf_arch::enable_interrupts();
@@ -7699,6 +8922,7 @@ pub fn run_forever() -> ! {
             credit_idle_since(cpu, idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
         }
     }
 }
@@ -7862,6 +9086,7 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
 /// without the own-stack model) — the caller should then plain-spin.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
+#[track_caller]
 pub fn cooperative_yield() -> bool {
     stackful::cooperative_yield()
 }
@@ -7885,6 +9110,18 @@ pub fn cooperative_yield() -> bool {
 /// `read_poll_timeout` does, the condition is evaluated once more after
 /// the deadline has passed, so one that became true between the last
 /// check and the expiry is not reported as a timeout.
+/// What a sync→async bridge wait does between checks: the sleep pumps, and
+/// the timer softirq the executor round runs, so a waiter outside the
+/// executor (polled driver paths, `block_on` callers, boot-time tests)
+/// still sees timer-wheel timers — request timeouts — expire. Never
+/// inlined: `responsive_spin_until` is inlined into hundreds of driver
+/// waits, and this body must not land in each of their frames.
+#[inline(never)]
+fn bridge_pump() {
+    sleep_pumps::run();
+    let _ = narf_time::hrtimer::hrtimer_run_softirq();
+}
+
 #[inline]
 pub fn responsive_spin_until<F: FnMut() -> bool>(
     mut done: F,
@@ -7904,7 +9141,7 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
             return done;
         }
         if i & 0xFFF == 0 {
-            sleep_pumps::run();
+            bridge_pump();
         }
         core::hint::spin_loop();
         i = i.wrapping_add(1);
@@ -7936,8 +9173,94 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
 /// - The awaited future must be IRQ-driven or self-waking. A
 ///   future that depends on another scheduler task to make
 ///   progress will hang because block_on doesn't run the executor.
+///
+/// **A bridged wait takes interrupts.** Entered with IRQs masked from
+/// process context (the kernel-test harness on the BSP), `block_on`
+/// unmasks them for the wait and masks them again before it returns — see
+/// [`sleeping_wait_enter`] — and says so once on the console: no
+/// production path is known to do it.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     block_on_inner(fut, /* allow_halt = */ true)
+}
+
+/// Interrupt state of a [`block_on`] wait: a sleeping wait runs with
+/// interrupts deliverable, as Linux's do (`schedule()` from a task that
+/// sleeps in `wait_for_completion` / `wait_event` runs the CPU with IRQs
+/// enabled; sleeping with them masked is a `might_sleep` bug).
+///
+/// The bridge's idle is "halt until an IRQ". Entered with IRQs masked it
+/// could only spin — `halt_until_irq` with IF=0 is a pause — and no
+/// interrupt was ever taken on this CPU for the whole wait: a device
+/// interrupt targeting it stayed pending in the local APIC while its
+/// waiter, bridged here, waited for exactly that interrupt. The
+/// kernel-test harness runs on the BSP with IRQs masked and the BSP is
+/// every NVMe queue's MSI-X target, so every command a harness test
+/// awaited through `block_on` ended only at its 30 s timeout ("timeout,
+/// completion polled", `irq_missed`) — the racing-writers smoke crawled
+/// at one batch per 30 s. A self-waking future (a `yield_now` loop) never
+/// reached the idle at all, so masking around the idle alone would not
+/// do: the whole wait runs unmasked.
+///
+/// Not from interrupt context (a handler must not take nested IRQs, and
+/// must use [`block_on_spin`] anyway): there the state is left as is.
+/// The caller-holds-no-`IrqSafeSpinLock` rule of [`block_on`] is what
+/// makes unmasking sound — a handler on this CPU cannot spin on a lock
+/// the interrupted waiter holds.
+///
+/// The first masked entry is reported on the console and every one is
+/// counted ([`masked_bridge_entries`]): the kernel-test harness does it by
+/// design; anywhere else it is a caller worth knowing about, not a
+/// condition to absorb silently. (No call-site capture: `#[track_caller]`
+/// on `block_on` changes how it inlines into its callers, whose frames the
+/// kernel's frame budget bounds.)
+///
+/// Returns whether it unmasked; [`sleeping_wait_exit`] masks again.
+/// Out of line, and no drop guard: `block_on_inner` is inlined into every
+/// caller, whose stack frames the kernel's frame budget bounds.
+#[inline(never)]
+fn sleeping_wait_enter() -> bool {
+    let unmask = !narf_arch::interrupts_enabled()
+        && !narf_lib::context::in_irq()
+        && !narf_lib::context::in_trap_handler();
+    if unmask {
+        note_masked_bridge();
+        // SAFETY: process context (not in a handler), no IRQ-unsafe lock
+        // held by the `block_on` contract; the IDT / vector table and the
+        // interrupt controller are live before any bridged wait. Masked
+        // again by `sleeping_wait_exit` before `block_on` returns.
+        unsafe { narf_arch::enable_interrupts() };
+    }
+    unmask
+}
+
+static MASKED_BRIDGE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// How many `block_on` waits were entered with IRQs masked (and unmasked
+/// for the wait) since boot.
+pub fn masked_bridge_entries() -> u64 {
+    MASKED_BRIDGE_ENTRIES.load(Ordering::Relaxed)
+}
+
+/// Count a masked entry; report the first on the console.
+fn note_masked_bridge() {
+    use core::fmt::Write as _;
+    if MASKED_BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed) == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "sched: block_on entered with IRQs masked on CPU {}; unmasked for the wait \
+             (reported once; counted in masked_bridge_entries)",
+            narf_lib::percpu::current_cpu()
+        );
+    }
+}
+
+/// Undo [`sleeping_wait_enter`]: mask again when it unmasked.
+#[inline(never)]
+fn sleeping_wait_exit(unmasked: bool) {
+    if unmasked {
+        // SAFETY: restores the masked state `sleeping_wait_enter` found.
+        unsafe { narf_arch::disable_interrupts() };
+    }
 }
 
 /// Spin-only sync→async bridge. Same shape as [`block_on`] but
@@ -7981,6 +9304,10 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // again until the future completes.
     // SAFETY: Valid memory or trusted environment
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    // The halting bridge is a sleeping wait: interrupts are taken for its
+    // duration (see `sleeping_wait_enter`). The spinning one keeps the
+    // caller's masked state — that is what it is for.
+    let unmasked = allow_halt && sleeping_wait_enter();
     let awake = Arc::new(WakeCell {
         blocking_wake: AtomicBool::new(false),
         flag: AtomicBool::new(true),
@@ -7988,12 +9315,14 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         parked_location: AtomicUsize::new(NOT_PARKED),
         activation_queued: AtomicBool::new(false),
         wake_next: AtomicPtr::new(core::ptr::null_mut()),
+        wake_list: AtomicU64::new(0),
         // Nested block_on future: not a ready-queue slot, so no wake-next id.
         task: 0,
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
         user_rt: AtomicBool::new(false),
+        idle_worker: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(false),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
@@ -8007,20 +9336,28 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         // the poll body is observable on the next iteration.
         awake.flag.store(false, Ordering::Release);
         match fut.as_mut().poll(&mut ctx) {
-            Poll::Ready(v) => return v,
+            Poll::Ready(v) => {
+                sleeping_wait_exit(unmasked);
+                return v;
+            }
             Poll::Pending => {
                 // Tick the sleep pumps so cursor/FB/serial stay
                 // alive while we wait for an IRQ wake or self-
-                // wake from the future's busy-poll.
-                sleep_pumps::run();
+                // wake from the future's busy-poll, and expire the
+                // timer wheel as the executor round would (a future
+                // waiting on a timer-wheel timer is woken here, not
+                // by an executor that is not running).
+                bridge_pump();
                 if allow_halt && !awake.flag.load(Ordering::Acquire) {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
                     // own wake_by_ref) flips awake, then we return.
-                    // `idle_wait` HLTs on a reliable tick and
+                    // `bridge_idle_wait` HLTs race-free on a reliable
+                    // tick (the wake above re-checked under masked
+                    // IRQs with the halt published to wakers) and
                     // bounded-spins on the InitialCount fallback, so
                     // a dropped tick can't wedge a blocked caller.
-                    idle_wait(None);
+                    bridge_idle_wait(&awake);
                 } else {
                     // Spin path: re-poll immediately. Cheap
                     // back-off via spin_loop hint.

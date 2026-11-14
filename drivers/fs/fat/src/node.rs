@@ -1255,6 +1255,16 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
         None
     }
 
+    // No synchronous answer: `lookup`'s `None` is not proof of absence, so
+    // the fallible forms say so and the VFS caches nothing from them.
+    fn try_lookup(&self, _name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    fn try_lookup_dir(&self, _name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let mut scanner = DirectoryScanner::new(self.volume.clone(), {

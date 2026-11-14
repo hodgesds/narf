@@ -66,7 +66,7 @@ pub async fn read_checked<B: BlockDevice + 'static>(
     logical: u64,
     len: usize,
 ) -> Result<Vec<u8>, FsError> {
-    read_checked_for_cache(vol, csum_root, logical, len)
+    read_checked_for_cache(vol, csum_root, logical, len, None)
         .await
         .map(|(bytes, _)| bytes)
 }
@@ -74,11 +74,14 @@ pub async fn read_checked<B: BlockDevice + 'static>(
 /// The ordinary checked read, also reporting whether every sector actually
 /// had a checksum. Missing checksums are valid for nodatasum or newly staged
 /// data, but those bytes must not populate a cache of verified windows.
+/// `owner` is the `(inode, file offset)` of `logical`, which a repair of a
+/// bad mirror reports ([`crate::repair`]).
 pub(crate) async fn read_checked_for_cache<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     csum_root: u64,
     logical: u64,
     len: usize,
+    owner: Option<(u64, u64)>,
 ) -> Result<(Vec<u8>, bool), FsError> {
     if len == 0 {
         return Ok((Vec::new(), true));
@@ -98,7 +101,10 @@ pub(crate) async fn read_checked_for_cache<B: BlockDevice + 'static>(
     while sector < end {
         let bytes = match find_csum(vol, csum_root, sector, sectorsize).await? {
             Some(stored) => {
-                vol.read_logical_checked(sector, sectorsize as usize, &stored)
+                let owner = owner.map(|(ino, file_off)| {
+                    (ino, file_off.saturating_add(sector).saturating_sub(logical))
+                });
+                vol.read_logical_checked(sector, sectorsize as usize, &stored, owner)
                     .await?
             }
             None => {
@@ -125,7 +131,7 @@ pub async fn verify_file_data_csums<B: BlockDevice + 'static>(
 ) -> Result<bool, FsError> {
     let sectorsize = u64::from(vol.sectorsize());
     let extents = crate::btree::collect_for(vol, tree_root, ino, format::EXTENT_DATA_KEY).await?;
-    for (_key, body) in &extents {
+    for (key, body) in &extents {
         if body.len() < 53 || body[20] != format::FILE_EXTENT_REG {
             continue;
         }
@@ -134,13 +140,20 @@ pub async fn verify_file_data_csums<B: BlockDevice + 'static>(
         if disk_bytenr == 0 {
             continue; // hole
         }
+        // The file offset `disk_bytenr` itself would sit at.
+        let file_base = key.offset.saturating_sub(format::le64(body, 37)?);
         let mut off = 0u64;
         while off < disk_num_bytes {
             let logical = disk_bytenr + off;
             match find_csum(vol, csum_root, logical, sectorsize).await? {
                 Some(stored)
                     if vol
-                        .read_logical_checked(logical, sectorsize as usize, &stored)
+                        .read_logical_checked(
+                            logical,
+                            sectorsize as usize,
+                            &stored,
+                            Some((ino, file_base.saturating_add(off))),
+                        )
                         .await
                         .is_ok() => {}
                 _ => return Ok(false),

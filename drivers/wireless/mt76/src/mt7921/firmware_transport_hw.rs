@@ -612,6 +612,20 @@ impl Hardware {
         if !self.owner.published {
             return Err(Error::Busy);
         }
+        // mt7921e_tx_prepare_skb: the home station's data asks for a TX
+        // status every HZ/4, the source of its TX rate (fill_txs). An
+        // unused reservation is reused by the next frame.
+        let rate_pid = if link == crate::mt7921::vif_slots::Link::HOME {
+            let now = self.now_ns();
+            self.owner
+                .storage
+                .as_mut()
+                .ok_or(Error::Busy)?
+                .tx_sequence
+                .rate_pid(u16::from(link.peer()), now)
+        } else {
+            None
+        };
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
         let token = if pipelined {
             storage.tokens.available_pipelined()?
@@ -648,7 +662,9 @@ impl Hardware {
         if qos && self.hw_amsdu {
             packet_tx::set_hw_amsdu(&mut header);
         }
-        if let Some(pid) = sample_pid {
+        // The BA-restart sample owns the frame's status when armed.
+        let rate_pid = rate_pid.filter(|_| sample_pid.is_none());
+        if let Some(pid) = sample_pid.or(rate_pid) {
             crate::mt7921::tx_sequence::request(&mut header, pid)?;
         }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
@@ -669,6 +685,8 @@ impl Hardware {
         storage.tokens.begin_at(token, slot)?;
         if sample_pid.is_some() {
             storage.tx_sequence.begin(tid, token)?;
+        } else if rate_pid.is_some() {
+            storage.tx_sequence.begin_rate(token);
         }
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
@@ -838,6 +856,12 @@ impl Backend for Hardware {
     ) -> Result<(), Error> {
         self.check()?;
         super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
+    }
+    fn tx_rate_report(&self) -> Option<crate::mt7921::tx_sequence::RateReport> {
+        self.owner
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.tx_sequence.rate_report())
     }
     fn suspend_dma(&mut self) -> Result<(), Error> {
         self.update(GLOBAL, ENABLE, 0)?;
@@ -1410,7 +1434,11 @@ impl Backend for Hardware {
 /// Retained coherent MCU/FWDL transport with verified reset/recovery.
 #[derive(Debug)]
 pub struct Transport {
-    session: Session<Hardware>,
+    /// Boxed: the session (13.6 KiB, mostly the retained hardware state) made
+    /// a Transport moved by value — through Option, Result, Poll and KeyWork —
+    /// copy itself into every frame on the way (27 KiB frames in
+    /// provision_radio_inner, retire_for_removal, KeyWork::prepare).
+    session: alloc::boxed::Box<Session<Hardware>>,
     /// PCI binding generation this transport was claimed under.
     generation: u64,
 }
@@ -1677,7 +1705,7 @@ impl Transport {
                 ],
             };
             Ok(Self {
-                session: Session::new(
+                session: alloc::boxed::Box::new(Session::new(
                     Hardware {
                         mmio,
                         device,
@@ -1691,7 +1719,7 @@ impl Transport {
                         wake: wake::Wake::default(),
                     },
                     firmware,
-                ),
+                )),
                 generation,
             })
         })
@@ -1944,6 +1972,7 @@ impl Transport {
             security,
             extra_ies,
             crate::mt7921::p2p_wire::Network::Infrastructure,
+            false,
         )
         .await
     }
@@ -1957,14 +1986,23 @@ impl Transport {
         security: crate::mt7921::association::Security,
         extra_ies: &[u8],
         network: crate::mt7921::p2p_wire::Network,
+        heard_beacon: bool,
     ) -> Result<u16, Error> {
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         let info = match self.session.state {
             State::RadioReady(info) | State::ScanReady(info) => info,
             _ => return Err(Error::Busy),
         };
-        let permission = crate::mt7921::association::TxPermission::from_ap(&domain, info, bss)
-            .ok_or(Error::Authority)?;
+        super::apply_pmksa_requests(&mut self.session.pmksa);
+        // `heard_beacon`: the latest scan received this BSS's Beacon, so a
+        // radar/NO_IR channel it operates on may be joined (never probed).
+        let permission = crate::mt7921::association::TxPermission::from_ap_heard(
+            &domain,
+            info,
+            bss,
+            heard_beacon,
+        )
+        .ok_or(Error::Authority)?;
         let aid = self
             .session
             .associate_station_as(bss, ssid, security, permission, extra_ies, network)
@@ -2084,6 +2122,20 @@ impl Transport {
         self.session.stop_monitor().await
     }
 
+    /// Host scheduled scan on the idle station (`mt7921_start_sched_scan`).
+    pub async fn start_sched_scan(
+        &mut self,
+        config: &narf_wireless::NetDetectConfig,
+    ) -> Result<(), Error> {
+        self.session.start_sched_scan(config).await
+    }
+    pub(super) fn step_sched_scan(&mut self) -> Result<Option<super::ScanReport>, Error> {
+        self.session.step_sched_scan()
+    }
+    pub async fn stop_sched_scan(&mut self) -> Result<(), Error> {
+        self.session.stop_sched_scan().await
+    }
+
     /// Last observed boot stage/result, also preserved after cancellation.
     pub fn state(&self) -> State {
         self.session.state
@@ -2101,9 +2153,16 @@ impl Transport {
         self.session.receive_ethernet()
     }
 
+    /// The next join is a reassociation away from `current_ap`.
+    pub(super) fn set_reassociation(&mut self, current_ap: [u8; 6]) {
+        self.session.station.reassociate_from = Some(current_ap);
+    }
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
         self.session.frag_threshold =
             super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
+        self.session.station.ps_wanted =
+            super::BOOT_POWER_SAVE.load(core::sync::atomic::Ordering::Relaxed);
+        super::apply_pmksa_requests(&mut self.session.pmksa);
         self.session.step_network(tx)
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {

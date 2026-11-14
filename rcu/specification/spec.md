@@ -269,6 +269,55 @@ sleep-pump step during a driver busy-wait) is not a quiescent point:
 the interrupted frame may hold driver gates, locks or raw RCU
 pointers.
 
+A second, read-only hook exists for the scheduler:
+
+```rust
+pub fn reader_nesting() -> usize;   // live QSBR guards on this CPU
+```
+
+`pin()` and the guard's drop both act on the CPU they run on. `ReadGuard`
+is `!Send`, which keeps a guard from crossing an `.await` in an `async fn`,
+but a stackful continuation is suspended and resumed as a stack and is
+never subject to that check. If one leaves its CPU inside a read section
+and resumes elsewhere, the CPU it left stays pinned for ever and the CPU
+it reaches counts below zero. The scheduler therefore reads
+`reader_nesting()` at each point where a stackful continuation gives up
+its CPU: it refuses to preempt while the count is non-zero, and it
+reports a voluntary park or yield made with a non-zero count
+(`scheduler/` §4).
+
+**Idle exit, interrupts and NMIs (Linux `rcu_eqs_exit`, `rcu_irq_enter`,
+`rcu_nmi_enter`).** `report_idle()` takes a CPU out of the grace-period
+census: its word becomes the inactive sentinel, which counts as past every
+epoch, so a grace period never waits on a halted CPU. A CPU must rejoin
+before anything that may read RCU-protected data runs on it:
+
+```rust
+// Executor: when an idle halt ends, and before every task poll.
+// Returns whether the CPU was idle; one load when it was not.
+pub fn exit_idle() -> bool;
+
+// Interrupt and NMI dispatch: first thing, before any handler runs.
+// Rejoins if the CPU was idle; dropping the guard returns it to idle.
+pub struct IrqEntry;
+impl IrqEntry { pub fn enter() -> Self; }
+```
+
+- Rejoining reads the epoch with a read-modify-write, stores it, and
+  issues a full fence, before the caller's first RCU load. A retirer
+  fences between unpublishing an object and reading the epoch it stamps
+  it with; a reclaimer fences before scanning the per-CPU words. Either
+  the woken reader cannot load the retired object, or the reclaimer sees
+  the adopted epoch, which is no newer than the object's stamp — and the
+  object waits for that CPU's next quiescent report.
+- `IrqEntry` is for interrupt and NMI context: lock-free, no clock read,
+  and nesting-safe. An entry nested in a context that already rejoined
+  does nothing; one that lands inside another path's idle transition
+  completes its own round trip before that path resumes.
+- Before this, the executor rejoined only at its first quiescent report,
+  after the first poll: that poll ran invisible to grace periods
+  (`scheduler/rcu_idle` reproduces the use-after-free).
+
 **Reclamation worker.** Destructors are arbitrary `Drop` code — the
 last reference to an address space, a mapped device file or a GPU
 buffer — and may take driver gates or wait on hardware. Linux runs
@@ -455,6 +504,14 @@ across kernels would need fresh design.
 
 All fields are stable at v1.0; adding new events / fields is
 a minor bump.
+
+### 8.8 IRQ and NMI readers (note)
+
+§8.1's prohibition stands as written, but it is no longer what the grace
+period's correctness rests on: interrupt and NMI entry rejoin the census
+(`IrqEntry`, §3.7), as Linux lets handlers be RCU readers. The prohibition
+is enforced defensively rather than relied on. Whether to lift it — the
+stall detector and crash dump already run from NMI — is open.
 
 ## 9. ABI versioning
 

@@ -218,25 +218,14 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             }
             // `generic_perform_write`: a fatal signal ends the wait; the
             // write lands whole without this task.
-            let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
+            // `killable_wait::write` also tells the file's cached pages.
+            match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
                 Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
                 Err(crate::killable_wait::Killed) => {
                     ctx.set_return(errno_ret(EINTR));
                     return;
                 }
-            };
-            // Keep any live generic-fallback MAP_SHARED page of this file
-            // coherent with the write (mapped_file::note_file_written).
-            if let Ok(written) = &outcome {
-                if *written != 0 && *written <= payload.len() {
-                    crate::mapped_file::note_file_written(
-                        &endpoint.ops,
-                        offset,
-                        &payload[..*written],
-                    );
-                }
             }
-            outcome
         };
         match outcome {
             Ok(0) if endpoint.ops.write_should_block() && total == 0 => {

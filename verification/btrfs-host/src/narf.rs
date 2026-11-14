@@ -37,11 +37,64 @@ pub fn reset() {
     disk_policy::__set_policy_for_test(Some(DiskPolicy::RootRw));
 }
 
-/// Register `dev` as the root partition and designate it (`root=UUID=`).
-pub fn register_root(dev: Arc<dyn BlockDeviceSync>, fsid: &[u8; 16]) -> Result<(), String> {
+fn register_fstypes() {
     use std::sync::Once;
     static FSTYPES: Once = Once::new();
     FSTYPES.call_once(narf_drivers_fs_btrfs::register_fstypes);
+}
+
+/// Mount subvolume `subvol` of `dev` read-write under `narf.disks=all`, the
+/// default profile — not the root path — for what `root-rw` refuses on a
+/// production root: creating snapshots, and mounting a snapshotted
+/// subvolume writable. Host images only.
+pub fn mount_default(
+    dev: Arc<dyn BlockDeviceSync>,
+    fsid: &[u8; 16],
+    subvol: &str,
+) -> Result<Arc<dyn FsInstance>, String> {
+    register_fstypes();
+    narf_block::registry::__reset_for_test();
+    disk_policy::__reset_root_for_test();
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+    let uuid = uuid_string(fsid);
+    narf_block::register_partition_device(
+        PART,
+        "nvme0n1",
+        dev,
+        Some(narf_block::registry::PartitionMetadata {
+            fs_uuid: uuid,
+            partlabel: "root".into(),
+            ..Default::default()
+        }),
+    );
+    let fstype = narf_filesystem::lookup_fstype("btrfs").ok_or("btrfs fstype not registered")?;
+    let source = format!("/dev/{PART}");
+    let fs = fstype
+        .init(&narf_filesystem::MountRequest {
+            fs_type: "btrfs",
+            source: &source,
+            options: &format!("subvol=/{subvol}"),
+            uid: 0,
+            gid: 0,
+            umask: 0o022,
+            initial_namespace: false,
+            read_only: false,
+        })
+        .map_err(|e| {
+            format!(
+                "default-profile mount: {e:?}; refusal: {:?}",
+                narf_drivers_fs_btrfs::rw_gate::last_refusal()
+            )
+        })?;
+    if fs.always_read_only() {
+        return Err("default-profile mount came up read-only".into());
+    }
+    Ok(fs)
+}
+
+/// Register `dev` as the root partition and designate it (`root=UUID=`).
+pub fn register_root(dev: Arc<dyn BlockDeviceSync>, fsid: &[u8; 16]) -> Result<(), String> {
+    register_fstypes();
     reset();
     let uuid = uuid_string(fsid);
     disk_policy::__set_root_arg_for_test(Some(Some(&format!("UUID={uuid}"))));

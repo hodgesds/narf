@@ -49,7 +49,10 @@ use crate::frame::{alloc_frame, alloc_pages_on, free_pages, PhysFrame};
 use crate::PAGE_SIZE;
 
 mod central;
+pub mod site_audit;
 pub(crate) use central::FrameState;
+#[cfg(feature = "kernel-test")]
+mod retention_tests;
 
 /// Local `usize` view of `PAGE_SIZE` (which the rest of the crate
 /// exposes as `u64` because it doubles as a physical-address
@@ -965,6 +968,18 @@ static LARGE_IN_USE: AtomicUsize = AtomicUsize::new(0);
 /// count here so [`frames_held`] can be exact.
 static LARGE_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
+/// Live contiguous LARGE allocations per buddy order, the large-object
+/// counterpart of a size class's live-object count (`/proc/slabinfo`
+/// `kmalloc-8k`… rows). One relaxed RMW on a path that already takes the
+/// buddy lock.
+static LARGE_LIVE_BY_ORDER: [AtomicUsize; MAX_ORDER as usize + 1] =
+    [const { AtomicUsize::new(0) }; MAX_ORDER as usize + 1];
+
+/// Live LARGE allocations served by the scattered vmalloc fallback, and the
+/// order-0 frames backing them.
+static LARGE_VMALLOC_LIVE: AtomicUsize = AtomicUsize::new(0);
+static LARGE_VMALLOC_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
 /// Why an allocation failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SlabError {
@@ -1022,9 +1037,23 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
             let p = alloc_class(c)?;
             #[cfg(feature = "kasan")]
             kasan_alloc(p, c);
+            if site_audit::sample_small(c) {
+                site_audit::record(p.as_ptr() as usize, class_size(c), class_size(c) as u32);
+            }
             Ok(p)
         }
-        None => alloc_large(layout),
+        None => {
+            let p = alloc_large(layout)?;
+            if site_audit::armed() {
+                let pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
+                site_audit::record(
+                    p.as_ptr() as usize,
+                    pages * PAGE_SIZE_USIZE,
+                    site_audit::KIND_LARGE | pages as u32,
+                );
+            }
+            Ok(p)
+        }
     }
 }
 
@@ -1037,7 +1066,11 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 /// `GlobalAlloc::dealloc` contract.
 pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
-    match class_for(need) {
+    let class = class_for(need);
+    if site_audit::armed() && class.is_none_or(|c| c >= site_audit::SMALL_MIN_CLASS) {
+        site_audit::forget(ptr.as_ptr() as usize);
+    }
+    match class {
         Some(c) => {
             #[cfg(feature = "kasan")]
             kasan_free(ptr, c);
@@ -1153,6 +1186,11 @@ pub unsafe fn try_dealloc_atomic(
                 .miss_count
                 .fetch_add(1, Ordering::Relaxed);
             return Err(AtomicDeallocFull);
+        }
+        // A sampled allocation freed from IRQ context is retired from the
+        // site audit like any other free (allocation-free, IRQ-safe lock).
+        if site_audit::armed() && c >= site_audit::SMALL_MIN_CLASS {
+            site_audit::forget(ptr.as_ptr() as usize);
         }
         let blk = ptr.cast::<FreeBlock>();
         // SAFETY: caller hands us ownership of the block; the push
@@ -1409,6 +1447,7 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         }
         // Refill/reclaim cannot consume these blocks before their count exists.
         let central_free = class.central_free.fetch_add(flush, Ordering::Relaxed) + flush;
+        let (_, empty_frames) = g.frames.counts();
         drop(g);
         // Compact: shift the surviving half down to slots 0..flush.
         for i in 0..(MAG_SIZE - flush) {
@@ -1420,13 +1459,18 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         class.magazines[cpu]
             .available
             .store(mag.top, Ordering::Relaxed);
-        // Proactive watermark: if this class has parked more than
-        // SLAB_RETAIN_FRAMES_HIGH frames of free blocks, flag the executor to
-        // shed empties back to the buddy at its next maintenance tick. Only a
-        // flag here — the actual buddy release (`free_frame`) must not run on
-        // the dealloc path, which may be nested under an arbitrary caller lock
-        // (including the buddy's own zone lock). See `drain_over_watermark`.
-        if central_free > SLAB_RETAIN_FRAMES_HIGH.saturating_mul(blocks_per_frame(c)) {
+        // SLUB discards a slab that becomes empty once the node already keeps
+        // `min_partial` of them. Do the same, deferred: when this class holds
+        // more empty frames than `min_empty_frames`, flag the executor to
+        // return the excess at its next maintenance tick. Only a flag here —
+        // the buddy release (`free_frame`) must not run on the dealloc path,
+        // which may be nested under an arbitrary caller lock (including the
+        // buddy's own zone lock). See `drain_over_watermark`. The free-object
+        // watermark stays as the trigger for untracked (legacy FIFO) frames,
+        // whose emptiness only a reclaim scan can discover.
+        if empty_frames > min_empty_frames(c)
+            || central_free > SLAB_RETAIN_FRAMES_HIGH.saturating_mul(blocks_per_frame(c))
+        {
             SLAB_WANTS_DRAIN.store(true, Ordering::Relaxed);
         }
     });
@@ -1444,6 +1488,7 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     if let Ok(frame) = alloc_pages_on(0, order) {
         LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
         LARGE_FRAMES.fetch_add(1usize << order, Ordering::Relaxed);
+        LARGE_LIVE_BY_ORDER[order as usize].fetch_add(1, Ordering::Relaxed);
         let p = frame.start_address().kernel_mut_ptr::<u8>();
         // SAFETY: `p` is reachable through the per-arch kernel
         // mapping + page-aligned to its order.
@@ -1462,6 +1507,8 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // that is the whole point of the fallback, so it must not be accounted
     // as though it had allocated a contiguous block.
     LARGE_FRAMES.fetch_add(n_pages, Ordering::Relaxed);
+    LARGE_VMALLOC_LIVE.fetch_add(1, Ordering::Relaxed);
+    LARGE_VMALLOC_FRAMES.fetch_add(n_pages, Ordering::Relaxed);
     Ok(p)
 }
 
@@ -1474,7 +1521,10 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
         // slab always frees a large block with its original layout).
         unsafe { crate::vmalloc::vfree(ptr, layout.size()) };
         LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
-        LARGE_FRAMES.fetch_sub(layout.size().div_ceil(PAGE_SIZE_USIZE), Ordering::Relaxed);
+        let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
+        LARGE_FRAMES.fetch_sub(n_pages, Ordering::Relaxed);
+        LARGE_VMALLOC_LIVE.fetch_sub(1, Ordering::Relaxed);
+        LARGE_VMALLOC_FRAMES.fetch_sub(n_pages, Ordering::Relaxed);
         return;
     }
     // `alloc_large` handed out `frame.start_address().kernel_mut_ptr()`,
@@ -1516,6 +1566,7 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     free_pages(frame, order);
     LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
     LARGE_FRAMES.fetch_sub(1usize << order, Ordering::Relaxed);
+    LARGE_LIVE_BY_ORDER[order as usize].fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Smallest buddy order that fits `n_pages`. Returns Err when the
@@ -1603,6 +1654,93 @@ pub fn magazine_stats() -> MagazineStats {
     }
 }
 
+/// Where one size class's frames are: the retention breakdown behind
+/// `/proc/slabinfo` and the `memory.stat`-style `/proc/narf/slab` detail.
+///
+/// `frames - empty_frames` frames hold at least one object that is allocated
+/// or parked in a per-CPU magazine; `live_objects` against
+/// `frames * objs_per_frame` is the class's packing. A class whose
+/// `live_objects` keeps rising across identical load cycles leaks; one whose
+/// `live_objects` returns to baseline while `frames` does not retains freed
+/// memory (fragmentation or an over-large empty-frame cache).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassDetail {
+    pub block_size: usize,
+    pub objs_per_frame: usize,
+    /// Frames the class currently holds from the buddy.
+    pub frames: usize,
+    /// Objects handed out and not yet freed.
+    pub live_objects: usize,
+    /// Free objects cached in per-CPU magazines.
+    pub magazine_free: usize,
+    /// Free objects on the central lists (tracked frames and legacy FIFO).
+    pub central_free: usize,
+    /// Tracked frames with some, but not all, objects on the central list.
+    pub partial_frames: usize,
+    /// Tracked frames with every object on the central list: returnable to
+    /// the buddy as they stand.
+    pub empty_frames: usize,
+    /// Free objects on the untracked legacy FIFO (frames grown before PFN
+    /// metadata existed), including any held by an in-progress reclaim scan.
+    pub legacy_free: usize,
+}
+
+/// Live LARGE (> largest class) allocations.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LargeDetail {
+    /// Contiguous allocations alive per buddy order.
+    pub live_by_order: [usize; MAX_ORDER as usize + 1],
+    /// Scattered vmalloc-fallback allocations alive.
+    pub vmalloc_live: usize,
+    /// Order-0 frames backing the vmalloc-fallback allocations.
+    pub vmalloc_frames: usize,
+    /// All frames held by large allocations.
+    pub frames: usize,
+}
+
+/// Retention breakdown of size class `c` (`c < num_classes()`). Takes the
+/// class lock for a constant number of loads (no allocation, no walk), so it
+/// is safe from any sleepable diagnostic reader; the magazine figure is a
+/// relaxed snapshot.
+pub fn class_detail(c: usize) -> ClassDetail {
+    let class = &CLASSES[c];
+    let (partial_frames, empty_frames, legacy_free) = {
+        let g = class.head.lock();
+        let (partial, empty) = g.frames.counts();
+        (partial, empty, g.len + g.scan.pending_count)
+    };
+    let grown = class.grown.load(Ordering::Relaxed);
+    let bpf = blocks_per_frame(c);
+    let magazine_free = class.magazines.iter().fold(0usize, |free, mag| {
+        free.saturating_add(mag.available.load(Ordering::Relaxed))
+    });
+    ClassDetail {
+        block_size: class_size(c),
+        objs_per_frame: bpf,
+        frames: grown / bpf,
+        live_objects: class.in_use(grown),
+        magazine_free,
+        central_free: class.central_free.load(Ordering::Relaxed),
+        partial_frames,
+        empty_frames,
+        legacy_free,
+    }
+}
+
+/// Live LARGE allocation breakdown. Lock-free relaxed snapshot.
+pub fn large_detail() -> LargeDetail {
+    let mut live_by_order = [0usize; MAX_ORDER as usize + 1];
+    for (slot, counter) in live_by_order.iter_mut().zip(LARGE_LIVE_BY_ORDER.iter()) {
+        *slot = counter.load(Ordering::Relaxed);
+    }
+    LargeDetail {
+        live_by_order,
+        vmalloc_live: LARGE_VMALLOC_LIVE.load(Ordering::Relaxed),
+        vmalloc_frames: LARGE_VMALLOC_FRAMES.load(Ordering::Relaxed),
+        frames: LARGE_FRAMES.load(Ordering::Relaxed),
+    }
+}
+
 // ── Slab-page reclaim ──────────────────────────────────────────────
 //
 // Size classes grow by carving a fresh frame into `PAGE_SIZE / block_size`
@@ -1639,18 +1777,90 @@ const SLAB_RECLAIM_BATCH_FRAMES: usize = 64;
 /// section that the former whole-list address sort created.
 const SLAB_RECLAIM_SCAN_BLOCKS: usize = 2_048;
 
-/// Proactive empty-frame watermark (in frames, per size class). When a class's
-/// central free list grows past `_HIGH` frames' worth of blocks, the next
-/// executor maintenance tick ([`drain_over_watermark`]) sheds fully-empty
-/// frames back to the buddy until the class is down to `_LOW`. This bounds how
-/// much a churny class can sequester from the buddy — the background shrinker
-/// otherwise only fires under the global memory low-watermark, which never
-/// trips while a fork storm's freed-but-parked frames keep "free" memory
-/// high. ~`_HIGH * N_CLASSES` frames (here ~18 MiB) is the steady-state
-/// per-class cache ceiling; large hoarder classes (1–4 KiB objects, few blocks
-/// per frame) are exactly the ones a high `central_free` makes reclaimable.
+/// Free-object watermark (in frames' worth of blocks, per size class) for the
+/// frames tracked frame lists cannot see: those on the legacy FIFO, grown
+/// before the permanent PFN metadata existed. Their emptiness is discovered
+/// only by a reclaim scan, so past `_HIGH` frames of central free blocks the
+/// maintenance tick scans them down toward `_LOW`. Tracked frames do not wait
+/// for this: see [`min_empty_frames`].
 const SLAB_RETAIN_FRAMES_HIGH: usize = 512;
 const SLAB_RETAIN_FRAMES_LOW: usize = 128;
+
+/// Empty frames a size class keeps for reuse: SLUB's `min_partial`,
+/// `clamp(ilog2(object_size) / 2, 5, 10)` (`mm/slub.c::set_min_partial`).
+///
+/// Linux frees a slab the moment it becomes empty unless the node already
+/// keeps this many partial slabs. NARF did the opposite: a class kept every
+/// empty frame until its whole free pool (partial frames included) passed 512
+/// frames' worth of blocks, and then shed only down to 128. A burst that grew
+/// a class and freed everything left up to 512 frames parked in that class
+/// for good — invisible to the buddy, never reported as reclaimable, and
+/// counted in `Slab` forever.
+const fn min_empty_frames(c: usize) -> usize {
+    let half_log = class_size(c).trailing_zeros() as usize / 2;
+    if half_log < 5 {
+        5
+    } else if half_log > 10 {
+        10
+    } else {
+        half_log
+    }
+}
+
+/// Generation of the newest request for every CPU to flush its magazines into
+/// the central lists ([`shrink`]); each CPU acts on it at its next
+/// maintenance tick, as SLUB's `flush_all` runs a work item per CPU.
+static MAG_FLUSH_GEN: AtomicUsize = AtomicUsize::new(0);
+/// The flush generation each CPU last acted on.
+static MAG_FLUSH_SEEN: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Move every block in this CPU's magazines to the central lists, so frames
+/// they pinned can become empty. Returns the number of blocks moved.
+///
+/// Must run on the CPU whose magazines it empties, outside any allocator call
+/// on that CPU (no magazine borrow live): the executor maintenance point or a
+/// sleepable task context. IRQs are masked for the whole move, exactly as in
+/// `alloc_class`/`dealloc_class`, so an IRQ-context `try_*_atomic` cannot
+/// observe a half-emptied magazine.
+fn flush_local_magazines() -> usize {
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu();
+        let mut moved = 0usize;
+        for (c, class) in CLASSES.iter().enumerate() {
+            // SAFETY: per-CPU access invariant — this is the active CPU's own
+            // cell, IRQs are masked, and the caller contract guarantees no
+            // allocator frame on this CPU holds a borrow of it.
+            let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+            if mag.top == 0 {
+                continue;
+            }
+            let n = mag.top;
+            let mut g = class.head.lock();
+            for slot in mag.stack.iter_mut().take(n) {
+                let blk = slot.take().expect("magazine slot below top");
+                // SAFETY: `blk` is a free block parked in this magazine; only
+                // this CPU can reach it. Its canary must still be intact.
+                unsafe { canary_check_free(blk, c) };
+                // SAFETY: the block came from this class and is exclusively
+                // owned here; the class lock covers both central lists.
+                unsafe { g.push_back(blk) };
+            }
+            mag.top = 0;
+            // Publish the inventory under the lock, like the dealloc spill.
+            class.central_free.fetch_add(n, Ordering::Relaxed);
+            drop(g);
+            class.magazines[cpu].available.store(0, Ordering::Relaxed);
+            moved += n;
+        }
+        moved
+    })
+}
+
+/// `(empty tracked frames, legacy FIFO blocks)` on class `c`'s central list.
+fn empty_and_legacy(c: usize) -> (usize, usize) {
+    let g = CLASSES[c].head.lock();
+    (g.frames.counts().1, g.len + g.scan.pending_count)
+}
 /// Per-class pages shed in one [`drain_over_watermark`] visit; a big hoard
 /// drains across successive ticks so one tick can't monopolise the executor.
 /// `reclaim_class_frames` detaches at most `SLAB_RECLAIM_BATCH_FRAMES` per call,
@@ -1674,12 +1884,15 @@ const fn blocks_per_frame(c: usize) -> usize {
     }
 }
 
-/// Executor maintenance hook: if a size class has parked more than
-/// `SLAB_RETAIN_FRAMES_HIGH` frames of free blocks, return fully-empty frames
-/// to the buddy until it is back near `SLAB_RETAIN_FRAMES_LOW`. This is the
-/// proactive counterpart to the failure-path direct reclaim in
-/// `frame::alloc_frame_on_inner_ctx`: it keeps the slab from ever hoarding
-/// enough to starve the buddy in the first place.
+/// Executor maintenance hook: return each size class's empty frames beyond
+/// [`min_empty_frames`] to the buddy (SLUB's discard of an empty slab past
+/// `min_partial`), and scan legacy FIFO frames once a class has parked more
+/// than `SLAB_RETAIN_FRAMES_HIGH` frames of free blocks. Also performs this
+/// CPU's share of a [`shrink`] request by flushing its magazines.
+///
+/// This is the proactive counterpart to the failure-path direct reclaim in
+/// `frame::alloc_frame_on_inner_ctx`: freed heap memory goes back to the
+/// buddy as the load that used it stops, not only under memory pressure.
 ///
 /// MUST be called from a sleepable, lock-free context — the scheduler's
 /// between-dispatch maintenance point, where it already drains RCU and frees
@@ -1687,6 +1900,18 @@ const fn blocks_per_frame(c: usize) -> usize {
 /// the dealloc hot path (which may be nested under an arbitrary caller lock) —
 /// hence the flag-then-drain split.
 pub fn drain_over_watermark() {
+    // A pending flush request costs one relaxed load and, after the first
+    // `shrink`, one per-CPU compare. The executor's maintenance point is
+    // pinned to its CPU, so `current_cpu()` is stable here without masking;
+    // the flush itself masks IRQs.
+    let gen = MAG_FLUSH_GEN.load(Ordering::Acquire);
+    if gen != 0 {
+        let cpu = current_cpu().min(MAX_CPUS - 1);
+        if MAG_FLUSH_SEEN[cpu].swap(gen, Ordering::AcqRel) != gen {
+            flush_local_magazines();
+            SLAB_WANTS_DRAIN.store(true, Ordering::Relaxed);
+        }
+    }
     if !SLAB_WANTS_DRAIN.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -1695,20 +1920,29 @@ pub fn drain_over_watermark() {
         let bpf = blocks_per_frame(c);
         let high = SLAB_RETAIN_FRAMES_HIGH.saturating_mul(bpf);
         let low = SLAB_RETAIN_FRAMES_LOW.saturating_mul(bpf);
-        // Shed this class toward `low` in `reclaim_class_frames`-sized batches,
-        // capped at `SLAB_DRAIN_FRAMES_PER_TICK` so one tick can't monopolise
-        // the executor. If the whole per-tick budget was spent and the class is
-        // still over `high`, re-arm so the next tick continues; stop early on a
-        // short/zero batch (remaining free blocks too fragmented to form empty
-        // frames) and wait for the next dealloc flush to re-flag us rather than
-        // re-walking the list fruitlessly.
+        let keep = min_empty_frames(c);
+        // Shed this class in `reclaim_class_frames`-sized batches, capped at
+        // `SLAB_DRAIN_FRAMES_PER_TICK` so one tick can't monopolise the
+        // executor; if the budget runs out with work left, re-arm so the next
+        // tick continues. Tracked empty frames above `keep` are always
+        // released (each batch is O(frames) — the tracked list hands them over
+        // without a search). The free-block watermark only adds a scan of
+        // legacy frames; a zero-progress batch ends this class's visit and
+        // waits for the next dealloc spill to re-flag it.
         let mut shed = 0usize;
         loop {
+            let (empty, legacy) = empty_and_legacy(c);
+            let excess = empty.saturating_sub(keep);
             let cf = class.central_free.load(Ordering::Relaxed);
-            if cf <= high {
+            let legacy_want = if legacy != 0 && cf > high {
+                cf.saturating_sub(low) / bpf
+            } else {
+                0
+            };
+            let want = excess.max(legacy_want);
+            if want == 0 {
                 break;
             }
-            let want = cf.saturating_sub(low) / bpf;
             let target = want
                 .min(SLAB_RECLAIM_BATCH_FRAMES)
                 .min(SLAB_DRAIN_FRAMES_PER_TICK - shed);
@@ -1716,11 +1950,15 @@ pub fn drain_over_watermark() {
                 still_over = true;
                 break;
             }
+            // Keep the class's `min_partial` cache unless a legacy scan is
+            // what is wanted; the keep bound is re-checked under the class
+            // lock, since another CPU may be draining this class too.
+            let keep_now = if legacy_want > excess { 0 } else { keep };
             // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s
             // blocks. Called from the sleepable maintenance context per the doc.
-            let freed = unsafe { reclaim_class_frames(c, target) };
+            let freed = unsafe { reclaim_class_frames_keeping(c, target, keep_now) };
             shed += freed;
-            if freed < target {
+            if freed == 0 {
                 break;
             }
         }
@@ -1728,6 +1966,41 @@ pub fn drain_over_watermark() {
     if still_over {
         SLAB_WANTS_DRAIN.store(true, Ordering::Relaxed);
     }
+}
+
+/// `kmem_cache_shrink` for the whole heap: flush this CPU's magazines, ask
+/// every other CPU to flush its own at its next maintenance tick, and return
+/// every empty frame to the buddy now. Returns the frames released.
+///
+/// Remote magazines are flushed asynchronously (SLUB's `flush_all` likewise
+/// runs per-CPU work), and the frames they free are released by the regular
+/// drain down to [`min_empty_frames`]. Sleepable, lock-free context only — it
+/// calls the buddy, and must not be called from inside an allocator call.
+pub fn shrink() -> usize {
+    let gen = MAG_FLUSH_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    // Generation 0 means "never requested"; skip it on (theoretical) wrap.
+    let gen = if gen == 0 {
+        MAG_FLUSH_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    } else {
+        gen
+    };
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu().min(MAX_CPUS - 1);
+        MAG_FLUSH_SEEN[cpu].store(gen, Ordering::Release);
+        flush_local_magazines();
+    });
+    let mut freed = 0usize;
+    for c in 0..N_CLASSES {
+        loop {
+            // SAFETY: `c < N_CLASSES`; sleepable lock-free context per the doc.
+            let n = unsafe { reclaim_class_frames(c, SLAB_RECLAIM_BATCH_FRAMES) };
+            freed += n;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    freed
 }
 
 /// Registered-once guard for the slab shrinker.
@@ -1882,14 +2155,39 @@ pub fn reclaim_empty_frames_to_buddy(target_pages: usize) -> usize {
 /// the buddy exactly once. The central free list holds only this class's
 /// blocks.
 unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) -> usize {
+    // SAFETY: forwarded caller contract.
+    unsafe { detach_class_frames_keeping(c, max_pages, frames, 0) }
+}
+
+/// [`detach_class_frames`], but leaving at least `keep_empty` tracked empty
+/// frames on the class. The bound is applied under the class lock, so
+/// concurrent maintenance drains on several CPUs cannot together overshoot
+/// the class's [`min_empty_frames`] cache (each reads the count it may
+/// release in the same critical section that releases it). A nonzero
+/// `keep_empty` also confines the pass to tracked frames.
+///
+/// # Safety
+/// As [`detach_class_frames`].
+unsafe fn detach_class_frames_keeping(
+    c: usize,
+    max_pages: usize,
+    frames: &mut [usize],
+    keep_empty: usize,
+) -> usize {
     let class = &CLASSES[c];
     let block_size = class_size(c);
     let n_blocks = PAGE_SIZE_USIZE / block_size;
-    let limit = max_pages.min(frames.len());
+    let mut limit = max_pages.min(frames.len());
     if n_blocks == 0 || limit == 0 {
         return 0;
     }
     let mut g = class.head.lock();
+    if keep_empty != 0 {
+        limit = limit.min(g.frames.counts().1.saturating_sub(keep_empty));
+        if limit == 0 {
+            return 0;
+        }
+    }
     // SAFETY: class lock owns both central representations and the caller
     // returns the detached frames after this function releases that lock.
     let detached_pages =
@@ -1931,13 +2229,29 @@ unsafe fn free_detached_slab_frames(frames: &[usize]) {
 /// # Safety
 /// `c < N_CLASSES`. The central free list holds only this class's blocks.
 unsafe fn reclaim_class_frames(c: usize, max_pages: usize) -> usize {
+    // SAFETY: forwarded caller contract.
+    unsafe { reclaim_class_frames_keeping(c, max_pages, 0) }
+}
+
+/// [`reclaim_class_frames`] that leaves `keep_empty` tracked empty frames
+/// (see [`detach_class_frames_keeping`]).
+///
+/// # Safety
+/// As [`reclaim_class_frames`].
+unsafe fn reclaim_class_frames_keeping(c: usize, max_pages: usize, keep_empty: usize) -> usize {
     let mut frames = [0usize; SLAB_RECLAIM_BATCH_FRAMES];
     // SAFETY: caller proves the class index/list invariant; every detached
     // frame is consumed exactly once immediately below.
-    let detached = unsafe { detach_class_frames(c, max_pages, &mut frames) };
+    let detached = unsafe { detach_class_frames_keeping(c, max_pages, &mut frames, keep_empty) };
     // SAFETY: exactly the initialized detached prefix is passed once.
     unsafe { free_detached_slab_frames(&frames[..detached]) };
     detached
+}
+
+/// `(limit, batchcount)` of the per-CPU magazines, for `/proc/slabinfo`'s
+/// `tunables` columns: capacity, and the batch moved per central transfer.
+pub const fn magazine_tunables() -> (usize, usize) {
+    (MAG_SIZE, MAG_SIZE / 2)
 }
 
 /// Number of distinct size classes the allocator supports.

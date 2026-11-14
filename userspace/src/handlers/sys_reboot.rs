@@ -45,6 +45,11 @@ const CMD_CAD_OFF: u64 = 0;
 /// the other way when it cannot power off). The Ctrl-Alt-Del toggles are
 /// accepted no-ops.
 ///
+/// Neither syncs: "reboot doesn't sync: do that yourself before calling
+/// this". The caller (systemd-shutdown, the `reboot` binary) has synced and
+/// unmounted or remounted read-only; the kernel only shuts the devices down
+/// (`kernel_restart` / `kernel_power_off` → `device_shutdown`).
+///
 /// LINUX-GAP: `LINUX_REBOOT_CMD_KEXEC` and `LINUX_REBOOT_CMD_SW_SUSPEND`
 /// are -EINVAL, as they are on a Linux built without CONFIG_KEXEC_CORE /
 /// CONFIG_HIBERNATION. SW_SUSPEND is hibernation (suspend-to-disk):

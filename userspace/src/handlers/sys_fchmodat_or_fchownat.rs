@@ -139,7 +139,7 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    ctx.set_return(errno_ret(path_lookup_errno(&path)));
+    ctx.set_return(errno_ret(path_lookup_errno(&path, None)));
 }
 
 /// `chown_common` on a directory reached through `DirOps`.

@@ -471,6 +471,7 @@ pub fn plan(
         p.full || has_any(&["narf-memory", "narf-boot", "narf-arch"]) || seeds.contains(KERNEL_BIN);
     p.run_xapic = p.full
         || has_any(&[
+            "narf-acpi",
             "narf-interrupts",
             "narf-memory",
             "narf-scheduler",

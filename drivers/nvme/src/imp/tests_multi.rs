@@ -1056,16 +1056,17 @@ fn smoke_nvme_msix_program_failure_falls_back_to_polled_qemu() -> TestResult {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // The steering target is a CPU that exists: under QEMU's MADT,
-        // APIC ID 0 — what the entries used to hard-code.
+        // The steering target is a CPU that exists: logical CPU 0's APIC
+        // ID (under QEMU's MADT, APIC ID 0 — what the entries used to
+        // hard-code).
         let target = super::msix_target_apic_id();
         let known = narf_interrupts::apic_id_of_cpu(0).is_some();
-        if known && narf_interrupts::apic_id_of_cpu(target as usize) != Some(target) {
+        if known && narf_interrupts::cpu_of_apic_id(target).is_none() {
             return TestResult::Fail(
                 "MSI-X entries are steered at an APIC ID firmware does not list",
             );
         }
-        if narf_interrupts::apic_id_of_cpu(0) == Some(0) && target != 0 {
+        if known && narf_interrupts::apic_id_of_cpu(0) != Some(target) {
             return TestResult::Fail("MSI-X target moved off CPU 0 although it exists");
         }
     }

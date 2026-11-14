@@ -95,7 +95,16 @@ at all. Three rules replace the mutex on that side:
 Content generations advance after acquiring that mutex and before changing
 bytes or length, and again when the mutation ends. A fill runs beside the
 mutation, so a generation sampled in between may tag old bytes; the second
-advance keeps them from staying current. Shrinking truncate publishes EOF and
+advance keeps them from staying current. The per-inode anchor and generation
+tables (`InodeTables`) hold only inodes some lookup or mapping holds: an
+`MmapAnchor` removes its entry and its inode's generation when its last
+reference drops, and a generation bump of an inode with no live anchor
+forgets the entry instead of inserting one. Every generation is a fresh tick
+from one never-repeating source, so a forgotten inode's next generation
+differs from every value a page was retained under; a reopened or recycled
+inode misses, never aliases. (The anchor table used to be pruned only at
+power-of-two sizes and the generation table never;
+`smoke_btrfs_inode_tables_track_open_files`.) Shrinking truncate publishes EOF and
 revokes mappings under the operation lock before retiring extents, and revokes
 again afterwards (`truncate_pagecache`), since a fault past its EOF check is
 excluded by no lock; a failed revoke restores the cached inode there.
@@ -105,8 +114,32 @@ walk only the requested window. A small read must not collect the inode's
 entire extent list. Reader epochs, checksum verification, the compressed-extent
 cache and zero filling of holes still cover these reads.
 
+A write does the same (`write::window_extents`, Linux `btrfs_drop_extents`
+from a `btrfs_lookup_file_extent` at the range's start): it looks up the
+extent item at or before its first sector and walks forward to its last, so
+what it reads is the leaves holding the items it replaces, whatever the
+number of extent items the file has. Of the old contents it reads only the
+partial sectors at its edges — nothing when it covers whole sectors (Linux
+`prepare_one_folio`). An overwrite of one page of a file with one extent per
+page therefore costs what an overwrite of any page costs
+(`smoke_btrfs_overwrite_cost_tracks_range_not_extent_count`, and the
+`overwrite` scenario of `cargo xtask btrfs-host-rw`); before, each write
+read every extent item of the file, so N page-sized writes into a file of N
+single-page extents read N² items. Every write is still its own
+synchronous operation — data written, items staged and the path's tree
+blocks rewritten before it returns; there is no delayed allocation.
+`truncate`, `fallocate` and hole punching still read all of the inode's
+extent items.
+
+Tree walks (`btree::Cursor`, `last_before`, `find_item`) hold the nodes on
+their path by reference to the node cache and never copy one. A path COW
+whose edits to a leaf only replace items by bodies of the same length (an
+overwrite's `EXTENT_DATA` and `INODE_ITEM`) patches a copy of the leaf
+instead of decoding and re-tiling its items (`write::patch_leaf`,
+`smoke_btrfs_patch_leaf_matches_retile`).
+
 Uncompressed reads covered entirely by valid data checksums retain windows up to
-128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
+128 KiB in the shared extent cache. Keys include shared-core identity,
 logical byte range, compression tag and file-extent generation. Reads never
 widen their requested window to fill the cache. Logical writes invalidate
 overlapping entries before and after I/O, and a fill crossing a write epoch
@@ -115,8 +148,17 @@ uncompressed cache. The maximum cached disk span also bounds invalidation's
 backward scan; it is enforced at insertion for both entry kinds.
 Missing-checksum sectors (including pending writes before commit) remain
 readable through the existing policy but never populate verified windows.
-An 8,192-entry ceiling bounds bookkeeping for tiny ranges as well as payload
-bytes.
+The cache is bounded in bytes of heap — each entry's buffer capacity plus
+128 bytes of bookkeeping — at 1/128 of RAM, never under 4 MiB nor over
+128 MiB (`cache_budget::DATA_CACHE`: 32 MiB at 4 GiB of RAM, 128 MiB from
+16 GiB up; 4 GiB is assumed where no frame allocator reports RAM, as in the
+host harness). An 8,192-entry ceiling also bounds the least-recently-used
+eviction scan. The cache registers the `btrfs-extent-data` shrinker
+(`narf_memory::reclaim::register_shrinker`) on its first fill; under memory
+pressure kswapd's `try_to_free` evicts least recently used entries up to its
+page share, as Linux page reclaim drops clean page-cache folios
+(`smoke_btrfs_extent_data_cache_bytes_and_shrink`,
+`smoke_btrfs_cache_budgets_follow_ram`).
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
@@ -128,7 +170,59 @@ record together and releases data through the ordinary COW/backref transaction.
 Read-only mounts do not recover orphans. Final-view Drop only makes previously
 accepted changes durable, leaving any unreaped orphan record for recovery.
 
+Read repair (`src/repair.rs`; Linux `btrfs_repair_io_failure`). A read of a
+mirrored range (DUP, RAID1/1C3/1C4, RAID10) that verified a good copy after
+a bad one rewrites the bad copy from it before returning: a tree block
+(`read_node*`) repairs the first copy that failed its bytenr, checksum or —
+for a child read through its parent (`btree::read_child_shared`,
+`read_node_expecting`) — the parent's generation / level / first-key check,
+as `btrfs_read_extent_buffer` → `btrfs_repair_eb_io_failure`; a data sector
+read through its checksum (`read_logical_checked`, every ordinary file read)
+repairs every copy that failed before the good one, as
+`btrfs_end_repair_bio`. A copy whose read failed with a device error counts
+as failed too. Per-device error counters follow `btrfs_dev_stat_inc_and_print`
+(`BtrfsVolume::dev_stats(devid)`: write, read, flush, corruption, generation;
+a data checksum mismatch counts `corrupt`, a device read error `rd`, a
+failed repair write `wr`) and are kept in memory only — Linux also persists
+them in the device tree's `DEV_STATS` item, NARF does not yet. A repair
+prints `read error corrected: ino I off O (dev devid D sector S)` (metadata:
+`ino 0`, `off` the block's logical address), rate-limited as `btrfs_info_rl`
+(100 per 5 s). `BtrfsVolume::repair_stats()` counts repairs and each kind of
+skip. The read never fails because of its repair.
+
 ## 4. Invariants
+
+Without a free-space tree (never under `root-rw`, which requires one) the
+allocator appends past the highest extent of each block group, one cursor per
+group, and only into a group of the requested type: tree blocks into
+METADATA groups (SYSTEM for the chunk tree), data into DATA groups, either
+into a mixed group (the read-write gate admits a filesystem without the tree
+only when every block group is mixed, so the type rule is a guard). It reports as free the bytes past those cursors, so a
+batch's reservation check refuses an operation the commit could not fit; it
+reported unlimited space, and a batch then took operations until its commit
+failed and lost every one it had reported successful
+(`smoke_btrfs_admitted_operations_survive_commit`, and the `release` scenario's
+image without a free-space tree, judged by `btrfs check` and by the block
+group of every extent).
+
+A tree's root block always carries the generation its ROOT_ITEM records:
+when deletions leave a root with one child, a child the transaction has not
+already COWed is COWed before it becomes the root, in every tree, as Linux
+`balance_level` does. Promoting it as it was left a root block of an older
+generation under a root item of the new one, which Linux refuses to read
+("parent transid verify failed"; `smoke_btrfs_collapsed_root_is_cowed`).
+
+No buffer of the write, truncate, punch or read paths follows the length of
+a call: a write is laid down one new extent (`MAX_WRITE_EXTENT`, 128 KiB) at a
+time in one reused buffer, and a read of an uncompressed extent goes in
+pieces of at most 128 KiB, as Linux works folio by folio and extent by
+extent. A write of n bytes once needed a contiguous heap block of n bytes,
+and the kernel aborted when a fragmented heap had none. Data-sized buffers
+come from `databuf::zeroed`, which allocates fallibly: a failure is
+`OutOfMemory` (ENOMEM) with nothing staged, never an abort
+(`smoke_btrfs_large_write_buffers_bounded`,
+`smoke_btrfs_write_buffer_failure_is_enomem`, and the `overwrite` scenario of
+`cargo xtask btrfs-host-rw` under `btrfs check`).
 
 A commit maintains the free-space tree incrementally (`write/free_space.rs`,
 Linux `btrfs_add_to_free_space_tree` / `btrfs_remove_from_free_space_tree`
@@ -159,12 +253,43 @@ rounds agreed, did not settle within its 64 rounds on a filesystem of 320
 block groups with three-level trees; `cargo xtask btrfs-host-rw --scenario
 scale` reproduces that shape.) What the trees hold afterwards is a function
 of the final block lists alone. Each new block's `METADATA_ITEM` key is
-checked absent from the committed extent tree before it is inserted. Extent
-and free-space leaves are kept dense: an overflowing leaf is split evenly
-(or left full when everything added sorts after what it held), and a sparse
+checked absent from the committed extent tree before it is inserted. In
+every tree a leaf that overflows is split evenly, or left full when
+everything added sorts after what it held (`write::retile_leaf`; Linux
+`split_leaf` splits at the middle, and `push_leaf_left` keeps appends
+dense). Filling the first leaf and spilling a remainder regardless of where
+the new items went left one full and one nearly empty leaf after every
+insert into the middle of a full leaf, and a file whose pages were first
+written in a scattered order — a mapped file written back in page-frame
+order — ended up with five extent items to a 16 KiB leaf instead of two
+hundred. Leaves written that way stay as they are until their items are
+deleted: only extent- and free-space-tree leaves are rejoined (a sparse
 committed leaf an edit reaches absorbs its right sibling; the sparser those
-trees, the more leaves the records of one commit's blocks reach. The on-disk
-format is unchanged.
+trees, the more leaves the records of one commit's blocks reach), since
+rejoining leaves of a subvolume tree means COWing a sibling that a snapshot
+may share. The on-disk format is unchanged.
+
+The node cache of each mounted filesystem is bounded in bytes of heap — a
+node's buffer plus 64 bytes of bookkeeping — at 1/128 of RAM, never under
+4 MiB nor over 256 MiB (`cache_budget::NODE_CACHE`: 32 MiB, 2,048 16 KiB
+nodes, at 4 GiB of RAM; 256 MiB, 16,384 nodes, from 32 GiB up; kernel tests
+cap it at 4 MiB). It used to be a fixed 4,096 nodes, 64 MiB at 16 KiB,
+whatever the machine. It is kept in two generations: fills and hits go to
+the young one, and when the young one would outgrow half the budget the old
+one is dropped and the young one takes its place. Every filesystem's node cache is registered
+with one `btrfs-nodes` shrinker at mount; under pressure it drops the old
+generation first and then young nodes, up to its page share, as Linux page
+reclaim releases the btree inode's extent buffers (`btree_release_folio`;
+`smoke_btrfs_node_cache_bytes_and_shrink`, `smoke_btrfs_node_cache_reclaimable`). A node in
+use survives any number of other fills
+(`smoke_btrfs_node_cache_keeps_what_is_used`). It used to be emptied
+outright when it filled, so one walk over more nodes than the bound left
+nothing for the next.
+
+CRC32C — every tree block written or read, every data sector — is computed
+eight bytes a step (slicing-by-8, as Linux's generic `crc32c`), checked
+against the byte-at-a-time definition
+(`smoke_btrfs_crc32c_sliced_matches_bytewise`).
 
 The allocator carves from one in-memory copy of the committed free-space tree
 per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
@@ -247,14 +372,161 @@ when their reservation does not fit (Linux
 `btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
 full filesystem can still be emptied; the batch then commits at once.
 
-`fsync` and `fdatasync`, on a file or a directory, both commit the open
-transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
+Freeing a file's data is reserved for in steps, never for the file as a
+whole (`write::DEALLOC_STEP_EXTENTS`, 16 extent items). A truncate that
+drops more than a step's worth drops them from the end of the file, each
+step a truncate of its own to an intermediate size, and the eviction of an
+unlinked inode removes its extents a step at a time, the inode and its
+`ORPHAN_ITEM` staying (with `nbytes` following) until the last (Linux
+`btrfs_truncate` and `btrfs_evict_inode` around `btrfs_truncate_inode_items`,
+which returns `-EAGAIN` for its caller to restart the transaction;
+`evict_refill_and_join`). Each step is one staged operation, so what is
+reserved at a time is a step's first-order need whatever the size of the
+file, and the batch commits between steps when its reservation runs out
+(`smoke_btrfs_release_reserves_in_steps`, and the `release` scenario of
+`cargo xtask btrfs-host-rw`). Dropping all of a file's extents in one
+operation priced every one of them at its worst case at once — some thirty
+tree blocks an extent, 2.3 GiB for a 256 MiB file — which was refused on any
+filesystem, and the chunk allocation that follows a refusal converted
+unallocated space into METADATA chunks (four per attempt) before the
+operation failed with `ENOSPC`. Each step of a truncate writes the inode's
+size down to the start of the lowest item it dropped (Linux
+`btrfs_inode_safe_disk_i_size_write(inode, control.last_size)` before each
+restart), so a crash between two steps leaves the file at that size, above
+the one asked for and with its old contents up to there, and nothing past
+its end; Linux leaves the same, and has added no orphan item for a truncate
+since v4.18. A truncate that drops no more than one step's worth of items
+is a single operation in a single transaction: the file is at its old size
+or its new one. An eviction walks the inode's items from its highest key
+down, as `btrfs_truncate_inode_items(new_size = 0)` does for
+`btrfs_evict_inode`, so its extents go from the end of the file first; a
+crash between two steps leaves an orphan that the next writable mount goes
+on reclaiming. The inode's `nbytes` follows the extents left and saturates
+at zero (Linux `inode_sub_bytes`): an orphan whose count was already too low
+is still evicted (`smoke_btrfs_eviction_survives_low_nbytes`) — eviction
+runs ahead of every write, so failing it would fail them all. A directory
+orphan, which Linux `btrfs_rmdir` leaves behind a crash while the removed
+directory is still open, is evicted the same way
+(`smoke_btrfs_directory_orphan_is_evicted`, and the `release` scenario
+checks the image with `btrfs check` before and after). An orphan that still
+has a name or directory entries is refused (`InvalidData`).
+
+`fallocate` steps the same way, from the front of its range (Linux
+`btrfs_punch_hole` → `btrfs_replace_file_extents`, which ends and restarts
+its transaction whenever `btrfs_drop_extents` runs out of its one-item
+reserve; `btrfs_fallocate` → `btrfs_prealloc_file_range`, one extent a
+transaction). A punch drops at most 16 extent items a step, puts a hole item
+in their place where the filesystem has no `NO_HOLES` (growing the one the
+step before left) and takes their bytes off `nbytes`; the partial sectors at
+either edge are zeroed with the first step. A preallocation lays down at
+most 16 PREALLOC extents a step over what nothing covers and, without
+`FALLOC_FL_KEEP_SIZE`, moves the size up to where the step reached
+(`__btrfs_prealloc_file_range` writes `i_size` forward after each extent).
+Its data space is checked against the free DATA space before the first step
+(Linux reserves it up front, `btrfs_alloc_data_chunk_ondemand`), so a request
+that cannot fit fails before anything changes, through the usual commit, grow
+and retry. A zero-range punches a step's stretch (at most 16 items and 128
+MiB) and preallocates the same stretch before the step ends, as
+`btrfs_replace_file_extents` inserts the replacement for what it dropped
+before it ends a transaction; it never returns success while a stretch it
+punched is still a hole (an allocation that fails ends the call with the
+error, and the retry after the filesystem grows starts over). So a crash in the middle leaves a punch or a zero-range done up
+to a step boundary — zeros from the start of the range to there, the old data
+after, the size untouched — and a preallocation done up to one, never
+anything outside the requested bytes changed; an operation of one step is one
+transaction. Each step but the last records where it left off
+(`stats::take_step_marks`), which is how the harness's crash model knows the
+states a step boundary may leave: only for an operation that took more than
+one step, only those. `write::set_dealloc_step_sync` commits every step on
+its own, for the crash tests of the `release` scenario
+(`smoke_btrfs_fallocate_reserves_in_steps`).
+
+A truncate or fallocate holds its inode's own lock (`MmapAnchor::content_lock`,
+Linux `inode_lock`) from start to end, and excludes the running operation
+one step at a time (`write::locked_step`: each step joins the running
+transaction beside other operations, without waiting in the operation queue;
+with the orphan reaping and the
+grow-and-retry `autogrow!` gives a whole operation), yielding between steps
+(`write::step_break`, Linux ending its transaction and
+`btrfs_btree_balance_dirty`). Other operations of the filesystem run between
+two steps (`smoke_btrfs_truncate_steps_let_others_run`); writes, truncates,
+fallocates and attribute changes of the same inode take the inode lock too and
+wait (`smoke_btrfs_truncates_of_one_file_serialize`). Each truncate step works
+out its range from the tree as it is. An unlinked inode is evicted at its
+last reference, as Linux evicts in the final `iput`: by the unlink, rmdir or
+rename that dropped its last link when no handle or mapping holds it, else
+by the background reaper once the last one closes (Linux's delayed iputs),
+and before a `syncfs` (`BtrfsVolume::run_delayed_iputs`). Each eviction goes
+four steps per join of the transaction, one eviction at a time. Writers,
+fsyncs and the commit timer never evict; an operation out of space reaps
+before it retries, as Linux `flush_space` waits for the delayed iputs. A
+mount evicts its recovered orphans whole
+(`smoke_btrfs_rm_rf_beside_writers_truncates_and_fsyncs`).
+
+A wait on a syscall's behalf — for an inode or directory lock, the rename
+lock, the operation queue or the transaction — ends when the task is sent
+SIGKILL (`narf_filesystem::killable`, Linux `inode_lock_killable` and
+`mutex_lock_killable`). A truncate or fallocate killed between two of its
+steps stops there, with the file at a step boundary, which is a state a crash
+may leave as well.
+
+An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
+no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`
+does (`if (!inode || inode->vfs_inode.i_nlink)`): for an inode that has
+links it first drops the inode's fs-verity items — Linux guards an fs-verity
+enable with an orphan item, and one that never finished leaves a partial
+descriptor and Merkle tree behind it (`btrfs_drop_verity_items`) — a bounded
+number per operation, and then it deletes the orphan item. Kernels before
+v4.18 left one behind every truncate. Answering it with an error failed
+every writable mount of the subvolume
+(`smoke_btrfs_stale_orphan_item_is_deleted`). fs-verity itself is not
+implemented: a filesystem with the `VERITY` compat-ro bit is not mounted
+read-write. An unlinked inode's fs-verity items go with the rest of its items
+when it is evicted, as `btrfs_truncate_inode_items` removes every item of the
+inode.
+
+`fsync` and `fdatasync` of a file commit the open transaction and write its
+superblock if any change to the inode is not yet durable
+(`BtrfsVolume::sync_object`): staging records, per subvolume tree, the newest
+generation that edited a key of each objectid, and a file whose entry is
+gone or no newer than the last superblock written returns at once (Linux
+`btrfs_sync_file` with the inode's `last_trans` committed). On a directory,
+and for `syncfs`, everything staged so far is made durable
+(`sync_to_disk_exclusive`). Concurrent callers share commits: each waits for
+the operations in flight only, not for those queued behind them, and after
+the first has committed, the
+others find their generation durable and return
+(`smoke_btrfs_fsync_waits_for_the_running_operation_only`; the `release`
+scenario's `group commit` crash case). `fdatasync`
 is not weaker: the size and extent items a write's data is read back through
 live in the open batch until it commits, so a device flush alone makes
 nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
 Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
 log: the driver replays a log at mount and can write one (`write_log`), but
 `fsync` does not use it.
+
+Operations of different inodes run side by side (`txn_gate`, Linux
+`num_writers` and `TRANS_STATE_COMMIT_START`). An operation takes its locks
+first — a data operation (write, truncate or fallocate step, attribute or
+xattr change) its inode's `content_lock`; a namespace change its
+directories' locks by inode number, then the locks of the inodes it names
+by inode number, with the cross-directory rename lock (Linux
+`s_vfs_rename_mutex`) before both — and only then joins the running
+transaction (`begin_data_op`, `begin_op`); it never waits for a lock while
+joined. Namespace changes also queue on `op_lock`, which keeps new inode
+numbers distinct; administrative work (subvolumes, snapshots, quota and
+qgroup changes, remount, orphan recovery at mount) queues there and closes
+the transaction for its whole span (`begin_admin`). A commit closes the
+transaction: it waits for every joined operation to leave and lets none join
+until it is done, ahead of the joiners that arrived after it. A joined
+operation that needs a commit or a chunk of its own (`with_space_retry`, a
+full batch, growth, a shared tree made private) steps out, closes, does it
+and joins again (`VolCore::exclusive`). One orphan is evicted at a time
+(`reaper`). Tested on four CPUs
+(`smoke_btrfs_concurrent_creates_get_distinct_numbers`,
+`smoke_btrfs_cross_dir_renames_do_not_deadlock`,
+`smoke_btrfs_orphan_eviction_beside_lookups`,
+`smoke_btrfs_quota_two_concurrent_writers`).
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.
@@ -329,7 +601,20 @@ extents spread over them, three-level free-space and extent trees —
 runs a desktop-like workload in small transactions (save-file
 loop, log appends with fsync, bursts of creates and unlinks), and reports per
 commit the nodes visited and written per tree, the recording passes, the
-blocks allocated beyond the reservation and the wall time.
+blocks allocated beyond the reservation and the wall time. The `overwrite`
+scenario builds files of 1,000 to 16,000 single-page extents (one written
+in a shuffled page order), overwrites pages at random and in file order,
+and fails if the fs-tree nodes visited, the nodes read from the device or
+(loosely) the time per overwrite grow with the file's extent count; it also
+reports sequential-write throughput in 128 KiB and 4 KiB calls. The `release`
+scenario truncates and unlinks files of 1, 1,000 and 100,000 extents on a
+6 GiB filesystem, and the 256 MiB truncate and 1 GiB unlink that found the
+defect: each must succeed without a METADATA chunk being allocated, and no
+step may reserve more than a step's worth. It then commits every step of a
+truncate (to nothing, to an extent boundary, into an extent) and of an
+unlink on its own and replays the write stream with a crash at every flush:
+each image must pass `btrfs check` and remount with the file at one of the
+step sizes.
 
 `cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest
@@ -350,6 +635,104 @@ result with the manifest the guest printed. `--jobs` guests (direct
 `-kernel` boot, `-smp 1`, 1 GiB each, own image copy, seed + job index) run
 in parallel; the default run finishes in well under three minutes.
 
+Every read or write of a member device is one scatter-gather request over the
+caller's own pages (`src/bio.rs`, Linux `btrfs_submit_bio` → `btrfs_map_bio`),
+and nothing of the volume is held across a device round trip: N readers have
+N requests at the device, and how many are in flight is the device queue's
+business, not the volume's (it once serialised every read, exec and page
+fault of a mount behind one 64 KiB coherent buffer per member;
+`smoke_btrfs_sg_concurrent_readers_overlap`). A buffer the device cannot take
+in place — outside the kernel direct map, starting or ending inside a device
+block (read-modify-written under a per-member lock that serialises only such
+runs), a segment the device refuses, or a plain reader's wait that SIGKILL may
+end — goes through a bounce of order-0 frames the page list owns, so a
+request a killed reader abandoned completes into frames that outlive it
+(`io/` `PageList::with_owner`;
+`smoke_btrfs_coherence_killed_reader_leaves_the_device_wait`). A node and a
+superblock copy are one request each whatever the logical block size (the
+block layer splits only to the device's limits), so the FUA primary
+superblock is never torn into per-block writes. A commit writes every new
+node — and every mirror of one — in flight together (`write_nodes`,
+`bio::join_all`, which waits for every request even after a failure) and
+then the superblock exactly as before: pre-flush, FUA primary, mirrors.
+
+Read repair never writes over a block anything references other than with
+the bytes every mirror of it must hold. btrfs never rewrites a referenced
+tree block or data extent in place (Linux repair relies on the same), and
+NARF's own rewrites of a logical range are: a batch's blocks written out per
+operation, each sealed once published (`CowState::sealed`) and COWed to a
+fresh address by the next operation, so a published block is written once;
+commit write-out of fresh blocks (`write_nodes`); data always to fresh
+extents (no `nodatacow`; PREALLOC is carved, never written in place); chunk
+relocation copying a chunk to new stripes and swapping its mapping. What can
+change a range between a bad read and its repair is a free and reallocation
+(a lock-free reader of an older root still reaches the block) or a write in
+flight. So a repair writes the bad copy only when all of these hold
+(`smoke_btrfs_repair_*`):
+
+- the filesystem is writable and healthy — not read-only (`sb_rdonly` in
+  `btrfs_repair_io_failure`), not degraded, not aborted — and verifies
+  checksums;
+- the range is a direct copy of a non-RAID5/6 chunk, inside one stripe, and
+  the bad copy's physical range covers no superblock copy (superblocks are
+  repaired only by a commit). RAID5/6 is not repaired (skipped, counted);
+- no write to any byte of the logical range is in flight, and none can start
+  until the repair finishes: every logical write (`write_stripes`, hence
+  `write_logical` and `write_nodes`) registers its range for its duration
+  and waits for an overlapping repair; a repair registers its own range only
+  when no write overlaps, else skips (`skipped_busy`). A chunk mapping swap
+  (`replace_chunk_item_mapping`) registers the chunk's range, and the repair
+  resolves the mapping only after registering, so it never writes through a
+  stale mapping to physical space a relocation released;
+- under that exclusion, the good copy re-read from the device is
+  byte-identical to the bytes verified (a range freed, reallocated and
+  rewritten since no longer matches: `skipped_changed`), and the bad copy
+  re-read still fails the check it failed (a copy that verifies now is left
+  alone, even if it differs).
+
+The repair therefore writes exactly what the good mirror holds at that
+instant, with no write to the range able to land in between. Its own reads
+are not killable; a repair future dropped mid-write (only through
+cancellation of the reading operation, which the write path does not yet
+make safe in general) can leave its device write in flight after the range
+is released — the same exposure as any dropped write future.
+
+Relocation (balance, device removal) and device replace copy what they read
+verified, never the raw first copy (`read_chunk_verified`): a tree block by
+its bytenr and checksum, a data sector by its stored checksum, each from the
+first good copy, which repairs the bad one — Linux relocation reads extents
+through the verified paths, and `btrfs_dev_replace` copies through scrub. A
+replaced member's stripe of a striped profile (RAID0/10/5/6) is copied piece
+by piece through the logical addresses it holds (`copy_striped_member`): a
+RAID10 piece from its other copy, a RAID5/6 data piece rebuilt from its full
+stripe, a RAID5/6 parity piece recomputed from the verified data of its full
+stripe (scrub's `scrub_raid56_parity_stripe` checks parity the same way). A
+piece with no good copy (RAID0, or every copy bad) fails the operation
+instead of being copied; Linux scrub skips writing such a sector and reports
+it. Free space and unchecksummed data are copied as they are. Tests:
+`smoke_btrfs_balance_does_not_propagate_a_corrupt_copy`,
+`smoke_btrfs_replace_raid{1,10}_does_not_propagate_a_corrupt_copy`,
+`smoke_btrfs_replace_raid{5,6}_rebuilds_a_corrupt_stripe`,
+`smoke_btrfs_replace_raid0_refuses_a_corrupt_stripe`
+(`drivers/fs/btrfs/lifecycle`).
+
+A write-path future dropped at any await point leaves the filesystem
+consistent (`smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean`,
+`drivers/fs/btrfs/race`). A killed task's operation is handed off to finish,
+so this is only reached by cancellation, but the property is kept anyway:
+an operation dropped before staging leaves its batch as it was (the COW
+snapshot is parked in the batch; only allocator carve-outs of unreferenced
+blocks leak until the commit); a batch commit dropped before it publishes
+puts its batch back for the next flush (`UnfinishedCommit`: the publish in
+`commit_txn` is one synchronous step, everything before it is fresh block
+writes and pins), and one dropped after it is done in memory; a staged
+superblock whose write was dropped is put back (`write_staged_super`), so
+committed transactions still become durable at the next sync; a commit's
+write-out dropped half-way stays queued and is finished by whoever next
+needs it (§8). A multi-step operation (truncate's tail zeroing then its size
+change) dropped between steps commits the steps it staged; that is not yet
+rolled back (§8 says why the hand-over does not change it).
+
 ## 5. Architecture notes
 
 The registration interface is shared by x86_64 and aarch64. Volume construction
@@ -365,5 +748,116 @@ Stage 4: persistent filesystem compatibility.
 
 ## 8. Open questions
 
+### Commit stages and the UNBLOCKED hand-over (Linux `transaction.c`)
+
+A commit (`flush_batch_from` → `commit_batch` → `commit_txn_inner`) holds
+the transaction closed (`txn_gate` close) and `txn_lock` only while it
+freezes and publishes its trees; its write-out runs with the transaction
+open again, so new operations join the next transaction instead of waiting
+for the previous one's I/O (soak 3cde4aa39 had 24 tasks queued at
+`batch_begin` behind a write-out, fsync taking tens of seconds). The stages
+and their Linux counterparts (`fs/btrfs/transaction.c` in the reference
+tree):
+
+| Linux | NARF |
+|---|---|
+| RUNNING: `join_transaction`, `num_writers++` | `txn_gate::join` (+ `op_lock` for namespace ops), `batch_begin` |
+| COMMIT_PREP: wait for `prev_trans` to reach TRANS_STATE_COMPLETED (2326–2345), new writers still join | `flush_batch_from` (transaction not closed by the caller): `finish_write_out` before closing |
+| COMMIT_START / COMMIT_DOING: no new joins, wait for writers, run delayed refs, `commit_cowonly_roots`, `switch_commit_roots` | `VolCore::exclusive` closes; `commit_txn_inner` up to the publish: tree updates, node stamping, superblock image (`bytes_used` summed over the dirty extent tree) |
+| frozen dirty extent buffers stay in memory until written (`btrfs_uninhibit_all_eb_writeback`, 2580) | every new node of the commit is a **dirty** node-cache entry from the freeze to the end of its write-out (`NodeCache::mark_dirty`): outside the budget, never evicted, invalidated, forgotten or replaced by a device fill; written, it becomes an ordinary clean entry; a commit that fails before publishing discards them (`DirtyNodes`) |
+| UNBLOCKED: `running_transaction = NULL`, wake `transaction_wait` (2561–2566) | publish (`queue_write_out`, then `commit_roots`, `publish_subvol_root`, `set_free_view`, `forget_node` of replaced blocks), then the close and `txn_lock` drop: the next batch opens at gen+1 on the published roots and free-space view, minus pinned extents |
+| `btrfs_write_and_wait_transaction` (2584), `write_all_supers` (2591) | the **write-out lane** (`BtrfsVolume::finish_write_out`): one queued `WriteOut` (nodes, superblock image) at a time; `write_nodes`, then the image is staged (only now: a staged image is always the newest fully written commit) and written when due (`MAX_STAGED_COMMITS`) |
+| SUPER_COMMITTED / COMPLETED, `btrfs_finish_extent_commit` (extent-tree.c) | `write_staged_super` → `note_durable` → `unpin_through(gen)`: pins carry the generation that freed them, and a superblock releases only those at or below its own |
+| `cleanup_transaction` / `btrfs_handle_fs_error` on a write-out error (`scrub_continue`) | a failed write-out aborts the filesystem (loudly: every operation since the last durable generation is lost), puts the batch's subvolume roots back to the last durable commit (`WriteOut::rollback`), and a batch opened over it is dropped at its flush instead of committed (`flush_batch_closed`) |
+
+Who finishes the write-out: the committer, once the transaction is open
+again (`flush_batch_from` for an operation that filled the batch or the
+commit timer; `commit_through` for `fsync`/`syncfs`/`msync`), or — if that
+caller's future was cancelled — whoever next needs it: every commit before
+it starts (`commit_txn_inner`, so every other transaction run under
+`exclusive` sees it complete), administrative work (`begin_admin`, which
+reads and writes the device directly), `write_staged_super` and so every
+sync, and the last-unmount commit (`core_is_dirty` counts a queued
+write-out). The `WriteOut` stays queued until it has succeeded, so a
+cancelled write-out is redone from the start (rewriting a node with the
+same bytes is harmless). A caller that keeps the transaction closed across
+a flush (`sync_to_disk`, administrative work) gets the commit complete,
+write-out and all, as before the hand-over.
+
+Durability waits: `commit_through(target)` first finishes a write-out that
+may already carry `target`, then — only if `target` is still in the open
+batch — closes the transaction for the freeze alone
+(`flush_batch_handing_over`) and waits for the write-out and superblock
+outside it. A change staged after a hand-over belongs to the next
+generation and is covered by the next commit, never reported durable on the
+earlier superblock. Waits inside an operation stay non-killable; a killed
+task's operation is no longer queued behind a write-out because nothing it
+waits for (the gate, `txn_lock`, `fs_batch`) is held across one.
+
+Tests (`drivers/fs/btrfs/commit`, `src/tests/commit_handover.rs`):
+dirty node-cache entries survive invalidation, eviction, shrink and a
+device fill; a cancelled write-out is finished by the next sync, and a crash
+image cut before it shows the old generation; with a write-out held
+(`WRITE_OUT_HOLD`), a new operation completes, an fsync after the hand-over
+waits for the next commit, and crash images cut during, between and after
+the two overlapping commits each show exactly one generation; a failed
+write-out with a later batch open aborts and leaves the device at the last
+durable generation. `smoke_btrfs_superblock_releases_only_its_own_pins`
+covers the per-generation pins.
+
+A multi-step operation (truncate's tail zeroing then its size change)
+dropped between its steps still commits the steps it staged. The hand-over
+does not change that: what is missing is a savepoint inside the batch, and
+other inodes' operations stage into the same batch between the steps, so
+putting the batch back to its state before the first step would lose them.
+Linux has no such case (a truncate is not cancellable); a killed task's
+truncate is handed off and finishes.
+
+### Data written outside the transaction (Linux ordered extents)
+
+A file write (`cow_write_file_once`) writes its data holding no transaction
+lock, as Linux writes a buffered write's delalloc range through an ordered
+extent (`cow_file_range` reserves the extent, the bio goes out with no
+transaction handle, `btrfs_finish_ordered_io` inserts the file-extent item
+and checksums). Per extent: carve it from the open batch's allocator under
+`fs_batch`, held only for the carve; withhold it from every allocator
+(`hold_inflight_data`, part of `pinned_ranges`) — the batch it came from may
+commit without it; write the data with the operation stepped out of the
+running transaction (`step_out_for_io`; not while `hold_commits` keeps a
+multi-stage operation in one transaction). Then join again and stage the
+file-extent items, checksums and inode, at the generation of whichever
+batch is open then, with the qgroup reservation taken at staging.
+
+Invariants: nothing records an extent whose data is not on the device
+(staging follows the completed write, and a superblock's pre-flush makes it
+durable); a reader sees the old extents until staging; the caller's inode
+lock keeps truncate, punch, fallocate, fsync and other writes of the file
+out until it is staged; a failed or abandoned write stages nothing and
+gives its carve back (the carving batch frees it at its commit; the
+withholding ends); a killed task's write is handed off and finishes. Tests:
+`smoke_btrfs_data_write_holds_no_transaction_lock` (another file's write, a
+create and a commit complete while a data write is held; a crash image then
+holds the old data; the held extent is not reused),
+`smoke_btrfs_abandoned_data_write_returns_its_extent`.
+
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
+
+Directories cannot carry xattrs through the VFS yet: `DirOps::set_xattr` is
+the trait's default (`Unsupported`), so a directory's `user.*`, ACL or
+security xattrs cannot be set or removed through it.
+
+A transaction's commit cannot allocate a chunk. Admission keeps it from
+needing one: every operation is refused with `NoSpace` unless the free
+metadata of the allocated block groups covers the global reserve and twice
+the batch's first-order need, and the refusal commits, then grows the
+filesystem between operations (`autogrow!`, `write::locked_step`). Linux
+can also allocate a chunk inside a transaction (`btrfs_reserve_metadata_bytes`
+→ `flush_space(ALLOC_CHUNK)`, the block group created by
+`btrfs_create_pending_block_groups` at commit). Doing the same here would take:
+the batch's allocator adopting a chunk allocated within the batch (its
+free-space view extended, the chunk's own tree items staged as edits of the
+same transaction rather than committed by a separate `alloc_chunk`
+transaction), the chunk-tree, device-tree and block-group edits joining the
+commit's fixed point, and a test in which a batch runs out of metadata at
+commit with unallocated device space left.

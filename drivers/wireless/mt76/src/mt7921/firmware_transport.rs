@@ -449,6 +449,40 @@ pub async fn stop_boot_monitor() -> Result<(), Error> {
         .stop_monitor()
         .await
 }
+/// Start a host scheduled scan on the retained idle station.
+pub async fn start_boot_sched_scan(config: &narf_wireless::NetDetectConfig) -> Result<(), Error> {
+    narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .start_sched_scan(config)
+        .await
+}
+/// One bounded collection step of the running scheduled scan: a finished
+/// cycle's results, or `None` while it runs. `Busy` when the owner is
+/// taken; `Cancelled` when no scheduled scan runs any more.
+pub fn step_boot_sched_scan() -> Result<Option<ScanReport>, Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.step_sched_scan()
+}
+pub async fn stop_boot_sched_scan() -> Result<(), Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .stop_sched_scan()
+        .await
+}
+
 pub fn step_boot_monitor() -> Result<MonitorCapture, Error> {
     let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -502,16 +536,19 @@ pub async fn associate_boot_station(
     security: crate::mt7921::association::Security,
     extra_ies: &[u8],
 ) -> Result<u16, Error> {
-    associate_boot_station_as(bss, ssid, security, extra_ies, false).await
+    associate_boot_station_as(bss, ssid, security, extra_ies, false, false).await
 }
 
 /// Station or P2P-client (`p2p_client`) join on the retained boot owner.
+/// `heard_beacon`: the latest scan received the BSS's own Beacon, which lets
+/// an infrastructure station follow it onto a radar/NO_IR channel.
 pub(crate) async fn associate_boot_station_as(
     bss: &ScanBss,
     ssid: &[u8],
     security: crate::mt7921::association::Security,
     extra_ies: &[u8],
     p2p_client: bool,
+    heard_beacon: bool,
 ) -> Result<u16, Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -525,8 +562,40 @@ pub(crate) async fn associate_boot_station_as(
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .associate_station_as(bss, ssid, security, extra_ies, network)
+        .associate_station_as(
+            bss,
+            ssid,
+            security,
+            extra_ies,
+            network,
+            heard_beacon && !p2p_client,
+        )
         .await
+}
+
+/// Roam the home station to `bss` within the ESS (cfg80211 CONNECT with
+/// NL80211_ATTR_PREV_BSSID, mac80211 reassociation): leave the current AP
+/// `current_ap` with a deauthentication and its keys retired, then join
+/// `bss` with a Reassociation Request naming `current_ap`.
+pub(crate) async fn reassociate_boot_station(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    heard_beacon: bool,
+    current_ap: [u8; 6],
+) -> Result<u16, Error> {
+    disassociate_boot_station().await?;
+    {
+        let Some(mut owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        owner
+            .as_mut()
+            .ok_or(Error::DeviceGone)?
+            .set_reassociation(current_ap);
+    }
+    associate_boot_station_as(bss, ssid, security, extra_ies, false, heard_beacon).await
 }
 
 /// Disassociate the current station using the retained boot owner.
@@ -590,6 +659,8 @@ async fn finish_received_data(
 pub struct PacketStep {
     pub transmitted: bool,
     pub received: Vec<Vec<u8>>,
+    /// The station link's statistics after this step (station steps only).
+    pub(crate) link: Option<crate::mt7921::link_stats::LinkStats>,
     /// Identifies the actual station/key receive owner that produced the batch.
     pub receive_epoch: u64,
 }
@@ -632,6 +703,35 @@ pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result
 /// boot owner samples it before each packet step.
 pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// NL80211_CMD_DEL_PMKSA / FLUSH_PMKSA for the home station's SAE PMKSA
+/// cache, applied by the boot owner before each join and packet step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PmksaRequest {
+    Flush,
+    Bssid([u8; 6]),
+    Pmkid([u8; 16]),
+}
+pub(crate) static BOOT_PMKSA_REQUESTS: narf_lib::sync::IrqSafeSpinLock<Vec<PmksaRequest>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// Apply queued PMKSA requests to `cache`.
+pub(crate) fn apply_pmksa_requests(cache: &mut crate::mt7921::pmksa::Cache) {
+    let requests = core::mem::take(&mut *BOOT_PMKSA_REQUESTS.lock());
+    for request in requests {
+        match request {
+            PmksaRequest::Flush => cache.flush(),
+            PmksaRequest::Bssid(bssid) => cache.remove(bssid),
+            PmksaRequest::Pmkid(pmkid) => cache.remove_pmkid(pmkid),
+        }
+    }
+}
+
+/// cfg80211 `wdev->ps` for the home station (`NL80211_CMD_SET_POWER_SAVE`):
+/// on by default as with `CONFIG_CFG80211_DEFAULT_PS`. The boot owner
+/// samples it before each packet step and applies it to an associated BSS.
+pub(crate) static BOOT_POWER_SAVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     prepare_boot_keys()?;
@@ -999,81 +1099,87 @@ where
 }
 
 pub(super) fn start_boot() -> narf_init::InitResult {
-    use core::fmt::Write;
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
     if crate::module_host::owns_discovery() {
         return InitResult::Ok;
     }
-    // Before executor polling, regular Mutex (no IRQ spinlock) retained.
-    // This future is self-waking and never depends on another executor task.
-    let result = narf_scheduler::block_on_spin(provision_boot_radio());
-    if result == Err(Error::DeviceGone) && !super::pci::is_probed() {
+    // No device, nothing to bring up — and no bring-up future to build.
+    if !super::pci::is_probed() {
         return InitResult::NotPresent;
     }
+    // Bring the radio up on a kernel task, not here. An initcall runs on the
+    // boot CPU's boot stack, and `block_on_spin` keeps the future it drives in
+    // its own frame: `provision_boot_radio()`'s state machine is large enough
+    // that its fields reached below the boot stack and overwrote the kernel
+    // image's page-table entries (aarch64, under KASLR). Linux likewise runs
+    // blocking device bring-up from a worker, not on the boot stack. The
+    // future is boxed by `spawn`; the outcome is reported when it lands.
+    narf_scheduler::spawn(boot_radio());
+    InitResult::Ok
+}
+
+/// The radio's boot bring-up: the first firmware provisioning attempt, then
+/// background retry or verified-reset recovery when it fails. Runs as a
+/// kernel task ([`start_boot`]).
+async fn boot_radio() {
+    use core::fmt::Write;
+    let result = provision_boot_radio().await;
     let _ = writeln!(
         narf_console::Writer,
         "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
         boot_status()
     );
     if result.is_ok() {
-        InitResult::Ok
-    } else if matches!(
+        return;
+    }
+    if matches!(
         boot_status(),
         BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
     ) {
         // No firmware attempt yet (or net authority arrived after radio bring-up):
-        // retry the same parked binding in the background as late firmware scans
-        // or userspace staging complete, falling back to verified reset recovery
-        // if the subsequent first hardware attempt fails.
-        narf_scheduler::spawn(async {
-            let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
-            })
-            .await;
-            if outcome.is_ok() {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "mt76: staged firmware provisioned; retained {:?}",
-                    boot_status()
-                );
-                return;
-            }
-            if !matches!(boot_status(), BootStatus::Absent) {
-                for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
-                    let result = reset_boot_transport(None).await;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "mt76: initial radio recovery {result:?}"
-                    );
-                    if result.is_ok() {
-                        let _ = provision_boot_radio().await;
-                        return;
-                    }
-                }
-            }
-        });
-        InitResult::Error("MT76 firmware preflight (provisioning available)")
+        // retry the same parked binding as late firmware scans or userspace
+        // staging complete, falling back to verified reset recovery if the
+        // subsequent first hardware attempt fails.
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: firmware preflight failed; provisioning retries in the background"
+        );
+        let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+        })
+        .await;
+        if outcome.is_ok() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: staged firmware provisioned; retained {:?}",
+                boot_status()
+            );
+            return;
+        }
+        if matches!(boot_status(), BootStatus::Absent) {
+            return;
+        }
     } else {
         // Recovery after initial firmware/radio failure has no registered
         // interface yet. Keep ownership in the same retained worker and only
         // publish an interface after a successful fresh identity query.
-        narf_scheduler::spawn(async {
-            for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
-                let result = reset_boot_transport(None).await;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "mt76: initial radio recovery {result:?}"
-                );
-                if result.is_ok() {
-                    let _ = provision_boot_radio().await;
-                    return;
-                }
-            }
-        });
-        InitResult::Error("MT76 firmware startup (owner retained)")
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: firmware startup failed; owner retained, recovering"
+        );
+    }
+    for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+        let result = reset_boot_transport(None).await;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: initial radio recovery {result:?}"
+        );
+        if result.is_ok() {
+            let _ = provision_boot_radio().await;
+            return;
+        }
     }
 }
 
@@ -1443,6 +1549,10 @@ trait Backend {
         &self,
         permission: crate::mt7921::association::TxPermission,
     ) -> Result<(), Error>;
+    /// The home station's latest sampled TX status (rate and failures).
+    fn tx_rate_report(&self) -> Option<crate::mt7921::tx_sequence::RateReport> {
+        None
+    }
     fn quiesce(&mut self) -> Result<(), Error>;
     fn idle(&mut self) -> Result<bool, Error>;
     fn initialize(&mut self) -> Result<(), Error>;
@@ -1683,6 +1793,29 @@ struct StationLink {
     tx_ba: tx_ba::Owner,
     tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
+    /// Signal and receive rate of the frames from this link's AP, for
+    /// NL80211_CMD_GET_STATION; reset with each association.
+    link_stats: crate::mt7921::link_stats::LinkStats,
+    /// cfg80211 `wdev->ps` as the owner should apply it, and the power
+    /// state the firmware BSS last took (`UNI_BSS_INFO_PS`; awake after
+    /// each association).
+    ps_wanted: bool,
+    ps_applied: bool,
+    /// The regulatory policy snapshot the grant and the firmware channel
+    /// domain / power limits were last programmed from.
+    applied_policy: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+    /// The AP this link is roaming away from: the next join sends a
+    /// Reassociation Request naming it (consumed by that join).
+    reassociate_from: Option<[u8; 6]>,
+    /// The AP's announced channel switch and when it takes effect
+    /// (mac80211 `csa` state of the managed interface).
+    csa: Option<(crate::mt7921::association::ChannelSwitch, u64)>,
+    /// Channel Switch Mode 1 is in force: no data until the switch.
+    csa_block_tx: bool,
+    /// The AP's Beacon names a new channel width for its unchanged PHY
+    /// (mac80211 `ieee80211_config_bw`): its elements, followed by the
+    /// control work.
+    bw_change: Option<narf_wireless::association::phy::ApElements>,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1738,6 +1871,14 @@ impl StationLink {
             tx_ba: tx_ba::Owner::default(),
             tx_restart: None,
             peer_lost: false,
+            link_stats: crate::mt7921::link_stats::LinkStats::default(),
+            ps_wanted: false,
+            ps_applied: false,
+            applied_policy: None,
+            reassociate_from: None,
+            csa: None,
+            csa_block_tx: false,
+            bw_change: None,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,
@@ -1784,6 +1925,8 @@ struct Session<B: Backend> {
     wtbl: crate::mt7921::vif_slots::Wtbl,
     /// The wiphy fragmentation threshold (`u32::MAX` = off).
     frag_threshold: u32,
+    /// The home station's SAE PMKSA cache.
+    pmksa: crate::mt7921::pmksa::Cache,
     receive_epoch: u64,
     /// Original copy-time native packets handed from the scan collector to
     /// the associated station's parsers; never re-stamped at delivery.
@@ -1799,6 +1942,8 @@ struct Session<B: Backend> {
     ap_keys: ap_crypto::Keys,
     wow_config: Option<narf_wireless::WowlanConfig>,
     wow_nlo: Option<Arc<scan::nlo::Plan>>,
+    /// The running host scheduled scan (NL80211_CMD_START_SCHED_SCAN).
+    sched: Option<scan::sched::Running>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1817,6 +1962,7 @@ impl<B: Backend> Session<B> {
             go: None,
             wtbl: crate::mt7921::vif_slots::Wtbl::default(),
             frag_threshold: u32::MAX,
+            pmksa: crate::mt7921::pmksa::Cache::default(),
             receive_epoch: 0,
             scan_packets: VecDeque::new(),
             scanning: false,
@@ -1826,6 +1972,7 @@ impl<B: Backend> Session<B> {
             ap_keys: ap_crypto::Keys::default(),
             wow_config: None,
             wow_nlo: None,
+            sched: None,
         }
     }
     fn stage(&mut self, stage: Stage) {

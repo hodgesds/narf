@@ -649,8 +649,14 @@ fn rebind_display_clocks(
         let Some(status) = otg.display_status(display) else {
             continue;
         };
-        for timing in status.pipes.iter().flatten() {
-            if let Some(clock) = records[usize::from(timing.request.pipe)] {
+        let pipes: Vec<u8> = status
+            .pipes
+            .iter()
+            .flatten()
+            .map(|t| t.request.pipe)
+            .collect();
+        for pipe in pipes {
+            if let Some(clock) = records[usize::from(pipe)] {
                 otg.rebind_clock(display, clock)?;
             }
         }
@@ -2042,8 +2048,9 @@ impl ColdBoot {
     pub fn display_running_timing(&mut self) -> Result<u8, otg::Error> {
         self.otg.as_mut().map_err(|e| *e)?.running_timing()
     }
-    pub fn display_timing_status(&self) -> Result<otg::Status, otg::Error> {
-        self.otg.as_ref().map(otg::Otg::status).map_err(|e| *e)
+    /// The selected display's records, borrowed (a `Status` is 14 KiB).
+    pub fn display_timing_status(&self) -> Result<&otg::Status, otg::Error> {
+        self.otg.as_ref().map(otg::Otg::status_ref).map_err(|e| *e)
     }
     /// Make `display` (0-3) the one following display operations address;
     /// see `Otg::select_display`. Global and pipe clocks are programmed with
@@ -2058,8 +2065,8 @@ impl ColdBoot {
             .map(otg::Otg::selected_display)
             .map_err(|e| *e)
     }
-    /// Any display's records.
-    pub fn display_status(&self, display: u8) -> Result<Option<otg::Status>, otg::Error> {
+    /// Any display's records, borrowed (a `Status` is 14 KiB).
+    pub fn display_status(&self, display: u8) -> Result<Option<&otg::Status>, otg::Error> {
         self.otg
             .as_ref()
             .map(|o| o.display_status(display))
@@ -2517,29 +2524,24 @@ impl ColdBoot {
         content: &mut dyn otg::PlaneContent,
     ) -> Result<alloc::boxed::Box<otg::PlanesUpdated>, otg::Error> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await?;
+        // Both steps are out of line: inline, the plane update's frame was
+        // 10 KiB under the display monitor's.
+        crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
         }
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let pool = &self.sequence.backend.pool;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.
         unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .update_live_planes(
-                    &self.sequence.backend.pool,
-                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                    gmc,
-                    pipe,
-                    request,
-                    plan,
-                    crystal,
-                    content,
-                )
-                .await
+            crate::out_of_line::boxed!(otg.update_live_planes(
+                pool, clocks, dccg, gmc, pipe, request, plan, crystal, content,
+            ))
+            .await
         }
     }
     /// Program a DPP-only clock (`request`, an `OdmSegment` pipe) for a
@@ -2715,7 +2717,7 @@ impl ColdBoot {
     pub async unsafe fn start_display_scanout(
         &mut self,
         pipe: u8,
-    ) -> Result<otg::ScanoutRunning, otg::Error> {
+    ) -> Result<alloc::boxed::Box<otg::ScanoutRunning>, otg::Error> {
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.

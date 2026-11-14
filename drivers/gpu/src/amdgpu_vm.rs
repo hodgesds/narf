@@ -610,6 +610,10 @@ impl Drop for Rebind {
     }
 }
 
+/// How long [`relocate`] waits for the buffer's jobs and fences before it
+/// refuses the move `Busy`.
+pub(crate) const RELOCATE_WAIT_NS: u64 = 5_000_000_000;
+
 /// Move an idle BO and rebind every registered VM which maps it. Waiting
 /// occurs before releasing any address lease; cancellation leaves mappings
 /// untouched. CPU leases and unregistered VM mappings still pin backing.
@@ -657,7 +661,7 @@ pub(crate) async fn relocate(
             bindings.extend(mapped.into_iter().map(|(m, e)| (vm.clone(), m, e)));
         }
     }
-    let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
+    let deadline = narf_time::monotonic_ns().saturating_add(RELOCATE_WAIT_NS);
     if let Some(engine) = crate::amdgpu_cs::submitter(card) {
         for ticket in jobs {
             if !engine.wait(ticket, deadline).await? {

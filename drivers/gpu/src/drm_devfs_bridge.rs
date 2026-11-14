@@ -193,6 +193,29 @@ fn device_closed(index: u32) {
     }
 }
 
+/// `drm_show_fdinfo` for an open of amdgpu card `index`: the driver, the
+/// open's client id and the card's PCI address, then amdgpu_show_fdinfo's
+/// memory keys (`amdgpu_gem::accounting::fdinfo`). Nothing for another
+/// driver's card.
+#[cfg(feature = "amdgpu")]
+fn drm_show_fdinfo(index: u32, gem: &crate::amdgpu_gem::GemState, out: &mut String) {
+    if crate::drm_registry::driver_name(index) != Some("amdgpu") {
+        return;
+    }
+    let pdev = crate::drm_registry::card(index)
+        .and_then(|card| crate::drm_sysfs_bridge::pci_addr_for_card(card.as_ref(), index))
+        .map(|a| {
+            alloc::format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                a.segment,
+                a.bus,
+                a.device,
+                a.function
+            )
+        });
+    crate::amdgpu_gem::accounting::fdinfo(gem, pdev.as_deref(), out);
+}
+
 /// Monotonically-increasing source of per-open DRM master ids. Starts at 1 so
 /// 0 is reserved as a "no such open" sentinel (render nodes pass 0 — they never
 /// participate in master arbitration).
@@ -419,7 +442,13 @@ impl FileOps for DriCardFile {
     /// lookup and no later edge exists to wake an infinite poll.
     fn poll_deadline(&self) -> Option<u64> {
         let now = narf_time::wall::monotonic_ns();
-        self.events.lock().next_event_deadline_ns(now)
+        let deadline = self.events.lock().next_event_deadline_ns(now);
+        // A poller parked on an event that never comes is where a lost
+        // flip strands a compositor: say so in the log, once.
+        if deadline.is_some() {
+            crate::drm::card::note_flip_stalls(now);
+        }
+        deadline
     }
 
     /// The DRM card fd is a PARKABLE readiness source: a poll/epoll set
@@ -518,6 +547,14 @@ impl FileOps for DriCardFile {
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let r = drm_node_remove_xattr(&self.metadata, name);
         Box::pin(async move { r })
+    }
+
+    /// drm_show_fdinfo.
+    fn show_fdinfo(&self, out: &mut String) {
+        #[cfg(feature = "amdgpu")]
+        drm_show_fdinfo(self.index, &self.amdgpu_gem, out);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = out;
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
@@ -1593,6 +1630,13 @@ impl Drop for DriRenderFile {
 }
 
 impl FileOps for DriRenderFile {
+    /// drm_show_fdinfo.
+    fn show_fdinfo(&self, out: &mut String) {
+        #[cfg(feature = "amdgpu")]
+        drm_show_fdinfo(self.index, &self.amdgpu_gem, out);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = out;
+    }
     fn mmap_backing(
         &self,
         offset: u64,

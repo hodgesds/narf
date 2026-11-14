@@ -185,6 +185,18 @@ impl Pool {
                 .map(|r| r.end - r.start)
                 .sum::<u64>()
     }
+    /// The largest free range in bytes: what the biggest single
+    /// reservation could be given, alignment aside.
+    pub fn largest_free(&self) -> u64 {
+        let used = self.0.used.lock();
+        let mut largest = 0;
+        let mut at = 0;
+        for range in used.iter() {
+            largest = largest.max(range.start.saturating_sub(at));
+            at = at.max(range.end);
+        }
+        largest.max(self.0.mapping.len.saturating_sub(at))
+    }
     /// The whole aperture, protected ranges included.
     pub fn size(&self) -> u64 {
         self.0.mapping.len

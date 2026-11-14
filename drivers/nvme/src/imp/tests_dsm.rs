@@ -13,10 +13,10 @@ use narf_bus::{BarKind, MmioRegion};
 use narf_io::alloc_coherent;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::id::DomainId;
-use narf_lib::sync::IrqSafeSpinLock;
 
+use super::mq::IoQueue;
 use super::ns::{NamespaceInfo, NsIds};
-use super::{Controller, IdentifyController, IoOpcode, NvmeError, Queue};
+use super::{Controller, IdentifyController, IoOpcode, NvmeError};
 use super::{ONCS_DATASET_MGMT, ONCS_WRITE_ZEROES};
 
 /// Queue depth of the fake controller; its SQ/CQ pages hold 16
@@ -39,6 +39,13 @@ struct FakeCtrl {
     sq_ptr: *const u8,
     dsm_ptr: *const u8,
     dsm_dma: u64,
+}
+
+impl Drop for FakeCtrl {
+    fn drop(&mut self) {
+        // The CQ was pre-staged for every command (see `fake_controller`).
+        super::mq::REAP_ONE_FOR_TEST.store(false, core::sync::atomic::Ordering::Release);
+    }
 }
 
 fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
@@ -67,14 +74,15 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
         }
     }
     let mut ctrl = Controller::new(0);
-    ctrl.bar0_region = Some(MmioRegion {
+    let bar_region = MmioRegion {
         phys: narf_memory::PhysAddr::new(bar.dma_addr().raw()),
         virt: bar.cpu_ptr::<u8>() as u64,
         len: bar.len() as u64,
         kind: BarKind::Mmio32 {
             prefetchable: false,
         },
-    });
+    };
+    ctrl.bar0_region = Some(bar_region);
     ctrl.identify = Some(IdentifyController {
         vid: 0,
         ssvid: 0,
@@ -100,22 +108,11 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
         ids: NsIds::default(),
     }];
     ctrl.dsm_page = Some(dsm);
-    ctrl.io_queues.push(Queue {
-        sq_buf: sq,
-        cq_buf: cq,
-        qid: 1,
-        depth: FAKE_DEPTH,
-        sq_tail: 0,
-        cq_head: 0,
-        cq_phase: 1,
-        db_stride: 4,
-        next_cid: 0,
-        stray_aer: [0; (super::ADMIN_Q_DEPTH - 1) as usize],
-        stray_aer_len: 0,
-        aer_cids: [0; (super::ADMIN_Q_DEPTH - 1) as usize],
-        aer_cids_len: 0,
-    });
-    ctrl.io_queue_locks.push(IrqSafeSpinLock::new(()));
+    ctrl.io_queues
+        .push(IoQueue::new(1, FAKE_DEPTH, sq, cq, bar_region, 4, None));
+    // Every slot already holds its command's completion: one per look, so
+    // the reaper does not consume command k+1's entry before it is posted.
+    super::mq::REAP_ONE_FOR_TEST.store(true, core::sync::atomic::Ordering::Release);
     Some(FakeCtrl {
         ctrl,
         _bar: bar,

@@ -439,6 +439,8 @@ pub mod aarch64;
 
 mod canary;
 mod cross_crate_init;
+mod init_depth;
+pub(crate) mod kstack_overflow;
 mod measure;
 mod reclaim_wait;
 mod secure_boot;
@@ -1900,6 +1902,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_memory::kaslr::image_phys_delta(),
                     narf_memory::kaslr::image_phys_bounds().0
                 );
+                // Every page of the image must be mapped at this slide: a hole
+                // faults only when something there first runs or is read.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY: the stub's tables are live; RAM is reachable
+                    // through them (the console already runs on the image).
+                    let hole = unsafe { narf_memory::kaslr::first_unmapped_image_page() };
+                    if let Some((va, got)) = hole {
+                        panic!(
+                            "kaslr: image page {va:#x} is mapped to {got:#x?}, not {:#x}, \
+                             at slide {:#x}",
+                            narf_memory::kaslr::image_virt_to_phys(va),
+                            narf_memory::kaslr::KERNEL_SLIDE
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                        );
+                    }
+                }
             }
 
             // MMU handoff per console/ §3.1. The three-step sequence
@@ -2087,6 +2106,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
                 // an undershoot lands in the guard slot.
                 narf_memory::bpf_text::randomize_window();
+                narf_memory::kstack::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
@@ -2100,6 +2120,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
                     }
                 }
+                // The kernel-stack slot exists now: move the BSP's hardirq
+                // stack off its unguarded .bss static.
+                crate::x86_64::percpu::guard_irq_stack();
+                crate::x86_64::gdt::guard_ist_stacks();
 
                 // Pre-populate the vmalloc window's kernel PML4 slot in the
                 // live kernel root, BEFORE the per-domain PML4 clones and any
@@ -2930,6 +2954,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
                 // an undershoot lands in the guard slot.
                 narf_memory::bpf_text::randomize_window();
+                narf_memory::kstack::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
@@ -2943,6 +2968,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
                     }
                 }
+                // The kernel-stack slot is reserved now; give the boot CPU its
+                // overflow stack before the first task stack exists.
+                crate::aarch64::trap::init_overflow_stack();
 
                 // vmalloc window: same treatment, and it was not reserved on
                 // aarch64 either — only the x86_64 path called it, so the
@@ -4237,12 +4265,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                     let root = fs.root();
                     // Read a file straight off the disk.
-                    let read = narf_scheduler::block_on(async {
+                    let read = narf_scheduler::block_on(alloc::boxed::Box::pin(async {
                         let file = root.lookup_async("big.dat").await?;
                         let mut buf = [0u8; 24];
                         let n = file.read(0, &mut buf).await?;
                         Ok::<_, narf_filesystem::FsError>((buf, n))
-                    });
+                    }));
                     match read {
                         Ok((buf, n)) => {
                             let _ = writeln!(
@@ -4308,7 +4336,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         None => break,
                     };
                     let name = entry.name;
-                    let ok = narf_scheduler::block_on(async {
+                    let ok = narf_scheduler::block_on(alloc::boxed::Box::pin(async {
                         // Grow the filesystem by a few chunks up front, while its
                         // extent/free-space trees are still single leaves (chunk
                         // growth requires that). This exercises per-block-group
@@ -4527,7 +4555,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         } else {
                             Err(())
                         }
-                    });
+                    }));
                     return match ok {
                         Ok(()) => {
                             let _ = writeln!(
@@ -4806,14 +4834,60 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     );
                 }
             }
-            // Run stages one at a time.
-            for s in narf_init::Stage::ALL {
-                if (s as u8) > (last_stage as u8) {
-                    break;
-                }
-                let _ = narf_init::run_stage(s);
-            }
+            // Run the initcalls on a kernel init stack, not on the boot
+            // stack: Linux runs `do_initcalls` in the `kernel_init` kthread.
+            // The boot stack is fixed and, on aarch64, sits next to the boot
+            // page tables; the init stack is an ordinary kernel-task stack
+            // with its canary (and the guard page once task stacks are
+            // vmapped), its depth measured. Still synchronous: the stages run
+            // on this CPU, in order, before boot continues.
+            const INIT_STACK_BYTES: usize = 128 * 1024;
+            narf_init::set_initcall_hook(init_depth::hook);
+            let init_depth =
+                narf_scheduler::stackful::run_on_kernel_stack(INIT_STACK_BYTES, move || {
+                    // Run stages one at a time.
+                    for s in narf_init::Stage::ALL {
+                        if (s as u8) > (last_stage as u8) {
+                            break;
+                        }
+                        let _ = narf_init::run_stage(s);
+                        // The boot stack runs every initcall. One that reached past its
+                        // bottom is named here, before what lies below is relied on.
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let stack = aarch64::boot_stack::usage();
+                            if stack.guard_written != 0 {
+                                panic!(
+                                    "boot stack overflow in init stage {}: {} of {} bytes used, \
+                             {} guard words written, lowest at phys {:#x?}",
+                                    s.name(),
+                                    stack.used,
+                                    stack.size,
+                                    stack.guard_written,
+                                    stack.lowest_written
+                                );
+                            }
+                        }
+                    }
+                });
+            let _ = writeln!(
+                console::Writer,
+                "  init stack: {} of {INIT_STACK_BYTES} bytes used by the initcalls",
+                init_depth.max(init_depth::peak_from_top())
+            );
+            init_depth::print_top(&mut console::Writer);
             let _ = narf_init::print_summary(&mut console::Writer);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let stack = aarch64::boot_stack::usage();
+                let _ = writeln!(
+                    console::Writer,
+                    "  boot stack: {} of {} bytes used after init ({} byte guard intact)",
+                    stack.used,
+                    stack.size,
+                    stack.guard
+                );
+            }
             // Status-panel diag: initcalls done; flip the phase to
             // Userspace so the panel shows the kernel reached its
             // final boot phase (scheduler, executors, sleep_pumps).

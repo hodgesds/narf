@@ -266,46 +266,38 @@ pub unsafe fn current_cpu_target_id() -> u32 {
     0
 }
 
-/// APIC ID of logical CPU `cpu` (its index in the ACPI MADT enumeration),
-/// or `None` if the topology is unknown / `cpu` is out of range. Thin
-/// passthrough to [`narf_acpi::apic_id_at`] so drivers (which dep
-/// `narf-interrupts` but not `narf-acpi`) can route a per-queue MSI-X
-/// vector to a specific CPU's LAPIC — the IRQ then lands on the core whose
-/// forwarder services that queue, instead of always the BSP.
+/// APIC ID of logical (scheduler) CPU `cpu`: the destination an MSI,
+/// IOAPIC entry or IPI needs to reach the CPU a task is pinned to.
+///
+/// Logical CPU ids are dense `0..cpu_count`, boot CPU first, the rest in
+/// ascending APIC-ID order ([`narf_acpi::apic_id_of_cpu`]); they equal the
+/// APIC ID only on a gap-free topology. [`apic_id_at`] is the MADT's
+/// firmware order and is neither. `None` when the topology is unknown or
+/// there is no such CPU.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn apic_id_at(cpu: usize) -> Option<u32> {
-    narf_acpi::apic_id_at(cpu)
+pub fn apic_id_of_cpu(cpu: usize) -> Option<u32> {
+    narf_acpi::apic_id_of_cpu(cpu)
 }
 
-/// APIC ID of scheduler CPU `cpu`, for steering an interrupt at the CPU a
-/// task is pinned to.
-///
-/// Scheduler CPU ids are APIC IDs (the AP trampoline derives its id from
-/// CPUID), whereas [`apic_id_at`] indexes the MADT in the order firmware
-/// lists it. Passing a CPU id to `apic_id_at` therefore targets the wrong
-/// CPU on any board whose MADT is not in ascending APIC-ID order. `None`
-/// when firmware does not list an enabled CPU with that APIC ID.
+/// Logical CPU id of the processor with APIC ID `apic` (inverse of
+/// [`apic_id_of_cpu`]).
 #[cfg(target_arch = "x86_64")]
-pub fn apic_id_of_cpu(cpu: usize) -> Option<u32> {
-    let wanted = u32::try_from(cpu).ok()?;
-    (0..256)
-        .map_while(narf_acpi::apic_id_at)
-        .find(|apic| *apic == wanted)
+#[inline]
+pub fn cpu_of_apic_id(apic: u32) -> Option<usize> {
+    narf_acpi::cpu_of_apic_id(apic)
+}
+
+/// aarch64 stub: no APIC.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn cpu_of_apic_id(_apic: u32) -> Option<usize> {
+    None
 }
 
 /// aarch64 stub: no APIC.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub fn apic_id_of_cpu(_cpu: usize) -> Option<u32> {
-    None
-}
-
-/// aarch64 stub: GIC affinity routing isn't wired to logical CPU indices
-/// yet, so per-CPU MSI steering is unavailable (callers fall back to a
-/// single target).
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-pub fn apic_id_at(_cpu: usize) -> Option<u32> {
     None
 }

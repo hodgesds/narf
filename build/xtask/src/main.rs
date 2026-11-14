@@ -42,7 +42,9 @@ mod ci_clippy;
 mod composition;
 mod crate_release;
 mod efi_image;
+mod frame_budget;
 mod http3_smoke;
+mod kaslr_knob;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod net_robust;
@@ -2537,8 +2539,13 @@ fn qemu_virt_dtb_path() -> PathBuf {
 }
 
 fn ahci_image_path() -> PathBuf {
+    // `NARF_SATA_IMG` puts the SATA disk somewhere else, so that two QEMUs in
+    // one worktree do not both open (and lock) the same file. Created like
+    // the default when absent.
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let path = root.join("target").join("narf-sata.img");
+    let path = std::env::var_os("NARF_SATA_IMG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target").join("narf-sata.img"));
     if !path.exists() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -4742,6 +4749,22 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 table.total(),
                 table.encoded_len()
             );
+            if matches!(args.arch, Arch::Aarch64) {
+                // Written on every link — 0 unless asked — so an image patched
+                // for one run never carries its slide into the next.
+                let slide = kaslr_knob::slide_from_env()?;
+                kaslr_knob::set_slide(&elf, slide)
+                    .with_context(|| format!("patching the KASLR slide into {}", elf.display()))?;
+                if slide != 0 {
+                    println!("xtask: KASLR slide pinned to {slide:#x} (NARF_KASLR_SLIDE)");
+                }
+            }
+            // Stack-frame budget on the image the merge gates test: every
+            // function's frame within 8 KiB unless listed, and the list only
+            // shrinks (frame_budget.rs).
+            if matches!(args.arch, Arch::X86_64) && features.contains("kernel-test") {
+                frame_budget::check(&elf, &root.join("build/frame-budget.txt"))?;
+            }
         }
     }
 

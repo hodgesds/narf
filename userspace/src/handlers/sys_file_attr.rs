@@ -119,7 +119,7 @@ fn file_attr_target(
     match target {
         Some(target) => Ok((target, Some(resolved))),
         // `filename_lookup`'s own errno: ENOENT, ENOTDIR, ELOOP, EACCES.
-        None => Err(-path_lookup_errno(&resolved)),
+        None => Err(-path_lookup_errno(&resolved, None)),
     }
 }
 

@@ -861,3 +861,73 @@ fn io_dma_sync_keeps_cpu_data_and_clamps_ranges() -> TestResult {
     }
 }
 kernel_test_in!("io", io_dma_sync_keeps_cpu_data_and_clamps_ranges);
+
+/// Registering and unregistering a payload per I/O keeps the object table
+/// and the registry bounded by the live objects, not by the I/O count: an
+/// unregistered index is released and reused under a greater generation,
+/// and the cap of the unregistered payload fails `check_live` and resolves
+/// to nothing — also once its index names the next payload.
+fn smoke_io_registry_bounded_by_live_objects() -> TestResult {
+    use crate::sg::PageList;
+    use crate::{register_pages_with_cap, registry_len, resolve_pages_cap, unregister_pages};
+    use narf_capabilities::object_table;
+    use narf_lib::id::DomainId;
+    use narf_memory::frame::{alloc_frame, free_frame};
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let page = frame.start_address();
+    let list = |len: usize| PageList::new(alloc::vec![page], len, DomainId::DRIVER_0).unwrap();
+
+    // Warm up: the first registration may take a fresh index.
+    let first = register_pages_with_cap(list(512));
+    unregister_pages(first);
+    let objects = object_table::len();
+    let slots = registry_len();
+
+    // A stale cap never comes back.
+    let stale = register_pages_with_cap(list(1024));
+    let stale_index = stale.slot().index;
+    unregister_pages(stale);
+    if stale.check_live().is_ok() || resolve_pages_cap(&stale).is_some() {
+        free_frame(frame);
+        return TestResult::Fail("an unregistered page-list cap still resolves");
+    }
+    let next = register_pages_with_cap(list(2048));
+    let reused = next.slot().index == stale_index;
+    if stale.check_live().is_ok() || resolve_pages_cap(&stale).is_some() {
+        free_frame(frame);
+        return TestResult::Fail("a stale cap resolves to the payload that reused its index");
+    }
+    if reused && next.slot().generation <= stale.slot().generation {
+        free_frame(frame);
+        return TestResult::Fail("a reused index did not advance its generation");
+    }
+    if resolve_pages_cap(&next).is_none_or(|l| l.len() != 2048) {
+        free_frame(frame);
+        return TestResult::Fail("the live cap does not resolve to its own payload");
+    }
+    unregister_pages(next);
+
+    // A million payloads, a handful of slots.
+    for i in 0..1_000_000usize {
+        let cap = register_pages_with_cap(list(4096));
+        if i % 100_000 == 0 && resolve_pages_cap(&cap).is_none() {
+            free_frame(frame);
+            return TestResult::Fail("a fresh cap does not resolve");
+        }
+        unregister_pages(cap);
+    }
+    let grew_objects = object_table::len().saturating_sub(objects);
+    let grew_slots = registry_len().saturating_sub(slots);
+    free_frame(frame);
+    // Other CPUs may register objects of their own meanwhile; a per-I/O
+    // leak would show as a million.
+    if grew_objects > 64 || grew_slots > 64 {
+        return TestResult::Fail("a payload per I/O grew the object table or the registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_registry_bounded_by_live_objects);

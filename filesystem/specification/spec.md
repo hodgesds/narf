@@ -221,7 +221,9 @@ win over file-rooted ones). `sync_all::sync_all() -> impl Future<Output =
 SyncReport>` is Linux `ksys_sync`: `syncfs` each of them, then
 `flush_block_devices()` — one flush per disk that has an entry the
 `narf.disks` policy lets write (a read-only disk received no write from this
-boot). `sync(2)` and the pre-shutdown step of every reboot / power-off use it.
+boot). `sync(2)` and the emergency sync of a forced orderly power-off
+(`narf_power::orderly::emergency_sync`) use it; `reboot(2)` does not sync
+(userspace has). `sync_all::runs()` counts the passes started.
 
 `/dev` block nodes (`BlockFile`) split a request into device calls of at
 most `max_chunk_lbas(block_size)` LBAs (≤ 65 535, ≤ 1 MiB) and return the
@@ -299,7 +301,22 @@ pub trait DirOps {
     fn dcache_identity(&self) -> (usize, u64, u64); // superblock, inode namespace, inode
     fn rcu_walkable(&self) -> bool;
     fn dcache_case_insensitive(&self) -> bool;
+
+    // Name lookup. Ok(node) = positive; Err(NotFound) = the name is absent;
+    // any other Err = the lookup failed (Linux `->lookup` returning ERR_PTR).
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError>;    // default: lookup().ok_or(NotFound)
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError>; // default: lookup_dir().ok_or(NotFound)
+    fn lookup_async(&self, name: &str) -> FsFuture<'_, Arc<dyn FileOps>>;     // default: try_lookup
+    fn lookup_dir_async(&self, name: &str) -> FsFuture<'_, Arc<dyn DirOps>>;  // default: try_lookup_dir
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>>;                 // infallible convenience
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>>;              // infallible convenience
 }
+
+impl FsError {
+    pub fn is_walk_failure(self) -> bool; // Io | Interrupted | OutOfMemory
+}
+// FsError::Interrupted: a killable wait (narf_filesystem::killable) was
+// abandoned because the caller was sent SIGKILL. Maps to EINTR.
 
 pub fn begin_path_mutation(
     parent: &dyn DirOps,
@@ -365,6 +382,29 @@ pub fn begin_path_mutation(
   filesystems retain reference walk until they provide an equivalent validity
   contract; this is the NARF equivalent of Linux returning `-ECHILD` from an
   RCU lookup that cannot safely complete locklessly.
+- Lookup has Linux `->lookup`'s three outcomes. `Ok` is a positive entry;
+  `Err(FsError::NotFound)` means the name is absent, and only that may become
+  a negative dentry; any other error means the lookup could not answer — a
+  device error (`Io`, EIO), an abandoned killable wait (`Interrupted`, EINTR,
+  seen only by the killed caller), allocation failure (`OutOfMemory`,
+  ENOMEM), corruption (`InvalidData`). Reference walk (sync and async)
+  returns such an error to its caller and caches nothing for that name, so
+  the next lookup asks the filesystem again (`lookup_slow` propagating the
+  `ERR_PTR`). A directory whose lookup can fail must override `try_lookup` /
+  `try_lookup_dir` (and its async forms); the `Option` forms collapse a
+  failure into `None` and are not used by the walk. A directory with no
+  synchronous answer (FAT, exFAT, MINIX, UDF, SquashFS, ISO 9660, 9p, FUSE)
+  returns `Err(Unsupported)` from the `try_*` forms rather than a miss.
+  Overlay lookups fail with a layer's walk failure (`is_walk_failure`)
+  instead of treating it as absence in that layer (`ovl_lookup_single`). The
+  syscall layer maps a walk failure on the path to its errno before any
+  ENOENT/ENOTDIR classification, and `open` does not fall through to its
+  directory or `O_CREAT` handling on one. That errno is the failing walk's
+  own: the stat helpers (`stat_ino_path_dir_aware_ext` and its callers)
+  return the lookup's error and hand it to `path_lookup_errno`, which
+  re-walks the path only for a caller that has no error of its own — a
+  second walk after an error that has cleared would find nothing wrong and
+  report ENOENT.
 - `dcache_identity` is the inode-alias key used by the dcache and must be
   wait-free. Its default object address is valid for filesystems that retain
   one `DirOps` object per inode. A participating backend that creates fresh
@@ -563,7 +603,10 @@ wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
 `/proc/<pid>/task/<tid>/` serves `comm`, `mem`, `stat`, `syscall` and
 `wchan`; the last two describe that thread, from the `syscall` frame and
 `wchan` name the thread-stat hook's `ThreadStat` carries. `wchan` has no
-trailing newline, as Linux `proc_pid_wchan`.
+trailing newline, as Linux `proc_pid_wchan`. It also serves the `fd` and
+`fdinfo` directories (`tid_base_stuff`), which are the process's — a thread's
+descriptor table is its process's — so `/proc/thread-self/fd/<n>` is the link
+`/proc/self/fd/<n>` is.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
@@ -876,19 +919,44 @@ without it, no PSI cgroup ABI is present. The current PSI implementation
 reports Linux-shaped zero counters and does not yet implement pressure-trigger
 writes or poll notifications.
 
-The memory-controller allocator hook is nonblocking in every allocation
+What the memory controller charges is user memory only, as in Linux without
+`__GFP_ACCOUNT`: anonymous pages, page-cache folios a task brings in, and
+tmpfs/shmem pages, charged to the memory cgroup of the task that allocates
+them. Kernel memory — the heap, page tables, driver and filesystem buffers —
+is charged to no cgroup, so no kernel allocation can be refused by a cgroup
+limit. Every memory cgroup has a `MemcgId` (Linux `mem_cgroup_id`,
+1..=65535); the allocator records it on each charged frame, and the frame's
+final free uncharges that cgroup and its ancestors, never whichever task is
+running at the time. `memory.current` therefore equals the user memory a
+cgroup's tasks allocated and still hold. A cgroup removed (rmdir, or `memory`
+disabled in its parent's `subtree_control`) while pages are charged to it goes
+offline but keeps its id and counters until `memory.current` reaches 0, so
+late uncharges reach it and its ancestors exactly as the charges did; the id
+is then released. (Linux reparents the dying cgroup's objcg; ancestor counters
+come out the same.) The older pid-keyed charge/uncharge pair remains for BPF
+maps and zswap payloads, which charge and uncharge from their owner's context.
+
+The memory-controller charge hook is nonblocking in every allocation
 context. Crossing `memory.high` commits the charge and publishes a capped,
 coalesced background-reclaim request. Breaching `memory.max` publishes the
-same non-OOM-authorized work and returns the allocator's exhaustion result.
-Fallible callers map that result to `ENOMEM`; syscall paths that collapse
-allocation exhaustion into another internal error must preserve it before
-performing their Linux errno mapping. The hook never invokes shrinkers, waits,
-or selects an OOM victim inline because its caller may hold an IRQ-safe lock
-that those paths need. Hierarchical current counters use atomic reservation
-with rollback, so concurrent charges cannot individually pass a stale max
-check and overrun the limit. Background reclaim is currently global rather
-than cgroup-keyed; deferred throttling and scoped memcg OOM require stable
-allocation-owner attribution and remain follow-up work.
+same non-OOM-authorized reclaim work, bumps the `max` event, and refuses the
+charge. A refused user-page charge queues a memory-cgroup OOM (Linux
+`mem_cgroup_out_of_memory`) that the OOM reaper runs with no allocator or
+address-space lock held: it kills one process of the cgroup's subtree chosen
+by the OOM policy, or, if none is eligible, the task whose charge was refused,
+and bumps `oom`/`oom_kill`. The refused allocation returns `ReservePressure`,
+so a faulting task waits for a reclaim cycle and retries instead of taking
+SIGSEGV; at worst it is the OOM victim. A copy-on-write break of a page the
+task already owns is force-charged past `memory.max` (Linux `__GFP_NOFAIL`).
+Page-cache and tmpfs allocations that are refused fail with `ENOMEM`. The hook
+never invokes shrinkers, waits, or selects an OOM victim inline because its
+caller may hold an IRQ-safe lock that those paths need. Hierarchical current
+counters use atomic reservation with rollback, so concurrent charges cannot
+individually pass a stale max check and overrun the limit. Background reclaim
+is global rather than cgroup-keyed, so a cgroup at `memory.max` is relieved by
+its OOM kill rather than by reclaiming its own pages; per-cgroup LRU reclaim
+and `memory.high` throttling remain follow-up work. `memory.stat` reports the
+whole of `memory.current` as `anon`; file, shmem and kernel are not split out.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
@@ -1756,7 +1824,14 @@ through `open(2)` produces an nsfs-like descriptor that retains the
 namespace object for `setns(2)`; `O_PATH|O_NOFOLLOW` instead opens the symlink
 node itself. The proc fd provider returns one `ProcFdSnapshot` containing the
 link target plus live offset, status flags, mount ID, and inode identity, so
-`fd/` and `fdinfo/` project the same open file description.
+`fd/` and `fdinfo/` project the same open file description. The snapshot also
+carries the open file itself (`ProcFdSnapshot::file`), and `fdinfo/<fd>` ends
+with whatever that file's `FileOps::show_fdinfo` writes — Linux's
+`file_operations::show_fdinfo`, which DRM device files use for the
+`drm-*` usage keys. The default writes nothing.
+`procfs::current_process_id()` and `procfs::process_comm(pid)` expose the
+caller's process id and a process's name to drivers through the same hooks
+procfs reads them with.
 For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
 id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
 `deny` transition before `gid_map` is installed. Their inode owners use the

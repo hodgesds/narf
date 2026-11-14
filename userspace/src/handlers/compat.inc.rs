@@ -1343,7 +1343,7 @@ const HOST_ANCHORED: &str = "\0";
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, ..)| s)
+    stat_ino_path_dir_aware(path).ok().map(|(s, ..)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
@@ -1379,7 +1379,25 @@ pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// name is free — so `mkdir` on it fails with EEXIST it cannot explain, and a
 /// shell following `a -> b -> a` reports "No such file" for a link that
 /// plainly exists.
-fn path_lookup_errno(path: &str) -> i64 {
+///
+/// `first` is the error the caller's own lookup of `path` failed with, when
+/// it has one: Linux returns the lookup's error as it is (`filename_lookup`
+/// → `link_path_walk`), so a walk that could not be carried out (EIO, EINTR
+/// for a killed caller, ENOMEM) is that error, never re-asked. Walking the
+/// path again to find out would answer a different question — a transient
+/// EIO gone by the second walk came back as ENOENT, telling the caller the
+/// name is free. Only a caller with no error of its own (`None`, a lookup
+/// that reports none) has the path walked again for one.
+fn path_lookup_errno(path: &str, first: Option<narf_filesystem::FsError>) -> i64 {
+    match first {
+        Some(error) if error.is_walk_failure() => return copy_fs_errno(error),
+        Some(_) => {}
+        None => {
+            if let Some(error) = path_walk_failure(path) {
+                return copy_fs_errno(error);
+            }
+        }
+    }
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
     let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
@@ -1399,7 +1417,7 @@ fn path_lookup_errno(path: &str) -> i64 {
         prefix.push_str(comp);
         // Non-final components are always followed, as in a real walk.
         match stat_ino_path_dir_aware_ext(&prefix, true) {
-            Some((st, ..)) => {
+            Ok((st, ..)) => {
                 if st.mode.file_type != narf_filesystem::FileType::Dir {
                     return ENOTDIR;
                 }
@@ -1415,11 +1433,12 @@ fn path_lookup_errno(path: &str) -> i64 {
                     return EACCES;
                 }
             }
-            // This ancestor did not resolve. A cycle here stops the walk just
-            // as a missing component does, but means something quite
-            // different, so ask before defaulting.
-            None if path_symlink_loop(&prefix) => return ELOOP,
-            None => return ENOENT,
+            // This ancestor did not resolve: its lookup's own error. A
+            // cycle stops the walk just as a missing component does, but
+            // means something quite different.
+            Err(error) if error.is_walk_failure() => return copy_fs_errno(error),
+            Err(narf_filesystem::FsError::SymlinkLoop) => return ELOOP,
+            Err(_) => return ENOENT,
         }
     }
     // Every ancestor resolved. An over-long leaf can be neither a file nor
@@ -1428,7 +1447,11 @@ fn path_lookup_errno(path: &str) -> i64 {
         return ENAMETOOLONG;
     }
     // Every ancestor resolved, so any cycle is in the final component.
-    if path_symlink_loop(path) {
+    let looped = match first {
+        Some(error) => error == narf_filesystem::FsError::SymlinkLoop,
+        None => path_symlink_loop(path),
+    };
+    if looped {
         return ELOOP;
     }
     ENOENT
@@ -1545,11 +1568,11 @@ pub(crate) fn user_path_lookup(
             follow_final = false;
         }
     }
-    let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
-        stat_ino_path_dir_aware_ext(&path, follow_final)
-    else {
-        return Err(path_lookup_errno(&path));
-    };
+    let (stat, _ino, _rdev, uid, gid, _attrs) =
+        match stat_ino_path_dir_aware_ext(&path, follow_final) {
+            Ok(found) => found,
+            Err(error) => return Err(path_lookup_errno(&path, Some(error))),
+        };
     if !path_ancestors_searchable(&path, task) {
         return Err(EACCES);
     }
@@ -1689,9 +1712,9 @@ fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::Strin
         return Err(ELOOP);
     };
     match stat_ino_path_dir_aware_ext(&resolved, true) {
-        Some((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
-        Some(_) => Err(ENOTDIR),
-        None => Err(path_lookup_errno(&resolved)),
+        Ok((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
+        Ok(_) => Err(ENOTDIR),
+        Err(error) => Err(path_lookup_errno(&resolved, Some(error))),
     }
 }
 
@@ -1703,6 +1726,23 @@ fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::Strin
 /// hop count here: a second implementation of the walk would be free to
 /// disagree with the first about what counts as a hop, and then the errno
 /// would depend on which one ran.
+/// The walk failure (see [`narf_filesystem::FsError::is_walk_failure`]) that
+/// stops resolving `path`, if that is why it fails. Runs only from the
+/// failure classifier, like [`path_symlink_loop`]; nothing a failed lookup
+/// returned was cached, so this walk asks the filesystem again.
+fn path_walk_failure(path: &str) -> Option<narf_filesystem::FsError> {
+    current_resolve_absolute(path, |_fs, root, rel| {
+        if rel.is_empty() {
+            return None;
+        }
+        match poll_blocking(narf_filesystem::resolve_async_dentry_ext(root, rel, true)) {
+            Some(Err(error)) if error.is_walk_failure() => Some(error),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
 fn path_symlink_loop(path: &str) -> bool {
     current_resolve_absolute(path, |_fs, root, rel| {
         // A mount root is a directory, never a symlink, so it cannot cycle.
@@ -1715,7 +1755,7 @@ fn path_symlink_loop(path: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn stat_ino_path_dir_aware(path: &str) -> Option<PathStat> {
+fn stat_ino_path_dir_aware(path: &str) -> Result<PathStat, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_ext(path, true)
 }
 
@@ -1738,7 +1778,15 @@ type PathStat = (
     narf_filesystem::InodeAttrs,
 );
 
-fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
+/// On failure, the error the path's lookup failed with (Linux
+/// `filename_lookup`'s): a walk that could not be carried out (EIO, EINTR,
+/// ENOMEM) is returned as soon as it happens, without trying the path's
+/// other shapes, and otherwise the first walk's error (`NotFound` when no
+/// walk took place).
+fn stat_ino_path_dir_aware_ext(
+    path: &str,
+    follow_final: bool,
+) -> Result<PathStat, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_depth(path, follow_final, 0)
 }
 
@@ -1750,8 +1798,10 @@ fn stat_ino_path_dir_aware_depth(
     path: &str,
     follow_final: bool,
     depth: u8,
-) -> Option<PathStat> {
+) -> Result<PathStat, narf_filesystem::FsError> {
     const MAX_STAT_RETRY: u8 = 2;
+    // The first walk's error, if it failed.
+    let mut first: Option<narf_filesystem::FsError> = None;
     let file = current_resolve_absolute(path, |fs, root, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
@@ -1780,7 +1830,7 @@ fn stat_ino_path_dir_aware_depth(
                 rel,
                 follow_final,
             ))
-            .and_then(|r| r.ok())
+            .and_then(|r| r.map_err(|error| first = Some(error)).ok())
             // rdev() is needed by seatd/libudev, which validate a
             // device node's type via the MAJOR:MINOR from a PATH
             // stat (not just fstat) — a 0 rdev reads as "not an
@@ -1792,9 +1842,23 @@ fn stat_ino_path_dir_aware_depth(
         }
     })
     .flatten();
-    if file.is_some() {
-        return file;
+    if let Some(file) = file {
+        return Ok(file);
     }
+    // The lookup could not be carried out: that is the answer, as it is
+    // `filename_lookup`'s. Trying the path's other shapes now could only
+    // turn it into a wrong ENOENT.
+    if let Some(error) = first.filter(|error| error.is_walk_failure()) {
+        return Err(error);
+    }
+    // A retry's walk failure is the answer too; otherwise the first walk's
+    // error stands.
+    let retried = |result: Result<PathStat, narf_filesystem::FsError>| {
+        result.map_err(|error| match first {
+            Some(first) if !error.is_walk_failure() => first,
+            _ => error,
+        })
+    };
     // A FOLLOWED `/proc/<pid>/{root,cwd,exe}` resolves to its target, exactly
     // as `open(2)` does — `stat("/proc/self/root")` must describe the task's
     // root directory, not fail. The walk above cannot reach an absolute target
@@ -1809,7 +1873,7 @@ fn stat_ino_path_dir_aware_depth(
         if let Some(target) = proc_task_link_target(current_task_id(), probe) {
             let host = apply_chroot(&target);
             if host != probe && depth < MAX_STAT_RETRY {
-                return stat_ino_path_dir_aware_depth(&host, true, depth + 1);
+                return retried(stat_ino_path_dir_aware_depth(&host, true, depth + 1));
             }
         }
     }
@@ -1827,7 +1891,7 @@ fn stat_ino_path_dir_aware_depth(
         // stable id) so a dir is distinguishable from its parent —
         // systemd's rm_rf root-guard aborts ("Attempted to remove entire
         // root file system") when a dir and its parent share st_ino.
-        return Some((
+        return Ok((
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
@@ -1854,7 +1918,7 @@ fn stat_ino_path_dir_aware_depth(
         for b in path.trim_end_matches('/').bytes() {
             ino = ino.wrapping_mul(1099511628211).wrapping_add(b as u64);
         }
-        return Some((
+        return Ok((
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
@@ -1905,19 +1969,23 @@ fn stat_ino_path_dir_aware_depth(
                         if let Some(target) =
                             fd_path_for_task(task, fd).filter(|p| p.starts_with('/'))
                         {
-                            return stat_ino_path_dir_aware_depth(
+                            return retried(stat_ino_path_dir_aware_depth(
                                 &apply_chroot(&target),
                                 false,
                                 depth + 1,
-                            );
+                            ));
                         }
                     }
                 }
-                return stat_ino_path_dir_aware_depth(&expanded, follow_final, depth + 1);
+                return retried(stat_ino_path_dir_aware_depth(
+                    &expanded,
+                    follow_final,
+                    depth + 1,
+                ));
             }
         }
     }
-    None
+    Err(first.unwrap_or(narf_filesystem::FsError::NotFound))
 }
 
 /// `FileOps` backing an open *directory* fd (from `open(path,
@@ -2335,11 +2403,12 @@ const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BA
 const EXEC_PREFIX_BYTES: usize = 256;
 
 /// What opening an exec image yields: the sniffing prefix, the resolved file,
-/// and the file's size at open time.
+/// the file's size at open time, and its resolved host path for mount policy.
 type ExecOpen = (
     alloc::vec::Vec<u8>,
     alloc::sync::Arc<dyn narf_filesystem::FileOps>,
     u64,
+    alloc::string::String,
 );
 
 /// The image an `execve` is loading, as something the ELF loader can READ from
@@ -2403,23 +2472,30 @@ impl crate::elf::ExecBytes for ExecSource {
                 if end > *size {
                     return Err(crate::elf::ElfError::TooShort);
                 }
+                let epoch = crate::mapped_file::read_epoch();
                 let mut done = 0usize;
                 while done < dst.len() {
-                    // `poll_io_to_completion`, not the budget-capped
+                    // `poll_io_to_completion`'s patience, not the budget-capped
                     // `poll_blocking`, for the same reason the old whole-image
                     // read used it: overrunning a healthy read under concurrent
-                    // block I/O surfaced as execve(2) = EIO, and dropping an
-                    // in-flight future abandons a virtio-blk request that is
-                    // still DMA-ing into a pooled scratch buffer.
-                    match poll_io_to_completion(ops.read(off + done as u64, &mut dst[done..])) {
+                    // block I/O surfaced as execve(2) = EIO. Killable, as
+                    // Linux's `kernel_read` is: a killed exec stops here (the
+                    // task dies on its way out), and the read, which may have a
+                    // virtio-blk request DMA-ing into a pooled scratch buffer,
+                    // finishes in the background into its own buffer.
+                    match crate::killable_wait::read_into(ops, off + done as u64, &mut dst[done..]) {
                         // A read that stops short of a range inside the file
                         // means the file changed under us or the device is
                         // lying; either way the caller must not get zeros.
-                        Some(Ok(0)) => return Err(crate::elf::ElfError::ImageReadFailed),
-                        Some(Ok(n)) => done += n,
+                        Ok(Some(Ok(0))) => return Err(crate::elf::ElfError::ImageReadFailed),
+                        Ok(Some(Ok(n))) => done += n,
                         _ => return Err(crate::elf::ElfError::ImageReadFailed),
                     }
                 }
+                // The image as a mapping of the file shows it: a linker
+                // that wrote its output through `MAP_SHARED` and exited may
+                // not have been written back yet.
+                crate::mapped_file::overlay_dirty(ops, off, dst, epoch);
                 Ok(())
             }
         }
@@ -2534,23 +2610,6 @@ fn do_execve_resolved(
     }
     let path: &str = &path_owned;
 
-    // `fs/exec.c::do_open_execat` opens the binary with `.acc_mode =
-    // MAY_EXEC`, and `may_open` refuses that on a `noexec` mount:
-    //
-    //     if (path_noexec(path)) return -EACCES;
-    //
-    // A mount is made `noexec` precisely so nothing on it can run, so this
-    // holds for root as well. An `image_override` is an already-read
-    // memfd/fd image with no mount behind it, and Linux likewise has no
-    // mount to test there.
-    if image_override.is_none()
-        && narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(&apply_chroot(path)) & narf_filesystem::mnt_flags::NOEXEC != 0
-    {
-        ctx.set_return(errno_ret(EACCES)); // -EACCES
-        return;
-    }
-
     // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
     // fast boot even while the console is otherwise quiet): mark when the
     // session reaches its compositor / shell. Its presence = the greeter got
@@ -2590,9 +2649,8 @@ fn do_execve_resolved(
     };
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
 
-    // Resolve a path under the caller's chroot (containers/distros exec
-    // `/bin/sh` expecting the chrooted rootfs) and slurp its bytes, capped at
-    // 64 MiB. Returns the bytes, or a negative errno on failure. The errno
+    // Resolve an image under the caller's chroot and read its sniffing
+    // prefix. Returns the opened file, or a negative errno on failure. The errno
     // distinction is load-bearing: `execvp(3)` PATH-searches by execve'ing
     // each candidate and treating -ENOENT as "try the next dir" but -EINVAL/
     // -EIO as fatal. Returning EINVAL for a not-found path (the old behaviour)
@@ -2603,7 +2661,21 @@ fn do_execve_resolved(
     // demand-pages each PT_LOAD from the latter, so the bytes here serve only
     // the shebang sniff and the ELF metadata the parser needs.
     let read_exec = |p: &str| -> Result<ExecOpen, i64> {
-        let ep = apply_chroot(p);
+        // `do_open_execat` uses the namespace-wide LOOKUP_FOLLOW walk. A
+        // filesystem-local walk restarts an absolute link at its mount root:
+        // /home/daniel/.local/bin/codex then becomes /home/home/daniel/... on
+        // a separately mounted /home, even though open/stat find the file.
+        // Expand through the caller's mounts and chroot before opening it.
+        let ep = resolve_vfs_symlink_path_scoped(&apply_chroot(p), true)
+            .map_err(|errno| -errno)?;
+        // Linux checks path_noexec on the file it opened, including each
+        // script interpreter, rather than the mount containing a symlink.
+        // Anonymous fd images never enter this path and have no mount.
+        if narf_filesystem::any_restricted_mounts()
+            && current_mount_flags_at(&ep) & narf_filesystem::mnt_flags::NOEXEC != 0
+        {
+            return Err(-EACCES);
+        }
         // Resolve through the caller's PRIVATE mount namespace, not the global
         // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
         // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
@@ -2639,7 +2711,7 @@ fn do_execve_resolved(
                 {
                     return Err(-EACCES);
                 }
-                return Err(-path_lookup_errno(&ep));
+                return Err(-path_lookup_errno(&ep, None));
             }
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash
@@ -2692,11 +2764,21 @@ fn do_execve_resolved(
         // bytes, filled before any binfmt handler is consulted.
         let prefix_len = core::cmp::min(file_size, EXEC_PREFIX_BYTES);
         let mut buf = alloc::vec![0u8; prefix_len];
+        let epoch = crate::mapped_file::read_epoch();
         let mut off = 0usize;
         while off < prefix_len {
-            match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
+            // Killable (`kernel_read`): see `ExecSource::read_exact_at`.
+            let read = match crate::killable_wait::read_into(&ops, off as u64, &mut buf[off..]) {
+                Ok(read) => read,
+                Err(crate::killable_wait::Killed) => return Err(-EINTR),
+            };
+            match read {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
+                // A read a fatal signal ended is -EINTR (`kernel_read`
+                // returns the wait's error), not a storage failure; every
+                // other read failure of the image is -EIO, as before.
+                Some(Err(narf_filesystem::FsError::Interrupted)) => return Err(-EINTR),
                 Some(Err(e)) => {
                     use core::fmt::Write as _;
                     let _ = writeln!(
@@ -2718,7 +2800,8 @@ fn do_execve_resolved(
             }
         }
         buf.truncate(off);
-        Ok((buf, ops, file_size as u64))
+        crate::mapped_file::overlay_dirty(&ops, 0, &mut buf, epoch);
+        Ok((buf, ops, file_size as u64, ep))
     };
 
     // Step 3: read the image. A leading `#!` is an interpreter directive
@@ -2740,6 +2823,7 @@ fn do_execve_resolved(
     // a process pays for the pages it touches. `None` for the fexecve/memfd
     // arm below, whose bytes are already in hand with no file behind them.
     let mut exec_file: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> = None;
+    let mut exec_mount_path = None;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -2753,7 +2837,7 @@ fn do_execve_resolved(
     } else {
         let mut depth = 0u32;
         loop {
-            let (prefix, resolved_ops, file_size) = match read_exec(&cur_path) {
+            let (prefix, resolved_ops, file_size, mount_path) = match read_exec(&cur_path) {
                 Ok(b) => b,
                 Err(code) => {
                     ctx.set_return(SyscallReturn::ok(code as u64));
@@ -2809,6 +2893,7 @@ fn do_execve_resolved(
                 size: file_size,
             };
             exec_file = Some(resolved_ops);
+            exec_mount_path = Some(mount_path);
             break;
         }
     }
@@ -2830,7 +2915,7 @@ fn do_execve_resolved(
     // it here, as before, returned ENOEXEC to a caller already running as
     // the set-user-ID file's owner.)
     let exec_cred = {
-        let mount_path = apply_chroot(&cur_path);
+        let mount_path = exec_mount_path.unwrap_or_else(|| apply_chroot(&cur_path));
         exec_prepare_credentials(task, exec_file.as_deref(), &mount_path)
     };
     let exec_aux = exec_auxv(task, &exec_cred);
@@ -3061,6 +3146,17 @@ fn do_execve_resolved(
         // refs now — after activate(), so teardown of a last-ref pre-exec AS
         // never races the CR3 it used to back.
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
+        // The polling future owns a reference too, and this path never
+        // returns to the poll that would swap it: install the new space
+        // there, so the pre-exec one is released now rather than when the
+        // task exits (it kept every exec'd daemon's fork-time address space
+        // alive for the daemon's whole life).
+        let future_as = crate::user_task::current_user_task().and_then(|uctx| {
+            // SAFETY: this task's own exec, on its own stack; its future is
+            // pinned in the task and is not being polled.
+            unsafe { (*uctx).replace_process_address_space(new_as.clone()) }
+        });
+        drop(future_as);
         drop(new_as);
         drop(prev_slot_as);
         // The resolved binary's `FileOps`. Added with demand-paged exec and
@@ -3071,6 +3167,10 @@ fn do_execve_resolved(
         // its cached pages. The mapping the new image needs keeps its own
         // reference, so dropping this one here is safe.
         drop(exec_file);
+        // Diagnostic: record any address-space `Arc` this jump abandons
+        // (`/proc/narf/mm_orphans`).
+        #[cfg(target_arch = "x86_64")]
+        narf_scheduler::stackful::note_abandoned_stack();
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
@@ -3198,10 +3298,14 @@ pub(crate) fn proc_exe_magic_target(task: u64, path: &str) -> Option<alloc::stri
         .map(|exe| exe.as_ref().clone())
 }
 
-/// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
-/// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
+/// Parse `/proc/self/fd/<N>`, `/proc/thread-self/fd/<N>` or
+/// `/proc/<pid>/fd/<N>` → the fd number `N`. These are the magic symlinks
+/// glibc's fexecve / systemd's spawn execve.
 pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
-    let rest = if let Some(r) = path.strip_prefix("/proc/self/fd/") {
+    let rest = if let Some(r) = path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
+    {
         r
     } else {
         let r = path.strip_prefix("/proc/")?;
@@ -3332,19 +3436,28 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
     if size == 0 || size > 64 * 1024 * 1024 {
         return None;
     }
-    let mut buf = alloc::vec![0u8; size];
+    let epoch = crate::mapped_file::read_epoch();
+    // Fallible, as in `read_path_and_file_from_vfs`: memory pressure fails
+    // the exec instead of panicking the kernel.
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(size).is_err() {
+        return None;
+    }
+    buf.resize(size, 0u8);
     let mut off = 0usize;
     while off < size {
         // Same rule as the main image read in read_exec: an exec image read
         // is never pumped with the budget-capped poll_blocking (overrun both
         // fails a healthy exec AND drops an in-flight block-I/O future).
-        match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
-            Some(Ok(0)) => break,
-            Some(Ok(n)) => off += n,
+        // Killable (`kernel_read`): see `ExecSource::read_exact_at`.
+        match crate::killable_wait::read_into(&ops, off as u64, &mut buf[off..]) {
+            Ok(Some(Ok(0))) => break,
+            Ok(Some(Ok(n))) => off += n,
             _ => return None,
         }
     }
     buf.truncate(off);
+    crate::mapped_file::overlay_dirty(&ops, 0, &mut buf, epoch);
     if buf.len() < 64 {
         None
     } else {
@@ -3936,7 +4049,14 @@ pub(crate) unsafe fn copy_from_user_vec(
     len: usize,
 ) -> Result<alloc::vec::Vec<u8>, u64> {
     validate_user_range(src_uptr, len)?;
-    let mut buf = alloc::vec![0u8; len];
+    // Fallible: a large user buffer under memory pressure is -ENOMEM to the
+    // caller, not a kernel panic (`vec!` aborts; observed on a 4 GiB soak,
+    // a 1 MiB `send` copy in `sys_socket_send`).
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return Err(ENOMEM as u64);
+    }
+    buf.resize(len, 0u8);
     // SAFETY: validated above; SMAP bracket inside copy_from_user.
     unsafe { copy_from_user(&mut buf, src_uptr) }?;
     Ok(buf)
@@ -7724,6 +7844,20 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
     let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
     let syscall = proc_task_syscall_frame(task);
     let wchan = proc_wchan_of_frame(syscall);
+    let wait_site = wchan.as_ref().and_then(|_| crate::handlers::parked_wait_site(task));
+    let park_site = wchan.as_ref().and_then(|_| crate::handlers::parked_park_site(task));
+    // Not parked, but inside a syscall: on a CPU, or runnable after a
+    // scheduling point.
+    let running_in = if wchan.is_none() {
+        crate::task::running_syscall(task)
+            .and_then(|nr| crate::syscall::syscall_name_of_number(u64::from(nr)))
+            .map(alloc::string::String::from)
+    } else {
+        None
+    };
+    let yield_site = running_in
+        .as_ref()
+        .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
         timeslices,
@@ -7733,6 +7867,10 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         nice: nice_of(pid),
         syscall,
         wchan,
+        wait_site,
+        park_site,
+        running_in,
+        yield_site,
     }
 }
 
@@ -7975,6 +8113,278 @@ pub fn proc_pid_report(outer: u64) -> Option<u64> {
     {
         Some(outer)
     }
+}
+
+/// `/proc/narf/tasks`: every scheduler task that `/proc` does not list (no
+/// pid binding), with what it still holds. A task the scheduler keeps after
+/// its process left `/proc` keeps its future, its kernel stack and, if it has
+/// one, its address space — its resident pages and page tables — alive.
+///
+/// Header lines count scheduler tasks, `/proc`-visible ones, hidden ones,
+/// hidden ones that still own an address space and those address spaces'
+/// resident pages. Then one `group` line per (registry state, syscall, wait
+/// site) with its count and resident pages, largest first, and up to 64
+/// `task` lines.
+pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    let ids = narf_scheduler::task_origins();
+    let mut visible = 0usize;
+    let mut hidden = 0usize;
+    let mut hidden_as = 0usize;
+    let mut hidden_rss = 0u64;
+    let mut groups: BTreeMap<alloc::string::String, (usize, u64)> = BTreeMap::new();
+    let mut lines = alloc::string::String::new();
+    let mut listed = 0usize;
+    for (id, origin, spawned_at) in ids.iter() {
+        let tid = id.raw();
+        if task_to_pid_raw(tid).is_some() {
+            visible += 1;
+            continue;
+        }
+        hidden += 1;
+        let task = crate::task::task_get(tid);
+        let state = match task.as_ref() {
+            None => "unregistered",
+            Some(t) if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE => "zombie",
+            Some(_) => "live",
+        };
+        let last_pid = task.as_ref().map_or(0, |t| t.pid.load(Ordering::Relaxed));
+        let frame = proc_task_syscall_frame(tid);
+        let sys = proc_wchan_of_frame(frame).or_else(|| {
+            crate::task::running_syscall(tid)
+                .and_then(|nr| crate::syscall::syscall_name_of_number(u64::from(nr)))
+                .map(alloc::string::String::from)
+        });
+        let site = crate::handlers::parked_wait_site(tid)
+            .or_else(|| crate::handlers::parked_park_site(tid))
+            .or_else(|| crate::handlers::yielded_site(tid));
+        let space = narf_scheduler::address_space_of(*id);
+        let rss = space.as_ref().map_or(0, |s| s.memory_stats().resident_pages);
+        let as_refs = space.as_ref().map_or(0, |s| Arc::strong_count(s).saturating_sub(1));
+        if space.is_some() {
+            hidden_as += 1;
+            hidden_rss = hidden_rss.saturating_add(rss);
+        }
+        // The future's type path, trimmed to its last three segments.
+        let short = {
+            let mut cut = origin.len();
+            for _ in 0..3 {
+                match origin[..cut].rfind("::") {
+                    Some(at) => cut = at,
+                    None => {
+                        cut = 0;
+                        break;
+                    }
+                }
+            }
+            if cut == 0 {
+                *origin
+            } else {
+                &origin[cut + 2..]
+            }
+        };
+        let key = alloc::format!(
+            "{} origin={} spawned={}:{} as={} sys={} at={}",
+            state,
+            short,
+            spawned_at.file(),
+            spawned_at.line(),
+            u8::from(space.is_some()),
+            sys.as_deref().unwrap_or("-"),
+            site.as_deref().unwrap_or("-"),
+        );
+        let e = groups.entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = e.1.saturating_add(rss);
+        if listed < 64 {
+            listed += 1;
+            let _ = writeln!(
+                lines,
+                "task tid={} pid={} comm={} {} as_rss={} as_refs={} sys={} at={} origin={}",
+                tid,
+                last_pid,
+                proc_comm_of_task(tid).unwrap_or_default(),
+                state,
+                rss,
+                as_refs,
+                sys.as_deref().unwrap_or("-"),
+                site.as_deref().unwrap_or("-"),
+                origin,
+            );
+        }
+    }
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "sched_tasks {}", ids.len());
+    let _ = writeln!(s, "proc_visible {}", visible);
+    let _ = writeln!(s, "hidden {}", hidden);
+    let _ = writeln!(s, "hidden_with_as {}", hidden_as);
+    let _ = writeln!(s, "hidden_as_rss_pages {}", hidden_rss);
+    let mut sorted: alloc::vec::Vec<_> = groups.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (key, (count, rss)) in sorted.iter().take(40) {
+        let _ = writeln!(s, "group n={} rss_pages={} {}", count, rss, key);
+    }
+    s.push_str(&lines);
+    s.into_bytes()
+}
+
+/// `/proc/narf/mm_orphans`: user address spaces whose page tables are still
+/// live while no scheduler task reaches them, with what the weak registry
+/// (`narf_memory::as_origin`) knows of each: strong references now and at
+/// the last task's exit, the frame on that task's abandoned exit stack that
+/// still held one (`.text` offset, 0 none), scheduler tasks still attached
+/// (`mm_users`), and whether the first task attached is still in the task
+/// registry (`live`, `zombie`, `unregistered`) or the scheduler (`sched`).
+///
+/// Header lines, then one `group` line per distinct description, largest
+/// first, then up to 32 `orphan` lines.
+pub fn narf_mm_orphans_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    let spaces = narf_scheduler::all_address_spaces();
+    let mut owned: alloc::vec::Vec<u64> = spaces.iter().map(|a| a.root.raw()).collect();
+    drop(spaces);
+    owned.sort_unstable();
+    let mut roots = alloc::vec::Vec::new();
+    narf_memory::as_origin::for_each(|root, _| {
+        if owned.binary_search(&root).is_err() {
+            roots.push(root);
+        }
+    });
+    let mut groups: BTreeMap<alloc::string::String, usize> = BTreeMap::new();
+    let mut lines = alloc::string::String::new();
+    let mut listed = 0usize;
+    for root in roots.iter().copied() {
+        let Some(info) = narf_memory::as_origin::info(root) else {
+            continue;
+        };
+        let tid = info.owner_tid;
+        let state = if tid == 0 {
+            "none"
+        } else {
+            match crate::task::task_get(tid) {
+                None => "unregistered",
+                Some(t) if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE => "zombie",
+                Some(_) => "live",
+            }
+        };
+        let sched = tid != 0
+            && narf_scheduler::address_space_of_live(narf_scheduler::TaskId(tid)).is_some();
+        let (file, line) = info.origin.map_or(("?", 0), |o| (o.file(), o.line()));
+        let opt = |v: Option<usize>| v.map_or(alloc::string::String::from("-"), |v| alloc::format!("{v}"));
+        let key = alloc::format!(
+            "origin={}:{} owner={}{} strong={} exit_strong={} held_site={:#x} held_by_owner={} mm_users={}",
+            file,
+            line,
+            state,
+            if sched { "+sched" } else { "" },
+            opt(info.strong),
+            opt(info.exit_strong),
+            info.held_site,
+            u8::from(info.held_tid != 0 && info.held_tid == tid),
+            opt(info.user_tasks.map(|u| u as usize)),
+        );
+        if listed < 32 {
+            listed += 1;
+            let _ = writeln!(
+                lines,
+                "orphan root={:#x} tid={} held_tid={} {}",
+                root, tid, info.held_tid, key
+            );
+        }
+        *groups.entry(key).or_insert(0) += 1;
+    }
+    let (exits, held) = narf_memory::as_origin::exit_counts();
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "orphans {}", roots.len());
+    let _ = writeln!(s, "exits {}", exits);
+    let _ = writeln!(s, "exits_stack_held {}", held);
+    let mut sorted: alloc::vec::Vec<_> = groups.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for (key, count) in sorted.iter().take(40) {
+        let _ = writeln!(s, "group n={} {}", count, key);
+    }
+    s.push_str(&lines);
+    s.into_bytes()
+}
+
+/// `/proc/narf/mm_holders`: who holds the address spaces that
+/// `/proc/narf/mm_orphans` lists with no task left (`mm_users` 0) but a
+/// strong reference. Sweeps all RAM for words equal to their `Arc` address
+/// ([`narf_memory::as_origin::scan_ram_for_arcs`]) and groups the hits by the
+/// nearest kernel-image word before them (a vtable, `.rodata` or `.text`
+/// address, as a `.text`-relative offset) and its distance in words: an owner
+/// repeats one layout once per leaked space, stale copies scatter. Then the
+/// first hits raw, with their surrounding words. Slow; read on demand.
+pub fn narf_mm_holders_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    extern "C" {
+        static __text_start: u8;
+        static __rodata_end: u8;
+    }
+    let image_lo = core::ptr::addr_of!(__text_start) as u64;
+    let image_hi = core::ptr::addr_of!(__rodata_end) as u64;
+    let spaces = narf_scheduler::all_address_spaces();
+    let mut owned: alloc::vec::Vec<u64> = spaces.iter().map(|a| a.root.raw()).collect();
+    drop(spaces);
+    owned.sort_unstable();
+    let mut roots = alloc::vec::Vec::new();
+    narf_memory::as_origin::for_each(|root, _| {
+        if owned.binary_search(&root).is_err() {
+            roots.push(root);
+        }
+    });
+    let mut targets: alloc::vec::Vec<u64> = roots
+        .iter()
+        .filter_map(|&root| narf_memory::as_origin::info(root))
+        .filter(|info| info.strong.is_some_and(|s| s > 0) && info.user_tasks == Some(0))
+        .map(|info| info.arc)
+        .filter(|&arc| arc != 0)
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let mut patterns: BTreeMap<(i64, u64), usize> = BTreeMap::new();
+    let mut raw = alloc::string::String::new();
+    let mut hits = 0usize;
+    narf_memory::as_origin::scan_ram_for_arcs(&targets, |phys, words, at| {
+        hits += 1;
+        let in_image = |w: u64| w >= image_lo && w < image_hi;
+        let key = (0..at)
+            .rev()
+            .find(|&k| in_image(words[k]))
+            .map(|k| ((at - k) as i64, words[k] - image_lo))
+            .or_else(|| {
+                (at + 1..words.len())
+                    .find(|&k| in_image(words[k]))
+                    .map(|k| (-((k - at) as i64), words[k] - image_lo))
+            })
+            .unwrap_or((0, 0));
+        *patterns.entry(key).or_insert(0) += 1;
+        if hits <= 8 {
+            let _ = write!(raw, "hit phys={:#x} words", phys);
+            for (k, w) in words.iter().enumerate() {
+                let mark = if k == at { "*" } else { "" };
+                if in_image(*w) {
+                    let _ = write!(raw, " {}img+{:#x}", mark, w - image_lo);
+                } else {
+                    let _ = write!(raw, " {}{:#x}", mark, w);
+                }
+            }
+            raw.push('\n');
+        }
+    });
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "targets {}", targets.len());
+    let _ = writeln!(s, "hits {}", hits);
+    let mut sorted: alloc::vec::Vec<_> = patterns.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for ((dist, word), count) in sorted.iter().take(30) {
+        let _ = writeln!(s, "pattern n={} dist={} img+{:#x}", count, dist, word);
+    }
+    s.push_str(&raw);
+    s.into_bytes()
 }
 
 /// /proc enumerator — every live PROCESS (thread-group leader, keyed in
@@ -8566,22 +8976,14 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     // resolve pid→tid. Getting this wrong made /proc/self/fd/<n> unresolvable —
     // systemd execs its executor via `execve("/proc/self/fd/N")`, so an empty
     // resolution turned every service spawn into EBADF (project_pidns_flow_model).
-    let tid = proc_pid_to_tid(pid);
-    if let Some(path) = crate::mqueue::fd_path(tid, n) {
-        // Validate that the slot still exists before trusting the separately
-        // maintained fd→path table (fd numbers may be closed and reused).
-        if crate::fd::with_table(tid, |table| table.get(n).is_some()).unwrap_or(false) {
-            return Some(strip_chroot_prefix(tid, &path));
-        }
-    }
-    crate::fd::with_table(tid, |table| Some(pathless_fd_link(&*table.get(n)?.ops))).flatten()
+    fd_path_for_task(proc_pid_to_tid(pid), n)
 }
 
-/// `/proc/<pid>/fd/<n>` target of an fd with no recorded path — what Linux's
-/// pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
-/// `pipe:[ino]` (pipefs), `anon_inode:<name>` (anon_inodefs, e.g.
-/// `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets by that inode, and
-/// tools tell eventfds from timerfds by the name.
+/// `/proc/<pid>/fd/<n>` target of a file with no name in the namespace — what
+/// Linux's pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
+/// `pipe:[ino]` (pipefs), `net:[ino]` (nsfs), `anon_inode:<name>`
+/// (anon_inodefs, e.g. `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets
+/// by that inode, and tools tell eventfds from timerfds by the name.
 ///
 /// Never starts with `/`: fexecve via `/proc/self/fd/N` uses that to decide
 /// between re-resolving a path and exec'ing the fd's own bytes.
@@ -8590,6 +8992,14 @@ fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String
     if let Some(name) = ops.anon_name() {
         return alloc::format!("anon_inode:{name}");
     }
+    // `fs/nsfs.c::ns_dname`: `<type>:[<inum>]`.
+    #[cfg(feature = "container")]
+    if let Some(ns) = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::namespaces::NsFd>())
+    {
+        return ns.link_text();
+    }
     let dev = ops.inode_attrs().dev;
     if dev != 0 && dev == PseudoFs::Sock.dev() {
         return alloc::format!("socket:[{}]", ops.ino());
@@ -8597,53 +9007,73 @@ fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String
     if dev != 0 && dev == PseudoFs::Pipe.dev() {
         return alloc::format!("pipe:[{}]", ops.ino());
     }
-    // Types not yet given an identity keep the non-empty placeholder. A
-    // memfd lands here too: its `/memfd:<name> (deleted)` link is rendered
+    // What is left is a file that has no name here: one whose name was
+    // removed (the path helpers send an unlinked file this way so that it is
+    // reached as an object, never by a path that no longer leads to it), a
+    // file on a kernel-internal mount (`/memfd:<name> (deleted)` is rendered
     // only by `fd_path_of`, because callers of this treat a `/` as a path to
-    // reopen.
+    // reopen), or a class nobody has named yet.
     "anon_inode:[FileOps]".into()
 }
 
-/// `d_path` of a file created unlinked on a kernel-internal mount
-/// ([`narf_filesystem::FileOps::internal_name`]): `/memfd:<name> (deleted)`.
+/// `d_path` of a file on a kernel-internal mount, which no path in the
+/// namespace leads to: one created unlinked there
+/// ([`narf_filesystem::FileOps::internal_name`], `/memfd:<name> (deleted)`),
+/// or a dma-buf (`dmabuffs_dname`, `/dmabuf:<name>` — NARF's are unnamed).
 pub(crate) fn internal_file_path(ops: &dyn narf_filesystem::FileOps) -> Option<alloc::string::String> {
-    ops.internal_name().map(|name| alloc::format!("/{name} (deleted)"))
+    if let Some(name) = ops.internal_name() {
+        return Some(alloc::format!("/{name} (deleted)"));
+    }
+    let dev = ops.inode_attrs().dev;
+    (dev != 0 && dev == narf_filesystem::inode_id::PseudoFs::DmaBuf.dev())
+        .then(|| alloc::string::String::from("/dmabuf:"))
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
     let tid = proc_pid_to_tid(pid);
-    let (pos, flags, ino, internal) = crate::fd::with_table(tid, |table| {
+    let (pos, flags, ops, name) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
         Some((
             table.offset(n)?,
             table.status_flags(n)?,
-            entry.ops.ino(),
-            internal_file_path(&*entry.ops),
+            entry.ops.clone(),
+            table.description(n).and_then(|description| description.name()),
         ))
     })
     .flatten()?;
-    // Preferred: the real backing path recorded at open() time (the same
-    // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
-    // readlinks to — musl's realpath() opens O_PATH then readlinks here.
-    // Report it chroot-relative so a chrooted process (e.g. udev in a
-    // distro chroot) can re-open the link target in its own namespace.
+    // `proc_fd_link` + `d_path`. A file on a kernel-internal mount reads its
+    // `d_dname` text. A file opened by path reads that path — the one its
+    // open file carries, so the same for every descriptor, thread and
+    // process that holds it, and following a rename — relative to the
+    // READER's root (`current->fs->root`; a path outside it stays absolute),
+    // with ` (deleted)` once the name is gone. musl's and Bun's realpath
+    // open `O_PATH` and read this. Anything else reads its class.
     //
-    // A memfd's link is what Linux readlink shows, `/memfd:<name> (deleted)`.
-    // It is display-only: the path helpers the exec and open paths consult
-    // (`fd_path_string_of`, `fd_path_for_task`) keep reporting no `/` path
-    // for it, so fexecve still runs the fd's own bytes rather than looking
-    // the text up as a file.
+    // The internal-mount and deleted texts are display-only: the path
+    // helpers the exec and open paths consult (`fd_path_string_of`,
+    // `fd_path_for_task`) report no `/` path for such a file, so fexecve
+    // still runs the fd's own bytes rather than looking the text up.
+    let path = match (internal_file_path(&*ops), &name) {
+        (Some(path), _) => path,
+        (None, Some(name)) => {
+            let shown = strip_chroot_prefix(current_task_id(), &name.path);
+            if name.deleted {
+                alloc::format!("{shown} (deleted)")
+            } else {
+                shown
+            }
+        }
+        (None, None) => pathless_fd_link(&*ops),
+    };
     Some(narf_filesystem::procfs::ProcFdSnapshot {
-        path: match internal {
-            Some(path) => path,
-            None => fd_path_string_of(pid, n)?,
-        },
+        path,
         info: narf_filesystem::procfs::ProcFdInfo {
             pos,
             flags,
-            mnt_id: crate::mqueue::fd_mount_id(tid, n).unwrap_or(0),
-            ino,
+            mnt_id: name.and_then(|name| name.mount_id).unwrap_or(0),
+            ino: ops.ino(),
         },
+        file: narf_filesystem::procfs::ProcFdFile(Some(ops)),
     })
 }
 
@@ -8652,11 +9082,36 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
 /// its first argument as a Linux PID for procfs. Treating a TaskId as a PID
 /// misroutes a lookup whenever it numerically collides with another process's
 /// PID (as systemd's forked mount helpers routinely do).
+///
+/// The answer is a path (it starts with `/`) only while that path leads to
+/// the file. A file whose name was removed is reached as an object, like one
+/// that never had a name: its old path leads nowhere, or to a different file
+/// made there since.
 pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::String> {
-    if let Some(p) = crate::mqueue::fd_path(task, n) {
-        return Some(strip_chroot_prefix(task, &p));
-    }
-    crate::fd::with_table(task, |t| Some(pathless_fd_link(&*t.get(n)?.ops))).flatten()
+    let (ops, name) = crate::fd::with_table(task, |t| {
+        Some((
+            t.get(n)?.ops.clone(),
+            t.description(n).and_then(|description| description.name()),
+        ))
+    })
+    .flatten()?;
+    Some(match name {
+        Some(name) if !name.deleted => strip_chroot_prefix(task, &name.path),
+        _ => pathless_fd_link(&*ops),
+    })
+}
+
+/// The name an open file would carry for `path`: the directory part with its
+/// symlinks resolved, as `open` records it. `rename`, `unlink` and `rmdir`
+/// report the names they changed in this form (`crate::fd::names`).
+pub(crate) fn open_file_name(path: &str) -> alloc::string::String {
+    let (dir, leaf) = match path.rsplit_once('/') {
+        Some(("", leaf)) => ("/", leaf),
+        Some((dir, leaf)) => (dir, leaf),
+        None => return alloc::string::String::from(path),
+    };
+    let dir = resolve_vfs_symlink_path(dir, true).unwrap_or_else(|| alloc::string::String::from(dir));
+    alloc::format!("{}/{leaf}", dir.trim_end_matches('/'))
 }
 
 /// Strip the task's chroot prefix from a host-absolute path, yielding the
@@ -9322,72 +9777,14 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     false
 }
 
-/// Timer-tick hook (called from the arch timer ISR). Raises any signal
-/// whose timer has expired for the *currently running* task, so a
-/// CPU-bound task that never parks still receives e.g. SIGALRM from
-/// `alarm()` / `setitimer(ITIMER_REAL)`. Alloc-free — safe to call with
-/// interrupts disabled from the trap handler. The raised signal is then
-/// delivered by `signal_delivery_hook` on the same trap's return to user.
+/// Timer-tick hook (called from the arch timer ISR and at syscall exit).
+/// Runs the CPU-clock interval timers (ITIMER_VIRTUAL → SIGVTALRM,
+/// ITIMER_PROF → SIGPROF) for the current task, which Linux also samples from
+/// the tick in the task's own context. Alloc-free; one atomic load when no
+/// CPU itimer is armed. ITIMER_REAL and POSIX timers are hrtimers and raise
+/// their own signals from their expiry callbacks.
 pub fn timer_tick_raise_due_signals() {
-    // CPU itimers (ITIMER_VIRTUAL → SIGVTALRM, ITIMER_PROF → SIGPROF) for
-    // the interrupted/current task. Checked ahead of the REAL scan because
-    // the REAL fast gate below returns from the whole function; both paths
-    // are alloc-free and one-atomic-load cheap when unused.
     crate::posix_timer::itimer_cpu_tick();
-    {
-        let Some(now) = crate::posix_timer::itimer_real_due_now() else {
-            return;
-        };
-        // Scan EVERY armed ITIMER_REAL slot, not just the interrupted task's.
-        // The owner of a `setitimer(ITIMER_REAL)` is frequently PARKED (e.g.
-        // blocked in waitpid while CPU-bound children spin) — so it's never
-        // the interrupted task, and the sleep-pump that would catch it
-        // starves under that load. Without this scan the parked owner's
-        // SIGALRM never fires (the kernel cause of the SMP chroot_run /
-        // stress-ng hang, where a parent stops its workers via an alarm).
-        //
-        // O(1)-stack drain: take one due owner at a time, then raise + wake it
-        // OUTSIDE the ITIMERS lock. We MUST NOT collect the owners into a large
-        // on-stack `[u64; N]` buffer here: this runs in the timer ISR on the
-        // *user task's own kernel stack* (per-task-own-stack model), and a
-        // ~512 B array on that IRQ-path frame deterministically smashed this
-        // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
-        // — the same "no big on-stack array in IRQ context" hazard the timer
-        // wheel documents (the hrtimer expiry path).
-        raise_due_itimer_real(now);
-    }
-}
-
-/// Drain-and-raise every due ITIMER_REAL owner at `now`. Shared by the
-/// timer-tick hook above and the park loop's backstop kick
-/// (`park_should_block`): a parked owner's own 1 ms backstop treadmill
-/// otherwise never raises — its re-executed syscall parks again without
-/// reaching the syscall-EXIT hook, the posix-timer sleep pump only runs
-/// from nested waits (not the executor's `run_io` rounds), and an idle
-/// CPU's tick interrupts the executor, not user mode. The raise then
-/// depended on UNRELATED system activity — measured 6.5 s (and worse) of
-/// SIGALRM latency to a task parked in a FIFO open on an idle guest.
-///
-/// Alloc-free and IRQ-safe (O(1)-stack take-one drain; see the stack
-/// hazard note above). Every lock `wake_signal` touches is an
-/// `IrqSafeSpinLock`, so both the timer ISR and executor contexts may
-/// call this.
-pub(crate) fn raise_due_itimer_real(now: u64) {
-    let mut after: Option<u64> = None;
-    while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
-        after = Some(t);
-        // SIGALRM (14). Slot was pre-created when the timer was armed, so
-        // this only sets a bit in an existing entry (never allocates).
-        // ITIMER_REAL is process-directed (`it_real_fn` ->
-        // `kill_pid_info(SIGALRM, SEND_SIG_PRIV, leader_pid)`): raise it on the
-        // group's shared set and wake a thread that wants it — which may be a
-        // sibling when the owner blocks SIGALRM. The owner's slot was seeded
-        // when the timer was armed, so this never allocates.
-        if !raise_group_signal_irq(t, 14) {
-            let _ = raise_signal_pending_irq(t, 14);
-            wake_signal(t);
-        }
-    }
 }
 
 /// Preemptive time-slice: hand a CPU-bound user task back to the
@@ -9766,13 +10163,18 @@ fn futex_timeout_deadline(
     }
     let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
     let remaining = i128::from(requested).saturating_sub(wall_now);
-    if remaining <= 0 {
-        Ok(Some(monotonic_now))
+    let deadline = if remaining <= 0 {
+        monotonic_now
     } else {
-        Ok(Some(monotonic_now.saturating_add(
-            u64::try_from(remaining).unwrap_or(u64::MAX),
-        )))
+        monotonic_now.saturating_add(u64::try_from(remaining).unwrap_or(u64::MAX))
+    };
+    // The wait's timer runs on the REALTIME base so a clock step moves it
+    // (`futex_setup_timer` with `CLOCK_REALTIME`).
+    if let Some(uc) = crate::user_task::current_user_task() {
+        // SAFETY: the running task's live ctx; atomics only.
+        crate::user_task::note_realtime_park(unsafe { &*uc }, deadline, requested.max(1));
     }
+    Ok(Some(deadline))
 }
 
 /// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
@@ -14091,14 +14493,11 @@ fn install_recv_ancillary(
     let mut installed = 0;
     for passed in fds.into_iter().take(rights_to_install) {
         // `scm_detach_fds` → `receive_fd` installs the sender's `struct
-        // file` itself, `f_path` included, so `/proc/<pid>/fd/<n>` of the new
-        // descriptor names the file the sender opened. sshd's monitor passes
+        // file` itself. The open file description carries what the file
+        // names, so `/proc/<pid>/fd/<n>` of the new descriptor reads the
+        // sender's path with nothing to copy here — sshd's monitor passes
         // the pty it allocated to the session process this way, and
         // `ttyname` of the session's stdin reads that link.
-        let opened_path = passed
-            .description
-            .as_ref()
-            .and_then(|description| description.opened_path());
         if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
                 passed.ops,
@@ -14109,15 +14508,6 @@ fn install_recv_ancillary(
         })
         .flatten()
         {
-            match opened_path {
-                Some(path) => {
-                    let mount_id = current_mount_id_at(&path);
-                    crate::mqueue::register_fd_path_owned(task, newfd, path, mount_id);
-                }
-                // A pathless file must not inherit the row a previous user
-                // of this descriptor number left behind (`fd::install`).
-                None => crate::mqueue::forget_fd_path(task, newfd),
-            }
             let offset = rights_start + 16 + installed * 4;
             ctrl[offset..offset + 4].copy_from_slice(&newfd.to_le_bytes());
             installed += 1;
@@ -14149,7 +14539,6 @@ fn install_recv_ancillary(
             let offset = rights_start + 16 + i * 4;
             let newfd = u32::from_le_bytes(ctrl[offset..offset + 4].try_into().unwrap());
             let _ = fd::with_table(task, |table| table.close(newfd));
-            crate::mqueue::forget_fd_path(task, newfd);
         }
         used = 0;
         truncated = true;
@@ -16369,9 +16758,17 @@ mod aio {
         // fix in the same class.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
         let outcome = ops.map(|ops| {
-            poll_blocking(ops.read(offset, &mut kbuf))
+            let epoch = crate::mapped_file::read_epoch();
+            let read = poll_blocking(ops.read(offset, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-                .ok()
+                .ok();
+            // As `read(2)`: a `MAP_SHARED` store not written back yet is
+            // part of the file.
+            if let Some(n) = read {
+                let n = n.min(kbuf.len());
+                crate::mapped_file::overlay_dirty(&ops, offset, &mut kbuf[..n], epoch);
+            }
+            read
         });
         match outcome {
             Some(Some(n)) => {
@@ -16404,6 +16801,7 @@ mod aio {
         // Clone ops out, then run the blocking write outside the lock — same
         // non-reentrant / park-with-lock-held hazard as do_pread.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let stamp = crate::mapped_file::write_stamp();
         let outcome = ops.as_ref().map(|ops| {
             poll_blocking(ops.write(offset, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
@@ -16415,7 +16813,7 @@ mod aio {
         // sys_write/sys_pwrite64 do.
         if let (Some(ops), Some(Some(n))) = (&ops, &outcome) {
             if *n != 0 && *n <= kbuf.len() {
-                crate::mapped_file::note_file_written(ops, offset, &kbuf[..*n]);
+                crate::mapped_file::note_file_written(ops, offset, &kbuf[..*n], stamp);
             }
         }
         match outcome {
@@ -16496,11 +16894,12 @@ mod aio {
         // fd-table lock held (see do_pread).
         let ops = fd::with_table(tid, |t| t.get(iocb.aio_resfd).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
+            let stamp = crate::mapped_file::write_stamp();
             if let Some(Ok(n)) = poll_blocking(ops.write(0, &one)) {
                 // Same write(2)-family fold-in as do_pwrite (#676); a no-op
                 // unless the resfd's file has fallback-cached pages.
                 if n != 0 && n <= one.len() {
-                    crate::mapped_file::note_file_written(&ops, 0, &one[..n]);
+                    crate::mapped_file::note_file_written(&ops, 0, &one[..n], stamp);
                 }
             }
         }
@@ -17718,7 +18117,7 @@ pub(crate) use {
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,
-    handler_sys_sync::{pre_shutdown_sync, sync_all_blocking, sys_sync},
+    handler_sys_sync::sys_sync,
     handler_sys_sync_file_range::sys_sync_file_range,
     handler_sys_syncfs::sys_syncfs,
     handler_sys_sysinfo::sys_sysinfo,

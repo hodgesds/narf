@@ -207,3 +207,72 @@ kernel_test_in!(
     "drivers/wireless/mt7921/tx_ba",
     mt76_native_restart_samples_only_final_real_fragment_after_predecessor_retirement
 );
+
+/// `mt7921e_tx_prepare_skb` through the production TXD writer: the home
+/// station's first data frame requests a HOST TX status on its own PID
+/// (hardware A-MSDU off for that frame, mt76_connac_mac.c), the next frame
+/// inside HZ/4 is ordinary, and the matching report becomes the station's
+/// TX rate once the frame has retired.
+fn rate_sample() -> Result<(), &'static str> {
+    let (mut words, mut hw) = rig().map_err(|_| "rate sample rig")?;
+    hw.owner.storage.as_mut().unwrap().tx_sequence = crate::mt7921::tx_sequence::Owner::new();
+    hw.owner.published = true;
+    hw.hw_amsdu = true;
+    let frame = super::tx_pipeline_hw_tests::ethernet(0x52);
+    for _ in 0..2 {
+        hw.submit_data_txd(
+            crate::mt7921::vif_slots::Link::HOME,
+            &frame,
+            true,
+            true,
+            true,
+            false,
+            0,
+        )
+        .map_err(|_| "home data frame")?;
+    }
+    let ring = &hw.owner.storage.as_ref().unwrap().data;
+    let (first, second) = (ring.buffers[0].as_slice(), ring.buffers[1].as_slice());
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    if first[20..24] != [3, 4, 0, 0]
+        || word(first, 28) & (1 << 10) != 0
+        || word(first, 12) & (1 << 28) == 0
+        || first[64..124] != frame
+    {
+        return Err("first home frame did not request a rate status");
+    }
+    if second[20..24] != [0; 4] || word(second, 28) & (1 << 10) == 0 {
+        return Err("a frame inside HZ/4 was sampled again");
+    }
+    if Backend::tx_rate_report(&hw).is_some() {
+        return Err("rate reported before any TX status");
+    }
+    terminal(&mut words, &mut hw, 0, 1).map_err(|_| "sampled frame retirement")?;
+    // VHT (mode 4) MCS 7, two streams, 80 MHz.
+    let mut report = txs(3, 0, 0);
+    let rate = 7u32 | 4 << 6 | 1 << 10;
+    let r0 = u32::from_le_bytes(report[8..12].try_into().unwrap()) | rate | 2 << 29;
+    report[8..12].copy_from_slice(&r0.to_le_bytes());
+    inject_rx(&mut words, &hw, 0, &report);
+    for _ in 0..3 {
+        hw.route_rx(None).map_err(|_| "TX status receipt")?;
+    }
+    let sampled = Backend::tx_rate_report(&hw).ok_or("TX status not taken as a rate")?;
+    if sampled.wcid != 1 || u32::from(sampled.tx_rate) != rate || sampled.bw != 2 {
+        return Err("rate report fields");
+    }
+    let decoded = crate::mt7921::link_stats::tx_rate(sampled.tx_rate, sampled.bw)
+        .ok_or("rate word did not decode")?;
+    if decoded.vht_mcs != Some((7, 2)) || decoded.width_mhz != 80 {
+        return Err("decoded TX rate");
+    }
+    hw.owner.published = false;
+    Ok(())
+}
+fn mt76_native_home_data_requests_periodic_rate_status() -> TestResult {
+    rate_sample().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/station",
+    mt76_native_home_data_requests_periodic_rate_status
+);

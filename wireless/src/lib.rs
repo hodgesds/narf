@@ -13,6 +13,7 @@ pub mod ap_control;
 pub mod association;
 pub mod caps;
 pub mod ccmp;
+pub mod cqm;
 pub mod eapol;
 pub mod iface;
 pub mod mfp;
@@ -21,9 +22,11 @@ pub mod mlme;
 pub mod monitor;
 pub mod nl80211;
 pub mod packet_key;
+pub mod rate;
 pub mod reconnect;
 pub mod reg;
 pub mod reorder;
+pub mod rfkill;
 pub mod rsn;
 pub mod sae;
 pub mod scan;
@@ -646,6 +649,14 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The PMK-offload owner also runs WPA2-Personal with AKM PSK-SHA256
+    /// (00-0F-AC:6: AES-128-CMAC EAPOL MIC, SHA-256 KDF). wpa_supplicant
+    /// selects it whenever the AP offers it, so without it such an AP gets
+    /// a refused CONNECT.
+    fn supports_psk_sha256_offload(&self) -> bool {
+        false
+    }
+
     /// The firmware PSK owner accepts an explicit optional-PMF policy and
     /// verifies the admitted native request/response before opening its port.
     /// This does not follow from cipher or required-PMF support alone.
@@ -721,9 +732,17 @@ pub trait WirelessNetIface: Interface {
         None
     }
 
+    /// The driver implements [`roam`](Self::roam). Without it a CONNECT on a
+    /// connected interface is refused with -EALREADY before any driver work,
+    /// as `cfg80211_connect` does; wpa_supplicant then disconnects and
+    /// connects again (`wpa_driver_nl80211_connect`).
+    fn supports_roam(&self) -> bool {
+        false
+    }
+
     /// Reassociate (roam) to a new BSS of the current ESS, preserving the
     /// interface. Defaults to unsupported; drivers that can reassociate
-    /// override this.
+    /// override this and [`supports_roam`](Self::supports_roam).
     async fn roam(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }

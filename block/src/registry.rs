@@ -101,6 +101,17 @@ pub trait BlockDeviceSync: Send + Sync {
         self.write(lba, n_blocks, data)?;
         self.flush()
     }
+    /// The device's asynchronous submission queue set, when its driver has
+    /// one (Linux: the device's `request_queue`). [`SyncBlock::submit`]
+    /// dispatches through it and returns a pending future, so requests from
+    /// many tasks are in flight at the device at once; without it every
+    /// request is performed synchronously inside `submit`, one at a time.
+    /// Wrappers must forward it, windowed ([`crate::OffsetQueue`]) or
+    /// gated as they window or gate the sync calls, so the async path keeps
+    /// every layer's contract. The default is no queue.
+    fn queue(&self) -> Option<Arc<dyn crate::BlockQueue>> {
+        None
+    }
     /// Whether [`Self::trim`] really deallocates on the device
     /// (NVMe Dataset Management / ATA DATA SET MANAGEMENT with the
     /// TRIM bit / SCSI UNMAP). The default is `false`: a device must
@@ -639,21 +650,34 @@ use crate::{
 /// async `BlockDevice` trait. Use this to feed registry-resident
 /// devices (`block_devices()` results) to filesystem-mount helpers
 /// that demand a `BlockDevice`.
+///
+/// The device's [`BlockQueue`](crate::BlockQueue), when it has one, is
+/// resolved once here and used by every `submit` / `flush` / `cancel`.
 #[derive(Clone)]
-pub struct SyncBlock(pub Arc<dyn BlockDeviceSync>);
+pub struct SyncBlock(
+    pub Arc<dyn BlockDeviceSync>,
+    Option<Arc<dyn crate::BlockQueue>>,
+);
 
 impl core::fmt::Debug for SyncBlock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SyncBlock")
             .field("lba_size", &self.0.lba_size())
             .field("capacity", &self.0.capacity())
+            .field("queued", &self.1.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl SyncBlock {
     pub fn new(dev: Arc<dyn BlockDeviceSync>) -> Arc<Self> {
-        Arc::new(Self(dev))
+        let queue = dev.queue();
+        Arc::new(Self(dev, queue))
+    }
+
+    /// The asynchronous queue requests go through, if the device has one.
+    pub fn queue(&self) -> Option<&Arc<dyn crate::BlockQueue>> {
+        self.1.as_ref()
     }
 }
 
@@ -688,25 +712,35 @@ impl BlockDevice for SyncBlock {
         }
     }
 
+    /// Through the device's [`crate::BlockQueue`] when it has one — a
+    /// pending future, the request queued at the device beside every other
+    /// task's — else performed synchronously here, one request per device
+    /// at a time.
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
+        if let Some(q) = &self.1 {
+            return crate::queue::SyncSubmit::Queued(q.submit(req));
+        }
         let buffer = narf_io::resolve_cap(&req.buffer);
         let result = self.do_io(&req, buffer);
-        async move {
-            BlockCompletion {
-                tag: 0,
-                user_tag: req.user_tag,
-                result,
-            }
-        }
+        crate::queue::SyncSubmit::Ready(Some(BlockCompletion {
+            tag: 0,
+            user_tag: req.user_tag,
+            result,
+        }))
     }
     /// Forwards to [`BlockDeviceSync::flush`]; an error is dropped here
     /// (the trait returns `()`) — use [`BlockDevice::flush_result`].
-    async fn flush(&self) {
-        let _ = self.0.flush();
+    fn flush(&self) -> impl Future<Output = ()> + Send {
+        let f = self.flush_result();
+        async move {
+            let _ = f.await;
+        }
     }
     fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
-        let r = self.0.flush().map_err(map_io_err);
-        async move { r }
+        if let Some(q) = &self.1 {
+            return crate::queue::SyncFlush::Queued(q.flush());
+        }
+        crate::queue::SyncFlush::Ready(Some(self.0.flush().map_err(map_io_err)))
     }
     /// Forwards to [`BlockDeviceSync::trim`] when the device
     /// supports it; an error is dropped here (the trait returns
@@ -720,8 +754,25 @@ impl BlockDevice for SyncBlock {
             let _ = self.0.trim(r.start, r.blocks);
         }
     }
-    async fn cancel(&self, _t: u64) -> CancelResult {
-        CancelResult::NotFound
+    async fn cancel(&self, t: u64) -> CancelResult {
+        match &self.1 {
+            Some(q) => q.cancel(t).await,
+            None => CancelResult::NotFound,
+        }
+    }
+    /// Through the queue's scatter-gather path (split to its limits) when
+    /// the device has one; else iterated page by page through the sync
+    /// calls, one bounce per child range.
+    fn submit_sg(&self, req: crate::SgRequest) -> impl Future<Output = BlockCompletion> + Send {
+        if let Some(q) = &self.1 {
+            return crate::queue::SyncSubmit::Queued(crate::queue::submit_sg(&**q, req));
+        }
+        let result = self.do_sg_iter(&req);
+        crate::queue::SyncSubmit::Ready(Some(BlockCompletion {
+            tag: 0,
+            user_tag: req.user_tag,
+            result,
+        }))
     }
 }
 
@@ -736,6 +787,56 @@ fn map_io_err(e: BlockIoError) -> BlockError {
 }
 
 impl SyncBlock {
+    /// Scatter-gather by iteration for a device without a queue: each run
+    /// of up to 64 KiB is bounced through a kernel buffer.
+    fn do_sg_iter(&self, req: &crate::SgRequest) -> Result<(), BlockError> {
+        let list = req.resolve().ok_or(BlockError::PermissionDenied)?;
+        let lba_bytes = self.0.lba_size() as usize;
+        let total = (req.blocks as usize)
+            .checked_mul(lba_bytes)
+            .ok_or(BlockError::InvalidRange)?;
+        if req
+            .offset
+            .checked_add(total)
+            .is_none_or(|end| end > list.len())
+        {
+            return Err(BlockError::InvalidRange);
+        }
+        const RUN: usize = 64 * 1024;
+        let mut done = 0usize;
+        while done < total {
+            let n = (total - done)
+                .min(RUN / lba_bytes * lba_bytes)
+                .max(lba_bytes);
+            let n = n.min(total - done);
+            let blocks = u16::try_from(n / lba_bytes).map_err(|_| BlockError::InvalidRange)?;
+            let lba = req.lba + (done / lba_bytes) as u64;
+            let mut bounce = alloc::vec![0u8; n];
+            match req.op {
+                BlockOp::Read => {
+                    self.0.read(lba, blocks, &mut bounce).map_err(map_io_err)?;
+                    if !crate::sg::copy_pages(&list, req.offset + done, &mut bounce, true) {
+                        return Err(BlockError::InvalidRange);
+                    }
+                }
+                BlockOp::Write { fua } => {
+                    if !crate::sg::copy_pages(&list, req.offset + done, &mut bounce, false) {
+                        return Err(BlockError::InvalidRange);
+                    }
+                    if fua {
+                        self.0.write_fua(lba, blocks, &bounce).map_err(map_io_err)?;
+                    } else {
+                        self.0.write(lba, blocks, &bounce).map_err(map_io_err)?;
+                    }
+                }
+                BlockOp::WriteZeroes => self.0.write(lba, blocks, &bounce).map_err(map_io_err)?,
+                BlockOp::Trim => self.0.trim(lba, blocks as u64).map_err(map_io_err)?,
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
     fn do_io(
         &self,
         req: &BlockRequest,

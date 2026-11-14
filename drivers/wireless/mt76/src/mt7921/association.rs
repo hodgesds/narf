@@ -82,6 +82,15 @@ pub enum Security {
         psk: [u8; 32],
         required: bool,
     },
+    /// WPA2-Personal exactly as a supplicant selected it for the owner to
+    /// run: AKM `akm` (PSK 2 or PSK-SHA256 6) under `ieee80211w` = `pmf`.
+    /// The plan offers only that AKM, so the owner's RSNE repeats the
+    /// supplicant's choice.
+    Wpa2PskSelected {
+        psk: [u8; 32],
+        akm: u8,
+        pmf: narf_wireless::association::Pmf,
+    },
     /// WPA3-Personal: SAE authentication (sae_pwe=2), PMF required.
     Wpa3Sae {
         password: SaePassword,
@@ -93,6 +102,7 @@ impl core::fmt::Debug for Security {
             Self::Open => "Open",
             Self::Wpa2Psk { .. } => "Wpa2Psk { .. }",
             Self::Wpa2PskPmf { .. } => "Wpa2PskPmf { .. }",
+            Self::Wpa2PskSelected { .. } => "Wpa2PskSelected { .. }",
             Self::Wpa3Sae { .. } => "Wpa3Sae { .. }",
         })
     }
@@ -108,7 +118,9 @@ impl Security {
     pub fn mode(&self) -> SecurityMode {
         match self {
             Self::Open => SecurityMode::Open,
-            Self::Wpa2Psk { .. } | Self::Wpa2PskPmf { .. } => SecurityMode::Wpa2Psk,
+            Self::Wpa2Psk { .. } | Self::Wpa2PskPmf { .. } | Self::Wpa2PskSelected { .. } => {
+                SecurityMode::Wpa2Psk
+            }
             Self::Wpa3Sae { .. } => SecurityMode::Wpa3Sae {
                 pwe: narf_wireless::association::SaePwe::Both,
             },
@@ -128,8 +140,62 @@ impl Security {
                 } else {
                     Pmf::Optional
                 }),
+            Self::Wpa2PskSelected { akm, pmf, .. } => JoinOptions::default()
+                .with_akms(if *akm == narf_wireless::rsn::AKM_PSK_SHA256 {
+                    AkmSet::PSK_SHA256
+                } else {
+                    AkmSet::PSK
+                })
+                .with_pmf(*pmf),
             Self::Wpa3Sae { .. } => JoinOptions::default().with_akms(AkmSet::ALL),
         }
+    }
+    /// The owner profile for a supplicant's WPA2-Personal request: its
+    /// RSNE's one AKM and MFPC/MFPR bits. Without an RSNE, or for plain
+    /// PSK without MFPC, the legacy profile.
+    pub fn wpa2_from_supplicant(psk: [u8; 32], ie: &[u8]) -> Option<Self> {
+        use narf_wireless::association::Pmf;
+        use narf_wireless::rsn;
+        let mut rest = ie;
+        let mut found = None;
+        while let [id, len, tail @ ..] = rest {
+            let len = usize::from(*len);
+            let body = tail.get(..len)?;
+            if *id == 48 {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(rsn::RsnIe::decode_body(body)?);
+            }
+            rest = &tail[len..];
+        }
+        let Some(rsne) = found else {
+            return Some(Self::Wpa2Psk { psk });
+        };
+        let [akm] = rsne.akms.as_slice() else {
+            return None;
+        };
+        if akm.oui != rsn::RSN_OUI || !matches!(akm.suite_type, rsn::AKM_PSK | rsn::AKM_PSK_SHA256)
+        {
+            return None;
+        }
+        let mfpc = rsne.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0;
+        let mfpr = rsne.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED != 0;
+        let pmf = match (mfpc, mfpr) {
+            (false, false) => Pmf::Disabled,
+            (true, false) => Pmf::Optional,
+            (true, true) => Pmf::Required,
+            (false, true) => return None,
+        };
+        Some(if akm.suite_type == rsn::AKM_PSK && pmf == Pmf::Disabled {
+            Self::Wpa2Psk { psk }
+        } else {
+            Self::Wpa2PskSelected {
+                psk,
+                akm: akm.suite_type,
+                pmf,
+            }
+        })
     }
 }
 /// One accepted SAE Authentication receipt.
@@ -173,6 +239,52 @@ const STA_REC_KEY_V2: u16 = 17;
 /// `enum mt76_cipher_type`, where AES_CCMP is 4.)
 pub(crate) const MCU_CIPHER_AES_CCMP: u8 = 5;
 pub(crate) const MCU_CIPHER_BIP_CMAC_128: u8 = 10;
+
+/// The cipher suites of the supplicant's RSNE in its CONNECT elements
+/// (`wpa_gen_wpa_ie_rsn`: the pairwise, group and group management
+/// ciphers it selected), when it names hardware data ciphers.
+pub(crate) fn supplicant_ciphers(mut ies: &[u8]) -> Option<narf_wireless::rsn::Ciphers> {
+    while let [id, len, rest @ ..] = ies {
+        let body = rest.get(..usize::from(*len))?;
+        if *id == 48 {
+            let rsn = narf_wireless::rsn::RsnIe::decode_body(body)?;
+            let ciphers = narf_wireless::rsn::Ciphers::of_station(&rsn)?;
+            return (mcu_data_cipher(ciphers.pairwise).is_some()
+                && mcu_data_cipher(ciphers.group).is_some())
+            .then_some(ciphers);
+        }
+        ies = &rest[usize::from(*len)..];
+    }
+    None
+}
+
+/// `mt76_connac_mcu_get_cipher` for the data ciphers the station runs in
+/// hardware (mt7921_set_key: CCMP, CCMP-256, GCMP, GCMP-256), with the
+/// temporal key length.
+pub(crate) fn mcu_data_cipher(suite: u8) -> Option<(u8, usize)> {
+    use narf_wireless::rsn;
+    let mcu = match suite {
+        rsn::CIPHER_CCMP_128 => MCU_CIPHER_AES_CCMP,
+        rsn::CIPHER_CCMP_256 => 6,
+        rsn::CIPHER_GCMP_128 => 7,
+        rsn::CIPHER_GCMP_256 => 8,
+        _ => return None,
+    };
+    Some((mcu, rsn::data_cipher_key_len(suite)?))
+}
+
+/// The RXD1 `MT_RXD1_NORMAL_SEC_MODE` value (`enum mt76_cipher_type`) of
+/// a frame hardware decrypted under `suite`.
+pub(crate) fn mac_data_cipher(suite: u8) -> Option<u8> {
+    use narf_wireless::rsn;
+    Some(match suite {
+        rsn::CIPHER_CCMP_128 => 4,
+        rsn::CIPHER_CCMP_256 => 10,
+        rsn::CIPHER_GCMP_128 => 11,
+        rsn::CIPHER_GCMP_256 => 12,
+        _ => return None,
+    })
+}
 
 fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     let offset = bytes.len();
@@ -228,6 +340,8 @@ impl JoinPlan {
             ap_phy: None,
         })
     }
+    /// `ciphers` is the supplicant's selection ([`supplicant_ciphers`]);
+    /// `None` keeps CCMP-128 with BIP-CMAC-128.
     pub(crate) fn prepare_native(
         bss: &ScanBss,
         own: [u8; 6],
@@ -235,16 +349,20 @@ impl JoinPlan {
         security: Security,
         info: super::firmware_transport::RadioInfo,
         permission: TxPermission,
+        ciphers: Option<narf_wireless::rsn::Ciphers>,
     ) -> Result<Self, super::firmware_transport::Error> {
         use super::firmware_transport::Error as NativeError;
+        let options = match ciphers {
+            Some(ciphers) => security.options().with_ciphers(ciphers),
+            None => security.options(),
+        };
         if is_six_ghz(bss) || permission.six.is_some() {
-            return Self::prepare_native_6ghz(bss, own, ssid, security, info, permission);
+            return Self::prepare_native_6ghz(bss, own, ssid, security, info, permission, options);
         }
         if permission.native_width() == super::cmd::CH_BW_160 && !super::vht::wide160(info) {
             return Err(NativeError::UnsupportedFirmware);
         }
         let mode = security.mode();
-        let options = security.options();
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let ap = narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
@@ -372,6 +490,7 @@ impl JoinPlan {
         security: Security,
         info: super::firmware_transport::RadioInfo,
         permission: TxPermission,
+        options: narf_wireless::association::JoinOptions,
     ) -> Result<Self, super::firmware_transport::Error> {
         use super::firmware_transport::Error as NativeError;
         let grant = permission.six.ok_or(NativeError::Authority)?;
@@ -390,18 +509,11 @@ impl JoinPlan {
         .map_err(|_| NativeError::UnsupportedFirmware)?;
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
-        let common = ManagementPlan::prepare_6ghz(
-            bss,
-            own,
-            ssid,
-            security.mode(),
-            &local,
-            security.options(),
-        )
-        .map_err(|error| match error {
-            Error::UnsupportedSecurity => NativeError::Bounds,
-            _ => NativeError::UnsupportedFirmware,
-        })?;
+        let common = ManagementPlan::prepare_6ghz(bss, own, ssid, security.mode(), &local, options)
+            .map_err(|error| match error {
+                Error::UnsupportedSecurity => NativeError::Bounds,
+                _ => NativeError::UnsupportedFirmware,
+            })?;
         let plan = common.six_ghz().ok_or(NativeError::UnsupportedFirmware)?;
         if !grant.matches(plan) {
             return Err(NativeError::Authority);
@@ -468,6 +580,11 @@ impl JoinPlan {
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         self.common.start_authentication()
     }
+    /// SAE with a cached PMKSA: Open System authentication and the PMKID
+    /// in the association request (`JoinPlan::start_pmksa_authentication`).
+    pub fn start_pmksa_authentication(&mut self, pmkid: [u8; 16]) -> Result<&[u8], Error> {
+        self.common.start_pmksa_authentication(pmkid)
+    }
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
         let typed_phy = self.common.offered_phy().is_some();
         let Some(request) = self.common.authentication_response(bytes)? else {
@@ -517,6 +634,10 @@ impl JoinPlan {
         }
         out.extend_from_slice(&wmm::INFORMATION);
         Ok(Some(SaeOutcome::Associate(out)))
+    }
+    /// The request goes out as a Reassociation Request (roaming).
+    pub fn expect_reassociation(&mut self) {
+        self.common.expect_reassociation();
     }
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
         let Some(aid) = self.common.association_response(bytes)? else {
@@ -798,7 +919,18 @@ impl JoinPlan {
         aid: u16,
         key: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        if self.security == SecurityMode::Open || key.len() != 16 {
+        self.secure_peer_record_cipher_on(link, aid, key, narf_wireless::rsn::CIPHER_CCMP_128)
+    }
+    /// `secure_peer_record_on` for the negotiated pairwise `cipher`.
+    pub(crate) fn secure_peer_record_cipher_on(
+        &self,
+        link: Link,
+        aid: u16,
+        key: &[u8],
+        cipher: u8,
+    ) -> Result<Vec<u8>, Error> {
+        let (mcu, len) = mcu_data_cipher(cipher).ok_or(Error::UnsupportedSecurity)?;
+        if self.security == SecurityMode::Open || key.len() != len {
             return Err(Error::UnsupportedSecurity);
         }
         let mut out = self.peer_record_on(link, aid, true)?;
@@ -808,11 +940,11 @@ impl JoinPlan {
         let sec = tlv(&mut out, STA_REC_KEY_V2, 44);
         out[sec + 4] = 0; // enum set_key_cmd::SET_KEY, copied verbatim by Linux.
         out[sec + 5] = 1; // n_cipher = 1
-        out[sec + 8] = MCU_CIPHER_AES_CCMP;
+        out[sec + 8] = mcu;
         out[sec + 9] = 36; // cipher_len
         out[sec + 10] = 0; // key_id = 0
-        out[sec + 11] = 16; // key_len = 16
-        out[sec + 12..sec + 28].copy_from_slice(key);
+        out[sec + 11] = len as u8;
+        out[sec + 12..sec + 12 + len].copy_from_slice(key);
         Ok(out)
     }
 }
@@ -864,7 +996,20 @@ pub(crate) fn igtk_record_on(
     gtk: &[u8],
     igtk: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    if gtk_id > 3 || gtk.len() != 16 || igtk.len() != 16 {
+    igtk_record_cipher_on(link, gtk_id, gtk, narf_wireless::rsn::CIPHER_CCMP_128, igtk)
+}
+/// `igtk_record_on` whose `key[0]` repeats a GTK of `group_cipher`. Only
+/// the BIP-CMAC-128 IGTK is a hardware key (mt7921_set_key refuses the
+/// other BIP suites, which mac80211 then runs in software).
+pub(crate) fn igtk_record_cipher_on(
+    link: Link,
+    gtk_id: u8,
+    gtk: &[u8],
+    group_cipher: u8,
+    igtk: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let (mcu, len) = mcu_data_cipher(group_cipher).ok_or(Error::UnsupportedSecurity)?;
+    if gtk_id > 3 || gtk.len() != len || igtk.len() != 16 {
         return Err(Error::UnsupportedSecurity);
     }
     let mut out = vec![0; 8];
@@ -876,8 +1021,8 @@ pub(crate) fn igtk_record_on(
     let sec = tlv(&mut out, STA_REC_KEY_V2, 80);
     out[sec + 4] = 0; // SET_KEY
     out[sec + 5] = 2; // n_cipher
-    out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, gtk_id, 16]);
-    out[sec + 12..sec + 28].copy_from_slice(gtk);
+    out[sec + 8..sec + 12].copy_from_slice(&[mcu, 36, gtk_id, len as u8]);
+    out[sec + 12..sec + 12 + len].copy_from_slice(gtk);
     out[sec + 44..sec + 48].copy_from_slice(&[MCU_CIPHER_BIP_CMAC_128, 36, 0, 16]);
     out[sec + 48..sec + 64].copy_from_slice(igtk);
     Ok(out)
@@ -894,11 +1039,22 @@ pub(crate) fn key_record_on(
     key_id: u8,
     key: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
+    key_record_cipher_on(link, wcid, key_id, key, narf_wireless::rsn::CIPHER_CCMP_128)
+}
+/// `key_record_on` for a key of data `cipher` (CCMP-128/256, GCMP-128/256).
+pub(crate) fn key_record_cipher_on(
+    link: Link,
+    wcid: u8,
+    key_id: u8,
+    key: Option<&[u8]>,
+    cipher: u8,
+) -> Result<Vec<u8>, Error> {
+    let (mcu, len) = mcu_data_cipher(cipher).ok_or(Error::UnsupportedSecurity)?;
     let group = wcid == link.bmc();
     if !(group || wcid == link.peer())
         || key_id > 3
         || !group && key_id != 0
-        || key.is_some_and(|key| key.len() != 16)
+        || key.is_some_and(|key| key.len() != len)
     {
         return Err(Error::UnsupportedSecurity);
     }
@@ -914,8 +1070,8 @@ pub(crate) fn key_record_on(
     out[sec + 4] = u8::from(key.is_none());
     if let Some(key) = key {
         out[sec + 5] = 1;
-        out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, key_id, 16]);
-        out[sec + 12..sec + 28].copy_from_slice(key);
+        out[sec + 8..sec + 12].copy_from_slice(&[mcu, 36, key_id, len as u8]);
+        out[sec + 12..sec + 12 + len].copy_from_slice(key);
     }
     Ok(out)
 }
@@ -1013,6 +1169,87 @@ pub(crate) struct TxPermission {
     wmm_rule: Option<narf_wireless::reg::WmmRule>,
     /// A 6 GHz grant: `channel` is then a 6 GHz channel number.
     pub(crate) six: Option<SixGrant>,
+    /// Granted on a radar (DFS) or NO_IR channel only because this scan
+    /// received the target BSS's own Beacon: the station follows an AP that
+    /// already operates there, as cfg80211/mac80211 let a client do (only
+    /// IEEE80211_CHAN_DISABLED refuses a station chandef). The policy is
+    /// re-checked with the same relaxation (`current`). Nothing here permits
+    /// probing: scans keep these channels passive.
+    heard_ap: bool,
+}
+
+/// The regulatory flags a station that heard its AP's Beacon may operate
+/// under. INDOOR_ONLY, power, bandwidth and 6 GHz client rules still hold.
+fn follows_heard_ap(flags: narf_wireless::reg::RegFlags) -> narf_wireless::reg::RegFlags {
+    use narf_wireless::reg::RegFlags;
+    flags.difference(RegFlags::DFS | RegFlags::NO_IR)
+}
+
+/// A Channel Switch Announcement (37) or Extended CSA (60) from the AP
+/// (mac80211 `ieee80211_parse_ch_switch_ie`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChannelSwitch {
+    /// Channel Switch Mode 1: no transmission until the switch.
+    pub block_tx: bool,
+    pub channel: u8,
+    /// Target Beacon Transmission Times until the switch (0: any time).
+    pub count: u8,
+    /// The ECSA's operating class, when the AP sent one this owner reads.
+    pub operating_class: Option<u8>,
+    /// The Secondary Channel Offset element (62): 1 above, 3 below.
+    pub secondary_offset: Option<u8>,
+    /// The Wide Bandwidth Channel Switch subelement (194) of the Channel
+    /// Switch Wrapper (196): new channel width, CCFS0, CCFS1.
+    pub wide: Option<[u8; 3]>,
+}
+
+/// The CSA or ECSA among `ies`, with the width elements that accompany it
+/// (mac80211 `ieee80211_parse_ch_switch_ie`): an ECSA whose operating
+/// class names a band is preferred over the CSA. Only complete elements
+/// before a truncation count.
+pub(crate) fn channel_switch(ies: &[u8]) -> Option<ChannelSwitch> {
+    let (mut csa, mut ecsa, mut secondary_offset, mut wide) = (None, None, None, None);
+    let mut rest = ies;
+    while let [id, len, tail @ ..] = rest {
+        let Some(body) = tail.get(..usize::from(*len)) else {
+            break;
+        };
+        match (*id, body) {
+            (37, &[mode, channel, count]) if csa.is_none() => {
+                csa = Some((mode, None, channel, count))
+            }
+            (60, &[mode, class, channel, count]) if ecsa.is_none() => {
+                ecsa = Some((mode, Some(class), channel, count));
+            }
+            (62, &[offset]) if secondary_offset.is_none() => secondary_offset = Some(offset),
+            (196, wrapper) if wide.is_none() => wide = wide_bandwidth_switch(wrapper),
+            _ => {}
+        }
+        rest = &tail[body.len()..];
+    }
+    let (mode, operating_class, channel, count) = ecsa
+        .filter(|&(_, class, _, _)| class.and_then(super::csa::class_band).is_some())
+        .or(csa)?;
+    (channel != 0).then_some(ChannelSwitch {
+        block_tx: mode == 1,
+        channel,
+        count,
+        operating_class,
+        secondary_offset,
+        wide,
+    })
+}
+
+/// The Wide Bandwidth Channel Switch subelement of a Channel Switch Wrapper.
+fn wide_bandwidth_switch(mut subelements: &[u8]) -> Option<[u8; 3]> {
+    while let [id, len, tail @ ..] = subelements {
+        let body = tail.get(..usize::from(*len))?;
+        if *id == 194 {
+            return body.get(..3)?.try_into().ok();
+        }
+        subelements = &tail[body.len()..];
+    }
+    None
 }
 
 /// True for a BSS carrying the explicit 6 GHz band identity.
@@ -1065,6 +1302,109 @@ fn six_width(width: narf_wireless::association::six_ghz::SixGhzWidth) -> Option<
 impl TxPermission {
     pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
         Self::occupied(domain, channel, None, None, None)
+    }
+    /// `domain` as a station that heard its AP's Beacon may use it.
+    fn heard_ap_domain(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> narf_wireless::reg::RegulatoryDomain {
+        let mut relaxed = domain.clone();
+        for rule in &mut relaxed.rules {
+            rule.flags = follows_heard_ap(rule.flags);
+        }
+        relaxed
+    }
+    /// [`from_domain`](Self::from_domain) for a 2.4/5 GHz BSS whose Beacon
+    /// this scan received: a radar or NO_IR channel the AP operates on is
+    /// granted to the station joining it (cfg80211 `cfg80211_chandef_usable`
+    /// with only IEEE80211_CHAN_DISABLED prohibited for a client).
+    pub(crate) fn from_heard_ap(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        channel: u8,
+    ) -> Option<Self> {
+        Self::from_domain(domain, channel).or_else(|| {
+            let mut grant = Self::from_domain(&Self::heard_ap_domain(domain), channel)?;
+            grant.heard_ap = true;
+            Some(grant)
+        })
+    }
+    /// [`from_ap`](Self::from_ap), relaxed to a radar/NO_IR channel only
+    /// when `heard` (this scan received the BSS's Beacon). 6 GHz grants are
+    /// never relaxed.
+    pub(crate) fn from_ap_heard(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        info: super::firmware_transport::RadioInfo,
+        bss: &ScanBss,
+        heard: bool,
+    ) -> Option<Self> {
+        Self::from_ap(domain, info, bss).or_else(|| {
+            if !heard || is_six_ghz(bss) {
+                return None;
+            }
+            let mut grant = Self::from_ap(&Self::heard_ap_domain(domain), info, bss)?;
+            grant.heard_ap = true;
+            Some(grant)
+        })
+    }
+    /// Granted on a radar/NO_IR channel because the AP's Beacon was heard.
+    pub(crate) fn follows_heard_ap(self) -> bool {
+        self.heard_ap
+    }
+    /// The grant of exactly `def` under `domain`.
+    pub(crate) fn from_chandef(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        def: super::csa::Chandef,
+    ) -> Option<Self> {
+        match def.width {
+            super::cmd::CH_BW_20 => Self::from_domain(domain, def.primary),
+            super::cmd::CH_BW_40 => Self::from_domain40(domain, def.primary, def.secondary()?),
+            super::cmd::CH_BW_80 => Self::from_domain80(domain, def.primary, def.center),
+            super::cmd::CH_BW_160 => Self::from_domain160(domain, def.primary, def.center),
+            _ => None,
+        }
+    }
+    /// The grant of a station following its associated AP to `def` (a
+    /// channel switch, or a width change in its Beacons): as for a heard
+    /// AP, a radar/NO_IR channel the AP operates on is allowed. A `vht`
+    /// connection keeps a permitted 80 MHz block as its VHT evidence, as
+    /// [`from_ap`](Self::from_ap) records it.
+    pub(crate) fn following_ap(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        def: super::csa::Chandef,
+        vht: bool,
+    ) -> Option<Self> {
+        let relaxed = Self::heard_ap_domain(domain);
+        let (mut grant, used) = match Self::from_chandef(domain, def) {
+            Some(grant) => (grant, domain),
+            None => {
+                let mut grant = Self::from_chandef(&relaxed, def)?;
+                grant.heard_ap = true;
+                (grant, &relaxed)
+            }
+        };
+        if vht && grant.vht80_channel.is_none() {
+            grant.vht80_channel = [36, 52, 100, 116, 132, 149, 165]
+                .into_iter()
+                .find(|&primary| Self::from_domain80(used, primary, primary + 6).is_some());
+        }
+        Some(grant)
+    }
+    /// This grant's occupied channel (2.4/5 GHz).
+    pub(crate) fn chandef(self) -> super::csa::Chandef {
+        super::csa::Chandef {
+            primary: self.channel,
+            width: self.native_width(),
+            center: self.center_channel(),
+        }
+    }
+    /// The same operating channel, width and band as `other` (power,
+    /// country and WMM rule may differ).
+    pub(crate) fn same_operation(self, other: Self) -> bool {
+        self.channel == other.channel
+            && self.secondary == other.secondary
+            && self.center80 == other.center80
+            && self.center160 == other.center160
+            && self.six.map(|six| (six.center, six.width))
+                == other.six.map(|six| (six.center, six.width))
     }
     pub(crate) fn from_domain40(
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -1287,6 +1627,7 @@ impl TxPermission {
                 ],
                 rule_power: rule.max_power_dbm,
             }),
+            heard_ap: false,
         })
     }
     /// The occupied 6 GHz channel of a 6 GHz grant.
@@ -1417,6 +1758,7 @@ impl TxPermission {
             vht80_channel: None,
             wmm_rule: domain.wmm_rule_for(primary),
             six: None,
+            heard_ap: false,
         })
     }
 
@@ -1441,6 +1783,16 @@ impl TxPermission {
                 })
             });
         }
+        // A grant that followed a heard AP onto a radar/NO_IR channel stays
+        // current under the same relaxation; a rule that disappears, shrinks
+        // or loses power still revokes it.
+        let relaxed;
+        let domain = if self.heard_ap {
+            relaxed = Self::heard_ap_domain(domain);
+            &relaxed
+        } else {
+            domain
+        };
         self.vht80_channel
             .is_none_or(|primary| Self::from_domain80(domain, primary, primary + 6).is_some())
             && Self::occupied(

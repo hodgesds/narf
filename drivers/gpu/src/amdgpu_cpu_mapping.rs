@@ -126,6 +126,8 @@ pub(crate) fn backing(
     // The placement lock excludes relocation commits, so this generation and
     // its frame snapshots stay current until the owner is registered.
     let placement = object.placement.lock();
+    // The mapping exposes this generation's frames: an address lease.
+    object.leases.fetch_add(1, Ordering::AcqRel);
     let whole = placement.frames(0, object.byte_len as usize)?;
     let frames = placement.frames(offset, len)?;
     let mut index = BACKINGS.lock();
@@ -217,13 +219,22 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
     if moves_by_engine(object) {
         return Err(FsError::Busy);
     }
-    let backing = BACKINGS
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire));
-    let Some(backing) = backing else {
-        return object.relocate(to_vram);
+    let mapped = || {
+        BACKINGS
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire))
+    };
+    let backing = match mapped() {
+        Some(backing) => backing,
+        None => match object.relocate(to_vram) {
+            // The unmapped move was refused because the buffer gained a
+            // CPU mapping while its bytes were copied: it is a mapped
+            // buffer now, and moves as one.
+            Err(FsError::Busy) => mapped().ok_or(FsError::Busy)?,
+            result => return result,
+        },
     };
     let source = {
         let placement = object.placement.lock();

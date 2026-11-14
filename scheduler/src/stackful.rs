@@ -39,8 +39,12 @@
 //!  stack_bottom─► └─────────────┘
 //! ```
 //!
-//! Stack overflow: phase 1b uses a plain `Box<[u8]>` with no guard
-//! page. Phase 3 adds a guard page via vmalloc.
+//! Stack overflow: every task stack is a guarded, virtually mapped
+//! [`KernelStack`] (`narf_memory::kstack`, Linux `CONFIG_VMAP_STACK`). The
+//! VA below the stack is never mapped, so an overflow faults on the guard and
+//! the trap layer reports it ("kernel stack overflow") instead of the stack
+//! silently writing into the frame below. The low-end canary stays as a
+//! cheap second check and as the high-water baseline.
 
 #![allow(dead_code)]
 
@@ -55,6 +59,8 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
+
+use narf_memory::kstack::KernelStack;
 
 #[cfg(target_arch = "aarch64")]
 use narf_arch::aarch64::kernel_ctx::{kernel_switch, KernelContext};
@@ -99,7 +105,7 @@ fn current_preempt_vector() -> u64 {
     }
 }
 
-/// Default per-task kernel stack size. 32 KiB: under the own-stack
+/// Default per-task kernel stack size. Under the own-stack
 /// model the ENTIRE syscall/trap path of a user task runs on this
 /// stack — with interrupts enabled, so an IRQ handler's frames land
 /// on top of whatever depth the syscall body already reached. The
@@ -107,9 +113,21 @@ fn current_preempt_vector() -> u64 {
 /// plumbing, ext2 block staging, pty open), and 16 KiB measurably
 /// overflowed during `fork(2)` (the wl_xdg slab-canary corruption —
 /// see STACK_CANARY below, which now catches any recurrence with
-/// attribution). 32 KiB gives those paths + IRQ nesting real
-/// headroom at 8 pages per task.
-pub const DEFAULT_KERNEL_STACK_BYTES: usize = 32 * 1024;
+/// attribution).
+///
+/// 64 KiB, sized from measurement, not by analogy with Linux's 16 KiB: a
+/// 16 GiB QEMU soak with 64 KiB stacks and a release-time high-water probe
+/// saw most stackful-task stacks peak at 4–12 KiB, over 7,000 at 20–32 KiB,
+/// 61 beyond 32 KiB and the deepest at 49,792 bytes — so 32 KiB (which the
+/// soak also overflowed, silently, before stacks had guards) cannot hold the
+/// real paths, and 64 KiB leaves ~14 KiB over the deepest observed. NARF's
+/// own-stack model puts a whole syscall, its futures' poll frames and the
+/// trap frames of IRQs taken mid-syscall on this one stack, and Rust frames
+/// carry large by-value futures/structs that Linux's C frames do not. The
+/// guard (`narf_memory::kstack`) turns anything deeper into a reported fault;
+/// `note_released_stack_depth` reports new depth maxima with the deepest
+/// return addresses so the heavy paths can be slimmed and this lowered.
+pub const DEFAULT_KERNEL_STACK_BYTES: usize = 64 * 1024;
 
 /// Stack-overflow tripwire: number of canary words at the LOW end of
 /// every `KernelTask` stack. A stack that grows past its bottom must
@@ -154,7 +172,10 @@ const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 /// (`StackfulAdapter::drop` → `KernelTask::mark_stack_recyclable`); a
 /// `KernelTask` freed by any other path frees its stack straight to the buddy,
 /// so a still-referenced stack can never be handed back out.
-// Kept deliberately small: the cache holds whole 32 KiB stacks, and a
+// (History: stacks were heap blocks then. They are now guarded `KernelStack`s
+// built from order-0 frames, so fragmentation no longer fails them; what the
+// cache saves is the per-page map/unmap and global TLB invalidation.)
+// Kept deliberately small: the cache holds whole 64 KiB stacks, and a
 // fork/exit storm already hovers near memory exhaustion, so a large cache would
 // sequester megabytes that the storm needs and tip it into OOM sooner (observed
 // — a 16 MiB cache OOM'd a sweep a 4 MiB one survived). A couple per CPU plus a
@@ -163,7 +184,7 @@ const STACK_MAG_SIZE: usize = 2;
 const STACK_DEPOT_CAP: usize = 32;
 
 struct StackSlots<const N: usize> {
-    slots: [Option<alloc::boxed::Box<[u8]>>; N],
+    slots: [Option<KernelStack>; N],
     len: usize,
 }
 impl<const N: usize> StackSlots<N> {
@@ -175,7 +196,7 @@ impl<const N: usize> StackSlots<N> {
     }
     /// Store `stack`, or hand it back (`Some`) when full.
     #[inline]
-    fn push(&mut self, stack: alloc::boxed::Box<[u8]>) -> Option<alloc::boxed::Box<[u8]>> {
+    fn push(&mut self, stack: KernelStack) -> Option<KernelStack> {
         if self.len >= N {
             return Some(stack);
         }
@@ -184,7 +205,7 @@ impl<const N: usize> StackSlots<N> {
         None
     }
     #[inline]
-    fn pop(&mut self) -> Option<alloc::boxed::Box<[u8]>> {
+    fn pop(&mut self) -> Option<KernelStack> {
         if self.len == 0 {
             return None;
         }
@@ -215,11 +236,13 @@ static STACK_DEPOT: narf_lib::sync::IrqSafeSpinLock<StackSlots<STACK_DEPOT_CAP>>
     narf_lib::sync::IrqSafeSpinLock::new(StackSlots::new());
 
 /// Obtain a `stack_bytes` kernel stack: this CPU's magazine first, then the
-/// global depot, then a fresh zeroed buddy allocation. Cached stacks were
+/// global depot, then a fresh zeroed guarded mapping. Cached stacks were
 /// already zeroed at free, so there is no scrub here (off the hot path);
 /// `with_stack_size` re-arms the overflow canary either way. Non-default sizes
-/// always allocate fresh.
-fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
+/// always allocate fresh. A cached stack keeps its mapping and its guards:
+/// the cache holds `KernelStack` handles, not memory (Linux keeps
+/// `NR_CACHED_STACKS` vmapped stacks per CPU the same way).
+fn acquire_kernel_stack(stack_bytes: usize) -> KernelStack {
     if stack_bytes == DEFAULT_KERNEL_STACK_BYTES {
         // Tier 1: this CPU's magazine — no shared lock on the hot path.
         let local = narf_lib::sync::without_interrupts(|| {
@@ -229,15 +252,20 @@ fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
             mag.pop()
         });
         if let Some(stack) = local {
+            KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
             return stack;
         }
         // Tier 2: global depot.
         if let Some(stack) = STACK_DEPOT.lock().pop() {
+            KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
             return stack;
         }
     }
-    // Tier 3: fresh (also the only path for non-default sizes).
-    alloc::vec![0u8; stack_bytes].into_boxed_slice()
+    // Tier 3: fresh (also the only path for non-default sizes). Infallible
+    // like the heap allocation it replaces: a task without a stack cannot be
+    // built, and the error names why.
+    KernelStack::alloc(stack_bytes)
+        .unwrap_or_else(|e| panic!("kernel stack allocation ({stack_bytes} bytes) failed: {e:?}"))
 }
 
 /// Return a default-size kernel stack to the cache after zeroing it, or let it
@@ -245,11 +273,21 @@ fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
 /// when both are full (the final `Box` drop happens outside every lock). MUST
 /// only be called once the stack is provably unreferenced — i.e. from the RCU
 /// reclaim of a `KernelTask` marked recyclable (see `KernelTask::drop`).
-fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
+///
+/// `used` is the stack's high-water mark (`KernelTask::stack_high_water`):
+/// every word below it, canary aside, is still zero, so only the top `used`
+/// bytes and the canary words need the scrub.
+fn recycle_kernel_stack(mut stack: KernelStack, used: usize) {
     if stack.len() != DEFAULT_KERNEL_STACK_BYTES {
-        return; // non-default: frees to the buddy here
+        return; // non-default: unmaps and frees here
     }
-    stack.fill(0); // SECURITY: scrub before the stack enters any tier
+    // SECURITY: scrub before the stack enters any tier.
+    let len = stack.len();
+    stack[len - used.min(len)..].fill(0);
+    stack[..STACK_CANARY_WORDS * 8].fill(0);
+    // Counted as cached before it becomes reachable, so a concurrent pop's
+    // decrement never runs ahead of it; undone below if it frees instead.
+    KSTACK_CACHED_BYTES.fetch_add(len, Ordering::Relaxed);
 
     // Tier 1: this CPU's magazine.
     let overflow = narf_lib::sync::without_interrupts(|| {
@@ -264,7 +302,197 @@ fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
     // Tier 2: global depot. The lock is released at the end of this statement;
     // if the depot is full too, the handed-back `Box` drops below, freeing to
     // the buddy outside the lock.
-    let _buddy = STACK_DEPOT.lock().push(stack);
+    let buddy = STACK_DEPOT.lock().push(stack);
+    if buddy.is_some() {
+        KSTACK_CACHED_BYTES.fetch_sub(len, Ordering::Relaxed);
+    } else if !STACK_SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        // First stack parked in the depot: let reclaim and drop_caches
+        // empty it. Registration writes a fixed array; it never allocates.
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "kstack-depot",
+            count: stack_depot_count,
+            scan: stack_depot_scan,
+        });
+    }
+}
+
+/// Bytes of zeroed, still-mapped stacks parked in the per-CPU magazines and
+/// the depot.
+static KSTACK_CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// `(live, cached)` kernel-stack bytes for `/proc/meminfo`'s `KernelStack`
+/// and stack-cache lines: every mapped stack (`kstack::mapped_bytes`) is
+/// either cached here or owned by a live task.
+pub fn kernel_stack_bytes() -> (usize, usize) {
+    let cached = KSTACK_CACHED_BYTES.load(Ordering::Relaxed);
+    (
+        narf_memory::kstack::mapped_bytes().saturating_sub(cached),
+        cached,
+    )
+}
+
+static STACK_SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Base pages per default-size kernel stack.
+const STACK_PAGES: usize = DEFAULT_KERNEL_STACK_BYTES / 4096;
+
+/// Shrinker `count`: base pages of stacks in the global depot. The per-CPU
+/// magazines (Linux's per-CPU cached vmapped stacks) stay.
+fn stack_depot_count() -> usize {
+    STACK_DEPOT.lock().len * STACK_PAGES
+}
+
+/// Shrinker `scan`: unmap and free depot stacks, at most `nr_pages` pages'
+/// worth. Each is taken under the depot lock and dropped after it.
+fn stack_depot_scan(nr_pages: usize) -> usize {
+    let mut freed = 0usize;
+    while freed + STACK_PAGES <= nr_pages {
+        let Some(stack) = STACK_DEPOT.lock().pop() else {
+            break;
+        };
+        KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
+        drop(stack);
+        freed += STACK_PAGES;
+    }
+    freed
+}
+
+/// Deepest released-stack high-water mark seen since boot.
+static STACK_DEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
+/// Depth maxima below this are routine and not reported.
+const STACK_DEPTH_REPORT_BYTES: usize = 24 * 1024;
+
+/// Report a released stack that set a new depth record past
+/// `STACK_DEPTH_REPORT_BYTES`, with the return addresses left at its deepest
+/// point (the frames of the deepest call chain stay in the stack after it
+/// unwinds; symbolise `+off` with addr2line). Runs at release, never on the
+/// path that went deep, so it cannot perturb it. Feeds the stack sizing in
+/// `DEFAULT_KERNEL_STACK_BYTES`.
+/// The kernel image's text range, for telling return addresses from data.
+/// Hosted builds (the btrfs host harness) link without the kernel linker
+/// script, so there is no text range and nothing is reported as one.
+#[cfg(target_os = "none")]
+fn kernel_text_range() -> (u64, u64) {
+    extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    (
+        core::ptr::addr_of!(__text_start) as u64,
+        core::ptr::addr_of!(__text_end) as u64,
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+fn kernel_text_range() -> (u64, u64) {
+    (0, 0)
+}
+
+fn note_released_stack_depth(stack: &KernelStack, used: usize) {
+    if used < STACK_DEPTH_REPORT_BYTES || used <= STACK_DEPTH_MAX.fetch_max(used, Ordering::Relaxed)
+    {
+        return;
+    }
+    let (ts, te) = kernel_text_range();
+    narf_console::klog!(
+        "KSTACK-DEPTH record: {} of {} bytes (stack {:#x}); deepest return addresses:",
+        used,
+        stack.len(),
+        stack.base()
+    );
+    let deepest = stack.len() - used.min(stack.len());
+    let mut shown = 0;
+    let mut off = deepest & !7;
+    while off + 8 <= stack.len() && shown < 16 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&stack[off..off + 8]);
+        let v = u64::from_ne_bytes(w);
+        if (ts..te).contains(&v) {
+            narf_console::klog!(
+                "KSTACK-DEPTH   [top-{:#x}] {:#x} (+{:#x})",
+                stack.len() - off,
+                v,
+                v - ts
+            );
+            shown += 1;
+        }
+        off += 8;
+    }
+}
+
+// ── Kernel-stack overflow: test expectation + recovery ───────────────
+//
+// An overflow is fatal: the trap layer's report (`frame/kstack_overflow.rs`)
+// panics. The only exception is a kernel test that deliberately overflows a
+// task it owns: it arms the expected stack base, and the report then retires
+// that task (`exit_current_stackful`) instead of panicking, so the test can
+// assert the guard fired. Arming exists only in kernel-test builds; in every
+// other build `overflow_test_recovery` always answers `None`.
+
+/// Stack base a kernel test expects to overflow (0 = none armed).
+static OVERFLOW_EXPECT_BASE: AtomicU64 = AtomicU64::new(0);
+/// Guard address of the last expected overflow (0 = none seen yet).
+static OVERFLOW_SEEN_FAULT: AtomicU64 = AtomicU64::new(0);
+
+/// Arm (`base != 0`) or disarm (`0`) the overflow expectation.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __arm_overflow_expectation(base: u64) {
+    // Arming clears the last observation; disarming keeps it for the test.
+    if base != 0 {
+        OVERFLOW_SEEN_FAULT.store(0, Ordering::Release);
+    }
+    OVERFLOW_EXPECT_BASE.store(base, Ordering::Release);
+}
+
+/// Guard address the last expected overflow faulted on, if one was seen.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __overflow_seen() -> Option<u64> {
+    match OVERFLOW_SEEN_FAULT.load(Ordering::Acquire) {
+        0 => None,
+        f => Some(f),
+    }
+}
+
+/// Called by the trap layer after it reported an overflow of the stack
+/// `[base, top)` at guard address `fault`. Returns the `(pc, sp)` to resume at
+/// when a kernel test armed exactly this overflow (consuming the expectation);
+/// `None` otherwise, and the caller panics. The resume point runs on the top
+/// of the overflowed stack — whose contents are dead, the task never returns
+/// to them — and retires the task.
+pub fn overflow_test_recovery(base: u64, top: u64, fault: u64) -> Option<(u64, u64)> {
+    if base == 0
+        || OVERFLOW_EXPECT_BASE
+            .compare_exchange(base, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return None;
+    }
+    OVERFLOW_SEEN_FAULT.store(fault.max(1), Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Function-entry alignment: rsp ≡ 8 (mod 16), as after a `call`.
+        Some((overflow_test_recover as usize as u64, (top & !0xF) - 8))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Some((overflow_test_recover as usize as u64, top & !0xF))
+    }
+}
+
+/// Resume point of an expected overflow: re-arm the canary the recursion ran
+/// through, then retire the task exactly like a direct exit.
+extern "C" fn overflow_test_recover() -> ! {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: the overflowed task is current on this CPU; its continuation
+        // is abandoned, so this is the only code touching it.
+        unsafe { (*p).rearm_stack_canary() };
+    }
+    // SAFETY: kernel mode, on the current task's own stack (its top).
+    unsafe { exit_current_stackful() }
 }
 
 /// One cache-line-isolated CPU-local value. Scheduler context transitions
@@ -376,6 +604,162 @@ pub fn preempt_count() -> u32 {
 #[inline]
 fn preempt_enabled() -> bool {
     preempt_count() == 0
+}
+
+/// A stackful continuation gave up its CPU while holding state that belongs
+/// to that CPU.
+///
+/// Two kinds of state are counted per CPU and released on whichever CPU the
+/// holder happens to be running on: QSBR read guards (`narf_rcu::pin`) and
+/// preempt-disable depth ([`preempt_disable`]). A continuation that parks or
+/// yields with either held leaves its CPU pinned or unpreemptible while other
+/// tasks run there, and, once an idle CPU takes the sleeping task, releases
+/// on the wrong CPU. `ReadGuard` and [`PreemptGuard`] are `!Send`, which
+/// protects `async fn` state machines; a stackful continuation is switched as
+/// a stack and is never checked by the compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkViolation {
+    /// Task that gave up the CPU.
+    pub task: u64,
+    /// CPU it gave up.
+    pub cpu: u32,
+    /// QSBR read guards live on that CPU at that moment.
+    pub rcu_readers: usize,
+    /// Preempt-disable depth of that CPU at that moment.
+    pub preempt_depth: u32,
+    /// Source location that requested the park or yield.
+    pub site: &'static core::panic::Location<'static>,
+}
+
+/// `[nr, arg0..arg5, user_sp, user_pc]` of the system call `task` is in, if
+/// the installer can tell; the frame `/proc/<pid>/syscall` prints.
+pub type ParkSyscallHook = fn(task: u64, syscall: &mut [u64; 9]) -> bool;
+
+static PARK_SYSCALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PARK_VIOLATION_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PARK_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+/// Park sites already reported, by `Location` address: a hot path that
+/// violates the rule says so once, not once per park.
+#[cfg(not(feature = "kernel-test"))]
+static PARK_VIOLATION_SITES: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+#[cfg(feature = "kernel-test")]
+static PARK_VIOLATION_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+/// Let the park-violation report name the system call the task is in.
+pub fn set_park_syscall_hook(hook: ParkSyscallHook) {
+    PARK_SYSCALL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Replace the built-in one-line report with `hook`. It runs on the parking
+/// task's own stack, before the switch, once per park site.
+pub fn set_park_violation_hook(hook: fn(&ParkViolation)) {
+    PARK_VIOLATION_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Parks and yields seen so far with CPU-local state held.
+pub fn park_violation_count() -> u64 {
+    PARK_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+/// Under `kernel-test` a violation is a hard failure. A test that provokes
+/// one on purpose arms this first; it is then only counted.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_expect_park_violation(expected: bool) {
+    PARK_VIOLATION_EXPECTED.store(expected, Ordering::Release);
+}
+
+/// What `cpu` holds that a continuation leaving it must not take along:
+/// `(QSBR read guards, preempt-disable depth)`, or `None` when it holds
+/// neither. Two loads of this CPU's own counters.
+///
+/// A nested executor round (`poll_one_round_nested`) runs inside another
+/// kernel frame, and whatever that frame holds is counted on this CPU too
+/// without belonging to the task parking inside the round. It stays on this
+/// CPU with its frame, so there is nothing to report and no way to tell the
+/// two apart; nested rounds are skipped.
+#[inline]
+fn cpu_local_state_held(cpu: usize) -> Option<(usize, u32)> {
+    let rcu_readers = narf_rcu::reader_nesting();
+    let preempt_depth = PREEMPT_DEPTH[cpu].load(Ordering::Relaxed);
+    if (rcu_readers == 0 && preempt_depth == 0) || crate::in_nested_round(cpu) {
+        return None;
+    }
+    Some((rcu_readers, preempt_depth))
+}
+
+/// Whether preempting the interrupted continuation now would switch it out
+/// inside a QSBR read section.
+///
+/// A preempted task is requeued and may be stolen, so it can resume on another
+/// CPU and drop its guard there. Unlike a voluntary park this is nobody's bug:
+/// read sections do not disable preemption. The timer simply does not switch
+/// until the section ends, which is how Linux's non-preemptible RCU treats
+/// `rcu_read_lock()`; the reschedule request stays pending and the next tick
+/// acts on it. The preempt-disable depth is already checked on entry.
+#[inline]
+fn preempt_would_carry_rcu_readers() -> bool {
+    narf_rcu::reader_nesting() != 0
+}
+
+#[cold]
+#[inline(never)]
+fn report_park_violation(violation: ParkViolation) {
+    PARK_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "kernel-test")]
+    {
+        if PARK_VIOLATION_EXPECTED.load(Ordering::Acquire) {
+            return;
+        }
+        panic!(
+            "task {} gave up cpu {} holding CPU-local state: {} QSBR read guard(s), \
+             preempt-disable depth {} (requested at {})",
+            violation.task,
+            violation.cpu,
+            violation.rcu_readers,
+            violation.preempt_depth,
+            violation.site
+        );
+    }
+    #[cfg(not(feature = "kernel-test"))]
+    {
+        let site = core::ptr::from_ref(violation.site) as usize;
+        for seen in &PARK_VIOLATION_SITES {
+            match seen.compare_exchange(0, site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(recorded) if recorded == site => return,
+                Err(_) => {}
+            }
+        }
+        let hook = PARK_VIOLATION_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only `set_park_violation_hook` stores here, from a
+            // `fn(&ParkViolation)`.
+            let hook = unsafe { core::mem::transmute::<usize, fn(&ParkViolation)>(hook) };
+            hook(&violation);
+            return;
+        }
+        let mut syscall = [0u64; 9];
+        let hook = PARK_SYSCALL_HOOK.load(Ordering::Acquire);
+        let named = hook != 0 && {
+            // SAFETY: only `set_park_syscall_hook` stores here, from a
+            // `ParkSyscallHook`.
+            let hook = unsafe { core::mem::transmute::<usize, ParkSyscallHook>(hook) };
+            hook(violation.task, &mut syscall)
+        };
+        narf_console::klog!(
+            "BUG: scheduler: task {} gave up cpu {} holding CPU-local state: {} QSBR read \
+             guard(s), preempt-disable depth {}; requested at {}; syscall nr={} user_pc={:#x}{}",
+            violation.task,
+            violation.cpu,
+            violation.rcu_readers,
+            violation.preempt_depth,
+            violation.site,
+            syscall[0],
+            syscall[8],
+            if named { "" } else { " (syscall not known)" }
+        );
+    }
 }
 
 /// Read-and-clear this CPU's "last poll_to_yield returned via preemption" flag.
@@ -573,6 +957,65 @@ where
         }
     }
     false
+}
+
+/// Run `f` to completion on a fresh `stack_bytes` kernel stack, on this CPU,
+/// before returning — the boot CPU's `kernel_init`.
+///
+/// Linux runs `do_initcalls` in the `kernel_init` kthread, on an ordinary
+/// kernel-thread stack, never on the boot CPU's bootstrap stack: that stack is
+/// fixed, small, and sits next to boot data (here, on aarch64, the boot page
+/// tables — an initcall that overran it cleared kernel-image L2 descriptors).
+/// This gives the initcalls the same kind of stack a kernel task gets, from
+/// the same allocator — with its overflow canary, and the guard page once
+/// task stacks are vmapped — and its depth is measured.
+///
+/// It is not an executor task: `CURRENT_TASK` stays 0, so the `block_on`
+/// family remains usable exactly as on the caller's stack, and the boot
+/// sequence stays synchronous. Preemption is off, as it is for the caller. If
+/// the body parks its continuation (a sync wait inside), the continuation is
+/// simply resumed again until it completes.
+///
+/// Returns the deepest the body went, in bytes from the stack top (measured
+/// from paint laid below the initial frame).
+///
+/// # Panics
+/// If the body overran the stack's canary (`check_stack_canary`).
+pub fn run_on_kernel_stack<F>(stack_bytes: usize, f: F) -> usize
+where
+    F: FnOnce() + Send + 'static,
+{
+    const PAINT: u8 = 0xA5;
+    // The initial frame `KernelTask` builds lives in the top page.
+    const FRAME_RESERVE: usize = 4096;
+    let mut body = Some(f);
+    let mut task = KernelTask::with_stack_size(
+        core::future::poll_fn(move |_| {
+            if let Some(f) = body.take() {
+                f();
+            }
+            Poll::Ready(())
+        }),
+        stack_bytes,
+    );
+    task.set_no_preempt(true);
+    let paint_from = STACK_CANARY_WORDS * 8;
+    let paint_to = task.stack.len().saturating_sub(FRAME_RESERVE);
+    if paint_from < paint_to {
+        task.stack[paint_from..paint_to].fill(PAINT);
+    }
+    let mut exec_ctx = KernelContext::default();
+    let waker = KernelTask::no_op_waker();
+    // SAFETY: the task and context are owned here and polled by no one else.
+    while unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+        core::hint::spin_loop();
+    }
+    task.check_stack_canary();
+    let untouched = task.stack[paint_from..paint_to]
+        .iter()
+        .take_while(|byte| **byte == PAINT)
+        .count();
+    task.stack.len() - paint_from - untouched
 }
 
 /// The current stackful task's kernel stack as `(bottom, top)`, or `None`
@@ -1238,6 +1681,9 @@ unsafe fn try_direct_handoff(
         guard_switch_into("direct_handoff:target.ctx", &target_ref.ctx);
         #[cfg(any(test, feature = "kernel-test"))]
         DIRECT_HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        // A task-to-task switch is a scheduling point even though it bypasses
+        // the executor loop.
+        crate::note_sched_pass(cpu);
         // SAFETY: source and target contexts are distinct, live save slots;
         // the target returns either to `root_exec` or directly to this exact
         // root continuation, never to a third task stack.
@@ -1486,6 +1932,18 @@ pub fn current_stackful_stack_top() -> u64 {
     // alive for the duration of its run; `stack` is a stable heap allocation.
     let task = unsafe { &*p };
     ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64
+}
+
+/// `(high-water bytes, stack bytes)` of the stackful task running on this
+/// CPU, or `None` outside one. See [`KernelTask::stack_high_water`].
+pub fn current_stackful_high_water() -> Option<(usize, usize)> {
+    let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `p` is the in-flight task on this CPU, alive while it runs.
+    let task = unsafe { &*p };
+    Some((task.stack_high_water(), task.stack.len()))
 }
 
 /// Per-CPU storage for the cooperative executor's resume context.
@@ -1918,9 +2376,9 @@ pub struct KernelTask {
     /// The future being driven. Pinned in a Box so its address is
     /// stable across poll calls.
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// Per-task kernel stack. Box<[u8]> for automatic drop. Size
-    /// captured at `new()` time; phase 1b doesn't grow stacks.
-    stack: Box<[u8]>,
+    /// Per-task kernel stack: a guarded vmapped [`KernelStack`] (unmapped VA
+    /// below and above). Size captured at `new()` time; stacks don't grow.
+    stack: KernelStack,
     /// Set only on the RCU-confirmed-dead reclaim path
     /// (`StackfulAdapter::drop`). When set, `Drop` returns `stack` to the
     /// per-CPU stack cache for reuse; when clear (a `KernelTask` freed by any
@@ -2145,13 +2603,17 @@ impl KernelTask {
     }
 
     /// Same as `new` but with a custom stack size. Must be ≥ 4 KiB
-    /// (one page) and 16-byte aligned. Caller-driven for drivers
-    /// that genuinely need deeper stacks.
+    /// (one page), ≤ `KSTACK_MAX_BYTES` (128 KiB) and 16-byte aligned.
+    /// Caller-driven for drivers that genuinely need deeper stacks.
     pub fn with_stack_size<F>(future: F, stack_bytes: usize) -> Box<Self>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         assert!(stack_bytes >= 4096, "kernel stack must be ≥ 4 KiB");
+        assert!(
+            stack_bytes <= narf_memory::kstack::KSTACK_MAX_BYTES,
+            "kernel stack must be ≤ 128 KiB"
+        );
         assert!(
             stack_bytes & 0xF == 0,
             "kernel stack must be 16-byte aligned"
@@ -2162,7 +2624,7 @@ impl KernelTask {
         // rsp at this stack — both pointers must stay valid). Reuses a
         // recycled default-size stack when available (see STACK_CACHE) so a
         // fork storm does not churn an order-3 buddy block per task.
-        let mut stack: Box<[u8]> = acquire_kernel_stack(stack_bytes);
+        let mut stack: KernelStack = acquire_kernel_stack(stack_bytes);
 
         // Arm the overflow tripwire at the LOW end of the stack. See
         // STACK_CANARY: a stack overrunning its bottom pushes through
@@ -2271,10 +2733,11 @@ impl KernelTask {
     pub fn check_stack_canary(&self) {
         if let Some((i, got)) = self.stack_canary_clobbered() {
             let base = self.stack.as_ptr() as u64;
+            let cpu = this_cpu();
             panic!(
                 "KERNEL TASK STACK OVERFLOW: canary word {} at {:#x} clobbered \
                  ({:#018x} != {:#018x}) — stack [{:#x},{:#x}) ({} KiB) overran its \
-                 bottom into the heap below",
+                 bottom into the heap below; task {} on cpu {}; {}",
                 i,
                 base + (i as u64) * 8,
                 got,
@@ -2282,8 +2745,21 @@ impl KernelTask {
                 base,
                 base + self.stack.len() as u64,
                 self.stack.len() / 1024,
+                crate::current_task_id_on(cpu).raw(),
+                cpu,
+                OverflowEvidence { task: self },
             );
         }
+    }
+
+    /// The stack word at byte offset `at`, if it lies inside the stack.
+    fn stack_word(&self, at: u64) -> Option<u64> {
+        let base = self.stack.as_ptr() as u64;
+        let off = at.checked_sub(base)? as usize;
+        let bytes = self.stack.get(off..off.checked_add(8)?)?;
+        let mut w = [0u8; 8];
+        w.copy_from_slice(bytes);
+        Some(u64::from_ne_bytes(w))
     }
 
     /// First clobbered canary word at the low end of the stack, as
@@ -2299,6 +2775,39 @@ impl KernelTask {
             }
         }
         None
+    }
+
+    /// Deepest bytes of this task's stack ever written: stacks start zeroed
+    /// (fresh mappings and recycled stacks alike), so the lowest non-zero word
+    /// above the canary marks the high-water mark. Linux `stack_not_used`
+    /// (`CONFIG_DEBUG_STACK_USAGE`) measures the same way. A stack whose canary
+    /// is gone reports its full length.
+    pub fn stack_high_water(&self) -> usize {
+        if self.stack_canary_clobbered().is_some() {
+            return self.stack.len();
+        }
+        let words = self.stack.len() / 8;
+        for i in STACK_CANARY_WORDS..words {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&self.stack[i * 8..(i + 1) * 8]);
+            if u64::from_ne_bytes(w) != 0 {
+                return self.stack.len() - i * 8;
+            }
+        }
+        0
+    }
+
+    /// Bounds `[base, top)` of this task's kernel stack.
+    pub fn stack_bounds(&self) -> (u64, u64) {
+        (self.stack.base(), self.stack.top())
+    }
+
+    /// Re-write the low-end canary words (the overflow test's recovery: its
+    /// deliberate overflow ran through them before reaching the guard).
+    fn rearm_stack_canary(&mut self) {
+        for i in 0..STACK_CANARY_WORDS {
+            self.stack[i * 8..(i + 1) * 8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
+        }
     }
 
     /// Resume the task. Switches to its stack and lets it run
@@ -2901,6 +3410,53 @@ impl KernelTask {
     }
 }
 
+/// What a task whose stack overflowed still has to say for itself, for the
+/// overflow panic — reporting only, read from the task's own stack:
+///
+/// * where it last switched out (saved `rip`/`rsp`/`rbp`), and the chain of
+///   return addresses from that `rbp`, followed only while each frame lies
+///   inside the stack (meaningful where frame pointers are kept);
+/// * the words just above the canary: the deepest frames the overflow left
+///   behind are still there after the task unwound. Symbolise both against
+///   `nm -n` of the kernel image.
+struct OverflowEvidence<'a> {
+    task: &'a KernelTask,
+}
+
+impl core::fmt::Display for OverflowEvidence<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let task = self.task;
+        let ctx = &task.ctx;
+        #[cfg(target_arch = "x86_64")]
+        let (rip, rsp, rbp) = (ctx.rip, ctx.rsp, ctx.rbp);
+        #[cfg(not(target_arch = "x86_64"))]
+        let (rip, rsp, rbp) = (0u64, 0u64, 0u64);
+        let _ = ctx;
+        write!(f, "saved rip={rip:#x} rsp={rsp:#x} rbp={rbp:#x}; frames:")?;
+        let mut frame = rbp;
+        for _ in 0..16 {
+            let (Some(next), Some(ret)) = (task.stack_word(frame), task.stack_word(frame + 8))
+            else {
+                break;
+            };
+            write!(f, " {ret:#x}")?;
+            if next <= frame {
+                break;
+            }
+            frame = next;
+        }
+        let deepest = task.stack.as_ptr() as u64 + (STACK_CANARY_WORDS as u64) * 8;
+        write!(f, "; words above the canary:")?;
+        for i in 0..32u64 {
+            match task.stack_word(deepest + i * 8) {
+                Some(word) => write!(f, " {word:#x}")?,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for KernelTask {
     /// Backstop: guarantee no per-CPU `CURRENT_STACKFUL_TASK` slot outlives
     /// this task pointing at it. The reclaim path (`StackfulAdapter::drop`)
@@ -2911,8 +3467,8 @@ impl Drop for KernelTask {
         self.unbind_wake_cell();
         self.drop_active_poll_waker();
         self.clear_current_slots();
-        // Recycle the stack to the per-CPU cache instead of freeing its 8
-        // contiguous frames to the buddy — ONLY when this drop is the
+        // Recycle the stack (mapping and guards included) to the per-CPU cache
+        // instead of unmapping it and freeing its frames — ONLY when this drop is the
         // RCU-confirmed-dead reclaim (`recyclable_stack` set by
         // `StackfulAdapter::drop`), the sole point the stack is provably
         // unreferenced by any CPU. Any other free path (the backstop for a
@@ -2920,11 +3476,13 @@ impl Drop for KernelTask {
         // stack drops here and frees to the buddy — never handed back out while
         // a stale `rsp` might still point into it. `mem::take` leaves an empty,
         // non-allocating placeholder so the field's own drop is a no-op.
+        let used = self.stack_high_water();
+        note_released_stack_depth(&self.stack, used);
         let stack = core::mem::take(&mut self.stack);
         if self.recyclable_stack.load(Ordering::Acquire) {
-            recycle_kernel_stack(stack);
+            recycle_kernel_stack(stack, used);
         }
-        // else: `stack` frees to the buddy as it drops here.
+        // else: `stack` unmaps and frees its frames as it drops here.
     }
 }
 
@@ -3273,6 +3831,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if frame.vector != current_preempt_vector() {
         return false;
     }
+    // Every tick, whatever it interrupted: wakes staged on a CPU that is not
+    // reaching its executor are offered to an idle CPU (Linux
+    // `sched_balance_trigger`). None of the early returns below changes that.
+    crate::kick_idle_balance_from_tick();
     if !cpl_zero(frame.cs) {
         return false; // trapped from user mode; not our path
     }
@@ -3332,6 +3894,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
+    if preempt_would_carry_rcu_readers() {
+        return false;
+    }
     // SAFETY: Same live-`KernelTask` invariant as above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
@@ -3352,7 +3917,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // #UD. Catch it with attribution instead of silently corrupting.
     let frame_addr = frame as *const TrapFrame as u64;
     // SAFETY: live KernelTask per the CURRENT_STACKFUL_TASK invariant above;
-    // `stack` is a `Box<[u8]>` whose base/len bound the task's kernel stack.
+    // `stack` is a `KernelStack` whose base/len bound the task's kernel stack.
     let task_ref: &KernelTask = unsafe { &*task_ptr };
     let stk_base = task_ref.stack.as_ptr() as u64;
     let stk_top = stk_base + task_ref.stack.len() as u64;
@@ -3509,6 +4074,11 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
 /// Same live-frame and completed-EOI requirements as `try_preempt_aarch64`.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> bool {
+    if tick {
+        // See `try_preempt`: the tick-side idle-balance kick is independent
+        // of whether this CPU can be preempted right now.
+        crate::kick_idle_balance_from_tick();
+    }
     if !preempt_enabled() {
         return false;
     }
@@ -3550,6 +4120,9 @@ pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> b
     let task = unsafe { &*task_ptr };
     let need_resched = crate::need_resched_pending(cpu) || rt_reconsider(task, cpu);
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
+        return false;
+    }
+    if preempt_would_carry_rcu_readers() {
         return false;
     }
     let exec_ctx = task.exec_ctx.load(Ordering::Acquire);
@@ -3860,6 +4433,7 @@ pub fn current_slice_elapsed_ns() -> u64 {
 /// Called from a syscall handler running in kernel mode on the current task's
 /// own kernel stack, with a stackful task current on this CPU.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub unsafe fn yield_current_stackful() {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -3886,6 +4460,7 @@ pub unsafe fn yield_current_stackful() {
 /// `p` must be the live `CURRENT_STACKFUL_TASK` for `cpu`, and the caller must
 /// execute on that CPU in kernel mode on the task's own stack.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yield_peer: bool) {
     #[cfg(target_arch = "x86_64")]
     debug_assert!(
@@ -3901,6 +4476,18 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
     let exec_ctx = unsafe { (*p).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
         return;
+    }
+    // Every voluntary switch-out comes through here, and the sleeping task
+    // may be resumed by any allowed CPU. It must not take this CPU's read
+    // guards or preempt-disable depth with it (see `ParkViolation`).
+    if let Some((rcu_readers, preempt_depth)) = cpu_local_state_held(cpu) {
+        report_park_violation(ParkViolation {
+            task: crate::current_task_id_on(cpu).raw(),
+            cpu: cpu as u32,
+            rcu_readers,
+            preempt_depth,
+            site: core::panic::Location::caller(),
+        });
     }
     let masked_trap_park = !narf_arch::interrupts_enabled();
     if masked_trap_park {
@@ -4000,6 +4587,7 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
 /// switch-out as `maybe_resched_syscall_exit` / the own-stack park paths — the
 /// well-tested cooperative path, NOT `no_preempt`.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub fn cooperative_yield() -> bool {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -4030,6 +4618,7 @@ pub fn cooperative_yield() -> bool {
 /// context switch when the conservative runnable-work probe finds no peer and
 /// using the bounded direct-transfer path for an eligible local peer.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub fn sched_yield_current() -> bool {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -4474,6 +5063,64 @@ pub fn current_stackful_waker() -> Option<Waker> {
     None
 }
 
+/// Address spaces that outlive their tasks (`/proc/narf/mm_orphans`): the
+/// current task is about to abandon its kernel stack — exit, or exec entering
+/// the new image at the stack top — so no destructor of a local still live
+/// on it will ever run. Hand the live part, `[rsp, top)`, to
+/// [`narf_memory::as_origin::scan_abandoned_stack`], which records every
+/// registered `Arc<AddressSpace>` found there and the frame that held it.
+/// Returns whether one was found. Runs once per exit or exec, never on a hot
+/// path; a no-op outside a stackful task.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+pub fn note_abandoned_stack() -> bool {
+    extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: `p` is this CPU's in-flight task.
+    let (base, top) = unsafe { (*p).stack_bounds() };
+    let rsp: u64;
+    // SAFETY: reads the stack pointer only.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+    };
+    if rsp < base || rsp >= top {
+        return false;
+    }
+    // SAFETY: `[rsp, top)` is the live part of this task's own mapped stack.
+    unsafe {
+        narf_memory::as_origin::scan_abandoned_stack(
+            rsp & !7,
+            top & !7,
+            crate::current_task_id().raw(),
+            core::ptr::addr_of!(__text_start) as u64,
+            core::ptr::addr_of!(__text_end) as u64,
+        )
+    }
+}
+
+/// [`note_abandoned_stack`] at a task exit, with the exiting space's strong
+/// count.
+#[cfg(target_arch = "x86_64")]
+fn note_exit_address_space() {
+    let (root, strong) = {
+        let active = crate::active_user_as_slot().lock();
+        match active.as_ref() {
+            Some(space) => (space.root.raw(), Arc::strong_count(space)),
+            None => (0, 0),
+        }
+    };
+    let held = note_abandoned_stack();
+    if root != 0 {
+        narf_memory::as_origin::note_exit(root, strong, held);
+    }
+}
+
 /// Mark the CURRENT stackful task complete and `kernel_switch` out — never
 /// returns (the executor observes `completed` and drops the task). The
 /// per-task-own-stack replacement for the longjmp-based task exit.
@@ -4484,6 +5131,10 @@ pub fn current_stackful_waker() -> Option<Waker> {
 pub unsafe fn exit_current_stackful() -> ! {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    #[cfg(target_arch = "x86_64")]
+    if !p.is_null() {
+        note_exit_address_space();
+    }
     if !p.is_null() {
         // SAFETY: in-flight task on this CPU.
         unsafe {
@@ -4732,6 +5383,144 @@ impl Future for StackfulAdapter {
 }
 
 // Tests are inline below — same gating as the kernel_ctx smokes.
+
+/// Guarded-stack tests (`scheduler/kstack`): a real overflow must end on the
+/// guard and be reported, and the wake path's measured stack cost.
+#[cfg(feature = "kernel-test")]
+pub mod kstack_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// One ~256-byte frame per level, kept alive by `black_box`, with work
+    /// after the call so it cannot become a loop.
+    #[inline(never)]
+    fn recurse(depth: u64, stop: u64, at_bottom: &mut dyn FnMut()) -> u64 {
+        let frame = core::hint::black_box([depth; 32]);
+        if depth == stop {
+            at_bottom();
+            return frame[1];
+        }
+        recurse(depth + 1, stop, at_bottom).wrapping_add(core::hint::black_box(frame[3]))
+    }
+
+    /// Recurses until the stack runs out.
+    struct Overflow;
+    impl Future for Overflow {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            core::hint::black_box(recurse(0, u64::MAX, &mut || {}));
+            Poll::Ready(())
+        }
+    }
+
+    /// A task that recurses off the bottom of its stack must fault on the
+    /// guard below it and be reported (here: retired, because the test armed
+    /// the expectation; otherwise the report panics). Before guard pages the
+    /// same recursion wrote straight into the frame below the stack.
+    fn smoke_kstack_overflow_faults_on_guard() -> TestResult {
+        let mut task = KernelTask::new(Overflow);
+        let (base, _top) = task.stack_bounds();
+        __arm_overflow_expectation(base);
+        #[allow(clippy::default_constructed_unit_structs)]
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: single-threaded test; the task is driven only from here.
+        let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        __arm_overflow_expectation(0);
+        let Some(fault) = __overflow_seen() else {
+            return TestResult::Fail("overflow was not reported by the guard fault");
+        };
+        if fault >= base || base - fault > narf_memory::kstack::KSTACK_MAX_BYTES as u64 {
+            return TestResult::Fail("reported fault is not in the guard below the stack");
+        }
+        if result != Poll::Ready(()) {
+            return TestResult::Fail("overflowed task was not retired");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scheduler/kstack", smoke_kstack_overflow_faults_on_guard);
+
+    static PARKED_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    static PLAIN_HW: AtomicUsize = AtomicUsize::new(0);
+    static WAKE_HW: AtomicUsize = AtomicUsize::new(0);
+    static STACK_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Parks once, recording its scheduler waker; completes when woken.
+    struct ParkOnce(bool);
+    impl Future for ParkOnce {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            if this.0 {
+                return Poll::Ready(());
+            }
+            *PARKED_WAKER.lock() = Some(cx.waker().clone());
+            this.0 = true;
+            Poll::Pending
+        }
+    }
+
+    /// Recursion depth used for both runs: ~14 KiB of the default stack.
+    const DEPTH: u64 = 48;
+
+    /// The wake path run at depth on a task stack, the way a wake from an
+    /// interrupt landing on a deep syscall stack runs: IRQs masked, real
+    /// scheduler waker of a parked task, full `wake_by_ref` → placement path.
+    /// Its cost is the high-water difference against the same recursion
+    /// without the wake, each on a fresh zeroed stack. The wake must leave at
+    /// least a quarter of the stack free.
+    fn smoke_kstack_wake_path_headroom() -> TestResult {
+        crate::__reset_queues_for_test();
+        *PARKED_WAKER.lock() = None;
+        crate::spawn(ParkOnce(false));
+        crate::spawn_stackful(async {
+            crate::yield_now().await;
+            core::hint::black_box(recurse(0, DEPTH, &mut || {}));
+            if let Some((hw, len)) = current_stackful_high_water() {
+                PLAIN_HW.store(hw, Ordering::Release);
+                STACK_LEN.store(len, Ordering::Release);
+            }
+        });
+        crate::spawn_stackful(async {
+            crate::yield_now().await;
+            crate::yield_now().await;
+            let waker = PARKED_WAKER.lock().take();
+            core::hint::black_box(recurse(0, DEPTH, &mut || {
+                if let Some(w) = waker.as_ref() {
+                    narf_lib::sync::without_interrupts(|| w.wake_by_ref());
+                }
+            }));
+            if let Some((hw, _)) = current_stackful_high_water() {
+                WAKE_HW.store(hw, Ordering::Release);
+            }
+        });
+        crate::run_until_empty();
+        let (plain, wake, len) = (
+            PLAIN_HW.load(Ordering::Acquire),
+            WAKE_HW.load(Ordering::Acquire),
+            STACK_LEN.load(Ordering::Acquire),
+        );
+        narf_console::klog!(
+            "[kstack] wake path at depth: plain {} B, with wake {} B, wake cost {} B, stack {} B",
+            plain,
+            wake,
+            wake.saturating_sub(plain),
+            len
+        );
+        if plain == 0 || wake == 0 || len == 0 {
+            return TestResult::Fail("high-water marks not recorded");
+        }
+        if wake <= plain {
+            return TestResult::Fail("wake at depth used no stack: not measured");
+        }
+        if wake > len - len / 4 {
+            return TestResult::Fail("wake path at depth left under a quarter of the stack");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scheduler/kstack", smoke_kstack_wake_path_headroom);
+}
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {

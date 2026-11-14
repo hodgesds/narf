@@ -3100,3 +3100,54 @@ kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_tx_charges_return_on_completion_refusal_and_reset
 );
+
+fn smoke_igc_refused_frame_returns_its_buffer_to_the_pool() -> TestResult {
+    fn plain(_: &[u8], _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn owned(_: u64, _: Frame, _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const NAME: &str = "igc-pool-selftest";
+    let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 10], plain);
+    check!(name == NAME, "the test interface was renamed");
+    let pool = alloc::sync::Arc::new(narf_io::pool::DmaPool::new(2048, DomainId::DRIVER_0, 8));
+    check!(pool.prefill(8) == 8, "pool prefill failed");
+    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
+    let q = Queue::new_sized(64, 64).unwrap();
+    q.set_owner(NAME);
+    let m = Model::new();
+    let aware = crate::queue::TxOptions {
+        backpressure: true,
+        ..Default::default()
+    };
+    // Stop the queue with frames that are not the pool's.
+    while q
+        .post_options(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500, aware)
+        .is_ok()
+    {}
+    check!(q.txq().is_stopped(), "the queue did not stop");
+    // More refusals than the pool has buffers: each must come back.
+    for _ in 0..20 {
+        let Some(mut frame) = narf_net::iface::tx_acquire(NAME, 54) else {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a refusal took a buffer out of the zero-copy pool for good");
+        };
+        frame.payload_mut().copy_from_slice(&tcp4(0));
+        if q.post_options(&m, 0, frame, TxMeta::plain(), 1500, aware) != Err(IgcError::TxBusy) {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a stopped queue took a backpressured frame");
+        }
+    }
+    let available = pool.available();
+    let _ = narf_net::iface::unregister(NAME);
+    check!(
+        available == 8,
+        "refused frames were not returned to their pool"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_refused_frame_returns_its_buffer_to_the_pool
+);

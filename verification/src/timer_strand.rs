@@ -324,3 +324,100 @@ kernel_test_in!(
     "scheduler/strand/timer",
     smoke_hrtimer_remote_earlier_event_rearms_by_ipi
 );
+
+static TMIGR_FIRED_CPU: [AtomicUsize; 2] =
+    [AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX)];
+
+#[repr(C)]
+struct TmigrTimer {
+    timer: narf_time::timer::TimerList,
+    slot: usize,
+}
+
+fn tmigr_timer_fn(r: narf_time::timer::TimerRef) {
+    // SAFETY: only `TmigrTimer` uses this callback; `timer` is its first
+    // field (repr(C)); the test keeps it alive.
+    let slot = unsafe { (*(r.as_ptr() as *const TmigrTimer)).slot };
+    TMIGR_FIRED_CPU[slot].store(narf_lib::percpu::current_cpu(), Ordering::Release);
+}
+
+/// Timer migration (Linux tmigr): a GLOBAL (unpinned) wheel timer queued on
+/// a tickless-idle AP does not count toward that AP's next event while
+/// another CPU is active, and is expired on time anyway — by this active
+/// CPU's timer softirq, or by the AP if it woke for something else first.
+/// A PINNED one wakes its own AP and fires there.
+fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
+    use narf_time::timer::{self, TimerList, TIMER_PINNED};
+    let me = narf_lib::percpu::current_cpu();
+    let live = live_aps();
+    let Some(ap) = (0..MAX_CPUS).find(|cpu| live & (1u64 << cpu) != 0) else {
+        return TestResult::Skip("needs a second CPU that really came up");
+    };
+    timer::timers_prepare_cpu(ap);
+    let Some(prod) = ProdTimers::enter(live) else {
+        return TestResult::Skip("no programmable tickless clockevent");
+    };
+    let idle = wait_for(1_000_000_000, || {
+        narf_scheduler::__test_cpu_halted(ap)
+            && !narf_time::periodic_tick_wanted(ap)
+            && !narf_time::timer_migration::cpu_active(ap)
+    });
+    if !idle {
+        prod.restore();
+        return TestResult::Skip("the AP never went tickless-idle");
+    }
+    for s in &TMIGR_FIRED_CPU {
+        s.store(usize::MAX, Ordering::Release);
+    }
+    narf_time::timer_migration::tmigr_cpu_activate();
+    let global = alloc::boxed::Box::new(TmigrTimer {
+        timer: TimerList::new(tmigr_timer_fn, 0),
+        slot: 0,
+    });
+    let pinned = alloc::boxed::Box::new(TmigrTimer {
+        timer: TimerList::new(tmigr_timer_fn, TIMER_PINNED),
+        slot: 1,
+    });
+    let at = timer::jiffies() + 20;
+    // SAFETY: the Boxes stay put; deleted below.
+    unsafe {
+        // The global timer is due first, so the AP is not already awake
+        // for its pinned one when the global one comes due.
+        timer::add_timer_on(&global.timer, at, ap);
+        timer::add_timer_on(&pinned.timer, at + 40, ap);
+    }
+    // While this CPU is active, the idle AP leaves its global timers to it.
+    let handed_over = narf_time::timer_migration::cpu_active(ap)
+        || narf_time::timer_migration::global_next_for(ap) == u64::MAX;
+    // This CPU is active: its softirq is where idle CPUs' global timers run.
+    let end = narf_time::monotonic_ns() + 1_000_000_000;
+    while narf_time::monotonic_ns() < end
+        && TMIGR_FIRED_CPU
+            .iter()
+            .any(|s| s.load(Ordering::Acquire) == usize::MAX)
+    {
+        let _ = narf_time::hrtimer::hrtimer_run_softirq();
+        core::hint::spin_loop();
+    }
+    let (g, p) = (
+        TMIGR_FIRED_CPU[0].load(Ordering::Acquire),
+        TMIGR_FIRED_CPU[1].load(Ordering::Acquire),
+    );
+    timer::del_timer_sync(&global.timer);
+    timer::del_timer_sync(&pinned.timer);
+    prod.restore();
+    if p != ap {
+        return TestResult::Fail("a pinned timer on an idle AP did not wake it and fire there");
+    }
+    if !handed_over {
+        return TestResult::Fail("an idle AP kept its global timers while another CPU was active");
+    }
+    if g != me && g != ap {
+        return TestResult::Fail("an idle AP's global timer never fired");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand/timer",
+    smoke_tmigr_global_timer_runs_on_active_cpu
+);

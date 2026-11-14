@@ -136,11 +136,12 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
             // (apic_id << 12). Vector in low byte of data; high
             // bits 0 (fixed delivery, edge-triggered, physical).
             //
-            // BSP APIC ID is read from MADT (entry 0). Most x86
+            // BSP APIC ID from the MADT-derived CPU map (logical CPU
+            // 0 is the boot CPU; MADT entry 0 need not be). Most x86
             // BSPs have APIC ID 0 but it's not guaranteed; Linux
             // also reads boot_cpu_data.apicid rather than
             // hardcoding 0.
-            let bsp_apic = match narf_acpi::apic_id_at(0) {
+            let bsp_apic = match narf_acpi::apic_id_of_cpu(0) {
                 Some(id) if id <= 0xFF => id,
                 _ => 0, // fallback if MADT didn't enumerate
             };

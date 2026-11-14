@@ -74,33 +74,46 @@ kernel_test_in!("scheduler", smoke_scheduler_parked_idle_leaves_rcu_census);
 /// held, and the CPU spun forever with interrupts masked (every other CPU
 /// then stalled on its TLB-shootdown ack). The nested round must leave the
 /// CPU's quiescent state untouched; a top-level round must still report.
+///
+/// Measured on the CPU's reported epoch, opened one ahead of it: a nested
+/// round must leave it behind, a top-level round must catch it up. (The
+/// quiescent timestamp is no proxy: a poll on an idle CPU rejoins the census
+/// before it runs — `narf_rcu::exit_idle` — without reporting quiescence.)
 fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static POLLED: AtomicUsize = AtomicUsize::new(0);
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu >= 64 {
-        return TestResult::Skip("current CPU is outside watchdog mask");
-    }
-    let bit = 1u64 << cpu;
     crate::__reset_queues_for_test();
     POLLED.store(0, Ordering::Relaxed);
 
-    // Inactive: no published quiescent timestamp on this CPU.
-    crate::report_parked_queue_idle();
+    // This CPU reports epoch `e`; then a retirement opens `e + 1` without it.
+    let behind = || {
+        narf_rcu::report_quiescent();
+        let reported = narf_rcu::__test_last_quiescent(cpu);
+        {
+            let guard = narf_rcu::pin();
+            narf_rcu::defer_drop(narf_rcu::Owned::new(0u64), &guard);
+        }
+        narf_rcu::advance_epoch_if_pending();
+        reported
+    };
+
+    let reported = behind();
     crate::spawn(async {
         POLLED.fetch_add(1, Ordering::Relaxed);
     });
     let _ = crate::poll_one_round_nested();
-    let nested_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    let nested_reported = narf_rcu::__test_last_quiescent(cpu) != reported;
     let nested_polled = POLLED.load(Ordering::Relaxed);
 
     // A top-level round is a quiescent point and must still report one.
-    crate::report_parked_queue_idle();
+    let reported = behind();
     crate::spawn(async {
         POLLED.fetch_add(1, Ordering::Relaxed);
     });
     let _ = crate::poll_one_round();
-    let top_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    let after = narf_rcu::__test_last_quiescent(cpu);
+    let top_reported = after != reported && after != u64::MAX;
 
     crate::__reset_queues_for_test();
     narf_rcu::report_quiescent();
@@ -115,7 +128,139 @@ fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_nested_round_is_not_quiescent);
+kernel_test_in!(
+    "scheduler/rcu_idle",
+    smoke_scheduler_nested_round_is_not_quiescent
+);
+
+/// An idle CPU leaves the QSBR census (`report_idle` publishes the
+/// "inactive" sentinel, past every epoch). When it wakes, it must rejoin the
+/// census before it runs anything that reads RCU-protected data — Linux's
+/// `rcu_eqs_exit` — or a grace period completes under that reader.
+///
+/// An idle AP is woken to run one task that pins, loads an object from an
+/// RCU cell, and holds it. Meanwhile this CPU retires the object and waits a
+/// bounded time for a grace period. None may complete, the object must not
+/// be dropped, and the reader must still see it intact (the drop poisons it)
+/// when it finally looks.
+fn smoke_scheduler_reader_on_woken_cpu_holds_grace_period() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    const LIVE: u64 = 0x11FE_11FE_11FE_11FE;
+    const POISON: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+
+    struct Probe {
+        magic: u64,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            FREES.fetch_add(1, Ordering::AcqRel);
+            // SAFETY: a field of the value being dropped.
+            unsafe { core::ptr::write_volatile(&mut self.magic, POISON) };
+        }
+    }
+
+    static CELL: narf_rcu::Atomic<Probe> = narf_rcu::Atomic::null();
+    static FREES: AtomicUsize = AtomicUsize::new(0);
+    static HOLDING: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    fn wait_for(ns: u64, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(ns));
+        loop {
+            if done() {
+                return true;
+            }
+            if narf_time::now_cycles() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    let Some(ap) = (0..64).find(|cpu| *cpu != me && live & (1u64 << cpu) != 0) else {
+        return TestResult::Skip("needs a second CPU that really came up");
+    };
+    if !wait_for(2_000_000_000, || {
+        narf_rcu::__test_last_quiescent(ap) == u64::MAX
+    }) {
+        return TestResult::Skip("the AP never went idle");
+    }
+
+    HOLDING.store(false, Ordering::Release);
+    RELEASE.store(false, Ordering::Release);
+    DONE.store(false, Ordering::Release);
+    SEEN.store(0, Ordering::Release);
+    {
+        let guard = narf_rcu::pin();
+        CELL.store(narf_rcu::Owned::new(Probe { magic: LIVE }), &guard);
+    }
+    narf_rcu::sync();
+    let frees_before = FREES.load(Ordering::Acquire);
+
+    // The AP's first poll after waking: pin, load, hold.
+    crate::spawn_with_spec(
+        async {
+            let guard = narf_rcu::pin();
+            let held = CELL.load(&guard).as_ref();
+            HOLDING.store(true, Ordering::Release);
+            wait_for(3_000_000_000, || RELEASE.load(Ordering::Acquire));
+            let seen = held.map_or(0, |probe| {
+                // SAFETY: `probe` is protected by `guard` — the property under test.
+                unsafe { core::ptr::read_volatile(&probe.magic) }
+            });
+            SEEN.store(seen, Ordering::Release);
+            drop(guard);
+            DONE.store(true, Ordering::Release);
+        },
+        crate::TaskSpec {
+            affinity: crate::Affinity::pinned(crate::CpuId(ap as u32)),
+            ..crate::TaskSpec::kernel_any()
+        },
+    );
+    if !wait_for(2_000_000_000, || HOLDING.load(Ordering::Acquire)) {
+        RELEASE.store(true, Ordering::Release);
+        return TestResult::Fail("the woken AP did not run the reader");
+    }
+
+    // Retire the object the AP holds and give a grace period every chance.
+    {
+        let guard = narf_rcu::pin();
+        CELL.store(narf_rcu::Owned::new(Probe { magic: LIVE }), &guard);
+    }
+    let elapsed = narf_rcu::sync_until(narf_time::monotonic_ns() + 200_000_000);
+    let freed_under_reader = FREES.load(Ordering::Acquire) - frees_before;
+
+    RELEASE.store(true, Ordering::Release);
+    let finished = wait_for(3_000_000_000, || DONE.load(Ordering::Acquire));
+    let seen = SEEN.load(Ordering::Acquire);
+    {
+        let guard = narf_rcu::pin();
+        CELL.clear(&guard);
+    }
+    narf_rcu::sync();
+
+    if !finished {
+        return TestResult::Fail("the reader on the AP did not finish");
+    }
+    if elapsed || freed_under_reader != 0 {
+        return TestResult::Fail(
+            "a grace period completed and freed the object under a reader on a just-woken CPU",
+        );
+    }
+    if seen != LIVE {
+        return TestResult::Fail("the reader on a just-woken CPU saw its object poisoned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/rcu_idle",
+    smoke_scheduler_reader_on_woken_cpu_holds_grace_period
+);
 
 fn smoke_scheduler_drives_future() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -194,6 +339,53 @@ fn smoke_scheduler_respects_waker() -> TestResult {
     }
 }
 kernel_test_in!("scheduler", smoke_scheduler_respects_waker);
+
+/// `all_task_ids` and `task_origins` name each task once, whatever queue it
+/// sits in and however often it moves between ready and parked while the
+/// snapshot is taken (the soak's `/proc/loadavg` total counted one kernel
+/// thread three times).
+fn smoke_scheduler_task_snapshot_names_each_task_once() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DUPLICATE: AtomicBool = AtomicBool::new(false);
+
+    fn unique() -> bool {
+        let ids = crate::all_task_ids();
+        let origins = crate::task_origins();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut origin_ids: alloc::vec::Vec<_> = origins.iter().map(|o| o.0).collect();
+        origin_ids.sort_unstable();
+        origin_ids.dedup();
+        sorted.len() == ids.len() && origin_ids.len() == origins.len()
+    }
+
+    DUPLICATE.store(false, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    for _ in 0..8 {
+        crate::spawn(async {
+            for _ in 0..20 {
+                crate::yield_now().await;
+                if !unique() {
+                    DUPLICATE.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    let spawned = crate::all_task_ids().len();
+    if !unique() || spawned < 8 {
+        return TestResult::Fail("a fresh snapshot named a task twice or missed one");
+    }
+    crate::run_until_empty();
+    if DUPLICATE.load(Ordering::Relaxed) {
+        return TestResult::Fail("a snapshot taken while tasks moved named one twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_task_snapshot_names_each_task_once
+);
 
 fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
     // A Cap<CpuBudget, Spend>-attached task runs while the cap is live,
@@ -6457,4 +6649,372 @@ fn smoke_wake_arriving_during_activation_keeps_notification() -> TestResult {
 kernel_test_in!(
     "scheduler",
     smoke_wake_arriving_during_activation_keeps_notification
+);
+
+/// Build a user address space with one materialized page in each of three
+/// PML4 slots (each with its own PDPT/PD/PT chain), so its teardown has
+/// tables at every level to return.
+#[cfg(target_arch = "x86_64")]
+fn mm_exit_fixture() -> Result<alloc::sync::Arc<narf_memory::AddressSpace>, TestResult> {
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    // SAFETY: paging is enabled in the kernel test environment.
+    let space = unsafe { AddressSpace::new_for_user() }
+        .map_err(|_| TestResult::Skip("new_for_user failed"))?;
+    for base in bases {
+        let backing = narf_memory::alloc_frame()
+            .map_err(|_| TestResult::Skip("frame allocator drained"))?
+            .start_address();
+        space
+            .map_region(Region {
+                base: VirtAddr::new(base),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![backing].into(),
+            })
+            .map_err(|_| TestResult::Fail("fixture region was rejected"))?;
+    }
+    // SAFETY: the test owns the root and every backing frame.
+    unsafe { space.materialize() }.map_err(|_| TestResult::Fail("fixture materialize failed"))?;
+    Ok(alloc::sync::Arc::new(space))
+}
+
+/// Linux `exit_mm` → `mmput` → `exit_mmap`: the last task of an address space
+/// finishing returns its mappings and every page table below the root at
+/// once, while a passive holder — a zombie's bookkeeping, a `/proc` reader, a
+/// reference nobody released — still has the `Arc`. The root follows when
+/// that last `Arc` goes (`mmdrop`). Two tasks share the space (a process and
+/// its thread): the first to finish must leave it intact.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_last_user_task_releases_mm() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    crate::__reset_queues_for_test();
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+    let tables_before = narf_memory::frame::page_table_frames();
+    let space = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let walked = space.page_table_frames();
+    if walked < 10 {
+        return TestResult::Fail("fixture built fewer tables than three chains need");
+    }
+    // The passive holder.
+    let passive = space.clone();
+    for _ in 0..2 {
+        spawn_user(
+            crate::alloc_task_id(),
+            async {
+                RAN.fetch_add(1, Ordering::Relaxed);
+            },
+            TaskSpec::unthrottled(),
+            space.clone(),
+        );
+    }
+    drop(space);
+    crate::run_until_empty();
+    if RAN.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("user tasks did not run");
+    }
+    if passive.scheduler_user_tasks() != 0 {
+        return TestResult::Fail("finished tasks still counted as mm users");
+    }
+    if passive.region_count() != 0 {
+        return TestResult::Fail("mappings outlived the last task");
+    }
+    if passive.page_table_frames() != 1 {
+        return TestResult::Fail("page tables below the root outlived the last task");
+    }
+    // Other CPUs may map kernel memory meanwhile; allow a little.
+    if narf_memory::frame::page_table_frames() > tables_before + 1 + 4 {
+        return TestResult::Fail("PageTables did not return to baseline plus the root");
+    }
+    let root = passive.root.raw();
+    if narf_memory::as_origin::info(root).is_none() {
+        return TestResult::Fail("the root must live until the last Arc");
+    }
+    if passive.exit_mmap() != 0 || passive.page_table_frames() != 1 {
+        return TestResult::Fail("a second exit_mmap was not a no-op");
+    }
+    drop(passive);
+    if narf_memory::as_origin::info(root).is_some() {
+        return TestResult::Fail("the root outlived the last Arc");
+    }
+    if narf_memory::frame::page_table_frames() > tables_before + 4 {
+        return TestResult::Fail("PageTables did not return to baseline");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_last_user_task_releases_mm
+);
+
+/// Linux `exec_mmap` → `mmput(old_mm)`: an exec that displaces the last user
+/// of the old address space releases that space's mappings and tables at
+/// once, even though the exec path (and here the test) still holds an `Arc`
+/// to it; the new space is untouched.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_exec_displacing_last_user_releases_old_mm() -> TestResult {
+    extern crate alloc;
+    use crate::{replace_address_space, spawn_user, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let old = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let new = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let new_tables = new.page_table_frames();
+    let tid = spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        old.clone(),
+    );
+    let displaced = replace_address_space(tid, new.clone());
+    let ok_displaced = matches!(&displaced, Some(p) if alloc::sync::Arc::ptr_eq(p, &old));
+    let old_regions = old.region_count();
+    let old_tables = old.page_table_frames();
+    let new_users = new.scheduler_user_tasks();
+    let new_after = new.page_table_frames();
+    drop(displaced);
+    crate::run_until_empty();
+    if !ok_displaced {
+        return TestResult::Fail("replace_address_space did not return the old space");
+    }
+    if old_regions != 0 || old_tables != 1 {
+        return TestResult::Fail("the displaced space kept its mappings or tables");
+    }
+    if new_users != 1 || new_after != new_tables {
+        return TestResult::Fail("the new space lost its user or its tables");
+    }
+    if new.region_count() != 0 || new.page_table_frames() != 1 {
+        return TestResult::Fail("the new space outlived its only task");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_exec_displacing_last_user_releases_old_mm
+);
+
+/// After many address spaces lose their last task, the only references left
+/// are the per-CPU lazy holders (the executor's root handoff and the direct
+/// handoff's root cell, Linux's lazy-TLB `active_mm`): at most two per CPU,
+/// however many exited. Each of those already went through `exit_mmap`, so it
+/// pins one root page and nothing else.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_lazy_mm_holders_bounded_by_cpus() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+
+    const SPACES: usize = 48;
+    crate::__reset_queues_for_test();
+    let mut roots = alloc::vec::Vec::with_capacity(SPACES);
+    for _ in 0..SPACES {
+        let space = match mm_exit_fixture() {
+            Ok(space) => space,
+            Err(result) => return result,
+        };
+        roots.push(space.root.raw());
+        spawn_user(
+            crate::alloc_task_id(),
+            async {},
+            TaskSpec::unthrottled(),
+            space,
+        );
+    }
+    crate::run_until_empty();
+    let mut live = 0usize;
+    for &root in &roots {
+        if let Some(info) = narf_memory::as_origin::info(root) {
+            live += 1;
+            if info.user_tasks != Some(0) {
+                return TestResult::Fail("a finished space still counts a user");
+            }
+        }
+    }
+    let cpus = (narf_lib::smp::cpu_count() as usize).max(1);
+    if live > 2 * cpus {
+        return TestResult::Fail("lazy holders kept more roots than two per CPU");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_lazy_mm_holders_bounded_by_cpus
+);
+
+/// Linux `exit_mm`: an exiting task gives up its user reference in its own
+/// context — the last one runs `exit_mmap` there — and the later slot drop
+/// must not give it up a second time (an underflow of the user count). A
+/// second `exit_mm` is a no-op.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_exit_mm_releases_once() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let space = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let tid = spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        space.clone(),
+    );
+    if space.mmget_not_zero().is_none() {
+        return TestResult::Fail("a spawned task's space had no user");
+    }
+    if !crate::exit_mm(tid) {
+        return TestResult::Fail("exit_mm found no user reference to give up");
+    }
+    let regions = space.region_count();
+    let tables = space.page_table_frames();
+    let again = crate::exit_mm(tid);
+    let refused = space.mmget_not_zero().is_none();
+    crate::run_until_empty();
+    if regions != 0 || tables != 1 {
+        return TestResult::Fail("the last exit_mm did not run exit_mmap");
+    }
+    if again {
+        return TestResult::Fail("a second exit_mm gave up a reference again");
+    }
+    if !refused {
+        return TestResult::Fail("mmget_not_zero succeeded after exit_mm");
+    }
+    if space.scheduler_user_tasks() != 0 {
+        return TestResult::Fail("the slot drop released the user a second time");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("scheduler/mm-exit", smoke_scheduler_exit_mm_releases_once);
+
+// ── block_on bridge: a cross-CPU wake kicks the halted bridge ──────
+
+static BRIDGE_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static BRIDGE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BRIDGE_WOKE_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the waker saw the bridge's CPU published as halted before waking.
+static BRIDGE_SAW_HALTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
+    // `block_on` on this CPU halts waiting for a future that a task on
+    // another CPU completes. The waker must IPI this CPU (the bridge
+    // publishes its halt as the executor's idle path does), so the bridge
+    // returns within microseconds of the wake — not at this CPU's next
+    // unrelated interrupt, which on a tickless CPU may be far away. The
+    // bridge takes its halting path only on a reliable tick with IRQs
+    // enabled; elsewhere it spins and there is nothing to test.
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::Poll;
+    if !narf_time::tick_reliable() {
+        return TestResult::Skip("no reliable tick: block_on spins instead of halting");
+    }
+    let me = narf_lib::percpu::current_cpu();
+    let Some(other) =
+        (0..narf_lib::percpu::MAX_CPUS).find(|&c| c != me && narf_lib::smp::is_online(c as u32))
+    else {
+        return TestResult::Skip("no second online CPU");
+    };
+    BRIDGE_DONE.store(false, Ordering::SeqCst);
+    BRIDGE_WOKE_AT.store(0, Ordering::SeqCst);
+    BRIDGE_SAW_HALTED.store(false, Ordering::SeqCst);
+    *BRIDGE_WAKER.lock() = None;
+    let ipis0 = crate::__test_resched_ipis_sent(other);
+    let irqs_were_on = narf_arch::interrupts_enabled();
+    // SAFETY: the bridge halts only with IRQs enabled; restored below.
+    unsafe { narf_arch::enable_interrupts() };
+    crate::spawn_stackful_pinned(
+        async move {
+            // Long enough for the bridge to be committed to its halt; then
+            // wake it while it is published as halted (a periodic tick wakes
+            // it briefly now and then; waking in such a window needs no IPI).
+            crate::narf_time::sleep_ms(40).await;
+            let until = narf_time::Deadline::after_ms(100);
+            while !crate::CPU_HALTED[me].load(Ordering::SeqCst) && !until.expired() {
+                core::hint::spin_loop();
+            }
+            BRIDGE_SAW_HALTED.store(
+                crate::CPU_HALTED[me].load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            BRIDGE_WOKE_AT.store(narf_time::now_cycles(), Ordering::SeqCst);
+            BRIDGE_DONE.store(true, Ordering::SeqCst);
+            let w = BRIDGE_WAKER.lock().take();
+            if let Some(w) = w {
+                w.wake();
+            }
+        },
+        other as u32,
+    );
+    // A backstop so a task that never runs cannot hang the suite: the
+    // sleep arms a timer the bridge's pump expires.
+    let mut give_up = core::pin::pin!(crate::narf_time::sleep_ms(5_000));
+    let outcome = crate::block_on(core::future::poll_fn(|cx| {
+        if BRIDGE_DONE.load(Ordering::SeqCst) {
+            return Poll::Ready(true);
+        }
+        *BRIDGE_WAKER.lock() = Some(cx.waker().clone());
+        if BRIDGE_DONE.load(Ordering::SeqCst) {
+            return Poll::Ready(true);
+        }
+        if give_up.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        Poll::Pending
+    }));
+    let returned_at = narf_time::now_cycles();
+    if !irqs_were_on {
+        // SAFETY: counterpart to the enable above.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    if !outcome {
+        return TestResult::Fail("the pinned waker task never ran (bridge gave up after 5 s)");
+    }
+    let latency_us =
+        narf_time::cycles_to_ns(returned_at.wrapping_sub(BRIDGE_WOKE_AT.load(Ordering::SeqCst)))
+            / 1_000;
+    let ipis = crate::__test_resched_ipis_sent(other).wrapping_sub(ipis0);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "block_on bridge: woken from CPU {other} after {latency_us} us; {ipis} resched IPI(s) sent"
+        );
+    }
+    if !BRIDGE_SAW_HALTED.load(Ordering::SeqCst) {
+        return TestResult::Fail("the bridge never published a halt in 100 ms (it spins)");
+    }
+    if ipis == 0 {
+        return TestResult::Fail("the wake sent no reschedule IPI to the halted bridge");
+    }
+    if latency_us > 5_000 {
+        return TestResult::Fail("the bridge woke more than 5 ms after the wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/bridge",
+    smoke_block_on_bridge_is_kicked_by_cross_cpu_wake
 );

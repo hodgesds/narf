@@ -1256,6 +1256,9 @@ impl crate::WirelessNetIface for RoamStub {
     async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
         Err(crate::WirelessError::HardwareError)
     }
+    fn supports_roam(&self) -> bool {
+        true
+    }
     async fn roam(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
         Ok(())
     }

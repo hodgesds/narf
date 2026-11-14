@@ -737,6 +737,61 @@ pub enum ArmError {
     /// this comparator. Spec guarantees periodic mode only on
     /// timer 0; pick another comparator.
     NoPeriodic,
+    /// [`arm_oneshot_checked`]: by the time the comparator was enabled the
+    /// main counter was within [`MIN_PROG_TICKS`] of the deadline, or past
+    /// it. HPET comparators match on equality, so a passed value never
+    /// fires (until the counter wraps). Linux `hpet_clkevt_set_next_event`
+    /// returns -ETIME here and the clockevent core retries further out.
+    Expired,
+}
+
+/// Minimum distance (HPET ticks) between the main counter and a freshly
+/// written one-shot comparator for the write to count as armed — Linux
+/// `HPET_MIN_CYCLES`. Real HPET MMIO accesses take on the order of a
+/// microsecond each, and arming one comparator takes several.
+pub const MIN_PROG_TICKS: u64 = 128;
+
+/// [`arm_oneshot`], then check the main counter against the deadline the way
+/// Linux `hpet_clkevt_set_next_event` does: `Err(Expired)` when the counter
+/// is already within [`MIN_PROG_TICKS`] of it (or past it), in which case the
+/// caller must re-arm further out.
+///
+/// # Safety
+/// As for [`arm_oneshot`].
+pub unsafe fn arm_oneshot_checked(n: u8, gsi: u8, deadline: u64) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    // SAFETY: lock scope keeps singleton alive; index bounded.
+    let route_cap = unsafe { h.timer_route_cap(n) };
+    if gsi >= 32 || (route_cap & (1u32 << gsi)) == 0 {
+        return Err(ArmError::BadGsi);
+    }
+    // SAFETY: caller-asserted IDT/IOAPIC readiness; index bounded; GSI
+    // validated against the route-cap mask.
+    unsafe { h.arm_oneshot_comparator(n, gsi, deadline) };
+    // SAFETY: as above.
+    let now = unsafe { h.read_counter() };
+    // SAFETY: as above.
+    let narrow = unsafe { read_u64(h.timer_block(n) + TIMER_REG_CONFIG) } & TN_32MODE_CNF != 0;
+    if oneshot_expired(deadline, now, narrow) {
+        return Err(ArmError::Expired);
+    }
+    Ok(())
+}
+
+/// Whether a one-shot comparator at `deadline` counts as missed with the main
+/// counter at `now`: signed distance (32-bit in 32-bit mode, as Linux's
+/// `(s32)(cnt - hpet_readl(HPET_COUNTER))`) below [`MIN_PROG_TICKS`].
+pub fn oneshot_expired(deadline: u64, now: u64, narrow: bool) -> bool {
+    let distance = if narrow {
+        i64::from((deadline as u32).wrapping_sub(now as u32) as i32)
+    } else {
+        deadline.wrapping_sub(now) as i64
+    };
+    distance < MIN_PROG_TICKS as i64
 }
 
 /// Program comparator `n` for a one-shot wakeup at `deadline`

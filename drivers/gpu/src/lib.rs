@@ -173,6 +173,8 @@ pub mod amdgpu_panel_backlight;
 #[path = "amdgpu_cp_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_cp;
+#[cfg(feature = "amdgpu")]
+pub(crate) mod out_of_line;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_cp as amdgpu_cp_navi22;
@@ -948,6 +950,8 @@ mod atomic_e2e_tests;
 
 #[cfg(feature = "kernel-test")]
 mod drm_ioctl_smokes;
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+mod drm_kwin_replay_tests;
 #[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
 mod drm_rdna2_fb_tests;
 

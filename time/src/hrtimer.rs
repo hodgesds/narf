@@ -36,8 +36,9 @@
 //!
 //! Time unit: nanoseconds of the timer's clock (`ktime_t`). MONOTONIC is
 //! [`crate::monotonic_ns`]; REALTIME and TAI are MONOTONIC plus the wall
-//! offset (TAI adds the NTP TAI offset); BOOTTIME is MONOTONIC (NARF has no
-//! suspend offset yet). The clockevent hook takes TSC/counter cycles.
+//! offset (TAI adds the NTP TAI offset); BOOTTIME is MONOTONIC plus the time
+//! spent suspended (`offs_boot`). The clockevent hook takes monotonic counter
+//! cycles; a clockevent that compares against the raw counter converts.
 //!
 //! Lock order: a CPU base lock is never held while another CPU base lock is
 //! taken (`switch_hrtimer_base` releases the old base before it locks the new
@@ -457,7 +458,9 @@ fn tick_program_event(deadline_ns: Ktime) {
     f(ns_to_deadline_cycles(deadline_ns));
 }
 
-/// Cycle count at which `ns` of monotonic time has certainly passed.
+/// Monotonic cycle count at which `ns` of monotonic time has certainly
+/// passed. Clockevents that compare against the raw counter convert with
+/// [`crate::mono_to_raw_cycles`].
 #[inline]
 pub fn ns_to_deadline_cycles(ns: Ktime) -> u64 {
     if ns == KTIME_MAX {
@@ -505,6 +508,7 @@ pub fn set_tai_offset_ns(off: u64) {
 fn base_offset(index: usize) -> i64 {
     match index % HRTIMER_BASE_SOFT {
         1 => crate::wall_offset_ns(),
+        2 => crate::boot_offset_ns() as i64,
         3 => crate::wall_offset_ns().saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
         _ => 0,
     }
@@ -897,15 +901,31 @@ fn expire_hard(base: &'static HrTimerCpuBase) -> Ktime {
 /// timers, raises the soft expiry if due, and returns the next event in
 /// clockevent cycles (`u64::MAX` when none) for the caller to program.
 pub fn hrtimer_interrupt() -> u64 {
+    // `run_local_timers`: raise the timer softirq when a wheel base is due.
+    crate::timer::timer_tick();
     let Some(base) = cpu_base(this_cpu()) else {
-        return u64::MAX;
+        return ns_to_deadline_cycles(crate::timer::next_timer_event_ns_local());
     };
-    if base.next_event.load(Ordering::Acquire) > crate::monotonic_ns()
+    let next = if base.next_event.load(Ordering::Acquire) > crate::monotonic_ns()
         && !base.retrigger.swap(false, Ordering::AcqRel)
     {
-        return ns_to_deadline_cycles(base.next_event.load(Ordering::Acquire));
+        base.next_event.load(Ordering::Acquire)
+    } else {
+        expire_hard(base)
+    };
+    // The clockevent also carries the timer wheel's next expiry.
+    ns_to_deadline_cycles(next.min(crate::timer::next_timer_event_ns_local()))
+}
+
+/// Make `cpu` re-evaluate its next event now: set its retrigger flag, then
+/// send it the reschedule IPI (`trigger_dyntick_cpu`). Used when a timer is
+/// queued on another CPU's base.
+pub fn kick_cpu_next_event(cpu: u32) {
+    if let Some(base) = cpu_base(cpu as usize) {
+        base.retrigger.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
+        remote_kick(cpu);
     }
-    ns_to_deadline_cycles(expire_hard(base))
 }
 
 /// `hrtimer_run_queues`: the periodic-tick (low-resolution) expiry path, for
@@ -930,6 +950,8 @@ pub fn hrtimer_run_softirq() -> u64 {
         return 0;
     };
     let before = base.nr_events.load(Ordering::Relaxed);
+    // `TIMER_SOFTIRQ`: the timer wheel expires in the same context.
+    let wheel = crate::timer::run_timer_softirq();
     let now = crate::monotonic_ns();
     // Load first: this runs on every executor round, and an unconditional
     // swap would dirty the line each time.
@@ -949,7 +971,7 @@ pub fn hrtimer_run_softirq() -> u64 {
         });
         let _ = next;
     }
-    base.nr_events.load(Ordering::Relaxed) - before
+    base.nr_events.load(Ordering::Relaxed) - before + wheel
 }
 
 /// Expire every CPU's due hard timers from this CPU (tick broadcast for a
@@ -988,14 +1010,34 @@ pub fn retrigger_next_event() {
         let mut g = base.inner.lock();
         let next = update_next_event(base, &mut g);
         drop(g);
+        let next = next.min(crate::timer::next_timer_event_ns_local());
         tick_program_event(next);
         next
     });
     let _ = next;
 }
 
-/// `clock_was_set`: REALTIME/TAI offsets changed; every CPU re-evaluates.
+static CLOCK_WAS_SET_NOTIFIER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the hook `clock_was_set` runs after the bases are re-evaluated
+/// (the vDSO republishes its clock data from it).
+pub fn set_clock_was_set_notifier(f: fn()) {
+    CLOCK_WAS_SET_NOTIFIER.store(f as usize, Ordering::Release);
+}
+
+/// `clock_was_set`: REALTIME/TAI/BOOTTIME offsets changed; every CPU
+/// re-evaluates its bases.
 pub fn clock_was_set() {
+    clock_was_set_bases();
+    let raw = CLOCK_WAS_SET_NOTIFIER.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only `fn()` values are stored by the setter.
+        let f: fn() = unsafe { core::mem::transmute(raw) };
+        f();
+    }
+}
+
+fn clock_was_set_bases() {
     let me = this_cpu();
     for cpu in 0..MAX_CPUS {
         let Some(base) = cpu_base(cpu) else { continue };
@@ -1013,8 +1055,10 @@ pub fn clock_was_set() {
 /// local clockevent must fire for (`None` when idle with no timers). Lock-free
 /// and IRQ-safe; used by tickless idle and the timer interrupt.
 pub fn next_event_cycles_local() -> Option<u64> {
-    let base = cpu_base(this_cpu())?;
-    let n = base.next_event.load(Ordering::Acquire);
+    let hr = cpu_base(this_cpu()).map_or(KTIME_MAX, |b| b.next_event.load(Ordering::Acquire));
+    // `tick_nohz_next_event`: the earlier of the next hrtimer and the next
+    // timer-wheel expiry that may wake this CPU.
+    let n = hr.min(crate::timer::next_timer_event_ns_local());
     (n != KTIME_MAX).then(|| ns_to_deadline_cycles(n))
 }
 

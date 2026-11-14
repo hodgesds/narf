@@ -20,11 +20,15 @@ pub mod hrtimer;
 pub mod ntp;
 pub mod phc;
 pub mod rtc;
+pub mod timer;
+pub mod timer_migration;
 pub mod timerqueue;
 pub mod wall;
 
 mod hrtimer_tests;
 mod tests;
+mod timer_migration_tests;
+mod timer_tests;
 pub use wall::{
     adjust_wall_offset_ns, begin_leap_smear, cyc_to_ns_mult_shift, cycles_per_ns, cycles_to_ns,
     monotonic_ns, now_wall, ns_to_cycles, set_clock_hz, set_cycles_per_ns, set_wall_offset,
@@ -43,12 +47,15 @@ use core::task::{Context, Poll};
 /// CPU may halt indefinitely between deadlines and trust the next tick to
 /// wake it.
 ///
-/// `false` means the tick fell back to an uncalibrated periodic source (the
-/// LAPIC InitialCount fixed-count fallback when CPUID reports no TSC-deadline,
-/// e.g. QEMU `qemu64` under TCG). There a tick can be dropped or arrive late,
-/// so a halted CPU can sleep past a near-term timer-wheel deadline. The
-/// executor consults this to spin-poll the wheel instead of halting when the
-/// tick is not dependable. See `scheduler`'s idle path.
+/// `false` means no per-CPU tick was armed (no clockevent passed its probe,
+/// or the selected one is a shared device that ticks only one CPU), so a
+/// halted CPU might never be woken; the executor then spin-polls instead of
+/// halting. A periodic per-CPU tick — the LAPIC InitialCount mode of CPUs
+/// without TSC-deadline included — IS reliable: it wakes a halted CPU every
+/// period, exactly as Linux's periodic-tick idle relies on. Whether the tick
+/// can also be stopped for NOHZ idle is a separate, per-device question
+/// (`clockevent::ClockEvent::can_stop_idle_tick`). See `scheduler`'s idle
+/// path.
 static TICK_RELIABLE: AtomicBool = AtomicBool::new(true);
 
 /// Publish whether the selected primary clock-event tick is reliable.
@@ -136,9 +143,99 @@ pub fn nohz_idle_enabled() -> bool {
     NOHZ_IDLE_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Read the raw monotonic counter.
+/// Counter cycles the system spent suspended. CLOCK_MONOTONIC does not
+/// advance across suspend (Linux suspends the timekeeper's clocksource), so
+/// monotonic counter time is the raw counter minus this. Grows only in
+/// [`timekeeping_resume`].
+static SUSPENDED_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `tk->offs_boot`: CLOCK_BOOTTIME = CLOCK_MONOTONIC + this (ns slept).
+static OFFS_BOOT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Timekeeping suspended: monotonic time reads as [`FROZEN_MONO_CYCLES`].
+static TK_FROZEN: AtomicBool = AtomicBool::new(false);
+static FROZEN_MONO_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SUSPEND_START_RAW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic counter time (CLOCK_MONOTONIC in counter cycles): the raw
+/// counter minus the time spent suspended. Every `Instant`, deadline and
+/// duration uses this; only clockevent hardware programming uses
+/// [`raw_cycles`] (convert with [`mono_to_raw_cycles`]).
 #[inline]
 pub fn now_cycles() -> u64 {
+    if TK_FROZEN.load(Ordering::Acquire) {
+        return FROZEN_MONO_CYCLES.load(Ordering::Relaxed);
+    }
+    raw_cycles().wrapping_sub(SUSPENDED_CYCLES.load(Ordering::Acquire))
+}
+
+/// The monotonic-cycles value `c` in raw counter cycles, for programming a
+/// clockevent (TSC-deadline) that compares against the raw counter.
+#[inline]
+pub fn mono_to_raw_cycles(c: u64) -> u64 {
+    if c == u64::MAX {
+        return u64::MAX;
+    }
+    c.saturating_add(SUSPENDED_CYCLES.load(Ordering::Acquire))
+}
+
+/// Counter cycles spent suspended so far (published to the vDSO).
+#[inline]
+pub fn suspended_cycles() -> u64 {
+    SUSPENDED_CYCLES.load(Ordering::Acquire)
+}
+
+/// `offs_boot` in ns: time spent suspended (CLOCK_BOOTTIME − CLOCK_MONOTONIC).
+#[inline]
+pub fn boot_offset_ns() -> u64 {
+    OFFS_BOOT_NS.load(Ordering::Acquire)
+}
+
+/// CLOCK_BOOTTIME in ns: monotonic time plus time spent suspended.
+#[inline]
+pub fn boottime_ns() -> u64 {
+    monotonic_ns().saturating_add(boot_offset_ns())
+}
+
+/// `timekeeping_suspend`: stop CLOCK_MONOTONIC at its current value. Called
+/// with the system quiesced, right before the platform sleep.
+pub fn timekeeping_suspend() {
+    if TK_FROZEN.load(Ordering::Acquire) {
+        return;
+    }
+    let raw = raw_cycles();
+    FROZEN_MONO_CYCLES.store(
+        raw.wrapping_sub(SUSPENDED_CYCLES.load(Ordering::Acquire)),
+        Ordering::Relaxed,
+    );
+    SUSPEND_START_RAW.store(raw, Ordering::Relaxed);
+    TK_FROZEN.store(true, Ordering::Release);
+}
+
+/// `timekeeping_resume` + `__timekeeping_inject_sleeptime`: the counter
+/// cycles since [`timekeeping_suspend`] were spent asleep. CLOCK_MONOTONIC
+/// resumes from where it stopped; CLOCK_BOOTTIME and CLOCK_REALTIME gain the
+/// sleep time; every CPU re-evaluates its hrtimers (`clock_was_set`).
+/// Returns the injected ns.
+pub fn timekeeping_resume() -> u64 {
+    if !TK_FROZEN.load(Ordering::Acquire) {
+        return 0;
+    }
+    let slept = raw_cycles().wrapping_sub(SUSPEND_START_RAW.load(Ordering::Relaxed));
+    // Publish the new offset before thawing: a reader that sees the thaw
+    // sees the offset, so monotonic time continues from the frozen value.
+    SUSPENDED_CYCLES.fetch_add(slept, Ordering::AcqRel);
+    TK_FROZEN.store(false, Ordering::Release);
+    let ns = cycles_to_ns(slept);
+    OFFS_BOOT_NS.fetch_add(ns, Ordering::AcqRel);
+    // Wall time kept running while asleep.
+    adjust_wall_offset_ns(ns as i64);
+    hrtimer::clock_was_set();
+    ns
+}
+
+/// Read the raw hardware counter (TSC / `CNTPCT_EL0`). Counts through
+/// suspend; see [`now_cycles`] for monotonic time.
+#[inline]
+pub fn raw_cycles() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         // LFENCE;RDTSC — the fence stops the out-of-order engine from
@@ -216,6 +313,9 @@ pub fn busy_wait_cycles(cycles: u64) {
 pub struct SleepUntil {
     deadline: Instant,
     handle: Option<hrtimer::SleepHandle>,
+    /// `msleep`: a coarse sleep on the timer wheel instead of an hrtimer.
+    coarse: Option<timer::TimeoutHandle>,
+    wheel: bool,
 }
 
 impl SleepUntil {
@@ -223,6 +323,18 @@ impl SleepUntil {
         Self {
             deadline,
             handle: None,
+            coarse: None,
+            wheel: false,
+        }
+    }
+
+    /// Linux `msleep`: sleep on the timer wheel (`schedule_timeout`), which
+    /// may fire up to one wheel-level granularity late but costs no
+    /// hrtimer reprogramming.
+    pub fn coarse(deadline: Instant) -> Self {
+        Self {
+            wheel: true,
+            ..Self::new(deadline)
         }
     }
 }
@@ -245,7 +357,19 @@ impl Future for SleepUntil {
         let this = self.get_mut();
         if Instant::now() >= this.deadline {
             this.handle = None;
+            this.coarse = None;
             return Poll::Ready(());
+        }
+        if this.wheel {
+            // The first jiffy whose start is at or after the deadline.
+            let expires = timer::ns_to_jiffies(deadline_cycles_to_ns(this.deadline.as_cycles()));
+            this.coarse
+                .get_or_insert_with(|| timer::TimeoutHandle::new(0))
+                .arm(expires, cx.waker());
+            if !hrtimer::arm_callback_installed() {
+                cx.waker().wake_by_ref();
+            }
+            return Poll::Pending;
         }
         let refreshed = this
             .handle
@@ -296,9 +420,20 @@ pub fn sleep_us(us: u64) -> SleepUntil {
     sleep_until(Deadline::after_us(us))
 }
 
-/// Sleep for `ms` milliseconds of wall-clock time.
+/// Sleep for `ms` milliseconds of wall-clock time: Linux `msleep`, a coarse
+/// sleep on the timer wheel ([`msleep`]) — it ends no earlier than `ms` and
+/// at most one wheel-level granularity later (within a jiffy or two below
+/// 63 ms).
+/// Use [`sleep_us`] / [`sleep_ns`] (hrtimers) where the millisecond matters.
 pub fn sleep_ms(ms: u64) -> SleepUntil {
-    sleep_until(Deadline::after_ms(ms))
+    msleep(ms)
+}
+
+/// Linux `msleep`: a coarse sleep on the timer wheel, which may end up to
+/// one wheel-level granularity late. For waits whose length does not
+/// matter to the millisecond; use [`sleep_ms`] otherwise.
+pub fn msleep(ms: u64) -> SleepUntil {
+    SleepUntil::coarse(Deadline::after_ms(ms).0)
 }
 
 /// Wall-clock deadline anchored to a future TSC reading. Cheap to

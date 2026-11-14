@@ -31,6 +31,16 @@ impl Pause {
     // training completion must never expose VRAM to cached writers again.
 }
 
+/// `block_on_spin` on a future built by `make`, on the heap. Every future this
+/// initcall drives (firmware bring-up, modeset, power, recovery registration)
+/// is large; built inline, together they gave `start` a 27 KiB frame that
+/// every boot paid, even one returning NotPresent without the GPU. Not
+/// inlined, so building one costs a frame only on the path that runs it.
+#[inline(never)]
+fn block_on_boxed<Fut: core::future::Future>(make: impl FnOnce() -> Fut) -> Fut::Output {
+    narf_scheduler::block_on_spin(alloc::boxed::Box::pin(make()))
+}
+
 pub(super) fn start() -> InitResult {
     if ATTEMPTED.swap(true, Ordering::AcqRel) {
         return InitResult::NotPresent;
@@ -120,60 +130,13 @@ pub(super) fn start() -> InitResult {
     navi48::set_encode_proof(narf_boot::args().has_flag("amdgpu.encode_proof"));
     navi48::set_jpeg_proof(narf_boot::args().has_flag("amdgpu.jpeg_proof"));
     navi48::set_jpeg_decode_proof(narf_boot::args().has_flag("amdgpu.jpeg_decode_proof"));
+    // Each generation's bring-up, and Navi22's follow-up, are out of line:
+    // their results (`boot::Report`, platform status) are large, and inlined
+    // here they gave every boot — GPU or not — a 20 KiB frame.
     let ok = if navi48 {
-        // SAFETY: the retained prepared owner and paused CPU writers persist.
-        let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
-        completed(generation, result, navi48::status());
-        if result.is_ok() {
-            // Automatic GPU recovery (Linux `amdgpu.gpu_recovery`), as for
-            // RX 6000: kernel boot-framebuffer writers go behind the console
-            // hook first; recovery withdraws the native scanout itself.
-            navi48::set_recovery_console_hook(recovery_console);
-            // SAFETY: the console hook pauses every kernel framebuffer
-            // writer for the reset; user VRAM mappings follow Linux (not
-            // revoked, contents lost).
-            unsafe { navi48::set_automatic_recovery(options.gpu_recovery) };
-            // S3 through the async system-PM phase (evict VRAM, quiesce,
-            // save PCI state; resume posts and re-runs bring-up).
-            // SAFETY: same console hook and user-mapping policy as recovery.
-            unsafe { navi48::register_system_pm() };
-            // Runtime PM (`amdgpu.runpm`, BACO/BAMACO autosuspend). A kernel
-            // console drawing into this GPU's VRAM, the boot framebuffer or
-            // the native scanout, keeps it active, as fbcon's lit display
-            // keeps Linux's dGPU awake.
-            let runpm = narf_drivers_gpu::amdgpu_navi48_runtime_pm::parse_runpm(
-                narf_boot::args().value("amdgpu.runpm"),
-            );
-            let console_on_gpu = !console_off_gpu
-                || options.native_display
-                || narf_boot::args().has_flag("amdgpu.native_display");
-            // SAFETY: the S3 contract above (console hook, user mappings)
-            // covers runtime suspend, which never pauses the console.
-            narf_scheduler::block_on_spin(unsafe {
-                narf_drivers_gpu::amdgpu_navi48_runtime_pm::register(runpm, console_on_gpu)
-            });
-        }
-        result.is_ok()
+        bring_up_navi48(generation, &options, console_off_gpu)
     } else {
-        let args = narf_boot::args();
-        platform::set_display_engines(
-            options.native_display || args.has_flag("amdgpu.display_probe"),
-        );
-        // SAFETY: the retained prepared owner and paused CPU writers persist.
-        let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
-        completed(generation, result, platform::status());
-        if result.is_ok() {
-            // Polls only the owner lock; the forwarding tasks run later on
-            // the executor.
-            if let Err(error) = narf_scheduler::block_on_spin(platform::start_fault_service()) {
-                use core::fmt::Write;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: navi22 page faults not reported: {error:?}"
-                );
-            }
-        }
-        result.is_ok()
+        bring_up_navi22(generation, &options)
     };
     if ok || !affected {
         // A secondary GPU cannot affect the boot framebuffer on another BAR.
@@ -194,83 +157,7 @@ pub(super) fn start() -> InitResult {
         navi48::set_max_bpc(bpc);
     }
     if ok && !navi48 {
-        // Display detection programs the HPD, AUX and DDC engines. RDNA2
-        // native display is on by default (`amdgpu.native_display=0` keeps
-        // the GOP framebuffer and leaves those engines untouched).
-        let native = options.native_display;
-        if native || narf_boot::args().has_flag("amdgpu.display_probe") {
-            report_displays();
-        }
-        // `amdgpu.rdna2_multi`: light every connected sink (KMS CRTCs 1..).
-        narf_drivers_gpu::amdgpu_rdna2_kms::set_auto_multi(options.multi);
-        if native {
-            navi22_native_display();
-        }
-        // Power saving (GFXOFF, clock gating, memory DPM, ...) runs after the
-        // native modeset so display-dependent features see its admission;
-        // each feature still passes its own gate. `amdgpu.rdna2_pg=none`
-        // programs none.
-        //
-        // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend) arms GFXOFF
-        // through this same application: the first application is the only
-        // one that can start the GFXOFF controller, so the mode is decided
-        // here and the opt-in augmented with it.
-        let runpm = narf_drivers_gpu::amdgpu_navi22_runtime_pm::parse_runpm(
-            narf_boot::args().value("amdgpu.runpm"),
-        );
-        let gfxoff = narf_scheduler::block_on_spin(platform::gfxoff_available());
-        let runtime_mode = narf_drivers_gpu::amdgpu_navi22_runtime_pm::detect_mode(
-            runpm,
-            gfxoff,
-            narf_drivers_gpu::amdgpu_navi22_runtime_pm::Platform::current(),
-        );
-        if let Some(value) = options.power_saving {
-            if runtime_mode == narf_drivers_gpu::amdgpu_navi22_runtime_pm::Mode::GfxOff {
-                let optin = narf_drivers_gpu::amdgpu_navi22_power_policy::OptIn::parse(Some(value))
-                    .with(
-                        narf_drivers_gpu::amdgpu_navi22_power_policy::Feature::GfxOff,
-                        true,
-                    );
-                // SAFETY: after a successful firmware run; the TDR sampler takes
-                // GFXOFF references and no other GC MMIO client runs yet.
-                let _ =
-                    narf_scheduler::block_on_spin(unsafe { platform::power_saving_optin(optin) });
-            } else {
-                // SAFETY: after a successful firmware run; the TDR sampler takes
-                // GFXOFF references and no other GC MMIO client runs yet.
-                let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
-            }
-        }
-        // Automatic GPU recovery after a hang (Linux `amdgpu.gpu_recovery`).
-        // Kernel CPU writers of the boot framebuffer go behind the console
-        // hook first, so a reset never races the console or the pumps.
-        platform::set_recovery_console_hook(recovery_console);
-        // SAFETY: the console hook above pauses every kernel framebuffer
-        // writer for the reset; recovery withdraws the native scanout itself;
-        // user VRAM mappings follow Linux (not revoked, contents lost).
-        unsafe {
-            narf_drivers_gpu::amdgpu_navi22_tdr::set_automatic_recovery(options.gpu_recovery);
-        }
-        // Publish the sysfs power controls (`pp_features`,
-        // `power_dpm_force_performance_level`) with the running PMFW mask.
-        narf_scheduler::block_on_spin(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish());
-        // S3 through the async system-PM phase (quiesce, save PCI state;
-        // resume rebuilds the owner, as recovery does).
-        // SAFETY: same console hook and user-mapping policy as recovery.
-        unsafe { platform::register_system_pm() };
-        // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend). A kernel
-        // console drawing into this GPU's VRAM, the boot framebuffer or
-        // the native scanout, keeps it active, as fbcon's lit display
-        // keeps Linux's dGPU awake.
-        let console_on_gpu = !console_off_gpu
-            || options.native_display
-            || platform::native_display_running()
-            || narf_boot::args().has_flag("amdgpu.native_display");
-        // SAFETY: the S3 contract above (console hook, user mappings)
-        // covers runtime suspend, which never pauses the console.
-        narf_scheduler::block_on_spin(unsafe {
-            narf_drivers_gpu::amdgpu_navi22_runtime_pm::register(runpm, console_on_gpu)
-        });
+        navi22_after_bring_up(&options, console_off_gpu);
     }
     // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
     // enables HDMI FRL when TMDS cannot carry a mode. Decimal or 0x hex.
@@ -299,6 +186,158 @@ pub(super) fn start() -> InitResult {
     }
 }
 
+/// Navi48 (RDNA4) firmware bring-up and what it arms on success.
+#[inline(never)]
+fn bring_up_navi48(
+    generation: &str,
+    options: &narf_drivers_gpu::amdgpu_rdna2::options::BootOptions,
+    console_off_gpu: bool,
+) -> bool {
+    // SAFETY: the retained prepared owner and paused CPU writers persist.
+    let result = block_on_boxed(|| unsafe { navi48::run() });
+    completed(generation, result, navi48::status());
+    if result.is_ok() {
+        // Automatic GPU recovery (Linux `amdgpu.gpu_recovery`), as for
+        // RX 6000: kernel boot-framebuffer writers go behind the console
+        // hook first; recovery withdraws the native scanout itself.
+        navi48::set_recovery_console_hook(recovery_console);
+        // SAFETY: the console hook pauses every kernel framebuffer
+        // writer for the reset; user VRAM mappings follow Linux (not
+        // revoked, contents lost).
+        unsafe { navi48::set_automatic_recovery(options.gpu_recovery) };
+        // S3 through the async system-PM phase (evict VRAM, quiesce,
+        // save PCI state; resume posts and re-runs bring-up).
+        // SAFETY: same console hook and user-mapping policy as recovery.
+        unsafe { navi48::register_system_pm() };
+        // Runtime PM (`amdgpu.runpm`, BACO/BAMACO autosuspend). A kernel
+        // console drawing into this GPU's VRAM, the boot framebuffer or
+        // the native scanout, keeps it active, as fbcon's lit display
+        // keeps Linux's dGPU awake.
+        let runpm = narf_drivers_gpu::amdgpu_navi48_runtime_pm::parse_runpm(
+            narf_boot::args().value("amdgpu.runpm"),
+        );
+        let console_on_gpu = !console_off_gpu
+            || options.native_display
+            || narf_boot::args().has_flag("amdgpu.native_display");
+        // SAFETY: the S3 contract above (console hook, user mappings)
+        // covers runtime suspend, which never pauses the console.
+        block_on_boxed(|| unsafe {
+            narf_drivers_gpu::amdgpu_navi48_runtime_pm::register(runpm, console_on_gpu)
+        });
+    }
+    result.is_ok()
+}
+
+/// Navi22 (RDNA2) firmware bring-up and its fault service.
+#[inline(never)]
+fn bring_up_navi22(
+    generation: &str,
+    options: &narf_drivers_gpu::amdgpu_rdna2::options::BootOptions,
+) -> bool {
+    let args = narf_boot::args();
+    platform::set_display_engines(options.native_display || args.has_flag("amdgpu.display_probe"));
+    // SAFETY: the retained prepared owner and paused CPU writers persist.
+    let result = block_on_boxed(|| unsafe { platform::run() });
+    completed(generation, result, platform::status());
+    if result.is_ok() {
+        // Polls only the owner lock; the forwarding tasks run later on
+        // the executor.
+        if let Err(error) = block_on_boxed(platform::start_fault_service) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 page faults not reported: {error:?}"
+            );
+        }
+    }
+    result.is_ok()
+}
+
+/// After a successful Navi22 bring-up: display detection, native display,
+/// power saving, recovery, sysfs power controls, S3 and runtime PM.
+#[inline(never)]
+fn navi22_after_bring_up(
+    options: &narf_drivers_gpu::amdgpu_rdna2::options::BootOptions,
+    console_off_gpu: bool,
+) {
+    // Display detection programs the HPD, AUX and DDC engines. RDNA2
+    // native display is on by default (`amdgpu.native_display=0` keeps
+    // the GOP framebuffer and leaves those engines untouched).
+    let native = options.native_display;
+    if native || narf_boot::args().has_flag("amdgpu.display_probe") {
+        report_displays();
+    }
+    // `amdgpu.rdna2_multi`: light every connected sink (KMS CRTCs 1..).
+    narf_drivers_gpu::amdgpu_rdna2_kms::set_auto_multi(options.multi);
+    if native {
+        navi22_native_display();
+    }
+    // Power saving (GFXOFF, clock gating, memory DPM, ...) runs after the
+    // native modeset so display-dependent features see its admission;
+    // each feature still passes its own gate. `amdgpu.rdna2_pg=none`
+    // programs none.
+    //
+    // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend) arms GFXOFF
+    // through this same application: the first application is the only
+    // one that can start the GFXOFF controller, so the mode is decided
+    // here and the opt-in augmented with it.
+    let runpm = narf_drivers_gpu::amdgpu_navi22_runtime_pm::parse_runpm(
+        narf_boot::args().value("amdgpu.runpm"),
+    );
+    let gfxoff = block_on_boxed(platform::gfxoff_available);
+    let runtime_mode = narf_drivers_gpu::amdgpu_navi22_runtime_pm::detect_mode(
+        runpm,
+        gfxoff,
+        narf_drivers_gpu::amdgpu_navi22_runtime_pm::Platform::current(),
+    );
+    if let Some(value) = options.power_saving {
+        if runtime_mode == narf_drivers_gpu::amdgpu_navi22_runtime_pm::Mode::GfxOff {
+            let optin = narf_drivers_gpu::amdgpu_navi22_power_policy::OptIn::parse(Some(value))
+                .with(
+                    narf_drivers_gpu::amdgpu_navi22_power_policy::Feature::GfxOff,
+                    true,
+                );
+            // SAFETY: after a successful firmware run; the TDR sampler takes
+            // GFXOFF references and no other GC MMIO client runs yet.
+            let _ = block_on_boxed(|| unsafe { platform::power_saving_optin(optin) });
+        } else {
+            // SAFETY: after a successful firmware run; the TDR sampler takes
+            // GFXOFF references and no other GC MMIO client runs yet.
+            let _ = block_on_boxed(|| unsafe { platform::power_saving(value) });
+        }
+    }
+    // Automatic GPU recovery after a hang (Linux `amdgpu.gpu_recovery`).
+    // Kernel CPU writers of the boot framebuffer go behind the console
+    // hook first, so a reset never races the console or the pumps.
+    platform::set_recovery_console_hook(recovery_console);
+    // SAFETY: the console hook above pauses every kernel framebuffer
+    // writer for the reset; recovery withdraws the native scanout itself;
+    // user VRAM mappings follow Linux (not revoked, contents lost).
+    unsafe {
+        narf_drivers_gpu::amdgpu_navi22_tdr::set_automatic_recovery(options.gpu_recovery);
+    }
+    // Publish the sysfs power controls (`pp_features`,
+    // `power_dpm_force_performance_level`) with the running PMFW mask.
+    block_on_boxed(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish);
+    // S3 through the async system-PM phase (quiesce, save PCI state;
+    // resume rebuilds the owner, as recovery does).
+    // SAFETY: same console hook and user-mapping policy as recovery.
+    unsafe { platform::register_system_pm() };
+    // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend). A kernel
+    // console drawing into this GPU's VRAM, the boot framebuffer or
+    // the native scanout, keeps it active, as fbcon's lit display
+    // keeps Linux's dGPU awake.
+    let console_on_gpu = !console_off_gpu
+        || options.native_display
+        || platform::native_display_running()
+        || narf_boot::args().has_flag("amdgpu.native_display");
+    // SAFETY: the S3 contract above (console hook, user mappings)
+    // covers runtime suspend, which never pauses the console.
+    block_on_boxed(|| unsafe {
+        narf_drivers_gpu::amdgpu_navi22_runtime_pm::register(runpm, console_on_gpu)
+    });
+}
+
 /// Opt-in (`amdgpu.native_display`) native Navi48 scanout: retire the GOP's
 /// DP SST output and light every connected sink natively, the console on
 /// the first (DP before HDMI). Off by
@@ -311,7 +350,7 @@ fn native_display() {
     // SAFETY: final synchronous boot initcall, before executor/user startup.
     // Only the boot console writes the GOP framebuffer, whose memory the
     // owner never allocates; retirement stops its scanout role only.
-    let retired = narf_scheduler::block_on_spin(unsafe { navi48::retire_inherited_display() });
+    let retired = block_on_boxed(|| unsafe { navi48::retire_inherited_display() });
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: navi48 inherited display {retired:?}"
@@ -320,8 +359,7 @@ fn native_display() {
         return;
     }
     // SAFETY: as above; the inherited consumers are now retired.
-    let lit =
-        narf_scheduler::block_on_spin(unsafe { navi48::modeset_displays(|_, _, row| row.fill(0)) });
+    let lit = block_on_boxed(|| unsafe { navi48::modeset_displays(|_, _, row| row.fill(0)) });
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: navi48 native modeset {lit:?}"
@@ -510,7 +548,7 @@ fn navi22_native_display() {
     narf_drivers_gpu::amdgpu_navi22_modeset::set_connector_preference(options.connector);
     // SAFETY: final synchronous boot initcall after a successful firmware run;
     // no other display client exists and only the console writes scanout.
-    let lit = narf_scheduler::block_on_spin(unsafe {
+    let lit = block_on_boxed(|| unsafe {
         platform::modeset_displays(narf_drivers_gpu::amdgpu_rdna2_modeset::test_pattern)
     });
     let _ = match lit {
@@ -543,7 +581,7 @@ fn navi22_native_display() {
 fn report_displays() {
     use core::fmt::Write;
     use narf_drivers_gpu::amdgpu_rdna2_display::{Detection, Signal};
-    let reports = match narf_scheduler::block_on_spin(platform::detect_displays()) {
+    let reports = match block_on_boxed(platform::detect_displays) {
         Ok(reports) => reports,
         Err(error) => {
             let _ = writeln!(

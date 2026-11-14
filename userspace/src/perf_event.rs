@@ -2390,9 +2390,11 @@ pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot:
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let file = if fd >= 0 {
         fd::with_table(task, |table| {
-            table
-                .get(fd as u32)
-                .map(|entry| (entry.ops.ino(), crate::mqueue::fd_path(task, fd as u32)))
+            let path = table
+                .description(fd as u32)
+                .and_then(|description| description.name())
+                .map(|name| alloc::string::String::from(&*name.path));
+            table.get(fd as u32).map(|entry| (entry.ops.ino(), path))
         })
         .flatten()
     } else {

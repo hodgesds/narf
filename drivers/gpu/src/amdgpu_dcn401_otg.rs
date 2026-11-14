@@ -1662,6 +1662,11 @@ impl Otg {
     pub fn status(&self) -> Status {
         *self.0.status
     }
+    /// The selected display's records, borrowed: `status` copies 14 KiB
+    /// onto the caller's frame.
+    pub fn status_ref(&self) -> &Status {
+        &self.0.status
+    }
     /// Make `display` (a pipe index of the pool) the one every following
     /// operation addresses.
     /// Each display keeps its own records; the other displays' pipes,
@@ -1673,13 +1678,15 @@ impl Otg {
     pub fn selected_display(&self) -> u8 {
         self.0.displays.selected
     }
-    /// Any display's records, the selected one's current.
-    pub fn display_status(&self, display: u8) -> Option<Status> {
+    /// Any display's records, the selected one's current. Borrowed: a
+    /// `Status` is 14 KiB, and a copy per query put that on every caller's
+    /// stack frame.
+    pub fn display_status(&self, display: u8) -> Option<&Status> {
         let d = &self.0.displays;
         if display == d.selected {
-            Some(*self.0.status)
+            Some(&self.0.status)
         } else {
-            d.parked.get(usize::from(display)).copied()
+            d.parked.get(usize::from(display))
         }
     }
     /// What the displays other than the selected one hold.

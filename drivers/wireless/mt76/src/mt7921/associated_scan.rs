@@ -80,6 +80,7 @@ impl<B: Backend> Session<B> {
                 report.received = report.received.saturating_add(1);
                 if let Some(bss) = beacon(&packet.bytes, info.capabilities.phy.spatial_streams) {
                     if scan_id(&bss).is_some_and(|id| channels.contains(&id)) {
+                        report.note_beacon(&packet.bytes, &bss);
                         if let Some(old) = report.bss.iter_mut().find(|old| {
                             old.bssid == bss.bssid
                                 && old.channel == bss.channel

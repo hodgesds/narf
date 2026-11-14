@@ -159,6 +159,28 @@ pub(crate) fn note_alloc_ranges(examined: u64) {
     TOTAL_ALLOC_RANGES.fetch_add(examined, Relaxed);
 }
 
+/// The largest first-order reservation any one operation's own data
+/// references called for since [`reset_max_op_reservation`], in tree blocks.
+static MAX_OP_RESERVATION: AtomicU64 = AtomicU64::new(0);
+
+/// The most tree blocks any single operation reserved for its own data
+/// references (new, dropped and added extents) since the last
+/// [`reset_max_op_reservation`]: what a harness checks to see that freeing a
+/// large file is reserved for in bounded steps, not all at once.
+pub fn max_op_reservation() -> u64 {
+    MAX_OP_RESERVATION.load(Relaxed)
+}
+
+/// Start [`max_op_reservation`] again from zero.
+pub fn reset_max_op_reservation() {
+    MAX_OP_RESERVATION.store(0, Relaxed);
+}
+
+/// Note what one operation's own data references reserve.
+pub(crate) fn note_op_reservation(blocks: u64) {
+    MAX_OP_RESERVATION.fetch_max(blocks, Relaxed);
+}
+
 /// Count one node read from the device (a node-cache miss).
 pub(crate) fn note_device_read() {
     TOTAL_DEVICE_READS.fetch_add(1, Relaxed);
@@ -322,4 +344,28 @@ impl CommitStats {
             self.alloc_disk_builds.fetch_add(1, Relaxed);
         }
     }
+}
+
+/// Where each step but the last of the most recent stepped truncate or
+/// `fallocate` left off ([`take_step_marks`]).
+static STEP_MARKS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u64>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// A stepped operation starts: forget the marks of the one before.
+pub(crate) fn begin_step_marks() {
+    STEP_MARKS.lock().clear();
+}
+
+/// A step that is not the operation's last is staged, leaving off at `at`:
+/// for a truncate the size it wrote, for a punch or a zero-range the end of
+/// what is punched, for a preallocation the end of what is allocated.
+pub(crate) fn note_step_mark(at: u64) {
+    STEP_MARKS.lock().push(at);
+}
+
+/// The marks of the most recent stepped operation, in the order its steps
+/// were staged: the states a crash can leave between two of its steps, for
+/// a harness's crash model. Empty for an operation that took one step.
+pub fn take_step_marks() -> alloc::vec::Vec<u64> {
+    core::mem::take(&mut *STEP_MARKS.lock())
 }

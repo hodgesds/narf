@@ -265,6 +265,32 @@ impl NicControl for Igc {
             ]);
         }
         out.extend(linux_stats(&counters, &s, skipped, &linux_queues));
+        // Transmit backpressure, per queue and for the stack as a whole.
+        // All of these stay 0 on a healthy system except `tx_busy`, which
+        // counts offers a full queue turned away (each is re-offered).
+        for (q, queue) in queues.iter().enumerate() {
+            out.push(Statistic {
+                name: alloc::format!("tx_queue_{q}_busy"),
+                value: queue.txq().busy(),
+            });
+            out.push(Statistic {
+                name: alloc::format!("tx_queue_{q}_stopped_long"),
+                value: queue.txq().long_stops(),
+            });
+        }
+        for (name, counter) in [
+            (
+                "tcp_tx_refusal_storms",
+                &narf_net::txq::stats::REOFFER_STORMS,
+            ),
+            ("tcp_tx_long_waits", &narf_net::txq::stats::LONG_WAITS),
+            ("tcp_tx_pool_empty", &narf_net::txq::stats::POOL_EMPTY),
+        ] {
+            out.push(Statistic {
+                name: alloc::string::String::from(name),
+                value: counter.load(core::sync::atomic::Ordering::Relaxed),
+            });
+        }
         Ok(out)
     }
     fn registers(&self) -> Result<Vec<u32>, i32> {

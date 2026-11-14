@@ -74,6 +74,19 @@ stricter whole-encryption-sector rule before calling these primitives.
 | Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
 | Key wrap  | AES Key Wrap, 128-bit KEK (`aes_kw::aes_wrap` / `aes_unwrap`, RFC 3394; IEEE 802.11 EAPOL-Key Key Data) |
 
+`gcm::{seal, open, gmac, gmac_verify}` supplies AES-GCM and GMAC (NIST SP
+800-38D) with a 12-byte nonce and a 16-byte tag, for 802.11 GCMP-128/256 and
+BIP-GMAC-128/256. The key length (16 or 32 bytes) selects the variant; any
+other length is `Error::Key`. `open` checks the tag over the ciphertext
+before decrypting and leaves `body` unchanged on every error; `gmac_verify`
+compares with `subtle`. The backends are constant-time: `aes` is the
+fixsliced software implementation (no lookup tables), and `polyval` is
+BearSSL's `ghash_ctmul64`. x86_64 pins both with `aes_force_soft` /
+`polyval_force_soft`; aarch64 uses them by default (no `aes_armv8` /
+`polyval_armv8`). Tests (`crypto/gcm`): SP 800-38D Test Cases 2-4 and 14-16,
+802.11 GCMP-128 and GCMP-256 MPDUs, and the BIP-GMAC-128/256 Deauthentication
+vectors.
+
 `aes_ccm::{seal, open}` supplies the AES-128-CCM profile used by 802.11
 CCMP: 13-byte nonce, detached eight-byte MIC and a two-byte message-length
 field. Messages longer than 65535 bytes fail before mutation. Associated data

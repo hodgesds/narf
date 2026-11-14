@@ -3951,8 +3951,7 @@ fn smoke_sysfs_active_vt_notifies_each_open() -> TestResult {
     let second = dir.lookup("active").unwrap();
     let mut buf = [0u8; 16];
     for file in [&first, &second] {
-        if narf_scheduler::block_on_spin(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n"
-        {
+        if crate::wait_sync(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n" {
             return TestResult::Fail("initial active VT read");
         }
     }
@@ -3969,7 +3968,7 @@ fn smoke_sysfs_active_vt_notifies_each_open() -> TestResult {
     if first.poll_readiness() & changed != changed {
         return TestResult::Fail("poll consumed sysfs notification before read");
     }
-    if narf_scheduler::block_on_spin(first.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty2\n" {
+    if crate::wait_sync(first.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty2\n" {
         return TestResult::Fail("activated VT read");
     }
     if first.poll_readiness() & changed != 0 || second.poll_readiness() & changed != changed {

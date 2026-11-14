@@ -246,6 +246,16 @@ SECTIONS
         QUAD(AP_STACKS);
     } :data
 
+    /* Physical bounds of the boot CPU's stack and its guard, as values the
+     * kernel half can read (same reason as `.ap_boot_syms`): guard base, stack
+     * bottom, stack top. `frame/src/aarch64/boot_stack.rs` reads them. */
+    .boot_stack_bounds : AT(ADDR(.boot_stack_bounds) - KIMAGE_VOFFSET) ALIGN(8) {
+        __boot_stack_bounds = .;
+        QUAD(boot_stack_guard);
+        QUAD(stack_bottom);
+        QUAD(stack_top);
+    } :data
+
     /* `.bss` is LAST in this segment, deliberately.
      *
      * It is NOBITS, so it occupies no file bytes — but only if nothing with file

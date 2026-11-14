@@ -137,6 +137,7 @@ pub mod tls_x509;
 pub mod txq;
 pub mod udp_gso;
 pub mod udp_sock;
+pub mod watchdog;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
@@ -173,6 +174,8 @@ mod tests;
 mod tls_client_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod udp_gso_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod watchdog_tests;
 
 use alloc::boxed::Box;
 use alloc::string::String;

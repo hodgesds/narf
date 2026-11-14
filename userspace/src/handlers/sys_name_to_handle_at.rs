@@ -198,9 +198,11 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // A failed walk reports why (ENOTDIR for a file prefix, ELOOP, EACCES),
     // as `user_path_at` does, rather than a flat ENOENT.
     let path_ino = match stat_ino_path_dir_aware_ext(&path, flags & AT_SYMLINK_FOLLOW != 0) {
-        Some((_, ino, ..)) => ino,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&path)) as u64));
+        Ok((_, ino, ..)) => ino,
+        Err(error) => {
+            ctx.set_return(SyscallReturn::ok(
+                (-path_lookup_errno(&path, Some(error))) as u64,
+            ));
             return;
         }
     };

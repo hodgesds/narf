@@ -15,20 +15,20 @@
 //!   `log_thermal_throttling_event`), others are ignored.
 //!
 //! The power-off is Linux's `hw_protection_shutdown`, not a direct S5 from
-//! the IV task: `narf_power::orderly::hw_protection_shutdown` queues the
-//! orderly power-off (every filesystem synced from the power worker, bounded
-//! by [`FORCED_POWEROFF_MS`], then the device shutdown hooks — NVMe Flush +
-//! CC.SHN — and ACPI S5) and arms a forced fallback should the orderly path
-//! not start. PMFW's own hardware CTF remains the last line of protection.
+//! the IV task: `narf_power::orderly::hw_protection_shutdown` queues a forced
+//! orderly power-off (the userspace `kernel.poweroff_cmd`; if that cannot be
+//! started, an emergency sync, then the device shutdown hooks — NVMe Flush +
+//! CC.SHN — and ACPI S5) and arms a forced kernel power-off for
+//! [`FORCED_POWEROFF_MS`] later should the machine still be up. PMFW's own
+//! hardware CTF remains the last line of protection.
 //! Fan stays automatic.
 use crate::amdgpu_ih_navi22::{source, Handle, Iv, Source, Subscription};
 use crate::amdgpu_smu_navi22::{self as smu, Limits};
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Sync budget of the thermal power-off: a filesystem sync still running
-/// after this is abandoned and the machine powered off (Linux
-/// `hw_protection_shutdown(..., ms_until_forced)`).
+/// How long the thermal power-off gives the orderly path before the kernel
+/// power-off is forced (Linux `hw_protection_shutdown(..., ms_until_forced)`).
 pub const FORCED_POWEROFF_MS: u64 = 10_000;
 
 /// `AMDGPU_SWCTF_EXTRA_DELAY`.

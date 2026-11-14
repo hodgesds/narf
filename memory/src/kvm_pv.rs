@@ -201,14 +201,15 @@ pub fn register_steal_time_current_cpu() {
     }
 }
 
-/// Deliver a fixed-vector IPI to `cpu_mask` with one `KVM_HC_SEND_IPI`
-/// hypercall. Returns false (caller must fall back to ICR writes) when the
-/// feature is absent, a target sits outside the single 64-bit bitmap window,
-/// or the host rejects the call. APIC IDs equal logical CPU ids on every
-/// topology NARF boots today (QEMU `-smp`, MADT identity), matching the
-/// `min = 0` window base.
-pub fn pv_send_ipi(cpu_mask: u64, vector: u8) -> bool {
-    if cpu_mask == 0 {
+/// Deliver a fixed-vector IPI to every APIC ID set in `apic_mask` (bit n =
+/// APIC ID n, the `min = 0` window of `KVM_HC_SEND_IPI`) with one
+/// hypercall. The caller translates logical CPUs to APIC IDs
+/// (`narf_interrupts::x86_64::apic`); targets outside the 64-bit window
+/// cannot be expressed and go through the ICR instead. Returns false
+/// (caller must fall back to ICR writes) when the feature is absent or the
+/// host rejects the call.
+pub fn pv_send_ipi(apic_mask: u64, vector: u8) -> bool {
+    if apic_mask == 0 {
         return true;
     }
     if !SEND_IPI_ACTIVE.load(Ordering::Acquire) {
@@ -216,7 +217,7 @@ pub fn pv_send_ipi(cpu_mask: u64, vector: u8) -> bool {
     }
     // icr low word: vector, fixed delivery (APIC_DM_FIXED = 0).
     // SAFETY: feature checked; vendor instruction pinned by detect().
-    let ret = unsafe { hypercall4(KVM_HC_SEND_IPI, cpu_mask, 0, 0, vector as u64) };
+    let ret = unsafe { hypercall4(KVM_HC_SEND_IPI, apic_mask, 0, 0, vector as u64) };
     ret >= 0
 }
 

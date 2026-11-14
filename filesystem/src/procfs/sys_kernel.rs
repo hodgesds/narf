@@ -42,6 +42,9 @@ static PRINTK_DEVKMSG: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::ne
 static CORE_PATTERN: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 
 static CORE_USES_PID: AtomicI32 = AtomicI32::new(0);
+/// `kernel.poweroff_cmd` (`kernel/reboot.c::poweroff_cmd`); `None` until
+/// first written = [`DEFAULT_POWEROFF_CMD`].
+static POWEROFF_CMD: IrqSafeSpinLock<Option<String>> = IrqSafeSpinLock::new(None);
 static CORE_PIPE_LIMIT: AtomicU32 = AtomicU32::new(0);
 
 static PID_MAX: AtomicU32 = AtomicU32::new(32768);
@@ -679,6 +682,45 @@ fn write_core_pipe_limit(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Linux `POWEROFF_CMD_PATH_LEN`: the buffer behind `kernel.poweroff_cmd`,
+/// NUL included.
+pub const POWEROFF_CMD_PATH_LEN: usize = 256;
+
+/// The default `kernel.poweroff_cmd` (`kernel/reboot.c`).
+pub const DEFAULT_POWEROFF_CMD: &str = "/sbin/poweroff";
+
+/// `kernel.poweroff_cmd` — the command `orderly_poweroff` runs as a usermode
+/// helper: `argv_split` on whitespace, argv[0] the program.
+pub fn poweroff_cmd() -> String {
+    POWEROFF_CMD
+        .lock()
+        .clone()
+        .unwrap_or_else(|| String::from(DEFAULT_POWEROFF_CMD))
+}
+
+/// Set `kernel.poweroff_cmd`, as a write to the sysctl file does.
+pub fn set_poweroff_cmd(cmd: &str) -> Result<(), FsError> {
+    write_poweroff_cmd(cmd)
+}
+
+fn read_poweroff_cmd() -> String {
+    format!("{}\n", poweroff_cmd())
+}
+
+/// `proc_dostring` into a `POWEROFF_CMD_PATH_LEN` buffer: the value ends at
+/// the first newline or NUL and is silently truncated to `maxlen - 1`
+/// bytes. An empty value is stored as such: the helper then has no program
+/// and fails, as Linux's `call_usermodehelper` does.
+fn write_poweroff_cmd(v: &str) -> Result<(), FsError> {
+    let end = v.find(['\n', '\0']).unwrap_or(v.len());
+    let mut cut = end.min(POWEROFF_CMD_PATH_LEN - 1);
+    while !v.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    *POWEROFF_CMD.lock() = Some(v[..cut].to_string());
+    Ok(())
+}
+
 // ── kernel/random/* ─────────────────────────────────────────────
 
 // entropy_avail: the csprng pool's real state (#1026) — 4096 bits
@@ -869,6 +911,13 @@ pub fn register_all() {
         read: read_cap_last_cap,
         write: None,
         perms: 0o444,
+    });
+    // `kernel/reboot.c::kern_reboot_table`: 0644 `proc_dostring`.
+    register_sysctl(SysctlEntry {
+        path: "kernel/poweroff_cmd",
+        read: read_poweroff_cmd,
+        write: Some(write_poweroff_cmd),
+        perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "kernel/core_pattern",
@@ -1439,6 +1488,34 @@ fn smoke_kernel_core_pattern_rw() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_core_pattern_rw);
+
+/// `kernel.poweroff_cmd` (`kernel/reboot.c`): defaults to `/sbin/poweroff`,
+/// reads back with a newline, and a write ends at the first newline.
+fn smoke_kernel_poweroff_cmd_rw() -> TestResult {
+    register_all();
+    let Some(f) = lookup_sys("kernel/poweroff_cmd") else {
+        return TestResult::Fail("poweroff_cmd sysctl not found");
+    };
+    let saved = poweroff_cmd();
+    let default_read = read_sys("kernel/poweroff_cmd");
+    let wrote = f.write(b"/usr/bin/systemctl poweroff\nignored").is_ok();
+    let live = poweroff_cmd();
+    let read_back = read_sys("kernel/poweroff_cmd");
+    let _ = set_poweroff_cmd(&saved);
+    if saved == DEFAULT_POWEROFF_CMD && default_read.as_deref() != Some("/sbin/poweroff\n") {
+        return TestResult::Fail("poweroff_cmd default is not /sbin/poweroff");
+    }
+    if !wrote {
+        return TestResult::Fail("write poweroff_cmd failed");
+    }
+    if live != "/usr/bin/systemctl poweroff"
+        || read_back.as_deref() != Some("/usr/bin/systemctl poweroff\n")
+    {
+        return TestResult::Fail("poweroff_cmd did not store the first line of the write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_poweroff_cmd_rw);
 
 /// systemd-sysctl writes both at boot (`50-coredump.conf`); a missing file
 /// is a logged failure on every boot.

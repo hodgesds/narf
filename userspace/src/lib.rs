@@ -124,6 +124,7 @@ pub fn proc_sysvipc_table(kind: u8) -> alloc::string::String {
 // the variant (block below the thread pointer on x86_64, above the reserved
 // TCB words on aarch64) and `stage_tls` lays the block out accordingly.
 pub mod tls;
+pub mod umh;
 pub mod user_task;
 pub mod vdso;
 pub mod xdp_socket;
@@ -155,6 +156,7 @@ mod abi_futex_tests;
 mod abi_inode_identity_tests;
 mod abi_ioerrno_tests;
 mod abi_ipc_tests;
+mod abi_lookup_error_tests;
 mod abi_mem2_tests;
 mod abi_mem_tests;
 mod abi_misc_tests;
@@ -167,6 +169,7 @@ mod abi_pidns_tests;
 mod abi_populate_tests;
 mod abi_proc2_tests;
 mod abi_proc_tests;
+mod abi_procfd_tests;
 mod abi_pty_tests;
 mod abi_readahead_tests;
 mod abi_remount_tests;

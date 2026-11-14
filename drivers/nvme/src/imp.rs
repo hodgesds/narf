@@ -28,8 +28,10 @@
 pub mod admin;
 pub mod chardev;
 pub mod mi;
+pub mod mq;
 pub mod ns;
 pub mod prp;
+pub mod req;
 pub mod shutdown;
 
 mod tests;
@@ -37,16 +39,19 @@ mod tests_cid;
 mod tests_dsm;
 mod tests_flush;
 mod tests_gate;
+mod tests_mq;
 mod tests_multi;
 mod tests_retry;
 
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use mq::{Cmd, CmdOutcome, CmdResources, IoQueue};
 use narf_block::{
-    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
+    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockQueue, BlockRequest, CancelResult,
     LbaRange,
 };
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
@@ -249,7 +254,6 @@ fn nvme_admin_irq() {}
 /// completes it would. Only the in-kernel smokes set it.
 #[doc(hidden)]
 pub static FAIL_IDENTIFY_FOR_TEST: AtomicBool = AtomicBool::new(false);
-fn nvme_io_irq() {}
 
 /// Test hook: the next N MSI-X entry programmings by
 /// [`Controller::bring_up`] (admin entry 0) / [`Controller::create_io_queue`]
@@ -263,20 +267,17 @@ pub static FAIL_MSIX_PROGRAM_FOR_TEST: AtomicU32 = AtomicU32::new(0);
 /// Every entry targets one CPU, as before: completions are consumed by
 /// whichever CPU is waiting (the vector's global `fire_count`), so the
 /// target only has to be a CPU that exists and takes interrupts. That CPU
-/// is scheduler CPU 0, resolved to a real APIC ID through
+/// is logical CPU 0 (the boot CPU), resolved to its real APIC ID through
 /// `narf_interrupts::apic_id_of_cpu` (as `drivers/net/igc` does) instead of
-/// the literal 0 the entries used to carry: scheduler CPU ids are APIC
-/// IDs, so on a machine whose firmware lists an enabled CPU with APIC ID 0
-/// the destination is unchanged, and on one that does not — where a
-/// literal 0 addressed no CPU at all and every interrupt was lost — the
-/// entries go to the CPU doing the bring-up. 0 when the topology is not
-/// known (no MADT), as before.
+/// the literal 0 the entries used to carry: on a machine whose boot CPU
+/// has APIC ID 0 the destination is unchanged, and on one where it does
+/// not — where a literal 0 addressed another CPU or none, and every
+/// interrupt was lost — the entries go to the boot CPU. 0 when the
+/// topology is not known (no MADT), as before.
 fn msix_target_apic_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        narf_interrupts::apic_id_of_cpu(0)
-            .or_else(|| narf_interrupts::apic_id_of_cpu(narf_lib::percpu::current_cpu()))
-            .unwrap_or(0)
+        narf_interrupts::apic_id_of_cpu(0).unwrap_or(0)
     }
     // No APIC: the argument is the ITS DeviceID, which this driver has
     // always passed as 0.
@@ -304,7 +305,7 @@ pub enum IoOpcode {
 /// program are named; the rest stay zero.
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct Sqe {
+pub(crate) struct Sqe {
     cdw0: u32, // opcode + fuse + cid
     nsid: u32,
     _resv: [u32; 2],
@@ -343,7 +344,7 @@ impl Sqe {
 /// NVMe Completion Queue Entry. Layout per base spec §4.6: 16 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-struct Cqe {
+pub(crate) struct Cqe {
     cmd_specific: u32,
     _resv: u32,
     sq_head: u16,
@@ -429,28 +430,25 @@ const _: () = assert!(ADMIN_Q_DEPTH > 4);
 /// "Cmd Limit Exceeded" on the 4th.
 const AER_POST_COUNT: u8 = 3;
 
-/// I/O queue depth — same constraint (single 4 KiB DMA page each).
-/// Independent of the admin depth: only the admin queue needs the
-/// AER headroom (§5.2), so the I/O depth stays at 4.
-const IO_Q_DEPTH: u16 = 4;
+/// I/O queue depth for this controller: `CAP.MQES + 1` clamped to Linux's
+/// `io_queue_depth` (see [`mq::io_queue_depth`]); one page's worth (64
+/// entries) before CAP has been read.
+fn io_queue_depth_of(caps: Option<NvmeCaps>) -> u16 {
+    caps.map_or(64, |c| mq::io_queue_depth(c.mqes))
+}
 
 /// Default I/O queue id (NVMe reserves qid=0 for the admin queue;
 /// the first I/O queue is qid=1).
 const IO_QID: u16 = 1;
 
-/// Hard upper bound on the number of I/O queue pairs we ask the
-/// controller to create. Bounded by:
-///   - MSI-X table slots we want to consume up-front.
-///   - Per-queue DMA footprint: every pair burns one SQ page + one
-///     CQ page = 8 KiB, plus a per-vector waker channel.
-///   - Round-robin index math fits comfortably in a usize regardless.
-///
-/// The final granted count is `min(host_cpu_count, CAP.MQES+1,
-/// NVME_MAX_IO_QUEUE_PAIRS, controller-grant)` — see
-/// `create_io_queues_msix`. Per NVMe Base Spec 2.0c §5.27 (Set
-/// Features — Number of Queues) the controller MAY grant fewer than
-/// the host requests.
-const NVME_MAX_IO_QUEUE_PAIRS: u16 = 8;
+/// I/O queue pairs the host asks for: one per CPU (Linux
+/// `nvme_setup_io_queues`: `num_possible_cpus()`), at least one. The
+/// controller may grant fewer (NVMe Base Spec 2.0c §5.27, Set Features —
+/// Number of Queues), and the MSI-X table and IDT vector supply bound it
+/// further — see `create_io_queues_msix`.
+pub(crate) fn host_io_queue_pairs() -> u16 {
+    (narf_lib::smp::cpu_count() as u16).max(1)
+}
 
 /// Namespace id the single-namespace helpers fall back to before a scan
 /// found any namespace (I/O is then refused as `NamespaceUnusable`).
@@ -511,32 +509,32 @@ pub struct Controller {
     admin: Option<Queue>,
     /// Set after `create_io_queue*` completes. One entry per granted
     /// I/O queue pair (qid = index+1). `io_queues[0]` is qid=1, the
-    /// first I/O queue. Round-robin / per-CPU dispatch picks an
-    /// index via `pick_queue`.
+    /// first I/O queue. Dispatch picks the submitting CPU's queue
+    /// (`pick_queue`). Each queue carries its own tag space, locks and
+    /// completion handling ([`mq::IoQueue`]); the `Arc` is shared with
+    /// every request in flight on it, so a queue torn down under a
+    /// request stays valid memory until the request has seen its reset.
     ///
     /// NVMe Base Spec 2.0c §3.3 / §4.1.4: qid=0 is admin; I/O queues
     /// use qid >= 1.
-    io_queues: Vec<Queue>,
-    /// Per-queue submission locks. `io_queue_locks[i]` guards
-    /// `io_queues[i]`'s SQ tail + doorbell. Parallel submitters to
-    /// different queues each take their own lock, so concurrent I/O
-    /// to distinct queue indices proceeds without serialising on the
-    /// global controller lock.
-    ///
-    /// Length mirrors `io_queues`; both vecs are populated and cleared
-    /// together in the `create_io_queue*` paths.
-    ///
-    /// Linux reference: drivers/nvme/host/nvme.h:nvme_queue::sq_lock
-    io_queue_locks: Vec<IrqSafeSpinLock<()>>,
+    io_queues: Vec<Arc<IoQueue>>,
     /// One IDT vector per I/O CQ. `io_irq_vectors[i]` is the vector
     /// MSI-X table entry `i` delivers to for completions on
     /// `io_queues[i]`. Empty for the polled-completion path
     /// (`create_io_queue`).
     io_irq_vectors: Vec<u8>,
-    /// Round-robin counter used to pick the next I/O queue under
-    /// concurrent submitters (`fetch_add` per submission). Reset to
-    /// 0 when `io_queues` is repopulated. Wraps naturally.
-    next_queue: AtomicUsize,
+    /// How the I/O queues complete, for the boot log and
+    /// `/proc/narf/nvme_queues`: `"msix"` or `"polled (<why>)"` naming the
+    /// step at which the MSI-X path was given up.
+    io_queue_mode: &'static str,
+    /// The gate-free data path's view of this controller: its queues and
+    /// namespace geometry, rebuilt (`io_path_dirty`) whenever either
+    /// changes and mirrored into the slot when the gate is released
+    /// (`ControllerGuard::drop`). `None` while the controller has no
+    /// usable I/O queues (never brought up, dead, suspended).
+    io_path: Option<Arc<req::IoPath>>,
+    /// `io_path` must be rebuilt before the gate is next released.
+    io_path_dirty: bool,
     /// Live BAR0 mapping post-bring-up. Stored so admin commands
     /// don't have to re-map (which writes to cfg-space).
     bar0_region: Option<MmioRegion>,
@@ -571,18 +569,13 @@ pub struct Controller {
     /// False when the namespace's LBA format cannot carry block I/O
     /// (see [`prp::NamespaceFormat::usable`]).
     ns_usable: bool,
-    /// Persistent PRP-list page for I/O transfers longer than two
-    /// pages. Every I/O path holds `&mut Controller` until its CQE is
-    /// consumed, so one page serves all of them, and it is never freed
-    /// while the controller lives (a timed-out command may still read
-    /// it — see `dead`).
-    prp_list: Option<DmaBuffer>,
     /// Persistent one-page buffer holding the Dataset Management
     /// range list (at most [`DSM_MAX_RANGES`] 16-byte definitions =
     /// exactly one 4 KiB page) while a DSM command is in flight.
-    /// Same lifetime discipline as `prp_list`: every DSM path holds
-    /// `&mut self` until its CQE is consumed, and the page is never
-    /// freed while the controller lives.
+    /// Every DSM path holds `&mut self` until its CQE is consumed, and
+    /// the page is never freed while the controller lives (a timed-out
+    /// command may still read it — see `dead`). Read/Write PRP lists
+    /// are per command, from the queue's pool ([`mq::IoQueue`]).
     dsm_page: Option<DmaBuffer>,
     /// Set when an I/O command timed out. The CQ head/phase no longer
     /// match the device and the command's buffers may still be DMA
@@ -623,6 +616,26 @@ pub struct Controller {
     vs: u32,
     /// Flush commands completed (see [`Controller::flush_nsid`]).
     flushes_completed: u64,
+}
+
+impl Drop for Controller {
+    /// A controller that goes out of scope without having been stopped
+    /// (the smokes' stack-local controllers; a failed probe) is stopped
+    /// here — CC.EN=0, MSI-X disabled, queues torn down, vectors and
+    /// handlers released — so its IDT vectors and DMA pages do not leak,
+    /// with the same confirmed-stop discipline as `disable_after_failure`
+    /// (pages are leaked, not freed, when CSTS.RDY never drops). Installed
+    /// controllers live in leaked slots and never reach this.
+    fn drop(&mut self) {
+        let live = self.admin.is_some()
+            || !self.io_queues.is_empty()
+            || self.admin_irq_vector.is_some()
+            || !self.io_irq_vectors.is_empty()
+            || self.irq_vector.is_some();
+        if live {
+            self.disable_inner(None);
+        }
+    }
 }
 
 impl core::fmt::Debug for Controller {
@@ -790,10 +803,10 @@ impl Queue {
         let opcode = (sqe.cdw0 & 0xFF) as u8;
         let started = narf_time::now_cycles();
         let fires_at_submit = vector.map(narf_interrupts::fire_count);
-        // Test-only fault injection, I/O queues only (see
-        // [`IO_LOSE_FOR_TEST`] / [`IO_LATE_FOR_TEST`]).
-        let lose = self.qid != 0 && take_test_fault(&IO_LOSE_FOR_TEST);
-        let late = self.qid != 0 && take_test_fault(&IO_LATE_FOR_TEST);
+        // The admin queue takes no injected faults (see
+        // [`IO_LOSE_FOR_TEST`] / [`IO_LATE_FOR_TEST`], I/O queues only).
+        let lose = false;
+        let late = false;
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -883,7 +896,7 @@ impl Queue {
             self.advance_head(bar0);
             if cqe.is_for(cid) {
                 if expired {
-                    note_late_completion(bar0.phys.raw(), self.qid, opcode, cid, started);
+                    note_late_completion(bar0.phys.raw(), self.qid, opcode, cid, started, false);
                 }
                 return Ok(cqe);
             }
@@ -959,52 +972,6 @@ fn post_one_aer(admin: &mut Queue, bar0: &MmioRegion) {
     // SAFETY: identity-mapped MMIO doorbell.
     unsafe {
         bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
-    }
-}
-
-/// How long one wait of the async I/O path may park before the CQ is
-/// checked regardless of whether the queue's vector fired: the phase-poll
-/// fallback for a lost or never-delivered MSI (the sync path checks the
-/// CQE phase continuously; this is its async equivalent). The same
-/// cadence as the AER supervisor's poll.
-pub const ASYNC_CQ_POLL_MS: u64 = 250;
-
-/// One I/O command in flight on the async path, from
-/// [`Controller::submit_io_begin`] until [`Controller::submit_io_poll`]
-/// reports it finished. Plain data: holding it borrows nothing.
-#[derive(Copy, Clone, Debug)]
-pub struct IoInFlight {
-    /// Index into `io_queues` the command was submitted on.
-    qi: usize,
-    /// Its command identifier on that queue.
-    cid: u16,
-    /// Its opcode, for error and timeout reports (a CQE carries none).
-    opcode: u8,
-    /// The queue's interrupt vector.
-    vector: u8,
-    /// When the command is given up on (shared by every wait).
-    deadline: narf_time::Deadline,
-    /// `now_cycles()` at submission, for the timeout report.
-    started: u64,
-    /// The vector's `fire_count` at submission, for the timeout report.
-    fires_at_submit: u64,
-}
-
-impl IoInFlight {
-    /// A wait for this command's next reason to look at the CQ: the
-    /// queue's vector firing, or [`ASYNC_CQ_POLL_MS`] passing, or the
-    /// command's deadline — whichever is first. The `fire_count` baseline
-    /// is taken here, so arm the wait BEFORE the CQ check it follows;
-    /// an interrupt that lands between the check and the await then
-    /// resolves the wait at once instead of being lost.
-    pub fn wait(&self) -> narf_time::Timeout<narf_interrupts::WaitForIrq> {
-        let slice = narf_time::Deadline::after_ms(ASYNC_CQ_POLL_MS);
-        narf_interrupts::wait_for_irq_until(self.vector, slice.min(self.deadline))
-    }
-
-    /// The interrupt vector of the queue the command is on.
-    pub fn vector(&self) -> u8 {
-        self.vector
     }
 }
 
@@ -1115,9 +1082,10 @@ impl Controller {
             device: None,
             admin: None,
             io_queues: Vec::new(),
-            io_queue_locks: Vec::new(),
+            io_path: None,
+            io_path_dirty: false,
             io_irq_vectors: Vec::new(),
-            next_queue: AtomicUsize::new(0),
+            io_queue_mode: "none",
             bar0_region: None,
             identify: None,
             lba_bytes: 512,
@@ -1127,7 +1095,6 @@ impl Controller {
             admin_irq_vector: None,
             max_transfer: prp::NVME_CTRL_PAGE_SIZE as u32,
             ns_usable: false,
-            prp_list: None,
             dsm_page: None,
             dead: false,
             stop_confirmed: true,
@@ -1202,45 +1169,88 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = IoOpcode::Flush as u32;
         sqe.nsid = nsid;
-        // Every I/O path consumes its completion before returning, so all
-        // earlier writes are complete; one Flush on any queue covers them.
-        // A Flush carries no data pointer.
-        let qi = self.pick_queue();
-        self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
+        // A Flush covers every write the namespace has completed, on any
+        // queue. It carries no data pointer.
+        self.submit_io_sync(sqe, CmdResources::default())?;
         self.flushes_completed += 1;
         Ok(())
     }
 
-    /// Submit a prebuilt SQE on I/O queue `qi` and poll its CQ for the
-    /// completion, within `timeout_ms`. The polled sibling of
-    /// [`Self::submit_sqe_irq`]: Flush, Dataset Management and Write
-    /// Zeroes always take it, Read/Write when the queue has no vector.
-    /// Callers pass [`io_timeout_ms`] (Linux `NVME_IO_TIMEOUT`, 30 s). A
-    /// completion timeout marks the controller dead — the command and any
-    /// page it names may still be live in the device — and leaves the
-    /// reset + replay to the block entry points ([`run_with_replay`]).
+    /// Post a prebuilt SQE on this CPU's I/O queue and wait for its
+    /// completion synchronously (the gate-held paths: Flush, Dataset
+    /// Management, Write Zeroes, the sync block wrappers' scratch
+    /// transfers). The command shares the queue's tag space with the
+    /// queued async path — many commands are in flight at once; this
+    /// caller merely waits for its own. `res` is held until the terminal
+    /// completion. Returns the completion's dword 0.
     ///
-    /// The caller guarantees what every I/O path here does: the SQE's data
-    /// pointer (if any) names DMA memory that outlives the command — the
-    /// caller's buffer across this synchronous call, or one of the
-    /// controller's persistent pages.
-    fn submit_sqe_polled(
-        &mut self,
-        qi: usize,
-        sqe: Sqe,
-        timeout_ms: u64,
-    ) -> Result<Cqe, NvmeError> {
-        let vector = self.io_irq_vectors.get(qi).copied();
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: the I/O queue and BAR0 are live, `&mut self` makes this
-        // the queue's only submitter, and the data pointer is valid per
-        // this function's contract.
-        let r = unsafe { io.submit_ms(bar0, sqe, timeout_ms, vector) };
-        if let Err(NvmeError::CompletionTimeout) = r {
-            self.dead = true;
+    /// Budget [`IO_TIMEOUT_MS`] (Linux `NVME_IO_TIMEOUT`). A timeout
+    /// marks the controller dead — the command and the pages it names may
+    /// still be live in the device, and stay held by the queue — and
+    /// leaves the reset + replay to the block entry points
+    /// ([`run_with_replay`]).
+    fn submit_io_sync(&mut self, sqe: Sqe, res: CmdResources) -> Result<u32, NvmeError> {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
         }
-        r
+        let q = self.pick_queue().ok_or(NvmeError::NoIoQueue)?;
+        let opcode = (sqe.cdw0 & 0xFF) as u8;
+        let tag = alloc_tag_sync(&q).ok_or(NvmeError::CompletionTimeout)?;
+        let id = q.post(tag, sqe, res)?;
+        match Cmd::new(Arc::clone(&q), id).wait_sync() {
+            CmdOutcome::Completed {
+                status: 0,
+                cmd_specific,
+                ..
+            } => Ok(cmd_specific),
+            CmdOutcome::Completed { status, .. } => Err(NvmeError::CommandFailed {
+                cmd: opcode,
+                status,
+            }),
+            CmdOutcome::Reset => Err(NvmeError::ControllerDead),
+            CmdOutcome::TimedOut => {
+                q.report_timeout(tag);
+                self.mark_dead();
+                Err(NvmeError::CompletionTimeout)
+            }
+        }
+    }
+
+    /// The controller stopped answering: refuse further I/O until the
+    /// reset the block entry points perform.
+    pub(crate) fn mark_dead(&mut self) {
+        if !self.dead {
+            self.dead = true;
+            self.io_path_dirty = true;
+        }
+    }
+
+    /// Rebuild the gate-free data path's snapshot of this controller
+    /// after its queues or geometry changed (see `io_path`).
+    fn refresh_io_path(&mut self) {
+        if !self.io_path_dirty {
+            return;
+        }
+        self.io_path_dirty = false;
+        if self.dead || self.io_queues.is_empty() {
+            self.io_path = None;
+            return;
+        }
+        self.io_path = Some(Arc::new(req::IoPath {
+            queues: self.io_queues.clone(),
+            namespaces: self.namespaces.clone(),
+            primary_nsid: self.primary_nsid,
+            max_transfer: self.max_transfer,
+            vwc: self.has_volatile_write_cache(),
+            bar: self.bar0_region.map_or(0, |b| b.phys.raw()),
+        }));
+    }
+
+    /// The gate-free data path's current view (see `io_path`); `None`
+    /// while the controller cannot take I/O.
+    pub(crate) fn io_path(&mut self) -> Option<Arc<req::IoPath>> {
+        self.refresh_io_path();
+        self.io_path.clone()
     }
 
     /// Identify Controller ONCS bit 2: the controller supports the
@@ -1358,8 +1368,7 @@ impl Controller {
             sqe.cdw11 = DSM_CDW11_DEALLOCATE;
             // The range-list page is persistent DMA memory that
             // outlives the command.
-            let qi = self.pick_queue();
-            self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
+            self.submit_io_sync(sqe, CmdResources::default())?;
         }
         Ok(())
     }
@@ -1414,8 +1423,7 @@ impl Controller {
             // CDW12 bits[15:0] = NLB, 0-based (Figure 73).
             sqe.cdw12 = (n - 1) as u32;
             // Write Zeroes carries no data pointer.
-            let qi = self.pick_queue();
-            self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
+            self.submit_io_sync(sqe, CmdResources::default())?;
             at += n;
             left -= n;
         }
@@ -1442,7 +1450,7 @@ impl Controller {
                 narf_scheduler::responsive_spin_until(cond, narf_time::Deadline::after_ms(ms))
             },
         );
-        self.dead = true;
+        self.mark_dead();
         Some(report)
     }
 
@@ -1842,10 +1850,6 @@ impl Controller {
             }
         };
 
-        // Persistent PRP-list page for > 2-page transfers (see
-        // `Controller::prp_list`).
-        let prp_list = alloc_coherent(prp::NVME_CTRL_PAGE_SIZE, DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
         // Persistent Dataset Management range-list page (see
         // `Controller::dsm_page`).
         let dsm_page = alloc_coherent(prp::NVME_CTRL_PAGE_SIZE, DomainId::DRIVER_0)
@@ -1868,8 +1872,8 @@ impl Controller {
             }
         }
         self.namespaces = namespaces;
-        self.prp_list = Some(prp_list);
         self.dsm_page = Some(dsm_page);
+        self.io_path_dirty = true;
 
         // ── 9. Async Event Configuration + AERs (#928) ────────────
         // Enable SMART/health + namespace-attribute-changed events,
@@ -1903,6 +1907,37 @@ impl Controller {
     /// leaked with `mem::forget` rather than returned to the allocator.
     /// Returns `true` when the controller was confirmed stopped.
     pub fn disable_after_failure(&mut self, cap: &Cap<BusDeviceCap, Write>) -> bool {
+        self.disable_inner(Some(cap))
+    }
+
+    /// [`Self::disable_after_failure`]; without `cap` the function's
+    /// bus-master enable is left as is (a dropped controller has no cap).
+    /// Free every IDT vector this controller allocated (handlers first),
+    /// each exactly once: the admin queue's and the I/O queues'
+    /// (`irq_vector` aliases one of them — the admin vector on the
+    /// single-pair path, the first I/O vector on the multi-queue path — and
+    /// must not be freed twice, nor the admin vector forgotten, which
+    /// leaked one IDT vector and its handler per multi-queue bring-up,
+    /// i.e. per controller reset). The caller guarantees no MSI-X entry
+    /// can still deliver to them: the table is disabled, or the function
+    /// was reset and its table re-programmed by a newer bring-up.
+    fn free_irq_vectors(&mut self) {
+        let mut vectors: Vec<u8> = self
+            .irq_vector
+            .take()
+            .into_iter()
+            .chain(self.admin_irq_vector.take())
+            .chain(self.io_irq_vectors.drain(..))
+            .collect();
+        vectors.sort_unstable();
+        vectors.dedup();
+        for v in vectors {
+            narf_interrupts::dispatch::clear_handler(v);
+            let _ = narf_interrupts::vector::free(v);
+        }
+    }
+
+    fn disable_inner(&mut self, cap: Option<&Cap<BusDeviceCap, Write>>) -> bool {
         let timeout_ms = self.caps.map(|c| c.ready_timeout_ms()).unwrap_or(500);
         let stopped = match self.bar0_region.as_ref() {
             Some(bar) => {
@@ -1929,42 +1964,30 @@ impl Controller {
             // the controller is disabled (or abandoned) so no source fires.
             unsafe { table.disable() };
         }
-        // Every vector this controller allocated, each exactly once: the
-        // admin queue's, and the I/O queues' (`irq_vector` aliases one of
-        // them — the admin vector on the single-pair path, the first I/O
-        // vector on the multi-queue path — and must not be freed twice,
-        // nor the admin vector forgotten, which leaked one IDT vector and
-        // its handler per multi-queue bring-up, i.e. per controller reset).
-        let mut vectors: Vec<u8> = self
-            .irq_vector
-            .take()
-            .into_iter()
-            .chain(self.admin_irq_vector.take())
-            .chain(self.io_irq_vectors.drain(..))
-            .collect();
-        vectors.sort_unstable();
-        vectors.dedup();
-        for v in vectors {
-            narf_interrupts::dispatch::clear_handler(v);
-            let _ = narf_interrupts::vector::free(v);
-        }
-        if let Some(device) = self.device {
+        self.free_irq_vectors();
+        if let (Some(device), Some(cap)) = (self.device, cap) {
             let _ = narf_bus::pci::clear_command(cap, &device, narf_bus::pci::cmd::BUS_MASTER);
         }
         let admin = self.admin.take();
         let io = core::mem::take(&mut self.io_queues);
-        let prp_list = self.prp_list.take();
         let dsm_page = self.dsm_page.take();
         let pages = core::mem::take(&mut self.in_flight_dma);
-        self.io_queue_locks.clear();
         self.dead = true;
+        self.io_path = None;
+        self.io_path_dirty = false;
         self.stop_confirmed = stopped;
+        // Each I/O queue quiesces itself: in-flight commands are marked
+        // reset (their owners requeue), abandoned ones freed or leaked by
+        // `stopped`, and the queue's own pages likewise. Requests still
+        // holding a queue keep it alive until they have seen the reset.
+        for q in &io {
+            q.teardown(stopped);
+        }
+        drop(io);
         if stopped {
-            drop((admin, io, prp_list, dsm_page, pages));
+            drop((admin, dsm_page, pages));
         } else {
             core::mem::forget(admin);
-            core::mem::forget(io);
-            core::mem::forget(prp_list);
             core::mem::forget(dsm_page);
             core::mem::forget(pages);
         }
@@ -2079,7 +2102,6 @@ impl Controller {
                     iv = 1;
                     ien = 1;
                     irq_vec = Some(v);
-                    narf_interrupts::install_handler(v, nvme_io_irq);
                 } else {
                     // The entry was not written: creating the CQ with
                     // IEN=1 would point it at an unprogrammed entry. Keep
@@ -2097,10 +2119,11 @@ impl Controller {
             }
         }
 
-        // Allocate IOSQ + IOCQ DMA pages — same shape as admin.
-        let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+        // Allocate IOSQ + IOCQ DMA pages, sized from CAP.MQES.
+        let depth = io_queue_depth_of(self.caps);
+        let sq_buf = alloc_coherent(64 * depth as usize, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+        let cq_buf = alloc_coherent(16 * depth as usize, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         let sq_phys = sq_buf.dma_addr().raw();
         let cq_phys = cq_buf.dma_addr().raw();
@@ -2114,7 +2137,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::CreateCq as u32;
         sqe.prp1 = cq_phys;
-        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw10 = ((depth as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((iv as u32) << 16) | (ien << 1) | 1;
         // SAFETY: queue + bar live; CQ buffer is fresh DMA.
         if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
@@ -2136,7 +2159,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::CreateSq as u32;
         sqe.prp1 = sq_phys;
-        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw10 = ((depth as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
         // SAFETY: queue + bar live.
         if let Err(e) = unsafe { admin.submit(bar0, sqe) } {
@@ -2148,30 +2171,26 @@ impl Controller {
             return Err(e);
         }
 
-        // Stash the new IoQueue. Drop replaces any prior set.
+        // Stash the new IoQueue. Any prior set is replaced (an earlier
+        // set that was never torn down frees its pages on drop).
+        let db_stride = admin.db_stride;
+        let bar = *bar0;
         self.io_queues.clear();
-        self.io_queue_locks.clear();
         self.io_irq_vectors.clear();
-        self.next_queue.store(0, Ordering::Relaxed);
         if let Some(v) = irq_vec {
             self.io_irq_vectors.push(v);
         }
-        self.io_queues.push(Queue {
-            sq_buf,
-            cq_buf,
-            qid: IO_QID,
-            depth: IO_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1,
-            db_stride: admin.db_stride,
-            next_cid: 0,
-            stray_aer: [0; (ADMIN_Q_DEPTH - 1) as usize],
-            stray_aer_len: 0,
-            aer_cids: [0; (ADMIN_Q_DEPTH - 1) as usize],
-            aer_cids_len: 0,
-        });
-        self.io_queue_locks.push(IrqSafeSpinLock::new(()));
+        let q = IoQueue::new(IO_QID, depth, sq_buf, cq_buf, bar, db_stride, irq_vec);
+        q.install_isr();
+        self.io_queues.push(q);
+        self.io_path_dirty = true;
+        if !self.io_queue_mode.starts_with("polled") {
+            self.io_queue_mode = if irq_vec.is_some() {
+                "single queue on MSI-X"
+            } else {
+                "polled (single queue)"
+            };
+        }
         Ok(())
     }
 
@@ -2288,8 +2307,10 @@ impl Controller {
         qid: u16,
         iv: u16,
         admin_stride: u64,
-    ) -> Result<Queue, NvmeError> {
-        let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+        vector: u8,
+    ) -> Result<Arc<IoQueue>, NvmeError> {
+        let depth = io_queue_depth_of(self.caps);
+        let cq_buf = alloc_coherent(16 * depth as usize, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         let cq_phys = cq_buf.dma_addr().raw();
         // Create I/O CQ (§5.2.2, opcode 0x05):
@@ -2304,7 +2325,7 @@ impl Controller {
             let mut sqe = Sqe::zero();
             sqe.cdw0 = AdminOpcode::CreateCq as u32;
             sqe.prp1 = cq_phys;
-            sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
+            sqe.cdw10 = ((depth as u32 - 1) << 16) | (qid as u32);
             sqe.cdw11 = ((iv as u32) << 16) | (1 << 1) | 1;
             // SAFETY: admin queue + BAR live; CQ DMA fresh.
             unsafe { admin.submit(bar0, sqe) }.map(|_| ())
@@ -2314,7 +2335,7 @@ impl Controller {
             return Err(e);
         }
 
-        let sq_buf = match alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0) {
+        let sq_buf = match alloc_coherent(64 * depth as usize, DomainId::DRIVER_0) {
             Ok(b) => b,
             Err(_) => {
                 self.in_flight_dma.push(cq_buf);
@@ -2338,7 +2359,7 @@ impl Controller {
             let mut sqe = Sqe::zero();
             sqe.cdw0 = AdminOpcode::CreateSq as u32;
             sqe.prp1 = sq_phys;
-            sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
+            sqe.cdw10 = ((depth as u32 - 1) << 16) | (qid as u32);
             sqe.cdw11 = ((qid as u32) << 16) | 1;
             // SAFETY: admin queue + BAR live; SQ DMA fresh.
             unsafe { admin.submit(bar0, sqe) }.map(|_| ())
@@ -2349,21 +2370,16 @@ impl Controller {
             return Err(e);
         }
 
-        Ok(Queue {
+        let bar = *self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        Ok(IoQueue::new(
+            qid,
+            depth,
             sq_buf,
             cq_buf,
-            qid,
-            depth: IO_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1,
-            db_stride: admin_stride,
-            next_cid: 0,
-            stray_aer: [0; (ADMIN_Q_DEPTH - 1) as usize],
-            stray_aer_len: 0,
-            aer_cids: [0; (ADMIN_Q_DEPTH - 1) as usize],
-            aer_cids_len: 0,
-        })
+            bar,
+            admin_stride,
+            Some(vector),
+        ))
     }
 
     /// Create N I/O queue pairs with MSI-X-driven completions, one
@@ -2419,16 +2435,10 @@ impl Controller {
         use core::fmt::Write as _;
         let device = self.device.ok_or(NvmeError::NotReady)?;
 
-        // Clamp the request to our static + hardware bounds. CAP.MQES
-        // is zero-based, so the deepest legal queue depth is MQES+1;
-        // since we use a fixed IO_Q_DEPTH=4 the MQES check only
-        // matters if a vendor advertised <4-deep queues (no real
-        // controller does, but stay defensive). The number of
-        // *queues* doesn't run through MQES — that gates depth — so
-        // strictly we only need the static cap + cpu_count gate here.
-        let cpu_n = narf_lib::smp::cpu_count() as u16;
-        let host_cap = cpu_n.clamp(1, NVME_MAX_IO_QUEUE_PAIRS);
-        let req = requested.max(1).min(host_cap);
+        // One pair per CPU is the most the host can use (Linux
+        // `nvme_setup_io_queues`); the depth of each comes from CAP.MQES
+        // (`io_queue_depth_of`), not from the count.
+        let req = requested.max(1).min(host_io_queue_pairs());
 
         // ── 1. Ask the controller for `req` pairs ─────────────
         // A refusal here is pre-creation (see the error contract
@@ -2441,6 +2451,7 @@ impl Controller {
                     "nvme: Set Features (Number of Queues) failed ({e:?}); \
                      falling back to the single polled I/O queue"
                 );
+                self.io_queue_mode = "polled (Set Features Number of Queues failed)";
                 return Err(NvmeError::Msix);
             }
         };
@@ -2450,6 +2461,7 @@ impl Controller {
         // assumes.
         let granted = req.min(nsqa).min(ncqa);
         if granted == 0 {
+            self.io_queue_mode = "polled (controller granted no I/O queues)";
             return Err(NvmeError::Msix);
         }
 
@@ -2464,25 +2476,37 @@ impl Controller {
             Some(t) => t,
             None => match enable_msix(bus_dev_cap, &device) {
                 Ok(t) => t,
-                Err(_) => return Err(NvmeError::Msix),
+                Err(_) => {
+                    self.io_queue_mode = "polled (MSI-X capability unusable)";
+                    return Err(NvmeError::Msix);
+                }
             },
         };
         // I/O entries start at 1 when the table has room, leaving
         // entry 0 to the admin queue; a one-entry table shares
         // entry 0 (Linux `nvme_create_cq`).
         let io_base: u16 = if msix.size() <= 1 { 0 } else { 1 };
-        if msix.size() < granted + io_base {
+        // The MSI-X table bounds the queue count, it does not forbid the
+        // path: Linux `nvme_setup_irqs` takes however many vectors
+        // `pci_alloc_irq_vectors_affinity` can give (`result - 1` I/O
+        // queues on a table smaller than CPUs + 1). A drive whose table has
+        // fewer entries than this host has CPUs used to fall all the way
+        // back to the single polled queue here.
+        let granted = granted.min(msix.size().saturating_sub(io_base));
+        if granted == 0 {
+            self.io_queue_mode = "polled (MSI-X table has no I/O entry)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
         if msix.alloc_block(granted + io_base).is_err() {
+            self.io_queue_mode = "polled (MSI-X table entries already allocated)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
 
         // ── 3. Per-queue: vector + table entry ─────────────────
         let mut vectors: Vec<u8> = Vec::with_capacity(granted as usize);
-        let mut queues: Vec<Queue> = Vec::with_capacity(granted as usize);
+        let mut queues: Vec<Arc<IoQueue>> = Vec::with_capacity(granted as usize);
         let admin_stride = match self.admin.as_ref() {
             Some(a) => a.db_stride,
             None => {
@@ -2501,13 +2525,21 @@ impl Controller {
         // "program before delivery" (i.e. before the first
         // interrupt could fire), and the first interrupt-eligible
         // event is the first I/O completion, well after enable().
+        // The IDT vector supply bounds the count too (Linux
+        // `pci_alloc_irq_vectors_affinity` returns fewer and
+        // `nvme_setup_io_queues` creates that many): run out after at
+        // least one and that is the queue count.
+        let mut granted = granted;
+        let target_apic = msix_target_apic_id();
         for i in 0..granted {
             let v = match narf_interrupts::vector::alloc() {
                 Ok(v) => v,
+                Err(_) if i > 0 => {
+                    granted = i;
+                    break;
+                }
                 Err(_) => {
-                    for v in vectors {
-                        let _ = narf_interrupts::vector::free(v);
-                    }
+                    self.io_queue_mode = "polled (no free IDT vector)";
                     self.msix = Some(msix);
                     return Err(NvmeError::Msix);
                 }
@@ -2516,11 +2548,12 @@ impl Controller {
             // MSI-X table exclusively (no concurrent writer); the
             // table-slot index was alloc_block'd above.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            if unsafe { msix.program_vector(io_base + i, msix_target_apic_id(), v) }.is_err() {
+            if unsafe { msix.program_vector(io_base + i, target_apic, v) }.is_err() {
                 let _ = narf_interrupts::vector::free(v);
                 for v in vectors {
                     let _ = narf_interrupts::vector::free(v);
                 }
+                self.io_queue_mode = "polled (MSI-X table entry could not be programmed)";
                 self.msix = Some(msix);
                 return Err(NvmeError::Msix);
             }
@@ -2536,29 +2569,35 @@ impl Controller {
             for v in vectors {
                 let _ = narf_interrupts::vector::free(v);
             }
+            self.io_queue_mode = "polled (MSI-X enable failed)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
 
         for i in 0..granted {
             let qid = i + 1; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
-                             // Install the per-queue handler before the CQ exists,
-                             // so a completion can never land on a vector with no
-                             // handler (spurious) — same order as `create_io_queue`.
-            narf_interrupts::install_handler(vectors[i as usize], nvme_io_irq);
-            match self.create_one_msix_queue(qid, io_base + i, admin_stride) {
-                Ok(q) => queues.push(q),
+            let v = vectors[i as usize];
+            match self.create_one_msix_queue(qid, io_base + i, admin_stride, v) {
+                Ok(q) => {
+                    q.set_irq_route(io_base + i, target_apic);
+                    // The queue's handler goes in before the CQ can
+                    // interrupt (the first completion is the first
+                    // I/O's, after this returns).
+                    q.install_isr();
+                    queues.push(q);
+                }
                 Err(e) => {
-                    // Mid-creation failure: park the DMA of the
-                    // pairs that did get created, free every vector
-                    // (handlers included), restore the MSI-X table.
-                    // The controller may still own a half-created
-                    // pair, so the caller must NOT fall back to the
-                    // polled pair — the error propagates as-is (see
-                    // the error contract above).
+                    // Mid-creation failure: the pairs that did get
+                    // created are torn down with the controller NOT
+                    // confirmed stopped (their pages stay out of the
+                    // allocator), every vector is freed (handlers
+                    // included) and the MSI-X table restored. The
+                    // controller may still own a half-created pair, so
+                    // the caller must NOT fall back to the polled pair —
+                    // the error propagates as-is (see the error contract
+                    // above).
                     for q in queues {
-                        self.in_flight_dma.push(q.sq_buf);
-                        self.in_flight_dma.push(q.cq_buf);
+                        q.teardown(false);
                     }
                     for v in vectors {
                         narf_interrupts::dispatch::clear_handler(v);
@@ -2571,16 +2610,12 @@ impl Controller {
         }
 
         // ── 5. Publish ────────────────────────────────────────
-        let mut locks: Vec<IrqSafeSpinLock<()>> = Vec::with_capacity(queues.len());
-        for _ in 0..queues.len() {
-            locks.push(IrqSafeSpinLock::new(()));
-        }
         self.msix = Some(msix);
         self.irq_vector = vectors.first().copied();
         self.io_irq_vectors = vectors;
         self.io_queues = queues;
-        self.io_queue_locks = locks;
-        self.next_queue.store(0, Ordering::Relaxed);
+        self.io_path_dirty = true;
+        self.io_queue_mode = "msix";
 
         Ok(granted as usize)
     }
@@ -2599,14 +2634,67 @@ impl Controller {
         &mut self,
         bus_dev_cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<usize, NvmeError> {
-        match self.create_io_queues_msix(bus_dev_cap, NVME_MAX_IO_QUEUE_PAIRS) {
-            Ok(n) => Ok(n),
+        let n = match self.create_io_queues_msix(bus_dev_cap, host_io_queue_pairs()) {
+            Ok(n) => n,
             Err(NvmeError::Msix) => {
                 self.create_io_queue()?;
-                Ok(1)
+                1
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+        self.log_io_queue_routes();
+        Ok(n)
+    }
+
+    /// The boot-log half of the completion-path self-diagnosis: how many
+    /// I/O queues exist, how they complete, and — for MSI-X queues — each
+    /// queue's IDT vector, MSI-X table entry and target APIC ID. Read with
+    /// the counters in `/proc/narf/nvme_queues` after some I/O, one boot
+    /// tells whether completions arrive by interrupt at all.
+    pub fn log_io_queue_routes(&self) {
+        use core::fmt::Write as _;
+        let mut w = narf_console::Writer;
+        let bdf = controller_bdf(self).map(ns::bdf_string).unwrap_or_default();
+        let _ = write!(
+            w,
+            "nvme: {bdf}: {} I/O queue(s), {}, depth {}, {} CPU(s):",
+            self.io_queues.len(),
+            self.io_queue_mode,
+            self.io_queues.first().map_or(0, |q| q.depth),
+            narf_lib::smp::cpu_count(),
+        );
+        for q in &self.io_queues {
+            let s = q.stats();
+            match (s.vector, s.msix_entry, s.target_apic) {
+                (Some(v), Some(e), Some(a)) => {
+                    let _ = write!(w, " q{} vec {v} msix {e} apic {a};", s.qid);
+                }
+                (Some(v), _, _) => {
+                    let _ = write!(w, " q{} vec {v};", s.qid);
+                }
+                _ => {
+                    let _ = write!(w, " q{} polled;", s.qid);
+                }
+            }
         }
+        let _ = writeln!(w);
+    }
+
+    /// Abort (§5.1, admin opcode 0x08): ask the controller to abort command
+    /// `cid` on I/O submission queue `sqid`. Returns whether it was
+    /// aborted (completion dword 0 bit 0 clear); a command that already
+    /// completed, or one the controller declines to abort, reports
+    /// `false` and completes on its own. Linux `nvme_abort_req`.
+    pub fn abort_command(&mut self, sqid: u16, cid: u16) -> Result<bool, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::Abort as u32;
+        // CDW10 bits[15:0] = SQID, bits[31:16] = CID of the command to abort.
+        sqe.cdw10 = (sqid as u32) | ((cid as u32) << 16);
+        // SAFETY: admin queue + BAR live; Abort carries no data pointer.
+        let cqe = unsafe { admin.submit(bar0, sqe)? };
+        Ok(cqe.cmd_specific & 1 == 0)
     }
 
     // ── Admin: Get Features ───────────────────────────────────────────
@@ -3153,14 +3241,6 @@ impl Controller {
         self.admin.as_ref().map_or(0, |a| a.stray_aer_len)
     }
 
-    /// Per-queue lock count — always equal to `io_queue_count()`.
-    /// Both vecs are populated and cleared together in the
-    /// `create_io_queue*` paths. Exposed for tests.
-    #[inline]
-    pub fn io_queue_lock_count(&self) -> usize {
-        self.io_queue_locks.len()
-    }
-
     // ── Admin: Format NVM ─────────────────────────────────────────────
 
     /// Format NVM (§5.4, opcode 0x80). Reformats `nsid` with LBA format
@@ -3331,218 +3411,36 @@ impl Controller {
         &self.io_irq_vectors
     }
 
-    /// Round-robin pick of an I/O queue index. Returns 0 when only
-    /// one queue exists. Unlocked / lock-free — every submission
-    /// path immediately takes the controller's lock after, so the
-    /// fetch_add isn't load-bearing for safety, just for distribution.
+    /// The I/O queue this CPU submits on (Linux maps each CPU to one
+    /// hardware queue; with fewer queues than CPUs they are shared
+    /// modulo). `None` before any I/O queue exists.
     #[inline]
-    fn pick_queue(&self) -> usize {
-        let n = self.io_queues.len();
-        if n <= 1 {
-            return 0;
-        }
-        self.next_queue.fetch_add(1, Ordering::Relaxed) % n
+    fn pick_queue(&self) -> Option<Arc<IoQueue>> {
+        req::pick_queue(&self.io_queues).cloned()
     }
 
-    /// Submit a prebuilt SQE on I/O queue `qi` and wait for its
-    /// MSI-X completion, draining the CQE carrying our CID (see
-    /// [`Self::try_take_io_cqe`]). Shared core of
-    /// [`Self::submit_io_irq`] and the `nvm_io_*` production paths
-    /// (#928): the wait is IRQ-driven — the dispatch table's
-    /// `fire_count` for the queue's vector, bumped by the ISR —
-    /// with a CQE-phase check as the lost-interrupt fallback (QEMU
-    /// has been observed to lose an MSI on hot reset paths).
-    /// `responsive_spin_until` ticks sleep_pumps so the FB cursor /
-    /// serial drain stay alive. Wall-clock budget [`IO_TIMEOUT_MS`]
-    /// (30 s, Linux `NVME_IO_TIMEOUT`). When it runs out the CQ is
-    /// looked at one last time ([`Self::reap_io_cqe`], Linux
-    /// `nvme_timeout` → `nvme_poll_irqdisable`); only then is the
-    /// command declared lost and the controller marked dead (the
-    /// command's data / PRP-list pages may still be DMA targets).
-    /// The reset + replay happen in the block entry points
-    /// ([`run_with_replay`]), which own the slot. Requires
-    /// `io_irq_vectors[qi]` to exist; callers without a vector use
-    /// the polled [`Queue::submit`] instead.
-    fn submit_sqe_irq(&mut self, qi: usize, mut sqe: Sqe) -> Result<(), NvmeError> {
-        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        let opcode = (sqe.cdw0 & 0xFF) as u8;
-        let started = narf_time::now_cycles();
-        let fires_at_submit = Some(narf_interrupts::fire_count(v));
-        // Test-only fault injection (see [`IO_LOSE_FOR_TEST`] /
-        // [`IO_LATE_FOR_TEST`]).
-        let lose = take_test_fault(&IO_LOSE_FOR_TEST);
-        let late = take_test_fault(&IO_LATE_FOR_TEST);
-        let deadline = narf_time::Deadline::after_ms(io_timeout_ms());
-
-        // Auto-CID + ring SQ tail doorbell. Scoped so the queue
-        // borrow ends before the wait below; the CID is kept for
-        // the drain loop.
-        let cid = {
-            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-            let cid = io.next_cid;
-            io.next_cid = io.next_cid.wrapping_add(1);
-            sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
-            // SAFETY: queue is page-aligned; sq_tail bounded.
-            unsafe {
-                write_sqe(&io.sq_buf, io.sq_tail, &sqe);
-            }
-            io.sq_tail = (io.sq_tail + 1) % io.depth;
-            if !lose {
-                // SAFETY: identity-mapped MMIO doorbell.
-                unsafe {
-                    bar0.write32(io.sq_db_off(), io.sq_tail as u32);
-                }
-            }
-            cid
-        };
-
-        // Wait for OUR completion: loop until the CQE carrying our
-        // CID arrives at the head (see `try_take_io_cqe`). Each
-        // wait is bounded by the shared deadline; the fire_count
-        // baseline is re-read per iteration and the CQE phase is
-        // always re-checked, so an MSI that lands between
-        // iterations cannot be missed.
-        loop {
-            if late {
-                // Injected late completion: ignore the CQ for the
-                // whole budget, so only the last look can find it.
-                let _ = narf_scheduler::responsive_spin_until(|| false, deadline);
-                break;
-            }
-            if self.try_take_io_cqe(qi, cid, opcode)? {
-                return Ok(());
-            }
-            if deadline.expired() {
-                break;
-            }
-            let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
-            let baseline = narf_interrupts::fire_count(v);
-            let done = narf_scheduler::responsive_spin_until(
-                || {
-                    if narf_interrupts::fire_count(v) > baseline {
-                        return true;
-                    }
-                    let Some(io) = self.io_queues.get(qi) else {
-                        return false;
-                    };
-                    // SAFETY: cq_buf is a live identity-mapped DMA page.
-                    let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-                    (cqe.status & 1) == (io.cq_phase & 1)
-                },
-                narf_time::Deadline::after_ms(remaining_ms.max(1)),
-            );
-            if !done {
-                break;
-            }
-        }
-
-        // The budget is spent. One last look at the CQ before the
-        // command is declared lost: the deadline can pass right after
-        // a stray was consumed with ours in the next slot, and Linux
-        // `nvme_timeout` polls the queue for exactly this reason.
-        if self.reap_io_cqe(qi, cid, opcode)? {
-            if let Some(bar0) = self.bar0_region.as_ref() {
-                let qid = self.io_queues.get(qi).map_or(0, |q| q.qid);
-                note_late_completion(bar0.phys.raw(), qid, opcode, cid, started);
-            }
-            return Ok(());
-        }
-        // The command (and its data / PRP-list pages) may still be
-        // live in the device; stop trusting this queue.
-        self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
-        self.dead = true;
-        Err(NvmeError::CompletionTimeout)
+    /// The I/O queues, for the queued data path and the smokes.
+    pub(crate) fn io_queues(&self) -> &[Arc<IoQueue>] {
+        &self.io_queues
     }
 
-    /// Non-blocking drain of I/O queue `qi` for the CQE carrying `cid`:
-    /// consume fresh head entries (strays are counted and dropped by
-    /// [`Self::try_take_io_cqe`]) until ours turns up (`Ok(true)`), the
-    /// head goes stale, or `depth` entries were examined (`Ok(false)`).
-    /// `Err` when ours arrived with a nonzero status.
-    fn reap_io_cqe(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<bool, NvmeError> {
-        let depth = self.io_queues.get(qi).map_or(1, |q| q.depth.max(1));
-        for _ in 0..depth {
-            if self.try_take_io_cqe(qi, cid, opcode)? {
-                return Ok(true);
-            }
-            let Some(io) = self.io_queues.get(qi) else {
-                return Ok(false);
-            };
-            // SAFETY: cq_buf is a live identity-mapped DMA page.
-            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-            if (cqe.status & 1) != (io.cq_phase & 1) {
-                return Ok(false);
-            }
-            // A fresh stray was consumed; look at the next slot.
-        }
-        Ok(false)
+    /// Commands in flight across every I/O queue.
+    pub fn io_in_flight(&self) -> usize {
+        self.io_queues.iter().map(|q| q.in_flight()).sum()
     }
 
-    /// Report a completion timeout of command `cid` on I/O queue `qi`
-    /// ([`log_cmd_timeout`]). Read-only: the caller decides what the
-    /// timeout means for the controller.
-    fn report_io_timeout(
-        &self,
-        qi: usize,
-        opcode: u8,
-        cid: u16,
-        fires_at_submit: Option<u64>,
-        started: Option<u64>,
-    ) {
-        if let (Some(io), Some(bar0)) = (self.io_queues.get(qi), self.bar0_region.as_ref()) {
-            let vector = self.io_irq_vectors.get(qi).copied();
-            log_cmd_timeout(bar0, io, opcode, cid, vector, fires_at_submit, started);
-        }
+    /// The highest in-flight mark any I/O queue reached.
+    pub fn io_peak_in_flight(&self) -> usize {
+        self.io_queues
+            .iter()
+            .map(|q| q.peak_in_flight())
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Try once to consume the CQE carrying `cid` from I/O queue
-    /// `qi`. Returns `Ok(true)` when our CQE arrived (and its NVMe
-    /// status was zero), `Ok(false)` when nothing for us is pending
-    /// — no fresh CQE at the head, or the head CQE was a stray
-    /// (consumed and dropped, never mistaken for ours) — and `Err`
-    /// when our CQE arrived with a nonzero status. Callers loop:
-    /// wait, retry. Shared by the sync and async IRQ-driven I/O
-    /// paths so both match completions by CID.
-    fn try_take_io_cqe(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<bool, NvmeError> {
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: cq_buf is a live identity-mapped DMA page.
-        let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-        if (cqe.status & 1) != (io.cq_phase & 1) {
-            return Ok(false); // no fresh completion at the head
-        }
-        let (head, phase) = (io.cq_head, io.cq_phase);
-        io.advance_head(bar0);
-        if !cqe.is_for(cid) {
-            // Stray completion (another submitter's late CQE, or a
-            // corrupted head): consumed and dropped above, counted
-            // and reported here. The caller waits and retries for
-            // ours.
-            note_stray_cqe(bar0.phys.raw(), io.qid, head, phase, Some(cid), &cqe);
-            return Ok(false);
-        }
-        let nvme_status = cqe.status >> 1;
-        if nvme_status != 0 {
-            return Err(NvmeError::CommandFailed {
-                cmd: opcode,
-                status: nvme_status,
-            });
-        }
-        Ok(true)
-    }
-
-    /// Submit an NVM Read/Write to a round-robin-picked I/O queue
-    /// and wait for MSI-X-delivered completion via
-    /// [`Self::submit_sqe_irq`]. Caller decides between `read_lba`
-    /// (polled) and this for IRQ-driven flows.
-    ///
-    /// Synchronous variant: spins on `fire_count` after submitting;
-    /// the underlying mechanism is the same one `wait_for_irq.await`
-    /// drives, just without an executor. With multi-queue wired the
-    /// queue is picked via `pick_queue` (round-robin AtomicUsize)
-    /// and the wait targets THAT queue's MSI-X vector so completion
-    /// dispatch stays per-CQ.
+    /// Submit an NVM Read/Write to this CPU's I/O queue and wait for its
+    /// completion — IRQ-driven or polled, whichever the queue has — from
+    /// a gate-held caller.
     pub fn submit_io_irq(
         &mut self,
         opcode: u8,
@@ -3550,174 +3448,22 @@ impl Controller {
         n_blocks: u16,
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
-        if self.io_queues.is_empty() {
-            return Err(NvmeError::NoIoQueue);
-        }
-        if n_blocks == 0 {
-            return Ok(());
-        }
-        let sqe = self.build_nvm_sqe(
-            opcode,
-            lba,
-            n_blocks as u32,
-            buf.dma_addr().raw(),
-            buf.len(),
-        )?;
-        let qi = self.pick_queue();
-        self.submit_sqe_irq(qi, sqe)
+        self.nvm_io(opcode, lba, n_blocks, buf)
     }
 
-    /// Begin an IRQ-driven I/O submission: build the SQE, pick a
-    /// queue, write the SQE and ring the doorbell. Returns the
-    /// in-flight command ([`IoInFlight`]); the caller then loops
-    /// "arm a wait ([`IoInFlight::wait`]), check the CQ
-    /// ([`Self::submit_io_poll`]), await the wait" until the poll
-    /// reports the command finished — see
-    /// [`Self::submit_io_irq_async`], which is exactly that loop.
+    /// Async sibling of [`Self::submit_io_irq`] for callers that hold
+    /// `&mut Controller` across the await (smokes; the production async
+    /// path is [`req::NvmeRequest`], which holds no controller borrow):
+    /// post the command on this CPU's queue and await its completion.
+    /// The command shares the queue with everything else in flight.
     ///
-    /// This is the `block_on` / `IrqSafeSpinLock`-across-await
-    /// restructure (AGENTS.md): NO await happens here and NO
-    /// borrow is held across the caller's await — the wait future
-    /// owns only the vector + its `fire_count` baseline, so the
-    /// caller may release the slot gate (an atomic, never an
-    /// IRQ-masking lock) before awaiting, then re-acquire and call
-    /// `submit_io_poll`. The per-queue locks are only ever held in
-    /// the short sync phases on either side of the await, never
-    /// across it; no `block_on` appears anywhere on this path.
+    /// `buf` is borrowed, not pinned: the caller keeps it alive until the
+    /// future resolves. Dropping the future before then abandons the
+    /// command — its tag and PRP page stay held until the completion
+    /// lands — but the caller's buffer is its own to keep alive.
     ///
-    /// No wait needs to exist before the doorbell: every wait is
-    /// armed *before* the CQ check that follows it, so a completion
-    /// whose interrupt fired before the wait was armed is already in
-    /// the CQ when that check runs, and one that fires after is seen
-    /// by the wait.
-    ///
-    /// `n_blocks == 0` is a [`NvmeError::BadTransfer`] here (via
-    /// `build_nvm_sqe`); callers that treat empty transfers as
-    /// success check first, as [`Self::submit_io_irq_async`] does.
-    pub fn submit_io_begin(
-        &mut self,
-        opcode: u8,
-        lba: u64,
-        n_blocks: u16,
-        buf: &DmaBuffer,
-    ) -> Result<IoInFlight, NvmeError> {
-        if self.io_queues.is_empty() {
-            return Err(NvmeError::NoIoQueue);
-        }
-        let mut sqe = self.build_nvm_sqe(
-            opcode,
-            lba,
-            n_blocks as u32,
-            buf.dma_addr().raw(),
-            buf.len(),
-        )?;
-        let qi = self.pick_queue();
-        let vector = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
-        let started = narf_time::now_cycles();
-        let fires_at_submit = narf_interrupts::fire_count(vector);
-        // The same budget as the sync path (Linux `NVME_IO_TIMEOUT`).
-        let deadline = narf_time::Deadline::after_ms(io_timeout_ms());
-
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        let cid = io.next_cid;
-        io.next_cid = io.next_cid.wrapping_add(1);
-        sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
-        // SAFETY: queue page-aligned; sq_tail bounded.
-        unsafe {
-            write_sqe(&io.sq_buf, io.sq_tail, &sqe);
-        }
-        io.sq_tail = (io.sq_tail + 1) % io.depth;
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe {
-            bar0.write32(io.sq_db_off(), io.sq_tail as u32);
-        }
-        Ok(IoInFlight {
-            qi,
-            cid,
-            opcode,
-            vector,
-            deadline,
-            started,
-            fires_at_submit,
-        })
-    }
-
-    /// Check on command `io` begun by [`Self::submit_io_begin`], on
-    /// the queue it was submitted on. Never blocks.
-    ///
-    /// - `Ok(true)`: its completion was consumed (status zero). Done.
-    /// - `Ok(false)`: not completed yet and the budget is not spent.
-    ///   Whatever woke the caller — another queue's interrupt on a
-    ///   shared vector, the late MSI of an earlier polled Flush on
-    ///   this queue, the wait's poll slice running out — was not
-    ///   this command's completion, and that is not an error: await
-    ///   a fresh [`IoInFlight::wait`] and poll again. Strays at the
-    ///   CQ head are consumed, counted and dropped on the way.
-    /// - `Err(CommandFailed)`: it completed with an error status.
-    /// - `Err(CompletionTimeout)`: the budget is spent and one last
-    ///   look at the CQ did not find it. The controller is marked
-    ///   dead — the command may still be live in the device, so its
-    ///   buffers must not be reused or freed until the controller is
-    ///   reset. A completion found by that last look is `Ok(true)`
-    ///   (counted as a late completion).
-    pub fn submit_io_poll(&mut self, io: &IoInFlight) -> Result<bool, NvmeError> {
-        let expired = io.deadline.expired();
-        if self.reap_io_cqe(io.qi, io.cid, io.opcode)? {
-            if expired {
-                if let Some(bar0) = self.bar0_region.as_ref() {
-                    let qid = self.io_queues.get(io.qi).map_or(0, |q| q.qid);
-                    note_late_completion(bar0.phys.raw(), qid, io.opcode, io.cid, io.started);
-                }
-            }
-            return Ok(true);
-        }
-        if !expired {
-            return Ok(false);
-        }
-        self.report_io_timeout(
-            io.qi,
-            io.opcode,
-            io.cid,
-            Some(io.fires_at_submit),
-            Some(io.started),
-        );
-        self.dead = true;
-        Err(NvmeError::CompletionTimeout)
-    }
-
-    /// Async sibling of `submit_io_irq`. Submits the command, then
-    /// parks on the queue's MSI-X vector instead of spinning on
-    /// `fire_count`. Lets the executor run other tasks during the
-    /// I/O — the difference between "kernel pauses for the entire
-    /// I/O" and "kernel does other work while the device is busy".
-    ///
-    /// The wait is a loop, not a single await: arm a wait, check the
-    /// CQ, await, repeat, until the command's shared deadline
-    /// ([`IO_TIMEOUT_MS`]). A wake that is not this command's
-    /// completion just goes round again, and each wait is also
-    /// bounded by [`ASYNC_CQ_POLL_MS`], so a completion whose
-    /// interrupt never arrives is found by the next CQ check instead
-    /// of costing the whole budget. Only when the deadline has
-    /// passed and a last look at the CQ still finds nothing is the
-    /// command declared lost (controller dead, `CompletionTimeout`).
-    ///
-    /// The composed form still holds `&mut self` — i.e. the slot
-    /// gate — across the await: that is sound here because the gate
-    /// is an atomic that leaves IRQs live (no `IrqSafeSpinLock` is
-    /// held across the suspension point), so the MSI wake can fire;
-    /// the cost is whole-controller serialisation for the I/O
-    /// duration, the same as the sync path. Callers that need the
-    /// gate released across the await use `submit_io_begin` /
-    /// `submit_io_poll` directly. Completion matching is CID-aware
-    /// (see [`Self::try_take_io_cqe`]); true concurrency still needs
-    /// a per-queue CID waiter table + the `InstalledController`
-    /// request-gate → async-Mutex migration, so until then one async
-    /// I/O is in flight per controller.
-    ///
-    /// Dropping the future before it resolves abandons the command
-    /// in the device; its completion is then a stray for the next
-    /// submitter (consumed, counted, logged).
+    /// A completion timeout marks the controller dead and returns
+    /// [`NvmeError::CompletionTimeout`]; the reset is the caller's.
     pub async fn submit_io_irq_async(
         &mut self,
         opcode: u8,
@@ -3731,44 +3477,49 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let io = self.submit_io_begin(opcode, lba, n_blocks, buf)?;
-        loop {
-            // Arm BEFORE the check: see `submit_io_begin`.
-            let wait = io.wait();
-            if self.submit_io_poll(&io)? {
-                return Ok(());
+        let ns = self.primary_geom();
+        let q = self.pick_queue().ok_or(NvmeError::NoIoQueue)?;
+        let (sqe, res) = self.build_nvm_sqe_ns(
+            &q,
+            ns,
+            false,
+            opcode,
+            lba,
+            n_blocks as u32,
+            buf.dma_addr().raw(),
+            buf.len(),
+        )?;
+        let tag = alloc_tag_sync(&q).ok_or(NvmeError::CompletionTimeout)?;
+        let id = q.post(tag, sqe, res)?;
+        let mut cmd = Cmd::new(Arc::clone(&q), id);
+        let outcome = core::future::poll_fn(|cx| cmd.poll_outcome(cx)).await;
+        match outcome {
+            CmdOutcome::Completed { status: 0, .. } => Ok(()),
+            CmdOutcome::Completed { status, .. } => Err(NvmeError::CommandFailed {
+                cmd: opcode,
+                status,
+            }),
+            CmdOutcome::Reset => Err(NvmeError::ControllerDead),
+            CmdOutcome::TimedOut => {
+                q.report_timeout(tag);
+                drop(cmd);
+                self.mark_dead();
+                Err(NvmeError::CompletionTimeout)
             }
-            // Either outcome — the vector fired, or the slice ran out —
-            // means "look at the CQ again".
-            let _ = wait.await;
         }
     }
 
     /// Validate an NVM Read/Write against the controller and namespace
     /// limits and build its SQE, including the data pointer for the
     /// physically contiguous buffer at device address `dma` of `len`
-    /// bytes.
-    ///
-    /// PRPs follow Linux `nvme_pci_setup_data_prp` (see [`prp`]); a
-    /// transfer longer than two pages writes its list into the
-    /// controller's persistent `prp_list` page, which is safe to reuse
-    /// because every caller holds `&mut self` until the CQE is consumed.
-    fn build_nvm_sqe(
-        &mut self,
-        opcode: u8,
-        lba: u64,
-        n_blocks: u32,
-        dma: u64,
-        len: usize,
-    ) -> Result<Sqe, NvmeError> {
-        let ns = self.primary_geom();
-        self.build_nvm_sqe_ns(ns, false, opcode, lba, n_blocks, dma, len)
-    }
-
-    /// [`Self::build_nvm_sqe`] against namespace `ns`.
+    /// bytes. A transfer longer than two pages gets its PRP list in a
+    /// page from `q`'s pool, returned in the command's resources so it
+    /// lives exactly as long as the command (Linux `nvme_pci_setup_data_prp`
+    /// + the per-request `iod` list).
     #[allow(clippy::too_many_arguments)]
     fn build_nvm_sqe_ns(
-        &mut self,
+        &self,
+        q: &IoQueue,
         ns: ns::NamespaceInfo,
         fua: bool,
         opcode: u8,
@@ -3776,70 +3527,22 @@ impl Controller {
         n_blocks: u32,
         dma: u64,
         len: usize,
-    ) -> Result<Sqe, NvmeError> {
+    ) -> Result<(Sqe, CmdResources), NvmeError> {
         if self.dead {
             return Err(NvmeError::ControllerDead);
         }
-        if !ns.usable {
-            return Err(NvmeError::NamespaceUnusable);
-        }
-        // NLB is a 16-bit zero-based field (NVM Command Set §3.2.4).
-        if n_blocks == 0 || n_blocks > 0x1_0000 {
-            return Err(NvmeError::BadTransfer);
-        }
-        if lba
-            .checked_add(n_blocks as u64)
-            .is_none_or(|end| end > ns.nsze)
-        {
-            return Err(NvmeError::OutOfRange);
-        }
-        let bytes = n_blocks as u64 * ns.lba_bytes as u64;
-        if bytes > len as u64 {
-            return Err(NvmeError::BadTransfer);
-        }
-        if bytes > self.max_transfer as u64 {
-            return Err(NvmeError::ExceedsMaxTransfer);
-        }
-        let bytes = bytes as usize;
-        let pair = match self.prp_list.as_ref() {
-            Some(list) => {
-                // SAFETY: `list` is this controller's persistent 4 KiB
-                // coherent page (PRPS_PER_PAGE u64 entries, page aligned);
-                // `&mut self` excludes every other I/O path, and no
-                // command referencing it is in flight (each path consumes
-                // its CQE before returning, and a timeout marks the
-                // controller dead, refused above).
-                let entries = unsafe {
-                    core::slice::from_raw_parts_mut(list.cpu_mut_ptr::<u64>(), prp::PRPS_PER_PAGE)
-                };
-                prp::setup_prps(dma, bytes, entries, &[list.dma_addr().raw()])
-            }
-            None => prp::setup_prps(dma, bytes, &mut [], &[]),
-        }
-        .map_err(|e| match e {
-            prp::PrpError::ListTooSmall => NvmeError::ExceedsMaxTransfer,
-            _ => NvmeError::BadTransfer,
-        })?;
-        // Publish the list entries before the SQE + doorbell that let
-        // the controller fetch them.
-        compiler_fence(Ordering::Release);
-
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = opcode as u32;
-        sqe.nsid = ns.nsid;
-        sqe.prp1 = pair.prp1;
-        sqe.prp2 = pair.prp2;
-        // CDW10/11 = SLBA (64-bit, little-endian split).
-        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
-        sqe.cdw11 = (lba >> 32) as u32;
-        // CDW12 bits[15:0] = NLB-1; bit 30 = FUA (NVM Command Set 1.0c
-        // Figure 63: the write is on media before completion), as Linux
-        // `nvme_setup_rw` sets for `REQ_FUA`. LR / PRINFO stay zero.
-        sqe.cdw12 = n_blocks - 1;
-        if fua && opcode == IoOpcode::Write as u8 {
-            sqe.cdw12 |= shutdown::CDW12_FUA;
-        }
-        Ok(sqe)
+        req::build_rw_sqe(
+            q,
+            ns,
+            self.max_transfer,
+            fua,
+            opcode,
+            lba,
+            n_blocks,
+            dma,
+            len,
+            None,
+        )
     }
 
     /// Polled NVM Read/Write of `n_blocks` LBAs at `lba` into / from the
@@ -3862,20 +3565,11 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let sqe = self.build_nvm_sqe_ns(ns, fua, opcode, lba, n_blocks, dma, len)?;
-        let qi = self.pick_queue();
-        // IRQ path when this queue has a vector (#928): the
-        // completion wait is MSI-X-driven instead of MMIO polling.
-        // The polled submit stays the fallback for vector-less
-        // boots (no MSI-X, or the single-queue path without a
-        // spare vector).
-        if self.io_irq_vectors.get(qi).is_some() {
-            return self.submit_sqe_irq(qi, sqe);
-        }
-        // The data range and the PRP-list page are DMA memory that
-        // outlives the command (the caller owns the data buffer across
-        // this synchronous call; the list is persistent).
-        self.submit_sqe_polled(qi, sqe, io_timeout_ms()).map(|_| ())
+        let q = self.pick_queue().ok_or(NvmeError::NoIoQueue)?;
+        let (sqe, res) = self.build_nvm_sqe_ns(&q, ns, fua, opcode, lba, n_blocks, dma, len)?;
+        // The data range is the caller's, live across this synchronous
+        // call; the PRP page travels with the command.
+        self.submit_io_sync(sqe, res).map(|_| ())
     }
 
     /// Polled NVM Read/Write of `n_blocks` LBAs to / from `buf` starting
@@ -3944,9 +3638,9 @@ impl Controller {
 
     /// Multi-page PRP-list NVM I/O over a caller-supplied list of
     /// (not necessarily contiguous) 4 KiB pages. See `read_lba_pages`
-    /// for the public-API contract. The list entries go into the
-    /// persistent `prp_list` page, so no list memory is freed while the
-    /// controller might still read it.
+    /// for the public-API contract. The list entries go into a page from
+    /// the queue's pool that travels with the command, so no list memory
+    /// is freed while the controller might still read it.
     fn nvm_io_multipage(
         &mut self,
         opcode: u8,
@@ -3963,74 +3657,44 @@ impl Controller {
         if self.dead {
             return Err(NvmeError::ControllerDead);
         }
-        if !self.ns_usable {
-            return Err(NvmeError::NamespaceUnusable);
-        }
-        if lba
-            .checked_add(n_blocks as u64)
-            .is_none_or(|end| end > self.nsze)
-        {
-            return Err(NvmeError::OutOfRange);
-        }
-        let bytes = n_blocks as u64 * self.lba_bytes as u64;
-        if bytes > pages.len() as u64 * PAGE_SIZE {
-            return Err(NvmeError::BadTransfer);
-        }
-        if bytes > self.max_transfer as u64 {
-            return Err(NvmeError::ExceedsMaxTransfer);
-        }
-        if pages.iter().any(|p| p.raw() & (PAGE_SIZE - 1) != 0) {
-            return Err(NvmeError::BadTransfer);
-        }
-        // Only the pages the transfer actually touches become PRPs.
-        let used = (bytes as usize).div_ceil(PAGE_SIZE as usize);
-        let pages = &pages[..used];
-
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = opcode as u32;
-        sqe.nsid = self.primary_nsid;
-        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
-        sqe.cdw11 = (lba >> 32) as u32;
-        sqe.cdw12 = (n_blocks - 1) as u32;
-        sqe.prp1 = pages[0].raw();
-
-        match pages.len() {
-            1 => sqe.prp2 = 0,
-            2 => sqe.prp2 = pages[1].raw(),
-            _ => {
-                // One list page holds PRPS_PER_PAGE entries; the
-                // max-transfer clamp (≤ 2 MiB) keeps `pages.len() - 1`
-                // within it, so no chaining is needed here.
-                let entries = pages.len() - 1;
-                if entries > prp::PRPS_PER_PAGE {
-                    return Err(NvmeError::TooManyPages);
-                }
-                let list = self.prp_list.as_ref().ok_or(NvmeError::OutOfDmaMemory)?;
-                // SAFETY: persistent 4 KiB coherent list page owned by
-                // this controller; `&mut self` excludes other I/O and no
-                // command referencing it is in flight (dead checked
-                // above). `entries` ≤ PRPS_PER_PAGE.
-                unsafe {
-                    let entries_ptr = list.cpu_mut_ptr::<u64>();
-                    for (i, p) in pages[1..].iter().enumerate() {
-                        core::ptr::write_volatile(entries_ptr.add(i), p.raw());
-                    }
-                }
-                compiler_fence(Ordering::Release);
-                sqe.prp2 = list.dma_addr().raw();
-            }
-        }
-
-        let qi = self.pick_queue();
-        // IRQ path when this queue has a vector (#928); polled
-        // submit stays the fallback for vector-less boots.
-        if self.io_irq_vectors.get(qi).is_some() {
-            return self.submit_sqe_irq(qi, sqe);
-        }
-        // The caller's pages and the persistent PRP-list page stay
-        // mapped across this synchronous submit.
-        self.submit_sqe_polled(qi, sqe, io_timeout_ms()).map(|_| ())
+        let ns = self.primary_geom();
+        let segs: Vec<(u64, u32)> = pages.iter().map(|p| (p.raw(), PAGE_SIZE as u32)).collect();
+        let q = self.pick_queue().ok_or(NvmeError::NoIoQueue)?;
+        let (sqe, res) = req::build_rw_sqe_segments(
+            &q,
+            ns,
+            self.max_transfer,
+            false,
+            opcode,
+            lba,
+            n_blocks as u32,
+            &segs,
+            None,
+        )?;
+        self.submit_io_sync(sqe, res).map(|_| ())
     }
+}
+
+/// Take a tag from `q` for a synchronous submitter, waiting (responsively,
+/// no lock held) for one to come free; `None` when none did within the
+/// I/O budget — the queue is wedged, which the caller reports as a
+/// timeout.
+fn alloc_tag_sync(q: &IoQueue) -> Option<u16> {
+    if let Some(t) = q.try_alloc_tag(None) {
+        return Some(t);
+    }
+    let mut tag = None;
+    narf_scheduler::responsive_spin_until(
+        || {
+            if q.cq_has_fresh() {
+                q.process_cq(false);
+            }
+            tag = q.try_alloc_tag(None);
+            tag.is_some()
+        },
+        narf_time::Deadline::after_ms(io_timeout_ms()),
+    );
+    tag
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -4284,6 +3948,83 @@ fn log_cmd_timeout(
     );
 }
 
+/// [`log_cmd_timeout`] for a queued-submission I/O queue, whose cursor
+/// the caller has already sampled.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_io_timeout(
+    bar0: &MmioRegion,
+    qid: u16,
+    cq_head: u16,
+    cq_phase: u16,
+    head: Cqe,
+    sq_tail: u16,
+    opcode: u8,
+    cid: u16,
+    vector: Option<u8>,
+    fires_at_submit: Option<u64>,
+    started: Option<u64>,
+) {
+    use core::fmt::Write as _;
+    let n = CMD_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // SAFETY: BAR0 is this controller's mapped register window; CSTS is a
+    // read-only, side-effect-free register.
+    let csts = unsafe { bar0.read32(REG_CSTS) };
+    let fresh = (head.status & 1) == (cq_phase & 1);
+    let mut w = narf_console::Writer;
+    let _ = write!(
+        w,
+        "nvme: bar {:#x}: ERROR: command timeout #{n}: opcode {opcode:#04x} cid {cid:#06x} \
+         queue {qid}",
+        bar0.phys.raw(),
+    );
+    match started {
+        Some(t) => {
+            let ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(t)) / 1_000_000;
+            let _ = write!(w, " after {ms} ms");
+        }
+        None => {
+            let _ = write!(w, " (elapsed n/a)");
+        }
+    }
+    let _ = write!(
+        w,
+        "; cq head {cq_head} phase {} head-cqe[{} cid {:#06x} sqid {} sqhd {} status {:#06x}]; \
+         sq tail {sq_tail}; csts {csts:#x}",
+        cq_phase & 1,
+        if fresh { "FRESH" } else { "stale" },
+        head.cid,
+        head.sq_id,
+        head.sq_head,
+        head.status >> 1,
+    );
+    match vector {
+        Some(v) => {
+            let fires = narf_interrupts::fire_count(v);
+            let _ = write!(w, "; vector {v} fire_count {fires}");
+            if let Some(f0) = fires_at_submit {
+                let _ = write!(w, " (+{} since submit)", fires.saturating_sub(f0));
+            }
+        }
+        None => {
+            let _ = write!(w, "; vector none (polled)");
+        }
+    }
+    let _ = writeln!(
+        w,
+        "; irqs {}{}",
+        if narf_memory::context::irqs_enabled() {
+            "enabled"
+        } else {
+            "DISABLED"
+        },
+        if narf_lib::context::in_irq() {
+            ", in irq"
+        } else {
+            ""
+        },
+    );
+}
+
 /// Commands whose completion was only found by the last look at the CQ
 /// after their budget ran out (see [`note_late_completion`]).
 static LATE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
@@ -4308,14 +4049,28 @@ pub fn io_replays() -> u64 {
 /// queue means the interrupt and the phase check both failed to end the
 /// wait in time. Linux `nvme_timeout`: "I/O tag %d (%04x) QID %d timeout,
 /// completion polled".
-fn note_late_completion(bar: u64, qid: u16, opcode: u8, cid: u16, started: u64) {
+///
+/// `irq_missed` is the IRQ-driven-queue case: the handler never published
+/// this completion, so the interrupt was lost or never delivered. Logged
+/// with Linux's `nvme_timeout` text, rate-limited (the first 8, then every
+/// 64th) so a drive whose interrupts never arrive does not flood the
+/// console; the per-queue counts stay in `/proc/narf/nvme_queues`.
+fn note_late_completion(bar: u64, qid: u16, opcode: u8, cid: u16, started: u64, irq_missed: bool) {
     use core::fmt::Write as _;
     let n = LATE_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 8 && n % 64 != 0 {
+        return;
+    }
     let ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started)) / 1_000_000;
+    let why = if irq_missed {
+        "interrupt missed"
+    } else {
+        "late completion"
+    };
     let _ = writeln!(
         narf_console::Writer,
-        "nvme: bar {bar:#x}: WARNING: opcode {opcode:#04x} cid {cid:#06x} queue {qid} timed out \
-         after {ms} ms, completion polled (late completion #{n})"
+        "nvme: bar {bar:#x}: I/O tag {cid} ({cid:04x}) QID {qid} timeout, completion polled \
+         (opcode {opcode:#04x}, after {ms} ms; {why} #{n})"
     );
 }
 
@@ -4665,28 +4420,19 @@ impl BlockDevice for NvmeBlockDevice {
         }
     }
 
+    /// Queued on the submitting CPU's I/O queue of `nvme0` (see
+    /// [`req::NvmeQueue`]): the future is pending until the command's
+    /// completion, beside every other request in flight.
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
-        // Resolve the cap → DmaBuffer up front. A revoked or stale
-        // cap fails `check_live` inside `narf_io::resolve_cap`,
-        // which short-circuits to `PermissionDenied` below.
-        let buffer = narf_io::resolve_cap(&req.buffer);
-        let result = nvme_submit_blocking(&req, buffer);
-        async move {
-            BlockCompletion {
-                tag: 0,
-                user_tag: req.user_tag,
-                result,
-            }
-        }
+        primary_queue().submit(req)
     }
     /// NVMe Flush of the primary namespace when the controller has a
     /// volatile write cache (see [`Controller::flush_nsid`]).
     async fn flush(&self) {
-        let _ = nvme_flush_primary();
+        let _ = primary_queue().flush().await;
     }
     fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
-        let r = nvme_flush_primary();
-        async move { r }
+        primary_queue().flush()
     }
     async fn discard(&self, r: LbaRange) {
         // Fire-and-forget at the trait, but the Dataset Management
@@ -4698,106 +4444,61 @@ impl BlockDevice for NvmeBlockDevice {
         // believing a range was deallocated when it was not (#927).
         let _ = nvme_discard_primary(&[r]);
     }
-    async fn cancel(&self, _tag: u64) -> CancelResult {
-        // Polled completions are synchronous from the caller's POV,
-        // so there is nothing to cancel by the time the future
-        // suspends. Real cancel arrives with the queued submission
-        // model.
-        CancelResult::NotFound
+    fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult> + Send {
+        primary_queue().cancel(tag)
     }
 }
 
-fn nvme_submit_blocking(
-    req: &BlockRequest,
-    buffer: Option<alloc::sync::Arc<DmaBuffer>>,
-) -> Result<(), BlockError> {
-    let buffer = buffer.ok_or(BlockError::PermissionDenied)?;
-    if req.blocks == 0 {
-        return Ok(());
+/// `nvme0`'s primary namespace as a block queue.
+fn primary_queue() -> req::NvmeQueue {
+    let nsid = with_controller(|c| c.primary_nsid).unwrap_or(DEFAULT_NSID);
+    req::NvmeQueue { instance: 0, nsid }
+}
+
+/// Dataset Management (Deallocate) of `blocks` LBAs at `lba` of namespace
+/// `nsid` on controller `instance` — the queue's `BlockOp::Trim`. A
+/// controller without ONCS Dataset Management fails it
+/// (`NvmeError::NotImplemented` → `IOError`), never a silent success.
+fn nvme_discard_ns(instance: u32, nsid: u32, lba: u64, blocks: u32) -> Result<(), BlockError> {
+    let slot = slot_of(instance).ok_or(BlockError::DeviceRemoved)?;
+    let ctrl = acquire_live(slot)?;
+    run_with_replay(slot, ctrl, "discard", |ctrl| {
+        let ns = ctrl.ns_geom(nsid).ok_or(NvmeError::NamespaceUnusable)?;
+        ctrl.dataset_mgmt_ns(
+            ns,
+            &[LbaRange {
+                start: lba,
+                blocks: blocks as u64,
+            }],
+        )
+    })
+    .map_err(map_nvme_err)
+}
+
+/// Write Zeroes of `blocks` LBAs at `lba` of namespace `nsid` on controller
+/// `instance` — the queue's `BlockOp::WriteZeroes`.
+fn nvme_write_zeroes_ns(instance: u32, nsid: u32, lba: u64, blocks: u32) -> Result<(), BlockError> {
+    let slot = slot_of(instance).ok_or(BlockError::DeviceRemoved)?;
+    let ctrl = acquire_live(slot)?;
+    run_with_replay(slot, ctrl, "write-zeroes", |ctrl| {
+        let ns = ctrl.ns_geom(nsid).ok_or(NvmeError::NamespaceUnusable)?;
+        ctrl.write_zeroes_ns(ns, lba, blocks as u64)
+    })
+    .map_err(map_nvme_err)
+}
+
+/// Take `slot`'s gate on a live controller: one left dead by an earlier
+/// request (its replays ran out, or the reset at the timeout failed) is
+/// reset again first (see `recover_slot`), the guard dropped and retaken
+/// around the recovery, which takes the gate itself.
+fn acquire_live(slot: &'static InstalledController) -> Result<ControllerGuard, BlockError> {
+    let ctrl = acquire(slot).map_err(map_nvme_err)?;
+    if !ctrl.is_dead() {
+        return Ok(ctrl);
     }
-    // Interrupts stay enabled for the whole transfer: hold the
-    // device's request gate, not the IRQ-masking CONTROLLERS lock.
-    // See `InstalledController`.
-    let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot).map_err(map_nvme_err)?;
-    if ctrl.is_dead() {
-        // An earlier request left the controller dead (its replays ran
-        // out, or the reset at the timeout failed). Try the reset again
-        // before refusing this request too (see `recover_slot`). The
-        // guard is dropped first: recovery takes the gate itself.
-        drop(ctrl);
-        recover_slot(0).map_err(map_nvme_err)?;
-        ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
-    }
-    // Trim and WriteZeroes move no data: they issue their own
-    // opcodes against the namespace and never touch the request's
-    // buffer (the pre-fix code wrote the buffer's stale contents
-    // for WriteZeroes and silently succeeded for Trim, #927). A
-    // controller without the ONCS bit fails the request via
-    // `NvmeError::NotImplemented` — never a silent success.
-    let (opcode, fua, what) = match req.op {
-        BlockOp::Read => (IoOpcode::Read as u8, false, "read"),
-        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua, "write"),
-        BlockOp::Trim => {
-            return run_with_replay(slot, ctrl, "discard", |ctrl| {
-                let ns = ctrl.primary_geom();
-                ctrl.dataset_mgmt_ns(
-                    ns,
-                    &[LbaRange {
-                        start: req.lba,
-                        blocks: req.blocks as u64,
-                    }],
-                )
-            })
-            .map_err(map_nvme_err);
-        }
-        BlockOp::WriteZeroes => {
-            return run_with_replay(slot, ctrl, "write-zeroes", |ctrl| {
-                let ns = ctrl.primary_geom();
-                ctrl.write_zeroes_ns(ns, req.lba, req.blocks as u64)
-            })
-            .map_err(map_nvme_err);
-        }
-    };
-    let lba_bytes = ctrl.lba_bytes as u64;
-    let total_bytes = (req.blocks as u64)
-        .checked_mul(lba_bytes)
-        .ok_or(BlockError::InvalidRange)?;
-    if (buffer.len() as u64) < total_bytes {
-        return Err(BlockError::InvalidRange);
-    }
-    // `alloc_coherent` buffers are physically contiguous, so each
-    // command takes a window of the buffer and the PRPs are built over
-    // it. Split at the controller's maximum transfer (MDTS), the way
-    // the Linux block layer splits at `max_hw_sectors`.
-    //
-    // A replay (see `run_with_replay`) restarts the request at its first
-    // block. The buffer is the caller's, pinned by the `Arc` for this
-    // whole call and written by nobody else: a write's payload is intact
-    // for the replay, and a read's destination is simply filled again.
-    let result = run_with_replay(slot, ctrl, what, |ctrl| {
-        let per_cmd = core::cmp::max(1, ctrl.max_transfer_bytes() as u64 / lba_bytes) as u32;
-        let mut done: u32 = 0;
-        while done < req.blocks {
-            let n = core::cmp::min(per_cmd, req.blocks - done);
-            let ns = ctrl.primary_geom();
-            ctrl.nvm_io_ns_at(
-                ns,
-                fua,
-                opcode,
-                req.lba.saturating_add(done as u64),
-                n,
-                &buffer,
-                (done as u64 * lba_bytes) as usize,
-            )?;
-            done += n;
-        }
-        Ok(())
-    });
-    if matches!(result, Err(NvmeError::CompletionTimeout)) {
-        retain_buffer_while_device_live(slot, &buffer);
-    }
-    result.map_err(map_nvme_err)
+    drop(ctrl);
+    recover_slot(slot.instance).map_err(map_nvme_err)?;
+    acquire(slot).map_err(map_nvme_err)
 }
 
 /// Request buffers kept alive forever because a timed-out command might
@@ -4808,38 +4509,6 @@ static RETAINED_IO_BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// from being recycled.
 pub fn retained_io_buffers() -> u64 {
     RETAINED_IO_BUFFERS.load(Ordering::Relaxed)
-}
-
-/// A request on `slot` using the caller's `buffer` failed with a command
-/// timeout. Linux `nvme_timeout` disables the controller
-/// (`nvme_dev_disable`) before it completes the request, so the request's
-/// pages are never handed back under a live command; here the reset at the
-/// timeout site ([`run_with_replay`]) normally does the same. When it
-/// could not — the controller is still dead and was never confirmed
-/// disabled (CSTS.RDY would not drop, the function is gone, the final
-/// shutdown has begun, or the gate cannot even be taken to find out) —
-/// the device may yet write a late read's data into the buffer, so one
-/// reference to it is leaked: the memory can then never be recycled under
-/// that write, exactly as [`Controller::disable_after_failure`] leaks the
-/// queues when RDY never clears.
-fn retain_buffer_while_device_live(
-    slot: &'static InstalledController,
-    buffer: &alloc::sync::Arc<DmaBuffer>,
-) {
-    use core::fmt::Write as _;
-    let quiet = acquire(slot).is_ok_and(|ctrl| !ctrl.may_still_dma());
-    if quiet {
-        return;
-    }
-    core::mem::forget(alloc::sync::Arc::clone(buffer));
-    RETAINED_IO_BUFFERS.fetch_add(1, Ordering::Relaxed);
-    let _ = writeln!(
-        narf_console::Writer,
-        "nvme: {}: ERROR: controller not confirmed disabled after a command timeout; \
-         keeping the request's {} byte DMA buffer alive forever (the device may still write it)",
-        ns::controller_name(slot.instance),
-        buffer.len(),
-    );
 }
 
 /// Dataset Management (Deallocate) over `ranges` of the primary
@@ -4856,22 +4525,6 @@ fn nvme_discard_primary(ranges: &[LbaRange]) -> Result<(), BlockError> {
     run_with_replay(slot, ctrl, "discard", |ctrl| {
         let ns = ctrl.primary_geom();
         ctrl.dataset_mgmt_ns(ns, ranges)
-    })
-    .map_err(map_nvme_err)
-}
-
-fn nvme_flush_primary() -> Result<(), BlockError> {
-    let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot).map_err(map_nvme_err)?;
-    if ctrl.is_dead() {
-        // Same dead-controller recovery as the submit path.
-        drop(ctrl);
-        recover_slot(0).map_err(map_nvme_err)?;
-        ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
-    }
-    run_with_replay(slot, ctrl, "flush", |ctrl| {
-        let nsid = ctrl.primary_nsid;
-        ctrl.flush_nsid(nsid)
     })
     .map_err(map_nvme_err)
 }
@@ -4989,7 +4642,18 @@ struct InstalledController {
     /// pair (`resume_slot`); install and the final shutdown are the
     /// only other accessor / reader.
     shutdown_regs: IrqSafeSpinLock<Option<(MmioRegion, u64)>>,
+    /// The gate-free data path's snapshot of the controller (see
+    /// `Controller::io_path`), published by `ControllerGuard::drop`. Held
+    /// only to clone the `Arc` out.
+    io_path: IrqSafeSpinLock<Option<Arc<req::IoPath>>>,
     ctrl: UnsafeCell<Controller>,
+}
+
+impl InstalledController {
+    /// The current I/O path, `None` while the controller cannot take I/O.
+    fn io_path(&self) -> Option<Arc<req::IoPath>> {
+        self.io_path.lock().clone()
+    }
 }
 
 // SAFETY: all access to `ctrl` goes through `req_gate` (see `acquire` —
@@ -5033,9 +4697,10 @@ fn shutdown_regs_of(ctrl: &Controller) -> Option<(MmioRegion, u64)> {
 fn leak_slot(
     instance: u32,
     bdf: Option<narf_bus::PcieAddr>,
-    ctrl: Controller,
+    mut ctrl: Controller,
 ) -> &'static InstalledController {
     let shutdown_regs = shutdown_regs_of(&ctrl);
+    let io_path = ctrl.io_path();
     alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
         req_gate: AtomicBool::new(false),
         gate_owner: AtomicU64::new(0),
@@ -5047,6 +4712,7 @@ fn leak_slot(
         timeout_streak: AtomicU32::new(0),
         scratch: IrqSafeSpinLock::new(None),
         shutdown_regs: IrqSafeSpinLock::new(shutdown_regs),
+        io_path: IrqSafeSpinLock::new(io_path),
         ctrl: UnsafeCell::new(ctrl),
     }))
 }
@@ -5062,6 +4728,17 @@ fn leak_slot(
 /// that guard would be a use-after-free reachable only under load. Outside
 /// the harness every probe installs a new function exactly once, so
 /// nothing accumulates.
+///
+/// The slot is leaked, its IDT vectors are not: when the replacement drives
+/// the same function, its bring-up reset the device (CC.EN=0 deletes every
+/// queue) and re-programmed the MSI-X table, so no entry can deliver to the
+/// old controller's vectors any more; they and their handlers are freed
+/// here (Linux reuses a function's vectors across `nvme_reset_work`).
+/// Leaking them cost every reinstall up to 17 of the ~200 free vectors, and
+/// the queue count is bounded by the free vectors, so a few dozen
+/// reinstalls left later bring-ups polled and the `interrupts` smokes with
+/// no vector at all. The old controller's MSI-X handle is dropped without
+/// touching the table, which now belongs to the replacement.
 pub(crate) fn install_controller(ctrl: Controller) -> u32 {
     let bdf = controller_bdf(&ctrl);
     let mut g = CONTROLLERS.lock();
@@ -5069,18 +4746,27 @@ pub(crate) fn install_controller(ctrl: Controller) -> u32 {
         Some(b) => g.iter().position(|s| s.bdf == Some(b)),
         None => (!g.is_empty()).then_some(0),
     };
-    match pos {
+    let (instance, superseded) = match pos {
         Some(i) => {
             let instance = g[i].instance;
-            g[i] = leak_slot(instance, bdf, ctrl);
-            instance
+            let old = core::mem::replace(&mut g[i], leak_slot(instance, bdf, ctrl));
+            (instance, bdf.is_some().then_some(old))
         }
         None => {
             let instance = g.len() as u32;
             g.push(leak_slot(instance, bdf, ctrl));
-            instance
+            (instance, None)
+        }
+    };
+    drop(g);
+    if let Some(old) = superseded {
+        // A holder that took the old slot before the swap finishes first.
+        if let Ok(mut old) = acquire(old) {
+            let _ = old.msix.take();
+            old.free_irq_vectors();
         }
     }
+    instance
 }
 
 fn slot_of(instance: u32) -> Option<&'static InstalledController> {
@@ -5132,6 +4818,12 @@ impl core::ops::DerefMut for ControllerGuard {
 
 impl Drop for ControllerGuard {
     fn drop(&mut self) {
+        // Publish what this holder changed for the gate-free data path
+        // before the gate opens. Cheap when nothing changed (one flag).
+        if self.io_path_dirty {
+            let path = self.io_path();
+            *self.slot.io_path.lock() = path;
+        }
         self.slot.req_gate.store(false, Ordering::Release);
     }
 }
@@ -5730,6 +5422,16 @@ impl SyncData<'_> {
 }
 
 impl narf_block::BlockDeviceSync for NvmeNamespaceBlock {
+    /// This namespace's queued submission path: requests from
+    /// `SyncBlock::submit` go straight to the controller's I/O queues,
+    /// many in flight at once, without the request gate or the sync
+    /// scratch.
+    fn queue(&self) -> Option<alloc::sync::Arc<dyn narf_block::BlockQueue>> {
+        Some(alloc::sync::Arc::new(req::NvmeQueue {
+            instance: self.instance,
+            nsid: self.nsid,
+        }))
+    }
     fn lba_size(&self) -> u32 {
         sync_lba_size(self.instance, Some(self.nsid))
     }
@@ -5940,7 +5642,66 @@ pub fn probe(
         });
     }
     register_controller(instance, device, cap);
+    register_queue_stats_proc();
     Ok(())
+}
+
+/// `/proc/narf/nvme_queues`: one line per I/O queue of every installed
+/// controller with its interrupt route and completion-path counters —
+/// the second half of the self-diagnosis `log_io_queue_routes` starts.
+/// An IRQ-driven queue whose `reaped_isr` stays 0 while `irq_missed`
+/// grows gets no interrupts; one whose `slow_pickups` grows gets them but
+/// its waiters are not woken promptly.
+#[derive(Debug)]
+struct NvmeQueuesProc;
+
+impl narf_filesystem::procfs::ProcFile for NvmeQueuesProc {
+    fn read(&self) -> Vec<u8> {
+        use core::fmt::Write as _;
+        let mut s = alloc::string::String::new();
+        let _ = writeln!(
+            s,
+            "# ctrl qid depth vector msix_entry target_apic posted in_flight isr_runs \
+             reaped_isr reaped_poll irq_missed slow_pickups pickup_max_us strays mode"
+        );
+        let n = CONTROLLERS.lock().len() as u32;
+        for instance in 0..n {
+            let _ = with_controller_at(instance, |c| {
+                for q in c.io_queues() {
+                    let st = q.stats();
+                    let _ = writeln!(
+                        s,
+                        "nvme{instance} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        st.qid,
+                        st.depth,
+                        st.vector.map_or(-1, i32::from),
+                        st.msix_entry.map_or(-1, i32::from),
+                        st.target_apic.map_or(-1i64, i64::from),
+                        st.posted,
+                        st.in_flight,
+                        st.isr_runs,
+                        st.reaped_isr,
+                        st.reaped_poll,
+                        st.irq_missed,
+                        st.slow_pickups,
+                        st.pickup_max_ns / 1_000,
+                        st.strays,
+                        c.io_queue_mode,
+                    );
+                }
+            });
+        }
+        s.into_bytes()
+    }
+}
+
+static QUEUE_STATS_PROC: AtomicBool = AtomicBool::new(false);
+
+fn register_queue_stats_proc() {
+    if QUEUE_STATS_PROC.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_filesystem::procfs::register_proc("narf/nvme_queues", Arc::new(NvmeQueuesProc));
 }
 
 /// Publish controller `instance`: block devices (namespaces + partitions,
@@ -6759,11 +6520,12 @@ impl narf_drivers::DriverParams for NvmeParams {
             )
         })
         .unwrap_or((0, 0, 0, None, 0));
+        let depth = with_controller(|c| c.io_queues().first().map_or(0, |q| q.depth)).unwrap_or(0);
         NvmeSnapshot {
             bar0,
             lba_bytes,
             nsze,
-            io_q_depth: IO_Q_DEPTH,
+            io_q_depth: depth,
             irq_vector: irq,
             log_level: self.log_level,
             identify_vid: vid,

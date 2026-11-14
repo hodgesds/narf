@@ -16,9 +16,9 @@ use narf_bus::{BarKind, MmioRegion};
 use narf_io::alloc_coherent;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::id::DomainId;
-use narf_lib::sync::IrqSafeSpinLock;
 
 use super::admin::{CNS_CONTROLLER, OPC_IDENTIFY};
+use super::mq::{Cmd, CmdOutcome, CmdResources, IoQueue};
 use super::{Controller, Cqe, IoOpcode, Queue, Sqe};
 
 /// Queue depth of the fake controller: the admin depth, so the AER
@@ -46,20 +46,25 @@ const AER_ERR_STATUS: u16 = 1 | (0x02 << 1);
 /// The SQ/CQ pages are owned by `ctrl` (inside the `Queue`s); the
 /// struct keeps alive only what `ctrl` does not own — the BAR
 /// mapping's backing page and the identify page.
-struct FakeCidCtrl {
-    ctrl: Controller,
+pub(super) struct FakeCidCtrl {
+    pub(super) ctrl: Controller,
     /// Keeps the fake BAR mapping alive for `ctrl`'s lifetime.
     _bar: narf_io::DmaBuffer,
     /// Keeps the identify page alive (PRP1 for the admin test).
     _id_page: narf_io::DmaBuffer,
     /// CQ pages, for pre-posting completions.
     cq_admin: *const u8,
-    cq_io: *const u8,
+    pub(super) cq_io: *const u8,
     /// DMA address of the identify page (PRP1 for the admin test).
-    id_dma: u64,
+    pub(super) id_dma: u64,
 }
 
 fn fake_cid_controller() -> Option<FakeCidCtrl> {
+    fake_cid_controller_with(None)
+}
+
+/// [`fake_cid_controller`] whose I/O queue is IRQ-driven on `vector`.
+pub(super) fn fake_cid_controller_with(vector: Option<u8>) -> Option<FakeCidCtrl> {
     let sq_admin = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
     let cq_admin = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
     let sq_io = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
@@ -82,14 +87,15 @@ fn fake_cid_controller() -> Option<FakeCidCtrl> {
     let mut ctrl = Controller::new(0);
     // SAFETY: the fake BAR is a live 8 KiB coherent page; doorbell
     // offsets (0x1000+) land inside it. Mirrors `tests_dsm`.
-    ctrl.bar0_region = Some(MmioRegion {
+    let bar_region = MmioRegion {
         phys: narf_memory::PhysAddr::new(bar.dma_addr().raw()),
         virt: bar.cpu_ptr::<u8>() as u64,
         len: bar.len() as u64,
         kind: BarKind::Mmio32 {
             prefetchable: false,
         },
-    });
+    };
+    ctrl.bar0_region = Some(bar_region);
     ctrl.admin = Some(Queue {
         sq_buf: sq_admin,
         cq_buf: cq_admin,
@@ -105,22 +111,18 @@ fn fake_cid_controller() -> Option<FakeCidCtrl> {
         aer_cids: [0; (super::ADMIN_Q_DEPTH - 1) as usize],
         aer_cids_len: 0,
     });
-    ctrl.io_queues.push(Queue {
-        sq_buf: sq_io,
-        cq_buf: cq_io,
-        qid: 1,
-        depth: CID_FAKE_DEPTH,
-        sq_tail: 0,
-        cq_head: 0,
-        cq_phase: 1,
-        db_stride: 4,
-        next_cid: 0,
-        stray_aer: [0; (super::ADMIN_Q_DEPTH - 1) as usize],
-        stray_aer_len: 0,
-        aer_cids: [0; (super::ADMIN_Q_DEPTH - 1) as usize],
-        aer_cids_len: 0,
-    });
-    ctrl.io_queue_locks.push(IrqSafeSpinLock::new(()));
+    ctrl.io_queues.push(IoQueue::new(
+        1,
+        CID_FAKE_DEPTH,
+        sq_io,
+        cq_io,
+        bar_region,
+        4,
+        vector,
+    ));
+    if let Some(v) = vector {
+        ctrl.io_irq_vectors.push(v);
+    }
 
     Some(FakeCidCtrl {
         ctrl,
@@ -288,27 +290,20 @@ fn smoke_nvme_cid_io_stray_dropped() -> TestResult {
     sqe.cdw10 = 0;
     sqe.cdw11 = 0;
     sqe.cdw12 = 0;
-    let cqe = {
-        let Some(io) = ctrl.io_queues.first_mut() else {
-            return TestResult::Fail("fake controller has no I/O queue");
-        };
-        let Some(bar0) = ctrl.bar0_region.as_ref() else {
-            return TestResult::Fail("fake controller has no BAR0");
-        };
-        // SAFETY: fake I/O queue + RAM-backed BAR; the staged
-        // CQEs complete the wait synchronously.
-        match unsafe { io.submit_raw(bar0, sqe) } {
-            Ok(c) => c,
-            Err(_) => {
-                return TestResult::Fail("I/O submit_raw failed with stray ahead");
-            }
+    let strays0 = super::stray_cqe_drops();
+    match io_submit(ctrl, sqe) {
+        CmdOutcome::Completed {
+            status: 0,
+            cmd_specific,
+            ..
+        } if cmd_specific == OWN_SENTINEL => {}
+        CmdOutcome::Completed { .. } => {
+            return TestResult::Fail("I/O submit consumed the stray CQE (poisoned)");
         }
-    };
-    if cqe.cmd_specific != OWN_SENTINEL {
-        return TestResult::Fail("I/O submit consumed the stray CQE (poisoned)");
+        _ => return TestResult::Fail("I/O submit failed with stray ahead"),
     }
-    if cqe.cid != 0 {
-        return TestResult::Fail("returned I/O CQE does not carry our CID");
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the stray was not counted");
     }
     if ctrl.stray_aer_len() != 0 {
         return TestResult::Fail("I/O stray was stashed as an AER event");
@@ -410,7 +405,13 @@ kernel_test_in!("drivers/nvme", smoke_nvme_peek_cqe_decodes_spec_layout);
 ///
 /// # Safety
 /// `cq` is a live 4 KiB coherent page and `slot` is inside it.
-unsafe fn stage_cqe(cq: *const u8, slot: usize, cid: u16, sq_id: u16, cmd_specific: u32) {
+pub(super) unsafe fn stage_cqe(
+    cq: *const u8,
+    slot: usize,
+    cid: u16,
+    sq_id: u16,
+    cmd_specific: u32,
+) {
     // SAFETY: per this function's contract.
     unsafe {
         core::ptr::write_volatile(
@@ -425,6 +426,19 @@ unsafe fn stage_cqe(cq: *const u8, slot: usize, cid: u16, sq_id: u16, cmd_specif
             },
         );
     }
+}
+
+/// Post `sqe` on the fake controller's I/O queue (tags rotate from 0) and
+/// wait for its outcome the way the gate-held paths do.
+fn io_submit(ctrl: &Controller, sqe: Sqe) -> CmdOutcome {
+    let q = ctrl.io_queues()[0].clone();
+    let Some(tag) = q.try_alloc_tag(None) else {
+        return CmdOutcome::TimedOut;
+    };
+    let Ok(id) = q.post(tag, sqe, CmdResources::default()) else {
+        return CmdOutcome::Reset;
+    };
+    Cmd::new(q, id).wait_sync()
 }
 
 fn smoke_nvme_stray_drop_is_counted() -> TestResult {
@@ -465,32 +479,29 @@ fn smoke_nvme_stray_drop_is_counted() -> TestResult {
     sqe.nsid = 1;
     sqe.prp1 = fake.id_dma;
     let before = super::stray_cqe_drops();
-    {
-        let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
-            return TestResult::Fail("fake controller has no I/O queue / BAR0");
-        };
-        // SAFETY: fake I/O queue + RAM-backed BAR; the staged CQEs
-        // complete the wait synchronously.
-        if unsafe { io.submit_raw(bar0, sqe) }.is_err() {
-            return TestResult::Fail("polled submit failed with a stray ahead");
-        }
+    if !matches!(
+        io_submit(ctrl, sqe),
+        CmdOutcome::Completed { status: 0, .. }
+    ) {
+        return TestResult::Fail("polled submit failed with a stray ahead");
     }
     if super::stray_cqe_drops() != before + 1 {
         return TestResult::Fail("polled matcher did not count the dropped stray");
     }
 
-    // IRQ-path matcher: a stray (CID 0x77) at the head while CID 1 is
-    // awaited is consumed, counted, and reported as "not ours".
+    // Completion reaper (the ISR's and every waiter's path): a stray
+    // (CID 0x77) at the head with no command under that tag is consumed,
+    // counted, and reported as nobody's.
     // SAFETY: slot 2 of the same page.
     unsafe { stage_cqe(fake.cq_io, 2, 0x77, 1, IO_STRAY_SENTINEL) };
-    match ctrl.try_take_io_cqe(0, 1, IoOpcode::Read as u8) {
-        Ok(false) => {}
-        _ => return TestResult::Fail("IRQ-path matcher accepted or failed on a stray"),
+    let q = ctrl.io_queues()[0].clone();
+    if !q.cq_has_fresh() || q.process_cq(false) != 1 {
+        return TestResult::Fail("the reaper did not consume the stray");
     }
     if super::stray_cqe_drops() != before + 2 {
-        return TestResult::Fail("IRQ-path matcher did not count the dropped stray");
+        return TestResult::Fail("the reaper did not count the dropped stray");
     }
-    if ctrl.io_queues.first().map(|q| q.cq_head) != Some(3) {
+    if q.cq_has_fresh() {
         return TestResult::Fail("the stray was not consumed from the CQ");
     }
 
@@ -528,7 +539,10 @@ fn smoke_nvme_timeout_is_counted() -> TestResult {
     // A command whose completion never arrives is reported where the
     // timeout is declared (opcode, CID, queue, CQ head, CSTS, vector,
     // interrupt state, elapsed) and counted. Nothing is staged, so the
-    // real wait loop runs out its (short) budget against a silent CQ.
+    // real wait runs out its (short) budget against a silent CQ. The
+    // command stays in flight at the queue — its pages are the device's
+    // until a reset — and the controller is marked dead.
+    let _budget = ShortIoBudget::set(20);
     let Some(mut fake) = fake_cid_controller() else {
         return TestResult::Fail("fake CID controller setup failed");
     };
@@ -538,30 +552,31 @@ fn smoke_nvme_timeout_is_counted() -> TestResult {
     sqe.nsid = 1;
     sqe.prp1 = fake.id_dma;
     let before = super::command_timeouts();
-    let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
-        return TestResult::Fail("fake controller has no I/O queue / BAR0");
-    };
-    // SAFETY: fake I/O queue + RAM-backed BAR; no device is involved.
-    let r = unsafe { io.submit_raw_ms(bar0, sqe, 20, None) };
+    let r = ctrl.submit_io_sync(sqe, CmdResources::default());
     if !matches!(r, Err(super::NvmeError::CompletionTimeout)) {
         return TestResult::Fail("a silent CQ did not time the command out");
     }
     if super::command_timeouts() != before + 1 {
         return TestResult::Fail("the timeout was not counted exactly once");
     }
-    if io.cq_head != 0 {
-        return TestResult::Fail("a timeout consumed a CQ entry");
+    if !ctrl.is_dead() {
+        return TestResult::Fail("a timeout did not mark the controller dead");
+    }
+    let q = ctrl.io_queues()[0].clone();
+    if q.in_flight() != 1 || q.cq_has_fresh() {
+        return TestResult::Fail("a timed-out command was released, or a CQ entry consumed");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_timeout_is_counted);
 
 fn smoke_nvme_polled_last_look_finds_completion() -> TestResult {
-    // The polled matcher looks at the CQ once more after its budget is
-    // spent, and that look walks past a stray: with the wait made blind
-    // (the late-completion hook) and the CQ holding a stray followed by
-    // our completion, the command must still succeed — counted as a late
+    // The owner looks at the CQ once more after its budget is spent, and
+    // that look walks past a stray: with the wait made blind (the
+    // late-completion hook) and the CQ holding a stray followed by our
+    // completion, the command must still succeed — counted as a late
     // completion, not as a timeout — and the stray must be counted.
+    let _budget = ShortIoBudget::set(20);
     let Some(mut fake) = fake_cid_controller() else {
         return TestResult::Fail("fake CID controller setup failed");
     };
@@ -580,18 +595,14 @@ fn smoke_nvme_polled_last_look_finds_completion() -> TestResult {
         super::command_timeouts(),
         super::stray_cqe_drops(),
     );
-    let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
-        return TestResult::Fail("fake controller has no I/O queue / BAR0");
-    };
     super::IO_LATE_FOR_TEST.store(1, core::sync::atomic::Ordering::Release);
-    // SAFETY: fake I/O queue + RAM-backed BAR; no device is involved.
-    let r = unsafe { io.submit_raw_ms(bar0, sqe, 20, None) };
+    let r = ctrl.submit_io_sync(sqe, CmdResources::default());
     let taken = super::IO_LATE_FOR_TEST.swap(0, core::sync::atomic::Ordering::AcqRel) == 0;
     if !taken {
         return TestResult::Fail("the submit never took the fault: nothing was tested");
     }
     match r {
-        Ok(cqe) if cqe.cmd_specific == OWN_SENTINEL && cqe.cid == 0 => {}
+        Ok(dw0) if dw0 == OWN_SENTINEL => {}
         Ok(_) => return TestResult::Fail("the last look returned the wrong completion"),
         Err(_) => return TestResult::Fail("a completion sitting in the CQ was declared lost"),
     }
@@ -628,9 +639,8 @@ impl Drop for FakeAsyncCtrl {
 }
 
 fn fake_async_controller() -> Option<FakeAsyncCtrl> {
-    let mut fake = fake_cid_controller()?;
     let vector = narf_interrupts::vector::alloc().ok()?;
-    fake.ctrl.io_irq_vectors.push(vector);
+    let mut fake = fake_cid_controller_with(Some(vector))?;
     fake.ctrl.ns_usable = true;
     fake.ctrl.lba_bytes = 512;
     fake.ctrl.nsze = 1024;
@@ -674,11 +684,16 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     // on the same queue, or another queue sharing the vector, bumps it
     // too. The async wait must go round again — the pre-fix path declared
     // the completion lost on the spot (controller dead,
-    // `CompletionTimeout`). And a completion that arrives with NO
-    // interrupt must still be found, by the wait's poll slice, long
-    // before the command's budget.
+    // `CompletionTimeout`). And a completion whose interrupt is never
+    // delivered is NOT found early by some poll slice (Linux has none; it
+    // hid a missed interrupt as a silent slowdown): the waiter stays
+    // pending until the command's timeout, where `nvme_timeout`'s one
+    // poll finds it — "timeout, completion polled" — counted in the
+    // queue's `irq_missed`, without a command timeout or a dead
+    // controller.
     use core::future::Future;
     use core::task::{Context, Poll};
+    let budget = ShortIoBudget::set(60);
     let Some(mut fx) = fake_async_controller() else {
         return TestResult::Fail("fake async controller setup failed");
     };
@@ -686,6 +701,11 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     let cq_io = fx.fake.cq_io;
     let buf_ptr: *const narf_io::DmaBuffer = &fx.fake._id_page;
     let timeouts0 = super::command_timeouts();
+    let late0 = super::late_completions();
+    let queue = fx.fake.ctrl.io_queues()[0].clone();
+    if queue.irq_missed() != 0 {
+        return TestResult::Fail("a fresh queue starts with interrupts missed");
+    }
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     let outcome = {
@@ -712,7 +732,21 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
         // Our completion, with no interrupt at all.
         // SAFETY: `cq_io` is the fake queue's live CQ page; slot 0.
         unsafe { stage_cqe(cq_io, 0, 0, 1, OWN_SENTINEL) };
-        let give_up = narf_time::Deadline::after_ms(super::ASYNC_CQ_POLL_MS * 8);
+        // Half the budget: still pending — nothing but the interrupt or
+        // the timeout ends an IRQ queue's wait.
+        let half = narf_time::Deadline::after_ms(30);
+        loop {
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail(
+                    "a completion without an interrupt was polled before the timeout",
+                );
+            }
+            if half.expired() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let give_up = narf_time::Deadline::after_ms(2_000);
         loop {
             if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
                 break Some(r);
@@ -723,6 +757,7 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
             core::hint::spin_loop();
         }
     };
+    drop(budget);
     match outcome {
         Some(Ok(())) => {}
         Some(Err(_)) => return TestResult::Fail("async read failed although its CQE arrived"),
@@ -730,6 +765,12 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     }
     if fx.fake.ctrl.is_dead() || super::command_timeouts() != timeouts0 {
         return TestResult::Fail("a completed async command left the controller dead / timed out");
+    }
+    if super::late_completions() != late0 + 1 {
+        return TestResult::Fail("the timeout's polled completion was not logged as one");
+    }
+    if queue.irq_missed() != 1 || queue.reaped_isr() != 0 || queue.reaped_poll() != 1 {
+        return TestResult::Fail("the missed interrupt was not counted on the queue");
     }
     TestResult::Pass
 }
@@ -739,11 +780,16 @@ kernel_test_in!(
 );
 
 fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
-    // `submit_io_poll` before the deadline: "not yet" is not an error and
-    // a stray at the head is consumed without ending the command. At the
-    // deadline the CQ is looked at one last time: a completion sitting
-    // there is taken (late completion, no timeout); only an empty CQ
-    // makes the command lost (timeout counted, controller dead).
+    // Polling before the deadline: "not yet" is not an error, and an
+    // IRQ queue's waiter does not touch the CQ — a stray at the head stays
+    // there (the handler or the timeout's poll consumes it, Linux
+    // `nvme_timeout`). At the deadline the CQ is looked at one last time:
+    // the stray is consumed and counted, and a completion sitting behind
+    // it is taken (late completion, no timeout); only an empty CQ makes
+    // the command lost (timeout counted, controller dead).
+    use core::future::Future;
+    use core::task::{Context, Poll};
+    let budget = ShortIoBudget::set(40);
     let Some(mut fx) = fake_async_controller() else {
         return TestResult::Fail("fake async controller setup failed");
     };
@@ -751,7 +797,6 @@ fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
     let buf_ptr: *const narf_io::DmaBuffer = &fx.fake._id_page;
     // SAFETY: the identify page lives in `fx` for the whole test.
     let buf = unsafe { &*buf_ptr };
-    let budget = ShortIoBudget::set(40);
     let ctrl = &mut fx.fake.ctrl;
     let (late0, timeouts0, strays0) = (
         super::late_completions(),
@@ -759,26 +804,32 @@ fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
         super::stray_cqe_drops(),
     );
 
-    // Command 1 (CID 0): a stray first, then its completion after expiry.
-    let Ok(io) = ctrl.submit_io_begin(IoOpcode::Read as u8, 0, 1, buf) else {
-        return TestResult::Fail("submit_io_begin failed");
-    };
-    if !matches!(ctrl.submit_io_poll(&io), Ok(false)) || ctrl.is_dead() {
-        return TestResult::Fail("an in-flight command with an empty CQ was not 'not yet'");
-    }
-    // SAFETY: `cq_io` is the fake queue's live CQ page; slots 0..1.
-    unsafe { stage_cqe(cq_io, 0, 0x55, 1, IO_STRAY_SENTINEL) };
-    if !matches!(ctrl.submit_io_poll(&io), Ok(false)) || ctrl.is_dead() {
-        return TestResult::Fail("a stray at the head ended the command");
-    }
-    if super::stray_cqe_drops() != strays0 + 1 {
-        return TestResult::Fail("the stray was not consumed and counted");
-    }
-    // SAFETY: as above.
-    unsafe { stage_cqe(cq_io, 1, 0, 1, OWN_SENTINEL) };
-    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
-    if !matches!(ctrl.submit_io_poll(&io), Ok(true)) {
-        return TestResult::Fail("a completion in the CQ at the deadline was declared lost");
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Command 1 (tag 0): a stray first, then its completion after expiry.
+    {
+        let mut fut = core::pin::pin!(ctrl.submit_io_irq_async(IoOpcode::Read as u8, 0, 1, buf));
+        if fut.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("an in-flight command with an empty CQ was not 'not yet'");
+        }
+        // SAFETY: `cq_io` is the fake queue's live CQ page; slots 0..1.
+        unsafe { stage_cqe(cq_io, 0, 0x55, 1, IO_STRAY_SENTINEL) };
+        if fut.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("a stray at the head ended the command");
+        }
+        if super::stray_cqe_drops() != strays0 {
+            return TestResult::Fail("an IRQ queue's waiter polled the CQ before its deadline");
+        }
+        // SAFETY: as above.
+        unsafe { stage_cqe(cq_io, 1, 0, 1, OWN_SENTINEL) };
+        super::IO_LATE_FOR_TEST.store(0, core::sync::atomic::Ordering::Release);
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            _ => {
+                return TestResult::Fail("a completion in the CQ at the deadline was declared lost")
+            }
+        }
     }
     if super::late_completions() != late0 + 1
         || super::command_timeouts() != timeouts0
@@ -786,17 +837,25 @@ fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
     {
         return TestResult::Fail("the last look's completion was not a late completion");
     }
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the timeout's poll did not consume and count the stray");
+    }
 
-    // Command 2 (CID 1): nothing ever arrives.
-    let Ok(io) = ctrl.submit_io_begin(IoOpcode::Read as u8, 0, 1, buf) else {
-        return TestResult::Fail("second submit_io_begin failed");
-    };
-    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
-    if !matches!(
-        ctrl.submit_io_poll(&io),
-        Err(super::NvmeError::CompletionTimeout)
-    ) {
-        return TestResult::Fail("a command with no completion did not time out at its deadline");
+    // Command 2 (tag 1): nothing ever arrives.
+    {
+        let mut fut = core::pin::pin!(ctrl.submit_io_irq_async(IoOpcode::Read as u8, 0, 1, buf));
+        if fut.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("second command resolved with nothing in the CQ");
+        }
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
+        if !matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(super::NvmeError::CompletionTimeout))
+        ) {
+            return TestResult::Fail(
+                "a command with no completion did not time out at its deadline",
+            );
+        }
     }
     drop(budget);
     if super::command_timeouts() != timeouts0 + 1 || !ctrl.is_dead() {

@@ -834,6 +834,25 @@ jobs:
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
             --subsystem interrupts --kernel-tests-only
 
+      # APIC-ID-gapped topology. QEMU numbers APIC IDs per socket from a
+      # power-of-two boundary, so `sockets=2,cores=3` gives APIC IDs
+      # 0,1,2,4,5,6: logical CPU != APIC ID for CPUs 3..5, as on a Zen part
+      # with cores fused off (and MADT order != APIC order, as on the
+      # Ryzen 7600X). Every default QEMU topology is the identity and
+      # cannot catch a CPU index used as an interrupt destination; this
+      # boot does: AP bring-up (INIT/SIPI to APIC IDs), the IPI fan-out
+      # (shootdown acks from every peer), the block_on bridge's cross-CPU
+      # kick, and NVMe completions by MSI-X with no missed interrupt.
+      - name: cargo xtask test — APIC-ID-gapped SMP topology
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
+        timeout-minutes: 15
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "600"
+          NARF_QEMU_SMP: "6,sockets=2,cores=3"
+        run: |
+          cargo xtask test --arch=x86_64 --kernel-tests-only \
+            --subsystem interrupts,scheduler/bridge,drivers/nvme/mq
+
       # Two same-family NICs (issue #1632): `XTASK_QEMU_SECOND_NIC=1`
       # attaches a second legacy NIC of the same model as the first on
       # its own user-mode netdev `n2`, so the e1000 multi-instance

@@ -4261,10 +4261,28 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
             ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
             ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
             (*tf).ss = 0x1b;
+            (*tf).vector = 0x80;
         }
         if uc.blocked_syscall() != Some(want(202)) {
             return TestResult::Fail("the int 0x80 TrapFrame was not decoded");
         }
+        // The same TrapFrame from a page fault: parked outside any syscall.
+        // Linux reports nr -1 and only SP and PC; the user's rax (here 202)
+        // is not a syscall number and must not be shown as one.
+        // SAFETY: as above.
+        unsafe {
+            (*tf).vector = 14;
+            ((*tf).rsp, (*tf).rip) = (0x7fff_0000, 0x4000_1234);
+        }
+        let not_in = [crate::user_task::NOT_IN_SYSCALL, 0, 0, 0, 0, 0, 0];
+        if uc.blocked_syscall() != Some(not_in) {
+            return TestResult::Fail("a page-fault park was decoded as a syscall");
+        }
+        if uc.blocked_syscall_frame().map(|f| (f[7], f[8])) != Some((0x7fff_0000, 0x4000_1234)) {
+            return TestResult::Fail("a page-fault park lost its user SP and PC");
+        }
+        // SAFETY: as above.
+        unsafe { (*tf).vector = 0x80 };
     }
 
     #[cfg(target_arch = "aarch64")]

@@ -319,6 +319,20 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             self.close();
         }
     }
+    /// `priv->ra_watchdog` (`rtl8xxxu_watchdog_callback`): the host RA
+    /// refresh for the connected station, under the owner lock. Run from
+    /// the device's watchdog work every 2 s.
+    pub(super) async fn watchdog(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if state.service.rate_watchdog().is_err() {
+            state.clear_transmit();
+            drop(state);
+            self.close();
+        }
+    }
     pub(super) fn drain(&self) -> bool {
         self.dispatch_with(|frame| narf_net::iface::on_rx_frame_from(&self.name, frame))
     }
@@ -517,6 +531,7 @@ pub async fn attach(
     device.bind_admin(registration)?;
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
+    crate::watchdog_work::start(&device, WATCHDOG_MS);
     let worker = device.clone();
     narf_scheduler::spawn(async move {
         loop {
@@ -526,6 +541,23 @@ pub async fn attach(
         }
     });
     Ok(device)
+}
+/// `schedule_delayed_work(&priv->ra_watchdog, 2 * HZ)`.
+const WATCHDOG_MS: u64 = 2000;
+/// `priv->ra_watchdog`; a failed device is terminal and stops it.
+impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static>
+    crate::watchdog_work::Watchdog for Device<C, B, E>
+where
+    Self: Send + Sync,
+{
+    fn watchdog_stopped(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+    fn watchdog_step(
+        self: Arc<Self>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { self.watchdog().await })
+    }
 }
 impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Interface
     for Device<C, B, E>

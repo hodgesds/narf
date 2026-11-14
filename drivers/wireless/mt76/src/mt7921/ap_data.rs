@@ -112,6 +112,7 @@ impl<B: Backend> Session<B> {
         Ok(super::super::PacketStep {
             transmitted,
             received,
+            link: None,
             receive_epoch: self.receive_epoch,
         })
     }

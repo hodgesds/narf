@@ -45,6 +45,37 @@ the following 2 GiB remains the frame-backed valloc heap. Aligned 2 MiB
 non-RAM spans use large leaves, while unaligned spans and any span intersecting
 known System RAM use 4 KiB leaves. This keeps the WC-to-WB RAM clamp exact.
 
+**Guarded kernel stacks (`kstack`, Linux `CONFIG_VMAP_STACK`).** Every kernel
+task stack (and each aarch64 CPU's overflow stack) is a `KernelStack`: zeroed
+order-0 frames mapped virtually contiguous in top-level slot
+`KSTACK_L0_SLOT` (279), reserved with the other shared kernel slots by
+`bpf_text::reserve_kernel_slots` and randomized at 2 MiB granularity by
+`kstack::randomize_window` before the first stack exists.
+
+```rust
+pub const KSTACK_L0_SLOT: usize;          // 279
+pub const KSTACK_SHIFT: u32;              // 17
+pub const KSTACK_MAX_BYTES: usize;        // 128 KiB = 1 << KSTACK_SHIFT
+pub const KSTACK_SLOT_BYTES: u64;         // 256 KiB per stack
+pub struct KernelStack;                   // Send + Sync; Deref<[u8]>; Drop unmaps
+impl KernelStack {
+    pub const fn empty() -> Self;         // len 0, drop is a no-op
+    pub fn alloc(len: usize) -> Result<Self, KstackError>; // 0 < len ≤ 128 KiB
+    pub fn base(&self) -> u64; pub fn top(&self) -> u64; pub fn len(&self) -> usize;
+}
+pub struct GuardHit { pub stack_base: u64, pub stack_top: u64 }
+pub fn guard_hit(addr: u64) -> Option<GuardHit>;      // lock-free, fault path
+pub fn stack_containing(addr: u64) -> Option<(u64, u64)>;
+pub fn area_contains(addr: u64) -> bool;
+pub fn randomize_window();
+```
+
+Each stack occupies the bottom of its 256 KiB-aligned slot; slot 0 is never
+allocated. Leaves use `valloc`'s flags (RW, NX, non-global, protection key 0).
+`guard_hit` attributes an unmapped address to the stack in the next slot up —
+the one whose overflow reaches it — and is what #PF/#DF (x86_64) and the
+bad-stack entry (aarch64) consult.
+
 ```rust
 pub struct PhysFrame;     // owned 4 KiB physical frame (base page)
 pub struct VirtAddr(u64);
@@ -96,6 +127,19 @@ pub struct Folio { order: u8, head: PhysFrame }
 pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
+/// (feature `cgroup`) Charge a just-allocated page-cache/shmem block to the
+/// current task's memory cgroup; uncharged by its final free.
+pub fn frame::charge_frame_to_current(frame: PhysFrame, order: u8) -> Result<(), FrameAllocError>;
+/// Move a migrating page's memory-cgroup charge to its destination.
+pub fn frame::transfer_frame_memcg(old: PhysAddr, new: PhysAddr);
+/// (feature `cgroup`) Per-page charge seam installed by the cgroupfs memory
+/// controller: charge(pid, bytes, force) -> Result<MemcgId, MemcgId>,
+/// uncharge(MemcgId, bytes), memcg OOM(MemcgId, pid) run by the OOM reaper.
+pub fn install_page_charge_hooks(
+    charge: fn(u64, u64, bool) -> Result<MemcgId, MemcgId>,
+    uncharge: fn(MemcgId, u64),
+    oom: fn(MemcgId, u64) -> bool,
+);
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
 /// Contiguous kernel block with every byte at or below `limit_phys`
 /// (inclusive), searched across all online nodes — the frame half of
@@ -242,6 +286,10 @@ pub fn firmware_node_count() -> u32;
 /// Free-block counts by buddy order, including cached base pages and pairs
 /// in orders 0 and 1 respectively.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
+/// Frees the buddy allocator has refused since boot because the frame's
+/// free-state word showed it was already free (a double free). 0 in a
+/// correct kernel.
+pub fn frame::double_frees_refused() -> u64;
 
 /// Free-memory pressure band and the physical-page deficit to high.
 pub fn watermark_min() -> u64;
@@ -1201,6 +1249,21 @@ impl AddressSpace {
 /// corresponding translations have been invalidated. Plain SHARED mappings
 /// instead retain backing through their VMA-level or in-memory owner.
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+/// Dirty tracking for SHARED|EXTERNAL_REFS frames (Linux write-notify:
+/// `do_wp_page` -> `page_mkwrite`). A PTE for such a frame in a writable
+/// region carries the write bit only while `write_enabled(phys)` says so; a
+/// store to a read-only one reaches `cow_split_on_write`, which calls
+/// `write_notify(phys)` instead of copying, and the fault path re-installs
+/// the PTE. Both hooks run under the region lock and must not re-enter this
+/// crate. Uninstalled, such PTEs are writable as before.
+pub fn install_shared_page_write_hooks(write_enabled: fn(u64) -> bool, write_notify: fn(u64) -> bool);
+impl AddressSpace {
+    /// Re-install `vaddr`'s PTE from the region's current state if it still
+    /// maps `expected` in a SHARED|EXTERNAL_REFS region (Linux `folio_mkclean`
+    /// per mapper); every CPU's TLB entry for it is invalidated before return.
+    pub unsafe fn refresh_shared_page(&self, vaddr: VirtAddr, expected: PhysAddr)
+        -> Result<bool, AddressSpaceError>;
+}
 /// Clone upper-layer VMA ownership while the parent fork transaction still
 /// excludes mutation, before a child may expose borrowed shared backing.
 /// Callers that create SHARED mappings without EXTERNAL_REFS must either
@@ -1447,6 +1510,25 @@ pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 pub fn slab::stats() -> SlabStats;
 pub fn slab::magazine_stats() -> MagazineStats;
 
+/// Retention breakdown of one size class (frames held, live objects,
+/// magazine / central free objects, partial / empty tracked frames, legacy
+/// FIFO blocks) and of large allocations (live blocks per buddy order, vmalloc
+/// fallback). `class_detail` takes the class lock for a constant number of
+/// loads and never allocates. Rendered by `/proc/slabinfo` (Linux 2.1 format,
+/// plus `kmalloc-8k..` rows for page-backed sizes) and `/proc/narf/slab`.
+pub fn slab::class_detail(c: usize) -> ClassDetail;
+pub fn slab::large_detail() -> LargeDetail;
+pub const fn slab::magazine_tunables() -> (usize, usize);
+
+/// `kmem_cache_shrink` for the whole heap: flush this CPU's magazines, request
+/// every other CPU flush its own at its next executor maintenance tick, and
+/// return every empty tracked frame to the buddy. Sleepable, lock-free
+/// context only; never from inside an allocator call.
+pub fn slab::shrink() -> usize;
+/// `drop_slab`: run all shrinkers until a pass frees nothing, then
+/// `slab::shrink`. Backs `/proc/sys/vm/drop_caches`.
+pub fn reclaim::drop_slab() -> usize;
+
 /// Ordinary slab frames use per-frame central chains and intrusive partial /
 /// empty frame lists. Frame descriptors keep their 64-byte footprint: slab
 /// bookkeeping occupies existing padding independently of COW and pin atomics.
@@ -1482,6 +1564,16 @@ x86_64 is rejected at runtime.
 
 ## 4. Invariants & safety properties
 
+- **A kernel stack never has a mapped page below it.** Every `KernelStack`
+  starts at a 256 KiB slot boundary with at least `KSTACK_MAX_BYTES` (128 KiB)
+  of never-mapped VA below its base and the rest of its slot above its top.
+  Both target specs use inline stack probes, so even a frame larger than the
+  guard touches the first page below the base first: an overflow is a fault
+  on the guard, never a write into another object. Inside a stack, bit
+  `KSTACK_SHIFT` of the address is 0; in the guard directly below, it is 1
+  (the aarch64 entry check relies on this). A stack's extent is published
+  only after all its pages are mapped and cleared before they are unmapped,
+  so `guard_hit` never attributes to a half-built or freed stack.
 - Every non-identity kernel mapping has a domain assignment; untagged
   mappings panic in debug, deny-by-default in release.
 - **User memory types never alias System RAM against the kernel's type.**
@@ -1523,11 +1615,37 @@ x86_64 is rejected at runtime.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
 - Buddy allocator free lists and their IRQ-safe locks are per-NUMA-node and
-  cache-line isolated. Order-0 allocation/free is fronted by a bounded,
-  cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
-  under one zone-lock acquisition. Kernel/UNMOVABLE order-1 blocks have a
-  separate eight-pair cache per CPU/node, populated only by complete returned
-  blocks and spilling four pairs at a time. User/MOVABLE blocks bypass it.
+  cache-line isolated. Every managed frame has a free-state word (8 bytes per
+  frame, in 128 MiB sections taken from the buddy: installed for boot RAM at
+  slab promotion, and for a hot-plugged range before it is donated). The word
+  records where the frame is while free — head of a free block (node,
+  migratetype, order, list position) or resident in a per-CPU cache (next
+  frame) — and is 0 otherwise. A word is written only by the holder of the
+  frame's free state: the listing zone under its lock, or the holding cache
+  under its lock. Zones mirror their free lists into the words from slab
+  promotion on, so finding and unlinking a block's buddy is one load and one
+  swap-remove: a free costs O(orders) however many blocks are listed, and an
+  exact-range removal costs O(blocks in the range × orders). A frame with no
+  word (no section covers it) keeps the list-scanning path and is never
+  cached. A free of a frame whose word is non-zero is a double free: it is
+  refused, counted (`double_frees_refused`), and leaves lists and free-page
+  totals untouched.
+  Order-0 allocation/free is fronted by a cache-line-aligned
+  per-CPU/per-node cache whose frames are linked through those words, so the
+  cache has no fixed capacity. Its sizing is derived per node, never constant:
+  the exchange unit `batch` from the node's size (Linux `zone_batchsize`; 63
+  for 1 GiB or more), and a ceiling `high` that floats between the node's low
+  watermark and one eighth of the node, each divided by the CPUs sharing the
+  node (Linux `zone_highsize`, `nr_pcp_alloc`, `nr_pcp_high`) — raised by
+  consecutive refills and by free streaks that did not fit, lowered while the
+  node is below its high watermark, and held to four batches while it is below
+  its low watermark. The sizing is re-derived when the node's size, its low
+  watermark or the CPU count changes. A refill takes `batch << k` frames
+  (k ≤ 5, at most 2016) under one zone-lock acquisition; a trim, spill or
+  drain returns at most 64 blocks per zone-lock acquisition and releases the
+  zone lock between acquisitions. Kernel/UNMOVABLE order-1 blocks ride the
+  same cache on a second list, populated only by complete returned blocks and
+  counted in the same page total. User/MOVABLE blocks bypass it.
   Cached pages remain included in free-page totals and in their corresponding
   order's block statistics. Each successful ownership handoff updates
   one per-node atomic free-page total after removing a frame from the free pool
@@ -1541,10 +1659,15 @@ x86_64 is rejected at runtime.
   or folio allocation holds only one zone lock at a time; nearest-node fallback
   releases the failed zone before trying the next, so unrelated NUMA nodes do
   not serialize on a global frame lock. Coordinated draining bypasses new cache
-  insertion and drains both cache classes before high-order retry or explicit
-  compaction; runtime-hotplug nodes bypass both cache classes so
-  exact-range offline admission continues to observe every free frame in the
-  buddy. Aggregate snapshots visit only nodes in the published online mask;
+  insertion and drains both cache lists before high-order retry or explicit
+  compaction, after a best-effort pass that empties the caches in bounded
+  slices with every lock released in between. An order-0 allocation that finds
+  its node's zone empty performs the same drain before reporting the node
+  exhausted, so memory held in other CPUs' caches is never an allocation
+  failure. Runtime-hotplug nodes bypass the cache, and it is drained when that
+  bypass is published, so exact-range offline admission continues to observe
+  every free frame in the buddy. Aggregate snapshots visit only nodes in the
+  published online mask;
   node counters are initialized before their bit is set and their bit is
   cleared only after the final range has left the allocator.
 - The installed `FrameAlloc` remains an authoritative cap-gated fat pointer,
@@ -1555,9 +1678,29 @@ x86_64 is rejected at runtime.
   locked fallback; reinstalling the buddy publishes its lock-free kind only
   after the pointer is authoritative. Allocator replacement still requires the
   caller's documented ownership quiescence.
+- Memory-cgroup charging (feature `cgroup`) covers user memory only. A
+  `User`/`UserReserve` allocation, and a page-cache or shmem frame passed to
+  `charge_frame_to_current`, is charged to the current task's memory cgroup
+  before it is handed out; `Kernel` allocations (`alloc_frame`,
+  `alloc_pages_on`, `alloc_pages_below`, the heap) are never charged, so no
+  kernel allocation can fail on a cgroup limit. The charged `MemcgId` is
+  recorded per frame (a 4-byte word per boot-managed frame beside the flat COW
+  table, a sharded map for hot-plugged RAM; Linux `folio->memcg_data`) and the
+  frame's final free — `free_pages_ctx`, the final-owner return of
+  `free_frame`/batched frees, `free_movable_range` — takes the record and
+  uncharges that cgroup. A frame on a buddy free list never carries a record.
+  Page migration moves the record to the destination
+  (`transfer_frame_memcg`, Linux `mem_cgroup_migrate`); migration destinations
+  are not charged themselves. A refused user charge queues a memcg OOM for the
+  OOM reaper and returns `ReservePressure`; a copy-on-write break is
+  force-charged.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
-  frame lock is held. Offline succeeds only for an exact registered range
+  frame lock is held. The free-state words for the new range are installed
+  first, before the hot-plug registry or any zone is locked; if they cannot be
+  allocated the range is refused with `MetadataCapacity`. Sections are never
+  removed, so an offlined range keeps its (all-zero) words.
+  Offline succeeds only for an exact registered range
   whose complete buddy extent is free; a failed removal leaves every free
   list and node counter unchanged.
 - **A `PhysFrame` returned by `alloc_frame()` is always tagged to
@@ -1938,7 +2081,14 @@ x86_64 is rejected at runtime.
   from that finite snapshot and new frees append after it, so producers cannot
   extend a pass. Partial candidates remain private across bounded visits and
   return to the queue in O(1) after one snapshot; a complete candidate detaches
-  exactly one frame. The old whole-list address sort is forbidden. The slab
+  exactly one frame. The old whole-list address sort is forbidden. A size
+  class keeps at most SLUB's `min_partial` (`clamp(ilog2(size)/2, 5, 10)`)
+  empty tracked frames: a dealloc spill that leaves more only sets a flag
+  (the dealloc path never calls the buddy), and the executor maintenance
+  point returns the excess, clamping each batch to `empty - min_partial`
+  under the class lock so concurrent per-CPU drains cannot overshoot.
+  Remote magazines are flushed only by their own
+  CPU at that point, on a `slab::shrink` generation request. The slab
   updates class ownership under the class lock, then releases that lock before
   buddy return, cgroup uncharge, or any callback that can re-enter the
   allocator. The negative cgroup uncharge path reached during final-owner
@@ -2193,6 +2343,7 @@ x86_64 is rejected at runtime.
   | 0        | `0x0`                 | AP trampoline pages *only* — see below |
   | 1        | `0x0000_0080_0000_0000` | high MMIO window; never maps RAM    |
   | 272      | `0xFFFF_8800_0000_0000` | `vmalloc` / `ioremap`               |
+  | 279      | `0xFFFF_8B80_0000_0000` | guarded kernel stacks (`kstack`), same slot on aarch64 |
   | 384..510 | `0xFFFF_C000_0000_0000` (`KERNEL_DIRECT_MAP_BASE`) | direct map of RAM |
   | 511      | `0xFFFF_FFFF_8000_0000` (`KERNEL_VIRT_BASE`) | kernel image        |
 

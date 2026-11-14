@@ -404,7 +404,18 @@ for `SecurityMode::Wpa2Psk`:
 - `Required` advertises MFPC|MFPR and refuses an AP without MFPC.
 
 PMF is in force when both RSNEs set MFPC; the AP's group management cipher
-must then be the default BIP-CMAC-128. With `AkmSet::PSK_SHA256` the plan
+must then be the selected one (default BIP-CMAC-128).
+`JoinOptions::ciphers: Option<rsn::Ciphers>` is the supplicant's selection
+of pairwise, group and group management cipher (`None`: CCMP-128 and
+BIP-CMAC-128). The AP's RSNE must offer them, the station RSNE names them
+(a non-default management cipher explicitly), `SaeJoin` does the same, and
+`JoinPlan::ciphers()` reports them. `rsn::Ciphers` gives the
+`wpa_cipher_key_len` of each suite (16 for CCMP-128/GCMP-128/BIP-*-128, 32
+for the 256-bit suites). `validate_sme_ies_for` accepts a supplicant RSNE
+with any of CCMP-128/256 and GCMP-128/256. `mfp::{BipKey, BipKeyStore,
+bip_protect, bip_verify}` implement BIP-CMAC-128/256 and BIP-GMAC-128/256
+(MMIE with an 8- or 16-octet MIC; BIP-GMAC nonce A2 || IPN), alongside the
+CMAC-128-only `MfpKeyStore`. With `AkmSet::PSK_SHA256` the plan
 also negotiates AKM 6 (PSK-SHA256), so PMF-required WPA2 APs that offer only
 AKM 6 can be joined as Linux does. `JoinPlan::akm() -> Option<KeyMgmt>` and
 `JoinPlan::pmf() -> bool` (always true for SAE) report the outcome.
@@ -611,7 +622,17 @@ Result<SaeStep, Error>`: `Transmit` (Confirm, or a Commit carrying an
 anti-clogging token, at most `MAX_ANTI_CLOGGING` = 3 rounds, group 19 only),
 `Ignored` (other peers, a reflected Commit, a retransmitted peer Commit) or
 `Associate` (the association request with the SAE PMKID spliced into its
-RSNE). Status codes other than 0/126/76 are terminal `Rejected`; a Commit
+RSNE). For a cached PMKSA the owner calls `start_pmksa_authentication(pmkid)`
+instead. It returns Open System authentication, and the association
+request's RSNE names that PMKID. For roaming (CONNECT with PREV_BSSID), the
+owner sends `association::reassociation_request(assoc, current_ap)` (subtype
+2, with the Current AP Address after the Listen Interval) and calls
+`expect_reassociation()`, so `association_response` takes the
+Reassociation Response (subtype 3). `authentication_response` accepts the Open
+System reply only for such an attempt, and SAE and a cached attempt exclude
+each other on one plan. An AP that has lost the PMKSA refuses the
+association (`Rejected(53)`); the owner then runs full SAE on a fresh plan.
+Status codes other than 0/126/76 are terminal `Rejected`; a Commit
 status that disagrees with the PWE method or a Confirm before the peer
 Commit is `Protocol`. `sae_pending_frame()` supplies retransmissions;
 `start_authentication`/`authentication_response` refuse SAE plans. The PMK
@@ -1678,8 +1699,26 @@ password `SAE_OFFLOAD` (-EINVAL otherwise); pairwise / group ciphers must be
 wiphy cipher suites (-EINVAL). CONNECT accepts up to five pairwise selectors,
 while direct ASSOCIATE accepts one, as `nl80211_crypto_settings` does.
 `CONTROL_PORT_OVER_NL80211` needs
-`SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). For the PMK
-path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK. Required
+`SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). A CONNECT on a
+station that is already connected is -EALREADY, after the request's own
+validation, unless `WirelessNetIface::supports_roam()` (default false; true
+for drivers that implement `roam`) says the driver reassociates
+(`cfg80211_connect`). wpa_supplicant answers -EALREADY with DISCONNECT and a
+second CONNECT. A SAE-offload CONNECT carries `NL80211_ATTR_SAE_PASSWORD`,
+auth type SAE, `USE_MFP` required, AKM SAE, CCMP, and `WPA_VERSIONS` 2 or 3
+(wpa_supplicant `wpa_ver_supported` sends 3 once the family covers
+`SAE_PASSWORD`). The SAE elements are admitted by
+`association::validate_sme_ies_for(.., SmeRsna::Wpa3Sae)`. BSS selection for
+an SAE CONNECT also finds a WPA3-Personal transition BSS: a WPA2-classified
+result whose RSNE offers AKM 8 or 24 (`select_bss_with_ies`). For the PMK
+path the RSN element in `NL80211_ATTR_IE` must describe CCMP and the AKM of
+`NL80211_ATTR_AKM_SUITES`: PSK, or PSK-SHA256 when the default-false
+`WirelessNetIface::supports_psk_sha256_offload()` says the owner runs it.
+The RSNE's PTKSA/GTKSA replay-counter bits are masked before its
+capabilities are compared, as wpa_supplicant sets sixteen PTKSA counters
+toward every WMM AP. `JoinPlan::append_sme_ies` admits a supplicant RSNE
+only when it names the AKM and MFPC/MFPR the plan negotiated
+(`SmeRsna::Wpa2 { akm, mfp }`). Required
 PMF additionally needs the explicit default-false
 `WirelessNetIface::supports_wpa2_mfp_offload() -> bool` and `USE_MFP=1`;
 cipher advertisement alone cannot grant this association capability. The
@@ -2177,6 +2216,38 @@ local-teardown notifications themselves through
 Deauthentication / Disassociation), so the control bridge does not emit a
 second local-disconnect event.
 
+`rate.rs` holds cfg80211's `rate_info` bitrates in 100 kb/s
+(`ht_bitrate_100kbps`, `vht_bitrate_100kbps`, `he_bitrate_100kbps`, after
+`cfg80211_calculate_bitrate_ht/_vht/_he`). Every MCS, NSS, width, GI and RU
+index is bounds-checked and returns `None` outside the tables. ath11k and
+mt76 share them for `StationInfo` rates. Test: `wireless/rate`.
+
+`cqm.rs` holds `SoftwareCqm`, mac80211's software RSSI monitor for a
+station driver without firmware CQM. `beacon(signal, config)` keeps
+`ewma_beacon_signal` (precision 4, weight 4) and returns a LOW/HIGH crossing
+after `IEEE80211_SIGNAL_AVE_MIN_COUNT` Beacons: by threshold and hysteresis,
+or by the `cfg80211_cqm_rssi_update` range for a list. `level_dbm()` gives
+the averaged level, and `reconfigured()` clears the last event. mt76 uses
+it. Test: `wireless/cqm`.
+
+`rfkill.rs` is cfg80211's per-wiphy rfkill. Each wiphy is one `wlan`
+radio named `phyN`:
+
+- It is registered when the wiphy's first interface registers and
+  unregistered when the last one leaves. A wiphy seen before the core is
+  connected is registered on `install(Backend { register, unregister })`.
+- `narf-drivers-wireless` connects it to the platform rfkill core
+  (`register_radio_indexed`), so `/dev/rfkill`, `/sys/class/rfkill` and
+  the airplane key drive it.
+- `set_soft_blocked(index, true)` is `cfg80211_rfkill_set_block`. Every
+  connected interface of the wiphy disassociates from its own task and
+  reports a locally generated DISCONNECT (reason 3).
+- While the wiphy is blocked, every nl80211 do-operation on its netdevs
+  other than DISCONNECT is -ERFKILL: that radio's interfaces are shut down
+  (`cfg80211_rfkill_block_work`).
+- Tests: `wireless/rfkill` and
+  `smoke_nl80211_rfkill_blocked_wiphy_refuses_scan_and_connect`.
+
 ### 3.4.1 CCMP packet helpers (`ccmp.rs`)
 
 `build_aad` authenticates the three addresses, fragment number and optional
@@ -2595,6 +2666,26 @@ scalar/mask constructors exist only in test or `kernel-test` builds. Protocol
 fixtures use explicit injected material and do not depend on target entropy.
 
 ### 3.5 Authenticated regulatory policy
+
+**Hints, initiators and REG_CHANGE.** A Linux-database country records its
+initiator (`reg::db::Hint`): Core (boot/world), User (`REQ_SET_REG`), or
+CountryIe { previous }.
+
+- `db::hint_country_ie(alpha2)` is cfg80211 `regulatory_hint_country_ie`.
+  nl80211 calls it after a successful CONNECT with the connected BSS's
+  Country element (7). It selects that country's Linux-database rules. It
+  does nothing for a user-chosen country, a signed deployment or caller
+  policy, the world/custom markers, or a malformed alpha2.
+- `db::restore_after_disconnect()` is `regulatory_hint_disconnect`. A
+  country taken from an AP reverts to the one it replaced. nl80211 calls it
+  for DISCONNECT and for every driver-reported disconnect.
+- Each change is `NL80211_CMD_REG_CHANGE` on the "regulatory" group, with
+  `REG_ALPHA2`, `REG_INITIATOR` (CORE 0, USER 1, COUNTRY_IE 3) and
+  `REG_TYPE`.
+- `db::revision()` moves with every installation. Drivers compare the
+  domain by value (`RegulatoryDomain: PartialEq`) to re-program firmware
+  (cfg80211's `reg_notifier`).
+- Test: `wireless/regulatory`.
 
 `reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
 authority. `reg::policy::load()` opens the exact `wireless-regulatory.bin`

@@ -5,15 +5,17 @@
 //!      vector page) and patch its parameter block with CR3, the
 //!      BSP-built GDT, the per-AP stack table, and the Rust entry
 //!      pointer.
-//!   2. For each AP (logical id 1..cpu_count): allocate a stack,
-//!      slot it into AP_STACKS, send INIT, sleep ≥10 ms, send SIPI,
+//!   2. For each AP (logical id 1..cpu_count, APIC ID from the
+//!      MADT-derived map): allocate a stack, slot it into
+//!      AP_STACKS[apic], send INIT, sleep ≥10 ms, send SIPI,
 //!      sleep ≥200 µs, send a second SIPI (Intel SDM §10.4.4.1
 //!      universal-startup pattern).
 //!   3. Spin until each AP marks itself online via
 //!      `narf_lib::smp::mark_online`.
 //!
 //! AP entry path: `_ap_trampoline_start` (real mode) → patched-CR3
-//! load → long mode → `_ap_start_rust(logical_id)`. The trampoline
+//! load → long mode → `_ap_start_rust(apic_id)`, which maps the APIC
+//! ID back to the logical id. The trampoline
 //! lives in `.text.ap_trampoline` and is copied to phys 0x8000 at
 //! runtime — the BSP's identity mapping covers the first 1 GiB so
 //! both source and destination are reachable.
@@ -39,10 +41,11 @@ const _: () = assert!(TRAMPOLINE_PHYS == narf_memory::mmu::AP_TRAMPOLINE_EXEC_BA
 /// SIPI vector-page byte (vector_page << 12 = TRAMPOLINE_PHYS).
 const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 
-/// Per-AP stack-top table. Indexed by logical CPU id (== APIC id
-/// on QEMU). Each entry is the virtual address of the top of the
-/// AP's kernel stack — the trampoline loads `rsp = AP_STACKS[id]`
-/// before calling into Rust.
+/// Per-AP stack-top table, indexed by the AP's APIC ID: the trampoline
+/// runs before the AP knows its logical id and loads
+/// `rsp = AP_STACKS[CPUID.1:EBX[31:24]]`. Each entry is the virtual
+/// address of the top of the AP's kernel stack. An AP whose APIC ID is
+/// `>= MAX_CPUS` cannot be given a slot and is not started.
 #[unsafe(no_mangle)]
 static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
@@ -139,13 +142,15 @@ unsafe fn install_trampoline() {
 
 /// AP entry from the trampoline. Runs in 64-bit long mode with the
 /// kernel's CR3, GDT, and stack already loaded; IDT not yet loaded.
-/// `logical_id` was placed in RDI by the trampoline (read from
-/// CPUID leaf 1 EBX[31:24] == APIC id under QEMU).
+/// `apic_id` was placed in RDI by the trampoline (CPUID leaf 1
+/// EBX[31:24]); the logical CPU id is its slot in the MADT-derived map
+/// (`start_aps` started this AP from that map, so it is listed).
 #[unsafe(no_mangle)]
-pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
-    let id = logical_id as u32;
+pub extern "C" fn _ap_start_rust(apic_id: u64) -> ! {
+    let apic_id = apic_id as u32;
+    let id = narf_acpi::cpu_of_apic_id(apic_id).map_or(apic_id, |cpu| cpu as u32);
 
-    // 1. Set IA32_TSC_AUX so current_cpu() returns logical_id.
+    // 1. Set IA32_TSC_AUX so current_cpu() returns the logical id.
     // SAFETY: per-CPU one-shot during bring-up.
     unsafe {
         narf_arch::x86_64::cpu::set_current_cpu(id);
@@ -262,6 +267,8 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     unsafe {
         let (rsp0_top, irq_top) = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top, irq_top);
+        super::percpu::guard_irq_stack();
+        super::gdt::guard_ist_stacks();
         super::syscall::enable();
         // EFER.NXE — the BSP sets this in bare_main before userspace;
         // each AP must set it too. Without it, every user data/stack PTE
@@ -396,7 +403,8 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // 5. Enter the per-CPU scheduler run loop. `run_forever` drains
     //    this CPU's ready queue, attempts to steal from siblings,
     //    and halts on IRQ when nothing is runnable. Returns never.
-    narf_scheduler::run_forever();
+    // On a guarded stack: the trampoline's direct-mapped block has no guard.
+    super::super::kstack_overflow::run_executor_on_guarded_stack();
 }
 
 /// Bring up every AP advertised by `narf_lib::smp::cpu_count()`.
@@ -438,9 +446,28 @@ pub unsafe fn start_aps() -> u32 {
     // the trampoline halts the AP if its stack-top entry is 0.
     // Stack-allocated viable list to avoid pulling `alloc` into
     // this module — `MAX_CPUS` is a small fixed bound.
+    // Logical CPU ids are dense (`0..total`, the boot CPU 0); the INIT /
+    // SIPI destination and the AP_STACKS slot are the CPU's APIC ID from
+    // the MADT-derived map — equal to the logical id only on a gap-free
+    // topology (QEMU's default, a dense desktop part), not on one whose
+    // firmware leaves APIC-ID holes. Before this map existed the loop sent
+    // INIT/SIPI to APIC IDs `1..total`: on `-smp 6,sockets=2,cores=3`
+    // (APIC IDs 0,1,2,4,5,6) it addressed the absent APIC 3 and never
+    // started APIC 6. Without an MADT (count from SRAT/CPUID) the ids are
+    // assumed to be the identity, as before.
     let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
+    let mut viable_apic_buf = [0u32; narf_lib::percpu::MAX_CPUS];
     let mut viable_len: usize = 0;
     for logical in 1..total {
+        let apic = narf_acpi::apic_id_of_cpu(logical as usize).unwrap_or(logical);
+        if apic as usize >= narf_lib::percpu::MAX_CPUS {
+            let _ = writeln!(
+                Writer,
+                "  smp(x86): CPU {} (APIC {}): APIC ID beyond the AP stack table, not started",
+                logical, apic
+            );
+            continue;
+        }
         // One CONTIGUOUS order-4 block (64 KiB) per AP — the AP runs the
         // deep executor dispatch + trap/IPI handling and needs a single
         // usable stack range (a per-page loop only used the first frame's
@@ -464,12 +491,14 @@ pub unsafe fn start_aps() -> u32 {
         // during this start_aps call, before the AP runs.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
+            (*core::ptr::addr_of_mut!(AP_STACKS))[apic as usize] = stack_top;
         }
         viable_buf[viable_len] = logical;
+        viable_apic_buf[viable_len] = apic;
         viable_len += 1;
     }
     let viable = &viable_buf[..viable_len];
+    let viable_apic = &viable_apic_buf[..viable_len];
     compiler_fence(Ordering::SeqCst);
 
     // Parallelise the INIT-SIPI-SIPI handshake across APs: a serial
@@ -478,42 +507,37 @@ pub unsafe fn start_aps() -> u32 {
     // *minimum* delays between phases against any single AP, so
     // batching across APs is fine. With this shape the entire phase
     // takes ~10.2ms regardless of AP count.
-    //
-    // APIC id == logical id under QEMU's `-smp N`; on real silicon
-    // MADT enumeration produces the same identity for the
-    // common-case Local APIC entries (apic_id == cpu_index). When
-    // ACPI ever surfaces a non-trivial mapping this loop wants a
-    // proper apic_id_for_logical(id) lookup.
+    // The destinations are APIC IDs (`viable_apic`), not logical ids.
 
-    for &logical in viable.iter() {
+    for &apic in viable_apic.iter() {
         // SAFETY: x2APIC was enabled by init_bsp, so the INIT-IPI MSR
-        // write in send_init_ipi targets a valid x2APIC; `logical` is a
-        // viable APIC id selected above.
+        // write in send_init_ipi targets a valid x2APIC; `apic` is a
+        // viable MADT-listed APIC id selected above.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            narf_interrupts::x86_64::apic::send_init_ipi(logical);
+            narf_interrupts::x86_64::apic::send_init_ipi(apic);
         }
     }
     delay_us(10_000); // 10 ms per Intel SDM §10.4.4.1, single shared wait
 
-    for &logical in viable.iter() {
+    for &apic in viable_apic.iter() {
         // SAFETY: x2APIC enabled by init_bsp; send_startup_ipi writes the
-        // SIPI MSR to a valid x2APIC. `logical` is a viable APIC id and
+        // SIPI MSR to a valid x2APIC. `apic` is a viable APIC id and
         // SIPI_VECTOR_PAGE is the page-aligned trampoline vector at 0x8000.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
+            narf_interrupts::x86_64::apic::send_startup_ipi(apic, SIPI_VECTOR_PAGE);
         }
     }
     delay_us(200); // ≥200 µs between SIPIs, single shared wait
 
-    for &logical in viable.iter() {
+    for &apic in viable_apic.iter() {
         // SAFETY: x2APIC enabled by init_bsp; this is the second (retry)
         // SIPI to the same valid APIC id with the same page-aligned
         // trampoline vector, per the Intel-recommended INIT-SIPI-SIPI.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
+            narf_interrupts::x86_64::apic::send_startup_ipi(apic, SIPI_VECTOR_PAGE);
         }
     }
 
@@ -543,9 +567,13 @@ pub unsafe fn start_aps() -> u32 {
         .filter(|&&id| narf_lib::smp::is_online(id))
         .count() as u32;
     if started != viable_len as u32 {
-        for &id in viable.iter() {
+        for (&id, &apic) in viable.iter().zip(viable_apic) {
             if !narf_lib::smp::is_online(id) {
-                let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", id);
+                let _ = writeln!(
+                    Writer,
+                    "  smp(x86): AP {} (APIC {}) never reported online",
+                    id, apic
+                );
             }
         }
     }

@@ -13,13 +13,19 @@ pub(crate) struct Counters {
 pub(crate) struct CardStats {
     bytes_moved: AtomicU64,
     evictions: AtomicU64,
+    failures: super::accounting::Failures,
 }
 impl CardStats {
     pub(super) fn moved(&self, bytes: u64) {
         self.bytes_moved.fetch_add(bytes, Ordering::Relaxed);
     }
-    pub(super) fn evicted(&self) {
-        self.evictions.fetch_add(1, Ordering::Relaxed);
+    /// Count an eviction; true for the card's first.
+    pub(super) fn evicted(&self) -> bool {
+        self.evictions.fetch_add(1, Ordering::Relaxed) == 0
+    }
+    /// Allocation failures and when they were last reported.
+    pub(super) fn failures(&self) -> &super::accounting::Failures {
+        &self.failures
     }
 }
 static CARDS: IrqSafeSpinLock<Vec<(u32, Arc<CardStats>)>> = IrqSafeSpinLock::new(Vec::new());

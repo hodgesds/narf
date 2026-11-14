@@ -238,6 +238,36 @@ pub fn image_virt_to_phys(virt: u64) -> u64 {
         .wrapping_add(IMAGE_PHYS_DELTA.load(Ordering::Relaxed))
 }
 
+/// The first page of the running image that the kernel's page tables do not
+/// map to where it is, as `(virtual address, what it translates to)`; `None`
+/// when every page from the image's first byte to `__kernel_end` — text,
+/// rodata, data, bss, at the applied slide — maps to its own frame.
+///
+/// A window that covers less than the linked image, or an entry cleared
+/// later, leaves part of the kernel unreachable at some slides only, and the
+/// first instruction fetched there faults long after boot. Boot asserts this
+/// instead.
+///
+/// # Safety
+/// The kernel's translation root must be live and its tables reachable
+/// through the kernel direct map.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn first_unmapped_image_page() -> Option<(u64, Option<u64>)> {
+    let (start, end) = image_link_bounds();
+    let first = start & !0xFFF;
+    let base = kernel_virt_base().wrapping_add(first);
+    let pages = (end - first).div_ceil(0x1000);
+    // SAFETY: TTBR1_EL1 is readable at EL1 and names the kernel root.
+    let root = unsafe { crate::aarch64::paging::read_ttbr1_el1() };
+    (0..pages).map(|page| base + page * 0x1000).find_map(|va| {
+        let want = image_virt_to_phys(va);
+        // SAFETY: caller contract — live root, tables direct-mapped.
+        let got = unsafe { crate::aarch64::paging::translate(root, crate::VirtAddr::new(va)) }
+            .map(|phys| phys.raw());
+        (got != Some(want)).then_some((va, got))
+    })
+}
+
 #[cfg(feature = "kernel-test")]
 mod kaslr_slide_tests {
     use super::*;

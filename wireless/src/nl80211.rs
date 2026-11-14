@@ -229,6 +229,7 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
         iface.net_ns_id,
         GenlReply { command: 48, attrs },
     );
+    control::regulatory_disconnect();
 }
 
 /// Report a netdev the driver removed on its own after `NEW_INTERFACE`

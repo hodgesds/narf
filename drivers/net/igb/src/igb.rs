@@ -1157,8 +1157,6 @@ const TX_RING_USABLE: usize = TX_RING_LEN - 1;
 /// posted longer ago than this with no DD is a wedged ring, not
 /// congestion.
 const TX_TIMEOUT_NS: u64 = 5_000_000_000;
-/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
-const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 const RX_RING_LEN: usize = 256;
 /// Per-slot DMA buffer size for the TX copy pool and the RX ring.
 /// Fixed at the family's max-frame size (issue #802): 10240 covers
@@ -3168,22 +3166,12 @@ impl Igb {
         self.stats.tx_resets.load(Ordering::Relaxed)
     }
 
-    /// One watchdog pass (shared by the supervisor task and the
-    /// fixture): if the link is up and a TX descriptor has waited
-    /// past the timeout, count the timeout and recover. Returns
-    /// true when recovery fired.
+    /// One watchdog pass, synchronously (the fixture): the core
+    /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
+    /// true when recovery fired and succeeded.
     fn check_tx_watchdog_at(&self, now: u64) -> bool {
-        if self.detached.load(Ordering::Acquire)
-            || self.suspended.load(Ordering::Acquire)
-            || self.recovering.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        if !self.link_up() {
-            return false;
-        }
-        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
-        if !self.tx_state.lock().stalled(now, timeout) {
+        use narf_net::watchdog::NetdevWatchdog;
+        if !self.tx_timed_out(now) {
             return false;
         }
         self.stats.note_tx_timeout();
@@ -4521,10 +4509,11 @@ fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
         igb_tx_pump(d_tx, tx_cons).await;
     });
 
-    let d_wd = device;
-    narf_scheduler::spawn(async move {
-        igb_watchdog_pump(d_wd).await;
-    });
+    // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues
+    // the reset when a transmit is stuck; it stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
 }
 
 async fn igb_rx_pump(device: Arc<Igb>) {
@@ -4585,15 +4574,29 @@ async fn igb_tx_pump(device: Arc<Igb>, mut tx_cons: Consumer<Frame, TX_RING_N>) 
     }
 }
 
-/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
-/// run one watchdog pass; a queue stalled 5 s with carrier up is
-/// recovered and counted. The pass itself gates on detach/suspend
-/// and on an in-flight recovery, so this loop is only a timer.
-async fn igb_watchdog_pump(device: Arc<Igb>) {
-    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
-    loop {
-        narf_time::sleep_cycles(tick).await;
-        device.check_tx_watchdog_at(narf_time::now_cycles());
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `igb_tx_timeout` → `igb_reset_task`).
+impl narf_net::watchdog::NetdevWatchdog for Igb {
+    /// A TX descriptor waited past `TX_TIMEOUT_NS` with link up, and the
+    /// device is attached, awake and not already recovering.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.detached.load(Ordering::Acquire)
+            || self.suspended.load(Ordering::Acquire)
+            || self.recovering.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if !self.link_up() {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        self.tx_state.lock().stalled(now, timeout)
+    }
+
+    /// Count the timeout and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        self.stats.note_tx_timeout();
+        let _ = self.recover();
     }
 }
 

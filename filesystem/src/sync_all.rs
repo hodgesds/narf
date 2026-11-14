@@ -19,12 +19,23 @@
 //! ([`crate::all_mounted_filesystems`]) — followed by one cache flush per
 //! physical disk that this boot may have written.
 //!
-//! Two callers: `sync(2)`, and the pre-shutdown step `narf_power::system`
-//! runs before the device shutdown hooks (NVMe Flush + CC.SHN) on every
-//! reboot / power-off / halt.
+//! Two callers: `sync(2)`, and `narf_power::orderly::emergency_sync` — the
+//! forced fallback of an orderly power-off whose userspace poweroff command
+//! could not be started. `reboot(2)` does not sync (Linux: "reboot doesn't
+//! sync: do that yourself before calling this").
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// [`sync_all`] passes started this boot.
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`sync_all`] passes have started this boot — lets a test prove
+/// a path did NOT sync.
+pub fn runs() -> u64 {
+    RUNS.load(Ordering::Acquire)
+}
 
 use crate::{FsError, FsInstance};
 
@@ -90,6 +101,7 @@ pub fn flush_block_devices() -> (usize, usize) {
 /// Linux `ksys_sync`: `syncfs` every mounted filesystem, then flush every
 /// disk. Never fails as a whole; the report says what went wrong.
 pub async fn sync_all() -> SyncReport {
+    RUNS.fetch_add(1, Ordering::AcqRel);
     let filesystems = crate::all_mounted_filesystems();
     let (n, fs_errors) = sync_filesystems(&filesystems).await;
     let (disks_flushed, flush_errors) = flush_block_devices();

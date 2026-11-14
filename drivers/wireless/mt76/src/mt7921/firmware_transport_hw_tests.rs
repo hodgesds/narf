@@ -64,7 +64,9 @@ fn rig_with(
         data: Ring::allocate_for(dma, TX_DATA, false)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
-        tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
+        // The descriptor fixtures pin exact TXD words and PIDs; the
+        // periodic rate sample has its own test (tx_sequence_hw_tests).
+        tx_sequence: crate::mt7921::tx_sequence::Owner::without_rate_sampling(),
         pending_events: VecDeque::new(),
         pending_data: VecDeque::new(),
         receive_epoch: 0,

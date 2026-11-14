@@ -388,6 +388,34 @@ kernel_test_in!("time", smoke_time_wall_offset_and_leap_smear);
 
 // ── HPET comparator-programming smokes ───────────────────────────
 
+/// Linux `hpet_clkevt_set_next_event`: a one-shot comparator the counter has
+/// passed, or is within `HPET_MIN_CYCLES` of, is -ETIME (equality-match
+/// hardware would never fire it); one comfortably ahead is armed. In 32-bit
+/// mode the distance is taken modulo 2^32, across the wrap.
+fn smoke_hpet_oneshot_expired_matches_linux_etime() -> TestResult {
+    use crate::hpet::{oneshot_expired, MIN_PROG_TICKS};
+    let cases = [
+        (1_000_000, 1_000_000 - MIN_PROG_TICKS, false, false),
+        (1_000_000, 1_000_000 - MIN_PROG_TICKS + 1, false, true),
+        (1_000_000, 1_000_000, false, true),
+        (1_000_000, 1_000_001, false, true),
+        (1_000_000, 900_000, false, false),
+        // 32-bit mode: deadline just past the wrap, counter just before it.
+        (0x0000_0100, 0xFFFF_FF00, true, false),
+        // 32-bit mode: deadline behind a counter that wrapped.
+        (0xFFFF_FF00, 0x0000_0010, true, true),
+        // Upper bits are ignored in 32-bit mode.
+        (0x1_0000_1000, 0x0000_0010, true, false),
+    ];
+    for (deadline, now, narrow, want) in cases {
+        if oneshot_expired(deadline, now, narrow) != want {
+            return TestResult::Fail("HPET one-shot expiry check disagrees with Linux -ETIME");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time/hpet", smoke_hpet_oneshot_expired_matches_linux_etime);
+
 fn smoke_hpet_arm_oneshot_rejects_when_uninitialised() -> TestResult {
     use crate::hpet;
     // Stash + reset so we don't clobber a real boot-initialised

@@ -1210,7 +1210,18 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         // so the block-device IRQ (IRQs are enabled on this path, and no mount
         // lock is held) completes the reads. Returning None made every deep bind
         // fail NotFound → ENOENT → 226/EXIT_NAMESPACE (logind et al.).
-        narf_scheduler::block_on_spin(self.lookup_async(name)).ok()
+        self.try_lookup(name).ok()
+    }
+
+    /// `ext2_lookup`: the node, `NotFound` for an absent name, or the error
+    /// that stopped the lookup (a failed directory-block read is `Io`, never
+    /// a miss the VFS could cache).
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        narf_filesystem::wait_sync(self.lookup_async(name))
+    }
+
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        narf_filesystem::wait_sync(self.lookup_dir_async(name))
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -1224,7 +1235,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         // See `lookup`: drive the async directory lookup to completion so the
         // synchronous VFS API resolves real entries on this block-backed FS.
-        narf_scheduler::block_on_spin(self.lookup_dir_async(name)).ok()
+        self.try_lookup_dir(name).ok()
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -1520,7 +1531,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     /// The directory's `system.posix_acl_default` in uapi form, for the
     /// VFS's `posix_acl_create` at create time.
     fn default_acl(&self) -> Option<Vec<u8>> {
-        narf_scheduler::block_on_spin(self.xattr_get(narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT))
+        narf_filesystem::wait_sync(self.xattr_get(narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT))
             .ok()
     }
 

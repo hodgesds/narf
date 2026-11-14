@@ -197,7 +197,7 @@ impl Interrupts {
             #[cfg(target_arch = "x86_64")]
             let cpu = super::rss::queue_cpu(index.saturating_sub(1));
             #[cfg(target_arch = "x86_64")]
-            let target = narf_interrupts::apic_id_at(cpu as usize)
+            let target = narf_interrupts::apic_id_of_cpu(cpu as usize)
                 .filter(|&id| id <= 255)
                 .or_else(|| {
                     // SAFETY: interrupt controller is initialized before PCI probe.

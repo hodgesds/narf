@@ -408,6 +408,19 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     task_registry_shard(tid).tasks.lock().get(&tid).cloned()
 }
 
+/// Apply `f` to a registered task without waiting for the registry and
+/// without taking a reference. `None` if the task is gone or its shard is
+/// locked.
+///
+/// For diagnostics that run on a path that must not wait for the registry
+/// (the registry may be held by the very task being described) and must not
+/// hold the last reference to a task. `f` runs under the shard lock, so it
+/// must be short and must not take another task-registry lock.
+pub fn try_with_task<R>(tid: u64, f: impl FnOnce(&Task) -> R) -> Option<R> {
+    let tasks = task_registry_shard(tid).tasks.try_lock()?;
+    tasks.get(&tid).map(|task| f(task))
+}
+
 /// Resolve `tid`, using the stackful task's cached owner when it names the
 /// caller. Cross-task lookups retain the authoritative registry path.
 pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {
@@ -678,7 +691,22 @@ pub(crate) fn switch_counts(tid: u64) -> (u64, u64, u64) {
 /// CPU, and prints "running" otherwise.
 #[inline]
 pub(crate) fn parked_in_syscall(tid: u64) -> bool {
-    task_get(tid).is_some_and(|task| task.uctx.parked_in_syscall.load(Ordering::Relaxed))
+    // A zombie is parked in nothing, whatever its exit work last left in the
+    // flag (see `mark_zombie`).
+    task_get(tid).is_some_and(|task| {
+        task.state.load(Ordering::Acquire) != TASK_ZOMBIE
+            && task.uctx.parked_in_syscall.load(Ordering::Relaxed)
+    })
+}
+
+/// The raw number of the syscall `tid` is executing, if it is inside one
+/// (parked or not). A zombie is inside none.
+pub(crate) fn running_syscall(tid: u64) -> Option<u32> {
+    let task = task_get(tid)?;
+    if task.state.load(Ordering::Acquire) == TASK_ZOMBIE {
+        return None;
+    }
+    task.uctx.in_syscall.load(Ordering::Relaxed).checked_sub(1)
 }
 
 #[inline]
@@ -1427,6 +1455,17 @@ pub fn mark_zombie(tid: u64) -> bool {
         Some(t) => {
             #[cfg(feature = "native-ring")]
             t.authority_control.retire();
+            // A task that parked in the syscall it exits from (a killable
+            // wait SIGKILL ended, a fault taken by `exit_group`'s robust-list
+            // walk) never returns through the dispatcher that clears this. A
+            // zombie is parked in nothing: left set, `/proc/<pid>/wchan`,
+            // `syscall` and `stack` kept naming that syscall, decoded from a
+            // kernel stack the task no longer owns, for as long as the zombie
+            // waited to be reaped — dead tasks read as stuck ones.
+            t.uctx.parked_in_syscall.store(false, Ordering::Release);
+            t.uctx.park_site.store(0, Ordering::Relaxed);
+            t.uctx.yield_site.store(0, Ordering::Relaxed);
+            t.uctx.in_syscall.store(0, Ordering::Relaxed);
             t.state.store(TASK_ZOMBIE, Ordering::Release);
             true
         }

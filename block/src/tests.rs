@@ -2758,3 +2758,179 @@ kernel_test_in!(
     "block/disk_policy",
     smoke_block_disk_policy_root_policies_log_stick
 );
+
+// ── Scatter-gather: split to limits, iterate on a RAM disk ────────
+
+/// `n` separately allocated order-0 frames as a page list of `len` bytes.
+fn sg_pages(
+    n: usize,
+    len: usize,
+) -> Option<(alloc::vec::Vec<narf_io::DmaBuffer>, narf_io::sg::PageList)> {
+    use narf_lib::id::DomainId;
+    let mut keep = alloc::vec::Vec::new();
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..n {
+        let b = narf_io::alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        frames.push(narf_memory::PhysAddr::new(b.dma_addr().raw()));
+        keep.push(b);
+    }
+    let list = narf_io::sg::PageList::new(frames, len, DomainId::DRIVER_0).ok()?;
+    Some((keep, list))
+}
+
+fn smoke_block_sg_split_to_limits() -> TestResult {
+    // A request over 6 non-contiguous pages against a queue allowing 2
+    // segments / 8 KiB per request splits into whole-block children that
+    // each conform, cover the payload exactly once and in order; a request
+    // within the limits is not split; a block that can never fit is
+    // refused.
+    use crate::queue::QueueLimits;
+    use crate::sg::{child_ranges, fit, Fit};
+    let Some((_keep, list)) = sg_pages(6, 6 * 4096) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    let limits = QueueLimits {
+        logical_block_size: 512,
+        max_transfer_bytes: 8192,
+        max_segments: 2,
+        max_segment_bytes: 8192,
+        dma_alignment: 4,
+        queue_depth: 8,
+        nr_queues: 1,
+    };
+    let segs = list.segments();
+    if fit(&segs, 48, &limits) != Fit::Split {
+        return TestResult::Fail("an oversized request was not classified as Split");
+    }
+    let Some(ranges) = child_ranges(&list, 0, 6 * 4096, &limits) else {
+        return TestResult::Fail("split refused a splittable request");
+    };
+    let mut at = 0usize;
+    for &(off, len) in &ranges {
+        if off != at || len == 0 || len % 512 != 0 || len > 8192 {
+            return TestResult::Fail(
+                "children are not contiguous whole-block ranges within limits",
+            );
+        }
+        let Some(child_segs) = list.segments_in(off, len) else {
+            return TestResult::Fail("child range outside the list");
+        };
+        if child_segs.len() > 2 || child_segs.iter().any(|s| s.len > 8192) {
+            return TestResult::Fail("a child exceeds the segment limits");
+        }
+        at += len;
+    }
+    if at != 6 * 4096 || ranges.len() < 3 {
+        return TestResult::Fail("children do not cover the payload exactly once");
+    }
+    // Within limits: one child == the request.
+    let Some(one) = child_ranges(&list, 0, 4096, &limits) else {
+        return TestResult::Fail("split refused a conforming request");
+    };
+    if one.len() != 1 || one[0] != (0, 4096) {
+        return TestResult::Fail("a conforming request was split");
+    }
+    if fit(&list.segments_in(0, 4096).unwrap_or_default(), 8, &limits) != Fit::Fits {
+        return TestResult::Fail("a conforming request was not classified as Fits");
+    }
+    // One 4 KiB block cannot fit a 2 KiB transfer limit: refused, not looped.
+    let tiny = QueueLimits {
+        logical_block_size: 4096,
+        max_transfer_bytes: 2048,
+        ..limits
+    };
+    if child_ranges(&list, 0, 4096, &tiny).is_some() {
+        return TestResult::Fail("a block larger than the transfer limit was split");
+    }
+    // A segment misaligned to the DMA alignment can never conform.
+    let mis = [narf_io::sg::Segment {
+        dma: 0x1002,
+        len: 512,
+    }];
+    if !matches!(fit(&mis, 1, &limits), Fit::Refused(_)) {
+        return TestResult::Fail("a misaligned segment was not refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/sg", smoke_block_sg_split_to_limits);
+
+fn smoke_block_sg_ram_disk_iterates_pages() -> TestResult {
+    // A RAM disk has no scatter-gather DMA: `submit_sg` copies page by
+    // page. Write a pattern from 3 non-contiguous pages, read it back into
+    // 3 others, through `SyncBlock`-free direct calls and through the
+    // splitter with limits smaller than the request.
+    use crate::ram::RamBlockDevice;
+    use crate::sg::SgRequest;
+    use crate::{BlockDevice, BlockOp};
+    use core::future::Future;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    unsafe fn no_op(_: *const ()) {}
+    const VTAB: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+    // SAFETY: null-pointer-clean stubs.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+    let mut cx = Context::from_waker(&waker);
+    let dev = RamBlockDevice::new(512, 1024);
+    let Some((wkeep, wlist)) = sg_pages(3, 3 * 4096) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    let Some((rkeep, rlist)) = sg_pages(3, 3 * 4096) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    for (i, b) in wkeep.iter().enumerate() {
+        // SAFETY: live coherent pages, exclusively ours.
+        unsafe {
+            for j in 0..4096usize {
+                core::ptr::write_volatile(
+                    b.cpu_mut_ptr::<u8>().add(j),
+                    (j as u8) ^ (i as u8 * 0x55),
+                );
+            }
+        }
+    }
+    let wcap = narf_io::register_pages_with_cap(wlist);
+    let rcap = narf_io::register_pages_with_cap(rlist);
+    let Ok(wr) = wcap.derive::<narf_capabilities::Read>() else {
+        return TestResult::Fail("derive failed");
+    };
+    let Ok(rr) = rcap.derive::<narf_capabilities::Read>() else {
+        return TestResult::Fail("derive failed");
+    };
+    let mut w = core::pin::pin!(dev.submit_sg(SgRequest::new(
+        BlockOp::Write { fua: false },
+        64,
+        24,
+        wr,
+        1
+    )));
+    let Poll::Ready(c) = w.as_mut().poll(&mut cx) else {
+        return TestResult::Fail("RAM disk SG write pending");
+    };
+    if c.result.is_err() {
+        return TestResult::Fail("RAM disk SG write failed");
+    }
+    let mut r = core::pin::pin!(dev.submit_sg(SgRequest::new(BlockOp::Read, 64, 24, rr, 2)));
+    let Poll::Ready(c) = r.as_mut().poll(&mut cx) else {
+        return TestResult::Fail("RAM disk SG read pending");
+    };
+    if c.result.is_err() {
+        return TestResult::Fail("RAM disk SG read failed");
+    }
+    for (i, b) in rkeep.iter().enumerate() {
+        // SAFETY: as above.
+        let ok = unsafe {
+            (0..4096usize).all(|j| {
+                core::ptr::read_volatile(b.cpu_ptr::<u8>().add(j)) == (j as u8) ^ (i as u8 * 0x55)
+            })
+        };
+        if !ok {
+            return TestResult::Fail("RAM disk SG read-back mismatch");
+        }
+    }
+    narf_io::unregister_pages(wcap);
+    narf_io::unregister_pages(rcap);
+    TestResult::Pass
+}
+kernel_test_in!("block/sg", smoke_block_sg_ram_disk_iterates_pages);

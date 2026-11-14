@@ -25,10 +25,16 @@ mod p2p_management_model;
 mod active_scan_tests;
 #[path = "rxd_fields_tests.rs"]
 mod rxd_fields_tests;
+#[path = "sched_scan_tests.rs"]
+mod sched_scan_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
 
+#[path = "cipher_tests.rs"]
+mod cipher_tests;
+#[path = "dfs_tests.rs"]
+mod dfs_tests;
 #[path = "dynamic_wmm_tests.rs"]
 mod dynamic_wmm_tests;
 #[path = "frag_tests.rs"]
@@ -57,6 +63,8 @@ mod rx_ba_tests;
 mod rx_fragment_tests;
 #[path = "six_ghz_tests.rs"]
 mod six_ghz_tests;
+#[path = "station_stats_tests.rs"]
+mod station_stats_tests;
 #[path = "system_pm_tests.rs"]
 mod system_pm_tests;
 #[path = "tx_ba_restart_tests.rs"]
@@ -259,6 +267,9 @@ struct Model {
     edca_progress_fault: u8,
     deny_tx_after: Option<usize>,
     tx_policy: Option<Arc<CurrentPolicy>>,
+    /// Keep the fixture AP after the station's closing deauth, for tests
+    /// that reconnect to it (they restart its phase themselves).
+    keep_access_point: bool,
     station_channel: u8,
     rx_stall: bool,
     idle_stall: bool,
@@ -402,6 +413,7 @@ impl Model {
             edca_progress_fault: 0,
             deny_tx_after: None,
             tx_policy: None,
+            keep_access_point: false,
             station_channel: 6,
             rx_stall: false,
             idle_stall: false,
@@ -1053,7 +1065,9 @@ impl Backend for Model {
                 {
                     return Err(Error::Bounds);
                 }
-                self.access_point = None;
+                if !self.keep_access_point {
+                    self.access_point = None;
+                }
                 return Ok(());
             }
         }

@@ -1032,8 +1032,8 @@ pub fn try_init_default() {
 
 /// Power-off / reboot shutdown hook (#942): the TPM's teardown.
 ///
-/// Runs with the system otherwise idle, after the pre-shutdown
-/// filesystem sync and the persistent-log flush, in reverse probe
+/// Runs with the system otherwise idle, after the persistent-log
+/// flush, in reverse probe
 /// order with the other device hooks (Linux `device_shutdown`).
 /// The hook must be bounded and must not sleep on the scheduler:
 /// the submit is a self-waking register poll driven through

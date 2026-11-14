@@ -102,7 +102,14 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
         return;
     }
     match crate::mapped_file::flush_current_range(addr, len) {
+        // A flush a fatal signal cut short stops early and reports nothing
+        // wrong; the pages it did not reach stay dirty for the flusher. The
+        // caller is dying, but the answer must not claim the range is
+        // durable.
+        Ok(()) if crate::handlers::current_task_fatal_signal_pending() => {
+            ctx.set_return(errno_ret(EINTR))
+        }
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(errno_ret(EIO)),
+        Err(error) => ctx.set_return(errno_ret(copy_fs_errno(error))),
     }
 }

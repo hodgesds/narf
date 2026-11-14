@@ -149,6 +149,101 @@ struct Queue {
     created_ns: u64,
     /// This queue's share of the namespace's fragment memory.
     mem: usize,
+    /// `q->timer`: fires `ip_expire` `ipfrag_time` after creation.
+    timer: FragTimerHandle,
+}
+
+/// A queue's expiry timer (`inet_frag_queue::timer`). It names its queue by
+/// key, not by pointer: queues move inside the map.
+///
+/// Ownership follows the wheel. Dropping the queue's handle shuts the timer
+/// down; if its callback is not running the handle frees it, otherwise the
+/// running callback does once it returns from the queue lookup. A callback
+/// that runs therefore always frees its own timer — it either finds its
+/// queue (and expires it, dropping the handle while the callback runs) or
+/// finds the queue already gone. Linux gets the same from the queue
+/// refcount the timer holds.
+#[repr(C)]
+struct FragTimer {
+    timer: narf_scheduler::narf_time::timer::TimerList,
+    net_ns_id: u64,
+    key: FragKey,
+}
+
+/// Owning handle in the queue (a pointer, not a `Box`: the wheel touches the
+/// timer while the queue map is borrowed mutably).
+struct FragTimerHandle(core::ptr::NonNull<FragTimer>);
+
+// SAFETY: `FragTimer` is a `TimerList` (Send + Sync) and plain data.
+unsafe impl Send for FragTimerHandle {}
+
+impl core::fmt::Debug for FragTimerHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("FragTimerHandle").finish()
+    }
+}
+
+impl FragTimerHandle {
+    /// A queue's timer, armed for `ipfrag_time` from now.
+    fn armed(net_ns_id: u64, key: FragKey) -> Self {
+        use narf_scheduler::narf_time::timer;
+        let ft = alloc::boxed::Box::leak(alloc::boxed::Box::new(FragTimer {
+            timer: timer::TimerList::new(frag_timer_fn, 0),
+            net_ns_id,
+            key,
+        }));
+        // SAFETY: leaked, so it stays put; freed by the handle's drop or by
+        // the callback (see `FragTimer`).
+        unsafe {
+            timer::mod_timer(
+                &ft.timer,
+                timer::jiffies() + timer::ns_to_jiffies(IPFRAG_TIME_NS),
+            )
+        };
+        Self(core::ptr::NonNull::from(ft))
+    }
+}
+
+impl Drop for FragTimerHandle {
+    fn drop(&mut self) {
+        use narf_scheduler::narf_time::timer;
+        // SAFETY: live until freed below or by its running callback.
+        let t = unsafe { &self.0.as_ref().timer };
+        timer::timer_shutdown(t);
+        if timer::try_to_del_timer_sync(t) != -1 {
+            // Neither pending nor running, and shut down: nothing can touch
+            // it again.
+            // SAFETY: leaked by `armed`; this is the last owner.
+            drop(unsafe { alloc::boxed::Box::from_raw(self.0.as_ptr()) });
+        }
+    }
+}
+
+/// `ip_expire`: the queue's timer fired.
+fn frag_timer_fn(r: narf_scheduler::narf_time::timer::TimerRef) {
+    let me = r.as_ptr() as *mut FragTimer;
+    // SAFETY: only `FragTimer`s use this callback (`timer` is the first field
+    // of the repr(C) struct); a running callback's timer is freed by nobody
+    // but itself.
+    let (net_ns_id, key) = unsafe { ((*me).net_ns_id, (*me).key) };
+    let owed = {
+        let mut all = FQDIRS.lock();
+        all.get_mut(&net_ns_id).and_then(|dir| {
+            let ours = dir
+                .queues
+                .get(&key)
+                .is_some_and(|q| q.timer.0.as_ptr() == me);
+            // Dropping the queue's handle here sees this callback running and
+            // leaves the free to it.
+            ours.then(|| expire_queue(net_ns_id, dir, &key)).flatten()
+        })
+    };
+    if let Some(e) = owed {
+        send_reasm_timeout(&e);
+    }
+    // SAFETY: the callback owns its timer (see `FragTimer`); nothing touches
+    // it after this.
+    drop(unsafe { alloc::boxed::Box::from_raw(me) });
 }
 
 /// `/proc/net/snmp` reassembly counters (`IPSTATS_MIB_REASM*`).
@@ -189,8 +284,7 @@ impl Fqdir {
 }
 
 static FQDIRS: IrqSafeSpinLock<BTreeMap<u64, Fqdir>> = IrqSafeSpinLock::new(BTreeMap::new());
-/// Live queues across all namespaces, so the timer tick skips the lock when
-/// nothing is being reassembled.
+/// Live queues across all namespaces (diagnostic).
 static QUEUE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// `inet_frag_queue_insert` results.
@@ -304,6 +398,7 @@ pub fn ip_defrag_at(now_ns: u64, net_ns_id: u64, iface_in: &str, packet: &[u8]) 
             max_df_size: 0,
             created_ns: now_ns,
             mem: qsize,
+            timer: FragTimerHandle::armed(net_ns_id, key),
         });
         dir.mem += qsize;
         QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -458,16 +553,32 @@ struct Expired {
     head: Vec<u8>,
 }
 
-/// Net timer tick: expire queues older than `ipfrag_time`.
-pub fn tick() {
-    if QUEUE_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
+/// The locked half of `ip_expire` for the queue at `key`: unhash it, count
+/// the timeout, and return the ICMP error it owes the sender, if any.
+fn expire_queue(net_ns_id: u64, dir: &mut Fqdir, key: &FragKey) -> Option<Expired> {
+    let mut q = dir.queues.remove(key)?;
+    dir.mem = dir.mem.saturating_sub(q.mem);
+    QUEUE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    dir.stats.fails += 1;
+    dir.stats.timeout += 1;
+    if !q.first_in {
+        return None;
     }
-    expire_at(narf_scheduler::narf_time::monotonic_ns());
+    // The head is the lowest run; offset 0 is in it.
+    let first = q.runs.first().filter(|r| r.offset == 0)?;
+    let mut head = q.head_hdr.clone();
+    head.extend_from_slice(&first.data[..q.head_len.min(first.data.len())]);
+    Some(Expired {
+        net_ns_id,
+        iif: core::mem::take(&mut q.iif),
+        head,
+    })
 }
 
 /// `ip_expire` for every queue created at least [`IPFRAG_TIME_NS`] before
-/// `now_ns`. Returns how many queues expired.
+/// `now_ns`, whatever its timer says (tests drive the clock by hand; the
+/// queues' own timers expire them in normal operation). Returns how many
+/// queues expired.
 #[doc(hidden)]
 pub fn expire_at(now_ns: u64) -> usize {
     let mut owed: Vec<Expired> = Vec::new();
@@ -482,28 +593,13 @@ pub fn expire_at(now_ns: u64) -> usize {
                 .map(|(k, _)| *k)
                 .collect();
             for key in dead {
-                let Some(q) = dir.queues.remove(&key) else {
-                    continue;
-                };
-                dir.mem = dir.mem.saturating_sub(q.mem);
-                QUEUE_COUNT.fetch_sub(1, Ordering::Relaxed);
-                dir.stats.fails += 1;
-                dir.stats.timeout += 1;
-                expired += 1;
-                if !q.first_in {
+                if !dir.queues.contains_key(&key) {
                     continue;
                 }
-                // The head is the lowest run; offset 0 is in it.
-                let Some(first) = q.runs.first().filter(|r| r.offset == 0) else {
-                    continue;
-                };
-                let mut head = q.head_hdr.clone();
-                head.extend_from_slice(&first.data[..q.head_len.min(first.data.len())]);
-                owed.push(Expired {
-                    net_ns_id,
-                    iif: q.iif,
-                    head,
-                });
+                expired += 1;
+                if let Some(e) = expire_queue(net_ns_id, dir, &key) {
+                    owed.push(e);
+                }
             }
         }
     }

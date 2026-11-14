@@ -169,6 +169,7 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // whose backing became newly shared. Repeated forks therefore do not
     // re-walk pages that were already COW read-only.
     let child_as = alloc::sync::Arc::new(child_as);
+    narf_memory::as_origin::note_arc(&child_as);
 
     // Snapshot the parent's trap frame BEFORE we set the parent's
     // own return value below. The snapshot captures the syscall-
@@ -372,7 +373,6 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
-    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     // fork(2) is clone without CLONE_FS: a private copy of root + cwd.
     fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());

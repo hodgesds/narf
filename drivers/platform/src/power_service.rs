@@ -62,9 +62,12 @@ impl service::ActionExecutor for PlatformExecutor {
                 let _ = schedule_sleep(action, cap);
             }
             PowerAction::PowerOff => {
+                // An explicit policy action: forced, so a missing poweroff
+                // command still powers off (emergency sync + kernel
+                // power-off), as Linux `orderly_poweroff(true)`.
                 narf_power::orderly::orderly_poweroff(
                     narf_power::orderly::OrderlyReason::PowerService,
-                    None,
+                    true,
                 );
             }
         }

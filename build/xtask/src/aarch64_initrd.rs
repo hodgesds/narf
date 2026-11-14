@@ -30,10 +30,15 @@ const PH_MAX: usize = 4096;
 /// sit at a fixed address (0x4f000000), but the kernel image has grown
 /// past it — its segment 3 now spans 0x4c600000..0x4f8ad908, covering
 /// the fixed DTB address, so QEMU refuses to start ("Some ROM regions
-/// are overlapping"). The guest finds the DTB wherever it lands: both
-/// the Rust `scan_for_dtb` and the stub's `.Lfdt_pick` scan low RAM
-/// for the FDT magic, and the relocation avoid-table is built from the
-/// found address, so a dynamic address needs no guest change.
+/// are overlapping").
+///
+/// This is a contract with the guest: QEMU enters a raw ELF with x0 = 0,
+/// so the guest computes the same address — its link-time `__kernel_end`
+/// (the end of `.bss`, the last PT_LOAD), raised to `FLOOR`, rounded up to
+/// `ALIGN` — in the stub's `.Lfdt_pick` and the Rust `scan_for_dtb`
+/// (`runner_dtb_addr`), and checks it for the FDT magic. Both also scan
+/// [0x4000_0000, 0x5000_0000), but an image ending past that puts the DTB
+/// out of the scan's reach. Change `FLOOR` or `ALIGN` there too.
 pub(crate) fn dtb_load_addr(kernel: &Path) -> Result<u64> {
     kernel_end(kernel)?
         .max(FLOOR)

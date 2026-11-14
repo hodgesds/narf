@@ -130,15 +130,26 @@ mismatch short-circuits to `Err(Revoked)`. `revoke(cap)` increments
 the object epoch — O(1) mass invalidation of every derived + badged
 cap that references it, regardless of how many tasks hold them.
 
-**Indexed metadata.** Object indices are never reused. A sparse four-byte
-index directory publishes immutable kinds and stable leaves once; readers
-perform three acquire pointer loads and an acquire epoch load, with no global
-read lock or search. Kind is initialized before release publication of epoch 1
-and never changes, so `epoch_and_kind` observes a coherent kind/epoch pair.
-Allocation failure leaves an invalid hole and `bootstrap_with` reports
-`CapTableFull`; the legacy infallible mint retains its panic policy. Published
-pages are permanent. Epoch wrap reaches terminal zero and never revives an
-old capability. Neither `CapSlot` nor task-local slot addressing changes.
+**Indexed metadata.** A sparse four-byte index directory publishes stable
+leaves once; readers perform three acquire pointer loads and an acquire epoch
+load, with no global read lock or search. An object's index is reused after
+`object_table::release(index)` — the generation half of the 128-bit slot is
+what makes that sound: the epoch's parity says what an entry is (odd = live,
+even = released, zero = never allocated or exhausted); registration publishes
+an odd epoch, `bump_epoch` (revocation) adds two, `release` adds one and puts
+the index on a lock-free free list, and a re-registration rewrites the kind
+and adds one again. `check_live` is an equality test against a live epoch, so
+every capability minted before a release fails it forever, whatever object the
+index names next; readers never read the kind of an entry that is not live,
+and `epoch_and_kind` reads the kind between two loads of the epoch so the
+pair is coherent. A second release of the same index is refused. Allocation
+failure leaves an invalid hole and `bootstrap_with` reports `CapTableFull`;
+the legacy infallible mint retains its panic policy. Published pages are
+permanent. An epoch that would wrap retires the entry at terminal zero and
+never revives an old capability. Neither `CapSlot` nor task-local slot
+addressing changes. (`smoke_cap_object_index_reused_after_release`,
+`smoke_cap_object_release_bounds_the_table`; `io/`'s DMA registries release
+their indices on unregister, `smoke_io_registry_bounded_by_live_objects`.)
 
 **This is the single most important runtime invariant in NARF's
 security model:** *holding a `Cap<T, R>` proves you were granted
@@ -196,6 +207,7 @@ pub enum CapKind {
     Domain               = 0x0050,    // claim a DomainId; security-sensitive
     DmaBuffer            = 0x0051,
     SharedRegion         = 0x0052,
+    DmaPageList          = 0x0054,   // io/: a list of page frames one DMA payload spans
 
     // Tracing / observability
     Probe                = 0x0060,

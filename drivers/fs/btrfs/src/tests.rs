@@ -17,12 +17,30 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod admitted_ops;
 mod batch_commit;
+mod cache_bounds;
+mod cache_off;
+mod commit_handover;
 mod commit_scale;
+mod concurrent_ops;
 mod data_cache;
 mod extent_window;
+mod group_commit;
+mod grow_tall;
+mod inode_lock;
+mod mirror_repair;
+mod ordered_data;
+mod overwrite_cost;
+mod release_cost;
+mod root_collapse;
 mod safety;
+mod sg_io;
+mod snapshot_gen;
 mod snapshots;
+mod two_handles;
+mod verified_copies;
+mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
 
@@ -173,12 +191,20 @@ fn poll_once<F: core::future::Future>(mut future: F) -> Option<F::Output> {
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut context = Context::from_waker(&waker);
     // SAFETY: `future` stays at this stack slot until dropped.
-    let pinned = unsafe { Pin::new_unchecked(&mut future) };
-    match pinned.poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    // A long truncate or fallocate yields between its steps
+    // (`write::step_break`) and is ready only after many polls; a future
+    // that is really blocked stays pending and comes back `None`.
+    for _ in 0..POLL_ONCE_LIMIT {
+        if let Poll::Ready(value) = pinned.as_mut().poll(&mut context) {
+            return Some(value);
+        }
     }
+    None
 }
+
+/// Polls [`poll_once`] spends on a future before calling it blocked.
+const POLL_ONCE_LIMIT: u32 = 1 << 20;
 
 /// Mount a `NARFBTR1` sparse image on a fresh `RamBlockDevice` (512-byte LBAs).
 fn mount_sparse(
@@ -312,7 +338,17 @@ struct WritableSparseDevice {
     overlay: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
+/// Test-only: while set, every [`WritableSparseDevice`] fails its cache
+/// flushes (a device whose REQ_PREFLUSH errors).
+static FAIL_FLUSHES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 impl narf_block::BlockDeviceSync for WritableSparseDevice {
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        if FAIL_FLUSHES.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        Ok(())
+    }
     fn lba_size(&self) -> u32 {
         self.lba_size
     }
@@ -2861,18 +2897,22 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
         _ => return TestResult::Fail("simple snapshot failed to mount"),
     };
     let snapshot_id = snapshot.fs_tree_id();
+    // Its root is a copy of the source's (`btrfs_copy_root`): one new node
+    // the snapshot owns, which simple quotas charge to it; nothing else.
     if qgroup_item(&snapshot, format::QGROUP_INFO_KEY, snapshot_id)
         .and_then(|body| format::le64(&body, 8).ok())
         .unwrap_or(u64::MAX)
-        != 0
+        != snapshot.nodesize() as u64
         || !qgroup_relation_present(&snapshot, snapshot_id, PARENT)
     {
-        return TestResult::Fail("shared snapshot was charged or missed auto-inheritance");
+        return TestResult::Fail(
+            "snapshot was charged other than its root copy, or missed auto-inheritance",
+        );
     }
 
-    // The source qgroup cannot disappear while the shared root still contains
-    // metadata permanently owned by it. Once the snapshot COWs that final
-    // holder, the debit must still find the orphaned qgroup.
+    // The snapshot holds nothing the source owns (it copied the source's
+    // only block, its root leaf), so deleting the source debits all of the
+    // source's usage at once.
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
     let _ = poll_once(snapshot.sync_to_disk());
@@ -2894,8 +2934,8 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     let orphan_usage = qgroup_item(&top_for_delete, format::QGROUP_INFO_KEY, child_id)
         .and_then(|body| format::le64(&body, 8).ok())
         .unwrap_or(0);
-    if orphan_usage != child_usage {
-        return TestResult::Fail("simple source qgroup was dropped before its final debit");
+    if orphan_usage != 0 {
+        return TestResult::Fail("simple source qgroup kept usage its deletion freed");
     }
     // Batched commits: sync before reading the volume back from disk.
     let _ = poll_once(top_for_delete.sync_to_disk());
@@ -2928,7 +2968,7 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     }
     let debited_orphan = qgroup_item(&snapshot, format::QGROUP_INFO_KEY, child_id)
         .and_then(|body| format::le64(&body, 8).ok());
-    if debited_orphan != Some(0) {
+    if debited_orphan.is_some_and(|usage| usage != 0) {
         return TestResult::Fail("simple orphan qgroup missed its final owner debit");
     }
 
@@ -3403,7 +3443,9 @@ fn check_queued_mutation_cache_epoch(kind: u8) -> TestResult {
     if !matches!(poll_once(file.write(0, &old)), Some(Ok(8192))) {
         return TestResult::Fail("cache epoch file seed failed");
     }
-    let held = match poll_once(vol.op_lock().lock()) {
+    // A commit in progress: the transaction closed, which keeps out every
+    // mutation, whole operations and a truncate's or fallocate's steps alike.
+    let held = match poll_once(vol.close_txn()) {
         Some(held) => held,
         None => return TestResult::Fail("cache epoch operation lock busy"),
     };
@@ -3539,15 +3581,15 @@ fn smoke_btrfs_commit_keeps_freed_space_for_older_readers() -> TestResult {
     };
     const RANGE: (u64, u64) = (0x7000_0000, 0x4000);
     const LATER: (u64, u64) = (0x7100_0000, 0x4000);
-    vol.pin_extent(RANGE.0, RANGE.1);
+    vol.pin_extent(1, RANGE.0, RANGE.1);
     let older = vol.begin_reader();
-    vol.unpin_all();
+    vol.unpin_through(u64::MAX);
     if !vol.pinned_ranges().contains(&RANGE) {
         return TestResult::Fail("a commit released space a running reader may use");
     }
     let newer = vol.begin_reader();
-    vol.pin_extent(LATER.0, LATER.1);
-    vol.unpin_all();
+    vol.pin_extent(1, LATER.0, LATER.1);
+    vol.unpin_through(u64::MAX);
     drop(older);
     let ranges = vol.pinned_ranges();
     if ranges.contains(&RANGE) {
@@ -3560,20 +3602,52 @@ fn smoke_btrfs_commit_keeps_freed_space_for_older_readers() -> TestResult {
     if !vol.pinned_ranges().is_empty() {
         return TestResult::Fail("space stayed withheld with no reader running");
     }
-    vol.pin_extent(RANGE.0, RANGE.1);
-    vol.unpin_all();
+    vol.pin_extent(1, RANGE.0, RANGE.1);
+    vol.unpin_through(u64::MAX);
     if !vol.pinned_ranges().is_empty() {
         return TestResult::Fail("a commit with no reader running withheld its space");
     }
     TestResult::Pass
 }
+
+/// A superblock releases only what the transactions it covers freed (Linux
+/// `btrfs_finish_extent_commit`, per transaction): a later transaction's
+/// freed blocks stay pinned until a superblock of its own generation is
+/// durable, because the one just written still names the trees using them.
+fn smoke_btrfs_superblock_releases_only_its_own_pins() -> TestResult {
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    const OLD: (u64, u64) = (0x7000_0000, 0x4000);
+    const NEW: (u64, u64) = (0x7100_0000, 0x4000);
+    vol.pin_extent(10, OLD.0, OLD.1);
+    vol.pin_extent(11, NEW.0, NEW.1);
+    vol.unpin_through(10);
+    let ranges = vol.pinned_ranges();
+    if ranges.contains(&OLD) {
+        return TestResult::Fail("a superblock kept its own transaction's pins");
+    }
+    if !ranges.contains(&NEW) {
+        return TestResult::Fail("a superblock released a later transaction's pins");
+    }
+    vol.unpin_through(11);
+    if !vol.pinned_ranges().is_empty() {
+        return TestResult::Fail("the later superblock kept its transaction's pins");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_superblock_releases_only_its_own_pins
+);
 kernel_test_in!(
     "drivers/fs/btrfs/cache",
     smoke_btrfs_commit_keeps_freed_space_for_older_readers
 );
 
 /// Lookup and final eviction race without a lock: an eviction either sees the
-/// lookup's anchor and backs off, or the lookup sees the eviction's count.
+/// lookup's anchor and backs off, or the lookup sees its inode evicting.
 fn smoke_btrfs_eviction_claim_excludes_open_inodes() -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_fixture() {
@@ -3586,20 +3660,23 @@ fn smoke_btrfs_eviction_claim_excludes_open_inodes() -> TestResult {
         _ => return TestResult::Fail("create evict.dat failed"),
     };
     let (tree, ino) = (vol.fs_tree_id(), file.ino());
-    let before = vol.eviction_count();
     if vol.claim_for_eviction(tree, ino) {
         return TestResult::Fail("eviction claimed an open inode");
     }
-    if vol.eviction_count() != before {
+    if vol.is_evicting(tree, ino) {
         return TestResult::Fail("a refused claim sent running lookups back to the start");
     }
     drop(file);
     if !vol.claim_for_eviction(tree, ino) {
         return TestResult::Fail("eviction refused a closed inode");
     }
-    if vol.eviction_count() == before {
+    if !vol.is_evicting(tree, ino) {
         return TestResult::Fail("an eviction was invisible to a running lookup");
     }
+    if vol.is_evicting(tree, ino + 1) {
+        return TestResult::Fail("an eviction was visible to a lookup of another inode");
+    }
+    vol.end_eviction(tree, ino);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -8671,6 +8748,7 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
     let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
     let source_big_extent;
     let pre_snapshot_root;
+    let pre_snapshot_node;
     {
         let vol = match poll_once(BtrfsVolume::mount_opts(
             device.clone(),
@@ -8690,6 +8768,12 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             None => return TestResult::Fail("source big.dat extent missing"),
         };
         pre_snapshot_root = vol.fs_tree_root();
+        // The source's root as the snapshot copies it: the block itself is
+        // freed by the source's own COW in the same transaction.
+        pre_snapshot_node = match poll_once(vol.read_node_shared(pre_snapshot_root.0)) {
+            Some(Ok(node)) => node,
+            _ => return TestResult::Fail("source root did not read"),
+        };
         if !matches!(
             poll_once(root.snapshot_async(root.clone(), "snap", false)),
             Some(Ok(()))
@@ -8723,8 +8807,17 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             return TestResult::Fail("writable snapshot remounted read-only");
         }
         snapshot_id = snap.fs_tree_id();
-        if snap.fs_tree_root() != pre_snapshot_root {
-            return TestResult::Fail("snapshot did not retain the source point-in-time root");
+        let pre_node = &pre_snapshot_node;
+        let Some(Ok(snap_node)) = poll_once(snap.read_node_shared(snap.fs_tree_root().0)) else {
+            return TestResult::Fail("snapshot root block did not read");
+        };
+        if snap.fs_tree_root() == pre_snapshot_root
+            || snap.fs_tree_root().1 != pre_snapshot_root.1
+            || pre_node.get(HEADER_SIZE..) != snap_node.get(HEADER_SIZE..)
+        {
+            return TestResult::Fail(
+                "snapshot root is not a copy of the source's point-in-time root",
+            );
         }
         let extent_root = match poll_once(crate::roots::find_root(
             &*snap,
@@ -8746,6 +8839,9 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             Some(Ok(Some(body))) => body,
             _ => return TestResult::Fail("shared snapshot extent item missing"),
         };
+        // The snapshot's copy of the source's root leaf holds the extent
+        // through a data reference of its own (`btrfs_inc_ref`), beside the
+        // source's.
         if format::le64(&extent_item, 0).ok() != Some(2) {
             return TestResult::Fail("shared extent aggregate refcount is not two");
         }
@@ -8760,8 +8856,11 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             counts.push(format::le32(&extent_item, pos + 25).unwrap_or(0));
             pos += 29;
         }
-        if roots.as_slice() != [format::FS_TREE_OBJECTID] || counts.as_slice() != [2] {
-            return TestResult::Fail("implicit snapshot data reference was not retained");
+        let mut pairs: Vec<(u64, u32)> =
+            roots.iter().copied().zip(counts.iter().copied()).collect();
+        pairs.sort_unstable();
+        if pairs.as_slice() != [(format::FS_TREE_OBJECTID, 1), (snapshot_id, 1)] {
+            return TestResult::Fail("snapshot data reference was not its own");
         }
         let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
             Some(Ok(f)) => f,
@@ -8993,8 +9092,26 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     };
     let shared_id = shared.fs_tree_id();
     let shared_root = shared.fs_tree_root();
-    if origin.fs_tree_root() != shared_root {
-        return TestResult::Fail("snapshot did not share the origin metadata root");
+    let origin_root = origin.fs_tree_root();
+    // Linux `btrfs_copy_root`: the snapshot's root is a block of its own,
+    // owned by it, with the origin root's level and contents; the two trees
+    // share what is below it.
+    if origin_root == shared_root {
+        return TestResult::Fail("snapshot shares the origin's root block");
+    }
+    let (Some(Ok(origin_node)), Some(Ok(shared_node))) = (
+        poll_once(shared.read_node_shared(origin_root.0)),
+        poll_once(shared.read_node_shared(shared_root.0)),
+    ) else {
+        return TestResult::Fail("snapshot root blocks did not read");
+    };
+    if origin_root.1 != shared_root.1
+        || origin_node.get(HEADER_SIZE..) != shared_node.get(HEADER_SIZE..)
+        || format::le64(&shared_node, 88).ok() != Some(shared_id)
+    {
+        return TestResult::Fail(
+            "snapshot root is not a copy of the origin's owned by the snapshot",
+        );
     }
     let extent_root = match poll_once(crate::roots::find_root(
         &*shared,
@@ -9014,22 +9131,13 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         ),
     )) {
         Some(Ok(Some(body))) => body,
-        _ => return TestResult::Fail("shared metadata extent item missing"),
+        _ => return TestResult::Fail("snapshot root metadata extent item missing"),
     };
-    if format::le64(&metadata, 0).ok() != Some(2) {
-        return TestResult::Fail("shared metadata root refcount was not two");
-    }
-    let mut root_refs = Vec::new();
-    let mut pos = 24usize;
-    while pos < metadata.len() {
-        if metadata[pos] != 176 || pos + 9 > metadata.len() {
-            return TestResult::Fail("shared metadata inline refs were malformed");
-        }
-        root_refs.push(format::le64(&metadata, pos + 1).unwrap_or(0));
-        pos += 9;
-    }
-    if !root_refs.contains(&origin_id) || !root_refs.contains(&shared_id) {
-        return TestResult::Fail("shared metadata did not name both subvolume roots");
+    if format::le64(&metadata, 0).ok() != Some(1)
+        || metadata.get(24) != Some(&176)
+        || format::le64(&metadata, 25).ok() != Some(shared_id)
+    {
+        return TestResult::Fail("snapshot root block is not held by the snapshot alone");
     }
 
     // The first origin mutation must materialise it privately while the snapshot
@@ -9037,8 +9145,8 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     if !matches!(poll_once(origin.root().create("origin-only")), Some(Ok(_))) {
         return TestResult::Fail("shared origin first mutation failed");
     }
-    if origin.fs_tree_root() == shared_root {
-        return TestResult::Fail("shared origin was not materialised before mutation");
+    if origin.fs_tree_root() == origin_root {
+        return TestResult::Fail("shared origin was not COWed by its mutation");
     }
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
@@ -9059,8 +9167,8 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         return TestResult::Fail("origin mutation leaked into shared snapshot");
     }
 
-    // The snapshot is now the final holder of the old root. Deleting it must
-    // reclaim that tree while leaving the materialised origin mountable.
+    // Deleting the snapshot must reclaim its tree while leaving the origin
+    // mountable.
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
     let _ = poll_once(shared_after.sync_to_disk());
@@ -12212,6 +12320,9 @@ fn smoke_btrfs_block_group_tree_write() -> TestResult {
         return TestResult::Fail("unlink on block-group-tree fs failed");
     }
     drop(file);
+    // The delayed iput of the closed, unlinked file (the background
+    // reaper's work, run here).
+    poll_once(vol.run_delayed_iputs());
     for i in 0..4 {
         if !matches!(
             poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),
@@ -14241,3 +14352,590 @@ fn smoke_btrfs_abort_refusals_stay_audible() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_abort_refusals_stay_audible);
+
+// ── A killed task's operation, finished by another scheduler task ────────
+
+/// The task whose operation the hand-off test's other task is finishing,
+/// published only while that task polls it (the userspace hand-off keeps it
+/// per CPU in the same way).
+static HANDOFF_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HANDOFF_JOINED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static HANDOFF_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The task the hand-off tests have "killed" (0: none).
+static HANDOFF_KILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The userspace hooks' shape: inside a hand-off the current task is the
+/// owner, and the owner of a handed-off operation counts as killed.
+static HANDOFF_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
+    current: || match HANDOFF_OWNER.load(core::sync::atomic::Ordering::Acquire) {
+        0 => narf_scheduler::current_task_id().raw(),
+        owner => owner,
+    },
+    pending: |task| task != 0 && task == HANDOFF_KILLED.load(core::sync::atomic::Ordering::Acquire),
+    arm: |_, _| {},
+    disarm: |_| {},
+    owner: || HANDOFF_OWNER.load(core::sync::atomic::Ordering::Acquire),
+};
+
+/// Polls `inner` as `owner`'s handed-off operation, like the userspace
+/// `killable_wait` hand-off of a killed task's operation.
+struct HandedOff<F> {
+    owner: u64,
+    inner: core::pin::Pin<alloc::boxed::Box<F>>,
+}
+
+impl<F: core::future::Future<Output = ()>> core::future::Future for HandedOff<F> {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        HANDOFF_OWNER.store(this.owner, core::sync::atomic::Ordering::Release);
+        let out = this.inner.as_mut().poll(cx);
+        HANDOFF_OWNER.store(0, core::sync::atomic::Ordering::Release);
+        out
+    }
+}
+
+/// A killed task's operation is not dropped: it is handed to another
+/// scheduler task to finish. That task must still be the operation as far
+/// as the transaction is concerned. Asked by the new task's id, the gate
+/// said "not joined": a commit run there read through the killable path a
+/// commit must never take and gave up, losing every operation in its batch
+/// (the kill soak's "transaction commit failed (Busy|InvalidData), N
+/// operation(s) lost"), and `exclusive` — which a joined operation uses to
+/// step out, close and commit — waited for its own join to leave.
+///
+/// Here this test task joins, as the killed task's operation did, and the
+/// operation goes on in a spawned task as a hand-off: it must see itself
+/// joined, and its `exclusive` must run and finish while the join is held.
+fn smoke_btrfs_handed_off_operation_keeps_its_transaction() -> TestResult {
+    use core::sync::atomic::Ordering;
+    let vol = match mount_fixture() {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("hand-off fixture failed to mount"),
+    };
+    HANDOFF_JOINED.store(0, Ordering::Release);
+    HANDOFF_DONE.store(false, Ordering::Release);
+    let saved = narf_filesystem::killable::replace_kill_hooks(Some(&HANDOFF_HOOKS));
+    let owner = crate::txn_gate::identity();
+    let Some(joined) = poll_once(vol.join_txn()) else {
+        narf_filesystem::killable::replace_kill_hooks(saved);
+        return TestResult::Fail("joining the transaction blocked");
+    };
+    let handed = Arc::clone(&vol);
+    narf_scheduler::spawn(HandedOff {
+        owner,
+        inner: alloc::boxed::Box::pin(async move {
+            HANDOFF_JOINED.store(1 + u8::from(handed.txn_joined()), Ordering::Release);
+            handed.exclusive(async {}).await;
+            HANDOFF_DONE.store(true, Ordering::Release);
+        }),
+    });
+    for _ in 0..100_000 {
+        if HANDOFF_DONE.load(Ordering::Acquire) {
+            break;
+        }
+        narf_scheduler::poll_one_round();
+    }
+    let done = HANDOFF_DONE.load(Ordering::Acquire);
+    let saw_joined = HANDOFF_JOINED.load(Ordering::Acquire);
+    // A stuck hand-off finishes once the join goes; run it out either way.
+    drop(joined);
+    for _ in 0..100_000 {
+        if HANDOFF_DONE.load(Ordering::Acquire) {
+            break;
+        }
+        narf_scheduler::poll_one_round();
+    }
+    narf_filesystem::killable::replace_kill_hooks(saved);
+    if saw_joined != 2 {
+        return TestResult::Fail("a handed-off operation did not see its own join");
+    }
+    if !done {
+        return TestResult::Fail(
+            "a handed-off operation waited for its own join to close the transaction",
+        );
+    }
+    if vol.txn_closed() || poll_once(vol.close_txn()).is_none() {
+        return TestResult::Fail("the hand-off left the transaction joined or closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_handed_off_operation_keeps_its_transaction
+);
+
+// ── A kill landing in every phase of a commit ───────────────────────────
+
+/// Which device I/O the stall device holds (`u64::MAX`: none), how many it
+/// has seen, whether the held one may go, and its waker.
+static STALL_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static STALL_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STALL_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STALL_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STALL_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Every I/O yields once before it completes, so whoever holds the device
+/// across it makes the next comer wait — the contention a kill acts on.
+static STALL_YIELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Pending once (waking itself), then ready.
+struct YieldOnce(bool);
+
+impl core::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            return core::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}
+
+/// A RAM device that holds its `STALL_AT`-th I/O until released: the point
+/// at which the test kills the task running the commit.
+struct StallDevice {
+    inner: Arc<narf_block::ram::RamBlockDevice>,
+}
+
+struct Stall;
+
+impl core::future::Future for Stall {
+    type Output = ();
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        use core::sync::atomic::Ordering;
+        if STALL_GO.load(Ordering::Acquire) {
+            return core::task::Poll::Ready(());
+        }
+        *STALL_WAKER.lock() = Some(cx.waker().clone());
+        STALL_HELD.store(true, Ordering::Release);
+        if STALL_GO.load(Ordering::Acquire) {
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    }
+}
+
+impl narf_block::BlockDevice for StallDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feat: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feat)
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let n = STALL_SEEN.fetch_add(1, Ordering::AcqRel);
+        let stall = n == STALL_AT.load(Ordering::Acquire);
+        let yield_once = STALL_YIELD.load(Ordering::Acquire);
+        let io = self.inner.submit(req);
+        // Boxed so this fixture's futures are no larger than a real
+        // device's: the volume's futures are instantiated for it too, and
+        // the kernel frame budget counts them.
+        alloc::boxed::Box::pin(async move {
+            if stall {
+                Stall.await;
+            }
+            if yield_once {
+                YieldOnce(false).await;
+            }
+            io.await
+        })
+            as core::pin::Pin<
+                alloc::boxed::Box<
+                    dyn core::future::Future<Output = narf_block::BlockCompletion> + Send + '_,
+                >,
+            >
+    }
+    /// The volume's reads and writes are scatter-gather requests: the same
+    /// stall / yield policy, counted on the same request counter.
+    fn submit_sg(
+        &self,
+        req: narf_block::SgRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let n = STALL_SEEN.fetch_add(1, Ordering::AcqRel);
+        let stall = n == STALL_AT.load(Ordering::Acquire);
+        let yield_once = STALL_YIELD.load(Ordering::Acquire);
+        let io = self.inner.submit_sg(req);
+        alloc::boxed::Box::pin(async move {
+            if stall {
+                Stall.await;
+            }
+            if yield_once {
+                YieldOnce(false).await;
+            }
+            io.await
+        })
+            as core::pin::Pin<
+                alloc::boxed::Box<
+                    dyn core::future::Future<Output = narf_block::BlockCompletion> + Send + '_,
+                >,
+            >
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+}
+
+static PHASE_RESULT: narf_lib::sync::IrqSafeSpinLock<Option<Result<(), FsError>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static PHASE_READER_STOP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static PHASE_READER_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// A commit whose task is killed part-way finishes, wherever the kill lands.
+///
+/// The commit is started by this test task (it closes the transaction as
+/// this task), then held at its `at`-th device I/O — with the node cache
+/// emptied, that walks the commit's reads of the extent, free-space and
+/// root trees, its node writes and its superblock — and its task is killed:
+/// the rest is handed to another scheduler task, as the userspace hand-off
+/// does with a killed task's operation, and the killed owner's killable
+/// waits fire. A live reader keeps the device busy meanwhile (every I/O
+/// yields once), so the commit's reads queue for it — the wait a kill ends.
+/// No read on the commit's behalf may give up: the commit must succeed, the
+/// filesystem stay writable, and the data read back.
+///
+/// Before the hand-off kept the operation's identity, the reads after the
+/// kill were judged outside any commit, gave up, and the commit failed with
+/// its batch lost — the kill soak's "transaction commit failed".
+fn smoke_btrfs_commit_survives_a_kill_in_every_phase() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    const MAX_IO: u64 = 400;
+    let image = decode_sparse(FIXTURE_SPARSE);
+    let saved = narf_filesystem::killable::replace_kill_hooks(Some(&HANDOFF_HOOKS));
+    let restore = |result: TestResult| {
+        narf_filesystem::killable::replace_kill_hooks(saved);
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        result
+    };
+    let mut phases = 0u64;
+    for at in 0..MAX_IO {
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        STALL_GO.store(false, Ordering::Release);
+        STALL_HELD.store(false, Ordering::Release);
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        let device = Arc::new(StallDevice {
+            inner: narf_block::ram::RamBlockDevice::from_image(512, image.clone()),
+        });
+        let vol = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+            Some(Ok(vol)) => vol,
+            _ => return restore(TestResult::Fail("stall fixture failed to mount")),
+        };
+        let file = match poll_once(vol.root().create("killed-commit.dat")) {
+            Some(Ok(file)) => file,
+            _ => return restore(TestResult::Fail("create failed")),
+        };
+        let data = alloc::vec![(at as u8) ^ 0x5a; 96 * 1024];
+        if !matches!(poll_once(file.write(0, &data)), Some(Ok(n)) if n == data.len()) {
+            return restore(TestResult::Fail("staging the batch failed"));
+        }
+        vol.__test_empty_node_cache();
+        STALL_SEEN.store(0, Ordering::Release);
+        STALL_AT.store(at, Ordering::Release);
+        let owner = crate::txn_gate::identity();
+        let committing = Arc::clone(&vol);
+        let mut commit: core::pin::Pin<
+            alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send>,
+        > = alloc::boxed::Box::pin(async move { committing.sync_to_disk().await });
+        // Run the commit as this task until it reaches the held I/O.
+        let mut finished = None;
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        for _ in 0..100_000 {
+            match commit.as_mut().poll(&mut cx) {
+                core::task::Poll::Ready(result) => {
+                    finished = Some(result);
+                    break;
+                }
+                core::task::Poll::Pending if STALL_HELD.load(Ordering::Acquire) => break,
+                core::task::Poll::Pending => {}
+            }
+        }
+        if let Some(result) = finished {
+            // The commit did fewer I/Os than `at`: every phase is covered.
+            if result.is_err() {
+                return restore(TestResult::Fail("an undisturbed commit failed"));
+            }
+            break;
+        }
+        phases += 1;
+        // Kill this task; its commit goes on elsewhere, while a live reader
+        // contends for the device.
+        *PHASE_RESULT.lock() = None;
+        HANDOFF_KILLED.store(owner, Ordering::Release);
+        STALL_YIELD.store(true, Ordering::Release);
+        PHASE_READER_STOP.store(false, Ordering::Release);
+        PHASE_READER_DONE.store(false, Ordering::Release);
+        let reader_vol = Arc::clone(&vol);
+        narf_scheduler::spawn(async move {
+            let mut buf = alloc::vec![0u8; 16 * 1024];
+            while !PHASE_READER_STOP.load(Ordering::Acquire) {
+                reader_vol.__test_empty_node_cache();
+                if let Ok(file) = reader_vol.root().lookup_async("killed-commit.dat").await {
+                    let _ = file.read(0, &mut buf).await;
+                }
+                YieldOnce(false).await;
+            }
+            PHASE_READER_DONE.store(true, Ordering::Release);
+        });
+        narf_scheduler::spawn(HandedOff {
+            owner,
+            inner: alloc::boxed::Box::pin(async move {
+                let result = commit.await;
+                *PHASE_RESULT.lock() = Some(result);
+            }),
+        });
+        STALL_GO.store(true, Ordering::Release);
+        if let Some(waker) = STALL_WAKER.lock().take() {
+            waker.wake();
+        }
+        let mut result = None;
+        for _ in 0..1_000_000 {
+            result = PHASE_RESULT.lock().take();
+            if result.is_some() {
+                break;
+            }
+            narf_scheduler::poll_one_round();
+        }
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        PHASE_READER_STOP.store(true, Ordering::Release);
+        for _ in 0..1_000_000 {
+            if PHASE_READER_DONE.load(Ordering::Acquire) {
+                break;
+            }
+            narf_scheduler::poll_one_round();
+        }
+        STALL_YIELD.store(false, Ordering::Release);
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                return restore(TestResult::Fail(
+                    "a commit gave up when its task was killed part-way",
+                ))
+            }
+            None => {
+                return restore(TestResult::Fail(
+                    "a commit whose task was killed part-way never finished",
+                ))
+            }
+        }
+        if vol.is_core_read_only() {
+            return restore(TestResult::Fail(
+                "a killed commit left the filesystem read-only",
+            ));
+        }
+        let mut back = alloc::vec![0u8; data.len()];
+        if !matches!(poll_once(file.read(0, &mut back)), Some(Ok(n)) if n == data.len())
+            || back != data
+        {
+            return restore(TestResult::Fail("a killed commit lost the data it carried"));
+        }
+    }
+    if phases == 0 {
+        return restore(TestResult::Fail("the commit did no I/O to hold"));
+    }
+    restore(TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_commit_survives_a_kill_in_every_phase
+);
+
+// ── Cancellation fuzz: drop a write-path future after its N-th poll ─────
+
+/// One write-path operation of the cancellation fuzz, as a boxed future
+/// over `file`.
+fn fuzz_op<'a>(
+    kind: u8,
+    file: &'a Arc<dyn narf_filesystem::FileOps>,
+    data: &'a [u8],
+) -> core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send + 'a>,
+> {
+    match kind {
+        0 => alloc::boxed::Box::pin(async move { file.write(0, data).await.map(|_| ()) }),
+        1 => alloc::boxed::Box::pin(async move { file.write(256 * 1024, data).await.map(|_| ()) }),
+        2 => alloc::boxed::Box::pin(async move { file.truncate(4096).await }),
+        3 => alloc::boxed::Box::pin(async move { file.fsync(false).await }),
+        _ => alloc::boxed::Box::pin(async move {
+            file.write(8192, data).await?;
+            file.fsync(true).await
+        }),
+    }
+}
+
+const FUZZ_KINDS: [&str; 5] = [
+    "write",
+    "append-write",
+    "truncate",
+    "fsync",
+    "write+fdatasync",
+];
+
+/// Whether a dropped write-path future can break the filesystem: for each
+/// operation kind and every N, start it with every device I/O yielding
+/// once (so each I/O is an await point that returns), poll it N times,
+/// drop it, then commit, and check the commit succeeds, the filesystem
+/// stays writable, its tree checks pass, and a fresh mount of the device
+/// reads a file whose bytes are the old or the new ones.
+///
+/// NARF never drops a filesystem future that has started — a killed
+/// task's operation is handed off to finish (`killable_wait`) — so this
+/// is the stronger property: an operation abandoned at any await point
+/// must leave the transaction, the batch and the gate as it found them.
+fn smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    let image = decode_sparse(FIXTURE_SPARSE);
+    let old = alloc::vec![0x11u8; 128 * 1024];
+    let new = alloc::vec![0x22u8; 64 * 1024];
+    let mut cases = 0u32;
+    let fail = |what: &'static str, kind: u8, n: u32| {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs cancellation fuzz: {} dropped after poll {}: {}",
+            FUZZ_KINDS[kind as usize],
+            n,
+            what
+        );
+        STALL_YIELD.store(false, Ordering::Release);
+        TestResult::Fail(what)
+    };
+    for kind in 0..FUZZ_KINDS.len() as u8 {
+        for n in 1u32..400 {
+            STALL_AT.store(u64::MAX, Ordering::Release);
+            STALL_YIELD.store(false, Ordering::Release);
+            let device = Arc::new(StallDevice {
+                inner: narf_block::ram::RamBlockDevice::from_image(512, image.clone()),
+            });
+            let vol = match poll_once(BtrfsVolume::mount(Arc::clone(&device), DomainId::DRIVER_0)) {
+                Some(Ok(vol)) => vol,
+                _ => return fail("fixture failed to mount", kind, n),
+            };
+            let file = match poll_once(vol.root().create("fuzz.dat")) {
+                Some(Ok(file)) => file,
+                _ => return fail("create failed", kind, n),
+            };
+            if !matches!(poll_once(file.write(0, &old)), Some(Ok(_)))
+                || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+            {
+                return fail("seeding failed", kind, n);
+            }
+            // The operation, every I/O an await point, cut after poll n.
+            vol.__test_empty_node_cache();
+            STALL_YIELD.store(true, Ordering::Release);
+            let mut finished = false;
+            {
+                let mut op = fuzz_op(kind, &file, &new);
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                for _ in 0..n {
+                    if let core::task::Poll::Ready(result) = op.as_mut().poll(&mut cx) {
+                        if result.is_err() {
+                            return fail("the undisturbed operation failed", kind, n);
+                        }
+                        finished = true;
+                        break;
+                    }
+                }
+                // Dropped here, mid-flight unless it finished.
+            }
+            STALL_YIELD.store(false, Ordering::Release);
+            cases += 1;
+            match poll_once(vol.sync_to_disk()) {
+                Some(Ok(())) => {}
+                Some(Err(_)) => return fail("the commit after the drop failed", kind, n),
+                None => return fail("the commit after the drop never finished", kind, n),
+            }
+            if vol.is_core_read_only() {
+                return fail("the drop left the filesystem read-only", kind, n);
+            }
+            if !matches!(poll_once(crate::rw_gate::check_trees(&vol)), Some(Ok(()))) {
+                return fail(
+                    "the tree checks refused the filesystem after the drop",
+                    kind,
+                    n,
+                );
+            }
+            // A later operation and commit still work.
+            if !matches!(poll_once(file.write(512 * 1024, &new)), Some(Ok(_)))
+                || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+            {
+                return fail("a write and commit after the drop failed", kind, n);
+            }
+            drop(file);
+            drop(vol);
+            // What reached the device mounts and reads back sanely.
+            let again = match poll_once(BtrfsVolume::mount(Arc::clone(&device), DomainId::DRIVER_0))
+            {
+                Some(Ok(vol)) => vol,
+                _ => return fail("the device did not mount again after the drop", kind, n),
+            };
+            let reread = match poll_once(again.root().lookup_async("fuzz.dat")) {
+                Some(Ok(file)) => file,
+                _ => return fail("the file was lost after the drop", kind, n),
+            };
+            let mut head = alloc::vec![0u8; 4096];
+            match poll_once(reread.read(0, &mut head)) {
+                Some(Ok(4096)) if head.iter().all(|&b| b == 0x11 || b == 0x22) => {}
+                _ => {
+                    return fail(
+                        "the file's bytes are neither old nor new after the drop",
+                        kind,
+                        n,
+                    )
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+    }
+    if cases == 0 {
+        return TestResult::Fail("the fuzz ran no case");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean
+);

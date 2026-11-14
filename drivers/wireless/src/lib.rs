@@ -15,6 +15,7 @@ pub mod rtl8xxxu;
 pub mod rtlwifi;
 pub mod rtw88;
 pub mod rtw89;
+mod watchdog_work;
 
 // MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920). Promoted out of the
 // former `src/mt7921/` module into the standalone dual-build crate
@@ -64,6 +65,19 @@ impl narf_power::system_pm::AsyncSystemPm for Mt76SystemPm {
 }
 
 pub fn register_initcalls() {
+    // cfg80211's per-wiphy rfkill: every wiphy is one `wlan` radio of the
+    // rfkill core, so `/dev/rfkill`, the sysfs class and the airplane key
+    // block and unblock it.
+    narf_wireless::rfkill::install(narf_wireless::rfkill::Backend {
+        register: |name| {
+            narf_drivers_platform::rfkill::register_radio_indexed(
+                name,
+                narf_drivers_platform::rfkill::RadioType::Wlan,
+                narf_wireless::rfkill::set_soft_blocked,
+            )
+        },
+        unregister: narf_drivers_platform::rfkill::unregister_radio,
+    });
     // Register wireless drivers with the bus dispatcher.
     narf_init::register(Stage::Subsys, "iwlwifi", || {
         iwlwifi::register();

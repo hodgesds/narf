@@ -584,9 +584,12 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     /// This is the POLICY's decision of WHERE a just-woken task should run; the
     /// scheduler CORE performs the mechanical migrate + enqueue + IPI
     /// (`ttwu_queue`). Consulted on the wake path when the wakee's `prev_cpu`
-    /// (its cache-warm home CPU) is BUSY. Returns `Some(cpu)` to run the wakee
-    /// on a selected CPU now, or `None` to keep it on `prev_cpu`. `waker_cpu`
-    /// is the CPU issuing the wake.
+    /// (its cache-warm home CPU) is BUSY, backlogged or not rescheduling.
+    /// Returns `Some(cpu)` to run the wakee on an idle sibling now, or `None`
+    /// for no preference. With `None` the core keeps a merely backlogged
+    /// wakee on `prev_cpu`, but for a `prev_cpu` that is running another task
+    /// or not rescheduling it applies `select_idle_sibling` itself, so a
+    /// policy cannot strand a wake. `waker_cpu` is the CPU issuing the wake.
     ///
     /// The core supplies `is_online`, `is_idle`, and an affinity predicate.
     /// Implementations must honor `allowed`; the core still validates affinity
@@ -723,9 +726,11 @@ pub struct ClassScheduler;
 /// Shared wake-time idle-sibling selection — Linux `select_idle_sibling`
 /// intersected with the wakee's affinity, policy-agnostic. Wake-affine
 /// first (waker's CPU when idle and node-local: the producer→consumer IPC
-/// shape), then the nearest node-local idle CPU scanning outward from
-/// `prev_cpu`, then any idle CPU. `None` keeps the wakee on `prev_cpu`
-/// rather than stacking it onto another BUSY CPU.
+/// shape), then the nearest idle CPU sharing `prev_cpu`'s last-level cache
+/// (Linux scans `sd_llc`), then the nearest node-local idle CPU scanning
+/// outward from `prev_cpu`, then any idle CPU. `None` keeps the wakee on
+/// `prev_cpu` rather than stacking it onto another BUSY CPU. CPUs whose LLC
+/// is unknown are not treated as sharing one.
 ///
 /// Both the EEVDF and Class policies use this. The Class policy — the boot
 /// DEFAULT — previously inherited the trait's `None` stub, so a wake NEVER
@@ -750,6 +755,18 @@ pub(crate) fn select_idle_sibling(
         return Some(waker_cpu);
     }
     let max = narf_lib::percpu::MAX_CPUS as u32;
+    if let Some(llc) = crate::steal::llc_id(prev_cpu) {
+        for i in 1..max {
+            let cpu = CpuId((prev_cpu.0 + i) % max);
+            if crate::steal::llc_id(cpu) == Some(llc)
+                && is_online(cpu)
+                && is_idle(cpu)
+                && allowed(cpu)
+            {
+                return Some(cpu);
+            }
+        }
+    }
     if node.is_some() {
         for i in 1..max {
             let cpu = CpuId((prev_cpu.0 + i) % max);

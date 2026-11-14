@@ -18,6 +18,8 @@ mod host;
 mod linux;
 mod model;
 mod narf;
+mod overwrite;
+mod release;
 mod scale;
 mod workload;
 
@@ -47,7 +49,7 @@ USAGE: narf-btrfs-host [OPTIONS]
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
   --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
-                    enospc,scale
+                    enospc,scale,overwrite,release
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -57,7 +59,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 8] = [
+pub const SCENARIOS: [&str; 10] = [
     "regress",
     "root",
     "snapshots",
@@ -66,6 +68,8 @@ pub const SCENARIOS: [&str; 8] = [
     "fst",
     "enospc",
     "scale",
+    "overwrite",
+    "release",
 ];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
@@ -397,6 +401,7 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
             nodesize,
             root_subvol: "@",
             others: &others,
+            default_profile: false,
         };
         let opts = crash::Opts {
             cuts: sc.cuts,
@@ -705,11 +710,16 @@ fn main() {
             }
             continue;
         }
-        if name == "fst" || name == "enospc" || name == "scale" {
+        if matches!(
+            name.as_str(),
+            "fst" | "enospc" | "scale" | "overwrite" | "release"
+        ) {
             let run = match name.as_str() {
                 "fst" => fst::run(&args),
                 "enospc" => enospc::run(&args),
-                _ => scale::run(&args),
+                "scale" => scale::run(&args),
+                "overwrite" => overwrite::run(&args),
+                _ => release::run(&args),
             };
             match run {
                 Ok(s) => println!("{s}"),

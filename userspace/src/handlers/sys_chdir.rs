@@ -77,7 +77,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     if resolved_dir.is_none() {
         let errno = match stat_ino_path_dir_aware_ext(&resolved, true) {
             // Exists, but is not a directory (regular file, device, fifo…).
-            Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => ENOTDIR,
+            Ok((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => ENOTDIR,
             // The final component resolves to nothing. Re-classify the
             // walk: a NON-final component that is not a directory is also
             // -ENOTDIR in Linux (`link_path_walk`), which this used to
@@ -85,7 +85,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
             // `path_lookup_errno` also reports -EACCES when an ANCESTOR is
             // not searchable, which is what Linux's walk would have failed
             // with before it ever reached the final component.
-            _ => path_lookup_errno(&resolved),
+            found => path_lookup_errno(&resolved, found.err()),
         };
         ctx.set_return(errno_ret(errno));
         return;

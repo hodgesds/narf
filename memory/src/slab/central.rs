@@ -63,11 +63,19 @@ fn valid_node(frame: usize, node: NonNull<FreeBlock>, class: usize) -> bool {
 struct FrameList {
     head: usize,
     tail: usize,
+    /// Member frames. Maintained under the class lock for diagnostics
+    /// (`/proc/slabinfo`, retention tests); never consulted for decisions
+    /// that need an exact count outside that lock.
+    len: usize,
 }
 
 impl FrameList {
     const fn new() -> Self {
-        Self { head: 0, tail: 0 }
+        Self {
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
     }
 
     /// # Safety
@@ -89,6 +97,7 @@ impl FrameList {
             }
             self.tail = frame;
         }
+        self.len += 1;
     }
 
     /// # Safety
@@ -116,6 +125,7 @@ impl FrameList {
             (*record).next = 0;
             (*record).list = 0;
         }
+        self.len -= 1;
     }
 
     /// # Safety
@@ -134,6 +144,7 @@ impl FrameList {
             }
         }
         self.tail = other.tail;
+        self.len += other.len;
         *other = Self::new();
     }
 }
@@ -150,6 +161,11 @@ impl FrameLists {
             partial: FrameList::new(),
             empty: FrameList::new(),
         }
+    }
+
+    /// `(partial, empty)` frame counts. Caller holds the class lock.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.partial.len, self.empty.len)
     }
 
     /// # Safety

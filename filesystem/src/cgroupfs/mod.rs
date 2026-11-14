@@ -560,6 +560,31 @@ fn snapshot_ctrl_state(cg: &Cgroup, name: &'static str) -> Option<Arc<dyn Contro
     cg.ctrl_state.lock().get(name).cloned()
 }
 
+/// Member pids of the cgroup whose `memory` state is `state`, and of every
+/// cgroup below it: the processes a memory-cgroup OOM may choose from.
+/// `None` when no live cgroup carries `state` (it has gone offline).
+#[cfg(feature = "cgroup-memory")]
+pub(super) fn memcg_member_pids(state: &Arc<dyn ControllerState>) -> Option<Vec<u64>> {
+    fn find(cg: &Arc<Cgroup>, state: &Arc<dyn ControllerState>) -> Option<Arc<Cgroup>> {
+        if snapshot_ctrl_state(cg, "memory").is_some_and(|s| Arc::ptr_eq(&s, state)) {
+            return Some(cg.clone());
+        }
+        let children: Vec<Arc<Cgroup>> = cg.children.lock().values().cloned().collect();
+        children.iter().find_map(|child| find(child, state))
+    }
+    fn collect(cg: &Arc<Cgroup>, out: &mut Vec<u64>) {
+        out.extend(cg.members.lock().iter().copied());
+        let children: Vec<Arc<Cgroup>> = cg.children.lock().values().cloned().collect();
+        for child in &children {
+            collect(child, out);
+        }
+    }
+    let cg = find(&root(), state)?;
+    let mut pids = Vec::new();
+    collect(&cg, &mut pids);
+    Some(pids)
+}
+
 fn root() -> Arc<Cgroup> {
     let root = CGROUP_ROOT.get_or_init(Cgroup::new_root).clone();
 
@@ -696,6 +721,11 @@ fn attach_chain(cg: &Arc<Cgroup>, pid: u64) -> Result<(), FsError> {
 /// Move `pid` into `dst`, honouring controller vetoes (`can_attach`);
 /// on rejection the process stays put. The `cgroup.procs`-write path.
 fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+    // Pid 0 names no process (the idle task, or a caller with no pid); it is
+    // never a member.
+    if pid == 0 {
+        return Err(FsError::InvalidData);
+    }
     // No-internal-process constraint (v2 §"No Internal Process
     // Constraint"): a non-root cgroup that distributes resources to its
     // children (has a non-empty `subtree_control`) may not hold member
@@ -733,6 +763,9 @@ fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
 /// Move `pid` into `dst` unconditionally (no veto) — fork inheritance
 /// and boot placement, where the process already exists.
 fn place_forced(pid: u64, dst: &Arc<Cgroup>) {
+    if pid == 0 {
+        return;
+    }
     let prev = TASK_CGROUP.lock().get(&pid).cloned();
     if let Some(prev) = &prev {
         if Arc::ptr_eq(prev, dst) {
@@ -791,6 +824,9 @@ fn thread_cgroup_of(tid: u64, tgid: u64) -> Arc<Cgroup> {
 }
 
 fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+    if tid == 0 {
+        return Err(FsError::InvalidData);
+    }
     let kind = *dst.cg_type.lock();
     if kind == CgroupType::DomainInvalid {
         return Err(FsError::Unsupported);
@@ -1343,6 +1379,22 @@ fn resolve_pid(pid: u64) -> Option<u64> {
     crate::procfs::pid_resolve(pid)
 }
 
+/// One line per id as the reader's namespace names it, skipping ids it cannot
+/// see. Never a `0`: Linux lists only tasks with a pid in the reader's
+/// namespace (`cgroup_procs_show` → `task_pid_vnr`, which a reader that
+/// cannot see the task gets as 0 — and Linux skips those), and a `0` read
+/// back by a shell is `kill -9 0`, the caller's own process group.
+fn render_visible_ids(ids: &[u64]) -> String {
+    let mut s = String::new();
+    for &id in ids {
+        if let Some(visible) = report_pid(id).filter(|&visible| visible != 0) {
+            s.push_str(&visible.to_string());
+            s.push('\n');
+        }
+    }
+    s
+}
+
 fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
     match f {
         CoreFile::Controllers => {
@@ -1368,35 +1420,21 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             }
         }
         CoreFile::Procs => {
-            let mut s = String::new();
             // Members are outer ProcessIds; report them in the READER's PID
             // namespace and drop any not visible there (namespace isolation).
-            for pid in cg.members.lock().iter() {
-                if let Some(v) = report_pid(*pid) {
-                    s.push_str(&v.to_string());
-                    s.push('\n');
-                }
-            }
-            s
+            let members: Vec<u64> = cg.members.lock().iter().copied().collect();
+            render_visible_ids(&members)
         }
         CoreFile::Threads => {
-            let mut s = String::new();
-            // Threaded cgroups track tids; otherwise mirror procs.
-            let t = cg.threads.lock();
-            if t.is_empty() {
-                for pid in cg.members.lock().iter() {
-                    if let Some(v) = report_pid(*pid) {
-                        s.push_str(&v.to_string());
-                        s.push('\n');
-                    }
-                }
+            // Threaded cgroups track tids; otherwise mirror procs. Tids are
+            // reported in the reader's namespace like pids.
+            let threads: Vec<u64> = cg.threads.lock().iter().copied().collect();
+            if threads.is_empty() {
+                let members: Vec<u64> = cg.members.lock().iter().copied().collect();
+                render_visible_ids(&members)
             } else {
-                for tid in t.iter() {
-                    s.push_str(&tid.to_string());
-                    s.push('\n');
-                }
+                render_visible_ids(&threads)
             }
-            s
         }
         CoreFile::Events => {
             // `frozen` is the EFFECTIVE state (self or any ancestor
@@ -1607,7 +1645,15 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
             }
         } else if !enable && enabled.remove(name) {
             for child in children.values() {
-                mutate_ctrl_state(child, |states| states.remove(name));
+                let removed = mutate_ctrl_state(child, |states| states.remove(name));
+                // Pages still charged to the child's memory cgroup keep
+                // uncharging it (and its ancestors) until they are freed.
+                #[cfg(feature = "cgroup-memory")]
+                if let Some(state) = removed.filter(|_| name == "memory") {
+                    memory::offline_memcg(&state);
+                }
+                #[cfg(not(feature = "cgroup-memory"))]
+                drop(removed);
             }
         }
     }
@@ -2136,6 +2182,12 @@ impl DirOps for CgroupDir {
                 return Err(FsError::Busy);
             }
             self.cg.children.lock().remove(name);
+            // The removed cgroup's memory state goes offline; pages charged
+            // to it keep uncharging it until the last one is freed.
+            #[cfg(feature = "cgroup-memory")]
+            if let Some(state) = snapshot_ctrl_state(&child, "memory") {
+                memory::offline_memcg(&state);
+            }
             Ok(())
         })
     }

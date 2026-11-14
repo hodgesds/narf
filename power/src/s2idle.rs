@@ -516,7 +516,12 @@ fn s2idle_after_claim(
     // (Linux `suspend_device_irqs` .. `resume_device_irqs`).
     narf_interrupts::wake::set_suspend_window(true);
     STAT_PARKS.fetch_add(1, Ordering::Relaxed);
+    // `timekeeping_suspend` / `timekeeping_resume`: CLOCK_MONOTONIC stops
+    // for the park and the time asleep is injected into CLOCK_BOOTTIME and
+    // CLOCK_REALTIME (`offs_boot`), as Linux does around s2idle.
+    narf_time::timekeeping_suspend();
     let exit = park(max_halts);
+    let _slept_ns = narf_time::timekeeping_resume();
     narf_interrupts::wake::set_suspend_window(false);
     STAT_LAST_EXIT.store(exit as u8, Ordering::Release);
     if exit == ParkExit::WakeEvent {

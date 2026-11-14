@@ -161,3 +161,95 @@ kernel_test_in!(
     "drivers/wireless/mt7921/tx_ba",
     mt76_sequence_sample_rejects_wrong_native_metadata_and_clears_only_sample_aggregation
 );
+
+/// `report` with the TXS0 rate word and bandwidth (and optionally failed).
+fn rate_report_bytes(pid: u8, wcid: u16, rate: u16, bw: u8, failed: bool) -> Vec<u8> {
+    let mut bytes = report(pid, 0, wcid, 0);
+    let mut r0 = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    r0 |= u32::from(rate) | u32::from(bw) << 29;
+    if failed {
+        r0 |= 1 << 16;
+    }
+    bytes[8..12].copy_from_slice(&r0.to_le_bytes());
+    bytes
+}
+
+/// Linux `mt7921e_tx_prepare_skb` + `mt76_connac2_mac_fill_txs`: the home
+/// station's data asks for a TX status at most every HZ/4 on its own PID;
+/// the matching report (PID and WCID) gives its rate and bandwidth and
+/// counts failures; the PID is reused only after both the report and the
+/// frame's retirement, or after a retired frame's status never came; an
+/// unpublished reservation is reused; the BA-restart sample is untouched.
+fn mt76_tx_status_rate_sampling() -> Result<(), &'static str> {
+    let mut owner = Owner::new();
+    let ms = 1_000_000;
+    let pid = owner.rate_pid(1, 0).ok_or("no first rate sample")?;
+    if owner.rate_pid(1, 10 * ms) != Some(pid) {
+        return Err("unpublished reservation not reused");
+    }
+    owner.begin_rate(9);
+    if owner.rate_pid(1, 100 * ms).is_some() {
+        return Err("second sample while one is outstanding");
+    }
+    // VHT MCS9 2 SS at 80 MHz.
+    let vht = 4 << 6 | 9 | 1 << 10;
+    owner
+        .receive(&rate_report_bytes(pid, 1, vht, 2, false))
+        .map_err(|_| "rate report refused")?;
+    let report = owner.rate_report().ok_or("no rate report")?;
+    if (report.wcid, report.tx_rate, report.bw, report.failures) != (1, vht, 2, 0) {
+        return Err("rate report fields");
+    }
+    // Another WCID's or PID's report is not this sample's.
+    owner
+        .receive(&rate_report_bytes(pid, 2, 0, 0, true))
+        .map_err(|_| "foreign report")?;
+    if owner.rate_report() != Some(report) {
+        return Err("foreign report taken");
+    }
+    owner.terminal(packet_tx::Completion {
+        token: 9,
+        status: 0,
+    });
+    if owner.rate_pid(1, 200 * ms).is_some() {
+        return Err("sampled before HZ/4");
+    }
+    let next = owner.rate_pid(1, 260 * ms).ok_or("no sample after HZ/4")?;
+    owner.begin_rate(10);
+    owner
+        .receive(&rate_report_bytes(next, 1, vht, 2, true))
+        .map_err(|_| "failed report refused")?;
+    let failed = owner.rate_report().ok_or("no report")?;
+    if failed.failures != 1 || failed.sequence != report.sequence + 1 {
+        return Err("failure count or sequence");
+    }
+    owner.terminal(packet_tx::Completion {
+        token: 10,
+        status: 0,
+    });
+    // A retired frame whose status never comes is given up after 1 s.
+    let lost = owner.rate_pid(1, 600 * ms).ok_or("no third sample")?;
+    owner.begin_rate(11);
+    owner.terminal(packet_tx::Completion {
+        token: 11,
+        status: 0,
+    });
+    if owner.rate_pid(1, 900 * ms).is_some() || owner.rate_pid(1, 1700 * ms) == Some(lost) {
+        return Err("lost status not given up after a second, or PID reused at once");
+    }
+    // The BA-restart sample still arms beside a rate sample.
+    if owner.arm(0).is_err() || owner.pid(0).ok().flatten().is_none() {
+        return Err("BA sample blocked by rate sampling");
+    }
+    Ok(())
+}
+fn mt76_tx_status_rate_sampling_test() -> TestResult {
+    match mt76_tx_status_rate_sampling() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/station",
+    mt76_tx_status_rate_sampling_test
+);

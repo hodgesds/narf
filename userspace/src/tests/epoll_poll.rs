@@ -3345,69 +3345,193 @@ kernel_test_in!(
     smoke_epoll_ctl_rejects_cycles_allows_finite_nesting
 );
 
-/// An epoll fd forwards its nearest child timerfd deadline through
-/// `poll_deadline`, so a `poll(2)` park over the epoll fd clamps its
-/// wake-up to the timer instead of sleeping forever (a timerfd expiry
-/// fires no readiness notify).
-fn smoke_epoll_fd_forwards_nested_timerfd_poll_deadline() -> TestResult {
-    // Kernel-test fixture: this smoke calls the syscall entry point directly and
-    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
-    // buffers. `validate_user_range` confines a real syscall to the user half,
-    // so the scoped opt-in is what keeps the fixture working without weakening
-    // the production predicate. See `handlers::kernel_buffers_guard`.
+/// A waker that sets a flag: stands in for a parked `ppoll`/`epoll_wait`.
+struct FlagWake(core::sync::atomic::AtomicBool);
+
+impl alloc::task::Wake for FlagWake {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The Wayland / libinput pattern: a timerfd inside epoll A, A inside epoll
+/// B, and waiters parked on A (a `ppoll(-1)` over the epoll fd) and on B.
+/// The timer is armed — so its hrtimer is queued and expires — on a CPU
+/// other than the waiters'. Its expiry must reach both waiters through the
+/// chain Linux runs: `timerfd_tmrproc` → `wake_up_locked_poll` →
+/// `ep_poll_callback` on A → A's own wait queue → B (fs/timerfd.c,
+/// fs/eventpoll.c). No deadline forwarding is involved: the expiry itself
+/// wakes.
+fn smoke_epoll_nested_timerfd_expiry_wakes_outer_waiters() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::POLL_IN;
     let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
+    let me = narf_lib::percpu::current_cpu();
+    let Some(other) =
+        (0..narf_lib::percpu::MAX_CPUS).find(|&c| c != me && narf_lib::smp::is_online(c as u32))
+    else {
+        return TestResult::Skip("no second online CPU");
+    };
 
-    let r = call(Syscall::EpollCreate, SyscallArgs::default());
-    if r.status != SyscallReturn::OK {
-        return TestResult::Fail("epoll_create1 failed");
+    let mut epfds = [0u32; 2];
+    for slot in epfds.iter_mut() {
+        let r = call(Syscall::EpollCreate, SyscallArgs::default());
+        if r.status != SyscallReturn::OK {
+            return TestResult::Fail("epoll_create1 failed");
+        }
+        *slot = r.value as u32;
     }
-    let epfd = r.value as u32;
-
-    // Install an armed timerfd (absolute deadline well in the future).
-    let tfd_ops = crate::io_mux::TimerFd::new();
-    let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(500_000_000);
-    tfd_ops.arm(deadline, 0);
+    let [epa, epb] = epfds;
+    let tfd_ops =
+        crate::io_mux::TimerFd::new(narf_scheduler::narf_time::hrtimer::ClockId::Monotonic);
     let tfd = crate::fd::install(
         task,
         crate::fd::FdEntry {
-            ops: tfd_ops,
+            ops: tfd_ops.clone(),
             offset: 0,
             flags: 0,
             status_flags: 0,
         },
     )
     .unwrap();
-
     let mut ev = [0u8; 12];
     ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
-    call(
-        Syscall::EpollCtl,
-        SyscallArgs {
-            arg0: epfd as u64,
-            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
-            arg2: tfd as u64,
-            arg3: ev.as_ptr() as u64,
-            ..SyscallArgs::default()
-        },
-    );
-    crate::syscall::__test_clear_global();
-
-    let epoll_ops = crate::fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten();
-    let Some(epoll_ops) = epoll_ops else {
-        return TestResult::Fail("epfd not in fd table");
-    };
-    match epoll_ops.poll_deadline() {
-        Some(d) if d == deadline => TestResult::Pass,
-        Some(_) => TestResult::Fail("epoll fd forwarded a WRONG nested timerfd deadline"),
-        None => TestResult::Fail(
-            "epoll fd must forward a nested timerfd deadline (poll(-1) parks forever without it)",
-        ),
+    for (ep, fd) in [(epa, tfd), (epb, epa)] {
+        let r = call(
+            Syscall::EpollCtl,
+            SyscallArgs {
+                arg0: ep as u64,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: fd as u64,
+                arg3: ev.as_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return TestResult::Fail("epoll_ctl ADD failed");
+        }
     }
+    crate::syscall::__test_clear_global();
+    let ops = |fd: u32| crate::fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    let (Some(a_ops), Some(b_ops)) = (ops(epa), ops(epb)) else {
+        return TestResult::Fail("epoll fds not in the fd table");
+    };
+
+    let flag_a = Arc::new(FlagWake(core::sync::atomic::AtomicBool::new(false)));
+    let flag_b = Arc::new(FlagWake(core::sync::atomic::AtomicBool::new(false)));
+    let waker_a = core::task::Waker::from(flag_a.clone());
+    let waker_b = core::task::Waker::from(flag_b.clone());
+    const ID_A: u64 = 0x7f00_0001;
+    const ID_B: u64 = 0x7f00_0002;
+    let pending = |r: Option<core::task::Poll<u32>>| matches!(r, Some(core::task::Poll::Pending));
+    if !pending(a_ops.arm_readiness(ID_A, POLL_IN, &waker_a))
+        || !pending(b_ops.arm_readiness(ID_B, POLL_IN, &waker_b))
+    {
+        return TestResult::Fail("an unarmed timerfd made its epoll readable");
+    }
+
+    let irqs_were_on = narf_arch::interrupts_enabled();
+    // SAFETY: the wait below needs interrupts; restored before returning.
+    unsafe { narf_arch::enable_interrupts() };
+    let armed_on = Arc::new(core::sync::atomic::AtomicU64::new(u64::MAX));
+    {
+        let tfd_ops = tfd_ops.clone();
+        let armed_on = armed_on.clone();
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let now = narf_scheduler::narf_time::monotonic_ns();
+                tfd_ops.arm(now.saturating_add(20_000_000), 0);
+                armed_on.store(narf_lib::percpu::current_cpu() as u64, Ordering::SeqCst);
+            },
+            other as u32,
+        );
+    }
+    let give_up = narf_scheduler::narf_time::Deadline::after_ms(3_000);
+    while !(flag_a.0.load(Ordering::SeqCst) && flag_b.0.load(Ordering::SeqCst) || give_up.expired())
+    {
+        // The pinned task and the other CPU's timer interrupt run meanwhile.
+        core::hint::spin_loop();
+    }
+    if !irqs_were_on {
+        // SAFETY: counterpart to the enable above.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    let expirations = tfd_ops.__test_expirations();
+    a_ops.disarm_readiness(ID_A);
+    b_ops.disarm_readiness(ID_B);
+    tfd_ops.arm(0, 0);
+
+    if armed_on.load(Ordering::SeqCst) != other as u64 {
+        return TestResult::Fail("the timerfd was not armed on the other CPU");
+    }
+    if expirations != 1 {
+        return TestResult::Fail("the timerfd did not expire within 3 s");
+    }
+    if !flag_a.0.load(Ordering::SeqCst) {
+        return TestResult::Fail("a ppoll(-1) on the epoll fd was not woken by the timerfd expiry");
+    }
+    if !flag_b.0.load(Ordering::SeqCst) {
+        return TestResult::Fail("an outer epoll was not woken through the nested epoll");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
-    "userspace",
-    smoke_epoll_fd_forwards_nested_timerfd_poll_deadline
+    "userspace/timerfd",
+    smoke_epoll_nested_timerfd_expiry_wakes_outer_waiters
+);
+
+/// The hrtimer core runs a due timer against the base time it sampled once;
+/// the timerfd callback's own clock read can come out earlier (a CLOCK_REALTIME
+/// slew chunk or step landed in between). Linux counts the expiry anyway
+/// (`timerfd_triggered`) and wakes on every expiry. The callback used to
+/// re-arm at the same, still-"future" deadline instead, which the expiry
+/// loop's stale base time then found due again — for ever, in hard IRQ.
+fn smoke_timerfd_expiry_counts_when_its_clock_reads_early() -> TestResult {
+    use narf_filesystem::POLL_IN;
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+    let tfd = crate::io_mux::TimerFd::new(ClockId::Realtime);
+    // One-shot, a whole second ahead of the clock the callback will read.
+    tfd.arm(tfd.now().saturating_add(1_000_000_000), 0);
+    tfd.__test_run_expiry();
+    let one_shot = tfd.__test_expirations();
+    let ready = narf_filesystem::FileOps::poll_readiness(&*tfd);
+    let (left, _) = tfd.current();
+    tfd.arm(0, 0);
+    if one_shot != 1 || ready & POLL_IN == 0 {
+        return TestResult::Fail("an expiry the hrtimer core ran was not counted");
+    }
+    if left != 0 {
+        return TestResult::Fail("an expired one-shot timerfd was re-armed at its own deadline");
+    }
+
+    // Periodic and unread: every expiry is an event, as Linux wakes the wait
+    // queue on each one even while POLL_IN is already set.
+    tfd.arm(tfd.now().saturating_add(1_000_000_000), 1_000_000_000);
+    tfd.__test_run_expiry();
+    let Some(cell) = narf_filesystem::FileOps::readiness(&*tfd) else {
+        tfd.arm(0, 0);
+        return TestResult::Fail("timerfd has no readiness cell");
+    };
+    let seq = cell.seq();
+    let first_deadline = tfd.current().0;
+    tfd.__test_run_expiry();
+    let second = (cell.seq(), tfd.__test_expirations());
+    tfd.arm(0, 0);
+    if first_deadline == 0 {
+        return TestResult::Fail("a periodic timerfd was not re-armed after its expiry");
+    }
+    if second.0 == seq || second.1 != 2 {
+        return TestResult::Fail("a further expiry of an unread periodic timerfd raised no event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/timerfd",
+    smoke_timerfd_expiry_counts_when_its_clock_reads_early
 );
 
 // ── Wave-64 eventfd / timerfd / event-loop integration smokes ────────

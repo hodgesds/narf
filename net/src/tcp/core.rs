@@ -197,6 +197,11 @@ pub const TCP_NOTSENT_LOWAT: i32 = 25;
 /// Per-connection state. Carried inside `Arc<IrqSafeSpinLock<_>>`
 /// so the table and any caller share the same lock.
 pub struct Tcb {
+    /// The connection's wheel timer, armed for the earliest of its timer
+    /// deadlines below (Linux's per-socket `icsk_retransmit_timer`,
+    /// `icsk_delack_timer`, `sk_timer` and the TIME-WAIT timer, folded into
+    /// one `timer_list`). See [`TcpTimer`].
+    timer: TcpTimerHandle,
     pub id: u32,
     pub net_ns_id: u64,
     /// Address family discriminator. IPv4 addresses remain in the compact
@@ -255,6 +260,11 @@ pub struct Tcb {
     /// Counts RTO rewinds of `snd_nxt` to `snd_una` (go-back-N). A refused
     /// segment is only un-sent if none happened since it was marked.
     pub rewind_epoch: u32,
+    /// Refusals since the connection last got a segment into its device.
+    pub tx_refused_in_row: u32,
+    /// When the current wait for the device began (cycles); 0 when not
+    /// waiting. Unlike `tx_wait_since_cycles` the probe does not restart it.
+    pub tx_wait_start_cycles: u64,
 
     // ── Retransmit ──
     pub rtt: RttEstimator,
@@ -557,7 +567,24 @@ fn emit_tcb_frame_on(
             dev.try_xmit_frame(driver, bind.queue, f, meta)
         }
         (TxFrame::Owned(v), Some((driver, bind))) => {
-            dev.try_xmit_copy(driver, bind.queue, &v, meta)
+            // A frame the driver copies occupies the device queue just as
+            // an owned one does. Uncharged, a connection whose pool was
+            // empty escaped the per-connection limit altogether.
+            if dev.zero_copy_tx() {
+                // Built in a `Vec` although the device has a zero-copy
+                // pool: the pool had no buffer.
+                let empties = crate::txq::stats::POOL_EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+                if crate::txq::report_allowed() {
+                    narf_console::klog!(
+                        "[tcp] {}: transmit pool empty, {} byte frame copied (pool_empty={})",
+                        dev.name,
+                        v.len(),
+                        empties
+                    );
+                }
+            }
+            let charge = charge.then(|| bind.account.charge(v.len() as u32));
+            dev.try_xmit_copy(driver, bind.queue, &v, meta, charge)
         }
         (TxFrame::Owned(v), None) => dev.xmit_meta(&v, meta).map_err(|()| TxRefusal::Dropped),
         (TxFrame::Dma(f), None) => dev.xmit_frame(f, meta).map_err(|()| TxRefusal::Dropped),
@@ -600,6 +627,206 @@ fn neigh_failed(arc: &Arc<IrqSafeSpinLock<Tcb>>, frame: &[u8]) {
     );
 }
 
+// ── per-connection timer (timer_list) ─────────────────────────────
+
+/// A connection's wheel timer (Linux `sk_reset_timer` / `sk_stop_timer`
+/// discipline). While the timer is pending it owns one strong reference to
+/// the TCB's `Arc` (`sock_hold`), taken when it goes from idle to pending
+/// and given back when it fires (the handler consumes it) or is deleted.
+/// So a TCB is never freed while its timer is queued, and a TCB freed by
+/// the handler's own reference drop frees the timer only after the wheel
+/// let go of it (the callback gets a pointer, not a borrow).
+///
+/// Deadlines live in the TCB (`retx_deadline_cycles` and friends); every
+/// write that sets one calls [`Tcb::tcp_timer_reduce`], which pulls the timer
+/// in to the earliest deadline (`timer_reduce`). A deadline that moved later
+/// or was cleared leaves the timer early: the handler then finds nothing due
+/// and re-arms for the real earliest one, as Linux's `tcp_write_timer`
+/// does with `icsk_timeout`.
+#[repr(C)]
+struct TcpTimer {
+    timer: narf_scheduler::narf_time::timer::TimerList,
+    /// `Arc::as_ptr` of the owning TCB; null until it is published.
+    owner: core::sync::atomic::AtomicPtr<IrqSafeSpinLock<Tcb>>,
+}
+
+/// Owning handle to a [`TcpTimer`]. Not a `Box`: the wheel updates the
+/// timer while the TCB is borrowed mutably, so the timer lives outside the
+/// TCB's memory.
+#[derive(Copy, Clone)]
+struct TcpTimerHandle(core::ptr::NonNull<TcpTimer>);
+
+// SAFETY: `TcpTimer` is atomics plus a `TimerList`, which is Send + Sync.
+unsafe impl Send for TcpTimerHandle {}
+// SAFETY: as above.
+unsafe impl Sync for TcpTimerHandle {}
+
+impl TcpTimerHandle {
+    fn new() -> Self {
+        let b = Box::new(TcpTimer {
+            timer: narf_scheduler::narf_time::timer::TimerList::new(tcp_timer_fn, 0),
+            owner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
+        Self(core::ptr::NonNull::from(Box::leak(b)))
+    }
+
+    fn get(&self) -> &TcpTimer {
+        // SAFETY: allocated in `new`, freed only by `Tcb`'s drop, which runs
+        // once the timer is neither pending nor referenced by a handler.
+        unsafe { self.0.as_ref() }
+    }
+
+    fn set_owner(&self, owner: *const IrqSafeSpinLock<Tcb>) {
+        self.get().owner.store(owner as *mut _, Ordering::Release);
+    }
+
+    /// `sk_reset_timer` with reduce semantics: pending no later than jiffy
+    /// `expires`. Takes the pending reference on idle → pending.
+    fn reduce(&self, expires: u64) {
+        let tt = self.get();
+        let owner = tt.owner.load(Ordering::Acquire);
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: `tt` lives until the TCB drops, which a pending timer's
+        // reference prevents; it never moves.
+        // 0: this call armed it (-1, refused after shutdown, takes nothing).
+        if unsafe { narf_scheduler::narf_time::timer::mod_timer_checked(&tt.timer, expires, true) }
+            == 0
+        {
+            // SAFETY: the caller holds a reference to the TCB (it has the
+            // TCB locked), so the count is non-zero.
+            unsafe { Arc::increment_strong_count(owner) };
+        }
+    }
+
+    /// `sk_reset_timer`: pending at jiffy `expires`.
+    fn reset(&self, expires: u64) {
+        let tt = self.get();
+        let owner = tt.owner.load(Ordering::Acquire);
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: as in `reduce`.
+        if unsafe { narf_scheduler::narf_time::timer::mod_timer_checked(&tt.timer, expires, false) }
+            == 0
+        {
+            // SAFETY: as in `reduce`.
+            unsafe { Arc::increment_strong_count(owner) };
+        }
+    }
+
+    /// `sk_stop_timer` + `timer_shutdown`: dequeue, return the pending
+    /// reference, and refuse any later arm. Does not wait for a running
+    /// handler (which may be the caller).
+    fn shutdown(&self) {
+        let tt = self.get();
+        let owner = tt.owner.load(Ordering::Acquire);
+        if narf_scheduler::narf_time::timer::timer_shutdown(&tt.timer) && !owner.is_null() {
+            // SAFETY: the dequeued timer's reference; the caller holds its
+            // own, so this is never the last one.
+            unsafe { Arc::decrement_strong_count(owner) };
+        }
+    }
+}
+
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        // The timer is not pending (that would hold a reference) and a
+        // handler that dropped the last reference no longer uses it.
+        // SAFETY: allocated by `TcpTimerHandle::new`; this is its owner.
+        drop(unsafe { Box::from_raw(self.timer.0.as_ptr()) });
+    }
+}
+
+/// Jiffy by which cycle deadline `c` has passed (rounded up, so the timer
+/// never fires before the deadline its handler checks).
+fn deadline_jiffy(c: u64) -> u64 {
+    let ns = narf_scheduler::narf_time::deadline_cycles_to_ns(c);
+    narf_scheduler::narf_time::timer::ns_to_jiffies(ns)
+}
+
+impl Tcb {
+    /// Earliest timer deadline (cycles), mirroring what the handler
+    /// ([`tick_retransmit`]) acts on.
+    fn next_timer_cycles(&self) -> Option<u64> {
+        let mut next = u64::MAX;
+        let mut at = |c: u64| {
+            if c != 0 {
+                next = next.min(c);
+            }
+        };
+        if !self.retx_queue.is_empty() {
+            at(self.retx_deadline_cycles);
+        }
+        at(self.delayed_ack_deadline_cycles);
+        at(self.persist_deadline_cycles);
+        at(self.defer_accept_deadline_cycles);
+        if self.state == TcpState::TimeWait || (self.state == TcpState::FinWait2 && self.orphan) {
+            at(self.time_wait_deadline_cycles);
+        }
+        if self.tx_wait_since_cycles != 0 {
+            at(self
+                .tx_wait_since_cycles
+                .saturating_add(narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_PROBE_NS)));
+        }
+        if self.keepalive_enabled && self.state == TcpState::Established {
+            let idle = narf_scheduler::narf_time::ns_to_cycles(self.keepalive_idle_ns);
+            let intvl = narf_scheduler::narf_time::ns_to_cycles(self.keepalive_intvl_ns);
+            at(self
+                .last_progress_cycles
+                .saturating_add(idle)
+                .saturating_add(intvl.saturating_mul(self.keepalive_probes_sent as u64))
+                .max(1));
+        }
+        (next != u64::MAX).then_some(next)
+    }
+
+    /// Pull the connection timer in to the earliest deadline. Called after
+    /// every write that sets a deadline.
+    pub(crate) fn tcp_timer_reduce(&mut self) {
+        if let Some(c) = self.next_timer_cycles() {
+            self.timer.reduce(deadline_jiffy(c));
+        }
+    }
+
+    /// Whether the connection timer is queued (tests).
+    #[doc(hidden)]
+    pub fn __timer_pending(&self) -> bool {
+        self.timer.get().timer.is_pending()
+    }
+
+    /// Jiffy the connection timer is queued for (tests).
+    #[doc(hidden)]
+    pub fn __timer_expires(&self) -> u64 {
+        self.timer.get().timer.expires()
+    }
+}
+
+/// The connection timer's callback (`tcp_write_timer` and friends): take
+/// back the pending reference, run every due timer, re-arm for the next.
+fn tcp_timer_fn(r: narf_scheduler::narf_time::timer::TimerRef) {
+    // SAFETY: only `TcpTimer`s use this callback; `timer` is the first field
+    // of the repr(C) struct.
+    let tt = unsafe { &*(r.as_ptr() as *const TcpTimer) };
+    let owner = tt.owner.load(Ordering::Acquire);
+    if owner.is_null() {
+        return;
+    }
+    // SAFETY: the pending timer owned this reference (taken on arm).
+    let arc = unsafe { Arc::from_raw(owner) };
+    tick_retransmit(&arc);
+    {
+        let t = arc.lock();
+        if let Some(c) = t.next_timer_cycles() {
+            let now = narf_scheduler::narf_time::timer::jiffies();
+            t.timer.reset(deadline_jiffy(c).max(now + 1));
+        }
+    }
+    // May free the TCB and with it `tt`; nothing touches `tt` after this.
+    drop(arc);
+}
+
 impl core::fmt::Debug for Tcb {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Tcb")
@@ -627,6 +854,7 @@ impl Tcb {
         iss: u32,
     ) -> Self {
         Self {
+            timer: TcpTimerHandle::new(),
             id,
             net_ns_id: 0,
             is_ipv6: false,
@@ -657,6 +885,8 @@ impl Tcb {
             xmit_again: false,
             tx_wait_since_cycles: 0,
             rewind_epoch: 0,
+            tx_refused_in_row: 0,
+            tx_wait_start_cycles: 0,
             rtt: RttEstimator::new(),
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
@@ -1073,6 +1303,13 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
         (is_listen && tcb.is_ipv6).then_some((tcb.net_ns_id, tcb.local_addr6, tcb.local_port));
     let arc = Arc::new(IrqSafeSpinLock::new(tcb));
     {
+        // The timer's reference names the TCB from now on; arm it for any
+        // deadline set before publication.
+        let mut t = arc.lock();
+        t.timer.set_owner(Arc::as_ptr(&arc));
+        t.tcp_timer_reduce();
+    }
+    {
         let mut g = TCB_TABLE[tcb_shard(id)].lock();
         let m = g.get_or_insert_with(BTreeMap::new);
         m.insert(id, arc.clone());
@@ -1244,6 +1481,12 @@ pub fn remove_tcb(id: u32) {
         } else {
             conn_index_remove(conn_key(ns, ra, rp, la, lp));
         }
+    }
+    if let Some(arc) = lookup_tcb(id) {
+        // `sk_stop_timer` + no re-arm: the connection is gone. A handler
+        // already running finishes with its own reference.
+        let timer = arc.lock().timer;
+        timer.shutdown();
     }
     let mut g = TCB_TABLE[tcb_shard(id)].lock();
     if let Some(m) = g.as_mut() {
@@ -1915,9 +2158,11 @@ pub fn connect_wait(id: u32, options: ConnectOptions) -> Result<u32, i32> {
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            // Pump the neighbour and SYN timers from inside the spin so a
-            // lost ARP request or SYN gets retried before the deadline.
-            crate::tcp_stack::neigh_tick();
+            // The neighbour's resolution timer and this connection's timer
+            // are wheel timers; the spin's sleep pumps run executor rounds,
+            // which expire them, so a lost ARP request or SYN is retried
+            // before the deadline. The direct call keeps a SYN retry on
+            // time where the spin runs with no executor step pump.
             tick_retransmit(&arc);
             !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
         },
@@ -2476,6 +2721,7 @@ fn arm_orphan_fin_wait2(t: &mut Tcb) {
     if t.orphan && t.state == TcpState::FinWait2 && t.time_wait_deadline_cycles == 0 {
         t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
             .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(FIN_TIMEOUT_NS));
+        t.tcp_timer_reduce();
     }
 }
 
@@ -2490,12 +2736,15 @@ pub fn setsockopt_int(id: u32, opt: i32, val: i32) -> Result<(), ()> {
         }
         TCP_KEEPALIVE => {
             t.keepalive_enabled = val != 0;
+            t.tcp_timer_reduce();
         }
         TCP_KEEPIDLE => {
             t.keepalive_idle_ns = (val as u64).saturating_mul(1_000_000_000);
+            t.tcp_timer_reduce();
         }
         TCP_KEEPINTVL => {
             t.keepalive_intvl_ns = (val as u64).saturating_mul(1_000_000_000);
+            t.tcp_timer_reduce();
         }
         TCP_KEEPCNT => {
             t.keepalive_cnt = val.clamp(1, 255) as u8;
@@ -3083,6 +3332,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         if t.delayed_ack_deadline_cycles == 0 {
             t.delayed_ack_deadline_cycles = narf_scheduler::narf_time::now_cycles()
                 .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(DELAYED_ACK_NS));
+            t.tcp_timer_reduce();
         }
     }
 }
@@ -3270,6 +3520,14 @@ fn tsval_now() -> u32 {
 // ── Retransmit queue ────────────────────────────────────────────────
 
 fn queue_retransmit(t: &mut Tcb, seq: u32, seq_len: u32, flags: u8) {
+    // The record is made after the frame was handed to the device, without
+    // the connection lock. An ACK that got in first has already released
+    // everything it covers; a record added now would never be released,
+    // and with nothing left to acknowledge its timer would fire with
+    // nothing to resend.
+    if seq_leq(seq.wrapping_add(seq_len), t.snd_una) {
+        return;
+    }
     let now = narf_scheduler::narf_time::now_cycles();
     let seg = OutSeg {
         seq,
@@ -3341,6 +3599,7 @@ fn arm_retransmit_timer(t: &mut Tcb) {
     let rto = t.rtt.current_rto();
     let now = narf_scheduler::narf_time::now_cycles();
     t.retx_deadline_cycles = now.wrapping_add(narf_scheduler::narf_time::ns_to_cycles(rto));
+    t.tcp_timer_reduce();
 }
 
 /// Linux `tcp_write_err` (net/ipv4/tcp_timer.c): a timed-out connection
@@ -3460,6 +3719,20 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (seq, payload, fin, t.rcv_nxt, window, opts)
     };
     if payload.is_empty() && fin == 0 {
+        // Nothing is outstanding, so the record that fired is stale.
+        // Returning here left the deadline in the past: the timer fired
+        // again on every tick, each firing counted as a retransmission, and
+        // the eighth reset an idle, fully acknowledged connection.
+        let mut t = arc.lock();
+        let una = t.snd_una;
+        t.retx_queue.retain(|f| !seq_leq(f.end_seq(), una));
+        t.flightsize = t
+            .retx_queue
+            .iter()
+            .fold(0u32, |sum, f| sum.saturating_add(f.len));
+        t.rtt.undo_back_off(before_backoff);
+        t.rto_count = t.rto_count.saturating_sub(1);
+        arm_retransmit_timer(&mut t);
         return;
     }
     let iface = match iface_for_tcb(&arc.lock()) {
@@ -3491,12 +3764,19 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
-        // pump_send continues after it rather than double-sending.
-        t.send_buf.mark_sent(payload.len());
-        t.snd_nxt = seq
-            .wrapping_add(payload.len() as u32)
-            .wrapping_add((fin != 0) as u32);
-        note_sent(&mut t);
+        // pump_send continues after it rather than double-sending. The lock
+        // was released since the rewind, though. If a sender or an ACK moved
+        // `snd_nxt` meanwhile, it also kept the send-buffer offset in step;
+        // marking and setting `snd_nxt` here regardless left the two apart
+        // (a range marked sent and never transmitted) or `snd_nxt` below
+        // `snd_una`. What was resent is then just a duplicate.
+        if t.snd_nxt == seq {
+            t.send_buf.mark_sent(payload.len());
+            t.snd_nxt = seq
+                .wrapping_add(payload.len() as u32)
+                .wrapping_add((fin != 0) as u32);
+            note_sent(&mut t);
+        }
         t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
         if refused && t.retx_deadline_cycles != 0 {
@@ -3513,6 +3793,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             let probe = t.rtt.current_rto().min(TCP_RESOURCE_PROBE_INTERVAL_NS);
             t.retx_deadline_cycles = narf_scheduler::narf_time::now_cycles()
                 .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(probe));
+            t.tcp_timer_reduce();
         }
     }
 }
@@ -3560,6 +3841,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles().wrapping_add(
             narf_scheduler::narf_time::ns_to_cycles(t.persist_backoff_ns),
         );
+        t.tcp_timer_reduce();
         (seq, window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
@@ -3620,6 +3902,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let (seq, window, opt_bytes, ack) = {
         let mut t = arc.lock();
         t.keepalive_probes_sent = t.keepalive_probes_sent.saturating_add(1);
+        t.tcp_timer_reduce();
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&mut t);
@@ -3728,6 +4011,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     t.persist_backoff_ns = PERSIST_INITIAL_NS;
                     t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
                         .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(PERSIST_INITIAL_NS));
+                    t.tcp_timer_reduce();
                 }
                 break;
             }
@@ -3887,6 +4171,11 @@ fn pump_send_queued_once(
     egress: &CachedEgress,
     driver: &dyn crate::txq::TxBackpressure,
 ) {
+    // Segments the device refused during this call. One immediate re-offer
+    // is allowed, for a wake that raced the refusal; after that the sender
+    // parks whatever the queue's flag says and is resumed by the wake pass
+    // or the probe timer. It never re-offers in a loop.
+    let mut refusals = 0u32;
     loop {
         let marked = {
             let mut t = arc.lock();
@@ -3909,6 +4198,7 @@ fn pump_send_queued_once(
                     t.persist_backoff_ns = PERSIST_INITIAL_NS;
                     t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
                         .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(PERSIST_INITIAL_NS));
+                    t.tcp_timer_reduce();
                 }
                 return;
             }
@@ -3939,9 +4229,36 @@ fn pump_send_queued_once(
                 if throttled {
                     if t.tx_wait_since_cycles == 0 {
                         t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
+                        t.tcp_timer_reduce();
                     }
                     return;
                 }
+            }
+            // Ask the queue before building anything: a frame offered to a
+            // stopped queue costs a payload copy, a frame build and the
+            // packet taps, and then is not sent (Linux tests
+            // `netif_xmit_frozen_or_stopped` before `dev_hard_start_xmit`).
+            // A connection that has already waited a probe interval first
+            // checks that its queue still is the driver's: `ethtool -G/-L`
+            // replaces the queue objects, and a flag nobody clears any more
+            // would park it for good.
+            let stopped = match t.tx_bind.as_ref() {
+                Some(bind) if bind.account.queue().is_stopped() => {
+                    if t.tx_wait_since_cycles != 0 && !binding_current(driver, bind) {
+                        None
+                    } else {
+                        Some(bind.account.queue().wait(&bind.account))
+                    }
+                }
+                _ => Some(false),
+            };
+            match stopped {
+                None => t.tx_bind = None,
+                Some(true) => {
+                    tx_park(&mut t);
+                    return;
+                }
+                Some(false) => {}
             }
             let (seq, payload) = if fin_only {
                 (t.fin_seq, Vec::new())
@@ -4000,25 +4317,105 @@ fn pump_send_queued_once(
         if sent == Err(TxRefusal::Busy) {
             let mut t = arc.lock();
             unsend(&mut t, &marked);
+            refusals += 1;
+            t.tx_refused_in_row = t.tx_refused_in_row.saturating_add(1);
+            if t.tx_refused_in_row % TX_REFUSALS_REPORT == 0 {
+                crate::txq::stats::REOFFER_STORMS.fetch_add(1, Ordering::Relaxed);
+                report_tx_stuck(&t, "refusals in a row", u64::from(t.tx_refused_in_row));
+            }
+            // The queue the driver refused on is not the one this
+            // connection is bound to (replaced by a resize): drop the
+            // binding, so the next offer selects a queue again, and park.
+            if t.tx_bind
+                .as_ref()
+                .is_some_and(|bind| !binding_current(driver, bind))
+            {
+                t.tx_bind = None;
+            }
             // Listed on the queue before its stopped flag is read: a wake
             // that ran in between shows here as "not stopped" and the
-            // segment is simply offered again.
+            // segment is offered once more.
             let still_stopped = t
                 .tx_bind
                 .as_ref()
                 .is_none_or(|bind| bind.account.queue().wait(&bind.account));
-            if still_stopped {
-                if t.tx_wait_since_cycles == 0 {
-                    t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
-                }
+            if still_stopped || refusals > 1 {
+                tx_park(&mut t);
                 return;
             }
             continue;
+        }
+        if sent == Err(TxRefusal::Dropped) {
+            // A queue index the driver no longer has is dropped every time:
+            // re-select instead of sending the rest of the stream into it.
+            let mut t = arc.lock();
+            if t.tx_bind
+                .as_ref()
+                .is_some_and(|bind| !binding_current(driver, bind))
+            {
+                t.tx_bind = None;
+            }
         }
         if marked.fin {
             return;
         }
     }
+}
+
+/// The sender stops for its device queue: the wake pass resumes it, or
+/// `tick_tx_wait` after the probe interval.
+fn tx_park(t: &mut Tcb) {
+    let now = narf_scheduler::narf_time::now_cycles().max(1);
+    if t.tx_wait_since_cycles == 0 {
+        t.tx_wait_since_cycles = now;
+        t.tcp_timer_reduce();
+    }
+    if t.tx_wait_start_cycles == 0 {
+        t.tx_wait_start_cycles = now;
+    }
+}
+
+/// Refusals in a row that are counted and reported as one storm.
+const TX_REFUSALS_REPORT: u32 = 64;
+/// How long a connection waits for its queue before that is reported.
+const TX_WAIT_REPORT_NS: u64 = 1_000_000_000;
+
+/// One rate-limited line describing a connection that is not getting its
+/// data into the device, with what is needed to tell why.
+fn report_tx_stuck(t: &Tcb, what: &str, amount: u64) {
+    if !crate::txq::report_allowed() {
+        return;
+    }
+    let (queue, stopped, queued) = t.tx_bind.as_ref().map_or((-1, false, 0), |bind| {
+        (
+            i32::from(bind.queue),
+            bind.account.queue().is_stopped(),
+            bind.account.queued(),
+        )
+    });
+    narf_console::klog!(
+        "[tcp] conn {} port {}: {} {}; txq={} stopped={} queued={} unsent={} inflight={} storms={} long_waits={}",
+        t.id,
+        t.local_port,
+        what,
+        amount,
+        queue,
+        stopped,
+        queued,
+        t.send_buf.unsent_len(),
+        t.snd_nxt.wrapping_sub(t.snd_una),
+        crate::txq::stats::REOFFER_STORMS.load(Ordering::Relaxed),
+        crate::txq::stats::LONG_WAITS.load(Ordering::Relaxed)
+    );
+}
+
+/// Whether `bind` still names the queue object the driver uses for that
+/// index. Slow path only: asked after a refusal, a drop, or a probe interval
+/// spent waiting.
+fn binding_current(driver: &dyn crate::txq::TxBackpressure, bind: &TxBinding) -> bool {
+    driver
+        .tx_queue(bind.queue)
+        .is_some_and(|queue| Arc::ptr_eq(&queue, bind.account.queue()))
 }
 
 /// Undo `pump_send_queued_once`'s mark for a segment the device refused.
@@ -4144,12 +4541,15 @@ fn send_data_queued(
         }
         if t.delayed_ack_deadline_cycles == 0 {
             t.delayed_ack_deadline_cycles = owed.2;
+            t.tcp_timer_reduce();
         }
         return result;
     }
     // Taken, or dropped by a device that cannot send at all: either way it
     // is in flight as far as loss recovery is concerned.
     t.tx_wait_since_cycles = 0;
+    t.tx_wait_start_cycles = 0;
+    t.tx_refused_in_row = 0;
     let mut seq_len = payload.len() as u32;
     if extra_flags & FLAG_FIN != 0 {
         seq_len = seq_len.saturating_add(1);
@@ -4184,6 +4584,19 @@ fn tick_tx_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 >= narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_PROBE_NS);
         if due {
             t.tx_wait_since_cycles = now.max(1);
+            t.tcp_timer_reduce();
+            let waited = now.saturating_sub(t.tx_wait_start_cycles);
+            if t.tx_wait_start_cycles != 0
+                && waited >= narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_REPORT_NS)
+            {
+                t.tx_wait_start_cycles = now.max(1);
+                crate::txq::stats::LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+                report_tx_stuck(
+                    &t,
+                    "ms waiting for its transmit queue",
+                    narf_scheduler::narf_time::cycles_to_ns(waited) / 1_000_000,
+                );
+            }
         }
         due
     };
@@ -4739,6 +5152,7 @@ fn handle_in_syn_sent(
         let una = t.snd_una;
         t.send_buf.unacked_head_seq = una;
         t.state = TcpState::Established;
+        t.tcp_timer_reduce();
         // Take an RTT sample from the SYN's queue entry.
         if let Some(seg) = t.retx_queue.pop_front() {
             if !seg.retransmitted {
@@ -4751,6 +5165,7 @@ fn handle_in_syn_sent(
         }
         t.retx_deadline_cycles = 0;
         t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
+        t.tcp_timer_reduce();
     }
     // Final ACK of the handshake.
     send_ack(arc, 0);
@@ -4777,6 +5192,7 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
         t.snd_wl2 = hdr.acknowledgement;
         t.send_buf.unacked_head_seq = t.snd_una;
         t.state = TcpState::Established;
+        t.tcp_timer_reduce();
         if let Some(seg) = t.retx_queue.pop_front() {
             if !seg.retransmitted {
                 let elapsed =
@@ -4788,6 +5204,7 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
         }
         t.retx_deadline_cycles = 0;
         t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
+        t.tcp_timer_reduce();
     }
     let win = rcv_window(arc);
     let mut advanced = false;
@@ -4904,6 +5321,7 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>, has_data: bool)
         child.defer_accept_listener = Some(l.id);
         child.defer_accept_deadline_cycles =
             narf_scheduler::narf_time::now_cycles().wrapping_add(timeout);
+        child.tcp_timer_reduce();
         return None;
     }
     if l.accept_queue.len() < l.backlog {
@@ -4995,6 +5413,7 @@ fn enter_time_wait(t: &mut Tcb) {
     t.state = TcpState::TimeWait;
     t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
         .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
+    t.tcp_timer_reduce();
     let limit = t.send_buf.limit;
     t.send_buf = SendBuf::new(limit, t.snd_nxt);
     t.retx_queue = VecDeque::new();
@@ -5136,6 +5555,7 @@ fn handle_in_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
     let mut t = arc.lock();
     t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
         .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
+    t.tcp_timer_reduce();
     drop(t);
     if hdr.flags & FLAG_FIN != 0 {
         send_ack(arc, 0);
@@ -5188,6 +5608,7 @@ fn handle_ack(
     if ack_in_range {
         t.keepalive_probes_sent = 0;
         t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
+        t.tcp_timer_reduce();
     }
     // Window update.  Follow Linux `tcp_may_update_window`: a newly
     // cumulative ACK is authoritative even if reverse-direction data made
@@ -5273,6 +5694,7 @@ fn handle_ack(
         t.rto_count = 0;
         t.keepalive_probes_sent = 0;
         t.last_progress_cycles = now;
+        t.tcp_timer_reduce();
         // Re-arm retransmit timer if there's still unacked data.
         if t.retx_queue.is_empty() {
             t.retx_deadline_cycles = 0;
@@ -5555,6 +5977,7 @@ fn schedule_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, need: AckNeed) {
     if t.delayed_ack_deadline_cycles == 0 {
         t.delayed_ack_deadline_cycles = narf_scheduler::narf_time::now_cycles()
             .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(DELAYED_ACK_NS));
+        t.tcp_timer_reduce();
     }
 }
 
@@ -5643,9 +6066,9 @@ pub fn __with_tcb_mut<R>(id: u32, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
 /// exactly one CPU runs the O(all-TCBs) scan per interval.
 static LAST_TICK_ALL_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Sweep every live TCB, ticking the retransmit / delayed-ACK /
-/// persist / keepalive / TIME-WAIT timers. Called once per sleep-
-/// pump iteration; cheap (lock + short walk).
+/// Run every live TCB's timer handler now, whatever its deadlines. The
+/// timers themselves run from each connection's wheel timer ([`TcpTimer`]);
+/// this sweep is for tests and benchmarks that drive TCP time by hand.
 pub fn tick_all() {
     // `sleep_pumps::run()` calls this on EVERY executor idle round on EVERY
     // CPU, so ungated all CPUs concurrently scan and lock every TCB — 16×

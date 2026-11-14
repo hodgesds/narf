@@ -59,6 +59,13 @@ pub struct Mutex<T: ?Sized> {
 struct MutexInner {
     locked: bool,
     waiters: VecDeque<(WaiterId, Waker)>,
+    /// Linux `MUTEX_FLAG_HANDOFF`: the waiter at the front has been woken
+    /// once and found the lock taken by someone who never queued. The next
+    /// release hands the lock to it directly instead of freeing it.
+    handoff: bool,
+    /// The waiter a release handed the lock to, which owns it from that
+    /// moment (`locked` stays true) and claims it on its next poll.
+    granted: Option<WaiterId>,
 }
 
 // SAFETY: `Mutex<T>` provides exclusive access to `T` through the
@@ -68,12 +75,26 @@ unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 // SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
+/// [`Mutex::held_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldState {
+    /// Held, by a guard or by a grant not yet claimed.
+    pub locked: bool,
+    /// The waiter (its id) a release handed the lock to, which has not run
+    /// to claim it yet.
+    pub granted_to: Option<u64>,
+    /// Futures queued for the lock.
+    pub waiters: usize,
+}
+
 impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             inner: IrqSafeSpinLock::new(MutexInner {
                 locked: false,
                 waiters: VecDeque::new(),
+                handoff: false,
+                granted: None,
             }),
             data: UnsafeCell::new(data),
         }
@@ -88,10 +109,12 @@ impl<T: ?Sized> Mutex<T> {
     /// Returns a future that resolves to a `MutexGuard` when the
     /// lock is available.
     #[inline]
+    #[track_caller]
     pub fn lock(&self) -> LockFuture<'_, T> {
         LockFuture {
             mutex: self,
             waiter_id: None,
+            site: core::panic::Location::caller(),
         }
     }
 
@@ -127,6 +150,20 @@ impl<T: ?Sized> Mutex<T> {
     pub fn is_locked(&self) -> bool {
         self.inner.lock().locked
     }
+
+    /// Who has the lock, for state dumps: held or not, the waiter a release
+    /// handed it to that has not yet run to claim it (it owns the lock
+    /// meanwhile, so nothing else can take it), and how many wait. A lock
+    /// held by a grantee that never runs looks free to every other
+    /// diagnostic; this names it. Racy, like [`Self::is_locked`].
+    pub fn held_state(&self) -> HeldState {
+        let inner = self.inner.lock();
+        HeldState {
+            locked: inner.locked,
+            granted_to: inner.granted.map(|WaiterId(id)| id),
+            waiters: inner.waiters.len(),
+        }
+    }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
@@ -139,10 +176,59 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     }
 }
 
+/// Where a waiter on this CPU last found a lock taken: the call site of
+/// its `lock()`. A task that parks right after takes it
+/// ([`take_wait_site`]) so the kernel can say what a blocked task waits on
+/// — the hung-task question "which lock?". One pointer per CPU, written on
+/// the slow path only.
+static WAIT_SITE: [core::sync::atomic::AtomicPtr<core::panic::Location<'static>>;
+    crate::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::percpu::MAX_CPUS];
+
+/// Record that a lock acquired at `site` is making this CPU's current
+/// poll wait. Any lock type may report here.
+pub fn note_wait_site(site: &'static core::panic::Location<'static>) {
+    let cpu = crate::percpu::current_cpu();
+    if let Some(slot) = WAIT_SITE.get(cpu) {
+        slot.store(site as *const _ as *mut _, Ordering::Relaxed);
+    }
+    // A lock type with waiter ids sets its own right after.
+    if let Some(slot) = WAIT_WAITER.get(cpu) {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The waiter id ([`HeldState::granted_to`]) of the lock wait
+/// [`note_wait_site`] last recorded on this CPU, 0 for a lock type without
+/// one. Taken with the site, so a dump can match a granted waiter to the
+/// task parked on it.
+static WAIT_WAITER: [core::sync::atomic::AtomicU64; crate::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_CPUS];
+
+/// Take the waiter id recorded with the last [`note_wait_site`] on this CPU.
+pub fn take_wait_waiter() -> u64 {
+    let cpu = crate::percpu::current_cpu();
+    WAIT_WAITER
+        .get(cpu)
+        .map_or(0, |slot| slot.swap(0, Ordering::Relaxed))
+}
+
+/// Take what [`note_wait_site`] recorded on this CPU since the last take.
+pub fn take_wait_site() -> Option<&'static core::panic::Location<'static>> {
+    let cpu = crate::percpu::current_cpu();
+    let raw = WAIT_SITE
+        .get(cpu)?
+        .swap(core::ptr::null_mut(), Ordering::Relaxed);
+    // SAFETY: only `note_wait_site` stores here, from a `&'static Location`.
+    (!raw.is_null()).then(|| unsafe { &*raw })
+}
+
 /// Future returned by [`Mutex::lock`].
 pub struct LockFuture<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
     waiter_id: Option<WaiterId>,
+    /// Where `lock()` was called, for [`note_wait_site`].
+    site: &'static core::panic::Location<'static>,
 }
 
 impl<T: ?Sized> fmt::Debug for LockFuture<'_, T> {
@@ -172,6 +258,13 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
             return Poll::Ready(MutexGuard { mutex: this.mutex });
         }
 
+        // Handed to us by the last release: ours already.
+        if this.waiter_id.is_some() && inner.granted == this.waiter_id {
+            inner.granted = None;
+            this.waiter_id = None;
+            return Poll::Ready(MutexGuard { mutex: this.mutex });
+        }
+
         // Locked. Either install our waker for the first time or
         // refresh it (the executor may re-poll us with a fresh
         // waker if the task was donated, migrated, etc.).
@@ -187,12 +280,26 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
                         *w = cx.waker().clone();
                     }
                 } else {
-                    // Our slot was popped (a concurrent release
-                    // woke us) but the lock got stolen before we
-                    // re-polled. Re-register at the back.
-                    inner.waiters.push_back((id, cx.waker().clone()));
+                    // Our slot was popped (a concurrent release woke
+                    // us) but the lock was taken before we re-polled,
+                    // by someone who never queued. Going to the back
+                    // here let a waiter be passed over without bound:
+                    // a volume-wide filesystem lock under a dozen busy
+                    // threads left `msync`, `ftruncate`, `rename` and
+                    // `fdatasync` waiting for minutes. As Linux
+                    // (`__mutex_handoff`), take the front instead and
+                    // have the next release hand the lock over.
+                    inner.waiters.push_front((id, cx.waker().clone()));
+                    inner.handoff = true;
                 }
             }
+        }
+        note_wait_site(this.site);
+        if let (Some(WaiterId(id)), Some(slot)) = (
+            this.waiter_id,
+            WAIT_WAITER.get(crate::percpu::current_cpu()),
+        ) {
+            slot.store(id, Ordering::Relaxed);
         }
         Poll::Pending
     }
@@ -220,6 +327,15 @@ impl<T: ?Sized> Drop for LockFuture<'_, T> {
         // chain continues.
         let Some(id) = self.waiter_id else { return };
         let mut inner = self.mutex.inner.lock();
+        if inner.granted == Some(id) {
+            // The lock was handed to us and never claimed: pass it on.
+            inner.granted = None;
+            if let Some(waker) = release_locked(&mut inner) {
+                drop(inner);
+                waker.wake();
+            }
+            return;
+        }
         let pre = inner.waiters.len();
         inner.waiters.retain(|(wid, _)| *wid != id);
         let still_there = inner.waiters.len() != pre;
@@ -269,13 +385,35 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     }
 }
 
+/// Release the lock with `inner` held: hand it to the front waiter if a
+/// hand-off is due, else free it and wake the front waiter. Returns the
+/// waker to call once `inner` is released.
+fn release_locked(inner: &mut MutexInner) -> Option<Waker> {
+    let next = inner.waiters.pop_front();
+    match next {
+        Some((id, waker)) if inner.handoff => {
+            inner.handoff = false;
+            inner.granted = Some(id);
+            Some(waker)
+        }
+        Some((_, waker)) => {
+            inner.locked = false;
+            Some(waker)
+        }
+        None => {
+            inner.handoff = false;
+            inner.locked = false;
+            None
+        }
+    }
+}
+
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         let mut inner = self.mutex.inner.lock();
-        inner.locked = false;
-        let next = inner.waiters.pop_front();
+        let next = release_locked(&mut inner);
         drop(inner);
-        if let Some((_, w)) = next {
+        if let Some(w) = next {
             w.wake();
         }
     }
@@ -309,5 +447,58 @@ mod admission_tests {
         assert!(mutex.try_lock_unqueued().is_none());
         drop(b_guard);
         assert!(mutex.try_lock_unqueued().is_some());
+    }
+
+    #[test]
+    fn a_waiter_passed_over_once_is_handed_the_lock() {
+        let mutex = Mutex::new(());
+        let holder = mutex.try_lock().unwrap();
+        let mut a = mutex.lock();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        // A is woken; a newcomer gets in first.
+        drop(holder);
+        let barger = mutex.try_lock().expect("the lock was free");
+        // A loses that race once ...
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        // ... and is handed the lock on the next release: no one else,
+        // queued or not, can take it in between.
+        drop(barger);
+        assert!(mutex.try_lock().is_none());
+        // The grant shows in the state dump until A runs to claim it.
+        let held = mutex.held_state();
+        assert!(held.locked && held.granted_to.is_some());
+        let mut c = mutex.lock();
+        assert!(Pin::new(&mut c).poll(&mut cx).is_pending());
+        let Poll::Ready(a_guard) = Pin::new(&mut a).poll(&mut cx) else {
+            panic!("the passed-over waiter was not handed the lock");
+        };
+        drop(a_guard);
+        let Poll::Ready(c_guard) = Pin::new(&mut c).poll(&mut cx) else {
+            panic!("the next waiter was stranded");
+        };
+        drop(c_guard);
+        assert!(mutex.try_lock().is_some());
+    }
+
+    #[test]
+    fn a_handed_lock_that_is_never_claimed_passes_on() {
+        let mutex = Mutex::new(());
+        let holder = mutex.try_lock().unwrap();
+        let mut a = mutex.lock();
+        let mut b = mutex.lock();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut b).poll(&mut cx).is_pending());
+        drop(holder);
+        let barger = mutex.try_lock().expect("the lock was free");
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        drop(barger); // handed to A
+        drop(a); // A gives up without claiming it
+        let Poll::Ready(b_guard) = Pin::new(&mut b).poll(&mut cx) else {
+            panic!("a lock handed to a cancelled waiter was lost");
+        };
+        drop(b_guard);
+        assert!(mutex.try_lock().is_some());
     }
 }

@@ -493,6 +493,15 @@ impl BlockDeviceSync for PartitionBlockDevice {
     fn is_read_only(&self) -> bool {
         self.parent.is_read_only()
     }
+    /// The parent's queue, windowed to this partition.
+    fn queue(&self) -> Option<Arc<dyn crate::BlockQueue>> {
+        let inner = self.parent.queue()?;
+        Some(crate::OffsetQueue::new(
+            inner,
+            self.start_lba,
+            self.sector_count,
+        ))
+    }
 }
 
 /// Errors during partition scanning.

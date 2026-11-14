@@ -569,14 +569,17 @@ pub fn cpu_count_from_srat() -> u32 {
     n
 }
 
-/// Look up the NUMA node a CPU belongs to. Returns `None` when the
-/// CPU was not present in the SRAT (caller should default to node 0
-/// or apply a same-socket fallback).
+/// Look up the NUMA node logical CPU `cpu` belongs to. Returns `None`
+/// when the CPU was not present in the SRAT (caller should default to
+/// node 0 or apply a same-socket fallback). The SRAT keys its entries by
+/// APIC ID, so the lookup goes through the MADT-derived CPU map (identity
+/// before the MADT is parsed).
 pub fn cpu_node(cpu: u32) -> Option<u32> {
-    if (cpu as usize) >= MAX_CPUS {
+    let apic = apic_id_of_cpu(cpu as usize).unwrap_or(cpu);
+    if (apic as usize) >= MAX_CPUS {
         return None;
     }
-    let v = CPU_NODE[cpu as usize].load(Ordering::Acquire);
+    let v = CPU_NODE[apic as usize].load(Ordering::Acquire);
     if v == u32::MAX {
         None
     } else {
@@ -636,6 +639,85 @@ static MADT_CPU_COUNT: AtomicU32 = AtomicU32::new(0);
 /// list used by `start_aps`.
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 static PROCESSOR_UIDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+
+/// Logical CPU id -> APIC ID, the boot topology every interrupt
+/// destination is resolved through (Linux `cpu_physical_id()` /
+/// `x86_cpu_to_apicid`). Logical 0 is the boot CPU; the other enabled
+/// MADT processors follow in ascending APIC-ID order, so the logical ids
+/// are dense `0..cpu_count_from_madt()` even when firmware leaves APIC-ID
+/// gaps (a Zen part with cores fused off, a multi-socket box whose
+/// sockets start at a power-of-two boundary) or lists the processors out
+/// of APIC-ID order (the Ryzen 7600X MADT lists 0,2,4,..,1,3,..). On a
+/// dense topology whose boot CPU has the lowest APIC ID — QEMU, the
+/// desktops NARF boots — the map is the identity. `u32::MAX` = no CPU.
+///
+/// Built once by [`parse_madt`]; unlike [`APIC_IDS`] it is never touched by
+/// test fixtures, because live IPI and NMI delivery read it.
+static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+/// Number of valid entries in [`CPU_APIC_IDS`]; 0 = no map (no MADT).
+static CPU_MAP_LEN: AtomicU32 = AtomicU32::new(0);
+
+/// The calling CPU's APIC ID from CPUID: the x2APIC ID (leaf 0xB EDX)
+/// when the leaf exists, else the 8-bit initial APIC ID (leaf 1
+/// EBX[31:24]). Independent of the LAPIC's mode, so it works before the
+/// interrupt controller is up.
+#[cfg(target_arch = "x86_64")]
+pub fn boot_cpu_apic_id_from_cpuid() -> u32 {
+    // SAFETY: CPUID is unprivileged and always present on x86_64.
+    let max = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+    if max >= 0xB {
+        // SAFETY: leaf 0xB is within the advertised range.
+        let leaf = unsafe { core::arch::x86_64::__cpuid_count(0xB, 0) };
+        // EBX = 0 means the leaf is not implemented despite max >= 0xB.
+        if leaf.ebx != 0 {
+            return leaf.edx;
+        }
+    }
+    // SAFETY: leaf 1 always exists.
+    unsafe { core::arch::x86_64::__cpuid(1) }.ebx >> 24
+}
+
+/// Rebuild [`CPU_APIC_IDS`] from the enabled entries of [`APIC_IDS`]
+/// (`count` of them): `bsp` first when it is listed, the rest ascending.
+fn build_cpu_map(count: usize, bsp: Option<u32>) {
+    let mut ids = [u32::MAX; MAX_CPUS];
+    let n = count.min(MAX_CPUS);
+    for (i, slot) in ids.iter_mut().enumerate().take(n) {
+        *slot = APIC_IDS[i].load(Ordering::Acquire);
+    }
+    let ids = &mut ids[..n];
+    ids.sort_unstable();
+    let bsp_pos = bsp.and_then(|b| ids.iter().position(|&id| id == b));
+    if let Some(pos) = bsp_pos {
+        ids[..=pos].rotate_right(1);
+    }
+    for (i, slot) in CPU_APIC_IDS.iter().enumerate() {
+        slot.store(ids.get(i).copied().unwrap_or(u32::MAX), Ordering::Release);
+    }
+    CPU_MAP_LEN.store(n as u32, Ordering::Release);
+}
+
+/// APIC ID of logical CPU `cpu` — the destination to put in an IPI's ICR,
+/// an MSI address or an IOAPIC redirection entry to reach that CPU.
+/// `None` when the MADT is unknown or lists no such CPU.
+#[inline]
+pub fn apic_id_of_cpu(cpu: usize) -> Option<u32> {
+    if cpu >= CPU_MAP_LEN.load(Ordering::Acquire) as usize {
+        return None;
+    }
+    match CPU_APIC_IDS[cpu].load(Ordering::Acquire) {
+        u32::MAX => None,
+        id => Some(id),
+    }
+}
+
+/// Logical CPU id of the processor with APIC ID `apic` (the inverse of
+/// [`apic_id_of_cpu`]). `None` when the MADT is unknown or does not list an
+/// enabled processor with that APIC ID.
+pub fn cpu_of_apic_id(apic: u32) -> Option<usize> {
+    let n = CPU_MAP_LEN.load(Ordering::Acquire) as usize;
+    (0..n.min(MAX_CPUS)).find(|&cpu| CPU_APIC_IDS[cpu].load(Ordering::Acquire) == apic)
+}
 
 /// Sticky flag: set once `parse_madt` has run successfully.
 static MADT_PARSED: AtomicBool = AtomicBool::new(false);
@@ -827,6 +909,12 @@ pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
 
     MADT_CPU_COUNT.store(cpu_count, Ordering::Release);
+    // `parse_madt` runs on the boot CPU, before any AP is started.
+    #[cfg(target_arch = "x86_64")]
+    let bsp = Some(boot_cpu_apic_id_from_cpuid());
+    #[cfg(not(target_arch = "x86_64"))]
+    let bsp = None;
+    build_cpu_map(cpu_count as usize, bsp);
     MADT_PARSED.store(true, Ordering::Release);
     Ok(count)
 }
@@ -847,8 +935,9 @@ pub fn cpu_count_from_madt() -> u32 {
     MADT_CPU_COUNT.load(Ordering::Acquire)
 }
 
-/// Lookup the APIC id at enumeration index `i`. Stage-4 SMP bring-up
-/// uses this list as the canonical AP target order. Returns `None`
+/// The APIC id at MADT enumeration index `i` — firmware order, which is
+/// neither ascending nor the logical CPU order (see [`apic_id_of_cpu`],
+/// the lookup an interrupt destination for a CPU wants). Returns `None`
 /// for indices beyond the enumerated count.
 pub fn apic_id_at(i: usize) -> Option<u32> {
     if i >= MAX_CPUS {

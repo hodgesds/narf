@@ -13,6 +13,7 @@
 //! as some mount ([`BtrfsVolume`] view) of it does, and the next mount after
 //! the last one goes builds a fresh instance from disk.
 
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -88,7 +89,10 @@ pub async fn mount(
     read_only: bool,
 ) -> Result<Arc<BtrfsVolume<SyncBlock>>, FsError> {
     let what = alloc::format!("{subvol:?}");
-    let result = mount_inner(source, devices, subvol, read_only).await;
+    // Boxed: a mount's sub-futures are large, and held inline they made this
+    // future and every frame that holds or polls it (`btrfs_factory`, the
+    // root and test mounts, `block_on`) tens of KiB deep.
+    let result = Box::pin(mount_inner(source, devices, subvol, read_only)).await;
     if let Err(error) = &result {
         use core::fmt::Write as _;
         let _ = writeln!(
@@ -114,18 +118,28 @@ async fn mount_inner(
             if !core.has_member(devid) {
                 return Err(FsError::Busy);
             }
-            return BtrfsVolume::mount_view(&core, subvol, read_only).await;
+            return Box::pin(BtrfsVolume::mount_view(&core, subvol, read_only)).await;
         }
     }
     let volume = if read_only {
-        let volume =
-            BtrfsVolume::mount_devices_read_only(devices, DomainId::DRIVER_0, true).await?;
+        let volume = Box::pin(BtrfsVolume::mount_devices_read_only(
+            devices,
+            DomainId::DRIVER_0,
+            true,
+        ))
+        .await?;
         if let Some(selector) = &subvol {
-            volume.switch_to_subvol(selector).await?;
+            Box::pin(volume.switch_to_subvol(selector)).await?;
         }
         volume
     } else {
-        BtrfsVolume::mount_subvol_devices(devices, DomainId::DRIVER_0, true, subvol).await?
+        Box::pin(BtrfsVolume::mount_subvol_devices(
+            devices,
+            DomainId::DRIVER_0,
+            true,
+            subvol,
+        ))
+        .await?
     };
     register(volume.core());
     Ok(volume)

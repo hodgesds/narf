@@ -17,11 +17,14 @@
 //! device that can emit `KEY_POWER`, runs `HandlePowerKey=` (by default an
 //! orderly `poweroff.target`: services stopped, filesystems unmounted).
 //!
-//! NARF adds one fallback Linux does not need: when nothing has the device
-//! open (no logind — e.g. not booted under systemd PID 1), the press becomes
-//! an orderly kernel power-off ([`crate::orderly`]): every filesystem synced
-//! from task context, then the device shutdown hooks. Never a power-off from
-//! the notifying context.
+//! With nothing listening, Linux does nothing more: powering off is
+//! userspace's job. NARF keeps one fallback for a system with no logind
+//! (e.g. not booted under systemd): the press becomes
+//! `orderly_poweroff(false)` ([`crate::orderly`]), which runs the userspace
+//! `kernel.poweroff_cmd` (default `/sbin/poweroff`) — what logind would have
+//! started — and does nothing more if that command cannot be started. The
+//! kernel never syncs or shuts devices down on a button press while user
+//! tasks keep running, and never powers off from the notifying context.
 
 use alloc::sync::Arc;
 
@@ -39,16 +42,26 @@ pub enum PressOutcome {
     /// `KEY_POWER` was delivered to `readers` open handle(s); userspace
     /// decides what happens.
     Delivered { readers: u32 },
-    /// Nothing listens: an orderly kernel power-off was requested
-    /// (`first` = this press made the request).
+    /// Nothing listens: an orderly power-off (the userspace poweroff
+    /// command, unforced) was requested (`first` = this press made the
+    /// request).
     OrderlyPowerOff { first: bool },
 }
 
-/// The capability set of the power-button input device: `EV_KEY` +
-/// `KEY_POWER` (and `EV_SYN`), exactly what `acpi_button_add` declares.
+/// The power-button input device, as `acpi_button_add` declares it for the
+/// fixed-feature button (PM1 `PWRBTN_STS`, ACPI HID `LNXPWRBN` — the event
+/// NARF's SCI dispatcher reports): name "Power Button", phys
+/// `LNXPWRBN/button/input0`, `BUS_HOST` with product
+/// `ACPI_BUTTON_TYPE_POWER` (1), and `EV_KEY` `KEY_POWER` + `KEY_WAKEUP`
+/// (with `EV_SYN`). udev / logind key their power-switch handling off this
+/// identity.
 pub fn power_button_caps() -> DeviceCaps {
     let mut caps = DeviceCaps::new();
+    caps.name = alloc::string::String::from("Power Button");
+    caps.phys = alloc::string::String::from("LNXPWRBN/button/input0");
+    caps.id = narf_input::evdev::InputId::new(narf_input::evdev::bus::HOST, 0, 1, 0);
     caps.add_key(KEY_POWER);
+    caps.add_key(evdev::key::KEY_WAKEUP);
     caps
 }
 
@@ -71,7 +84,8 @@ pub fn input_device() -> Option<Arc<DeviceNode>> {
 }
 
 /// Report one press on `node`: deliver press + release (each followed by
-/// `SYN_REPORT`); with no reader, request the orderly power-off instead.
+/// `SYN_REPORT`); with no reader, request the unforced orderly power-off
+/// instead.
 ///
 /// Safe from interrupt context: event dispatch and the orderly request are
 /// both IRQ-safe and neither blocks.
@@ -79,7 +93,7 @@ pub fn report_press_on(node: &DeviceNode) -> PressOutcome {
     let readers = node.reader_count();
     if readers == 0 {
         let first =
-            crate::orderly::orderly_poweroff(crate::orderly::OrderlyReason::PowerButton, None);
+            crate::orderly::orderly_poweroff(crate::orderly::OrderlyReason::PowerButton, false);
         return PressOutcome::OrderlyPowerOff { first };
     }
     evdev::dispatch_key_to_node(node, KEY_POWER, true);
@@ -106,7 +120,7 @@ pub fn report_power_button() -> PressOutcome {
         PressOutcome::OrderlyPowerOff { .. } => {
             let _ = writeln!(
                 narf_console::Writer,
-                "  acpi: power button, no KEY_POWER consumer -> orderly power-off"
+                "  acpi: power button, no KEY_POWER consumer -> orderly power-off (poweroff_cmd)"
             );
         }
     }

@@ -161,6 +161,8 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
         "--format-version=1",
     ]))?;
     let mut seen = BTreeSet::new();
+    // Lint every context before failing, so one run reports all of them.
+    let mut failed = Vec::new();
     for context in CONTEXTS {
         let frame_features = context
             .split(',')
@@ -198,8 +200,12 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
             .args(clippy_args(Some(&target), &selected, features));
         eprintln!("clippy-changed ({context}): {cmd:?}");
         if !args.dry_run && !cmd.status().context("run targeted Clippy")?.success() {
-            bail!("targeted Clippy failed ({context})");
+            eprintln!("clippy-changed: targeted Clippy failed ({context})");
+            failed.push(*context);
         }
+    }
+    if !failed.is_empty() {
+        bail!("targeted Clippy failed ({})", failed.join("; "));
     }
     Ok(())
 }
@@ -209,7 +215,9 @@ fn clippy_args(
     selected: &[String],
     features: BTreeSet<String>,
 ) -> Vec<String> {
-    let mut args = ["clippy", "--locked", "--no-deps"]
+    // `--keep-going`: report every crate's lints in one run instead of
+    // stopping at the first crate that fails, so one pass lists all of them.
+    let mut args = ["clippy", "--locked", "--no-deps", "--keep-going"]
         .map(str::to_string)
         .to_vec();
     if let Some(target) = target {

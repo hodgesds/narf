@@ -2037,6 +2037,11 @@ impl narf_filesystem::FileOps for ProgFile {
         narf_filesystem::inode_id::anon_inode().attrs()
     }
 
+    /// `/proc/<pid>/fd/<n>` reads `anon_inode:bpf-prog`.
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("bpf-prog")
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,

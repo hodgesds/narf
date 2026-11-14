@@ -227,14 +227,33 @@ impl FileOps for EventFd {
 /// `timerfd_create(2)` — a fd that becomes readable when a deadline
 /// passes. `read` returns the number of expirations since the last
 /// read (u64).
-#[derive(Debug)]
+///
+/// Linux `fs/timerfd.c`: the fd owns an hrtimer on its clock's base whose
+/// callback (`timerfd_tmrproc`) counts the expiry and wakes pollers. Here the
+/// callback runs in hard-IRQ context: it takes only the fd's IRQ-safe state
+/// lock, forwards a periodic timer, and raises POLL_IN on the readiness cell
+/// (IRQ-safe, releases no reference).
+#[repr(C)]
 pub struct TimerFd {
+    /// First field: the callback recovers the fd from it (`container_of`).
+    timer: narf_scheduler::narf_time::hrtimer::HrTimer,
+    clock: narf_scheduler::narf_time::hrtimer::ClockId,
     state: IrqSafeSpinLock<TimerState>,
+    readiness: narf_lib::readiness::Readiness,
+}
+
+impl core::fmt::Debug for TimerFd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TimerFd")
+            .field("clock", &self.clock)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 struct TimerState {
-    /// Absolute monotonic-ns deadline; 0 = disarmed.
+    /// Absolute deadline in the fd's clock (ns); 0 = disarmed.
     next_fire_ns: u64,
     /// Re-arm interval in ns; 0 = one-shot.
     interval_ns: u64,
@@ -242,25 +261,119 @@ struct TimerState {
     expirations: u64,
 }
 
+impl TimerState {
+    /// Count every expiry up to `now` and advance a periodic deadline past
+    /// it (`hrtimer_forward`). Returns whether anything expired.
+    fn expire(&mut self, now: u64) -> bool {
+        if self.next_fire_ns == 0 || now < self.next_fire_ns {
+            return false;
+        }
+        if self.interval_ns == 0 {
+            self.expirations = self.expirations.saturating_add(1);
+            self.next_fire_ns = 0;
+        } else {
+            let missed = ((now - self.next_fire_ns) / self.interval_ns).saturating_add(1);
+            self.expirations = self.expirations.saturating_add(missed);
+            self.next_fire_ns = self
+                .next_fire_ns
+                .saturating_add(self.interval_ns.saturating_mul(missed));
+        }
+        true
+    }
+}
+
+/// `timerfd_tmrproc`: the fd's hrtimer expired.
+///
+/// Linux (`fs/timerfd.c`: `timerfd_tmrproc` → `timerfd_triggered`) counts
+/// the expiry unconditionally — the hrtimer firing IS the expiry — and wakes
+/// the fd's wait queue on every one (`wake_up_locked_poll(&ctx->wqh,
+/// EPOLLIN)`), which runs `ep_poll_callback` for an epoll watching it.
+///
+/// It must not re-read the clock and re-check the deadline: the hrtimer core
+/// decided the timer was due against the base time it sampled once
+/// (`__hrtimer_run_queues`' `basenow`). A wall-offset change in between (an
+/// NTP slew chunk or a step lowering CLOCK_REALTIME/TAI) makes the re-read
+/// earlier than the deadline; re-arming at that same deadline then put the
+/// timer straight back at the head of a queue whose stale `basenow` says it
+/// is due, and the expiry loop ran it again, for ever, in hard IRQ.
+fn timerfd_tmrproc(
+    t: &narf_scheduler::narf_time::hrtimer::HrTimer,
+) -> narf_scheduler::narf_time::hrtimer::HrtimerRestart {
+    use narf_scheduler::narf_time::hrtimer::{self, HrtimerRestart};
+    // SAFETY: only `TimerFd` uses this callback, and `timer` is the first
+    // field of the repr(C) struct.
+    let tfd = unsafe { &*(t as *const _ as *const TimerFd) };
+    let now = hrtimer::clock_now(tfd.clock);
+    let (expired, next) = {
+        let mut s = tfd.state.lock();
+        // The deadline this hrtimer was armed for is due by the hrtimer
+        // core's clock: count it even if `now` reads earlier. (A `tick()` in
+        // task context may already have counted it and moved `next_fire_ns`
+        // on; then only what `now` says is due counts.)
+        let due = if s.next_fire_ns != 0 && s.next_fire_ns <= t.expires() {
+            now.max(s.next_fire_ns)
+        } else {
+            now
+        };
+        (s.expire(due), s.next_fire_ns)
+    };
+    if expired {
+        // Every expiry wakes the wait queue, rising edge or not (an unread
+        // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
+        // each expiry, as on Linux).
+        tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
+    }
+    if next == 0 {
+        return HrtimerRestart::NoRestart;
+    }
+    // Periodic (or a re-arm that raced this expiry): run again at the next
+    // deadline. The timer is ours and running, so it stays on this base.
+    // SAFETY: the fd outlives its timer (Drop cancels it).
+    unsafe { hrtimer::hrtimer_start_range_ns(t, next, 0, hrtimer::HrtimerMode::ABS) };
+    HrtimerRestart::NoRestart
+}
+
 impl TimerFd {
-    pub fn new() -> Arc<Self> {
+    pub fn new(clock: narf_scheduler::narf_time::hrtimer::ClockId) -> Arc<Self> {
+        use narf_scheduler::narf_time::hrtimer::{HrTimer, HrtimerMode};
         Arc::new(Self {
+            timer: HrTimer::new(timerfd_tmrproc, clock, HrtimerMode::ABS_HARD),
+            clock,
             state: IrqSafeSpinLock::new(TimerState {
                 next_fire_ns: 0,
                 interval_ns: 0,
                 expirations: 0,
             }),
+            readiness: narf_lib::readiness::Readiness::new(0),
         })
     }
 
-    /// Set the timer. `value_ns` is the absolute monotonic-ns
-    /// deadline for the first fire; `interval_ns` is the rearm
-    /// period (0 = one-shot).
+    /// Current time of this fd's clock.
+    pub fn now(&self) -> u64 {
+        narf_scheduler::narf_time::hrtimer::clock_now(self.clock)
+    }
+
+    /// Set the timer (`do_timerfd_settime`). `value_ns` is the absolute
+    /// deadline in the fd's clock for the first fire (0 = disarm);
+    /// `interval_ns` is the rearm period (0 = one-shot).
     pub fn arm(&self, value_ns: u64, interval_ns: u64) {
-        let mut s = self.state.lock();
-        s.next_fire_ns = value_ns;
-        s.interval_ns = interval_ns;
-        s.expirations = 0;
+        use narf_scheduler::narf_time::hrtimer;
+        // Cancel first (waits out a running callback), then publish the new
+        // state, then start: an expiry of the old setting can no longer count.
+        hrtimer::hrtimer_cancel(&self.timer);
+        {
+            let mut s = self.state.lock();
+            s.next_fire_ns = value_ns;
+            s.interval_ns = interval_ns;
+            s.expirations = 0;
+        }
+        self.readiness.set(0, POLL_IN);
+        if value_ns != 0 {
+            // SAFETY: the fd is Arc-allocated and Drop cancels the timer.
+            unsafe {
+                hrtimer::hrtimer_start_range_ns(&self.timer, value_ns, 0, hrtimer::HrtimerMode::ABS)
+            };
+        }
     }
 
     /// Wave-64: `timerfd_gettime(2)` snapshot.
@@ -276,31 +389,37 @@ impl TimerFd {
         if s.next_fire_ns == 0 {
             return (0, s.interval_ns);
         }
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        let remaining = s.next_fire_ns.saturating_sub(now);
+        let remaining = s.next_fire_ns.saturating_sub(self.now());
         (remaining, s.interval_ns)
     }
 
-    /// Tick: if the deadline has passed, increment expirations and
-    /// re-arm if periodic. Called from `read` and `poll_readiness`.
+    /// Run the expiry callback now, as the hrtimer core would once it found
+    /// the timer due (tests: an expiry whose clock re-read is early).
+    #[doc(hidden)]
+    pub fn __test_run_expiry(&self) {
+        let _ = timerfd_tmrproc(&self.timer);
+    }
+
+    /// Pending expirations not yet read out (tests).
+    #[doc(hidden)]
+    pub fn __test_expirations(&self) -> u64 {
+        self.state.lock().expirations
+    }
+
+    /// Count an expiry the callback has not delivered yet (its interrupt may
+    /// still be on its way). Called from `read` and `poll_readiness`.
     fn tick(&self) {
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        let mut s = self.state.lock();
-        if s.next_fire_ns == 0 || now < s.next_fire_ns {
-            return;
+        let now = self.now();
+        let expired = self.state.lock().expire(now);
+        if expired {
+            self.readiness.set(POLL_IN, 0);
         }
-        if s.interval_ns == 0 {
-            s.expirations += 1;
-            s.next_fire_ns = 0;
-        } else {
-            // Count missed expirations.
-            let missed = ((now - s.next_fire_ns) / s.interval_ns).saturating_add(1);
-            s.expirations = s.expirations.saturating_add(missed);
-            s.next_fire_ns = s
-                .next_fire_ns
-                .saturating_add(s.interval_ns.saturating_mul(missed));
-        }
-        drop(s);
+    }
+}
+
+impl Drop for TimerFd {
+    fn drop(&mut self) {
+        narf_scheduler::narf_time::hrtimer::hrtimer_cancel(&self.timer);
     }
 }
 
@@ -348,6 +467,8 @@ impl FileOps for TimerFd {
             }
             buf[..8].copy_from_slice(&s.expirations.to_le_bytes());
             s.expirations = 0;
+            drop(s);
+            self.readiness.set(0, POLL_IN);
             Ok(8)
         })
     }
@@ -377,21 +498,22 @@ impl FileOps for TimerFd {
         }
     }
 
-    /// The armed deadline so a parked `epoll`/`poll` waiter can wake when
-    /// this timer elapses. Already-expired (`expirations > 0`) or disarmed
-    /// (`next_fire_ns == 0`) timers report `None` — the former is reported
-    /// ready by `poll_readiness`, the latter has no schedule.
+    /// The fd's hrtimer raises POLL_IN on this cell when it expires, so a
+    /// parked poll/epoll waiter is woken by the expiry itself.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
+    }
+
+    /// The armed deadline, for waiters that clamp a park to it (a `poll` on
+    /// an epoll fd forwards its nested timerfds' deadlines). Ticks first, so
+    /// an already-elapsed timer folds into `expirations` and reports `None`
+    /// ("ready now") rather than a past deadline, which would make such a
+    /// waiter re-park on the same past instant in a 100%-CPU loop.
     fn poll_deadline(&self) -> Option<u64> {
-        // Tick first, exactly as `poll_readiness` does: without it a timer that
-        // has already elapsed but not yet been ticked still has `expirations==0`
-        // and a past `next_fire_ns`, so this would hand a caller a deadline IN
-        // THE PAST. An epoll waiter clamps its scheduler wake-up to this; a past
-        // deadline makes the scheduler wake it immediately, and if the elapsed
-        // expiry is not deliverable (EPOLLET edge already consumed) the wait
-        // re-parks and re-clamps to the same past instant — a 100%-CPU spin.
-        // After the tick an elapsed timer reports `expirations>0` (=> None,
-        // "ready now, no schedule") or has advanced `next_fire_ns` to a future
-        // instant.
         self.tick();
         let s = self.state.lock();
         if s.next_fire_ns == 0 || s.expirations > 0 {
@@ -652,19 +774,54 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    // Regression: a parked epoll_wait clamps its scheduler wake-up to a
-    // timerfd's `poll_deadline()`. If that returns an instant already in the
-    // PAST, the scheduler wakes the waiter immediately; when the elapsed expiry
-    // is not deliverable (its EPOLLET edge was already consumed) the wait
-    // re-parks and re-clamps to the same past instant — a 100%-CPU epoll_wait
-    // livelock (kwin's greeter never presented). `poll_deadline` must tick
-    // first, so an already-elapsed one-shot folds into `expirations` and reports
-    // None ("ready now, no schedule"), never a past deadline.
-    fn smoke_timerfd_poll_deadline_never_past() -> TestResult {
-        let now = narf_scheduler::narf_time::monotonic_ns();
+    // `timerfd_tmrproc`: the fd's own hrtimer counts the expiry and raises
+    // POLL_IN on its readiness cell, so a parked poll/epoll waiter is woken by
+    // the expiry itself, without anyone calling `read` or `poll_readiness`.
+    // A disarmed or future timer stays unreadable; a re-arm clears the count.
+    fn smoke_timerfd_hrtimer_expiry_raises_readiness() -> TestResult {
+        use narf_scheduler::narf_time::hrtimer::{self, ClockId};
+        let tfd = TimerFd::new(ClockId::Monotonic);
+        let now = tfd.now();
+        tfd.arm(now.saturating_add(1_000_000), 0);
+        if tfd.readiness.mask() & POLL_IN != 0 {
+            return TestResult::Fail("a future timer must not be readable");
+        }
+        let end = now.saturating_add(500_000_000);
+        while tfd.readiness.mask() & POLL_IN == 0 && tfd.now() < end {
+            // Expire this CPU's due timers even if its interrupt is masked.
+            hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+        if tfd.readiness.mask() & POLL_IN == 0 {
+            return TestResult::Fail("the timerfd hrtimer never raised POLL_IN");
+        }
+        if tfd.current().0 != 0 {
+            return TestResult::Fail("an expired one-shot must report no time remaining");
+        }
+        tfd.arm(now.saturating_add(60_000_000_000), 0);
+        if tfd.poll_readiness() & POLL_IN != 0 {
+            return TestResult::Fail("re-arming must clear the pending expirations");
+        }
+        let disarmed = TimerFd::new(ClockId::Monotonic);
+        if disarmed.poll_readiness() & POLL_IN != 0 {
+            return TestResult::Fail("a disarmed timer must not be readable");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/io_mux",
+        smoke_timerfd_hrtimer_expiry_raises_readiness
+    );
 
-        // One-shot armed at an ABSOLUTE deadline already in the past.
-        let elapsed = TimerFd::new();
+    // Regression: a parked epoll_wait clamps its scheduler wake-up to a
+    // timerfd's `poll_deadline()`. A deadline already in the PAST made the
+    // waiter re-park on the same instant forever (a 100%-CPU epoll_wait;
+    // kwin's greeter never presented). An already-elapsed one-shot must fold
+    // into `expirations` and report None, never a past deadline.
+    fn smoke_timerfd_poll_deadline_never_past() -> TestResult {
+        use narf_scheduler::narf_time::hrtimer::ClockId;
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        let elapsed = TimerFd::new(ClockId::Monotonic);
         elapsed.arm(1, 0);
         match elapsed.poll_deadline() {
             None => {}
@@ -673,21 +830,16 @@ mod tests {
             }
             Some(_) => return TestResult::Fail("elapsed one-shot poll_deadline should be None"),
         }
-        // The elapsed expiry is now counted, so it reports readable.
         if elapsed.poll_readiness() != POLL_IN {
             return TestResult::Fail("elapsed timer should be POLL_IN after the tick");
         }
-
-        // A future one-shot still reports its (future) deadline to the clamp.
-        let future = TimerFd::new();
+        let future = TimerFd::new(ClockId::Monotonic);
         future.arm(now.saturating_add(60_000_000_000), 0);
         match future.poll_deadline() {
             Some(d) if d > now => {}
             _ => return TestResult::Fail("future one-shot must report its future deadline"),
         }
-
-        // A disarmed timer has no schedule.
-        if TimerFd::new().poll_deadline().is_some() {
+        if TimerFd::new(ClockId::Monotonic).poll_deadline().is_some() {
             return TestResult::Fail("disarmed timer must report no deadline");
         }
         TestResult::Pass

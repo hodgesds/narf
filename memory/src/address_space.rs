@@ -182,6 +182,65 @@ pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64)) {
     *SHARED_FRAME_HOOKS.lock() = Some((retain, release));
 }
 
+/// Dirty tracking for the frames of `SHARED | EXTERNAL_REFS` regions (the
+/// generic file page cache above this crate), as Linux tracks a shared file
+/// folio through its write-notify fault (`do_wp_page` → `page_mkwrite` /
+/// `folio_mark_dirty`).
+///
+/// * `write_enabled(phys)` — may a PTE for `phys` in a writable shared
+///   region carry the write bit now? The owner answers "yes" only for a
+///   frame it has recorded as dirty; every other such PTE is installed
+///   read-only, so the first store to it faults.
+/// * `write_notify(phys)` — a store hit a read-only PTE for `phys` in a
+///   writable shared region. The owner records the frame dirty and returns
+///   `true`; the fault path then re-installs the PTE, now writable. `false`
+///   (not the owner's frame) leaves the fault to its usual outcome.
+///
+/// Both are called with this address space's region lock held: they must
+/// not call back into the memory crate. Uninstalled, every such PTE stays
+/// writable as before.
+static SHARED_PAGE_WRITE_ENABLED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static SHARED_PAGE_WRITE_NOTIFY: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the dirty-tracking hooks for `SHARED | EXTERNAL_REFS` frames.
+pub fn install_shared_page_write_hooks(
+    write_enabled: fn(u64) -> bool,
+    write_notify: fn(u64) -> bool,
+) {
+    use core::sync::atomic::Ordering;
+    SHARED_PAGE_WRITE_ENABLED.store(write_enabled as usize, Ordering::Release);
+    SHARED_PAGE_WRITE_NOTIFY.store(write_notify as usize, Ordering::Release);
+}
+
+fn shared_page_write_enabled(phys: PhysAddr) -> bool {
+    let raw = SHARED_PAGE_WRITE_ENABLED.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 || phys.raw() == 0 {
+        return true;
+    }
+    // SAFETY: only `install_shared_page_write_hooks` stores here, a
+    // `fn(u64) -> bool`.
+    let hook: fn(u64) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(phys.raw())
+}
+
+fn shared_page_write_notify(phys: PhysAddr) -> bool {
+    let raw = SHARED_PAGE_WRITE_NOTIFY.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 || phys.raw() == 0 {
+        return false;
+    }
+    // SAFETY: only `install_shared_page_write_hooks` stores here, a
+    // `fn(u64) -> bool`.
+    let hook: fn(u64) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(phys.raw())
+}
+
+#[inline]
+fn is_external_shared(perms: RegionPerms) -> bool {
+    perms.contains(RegionPerms::SHARED) && perms.contains(RegionPerms::EXTERNAL_REFS)
+}
+
 /// Install the callback which retires ownership metadata kept above the
 /// memory crate when an address space reaches its last reference.
 pub fn install_address_space_drop_hook(hook: AddressSpaceDropHook) {
@@ -699,6 +758,9 @@ fn user_page_writable(perms: RegionPerms, phys: PhysAddr) -> bool {
 fn user_page_writable_at_count(perms: RegionPerms, phys: PhysAddr, cow_count: u32) -> bool {
     perms.contains(RegionPerms::WRITE)
         && (!perms.contains(RegionPerms::COW) || phys.raw() == 0 || cow_count <= 1)
+        // A shared file-cache page is writable only once its owner has
+        // recorded it dirty (see `install_shared_page_write_hooks`).
+        && (!is_external_shared(perms) || shared_page_write_enabled(phys))
 }
 
 /// A contiguous user virtual mapping with block-indexed physical backing.
@@ -2611,6 +2673,37 @@ pub struct AddressSpace {
     membarrier_task_state: core::sync::atomic::AtomicU32,
 }
 
+/// A user reference to an address space (Linux `mmget`/`mmput`), from
+/// [`AddressSpace::mmget_not_zero`]. Its memory and page tables stay in place
+/// while it lives; dropping the last user runs `exit_mmap`.
+#[derive(Debug)]
+pub struct MmUser {
+    space: alloc::sync::Arc<AddressSpace>,
+}
+
+impl MmUser {
+    /// The address space, as an `Arc` (`mm_count`) a caller may keep.
+    pub fn arc(&self) -> &alloc::sync::Arc<AddressSpace> {
+        &self.space
+    }
+}
+
+impl core::ops::Deref for MmUser {
+    type Target = AddressSpace;
+
+    fn deref(&self) -> &AddressSpace {
+        &self.space
+    }
+}
+
+impl Drop for MmUser {
+    fn drop(&mut self) {
+        if self.space.scheduler_detach_user_task() {
+            self.space.exit_mmap();
+        }
+    }
+}
+
 // `clone_for_fork` is intentionally a by-value interface today. Keep the
 // value small enough that nested syscall/fork frames cannot silently consume
 // a material fraction of the 32 KiB kernel-task stack again. Large bounded
@@ -2830,7 +2923,12 @@ impl AddressSpace {
     /// Retire one scheduler task after its final poll. The zero transition is
     /// the OOM reaper's quiescence event: no task can newly fault or contend a
     /// VMA lock through this address space after it becomes visible.
-    pub fn scheduler_detach_user_task(&self) {
+    ///
+    /// Returns `true` for that zero transition — Linux `mmput` dropping the
+    /// last `mm_users` reference — after which the caller runs
+    /// [`Self::exit_mmap`] once it holds no lock the teardown cannot run
+    /// under.
+    pub fn scheduler_detach_user_task(&self) -> bool {
         let previous = self
             .membarrier_task_state
             .fetch_update(
@@ -2846,7 +2944,44 @@ impl AddressSpace {
             .expect("address-space live-task count underflow");
         if previous >> LIVE_USER_TASKS_SHIFT == 1 {
             crate::oom::wake_reaper_if_pending();
+            return true;
         }
+        false
+    }
+
+    /// Linux `mmget_not_zero`: take a user reference (`mm_users`) for the
+    /// duration of an access to another task's memory, unless the last user
+    /// is already gone — then `exit_mmap` has run or is running, and the
+    /// caller must fail as Linux does (`-ESRCH`, `-EIO`, a short or empty
+    /// read). While the returned [`MmUser`] lives, `exit_mmap` cannot start;
+    /// dropping it is `mmput`, and the drop that ends the last user runs
+    /// `exit_mmap` itself. An `Arc` alone (`mm_count`) keeps only the struct.
+    pub fn mmget_not_zero(self: &alloc::sync::Arc<Self>) -> Option<MmUser> {
+        self.membarrier_task_state
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+                |state| {
+                    let count = state >> LIVE_USER_TASKS_SHIFT;
+                    if count == 0 || count >= u32::MAX >> LIVE_USER_TASKS_SHIFT {
+                        return None;
+                    }
+                    Some((state & MEMBARRIER_STATE_MASK) | ((count + 1) << LIVE_USER_TASKS_SHIFT))
+                },
+            )
+            .ok()
+            .map(|_| MmUser {
+                space: self.clone(),
+            })
+    }
+
+    /// Users of this address space (Linux `mm_users`): scheduler tasks which
+    /// may still execute through it plus [`MmUser`] references held by
+    /// accessors of its memory — as opposed to the `Arc` count, `mm_count`.
+    pub fn scheduler_user_tasks(&self) -> u32 {
+        self.membarrier_task_state
+            .load(core::sync::atomic::Ordering::Acquire)
+            >> LIVE_USER_TASKS_SHIFT
     }
 
     /// Whether every scheduler task which could execute through this address
@@ -3637,6 +3772,7 @@ impl AddressSpace {
     /// Caller must run with paging enabled. Post-construction the
     /// AS is safe to build up and activate per the normal flow.
     #[cfg(target_arch = "x86_64")]
+    #[track_caller]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
         let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         // SAFETY: forwarded from this function's caller; `floor` is the fresh
@@ -3653,6 +3789,7 @@ impl AddressSpace {
     /// Same paging contract as [`Self::new_for_user`]. `floor` must be a
     /// page-aligned address in the ordinary mmap randomization window.
     #[cfg(target_arch = "x86_64")]
+    #[track_caller]
     unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
         debug_assert_eq!(floor & 0xFFF, 0);
         debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
@@ -3662,6 +3799,7 @@ impl AddressSpace {
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
+        crate::as_origin::record(phys.raw(), core::panic::Location::caller());
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -7273,7 +7411,74 @@ impl AddressSpace {
         if self.root.as_u64() == 0 || self.is_vm_shared() {
             return 0;
         }
+        self.unmap_all_regions()
+    }
 
+    /// Linux `exit_mmap`, run by `mmput` when the last user of the mm
+    /// (`mm_users`) is gone: here, when the last scheduler task attached to
+    /// this address space detaches ([`Self::scheduler_detach_user_task`]
+    /// returned `true`). Every mapping, its backing and every user page table
+    /// below the root go back now; only the root and this struct remain until
+    /// the last `Arc` (Linux `mm_count`, `mmdrop`) drops. Passive holders —
+    /// `/proc` readers, futex keys, a lazily active root on a CPU that has not
+    /// switched away yet, or a reference nobody released — see an empty
+    /// address space and keep no memory alive with it.
+    ///
+    /// Unlike [`Self::reclaim_unshared_on_exit`] this needs no `CLONE_VM`
+    /// refusal: a zero `mm_users` count proves no task of any process can
+    /// execute, fault or map through this space again. Idempotent; regions an
+    /// unmap could not take (a swap transition in flight) stay for `Drop`,
+    /// together with the tables that map them. Returns the base pages removed.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn exit_mmap(&self) -> usize {
+        if self.root.as_u64() == 0 {
+            return 0;
+        }
+        debug_assert!(self.user_tasks_quiesced());
+        let pages = self.unmap_all_regions();
+        #[cfg(target_arch = "x86_64")]
+        if self.regions.lock().iter().next().is_none() && self.huge_regions.lock().is_empty() {
+            // Linux free_pgtables: the empty tables the unmaps left (every
+            // PDPT, and anything a partial path kept) go too. Quarantined
+            // unmaps first, so no detached table is freed twice.
+            self.flush_deferred();
+            let root = self.root;
+            let tag = self.translation_tag();
+            // SAFETY: no scheduler task can use this space any more and every
+            // region is gone, so no walk can create a table under the root
+            // again; the invalidation retires every cached walk of the root,
+            // which may still be some CPU's lazy active root, before a table
+            // frame is freed. A leftover leaf has no region backing it; only
+            // its reverse-map entry is retired, as final teardown does.
+            unsafe {
+                crate::x86_64::paging::free_user_subtrees_keep_root(
+                    root,
+                    || {
+                        crate::tlb_shootdown::shootdown_owned(
+                            root.as_u64(),
+                            crate::tlb_shootdown::ShootdownRequest::for_tag(tag),
+                        )
+                    },
+                    |phys, va| {
+                        crate::rmap::remove(phys, root, va);
+                    },
+                );
+            }
+        }
+        pages
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn exit_mmap(&self) -> usize {
+        0
+    }
+
+    /// Unmap every huge and ordinary region through the ordinary unmap
+    /// paths (leaf invalidation, backing release, emptied PT/PD detach).
+    /// Stops at a region whose unmap fails (a swap transition) and leaves it
+    /// and later regions for final `Drop`. Returns the base pages removed.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn unmap_all_regions(&self) -> usize {
         // Linux exit_mmap's mmu_notifier_release, before any frame below is
         // released. Device mirrors of this address space are retired.
         self.notify_release();
@@ -12920,6 +13125,23 @@ impl AddressSpace {
     /// The result includes base-page and hardware-huge regions. Lazy base-page
     /// slots whose physical entry is zero contribute virtual bytes but not
     /// resident pages.
+    /// Page-table frames this address space owns: its root and every marked
+    /// table in the user half (Linux `mm_pgtables_bytes(mm) / PAGE_SIZE`).
+    /// Walked, not counted, so it is diagnostic; 0 off x86_64.
+    pub fn page_table_frames(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.root.raw() == 0 {
+                return 0;
+            }
+            crate::x86_64::paging::count_marked_tables(self.root, 0..256)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    }
+
     pub fn memory_stats(&self) -> AddressSpaceMemoryStats {
         let mut stats = AddressSpaceMemoryStats::default();
         {
@@ -13415,6 +13637,7 @@ impl AddressSpace {
     ///   space fork hook clones its VMA-level owner before this function
     ///   releases the parent VMA transaction.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[track_caller]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         // Linux `dup_mm` copies `mm_struct`, including `mmap_base`; ASLR is
         // chosen for a fresh layout at exec, not redrawn at fork. Besides
@@ -13749,6 +13972,26 @@ impl AddressSpace {
 
             let mut regions = self.regions.lock();
             let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+            // Write-notify: a store to a clean shared file-cache page, which
+            // is mapped read-only until its owner records it dirty. Nothing
+            // is copied — the page is the file's — and the trap path's
+            // `remap_page` then installs the PTE writable.
+            if !force && is_external_shared(region.perms) {
+                if !region.perms.contains(RegionPerms::WRITE) {
+                    return Err(AddressSpaceError::Unmapped);
+                }
+                let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+                let phys = region
+                    .phys
+                    .get(page_idx)
+                    .map(|phys| phys.raw())
+                    .unwrap_or(0);
+                return if shared_page_write_notify(PhysAddr::new(phys)) {
+                    Ok(())
+                } else {
+                    Err(AddressSpaceError::Unmapped)
+                };
+            }
             // A present write fault is recoverable only when fork explicitly
             // made this logically-writable private mapping COW. In particular,
             // mprotect(PROT_READ) must fall through to SIGSEGV.
@@ -13921,6 +14164,10 @@ impl AddressSpace {
         let new_frame = crate::frame::alloc_user_frame_on_strict(target_node)
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
+        // The destination takes over the source's memory-cgroup charge
+        // (Linux `mem_cgroup_migrate`); the source's final free then
+        // uncharges nothing, and a failed move frees the destination with it.
+        crate::frame::transfer_frame_memcg(old_phys, new_phys);
         let perms = region.perms;
         // Invalidate-everywhere → copy → install, via the shared relocation
         // core (see `relocate_leaf` for why the order is load-bearing).
@@ -14195,6 +14442,10 @@ impl AddressSpace {
                 (Some(frame), phys)
             }
         };
+        // The destination takes over the source's memory-cgroup charge
+        // (Linux `mem_cgroup_migrate`); the source's final free then
+        // uncharges nothing, and a failed move frees the destination with it.
+        crate::frame::transfer_frame_memcg(old_phys, new_phys);
         // SAFETY: live root; page_va maps old_phys; new_phys is a live frame.
         if unsafe { self.relocate_leaf(page_va, perms, old_phys, new_phys) }.is_err() {
             // Free only a frame WE allocated; a caller-provided `dst` is left for
@@ -14728,6 +14979,54 @@ impl AddressSpace {
         result
     }
 
+    /// Re-install the PTE for `vaddr` from the region's current state, but
+    /// only while it still maps `expected` in a `SHARED | EXTERNAL_REFS`
+    /// region. Returns whether it did.
+    ///
+    /// The owner of such frames calls it after changing its answer to
+    /// `write_enabled` (see `install_shared_page_write_hooks`): to
+    /// write-protect a page before writing it back (Linux `folio_mkclean`)
+    /// every mapper's PTE is re-installed read-only, and the TLB entries of
+    /// every CPU that may hold one are invalidated before this returns
+    /// (`remap_page`: `flush_region_broadcast` on x86_64, the broadcast
+    /// `TLBI` of `unmap_4kb` on aarch64). A store after that faults and is
+    /// recorded.
+    ///
+    /// # Safety
+    /// As [`Self::remap_page`]; `self.root` is this address space's live
+    /// root. The region lock taken here re-resolves the page, so a region
+    /// unmapped or replaced concurrently is either skipped or re-installed
+    /// with its own current frame and permissions.
+    pub unsafe fn refresh_shared_page(
+        &self,
+        vaddr: VirtAddr,
+        expected: PhysAddr,
+    ) -> Result<bool, AddressSpaceError> {
+        let v = vaddr.as_u64() & !0xFFF;
+        {
+            let regions = self.regions.lock();
+            let Some(region) = regions.containing(v) else {
+                return Ok(false);
+            };
+            if !is_external_shared(region.perms) {
+                return Ok(false);
+            }
+            let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+            let current = region
+                .phys
+                .get(page_idx)
+                .map(|phys| phys.raw())
+                .unwrap_or(0);
+            if current == 0 || current != expected.raw() {
+                return Ok(false);
+            }
+        }
+        // SAFETY: forwarded caller contract; `remap_page` re-resolves the
+        // page under the region lock and installs exactly what the region
+        // now says for it.
+        unsafe { self.remap_page(VirtAddr::new(v)) }.map(|()| true)
+    }
+
     /// aarch64 sibling of the x86_64 `remap_page`. Same contract:
     /// look up the region containing `vaddr`, install a fresh PTE
     /// for that 4 KiB page reflecting the region's current
@@ -14811,9 +15110,11 @@ impl AddressSpace {
             // Genuinely read-only mapping — not writable, not recoverable.
             return false;
         }
-        if region.perms.contains(RegionPerms::COW) {
+        if region.perms.contains(RegionPerms::COW) || is_external_shared(region.perms) {
             // Writable-but-COW: resolve the private copy and rewrite the leaf so
             // the upcoming supervisor write lands on a private, writable page.
+            // A clean shared file-cache page is read-only until its owner
+            // records it dirty: the same call takes its write-notify path.
             // SAFETY: forwarded to the callees' documented contract.
             if unsafe { self.cow_split_on_write(vaddr) }.is_err() {
                 return false;
@@ -15063,6 +15364,59 @@ impl Default for AddressSpace {
     }
 }
 
+impl AddressSpace {
+    /// Teardown of the swap entries a dropped address space still owns.
+    ///
+    /// A large pressure victim can own hundreds of thousands of swap entries.
+    /// Teardown must free them without first allocating region-sized VA and
+    /// SwapPte vectors from the already exhausted heap, so it works in fixed
+    /// on-stack batches, each one root-lock transaction and one backend
+    /// retirement. Out of line and kept small (64 pages, 2 KiB of batch state):
+    /// `Drop` can run from the scheduler's wake path when a parked slot holds
+    /// the last `Arc<AddressSpace>`, and a 512-page batch inlined into `Drop`
+    /// made its frame 18 KiB — over half a kernel stack, paid by every drop
+    /// whether or not anything was swapped.
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    #[inline(never)]
+    fn drop_swap_entries(&self, regions: &mut RegionTable) {
+        const SWAP_TEARDOWN_BATCH: usize = 64;
+        const _: () = assert!(SWAP_TEARDOWN_BATCH <= crate::swap::SWAP_BATCH_PAGES_MAX);
+        let mut pages = [VirtAddr::new(0); SWAP_TEARDOWN_BATCH];
+        let mut entries = [crate::swap::SwapPte {
+            swap_type: 0,
+            offset: 0,
+        }; SWAP_TEARDOWN_BATCH];
+        let mut slots = [crate::swap::SwapSlot::NONE; SWAP_TEARDOWN_BATCH];
+        while !regions.swap_pages.is_empty() {
+            let mut count = 0usize;
+            for (&va, state) in regions.swap_pages.iter().rev().take(SWAP_TEARDOWN_BATCH) {
+                assert_eq!(
+                    *state,
+                    SwapPageState::Swapped,
+                    "address space dropped during a swap ownership transition"
+                );
+                pages[count] = VirtAddr::new(va);
+                count += 1;
+            }
+            // SAFETY: Drop has exclusive ownership of this live root; the
+            // stable records remain pinned until removed below.
+            unsafe {
+                crate::swap::take_swap_entries_into(
+                    self.root,
+                    &pages[..count],
+                    &mut entries[..count],
+                )
+            }
+            .expect("stable swapped page lost its swap PTE before drop");
+            for page in &pages[..count] {
+                regions.swap_pages.remove(&page.as_u64());
+            }
+            crate::swap::swap_discard_batch_noalloc(&mut entries[..count], &mut slots[..count]);
+        }
+    }
+}
+
 impl Drop for AddressSpace {
     /// Process-exit teardown: log + (eventually) release every
     /// still-mapped region's data frames, free the per-AS page-
@@ -15141,48 +15495,8 @@ impl Drop for AddressSpace {
             #[cfg(target_arch = "x86_64")]
             let mut regions = regions;
             #[cfg(target_arch = "x86_64")]
-            {
-                // A large pressure victim can own hundreds of thousands of
-                // swap entries. Teardown must free them without first
-                // allocating region-sized VA and SwapPte vectors from the
-                // already exhausted heap. Fixed batches preserve one root-lock
-                // transaction and one backend retirement per bounded window.
-                const SWAP_TEARDOWN_BATCH: usize = crate::swap::SWAP_BATCH_PAGES_MAX;
-                let mut pages = [VirtAddr::new(0); SWAP_TEARDOWN_BATCH];
-                let mut entries = [crate::swap::SwapPte {
-                    swap_type: 0,
-                    offset: 0,
-                }; SWAP_TEARDOWN_BATCH];
-                let mut slots = [crate::swap::SwapSlot::NONE; SWAP_TEARDOWN_BATCH];
-                while !regions.swap_pages.is_empty() {
-                    let mut count = 0usize;
-                    for (&va, state) in regions.swap_pages.iter().rev().take(SWAP_TEARDOWN_BATCH) {
-                        assert_eq!(
-                            *state,
-                            SwapPageState::Swapped,
-                            "address space dropped during a swap ownership transition"
-                        );
-                        pages[count] = VirtAddr::new(va);
-                        count += 1;
-                    }
-                    // SAFETY: Drop has exclusive ownership of this live root;
-                    // the stable records remain pinned until removed below.
-                    unsafe {
-                        crate::swap::take_swap_entries_into(
-                            self.root,
-                            &pages[..count],
-                            &mut entries[..count],
-                        )
-                    }
-                    .expect("stable swapped page lost its swap PTE before drop");
-                    for page in &pages[..count] {
-                        regions.swap_pages.remove(&page.as_u64());
-                    }
-                    crate::swap::swap_discard_batch_noalloc(
-                        &mut entries[..count],
-                        &mut slots[..count],
-                    );
-                }
+            if !regions.swap_pages.is_empty() {
+                self.drop_swap_entries(&mut regions);
             }
 
             if self.root.as_u64() != 0 {

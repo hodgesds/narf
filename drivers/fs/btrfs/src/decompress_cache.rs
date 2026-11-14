@@ -33,23 +33,54 @@
 //! - **Only verified data.** Callers insert only after the compressed bytes
 //!   passed the checksum check (when the volume verifies checksums) *and*
 //!   decompressed successfully. Failures are never cached.
-//! - **Bounded.** At most [`BUDGET_BYTES`] of decompressed data. The least
-//!   recently used entry is evicted first. One spinlock serializes the
-//!   bookkeeping, and the data is shared out as `Arc<Vec<u8>>`, so the lock is
-//!   never held across I/O or decompression.
-//!   An entry-count limit also bounds bookkeeping for tiny read windows.
+//! - **Bounded.** At most [`budget_bytes`] (a fraction of RAM,
+//!   [`crate::cache_budget::DATA_CACHE`]) of heap, counting each entry's
+//!   buffer and its bookkeeping. The least recently used entry is evicted
+//!   first. One spinlock serializes the bookkeeping, and the data is shared
+//!   out as `Arc<Vec<u8>>`, so the lock is never held across I/O or
+//!   decompression. An entry-count limit also bounds the eviction scan.
+//! - **Can be switched off.** `btrfs.data_cache=0` on the kernel command
+//!   line makes every lookup miss and every fill a no-op ([`enabled`]), so a
+//!   suspected stale read can be checked against a run without the cache.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Upper bound on cached extent bytes, across all volumes.
-pub const BUDGET_BYTES: usize = 32 << 20;
+/// Most entries, across all volumes: eviction scans them for the least
+/// recently used one.
 const MAX_ENTRIES: usize = 8192;
+
+/// Bookkeeping an entry costs on top of its buffer: the key and entry in the
+/// map's B-tree node, and the `Arc` header and `Vec` triple.
+const ENTRY_OVERHEAD: usize = 128;
+
+/// What caching `plain` costs the heap.
+fn charge(plain: &Arc<Vec<u8>>) -> usize {
+    plain.capacity() + ENTRY_OVERHEAD
+}
+
+/// The budget in bytes, computed from RAM on first use (0: not yet).
+static BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+/// Upper bound on the heap the cache holds, across all volumes: a fraction
+/// of RAM ([`crate::cache_budget::DATA_CACHE`]; 32 MiB at 4 GiB, 128 MiB
+/// from 16 GiB up). It used to be a fixed 32 MiB of buffer bytes, not
+/// counting the bookkeeping.
+pub fn budget_bytes() -> usize {
+    match BUDGET.load(Ordering::Relaxed) {
+        0 => {
+            let budget = crate::cache_budget::DATA_CACHE.of(crate::cache_budget::total_ram_bytes());
+            BUDGET.store(budget, Ordering::Relaxed);
+            budget
+        }
+        budget => budget,
+    }
+}
 
 /// Identity of a volume: its allocation address. Stable while any entry holds
 /// its `Weak`.
@@ -143,8 +174,35 @@ fn key(vol: VolKey, id: ExtentId) -> Key {
     }
 }
 
+/// Cache state from the command line: 0 not read yet, 1 on, 2 off.
+static ENABLED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the cache is in use: unless `btrfs.data_cache=0` is on the
+/// kernel command line.
+pub fn enabled() -> bool {
+    match ENABLED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = narf_boot::args().value("btrfs.data_cache") != Some("0");
+            ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test-only: turn the cache on or off, as `btrfs.data_cache=` would.
+#[cfg(feature = "kernel-test")]
+pub fn set_enabled_for_test(on: bool) {
+    ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
 /// Look up a decompressed extent or verified uncompressed window.
 pub fn get(vol: &VolumeRef, id: ExtentId) -> Option<Arc<Vec<u8>>> {
+    if !enabled() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut cache = CACHE.lock();
     cache.clock += 1;
     let now = cache.clock;
@@ -171,14 +229,17 @@ pub fn epoch(vol: &VolumeRef) -> u64 {
 /// while the volume's epoch was `epoch`. A later write epoch rejects the fill.
 pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<u8>>) {
     let size = plain.len();
-    if size == 0
-        || size > BUDGET_BYTES / 4
+    let budget = budget_bytes();
+    if !enabled()
+        || size == 0
+        || charge(&plain) > budget / 4
         || id.disk_num_bytes == 0
         || id.disk_num_bytes > MAX_DISK_BYTES
         || (id.compression == crate::format::COMPRESS_NONE && size as u64 != id.disk_num_bytes)
     {
         return;
     }
+    register_shrinker();
     let mut cache = CACHE.lock();
     if cache.epochs.get(&vol.key).copied().unwrap_or(0) != epoch_at_read {
         return;
@@ -189,7 +250,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
         cache.entries.retain(|_, e| {
             let live = e.owner.strong_count() > 0;
             if !live {
-                freed += e.plain.len();
+                freed += charge(&e.plain);
             }
             live
         });
@@ -199,7 +260,8 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
             .epochs
             .retain(|vol_key, _| *vol_key == vol.key || live.contains(vol_key));
     }
-    while cache.bytes + size > BUDGET_BYTES || cache.entries.len() >= MAX_ENTRIES {
+    let size = charge(&plain);
+    while cache.bytes + size > budget || cache.entries.len() >= MAX_ENTRIES {
         let Some(victim) = cache
             .entries
             .iter()
@@ -209,7 +271,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
             break;
         };
         if let Some(entry) = cache.entries.remove(&victim) {
-            cache.bytes -= entry.plain.len();
+            cache.bytes -= charge(&entry.plain);
         }
     }
     cache.clock += 1;
@@ -220,7 +282,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
         last_use: now,
     };
     if let Some(old) = cache.entries.insert(key(vol.key, id), entry) {
-        cache.bytes -= old.plain.len();
+        cache.bytes -= charge(&old.plain);
     }
     cache.bytes += size;
 }
@@ -256,14 +318,82 @@ pub fn invalidate(vol: VolKey, logical: u64, len: usize) {
         .collect();
     for k in doomed {
         if let Some(entry) = cache.entries.remove(&k) {
-            cache.bytes -= entry.plain.len();
+            cache.bytes -= charge(&entry.plain);
         }
     }
+}
+
+static SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Let reclaim shrink the cache under memory pressure. Linux keeps
+/// decompressed and verified file data in the page cache, which page reclaim
+/// shrinks; this cache stands in for it and gives memory back the same way.
+fn register_shrinker() {
+    if !SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "btrfs-extent-data",
+            count: shrinker_count,
+            scan: shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: base pages the cache holds. Allocation-free.
+fn shrinker_count() -> usize {
+    CACHE.lock().bytes / crate::cache_budget::PAGE
+}
+
+/// Shrinker `scan`: evict least recently used entries worth at most `nr`
+/// base pages, never reporting more. Allocation-free; the lock is taken
+/// per eviction and each entry is freed outside it.
+fn shrinker_scan(nr: usize) -> usize {
+    (shrink_bytes(nr.saturating_mul(crate::cache_budget::PAGE))) / crate::cache_budget::PAGE
+}
+
+/// Evict least recently used entries worth at most `max_bytes`; returns the
+/// bytes evicted.
+fn shrink_bytes(max_bytes: usize) -> usize {
+    let mut freed = 0usize;
+    loop {
+        let victim = {
+            let mut cache = CACHE.lock();
+            let Some((key, size)) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_use)
+                .map(|(k, e)| (*k, charge(&e.plain)))
+            else {
+                break;
+            };
+            if freed + size > max_bytes {
+                break;
+            }
+            cache.bytes -= size;
+            freed += size;
+            cache.entries.remove(&key)
+        };
+        drop(victim);
+    }
+    freed
 }
 
 /// `(hits, misses)` since boot.
 pub fn stats() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+}
+
+/// Heap charged for every entry, and the entry count (tests).
+#[cfg(feature = "kernel-test")]
+pub fn cached_total() -> (usize, usize) {
+    let cache = CACHE.lock();
+    (cache.bytes, cache.entries.len())
+}
+
+/// Drive the shrinker as kswapd would: `(pages counted, pages freed)`
+/// (tests).
+#[cfg(feature = "kernel-test")]
+pub fn __test_shrinker(nr: usize) -> (usize, usize) {
+    (shrinker_count(), shrinker_scan(nr))
 }
 
 /// Cached bytes for `vol` (tests).

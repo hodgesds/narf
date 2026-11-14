@@ -20,6 +20,7 @@ pub mod atomic_pool;
 // BPF memory: the executable-text allocator, the program heap, the recoverable
 // -fault table, and the per-CPU BPF stack. `bpf_text::reserve_kernel_slots` is
 // boot-order critical — see `bpf/specification/spec.md` §4.1.
+pub mod as_origin;
 pub mod bpf_arena;
 pub mod bpf_extable;
 pub mod bpf_stack;
@@ -41,6 +42,7 @@ mod ioremap_cache;
 #[cfg(feature = "kasan")]
 pub mod kasan;
 pub mod kaslr;
+pub mod kstack;
 #[cfg(target_arch = "x86_64")]
 pub mod kvm_pv;
 pub mod mempolicy;
@@ -89,10 +91,11 @@ mod tests;
 pub use address_space::{
     install_address_space_drop_hook, install_address_space_fork_hook,
     install_file_batch_fault_hook, install_file_fault_hook, install_shared_frame_hooks,
-    with_address_space_shared_mapping_transaction, with_shared_mapping_transaction, AddressSpace,
-    AddressSpaceError, BrkUpdateResult, FileFaultError, FixedRelocationError, FutureLockPolicy,
-    HugeRegion, MappingReceipt, MremapLimits, NumaRegionSnapshot, Region, RegionPerms,
-    RemoteAccess, RemoteBuf, SharedMremapMode, StackGrowthLimits, ZapOutcome,
+    install_shared_page_write_hooks, with_address_space_shared_mapping_transaction,
+    with_shared_mapping_transaction, AddressSpace, AddressSpaceError, BrkUpdateResult,
+    FileFaultError, FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt, MmUser,
+    MremapLimits, NumaRegionSnapshot, Region, RegionPerms, RemoteAccess, RemoteBuf,
+    SharedMremapMode, StackGrowthLimits, ZapOutcome,
 };
 pub use memtype::{ram_alias_refusals, MemoryType};
 
@@ -111,12 +114,15 @@ pub use addr::{
     direct_map_activate_at, direct_map_base, direct_map_live, direct_map_phys_end,
     KERNEL_DIRECT_MAP_BASE, KERNEL_DIRECT_MAP_PML4_BASE, KERNEL_DIRECT_MAP_PML4_SLOTS,
 };
+#[cfg(target_arch = "aarch64")]
+pub use addr::{direct_map_base, direct_map_live, direct_map_phys_end};
 pub use addr::{PhysAddr, VirtAddr};
 pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState};
 
 #[cfg(feature = "cgroup")]
 pub use cgroup_charge::{
     __charge_pid_for_test, install_cgroup_charge_hook, install_cgroup_pid_provider,
+    install_page_charge_hooks, memcg_oom_requests, MemcgId,
 };
 
 /// Per-arch offset that maps a physical RAM address to its

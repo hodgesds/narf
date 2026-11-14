@@ -999,6 +999,38 @@ fn smoke_task_refcount_lifetime() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
 
+/// A task that exits from a syscall it had parked in is no longer parked:
+/// a zombie reports no wchan, syscall or stack, even though nothing ran
+/// the dispatcher's clearing of the park flag on the way out. Before, a
+/// zombie leader kept naming the syscall it died in — decoded from a kernel
+/// stack it no longer owned — and read as stuck for as long as it waited
+/// for its siblings and its parent.
+fn smoke_zombie_is_parked_in_no_syscall() -> TestResult {
+    use core::sync::atomic::Ordering;
+    const TID: u64 = 0xF0_46;
+    crate::task::release_task(TID);
+    let task = crate::task::Task::new_registered(TID, TID);
+    task.uctx.parked_in_syscall.store(true, Ordering::Release);
+    let parked_while_live = crate::task::parked_in_syscall(TID);
+    crate::task::mark_zombie(TID);
+    let flag_after_exit = task.uctx.parked_in_syscall.load(Ordering::Acquire);
+    // Exit work that parks after the zombie flip sets the flag again.
+    task.uctx.parked_in_syscall.store(true, Ordering::Release);
+    let parked_as_zombie = crate::task::parked_in_syscall(TID);
+    crate::task::release_task(TID);
+    if !parked_while_live {
+        return TestResult::Fail("a live parked task was not reported parked");
+    }
+    if flag_after_exit {
+        return TestResult::Fail("exit left the task's park flag set");
+    }
+    if parked_as_zombie {
+        return TestResult::Fail("a zombie was reported parked in a syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_zombie_is_parked_in_no_syscall);
+
 /// Exit must run the master per-task table sweep (release_task_tables):
 /// every tid-keyed row — signal state, parked wakers, /proc mirrors,
 /// foreground-console slot, robust-list head, interval timers — drops
@@ -1067,12 +1099,11 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     crate::handlers::__test_parent_of_set(CHILD_PID, TID); // running child
     crate::handlers::__test_set_foreground_task(TID);
     crate::handlers::__test_set_robust_list(TID, 0xdead_0000, 24);
-    crate::mqueue::register_fd_path(TID, 9, "/task-exit-residue", None);
     crate::posix_timer::__test_arm_itimer_real(TID, u64::MAX, 1_000_000);
 
     let before = crate::handlers::__test_task_table_residue(TID);
-    // Bits 0,3,4,5,6,7,8,10,11,12 must be populated pre-exit (mask 0x1DF9).
-    if before & 0x1DF9 != 0x1DF9 {
+    // Bits 0,3,4,5,6,7,8,10,11 must be populated pre-exit (mask 0x0DF9).
+    if before & 0x0DF9 != 0x0DF9 {
         crate::task::release_task(TID);
         return TestResult::Fail("test setup failed to populate the tables");
     }

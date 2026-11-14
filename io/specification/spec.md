@@ -154,6 +154,35 @@ inside it keeps that cacheable alias (the same residual Linux accepts for
 (`arch_dma_prep_coherent`), and nothing in the kernel touches the alias.
 Removing `no-map` ranges from the linear map is a `memory/` change.
 
+**Scatter-gather page lists** (`io/src/sg.rs`, Linux `struct bio_vec` /
+`sg_table` as a device sees it). `PageList::new(pages: Vec<PhysAddr>, len,
+domain)` names order-0 frames the caller owns (page-cache pages, a
+filesystem's node buffers) carrying `len` bytes; `segments()` /
+`segments_in(offset, len)` return `(dma, len)` runs with physically adjacent
+frames merged. `register_pages_with_cap(list) -> Cap<PageList, Write>` mints
+a `CapKind::DmaPageList` capability in the same epoch-gated registry as
+`DmaBuffer`; `resolve_pages_cap(&Cap<PageList, R>)` resolves it (a revoked
+cap resolves to nothing) and `unregister_pages(cap)` revokes it — the list
+lives until the last `Arc` drops, i.e. after every command in flight over it
+completed. In per-domain IOMMU mode `PageList::map_into(&domain, pci)` maps
+every frame read/write into the device's domain (`dma_addr(i)` becomes the
+IOVA) and the mappings are torn down when the list drops; identity /
+disabled modes use the frame address. The frames themselves are never freed
+by `io/`: they are the caller's, kept allocated for the list's lifetime.
+`unregister_pages` / `unregister` clear the registry slot and then
+`object_table::release` the index, so a caller with a payload per block
+request (a filesystem's every read and write) does not grow the object table
+or this registry: the index is handed to a later registration under a greater
+generation, and every copy of the old cap — a split child, a request a device
+still owns after a timeout, a killed waiter's abandoned request — fails
+`check_live` instead of resolving to the new payload
+(`smoke_io_registry_bounded_by_live_objects`).
+`PageList::with_owner(Box<dyn Any + Send + Sync>)` lets the caller park
+what keeps them allocated in the list itself (a bio's page references): the
+owner drops with the list, after the last command over it completed, so a
+waiter that gives up early (a killable read) can drop its future without
+freeing frames a device is still writing.
+
 **Per-domain IOMMU translation** (module `iommu`, `iova`; Linux
 `iommu.c` + `dma-iommu.c` + `iova.c` + `generic_pt/fmt/{amdv1,vtdss}.h`).
 

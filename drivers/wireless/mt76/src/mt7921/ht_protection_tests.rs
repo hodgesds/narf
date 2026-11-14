@@ -62,7 +62,9 @@ fn protection() -> Result<(), &'static str> {
                 return Err("dynamic HT protection change ended the link");
             }
         }
-        // A real HT Operation change (secondary/width) still ends it.
+        // An HT Operation without the secondary channel the VHT 80 MHz
+        // operation needs is inconsistent and still ends it (a consistent
+        // width change is followed, `csa::beacon_phy`).
         s.backend.packets.push_back(beacon(byte2, Some(0)));
         if s.receive_ethernet() != Err(Error::DeviceGone) {
             return Err("HT width change survived the protection mask");

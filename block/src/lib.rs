@@ -40,9 +40,11 @@ pub mod mq;
 pub mod noop;
 pub mod opal;
 pub mod partition;
+pub mod queue;
 pub mod ram;
 pub mod registry;
 pub mod scsi;
+pub mod sg;
 
 mod e2e_tests;
 mod tests;
@@ -54,6 +56,8 @@ pub use io_scheduler::{
 };
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use noop::NoopScheduler;
+pub use queue::{BlockQueue, BoxedCancel, BoxedCompletion, BoxedResult, OffsetQueue, QueueLimits};
+pub use sg::{split_to_limits, SgRequest, SplitCompletion};
 
 #[cfg(feature = "cgroup")]
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
@@ -110,6 +114,20 @@ pub trait BlockDevice: Send + Sync {
 
     /// Cancel an in-flight request by kernel-assigned tag.
     fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult> + Send;
+
+    /// Submit a scatter-gather request (the payload is a list of the
+    /// caller's pages, see [`SgRequest`]). The block layer fits it to the
+    /// device's limits ([`split_to_limits`]). The default refuses: a
+    /// device without scatter-gather DMA implements it by iterating the
+    /// pages (`RamBlockDevice`, `SyncBlock`).
+    fn submit_sg(&self, req: SgRequest) -> impl Future<Output = BlockCompletion> + Send {
+        let user_tag = req.user_tag;
+        core::future::ready(BlockCompletion {
+            tag: 0,
+            user_tag,
+            result: Err(BlockError::InvalidRange),
+        })
+    }
 
     /// Submit a request and charge its bytes to the submitting task's
     /// cgroup-v2 `io` controller before dispatch.

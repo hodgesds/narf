@@ -72,12 +72,12 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // nothing inside a covering mount stays -ENOENT — see the LINUX-GAP
     // below.)
     match stat_ino_path_dir_aware_ext(&resolved, true) {
-        Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => {
+        Ok((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => {
             ctx.set_return(errno_ret(ENOTDIR));
             return;
         }
-        Some(_) => {}
-        None => {
+        Ok(_) => {}
+        Err(error) => {
             // The covering-mount test above only proves SOME mount serves
             // this path's prefix, which is far weaker than `user_path_at(...,
             // LOOKUP_FOLLOW | LOOKUP_DIRECTORY)`. A name that resolves to
@@ -90,7 +90,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
             // `path_lookup_errno` classifies the failure the way
             // `link_path_walk` does, so the caller learns whether the name is
             // missing, is not a directory, cannot be searched, or loops.
-            ctx.set_return(errno_ret(path_lookup_errno(&resolved)));
+            ctx.set_return(errno_ret(path_lookup_errno(&resolved, Some(error))));
             return;
         }
     }

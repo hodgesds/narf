@@ -376,6 +376,34 @@ kernel_test_in!(
     smoke_led_worker_applies_brightness_blink_off
 );
 
+/// The engine runs as periodic delayed work: once started, a submitted
+/// command reaches its LED within a few periods with nobody draining the
+/// mailbox by hand.
+fn smoke_led_engine_runs_as_delayed_work() -> TestResult {
+    use crate::class::SimpleLed;
+    use crate::worker::{start_worker, submit_command, ACTION_SET_BRIGHTNESS};
+    crate::__reset_all_for_test();
+    register_led(Arc::new(SimpleLed::brightness_led("wq-lvl")));
+    let idx = led_devices()
+        .iter()
+        .position(|d| d.name() == "wq-lvl")
+        .expect("registered") as u32;
+    start_worker();
+    if !submit_command(idx, ACTION_SET_BRIGHTNESS, 77) {
+        return TestResult::Fail("mailbox rejected a brightness command");
+    }
+    let end = narf_time::monotonic_ns() + 1_000_000_000;
+    while narf_time::monotonic_ns() < end && led_devices()[idx as usize].brightness() != 77 {
+        let _ = narf_scheduler::poll_one_round();
+        core::hint::spin_loop();
+    }
+    if led_devices()[idx as usize].brightness() != 77 {
+        return TestResult::Fail("the engine work did not apply a queued command");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_led_engine_runs_as_delayed_work);
+
 fn smoke_led_worker_sets_rgb_color() -> TestResult {
     use crate::multicolor::{register_rgb_led, rgb_led_devices, SimpleRgbLed};
     use crate::worker::{drain, submit_command, ACTION_SET_COLOR};

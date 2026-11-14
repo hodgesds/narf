@@ -870,8 +870,29 @@ impl dp::Phy for DpPhy<'_> {
     }
 }
 
-/// The retained single-stream output.
-pub struct Pipeline {
+/// The retained single-stream output: a handle to its state on the heap.
+///
+/// The state is 7.5 KiB. Held and moved by value — through every `?`,
+/// `Option` and `Vec` push — it put copies of itself in each caller's frame
+/// (`multi::Group::new` reserved 15.8 KiB). As one pointer, a `Pipeline`
+/// moves for free; the state is reached through `Deref`.
+pub struct Pipeline(alloc::boxed::Box<PipelineInner>);
+
+impl core::ops::Deref for Pipeline {
+    type Target = PipelineInner;
+    fn deref(&self) -> &PipelineInner {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Pipeline {
+    fn deref_mut(&mut self) -> &mut PipelineInner {
+        &mut self.0
+    }
+}
+
+/// The state behind a [`Pipeline`].
+pub struct PipelineInner {
     gpu: AmdGpu,
     regs: Regs,
     connector: Connector,
@@ -945,6 +966,12 @@ pub struct Pipeline {
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl core::fmt::Debug for PipelineInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Pipeline")
             .field("connector", &self.connector)
             .field("route", &self.route)
@@ -968,6 +995,24 @@ impl Pipeline {
         connector: Connector,
         route: Route,
     ) -> Result<Self, Error> {
+        // SAFETY: forwarded.
+        unsafe { PipelineInner::new(gpu, authority, connector, route) }
+    }
+}
+
+// The pipeline's operations work on the state itself, so a method can borrow
+// several of its fields at once; `Pipeline` reaches them through `Deref`.
+impl PipelineInner {
+    /// # Safety
+    /// As [`Pipeline::new`].
+    // Builds the inner state and returns it wrapped in its `Pipeline` handle.
+    #[allow(clippy::new_ret_no_self)]
+    unsafe fn new(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        connector: Connector,
+        route: Route,
+    ) -> Result<Pipeline, Error> {
         let profile = crate::amdgpu_dcn_profile::Profile::resolve(gpu)?;
         if !profile.is_dcn30() {
             return Err(Error::Unsupported);
@@ -1011,7 +1056,7 @@ impl Pipeline {
         let pipe = route.pipe;
         // SAFETY: every claim is the caller's exclusive display ownership.
         unsafe {
-            Ok(Self {
+            Ok(Pipeline(alloc::boxed::Box::new(PipelineInner {
                 gpu: snapshot(gpu)?,
                 regs,
                 connector,
@@ -1056,7 +1101,7 @@ impl Pipeline {
                 overlay_update: None,
                 live_watermarks: None,
                 live_sync: None,
-            })
+            })))
         }
     }
     pub fn state(&self) -> State {
@@ -2239,7 +2284,7 @@ pub use crate::amdgpu_dcn30_dp_link::RxEvent;
 /// The DP link layer (`amdgpu_dcn30_dp_link`): detection's capability
 /// retrieval and link verification, link-loss checks, retraining and
 /// unplug teardown.
-impl Pipeline {
+impl PipelineInner {
     /// The board's VBIOS LTTPR policy (`dcn30_resource_construct`), before
     /// `enable`.
     pub fn set_lttpr_policy(&mut self, policy: dp_link::VbiosLttpr) {
@@ -2456,7 +2501,7 @@ impl Aux for NoAux {
 }
 
 /// KMS hooks (amdgpu_navi22_kms / amdgpu_navi22_scanout).
-impl Pipeline {
+impl PipelineInner {
     /// Ask `enable` for exactly this timing (None: the sink's preferred).
     /// The fixed/variable timing and AMD SPD are committed together by the
     /// retained stream owner; this never reinitializes a working PHY.
@@ -2766,7 +2811,7 @@ pub fn test_pattern(_line: u32, row: &mut [u32]) {
 /// the display owner; `program_plane` runs under the OTG's pipe-control
 /// lock, which the flip owner takes and releases around it and the
 /// surface address.
-impl Pipeline {
+impl PipelineInner {
     /// The placement the pipe now shows (the lit owned surface when no
     /// update was programmed since the modeset).
     pub fn plane_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
@@ -3034,7 +3079,7 @@ impl Pipeline {
 
 /// Opt-in power saving (amdgpu_navi22_power_policy): the DAL clock owner,
 /// for memory/fabric floors and the PMFW watermark table.
-impl Pipeline {
+impl PipelineInner {
     pub(crate) fn clock_manager(&mut self) -> &mut ClockManager {
         &mut self.clocks
     }

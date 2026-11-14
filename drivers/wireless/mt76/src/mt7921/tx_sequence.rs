@@ -18,11 +18,47 @@ struct Sample {
     terminal: Option<u8>,
     report: Option<Result<u16, Error>>,
 }
+/// Linux `mt7921e_tx_prepare_skb`: a station's data frame requests a TX
+/// status at most every HZ/4, and `mt76_connac2_mac_fill_txs` takes the
+/// station's TX rate from it.
+const RATE_INTERVAL_NS: u64 = 250_000_000;
+/// A rate sample whose frame retired without a status is given up after
+/// this long (its PID is then reused).
+const RATE_ABANDON_NS: u64 = 1_000_000_000;
+
+/// One outstanding rate-only TX status request.
+#[derive(Clone, Copy, Debug)]
+struct RateSample {
+    pid: u8,
+    wcid: u16,
+    token: Option<u16>,
+    requested_ns: u64,
+    reported: bool,
+    terminal: bool,
+}
+
+/// The latest TX status of a station: the rate word and bandwidth the
+/// frame went out at (`MT_TXS0_TX_RATE`, `MT_TXS0_BW`) and how many of the
+/// sampled frames failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RateReport {
+    pub wcid: u16,
+    pub tx_rate: u16,
+    pub bw: u8,
+    pub failures: u32,
+    /// Increments with every report, so a consumer takes each one once.
+    pub sequence: u32,
+}
+
 #[derive(Debug)]
 pub(super) struct Owner {
     next: u16,
     occupied: [u64; 2],
     sample: Option<Sample>,
+    rate: Option<RateSample>,
+    last_rate_ns: Option<u64>,
+    rate_report: Option<RateReport>,
+    rate_sampling: bool,
 }
 impl Owner {
     pub fn new() -> Self {
@@ -30,7 +66,92 @@ impl Owner {
             next: FIRST_PID,
             occupied: [0; 2],
             sample: None,
+            rate: None,
+            last_rate_ns: None,
+            rate_report: None,
+            rate_sampling: true,
         }
+    }
+    /// For descriptor fixtures that pin exact TXD words and PIDs: no
+    /// periodic rate sample is requested, so only their own BA sample
+    /// changes a frame's status fields.
+    pub fn without_rate_sampling() -> Self {
+        Self {
+            rate_sampling: false,
+            ..Self::new()
+        }
+    }
+    /// A PID for a rate-only TX status on `wcid`'s next data frame, when the
+    /// last sample is at least HZ/4 old. An unpublished request is reused;
+    /// a retired frame whose status never came is given up after a second.
+    pub fn rate_pid(&mut self, wcid: u16, now_ns: u64) -> Option<u8> {
+        if !self.rate_sampling {
+            return None;
+        }
+        if let Some(rate) = self.rate {
+            if rate.token.is_none() && rate.wcid == wcid {
+                return Some(rate.pid);
+            }
+            let abandoned =
+                rate.terminal && now_ns.saturating_sub(rate.requested_ns) >= RATE_ABANDON_NS;
+            if !abandoned {
+                return None;
+            }
+            self.rate = None;
+            self.release_pid(rate.pid);
+        }
+        if self
+            .last_rate_ns
+            .is_some_and(|last| now_ns.saturating_sub(last) < RATE_INTERVAL_NS)
+        {
+            return None;
+        }
+        let pid = self.reserve_pid()?;
+        self.rate = Some(RateSample {
+            pid,
+            wcid,
+            token: None,
+            requested_ns: now_ns,
+            reported: false,
+            terminal: false,
+        });
+        self.last_rate_ns = Some(now_ns);
+        Some(pid)
+    }
+    /// The rate-sampled frame was published as `token`.
+    pub fn begin_rate(&mut self, token: u16) {
+        if let Some(rate) = self.rate.as_mut() {
+            rate.token = Some(token);
+        }
+    }
+    /// The station's latest sampled TX status.
+    pub fn rate_report(&self) -> Option<RateReport> {
+        self.rate_report
+    }
+    fn finish_rate(&mut self) {
+        if let Some(rate) = self.rate.filter(|rate| rate.reported && rate.terminal) {
+            self.rate = None;
+            self.release_pid(rate.pid);
+        }
+    }
+    /// The lowest free PID after the rotating start (`idr_alloc_cyclic`).
+    fn reserve_pid(&mut self) -> Option<u8> {
+        let mut free = None;
+        for _ in FIRST_PID..127 {
+            let candidate = self.next as u8;
+            self.next = if self.next == 126 {
+                FIRST_PID
+            } else {
+                self.next + 1
+            };
+            if self.occupied[usize::from(candidate) / 64] & (1u64 << (candidate % 64)) == 0 {
+                free = Some(candidate);
+                break;
+            }
+        }
+        let pid = free?;
+        self.occupied[usize::from(pid) / 64] |= 1u64 << (pid % 64);
+        Some(pid)
     }
     /// The caller proves every earlier native data token terminal before
     /// arming. Re-arm cannot overlap an old, unconsumed report owner.
@@ -66,21 +187,7 @@ impl Owner {
             return Err(Error::Busy);
         }
         // mt76.h MASK=GENMASK(6,0); tx.c idr_alloc end127 is exclusive.
-        let mut free = None;
-        for _ in FIRST_PID..127 {
-            let candidate = self.next as u8;
-            self.next = if self.next == 126 {
-                FIRST_PID
-            } else {
-                self.next + 1
-            };
-            if self.occupied[usize::from(candidate) / 64] & (1u64 << (candidate % 64)) == 0 {
-                free = Some(candidate);
-                break;
-            }
-        }
-        let pid = free.ok_or(Error::EventOverflow)?;
-        self.occupied[usize::from(pid) / 64] |= 1u64 << (pid % 64);
+        let pid = self.reserve_pid().ok_or(Error::EventOverflow)?;
         self.sample = Some(Sample {
             tid,
             wcid,
@@ -118,6 +225,14 @@ impl Owner {
         Ok(())
     }
     pub fn terminal(&mut self, completion: packet_tx::Completion) {
+        if let Some(rate) = self
+            .rate
+            .as_mut()
+            .filter(|rate| rate.token == Some(completion.token))
+        {
+            rate.terminal = true;
+        }
+        self.finish_rate();
         if let Some(sample) = self
             .sample
             .as_mut()
@@ -131,6 +246,34 @@ impl Owner {
     /// WCID/TID/format/sequence is never accepted as a new observation.
     pub fn receive(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let reports = reports(bytes)?;
+        // `mt76_connac2_mac_fill_txs` for the rate sample's PID and WCID.
+        if let Some(mut rate) = self.rate.filter(|rate| rate.token.is_some()) {
+            for report in reports
+                .iter()
+                .filter(|report| report.pid == rate.pid && report.wcid == rate.wcid)
+            {
+                if report.format > 1 {
+                    continue;
+                }
+                let failures = self
+                    .rate_report
+                    .filter(|last| last.wcid == rate.wcid)
+                    .map_or(0, |last| last.failures);
+                let sequence = self
+                    .rate_report
+                    .map_or(1, |last| last.sequence.wrapping_add(1));
+                self.rate_report = Some(RateReport {
+                    wcid: rate.wcid,
+                    tx_rate: report.tx_rate,
+                    bw: report.bw,
+                    failures: failures.saturating_add(u32::from(report.failed)),
+                    sequence,
+                });
+                rate.reported = true;
+            }
+            self.rate = Some(rate);
+            self.finish_rate();
+        }
         let Some(mut sample) = self.sample.filter(|sample| sample.token.is_some()) else {
             return Ok(());
         };
@@ -237,6 +380,9 @@ struct Report {
     ampdu: bool,
     failed: bool,
     sequence: u16,
+    /// `MT_TXS0_TX_RATE` and `MT_TXS0_BW`.
+    tx_rate: u16,
+    bw: u8,
 }
 fn reports(bytes: &[u8]) -> Result<Vec<Report>, Error> {
     if bytes.len() < 40 {
@@ -259,6 +405,8 @@ fn reports(bytes: &[u8]) -> Result<Vec<Report>, Error> {
             ampdu: r0 & (1 << 25) != 0,
             failed: r0 & (0x5f << 16) != 0,
             sequence: (word(4) >> 20) as u16,
+            tx_rate: (r0 & 0x3fff) as u16,
+            bw: ((r0 >> 29) & 3) as u8,
         });
     }
     Ok(reports)

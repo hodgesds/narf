@@ -666,6 +666,8 @@ mod tests {
         };
         let affinity_generation = crate::register_task_affinity(id, spec.affinity, false);
         crate::TaskSlot {
+            origin: "test",
+            site: core::panic::Location::caller(),
             user_scheduling: Some(attach(id, None)),
             dispatch_reason: crate::DispatchReason::Policy,
             task: Box::pin(core::future::pending()),

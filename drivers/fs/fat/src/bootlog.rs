@@ -71,6 +71,9 @@ pub const EARLY_FLUSH_MS: u64 = 1_000;
 pub const EARLY_WINDOW_MS: u64 = 60_000;
 /// Flush period afterwards.
 pub const LATE_FLUSH_MS: u64 = 5_000;
+/// After this long without a new kernel log record, the flush loop logs one
+/// line of its own, so a quiet log still says until when the kernel ran.
+pub const QUIET_MARK_MS: u64 = 30_000;
 /// Bytes exported from the log store per file write.
 const CHUNK: usize = 16 * 1024;
 /// Upper bound on one final (panic/reboot) flush.
@@ -512,13 +515,25 @@ async fn run(token: String) {
     let armed_at = narf_time::Deadline::after_ms(EARLY_WINDOW_MS);
     let selftest_panic = narf_boot::args().value(SELFTEST_ARG) == Some("panic");
     let mut failures = 0u32;
+    let mut quiet = narf_time::Deadline::after_ms(QUIET_MARK_MS);
     loop {
         match flush_live(true, None).await {
             Some(Ok(_)) if selftest_panic => {
                 // Proves the panic-path flush end to end (QEMU usb-image check).
                 panic!("bootlog: {SELFTEST_ARG}=panic: deliberate panic after the first flush");
             }
-            Some(Ok(_)) => failures = 0,
+            Some(Ok(written)) => {
+                failures = 0;
+                if quiet_mark_due(written, &mut quiet) {
+                    // Saved by the next flush. A hang that silences the whole
+                    // log then still shows when this task last ran.
+                    let _ = writeln!(
+                        Writer,
+                        "bootlog: alive; no other kernel log for {} s",
+                        QUIET_MARK_MS / 1000
+                    );
+                }
+            }
             Some(Err(error)) => {
                 failures += 1;
                 let _ = writeln!(Writer, "bootlog: write failed: {error:?}");
@@ -548,6 +563,21 @@ async fn run(token: String) {
         };
         sleep_ms(period).await;
     }
+}
+
+/// Whether the flush loop should log its quiet-log line: true once
+/// [`QUIET_MARK_MS`] passed with nothing written. Any write, or a mark,
+/// restarts the period.
+pub fn quiet_mark_due(written: usize, quiet: &mut narf_time::Deadline) -> bool {
+    if written != 0 {
+        *quiet = narf_time::Deadline::after_ms(QUIET_MARK_MS);
+        return false;
+    }
+    if !quiet.expired() {
+        return false;
+    }
+    *quiet = narf_time::Deadline::after_ms(QUIET_MARK_MS);
+    true
 }
 
 /// Name of the device the live session writes to, if armed.

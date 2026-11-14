@@ -356,6 +356,12 @@ impl Virtqueue {
         unsafe { core::ptr::read_volatile(self.used_base().add(1)) }
     }
 
+    /// Whether the device has published a used entry this queue has not
+    /// consumed yet (`poll_used` would return `Some`).
+    pub fn has_used(&self) -> bool {
+        self.used_idx_snapshot() != self.last_used_idx
+    }
+
     /// Non-mutating queue state for fatal-path diagnostics.
     ///
     /// The tuple is `(avail_idx, last_used_idx, device_used_idx, num_free)`.

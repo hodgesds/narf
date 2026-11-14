@@ -122,15 +122,15 @@ pub fn next_deadline() -> Option<Instant>;
   calibration must call `calibrate_clocks()` first. A literal cycle count
   passed to `sleep_cycles` is a different duration on every CPU.
 - hrtimer-grade precision (≤ 1 µs jitter target on a quiet CPU).
-- Timer wheel (`timer_list`) for bulk coarse-grained kernel timeouts —
-  Stage 5 B, not yet present; every current sleep and timeout is an hrtimer.
+- Timer wheel (`timer_list`, §3.2.2) for coarse kernel timeouts that are
+  usually cancelled before they fire (`msleep`, park backstops).
 
 ### 3.2.1 hrtimers (`narf_time::hrtimer`, Linux `kernel/time/hrtimer.c`)
 
 | Linux | NARF |
 | --- | --- |
 | `struct hrtimer_cpu_base` (per CPU) | `HrTimerCpuBase`, allocated per CPU at bring-up (`hrtimers_prepare_cpu`); a static array holds only pointers |
-| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME = MONOTONIC (no suspend offset yet) |
+| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME through `offs_boot` (time spent suspended; MONOTONIC excludes it, `timekeeping_suspend`/`timekeeping_resume` around s2idle). Clockevents are programmed on raw counter time (`mono_to_raw_cycles`) |
 | `struct timerqueue_head` (rbtree, leftmost cached) | `timerqueue::TimerQueueHead`: intrusive red-black tree, earliest cached; FIFO on equal expiry |
 | `struct hrtimer`, `hrtimer_setup` | `HrTimer::new(fn, clock, mode)` — caller-owned storage, intrusive node |
 | `hrtimer_start_range_ns`, `_softexpires` / `expires` | `hrtimer_start_range_ns(timer, tim, delta, mode)`; expiry runs at `softexpires`, the clockevent is programmed for `expires` |
@@ -171,6 +171,42 @@ A sleeper whose waker is a scheduler task waker (`set_hardirq_waker_predicate`)
 is queued on a hard base and woken from the timer interrupt with
 `wake_by_ref`; any other waker uses the `_SOFT` base and is woken from the
 executor.
+
+### 3.2.2 Timer wheel and timer migration (`narf_time::timer`, `narf_time::timer_migration`)
+
+| Linux | NARF |
+| --- | --- |
+| `struct timer_base` × `BASE_LOCAL` / `BASE_GLOBAL` / `BASE_DEF` per CPU | three `TimerBase`s per CPU, allocated on first use (`timers_prepare_cpu`); pinned → LOCAL, deferrable → DEF, else GLOBAL |
+| non-cascading wheel, `LVL_DEPTH` (9 at HZ=1000) × 64 buckets, `calc_wheel_index`, `pending_map` | same geometry and index arithmetic; a timer fires no earlier than its expiry and at most one level granularity later |
+| `struct timer_list`, `timer_setup` | `TimerList::new(fn, flags)` — caller-owned, intrusive bucket links |
+| `mod_timer` / `timer_reduce` / `add_timer_on` / `timer_delete` / `try_to_del_timer_sync` / `timer_delete_sync` / `timer_shutdown(_sync)` / `timer_pending` | `mod_timer` / `timer_reduce` / `add_timer_on` / `del_timer` / `try_to_del_timer_sync` / `del_timer_sync` / `timer_shutdown(_sync)` / `is_pending`; `mod_timer_checked` also tells "armed now" from "refused, shut down" for owners that hold a reference per pending timer (`sk_reset_timer`); an unpinned re-arm moves to the calling CPU unless the callback runs; `forward_timer_base` before indexing |
+| `__run_timers`, `collect_expired_timers`, `__next_timer_interrupt` | same, from `run_timer_softirq` in the executor round (`TIMER_SOFTIRQ`, raised by `timer_tick` from the timer interrupt). Collected timers stay linked (on the base's expiry list) and pending until their callback is about to run, so a delete racing the expiry unlinks them like any queued timer |
+| `base->running_timer`, callback may free its timer | the base records the running timer by address; `del_timer_sync` waits on it; the wheel never touches a timer after calling its callback, which gets a `TimerRef` (pointer), so it may free the timer |
+| `get_next_timer_interrupt` / `tick_nohz_next_event` | `next_timer_event_ns_local()`, folded into the CPU's next clockevent event (`hrtimer::next_event_cycles_local`, `hrtimer_interrupt`, `retrigger_next_event`); DEF timers count only while the CPU is active |
+| `trigger_dyntick_cpu` | a new first non-deferrable timer on another CPU's base kicks it (`hrtimer::kick_cpu_next_event`) |
+| `timers_dead_cpu` | `timers_dead_cpu(cpu)` from CPU offline |
+| `schedule_timeout` / `msleep` | `TimeoutHandle` (`process_timeout` wakes by reference); `narf_time::msleep` |
+| `struct tmigr_group` hierarchy, `TMIGR_CHILDREN_PER_GROUP` = 8 | `timer_migration::Tmigr`: level 0 groups CPUs sharing a last-level cache, level 1 groups those by package / NUMA node, level 2 fans in by eight, level 3 is the root (four levels reach one root for up to 4096 CPUs); built at CPU online (`tmigr_cpu_online(cpu, llc, node)` from the scheduler's CPU startup) |
+| `migr_state` (active mask, migrator), `tmigr_active_up` / `tmigr_inactive_up` | per group: active children and one migrator child; going idle hands the role to an active sibling, and a group with none left goes idle in its parent; waking takes the role in a group without one and continues up. One atomic word per group (active mask, migrator, 16-bit sequence) changed only by compare-and-exchange, as Linux: activation takes no lock and leaves its queued events marked `ignore` (dropped lazily under the group lock); an inactive walk keeps a child group's bit if that child went active again meanwhile |
+| `struct tmigr_event`, `tmigr_update_events` | an idle CPU's next GLOBAL expiry is an event in its group; an idle group's first event (with its CPU) is an event in the parent. A walk carries the child's view into the parent while holding the child's lock |
+| `tmigr_cpu_deactivate` return / `tmc->wakeup` | only the CPU whose walk leaves the root idle (the last active CPU, or an idle CPU whose new timer reaches an idle root) wakes for the root's first event; every other idle CPU's next event leaves its GLOBAL timers out |
+| `tmigr_requires_handle_remote` / `tmigr_handle_remote` / `tmigr_handle_remote_cpu` / `timer_expire_remote` | lock-free check from the executor round; the walk up the groups this CPU is migrator of (or that have none) pops each due event and runs that idle CPU's GLOBAL base here, then requeues its next expiry; an active migrator's next event includes those groups' first events |
+| `tmigr_cpu_offline` | from CPU offline, before `timers_dead_cpu` |
+
+A CPU outside the hierarchy counts as active and handles its own timers.
+
+Users (`timer_list` in Linux, on the wheel here): the console byte-waker park
+backstop; `msleep` / `sleep_ms` (`schedule_timeout`); TCP's per-connection
+timer (retransmit, delayed ACK, zero-window probe, keepalive, TIME-WAIT and
+orphan FIN-WAIT-2, transmit-wait probe, deferred accept — one `timer_list`
+per connection armed for the earliest deadline, holding a TCB reference while
+pending, `sk_reset_timer` discipline); IPv4 fragment queue expiry
+(`ip_expire`, one per queue); neighbour resolution (`neigh->timer`, one
+per resolving neighbour) and the neighbour GC; the net-device transmit
+watchdog (`dev_watchdog`, one per NIC); and every delayed work
+(`narf_scheduler::workqueue::DelayedWork`: the writeback flusher, the LED
+engine). Callbacks run in executor context with no base
+lock held; `del_timer_sync` must not be called from the timer's own callback.
 
 ### 3.3 Clocksource / Clockevent abstractions (for arch backends)
 
@@ -313,6 +349,25 @@ single-shot drain, and PPS.
 - Lock order: one CPU-base lock at a time (migration releases the old base
   before taking the new, with the timer marked migrating in between); a
   sleeper's waker lock is taken with no base lock held.
+- Timer wheel: a timer fires no earlier than its expiry jiffy and at most
+  one level granularity later; a timer deleted before its callback starts
+  never runs, including one already collected for the expiry in progress;
+  after `del_timer_sync` returns the callback is not running and the wheel
+  holds no reference to the timer. The wheel never touches a timer once its
+  callback has started.
+- Timer migration: every idle CPU's earliest GLOBAL timer is represented,
+  through its group chain, in the queue of the lowest group that still has
+  a migrator, or in the root's when no CPU is active — in which case the
+  CPU whose walk left the root idle wakes for it. So a GLOBAL timer is
+  late only if its migrator does not run its executor round (an active CPU
+  with interrupts masked), as a pinned timer is if its own CPU does not.
+  Locks: `tmc` → group locks bottom-up, at most a child and its parent at
+  once; no timer base lock is held across them. A group's active mask and
+  migrator change only by sequence-counted compare-and-exchange; an event
+  update re-reads the child's state under the child's and parent's locks
+  and leaves an active child's event ignored, so a stale walk can add a
+  spurious remote expiry (which rechecks under the CPU's `tmc` lock) but
+  never drop an idle CPU's event.
 - Wall-clock jumps (NTP step) never leak into monotonic time.
 - Frequency changes from `arch/` (CPU DVFS) are invisible through
   this interface — the clocksource frequency is either invariant

@@ -22,6 +22,7 @@ pub mod iommu_model;
 mod iommu_perdomain_tests;
 pub mod iova;
 pub mod pool;
+pub mod sg;
 mod tests;
 
 use core::fmt;
@@ -73,19 +74,25 @@ impl<R: narf_capabilities::Rights> CapOp<DmaBuffer, R> for GetPhysAddr {
 // the cap that authorised it (the device's queue still holds the
 // completion in flight).
 
-static REGISTRY: IrqSafeSpinLock<Vec<Option<Arc<DmaBuffer>>>> = IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<Option<Registered>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// What a registry slot holds: the object its cap kind names.
+#[derive(Clone)]
+enum Registered {
+    Buffer(Arc<DmaBuffer>),
+    Pages(Arc<sg::PageList>),
+}
 
 /// Register `buf` in the cap → buffer registry and mint a
 /// `Cap<DmaBuffer, Write>` that points at it. The cap's
 /// `slot.index` is the registry slot, so devices can `resolve()`
 /// back to the buffer from a `BlockRequest::buffer` field.
 pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities::Write> {
-    // `Cap::bootstrap` registers a fresh DmaBuffer object-table entry
-    // and mints the cap for it (SEC-B5, #1293: `Cap::mint` is
-    // crate-private to `capabilities/`, so this is the only way to
-    // mint from outside the crate). The slot's generation is 1 for a
-    // fresh entry — the same value the old hand-built slot read back
-    // via `current_epoch` — and `slot.index` is the registry index.
+    // `Cap::bootstrap` registers a DmaBuffer object-table entry (a
+    // released index under a greater generation, or a fresh one) and
+    // mints the cap for it (SEC-B5, #1293: `Cap::mint` is crate-private
+    // to `capabilities/`, so this is the only way to mint from outside
+    // the crate); `slot.index` is the registry index.
     let cap: Cap<DmaBuffer, narf_capabilities::Write> = Cap::bootstrap();
     let index = cap.slot().index;
     buf.slot_index = Some(index);
@@ -93,8 +100,42 @@ pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities
     if (index as usize) >= r.len() {
         r.resize(index as usize + 1, None);
     }
-    r[index as usize] = Some(Arc::new(buf));
+    r[index as usize] = Some(Registered::Buffer(Arc::new(buf)));
     cap
+}
+
+/// Register a page list and mint a `Cap<PageList, Write>` for it, the
+/// scatter-gather sibling of [`register_with_cap`]: the cap's `slot.index`
+/// is the registry slot a block device resolves back to the list.
+pub fn register_pages_with_cap(list: sg::PageList) -> Cap<sg::PageList, narf_capabilities::Write> {
+    let cap: Cap<sg::PageList, narf_capabilities::Write> = Cap::bootstrap();
+    let index = cap.slot().index;
+    let mut r = REGISTRY.lock();
+    if (index as usize) >= r.len() {
+        r.resize(index as usize + 1, None);
+    }
+    r[index as usize] = Some(Registered::Pages(Arc::new(list)));
+    cap
+}
+
+/// Revoke a page-list cap and free its registry slot (see [`unregister`]).
+/// The list — and its IOMMU mappings — go when the last `Arc` drops, i.e.
+/// after every command in flight over it has completed.
+pub fn unregister_pages<R: narf_capabilities::Rights>(cap: Cap<sg::PageList, R>) {
+    unregister_by_index(cap.slot().index);
+}
+
+/// Cap-gated resolve of a page list: `None` if the cap is revoked, the
+/// slot is empty or holds a buffer instead.
+pub fn resolve_pages_cap<R: narf_capabilities::Rights>(
+    cap: &Cap<sg::PageList, R>,
+) -> Option<Arc<sg::PageList>> {
+    cap.check_live().ok()?;
+    let r = REGISTRY.lock();
+    match r.get(cap.slot().index as usize) {
+        Some(Some(Registered::Pages(l))) => Some(l.clone()),
+        _ => None,
+    }
 }
 
 /// Revoke the cap and free the registry slot. After this call
@@ -103,25 +144,32 @@ pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities
 /// drops (typically immediately if no in-flight `resolve()` Arc is
 /// held).
 pub fn unregister<R: narf_capabilities::Rights>(cap: Cap<DmaBuffer, R>) {
-    let index = cap.slot().index;
-    let _ = narf_capabilities::object_table::bump_epoch(index);
-    let mut r = REGISTRY.lock();
-    if let Some(slot) = r.get_mut(index as usize) {
-        *slot = None;
-    }
+    unregister_by_index(cap.slot().index);
 }
 
 /// Index-keyed counterpart to `unregister`. Used by the driver
 /// framework's reclaim path to drop a `Cap<DmaBuffer, _>`'s backing
 /// without the framework having to round-trip through the typed cap.
-/// Bumps the object-table epoch (so every outstanding cap fails
-/// `check_live`) and clears the registry slot.
+/// Clears the registry slot, then releases the object-table index: every
+/// outstanding cap fails `check_live` (the epoch moved) and the index may be
+/// handed to the next registration under a greater generation. The slot is
+/// cleared first so that registration, which installs its object after
+/// taking the index, can never have its entry wiped by the releaser.
 pub fn unregister_by_index(index: u32) {
-    let _ = narf_capabilities::object_table::bump_epoch(index);
-    let mut r = REGISTRY.lock();
-    if let Some(slot) = r.get_mut(index as usize) {
-        *slot = None;
+    {
+        let mut r = REGISTRY.lock();
+        if let Some(slot) = r.get_mut(index as usize) {
+            *slot = None;
+        }
     }
+    let _ = narf_capabilities::object_table::release(index);
+}
+
+/// Registry slots in use (diagnostics): the registry grows to the highest
+/// object index it has seen, which index reuse keeps bounded by the peak
+/// number of live objects.
+pub fn registry_len() -> usize {
+    REGISTRY.lock().len()
 }
 
 /// Resolve a capability slot index to the underlying DmaBuffer.
@@ -129,7 +177,10 @@ pub fn unregister_by_index(index: u32) {
 /// `unregister`-ed.
 pub fn resolve(index: u32) -> Option<Arc<DmaBuffer>> {
     let r = REGISTRY.lock();
-    r.get(index as usize).and_then(|o| o.clone())
+    match r.get(index as usize) {
+        Some(Some(Registered::Buffer(b))) => Some(b.clone()),
+        _ => None,
+    }
 }
 
 /// Cap-gated resolve: returns `None` if the cap is revoked, the
@@ -154,6 +205,9 @@ pub enum IoError {
     /// remaps System RAM non-cacheable (see `memory/src/memtype.rs`), so it
     /// fails closed instead of handing out write-back memory.
     NoCoherentPool,
+    /// A page list with no pages, unaligned frames or fewer frames than
+    /// its length needs.
+    InvalidPageList,
     /// A reserved DMA pool range was refused: unaligned, empty, overlapping
     /// another pool, or intersecting System RAM.
     PoolRejected,
@@ -172,6 +226,7 @@ impl fmt::Display for IoError {
             IoError::NoCoherentPool => {
                 f.write_str("io: non-coherent device has no reserved DMA pool")
             }
+            IoError::InvalidPageList => f.write_str("io: page list is empty, unaligned or short"),
             IoError::PoolRejected => f.write_str("io: reserved DMA pool range refused"),
             IoError::Timeout => f.write_str("io: IOMMU command completion timed out"),
         }

@@ -53,7 +53,15 @@ pub(crate) fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
     let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
     let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
 
-    let tfd = crate::io_mux::TimerFd::new();
+    // The fd's hrtimer runs on its clock's base. The ALARM clocks run on
+    // their base clock (NARF has no RTC wake alarm).
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+    let clock = match clockid {
+        CLOCK_REALTIME | CLOCK_REALTIME_ALARM => ClockId::Realtime,
+        CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => ClockId::Boottime,
+        _ => ClockId::Monotonic,
+    };
+    let tfd = crate::io_mux::TimerFd::new(clock);
     timerfd_arc_register(&tfd);
     let task = current_task_id();
     let new_fd = match fd::install(task, crate::fd::FdEntry {

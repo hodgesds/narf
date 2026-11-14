@@ -842,6 +842,15 @@ pub struct FlipLog {
     /// Recent completions as (highest ticket covered, stamp), oldest first.
     recent: [(u64, FlipStamp); FLIP_HISTORY],
     len: usize,
+    /// CLOCK_MONOTONIC ns at which the oldest ticket not yet completed
+    /// became the oldest: when it was reserved with nothing pending, or
+    /// when the tickets before it completed.
+    pending_since_ns: u64,
+    /// The ticket [`FlipLog::stalled`] last reported (0: none pending
+    /// report), so each stall is reported once.
+    stall_reported: u64,
+    /// A reported ticket that completed since: (ticket, ns it waited).
+    stall_recovered: Option<(u64, u64)>,
 }
 
 impl Default for FlipLog {
@@ -857,13 +866,46 @@ impl FlipLog {
             completed: 0,
             recent: [(0, FlipStamp { ns: 0, sequence: 0 }); FLIP_HISTORY],
             len: 0,
+            pending_since_ns: 0,
+            stall_reported: 0,
+            stall_recovered: None,
         }
     }
 
     /// The ticket of the next submitted frame.
     pub fn reserve(&mut self) -> u64 {
+        self.reserve_at(narf_time::wall::monotonic_ns())
+    }
+
+    /// [`FlipLog::reserve`] at CLOCK_MONOTONIC `now`.
+    pub fn reserve_at(&mut self, now: u64) -> u64 {
+        if self.reserved == self.completed {
+            self.pending_since_ns = now;
+        }
         self.reserved += 1;
         self.reserved
+    }
+
+    /// The oldest ticket still waiting for its flip and how long it has
+    /// waited, once that is `after_ns` or more. Each ticket is reported
+    /// once; [`FlipLog::take_recovered`] says when it completed after all.
+    pub fn stalled(&mut self, now: u64, after_ns: u64) -> Option<(u64, u64)> {
+        let oldest = self.completed + 1;
+        if self.reserved < oldest || self.stall_reported == oldest {
+            return None;
+        }
+        let waited = now.saturating_sub(self.pending_since_ns);
+        if waited < after_ns {
+            return None;
+        }
+        self.stall_reported = oldest;
+        Some((oldest, waited))
+    }
+
+    /// A ticket [`FlipLog::stalled`] reported that has completed since,
+    /// and how long it waited in all.
+    pub fn take_recovered(&mut self) -> Option<(u64, u64)> {
+        self.stall_recovered.take()
     }
 
     /// Every ticket up to `upto` completed at `stamp`.
@@ -873,6 +915,15 @@ impl FlipLog {
             return;
         }
         self.completed = upto;
+        if self.stall_reported != 0 && upto >= self.stall_reported {
+            self.stall_recovered = Some((
+                self.stall_reported,
+                stamp.ns.saturating_sub(self.pending_since_ns),
+            ));
+            self.stall_reported = 0;
+        }
+        // A ticket still pending is the oldest from now.
+        self.pending_since_ns = stamp.ns;
         if self.len == FLIP_HISTORY {
             self.recent.copy_within(1.., 0);
             self.len -= 1;
@@ -937,6 +988,61 @@ pub static FLIPS: [narf_lib::sync::IrqSafeSpinLock<FlipLog>; 4] = [
 /// Display `display`'s flip log (the last one for an out-of-range index).
 pub fn flips(display: u8) -> &'static narf_lib::sync::IrqSafeSpinLock<FlipLog> {
     &FLIPS[usize::from(display).min(FLIPS.len() - 1)]
+}
+
+/// How long after its commit a flip-complete event is overdue. A flip
+/// latches within a frame or two; drm_atomic_helper_wait_for_flip_done
+/// waits 10 s before its "flip_done timed out", a compositor about one
+/// before it gives the frame up (KWin's "Pageflip timed out").
+pub const FLIP_STALL_NS: u64 = 1_000_000_000;
+
+/// The display driver's account of a stalled flip (its presenter's state),
+/// logged after the stall line.
+static FLIP_STALL_REPORTER: narf_lib::sync::IrqSafeSpinLock<Option<fn(u8)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Have `report(display)` log the display driver's state when a flip of
+/// one of its displays stalls. Returns the reporter it replaces.
+pub fn set_flip_stall_reporter(report: Option<fn(u8)>) -> Option<fn(u8)> {
+    core::mem::replace(&mut *FLIP_STALL_REPORTER.lock(), report)
+}
+
+/// Log a hardware flip whose completion is overdue, once per stalled
+/// ticket, and its completion if it comes after all: Linux's "flip_done
+/// timed out". Called where a poller waits on a flip event at `now`
+/// (CLOCK_MONOTONIC), which is where a lost flip strands a compositor;
+/// with nothing overdue it is one uncontended lock per display.
+pub(crate) fn note_flip_stalls(now: u64) {
+    use core::fmt::Write;
+    for (display, log) in FLIPS.iter().enumerate() {
+        let (stalled, recovered, reserved, completed) = {
+            let mut log = log.lock();
+            (
+                log.stalled(now, FLIP_STALL_NS),
+                log.take_recovered(),
+                log.reserved,
+                log.completed,
+            )
+        };
+        if let Some((ticket, waited)) = recovered {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: display {display} flip ticket {ticket} completed after all, {} ms after its commit",
+                waited / 1_000_000
+            );
+        }
+        if let Some((ticket, waited)) = stalled {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: display {display} flip_done timed out: ticket {ticket} has no flip {} ms after its commit ({reserved} submitted, {completed} completed)",
+                waited / 1_000_000
+            );
+            let reporter = *FLIP_STALL_REPORTER.lock();
+            if let Some(report) = reporter {
+                report(display as u8);
+            }
+        }
+    }
 }
 
 /// Complete hardware flip tickets up to `ticket` on `display` immediately,
@@ -2280,12 +2386,28 @@ impl Card {
     }
 
     /// Register a new dumb backing. Returns the gem handle.
+    ///
+    /// A card-table dumb buffer reaches a presenter as a bare physical
+    /// address ([`PlaneFrame::phys`], no `bo`). Nothing keeps that address
+    /// alive for a presenter that works after the commit returned: the
+    /// backing goes back to the page allocator when the buffer's last
+    /// reference does (DESTROY_DUMB and RMFB, or a closed framebuffer
+    /// leaving the screen, `collect_closed_fbs`). The linear GEM card
+    /// (Navi 22), whose presenter queues frames and keeps the committed
+    /// one for a relight, must therefore never have one, and does not: its
+    /// CREATE_DUMB makes a GEM buffer in the opener's table or fails
+    /// (`drm_ioctl_bridge::amdgpu_dumb`), so every client frame that
+    /// presenter holds carries a scanout pin.
     pub fn register_dumb_backing(
         &mut self,
         phys: u64,
         byte_len: usize,
         order: u8,
     ) -> Result<u32, CardError> {
+        debug_assert!(
+            !(self.driver_name == "amdgpu" && self.native_atomic && !self.gfx12_modifiers),
+            "a card-table dumb buffer on the linear GEM card: its presenter would hold a bare address"
+        );
         let handle = self
             .gem
             .alloc(phys, byte_len)
@@ -2924,12 +3046,15 @@ impl Card {
                 .any(|p| p.primary_of.is_none() && p.fb_id == Some(fb_id))
     }
     /// Free closed framebuffers (CLOSEFB'd while shown) nothing scans any
-    /// more. Returns dumb backings to buddy-free.
+    /// more: drm_mode_closefb drops the file's reference and the plane's
+    /// goes when it shows something else, whatever the framebuffer is made
+    /// of (a GEM buffer, a card-table dumb buffer or an import). Returns
+    /// dumb backings to buddy-free.
     pub fn collect_closed_fbs(&mut self) -> Vec<(u64, u8)> {
         let closed: Vec<u32> = self
             .framebuffers
             .iter()
-            .filter(|fb| fb.bo.as_ref().is_some_and(|bo| bo.owner == CLOSED_FB_OWNER))
+            .filter(|fb| fb.owner() == Some(CLOSED_FB_OWNER))
             .map(|fb| fb.id)
             .filter(|&id| !self.fb_shown(id))
             .collect();
@@ -3140,6 +3265,164 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/drm/card",
         smoke_dumb_backing_frees_when_unmapped
+    );
+
+    /// A ticket whose flip has not completed `FLIP_STALL_NS` after it
+    /// became the oldest pending one is reported once, however many
+    /// commits queue behind it; when it completes after all, that is
+    /// reported with its whole wait, and the next ticket's wait starts
+    /// there.
+    fn flip_log_reports_a_stalled_ticket_once_and_its_recovery() -> TestResult {
+        const S: u64 = FLIP_STALL_NS;
+        let mut log = FlipLog::new();
+        if log.stalled(10 * S, S).is_some() {
+            return TestResult::Fail("stall with nothing submitted");
+        }
+        let a = log.reserve_at(1_000);
+        if log.stalled(1_000 + S - 1, S).is_some() {
+            return TestResult::Fail("stall before the flip is overdue");
+        }
+        if log.stalled(1_000 + S, S) != Some((a, S)) {
+            return TestResult::Fail("overdue flip not reported");
+        }
+        let b = log.reserve_at(1_000 + S);
+        if log.stalled(1_000 + 2 * S, S).is_some() || log.take_recovered().is_some() {
+            return TestResult::Fail("stall reported twice");
+        }
+        log.complete(
+            a,
+            FlipStamp {
+                ns: 1_000 + 3 * S,
+                sequence: 1,
+            },
+        );
+        if log.take_recovered() != Some((a, 3 * S)) || log.take_recovered().is_some() {
+            return TestResult::Fail("late completion not reported once");
+        }
+        // The ticket queued behind it has waited since that completion.
+        if log.stalled(1_000 + 4 * S - 1, S).is_some()
+            || log.stalled(1_000 + 4 * S, S) != Some((b, S))
+        {
+            return TestResult::Fail("next ticket's wait");
+        }
+        log.complete_all(1_000 + 5 * S);
+        if log.take_recovered() != Some((b, 2 * S)) || log.stalled(u64::MAX, S).is_some() {
+            return TestResult::Fail("completed log still stalled");
+        }
+        // A flip on time is never reported.
+        let c = log.reserve_at(1_000 + 9 * S);
+        log.complete(
+            c,
+            FlipStamp {
+                ns: 1_000 + 9 * S + 16_000_000,
+                sequence: 2,
+            },
+        );
+        if log.take_recovered().is_some() || log.stalled(u64::MAX, S).is_some() {
+            return TestResult::Fail("a flip on time was reported");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        flip_log_reports_a_stalled_ticket_once_and_its_recovery
+    );
+
+    /// Where a poller waits on a flip event, an overdue flip is logged
+    /// and the display driver's reporter is asked for its state, once.
+    fn overdue_flip_is_reported_to_the_display_driver_once() -> TestResult {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        fn report(display: u8) {
+            if display == 2 {
+                CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        CALLS.store(0, Ordering::Release);
+        let previous = set_flip_stall_reporter(Some(report));
+        let now = narf_time::wall::monotonic_ns().max(3 * FLIP_STALL_NS);
+        // Display 2's log: nothing else in the test image presents there.
+        let ticket = {
+            let mut log = flips(2).lock();
+            log.complete_all(now - 2 * FLIP_STALL_NS);
+            let _ = log.take_recovered();
+            log.reserve_at(now - 2 * FLIP_STALL_NS)
+        };
+        note_flip_stalls(now);
+        note_flip_stalls(now + 1);
+        let once = CALLS.load(Ordering::Acquire) == 1;
+        complete_flip_ticket(2, Some(ticket));
+        note_flip_stalls(now + 2);
+        let recovered = flips(2).lock().take_recovered().is_none();
+        set_flip_stall_reporter(previous);
+        if !once {
+            return TestResult::Fail("overdue flip not reported to the driver exactly once");
+        }
+        if !recovered || CALLS.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail("late completion not consumed, or reported as a stall");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        overdue_flip_is_reported_to_the_display_driver_once
+    );
+
+    /// drm_mode_closefb on a framebuffer of a card-table dumb buffer (one
+    /// made through the generic ADDFB path, which has no per-open GEM
+    /// buffer): while a plane scans it, it stays, owned by no file; once
+    /// the plane has moved on, it and its backing go, as the framebuffer's
+    /// last reference drops in drm_framebuffer_put.
+    fn closed_dumb_framebuffer_goes_once_off_screen() -> TestResult {
+        narf_memory::rmap::__reset_for_test();
+        const OPEN: u64 = 7;
+        let mut card = Card::new("test", "test", (1, 0, 0));
+        card.crtcs.push(Crtc {
+            id: 11,
+            mode: Some(crate::Mode {
+                width: 64,
+                height: 16,
+                refresh_hz: 60,
+                bpp: 32,
+            }),
+            enabled: true,
+            primary_fb: None,
+            x: 0,
+            y: 0,
+        });
+        let phys = 0x60_000u64;
+        let Ok(handle) = card.register_dumb_backing(phys, 4096, 0) else {
+            return TestResult::Fail("register_dumb_backing failed");
+        };
+        let Ok(fb) = card.addfb2(64, 16, 0x3432_5258, 256, handle) else {
+            return TestResult::Fail("ADDFB2 of a dumb buffer failed");
+        };
+        card.set_fb_creator(fb, OPEN);
+        card.crtcs[0].primary_fb = Some(fb);
+        // GEM_CLOSE: the framebuffer keeps the buffer.
+        if card.remove_dumb_backing(handle).is_some() {
+            return TestResult::Fail("GEM_CLOSE freed a buffer its framebuffer holds");
+        }
+        if card.closefb(fb, OPEN) != Ok(None) || card.framebuffer(fb).is_err() {
+            return TestResult::Fail("CLOSEFB of a shown framebuffer removed it");
+        }
+        if !card.collect_closed_fbs().is_empty() || card.framebuffer(fb).is_err() {
+            return TestResult::Fail("a closed framebuffer went while still on screen");
+        }
+        // The plane shows something else: nothing scans the closed one.
+        card.crtcs[0].primary_fb = None;
+        let freed = card.collect_closed_fbs();
+        if card.framebuffer(fb).is_ok() {
+            return TestResult::Fail("a closed dumb framebuffer stayed after leaving the screen");
+        }
+        if freed != [(phys, 0)] || card.dumb_backing(handle).is_some() {
+            return TestResult::Fail("a closed dumb framebuffer's backing was not returned");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        closed_dumb_framebuffer_goes_once_off_screen
     );
 
     /// ADDFB2 of an Intel GEM handle follows drm's framebuffer_check and

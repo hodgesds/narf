@@ -429,6 +429,43 @@ kernel_test_in!(
     smoke_connect_fails_ehostunreach_when_arp_gives_up
 );
 
+/// The neighbour's resolution timer is a wheel timer (`neigh->timer`): with
+/// nobody scanning, the executor round's timer softirq alone re-sends the
+/// ARP request after `RETRANS_TIME`; the reply stops the timer.
+fn smoke_neigh_timer_retransmits_from_the_wheel() -> TestResult {
+    let local = [10, 0, 98, 1];
+    let _ = reset("tcp-rob-neigh-wheel", local);
+    let peer = [10, 0, 98, 9];
+    let peer_mac = [0x02, 0, 0, 0, 0, 0x98];
+    let Ok(_) = core::connect_start_in(0, peer, 80, core::ConnectOptions::default()) else {
+        return TestResult::Fail("connect_start_in failed");
+    };
+    let mut requests = arp_requests_for(&drain(), peer);
+    if crate::tcp_stack::__neigh_timer_pending("tcp-rob-neigh-wheel", peer) != Some(true) {
+        return TestResult::Fail("starting resolution did not arm the neighbour timer");
+    }
+    // Twice RETRANS_TIME, expiring timers only as an executor round does.
+    let end = narf_scheduler::narf_time::monotonic_ns() + 2_500_000_000;
+    while requests < 2 && narf_scheduler::narf_time::monotonic_ns() < end {
+        let _ = narf_scheduler::narf_time::hrtimer::hrtimer_run_softirq();
+        requests += arp_requests_for(&drain(), peer);
+        ::core::hint::spin_loop();
+    }
+    if requests < 2 {
+        return TestResult::Fail("the neighbour timer did not re-send the ARP request");
+    }
+    arp_reply("tcp-rob-neigh-wheel", local, peer, peer_mac);
+    let _ = drain();
+    if crate::tcp_stack::__neigh_timer_pending("tcp-rob-neigh-wheel", peer).is_some() {
+        return TestResult::Fail("the ARP reply did not stop the neighbour timer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_neigh_timer_retransmits_from_the_wheel
+);
+
 /// A SYN from a peer whose MAC we do not know is answered without waiting in
 /// the RX path: the SYN-ACK queues on the neighbour and goes out with the ARP
 /// reply. (This used to spin up to 500 ms inside the receive handler.)
@@ -1326,9 +1363,17 @@ use alloc::sync::Arc;
 static CAPTURE_REFUSES: ::core::sync::atomic::AtomicBool =
     ::core::sync::atomic::AtomicBool::new(false);
 
+/// A connection to resume from inside the ordinary transmit hook: a sender
+/// running between an RTO's rewind and the end of `fire_retransmit`.
+static PLAIN_REENTER: ::core::sync::atomic::AtomicU32 = ::core::sync::atomic::AtomicU32::new(0);
+
 fn refusable_send(frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
     if CAPTURE_REFUSES.load(::core::sync::atomic::Ordering::SeqCst) {
         return Err(());
+    }
+    let id = PLAIN_REENTER.swap(0, ::core::sync::atomic::Ordering::SeqCst);
+    if id != 0 {
+        core::tx_resume(id);
     }
     capture_send(frame, meta)
 }
@@ -1337,6 +1382,8 @@ fn refusable_send(frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
 struct FakeRing {
     /// Posted, not yet transmitted.
     held: VecDeque<Vec<u8>>,
+    /// The charge that came with each held frame, released with it.
+    charges: VecDeque<Option<crate::txq::TxCharge>>,
     /// Transmitted, in order.
     wire: Vec<Vec<u8>>,
 }
@@ -1355,6 +1402,16 @@ struct FakeNic {
     /// A connection to resume from inside the next transmit, the way an
     /// acknowledgement processed during the send re-enters the sender.
     reenter: ::core::sync::atomic::AtomicU32,
+    /// The queue object after a resize; `queue` is then the stale one.
+    replacement: IrqSafeSpinLock<Option<Arc<TxQueue>>>,
+    /// Frames offered, accepted or not.
+    offers: ::core::sync::atomic::AtomicU32,
+    /// Answer `Busy` without stopping the queue: a driver breaking the
+    /// contract, which must still not make the sender spin.
+    busy_unstopped: ::core::sync::atomic::AtomicBool,
+    /// A segment the peer delivers right after the next accepted frame:
+    /// its ACK overtakes the sender's own bookkeeping for that frame.
+    on_accept: IrqSafeSpinLock<Option<PeerSegment>>,
     /// Refuse, once, the frame that starts at this sequence number.
     refuse_seq: ::core::sync::atomic::AtomicU32,
     /// A segment `(src, dst, bytes)` the peer delivers during that refusal:
@@ -1371,6 +1428,10 @@ impl FakeNic {
             }),
             ring: IrqSafeSpinLock::new(FakeRing::default()),
             reenter: ::core::sync::atomic::AtomicU32::new(0),
+            replacement: IrqSafeSpinLock::new(None),
+            offers: ::core::sync::atomic::AtomicU32::new(0),
+            busy_unstopped: ::core::sync::atomic::AtomicBool::new(false),
+            on_accept: IrqSafeSpinLock::new(None),
             refuse_seq: ::core::sync::atomic::AtomicU32::new(0),
             on_refuse: IrqSafeSpinLock::new(None),
         })
@@ -1378,7 +1439,31 @@ impl FakeNic {
     fn free(ring: &FakeRing) -> u32 {
         FAKE_RING_LEN - 1 - ring.held.len() as u32
     }
-    fn post(&self, frame: &[u8]) -> Result<(), TxRefusal> {
+    /// The queue object the driver currently uses.
+    fn current(&self) -> Arc<TxQueue> {
+        self.replacement
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.queue.clone())
+    }
+    /// `ethtool -G`: a new queue object for the same ring.
+    fn replace_queue(&self) -> Arc<TxQueue> {
+        let queue = TxQueue::new(TxQueueGeometry {
+            ring_len: FAKE_RING_LEN,
+            max_frame_descs: 2,
+        });
+        *self.replacement.lock() = Some(queue.clone());
+        queue
+    }
+    fn post(&self, frame: &[u8], charge: Option<crate::txq::TxCharge>) -> Result<(), TxRefusal> {
+        self.offers
+            .fetch_add(1, ::core::sync::atomic::Ordering::SeqCst);
+        if self
+            .busy_unstopped
+            .load(::core::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TxRefusal::Busy);
+        }
         let seq = tcp_parts(frame).0;
         if self
             .refuse_seq
@@ -1390,7 +1475,7 @@ impl FakeNic {
             )
             .is_ok()
         {
-            self.queue.refused();
+            self.current().refused();
             let delivered = self.on_refuse.lock().take();
             if let Some((src, dst, segment)) = delivered {
                 handle_segment(src, dst, &segment);
@@ -1398,14 +1483,20 @@ impl FakeNic {
             return Err(TxRefusal::Busy);
         }
         {
+            let queue = self.current();
             let mut ring = self.ring.lock();
-            if self.queue.is_stopped() || Self::free(&ring) == 0 {
-                self.queue.refused();
+            if queue.is_stopped() || Self::free(&ring) == 0 {
+                queue.refused();
                 return Err(TxRefusal::Busy);
             }
             ring.held.push_back(frame.to_vec());
+            ring.charges.push_back(charge);
             let free = Self::free(&ring);
-            self.queue.sent(frame.len() as u32, || free);
+            queue.sent(frame.len() as u32, || free);
+        }
+        let delivered = self.on_accept.lock().take();
+        if let Some((src, dst, segment)) = delivered {
+            handle_segment(src, dst, &segment);
         }
         let id = self.reenter.swap(0, ::core::sync::atomic::Ordering::SeqCst);
         if id != 0 {
@@ -1424,16 +1515,18 @@ impl FakeNic {
             };
             bytes += frame.len() as u64;
             ring.wire.push(frame);
+            ring.charges.pop_front();
             done += 1;
         }
         let free = Self::free(&ring);
-        self.queue.completed(done, bytes, free);
+        self.current().completed(done, bytes, free);
     }
     /// A watchdog reset: whatever the ring held is discarded.
     fn reset(&self) -> usize {
         let mut ring = self.ring.lock();
         let lost = ring.held.len();
         ring.held.clear();
+        ring.charges.clear();
         self.queue.reset();
         lost
     }
@@ -1450,7 +1543,7 @@ impl TxBackpressure for FakeNic {
         1
     }
     fn tx_queue(&self, q: u16) -> Option<Arc<TxQueue>> {
-        (q == 0).then(|| self.queue.clone())
+        (q == 0).then(|| self.current())
     }
     fn tx_select_queue(&self, _frame: &[u8]) -> u16 {
         0
@@ -1464,10 +1557,16 @@ impl TxBackpressure for FakeNic {
         frame: crate::Frame,
         _meta: crate::TxMeta,
     ) -> Result<(), TxRefusal> {
-        self.post(frame.payload())
+        self.post(frame.payload(), None)
     }
-    fn try_xmit_copy(&self, _q: u16, frame: &[u8], _meta: crate::TxMeta) -> Result<(), TxRefusal> {
-        self.post(frame)
+    fn try_xmit_copy(
+        &self,
+        _q: u16,
+        frame: &[u8],
+        _meta: crate::TxMeta,
+        charge: Option<crate::txq::TxCharge>,
+    ) -> Result<(), TxRefusal> {
+        self.post(frame, charge)
     }
 }
 
@@ -1596,8 +1695,13 @@ fn smoke_tx_burst_larger_than_ring_waits_and_arrives_in_order() -> TestResult {
     if drain().iter().any(|f| frame_payload_len(f) != 0) {
         return TestResult::Fail("data bypassed the queue through the dropping hook");
     }
-    if nic.queue.busy() == 0 || nic.queue.restarts() == 0 {
+    if nic.queue.restarts() == 0 {
         return TestResult::Fail("the ring never pushed back");
+    }
+    // The sender reads the stopped flag before it builds a frame, so the
+    // ring pushes back without a single refused offer.
+    if nic.queue.busy() != 0 {
+        return TestResult::Fail("frames were built and offered to a stopped queue");
     }
     if __with_tcb(id, |t| t.tx_wait_since_cycles) != Some(0) {
         return TestResult::Fail("still marked waiting after everything was sent");
@@ -1967,6 +2071,366 @@ fn smoke_tx_refused_rto_retransmission_is_not_an_attempt() -> TestResult {
 kernel_test_in!(
     "net/tcp/robust",
     smoke_tx_refused_rto_retransmission_is_not_an_attempt
+);
+
+/// The hang this guards against: `ethtool -G/-L` gives the driver new queue
+/// objects while a connection stays bound to the old one. If the old flag
+/// reads "running" and the new queue refuses, the sender must not re-offer
+/// in a loop: it drops the binding, parks, and binds to the new queue when
+/// the probe timer resumes it.
+fn smoke_tx_sender_parks_and_rebinds_when_its_queue_is_replaced() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp8", [10, 102, 0, 1], 7_929);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    let data = pattern(40_000);
+    if send(id, &data[..2000]) != Ok(2000) || nic.held().is_empty() {
+        return TestResult::Fail("the first segments were not sent");
+    }
+    // The resize: a new queue object, stopped, while the old flag is clear.
+    let new_queue = nic.replace_queue();
+    new_queue.refused();
+    nic.offers.store(0, Ordering::SeqCst);
+    if send(id, &data[2000..]) != Ok(38_000) {
+        return TestResult::Fail("the send buffer did not take the rest");
+    }
+    if nic.offers.load(Ordering::SeqCst) > 2 {
+        return TestResult::Fail("the sender kept re-offering to a queue that refuses");
+    }
+    let Some((parked, bound)) =
+        __with_tcb(id, |t| (t.tx_wait_since_cycles != 0, t.tx_bind.is_some()))
+    else {
+        return TestResult::Fail("connection vanished");
+    };
+    if !parked || bound {
+        return TestResult::Fail("the sender did not park and drop its stale binding");
+    }
+    // Room on the new queue; nobody is on its waiter list, so the probe
+    // timer is what resumes the connection.
+    nic.complete(FAKE_RING_LEN as usize);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    let rebound = __with_tcb(id, |t| {
+        t.tx_bind
+            .as_ref()
+            .is_some_and(|bind| Arc::ptr_eq(bind.account.queue(), &new_queue))
+    });
+    if rebound != Some(true) || nic.held().is_empty() {
+        return TestResult::Fail("the connection did not bind to the new queue and resume");
+    }
+    for _ in 0..200 {
+        nic.complete(5);
+        new_queue.run_wakeups();
+    }
+    if stream_of(&nic.wire(), 0x10000) != Some(data) {
+        return TestResult::Fail("the stream did not complete in order on the new queue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_sender_parks_and_rebinds_when_its_queue_is_replaced
+);
+
+/// The other half: the connection is waiting on the old queue, whose flag
+/// stays "stopped" for ever once the driver has moved to a new object.
+fn smoke_tx_waiter_on_a_replaced_queue_is_released_by_the_probe() -> TestResult {
+    let (nic, id, _) = backpressure_conn("txbp9", [10, 103, 0, 1], 7_930);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    let data = pattern(60_000);
+    if send(id, &data) != Ok(data.len()) || !nic.queue.is_stopped() {
+        return TestResult::Fail("the ring did not stop");
+    }
+    let new_queue = nic.replace_queue();
+    nic.complete(FAKE_RING_LEN as usize);
+    if !nic.queue.is_stopped() || !nic.held().is_empty() {
+        return TestResult::Fail("test setup: the old queue should stay stopped");
+    }
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if nic.held().is_empty() {
+        return TestResult::Fail("a waiter on a replaced queue was never released");
+    }
+    for _ in 0..200 {
+        nic.complete(5);
+        new_queue.run_wakeups();
+    }
+    if stream_of(&nic.wire(), 0x10000) != Some(data) {
+        return TestResult::Fail("the stream did not complete in order after the rebind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_waiter_on_a_replaced_queue_is_released_by_the_probe
+);
+
+/// The hard bound, whatever the driver does: a device that answers `Busy`
+/// without stopping its queue gets two offers per call, then the sender
+/// parks for the probe timer.
+fn smoke_tx_sender_never_spins_on_a_busy_queue_that_is_not_stopped() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp10", [10, 104, 0, 1], 7_931);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(1000)) != Ok(1000) {
+        return TestResult::Fail("the first segment was not sent");
+    }
+    nic.busy_unstopped.store(true, Ordering::SeqCst);
+    nic.offers.store(0, Ordering::SeqCst);
+    if send(id, &pattern(30_000)) != Ok(30_000) {
+        return TestResult::Fail("the send buffer did not take the data");
+    }
+    if nic.offers.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("the sender did not stop after one re-offer");
+    }
+    if __with_tcb(id, |t| t.tx_wait_since_cycles != 0) != Some(true) {
+        return TestResult::Fail("the sender is not parked for the probe timer");
+    }
+    // Each probe is again bounded.
+    nic.offers.store(0, Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if nic.offers.load(Ordering::SeqCst) > 2 {
+        return TestResult::Fail("a probe re-offered without bound");
+    }
+    nic.busy_unstopped.store(false, Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if nic.held().len() < 2 {
+        return TestResult::Fail("the sender did not resume once the device took frames");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_sender_never_spins_on_a_busy_queue_that_is_not_stopped
+);
+
+/// Frames the driver copies are charged like owned ones, so the
+/// per-connection limit holds for them: the connection stops at the limit
+/// with ring to spare, and its own completions resume it.
+fn smoke_tx_copied_frames_are_charged_and_throttled() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp11", [10, 105, 0, 1], 7_932);
+    narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES.store(4000, Ordering::Relaxed);
+    let sent = send(id, &pattern(60_000));
+    narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES.store(4 << 20, Ordering::Relaxed);
+    if sent != Ok(60_000) {
+        return TestResult::Fail("the send buffer did not take the data");
+    }
+    let held = nic.held();
+    let in_device: usize = held.iter().map(Vec::len).sum();
+    let Some((queued, parked)) = __with_tcb(id, |t| {
+        (
+            t.tx_bind.as_ref().map_or(0, |bind| bind.account.queued()),
+            t.tx_wait_since_cycles != 0,
+        )
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if queued as usize != in_device || in_device == 0 {
+        return TestResult::Fail("copied frames are not charged to their connection");
+    }
+    if nic.queue.is_stopped() || held.len() >= 14 || in_device <= 4000 || !parked {
+        return TestResult::Fail("the per-connection limit did not stop the sender first");
+    }
+    // Its own completions return the charge and schedule the resume.
+    nic.complete(held.len());
+    if __with_tcb(id, |t| {
+        t.tx_bind.as_ref().map_or(1, |bind| bind.account.queued())
+    }) != Some(0)
+    {
+        return TestResult::Fail("completion did not return the charges");
+    }
+    if nic.queue.run_wakeups() != 1 || nic.held().is_empty() {
+        return TestResult::Fail("completions did not resume the throttled connection");
+    }
+    // A reset returns what the ring held as well.
+    let _ = nic.reset();
+    if __with_tcb(id, |t| {
+        t.tx_bind.as_ref().map_or(1, |bind| bind.account.queued())
+    }) != Some(0)
+    {
+        return TestResult::Fail("a reset kept the charges of the frames it discarded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_copied_frames_are_charged_and_throttled
+);
+
+/// The ACK for a segment can be processed before the sender records the
+/// segment for retransmission (the record is made after the device took the
+/// frame). That record was then never released: on an idle connection its
+/// timer fired with nothing to resend, did not re-arm, fired again on every
+/// tick, and the eighth firing reset the connection.
+fn smoke_tx_ack_before_record_leaves_no_stale_retransmit_timer() -> TestResult {
+    let local = [10, 106, 0, 1];
+    let (nic, id, peer) = backpressure_conn("txbp12", local, 7_933);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    *nic.on_accept.lock() = Some((
+        peer,
+        local,
+        tcp_bytes(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 7_933,
+            seq: 0x20000,
+            ack: 0x10000 + 300,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        }),
+    ));
+    if send(id, &pattern(300)) != Ok(300) {
+        return TestResult::Fail("the segment was not sent");
+    }
+    if __with_tcb(id, |t| {
+        (t.snd_una, t.retx_queue.len(), t.retx_deadline_cycles)
+    }) != Some((0x10000 + 300, 0, 0))
+    {
+        return TestResult::Fail("a segment already acknowledged was recorded for retransmission");
+    }
+    // A stale record that exists anyway must be discarded, not counted.
+    let before = __with_tcb(id, |t| t.rtt.backoff_count).unwrap_or(9);
+    let _ = __with_tcb_mut(id, |t| {
+        t.retx_queue.push_back(crate::tcp::retransmit::OutSeg {
+            seq: 0x10000,
+            len: 300,
+            sent_at_cycles: 1,
+            retransmitted: false,
+            flags: FLAG_ACK,
+        });
+    });
+    for _ in 0..20 {
+        let _ = __with_tcb_mut(id, |t| {
+            if !t.retx_queue.is_empty() {
+                t.retx_deadline_cycles = 1;
+            }
+        });
+        tick_retransmit(&arc);
+    }
+    if __with_tcb(id, |t| {
+        (
+            t.state,
+            t.retx_queue.len(),
+            t.retx_deadline_cycles,
+            t.rtt.backoff_count,
+        )
+    }) != Some((TcpState::Established, 0, 0, before))
+    {
+        return TestResult::Fail("a stale retransmit record kept firing or reset the connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_ack_before_record_leaves_no_stale_retransmit_timer
+);
+
+/// `fire_retransmit` releases the lock between rewinding to `snd_una` and
+/// advancing past the head it resent. A sender that runs in between has
+/// already advanced; advancing again left the send-buffer offset ahead of
+/// `snd_nxt`, a range marked sent that nothing ever transmits.
+fn smoke_tx_rto_does_not_advance_over_a_sender_that_ran_meanwhile() -> TestResult {
+    let (_nic, id, _) = backpressure_conn("txbp13", [10, 107, 0, 1], 7_934);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(6000)) != Ok(6000) {
+        return TestResult::Fail("the data was not sent");
+    }
+    // The sender runs from inside the RTO's own retransmission.
+    PLAIN_REENTER.store(id, ::core::sync::atomic::Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    if PLAIN_REENTER.load(::core::sync::atomic::Ordering::SeqCst) != 0 {
+        return TestResult::Fail("the RTO did not retransmit through the ordinary hook");
+    }
+    let Some((marked, in_flight)) = __with_tcb(id, |t| {
+        (
+            t.send_buf.inflight_bytes() as u32,
+            t.snd_nxt.wrapping_sub(t.snd_una),
+        )
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if marked != in_flight || in_flight == 0 {
+        return TestResult::Fail("the send-buffer offset and snd_nxt disagree after the RTO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_rto_does_not_advance_over_a_sender_that_ran_meanwhile
+);
+
+/// A connection that cannot get its data into the device is counted: every
+/// 64 refusals in a row, and every second spent waiting. Sending again
+/// clears both.
+fn smoke_tx_stuck_sender_is_counted_and_cleared() -> TestResult {
+    use crate::txq::stats::{LONG_WAITS, REOFFER_STORMS};
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp14", [10, 108, 0, 1], 7_935);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(1000)) != Ok(1000) {
+        return TestResult::Fail("the first segment was not sent");
+    }
+    nic.busy_unstopped.store(true, Ordering::SeqCst);
+    let storms = REOFFER_STORMS.load(Ordering::Relaxed);
+    if send(id, &pattern(30_000)) != Ok(30_000) {
+        return TestResult::Fail("the send buffer did not take the data");
+    }
+    for _ in 0..40 {
+        let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+        tick_retransmit(&arc);
+    }
+    if REOFFER_STORMS.load(Ordering::Relaxed) == storms {
+        return TestResult::Fail("82 refusals in a row were not counted as a storm");
+    }
+    // The wait began more than a second ago: counted once, then the second
+    // starts over.
+    let waits = LONG_WAITS.load(Ordering::Relaxed);
+    let _ = __with_tcb_mut(id, |t| {
+        t.tx_wait_start_cycles = 1;
+        t.tx_wait_since_cycles = 1;
+    });
+    tick_retransmit(&arc);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if LONG_WAITS.load(Ordering::Relaxed) != waits + 1 {
+        return TestResult::Fail("a second of waiting was not counted exactly once");
+    }
+    nic.busy_unstopped.store(false, Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    // It sends until the ring stops it, which is an ordinary wait again.
+    if __with_tcb(id, |t| t.tx_refused_in_row) != Some(0) || nic.held().is_empty() {
+        return TestResult::Fail("sending again did not clear the refusal count");
+    }
+    if !drive_to_wire(&nic, 31_000) {
+        return TestResult::Fail("the connection did not finish sending");
+    }
+    if __with_tcb(id, |t| (t.tx_wait_start_cycles, t.tx_wait_since_cycles)) != Some((0, 0)) {
+        return TestResult::Fail("a connection with nothing left to send is still marked waiting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_stuck_sender_is_counted_and_cleared
 );
 
 // ── Receive batches (`iface::rx_batch`) ─────────────────────────────────

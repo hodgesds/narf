@@ -52,7 +52,13 @@ pub type Outputs = alloc::boxed::Box<[Option<MstOutput>; MST_OUTPUTS]>;
 /// Reserve every surviving identity before admitting new ones. Disconnected
 /// slots remain reserved for replug until every slot is needed by other sinks.
 fn reconcile(previous: &[Option<MstOutput>; MST_OUTPUTS], topology: &Topology) -> Outputs {
-    let mut out: Outputs = alloc::boxed::Box::new(previous.clone());
+    // Cloned straight into the heap: `Box::new(previous.clone())` built
+    // the whole array on this frame first (13 KiB).
+    let mut out: Outputs = previous
+        .to_vec()
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("MST_OUTPUTS slots in, MST_OUTPUTS out"));
     for o in out.iter_mut().flatten() {
         o.sink = None;
         o.edid.clear();

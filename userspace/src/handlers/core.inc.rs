@@ -562,7 +562,25 @@ static TASK_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 /// Boot wires `|| scheduler::current_task_id().raw()` here.
 pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     TASK_LOOKUP.store(lookup as usize, Ordering::Release);
+    // Filesystem lock waits on a syscall's behalf end on SIGKILL.
+    narf_filesystem::killable::install_kill_hooks(&KILL_HOOKS);
+    // A synchronous filesystem entry point's wait parks the user task.
+    narf_filesystem::sync_wait::install_sync_wait_hooks(&SYNC_WAIT_HOOKS);
 }
+
+static SYNC_WAIT_HOOKS: narf_filesystem::sync_wait::SyncWaitHooks =
+    narf_filesystem::sync_wait::SyncWaitHooks {
+        in_user_task: || crate::user_task::current_user_task().is_some(),
+        park: park_pending_future,
+    };
+
+static KILL_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
+    current: crate::killable_wait::hook_current,
+    pending: crate::killable_wait::hook_pending,
+    arm: register_signal_waker,
+    disarm: drop_signal_waker,
+    owner: crate::killable_wait::hook_owner,
+};
 
 /// Test hook: drop any installed current-task lookup so
 /// `current_task_id()` falls back to 0. The in-kernel smoke tests
@@ -632,7 +650,7 @@ fn raw_waker() -> RawWaker {
 /// Returns `false` only outside a stackful user task (principally kernel-test
 /// contexts and architectures which have not enabled own-stack user tasks).
 #[inline]
-fn park_pending_future() -> bool {
+fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool {
     sleep_pumps::run();
     let Some(uctx) = crate::user_task::current_user_task() else {
         return false;
@@ -644,7 +662,23 @@ fn park_pending_future() -> bool {
     // SAFETY: this is the in-flight task's poller-pinned UserTaskCtx. The
     // continuation stays on this task's private kernel stack while asleep.
     let uc = unsafe { &*uctx };
-    crate::handlers::close_kernel_span(uc, current_task_id());
+    let task = current_task_id();
+    crate::handlers::close_kernel_span(uc, task);
+    // What this task waits on, for `/proc/<pid>/stack`: the lock, if a lock
+    // is what this poll is waiting for, and otherwise the kernel code that
+    // parked it (the `poll_blocking` caller).
+    // Which of the lock's waiters this task is (a state dump names the
+    // waiter a lock was handed to; this says which task that is).
+    let waiter = narf_lib::mutex::take_wait_waiter();
+    let site = match narf_lib::mutex::take_wait_site() {
+        Some(lock) => {
+            PARKED_WAITER.lock().insert(task, waiter);
+            lock as *const _ as usize | PARK_SITE_LOCK
+        }
+        None => caller as *const _ as usize,
+    };
+    uc.park_site
+        .store(site, core::sync::atomic::Ordering::Relaxed);
     uc.parked_in_syscall
         .store(true, core::sync::atomic::Ordering::Release);
     // SAFETY: a current stackful task and its executor context were verified
@@ -654,14 +688,181 @@ fn park_pending_future() -> bool {
     // A stackful resume continues here without re-entering UserTaskFuture::poll,
     // so restore the publication another task may have replaced while we slept.
     crate::user_task::install_current(uctx);
+    // Running again: parked on nothing, whatever the syscall does next.
+    uc.parked_in_syscall
+        .store(false, core::sync::atomic::Ordering::Release);
+    uc.park_site.store(0, core::sync::atomic::Ordering::Relaxed);
+    PARKED_WAITER.lock().remove(&task);
     crate::handlers::open_kernel_span(uc);
     true
+}
+
+/// `UserTaskCtx::park_site` bit 0: the site is a lock's `lock()` call.
+/// `Location` is word-aligned, so the bit is free.
+const PARK_SITE_LOCK: usize = 1;
+
+fn location_text(addr: usize) -> Option<alloc::string::String> {
+    if addr == 0 {
+        return None;
+    }
+    // SAFETY: only `&'static Location` addresses are stored in these fields
+    // (bit 0 masked off here).
+    let site = unsafe { &*((addr & !PARK_SITE_LOCK) as *const core::panic::Location<'static>) };
+    Some(alloc::format!("{}:{}", site.file(), site.line()))
+}
+
+fn park_site_of(task: u64) -> usize {
+    crate::task::task_get(task).map_or(0, |t| {
+        t.uctx.park_site.load(core::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// The mutex waiter id of each task parked on a lock, so a dump that names
+/// the waiter a lock was handed to also names the task.
+static PARKED_WAITER: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, u64>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Where task `task` is parked, if it parked waiting for a lock, with the
+/// lock waiter id it holds.
+pub(crate) fn parked_wait_site(task: u64) -> Option<alloc::string::String> {
+    let site = park_site_of(task);
+    if site & PARK_SITE_LOCK == 0 {
+        return None;
+    }
+    let text = location_text(site)?;
+    Some(match PARKED_WAITER.lock().get(&task).copied() {
+        Some(w) if w != 0 => alloc::format!("{text} waiter {w}"),
+        _ => text,
+    })
+}
+
+/// The kernel site that parked task `task`, if it parked on something other
+/// than a lock.
+pub(crate) fn parked_park_site(task: u64) -> Option<alloc::string::String> {
+    let site = park_site_of(task);
+    if site & PARK_SITE_LOCK != 0 {
+        return None;
+    }
+    location_text(site)
+}
+
+/// The scheduling point task `task` yielded at inside a syscall and is
+/// runnable from, if it is there now.
+pub(crate) fn yielded_site(task: u64) -> Option<alloc::string::String> {
+    location_text(crate::task::task_get(task).map_or(0, |t| {
+        t.uctx.yield_site.load(core::sync::atomic::Ordering::Relaxed)
+    }))
+}
+
+/// Linux `cond_resched()`: a scheduling point for kernel code with a long
+/// way still to go.
+///
+/// [`poll_blocking`] and [`poll_io_to_completion`] give up the CPU only when
+/// a future reports `Pending`. A filesystem operation that completes inside
+/// one poll — every btrfs write on a polled block device does — never
+/// reports it, so a loop of such operations runs from its first to its last
+/// with no scheduling point at all, and every task queued on that CPU waits
+/// for the whole loop while other CPUs sit idle. A loop like that calls
+/// this between operations, holding no lock.
+///
+/// Returns `true` when the caller is a task running on its own kernel stack
+/// (a syscall): it has yielded to a runnable peer on this CPU, or had none
+/// (`sched_yield` semantics — `yield_task_fair`). `false` means there is no
+/// such task; an `async` caller then yields through the executor instead.
+///
+/// Either way this CPU reports an RCU quiescent state, as Linux
+/// `cond_resched()` does (`rcu_all_qs`). The executor reports one at every
+/// cooperative poll boundary, but a long syscall with nothing else to run
+/// on its CPU never gets back there — the yield finds no peer and does not
+/// switch — and without a report of its own that CPU would hold every grace
+/// period open for the length of the loop while retired memory piled up.
+/// The caller is at a point where it could equally have parked, which is
+/// the executor's own condition for reporting: no RCU reference is held
+/// across it.
+///
+/// While the task is off its CPU here, `/proc/<pid>/stack` names the caller.
+#[track_caller]
+pub(crate) fn cond_resched() -> bool {
+    {
+        // The report is per CPU: stay on this one while it is made.
+        let _on_this_cpu = narf_scheduler::stackful::preempt_disable();
+        narf_rcu::report_quiescent();
+    }
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return false;
+    }
+    let caller = core::panic::Location::caller();
+    let uctx = crate::user_task::current_user_task();
+    if let Some(uctx) = uctx {
+        // SAFETY: as in `park_pending_future`: the in-flight task's
+        // poller-pinned context.
+        let uc = unsafe { &*uctx };
+        crate::handlers::close_kernel_span(uc, current_task_id());
+        uc.yield_site.store(
+            caller as *const _ as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let yielded = narf_scheduler::stackful::sched_yield_current();
+    if let Some(uctx) = uctx {
+        // The continuation resumes here without re-entering
+        // `UserTaskFuture::poll`: restore the publication a peer replaced.
+        crate::user_task::install_current(uctx);
+        // SAFETY: as above.
+        let uc = unsafe { &*uctx };
+        uc.yield_site.store(0, core::sync::atomic::Ordering::Relaxed);
+        crate::handlers::open_kernel_span(uc);
+    }
+    yielded
+}
+
+/// Waits that found no task to park and fell back to polling in place.
+///
+/// With a user task alive this is a CPU held hostage: the caller is the
+/// executor thread (or an interrupt-time path), the future can only
+/// complete through work other tasks do, and nothing else runs on this CPU
+/// until it does. The fallback still finishes the operation — abandoning a
+/// polled filesystem future would drop it with a lock held and an update
+/// half made — but no production path is supposed to reach it. Kernel
+/// tests assert that the paths which used to (address-space teardown,
+/// `munmap`) leave this counter alone.
+static FALLBACK_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See [`FALLBACK_WAITS`]. Read by the x86_64 `sys_mmap` tests and the
+/// writeback kernel tests only.
+#[cfg(any(target_arch = "x86_64", feature = "kernel-test"))]
+pub(crate) fn fallback_waits() -> u64 {
+    FALLBACK_WAITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one fallback wait and, when a user task could be starved by it,
+/// say who is doing it. Rate-limited: the first few, then every 1024th.
+#[cold]
+fn note_fallback_wait(caller: &core::panic::Location<'_>) {
+    let count = FALLBACK_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if narf_scheduler::live_user_task_count() == 0 {
+        // Boot, shutdown and the in-kernel test harness: nobody to starve.
+        return;
+    }
+    if count > 8 && count % 1024 != 0 {
+        return;
+    }
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "ERROR: filesystem wait with no task to park (cpu held until it completes): {}:{} \
+         [occurrence {}]",
+        caller.file(),
+        caller.line(),
+        count
+    );
 }
 
 /// Drive a filesystem Future to completion inside a synchronous syscall.
 /// `Pending` parks a stackful user task until the future's registered waker
 /// fires. Outside that execution model, retain a bounded spin-pump solely for
 /// kernel tests and early fallback contexts.
+#[track_caller]
 pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     let task_waker = narf_scheduler::stackful::current_stackful_waker();
@@ -674,14 +875,19 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     let mut fallback_polls = 0u64;
     loop {
+        // A site noted by whatever this CPU polled before is not ours.
+        let _ = narf_lib::mutex::take_wait_site();
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
-                if !park_pending_future() {
+                if !park_pending_future(core::panic::Location::caller()) {
                     return None;
                 }
             }
             Poll::Pending => {
+                if fallback_polls == 0 {
+                    note_fallback_wait(core::panic::Location::caller());
+                }
                 sleep_pumps::run();
                 core::hint::spin_loop();
                 fallback_polls += 1;
@@ -697,6 +903,7 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
 /// future (and therefore its DMA ownership) alive for the whole sleep. The
 /// runtime path has no polling ceiling: completion or cancellation must wake
 /// it. Only the non-stackful test fallback retains a finite wedge detector.
+#[track_caller]
 pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     let task_waker = narf_scheduler::stackful::current_stackful_waker();
@@ -708,14 +915,19 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     let mut fallback_polls = 0u64;
     loop {
+        // A site noted by whatever this CPU polled before is not ours.
+        let _ = narf_lib::mutex::take_wait_site();
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
-                if !park_pending_future() {
+                if !park_pending_future(core::panic::Location::caller()) {
                     return None;
                 }
             }
             Poll::Pending => {
+                if fallback_polls == 0 {
+                    note_fallback_wait(core::panic::Location::caller());
+                }
                 sleep_pumps::run();
                 core::hint::spin_loop();
                 fallback_polls += 1;
@@ -1142,6 +1354,36 @@ fn task_nofile_limit(task: u64) -> u64 {
         .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur)
 }
 
+/// `/proc/narf/tasks`, read-only.
+#[derive(Debug)]
+struct NarfTasksFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfTasksFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_tasks_report()
+    }
+}
+
+/// `/proc/narf/mm_holders`, read-only (sweeps RAM on every read).
+#[derive(Debug)]
+struct NarfMmHoldersFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfMmHoldersFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_mm_holders_report()
+    }
+}
+
+/// `/proc/narf/mm_orphans`, read-only.
+#[derive(Debug)]
+struct NarfMmOrphansFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfMmOrphansFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_mm_orphans_report()
+    }
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
     // Publish the descriptor-allocation bound to the fd table. Until this is
@@ -1184,6 +1426,13 @@ pub fn init_per_task_state() {
         crate::proc_ipc_limit_read,
         crate::proc_ipc_limit_write,
     );
+    // `/proc/narf/tasks`: scheduler tasks `/proc` does not list, and what
+    // they still hold (see `narf_tasks_report`).
+    narf_filesystem::procfs::register_proc("narf/tasks", Arc::new(NarfTasksFile));
+    // `/proc/narf/mm_orphans`: address spaces no task reaches, and who still
+    // holds them (see `narf_mm_orphans_report`).
+    narf_filesystem::procfs::register_proc("narf/mm_orphans", Arc::new(NarfMmOrphansFile));
+    narf_filesystem::procfs::register_proc("narf/mm_holders", Arc::new(NarfMmHoldersFile));
     rlimit_init();
     nice_init();
     umask_init();
@@ -1753,7 +2002,7 @@ fn open_impl_reserved(
         let errno = if resolve_dir_absolute(parent).is_some() {
             EISDIR
         } else {
-            path_lookup_errno(path)
+            path_lookup_errno(path, None)
         };
         ctx.set_return(errno_ret(errno));
         return;
@@ -1845,7 +2094,10 @@ fn open_impl_reserved(
                         status_flags: open_status_flags,
                     });
                 match new_fd {
-                    Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                    Some(n) => {
+                        crate::mqueue::register_fd_tmpfile(task, n, path, current_mount_id_at(path));
+                        ctx.set_return(SyscallReturn::ok(n as u64));
+                    }
                     None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
             }
@@ -1862,7 +2114,7 @@ fn open_impl_reserved(
                 let errno = if stat_path_dir_aware(path).is_some() {
                     ENOTDIR
                 } else {
-                    path_lookup_errno(path)
+                    path_lookup_errno(path, None)
                 };
                 ctx.set_return(errno_ret(errno));
             }
@@ -1966,6 +2218,11 @@ fn open_impl_reserved(
     //   the registry finds the longest-matching mount.
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
+    // A walk that could not be carried out — the device failed, this task
+    // was killed while it waited, memory ran out — is the open's error, as
+    // `lookup_slow`'s ERR_PTR is in `path_openat`. It is not a miss: the
+    // directory and O_CREAT fallbacks below must not run on it.
+    let mut walk_failure: Option<narf_filesystem::FsError> = None;
     let ops = if let Some(FastCreateResolution::Existing { node, .. }) = fast_create.as_ref() {
         Some(Arc::clone(node))
     } else if fast_create.is_some() {
@@ -1978,8 +2235,15 @@ fn open_impl_reserved(
                 // here and is handled by the directory branch below.
                 fs.root_file()
             } else {
-                poll_blocking(narf_filesystem::resolve_async_dentry(root, rel))
-                    .and_then(|r| r.ok())
+                match poll_blocking(narf_filesystem::resolve_async_dentry(root, rel))? {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        if error.is_walk_failure() {
+                            walk_failure = Some(error);
+                        }
+                        None
+                    }
+                }
             }
         })
         .flatten()
@@ -1998,6 +2262,10 @@ fn open_impl_reserved(
             })
             .flatten()
     };
+    if let (None, Some(error)) = (ops.as_ref(), walk_failure) {
+        ctx.set_return(errno_ret(copy_fs_errno(error)));
+        return;
+    }
 
     // Directory open: hand back a directory fd (a `DirFdFile` carrying the
     // `DirOps`) when the path names a directory, either because it didn't
@@ -2180,6 +2448,7 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::TimedOut => 62,         // ETIME
                         narf_filesystem::FsError::Canceled => 125,        // ECANCELED
+                        narf_filesystem::FsError::Interrupted => 4,       // EINTR
                         narf_filesystem::FsError::NoSpace => 28,
                         narf_filesystem::FsError::NoDevice => 19, // ENODEV
                         narf_filesystem::FsError::OutOfMemory => 12,
@@ -2202,7 +2471,7 @@ fn open_impl_reserved(
                 // a device error for a caller that merely named a missing
                 // directory.
                 None => {
-                    ctx.set_return(errno_ret(path_lookup_errno(path)));
+                    ctx.set_return(errno_ret(path_lookup_errno(path, None)));
                     return;
                 }
                 Some(None) => {
@@ -2219,7 +2488,7 @@ fn open_impl_reserved(
             // as a fatal EPERM. A non-directory prefix component is
             // -ENOTDIR (`open("/etc/passwd/x")`), as for stat — see
             // `path_lookup_errno`.
-            ctx.set_return(errno_ret(path_lookup_errno(path)));
+            ctx.set_return(errno_ret(path_lookup_errno(path, None)));
             return;
         }
     };
@@ -2484,7 +2753,16 @@ fn open_impl_reserved(
         && ops.stat().mode.file_type == narf_filesystem::FileType::File
         && ops.stat().size != 0
     {
-        match poll_blocking(ops.truncate(0)) {
+        // Excluded from writeback, and followed by the cache invalidation:
+        // see `mapped_file::size_change_serialized`.
+        let Some(outcome) = crate::mapped_file::size_change_serialized(&ops, || {
+            poll_blocking(ops.truncate(0))
+        }) else {
+            // Killed while waiting for the file's writeback lock.
+            ctx.set_return(errno_ret(EINTR));
+            return;
+        };
+        match outcome {
             Some(Ok(())) => {
                 file_remove_privs(ops.as_ref(), task);
                 crate::mqueue::notify_modify_path(path);
@@ -2679,6 +2957,10 @@ fn open_fifo(
         }
     };
 
+    // The file is open on `_path` from here on, whether or not this open
+    // goes on to wait for a peer.
+    crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
+
     // Opening either direction changes the FIFO peer condition. Blocking
     // openers use the normal deduplicated I/O-waker registry below; publish
     // the transition only after the handle/open-count is visible. The shared
@@ -2691,7 +2973,6 @@ fn open_fifo(
         || (can_read && shared.writer_count() > 0)
         || (can_write && shared.reader_count() > 0);
     if peer_ready {
-        crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
         return;
     }
@@ -3273,7 +3554,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            return SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64);
+            return SyscallReturn::ok((-path_lookup_errno(path_ref, None)) as u64);
         }
     };
     if let Err(errno) = mnt_want_write(path_ref) {
@@ -3910,8 +4191,8 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
     let (s, ino, rdev, uid, gid, attrs) = match stat_ino_path_dir_aware_ext(path, follow_final) {
-        Some(tuple) => tuple,
-        None => {
+        Ok(tuple) => tuple,
+        Err(error) => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
             //
@@ -3921,7 +4202,9 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
             // a prefix is a file and creating it never will work. The
             // resolver reports no reason, so the walk is re-classified on
             // this failure path — see `path_lookup_errno`.
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path)) as u64));
+            ctx.set_return(SyscallReturn::ok(
+                (-path_lookup_errno(path, Some(error))) as u64,
+            ));
             return;
         }
     };
@@ -4080,6 +4363,9 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,
         FsError::QuotaExceeded => -EDQUOT,
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         _ => -EPERM,  // `if (!dir->i_op->unlink)`
     };
@@ -4137,6 +4423,9 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,  // from ->rmdir
         FsError::QuotaExceeded => -EDQUOT,  // ditto
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         FsError::Unsupported => -EPERM,  // `if (!dir->i_op->rmdir)`
         _ => -EPERM,
@@ -4172,6 +4461,9 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::SymlinkLoop => -ELOOP,
         FsError::NoSpace => -ENOSPC,
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         // "everything else → EPERM", per the doc comment above.
         _ => -EPERM,
@@ -4239,8 +4531,9 @@ fn path_is_strictly_under(path: &str, ancestor: &str) -> bool {
 }
 
 /// What `lookup_one_qstr_excl` finds at a normalised absolute path, without
-/// following a final symlink: `None` = negative dentry, `Some(is_dir)`.
-fn namespace_node_kind(path: &str) -> Option<bool> {
+/// following a final symlink: `Ok(is_dir)`, or the lookup's error (a
+/// negative dentry is `NotFound`).
+fn namespace_node_kind(path: &str) -> Result<bool, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_ext(path, false)
         .map(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
 }
@@ -4259,14 +4552,16 @@ fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String
     // The dir-aware stat covers real directories, mount roots, synthetic
     // mount ancestors and — since intermediate components are followed —
     // a symlink to a directory (`/proc/self/…`).
-    if stat_ino_path_dir_aware(dir)
-        .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+    let found = stat_ino_path_dir_aware(dir);
+    if found
+        .as_ref()
+        .is_ok_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
     {
         return Ok(alloc::string::String::from(dir));
     }
     // `path_lookup_errno` classifies every component BEFORE the leaf, so
     // hand it a path whose parent is `dir`.
-    Err(-path_lookup_errno(&alloc::format!("{dir}/.")))
+    Err(-path_lookup_errno(&alloc::format!("{dir}/."), found.err()))
 }
 
 /// `fs/namei.c::filename_create` up to (not including) `mnt_want_write`,
@@ -4287,8 +4582,15 @@ fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String
 /// node.
 fn filename_create_check(path: &str, last: LastComponent) -> Result<(), i64> {
     parentat_dir(path, last)?;
-    if !last.is_norm() || namespace_node_kind(path).is_some() {
+    if !last.is_norm() {
         return Err(-EEXIST);
+    }
+    match namespace_node_kind(path) {
+        Ok(_) => return Err(-EEXIST),
+        // `filename_create`'s lookup failed outright: its error, not a
+        // creation over a name nobody could look up.
+        Err(error) if error.is_walk_failure() => return Err(-copy_fs_errno(error)),
+        Err(_) => {}
     }
     if last == LastComponent::NormSlash {
         return Err(-ENOENT);
@@ -4662,9 +4964,9 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     // -ENOTDIR) whatever is wrong with the new name. A trailing slash makes
     // the lookup demand a directory: `link("file/", x)` is -ENOTDIR.
     let old_is_dir = match namespace_node_kind(&old_path) {
-        Some(is_dir) => is_dir,
-        None => {
-            ctx.set_return(errno_ret(path_lookup_errno(&old_path)));
+        Ok(is_dir) => is_dir,
+        Err(error) => {
+            ctx.set_return(errno_ret(path_lookup_errno(&old_path, Some(error))));
             return;
         }
     };
@@ -4820,7 +5122,7 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     let Some(dir) = resolve_dir_absolute(dir_path) else {
         // The walk to the target directory failed; say why (ENOENT, or
         // ENOTDIR for a file component) as `link_path_walk` does.
-        return -path_lookup_errno(new_path);
+        return -path_lookup_errno(new_path, None);
     };
     match poll_blocking(dir.link_node(&new_leaf, node)) {
         Some(Ok(())) => {
@@ -4948,7 +5250,7 @@ fn readlink_impl(
             if stat_path_dir_aware(&path).is_some() {
                 ctx.set_return(errno_ret(EINVAL));
             } else {
-                ctx.set_return(errno_ret(path_lookup_errno(&path)));
+                ctx.set_return(errno_ret(path_lookup_errno(&path, None)));
             }
             return;
         }
@@ -5171,7 +5473,7 @@ impl CopyFdEndpoint {
     }
 }
 
-fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
+pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
     match error {
         narf_filesystem::FsError::NotFound => 2,
         narf_filesystem::FsError::NoSuchProcess => 3, // ESRCH
@@ -5208,6 +5510,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::WouldBlock => EAGAIN,
         narf_filesystem::FsError::TimedOut => 62,  // ETIME
         narf_filesystem::FsError::Canceled => 125, // ECANCELED
+        narf_filesystem::FsError::Interrupted => EINTR,
     }
 }
 
@@ -5492,6 +5795,13 @@ fn copy_fd_to_fd(
     let use_off_ptr = explicit_in_off.is_some();
     let use_out_off_ptr = explicit_out_off.is_some();
     let same_description = Arc::ptr_eq(&input.description, &output.description);
+    // `sendfile`/`splice` read the source through the page cache on Linux,
+    // so they see a `MAP_SHARED` store that has not been written back. The
+    // pipe paths below hand out the filesystem's own pages; commit the
+    // source's dirty mapped pages first so those pages hold them.
+    if !input.ops.is_stream() {
+        crate::mapped_file::flush_file_for_read(&input.ops);
+    }
     // Pipes and other streams have no f_pos. Their syscall modules reject an
     // explicit offset before reaching this core, and an implicit transfer must
     // neither serialize nor mutate the otherwise-unused description cursor.
@@ -5575,6 +5885,7 @@ fn copy_fd_to_fd(
             } else {
                 let mut sink_off = step_out_off;
                 crate::pipe::splice_to_sink(input_ops.as_ref(), want, |bytes| {
+                    let stamp = crate::mapped_file::write_stamp();
                     // The payload mutex is sleepable. Keep the source prefix
                     // until the sink accepts it, including an asynchronous sink.
                     let result = poll_blocking(output_ops.write(sink_off, bytes))
@@ -5585,6 +5896,7 @@ fn copy_fd_to_fd(
                                 output_ops,
                                 sink_off,
                                 &bytes[..written],
+                                stamp,
                             );
                         }
                         sink_off = sink_off.saturating_add(written as u64);
@@ -5596,6 +5908,8 @@ fn copy_fd_to_fd(
             crate::pipe::splice_from_source(input_ops.as_ref(), in_off, output_ops.as_ref(), want)
         } else {
             let mut kbuf = alloc::vec![0u8; want];
+            // (No overlay here: `copy_fd_to_fd` committed the source's
+            // dirty mapped pages before the loop.)
             let n = match poll_blocking(input_ops.read(in_off, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
             {
@@ -5611,6 +5925,7 @@ fn copy_fd_to_fd(
             if n == 0 {
                 break;
             }
+            let stamp = crate::mapped_file::write_stamp();
             match poll_blocking(output_ops.write(step_out_off, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
             {
@@ -5620,6 +5935,7 @@ fn copy_fd_to_fd(
                             output_ops,
                             step_out_off,
                             &kbuf[..written],
+                            stamp,
                         );
                     }
                     Ok(written)
@@ -7773,7 +8089,8 @@ fn xattr_lookup(
     // With LOOKUP_FOLLOW a dangling final symlink is -ENOENT too: the walk
     // above left it unexpanded, and the xattr resolver (which never follows)
     // would otherwise find the link itself.
-    let exists = stat_ino_path_dir_aware_ext(&resolved, follow).is_some()
+    let found = stat_ino_path_dir_aware_ext(&resolved, follow);
+    let exists = found.is_ok()
         || match xattr_target(&resolved) {
             Some(XattrTarget::File(file)) => {
                 !follow || file.stat().mode.file_type != narf_filesystem::FileType::Symlink
@@ -7782,7 +8099,7 @@ fn xattr_lookup(
             None => false,
         };
     if !exists {
-        return Err(-path_lookup_errno(&resolved));
+        return Err(-path_lookup_errno(&resolved, found.err()));
     }
     Ok((resolved, follow))
 }
@@ -8817,9 +9134,11 @@ pub(crate) fn do_utimes(
         .or_else(|| resolve_dir_absolute(&path).map(XattrTarget::Dir));
     // A node only `stat` can see (a synthetic filesystem) still exists; it
     // keeps the old lenient accept, since there is nothing to stamp.
-    if target.is_none() && stat_ino_path_dir_aware_ext(&path, follow).is_none() {
-        ctx.set_return(errno_ret(path_lookup_errno(&path)));
-        return;
+    if target.is_none() {
+        if let Err(error) = stat_ino_path_dir_aware_ext(&path, follow) {
+            ctx.set_return(errno_ret(path_lookup_errno(&path, Some(error))));
+            return;
+        }
     }
     let (atime, mtime, touch) = match utimes_request(times) {
         Ok(req) => req,
@@ -10365,21 +10684,14 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                 }
             };
             // `generic_perform_write`: killable, see `killable_wait::write`.
-            let outcome = match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
+            // `killable_wait::write` also tells the file's cached pages.
+            match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
                 Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
                 Err(crate::killable_wait::Killed) => {
                     ctx.set_return(errno_ret(EINTR));
                     return;
                 }
-            };
-            // Keep any live generic-fallback MAP_SHARED page of this file
-            // coherent with the write (mapped_file::note_file_written).
-            if let Ok(n) = &outcome {
-                if *n != 0 && *n <= payload.len() {
-                    crate::mapped_file::note_file_written(&endpoint.ops, off, &payload[..*n]);
-                }
             }
-            outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
             // `filemap_read`: killable, see `killable_wait::read`.
@@ -10693,7 +11005,7 @@ pub fn retain_external_shared_frame(phys: u64) {
             return;
         }
     }
-    let _ = crate::mapped_file::retain_shared_file_page(phys);
+    let _ = crate::mapped_file::retain_external_unclaimed(phys);
 }
 
 pub fn release_external_shared_frame(phys: u64) {
@@ -10708,7 +11020,7 @@ pub fn release_external_shared_frame(phys: u64) {
             return;
         }
     }
-    let _ = crate::mapped_file::release_shared_file_page(phys);
+    let _ = crate::mapped_file::release_external_unclaimed(phys);
 }
 
 // ── FirmwareInstall — arg0=name_ptr, arg1=name_len,
@@ -11995,7 +12307,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // have no base-page demand-fault path.
         // `clone_for_fork` has already write-protected only the present parent
         // leaves whose backing became newly shared.
-        alloc::sync::Arc::new(dup)
+        let dup = alloc::sync::Arc::new(dup);
+        narf_memory::as_origin::note_arc(&dup);
+        dup
     };
     // Reserve the pidfd number before allocating a PID or publishing child
     // state. Linux pidfd_prepare makes descriptor exhaustion fail the entire
@@ -12470,7 +12784,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     } else {
         crate::fd::fork(parent_pid, child_tid.raw());
     }
-    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
 
     // CLONE_PIDFD: publish the already-reserved descriptor only after the
     // child's fd-table copy. A non-CLONE_FILES child therefore cannot inherit
@@ -13837,6 +14150,12 @@ struct PendingTermination {
     group: bool,
 }
 
+/// [`narf_power::orderly::MappedPageSync`]: see `wait_init`.
+fn mapped_page_sync(
+) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+    alloc::boxed::Box::pin(crate::mapped_file::sync_all_files_async())
+}
+
 pub fn wait_init() {
     // Once per boot: wait_init runs again on every test reset, and the pump
     // registry has a fixed number of slots.
@@ -13845,9 +14164,14 @@ pub fn wait_init() {
     if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         narf_scheduler::sleep_pumps::register(sysrq_pump);
     }
-    // Every reboot / power-off / halt syncs every mounted filesystem before
-    // the device shutdown hooks (NVMe Flush + CC.SHN) run. Idempotent.
-    narf_power::system::install_pre_shutdown_sync(pre_shutdown_sync);
+    // The orderly power-off (power button with no logind, thermal trip)
+    // runs `kernel.poweroff_cmd` through this usermode helper, as Linux
+    // `__orderly_poweroff` does. `reboot(2)` itself does not sync: userspace
+    // has synced and remounted read-only before it calls it. Idempotent.
+    narf_power::orderly::install_usermode_helper(crate::umh::call_usermodehelper_exec);
+    // The forced fallback's emergency sync writes the unwritten mapped pages
+    // through this hook before it syncs the filesystems.
+    narf_power::orderly::install_mapped_page_sync(mapped_page_sync);
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
     crate::ptrace::ptrace_init();
@@ -13873,7 +14197,7 @@ pub fn wait_init() {
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
     crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(shared_pending_process_exit);
-    crate::user_task::register_process_exit_observer(reclaim_exiting_process_memory);
+    crate::user_task::register_process_exit_observer(release_exiting_process_mm);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -14336,10 +14660,21 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         unsafe {
             // Mark the park so the kernel-time bracket skips this
             // syscall's fold (see UserTaskCtx::parked_in_syscall).
+            (*uctx).park_site.store(
+                core::panic::Location::caller() as *const _ as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
             (*uctx)
                 .parked_in_syscall
                 .store(true, core::sync::atomic::Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
+            // Running again: parked on nothing until the next park.
+            (*uctx)
+                .parked_in_syscall
+                .store(false, core::sync::atomic::Ordering::Release);
+            (*uctx)
+                .park_site
+                .store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -15034,7 +15369,6 @@ fn release_task_tables(tid: u64) {
     fs_release(tid);
     task_map_remove(&PERSONALITY_TABLE, tid);
     remove_mount_namespace(tid);
-    crate::mqueue::release_task_fd_paths(tid);
 
     // Memory policy. `MBIND_TABLE` is deliberately NOT retired here: range
     // policies are keyed by address space and die with it
@@ -15391,31 +15725,21 @@ fn shared_pending_process_exit(pid: u64, tid: u64) {
     release_shared_pending(pid_to_task_raw(pid).unwrap_or(tid));
 }
 
-/// Return a dying process's mappings before notifying its parent. The task
-/// registry deliberately retains a zombie until wait reaps it, and the
-/// scheduler/RCU path can retain its `AddressSpace` longer still; leaving VMA
-/// and page-table storage attached until final `Drop` lets a fork storm consume
-/// nearly all RAM even though every child has already exited.
+/// Linux `exit_mm` → `mmput` for a process's last thread, before its parent
+/// is notified (`exit_notify` comes after `exit_mm`): the thread's user
+/// reference on its address space goes now, in its own context, and when it
+/// is the last user of that space — no other thread, no `CLONE_VM` process,
+/// no accessor holding `mmget` — `exit_mmap` returns every mapping and page
+/// table here. A parent woken to launch its next child therefore observes
+/// the memory back, and the teardown never runs later in the executor where
+/// the dead task's slot is dropped.
 ///
-/// `notify_task_exited` invokes process observers only after the last thread's
-/// robust-futex, clear-child-tid and rusage user-memory accesses have finished.
-/// The memory exit-reclaimer is idempotent, invalidates every cached
-/// translation before returning backing frames, keeps the root alive for the
-/// scheduler's imminent switch, and refuses an address space that was ever
-/// shared with `CLONE_VM`. We intentionally retain that conservative refusal:
-/// the task lookup itself holds an extra `Arc`, so an exit observer cannot
-/// prove sole ownership from `Arc::strong_count`.
-/// Register this after SysV/process signal cleanup but before `on_child_exit`,
-/// so a parent woken to launch its next child observes the reclaimed memory.
-fn reclaim_exiting_process_memory(_pid: u64, tid: u64) {
-    if let Some(address_space) = address_space_of_task(tid) {
-        // SAFETY: process observers run only for the last thread, after every
-        // exit-time user-memory access. This task exits through the stackful
-        // scheduler immediately after the observer fan-out and cannot return
-        // to userspace; the callee independently refuses CLONE_VM address
-        // spaces whose ownership this layer cannot prove exclusive.
-        let _ = unsafe { address_space.reclaim_unshared_on_exit() };
-    }
+/// `notify_task_exited` invokes process observers only after the last
+/// thread's robust-futex, clear-child-tid and rusage user-memory accesses
+/// have finished; registered after SysV/process signal cleanup and before
+/// `on_child_exit`.
+fn release_exiting_process_mm(_pid: u64, tid: u64) {
+    narf_scheduler::exit_mm(narf_scheduler::TaskId(tid));
 }
 
 /// Test-only: run the AIO-context exit sweep for `tid` (the
@@ -15475,7 +15799,6 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
             .is_some_and(|m| m.contains_key(&tid)),
         1 << 11,
     );
-    r |= has(crate::mqueue::task_has_fd_paths(tid), 1 << 12);
     r
 }
 
@@ -16128,6 +16451,22 @@ pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
 /// Translate a scheduler TaskId to the user-visible ProcessId registered
 /// at fork/spawn time. Returns `None` when the task has no registered
 /// ProcessId (kernel-only tasks, test stubs).
+/// The system call a stackful task is parked in, for the scheduler's
+/// park-with-CPU-local-state report (`set_park_syscall_hook`): fills
+/// `syscall` with `[nr, arg0..arg5, user_sp, user_pc]` and returns true, or
+/// returns false when the task is not a user task in a system call or its
+/// registry shard is contended.
+///
+/// Runs on the parking task's own stack just before it switches out, so the
+/// registry is only `try_lock`ed, no reference is cloned and nothing
+/// allocates.
+pub fn park_syscall_frame(task_raw: u64, syscall: &mut [u64; 9]) -> bool {
+    crate::task::try_with_task(task_raw, |task| task.uctx.blocked_syscall_frame())
+        .flatten()
+        .map(|frame| *syscall = frame)
+        .is_some()
+}
+
 pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
     if let Some((pid, _uid, _gid)) = crate::task::current_cached_identity(task_raw) {
         return Some(pid);
@@ -20941,45 +21280,3 @@ pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
 /// continue to use `narf_userspace::handlers::sleep_pumps`.
 pub use narf_scheduler::sleep_pumps;
 
-/// Regression coverage for the shutdown sync wiring: `wait_init` — the
-/// userspace init a real boot runs once — must install the production
-/// pre-shutdown filesystem sync into `narf_power::system`, so every
-/// reboot / power-off / halt syncs filesystems before the device
-/// shutdown hooks (NVMe Flush + CC.SHN) run.
-///
-/// The assertion lives here, not in the `power/shutdown` ordering smoke:
-/// the installer is this crate's boot init, and in a kernel-test boot it
-/// runs only when a userspace test establishes it. The power smoke used
-/// to assert the installed hook itself and passed only in boots where a
-/// userspace test had already run — under the split kernel-test runner
-/// its boot contains no userspace test, and the assertion failed on a
-/// precondition this layer owns. Assert identity, not mere presence:
-/// the installed hook must be exactly `pre_shutdown_sync`.
-#[cfg(feature = "kernel-test")]
-mod pre_shutdown_sync_install_tests {
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    fn smoke_userspace_wait_init_installs_pre_shutdown_sync() -> TestResult {
-        super::wait_init();
-        let installed = narf_power::system::__swap_pre_shutdown_sync_for_test(None);
-        // Restore before asserting: a failure must not leave the slot
-        // empty for later tests in the boot.
-        if let Some(hook) = installed {
-            narf_power::system::install_pre_shutdown_sync(hook);
-        }
-        // Compare in the slot's own representation — the hook stored as a
-        // code address (`install_pre_shutdown_sync` stores `hook as usize`);
-        // a fn-pointer `==` is not a meaningful comparison.
-        let expected: narf_power::system::PreShutdownSync = super::pre_shutdown_sync;
-        if installed.map(|hook| hook as usize) != Some(expected as usize) {
-            return TestResult::Fail(
-                "wait_init did not install the production pre-shutdown sync: reboot would skip the fs sync",
-            );
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "userspace",
-        smoke_userspace_wait_init_installs_pre_shutdown_sync
-    );
-}

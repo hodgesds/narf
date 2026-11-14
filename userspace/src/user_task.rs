@@ -85,11 +85,71 @@ fn arm_park_timer(
     slack_ns: u64,
     waker: &core::task::Waker,
 ) {
+    arm_park_timer_on(
+        handle,
+        narf_scheduler::narf_time::hrtimer::ClockId::Monotonic,
+        expires_ns,
+        slack_ns,
+        waker,
+    );
+}
+
+/// [`arm_park_timer`] on a named clock's base (`expires_ns` in that clock).
+fn arm_park_timer_on(
+    handle: &mut Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
+    clock: narf_scheduler::narf_time::hrtimer::ClockId,
+    expires_ns: u64,
+    slack_ns: u64,
+    waker: &core::task::Waker,
+) {
     use narf_scheduler::narf_time::hrtimer::{HrtimerMode, SleepHandle};
-    match handle.as_ref() {
-        Some(h) => h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker),
-        None => *handle = Some(SleepHandle::arm(expires_ns, slack_ns, waker)),
+    if handle.as_ref().is_some_and(|h| h.timer().clock() != clock) {
+        // A sleeper's clock is fixed at setup; a park on another clock gets
+        // a fresh one (the old one is cancelled as it drops).
+        *handle = None;
     }
+    let h = handle.get_or_insert_with(|| SleepHandle::new(clock));
+    h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker);
+}
+
+/// Record that the park deadline `mono_deadline_ns` stands for the absolute
+/// CLOCK_REALTIME expiry `realtime_ns` (absolute `clock_nanosleep`,
+/// `FUTEX_CLOCK_REALTIME` waits). The park then runs its timer on the
+/// REALTIME base, so a clock step (`clock_was_set`) moves it, as in Linux.
+pub(crate) fn note_realtime_park(uc: &UserTaskCtx, mono_deadline_ns: u64, realtime_ns: u64) {
+    uc.sleep_realtime_ns.store(realtime_ns, Ordering::Release);
+    uc.sleep_realtime_mono_ns
+        .store(mono_deadline_ns, Ordering::Release);
+}
+
+/// The clock and expiry a park with deadline `deadline` (monotonic ns) runs
+/// its timer on. A deadline recorded by [`note_realtime_park`] is
+/// re-derived from its wall-clock expiry against the current wall offset —
+/// and `sleep_deadline_ns` updated — so every reader sees the moved
+/// deadline after a clock step. Any other deadline is monotonic.
+fn park_timer_target(
+    uc: &UserTaskCtx,
+    deadline: u64,
+) -> (narf_scheduler::narf_time::hrtimer::ClockId, u64, u64) {
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+    let realtime = uc.sleep_realtime_ns.load(Ordering::Acquire);
+    if realtime == 0
+        || deadline == u64::MAX
+        || uc.sleep_realtime_mono_ns.load(Ordering::Acquire) != deadline
+    {
+        return (ClockId::Monotonic, deadline, deadline);
+    }
+    let offset = narf_scheduler::narf_time::wall_offset_ns();
+    let mono = (realtime as i128 - offset as i128).clamp(1, (u64::MAX - 1) as i128) as u64;
+    if mono != deadline
+        && uc
+            .sleep_deadline_ns
+            .compare_exchange(deadline, mono, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        uc.sleep_realtime_mono_ns.store(mono, Ordering::Release);
+    }
+    (ClockId::Realtime, realtime, mono)
 }
 
 /// Per-task context the polling routine installs in
@@ -128,6 +188,12 @@ pub struct UserTaskCtx {
     pub timer_slack_ns: AtomicU64,
     /// `current->default_timer_slack_ns`: what `PR_SET_TIMERSLACK(0)` restores.
     pub default_timer_slack_ns: AtomicU64,
+    /// Absolute CLOCK_REALTIME expiry of the current park, valid while
+    /// `sleep_realtime_mono_ns == sleep_deadline_ns` (see
+    /// `note_realtime_park`); 0 = none.
+    pub sleep_realtime_ns: AtomicU64,
+    /// The monotonic park deadline `sleep_realtime_ns` was converted to.
+    pub sleep_realtime_mono_ns: AtomicU64,
     /// Set true by `sys_epoll_wait`/`sys_poll` while parked so the
     /// poll routine registers this task's waker in the net-readiness
     /// table (`crate::handlers::register_io_waiter`). When inbound TCP
@@ -330,10 +396,29 @@ pub struct UserTaskCtx {
     /// and skips the fold when set (matching the longjmp paths, which
     /// never reach the fold at all).
     pub parked_in_syscall: core::sync::atomic::AtomicBool,
+    /// The raw number of the syscall this task is executing, plus one; 0
+    /// outside a syscall. `/proc/<pid>/stack` names it for a task that is
+    /// inside a syscall but not parked (on a CPU, or runnable): such a task
+    /// has no stable frame to decode, and used to report nothing at all.
+    pub in_syscall: core::sync::atomic::AtomicU32,
+    /// What this task is parked on, for `/proc/<pid>/stack`: the address of
+    /// a `&'static Location` (the lock's `lock()` call site with bit 0 set,
+    /// or the kernel site that parked it with bit 0 clear), 0 when parked on
+    /// nothing nameable or not parked. Lock-free so a park pays one store.
+    pub park_site: core::sync::atomic::AtomicUsize,
+    /// The scheduling point (`cond_resched` caller) this task yielded at
+    /// and is runnable from, as a `&'static Location` address; 0 otherwise.
+    pub yield_site: core::sync::atomic::AtomicUsize,
     /// Top of this task's own kernel stack (0 when it has none): where its
     /// trap/syscall register frame lives while it is parked, Linux's
     /// `task_pt_regs()`. Written once, the first time the task runs.
     pub kernel_stack_top: AtomicU64,
+    /// The polling future's `UserProcess`, published by its first poll (the
+    /// future is pinned in its task for the task's life). An own-stack exec
+    /// never returns to that poll, so it installs the new address space here
+    /// itself — otherwise the future keeps the pre-exec address space alive
+    /// until the task exits (Linux `exec_mmap` drops the old mm at exec).
+    process: core::sync::atomic::AtomicPtr<crate::UserProcess>,
     /// Non-zero while this task is parked in a blocked F_SETLKW: the
     /// lock-table key it waits on. `park_should_block` registers the
     /// task's waker on `fd::locks`' per-key waiter queue through this,
@@ -495,6 +580,10 @@ pub struct UserTaskCtx {
     /// delayed dequeued waker can never observe a new wait in the old record.
     pub(crate) futex_wait_cache:
         narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<crate::handlers::FutexQ>>>,
+    /// Timer-wheel timeout for coarse park backstops (the console
+    /// byte-waker fallback), created on first use.
+    pub coarse_timeout:
+        narf_lib::sync::IrqSafeSpinLock<Option<narf_scheduler::narf_time::timer::TimeoutHandle>>,
     /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
     /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
     /// such a wait through `futex_wait_restart` with the stored expiry, so
@@ -646,6 +735,11 @@ impl Default for UserTaskCtx {
     }
 }
 
+/// Syscall-number slot of a frame parked outside any syscall (an exception
+/// or interrupt from user mode): Linux's -1, which `/proc/<pid>/syscall`
+/// prints as `-1 <sp> <pc>`.
+pub const NOT_IN_SYSCALL: u64 = u64::MAX;
+
 /// Syscall number + six arguments from a parked task's saved registers (see
 /// [`UserTaskCtx::blocked_syscall`] for the layouts). `top` is the task's own
 /// kernel stack top, or 0; `state` is its longjmp-model [`UserState`] buffer.
@@ -663,10 +757,18 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
         // task's kernel stack.
         let last = unsafe { core::ptr::read_volatile((top - 8) as *const u64) };
         if last & 3 == 3 && last <= 0xffff {
-            // `int 0x80`: a TrapFrame ends at `top` (its last word is SS).
+            // A TrapFrame ends at `top` (its last word is SS): `int 0x80`, or
+            // an exception or interrupt taken from user mode.
             let f = top - core::mem::size_of::<TrapFrame>() as u64;
             // SAFETY: as above.
             let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
+            if t.vector != 0x80 {
+                // Parked outside any syscall — a page fault waiting for a
+                // read, say. Linux's `syscall_get_nr` is -1 there (orig_ax),
+                // and `task_current_syscall` reports only SP and PC; the
+                // user's rax is not a syscall number.
+                return Some([NOT_IN_SYSCALL, 0, 0, 0, 0, 0, 0, t.rsp, t.rip]);
+            }
             return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9, t.rsp, t.rip]);
         }
         // `syscall`: UserState below the 16-byte domain snapshot.
@@ -780,17 +882,43 @@ impl UserTaskCtx {
         if !self.parked_in_syscall.load(Ordering::Acquire) {
             return None;
         }
+        let nr = if regs[0] == NOT_IN_SYSCALL {
+            NOT_IN_SYSCALL
+        } else {
+            u64::from(crate::syscall::syscall_number(regs[0] as u32))
+        };
         Some([
-            u64::from(crate::syscall::syscall_number(regs[0] as u32)),
-            regs[1],
-            regs[2],
-            regs[3],
-            regs[4],
-            regs[5],
-            regs[6],
-            regs[7],
-            regs[8],
+            nr, regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8],
         ])
+    }
+
+    /// Publish the polling future's pinned `UserProcess` (see `process`).
+    fn publish_process(&self, process: &mut crate::UserProcess) {
+        self.process.store(process, Ordering::Release);
+    }
+
+    /// Install `address_space` as the polling future's own reference after
+    /// an own-stack exec, returning the one it replaces — the pre-exec space,
+    /// which the caller drops once the new root is active. `None` when no
+    /// future was published (a task not run by a `UserTaskFuture`).
+    ///
+    /// # Safety
+    /// Only the task itself may call this, from its own exec on its own
+    /// stack: its future is pinned in the task and is not being polled.
+    pub(crate) unsafe fn replace_process_address_space(
+        &self,
+        address_space: alloc::sync::Arc<narf_memory::AddressSpace>,
+    ) -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        let process = self.process.load(Ordering::Acquire);
+        if process.is_null() {
+            return None;
+        }
+        // SAFETY: caller contract — the pinned future outlives this call and
+        // nothing else accesses its `process` while the task runs its exec.
+        Some(core::mem::replace(
+            unsafe { &mut (*process).address_space },
+            address_space,
+        ))
     }
 
     /// Record this task's kernel stack top the first time its future runs on
@@ -819,6 +947,8 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            sleep_realtime_ns: AtomicU64::new(0),
+            sleep_realtime_mono_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
@@ -848,7 +978,11 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_rusage_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
+            in_syscall: core::sync::atomic::AtomicU32::new(0),
+            park_site: core::sync::atomic::AtomicUsize::new(0),
+            yield_site: core::sync::atomic::AtomicUsize::new(0),
             kernel_stack_top: AtomicU64::new(0),
+            process: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
             sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
@@ -868,6 +1002,7 @@ impl UserTaskCtx {
             scheduler_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             signal_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_wait_cache: narf_lib::sync::IrqSafeSpinLock::new(None),
+            coarse_timeout: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
             nanosleep_restart_req: AtomicU64::new(0),
@@ -1226,6 +1361,49 @@ mod current_user_task_source_tests {
     );
 }
 
+#[cfg(feature = "kernel-test")]
+mod realtime_park_tests {
+    use super::{note_realtime_park, park_timer_target, UserTaskCtx};
+    use core::sync::atomic::Ordering;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+
+    /// An absolute CLOCK_REALTIME park (`clock_nanosleep(TIMER_ABSTIME)`,
+    /// `FUTEX_CLOCK_REALTIME`) runs its timer on the REALTIME base at the
+    /// wall-clock expiry, and its monotonic deadline follows a clock step,
+    /// as Linux's REALTIME hrtimer sleeper does. A monotonic park is
+    /// untouched by the step.
+    fn smoke_realtime_park_follows_clock_step() -> TestResult {
+        const STEP: i64 = 5_000_000_000;
+        let uc = UserTaskCtx::new();
+        let saved = narf_scheduler::narf_time::wall_offset_ns();
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        let realtime = (now as i64 + saved + 60_000_000_000) as u64;
+        let mono = (realtime as i64 - saved) as u64;
+        note_realtime_park(&uc, mono, realtime);
+        uc.sleep_deadline_ns.store(mono, Ordering::Release);
+        let before = park_timer_target(&uc, mono);
+        // settimeofday +5 s: the wall-clock expiry is 5 s of monotonic time
+        // nearer.
+        narf_scheduler::narf_time::set_wall_offset_uncapped(saved + STEP);
+        let after = park_timer_target(&uc, mono);
+        let stored = uc.sleep_deadline_ns.load(Ordering::Acquire);
+        let plain = park_timer_target(&uc, now + 1_000);
+        narf_scheduler::narf_time::set_wall_offset_uncapped(saved);
+        if before != (ClockId::Realtime, realtime, mono) {
+            return TestResult::Fail("a REALTIME park did not run on the REALTIME base");
+        }
+        if after.2 != mono - STEP as u64 || stored != after.2 {
+            return TestResult::Fail("a clock step did not move a REALTIME park's deadline");
+        }
+        if plain != (ClockId::Monotonic, now + 1_000, now + 1_000) {
+            return TestResult::Fail("a monotonic park was treated as a REALTIME one");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/process", smoke_realtime_park_follows_clock_step);
+}
+
 // ── Per-task-own-stack syscall park ─────────────────────────────────
 //
 // In the own-stack model a blocking syscall does NOT longjmp back to the
@@ -1352,7 +1530,10 @@ fn park_should_block(
     }
 
     // Deadline-based park (sleep / nanosleep / pause / blocking poll·epoll·futex).
-    let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
+    // A wall-clock (REALTIME) deadline is re-derived against the current
+    // wall offset first, so a clock step since the last evaluation counts.
+    let (park_clock, park_expiry, deadline) =
+        park_timer_target(uc, uc.sleep_deadline_ns.load(Ordering::Acquire));
     // Infinite SysV semaphore waits have a durable queue-local waker and no
     // timer. Keep their hot handoff out of the generic I/O/futex/flock/timer
     // decision tree while preserving the same signal arm-then-recheck rule.
@@ -1392,19 +1573,6 @@ fn park_should_block(
     }
     if deadline != 0 {
         let now = narf_scheduler::narf_time::monotonic_ns();
-        // Kick due ITIMER_REAL owners from the park loop itself (gated to
-        // one atomic load when none is armed). A parked owner's ONLY
-        // reliable periodic execution is this backstop re-check: its
-        // re-executed syscall parks again without reaching the syscall-exit
-        // raise hook, and the posix-timer sleep pump does not run from the
-        // executor's io rounds — so without this kick, SIGALRM to a parked
-        // task waited on unrelated system activity (seconds on an idle
-        // guest; stress-ng --dup's EINTR-driven FIFO opens ran at 0.003x
-        // Linux). Raising before the signal check below lets a fresh due
-        // SIGALRM break THIS park evaluation, not the next one.
-        if crate::posix_timer::itimer_real_due_at(now) {
-            crate::handlers::raise_due_itimer_real(now);
-        }
         // Linux interruptible-sleep semantics: a deliverable pending signal
         // breaks ANY deadline park — finite ones included. nanosleep/futex/
         // poll are all signal-interruptible on Linux (-EINTR); restricting
@@ -1639,7 +1807,17 @@ fn park_should_block(
             // (re)arm this park's hrtimer sleeper on this CPU's base. Re-arming
             // the same sleeper on every park keeps its expiry current (a futex
             // park broken by its gen guard re-parks here with a new deadline).
-            arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
+            if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
+                arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
+            } else {
+                arm_park_timer_on(
+                    sleep_handle,
+                    park_clock,
+                    park_expiry,
+                    uc.timer_slack(),
+                    waker,
+                );
+            }
             if uc.net_io_wait.load(Ordering::Acquire) {
                 #[cfg(feature = "syscall-trace")]
                 crate::syscall::syscall_trace_account_park(
@@ -1717,14 +1895,17 @@ fn park_should_block(
         // now durable; the byte-waker slot is not, so its net stays.
         // Convert via `ns_to_cycles` (precise inverse of `cycles_to_ns`), NOT
         // `* cycles_per_ns()` — see the deadline-park note above.
+        // A coarse backstop that is almost always cancelled by the byte
+        // arriving first: a timer-wheel timeout (`schedule_timeout`), not an
+        // hrtimer, as Linux uses for such waits. Not deferrable: it exists
+        // for the case where the byte wake was lost, so it must fire.
         const BYTE_WAKER_FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        arm_park_timer(
-            sleep_handle,
-            now.saturating_add(BYTE_WAKER_FALLBACK_NS),
-            uc.timer_slack(),
-            waker,
-        );
+        use narf_scheduler::narf_time::timer;
+        let expires = timer::jiffies() + timer::ns_to_jiffies(BYTE_WAKER_FALLBACK_NS);
+        uc.coarse_timeout
+            .lock()
+            .get_or_insert_with(|| timer::TimeoutHandle::new(0))
+            .arm(expires, waker);
         return true;
     }
 
@@ -1792,8 +1973,16 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
         crate::task::note_park(narf_scheduler::current_task_id().raw());
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
+            // `/proc/<pid>/stack`: a readiness/sleep park, named by this site.
+            (*uctx).park_site.store(
+                core::panic::Location::caller() as *const _ as usize,
+                Ordering::Relaxed,
+            );
             (*uctx).parked_in_syscall.store(true, Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
+            // Running again: parked on nothing until the next park.
+            (*uctx).parked_in_syscall.store(false, Ordering::Release);
+            (*uctx).park_site.store(0, Ordering::Relaxed);
         }
         // ── Resumed via kernel_switch (NOT a re-poll) ── re-publish this task's
         // `CURRENT` cell: `install_current` runs only in `UserTaskFuture::poll`,
@@ -1954,6 +2143,15 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
         o(pid, tid);
     }
     let (group_dead, was_multithreaded) = crate::handlers::thread_group_live_dec_state(pid);
+    if !group_dead {
+        // Linux `exit_mm` for a thread whose group lives on: its user
+        // reference goes in its own context, after the thread observers'
+        // last user-memory access (clear_child_tid). The group's last
+        // thread does this among the process observers instead
+        // (`release_exiting_process_mm`), after the ones that still read the
+        // address space and before the parent is told.
+        narf_scheduler::exit_mm(narf_scheduler::TaskId(tid));
+    }
     if group_dead {
         // Complete the wait4 rusage snapshot with the process's vm size —
         // once per process, here, while the last thread's AS is still
@@ -1983,6 +2181,27 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
 pub fn __test_clear_exit_observers() {
     THREAD_EXIT_OBSERVERS.lock().clear();
     PROCESS_EXIT_OBSERVERS.lock().clear();
+}
+
+/// Test-only: the registered exit observers (thread, process), for a test
+/// that installs its own set and must give every other test the boot set
+/// back afterwards ([`__test_restore_exit_observers`]).
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_take_exit_observers(
+) -> (alloc::vec::Vec<ExitObserver>, alloc::vec::Vec<ExitObserver>) {
+    (
+        core::mem::take(&mut *THREAD_EXIT_OBSERVERS.lock()),
+        core::mem::take(&mut *PROCESS_EXIT_OBSERVERS.lock()),
+    )
+}
+
+/// Test-only: put back what [`__test_take_exit_observers`] took.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_restore_exit_observers(
+    saved: (alloc::vec::Vec<ExitObserver>, alloc::vec::Vec<ExitObserver>),
+) {
+    *THREAD_EXIT_OBSERVERS.lock() = saved.0;
+    *PROCESS_EXIT_OBSERVERS.lock() = saved.1;
 }
 
 /// Test-only reset.
@@ -2326,6 +2545,9 @@ pub fn install_user_task_hooks() {
         crate::handlers::resume_current_kernel_span,
     );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    // Lets the scheduler's park-with-CPU-local-state report name the system
+    // call the offending task is in.
+    narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.
@@ -2744,7 +2966,11 @@ impl core::future::Future for UserTaskFuture {
         // then return Pending. The scale is tuned for ~1 ms per
         // park iteration: short enough not to perturb other tasks,
         // long enough to keep heap pressure flat.
-        let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        // A wall-clock (REALTIME) park deadline is re-derived first.
+        let (park_clock, park_expiry, deadline) = park_timer_target(
+            &this.task.uctx,
+            this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire),
+        );
         if deadline != 0 {
             // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
             this.task
@@ -2968,7 +3194,17 @@ impl core::future::Future for UserTaskFuture {
                 // timeout, and the check→register race is closed above.
                 let fire_ns = deadline;
                 let slack = this.task.uctx.timer_slack();
-                arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
+                if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
+                    arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
+                } else {
+                    arm_park_timer_on(
+                        &mut this.sleep_handle,
+                        park_clock,
+                        park_expiry,
+                        slack,
+                        cx.waker(),
+                    );
+                }
                 if !narf_scheduler::narf_time::hrtimer::arm_callback_installed() {
                     // No clockevent programmer: self-wake so the task still
                     // makes progress (degraded, never wedged).
@@ -3218,6 +3454,7 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
         this.task.uctx.record_kernel_stack_top();
+        this.task.uctx.publish_process(&mut this.process);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
@@ -3857,6 +4094,7 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
         this.task.uctx.record_kernel_stack_top();
+        this.task.uctx.publish_process(&mut this.process);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Linux schedule_tail performs this only after switching to the new
@@ -4032,6 +4270,7 @@ pub fn install_user_task_hooks() {
         crate::handlers::resume_current_kernel_span,
     );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     narf_scheduler::stackful::enable_user_own_stack();
 }
 

@@ -23,23 +23,67 @@ use crate::volume::BtrfsVolume;
 /// Decompress a whole compressed extent according to its algorithm. zlib and
 /// zstd are single streams; LZO is btrfs's sector-segmented framing, which needs
 /// `sectorsize`.
+///
+/// The decoder state comes from a [`crate::workspace`] pool, as Linux takes a
+/// workspace: built here per call, it gave this function a 19 KiB frame on
+/// every compressed read.
 fn decompress(compression: u8, input: &[u8], sectorsize: usize) -> Result<Vec<u8>, FsError> {
     match compression {
-        format::COMPRESS_ZLIB => {
-            miniz_oxide::inflate::decompress_to_vec_zlib(input).map_err(|_| FsError::InvalidData)
-        }
-        format::COMPRESS_ZSTD => {
-            use ruzstd::io::Read;
-            let mut decoder =
-                ruzstd::decoding::StreamingDecoder::new(input).map_err(|_| FsError::InvalidData)?;
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|_| FsError::InvalidData)?;
-            Ok(out)
-        }
+        format::COMPRESS_ZLIB => inflate_zlib(input),
+        format::COMPRESS_ZSTD => decode_zstd(input),
         format::COMPRESS_LZO => crate::lzo::decompress_extent(input, sectorsize),
         _ => Err(FsError::InvalidData),
+    }
+}
+
+/// A zlib stream, inflated by a pooled inflater (miniz's
+/// `decompress_to_vec_zlib` loop, which would build its own each call).
+fn inflate_zlib(mut input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
+    use miniz_oxide::inflate::TINFLStatus;
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+        | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    let mut ws = crate::workspace::ZLIB.get();
+    ws.init();
+    let mut out: Vec<u8> = alloc::vec![0; input.len().saturating_mul(2).max(64)];
+    let mut at = 0;
+    loop {
+        let (status, consumed, produced) = decompress(&mut ws, input, &mut out, at, flags);
+        at += produced;
+        match status {
+            TINFLStatus::Done => {
+                out.truncate(at);
+                return Ok(out);
+            }
+            TINFLStatus::HasMoreOutput if consumed <= input.len() => {
+                input = &input[consumed..];
+                let grown = out.len().saturating_mul(2);
+                out.resize(grown, 0);
+            }
+            _ => return Err(FsError::InvalidData),
+        }
+    }
+}
+
+/// A zstd frame, decoded by a pooled frame decoder, straight into the output
+/// (ruzstd's `read_to_end` stages through a 16 KiB stack buffer of its own).
+fn decode_zstd(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use ruzstd::io::Read;
+    const STEP: usize = 64 * 1024;
+    let mut ws = crate::workspace::ZSTD.get();
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new_with_decoder(input, &mut *ws)
+        .map_err(|_| FsError::InvalidData)?;
+    let mut out = Vec::new();
+    loop {
+        let at = out.len();
+        out.resize(at + STEP, 0);
+        let n = decoder
+            .read(&mut out[at..])
+            .map_err(|_| FsError::InvalidData)?;
+        out.truncate(at + n);
+        if n == 0 {
+            return Ok(out);
+        }
     }
 }
 
@@ -217,12 +261,26 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 let d0 = (ov_start - offset) as usize;
                 let read_len = (ov_end - ov_start) as usize;
                 if compression == format::COMPRESS_NONE {
-                    // Read only the bytes the window needs.
+                    // Read only the bytes the window needs, a cacheable piece
+                    // at a time: an extent Linux wrote can be 128 MiB, and a
+                    // read of it must not need a buffer that size.
                     let logical = disk_bytenr + extent_offset + (ov_start - file_start);
-                    let data =
-                        read_uncompressed_cached(vol, csum_root, logical, read_len, le64(body, 0)?)
-                            .await?;
-                    dst[d0..d0 + read_len].copy_from_slice(&data);
+                    let piece = crate::decompress_cache::MAX_DISK_BYTES as usize;
+                    let mut done = 0usize;
+                    while done < read_len {
+                        let take = (read_len - done).min(piece);
+                        let data = read_uncompressed_cached(
+                            vol,
+                            csum_root,
+                            logical + done as u64,
+                            take,
+                            le64(body, 0)?,
+                            Some((ino, ov_start + done as u64)),
+                        )
+                        .await?;
+                        dst[d0 + done..d0 + done + take].copy_from_slice(&data);
+                        done += take;
+                    }
                 } else {
                     // Compressed extents are decoded whole, then sliced. The
                     // compressed payload of length `disk_num_bytes` lives at
@@ -241,6 +299,9 @@ pub async fn read_file<B: BlockDevice + 'static>(
                             generation: le64(body, 0)?,
                         },
                         sectorsize,
+                        // `btrfs_submit_compressed_read`: the file offset
+                        // the extent's first byte maps to.
+                        Some((ino, file_start.saturating_sub(extent_offset))),
                     )
                     .await?;
                     let src_start = (extent_offset + (ov_start - file_start)) as usize;
@@ -269,6 +330,7 @@ async fn read_uncompressed_cached<B: BlockDevice + 'static>(
     logical: u64,
     len: usize,
     generation: u64,
+    file_pos: Option<(u64, u64)>,
 ) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
     use crate::decompress_cache as cache;
     let core: alloc::sync::Weak<crate::volume::VolCore<B>> =
@@ -291,7 +353,9 @@ async fn read_uncompressed_cached<B: BlockDevice + 'static>(
     }
     let epoch = if cacheable { cache::epoch(&handle) } else { 0 };
     let (data, fully_verified) = match csum_root {
-        Some(root) => crate::csum::read_checked_for_cache(vol, root, logical, len).await?,
+        Some(root) => {
+            crate::csum::read_checked_for_cache(vol, root, logical, len, file_pos).await?
+        }
         None => (vol.read_logical(logical, len).await?, false),
     };
     let data = alloc::sync::Arc::new(data);
@@ -311,6 +375,7 @@ async fn read_compressed_cached<B: BlockDevice + 'static>(
     csum_root: Option<u64>,
     id: crate::decompress_cache::ExtentId,
     sectorsize: usize,
+    file_pos: Option<(u64, u64)>,
 ) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
     use crate::decompress_cache as cache;
     // Keyed by the shared core, not this mount's view: every subvolume mount
@@ -326,7 +391,15 @@ async fn read_compressed_cached<B: BlockDevice + 'static>(
     let epoch = cache::epoch(&handle);
     let raw = match csum_root {
         Some(root) => {
-            crate::csum::read_checked(vol, root, id.disk_bytenr, id.disk_num_bytes as usize).await?
+            crate::csum::read_checked_for_cache(
+                vol,
+                root,
+                id.disk_bytenr,
+                id.disk_num_bytes as usize,
+                file_pos,
+            )
+            .await?
+            .0
         }
         None => {
             vol.read_logical(id.disk_bytenr, id.disk_num_bytes as usize)

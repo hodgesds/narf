@@ -72,7 +72,9 @@ pub enum PowerAction {
     /// different actions — `Suspend` must never silently run the
     /// idle path or vice versa.
     Freeze,
-    /// Orderly power-off (filesystem sync, then device shutdown).
+    /// Orderly power-off ([`crate::orderly`]: the userspace poweroff
+    /// command, forced to an emergency sync + kernel power-off if it
+    /// cannot be started).
     PowerOff,
 }
 

@@ -318,6 +318,17 @@ pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
 pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
+    // Periodic mode expires this CPU's hrtimers from its own tick
+    // (`on_timer_tick` → `hrtimer_run_queues`, Linux's low-resolution
+    // mode), so timers need no per-event programming here; publish that a
+    // clockevent backs them, as the TSC-deadline path does, so a sleeper
+    // does not self-wake and poll. `arm_hrtimer_event` is a no-op on a CPU
+    // without TSC-deadline; the HPET pump, when it comes up, installs the
+    // programmer that also arms the precise broadcast.
+    narf_time::hrtimer::hrtimers_prepare_cpu(tsc_cpu());
+    if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
+    }
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // x2APIC MSR path.
         // SAFETY: APIC is enabled by init_bsp.
@@ -398,14 +409,22 @@ pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
 pub struct LapicClockEvent;
 
 impl narf_time::clockevent::ClockEvent for LapicClockEvent {
+    fn can_stop_idle_tick(&self) -> bool {
+        tsc_deadline_active()
+    }
+
     fn set_idle_tick(&self, stop_tick: bool, budget_deadline: Option<u64>) -> bool {
+        // The TSC-deadline MSR compares against the raw counter; scheduler
+        // and hrtimer deadlines are monotonic counter time (which excludes
+        // time spent suspended). Convert at this boundary.
+        let budget_deadline = budget_deadline.map(narf_time::mono_to_raw_cycles);
         let enabled = narf_arch::interrupts_enabled();
         // SAFETY: serialize the local deadline registers with the timer ISR.
         unsafe { narf_arch::disable_interrupts() };
         let cpu = tsc_cpu();
         let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
         if period != 0 {
-            let now = narf_time::now_cycles();
+            let now = narf_time::raw_cycles();
             let was_stopped = !narf_time::periodic_tick_wanted(cpu);
             narf_time::set_periodic_tick_wanted(cpu, !stop_tick);
             if !stop_tick && was_stopped {
@@ -419,7 +438,8 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             };
             // This CPU's own next hrtimer event (`tick_nohz_stop_tick` →
             // `hrtimer_get_next_event`); every CPU carries its own.
-            let wheel = narf_time::hrtimer::next_event_cycles_local();
+            let wheel =
+                narf_time::hrtimer::next_event_cycles_local().map(narf_time::mono_to_raw_cycles);
             let target = next_arm_target(
                 now,
                 periodic.min(budget_deadline.unwrap_or(u64::MAX)),
@@ -492,10 +512,19 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             unsafe {
                 start_timer(vector, initial_count);
             }
-            // Uncalibrated fixed-count periodic: under TCG (qemu64, no
-            // TSC-deadline) a tick can be dropped or late, so the executor
-            // must not halt indefinitely on a near-term wheel deadline.
-            narf_time::set_tick_reliable(false);
+            // Periodic LAPIC tick on every CPU (each AP arms its own in
+            // `smp.rs`): it keeps firing through `hlt` (C1), so a halted CPU
+            // is always woken within one period — Linux's periodic-tick idle
+            // (`default_idle` → `sti; hlt`, woken by the tick, a device IRQ
+            // or a reschedule IPI). The tick cannot be stopped or programmed
+            // per event (`can_stop_idle_tick` is false), so there is no
+            // NOHZ idle here; precise deadlines go through the HPET
+            // broadcast (`timer_pump`), and between those a timer fires at
+            // the next tick at the latest, as in Linux's low-resolution
+            // mode. This used to publish "unreliable", which made every
+            // idle CPU busy-poll in 1 ms slices at 100% CPU instead of
+            // halting.
+            narf_time::set_tick_reliable(true);
         }
         Ok(())
     }
@@ -553,9 +582,12 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
 fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
     // KVM PV_SEND_IPI: the whole target set in ONE hypercall instead of a
     // vmexit-per-target ICR loop (either mode below). Falls through to the
-    // architectural paths off-KVM or if the host rejects the call.
-    if narf_memory::kvm_pv::pv_send_ipi(cpu_mask, vector) {
-        return;
+    // architectural paths off-KVM, if a target's APIC ID is outside the
+    // hypercall's 64-bit window, or if the host rejects the call.
+    if let Some(apic_mask) = apic_mask_of(cpu_mask) {
+        if narf_memory::kvm_pv::pv_send_ipi(apic_mask, vector) {
+            return;
+        }
     }
     if !X2APIC_ACTIVE.load(Ordering::Acquire) {
         // xAPIC MMIO fallback. Same ICR fields as below, but split
@@ -573,39 +605,60 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
         // `interrupts/ipi` smokes hit under `-x2apic`) or, if a peer
         // happens to drain the bit by polling, lets execution continue
         // with a stale TLB entry live on another core.
-        let icr_hi = lapic_reg(0x310);
-        let icr_lo = lapic_reg(0x300);
         let mut m = cpu_mask;
         while m != 0 {
-            let cpu = m.trailing_zeros();
+            let apic = dest_apic_of_cpu(m.trailing_zeros());
             m &= m - 1;
             // SAFETY: LAPIC MMIO reached via `lapic_reg`; ICR writes are
-            // architectural. Serialising on Delivery Status keeps a
-            // second target's ICR_LO from overwriting an IPI still in
-            // flight (SDM Vol 3 §10.6.1).
-            unsafe {
-                wait_icr_idle(icr_lo);
-                core::ptr::write_volatile(icr_hi, (cpu & 0xFF) << 24);
-                core::ptr::write_volatile(icr_lo, u32::from(vector) | (1 << 14));
-            }
+            // architectural. `xapic_icr_send` serialises on Delivery
+            // Status, which keeps a second target's ICR_LO from overwriting
+            // an IPI still in flight (SDM Vol 3 §10.6.1), and masks
+            // interrupts across the register pair.
+            unsafe { xapic_icr_send((apic & 0xFF) << 24, u32::from(vector) | (1 << 14)) };
         }
         return;
     }
     let mut m = cpu_mask;
     while m != 0 {
-        let cpu = m.trailing_zeros();
+        let apic = dest_apic_of_cpu(m.trailing_zeros());
         m &= m - 1;
         // Fixed delivery, edge-triggered, level-assert,
         // physical destination, no shorthand. Dest in high
         // 32 bits (x2APIC full APIC ID).
         let icr: u64 = (vector as u64)
             | (1u64 << 14)             // level = assert
-            | ((cpu as u64) << 32); // destination APIC id
-                                    // SAFETY: x2APIC confirmed active above.
+            | ((apic as u64) << 32); // destination APIC id
+                                     // SAFETY: x2APIC confirmed active above.
         unsafe {
             wrmsr_icr(icr);
         }
     }
+}
+
+/// The APIC ID to put in an ICR to reach logical CPU `cpu` (Linux
+/// `per_cpu(x86_cpu_to_apicid, cpu)`): the MADT-derived map, or `cpu`
+/// itself before the MADT is parsed — the only CPU then is the boot CPU,
+/// and on a gap-free topology the two agree anyway.
+#[inline]
+fn dest_apic_of_cpu(cpu: u32) -> u32 {
+    narf_acpi::apic_id_of_cpu(cpu as usize).unwrap_or(cpu)
+}
+
+/// `cpu_mask` (bit = logical CPU) as a bitmap of destination APIC IDs, the
+/// form `KVM_HC_SEND_IPI` takes. `None` when an APIC ID is >= 64 and does
+/// not fit the single-window call.
+fn apic_mask_of(cpu_mask: u64) -> Option<u64> {
+    let mut out = 0u64;
+    let mut m = cpu_mask;
+    while m != 0 {
+        let apic = dest_apic_of_cpu(m.trailing_zeros());
+        m &= m - 1;
+        if apic >= 64 {
+            return None;
+        }
+        out |= 1u64 << apic;
+    }
+    Some(out)
 }
 
 /// Send a fixed-vector IPI to every CPU in `cpu_mask`. Thin public
@@ -698,13 +751,7 @@ pub unsafe fn self_ipi(vector: u8) {
         let icr_low: u32 = (vector as u32) | (1 << 14) | (1 << 18);
         // SAFETY: LAPIC MMIO reached via `lapic_reg`; high half irrelevant
         // for self-shorthand but Intel mandates writing it first.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let icr_hi_reg = lapic_reg(0x310);
-            let icr_lo_reg = lapic_reg(0x300);
-            core::ptr::write_volatile(icr_hi_reg, 0);
-            core::ptr::write_volatile(icr_lo_reg, icr_low);
-        }
+        unsafe { xapic_icr_send(0, icr_low) };
     }
 }
 
@@ -744,14 +791,70 @@ pub unsafe fn wrmsr_icr(icr: u64) {
         let icr_low = (icr & 0xFFFF_FFFF) as u32;
         // SAFETY: LAPIC MMIO reached via `lapic_reg`; spec mandates writing
         // ICR_HIGH before ICR_LOW (LOW write triggers send).
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let icr_hi_reg = lapic_reg(0x310);
-            let icr_lo_reg = lapic_reg(0x300);
-            core::ptr::write_volatile(icr_hi_reg, icr_high);
-            core::ptr::write_volatile(icr_lo_reg, icr_low);
-        }
+        unsafe { xapic_icr_send(icr_high, icr_low) };
     }
+}
+
+/// One step of an xAPIC ICR send, in the order the steps must happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcrStep {
+    /// Wait for the previous IPI to leave the ICR (Delivery Status clear).
+    WaitIdle,
+    /// Write ICR_HI: the destination.
+    WriteHigh(u32),
+    /// Write ICR_LO: the command. This is the write that sends.
+    WriteLow(u32),
+}
+
+/// Perform the three steps of an xAPIC ICR send with interrupts masked from
+/// before the first to after the last, restoring the caller's interrupt state.
+///
+/// In xAPIC mode the ICR is two memory-mapped registers and the send is not
+/// atomic: the destination is latched by the ICR_HI write and the IPI goes out
+/// on the ICR_LO write. A sender interrupted between the two by a handler that
+/// sends an IPI of its own comes back to an ICR_HI holding the handler's
+/// destination, and its ICR_LO write then delivers its vector there. Handlers
+/// do send: the scheduler's tick sends reschedule and idle-balance kicks, the
+/// stall watchdog sends an NMI probe from the tick, and a wake from any interrupt
+/// can kick an idle CPU. A reschedule or TLB-shootdown IPI landing on the wrong
+/// CPU is a lost wakeup or an unacknowledged shootdown.
+///
+/// Linux masks interrupts across the same pair (`default_send_IPI_single` and
+/// the mask variants call `__default_send_IPI_dest_field` under
+/// `local_irq_save`) and waits for Delivery Status first.
+///
+/// An NMI is not masked by this. Code that can run in NMI context must not
+/// send through the xAPIC ICR.
+#[inline]
+pub(crate) fn icr_send_masked(icr_hi: u32, icr_lo: u32, mut step: impl FnMut(IcrStep)) {
+    narf_lib::sync::without_interrupts(|| {
+        step(IcrStep::WaitIdle);
+        step(IcrStep::WriteHigh(icr_hi));
+        step(IcrStep::WriteLow(icr_lo));
+    });
+}
+
+/// Send one IPI through the memory-mapped xAPIC ICR. Every xAPIC sender in
+/// this file goes through here; see [`icr_send_masked`] for why.
+///
+/// # Safety
+/// The LAPIC must be initialised and reachable through [`lapic_reg`], and
+/// x2APIC must not be the active mode.
+#[inline]
+unsafe fn xapic_icr_send(icr_hi: u32, icr_lo: u32) {
+    let hi_reg = lapic_reg(0x310);
+    let lo_reg = lapic_reg(0x300);
+    icr_send_masked(icr_hi, icr_lo, |step| {
+        // SAFETY: the caller guarantees both registers are mapped LAPIC MMIO;
+        // the writes are the architectural ICR programming sequence.
+        unsafe {
+            match step {
+                IcrStep::WaitIdle => wait_icr_idle(lo_reg),
+                IcrStep::WriteHigh(value) => core::ptr::write_volatile(hi_reg, value),
+                IcrStep::WriteLow(value) => core::ptr::write_volatile(lo_reg, value),
+            }
+        }
+    });
 }
 
 /// Read this CPU's APIC ID via x2APIC MSR 0x802.
@@ -900,13 +1003,8 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
         // xAPIC MMIO fallback. ICR_HI carries the destination
         // APIC ID in bits 24..31; ICR_LO carries the IPI fields.
         // Writing ICR_LO triggers the IPI, so write ICR_HI first.
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
         // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
@@ -929,14 +1027,11 @@ pub unsafe fn send_nmi_ipi(target_apic_id: u32) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
-        // SAFETY: LAPIC MMIO is reached via `lapic_reg`. Write HI (dest)
-        // before LO (triggers the IPI).
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`. HI (dest) is
+        // written before LO (triggers the IPI), with interrupts masked: this
+        // one is sent from the timer tick, on top of whatever the tick
+        // interrupted.
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
@@ -964,13 +1059,8 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
         // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
@@ -1074,7 +1164,8 @@ pub fn on_timer_tick() {
     // carries only its own base, so a stuck CPU delays only its own timers)
     // and learn its next event. Expiry retires the due timers here, so the
     // re-arm below never lands on an already-past event (no re-fire storm).
-    let next_hrtimer = narf_time::hrtimer::hrtimer_interrupt();
+    // Monotonic → raw counter time for the TSC-deadline MSR.
+    let next_hrtimer = narf_time::mono_to_raw_cycles(narf_time::hrtimer::hrtimer_interrupt());
     let wheel_earliest = (next_hrtimer != u64::MAX).then_some(next_hrtimer);
     let scheduler =
         pending_scheduler_deadline(now, TSC_SCHED_DEADLINE[cpu].load(Ordering::Relaxed));
@@ -1236,6 +1327,8 @@ pub(crate) const fn should_rearm_tsc_deadline(
 /// interleave. `hrtimer_event` false = a scheduler budget deadline, which is
 /// also recorded so it survives an earlier interrupt.
 fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
+    // Callers pass monotonic counter time; the MSR compares the raw counter.
+    let deadline_cycles = narf_time::mono_to_raw_cycles(deadline_cycles);
     // IRQs are masked across the whole RCW below (see the disable/enable
     // pair), so `tsc_cpu()` is stable — we can't migrate mid-function — and
     // the per-CPU `TSC_ARMED`/MSR we read, compare, and write all belong to
@@ -1295,6 +1388,13 @@ fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
             narf_arch::current::enable_interrupts();
         }
     }
+}
+
+/// Whether THIS CPU's LAPIC timer runs in TSC-deadline (one-shot,
+/// per-event programmable) mode. False in the periodic InitialCount mode
+/// CPUs without TSC-deadline use (AMD Zen 2/4 desktops among them).
+pub fn tsc_deadline_active() -> bool {
+    TSC_DEADLINE_PERIOD_CYCLES[tsc_cpu()].load(Ordering::Relaxed) != 0
 }
 
 /// Reprogram this CPU's LAPIC deadline if `deadline_cycles` is materially

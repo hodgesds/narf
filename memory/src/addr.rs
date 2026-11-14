@@ -293,6 +293,56 @@ pub fn direct_map_live() -> bool {
     direct_map_base() != 0
 }
 
+/// Top of the physical range the aarch64 TTBR1 linear map covers,
+/// measured from PA 0 like the x86_64 extent: the window is the single
+/// 1 GiB block at PA `0x4000_0000` (`build_ram_l2` in
+/// `frame/src/aarch64/boot.S` builds 512 × 2 MiB blocks from there,
+/// and `hi_L1[1]` points at them). `PhysAddr::kernel_ptr` resolves
+/// `phys | KERNEL_PHYS_OFFSET` into it.
+///
+/// PA `[0, 0x4000_0000)` in that VA range is the Device MMIO window,
+/// not RAM — no caller buffer lives there, and the range check plus
+/// `is_valloc_ptr` in callers such as `direct_frames` keep non-RAM
+/// VAs out, exactly as the x86_64 side relies on its VA layout.
+#[cfg(target_arch = "aarch64")]
+pub const KERNEL_DIRECT_MAP_PHYS_END: u64 = 0x8000_0000;
+
+/// Physical extent of the direct map `[0, end)`, or 0 while it is not live.
+///
+/// aarch64: the TTBR1 linear map is a fixed 1 GiB window (see
+/// [`KERNEL_DIRECT_MAP_PHYS_END`]), installed by `boot.S` before Rust
+/// entry — so the extent is a constant, not a value `init_mmu`
+/// publishes at run time as on x86_64.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn direct_map_phys_end() -> u64 {
+    KERNEL_DIRECT_MAP_PHYS_END
+}
+
+/// Base the direct map is live at, or 0 while it is not.
+///
+/// aarch64: the fixed [`crate::KERNEL_PHYS_OFFSET`] — the TTBR1
+/// linear map has no boot-chosen slot to publish.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn direct_map_base() -> u64 {
+    crate::KERNEL_PHYS_OFFSET
+}
+
+/// Whether the high-half direct map is live.
+///
+/// aarch64: always true once Rust runs — `boot.S` installs the TTBR1
+/// linear map before the MMU comes on, so there is no activation step
+/// for `init_mmu` to perform (unlike x86_64, where the map is built
+/// and published at run time). On a hosted build the range check in
+/// callers (`start < base`) still rejects ordinary pointers, which sit
+/// far below the high-half base.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn direct_map_live() -> bool {
+    true
+}
+
 impl VirtAddr {
     #[inline]
     pub const fn new(v: u64) -> Self {

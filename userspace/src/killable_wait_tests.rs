@@ -2,7 +2,7 @@
 //! operation it was waiting on must still reach its own completion.
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use narf_filesystem::{FsFuture, Mode, Stat};
+use narf_filesystem::{FsError, FsFuture, Mode, Stat};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -189,14 +189,29 @@ kernel_test_in!(
 fn smoke_killable_wait_ready_operation_arms_nothing() -> TestResult {
     const TASK: u64 = 0x6b11_ab20;
     let _fixture = DetachFixture::new(TASK);
-    // Even with SIGKILL already pending, a completed operation is reported
-    // as completed: its side effects happened.
-    crate::handlers::raise_signal_pending(TASK, 9);
     let waker = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut wait = KillableWait::new(TASK, Box::pin(async { 3usize }));
     if Pin::new(&mut wait).poll(&mut cx) != Poll::Ready(Ok(3)) {
         return TestResult::Fail("a ready operation was not reported");
+    }
+    // With SIGKILL already pending nothing starts, not even an operation
+    // that would complete at once (Linux tests `fatal_signal_pending` before
+    // the work).
+    crate::handlers::raise_signal_pending(TASK, 9);
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran2 = ran.clone();
+    let mut killed = KillableWait::new(
+        TASK,
+        Box::pin(async move {
+            ran2.store(true, Ordering::Release);
+            3usize
+        }),
+    );
+    if Pin::new(&mut killed).poll(&mut cx) != Poll::Ready(Err(Killed))
+        || ran.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a task with SIGKILL pending started an operation");
     }
     if crate::handlers::dbg_has_signal_waker(TASK) {
         return TestResult::Fail("a ready operation registered a signal waker");
@@ -213,6 +228,8 @@ struct NeverFile {
     reads: AtomicUsize,
     writes: AtomicUsize,
     release: Arc<AtomicBool>,
+    /// SIGKILL arrives for [`SYSCALL_TASK`] while its I/O is queued.
+    kill_when_queued: Arc<AtomicBool>,
 }
 
 impl NeverFile {
@@ -221,11 +238,22 @@ impl NeverFile {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             release: Arc::new(AtomicBool::new(false)),
+            kill_when_queued: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The task is killed once its operation has started and is queued: a
+    /// task with SIGKILL already pending starts nothing at all.
+    fn kill_when_queued(&self) {
+        self.kill_when_queued.store(true, Ordering::Release);
+    }
+
+    fn gate(&self) -> Gate {
+        Gate(self.release.clone(), self.kill_when_queued.clone())
     }
 }
 
-struct Gate(Arc<AtomicBool>);
+struct Gate(Arc<AtomicBool>, Arc<AtomicBool>);
 
 impl Future for Gate {
     type Output = ();
@@ -233,6 +261,9 @@ impl Future for Gate {
         if self.0.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
+            if self.1.swap(false, Ordering::AcqRel) {
+                crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+            }
             Poll::Pending
         }
     }
@@ -242,7 +273,7 @@ impl FileOps for NeverFile {
     fn read<'a>(&'a self, _: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            Gate(self.release.clone()).await;
+            self.gate().await;
             buf.fill(0x5a);
             Ok(buf.len())
         })
@@ -250,7 +281,7 @@ impl FileOps for NeverFile {
 
     fn write<'a>(&'a self, _: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            Gate(self.release.clone()).await;
+            self.gate().await;
             self.writes.fetch_add(buf.len(), Ordering::Relaxed);
             Ok(buf.len())
         })
@@ -343,7 +374,7 @@ fn smoke_killable_read_of_a_stuck_file_returns_on_sigkill() -> TestResult {
     let file = NeverFile::new();
     let ops: Arc<dyn FileOps> = file.clone();
     let mut staging = alloc::vec![0u8; 4096];
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     let outcome = read(&ops, 0, &mut staging, 4096, ReadOptions::default());
     if outcome != Err(Killed) {
         return TestResult::Fail("a read parked on a stuck file did not end on SIGKILL");
@@ -375,7 +406,7 @@ fn smoke_killable_write_completes_after_its_writer_is_killed() -> TestResult {
     let file = NeverFile::new();
     let ops: Arc<dyn FileOps> = file.clone();
     let mut payload = alloc::vec![0xa5u8; 1500];
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     if write(&ops, 0, &mut payload) != Err(Killed) {
         return TestResult::Fail("a write parked on a stuck file did not end on SIGKILL");
     }
@@ -441,7 +472,7 @@ fn smoke_killable_fill_frame_frees_the_frame_of_a_killed_fault() -> TestResult {
     };
     let frame = frame.start_address();
     let released_before = FRAMES_RELEASED.load(Ordering::Relaxed);
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     if fill_frame(&ops, 0, frame, 4096) != Err(Killed) {
         return TestResult::Fail("a fault parked on a stuck file did not end on SIGKILL");
     }
@@ -465,4 +496,572 @@ fn smoke_killable_fill_frame_frees_the_frame_of_a_killed_fault() -> TestResult {
 kernel_test_in!(
     "userspace/killable",
     smoke_killable_fill_frame_frees_the_frame_of_a_killed_fault
+);
+
+// ── execve image reads ─────────────────────────────────────────────
+
+/// An `execve` image read of a file whose read never completes ends on
+/// SIGKILL — Linux `kernel_read` is killable — without touching the
+/// destination, and the read finishes into its own buffer afterwards. A read
+/// that is not killed fills the destination, a staging chunk at a time.
+fn smoke_killable_exec_image_read_ends_on_sigkill() -> TestResult {
+    use crate::elf::ExecBytes;
+    let _fixture = DetachFixture::new(SYSCALL_TASK);
+    crate::handlers::install_task_id_lookup(syscall_task);
+    let file = NeverFile::new();
+    let ops: Arc<dyn FileOps> = file.clone();
+    let image = crate::handlers::ExecSource::File {
+        ops: ops.clone(),
+        size: 1 << 20,
+    };
+    let mut header = [0u8; 64];
+    file.kill_when_queued();
+    if image.read_exact_at(0, &mut header) != Err(crate::elf::ElfError::ImageReadFailed) {
+        return TestResult::Fail("an image read of a stuck file did not end on SIGKILL");
+    }
+    if file.reads.load(Ordering::Relaxed) != 1 || header != [0u8; 64] {
+        return TestResult::Fail("the killed image read touched its destination");
+    }
+    let Some(mut detached) = DETACHED.lock().take() else {
+        return TestResult::Fail("the stuck image read was dropped with its I/O in flight");
+    };
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    file.release.store(true, Ordering::Release);
+    if detached.as_mut().poll(&mut cx) != Poll::Ready(()) {
+        return TestResult::Fail("the detached image read could not finish");
+    }
+    crate::handlers::clear_signal_pending(SYSCALL_TASK, 9);
+    // Not killed: the whole range, in staging chunks.
+    let mut big = alloc::vec![0u8; READ_INTO_MAX + 100];
+    if image.read_exact_at(0, &mut big).is_err() || big.iter().any(|&b| b != 0x5a) {
+        return TestResult::Fail("an image read did not fill its destination");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_exec_image_read_ends_on_sigkill
+);
+
+// ── Durability waits: fsync, fdatasync, syncfs ──────────────────────
+
+/// What a [`StuckSync`] commit has seen: how often it was polled, the poll
+/// on which the test's "kill arrives" action runs, and whether it finished.
+struct SyncState {
+    polls: AtomicUsize,
+    kill_at: usize,
+    kill: fn(),
+    release: AtomicBool,
+    finished: AtomicUsize,
+}
+
+/// A regular file whose `fsync`/`syncfs` waits — on another task, a lock or
+/// I/O; the test does not say which — until the test releases it, and never
+/// wakes its waiter by itself: only a signal can.
+struct StuckSync(Arc<SyncState>);
+
+impl StuckSync {
+    fn new(kill_at: usize, kill: fn()) -> (Arc<Self>, Arc<SyncState>) {
+        let state = Arc::new(SyncState {
+            polls: AtomicUsize::new(0),
+            kill_at,
+            kill,
+            release: AtomicBool::new(false),
+            finished: AtomicUsize::new(0),
+        });
+        (Arc::new(Self(state.clone())), state)
+    }
+
+    fn commit(&self) -> FsFuture<'static, ()> {
+        Box::pin(SyncCommit(self.0.clone()))
+    }
+}
+
+struct SyncCommit(Arc<SyncState>);
+
+impl Future for SyncCommit {
+    type Output = Result<(), FsError>;
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        let state = &self.0;
+        let polls = state.polls.fetch_add(1, Ordering::AcqRel) + 1;
+        if state.release.load(Ordering::Acquire) {
+            state.finished.fetch_add(1, Ordering::AcqRel);
+            return Poll::Ready(Ok(()));
+        }
+        if polls == state.kill_at {
+            (state.kill)();
+        }
+        Poll::Pending
+    }
+}
+
+impl FileOps for StuckSync {
+    fn read<'a>(&'a self, _: u64, _: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let n = buf.len();
+        Box::pin(async move { Ok(n) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 2 * 4096,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+
+    fn can_poll(&self) -> bool {
+        false
+    }
+
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        self.commit()
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        self.commit()
+    }
+}
+
+/// The poll on which a stuck commit's waiter is sent SIGKILL. Each poll is
+/// one pass of the waiting task: its first, then one per wake.
+const KILL_AT: usize = 3;
+
+const EINTR_RET: i64 = -4;
+
+/// The `abi_test_support` harness plus a retained-detach hook, undone on drop.
+struct SyscallFixture;
+
+impl SyscallFixture {
+    fn new() -> Self {
+        crate::abi_test_support::setup();
+        crate::handlers::signal_waker_init();
+        DETACHED.lock().take();
+        DETACH_HOOK.store(retain_detached as fn(Detached) as usize, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for SyscallFixture {
+    fn drop(&mut self) {
+        DETACH_HOOK.store(0, Ordering::Release);
+        DETACHED.lock().take();
+        crate::abi_test_support::teardown();
+    }
+}
+
+fn kill_fake_task() {
+    crate::handlers::raise_signal_pending(crate::abi_test_support::FAKE_TASK, 9);
+}
+
+fn install_on(task: u64, ops: Arc<dyn FileOps>) -> Option<u32> {
+    crate::fd::install(
+        task,
+        crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_RDWR,
+        },
+    )
+}
+
+/// Finish the killed commit the test kept, as the scheduler would have.
+fn finish_detached(state: &SyncState) -> Result<(), &'static str> {
+    let Some(mut detached) = DETACHED.lock().take() else {
+        return Err("the commit in flight was dropped instead of handed on");
+    };
+    if state.finished.load(Ordering::Acquire) != 0 {
+        return Err("the stuck commit finished by itself");
+    }
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    state.release.store(true, Ordering::Release);
+    if detached.as_mut().poll(&mut cx) != Poll::Ready(())
+        || state.finished.load(Ordering::Acquire) != 1
+    {
+        return Err("the detached commit did not run to its end");
+    }
+    Ok(())
+}
+
+fn with_fixture(body: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
+    let fixture = SyscallFixture::new();
+    let outcome = crate::handlers::with_kernel_buffers(body);
+    drop(fixture);
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+
+/// `fsync(2)` and `fdatasync(2)` on a file whose commit never completes: a
+/// SIGKILL that arrives while the caller waits ends the syscall with -EINTR
+/// on the very pass it lands on, and the commit is kept to finish without it.
+fn smoke_killable_fsync_ends_on_sigkill_within_one_pass() -> TestResult {
+    use crate::abi_test_support::{a0, call, FAKE_TASK};
+    use crate::syscall::Syscall;
+    for nr in [Syscall::Fsync, Syscall::Fdatasync] {
+        let outcome = with_fixture(|| {
+            let (file, state) = StuckSync::new(KILL_AT, kill_fake_task);
+            let fd = install_on(FAKE_TASK, file).ok_or("could not install the test file")?;
+            if call(nr.raw(), a0(u64::from(fd))) != Some(EINTR_RET) {
+                return Err("fsync of a stuck file did not return -EINTR on SIGKILL");
+            }
+            // Count, not time: the wait ended on the pass the kill arrived on.
+            if state.polls.load(Ordering::Acquire) != KILL_AT {
+                return Err("fsync kept waiting after its task was sent SIGKILL");
+            }
+            if crate::handlers::dbg_has_signal_waker(FAKE_TASK) {
+                return Err("the ended fsync left its signal waker registered");
+            }
+            finish_detached(&state)
+        });
+        if !matches!(outcome, TestResult::Pass) {
+            return outcome;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_fsync_ends_on_sigkill_within_one_pass
+);
+
+/// A task that is not killed gets the commit's own result, and a task that
+/// already has SIGKILL pending queues no commit at all.
+fn smoke_killable_fsync_killed_task_starts_nothing() -> TestResult {
+    use crate::abi_test_support::{a0, call, FAKE_TASK};
+    use crate::syscall::Syscall;
+    with_fixture(|| {
+        let (file, state) = StuckSync::new(usize::MAX, kill_fake_task);
+        let fd = install_on(FAKE_TASK, file).ok_or("could not install the test file")?;
+        state.release.store(true, Ordering::Release);
+        if call(Syscall::Fsync.raw(), a0(u64::from(fd))) != Some(0)
+            || state.finished.load(Ordering::Acquire) != 1
+        {
+            return Err("fsync of a live task did not commit");
+        }
+        kill_fake_task();
+        let polls = state.polls.load(Ordering::Acquire);
+        if call(Syscall::Fsync.raw(), a0(u64::from(fd))) != Some(EINTR_RET) {
+            return Err("fsync by a task with SIGKILL pending did not return -EINTR");
+        }
+        if state.polls.load(Ordering::Acquire) != polls || DETACHED.lock().is_some() {
+            return Err("a task with SIGKILL pending started a commit");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_fsync_killed_task_starts_nothing
+);
+
+/// `syncfs(2)` waits the same way and ends the same way.
+fn smoke_killable_syncfs_ends_on_sigkill_within_one_pass() -> TestResult {
+    use crate::abi_test_support::{a0, call, FAKE_TASK};
+    use crate::syscall::Syscall;
+    with_fixture(|| {
+        let (file, state) = StuckSync::new(KILL_AT, kill_fake_task);
+        let fd = install_on(FAKE_TASK, file).ok_or("could not install the test file")?;
+        if call(Syscall::Syncfs.raw(), a0(u64::from(fd))) != Some(EINTR_RET) {
+            return Err("syncfs of a stuck filesystem did not return -EINTR on SIGKILL");
+        }
+        if state.polls.load(Ordering::Acquire) != KILL_AT {
+            return Err("syncfs kept waiting after its task was sent SIGKILL");
+        }
+        finish_detached(&state)
+    })
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_syncfs_ends_on_sigkill_within_one_pass
+);
+
+static MSYNC_AS: IrqSafeSpinLock<Option<Arc<narf_memory::AddressSpace>>> =
+    IrqSafeSpinLock::new(None);
+
+fn lookup_msync_as() -> Option<Arc<narf_memory::AddressSpace>> {
+    MSYNC_AS.lock().clone()
+}
+
+fn msync_case() -> Result<(), &'static str> {
+    use crate::abi_test_support::{a2, call, FAKE_TASK};
+    use crate::syscall::{Syscall, SyscallArgs};
+    const MS_SYNC: u64 = 4;
+    const LEN: u64 = 2 * 4096;
+    let (file, state) = StuckSync::new(KILL_AT, kill_fake_task);
+    let fd = install_on(FAKE_TASK, file).ok_or("could not install the test file")?;
+    let map = SyscallArgs {
+        arg0: 0,
+        arg1: LEN,
+        arg2: 3, // PROT_READ | PROT_WRITE
+        arg3: 1, // MAP_SHARED
+        arg4: u64::from(fd),
+        arg5: 0,
+    };
+    let addr = match call(Syscall::Mmap.raw(), map) {
+        Some(addr) if addr > 0 => addr as u64,
+        _ => return Err("MAP_SHARED mmap of the test file failed"),
+    };
+    if call(Syscall::Msync.raw(), a2(addr, LEN, MS_SYNC)) != Some(EINTR_RET) {
+        return Err("msync(MS_SYNC) of a stuck file did not return -EINTR on SIGKILL");
+    }
+    if state.polls.load(Ordering::Acquire) != KILL_AT {
+        return Err("msync kept waiting for the commit after its task was sent SIGKILL");
+    }
+    finish_detached(&state)
+}
+
+/// `msync(MS_SYNC)` of a shared mapping whose file's commit never
+/// completes: the commit it ends with is waited for killably too.
+fn smoke_killable_msync_commit_ends_on_sigkill_within_one_pass() -> TestResult {
+    with_fixture(|| {
+        // SAFETY: kernel tests run with paging enabled; the new root inherits
+        // only the kernel half and is owned by this test.
+        let aspace = unsafe { narf_memory::AddressSpace::new_for_user() }
+            .map_err(|_| "failed to create the test address space")?;
+        *MSYNC_AS.lock() = Some(Arc::new(aspace));
+        crate::handlers::install_address_space_lookup(lookup_msync_as);
+        let outcome = msync_case();
+        crate::handlers::restore_address_space_lookup(None);
+        *MSYNC_AS.lock() = None;
+        outcome
+    })
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_msync_commit_ends_on_sigkill_within_one_pass
+);
+
+const GROUP_LEADER: u64 = 0x6b11_a000;
+const GROUP_SIBLING: u64 = 0x6b11_a001;
+
+/// `kill(leader, SIGKILL)` from the parent, as `kill_process` sends it.
+fn kill_group() {
+    let _ = crate::handlers::raise_group_signal(
+        GROUP_LEADER,
+        9,
+        crate::handlers::GroupSigInfo::Sender(crate::handlers::SI_USER),
+    );
+}
+
+/// The parent's `wait4(-1, &status, WNOHANG)`: `(pid, status)`.
+fn parent_wait() -> Option<(i64, i32)> {
+    use crate::abi_test_support::{a4, call, set_task, FAKE_TASK};
+    use crate::syscall::Syscall;
+    set_task(FAKE_TASK);
+    let mut status: i32 = -1;
+    let pid = call(
+        Syscall::Wait4.raw(),
+        a4(u64::MAX, &mut status as *mut i32 as u64, 1, 0, 0),
+    )?;
+    Some((pid, status))
+}
+
+/// A thread's return to user mode with SIGKILL pending, then its exit
+/// fan-out (the polling future runs that half after the exit longjmp).
+fn thread_dies(task: u64) {
+    struct ReturnToUser(crate::syscall::SyscallArgs);
+    impl crate::syscall::TrapContext for ReturnToUser {
+        fn args(&self) -> &crate::syscall::SyscallArgs {
+            &self.0
+        }
+        fn set_return(&mut self, _: crate::syscall::SyscallReturn) {}
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            true
+        }
+    }
+    crate::abi_test_support::set_task(task);
+    let mut ctx = ReturnToUser(crate::syscall::SyscallArgs::default());
+    crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+    crate::user_task::notify_task_exited(GROUP_LEADER, task);
+}
+
+fn group_case() -> Result<(), &'static str> {
+    use crate::abi_test_support::{a0, call, set_task, FAKE_TASK};
+    use crate::syscall::Syscall;
+    // A two-thread process whose parent is the harness task.
+    for task in [GROUP_LEADER, GROUP_SIBLING] {
+        crate::task::release_task(task);
+        let _ = crate::task::Task::new_registered(task, GROUP_LEADER);
+        crate::handlers::register_task_to_pid(task, GROUP_LEADER);
+    }
+    crate::handlers::register_pid_task_mapping(GROUP_LEADER, GROUP_LEADER);
+    crate::handlers::thread_group_live_inc(GROUP_LEADER);
+    crate::handlers::__test_inject_parent_of(GROUP_LEADER, FAKE_TASK);
+    let (file, state) = StuckSync::new(KILL_AT, kill_group);
+    let fd = install_on(GROUP_SIBLING, file).ok_or("could not install the test file")?;
+
+    // The sibling waits for its commit; the parent's SIGKILL arrives
+    // meanwhile and reaches every thread of the group.
+    set_task(GROUP_SIBLING);
+    if call(Syscall::Fsync.raw(), a0(u64::from(fd))) != Some(EINTR_RET) {
+        return Err("the sibling's fsync did not end on the group's SIGKILL");
+    }
+    if state.polls.load(Ordering::Acquire) != KILL_AT {
+        return Err("the sibling kept waiting after the group was sent SIGKILL");
+    }
+    if !crate::handlers::task_fatal_signal_pending(GROUP_LEADER) {
+        return Err("kill(pid, SIGKILL) did not reach the leader");
+    }
+
+    // The group dies as a group: one thread gone is no exit to report.
+    thread_dies(GROUP_SIBLING);
+    if parent_wait() != Some((0, -1)) {
+        return Err("wait4 reported the process before its last thread exited");
+    }
+    thread_dies(GROUP_LEADER);
+    let Some((pid, status)) = parent_wait() else {
+        return Err("wait4 failed after the group exited");
+    };
+    if pid != GROUP_LEADER as i64 {
+        return Err("wait4 did not reap the killed process");
+    }
+    if status & 0x7f != 9 || status & 0x80 != 0 {
+        return Err("wait4 did not report death by SIGKILL");
+    }
+    finish_detached(&state)
+}
+
+/// A multi-threaded process with one thread waiting on a stuck commit is
+/// `kill -9`ed: that wait ends at once, the group exits as one, and the
+/// parent's `wait4` reaps it, killed by SIGKILL.
+fn smoke_killable_fsync_thread_does_not_hold_its_group() -> TestResult {
+    with_fixture(|| {
+        // Exactly one copy of the exit fan-out, and the boot set (SysV,
+        // cgroup, shm, ... observers) back for every later test.
+        let saved = crate::user_task::__test_take_exit_observers();
+        crate::handlers::wait_init();
+        let outcome = group_case();
+        crate::user_task::__test_restore_exit_observers(saved);
+        for task in [GROUP_LEADER, GROUP_SIBLING] {
+            crate::handlers::clear_signal_pending(task, 9);
+            crate::fd::detach(task);
+            crate::task::release_task(task);
+            crate::handlers::__test_forget_task_pid(task);
+        }
+        outcome
+    })
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_fsync_thread_does_not_hold_its_group
+);
+
+static STORM: IrqSafeSpinLock<Vec<Detached>> = IrqSafeSpinLock::new(Vec::new());
+
+fn retain_storm(op: Detached) {
+    STORM.lock().push(op);
+}
+
+const STORM_TASK: u64 = 0x6b11_5707;
+
+fn storm_task() -> u64 {
+    STORM_TASK
+}
+
+/// A kill storm against a device that does not complete: read-like
+/// operations (their waits killable) and write-like ones (a commit that
+/// must finish) are killed while queued. The reads give up at once and are
+/// not detached; a task already killed starts nothing; only the write-like
+/// operations stay detached, as many as were in flight, and they finish
+/// once the device does. The detached count returns to where it was.
+fn smoke_killable_kill_storm_leaves_only_the_operations_holding_state() -> TestResult {
+    const READS: usize = 40;
+    const WRITES: usize = 3;
+    let _fixture = DetachFixture::new(STORM_TASK);
+    crate::handlers::install_task_id_lookup(storm_task);
+    STORM.lock().clear();
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let ready = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let before = super::abandoned_in_flight();
+    let mut waits = Vec::new();
+    for i in 0..READS + WRITES {
+        let stuck = Stuck {
+            ready: ready.clone(),
+            drops: drops.clone(),
+        };
+        let op: OwnedWait<usize> = if i < READS {
+            // A read: queued for the device behind a killable wait.
+            Box::pin(async move {
+                narf_filesystem::killable::killable(stuck)
+                    .await
+                    .unwrap_or(0)
+            })
+        } else {
+            // A write in a transaction: its wait is not killable.
+            Box::pin(stuck)
+        };
+        let mut wait = KillableWait::new(STORM_TASK, op).detach_with(retain_storm);
+        if Pin::new(&mut wait).poll(&mut cx) != Poll::Pending {
+            return TestResult::Fail("an operation on a stalled device completed");
+        }
+        waits.push(wait);
+    }
+    crate::handlers::raise_signal_pending(STORM_TASK, 9);
+    for (i, mut wait) in waits.into_iter().enumerate() {
+        let woke = Pin::new(&mut wait).poll(&mut cx);
+        let expected = if i < READS {
+            // A queued read gives up at its killable wait: done, nothing
+            // left to detach.
+            Poll::Ready(Ok(0))
+        } else {
+            Poll::Ready(Err(Killed))
+        };
+        if woke != expected {
+            return TestResult::Fail("a queued wait outlived SIGKILL");
+        }
+    }
+    // A task with SIGKILL pending starts nothing more.
+    let (op, _, never) = stuck();
+    let mut late = KillableWait::new(STORM_TASK, op).detach_with(retain_storm);
+    if Pin::new(&mut late).poll(&mut cx) != Poll::Ready(Err(Killed)) {
+        return TestResult::Fail("a killed task started an operation");
+    }
+    drop(late);
+    if never.load(Ordering::Relaxed) != 1 || STORM.lock().len() != WRITES {
+        return TestResult::Fail("more than the operations holding state were detached");
+    }
+    // The device is still stalled: the detached writes wait for it.
+    let mut detached = core::mem::take(&mut *STORM.lock());
+    detached.retain_mut(|op| op.as_mut().poll(&mut cx) == Poll::Pending);
+    if detached.len() != WRITES || drops.load(Ordering::Relaxed) != READS {
+        return TestResult::Fail("a detached write finished before its device, or a read lingered");
+    }
+    if super::abandoned_in_flight() != before + WRITES {
+        return TestResult::Fail("the detached count is not the operations still holding state");
+    }
+    // The device recovers: the rest finish and the count is back.
+    ready.store(true, Ordering::Release);
+    detached.retain_mut(|op| op.as_mut().poll(&mut cx) == Poll::Pending);
+    if !detached.is_empty() || super::abandoned_in_flight() != before {
+        return TestResult::Fail("the detached operations did not finish once the device did");
+    }
+    if drops.load(Ordering::Relaxed) != READS + WRITES {
+        return TestResult::Fail("an operation was leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_kill_storm_leaves_only_the_operations_holding_state
 );

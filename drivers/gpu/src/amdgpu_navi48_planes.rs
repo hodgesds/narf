@@ -229,7 +229,7 @@ impl ColdBoot {
         let Some(i) = running.iter().position(|m| m.pipe == display) else {
             return Ok(None);
         };
-        let m = running[i];
+        let m = running[i].clone();
         let mut selection = m.selection;
         selection.format = format;
         selection.planes = setup;
@@ -276,7 +276,7 @@ impl ColdBoot {
         {
             return Ok(None);
         }
-        let mut next = m;
+        let mut next = m.clone();
         next.selection = selection;
         next.plan = plan;
         // The display's pipes after the change, for the clock targets.
@@ -301,7 +301,9 @@ impl ColdBoot {
         // dcn401_prepare_bandwidth for this full update: pinned (Linux forces
         // p_state_change_support false) before update_clocks and before any
         // display's watermarks move, i.e. before the first change below.
-        self.pin_display_uclk().await?;
+        // Each step below is boxed where it is awaited: inline, their state
+        // gave this plane update a 24 KiB frame.
+        crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
         // prepare_bandwidth: the shared clocks only raised, the DTOs of the
         // pipes that keep fetching raised where their plane needs more.
         let mut raise: Vec<(u8, u32)> = running
@@ -312,15 +314,14 @@ impl ColdBoot {
             .flat_map(|(_, (r, p))| running_dpp_targets(r, p))
             .collect();
         raise.extend(new_targets.iter().filter(|&&(q, _)| old_mask & 1 << q != 0));
-        self.update_live_display_clocks(request, &raise, false)
-            .await?;
+        crate::out_of_line::boxed!(self.update_live_display_clocks(request, &raise, false)).await?;
         // The new pipes' DPP-only clocks, at their planes' DPPCLK.
         for &(q, khz) in new_targets.iter().filter(|&&(q, _)| old_mask & 1 << q == 0) {
-            self.prepare_display_plane_clock_live(dccg::Request {
+            crate::out_of_line::boxed!(self.prepare_display_plane_clock_live(dccg::Request {
                 pipe: q,
                 dpp_khz: khz,
                 pixel: dccg::PixelClock::OdmSegment,
-            })
+            }))
             .await
             .map_err(ModesetError::PipeClocks)?;
         }
@@ -355,18 +356,21 @@ impl ColdBoot {
                     continue;
                 }
                 // SAFETY: the caller's obligations; the scanout stays live.
-                let d = unsafe { self.update_live_display_plan(running[j].pipe, &plans[j], true) }
-                    .await?;
+                let d = crate::out_of_line::boxed!(unsafe {
+                    self.update_live_display_plan(running[j].pipe, &plans[j], true)
+                })
+                .await?;
                 running[j].plan = d.plan;
                 running[j].scanout.plan = d.plan;
-                self.modesets.retain(running[j]);
+                self.modesets.retain(running[j].clone());
                 continue;
             }
             // SAFETY: the caller's obligations, CPU views of replaced surfaces
             // withdrawn. This stream's DET/plane reductions latch before
             // siblings which need the newly available budget are visited.
-            let update =
-                unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) };
+            let update = crate::out_of_line::boxed!(unsafe {
+                self.update_live_display_planes(display, &live, &plan, &mut content)
+            });
             let change = match update.await {
                 Ok(u) => u,
                 // Refused before any register write: the scanout runs as it
@@ -383,8 +387,8 @@ impl ColdBoot {
                 Err(e) => return Err(e.into()),
             };
             next.scanout = change.scanout;
-            running[i] = next;
-            self.modesets.retain(next);
+            running[i] = next.clone();
+            self.modesets.retain(next.clone());
             updated = Some(change);
         }
         let updated = updated.ok_or(otg::Error::Invalid)?;
@@ -394,9 +398,12 @@ impl ColdBoot {
             .flat_map(|r| running_dpp_targets(r, &r.plan))
             .collect();
         // SAFETY: as above.
-        unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
+        crate::out_of_line::boxed!(unsafe {
+            self.optimize_running(&mut running, request, &targets)
+        })
+        .await?;
         for r in &running {
-            self.modesets.retain(*r);
+            self.modesets.retain(r.clone());
         }
         Ok(Some(PlanesChange {
             pipe: display,

@@ -30,7 +30,7 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
+    hook_fd_file, hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
     hook_ns_mountinfo_generation, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
     hook_root_path, pid_entry_ino, proc_pid_ino, slice_read, task_info, ProcDirMarker,
 };
@@ -555,8 +555,36 @@ fn render_schedstat(pid: u64) -> String {
 /// to walk. The single null frame keeps the `[<%px>] %pS` shape a parser
 /// expects rather than inventing symbol names (`/proc/<pid>/wchan` names the
 /// blocking syscall instead, which NARF can answer truthfully).
-fn render_stack(_pid: u64) -> String {
-    "[<0000000000000000>] 0x0\n".to_string()
+/// `/proc/<pid>/stack`. NARF has no kernel unwinder to print the frames
+/// Linux does; it prints what it knows of a parked task — the lock it is
+/// queued on (its `lock()` call site) and the syscall it is parked in — in
+/// Linux's line format, or the old placeholder when it knows neither.
+///
+/// A parked task: the lock it is queued on, or else the kernel site that
+/// parked it, then the syscall. A task inside a syscall that is not parked
+/// (on a CPU, or runnable and waiting for one): the scheduling point it
+/// yielded at, if any, then `<syscall> (running)`. Linux prints the frames
+/// of a running task's stack too; this is the part NARF can name.
+fn render_stack(pid: u64) -> String {
+    let snapshot = super::hook_sched_snapshot(pid);
+    let mut out = String::new();
+    if let Some(wchan) = snapshot.wchan {
+        if let Some(site) = snapshot.wait_site {
+            out.push_str(&format!("[<0>] lock at {site}\n"));
+        } else if let Some(site) = snapshot.park_site {
+            out.push_str(&format!("[<0>] wait at {site}\n"));
+        }
+        out.push_str(&format!("[<0>] {wchan}\n"));
+    } else if let Some(name) = snapshot.running_in {
+        if let Some(site) = snapshot.yield_site {
+            out.push_str(&format!("[<0>] yield at {site}\n"));
+        }
+        out.push_str(&format!("[<0>] {name} (running)\n"));
+    }
+    if out.is_empty() {
+        out.push_str("[<0000000000000000>] 0x0\n");
+    }
+    out
 }
 
 /// `/proc/<pid>/wchan` — where the task is sleeping.
@@ -591,8 +619,8 @@ fn format_wchan(name: Option<String>) -> String {
 /// Linux ref: `fs/proc/base.c:proc_pid_syscall` → `task_current_syscall()`.
 /// Format: `nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n`, or `"running\n"` for
 /// a task that is not blocked (which is what `task_current_syscall` reports
-/// for anything still on a CPU), or `"-1 0x0 … 0x0\n"` for a task blocked
-/// outside a syscall.
+/// for anything still on a CPU), or `"-1 sp pc\n"` for a task blocked
+/// outside a syscall (`"-1 0x0 … 0x0\n"` when not even its frame is known).
 ///
 /// The frame comes from the parked task's saved register state — the same
 /// place Linux reads it (`pt_regs`), and the same snapshot `PTRACE_GETREGS`
@@ -611,6 +639,11 @@ fn render_syscall(pid: u64) -> String {
 /// with no parked frame.
 fn format_syscall(frame: Option<[u64; 9]>, state: impl FnOnce() -> char) -> String {
     match frame {
+        // `proc_pid_syscall`: a task blocked outside any syscall (in a page
+        // fault, say) prints its -1 with only SP and PC.
+        Some(frame) if frame[0] as i64 == -1 => {
+            format!("-1 {:#x} {:#x}\n", frame[7], frame[8])
+        }
         Some(frame) => format!(
             "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
             frame[0] as i64,
@@ -1065,6 +1098,10 @@ impl FileOps for ProcFdInfoFile {
                 let _ = writeln!(s, "Pid:\t{}", target);
                 let _ = writeln!(s, "NSpid:\t{}", target);
             }
+            // file_operations::show_fdinfo (seq_show_fdinfo calls it last).
+            if let Some(file) = hook_fd_file(pid, fd) {
+                file.show_fdinfo(&mut s);
+            }
             if let Some(path) = hook_fd_path(pid, fd) {
                 let _ = writeln!(s, "# backing: {}", path);
             }
@@ -1346,18 +1383,32 @@ impl DirOps for ProcTaskTidDir {
                 ino: proc_pid_ino(self.ino, name),
                 wchan: name == "wchan",
             })),
+            "fd" | "fdinfo" => Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name)))),
+            _ => None,
+        }
+    }
+    /// `tid_base_stuff`: `DIR("fd", …)` and `DIR("fdinfo", …)`. A thread's
+    /// descriptor table is its process's (`CLONE_FILES`), so these are the
+    /// directories `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` are — which is
+    /// what makes `/proc/thread-self/fd/<n>` the link `/proc/self/fd/<n>` is.
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        match name {
+            "fd" => Some(Arc::new(ProcFdDir { pid: self.pid })),
+            "fdinfo" => Some(Arc::new(ProcFdInfoDir { pid: self.pid })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(
-            ["comm", "mem", "stat", "syscall", "wchan"]
-                .into_iter()
-                .map(|name| DirEntry {
-                    name: name.into(),
-                    file_type: FileType::File,
-                }),
-        )
+        let files = ["comm", "mem", "stat", "syscall", "wchan"]
+            .into_iter()
+            .map(|name| (name, FileType::File));
+        let dirs = ["fd", "fdinfo"]
+            .into_iter()
+            .map(|name| (name, FileType::Dir));
+        Box::new(files.chain(dirs).map(|(name, file_type)| DirEntry {
+            name: name.into(),
+            file_type,
+        }))
     }
 }
 
@@ -1520,8 +1571,10 @@ fn test_sched_snapshot(_pid: u64) -> super::ProcSchedSnapshot {
         policy: 0,
         nice: 0,
         // `read(fd=4, buf=0x1000, count=0x200)` parked at sp/pc.
+        wait_site: None,
         syscall: Some([0, 4, 0x1000, 0x200, 0, 0, 0, 0x7fff_f000, 0x0040_1000]),
         wchan: Some(alloc::string::String::from("read")),
+        ..Default::default()
     }
 }
 
@@ -1588,17 +1641,97 @@ kernel_test_in!(
     smoke_syscall_and_wchan_for_a_running_task
 );
 
+fn test_sched_snapshot_waiting_on_a_lock(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        wchan: Some(alloc::string::String::from("msync")),
+        wait_site: Some(alloc::string::String::from(
+            "drivers/fs/btrfs/src/write.rs:42",
+        )),
+        ..Default::default()
+    }
+}
+
+/// A task parked waiting for a lock says which: `/proc/<pid>/stack` names
+/// the lock's acquisition site above the syscall it is parked in, so a
+/// hung-task report can tell one stalled lock from another.
+fn smoke_stack_names_the_lock_a_task_waits_on() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_waiting_on_a_lock));
+    let stack = render_stack(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+    if stack != "[<0>] lock at drivers/fs/btrfs/src/write.rs:42\n[<0>] msync\n" {
+        return TestResult::Fail("/proc/<pid>/stack did not name the lock and the syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_stack_names_the_lock_a_task_waits_on
+);
+
+fn test_sched_snapshot_parked_off_lock(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        wchan: Some(alloc::string::String::from("fsync")),
+        park_site: Some(alloc::string::String::from(
+            "userspace/src/killable_wait.rs:7",
+        )),
+        ..Default::default()
+    }
+}
+
+fn test_sched_snapshot_running_in_syscall(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        running_in: Some(alloc::string::String::from("msync")),
+        yield_site: Some(alloc::string::String::from(
+            "userspace/src/mapped_file/writeback.rs:9",
+        )),
+        ..Default::default()
+    }
+}
+
+/// Every task inside a syscall gets a stack that says where it is: a task
+/// parked on something other than a lock names the site that parked it, and
+/// one that is not parked at all — busy, or runnable after a scheduling
+/// point — names its syscall and that scheduling point. Both used to read
+/// `0x0`, which said nothing about a task that might be the one holding up
+/// everything else.
+fn smoke_stack_names_every_park_and_a_running_syscall() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_parked_off_lock));
+    let parked = render_stack(1);
+    super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_running_in_syscall));
+    let running = render_stack(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+    if parked != "[<0>] wait at userspace/src/killable_wait.rs:7\n[<0>] fsync\n" {
+        return TestResult::Fail("/proc/<pid>/stack did not name the site that parked the task");
+    }
+    if running != "[<0>] yield at userspace/src/mapped_file/writeback.rs:9\n[<0>] msync (running)\n"
+    {
+        return TestResult::Fail("/proc/<pid>/stack did not name a running task's syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_stack_names_every_park_and_a_running_syscall
+);
+
 /// Thread 7 is parked in `futex(0x1000, 128, 0)`; thread 8 sleeps outside a
-/// syscall. Each `task/<tid>/{syscall,wchan}` must describe ITS thread.
+/// syscall; thread 10 is parked in a page fault (its frame is known, its
+/// syscall number is -1). Each `task/<tid>/{syscall,wchan}` must describe ITS
+/// thread.
 fn test_thread_stat(tid: u64) -> Option<super::ThreadStat> {
     let parked = tid == 7;
-    (tid == 7 || tid == 8).then(|| super::ThreadStat {
+    let syscall = match tid {
+        7 => Some([202, 0x1000, 128, 0, 0, 0, 0, 0x7fff_e000, 0x0040_2000]),
+        10 => Some([u64::MAX, 0, 0, 0, 0, 0, 0, 0x7fff_d000, 0x0040_3000]),
+        _ => None,
+    };
+    matches!(tid, 7 | 8 | 10).then(|| super::ThreadStat {
         comm: alloc::string::String::from("worker"),
         utime_ticks: 0,
         stime_ticks: 0,
         state: 'S',
         tgid: Some(1),
-        syscall: parked.then_some([202, 0x1000, 128, 0, 0, 0, 0, 0x7fff_e000, 0x0040_2000]),
+        syscall,
         wchan: parked.then(|| alloc::string::String::from("futex")),
     })
 }
@@ -1634,6 +1767,8 @@ fn smoke_task_tid_syscall_and_wchan_describe_the_thread() -> TestResult {
     let parked_wchan = read(7, "wchan");
     let idle_syscall = read(8, "syscall");
     let idle_wchan = read(8, "wchan");
+    let fault_syscall = read(10, "syscall");
+    let fault_wchan = read(10, "wchan");
     let gone = read(9, "syscall");
     super::__test_thread_stat_hook_restore(prev);
 
@@ -1650,6 +1785,12 @@ fn smoke_task_tid_syscall_and_wchan_describe_the_thread() -> TestResult {
         || idle_wchan.as_deref() != Some("0")
     {
         return TestResult::Fail("a thread blocked outside a syscall reads -1 / 0");
+    }
+    // `proc_pid_syscall`: "%d 0x%llx 0x%llx\n" for nr < 0.
+    if fault_syscall.as_deref() != Some("-1 0x7fffd000 0x403000\n")
+        || fault_wchan.as_deref() != Some("0")
+    {
+        return TestResult::Fail("a thread parked in a page fault reads -1 sp pc / 0");
     }
     if gone.as_deref() != Some("") {
         return TestResult::Fail("a vanished thread's syscall file reads empty");

@@ -247,15 +247,32 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // filesystems implement). NARF has no such hook, so MNT_FORCE only
     // bypasses the busy test, exactly like MNT_DETACH, and aborts nothing.
     let lazy = flags & (MNT_DETACH | MNT_FORCE) != 0;
+    // The filesystem's device number, for the file cache: what it holds for
+    // this mount is written before the mount goes, and dropped after.
+    let device = stat_ino_path_dir_aware(target.as_str())
+        .ok()
+        .map(|stat| stat.5.dev)
+        .filter(|device| *device != 0);
     if !lazy
         && (!submounts.is_empty()
             || any_task_cwd_under(target.as_str())
             || any_task_root_under(target.as_str())
-            || crate::mqueue::any_fd_path_under(target.as_str()))
+            || crate::mqueue::any_fd_path_under(target.as_str())
+            // A shared mapping of one of its files holds the mount, as
+            // `vma->vm_file` does on Linux.
+            || device.is_some_and(crate::mapped_file::device_mapped))
     {
         ctx.set_return(fail(EBUSY));
         return;
     }
+
+    // `generic_shutdown_super` → `sync_filesystem`: every dirty `MAP_SHARED`
+    // page of a file on this filesystem reaches it before the mount goes.
+    // Pages that cannot be written are lost after the unmount, with the
+    // count logged, as Linux evicts the inodes whatever the sync returned.
+    // A filesystem that reports no device number cannot be told apart, so
+    // every file is written for it.
+    let _ = crate::mapped_file::sync_all_files(device);
 
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
@@ -284,6 +301,15 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // unmounts and returns 0. A racing unmount that emptied the slot between
     // the check above and here lands on `NotFound` → -EINVAL, Linux's answer
     // for "the path is no longer a mount point".
+    if result.is_ok() && !lazy {
+        // Nothing of this filesystem stays in the file cache: no entry
+        // keeps one of its files open, and no writeback reaches it. (A
+        // lazy detach leaves the filesystem alive for whoever still uses
+        // it, its cached pages with it, as Linux's does.)
+        if let Some(device) = device {
+            crate::mapped_file::forget_device(device);
+        }
+    }
     match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(narf_filesystem::FsError::NotFound) => ctx.set_return(fail(EINVAL)),

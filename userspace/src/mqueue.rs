@@ -747,45 +747,16 @@ fn with_inotify_active<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>, &Atom
     f(g.get_or_insert_with(BTreeMap::new), &INOTIFY_ACTIVE)
 }
 
-// ── fd → path side table ────────────────────────────────────────────
-// The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
-// just an fd) can't recover the file's path to fire IN_MODIFY. We record
-// task → fd-indexed absolute paths at open and consult it on write; close
-// clears the reusable slot. The path is part of descriptor identity, so every
-// duplication path preserves it as well; *at syscalls also rely on it for
-// directory fds. An fd-indexed vector mirrors FdTable: a hot open/close loop
-// reuses slot 3 instead of allocating and freeing a B-tree node every time.
-type FdPathIdentity = (String, Option<u64>);
-type FdPathSlots = Vec<Option<FdPathIdentity>>;
-type FdPathTasks = BTreeMap<u64, FdPathSlots>;
-const FD_PATH_SHARDS: usize = 32;
+// ── What a descriptor names ─────────────────────────────────────────
+// The name of an open file lives in its open file description
+// (`crate::fd::names`, Linux `file->f_path`), so `dup`, `fork`, `SCM_RIGHTS`
+// and the threads sharing a descriptor table all read one name, it follows a
+// rename, and it goes when the last descriptor closes. These are the
+// descriptor-number entry points: an open records the path it resolved, and
+// a `*at` syscall, an inotify event or a `/proc/<pid>/fd` link asks what a
+// descriptor refers to.
 
-#[repr(align(64))]
-struct FdPathShard {
-    paths: IrqSafeSpinLock<Option<FdPathTasks>>,
-}
-
-impl FdPathShard {
-    const fn new() -> Self {
-        Self {
-            paths: IrqSafeSpinLock::new(None),
-        }
-    }
-}
-
-static FD_PATHS: [FdPathShard; FD_PATH_SHARDS] = [const { FdPathShard::new() }; FD_PATH_SHARDS];
-
-#[inline]
-fn fd_path_shard(task: u64) -> usize {
-    (task as usize) & (FD_PATH_SHARDS - 1)
-}
-
-fn with_fd_paths<R>(task: u64, f: impl FnOnce(&mut FdPathTasks) -> R) -> R {
-    let mut g = FD_PATHS[fd_path_shard(task)].paths.lock();
-    f(g.get_or_insert_with(BTreeMap::new))
-}
-
-/// Record the absolute path an fd was opened on (for later IN_MODIFY).
+/// Record the absolute path `fd` was just opened on.
 pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<u64>) {
     register_fd_path_owned(task, fd, String::from(path), mount_id);
 }
@@ -793,157 +764,59 @@ pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<
 /// Owned counterpart for open paths that no longer need their normalized
 /// pathname after registration.
 pub(crate) fn register_fd_path_owned(task: u64, fd: u32, path: String, mount_id: Option<u64>) {
-    // The description's close event names this path (`fsnotify_close`).
     let opened = crate::fd::with_table(task, |t| {
         t.get(fd).map(|e| e.ops.clone()).zip(t.description(fd))
     })
     .flatten();
     if let Some((ops, description)) = opened {
         let is_dir = matches!(ops.stat().mode.file_type, narf_filesystem::FileType::Dir);
-        description.set_close_notify(&path, is_dir);
-    }
-    with_fd_paths(task, |m| {
-        let slots = m.entry(task).or_default();
-        let index = fd as usize;
-        if slots.len() <= index {
-            slots.resize_with(index + 1, || None);
-        }
-        slots[index] = Some((path, mount_id));
-    });
-}
-
-/// Drop an fd → path mapping on close.
-pub(crate) fn forget_fd_path(task: u64, fd: u32) {
-    with_fd_paths(task, |m| {
-        if let Some(slot) = m
-            .get_mut(&task)
-            .and_then(|slots| slots.get_mut(fd as usize))
-        {
-            *slot = None;
-        }
-    });
-}
-
-/// Drop every descriptor-path identity owned by an exiting task.
-///
-/// `CLONE_FILES` shares the descriptor table but the compatibility metadata
-/// remains task-keyed, so detaching the shared fd-table reference cannot
-/// retire these rows. Leaving them behind retains one cloned pathname (and
-/// its B-tree entry) per inherited descriptor for every exited thread.
-pub(crate) fn release_task_fd_paths(task: u64) {
-    let mut paths = FD_PATHS[fd_path_shard(task)].paths.lock();
-    if let Some(paths) = paths.as_mut() {
-        paths.remove(&task);
+        crate::fd::names::bind(&description, path, mount_id, is_dir);
     }
 }
 
-/// Test/reset hook — drop every recorded fd→path mapping.
-///
-/// `crate::fd::__test_reset` wipes the descriptor tables wholesale rather
-/// than closing each fd, so without this the paths those descriptors were
-/// opened on outlive them, and anything that reads the table as a liveness
-/// signal (the `umount(2)` busy test) sees references no task holds.
-#[doc(hidden)]
-pub fn __test_reset_fd_paths() {
-    for shard in FD_PATHS.iter() {
-        *shard.paths.lock() = None;
-    }
-}
-
-/// Test-only residue probe for the central task-exit sweep.
-pub(crate) fn task_has_fd_paths(task: u64) -> bool {
-    FD_PATHS[fd_path_shard(task)]
-        .paths
-        .lock()
-        .as_ref()
-        .and_then(|paths| paths.get(&task))
-        .is_some_and(|slots| slots.iter().any(Option::is_some))
-}
-
-/// Duplicate (or replace) a descriptor's pathname identity.
-///
-/// `dup2`/`dup3` may replace an existing destination, so an untracked source
-/// must explicitly clear any former identity at the destination.
-pub(crate) fn duplicate_fd_path(task: u64, source_fd: u32, destination_fd: u32) {
-    with_fd_paths(task, |m| {
-        let identity = m
-            .get(&task)
-            .and_then(|slots| slots.get(source_fd as usize))
-            .and_then(Clone::clone);
-        if let Some(identity) = identity {
-            let slots = m.entry(task).or_default();
-            let index = destination_fd as usize;
-            if slots.len() <= index {
-                slots.resize_with(index + 1, || None);
-            }
-            slots[index] = Some(identity);
-        } else if let Some(slot) = m
-            .get_mut(&task)
-            .and_then(|slots| slots.get_mut(destination_fd as usize))
-        {
-            *slot = None;
-        }
-    });
-}
-
-/// Look up the absolute path an fd was opened on, if recorded. Used by
-/// `landlock_add_rule` to turn a `parent_fd` back into a path.
-pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
-    with_fd_paths(task, |m| {
-        m.get(&task)
-            .and_then(|slots| slots.get(fd as usize))
-            .and_then(|slot| slot.as_ref())
-            .map(|(path, _)| path.clone())
+/// `fd` was just opened with `O_TMPFILE` inside the directory `dir`:
+/// `d_tmpfile` names the inode `#<ino>` there and never links it, so the
+/// file reads `<dir>/#<ino> (deleted)`.
+pub(crate) fn register_fd_tmpfile(task: u64, fd: u32, dir: &str, mount_id: Option<u64>) {
+    let opened = crate::fd::with_table(task, |t| {
+        t.get(fd).map(|e| e.ops.clone()).zip(t.description(fd))
     })
+    .flatten();
+    if let Some((ops, description)) = opened {
+        let path = alloc::format!("{}/#{}", dir.trim_end_matches('/'), ops.ino());
+        crate::fd::names::bind_unlinked(&description, path, mount_id);
+    }
 }
 
-/// Is any open fd, in any task, backed by a path at or under `prefix`?
+/// What the file behind `fd` names, if it was opened by path.
+pub(crate) fn fd_name(task: u64, fd: u32) -> Option<crate::fd::names::FileName> {
+    crate::fd::with_table(task, |t| t.description(fd))
+        .flatten()
+        .and_then(|description| description.name())
+}
+
+/// The absolute path of the file behind `fd`: where it is now or, once its
+/// name has been removed, where it last was. Used by `landlock_add_rule` to
+/// turn a `parent_fd` back into a path, and by the `*at` syscalls.
+pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
+    fd_name(task, fd).map(|name| String::from(&*name.path))
+}
+
+/// Is any open file, in any task, at or under `prefix`?
 ///
 /// This is NARF's stand-in for Linux's `mnt_get_count()`: the per-mount
 /// reference count a `struct file` on that mount holds, which is what makes
-/// `umount(2)` answer -EBUSY. The table this walks is the one `open(2)`
-/// records into and `close(2)` / task exit retire, so an entry means a live
-/// descriptor — see `sys_umount2`.
+/// `umount(2)` answer -EBUSY — see `sys_umount2`.
 ///
 /// `prefix` is a host-absolute path with no trailing slash (`/` itself is
 /// passed as `/`, and then everything is under it).
 pub(crate) fn any_fd_path_under(prefix: &str) -> bool {
-    FD_PATHS.iter().any(|shard| {
-        shard.paths.lock().as_ref().is_some_and(|tasks| {
-            tasks.values().any(|slots| {
-                slots
-                    .iter()
-                    .flatten()
-                    .any(|(path, _)| crate::handlers::path_at_or_under(path, prefix))
-            })
-        })
-    })
+    crate::fd::names::any_under(prefix)
 }
 
 /// Mount that was visible when `fd` was opened.
 pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
-    with_fd_paths(task, |m| {
-        m.get(&task)
-            .and_then(|slots| slots.get(fd as usize))
-            .and_then(|slot| slot.as_ref())
-            .and_then(|(_, id)| *id)
-    })
-}
-
-/// Copy fd-path identities along with the descriptor table during fork/clone.
-/// The table is task-keyed even when CLONE_FILES shares the underlying file
-/// descriptions, because proc-fd lookups and *at syscalls resolve through the
-/// calling task.  Without this, a forked systemd mount helper inherited a
-/// valid O_PATH parent fd but `mkdirat(parent_fd, ...)` saw EBADF.
-pub(crate) fn fork_fd_paths(parent: u64, child: u64) {
-    let inherited = with_fd_paths(parent, |m| m.get(&parent).cloned());
-    with_fd_paths(child, |m| {
-        if let Some(slots) = inherited {
-            m.insert(child, slots);
-        } else {
-            m.remove(&child);
-        }
-    });
+    fd_name(task, fd).and_then(|name| name.mount_id)
 }
 
 fn parent_and_base(abs: &str) -> (&str, &str) {
@@ -1079,14 +952,13 @@ pub(crate) fn notify_attrib(abs_path: &str, is_dir: bool) {
 }
 
 /// IN_ATTRIB for the file behind `fd` (fchmod/fchown/futimens), looked up
-/// via the fd → path table.
+/// via the name its open file carries.
 pub(crate) fn notify_attrib_fd(task: u64, fd: u32) {
     if !fs_notify_active() {
         return;
     }
-    let path = fd_path(task, fd);
-    if let Some(p) = path {
-        fs_notify(&p, IN_ATTRIB, false);
+    if let Some(name) = fd_name(task, fd).filter(|name| !name.deleted) {
+        fs_notify(&name.path, IN_ATTRIB, false);
     }
 }
 
@@ -1096,14 +968,13 @@ pub fn notify_modify_path(abs_path: &str) {
     fs_notify(abs_path, IN_MODIFY, false);
 }
 
-/// IN_MODIFY for the file behind `fd`, looked up via the fd → path table.
+/// IN_MODIFY for the file behind `fd`, looked up via the name it carries.
 pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
     if !fs_notify_active() {
         return;
     }
-    let path = fd_path(task, fd);
-    if let Some(p) = path {
-        fs_notify(&p, IN_MODIFY, false);
+    if let Some(name) = fd_name(task, fd).filter(|name| !name.deleted) {
+        fs_notify(&name.path, IN_MODIFY, false);
     }
 }
 

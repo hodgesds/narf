@@ -535,7 +535,7 @@ mod stall_wd {
                 if halted || awake == 0 {
                     continue; // idle-halted or nothing runnable — not a spin
                 }
-                if let Some(apic) = narf_acpi::apic_id_at(cpu) {
+                if let Some(apic) = narf_acpi::apic_id_of_cpu(cpu) {
                     // SAFETY: LAPIC initialised at boot.
                     unsafe {
                         narf_interrupts::x86_64::apic::send_nmi_ipi(apic as u32);
@@ -1101,6 +1101,9 @@ unsafe extern "C" {
 extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
     // SAFETY: `frame` is the live trap frame on the entry stack (shim contract).
     let frame = unsafe { &mut *frame };
+    // An interrupt on an idle CPU rejoins the RCU census before any handler
+    // runs and leaves it again on return (Linux `rcu_irq_enter`/`_exit`).
+    let _rcu = narf_rcu::IrqEntry::enter();
     narf_lib::context::enter_trap_handler();
     let mut regs = [0; 34];
     regs[..20].copy_from_slice(&[
@@ -1140,10 +1143,135 @@ extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
     narf_lib::context::exit_trap_handler();
 }
 
+/// Rewrite `frame` so `iretq` resumes kernel code at `pc` on `sp` with
+/// interrupts masked (the overflow test's task-retire continuation).
+fn resume_kernel_at(frame: &mut TrapFrame, pc: u64, sp: u64) {
+    frame.rip = pc;
+    frame.rsp = sp;
+    frame.cs = super::gdt::KCODE_SEL as u64;
+    frame.ss = super::gdt::KDATA_SEL as u64;
+    frame.rflags = 0x2;
+}
+
+/// #DF handler body for kernel-stack overflow. `true` when a kernel test's
+/// expected overflow was retired and the frame now resumes elsewhere; a real
+/// overflow panics inside `report`. `false` for an unrelated #DF.
+#[cold]
+#[inline(never)]
+fn stack_overflow_on_double_fault(frame: &mut TrapFrame) -> bool {
+    let cr2: u64;
+    // SAFETY: reading CR2 at CPL=0 is always defined.
+    unsafe {
+        core::arch::asm!("mov {v}, cr2", v = out(reg) cr2, options(nomem, nostack, preserves_flags));
+    }
+    // CR2 is the guard address the escalating #PF faulted on; the saved rsp
+    // (in the guard too, when the push itself faulted) is the fallback.
+    let (fault, hit) = match narf_memory::kstack::guard_hit(cr2) {
+        Some(hit) => (cr2, hit),
+        None => match narf_memory::kstack::guard_hit(frame.rsp) {
+            Some(hit) => (frame.rsp, hit),
+            None => return false,
+        },
+    };
+    match super::super::kstack_overflow::report(
+        "double fault",
+        hit,
+        fault,
+        frame.rip,
+        frame.rsp,
+        frame.rbp,
+    ) {
+        Some((pc, sp)) => {
+            resume_kernel_at(frame, pc, sp);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Arguments for [`page_fault_overflow_body`], passed across the stack switch.
+struct PfOverflow {
+    frame: *mut TrapFrame,
+    cr2: u64,
+    hit: narf_memory::kstack::GuardHit,
+    resumed: bool,
+}
+
+extern "C" fn page_fault_overflow_body(arg: *mut PfOverflow) {
+    // SAFETY: `arg` points at the caller's live `PfOverflow` (on the faulting
+    // stack, which is mapped: the #PF frame was pushed there), and the caller
+    // waits in `call_on_stack` for this to return.
+    let a = unsafe { &mut *arg };
+    // SAFETY: `a.frame` is the live trap frame of the #PF being handled.
+    let frame = unsafe { &mut *a.frame };
+    if let Some((pc, sp)) = super::super::kstack_overflow::report(
+        "page fault",
+        a.hit,
+        a.cr2,
+        frame.rip,
+        frame.rsp,
+        frame.rbp,
+    ) {
+        resume_kernel_at(frame, pc, sp);
+        a.resumed = true;
+    }
+}
+
+/// #PF on a kernel-stack guard: switch to this CPU's #DF IST stack and report
+/// there. A #DF taken while this runs would reuse the same stack — acceptable
+/// on a path that ends in panic; Linux accepts the same.
+#[cold]
+#[inline(never)]
+fn stack_overflow_on_page_fault(
+    frame: &mut TrapFrame,
+    cr2: u64,
+    hit: narf_memory::kstack::GuardHit,
+) -> bool {
+    let mut arg = PfOverflow {
+        frame,
+        cr2,
+        hit,
+        resumed: false,
+    };
+    let top = super::gdt::df_ist_top();
+    // SAFETY: `top` is the 16-byte-aligned top of this CPU's #DF IST stack,
+    // unused unless a #DF is in progress (it is not: this is #PF); the body is
+    // an `extern "C" fn(*mut PfOverflow)` and `arg` outlives the call.
+    unsafe {
+        call_on_stack(
+            &mut arg as *mut PfOverflow as *mut u8,
+            page_fault_overflow_body as usize,
+            top,
+        )
+    };
+    arg.resumed
+}
+
+/// Call `f(arg)` with `rsp = top` and return to the original stack — a port of
+/// Linux's `call_on_stack`.
+///
+/// # Safety
+/// `top` must be the 16-byte-aligned top of a mapped stack nothing else uses
+/// for the duration, and `f` an `extern "C" fn(*mut u8)`.
+#[unsafe(naked)]
+unsafe extern "C" fn call_on_stack(arg: *mut u8, f: usize, top: u64) {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "mov rsp, rdx",
+        "call rsi",
+        "mov rsp, rbp",
+        "pop rbp",
+        "ret",
+    );
+}
+
 /// Rust-side trap dispatch. Called from `common_trap` in `trap_entry.S`
 /// with a mutable pointer to the `TrapFrame` on the trap stack.
 ///
 /// Contract:
+///   - A #DF or kernel #PF on a kernel-stack guard page is a stack overflow:
+///     reported from the #DF IST stack (`kstack_overflow::report`), then panic.
 ///   - If a probe is armed (`narf_arch::x86_64::probe` globals), consume
 ///     it: record the vector, rewrite `frame.rip` to the probe's
 ///     recovery RIP, and return. The asm tail restores GPRs and
@@ -1171,6 +1299,13 @@ const fn scheduler_user_return_allowed(cs: u64, vector: u64) -> bool {
 }
 
 fn dispatch_trap(frame: &mut TrapFrame) {
+    // #DF arrives on its own IST stack. The usual cause of a kernel #DF is a
+    // kernel stack overflow: the #PF on the guard page could not push its own
+    // exception frame. Classify before anything reads the faulting stack
+    // (Linux `exc_double_fault` -> `handle_stack_overflow`).
+    if frame.vector == 8 && stack_overflow_on_double_fault(frame) {
+        return;
+    }
     // Software-interrupt syscall gate. `int 0x80` arrives here; the
     // caller's registers have been saved into `frame` already.
     // Convention: rax = syscall number, rdi/rsi/rdx/r10/r8/r9 =
@@ -1232,6 +1367,9 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         // (whose trap-entry LAST_RIP never updates). Cheap; NMI context.
         #[cfg(feature = "stall-watchdog")]
         stall_wd::record_nmi(narf_lib::percpu::current_cpu(), frame.rip, frame.cs);
+        // An NMI on an idle CPU rejoins the RCU census for its handlers (the
+        // stall detector and crash dump run here) — Linux `rcu_nmi_enter`.
+        let _rcu = narf_rcu::IrqEntry::enter();
         narf_interrupts::on_nmi();
         return;
     }
@@ -1476,6 +1614,17 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         let cr2_in_user_half = cr2 < 0x0000_8000_0000_0000;
         let from_user = (frame.cs & 3) == 3;
 
+        // A kernel fault on a kernel-stack guard page is an overflow. Report it
+        // from the #DF IST stack before anything below spends more of what is
+        // left (Linux `page_fault_oops`'s VMAP_STACK branch).
+        if !from_user && narf_memory::kstack::area_contains(cr2) {
+            if let Some(hit) = narf_memory::kstack::guard_hit(cr2) {
+                if stack_overflow_on_page_fault(frame, cr2, hit) {
+                    return;
+                }
+            }
+        }
+
         // DIAG (stall-watchdog): detect a fault LOOP — the same CPU faulting on
         // the same (rip, cr2) repeatedly means the fault handler "resolves" it
         // but the retry re-faults (e.g. a stack-grow that installs a page the
@@ -1578,12 +1727,25 @@ fn dispatch_trap(frame: &mut TrapFrame) {
                 // reclaim. Its scheduler kick is deliberately enough to end
                 // that wait; honour the pending fatal signal before this failed
                 // allocation is misclassified as a fresh synchronous SIGSEGV.
-                if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
-                    let mut ctx = X86TrapContext::from_int80(frame);
-                    if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-                        hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
-                    }
-                }
+                //
+                // The default action exits the task on this stack and never
+                // returns, so no destructor of a local here runs: release the
+                // address-space reference first. Holding it across the exit
+                // leaked one strong `Arc` per task killed in a fault — its
+                // whole address space outlived it (a kill storm's ~14 page
+                // tables and the pages of every such child). Should the hook
+                // return, take a fresh reference for the stack-grow attempt.
+                let as_arc =
+                    if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
+                        drop(as_arc);
+                        let mut ctx = X86TrapContext::from_int80(frame);
+                        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+                        }
+                        narf_userspace::active_user_as()
+                    } else {
+                        Some(as_arc)
+                    };
                 file_fault_bus = r == Err(narf_memory::AddressSpaceError::Bus);
                 // A guard marker is a final SIGSEGV, never a stack grow.
                 let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
@@ -1605,7 +1767,9 @@ fn dispatch_trap(frame: &mut TrapFrame) {
                 // are delivered far more often near a stack boundary).
                 // try_grow_stack requires a nearby real STACK_GUARD region, so
                 // a non-stack user vaddr still reaches the SEGV/panic surface.
-                if !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half) {
+                if let Some(as_arc) = as_arc
+                    .filter(|_| !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half))
+                {
                     // SAFETY: same identity-map argument.
                     if unsafe {
                         as_arc.try_grow_stack_with_limits(

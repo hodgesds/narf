@@ -13,6 +13,8 @@ pub(super) fn occupied_domain(
 }
 #[path = "wowlan_nlo_station.rs"]
 pub(super) mod nlo;
+#[path = "sched_scan.rs"]
+pub(super) mod sched;
 
 pub use narf_wireless::association::Bss as ScanBss;
 /// Linux MT76_CONNAC_SCAN_IE_LEN; the packed v1 request reserves600 bytes.
@@ -57,9 +59,49 @@ pub fn validate_scan_probe_ies(mut bytes: &[u8]) -> Result<(), Error> {
 #[derive(Clone, Debug)]
 pub struct ScanReport {
     pub bss: Vec<ScanBss>,
+    /// `(bssid, channel)` of every result whose own Beacon (not only a
+    /// Probe Response) this scan received. Only such a BSS may be followed
+    /// onto a radar/NO_IR channel (`TxPermission::from_heard_ap`).
+    pub beaconed: Vec<([u8; 6], u8)>,
     pub received: u32,
     pub ignored: u32,
     pub truncated: bool,
+}
+
+impl ScanReport {
+    /// Record `bss` as beaconed when `packet` is its Beacon frame.
+    pub(super) fn note_beacon(&mut self, packet: &[u8], bss: &ScanBss) {
+        let key = (bss.bssid, bss.channel);
+        if bss.band.is_none()
+            && is_beacon(packet)
+            && !self.beaconed.contains(&key)
+            && self.beaconed.len() < 64
+        {
+            self.beaconed.push(key);
+        }
+    }
+
+    /// Add or refresh `bss`, received in `packet`; a hidden-SSID Beacon
+    /// does not replace a Probe Response's SSID. At most 64 results.
+    pub(super) fn record(&mut self, packet: &[u8], bss: ScanBss) {
+        self.note_beacon(packet, &bss);
+        if let Some(old) = self.bss.iter_mut().find(|old| {
+            old.bssid == bss.bssid && old.channel == bss.channel && old.band == bss.band
+        }) {
+            if !bss.ssid.is_empty() || old.ssid.is_empty() {
+                *old = bss;
+            }
+        } else if self.bss.len() < 64 {
+            self.bss.push(bss);
+        } else {
+            self.truncated = true;
+        }
+    }
+}
+
+/// A native management RX packet carrying a Beacon (subtype 8).
+pub(super) fn is_beacon(packet: &[u8]) -> bool {
+    rx_frame(packet).is_some_and(|frame| frame.first() == Some(&0x80))
 }
 
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -85,6 +127,9 @@ pub(super) fn rx_on_channel(packet: &[u8], channel: u8) -> Option<&[u8]> {
 pub(super) struct CcmpRx {
     pub pn: u64,
     pub key_id: u8,
+    /// `MT_RXD1_NORMAL_SEC_MODE` (`enum mt76_cipher_type`): AES_CCMP 4,
+    /// CCMP_256 10, GCMP 11, GCMP_256 12. Their PN layout is the same.
+    pub cipher: u8,
 }
 
 pub(super) struct NativeRx<'a> {
@@ -99,6 +144,9 @@ pub(super) struct NativeRx<'a> {
     pub fragment: bool,
     /// Optional original P-RXV DW0; absence is not a fabricated PHY rate.
     pub phy: Option<u32>,
+    /// The per-chain RCPI word: P-RXV DW1, or group 5's when present
+    /// (mt7921_mac_fill_rx). `None` without group 3.
+    pub rcpi: Option<u32>,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
@@ -126,7 +174,8 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     super::super::channel::from_rx_channel(channel)?;
     let r4 = word(packet, 16)?;
     let cipher = (r1 >> 16) & 0x1f;
-    if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
+    // MT_CIPHER_NONE, AES_CCMP, CCMP_256, GCMP, GCMP_256.
+    if !matches!(cipher, 0 | 4 | 10 | 11 | 12)
         || r1 & (0x3f << 23) != 0
         || r2 & ((1 << 13) | (7 << 23)) != 0
     {
@@ -143,6 +192,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let mut offset = 24usize;
     let mut pn = None;
     let mut phy = None;
+    let mut rcpi = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
         if r1 & (1 << flag) != 0 {
             let group = packet.get(offset..offset + size)?;
@@ -156,10 +206,12 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     }
     if r1 & (1 << 13) != 0 {
         phy = Some(word(packet, offset)?);
+        rcpi = Some(word(packet, offset + 4)?);
         packet.get(offset..offset + 8)?;
         offset += 8;
         if r1 & (1 << 15) != 0 {
             packet.get(offset..offset + 72)?;
+            rcpi = Some(word(packet, offset + 24)?);
             offset += 72;
         }
     } else if r1 & (1 << 15) != 0 {
@@ -175,10 +227,12 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         tid: ((r2 >> 16) & 15) as u8,
         fragment,
         phy,
-        ccmp: if cipher == 4 {
+        rcpi,
+        ccmp: if cipher != 0 {
             Some(CcmpRx {
                 pn: pn?,
                 key_id: ((r1 >> 21) & 3) as u8,
+                cipher: cipher as u8,
             })
         } else {
             None
@@ -596,7 +650,7 @@ impl<B: Backend> Session<B> {
         mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         validate_scan_options(options)?;
-        if self.p2p_rf_busy() {
+        if self.p2p_rf_busy() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let sequence = self.scan_seq % 127 + 1;
@@ -797,6 +851,7 @@ impl<B: Backend> Session<B> {
             .await?;
             let mut report = ScanReport {
                 bss: Vec::new(),
+                beaconed: Vec::new(),
                 received: 0,
                 ignored: 0,
                 truncated: false,
@@ -830,19 +885,7 @@ impl<B: Backend> Session<B> {
                         if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
                             continue;
                         }
-                        if let Some(old) = report.bss.iter_mut().find(|old| {
-                            old.bssid == bss.bssid
-                                && old.channel == bss.channel
-                                && old.band == bss.band
-                        }) {
-                            if !bss.ssid.is_empty() || old.ssid.is_empty() {
-                                *old = bss;
-                            }
-                        } else if report.bss.len() < 64 {
-                            report.bss.push(bss);
-                        } else {
-                            report.truncated = true;
-                        }
+                        report.record(&packet, bss);
                     }
                     if let Some(event) = backend.receive()? {
                         if event.len() < 36 {

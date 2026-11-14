@@ -60,8 +60,88 @@ multipath / fabrics (defer).
 - **Multiple controllers** (Linux `nvme_probe` per PCI function). `probe` runs
   once per NVMe function and installs it as the next instance `nvme<C>` (probe
   order = PCI enumeration order); each instance owns its BAR mapping, admin and
-  I/O queues, MSI-X vectors, PRP list and 128 KiB DMA scratch behind its own
+  I/O queues, MSI-X vectors and 128 KiB DMA scratch behind its own
   request gate. Re-probing an installed function is a no-op.
+- **Queued I/O submission** (`imp/mq.rs`, `imp/req.rs`; Linux blk-mq +
+  `nvme_queue_rq` / `nvme_irq` / `nvme_process_cq`). Every I/O queue
+  (`mq::IoQueue`) has its own command-id tag space — `depth - 1` tags, depth
+  = `min(CAP.MQES + 1, 1024)` (Linux `io_queue_depth`), no fixed constant —
+  a per-command slot (state, waker, owned DMA resources: the command's PRP
+  list page from the queue's pool and a pin on the caller's payload), a
+  submission lock held only to write one SQE and ring the doorbell, and a
+  completion lock held only to walk fresh CQEs. Nothing is held across an
+  await. The host asks for one queue pair per CPU (`host_io_queue_pairs()`,
+  Linux `nvme_setup_io_queues`), bounded by the controller's grant (Set
+  Features — Number of Queues), the MSI-X table and the IDT vector supply
+  — each a *bound on the count*, as in Linux `nvme_setup_irqs`, never a
+  reason to fall back to polling (a table with fewer entries than CPUs
+  gives `size − 1` MSI-X queues); a CPU submits on queue `cpu % n`.
+  Completions are consumed as `nvme-pci` consumes them: on an IRQ-driven
+  queue only the queue's MSI-X handler (installed with the queue as its
+  cookie, Linux `nvme_irq` → `nvme_process_cq`) reaps the CQ, matching
+  CQEs to their command id, publishing in the slot and waking the owner by
+  reference; **a waiter on an IRQ-driven queue never looks at the CQ** (no
+  poll slice, no phase check of its own), so a lost or undelivered
+  interrupt is not a silent slowdown but surfaces at the command's
+  timeout (below). On a queue created without a vector (the polled
+  fallback, Linux `poll_queues`) the waiter reaps (`nvme_poll`) and asks to
+  be polled again at once — a cooperative busy-poll, `blk_poll` with
+  `cond_resched`. The owner reaps (frees) in process context either way.
+  The gate-free data path is
+  `req::NvmeRequest`: one future per block request, posted on the
+  submitting CPU's queue from an immutable snapshot of the controller's
+  queues + geometry (`req::IoPath`, republished whenever the gate holder
+  changes either), awaiting its own completion while any number of other
+  requests are at the device. `NvmeNamespaceBlock::queue()` /
+  `NvmeBlockDevice::submit` expose it as a `narf_block::BlockQueue`
+  (`req::NvmeQueue`), so `SyncBlock::submit` returns a *pending* future;
+  the request gate is taken only on the slow paths (timeout → reset +
+  replay, controller found dead or mid-reset at submission). Requests
+  longer than MDTS are issued as a sequence of commands. Flush is queued
+  too; Dataset Management / Write Zeroes stay gate-held (no data moves).
+  Scatter-gather (`narf_block::SgRequest` over a `Cap<PageList, Read>`,
+  `req::NvmeQueue::submit_sg`): the block layer splits to this queue's
+  `QueueLimits` (MDTS, 513 pages per command, dword alignment) and the
+  driver builds PRP1 + a per-command PRP-list page straight from the
+  list's segments (`req::build_rw_sqe_segments`); the list is pinned in
+  the command's slot until the terminal completion like a buffer.
+  `BlockCompletion::tag` encodes `(instance, qid, cid, generation)`;
+  `cancel(tag)` issues an NVMe Abort (admin opcode 0x08,
+  `Controller::abort_command`) and reports `Cancelled` exactly when the
+  controller says it aborted the command (completion dword 0 bit 0 clear),
+  whose owner then completes with `BlockError::Cancelled`. Dropping a
+  request future before completion *abandons* its command: the slot keeps
+  the tag, PRP page and payload pin until the CQE lands (reclaimed by the
+  next process-context visitor) or the queue is torn down — never freed
+  under a possibly live command (AGENTS.md invariant 7).
+  **Timeouts are per queue, not per waiter** (blk-mq
+  `blk_rq_timed_out_timer`): each `IoQueue` owns one `narf_time::timer::TimerList`
+  armed for the earliest outstanding deadline; its expiry marks every
+  expired command and wakes its owner, who then does what Linux
+  `nvme_timeout` does, in its order: terminal states first (queue torn
+  down → `Reset`), then "did we miss an interrupt?" — **one** poll of the
+  CQ (`nvme_poll_irqdisable`); a completion found there completes the
+  command normally, logged `I/O tag <t> (<cid>) QID <q> timeout,
+  completion polled` (rate-limited: the first 8, then every 64th) and
+  counted in the queue's `irq_missed` (an IRQ-driven queue) as well as
+  the global `late_completions()`; otherwise the reset + replay below.
+  **Self-diagnosis of the completion path** (one boot answers "do this
+  drive's interrupts arrive?"): `create_io_queues_preferred` logs
+  `nvme: <bdf>: <n> I/O queue(s), <mode>, depth <d>, <cpus> CPU(s): q<i>
+  vec <v> msix <e> apic <a>; …` — `mode` is `msix` or `polled (<the step
+  that gave MSI-X up>)` — and `/proc/narf/nvme_queues` lists, per queue,
+  the same route with `isr_runs`, `reaped_isr`, `reaped_poll`,
+  `irq_missed`, `slow_pickups` (ISR-published completions the waiter
+  picked up more than 10 ms later: the interrupt arrived, the wake did
+  not reach the waiter) and `pickup_max_us` (`IoQueue::stats()`). The
+  sync wrappers (`NvmeNamespaceBlock::read` / `write` through `sync_io`)
+  stay polled — the paths that run before interrupts work or may not
+  sleep (early boot, panic, gate-held Flush/DSM): they post a tagged
+  command on the same queues and spin responsively on the CQ for their
+  own slot, bounded by the command's deadline — no `block_on` (they may
+  be called from inside an executor poll), no IRQ wait, and no longer
+  one-in-flight per controller: the gate they hold serialises the
+  controller's scratch, not the device.
   `controller_count()`, `instance_of(PcieAddr)`, `with_controller_at(instance,
   f)`, `admin_passthrough_at(instance, ..)`, `remove_controller(instance, cap)
   -> Option<bool>` (refuse I/O, unregister its block devices and node, then
@@ -163,7 +243,9 @@ multipath / fabrics (defer).
   `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
   afterwards). `shutdown_all_controllers()` is registered as the
   `narf_power::system` shutdown hook `"nvme"`, run on every reboot /
-  power-off after the filesystem sync and the persistent-log flush. It
+  power-off after the persistent-log flush (Linux `device_shutdown`; the
+  filesystems were synced by userspace, or by the emergency sync of a forced
+  orderly power-off, before the transition began). It
   refuses new requests, waits up to `SHUTDOWN_DRAIN_TIMEOUT_MS` (30 s, Linux
   `NVME_IO_TIMEOUT`) per controller for the in-flight command to release the
   request gate, then flushes + sends CC.SHN; a controller that never drains
@@ -208,9 +290,9 @@ multipath / fabrics (defer).
   `nvme_create_cq`: `vector = num_vecs == 1 ? 0 : qid`); I/O queues
   use entries `1..=granted` with `IV = qid`, `IEN = 1`, one IDT
   vector + installed handler each. Every entry is steered at one CPU —
-  scheduler CPU 0, resolved to a real APIC ID with
-  `narf_interrupts::apic_id_of_cpu` (the bring-up CPU if firmware lists
-  no APIC ID 0; a literal 0 only when the topology is unknown) — since
+  logical CPU 0 (the boot CPU), resolved to its real APIC ID with
+  `narf_interrupts::apic_id_of_cpu` (a literal 0 only when the topology
+  is unknown) — since
   completions are consumed by whichever CPU is waiting. An entry that
   cannot be programmed is never advertised as a vector: a failed admin
   entry leaves the admin queue vector-less (so a single I/O queue that
@@ -238,12 +320,14 @@ multipath / fabrics (defer).
   reason to look at the CQ: `Ok(false)` — not yet — for a wake that
   was not this command's completion (another queue on a shared vector,
   the late MSI of an earlier polled Flush on the same queue), never a
-  lost completion. Each wait is bounded by `ASYNC_CQ_POLL_MS` (250 ms)
-  as well as the command's deadline (`IO_TIMEOUT_MS`, shared by all its
-  waits), so a completion whose interrupt never arrives is found by the
-  next check; only when the deadline has passed and a last look at the
-  CQ finds nothing does the poll return `CompletionTimeout` and mark
-  the controller dead. Waits are armed before the CQ check they follow,
+  lost completion. On an IRQ-driven queue the wait is **not** bounded
+  by any poll slice of its own (the former `ASYNC_CQ_POLL_MS`, 250 ms,
+  is gone): it ends with the handler's wake or at the command's deadline
+  (`IO_TIMEOUT_MS`), where the timeout path's one poll either finds the
+  completion ("timeout, completion polled", `irq_missed`) or, finding
+  nothing, returns `CompletionTimeout` and marks the controller dead.
+  On a vector-less queue the waiter re-polls cooperatively. The waker
+  is registered in the slot before the state re-check that follows it,
   which is what closes the lost-wakeup window. (`submit_io_finish`, the
   former single-shot drain, is gone.) The split
   lets a caller release the slot gate across the await — no
@@ -281,11 +365,38 @@ multipath / fabrics (defer).
   supervisor poll interval, permitting peer executor tasks to make progress.
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
-- No DMA buffer a command may still reference is freed: I/O uses persistent
-  scratch and PRP-list pages, a timed-out I/O marks the controller dead, a
-  timed-out admin passthrough leaks its pages, and a timed-out Identify /
-  Security Send / Security Receive parks its data buffer in `in_flight_dma`
-  until `disable_after_failure` confirms the controller stopped.
+- **An IRQ-driven I/O queue's waiter never reaps the CQ** (`mq::Cmd`,
+  Linux `nvme-pci`): the queue's handler publishes every completion and
+  wakes the owner; the only other look at the CQ is the one poll the
+  timeout path makes (`IoQueue::poll_cmd`, Linux `nvme_timeout`). A
+  completion found only there is logged "timeout, completion polled" and
+  counted (`IoQueue::stats().irq_missed`). No poll slice may be added to
+  the IRQ-queue wait: it turned a missing interrupt into a per-request
+  slowdown no gate noticed. Polled completion exists exactly where Linux
+  has it — vector-less queues and the synchronous pre-interrupt paths.
+- The MSI-X table size, the IDT vector supply and the controller's grant
+  bound the I/O queue *count*; none of them selects the polled fallback
+  while at least one I/O entry can be programmed.
+- No DMA buffer a command may still reference is freed: every I/O command's
+  PRP-list page and payload pin live in its queue slot until its terminal
+  completion (a dropped future abandons, never frees); a timed-out I/O
+  marks the controller dead and its slot keeps the pages until the reset's
+  teardown frees them (controller confirmed stopped) or leaks them
+  (`retained_io_buffers()`); a timed-out admin passthrough leaks its pages,
+  and a timed-out Identify / Security Send / Security Receive parks its data
+  buffer in `in_flight_dma` until `disable_after_failure` confirms the
+  controller stopped.
+- A queue is quiesced under its submission lock before it is torn down, so
+  no command can be posted to a queue the device no longer has; every
+  command in flight at teardown is marked reset and its owner requeues it
+  on the rebuilt queues (Linux `nvme_cancel_request` → retry).
+- A completion is matched to its command by id against the queue's slot
+  table; a CQE for a free, already-completed or reset slot is a stray:
+  counted (`stray_cqe_drops()`), reported, dropped. Tags rotate (a freed
+  tag is the last to be reused) so a late completion for a timed-out
+  command does not land on a new one.
+- Interrupt context never frees: the ISR publishes status and wakes by
+  reference; owners reap in process context.
 - An admin command timeout (5 s) fails that command only: it does not mark
   the controller dead and is never replayed. (Linux resets on an admin
   timeout, but after 60 s; at 5 s a slow Format NVM or vendor passthrough

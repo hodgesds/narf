@@ -134,7 +134,7 @@ async fn listen<C: ControlIo, B: PacketIo>(
     let deadline = now_ms().saturating_add(ms);
     while now_ms() < deadline {
         if radio.recovery_pending() {
-            radio.maintain(now_ms()).await?;
+            radio.maintain().await?;
         }
         match radio.poll()? {
             Some(frames) => {
@@ -515,6 +515,21 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
             Err(_) => self.fail(&mut state),
         }
     }
+    /// `priv->ra_watchdog` (`rtl8xxxu_watchdog_callback`): the RA iteration
+    /// for the associated station, under the owner lock. Run from the
+    /// device's watchdog work every `WATCHDOG_MS`.
+    pub(super) async fn watchdog(&self) {
+        if self.failed.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let Slot::Station(station) = &mut state.slot else {
+            return;
+        };
+        if station.watchdog(now_ms()).await.is_err() {
+            self.fail(&mut state);
+        }
+    }
     /// Network-stack drain: delivered Ethernet frames, with no lock held
     /// across the stack callback.
     pub(super) fn drain(&self) -> bool {
@@ -631,6 +646,7 @@ pub async fn attach(
     device.bind_admin(registration)?;
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
+    crate::watchdog_work::start(&device, gen2_radio::WATCHDOG_MS);
     let worker = device.clone();
     narf_scheduler::spawn(async move {
         loop {
@@ -642,6 +658,20 @@ pub async fn attach(
     Ok(device)
 }
 
+/// `priv->ra_watchdog`; a failed device is terminal and stops it.
+impl<C: ControlIo + 'static, B: PacketIo + 'static> crate::watchdog_work::Watchdog for Device<C, B>
+where
+    Self: Send + Sync,
+{
+    fn watchdog_stopped(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+    fn watchdog_step(
+        self: Arc<Self>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { self.watchdog().await })
+    }
+}
 impl<C: ControlIo + 'static, B: PacketIo + 'static> Interface for Device<C, B> {
     fn name(&self) -> &str {
         &self.name

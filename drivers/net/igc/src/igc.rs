@@ -1245,6 +1245,32 @@ impl Igc {
             // The periodic wake pass: covers a completion reclaimed by a
             // sender, which cannot resume other connections itself.
             queue.txq().run_wakeups();
+            // A queue stopped for a second has frames that do not
+            // complete: say so once a second, long before the 5 s watchdog
+            // (which also needs carrier) would.
+            let second = narf_time::ns_to_cycles(1_000_000_000);
+            if let Some(cycles) = queue
+                .txq()
+                .stopped_too_long(narf_time::now_cycles(), second)
+            {
+                if narf_net::txq::report_allowed() {
+                    let pending = queue.statistics()[4];
+                    let _ = core::fmt::write(
+                        &mut narf_console::Writer,
+                        format_args!(
+                            "[igc] {} q{} TX queue stopped {} ms: pending={} busy={} restarts={} waiters={} carrier={}\n",
+                            self.name(),
+                            q,
+                            narf_time::cycles_to_ns(cycles) / 1_000_000,
+                            pending,
+                            queue.txq().busy(),
+                            queue.txq().restarts(),
+                            queue.txq().waiters(),
+                            self.link_up()
+                        ),
+                    );
+                }
+            }
         }
         self.sample_counters();
         {
@@ -1552,6 +1578,7 @@ impl narf_net::txq::TxBackpressure for Igc {
         q: u16,
         bytes: &[u8],
         meta: TxMeta,
+        charge: Option<narf_net::txq::TxCharge>,
     ) -> Result<(), narf_net::txq::TxRefusal> {
         if bytes.len() < 14 || bytes.len() > MAX_TSO {
             return Err(narf_net::txq::TxRefusal::Dropped);
@@ -1559,7 +1586,11 @@ impl narf_net::txq::TxBackpressure for Igc {
         let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
             .map_err(|_| narf_net::txq::TxRefusal::Dropped)?;
         buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        self.try_xmit(q, Frame::new(buffer, bytes.len() as u32), meta)
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        if let Some(charge) = charge {
+            frame.set_tx_charge(charge);
+        }
+        self.try_xmit(q, frame, meta)
     }
 }
 
@@ -2094,6 +2125,11 @@ fn spawn_pumps(
             }
         }
     });
+    // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues the
+    // reset when a queue's transmit is stuck; it stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, IGC_TX_TIMEOUT_NS);
     narf_scheduler::spawn(async move {
         while !device.removed.load(Ordering::Acquire) {
             device.maintain_admin();
@@ -2116,29 +2152,42 @@ fn spawn_pumps(
                 crate::publish::publish_link(device.name(), link);
                 *device.published_link.lock() = link;
             }
-            let timeout = narf_time::ns_to_cycles(5_000_000_000);
-            if link.carrier
-                && device
-                    .queues()
-                    .iter()
-                    .any(|q| q.stalled(narf_time::now_cycles(), timeout))
-            {
-                let first = {
-                    let mut stats = device.stats.lock();
-                    stats.tx_timeouts += 1;
-                    stats.tx_timeouts == 1
-                };
-                if first {
-                    device
-                        .completion_autopsy_pending
-                        .store(true, Ordering::Release);
-                    device.dump_completion_state();
-                }
-                let _ = device.recover();
-            }
             narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
         }
     });
+}
+
+/// `dev->watchdog_timeo`: a queue whose transmit waited this long with
+/// carrier up is wedged.
+const IGC_TX_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `igc_tx_timeout` → `igc_reset_task`).
+impl narf_net::watchdog::NetdevWatchdog for Igc {
+    /// A queue's transmit waited past `IGC_TX_TIMEOUT_NS` with carrier up.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.removed.load(Ordering::Acquire) || !self.link_sample().carrier {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(IGC_TX_TIMEOUT_NS);
+        self.queues().iter().any(|q| q.stalled(now, timeout))
+    }
+
+    /// Count the timeout (the first one dumps the completion state for the
+    /// autopsy) and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        let first = {
+            let mut stats = self.stats.lock();
+            stats.tx_timeouts += 1;
+            stats.tx_timeouts == 1
+        };
+        if first {
+            self.completion_autopsy_pending
+                .store(true, Ordering::Release);
+            self.dump_completion_state();
+        }
+        let _ = self.recover();
+    }
 }
 
 /// Every Intel device id this driver claims. Kept as a single

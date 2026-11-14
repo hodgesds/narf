@@ -640,7 +640,9 @@ impl ColdBoot {
             .get_mut(&port)
             .ok_or(MstFailure::Invalid)?
             .consume_events();
-        let result = self.poll_display_mst(port).await;
+        // Each AUX step is out of line: inline, they gave the display
+        // monitor's MST service an 11 KiB frame.
+        let result = crate::out_of_line::boxed!(self.poll_display_mst(port)).await;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         link.consume_events();
         result?;
@@ -657,8 +659,9 @@ impl ColdBoot {
             dmub: &mut self.sequence.backend.dmub,
             instance,
         };
-        link.refresh_resources(&mut aux).await?;
-        let (changed, lost) = link.refresh_pcon_outputs(&mut aux, &running).await?;
+        crate::out_of_line::boxed!(link.refresh_resources(&mut aux)).await?;
+        let (changed, lost) =
+            crate::out_of_line::boxed!(link.refresh_pcon_outputs(&mut aux, &running)).await?;
         if !lost.is_empty() {
             return Ok(MstService::Lost(lost));
         }
@@ -669,7 +672,7 @@ impl ColdBoot {
             return Ok(MstService::Kept);
         }
         if link.has_stream_resources() {
-            if !link.reprobe_live(&mut aux).await? {
+            if !crate::out_of_line::boxed!(link.reprobe_live(&mut aux)).await? {
                 let lost: Vec<u8> = link
                     .payloads
                     .iter()
@@ -683,7 +686,7 @@ impl ColdBoot {
                 });
             }
         } else {
-            link.prepare(&mut aux).await?;
+            crate::out_of_line::boxed!(link.prepare(&mut aux)).await?;
         }
         self.readmit_dark_mst_outputs(port);
         Ok(MstService::Kept)
@@ -2482,7 +2485,7 @@ impl ColdBoot {
         selection: &mut Selection,
         pipe: u8,
         encoders: modeset::StreamEncoders,
-    ) -> Result<otg::ScanoutRunning, ModesetError> {
+    ) -> Result<alloc::boxed::Box<otg::ScanoutRunning>, ModesetError> {
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         link.require_transaction_idle()?;
         let uhbr = matches!(selection.rate, DpRate::Uhbr(_));

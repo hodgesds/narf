@@ -180,6 +180,9 @@ fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     let dst_frame =
         crate::frame::alloc_user_frame_on_strict(node).map_err(|_| MigrateError::Failed)?;
     let dst = dst_frame.start_address();
+    // `dst` takes over `src`'s memory-cgroup charge (Linux
+    // `mem_cgroup_migrate`); whichever frame is freed last uncharges it once.
+    crate::frame::transfer_frame_memcg(src, dst);
     // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -1487,7 +1490,11 @@ mod tests {
         // multi-owner migration (which takes a Vec snapshot). Frames 1..=3 are
         // free so pass 1 must reserve them.
         let blk = match crate::frame::alloc_pages_on(0, 2) {
-            Ok(f) => f.start_address(),
+            Ok(f) => {
+                // Freed frame by frame below: split it first (`split_page`).
+                crate::frame::split_block(f, 2);
+                f.start_address()
+            }
             Err(_) => return TestResult::Skip("could not allocate an order-2 block"),
         };
         for i in 1..4u64 {
@@ -1591,7 +1598,11 @@ mod tests {
         // An order-1 block gives us two contiguous frames we control: map the
         // first as a movable user page, free the second so it is reservable.
         let blk = match crate::frame::alloc_pages_on(0, 1) {
-            Ok(f) => f.start_address(),
+            Ok(f) => {
+                // Freed frame by frame below: split it first (`split_page`).
+                crate::frame::split_block(f, 1);
+                f.start_address()
+            }
             Err(_) => return TestResult::Skip("could not allocate an order-1 block"),
         };
         let f0 = blk;
@@ -1716,7 +1727,11 @@ mod tests {
 
         // A contiguous order-4 block (16 frames) is our controlled sweep span.
         let blk = match crate::frame::alloc_pages_on(0, 4) {
-            Ok(f) => f.start_address(),
+            Ok(f) => {
+                // Freed frame by frame below: split it first (`split_page`).
+                crate::frame::split_block(f, 4);
+                f.start_address()
+            }
             Err(_) => return TestResult::Skip("could not allocate an order-4 block"),
         };
         let base = blk.raw();

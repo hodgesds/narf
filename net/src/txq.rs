@@ -31,8 +31,17 @@
 //! A frame offered through [`TxBackpressure::try_xmit`] is refused while the
 //! queue is stopped. Frames sent through the interface's ordinary transmit
 //! hook (pure ACKs, SYN/FIN/RST, retransmissions, every other protocol) are
-//! accepted while descriptors remain: the stop threshold leaves one
-//! worst-case frame of descriptors free for them.
+//! accepted while descriptors remain. That is not a guaranteed reserve: a
+//! queue stops after a post that leaves fewer than `max_frame_descs` free,
+//! so what is left for them is anywhere from nothing to one descriptor less
+//! than a worst-case frame. The ordinary hook also ignores the stopped
+//! flag, so traffic through it at or above the link's rate can hold the
+//! ring below the wake threshold and keep waiting TCP data out; Linux
+//! arbitrates the two in the qdisc, which this stack does not have.
+//!
+//! [`stats`] counts the conditions that should not last: a queue stopped
+//! for more than a second, a connection waiting that long, a sender refused
+//! many times in a row, and a transmit pool with no buffer.
 //!
 //! Not implemented: the adaptive per-queue byte limit of
 //! `lib/dynamic_queue_limits.c`. `sent`/`completed` already carry the byte
@@ -80,8 +89,17 @@ pub trait TxBackpressure: core::fmt::Debug + Send + Sync {
     /// Offer an owned frame to queue `q`. Refused with [`TxRefusal::Busy`]
     /// while the queue is stopped.
     fn try_xmit(&self, q: u16, frame: crate::Frame, meta: crate::TxMeta) -> Result<(), TxRefusal>;
-    /// As [`Self::try_xmit`] for a frame the driver must copy.
-    fn try_xmit_copy(&self, q: u16, frame: &[u8], meta: crate::TxMeta) -> Result<(), TxRefusal>;
+    /// As [`Self::try_xmit`] for a frame the driver must copy. `charge` is
+    /// the sending connection's byte charge: the driver attaches it to the
+    /// frame it builds ([`crate::Frame::set_tx_charge`]) so it is returned
+    /// when that frame completes, exactly as for an owned frame.
+    fn try_xmit_copy(
+        &self,
+        q: u16,
+        frame: &[u8],
+        meta: crate::TxMeta,
+        charge: Option<TxCharge>,
+    ) -> Result<(), TxRefusal>;
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +124,10 @@ pub struct TxQueue {
     busy: AtomicU64,
     sent_bytes: AtomicU64,
     completed_bytes: AtomicU64,
+    /// When the queue last stopped (cycles); meaningful while stopped.
+    stopped_at: AtomicU64,
+    long_stops: AtomicU64,
+    long_stop_seen: AtomicU64,
     lists: IrqSafeSpinLock<WakeLists>,
 }
 
@@ -131,6 +153,9 @@ impl TxQueue {
             busy: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
             completed_bytes: AtomicU64::new(0),
+            stopped_at: AtomicU64::new(0),
+            long_stops: AtomicU64::new(0),
+            long_stop_seen: AtomicU64::new(0),
             lists: IrqSafeSpinLock::new(WakeLists::default()),
         })
     }
@@ -173,7 +198,7 @@ impl TxQueue {
         self.sent_bytes
             .fetch_add(u64::from(bytes), Ordering::Relaxed);
         if free() < self.stop_thrs {
-            self.stopped.store(true, Ordering::SeqCst);
+            self.mark_stopped();
             if free() >= self.wake_thrs {
                 self.stopped.store(false, Ordering::SeqCst);
             }
@@ -184,7 +209,44 @@ impl TxQueue {
     /// stopped; the completion that makes room wakes it.
     pub fn refused(&self) {
         self.busy.fetch_add(1, Ordering::Relaxed);
-        self.stopped.store(true, Ordering::SeqCst);
+        self.mark_stopped();
+    }
+
+    fn mark_stopped(&self) {
+        if !self.stopped.swap(true, Ordering::SeqCst) {
+            self.stopped_at.store(
+                narf_scheduler::narf_time::now_cycles().max(1),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Driver's periodic task: `Some(cycles stopped)` when the queue has
+    /// been stopped for at least `threshold` cycles, at most once per
+    /// `threshold`. A healthy queue is stopped for a completion interval;
+    /// one stopped for a second has frames that do not complete.
+    pub fn stopped_too_long(&self, now: u64, threshold: u64) -> Option<u64> {
+        if !self.is_stopped() {
+            return None;
+        }
+        let stopped_for = now.saturating_sub(self.stopped_at.load(Ordering::Relaxed));
+        if stopped_for < threshold
+            || now.saturating_sub(self.long_stop_seen.load(Ordering::Relaxed)) < threshold
+        {
+            return None;
+        }
+        self.long_stop_seen.store(now, Ordering::Relaxed);
+        self.long_stops.fetch_add(1, Ordering::Relaxed);
+        stats::LONG_STOPS.fetch_add(1, Ordering::Relaxed);
+        Some(stopped_for)
+    }
+    /// Times [`Self::stopped_too_long`] reported.
+    pub fn long_stops(&self) -> u64 {
+        self.long_stops.load(Ordering::Relaxed)
+    }
+    /// Connections listed as waiting for room.
+    pub fn waiters(&self) -> usize {
+        self.lists.lock().waiters.len()
     }
 
     /// Driver: one reclaim batch freed `pkts` frames of `bytes`, leaving
@@ -349,10 +411,76 @@ pub fn tsq_limit(segment: u32, cwnd: u32, ssthresh: u32, srtt_us: u64, cap: u32)
     (u64::from(segment) * 2).max(rate >> 10).min(u64::from(cap)) as u32
 }
 
+/// Counts of transmit conditions that should not last, for `ethtool -S`.
+/// Written only when the condition occurs, never per healthy frame.
+pub mod stats {
+    use core::sync::atomic::AtomicU64;
+
+    /// A connection was refused 64 more times in a row without sending.
+    pub static REOFFER_STORMS: AtomicU64 = AtomicU64::new(0);
+    /// A connection had waited another second for its queue.
+    pub static LONG_WAITS: AtomicU64 = AtomicU64::new(0);
+    /// A queue had been stopped for another second.
+    pub static LONG_STOPS: AtomicU64 = AtomicU64::new(0);
+    /// A frame was copied because its queue's zero-copy pool was empty.
+    pub static POOL_EMPTY: AtomicU64 = AtomicU64::new(0);
+}
+
+static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a diagnostic line may be logged now: one per second for all of
+/// the conditions in [`stats`] together. The counters carry the totals.
+pub fn report_allowed() -> bool {
+    let now = narf_scheduler::narf_time::now_cycles().max(1);
+    let last = LAST_REPORT.load(Ordering::Relaxed);
+    if last != 0
+        && now.saturating_sub(last) < narf_scheduler::narf_time::ns_to_cycles(1_000_000_000)
+    {
+        return false;
+    }
+    LAST_REPORT
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
+
+    fn txq_reports_a_long_stop_once_per_interval() -> TestResult {
+        const T: u64 = 1_000_000;
+        let q = TxQueue::new(TxQueueGeometry {
+            ring_len: 256,
+            max_frame_descs: 20,
+        });
+        let before = narf_scheduler::narf_time::now_cycles();
+        kt_assert_eq!(
+            q.stopped_too_long(before + 10 * T, T),
+            None,
+            "running queue"
+        );
+        q.refused();
+        let after = narf_scheduler::narf_time::now_cycles();
+        kt_assert_eq!(q.stopped_too_long(after, T + (after - before)), None);
+        kt_assert!(q
+            .stopped_too_long(after + 2 * T, T)
+            .is_some_and(|c| c >= 2 * T));
+        kt_assert_eq!(
+            q.stopped_too_long(after + 2 * T + 1, T),
+            None,
+            "reported twice"
+        );
+        kt_assert!(q.stopped_too_long(after + 4 * T, T).is_some());
+        kt_assert_eq!(q.long_stops(), 2);
+        q.completed(1, 0, 255);
+        kt_assert_eq!(q.stopped_too_long(after + 9 * T, T), None, "woken queue");
+        // A later stop is timed from when it happened.
+        q.refused();
+        kt_assert_eq!(q.waiters(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!("net/txq", txq_reports_a_long_stop_once_per_interval);
 
     fn geometry(ring_len: u32, max_frame_descs: u32) -> TxQueueGeometry {
         TxQueueGeometry {

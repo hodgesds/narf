@@ -1221,27 +1221,49 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_table);
 
-// Forked helpers inherit the descriptor table AND the task-keyed path
-// identities used by Linux *at syscalls. systemd opens a mount parent in PID 1
-// then its mount helper calls mkdirat(parent_fd, leaf, ...); losing this
-// metadata turned the valid inherited O_PATH fd into EBADF.
+/// Put an open file at `fd` in `task`'s table, standing in for an `open`.
+fn seed_named_fd(task: u64, fd: u32, path: &str, mount_id: Option<u64>) {
+    crate::fd::with_table(task, |t| {
+        if let Some(ops) = t.get(0).map(|e| e.ops.clone()) {
+            t.set(
+                fd,
+                crate::fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                },
+            );
+        }
+    });
+    crate::mqueue::register_fd_path(task, fd, path, mount_id);
+}
+
+// Forked helpers inherit the descriptor table and, with each open file, the
+// path it names — which is what Linux *at syscalls resolve against. systemd
+// opens a mount parent in PID 1 then its mount helper calls
+// mkdirat(parent_fd, leaf, ...); losing the name turned the valid inherited
+// O_PATH fd into EBADF.
 fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
     const PARENT: u64 = 0xF001;
     const CHILD: u64 = 0xF002;
     const FD: u32 = 9;
-    crate::mqueue::register_fd_path(PARENT, FD, "/sys/fs/fuse", Some(7));
-    crate::mqueue::fork_fd_paths(PARENT, CHILD);
+    seed_named_fd(PARENT, FD, "/sys/fs/fuse", Some(7));
+    crate::fd::fork(PARENT, CHILD);
     let path = crate::mqueue::fd_path(CHILD, FD);
     let mount_id = crate::mqueue::fd_mount_id(CHILD, FD);
-    crate::mqueue::forget_fd_path(PARENT, FD);
-    crate::mqueue::forget_fd_path(CHILD, FD);
+    crate::fd::detach(PARENT);
+    crate::fd::detach(CHILD);
     if path.as_deref() == Some("/sys/fs/fuse") && mount_id == Some(7) {
         TestResult::Pass
     } else {
         TestResult::Fail("fork lost the inherited fd path identity")
     }
 }
-kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_path_identity);
+kernel_test_in!(
+    "userspace/process",
+    smoke_userspace_fork_inherits_fd_path_identity
+);
 
 // Procfs APIs address an fd by Linux PID, but syscall handlers already have a
 // scheduler TaskId. These number spaces may collide: resolving a TaskId via
@@ -1252,11 +1274,11 @@ fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
     const OTHER_TASK: u64 = 0xF102;
     const FD: u32 = 7;
     crate::handlers::register_pid_task_mapping(TASK, OTHER_TASK);
-    crate::mqueue::register_fd_path(TASK, FD, "/sys/kernel", None);
-    crate::mqueue::register_fd_path(OTHER_TASK, FD, "/wrong-process", None);
+    seed_named_fd(TASK, FD, "/sys/kernel", None);
+    seed_named_fd(OTHER_TASK, FD, "/wrong-process", None);
     let path = crate::handlers::fd_path_for_task(TASK, FD);
-    crate::mqueue::forget_fd_path(TASK, FD);
-    crate::mqueue::forget_fd_path(OTHER_TASK, FD);
+    crate::fd::detach(TASK);
+    crate::fd::detach(OTHER_TASK);
     if path.as_deref() == Some("/sys/kernel") {
         TestResult::Pass
     } else {
@@ -1264,7 +1286,7 @@ fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
     }
 }
 kernel_test_in!(
-    "userspace",
+    "userspace/process",
     smoke_userspace_fd_path_task_lookup_avoids_pid_collision
 );
 

@@ -23,6 +23,20 @@ those subsystems the hooks they need.
 
 ## 3. Public interface
 
+Kernel-stack overflow handling (see §4):
+
+```rust
+// frame/src/kstack_overflow.rs — shared by both arches; panics unless a
+// kernel test armed this overflow, then returns the (pc, sp) to resume at.
+pub fn report(how: &str, hit: GuardHit, fault: u64, pc: u64, sp: u64, fp: u64)
+    -> Option<(u64, u64)>;
+// x86_64
+pub fn gdt::df_ist_top() -> u64;              // this CPU's #DF IST stack top
+// aarch64
+pub fn aarch64::trap::init_overflow_stack();  // per CPU, sets TPIDR_EL1
+extern "C" fn rust_aarch64_bad_stack(frame: &mut TrapFrame, old_sp: u64);
+```
+
 Production x86 boot enables tickless idle on capable local clockevents.
 `nohz=off` retains periodic ticks; the former `nohz_idle` flag remains accepted
 as an alias for the default. The power initcall installs the predictive idle
@@ -226,6 +240,24 @@ cannot be consumed by an IPI after the final wake check but before user entry.
 - **NMI / double-fault / machine-check paths have their own IST-backed
   trap frames** and perform the same save/restore independently. They
   must not assume GS / TPIDR_EL1 is valid.
+- **A kernel-stack overflow is reported, never silent, and never handled on
+  the overflowed stack** (Linux `handle_stack_overflow` / arm64
+  `handle_bad_stack`). x86_64: a #DF whose CR2 (or saved RSP) is guard VA
+  (`kstack::guard_hit`) is reported from the #DF IST stack before anything
+  reads the faulting stack; a CPL0 #PF on guard VA switches to the #DF IST
+  stack (`call_on_stack`) and reports there. aarch64: every current-EL/SP_EL1
+  vector first runs `KSTACK_CHECK` — for an SP in `KSTACK_L0_SLOT`, bit
+  `KSTACK_SHIFT` of `SP - 816` set means the frame push would land below the
+  stack's base — and branches, storing nothing, to `__narf_kstack_overflow`,
+  which moves to this CPU's overflow stack (`TPIDR_EL1`, a guarded 16 KiB
+  `KernelStack` set by `init_overflow_stack` before the CPU runs anything on a
+  guarded stack) and calls `rust_aarch64_bad_stack`; an EL1 data abort on
+  guard VA with SP still inside the stack is reported from the sync dispatch.
+  `TPIDRRO_EL0` is entry scratch for that check and is zero whenever EL0 runs.
+  The report (`kstack_overflow::report`) prints CPU, task, stack bounds, guard
+  address, pc/sp/fp and a backtrace read from the overflowed stack, takes no
+  lock and allocates nothing, then panics — except for an overflow a
+  kernel-test build armed for that exact stack, which is retired instead.
 - Panic path never returns; it quiesces the system and hands over to
   `console/`. On SMP (Stage 2+) it broadcasts an `IPI-NMI` to halt APs
   before calling `console::panic_sink`.
@@ -250,12 +282,17 @@ cannot be consumed by an IPI after the final wake check but before user entry.
 
 ### aarch64
 - EL1 vector table aligned to 2 KiB; four groups of four vectors.
-- `TPIDR_EL1` holds the `CpuLocal` pointer.
+- `TPIDR_EL1` holds this CPU's kernel-stack overflow-stack top (written by
+  `init_overflow_stack`; read by `vec.S` before it may store). The CPU id
+  comes from MPIDR (`narf_arch::aarch64::cpu::current_cpu`), not from a
+  `CpuLocal` pointer in `TPIDR_EL1`.
 - SP_EL0 for user, SP_EL1 for kernel; SPSel=1 on entry.
 - Each AP receives one contiguous 64 KiB kernel stack before `CPU_ON`. The AP
   entry trampoline uses its physical top with the MMU off, then rebases the
-  empty stack to the high direct map before entering Rust. AP executor and IRQ
-  work must never run on a single-page boot stack.
+  empty stack to the high direct map before entering Rust. Before entering its
+  scheduler loop the AP moves to a guarded 64 KiB `KernelStack`
+  (`run_executor_on_guarded_stack`, both arches); the boot block is abandoned.
+  AP executor and IRQ work must never run on a single-page boot stack.
 - **Stack alignment:** SP must be 16-byte aligned at EL1 vector entry;
   the vector prologue enforces this before any push.
 - **MTE is suspended on vector entry.** The prologue clears

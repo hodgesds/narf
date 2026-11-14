@@ -327,7 +327,34 @@ pub struct ProcFdInfo {
 pub struct ProcFdSnapshot {
     pub path: String,
     pub info: ProcFdInfo,
+    /// The open file itself: its `FileOps::show_fdinfo` ends the fd's
+    /// fdinfo.
+    pub file: ProcFdFile,
 }
+
+/// The open file a [`ProcFdSnapshot`] describes. Two are equal when they
+/// are the same open file.
+#[derive(Clone, Default)]
+pub struct ProcFdFile(pub Option<Arc<dyn FileOps>>);
+impl fmt::Debug for ProcFdFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ProcFdFile(open)"
+        } else {
+            "ProcFdFile(none)"
+        })
+    }
+}
+impl PartialEq for ProcFdFile {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => core::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for ProcFdFile {}
 
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
 /// reports per line: range, protection bits, and optional file backing.
@@ -448,6 +475,18 @@ pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize, usize)) {
     PID_RESOLVE_HOOK.store(snap.1, Ordering::Release);
     PID_REPORT_HOOK.store(snap.2, Ordering::Release);
     CURRENT_TID_HOOK.store(snap.3, Ordering::Release);
+}
+
+/// The calling process's id, as `/proc/self` resolves it (0 before the
+/// process hooks are installed). For drivers that record who uses an open
+/// file (drm_file_update_pid).
+pub fn current_process_id() -> u64 {
+    current_outer_pid()
+}
+
+/// The name (`comm`) of process `pid`, if it is alive.
+pub fn process_comm(pid: u64) -> Option<String> {
+    task_info(pid, TaskInfoQuery::Basic).map(|task| task.comm)
 }
 
 pub(crate) fn current_pid() -> u64 {
@@ -593,6 +632,18 @@ pub struct ProcSchedSnapshot {
     /// Where a parked task is waiting — the handler it is blocked in.
     /// `None` prints `0`, as Linux does when it cannot name the site.
     pub wchan: Option<String>,
+    /// The lock a parked task is queued on, as the source location of its
+    /// `lock()` call (`file:line`), when it parked waiting for one.
+    pub wait_site: Option<String>,
+    /// Where a parked task's wait was made from (`file:line` of the kernel
+    /// code that parked it), when it is not queued on a named lock.
+    pub park_site: Option<String>,
+    /// The syscall a task that is NOT parked is executing — on a CPU, or
+    /// runnable and waiting for one. `None` outside a syscall.
+    pub running_in: Option<String>,
+    /// Where a task running a syscall last gave up its CPU at a scheduling
+    /// point (`cond_resched`) and is runnable again, if it is there now.
+    pub yield_site: Option<String>,
 }
 
 type SchedSnapshotFn = fn(u64) -> ProcSchedSnapshot;
@@ -894,6 +945,17 @@ pub(crate) fn hook_fd_pidfd_pid(pid: u64, fd: u32) -> Option<u64> {
     // SAFETY: v was stored by set_fd_pidfd_pid_hook as a FdPidfdPidFn fn-pointer; non-zero confirms it.
     let f: FdPidfdPidFn = unsafe { core::mem::transmute(v) };
     f(pid, fd)
+}
+
+/// The open file behind fd `fd` of `pid`, for its `show_fdinfo`.
+pub(crate) fn hook_fd_file(pid: u64, fd: u32) -> Option<Arc<dyn FileOps>> {
+    let v = FD_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_proc_ext_hooks as an FdSnapshotFn; non-zero confirms it.
+    let f: FdSnapshotFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd).and_then(|snapshot| snapshot.file.0)
 }
 
 pub(crate) fn hook_fd_info(pid: u64, fd: u32) -> Option<ProcFdInfo> {
@@ -2850,34 +2912,156 @@ fn gen_cpuinfo() -> String {
     s
 }
 
+/// What the mapped-file page cache (in `narf_userspace`) holds, for
+/// `/proc/meminfo`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageCacheStats {
+    /// Cached file pages (frames), mapped or not.
+    pub pages: u64,
+    /// Unmapped pages still waiting for writeback.
+    pub unwritten_unmapped: u64,
+    /// Kernel heap bytes held by the cache's own records (page records,
+    /// their index nodes, per-file entries) — not by the pages.
+    pub record_bytes: u64,
+}
+
+type PageCacheStatsFn = fn() -> PageCacheStats;
+static PAGE_CACHE_STATS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire `/proc/meminfo`'s page-cache figures.
+pub fn set_page_cache_stats_hook(f: PageCacheStatsFn) {
+    PAGE_CACHE_STATS_HOOK.store(f as usize, Ordering::Release);
+}
+
+fn page_cache_stats() -> PageCacheStats {
+    let v = PAGE_CACHE_STATS_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return PageCacheStats::default();
+    }
+    // SAFETY: only `set_page_cache_stats_hook` stores here, a
+    // `PageCacheStatsFn`.
+    let f: PageCacheStatsFn = unsafe { core::mem::transmute(v) };
+    f()
+}
+
+/// Where every allocator-managed page is, in kB: Linux's `/proc/meminfo`
+/// split, with NARF lines for what Linux has no field for. The disjoint
+/// parts (`Reserved`, `Cached`, `AnonPages`, `Slab`, `KernelStack`,
+/// `NarfStackCache`, `PageTables`, `NarfUnaccounted`) sum to
+/// `MemTotal - MemFree`;
+/// `NarfUnaccounted` is the remainder no counter claims yet, so a growing
+/// value names a missing counter instead of hiding it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemBreakdown {
+    pub total_kb: u64,
+    pub free_kb: u64,
+    pub reserved_kb: u64,
+    pub cached_kb: u64,
+    /// User pages charged to memory cgroups that are not page cache.
+    pub anon_kb: u64,
+    /// Kernel heap. Kernel stacks are vmapped frames, not heap (`KernelStack`).
+    pub slab_kb: u64,
+    pub kernel_stack_kb: u64,
+    pub stack_cache_kb: u64,
+    pub page_tables_kb: u64,
+    pub unaccounted_kb: u64,
+    /// Heap and page-cache pages the registered shrinkers can release.
+    pub shrinkable_kb: u64,
+    pub user_charged_kb: u64,
+}
+
+impl MemBreakdown {
+    /// The disjoint parts of the used memory, summed.
+    pub fn claimed_kb(&self) -> u64 {
+        self.cached_kb
+            + self.anon_kb
+            + self.slab_kb
+            + self.kernel_stack_kb
+            + self.stack_cache_kb
+            + self.page_tables_kb
+    }
+}
+
+/// Snapshot [`MemBreakdown`]. Lock-free relaxed counters, so the parts can
+/// disagree by in-flight allocations.
+pub fn mem_breakdown() -> MemBreakdown {
+    let stats = narf_memory::frame::stats();
+    let total_kb = stats.total as u64 * 4;
+    let free_kb = stats.free as u64 * 4;
+    let heap_kb = narf_memory::slab::frames_held() as u64 * 4;
+    let (stack_live, stack_cached) = narf_scheduler::stackful::kernel_stack_bytes();
+    let kernel_stack_kb = stack_live as u64 / 1024;
+    let stack_cache_kb = stack_cached as u64 / 1024;
+    let cached_kb = page_cache_stats().pages as u64 * 4;
+    let user_charged_kb = narf_memory::frame::user_charged_bytes() / 1024;
+    let mut m = MemBreakdown {
+        total_kb,
+        free_kb,
+        reserved_kb: stats.reserved as u64 * 4,
+        cached_kb,
+        anon_kb: user_charged_kb.saturating_sub(cached_kb),
+        slab_kb: heap_kb,
+        kernel_stack_kb,
+        stack_cache_kb,
+        page_tables_kb: narf_memory::frame::page_table_frames() as u64 * 4,
+        unaccounted_kb: 0,
+        shrinkable_kb: narf_memory::reclaim::shrinkable_pages() as u64 * 4,
+        user_charged_kb,
+    };
+    // `MemTotal` counts boot-reserved frames (kernel image, firmware and
+    // excluded ranges) that the buddy never manages; they are a part of
+    // their own, not unaccounted memory.
+    m.unaccounted_kb = total_kb
+        .saturating_sub(free_kb)
+        .saturating_sub(m.reserved_kb)
+        .saturating_sub(m.claimed_kb());
+    m
+}
+
 fn gen_meminfo() -> String {
     use core::fmt::Write as _;
-    let stats = narf_memory::frame::stats();
-    // Frames are 4 KiB on every arch we target.
-    let total_kb = stats.total * 4;
-    let free_kb = stats.free * 4;
-    let reserved_kb = stats.reserved * 4;
-    let slab_unreclaimable_kb = narf_memory::slab::frames_held() * 4;
+    let m = mem_breakdown();
+    let cache = page_cache_stats();
     let mut s = String::new();
-    let _ = writeln!(s, "MemTotal:     {:>10} kB", total_kb);
-    let _ = writeln!(s, "MemFree:      {:>10} kB", free_kb);
+    let _ = writeln!(s, "MemTotal:     {:>10} kB", m.total_kb);
+    let _ = writeln!(s, "MemFree:      {:>10} kB", m.free_kb);
     // Without page-cache + slab accounting separated out we can't
     // distinguish "available" from "free"; report the same value
     // so the standard `free` math (`available = MemAvailable`)
     // still produces a meaningful number.
-    let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
+    let _ = writeln!(s, "MemAvailable: {:>10} kB", m.free_kb);
     let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
-    let _ = writeln!(s, "Cached:       {:>10} kB", 0);
+    let _ = writeln!(s, "Cached:       {:>10} kB", m.cached_kb);
     let _ = writeln!(s, "SwapCached:   {:>10} kB", 0);
     // NARF has no swap. Linux still prints both lines on a swapless kernel,
     // and systemd-oomd refuses to start without them ("Failed to get
     // SwapTotal from /proc/meminfo").
     let _ = writeln!(s, "SwapTotal:    {:>10} kB", 0);
     let _ = writeln!(s, "SwapFree:     {:>10} kB", 0);
-    let _ = writeln!(s, "Slab:         {:>10} kB", slab_unreclaimable_kb);
+    let _ = writeln!(s, "AnonPages:    {:>10} kB", m.anon_kb);
+    let _ = writeln!(s, "Slab:         {:>10} kB", m.slab_kb);
     let _ = writeln!(s, "SReclaimable: {:>10} kB", 0);
-    let _ = writeln!(s, "SUnreclaim:   {:>10} kB", slab_unreclaimable_kb);
-    let _ = writeln!(s, "Reserved:     {:>10} kB", reserved_kb);
+    let _ = writeln!(s, "SUnreclaim:   {:>10} kB", m.slab_kb);
+    let _ = writeln!(s, "KernelStack:  {:>10} kB", m.kernel_stack_kb);
+    let _ = writeln!(s, "PageTables:   {:>10} kB", m.page_tables_kb);
+    let _ = writeln!(s, "Reserved:     {:>10} kB", m.reserved_kb);
+    // NARF-specific (tools skip lines they do not know).
+    // The mapped-file cache's own heap, inside `Slab` above, and its
+    // unmapped pages still waiting for writeback.
+    let _ = writeln!(s, "NarfCacheRecords: {:>6} kB", cache.record_bytes / 1024);
+    let _ = writeln!(
+        s,
+        "NarfCacheUnwritten: {:>4} kB",
+        cache.unwritten_unmapped * 4
+    );
+    // Zeroed, still-mapped kernel stacks parked for reuse.
+    let _ = writeln!(s, "NarfStackCache: {:>8} kB", m.stack_cache_kb);
+    // User memory charged to memory cgroups (`AnonPages` + charged cache).
+    let _ = writeln!(s, "NarfUserCharged: {:>7} kB", m.user_charged_kb);
+    // What the registered shrinkers could release (heap caches + page cache).
+    let _ = writeln!(s, "NarfShrinkable: {:>8} kB", m.shrinkable_kb);
+    // Used pages that no counter above claims.
+    let _ = writeln!(s, "NarfUnaccounted: {:>7} kB", m.unaccounted_kb);
     s
 }
 
@@ -3925,6 +4109,62 @@ fn smoke_meminfo_has_linux_slab_fields() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_meminfo_has_linux_slab_fields);
+
+/// Every page a workload takes lands in a named meminfo field: 4 MiB of heap
+/// moves `Slab`, 256 page-table frames move `PageTables`, and neither moves
+/// `NarfUnaccounted`; the parts plus `MemFree` add up to `MemTotal`; freeing
+/// returns all of them.
+fn smoke_meminfo_breakdown_accounts_every_page() -> TestResult {
+    const SLACK_KB: i64 = 1024; // other CPUs keep allocating meanwhile
+    let delta = |a: u64, b: u64| b as i64 - a as i64;
+    let before = mem_breakdown();
+    if before.free_kb + before.reserved_kb + before.claimed_kb() + before.unaccounted_kb
+        != before.total_kb
+    {
+        return TestResult::Fail("meminfo parts do not sum to MemTotal");
+    }
+    let mut heap: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..256 {
+        heap.push(alloc::vec![1u8; 16 * 1024]);
+    }
+    let mut tables = Vec::new();
+    for _ in 0..256 {
+        match narf_memory::alloc_frame() {
+            Ok(f) => {
+                narf_memory::frame::__pagetable_register(f.start_address().raw());
+                tables.push(f);
+            }
+            Err(_) => break,
+        }
+    }
+    let mid = mem_breakdown();
+    let tables_kb = tables.len() as i64 * 4;
+    for f in tables.drain(..) {
+        narf_memory::frame::__pagetable_unregister(f.start_address().raw());
+        narf_memory::free_frame(f);
+    }
+    drop(heap);
+    let after = mem_breakdown();
+    if (delta(before.slab_kb, mid.slab_kb) - 4096).abs() > SLACK_KB {
+        return TestResult::Fail("4 MiB of heap did not show in Slab");
+    }
+    if (delta(before.page_tables_kb, mid.page_tables_kb) - tables_kb).abs() > SLACK_KB {
+        return TestResult::Fail("page-table frames did not show in PageTables");
+    }
+    if delta(before.unaccounted_kb, mid.unaccounted_kb).abs() > SLACK_KB {
+        return TestResult::Fail("the workload's pages fell into NarfUnaccounted");
+    }
+    if delta(before.page_tables_kb, after.page_tables_kb).abs() > SLACK_KB
+        || delta(before.slab_kb, after.slab_kb) > SLACK_KB
+    {
+        return TestResult::Fail("freeing did not return the pages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_meminfo_breakdown_accounts_every_page
+);
 
 /// Regression: the static cpuinfo file still resolves through the
 /// root and returns non-empty content. This verifies the refactor

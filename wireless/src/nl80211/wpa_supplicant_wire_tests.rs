@@ -222,3 +222,355 @@ kernel_test_in!(
     "wireless/nl80211/wpa_supplicant",
     smoke_nl80211_wpa_supplicant_2_12_psk_connect_on_the_wire
 );
+
+// ── SAE offload: a NetworkManager `key-mgmt=sae` profile ───────────────
+//
+// With NL80211_EXT_FEATURE_SAE_OFFLOAD (and the PSK 4-way handshake
+// offload) wpa_supplicant keeps SAE in its selection, sets auth_alg SAE,
+// puts the password in NL80211_ATTR_SAE_PASSWORD and waits for
+// PORT_AUTHORIZED (`wpa_supplicant_set_suites`, `wpas_start_assoc_cb`,
+// `wpa_driver_nl80211_try_connect`, `wpa_supplicant_event_assoc`).
+// NetworkManager forces `ieee80211w=2` for such a profile.
+
+const AKM_SAE: u32 = 0x000f_ac08;
+const PASSWORD: &[u8] = b"correct horse battery";
+
+/// `wpa_gen_wpa_ie_rsn` for CCMP / CCMP / SAE with `ieee80211w=2` on a WMM
+/// AP: capabilities MFPC | MFPR | sixteen PTKSA replay counters (0x00cc), a
+/// zero PMKID count and the BIP-CMAC-128 group management cipher.
+const SAE_RSNE: [u8; 28] = [
+    48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8, 0xcc,
+    0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+];
+
+/// The RSN element of a WPA3-Personal transition-mode AP: PSK and SAE,
+/// MFP capable but not required.
+const TRANSITION_AP_RSNE: [u8; 26] = [
+    48, 24, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00,
+    0x0f, 0xac, 8, 0x80, 0x00,
+];
+
+fn sae_association_ies() -> Vec<u8> {
+    let mut ie = SAE_RSNE.to_vec();
+    ie.extend_from_slice(&[59, 4, 115, 115, 116, 117]);
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    ie.extend_from_slice(&[244, 1, 0x20]); // RSNXE: SAE hash-to-element
+    ie
+}
+
+fn sae_connect(ifindex: u32, wpa_version: u32) -> Vec<u8> {
+    let mut a = Vec::new();
+    push_attr(&mut a, 3, &ifindex.to_ne_bytes());
+    // nl80211_connect_common
+    push_attr(&mut a, 204, &[]); // IFACE_SOCKET_OWNER
+    push_attr(&mut a, 6, &BSSID);
+    push_attr(&mut a, 200, &BSSID);
+    push_attr(&mut a, 38, &5200u32.to_ne_bytes());
+    push_attr(&mut a, 201, &5200u32.to_ne_bytes());
+    push_attr(&mut a, 52, SSID);
+    push_attr(&mut a, 42, &sae_association_ies());
+    push_attr(&mut a, 75, &wpa_version.to_ne_bytes());
+    push_attr(&mut a, 73, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 74, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 76, &akm_list(&[AKM_SAE]));
+    push_attr(&mut a, 68, &[]);
+    push_attr(&mut a, 102, &0x888eu16.to_ne_bytes());
+    push_attr(&mut a, 264, &[]);
+    push_attr(&mut a, 286, &[]);
+    push_attr(&mut a, 261, &[]); // EXTERNAL_AUTH_SUPPORT (SAE AKM, no SME)
+    push_attr(&mut a, 315, &[]); // MLO_SUPPORT
+                                 // wpa_driver_nl80211_try_connect
+    push_attr(&mut a, 66, &1u32.to_ne_bytes()); // NL80211_MFP_REQUIRED
+    push_attr(&mut a, 298, &[2]); // SAE_PWE
+    push_attr(&mut a, 277, PASSWORD); // SAE_PASSWORD
+    push_attr(&mut a, 53, &4u32.to_ne_bytes()); // NL80211_AUTHTYPE_SAE
+    push_attr(&mut a, 204, &[]); // SOCKET_OWNER, a second time
+    a
+}
+
+fn sae_wiphy() -> ConnectCaps {
+    ConnectCaps {
+        sae_offload: true,
+        ..offload_wiphy()
+    }
+}
+
+fn check_sae() -> Result<(), &'static str> {
+    use crate::association::{validate_sme_ies_for, Error, SmeRsna};
+    // NL80211_WPA_VERSION_2 is what a family below NL80211_ATTR_SAE_PASSWORD
+    // gets, NL80211_WPA_VERSION_3 (4) what Linux gets (`wpa_ver_supported`).
+    for wpa_version in [2u32, 4] {
+        match &parse(&sae_connect(7, wpa_version), sae_wiphy()) {
+            Ok(Operation::Connect {
+                bssid,
+                frequency_mhz,
+                cred: Credential::Sae(password),
+                owner,
+                ..
+            }) => {
+                if password.as_slice() != PASSWORD
+                    || *bssid != Some(BSSID)
+                    || *frequency_mhz != Some(5200)
+                    || *owner != Some(PORT)
+                {
+                    return Err("wpa_supplicant's SAE CONNECT decoded to a different request");
+                }
+            }
+            Ok(_) => return Err("wpa_supplicant's SAE CONNECT did not take the SAE path"),
+            Err(_) => return Err("wpa_supplicant's SAE-offload CONNECT refused"),
+        }
+    }
+    if !matches!(parse(&sae_connect(7, 1), sae_wiphy()), Err(EOPNOTSUPP)) {
+        return Err("SAE accepted under WPA version 1");
+    }
+    // nl80211_crypto_settings: a SAE password needs the SAE_OFFLOAD feature.
+    if !matches!(parse(&sae_connect(7, 2), offload_wiphy()), Err(EINVAL)) {
+        return Err("SAE password accepted without SAE offload");
+    }
+
+    // The native owner's admission of the supplicant's elements.
+    let ies = sae_association_ies();
+    if validate_sme_ies_for(&ies, SmeRsna::Wpa3Sae).is_err() {
+        return Err("the supplicant's SAE association elements were refused");
+    }
+    if validate_sme_ies_for(&ies, SmeRsna::Wpa2Psk) != Err(Error::UnsupportedSecurity)
+        || validate_sme_ies_for(&association_ies(), SmeRsna::Wpa3Sae)
+            != Err(Error::UnsupportedSecurity)
+    {
+        return Err("SAE and WPA2-PSK association elements were interchangeable");
+    }
+    // PMF required is part of the SAE request: MFPC alone is not it.
+    let mut optional = ies.clone();
+    optional[20] = 0x8c;
+    // The only RSNXE capability the owner negotiates is hash-to-element.
+    let mut rsnxe = ies.clone();
+    let last = rsnxe.len() - 1;
+    rsnxe[last] = 0x21;
+    for bad in [&optional, &rsnxe] {
+        if validate_sme_ies_for(bad, SmeRsna::Wpa3Sae) != Err(Error::UnsupportedSecurity) {
+            return Err("an SAE request with other RSN capabilities was admitted");
+        }
+    }
+
+    // BSS selection: the transition-mode BSS is summarised as WPA2 but its
+    // RSN element offers SAE; a WPA2-only neighbour on the same SSID does not.
+    let bss = |bssid: [u8; 6], rssi: i8| crate::BssInfo {
+        bssid,
+        ssid: SSID.to_vec(),
+        frequency_mhz: 5200,
+        channel: 40,
+        rssi,
+        security: crate::scan::BssSecurity::Wpa2,
+    };
+    let other = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x41];
+    let results = [
+        (bss(other, -30), RSNE.to_vec()),
+        (bss(BSSID, -60), TRANSITION_AP_RSNE.to_vec()),
+    ];
+    let pick = |list: &[(crate::BssInfo, Vec<u8>)], akm| {
+        select_bss_with_ies(
+            list.iter().map(|(b, ies)| (b, ies.as_slice())),
+            SSID,
+            None,
+            Some(5200),
+            akm,
+        )
+        .map(|b| b.bssid)
+    };
+    if pick(&results, Akm::Sae) != Some(BSSID) {
+        return Err("an SAE connect did not find the transition-mode BSS");
+    }
+    if pick(&results[..1], Akm::Sae).is_some() {
+        return Err("an SAE connect selected a BSS that offers only PSK");
+    }
+    if pick(&results, Akm::Psk) != Some(other) {
+        return Err("PSK selection changed");
+    }
+    Ok(())
+}
+
+fn smoke_nl80211_wpa_supplicant_2_12_sae_offload_connect_on_the_wire() -> TestResult {
+    match check_sae() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "wireless/nl80211/wpa_supplicant",
+    smoke_nl80211_wpa_supplicant_2_12_sae_offload_connect_on_the_wire
+);
+
+/// wpa_supplicant reconnecting (another BSS of the ESS, or the same one)
+/// while the wiphy is connected: `cfg80211_connect` refuses a CONNECT on a
+/// connected station with -EALREADY unless the driver reassociates, and
+/// `wpa_driver_nl80211_connect` answers that with DISCONNECT and a second
+/// CONNECT. A non-roaming offload driver (MT7921/MT7922) must get that
+/// errno, not a failed CONNECT event while its old link stays up.
+fn smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready() -> TestResult {
+    let connected = ConnectCaps {
+        connected: true,
+        ..offload_wiphy()
+    };
+    let roaming = ConnectCaps {
+        roam: true,
+        ..connected
+    };
+    let wire = connect(7, &[AKM_PSK]);
+    if parse(&wire, connected).err() != Some(EALREADY)
+        || parse(
+            &sae_connect(7, 4),
+            ConnectCaps {
+                sae_offload: true,
+                ..connected
+            },
+        )
+        .err()
+            != Some(EALREADY)
+    {
+        return TestResult::Fail("CONNECT on a connected non-roaming wiphy was not -EALREADY");
+    }
+    if !matches!(parse(&wire, roaming), Ok(Operation::Connect { .. }))
+        || !matches!(parse(&wire, offload_wiphy()), Ok(Operation::Connect { .. }))
+    {
+        return TestResult::Fail("CONNECT refused on a roaming or disconnected wiphy");
+    }
+    // Malformed requests keep their own errno ahead of the state check.
+    let mut bad = wire.clone();
+    push_attr(&mut bad, 66, &3u32.to_ne_bytes()); // USE_MFP out of range
+    if parse(&bad, connected).err() != Some(ERANGE) {
+        return TestResult::Fail("connected state masked an invalid CONNECT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211/wpa_supplicant",
+    smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready
+);
+
+// ── WPA2-Personal with PMF / PSK-SHA256 on a PMF-offloading owner ──────
+//
+// What wpa_supplicant 2.12 sends for a NetworkManager WPA-PSK profile with
+// `pmf` optional (`ieee80211w=1`) or required (`=2`) once the wiphy offers
+// the PMF handshake offload and NL80211_EXT_FEATURE_MFP_OPTIONAL: the RSNE
+// with MFPC (|MFPR), sixteen PTKSA replay counters toward a WMM AP, a zero
+// PMKID count and BIP-CMAC-128, and NL80211_ATTR_USE_MFP _OPTIONAL (2) or
+// _REQUIRED (1). With PSK-SHA256 offered by the AP, wpa_pick_key_mgmt
+// selects AKM 6 in both the RSNE and NL80211_ATTR_AKM_SUITES.
+
+fn pmf_rsne(akm: u8, caps: u16) -> Vec<u8> {
+    let mut ie = alloc::vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, akm,
+    ];
+    ie.extend_from_slice(&caps.to_le_bytes());
+    ie.extend_from_slice(&[0, 0, 0x00, 0x0f, 0xac, 6]);
+    ie
+}
+
+fn pmf_connect(akm: u32, rsne: &[u8], mfp: u32) -> Vec<u8> {
+    let mut a = Vec::new();
+    push_attr(&mut a, 3, &7u32.to_ne_bytes());
+    push_attr(&mut a, 204, &[]);
+    push_attr(&mut a, 6, &BSSID);
+    push_attr(&mut a, 38, &5200u32.to_ne_bytes());
+    push_attr(&mut a, 52, SSID);
+    let mut ie = rsne.to_vec();
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    push_attr(&mut a, 42, &ie);
+    push_attr(&mut a, 75, &2u32.to_ne_bytes());
+    push_attr(&mut a, 73, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 74, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 76, &akm_list(&[akm]));
+    push_attr(&mut a, 254, &PMK);
+    push_attr(&mut a, 68, &[]);
+    push_attr(&mut a, 102, &0x888eu16.to_ne_bytes());
+    push_attr(&mut a, 66, &mfp.to_ne_bytes()); // USE_MFP
+    push_attr(&mut a, 53, &0u32.to_ne_bytes());
+    a
+}
+
+/// A wiphy like the MT7921 one after the PMF offload: PSK and PSK-SHA256
+/// from the PMK, required and optional PMF.
+fn pmf_wiphy() -> ConnectCaps {
+    ConnectCaps {
+        psk_mfp_offload: true,
+        optional_mfp: true,
+        psk_sha256: true,
+        ..offload_wiphy()
+    }
+}
+
+fn check_pmf() -> Result<(), &'static str> {
+    use crate::association::{validate_sme_ies_for, SmeRsna};
+    const MFPC: u16 = 0x80;
+    const MFPR: u16 = 0x40;
+    let psk = |o: Result<Operation, i32>| matches!(o, Ok(Operation::Connect { cred: Credential::Psk(ref p), .. }) if **p == PMK);
+    // (AKM attribute, RSNE AKM, RSNE capabilities incl. replay counters,
+    // USE_MFP): optional and required PMF with PSK and PSK-SHA256.
+    for (akm, rsne_akm, caps, mfp) in [
+        (AKM_PSK, 2u8, MFPC | 0x0c, 2u32),
+        (AKM_PSK, 2, MFPC | MFPR | 0x0c, 1),
+        (AKM_PSK_SHA256, 6, MFPC | 0x0c, 2),
+        (AKM_PSK_SHA256, 6, MFPC | MFPR | 0x0c, 1),
+    ] {
+        let rsne = pmf_rsne(rsne_akm, caps);
+        if !psk(parse(&pmf_connect(akm, &rsne, mfp), pmf_wiphy())) {
+            return Err("wpa_supplicant's WPA2 PMF / PSK-SHA256 CONNECT refused");
+        }
+        // The native owner's admission against the profile it negotiates.
+        if validate_sme_ies_for(
+            &rsne,
+            SmeRsna::Wpa2 {
+                akm: rsne_akm,
+                mfp: caps & (MFPC | MFPR),
+            },
+        )
+        .is_err()
+        {
+            return Err("owner refused the supplicant's WPA2 PMF RSNE");
+        }
+        if validate_sme_ies_for(&rsne, SmeRsna::Wpa2Psk).is_ok() {
+            return Err("a PMF / PSK-SHA256 RSNE passed as legacy WPA2-PSK");
+        }
+    }
+    // An owner without PSK-SHA256 refuses AKM 6; the RSNE must name the
+    // AKM of NL80211_ATTR_AKM_SUITES.
+    let sha = pmf_rsne(6, MFPC | 0x0c);
+    let no_sha = ConnectCaps {
+        psk_sha256: false,
+        ..pmf_wiphy()
+    };
+    if parse(&pmf_connect(AKM_PSK_SHA256, &sha, 2), no_sha).err() != Some(EOPNOTSUPP)
+        || parse(&pmf_connect(AKM_PSK, &sha, 2), pmf_wiphy()).err() != Some(EOPNOTSUPP)
+    {
+        return Err("PSK-SHA256 admitted without the owner, or AKM/RSNE mismatch");
+    }
+    // USE_MFP must match the RSNE: no MFPC for _OPTIONAL is refused.
+    if parse(&pmf_connect(AKM_PSK, &pmf_rsne(2, 0x0c), 2), pmf_wiphy()).is_ok() {
+        return Err("USE_MFP optional with an RSNE without MFPC");
+    }
+    // Owner side: the AKM and MFP bits must equal what it negotiated.
+    if validate_sme_ies_for(&pmf_rsne(2, MFPC), SmeRsna::Wpa2 { akm: 6, mfp: MFPC }).is_ok()
+        || validate_sme_ies_for(
+            &pmf_rsne(2, MFPC),
+            SmeRsna::Wpa2 {
+                akm: 2,
+                mfp: MFPC | MFPR,
+            },
+        )
+        .is_ok()
+    {
+        return Err("owner admitted a different AKM / PMF selection");
+    }
+    Ok(())
+}
+
+fn smoke_nl80211_wpa_supplicant_2_12_wpa2_pmf_and_psk_sha256_offload() -> TestResult {
+    match check_pmf() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "wireless/nl80211/wpa_supplicant",
+    smoke_nl80211_wpa_supplicant_2_12_wpa2_pmf_and_psk_sha256_offload
+);

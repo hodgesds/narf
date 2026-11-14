@@ -8,7 +8,7 @@ use narf_filesystem::{DirOps, FileOps, FsError};
 
 use crate::dev::RecDev;
 use crate::host::block_on;
-use crate::model::{FlatTree, Inode, Kind, Model, ROOT};
+use crate::model::{Flat, FlatTree, Inode, Kind, Model, ROOT};
 use crate::narf::{dir_at, file_at, split};
 
 /// SplitMix64: tiny, seedable, good enough for workload choices.
@@ -291,8 +291,9 @@ impl<'a> Workload<'a> {
     }
 
     /// Attribute commits the device saw since the last call to the states
-    /// `before` (and the current one).
-    pub fn note_commits(&mut self, before: Option<Vec<FlatTree>>) {
+    /// `before` (and the current one), and to `partial`: the states between
+    /// two steps of the operation that ran.
+    pub fn note_commits(&mut self, before: Option<Vec<FlatTree>>, partial: Vec<Vec<FlatTree>>) {
         let gens = self.dev.sb_gens();
         if gens.len() == self.seen_sb {
             return;
@@ -304,6 +305,7 @@ impl<'a> Workload<'a> {
                 candidates.push(b);
             }
         }
+        candidates.extend(partial);
         for &gen in &gens[self.seen_sb..] {
             self.commits.push(CommitRec {
                 gen,
@@ -778,8 +780,15 @@ impl<'a> Workload<'a> {
             Some(self.flats())
         };
         *self.stats.ops.entry(op.kind()).or_default() += 1;
+        let stepped = matches!(op, Op::Truncate { .. } | Op::Fallocate { .. }).then(|| op.clone());
+        let _ = narf_drivers_fs_btrfs::stats::take_step_marks();
         let r = self.apply_inner(op);
-        self.note_commits(before);
+        let marks = narf_drivers_fs_btrfs::stats::take_step_marks();
+        let partial = match (&before, stepped) {
+            (Some(before), Some(op)) if !marks.is_empty() => between_steps(before, &op, &marks),
+            _ => Vec::new(),
+        };
+        self.note_commits(before, partial);
         r.map_err(|e| {
             format!(
                 "op #{} {short} failed: {e}\nklog tail:\n{}",
@@ -1124,4 +1133,53 @@ pub fn model_from_narf(root: &Arc<dyn DirOps>) -> Result<(Model, Vec<String>), S
         Ok::<_, String>(())
     })?;
     Ok((m, nested))
+}
+
+/// The states a crash can leave between two steps of a truncate or an
+/// `fallocate` that took more than one (`write::DEALLOC_STEP_EXTENTS` extent
+/// items each), from where each step but the last left off (`marks`,
+/// `stats::take_step_marks`): a truncate's file cut at each size it wrote;
+/// a punch's range zeroed up to each mark (its partial edge sectors with the
+/// first step); a preallocation's file, unless `KEEP_SIZE`, grown to each
+/// mark. Nothing else: an operation of one step is old-or-new.
+fn between_steps(before: &[FlatTree], op: &Op, marks: &[u64]) -> Vec<Vec<FlatTree>> {
+    let (sub, path) = match op {
+        Op::Truncate { sub, path, .. } | Op::Fallocate { sub, path, .. } => (*sub, path),
+        _ => return Vec::new(),
+    };
+    let Some(Flat::File { data, .. }) = before.get(sub).and_then(|t| t.get(path)) else {
+        return Vec::new();
+    };
+    let old = data.clone();
+    marks
+        .iter()
+        .map(|&mark| {
+            let mut bytes = (*old).clone();
+            match *op {
+                Op::Truncate { .. } => bytes.truncate((mark as usize).min(bytes.len())),
+                Op::Fallocate { mode, off, len, .. } if mode & FALLOC_FL_PUNCH_HOLE != 0 => {
+                    let end = (off + len) as usize;
+                    let tail = end - end % 4096;
+                    let n = bytes.len();
+                    let clip = |x: usize| x.min(n);
+                    let (a, b) = (clip(off as usize), clip((mark as usize).min(end)));
+                    bytes[a..b.max(a)].fill(0);
+                    let (c, d) = (clip(tail.max(off as usize)), clip(end));
+                    bytes[c..d.max(c)].fill(0);
+                }
+                Op::Fallocate { mode, off, len, .. } if mode & FALLOC_FL_KEEP_SIZE == 0 => {
+                    let size = (mark.min(off + len)) as usize;
+                    if size > bytes.len() {
+                        bytes.resize(size, 0);
+                    }
+                }
+                _ => {}
+            }
+            let mut state = before.to_vec();
+            if let Some(Flat::File { data, .. }) = state[sub].get_mut(path) {
+                *data = Arc::new(bytes);
+            }
+            state
+        })
+        .collect()
 }

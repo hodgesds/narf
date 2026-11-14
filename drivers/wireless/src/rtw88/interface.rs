@@ -1348,23 +1348,37 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     narf_net::iface::install_rx_drain(super::endpoints::drain);
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
+    crate::watchdog_work::start(&device, WATCHDOG_PERIOD_MS);
     narf_scheduler::spawn(async move {
-        let mut ticks = 0u32;
         while !device.withdrawn() {
             if I::SYNCHRONOUS {
                 device.drain();
             } else {
                 device.drain_async().await;
             }
-            ticks = ticks.wrapping_add(1);
-            // The station rate-limits itself to the source 2s period.
-            if ticks % 250 == 0 {
-                device.watchdog().await;
-            }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     });
     Ok(())
+}
+
+/// `RTW_WATCH_DOG_DELAY_TIME`: the watchdog period.
+const WATCHDOG_PERIOD_MS: u64 = 2000;
+
+/// `rtwdev->watch_dog_work`: the station's dynamic-mechanism period as
+/// delayed work (Linux `rtw_watch_dog_work`, re-queued every
+/// `RTW_WATCH_DOG_DELAY_TIME`) until the device is withdrawn.
+impl<I: Io + 'static> crate::watchdog_work::Watchdog for Device<I> {
+    fn watchdog_stopped(&self) -> bool {
+        self.withdrawn()
+    }
+    fn watchdog_step(
+        self: Arc<Self>,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+        alloc::boxed::Box::pin(async move {
+            let _ = self.watchdog().await;
+        })
+    }
 }
 struct Registered<I: Io>(Arc<Device<I>>);
 impl<I: Io + 'static> Interface for Registered<I> {

@@ -297,13 +297,19 @@ static IP_ID_KEY: OnceLock<[u64; 2]> = OnceLock::new();
 
 fn ip_idents_init() {
     IP_IDENTS_INIT.call_once(|| {
-        let mut b = [0u8; IP_IDENTS_SZ * 4];
-        get_random_bytes(&mut b);
-        for (slot, chunk) in IP_IDENTS.iter().zip(b.chunks_exact(4)) {
-            slot.store(
-                u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                Ordering::Relaxed,
-            );
+        // Seed the atomic table in bounded batches: this can run on an
+        // RX-driven send path, where an 8 KiB temporary consumes the IRQ stack.
+        const BATCH_IDS: usize = 64;
+        let mut b = [0u8; BATCH_IDS * 4];
+        for slots in IP_IDENTS.chunks(BATCH_IDS) {
+            let bytes = &mut b[..slots.len() * 4];
+            get_random_bytes(bytes);
+            for (slot, chunk) in slots.iter().zip(bytes.chunks_exact(4)) {
+                slot.store(
+                    u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                    Ordering::Relaxed,
+                );
+            }
         }
     });
 }

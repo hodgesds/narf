@@ -35,8 +35,10 @@ pub(super) struct StationSecurity {
     /// `IEEE80211_NUM_TIDS` for management frames).
     management_pn: u64,
     /// The installed IGTK for software BIP verification (mt76 hands BIP
-    /// group management frames to mac80211 `ieee80211_crypto_aes_cmac_decrypt`).
-    igtk: narf_wireless::mfp::MfpKeyStore,
+    /// group management frames to mac80211 `ieee80211_crypto_aes_*_decrypt`).
+    igtk: narf_wireless::mfp::BipKeyStore,
+    /// The negotiated pairwise, group and group management ciphers.
+    pub(super) ciphers: narf_wireless::rsn::Ciphers,
     /// The last installed CCMP group key index, repeated as `key[0]` of
     /// the IGTK record (`sta_key_conf`).
     gtk_id: u8,
@@ -72,6 +74,13 @@ impl StationSecurity {
         }
         let key_mgmt = plan.akm().ok_or(Error::Bounds)?;
         let pmf = plan.pmf();
+        let ciphers = plan.ciphers();
+        if crate::mt7921::association::mcu_data_cipher(ciphers.pairwise).is_none()
+            || crate::mt7921::association::mcu_data_cipher(ciphers.group).is_none()
+            || !ciphers.valid()
+        {
+            return Err(Error::Bounds);
+        }
         let mut ies = &bss.information_elements[..];
         let mut ap_rsn_ie = None;
         let mut ap_rsnxe = None;
@@ -97,9 +106,9 @@ impl StationSecurity {
                 assoc_ie,
                 ap_rsn_ie: ap_rsn_ie.ok_or(Error::Bounds)?,
                 ap_rsnxe,
-                pairwise_key_len: 16,
-                group_key_len: 16,
-                mgmt_group_key_len: pmf.then_some(16),
+                pairwise_key_len: ciphers.pairwise_key_len(),
+                group_key_len: ciphers.group_key_len(),
+                mgmt_group_key_len: pmf.then_some(ciphers.mgmt_key_len()),
                 pmf,
             }),
             pairwise: [0; 17],
@@ -108,7 +117,8 @@ impl StationSecurity {
             pmf,
             ptk_installed: false,
             management_pn: 0,
-            igtk: narf_wireless::mfp::MfpKeyStore::new(),
+            igtk: narf_wireless::mfp::BipKeyStore::new(),
+            ciphers,
             gtk_id: 0,
         })
     }
@@ -146,7 +156,8 @@ impl StationSecurity {
     }
 
     pub(super) fn commit_group(&mut self, gtk: &Gtk) -> Result<(), Error> {
-        if gtk.key_id > 3 || gtk.key.len() != 16 || gtk.rsc[6..] != [0, 0] {
+        if gtk.key_id > 3 || gtk.key.len() != self.ciphers.group_key_len() || gtk.rsc[6..] != [0, 0]
+        {
             return Err(Error::MalformedEvent);
         }
         self.group[usize::from(gtk.key_id)] = Some([u64::from_le_bytes(gtk.rsc); 17]);
@@ -167,21 +178,30 @@ impl StationSecurity {
     /// The firmware accepted the IGTK record. The KDE IPN is the AP's last
     /// IPN; mac80211 seeds the BIP replay counter with it.
     pub(super) fn commit_igtk(&mut self, igtk: &narf_wireless::eapol::Igtk) -> Result<(), Error> {
-        let key: [u8; 16] = igtk
-            .key
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::MalformedEvent)?;
-        self.igtk
-            .install_active(key, igtk.key_id)
-            .map_err(|_| Error::MalformedEvent)?;
         let mut ipn = [0; 8];
         ipn[..6].copy_from_slice(&igtk.ipn);
-        if let Some(active) = self.igtk.active.as_mut() {
-            active.rx_pn = u64::from_le_bytes(ipn);
-        }
+        let key = narf_wireless::mfp::BipKey::new(
+            self.ciphers.group_mgmt,
+            &igtk.key,
+            igtk.key_id,
+            u64::from_le_bytes(ipn),
+        )
+        .map_err(|_| Error::MalformedEvent)?;
+        self.igtk.install_active(key);
         self.supplicant.group_keys_installed(None, Some(&igtk.key));
         Ok(())
+    }
+
+    /// The hardware decrypted `rx` under the negotiated cipher of the key
+    /// it names (pairwise key 0, else a GTK); mac80211 checks the RX key's
+    /// cipher the same way before it trusts RX_FLAG_DECRYPTED.
+    pub(super) fn decrypted_by(&self, rx: &super::scan::CcmpRx) -> bool {
+        let suite = if rx.key_id == 0 {
+            self.ciphers.pairwise
+        } else {
+            self.ciphers.group
+        };
+        crate::mt7921::association::mac_data_cipher(suite) == Some(rx.cipher)
     }
 
     /// The installed GTK, for the IGTK record's BIP batch `key[0]`.
@@ -189,7 +209,7 @@ impl StationSecurity {
         self.supplicant
             .gtk
             .as_deref()
-            .filter(|gtk| gtk.len() == 16)
+            .filter(|gtk| gtk.len() == self.ciphers.group_key_len())
             .map(|gtk| (self.gtk_id, gtk))
     }
 
@@ -220,8 +240,7 @@ impl StationSecurity {
                 return None;
             }
             let body =
-                narf_wireless::mfp::verify_inbound(&mut self.igtk, &frame[..24], &frame[24..])
-                    .ok()?;
+                narf_wireless::mfp::bip_verify(&mut self.igtk, &frame[..24], &frame[24..]).ok()?;
             let mut out = frame[..24].to_vec();
             out.extend_from_slice(body);
             return Some(out);
@@ -229,7 +248,11 @@ impl StationSecurity {
         // Unicast: hardware-decrypted under the pairwise key only, with a
         // strictly increasing management PN (ieee80211_crypto_ccmp_decrypt).
         let ccmp = ccmp?;
-        if !protected || ccmp.key_id != 0 || ccmp.pn <= self.management_pn {
+        if !protected
+            || ccmp.key_id != 0
+            || !self.decrypted_by(&ccmp)
+            || ccmp.pn <= self.management_pn
+        {
             return None;
         }
         self.management_pn = ccmp.pn;
@@ -259,12 +282,8 @@ impl Drop for StationSecurity {
         {
             key.zeroize();
         }
-        for igtk in [&mut self.igtk.active, &mut self.igtk.next]
-            .into_iter()
-            .flatten()
-        {
-            igtk.key.zeroize();
-        }
+        // BipKey keys are Zeroizing: dropping them wipes the IGTKs.
+        self.igtk = narf_wireless::mfp::BipKeyStore::new();
     }
 }
 
@@ -602,7 +621,9 @@ impl<B: Backend> Session<B> {
             return None;
         }
         let pn = match (native.ccmp, self.station.security.as_ref()) {
-            (Some(ccmp), Some(_)) if ccmp.key_id == 0 => Some(ccmp.pn),
+            (Some(ccmp), Some(security)) if ccmp.key_id == 0 && security.decrypted_by(&ccmp) => {
+                Some(ccmp.pn)
+            }
             (None, None) => None,
             _ => return None,
         };
@@ -654,6 +675,13 @@ impl<B: Backend> Session<B> {
         {
             receiver.clear();
             return None;
+        }
+        // A frame the hardware decrypted under another cipher is dropped.
+        if let (Some(ccmp), Some(security)) = (native.ccmp, self.station.security.as_ref()) {
+            if !security.decrypted_by(&ccmp) {
+                receiver.clear();
+                return None;
+            }
         }
         let floor = self
             .station
@@ -743,6 +771,12 @@ impl<B: Backend> Session<B> {
             && matches!(state, State::Associated { .. })
             && self.data_pending.is_empty()
             && (station.wmm_pending.is_some()
+                || station
+                    .csa
+                    .is_some_and(|(_, at)| self.backend.now_ns() >= at)
+                || station.bw_change.is_some()
+                || self.policy_changed(station)
+                || station.ps_wanted != station.ps_applied
                 || !station.control_pending.is_empty()
                 || station.rx_ba.pending(self.backend.now_ns())
                 || station.tx_ba.pending(self.backend.now_ns())
@@ -754,15 +788,17 @@ impl<B: Backend> Session<B> {
                     .as_ref()
                     .is_some_and(|security| !security.pending.is_empty()))
     }
-    async fn install_group_key(&mut self, gtk: &Gtk) -> Result<(), Error> {
+    /// Install `gtk` under the negotiated group `cipher`.
+    async fn install_group_key(&mut self, gtk: &Gtk, cipher: u8) -> Result<(), Error> {
         if gtk.rsc[6..] != [0, 0] {
             return Err(Error::MalformedEvent);
         }
-        let record = crate::mt7921::association::key_record_on(
+        let record = crate::mt7921::association::key_record_cipher_on(
             self.station.link,
             self.station.link.bmc(),
             gtk.key_id,
             Some(&gtk.key),
+            cipher,
         )
         .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
@@ -777,10 +813,20 @@ impl<B: Backend> Session<B> {
         security: &StationSecurity,
         igtk: &narf_wireless::eapol::Igtk,
     ) -> Result<(), Error> {
+        // mt7921_set_key takes only the AES-CMAC IGTK; mac80211 verifies
+        // the other BIP suites in software (`commit_igtk`'s key).
+        if security.ciphers.group_mgmt != narf_wireless::rsn::CIPHER_BIP_CMAC_128 {
+            return Ok(());
+        }
         let (gtk_id, gtk) = security.gtk().ok_or(Error::MalformedEvent)?;
-        let record =
-            crate::mt7921::association::igtk_record_on(self.station.link, gtk_id, gtk, &igtk.key)
-                .map_err(|_| Error::MalformedEvent)?;
+        let record = crate::mt7921::association::igtk_record_cipher_on(
+            self.station.link,
+            gtk_id,
+            gtk,
+            security.ciphers.group,
+            &igtk.key,
+        )
+        .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -872,11 +918,12 @@ impl<B: Backend> Session<B> {
                 )
                 .await?;
                 if let Some(tk) = tk {
-                    let record = crate::mt7921::association::key_record_on(
+                    let record = crate::mt7921::association::key_record_cipher_on(
                         self.station.link,
                         self.station.link.peer(),
                         0,
                         Some(&tk),
+                        security.ciphers.pairwise,
                     )
                     .map_err(|_| Error::MalformedEvent)?;
                     self.exchange_station(Command::Unified { id: 3 }, &record)
@@ -884,7 +931,7 @@ impl<B: Backend> Session<B> {
                     security.commit_pairwise();
                 }
                 if let Some(gtk) = gtk {
-                    self.install_group_key(&gtk).await?;
+                    self.install_group_key(&gtk, security.ciphers.group).await?;
                     security.commit_group(&gtk)?;
                 }
                 if let Some(igtk) = igtk.filter(|_| security.pmf) {
@@ -1000,6 +1047,15 @@ impl<B: Backend> Session<B> {
             if native.channel != channel {
                 self.clear_aggregate_receive();
                 continue;
+            }
+            // GET_STATION: every frame the AP sent on the operating channel
+            // contributes its signal; data frames also their rate.
+            if native.frame.get(10..16) == Some(&peer[..]) {
+                let data = native.frame.first().is_some_and(|fc| fc & 0x0c == 0x08);
+                let beacon = native.frame.first() == Some(&0x80);
+                self.station
+                    .link_stats
+                    .observe(native.rcpi, native.phy, data, beacon);
             }
             // PMF management admission before any MLME/BA consumer: mac80211
             // `ieee80211_drop_unencrypted_mgmt` plus the CCMP (hardware) and
@@ -1118,14 +1174,26 @@ impl<B: Backend> Session<B> {
                     && f[10..16] == peer
                     && f[16..22] == peer
                     && (f[4..10] == own || f[4..10] == [255; 6])
-                    && !narf_wireless::association::phy::ApElements::parse(&f[36..])
-                        .is_ok_and(|current| crate::mt7921::ht20::same_ap_phy(&ap, &current))
                 {
-                    self.station.peer_lost = true;
-                    self.station.rx_ba.fence();
-                    self.station.tx_ba.fence();
-                    self.clear_aggregate_receive();
-                    return Err(Error::DeviceGone);
+                    match crate::mt7921::csa::beacon_phy(&ap, &f[36..]) {
+                        // The latest Beacon wins over a change not yet followed.
+                        crate::mt7921::csa::BeaconPhy::Same => self.station.bw_change = None,
+                        // mac80211 `ieee80211_config_bw`: the station follows
+                        // a new width of the unchanged PHY (control work),
+                        // unless an announced switch will rebind it first.
+                        crate::mt7921::csa::BeaconPhy::Width(current) => {
+                            if self.station.csa.is_none() {
+                                self.station.bw_change = Some(*current);
+                            }
+                        }
+                        crate::mt7921::csa::BeaconPhy::Changed => {
+                            self.station.peer_lost = true;
+                            self.station.rx_ba.fence();
+                            self.station.tx_ba.fence();
+                            self.clear_aggregate_receive();
+                            return Err(Error::DeviceGone);
+                        }
+                    }
                 }
             }
             if native.amsdu != 0 {
@@ -1168,6 +1236,36 @@ impl<B: Backend> Session<B> {
                     self.station.tx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
+                }
+            }
+            // The AP announces it is leaving this channel (Channel Switch
+            // Announcement, element 37, or Extended CSA, element 60), on a
+            // radar channel because it detected radar. mac80211
+            // (`ieee80211_sta_process_chanswitch`) records the target and the
+            // switch time (count x beacon interval), stops data at once for
+            // Channel Switch Mode 1, and follows the AP at that time
+            // (`service_channel_switch`).
+            if native.ccmp.is_none()
+                && matches!(header[0], 0x80 | 0x50)
+                && header[1] & 0xc7 == 0
+                && header[22] & 15 == 0
+                && (header[4..10] == own || header[4..10] == [0xff; 6])
+                && header[10..16] == peer
+                && header[16..22] == peer
+                && self.station.csa.is_none()
+            {
+                if let Some(switch) = frame
+                    .get(36..)
+                    .and_then(crate::mt7921::association::channel_switch)
+                {
+                    let interval_ns =
+                        u64::from(u16::from_le_bytes([frame[32], frame[33]]).max(1)) * 1_024_000;
+                    let at = self
+                        .backend
+                        .now_ns()
+                        .saturating_add(u64::from(switch.count) * interval_ns);
+                    self.station.csa = Some((switch, at));
+                    self.station.csa_block_tx = switch.block_tx;
                 }
             }
             if let Some(parameters) = self.station.wmm_pending.or(self.station.wmm) {
@@ -1253,7 +1351,7 @@ impl<B: Backend> Session<B> {
                 let Some(security) = self.station.security.as_mut() else {
                     continue;
                 };
-                if !protected {
+                if !protected || !security.decrypted_by(&ccmp) {
                     continue;
                 }
                 let tid = if header[0] & 0x80 != 0 {
@@ -1485,6 +1583,10 @@ impl<B: Backend> Session<B> {
     pub(super) fn start_ethernet(&mut self, frame: &[u8]) -> Result<(), Error> {
         if self.station.peer_lost {
             return Err(Error::DeviceGone);
+        }
+        // Channel Switch Mode 1: no data until the switch.
+        if self.station.csa_block_tx {
+            return Err(Error::Busy);
         }
         let State::Associated { info, .. } = self.state else {
             return Err(Error::Busy);
@@ -1721,7 +1823,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::DeviceGone);
         }
         let epoch = self.receive_epoch;
-        let ready = !self.p2p_rf_busy() && self.poll_data_tx()?;
+        let ready = !self.p2p_rf_busy() && !self.station.csa_block_tx && self.poll_data_tx()?;
         let transmitted = if let Some(frame) = tx.filter(|_| ready) {
             self.start_ethernet(frame)?;
             true
@@ -1740,9 +1842,18 @@ impl<B: Backend> Session<B> {
         if !self.receive_current(epoch)? {
             received.clear();
         }
+        // The home station's sampled TX status (rate, failures).
+        if let Some(report) = self
+            .backend
+            .tx_rate_report()
+            .filter(|report| report.wcid == u16::from(self.station.link.peer()))
+        {
+            self.station.link_stats.observe_txs(report);
+        }
         Ok(super::PacketStep {
             transmitted,
             received,
+            link: Some(self.station.link_stats),
             receive_epoch: epoch,
         })
     }
@@ -1818,6 +1929,27 @@ impl<B: Backend> Session<B> {
         Err(Error::MalformedEvent)
     }
 
+    /// Wait for the AP's Open System Authentication response and return
+    /// the association request it releases.
+    async fn open_authentication_response(
+        &mut self,
+        plan: &mut JoinPlan,
+        rx_channel: u8,
+    ) -> Result<Vec<u8>, Error> {
+        self.wait_station_rx(3_000, |_, packet| {
+            if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                if let Some(assoc) = plan
+                    .authentication_response(frame)
+                    .map_err(|_| Error::MalformedEvent)?
+                {
+                    return Ok(Some(assoc.to_vec()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
     pub(super) async fn associate_station(
         &mut self,
         bss: &ScanBss,
@@ -1848,7 +1980,7 @@ impl<B: Backend> Session<B> {
         extra_ies: &[u8],
         network: crate::mt7921::p2p_wire::Network,
     ) -> Result<u16, Error> {
-        if self.p2p_rf_busy() {
+        if self.p2p_rf_busy() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let (info, setup) = match self.state {
@@ -1890,7 +2022,9 @@ impl<B: Backend> Session<B> {
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
         let own = info.capabilities.mac;
-        let mut plan = JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
+        let ciphers = crate::mt7921::association::supplicant_ciphers(extra_ies);
+        let mut plan =
+            JoinPlan::prepare_native(bss, own, ssid, security, info, permission, ciphers)?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
         self.backend.check_tx_permission(permission)?;
         if !self.station.rx_ba.begin_connection() || !self.station.tx_ba.begin_connection() {
@@ -1912,12 +2046,33 @@ impl<B: Backend> Session<B> {
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
         self.station.tx_credit.clear();
+        // A channel switch or width change of an earlier association is
+        // not this one's.
+        self.station.csa = None;
+        self.station.csa_block_tx = false;
+        self.station.bw_change = None;
         self.boot_started = Some(self.backend.now_ns());
         self.station.security = None;
         self.station.wmm = None;
         self.station.wmm_pending = None;
         self.station.permission = Some(permission);
         let mut sae_pmk: Option<Zeroizing<[u8; 32]>> = None;
+        // The SAE network's credentials, and its live cached PMKSA for this
+        // BSS (wpa_supplicant `pmksa_cache_get`).
+        let credentials = match security {
+            Security::Wpa3Sae { password } => {
+                Some(crate::mt7921::pmksa::binding(ssid, password.as_bytes()))
+            }
+            _ => None,
+        };
+        let mut cached = credentials.and_then(|binding| {
+            let now = self.backend.now_ns();
+            self.pmksa.lookup(bss.bssid, binding, now)
+        });
+        // The PMKSA a full SAE exchange produced, recorded on success.
+        let mut new_pmksa: Option<([u8; 16], Zeroizing<[u8; 32]>)> = None;
+        // Roaming: this join is a reassociation away from that AP.
+        let reassociate_from = self.station.reassociate_from.take();
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -1933,17 +2088,7 @@ impl<B: Backend> Session<B> {
                 self.check_station_tx()?;
             }
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
-            let channels = permission.channels();
-            let mut domain = vec![0u8; 12 + 8 * channels.len()];
-            domain[..2].copy_from_slice(&permission.country);
-            domain[4..7].fill(1); // 20 MHz
-            domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
-            domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
-            for (index, channel) in channels.into_iter().enumerate() {
-                domain[12 + index * 8..14 + index * 8]
-                    .copy_from_slice(&u16::from(channel).to_le_bytes());
-                // Flags zero only after complete occupied-channel admission.
-            }
+            let domain = station_channel_domain(permission, band);
             self.notify(
                 Command::Ce {
                     id: 0x0f,
@@ -2004,51 +2149,106 @@ impl<B: Backend> Session<B> {
 
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
-            let assoc_req = if let Security::Wpa3Sae { password } = security {
-                let (request, pmk) = self
-                    .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
-                    .await?;
-                sae_pmk = Some(pmk);
-                request
-            } else {
-                let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
-                self.send_management(auth_req, u16::from(self.station.link.peer()))
-                    .await?;
-
-                // 4. Wait for Authentication Response:
-                self.wait_station_rx(3_000, |_, packet| {
-                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                        if let Some(assoc) = plan
-                            .authentication_response(frame)
-                            .map_err(|_| Error::MalformedEvent)?
-                        {
-                            return Ok(Some(assoc.to_vec()));
+            let aid = loop {
+                let attempt = async {
+                    let assoc_req = match (security, cached.as_ref()) {
+                        // PMKSA caching: Open System authentication and the
+                        // cached PMKID instead of a new SAE exchange.
+                        (Security::Wpa3Sae { .. }, Some((pmkid, pmk))) => {
+                            let auth_req = plan
+                                .start_pmksa_authentication(*pmkid)
+                                .map_err(|_| Error::Busy)?
+                                .to_vec();
+                            self.send_management(&auth_req, u16::from(self.station.link.peer()))
+                                .await?;
+                            let request = self
+                                .open_authentication_response(&mut plan, rx_channel)
+                                .await?;
+                            sae_pmk = Some(Zeroizing::new(**pmk));
+                            request
                         }
+                        (Security::Wpa3Sae { password }, None) => {
+                            let (request, pmk) = self
+                                .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
+                                .await?;
+                            new_pmksa = plan
+                                .sae()
+                                .and_then(|join| join.pmkid())
+                                .map(|pmkid| (pmkid, Zeroizing::new(*pmk)));
+                            sae_pmk = Some(pmk);
+                            request
+                        }
+                        _ => {
+                            let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
+                            self.send_management(auth_req, u16::from(self.station.link.peer()))
+                                .await?;
+                            // 4. Wait for Authentication Response:
+                            self.open_authentication_response(&mut plan, rx_channel)
+                                .await?
+                        }
+                    };
+
+                    // 5. Send Association Request (a Reassociation Request
+                    // when roaming within the ESS):
+                    let assoc_req = match reassociate_from {
+                        Some(current_ap) => {
+                            plan.expect_reassociation();
+                            narf_wireless::association::reassociation_request(
+                                &assoc_req, current_ap,
+                            )
+                            .ok_or(Error::Bounds)?
+                        }
+                        None => assoc_req,
+                    };
+                    self.stage(Stage::Associate);
+                    self.send_management(&assoc_req, u16::from(self.station.link.peer()))
+                        .await?;
+
+                    // 6. Wait for Association Response:
+                    self.wait_station_rx(3_000, |_, packet| {
+                        if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                            if let Some(aid) =
+                                plan.association_response(frame)
+                                    .map_err(|error| match error {
+                                        // The status itself only selects the
+                                        // PMKSA fallback below.
+                                        narf_wireless::association::Error::Rejected(status) => {
+                                            Error::Rejected(u8::try_from(status).unwrap_or(u8::MAX))
+                                        }
+                                        _ => Error::MalformedEvent,
+                                    })?
+                            {
+                                return Ok(Some(aid));
+                            }
+                        }
+                        Ok(None)
+                    })
+                    .await
+                }
+                .await;
+                match attempt {
+                    Ok(aid) => break aid,
+                    // wpa_supplicant: "PMKSA caching attempt rejected - drop
+                    // PMKSA cache entry and fall back to SAE authentication"
+                    // (WLAN_STATUS_INVALID_PMKID, or no answer to it).
+                    Err(_) if cached.take().is_some() => {
+                        self.pmksa.remove(bss.bssid);
+                        sae_pmk = None;
+                        plan = JoinPlan::prepare_native(
+                            bss,
+                            own,
+                            ssid,
+                            security,
+                            info,
+                            permission,
+                            crate::mt7921::association::supplicant_ciphers(extra_ies),
+                        )?;
+                        plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
+                        self.stage(Stage::Authenticate);
                     }
-                    Ok(None)
-                })
-                .await?
+                    Err(error) => return Err(error),
+                }
             };
-
-            // 5. Send Association Request:
-            self.stage(Stage::Associate);
-            self.send_management(&assoc_req, u16::from(self.station.link.peer()))
-                .await?;
-
-            // 6. Wait for Association Response:
-            let aid = self
-                .wait_station_rx(3_000, |_, packet| {
-                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                        if let Some(aid) = plan
-                            .association_response(frame)
-                            .map_err(|_| Error::MalformedEvent)?
-                        {
-                            return Ok(Some(aid));
-                        }
-                    }
-                    Ok(None)
-                })
-                .await?;
 
             self.station.management_rate = plan.management_rate();
             if let Some((width, center)) = plan.phy_channel() {
@@ -2203,12 +2403,13 @@ impl<B: Backend> Session<B> {
                 }
                 Security::Wpa2Psk { .. }
                 | Security::Wpa2PskPmf { .. }
+                | Security::Wpa2PskSelected { .. }
                 | Security::Wpa3Sae { .. } => {
                     self.stage(Stage::EapolHandshake);
                     let pmk = match security {
-                        Security::Wpa2Psk { psk } | Security::Wpa2PskPmf { psk, .. } => {
-                            Zeroizing::new(psk)
-                        }
+                        Security::Wpa2Psk { psk }
+                        | Security::Wpa2PskPmf { psk, .. }
+                        | Security::Wpa2PskSelected { psk, .. } => Zeroizing::new(psk),
                         _ => sae_pmk.take().ok_or(Error::MalformedEvent)?,
                     };
                     let mut security = StationSecurity::new(bss, &plan, own, &pmk)?;
@@ -2253,17 +2454,18 @@ impl<B: Backend> Session<B> {
                                 .await?;
                                 self.stage(Stage::StaRecord);
                                 let record = plan
-                                    .secure_peer_record_on(
+                                    .secure_peer_record_cipher_on(
                                         self.station.link,
                                         aid,
                                         m3.tk.as_deref().unwrap(),
+                                        security.ciphers.pairwise,
                                     )
                                     .map_err(|_| Error::MalformedEvent)?;
                                 self.exchange_station(Command::Unified { id: 3 }, &record)
                                     .await?;
                                 security.commit_pairwise();
                                 let gtk = m3.gtk.as_ref().unwrap();
-                                self.install_group_key(gtk).await?;
+                                self.install_group_key(gtk, security.ciphers.group).await?;
                                 security.commit_group(gtk)?;
                                 if let Some(igtk) = m3.igtk.as_ref().filter(|_| security.pmf) {
                                     self.install_igtk(&security, igtk).await?;
@@ -2292,6 +2494,16 @@ impl<B: Backend> Session<B> {
             Ok(aid) => {
                 self.boot_started = None;
                 self.station.peer_lost = false;
+                // A report from before this association is not its own.
+                self.station.link_stats = crate::mt7921::link_stats::LinkStats::starting_after(
+                    self.backend.tx_rate_report().map(|report| report.sequence),
+                );
+                self.station.ps_applied = false;
+                self.station.applied_policy = self.backend.regulatory_domain().ok();
+                if let (Some(binding), Some((pmkid, pmk))) = (credentials, new_pmksa.take()) {
+                    let now = self.backend.now_ns();
+                    self.pmksa.insert(bss.bssid, binding, pmkid, &pmk, now);
+                }
                 self.station.bss = Some(bss.clone());
                 self.station.wmm = plan.wmm();
                 self.station.ht20_profile = plan.ht20();
@@ -2313,6 +2525,12 @@ impl<B: Backend> Session<B> {
                 Ok(aid)
             }
             Err(error) => {
+                // A join that used a cached PMKSA and still failed (a 4-way
+                // handshake the AP's PMK did not match) drops the entry, as
+                // wpa_supplicant clears the current PMKSA on that failure.
+                if cached.is_some() {
+                    self.pmksa.remove(bss.bssid);
+                }
                 self.station.security = None;
                 self.station.wmm = None;
                 self.station.wmm_pending = None;
@@ -2585,7 +2803,29 @@ impl<B: Backend> Session<B> {
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
-        if self.station.wmm_pending.is_none()
+        // A switch falls due only in the ordinary associated state: an
+        // associated scan restores its own state and retries afterwards.
+        let switch_due = matches!(restore, State::Associated { .. })
+            && self
+                .station
+                .csa
+                .is_some_and(|(_, at)| self.backend.now_ns() >= at);
+        // A width change in the AP's Beacons is followed the same way; an
+        // announced switch rebinds the AP's elements itself.
+        let width_due = matches!(restore, State::Associated { .. })
+            && self.station.bw_change.is_some()
+            && self.station.csa.is_none();
+        let mut restore = restore;
+        // While Channel Switch Mode 1 holds data, other control work waits
+        // for the switch: nothing may be sent on the old channel.
+        if self.station.csa_block_tx && !switch_due {
+            return Ok(());
+        }
+        if !switch_due
+            && !width_due
+            && self.station.wmm_pending.is_none()
+            && !self.policy_changed(&self.station)
+            && self.station.ps_wanted == self.station.ps_applied
             && self.station.control_pending.is_empty()
             && !self.station.rx_ba.pending(self.backend.now_ns())
             && !self.station.tx_ba.pending(self.backend.now_ns())
@@ -2608,7 +2848,29 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            if switch_due {
+                if let Some(channel) = self.service_channel_switch(info, associated).await? {
+                    // The state restored after the control work is the
+                    // association on its new channel.
+                    if let State::Associated {
+                        info, peer, aid, ..
+                    } = restore
+                    {
+                        restore = State::Associated {
+                            info,
+                            peer,
+                            channel,
+                            aid,
+                        };
+                    }
+                }
+            }
+            if width_due {
+                self.service_width_change(info, associated).await?;
+            }
+            self.service_regulatory(info).await?;
             self.service_wmm_update().await?;
+            self.service_power_save().await?;
             self.service_transmit_ba().await?;
             self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
@@ -2675,8 +2937,279 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// Follow the AP's announced channel switch in place (mac80211
+    /// `ieee80211_sta_process_chanswitch` / `ieee80211_chswitch_work`;
+    /// `mt7921_csa_work` sends the new channel context's RLM): the same BSS
+    /// on the new channel, at the width the CSA, Secondary Channel Offset,
+    /// Wide Bandwidth Channel Switch element or ECSA operating class names
+    /// (`ieee80211_parse_ch_switch_ie`), no wider than the connection's
+    /// limit, narrowed to what the policy allows ([`Self::follow_ap`]). The
+    /// association, keys, BA sessions and PHY profiles carry over. A switch
+    /// it cannot follow ends the link (`ieee80211_sta_connection_lost`):
+    /// another band, 6 GHz, inconsistent channel data, or a channel the
+    /// policy forbids at any width. Returns the new primary channel.
+    async fn service_channel_switch(
+        &mut self,
+        info: super::RadioInfo,
+        associated: State,
+    ) -> Result<Option<u8>, Error> {
+        let Some((switch, _)) = self.station.csa.take() else {
+            return Ok(None);
+        };
+        self.station.csa_block_tx = false;
+        self.station.bw_change = None;
+        let State::Associated { .. } = associated else {
+            return Err(Error::Busy);
+        };
+        let (Some(old), Some(bss)) = (self.station.permission, self.station.bss.as_ref()) else {
+            return Err(Error::Authority);
+        };
+        let target = (!crate::mt7921::association::is_six_ghz(bss)
+            && crate::mt7921::csa::switch_band(&switch) == old.band())
+        .then(|| {
+            crate::mt7921::csa::switch_target(
+                &switch,
+                self.width_limit(),
+                self.station.vht_profile.is_some(),
+            )
+        })
+        .flatten();
+        let Some((ap, used)) = target else {
+            return Err(self.leave_ap());
+        };
+        // mac80211 ignores a switch to the channel it already uses.
+        if used == old.chandef() {
+            return Ok(None);
+        }
+        self.follow_ap(info, ap, None).await?;
+        Ok(Some(switch.channel))
+    }
+
+    /// mac80211 `ieee80211_config_bw` for a Beacon whose PHY changed only in
+    /// its width (`csa::beacon_phy`): the AP's new channel, at most the
+    /// connection's limit and narrowed to what the policy allows. A
+    /// Beacon whose operation elements are inconsistent ends the link.
+    async fn service_width_change(
+        &mut self,
+        info: super::RadioInfo,
+        associated: State,
+    ) -> Result<(), Error> {
+        let Some(elements) = self.station.bw_change.take() else {
+            return Ok(());
+        };
+        let State::Associated { channel, .. } = associated else {
+            return Err(Error::Busy);
+        };
+        let Some(ap) = crate::mt7921::csa::ap_chandef(&elements, channel) else {
+            return Err(self.leave_ap());
+        };
+        self.follow_ap(info, ap, Some(elements)).await
+    }
+
+    /// The connection's channel width limit (mac80211 `conn->bw_limit`):
+    /// 160 or 80 MHz for VHT, 40 MHz for HT when both sides support it,
+    /// else 20 MHz.
+    fn width_limit(&self) -> u8 {
+        match (self.station.vht_profile, self.station.ht20_profile) {
+            (Some(vht), _) if vht.wide160() => cmd::CH_BW_160,
+            (Some(_), _) => cmd::CH_BW_80,
+            (None, Some(ht)) if ht.forty() => cmd::CH_BW_40,
+            _ => cmd::CH_BW_20,
+        }
+    }
+
+    /// End the link: the AP moved somewhere this station cannot follow.
+    fn leave_ap(&mut self) -> Error {
+        self.station.peer_lost = true;
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        Error::Authority
+    }
+
+    /// Move the association to the AP's channel `ap`: the station uses it
+    /// at most at the connection's width limit and, while the policy does
+    /// not allow that width, one step narrower (`ieee80211_chandef_downgrade`;
+    /// mac80211 would disconnect where cfg80211 refuses the AP's width, but
+    /// this owner's grant is stricter than `cfg80211_chandef_usable`, so it
+    /// keeps the link at a width it may use). The BSS's elements are
+    /// rewritten for `ap` and the tracked AP elements become `elements` (a
+    /// Beacon's) or those rewritten ones. The HT/VHT/HE profiles follow the
+    /// used width; the radio retunes (channel domain, power limits,
+    /// CHANNEL_SWITCH) and the BSS RLM record carries the new channel
+    /// context (`mt76_connac_mcu_uni_set_chctx`). The STA record is not
+    /// resent: Linux mt7921 has no `sta_rc_update`.
+    async fn follow_ap(
+        &mut self,
+        info: super::RadioInfo,
+        ap: crate::mt7921::csa::Chandef,
+        elements: Option<narf_wireless::association::phy::ApElements>,
+    ) -> Result<(), Error> {
+        let (Some(old), Some(mut bss)) = (self.station.permission, self.station.bss.clone()) else {
+            return Err(Error::Authority);
+        };
+        bss.information_elements =
+            crate::mt7921::csa::describe(&bss.information_elements, ap).ok_or(Error::Bounds)?;
+        bss.channel = ap.primary;
+        let elements = match (self.station.ap_phy, elements) {
+            (_, Some(elements)) => Some(elements),
+            (Some(_), None) => Some(
+                narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                    .map_err(|_| Error::Bounds)?,
+            ),
+            (None, None) => None,
+        };
+        let vht = self.station.vht_profile.is_some();
+        let domain = self.backend.regulatory_domain()?;
+        let mut used = ap.limited(self.width_limit());
+        let grant = loop {
+            if let Some(grant) =
+                crate::mt7921::association::TxPermission::following_ap(&domain, used, vht)
+            {
+                break grant;
+            }
+            if used.width == cmd::CH_BW_20 {
+                return Err(self.leave_ap());
+            }
+            used = used.downgrade();
+        };
+        let moved = grant.chandef() != old.chandef();
+        // The radio's channel is shared with the other live station owner
+        // or the GO; mac80211 cannot reserve a channel context for the move
+        // and disconnects.
+        if moved && (self.other_station_permission().is_some() || self.go_plan().is_some()) {
+            return Err(self.leave_ap());
+        }
+        let operation = elements
+            .and_then(|elements| elements.ht_operation())
+            .or_else(|| {
+                narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                    .ok()
+                    .and_then(|elements| elements.ht_operation())
+            });
+        if let (Some(profile), Some(operation)) = (self.station.ht20_profile, operation) {
+            self.station.ht20_profile = Some(profile.retuned(operation, used.secondary()));
+        }
+        if let (Some(profile), Some(elements)) = (self.station.vht_profile, elements) {
+            self.station.vht_profile = Some(profile.retuned(used.width, used.center, elements));
+        }
+        if let Some(profile) = self.station.he_profile {
+            self.station.he_profile = Some(profile.retuned(used.width));
+        }
+        self.station.ap_phy = elements;
+        if let Some(receiver) = &mut self.station.ht20_rx {
+            receiver.retune(ap.primary);
+        }
+        self.station.bss = Some(bss);
+        self.station.permission = Some(if moved { grant } else { old });
+        self.clear_aggregate_receive();
+        if !moved {
+            return Ok(());
+        }
+        let tx_streams = self.station.vht_profile.map_or_else(
+            || {
+                self.station
+                    .ht20_profile
+                    .map_or(1, crate::mt7921::ht20::Profile::transmit_streams)
+            },
+            crate::mt7921::vht::Profile::transmit_streams,
+        );
+        self.reconfigure_station_channel(info, used.primary, grant, tx_streams)
+            .await?;
+        let chains = (1 << info.capabilities.phy.spatial_streams.min(2)) - 1;
+        self.exchange_station(
+            Command::Unified { id: 2 },
+            &crate::mt7921::vif_slots::on_bss(
+                self.station.link.vif(),
+                crate::mt7921::csa::rlm(used, tx_streams, chains),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Every association/key/port publication earns fresh authority after
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
+    /// The installed regulatory policy is no longer the one this station's
+    /// grant and firmware limits were programmed from.
+    pub(super) fn policy_changed(&self, station: &super::StationLink) -> bool {
+        // Compared by value: reinstalling identical rules is no change.
+        station.applied_policy.as_ref().is_some_and(|applied| {
+            self.backend
+                .regulatory_domain()
+                .is_ok_and(|now| !alloc::sync::Arc::ptr_eq(applied, &now) && **applied != *now)
+        })
+    }
+
+    /// cfg80211's `reg_notifier` -> `mt7921_regd_notifier` for an associated
+    /// station: the same BSS is re-admitted under the new policy and its
+    /// channel domain and power limits are programmed again
+    /// (`mt76_connac_mcu_set_channel_domain`, `mt76_connac_mcu_set_rate_txpower`).
+    /// A policy that no longer permits the operating channel at the same
+    /// width ends the link (`reg_leave_invalid_chans`).
+    async fn service_regulatory(&mut self, info: super::RadioInfo) -> Result<(), Error> {
+        if !self.policy_changed(&self.station) {
+            return Ok(());
+        }
+        let now = self.backend.regulatory_domain()?;
+        let (Some(old), Some(bss)) = (self.station.permission, self.station.bss.clone()) else {
+            return Err(Error::Authority);
+        };
+        let new = crate::mt7921::association::TxPermission::from_ap_heard(
+            &now,
+            info,
+            &bss,
+            old.follows_heard_ap(),
+        )
+        .filter(|new| new.same_operation(old));
+        let Some(new) = new else {
+            self.station.peer_lost = true;
+            self.station.rx_ba.fence();
+            self.station.tx_ba.fence();
+            return Err(Error::Authority);
+        };
+        let band = new.band().ok_or(Error::Bounds)?;
+        let limits = new
+            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+            .ok_or(Error::Bounds)?;
+        // The new grant is current under the new policy; the old one may
+        // not be (a lower power ceiling).
+        self.station.permission = Some(new);
+        self.check_station_tx()?;
+        self.notify(
+            Command::Ce {
+                id: 0x0f,
+                query: false,
+            },
+            &station_channel_domain(new, band),
+        )
+        .await?;
+        self.notify(
+            Command::Ce {
+                id: 0x5d,
+                query: false,
+            },
+            &limits,
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        self.station.applied_policy = Some(now);
+        self.check_station_tx()
+    }
+
+    /// mt7921_mcu_uni_bss_ps (`BSS_CHANGED_PS`): UNI_CMD BSS_INFO_UPDATE
+    /// with the `UNI_BSS_INFO_PS` (21) TLV, `ps_state` 2 (dynamic power
+    /// save, firmware-timed) or 0 (awake), for this link's BSS.
+    async fn service_power_save(&mut self) -> Result<(), Error> {
+        if self.station.ps_wanted == self.station.ps_applied {
+            return Ok(());
+        }
+        let body = bss_power_save(self.station.link.bss(), self.station.ps_wanted);
+        self.exchange_station(Command::Unified { id: 2 }, &body)
+            .await?;
+        self.station.ps_applied = self.station.ps_wanted;
+        Ok(())
+    }
+
     pub(super) async fn exchange_station(
         &mut self,
         command: Command,
@@ -2708,4 +3241,35 @@ impl<B: Backend> Session<B> {
         }
         Ok(())
     }
+}
+
+/// The `mt7921_mcu_uni_bss_ps` request: `{ bss_idx, pad[3] }` then the
+/// `UNI_BSS_INFO_PS` TLV `{ tag 21, len 8, ps_state, pad[3] }`.
+pub(super) fn bss_power_save(bss: u8, enabled: bool) -> [u8; 12] {
+    let mut body = [0; 12];
+    body[0] = bss;
+    body[4..6].copy_from_slice(&21u16.to_le_bytes());
+    body[6..8].copy_from_slice(&8u16.to_le_bytes());
+    body[8] = if enabled { 2 } else { 0 };
+    body
+}
+
+/// The station's channel domain (`mt76_connac_mcu_set_channel_domain`):
+/// the occupied channels of `permission` with NO_IR cleared, everything
+/// else absent.
+pub(super) fn station_channel_domain(
+    permission: crate::mt7921::association::TxPermission,
+    band: crate::mt7921::channel::Band,
+) -> Vec<u8> {
+    let channels = permission.channels();
+    let mut domain = vec![0u8; 12 + 8 * channels.len()];
+    domain[..2].copy_from_slice(&permission.country);
+    domain[4..7].fill(1); // 20 MHz
+    domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
+    domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
+    for (index, channel) in channels.into_iter().enumerate() {
+        domain[12 + index * 8..14 + index * 8].copy_from_slice(&u16::from(channel).to_le_bytes());
+        // Flags zero only after complete occupied-channel admission.
+    }
+    domain
 }

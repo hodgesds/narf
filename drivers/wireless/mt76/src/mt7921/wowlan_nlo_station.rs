@@ -28,9 +28,10 @@ impl Plan {
         backend: &B,
         info: RadioInfo,
         config: &NetDetectConfig,
+        limits: narf_wireless::SchedScanSupport,
         operating: Option<crate::mt7921::association::TxPermission>,
     ) -> Result<Self, Error> {
-        wowlan_nlo::validate(config)?;
+        wowlan_nlo::validate_with(config, limits)?;
         let policy = (!config.probe_ssids.is_empty())
             .then(|| backend.regulatory_domain())
             .transpose()?;
@@ -124,6 +125,11 @@ impl Plan {
         };
         plan.current(backend)?;
         Ok(plan)
+    }
+
+    /// The request's channels in scan-id (RXD channel) form.
+    pub(in crate::mt7921::firmware_transport) fn scan_ids(&self) -> &[u8] {
+        &self.ids
     }
 
     pub(in crate::mt7921::firmware_transport) fn current<B: Backend>(

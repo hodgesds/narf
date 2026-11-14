@@ -190,6 +190,16 @@ pub fn stackful::materialize_current_user_fpu() -> bool;
 pub fn stackful::reset_current_user_fpu() -> bool;
 #[cfg(target_arch = "x86_64")]
 pub fn stackful::handle_user_fpu_unavailable() -> bool;
+/// Guarded kernel stacks: every stackful task runs on a `narf_memory::kstack::
+/// KernelStack` (≤ 128 KiB; `StackfulOptions::stack_bytes` above that panics).
+pub fn stackful::KernelTask::stack_bounds(&self) -> (u64, u64);
+/// Bytes of the task stack ever written (stacks start zeroed).
+pub fn stackful::KernelTask::stack_high_water(&self) -> usize;
+pub fn stackful::current_stackful_high_water() -> Option<(usize, usize)>;
+/// Trap layer, after reporting an overflow of [base, top) at `fault`:
+/// Some((pc, sp)) only for an overflow a kernel test armed for this stack.
+pub fn stackful::overflow_test_recovery(base: u64, top: u64, fault: u64)
+    -> Option<(u64, u64)>;
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 /// Mark a dequeued synchronous waiter for an immediate local handoff.
@@ -489,6 +499,12 @@ context before activation. Its no-work check uses the library's cache-line
 isolated local presence flag, so a syscall does not scan deferred slots or
 consult a global wake counter.
 
+The target is not the inbox's only consumer. A staged slot has not been
+admitted to the target's policy, so an idle CPU's balance pass may remove one
+under a non-blocking inbox lock and admit it locally instead (§3.3). A task
+enqueued across CPUs is therefore not held until its target next reaches an
+executor boundary.
+
 #### 3.1.1 Pluggable scheduling policy
 
 Scheduling policy may be implemented in a separate `no_std` crate using only
@@ -691,6 +707,30 @@ be mistaken for an empty runnable queue. A delayed node follows a migrated
 task's current parked token; the CPU-offline path drains again after moving its
 resident owners, paired with producers' token recheck under the inbox gate.
 
+A node on a CPU's public inbox list names a task parked on that CPU, or one
+reaped from it that has no further wake to lose. Every path that takes a task
+out of a CPU's parked set to run it unlinks the task's node under the gate
+before the slot is enqueued anywhere: the owner's drain, wake-time placement,
+synchronous wake affinity, a runtime affinity move, local activation, donation,
+the park-time wake recheck, and an idle CPU's pull. The owner's drain is on
+that list because it releases a detached node's claim before it takes the slot
+(a wake after the release must be able to stage itself), and a wake in that
+window links the cell on the public list again. While the slot is in the
+taker's hands its parked token is clear, so no producer can link the node
+again. Without this the node's claim would coalesce the task's next wake, and
+a task that slept again on its new CPU would wait for its old home to drain.
+The one node a taker cannot unlink is one in the owner's detached batch; the
+drain that detached it is already running and releases or forwards it. The
+lock order is parked set, then gate; the gate remains a leaf.
+
+Each node carries the stamp — CPU and detach generation — of the public list
+it was last linked on, written under that list's gate at link and cleared at
+unlink; a detach moves the list's generation on instead of touching its
+nodes. Under a list's gate the stamp therefore says whether a node is on that
+list, and a taker walks the list only then. A claim that is set while the
+node is in the owner's batch, or not linked yet, costs one comparison rather
+than a walk of everything staged there with ownership locks held.
+
 Home publication precedes the SeqCst parked-token store. The subsequent
 SeqCst awake-bit recheck pairs with the waker's SeqCst flag swap followed by
 token load: both sides cannot miss the transition. Node-claim release and
@@ -827,6 +867,107 @@ pub struct TaskSpec {
   that was admitted or ran within the 500 us migration-cost window is
   cache-hot and is not an idle-steal candidate; explicit affinity and
   CPU-lifecycle moves are exempt.
+- **A woken task is runnable wherever it is held.** Besides its ready queue a
+  CPU holds woken tasks it has not activated yet: cross-CPU enqueues in its
+  wake inbox, and woken sleepers still in its parked set. They count toward
+  the victim's runnable work above, and when the ready queue offers a thief
+  nothing it may pull one of them under the same rules — dispatchable, inside
+  `allowed`, permitted by the steal strategy, not cache-hot, and leaving the
+  victim one runnable or running task (Linux `sched_balance_newidle`). A
+  healthy CPU that is idle with a single staged wake keeps it. "Running" is
+  not the only way to be unreachable: the executor has no current task while
+  it runs deferred destructors, the slab drain, the sleep pumps or the timer
+  wheel, and a CPU stuck there looks idle. So the floor is also lifted for a
+  victim that is **not rescheduling**: awake (not halted) and past no
+  scheduling point for 1 ms, by the pass stamp its executor writes at every
+  scheduling point (see the next item). The same victim gives no warm cache
+  back to a hot task, so the cache-hot window does not apply to its staged
+  wakes either (Linux migrates a hot task once balancing on its behalf keeps
+  failing). Neither test depends on the victim taking interrupts. The floor counts tasks, not
+  inbox nodes: a node can outlive its wake (its task ran under a direct
+  handoff and sleeps again, or is running that way now), so the thief judges
+  the woken sleepers in its window first and applies the floor to the ones
+  that are still runnable, before taking from either holding place. Nodes
+  outside the window are counted at face value. One pull judges at most 32
+  staged entries per holding place. The wake inbox is a queue and is scanned
+  oldest first; the parked-wake list is a stack and is scanned newest first.
+  The window moves: a pull that judges a full window and takes nothing starts
+  the next pull on that victim one window further on and wraps at the end, so
+  entries no thief may take (pinned to the victim, cache-hot, throttled,
+  directly claimed, stale) do not hide the entries behind them. The inbox is
+  indexed and every entry is reachable this way. Reaching a window on the
+  parked-wake list means walking to it under the gate, so its start is
+  limited to 96 nodes down: the newest 128 nodes are reachable by successive
+  pulls, older ones only as newer ones leave. For woken sleepers the thief pins those nodes
+  under the inbox gate, releases it, and only then judges and takes a slot
+  under the victim's parked-set lock, so the gate is never held over an
+  eligibility check or a steal-strategy callback. A pulled task moves as a whole slot, exactly like a ready-queue
+  steal: saved domain state, address-space owner, FP/SIMD image and budget
+  account travel with it and are restored by the thief's ordinary dispatch.
+- **A busy CPU advertises wakes it is not serving.** Each CPU's executor
+  counts the scheduling points it passes — a dispatch round starting, a polled
+  task returning to it, a direct task-to-task handoff — in a counter only that
+  CPU writes, and stamps the time of the latest one beside it. When a CPU's timer tick
+  finds wakes staged there and its executor has passed no scheduling point
+  since the previous such tick, it sends one reschedule kick to a halted CPU
+  (Linux `sched_balance_trigger` → `nohz_balancer_kick` → `kick_ilb`). The
+  kick names no task; the woken CPU's steal pass applies the rules above. It
+  is aimed and rationed, as `find_new_ilb` and `NOHZ_BALANCE_KICK` do for
+  Linux:
+  - the target must be in the union of the hard affinity masks of the staged,
+    runnable tasks (up to 32 per holding place are read, under `try_lock`);
+    if no other CPU is, no kick is sent, so wakes pinned to the stalled CPU
+    and nodes whose task went back to sleep wake nobody;
+  - the target must be online, halted, and `Active` or `Idle` — a logically
+    offlined CPU also publishes itself halted and stays online, but runs no
+    steal pass;
+  - a target whose `NEED_RESCHED` is still set has not consumed the last
+    kick or wake and is skipped;
+  - among those, the nearest higher-numbered CPU is chosen, wrapping;
+  - within one stall, stalled ticks 1, 2, 4, 8, … send while the number of
+    staged entries is unchanged, and a change starts over.
+
+  A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
+  buys two steal passes. With tickless idle a halted CPU takes no periodic
+  tick, so a kick is what starts its steal pass. A CPU with interrupts masked
+  takes no tick and sends no kick, so the tick-side kick is only a second
+  line: wakers and enqueuers act first (next item), and nothing relies on the
+  stalled CPU's own tick or on any periodic backstop.
+- **A wake or enqueue never waits behind a CPU that is not rescheduling**
+  (Linux `try_to_wake_up` → `select_task_rq` → `select_idle_sibling`, and
+  `nohz_balancer_kick` → `kick_ilb`). The waker classifies the wakee's
+  previous CPU (`home`):
+  - halted: the task stays and `home` gets one reschedule IPI; under tickless
+    idle that IPI, not a tick, starts it;
+  - awake, running no task and rescheduling: the task stays and `home` runs it
+    at its next round (no IPI); only a backlog of two or more fresh wakes
+    since that round asks for an idle sibling;
+  - running another task (Linux: `prev` busy): the task moves to an idle
+    sibling if there is one;
+  - not rescheduling (awake, no scheduling point for 1 ms, perhaps with
+    interrupts masked): the task moves to an idle sibling; if the wake-time
+    move cannot take it (contended queue, or a slot it does not move:
+    non-default class or priority, a budget, a donation), the waker IPIs that
+    idle CPU and its steal pass pulls the wake under the rules above.
+
+  A wake whose `home` is the waker's own CPU, and a self-wake, keep `home`.
+  An idle sibling is a halted, online, `Active`/`Idle` CPU inside the task's
+  hard affinity: the policy's `select_task_rq` chooses it, and when the
+  policy names none for a busy or stalled `home` the core uses
+  `select_idle_sibling` (waker's CPU if idle and node-local, then the nearest
+  idle CPU in `home`'s last-level cache, then in its NUMA node, then any).
+  A cross-CPU enqueue onto a CPU that is not rescheduling stages the slot in
+  that CPU's wake inbox as before and IPIs one halted, schedulable, allowed CPU
+  to pull it instead of IPI-ing the stalled target. Each wake or enqueue sends
+  at most one reschedule IPI.
+- **Steal policies see staged wakes.** The hints the core hands a
+  `StealStrategy` (`StealContext`) count them: a CPU with wakes staged is not
+  reported idle whatever its executor state, is reported as possibly having a
+  runnable peer, and its queued load is its ready queue plus its staged
+  entries. `LlcAwareSteal` and `Pick2Steal` skip idle, peer-less and
+  empty-queued donors, and a CPU stuck in executor maintenance reports `Idle`
+  with an empty ready queue, so without this they would not visit it. The
+  hints stay advisory; the pull applies every rule above.
 - Process-fork placement may take a non-blocking snapshot of every allowed,
   online run queue. Its load includes dispatchable queued slots, staged wake
   inbox entries, and the currently executing task. A contended queue is
@@ -962,12 +1103,53 @@ pub fn cpu_demand(cpu: CpuId) -> CpuDemand;
 pub fn interrupt_account_enter(kind: InterruptKind) -> InterruptAccountGuard;
 pub fn preempt_disable() -> PreemptGuard;
 pub fn preempt_count() -> u32;
+
+// scheduler::stackful — a continuation gave up its CPU holding CPU-local
+// state (§4). Detection is always on; these only shape the report.
+pub struct ParkViolation {
+    pub task: u64,
+    pub cpu: u32,
+    pub rcu_readers: usize,
+    pub preempt_depth: u32,
+    pub site: &'static core::panic::Location<'static>,
+}
+pub type ParkSyscallHook = fn(task: u64, syscall: &mut [u64; 9]) -> bool;
+pub fn set_park_syscall_hook(hook: ParkSyscallHook);
+pub fn set_park_violation_hook(hook: fn(&ParkViolation));
+pub fn park_violation_count() -> u64;
 ```
 
 `CpuDemand` reads only one CPU-local queue and copied/atomic counters. It
 reports runnable work-kind counts, RT reservation, next deadline, state, and
 cumulative hard-IRQ/NMI cycles. It is a governor input, never a frequency
 control callback.
+
+### 3.6 Workqueues (`narf_scheduler::workqueue`, Linux `kernel/workqueue.c`)
+
+| Linux | NARF |
+| --- | --- |
+| `struct work_struct`, `INIT_WORK`, `work_func_t` | `WorkStruct::new(WorkFn::Sync(fn) \| WorkFn::Async(fn -> future))`; the function gets a `WorkRef` (pointer) and may free its work |
+| `struct delayed_work`, `INIT_(DEFERRABLE_)DELAYED_WORK` | `DelayedWork::new(fn, deferrable)`: a work and a timer-wheel `timer_list` |
+| `alloc_workqueue(name, flags, max_active)`, `alloc_ordered_workqueue` | same; `WQ_UNBOUND`, `WQ_HIGHPRI`, `WQ_MEM_RECLAIM`, `WQ_FREEZABLE` (accepted), `WQ_POWER_EFFICIENT` (unbound) |
+| `system_wq`, `system_highpri_wq`, `system_long_wq`, `system_unbound_wq`, `system_power_efficient_wq` | same, created at `workqueue_init` (scheduler `init`) |
+| `queue_work(_on)`, `schedule_work`, `queue_delayed_work(_on)`, `schedule_delayed_work`, `mod_delayed_work(_on)` | same; never allocate or block (callable from timer callbacks and interrupt handlers) |
+| `cancel_work_sync`, `cancel_delayed_work(_sync)`, `flush_work` | same, async; `*_blocking` forms drive nested executor rounds |
+| per-CPU normal / highpri `worker_pool`s, unbound pool | same; per-CPU workers are pinned tasks, unbound ones run anywhere |
+| concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy) |
+| `max_active`, inactive list | per workqueue, queue order kept |
+| rescuer, `send_mayday` | a pool at `MAX_WORKERS_PER_POOL` sends its `WQ_MEM_RECLAIM` work to the workqueue's rescuer task |
+| `may_start_working` / `manage_workers` | a worker about to run a work makes sure the pool keeps an idle worker in reserve |
+| `WORKER_IDLE`, `idle_list`, `idle_worker_timeout`, `too_many_workers`, `IDLE_WORKER_TIMEOUT` (300 s) | idle workers park on the pool's idle list; the pool's idle timer reaps those beyond the reserve (more than 2 idle, idle ≥ busy / 4) after 300 s |
+| `HIGHPRI_NICE_LEVEL` (`MIN_NICE`) | high-priority pool workers run at `Priority(-20)` |
+
+An idle worker marks itself to the executor (`set_idle_worker`) before it
+parks; the executor counts it as no work, so `run_until_empty` treats a CPU
+whose only parked tasks are idle workers as empty (`ParkedTasks::busy_len`).
+
+Departures, each because of the executor: a synchronous work that spins
+holds its CPU as a non-preemptible kthread would; the rescuer is started on
+mayday (task creation does not fail). `__reset_queues_for_test` forgets every
+pool with the workers it drops.
 
 ### Live Linux user-thread policies
 
@@ -1031,6 +1213,18 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
 
 ## 4. Invariants & safety properties
 
+- **Every stackful task stack is guarded** (`memory/` §4, kernel stacks): an
+  overflow faults on unmapped VA and is reported by `frame/` (§4), never
+  written into a neighbouring object. The per-CPU stack cache holds
+  `KernelStack` handles, so a recycled stack keeps its mapping and guards; it
+  is zeroed before it enters the cache and is recycled only on the
+  RCU-confirmed-dead path. An overflowed task is never resumed: outside
+  kernel-test builds the report panics.
+- **The raw-waker path reserves no `TaskSlot`-sized frame.** Helpers that move
+  a `TaskSlot` (`try_activate_parked_local`, `try_sync_wake_affine`,
+  `try_migrate_wakee_to`) stay out of line, so a wake that does not move a
+  slot — the common case, and the one taken from interrupts on a deep task
+  stack — pays only its own small frames.
 - A task initially polls in its spawn domain and resumes in its saved domain;
   scope entry/exit updates the same task-owned logical authority state.
 - A user task polls with its own address-space root active. On both
@@ -1066,6 +1260,19 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   continuation resumes masked until its architecture epilogue restores the
   interrupted state.
 - Work-stealing preserves per-task FIFO ordering of wakes.
+- A woken task has exactly one owner at every instant, and a non-owner takes
+  it only under the lock that owner uses: the ready-queue lock, the wake-inbox
+  lock, or the parked-set lock. The owner's drain, a direct-handoff claim,
+  wake-time placement and an idle pull all decide a parked task under the
+  parked-set lock, so exactly one of them gets the slot. A pull never takes a
+  running continuation or one under a direct-handoff claim, and takes every
+  victim-side lock except the leaf inbox gate without blocking.
+- A woken or enqueued task never depends on a CPU that is not rescheduling to
+  reach it: the waker or enqueuer moves it to an idle CPU or IPIs an idle CPU
+  to pull it (§3.3), and every move is a whole-slot `enqueue_on(...,
+  Migrated)` under the owner's locks above. No periodic timer is part of the
+  guarantee; the only residual wait is a CPU whose own task wakes a peer that
+  last ran on that same CPU and then keeps the CPU with interrupts masked.
 - `has_other_runnable_work` may return a false positive under queue contention
   but never blocks to refine the answer. A false result means the caller can
   elide a voluntary self-yield without withholding the CPU from known work.
@@ -1146,6 +1353,30 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   hook relies on poll-boundary release; holding a non-sleepable guard
   across await is a UAF waiting to happen. Enforced by `!Send` + type
   discipline in `rcu/`; the scheduler treats the invariant as given.
+- **A stackful continuation gives up its CPU holding no CPU-local state.**
+  The type discipline above covers `async fn` state machines only: a
+  stackful continuation is switched as a stack, so a `ReadGuard` or a
+  `PreemptGuard` live in one of its frames crosses the switch unseen. Both are
+  counted on the CPU that took them and released on the CPU that drops them.
+  A sleeping task may be resumed by any allowed CPU (wake-time placement, a
+  ready-queue steal, an idle pull of a staged wake), so the scheduler checks
+  at the switch itself:
+  - Every voluntary switch-out (`yield_current_stackful`, `cooperative_yield`,
+    `sched_yield_current`, the syscall-exit reschedule) reads this CPU's QSBR
+    reader nesting (`rcu::reader_nesting()`) and preempt-disable depth: two
+    loads of the CPU's own counters. Either being non-zero is a
+    `ParkViolation`. It is counted, and reported once per requesting source
+    location with the task, CPU, both counts and — through
+    `set_park_syscall_hook`, which `userspace/` installs — the system call the
+    task is in. `set_park_violation_hook` replaces the built-in line. Under
+    the `kernel-test` feature it is a panic unless the test armed
+    `__test_expect_park_violation`. A switch-out made inside a nested executor
+    round is not judged: the enclosing frame's state is counted on the same
+    CPU and stays there with it.
+  - Involuntary preemption of a kernel continuation is refused while the
+    reader nesting is non-zero (it is already refused while preemption is
+    disabled). The request stays pending and the next tick acts on it, as
+    with Linux's non-preemptible `rcu_read_lock()`.
 
 ## 5. Architecture notes
 

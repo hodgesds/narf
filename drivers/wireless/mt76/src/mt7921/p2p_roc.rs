@@ -120,7 +120,10 @@ impl<B: Backend> Session<B> {
         let domain = self.backend.regulatory_domain()?;
         let _ = Listen::prepare(info, &domain, frequency_mhz)?;
         let _ = p2p_wire::Request::new(0, 1, frequency_mhz, duration_ms, Kind::Remain)?;
-        if self.p2p_rf_busy() {
+        // The scheduled scan's firmware cycles own the radio's off-channel
+        // time: as the scheduled-scan start refuses a pending ROC, a ROC
+        // (listen or off-channel action) waits for the scan's stop.
+        if self.p2p_rf_busy() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         if !quiesced {

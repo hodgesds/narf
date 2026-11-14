@@ -251,6 +251,8 @@ struct DeviceInfo {
     freqs: Vec<u32>,
     ciphers: Vec<u32>,
     raw_band_types: Vec<u16>,
+    /// NL80211_ATTR_EXT_FEATURES, one bit per `enum nl80211_ext_feature_index`.
+    ext_features: Vec<u8>,
 }
 fn wiphy_info(message: &[u8], info: &mut DeviceInfo) {
     let top = attrs(&message[20..]);
@@ -290,6 +292,9 @@ fn wiphy_info(message: &[u8], info: &mut DeviceInfo) {
                 }
             }
         }
+    }
+    if let Some(features) = find(&top, 217) {
+        info.ext_features = features.to_vec();
     }
     if let Some(suites) = find(&top, 57) {
         info.ciphers
@@ -401,6 +406,11 @@ fn networkmanager_creates_a_wifi_device(absent_family_lookup: bool) -> Result<()
     }
     // WLAN_CIPHER_SUITE_CCMP is what gives the device _NM_WIFI_DEVICE_CAP_RSN;
     // a 2.4 or 5 GHz frequency sets the FREQ_VALID capability either way.
+    // BIP-CMAC-128 (00-0F-AC:6) gives wpa_supplicant ENC_BIP: with the
+    // default `pmf` it then negotiates optional PMF, which the owner runs.
+    if !info.ciphers.contains(&0x000f_ac06) {
+        return Err("wiphy does not advertise BIP-CMAC-128");
+    }
     if !info.ciphers.contains(&0x000f_ac04) {
         return Err("driver does not report CCMP");
     }
@@ -415,6 +425,20 @@ fn networkmanager_creates_a_wifi_device(absent_family_lookup: bool) -> Result<()
     // ("Band 32769:" when NLA_F_NESTED leaks into it).
     if info.raw_band_types != [0, 1, 3] {
         return Err("band attribute types are not enum nl80211_band values");
+    }
+    // What wpa_supplicant keys the offloaded connection on: with
+    // 4WAY_HANDSHAKE_STA_PSK (15) it hands over the PMK, with SAE_OFFLOAD
+    // (38) it keeps SAE in its AKM selection and hands over the password.
+    let ext_feature = |bit: usize| {
+        info.ext_features
+            .get(bit / 8)
+            .is_some_and(|byte| byte & (1 << (bit % 8)) != 0)
+    };
+    if !ext_feature(15) {
+        return Err("wiphy does not advertise 4WAY_HANDSHAKE_STA_PSK");
+    }
+    if !ext_feature(38) {
+        return Err("wiphy does not advertise SAE_OFFLOAD: wpa_supplicant drops SAE");
     }
 
     if absent_family_lookup {
@@ -584,4 +608,149 @@ fn mt7922_us_domain_permits_non_radar_5ghz() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_us_domain_permits_non_radar_5ghz
+);
+
+/// The elements wpa_supplicant 2.12 hands an SAE-offload CONNECT for a
+/// NetworkManager `key-mgmt=sae` profile (`ieee80211w=2`): the RSN element
+/// with AKM SAE, MFPC | MFPR and sixteen PTKSA replay counters (0x00cc), a
+/// zero PMKID count and BIP-CMAC-128, then Supported Operating Classes,
+/// Extended Capabilities and the RSNXE with the hash-to-element bit. The
+/// native SAE owner sends its own RSNE and RSNXE; it must admit this request
+/// for the 5200 MHz BSS, and must not take it for a WPA2-PSK one.
+fn mt7922_admits_wpa_supplicant_sae_association_elements() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-wpas"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    if !iface.supports_sae_offload() {
+        return TestResult::Fail("MT7921 station does not offer its SAE owner to nl80211");
+    }
+    let mut ie = alloc::vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8,
+        0xcc, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+    ];
+    ie.extend_from_slice(&[59, 4, 115, 115, 116, 117]);
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    ie.extend_from_slice(&[244, 1, 0x20]);
+    let request = |security| AssociateRequest {
+        bssid: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40],
+        ssid: b"narf-transition".to_vec(),
+        frequency_mhz: 5200,
+        channel: 40,
+        security,
+        ie: ie.clone(),
+    };
+    let sae = request(narf_wireless::SecurityConfig::Wpa3 {
+        password: b"correct horse battery".to_vec(),
+    });
+    if iface.validate_join(&sae) != Ok(false) {
+        return TestResult::Fail("wpa_supplicant's SAE association elements refused");
+    }
+    let psk = request(narf_wireless::SecurityConfig::Wpa2 { psk: [0x5a; 32] });
+    if iface.validate_join(&psk) != Err(WirelessError::NotSupported) {
+        return TestResult::Fail("SAE association elements admitted for a WPA2-PSK join");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_admits_wpa_supplicant_sae_association_elements
+);
+
+/// NetworkManager WPA-PSK with `pmf` optional or required: the MT7922
+/// wiphy offers the PMF handshake offload (and MFP_OPTIONAL) and PSK-SHA256,
+/// and admits the RSNE wpa_supplicant then sends for both AKMs.
+fn mt7922_admits_wpa_supplicant_wpa2_pmf_association_elements() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-wpas"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    if !iface.supports_wpa2_mfp_offload()
+        || !iface.supports_optional_mfp()
+        || !iface.supports_psk_sha256_offload()
+    {
+        return TestResult::Fail("MT7921 station does not offer its WPA2 PMF owner");
+    }
+    for (akm, caps) in [(2u8, 0x8cu8), (2, 0xcc), (6, 0x8c), (6, 0xcc)] {
+        let mut ie = alloc::vec![
+            48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac,
+            akm, caps, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+        ];
+        ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+        let request = AssociateRequest {
+            bssid: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40],
+            ssid: b"narf-pmf".to_vec(),
+            frequency_mhz: 5200,
+            channel: 40,
+            security: narf_wireless::SecurityConfig::Wpa2 { psk: [0x5a; 32] },
+            ie,
+        };
+        if iface.validate_join(&request) != Ok(false) {
+            return TestResult::Fail("wpa_supplicant's WPA2 PMF association elements refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_admits_wpa_supplicant_wpa2_pmf_association_elements
+);
+
+/// wpa_supplicant's bgscan / NetworkManager's roaming threshold on an
+/// MT7922: the wiphy takes NL80211_CMD_SET_CQM (one threshold and a list),
+/// and the AP's Beacon signal from the receive path drives mac80211's
+/// software monitor to one LOW crossing, after four Beacons, at the
+/// averaged level. A new association restarts the average.
+fn mt7922_cqm_rssi_from_the_aps_beacons() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-cqm"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    let config = narf_wireless::CqmRssiConfig {
+        thresholds_dbm: alloc::vec![-70],
+        hysteresis_db: 4,
+    };
+    if !iface.supports_cqm_rssi()
+        || !iface.supports_cqm_rssi_list()
+        || iface.set_cqm_rssi(Some(config)).is_err()
+    {
+        return TestResult::Fail("MT7922 does not take NL80211_CMD_SET_CQM");
+    }
+    let mut link = crate::mt7921::link_stats::LinkStats::default();
+    let mut events = Vec::new();
+    // Beacons at -80 dBm (RCPI 60), one per packet step.
+    for _ in 0..6 {
+        link.observe(Some(60), None, false, true);
+        events.extend(iface.cqm.lock().beacons(&link));
+    }
+    if events != [(false, -80)] {
+        return TestResult::Fail("not one LOW crossing at the averaged Beacon signal");
+    }
+    // Data frames are not Beacons; a step without new Beacons feeds nothing.
+    link.observe(Some(200), None, true, false);
+    if !iface.cqm.lock().beacons(&link).is_empty() {
+        return TestResult::Fail("a data frame fed the Beacon monitor");
+    }
+    // Several Beacons in one step are all counted.
+    iface.cqm.lock().restart();
+    let mut burst = crate::mt7921::link_stats::LinkStats::default();
+    for _ in 0..4 {
+        burst.observe(Some(60), None, false, true);
+    }
+    if iface.cqm.lock().beacons(&burst) != [(false, -80)] {
+        return TestResult::Fail("Beacons within one step not all counted");
+    }
+    if iface.set_cqm_rssi(None).is_err() {
+        return TestResult::Fail("disabling CQM");
+    }
+    iface.cqm.lock().restart();
+    let mut quiet = crate::mt7921::link_stats::LinkStats::default();
+    for _ in 0..6 {
+        quiet.observe(Some(60), None, false, true);
+    }
+    if !iface.cqm.lock().beacons(&quiet).is_empty() {
+        return TestResult::Fail("CQM event after it was disabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_cqm_rssi_from_the_aps_beacons
 );

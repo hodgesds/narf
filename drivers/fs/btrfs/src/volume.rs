@@ -12,15 +12,14 @@
 //! address), drop the guard, then do I/O. Holding a spinlock across
 //! `poll_blocking` would wedge the volume under an IRQ-driven backend.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use narf_block::{BlockDevice, BlockError, BlockOp, BlockRequest, QosHint};
-use narf_capabilities::{Cap, Read, Write};
+use narf_block::{BlockDevice, BlockError};
 use narf_filesystem::FsError;
-use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -57,62 +56,127 @@ pub struct BalanceStats {
     pub converted: u64,
 }
 
-/// Volume-owned scratch DMA buffer, serialised across all block submissions.
-#[derive(Debug)]
-struct VolumeIo {
-    cap: Cap<DmaBuffer, Write>,
-    block_size: usize,
-    /// Bytes in the scratch buffer: a whole number of blocks, at least one
-    /// superblock and one maximum-size tree node.
-    len: usize,
-}
-
-/// Scratch transfer size per member. A superblock copy (4 KiB) and every tree
-/// node (at most 64 KiB) then go to the device as ONE request: on a 512-byte
-/// LBA namespace a block-at-a-time writer turned the FUA primary superblock
-/// into eight separate FUA writes, any prefix of which a power cut could leave
-/// on disk as a torn, checksum-failing primary.
-const SCRATCH_BYTES: usize = 64 * 1024;
-
-/// The scratch length for a device of `block_size`-byte blocks.
-fn scratch_len(block_size: usize) -> usize {
-    (SCRATCH_BYTES / block_size).max(1) * block_size
-}
-
-/// Allocate one member's scratch I/O state.
-fn new_volume_io(block_size: usize, domain: DomainId) -> Result<VolumeIo, FsError> {
-    let len = scratch_len(block_size);
-    let dma = alloc_coherent(len, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
-    Ok(VolumeIo {
-        cap: register_with_cap(dma),
-        block_size,
-        len,
-    })
-}
-
-/// One member device, with geometry and scratch I/O state local to that
-/// device. Different members may expose different logical block sizes.
+/// One member device with its geometry. Different members may expose
+/// different logical block sizes. Every read and write goes to the device as
+/// its own scatter-gather request over the caller's pages ([`crate::bio`]):
+/// nothing here is held across a device round trip.
 #[derive(Debug)]
 struct VolumeDevice<B: BlockDevice> {
     device: Arc<B>,
     capacity: u64,
+    /// The device's logical block size in bytes.
+    block_size: usize,
+    /// DMA domain the volume's page lists are registered in.
+    domain: DomainId,
     /// Member-specific embedded dev_item, preserved while common superblock
     /// transaction fields are replicated to every device.
     dev_item: IrqSafeSpinLock<[u8; format::SUPERBLOCK_DEV_ITEM_SIZE]>,
-    io: Mutex<VolumeIo>,
+    /// Serialises the read-modify-write of a range that starts or ends
+    /// inside a device block — never a node, a data sector or a superblock,
+    /// which are block aligned on every supported LBA size.
+    rmw: Mutex<()>,
 }
 
-impl VolumeIo {
-    fn buffer(&self) -> Option<Arc<DmaBuffer>> {
-        resolve_cap(&self.cap)
+impl<B: BlockDevice> VolumeDevice<B> {
+    fn new(
+        device: Arc<B>,
+        capacity: u64,
+        dev_item: [u8; format::SUPERBLOCK_DEV_ITEM_SIZE],
+        domain: DomainId,
+    ) -> Arc<Self> {
+        let block_size = device.logical_block_size() as usize;
+        Arc::new(Self {
+            device,
+            capacity,
+            block_size,
+            domain,
+            dev_item: IrqSafeSpinLock::new(dev_item),
+            rmw: Mutex::new(()),
+        })
+    }
+
+    /// Read `dst.len()` bytes at device byte offset `offset`.
+    async fn read(&self, offset: u64, dst: &mut [u8], killable: bool) -> Result<(), FsError> {
+        crate::bio::read_exact_from(
+            &*self.device,
+            self.block_size,
+            self.domain,
+            self.capacity,
+            offset,
+            dst,
+            killable,
+        )
+        .await
+    }
+
+    /// Write `src` at device byte offset `offset`.
+    async fn write(&self, offset: u64, src: &[u8], fua: bool) -> Result<(), FsError> {
+        crate::bio::write_exact_to(
+            &*self.device,
+            self.block_size,
+            self.domain,
+            &self.rmw,
+            self.capacity,
+            offset,
+            src,
+            fua,
+        )
+        .await
     }
 }
 
-impl Drop for VolumeIo {
+/// A published commit's write-out: its new nodes and the superblock image
+/// that names them ([`BtrfsVolume::finish_write_out`]).
+#[derive(Debug)]
+pub(crate) struct WriteOut {
+    /// The commit's generation.
+    pub(crate) gen: u64,
+    /// Every node the commit allocated, stamped; dirty in the node cache
+    /// until written.
+    pub(crate) nodes: Vec<(u64, Vec<u8>)>,
+    /// The superblock image, staged once the nodes are out.
+    pub(crate) raw_super: Vec<u8>,
+    /// [`BtrfsVolume::write_node_root_admin`]'s gate.
+    pub(crate) root_admin: bool,
+    /// Subvolume roots, `(tree, (root, level))`, as the last durable commit
+    /// left them: put back if the write-out fails, so what readers see is
+    /// what the device holds.
+    pub(crate) rollback: Vec<(u64, (u64, u8))>,
+}
+
+/// Test-only: while set, a write-out waits before writing anything, as one
+/// held up by a saturated device would; [`WRITE_OUT_HELD`] once one has.
+#[cfg(feature = "kernel-test")]
+pub(crate) static WRITE_OUT_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+pub(crate) static WRITE_OUT_HELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// A data extent withheld from allocation while its write is in flight
+/// ([`BtrfsVolume::hold_inflight_data`]); released on drop.
+pub(crate) struct InflightData<'a> {
+    list: &'a IrqSafeSpinLock<Vec<(u64, u64)>>,
+    range: (u64, u64),
+}
+
+impl Drop for InflightData<'_> {
     fn drop(&mut self) {
-        unregister(self.cap);
+        let mut list = self.list.lock();
+        if let Some(at) = list.iter().position(|r| *r == self.range) {
+            list.swap_remove(at);
+        }
     }
 }
+
+/// Test-only: while set, a data write waits before its device write
+/// ([`DATA_WRITE_HELD`] once one has), as one held up by a slow device.
+#[cfg(feature = "kernel-test")]
+pub(crate) static DATA_WRITE_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+pub(crate) static DATA_WRITE_HELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Cached metadata nodes, keyed by logical address.
 ///
@@ -123,20 +187,66 @@ impl Drop for VolumeIo {
 /// samples `epoch` before its read and only inserts if no invalidation has
 /// happened since, so a racing write costs a skipped fill rather than a wrong
 /// answer.
-#[derive(Debug, Default)]
+///
+/// The cache is bounded in bytes, in two generations. Every fill and every
+/// hit lands in `young`; when `young` would grow past half the budget, `old`
+/// is dropped and `young` takes its place. A node used since the last
+/// turn-over therefore survives the next one, and only nodes nothing has
+/// touched for a whole generation go. (It used to be one map emptied when it
+/// reached the bound, so a walk over more nodes than the bound — every extent
+/// item of a large fragmented file, say — left nothing behind for the next
+/// one, which read it all from the device again, upper levels included.)
+///
+/// The budget is [`crate::cache_budget::NODE_CACHE`] of RAM; it used to be a
+/// fixed 4,096 nodes, 64 MiB at 16 KiB whatever the machine.
+///
+/// `dirty` holds a frozen commit's nodes from the moment the commit fixes
+/// them until its write-out has put them on the device (Linux keeps a
+/// transaction's dirty extent buffers in memory until
+/// `btrfs_write_and_wait_transaction` has written them). Readers of the
+/// trees that commit published find them there; nothing may evict,
+/// invalidate or replace them meanwhile, because the device does not hold
+/// them yet: they sit outside the two generations and the budget, an
+/// invalidation of their range leaves them alone, and a device fill of
+/// their address is not published.
+#[derive(Debug)]
 struct NodeCache {
-    entries: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    young: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    old: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    dirty: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    /// Bytes charged for `young` and `old` ([`node_charge`]).
+    young_bytes: usize,
+    old_bytes: usize,
+    /// Most bytes both generations may hold together.
+    budget: usize,
     epoch: u64,
 }
 
-/// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
-/// kernel-test and 64 MiB in production, comfortably holding the working set a
-/// commit revisits while staying a fixed, predictable cost.
-const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
-    256
-} else {
-    4096
-};
+/// One generation of the [`NodeCache`], as retired by a turn-over: dropped
+/// by the caller once the cache lock is released, since it frees up to half
+/// the cache's nodes.
+type RetiredNodes = BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>;
+
+/// Bookkeeping a cached node costs on top of its bytes: the `Arc` header and
+/// `Vec` triple, and its share of the map's B-tree node.
+const NODE_ENTRY_OVERHEAD: usize = 64;
+
+/// What caching `node` costs the heap.
+fn node_charge(node: &Arc<alloc::vec::Vec<u8>>) -> usize {
+    node.capacity() + NODE_ENTRY_OVERHEAD
+}
+
+/// The node cache budget of a filesystem mounted now. Kernel tests keep the
+/// 4 MiB they always had, so a test still turns the cache over and the
+/// many fixtures a run mounts stay small.
+fn node_cache_budget() -> usize {
+    let budget = crate::cache_budget::NODE_CACHE.of(crate::cache_budget::total_ram_bytes());
+    if cfg!(feature = "kernel-test") {
+        budget.min(4 * crate::cache_budget::MIB)
+    } else {
+        budget
+    }
+}
 
 /// Commits allowed to stage before the superblock is forced out.
 ///
@@ -160,12 +270,364 @@ const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
 const MAX_STAGED_COMMITS: usize = 1;
 
 impl NodeCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            young: BTreeMap::new(),
+            old: BTreeMap::new(),
+            dirty: BTreeMap::new(),
+            young_bytes: 0,
+            old_bytes: 0,
+            budget,
+            epoch: 0,
+        }
+    }
+
+    /// Bytes both generations hold.
+    fn bytes(&self) -> usize {
+        self.young_bytes + self.old_bytes
+    }
+
     /// Drop `logical` and advance the epoch, so any fill already in flight for
     /// it (or for anything else) declines to publish.
     fn invalidate(&mut self, logical: u64) {
-        self.entries.remove(&logical);
+        self.remove(logical);
         self.epoch = self.epoch.wrapping_add(1);
     }
+
+    /// The cached node at `logical`, which becomes young again.
+    fn get(&mut self, logical: u64) -> Option<(Arc<alloc::vec::Vec<u8>>, Option<RetiredNodes>)> {
+        if let Some(hit) = self.dirty.get(&logical) {
+            return Some((hit.clone(), None));
+        }
+        if let Some(hit) = self.young.get(&logical) {
+            return Some((hit.clone(), None));
+        }
+        let hit = self.old.remove(&logical)?;
+        self.old_bytes -= node_charge(&hit);
+        let retired = self.insert(logical, hit.clone());
+        Some((hit, retired))
+    }
+
+    /// Cache `node` at `logical`. Returns the generation this retired, if
+    /// it turned the cache over. A dirty node at `logical` is not replaced:
+    /// it is newer than anything the device can have returned.
+    fn insert(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) -> Option<RetiredNodes> {
+        if self.dirty.contains_key(&logical) {
+            return None;
+        }
+        if let Some(stale) = self.old.remove(&logical) {
+            self.old_bytes -= node_charge(&stale);
+        }
+        let charge = node_charge(&node);
+        if let Some(slot) = self.young.get_mut(&logical) {
+            let replaced = core::mem::replace(slot, node);
+            self.young_bytes = self.young_bytes - node_charge(&replaced) + charge;
+            return None;
+        }
+        // Turn over before the young generation outgrows half the budget, so
+        // the two together never exceed it (a node bigger than half the
+        // budget, which no floor allows, would still be kept alone).
+        let retired =
+            (!self.young.is_empty() && self.young_bytes + charge > self.budget / 2).then(|| {
+                self.old_bytes = core::mem::take(&mut self.young_bytes);
+                core::mem::replace(&mut self.old, core::mem::take(&mut self.young))
+            });
+        self.young.insert(logical, node);
+        self.young_bytes += charge;
+        retired
+    }
+
+    /// Hold `node` at `logical` as dirty until [`Self::clean`]: a frozen
+    /// commit's node, not on the device yet. Any clean copy of the address
+    /// goes, and the epoch moves so no fill in flight publishes over it.
+    fn mark_dirty(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) {
+        self.remove(logical);
+        self.dirty.insert(logical, node);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// The dirty node at `logical` is done with. Written, it becomes an
+    /// ordinary young entry; discarded (its commit failed before it
+    /// published, so no tree references the address), it is dropped and the
+    /// next reader goes to the device. The epoch moves either way, so a fill
+    /// that read the address before the write finished does not publish what
+    /// it read.
+    fn clean(&mut self, logical: u64, written: bool) -> Option<RetiredNodes> {
+        let node = self.dirty.remove(&logical)?;
+        self.epoch = self.epoch.wrapping_add(1);
+        written.then(|| self.insert(logical, node)).flatten()
+    }
+
+    /// Whether `logical` is held dirty.
+    fn is_dirty(&self, logical: u64) -> bool {
+        self.dirty.contains_key(&logical)
+    }
+
+    /// Drop the node cached at `logical`, if any. A dirty node stays: until
+    /// its write-out ends, the cache is the only place it exists.
+    fn remove(&mut self, logical: u64) {
+        if let Some(node) = self.young.remove(&logical) {
+            self.young_bytes -= node_charge(&node);
+        }
+        if let Some(node) = self.old.remove(&logical) {
+            self.old_bytes -= node_charge(&node);
+        }
+    }
+
+    /// Give back at most `max_bytes` (the shrinker's share): the old
+    /// generation first, whose nodes nothing has used since the last
+    /// turn-over, then the young one. Returns the bytes released.
+    ///
+    /// Allocation-free. Dropping an entry does not move the epoch: what is
+    /// left is still current, and a fill in flight may still publish.
+    fn shrink(&mut self, max_bytes: usize) -> usize {
+        let mut freed = 0;
+        for young in [false, true] {
+            loop {
+                let map = if young {
+                    &mut self.young
+                } else {
+                    &mut self.old
+                };
+                let Some(entry) = map.first_entry() else {
+                    break;
+                };
+                let charge = node_charge(entry.get());
+                if freed + charge > max_bytes {
+                    return freed;
+                }
+                drop(entry.remove());
+                if young {
+                    self.young_bytes -= charge;
+                } else {
+                    self.old_bytes -= charge;
+                }
+                freed += charge;
+            }
+        }
+        freed
+    }
+
+    /// Addresses of the cached nodes in `[from, end)`.
+    fn cached_in(&self, from: u64, end: u64) -> alloc::vec::Vec<u64> {
+        self.young
+            .range(from..end)
+            .chain(self.old.range(from..end))
+            .map(|(&addr, _)| addr)
+            .collect()
+    }
+
+    /// Test-only: whether a node read once per insert survives twice the
+    /// budget of other inserts, and whether the cache stays within its
+    /// budget in bytes.
+    #[cfg(feature = "kernel-test")]
+    fn __test_keeps_what_is_used() -> bool {
+        const NODESIZE: usize = 16 * 1024;
+        const NODES: usize = 64;
+        let budget = NODES * (NODESIZE + NODE_ENTRY_OVERHEAD);
+        let mut cache = NodeCache::new(budget);
+        let node = || Arc::new(alloc::vec![0u8; NODESIZE]);
+        let hot = 7u64;
+        let _ = cache.insert(hot, node());
+        for cold in 0..2 * NODES as u64 {
+            let _ = cache.insert(1000 + cold, node());
+            if cache.get(hot).is_none() || cache.bytes() > budget {
+                return false;
+            }
+        }
+        // What nothing used for a generation is gone; what was just put in
+        // is not.
+        let last = 1000 + 2 * NODES as u64 - 1;
+        cache.get(1000).is_none() && cache.get(last).is_some() && {
+            cache.remove(last);
+            cache.invalidate(hot);
+            cache.get(last).is_none() && cache.get(hot).is_none() && cache.epoch == 1
+        }
+    }
+}
+
+/// Every mounted filesystem's node cache, for the shrinker.
+static NODE_CACHES: IrqSafeSpinLock<Vec<Weak<IrqSafeSpinLock<NodeCache>>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+static NODE_SHRINKER_REGISTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Let reclaim shrink `cache` under memory pressure, as Linux's btree inode
+/// hands its extent buffers' pages to page reclaim
+/// (`btree_release_folio`). One shrinker covers every filesystem; caches of
+/// unmounted filesystems are dropped from the list here.
+fn register_node_cache(cache: &Arc<IrqSafeSpinLock<NodeCache>>) {
+    {
+        let mut caches = NODE_CACHES.lock();
+        caches.retain(|cache| cache.strong_count() != 0);
+        caches.push(Arc::downgrade(cache));
+    }
+    if !NODE_SHRINKER_REGISTERED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "btrfs-nodes",
+            count: node_shrinker_count,
+            scan: node_shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: base pages the node caches hold. Allocation-free.
+fn node_shrinker_count() -> usize {
+    let caches = NODE_CACHES.lock();
+    let bytes = caches
+        .iter()
+        .filter_map(Weak::upgrade)
+        .fold(0usize, |sum, cache| {
+            sum.saturating_add(cache.lock().bytes())
+        });
+    bytes / crate::cache_budget::PAGE
+}
+
+/// Shrinker `scan`: release at most `nr` base pages of cached nodes, never
+/// reporting more. Allocation-free.
+fn node_shrinker_scan(nr: usize) -> usize {
+    let max = nr.saturating_mul(crate::cache_budget::PAGE);
+    let mut freed = 0usize;
+    let caches = NODE_CACHES.lock();
+    for cache in caches.iter().filter_map(Weak::upgrade) {
+        if freed >= max {
+            break;
+        }
+        freed += cache.lock().shrink(max - freed);
+    }
+    freed / crate::cache_budget::PAGE
+}
+
+/// Test-only: [`NodeCache::__test_keeps_what_is_used`].
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_keeps_what_is_used() -> bool {
+    NodeCache::__test_keeps_what_is_used()
+}
+
+/// Test-only: a dirty node survives everything that drops clean ones — an
+/// invalidation of its range, eviction by a full cache, a shrink, a
+/// `forget` — and a device fill of its address does not replace it; once
+/// written it is an ordinary clean entry, and a discarded one (its commit
+/// failed before publishing) is gone.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_dirty_entries() -> Result<(), &'static str> {
+    const NODESIZE: usize = 16 * 1024;
+    let budget = 8 * (NODESIZE + NODE_ENTRY_OVERHEAD);
+    let mut cache = NodeCache::new(budget);
+    let frozen = Arc::new(alloc::vec![0xAAu8; NODESIZE]);
+    let at = 4 * NODESIZE as u64;
+    let _ = cache.insert(at, Arc::new(alloc::vec![0x11u8; NODESIZE]));
+    cache.mark_dirty(at, frozen.clone());
+    let holds = |cache: &mut NodeCache| {
+        cache
+            .get(at)
+            .is_some_and(|(node, _)| Arc::ptr_eq(&node, &frozen))
+    };
+    if !holds(&mut cache) {
+        return Err("a dirty node did not replace the clean copy of its address");
+    }
+    // A device fill of the address (stale bytes) is not published.
+    let _ = cache.insert(at, Arc::new(alloc::vec![0x22u8; NODESIZE]));
+    // Invalidation, as a write of an overlapping range does.
+    for addr in cache.cached_in(at, at + NODESIZE as u64) {
+        cache.invalidate(addr);
+    }
+    cache.remove(at);
+    // Eviction: far more clean nodes than the budget holds, then a shrink.
+    for n in 0..64u64 {
+        let _ = cache.insert(
+            (100 + n) * NODESIZE as u64,
+            Arc::new(alloc::vec![0u8; NODESIZE]),
+        );
+    }
+    cache.shrink(usize::MAX);
+    if !holds(&mut cache) {
+        return Err("a dirty node was replaced, invalidated or evicted");
+    }
+    if cache.bytes() != 0 {
+        return Err("a dirty node was charged to the budget");
+    }
+    let _ = cache.clean(at, true);
+    if !holds(&mut cache) || cache.is_dirty(at) {
+        return Err("a written dirty node did not become a clean entry");
+    }
+    cache.shrink(usize::MAX);
+    if cache.get(at).is_some() {
+        return Err("a written node stayed unevictable");
+    }
+    cache.mark_dirty(at, frozen.clone());
+    let _ = cache.clean(at, false);
+    if cache.get(at).is_some() {
+        return Err("a discarded dirty node stayed cached");
+    }
+    Ok(())
+}
+
+/// Test-only: fill a node cache with a 16-node budget far past it and
+/// report whether it stayed within the budget in bytes, then whether a
+/// shrink releases no more than asked, the old generation before the young
+/// one, and everything when asked for everything.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_bytes_and_shrink() -> Result<(), &'static str> {
+    const NODESIZE: usize = 16 * 1024;
+    let charge = NODESIZE + NODE_ENTRY_OVERHEAD;
+    let budget = 16 * charge;
+    let mut cache = NodeCache::new(budget);
+    for logical in 0..1000u64 {
+        let _ = cache.insert(logical * NODESIZE as u64, Arc::new(vec![0u8; NODESIZE]));
+        if cache.bytes() > budget {
+            return Err("node cache outgrew its byte budget");
+        }
+    }
+    let (old, young) = (cache.old_bytes, cache.young_bytes);
+    if old == 0 || young == 0 {
+        return Err("node cache did not keep two generations");
+    }
+    if cache.shrink(charge - 1) != 0 {
+        return Err("shrink released more than it was asked for");
+    }
+    if cache.shrink(charge) != charge || cache.old_bytes != old - charge {
+        return Err("shrink did not release the old generation first");
+    }
+    let rest = cache.bytes();
+    if cache.shrink(usize::MAX) != rest || cache.bytes() != 0 {
+        return Err("a full shrink left nodes behind");
+    }
+    if !cache.young.is_empty() || !cache.old.is_empty() {
+        return Err("byte count and maps disagree after a shrink");
+    }
+    Ok(())
+}
+
+/// Test-only: the reclaim shrinker sees this filesystem's node cache, and
+/// `(bytes cached, budget)` of it.
+#[cfg(feature = "kernel-test")]
+impl<B: BlockDevice> VolCore<B> {
+    pub(crate) fn __test_node_cache_bytes(&self) -> (usize, usize) {
+        let cache = self.nodes.lock();
+        (cache.bytes(), cache.budget)
+    }
+
+    pub(crate) fn __test_node_cache_registered(&self) -> bool {
+        NODE_CACHES
+            .lock()
+            .iter()
+            .any(|cache| core::ptr::eq(cache.as_ptr(), Arc::as_ptr(&self.nodes)))
+    }
+
+    /// Entries in the anchor and generation tables.
+    pub(crate) fn __test_inode_table_sizes(&self) -> (usize, usize) {
+        let tables = self.inode_tables.lock();
+        (tables.anchors.len(), tables.generations.values.len())
+    }
+}
+
+/// Test-only: drive the node-cache shrinker as kswapd would.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_shrinker(nr: usize) -> (usize, usize) {
+    let count = node_shrinker_count();
+    (count, node_shrinker_scan(nr))
 }
 
 /// Mutable volume metadata guarded by one lock (never held across I/O).
@@ -238,7 +700,7 @@ impl<B: BlockDevice> Drop for RootPin<B> {
 /// started before that commit has finished, RCU-style.
 #[derive(Debug, Default)]
 pub(crate) struct ReaderEpochs {
-    /// Advanced by every durable commit ([`VolCore::unpin_all`]).
+    /// Advanced by every durable commit ([`VolCore::unpin_through`]).
     current: u64,
     /// Running readers per the epoch they started in.
     active: BTreeMap<u64, u32>,
@@ -299,6 +761,84 @@ impl<B: BlockDevice> Drop for ReaderGuard<B> {
 /// when the operation's future is dropped mid-way).
 #[derive(Debug)]
 pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
+
+/// A wait on a syscall's behalf that SIGKILL ends ([`narf_filesystem::killable`]).
+/// The error never reaches the caller's program: a task sent SIGKILL does
+/// not return from its system call.
+///
+/// It is [`FsError::Interrupted`] (Linux `-EINTR` from a `*_killable` wait),
+/// distinct from every answer about the filesystem: a lookup or read that
+/// ends this way must not be taken for a miss, corruption or a busy object.
+pub(crate) async fn killable<F: core::future::Future>(future: F) -> Result<F::Output, FsError> {
+    narf_filesystem::killable::killable(future)
+        .await
+        .ok_or(FsError::Interrupted)
+}
+
+/// Mark direct copy `copy` as one a repair should rewrite.
+fn note_bad_copy(bad: &mut u32, copy: usize) {
+    if copy < 32 {
+        *bad |= 1 << copy;
+    }
+}
+
+/// What became of the copies a verified read tried, for the error it reports
+/// when none served.
+///
+/// A copy that was read but failed verification is corruption
+/// (`InvalidData`, which `with_root_retry!` re-reads from a moved root).
+/// Copies that could not be read at all report the device's error, as
+/// `btrfs_read_extent_buffer` returns `-EIO`: a failed device is not a
+/// corrupt tree. A killed caller's abandoned wait ends the read at once with
+/// [`FsError::Interrupted`]; the next copy's wait would be abandoned too, and
+/// the caller must not read it as corruption.
+#[derive(Default)]
+struct CopyFailure {
+    mismatched: bool,
+    read_error: Option<FsError>,
+}
+
+impl CopyFailure {
+    fn read_failed(&mut self, error: FsError) -> Result<(), FsError> {
+        if error == FsError::Interrupted {
+            return Err(error);
+        }
+        // Only a device or allocation failure is reported as such; a copy
+        // with no usable stripe (a missing member) stays what it was.
+        if error.is_walk_failure() {
+            self.read_error = Some(error);
+        }
+        Ok(())
+    }
+
+    fn mismatch(&mut self) {
+        self.mismatched = true;
+    }
+
+    fn into_error(self) -> FsError {
+        match (self.mismatched, self.read_error) {
+            (false, Some(error)) => error,
+            _ => FsError::InvalidData,
+        }
+    }
+}
+
+/// One running operation ([`VolCore::begin_op`], [`VolCore::begin_data_op`],
+/// [`VolCore::begin_admin`]). The transaction guard is declared first, so it
+/// is released before the queue moves on.
+pub(crate) enum OpGuard<'a> {
+    Joined {
+        _joined: crate::txn_gate::Joined<'a>,
+    },
+    Queued {
+        _joined: crate::txn_gate::Joined<'a>,
+        _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+    },
+    Admin {
+        _closed: crate::txn_gate::Closed<'a>,
+        _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+    },
+}
 
 impl Drop for CommitHold<'_> {
     fn drop(&mut self) {
@@ -363,6 +903,23 @@ impl<B: BlockDevice> Drop for BtrfsVolume<B> {
 
 /// Accessors on the shared core.
 impl<B: BlockDevice> VolCore<B> {
+    /// Whether this filesystem's background reaper acts.
+    pub(crate) fn reaper_on(&self) -> bool {
+        self.reaper_on.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: let this filesystem's background reaper act.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn enable_reaper_for_test(&self) {
+        self.reaper_on
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The reaper's sleep until an unlinked inode's last reference goes.
+    pub(crate) fn reap_wanted(&self) -> ReapWanted {
+        ReapWanted(Arc::clone(&self.inode_tables))
+    }
+
     /// The live superblock's generation (the last committed transaction).
     pub(crate) fn committed_generation(&self) -> u64 {
         self.state.lock().superblock.generation
@@ -375,7 +932,8 @@ impl<B: BlockDevice> VolCore<B> {
     /// gives a pre-existing, never-mutated file an instance-unique
     /// value before any page can be retained under it.
     pub(crate) fn cache_generation(&self, tree: u64, ino: u64) -> u64 {
-        let mut generations = self.cache_generations.lock();
+        let mut tables = self.inode_tables.lock();
+        let generations = &mut tables.generations;
         match generations.values.get(&(tree, ino)) {
             Some(&generation) => generation,
             None => {
@@ -398,10 +956,26 @@ impl<B: BlockDevice> VolCore<B> {
     /// `mapping->invalidate_lock`/`filemap_invalidate_lock` fill exclusion).
     /// An allocating operation may retry after ENOSPC; each attempt gets
     /// its own epochs, including attempts that end in partial errors.
+    ///
+    /// With no live anchor for the inode (it is not open: an unlink of a
+    /// closed file, a create before its node exists) the entry is removed
+    /// instead: the next [`Self::cache_generation`] then issues a fresh
+    /// tick, newer than every value issued before, which is all a bump
+    /// promises — and nothing is left behind for an inode nobody holds.
+    /// Checked under the same lock that publishes anchors, so an anchor
+    /// cannot appear between the check and the update.
     pub(crate) fn bump_cache_generation(&self, tree: u64, ino: u64) {
-        let mut generations = self.cache_generations.lock();
-        let generation = generations.fresh_tick();
-        generations.values.insert((tree, ino), generation);
+        let mut tables = self.inode_tables.lock();
+        let open = tables
+            .anchors
+            .get(&(tree, ino))
+            .is_some_and(|anchor| anchor.strong_count() != 0);
+        if open {
+            let generation = tables.generations.fresh_tick();
+            tables.generations.values.insert((tree, ino), generation);
+        } else {
+            tables.generations.values.remove(&(tree, ino));
+        }
     }
 
     /// Forget every generation issued for fs tree `tree` (subvolume
@@ -412,37 +986,42 @@ impl<B: BlockDevice> VolCore<B> {
     /// from the same never-repeating tick source, so a recycled tree
     /// id starts from values no page was ever retained under.
     pub(crate) fn prune_cache_generations(&self, tree: u64) {
-        self.cache_generations
+        self.inode_tables
             .lock()
+            .generations
             .values
             .retain(|&(t, _), _| t != tree);
         self.orphans.lock().retain(|&(t, _)| t != tree);
     }
 
     /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
-    /// first use. Dead entries are pruned as the table grows.
+    /// first use. An anchor removes its own entry when its last holder
+    /// drops it ([`MmapAnchor`]'s `Drop`).
     pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64, inode: InodeItem) -> Arc<MmapAnchor> {
-        let mut anchors = self.mmap_anchors.lock();
-        if let Some(anchor) = anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
+        let mut tables = self.inode_tables.lock();
+        if let Some(anchor) = tables.anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
             return anchor;
         }
-        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
-            anchors.retain(|_, anchor| anchor.strong_count() != 0);
-        }
         let anchor = Arc::new(MmapAnchor {
-            _tree: tree,
-            _ino: ino,
+            tables: Arc::downgrade(&self.inode_tables),
+            tree,
+            ino,
             inode: IrqSafeSpinLock::new(inode),
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
             update_seq: core::sync::atomic::AtomicU64::new(0),
+            content_lock: Mutex::new(()),
         });
-        anchors.insert((tree, ino), Arc::downgrade(&anchor));
+        // Replaces at most a dead entry whose anchor's `Drop` has not run
+        // yet; that `Drop` then finds this anchor in place and leaves both
+        // it and the generation alone.
+        tables.anchors.insert((tree, ino), Arc::downgrade(&anchor));
         anchor
     }
 
     pub(crate) fn inode_is_open(&self, tree: u64, ino: u64) -> bool {
-        self.mmap_anchors
+        self.inode_tables
             .lock()
+            .anchors
             .get(&(tree, ino))
             .is_some_and(|inode| inode.strong_count() != 0)
     }
@@ -450,8 +1029,9 @@ impl<B: BlockDevice> VolCore<B> {
     pub(crate) fn note_orphan(&self, tree: u64, ino: u64) {
         self.orphans.lock().insert((tree, ino));
         let anchor = self
-            .mmap_anchors
+            .inode_tables
             .lock()
+            .anchors
             .get(&(tree, ino))
             .and_then(Weak::upgrade);
         if let Some(anchor) = anchor {
@@ -471,6 +1051,7 @@ impl<B: BlockDevice> VolCore<B> {
 
     pub(crate) fn forget_orphan(&self, tree: u64, ino: u64) {
         self.orphans.lock().remove(&(tree, ino));
+        self.evicting.lock().remove(&(tree, ino));
     }
 
     /// The transaction accumulating operations that have not committed yet.
@@ -560,8 +1141,10 @@ impl<B: BlockDevice> VolCore<B> {
 /// inode holds it, so it cannot be reused while any mapping exists.
 #[derive(Debug)]
 pub(crate) struct MmapAnchor {
-    _tree: u64,
-    _ino: u64,
+    /// The table this anchor is published in, for its `Drop`.
+    tables: Weak<IrqSafeSpinLock<InodeTables>>,
+    tree: u64,
+    ino: u64,
     pub(crate) inode: IrqSafeSpinLock<InodeItem>,
     pub(crate) live_size: core::sync::atomic::AtomicU64,
     /// Sequence of the owning side's updates to `inode`/`live_size`, written
@@ -570,6 +1153,101 @@ pub(crate) struct MmapAnchor {
     /// and publishes only if it did not move, so a tree read that lost a
     /// race never overwrites what the mutation published.
     pub(crate) update_seq: core::sync::atomic::AtomicU64,
+    /// Held for the whole of a write, truncate, fallocate or attribute
+    /// change of this inode — Linux `inode_lock`. A truncate or fallocate
+    /// takes the volume's operation lock only per step and lets other work
+    /// run between its steps; this keeps every other content change of the
+    /// same inode out until it is done.
+    pub(crate) content_lock: Mutex<()>,
+}
+
+impl MmapAnchor {
+    /// The inode's number.
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
+impl Drop for MmapAnchor {
+    /// The inode's last lookup or mapping is gone: forget its anchor entry
+    /// and its content generation, so neither table grows with every file
+    /// ever opened. The generation may go because nothing can match it any
+    /// more: a page retained under it is keyed by this anchor's address,
+    /// which no later open is promised to get, and the inode's next
+    /// generation is a fresh tick no page was ever retained under (see
+    /// [`CacheGenerations`]). Linux likewise frees `btrfs_inode` (and its
+    /// `i_version`) when the last reference to an inode goes.
+    ///
+    /// Leaves both alone if a newer anchor of the inode has already taken
+    /// the slot (it was published after this one's last reference went but
+    /// before this ran): that anchor carries the inode's generation on.
+    fn drop(&mut self) {
+        let Some(tables) = self.tables.upgrade() else {
+            return;
+        };
+        let unlinked = self.inode.lock().nlink == 0;
+        let mut tables = tables.lock();
+        let key = (self.tree, self.ino);
+        let mine = tables
+            .anchors
+            .get(&key)
+            .is_some_and(|anchor| core::ptr::eq(anchor.as_ptr(), self));
+        if mine {
+            tables.anchors.remove(&key);
+            tables.generations.values.remove(&key);
+        }
+        // The last reference to an unlinked inode: queue its delayed iput
+        // and wake the reaper (Linux `btrfs_add_delayed_iput` waking the
+        // cleaner kthread).
+        let waker = if unlinked {
+            tables.reap_wanted = true;
+            tables.reap_waker.take()
+        } else {
+            None
+        };
+        drop(tables);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// The orphan reaper's sleep: ready once an unlinked inode's last reference
+/// has gone since it last woke ([`crate::write::orphan_reaper`]).
+pub(crate) struct ReapWanted(pub(crate) Arc<IrqSafeSpinLock<InodeTables>>);
+
+impl core::future::Future for ReapWanted {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let mut tables = self.0.lock();
+        if core::mem::take(&mut tables.reap_wanted) {
+            return core::task::Poll::Ready(());
+        }
+        tables.reap_waker = Some(cx.waker().clone());
+        core::task::Poll::Pending
+    }
+}
+
+/// Per-inode tables of one filesystem instance, keyed by
+/// `(fs tree id, inode number)`, under one lock so an anchor's publication,
+/// its removal and the generation updates that depend on whether it is live
+/// are atomic with respect to each other. The generation domain is exactly
+/// the identity domain, so both live on the shared core, not a mount view.
+#[derive(Debug)]
+pub(crate) struct InodeTables {
+    /// Live [`MmapAnchor`]s. An entry outlives its anchor only between the
+    /// anchor's last reference and its `Drop`.
+    anchors: BTreeMap<(u64, u64), Weak<MmapAnchor>>,
+    /// Content generations of open inodes ([`CacheGenerations`]).
+    generations: CacheGenerations,
+    /// An unlinked inode's last reference has gone: the reaper has work.
+    reap_wanted: bool,
+    /// The reaper, asleep until then.
+    reap_waker: Option<core::task::Waker>,
 }
 
 /// Content-generation counters for one filesystem instance, backing
@@ -590,6 +1268,16 @@ pub(crate) struct MmapAnchor {
 /// it. That uniqueness is what makes the generation half of the
 /// page cache's (identity, generation) guard sound even when an
 /// identity anchor's address is recycled.
+///
+/// It is also what makes forgetting an entry safe: a forgotten key
+/// is reissued from the same tick source, so its next value differs
+/// from every value any page was ever retained under, and a
+/// recycled inode (or a reopened one) can only miss, never alias an
+/// old instance. Entries are kept only for inodes with a live
+/// [`MmapAnchor`]: the anchor's `Drop` forgets its inode's entry,
+/// and a bump of an inode without one forgets instead of
+/// inserting, so the map tracks the files open now rather than
+/// every file ever touched.
 #[derive(Debug)]
 pub(crate) struct CacheGenerations {
     values: BTreeMap<(u64, u64), u64>,
@@ -621,17 +1309,14 @@ impl CacheGenerations {
 /// allocator, pinned extents, and the commit timer.
 #[derive(Debug)]
 pub struct VolCore<B: BlockDevice> {
-    /// Live [`MmapAnchor`]s by `(fs tree id, inode number)`.
-    mmap_anchors: IrqSafeSpinLock<BTreeMap<(u64, u64), Weak<MmapAnchor>>>,
+    /// Live [`MmapAnchor`]s and the content generations backing
+    /// `FileOps::mmap_cache_generation` ([`InodeTables`]), by
+    /// `(fs tree id, inode number)`. Shared with the anchors, which remove
+    /// themselves when dropped.
+    inode_tables: Arc<IrqSafeSpinLock<InodeTables>>,
     /// Unlinked inode items are persisted with Linux ORPHAN_ITEM records.
     /// Cleanup waits for every lookup/mapping anchor, then runs under op_lock.
     orphans: IrqSafeSpinLock<BTreeSet<(u64, u64)>>,
-    /// Per-inode content generations backing
-    /// `FileOps::mmap_cache_generation`, keyed by the same
-    /// `(fs tree id, inode number)` pair as `mmap_anchors`: the
-    /// generation domain must be exactly the identity domain, so
-    /// both live here on the shared core, not on a mount view.
-    cache_generations: IrqSafeSpinLock<CacheGenerations>,
     /// Source device passed first at mount. Retained for compatibility with
     /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
@@ -672,7 +1357,46 @@ pub struct VolCore<B: BlockDevice> {
     /// held for hundreds of milliseconds at a time. Nothing on the read side
     /// (`read`, `lookup`, `stat`) may take it, exactly as no Linux reader
     /// waits for a transaction: see [`ReaderEpochs`] and `evictions`.
+    ///
+    /// Data operations — writes, truncate and fallocate steps, attribute and
+    /// xattr changes — no longer take it: each holds its inode's lock
+    /// (`MmapAnchor::content_lock`, Linux `inode_lock`) and joins the
+    /// running transaction (`txn_gate`), side by side with others. What
+    /// still queues here: namespace changes (which also hold their
+    /// directories' and inodes' locks) and administrative work (subvolumes,
+    /// snapshots, quotas, remount, mount-time recovery), which closes the
+    /// transaction for itself.
     op_lock: Mutex<()>,
+    /// The running transaction's door ([`crate::txn_gate`]): every
+    /// operation joins it for its read-to-stage span; a commit — `fsync`,
+    /// `syncfs`, the commit timer, or one an operation needs — closes it,
+    /// waiting for the operations in flight and keeping new ones out (Linux
+    /// `num_writers` and `TRANS_STATE_COMMIT_START`).
+    txn_gate: crate::txn_gate::TxnGate,
+    /// One orphan reaper at a time: concurrent operations each try to reap
+    /// on their way in, and an eviction must not run twice at once.
+    reaper: Mutex<()>,
+    /// Whether the background reaper acts: not in kernel-test builds, whose
+    /// tests drive every operation of their volume themselves (a fault
+    /// injected or a crash armed included), unless a test turns it on.
+    reaper_on: core::sync::atomic::AtomicBool,
+    /// Held by a cross-directory rename around its directory locks (Linux
+    /// `s_vfs_rename_mutex` in `lock_rename`).
+    rename_lock: Mutex<()>,
+    /// Generation of the newest superblock this core has written to the
+    /// device (Linux `fs_info->last_trans_committed`, counted at the
+    /// superblock write rather than at the commit, because a commit's
+    /// superblock may be staged in memory for a while).
+    durable_gen: core::sync::atomic::AtomicU64,
+    /// Generation of the newest transaction an operation has staged into.
+    staged_gen: core::sync::atomic::AtomicU64,
+    /// `(tree, objectid)` → the newest generation that staged an edit of a
+    /// key with that objectid, for generations not yet durable: everything
+    /// of an inode — its item, its names (`INODE_REF`), its extents, its
+    /// xattrs — is keyed by its number. `fsync` of a file whose entry is gone
+    /// or durable has nothing to wait for (Linux `btrfs_inode_in_log` /
+    /// `inode->last_trans <= last_committed` in `btrfs_sync_file`).
+    dirty_objects: IrqSafeSpinLock<BTreeMap<(u64, u64), u64>>,
     /// Raw `flags` word of the selected superblock (for [`crate::rw_gate`]).
     super_flags: u64,
     /// The write-safety gate's verdict, computed once at mount: `Some` means
@@ -702,6 +1426,10 @@ pub struct VolCore<B: BlockDevice> {
     /// the last superblock on disk — which is intact precisely because the
     /// blocks it references are pinned until this image lands.
     staged_super: IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+    /// The published commit whose write-out has not finished (Linux: the
+    /// transaction between TRANS_STATE_UNBLOCKED and TRANS_STATE_COMPLETED);
+    /// see [`BtrfsVolume::finish_write_out`].
+    write_out: Mutex<Option<WriteOut>>,
     /// Commits staged since the superblock last reached disk.
     staged_count: core::sync::atomic::AtomicUsize,
     /// Multi-stage operations in flight ([`VolCore::hold_commits`]): while
@@ -729,12 +1457,23 @@ pub struct VolCore<B: BlockDevice> {
     /// that has already been overwritten — silent corruption, and invisible to
     /// `btrfs check` until after the crash.
     ///
-    /// NARF flips the superblock on every write, so today the set is emptied
-    /// before the next allocation and never withholds anything. It exists so
-    /// that stops being what makes the invariant hold. Linux keeps it on the
-    /// transaction; it sits here until NARF has a transaction object, which is
-    /// sound only while at most one commit is in flight.
-    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    /// Each range carries the generation of the transaction that freed it,
+    /// `(gen, start, len)`, and a superblock of generation `g` releases only
+    /// the ranges freed at or below `g` (Linux keeps the set per transaction
+    /// and `btrfs_finish_extent_commit` releases one transaction's set once
+    /// that transaction's superblock is written). With one commit frozen
+    /// while the previous one's superblock is still going out, a global
+    /// release would hand the newer commit's freed blocks back before any
+    /// durable superblock stopped referencing them.
+    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64, u64)>>,
+    /// Data extents carved for a write whose data is still being written,
+    /// with no transaction lock held (Linux: the reserved extent of an
+    /// ordered extent, `btrfs_reserve_extent` before the bio, the file
+    /// extent item inserted only by `btrfs_finish_ordered_io`). Every
+    /// allocator withholds them ([`BtrfsVolume::pinned_ranges`]): the batch
+    /// they were carved from may commit — without recording them — before
+    /// the write stages them into a later one. See [`InflightData`].
+    data_inflight: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
     /// Tree roots a lock-free reader is walking from, with a count per
     /// address ([`BtrfsVolume::pin_live_root`]). A reader verifies every
     /// child it reads against its parent's pointer (generation, level, first
@@ -752,10 +1491,16 @@ pub struct VolCore<B: BlockDevice> {
     /// Inodes final eviction has started on. A lookup takes no operation
     /// lock, so it can resolve a name to an inode that an unlink and the
     /// orphan reaper then destroy before the lookup's anchor exists: the
-    /// reaper counts here before its last open check, the lookup reads this
-    /// after publishing its anchor, and whichever loses that race notices
-    /// (the reaper skips the inode, the lookup starts over).
-    evictions: core::sync::atomic::AtomicU64,
+    /// reaper enters the inode here before its last open check, the lookup
+    /// looks for its own inode here after publishing its anchor, and
+    /// whichever loses that race notices (the reaper skips the inode, the
+    /// lookup starts over). Only the lookup of that inode starts over;
+    /// evictions of other inodes never send a lookup back (they once did,
+    /// through a filesystem-wide counter, and continuous eviction starved
+    /// every lookup).
+    evicting: IrqSafeSpinLock<BTreeSet<(u64, u64)>>,
+    /// Lookups sent back by an eviction of the inode they resolved.
+    lookup_retries: core::sync::atomic::AtomicU64,
     /// Metadata node cache, keyed by logical address.
     ///
     /// Consecutive commits path-COW the same upper levels of the extent,
@@ -763,12 +1508,21 @@ pub struct VolCore<B: BlockDevice> {
     /// from its root. Every miss costs an (emulated) device read plus a
     /// full-node checksum verification, and both are pure repetition for a
     /// block nothing has written since.
-    nodes: IrqSafeSpinLock<NodeCache>,
+    nodes: Arc<IrqSafeSpinLock<NodeCache>>,
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
     aborted: core::sync::atomic::AtomicBool,
     /// Operations turned away since the abort. See [`Self::note_refused`].
     refused_after_abort: core::sync::atomic::AtomicU64,
+    /// Logical writes and read repairs in flight ([`crate::repair`]).
+    pub(crate) io_ranges: crate::repair::IoRanges,
+    /// What read repair has done.
+    pub(crate) repair_counters: crate::repair::RepairCounters,
+    /// Per-device error counters (`btrfs_device::dev_stat_values`).
+    pub(crate) dev_stats: crate::repair::DevStats,
+    /// Test hook between a read's verification and its repair.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) repair_hook: IrqSafeSpinLock<Option<crate::repair::RepairHook>>,
     /// `BTRFS_FS_QUOTA_OVERRIDE` — see [`Self::quota_override`].
     quota_override: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
@@ -801,7 +1555,11 @@ pub struct VolCore<B: BlockDevice> {
 /// with staged operations, or a committed transaction whose superblock is
 /// only staged. A batch lock held by someone else counts as dirty.
 fn core_is_dirty<B: BlockDevice>(core: &VolCore<B>) -> Option<u64> {
-    let staged = core.staged_super.lock().is_some();
+    let staged = core.staged_super.lock().is_some()
+        || match core.write_out.try_lock() {
+            Some(slot) => slot.is_some(),
+            None => true,
+        };
     let batch_tree = match core.fs_batch.try_lock() {
         Some(guard) => guard
             .as_ref()
@@ -1009,7 +1767,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.frozen.store(true, Ordering::Release);
         // Wait out any operation admitted before the freeze; none can start
         // after it.
-        let _ops = self.op_lock.lock().await;
+        let _ops = self.begin_admin().await?;
         let result = loop {
             if let Err(err) = self.sync_to_disk().await {
                 break Err(err);
@@ -1019,8 +1777,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             // staged, under the lock every new batch must take.
             let _txn = self.txn_lock().lock().await;
             let mut batch = self.fs_batch().lock().await;
-            let pending =
-                batch.as_ref().is_some_and(|b| b.has_ops()) || self.staged_super.lock().is_some();
+            let pending = batch.as_ref().is_some_and(|b| b.has_ops())
+                || self.staged_super.lock().is_some()
+                || self.write_out_pending();
             if pending {
                 continue;
             }
@@ -1154,7 +1913,6 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     /// Whether a transaction has been aborted on this volume.
-    #[cfg(feature = "kernel-test")]
     pub(crate) fn transaction_aborted(&self) -> bool {
         self.aborted.load(core::sync::atomic::Ordering::Acquire)
     }
@@ -1207,13 +1965,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if capacity <= 1024 * 1024 || capacity % u64::from(self.sectorsize) != 0 {
             return Err(FsError::InvalidData);
         }
-        let io = new_volume_io(logical, self.domain)?;
-        Ok(Arc::new(VolumeDevice {
-            device,
-            capacity,
-            dev_item: IrqSafeSpinLock::new(dev_item),
-            io: Mutex::new(io),
-        }))
+        Ok(VolumeDevice::new(device, capacity, dev_item, self.domain))
     }
 
     /// Add a writable member and commit its `DEV_ITEM` plus superblocks. New
@@ -1298,28 +2050,48 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if replacement.capacity < source.capacity {
             return Err(FsError::NoSpace);
         }
-        for (start, length) in crate::write::device_extent_ranges(self, devid).await? {
+        // Copy what the member holds verified, from a good copy where its
+        // own is bad (Linux `btrfs_dev_replace` copies through scrub, which
+        // checks every block and repairs it from another mirror or, on
+        // RAID5/6, rebuilds it from the rest of its full stripe). A stripe
+        // of a mirrored profile holds its chunk 1:1 and is read logically; a
+        // striped profile's stripe is copied piece by piece through the
+        // logical addresses it holds ([`Self::copy_striped_member`]).
+        let csum_root = if self.verify_checksums {
+            let (root_tree, _) = self.root_tree_root();
+            Some(
+                crate::roots::find_root(self, root_tree, format::CSUM_TREE_OBJECTID)
+                    .await?
+                    .0,
+            )
+        } else {
+            None
+        };
+        for (start, length, chunk) in crate::write::device_extents(self, devid).await? {
+            let linear = {
+                let g = self.state.lock();
+                matches!(
+                    (g.chunk_map.max_contiguous(chunk), g.chunk_map.chunk_remaining(chunk)),
+                    (Ok(a), Ok(b)) if a == b
+                ) && g.chunk_map.raid56_set(chunk).is_err()
+            };
+            if !linear && self.verify_checksums {
+                self.copy_striped_member(devid, chunk, csum_root, &replacement)
+                    .await?;
+                continue;
+            }
             let mut offset = 0u64;
             while offset < length {
                 let take = (length - offset).min(128 * 1024) as usize;
-                let mut bytes = vec![0u8; take];
-                read_exact_from(
-                    &*source.device,
-                    &source.io,
-                    source.capacity,
-                    start + offset,
-                    &mut bytes,
-                )
-                .await?;
-                write_exact_to(
-                    &*replacement.device,
-                    &replacement.io,
-                    replacement.capacity,
-                    start + offset,
-                    &bytes,
-                    false,
-                )
-                .await?;
+                let bytes = if linear && self.verify_checksums {
+                    self.read_chunk_verified(chunk + offset, take, true, true, csum_root)
+                        .await?
+                } else {
+                    let mut bytes = vec![0u8; take];
+                    source.read(start + offset, &mut bytes, false).await?;
+                    bytes
+                };
+                replacement.write(start + offset, &bytes, false).await?;
                 offset += take as u64;
             }
         }
@@ -1329,19 +2101,117 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let zero = vec![0u8; format::SUPERBLOCK_SIZE];
         for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
             if offset + format::SUPERBLOCK_SIZE as u64 <= source.capacity {
-                write_exact_to(
-                    &*source.device,
-                    &source.io,
-                    source.capacity,
-                    offset,
-                    &zero,
-                    false,
-                )
-                .await?;
+                source.write(offset, &zero, false).await?;
             }
         }
         source.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
+    }
+
+    /// Device replace of a striped chunk's stripe on member `devid` (RAID0,
+    /// RAID10, RAID5, RAID6): every piece of the chunk that member holds is
+    /// read through its logical address, verified and repaired like any
+    /// read ([`Self::read_chunk_verified`]: a RAID10 piece from its other
+    /// copy, a RAID5/6 data piece rebuilt from its full stripe), and written
+    /// at the member's physical offset on `replacement`. A RAID5/6 parity
+    /// piece is recomputed from the verified data of its full stripe — Linux
+    /// scrub (`scrub_raid56_parity_stripe`) checks parity against the data
+    /// the same way. RAID0 has no second copy: a piece bad on the member
+    /// fails the replace (Linux scrub skips writing a sector it could not
+    /// repair and reports it; refusing the replace keeps the bad bytes off
+    /// the new member either way).
+    ///
+    /// Boxed out of line: the future is built in this frame, not in the
+    /// replace's.
+    #[inline(never)]
+    fn copy_striped_member<'a>(
+        &'a self,
+        devid: u64,
+        chunk: u64,
+        csum_root: Option<u64>,
+        replacement: &'a VolumeDevice<B>,
+    ) -> crate::write::BoxFut<'a, ()> {
+        Box::pin(self.copy_striped_member_inner(devid, chunk, csum_root, replacement))
+    }
+
+    async fn copy_striped_member_inner(
+        &self,
+        devid: u64,
+        chunk: u64,
+        csum_root: Option<u64>,
+        replacement: &VolumeDevice<B>,
+    ) -> Result<(), FsError> {
+        let (chunk_start, chunk_len) = self.state.lock().chunk_map.chunk_bounds(chunk)?;
+        let end = chunk_start + chunk_len;
+        let raid56 = self.state.lock().chunk_map.raid56_set(chunk_start);
+        match raid56 {
+            Err(FsError::Unsupported) => {
+                let mut logical = chunk_start;
+                while logical < end {
+                    let (take, on_member) = {
+                        let g = self.state.lock();
+                        let take = g.chunk_map.max_contiguous(logical)?;
+                        let on_member: Vec<u64> = g
+                            .chunk_map
+                            .map_logical_stripes(logical)?
+                            .into_iter()
+                            .filter(|loc| loc.devid == devid)
+                            .map(|loc| loc.physical)
+                            .collect();
+                        (take, on_member)
+                    };
+                    if !on_member.is_empty() {
+                        let bytes = self
+                            .read_chunk_verified(logical, take as usize, true, true, csum_root)
+                            .await?;
+                        for physical in on_member {
+                            replacement.write(physical, &bytes, false).await?;
+                        }
+                    }
+                    logical += take;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(_) => {
+                let mut row = chunk_start;
+                while row < end {
+                    let set = self.state.lock().chunk_map.raid56_set(row)?;
+                    let stripe_len = set.stripe_len as usize;
+                    let parity_here = set.parity.iter().any(|loc| loc.devid == devid);
+                    let mut data: Vec<Vec<u8>> = Vec::with_capacity(set.data.len());
+                    for (index, loc) in set.data.iter().enumerate() {
+                        if loc.devid != devid && !parity_here {
+                            continue;
+                        }
+                        let logical = row + index as u64 * set.stripe_len;
+                        let bytes = self
+                            .read_chunk_verified(logical, stripe_len, true, true, csum_root)
+                            .await?;
+                        if loc.devid == devid {
+                            replacement.write(loc.physical, &bytes, false).await?;
+                        }
+                        data.push(bytes);
+                    }
+                    if parity_here {
+                        let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                        let (p, q) = crate::raid56::syndromes(&slices, set.parity.len() == 2)?;
+                        for (index, loc) in set.parity.iter().enumerate() {
+                            if loc.devid == devid {
+                                let parity = if index == 0 {
+                                    p.as_slice()
+                                } else {
+                                    q.as_slice()
+                                };
+                                replacement.write(loc.physical, parity, false).await?;
+                            }
+                        }
+                    }
+                    row += set.stripe_len * set.data.len() as u64;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Remove a member, first relocating every chunk stripe that resides on it
@@ -1373,15 +2243,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let zero = vec![0u8; format::SUPERBLOCK_SIZE];
         for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
             if offset + format::SUPERBLOCK_SIZE as u64 <= removed.capacity {
-                write_exact_to(
-                    &*removed.device,
-                    &removed.io,
-                    removed.capacity,
-                    offset,
-                    &zero,
-                    false,
-                )
-                .await?;
+                removed.write(offset, &zero, false).await?;
             }
         }
         removed.device.flush_result().await.map_err(FsError::Io)?;
@@ -1490,7 +2352,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         dst: &mut [u8],
     ) -> Result<(), FsError> {
         let member = self.member(devid)?;
-        read_exact_from(&*member.device, &member.io, member.capacity, offset, dst).await
+        // A plain reader — a lookup, a file read, a page fill — gives up its
+        // place in the queue for the device when its task is sent SIGKILL
+        // (Linux `folio_lock_killable` in `filemap_read`). Not inside an
+        // operation or a commit: a read that is part of one completes, as
+        // Linux never interrupts a transaction's own reads.
+        let killable = !(self.txn_gate.closed_by_current() || self.txn_gate.joined_by_current());
+        member.read(offset, dst, killable).await
     }
 
     /// Read one direct-copy choice, splitting at chunk/stripe boundaries.
@@ -1608,7 +2476,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Resolve both physical copies under the lock, then release it before
         // I/O. A plain logical read can retry transport failure; callers with a
         // checksum (notably read_node and the data-csum path) retry corruption.
-        let mut buf = vec![0u8; len];
+        let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
         let mut last = FsError::NotFound;
         for copy in 0..copies {
@@ -1624,28 +2492,333 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// supplied on-disk data checksum. Unlike [`Self::read_logical`], checksum
     /// failure is part of copy selection, so a readable-but-corrupt primary DUP
     /// stripe falls back to its mirror.
+    ///
+    /// A copy that failed before the good one is then rewritten from it
+    /// (Linux `btrfs_end_repair_bio` → `btrfs_repair_io_failure` for every
+    /// mirror tried before the good one; see [`crate::repair`]). `owner` is
+    /// the `(inode, file offset)` of `logical`, for the repair message.
     pub(crate) async fn read_logical_checked(
         &self,
         logical: u64,
         len: usize,
         stored: &[u8],
+        owner: Option<(u64, u64)>,
     ) -> Result<Vec<u8>, FsError> {
-        let mut buf = vec![0u8; len];
+        let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
+        let mut failure = CopyFailure::default();
+        let mut bad = 0u32;
         for copy in 0..copies {
-            if self
-                .read_logical_copy(logical, &mut buf, copy)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
+                failure.read_failed(error)?;
+                self.note_copy_read_error(logical, copy, error, &mut bad, true);
                 continue;
             }
             let digest = crate::checksum::digest(self.csum_type, &buf)?;
             if digest.get(..stored.len()) == Some(stored) {
+                if bad != 0 {
+                    self.repair_copies(crate::repair::Request {
+                        logical,
+                        good: &buf,
+                        good_copy: copy,
+                        bad,
+                        verify: crate::repair::Verify::Data(stored),
+                        owner: owner.unwrap_or((0, logical)),
+                    })
+                    .await;
+                }
                 return Ok(buf);
             }
+            // `btrfs_data_csum_ok`: a data checksum mismatch counts against
+            // the device the copy came from.
+            if let Some(devid) = self.copy_devid(logical, copy) {
+                self.dev_stats
+                    .inc_and_print(devid, crate::repair::DEV_STAT_CORRUPTION_ERRS);
+            }
+            note_bad_copy(&mut bad, copy);
+            failure.mismatch();
         }
-        Err(FsError::InvalidData)
+        Err(failure.into_error())
+    }
+
+    /// The member device direct copy `copy` of `logical` lives on.
+    fn copy_devid(&self, logical: u64, copy: usize) -> Option<u64> {
+        let g = self.state.lock();
+        let locations = g.chunk_map.map_logical_stripes(logical).ok()?;
+        locations.get(copy).map(|location| location.devid)
+    }
+
+    /// A direct copy could not be read: a device error counts against the
+    /// device (`btrfs_log_dev_io_error`, `BTRFS_DEV_STAT_READ_ERRS`) and,
+    /// when `mark`, marks the copy for repair (Linux rewrites a mirror it
+    /// failed to read like one that failed verification). A copy with no
+    /// usable stripe (a missing member) is neither.
+    fn note_copy_read_error(
+        &self,
+        logical: u64,
+        copy: usize,
+        error: FsError,
+        bad: &mut u32,
+        mark: bool,
+    ) {
+        if !matches!(error, FsError::Io(_)) {
+            return;
+        }
+        if let Some(devid) = self.copy_devid(logical, copy) {
+            self.dev_stats
+                .inc_and_print(devid, crate::repair::DEV_STAT_READ_ERRS);
+            if mark {
+                note_bad_copy(bad, copy);
+            }
+        }
+    }
+
+    /// Rewrite the copies a read found bad from the one it verified
+    /// ([`crate::repair`]). Best effort: the read has its bytes whatever
+    /// becomes of the repair. Boxed so a read's own future stays small.
+    fn repair_copies<'a>(
+        &'a self,
+        req: crate::repair::Request<'a>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.repair_copies_inner(req))
+    }
+
+    async fn repair_copies_inner(&self, req: crate::repair::Request<'_>) {
+        use crate::repair::{RepairCounters as C, Verify};
+        let counters = &self.repair_counters;
+        // `btrfs_repair_io_failure`: nothing is written to a filesystem
+        // mounted read-only or past a critical error. NARF also writes
+        // nothing degraded or while a remount to read-only drains
+        // (`frozen`), and a copy is only known good when it was verified
+        // against its checksum.
+        if self.core_read_only()
+            || self.frozen.load(core::sync::atomic::Ordering::Acquire)
+            || self.degraded
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+            || !self.verify_checksums
+        {
+            C::bump(&counters.skipped_read_only);
+            return;
+        }
+        let len = req.good.len() as u64;
+
+        #[cfg(feature = "kernel-test")]
+        if let Some(hook) = self.repair_hook.lock().as_ref() {
+            (hook.0)(req.logical);
+        }
+
+        // Rule 3: no write to the range in flight, none can start until this
+        // is done, and the chunk mapping cannot change under it (a mapping
+        // swap registers the chunk's range as a write) — so the mapping is
+        // resolved only now.
+        let Some(_range) = self.io_ranges.try_begin_repair(req.logical, len) else {
+            C::bump(&counters.skipped_busy);
+            return;
+        };
+        let (locations, contiguous, raid56) = {
+            let g = self.state.lock();
+            (
+                g.chunk_map.map_logical_stripes(req.logical),
+                g.chunk_map.max_contiguous(req.logical),
+                g.chunk_map.raid56_set(req.logical).is_ok(),
+            )
+        };
+        let (Ok(locations), Ok(contiguous)) = (locations, contiguous) else {
+            C::bump(&counters.skipped_unsupported);
+            return;
+        };
+        if raid56 || contiguous < len || req.good_copy >= locations.len() {
+            C::bump(&counters.skipped_unsupported);
+            return;
+        }
+
+        // Rule 4: the good copy still holds exactly what was verified.
+        let Ok(mut buf) = crate::databuf::zeroed(req.good.len()) else {
+            C::bump(&counters.failed);
+            return;
+        };
+        let good = locations[req.good_copy];
+        if self
+            .read_physical_unkillable(good.devid, good.physical, &mut buf)
+            .await
+            .is_err()
+            || buf.as_slice() != req.good
+        {
+            C::bump(&counters.skipped_changed);
+            return;
+        }
+
+        for (copy, bad) in locations.iter().enumerate() {
+            if copy >= 32 || req.bad & (1 << copy) == 0 || copy == req.good_copy {
+                continue;
+            }
+            // Never a superblock copy: those are written by a commit only.
+            let end = bad.physical.saturating_add(len);
+            if format::SUPERBLOCK_MIRROR_OFFSETS
+                .iter()
+                .any(|&sb| sb < end && bad.physical < sb + format::SUPERBLOCK_SIZE as u64)
+            {
+                C::bump(&counters.skipped_unsupported);
+                continue;
+            }
+            // The bad copy must still fail the check it failed: one that
+            // verifies now was rewritten since, and is not ours to touch.
+            let still_bad = match self
+                .read_physical_unkillable(bad.devid, bad.physical, &mut buf)
+                .await
+            {
+                Ok(()) => !match req.verify {
+                    Verify::Node(expect) => {
+                        self.node_verifies(req.logical, &buf) && expect.is_none_or(|ok| ok(&buf))
+                    }
+                    Verify::Data(stored) => crate::checksum::digest(self.csum_type, &buf)
+                        .is_ok_and(|digest| digest.get(..stored.len()) == Some(stored)),
+                },
+                Err(FsError::Io(_)) => true,
+                Err(_) => {
+                    C::bump(&counters.skipped_unsupported);
+                    continue;
+                }
+            };
+            if !still_bad {
+                C::bump(&counters.skipped_changed);
+                continue;
+            }
+            match self
+                .write_physical_on(bad.devid, bad.physical, req.good)
+                .await
+            {
+                Ok(()) => {
+                    C::bump(&counters.repaired);
+                    crate::repair::report_corrected(
+                        req.owner.0,
+                        req.owner.1,
+                        bad.devid,
+                        bad.physical,
+                    );
+                }
+                Err(_) => {
+                    C::bump(&counters.failed);
+                    self.dev_stats
+                        .inc_and_print(bad.devid, crate::repair::DEV_STAT_WRITE_ERRS);
+                }
+            }
+        }
+    }
+
+    /// The checks a node read applies: its recorded bytenr, and its
+    /// checksum when the mount verifies them.
+    fn node_verifies_as_read(&self, logical: u64, buf: &[u8]) -> Result<bool, FsError> {
+        if format::le64(buf, 48)? != logical {
+            return Ok(false);
+        }
+        Ok(!self.verify_checksums
+            || crate::checksum::verify(
+                self.csum_type,
+                &buf[format::CSUM_SIZE..],
+                &buf[..format::CSUM_SIZE],
+            )?)
+    }
+
+    /// A tree block's own checks: the bytenr it records and its checksum.
+    fn node_verifies(&self, logical: u64, buf: &[u8]) -> bool {
+        format::le64(buf, 48).ok() == Some(logical)
+            && crate::checksum::verify(
+                self.csum_type,
+                &buf[format::CSUM_SIZE..],
+                &buf[..format::CSUM_SIZE],
+            )
+            .unwrap_or(false)
+    }
+
+    /// [`Self::read_physical_on`] that a fatal signal does not end: a
+    /// repair's reads are part of the repair, which runs to its end.
+    async fn read_physical_unkillable(
+        &self,
+        devid: u64,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), FsError> {
+        self.member(devid)?.read(offset, dst, false).await
+    }
+
+    /// Read `len` bytes of a chunk being relocated or copied to a new
+    /// member, verified as Linux reads them (`relocate_data_extent` /
+    /// `relocate_tree_block` read through the ordinary verified paths;
+    /// `btrfs_dev_replace` copies through scrub): a tree block through its
+    /// own bytenr and checksum, a data sector through its stored checksum,
+    /// each from the first good mirror (repairing the bad one). Bytes that
+    /// are neither — free space, a data sector without a checksum — are read
+    /// as they are. A data sector bad on every copy fails the copy.
+    ///
+    /// `metadata`/`data`: the chunk's block-group type; a mixed chunk tries
+    /// each block as a tree block first.
+    pub(crate) async fn read_chunk_verified(
+        &self,
+        logical: u64,
+        len: usize,
+        metadata: bool,
+        data: bool,
+        csum_root: Option<u64>,
+    ) -> Result<Vec<u8>, FsError> {
+        if !metadata {
+            return match (data, csum_root) {
+                (true, Some(root)) => crate::csum::read_checked(self, root, logical, len).await,
+                _ => self.read_logical(logical, len).await,
+            };
+        }
+        let mut out = crate::databuf::zeroed(len)?;
+        let block = self.nodesize();
+        let mut done = 0usize;
+        while done < len {
+            let at = logical + done as u64;
+            let take = (len - done).min(block - (at % block as u64) as usize);
+            let mut filled = false;
+            if metadata && take == self.nodesize() && at % self.nodesize() as u64 == 0 {
+                // One attempt, no retry loop: most of a metadata chunk can be
+                // free space, which never verifies.
+                if let Ok(node) = Box::pin(self.read_node_attempt(at, None)).await {
+                    out[done..done + take].copy_from_slice(&node);
+                    filled = true;
+                }
+            }
+            if !filled {
+                let bytes = match (data, csum_root) {
+                    (true, Some(root)) => crate::csum::read_checked(self, root, at, take).await?,
+                    _ => self.read_logical(at, take).await?,
+                };
+                out[done..done + take].copy_from_slice(&bytes);
+            }
+            done += take;
+        }
+        Ok(out)
+    }
+
+    /// Test-only: `(devid, physical)` of every direct copy of `logical`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_copy_locations(&self, logical: u64) -> Vec<(u64, u64)> {
+        let g = self.state.lock();
+        g.chunk_map
+            .map_logical_stripes(logical)
+            .map(|v| v.iter().map(|l| (l.devid, l.physical)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: run `hook` between a read's verification and its repair.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_set_repair_hook(&self, hook: Option<crate::repair::RepairHook>) {
+        *self.repair_hook.lock() = hook;
+    }
+
+    /// What read repair has done on this filesystem.
+    pub fn repair_stats(&self) -> crate::repair::RepairStats {
+        self.repair_counters.snapshot()
+    }
+
+    /// The error counters of member `devid` (`BTRFS_IOC_GET_DEV_STATS`
+    /// order: write, read, flush, corruption, generation).
+    pub fn dev_stats(&self, devid: u64) -> [u32; 5] {
+        self.dev_stats.get(devid)
     }
 
     /// Read one b-tree node (a `nodesize` block) at logical address `logical`,
@@ -1665,60 +2838,94 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// descent used to copy 16 KiB per level. Callers that need to mutate a node still take `read_node` and
     /// get their own copy.
     pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
+        self.read_node_expecting(logical, None).await
+    }
+
+    /// [`Self::read_node_shared`] for a child reached through a parent
+    /// pointer: `expect` is the parent's check of the child (generation,
+    /// level, first key — Linux `btrfs_tree_parent_check`, applied by
+    /// `btrfs_validate_extent_buffer` to each mirror). A copy that fails it
+    /// is a bad mirror like one that fails its checksum: the next copy is
+    /// read, and a good one repairs it. A cache hit is returned unchecked;
+    /// the caller still applies its check.
+    pub(crate) async fn read_node_expecting(
+        &self,
+        logical: u64,
+        expect: Option<crate::repair::ParentCheck<'_>>,
+    ) -> Result<Arc<Vec<u8>>, FsError> {
         // A block of the running batch is rewritten in place at the same
         // address by later operations, and another CPU can read it from the
         // device in the middle of that write (a reader takes no operation
         // lock). The torn image fails its checksum; by the time the read is
         // retried the writer has finished and published the new bytes in the
         // cache. A block that is genuinely bad fails every attempt.
+        // Only a copy that failed verification is worth reading again; a
+        // killed caller's abandoned wait ends the read at once.
         let mut last = FsError::InvalidData;
         for _ in 0..3 {
-            match self.read_node_attempt(logical).await {
+            match self.read_node_attempt(logical, expect).await {
                 Ok(node) => {
                     self.stats.note_read(&node);
                     return Ok(node);
                 }
+                Err(FsError::Interrupted) => return Err(FsError::Interrupted),
                 Err(error) => last = error,
             }
         }
         Err(last)
     }
 
-    async fn read_node_attempt(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
+    async fn read_node_attempt(
+        &self,
+        logical: u64,
+        expect: Option<crate::repair::ParentCheck<'_>>,
+    ) -> Result<Arc<Vec<u8>>, FsError> {
         // Serve from the node cache when nothing has written this address
         // since it was filled. A hit skips both the device read and the
         // full-node checksum verification; the clone is a memcpy against an
         // I/O plus a checksum over the whole node.
         let epoch = {
-            let cache = self.nodes.lock();
-            if let Some(hit) = cache.entries.get(&logical) {
-                return Ok(hit.clone());
+            let mut cache = self.nodes.lock();
+            if let Some((hit, retired)) = cache.get(logical) {
+                drop(cache);
+                drop(retired);
+                return Ok(hit);
             }
             cache.epoch
         };
-        let _ = epoch;
 
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
+        let mut failure = CopyFailure::default();
+        // `btrfs_read_extent_buffer` repairs the first mirror that failed
+        // (`failed_mirror`) once a later one verified.
+        let mut bad = 0u32;
         for copy in 0..copies {
-            if self
-                .read_logical_copy(logical, &mut buf, copy)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
+                failure.read_failed(error)?;
+                // Every failed read counts; only the first failure is
+                // repaired (`failed_mirror`).
+                let first = bad == 0;
+                self.note_copy_read_error(logical, copy, error, &mut bad, first);
                 continue;
             }
-            if format::le64(&buf, 48)? != logical {
+            if !self.node_verifies_as_read(logical, &buf)? || expect.is_some_and(|ok| !ok(&buf)) {
+                failure.mismatch();
+                if bad == 0 {
+                    note_bad_copy(&mut bad, copy);
+                }
                 continue;
             }
-            if self.verify_checksums
-                && !crate::checksum::verify(
-                    self.csum_type,
-                    &buf[format::CSUM_SIZE..],
-                    &buf[..format::CSUM_SIZE],
-                )?
-            {
-                continue;
+            if bad != 0 {
+                self.repair_copies(crate::repair::Request {
+                    logical,
+                    good: &buf,
+                    good_copy: copy,
+                    bad,
+                    verify: crate::repair::Verify::Node(expect),
+                    owner: (0, logical),
+                })
+                .await;
             }
             crate::stats::note_device_read();
             let shared = Arc::new(core::mem::take(&mut buf));
@@ -1726,21 +2933,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             // failed one is retried from another mirror, and caching it would
             // make a transient bad mirror permanent for this mount.
             let mut cache = self.nodes.lock();
-            if cache.epoch == epoch {
-                // A write landed while this read was in flight if the epoch
-                // moved; the bytes in hand may already be stale, so drop them
-                // rather than publish them.
-                if cache.entries.len() >= NODE_CACHE_MAX {
-                    // Crude but bounded, and the working set a commit revisits
-                    // sits far below the cap — an LRU's bookkeeping would cost
-                    // more here than the misses it saves.
-                    cache.entries.clear();
-                }
-                cache.entries.insert(logical, shared.clone());
-            }
+            // A write landed while this read was in flight if the epoch
+            // moved; the bytes in hand may already be stale, so drop them
+            // rather than publish them.
+            let retired = (cache.epoch == epoch)
+                .then(|| cache.insert(logical, shared.clone()))
+                .flatten();
+            drop(cache);
+            drop(retired);
             return Ok(shared);
         }
-        Err(FsError::InvalidData)
+        Err(failure.into_error())
     }
 
     // ── Mount ──────────────────────────────────────────────────────
@@ -1801,9 +3004,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // commit the previous subvolume's tree into the new subvolume's root
         // item. Log replay walks several roots in a row and is the path that
         // reaches this. The commit waits for any running operation of
-        // another mount (see `op_lock`).
+        // another mount (see `txn_gate`).
         {
-            let _op = self.op_lock().lock().await;
+            let _op = self.begin_commit().await?;
             crate::write::flush_batch(self).await?;
         }
         // The resolution reads the root tree (and the trees on the path)
@@ -1956,7 +3159,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 }
                 continue;
             }
-            let io = Mutex::new(new_volume_io(logical, domain)?);
+            let member = VolumeDevice::new(
+                device,
+                capacity,
+                [0u8; format::SUPERBLOCK_DEV_ITEM_SIZE],
+                domain,
+            );
             let mut best: Option<(u64, Superblock, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE], u64)> =
                 None;
             let mut saw_unsupported = false;
@@ -1965,10 +3173,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     continue;
                 }
                 let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
-                if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
-                    .await
-                    .is_err()
-                {
+                if member.read(offset, &mut candidate, false).await.is_err() {
                     continue;
                 }
                 if format::le64(&candidate, format::SUPERBLOCK_BYTENR_OFFSET) != Ok(offset) {
@@ -2018,12 +3223,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             match best {
                 Some((offset, superblock, dev_item, flags)) => {
-                    let member = Arc::new(VolumeDevice {
-                        device,
-                        capacity,
-                        dev_item: IrqSafeSpinLock::new(dev_item),
-                        io,
-                    });
+                    *member.dev_item.lock() = dev_item;
                     scanned.push((member, offset, superblock, flags));
                 }
                 None if index == 0 && saw_unsupported => return Err(FsError::Unsupported),
@@ -2115,10 +3315,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
         seed.map_logical(superblock.chunk_root)?;
 
+        let node_cache = Arc::new(IrqSafeSpinLock::new(NodeCache::new(node_cache_budget())));
+        register_node_cache(&node_cache);
         let core = Arc::new(VolCore {
-            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            inode_tables: Arc::new(IrqSafeSpinLock::new(InodeTables {
+                anchors: BTreeMap::new(),
+                generations: CacheGenerations::new(),
+                reap_wanted: false,
+                reap_waker: None,
+            })),
+            reaper_on: core::sync::atomic::AtomicBool::new(cfg!(not(feature = "kernel-test"))),
             orphans: IrqSafeSpinLock::new(BTreeSet::new()),
-            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             device: source_device,
             magic: superblock.magic,
             nodesize: superblock.nodesize,
@@ -2133,21 +3340,35 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             sharing_checked: core::sync::atomic::AtomicBool::new(false),
             txn_lock: Mutex::new(()),
             op_lock: Mutex::new(()),
+            txn_gate: crate::txn_gate::TxnGate::new(),
+            reaper: Mutex::new(()),
+            rename_lock: Mutex::new(()),
+            durable_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
+            staged_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
+            dirty_objects: IrqSafeSpinLock::new(BTreeMap::new()),
             timer_started: core::sync::atomic::AtomicBool::new(false),
             frozen: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
+            write_out: Mutex::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
             commit_holds: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            data_inflight: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
-            evictions: core::sync::atomic::AtomicU64::new(0),
-            nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            evicting: IrqSafeSpinLock::new(BTreeSet::new()),
+            lookup_retries: core::sync::atomic::AtomicU64::new(0),
+            nodes: node_cache,
             aborted: core::sync::atomic::AtomicBool::new(false),
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
+            io_ranges: crate::repair::IoRanges::default(),
+            repair_counters: crate::repair::RepairCounters::default(),
+            dev_stats: crate::repair::DevStats::default(),
+            #[cfg(feature = "kernel-test")]
+            repair_hook: IrqSafeSpinLock::new(None),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             stats: crate::stats::CommitStats::default(),
@@ -2215,9 +3436,250 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Held across one mutating operation (see the field).
+    /// Test-only: the queue mutating operations wait in (see the field).
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn op_lock(&self) -> &Mutex<()> {
         &self.op_lock
+    }
+
+    /// Start one namespace change: wait in the operation queue (`op_lock`),
+    /// then join the running transaction. The caller already holds the
+    /// directory and inode locks it needs (never taken while joined: see
+    /// [`crate::txn_gate`]).
+    pub(crate) async fn begin_op(&self) -> Result<OpGuard<'_>, FsError> {
+        let queue = killable(self.op_lock.lock()).await?;
+        let joined = killable(self.txn_gate.join()).await?;
+        Ok(OpGuard::Queued {
+            _joined: joined,
+            _queue: queue,
+        })
+    }
+
+    /// Start one data operation (or one step of a truncate or fallocate):
+    /// join the running transaction, beside every other operation joined.
+    /// The caller holds its inode's lock.
+    pub(crate) async fn begin_data_op(&self) -> Result<OpGuard<'_>, FsError> {
+        Ok(OpGuard::Joined {
+            _joined: killable(self.txn_gate.join()).await?,
+        })
+    }
+
+    /// Start administrative work (subvolumes, snapshots, quotas, remount,
+    /// recovery): wait in the operation queue, then close the transaction
+    /// to every other operation for the whole of it.
+    pub(crate) async fn begin_admin(&self) -> Result<OpGuard<'_>, FsError> {
+        let queue = killable(self.op_lock.lock()).await?;
+        let closed = killable(self.txn_gate.close()).await?;
+        // Administrative work reads and writes the device under the closed
+        // transaction: the last commit's write-out completes first.
+        self.finish_write_out().await?;
+        Ok(OpGuard::Admin {
+            _closed: closed,
+            _queue: queue,
+        })
+    }
+
+    /// Close the transaction for a commit forced from outside any
+    /// operation: waits for the operations in flight, not for those queued
+    /// behind them.
+    pub(crate) async fn begin_commit(&self) -> Result<crate::txn_gate::Closed<'_>, FsError> {
+        killable(self.txn_gate.close()).await
+    }
+
+    /// Run `work` with the transaction closed — a commit, a chunk
+    /// allocation, any transaction of its own over the committed trees.
+    ///
+    /// Called with the transaction already closed, it is the closer that
+    /// runs (nothing joined runs while it is closed) and `work` runs
+    /// directly. Called by a joined operation, the operation steps out,
+    /// closes, runs `work` and joins again, waiting like any other joiner
+    /// ([`crate::txn_gate::Upgrade`]); operation code calls this only at a
+    /// point where it holds nothing it read from the tree beyond what its
+    /// inode and directory locks keep stable. With nothing joined it closes
+    /// first (mount, unmount, tests).
+    pub(crate) async fn exclusive<T>(&self, work: impl core::future::Future<Output = T>) -> T {
+        if self.txn_gate.closed_by_current() {
+            return work.await;
+        }
+        let upgrade = self
+            .txn_gate
+            .joined_by_current()
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
+        let out = {
+            // No write-out wait here: what `work` commits finishes the
+            // previous write-out first (`commit_txn_inner`), and a second
+            // await before `work` would keep a third copy of it in every
+            // caller's future.
+            let _closed = self.txn_gate.close().await;
+            work.await
+        };
+        if let Some(upgrade) = upgrade {
+            upgrade.step_in().await;
+        }
+        out
+    }
+
+    /// Run a commit's freeze (`freeze`, which publishes and leaves its
+    /// write-out queued) with the transaction closed, and its write-out with
+    /// the transaction open — Linux `btrfs_commit_transaction` from
+    /// COMMIT_PREP to COMPLETED:
+    ///
+    /// - the previous commit's write-out completes first, with the
+    ///   transaction still open (COMMIT_PREP waits for `prev_trans` to reach
+    ///   TRANS_STATE_COMPLETED before COMMIT_START);
+    /// - the transaction closes for the freeze (COMMIT_START .. DOING);
+    /// - it opens again (UNBLOCKED), and this commit's write-out runs while
+    ///   new operations join the next transaction (to COMPLETED).
+    ///
+    /// A joined caller (an operation that filled the batch) steps out for
+    /// all of it, as [`Self::exclusive`] does, and joins again only once its
+    /// commit is complete: its own join is not what holds the next commit's
+    /// close back while this write-out runs.
+    pub(crate) async fn commit_handing_over(
+        &self,
+        freeze: impl core::future::Future<Output = Result<(), FsError>>,
+    ) -> Result<(), FsError> {
+        if self.txn_gate.closed_by_current() {
+            freeze.await?;
+            return self.finish_write_out().await;
+        }
+        let upgrade = self
+            .txn_gate
+            .joined_by_current()
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
+        let result = async {
+            self.finish_write_out().await?;
+            {
+                let _closed = self.txn_gate.close().await;
+                self.finish_write_out().await?;
+                freeze.await?;
+            }
+            self.finish_write_out().await
+        }
+        .await;
+        if let Some(upgrade) = upgrade {
+            upgrade.step_in().await;
+        }
+        result
+    }
+
+    /// Whether the transaction is closed (by the running code, when it is
+    /// the one asking: nothing joined runs while it is).
+    pub(crate) fn txn_closed(&self) -> bool {
+        self.txn_gate.closed_by_current()
+    }
+
+    /// Test-only: close the transaction, as a commit would.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn close_txn(&self) -> crate::txn_gate::CloseFuture<'_> {
+        self.txn_gate.close()
+    }
+
+    /// Test-only: join the transaction, as an operation in flight would.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn join_txn(&self) -> crate::txn_gate::JoinFuture<'_> {
+        self.txn_gate.join()
+    }
+
+    /// Test-only: empty the node cache, so what reads tree blocks next reads
+    /// them from the device.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_empty_node_cache(&self) {
+        // `shrink` frees up to the bytes it is given.
+        self.nodes.lock().shrink(usize::MAX);
+    }
+
+    /// Test-only: whether the running code is joined to the transaction.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn txn_joined(&self) -> bool {
+        self.txn_gate.joined_by_current()
+    }
+
+    /// Withhold the data extent `[start, start + len)`, just carved from the
+    /// open batch, from every allocator until the returned guard drops —
+    /// after its write has been staged, or when the write gives up (the
+    /// carve is then returned: the batch that carved it frees it at its
+    /// commit, which does not record it).
+    pub(crate) fn hold_inflight_data(&self, start: u64, len: u64) -> InflightData<'_> {
+        self.data_inflight.lock().push((start, len));
+        InflightData {
+            list: &self.data_inflight,
+            range: (start, len),
+        }
+    }
+
+    /// Test-only: the data extents being written outside any transaction.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn inflight_data(&self) -> alloc::vec::Vec<(u64, u64)> {
+        self.data_inflight.lock().clone()
+    }
+
+    /// Leave the running transaction for a stretch of work that holds
+    /// nothing a commit needs — a data write between its extent carve and
+    /// its staging (Linux writes data with no transaction handle) — so a
+    /// commit, and every operation queued behind it, need not wait for its
+    /// I/O. `None` when the caller is not joined, or when a multi-stage
+    /// operation keeps its stages in one transaction ([`Self::hold_commits`]).
+    /// Join again with [`crate::txn_gate::Upgrade::step_in`].
+    pub(crate) fn step_out_for_io(&self) -> Option<crate::txn_gate::Upgrade<'_>> {
+        (!self.commits_held() && self.txn_gate.joined_by_current())
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate))
+    }
+
+    /// The cross-directory rename lock (see the field).
+    pub(crate) fn rename_lock(&self) -> &Mutex<()> {
+        &self.rename_lock
+    }
+
+    /// The orphan reaper's lock, if no other operation is reaping.
+    pub(crate) fn try_reaper(&self) -> Option<narf_lib::mutex::MutexGuard<'_, ()>> {
+        self.reaper.try_lock()
+    }
+
+    /// Generation of the newest superblock written to the device.
+    pub(crate) fn durable_gen(&self) -> u64 {
+        self.durable_gen.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// An operation has staged `edits` into the transaction of generation
+    /// `gen` in subvolume tree `tree`: remember which objects it touched.
+    pub(crate) fn note_staged(&self, tree: u64, objectids: impl Iterator<Item = u64>, gen: u64) {
+        self.staged_gen
+            .fetch_max(gen, core::sync::atomic::Ordering::AcqRel);
+        let mut dirty = self.dirty_objects.lock();
+        for objectid in objectids {
+            let slot = dirty.entry((tree, objectid)).or_insert(gen);
+            *slot = (*slot).max(gen);
+        }
+    }
+
+    /// The generation whose superblock must be durable before every change
+    /// to object `objectid` of tree `tree` is, or `None` if all of them are.
+    pub(crate) fn dirty_generation(&self, tree: u64, objectid: u64) -> Option<u64> {
+        let durable = self.durable_gen();
+        self.dirty_objects
+            .lock()
+            .get(&(tree, objectid))
+            .copied()
+            .filter(|&gen| gen > durable)
+    }
+
+    /// The generation whose superblock must be durable before everything
+    /// staged or committed so far is.
+    pub(crate) fn newest_generation(&self) -> u64 {
+        self.staged_gen
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(self.superblock().generation)
+    }
+
+    /// A superblock of generation `gen` is on the device.
+    fn note_durable(&self, gen: u64) {
+        let before = self
+            .durable_gen
+            .fetch_max(gen, core::sync::atomic::Ordering::AcqRel);
+        if gen > before {
+            self.dirty_objects.lock().retain(|_, staged| *staged > gen);
+        }
     }
 
     /// Serialises closing one transaction against opening the next.
@@ -2225,13 +3687,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         &self.txn_lock
     }
 
-    /// Start the core's commit timer once.
+    /// Start the core's commit timer and orphan reaper once.
     fn start_commit_timer(self: &Arc<Self>) {
         if !self
             .timer_started
             .swap(true, core::sync::atomic::Ordering::AcqRel)
         {
             crate::write::spawn_commit_timer(&self.core);
+            crate::write::spawn_orphan_reaper(&self.core);
         }
     }
 
@@ -2579,15 +4042,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             return Err(FsError::ReadOnly);
         }
         let member = self.member(devid)?;
-        write_exact_to(
-            &*member.device,
-            &member.io,
-            member.capacity,
-            offset,
-            src,
-            false,
-        )
-        .await
+        member.write(offset, src, false).await
     }
 
     /// Write `src` at btrfs *logical* address `logical` (single-chunk range).
@@ -2613,6 +4068,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // pre-write bytes; without the second bump its epoch check would pass
         // and it would publish them as current.
         let _ = self.invalidate_nodes(logical, src.len());
+        self.write_stripes(logical, src).await?;
+        Ok(self.invalidate_nodes(logical, src.len()))
+    }
+
+    /// Write `src` to every stripe of its logical range (Linux
+    /// `btrfs_map_bio`: one bio per mirror, all in flight together), split at
+    /// chunk / stripe boundaries. No cache bookkeeping: the callers'.
+    async fn write_stripes(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
+        // Held until every mirror's write finished: a read repair of any byte
+        // of this range waits for it, or this waits for the repair.
+        let _writing = self.io_ranges.begin_write(logical, src.len() as u64).await;
         let mut done = 0usize;
         while done < src.len() {
             let at = logical
@@ -2632,21 +4098,216 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 )
             };
             let take = (src.len() - done).min(contiguous as usize);
+            let piece = &src[done..done + take];
             if let Some(set) = raid56 {
-                self.write_raid56(at, &src[done..done + take], &set).await?;
-            } else {
-                for location in locations {
-                    self.write_physical_on(
-                        location.devid,
-                        location.physical,
-                        &src[done..done + take],
-                    )
+                self.write_raid56(at, piece, &set).await?;
+            } else if let [only] = locations.as_slice() {
+                self.write_physical_on(only.devid, only.physical, piece)
                     .await?;
-                }
+            } else {
+                // DUP / RAID1 / RAID10: every copy at once; a failed copy
+                // fails the write once every copy has finished.
+                let mirrors: Vec<crate::bio::IoFut<'_>> = locations
+                    .iter()
+                    .map(|location| -> crate::bio::IoFut<'_> {
+                        Box::pin(self.write_physical_on(location.devid, location.physical, piece))
+                    })
+                    .collect();
+                crate::bio::join_all(mirrors, crate::bio::WRITE_WINDOW).await?;
             }
             done += take;
         }
-        Ok(self.invalidate_nodes(logical, src.len()))
+        Ok(())
+    }
+
+    /// Write a commit's new metadata nodes — all of them in flight together,
+    /// the device's queue bounding how many — and keep them cached
+    /// (Linux `btrfs_write_marked_extents` → `write_one_eb` per dirty
+    /// buffer, then `btrfs_wait_tree_block_writeback`). `root_admin` is the
+    /// [`Self::write_node_root_admin`] gate.
+    ///
+    /// The node-cache epoch moves once before every write and once after
+    /// every write completed, so a reader whose device read overlapped ANY
+    /// of them declines to publish what it holds (see
+    /// [`Self::write_logical_unchecked`]); the written bytes are then
+    /// published under the final epoch.
+    pub(crate) async fn write_nodes(
+        &self,
+        nodes: &[(u64, &[u8])],
+        root_admin: bool,
+    ) -> Result<(), FsError> {
+        let refused = if root_admin {
+            // Root-admin skips only the subvolume's own RDONLY flag; a
+            // read-only or aborted filesystem takes no writes from anyone.
+            self.degraded
+                || self.core_read_only()
+                || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+        } else {
+            !self.supports_writes()
+        };
+        if refused {
+            return Err(FsError::ReadOnly);
+        }
+        // Nodes a frozen commit holds dirty in the cache: readers keep
+        // finding them there through the write, and the write makes them
+        // clean (or drops them, if it failed).
+        let dirty: Vec<bool> = {
+            let cache = self.nodes.lock();
+            nodes.iter().map(|&(l, _)| cache.is_dirty(l)).collect()
+        };
+        for &(logical, buf) in nodes {
+            self.stats.note_write(buf);
+            let _ = self.invalidate_nodes(logical, buf.len());
+        }
+        let writes: Vec<crate::bio::IoFut<'_>> = nodes
+            .iter()
+            .map(|&(logical, buf)| -> crate::bio::IoFut<'_> {
+                Box::pin(self.write_stripes(logical, buf))
+            })
+            .collect();
+        let written = crate::bio::join_all(writes, crate::bio::WRITE_WINDOW).await;
+        // The trailing invalidation also drops what a reader published from
+        // a device read that overlapped a write (pre-write or torn bytes).
+        let mut epoch = 0;
+        for &(logical, buf) in nodes {
+            epoch = self.invalidate_nodes(logical, buf.len());
+        }
+        if written.is_ok() {
+            for (&(logical, buf), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| !d) {
+                self.cache_written_node(logical, buf, epoch);
+            }
+        }
+        // A failed write leaves them dirty: the write-out that failed aborts
+        // the filesystem, and they stay what readers of its published trees
+        // see.
+        if written.is_ok() {
+            for (&(logical, _), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| d) {
+                let retired = self.nodes.lock().clean(logical, true);
+                drop(retired);
+            }
+        }
+        written
+    }
+
+    /// Hold a frozen commit's nodes dirty in the node cache until
+    /// [`Self::write_nodes`] has written them: from here on a reader of the
+    /// trees they belong to finds them in memory, never on a device that
+    /// does not have them yet.
+    pub(crate) fn mark_nodes_dirty(&self, nodes: &[(u64, &[u8])]) {
+        let nodesize = self.nodesize();
+        for &(logical, buf) in nodes.iter().filter(|(_, b)| b.len() == nodesize) {
+            let node = Arc::new(buf.to_vec());
+            self.nodes.lock().mark_dirty(logical, node);
+        }
+    }
+
+    /// Drop dirty nodes of a commit that failed before it published.
+    pub(crate) fn discard_dirty_nodes(&self, addrs: &[u64]) {
+        for &logical in addrs {
+            let retired = self.nodes.lock().clean(logical, false);
+            drop(retired);
+        }
+    }
+
+    /// Hand a published commit's write-out to the filesystem. The lane must
+    /// be empty: every commit finishes the previous write-out before it
+    /// starts ([`Self::finish_write_out`]), and only a commit, with the
+    /// transaction closed, queues one.
+    pub(crate) async fn queue_write_out(&self, job: WriteOut) -> Result<(), FsError> {
+        let mut slot = self.write_out.lock().await;
+        if slot.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        *slot = Some(job);
+        Ok(())
+    }
+
+    /// Whether a published commit's write-out has not finished.
+    pub(crate) fn write_out_pending(&self) -> bool {
+        match self.write_out.try_lock() {
+            Some(slot) => slot.is_some(),
+            None => true,
+        }
+    }
+
+    /// Finish the published commit's write-out, if one is outstanding: its
+    /// nodes, then its superblock image, staged and — when due — written
+    /// (Linux `btrfs_write_and_wait_transaction`, then `write_all_supers`
+    /// for `super_for_commit`). Commits are written in the order they
+    /// published, and a superblock only after every node it references.
+    ///
+    /// Whoever needs the commit complete calls this: the committer, the next
+    /// commit before it starts, a sync. The job stays queued until it has
+    /// succeeded, so a caller cancelled half-way leaves it for the next one,
+    /// which writes it again from the start (rewriting a node with the same
+    /// bytes is harmless). A failed write-out aborts the filesystem: the
+    /// trees in memory were published on top of blocks the device does not
+    /// have, so nothing may be committed over them (Linux
+    /// `btrfs_handle_fs_error` / `cleanup_transaction`).
+    ///
+    /// Boxed, and out of line so the future is built in this frame: it is
+    /// awaited from every closer of the transaction, and its state would
+    /// otherwise sit in each of their frames.
+    #[inline(never)]
+    pub(crate) fn finish_write_out(&self) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.finish_write_out_inner())
+    }
+
+    async fn finish_write_out_inner(&self) -> Result<(), FsError> {
+        let mut slot = self.write_out.lock().await;
+        let result = match slot.as_ref() {
+            None => return Ok(()),
+            Some(job) => self.run_write_out(job).await,
+        };
+        let job = slot.take();
+        drop(slot);
+        if let Err(error) = result {
+            self.abort_transaction();
+            for &(tree, (root, level)) in job.iter().flat_map(|job| &job.rollback) {
+                BtrfsVolume::view_for_tree(self.core(), tree).advance_fs_root(root, level);
+            }
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: ================================================================\n\
+                 btrfs: FILESYSTEM IS NOW READ-ONLY\n\
+                 btrfs:   writing out the commit of generation {} failed: {error:?}\n\
+                 btrfs:   every operation since generation {} is lost\n\
+                 btrfs:   every later write returns EROFS until the next mount\n\
+                 btrfs: ================================================================",
+                job.as_ref().map_or(0, |job| job.gen),
+                self.durable_gen(),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn run_write_out(&self, job: &WriteOut) -> Result<(), FsError> {
+        #[cfg(feature = "kernel-test")]
+        while WRITE_OUT_HOLD.load(core::sync::atomic::Ordering::Acquire) {
+            WRITE_OUT_HELD.store(true, core::sync::atomic::Ordering::Release);
+            narf_time::sleep_ms(1).await;
+        }
+        let refs: Vec<(u64, &[u8])> = job.nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        self.write_nodes(&refs, job.root_admin).await?;
+        drop(refs);
+        // Stand in for a crash at the one instant the COW invariant is load
+        // bearing: nodes written, superblock still pointing at the previous
+        // tree. The errno is irrelevant — what matters is never reaching the
+        // superblock write, leaving the device exactly as a crash here would.
+        #[cfg(feature = "kernel-test")]
+        if self.take_crash_before_super() {
+            return Err(FsError::Unsupported);
+        }
+        // Staged only now that every node it references is on the device:
+        // the staged image is always the newest fully written commit. The
+        // pins are released after it is written, not here
+        // (`btrfs_finish_extent_commit` after `write_all_supers`).
+        if self.stage_superblock(job.raw_super.clone(), job.root_admin) {
+            self.write_staged_now().await?;
+        }
+        Ok(())
     }
 
     /// Keep a multi-stage operation (truncate's tail zeroing then its size
@@ -2701,45 +4362,106 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
     /// fsyncs, crashes the following commit, and requires the fsynced data
     /// back. Deferring commits without doing the work here turns that red.
-    /// [`Self::sync_to_disk`] from outside any operation (`fsync`, `syncfs`):
-    /// waits for the running operation, so the commit it forces cannot land
-    /// between another CPU's tree reads and its staging.
+    /// [`Self::sync_to_disk`] from outside any operation (`fsync` of a
+    /// directory, `syncfs`): make everything staged or committed so far
+    /// durable.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
-        let _op = self.op_lock().lock().await;
-        // Reclaiming orphans is housekeeping this call does on the way; what
-        // it owes its caller is the commit. An orphan that cannot be
-        // reclaimed for lack of space must not cost the sync — the commit
-        // releases pinned space, after which the reclaim is tried once more,
-        // and an orphan still left keeps its on-disk record for later.
-        let reaped = self.reap_orphans().await;
-        self.sync_to_disk().await?;
-        match reaped {
-            Err(FsError::NoSpace) => match self.reap_orphans().await {
-                Ok(()) => self.sync_to_disk().await,
-                Err(FsError::NoSpace) => Ok(()),
-                Err(error) => Err(error),
-            },
-            other => other,
+        self.commit_through(self.newest_generation()).await
+    }
+
+    /// `fsync` of object `objectid` (a file) of this mount's tree: make every
+    /// change to it durable. Nothing to do if none is newer than the last
+    /// superblock written (Linux `btrfs_sync_file` returning early for an
+    /// inode whose `last_trans` is committed).
+    pub async fn sync_object(&self, objectid: u64) -> Result<(), FsError> {
+        match self.dirty_generation(self.fs_tree_id(), objectid) {
+            Some(gen) => self.commit_through(gen).await,
+            None => Ok(()),
         }
+    }
+
+    /// Make the transaction of generation `target` durable, committing the
+    /// open one if no superblock of `target` or later has been written.
+    ///
+    /// Waits for the running operation, so the commit cannot land between
+    /// another CPU's tree reads and its staging — but not for the operations
+    /// queued behind it (`txn_gate`). Concurrent callers share commits:
+    /// whoever gets the lock first commits everything open, and each one
+    /// after it finds its generation durable and returns (Linux joins an
+    /// `fsync` to the transaction already committing,
+    /// `btrfs_commit_transaction` with `cur_trans->state >= COMMIT_START`).
+    ///
+    /// The transaction is closed only while the commit freezes and publishes
+    /// its trees; the write-out it waits for runs with the transaction open,
+    /// so operations queued behind the sync join the next transaction instead
+    /// of waiting for this one's I/O (Linux TRANS_STATE_UNBLOCKED). A commit
+    /// already writing out `target` is waited for, not repeated; a change
+    /// staged after the hand-over is in the open transaction and needs the
+    /// next commit, never this one.
+    ///
+    /// Boxed, out of line: every `fsync`/`msync`/`syncfs` future would
+    /// otherwise hold the commit's and the write-out's states inline.
+    #[inline(never)]
+    fn commit_through(&self, target: u64) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.commit_through_inner(target))
+    }
+
+    async fn commit_through_inner(&self, target: u64) -> Result<(), FsError> {
+        if self.durable_gen() >= target {
+            return Ok(());
+        }
+        // A commit that published `target` may still be writing it out (its
+        // superblock goes out with it: `MAX_STAGED_COMMITS`).
+        self.finish_write_out().await?;
+        if self.durable_gen() >= target {
+            return Ok(());
+        }
+        if self.superblock().generation < target {
+            let commit = self.begin_commit().await?;
+            if self.superblock().generation < target {
+                // No orphan eviction here: what an fsync owes is the commit
+                // (eviction runs at the final iput and in the background
+                // reaper).
+                crate::write::flush_batch_handing_over(self).await?;
+            }
+            drop(commit);
+        }
+        self.write_staged_super().await
     }
 
     /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device
     /// flush, so the superblock mirrors (written without FUA) are durable as
     /// well. Safe from a pre-shutdown hook while the block devices still run:
     /// it waits for the running operation, takes no IRQ-masking lock across
-    /// I/O, and on a read-only or aborted filesystem only flushes.
+    /// I/O, and on a read-only filesystem only flushes.
+    ///
+    /// An aborted filesystem flushes and then fails with `ReadOnly`: changes
+    /// it accepted were lost with the transaction that aborted, so a sync —
+    /// the one before power-off included — must not report them durable
+    /// (Linux `btrfs_sync_fs` gets -EROFS from `btrfs_attach_transaction_barrier`
+    /// once `BTRFS_FS_ERROR` is set, and `sync_filesystem` returns it).
     pub async fn sync_fs(&self) -> Result<(), FsError> {
-        if !self.core_read_only() && !self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+        let aborted = self.aborted.load(core::sync::atomic::Ordering::Acquire);
+        if !self.core_read_only() && !aborted {
+            // Evict what no handle holds any more before the commit, as
+            // Linux runs the delayed iputs before a filesystem goes away
+            // (`close_ctree`), so a syncfs before shutdown leaves no orphan
+            // behind that it could have reclaimed.
+            self.run_delayed_iputs().await;
             self.sync_to_disk_exclusive().await?;
         }
-        self.flush().await
+        self.flush().await?;
+        if aborted {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(())
     }
 
     pub fn sync_to_disk(&self) -> crate::write::BoxFut<'_, ()> {
-        alloc::boxed::Box::pin(async move {
+        alloc::boxed::Box::pin(self.exclusive(async move {
             crate::write::flush_batch(self).await?;
             self.write_staged_super().await
-        })
+        }))
     }
 
     /// Push the staged superblock, if any, through to the device — the second
@@ -2751,31 +4473,75 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// of its own left to flush, and calling back into the batch machinery
     /// from inside a commit makes the two mutually recursive for no gain.
     pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
+        // A published commit still being written out stages its image only
+        // when its nodes are out.
+        self.finish_write_out().await?;
+        self.write_staged_now_boxed().await
+    }
+
+    /// [`Self::write_staged_now`], boxed out of line (see
+    /// [`Self::finish_write_out`]).
+    #[inline(never)]
+    fn write_staged_now_boxed(&self) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.write_staged_now())
+    }
+
+    /// [`Self::write_staged_super`] without finishing the write-out first:
+    /// the write-out's own last step.
+    async fn write_staged_now(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {
             // Nothing outstanding; the barrier is all that is owed (fsync of
             // data already covered by a durable superblock).
             return self.flush().await;
         };
+        // A caller whose future is dropped mid-write must not take the image
+        // with it: the in-memory trees already describe it, and with it gone
+        // a later sync would find nothing staged and flush only, leaving the
+        // committed transactions never durable. Put back on drop; rewriting
+        // a superblock that partly landed is idempotent.
+        struct KeepStaged<'a> {
+            slot: &'a IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+            image: Option<(alloc::vec::Vec<u8>, bool)>,
+        }
+        impl Drop for KeepStaged<'_> {
+            fn drop(&mut self) {
+                if let Some(image) = self.image.take() {
+                    let mut slot = self.slot.lock();
+                    if slot.is_none() {
+                        *slot = Some(image);
+                    }
+                }
+            }
+        }
+        let mut keep = KeepStaged {
+            slot: &self.staged_super,
+            image: Some((raw, root_admin)),
+        };
         // Every staged commit's nodes were written before this point. The
         // superblock writer issues the one pre-flush that makes them durable
         // before the FUA primary (`write_all_supers`).
+        let raw = keep
+            .image
+            .as_ref()
+            .map(|(raw, _)| raw.clone())
+            .unwrap_or_default();
         let written = if root_admin {
             self.write_superblock_root_admin(&raw).await
         } else {
             self.write_superblock(&raw).await
         };
-        if let Err(error) = written {
-            // Keep the image: it is still what the in-memory trees describe.
-            // The filesystem is now in its error state and takes no writes.
-            *self.staged_super.lock() = Some((raw, root_admin));
-            return Err(error);
-        }
+        // On failure `keep` puts the image back as it drops: it is still what
+        // the in-memory trees describe. The filesystem is then in its error
+        // state and takes no writes.
+        written?;
+        keep.image = None;
         self.staged_count
             .store(0, core::sync::atomic::Ordering::Release);
         // Only now, exactly as `btrfs_finish_extent_commit` runs only after
-        // `write_all_supers`.
-        self.unpin_all();
+        // `write_all_supers` — and only what the transactions this image
+        // covers freed.
+        self.unpin_through(format::super_generation(&raw).unwrap_or(0));
         Ok(())
     }
 
@@ -2795,10 +4561,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Withhold `[start, start + len)` from allocation until [`Self::unpin_all`].
-    pub(crate) fn pin_extent(&self, start: u64, len: u64) {
+    /// Withhold `[start, start + len)`, freed by the transaction of
+    /// generation `gen`, from allocation until a superblock of `gen` or later
+    /// is durable ([`Self::unpin_through`]).
+    pub(crate) fn pin_extent(&self, gen: u64, start: u64, len: u64) {
         if len != 0 {
-            self.pinned.lock().push((start, len));
+            self.pinned.lock().push((gen, start, len));
         }
     }
 
@@ -2806,7 +4574,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// readers that may still reference it are running, for the allocator to
     /// subtract.
     pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
-        let mut ranges = self.pinned.lock().clone();
+        let mut ranges: alloc::vec::Vec<(u64, u64)> = self
+            .pinned
+            .lock()
+            .iter()
+            .map(|&(_, start, len)| (start, len))
+            .collect();
+        ranges.extend(self.data_inflight.lock().iter().copied());
         ranges.extend(
             self.reader_epochs
                 .lock()
@@ -2827,10 +4601,46 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
     }
 
-    /// See [`VolCore::evictions`]: read it before resolving a name and again
-    /// after the resolved node exists.
-    pub(crate) fn eviction_count(&self) -> u64 {
-        self.evictions.load(core::sync::atomic::Ordering::SeqCst)
+    /// Whether final eviction has started on `(tree, ino)` (see the
+    /// `evicting` field): asked by a lookup after its anchor exists.
+    pub(crate) fn is_evicting(&self, tree: u64, ino: u64) -> bool {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.evicting.lock().contains(&(tree, ino))
+    }
+
+    /// A lookup resolved an inode being evicted and starts over.
+    pub(crate) fn note_lookup_retry(&self) {
+        self.lookup_retries
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: make every member device stop answering, as a saturated
+    /// device does, until `release` is set; `held` once it is.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) async fn __test_hold_io_until(
+        &self,
+        held: &core::sync::atomic::AtomicBool,
+        release: &core::sync::atomic::AtomicBool,
+    ) {
+        use core::sync::atomic::Ordering;
+        crate::bio::IO_GATE.store(true, Ordering::Release);
+        held.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            narf_time::sleep_ms(1).await;
+        }
+        crate::bio::IO_GATE.store(false, Ordering::Release);
+    }
+
+    /// Test-only: lookups sent back by an eviction so far.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn lookup_retries(&self) -> u64 {
+        self.lookup_retries
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Eviction of `(tree, ino)` is over, done or given up.
+    pub(crate) fn end_eviction(&self, tree: u64, ino: u64) {
+        self.evicting.lock().remove(&(tree, ino));
     }
 
     /// Claim `(tree, ino)` for final eviction: false when a lookup or mapping
@@ -2839,9 +4649,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if self.inode_is_open(tree, ino) {
             return false;
         }
-        self.evictions
-            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        !self.inode_is_open(tree, ino)
+        self.evicting.lock().insert((tree, ino));
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if self.inode_is_open(tree, ino) {
+            self.end_eviction(tree, ino);
+            return false;
+        }
+        true
     }
 
     /// The roots lock-free readers are walking from, as `(addr, nodesize)`
@@ -2851,12 +4665,27 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.reader_roots.lock().keys().map(|&a| (a, n)).collect()
     }
 
-    /// Release every pinned extent. The caller must have made a superblock
-    /// durable that no longer references any of them — that ordering is the
-    /// entire point of pinning, so calling this earlier reintroduces exactly
-    /// the corruption the set prevents.
-    pub(crate) fn unpin_all(&self) {
-        let ranges = core::mem::take(&mut *self.pinned.lock());
+    /// Release the extents freed by transactions of generation `gen` or
+    /// older (Linux `btrfs_finish_extent_commit` for each transaction up to
+    /// the one whose superblock was written). The caller must have made a
+    /// superblock of generation `gen` durable — it no longer references any
+    /// of them; that ordering is the entire point of pinning, so calling this
+    /// earlier reintroduces exactly the corruption the set prevents. Extents
+    /// a newer transaction freed stay pinned: the durable superblock still
+    /// names the trees that use them.
+    pub(crate) fn unpin_through(&self, gen: u64) {
+        let ranges: alloc::vec::Vec<(u64, u64)> = {
+            let mut pinned = self.pinned.lock();
+            let mut released = alloc::vec::Vec::new();
+            pinned.retain(|&(freed_at, start, len)| {
+                let release = freed_at <= gen;
+                if release {
+                    released.push((start, len));
+                }
+                !release
+            });
+            released
+        };
         self.reader_epochs.lock().retire(ranges);
     }
 
@@ -2886,53 +4715,36 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if cache.epoch != epoch {
             return;
         }
-        if cache.entries.len() >= NODE_CACHE_MAX {
-            cache.entries.clear();
-        }
-        cache.entries.insert(logical, Arc::new(buf.to_vec()));
+        let retired = cache.insert(logical, Arc::new(buf.to_vec()));
+        drop(cache);
+        drop(retired);
     }
 
     /// Drop the cached copy of a tree block nothing references any more: one
     /// a commit replaced, or one a batch wrote and then replaced again.
     ///
-    /// The cache is bounded by emptying it when it fills, so every dead
-    /// block left in it brings the next emptying — and the re-reading of
-    /// every live node — closer. A reader still walking a tree that holds
-    /// the block reads it back from the device, where it stays intact until
-    /// its space is unpinned.
+    /// The cache is bounded, so every dead block left in it takes the place
+    /// of a live one. A reader still walking a tree that holds the block
+    /// reads it back from the device, where it stays intact until its space
+    /// is unpinned.
     pub(crate) fn forget_node(&self, logical: u64) {
-        self.nodes.lock().entries.remove(&logical);
+        self.nodes.lock().remove(logical);
     }
 
     /// Write one metadata node and keep it cached.
     pub async fn write_node(&self, logical: u64, buf: &[u8]) -> Result<(), FsError> {
-        if !self.supports_writes() {
-            return Err(FsError::ReadOnly);
-        }
-        self.stats.note_write(buf);
-        let epoch = self.write_logical_unchecked(logical, buf).await?;
-        self.cache_written_node(logical, buf, epoch);
-        Ok(())
+        self.write_nodes(&[(logical, buf)], false).await
     }
 
-    /// [`Self::write_node`] for the root-admin path.
+    /// [`Self::write_node`] for the root-admin path (the commit goes
+    /// through [`Self::write_nodes`] directly).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) async fn write_node_root_admin(
         &self,
         logical: u64,
         buf: &[u8],
     ) -> Result<(), FsError> {
-        // Root-admin skips only the subvolume's own RDONLY flag; a read-only
-        // or aborted filesystem takes no writes from anyone.
-        if self.degraded
-            || self.core_read_only()
-            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
-        {
-            return Err(FsError::ReadOnly);
-        }
-        self.stats.note_write(buf);
-        let epoch = self.write_logical_unchecked(logical, buf).await?;
-        self.cache_written_node(logical, buf, epoch);
-        Ok(())
+        self.write_nodes(&[(logical, buf)], true).await
     }
 
     /// Drop every cached node the byte range `[logical, logical + len)`
@@ -2959,12 +4771,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let end = logical.saturating_add(len as u64);
         let from = logical.saturating_sub(node.saturating_sub(1));
         let mut cache = self.nodes.lock();
-        let stale: alloc::vec::Vec<u64> = cache
-            .entries
-            .range(from..end)
-            .map(|(&addr, _)| addr)
-            .collect();
-        for addr in stale {
+        for addr in cache.cached_in(from, end) {
             cache.invalidate(addr);
         }
         cache.epoch = cache.epoch.wrapping_add(1);
@@ -3055,6 +4862,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     async fn write_superblock_unchecked(&self, raw: &[u8]) -> Result<(), FsError> {
         let result = self.write_all_supers(raw).await;
+        if result.is_ok() {
+            if let Some(gen) = format::super_generation(raw) {
+                self.note_durable(gen);
+            }
+        }
         if result.is_err() {
             // `btrfs_handle_fs_error` after a failed `write_all_supers`: the
             // trees in memory are ahead of anything durable, so the only
@@ -3088,8 +4900,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .iter()
             .map(|(&devid, member)| (devid, member.clone()))
             .collect();
-        for (_, member) in &members {
-            member.device.flush_result().await.map_err(FsError::Io)?;
+        // `barrier_all_devices`: a member whose pre-flush failed is counted
+        // (`wait_dev_flush` → `BTRFS_DEV_STAT_FLUSH_ERRS`) and the superblock
+        // is not written, so the commit fails and the filesystem aborts.
+        for (devid, member) in &members {
+            self.flush_member(*devid, member).await?;
         }
         let max_errors = members.len().saturating_sub(1);
         let mut errors = 0usize;
@@ -3121,15 +4936,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 if self.core_read_only() {
                     return Err(FsError::ReadOnly);
                 }
-                let written = write_exact_to(
-                    &*member.device,
-                    &member.io,
-                    member.capacity,
-                    offset,
-                    &copy,
-                    primary,
-                )
-                .await;
+                let written = member.write(offset, &copy, primary).await;
                 if primary && written.is_err() {
                     device_ok = false;
                     break;
@@ -3156,11 +4963,31 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// (`blkdev_issue_flush`). The durability barrier of `fsync` and of every
     /// commit.
     pub async fn flush(&self) -> Result<(), FsError> {
-        let members: Vec<Arc<VolumeDevice<B>>> = self.devices.lock().values().cloned().collect();
-        for member in members {
-            member.device.flush_result().await.map_err(FsError::Io)?;
+        let members: Vec<(u64, Arc<VolumeDevice<B>>)> = self
+            .devices
+            .lock()
+            .iter()
+            .map(|(&devid, member)| (devid, member.clone()))
+            .collect();
+        for (devid, member) in &members {
+            self.flush_member(*devid, member).await?;
         }
         Ok(())
+    }
+
+    /// Flush one member's volatile write cache. A failure is counted against
+    /// the member and printed, as Linux `wait_dev_flush` does
+    /// (`btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_FLUSH_ERRS)`), and
+    /// returned.
+    async fn flush_member(&self, devid: u64, member: &VolumeDevice<B>) -> Result<(), FsError> {
+        match member.device.flush_result().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.dev_stats
+                    .inc_and_print(devid, crate::repair::DEV_STAT_FLUSH_ERRS);
+                Err(FsError::Io(error))
+            }
+        }
     }
 
     /// Read the selected raw superblock and normalize it to primary-copy form.
@@ -3337,11 +5164,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Publish replacement geometry for an existing logical chunk after its
     /// new physical contents and COWed chunk tree are durable.
-    pub(crate) fn replace_chunk_item_mapping(
+    ///
+    /// The chunk's whole logical range is registered as written across the
+    /// swap, so a read repair never writes through the old geometry to
+    /// physical space the swap hands back ([`crate::repair`]).
+    pub(crate) async fn replace_chunk_item_mapping(
         &self,
         logical: u64,
         chunk: &[u8],
     ) -> Result<(), FsError> {
+        let length = format::le64(chunk, 0)?;
+        let _swapping = self.io_ranges.begin_write(logical, length).await;
         self.state
             .lock()
             .chunk_map
@@ -3429,141 +5262,4 @@ fn same_common_superblock(left: &Superblock, right: &Superblock) -> bool {
         && left.root_level == right.root_level
         && left.chunk_root_level == right.chunk_root_level
         && left.sys_chunk_array == right.sys_chunk_array
-}
-
-/// The run of whole device blocks the next request covers, starting at byte
-/// `absolute` and wanting `remaining` bytes: `(lba, blocks, offset of
-/// `absolute` within the run, bytes of the caller's range inside the run)`.
-/// Pure: the unit of the request-shape tests.
-pub(crate) fn io_run(
-    absolute: u64,
-    remaining: usize,
-    block_size: usize,
-    scratch: usize,
-) -> (u64, usize, usize, usize) {
-    let bs = block_size as u64;
-    let lba = absolute / bs;
-    let in_run = (absolute % bs) as usize;
-    let copy = remaining.min(scratch - in_run);
-    let blocks = (in_run + copy).div_ceil(block_size);
-    (lba, blocks, in_run, copy)
-}
-
-/// Write `src` at physical byte offset `offset` in as few requests as the
-/// scratch buffer allows (one per 64 KiB run of whole blocks), reading and
-/// merging the existing contents only when the range starts or ends inside a
-/// block. A superblock copy or a tree node is therefore a single request,
-/// whatever the device's logical block size.
-async fn write_exact_to<B: BlockDevice + 'static>(
-    device: &B,
-    io: &Mutex<VolumeIo>,
-    limit: u64,
-    offset: u64,
-    src: &[u8],
-    fua: bool,
-) -> Result<(), FsError> {
-    let end = offset
-        .checked_add(src.len() as u64)
-        .ok_or(FsError::InvalidData)?;
-    if end > limit {
-        return Err(FsError::InvalidData);
-    }
-    let mut done = 0usize;
-    while done < src.len() {
-        let absolute = offset + done as u64;
-        let guard = io.lock().await;
-        let block_size = guard.block_size;
-        let (lba, blocks, in_run, copy) = io_run(absolute, src.len() - done, block_size, guard.len);
-        let run_bytes = blocks * block_size;
-        let partial = in_run != 0 || copy != run_bytes;
-
-        // For a partial run, fetch existing contents first so untouched bytes
-        // are preserved.
-        if partial {
-            let read = BlockRequest {
-                op: BlockOp::Read,
-                lba,
-                blocks: blocks as u32,
-                buffer: guard
-                    .cap
-                    .derive::<Read>()
-                    .map_err(|_| FsError::Io(BlockError::PermissionDenied))?,
-                qos: QosHint::Latency,
-                user_tag: 0,
-            };
-            device.submit(read).await.result.map_err(FsError::Io)?;
-        }
-
-        let buffer = guard
-            .buffer()
-            .ok_or(FsError::Io(BlockError::PermissionDenied))?;
-        // SAFETY: `guard` serialises all submissions on this registered coherent
-        // buffer of `guard.len >= run_bytes` bytes; we hold a strong Arc for the
-        // copy.
-        let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), run_bytes) };
-        dst[in_run..in_run + copy].copy_from_slice(&src[done..done + copy]);
-
-        let write = BlockRequest {
-            op: BlockOp::Write { fua },
-            lba,
-            blocks: blocks as u32,
-            buffer: guard
-                .cap
-                .derive::<Read>()
-                .map_err(|_| FsError::Io(BlockError::PermissionDenied))?,
-            qos: QosHint::Latency,
-            user_tag: 0,
-        };
-        device.submit(write).await.result.map_err(FsError::Io)?;
-        done += copy;
-        drop(guard);
-    }
-    Ok(())
-}
-
-/// Read `dst.len()` bytes at physical byte offset `offset`, one scratch-sized
-/// run of whole blocks per request through the volume's serialised buffer.
-async fn read_exact_from<B: BlockDevice + 'static>(
-    device: &B,
-    io: &Mutex<VolumeIo>,
-    limit: u64,
-    offset: u64,
-    dst: &mut [u8],
-) -> Result<(), FsError> {
-    let end = offset
-        .checked_add(dst.len() as u64)
-        .ok_or(FsError::InvalidData)?;
-    if end > limit {
-        return Err(FsError::InvalidData);
-    }
-    let mut done = 0usize;
-    while done < dst.len() {
-        let absolute = offset + done as u64;
-        let guard = io.lock().await;
-        let block_size = guard.block_size;
-        let (lba, blocks, in_run, copy) = io_run(absolute, dst.len() - done, block_size, guard.len);
-        let request = BlockRequest {
-            op: BlockOp::Read,
-            lba,
-            blocks: blocks as u32,
-            buffer: guard
-                .cap
-                .derive::<Read>()
-                .map_err(|_| FsError::Io(BlockError::PermissionDenied))?,
-            qos: QosHint::Latency,
-            user_tag: 0,
-        };
-        device.submit(request).await.result.map_err(FsError::Io)?;
-        let buffer = guard
-            .buffer()
-            .ok_or(FsError::Io(BlockError::PermissionDenied))?;
-        // SAFETY: `guard` serialises all submissions on this registered coherent
-        // buffer, which is `guard.len >= blocks * block_size` bytes and stays
-        // registered until the volume drops.
-        let source = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), blocks * block_size) };
-        dst[done..done + copy].copy_from_slice(&source[in_run..in_run + copy]);
-        done += copy;
-        drop(guard);
-    }
-    Ok(())
 }

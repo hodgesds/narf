@@ -117,6 +117,6 @@ pub(crate) fn symlink_absolute(
             ctx.set_return(errno_ret(EPERM)) // `if (!dir->i_op->symlink)`
         }
         // Parent path/filesystem didn't resolve → the walk's errno.
-        _ => ctx.set_return(errno_ret(path_lookup_errno(link_path))),
+        _ => ctx.set_return(errno_ret(path_lookup_errno(link_path, None))),
     }
 }

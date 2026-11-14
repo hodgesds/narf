@@ -135,7 +135,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // mount identity remains available, while pathname statx below
         // carries STATX_ATTR_MOUNT_ROOT for systemd's mount-point probe.
         (
-            Some(st),
+            Ok(st),
             crate::mqueue::fd_mount_id(task, dirfd as u32),
             false,
             alloc::string::String::new(),
@@ -244,15 +244,18 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         };
         #[cfg(not(feature = "container"))]
         let ns_stat = None;
-        let st = ns_stat.or_else(|| stat_ino_path_dir_aware_ext(&path_owned, follow_final));
+        let st = match ns_stat {
+            Some(st) => Ok(st),
+            None => stat_ino_path_dir_aware_ext(&path_owned, follow_final),
+        };
         let is_mount_root = current_path_is_mount_root(&path_owned);
         let mnt = current_mount_id_at(&path_owned);
         (st, mnt, is_mount_root, path_owned)
     };
 
     let (s, ino, rdev, uid, gid, attrs) = match fs_stat {
-        Some(tuple) => tuple,
-        None => {
+        Ok(tuple) => tuple,
+        Err(error) => {
             // File doesn't exist — report ENOENT, not the bare -1 sentinel
             // (which musl maps to EPERM). Callers that probe for a path's
             // existence (e.g. libwayland's wl_socket_lock, which only
@@ -261,7 +264,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             // filename_lookup also yields -ENOTDIR, -ELOOP and -EACCES.
             // The resolver reports no reason, so the walk is re-classified
             // after the fact — see `path_lookup_errno`.
-            ctx.set_return(errno_ret(path_lookup_errno(&walked_path)));
+            ctx.set_return(errno_ret(path_lookup_errno(&walked_path, Some(error))));
             return;
         }
     };

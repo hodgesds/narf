@@ -31,6 +31,8 @@ pub(crate) mod p2p;
 pub(crate) mod p2p_go;
 #[path = "iface_p2p_group.rs"]
 pub(crate) mod p2p_group;
+#[path = "iface_sched_scan.rs"]
+mod sched_scan;
 #[path = "iface_wowlan.rs"]
 mod wowlan;
 
@@ -79,11 +81,20 @@ pub struct Mt76Iface {
     p2p_go: IrqSafeSpinLock<Option<Arc<p2p_go::P2pGoIface>>>,
     vif_slots: IrqSafeSpinLock<crate::mt7921::vif_slots::Slots>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
+    /// `(bssid, channel)` of the cached results whose Beacon the latest
+    /// scan received (`ScanReport::beaconed`), replaced with the cache.
+    scan_beaconed: IrqSafeSpinLock<Vec<([u8; 6], u8)>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     tx_cons: IrqSafeSpinLock<Option<Consumer<Frame, TX_RING_N>>>,
     associated_bssid: IrqSafeSpinLock<Option<[u8; 6]>>,
+    /// The station link's statistics from the latest packet step, for
+    /// NL80211_CMD_GET_STATION (`station_info`); cleared with the link.
+    link_stats: IrqSafeSpinLock<Option<crate::mt7921::link_stats::LinkStats>>,
+    /// NL80211_CMD_SET_CQM and mac80211's software monitor over the AP's
+    /// Beacons; the monitor restarts with each association.
+    cqm: IrqSafeSpinLock<Cqm>,
     pending_tx: IrqSafeSpinLock<Option<Frame>>,
     control: narf_lib::mutex::Mutex<()>,
     teardown_needed: AtomicBool,
@@ -105,6 +116,8 @@ pub struct Mt76Iface {
     /// obtains a fresh native wake-route receipt.
     wake_reported: AtomicBool,
     wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// The running scheduled scan's event source (its START request).
+    sched_scan: IrqSafeSpinLock<Option<narf_wireless::ap_control::RadioEventAuthority>>,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -125,11 +138,14 @@ impl Mt76Iface {
             p2p_go: IrqSafeSpinLock::new(None),
             vif_slots: IrqSafeSpinLock::new(crate::mt7921::vif_slots::Slots::default()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
+            scan_beaconed: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
             rx_prod: IrqSafeSpinLock::new(None),
             tx_cons: IrqSafeSpinLock::new(None),
             associated_bssid: IrqSafeSpinLock::new(None),
+            link_stats: IrqSafeSpinLock::new(None),
+            cqm: IrqSafeSpinLock::new(Cqm::default()),
             pending_tx: IrqSafeSpinLock::new(None),
             control: narf_lib::mutex::Mutex::new(()),
             teardown_needed: AtomicBool::new(false),
@@ -148,6 +164,7 @@ impl Mt76Iface {
             sleeping: AtomicBool::new(false),
             wake_reported: AtomicBool::new(false),
             wowlan: IrqSafeSpinLock::new(None),
+            sched_scan: IrqSafeSpinLock::new(None),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -179,6 +196,12 @@ impl Mt76Iface {
             });
         }
         bands
+    }
+
+    /// Forget the cached scan results and which of them were beaconed.
+    pub(crate) fn clear_scan_cache(&self) {
+        self.scan_cache.lock().clear();
+        self.scan_beaconed.lock().clear();
     }
 
     /// STATION or P2P_CLIENT: mac80211 runs both as a STATION vif
@@ -302,6 +325,9 @@ impl Mt76Iface {
                 self.finish_teardown(false).await?;
             }
             self.drain_network()?;
+            if !self.link_up() {
+                self.poll_sched_scan().await;
+            }
             if self.link_up() {
                 let Some(_control) = self.control.try_lock() else {
                     return Ok(());
@@ -356,6 +382,13 @@ impl Mt76Iface {
             }
         };
         self.refresh_receive_epoch()?;
+        if let Some(link) = step.link {
+            *self.link_stats.lock() = Some(link);
+            let events = self.cqm.lock().beacons(&link);
+            for (high, level_dbm) in events {
+                narf_wireless::nl80211::notify_cqm_rssi(&self.name, high, level_dbm);
+            }
+        }
         let progress = step.transmitted || !step.received.is_empty();
         deliver_received_batch(
             step,
@@ -452,6 +485,8 @@ impl Mt76Iface {
         self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
+        *self.link_stats.lock() = None;
+        self.cqm.lock().restart();
         if !ap {
             publish_link(&self.name, false);
         }
@@ -509,7 +544,7 @@ impl Mt76Iface {
             .store(now.saturating_add(delay), Ordering::Release);
         self.lose_link();
         self.teardown_needed.store(true, Ordering::Release);
-        self.scan_cache.lock().clear();
+        self.clear_scan_cache();
         crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
@@ -562,33 +597,64 @@ impl Mt76Iface {
         {
             return Err(WirelessError::InvalidArgs);
         }
-        let protected = match &req.security {
-            narf_wireless::SecurityConfig::Open => false,
-            narf_wireless::SecurityConfig::Wpa2 { .. }
-            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
+        use narf_wireless::association::SmeRsna;
+        let rsna = match &req.security {
+            narf_wireless::SecurityConfig::Open => SmeRsna::Open,
+            // The supplicant's own AKM and PMF selection (PSK-SHA256,
+            // ieee80211w=1/2) is what the owner will negotiate.
+            narf_wireless::SecurityConfig::Wpa2 { psk } => {
+                match crate::mt7921::association::Security::wpa2_from_supplicant(*psk, &req.ie) {
+                    Some(crate::mt7921::association::Security::Wpa2PskSelected {
+                        akm,
+                        pmf,
+                        ..
+                    }) => SmeRsna::Wpa2 {
+                        akm,
+                        mfp: match pmf {
+                            narf_wireless::association::Pmf::Disabled => 0,
+                            narf_wireless::association::Pmf::Optional => {
+                                narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
+                            }
+                            narf_wireless::association::Pmf::Required => {
+                                narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
+                                    | narf_wireless::rsn::RSN_CAP_MFP_REQUIRED
+                            }
+                        },
+                    },
+                    Some(_) => SmeRsna::Wpa2Psk,
+                    None => return Err(WirelessError::NotSupported),
+                }
+            }
+            narf_wireless::SecurityConfig::Wpa3 { .. } => SmeRsna::Wpa3Sae,
             _ => return Err(WirelessError::NotSupported),
         };
-        crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
-            match error {
+        narf_wireless::association::validate_sme_ies_for(&req.ie, rsna).map_err(
+            |error| match error {
                 crate::mt7921::association::Error::InvalidBss => WirelessError::InvalidArgs,
                 _ => WirelessError::NotSupported,
-            }
-        })?;
+            },
+        )?;
         Ok(six)
     }
 
     /// Resolve the cached scan target and the native security owner, and
     /// require a current transmit permission for it.
+    ///
+    /// `follow_heard_ap` (the infrastructure station only) admits a radar or
+    /// NO_IR channel when the latest scan received the BSS's own Beacon;
+    /// the returned flag says whether the grant depends on that.
     pub(super) fn resolve_join(
         &self,
         req: &AssociateRequest,
         security: narf_wireless::SecurityConfig,
         six: bool,
-    ) -> Result<(ScanBss, crate::mt7921::association::Security), WirelessError> {
+        follow_heard_ap: bool,
+    ) -> Result<(ScanBss, crate::mt7921::association::Security, bool), WirelessError> {
         let security = match security {
             narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => {
-                crate::mt7921::association::Security::Wpa2Psk { psk }
+                crate::mt7921::association::Security::wpa2_from_supplicant(psk, &req.ie)
+                    .ok_or(WirelessError::NotSupported)?
             }
             // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
             narf_wireless::SecurityConfig::Wpa3 { password } => {
@@ -615,14 +681,22 @@ impl Mt76Iface {
             .ok_or(WirelessError::InvalidArgs)?;
 
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
-        if six {
+        let heard = follow_heard_ap
+            && !six
+            && self
+                .scan_beaconed
+                .lock()
+                .contains(&(bss.bssid, bss.channel));
+        let grant = if six {
             crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
+        } else if heard {
+            crate::mt7921::association::TxPermission::from_heard_ap(&domain, bss.channel)
         } else {
             crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
         }
         .ok_or(WirelessError::Denied)?;
 
-        Ok((bss, security))
+        Ok((bss, security, grant.follows_heard_ap()))
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
@@ -719,6 +793,64 @@ fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
     {
         use core::fmt::Write;
         let _ = writeln!(narf_console::Writer, "mt76: {stage} failed: {error:?}");
+    }
+}
+
+/// The CQM configuration and its software monitor.
+#[derive(Debug, Default)]
+struct Cqm {
+    config: Option<narf_wireless::CqmRssiConfig>,
+    monitor: narf_wireless::cqm::SoftwareCqm,
+    /// `LinkStats::beacons` already fed to the monitor.
+    seen: u32,
+}
+impl Cqm {
+    fn configure(&mut self, config: Option<narf_wireless::CqmRssiConfig>) {
+        self.config = config;
+        self.monitor.reconfigured();
+    }
+    /// A new association: no beacon average, no previous event.
+    fn restart(&mut self) {
+        self.monitor = Default::default();
+        self.seen = 0;
+    }
+    /// Feed the Beacons `link` counted since the last step (each at the
+    /// latest Beacon's signal; at most eight per step) and return the
+    /// crossings to report as `(high, level_dbm)`.
+    fn beacons(&mut self, link: &crate::mt7921::link_stats::LinkStats) -> Vec<(bool, i32)> {
+        let mut events = Vec::new();
+        let new = link.beacons.wrapping_sub(self.seen).min(8);
+        self.seen = link.beacons;
+        let Some(signal) = link.beacon_signal_dbm else {
+            return events;
+        };
+        for _ in 0..new {
+            if let Some(high) = self.monitor.beacon(i32::from(signal), self.config.as_ref()) {
+                events.push((high, self.monitor.level_dbm().unwrap_or(i32::from(signal))));
+            }
+        }
+        events
+    }
+}
+
+/// GET_STATION's view of `link` and the netdev counters.
+fn station_info_from(
+    link: &crate::mt7921::link_stats::LinkStats,
+    counters: Option<&narf_net::iface::IfaceCounterSnapshot>,
+) -> narf_wireless::StationInfo {
+    let mut chain_signal_dbm = [None; 8];
+    chain_signal_dbm[..2].copy_from_slice(&link.chain_signal_dbm);
+    let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    narf_wireless::StationInfo {
+        signal_dbm: link.signal_dbm,
+        signal_avg_dbm: link.signal_avg_dbm(),
+        chain_signal_dbm,
+        rx_bitrate: link.rx_rate,
+        tx_bitrate: link.tx_rate,
+        tx_failed: link.tx_failed,
+        rx_packets: counters.map(|c| clamp(c.rx_packets)),
+        tx_packets: counters.map(|c| clamp(c.tx_packets)),
+        ..Default::default()
     }
 }
 
@@ -986,6 +1118,28 @@ impl WirelessNetIface for Mt76Iface {
     fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
         self.native_wowlan_support()
     }
+    /// mt7921 `wiphy->max_sched_scan_*`: the network-list offload request
+    /// (one plan, MT76_CONNAC_MAX_SCHED_SCAN_SSID probe SSIDs,
+    /// MT76_CONNAC_MAX_SCAN_MATCH match sets).
+    fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
+        Some(crate::mt7921::wowlan_nlo::SCHED_LIMITS)
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        true
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        request: narf_wireless::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.start_sched_scan_native(authority, request).await
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        self.stop_sched_scan_native(authority).await
+    }
     fn wowlan_net_detect_limits(&self) -> Option<narf_wireless::SchedScanSupport> {
         Some(crate::mt7921::wowlan_nlo::LIMITS)
     }
@@ -1090,6 +1244,7 @@ impl WirelessNetIface for Mt76Iface {
             Vec::new()
         };
         let _control = self.control.lock().await;
+        self.end_sched_scan().await?;
         if self.link_up() {
             if req.random_mac.is_some() {
                 return Err(WirelessError::Busy);
@@ -1110,6 +1265,7 @@ impl WirelessNetIface for Mt76Iface {
                 }
             };
             let mut found = Vec::new();
+            let mut beaconed = Vec::new();
             if !channels.is_empty() {
                 let report = scan_boot_with_options(
                     &channels,
@@ -1122,6 +1278,7 @@ impl WirelessNetIface for Mt76Iface {
                 .await
                 .map_err(map_error)?;
                 found = report.bss;
+                beaconed = report.beaconed;
             }
             let six_ids = six_ghz_scan_ids(&req, &requested_6ghz, &found);
             if !six_ids.is_empty() {
@@ -1137,19 +1294,11 @@ impl WirelessNetIface for Mt76Iface {
                 .await
                 .map_err(map_error)?;
                 found.extend(report.bss);
+                beaconed.extend(report.beaconed);
             }
-            let results = found
-                .iter()
-                .map(|bss| BssInfo {
-                    bssid: bss.bssid,
-                    ssid: bss.ssid.clone(),
-                    frequency_mhz: scan_frequency(bss).unwrap_or(0),
-                    channel: u32::from(bss.channel),
-                    rssi: bss.signal_dbm.unwrap_or(-128),
-                    security: scan_security(bss),
-                })
-                .collect();
+            let results = found.iter().map(bss_info).collect();
             *self.scan_cache.lock() = found;
+            *self.scan_beaconed.lock() = beaconed;
             Ok(results)
         }
         .await;
@@ -1189,6 +1338,9 @@ impl WirelessNetIface for Mt76Iface {
         if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
+        self.end_sched_scan()
+            .await
+            .inspect_err(|error| note_failure("associate: scheduled-scan stop", error))?;
         let six = self
             .validate_join(&req)
             .inspect_err(|error| note_failure("associate: join validation", error))?;
@@ -1199,25 +1351,32 @@ impl WirelessNetIface for Mt76Iface {
             return Err(WirelessError::Busy);
         }
         let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
-        let (bss, security) = self
-            .resolve_join(&req, security, six)
+        let (bss, security, heard_beacon) = self
+            .resolve_join(&req, security, six, true)
             .inspect_err(|error| note_failure("associate: BSS/security resolution", error))?;
         {
             use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
             // Stable under `control`: SET_INTERFACE also takes that lock.
             let p2p_client = self.current_iftype() == 8;
-            let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
-                .await
-                .map_err(|error| {
-                    note_failure("associate: firmware join/handshake", &error);
-                    match error {
-                        Error::Bounds => WirelessError::InvalidArgs,
-                        Error::Busy => WirelessError::Busy,
-                        Error::Timeout => WirelessError::Timeout,
-                        Error::Authority => WirelessError::Denied,
-                        _ => WirelessError::HardwareError,
-                    }
-                })?;
+            let aid = associate_boot_station_as(
+                &bss,
+                &req.ssid,
+                security,
+                &req.ie,
+                p2p_client,
+                heard_beacon,
+            )
+            .await
+            .map_err(|error| {
+                note_failure("associate: firmware join/handshake", &error);
+                match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                }
+            })?;
             let _ = aid;
             let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
             let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
@@ -1261,6 +1420,167 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     fn supports_handshake_offload(&self) -> bool {
+        true
+    }
+
+    /// cfg80211 CONNECT on a connected station with PREV_BSSID: mac80211
+    /// reassociates. The netdev stays up through the move; the new
+    /// association completes with its own SAE/4-way handshake.
+    fn supports_roam(&self) -> bool {
+        true
+    }
+
+    async fn roam(&self, mut req: AssociateRequest) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        if !self.station_role() {
+            return Err(WirelessError::NotSupported);
+        }
+        let current = (*self.associated_bssid.lock()).ok_or(WirelessError::InvalidArgs)?;
+        let six = self
+            .validate_join(&req)
+            .inspect_err(|error| note_failure("roam: join validation", error))?;
+        let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
+        let (bss, security, heard_beacon) = self
+            .resolve_join(&req, security, six, true)
+            .inspect_err(|error| note_failure("roam: BSS/security resolution", error))?;
+        let result = crate::mt7921::firmware_transport::reassociate_boot_station(
+            &bss,
+            &req.ssid,
+            security,
+            &req.ie,
+            heard_beacon,
+            current,
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                *self.associated_bssid.lock() = Some(req.bssid);
+                *self.link_stats.lock() = None;
+                self.cqm.lock().restart();
+                Ok(())
+            }
+            Err(error) => {
+                note_failure("roam: reassociation", &error);
+                // The old association is gone too: a failed roam is a
+                // link loss (cfg80211 reports it as a failed CONNECT).
+                self.teardown_needed.store(true, Ordering::Release);
+                self.clear_link();
+                use crate::mt7921::firmware_transport::Error;
+                Err(match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                })
+            }
+        }
+    }
+
+    /// The owner caches the SAE PMKSA itself (as a full-offload firmware
+    /// does), so userspace can delete or flush it but supplies none:
+    /// SET_PMKSA stays -EOPNOTSUPP.
+    fn del_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        use crate::mt7921::firmware_transport::{PmksaRequest, BOOT_PMKSA_REQUESTS};
+        let request = match (entry.bssid, entry.pmkid) {
+            (Some(bssid), _) => PmksaRequest::Bssid(bssid),
+            (None, Some(pmkid)) => PmksaRequest::Pmkid(pmkid),
+            (None, None) => return Err(22), // EINVAL
+        };
+        BOOT_PMKSA_REQUESTS.lock().push(request);
+        Ok(())
+    }
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        use crate::mt7921::firmware_transport::{PmksaRequest, BOOT_PMKSA_REQUESTS};
+        let mut requests = BOOT_PMKSA_REQUESTS.lock();
+        requests.clear();
+        requests.push(PmksaRequest::Flush);
+        Ok(())
+    }
+
+    /// mac80211's software CQM (`ieee80211_rx_bss_info`) over the AP's
+    /// Beacon signal, for one threshold or a cfg80211 threshold list.
+    fn supports_cqm_rssi(&self) -> bool {
+        true
+    }
+    fn supports_cqm_rssi_list(&self) -> bool {
+        true
+    }
+    fn set_cqm_rssi(&self, config: Option<narf_wireless::CqmRssiConfig>) -> Result<(), i32> {
+        self.cqm.lock().configure(config);
+        Ok(())
+    }
+
+    /// mac80211 `SUPPORTS_PS | SUPPORTS_DYNAMIC_PS` (mt792x_init_wiphy)
+    /// with `WIPHY_FLAG_PS_ON_BY_DEFAULT`: power save starts on.
+    fn power_save_default(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    /// `ieee80211_set_power_mgmt` -> `BSS_CHANGED_PS` ->
+    /// `mt7921_mcu_uni_bss_ps`: the owner applies it to the associated BSS
+    /// on its next packet step, and to every later association.
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        crate::mt7921::firmware_transport::BOOT_POWER_SAVE.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// mac80211 `sta_set_sinfo` for the AP: last and averaged signal and
+    /// per-chain signal of its frames, the last data-frame receive rate,
+    /// and the netdev's packet counters (the station's only traffic).
+    fn station_info(&self) -> Option<narf_wireless::StationInfo> {
+        if !self.station_role() || !self.link_up() {
+            return None;
+        }
+        let link = (*self.link_stats.lock())?;
+        let counters = narf_net::iface::lookup(&self.name).map(|iface| iface.stats);
+        Some(station_info_from(&link, counters.as_ref()))
+    }
+
+    /// The native owner runs WPA2-PSK with required or optional PMF (BIP
+    /// IGTK, protected robust management frames, SA Query) from the PMK
+    /// (`Security::Wpa2PskSelected`), so CONNECT may carry
+    /// NL80211_MFP_REQUIRED or _OPTIONAL with the matching RSNE.
+    fn supports_wpa2_mfp_offload(&self) -> bool {
+        true
+    }
+    fn supports_optional_mfp(&self) -> bool {
+        true
+    }
+    /// PSK-SHA256 (AKM 6) runs through the same owner (AES-128-CMAC EAPOL
+    /// MIC, SHA-256 KDF in the shared supplicant).
+    fn supports_psk_sha256_offload(&self) -> bool {
+        true
+    }
+
+    /// The ciphers the owner implements, as Linux mt7921 lists them
+    /// (mt76 `cipher_suites` minus WEP/TKIP, which the owner does not run):
+    /// CCMP-128/256 and GCMP-128/256 data keys in hardware
+    /// (`MCU_CIPHER_AES_CCMP`/`CCMP_256`/`GCMP`/`GCMP_256`), the AES-CMAC
+    /// IGTK in hardware, and BIP-CMAC-256 / BIP-GMAC-128/256 verified in
+    /// software, as mac80211 does when mt7921_set_key refuses them.
+    /// Advertising AES-CMAC is what gives wpa_supplicant
+    /// WPA_DRIVER_CAPA_ENC_BIP, without which a profile with the default
+    /// `pmf` never asks for PMF.
+    fn cipher_suites(&self) -> &'static [u32] {
+        &[
+            narf_wireless::CIPHER_SUITE_CCMP,
+            narf_wireless::CIPHER_SUITE_CCMP_256,
+            narf_wireless::CIPHER_SUITE_GCMP,
+            narf_wireless::CIPHER_SUITE_GCMP_256,
+            narf_wireless::CIPHER_SUITE_AES_CMAC,
+            narf_wireless::CIPHER_SUITE_BIP_CMAC_256,
+            narf_wireless::CIPHER_SUITE_BIP_GMAC_128,
+            narf_wireless::CIPHER_SUITE_BIP_GMAC_256,
+        ]
+    }
+
+    /// The native station owner runs SAE (hunting-and-pecking and
+    /// hash-to-element), the 4-way handshake and management-frame protection
+    /// from a password (`Security::Wpa3Sae`), which is what
+    /// NL80211_EXT_FEATURE_SAE_OFFLOAD promises: wpa_supplicant then keeps
+    /// SAE for this wiphy and passes NL80211_ATTR_SAE_PASSWORD in CONNECT.
+    fn supports_sae_offload(&self) -> bool {
         true
     }
 
@@ -1362,6 +1682,18 @@ fn scan_channels(req: &ScanRequest, bands: u8, six: bool) -> Result<Vec<u8>, Wir
         channels.push(value);
     }
     Ok(channels)
+}
+
+/// A native scan result as cfg80211 reports it.
+fn bss_info(bss: &ScanBss) -> BssInfo {
+    BssInfo {
+        bssid: bss.bssid,
+        ssid: bss.ssid.clone(),
+        frequency_mhz: scan_frequency(bss).unwrap_or(0),
+        channel: u32::from(bss.channel),
+        rssi: bss.signal_dbm.unwrap_or(-128),
+        security: scan_security(bss),
+    }
 }
 
 /// A scan result's centre frequency in its own band.
@@ -1577,7 +1909,7 @@ pub(crate) fn remove_scan_iface() {
     iface.withdraw_p2p_group();
     iface.withdraw_p2p_go();
     iface.withdraw_p2p_metadata();
-    iface.scan_cache.lock().clear();
+    iface.clear_scan_cache();
     narf_wireless::registry::unregister(&iface.name);
     if let Some(cap) = iface.registration_cap.lock().take() {
         narf_net::registry().unregister_for_handle(&cap);
@@ -2060,7 +2392,7 @@ mod tests {
             || iface.supports_external_supplicant()
             || iface.supports_userspace_mlme()
             || !info.modes.contains(WirelessModes::AP)
-            || iface.supports_sae_offload()
+            || !iface.supports_sae_offload()
             || iface.max_scan_ssids() != 4
             || iface.max_scan_ie_len() != 600
             || !iface.supports_scan_random_mac()

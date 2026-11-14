@@ -31,8 +31,9 @@ pub(crate) fn dcf_sleep_requested() -> bool {
 #[path = "amdgpu_navi48_thermal.rs"]
 pub mod thermal;
 
-/// Linux's delayed SW CTF confirmation and the existing orderly worker's
-/// bounded sync budget. Power-off never runs from an IH or SMU call frame.
+/// Linux's delayed SW CTF confirmation and the `ms_until_forced` of the
+/// hardware-protection power-off. Power-off never runs from an IH or SMU
+/// call frame.
 pub const SWCTF_DELAY_MS: u64 = 50;
 pub const FORCED_POWEROFF_MS: u64 = 10_000;
 static HOT_NOTIFIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

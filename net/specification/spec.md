@@ -1191,6 +1191,14 @@ On such an egress `tcp::core::pump_send` sends one segment at a time:
 - `TxQueue::run_wakeups` resumes waiters once per wake (`tcp::core::tx_resume`).
   A connection that has waited `TX_WAIT_PROBE_NS` (10 ms) without a wake
   offers its segment again from the TCP timer tick.
+- The sender never re-offers in a loop: the queue's stopped flag is read
+  before a segment is marked or a frame built, one immediate re-offer is
+  allowed after a refusal (for a wake that raced it), and after that the
+  connection parks whatever the flag says. A binding whose queue object the
+  driver has replaced is dropped and made again from the next frame.
+- `txq::stats` counts, and one line per second at most reports, a connection
+  refused 64 times in a row, a connection waiting a second for its queue, a
+  queue stopped for a second, and a frame copied because its pool was empty.
 
 Traffic that is not new TCP data uses the interface's ordinary send hook
 whether or not the queue is stopped. If the device refuses it there: a pure
@@ -1200,6 +1208,29 @@ fallback); an RTO retransmission is retried after
 are covered by their retransmission timers; RST and non-TCP frames are
 dropped and counted. Linux holds all of these in the qdisc instead; there is
 no qdisc here.
+
+### Transmit watchdog (`watchdog`, Linux `dev_watchdog` / `ndo_tx_timeout`)
+
+A NIC with a transmit timeout implements `NetdevWatchdog`
+(`tx_timed_out(now)`: a transmit waited past the timeout with carrier up and
+no recovery under way; `tx_timeout()`: count it and reset) and starts
+`DevWatchdog::start_for_device(weak, timeo_ns)` (or `start` for a handle that
+stops it on drop). Every `watchdog_timeo` a timer-wheel timer asks
+`tx_timed_out`; on a stall it queues `tx_timeout` on `system_wq` — a reset
+may wait, a timer callback may not. The device is held weakly and the
+watchdog stops with it. e1000, igb, ixgbe, r8169, forcedeth and igc use it.
+
+### Network timers
+
+Every network timer is a timer-wheel `timer_list`: one per TCP connection
+(retransmit, delayed ACK, zero-window probe, keepalive, TIME-WAIT / orphan
+FIN-WAIT-2, transmit-wait probe, deferred accept — armed for the earliest
+deadline, holding a TCB reference while pending), one per IPv4 fragment
+queue (`ip_expire`), one per resolving neighbour (`neigh_timer_handler`:
+retransmit every `RETRANS_TIME`, give up after the probe budget), and the
+neighbour table's periodic GC (`neigh_periodic_work`: every 15 s once the
+table holds `gc_thresh1` entries, drop FAILED entries and unused ones past
+`GC_STALETIME`). No sleep pump scans connections, queues or neighbours.
 
 ### Receive batches
 

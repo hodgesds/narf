@@ -55,6 +55,7 @@ const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const ERANGE: i32 = 34;
 const EALREADY: i32 = 114;
+const ERFKILL: i32 = 132;
 const SCAN: u8 = 33;
 const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
@@ -702,7 +703,7 @@ fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32], cipher_limit: usize) ->
 /// its own RSN element (CCMP, PSK, explicitly optional/required PMF), so the requested
 /// RSN element must describe that admitted suite. Required PMF needs an
 /// explicit complete RSNE; it is never inferred from a cipher advertisement.
-fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
+fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8, suites: &[u32]) -> Result<(), i32> {
     if ie.len() > 2048 {
         return Err(EINVAL);
     }
@@ -714,11 +715,15 @@ fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
     if rsn.next().is_some() {
         return Err(EOPNOTSUPP);
     }
-    let rsn = crate::rsn::RsnIe::decode_body(body).ok_or(EINVAL)?;
-    let ccmp = crate::rsn::Suite::standard(crate::rsn::CIPHER_CCMP_128);
-    if rsn.group_cipher != ccmp
-        || rsn.pairwise_ciphers != [ccmp]
-        || rsn.akms != [crate::rsn::Suite::standard(crate::rsn::AKM_PSK)]
+    let mut rsn = crate::rsn::RsnIe::decode_body(body).ok_or(EINVAL)?;
+    // The PTKSA/GTKSA replay-counter counts describe the sender's receive
+    // counters, not the suite: wpa_supplicant sets sixteen PTKSA counters
+    // (0x000c) toward every WMM AP (`rsn_supp_capab`).
+    rsn.rsn_capabilities &= !(crate::rsn::RSN_CAP_PTKSA_REPLAY_COUNTER_MASK
+        | crate::rsn::RSN_CAP_GTKSA_REPLAY_COUNTER_MASK);
+    // One pairwise and one group data cipher, each among the wiphy's.
+    if !station_ciphers(&rsn, suites)
+        || rsn.akms != [crate::rsn::Suite::standard(akm)]
         || mfp == 0
             && rsn.rsn_capabilities
                 & (crate::rsn::RSN_CAP_MFP_REQUIRED | crate::rsn::RSN_CAP_MFP_CAPABLE)
@@ -741,11 +746,45 @@ fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
             || !rsn.pmkids.is_empty()
             || rsn.group_management_cipher.is_some_and(|cipher| {
                 cipher != crate::rsn::Suite::standard(crate::rsn::CIPHER_BIP_CMAC_128)
+                    && !suites.contains(&suite_value(cipher))
             }))
     {
         return Err(EOPNOTSUPP);
     }
     Ok(())
+}
+
+/// A suite selector as its nl80211 `u32` (`WLAN_CIPHER_SUITE_*`).
+fn suite_value(suite: crate::rsn::Suite) -> u32 {
+    u32::from_be_bytes([suite.oui[0], suite.oui[1], suite.oui[2], suite.suite_type])
+}
+
+/// A station RSNE's single pairwise cipher, group cipher and (default or
+/// named) group management cipher are valid RSNA suites the wiphy lists.
+fn station_ciphers(rsn: &crate::rsn::RsnIe, suites: &[u32]) -> bool {
+    crate::rsn::Ciphers::of_station(rsn).is_some_and(|ciphers| {
+        [ciphers.pairwise, ciphers.group]
+            .into_iter()
+            .all(|cipher| suites.contains(&(0x000f_ac00 | u32::from(cipher))))
+    })
+}
+
+/// The supplicant's RSNE in the CONNECT elements, if any, names the same
+/// pairwise and group ciphers as NL80211_ATTR_CIPHER_SUITES_PAIRWISE /
+/// CIPHER_SUITE_GROUP (the offloading owner follows the RSNE).
+fn rsne_names(ie: Option<&[u8]>, pairwise: Option<u32>, group: Option<u32>) -> bool {
+    let Some(Ok(ies)) = ie.map(elements) else {
+        return true;
+    };
+    ies.iter().filter(|(id, _)| *id == 48).all(|(_, body)| {
+        crate::rsn::RsnIe::decode_body(body)
+            .as_ref()
+            .and_then(crate::rsn::Ciphers::of_station)
+            .is_some_and(|ciphers| {
+                pairwise == Some(0x000f_ac00 | u32::from(ciphers.pairwise))
+                    && group == Some(0x000f_ac00 | u32::from(ciphers.group))
+            })
+    })
 }
 
 /// Split an information-element list (`validate_ie_attr`: well-formed
@@ -849,7 +888,11 @@ struct ConnectCaps {
     control_port_over_nl80211: bool,
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
+    /// The PSK owner also runs PSK-SHA256 (AKM 6) from the PMK.
+    psk_sha256: bool,
     connected: bool,
+    /// The driver implements reassociation (`supports_roam`).
+    roam: bool,
     max_scan_ssids: u8,
     max_scan_ie_len: u16,
     scan_random_sn: bool,
@@ -867,7 +910,9 @@ impl ConnectCaps {
                 || iface.supports_ap_authenticator(),
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
+            psk_sha256: iface.supports_psk_sha256_offload(),
             connected: iface.connected_bssid().is_some(),
+            roam: iface.supports_roam(),
             max_scan_ssids: iface.max_scan_ssids(),
             max_scan_ie_len: iface.max_scan_ie_len(),
             scan_random_sn: iface.supports_scan_random_sn(),
@@ -894,7 +939,9 @@ fn parse_operation(
             control_port_over_nl80211: false,
             cipher_suites: &[],
             scan_random_mac: false,
+            psk_sha256: false,
             connected: false,
+            roam: false,
             max_scan_ssids: 16,
             max_scan_ie_len: 512,
             scan_random_sn: false,
@@ -1036,7 +1083,13 @@ fn parse_operation_caps(
             let suites: &[u32] = if caps.external {
                 caps.cipher_suites
             } else if psk_offload || sae_offload {
-                &[crate::CIPHER_SUITE_CCMP]
+                // An offloading wiphy without a list runs CCMP-128 (the
+                // `cipher_suites` default).
+                if caps.cipher_suites.is_empty() {
+                    &[crate::CIPHER_SUITE_CCMP]
+                } else {
+                    caps.cipher_suites
+                }
             } else {
                 &[]
             };
@@ -1052,18 +1105,30 @@ fn parse_operation_caps(
             if attr(attrs, 277).is_some() && !sae_offload {
                 return Err(EINVAL);
             }
-            // CCMP (00-0F-AC:4) pairwise+group are required for every offload
-            // suite this profile accepts.
-            let ccmp = u32_attr(attrs, 73)? == Some(0x000fac04)
-                && u32_attr(attrs, 74)? == Some(0x000fac04);
+            // The offloading owner runs one pairwise and one group data
+            // cipher (CCMP-128/256, GCMP-128/256) that the wiphy lists;
+            // `crypto_suites` above checked membership.
+            let data = |value: Option<u32>| {
+                value.is_some_and(|suite| {
+                    suite >> 8 == 0x000fac && crate::rsn::data_cipher_key_len(suite as u8).is_some()
+                })
+            };
+            let ccmp = attr(attrs, 73).is_some_and(|raw| raw.len() == 4)
+                && data(u32_attr(attrs, 73)?)
+                && data(u32_attr(attrs, 74)?)
+                && rsne_names(attr(attrs, 42), u32_attr(attrs, 73)?, u32_attr(attrs, 74)?);
             let cred = if let Some(password) = attr(attrs, 277) {
-                // WPA3-SAE offload: SAE auth, RSN (WPA2 versions), AKM SAE
-                // (00-0F-AC:8), CCMP, and mandatory management-frame protection.
+                // WPA3-SAE offload: SAE auth, AKM SAE (00-0F-AC:8), CCMP, and
+                // mandatory management-frame protection. wpa_supplicant's
+                // `wpa_ver_supported` sends NL80211_WPA_VERSION_3 (4) for an
+                // SAE AKM once the family's max attribute covers
+                // NL80211_ATTR_SAE_PASSWORD, and NL80211_WPA_VERSION_2 below
+                // that.
                 if !sae_offload
                     || auth != 4
                     || mfp != 1
                     || !ccmp
-                    || u32_attr(attrs, 75)? != Some(2)
+                    || !matches!(u32_attr(attrs, 75)?, Some(2 | 4))
                     || primary_akm(attrs) != Some(0x000fac08)
                     || attr(attrs, 254).is_some()
                 {
@@ -1074,18 +1139,25 @@ fn parse_operation_caps(
                 }
                 Credential::Sae(Zeroizing::new(password.to_vec()))
             } else if let Some(pmk) = attr(attrs, 254) {
-                // WPA2-PSK offload: OPEN auth, AKM PSK and CCMP. Required
-                // PMF needs the driver's complete firmware-offload contract.
+                // WPA2-PSK offload: OPEN auth, AKM PSK (or PSK-SHA256 when
+                // the owner runs it) and CCMP. Required PMF needs the
+                // driver's complete firmware-offload contract.
+                // wpa_pick_key_mgmt prefers PSK-SHA256 whenever the AP and
+                // the profile allow it; an owner without it refuses AKM 6.
+                let akm = match primary_akm(attrs) {
+                    Some(0x000fac02) => crate::rsn::AKM_PSK,
+                    Some(0x000fac06) if caps.psk_sha256 => crate::rsn::AKM_PSK_SHA256,
+                    _ => return Err(EOPNOTSUPP),
+                };
                 if !psk_offload
                     || auth != 0
                     || mfp == 1 && !caps.psk_mfp_offload
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
-                    || primary_akm(attrs) != Some(0x000fac02)
                 {
                     return Err(EOPNOTSUPP);
                 }
-                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp)?;
+                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp, akm, suites)?;
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else if caps.external
                 && (attr(attrs, 70).is_some()
@@ -1128,6 +1200,13 @@ fn parse_operation_caps(
             };
             if let Some(ie) = attr(attrs, 42) {
                 elements(ie)?;
+            }
+            // cfg80211_connect: a connected station takes a new CONNECT only
+            // as a reassociation. A driver that cannot roam answers
+            // -EALREADY here, and wpa_supplicant disconnects and retries,
+            // instead of a failed CONNECT event while the old link stays up.
+            if caps.connected && !caps.roam {
+                return Err(EALREADY);
             }
             Ok(Operation::Connect {
                 ssid: ssid.to_vec(),
@@ -1248,15 +1327,8 @@ fn route(
     }
     if command == 27 {
         request_regulatory_country(bytes, &context, crate::reg::db::select_linux_country)?;
-        let domain = station::global_regdom()?;
-        let mut attrs = Vec::new();
-        let mut alpha2 = domain.alpha2.to_vec();
-        alpha2.push(0);
-        push_attr(&mut attrs, 33, &alpha2);
-        // NL80211_REGDOM_SET_BY_USER, NL80211_REGDOM_TYPE_COUNTRY.
-        push_attr(&mut attrs, 48, &[1]);
-        push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
-        publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+        station::global_regdom()?;
+        publish_reg_change(REG_INITIATOR_USER);
         return Ok(Vec::new());
     }
     if matches!(
@@ -1330,6 +1402,10 @@ fn route(
     let admin = authority(&context, iface.as_ref())?;
     if command == DISCONNECT {
         station::check_owner(iface.name(), context.portid)?;
+    } else if crate::rfkill::blocked(iface.wiphy_id()) {
+        // An rfkill-blocked wiphy has its interfaces shut down
+        // (`cfg80211_rfkill_block_work`); bringing one up is -ERFKILL.
+        return Err(ERFKILL);
     }
     let operation = parse_operation_caps(
         command,
@@ -1360,6 +1436,55 @@ fn route(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// `enum nl80211_reg_initiator`.
+const REG_INITIATOR_CORE: u8 = 0;
+const REG_INITIATOR_USER: u8 = 1;
+const REG_INITIATOR_COUNTRY_IE: u8 = 3;
+
+/// `nl80211_common_reg_change_event`: NL80211_CMD_REG_CHANGE for the
+/// current global domain on the "regulatory" group.
+fn publish_reg_change(initiator: u8) {
+    let Ok(domain) = station::global_regdom() else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    let mut alpha2 = domain.alpha2.to_vec();
+    alpha2.push(0);
+    push_attr(&mut attrs, 33, &alpha2); // NL80211_ATTR_REG_ALPHA2
+    push_attr(&mut attrs, 48, &[initiator]); // NL80211_ATTR_REG_INITIATOR
+                                             // NL80211_ATTR_REG_TYPE: COUNTRY (0) or WORLD (1).
+    push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
+    publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+}
+
+/// The alpha2 of a Country element (7) among `ies`.
+fn country_element(ies: &[u8]) -> Option<[u8; 2]> {
+    elements(ies)
+        .ok()?
+        .into_iter()
+        .find(|(id, body)| *id == 7 && body.len() >= 3)
+        .map(|(_, body)| [body[0], body[1]])
+}
+
+/// cfg80211 `regulatory_hint_country_ie` from `__cfg80211_connect_result`:
+/// the connected AP's Country element selects its country's rules unless
+/// the user chose a country.
+pub(crate) fn hint_country_ie(ies: &[u8]) {
+    if let Some(alpha2) = country_element(ies) {
+        if matches!(crate::reg::db::hint_country_ie(alpha2), Ok(true)) {
+            publish_reg_change(REG_INITIATOR_COUNTRY_IE);
+        }
+    }
+}
+
+/// cfg80211 `regulatory_hint_disconnect`: a country taken from the AP's
+/// Country element is dropped with the connection.
+pub(crate) fn regulatory_disconnect() {
+    if matches!(crate::reg::db::restore_after_disconnect(), Ok(true)) {
+        publish_reg_change(REG_INITIATOR_CORE);
+    }
 }
 
 /// A country hint selects authenticated database data; it cannot supply rules,
@@ -4423,8 +4548,8 @@ async fn execute(
                     let cache = CACHE.lock();
                     let results = cache.iter().find(|c| c.matches(iface.name(), ns, index));
                     results.and_then(|c| {
-                        select_bss(
-                            c.results.iter().map(|(b, _)| b),
+                        select_bss_with_ies(
+                            c.results.iter().map(|(b, ies)| (b, ies.as_slice())),
                             &ssid,
                             bssid,
                             frequency_mhz,
@@ -4455,11 +4580,7 @@ async fn execute(
                         })
                         .await?;
                     results.truncate(256);
-                    selected = select_bss(results.iter(), &ssid, bssid, frequency_mhz, akm);
-                    if !authorized_link(&admin, iface.as_ref(), ns, index) {
-                        return Err(crate::WirelessError::Denied);
-                    }
-                    let entries = results
+                    let entries: Vec<(crate::BssInfo, Vec<u8>)> = results
                         .into_iter()
                         .map(|bss| {
                             let ies = iface
@@ -4468,6 +4589,16 @@ async fn execute(
                             (bss, ies)
                         })
                         .collect();
+                    selected = select_bss_with_ies(
+                        entries.iter().map(|(b, ies)| (b, ies.as_slice())),
+                        &ssid,
+                        bssid,
+                        frequency_mhz,
+                        akm,
+                    );
+                    if !authorized_link(&admin, iface.as_ref(), ns, index) {
+                        return Err(crate::WirelessError::Denied);
+                    }
                     if let Some(cache) = CACHE
                         .lock()
                         .iter_mut()
@@ -4515,6 +4646,14 @@ async fn execute(
                 let _ = iface.disassociate().await;
             }
             let status: u16 = if result.is_ok() && still_live { 0 } else { 1 };
+            if status == 0 {
+                if let Some(ies) = selected
+                    .as_ref()
+                    .and_then(|bss| iface.scan_information_elements(bss.bssid))
+                {
+                    hint_country_ie(&ies);
+                }
+            }
             if let Some(index) = wiphy_index(iface.as_ref()) {
                 push_attr(&mut attrs, 1, &index.to_ne_bytes()); // NL80211_ATTR_WIPHY
             }
@@ -4560,6 +4699,7 @@ async fn execute(
             if !live || iface.disassociate().await.is_err() {
                 return;
             }
+            regulatory_disconnect();
             if iface.reports_disconnect_events() {
                 return;
             }
@@ -4646,6 +4786,57 @@ fn select_bss<'a>(
         })
         .max_by_key(|b| b.rssi)
         .cloned()
+}
+
+/// [`select_bss`] over results that still carry each BSS's elements.
+///
+/// A WPA3-Personal transition BSS lists PSK and SAE in one RSN element and a
+/// scan summary classifies it as WPA2. wpa_supplicant prefers SAE there, so
+/// an SAE CONNECT must find that BSS too: when no WPA3-classified BSS
+/// matches, a WPA2-classified one whose RSN element offers an SAE AKM does.
+fn select_bss_with_ies<'a>(
+    results: impl Iterator<Item = (&'a crate::BssInfo, &'a [u8])> + Clone,
+    ssid: &[u8],
+    bssid: Option<[u8; 6]>,
+    frequency_mhz: Option<u32>,
+    akm: Akm,
+) -> Option<crate::BssInfo> {
+    select_bss(
+        results.clone().map(|(bss, _)| bss),
+        ssid,
+        bssid,
+        frequency_mhz,
+        akm,
+    )
+    .or_else(|| {
+        if akm != Akm::Sae {
+            return None;
+        }
+        results
+            .filter(|(b, ies)| {
+                b.ssid == ssid
+                    && bssid.is_none_or(|address| address == b.bssid)
+                    && frequency_mhz.is_none_or(|freq| freq == b.frequency_mhz)
+                    && matches!(b.security, crate::scan::BssSecurity::Wpa2)
+                    && rsn_offers_sae(ies)
+            })
+            .max_by_key(|(b, _)| b.rssi)
+            .map(|(b, _)| b.clone())
+    })
+}
+
+/// Whether the RSN element among `ies` lists an SAE AKM (00-0F-AC:8 or :24).
+fn rsn_offers_sae(ies: &[u8]) -> bool {
+    elements(ies)
+        .ok()
+        .and_then(|list| list.into_iter().find(|(id, _)| *id == 48))
+        .and_then(|(_, body)| crate::rsn::RsnIe::decode_body(body))
+        .is_some_and(|rsn| {
+            rsn.akms.iter().any(|akm| {
+                *akm == crate::rsn::Suite::standard(crate::rsn::AKM_SAE)
+                    || *akm == crate::rsn::Suite::standard(crate::rsn::AKM_SAE_EXT_KEY)
+            })
+        })
 }
 
 fn scan_reply(

@@ -320,6 +320,65 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Top of the running CPU's #DF IST stack. The #PF path switches onto it to
+/// report a kernel-stack overflow with room to print (Linux `page_fault_oops`
+/// does `call_on_stack(__this_cpu_ist_top_va(DF), handle_stack_overflow)`).
+pub fn df_ist_top() -> u64 {
+    use core::sync::atomic::Ordering;
+    let cpu = narf_arch::x86_64::cpu::current_cpu() as usize;
+    let mut tss = TSS_PTRS
+        .get(cpu)
+        .map(|p| p.load(Ordering::Acquire))
+        .unwrap_or_default();
+    if tss.is_null() {
+        tss = core::ptr::addr_of_mut!(TSS);
+    }
+    // SAFETY: `tss` is this CPU's live TSS (or the BSP static); `ist[IST_DF-1]`
+    // is at byte offset 36 + 8 * (IST_DF - 1), read unaligned as `Tss` is packed.
+    unsafe {
+        tss.cast::<u8>()
+            .add(36 + (IST_DF as usize - 1) * 8)
+            .cast::<u64>()
+            .read_unaligned()
+    }
+}
+
+/// Move this CPU's four IST stacks (NMI, #DF, #MC, #VC) onto guarded
+/// `KernelStack`s (Linux keeps them in `cpu_entry_area` with guard pages), so
+/// an IST handler that overflows faults instead of running into the next
+/// stack of the per-CPU block. The boot-time stacks stay in force until this
+/// runs: the kernel-stack slot is reserved after the GDT/TSS are up.
+///
+/// Each TSS slot is one aligned 8-byte store, so an IST exception taken while
+/// this runs uses either the old or the new stack, both valid; the old stacks
+/// are static / leaked and never freed.
+pub fn guard_ist_stacks() {
+    use core::sync::atomic::Ordering;
+    let cpu = narf_arch::x86_64::cpu::current_cpu() as usize;
+    let mut tss = TSS_PTRS
+        .get(cpu)
+        .map(|p| p.load(Ordering::Acquire))
+        .unwrap_or_default();
+    if tss.is_null() {
+        tss = core::ptr::addr_of_mut!(TSS);
+    }
+    for i in 0..4 {
+        let Ok(stack) = narf_memory::kstack::KernelStack::alloc(IST_STACK_BYTES) else {
+            return; // keep the remaining boot-time stacks
+        };
+        let top = stack.top() & !0xF;
+        core::mem::forget(stack); // per-CPU, lives as long as the CPU
+                                  // SAFETY: `tss` is this CPU's live TSS; `ist[i]` is at byte offset
+                                  // 36 + 8 i (packed, so unaligned write), read by the CPU on IST entry.
+        unsafe {
+            tss.cast::<u8>()
+                .add(36 + i * 8)
+                .cast::<u64>()
+                .write_unaligned(top);
+        }
+    }
+}
+
 /// Retarget the running CPU's kernel-entry stack (TSS.rsp0 + the SYSCALL
 /// `gs:[8]` kernel_stack_top) to `top`, or restore the per-CPU boot baseline
 /// when `top == 0`. Installed into the scheduler via `set_kernel_stack_hook`

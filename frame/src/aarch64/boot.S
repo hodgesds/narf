@@ -127,6 +127,21 @@ _start:
     msr  cntkctl_el1, x0
     isb
 
+    /* Paint the boot stack and the guard below it, so the kernel can tell how
+     * deep the stack went (`boot_stack::usage`) and whether it ran off the
+     * bottom. Done on the copy, after any physical relocation. */
+    adrp x0, boot_stack_guard
+    add  x0, x0, #:lo12:boot_stack_guard
+    adrp x1, stack_top
+    add  x1, x1, #:lo12:stack_top
+    movz x2, #0x5441
+    movk x2, #0x4B53, lsl #16
+    movk x2, #0x5441, lsl #32
+    movk x2, #0x4B53, lsl #48       /* "ATSKATSK" */
+1:  str  x2, [x0], #8
+    cmp  x0, x1
+    b.lo 1b
+
     /* Stack in .boot.data. Physical base. */
     adrp x0, stack_top
     add  x0, x0, #:lo12:stack_top
@@ -155,6 +170,11 @@ _start:
     /* A pinned slide skips entropy entirely; it still passes through the mask
      * and alignment below, so it cannot escape the window. */
     ldr  x1, =KASLR_SLIDE_FIXED
+    cbnz x1, .Lkaslr_have
+    /* Or one patched into the linked image (`NARF_KASLR_SLIDE`, xtask), so a
+     * slide-dependent failure reproduces without a rebuild. */
+    adrp x1, kaslr_slide_override
+    ldr  x1, [x1, #:lo12:kaslr_slide_override]
     cbnz x1, .Lkaslr_have
 
     /* ID_AA64ISAR0_EL1.RNDR is bits [63:60]. */
@@ -612,6 +632,29 @@ _start_rust_entry:
     cmp  w0, w1
     b.eq .Lfdt_have
 
+    /* 2b. Where xtask's QEMU runner loads it for a raw-ELF boot: the first
+     * 1 MiB boundary at or above both the image's physical end and
+     * 0x4800_0000 (`dtb_load_addr` in build/xtask/src/aarch64_initrd.rs).
+     * Once the image reaches past 0x5000_0000 the scan below cannot see it,
+     * so this is the step that finds it. Probed only below 0x8000_0000, the
+     * 1 GiB of RAM the boot map treats as present. */
+    ldr  x2, =__kernel_end              /* link-time phys: the value */
+    movz x3, #0x4800, lsl #16
+    cmp  x2, x3
+    csel x2, x2, x3, hi
+    movz x3, #0xF, lsl #16
+    movk x3, #0xFFFF                    /* x3 = 1 MiB - 1 */
+    add  x2, x2, x3
+    and  x2, x2, #0xFFFFFFFFFFF00000
+    movz x3, #0x8000, lsl #16
+    cmp  x2, x3
+    b.hs 4f
+    ldr  w0, [x2]
+    rev  w0, w0
+    cmp  w0, w1
+    b.eq .Lfdt_have
+4:
+
     /* 3. Scan [0x4000_0000, 0x5000_0000) on 4-byte strides. Bounded, and the
      * same window the Rust fallback uses. */
     movz x2, #0x4000, lsl #16
@@ -1067,6 +1110,34 @@ build_ram_l2:
 
 .section .boot.data, "aw"
 .align 12
+/* The boot CPU's stack. It runs the whole boot — every initcall — and then the
+ * boot CPU's executor and the interrupts taken on it, so it is the kernel's
+ * deepest-used fixed stack.
+ *
+ * It used to sit directly ABOVE the boot page tables (`l0_lo` .. `l2_img`): a
+ * frame that reached past its bottom wrote straight into the kernel image's
+ * L2 descriptors. `block_on_spin(provision_boot_radio())` in an initcall did,
+ * clearing single entries; at KASLR slides that put kernel text under them
+ * the next fetch there took a translation fault.
+ *
+ * Now it sits BELOW them, so it grows away from them, behind a painted guard
+ * that the kernel checks after boot (`boot_stack::usage`): running into the
+ * guard is reported by name instead of corrupting whatever lies below. The
+ * stub's 2 MiB block mappings cannot leave a single 4 KiB page unmapped as a
+ * hardware guard; a painted guard is what this layout can check. Sized from
+ * the measured high-water mark with headroom — see `BOOT_STACK_SIZE`. */
+.equ BOOT_STACK_GUARD, 4096 * 4
+.equ BOOT_STACK_SIZE,  4096 * 32
+.global boot_stack_guard
+boot_stack_guard:
+    .skip BOOT_STACK_GUARD
+.global stack_bottom
+stack_bottom:
+    .skip BOOT_STACK_SIZE
+.global stack_top
+stack_top:
+
+.align 12
 l0_lo:
     .skip 4096
 l1_lo:
@@ -1105,7 +1176,10 @@ fdt_initrd_end:    .quad 0
 fdt_span:          .quad 0
 fdt_floor:         .quad 0
 
-stack_bottom:
-    .skip 4096 * 16
-.global stack_top
-stack_top:
+/* Debug: a slide to use instead of drawing entropy, 0 = draw. xtask writes it
+ * into the linked image from `NARF_KASLR_SLIDE` (`kaslr_knob::set_slide`), and
+ * the stub masks and aligns it like a drawn value, so it cannot leave the
+ * window. Not zeroed at boot: its value comes from the file. */
+.global kaslr_slide_override
+kaslr_slide_override: .quad 0
+

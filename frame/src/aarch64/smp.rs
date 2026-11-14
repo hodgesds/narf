@@ -265,6 +265,9 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     unsafe {
         narf_arch::aarch64::sysreg::write_vbar_el1(vbar);
     }
+    // 2b. This CPU's kernel-stack overflow stack (TPIDR_EL1), before it can
+    //     run a task on a guarded stack.
+    crate::aarch64::trap::init_overflow_stack();
 
     // 3. Per-CPU GIC init (v2 or v3): cpu interface + SGI/PPI bank +
     //    timer-PPI enable.
@@ -298,5 +301,6 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //    this CPU's ready queue, attempts to steal from siblings,
     //    and halts on IRQ (WFI inside `halt_until_irq`) when there
     //    is nothing to run. Returns never.
-    narf_scheduler::run_forever();
+    // On a guarded stack: the trampoline's direct-mapped block has no guard.
+    super::super::kstack_overflow::run_executor_on_guarded_stack();
 }

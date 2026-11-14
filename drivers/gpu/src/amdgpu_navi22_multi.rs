@@ -203,7 +203,7 @@ const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
 const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_DISABLE_MASK
 const MPC_OUT_RATE_CONTROL: u32 = 1 << 9; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_MASK
 
-impl Pipeline {
+impl PipelineInner {
     fn odm_reg(&self, reg: u64) -> u64 {
         self.d2(reg + u64::from(self.route.pipe) * ODM_STRIDE)
     }
@@ -976,8 +976,9 @@ impl Group {
         if self.state != GroupState::At(Phase::Prepared) {
             return Err(Error::Busy);
         }
-        match self
-            .bring_up(power, pool, tables, board, links, aux, &draw)
+        // Boxed: the bring-up's state is tens of KiB; inline it sat in this
+        // future and every frame polling it.
+        match alloc::boxed::Box::pin(self.bring_up(power, pool, tables, board, links, aux, &draw))
             .await
         {
             Ok(outputs) => {
@@ -986,7 +987,7 @@ impl Group {
             }
             Err(error) => {
                 let phase = self.phase;
-                let _ = self.tear_down(tables, aux).await;
+                let _ = alloc::boxed::Box::pin(self.tear_down(tables, aux)).await;
                 self.state = GroupState::Failed { phase, error };
                 Err(error)
             }
@@ -1177,7 +1178,7 @@ impl Group {
         // prepare_bandwidth for the whole context: accelerated mode, the
         // clocks every stream needs, then the one watermark set.
         self.at(Phase::Bandwidth);
-        let lead = &mut self.members[0];
+        let lead: &mut PipelineInner = &mut self.members[0];
         lead.at(Step::Clocks);
         lead.regs.update(
             lead.nbio1 + BIOS_SCRATCH_6 * 4,
@@ -1647,7 +1648,7 @@ impl Group {
             let signal = self.requests[k].connector.signal;
             let dig = lease.route.stream;
             lend_clocks(&mut self.members, k);
-            let m = &mut self.members[k];
+            let m: &mut PipelineInner = &mut self.members[k];
             if m.reached >= Step::Plane && m.audio.record(dig).is_some() {
                 let _ = m.audio.stop(dig, &mut m.clocks).await;
             }

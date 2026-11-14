@@ -164,6 +164,11 @@ pub fn cpu_take_offline(
     // `hrtimers_cpu_dying`: its queue is gone, so are its timers — every
     // hrtimer still queued on the CPU's base moves to this CPU's base.
     narf_time::hrtimer::hrtimers_cpu_dying(id as usize);
+    // `tmigr_cpu_offline`: it leaves the timer-migration hierarchy (its
+    // group hands the migrator role on), then `timers_dead_cpu` moves its
+    // timer-wheel timers here too.
+    narf_time::timer_migration::tmigr_cpu_offline(id as usize);
+    narf_time::timer::timers_dead_cpu(id as usize);
     policy::notify_cpu_state(cpu, CpuState::Offline, None);
     Ok(())
 }

@@ -1,5 +1,5 @@
-//! The LED engine worker: a periodic task that advances the trigger engine
-//! ([`crate::triggers::tick`]) and applies queued external commands.
+//! The LED engine worker: periodic delayed work that advances the trigger
+//! engine ([`crate::triggers::tick`]) and applies queued external commands.
 //!
 //! # Why a mailbox
 //!
@@ -203,23 +203,44 @@ fn apply(idx: usize, action: u32, value: u32) {
     }
 }
 
-/// The periodic worker: every 100 ms apply queued commands and advance the
-/// trigger engine. Spawned once at boot by [`start_worker`].
-async fn worker() {
-    loop {
-        let deadline = narf_time::Deadline::after_ms(100);
-        narf_time::SleepUntil::new(deadline.as_instant()).await;
-        drain();
-        crate::triggers::tick();
-    }
+/// The engine's period.
+const PERIOD_MS: u64 = 100;
+
+/// The engine as delayed work (Linux runs LED triggers from timers and
+/// workqueues: `ledtrig-timer`'s `timer_list`, `led_set_brightness`'s
+/// `set_brightness_work`): every `PERIOD_MS` apply queued commands and
+/// advance the trigger engine, on `system_power_efficient_wq`. Applying a
+/// command may sleep (an I²C LED), which work may and a timer may not.
+static ENGINE_WORK: narf_scheduler::workqueue::DelayedWork =
+    narf_scheduler::workqueue::DelayedWork::new(
+        narf_scheduler::workqueue::WorkFn::Sync(engine_work_fn),
+        false,
+    );
+
+fn engine_work_fn(_: narf_scheduler::workqueue::WorkRef) {
+    drain();
+    crate::triggers::tick();
+    queue_engine();
 }
 
-/// Spawn the engine worker. Idempotent — a repeated initcall (the kernel-test
-/// harness runs initcalls more than once) does not stack workers.
+fn queue_engine() {
+    let delay = narf_time::timer::ns_to_jiffies(PERIOD_MS * 1_000_000);
+    // SAFETY: the delayed work is a static.
+    unsafe {
+        narf_scheduler::workqueue::queue_delayed_work(
+            narf_scheduler::workqueue::system_power_efficient_wq(),
+            &ENGINE_WORK,
+            delay,
+        )
+    };
+}
+
+/// Start the engine. Idempotent — a repeated initcall (the kernel-test
+/// harness runs initcalls more than once) does not stack engines.
 pub fn start_worker() {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    narf_scheduler::spawn(worker());
+    queue_engine();
 }
