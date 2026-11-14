@@ -28,19 +28,24 @@
 //!   (sn & 0x3f) << 2`). `ppsc->fwctrl_lps` is false (`rtl92de_mod_params`),
 //!   so no frame takes the LPS hardware-sequence rule. Every rate the
 //!   descriptor can put on air must be admitted by the `N92D` permission.
-//!   The composition is the 2.4 GHz legacy station: no HT rate, A-MPDU or
-//!   SGI is admitted.
+//!   HT is admitted on an HT profile: MCS0-7 (1T1R) / MCS0-15 (2T2R),
+//!   40 MHz, A-MPDU and short GI follow the 8723BE shape; 5 GHz TX stays
+//!   refused (the 5 GHz lane owns it).
 //! - RX (`_rtl_pci_rx_interrupt`, `rtl92d_rx_query_desc`): the payload at
 //!   `drvinfo + shift` of the RX buffer (the in-ring descriptor is not in
-//!   the buffer), legacy 20 MHz frames. The 92D RX descriptor has no C2H
-//!   bit and the PHY-status `rx_pwdb_all` decode is not composed (no RSSI
-//!   is reported; Linux's 92DE watchdog has its RA refresh commented out).
+//!   the buffer), HT frames on an HT profile (MCS0-7 / MCS0-15, 40 MHz,
+//!   A-MPDU) and legacy frames otherwise. The 92D RX descriptor has no C2H
+//!   bit; the PHY-status `rx_pwdb_all` decode (`dm::rx_pwdb` on the 28-byte
+//!   `rx_fwinfo_92d` ahead of the frame) feeds `Mpdu.pwdb` when `PHYST` is
+//!   set.
 //! - Interrupts: [`mac::enable_interrupt`] / [`mac::disable_interrupt`] and
 //!   the `_rtl_pci_interrupt` pass over `rtl92de_interrupt_recognized`
 //!   (`ISR & irq_mask[0]`, W1C; `intb` 0) at `0x120`/`0x124`/`0x128`.
 //! - Leisure PS: `rtl92de_mod_params.fwctrl_lps = false`, so
 //!   `rtl_lps_enter_core` returns at its first gate and nothing is sent;
-//!   software LPS (`swctrl_lps`, `rtl_swlps_*`) is not composed.
+//!   software LPS is composed as decisions only (`lps::swlps_beacon`
+//!   records the TIM decision; the RF sleep/awake execution has no NARF
+//!   primitive).
 //! - Join: `rtl_cam_reset_all_entry`, `rtl92de_set_network_type` with the
 //!   link, then `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)`: `HW_VAR_AID`,
 //!   the `REG_CR + 1` / BCN_CTRL / `0x422` envelope around
@@ -51,10 +56,14 @@
 //!   BCN_VALID receipt.
 //! - RA: `rtl92d_update_hal_rate_mask` (`H2C_RA_MASK`) bounded by the
 //!   permission's admitted rates; no BCN_CTRL write follows on this chip.
+//! - DM watchdog: `rtl92d_dm_watchdog` (PWDB monitor, false-alarm
+//!   statistics, minimum RSSI, DIG, dynamic TX power, EDCA turbo) in
+//!   Linux order; the RA mask refresh stays uncomposed (commented out in
+//!   Linux).
 //! - Card disable: `rtl92de_card_disable` with its DMA retirement proof.
 use super::super::super::rtl8192de::{
-    h2c, mac, packet::rate_index_for_mode, power, rate::WirelessMode, rsvd_page, station as hw,
-    trx, Band, MacPhyMode, RfType,
+    dm, h2c, lifecycle, lps, mac, packet::rate_index_for_mode, phy, power, rate::WirelessMode,
+    rsvd_page, station as hw, trx, txpower, Band, MacPhyMode, RfType,
 };
 use super::{
     extent, queue, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN, RX_BASE,
@@ -109,6 +118,16 @@ pub(in super::super) struct State {
     pub(in super::super) erp_timing: Option<(bool, bool)>,
     /// `rtlpriv->tx_report.sn`.
     report_sn: u16,
+    /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` shadow, shared by
+    /// `HW_VAR_SHORTGI_DENSITY` and `HW_VAR_AMPDU_MIN_SPACE`).
+    pub(in super::super) min_space_cfg: u8,
+    /// `stats.txbytesunicast` accumulated by this owner (EDCA turbo
+    /// reads the delta since the last watchdog pass).
+    pub(in super::super) tx_unicast_bytes: u64,
+    /// `stats.rxbytesunicast` accumulated by this owner.
+    pub(in super::super) rx_unicast_bytes: u64,
+    /// Software-LPS beacon state (`rtl_swlps_beacon`).
+    pub(in super::super) swlps: lps::SwLps,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -121,6 +140,10 @@ impl State {
             link: None,
             erp_timing: None,
             report_sn: 0,
+            min_space_cfg: 0,
+            tx_unicast_bytes: 0,
+            rx_unicast_bytes: 0,
+            swlps: lps::SwLps::default(),
         }
     }
 }
@@ -234,15 +257,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
+        let ht = self.packet.ht;
+        let facts = self.de92_facts()?;
+        // `_rtl_get_highest_n_rate` for an HT station: MCS15 on 2T2R,
+        // MCS7 on 1T1R; 54M otherwise. Aggregation and short GI are HT-only.
+        let highest = if ht {
+            if facts.rf_type == RfType::TwoT2R {
+                trx::DESC_RATEMCS15
+            } else {
+                trx::DESC_RATEMCS7
+            }
+        } else {
+            trx::DESC_RATE54M
+        };
         if frame.len() < 24
-            || self.packet.ht
-            || aggregate.is_some()
-            || short_gi
-            || rate > trx::DESC_RATE54M
+            || !ht && (aggregate.is_some() || short_gi)
+            || aggregate.is_some_and(|(density, _)| density > 7)
+            || aggregate.is_some() && frame[0] != 0x88
+            || rate > highest
         {
             return Err(Error::Packet);
         }
-        let facts = self.de92_facts()?;
         let permission = self.rtl8192de_power.ok_or(Error::State)?;
         let op = permission.operating();
         if op.is_5ghz() {
@@ -264,9 +299,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             None if adaptive => return Err(Error::State),
             _ => None,
         };
-        // `_rtl_get_highest_n_rate` for a legacy peer: 11M for B, 54M for G.
+        // `_rtl_get_highest_n_rate` for a linked peer: 11M for B, the
+        // top MCS for N24G/N5G, 54M for G.
         let hw_rate = match link {
             Some(peer) if peer.mode == WirelessMode::B => 0x03,
+            Some(peer) if matches!(peer.mode, WirelessMode::N24g | WirelessMode::N5g) => highest,
             Some(_) => trx::DESC_RATE54M,
             None if special => trx::DESC_RATE1M,
             None => rate,
@@ -303,6 +340,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             Some((_, _, index)) => index,
             None => RATR_INX_WIRELESS_MC,
         };
+        let destination = if (2..=5).contains(&queue) {
+            &frame[16..22]
+        } else {
+            &frame[4..10]
+        };
+        let multicast = destination[0] & 1 != 0;
         let sw_define = super::ae::wants_report(frame).then(|| {
             self.packet.de92.report_sn = self.packet.de92.report_sn.wrapping_add(1);
             (self.packet.de92.report_sn & 0x3f) << 2
@@ -320,13 +363,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             hw_rate,
             use_driver_rate: link.is_none(),
             disable_fallback: link.is_none(),
-            use_shortgi: false,
+            use_shortgi: short_gi,
             use_shortpreamble: false,
             bw_40: op.forty(),
-            packet_bw_40: false,
+            // `_rtl_query_bandwidth_mode`: a unicast HT packet above 54M on
+            // a 40 MHz station.
+            packet_bw_40: op.forty() && ht && !multicast && hw_rate > trx::DESC_RATE54M,
             cur_40_prime_sc: op.prime_sc(),
-            ampdu: false,
-            ampdu_density: 0,
+            ampdu: aggregate.is_some_and(|(_, operational)| operational),
+            ampdu_density: aggregate.map_or(0, |(density, _)| density),
             sec_type: 0,
             qos_data: frame[0] == 0x88,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
@@ -384,6 +429,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         })?;
         self.io.kick(poll)?;
         self.phase = Phase::Running;
+        if data && frame[4] & 1 == 0 {
+            self.packet.de92.tx_unicast_bytes = self
+                .packet
+                .de92
+                .tx_unicast_bytes
+                .saturating_add(frame.len() as u64);
+        }
         Ok(id)
     }
 
@@ -394,7 +446,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        let channel = self.rtl8192de_power.ok_or(Error::State)?.channel();
+        let ht = self.packet.ht;
+        let permission = self.rtl8192de_power.ok_or(Error::State)?;
+        let forty = permission.operating().forty();
+        let channel = permission.channel();
+        // `_rtl_get_highest_n_rate` for an HT station: MCS15 on 2T2R,
+        // MCS7 on 1T1R.
+        let highest = if self.de92_facts()?.rf_type == RfType::TwoT2R {
+            trx::DESC_RATEMCS15
+        } else {
+            trx::DESC_RATEMCS7
+        };
         let slot = self.packet.receive;
         let depth = self.depth;
         let ring = self.receive.as_mut().ok_or(Error::State)?;
@@ -422,12 +484,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Descriptor);
             }
             let mut packet = None;
+            let rate_ok = if status.is_ht {
+                ht && (trx::DESC_RATEMCS0..=highest).contains(&status.rate)
+            } else {
+                status.rate <= trx::DESC_RATE54M
+            };
+            let longest = if ht {
+                26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
+            } else {
+                2304 + 4
+            };
             if !status.hw_error()
-                && !status.is_ht
-                && !status.ampdu
-                && status.bw == 0
-                && status.rate <= trx::DESC_RATE54M
-                && (24..=2304 + 4).contains(&length)
+                && (!status.ampdu || ht)
+                && rate_ok
+                && (status.bw == 0 || forty && status.bw == 1)
+                && (24..=longest).contains(&length)
             {
                 buffer.sync();
                 let mut bytes = Vec::new();
@@ -440,14 +511,31 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // Software CCMP: protected frames keep IV/ciphertext/MIC.
                 if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
                 {
+                    // `_rtl92de_query_rxphystatus` `rx_pwdb_all` from the
+                    // PHY status ahead of the frame (`dm::rx_pwdb`); the
+                    // firmware info is 28 bytes, read only as far as the
+                    // descriptor's driver info extends (at least 6).
+                    let pwdb = if status.physt && status.drvinfo_size >= 6 {
+                        let take = status.drvinfo_size.min(28);
+                        let mut phy = [0u8; 28];
+                        buffer.read_bytes(status.shift, &mut phy[..take])?;
+                        let cck_highpwr = if status.is_cck() {
+                            phy::get_bb(&self.io, phy::RFPGA0_XA_HSSIPARAMETER2, 1 << 9)? != 0
+                        } else {
+                            false
+                        };
+                        dm::rx_pwdb(&phy[..take], status.is_cck(), cck_highpwr)
+                    } else {
+                        None
+                    };
                     packet = Some(Mpdu {
                         bytes,
                         channel,
-                        ht: false,
+                        ht: status.is_ht,
                         short_gi: false,
-                        width40: false,
-                        aggregated: false,
-                        pwdb: None,
+                        width40: status.bw == 1,
+                        aggregated: status.ampdu,
+                        pwdb,
                         antenna_mux: None,
                     });
                 }
@@ -470,6 +558,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 packet: None,
             });
         };
+        if let Some(mpdu) = &packet {
+            if mpdu.bytes()[0] & 0x0c == 0x08 && mpdu.bytes()[4] & 1 == 0 {
+                self.packet.de92.rx_unicast_bytes = self
+                    .packet
+                    .de92
+                    .rx_unicast_bytes
+                    .saturating_add(mpdu.bytes().len() as u64);
+            }
+        }
         self.packet.receive = (slot + 1) % depth;
         self.phase = Phase::Running;
         Ok(ReceiveStep {
@@ -703,11 +800,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
-        if peer.ap_or_adhoc || !matches!(peer.mode, WirelessMode::B | WirelessMode::G) {
+        if peer.ap_or_adhoc
+            || !matches!(
+                peer.mode,
+                WirelessMode::B | WirelessMode::G | WirelessMode::N24g | WirelessMode::N5g
+            )
+        {
             return Err(Error::Packet);
         }
         let rf_type = self.de92_facts()?.rf_type;
-        let admitted = self.rtl8192de_power.ok_or(Error::State)?.admitted_rates() as u32;
+        let permission = self.rtl8192de_power.ok_or(Error::State)?;
+        let admitted = permission.admitted_rates() as u32;
+        let band = if permission.operating().is_5ghz() {
+            Band::On5Ghz
+        } else {
+            Band::On2Ghz
+        };
         self.phase = Phase::Failed;
         h2c::update_hal_rate_mask(
             &mut self.packet.de92.mailbox,
@@ -715,7 +823,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             &h2c::RateSelection {
                 peer: &peer,
                 rf_type,
-                band: Band::On2Ghz,
+                band,
                 bw40,
                 rssi_level: level,
             },
@@ -730,14 +838,155 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
-    /// `rtl_lps_set_psmode(EAUTOPS)` on 92DE: `rtl_lps_enter_core` returns at
-    /// `!ppsc->fwctrl_lps` (`rtl92de_mod_params.fwctrl_lps = false`), so this
-    /// is a successful no-op and `leisure` stays false.
+    /// `rtl_lps_enter_core` (`ps.c:392`) on 92DE: the first gate
+    /// (`!ppsc->fwctrl_lps`, `rtl92de_mod_params.fwctrl_lps = false`)
+    /// refuses — as in Linux, where the function returns at that
+    /// gate, the later gates are never consulted (their arguments
+    /// below are dead values, and the link-age gate would refuse
+    /// with no input anyway) — so this is a successful no-op and
+    /// `leisure` stays false.
     pub(super) async fn de92_enter_leisure(&mut self) -> Result<(), Error> {
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
+        if !lps::enter_core_allowed(
+            lifecycle::ModParams::default().fwctrl_lps,
+            false,
+            false,
+            0,
+            false,
+            false,
+        ) {
+            return Ok(());
+        }
         Ok(())
+    }
+
+    /// `rtl92d_dm_watchdog` (`rtl8192de/dm.c:1229`): the PWDB monitor,
+    /// false-alarm statistics, minimum RSSI, DIG, dynamic TX power
+    /// and EDCA turbo steps, in Linux order. Returns whether the TX
+    /// power level was re-programmed. The RA mask refresh stays
+    /// uncomposed (commented out in Linux), as do dynamic BB power
+    /// saving, TX-power tracking thermal meter and interrupt
+    /// migration. `undec_sm_pwdb` is the station RA's smoothed PWDB;
+    /// the single entry's minimum is that value while linked, 0
+    /// once the entry is gone (see [`dm::find_minimum_rssi`]).
+    pub(crate) async fn de92_dm_watchdog(&mut self, undec_sm_pwdb: i64) -> Result<bool, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if self.packet.leisure {
+            return Ok(false);
+        }
+        let facts = self.de92_facts()?;
+        let permission = self.rtl8192de_power.ok_or(Error::State)?;
+        let band_5g = permission.operating().is_5ghz();
+        let channel = permission.channel();
+        let linked = self.station_linked();
+        let entry_min = if linked { undec_sm_pwdb } else { 0 };
+        let band = if band_5g { Band::On5Ghz } else { Band::On2Ghz };
+        let bw40 = self.packet.width.is_some();
+        self.phase = Phase::Failed;
+        let payload = dm::pwdb_monitor_payload(undec_sm_pwdb);
+        h2c::Mailbox::fill(
+            &mut self.packet.de92.mailbox,
+            &self.io,
+            h2c::H2C_RSSI_REPORT,
+            &payload,
+            true,
+        )
+        .await?;
+        let false_alarm = dm::false_alarm_statistics(&self.io, band_5g)?;
+        let radio = self.rtl8192de.as_mut().ok_or(Error::State)?;
+        let dm_state = &mut radio.radio.dm;
+        dm_state.dig.min_undec_pwdb_for_dm =
+            dm::find_minimum_rssi(linked, undec_sm_pwdb, entry_min);
+        if dm_state.dm_initialgain_enable {
+            dm::dig(
+                &self.io,
+                &mut dm_state.dig,
+                false_alarm.cnt_all,
+                linked,
+                band_5g,
+            )?;
+        }
+        // `dm_flag` is 0 in NARF (`SwVars::new`); dynamic TX power is
+        // enabled from `rtl92d_dm_init_dynamic_txpower`.
+        let dtp_enable = dm_state.dynamic_txpower.enable;
+        let changed = dm::dynamic_txpower_step(
+            &mut dm_state.dynamic_txpower,
+            dtp_enable,
+            0,
+            linked,
+            entry_min,
+            undec_sm_pwdb,
+            band_5g,
+        );
+        if changed {
+            let pg = radio.radio.pg.as_ref().ok_or(Error::State)?;
+            txpower::set_level(
+                &self.io,
+                &radio.efuse,
+                facts.rf_type,
+                pg,
+                channel,
+                band,
+                bw40,
+                false,
+            )?;
+        }
+        // `disable_framebursting` is false (`SwVars::new`); the
+        // WEP/TKIP TXOP force is a no-op for the `0x5ea42b` base, so
+        // the pairwise cipher is unobservable here. Nothing in this
+        // Linux version sets `is_any_nonbepkts` for the 92D, so the
+        // turbo branch is always eligible.
+        let tx_bytes = self.packet.de92.tx_unicast_bytes;
+        let rx_bytes = self.packet.de92.rx_unicast_bytes;
+        match dm::check_edca_turbo(
+            &mut dm_state.edca_turbo,
+            linked,
+            false,
+            false,
+            tx_bytes,
+            rx_bytes,
+        ) {
+            dm::EdcaTurboAction::Write(value) => {
+                self.io.write32(dm::REG_EDCA_BE_PARAM, value)?;
+            }
+            dm::EdcaTurboAction::RestoreAcParam | dm::EdcaTurboAction::Keep => {}
+        }
+        self.phase = Phase::Running;
+        Ok(changed)
+    }
+
+    /// `rtl_swlps_beacon` (`ps.c:462`): the software-LPS beacon
+    /// decision for a beacon from the associated BSSID. NARF has no
+    /// per-interface PS-enable flag (`IEEE80211_CONF_PS` /
+    /// `sw_ps_enabled`): software PS is on whenever the driver
+    /// default `swctrl_lps` is on (`rtl92de_mod_params`, default
+    /// true), and `fwctrl_lps` is off (default false). The RF
+    /// sleep/awake execution the decision would trigger
+    /// (`rtl_ps_set_rf_state`) is not composed — the hook only
+    /// records the decision state. Returns the beacon action, if
+    /// any.
+    pub(crate) fn de92_swlps_beacon(
+        &mut self,
+        frame: &[u8],
+        bssid: [u8; 6],
+        aid: u16,
+    ) -> Option<lps::BeaconAction> {
+        let params = lifecycle::ModParams::default();
+        lps::swlps_beacon(
+            &mut self.packet.de92.swlps,
+            frame,
+            &bssid,
+            aid,
+            params.swctrl_lps,
+            true,
+            true,
+            params.fwctrl_lps,
+            true,
+        )
     }
 
     /// Disassociation: `rtl92de_set_network_type(STATION)` without a link

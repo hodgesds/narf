@@ -54,12 +54,13 @@ pub const QSLT_HIGH: u8 = 4;
 /// `QSLT_CMD`.
 pub const QSLT_CMD: u8 = 5;
 /// `DESC_RATE1M`, `DESC_RATE6M`, `DESC_RATE54M`, `DESC_RATEMCS0`,
-/// `DESC_RATEMCS7` (`wifi.h`).
+/// `DESC_RATEMCS7`, `DESC_RATEMCS15` (`wifi.h`).
 pub const DESC_RATE1M: u8 = 0x00;
 pub const DESC_RATE6M: u8 = 0x04;
 pub const DESC_RATE54M: u8 = 0x0b;
 pub const DESC_RATEMCS0: u8 = 0x0c;
 pub const DESC_RATEMCS7: u8 = 0x13;
+pub const DESC_RATEMCS15: u8 = 0x1b;
 /// AMPDU `max_agg_num` programmed by the fill (`0x14`).
 pub const MAX_AGG_NUM: u8 = 0x14;
 /// Data / RTS rate fallback limits programmed by the fill.

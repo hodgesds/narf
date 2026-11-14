@@ -1469,6 +1469,16 @@ fn de_mac_read32(io: &DeMacFake, reg: u16) -> u32 {
     u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]])
 }
 
+fn de_mac_write8(io: &DeMacFake, reg: u16, value: u8) {
+    io.0.lock().regs[usize::from(reg)] = value;
+}
+
+fn de_mac_write32(io: &DeMacFake, reg: u16, value: u32) {
+    let mut g = io.0.lock();
+    let r = usize::from(reg);
+    g.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 /// `rtl92d_phy_set_poweron` + the `_rtl92de_init_mac` power prefix,
 /// single MAC on 2.4 GHz: band bit and MAC-ON land on `REG_MAC0`, the
 /// V11 resume writes land, `REG_CR` ends at `0x2ff`, DMA stop clears.
@@ -5069,3 +5079,489 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_switch_channel_lck_wait
 );
+
+/// HT40 capability bodies (`base.c::_rtl_init_hw_ht_capab`), the
+/// host capability bits, and the `BSS_CHANGED_HT` timing order.
+fn smoke_rtl8192de_ht40_capability() -> TestResult {
+    // 2T2R 40 MHz, two-stream, A-MSDU on: cap 0x1c6e,
+    // factor/density 0x1f, RX mask [255, 255], TX == RX.
+    let body = ht::capability(true, RfType::TwoT2R, true, false).capability_body();
+    if body[0] != 0x6e
+        || body[1] != 0x1c
+        || body[2] != 0x1f
+        || body[3] != 255
+        || body[4] != 255
+        || body[15] != 1
+    {
+        return TestResult::Fail("8192DE HT40 2T2R capability body");
+    }
+    // 1T1R 20 MHz, no two-stream, A-MSDU off: cap 0x082c,
+    // RX mask [255, 0].
+    let body = ht::capability(false, RfType::OneT1R, false, true).capability_body();
+    if body[0] != 0x2c
+        || body[1] != 0x08
+        || body[2] != 0x1f
+        || body[3] != 255
+        || body[4] != 0
+        || body[15] != 1
+    {
+        return TestResult::Fail("8192DE HT20 1T1R capability body");
+    }
+    // 2T2R 40 MHz without two-stream: TX mask [255, 0] != RX, so
+    // the TX-stream count lands in body[15].
+    let body = ht::capability(true, RfType::TwoT2R, false, false).capability_body();
+    if body[3] != 255 || body[4] != 255 || body[15] != 3 {
+        return TestResult::Fail("8192DE HT40 no-2SS capability body");
+    }
+    if ht::minspace_cfg(RfType::OneT1R) != 0x50 || ht::minspace_cfg(RfType::TwoT2R) != 0x98 {
+        return TestResult::Fail("8192DE HT min-space base");
+    }
+    // Host bits: v2 envelope (2.4 GHz 20/40 MHz, no MCS8-15) under
+    // the US 2.4 GHz domain.
+    use envelope::*;
+    let factory = de_factory();
+    let domain = de_us_domain();
+    let bytes = de_napc_fixture(2, 0, 80, &[(6, 20, 0, de_rising), (6, 40, 1, de_rising)]);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE HT host caps envelope"),
+    };
+    let caps = ht::host_capabilities(&cal, &domain, RfType::TwoT2R, false);
+    if caps != ht::HOST_HT_2G | ht::HOST_HT40_2G | ht::HOST_2T2R {
+        return TestResult::Fail("8192DE HT host caps 2.4 GHz");
+    }
+    let caps = ht::host_capabilities(&cal, &domain, RfType::OneT1R, true);
+    if caps != ht::HOST_HT_2G | ht::HOST_HT40_2G | ht::HOST_DISABLE_AMSDU_8K {
+        return TestResult::Fail("8192DE HT host caps 1T1R dual-MAC");
+    }
+    // Host phy: the same body through the host bits, and None off HT.
+    match ht::host_phy(caps, 2400) {
+        Some(phy) if phy.ht[3] == 255 && phy.ht[4] == 0 && phy.vht.is_none() => {}
+        _ => return TestResult::Fail("8192DE HT host phy 2.4 GHz"),
+    }
+    if ht::host_phy(0, 2400).is_some() || ht::host_phy(caps, 6000).is_some() {
+        return TestResult::Fail("8192DE HT host phy refusal");
+    }
+    // v3 envelope (2.4 GHz + 5 GHz, MCS8-15 measured): 5 GHz host
+    // bits under the US 5 GHz domain, 2.4 GHz bits under the US
+    // 2.4 GHz domain.
+    let rows: &[NapcRowV3] = &[
+        (6, 0, 20, 0, de_v3_rising),
+        (36, 1, 20, 0, de_v3_rising),
+        (40, 1, 20, 0, de_v3_rising),
+        (165, 1, 20, 0, de_v3_rising),
+        (36, 1, 40, 1, de_v3_rising),
+        (40, 1, 40, 2, de_v3_rising),
+    ];
+    let bytes = de_napc_v3_fixture(0, 80, rows);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE HT host caps v3 envelope"),
+    };
+    let caps5 = ht::host_capabilities(&cal, &de_us_5g_domain(), RfType::TwoT2R, false);
+    if caps5 != ht::HOST_HT_5G | ht::HOST_HT40_5G | ht::HOST_TX_2SS | ht::HOST_2T2R {
+        return TestResult::Fail("8192DE HT host caps 5 GHz");
+    }
+    let caps2 = ht::host_capabilities(&cal, &domain, RfType::TwoT2R, false);
+    if caps2 != ht::HOST_HT_2G | ht::HOST_TX_2SS | ht::HOST_2T2R {
+        return TestResult::Fail("8192DE HT host caps 2.4 GHz v3");
+    }
+    match ht::host_phy(caps5, 5000) {
+        Some(phy) if phy.ht[3] == 255 && phy.ht[4] == 255 => {}
+        _ => return TestResult::Fail("8192DE HT host phy 5 GHz"),
+    }
+    // BSS_CHANGED_HT order with the fake MAC: density 5 raises to 7,
+    // factor 2 leaves the single-MAC base, min-space lands at 0x97.
+    let io = de_mac_fake();
+    let mut cfg = 0;
+    if ht::timing(
+        &io,
+        super::MacPhyMode::SingleMacSinglePhy,
+        &mut cfg,
+        RfType::TwoT2R,
+        2,
+        5,
+    )
+    .is_err()
+        || cfg != 0x97
+        || de_mac_read32(&io, mac::REG_AGGLEN_LMT) != 0xb972_a841
+        || de_mac_read8(&io, mac::REG_AMPDU_MIN_SPACE) != 0x97
+    {
+        return TestResult::Fail("8192DE HT BSS_CHANGED_HT timing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_ht40_capability
+);
+
+/// DM watchdog steps (`rtl8192de/dm.c`): false-alarm statistics,
+/// minimum RSSI, DIG adjust/write + CCK threshold, dynamic TX power,
+/// EDCA turbo, the PWDB-monitor payload, and `rx_pwdb_all`.
+fn smoke_rtl8192de_dm_watchdog_steps() -> TestResult {
+    // False alarms: six OFDM components + CCK on 2.4 GHz.
+    let io = de_mac_fake();
+    de_mac_write32(&io, phy::ROFDM0_FRAMESYNC, 0x0003_0002);
+    de_mac_write32(&io, phy::ROFDM0_PHYCOUNTER1, 0x0005_0000);
+    de_mac_write32(&io, phy::ROFDM_PHYCOUNTER2, 0x0007_0006);
+    de_mac_write32(&io, phy::ROFDM_PHYCOUNTER3, 0x0000_0004);
+    de_mac_write8(&io, phy::RCCK0_FACOUNTERLOWER, 0x09);
+    de_mac_write8(&io, phy::RCCK0_FACOUNTERUPPER + 3, 0x01);
+    let fa = match dm::false_alarm_statistics(&io, false) {
+        Ok(fa) => fa,
+        Err(_) => return TestResult::Fail("8192DE DM false alarm read"),
+    };
+    if fa.cnt_fast_fsync_fail != 2
+        || fa.cnt_sb_search_fail != 3
+        || fa.cnt_parity_fail != 5
+        || fa.cnt_rate_illegal != 6
+        || fa.cnt_crc8_fail != 7
+        || fa.cnt_mcs_fail != 4
+        || fa.cnt_ofdm_fail != 27
+        || fa.cnt_cck_fail != 265
+        || fa.cnt_all != 292
+        || de_mac_read32(&io, phy::ROFDM0_LSTF) != 0
+        || de_mac_read32(&io, phy::ROFDM1_LSTF) != 0
+        || de_mac_read32(&io, phy::RCCK0_FALSEALARMREPORT) & 0xc000 != 0x8000
+    {
+        return TestResult::Fail("8192DE DM false alarm statistics");
+    }
+    // 5 GHz: no CCK counter.
+    let io = de_mac_fake();
+    de_mac_write32(&io, phy::ROFDM0_FRAMESYNC, 0x0001_0001);
+    let fa = match dm::false_alarm_statistics(&io, true) {
+        Ok(fa) => fa,
+        Err(_) => return TestResult::Fail("8192DE DM false alarm 5 GHz read"),
+    };
+    if fa.cnt_cck_fail != 0 || fa.cnt_all != fa.cnt_ofdm_fail || fa.cnt_ofdm_fail != 2 {
+        return TestResult::Fail("8192DE DM false alarm 5 GHz");
+    }
+    // Minimum RSSI: linked takes the smoothed PWDB, unlinked the
+    // entry minimum.
+    if dm::find_minimum_rssi(true, 50, 30) != 50 || dm::find_minimum_rssi(false, 50, 30) != 30 {
+        return TestResult::Fail("8192DE DM minimum RSSI");
+    }
+    // DIG adjust: -1 / +0 / +1 / +2 across the FA thresholds.
+    let mut dig = dm::DigTable::init(0x30);
+    dm::dig_adjust(&mut dig, 100, true);
+    if dig.cur_igvalue != 0x2f || dig.cur_sta_cstate != dm::DIG_STA_CONNECT {
+        return TestResult::Fail("8192DE DM DIG adjust -1");
+    }
+    dm::dig_adjust(&mut dig, 300, true);
+    if dig.cur_igvalue != 0x2f {
+        return TestResult::Fail("8192DE DM DIG adjust +0");
+    }
+    dm::dig_adjust(&mut dig, 0x500, true);
+    if dig.cur_igvalue != 0x30 {
+        return TestResult::Fail("8192DE DM DIG adjust +1");
+    }
+    dm::dig_adjust(&mut dig, 0x700, true);
+    if dig.cur_igvalue != 0x32 {
+        return TestResult::Fail("8192DE DM DIG adjust +2");
+    }
+    // Three large-FA passes at the DIG ceiling: `large_fa_hit` 3,
+    // `rx_gain_min` at the ceiling, recovery armed.
+    let mut dig = dm::DigTable::init(dm::DM_DIG_MAX);
+    for _ in 0..3 {
+        dm::dig_adjust(&mut dig, 20_000, true);
+    }
+    if dig.large_fa_hit != 3 || dig.rx_gain_min != dm::DM_DIG_MAX || dig.recover_cnt != 3600 {
+        return TestResult::Fail("8192DE DM DIG large false alarm");
+    }
+    // DIG write: disabled only records 0x17; enabled writes the A/B
+    // AGC cores and latches `pre_igvalue`.
+    let io = de_mac_fake();
+    let mut dig = dm::DigTable::init(0x20);
+    dig.dig_enable_flag = false;
+    if dm::write_dig(&io, &mut dig).is_err()
+        || dig.pre_igvalue != 0x17
+        || de_mac_read32(&io, phy::ROFDM0_XAAGCCORE1) != 0
+    {
+        return TestResult::Fail("8192DE DM write DIG disabled");
+    }
+    dig.dig_enable_flag = true;
+    dig.pre_igvalue = 0;
+    if dm::write_dig(&io, &mut dig).is_err()
+        || dig.pre_igvalue != 0x20
+        || de_mac_read32(&io, phy::ROFDM0_XAAGCCORE1) & 0x7f != 0x20
+        || de_mac_read32(&io, phy::ROFDM0_XBAGCCORE1) & 0x7f != 0x20
+    {
+        return TestResult::Fail("8192DE DM write DIG");
+    }
+    if dm::write_dig(&io, &mut dig).is_err() || dig.pre_igvalue != 0x20 {
+        return TestResult::Fail("8192DE DM write DIG no-op");
+    }
+    // CCK packet-detection threshold: HIGH above 20, LOW at/below,
+    // LOW when disconnected.
+    let io = de_mac_fake();
+    let mut dig = dm::DigTable::init(0x20);
+    dig.cur_sta_cstate = dm::DIG_STA_CONNECT;
+    dig.min_undec_pwdb_for_dm = 30;
+    if dm::cck_packet_detection_thresh(&io, &mut dig).is_err()
+        || dig.cur_cck_pd_state != dm::CCK_PD_STAGE_HIGHRSSI
+        || de_mac_read32(&io, phy::RCCK0_CCA) & 0xff00 != 0xcd00
+    {
+        return TestResult::Fail("8192DE DM CCK threshold HIGH");
+    }
+    dig.min_undec_pwdb_for_dm = 15;
+    if dm::cck_packet_detection_thresh(&io, &mut dig).is_err()
+        || dig.cur_cck_pd_state != dm::CCK_PD_STAGE_LOWRSSI
+        || de_mac_read32(&io, phy::RCCK0_CCA) & 0xff00 != 0x8300
+    {
+        return TestResult::Fail("8192DE DM CCK threshold LOW");
+    }
+    dig.cur_sta_cstate = dm::DIG_STA_DISCONNECT;
+    if dm::cck_packet_detection_thresh(&io, &mut dig).is_err()
+        || dig.cur_cck_pd_state != dm::CCK_PD_STAGE_LOWRSSI
+    {
+        return TestResult::Fail("8192DE DM CCK threshold disconnect");
+    }
+    // Dynamic TX power: 2.4 GHz bands with hold, 5 GHz bands, the
+    // disabled and unlinked-zero exits.
+    let mut txp = dm::DynamicTxPower::init();
+    if dm::dynamic_txpower_step(&mut txp, false, 0, true, 0, 80, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+    {
+        return TestResult::Fail("8192DE DM TX power disabled");
+    }
+    if !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 80, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_LEVEL2
+    {
+        return TestResult::Fail("8192DE DM TX power LEVEL2");
+    }
+    if dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 80, false) {
+        return TestResult::Fail("8192DE DM TX power LEVEL2 stable");
+    }
+    if !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 70, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_LEVEL1
+    {
+        return TestResult::Fail("8192DE DM TX power LEVEL1");
+    }
+    if dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 72, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_LEVEL1
+    {
+        return TestResult::Fail("8192DE DM TX power hold");
+    }
+    if !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 60, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+    {
+        return TestResult::Fail("8192DE DM TX power NORMAL");
+    }
+    if dm::dynamic_txpower_step(&mut txp, true, dm::HAL_DM_HIPWR_DISABLE, true, 0, 80, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+    {
+        return TestResult::Fail("8192DE DM TX power HIPWR disable");
+    }
+    if dm::dynamic_txpower_step(&mut txp, true, 0, false, 0, 80, false)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+        || txp.last_dtp_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+    {
+        return TestResult::Fail("8192DE DM TX power unlinked zero");
+    }
+    if !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 0x33, true)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_LEVEL2
+        || !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 0x2b, true)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_LEVEL1
+        || !dm::dynamic_txpower_step(&mut txp, true, 0, true, 0, 0x2a, true)
+        || txp.highpower_lvl != dm::TXHIGHPWRLEVEL_NORMAL
+    {
+        return TestResult::Fail("8192DE DM TX power 5 GHz");
+    }
+    // EDCA turbo: unlinked latches and exits, download writes on
+    // entry, upload writes on direction change, framebursting off
+    // restores the AC parameters.
+    let mut turbo = dm::EdcaTurbo::init();
+    if dm::check_edca_turbo(&mut turbo, false, false, false, 100, 500) != dm::EdcaTurboAction::Keep
+        || turbo.current_turbo_edca
+        || turbo.last_tx_bytes != 100
+        || turbo.last_rx_bytes != 500
+    {
+        return TestResult::Fail("8192DE DM EDCA unlinked");
+    }
+    if dm::check_edca_turbo(&mut turbo, true, false, false, 1000, 9000)
+        != dm::EdcaTurboAction::Write(dm::EDCA_BE_PARAM)
+        || !turbo.current_turbo_edca
+        || !turbo.is_cur_rdlstate
+    {
+        return TestResult::Fail("8192DE DM EDCA download");
+    }
+    if dm::check_edca_turbo(&mut turbo, true, false, false, 2000, 18000)
+        != dm::EdcaTurboAction::Keep
+    {
+        return TestResult::Fail("8192DE DM EDCA download stable");
+    }
+    if dm::check_edca_turbo(&mut turbo, true, false, false, 20000, 19000)
+        != dm::EdcaTurboAction::Write(dm::EDCA_BE_PARAM)
+        || turbo.is_cur_rdlstate
+    {
+        return TestResult::Fail("8192DE DM EDCA upload");
+    }
+    if dm::check_edca_turbo(&mut turbo, true, true, false, 20000, 19000)
+        != dm::EdcaTurboAction::RestoreAcParam
+        || turbo.current_turbo_edca
+        || turbo.is_cur_rdlstate
+    {
+        return TestResult::Fail("8192DE DM EDCA restore");
+    }
+    // The WEP/TKIP TXOP force is a no-op for the 0x5ea42b base.
+    let mut turbo = dm::EdcaTurbo::init();
+    if dm::check_edca_turbo(&mut turbo, true, false, true, 0, 9000)
+        != dm::EdcaTurboAction::Write(dm::EDCA_BE_PARAM)
+    {
+        return TestResult::Fail("8192DE DM EDCA WEP/TKIP force");
+    }
+    // PWDB monitor payload: (pwdb << 16) | 0x100, 3 bytes LE.
+    if dm::pwdb_monitor_payload(50) != [0x00, 0x01, 0x32] {
+        return TestResult::Fail("8192DE DM PWDB monitor payload");
+    }
+    // RX RSSI (`trx.c::_rtl92de_query_rxphystatus`): OFDM from
+    // `pwdb_all`, CCK from the AGC report, short status refused.
+    if dm::rx_pwdb(&[0, 0, 0, 0, 0x64, 0], false, false) != Some(44) {
+        return TestResult::Fail("8192DE DM RX PWDB OFDM");
+    }
+    if dm::rx_pwdb(&[0, 0, 0, 0, 0xfe, 0], false, false) != Some(0) {
+        return TestResult::Fail("8192DE DM RX PWDB OFDM ceiling");
+    }
+    if dm::rx_pwdb(&[0, 0, 0, 0, 0, 0x8a], true, false) != Some(70) {
+        return TestResult::Fail("8192DE DM RX PWDB CCK low power");
+    }
+    if dm::rx_pwdb(&[0, 0, 0, 0, 0, 0x65], true, true) != Some(50) {
+        return TestResult::Fail("8192DE DM RX PWDB CCK high power");
+    }
+    if dm::rx_pwdb(&[0, 0, 0, 0, 0, 0xd6], true, false) != Some(36) {
+        return TestResult::Fail("8192DE DM RX PWDB CCK offset table");
+    }
+    if dm::rx_pwdb(&[0u8; 5], false, false).is_some() || dm::rx_pwdb(&[], false, false).is_some() {
+        return TestResult::Fail("8192DE DM RX PWDB short status");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_dm_watchdog_steps
+);
+
+/// Software LPS (`ps.c`): the `rtl_lps_enter_core` first gate, the
+/// TIM check, the beacon decision, and the RF-sleep interval/delay.
+fn smoke_rtl8192de_sw_lps() -> TestResult {
+    if lps::enter_core_allowed(false, false, false, 5, false, true)
+        || !lps::enter_core_allowed(true, false, false, 5, false, true)
+        || lps::enter_core_allowed(true, true, false, 5, false, true)
+        || lps::enter_core_allowed(true, false, true, 5, false, true)
+        || lps::enter_core_allowed(true, false, false, 4, false, true)
+        || lps::enter_core_allowed(true, false, false, 5, true, true)
+        || lps::enter_core_allowed(true, false, false, 5, false, false)
+    {
+        return TestResult::Fail("8192DE LPS enter-core gate");
+    }
+    // TIM: AID 1 set in the first bitmap octet, AID 16 in the second
+    // page (offset 1).
+    if !lps::check_tim(&[0, 1, 0x00, 0x02], 1)
+        || lps::check_tim(&[0, 1, 0x00, 0x02], 2)
+        || !lps::check_tim(&[0, 1, 0x02, 0x01], 16)
+        || lps::check_tim(&[0, 1, 0x02, 0x01], 1)
+        || lps::check_tim(&[0, 1], 1)
+    {
+        return TestResult::Fail("8192DE LPS TIM check");
+    }
+    // Beacon: 24-byte header + 12 fixed bytes, SSID then TIM.
+    let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let mut frame = [0u8; 45];
+    frame[0] = 0x80;
+    frame[16..22].copy_from_slice(&bssid);
+    frame[36] = 0;
+    frame[37] = 1;
+    frame[38] = 0;
+    frame[39] = 5;
+    frame[40] = 4;
+    frame[41] = 2;
+    frame[42] = 1;
+    frame[43] = 0;
+    frame[44] = 0x02;
+    let mut state = lps::SwLps::default();
+    if lps::swlps_beacon(&mut state, &frame, &bssid, 1, true, true, true, false, true)
+        != Some(lps::BeaconAction::SleepDue)
+        || !state.beacon_seen
+        || state.dtim_counter != 2
+        || state.multi_buffered
+    {
+        return TestResult::Fail("8192DE LPS beacon sleep due");
+    }
+    // Multicast buffered: stay awake for the DTIM.
+    frame[43] = 1;
+    let mut state = lps::SwLps::default();
+    if lps::swlps_beacon(&mut state, &frame, &bssid, 1, true, true, true, false, true)
+        != Some(lps::BeaconAction::StayAwake)
+        || !state.multi_buffered
+    {
+        return TestResult::Fail("8192DE LPS beacon multicast");
+    }
+    // Wrong BSSID and each gate refusal: refused, nothing recorded.
+    let mut state = lps::SwLps::default();
+    let other = [0x66u8; 6];
+    if lps::swlps_beacon(&mut state, &frame, &other, 1, true, true, true, false, true).is_some()
+        || state.beacon_seen
+        || lps::swlps_beacon(
+            &mut state, &frame, &bssid, 1, false, true, true, false, true,
+        )
+        .is_some()
+        || lps::swlps_beacon(
+            &mut state, &frame, &bssid, 1, true, false, true, false, true,
+        )
+        .is_some()
+        || lps::swlps_beacon(
+            &mut state, &frame, &bssid, 1, true, true, false, false, true,
+        )
+        .is_some()
+        || lps::swlps_beacon(&mut state, &frame, &bssid, 1, true, true, true, true, true).is_some()
+        || lps::swlps_beacon(
+            &mut state, &frame, &bssid, 1, true, true, true, false, false,
+        )
+        .is_some()
+    {
+        return TestResult::Fail("8192DE LPS beacon gates");
+    }
+    // No TIM element: refused, but the beacon-seen record is kept.
+    let mut no_tim = frame;
+    no_tim[39] = 1;
+    no_tim[40] = 0;
+    let mut state = lps::SwLps::default();
+    if lps::swlps_beacon(
+        &mut state, &no_tim, &bssid, 1, true, true, true, false, true,
+    )
+    .is_some()
+        || !state.beacon_seen
+    {
+        return TestResult::Fail("8192DE LPS beacon no TIM");
+    }
+    if lps::swlps_beacon(
+        &mut state,
+        &frame[..40],
+        &bssid,
+        1,
+        true,
+        true,
+        true,
+        false,
+        true,
+    )
+    .is_some()
+    {
+        return TestResult::Fail("8192DE LPS beacon short frame");
+    }
+    // Sleep interval: DTIM beacon doubles a period of 1, caps at 5.
+    if lps::sleep_interval(0, 1) != 2
+        || lps::sleep_interval(0, 3) != 3
+        || lps::sleep_interval(2, 1) != 2
+        || lps::sleep_interval(0, 9) != 5
+        || lps::sleep_interval(7, 1) != 5
+        || lps::sleep_delay_ms(2, 100) != 160
+        || lps::sleep_delay_ms(1, 20) != 0
+        || lps::sleep_delay_ms(5, 102) != 470
+    {
+        return TestResult::Fail("8192DE LPS sleep interval");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtlwifi/rtl8192de", smoke_rtl8192de_sw_lps);

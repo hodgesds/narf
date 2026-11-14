@@ -1166,6 +1166,66 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .rtl8192ee_power
                 .is_some_and(|p| super::super::rtl8192ee::ht::admitted(&p))
     }
+    /// RTL8192DE: the current `N92D` permission admits the HT station
+    /// (every MCS0-7 rate holds a measured index, so the
+    /// `rtl92d_update_hal_rate_mask` one-stream rows stay admitted).
+    pub(crate) fn rtl8192de_ht(&self) -> bool {
+        self.chip == super::Chip::Rtl8192de
+            && self
+                .rtl8192de_power
+                .is_some_and(|p| super::super::rtl8192de::ht::admitted(&p))
+    }
+    /// RTL8192DE: this function's RF type and dual-MAC
+    /// `disable_amsdu_8k` consequence for the current permission's
+    /// band, for the HT capability advertisement.
+    fn rtl8192de_ht_facts(&self) -> Option<(super::super::rtl8192de::RfType, bool)> {
+        let facts = self.packet.de92.facts?;
+        let current = self.rtl8192de_power?;
+        let band = if current.operating().is_5ghz() {
+            super::super::rtl8192de::Band::On5Ghz
+        } else {
+            super::super::rtl8192de::Band::On2Ghz
+        };
+        Some((
+            facts.rf_type,
+            super::super::rtl8192de::sw_consequences(facts.mode, band).disable_amsdu_8k,
+        ))
+    }
+    /// RTL8192DE local HT20 PHY for beacon observation and scanning
+    /// (`rtl8192de::ht::local` at the board's RF type).
+    pub(crate) fn rtl8192de_local_ht20(&self) -> Option<association::phy::LocalPhy> {
+        let p = self.rtl8192de_power?;
+        let (rf_type, disable_amsdu_8k) = self.rtl8192de_ht_facts()?;
+        Some(super::super::rtl8192de::ht::local(
+            false,
+            rf_type,
+            super::super::rtl8192de::ht::two_stream(&p, rf_type),
+            disable_amsdu_8k,
+        ))
+    }
+    /// RTL8192DE: the host-API capability bits
+    /// (`rtl8192de::ht::host_capabilities`) of the staged `N92D` envelope
+    /// under current host policy; 0 for every other chip, without an
+    /// envelope or without a regulatory domain.
+    pub(crate) fn station_rtl8192de_host_caps(&self, environment: &impl Environment) -> u8 {
+        if self.chip != super::Chip::Rtl8192de {
+            return 0;
+        }
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192de())
+        else {
+            return 0;
+        };
+        let Some((rf_type, disable_amsdu_8k)) = self.rtl8192de_ht_facts() else {
+            return 0;
+        };
+        environment.domain().map_or(0, |domain| {
+            super::super::rtl8192de::ht::host_capabilities(base, &domain, rf_type, disable_amsdu_8k)
+        })
+    }
     /// RTL8821AE: the host-API capability bits
     /// (`rtl8821ae::vht::host_capabilities`) of the staged calibration
     /// envelope under current host policy; 0 for every other chip, without
@@ -2100,6 +2160,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let mut plan = if (self.station.ht.is_some()
             || self.rtl8821ae_ht()
             || self.rtl8192ee_ht()
+            || self.rtl8192de_ht()
             || self.rtl8192ce_ht()
             || self.rtl8723be_ht())
             && has_wmm
@@ -2113,6 +2174,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 let wide = self.rtl8192ee_wide(&candidate, environment)?;
                 let two = self.rtl8192ee_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
                 super::super::rtl8192ee::ht::local(wide.is_some(), two)
+            } else if self.chip == super::Chip::Rtl8192de {
+                let wide = self.rtl8192de_wide(&candidate, environment)?;
+                let two = self.rtl8192de_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
+                let (rf_type, disable_amsdu_8k) = self.rtl8192de_ht_facts().ok_or(Error::State)?;
+                super::super::rtl8192de::ht::local(wide.is_some(), rf_type, two, disable_amsdu_8k)
             } else if self.chip == super::Chip::Rtl8723be {
                 let wide = self.rtl8723be_wide(&candidate, environment)?;
                 super::super::rtl8723be::ht::local(wide.is_some())
@@ -2452,6 +2518,30 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             self.packet.ce92.min_space_cfg = min_space;
                             self.check_station_policy(environment)?;
                             self.packet.ht = true;
+                        } else if self.chip == super::Chip::Rtl8192de {
+                            // `rtl_op_bss_info_changed(BSS_CHANGED_HT)`:
+                            // `HW_VAR_SHORTGI_DENSITY`, `_AMPDU_FACTOR` and
+                            // `_AMPDU_MIN_SPACE` (`rtl8192de::ht::timing`);
+                            // the HT SIFS came with `mac->mode` at peer
+                            // preparation.
+                            if !self.rtl8192de_ht() {
+                                return Err(Error::Profile);
+                            }
+                            let facts = self.packet.de92.facts.ok_or(Error::State)?;
+                            let mut min_space = self.packet.de92.min_space_cfg;
+                            self.station_publication(environment, || {
+                                super::super::rtl8192de::ht::timing(
+                                    &self.io,
+                                    facts.mode,
+                                    &mut min_space,
+                                    facts.rf_type,
+                                    profile.peer_ampdu_factor(),
+                                    profile.peer_mpdu_density(),
+                                )
+                            })?;
+                            self.packet.de92.min_space_cfg = min_space;
+                            self.check_station_policy(environment)?;
+                            self.packet.ht = true;
                         } else if self.chip == super::Chip::Rtl8723be {
                             // `rtl_op_bss_info_changed(BSS_CHANGED_HT)`:
                             // `HW_VAR_SHORTGI_DENSITY`, `_AMPDU_FACTOR` and
@@ -2481,6 +2571,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             super::Chip::Rtl8821ae
                                 | super::Chip::Rtl8192ee
                                 | super::Chip::Rtl8192ce
+                                | super::Chip::Rtl8192de
                                 | super::Chip::Rtl8723be
                         )
                     {
@@ -2738,6 +2829,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 ))
             } else if self.rtl8192ce_ht() {
                 self.rtl8192ce_local_ht20()
+            } else if self.rtl8192de_ht() {
+                self.rtl8192de_local_ht20()
             } else if self.rtl8723be_ht() {
                 self.rtl8723be_local_ht20()
             } else {
@@ -2776,6 +2869,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     }
                     if self.station.native_associated {
                         self.update_station_edca(&candidate.bss.information_elements, environment)?;
+                        if self.chip == super::Chip::Rtl8192de {
+                            // `rtl_swlps_beacon`: the software-LPS beacon
+                            // decision for the associated BSSID.
+                            if let Some(aid) = self.station.aid {
+                                let _ =
+                                    self.de92_swlps_beacon(frame.bytes(), candidate.bss.bssid, aid);
+                            }
+                        }
                     }
                     self.station.last_peer = now;
                 }
@@ -3469,11 +3570,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         .await?;
         self.check_station_policy(environment)
     }
-    /// `rtl92d_update_hal_rate_mask(sta, level)` for the 2.4 GHz legacy
-    /// peer (`supp_rates[0]` = the association's legacy intersection,
+    /// `rtl92d_update_hal_rate_mask(sta, level)` for the peer
+    /// (`supp_rates[0]` = the association's legacy intersection,
     /// `wireless_mode` B for `supp_rates[0] <= 0xf` else G as
-    /// `rtl_op_sta_add` derives it; HT is not admitted on this profile),
-    /// inside the `N92D` envelope's current authority. The mask must be a
+    /// `rtl_op_sta_add` derives it; N24G/N5G with the negotiated HT
+    /// MCS mask and SGI when an HT profile is negotiated), inside the
+    /// `N92D` envelope's current authority. The mask must be a
     /// non-empty subset of the current permission's admitted rates.
     async fn install_rtl8192de_station_rate_mask(
         &mut self,
@@ -3482,20 +3584,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         environment: &impl Environment,
     ) -> Result<(), Error> {
         use super::super::rtl8192de::{h2c, rate::WirelessMode};
-        if self.station.ht_profile.is_some() || self.rtl8192de_power.is_none() {
+        let permission = self.rtl8192de_power.ok_or(Error::State)?;
+        let ht = self.station.ht_profile;
+        if ht.is_some() && !super::super::rtl8192de::ht::admitted(&permission) {
             return Err(Error::Profile);
         }
         let supp = u32::from(rates & 0xfff);
         let peer = h2c::Peer {
-            mode: if supp <= 0xf {
-                WirelessMode::B
-            } else {
-                WirelessMode::G
+            mode: match ht {
+                Some(_) if permission.operating().is_5ghz() => WirelessMode::N5g,
+                Some(_) => WirelessMode::N24g,
+                None if supp <= 0xf => WirelessMode::B,
+                None => WirelessMode::G,
             },
             supp_rates: [supp, 0],
-            rx_mask: [0; 2],
-            sgi20: false,
-            sgi40: false,
+            rx_mask: ht.map_or([0; 2], |p| [p.tx_mcs()[0], p.tx_mcs()[1]]),
+            sgi20: ht.is_some_and(|p| p.tx_sgi20()),
+            sgi40: ht.is_some_and(|p| p.tx_sgi40()),
+            // No SMPS state is negotiated (`HtNegotiation` carries
+            // none); Linux's default is dynamic, not static.
             mimo_ps_static: false,
             ap_or_adhoc: false,
             aid: 0,
@@ -3585,6 +3692,41 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let owner = &mut *self;
         power_wait(base, None, None, None, None, grant, environment, async {
             owner.rtl8192ce_dm_watchdog(pwdb)?;
+            Ok(())
+        })
+        .await?;
+        self.check_station_policy(environment)?;
+        Ok(false)
+    }
+    /// RTL8192DE DM watchdog step (`rtl92d_dm_watchdog`, every
+    /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save):
+    /// the composed false-alarm statistics, DIG, dynamic TX power,
+    /// EDCA turbo and PWDB monitor
+    /// (`packet_owner.rs::de92_dm_watchdog`), inside the `N92D`
+    /// envelope's current authority. Linux's watchdog has
+    /// `rtl92d_dm_refresh_rate_adaptive_mask` commented out, so no mask is
+    /// ever re-sent: returns `false`.
+    async fn rtl8192de_watchdog(&mut self, environment: &impl Environment) -> Result<bool, Error> {
+        if !self.station.ra.due(environment.now_ms())
+            || self.leisure()
+            || !self.station_linked()
+            || !self.transmit_ready()
+            || self.rate_mask().is_none()
+        {
+            return Ok(false);
+        }
+        self.check_station_policy(environment)?;
+        let pwdb = self.station.ra.smoothed();
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        let owner = &mut *self;
+        power_wait(base, None, None, None, None, grant, environment, async {
+            owner.rtl8192de_dm_watchdog(pwdb).await?;
             Ok(())
         })
         .await?;
@@ -3694,11 +3836,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return result;
         }
         if self.chip == super::Chip::Rtl8192de {
-            // `rtl92de_dm_watchdog` has `rtl92d_dm_refresh_rate_adaptive_mask`
-            // commented out: the mask installed at association is never
-            // refreshed. Its DIG / dynamic TX power / EDCA turbo steps are
-            // not composed (the `rtl92de_hw_init` values stay).
-            return Ok(false);
+            let result = self.rtl8192de_watchdog(environment).await;
+            if result.is_err() {
+                self.abort_station();
+            }
+            return result;
         }
         if self.chip == super::Chip::Rtl8821ae {
             let result = self.rtl8821ae_watchdog(environment).await;

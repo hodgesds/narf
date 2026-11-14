@@ -3602,8 +3602,13 @@ is the factory identity — and retains the firmware owner, which runs
   chip (`REG_SYS_CFG` version bits), an autoloaded map (`REG_9346CR`
   BIT(5)) and a PROM mode whose function bandset holds 2.4 GHz (a
   dual-dual MAC0 stays diagnostic); the signed `N92D` envelope still
-  gates the channel at `prepare_rtl8192de`. Not composed: HT/40 MHz and 5 GHz on 92DE, DIG / dynamic TX power /
-  EDCA turbo watchdog steps, software LPS, RX RSSI, ASPM.
+  gates the channel at `prepare_rtl8192de`. Composed: HT/40 MHz on
+  92DE (offer, admission, TX/RX, `BSS_CHANGED_HT` timing), DIG /
+  dynamic TX power / EDCA turbo watchdog steps, software-LPS
+  decisions (enter-core gate, beacon TIM decision, sleep interval),
+  RX RSSI from the PHY status (`rx_pwdb_all`). Not composed: ASPM,
+  and the software-LPS RF sleep/awake execution
+  (`rtl_ps_set_rf_state` has no NARF primitive).
 
 ## 4. Invariants
 

@@ -86,6 +86,7 @@ pub mod init;
 pub mod lck;
 pub mod lifecycle;
 pub mod llt;
+pub mod lps;
 pub mod mac;
 pub mod packet;
 pub mod phy;
