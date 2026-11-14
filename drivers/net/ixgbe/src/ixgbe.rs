@@ -496,6 +496,12 @@ pub enum IxgbeError {
     TxTimeout,
     /// MSI-X capability not present / could not be enabled.
     MsixUnavailable,
+    /// SR-IOV bus-half failure (`narf_bus::sriov::enable_sriov` /
+    /// `disable_sriov`).
+    SriovBus(narf_bus::sriov::SriovError),
+    /// `sriov_enable` with no probe-retained bus authority
+    /// (fixture-built instance).
+    SriovNoAuthority,
     /// Catch-all.
     Other(&'static str),
 }
@@ -643,6 +649,22 @@ pub struct Ixgbe {
     /// by `configure_vmdq` so a VT re-enable starts from a clean
     /// VF epoch instead of inheriting stale MACs / API versions.
     pub vf_table: IrqSafeSpinLock<vmdq::VfTable>,
+    /// Wired SR-IOV geometry from the bus half
+    /// (`narf_bus::sriov::SriovEnabled`), `None` while SR-IOV is
+    /// off. Set only by [`Ixgbe::sriov_enable_with`] after both
+    /// halves succeed, cleared only by [`Ixgbe::sriov_disable_with`];
+    /// the VF enumeration lane reads the VF offset/stride/BAR
+    /// geometry from here. Never held across the `vmdq_cfg` lock.
+    sriov: IrqSafeSpinLock<Option<narf_bus::sriov::SriovEnabled>>,
+    /// Probe-retained bus authority for the SR-IOV config-space
+    /// half: the PF's `BusDevice` plus a copy of probe's
+    /// `Cap<BusDeviceCap, Write>` (the cap `enable_sriov` requires;
+    /// its doc says the caller must have claimed the capability).
+    /// Per-instance, not a module static, so a second PF keeps its
+    /// own authority (issue #795 shape). `None` in fixtures, which
+    /// drive the admin path through `sriov_enable_with` with a fake
+    /// bus half instead.
+    sriov_auth: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>>,
     /// FCoE RX queues programmed by `configure_fcoe`, if it ran
     /// (empty = not configured). The queue list is the FCRETA
     /// round-robin set; DDP contexts themselves are consumer
@@ -822,7 +844,7 @@ impl Ixgbe {
     /// init.
     pub unsafe fn bring_up_with_config(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
         queue_config: queues::QueueConfig,
     ) -> Result<Arc<Self>, IxgbeError> {
         // SAFETY: caller-authority over the device.
@@ -1035,6 +1057,8 @@ impl Ixgbe {
             vlan_filter: IrqSafeSpinLock::new(None),
             vmdq_cfg: IrqSafeSpinLock::new(None),
             vf_table: IrqSafeSpinLock::new(vmdq::VfTable::new()),
+            sriov: IrqSafeSpinLock::new(None),
+            sriov_auth: IrqSafeSpinLock::new(Some((*device, *cap))),
             fcoe_queues: IrqSafeSpinLock::new(Vec::new()),
             fdir_state: IrqSafeSpinLock::new(fdir::FdirState::default()),
             wol_armed: IrqSafeSpinLock::new(None),
@@ -1826,9 +1850,10 @@ impl Ixgbe {
     /// and VF `i` maps to pool `i+1`; the VF mailbox pump
     /// ([`Ixgbe::vt_mailbox_pump_step`]) starts serving VF messages
     /// from the 10 ms watchdog tick once this runs, and PCI SR-IOV
-    /// config-space enablement is a separate follow-up. Callers
-    /// must have RX/TX quiesced while reprogramming the queue
-    /// layout.
+    /// config-space enablement is [`Ixgbe::sriov_enable`], which
+    /// runs this as its device half (or reuses a config already
+    /// applied here). Callers must have RX/TX quiesced while
+    /// reprogramming the queue layout.
     pub fn configure_vmdq(&self, cfg: vmdq::VmdqConfig) -> Result<(), IxgbeError> {
         {
             let mut bank = queues::MmioBank::new(&self.mmio);
@@ -1862,6 +1887,143 @@ impl Ixgbe {
         }
         *self.rss_cfg.lock() = Some(rss);
         Ok(())
+    }
+
+    /// VFs currently enabled through the admin path (0 = SR-IOV off).
+    pub fn sriov_num_vfs(&self) -> u16 {
+        self.sriov.lock().map(|s| s.num_vfs).unwrap_or(0)
+    }
+
+    /// Wired VF geometry from the bus half, if SR-IOV is enabled:
+    /// VF offset / stride / device id plus the programmed VF BAR
+    /// windows. Read by the VF enumeration lane. `recover()`
+    /// replays the recorded VMDq config after a controller reset
+    /// and never touches config space, so the stored geometry
+    /// stands across a reset.
+    pub fn sriov_geometry(&self) -> Option<narf_bus::sriov::SriovEnabled> {
+        *self.sriov.lock()
+    }
+
+    /// Enable SR-IOV over an injected bus half: the fixture seam
+    /// for the admin path (the real bus half needs live ECAM, so
+    /// fixtures pass a recording closure instead). Order is Linux
+    /// `ixgbe_pci_sriov_enable` — device half first
+    /// (`__ixgbe_enable_sriov`), then `pci_enable_sriov` — so a
+    /// bus-half failure leaves VT configured with zero VFs on the
+    /// bus, a clean retryable state that needs no rollback, and a
+    /// device-half failure means the bus half never runs. This is
+    /// the deliberate ixgbe divergence from igb's bus-first order
+    /// (`Igb::sriov_enable_with` owns rollback): igb's device
+    /// half is internal, while ixgbe's is the public
+    /// [`Ixgbe::configure_vmdq`], and Linux ixgbe itself enables
+    /// the device half before `pci_enable_sriov`. Counts are
+    /// 1..=63 (Linux caps the 82599's 64 VFs at 63 so the PF keeps
+    /// resources; in-tree `vmdq::MAX_VFS`), refused before either
+    /// half runs. A repeat enable with the same count is an
+    /// idempotent no-op returning the stored geometry; a different
+    /// count while enabled is refused — disable first, then enable.
+    /// `cfg` applies only when VT is not yet configured; a prior
+    /// `configure_vmdq` stands (the issue's "once configure_vmdq
+    /// has run" flow). The `sriov` lock is never held across the
+    /// `vmdq_cfg` lock.
+    fn sriov_enable_with(
+        &self,
+        num_vfs: u16,
+        cfg: vmdq::VmdqConfig,
+        bus_enable: impl FnOnce() -> Result<narf_bus::sriov::SriovEnabled, narf_bus::sriov::SriovError>,
+    ) -> Result<narf_bus::sriov::SriovEnabled, IxgbeError> {
+        if num_vfs == 0 || num_vfs as usize > vmdq::MAX_VFS {
+            return Err(IxgbeError::Other("ixgbe SR-IOV VF count outside 1..=63"));
+        }
+        if let Some(enabled) = *self.sriov.lock() {
+            if enabled.num_vfs == num_vfs {
+                return Ok(enabled);
+            }
+            return Err(IxgbeError::Other(
+                "ixgbe SR-IOV already enabled with a different VF count (disable first)",
+            ));
+        }
+        // Device half first (Linux `__ixgbe_enable_sriov`): skip
+        // when VT is already configured — the earlier
+        // `configure_vmdq` stands, with its own pool/replication
+        // choice.
+        if self.vmdq_cfg.lock().is_none() {
+            self.configure_vmdq(cfg)?;
+        }
+        let enabled = bus_enable().map_err(IxgbeError::SriovBus)?;
+        *self.sriov.lock() = Some(enabled);
+        Ok(enabled)
+    }
+
+    /// Enable SR-IOV with `num_vfs` VFs through the production bus
+    /// half (Linux `ixgbe_pci_sriov_configure` / `sriov_numvfs`
+    /// write): device half first — [`Ixgbe::configure_vmdq`] with
+    /// the standard VT config (64 pools x 2 queues, default pool 0,
+    /// replication on) unless VT is already configured — then the
+    /// bus half over the probe-retained authority
+    /// (`narf_bus::sriov::enable_sriov` — programs the SR-IOV cap,
+    /// sizes + programs the VF BARs, writes NumVFs and sets VF
+    /// Enable). Requires a retained bus authority (fixtures have
+    /// none; they use `sriov_enable_with`). The resulting VF
+    /// geometry is stored for the enumeration lane; see
+    /// [`Ixgbe::sriov_geometry`].
+    ///
+    /// No MSI-X gate, unlike igb: the ixgbe mailbox pump is polled
+    /// (no ISR exists in this driver yet), and no MSI-X
+    /// prerequisite appears in Linux ixgbe's SR-IOV enable path
+    /// (`ixgbe_pci_sriov_enable` caps the count at 63 and calls
+    /// `pci_enable_sriov` with no MSI-X check). If silicon shows
+    /// VFs need PF MSI-X vectors, add the gate then.
+    pub fn sriov_enable(&self, num_vfs: u16) -> Result<narf_bus::sriov::SriovEnabled, IxgbeError> {
+        let Some((device, cap)) = *self.sriov_auth.lock() else {
+            return Err(IxgbeError::SriovNoAuthority);
+        };
+        self.sriov_enable_with(num_vfs, vmdq::VmdqConfig::standard(), || {
+            narf_bus::sriov::enable_sriov(&cap, &device, num_vfs)
+        })
+    }
+
+    /// Disable SR-IOV over an injected bus half (fixture seam,
+    /// mirror of [`Ixgbe::sriov_enable_with`]): the bus half only
+    /// (`disable_sriov` — VF Enable + Memory Space Enable cleared,
+    /// NumVFs zeroed), mirroring Linux `ixgbe_pci_sriov_disable`
+    /// minus the device reset. VT mode stays programmed:
+    /// `configure_vmdq` has no inverse (no pre-images are
+    /// recorded), so a device-half teardown is a follow-up — the
+    /// mailbox pump has no VFs left to serve, and `recover()`
+    /// replays the recorded VMDq config on the next reset either
+    /// way. Idempotent: disabling with nothing enabled succeeds
+    /// without calling the bus half. A bus-half failure is
+    /// reported, but the stored geometry is cleared — the driver no
+    /// longer tracks VFs it cannot address, and the caller must
+    /// treat config space as possibly still enabled.
+    fn sriov_disable_with(
+        &self,
+        bus_disable: impl FnOnce() -> Result<(), narf_bus::sriov::SriovError>,
+    ) -> Result<(), IxgbeError> {
+        if self.sriov.lock().is_none() {
+            return Ok(());
+        }
+        let result = bus_disable().map_err(IxgbeError::SriovBus);
+        *self.sriov.lock() = None;
+        result?;
+        Ok(())
+    }
+
+    /// Disable SR-IOV through the production bus half (Linux
+    /// `sriov_numvfs` write of 0 / `ixgbe_pci_sriov_configure(0)`):
+    /// bus half only; see [`Ixgbe::sriov_disable_with`]. Idempotent
+    /// when already off.
+    pub fn sriov_disable(&self) -> Result<(), IxgbeError> {
+        let auth = *self.sriov_auth.lock();
+        self.sriov_disable_with(|| match auth {
+            Some((device, cap)) => narf_bus::sriov::disable_sriov(&cap, &device),
+            // No bus half was ever enabled (fixture shape) — the
+            // seam returns early without calling this when there is
+            // no geometry, so this only fires with geometry stored
+            // but no authority, which probe never produces.
+            None => Err(narf_bus::sriov::SriovError::AuthorityRevoked),
+        })
     }
 
     /// Run one PF↔VF mailbox-pump pass (Linux `ixgbe_msg_task` via

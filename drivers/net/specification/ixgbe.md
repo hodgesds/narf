@@ -402,8 +402,19 @@ GET_QUEUES (2 TX + 2 RX queues). All other message types
 (SET_MULTICAST, RETA, RSS key, XCAST, link state, IPSEC,
 features) are NACKed. `Ixgbe::configure_vmdq` enables VT mode
 opt-in; the dispatcher is fixture-proven but awaits an
-interrupt pump, and PCI SR-IOV config-space enablement is a
-separate follow-up (see §14).
+interrupt pump. PCI SR-IOV config-space enablement is delivered
+by `Ixgbe::sriov_enable` (#2050): device half first
+(`configure_vmdq`, standard config, unless VT is already
+configured), then the bus half via `narf_bus::sriov::enable_sriov`
+over the probe-retained authority, 1..=63 VFs (Linux caps the
+82599's 64 at 63 so the PF keeps resources); the VF geometry is
+stored for the enumeration lane (`sriov_geometry`), and
+`sriov_disable` tears down the bus half only (VT mode stays
+programmed — `configure_vmdq` has no inverse). Order follows
+Linux `ixgbe_pci_sriov_enable` (device half, then
+`pci_enable_sriov`), deliberately not igb's bus-first order,
+and there is no MSI-X gate (the mailbox pump is polled; no
+MSI-X prerequisite appears in Linux ixgbe's enable path).
 
 ## 13k. Advanced RX descriptors + RX metadata (issue #1270)
 
@@ -1010,9 +1021,10 @@ Remainders (not silently dropped):
 Per the v0.1 exclusion list, still open after this stream:
 
 - SR-IOV / VMDq remainders (see §13b): the mailbox interrupt
-  pump; PCI SR-IOV config-space enablement; SET_MULTICAST and
+  pump; SET_MULTICAST and
   the other NACKed message types; 32-VF mode; spoof-check
-  enforcement; DCB+VT combinations. The #1397 address question
+  enforcement; DCB+VT combinations. PCI SR-IOV config-space
+  enablement landed (#2050). The #1397 address question
   is settled (datasheet dual-map; `ixgbe/regs.rs` is the shared
   authority), and the MRQE 0xB + per-pool RETA composition is
   done (#1489).

@@ -5342,6 +5342,316 @@ kernel_test_in!(
     smoke_ixgbe_vmdq_mailbox_pump_idle_and_ack
 );
 
+// ── SR-IOV PCI config-space enablement (#2050) ────────────────────
+
+/// Fake 82599 for the SR-IOV admin tests: a 128 KiB MMIO backing
+/// page (covers every VT register the device half programs) plus
+/// single-queue rings, no pumps. The bus half is injected, so no
+/// live ECAM is needed.
+struct SriovFixture {
+    device: Ixgbe,
+    _mmio_mem: DmaBuffer,
+}
+
+impl SriovFixture {
+    fn new() -> Self {
+        // 128 KiB fake BAR0 (82599 BAR0 window).
+        let mut mem = alloc_coherent(128 * 1024, DomainId::DRIVER_0).unwrap();
+        mem.as_mut_slice().fill(0);
+        let csr = MmioRegion {
+            phys: mem.phys_addr(),
+            virt: mem.as_mut_ptr() as u64,
+            len: mem.len() as u64,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let queue_config = super::queues::QueueConfig::single();
+        let ring_len = queue_config.ring_len;
+        let ring_bytes = ring_len * 16;
+        let tx_ring = alloc_coherent(ring_bytes, DomainId::DRIVER_0).unwrap();
+        let mut tx_pool = alloc::vec::Vec::with_capacity(ring_len);
+        for _ in 0..ring_len {
+            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).unwrap());
+        }
+        let rx_ring = alloc_coherent(ring_bytes, DomainId::DRIVER_0).unwrap();
+        let mut rx_pool = alloc::vec::Vec::with_capacity(ring_len);
+        for _ in 0..ring_len {
+            rx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).unwrap());
+        }
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let device = Ixgbe {
+            mmio: csr,
+            tx_queues: alloc::vec![TxQueueState {
+                tx_ring,
+                tx_pool,
+                tx_tail: IrqSafeSpinLock::new(0),
+                tx_posted_at: IrqSafeSpinLock::new(alloc::vec![0u64; ring_len]),
+            }],
+            rx_queues: alloc::vec![RxQueueState {
+                rx_ring,
+                rx_slots: IrqSafeSpinLock::new(rx_pool),
+                rx_head: IrqSafeSpinLock::new(0),
+            }],
+            rx_mirror: IrqSafeSpinLock::new(rx_prod),
+            mac,
+            link_up: IrqSafeSpinLock::new(true),
+            did: IXGBE_DEV_82599EB,
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
+            lan_id: 0,
+            queue_config,
+            rss_cfg: IrqSafeSpinLock::new(None),
+            dcb_cfg: IrqSafeSpinLock::new(None),
+            vlan_filter: IrqSafeSpinLock::new(None),
+            vmdq_cfg: IrqSafeSpinLock::new(None),
+            vf_table: IrqSafeSpinLock::new(super::vmdq::VfTable::new()),
+            fcoe_queues: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            fdir_state: IrqSafeSpinLock::new(super::fdir::FdirState::default()),
+            wol_armed: IrqSafeSpinLock::new(None),
+            eee_state: IrqSafeSpinLock::new(None),
+            wol_board_cap: IrqSafeSpinLock::new(super::wol::WolBoardCap::default()),
+            quiesced: IrqSafeSpinLock::new(false),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            tx_epoch: AtomicU64::new(0),
+            addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+            ifname: crate::publish::IfName::new(),
+            msix: None,
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            sriov: IrqSafeSpinLock::new(None),
+            sriov_auth: IrqSafeSpinLock::new(None),
+        };
+        core::mem::drop(tx_cons);
+        Self {
+            device,
+            _mmio_mem: mem,
+        }
+    }
+}
+
+/// Canned bus-half geometry for the SR-IOV admin seam tests
+/// (the bus test's fake VF device id; the values are fixture
+/// constants, not hardware claims).
+fn fake_sriov_enabled(num_vfs: u16) -> narf_bus::sriov::SriovEnabled {
+    narf_bus::sriov::SriovEnabled {
+        num_vfs,
+        vf_offset: 8,
+        vf_stride: 1,
+        vf_device_id: 0xABCD,
+        page_size: 4096,
+        vf_bars: [None; 6],
+    }
+}
+
+fn smoke_ixgbe_sriov_admin_enable_disable() -> TestResult {
+    use super::regs::REG_MRQC;
+    use super::vmdq::{
+        VmdqConfig, MAX_VFS, MRQC_MRQE_MASK, MRQC_VMDQEN, REG_VT_CTL, VT_CTL_POOL_MASK,
+    };
+    let fixture = SriovFixture::new();
+    let ixgbe = &fixture.device;
+    let enable_calls = AtomicU64::new(0);
+    let disable_calls = AtomicU64::new(0);
+    // Device half runs before the bus half: VT must be configured
+    // when the bus half is called.
+    let enabled = match ixgbe.sriov_enable_with(2, VmdqConfig::standard(), || {
+        if ixgbe.vmdq_cfg.lock().is_none() {
+            return Err(narf_bus::sriov::SriovError::ConfigFailed);
+        }
+        enable_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(fake_sriov_enabled(2))
+    }) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("sriov_enable_with failed on the fixture"),
+    };
+    if enabled != fake_sriov_enabled(2)
+        || enable_calls.load(Ordering::SeqCst) != 1
+        || disable_calls.load(Ordering::SeqCst) != 0
+        || ixgbe.sriov_num_vfs() != 2
+        || ixgbe.sriov_geometry() != Some(fake_sriov_enabled(2))
+    {
+        return TestResult::Fail("enable did not wire the VF geometry");
+    }
+    // SAFETY: fixture-owned MMIO backing.
+    let (mrqc, vt_ctl) = unsafe { (ixgbe.mmio.read32(REG_MRQC), ixgbe.mmio.read32(REG_VT_CTL)) };
+    if mrqc & MRQC_MRQE_MASK != MRQC_VMDQEN || vt_ctl & VT_CTL_POOL_MASK != 0 {
+        return TestResult::Fail("enable did not run the device half");
+    }
+    // Same-count re-enable is an idempotent no-op: the bus half
+    // is not called again.
+    if ixgbe
+        .sriov_enable_with(2, VmdqConfig::standard(), || {
+            Err(narf_bus::sriov::SriovError::ConfigFailed)
+        })
+        .is_err()
+    {
+        return TestResult::Fail("same-count re-enable was not an idempotent no-op");
+    }
+    if enable_calls.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("same-count re-enable touched the bus half");
+    }
+    // Resize while enabled, and counts outside 1..=63, are
+    // refused before either half runs.
+    for bad in [3u16, 0, MAX_VFS as u16 + 1] {
+        if ixgbe
+            .sriov_enable_with(bad, VmdqConfig::standard(), || {
+                enable_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_sriov_enabled(bad))
+            })
+            .is_ok()
+        {
+            return TestResult::Fail("bad VF count or resize was accepted");
+        }
+    }
+    if enable_calls.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("refused enable touched the bus half");
+    }
+    if ixgbe
+        .sriov_disable_with(|| {
+            disable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .is_err()
+    {
+        return TestResult::Fail("sriov_disable_with failed on the fixture");
+    }
+    if disable_calls.load(Ordering::SeqCst) != 1
+        || ixgbe.sriov_num_vfs() != 0
+        || ixgbe.sriov_geometry().is_some()
+    {
+        return TestResult::Fail("disable did not clear the stored geometry");
+    }
+    // VT mode stays programmed after a bus-half disable
+    // (`configure_vmdq` has no inverse — see `sriov_disable_with`).
+    // SAFETY: fixture-owned MMIO backing.
+    let mrqc = unsafe { ixgbe.mmio.read32(REG_MRQC) };
+    if mrqc & MRQC_MRQE_MASK != MRQC_VMDQEN {
+        return TestResult::Fail("disable tore down VT mode");
+    }
+    // Re-enable proves the disable left the device reusable, and a
+    // disable with nothing enabled is an idempotent no-op.
+    if ixgbe
+        .sriov_enable_with(2, VmdqConfig::standard(), || {
+            enable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_sriov_enabled(2))
+        })
+        .is_err()
+    {
+        return TestResult::Fail("re-enable after disable failed");
+    }
+    if enable_calls.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("re-enable did not run the bus half");
+    }
+    if ixgbe
+        .sriov_disable_with(|| {
+            disable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .is_err()
+    {
+        return TestResult::Fail("second disable failed");
+    }
+    if ixgbe
+        .sriov_disable_with(|| {
+            disable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .is_err()
+    {
+        return TestResult::Fail("idempotent disable failed");
+    }
+    if disable_calls.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("idempotent disable touched the bus half");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_sriov_admin_enable_disable);
+
+fn smoke_ixgbe_sriov_admin_device_first() -> TestResult {
+    use super::vmdq::VmdqConfig;
+    // The issue's primary flow: `configure_vmdq` first, then the
+    // bus half. The stored config stands — the seam does not
+    // re-apply its own.
+    let fixture = SriovFixture::new();
+    let ixgbe = &fixture.device;
+    if ixgbe.configure_vmdq(VmdqConfig::standard()).is_err() {
+        return TestResult::Fail("configure_vmdq failed on the fixture");
+    }
+    let enable_calls = AtomicU64::new(0);
+    if ixgbe
+        .sriov_enable_with(2, VmdqConfig::standard(), || {
+            if ixgbe.vmdq_cfg.lock().is_none() {
+                return Err(narf_bus::sriov::SriovError::ConfigFailed);
+            }
+            enable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_sriov_enabled(2))
+        })
+        .is_err()
+    {
+        return TestResult::Fail("enable after configure_vmdq failed");
+    }
+    if enable_calls.load(Ordering::SeqCst) != 1 || ixgbe.sriov_num_vfs() != 2 {
+        return TestResult::Fail("enable after configure_vmdq did not wire VFs");
+    }
+    // Device-half failure: an invalid VT config means the bus half
+    // never runs and no geometry is stored.
+    let fixture = SriovFixture::new();
+    let ixgbe = &fixture.device;
+    let enable_calls = AtomicU64::new(0);
+    let bad_cfg = VmdqConfig {
+        default_pool: 64,
+        replication: true,
+    };
+    if ixgbe
+        .sriov_enable_with(2, bad_cfg, || {
+            enable_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_sriov_enabled(2))
+        })
+        .is_ok()
+    {
+        return TestResult::Fail("enable succeeded with an invalid VMDq config");
+    }
+    if enable_calls.load(Ordering::SeqCst) != 0
+        || ixgbe.sriov_num_vfs() != 0
+        || ixgbe.vmdq_cfg.lock().is_some()
+    {
+        return TestResult::Fail("device-half failure ran the bus half");
+    }
+    // Bus-half failure: the device half already ran (VT is on), but
+    // no geometry is stored — a clean, retryable state.
+    let fixture = SriovFixture::new();
+    let ixgbe = &fixture.device;
+    if ixgbe
+        .sriov_enable_with(2, VmdqConfig::standard(), || {
+            Err(narf_bus::sriov::SriovError::CapNotPresent)
+        })
+        .is_ok()
+    {
+        return TestResult::Fail("enable succeeded without an SR-IOV capability");
+    }
+    if ixgbe.sriov_num_vfs() != 0 || ixgbe.vmdq_cfg.lock().is_none() {
+        return TestResult::Fail("bus-half failure stored geometry or skipped the device half");
+    }
+    // Production path without a probe-retained authority.
+    let fixture = SriovFixture::new();
+    let ixgbe = &fixture.device;
+    if !matches!(
+        ixgbe.sriov_enable(2),
+        Err(super::IxgbeError::SriovNoAuthority)
+    ) {
+        return TestResult::Fail("sriov_enable without authority did not refuse");
+    }
+    if ixgbe.sriov_disable().is_err() {
+        return TestResult::Fail("sriov_disable without authority was not an idempotent no-op");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_sriov_admin_device_first);
+
 fn smoke_ixgbe_vmdq_mailbox_pump_reset_event() -> TestResult {
     use super::queues::RegBank;
     use super::vmdq::{mailbox_pump_step, vflre, vflrec, VfTable};
@@ -5931,6 +6241,8 @@ impl TxTimeoutFixture {
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            sriov: IrqSafeSpinLock::new(None),
+            sriov_auth: IrqSafeSpinLock::new(None),
         };
         // Bring-up register program (steps 6–7), minus the IRQ
         // install: queue rings, receive filter, master RX enable.
