@@ -516,6 +516,12 @@ static TASK_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
 static THREAD_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
+/// Linux TID -> outer TGID for threads recorded in `THREAD_CGROUP`.
+/// Kept outside `THREAD_CGROUP` (and never locked together with it) so
+/// whole-process exit (`task_exited`) and domain migration (`place`) can
+/// sweep or migrate all sibling threads belonging to a tgid.
+static THREAD_TGID: IrqSafeSpinLock<BTreeMap<u64, u64>> = IrqSafeSpinLock::new(BTreeMap::new());
+
 /// Mutate the reverse index without recursively charging allocations made by
 /// the map itself. The charge hook resolves a pid through `TASK_CGROUP`, so a
 /// BTreeMap node allocation/free while this lock is held must be treated as
@@ -753,6 +759,7 @@ fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
     }
     dst.members.lock().insert(pid);
     mutate_task_cgroup(|membership| membership.insert(pid, dst.clone()));
+    migrate_domain_threads(pid, dst);
     if let Some(prev) = &prev {
         prev.notify_events();
     }
@@ -781,6 +788,7 @@ fn place_forced(pid: u64, dst: &Arc<Cgroup>) {
     }
     dst.members.lock().insert(pid);
     mutate_task_cgroup(|membership| membership.insert(pid, dst.clone()));
+    migrate_domain_threads(pid, dst);
     if let Some(prev) = &prev {
         prev.notify_events();
     }
@@ -823,7 +831,28 @@ fn thread_cgroup_of(tid: u64, tgid: u64) -> Arc<Cgroup> {
         .unwrap_or_else(|| cgroup_of(tgid))
 }
 
-fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+/// When a process moves between Domain cgroups (`place` / `place_forced`),
+/// migrate any of its non-`Threaded` threads recorded in `THREAD_TGID` so they
+/// do not remain stranded in the previous domain's `cgroup.threads`.
+fn migrate_domain_threads(pid: u64, dst: &Arc<Cgroup>) {
+    let candidate_tids: Vec<u64> = {
+        THREAD_TGID
+            .lock()
+            .iter()
+            .filter_map(|(&tid, &tgid)| (tgid == pid).then_some(tid))
+            .collect()
+    };
+    for tid in candidate_tids {
+        let cur = { THREAD_CGROUP.lock().get(&tid).cloned() };
+        if let Some(cur_cg) = cur {
+            if *cur_cg.cg_type.lock() != CgroupType::Threaded {
+                let _ = place_thread(tid, pid, dst);
+            }
+        }
+    }
+}
+
+fn place_thread(tid: u64, tgid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
     if tid == 0 {
         return Err(FsError::InvalidData);
     }
@@ -836,6 +865,9 @@ fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
     }
     let previous = THREAD_CGROUP.lock().get(&tid).cloned();
     if previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, dst)) {
+        if tgid != 0 {
+            THREAD_TGID.lock().entry(tid).or_insert(tgid);
+        }
         return Ok(());
     }
     if let Some(old) = &previous {
@@ -853,6 +885,9 @@ fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
     }
     dst.threads.lock().insert(tid);
     THREAD_CGROUP.lock().insert(tid, dst.clone());
+    if tgid != 0 {
+        THREAD_TGID.lock().insert(tid, tgid);
+    }
     dst.notify_events();
     Ok(())
 }
@@ -861,7 +896,7 @@ fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
 /// creating thread's css_set, which may be a threaded-subtree override.
 pub fn fork_thread_inherit(parent_tid: u64, parent_tgid: u64, child_tid: u64) {
     let dst = thread_cgroup_of(parent_tid, parent_tgid);
-    let _ = place_thread(child_tid, &dst);
+    let _ = place_thread(child_tid, parent_tgid, &dst);
 }
 
 /// `clone3(CLONE_INTO_CGROUP|CLONE_THREAD)` placement. Linux permits a
@@ -882,7 +917,7 @@ pub fn attach_thread_by_path(
     if !Arc::ptr_eq(&threaded_domain(&src), &threaded_domain(&dst)) {
         return Err(FsError::Unsupported);
     }
-    place_thread(child_tid, &dst)
+    place_thread(child_tid, parent_tgid, &dst)
 }
 
 /// `CLONE_INTO_CGROUP` (clone3): place the freshly-cloned `pid` into the
@@ -906,6 +941,7 @@ pub fn attach_by_path(path: &str, pid: u64) -> Result<(), FsError> {
 /// A non-leader thread exited: drop its threaded-subtree override and
 /// controller charges. Process membership remains owned by `task_exited`.
 pub fn thread_exited(tid: u64) {
+    THREAD_TGID.lock().remove(&tid);
     let previous = THREAD_CGROUP.lock().remove(&tid);
     if let Some(cgroup) = previous {
         detach_chain(&cgroup, tid);
@@ -921,6 +957,24 @@ pub fn task_exited(pid: u64) {
         detach_chain(&cg, pid);
         cg.members.lock().remove(&pid);
         cg.notify_events();
+    }
+    // Sweep any thread entry for `pid` itself or sibling `CLONE_THREAD` TIDs
+    // belonging to `pid` that outlived leader teardown or raced thread cleanup,
+    // so `cgroup.threads` cannot stay non-empty and wedge `populated 1`.
+    thread_exited(pid);
+    let sibling_tids: Vec<u64> = {
+        let mut tgid_map = THREAD_TGID.lock();
+        let tids: Vec<u64> = tgid_map
+            .iter()
+            .filter_map(|(&tid, &tgid)| (tgid == pid).then_some(tid))
+            .collect();
+        for tid in &tids {
+            tgid_map.remove(tid);
+        }
+        tids
+    };
+    for tid in sibling_tids {
+        thread_exited(tid);
     }
     TASK_NS_ROOT.lock().remove(&pid);
 }
