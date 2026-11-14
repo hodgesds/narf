@@ -125,7 +125,7 @@ fn smoke_ath9k_wow_patterns_and_support_follow_revision() -> TestResult {
     // hw.c: AR9462 2.0+/AR9565 1.1+ get the full 16 patterns.
     for (chip, mac_rev) in [(Chip::Ar9462, 2), (Chip::Ar9462, 3), (Chip::Ar9565, 2)] {
         let revision = rev(chip, mac_rev);
-        if Wow::new(&revision).max_patterns != MAX_NUM_PATTERN as u8
+        if Wow::new(&revision, false).max_patterns != MAX_NUM_PATTERN as u8
             || WowlanSupport::for_revision(&revision) != WowlanSupport::Full
             || WowlanSupport::for_revision(&revision).n_patterns() != 14
         {
@@ -141,7 +141,7 @@ fn smoke_ath9k_wow_patterns_and_support_follow_revision() -> TestResult {
         (Chip::Ar9300, 0),
     ] {
         let revision = rev(chip, mac_rev);
-        if Wow::new(&revision).max_patterns != MAX_NUM_PATTERN_LEGACY as u8
+        if Wow::new(&revision, false).max_patterns != MAX_NUM_PATTERN_LEGACY as u8
             || WowlanSupport::for_revision(&revision) != WowlanSupport::Legacy
             || WowlanSupport::for_revision(&revision).n_patterns() != MAX_NUM_USER_PATTERN as u8
             || WowlanSupport::for_revision(&revision).pattern_max_len() != MAX_PATTERN_SIZE
@@ -193,7 +193,7 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_wow_apply_pattern_programs_slots_and_refuses_overflow() -> TestResult {
-    let mut wow = Wow::new(&rev(Chip::Ar9462, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
     let mut model = Model::default();
     let [disassoc, _] = disassoc_deauth_patterns(&AP_MAC);
     if wow
@@ -266,7 +266,7 @@ fn smoke_ath9k_wow_apply_pattern_programs_slots_and_refuses_overflow() -> TestRe
     if wow.apply_pattern(&mut model, &pattern, &mask, 16, 22) != Err(BringUpError::BadState) {
         return TestResult::Fail("WoW pattern 16 past capacity was admitted");
     }
-    let mut legacy = Wow::new(&rev(Chip::Ar9485, 1));
+    let mut legacy = Wow::new(&rev(Chip::Ar9485, 1), false);
     if legacy.apply_pattern(&mut model, &pattern, &mask, 8, 22) != Err(BringUpError::BadState) {
         return TestResult::Fail("legacy WoW pattern 8 past capacity was admitted");
     }
@@ -278,7 +278,7 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_wow_enable_ar9462_two_ghz() -> TestResult {
-    let mut wow = Wow::new(&rev(Chip::Ar9462, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
     let mut model = Model::default();
     let triggers = AH_WOW_MAGIC_PATTERN_EN | AH_WOW_LINK_CHANGE | AH_WOW_BEACON_MISS;
     if wow
@@ -372,7 +372,7 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_wow_enable_ar9485_five_ghz_no_triggers() -> TestResult {
-    let mut wow = Wow::new(&rev(Chip::Ar9485, 1));
+    let mut wow = Wow::new(&rev(Chip::Ar9485, 1), false);
     let mut model = Model::default();
     if wow
         .enable(
@@ -425,7 +425,7 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_wow_wakeup_decodes_and_clears() -> TestResult {
-    let mut wow = Wow::new(&rev(Chip::Ar9462, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
     wow.event_mask = 0x320100;
     wow.event_mask2 = 0x100;
     let mut model = Model::default();
@@ -459,7 +459,7 @@ fn smoke_ath9k_wow_wakeup_decodes_and_clears() -> TestResult {
         return TestResult::Fail("WoW wakeup did not clear events and restore RSSI_THR");
     }
     // WOW4-only wake: the second status register alone reports a user pattern.
-    let mut wow = Wow::new(&rev(Chip::Ar9565, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9565, 2), false);
     wow.event_mask2 = 0x100;
     let mut model = Model::default();
     model.registers.insert(0x8370, 0x100);
@@ -472,7 +472,7 @@ fn smoke_ath9k_wow_wakeup_decodes_and_clears() -> TestResult {
         return TestResult::Fail("WOW4-only wakeup mis-decoded");
     }
     // AR9300 has no TSF2 branch: no DIRECT_CONNECT read at all.
-    let mut wow = Wow::new(&rev(Chip::Ar9300, 0));
+    let mut wow = Wow::new(&rev(Chip::Ar9300, 0), false);
     let mut model = Model::default();
     let wakeup = match wow.wakeup(&mut model, &rev(Chip::Ar9300, 0)) {
         Ok(wakeup) => wakeup,
@@ -482,7 +482,7 @@ fn smoke_ath9k_wow_wakeup_decodes_and_clears() -> TestResult {
         return TestResult::Fail("AR9300 wakeup took a TSF2 branch");
     }
     // A vanished device is refused, not decoded.
-    let mut wow = Wow::new(&rev(Chip::Ar9462, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
     let mut model = Model::default();
     model.registers.insert(0x825c, u32::MAX);
     if wow.wakeup(&mut model, &rev(Chip::Ar9462, 2)) != Err(BringUpError::DeviceGone) {
@@ -496,7 +496,7 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_wow_sleep_rx_stop_timeout_aborts() -> TestResult {
-    let mut wow = Wow::new(&rev(Chip::Ar9462, 2));
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
     let mut model = Model::default();
     model.registers.insert(0x0008, 0xc);
     if wow.enable(
@@ -522,4 +522,84 @@ fn smoke_ath9k_wow_sleep_rx_stop_timeout_aborts() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003/wow",
     smoke_ath9k_wow_sleep_rx_stop_timeout_aborts
+);
+
+fn smoke_ath9k_wow_mci_enabled_keeps_awake_and_skips_pwr_sav() -> TestResult {
+    // The flag is stored exactly as constructed.
+    if !Wow::new(&rev(Chip::Ar9462, 2), true).mci_enabled
+        || Wow::new(&rev(Chip::Ar9462, 2), false).mci_enabled
+    {
+        return TestResult::Fail("Wow::new did not store the MCI flag");
+    }
+    // The probe site computes it from the landed capability:
+    // `btcoex::mci_is_enabled` over `fill_cap_info` (§3.12). MCI parts
+    // with the capability set, and only those, get the flag.
+    use super::super::{btcoex, fill_cap_info, AR_ENT_OTP_49GHZ_DISABLE};
+    if !btcoex::mci_is_enabled(true, fill_cap_info(Chip::Ar9462, 0))
+        || !btcoex::mci_is_enabled(true, fill_cap_info(Chip::Ar9565, 0))
+        || btcoex::mci_is_enabled(true, fill_cap_info(Chip::Ar9485, 0))
+        || btcoex::mci_is_enabled(true, fill_cap_info(Chip::Ar9462, AR_ENT_OTP_49GHZ_DISABLE))
+        || btcoex::mci_is_enabled(false, fill_cap_info(Chip::Ar9462, 0))
+    {
+        return TestResult::Fail("probe-time mci_enabled differs from fill_cap_info");
+    }
+    // `ar9003_wow.c::ath9k_hw_wow_enable` with MCI enabled (AR9462 2.0,
+    // same triggers and keep-alive as the plain enable trace): the
+    // `AR_RTC_KEEP_AWAKE` write (`reg.h` `0x7034`, value `0x2`) fires
+    // twice — once in `enable` (line 445) and once in the WoW sleep
+    // (line 61) — while `AR_STA_ID1_PWR_SAV` is never set.
+    let keep_alive = KeepAlive {
+        tx_chainmask: 3,
+        is_2ghz: true,
+        sta_mac: STA_MAC,
+        ap_mac: AP_MAC,
+    };
+    let triggers = AH_WOW_MAGIC_PATTERN_EN | AH_WOW_LINK_CHANGE | AH_WOW_BEACON_MISS;
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), true);
+    let mut model = Model::default();
+    if wow
+        .enable(&mut model, &rev(Chip::Ar9462, 2), triggers, &keep_alive)
+        .is_err()
+    {
+        return TestResult::Fail("MCI WoW enable refused");
+    }
+    let keep_awake = model
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Write(0x7034, 0x2)))
+        .count();
+    if keep_awake != 2 {
+        return TestResult::Fail("MCI WoW enable did not write AR_RTC_KEEP_AWAKE twice");
+    }
+    if last_write(&model.ops, 0x8004) != Some(0) {
+        return TestResult::Fail("MCI WoW enable set AR_STA_ID1_PWR_SAV");
+    }
+    // The force-wake write and the event mask are untouched by the MCI
+    // branches.
+    if !model.ops.contains(&Op::Write(0x704c, 2)) || wow.event_mask != 0x320000 {
+        return TestResult::Fail("MCI WoW enable changed the non-MCI tail");
+    }
+    // Negative control: the same enable without MCI never touches
+    // `AR_RTC_KEEP_AWAKE` and sets `PWR_SAV` (`0x40000`).
+    let mut wow = Wow::new(&rev(Chip::Ar9462, 2), false);
+    let mut model = Model::default();
+    if wow
+        .enable(&mut model, &rev(Chip::Ar9462, 2), triggers, &keep_alive)
+        .is_err()
+    {
+        return TestResult::Fail("non-MCI WoW enable refused");
+    }
+    if model
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::Write(0x7034, _)))
+        || last_write(&model.ops, 0x8004) != Some(0x40000)
+    {
+        return TestResult::Fail("non-MCI WoW enable took an MCI branch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003/wow",
+    smoke_ath9k_wow_mci_enabled_keeps_awake_and_skips_pwr_sav
 );

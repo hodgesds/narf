@@ -377,6 +377,13 @@ pub(super) fn probe(
         identity.tx_chainmask
     );
     let (vendor, device_id) = (device.id.vendor, device.id.device);
+    // `hw.h::ath9k_hw_mci_is_enabled`: `common.btcoex_enabled &&
+    // hw_caps & ATH9K_HW_CAP_MCI`, with `hw_caps` from `fill_cap_info`
+    // (`identify`). Coexistence is enabled in this tree — the same
+    // `true` the MCI owner wiring passes to `btcoex::init_scheme`
+    // (#2028); once that lands, the owner-held `Btcoex` becomes the
+    // single source for this value and this call site follows it.
+    let mci_enabled = ar9003::btcoex::mci_is_enabled(true, identified.hw_caps);
     // ath9k_init_wow: `ATH9K_PCI_WOW` driver_data (AR9462 subsystems only).
     let wow = ar9003::wow::init_capable(
         ar9003::wow::driver_data(
@@ -386,7 +393,7 @@ pub(super) fn probe(
         ),
         false,
     )
-    .then(|| ar9003::wow::Wow::new(&revision));
+    .then(|| ar9003::wow::Wow::new(&revision, mci_enabled));
     *WOWLAN_SUPPORT.lock() = wow.map(|_| wowlan_support_for(&revision));
     let owner = Arc::new(Mutex::new(Owner {
         mmio,
@@ -1111,7 +1118,9 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
 /// MAC, AP). ANI/calibration and the hang check stop with the supervisor
 /// (`suspended`). `Ok(false)`: WoW does not apply (Linux `ret = 1`) or
 /// arming failed; the caller then takes the ordinary suspend, which retires
-/// the station. MCI/btcoex is not involved (`mci_enabled` false).
+/// the station. The MCI branches in `ath9k_hw_wow_enable` follow the
+/// probe-time `mci_enabled` flag; the MCI engine itself (setup, GPM
+/// handling, profile flush) is still owner-wiring work (#2028).
 fn wow_suspend(o: &mut Owner) -> Result<bool, narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
     let (Some(mut wow), Some(config)) = (o.wow, WOWLAN.lock().clone()) else {
