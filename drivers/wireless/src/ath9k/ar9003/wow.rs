@@ -20,9 +20,11 @@
 //! through `ar9003::irq::{wow, restore}`, the associated-station gate, the
 //! `ath9k_hw_configpcipowersave(false)` SerDes restore `Wakeup` reports, and
 //! the RX restart through the in-place reset). The MCI interaction
-//! (`ath9k_hw_mci_is_enabled`) stays false until the MCI owner is live; the
-//! `mci_enabled` flag threads the Linux branches so they stay visible. The
-//! TSF2 restart in `wow_wakeup` is reported as `tsf2_restart`: Linux only
+//! (`ath9k_hw_mci_is_enabled`) is wired at probe: `Wow::new` takes the
+//! `mci_enabled` flag computed from `fill_cap_info`'s `hw_caps` via
+//! `btcoex::mci_is_enabled` (§3.12), so `enable` takes the Linux MCI
+//! branches on MCI-capable parts. The TSF2 restart in `wow_wakeup` is
+//! reported as `tsf2_restart`: Linux only
 //! restarts it when a TSF2 generic timer was enabled
 //! (`hw.c::ath9k_hw_gen_timer_start_tsf2`), and this tree has no
 //! generic-timer table yet.
@@ -377,10 +379,11 @@ pub(in crate::ath9k) struct Wakeup {
 }
 
 /// `hw.h::struct ath9k_hw_wow`: the programmed WoW event masks and the
-/// pattern capacity, plus the MCI fact the WoW layer consults. MCI is
-/// #1912 §1 and is not implemented: `mci_enabled` is always false until
-/// it lands, and the branches below keep Linux's shape so the MCI
-/// interaction stays visible instead of silently vanishing.
+/// pattern capacity, plus the MCI fact the WoW layer consults
+/// (`hw.h::ath9k_hw_mci_is_enabled`). The caller supplies it at
+/// construction from the landed MCI capability — `btcoex::mci_is_enabled`
+/// over `fill_cap_info`'s `hw_caps` (§3.12) — so the branches below take
+/// Linux's MCI shape on MCI-capable parts instead of silently vanishing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::ath9k) struct Wow {
     pub event_mask: u32,
@@ -392,8 +395,11 @@ pub(in crate::ath9k) struct Wow {
 impl Wow {
     /// `hw.c::ath9k_hw_fill_cap_info` under `CONFIG_ATH9K_WOW`:
     /// `MAX_NUM_PATTERN` for AR9462 2.0-or-later / AR9565 1.1-or-later,
-    /// `MAX_NUM_PATTERN_LEGACY` otherwise.
-    pub(in crate::ath9k) fn new(revision: &Revision) -> Self {
+    /// `MAX_NUM_PATTERN_LEGACY` otherwise. `mci_enabled` is the
+    /// probe-time `btcoex::mci_is_enabled` value (capability from
+    /// `fill_cap_info`); the caller owns it, so the flag follows the
+    /// landed MCI without this layer holding the engine.
+    pub(in crate::ath9k) fn new(revision: &Revision, mci_enabled: bool) -> Self {
         Self {
             event_mask: 0,
             event_mask2: 0,
@@ -402,7 +408,7 @@ impl Wow {
             } else {
                 MAX_NUM_PATTERN_LEGACY as u8
             },
-            mci_enabled: false,
+            mci_enabled,
         }
     }
 
@@ -728,8 +734,10 @@ fn keep_alive_pattern(io: &mut impl RegisterIo, revision: &Revision, params: &Ke
 /// stop Rx DMA (a missed 10 ms stop aborts the sleep with `Timeout`),
 /// clear `AR_DC_TSF2_ENABLE` when no TSF2 timer is armed, then force
 /// wake on interrupt. With MCI enabled Linux sets `PWR_SAV` only when
-/// the MCI WLAN power-save state is disabled; that state does not exist
-/// here yet, so `mci_enabled` conservatively skips the set (see #1912 §1).
+/// the MCI WLAN power-save state is disabled
+/// (`ar9003_mci_state(MCI_STATE_GET_WLAN_PS_STATE)`); that state has no
+/// reader in this tree yet, so `mci_enabled` conservatively skips the
+/// set rather than guessing the state.
 fn set_powermode_wow_sleep(
     io: &mut impl RegisterIo,
     revision: &Revision,
