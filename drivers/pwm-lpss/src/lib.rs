@@ -34,18 +34,18 @@
 //! before waiting for `SW_UPDATE` to clear; bypass parts (Broxton)
 //! wait first, then set ENABLE.
 //!
-//! REBASE NOTE (#1700): the `narf_pwm` controller registry
-//! (`register_controller` / `lookup_controller`) does not exist on
-//! main yet — it arrives with open draft PR #1700. Until then,
-//! `probe()` stashes each bound controller in [`probed_controllers`]
-//! and no DT consumer can resolve it by phandle. Once #1700 lands,
-//! `probe()` gains one line per controller,
-//! `narf_pwm::register_controller(phandle, dev.clone())`, and this
-//! note (plus the remainder tracked on #1699) goes away. Which
-//! phandle a PCI-enumerated LPSS function registers under is itself
-//! a #1700-followup question: the registry is DT-phandle-keyed and
-//! LPSS on x86 is PCI/ACPI-enumerated, so there is no DT node to
-//! take a phandle from.
+//! Registry phandle (#1722, resolved): a probed LPSS function
+//! registers under the phandle of its own Devicetree node, found
+//! the way Linux `pci_set_of_node` finds it — descend from the
+//! PCI host bridge through the `reg` devfn hops
+//! ([`dt_phandle_for`], same shape as ath11k's `dt_facts`). A DT
+//! `pwm-fan` node whose `pwms` phandle names that node then
+//! resolves the LPSS controller through the `narf_pwm` registry,
+//! exactly as the #1700 probe path expects. No phandle is invented:
+//! when the boot carries no DTB (x86_64, the only real LPSS
+//! platform) or the DT describes no node for this function,
+//! `probe()` registers nothing and the controller stays reachable
+//! only through [`probed_controllers`].
 
 extern crate alloc;
 
@@ -453,9 +453,12 @@ impl PwmDevice for LpssPwm {
 // ── Probe / registry ────────────────────────────────────────────────
 
 /// Controllers bound by `probe()` this boot. Kept alive here (and
-/// visible via [`probed_controllers`]) until the `narf_pwm`
-/// controller registry lands with #1700 — see the REBASE NOTE at the
-/// top of this module.
+/// visible via [`probed_controllers`]) as the fallback for boots
+/// with no DT node for the function: `narf_bus::boot_dtb()` is
+/// `None` on x86_64, so on real LPSS hardware `probe()` registers
+/// nothing in the `narf_pwm` registry and this static is the only
+/// way to reach the controller. It is not a leftover of the #1700
+/// rebase — removing it would strand every x86 LPSS controller.
 static PROBED: IrqSafeSpinLock<Vec<Arc<LpssPwm>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Controllers bound by `probe()` this boot, as `PwmDevice`s.
@@ -467,14 +470,47 @@ pub fn probed_controllers() -> Vec<Arc<dyn PwmDevice>> {
         .collect()
 }
 
-/// PCI probe: claim an LPSS PWM function, map BAR0, and stash the
-/// bound controller.
-///
-/// REBASE NOTE (#1700): once the `narf_pwm` controller registry
-/// lands, add `narf_pwm::register_controller(phandle, dev.clone())`
-/// here (with whatever phandle the DT/ACPI layer assigns this
-/// PCI-enumerated function) so DT consumers such as `pwm-fan` can
-/// resolve it.
+/// The phandle of `device`'s own Devicetree node in `blob`, if the
+/// tree describes one: Linux `pci_set_of_node` — descend from the
+/// PCI host bridge through the `reg` devfn hops
+/// (`narf_firmware_fdt::for_pci_function`) and read the node's
+/// `phandle` property. `None` when the tree has no (unique) node
+/// for this function. This is the phandle `probe()` registers the
+/// controller under, so a DT consumer whose `pwms` specifier names
+/// that node resolves this controller; the same shape as ath11k's
+/// `dt_facts` for its calibration variant. Pure over the blob so
+/// tests can drive it without a boot DTB.
+pub fn dt_phandle_for_in(blob: &[u8], device: &BusDevice) -> Option<u32> {
+    let narf_bus::BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    let devfns = narf_bus::pci::devfn_path(device)?;
+    let mut phandle = None;
+    narf_firmware_fdt::for_pci_function(blob, addr.segment, &devfns, |_, props, _| {
+        phandle = narf_firmware_fdt::prop_phandle(props);
+    });
+    phandle
+}
+
+/// [`dt_phandle_for_in`] against the boot Devicetree
+/// (`narf_bus::boot_dtb`); `None` without a DTB (x86_64, a
+/// DTB-less boot) or without a node for this function.
+pub fn dt_phandle_for(device: &BusDevice) -> Option<u32> {
+    const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+    let phys = narf_bus::boot_dtb()?;
+    // SAFETY: the boot path reserved the firmware DTB in RAM covered
+    // by the kernel direct map; `discover` validates the header and
+    // bounds every slice by the blob's own `totalsize` (capped here)
+    // — the same contract ath11k's `dt_facts` and bus DMA rely on.
+    let blob = unsafe { narf_firmware_fdt::discover(phys.raw() as usize, MAX_DTB_SIZE) }?;
+    dt_phandle_for_in(blob, device)
+}
+
+/// PCI probe: claim an LPSS PWM function, map BAR0, stash the bound
+/// controller, and — when the boot Devicetree describes a node for
+/// this function — register it in the `narf_pwm` registry under
+/// that node's phandle so DT consumers such as `pwm-fan` can
+/// resolve it ([`dt_phandle_for`]).
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
     let Some(info) = board_info_for(device.id.device) else {
         return Err(ProbeError::NotForThisDriver);
@@ -497,6 +533,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
     };
     let dev = Arc::new(LpssPwm::new(name.clone(), mmio, info));
     PROBED.lock().push(Arc::clone(&dev));
+    // Register under the function's own DT node phandle when the
+    // boot tree describes one, so DT consumers can resolve it; a
+    // DTB-less boot (x86_64) registers nothing and the controller
+    // stays reachable only via `probed_controllers()`.
+    if let Some(phandle) = dt_phandle_for(&device) {
+        narf_pwm::register_controller(phandle, Arc::clone(&dev) as Arc<dyn PwmDevice>);
+    }
 
     let _ = core::fmt::write(
         &mut narf_console::Writer,
@@ -1000,4 +1043,250 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers-pwm-lpss", smoke_lpss_timing_bits_pure);
+
+    // ── DT phandle resolution (#1722) ───────────────────────────────
+
+    /// One big-endian u32 cell for the DT fixture builder.
+    fn be32(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    /// The fixture PCI function: Bay Trail LPSS PWM (DID 0x0f08) at
+    /// 00:1a.0, devfn 0xd0 — a root-bus function, so `devfn_path`
+    /// is exactly `[0xd0]` however many devices the bus registry
+    /// holds (no bridge can claim secondary bus 0).
+    fn lpss_fixture_device() -> BusDevice {
+        let addr = narf_bus::PcieAddr::new(0, 0, 0x1a, 0);
+        BusDevice {
+            addr: narf_bus::BusAddr::Pcie(addr),
+            id: narf_bus::DeviceId {
+                vendor: LPSS_VENDOR,
+                device: LPSS_DID_BYT_0,
+                class: 0,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+            },
+            kind: narf_bus::BusKind::Pcie {
+                addr,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        }
+    }
+
+    /// Fixture board DT, built with the shared `narf-firmware-fdt`
+    /// synthetic-tree builder (same one ath10k's DT tests use): one
+    /// PCI host bridge, the LPSS function node under it carrying
+    /// phandle 0x2a and `#pwm-cells = <2>`, and a `/fan` node
+    /// whose `pwms = <0x2a 0 40000>` names that phandle — the board
+    /// shape the #1700 `pwm-fan` probe expects. The function node's
+    /// `reg` phys.hi cell is `(bus << 16) | (devfn << 8)` per the
+    /// PCI Bus Binding: bus 0, devfn 0xd0 → 0x0000d000.
+    fn lpss_dt_fixture() -> Vec<u8> {
+        use narf_firmware_fdt::pci::tests::{build_tree, TreeNode};
+        let phandle = be32(0x2a);
+        let pwm_cells = be32(2);
+        let reg = [
+            0x00, 0x00, 0xd0, 0x00, // phys.hi: bus 0, devfn 0xd0
+            0x00, 0x00, 0x00, 0x00, // phys.mid
+            0x00, 0x00, 0x00, 0x00, // phys.lo
+        ];
+        let pwms: Vec<u8> = [be32(0x2a), be32(0), be32(40_000)]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let levels: Vec<u8> = [be32(0), be32(255)].iter().flatten().copied().collect();
+        let lpss = [TreeNode {
+            name: "pwm@1a,0",
+            props: &[
+                ("reg", reg.as_slice()),
+                ("phandle", phandle.as_slice()),
+                ("#pwm-cells", pwm_cells.as_slice()),
+            ],
+            children: &[],
+        }];
+        build_tree(&[
+            TreeNode {
+                name: "pcie@0",
+                props: &[("device_type", b"pci\0".as_slice())],
+                children: &lpss,
+            },
+            TreeNode {
+                name: "fan",
+                props: &[
+                    ("compatible", b"pwm-fan\0".as_slice()),
+                    ("pwms", pwms.as_slice()),
+                    ("cooling-levels", levels.as_slice()),
+                ],
+                children: &[],
+            },
+        ])
+    }
+
+    fn smoke_lpss_dt_phandle_resolves() -> TestResult {
+        let blob = lpss_dt_fixture();
+        match dt_phandle_for_in(&blob, &lpss_fixture_device()) {
+            Some(0x2a) => TestResult::Pass,
+            Some(_) => TestResult::Fail("LPSS node phandle must be 0x2a"),
+            None => TestResult::Fail("DT node phandle must resolve for the fixture function"),
+        }
+    }
+    kernel_test_in!("drivers-pwm-lpss", smoke_lpss_dt_phandle_resolves);
+
+    fn smoke_lpss_dt_phandle_misses_without_node() -> TestResult {
+        use narf_firmware_fdt::pci::tests::{build_tree, TreeNode};
+        let device = lpss_fixture_device();
+        // No host bridge at all: nothing to descend from.
+        let blob = build_tree(&[TreeNode {
+            name: "fan",
+            props: &[("compatible", b"pwm-fan\0".as_slice())],
+            children: &[],
+        }]);
+        if dt_phandle_for_in(&blob, &device).is_some() {
+            return TestResult::Fail("bridge-less tree must not resolve a phandle");
+        }
+        // Bridge present, but the function node carries a different
+        // devfn (00:1b.0 → 0xd8): this function has no node.
+        let reg = [
+            0x00, 0x00, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let phandle = be32(0x2a);
+        let other = [TreeNode {
+            name: "pwm@1b,0",
+            props: &[("reg", reg.as_slice()), ("phandle", phandle.as_slice())],
+            children: &[],
+        }];
+        let blob = build_tree(&[TreeNode {
+            name: "pcie@0",
+            props: &[("device_type", b"pci\0".as_slice())],
+            children: &other,
+        }]);
+        if dt_phandle_for_in(&blob, &device).is_some() {
+            return TestResult::Fail("wrong-devfn node must not resolve a phandle");
+        }
+        // Two nodes claiming the same devfn: ambiguous, so
+        // `for_pci_function` refuses — a phandle must be unique.
+        let reg = [
+            0x00, 0x00, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let dup = [
+            TreeNode {
+                name: "pwm@1a,0",
+                props: &[("reg", reg.as_slice()), ("phandle", phandle.as_slice())],
+                children: &[],
+            },
+            TreeNode {
+                name: "pwm@1a,0-dup",
+                props: &[("reg", reg.as_slice()), ("phandle", phandle.as_slice())],
+                children: &[],
+            },
+        ];
+        let blob = build_tree(&[TreeNode {
+            name: "pcie@0",
+            props: &[("device_type", b"pci\0".as_slice())],
+            children: &dup,
+        }]);
+        if dt_phandle_for_in(&blob, &device).is_some() {
+            return TestResult::Fail("ambiguous duplicate nodes must not resolve a phandle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers-pwm-lpss",
+        smoke_lpss_dt_phandle_misses_without_node
+    );
+
+    /// [`run_with_sim`] through the `PwmDevice` trait object: the
+    /// registry hands consumers an `Arc<dyn PwmDevice>`, so the
+    /// end-to-end test drives that handle, not the concrete type.
+    fn run_trait_with_sim<F, Fut>(pwm: AllocArc<dyn PwmDevice>, sim: Sim, op: F) -> u32
+    where
+        F: FnOnce(AllocArc<dyn PwmDevice>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), PwmError>> + Send + 'static,
+    {
+        narf_scheduler::__reset_queues_for_test();
+        let outcome = AllocArc::new(AtomicU32::new(0xFF));
+        let done = sim.done.clone();
+        let fut = op(pwm);
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            let r = fut.await;
+            o.store(
+                match r {
+                    Ok(()) => 0,
+                    Err(PwmError::InvalidChannel) => 1,
+                    Err(PwmError::InvalidConfig) => 2,
+                    Err(PwmError::HardwareError) => 3,
+                },
+                Ordering::SeqCst,
+            );
+            done.store(true, Ordering::Release);
+        });
+        narf_scheduler::spawn(sim.run());
+        narf_scheduler::run_until_empty();
+        outcome.load(Ordering::SeqCst)
+    }
+
+    fn smoke_lpss_dt_fan_resolves_and_spins() -> TestResult {
+        // The #1700 probe path, end to end at the registry level:
+        // the fixture fan node's `pwms` phandle (0x2a) is the
+        // phandle of the LPSS function's own DT node. Resolve it
+        // the way `probe()` does, register the LPSS controller
+        // under it, then look it up the way `dt_pwm_fan_probe`
+        // does (`lookup_controller(desc.controller)`) and drive
+        // channel 0 through the looked-up handle: 1 kHz / 50%
+        // must program ctrl 0x380 and set ENABLE. (The fan-side
+        // decode + governor drive against a registered 0x2a
+        // controller is already covered by
+        // `smoke_dt_pwm_fan_probe_registers_and_drives` in
+        // drivers-platform; this test proves the looked-up
+        // controller is the LPSS block.)
+        let blob = lpss_dt_fixture();
+        let phandle = match dt_phandle_for_in(&blob, &lpss_fixture_device()) {
+            Some(p) => p,
+            None => {
+                return TestResult::Fail("DT node phandle must resolve for the fixture function")
+            }
+        };
+        narf_pwm::unregister_controller(phandle);
+        let (mmio, ptr) = fake_mmio();
+        let pwm = AllocArc::new(LpssPwm::new(String::from("test-byt"), mmio, &LPSS_BYT_INFO));
+        narf_pwm::register_controller(phandle, AllocArc::clone(&pwm) as AllocArc<dyn PwmDevice>);
+        let looked_up = match narf_pwm::lookup_controller(phandle) {
+            Some(p) => p,
+            None => {
+                narf_pwm::unregister_controller(phandle);
+                return TestResult::Fail("registered LPSS controller must look up by phandle");
+            }
+        };
+        if !AllocArc::ptr_eq(
+            &looked_up,
+            &(AllocArc::clone(&pwm) as AllocArc<dyn PwmDevice>),
+        ) {
+            narf_pwm::unregister_controller(phandle);
+            return TestResult::Fail("lookup must return the LPSS controller, not another device");
+        }
+        let sim = Sim {
+            mmio,
+            npwm: 1,
+            done: AllocArc::new(AtomicBool::new(false)),
+            saw_enable_with_update: AllocArc::new(AtomicBool::new(false)),
+        };
+        let code = run_trait_with_sim(looked_up, sim, |p| async move {
+            p.set_config(0, &cfg(1000, 500_000, Polarity::Normal))
+                .await?;
+            p.enable(0).await
+        });
+        // SAFETY: fake backing, channel 0 in range.
+        let ctrl = unsafe { fake_read(ptr, 0x00) };
+        narf_pwm::unregister_controller(phandle);
+        if code != 0 {
+            return TestResult::Fail("driving the looked-up LPSS controller failed");
+        }
+        if ctrl != 0x380 | PWM_ENABLE {
+            return TestResult::Fail("looked-up LPSS channel must end enabled at ctrl 0x80000380");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers-pwm-lpss", smoke_lpss_dt_fan_resolves_and_spins);
 }

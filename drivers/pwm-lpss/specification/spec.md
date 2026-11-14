@@ -26,9 +26,8 @@ bit or formula in this driver is invented.
 
 **Does NOT own:**
 - The `PwmDevice` trait or the controller registry — those live in
-  `pwm/` (`narf_pwm`). The registry arrives with open draft PR
-  #1700; this driver marks its registration call as a rebase
-  remainder instead of duplicating that draft.
+  `pwm/` (`narf_pwm`); the registry landed with #1700 (closed) and
+  this driver registers into it from `probe()` (#1722).
 - PWM consumers (fan, LED, backlight) — they take
   `Arc<dyn PwmDevice>` and are unaffected by which controller
   supplies it.
@@ -92,6 +91,21 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 pub fn probed_controllers() -> Vec<Arc<dyn PwmDevice>>;
 pub fn register_pci_driver();
 pub fn register_initcalls(); // Stage::Subsys "pwm-lpss"
+
+/// The phandle of `device`'s own Devicetree node: `probe()`
+/// registers the controller in the `narf_pwm` registry under this
+/// phandle, so a DT consumer whose `pwms` specifier names that node
+/// resolves this controller (#1722). Found the way Linux
+/// `pci_set_of_node` finds it — descend from the PCI host bridge
+/// through the `reg` devfn hops (`narf_firmware_fdt::
+/// for_pci_function`) and read the node's `phandle` property; the
+/// same shape as ath11k's `dt_facts`. `None` when the boot carries
+/// no DTB (x86_64, the only real LPSS platform) or the tree
+/// describes no (unique) node for this function — then `probe()`
+/// registers nothing and the controller stays reachable only via
+/// `probed_controllers()`. No phandle is invented.
+pub fn dt_phandle_for(device: &BusDevice) -> Option<u32>;
+pub fn dt_phandle_for_in(blob: &[u8], device: &BusDevice) -> Option<u32>;
 ```
 
 ### 3.3 Register model
@@ -150,6 +164,9 @@ Formulas (Linux `pwm_lpss_prepare`):
 ## 6. Dependencies
 
 - `narf-pwm`: `PwmDevice` / `PwmConfig` / `Polarity` / `PwmError`.
+- `narf-firmware-fdt`: `for_pci_function` / `prop_phandle` /
+  `discover` for the DT-node phandle lookup (`dt_phandle_for`); its
+  `pci::tests` synthetic-tree builder for the DT fixture tests.
 - `narf-bus`: PCI match registration, `map_bar`, `MmioRegion`,
   `set_command`.
 - `narf-lib`: async mutex, `IrqSafeSpinLock` (probed static).
@@ -165,12 +182,11 @@ Stage 5 "Silicon" — desktop/embedded bring-up (same stage as the
 
 ## 8. Open questions
 
-1. **Phandle for a PCI-enumerated controller.** The #1700
-   registry is keyed by DT phandle, but LPSS on x86 is
-   PCI/ACPI-enumerated and has no DT node. Which phandle (if any) a
-   probed LPSS function registers under is a #1700-followup
-   decision; tracked as a remainder on #1699. Until it is decided,
-   `probe()` stashes controllers in `probed_controllers()`.
+1. **Phandle for a PCI-enumerated controller — RESOLVED (#1722).**
+   The controller registers under the phandle of its own DT node,
+   found via `for_pci_function` (Linux `pci_set_of_node`). On a
+   DTB-less x86 boot it registers nowhere and `probed_controllers()`
+   stays the only path — that static is therefore kept, not removed.
 2. **Suspend/resume.** Linux removed the LPSS save/restore
    handlers (consumers re-apply state). NARF consumers
    (`PwmFan`, `LedPwm`) likewise re-apply on resume; no driver
