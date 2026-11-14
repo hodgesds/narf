@@ -235,6 +235,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         prepared: Arc<Mutex<Option<Prepared<I, M>>>>,
         factory: Arc<Factory>,
         environment: E,
+        initial_channel: u8,
     ) -> Self {
         let admission = environment
             .admission()
@@ -267,7 +268,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
-            lifecycle: lifecycle::Lifecycle::new(),
+            lifecycle: lifecycle::Lifecycle::with_channel(initial_channel),
             work: Mutex::new(None),
             scan_request: Mutex::new(()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
@@ -1609,25 +1610,26 @@ impl Environment for NativeEnvironment {
         if self.firmware().device_id() == super::regs::RTL_DEV_8192DE {
             // Retuning rebuilds through `rtl92de_card_disable` and the
             // `_rtl92de_init_mac` power prefix (`rebuild_native`);
-            // admission is the `N92D` 20 MHz permission on 2.4 GHz
-            // channels 1-11 of this function's bandset that
-            // `prepare_rtl8192de` re-derives.
+            // admission is the `N92D` 20 MHz permission on the requested
+            // channel under the current domain, gated by the
+            // `native_channel` gate for the function's mode/bandset
+            // (`super::rtl8192de::allow_channel`) — the same admission
+            // `prepare_rtl8192de` applies, so the 5 GHz plan admitted
+            // there is also admitted here.
             let mode = super::rtl8192de::mode_from_prom(
                 super::rtl8192de::Interface::Pci,
                 &factory.logical,
             )
             .ok_or(Error::Profile)?;
             let function = self.firmware().native().function().ok_or(Error::Profile)?;
-            if !(1..=11).contains(&channel)
-                || !super::rtl8192de::native_channel(channel, mode, function)
-            {
-                return Err(Error::Profile);
-            }
-            return super::rtl8192de::envelope::Calibration::load_registered(factory)
-                .map_err(|_| Error::Profile)?
-                .permission(&self.domain()?, channel)
-                .map(|_| ())
-                .map_err(|_| Error::Profile);
+            return super::rtl8192de::allow_channel(
+                factory,
+                &self.domain()?,
+                mode,
+                function,
+                channel,
+            )
+            .map_err(|_| Error::Profile);
         }
         let device = self.firmware().device_id();
         if super::rtl8192ce::is_8192ce(device) {

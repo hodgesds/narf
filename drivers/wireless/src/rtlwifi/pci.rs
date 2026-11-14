@@ -515,6 +515,13 @@ pub unsafe fn bring_up(
         did,
         RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8192DE
     ) || rtl8192ce;
+    // PCI function number of this device (one function per MAC on
+    // dual-function parts such as RTL8192DE); the EFUSE read and the
+    // cold bring-up channel both select from it.
+    let function = match device.addr {
+        narf_bus::BusAddr::Pcie(addr) => addr.function,
+        _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
+    };
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
@@ -550,10 +557,6 @@ pub unsafe fn bring_up(
         // SAFETY: BAR2 mapped and owned.
         unsafe { irq::disable_interrupts_for(&registers, did) };
 
-        let function = match device.addr {
-            narf_bus::BusAddr::Pcie(addr) => addr.function,
-            _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
-        };
         // rtl8723ae/hw.c::rtl8723e_read_eeprom_info selects the Wi-Fi EFUSE
         // bank (REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0) before reading it.
         if did == RTL_DEV_8723AE {
@@ -701,6 +704,23 @@ pub unsafe fn bring_up(
         .as_ref()
         .map(|_| Arc::new(super::prepare_native::Retained::new(None)));
     let name = narf_net::iface::reserve_name("wlan%d");
+    // The lifecycle starts on the function's own band default: a
+    // dual-dual RTL8192DE MAC0 function starts on 5 GHz channel 36 (its
+    // Linux default), every other function on channel 1, so cold
+    // bring-up provisions MAC0 on 5 GHz with no explicit retune. An
+    // unreadable PROM falls back to channel 1 and the prepare layer
+    // refuses, as before.
+    let initial_channel = if did == RTL_DEV_8192DE {
+        factory
+            .as_ref()
+            .and_then(|factory| {
+                super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
+                    .map(|mode| super::rtl8192de::default_channel(mode, function))
+            })
+            .unwrap_or(1)
+    } else {
+        1
+    };
     let native = match (&firmware, &prepared, &factory) {
         (Some(firmware), Some(prepared), Some(factory)) => {
             Some(Arc::new(super::interface::Device::new(
@@ -708,6 +728,7 @@ pub unsafe fn bring_up(
                 prepared.clone(),
                 factory.clone(),
                 super::interface::NativeEnvironment::new(firmware.clone()),
+                initial_channel,
             )))
         }
         _ => None,

@@ -601,6 +601,7 @@ impl Harness {
                 fallback_channel: IrqSafeSpinLock::new(None),
                 bus_power: IrqSafeSpinLock::new(None),
             },
+            1,
         ));
         *device.environment_for_test().device.lock() = Arc::downgrade(&device);
         device.admit_for_test();
