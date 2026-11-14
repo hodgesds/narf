@@ -182,9 +182,10 @@ fn install_proc_ext_hooks() {
     // name and ifindex rtnetlink reports, so udev's database (keyed on
     // ifindex) and NetworkManager agree about which device is which.
     narf_filesystem::install_net_snapshot_hook(|| {
+        let wireless_ifaces = narf_wireless::registry::list();
         narf_net::iface::snapshot_all()
             .into_iter()
-            .map(|nic| {
+            .map(move |nic| {
                 let pci_parent = narf_net::iface::driver_info(&nic.name).and_then(
                     |(driver, _version, bus_info)| {
                         narf_bus::devices().into_iter().find_map(|device| {
@@ -212,7 +213,9 @@ fn install_proc_ext_hooks() {
                     },
                 );
                 let is_wireless = nic.name.starts_with("wlan")
-                    || nic.link_layer == narf_net::iface::LinkLayer::Ieee80211Radiotap;
+                    || nic.name.starts_with("p2p-")
+                    || nic.link_layer == narf_net::iface::LinkLayer::Ieee80211Radiotap
+                    || wireless_ifaces.iter().any(|iface| iface.name() == nic.name);
                 narf_filesystem::sysfs::NetIfaceInfo {
                     loopback: nic.name == "lo",
                     name: nic.name,
@@ -378,6 +381,17 @@ fn install_net_stack() {
         "  net: queued {} canonical sysfs ADD event(s)",
         events,
     );
+    // Keep `/sys/class/net/<dev>` and uevents synchronized for interfaces
+    // registered after boot (e.g. async-firmware Wi-Fi radios and P2P links).
+    narf_net::iface::install_net_sysfs_hook(|event| match event {
+        narf_net::iface::NetSysfsEvent::Added(name)
+        | narf_net::iface::NetSysfsEvent::Updated(name) => {
+            narf_filesystem::sysfs::sync_net_iface(name, true);
+        }
+        narf_net::iface::NetSysfsEvent::Removed(name) => {
+            narf_filesystem::sysfs::unpublish_net_iface(name);
+        }
+    });
     // QEMU SLIRP static config: the user-mode network backend always
     // hands the guest 10.0.2.15/24 with the gateway + DNS at 10.0.2.2.
     // Assign it statically to the virtio-net iface so a guest server is

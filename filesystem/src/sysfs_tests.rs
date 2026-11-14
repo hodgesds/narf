@@ -1103,6 +1103,137 @@ kernel_test_in!(
     smoke_sysfs_net_wireless_phy80211_symlink_and_devtype
 );
 
+fn smoke_sysfs_net_sync_and_unpublish_late_wireless() -> TestResult {
+    use crate::sysfs::{NetIfaceInfo, NetPciParent};
+
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    crate::sysfs::install_net_snapshot_hook(Vec::new);
+    crate::sysfs::populate_net_class();
+
+    let mut reader = crate::uevent::UeventReader::new();
+
+    fn virtual_wlan() -> Vec<NetIfaceInfo> {
+        alloc::vec![NetIfaceInfo {
+            name: "wlan0".to_string(),
+            mac: [0xf0, 0xa6, 0x54, 0x13, 0x95, 0x7b],
+            mtu: 1500,
+            ifindex: 4,
+            name_assign_type: 1,
+            tx_queue_len: 1000,
+            is_wireless: true,
+            ..NetIfaceInfo::default()
+        }]
+    }
+
+    fn pci_wlan() -> Vec<NetIfaceInfo> {
+        let mut list = virtual_wlan();
+        list[0].pci_parent = Some(NetPciParent {
+            segment: 0,
+            bus: 0x02,
+            device: 0,
+            function: 0,
+            vendor_id: 0x14c3,
+            device_id: 0x0616,
+            subsystem_vendor_id: 0x17aa,
+            subsystem_device_id: 0xe0cd,
+            class: 0x028000,
+            driver: "mt7921e".to_string(),
+        });
+        list
+    }
+
+    let result = (|| {
+        crate::sysfs::install_net_snapshot_hook(virtual_wlan);
+        crate::sysfs::sync_net_iface("wlan0", true);
+        let initial_events = reader.drain(16);
+        if !initial_events
+            .iter()
+            .any(|e| e.action == UeventAction::Add && e.devpath == "/class/ieee80211/phy0")
+            || !initial_events.iter().any(|e| {
+                e.action == UeventAction::Add
+                    && e.devpath == "/devices/virtual/net/wlan0"
+                    && e.extras.iter().any(|(k, v)| k == "DEVTYPE" && v == "wlan")
+            })
+        {
+            return Err("late virtual wlan0 did not emit phy0 and wlan0 ADD uevents");
+        }
+
+        // Updating with a PCI parent retires the virtual kobject and emits
+        // a canonical PCI ADD uevent + wires /class/ieee80211/phy0/device.
+        crate::sysfs::install_net_snapshot_hook(pci_wlan);
+        crate::sysfs::sync_net_iface("wlan0", true);
+        let reparent_events = reader.drain(16);
+        if !reparent_events
+            .iter()
+            .any(|e| e.action == UeventAction::Remove && e.devpath == "/devices/virtual/net/wlan0")
+            || !reparent_events.iter().any(|e| {
+                e.action == UeventAction::Add
+                    && e.devpath == "/devices/pci0000:02/0000:02:00.0/net/wlan0"
+                    && e.extras.iter().any(|(k, v)| k == "DEVTYPE" && v == "wlan")
+            })
+        {
+            return Err("reparenting wlan0 did not emit virtual REMOVE and PCI ADD");
+        }
+
+        let root = crate::sysfs::get_root();
+        let virtual_net = root
+            .get_child("devices")
+            .and_then(|d| d.get_child("virtual"))
+            .and_then(|v| v.get_child("net"))
+            .ok_or("/sys/devices/virtual/net missing")?;
+        if virtual_net.get_child("wlan0").is_some() {
+            return Err("stale /sys/devices/virtual/net/wlan0 still exists after reparent");
+        }
+        let class_net = root
+            .get_child("class")
+            .and_then(|c| c.get_child("net"))
+            .ok_or("/sys/class/net missing")?;
+        if class_net.get_symlink("wlan0").as_deref()
+            != Some("../../devices/pci0000:02/0000:02:00.0/net/wlan0")
+        {
+            return Err("/sys/class/net/wlan0 symlink did not update to PCI path");
+        }
+        let phy0 = root
+            .get_child("class")
+            .and_then(|c| c.get_child("ieee80211"))
+            .and_then(|i| i.get_child("phy0"))
+            .ok_or("/sys/class/ieee80211/phy0 missing after reparent")?;
+        if phy0.get_symlink("device").as_deref() != Some("../../../devices/pci0000:02/0000:02:00.0")
+        {
+            return Err("phy0 device symlink did not update to PCI path");
+        }
+
+        crate::sysfs::unpublish_net_iface("wlan0");
+        let remove_events = reader.drain(16);
+        if !remove_events.iter().any(|e| {
+            e.action == UeventAction::Remove
+                && e.devpath == "/devices/pci0000:02/0000:02:00.0/net/wlan0"
+        }) || !remove_events
+            .iter()
+            .any(|e| e.action == UeventAction::Remove && e.devpath == "/class/ieee80211/phy0")
+        {
+            return Err("unpublish_net_iface did not emit REMOVE for wlan0 and phy0");
+        }
+        if class_net.get_symlink("wlan0").is_some() {
+            return Err("/sys/class/net/wlan0 still exists after unpublish");
+        }
+        Ok(())
+    })();
+
+    crate::sysfs::install_net_snapshot_hook(Vec::new);
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_net_sync_and_unpublish_late_wireless
+);
+
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
 
 fn smoke_uevent_ring_fifo() -> TestResult {
