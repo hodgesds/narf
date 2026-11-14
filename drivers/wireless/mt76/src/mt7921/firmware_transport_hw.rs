@@ -49,6 +49,8 @@ const ENABLE: u32 = 5;
 const OMIT: u32 = (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28);
 const DONE: u32 = 1 << 31;
 const LAST: u32 = 1 << 30;
+const LAST_SEC1: u32 = 1 << 14;
+const CT_PARSE_LEN: usize = 72;
 const TX_FWDL: u32 = 0xd4300 + 16 * 16;
 const TX_WM: u32 = 0xd4300 + 17 * 16;
 const RX_PRE: u32 = 0xd4500;
@@ -544,11 +546,20 @@ impl Hardware {
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
         ring.index = (slot + 1) % DEPTH;
+        let parse_len = frame.len().min(CT_PARSE_LEN) as u32;
         ring.set_word(slot, 0, address as u32);
-        ring.set_word(slot, 2, 0);
-        ring.set_word(slot, 3, (address >> 32) as u32 & 15);
+        ring.set_word(slot, 2, payload as u32);
+        ring.set_word(
+            slot,
+            3,
+            (((address >> 32) as u32) & 15) | ((((payload >> 32) as u32) & 15) << 16),
+        );
         dma_barrier();
-        ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
+        ring.set_word(
+            slot,
+            1,
+            ((packet_tx::HEADER as u32) << 16) | LAST_SEC1 | parse_len,
+        );
         dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
@@ -687,11 +698,20 @@ impl Hardware {
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
         ring.index = (slot + 1) % DEPTH;
+        let parse_len = frame.len().min(CT_PARSE_LEN) as u32;
         ring.set_word(slot, 0, address as u32);
-        ring.set_word(slot, 2, 0);
-        ring.set_word(slot, 3, (address >> 32) as u32 & 15);
+        ring.set_word(slot, 2, payload as u32);
+        ring.set_word(
+            slot,
+            3,
+            (((address >> 32) as u32) & 15) | ((((payload >> 32) as u32) & 15) << 16),
+        );
         dma_barrier();
-        ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
+        ring.set_word(
+            slot,
+            1,
+            ((packet_tx::HEADER as u32) << 16) | LAST_SEC1 | parse_len,
+        );
         dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }

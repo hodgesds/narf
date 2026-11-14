@@ -178,7 +178,8 @@ fn native_order() -> Result<(), &'static str> {
                 let ring = &hw.owner.storage.as_ref().unwrap().data;
                 let bytes = ring.buffers[slot].as_slice();
                 if bytes[packet_tx::HEADER..packet_tx::HEADER + frame.len()] != frame
-                    || ring.word(slot, 1) != (64 << 16) | LAST
+                    || ring.word(slot, 1)
+                        != (64 << 16) | LAST_SEC1 | (frame.len().min(CT_PARSE_LEN) as u32)
                     || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) & (1 << 28) == 0
                 {
                     return Err(
