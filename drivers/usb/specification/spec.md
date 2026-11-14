@@ -474,17 +474,21 @@ also consult upstream Linux GPL sources.
   submission, latched into the endpoint's own owner state by the
   event demux — never the lossy shared transfer-event queue. Short
   Packet (CC 13) is a normal completion in either direction for
-  isochronous transfers. At most one isoch TD is in flight per
-  endpoint; a second begin is `NotReady` before touching the scratch
-  page or ring. The compatibility `isoch_in` / `isoch_out` wait the
-  token, and on timeout retire the posted TRB first — Stop Endpoint
+  isochronous transfers. Up to four isoch TDs may be in flight
+  per endpoint (`ISOCH_PIPELINE_DEPTH`, #2060), each staging in
+  its own 4 KiB DMA page; a begin while every pool slot is in
+  flight is `NotReady` before touching any page or the ring. The
+  compatibility `isoch_in` / `isoch_out` wait the token, and on
+  timeout retire the posted TRB first — Stop Endpoint
   + Set TR Dequeue Pointer via the same coordinator as `stop_bulk`
   (`Xhci::stop_isoch`, also callable directly) — then report the
   timeout, so a late completion can never alias the next transfer.
-  A failed stop keeps the endpoint claim closed rather than risking
-  silent misattribution. Multi-TRB isoch pipelining (depth > 1) is
-  out of scope here: the one-shot path stays depth-1, which is what
-  the UVC pump seam (#1672) advertises.
+  The stop retires the whole pipeline: Set TR Dequeue moves the
+  dequeue past every posted TD, so siblings of the timed-out TD go
+  stale with it. A failed stop keeps the endpoint claim closed
+  rather than risking silent misattribution. The UVC pump seam
+  advertises the same depth, so the pipelined receive
+  (`pump_video_frames_pipelined`) runs against hardware.
 - `Xhci::configure_endpoints` accepts new, distinct endpoint DCIs and refuses
   replacement of an existing endpoint without quiescence. It serializes slot
   configuration with new bulk submissions and preserves the highest existing
@@ -800,10 +804,10 @@ also consult upstream Linux GPL sources.
   `ISOC_DEPTH` transfers observed in flight at once, frames
   dequeued byte-exact and in order). Bulk streams and depth-1
   transports stay on the single-shot receive. The live `Xhci`
-  transport advertises depth 1 — its isochronous transfers share
-  one 4096-byte DMA page per endpoint and completions carry slot +
-  endpoint identity only — so multi-TRB pipelining on hardware
-  awaits #885 (per-transfer buffers and TRB identity).
+  transport advertises depth 4 (`ISOCH_PIPELINE_DEPTH`): each
+  in-flight isochronous transfer stages in its own 4096-byte DMA
+  page and completes against its own pointer-matched Transfer
+  Event (#2060), so the pipelined receive runs against hardware.
 - UVC suspend/resume (#807): the binders take the device's hub
   context — (parent hub slot id, downstream port), `None` on a root
   port — and `UvcDevice` records it as `hub_port`, the device-accepted

@@ -89,7 +89,9 @@ mod isoch_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
-pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken, Token as IsochToken};
+pub use bulk_owner::{
+    Direction as BulkDirection, Token as BulkToken, Token as IsochToken, ISOCH_PIPELINE_DEPTH,
+};
 pub mod cap;
 pub mod cmd_ring;
 pub mod dcbaa;
@@ -624,12 +626,23 @@ pub struct Device {
 #[derive(Debug)]
 pub struct EndpointState {
     bulk: bulk_owner::State,
-    /// One retained isochronous TD per endpoint (#885). The bulk
-    /// state is never begun on an isochronous endpoint (its kind
-    /// check refuses it), so isochronous completions get their own
-    /// owner state: pointer-matched latching, one-in-flight
-    /// exclusion, and the Stop + Set TR Dequeue retirement path.
-    isoch: bulk_owner::State,
+    /// Per-endpoint isochronous pipeline (#2060): up to
+    /// `ISOCH_PIPELINE_DEPTH` TDs in flight at once, each in its
+    /// own owner state with its own DMA page (see `isoch_bufs`).
+    /// The bulk state is never begun on an isochronous endpoint
+    /// (its kind check refuses it), so isochronous completions
+    /// get their own pool: pointer-matched latching per TD and
+    /// the Stop + Set TR Dequeue retirement path, which retires
+    /// the whole pipeline at once.
+    isoch: bulk_owner::IsochPool,
+    /// One 4 KiB DMA page per isoch pipeline slot (#2060),
+    /// indexed the same way as the pool: slot `i`'s TD stages
+    /// in `isoch_bufs[i]`. `None` on non-isochronous endpoints,
+    /// which never begin an isoch TD. A live TD's page is
+    /// retained until that TD's exact Transfer Event retires
+    /// it; dropping the receipt is not a cancellation or
+    /// permission to overwrite that page.
+    isoch_bufs: [Option<DmaBuffer>; ISOCH_PIPELINE_DEPTH],
     pub dci: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
@@ -648,7 +661,10 @@ pub struct EndpointState {
     /// then dropped it at end-of-function — risky under AMD-Vi
     /// (a freed page can be reused by the next allocation while
     /// a delayed device write is still in flight) and slow
-    /// under any allocator pressure.
+    /// under any allocator pressure. Isochronous transfers do
+    /// not stage here; they use the per-slot `isoch_bufs`
+    /// (#2060). Interrupt transfers use this page through
+    /// `with_ep_dma_buf`.
     dma_buf: DmaBuffer,
     /// Producer-cycle state.
     pcs: u32,
@@ -2563,11 +2579,11 @@ impl Xhci {
             .get_mut(usize::from(dci - 2))
             .and_then(Option::as_mut)
             .is_some_and(|endpoint| {
-                // Isochronous endpoints latch into their own owner
-                // state (#885); every other non-control endpoint
+                // Isochronous endpoints latch into their own pool
+                // (#885, #2060); every other non-control endpoint
                 // uses the bulk state. The kind is fixed at
-                // configure time, so exactly one state can hold a
-                // pending TD for this endpoint.
+                // configure time, so exactly one of the two can
+                // hold a pending TD for this endpoint.
                 if endpoint.kind.is_isochronous() {
                     endpoint.isoch.record(event)
                 } else {
@@ -4761,6 +4777,22 @@ impl Xhci {
             let dma_buf =
                 alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
+            // One DMA page per isoch pipeline slot (#2060), so
+            // concurrent isoch TDs on one endpoint never stage
+            // into the same page. Non-isochronous endpoints leave
+            // the slots empty; their bulk/interrupt paths keep
+            // using `dma_buf`.
+            let mut isoch_bufs: [Option<DmaBuffer>; ISOCH_PIPELINE_DEPTH] =
+                [None, None, None, None];
+            if ep.kind.is_isochronous() {
+                for slot in isoch_bufs.iter_mut() {
+                    *slot = Some(
+                        alloc_coherent(4096, DomainId::DRIVER_0)
+                            .map_err(|_| XhciError::NoMemory)?,
+                    );
+                }
+            }
+
             // EP context at `cs + cs * dci` = `cs * (1 + dci)`. cs
             // = 32 (CSZ=0) or 64 (CSZ=1).
             let cs = self.context_stride();
@@ -4811,7 +4843,8 @@ impl Xhci {
             tr.sync(0, tr.len());
             new_eps.push(EndpointState {
                 bulk: bulk_owner::State::new(),
-                isoch: bulk_owner::State::new(),
+                isoch: bulk_owner::IsochPool::new(),
+                isoch_bufs,
                 dci,
                 max_packet: params.max_packet,
                 kind: ep.kind,
@@ -4968,10 +5001,11 @@ impl Xhci {
     }
 
     /// Submit a single iso-OUT transfer (host→device, e.g. UAC PCM
-    /// playback packet). Caller's `data` is staged into the
-    /// per-endpoint persistent DMA buffer; controller picks the
-    /// next available frame and ships it. Waits for the Transfer
-    /// Event so the caller knows the packet was sent.
+    /// playback packet). Caller's `data` is staged into the TD's
+    /// own per-transfer DMA page from the endpoint's pool
+    /// (#2060); controller picks the next available frame and
+    /// ships it. Waits for the Transfer Event so the caller knows
+    /// the packet was sent.
     ///
     /// For *continuous* streaming the eventual ring layer pre-stages
     /// many iso TRBs and doesn't wait per-packet; this one-shot
@@ -4979,11 +5013,13 @@ impl Xhci {
     /// exercise.
     ///
     /// Completion identity (#885): the wait pointer-matches the
-    /// originating Isoch TRB (not just type + slot + DCI), at most
-    /// one isoch TD is in flight per endpoint, and a timeout
-    /// retires the posted TRB (Stop Endpoint + Set TR Dequeue
-    /// Pointer) before the timeout is reported, so a late
-    /// completion can never alias the next transfer.
+    /// originating Isoch TRB (not just type + slot + DCI), up to
+    /// [`ISOCH_PIPELINE_DEPTH`] TDs may be in flight per endpoint
+    /// at once, each in its own per-transfer DMA page (#2060),
+    /// and a timeout retires the posted TRB (Stop Endpoint + Set
+    /// TR Dequeue Pointer) before the timeout is reported, so a
+    /// late completion can never alias the next transfer. The
+    /// stop retires the whole pipeline, not just this TD.
     pub async fn isoch_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
@@ -5008,9 +5044,10 @@ impl Xhci {
     /// received into `out`.
     ///
     /// Same completion-identity contract as [`Xhci::isoch_out`]:
-    /// pointer-matched wait, one TD in flight per endpoint, and
-    /// Stop + Set TR Dequeue retirement of the posted TRB on
-    /// timeout (#885).
+    /// pointer-matched wait, up to [`ISOCH_PIPELINE_DEPTH`] TDs in
+    /// flight per endpoint in per-transfer DMA pages, and Stop +
+    /// Set TR Dequeue retirement of the posted TRB on timeout
+    /// (#885, #2060).
     pub async fn isoch_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
@@ -5032,9 +5069,11 @@ impl Xhci {
     /// Retire a timed-out isoch TD: Stop Endpoint + Set TR Dequeue
     /// Pointer, queued-event purge, claim release — the same
     /// coordinator as [`Xhci::stop_bulk`]. Without it the posted
-    /// Isoch TRB stays live, still pointing at the endpoint's
-    /// single shared DMA page, and its late completion would
-    /// satisfy the next transfer's wait (#885). Best-effort by
+    /// Isoch TRB stays live, still pointing at its per-transfer
+    /// DMA page, and its late completion would satisfy the next
+    /// transfer's wait (#885). The stop retires the whole
+    /// pipeline, not just this TD (Set TR Dequeue moves the
+    /// dequeue past every posted TD, #2060). Best-effort by
     /// design: a failed stop keeps the endpoint claim closed
     /// (`NotReady` on the next call) rather than risking silent
     /// misattribution, and the timeout stays the reported error.
@@ -5043,11 +5082,13 @@ impl Xhci {
     }
 
     /// Begin one bounded isoch TD. Mirrors [`Xhci::begin_bulk`]:
-    /// the endpoint retains its DMA page until the exact
-    /// originating Isoch TRB completes; dropping the receipt is
-    /// not a cancellation or permission to overwrite that page.
-    /// A second begin while one is in flight is `NotReady`
-    /// (one-in-flight exclusion, #885).
+    /// the endpoint retains the TD's per-transfer DMA page until
+    /// the exact originating Isoch TRB completes; dropping the
+    /// receipt is not a cancellation or permission to overwrite
+    /// that page. Up to [`ISOCH_PIPELINE_DEPTH`] TDs may be in
+    /// flight on one endpoint at once, each staging in its own
+    /// page (#2060); a begin while every pool slot is in flight
+    /// is `NotReady` before touching any page or the ring.
     fn begin_isoch(
         &self,
         slot_id: u8,
@@ -5089,14 +5130,25 @@ impl Xhci {
             }
             let EndpointState {
                 isoch,
+                isoch_bufs,
                 tr,
-                dma_buf,
                 pcs,
                 enq,
                 ..
             } = ep;
+            // Claim a free pipeline slot first: its page is the
+            // one this TD stages in, so two concurrent begins can
+            // never share a page. `begin_on` re-checks the slot
+            // is free, so this advisory pick cannot race a
+            // concurrent begin under the same devices lock.
+            let slot = isoch.free_slot().ok_or(XhciError::NotReady)?;
+            let dma = isoch_bufs
+                .get(slot)
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::NotReady)?;
             isoch
-                .begin(
+                .begin_on(
+                    slot,
                     bulk_owner::Endpoint {
                         generation,
                         slot: slot_id,
@@ -5106,21 +5158,21 @@ impl Xhci {
                     length,
                     || {
                         // SAFETY: the ownership claim is recorded before this closure;
-                        // a single endpoint owns this page, and length is <= 4096.
+                        // this slot's page is owned by this TD alone, and length is <= 4096.
                         unsafe {
                             if direction == BulkDirection::In {
-                                core::ptr::write_bytes(dma_buf.cpu_mut_ptr::<u8>(), 0, length);
+                                core::ptr::write_bytes(dma.cpu_mut_ptr::<u8>(), 0, length);
                             } else {
                                 core::ptr::copy_nonoverlapping(
                                     data.as_ptr(),
-                                    dma_buf.cpu_mut_ptr::<u8>(),
+                                    dma.cpu_mut_ptr::<u8>(),
                                     length,
                                 );
                             }
                         }
-                        dma_buf.sync(0, length);
+                        dma.sync(0, length);
                         device_dma_barrier();
-                        enqueue_isoch_on(tr, pcs, enq, dma_buf.dma_addr().raw(), length as u32)
+                        enqueue_isoch_on(tr, pcs, enq, dma.dma_addr().raw(), length as u32)
                     },
                 )
                 .map_err(bulk_error)?
@@ -5212,17 +5264,28 @@ impl Xhci {
             .get_mut(usize::from(token.endpoint() - 2))
             .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xFA))?;
-        let EndpointState { isoch, dma_buf, .. } = ep;
+        let EndpointState {
+            isoch, isoch_bufs, ..
+        } = ep;
+        // The copy-out source is this TD's own pipeline-slot page
+        // (#2060): the token's TRB pointer names the slot, so a
+        // concurrent TD's completion can never read this TD's
+        // page. A token with no slot is stale, not a page to guess.
+        let slot = isoch.slot_of(token).ok_or(XhciError::CmdFailed(0xFD))?;
+        let dma = isoch_bufs
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
         isoch
             .complete_isoch(device.generation, token, event, |length| {
                 if let Some(out) = out {
-                    dma_buf.sync(0, token.length());
+                    dma.sync(0, token.length());
                     device_dma_barrier();
                     // SAFETY: the exact terminal event retires device writes;
                     // caller capacity is checked before removing any event.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            dma_buf.cpu_ptr::<u8>(),
+                            dma.cpu_ptr::<u8>(),
                             out.as_mut_ptr(),
                             length,
                         );
