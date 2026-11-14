@@ -53,13 +53,11 @@
 //!
 //! What this owner deliberately does NOT own (later steps):
 //! - Legacy-mode admission.
-//! - The register-level 6 GHz TX-power program
-//!   (`rtw8922a_set_txpwr`: by-rate / limit / limit-RU pages on
-//!   BE registers, shape, diff, ref, SAR-diff) and the wide-6 GHz
-//!   TPE rearrange (40/80/160 MHz): admission records the
-//!   20 MHz primary-subchannel TPE constraint (`SixGhzProgram`)
-//!   the program consumes, but nothing here writes power
-//!   registers.
+//! - The wide-6 GHz TPE rearrange (40/80/160 MHz):
+//!   admission records the 20 MHz primary-subchannel TPE
+//!   constraint (`SixGhzProgram`) the TX-power program
+//!   consumes, but wider stations are refused until the
+//!   rearrange exists.
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
 //! - Link-lifecycle H2Cs (role-maintain / DMAC / join-info /
@@ -137,6 +135,14 @@
 //!   `txrx_be::fill_txwd_info_v2` output appended after the v2
 //!   body with BODY0 bit 22 set. Plain `prepare_data` still
 //!   clears the bit (no info block).
+//! - The register-level TX-power program
+//!   ([`Prepared8922a::set_txpwr`]): the admitted station's
+//!   program (`Station::txpwr_plan`, from the admitted
+//!   `SixGhzProgram` plus the caller-supplied container
+//!   elements, RFE, host country and channel center) applied
+//!   over the BAR2 register port in `rtw8922a_set_txpwr`
+//!   order (by-rate / offset / shape / limit / limit-RU /
+//!   diff / ref / SAR-diff, PHY_0).
 //! - The mac_pre_init owner (`mac_pre_init_8922a`): the MAC
 //!   reset (`reset_pwr_state`) + full `pwr_on_func` tail run in
 //!   `pci::bring_up` between the power-on head and the EFUSE
@@ -174,6 +180,7 @@ use super::irq_be::BindingBe;
 use super::mac_pre_init_8922a::{self, HalChipVer};
 use super::power;
 use super::ra_mask::{self, StationCaps};
+use super::radio_assets::Element;
 use super::rx_packet::Ack;
 use super::station_8922a::{self, LinkRequest, MldStation, Request, Station};
 use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained, TXWD_INFO_SIZE};
@@ -203,6 +210,9 @@ pub(super) enum Error {
     Station(station_8922a::Error),
     /// RA mask computation / encoding failure.
     Ra(ra_mask::Error),
+    /// TX-power register program failure (register
+    /// read/write during [`Self::set_txpwr`]).
+    Txpwr(super::rfk::Error),
     /// The fail-closed EHT facet (`EhtStation::new_8922ae`) could
     /// not be built, so no station can be admitted.
     EhtUnavailable,
@@ -475,6 +485,30 @@ pub(crate) struct Prepared8922a {
     /// + RXQ assembly). Rebuilt by `program_rings` at the
     ///   programmed depths, reset by `stop_dma`.
     completion: completion_8922a::Worker,
+}
+
+/// Read-modify-write one TX-power register in the crate's
+/// `modify32` convention (field value shifted into `mask`;
+/// full-mask writes skip the read), after
+/// `radio_init::modify`: a `u32::MAX` read is a gone device
+/// (`power::Error::Gone`).
+fn modify32(
+    regs: &mut impl super::irq::Regs,
+    address: u32,
+    mask: u32,
+    value: u32,
+) -> Result<(), super::rfk::Error> {
+    let expected = if mask == u32::MAX {
+        value
+    } else {
+        let old = regs.read32(address)?;
+        if old == u32::MAX {
+            return Err(super::power::Error::Gone.into());
+        }
+        (old & !mask) | ((value << mask.trailing_zeros()) & mask)
+    };
+    regs.write32(address, expected)?;
+    Ok(())
 }
 
 impl Prepared8922a {
@@ -889,6 +923,38 @@ impl Prepared8922a {
         ra_mask::build(caps, macid, 0, false, false).map_err(Error::Ra)
     }
 
+    /// Apply the BE TX-power program for one admitted
+    /// station (`rtw8922a_set_txpwr`, PHY_0): build the
+    /// program from the station's admitted record
+    /// ([`Station::txpwr_plan`]) and emit its writes over
+    /// the BAR2 register port. `elements` is the
+    /// container's firmware TXPWR elements (the caller
+    /// holds the loaded container); `country` is the host
+    /// regulatory alpha2; `center` is the
+    /// `rtw89_chan.channel` (20 MHz: the primary; wider:
+    /// the channel plan's center). No antenna-gain (DAG)
+    /// source exists, so the diff step uses offset 0 (the
+    /// C plan's stance); `cv` is the `hal.cv` cut version
+    /// this owner was constructed with (`CHIP_CAV` raises
+    /// the TXAGC reference to 16 RF units). The program is
+    /// built fully before the first write, so a refused
+    /// program writes nothing.
+    pub(super) fn set_txpwr(
+        &self,
+        macid: u8,
+        elements: &[Element],
+        country: [u8; 2],
+        center: u8,
+        regs: &mut impl super::irq::Regs,
+    ) -> Result<(), Error> {
+        let station = self.station(macid).ok_or(Error::NoStation)?;
+        let plan = station.txpwr_plan(elements, self.factory.rfe_type, country, center)?;
+        plan.visit(0, self.chip_version, |address, mask, value| {
+            modify32(regs, address, mask, value)
+        })
+        .map_err(Error::Txpwr)
+    }
+
     /// Acquire a BA-CAM bitmap slot for one admitted station's
     /// BlockAck session (`BaCam::acquire`); the index feeds
     /// [`Self::ba_h2c`].
@@ -986,7 +1052,8 @@ impl Prepared8922a {
             .position(|mld| mld.base_macid == base_macid)
             .ok_or(Error::NoMld)?;
         // Disjoint field borrows: the link slot out of `mlds`,
-        // the factory for the new link's CCTLs.
+        // the factory for the new link's CCTLs, the pool for
+        // the link MACID claim.
         let mld = &mut self.mlds[index];
         mld.add_link(&self.factory, facet, &mut self.pool, link)
             .map_err(Error::Station)

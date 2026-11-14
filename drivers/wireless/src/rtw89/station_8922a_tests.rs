@@ -3,7 +3,13 @@ use super::efuse_be::BeFactory;
 use super::eht::EhtStation;
 use super::ppe_tests::{IES_E1_EHT_PPE_NSS2, IES_H1_HE_PPE_NSS1};
 use super::ra_mask::{HeCaps, HtCaps, VhtCaps};
+use super::radio_assets::Element;
+use super::radio_power_c::{
+    ID_BYRATE, ID_LMT_2GHZ, ID_LMT_5GHZ, ID_LMT_6GHZ, ID_LMT_RU_2GHZ, ID_LMT_RU_5GHZ,
+    ID_LMT_RU_6GHZ, ID_REGD, ID_TX_SHAPE_LMT, RS_CCK, RS_HEDCM, RS_MCS, RS_OFDM, RS_OFFSET, WW,
+};
 use super::station_8922a::*;
+use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wireless::association::{phy::Width, six_ghz::SixGhzChannel};
 use narf_wireless::reg::PowerType6Ghz;
@@ -1767,4 +1773,372 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_mld_refusals);
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_8922a_mld_base_interleave
+);
+
+/// Firmware TXPWR element builder (the `radio_power_be`
+/// tests' fixture): one element per ID, header
+/// `[0, 0, rfe, size]` + LE32 count, rows padded to `size`.
+fn elm(id: u32, rfe: u8, size: u8, entries: &[&[u8]]) -> Element {
+    let mut bytes = vec![0, 0, rfe, size];
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let mut row = e.to_vec();
+        row.resize(usize::from(size), 0);
+        bytes.extend_from_slice(&row);
+    }
+    Element {
+        id,
+        version: [0; 4],
+        bytes,
+    }
+}
+
+/// By-rate entry {band, nss, rs, shf, len, data[4], bw, ofdma}
+/// (11-byte shipped layout).
+fn byr(band: u8, nss: u8, rs: u8, shf: u8, data: &[i8], bw: u8, ofdma: u8) -> Vec<u8> {
+    let mut e = vec![band, nss, rs, shf, data.len() as u8, 0, 0, 0, 0, bw, ofdma];
+    for (i, &v) in data.iter().enumerate() {
+        e[5 + i] = v as u8;
+    }
+    e
+}
+
+/// The `radio_power_be` `base` + `six_set` elements (rfe 0,
+/// tag 10) plus the REGD map (`radio_power_c` `six_set`):
+/// US FCC, GB UK/ETSI, BO not-applicable. Additions over the
+/// BE fixture: an FCC/STD OFDM limit (50) and RU limit (40)
+/// so a US Standard-Power TPE bites, and 6 GHz shape rows
+/// (OFDM 1 FCC/STD, 2 ETSI/STD, 0 FCC/LPI).
+fn txpwr_elements() -> Vec<Element> {
+    vec![
+        elm(
+            ID_BYRATE,
+            0,
+            11,
+            &[
+                &byr(0, 0, RS_CCK, 0, &[10, 2, 4, 6], 0, 0),
+                &byr(1, 0, RS_CCK, 0, &[99, 99, 99, 99], 0, 0),
+                &byr(0, 0, RS_OFDM, 4, &[-3, 8, 10, 12], 0, 0),
+                &byr(0, 0, RS_MCS, 14, &[30, 32], 0, 0),
+                &byr(0, 0, RS_MCS, 14, &[34, 36], 0, 1),
+                &byr(0, 0, RS_MCS, 0, &[20, 22, 24, 26], 0, 0),
+                &byr(0, 0, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(0, 1, RS_MCS, 8, &[30, 32, 34, 36], 0, 0),
+                &byr(0, 1, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(0, 0, RS_OFDM, 0, &[8, 10, 12, 14], 1, 0),
+                &byr(0, 0, RS_OFDM, 0, &[16, 18, 20, 22], 2, 0),
+                &byr(1, 0, RS_OFDM, 0, &[20, 22, 24, 26], 0, 0),
+                &byr(1, 1, RS_MCS, 8, &[30, 32, 34, 36], 0, 0),
+                &byr(1, 1, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(1, 0, RS_OFFSET, 0, &[-2, 2, 4, 6], 0, 0),
+                &byr(1, 0, RS_OFFSET, 4, &[8, 10, 12, 14], 0, 0),
+                // nss 2 is invalid for MCS: skipped, never an error.
+                &byr(1, 2, RS_MCS, 0, &[77], 0, 0),
+                // 6 GHz OFDM by-rate row (band 2).
+                &byr(2, 0, RS_OFDM, 0, &[16, 18, 20, 22], 0, 0),
+            ],
+        ),
+        elm(
+            ID_LMT_2GHZ,
+            0,
+            7,
+            &[
+                // bw, nt, rs, bf, regd, ch_idx, v
+                &[0, 0, RS_CCK, 0, WW, 5, 40],
+                &[0, 0, RS_OFDM, 1, WW, 5, 36],
+                &[0, 1, RS_MCS, 0, WW, 5, 30],
+                // non-WW regd is not read (regd = WW, no country).
+                &[0, 0, RS_OFDM, 1, 2, 5, 2],
+                // last entry wins.
+                &[0, 1, RS_MCS, 0, WW, 5, -6i8 as u8],
+            ],
+        ),
+        elm(
+            ID_LMT_5GHZ,
+            0,
+            7,
+            &[
+                // 80MHz center 42: mcs_20m at 36/40/44/48 (idx 0/2/4/6).
+                &[0, 0, RS_MCS, 0, WW, 0, 50],
+                &[0, 0, RS_MCS, 0, WW, 6, 52],
+                &[1, 0, RS_MCS, 0, WW, 1, 44],
+                &[1, 0, RS_MCS, 0, WW, 5, 40],
+                &[2, 0, RS_MCS, 1, WW, 3, 34],
+                // ofdm at primary 36.
+                &[0, 1, RS_OFDM, 0, WW, 0, 28],
+                // bw 4 is out of the 5GHz range: skipped.
+                &[4, 0, RS_MCS, 0, WW, 3, 1],
+            ],
+        ),
+        elm(
+            ID_LMT_RU_2GHZ,
+            0,
+            5,
+            &[&[0, 0, WW, 5, 20], &[2, 1, WW, 5, 18]],
+        ),
+        elm(
+            ID_LMT_RU_5GHZ,
+            0,
+            5,
+            &[&[1, 0, WW, 2, 24], &[2, 1, WW, 6, 26]],
+        ),
+        elm(
+            ID_TX_SHAPE_LMT,
+            0,
+            5,
+            &[
+                // [band, rs, regd, value, reg6]
+                &[0, 0, WW, 1],
+                &[1, 1, WW, 3],
+                &[1, 1, 3, 3],
+                &[2, 1, 2, 1, 2],
+                &[2, 1, 1, 2, 2],
+                &[2, 1, 2, 0, 1],
+            ],
+        ),
+        elm(
+            ID_LMT_6GHZ,
+            0,
+            8,
+            &[
+                // ch37 = 6G idx 17. FCC (2) LPI (1) OFDM: own value.
+                &[0, 0, RS_OFDM, 0, 2, 1, 17, 30],
+                // MCS: no FCC/LPI value, so [WW][DFLT] is read.
+                &[0, 0, RS_MCS, 0, WW, 0, 17, 24],
+                // ETSI (1) STD (2) OFDM for the GB/UK case.
+                &[0, 0, RS_OFDM, 0, 1, 2, 17, 40],
+                // reg6 3 is out of range: skipped.
+                &[0, 0, RS_OFDM, 0, 2, 3, 17, 2],
+                // FCC (2) STD (2) OFDM: the US SP own value.
+                &[0, 0, RS_OFDM, 0, 2, 2, 17, 50],
+            ],
+        ),
+        elm(
+            ID_LMT_RU_6GHZ,
+            0,
+            6,
+            &[
+                &[0, 0, 2, 1, 17, 22],
+                &[1, 0, WW, 0, 17, 20],
+                &[0, 0, 2, 2, 17, 40],
+            ],
+        ),
+        elm(
+            ID_REGD,
+            0,
+            9,
+            &[
+                &[b'U', b'S', 2, 2, 2],
+                &[b'G', b'B', 14, 14, 14],
+                // `RTW89_NA` (4): not applicable.
+                &[b'B', b'O', 2, 2, 4],
+            ],
+        ),
+    ]
+}
+
+/// Number of register writes `plan.visit` emits (all
+/// `rtw8922a_set_txpwr` steps, PHY_0).
+fn count_writes(plan: &super::radio_power_be::Plan) -> usize {
+    let mut n = 0;
+    let _ = plan.visit(0, 1, |_, _, _| {
+        n += 1;
+        Ok(())
+    });
+    n
+}
+
+fn smoke_rtw89_8922a_station_txpwr_plan_consumes_six_ghz_program() -> TestResult {
+    let elements = txpwr_elements();
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    // 6 GHz LPI ch37, no TPE: FCC/LPI limits, unconstrained.
+    let mut req = base_req();
+    req.band = Band::Ghz6;
+    req.width_mhz = 20;
+    req.primary = 37;
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Lpi,
+        tpe_dbm: None,
+    });
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz LPI admission refused"),
+    };
+    let plan = match st.txpwr_plan(&elements, 0, *b"US", 37) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("6GHz LPI TX-power plan refused"),
+    };
+    let (six, tpe) = match plan.six_ghz() {
+        Some(six) => six,
+        None => return TestResult::Fail("6GHz plan records no regd context"),
+    };
+    if (six.regd(), six.power()) != (2, 1) || tpe.is_some() {
+        return TestResult::Fail("6GHz LPI regd context mismatch");
+    }
+    let (words, _, limit, ru, shape) = plan.parts();
+    // byr[6G]: OFDM 16/18/20/22 rf -> 8/9/10/11 mac; CCK still 2.4GHz.
+    if words[0] != 0x0302_0105
+        || words[1] != u32::from_le_bytes([8, 9, 10, 11])
+        || limit[0][4] != 15
+        || limit[0][6] != 12
+        || ru[0][0] != 11
+        || ru[0][16] != 10
+        || shape != [0, 0]
+        || count_writes(&plan) != 197
+    {
+        return TestResult::Fail("6GHz LPI TX-power plan differs from rtw8922a_set_txpwr");
+    }
+    // Standard Power with a 5 dBm TPE: the TPE caps every
+    // limit/RU byte at dbm_to_mac(5) = 10, and only lowers.
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: Some(5),
+    });
+    let st_sp = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz SP admission refused"),
+    };
+    let sp = match st_sp.txpwr_plan(&elements, 0, *b"US", 37) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("6GHz SP TX-power plan refused"),
+    };
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: None,
+    });
+    let st_bare = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz SP (no TPE) admission refused"),
+    };
+    let bare = match st_bare.txpwr_plan(&elements, 0, *b"US", 37) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("6GHz SP (no TPE) TX-power plan refused"),
+    };
+    let (sp_six, sp_tpe) = match sp.six_ghz() {
+        Some(six) => six,
+        None => return TestResult::Fail("6GHz SP plan records no regd context"),
+    };
+    if (sp_six.regd(), sp_six.power()) != (2, 2) || sp_tpe != Some(5) {
+        return TestResult::Fail("6GHz SP regd context mismatch");
+    }
+    let (_, _, sp_limit, sp_ru, sp_shape) = sp.parts();
+    let (_, _, bare_limit, bare_ru, bare_shape) = bare.parts();
+    if sp_limit[0][4] != 10
+        || bare_limit[0][4] != 25
+        || sp_limit[0][6] != 10
+        || bare_limit[0][6] != 12
+        || sp_ru[0][0] != 10
+        || bare_ru[0][0] != 20
+        || sp_shape != [0, 1]
+        || bare_shape != [0, 1]
+        || count_writes(&sp) != 197
+    {
+        return TestResult::Fail(
+            "6GHz SP TPE constraint differs from rtw89_phy_get_tpe_constraint",
+        );
+    }
+    for p in 0..2 {
+        for i in 0..76 {
+            if sp_limit[p][i] > bare_limit[p][i] {
+                return TestResult::Fail("6GHz TPE raised a limit page byte");
+            }
+        }
+        for i in 0..80 {
+            if sp_ru[p][i] > bare_ru[p][i] {
+                return TestResult::Fail("6GHz TPE raised an RU page byte");
+            }
+        }
+    }
+    // GB Standard Power: ETSI/STD limits and shape 2.
+    let gb = match st_sp.txpwr_plan(&elements, 0, *b"GB", 37) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("6GHz GB SP TX-power plan refused"),
+    };
+    let (gb_six, _) = match gb.six_ghz() {
+        Some(six) => six,
+        None => return TestResult::Fail("6GHz GB plan records no regd context"),
+    };
+    let (_, _, gb_limit, _, gb_shape) = gb.parts();
+    if (gb_six.regd(), gb_six.power()) != (1, 2) || gb_limit[0][4] != 10 || gb_shape != [0, 2] {
+        return TestResult::Fail("6GHz GB SP regd context mismatch");
+    }
+    // 5 GHz 80 MHz (primary 36, center 42) and 2.4 GHz
+    // 20 MHz (ch6) take the WW-default program.
+    let mut req5 = base_req();
+    req5.width_mhz = 80;
+    let st5 = match admit(&f, facet, &mut pool, &req5) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("5GHz 80MHz admission refused"),
+    };
+    let plan5 = match st5.txpwr_plan(&elements, 0, *b"US", 42) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("5GHz TX-power plan refused"),
+    };
+    if plan5.six_ghz().is_some() || plan5.parts().4 != [0, 3] || count_writes(&plan5) != 197 {
+        return TestResult::Fail("5GHz TX-power plan differs");
+    }
+    let mut req2 = base_req();
+    req2.band = Band::Ghz2;
+    req2.width_mhz = 20;
+    req2.primary = 6;
+    let st2 = match admit(&f, facet, &mut pool, &req2) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("2.4GHz admission refused"),
+    };
+    let plan2 = match st2.txpwr_plan(&elements, 0, *b"US", 6) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("2.4GHz TX-power plan refused"),
+    };
+    if plan2.six_ghz().is_some()
+        || plan2.parts().0[0] != 0x0302_0105
+        || plan2.parts().4 != [1, 0]
+        || count_writes(&plan2) != 197
+    {
+        return TestResult::Fail("2.4GHz TX-power plan differs");
+    }
+    // Refusals: VLP is blocked for US/CA, an unknown country
+    // has no REGD rule, a missing REGD or BYRATE element is
+    // refused, a 20 MHz center that is not the primary is
+    // refused, and RFE 255 is refused.
+    let mut req_vlp = base_req();
+    req_vlp.band = Band::Ghz6;
+    req_vlp.width_mhz = 20;
+    req_vlp.primary = 37;
+    req_vlp.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Vlp,
+        tpe_dbm: None,
+    });
+    let st_vlp = match admit(&f, facet, &mut pool, &req_vlp) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz VLP admission refused"),
+    };
+    let no_regd: Vec<Element> = txpwr_elements()
+        .into_iter()
+        .filter(|e| e.id != ID_REGD)
+        .collect();
+    let no_byrate: Vec<Element> = txpwr_elements()
+        .into_iter()
+        .filter(|e| e.id != ID_BYRATE)
+        .collect();
+    let policy = Error::Txpwr(super::rfk::Error::Policy);
+    let table = Error::Txpwr(super::rfk::Error::Table);
+    if st_vlp.txpwr_plan(&elements, 0, *b"US", 37) != Err(policy)
+        || st.txpwr_plan(&elements, 0, *b"ZZ", 37) != Err(policy)
+        || st.txpwr_plan(&no_regd, 0, *b"US", 37) != Err(table)
+        || st.txpwr_plan(&no_byrate, 0, *b"US", 37) != Err(table)
+        || st.txpwr_plan(&elements, 0, *b"US", 36) != Err(policy)
+        || st.txpwr_plan(&elements, 255, *b"US", 37) != Err(policy)
+    {
+        return TestResult::Fail("6GHz TX-power plan refusals differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_station_txpwr_plan_consumes_six_ghz_program
 );

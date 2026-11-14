@@ -3963,19 +3963,29 @@ primary-subchannel constraint alone could over-permit power on
 the other subchannels. The admitted `Station` records the
 program (`SixGhzProgram`: power type, TPE dBm, phy.c
 `rtw89_phy_get_tpe_constraint` in MAC units via
-`radio_power_c::tpe_mac`, 63 with no TPE) for the future
-`rtw8922a_set_txpwr` limit program to consume. Country policy
+`radio_power_c::tpe_mac`, 63 with no TPE) for the
+`rtw8922a_set_txpwr` limit program
+(`station_8922a::Station::txpwr_plan`, applied by
+`prepared_8922a::Prepared8922a::set_txpwr`) to consume. Country policy
 (a 6 GHz-blocked country, the VLP block for US/CA) is not
 checked at admission: it lives with the REGD element owner
 (`radio_power_c::SixGhzPower::new`), which needs the
 container's REGD map and the host regulatory country this
-owner does not hold. Still open: the register-level
-`rtw8922a_set_txpwr` program (generic
+owner does not hold. The register-level `rtw8922a_set_txpwr`
+program itself lives in `radio_power_be::Plan` (generic
 `rtw89_phy_set_txpwr_{byrate,offset,limit,limit_ru}` on BE
 registers plus the 8922A `set_tx_shape` / `set_txpwr_diff` /
-`set_txpwr_ref` / `set_txpwr_sar_diff` steps), the wide-6 GHz
-TPE rearrange, and 8922A admission into `station_control`
-(the join flow that supplies the program). Unexecuted cases:
+`set_txpwr_ref` / `set_txpwr_sar_diff` steps, in Linux order)
+and is consumed per admitted station by
+`station_8922a::Station::txpwr_plan` (which builds the regd.c
+`SixGhzPower` context from the admitted program and the
+caller-supplied container, RFE, host country and channel
+center) and applied by
+`prepared_8922a::Prepared8922a::set_txpwr` over the BAR2
+register port (197 writes; a refused program writes
+nothing). Still open: the wide-6 GHz TPE rearrange, and
+8922A admission into `station_control` (the join flow that
+supplies the program). Unexecuted cases:
 `smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
 `smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`,
 `smoke_rtw8852c_6ghz_tpe_follows_mac80211_rearrange_and_regd`,
