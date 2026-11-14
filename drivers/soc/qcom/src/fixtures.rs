@@ -589,6 +589,10 @@ fn reg2(base: u64, size: u64) -> Vec<u32> {
 /// `arch/arm64/boot/dts/qcom/ipq6018.dtsi` (`q6v5_wcss`, `wcss-smp2p`,
 /// `smem`, `tcsr`, `tcsr_mutex`, `apcs_glb`, `gcc`) plus a `wifi@c000000`
 /// node per the `qcom,ath11k.yaml` example with `compat` as compatible.
+/// The wifi node carries the `memory-region` the AHB fixed-memory WLFW
+/// path needs (DT `memory-region[0]` as the HOST_DDR region, spec §3):
+/// a fixture-chosen 2 MiB region at 0x8000_0000, matching the direct
+/// IPQ6018 WLFW fixture's `host_ddr`.
 pub fn ipq6018_wifi_dt(compat: &str, wifi_irqs: &[u32]) -> Vec<u8> {
     let mut wifi_cells = Vec::new();
     for n in wifi_irqs {
@@ -615,6 +619,12 @@ pub fn ipq6018_wifi_dt(compat: &str, wifi_irqs: &[u32]) -> Vec<u8> {
                     ph::Q6_REGION,
                     0x4ab0_0000,
                     0x550_0000,
+                ))
+                .child(reserved(
+                    "memory@80000000",
+                    ph::WLAN_FW_MEM,
+                    0x8000_0000,
+                    0x20_0000,
                 )),
         )
         .child(
@@ -727,7 +737,8 @@ pub fn ipq6018_wifi_dt(compat: &str, wifi_irqs: &[u32]) -> Vec<u8> {
                         .u32s("reg", &reg2(0x0c00_0000, 0x200_0000))
                         .prop("interrupts", be32s(&wifi_cells))
                         .strs("interrupt-names", &names)
-                        .u32s("qcom,rproc", &[ph::RPROC]),
+                        .u32s("qcom,rproc", &[ph::RPROC])
+                        .u32s("memory-region", &[ph::WLAN_FW_MEM]),
                 ),
         )
         .child(
