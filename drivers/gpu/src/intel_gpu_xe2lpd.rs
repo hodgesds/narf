@@ -113,6 +113,134 @@ pub(crate) enum DisplayIp {
     Xe3Lpd,
 }
 
+/// Discrete Arc display IP families:
+/// - `Dg2`: Alchemist pre-GMD Display 13.
+/// - `Xe2Hpd`: Battlemage `GMD_ID_DISPLAY` 14.01 (`xe2_hpd_display`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscreteDisplayIp {
+    /// Display 13 (pre-GMD DG2 / Alchemist discrete display).
+    Dg2,
+    /// Display 14.01 (`xe2_hpd_display`: Battlemage discrete display).
+    Xe2Hpd,
+}
+
+impl DiscreteDisplayIp {
+    /// Major display version (`13` for DG2, `14` for BMG `Xe2_HPD`).
+    pub(crate) const fn ver(self) -> u8 {
+        match self {
+            Self::Dg2 => 13,
+            Self::Xe2Hpd => 14,
+        }
+    }
+
+    /// Minor release (`0` for DG2, `1` for BMG `Xe2_HPD`).
+    pub(crate) const fn rel(self) -> u8 {
+        match self {
+            Self::Dg2 => 0,
+            Self::Xe2Hpd => 1,
+        }
+    }
+
+    /// GGTT PTE codec matching the discrete display's page table format.
+    pub(crate) const fn pte_format(self) -> crate::intel_gpu_gtt::PteFormat {
+        match self {
+            Self::Dg2 => crate::intel_gpu_gtt::PteFormat::Gen12,
+            Self::Xe2Hpd => crate::intel_gpu_gtt::PteFormat::XeLpg,
+        }
+    }
+
+    /// Decode `GMD_ID_DISPLAY` for Battlemage (`14.01` = `Xe2_HPD`).
+    pub(crate) const fn decode_bmg(gmd: u32) -> Result<Self, IpError> {
+        if gmd == 0 {
+            return Err(IpError::Absent);
+        }
+        let ver = ((gmd >> 22) & 0x3ff) as u16;
+        let rel = ((gmd >> 14) & 0xff) as u8;
+        if ver == 14 && rel == 1 {
+            Ok(Self::Xe2Hpd)
+        } else {
+            Err(IpError::Unqualified { ver, rel })
+        }
+    }
+
+    /// Read-only discrete display identification and Pipe-A fuse admission.
+    pub(crate) fn identify(
+        io: &(impl MmioWindow + ?Sized),
+        platform: crate::intel_gpu_gt::GtPlatform,
+    ) -> Result<Self, IpError> {
+        use crate::intel_gpu_gt::GtPlatform;
+        if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+            return Err(IpError::Unqualified { ver: 0, rel: 0 });
+        }
+        let dfsm = io.read32(SKL_DFSM);
+        if dfsm == u32::MAX || !io.display_access_ok() {
+            return Err(IpError::NoDevice);
+        }
+        let ip = match platform {
+            GtPlatform::Alchemist => Self::Dg2,
+            GtPlatform::Battlemage => {
+                let a = io.read32(GMD_ID_DISPLAY);
+                let b = io.read32(GMD_ID_DISPLAY);
+                if a == u32::MAX || a != b || !io.display_access_ok() {
+                    return Err(IpError::NoDevice);
+                }
+                Self::decode_bmg(a)?
+            }
+            _ => unreachable!(),
+        };
+        if dfsm & DFSM_PIPE_A_DISABLE != 0 {
+            return Err(IpError::Unqualified {
+                ver: u16::from(ip.ver()),
+                rel: ip.rel(),
+            });
+        }
+        Ok(ip)
+    }
+}
+
+/// Observe a live firmware Pipe-A primary plane on a discrete GPU (`DG2` /
+/// `BMG`). Returns `None` when Pipe A or its primary plane is dark or invalid.
+pub(crate) fn discrete_pipe_a_scanout(
+    io: &(impl MmioWindow + ?Sized),
+) -> Option<crate::intel_gpu::ActiveScanout> {
+    use crate::intel_gpu_pipes::{
+        Pipe, PIPECONF_OFFSET, PIPE_SRCSZ_OFFSET, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
+        PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+    };
+    let pipe_base = Pipe::A.base();
+    let pipeconf = io.read32(pipe_base + PIPECONF_OFFSET);
+    if pipeconf == u32::MAX || pipeconf & 0xc000_0000 != 0xc000_0000 {
+        return None;
+    }
+    let plane_base = pipe_base + PLANE_PRIMARY_OFFSET;
+    let plane_ctl = io.read32(plane_base + PLANE_CTL_OFFSET);
+    let srcsz = io.read32(Pipe::A.trans_base() + PIPE_SRCSZ_OFFSET);
+    let stride_reg = io.read32(plane_base + PLANE_STRIDE_OFFSET);
+    let surf = io.read32(plane_base + PLANE_SURF_OFFSET);
+    if !io.display_access_ok()
+        || plane_ctl == u32::MAX
+        || plane_ctl & PLANE_CTL_ENABLE == 0
+        || srcsz == u32::MAX
+        || stride_reg == u32::MAX
+        || surf == u32::MAX
+    {
+        return None;
+    }
+    let width = ((srcsz >> 16) & 0x1fff) + 1;
+    let height = (srcsz & 0xfff) + 1;
+    let stride_bytes = (stride_reg & 0xfff) * 64;
+    if !(1..=8192).contains(&width) || !(1..=4320).contains(&height) || stride_bytes < width * 4 {
+        return None;
+    }
+    Some(crate::intel_gpu::ActiveScanout {
+        width,
+        height,
+        stride_bytes,
+        gtt_offset: surf & !0xfff,
+        phys_base: 0,
+    })
+}
+
 /// Why a display IP is not dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IpError {
@@ -823,16 +951,10 @@ pub(crate) fn pipe_dmc_disable_epilogue(io: &(impl MmioWindow + ?Sized), pipe: u
 }
 
 // ── PICA power well (Type-C) ─────────────────────────────────────
-//
-// Modeled for the display-20 Type-C routes, which stay refused: external
-// outputs on Lunar Lake are not admitted, so nothing requests this well.
 
 /// `XE2LPD_PICA_PW_CTL` and its request/status bits.
-#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) const PICA_PW_CTL: u64 = 0x16fe04;
-#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) const PICA_POWER_REQUEST: u32 = 1 << 31;
-#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) const PICA_POWER_STATUS: u32 = 1 << 30;
 
 fn wait(
@@ -859,14 +981,12 @@ fn wait(
 }
 
 /// `xe2lpd_pica_power_well_enable`: request, then status within 1 ms.
-#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn pica_enable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
     io.write32(PICA_PW_CTL, PICA_POWER_REQUEST);
     wait(io, PICA_PW_CTL, PICA_POWER_STATUS, PICA_POWER_STATUS, 1_000)
 }
 
 /// `xe2lpd_pica_power_well_disable`: clear, then status off within 1 ms.
-#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn pica_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
     io.write32(PICA_PW_CTL, 0);
     wait(io, PICA_PW_CTL, PICA_POWER_STATUS, 0, 1_000)

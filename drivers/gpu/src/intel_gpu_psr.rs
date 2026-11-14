@@ -79,6 +79,7 @@
 //! programmed watermarks are not proved, PSR is refused (`WmLevelUnknown`)
 //! rather than guessed.
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxStatus};
@@ -111,6 +112,8 @@ pub const DE_MISC_IER: u64 = 0x4446c;
 pub const EDP_PSR_ENABLE: u32 = 1 << 31;
 /// `EDP_PSR_RESTORE_PSR_ACTIVE_CTX_MASK` (software must not modify).
 pub const EDP_PSR_RESTORE_PSR_ACTIVE_CTX: u32 = 1 << 29;
+/// `LNL_EDP_PSR_ENTRY_SETUP_FRAMES` (bits 17:16, display >= 20).
+pub const LNL_EDP_PSR_ENTRY_SETUP_FRAMES_MASK: u32 = 3 << 16;
 /// `EDP_PSR_MAX_SLEEP_TIME(0x1f)` (`hsw_activate_psr1`, display < 20).
 pub const EDP_PSR_MAX_SLEEP_TIME_MAX: u32 = 0x1f << 20;
 /// `EDP_PSR_TP_TP1_TP3`.
@@ -166,6 +169,33 @@ pub const PSR_DEBUG_MASK: u32 = EDP_PSR_DEBUG_MASK_HPD
     | EDP_PSR_DEBUG_MASK_MEMUP
     | EDP_PSR_DEBUG_MASK_LPSP
     | EDP_PSR_DEBUG_MASK_MAX_SLEEP;
+
+/// `intel_psr_enable_source`'s PSR_MASK for display >= 20 eDP: HPD, MEMUP,
+/// LPSP (no MAX_SLEEP on display >= 20).
+pub const PSR_DEBUG_MASK_DISPLAY20: u32 =
+    EDP_PSR_DEBUG_MASK_HPD | EDP_PSR_DEBUG_MASK_MEMUP | EDP_PSR_DEBUG_MASK_LPSP;
+
+/// `PIPEDMC_BLOCK_PKGC_SW(pipe)` (`0x5f1d0 + 0x400 * pipe`) used by
+/// Wa_16025596647 when non-PSR pipes block DC5/DC6 while PSR runs.
+pub const fn pipedmc_block_pkgc_sw(pipe: u8) -> u64 {
+    0x5f1d0 + 0x400 * pipe as u64
+}
+/// `PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS`.
+pub const PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS: u32 = 1 << 31;
+
+static NON_PSR_PIPES: AtomicU8 = AtomicU8::new(0);
+
+/// `intel_psr_set_non_psr_pipes` (Wa_16025596647): record the bitmask of
+/// active pipes without PSR. While non-zero on display >= 20, PSR keeps
+/// Pipe A's package-C blocking workaround engaged across active PSR.
+pub fn set_non_psr_pipes(mask: u8) {
+    NON_PSR_PIPES.store(mask & 0xf, Ordering::Release);
+}
+
+/// Active non-PSR pipe mask recorded by [`set_non_psr_pipes`].
+pub fn non_psr_pipes() -> u8 {
+    NON_PSR_PIPES.load(Ordering::Acquire)
+}
 
 /// `intel_psr_wait_exit_locked`'s bound.
 pub const PSR_EXIT_TIMEOUT_MS: u64 = 2000;
@@ -370,6 +400,12 @@ pub enum Refusal {
     InvalidSetupTime,
     /// The setup time does not fit `vtotal - vdisplay - 1` lines.
     SetupTimeTooLong,
+    /// Wa_18037818876 (display 20): `entry_setup_frames > 0` requires
+    /// selective update, which was refused.
+    SetupFramesNoSu,
+    /// Display >= 20 SRD_STATUS requires `TRANS_SET_CONTEXT_LATENCY` >= 1
+    /// for PSR1 (no ALPM).
+    SetContextLatencyZero,
     /// Wa_14015648006's `wm_level_disabled` is not provided.
     WmLevelUnknown,
     /// `GEN8_DE_MISC_IER` could deliver `GEN8_DE_EDP_PSR`, and there is no
@@ -641,25 +677,75 @@ pub struct Psr1 {
     pub tp1_wakeup_us: u32,
     /// The VBT's `psr.tp2_tp3_wakeup_time_us`.
     pub tp2_tp3_wakeup_us: u32,
+    /// Display >= 20 (`LunarLake`/`PantherLake`): `hsw_activate_psr1`
+    /// omits `EDP_PSR_MAX_SLEEP_TIME` and writes
+    /// `LNL_EDP_PSR_ENTRY_SETUP_FRAMES`, and `PSR_DEBUG` omits
+    /// `EDP_PSR_DEBUG_MASK_MAX_SLEEP`.
+    pub display20: bool,
+    /// `intel_psr_entry_setup_frames`: extra frames (0..=3) requested
+    /// when setup time exceeds `vtotal - vdisplay - 1` on display >= 20.
+    pub entry_setup_frames: u8,
 }
 
 /// `intel_psr_compute_config` for PSR1 on display 14.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn compute_psr1(
     sink: &Sink,
     timing: &crate::intel_gpu_dsb::Timing,
     vbt: &VbtPsr,
     wm_level_disabled: Option<bool>,
 ) -> Result<Psr1, Refusal> {
+    compute_psr1_for(sink, timing, vbt, wm_level_disabled, false, None, true)
+}
+
+/// `intel_psr_compute_config` for PSR1 with explicit display-version
+/// and `_intel_psr_min_set_context_latency` / `Wa_18037818876` inputs.
+/// When `display20` is true, `set_context_latency` is the transcoder's
+/// `TRANS_SET_CONTEXT_LATENCY_A & 0xffff` (`None` if unreadable). When
+/// `has_su` is false and `entry_setup_frames > 0`, `Wa_18037818876`
+/// refuses PSR1 on display 20.
+pub(crate) fn compute_psr1_for(
+    sink: &Sink,
+    timing: &crate::intel_gpu_dsb::Timing,
+    vbt: &VbtPsr,
+    wm_level_disabled: Option<bool>,
+    display20: bool,
+    set_context_latency: Option<u32>,
+    has_su: bool,
+) -> Result<Psr1, Refusal> {
     let panel = vbt.enabled()?;
     if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
         return Err(Refusal::Interlaced);
     }
     sink.psr_support()?;
-    // intel_psr_entry_setup_frames: display < 20 has no setup frames.
     let setup = sink.setup_time_us().ok_or(Refusal::InvalidSetupTime)?;
     let blank = u32::from(timing.vtotal).saturating_sub(u32::from(timing.height));
-    if blank == 0 || usecs_to_scanlines(timing, setup) > blank - 1 {
+    let setup_lines = usecs_to_scanlines(timing, setup);
+    if blank == 0 {
         return Err(Refusal::SetupTimeTooLong);
+    }
+    let vblank_cap = blank - 1;
+    let entry_setup_frames = if setup_lines <= vblank_cap {
+        0
+    } else if !display20 || timing.vtotal == 0 {
+        return Err(Refusal::SetupTimeTooLong);
+    } else {
+        // intel_psr_entry_setup_frames (display >= 20): up to 3 extra frames.
+        let frames = (setup_lines - vblank_cap).div_ceil(u32::from(timing.vtotal));
+        if frames > 3 {
+            return Err(Refusal::SetupTimeTooLong);
+        }
+        frames as u8
+    };
+    if display20 && entry_setup_frames > 0 && !has_su {
+        return Err(Refusal::SetupFramesNoSu);
+    }
+    if display20 && !has_su {
+        match set_context_latency {
+            None => return Err(Refusal::Unavailable),
+            Some(0) => return Err(Refusal::SetContextLatencyZero),
+            Some(_) => {}
+        }
     }
     let wm_level_disabled = wm_level_disabled.ok_or(Refusal::WmLevelUnknown)?;
     // The VBT's psr_table is zero when the VBT has no PSR block.
@@ -673,6 +759,8 @@ pub(crate) fn compute_psr1(
         wm_level_disabled,
         tp1_wakeup_us: table.map_or(0, |t| t.tp1_wakeup_time_us),
         tp2_tp3_wakeup_us: table.map_or(0, |t| t.tp2_tp3_wakeup_time_us),
+        display20,
+        entry_setup_frames,
     })
 }
 
@@ -697,11 +785,17 @@ pub fn psr1_tp_time(config: &Psr1) -> u32 {
     value
 }
 
-/// `hsw_activate_psr1`'s value for display 14 (`link_standby` false).
+/// `hsw_activate_psr1`'s value (`link_standby` false). Display < 20 writes
+/// `EDP_PSR_MAX_SLEEP_TIME(0x1f)`; display >= 20 omits `MAX_SLEEP_TIME`
+/// and writes `LNL_EDP_PSR_ENTRY_SETUP_FRAMES(entry_setup_frames)`.
 pub fn psr1_ctl(config: &Psr1) -> u32 {
     let mut value = EDP_PSR_ENABLE;
     value |= config.idle_frames & EDP_PSR_IDLE_FRAMES_MASK;
-    value |= EDP_PSR_MAX_SLEEP_TIME_MAX;
+    if config.display20 {
+        value |= (u32::from(config.entry_setup_frames) & 3) << 16;
+    } else {
+        value |= EDP_PSR_MAX_SLEEP_TIME_MAX;
+    }
     value |= psr1_tp_time(config);
     value | EDP_PSR_CRC_ENABLE
 }
@@ -1404,7 +1498,23 @@ impl Psr {
             psr.program_sel_fetch_cursor(regs, &first);
         }
         // intel_psr_enable_source.
-        regs.write32(PSR_DEBUG, PSR_DEBUG_MASK);
+        regs.write32(
+            PSR_DEBUG,
+            if config.display20 {
+                PSR_DEBUG_MASK_DISPLAY20
+            } else {
+                PSR_DEBUG_MASK
+            },
+        );
+        if config.display20 && non_psr_pipes() != 0 {
+            let pkgc = regs.read32(pipedmc_block_pkgc_sw(0));
+            if pkgc != u32::MAX {
+                regs.write32(
+                    pipedmc_block_pkgc_sw(0),
+                    pkgc | PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS,
+                );
+            }
+        }
         let imr = regs.read32(PSR_IMR);
         regs.write32(PSR_IMR, (imr & !TGL_PSR_MASK) | !TGL_PSR_ERROR);
         // Wa_14015648006 (wm_optimization_wa).
@@ -1667,6 +1777,15 @@ impl Psr {
                 regs.write32(
                     MTL_CLKGATE_DIS_TRANS_A,
                     clkgate & !MTL_CLKGATE_DIS_TRANS_DMASC_GATING_DIS,
+                );
+            }
+        }
+        if self.config.display20 && non_psr_pipes() != 0 {
+            let pkgc = regs.read32(pipedmc_block_pkgc_sw(0));
+            if pkgc != u32::MAX {
+                regs.write32(
+                    pipedmc_block_pkgc_sw(0),
+                    pkgc & !PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS,
                 );
             }
         }

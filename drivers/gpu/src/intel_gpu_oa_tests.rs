@@ -1984,6 +1984,8 @@ fn smoke_i915_perf_open_add_remove_config_and_stream() -> TestResult {
     let hw = &backend.hw;
     let circ = DEFAULT_BUFFER;
     hw.report(0, 256, 0x42, circ);
+    // Land the following report's header word so `Unit::check` accepts report 0.
+    hw.word(256, 0x100);
     hw.set(OATAILPTR, BASE + 256);
     let mut out = vec![0u8; 512];
     let n = ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })).unwrap();
@@ -2333,6 +2335,8 @@ fn smoke_i915_read_filters_foreign_context_reports() -> TestResult {
             );
         }
     }
+    // Land the following report's header word so `Unit::check` accepts both reports.
+    hw.word(512, 1);
     hw.set(OATAILPTR, BASE + 512);
     let mut out = vec![0u8; 2 * (8 + 256)];
     let n = ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })).unwrap();

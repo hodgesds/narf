@@ -177,14 +177,20 @@ kernel_test_in!(
 );
 
 /// PSR1 stays refused on display 20: with a PSR-capable sink, a
-/// PSR-enabling VBT and qualifying watermarks (the display-14 enable
-/// fixture's inputs), a latched display-20 flip neither writes the sink's
-/// PSR configuration nor arms `PSR_CTL`. intel_psr.c's display >= 20 PSR1
-/// differs in hsw_activate_psr1 (no MAX_SLEEP_TIME, ENTRY_SETUP_FRAMES),
-/// the SRD_STATUS set-context latency and Wa_16025596647, none of which is
-/// implemented.
+/// Display-20 PSR1 qualification and programming through the KMS latch
+/// (`Xe2Lpd`, `intel_psr.c` display >= 20 branches):
+/// - SRD_STATUS requires `TRANS_SET_CONTEXT_LATENCY_A >= 1` (`0x6007c`):
+///   with SCL == 0 PSR1 refuses without touching PSR registers/sink.
+/// - With SCL >= 1, PSR1 enables with no `EDP_PSR_MAX_SLEEP_TIME` in
+///   `PSR_CTL` (`0x1f << 20`), no `EDP_PSR_DEBUG_MASK_MAX_SLEEP` (`1 << 28`)
+///   in `PSR_DEBUG`, and `LNL_EDP_PSR_ENTRY_SETUP_FRAMES` (`bits 17:16`).
+/// - Long setup times compute `entry_setup_frames == 1` instead of
+///   `SetupTimeTooLong`, `Wa_18037818876` refuses PSR1 without SU, and
+///   `Wa_16025596647` blocks PKGC via `PIPEDMC_BLOCK_PKGC_SW_A` when
+///   non-PSR pipes are active.
 #[cfg(target_arch = "x86_64")]
-fn smoke_xe2lpd_kms_psr1_refused_on_display20() -> TestResult {
+fn smoke_xe2lpd_kms_psr1_enabled_on_display20() -> TestResult {
+    // 1. With TRANS_SET_CONTEXT_LATENCY_A == 0, SRD_STATUS precondition refuses PSR1.
     let platform = MockPlatform::new();
     let timing = platform.dsb_timing();
     super::psr::attach(&platform, timing, Some(false));
@@ -195,19 +201,107 @@ fn smoke_xe2lpd_kms_psr1_refused_on_display20() -> TestResult {
     assert!(super::psr::psr(&device).is_none());
     assert_eq!(platform.read32(super::psr::PSR_CTL) & (1 << 31), 0);
     assert!(super::psr::sink_writes(&platform.all_writes()).is_empty());
-    // The display-14 owner, given the same inputs, does enable it.
+
+    // 2. With TRANS_SET_CONTEXT_LATENCY_A >= 1, display-20 PSR1 enables without
+    // MAX_SLEEP_TIME in PSR_CTL or MAX_SLEEP in PSR_DEBUG.
+    let platform = MockPlatform::new();
+    platform.set(0x6007c, 1);
+    let timing = platform.dsb_timing();
+    super::psr::attach(&platform, timing, Some(false));
+    let device = lunar(&platform);
+    super::psr::present_once(&device, object(true).unwrap());
+    let psr = super::psr::psr(&device).unwrap();
+    assert!(psr.config().display20);
+    assert_eq!(psr.config().entry_setup_frames, 0);
+    let ctl = platform.read32(super::psr::PSR_CTL);
+    assert_ne!(ctl & (1 << 31), 0);
+    assert_eq!(ctl & (0x1f << 20), 0);
+    assert_eq!(ctl & (3 << 16), 0);
+    assert_eq!(platform.read32(0x60860), (1 << 27) | (1 << 26) | (1 << 25));
+
+    // 3. Long setup time on display 20 computes entry_setup_frames = 1 (encoded
+    // in bits 17:16 of PSR_CTL) instead of refusing SetupTimeTooLong; without
+    // SU, Wa_18037818876 refuses with SetupFramesNoSu.
+    let short_vblank = crate::intel_gpu_dsb::Timing {
+        clock: 1034,
+        width: 64,
+        height: 32,
+        htotal: 224,
+        vtotal: 34, // blank = 2, cap = 1 line, 330 us = 2 lines > 1
+        flags: 0,
+    };
+    let sink = crate::intel_gpu_psr::Sink::read(&mut PsrAux(&platform)).unwrap();
+    let vbt = platform.psr_vbt();
+    assert_eq!(
+        crate::intel_gpu_psr::compute_psr1(&sink, &short_vblank, &vbt, Some(false)),
+        Err(crate::intel_gpu_psr::Refusal::SetupTimeTooLong)
+    );
+    assert_eq!(
+        crate::intel_gpu_psr::compute_psr1_for(
+            &sink,
+            &short_vblank,
+            &vbt,
+            Some(false),
+            true,
+            Some(1),
+            false,
+        ),
+        Err(crate::intel_gpu_psr::Refusal::SetupFramesNoSu)
+    );
+    let su_cfg = crate::intel_gpu_psr::compute_psr1_for(
+        &sink,
+        &short_vblank,
+        &vbt,
+        Some(false),
+        true,
+        Some(1),
+        true,
+    )
+    .unwrap();
+    assert_eq!(su_cfg.entry_setup_frames, 1);
+    assert_eq!(crate::intel_gpu_psr::psr1_ctl(&su_cfg) & (3 << 16), 1 << 16);
+    assert_eq!(crate::intel_gpu_psr::psr1_ctl(&su_cfg) & (0x1f << 20), 0);
+
+    // 4. Wa_16025596647: non-PSR pipes engage PIPEDMC_BLOCK_PKGC_SW_A while active
+    // and clear it on disable.
+    crate::intel_gpu_psr::set_non_psr_pipes(0b10);
+    let wa_platform = MockPlatform::new();
+    wa_platform.set(0x6007c, 1);
+    let wa_timing = wa_platform.dsb_timing();
+    super::psr::attach(&wa_platform, wa_timing, Some(false));
+    let wa_device = lunar(&wa_platform);
+    super::psr::present_once(&wa_device, object(true).unwrap());
+    assert_ne!(
+        wa_platform.read32(crate::intel_gpu_psr::pipedmc_block_pkgc_sw(0))
+            & crate::intel_gpu_psr::PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS,
+        0
+    );
+    {
+        let mut guard = complete(wa_device.session()).unwrap();
+        complete(guard.restore_console()).unwrap();
+    }
+    assert_eq!(
+        wa_platform.read32(crate::intel_gpu_psr::pipedmc_block_pkgc_sw(0))
+            & crate::intel_gpu_psr::PIPEDMC_BLOCK_PKGC_SW_BLOCK_PKGC_ALWAYS,
+        0
+    );
+    crate::intel_gpu_psr::set_non_psr_pipes(0);
+
+    // 5. The display-14 owner continues to enable with MAX_SLEEP_TIME.
     let platform = MockPlatform::new();
     let timing = platform.dsb_timing();
     super::psr::attach(&platform, timing, Some(false));
     let device = platform.meteor();
     super::psr::present_once(&device, object(true).unwrap());
-    assert!(super::psr::psr(&device).is_some());
+    let mtl_psr = super::psr::psr(&device).unwrap();
+    assert!(!mtl_psr.config().display20);
+    assert_ne!(platform.read32(super::psr::PSR_CTL) & (0x1f << 20), 0);
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_kms",
-    smoke_xe2lpd_kms_psr1_refused_on_display20
+    smoke_xe2lpd_kms_psr1_enabled_on_display20
 );
 
 const IDENTITY: [u64; 9] = [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32];
@@ -655,4 +749,373 @@ fn smoke_xe2lpd_kms_tile4_flips_through_owned_dpt() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_kms",
     smoke_xe2lpd_kms_tile4_flips_through_owned_dpt
+);
+
+/// Display-20 Tile4 panning through the remapped DPT: `Viewport { x: 35, y: 33 }`
+/// spans source tile `(col=1, row=1)` with residual `PLANE_OFFSET = (1 << 16) | 3`,
+/// keeping the 2 MiB-aligned DPT base in `PLANE_SURF` while remapping entry 0
+/// to source page `1 * 4 + 1 = 5`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe2lpd_kms_tile4_panning_through_owned_dpt() -> TestResult {
+    use crate::intel_gpu_scanout::{DptLayout, Layout, View, Viewport};
+    let pan_geo = Geometry {
+        width: 64,
+        height: 32,
+        pitch: 512, // 4 Tile4 columns
+    };
+    let origin = Viewport { x: 35, y: 33 };
+    let (layout, start_col, start_row, plane_offset) =
+        DptLayout::with_origin(pan_geo, Layout::Tile4, origin).unwrap();
+    assert_eq!(start_col, 1);
+    assert_eq!(start_row, 1);
+    assert_eq!(plane_offset, (1 << 16) | 3);
+    assert_eq!(layout.source_at(0, start_col, start_row), Some(5));
+    assert_eq!(layout.source_at(2, start_col, start_row), Some(7));
+
+    let platform = MockPlatform::new();
+    let timing = display20_resources(&platform);
+    crate::intel_gpu_kms::tile4_profile(&platform, pan_geo, timing).unwrap();
+    let device = lunar(&platform);
+    let gem = crate::intel_gpu_gem::GemState::new();
+    let handle = gem
+        .create_placed(
+            32768,
+            None,
+            crate::intel_gpu_gem::Placement::SystemWc,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    let fb = gem.object(handle).unwrap();
+    let _ = gem.close(handle);
+    let frames: Vec<u64> = fb.pages().collect();
+    assert_eq!(frames.len(), 8);
+    let view = View {
+        origin,
+        layout: Layout::Tile4,
+        ..View::default()
+    };
+    {
+        let mut session = complete(device.session()).unwrap();
+        drive(session.present_color(fb.clone(), pan_geo, view, None, Default::default(), timing))
+            .unwrap();
+    }
+    assert_eq!(platform.read32(0x701a4), (1 << 16) | 3);
+    let surface = platform.read32(LIVE);
+    assert_eq!(surface % (2 << 20), 0);
+    let pte = GGTT_ARRAY_BASE + u64::from(surface) / 4096 * 8;
+    let table = (u64::from(platform.read32(pte)) | (u64::from(platform.read32(pte + 4)) << 32))
+        & crate::intel_gpu_gtt::PTE_PHYS_MASK;
+    let entry = |index: u64| -> u64 {
+        // SAFETY: DPT page mapped by the live PTE just read for the retained surface.
+        unsafe {
+            narf_memory::PhysAddr::new(table + index * 8)
+                .kernel_ptr::<u64>()
+                .read_volatile()
+        }
+    };
+    // Row 0 of DPT maps source tile row 1 cols 1..=3 (pages 5, 6, 7); cols 3..8 stay zero.
+    assert_eq!(entry(0), frames[5] | 1 | (3 << 52));
+    assert_eq!(entry(1), frames[6] | 1 | (3 << 52));
+    assert_eq!(entry(2), frames[7] | 1 | (3 << 52));
+    assert_eq!(entry(3), 0);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_xe2lpd_kms_tile4_panning_through_owned_dpt
+);
+
+/// Display-20 FBC skips `Wa_22014263786` (`DPFC_CHICKEN_FORCE_SLB_INVALIDATION`),
+/// keeps `Wa_18038517565` (`PIPE_CLKGATE_DIS2`) + `DPFC_CONTROL`, and coexists
+/// with Display-20 PSR1 (without Display 14's `Wa_14016291713` conflict).
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe2lpd_kms_fbc_display20_deltas_and_psr1_coexistence() -> TestResult {
+    let platform = MockPlatform::new();
+    platform.set(0x6007c, 1);
+    platform.0.lock().fbc_offset = Some(0x100_0000);
+    let timing = platform.dsb_timing();
+    super::psr::attach(&platform, timing, Some(false));
+    let device = lunar(&platform);
+    super::psr::present_once(&device, object(true).unwrap());
+
+    assert!(super::psr::psr(&device).is_some());
+    assert_ne!(platform.read32(super::psr::PSR_CTL) & (1 << 31), 0);
+    // Display-20 FBC is enabled alongside PSR1:
+    assert_eq!(platform.read32(0x43200), 0x100_0000); // DPFC_CB_BASE
+    assert_ne!(platform.read32(0x43208) & (1 << 31), 0); // DPFC_CONTROL
+    assert_ne!(platform.read32(0x60114) & (1 << 3), 0); // Wa_18038517565
+                                                        // Wa_22014263786 (DPFC_CHICKEN bit 13) is skipped on display >= 20:
+    assert_eq!(platform.read32(0x43224) & (1 << 13), 0);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_xe2lpd_kms_fbc_display20_deltas_and_psr1_coexistence
+);
+
+/// Display 20 (Lunar Lake) and Display 30 (Panther Lake, when display30 is
+/// proven) admit KMS `panel_off`/`panel_on` relight and S3 system suspend.
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe2lpd_kms_s3_panel_relight_admitted() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt_runtime::system_suspend_admitted;
+    use crate::intel_gpu_kms::panel_generation_supported;
+    assert!(panel_generation_supported(Generation::MeteorLake, false));
+    assert!(panel_generation_supported(Generation::LunarLake, false));
+    assert!(panel_generation_supported(Generation::PantherLake, true));
+    assert!(!panel_generation_supported(Generation::PantherLake, false));
+    assert!(!panel_generation_supported(Generation::TigerLake, false));
+    assert!(system_suspend_admitted(false, true));
+    assert!(!system_suspend_admitted(true, false));
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_xe2lpd_kms_s3_panel_relight_admitted
+);
+
+/// Discrete Arc display bring-up (DG2 Display 13 & BMG `Xe2_HPD` 14.01):
+/// identification, non-dGPU / fused-Pipe-A refusals, live Pipe-A scanout
+/// observation, discrete PTE/status profiles, and `PTE_DM` encoding.
+fn smoke_discrete_arc_display_identify_and_vram_pte() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt::GtPlatform;
+    use crate::intel_gpu_gtt::{encode_display_vram_pte, PteFormat, PTE_DM, PTE_PRESENT};
+    use crate::intel_gpu_scanout_io::{display_pte_for, owned_status_for};
+    use crate::intel_gpu_xe2lpd::{discrete_pipe_a_scanout, DiscreteDisplayIp, IpError};
+
+    let dg2 = MockPlatform::new();
+    assert_eq!(
+        DiscreteDisplayIp::identify(&dg2, GtPlatform::Alchemist),
+        Ok(DiscreteDisplayIp::Dg2)
+    );
+    assert_eq!(DiscreteDisplayIp::Dg2.ver(), 13);
+    assert_eq!(DiscreteDisplayIp::Dg2.pte_format(), PteFormat::Gen12);
+    assert_eq!(
+        display_pte_for(Generation::AlderLake, None, Some(DiscreteDisplayIp::Dg2)),
+        Some((PteFormat::Gen12, 0))
+    );
+    assert_eq!(
+        owned_status_for(Generation::AlderLake, None, Some(DiscreteDisplayIp::Dg2)),
+        0x8200_0088
+    );
+
+    let bmg = MockPlatform::new();
+    bmg.set(0x510a0, (14 << 22) | (1 << 14));
+    assert_eq!(
+        DiscreteDisplayIp::identify(&bmg, GtPlatform::Battlemage),
+        Ok(DiscreteDisplayIp::Xe2Hpd)
+    );
+    assert_eq!(
+        (
+            DiscreteDisplayIp::Xe2Hpd.ver(),
+            DiscreteDisplayIp::Xe2Hpd.rel()
+        ),
+        (14, 1)
+    );
+    assert_eq!(DiscreteDisplayIp::Xe2Hpd.pte_format(), PteFormat::XeLpg);
+    assert_eq!(
+        display_pte_for(
+            Generation::MeteorLake,
+            None,
+            Some(DiscreteDisplayIp::Xe2Hpd)
+        ),
+        Some((PteFormat::XeLpg, 0))
+    );
+    assert_eq!(
+        owned_status_for(
+            Generation::MeteorLake,
+            None,
+            Some(DiscreteDisplayIp::Xe2Hpd)
+        ),
+        0x8304_0088
+    );
+
+    // Non-dGPU, unqualified GMD ID, and fused Pipe A refuse cleanly.
+    assert!(matches!(
+        DiscreteDisplayIp::identify(&bmg, GtPlatform::Integrated(Generation::LunarLake)),
+        Err(IpError::Unqualified { .. })
+    ));
+    let dark_gmd = MockPlatform::new();
+    dark_gmd.set(0x510a0, 14 << 22); // 14.00 != 14.01
+    assert_eq!(
+        DiscreteDisplayIp::identify(&dark_gmd, GtPlatform::Battlemage),
+        Err(IpError::Unqualified { ver: 14, rel: 0 })
+    );
+    let fused = MockPlatform::new();
+    fused.set(0x510a0, (14 << 22) | (1 << 14));
+    fused.set(0x51000, 1 << 30); // DFSM_PIPE_A_DISABLE
+    assert_eq!(
+        DiscreteDisplayIp::identify(&fused, GtPlatform::Battlemage),
+        Err(IpError::Unqualified { ver: 14, rel: 1 })
+    );
+
+    // VRAM GGTT PTE sets PTE_DM | PTE_PRESENT.
+    assert_eq!(
+        encode_display_vram_pte(PteFormat::Gen12, 0x1234_5000, 0),
+        Ok(0x1234_5000 | PTE_PRESENT | PTE_DM)
+    );
+    assert_eq!(
+        encode_display_vram_pte(PteFormat::XeLpg, 0x1234_5000, 0),
+        Ok(0x1234_5000 | PTE_PRESENT | PTE_DM)
+    );
+
+    // Dark Pipe A returns None; lit Pipe A returns ActiveScanout.
+    let panel = MockPlatform::new();
+    panel.set(0x70008, 0);
+    assert!(discrete_pipe_a_scanout(&panel).is_none());
+    panel.set(0x70008, 0xc000_0000);
+    panel.set(0x70180, 0x8400_0000);
+    panel.set(0x6001c, ((64 - 1) << 16) | (32 - 1));
+    panel.set(0x70188, 4);
+    panel.set(0x7019c, CONSOLE);
+    let obs = discrete_pipe_a_scanout(&panel).unwrap();
+    assert_eq!(
+        (obs.width, obs.height, obs.stride_bytes, obs.gtt_offset),
+        (64, 32, 256, CONSOLE)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_discrete_arc_display_identify_and_vram_pte
+);
+
+/// Discrete VRAM scanout admission across DRM `addfb2`, `GemObject::mark_scanout`
+/// eviction pinning, and `Presenter::with_vram_scanout` GGTT `PTE_DM` mapping.
+fn smoke_discrete_vram_scanout_presenter_addfb2_and_eviction_pin() -> TestResult {
+    use crate::drm::card::{Card, CardError};
+    use crate::drm::fb_cmd::FbCmd;
+    use crate::intel_gpu_gem::GemState;
+    use crate::intel_gpu_gtt::{PteFormat, PTE_DM, PTE_PRESENT};
+    use crate::intel_gpu_scanout::{Presenter, ScanoutError};
+    use crate::intel_gpu_scanout_io::{display_pte_for, PollIo};
+    use crate::intel_gpu_vram::{Vram, VramLayout};
+    use crate::intel_gpu_xe2lpd::DiscreteDisplayIp;
+
+    let order = 6u8; // 256 KiB mock LMEM region (fits 64 KiB alignments).
+    let frame = narf_memory::frame::alloc_pages_on(0, order).expect("vram test frame");
+    let len = 256 * 1024;
+    let bar = narf_bus::MmioRegion {
+        phys: frame.start_address(),
+        virt: frame.start_address().kernel_ptr::<u8>() as u64,
+        len,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let layout = VramLayout {
+        tile_size: len,
+        tile_offset: 0,
+        usable: len,
+    };
+    // SAFETY: exclusively owned contiguous frames back this fixture's LMEM pool.
+    let pool = unsafe { Vram::new(bar, layout) }.unwrap();
+    let gem = GemState::new();
+    let pending = gem
+        .prepare_vram_class(8192, None, &pool, true)
+        .expect("prepare vram bo");
+    let vram_obj = pending.object();
+    assert!(vram_obj.is_vram());
+    assert!(!vram_obj.is_wc());
+    assert!(!vram_obj.scanout());
+
+    let cmd = FbCmd {
+        width: 64,
+        height: 32,
+        pixel_format: 0x3432_5258,
+        handles: [1, 0, 0, 0],
+        pitches: [256, 0, 0, 0],
+        offsets: [0, 0, 0, 0],
+        modifier: [0; 4],
+        flags: 0,
+    };
+    // Integrated card refuses VRAM scanout BOs in addfb2_intel.
+    let mut igpu_card = Card::new("igpu", "test", (1, 0, 0));
+    assert_eq!(
+        igpu_card.addfb2_intel(&cmd, vram_obj.clone(), 1, true),
+        Err(CardError::InvalidDimensions)
+    );
+    assert!(!vram_obj.scanout());
+
+    // Discrete card admits VRAM scanout BOs and marks scanout (pinned against
+    // normal eviction while still drainable on S3 suspend).
+    let mut dgpu_card = Card::new("dgpu", "test", (1, 0, 0));
+    dgpu_card.intel_vram_scanout = true;
+    assert!(dgpu_card
+        .addfb2_intel(&cmd, vram_obj.clone(), 1, true)
+        .is_ok());
+    assert!(vram_obj.scanout());
+    assert!(!vram_obj.is_evictable(false));
+    assert!(vram_obj.is_evictable(true));
+
+    // Presenter without vram_scanout refuses; with vram_scanout maps PTE_DM.
+    let platform = MockPlatform::new();
+    let (fmt, pat) = display_pte_for(
+        Generation::MeteorLake,
+        None,
+        Some(DiscreteDisplayIp::Xe2Hpd),
+    )
+    .unwrap();
+    assert_eq!((fmt, pat), (PteFormat::XeLpg, 0));
+    // SAFETY: MockPlatform models the Pipe-A primary plane exclusively for this test.
+    let io_refuse = unsafe {
+        PollIo::new(
+            platform.clone(),
+            Generation::MeteorLake,
+            Pipe::A,
+            0x100_0000,
+        )
+    }
+    .unwrap();
+    // SAFETY: exclusive MockPlatform scanout arena ownership.
+    let mut presenter_refuse =
+        unsafe { Presenter::new(io_refuse, 0x100_0000, Pipe::A, fmt, pat, CONSOLE) }.unwrap();
+    assert_eq!(
+        presenter_refuse.prepare(vram_obj.clone(), geometry()),
+        Err(ScanoutError::Unsupported)
+    );
+    // SAFETY: no scanout surface was armed in this fixture.
+    let _ = unsafe { presenter_refuse.shutdown_stopped() };
+
+    let platform2 = MockPlatform::new();
+    // SAFETY: MockPlatform models the Pipe-A primary plane exclusively for this test.
+    let io_allow = unsafe {
+        PollIo::new(
+            platform2.clone(),
+            Generation::MeteorLake,
+            Pipe::A,
+            0x100_0000,
+        )
+    }
+    .unwrap();
+    // SAFETY: exclusive MockPlatform scanout arena ownership.
+    let mut presenter_allow =
+        unsafe { Presenter::new(io_allow, 0x100_0000, Pipe::A, fmt, pat, CONSOLE) }
+            .unwrap()
+            .with_vram_scanout(true);
+    let sid = presenter_allow
+        .prepare(vram_obj.clone(), geometry())
+        .unwrap();
+    let _ = presenter_allow.arm(sid, 1, platform2.now());
+    let gtt = platform2.read32(SURF);
+    assert!((GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(gtt)));
+    let pte = GGTT_ARRAY_BASE + u64::from(gtt) / 4096 * 8;
+    let low = platform2.read32(pte);
+    assert_eq!(
+        u64::from(low) & (PTE_PRESENT | PTE_DM),
+        PTE_PRESENT | PTE_DM
+    );
+    // SAFETY: fixture owns the mock scanout plane exclusively and drops all surfaces.
+    let _ = unsafe { presenter_allow.shutdown_stopped() };
+    drop(pending);
+    drop(vram_obj);
+    drop(pool);
+    narf_memory::frame::free_pages(frame, order);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_discrete_vram_scanout_presenter_addfb2_and_eviction_pin
 );

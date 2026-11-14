@@ -3,11 +3,12 @@
 //! xe_exec_queue.c, xe_exec.c, xe_sync.c and xe_wait_user_fence.c.
 use crate::{
     drm::syncobj::{self as so, SyncObjTable},
-    intel_gpu_exec::ResidentBatch,
+    intel_gpu_exec::{ResidentBatch, VmMapping},
     intel_gpu_gem::{GemState, Placement},
     intel_gpu_render::DeviceInfo,
     intel_gpu_uapi::{put32, put64, u32_at, u64_at},
-    intel_gpu_user::{UserBatch, UserContext},
+    intel_gpu_user::{UserBackend, UserBatch, UserContext},
+    intel_gpu_vram::Vram,
     intel_gpu_xe_sync::Sync,
     intel_gpu_xe_uapi as abi,
     intel_gpu_xe_vm::{read, zero, Bind, Vm},
@@ -21,6 +22,30 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_filesystem::{FsError, IoctlContext};
 use narf_lib::sync::IrqSafeSpinLock;
+
+async fn ensure_vram_residency(
+    backend: &dyn UserBackend,
+    pool: &Arc<Vram>,
+    mappings: &[VmMapping],
+    epoch: u64,
+    range: Option<(u64, u64)>,
+) {
+    let visible = !pool.smallbar_enabled();
+    for obj in mappings
+        .iter()
+        .filter(|m| range.is_none_or(|(start, len)| m.va < start + len && start < m.va + m.length))
+        .filter_map(|m| m.object.as_ref())
+        .filter(|obj| obj.preferred_vram() && !obj.is_vram())
+    {
+        if matches!(
+            obj.migrate_to_vram(backend, pool, visible, epoch).await,
+            Err(FsError::OutOfMemory)
+        ) {
+            let _ = evict_vram_for(backend, pool, visible, obj.size(), epoch, false).await;
+            let _ = obj.migrate_to_vram(backend, pool, visible, epoch).await;
+        }
+    }
+}
 
 /// xe_exec_queue_device_get_max_priority: CAP_SYS_NICE in the initial user
 /// namespace admits HIGH. No userspace queue can request GuC KMD_HIGH (0).
@@ -448,9 +473,6 @@ impl XeFile {
                 if flags & !7 != 0 || flags & 4 != 0 && flags & 2 == 0 {
                     return Err(FsError::InvalidData);
                 }
-                if flags & 6 != 0 {
-                    return Err(FsError::NotImplemented);
-                }
                 let mut names = self.names.lock();
                 if names.vms.len() >= 64 {
                     return Err(FsError::OutOfMemory);
@@ -459,6 +481,8 @@ impl XeFile {
                 let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
                 let vm = Vm::new(
                     flags & 1 != 0 || info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
                 )?;
                 put32(&mut wire, 12, id);
                 user.write(address, &wire)?;
@@ -627,7 +651,8 @@ impl XeFile {
         // xe_exec_queue_create_ioctl: an unknown VM, or a closed or banned
         // one, is -ENOENT before xe_exec_queue_create(_bind) runs the
         // extensions. Publication repeats the lookup under the name lock.
-        self.vm(u32_at(&wire, 12))?.check()?;
+        let vm = self.vm(u32_at(&wire, 12))?;
+        vm.check()?;
         let QueueProperties {
             priority,
             timeslice,
@@ -642,6 +667,9 @@ impl XeFile {
             context.init_hang_replay(replay)?;
         }
         context.configure_schedule(priority, timeslice)?;
+        if vm.lr {
+            context.configure_lr()?;
+        }
         if low_latency {
             context.configure_low_latency()?;
         }
@@ -818,25 +846,43 @@ impl XeFile {
             drop(names);
             return Ok(());
         }
-        let pending = match gem.prepare_vram_class(
-            size,
-            owner,
-            pool,
-            flags & 4 != 0 || !pool.smallbar_enabled(),
-        ) {
+        let visible = flags & 4 != 0 || !pool.smallbar_enabled();
+        let pending = match gem.prepare_vram_class(size, owner, pool, visible) {
             Ok(pending) => pending,
-            Err(FsError::OutOfMemory) if placement & 1 != 0 => {
-                let names = self.names.lock();
-                if let Some(vm) = &vm {
-                    vm.check()?;
+            Err(FsError::OutOfMemory) => {
+                if let Some(backend) = info.backend.as_ref() {
+                    if let Some(status) = backend
+                        .status()
+                        .filter(|s| s.platform == info.platform && s.epoch != 0)
+                    {
+                        let _ = evict_vram_for(
+                            backend.as_ref(),
+                            pool,
+                            visible,
+                            size,
+                            status.epoch,
+                            false,
+                        )
+                        .await;
+                    }
                 }
-                gem.create_for_vm(size, owner, |handle, _| {
-                    extensions?;
-                    put32(&mut wire, 28, handle);
-                    user.write(address, &wire)
-                })?;
-                drop(names);
-                return Ok(());
+                match gem.prepare_vram_class(size, owner, pool, visible) {
+                    Ok(pending) => pending,
+                    Err(FsError::OutOfMemory) if placement & 1 != 0 => {
+                        let names = self.names.lock();
+                        if let Some(vm) = &vm {
+                            vm.check()?;
+                        }
+                        gem.create_for_vm(size, owner, |handle, _| {
+                            extensions?;
+                            put32(&mut wire, 28, handle);
+                            user.write(address, &wire)
+                        })?;
+                        drop(names);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         };
@@ -948,8 +994,8 @@ impl XeFile {
             bind.pin(&vm, user)?;
         }
         let sync = Sync::read(user, u64_at(&wire, 112), u32_at(&wire, 108), table)?;
-        if count == 0 && sync.user_fence.is_some() {
-            return Err(FsError::NotImplemented);
+        if vm.lr && sync.has_fence_outputs() {
+            return Err(FsError::InvalidData);
         }
         let _order = match &queue {
             Some(queue) => Some(queue.context.serial.lock().await),
@@ -967,11 +1013,6 @@ impl XeFile {
         if let Some(queue) = &queue {
             queue.check()?;
         }
-        // No await or fallible preparation after this user-fence report.
-        // Concurrent exec must take the VM mutex before observing the mappings.
-        if let Some((address, value)) = sync.user_fence {
-            user.write_u64_release(address, value)?;
-        }
         state.publish(mappings);
         // Adopt the new MAP_USERPTR bindings and forget the replaced ones
         // under the same VM lock, so exec always checks what it maps.
@@ -980,6 +1021,45 @@ impl XeFile {
             .filter_map(|bind| bind.mirror.take())
             .collect();
         vm.adopt_userptrs(&state.mappings, fresh);
+        if binds.iter().any(|b| b.op == 4) {
+            vm.revalidate_userptrs(&mut state, user)?;
+            if let (Some(pool), Some(backend)) = (info.vram.as_ref(), info.backend.as_ref()) {
+                if let Some(epoch) = backend
+                    .status()
+                    .filter(|s| s.platform == info.platform && s.epoch != 0)
+                    .map(|s| s.epoch)
+                {
+                    for bind in binds.iter().filter(|b| b.op == 4) {
+                        if bind.prefetch_region == 1 {
+                            ensure_vram_residency(
+                                backend.as_ref(),
+                                pool,
+                                &state.mappings,
+                                epoch,
+                                Some((bind.address, bind.length)),
+                            )
+                            .await;
+                        } else {
+                            let end = bind.address + bind.length;
+                            for obj in state
+                                .mappings
+                                .iter()
+                                .filter(|m| m.va < end && bind.address < m.va + m.length)
+                                .filter_map(|m| m.object.as_ref())
+                                .filter(|obj| obj.is_vram() && obj.is_evictable(false))
+                            {
+                                let _ = obj.evict_to_system(backend.as_ref(), epoch, false).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // No await or fallible preparation after this user-fence report.
+        // Concurrent exec must take the VM mutex before observing the mappings.
+        if let Some((address, value)) = sync.user_fence {
+            user.write_u64_release(address, value)?;
+        }
         sync.publish(so::stub());
         Ok(())
     }
@@ -1014,6 +1094,9 @@ impl XeFile {
             return Err(FsError::Canceled);
         }
         let sync = Sync::read(user, u64_at(&wire, 16), u32_at(&wire, 12), table)?;
+        if queue.vm.lr && sync.has_fence_outputs() {
+            return Err(FsError::InvalidData);
+        }
         let addresses = if parallel.is_some() && count != 0 {
             let vector = read(user, u64_at(&wire, 24), width * 8)?;
             Some(
@@ -1054,6 +1137,10 @@ impl XeFile {
                 status.epoch
             };
             queue.context.check_epoch(epoch).map_err(canceled)?;
+            if let Some(pool) = info.vram.as_ref() {
+                ensure_vram_residency(backend.as_ref(), pool, &state.mappings, status.epoch, None)
+                    .await;
+            }
             let resident = if parallel.is_some() {
                 ResidentBatch::from_vm_parallel(
                     status.platform,
@@ -1183,4 +1270,29 @@ impl XeFile {
         }
         result
     }
+}
+
+pub(crate) async fn evict_vram_for(
+    backend: &dyn crate::intel_gpu_user::UserBackend,
+    pool: &Arc<crate::intel_gpu_vram::Vram>,
+    visible_only: bool,
+    min_bytes: u64,
+    epoch: u64,
+    allow_scanout: bool,
+) -> Result<u64, FsError> {
+    let mut freed = 0u64;
+    let candidates = pool.eviction_candidates(visible_only, min_bytes, allow_scanout);
+    for object in candidates {
+        match object.evict_to_system(backend, epoch, allow_scanout).await {
+            Ok(bytes) => {
+                freed = freed.saturating_add(bytes);
+                if min_bytes != 0 && freed >= min_bytes {
+                    break;
+                }
+            }
+            Err(FsError::Busy) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(freed)
 }

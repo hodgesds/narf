@@ -47,7 +47,7 @@ fn capture(batch: &ResidentBatch, access: impl FnMut() -> bool) -> Arc<Dump> {
 fn smoke_coredump_vm_dumpable_bind_split_replace_and_frozen_disclosure() -> TestResult {
     let gem = GemState::new();
     let (handle, object) = object(&gem, 16384);
-    let vm = Vm::new(false).unwrap();
+    let vm = Vm::new(false, false, false).unwrap();
     let mut wire = [0; 80];
     wire[8..12].copy_from_slice(&handle.to_le_bytes());
     wire[12..14].copy_from_slice(&2u16.to_le_bytes());

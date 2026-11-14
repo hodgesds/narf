@@ -390,6 +390,8 @@ struct State {
     /// Immutable queue-create intent; retained with the private context image
     /// through repeated registration, cancellation and verified reset.
     low_latency: bool,
+    /// Bound VM runs in long-running mode (no 5s job watchdog timeout).
+    lr: bool,
 }
 
 #[derive(Debug)]
@@ -559,6 +561,7 @@ impl UserContext {
                 queued: [0; 4],
                 staged: None,
                 low_latency: false,
+                lr: false,
             }),
         })
     }
@@ -756,6 +759,15 @@ impl UserContext {
             return Err(FsError::Busy);
         }
         state.low_latency = true;
+        Ok(())
+    }
+    /// Mark this context as bound to a long-running VM (no 5s job watchdog).
+    pub(crate) fn configure_lr(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.lr = true;
         Ok(())
     }
     pub(crate) fn banned(&self) -> bool {
@@ -970,6 +982,12 @@ impl UserJob {
             .capture_policy
             .as_ref()
             .is_some_and(|policy| policy.protected())
+    }
+    pub(crate) fn is_lr(&self) -> bool {
+        self.context.state.lock().lr
+    }
+    pub(crate) fn banned(&self) -> bool {
+        self.context.banned()
     }
     /// GuC priority, execution quantum and low-latency intent of this job.
     pub(crate) fn policy(&self) -> (u32, u32, bool) {

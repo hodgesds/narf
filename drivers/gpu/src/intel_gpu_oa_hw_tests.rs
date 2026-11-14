@@ -316,6 +316,20 @@ fn smoke_oa_per_context_job_executes_on_bound_queue_and_saves_state() -> TestRes
     );
     gt.oa_finish(&session, &oa::Request::Disable, 1000, || true)
         .unwrap();
+    // Stop the GT cleanly so `GuCGt::drop` releases `parts.oa` (which holds
+    // a clone of `session` and its `Permit(48, 0)`), preventing `ACTIVE[48][0]`
+    // from leaking to later card-48 OA tests when link order varies.
+    gt.begin_stop(1010).unwrap();
+    assert!(gt.poll(1011).is_pending());
+    reset_done(&io);
+    assert!(gt.poll(1012).is_pending());
+    assert!(gt.poll(1013).is_pending());
+    reset_done(&io);
+    assert!(gt.poll(1014).is_pending());
+    io.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(1015).is_pending());
+    io.0.borrow_mut().regs.insert(0xdfc, 0);
+    assert_eq!(gt.poll(1016), Poll::Ready(Ok(GtState::Stopped)));
     drop(gt);
     drop(session);
     TestResult::Pass

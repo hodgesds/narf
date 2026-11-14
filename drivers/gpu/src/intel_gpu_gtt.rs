@@ -186,6 +186,12 @@ impl PteFormat {
         Ok(self.encode_ggtt(gsm_offset, pat_index)? | PTE_DM)
     }
 
+    /// Encode a discrete VRAM page (`DG2` `GEN12_GGTT_PTE_LM` / `BMG`
+    /// `XE_GGTT_PTE_DM`) at device-local physical address `vram_phys`.
+    pub fn encode_ggtt_vram(self, vram_phys: u64, pat_index: u8) -> Result<u64, GttError> {
+        Ok(self.encode_ggtt(vram_phys, pat_index)? | PTE_DM)
+    }
+
     pub fn encode_ppgtt(self, phys: u64, pat_index: u8, writable: bool) -> Result<u64, GttError> {
         validate_phys(phys)?;
         let max = match self {
@@ -271,6 +277,15 @@ pub(crate) fn encode_display_pte(format: PteFormat, phys: u64, pat: u8) -> Resul
         return Err(GttError::PhysOutOfRange);
     }
     format.encode_ggtt(phys, pat)
+}
+
+/// Discrete display VRAM GGTT entry (`PTE_DM` bit 1 set).
+pub(crate) fn encode_display_vram_pte(
+    format: PteFormat,
+    vram_phys: u64,
+    pat: u8,
+) -> Result<u64, GttError> {
+    format.encode_ggtt_vram(vram_phys, pat)
 }
 
 /// Gen12 system-memory GGTT entry. `pat` is ignored because this format

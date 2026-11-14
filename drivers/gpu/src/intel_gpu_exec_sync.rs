@@ -125,10 +125,12 @@ impl SyncRequest {
         };
         if extensions {
             // parse_execbuf2_extensions: i915_user_extensions over
-            // execbuf_extensions[], whose only entry is
-            // DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0).
+            // execbuf_extensions[] (TIMELINE_FENCES = 0, EXECBUFFER_EXT_PERF = 1).
             abi::user_extensions(user, pointer, |address, name| {
-                if name != 0 {
+                if name == abi::EXECBUFFER_EXT_PERF {
+                    return Ok(());
+                }
+                if name != abi::EXECBUFFER_EXT_TIMELINE_FENCES {
                     return Err(FsError::InvalidData);
                 }
                 // parse_timeline_fences copies the whole 56-byte

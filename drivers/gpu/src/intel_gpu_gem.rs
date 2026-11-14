@@ -9,10 +9,10 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::dma_buf::{dma_resv_usage_rw, DmaBufObject, DmaResvFence, DmaResvUsage};
 use narf_filesystem::{FsError, IoctlContext, MmapBacking};
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_memory::frame::{alloc_frame, free_frame, PhysFrame};
 
 const PAGE: u64 = 4096;
@@ -20,6 +20,9 @@ const HANDLE_BASE: u32 = 0x4000_0000;
 const MMAP_BASE: u64 = 0x1000_0000_0000;
 const MAX_OBJECTS: usize = 4096;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const STORAGE_SYSTEM: u8 = 0;
+const STORAGE_VRAM_VISIBLE: u8 = 1;
+const STORAGE_VRAM_GPU_ONLY: u8 = 2;
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEXT_MMAP: AtomicU64 = AtomicU64::new(MMAP_BASE);
 // All reservation writers, including PRIME imports, and kernel CPU copies
@@ -31,8 +34,75 @@ static RESERVATIONS: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 pub(crate) mod cpu_mapping;
 
 #[derive(Debug)]
-pub struct GemObject {
+struct GemBacking {
     frames: Vec<PhysFrame>,
+    /// Local memory; reached by the CPU only through the LMEM BAR, after
+    /// private initialization completes.
+    vram: Option<crate::intel_gpu_vram::VramAllocation>,
+    /// Saved Flat-CCS auxiliary metadata retained while an Alchemist VRAM
+    /// object is evicted to system memory.
+    ccs_backup: Option<Arc<GemObject>>,
+    /// `size` is charged to the system-memory LIVE_BYTES bound.
+    charged: bool,
+}
+
+pub struct GemPages<'a> {
+    backing: narf_lib::sync::IrqSafeSpinLockGuard<'a, GemBacking>,
+    pins: &'a [narf_memory::address_space::UserPagePin],
+    wc: Option<&'a narf_memory::pageattr::WcPages>,
+    index: usize,
+}
+
+impl core::fmt::Debug for GemPages<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GemPages")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Iterator for GemPages<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let frame_count = self.backing.frames.len();
+        if self.index < frame_count {
+            let phys = self.backing.frames[self.index].start_address().raw();
+            self.index += 1;
+            return Some(phys);
+        }
+        let wc_count = self.wc.map_or(0, |wc| wc.frames().len());
+        if let Some(wc) = self.wc {
+            let wc_idx = self.index - frame_count;
+            if wc_idx < wc_count {
+                self.index += 1;
+                return Some(wc.frames()[wc_idx].start_address().raw());
+            }
+        }
+        let pin_idx = self.index - frame_count - wc_count;
+        if pin_idx < self.pins.len() {
+            self.index += 1;
+            return Some(self.pins[pin_idx].phys().raw());
+        }
+        let vram_idx = pin_idx - self.pins.len();
+        if let Some(vram) = &self.backing.vram {
+            let vram_pages = (vram.size() / PAGE) as usize;
+            if vram_idx < vram_pages {
+                self.index += 1;
+                return Some(vram.device_address() + vram_idx as u64 * PAGE);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct GemObject {
+    backing: IrqSafeSpinLock<GemBacking>,
+    storage: AtomicU8,
+    vram_page_sz: AtomicU64,
+    preferred_vram: AtomicBool,
+    migrating: Mutex<()>,
     private_staging: bool,
     /// Opted-in pending allocation quota follows the actual BO/job graph,
     /// independently of the ioctl waiter and without a back-reference cycle.
@@ -40,22 +110,17 @@ pub struct GemObject {
     /// USERPTR: retained caller pages instead of owned frames. Such objects
     /// have no handle, mmap offset, CPU copy path or PRIME export.
     pins: Vec<narf_memory::address_space::UserPagePin>,
-    /// Local memory; reached by the CPU only through the LMEM BAR, after
-    /// private initialization completes.
-    vram: Option<crate::intel_gpu_vram::VramAllocation>,
     /// 1 private/uninitialized, 2 clear prepared/completed, 3 CPU clear in
     /// progress, 4 published. Zero is ordinary storage. No public handle,
     /// mmap or user VM reaches states 1..3.
-    ccs: core::sync::atomic::AtomicU8,
+    ccs: AtomicU8,
     /// Zeroed write-combining system pages, in place of `frames`.
     wc: Option<narf_memory::pageattr::WcPages>,
     /// XE_BO_FLAG_SCANOUT: created for scanout, or made a framebuffer.
-    scanout: core::sync::atomic::AtomicBool,
+    scanout: AtomicBool,
     /// Published VM bindings naming this object (Linux xe_bo_is_vm_bound).
     vm_binds: core::sync::atomic::AtomicU32,
     size: u64,
-    /// `size` is charged to the system-memory LIVE_BYTES bound.
-    charged: bool,
     offset: u64,
     vm_owner: Option<u64>,
     read_only: bool,
@@ -91,33 +156,35 @@ fn charge(size: u64) -> Result<(), FsError> {
 }
 
 impl GemObject {
+    fn storage_of(vram: &crate::intel_gpu_vram::VramAllocation) -> u8 {
+        if vram.cpu_address().is_none() {
+            STORAGE_VRAM_GPU_ONLY
+        } else {
+            STORAGE_VRAM_VISIBLE
+        }
+    }
+
     fn allocate(size: u64, offset: u64) -> Result<Self, FsError> {
         charge(size)?;
-        let mut object = Self {
-            frames: Vec::new(),
-            private_staging: false,
-            pending_quota: IrqSafeSpinLock::new(None),
-            pins: Vec::new(),
-            vram: None,
-            ccs: core::sync::atomic::AtomicU8::new(0),
-            wc: None,
-            scanout: core::sync::atomic::AtomicBool::new(false),
-            vm_binds: core::sync::atomic::AtomicU32::new(0),
-            size,
-            charged: true,
-            offset,
-            vm_owner: None,
-            read_only: false,
-            pat_index: None,
-            cpu: IrqSafeSpinLock::new(()),
-            dma_buf: DmaBufObject::new(),
-        };
-        object
-            .frames
+        let mut frames = Vec::new();
+        if let Err(err) = frames
             .try_reserve_exact((size / PAGE) as usize)
-            .map_err(|_| FsError::OutOfMemory)?;
+            .map_err(|_| FsError::OutOfMemory)
+        {
+            LIVE_BYTES.fetch_sub(size, Ordering::AcqRel);
+            return Err(err);
+        }
         for _ in 0..size / PAGE {
-            let frame = alloc_frame().map_err(|_| FsError::OutOfMemory)?;
+            let frame = match alloc_frame() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    for frame in frames.drain(..) {
+                        free_frame(frame);
+                    }
+                    LIVE_BYTES.fetch_sub(size, Ordering::AcqRel);
+                    return Err(FsError::OutOfMemory);
+                }
+            };
             // SAFETY: newly allocated private frame, not published until zeroed.
             unsafe {
                 core::ptr::write_bytes(
@@ -126,9 +193,34 @@ impl GemObject {
                     PAGE as usize,
                 )
             };
-            object.frames.push(frame);
+            frames.push(frame);
         }
-        Ok(object)
+        Ok(Self {
+            backing: IrqSafeSpinLock::new(GemBacking {
+                frames,
+                vram: None,
+                ccs_backup: None,
+                charged: true,
+            }),
+            storage: AtomicU8::new(STORAGE_SYSTEM),
+            vram_page_sz: AtomicU64::new(PAGE),
+            preferred_vram: AtomicBool::new(false),
+            migrating: Mutex::new(()),
+            private_staging: false,
+            pending_quota: IrqSafeSpinLock::new(None),
+            pins: Vec::new(),
+            ccs: AtomicU8::new(0),
+            wc: None,
+            scanout: AtomicBool::new(false),
+            vm_binds: core::sync::atomic::AtomicU32::new(0),
+            size,
+            offset,
+            vm_owner: None,
+            read_only: false,
+            pat_index: None,
+            cpu: IrqSafeSpinLock::new(()),
+            dma_buf: DmaBufObject::new(),
+        })
     }
 
     pub(crate) fn private_system(size: u64) -> Result<Arc<Self>, FsError> {
@@ -143,9 +235,7 @@ impl GemObject {
         self.private_staging
     }
     pub(crate) fn is_gpu_only(&self) -> bool {
-        self.vram
-            .as_ref()
-            .is_some_and(|r| r.cpu_address().is_none())
+        self.storage.load(Ordering::Acquire) == STORAGE_VRAM_GPU_ONLY
     }
     pub(crate) fn gpu_only_access(
         &self,
@@ -154,7 +244,9 @@ impl GemObject {
         if !self.is_gpu_only() {
             return Err(crate::intel_gpu_gt::lnl::Error::Unsupported);
         }
-        self.vram
+        self.backing
+            .lock()
+            .vram
             .as_ref()
             .ok_or(crate::intel_gpu_gt::lnl::Error::State)?
             .smallbar_access(m)
@@ -193,12 +285,6 @@ impl GemObject {
         Ok(object)
     }
 
-    /// Owned system pages: write-back `frames` or the write-combining set.
-    fn system_frames(&self) -> &[PhysFrame] {
-        self.wc.as_ref().map_or(&self.frames, |wc| wc.frames())
-    }
-
-    /// System pages whose kernel and user CPU aliases are write-combining.
     pub(crate) fn is_wc(&self) -> bool {
         self.wc.is_some()
     }
@@ -288,17 +374,61 @@ impl GemObject {
 
     /// Device-memory pages carry the PPGTT DM bit and a VRAM address.
     pub(crate) fn is_vram(&self) -> bool {
-        self.vram.is_some()
+        self.storage.load(Ordering::Acquire) != STORAGE_SYSTEM
     }
 
-    pub(crate) fn in_vram_pool(&self, pool: &Arc<crate::intel_gpu_vram::Vram>) -> bool {
-        self.vram.as_ref().is_some_and(|vram| vram.pool_is(pool))
+    pub(crate) fn in_vram_pool(&self, pool: &crate::intel_gpu_vram::Vram) -> bool {
+        self.backing
+            .lock()
+            .vram
+            .as_ref()
+            .is_some_and(|vram| vram.pool_is_ref(pool))
+    }
+    pub(crate) fn vram_pool(&self) -> Option<Arc<crate::intel_gpu_vram::Vram>> {
+        self.backing
+            .lock()
+            .vram
+            .as_ref()
+            .map(|vram| vram.pool().clone())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn has_ccs_backup(&self) -> bool {
+        self.backing.lock().ccs_backup.is_some()
+    }
+    pub(crate) fn preferred_vram(&self) -> bool {
+        self.preferred_vram.load(Ordering::Acquire)
+    }
+    pub(crate) fn set_preferred_vram(&self) {
+        self.preferred_vram.store(true, Ordering::Release);
+    }
+    pub(crate) fn is_evictable(&self, allow_scanout: bool) -> bool {
+        if !self.is_vram()
+            || self.vm_owner.is_some()
+            || self.private_staging
+            || self.is_userptr()
+            || self.is_wc()
+        {
+            return false;
+        }
+        if !allow_scanout && self.scanout() {
+            return false;
+        }
+        if !self.idle(true) {
+            return false;
+        }
+        !cpu_mapping::has_active_aliases(self)
     }
     pub(crate) fn vram_page_size(&self) -> u64 {
-        self.vram.as_ref().map_or(PAGE, |vram| vram.page_size())
+        self.vram_page_sz.load(Ordering::Acquire)
     }
     pub(crate) fn begin_ccs_clear(&self) -> Result<(), FsError> {
-        if !self.vram.as_ref().is_some_and(|v| v.requires_ccs_clear()) {
+        if !self
+            .backing
+            .lock()
+            .vram
+            .as_ref()
+            .is_some_and(|v| v.requires_ccs_clear())
+        {
             return Err(FsError::Unsupported);
         }
         self.ccs
@@ -310,7 +440,14 @@ impl GemObject {
     /// Retain a private Xe2-style object for bounded CPU initialization.
     /// DG2 must use the trusted GPU data/flat-CCS clear instead.
     pub(crate) fn begin_cpu_vram_clear(self: &Arc<Self>) -> Result<CpuVramClear, FsError> {
-        if self.is_gpu_only() || self.vram.as_ref().is_none_or(|v| v.requires_ccs_clear()) {
+        if self.is_gpu_only()
+            || self
+                .backing
+                .lock()
+                .vram
+                .as_ref()
+                .is_none_or(|v| v.requires_ccs_clear())
+        {
             return Err(FsError::Unsupported);
         }
         self.ccs
@@ -323,23 +460,6 @@ impl GemObject {
         })
     }
 
-    /// Admission of a kernel CPU access to this object's LMEM BAR bytes:
-    /// `None` for a system-memory object, `Busy` while the pool is closed for
-    /// runtime suspend.
-    fn bar_access(&self) -> Result<Option<crate::intel_gpu_vram::CpuAccess<'_>>, FsError> {
-        match &self.vram {
-            Some(vram) => vram.cpu_access().map(Some).ok_or(FsError::Busy),
-            None => Ok(None),
-        }
-    }
-
-    /// Kernel WC alias of byte `offset` of a VRAM object.
-    fn vram_byte(&self, offset: u64) -> Option<*mut u8> {
-        self.vram
-            .as_ref()
-            .and_then(|vram| vram.kernel_virt().map(|base| (base + offset) as *mut u8))
-    }
-
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -348,14 +468,13 @@ impl GemObject {
         self.vm_owner
     }
 
-    pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
-        self.system_frames()
-            .iter()
-            .map(|frame| frame.start_address().raw())
-            .chain(self.pins.iter().map(|pin| pin.phys().raw()))
-            .chain(self.vram.iter().flat_map(|vram| {
-                (0..vram.size() / PAGE).map(move |page| vram.device_address() + page * PAGE)
-            }))
+    pub fn pages(&self) -> GemPages<'_> {
+        GemPages {
+            backing: self.backing.lock(),
+            pins: &self.pins,
+            wc: self.wc.as_ref(),
+            index: 0,
+        }
     }
 
     /// i915 render-class reader (upper bits) and writer (lower bits).
@@ -430,7 +549,8 @@ impl GemObject {
             wc_fence();
             return true;
         }
-        crate::intel_gpu_gtt::publish_system_pages(self.frames.iter())
+        let backing = self.backing.lock();
+        crate::intel_gpu_gtt::publish_system_pages(backing.frames.iter())
             && crate::intel_gpu_gtt::publish_system_phys(self.pins.iter().map(|pin| pin.phys()))
     }
 
@@ -454,7 +574,7 @@ impl GemObject {
 
     /// CPU physical frames, including BAR addresses for LMEM. GPU `pages()`
     /// deliberately uses device-local addresses instead and cannot supply
-    /// the CPU alias census. Storage is immutable in this ownership slice.
+    /// the CPU alias census.
     fn cpu_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         if self.is_gpu_only() || self.private_staging {
             return Err(FsError::Unsupported);
@@ -469,11 +589,13 @@ impl GemObject {
         frames
             .try_reserve_exact(pages.len())
             .map_err(|_| FsError::OutOfMemory)?;
-        if let Some(vram) = &self.vram {
+        let backing = self.backing.lock();
+        if let Some(vram) = &backing.vram {
             // LMEM BAR frames, write-combining as Linux's VRAM mmap.
             let base = vram.cpu_address().ok_or(FsError::Unsupported)?;
             frames.extend(pages.map(|page| base + page as u64 * PAGE));
         } else {
+            drop(backing);
             frames.extend(self.pages().skip(pages.start).take(pages.len()));
         }
         Ok(frames)
@@ -489,15 +611,35 @@ impl GemObject {
         if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(false)) {
             return Err(FsError::WouldBlock);
         }
+        let _guard = self.cpu.lock();
+        let pool = self.vram_pool();
         // The LMEM BAR does not decode while the GT owner has the function
         // runtime-suspended; callers that may resume it hold a wakeref first.
-        let _bar = self.bar_access()?;
-        let _guard = self.cpu.lock();
+        let _bar = match &pool {
+            Some(pool) => Some(pool.cpu_access().ok_or(FsError::Busy)?),
+            None => None,
+        };
+        let backing = self.backing.lock();
+        if backing
+            .vram
+            .as_ref()
+            .is_some_and(|v| v.cpu_address().is_none())
+        {
+            return Err(FsError::Unsupported);
+        }
+        let vram_virt = backing.vram.as_ref().and_then(|v| v.kernel_virt());
+        if backing.vram.is_some() && vram_virt.is_none() {
+            return Err(FsError::Unsupported);
+        }
+        let frames = self
+            .wc
+            .as_ref()
+            .map_or(backing.frames.as_slice(), |wc| wc.frames());
         for (i, byte) in bytes.iter_mut().enumerate() {
             let at = offset + i as u64;
-            if let Some(alias) = self.vram_byte(at) {
+            if let Some(base) = vram_virt {
                 // SAFETY: range checked; the allocation's WC alias is live.
-                *byte = unsafe { core::ptr::read_volatile(alias) };
+                *byte = unsafe { core::ptr::read_volatile((base + at) as *const u8) };
                 continue;
             }
             if self.is_userptr() {
@@ -507,7 +649,7 @@ impl GemObject {
                 *byte = unsafe { core::ptr::read_volatile(base.add((at % PAGE) as usize)) };
                 continue;
             }
-            let base = self.system_frames()[(at / PAGE) as usize]
+            let base = frames[(at / PAGE) as usize]
                 .start_address()
                 .kernel_ptr::<u8>();
             // SAFETY: range checked; raw volatile access also tolerates concurrent
@@ -587,13 +729,33 @@ impl GemObject {
         if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(true)) {
             return Err(FsError::WouldBlock);
         }
-        let _bar = self.bar_access()?;
         let _guard = self.cpu.lock();
+        let pool = self.vram_pool();
+        let _bar = match &pool {
+            Some(pool) => Some(pool.cpu_access().ok_or(FsError::Busy)?),
+            None => None,
+        };
+        let backing = self.backing.lock();
+        if backing
+            .vram
+            .as_ref()
+            .is_some_and(|v| v.cpu_address().is_none())
+        {
+            return Err(FsError::Unsupported);
+        }
+        let vram_virt = backing.vram.as_ref().and_then(|v| v.kernel_virt());
+        if backing.vram.is_some() && vram_virt.is_none() {
+            return Err(FsError::Unsupported);
+        }
+        let frames = self
+            .wc
+            .as_ref()
+            .map_or(backing.frames.as_slice(), |wc| wc.frames());
         for (i, byte) in bytes.iter().enumerate() {
             let at = offset + i as u64;
-            if let Some(alias) = self.vram_byte(at) {
+            if let Some(base) = vram_virt {
                 // SAFETY: range checked; the allocation's WC alias is live.
-                unsafe { core::ptr::write_volatile(alias, *byte) };
+                unsafe { core::ptr::write_volatile((base + at) as *mut u8, *byte) };
                 continue;
             }
             if self.is_userptr() {
@@ -603,18 +765,206 @@ impl GemObject {
                 unsafe { core::ptr::write_volatile(base.add((at % PAGE) as usize), *byte) };
                 continue;
             }
-            let base = self.system_frames()[(at / PAGE) as usize]
+            let base = frames[(at / PAGE) as usize]
                 .start_address()
                 .kernel_mut_ptr::<u8>();
             // SAFETY: same owned, range-checked pages as read().
             unsafe { core::ptr::write_volatile(base.add((at % PAGE) as usize), *byte) };
         }
-        if self.is_wc() || self.is_vram() {
+        if self.is_wc() || backing.vram.is_some() {
             // Write-combining stores are weakly ordered: drain them before a
             // later submission or fence publishes the bytes.
             wc_fence();
         }
         Ok(())
+    }
+
+    fn swap_to_system(
+        self: &Arc<Self>,
+        staging: &Arc<Self>,
+        ccs_backup: Option<Arc<GemObject>>,
+        allow_scanout: bool,
+    ) -> Result<u64, FsError> {
+        let (dropped_vram, old_frames, drop_ccs) = {
+            let _reservation = RESERVATIONS.lock();
+            let _cpu = self.cpu.lock();
+            let mut backing = self.backing.lock();
+            if backing.vram.is_none() {
+                return Ok(0);
+            }
+            if !self.idle(true)
+                || (!allow_scanout && self.scanout())
+                || cpu_mapping::has_active_aliases(self)
+            {
+                return Err(FsError::Busy);
+            }
+            let mut staging_backing = staging.backing.lock();
+            let new_frames = core::mem::take(&mut staging_backing.frames);
+            if !backing.charged && staging_backing.charged {
+                backing.charged = true;
+                staging_backing.charged = false;
+            }
+            drop(staging_backing);
+            let old_vram = backing.vram.take();
+            let old_frames = core::mem::replace(&mut backing.frames, new_frames);
+            let drop_ccs = backing.ccs_backup.take();
+            backing.ccs_backup = ccs_backup;
+            self.storage.store(STORAGE_SYSTEM, Ordering::Release);
+            self.vram_page_sz.store(PAGE, Ordering::Release);
+            (old_vram, old_frames, drop_ccs)
+        };
+        drop(drop_ccs);
+        drop(dropped_vram);
+        for frame in old_frames {
+            free_frame(frame);
+        }
+        Ok(self.size)
+    }
+
+    /// Evict an idle VRAM object to newly allocated system frames using
+    /// `backend.copy_objects`. On Alchemist (`DG2`), saves Flat-CCS metadata
+    /// alongside the data so a subsequent migration back to VRAM restores it.
+    pub(crate) async fn evict_to_system(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: u64,
+        allow_scanout: bool,
+    ) -> Result<u64, FsError> {
+        let _migrating = self.migrating.lock().await;
+        if !self.is_vram() {
+            return Ok(0);
+        }
+        if self.vm_owner.is_some() || self.private_staging || self.is_userptr() || self.is_wc() {
+            return Err(FsError::Unsupported);
+        }
+        if (!allow_scanout && self.scanout()) || !self.idle(true) {
+            return Err(FsError::Busy);
+        }
+        cpu_mapping::retire_object(self)?;
+        let requires_ccs = {
+            let backing = self.backing.lock();
+            let Some(vram) = &backing.vram else {
+                return Ok(0);
+            };
+            vram.requires_ccs_clear()
+        };
+        let staging = GemObject::private_system(self.size)?;
+        let ccs_backup = if requires_ccs {
+            let ccs_bytes = ((self.size / 256).div_ceil(PAGE) * PAGE).max(PAGE);
+            Some(GemObject::private_system(ccs_bytes)?)
+        } else {
+            None
+        };
+        let request = crate::intel_gpu_exec::copy::CopyRequest::for_migration(
+            self.clone(),
+            staging.clone(),
+            ccs_backup.clone(),
+            self.size,
+        )?;
+        let fence = backend.copy_objects(request, epoch).await?;
+        if fence.wait().await.is_err() {
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        self.swap_to_system(&staging, ccs_backup, allow_scanout)
+    }
+
+    fn swap_to_vram(
+        self: &Arc<Self>,
+        target: &Arc<Self>,
+        pool: &Arc<crate::intel_gpu_vram::Vram>,
+    ) -> Result<(), FsError> {
+        let (old_frames, old_ccs, uncharge) = {
+            let _reservation = RESERVATIONS.lock();
+            let _cpu = self.cpu.lock();
+            let mut backing = self.backing.lock();
+            if backing.vram.is_some() {
+                return Ok(());
+            }
+            if !self.idle(true) || cpu_mapping::has_active_aliases(self) {
+                return Err(FsError::Busy);
+            }
+            let vram = target
+                .backing
+                .lock()
+                .vram
+                .take()
+                .ok_or(FsError::InvalidData)?;
+            let storage = Self::storage_of(&vram);
+            backing.vram = Some(vram);
+            self.storage.store(storage, Ordering::Release);
+            self.vram_page_sz.store(pool.page_size(), Ordering::Release);
+            self.ccs.store(4, Ordering::Release);
+            let old_frames = core::mem::take(&mut backing.frames);
+            let old_ccs = backing.ccs_backup.take();
+            let uncharge = core::mem::replace(&mut backing.charged, false);
+            (old_frames, old_ccs, uncharge)
+        };
+        drop(old_ccs);
+        for frame in old_frames {
+            free_frame(frame);
+        }
+        if uncharge {
+            LIVE_BYTES.fetch_sub(self.size, Ordering::AcqRel);
+        }
+        pool.track(self);
+        Ok(())
+    }
+
+    /// Migrate a system-backed object (including an evicted VRAM object with
+    /// retained Flat-CCS metadata) back into `pool`.
+    pub(crate) async fn migrate_to_vram(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        pool: &Arc<crate::intel_gpu_vram::Vram>,
+        visible: bool,
+        epoch: u64,
+    ) -> Result<(), FsError> {
+        let _migrating = self.migrating.lock().await;
+        if self.is_vram() {
+            return if self.in_vram_pool(pool) {
+                Ok(())
+            } else {
+                Err(FsError::InvalidData)
+            };
+        }
+        if self.vm_owner.is_some() || self.private_staging || self.is_userptr() || self.is_wc() {
+            return Err(FsError::Unsupported);
+        }
+        if self.size == 0 || self.size % pool.page_size() != 0 {
+            return Err(FsError::InvalidData);
+        }
+        if !self.idle(true) {
+            return Err(FsError::Busy);
+        }
+        cpu_mapping::retire_object(self)?;
+        let ccs_backup = self.backing.lock().ccs_backup.clone();
+        let allocation = pool.allocate_class(self.size, visible)?;
+        let target_storage = Self::storage_of(&allocation);
+        let mut target_obj = Self::allocate(0, 0)?;
+        target_obj.private_staging = true;
+        target_obj.size = self.size;
+        {
+            let mut tb = target_obj.backing.lock();
+            tb.charged = false;
+            tb.vram = Some(allocation);
+        }
+        target_obj.storage.store(target_storage, Ordering::Release);
+        target_obj
+            .vram_page_sz
+            .store(pool.page_size(), Ordering::Release);
+        target_obj.ccs.store(4, Ordering::Release);
+        let target = Arc::new(target_obj);
+        let request = crate::intel_gpu_exec::copy::CopyRequest::for_migration(
+            self.clone(),
+            target.clone(),
+            ccs_backup,
+            self.size,
+        )?;
+        let fence = backend.copy_objects(request, epoch).await?;
+        if fence.wait().await.is_err() {
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        self.swap_to_vram(&target, pool)
     }
 }
 
@@ -714,10 +1064,21 @@ pub(crate) fn reserve_gpu_explicit(
 
 impl Drop for GemObject {
     fn drop(&mut self) {
-        for frame in self.frames.drain(..) {
+        let (frames, vram, ccs_backup, charged) = {
+            let mut backing = self.backing.lock();
+            (
+                core::mem::take(&mut backing.frames),
+                backing.vram.take(),
+                backing.ccs_backup.take(),
+                backing.charged,
+            )
+        };
+        drop(ccs_backup);
+        drop(vram);
+        for frame in frames {
             free_frame(frame);
         }
-        if self.charged {
+        if charged {
             LIVE_BYTES.fetch_sub(self.size, Ordering::AcqRel);
         }
     }
@@ -925,12 +1286,22 @@ impl GemState {
             },
             Placement::System | Placement::SystemWc => None,
         };
+        let mut track_pool = None;
         let mut object = match (local, placement) {
             (Some(allocation), _) => {
+                let storage = GemObject::storage_of(&allocation);
+                let page_size = allocation.page_size();
+                track_pool = Some(allocation.pool().clone());
                 let mut object = GemObject::allocate(0, offset)?;
-                object.vram = Some(allocation);
+                {
+                    let mut backing = object.backing.lock();
+                    backing.charged = false;
+                    backing.vram = Some(allocation);
+                }
+                object.storage.store(storage, Ordering::Release);
+                object.vram_page_sz.store(page_size, Ordering::Release);
+                object.preferred_vram.store(true, Ordering::Release);
                 object.size = size;
-                object.charged = false;
                 object
             }
             (None, Placement::SystemWc) => GemObject::allocate_wc(size, offset)?,
@@ -943,9 +1314,14 @@ impl GemState {
         let object = Arc::new(object);
         let handle = handles.next;
         report(handle, size)?;
+        let tracked = object.clone();
         handles.objects.insert(handle, object);
         handles.next = next;
         handles.bytes += size;
+        drop(handles);
+        if let Some(pool) = track_pool {
+            pool.track(&tracked);
+        }
         Ok(handle)
     }
 
@@ -1088,11 +1464,20 @@ impl GemState {
             None
         };
         let allocation = pool.allocate_class(size, visible)?;
+        let storage = GemObject::storage_of(&allocation);
         let mut object = GemObject::allocate(0, offset)?;
         *object.pending_quota.lock() = quota;
-        object.vram = Some(allocation);
+        {
+            let mut backing = object.backing.lock();
+            backing.charged = false;
+            backing.vram = Some(allocation);
+        }
+        object.storage.store(storage, Ordering::Release);
+        object
+            .vram_page_sz
+            .store(pool.page_size(), Ordering::Release);
+        object.preferred_vram.store(true, Ordering::Release);
         object.size = size;
-        object.charged = false;
         object.vm_owner = owner;
         object.ccs.store(1, Ordering::Release);
         Ok(PendingVram {
@@ -1158,9 +1543,15 @@ impl GemState {
         let handle = handles.next;
         report(handle, size)?;
         pending.object.ccs.store(4, Ordering::Release);
+        pending.object.set_preferred_vram();
+        let tracked = pending.object.clone();
         handles.objects.insert(handle, pending.object);
         handles.next = next;
         handles.bytes += size;
+        drop(handles);
+        if let Some(pool) = tracked.vram_pool() {
+            pool.track(&tracked);
+        }
         Ok(handle)
     }
 
@@ -1281,6 +1672,8 @@ impl CpuVramClear {
         let end = (self.next + 65536).min(self.object.size);
         let base = self
             .object
+            .backing
+            .lock()
             .vram
             .as_ref()
             .expect("CPU VRAM token")
@@ -1347,8 +1740,14 @@ impl VramPublication<'_> {
         drop(quota);
         let object = self.object.take().expect("verified private object");
         object.ccs.store(4, Ordering::Release);
+        object.set_preferred_vram();
+        let tracked = object.clone();
         handles.reserved.remove(&self.handle);
         handles.objects.insert(self.handle, object);
+        drop(handles);
+        if let Some(pool) = tracked.vram_pool() {
+            pool.track(&tracked);
+        }
         Ok(())
     }
 }

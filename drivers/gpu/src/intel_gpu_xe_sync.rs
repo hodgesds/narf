@@ -14,6 +14,9 @@ pub(crate) struct Sync {
     pub user_fence: Option<(u64, u64)>,
 }
 impl Sync {
+    pub fn has_fence_outputs(&self) -> bool {
+        !self.outputs.is_empty()
+    }
     pub fn read(
         user: &dyn IoctlContext,
         address: u64,

@@ -37,6 +37,8 @@ pub(crate) const USERPTR_PIN_ROUNDS: usize = 8;
 pub(crate) struct Vm {
     pub identity: u64,
     pub scratch: bool,
+    pub lr: bool,
+    pub fault: bool,
     pub dead: AtomicBool,
     pub state: Mutex<State>,
     /// Published MAP_USERPTR bindings. Changed only with `state` held; the
@@ -52,13 +54,15 @@ pub(crate) struct State {
     pub active: Vec<Arc<CompletionFence>>,
 }
 impl Vm {
-    pub fn new(scratch: bool) -> Result<Arc<Self>, FsError> {
+    pub fn new(scratch: bool, lr: bool, fault: bool) -> Result<Arc<Self>, FsError> {
         let identity = NEXT_VM
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| FsError::OutOfMemory)?;
         Ok(Arc::new(Self {
             identity,
             scratch,
+            lr,
+            fault,
             dead: AtomicBool::new(false),
             state: Mutex::new(State {
                 mappings: Vec::new(),
@@ -270,6 +274,8 @@ pub(crate) struct Bind {
     pub userptr: Option<u64>,
     /// The collected MAP_USERPTR binding, adopted when the bind publishes.
     pub mirror: Option<Userptr>,
+    /// DRM_XE_VM_BIND_OP_PREFETCH target memory region (0 = sysmem, 1 = VRAM).
+    pub prefetch_region: u32,
 }
 
 /// PAT indices coherent with CPU caches that this driver programs.
@@ -329,6 +335,7 @@ impl Bind {
                 mapping: None,
                 userptr: None,
                 mirror: None,
+                prefetch_region: 0,
             });
         }
         if address % 4096 != 0
@@ -350,6 +357,7 @@ impl Bind {
                 mapping: None,
                 userptr: None,
                 mirror: None,
+                prefetch_region: 0,
             });
         }
         if op == 2 {
@@ -375,10 +383,32 @@ impl Bind {
                 }),
                 userptr: Some(offset),
                 mirror: None,
+                prefetch_region: 0,
+            });
+        }
+        if op == 4 {
+            // DRM_XE_VM_BIND_OP_PREFETCH: requires FAULT_MODE, no BO or NULL
+            // flag, and a valid target memory region (0 = sysmem, 1 = VRAM0).
+            if !vm.fault
+                || object != 0
+                || flags & 4 != 0
+                || offset > u64::from(platform.is_discrete())
+            {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(Self {
+                object: None,
+                address,
+                length,
+                op: 4,
+                mapping: None,
+                userptr: None,
+                mirror: None,
+                prefetch_region: offset as u32,
             });
         }
         if op != 0 {
-            return Err(FsError::NotImplemented);
+            return Err(FsError::InvalidData);
         }
         let null = flags & 4 != 0;
         let object_arc = if null {
@@ -427,6 +457,7 @@ impl Bind {
             }),
             userptr: None,
             mirror: None,
+            prefetch_region: 0,
         })
     }
 
@@ -497,6 +528,17 @@ impl State {
     pub fn prepare(&self, binds: &[Bind], scratch: bool) -> Result<Vec<VmMapping>, FsError> {
         let mut mappings = self.mappings.clone();
         for bind in binds {
+            if bind.op == 4 {
+                if !crate::intel_gpu_exec::mappings_cover_any(
+                    &mappings,
+                    bind.address,
+                    bind.length,
+                    false,
+                ) {
+                    return Err(FsError::InvalidData);
+                }
+                continue;
+            }
             if bind.op == 3 {
                 let object = bind.object.as_ref().expect("retained unmap object");
                 mappings.retain(|m| {
@@ -614,6 +656,7 @@ mod tests {
             mapping: None,
             userptr: None,
             mirror: None,
+            prefetch_region: 0,
         };
         let mapped = state.prepare(&[unmap], true).unwrap();
         assert_eq!(
@@ -645,6 +688,7 @@ mod tests {
             }),
             userptr: None,
             mirror: None,
+            prefetch_region: 0,
         };
         let mapped = state.prepare(&[replace], true).unwrap();
         assert_eq!(mapped.len(), 3);
@@ -660,6 +704,7 @@ mod tests {
             mapping: None,
             userptr: None,
             mirror: None,
+            prefetch_region: 0,
         };
         gem.close(handle).unwrap();
         let mapped = state.prepare(&[all], true).unwrap();

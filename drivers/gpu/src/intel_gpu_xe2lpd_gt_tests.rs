@@ -333,7 +333,7 @@ fn smoke_xe2lpd_gt_profile_selection_keeps_headless_flr() -> TestResult {
     // System suspend: refused on the D0-only profiles.
     assert!(system_suspend_admitted(false, false));
     assert!(!system_suspend_admitted(true, false));
-    assert!(!system_suspend_admitted(false, true));
+    assert!(system_suspend_admitted(false, true));
 
     // The headless profile's cold start still requests the driver FLR, on
     // the same lit-display registers the display profile only reads: fresh

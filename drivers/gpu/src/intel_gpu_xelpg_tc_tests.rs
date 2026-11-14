@@ -436,3 +436,82 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_tc",
     smoke_mtl_tc_aux_power_well_request_and_busy_refusal
 );
+
+fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
+    use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL};
+
+    struct Display20Tc {
+        inner: TcFake,
+        pica_req: Cell<u32>,
+        tcss_pin: Cell<u8>,
+    }
+    impl Display20Tc {
+        fn new(port: XeLpgPort, tcss_pin: u8) -> Self {
+            Self {
+                inner: TcFake::new(port),
+                pica_req: Cell::new(0),
+                tcss_pin: Cell::new(tcss_pin),
+            }
+        }
+    }
+    impl MmioWindow for Display20Tc {
+        fn display_access_ok(&self) -> bool {
+            self.inner.display_access_ok()
+        }
+        fn read32(&self, off: u64) -> u32 {
+            if off == PICA_PW_CTL {
+                let req = self.pica_req.get();
+                return if req & PICA_POWER_REQUEST != 0 {
+                    req | PICA_POWER_STATUS
+                } else {
+                    req
+                };
+            }
+            if off == tcss_ddi_status(self.inner.tc()) {
+                let base = self.inner.read32(off);
+                return base | ((u32::from(self.tcss_pin.get()) & 0xF) << 20);
+            }
+            self.inner.read32(off)
+        }
+        fn write32(&self, off: u64, value: u32) {
+            if off == PICA_PW_CTL {
+                self.pica_req.set(value);
+            }
+            self.inner.write32(off, value);
+        }
+    }
+
+    let io = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D);
+    // Keep PORT_TX_DFLEXPA1 distinct so only TCSS_DDI_STATUS supplies PIN_ASSIGNMENT_D.
+    io.inner.pin.set(PIN_ASSIGNMENT_C);
+    io.inner.pica_isr.set(pica_dp_alt_hotplug(0));
+    let conn = match connect_for(&io, XeLpgPort::Tc1, false, 2, true) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("Display 20 TC DP-alt connect_for must succeed"),
+    };
+    if !conn.display20
+        || conn.pin_assignment != PIN_ASSIGNMENT_D
+        || conn.max_lanes != 2
+        || io.pica_req.get() & PICA_POWER_REQUEST == 0
+    {
+        return TestResult::Fail("Display 20 TC must enable PICA and read TCSS_DDI_STATUS");
+    }
+    if disconnect(&io, &conn).is_err() || io.pica_req.get() & PICA_POWER_REQUEST != 0 {
+        return TestResult::Fail("Display 20 TC disconnect must drop PICA_PW_CTL");
+    }
+    // Rollback on insufficient lanes must also drop PICA_PW_CTL.
+    if connect_for(&io, XeLpgPort::Tc1, false, 4, true)
+        != Err(TcError::InsufficientLanes {
+            max: 2,
+            required: 4,
+        })
+        || io.pica_req.get() & PICA_POWER_REQUEST != 0
+    {
+        return TestResult::Fail("Display 20 TC failure rollback must drop PICA_PW_CTL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_tc",
+    smoke_display20_tc_pica_and_tcss_pin_assignment
+);

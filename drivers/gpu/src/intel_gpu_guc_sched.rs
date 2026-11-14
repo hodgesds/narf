@@ -161,6 +161,8 @@ struct Context<B: GpuBacking> {
     timed_out: bool,
     /// GuC reset the engine under this context (CONTEXT_RESET_NOTIFICATION).
     reset: bool,
+    /// Long-running context explicitly killed on queue teardown (`ban`).
+    killed: bool,
     primary_finished: bool,
     parallel: Option<parallel::Group<B>>,
     /// The SCHEDULING_PRIORITY GuC last accepted for this registration:
@@ -1529,6 +1531,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             tail,
             timed_out: false,
             reset: false,
+            killed: false,
             primary_finished: false,
             parallel,
             sent_priority: None,
@@ -1686,6 +1689,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         context.deadline =
                             now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                     }
+                } else if context
+                    .user
+                    .as_ref()
+                    .is_some_and(|u| u.is_lr() && u.banned())
+                    && !context.killed
+                {
+                    context.killed = true;
+                    context.phase = Phase::Disable;
+                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
             }
             if now >= context.deadline {
@@ -1694,124 +1706,129 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 if context.user.is_none()
                     || context.timed_out
                     || context.reset
+                    || context.killed
                     || context.phase != Phase::Running
                 {
                     return Err(SchedulingError::Timeout);
                 }
-                let (mut expired, progressed) = if context.primary_finished {
-                    (false, false)
-                } else if context.placements.iter().count() > 1 {
-                    context.runtime.expired_on(
-                        &context.image,
-                        context.stamp,
-                        context.placements,
-                        self.platform,
-                        ct.window(),
-                    )?
+                if context.user.as_ref().is_some_and(|u| u.is_lr()) {
+                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 } else {
-                    context.runtime.expired(
-                        &context.image,
-                        context.stamp,
-                        context.engine,
-                        self.platform,
-                        ct.window(),
-                    )?
-                };
-                if progressed {
-                    let physical = job_timeout::observed_engine(
-                        &context.image,
-                        context.stamp,
-                        context.placements,
-                    )?
-                    .ok_or(SchedulingError::Protocol)?;
-                    resources
-                        .engines
-                        .iter_mut()
-                        .find(|e| e.engine == physical)
-                        .expect("scheduler engine")
-                        .last_progress = Some(now);
-                }
-                if let Some(group) = &mut context.parallel {
-                    if expired {
-                        group.timeout_lanes |= 1;
-                    }
-                    for (index, lane) in group.children.iter_mut().enumerate() {
-                        if lane.finished {
-                            continue;
-                        }
-                        let (child_expired, child_progressed) = lane.runtime.expired_on(
-                            &lane.image,
+                    let (mut expired, progressed) = if context.primary_finished {
+                        (false, false)
+                    } else if context.placements.iter().count() > 1 {
+                        context.runtime.expired_on(
+                            &context.image,
                             context.stamp,
-                            lane.placements,
+                            context.placements,
                             self.platform,
                             ct.window(),
-                        )?;
-                        if child_progressed {
-                            let physical = job_timeout::observed_engine(
+                        )?
+                    } else {
+                        context.runtime.expired(
+                            &context.image,
+                            context.stamp,
+                            context.engine,
+                            self.platform,
+                            ct.window(),
+                        )?
+                    };
+                    if progressed {
+                        let physical = job_timeout::observed_engine(
+                            &context.image,
+                            context.stamp,
+                            context.placements,
+                        )?
+                        .ok_or(SchedulingError::Protocol)?;
+                        resources
+                            .engines
+                            .iter_mut()
+                            .find(|e| e.engine == physical)
+                            .expect("scheduler engine")
+                            .last_progress = Some(now);
+                    }
+                    if let Some(group) = &mut context.parallel {
+                        if expired {
+                            group.timeout_lanes |= 1;
+                        }
+                        for (index, lane) in group.children.iter_mut().enumerate() {
+                            if lane.finished {
+                                continue;
+                            }
+                            let (child_expired, child_progressed) = lane.runtime.expired_on(
                                 &lane.image,
                                 context.stamp,
                                 lane.placements,
-                            )?
-                            .ok_or(SchedulingError::Protocol)?;
-                            resources
-                                .engines
-                                .iter_mut()
-                                .find(|e| e.engine == physical)
-                                .expect("scheduler engine")
-                                .last_progress = Some(now);
-                        }
-                        if child_expired {
-                            group.timeout_lanes |= 1 << (index + 1);
-                            expired = true;
-                        }
-                    }
-                }
-                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
-                if expired {
-                    // GuC preempts this context alone or resets its engine
-                    // if it cannot preempt within the firmware policy bound.
-                    context.timed_out = true;
-                    if self.pending_error.is_none() {
-                        let mut contexts = Contexts::new(diagnostic_total);
-                        contexts.push(context.diagnostic());
-                        for child in context.child_diagnostics() {
-                            contexts.push(child);
-                        }
-                        self.pending_error = Some(Report::capture(
-                            Capture {
-                                platform: self.platform,
-                                reason: Reason::Timeout,
-                                epoch: self.epoch,
-                                now_ns: now,
-                                state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
-                                engines: self.engines,
-                                process_name: None,
-                                pid: None,
-                                snapshot_time: None,
-                            },
-                            contexts,
-                            |offset| {
-                                // GuCGt checked awake before this poll; its PCI
-                                // owner retains D0/reset ownership throughout. The
-                                // authorized window rechecks current cap per read.
-                                forcewake_read(ct.window(), self.platform, offset)
-                            },
-                        ));
-                        // guc_exec_queue_timedout_job: with no GuC capture for
-                        // the queue, xe_engine_snapshot_capture_for_queue reads
-                        // the first engine of its class and logical mask before
-                        // scheduling is disabled.
-                        if let (Some(capture), Some(engine)) =
-                            (&mut self.error_capture, context.placements.iter().next())
-                        {
-                            let family = capture.family;
-                            capture.node.capture_manual(family, engine, |offset| {
-                                forcewake_read(ct.window(), self.platform, offset)
-                            });
-                            capture.manual = Some((context.id, engine));
+                                self.platform,
+                                ct.window(),
+                            )?;
+                            if child_progressed {
+                                let physical = job_timeout::observed_engine(
+                                    &lane.image,
+                                    context.stamp,
+                                    lane.placements,
+                                )?
+                                .ok_or(SchedulingError::Protocol)?;
+                                resources
+                                    .engines
+                                    .iter_mut()
+                                    .find(|e| e.engine == physical)
+                                    .expect("scheduler engine")
+                                    .last_progress = Some(now);
+                            }
+                            if child_expired {
+                                group.timeout_lanes |= 1 << (index + 1);
+                                expired = true;
+                            }
                         }
                     }
-                    context.phase = Phase::Disable;
+                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                    if expired {
+                        // GuC preempts this context alone or resets its engine
+                        // if it cannot preempt within the firmware policy bound.
+                        context.timed_out = true;
+                        if self.pending_error.is_none() {
+                            let mut contexts = Contexts::new(diagnostic_total);
+                            contexts.push(context.diagnostic());
+                            for child in context.child_diagnostics() {
+                                contexts.push(child);
+                            }
+                            self.pending_error = Some(Report::capture(
+                                Capture {
+                                    platform: self.platform,
+                                    reason: Reason::Timeout,
+                                    epoch: self.epoch,
+                                    now_ns: now,
+                                    state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
+                                    engines: self.engines,
+                                    process_name: None,
+                                    pid: None,
+                                    snapshot_time: None,
+                                },
+                                contexts,
+                                |offset| {
+                                    // GuCGt checked awake before this poll; its PCI
+                                    // owner retains D0/reset ownership throughout. The
+                                    // authorized window rechecks current cap per read.
+                                    forcewake_read(ct.window(), self.platform, offset)
+                                },
+                            ));
+                            // guc_exec_queue_timedout_job: with no GuC capture for
+                            // the queue, xe_engine_snapshot_capture_for_queue reads
+                            // the first engine of its class and logical mask before
+                            // scheduling is disabled.
+                            if let (Some(capture), Some(engine)) =
+                                (&mut self.error_capture, context.placements.iter().next())
+                            {
+                                let family = capture.family;
+                                capture.node.capture_manual(family, engine, |offset| {
+                                    forcewake_read(ct.window(), self.platform, offset)
+                                });
+                                capture.manual = Some((context.id, engine));
+                            }
+                        }
+                        context.phase = Phase::Disable;
+                    }
                 }
             }
             let id = u32::from(context.id);
@@ -1824,7 +1841,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             if let (Some(sent), Some(user), false) = (
                 context.sent_priority,
                 context.user.as_ref(),
-                context.timed_out || context.reset,
+                context.timed_out || context.reset || context.killed,
             ) {
                 let priority = user.priority();
                 if priority != sent
@@ -1978,11 +1995,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Err(error) => return Err(SchedulingError::Transport(error)),
             }
         }
-        for context in resources
-            .contexts
-            .iter()
-            .filter(|context| context.user.is_some() && context.phase == Phase::Running)
-        {
+        for context in resources.contexts.iter().filter(|context| {
+            context.user.as_ref().is_some_and(|user| !user.is_lr())
+                && context.phase == Phase::Running
+        }) {
             // A queued virtual context or gang may wait for an allowed
             // engine executing other work. Only a lack of GPU progress on
             // every unfinished lane/placement justifies the global fallback.
@@ -2009,7 +2025,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         for engine in &mut resources.engines {
             if !resources.contexts.iter().any(|context| {
                 context.owns_engine(engine.engine)
-                    && context.user.is_some()
+                    && context.user.as_ref().is_some_and(|user| !user.is_lr())
                     && context.phase == Phase::Running
             }) {
                 engine.last_progress = None;
@@ -2137,14 +2153,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
                 let hung = c.timed_out || c.reset;
-                if !hung
+                let aborted = hung || c.killed;
+                if !aborted
                     && (!c.all_finished() || c.parallel.as_ref().is_some_and(|g| !g.valid_wq()))
                 {
                     return Err(SchedulingError::Protocol);
                 }
-                // A hung job's saved state is never captured: its context
-                // is banned below.
-                if let Some(user) = c.user.as_ref().filter(|_| !hung) {
+                // A hung or explicitly killed job's saved state is never captured.
+                if let Some(user) = c.user.as_ref().filter(|_| !aborted) {
                     resources
                         .allocator
                         .sync_for_cpu(&c.image)
@@ -2196,7 +2212,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     }
                 }
                 c.fence
-                    .signal(if hung { Err(JobError::Hang) } else { Ok(()) });
+                    .signal(if aborted { Err(JobError::Hang) } else { Ok(()) });
                 if self.defaults == Defaults::Switch(c.engine, c.id) {
                     self.capture_defaults(c.engine)?;
                 }

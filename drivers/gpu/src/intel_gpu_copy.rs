@@ -22,6 +22,7 @@ pub struct CopyRequest {
     destination: Arc<GemObject>,
     destination_offset: u64,
     length: u64,
+    ccs_backup: Option<Arc<GemObject>>,
 }
 
 impl CopyRequest {
@@ -68,7 +69,28 @@ impl CopyRequest {
             destination,
             destination_offset,
             length,
+            ccs_backup: None,
         })
+    }
+
+    pub(crate) fn for_migration(
+        source: Arc<GemObject>,
+        destination: Arc<GemObject>,
+        ccs_backup: Option<Arc<GemObject>>,
+        length: u64,
+    ) -> Result<Self, FsError> {
+        if let Some(ccs) = &ccs_backup {
+            if ccs.is_vram()
+                || ccs.is_userptr()
+                || ccs.is_wc()
+                || ccs.size() < (length / 256).div_ceil(PAGE) * PAGE
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        let mut req = Self::new(source, 0, destination, 0, length)?;
+        req.ccs_backup = ccs_backup;
+        Ok(req)
     }
 
     pub(crate) fn validate_pool(
@@ -95,9 +117,12 @@ impl CopyRequest {
             return Err(FsError::Unsupported);
         }
         // DG2's compressed data and auxiliary representation must travel
-        // together. An ordinary system destination cannot retain that CCS.
-        if platform == GtPlatform::Alchemist && self.source.is_vram() && !self.destination.is_vram()
-        {
+        // together. An ordinary system destination without a CCS backup
+        // buffer cannot retain that CCS.
+        let save_ccs = platform == GtPlatform::Alchemist
+            && self.source.is_vram()
+            && !self.destination.is_vram();
+        if save_ccs && self.ccs_backup.is_none() {
             return Err(FsError::Unsupported);
         }
         let gem = GemState::new();
@@ -130,10 +155,24 @@ impl CopyRequest {
                 pat,
             ),
         ];
-        let ccs = platform == GtPlatform::Alchemist && self.destination.is_vram();
-        if ccs && !self.source.is_vram() {
-            let zero = gem.object(gem.create(COPY_CHUNK / 256, |_, _| Ok(()))?)?;
-            mappings.push(mapping(zero, CCS_ZERO, 0, COPY_CHUNK / 256, false, 0));
+        let ccs = platform == GtPlatform::Alchemist && (self.destination.is_vram() || save_ccs);
+        if save_ccs {
+            let backup = self.ccs_backup.clone().expect("checked CCS backup");
+            mappings.push(mapping(backup.clone(), CCS_ZERO, 0, backup.size(), true, 0));
+        } else if ccs && !self.source.is_vram() {
+            if let Some(backup) = &self.ccs_backup {
+                mappings.push(mapping(
+                    backup.clone(),
+                    CCS_ZERO,
+                    0,
+                    backup.size(),
+                    false,
+                    0,
+                ));
+            } else {
+                let zero = gem.object(gem.create(COPY_CHUNK / 256, |_, _| Ok(()))?)?;
+                mappings.push(mapping(zero, CCS_ZERO, 0, COPY_CHUNK / 256, false, 0));
+            }
         }
         let mut words = Vec::new();
         for offset in (0..self.length).step_by(COPY_CHUNK as usize) {
@@ -145,16 +184,29 @@ impl CopyRequest {
                 DESTINATION + offset,
                 length,
             );
-            if ccs {
-                emit_ccs_copy(
+            if save_ccs {
+                emit_ccs_copy_dirs(
                     &mut words,
-                    if self.source.is_vram() {
-                        SOURCE + offset
-                    } else {
-                        CCS_ZERO
-                    },
-                    !self.source.is_vram(),
+                    SOURCE + offset,
+                    false,
+                    CCS_ZERO + offset / 256,
+                    true,
+                    length,
+                );
+            } else if ccs {
+                let (src_addr, src_direct) = if self.source.is_vram() {
+                    (SOURCE + offset, false)
+                } else if self.ccs_backup.is_some() {
+                    (CCS_ZERO + offset / 256, true)
+                } else {
+                    (CCS_ZERO, true)
+                };
+                emit_ccs_copy_dirs(
+                    &mut words,
+                    src_addr,
+                    src_direct,
                     DESTINATION + offset,
+                    false,
                     length,
                 );
             }
@@ -236,9 +288,23 @@ pub(super) fn emit_ccs_copy(
     destination: u64,
     length: u64,
 ) {
+    emit_ccs_copy_dirs(words, source, direct, destination, false, length);
+}
+
+pub(super) fn emit_ccs_copy_dirs(
+    words: &mut Vec<u32>,
+    source: u64,
+    src_direct: bool,
+    destination: u64,
+    dst_direct: bool,
+    length: u64,
+) {
     debug_assert!(length != 0 && length <= 64 * 1024 * 1024 && length & 65535 == 0);
     words.extend_from_slice(&[
-        0x5200_0003 | (u32::from(direct) << 21) | ((length / 65536 - 1) as u32) << 8,
+        0x5200_0003
+            | (u32::from(src_direct) << 21)
+            | (u32::from(dst_direct) << 20)
+            | ((length / 65536 - 1) as u32) << 8,
         source as u32,
         (source >> 32) as u32 | (1 << 26),
         destination as u32,

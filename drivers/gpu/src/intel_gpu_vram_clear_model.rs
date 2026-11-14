@@ -175,8 +175,10 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
         assert!(!xe2, "Xe2 uncompressed copy has no auxiliary transfer");
         ccs = true;
         let cmd = &words[offset..offset + 5];
-        let direct = cmd[0] & (1 << 21) != 0;
-        assert_eq!(cmd[0] & !0x0023_ff00, 0x52000003);
+        let src_direct = cmd[0] & (1 << 21) != 0;
+        let dst_direct = cmd[0] & (1 << 20) != 0;
+        assert_eq!(cmd[0] & !0x0033_ff00, 0x52000003);
+        assert!(!(src_direct && dst_direct), "CCS transfer must touch VRAM");
         let count = u64::from((cmd[0] >> 8) & 1023) + 1;
         let metadata_bytes = count * 256;
         let data_bytes = metadata_bytes * 256;
@@ -184,16 +186,52 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
         assert_eq!(cmd[4] & 0xffff_0000, 1 << 26, "UC MOCS1 indirect target");
         let source = u64::from(cmd[1]) | u64::from(cmd[2] & 65535) << 32;
         let target = u64::from(cmd[3]) | u64::from(cmd[4] & 65535) << 32;
-        assert_eq!(target & 65535, 0);
-        let source_dpa = (!direct).then(|| leaf(root, source).0);
-        if direct {
-            for byte in 0..metadata_bytes {
-                // SAFETY: independently verified retained RO zero source.
-                let value =
-                    unsafe { core::ptr::read_volatile(self::pointer(root, source + byte, false)) };
-                assert_eq!(value, 0);
+        if !dst_direct {
+            assert_eq!(target & 65535, 0);
+        }
+        if !src_direct {
+            let source_dpa = leaf(root, source).0;
+            assert_eq!(source_dpa & 65535, 0);
+            if dst_direct {
+                let mut saved = alloc::vec![0u8; metadata_bytes as usize];
+                {
+                    let model = MODEL.lock();
+                    let model = model.as_ref().expect("CCS save requires owned model LMEM");
+                    assert!(
+                        source_dpa >= model.range.start
+                            && source_dpa + data_bytes <= model.range.end
+                    );
+                    let src_start = ((source_dpa - model.range.start) / 256) as usize;
+                    saved.copy_from_slice(
+                        &model.metadata[src_start..src_start + metadata_bytes as usize],
+                    );
+                }
+                for (i, byte) in saved.into_iter().enumerate() {
+                    // SAFETY: independently verified writable direct sysmem CCS buffer.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            self::pointer(root, target + i as u64, true),
+                            byte,
+                        )
+                    };
+                }
+                offset += 5;
+                continue;
             }
         }
+        let source_dpa = (!src_direct).then(|| leaf(root, source).0);
+        let mut restored = if src_direct {
+            let mut bytes = alloc::vec![0u8; metadata_bytes as usize];
+            for (i, slot) in bytes.iter_mut().enumerate() {
+                // SAFETY: independently verified retained RO direct sysmem source.
+                *slot = unsafe {
+                    core::ptr::read_volatile(self::pointer(root, source + i as u64, false))
+                };
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         let (dpa, _) = leaf(root, target);
         for chunk in (0..data_bytes).step_by(65536) {
             for page in 0..16 {
@@ -214,8 +252,8 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
             model
                 .metadata
                 .copy_within(source_start..source_start + metadata_bytes as usize, start);
-        } else {
-            model.metadata[start..start + metadata_bytes as usize].fill(0);
+        } else if let Some(bytes) = restored.take() {
+            model.metadata[start..start + metadata_bytes as usize].copy_from_slice(&bytes);
         }
         model.clears.push(dpa..dpa + data_bytes);
         offset += 5;

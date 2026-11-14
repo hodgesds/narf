@@ -1704,9 +1704,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if let Some(console) = kms_console {
         crate::intel_gpu_kms::install(card_index, kms_generation, gt_bar, device, cap, console);
     }
-    // Display-14 DC service: an MTL external route that stays live or
+    // Display-14/20/30 DC service: an external route that stays live or
     // quarantined between hotplug passes keeps DC5/DC6 re-entry refused.
-    if kms_generation == Generation::MeteorLake {
+    if crate::intel_gpu_xelpg_hpd::hpd_generation_supported(kms_generation) {
         crate::intel_gpu_dc_states::register_external_live(Some(
             crate::intel_gpu_xelpg_external::external_route_blocks_dc,
         ));
@@ -1789,7 +1789,11 @@ pub(crate) fn relight_display_locked(
     mode: &crate::intel_gpu_modeset::Mode,
 ) -> Option<ActiveScanout> {
     let display = with_display_info(|display| *display)?;
-    if !display.chip.generation.display_supported() {
+    let xe_lpd_route = matches!(
+        display.chip.generation,
+        Generation::LunarLake | Generation::PantherLake
+    ) && crate::intel_gpu_kms::display_for_bar(&display.gtt_mmadr).is_some();
+    if !display.chip.generation.display_supported() && !xe_lpd_route {
         return None;
     }
     if !external_routes_stopped(&display.gtt_mmadr) {
@@ -1803,17 +1807,44 @@ pub(crate) fn relight_display_locked(
     let height = u32::from(mode.v_active);
     let stride_bytes = padded_stride_bytes(width);
     let size_bytes = scanout_size_bytes(width, height);
-    let alloc =
-        crate::intel_gpu_gtt::alloc_contiguous_scanout(&display.gtt_mmadr, size_bytes).ok()?;
+    let alloc = if xe_lpd_route {
+        crate::intel_gpu_gtt::alloc_contiguous_scanout_with_format(
+            &display.gtt_mmadr,
+            crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A,
+            size_bytes,
+            crate::intel_gpu_gtt::PteFormat::Xe2,
+            0,
+        )
+        .ok()?
+    } else {
+        crate::intel_gpu_gtt::alloc_contiguous_scanout(&display.gtt_mmadr, size_bytes).ok()?
+    };
     let fb = crate::intel_gpu_modeset::Framebuffer {
         phys_addr: u64::from(alloc.gtt_offset),
         stride_bytes,
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
     let window = ModeWindow::new(display.gtt_mmadr, display.device, display.cap);
-    let applied =
+    let applied = if display.chip.generation == Generation::LunarLake {
+        crate::intel_gpu_xe2lpd::modeset(&window, &fb, Some(mode)).ok()?
+    } else if display.chip.generation == Generation::PantherLake {
+        crate::intel_gpu_xe3lpd::modeset(&window, &fb, Some(mode)).ok()?
+    } else {
         crate::intel_gpu_modeset::modeset_display_for_chip(&window, display.chip, &fb, Some(mode))
-            .ok()?;
+            .ok()?
+    };
+    if xe_lpd_route {
+        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_generation(display.chip.generation);
+        let range = crate::intel_gpu_vrr::VRR_STATE.range(1);
+        crate::intel_gpu_vrr::recompute_timings_for_modeset(
+            1,
+            &applied,
+            range,
+            ip,
+            crate::intel_gpu_vrr::VrrComputeOpts::default(),
+            crate::intel_gpu_vrr::VrrConnectorKind::EmbeddedDisplayPort,
+        );
+    }
     let scanout = ActiveScanout {
         width: u32::from(applied.h_active),
         height: u32::from(applied.v_active),
@@ -2789,59 +2820,104 @@ fn mtl_publish(request: MtlPublication) {
     }
 }
 
-/// One production MTL pass for the probed display. Only Meteor Lake
-/// reaches registers; the window is current-authority checked per access.
+/// One production Display-14/20/30 external pass for the probed display.
 fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnMut()) -> bool {
     with_display_info(|gpu| {
-        if gpu.chip.generation != Generation::MeteorLake {
+        if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation) {
+            return false;
+        }
+        let gtt = gpu.gtt_mmadr;
+        if matches!(
+            gpu.chip.generation,
+            Generation::LunarLake | Generation::PantherLake
+        ) && crate::intel_gpu_kms::display_for_bar(&gtt).is_none()
+        {
             return false;
         }
         let window = gpu.mode_window();
-        let gtt = gpu.gtt_mmadr;
-        // The owned panel the route adopts next to it, and the display-14
+        // The owned panel the route adopts next to it, and the display-14/20/30
         // DC service's pipe-DMC sink.
         let display = crate::intel_gpu_xelpg_external::MtlDisplay::production(
             crate::intel_gpu_modeset_xelpg::owned_panel_mode(),
         );
-        mtl_external_pass(
-            &window,
+        let xe2_scanout = matches!(
             gpu.chip.generation,
-            gtt.phys.raw(),
-            &display,
-            before_event,
-            after_event,
-            &mut |size| {
-                let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+            Generation::LunarLake | Generation::PantherLake
+        );
+        let mut alloc_fn = |size| {
+            let offset =
+                crate::intel_gpu_multipipe::scanout_gtt_offset(crate::intel_gpu_pipes::Pipe::B);
+            let alloc = if xe2_scanout {
+                crate::intel_gpu_gtt::alloc_contiguous_scanout_with_format(
                     &gtt,
-                    crate::intel_gpu_multipipe::scanout_gtt_offset(crate::intel_gpu_pipes::Pipe::B),
+                    offset,
                     size,
+                    crate::intel_gpu_gtt::PteFormat::Xe2,
+                    0,
                 )
-                .ok()?;
-                Some(ScanoutAllocation {
-                    gtt_offset: alloc.gtt_offset,
-                    phys_base: alloc.phys_base(),
-                    order: alloc.order,
-                    size_bytes: alloc.size_bytes,
-                })
-            },
-            &mut mtl_publish,
-        )
+            } else {
+                crate::intel_gpu_gtt::alloc_contiguous_scanout_at(&gtt, offset, size)
+            }
+            .ok()?;
+            Some(ScanoutAllocation {
+                gtt_offset: alloc.gtt_offset,
+                phys_base: alloc.phys_base(),
+                order: alloc.order,
+                size_bytes: alloc.size_bytes,
+            })
+        };
+        match gpu.chip.generation {
+            Generation::LunarLake => {
+                let view = crate::intel_gpu_xe2lpd::Flushed(&window);
+                mtl_external_pass(
+                    &view,
+                    gpu.chip.generation,
+                    gtt.phys.raw(),
+                    &display,
+                    before_event,
+                    after_event,
+                    &mut alloc_fn,
+                    &mut mtl_publish,
+                )
+            }
+            Generation::PantherLake => {
+                let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
+                let view = crate::intel_gpu_xe3lpd::View::new(&window, flush);
+                mtl_external_pass(
+                    &view,
+                    gpu.chip.generation,
+                    gtt.phys.raw(),
+                    &display,
+                    before_event,
+                    after_event,
+                    &mut alloc_fn,
+                    &mut mtl_publish,
+                )
+            }
+            _ => mtl_external_pass(
+                &window,
+                gpu.chip.generation,
+                gtt.phys.raw(),
+                &display,
+                before_event,
+                after_event,
+                &mut alloc_fn,
+                &mut mtl_publish,
+            ),
+        }
     })
     .unwrap_or(false)
 }
 
-/// Runtime-actor MTL pass for `bar`, holding the panel's KMS owner through
-/// [`crate::intel_gpu_kms::Device::external_pass`]: no panel frame change
-/// races the repartition, FBC and PSR are bracketed around the event, and
-/// the owner stays open (its proofs are multi-pipe aware). A busy owner, or
-/// a panel flip still in flight, skips the pass without polling; the event
-/// is taken on a later iteration. No-op off Meteor Lake.
+/// Runtime-actor Display-14/20/30 external pass for `bar`, holding the panel's
+/// KMS owner through [`crate::intel_gpu_kms::Device::external_pass`].
 fn service_mtl_external_for_bar(bar: &MmioRegion) {
-    let mtl = with_display_info(|gpu| {
-        gpu.chip.generation == Generation::MeteorLake && gpu.gtt_mmadr.phys == bar.phys
+    let supported = with_display_info(|gpu| {
+        crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation)
+            && gpu.gtt_mmadr.phys == bar.phys
     })
     .unwrap_or(false);
-    if !mtl {
+    if !supported {
         return;
     }
     let display = crate::intel_gpu_kms::display_for_bar(bar);

@@ -120,7 +120,8 @@ and dock interoperability remain separate acceptance work.
 caller's exact timing without replacing it with an EDID preferred mode.
 Probe takeover and `intel_gpu::relight_display` share generation dispatch:
 Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Lunar Lake
-and Panther Lake refuse programming with `ModesetError::UnsupportedGeneration`.
+and Panther Lake (when Display 30 is proven) use their Xe2/Xe3_LPD KMS
+relight and modeset paths rather than refusing.
 This dispatch does not enable Xe-LPG power management, which remains gated.
 The Xe-LPG modeset reports Pipe A's DMC dark after its crtc disable and lit
 before its port PLL (`XeLpgModeset::with_pipe_dmc` substitutes the sink), and

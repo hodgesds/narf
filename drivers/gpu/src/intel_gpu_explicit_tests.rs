@@ -366,9 +366,10 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
         SyncRequest::read(&user, &wire, &file.syncobjs),
         Err(FsError::ArgumentListTooLong)
     ));
-    // Only DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0) is in the table.
+    // Only DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0) and
+    // EXECBUFFER_EXT_PERF (1) are in the table.
     put64(&mut extension, 0, 0);
-    put32(&mut extension, 8, 1);
+    put32(&mut extension, 8, 2);
     user.user.store(1536, &extension);
     assert!(matches!(
         SyncRequest::read(&user, &wire, &file.syncobjs),
