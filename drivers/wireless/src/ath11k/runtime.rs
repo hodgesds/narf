@@ -3413,8 +3413,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         dp.free(&mut hif.ce.hal);
         hif.ce.hal.srng_clear();
         hif.ce.crash_flush = false;
+        // Box the rebuilt core and the DP hooks: both are large by-value
+        // structs, and holding them by value across `qmi_firmware_ready`
+        // blew the 8 KiB kernel stack-frame budget (this closure measured
+        // 17_896 bytes on main at 4a67c1cc). Holding `Box`es keeps the
+        // future's state and the poll's by-value moves pointer-sized; the
+        // core is unboxed once, for `Rt::new`, after the await.
         let mut core = match Ath11kCore::new(hif, qmi, cfg) {
-            Ok(c) => c,
+            Ok(c) => alloc::boxed::Box::new(c),
             Err((e, hif, qmi)) => {
                 let te = TransportError::new(
                     step::RECOVERY_CORE,
@@ -3426,11 +3432,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 return Err(te);
             }
         };
-        let mut hooks = DpHooks::new(Some(dp_cfg), 0, sizes, msi);
-        let r = core.qmi_firmware_ready(&mut hooks).await;
+        let mut hooks = alloc::boxed::Box::new(DpHooks::new(Some(dp_cfg), 0, sizes, msi));
+        let r = core.qmi_firmware_ready(&mut *hooks).await;
         let dp = hooks.dp.take();
         let (core, dp) = match (r, dp) {
-            (Ok(()), Some(dp)) => (core, dp),
+            (Ok(()), Some(dp)) => (*core, dp),
             (r, dp) => {
                 let e = r
                     .err()
