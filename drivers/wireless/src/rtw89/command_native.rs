@@ -1591,13 +1591,18 @@ impl super::rfk::Interface for Native {
             }
         }
     }
-    /// `rtw89_btc_ntfy_wl_rfk` (`BTC_WRFKT_CHLK`): run coexistence
-    /// with the current state, as `coex_switch_band` does. The WLRFK
-    /// scoreboard bit (`BIT(11)`) is not written here: the tree's
-    /// scoreboard helper overwrites the lower word instead of
-    /// setting/clearing one bit.
-    async fn coex_rfk(&mut self, _start: bool) -> Result<(), super::rfk::Error> {
+    /// `rtw89_btc_ntfy_wl_rfk` (`BTC_WRFKT_CHLK`): set the WLRFK
+    /// scoreboard bit (`BTC_WSCB_WLRFK`, `BIT(11)`) on START and clear
+    /// it on STOP through the read-modify-write helper, then run
+    /// coexistence with the current state, as `coex_switch_band` does.
+    /// Linux `_ntfy_wl_rfk` writes the bit before `_run_coex`
+    /// (`BTC_RSN_NTFY_WL_RFK`); the one-shot IQK path never reaches
+    /// here (see `begin`).
+    async fn coex_rfk(&mut self, start: bool) -> Result<(), super::rfk::Error> {
         super::rfk::Interface::admit(self)?;
+        super::coex_native::scoreboard_set_bit(self, super::coex_native::WLRFK, start)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)?;
         self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)

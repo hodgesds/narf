@@ -529,6 +529,26 @@ pub(super) async fn scoreboard(io: &mut impl Interface, lower: u32) -> Result<()
     a.0.delay_us(1000).await;
     a.0.admit()
 }
+
+/// Linux coex.c `BTC_WSCB_WLRFK = BIT(11)` (`enum btc_w2b_scoreboard`).
+pub(super) const WLRFK: u32 = 1 << 11;
+/// Linux coex.c `_write_scbd(rtwdev, BTC_ALL_BT, val, state)` for one
+/// scoreboard bit: read the current driver word at `R_AX_WL_SCBD`
+/// (0xac), set or clear `bit`, and write it back through
+/// [`scoreboard`], so the other scoreboard bits survive. The existing
+/// [`scoreboard`] overwrites the whole lower word, which is correct
+/// for the full-word init writes (0x4003 / 0x4803) but would clobber
+/// the other bits for a single-bit update.
+pub(super) async fn scoreboard_set_bit(
+    io: &mut impl Interface,
+    bit: u32,
+    set: bool,
+) -> Result<(), Error> {
+    let mut a = Access(io);
+    let current = a.r32(0xac)? & 0xffffff;
+    let next = if set { current | bit } else { current & !bit };
+    scoreboard(io, next).await
+}
 /// The WL-only source action precedes normal RFK selection in _run_coex.
 /// Keep its real fixed grant at every RFK boundary, with actual readback;
 /// the already completed OFF TDMA/slot policy has not changed.

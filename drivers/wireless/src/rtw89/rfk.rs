@@ -75,8 +75,8 @@ pub(super) trait Interface: Io {
     /// coex.c `rtw89_btc_ntfy_wl_rfk` (`BTC_WRFKT_CHLK`) START/STOP around
     /// a channel RFK run: `wl->rfk_info.state` + the WLRFK scoreboard bit
     /// + `_run_coex`. Default: no coexistence owner. The native override
-    ///   runs `_run_coex` via `coex_enforce`; the scoreboard bit itself
-    ///   needs a read-modify-write helper the tree does not have yet.
+    ///   runs `_run_coex` via `coex_enforce` after setting/clearing the
+    ///   scoreboard bit through the read-modify-write helper.
     async fn coex_rfk(&mut self, _start: bool) -> Result<(), Error> {
         Ok(())
     }
