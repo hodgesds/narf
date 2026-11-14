@@ -119,6 +119,7 @@ mod interface;
 mod iqk;
 mod irq;
 mod irq_be;
+mod link_h2c_8922a;
 mod lps;
 mod lps_packets;
 mod lps_wire;

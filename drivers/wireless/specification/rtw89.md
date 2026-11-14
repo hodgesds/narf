@@ -3992,6 +3992,33 @@ supplies the program). Unexecuted cases:
 `smoke_rtw8852c_6ghz_ra_is_he_only_ofdm`,
 `smoke_rtw8852c_6ghz_scan_split_admits_only_signed_primaries`.
 
+**8922A MLO link-lifecycle H2Cs (`link_h2c_8922a`, Refs #1918).**
+The per-link bodies Linux sends around `rtw89_core_sta_link_add` /
+`sta_link_assoc` / `sta_link_disconnect` / `sta_link_remove` are
+built (never sent) by `link_h2c_8922a.rs`, grounded in
+torvalds/linux @ cbbddb6 (`core.c`, `fw.c`, `cam.c`, `cam.h`,
+`core.h`): role-maintain CREATE/REMOVE (W0 per
+`RTW89_H2C_ROLE_MAINTAIN_W0_*`), the default DMAC table v2
+(132 bytes: c0 MACID|OP, m0..m12 `*_ALL`, the 8922A chip op),
+join-info v1 (12 bytes: AX W0 plus W1 with STA_TYPE, IS_MLD,
+MAIN_MACID, MLO_MODE = MLSR, INIT_PWR_STATE, EMLSR 256 µs codes
+4/5, LINK_ID), the address-CAM update (`CON_DISCONN`, v0 60-byte
+form on firmware < 0.35.84.0, 64-byte form with W15 once it does
+not; 8922A `addrcam_ver` 0, entry length 0x20 — not the AX
+0x40), and the MACID pause (plain 32-byte form, 256-byte SLEEP
+form on firmware >= 0.34.11.0). Transition composers emit them in
+Linux's order per link from the admitted record plus a
+per-link VIF context (`VifLinkCtx`: own link address, port, WMM,
+trigger, BSSID, CAM indices, AP/TDLS kind, firmware switches);
+station links send nothing on add/remove, AP/TDLS links add the
+pause + role CREATE + DMAC on add and role REMOVE on remove.
+Still open: the Prepared owner must allocate the per-instance
+CAM entries (128-entry addr-CAM pool, 20-entry BSSID-CAM pool)
+and hold the per-instance VIF-link contexts, and frame + send
+the bodies over CH12 — the transport lane. The VIF-level
+role/join/CAM/DMAC sequence in `rtw89_mac_vif_init` is not part
+of this module.
+
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s
 `rtw89_fw_h2c_init_ba_cam` -> fw.c `rtw89_fw_h2c_init_dynamic_ba_cam_v0_ext`:

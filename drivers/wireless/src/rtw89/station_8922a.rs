@@ -153,7 +153,9 @@
 //!   (`mac80211.c:1809`) does set-link, link-add, then
 //!   link-assoc per added link; `__rtw89_ops_clr_sta_links`
 //!   (`mac80211.c:1786`) does disassoc, disconnect, remove,
-//!   then unset-link per removed link.
+//!   then unset-link per removed link. The H2C bodies those
+//!   steps send are built by [`super::link_h2c_8922a`]
+//!   (issue #1918) from the links admitted here.
 //! - MLO itself is gated in Linux on the firmware
 //!   `NOTIFY_AP_INFO` feature (`core.c:7691`, present for
 //!   RTL8922A at `fw.c:1010`); this owner cannot see
@@ -182,9 +184,12 @@
 //!   MACID via [`admit_with_macid`], and it admits MLDs via
 //!   [`admit_mld`].
 //! - Role-maintain / DMAC / join-info / CAM H2Cs that Linux
-//!   sends around link add/assoc/disconnect are not built
-//!   here: like the single-link owner, this module builds
-//!   CCTL + BA-CAM bodies only and never sends them.
+//!   sends around link add/assoc/disconnect are built by
+//!   [`super::link_h2c_8922a`] (issue #1918), not here: like
+//!   the single-link owner, this module builds CCTL + BA-CAM
+//!   bodies only and never sends them; the lifecycle module
+//!   composes the per-link transition bodies from the records
+//!   admitted here plus the caller's VIF-link context.
 
 use super::{
     bacam_v1::{self, BaCam},

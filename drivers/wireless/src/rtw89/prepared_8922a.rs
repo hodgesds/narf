@@ -61,10 +61,15 @@
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
 //! - Link-lifecycle H2Cs (role-maintain / DMAC / join-info /
-//!   CAM around link add/assoc/disconnect, issue #1918): the
-//!   MLD composition here builds CCTL + BA-CAM bodies only,
-//!   like the single-link owner, and never sends them; the
-//!   H2C bodies those lifecycle steps need are a later lane.
+//!   CAM around link add/assoc/disconnect, issue #1918) are
+//!   built by `link_h2c_8922a.rs` from the MLD / station
+//!   records admitted here plus a per-link VIF context; the
+//!   MLD composition here still builds CCTL + BA-CAM bodies
+//!   only and never sends them. Still open: this owner must
+//!   allocate the per-instance CAM entries and hold the
+//!   per-instance VIF-link contexts (own link address, CAM
+//!   indices) the transition composers consume, and frame +
+//!   send the bodies over CH12 — the transport lane.
 //!
 //! ## MLO model (Linux grounding)
 //!
@@ -107,9 +112,10 @@
 //!   admission (the station owner's documented difference);
 //!   a VIF reserves only its base slot, not the strided
 //!   `base + 16` slot, so a VIF's second link instance has a
-//!   precomputed identity but no pool reservation yet —
-//!   VIF link setup beyond instance 0 belongs to the
-//!   link-lifecycle lane (#1918).
+//!   precomputed identity but no pool reservation yet — the
+//!   per-instance VIF-link contexts (own address, CAM indices)
+//!   the link-lifecycle builders (`link_h2c_8922a`, #1918)
+//!   consume are still to be held here.
 //! - A TDLS peer release never frees the VIF's MACID here.
 //!   Linux `__rtw89_ops_sta_remove` (`mac80211.c:622`)
 //!   releases the shared main MACID bit for TDLS peers,
