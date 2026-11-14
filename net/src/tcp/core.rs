@@ -6212,6 +6212,49 @@ pub fn signal_icmp_error_in(
         ICMP_TIME_EXCEEDED => errno::EHOSTUNREACH,
         _ => return,
     } as i32;
+    apply_icmp_error(&arc, err, seq);
+}
+
+/// Apply an ICMPv6 error about one of our IPv6 TCP segments to its
+/// connection (`tcp_v6_err`, `net/ipv6/tcp_ipv6.c`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signal_icmp6_error_in(
+    net_ns_id: u64,
+    remote_ip: [u8; 16],
+    remote_port: u16,
+    local_ip: [u8; 16],
+    local_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    seq: u32,
+) {
+    let Some(arc) = conn_index6_lookup((net_ns_id, remote_ip, remote_port, local_ip, local_port))
+    else {
+        return;
+    };
+    // Linux `icmpv6_err_convert` (`net/ipv6/icmp.c:1305-1369`).
+    const ICMPV6_UNREACH_ERRNO: [i64; 7] = [
+        errno::ENETUNREACH,  // ICMPV6_NOROUTE (0)
+        errno::EACCES,       // ICMPV6_ADM_PROHIBITED (1)
+        errno::EHOSTUNREACH, // ICMPV6_BEYOND_SCOPE (2)
+        errno::EHOSTUNREACH, // ICMPV6_ADDR_UNREACH (3)
+        errno::ECONNREFUSED, // ICMPV6_PORT_UNREACH (4)
+        errno::EACCES,       // ICMPV6_POLICY_FAIL (5)
+        errno::EACCES,       // ICMPV6_REJECT_ROUTE (6)
+    ];
+    let err = match icmp_type {
+        crate::pkt_ipv6::ICMPV6_DESTINATION_UNREACHABLE => ICMPV6_UNREACH_ERRNO
+            .get(icmp_code as usize)
+            .copied()
+            .unwrap_or(errno::EPROTO),
+        crate::pkt_ipv6::ICMPV6_TIME_EXCEEDED => errno::EHOSTUNREACH,
+        crate::pkt_ipv6::ICMPV6_PARAMETER_PROBLEM => errno::EPROTO,
+        _ => return,
+    } as i32;
+    apply_icmp_error(&arc, err, seq);
+}
+
+fn apply_icmp_error(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, seq: u32) {
     let fatal = {
         let mut t = arc.lock();
         if t.state == TcpState::Closed {
@@ -6230,6 +6273,6 @@ pub fn signal_icmp_error_in(
         }
     };
     if fatal {
-        abort_tcb(&arc, err, DropCause::IcmpError);
+        abort_tcb(arc, err, DropCause::IcmpError);
     }
 }

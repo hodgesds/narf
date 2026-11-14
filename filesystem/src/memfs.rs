@@ -1937,14 +1937,19 @@ impl MemFile {
     }
 
     /// Mint a pathname-AF_UNIX-socket node (S_IFSOCK) with the given perms.
-    fn new_socket(superblock: &Arc<MemSuper>, perms: u16) -> Result<Self, FsError> {
+    fn new_socket(
+        superblock: &Arc<MemSuper>,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Self, FsError> {
         Ok(MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::empty()),
-            _inode_lease: superblock.reserve_inode(0, 0)?,
+            _inode_lease: superblock.reserve_inode(uid, gid)?,
             perms: AtomicU32::new((perms & 0o7777) as u32),
-            uid: AtomicU32::new(0),
-            gid: AtomicU32::new(0),
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
             times: Times::now(),
             nlink: AtomicU32::new(1),
             iflags: AtomicU32::new(0),
@@ -3538,13 +3543,23 @@ impl DirOps for MemDir {
     /// through the socket layer's LISTENERS registry; this node is the
     /// filesystem-visible marker.
     fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        self.create_socket_with_attrs(name, perms, 0, 0)
+    }
+
+    fn create_socket_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let _path_mutation = crate::begin_path_mutation(self, &[name]);
             let mut g = self.entries.lock();
             if g.contains_key(name) {
                 return Err(FsError::Busy);
             }
-            let f = Arc::new(MemFile::new_socket(&self.superblock, perms)?);
+            let f = Arc::new(MemFile::new_socket(&self.superblock, perms, uid, gid)?);
             g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
             Ok(f as Arc<dyn FileOps>)
         })

@@ -34,12 +34,12 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::ipv6::{icmp6_sock, ndp, slaac};
 use crate::pkt::{ip_checksum, write_eth_header, ETHERTYPE_IPV6, ETH_HDR_LEN};
 use crate::pkt_ipv6::{
-    pseudo_checksum, Icmpv6Header, Ipv6Header, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST,
-    ICMPV6_HDR_LEN, ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION,
-    ICMPV6_PACKET_TOO_BIG, ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT,
-    ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NEXT_HEADER_DESTINATION_OPTIONS,
-    NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6, NEXT_HEADER_ROUTING,
-    NEXT_HEADER_TCP, NEXT_HEADER_UDP,
+    pseudo_checksum, Icmpv6Header, Ipv6Header, ICMPV6_DESTINATION_UNREACHABLE, ICMPV6_ECHO_REPLY,
+    ICMPV6_ECHO_REQUEST, ICMPV6_HDR_LEN, ICMPV6_NEIGHBOR_ADVERTISEMENT,
+    ICMPV6_NEIGHBOR_SOLICITATION, ICMPV6_PACKET_TOO_BIG, ICMPV6_PARAMETER_PROBLEM, ICMPV6_REDIRECT,
+    ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, ICMPV6_TIME_EXCEEDED, IPV6_HDR_LEN,
+    NEXT_HEADER_DESTINATION_OPTIONS, NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6,
+    NEXT_HEADER_ROUTING, NEXT_HEADER_TCP, NEXT_HEADER_UDP,
 };
 
 /// Result of walking the next-header chain.
@@ -1832,6 +1832,37 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
         return true;
     }
     match hdr.typ {
+        ICMPV6_DESTINATION_UNREACHABLE | ICMPV6_TIME_EXCEEDED | ICMPV6_PARAMETER_PROBLEM => {
+            if let Some(invoking_bytes) = body.get(8..) {
+                if let Ok(invoking) = Ipv6Header::decode(invoking_bytes) {
+                    let payload = &invoking_bytes[IPV6_HDR_LEN..];
+                    if let Some(l4) = skip_extension_headers(invoking.next_header, payload) {
+                        if l4.proto == NEXT_HEADER_TCP {
+                            if let Some(tcp) = payload.get(l4.offset..l4.offset + 8) {
+                                let orig_src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+                                let orig_dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+                                let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+                                let net_ns_id = crate::iface::lookup(iface)
+                                    .map(|entry| entry.net_ns_id)
+                                    .unwrap_or(0);
+                                crate::tcp::core::signal_icmp6_error_in(
+                                    net_ns_id,
+                                    invoking.dst_ip,
+                                    orig_dst_port,
+                                    invoking.src_ip,
+                                    orig_src_port,
+                                    hdr.typ,
+                                    hdr.code,
+                                    seq,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            true
+        }
         ICMPV6_PACKET_TOO_BIG => {
             // ICMPv6 error body: type/code/checksum, 32-bit MTU, then the
             // invoking packet. The quoted IPv6 destination identifies the

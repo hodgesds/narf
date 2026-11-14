@@ -636,6 +636,12 @@ membership/options/statistics and `PACKET_AUXDATA` follow Linux
 non-zero virtio-net headers fail explicitly because packet mmap/GSO is not
 implemented. Interface promiscuity/all-multicast memberships are
 reference-counted and visible through both `SIOCGIFFLAGS` and net sysfs.
+Pathname AF_UNIX `bind` creates its socket marker with the caller's filesystem
+UID and GID (the parent GID when the directory is setgid), mode `0777 & ~umask`,
+and applicable inherited access ACL. The creator can subsequently `chmod` its
+socket without `CAP_FOWNER`; ownership checks on unrelated inodes remain in
+force. Abstract addresses create no filesystem inode.
+
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 pathname binds materialize their socket inode before publishing the endpoint
