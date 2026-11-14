@@ -16,8 +16,8 @@ fn create_vm_flags(file: &RenderFile, info: &DeviceInfo, user: &Cpu, flags: u32)
 
 fn smoke_xe_lr_vm_flag_matrix_and_sync_contracts() -> TestResult {
     let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
-    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
-    prime(&mut gt, &w, 0xdfc);
+    let (w, arena, mut gt) = hardware_model(platform, 0x130044);
+    prime(&mut gt, &w, 0x130044);
     let (_, info) = setup(&mut gt, &w, platform);
     let file = RenderFile::new();
     let user = Cpu::new();
@@ -66,7 +66,7 @@ fn smoke_xe_lr_vm_flag_matrix_and_sync_contracts() -> TestResult {
     assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, lr_scratch_vm), Ok(0));
     assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, fault_vm), Ok(0));
     assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, fault_scratch_vm), Ok(0));
-    hardware_stop(&mut gt, &w, 0xdfc);
+    hardware_stop(&mut gt, &w, 0x130044);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);
     TestResult::Pass
