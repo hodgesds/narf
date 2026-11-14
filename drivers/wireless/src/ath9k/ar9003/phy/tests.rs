@@ -811,3 +811,161 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_disable_and_full_sleep
 );
+
+/// `prepare` for `chip`/`mac_rev` at `frequency` over `image` (CTL
+/// 0xe0, 40 half-dBm limit), returning the fixture and the result.
+fn prepare_chip(
+    chip: Chip,
+    mac_rev: u8,
+    image: &Image,
+    frequency: u16,
+) -> (Regs, Result<Prepared, BringUpError>) {
+    let revision = Revision {
+        chip,
+        mac_rev,
+        pcie: true,
+    };
+    let id = identity(image);
+    let mut io = Regs::default();
+    let prepared = prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(chip, 0, 0),
+        image,
+        frequency,
+        0xe0,
+        40,
+    );
+    (io, prepared)
+}
+
+/// `expected` for the same inputs `prepare_chip` used.
+fn expected_chip(
+    chip: Chip,
+    mac_rev: u8,
+    image: &Image,
+    frequency: u16,
+) -> Result<Prepared, BringUpError> {
+    let revision = Revision {
+        chip,
+        mac_rev,
+        pcie: true,
+    };
+    let id = identity(image);
+    expected(
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(chip, 0, 0),
+        image,
+        frequency,
+        0xe0,
+        40,
+    )
+}
+
+fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
+    // A genuine AR9565 board carries one-chain EEPROM masks.
+    let mut image = AR9300_DEFAULT;
+    image[map::TXRX_MASK] = 0x11;
+    // 2 GHz spur bins (bin = freq - 2300): 2420, 2437.
+    let spur2g = map::MODAL_2G + modal::SPUR_CHANS;
+    image[spur2g] = 120;
+    image[spur2g + 1] = 137;
+    // The 9565 fast-clock first row, column 1.
+    let fast = super::super::initvals_ar9565::AR9565_1P0_MODES_FAST_CLOCK[0];
+    let fast_write = (u64::from(fast[0]), fast[1]);
+    let fast_count = |io: &Regs| io.writes.iter().filter(|w| **w == fast_write).count();
+
+    // AR9565 at 2437: MRC-CCK never runs, the OFDM self-correlation
+    // filter is skipped, and the second in-range spur (2437, offset 0)
+    // programs the B mask. First spur 2440, offset +3: freq_sd 139,
+    // delta phase 157286, A mask index 9.
+    let (io, prepared) = prepare_chip(Chip::Ar9565, 0, &image, 2437);
+    if prepared.is_err() {
+        return TestResult::Fail("AR9565 2437 MHz preparation was refused");
+    }
+    let timing11 = io.regs.get(&AR_PHY_TIMING11).copied().unwrap_or(0);
+    let pilot = io.regs.get(&AR_PHY_PILOT_SPUR_MASK).copied().unwrap_or(0);
+    let chan = io.regs.get(&AR_PHY_CHAN_SPUR_MASK).copied().unwrap_or(0);
+    let mask_a = io.regs.get(&AR_PHY_SPUR_MASK_A).copied().unwrap_or(0);
+    let mask_b = io.regs.get(&AR_PHY_SPUR_MASK_B).copied().unwrap_or(0);
+    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+        || timing11 & 0x8000_0000 != 0
+        || timing11 & 0x4000_0000 == 0
+        || (timing11 >> 20) & 0x3ff != 139
+        || timing11 & 0xfffff != 157286
+        || (pilot >> 5) & 0x7f != 9
+        || pilot & 0x1f != 0xc
+        || (pilot >> 17) & 0x7f != 0
+        || (pilot >> 12) & 0x1f != 0xe
+        || (chan >> 5) & 0x7f != 9
+        || chan & 0x1f != 0xc
+        || (chan >> 17) & 0x7f != 0
+        || (chan >> 12) & 0x1f != 0xe
+        || (mask_a >> 10) & 0x7f != 9
+        || mask_a & 0x3ff != 0xa0
+        || mask_b != 0xa0
+        || fast_count(&io) != 1
+        || expected_chip(Chip::Ar9565, 0, &image, 2437) != prepared
+    {
+        return TestResult::Fail("AR9565 2437 MHz spur mitigation differs from ar9003_phy.c");
+    }
+
+    // AR9565 at 2412: first spur 2420 (offset +8) mitigates with the
+    // self-correlation filter set (the skip is 2437-only); the second
+    // spur 2437 (offset +25) is out of range, so no B-mask write.
+    let (io, prepared) = prepare_chip(Chip::Ar9565, 0, &image, 2412);
+    if prepared.is_err() {
+        return TestResult::Fail("AR9565 2412 MHz preparation was refused");
+    }
+    let timing11 = io.regs.get(&AR_PHY_TIMING11).copied().unwrap_or(0);
+    let pilot = io.regs.get(&AR_PHY_PILOT_SPUR_MASK).copied().unwrap_or(0);
+    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+        || io.writes.iter().any(|&(r, _)| r == AR_PHY_SPUR_MASK_B)
+        || timing11 & 0x8000_0000 == 0
+        || (timing11 >> 20) & 0x3ff != 372
+        || (pilot >> 12) & 0x1f != 0
+        || fast_count(&io) != 1
+        || expected_chip(Chip::Ar9565, 0, &image, 2412) != prepared
+    {
+        return TestResult::Fail("AR9565 2412 MHz spur mitigation differs from ar9003_phy.c");
+    }
+
+    // AR9300 at 2412, same spur bins: MRC-CCK runs (2420 in range),
+    // the self-correlation filter is set, no B mask, and no fast-clock
+    // write on 2 GHz.
+    let (io, _) = prepare_chip(Chip::Ar9300, 3, &image, 2412);
+    let cck = io.regs.get(&AR_PHY_CCK_SPUR_MIT).copied().unwrap_or(0);
+    let timing11 = io.regs.get(&AR_PHY_TIMING11).copied().unwrap_or(0);
+    if cck & 1 != 1
+        || timing11 & 0x8000_0000 == 0
+        || io.writes.iter().any(|&(r, _)| r == AR_PHY_SPUR_MASK_B)
+        || fast_count(&io) != 0
+    {
+        return TestResult::Fail("AR9300 2412 MHz spur contrast differs from ar9003_phy.c");
+    }
+
+    // AR9565 at 5180, 5 GHz spur bin 76 (4800 + 5 * 76): MRC-CCK still
+    // skipped, and the fast-clock array is written twice — the 5 GHz
+    // write plus the AR9565 always-on write.
+    let mut image5g = AR9300_DEFAULT;
+    image5g[map::TXRX_MASK] = 0x11;
+    image5g[map::MODAL_5G + modal::SPUR_CHANS] = 76;
+    let (io, prepared) = prepare_chip(Chip::Ar9565, 0, &image5g, 5180);
+    if prepared.is_err() {
+        return TestResult::Fail("AR9565 5180 MHz preparation was refused");
+    }
+    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+        || fast_count(&io) != 2
+        || expected_chip(Chip::Ar9565, 0, &image5g, 5180) != prepared
+    {
+        return TestResult::Fail("AR9565 5180 MHz fast-clock count differs from ar9003_phy.c");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9565_spur_mitigation_and_fast_clock
+);
