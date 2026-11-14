@@ -970,7 +970,146 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     TestResult::Pass
 }
 
+/// A 2 GHz image with the given `spurChans` fbins and a single-chain
+/// AR9485 mask (`TXRX_MASK` 0x11).
+fn spur_image(fbins: [u8; 5]) -> Image {
+    let mut image = AR9300_DEFAULT;
+    image[map::TXRX_MASK] = 0x11;
+    let spurs = super::super::eeprom::modal_base(false) + modal::SPUR_CHANS;
+    image[spurs..spurs + 5].copy_from_slice(&fbins);
+    image
+}
+
+/// The mitigated MRC-CCK fields for `cck_spur_freq` are all set.
+fn spur_mitigated(io: &Regs, freq: u32) -> bool {
+    let agc = io.regs.get(&AR_PHY_AGC_CONTROL).copied().unwrap_or(0);
+    let mit = io.regs.get(&AR_PHY_CCK_SPUR_MIT).copied().unwrap_or(0);
+    agc & 0x3c0 == 7 << 6
+        && mit & 0x1fe == 0x7f << 1
+        && mit & 0x6000_0000 == 2 << 29
+        && mit & 1 == 1
+        && (mit >> 9) & 0xfffff == freq
+}
+
+/// The cleared MRC-CCK fields are all set.
+fn spur_cleared(io: &Regs) -> bool {
+    let agc = io.regs.get(&AR_PHY_AGC_CONTROL).copied().unwrap_or(0);
+    let mit = io.regs.get(&AR_PHY_CCK_SPUR_MIT).copied().unwrap_or(0);
+    agc & 0x3c0 == 5 << 6 && mit & 1 == 0 && (mit >> 9) & 0xfffff == 0
+}
+
+/// `ar9003_hw_spur_mitigate_mrc_cck`'s AR9485-family arm
+/// (`ar9003_phy.c:252-322`, 20 MHz): the band's EEPROM `spurChans`
+/// through `fbin2freq`, five entries at range 10. An empty list writes
+/// nothing; the fixed AR9300 list never runs on this chip, and `prepare`
+/// carries the branch end to end.
+fn smoke_ath9k_ar9485_mrc_cck_spur_branch() -> TestResult {
+    // 2420 spur (fbin 120) at 2412: offset 8 < 10 mitigates,
+    // `cck_spur_freq` (8 << 19) / 11 = 381300.
+    let image = spur_image([120, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9485, &image, 2412).is_err() || !spur_mitigated(&io, 381300) {
+        return TestResult::Fail("AR9485 2412 EEPROM spur mitigation differs");
+    }
+    // 2430 spur (fbin 130) at 2437: offset -7 < 10 mitigates,
+    // `cck_spur_freq` -((7 << 19) / 11) = -333637, masked 714939.
+    let image = spur_image([130, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9485, &image, 2437).is_err() || !spur_mitigated(&io, 714939) {
+        return TestResult::Fail("AR9485 2437 EEPROM spur mitigation differs");
+    }
+    // A later entry also matches: the 2440 spur (fbin 140) at 2437
+    // (offset 3, `(3 << 19) / 11` = 142987) after a 2420 entry that is
+    // out of range (offset -17).
+    let image = spur_image([120, 140, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9485, &image, 2437).is_err() || !spur_mitigated(&io, 142987) {
+        return TestResult::Fail("AR9485 later EEPROM spur entry differs");
+    }
+    // An empty spur list writes nothing at all.
+    let image = spur_image([0, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9485, &image, 2412).is_err() || !io.writes.is_empty() {
+        return TestResult::Fail("AR9485 empty EEPROM spur list wrote registers");
+    }
+    // No entry in range clears the mitigation fields.
+    let image = spur_image([120, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9485, &image, 2462).is_err() || !spur_cleared(&io) {
+        return TestResult::Fail("AR9485 out-of-range EEPROM spur clear differs");
+    }
+    // The AR9300 on the same empty-spur image still mitigates from its
+    // fixed list (2420 at 2412, offset 8).
+    let image = spur_image([0, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9300, &image, 2412).is_err() || !spur_mitigated(&io, 381300) {
+        return TestResult::Fail("AR9300 fixed-list spur mitigation differs");
+    }
+    // The AR9300 on the 2430-spur image mitigates from its fixed 2440
+    // (offset 3, `(3 << 19) / 11` = 142987), not the EEPROM 2430.
+    let image = spur_image([130, 0, 0, 0, 0]);
+    let mut io = Regs::default();
+    if spur_mrc_cck(&mut io, Chip::Ar9300, &image, 2437).is_err() || !spur_mitigated(&io, 142987) {
+        return TestResult::Fail("AR9300 spur branch used the EEPROM list");
+    }
+    // End to end: `prepare` on AR9485 at 2412 mitigates from the EEPROM
+    // spur, and with an empty spur list writes neither spur register.
+    let revision = Revision {
+        chip: Chip::Ar9485,
+        mac_rev: 1,
+        pcie: true,
+    };
+    let image = spur_image([120, 0, 0, 0, 0]);
+    let id = identity(&image);
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9485, 0, 0),
+        &image,
+        2412,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || !spur_mitigated(&io, 381300)
+    {
+        return TestResult::Fail("AR9485 prepare did not mitigate the EEPROM spur");
+    }
+    let image = spur_image([0, 0, 0, 0, 0]);
+    let id = identity(&image);
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9485, 0, 0),
+        &image,
+        2412,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || io
+            .writes
+            .iter()
+            .any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT || r == AR_PHY_AGC_CONTROL)
+    {
+        return TestResult::Fail("AR9485 prepare wrote spur registers for an empty list");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9565_spur_mitigation_and_fast_clock
+);
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9485_mrc_cck_spur_branch
+);
 );

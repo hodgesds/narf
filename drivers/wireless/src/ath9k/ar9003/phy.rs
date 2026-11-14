@@ -152,9 +152,22 @@ fn doubler_fix(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
 }
 
 /// `ar9003_hw_spur_mitigate_mrc_cck` for a 20 MHz channel: the fixed
-/// AR9300 list at range 10, and the AR9462 branch (`ar9003_phy.c:269,275`)
-/// at range 5 with the first and last spurs (2420, 2480) skipped.
-fn spur_mrc_cck(io: &mut impl RegisterIo, chip: Chip, frequency: u16) -> Result<(), BringUpError> {
+/// AR9300 list at range 10, the AR9462 branch (`ar9003_phy.c:269,275`)
+/// at range 5 with the first and last spurs (2420, 2480) skipped, and
+/// the AR9485-family branch (`ar9003_phy.c:252-322`): the band's EEPROM
+/// `spurChans` through `fbin2freq`, five entries at range 10,
+/// `synth_freq` the channel. An empty spur list returns without a
+/// write, as Linux does; the HT40 form (range 19, `synth_freq` primary
+/// ± 10 MHz) is not prepared here.
+fn spur_mrc_cck(
+    io: &mut impl RegisterIo,
+    chip: Chip,
+    image: &Image,
+    frequency: u16,
+) -> Result<(), BringUpError> {
+    if chip == Chip::Ar9485 {
+        return spur_mrc_cck_eeprom(io, image, frequency);
+    }
     let range = if chip == Chip::Ar9462 { 5 } else { 10 };
     for (i, spur) in CCK_SPURS.into_iter().enumerate() {
         if chip == Chip::Ar9462 && (i == 0 || i == 3) {
@@ -162,6 +175,49 @@ fn spur_mrc_cck(io: &mut impl RegisterIo, chip: Chip, frequency: u16) -> Result<
         }
         let offset = spur - i32::from(frequency);
         if offset.abs() < range {
+            let mut cck = (offset.abs() << 19) / 11;
+            if offset < 0 {
+                cck = -cck;
+            }
+            field(io, AR_PHY_AGC_CONTROL, 0x3c0, 6, 7)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 0x1fe, 1, 0x7f)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 0x6000_0000, 29, 2)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 1, 0, 1)?;
+            field(
+                io,
+                AR_PHY_CCK_SPUR_MIT,
+                0x1fff_fe00,
+                9,
+                (cck & 0xfffff) as u32,
+            )?;
+            return Ok(());
+        }
+    }
+    field(io, AR_PHY_AGC_CONTROL, 0x3c0, 6, 5)?;
+    field(io, AR_PHY_CCK_SPUR_MIT, 1, 0, 0)?;
+    field(io, AR_PHY_CCK_SPUR_MIT, 0x1fff_fe00, 9, 0)
+}
+
+/// The AR9485-family arm of `ar9003_hw_spur_mitigate_mrc_cck`
+/// (`ar9003_phy.c:252-322`, 20 MHz): the band's EEPROM `spurChans`
+/// (`ar9003_get_spur_chan_ptr`), five entries through
+/// `ath9k_hw_fbin2freq` at range 10 against the channel. The first entry
+/// being zero means no spur and returns before any write; a spur outside
+/// the range falls through to the same clear writes as the fixed list.
+fn spur_mrc_cck_eeprom(
+    io: &mut impl RegisterIo,
+    image: &Image,
+    frequency: u16,
+) -> Result<(), BringUpError> {
+    let two = frequency < 4000;
+    let spurs = super::eeprom::modal_base(!two) + super::eeprom::modal::SPUR_CHANS;
+    if image[spurs] == 0 {
+        return Ok(());
+    }
+    for i in 0..5 {
+        let spur = super::eeprom::fbin2freq(image[spurs + i], two);
+        let offset = spur - i32::from(frequency);
+        if offset.abs() < 10 {
             let mut cck = (offset.abs() << 19) / 11;
             if offset < 0 {
                 cck = -cck;
@@ -550,7 +606,7 @@ pub(in crate::ath9k) fn prepare(
     // `ar9003_phy.c:571` (`ar9003_hw_spur_mitigate`): the AR9565 never
     // runs MRC-CCK spur mitigation.
     if !revision.ar9565() {
-        spur_mrc_cck(io, revision.chip, frequency)?;
+        spur_mrc_cck(io, revision.chip, image, frequency)?;
     }
     spur_ofdm(io, revision.chip, image, frequency)?;
     board::set_board_values(io, revision.chip, image, frequency, rx, tx)?;
