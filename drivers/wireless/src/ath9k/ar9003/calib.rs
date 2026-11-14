@@ -809,7 +809,9 @@ fn corr_coeff_table(ar9485: bool) -> [[u64; 3]; MAX_MEASUREMENT] {
 /// `ar9003_hw_tx_iq_cal_outlier_detection` for the single `iqcal_idx == 0`
 /// pass: per-chain outlier detection (skipped on AR9550, which is not
 /// modeled), the `iqc_coeff` table writes and the `TXIQCAL_DONE` state
-/// (`is_reusable` is always true here: no MCI). Also sets
+/// (`is_reusable` is always true here: the calibration itself never
+/// talks to MCI — the owner runs `init_cal_req`/`init_cal_done` around
+/// the run and does not consume the flag). Also sets
 /// `AR_PHY_TX_IQCAL_CONTROL_3` `IQCORR_EN` and
 /// `AR_PHY_RX_IQCAL_CORR_B0` `LOOPBACK_IQCORR_EN`.
 fn tx_iq_cal_outlier_detection(
