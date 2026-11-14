@@ -60,5 +60,8 @@ pub(crate) mod phc;
 #[cfg(feature = "kernel-test")]
 mod read_options_tests;
 
+#[cfg(feature = "kernel-test")]
+mod futex_completion_tests;
+
 #[cfg(all(feature = "kernel-test", feature = "native-ring"))]
 mod native_authority_tests;

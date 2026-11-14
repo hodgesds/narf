@@ -1383,6 +1383,21 @@ direct-handoff path without losing its exact parked owner; remote wakes retain
 ordinary placement. The helper does not change futex-key matching, successful
 wait completion, or generation ordering. Multi-wakes and exit-path spread
 wakes keep their ordinary fan-out behavior.
+Handler-driven waits publish an explicit completion under the bucket lock
+after wake removal and before scheduler notification. An acquire observation
+lets a successful unqueue avoid both the location and bucket locks. Requeue
+and cancellation do not publish completion. The sleeper checks its own wait
+record on every park iteration and clears its own deadline; wake delivery
+does not resolve a task ID or write another syscall's park state. A delayed
+notification retains the scheduler's ordinary spurious-wake semantics. Vector
+waits retain per-entry completion and the highest completed-index result.
+Single-word wait storage is cached in the task. It is reset only with unique
+Arc ownership; detached wake notifications retain their old record and force
+a fresh allocation if they overlap the next wait. Interruptible parks retain
+their precise signal waker in the task as well, avoiding a per-park map entry.
+Signal delivery consumes that handle and falls back to the task-lifetime
+scheduler handle between registrations. Callers without a registered task
+retain the signal registry fallback.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its

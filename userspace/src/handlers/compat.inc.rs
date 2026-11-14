@@ -10405,8 +10405,13 @@ struct FutexLocation {
 /// The single-word hot path stores its location inline. Vector waits allocate
 /// one location array; neither form allocates an index node for each enqueue.
 enum FutexLocations {
-    One(narf_lib::sync::IrqSafeSpinLock<FutexLocation>),
-    Many(alloc::boxed::Box<[narf_lib::sync::IrqSafeSpinLock<FutexLocation>]>),
+    One(FutexEntry),
+    Many(alloc::boxed::Box<[FutexEntry]>),
+}
+
+struct FutexEntry {
+    location: narf_lib::sync::IrqSafeSpinLock<FutexLocation>,
+    woken: core::sync::atomic::AtomicBool,
 }
 
 /// Linux futex_q's lock-pointer retry, represented by a key and a stable
@@ -10415,6 +10420,7 @@ enum FutexLocations {
 /// Queue entries hold an Arc so task teardown cannot leave dangling state.
 pub struct FutexQ {
     locations: FutexLocations,
+    woken: core::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for FutexQ {
@@ -10429,17 +10435,36 @@ impl core::fmt::Debug for FutexQ {
 
 impl FutexQ {
     fn new(mut keys: impl ExactSizeIterator<Item = FutexKey>) -> Self {
-        let entry = |key| narf_lib::sync::IrqSafeSpinLock::new(FutexLocation { key, handle: None });
+        let entry = |key| FutexEntry {
+            location: narf_lib::sync::IrqSafeSpinLock::new(FutexLocation { key, handle: None }),
+            woken: core::sync::atomic::AtomicBool::new(false),
+        };
         Self {
             locations: if keys.len() == 1 {
                 FutexLocations::One(entry(keys.next().expect("single futex key")))
             } else {
                 FutexLocations::Many(keys.map(entry).collect())
             },
+            woken: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn location(&self, idx: usize) -> &narf_lib::sync::IrqSafeSpinLock<FutexLocation> {
+    fn single_cached(
+        cache: &narf_lib::sync::IrqSafeSpinLock<Option<Arc<Self>>>,
+        key: FutexKey,
+    ) -> Arc<Self> {
+        let mut cache = cache.lock();
+        if let Some(wait) = cache.as_mut().and_then(Arc::get_mut) {
+            // Unique ownership excludes queue entries and detached wakers.
+            // No old producer can publish completion into this registration.
+            *wait = Self::new(core::iter::once(key));
+        } else {
+            *cache = Some(Arc::new(Self::new(core::iter::once(key))));
+        }
+        cache.as_ref().expect("single futex cache initialized").clone()
+    }
+
+    fn entry(&self, idx: usize) -> &FutexEntry {
         match &self.locations {
             FutexLocations::One(entry) => {
                 assert_eq!(idx, 0);
@@ -10447,6 +10472,23 @@ impl FutexQ {
             }
             FutexLocations::Many(entries) => &entries[idx],
         }
+    }
+
+    fn location(&self, idx: usize) -> &narf_lib::sync::IrqSafeSpinLock<FutexLocation> {
+        &self.entry(idx).location
+    }
+
+    /// Publish only an actual wake dequeue, under the owning bucket lock.
+    /// Cancellation and requeue never complete a wait. This is Linux's
+    /// release-store of NULL to futex_q::lock_ptr: a successful waiter can
+    /// finish without taking the bucket lock again.
+    fn mark_woken(&self, idx: usize) {
+        self.entry(idx).woken.store(true, Ordering::Release);
+        self.woken.store(true, Ordering::Release);
+    }
+
+    fn has_woken(&self) -> bool {
+        self.woken.load(Ordering::Acquire)
     }
 
     fn key(&self, idx: usize) -> FutexKey {
@@ -10464,6 +10506,38 @@ struct FutexWaiter {
     waker: core::task::Waker,
     bitset: u32,
     q: Option<alloc::sync::Arc<FutexQ>>,
+}
+
+impl FutexWaiter {
+    fn mark_woken(&self) {
+        if let Some(q) = &self.q {
+            q.mark_woken((self.slot - 1) as usize);
+        }
+    }
+
+    /// Handler-driven waits observe their own completion record. No remote
+    /// task lookup or write to a later syscall's park deadline is needed.
+    fn wake(self, urgent: bool) {
+        if self.q.is_some() {
+            if urgent {
+                narf_scheduler::wake_preempt_task(self.waker, self.tid);
+            } else {
+                self.waker.wake();
+                narf_scheduler::stackful::note_wake_preempt(self.tid);
+            }
+        } else if urgent {
+            wake_one_urgent(self.tid, self.waker);
+        } else {
+            wake_one(self.tid, self.waker);
+        }
+    }
+}
+
+#[inline]
+fn futex_remove_woken(queue: &mut FutexWaitQueue, handle: futex_queue::Handle) -> Option<FutexWaiter> {
+    let waiter = queue.remove(handle)?;
+    waiter.mark_woken();
+    Some(waiter)
 }
 
 struct FutexWaitQueue {
@@ -10566,10 +10640,14 @@ fn futex_take_wake_waiters(
     bitset: u32,
 ) -> alloc::vec::Vec<FutexWaiter> {
     if n == 0 { return alloc::vec::Vec::new(); }
-    let Some(policy) = &queue.policy else {
-        return futex_take_waiters(queue, key, n, bitset);
+    let waiters = match &queue.policy {
+        None => futex_take_waiters(queue, key, n, bitset),
+        Some(policy) => futex_take_ranked_waiters(&mut queue.entries, policy.as_ref(), key, n, bitset),
     };
-    futex_take_ranked_waiters(&mut queue.entries, policy.as_ref(), key, n, bitset)
+    for waiter in &waiters {
+        waiter.mark_woken();
+    }
+    waiters
 }
 
 #[inline(never)]
@@ -10718,10 +10796,10 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         let waiter = {
             let mut queue = futex_wait_bucket(key).values.lock();
             let handle = futex_select_waiter(&queue, key, bitset);
-            handle.and_then(|h| queue.remove(h))
+            handle.and_then(|h| futex_remove_woken(&mut queue, h))
         };
         if let Some(waiter) = waiter {
-            wake_one_urgent(waiter.tid, waiter.waker);
+            waiter.wake(true);
             return 1;
         }
         return 0;
@@ -10734,7 +10812,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
     // Broadcast wakes spread across owners instead of forming a serial chain
     // of urgent handoffs on the waker's CPU. Never call the scheduler locked.
     for waiter in drained {
-        wake_one(waiter.tid, waiter.waker);
+        waiter.wake(false);
     }
     count
 }
@@ -10753,10 +10831,10 @@ pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
     let waiter = {
         let mut queue = futex_wait_bucket(key).values.lock();
         let handle = futex_select_waiter(&queue, key, FUTEX_BITSET_MATCH_ANY);
-        handle.and_then(|h| queue.remove(h))
+        handle.and_then(|h| futex_remove_woken(&mut queue, h))
     };
     if let Some(waiter) = waiter {
-        wake_one(waiter.tid, waiter.waker);
+        waiter.wake(false);
         return 1;
     }
     0
@@ -11246,6 +11324,7 @@ fn futex_queue(
         waiter.bitset = bitset;
         return;
     }
+    q.entry(idx).woken.store(false, Ordering::Relaxed);
     location.handle = Some(queue.push_back(FutexWaiter {
         key, tid, slot: idx as u32 + 1, waker, bitset, q: Some(q.clone()),
     }));
@@ -11256,6 +11335,9 @@ fn futex_queue(
 /// Requeue publishes a new location under both buckets; retry if it moved
 /// between reading the location and acquiring its bucket lock.
 fn futex_unqueue(q: &FutexQ, idx: usize, _tid: u64) -> bool {
+    if q.entry(idx).woken.load(Ordering::Acquire) {
+        return false;
+    }
     loop {
         let before = *q.location(idx).lock();
         let mut queue = futex_wait_bucket(before.key).values.lock();
@@ -11335,7 +11417,7 @@ fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
 ///   waiter: g = gen(K); v = *uaddr; v == val ⇒ queue(K); gen(K) != g ⇒
 ///           re-read *uaddr, and a moved word is a setup failure.
 ///   waker:  *uaddr = new (userspace); bump gen(K); dequeue under the bucket
-///           lock; `wake_one` clears `sleep_deadline_ns` and fires the waker.
+///           lock; publish completion, then fire the waker.
 ///
 /// A waker whose dequeue runs after our queue (bucket-lock order) finds the
 /// entry. One whose dequeue ran before our queue bumped `gen(K)` before it,
@@ -11344,10 +11426,10 @@ fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
 /// is visible to the re-read: a changed word fails the setup, an unchanged
 /// one means it is still safe to wait. A colliding key's wake can also advance
 /// the hint: it triggers only this re-read, never a successful wait or an
-/// unrelated dequeue. `sleep_deadline_ns` is
-/// stored before the first queue, so the waker's clear always lands after it
-/// and a wake that beats the park makes the park loop return at once; one
-/// that lands after the park fires the parked task's own waker.
+/// unrelated dequeue. The completion record is initialized before queueing;
+/// a wake that beats the park is observed by the park loop, and one that
+/// lands after the park fires the parked task's own waker. Only the sleeper
+/// clears its deadline, so a delayed notification cannot end a newer wait.
 pub(crate) fn futex_block(
     ctx: &mut dyn TrapContext,
     words: &[FutexWaitWord],
@@ -11365,7 +11447,11 @@ pub(crate) fn futex_block(
     // SAFETY: the in-flight task's poller-pinned ctx, live for this trap.
     let uc = unsafe { &*uctx };
     let tid = current_task_id();
-    let q = alloc::sync::Arc::new(FutexQ::new(words.iter().map(|w| w.key)));
+    let q = if words.len() == 1 {
+        FutexQ::single_cached(&uc.futex_wait_cache, words[0].key)
+    } else {
+        Arc::new(FutexQ::new(words.iter().map(|w| w.key)))
+    };
     let finish = |uc: &crate::user_task::UserTaskCtx| {
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.futex_block_active.store(false, Ordering::Release);
@@ -11388,6 +11474,7 @@ pub(crate) fn futex_block(
         for (idx, w) in words.iter().enumerate() {
             // A requeue during an earlier pass may have moved this entry.
             *q.location(idx).lock() = FutexLocation { key: w.key, handle: None };
+            q.entry(idx).woken.store(false, Ordering::Relaxed);
             let Some((gen, current)) =
                 futex_wait_seqlock_read_key(w.key, || futex_read_user_word(w.uaddr))
             else {
@@ -11428,7 +11515,7 @@ pub(crate) fn futex_block(
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             }
-            own_stack_block(ctx);
+            own_stack_block_futex(ctx, &q);
         }
         let woken = futex_unqueue_multiple(&q, words.len(), tid);
         finish(uc);

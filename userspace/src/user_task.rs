@@ -345,8 +345,8 @@ pub struct UserTaskCtx {
     /// Non-zero while this task is parked in a blocking `rt_sigtimedwait`:
     /// the userspace `sigset_t` it is waiting on (bit N-1 = signal N — the
     /// same layout as `SIGNAL_PENDING`). Routes the park to the signal
-    /// waker registry exactly like `flock_key` routes to the flock waiter
-    /// queue: `park_should_block` registers the task in `SIGNAL_WAKERS`
+    /// waker exactly like `flock_key` routes to the flock waiter
+    /// queue: `park_should_block` installs the task's precise signal waker
     /// (so `wake_signal` from any raise path fires it promptly) and breaks
     /// the park when `handlers::sigwait_should_wake` reports a signal in
     /// the set pending (mask ignored — sigwait consumes blocked signals,
@@ -488,6 +488,13 @@ pub struct UserTaskCtx {
     /// (`try_to_wake_up`). Keeping the executor waker beside the task gives
     /// NARF the same durable fallback without scanning run queues.
     scheduler_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Precise interruptible-wait handle; reused across parks without a
+    /// task-id-indexed allocation. A signal takes it before invoking it.
+    pub(crate) signal_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Single-word futex storage. Reuse requires unique Arc ownership, so a
+    /// delayed dequeued waker can never observe a new wait in the old record.
+    pub(crate) futex_wait_cache:
+        narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<crate::handlers::FutexQ>>>,
     /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
     /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
     /// such a wait through `futex_wait_restart` with the stored expiry, so
@@ -859,6 +866,8 @@ impl UserTaskCtx {
             syscall_parked_restarting: AtomicBool::new(false),
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
             scheduler_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            signal_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            futex_wait_cache: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
             nanosleep_restart_req: AtomicU64::new(0),
@@ -1409,7 +1418,7 @@ fn park_should_block(
         // busy-spin on a bit nobody clears.
         let signal_pending = crate::handlers::has_interrupting_signal(task_id);
         if now < deadline && !signal_pending {
-            // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
+            // rt_sigtimedwait park: register the signal waker FIRST (every
             // raise path calls `wake_signal`, which fires this entry), THEN
             // re-check the wake condition — a signal raised in the
             // check→register window is caught by the re-check, a later one
@@ -1432,7 +1441,7 @@ fn park_should_block(
                 // release the sticky waiter reservation so signals it was
                 // waiting on resume normal handler delivery.
                 uc.sigwait_reserve.store(0, Ordering::Release);
-                // Signal-interruptible park: register in SIGNAL_WAKERS FIRST
+                // Signal-interruptible park: register the signal waker FIRST
                 // (every raise path — kill, itimer expiry, child exit — fires
                 // this entry via `wake_signal`), THEN re-check the pending
                 // set. A signal raised in the gate-check→register window is
@@ -1742,6 +1751,15 @@ pub fn __test_park_should_block(
 /// syscall handler that rewound RIP) so the sysret tail re-executes the syscall.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn own_stack_park() {
+    own_stack_park_until(|| false);
+}
+
+/// A handler-owned completion is checked on each park iteration. A completion
+/// racing this check still sets the scheduler's durable awake bit, so a yield
+/// returns here to observe it. Only the sleeper clears its own deadline; a
+/// delayed futex waker cannot clear a subsequent wait's state.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
     let mut sleep_handle: Option<narf_scheduler::narf_time::hrtimer::SleepHandle> = None;
     loop {
         let waker = match narf_scheduler::stackful::current_stackful_waker() {
@@ -1755,6 +1773,10 @@ pub fn own_stack_park() {
         // SAFETY: the in-flight task's poller-pinned UserTaskCtx; single-CPU
         // cooperative execution means no concurrent &mut to these fields.
         let uc = unsafe { &*uctx };
+        if completed() {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
+        }
         if !park_should_block(uc, &waker, &mut sleep_handle) {
             if let Some(h) = sleep_handle.take() {
                 drop(h);
@@ -2745,8 +2767,8 @@ impl core::future::Future for UserTaskFuture {
                 crate::handlers::is_signal_pending(crate::handlers::current_task_id());
             if now < deadline && !signal_pending {
                 // rt_sigtimedwait park: same register-then-re-check shape as
-                // the own-stack `park_should_block` sigwait arm — register in
-                // SIGNAL_WAKERS (every raise path fires it via `wake_signal`)
+                // the own-stack `park_should_block` sigwait arm — register the
+                // signal waker (every raise path fires it via `wake_signal`)
                 // and break the park when a signal in the waited set (mask
                 // ignored) or any deliverable signal is pending; the rewound
                 // syscall re-executes and consumes / returns -EINTR.
@@ -2765,7 +2787,7 @@ impl core::future::Future for UserTaskFuture {
                     // Non-sigwait park — release the sticky waiter
                     // reservation (see `UserTaskCtx::sigwait_reserve`).
                     this.task.uctx.sigwait_reserve.store(0, Ordering::Release);
-                    // Signal-interruptible park: register in SIGNAL_WAKERS
+                    // Signal-interruptible park: register the signal waker
                     // FIRST (every raise path fires it via `wake_signal`),
                     // then RE-CHECK pending — closes the check→register
                     // window; see the own-stack `park_should_block` twin.
