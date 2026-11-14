@@ -594,10 +594,7 @@ impl Core {
             return Err(Error::State);
         }
         if agg.is_some() && !self.aggregate
-            || matches!(
-                self.chip,
-                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
-            ) && fragment.is_some()
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && fragment.is_some()
         {
             return Err(Error::Packet);
         }

@@ -534,3 +534,112 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_set_txpwr_follows_rtw8851b_and_phy_ax
 );
+
+/// rtw8852a.c `rtw8852a_set_txpwr` + `rtw8852a_set_txpwr_ctrl` from the
+/// same firmware elements: full 2TX byrate (11 words), 2TX limit/RU
+/// pages, no TX shape (A's `set_txpwr` is byrate + offset + limit +
+/// limit_ru only; `.cfg_txrx_path` is NULL), and the two-path
+/// reference (`rtw8852a_bb_cal_txpwr_ref`: base_cw_0db 0x27,
+/// tssi_16dbm_cw 0x12c, ref 0).
+fn smoke_rtw89_na_set_txpwr_follows_rtw8852a_and_phy_ax() -> TestResult {
+    use super::super::operating_channel::{Profile as BProfile, Width as BWidth};
+    use narf_wireless::association::channel::Band as WBand;
+    let set = base(0, 10);
+    let (Some(ch6), Some(ch14), Some(a80)) = (
+        BProfile::new(WBand::Ghz2, 6),
+        BProfile::new(WBand::Ghz2, 14),
+        BProfile::new_5ghz(36, BWidth::Mhz80),
+    ) else {
+        return TestResult::Fail("RTL8852A power test profiles refused");
+    };
+    let Ok(plan) = Plan::from_elements_a(&set, 5, ch6) else {
+        return TestResult::Fail("RTL8852A power elements refused");
+    };
+    let mut writes = Vec::new();
+    if plan
+        .visit_a(|a, m, v| {
+            writes.push((a, m, v));
+            Ok(())
+        })
+        .is_err()
+    {
+        return TestResult::Fail("RTL8852A power visit failed");
+    }
+    let by_rate = writes
+        .iter()
+        .filter(|w| (0xd2c0..0xd2ec).contains(&w.0))
+        .count();
+    let lmt = writes
+        .iter()
+        .filter(|w| (0xd2ec..0xd33c).contains(&w.0))
+        .count();
+    let ru = writes
+        .iter()
+        .filter(|w| (0xd33c..0xd36c).contains(&w.0))
+        .count();
+    if by_rate != 11 || lmt != 20 || ru != 12 {
+        return TestResult::Fail("RTL8852A byrate/limit/RU are not the 2TX pages");
+    }
+    // First byrate word: CCK [5, 1, 2, 3]; first limit word cck_20m 40>>1.
+    if writes[0] != (0xd2c0, u32::MAX, u32::from_le_bytes([5, 1, 2, 3]))
+        || !writes.contains(&(0xd2ec, u32::MAX, 20))
+    {
+        return TestResult::Fail("RTL8852A byrate / limit values differ");
+    }
+    let refs: Vec<_> = writes
+        .iter()
+        .filter(|w| matches!(w.0, 0xd200 | 0x15804 | 0x15808 | 0x17804 | 0x17808))
+        .collect();
+    if refs
+        != [
+            &(0xd200, 0x0fff_fc00, 0),
+            &(0x15804, 0x07ff_ffff, (172 << 18) | (312 << 9)),
+            &(0x15808, 0x07ff_ffff, (172 << 18) | (312 << 9)),
+            &(0x17804, 0x07ff_ffff, (172 << 18) | (312 << 9)),
+            &(0x17808, 0x07ff_ffff, (172 << 18) | (312 << 9)),
+        ]
+        || writes.iter().any(|w| {
+            matches!(
+                w.0,
+                0x12300 | 0x14494 | 0x156cc | 0x176cc | 0x158f8 | 0x178f8
+            )
+        })
+    {
+        return TestResult::Fail("RTL8852A reference / C-only writes differ");
+    }
+    // Channel 14 takes no DFIR (A has no set_tx_shape); 5GHz has none.
+    let mut dfir = Vec::new();
+    let ok14 = Plan::from_elements_a(&set, 5, ch14).and_then(|p| {
+        p.visit_a(|a, _, v| {
+            dfir.push((a, v));
+            Ok(())
+        })
+    });
+    if ok14.is_err() || dfir.iter().any(|w| w.0 == 0x12300) {
+        return TestResult::Fail("RTL8852A channel 14 wrote DFIR");
+    }
+    let mut five = Vec::new();
+    let ok80 = Plan::from_elements_a(&set, 0, a80).and_then(|p| {
+        p.visit_a(|a, _, _| {
+            five.push(a);
+            Ok(())
+        })
+    });
+    if ok80.is_err() || five.contains(&0x12300) {
+        return TestResult::Fail("RTL8852A 5GHz 80MHz plan refused or wrote DFIR");
+    }
+    // Missing TX_SHAPE_LMT: the shared container is refused even though
+    // A never emits the shape it carries.
+    let partial: Vec<_> = set
+        .into_iter()
+        .filter(|e| e.id != ID_TX_SHAPE_LMT)
+        .collect();
+    if Plan::from_elements_a(&partial, 5, ch6).is_ok() {
+        return TestResult::Fail("RTL8852A power accepted a container without TX_SHAPE_LMT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_na_set_txpwr_follows_rtw8852a_and_phy_ax
+);

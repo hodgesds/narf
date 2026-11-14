@@ -1099,7 +1099,17 @@ kernel_test_in!(
 pub(in crate::rtw89) fn native_fragment_core(
     own: [u8; 6],
 ) -> Result<(Core, Vec<(u32, u32)>), Error> {
+    native_fragment_core_for_chip(ChipId::Rtl8852B, own)
+}
+/// [`native_fragment_core`] for the given chip: the Core's chip selects its
+/// ring registers and TXWD profile (`transmit_a` on RTL8852A, the AX v0
+/// body shared with B).
+pub(in crate::rtw89) fn native_fragment_core_for_chip(
+    chip: ChipId,
+    own: [u8; 6],
+) -> Result<(Core, Vec<(u32, u32)>), Error> {
     let mut model = Model::new();
+    model.chip = chip;
     let mut core = Core::prepare(&mut model, own, 0)?;
     core.start(&mut model)?;
     let mut regs = Vec::new();

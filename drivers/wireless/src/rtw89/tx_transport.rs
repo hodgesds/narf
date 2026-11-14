@@ -363,7 +363,9 @@ pub(super) fn prepare_header_fragment(
     frame_dma: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    if chip != ChipId::Rtl8852B || frame.get(1).is_none_or(|fc| fc & 0x80 != 0) {
+    if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852A)
+        || frame.get(1).is_none_or(|fc| fc & 0x80 != 0)
+    {
         return Err(Error::BadFrame);
     }
     prepare_header_profile(chip, info, sequence, frame_dma, frame, false, true)
