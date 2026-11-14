@@ -2337,3 +2337,70 @@ kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_proc_net_rows_carry_socket_identity
 );
+
+/// Linux unix_bind_bsd -> vfs_mknod -> inode_init_owner. Codex binds its
+/// control socket as uid 1000, then chmods it to 0600 before publication.
+fn smoke_abi_socket_unprivileged_owner_can_chmod_bound_path() -> TestResult {
+    for variant in 0..3 {
+        let result = with_memfs("/sockowner", "sockowner", &[("foreign", b"")], || {
+            let parent = b"/sockowner\0";
+            if call_chmod(
+                parent.as_ptr() as u64,
+                if variant == 2 { 0o2777 } else { 0o777 },
+            ) != Some(0)
+                || call_chown(parent.as_ptr() as u64, 0, 2000) != Some(0)
+                || call(Syscall::SetGid.raw(), a0(1000)) != Some(0)
+                || call(Syscall::SetUid.raw(), a0(1000)) != Some(0)
+            {
+                return Err("socket owner fixture failed");
+            }
+            // FS identity can differ from the process's uid/gid. It is the
+            // former that inode_init_owner and chmod's owner check consume.
+            if variant != 0 {
+                crate::handlers::__test_set_fsids(crate::handlers::current_task_id(), 1001, 1002);
+            }
+            let old = call(Syscall::Umask.raw(), a0(0o077)).ok_or("umask failed")?;
+            let outcome = (|| {
+                let path = b"/sockowner/control\0";
+                let fd = open(AF_UNIX, SOCK_STREAM, 0)?;
+                let (addr, len) = unix_addr(&path[..path.len() - 1]);
+                if sys(Syscall::SocketBind, a2(fd, addr.as_ptr() as u64, len)) != Some(0) {
+                    return Err("unprivileged socket bind failed");
+                }
+                let mut st = [0u8; STAT_SIZE];
+                if call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0)
+                    || stat_uid(&st) != if variant == 0 { 1000 } else { 1001 }
+                    || stat_gid(&st)
+                        != match variant {
+                            0 => 1000,
+                            1 => 1002,
+                            _ => 2000,
+                        }
+                    || stat_mode(&st) != 0o140700
+                {
+                    return Err("bound socket did not inherit fsids, setgid group, or umask");
+                }
+                if call_chmod(path.as_ptr() as u64, 0o600) != Some(0)
+                    || call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0)
+                    || stat_mode(&st) != 0o140600
+                {
+                    return Err("socket creator could not persist chmod(0600)");
+                }
+                if call_chmod(c"/sockowner/foreign".as_ptr() as u64, 0o600) != Some(-1) {
+                    return Err("socket fix bypassed ownership for another user's inode");
+                }
+                Ok(())
+            })();
+            let _ = call(Syscall::Umask.raw(), a0(old as u64));
+            outcome
+        });
+        if !matches!(result, TestResult::Pass) {
+            return result;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_unprivileged_owner_can_chmod_bound_path
+);

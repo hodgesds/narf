@@ -876,6 +876,19 @@ impl DirOps for OverlayDir {
         })
     }
 
+    fn create_socket_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let upper = self.prepare_create(name).await?;
+            upper.create_socket_with_attrs(name, perms, uid, gid).await
+        })
+    }
+
     fn mknod<'a>(
         &'a self,
         name: &'a str,
