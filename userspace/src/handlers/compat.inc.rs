@@ -2403,11 +2403,12 @@ const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BA
 const EXEC_PREFIX_BYTES: usize = 256;
 
 /// What opening an exec image yields: the sniffing prefix, the resolved file,
-/// and the file's size at open time.
+/// the file's size at open time, and its resolved host path for mount policy.
 type ExecOpen = (
     alloc::vec::Vec<u8>,
     alloc::sync::Arc<dyn narf_filesystem::FileOps>,
     u64,
+    alloc::string::String,
 );
 
 /// The image an `execve` is loading, as something the ELF loader can READ from
@@ -2609,23 +2610,6 @@ fn do_execve_resolved(
     }
     let path: &str = &path_owned;
 
-    // `fs/exec.c::do_open_execat` opens the binary with `.acc_mode =
-    // MAY_EXEC`, and `may_open` refuses that on a `noexec` mount:
-    //
-    //     if (path_noexec(path)) return -EACCES;
-    //
-    // A mount is made `noexec` precisely so nothing on it can run, so this
-    // holds for root as well. An `image_override` is an already-read
-    // memfd/fd image with no mount behind it, and Linux likewise has no
-    // mount to test there.
-    if image_override.is_none()
-        && narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(&apply_chroot(path)) & narf_filesystem::mnt_flags::NOEXEC != 0
-    {
-        ctx.set_return(errno_ret(EACCES)); // -EACCES
-        return;
-    }
-
     // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
     // fast boot even while the console is otherwise quiet): mark when the
     // session reaches its compositor / shell. Its presence = the greeter got
@@ -2665,9 +2649,8 @@ fn do_execve_resolved(
     };
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
 
-    // Resolve a path under the caller's chroot (containers/distros exec
-    // `/bin/sh` expecting the chrooted rootfs) and slurp its bytes, capped at
-    // 64 MiB. Returns the bytes, or a negative errno on failure. The errno
+    // Resolve an image under the caller's chroot and read its sniffing
+    // prefix. Returns the opened file, or a negative errno on failure. The errno
     // distinction is load-bearing: `execvp(3)` PATH-searches by execve'ing
     // each candidate and treating -ENOENT as "try the next dir" but -EINVAL/
     // -EIO as fatal. Returning EINVAL for a not-found path (the old behaviour)
@@ -2678,7 +2661,21 @@ fn do_execve_resolved(
     // demand-pages each PT_LOAD from the latter, so the bytes here serve only
     // the shebang sniff and the ELF metadata the parser needs.
     let read_exec = |p: &str| -> Result<ExecOpen, i64> {
-        let ep = apply_chroot(p);
+        // `do_open_execat` uses the namespace-wide LOOKUP_FOLLOW walk. A
+        // filesystem-local walk restarts an absolute link at its mount root:
+        // /home/daniel/.local/bin/codex then becomes /home/home/daniel/... on
+        // a separately mounted /home, even though open/stat find the file.
+        // Expand through the caller's mounts and chroot before opening it.
+        let ep = resolve_vfs_symlink_path_scoped(&apply_chroot(p), true)
+            .map_err(|errno| -errno)?;
+        // Linux checks path_noexec on the file it opened, including each
+        // script interpreter, rather than the mount containing a symlink.
+        // Anonymous fd images never enter this path and have no mount.
+        if narf_filesystem::any_restricted_mounts()
+            && current_mount_flags_at(&ep) & narf_filesystem::mnt_flags::NOEXEC != 0
+        {
+            return Err(-EACCES);
+        }
         // Resolve through the caller's PRIVATE mount namespace, not the global
         // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
         // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
@@ -2804,7 +2801,7 @@ fn do_execve_resolved(
         }
         buf.truncate(off);
         crate::mapped_file::overlay_dirty(&ops, 0, &mut buf, epoch);
-        Ok((buf, ops, file_size as u64))
+        Ok((buf, ops, file_size as u64, ep))
     };
 
     // Step 3: read the image. A leading `#!` is an interpreter directive
@@ -2826,6 +2823,7 @@ fn do_execve_resolved(
     // a process pays for the pages it touches. `None` for the fexecve/memfd
     // arm below, whose bytes are already in hand with no file behind them.
     let mut exec_file: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> = None;
+    let mut exec_mount_path = None;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -2839,7 +2837,7 @@ fn do_execve_resolved(
     } else {
         let mut depth = 0u32;
         loop {
-            let (prefix, resolved_ops, file_size) = match read_exec(&cur_path) {
+            let (prefix, resolved_ops, file_size, mount_path) = match read_exec(&cur_path) {
                 Ok(b) => b,
                 Err(code) => {
                     ctx.set_return(SyscallReturn::ok(code as u64));
@@ -2895,6 +2893,7 @@ fn do_execve_resolved(
                 size: file_size,
             };
             exec_file = Some(resolved_ops);
+            exec_mount_path = Some(mount_path);
             break;
         }
     }
@@ -2916,7 +2915,7 @@ fn do_execve_resolved(
     // it here, as before, returned ENOEXEC to a caller already running as
     // the set-user-ID file's owner.)
     let exec_cred = {
-        let mount_path = apply_chroot(&cur_path);
+        let mount_path = exec_mount_path.unwrap_or_else(|| apply_chroot(&cur_path));
         exec_prepare_credentials(task, exec_file.as_deref(), &mount_path)
     };
     let exec_aux = exec_auxv(task, &exec_cred);

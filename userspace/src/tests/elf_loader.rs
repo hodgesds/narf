@@ -3329,6 +3329,93 @@ kernel_test_in!(
     smoke_userspace_execve_loads_elf_then_bails_without_user_ctx
 );
 
+/// The Codex launcher uses two absolute links beneath a separately mounted
+/// /home. Stat/open already cross the mount boundary; exec must follow the
+/// same namespace walk instead of treating link text as filesystem-relative.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_absolute_links_cross_mounts() -> TestResult {
+    use narf_filesystem::{bootstrap_mount_authority, registry, FsInstance, MemFs};
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+    let auth = bootstrap_mount_authority();
+    let links = MemFs::new("execve-links");
+    let root = links.root();
+    let result = (|| {
+        for (name, target) in [
+            ("current", "/execve-real"),
+            ("launcher", "/execve-links/current/prog"),
+        ] {
+            if !matches!(
+                crate::handlers::poll_blocking(root.symlink(name, target)),
+                Some(Ok(_))
+            ) {
+                return TestResult::Fail("cannot stage execve launcher links");
+            }
+        }
+        let elf = build_minimal_elf_for_execve();
+        let executable = MemFs::with_seeds("execve-real", &[("prog", &elf)]);
+        let target_mount = match registry().mount(&auth, "/execve-real", executable) {
+            Ok(handle) => handle,
+            Err(_) => return TestResult::Fail("cannot mount execve target"),
+        };
+        let link_mount = match registry().mount(&auth, "/execve-links", links) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = registry().unmount(&target_mount, "/execve-real");
+                return TestResult::Fail("cannot mount execve links");
+            }
+        };
+        let result = (|| {
+            // ENOSYS is the existing handler fixture's post-load bail: it
+            // proves that lookup and ELF loading succeeded without entering
+            // ring 3. Mount policy belongs to the resolved target file.
+            for (link_flags, target_flags, expected) in [
+                (0, 0, ENOSYS),
+                (0, narf_filesystem::mnt_flags::NOEXEC, EACCES),
+                (narf_filesystem::mnt_flags::NOEXEC, 0, ENOSYS),
+            ] {
+                if !registry().set_flags_at("/execve-links", link_flags)
+                    || !registry().set_flags_at("/execve-real", target_flags)
+                {
+                    return TestResult::Fail("cannot set execve mount flags");
+                }
+                let path = b"/execve-links/launcher\0";
+                let mut ctx = StubCtx {
+                    args: SyscallArgs {
+                        arg0: path.as_ptr() as u64,
+                        arg1: 0,
+                        arg2: 0,
+                        arg3: 0,
+                        arg4: 0,
+                        arg5: 0,
+                    },
+                    ret: None,
+                };
+                kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+                if ctx.ret != Some(errno_ret(expected)) {
+                    return TestResult::Fail(
+                        "execve absolute-link lookup or target noexec policy failed",
+                    );
+                }
+            }
+            TestResult::Pass
+        })();
+        let _ = registry().unmount(&link_mount, "/execve-links");
+        let _ = registry().unmount(&target_mount, "/execve-real");
+        result
+    })();
+    crate::syscall::__test_clear_global();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_absolute_links_cross_mounts
+);
+
 /// Byte-built ET_EXEC for the execve page-in smokes (#740): one PT_LOAD
 /// R|X, file offset 0x1000 → vaddr 0x80_0000_1000, entry +0x111. The
 /// header DECLARES `declared_pages` of filesz/memsz; the byte vector

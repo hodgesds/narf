@@ -1187,7 +1187,12 @@ distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 mount itself) and other non-regular images with `EACCES`. Executable lookup
 preserves `ENOENT`, `ENOTDIR`, `ELOOP` and mapped filesystem errors; a directory
 reported as `InvalidPath` by the file-only resolver must not become `EIO`.
-`execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
+Executable paths follow absolute and intermediate symlinks through the caller's
+mount namespace, restarting absolute targets at the process root rather than
+the owning filesystem's mount root. `NOEXEC` and set-id `NOSUID` policy use the
+resolved executable mount, including a script's selected interpreter; a symlink
+on another mount does not supply that policy. `AT_EXECFN` retains the caller's
+spelling. `execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
