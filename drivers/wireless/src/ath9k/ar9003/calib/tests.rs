@@ -20,6 +20,7 @@ struct Model {
     chan: BTreeMap<u64, (u32, u32)>,
     now: u64,
     agc_stuck: bool,
+    txiqcal_stuck: bool,
 }
 const THRESHOLD: [u32; 3] = [37, 12, 50];
 impl Model {
@@ -46,6 +47,7 @@ impl Model {
             chan: BTreeMap::new(),
             now: 0,
             agc_stuck: false,
+            txiqcal_stuck: false,
         }
     }
     fn raw(&self, register: u64) -> u32 {
@@ -105,8 +107,17 @@ impl RegisterIo for Model {
         if register == AR_PHY_TIMING4 {
             value &= !AR_PHY_TIMING4_DO_CAL;
         }
+        if (register == AR_PHY_TX_IQCAL_START || register == AR_PHY_TX_IQCAL_START_9485)
+            && value & TX_IQCAL_START_DO_CAL != 0
+            && !self.txiqcal_stuck
+        {
+            value &= !TX_IQCAL_START_DO_CAL;
+        }
         if let Some(chain) = RXRF_AGC.iter().position(|r| *r == register) {
-            let caldac = (value >> 19) & 0x3f;
+            // The peak-detect comparator reflects whichever CALDAC field
+            // the band programs: bits 19-24 on 2 GHz, bits 9-14 on
+            // 5 GHz (`ar9003_hw_manual_peak_cal`).
+            let caldac = ((value >> 19) & 0x3f).max((value >> 9) & 0x3f);
             value = (value & !0x4) | (u32::from(caldac >= THRESHOLD[chain]) << 2);
         }
         self.values.insert(register, value);
@@ -204,6 +215,7 @@ fn init() -> Result<(), &'static str> {
         || report.carrier_leak != Some(true)
         || report.default_nf != [-100, -110, -105]
         || report.tx_iq_cal.is_some()
+        || report.tx_clcal.is_none()
         || cal.state() != State::Ready
         || cal.report() != Some(report)
     {
@@ -634,4 +646,325 @@ fn smoke_ath9k_ar9565_rx_iq_saturation_abort() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9565_rx_iq_saturation_abort
+);
+
+fn tx_iq_cal_run_paths() -> Result<(), &'static str> {
+    // Success on the non-9485 map: a forced TX gain is cleared, the TX
+    // IQ calibration is triggered and completes.
+    let mut io = Model::new();
+    io.values.insert(AR_PHY_TX_FORCED_GAIN, TXGAIN_FORCE);
+    match ready(tx_iq_cal_run(&mut io, false)) {
+        Ok(true) => {}
+        _ => return Err("AR9300 TX IQ cal run did not complete"),
+    }
+    if io.raw(AR_PHY_TX_FORCED_GAIN) & TXGAIN_FORCE != 0
+        || io
+            .wrote(AR_PHY_TX_IQCAL_START, TX_IQCAL_START_DO_CAL)
+            .is_none()
+    {
+        return Err("AR9300 TX IQ cal run trigger differs");
+    }
+    // A stuck TX IQ calibration reports incomplete, not an error:
+    // `ar9003_hw_init_cal_soc` falls back to the AGC calibration alone.
+    let mut io = Model::new();
+    io.txiqcal_stuck = true;
+    match ready(tx_iq_cal_run(&mut io, false)) {
+        Ok(false) => {}
+        _ => return Err("stuck TX IQ cal run did not report incomplete"),
+    }
+    // The AR9485 map moves the trigger register; no non-9485 TX IQCAL
+    // register is written.
+    let mut io = Model::new();
+    match ready(tx_iq_cal_run(&mut io, true)) {
+        Ok(true) => {}
+        _ => return Err("AR9485 TX IQ cal run did not complete"),
+    }
+    if io
+        .wrote(AR_PHY_TX_IQCAL_START_9485, TX_IQCAL_START_DO_CAL)
+        .is_none()
+        || io.writes.iter().any(|w| w.0 == AR_PHY_TX_IQCAL_START)
+    {
+        return Err("AR9485 TX IQ cal run used the wrong map");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9003_tx_iq_cal_run() -> TestResult {
+    match tx_iq_cal_run_paths() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9003_tx_iq_cal_run
+);
+
+fn dynamic_osdac_selection_paths() -> Result<(), &'static str> {
+    // In-range offsets (15, inside 7..24) on all chains: one loop
+    // iteration, OSDAC stays 0, the initial AGC cal plus one loop AGC
+    // cal, and the end state (OFFSET_CAL cleared, PHY active, TX IQ
+    // calibration re-enabled).
+    let mut io = Model::new();
+    for bb3 in BB3 {
+        io.values.insert(bb3, (15 << 26) | (15 << 21));
+    }
+    let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
+    match ready(dynamic_osdac_selection(&mut io, &revision, true)) {
+        Ok(true) => {}
+        _ => return Err("AR9300 dynamic OSDAC selection did not complete"),
+    }
+    if io.raw(BB1[0]) >> 30 != 0
+        || io.raw(BB1[1]) >> 30 != 0
+        || io.raw(BB1[2]) >> 30 != 0
+        || io
+            .writes
+            .iter()
+            .filter(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+            .count()
+            != 2
+        || io.raw(AR_PHY_AGC_CONTROL) & AGC_OFFSET_CAL != 0
+        || io.raw(AR_PHY_ACTIVE) & AR_PHY_ACTIVE_EN == 0
+        || io.raw(AR_PHY_TX_IQCAL_CONTROL_0) & TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL == 0
+    {
+        return Err("AR9300 dynamic OSDAC selection in-range differs");
+    }
+    // Out-of-range offsets (0, below 7) on all chains: OSDAC climbs
+    // 0 -> 3 over four iterations, five AGC cals in total.
+    let mut io = Model::new();
+    match ready(dynamic_osdac_selection(&mut io, &revision, true)) {
+        Ok(true) => {}
+        _ => return Err("AR9300 dynamic OSDAC selection did not complete"),
+    }
+    if io.raw(BB1[0]) != 3 << 30
+        || io.raw(BB1[1]) != 3 << 30
+        || io.raw(BB1[2]) != 3 << 30
+        || io
+            .writes
+            .iter()
+            .filter(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+            .count()
+            != 5
+    {
+        return Err("AR9300 dynamic OSDAC selection out-of-range differs");
+    }
+    // A stuck AGC calibration fails the selection.
+    let mut io = Model::new();
+    io.agc_stuck = true;
+    match ready(dynamic_osdac_selection(&mut io, &revision, true)) {
+        Ok(false) => {}
+        _ => return Err("stuck dynamic OSDAC selection did not fail"),
+    }
+    // The AR9485 map moves the TX IQCAL control register; no non-9485
+    // TX IQCAL register is written.
+    let mut io = Model::new();
+    for bb3 in BB3 {
+        io.values.insert(bb3, (15 << 26) | (15 << 21));
+    }
+    let revision = rev_for(0x0024_01ff, super::super::Chip::Ar9485);
+    match ready(dynamic_osdac_selection(&mut io, &revision, true)) {
+        Ok(true) => {}
+        _ => return Err("AR9485 dynamic OSDAC selection did not complete"),
+    }
+    if io.raw(AR_PHY_TX_IQCAL_CONTROL_0_9485) & TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL == 0
+        || io.writes.iter().any(|w| w.0 == AR_PHY_TX_IQCAL_CONTROL_0)
+    {
+        return Err("AR9485 dynamic OSDAC selection used the wrong map");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9003_dynamic_osdac_selection() -> TestResult {
+    match dynamic_osdac_selection_paths() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9003_dynamic_osdac_selection
+);
+
+fn fast_channel_change(
+    cal: &mut Calibration,
+    io: &mut Model,
+    revision: &Revision,
+    mask: u8,
+    frequency: u16,
+    saved: &Report,
+) -> Result<Report, BringUpError> {
+    let prepared = prepared(frequency, mask);
+    // SAFETY: the model is an exclusive, parked fake AR9300 with no DMA.
+    ready(unsafe { cal.fast_channel_change(io, &identity(mask), revision, &prepared, saved) })
+}
+
+fn fast_channel_change_reload() -> Result<(), &'static str> {
+    let mut io = Model::new();
+    let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
+    // Distinctive carrier-leak table entries for the save to keep.
+    io.values.insert(CL_TAB[0], 0x1111_1111);
+    io.values.insert(CL_TAB[1] + 20, 0x2222_2222);
+    io.values.insert(CL_TAB[2] + 60, 0x3333_3333);
+    let mut cal = Calibration::default();
+    let mut saved =
+        run(&mut cal, &mut io, &revision, 7, 2412).map_err(|_| "AR9300 init cal refused")?;
+    // Saved TX IQ coefficients from a direct post-processing, as the
+    // outlier test builds them.
+    let mut gen = Model::new();
+    gen.tx_iq_status(false, 2);
+    for chain in 0..3 {
+        gen.tx_iq_measurement(chain, 0, IQ_A);
+        gen.tx_iq_measurement(chain, 1, IQ_B);
+    }
+    let data = match tx_iq_cal_post_proc(&mut gen, &revision, 7) {
+        Ok(Some(data)) => data,
+        _ => return Err("AR9300 TX IQ post-processing failed"),
+    };
+    saved.tx_iq_cal = Some(data);
+    let saved_cl = match saved.tx_clcal {
+        Some(saved_cl) => saved_cl,
+        None => return Err("AR9300 carrier-leak table was not saved"),
+    };
+    if saved_cl.table[0][0] != 0x1111_1111
+        || saved_cl.table[1][5] != 0x2222_2222
+        || saved_cl.table[2][15] != 0x3333_3333
+    {
+        return Err("AR9300 carrier-leak table save differs");
+    }
+    // The reload path: saved coefficients re-applied, saved table
+    // re-written, no AGC calibration (nothing forced it), no peak cal.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 7, 2437, &saved)
+        .map_err(|_| "AR9300 fast channel change refused")?;
+    let phase = &io.writes[mark..];
+    if report.frequency_mhz != 2437
+        || report.tx_iq_cal != Some(data)
+        || report.tx_clcal != Some(saved_cl)
+        || report.peak_caldac != [None, None, None]
+        || report.default_nf != [-100, -110, -105]
+        || fast.state() != State::Ready
+        || phase
+            .iter()
+            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+        || !phase.contains(&(CL_TAB[0], 0x1111_1111))
+        || !phase.contains(&(CL_TAB[1] + 20, 0x2222_2222))
+        || !phase.contains(&(CL_TAB[2] + 60, 0x3333_3333))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 | (259 << 14)))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259 | (259 << 14)))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259 | (259 << 14)))
+    {
+        return Err("AR9300 fast channel change reload differs");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9300_fast_channel_change_reload() -> TestResult {
+    match fast_channel_change_reload() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_fast_channel_change_reload
+);
+
+fn fast_channel_change_fresh() -> Result<(), &'static str> {
+    let mut io = Model::new();
+    let revision = rev_for(0x002c_02ff, super::super::Chip::Ar9565);
+    io.tx_iq_status(false, 1);
+    io.tx_iq_measurement(0, 0, IQ_A);
+    io.values.insert(CL_TAB[0], 0x1111_1111);
+    io.values.insert(CL_TAB[0] + 20, 0x2222_2222);
+    io.values.insert(CL_TAB[0] + 60, 0x3333_3333);
+    let mut cal = Calibration::default();
+    let saved =
+        run(&mut cal, &mut io, &revision, 1, 2412).map_err(|_| "AR9565 init cal refused")?;
+    let tx_iq_cal = match saved.tx_iq_cal {
+        Some(tx_iq_cal) => tx_iq_cal,
+        None => return Err("AR9565 TX IQ calibration did not complete"),
+    };
+    if tx_iq_cal.tx_corr_coeff[0][0] != 3075 {
+        return Err("AR9565 TX IQ coefficient differs");
+    }
+    // The fresh path across bands: `TX_IQ_ON_AGC_CAL` re-runs the AGC
+    // calibration and the TX IQ post-processing, and the saved table is
+    // still re-written.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 1, 5180, &saved)
+        .map_err(|_| "AR9565 fast channel change refused")?;
+    let phase = &io.writes[mark..];
+    if report.frequency_mhz != 5180
+        || !report.five_ghz
+        || report.tx_iq_cal != Some(tx_iq_cal)
+        || report.peak_caldac != [Some(36), None, None]
+        || report.default_nf != [-100, -115, -105]
+        || fast.state() != State::Ready
+        || !phase
+            .iter()
+            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+        || !phase.contains(&(CL_TAB[0], 0x1111_1111))
+        || !phase.contains(&(CL_TAB[0] + 20, 0x2222_2222))
+        || !phase.contains(&(CL_TAB[0] + 60, 0x3333_3333))
+    {
+        return Err("AR9565 fast channel change differs");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9565_fast_channel_change() -> TestResult {
+    match fast_channel_change_fresh() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9565_fast_channel_change
+);
+
+fn fast_channel_change_refusals() -> Result<(), &'static str> {
+    let mut io = Model::new();
+    let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
+    let mut cal = Calibration::default();
+    let saved =
+        run(&mut cal, &mut io, &revision, 7, 2412).map_err(|_| "AR9300 init cal refused")?;
+    // Same channel: refused before any write.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    if fast_channel_change(&mut fast, &mut io, &revision, 7, 2412, &saved)
+        != Err(BringUpError::BadState)
+        || fast.state() != State::New
+        || io.writes.len() != mark
+    {
+        return Err("AR9300 fast channel change ran on the same channel");
+    }
+    // Inactive PHY: refused before any write.
+    let mut io = Model::new();
+    let mut fast = Calibration::default();
+    let mark = io.writes.len();
+    if fast_channel_change(&mut fast, &mut io, &revision, 7, 5180, &saved)
+        != Err(BringUpError::BadState)
+        || fast.state() != State::New
+        || io.writes.len() != mark
+    {
+        return Err("AR9300 fast channel change ran on an inactive PHY");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9300_fast_channel_change_refusals() -> TestResult {
+    match fast_channel_change_refusals() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_fast_channel_change_refusals
 );

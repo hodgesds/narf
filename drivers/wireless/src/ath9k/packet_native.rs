@@ -70,7 +70,10 @@ pub(super) enum Calibrated {
     /// `ath_hw`-lifetime IQ accumulators, refreshed after every step so
     /// the next generation continues them.
     Ar9300 {
-        report: super::ar9003::calib::Report,
+        /// Boxed: `Report` carries the 192-byte `TxClCal` table, which
+        /// would otherwise make this the enum's dominant variant
+        /// (`clippy::large_enum_variant`).
+        report: alloc::boxed::Box<super::ar9003::calib::Report>,
         grant: alloc::sync::Arc<super::admission::Grant>,
         permission: super::calibration::Permission,
         clock: super::mac::Clock,
@@ -541,7 +544,7 @@ impl Native {
             cap,
             bar,
             Calibrated::Ar9300 {
-                report,
+                report: alloc::boxed::Box::new(report),
                 grant,
                 permission,
                 clock: super::ar9003::mac::clock(report.five_ghz),
