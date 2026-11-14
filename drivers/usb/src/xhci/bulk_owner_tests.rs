@@ -103,8 +103,9 @@ kernel_test_in!(
 /// Isochronous completion identity (#885): the Transfer Event
 /// must pointer-match the originating Isoch TRB — a same
 /// slot/DCI event for another TRB, or an Event Data record, never
-/// retires the TD — and at most one isoch TD is in flight per
-/// endpoint. The event words are built from the xHCI 1.2 §6.4.2.1
+/// retires the TD — and one owner state holds at most one TD at a
+/// time (the endpoint pipeline is one such state per slot,
+/// #2060). The event words are built from the xHCI 1.2 §6.4.2.1
 /// Transfer Event layout (TRB Pointer in dwords 0..1, Completion
 /// Code in dword 2 bits 31:24, residue in bits 23:0, type 32 in
 /// dword 3 bits 15:10, endpoint in bits 20:16, slot in bits
@@ -501,4 +502,233 @@ fn smoke_xhci_control_force_reset_releases_claim() -> TestResult {
 kernel_test_in!(
     "drivers/usb/xhci",
     smoke_xhci_control_force_reset_releases_claim
+);
+
+/// Isochronous pipeline (#2060): up to `ISOCH_PIPELINE_DEPTH` TDs
+/// in flight on one endpoint, each completing against its own
+/// pointer-matched Transfer Event in any order — and the next
+/// begin past a full pool is `Busy` without publishing.
+fn smoke_xhci_isoch_pool_pipelines_four_transfers() -> TestResult {
+    let mut pool = IsochPool::new();
+    if pool.active() {
+        return TestResult::Fail("fresh isoch pool reported a TD in flight");
+    }
+    let mut tokens: [Option<Token>; ISOCH_PIPELINE_DEPTH] = core::array::from_fn(|_| None);
+    for (index, slot) in tokens.iter_mut().enumerate() {
+        let free = match pool.free_slot() {
+            Some(free) => free,
+            None => return TestResult::Fail("isoch pool ran out of free slots early"),
+        };
+        if free != index {
+            return TestResult::Fail("isoch pool did not hand out slots in order");
+        }
+        let trb = 0x1234_5000u64 + (index as u64) * 16;
+        match pool.begin_on(free, id(), Direction::In, 512, || trb) {
+            Ok(token) => *slot = Some(token),
+            Err(_) => return TestResult::Fail("isoch pool begin failed"),
+        }
+    }
+    if !pool.active()
+        || pool.free_slot().is_some()
+        || !matches!(
+            pool.begin_on(0, id(), Direction::In, 512, || panic!(
+                "fifth isoch publish"
+            )),
+            Err(Error::Busy)
+        )
+    {
+        return TestResult::Fail("fifth isoch TD published over a full pipeline");
+    }
+    // Complete out of order: the second TD first, then the rest.
+    // Each completion reports only its own length.
+    let consumed = Cell::new(0usize);
+    for index in [1usize, 3, 0, 2] {
+        let token = tokens[index].as_ref().unwrap();
+        match pool.complete_isoch(42, token, &event(token, 1, 0), |bytes| consumed.set(bytes)) {
+            Ok(Some(512)) if consumed.get() == 512 => {}
+            _ => return TestResult::Fail("isoch pool completion did not retire its own TD"),
+        }
+    }
+    if pool.active() || pool.free_slot() != Some(0) {
+        return TestResult::Fail("isoch pool did not free its slots on completion");
+    }
+    // A retired receipt never matches a reused ring address.
+    let token = tokens[0].as_ref().unwrap();
+    if pool.complete_isoch(42, token, &event(token, 1, 0), |_| ()) != Err(Error::Stale) {
+        return TestResult::Fail("retired isoch receipt completed after pipeline drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_pool_pipelines_four_transfers
+);
+
+/// Isochronous pool event routing (#2060): the demux latches a
+/// Transfer Event into the slot whose TRB it names, and only
+/// that slot's waiter can take it. An event for another TRB
+/// never latches anywhere.
+fn smoke_xhci_isoch_pool_routes_events_by_trb() -> TestResult {
+    let mut pool = IsochPool::new();
+    let mut tokens: [Option<Token>; ISOCH_PIPELINE_DEPTH] = core::array::from_fn(|_| None);
+    for (index, slot) in tokens.iter_mut().enumerate() {
+        let free = match pool.free_slot() {
+            Some(free) => free,
+            None => return TestResult::Fail("isoch pool ran out of free slots early"),
+        };
+        let trb = 0x2000_0000u64 + (index as u64) * 16;
+        match pool.begin_on(free, id(), Direction::In, 512, || trb) {
+            Ok(token) => *slot = Some(token),
+            Err(_) => return TestResult::Fail("isoch pool begin failed"),
+        }
+    }
+    // An event for a TRB that is not in flight latches nowhere.
+    let mut foreign = event(tokens[0].as_ref().unwrap(), 1, 0);
+    foreign[0] += 16 * 16;
+    if pool.record(foreign) {
+        return TestResult::Fail("foreign Transfer Event latched into the isoch pool");
+    }
+    // The second TD's event latches into its slot only: the
+    // first TD's waiter cannot take it, the second's can.
+    let second = event(tokens[1].as_ref().unwrap(), 1, 12);
+    if !pool.record(second) {
+        return TestResult::Fail("matching Transfer Event did not latch");
+    }
+    let first = tokens[0].as_ref().unwrap();
+    let taken_first = match pool.take_matching(&mut |ev| first.matches(ev)) {
+        Ok(taken) => taken,
+        Err(_) => return TestResult::Fail("take_matching failed on a foreign event"),
+    };
+    if taken_first.is_some() {
+        return TestResult::Fail("first TD's waiter took the second TD's event");
+    }
+    let second_token = tokens[1].as_ref().unwrap();
+    let taken_second = match pool.take_matching(&mut |ev| second_token.matches(ev)) {
+        Ok(taken) => taken,
+        Err(_) => return TestResult::Fail("take_matching failed on the matching event"),
+    };
+    match taken_second {
+        Some(ev) if ev == second => {}
+        _ => return TestResult::Fail("second TD's waiter did not take its own event"),
+    }
+    // The latched event completes the TD; the slot frees.
+    let consumed = Cell::new(0usize);
+    if pool.complete_isoch(42, second_token, &second, |bytes| consumed.set(bytes)) != Ok(Some(500))
+        || consumed.get() != 500
+    {
+        return TestResult::Fail("latched isoch event did not complete its TD");
+    }
+    if pool.slot_of(second_token).is_some() {
+        return TestResult::Fail("completed isoch TD still owns its pool slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_pool_routes_events_by_trb
+);
+
+/// Isochronous stop (#2060): claiming a stop on one TD retires
+/// the whole pipeline — Set TR Dequeue moves the dequeue past
+/// every posted TD, so the siblings go stale with the stopped
+/// one and the pool reopens for a fresh begin.
+fn smoke_xhci_isoch_pool_stop_retires_whole_pipeline() -> TestResult {
+    let mut pool = IsochPool::new();
+    let mut tokens: [Option<Token>; ISOCH_PIPELINE_DEPTH] = core::array::from_fn(|_| None);
+    for (index, slot) in tokens.iter_mut().enumerate().take(2) {
+        let free = match pool.free_slot() {
+            Some(free) => free,
+            None => return TestResult::Fail("isoch pool ran out of free slots early"),
+        };
+        let trb = 0x3000_0000u64 + (index as u64) * 16;
+        match pool.begin_on(free, id(), Direction::Out, 512, || trb) {
+            Ok(token) => *slot = Some(token),
+            Err(_) => return TestResult::Fail("isoch pool begin failed"),
+        }
+    }
+    let first = tokens[0].as_ref().unwrap();
+    let second = tokens[1].as_ref().unwrap();
+    let identity = match pool.begin_stop(42, first) {
+        Ok(identity) => identity,
+        Err(_) => return TestResult::Fail("isoch pool stop claim failed"),
+    };
+    // The stop identity names the stopped TD's TRB, not just its
+    // per-slot serial: both slots began at serial 1.
+    if identity.trb != 0x3000_0000 || identity.slot != 5 || identity.dci != 3 {
+        return TestResult::Fail("isoch stop identity mismatch");
+    }
+    if !matches!(pool.validate(42, first), Err(Error::Busy))
+        || !matches!(pool.validate(42, second), Ok(()))
+    {
+        return TestResult::Fail("stop claim did not quarantine only the stopped TD");
+    }
+    if pool.finish_stop(identity).is_err() {
+        return TestResult::Fail("isoch pool stop finish rejected its identity");
+    }
+    if pool.active()
+        || !matches!(pool.validate(42, first), Err(Error::Stale))
+        || !matches!(pool.validate(42, second), Err(Error::Stale))
+    {
+        return TestResult::Fail("sibling isoch TD survived the pipeline stop");
+    }
+    // The pool reopens: a fresh TD begins in the freed slot.
+    match pool.begin_on(0, id(), Direction::Out, 512, || 0x3000_1000) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("isoch pool did not reopen after the stop"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_pool_stop_retires_whole_pipeline
+);
+
+/// Isochronous stopping quarantine (#2060): while one TD is
+/// mid-stop, a sibling's genuine completion still latches (exact
+/// pointer match wins), but a forced event at the successor TRB
+/// is quarantined — it must never satisfy a later TD recycled
+/// onto that ring position.
+fn smoke_xhci_isoch_pool_stop_quarantines_successor_event() -> TestResult {
+    let mut pool = IsochPool::new();
+    let mut tokens: [Option<Token>; 2] = core::array::from_fn(|_| None);
+    for (index, slot) in tokens.iter_mut().enumerate() {
+        let free = match pool.free_slot() {
+            Some(free) => free,
+            None => return TestResult::Fail("isoch pool ran out of free slots early"),
+        };
+        let trb = 0x4000_0000u64 + (index as u64) * 16;
+        match pool.begin_on(free, id(), Direction::In, 512, || trb) {
+            Ok(token) => *slot = Some(token),
+            Err(_) => return TestResult::Fail("isoch pool begin failed"),
+        }
+    }
+    let first = tokens[0].as_ref().unwrap();
+    let second = tokens[1].as_ref().unwrap();
+    if pool.begin_stop(42, first).is_err() {
+        return TestResult::Fail("isoch pool stop claim failed");
+    }
+    // The sibling's genuine completion latches during the stop.
+    let sibling = event(second, 1, 0);
+    if !pool.record(sibling) {
+        return TestResult::Fail("sibling completion did not latch during the stop");
+    }
+    // A forced event at the successor TRB (the next ring position
+    // after the pipeline) is quarantined, never latched or queued.
+    let mut forced = event(second, 1, 0);
+    forced[0] += 16;
+    if !pool.record(forced) {
+        return TestResult::Fail("forced successor event was not quarantined");
+    }
+    let taken = match pool.take_matching(&mut |ev| second.matches(ev)) {
+        Ok(taken) => taken,
+        Err(_) => return TestResult::Fail("take_matching failed during the stop"),
+    };
+    match taken {
+        Some(ev) if ev == sibling => {}
+        _ => return TestResult::Fail("sibling waiter did not take its own event"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_pool_stop_quarantines_successor_event
 );

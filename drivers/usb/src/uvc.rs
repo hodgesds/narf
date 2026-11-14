@@ -885,13 +885,12 @@ pub trait UvcTransport: Sync {
     /// `isoch_in` calls on the same endpoint run against
     /// independent buffers and complete in submission order, so the
     /// pump can refill slots as they complete without reordering
-    /// packets. The default is 1 (single-shot): the real xHCI
-    /// transport keeps it — one isochronous TRB per endpoint shares
-    /// the endpoint's single 4096-byte DMA page, and Transfer Events
-    /// carry slot + endpoint identity only, so concurrent calls
-    /// would overwrite each other's payloads. True multi-TRB
-    /// pipelining with per-transfer buffers and TRB identity is
-    /// #885's work, not this method's.
+    /// packets. The default is 1 (single-shot): a transport with
+    /// shared per-endpoint state keeps it. The real xHCI
+    /// transport returns [`crate::xhci::ISOCH_PIPELINE_DEPTH`]
+    /// (4): each in-flight isoch TD stages in its own per-transfer
+    /// DMA page, and Transfer Events pointer-match the originating
+    /// Isoch TRB (#885 for the identity, #2060 for the buffers).
     fn isoch_pipeline_depth(&self) -> usize {
         1
     }
@@ -1002,14 +1001,13 @@ impl UvcTransport for crate::xhci::Xhci {
     }
 
     fn isoch_pipeline_depth(&self) -> usize {
-        // Single-shot only: `Xhci::isoch_in` stages every transfer
-        // in the endpoint's single 4096-byte DMA page and matches
-        // completions by slot + endpoint, so two concurrent calls
-        // would DMA into the same page (see #885). The pump's
-        // pipelined receive still runs for transports that advertise
-        // depth > 1; this transport advertises 1 until #885 lands
-        // per-transfer buffers and TRB identity.
-        1
+        // Pipelined (#2060): each in-flight isoch TD stages in
+        // its own per-transfer DMA page and completes against
+        // its own pointer-matched Transfer Event, so concurrent
+        // `isoch_in` calls on one endpoint run against
+        // independent buffers. Matches the pump's `ISOC_DEPTH`
+        // (4); the pump clamps to the smaller of the two.
+        crate::xhci::ISOCH_PIPELINE_DEPTH
     }
 
     fn bulk_in<'a>(
@@ -2093,11 +2091,10 @@ fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
 /// `isoch_pipeline_depth() > 1` leave this loop for the pipelined
 /// receive ([`pump_video_frames_pipelined`], which adopts the
 /// video crate's depth-4 `IsocScheduler`); bulk streams and
-/// depth-1 transports (the real xHCI path, until #885) stay on
-/// the single-shot receive below. Negotiation, activation, the
-/// stop protocol, and frame delivery are unchanged by the split;
-/// nothing here bakes in a single-shot assumption beyond that one
-/// call.
+/// depth-1 transports stay on the single-shot receive below.
+/// Negotiation, activation, the stop protocol, and frame delivery
+/// are unchanged by the split; nothing here bakes in a single-shot
+/// assumption beyond that one call.
 ///
 /// Lifecycle: the loop exits cleanly with `Ok(())` when
 /// [`take_pump_exit_request`] fires — checked at every loop top, and
@@ -2140,8 +2137,7 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
         .clamp(1, 4096);
     // #808: isochronous streams run pipelined when the transport can
     // serve concurrent transfers; bulk streams and depth-1 transports
-    // (the real xHCI path, until #885) stay on the single-shot loop
-    // below.
+    // stay on the single-shot loop below.
     if endpoint.transport == UvcStreamingTransport::Isochronous
         && transport.isoch_pipeline_depth() > 1
     {

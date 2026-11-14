@@ -62,3 +62,19 @@ fn smoke_xhci_dci_ep_index() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_dci_ep_index);
+
+/// Pipeline depth (#2060): the xHCI isoch pool depth is the UVC
+/// pump's `ISOC_DEPTH`, so the pipelined receive can actually
+/// keep that many transfers in flight against hardware — the
+/// pump clamps the advertised depth to the smaller of the two,
+/// and a drift here would silently leave pump slots unused.
+fn smoke_xhci_isoch_pipeline_depth_matches_uvc_scheduler() -> TestResult {
+    if ISOCH_PIPELINE_DEPTH != narf_drivers_video::uvc::ISOC_DEPTH {
+        return TestResult::Fail("xHCI isoch pool depth drifted from the UVC scheduler depth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_pipeline_depth_matches_uvc_scheduler
+);

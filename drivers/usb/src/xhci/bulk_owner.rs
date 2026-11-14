@@ -2,6 +2,11 @@
 //!
 //! A token is a receipt, not ownership of hardware DMA. Dropping it or a
 //! future awaiting it never makes the endpoint scratch page reusable.
+//!
+//! Isochronous endpoints hold an [`IsochPool`] instead of a single
+//! [`State`]: up to [`ISOCH_PIPELINE_DEPTH`] TDs in flight at once
+//! (#2060), each with its own owner state, so Transfer Events route
+//! by originating TRB pointer to the slot that owns them.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -68,6 +73,10 @@ pub(super) struct StopIdentity {
     pub serial: u64,
     pub slot: u8,
     pub dci: u8,
+    /// Originating TRB pointer. Serials are per-owner-state, so
+    /// two isoch pipeline slots can hold the same serial at once;
+    /// the TRB pointer is what disambiguates them (#2060).
+    pub trb: u64,
 }
 
 #[derive(Debug)]
@@ -94,6 +103,62 @@ impl State {
     }
     pub fn active(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Originating TRB pointer of the retained TD, if any. The
+    /// isoch pool routes tokens to slots by this pointer (#2060):
+    /// ring positions are distinct while a TD is in flight, so it
+    /// identifies the slot even when two slots hold the same
+    /// per-state serial.
+    pub(super) fn pending_trb(&self) -> Option<u64> {
+        self.pending.as_ref().map(|pending| pending.trb)
+    }
+
+    /// Latch `event` into the retained TD's completion iff it
+    /// pointer-matches that TD. Unlike [`State::record`], no
+    /// stopping quarantine: the isoch pool applies quarantine
+    /// only after no slot matched exactly, so a stopping TD never
+    /// swallows a sibling's genuine completion (#2060).
+    pub(super) fn record_exact(&mut self, event: super::event_wait::Event) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        if super::completion::transfer_matches(
+            &event,
+            pending.identity.slot,
+            pending.identity.dci,
+            pending.trb,
+        ) {
+            pending.completion.record(event);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when this state is mid-stop and `event` is a Transfer
+    /// Event for the retained TD's endpoint: the event must be
+    /// quarantined, never latched or queued. Stop Endpoint can
+    /// force an event at the successor TRB, which a later TD would
+    /// otherwise pointer-match after the ring address is reused.
+    pub(super) fn quarantines(&self, event: &super::event_wait::Event) -> bool {
+        let Some(pending) = self.pending.as_ref() else {
+            return false;
+        };
+        pending.stopping
+            && event[3] & (0x3f << 10) == 32 << 10
+            && event[3] >> 24 == u32::from(pending.identity.slot)
+            && event[3] & (0x1f << 16) == u32::from(pending.identity.dci) << 16
+    }
+
+    /// Drop the retained TD without a terminal completion. Only
+    /// the isochronous stop coordinator may call this, after Set
+    /// TR Dequeue Pointer proved the endpoint's whole posted
+    /// pipeline hardware-dead: a stop retires every in-flight
+    /// isoch TD on the endpoint, not just the token it was
+    /// claimed for (#2060).
+    pub(super) fn force_reset(&mut self) {
+        self.pending = None;
     }
 
     /// The infallible publication closure runs only after exclusive scratch
@@ -221,12 +286,14 @@ impl State {
             serial: p.serial,
             slot: p.identity.slot,
             dci: p.identity.dci,
+            trb: p.trb,
         })
     }
     pub fn validate_stop(&self, id: StopIdentity) -> Result<(), Error> {
         let p = self.pending.as_ref().ok_or(Error::Stale)?;
         if !p.stopping
             || p.serial != id.serial
+            || p.trb != id.trb
             || p.identity.generation != id.generation
             || p.identity.slot != id.slot
             || p.identity.dci != id.dci
@@ -267,6 +334,7 @@ impl State {
             serial: p.serial,
             slot: p.identity.slot,
             dci: p.identity.dci,
+            trb: p.trb,
         }))
     }
     /// Only the completed Reset Endpoint + Set Dequeue coordinator may
@@ -353,6 +421,158 @@ impl State {
         consume(transferred);
         self.pending = None;
         Ok(Some(transferred))
+    }
+}
+
+/// Maximum concurrent isochronous TDs on one endpoint (#2060).
+/// Matches the UVC pipelined pump's `ISOC_DEPTH` (4,
+/// `narf_drivers_video::uvc`): the pump clamps the advertised
+/// depth to the smaller of the two, so advertising more would
+/// never be used and advertising fewer would waste pump slots.
+/// One pool slot owns one 4 KiB DMA page in the endpoint state;
+/// the pool itself holds only the owner states.
+pub const ISOCH_PIPELINE_DEPTH: usize = 4;
+
+/// Per-endpoint isochronous pipeline (#2060): one single-pending
+/// owner state per in-flight TD, so up to
+/// [`ISOCH_PIPELINE_DEPTH`] Isoch TDs can be posted on one
+/// endpoint at once, each staging in its own DMA page (the
+/// endpoint state holds one page per slot, indexed the same
+/// way). Completion identity stays per-TD: Transfer Events
+/// route by originating TRB pointer, and a stop retires the
+/// whole pipeline — Set TR Dequeue Pointer moves the dequeue
+/// past every posted TD, so siblings of a stopped TD are
+/// hardware-dead too and their tokens go stale with it.
+///
+/// The pool never touches DMA itself: callers resolve a slot's
+/// page from the token's slot ([`IsochPool::slot_of`]) and stage
+/// through the publish closure of [`IsochPool::begin_on`].
+#[derive(Debug)]
+pub(super) struct IsochPool {
+    slots: [State; ISOCH_PIPELINE_DEPTH],
+}
+impl IsochPool {
+    pub fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| State::new()),
+        }
+    }
+
+    /// Any TD in flight on this endpoint.
+    pub fn active(&self) -> bool {
+        self.slots.iter().any(State::active)
+    }
+
+    /// First slot with no TD in flight, if any. Advisory: the
+    /// caller must still begin through [`IsochPool::begin_on`],
+    /// which re-checks the slot is free and reports `Busy`.
+    pub fn free_slot(&self) -> Option<usize> {
+        self.slots.iter().position(|slot| !slot.active())
+    }
+
+    /// Slot holding `token`'s TD, by originating TRB pointer.
+    /// `None` when no slot holds it (completed, retired, or a
+    /// foreign token).
+    pub fn slot_of(&self, token: &Token) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.pending_trb() == Some(token.trb))
+    }
+
+    /// Begin one TD in `slot` (see [`IsochPool::free_slot`]).
+    /// Same contract as [`State::begin`]: the publish closure
+    /// runs only after exclusive ownership is recorded, and a
+    /// busy slot reports `Busy` without publishing.
+    pub fn begin_on(
+        &mut self,
+        slot: usize,
+        id: Endpoint,
+        direction: Direction,
+        length: usize,
+        publish: impl FnOnce() -> u64,
+    ) -> Result<Token, Error> {
+        let state = self.slots.get_mut(slot).ok_or(Error::Stale)?;
+        state.begin(id, direction, length, publish)
+    }
+
+    /// Route a Transfer Event to the slot whose TD it names.
+    /// Exact pointer matches win over the stopping quarantine:
+    /// a sibling's genuine completion latches even while another
+    /// slot is mid-stop. Only when no slot matched does a
+    /// stopping slot quarantine the event (Stop Endpoint can
+    /// force one at a successor TRB).
+    pub fn record(&mut self, event: super::event_wait::Event) -> bool {
+        for slot in self.slots.iter_mut() {
+            if slot.record_exact(event) {
+                return true;
+            }
+        }
+        self.slots.iter().any(|slot| slot.quarantines(&event))
+    }
+
+    pub fn take_matching(
+        &mut self,
+        predicate: &mut dyn FnMut(&super::event_wait::Event) -> bool,
+    ) -> Result<Option<super::event_wait::Event>, Error> {
+        for slot in self.slots.iter_mut() {
+            if let Some(event) = slot.take_matching(predicate)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Route validation to the slot holding `token`'s TD.
+    pub fn validate(&self, generation: u64, token: &Token) -> Result<(), Error> {
+        let slot = self.slot_of(token).ok_or(Error::Stale)?;
+        self.slots[slot].validate(generation, token)
+    }
+
+    /// Complete `token`'s TD from its slot's owner state, same
+    /// isoch discipline as [`State::complete_isoch`].
+    pub fn complete_isoch(
+        &mut self,
+        generation: u64,
+        token: &Token,
+        event: &[u32; 4],
+        consume: impl FnOnce(usize),
+    ) -> Result<Option<usize>, Error> {
+        let slot = self.slot_of(token).ok_or(Error::Stale)?;
+        self.slots[slot].complete_isoch(generation, token, event, consume)
+    }
+
+    /// Route a stop claim to the slot holding `token`'s TD.
+    pub fn begin_stop(&mut self, generation: u64, token: &Token) -> Result<StopIdentity, Error> {
+        let slot = self.slot_of(token).ok_or(Error::Stale)?;
+        self.slots[slot].begin_stop(generation, token)
+    }
+
+    pub fn validate_stop(&self, id: StopIdentity) -> Result<(), Error> {
+        let slot = self
+            .slots
+            .iter()
+            .position(|slot| slot.pending_trb() == Some(id.trb))
+            .ok_or(Error::Stale)?;
+        self.slots[slot].validate_stop(id)
+    }
+
+    /// Finish a stop: validate the claimed identity, release its
+    /// TD, then release every sibling TD too. Set TR Dequeue
+    /// Pointer proved the endpoint's dequeue past all posted
+    /// TDs, so the siblings are hardware-dead — their tokens go
+    /// stale and their waiters report the timeout, never a late
+    /// completion aliased onto a future transfer.
+    pub fn finish_stop(&mut self, id: StopIdentity) -> Result<(), Error> {
+        let slot = self
+            .slots
+            .iter()
+            .position(|slot| slot.pending_trb() == Some(id.trb))
+            .ok_or(Error::Stale)?;
+        self.slots[slot].finish_stop(id)?;
+        for slot in self.slots.iter_mut() {
+            slot.force_reset();
+        }
+        Ok(())
     }
 }
 

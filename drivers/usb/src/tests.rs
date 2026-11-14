@@ -10075,8 +10075,9 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         // The modelled device serves concurrent `isoch_in` calls
         // from independent staged packets, so it advertises the
         // full scheduler depth — the transport the #808 pipeline
-        // fixture proves against. (The real xHCI transport keeps
-        // depth 1: one shared DMA page per endpoint, see #885.)
+        // fixture proves against. (The real xHCI transport
+        // advertises the same depth since #2060: one DMA page
+        // per in-flight isoch TD.)
         narf_drivers_video::uvc::ISOC_DEPTH
     }
 
