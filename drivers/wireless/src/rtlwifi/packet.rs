@@ -254,8 +254,14 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
         }
-        // Non-QoS DATA: mac80211 skb->priority0 on BE.
-        2 if fc & 0x03f0 == 0x0100 => Ok((4, 1 << 1, 0)),
+        // Non-QoS DATA: mac80211 skb->priority0 on BE. A Null DATA frame
+        // (subtype 4, To-DS) rides BE the same way: Linux sends nullfunc
+        // frames through the ordinary DATA path and `wants_report` asks
+        // for a TX report on them, but this gate only ever admitted
+        // subtype 0, so every Null submit died here with `Error::Packet`
+        // (the 8192EE path carries its own bypass for the header-only
+        // case; the 8723BE TX-report test's 30-byte Null had none).
+        2 if fc & 0x03f0 == 0x0100 || fc & 0x03f0 == 0x0140 => Ok((4, 1 << 1, 0)),
         // QoS DATA TID0..7 with normal ACK, no EOSP/A-MSDU/TXOP/queue size.
         // rtl_pci_tx queues `ieee802_1d_to_ac[priority]` on its own linked
         // ring and rtl88ee `_rtl88ee_map_hwqueue_to_fwqueue` sets TXD1

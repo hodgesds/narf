@@ -444,7 +444,9 @@ kernel_test_in!(
 /// an HT peer on the 40 MHz owner installs `RATR_INX_WIRELESS_NGB` (0)
 /// with the `H2C_RA_MASK` command sent. The join-flow install is covered
 /// by the GB test above; the HT-specific code is the N-row computation
-/// (`h2c::rate_mask`) and the NGB index.
+/// (`h2c::rate_mask`) and the NGB index. The command takes box 0 here:
+/// it is the first H2C command on this owner, unlike the join flow
+/// where KEEP_ALIVE takes box 0 first.
 fn smoke_rtl8723be_ht40_rate_mask_n_rows() -> TestResult {
     let Some((mut owner, port)) = owner40() else {
         return TestResult::Fail("fixture");
@@ -462,7 +464,7 @@ fn smoke_rtl8723be_ht40_rate_mask_n_rows() -> TestResult {
         || owner.rate_mask() != Some(0)
         || owner.packet.be8723.link != Some((peer, true, 0))
         || port
-            .wrote(1, h2c::REG_HMEBOX_0 + 4, h2c::H2C_RA_MASK.into())
+            .wrote(1, h2c::REG_HMEBOX_0, h2c::H2C_RA_MASK.into())
             .is_none()
     {
         return TestResult::Fail("HT40 RA mask install (NGB, ratr_index 0)");
