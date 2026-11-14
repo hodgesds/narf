@@ -2118,6 +2118,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-firmware-fdt",
  "narf-init",
  "narf-kernel-test",
  "narf-lib",

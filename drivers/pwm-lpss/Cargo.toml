@@ -19,6 +19,7 @@ narf-capabilities = { path = "../../capabilities" }
 narf-console      = { path = "../../console" }
 narf-init         = { path = "../../init" }
 narf-pwm          = { path = "../../pwm" }
+narf-firmware-fdt = { path = "../../firmware/fdt" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 async-trait       = "0.1"
