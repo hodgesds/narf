@@ -14,12 +14,16 @@
 
 use super::{
     board, eeprom::Identity, field, ini::Tables, power, power::Image, rmw, serdes::PllPwrsave,
-    Revision,
+    Chip, Revision,
 };
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 
 const AR_CR: u64 = 0x0008;
 const AR_CR_RXD: u32 = 0x20;
+/// `reg_mci.h::AR_GLB_SWREG_DISCONT_MODE` /
+/// `AR_GLB_SWREG_DISCONT_EN_BT_WLAN`.
+const AR_GLB_SWREG_DISCONT_MODE: u64 = 0x2002c;
+const AR_GLB_SWREG_DISCONT_EN_BT_WLAN: u32 = 0x3;
 const AR_IER: u64 = 0x0024;
 const AR_Q_TXD: u64 = 0x0880;
 const AR_GTXTO: u64 = 0x0064;
@@ -142,11 +146,17 @@ fn doubler_fix(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
     Ok(())
 }
 
-/// `ar9003_hw_spur_mitigate_mrc_cck` for an AR9300 (fixed list, range 10).
-fn spur_mrc_cck(io: &mut impl RegisterIo, frequency: u16) -> Result<(), BringUpError> {
-    for spur in CCK_SPURS {
+/// `ar9003_hw_spur_mitigate_mrc_cck` for a 20 MHz channel: the fixed
+/// AR9300 list at range 10, and the AR9462 branch (`ar9003_phy.c:269,275`)
+/// at range 5 with the first and last spurs (2420, 2480) skipped.
+fn spur_mrc_cck(io: &mut impl RegisterIo, chip: Chip, frequency: u16) -> Result<(), BringUpError> {
+    let range = if chip == Chip::Ar9462 { 5 } else { 10 };
+    for (i, spur) in CCK_SPURS.into_iter().enumerate() {
+        if chip == Chip::Ar9462 && (i == 0 || i == 3) {
+            continue;
+        }
         let offset = spur - i32::from(frequency);
-        if offset.abs() < 10 {
+        if offset.abs() < range {
             let mut cck = (offset.abs() << 19) / 11;
             if offset < 0 {
                 cck = -cck;
@@ -421,6 +431,13 @@ pub(in crate::ath9k) fn prepare(
     }
     // ~ADHOC_MCAST_KEYID | AGG_WEP_FIX | AGG_WEP | CFP_IGNORE.
     io.write32(AR_PCU_MISC_MODE2, (misc & !0x40) | 0x8 | 0x2_0000 | 0x80);
+    // `ar9003_hw_override_ini`'s AR9462/AR9565 arm (`ar9003_phy.c:709`):
+    // the BT/WLAN switch-register discontinuous mode, before the `CL_CAL`
+    // readback below. The `TX_IQ_CAL` half of that arm is the calibration
+    // readback in `calib::run`, not a preparation write.
+    if matches!(revision.chip, Chip::Ar9462 | Chip::Ar9565) {
+        io.write32(AR_GLB_SWREG_DISCONT_MODE, AR_GLB_SWREG_DISCONT_EN_BT_WLAN);
+    }
     let cl = io.read32(AR_PHY_CL_CAL_CTL);
     if cl == u32::MAX {
         return Err(BringUpError::DeviceGone);
@@ -450,7 +467,7 @@ pub(in crate::ath9k) fn prepare(
     let apm = image[super::eeprom::field::MISC_CONFIGURATION] & 0x8 != 0;
     let selfgen_mask = if apm && tx == 7 { 3 } else { tx };
     io.write32(AR_SELFGEN_MASK, u32::from(selfgen_mask));
-    power::program(io, &plan)?;
+    power::program(io, revision.chip, &plan)?;
 
     // ar9003_hw_set_rfmode: 2 GHz DYNAMIC; 5 GHz OFDM + fast clock
     // DYNAMIC | DYN_CCK_DISABLE.
@@ -463,7 +480,7 @@ pub(in crate::ath9k) fn prepare(
     let (mantissa, exponent) = slope(9 * coefficient / 10);
     field(io, AR_PHY_SGI_DELTA, 0x7fff0, 4, mantissa)?;
     field(io, AR_PHY_SGI_DELTA, 0xf, 0, exponent)?;
-    spur_mrc_cck(io, frequency)?;
+    spur_mrc_cck(io, revision.chip, frequency)?;
     spur_ofdm(io, image, frequency)?;
     board::set_board_values(io, revision.chip, image, frequency, rx, tx)?;
     // ar9003_hw_set_channel.

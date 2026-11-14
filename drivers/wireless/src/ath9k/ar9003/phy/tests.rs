@@ -289,6 +289,134 @@ kernel_test_in!(
     smoke_ath9k_ar9300_prepare_channel_registers
 );
 
+fn smoke_ath9k_ar9462_mrc_cck_spur_and_override_ini() -> TestResult {
+    // `ar9003_hw_spur_mitigate_mrc_cck` (`ar9003_phy.c:269,275`): the
+    // AR9462 branch uses range 5 and skips the 2420 and 2480 spurs;
+    // `ar9003_hw_override_ini` (`ar9003_phy.c:709`) writes the BT/WLAN
+    // switch-register discontinuous mode on AR9462/AR9565.
+    let revision = Revision {
+        chip: Chip::Ar9462,
+        mac_rev: 2,
+        pcie: true,
+    };
+    let image = AR9300_DEFAULT;
+    let id = identity(&image);
+    // 2412: the 2420 spur is skipped (offset 8 >= 5), so no mitigation.
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9462, 0, 0),
+        &image,
+        2412,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || io.regs.get(&AR_GLB_SWREG_DISCONT_MODE) != Some(&AR_GLB_SWREG_DISCONT_EN_BT_WLAN)
+        || io.regs[&AR_PHY_AGC_CONTROL] & 0x3c0 != 5 << 6
+        || io.regs[&AR_PHY_CCK_SPUR_MIT] & 1 != 0
+    {
+        return TestResult::Fail("AR9462 2412 spur mitigation / override_ini differs");
+    }
+    // 2437: the 2440 spur mitigates (offset 3 < 5).
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9462, 0, 0),
+        &image,
+        2437,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || io.regs[&AR_PHY_AGC_CONTROL] & 0x3c0 != 7 << 6
+        || io.regs[&AR_PHY_CCK_SPUR_MIT] & 1 != 1
+    {
+        return TestResult::Fail("AR9462 2437 spur mitigation differs");
+    }
+    // 2417: the 2420 spur is skipped and 2440 is out of range (23 >= 5).
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9462, 0, 0),
+        &image,
+        2417,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || io.regs[&AR_PHY_AGC_CONTROL] & 0x3c0 != 5 << 6
+        || io.regs[&AR_PHY_CCK_SPUR_MIT] & 1 != 0
+    {
+        return TestResult::Fail("AR9462 2417 spur mitigation differs");
+    }
+    // Contrast: the AR9300 mitigates at 2412 (2420 offset 8 < 10) and
+    // writes no switch-register mode.
+    let revision = Revision {
+        chip: Chip::Ar9300,
+        mac_rev: 3,
+        pcie: true,
+    };
+    let mut io = Regs::default();
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+        &image,
+        2412,
+        0xe0,
+        40,
+    )
+    .is_err()
+        || io.regs.contains_key(&AR_GLB_SWREG_DISCONT_MODE)
+        || io.regs[&AR_PHY_AGC_CONTROL] & 0x3c0 != 7 << 6
+        || io.regs[&AR_PHY_CCK_SPUR_MIT] & 1 != 1
+    {
+        return TestResult::Fail("AR9300 2412 spur mitigation / override_ini differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_mrc_cck_spur_and_override_ini
+);
+
+fn smoke_ath9k_ar9462_power_control_override_writes_tpc19_b1() -> TestResult {
+    // `ar9003_hw_power_control_override`'s `AR_SREV_9462_20_OR_LATER`
+    // arm (`ar9003_eeprom.c:4947`): the temperature slope also lands in
+    // the chain-1 `AR_PHY_TPC_19_B1`; other chips write only `TPC_19`.
+    let Ok(plan) = power::plan(&AR9300_DEFAULT, 2437, 0xe0, 40, 3) else {
+        return TestResult::Fail("AR9462 power plan was refused");
+    };
+    let slope = (plan.temp_slope as u32) & 0xff;
+    let mut io = Regs::default();
+    if power::program(&mut io, Chip::Ar9462, &plan).is_err()
+        || io.regs.get(&0xb440) != Some(&slope)
+        || io.regs.get(&0xa440) != Some(&slope)
+    {
+        return TestResult::Fail("AR9462 TPC_19_B1 temperature slope differs");
+    }
+    let mut io = Regs::default();
+    if power::program(&mut io, Chip::Ar9300, &plan).is_err()
+        || io.regs.contains_key(&0xb440)
+        || io.regs.get(&0xa440) != Some(&slope)
+    {
+        return TestResult::Fail("AR9300 power program wrote TPC_19_B1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_power_control_override_writes_tpc19_b1
+);
+
 fn smoke_ath9k_ar9300_board_values_follow_eeprom_flags() -> TestResult {
     let mut image = AR9300_DEFAULT;
     // Internal regulator on, drive strength, quick drop, xLNA bias.

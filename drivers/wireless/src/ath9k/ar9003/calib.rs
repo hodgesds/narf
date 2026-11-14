@@ -20,8 +20,9 @@
 //! `ATH9K_HW_CAP_RTT` nor MCI), the `ath9k_hw_reset` tail's
 //! `ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`, and the periodic
 //! `ar9003_hw_calibrate` driven by `link.c::ath_ani_calibrate` (ANI is not
-//! part of this owner), with the AR9300 `ar9003_hw_set_nf_limits` limits
-//! and the `ar9300_cca_regs` control-chain NF registers. On MCI parts
+//! part of this owner), with the per-chip `ar9003_hw_set_nf_limits` limits
+//! (AR9300, AR9462/AR9565) and the `ar9300_cca_regs` control-chain NF
+//! registers. On MCI parts
 //! the MCI calibration handshake (`mci::init_cal_req` / `init_cal_done`,
 //! `mci::start_reset` / `end_reset`) wraps this calibration when the
 //! link is enabled; the handshake lives in `mci`, not here.
@@ -40,6 +41,21 @@
 //! aborts on a saturated (±63) coefficient on AR9565
 //! (`ar9003_calib.c:274`); the calibration is still marked done, only
 //! the writes and the `IQCORR_ENABLE` are skipped.
+//!
+//! `ar9003_hw_override_ini` (`ar9003_phy.c:709`) gates `TX_IQ_CAL` once
+//! more on AR9462/AR9565: after the INI tables ran it reads
+//! `AR_PHY_TX_IQCAL_CONTROL_0` `ENABLE_TXIQ_CAL` and clears the flag
+//! when the bit is clear, so `init_cal_pcoem` skips both the `DELPT`
+//! program and the `TX_IQ_ON_AGC_CAL` block (`skip_tx_iqcal`). `run`
+//! reads the bit live — nothing writes the register between
+//! `phy::prepare` (whose `override_ini` section is the Linux read point)
+//! and this calibration — and carries the decision in the `Report`,
+//! which a fast channel change reuses instead of re-reading:
+//! `init_cal_pcoem` itself sets/clears the bit, so a re-read would
+//! disagree with the `enabled_cals` Linux keeps. No INI row writes the
+//! register (checked across the 9462 2p0/2p1, 9565 1p0/1p1 and 2p2
+//! headers @ `cbbddb6`), so the fixture states the bit per case and no
+//! reset value is assumed.
 //!
 //! TX IQ calibration as Linux runs it on AR9300: `ar9003_hw_init_cal_settings`
 //! enables `TX_IQ_CAL`, so `init_cal_pcoem` programs the
@@ -73,7 +89,7 @@
 //! modeling first.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use super::{eeprom::Identity, field, phy::Prepared, rmw, Revision};
+use super::{eeprom::Identity, field, phy::Prepared, rmw, Chip, Revision};
 use crate::ath9k::{
     calibration::{ar9287::Limits, Io},
     identity::{BringUpError, RegisterIo},
@@ -247,12 +263,32 @@ fn chains(mask: u8) -> impl Iterator<Item = usize> {
     (0..3usize).filter(move |c| mask & (1 << c) != 0)
 }
 
-/// `ar9003_hw_set_nf_limits` for the band.
-pub(in crate::ath9k) fn limits(five_ghz: bool) -> Limits {
-    if five_ghz {
-        LIMITS_5GHZ
+/// `AR_PHY_CCA_{NOM,MIN_GOOD,MAX_GOOD}_VAL_9462_2GHZ`.
+pub(in crate::ath9k) const LIMITS_9462_2GHZ: Limits = Limits {
+    nominal: -127,
+    min: -127,
+    max: -60,
+};
+/// `AR_PHY_CCA_{NOM,MIN_GOOD,MAX_GOOD}_VAL_9462_5GHZ`.
+pub(in crate::ath9k) const LIMITS_9462_5GHZ: Limits = Limits {
+    nominal: -127,
+    min: -127,
+    max: -60,
+};
+
+/// `ar9003_hw_set_nf_limits` for the chip and band
+/// (`ar9003_phy.c:1376`): AR9462/AR9565 override the 2 GHz and 5 GHz
+/// minima and nominals to -127 (the maxima stay the AR9300 -60).
+pub(in crate::ath9k) fn limits(revision: &Revision, five_ghz: bool) -> Limits {
+    let (two, five) = if matches!(revision.chip, Chip::Ar9462 | Chip::Ar9565) {
+        (LIMITS_9462_2GHZ, LIMITS_9462_5GHZ)
     } else {
-        LIMITS_2GHZ
+        (LIMITS_2GHZ, LIMITS_5GHZ)
+    };
+    if five_ghz {
+        five
+    } else {
+        two
     }
 }
 
@@ -378,6 +414,12 @@ pub struct Report {
     /// post-processing succeeded; `None` on AR9300/AR9580 and when the TX
     /// IQ calibration failed.
     pub tx_iq_cal: Option<TxIqCal>,
+    /// `ar9003_hw_override_ini`'s `TX_IQ_CAL` decision for the generation
+    /// this report calibrates (see the module docs): `init_cal_settings`'
+    /// SREV gate AND, on AR9462/AR9565, the `AR_PHY_TX_IQCAL_CONTROL_0`
+    /// readback. A fast channel change reuses it. A failed TX IQ
+    /// calibration leaves it true while `tx_iq_cal` is `None`.
+    pub tx_iq_cal_enabled: bool,
     /// `ar9003_hw_cl_cal_post_proc`'s saved carrier-leak table
     /// (`caldata->tx_clcal`, `TXCLCAL_DONE`): `Some` only when the
     /// carrier-leak calibration ran and the AGC calibration reported
@@ -417,6 +459,9 @@ impl Calibration {
     /// `Periodic::start` performs the reset tail's NF load. `revision`
     /// gates the per-chip branches: `TX_IQ_ON_AGC_CAL` (AR9485, AR9462,
     /// AR9565) runs the TX IQ post-processing after the AGC calibration.
+    /// On AR9462/AR9565 `ar9003_hw_override_ini`'s `TX_IQ_CAL` readback
+    /// further gates both the `DELPT` program and that block (see the
+    /// module docs); the decision is carried in the `Report`.
     ///
     /// # Safety
     /// Exclusive identified AR9003 part directly after `phy::prepare` for
@@ -453,7 +498,7 @@ impl Calibration {
             state: &mut self.state,
         };
         let five = prepared.frequency >= 4800;
-        let limits = limits(five);
+        let limits = limits(revision, five);
 
         // ar9003_hw_init_bb: activate, then ath9k_hw_synth_delay (full rate).
         let synth = read(io, AR_PHY_RX_DELAY)? & AR_PHY_RX_DELAY_DELAY;
@@ -467,9 +512,15 @@ impl Calibration {
         }
         // `ar9003_hw_init_cal_settings` (`:321-323`) + `init_cal_pcoem`:
         // `TX_IQ_CAL` programs `DELPT`; on `TX_IQ_ON_AGC_CAL` chips the
-        // AGC calibration also runs the TX IQ calibration.
+        // AGC calibration also runs the TX IQ calibration. On
+        // AR9462/AR9565 the `TX_IQ_CAL` half is further gated by
+        // `ar9003_hw_override_ini`'s `AR_PHY_TX_IQCAL_CONTROL_0`
+        // readback (see the module docs), and `init_cal_pcoem` skips
+        // both the `DELPT` program and the `TX_IQ_ON_AGC_CAL` block when
+        // it is clear.
         let cals = enabled_cals(revision);
-        if cals.tx_iq_cal {
+        let tx_iq_enabled = tx_iq_cal_enabled(io, revision, &cals)?;
+        if tx_iq_enabled {
             field(
                 io,
                 tx_iqcal_control_1(revision.ar9485()),
@@ -478,7 +529,7 @@ impl Calibration {
                 DELPT,
             )?;
         }
-        let txiqcal_done = if cals.tx_iq_on_agc_cal {
+        let txiqcal_done = if tx_iq_enabled && cals.tx_iq_on_agc_cal {
             // Fresh channel calibration data: `TXIQCAL_DONE` is clear, as
             // `ath9k_hw_reset` leaves it.
             rmw(
@@ -565,6 +616,7 @@ impl Calibration {
             carrier_leak,
             default_nf,
             tx_iq_cal,
+            tx_iq_cal_enabled: tx_iq_enabled,
             tx_clcal,
         };
         self.report = Some(report);
@@ -634,7 +686,7 @@ impl Calibration {
             state: &mut self.state,
         };
         let five = prepared.frequency >= 4800;
-        let limits = limits(five);
+        let limits = limits(revision, five);
 
         // Use chip chainmask only for calibration.
         set_chain_masks(io, identity, rx, prepared.selfgen_mask)?;
@@ -657,9 +709,13 @@ impl Calibration {
         // runs the TX IQ calibration — fresh whenever the saved
         // coefficients are absent, and (Linux's unconditional
         // `txiqcal_done = run_agc_cal = true`) whenever they are present.
+        // The decision is the carried `override_ini` one from `saved`
+        // (see the module docs), not a fresh readback: `init_cal_pcoem`
+        // rewrites `AR_PHY_TX_IQCAL_CONTROL_0`, so a re-read would
+        // disagree with the `enabled_cals` Linux keeps.
         let cals = enabled_cals(revision);
         let mut txiqcal_done = false;
-        if cals.tx_iq_cal {
+        if saved.tx_iq_cal_enabled {
             field(
                 io,
                 tx_iqcal_control_1(revision.ar9485()),
@@ -764,6 +820,7 @@ impl Calibration {
             carrier_leak,
             default_nf,
             tx_iq_cal,
+            tx_iq_cal_enabled: saved.tx_iq_cal_enabled,
             tx_clcal,
         };
         self.report = Some(report);
@@ -789,6 +846,26 @@ pub(in crate::ath9k) fn enabled_cals(revision: &Revision) -> EnabledCals {
         tx_iq_cal,
         tx_iq_on_agc_cal: tx_iq_cal && revision.ar9485_or_later() && !revision.ar9340(),
     }
+}
+
+/// `ar9003_hw_override_ini`'s `TX_IQ_CAL` decision
+/// (`ar9003_phy.c:709`): `init_cal_settings`' SREV gate, and on
+/// AR9462/AR9565 the `AR_PHY_TX_IQCAL_CONTROL_0` `ENABLE_TXIQ_CAL`
+/// readback after the INI tables ran. No INI row writes that register
+/// (see the module docs), so the fixture states the bit per case and no
+/// reset value is assumed here.
+fn tx_iq_cal_enabled(
+    io: &mut impl RegisterIo,
+    revision: &Revision,
+    cals: &EnabledCals,
+) -> Result<bool, BringUpError> {
+    if !cals.tx_iq_cal {
+        return Ok(false);
+    }
+    if !matches!(revision.chip, Chip::Ar9462 | Chip::Ar9565) {
+        return Ok(true);
+    }
+    Ok(read(io, tx_iqcal_control_0(revision.ar9485()))? & TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL != 0)
 }
 
 /// `struct ath9k_hw_cal_data`'s TX IQ calibration result
@@ -1507,7 +1584,7 @@ impl Periodic {
             revision: *revision,
             rx_chainmask: report.rx_chainmask,
             tx_chainmask: report.tx_chainmask,
-            limits: limits(report.five_ghz),
+            limits: limits(revision, report.five_ghz),
             hist: core::array::from_fn(|c| [report.default_nf[c]; HIST]),
             index: [0; 3],
             priv_nf: report.default_nf,

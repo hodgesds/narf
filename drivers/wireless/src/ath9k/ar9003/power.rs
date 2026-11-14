@@ -20,6 +20,7 @@ use super::{
     eeprom::{fbin2freq, field, modal, modal_base},
     field as set_field, rmw,
     templates::AR9300_EEPROM_BYTES,
+    Chip,
 };
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 
@@ -29,6 +30,8 @@ pub(in crate::ath9k) type Image = [u8; AR9300_EEPROM_BYTES];
 pub(in crate::ath9k) const MAX_RATE_POWER: u16 = 63;
 /// `ar9300RateSize`.
 pub(in crate::ath9k) const RATES: usize = 36;
+/// `ar9003_phy.h::AR_PHY_TPC_19_B1(ah)` (`AR_SM1_BASE + 0x240`).
+const AR_PHY_TPC_19_B1: u64 = 0xb440;
 const LEGACY_6_24: usize = 0;
 const LEGACY_1L_5L: usize = 4;
 const HT20_0_8_16: usize = 8;
@@ -446,7 +449,11 @@ pub(in crate::ath9k) fn plan(
 /// Program a [`Plan`]: `AR_PHY_TX_FORCED_GAIN` 0, the rate words, the
 /// open-loop gain delta / error-estimate / temperature slope overrides,
 /// `AR_TPC` and `AR_PHY_PWRTX_MAX` 0 (TPC disabled).
-pub(in crate::ath9k) fn program(io: &mut impl RegisterIo, plan: &Plan) -> Result<(), BringUpError> {
+pub(in crate::ath9k) fn program(
+    io: &mut impl RegisterIo,
+    chip: Chip,
+    plan: &Plan,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -472,6 +479,12 @@ pub(in crate::ath9k) fn program(io: &mut impl RegisterIo, plan: &Plan) -> Result
         }
     }
     set_field(io, 0xa440, 0xff, 0, plan.temp_slope as u32)?;
+    // `ar9003_hw_power_control_override`'s `AR_SREV_9462_20_OR_LATER` arm
+    // (`ar9003_eeprom.c:4947`): the same temperature slope into the
+    // chain-1 `AR_PHY_TPC_19_B1` (every in-tree AR9462 is 2.0/2.1).
+    if chip == Chip::Ar9462 {
+        set_field(io, AR_PHY_TPC_19_B1, 0xff, 0, plan.temp_slope as u32)?;
+    }
     set_field(io, 0xa43c, 0xff, 0, plan.temperature[0] as u32)?;
     // ar9003_hw_selfgen_tpc_txpower: ACK/CTS at the lowest rate's power.
     let ack = u32::from(if plan.frequency < 4000 {
