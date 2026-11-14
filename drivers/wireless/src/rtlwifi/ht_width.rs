@@ -397,6 +397,163 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.width = width;
         self.check_station_policy(environment)
     }
+    /// RTL8192DE: the AP's offered HT40 geometry with its `N92D` 40 MHz
+    /// permission, when the envelope measures it, current host policy
+    /// admits it and it admits HT (MCS0-7). `None` keeps the HT20 form.
+    /// Unlike the 2.4 GHz-only 8192EE, 5 GHz HT40 is permissionable
+    /// here: the `N92D` envelope carries 5 GHz 40 MHz points and 5 GHz
+    /// admission is delivered, so the offered geometry is used on
+    /// either band.
+    pub(super) fn rtl8192de_wide(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<
+        Option<(
+            super::super::super::ht::Geometry,
+            super::super::super::rtl8192de::envelope::Permission,
+        )>,
+        Error,
+    > {
+        use super::super::super::rtl8192de::{
+            envelope::{Operating, Width},
+            ht, sw_consequences, Band,
+        };
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192de())
+        else {
+            return Ok(None);
+        };
+        let facts = self.packet.de92.facts.ok_or(Error::State)?;
+        let current = self.rtl8192de_power.ok_or(Error::State)?;
+        let band = if current.operating().is_5ghz() {
+            Band::On5Ghz
+        } else {
+            Band::On2Ghz
+        };
+        let disable_amsdu_8k = sw_consequences(facts.mode, band).disable_amsdu_8k;
+        let two = ht::two_stream(&current, facts.rf_type);
+        let offer = association::phy::Offer::from_elements(
+            ht::local(true, facts.rf_type, two, disable_amsdu_8k),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        let Ok(Some(g)) = Self::offered_width(offer.width(), offer.ht().operation()) else {
+            return Ok(None);
+        };
+        let op = Operating {
+            width: if g.prime() == 1 {
+                Width::W40Above
+            } else {
+                Width::W40Below
+            },
+            channel: g.primary(),
+        };
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(ht::admitted)
+            .map(|p| (g, p)))
+    }
+    /// RTL8192DE local TX MCS selection (`rtl8192de::ht::capability`):
+    /// MCS8-15 only when the `N92D` permission at 20 MHz on the provisioned
+    /// primary and, when a 40 MHz one is offered, that one too admit every
+    /// two-stream rate on this function (Configuring may narrow the
+    /// negotiated width to 20 MHz), so mac80211's intersected `rx_mask[1]`
+    /// can only name rates the RA mask may install.
+    pub(super) fn rtl8192de_two_stream(
+        &self,
+        wide: Option<&super::super::super::rtl8192de::envelope::Permission>,
+        environment: &impl Environment,
+    ) -> Result<bool, Error> {
+        use super::super::super::rtl8192de::{envelope::Operating, ht::two_stream};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192de())
+        else {
+            return Ok(false);
+        };
+        let facts = self.packet.de92.facts.ok_or(Error::State)?;
+        let channel = self.rtl8192de_power.ok_or(Error::State)?.channel();
+        let narrow = base
+            .permission_for(&environment.domain()?, Operating::twenty(channel))
+            .ok();
+        Ok(narrow
+            .as_ref()
+            .is_some_and(|p| two_stream(p, facts.rf_type))
+            && wide.is_none_or(|p| two_stream(p, facts.rf_type)))
+    }
+    /// RTL8192DE `rtl_op_config` channel/width change on the running owner
+    /// (mac80211 sets the BSS chandef before authentication and narrows it
+    /// if the association response does): the `N92D` permission for the
+    /// target operating point (`width` 40 MHz on the provisioned primary,
+    /// else 20 MHz) is re-derived under current host policy, then
+    /// `Prepared::configure_rtl8192de_channel` (`sw_chnl` at the wide
+    /// channel with the admitted per-path indices, `set_bw_mode`) runs
+    /// inside that permission's authority. No frame may be outstanding; the
+    /// old receive epoch is retired. A failure leaves the owner failed.
+    pub(super) async fn retune_rtl8192de(
+        &mut self,
+        width: Option<super::super::super::ht::Geometry>,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8192de::envelope::{Operating, Width};
+        let current = self.rtl8192de_power.ok_or(Error::State)?;
+        let channel = current.channel();
+        let op = match width {
+            None => Operating::twenty(channel),
+            Some(g) if g.primary() == channel => Operating {
+                width: if g.prime() == 1 {
+                    Width::W40Above
+                } else {
+                    Width::W40Below
+                },
+                channel,
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        if current.operating() == op && self.packet.width == width {
+            return Ok(());
+        }
+        if !self.transmit_ready()
+            || self.station.pending.is_some()
+            || !matches!(self.station.phase, Phase::Joining | Phase::Configuring)
+        {
+            return Err(Error::State);
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192de())
+            .ok_or(Error::Profile)?
+            .clone();
+        let permission = base
+            .permission_for(&environment.domain()?, op)
+            .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if width.is_some() && !super::super::super::rtl8192de::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        self.station.retire_receive();
+        let owner = &mut *self;
+        super::super::super::station_power::wait_rtl8192de(base, permission, environment, async {
+            owner.io.authority(true, || Ok(()))?;
+            owner.configure_rtl8192de_channel(permission).await
+        })
+        .await?;
+        self.packet.width = width;
+        self.check_station_policy(environment)
+    }
     /// RTL8192CE / RTL8188CE: the `N92C` 40 MHz permission for the AP's
     /// offered HT40 geometry (as [`Self::rtl8192ee_wide`]), when the
     /// envelope admits HT there.

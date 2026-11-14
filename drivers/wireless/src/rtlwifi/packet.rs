@@ -681,6 +681,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.ce92_dm_watchdog(undec_sm_pwdb)
     }
+    /// 8192DE composed `rtl92d_dm_watchdog` step
+    /// (`packet_owner.rs::de92_dm_watchdog`). Returns whether the TX
+    /// power level was re-programmed (the RA mask is never refreshed).
+    pub(crate) async fn rtl8192de_dm_watchdog(
+        &mut self,
+        undec_sm_pwdb: i64,
+    ) -> Result<bool, Error> {
+        if !self.rtl8192de() {
+            return Err(Error::State);
+        }
+        self.de92_dm_watchdog(undec_sm_pwdb).await
+    }
     /// 8192EE composed `rtl92ee_dm_watchdog` step
     /// (`packet_owner.rs::ee92_dm_watchdog`). Returns whether the RA mask
     /// was refreshed.
