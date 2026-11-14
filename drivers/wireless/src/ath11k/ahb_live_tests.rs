@@ -1556,11 +1556,18 @@ kernel_test_in!(
 // the reg path. A future lane can add it once the struct is
 // grounded.
 //
-// The fake answers CONNECT_SERVICE for HTT_DATA_MSG, WMI_CONTROL and
-// WMI_CONTROL_MAC1: WCN6750 is single-pdev (`wmi_ep_count = 1`) and
-// never connects MAC1; IPQ6018 (`max_radios = 2`, `wmi_ep_count = 2`)
-// does, and its MAC1 commands arrive on CE7. WMI_CONTROL_MAC2 (IPQ8074
-// only, three radios) is not answered.
+// The fake answers CONNECT_SERVICE for HTT_DATA_MSG, WMI_CONTROL,
+// WMI_CONTROL_MAC1 and WMI_CONTROL_MAC2: WCN6750 is single-pdev
+// (`wmi_ep_count = 1`) and never connects MAC1; IPQ6018 (`max_radios =
+// 2`, `wmi_ep_count = 2`) connects MAC1, and its MAC1 commands arrive
+// on CE7; IPQ8074 (`max_radios = 3`, `wmi_ep_count = 3`) connects MAC2
+// as well, and its MAC2 commands arrive on CE9. The SERVICE_READY_EXT
+// the fake sends advertises SINGLE + DBS (two radios, firmware pdev
+// ids 1/2); with the script's `dbs_sbs` set it adds the DBS_SBS mode
+// (three phys, a third pdev id 3), which is what IPQ8074's three
+// radios need — the host picks the preferred mode from
+// `ath11k_hw_mode_pri_map` (DBS_SBS first), so the default event
+// would only yield two radios on IPQ8074.
 //
 // The fake holds raw pointers to the ring / bounce buffers, captured
 // after `hal_ce_alloc` while the test owns `live`: the buffers never
@@ -1603,6 +1610,28 @@ const TARGET_CE_MAP_IPQ6018: TargetCeMap = TargetCeMap {
     htt_dl: 1,
 };
 
+/// IPQ8074 (Linux `hw.c`
+/// `ath11k_target_service_to_ce_map_wlan_ipq8074`): RSVD_CTRL IN→1,
+/// WMI_CONTROL, WMI_CONTROL_MAC1 and WMI_CONTROL_MAC2 IN→2,
+/// HTT_DATA_MSG IN→1. Host→target: RSVD_CTRL OUT→0, WMI_CONTROL OUT→3,
+/// WMI_CONTROL_MAC1 OUT→7, WMI_CONTROL_MAC2 OUT→9, HTT_DATA_MSG OUT→4.
+const TARGET_CE_MAP_IPQ8074: TargetCeMap = TargetCeMap {
+    ctrl_dl: 1,
+    wmi_dl: 2,
+    htt_dl: 1,
+};
+
+/// IPQ5018 (Linux `hw.c`
+/// `ath11k_target_service_to_ce_map_wlan_ipq5018`): RSVD_CTRL IN→1,
+/// WMI_CONTROL IN→2, HTT_DATA_MSG IN→1; no per-pdev WMI MAC1/MAC2
+/// pipes. Host→target: RSVD_CTRL OUT→0, WMI_CONTROL OUT→3,
+/// HTT_DATA_MSG OUT→4.
+const TARGET_CE_MAP_IPQ5018: TargetCeMap = TargetCeMap {
+    ctrl_dl: 1,
+    wmi_dl: 2,
+    htt_dl: 1,
+};
+
 /// The target MAC the fake reports in the WMI READY event — the same
 /// fixture value as the HIF-level `Fw` (`core_tests.rs` `FW_MAC`), so
 /// the core's `mac_addr` assertion matches the established fixture.
@@ -1621,6 +1650,8 @@ mod htc_svc {
     pub const WMI_CONTROL: u16 = 0x0100;
     /// `SVC(ATH11K_HTC_SVC_GRP_WMI, 5)`.
     pub const WMI_CONTROL_MAC1: u16 = 0x0105;
+    /// `SVC(ATH11K_HTC_SVC_GRP_WMI, 6)`.
+    pub const WMI_CONTROL_MAC2: u16 = 0x0106;
     pub const HTT_DATA_MSG: u16 = 0x0300;
 }
 
@@ -1631,6 +1662,9 @@ mod htc_ep {
     pub const HTT: u8 = 1;
     pub const WMI: u8 = 2;
     pub const WMI_MAC1: u8 = 3;
+    /// Next free id after HTT / WMI / MAC1, as the target assigns
+    /// them in CONNECT_SERVICE_RESP order (see the module docs).
+    pub const WMI_MAC2: u8 = 4;
 }
 
 /// WMI event ids (Linux `wmi.h` `enum wmi_tlv_event_id`).
@@ -1676,6 +1710,9 @@ mod wmi_cmd {
 mod hw_mode {
     pub const SINGLE: u32 = 0;
     pub const DBS: u32 = 1;
+    /// Linux `wmi.h` `enum wmi_host_hw_mode` (`DBS_SBS = 4`; in-tree
+    /// `wmi.rs` `hw_mode::DBS_SBS`).
+    pub const DBS_SBS: u32 = 4;
 }
 
 /// What the fake target does: the default mirrors the HIF-level `Fw`
@@ -1715,6 +1752,11 @@ struct CeTargetScript {
     /// (`num_extra_mac_addr`; Linux `ath11k_wmi_tlv_rdy_parse` uses
     /// them only when `num_radios > 1`). Empty on single-pdev parts.
     extra_macs: Vec<[u8; 6]>,
+    /// Advertise the DBS_SBS hw mode (three phys) in
+    /// SERVICE_READY_EXT, with a third pdev's MAC-PHY caps: IPQ8074
+    /// only (`max_radios = 3`). Without it the EXT advertises DBS and
+    /// the host would only allocate two radios on IPQ8074.
+    dbs_sbs: bool,
 }
 
 impl Default for CeTargetScript {
@@ -1734,6 +1776,7 @@ impl Default for CeTargetScript {
             htt_version_conf: true,
             mac: TGT_MAC,
             extra_macs: Vec::new(),
+            dbs_sbs: false,
         }
     }
 }
@@ -1802,6 +1845,11 @@ struct CeTargetFake {
     conn_resp_wmi1: bool,
     /// WMI commands consumed on the MAC1 endpoint.
     wmi1_cmds: usize,
+    /// WMI_CONTROL_MAC2 connect seen / answered (IPQ8074 only).
+    connect_wmi2_seen: bool,
+    conn_resp_wmi2: bool,
+    /// WMI commands consumed on the MAC2 endpoint.
+    wmi2_cmds: usize,
     setup_complete_seen: bool,
     init_seen: bool,
     ver_req_seen: bool,
@@ -1908,6 +1956,9 @@ impl CeTargetFake {
             connect_wmi1_seen: false,
             conn_resp_wmi1: false,
             wmi1_cmds: 0,
+            connect_wmi2_seen: false,
+            conn_resp_wmi2: false,
+            wmi2_cmds: 0,
             setup_complete_seen: false,
             init_seen: false,
             ver_req_seen: false,
@@ -2181,6 +2232,12 @@ impl CeTargetFake {
                         self.queue_ctrl(&r);
                         self.conn_resp_wmi1 = true;
                     }
+                    htc_msg::CONNECT_SERVICE if svc == htc_svc::WMI_CONTROL_MAC2 => {
+                        self.connect_wmi2_seen = true;
+                        let r = Self::conn_svc_resp(svc, 0, htc_ep::WMI_MAC2, 2048);
+                        self.queue_ctrl(&r);
+                        self.conn_resp_wmi2 = true;
+                    }
                     htc_msg::SETUP_COMPLETE_EX => {
                         self.setup_complete_seen = true;
                         if self.script.svc_ready {
@@ -2189,7 +2246,7 @@ impl CeTargetFake {
                             let a = Self::service_available_event(self.script.advertise_ext2);
                             self.queue_wmi(&a, &[]);
                             self.svc_avail_sent = true;
-                            let e = Self::service_ready_ext_event();
+                            let e = Self::service_ready_ext_event(self.script.dbs_sbs);
                             self.queue_wmi(&e, &[]);
                             self.svc_ext_sent = true;
                             if self.script.advertise_ext2 && self.script.send_ext2 {
@@ -2236,6 +2293,14 @@ impl CeTargetFake {
                 self.wmi1_cmds += 1;
                 let tr = Self::credit_trailer(&[(htc_ep::WMI_MAC1, 1)]);
                 let f = Self::htc_frame(htc_ep::WMI_MAC1, &[], &tr);
+                self.dl_queue[self.map.wmi_dl as usize].push_back(f);
+            }
+            // CE9: host→target WMI on the MAC2 endpoint (IPQ8074 map
+            // WMI_CONTROL_MAC2 OUT→9): same credit return as CE7.
+            9 if eid == htc_ep::WMI_MAC2 && p.len() >= 4 => {
+                self.wmi2_cmds += 1;
+                let tr = Self::credit_trailer(&[(htc_ep::WMI_MAC2, 1)]);
+                let f = Self::htc_frame(htc_ep::WMI_MAC2, &[], &tr);
                 self.dl_queue[self.map.wmi_dl as usize].push_back(f);
             }
             // CE4: host→target HTT.
@@ -2444,8 +2509,13 @@ impl CeTargetFake {
     /// mpdu_density, max_bssid_rx_filters, ...), the SOC caps, the
     /// ARRAY_STRUCT entries in the decoder's order (hw-mode caps,
     /// mac-phy caps, HAL reg caps, combo, cap, OEM DMA, DMA ring
-    /// caps).
-    fn service_ready_ext_event() -> Vec<u8> {
+    /// caps). With `dbs_sbs` (IPQ8074) the event also advertises the
+    /// DBS_SBS mode (three phys, a third pdev id 3 with a second 5 GHz
+    /// radio, its HAL reg cap mirroring phy 1's 5 GHz range): the
+    /// DBS_SBS entries come after the SINGLE + DBS entries, which is
+    /// the order the decoder indexes (`pull_mac_phy_cap` skips 1 + 2
+    /// entries to reach the DBS_SBS phys).
+    fn service_ready_ext_event(dbs_sbs: bool) -> Vec<u8> {
         let mut hw_modes = Vec::new();
         hw_modes.extend_from_slice(&Self::hw_mode_cap(hw_mode::SINGLE, 0x1));
         hw_modes.extend_from_slice(&Self::hw_mode_cap(hw_mode::DBS, 0x3));
@@ -2456,6 +2526,16 @@ impl CeTargetFake {
         let mut hal_regs = Vec::new();
         hal_regs.extend_from_slice(&Self::hal_reg(0, 2312, 2732, 0, 0));
         hal_regs.extend_from_slice(&Self::hal_reg(1, 0, 0, 5150, 7125));
+        let (num_hw_modes, num_phy) = if dbs_sbs {
+            hw_modes.extend_from_slice(&Self::hw_mode_cap(hw_mode::DBS_SBS, 0x7));
+            mac_phys.extend_from_slice(&Self::mac_phy(hw_mode::DBS_SBS, 1, 0, 1, 0x1));
+            mac_phys.extend_from_slice(&Self::mac_phy(hw_mode::DBS_SBS, 2, 1, 2, 0x2));
+            mac_phys.extend_from_slice(&Self::mac_phy(hw_mode::DBS_SBS, 3, 2, 2, 0x2));
+            hal_regs.extend_from_slice(&Self::hal_reg(2, 0, 0, 5150, 7125));
+            (3, 3)
+        } else {
+            (2, 2)
+        };
         let dma = Self::tlv(
             wmi_tag::DMA_RING_CAPABILITIES,
             &Self::le(&[1, 0, 16, 2048, 4]),
@@ -2464,10 +2544,13 @@ impl CeTargetFake {
             wmi_ev::SERVICE_READY_EXT,
             &[
                 Self::tlv(wmi_tag::SERVICE_READY_EXT_EVENT, &[0; 76]),
-                Self::tlv(wmi_tag::SOC_MAC_PHY_HW_MODE_CAPS, &Self::le(&[2, 0])),
+                Self::tlv(
+                    wmi_tag::SOC_MAC_PHY_HW_MODE_CAPS,
+                    &Self::le(&[num_hw_modes, 0]),
+                ),
                 Self::tlv(wmi_tag::ARRAY_STRUCT, &hw_modes),
                 Self::tlv(wmi_tag::ARRAY_STRUCT, &mac_phys),
-                Self::tlv(wmi_tag::SOC_HAL_REG_CAPABILITIES, &Self::le(&[2])),
+                Self::tlv(wmi_tag::SOC_HAL_REG_CAPABILITIES, &Self::le(&[num_phy])),
                 Self::tlv(wmi_tag::ARRAY_STRUCT, &hal_regs),
                 Self::tlv(wmi_tag::ARRAY_STRUCT, &[]),
                 Self::tlv(wmi_tag::ARRAY_STRUCT, &[]),
@@ -3120,6 +3203,264 @@ fn smoke_ath11k_ahb_ipq6018_core_start_ce_fake() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_ahb_ipq6018_core_start_ce_fake
+);
+
+/// IPQ8074 core start past `firmware_start` against the CE/HTC/WMI
+/// target fake on the IPQ8074 service map, then `runtime::start_ahb`:
+///
+/// - HTC: READY on CE1 (RSVD_CTRL IN→1), CONNECT_SERVICE for HTT,
+///   WMI_CONTROL, WMI_CONTROL_MAC1 *and* WMI_CONTROL_MAC2
+///   (`max_radios = 3` → Linux `ath11k_htc_init` `wmi_ep_count = 3`
+///   with no preferred hw mode at attach), SETUP_COMPLETE_EX; the
+///   MAC2 commands arrive on CE9;
+/// - WMI: SERVICE_READY / AVAILABLE / EXT (+EXT2); the EXT's DBS_SBS
+///   mode (preferred over DBS and SINGLE, `ath11k_hw_mode_pri_map`)
+///   yields three radios with firmware pdev ids 1, 2 and 3; INIT is
+///   the multi-pdev `ath11k_init_wmi_config_ipq8074` command on the
+///   WMI_CONTROL endpoint; READY carries one extra MAC per radio;
+/// - HTT VERSION_CONF, then `pdev_create` allocates all three pdevs
+///   (HTT SRING_SETUP on CE4 for each);
+/// - `start_ahb` registers one netdev per radio with that radio's READY
+///   extra MAC, resolving the DP mac id (0, 1, 2) to the firmware pdev
+///   id (1, 2, 3) by index.
+fn smoke_ath11k_ahb_ipq8074_core_start_ce_fake() -> TestResult {
+    use super::super::ce::{monotonic_ms, Ce as HostCe, CeMsi, MsiCeIrq};
+    use super::super::core::{Ath11kCore, CeHif, CoreConfig};
+    use super::super::dp_ring::DpHwParams;
+    use super::super::hw::{HwRev, MSI_CONFIG_NONE};
+    use super::super::runtime::DpHooks;
+    // Distinct from the IPQ6018 case's extra MACs (…60/61): the netdev
+    // registry is process-global with no reset between kernel tests,
+    // so reusing them would make the registration check below vacuous.
+    const RADIO_MACS: [[u8; 6]; 3] = [
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x62],
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x63],
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x64],
+    ];
+    let hw = AhbChip::Ipq8074.params().hw_params(HwRev::Ipq8074);
+    let Ok(ce) = HostCe::alloc(
+        &hw,
+        CeMsi {
+            addr: 0,
+            ep_base_data: 0,
+            config: &MSI_CONFIG_NONE,
+        },
+        monotonic_ms,
+    ) else {
+        return TestResult::Fail("IPQ8074 CE alloc");
+    };
+    let script = CeTargetScript {
+        extra_macs: RADIO_MACS.to_vec(),
+        dbs_sbs: true,
+        ..CeTargetScript::default()
+    };
+    let Some(mut fake) = CeTargetFake::capture(&ce, TARGET_CE_MAP_IPQ8074, script) else {
+        return TestResult::Fail("IPQ8074 CE geometry");
+    };
+    let hif = CeHif {
+        ce,
+        io: ZeroIo,
+        irq: MsiCeIrq,
+        on_start: || {},
+        clock: monotonic_ms,
+    };
+    let Some(cfg) = CoreConfig::for_hw(&hw) else {
+        return TestResult::Fail("IPQ8074 core config");
+    };
+    let Ok(mut core) = Ath11kCore::new(hif, StartedQmi, cfg) else {
+        return TestResult::Fail("IPQ8074 core new");
+    };
+    let mut hooks = DpHooks::new(
+        DpHwParams::for_rev(hw.hw_rev),
+        hw.hw_rev as u32,
+        IPQ_SIZES,
+        None,
+    );
+    let out = {
+        let mut fut = pin!(core.qmi_firmware_ready(&mut hooks));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut out = None;
+        for _ in 0..200_000 {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                out = Some(v);
+                break;
+            }
+            fake.pump();
+        }
+        // The completing poll posts `pdev_create`'s SRING_SETUPs
+        // synchronously (see `drive_wcn6750_core_start`).
+        fake.pump();
+        out
+    };
+    let Some(Ok(())) = out else {
+        return TestResult::Fail("IPQ8074 core start did not succeed");
+    };
+    kt_assert!(core.is_ready());
+    kt_assert_eq!(core.mac_addr, Some(TGT_MAC));
+    kt_assert_eq!(core.num_radios(), 3);
+    kt_assert_eq!(core.preferred_hw_mode, hw_mode::DBS_SBS);
+    kt_assert_eq!(core.wmi_pdev_eps.len(), 3);
+    kt_assert_eq!(fake.errors, 0);
+    kt_assert!(fake.connect_wmi2_seen, "IPQ8074 MAC2 connect");
+    kt_assert!(
+        fake.conn_resp_htt && fake.conn_resp_wmi && fake.conn_resp_wmi1 && fake.conn_resp_wmi2
+    );
+    kt_assert!(fake.setup_complete_seen && fake.svc_ext_sent && fake.ext2_sent);
+    kt_assert!(fake.init_seen && fake.ready_event_sent);
+    kt_assert!(fake.ver_req_seen && fake.ver_conf_sent);
+    kt_assert!(fake.sring_setup_seen > 0);
+    let Some(dp) = hooks.dp.take() else {
+        return TestResult::Fail("IPQ8074 DP missing after core start");
+    };
+    kt_assert_eq!(dp.pdev_mac_ids(), alloc::vec![0, 1, 2]);
+    let ext = core
+        .svc_ext
+        .as_ref()
+        .map(|e| e.pdevs.iter().map(|p| p.pdev_id).collect::<Vec<u32>>());
+    kt_assert_eq!(ext, Some(alloc::vec![1, 2, 3]));
+    let (_shared, r) = super::super::runtime::start_ahb(core, dp);
+    let Ok(macs) = r else {
+        return TestResult::Fail("IPQ8074 start_ahb registered no radio");
+    };
+    kt_assert_eq!(macs, RADIO_MACS.to_vec());
+    for mac in RADIO_MACS {
+        kt_assert!(
+            narf_wireless::registry::list()
+                .into_iter()
+                .any(|p| p.mac() == mac),
+            "IPQ8074 radio netdev registered"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_ipq8074_core_start_ce_fake
+);
+
+/// IPQ5018 core start past `firmware_start` against the CE/HTC/WMI
+/// target fake on the IPQ5018 service map, then `runtime::start_ahb`:
+///
+/// - HTC: READY on CE1 (RSVD_CTRL IN→1), CONNECT_SERVICE for HTT and
+///   WMI_CONTROL only (`max_radios = 1` → Linux `ath11k_htc_init`
+///   `wmi_ep_count = 1` with no preferred hw mode at attach): the
+///   IPQ5018 service map has no per-pdev WMI MAC1/MAC2 pipes, so
+///   neither is ever connected; SETUP_COMPLETE_EX;
+/// - WMI: SERVICE_READY / AVAILABLE / EXT (+EXT2); the shared fake's
+///   EXT still advertises DBS with firmware pdev ids 1/2, but the
+///   chip's `max_radios = 1` (Linux `MAX_RADIOS_5018 = 1`; IPQ5018 is
+///   a 2G 2x2 device) clamps `num_radios()` to one radio, so INIT is
+///   the multi-pdev `ath11k_init_wmi_config_ipq8074` command for one
+///   radio and only pdev 1's resources are allocated; READY carries no
+///   extra MACs, and the single radio takes the READY primary MAC;
+/// - HTT VERSION_CONF, then `pdev_create` allocates the one pdev
+///   (HTT SRING_SETUP on CE4);
+/// - `start_ahb` registers one netdev with the READY primary MAC.
+fn smoke_ath11k_ahb_ipq5018_core_start_ce_fake() -> TestResult {
+    use super::super::ce::{monotonic_ms, Ce as HostCe, CeMsi, MsiCeIrq};
+    use super::super::core::{Ath11kCore, CeHif, CoreConfig};
+    use super::super::dp_ring::DpHwParams;
+    use super::super::hw::{HwRev, MSI_CONFIG_NONE};
+    use super::super::runtime::DpHooks;
+    let hw = AhbChip::Ipq5018Hw10.params().hw_params(HwRev::Ipq5018Hw10);
+    let Ok(ce) = HostCe::alloc(
+        &hw,
+        CeMsi {
+            addr: 0,
+            ep_base_data: 0,
+            config: &MSI_CONFIG_NONE,
+        },
+        monotonic_ms,
+    ) else {
+        return TestResult::Fail("IPQ5018 CE alloc");
+    };
+    let script = CeTargetScript {
+        ..CeTargetScript::default()
+    };
+    let Some(mut fake) = CeTargetFake::capture(&ce, TARGET_CE_MAP_IPQ5018, script) else {
+        return TestResult::Fail("IPQ5018 CE geometry");
+    };
+    let hif = CeHif {
+        ce,
+        io: ZeroIo,
+        irq: MsiCeIrq,
+        on_start: || {},
+        clock: monotonic_ms,
+    };
+    let Some(cfg) = CoreConfig::for_hw(&hw) else {
+        return TestResult::Fail("IPQ5018 core config");
+    };
+    let Ok(mut core) = Ath11kCore::new(hif, StartedQmi, cfg) else {
+        return TestResult::Fail("IPQ5018 core new");
+    };
+    let mut hooks = DpHooks::new(
+        DpHwParams::for_rev(hw.hw_rev),
+        hw.hw_rev as u32,
+        IPQ_SIZES,
+        None,
+    );
+    let out = {
+        let mut fut = pin!(core.qmi_firmware_ready(&mut hooks));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut out = None;
+        for _ in 0..200_000 {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                out = Some(v);
+                break;
+            }
+            fake.pump();
+        }
+        // The completing poll posts `pdev_create`'s SRING_SETUPs
+        // synchronously (see `drive_wcn6750_core_start`).
+        fake.pump();
+        out
+    };
+    let Some(Ok(())) = out else {
+        return TestResult::Fail("IPQ5018 core start did not succeed");
+    };
+    kt_assert!(core.is_ready());
+    kt_assert_eq!(core.mac_addr, Some(TGT_MAC));
+    kt_assert_eq!(core.num_radios(), 1);
+    kt_assert_eq!(core.wmi_pdev_eps.len(), 1);
+    kt_assert_eq!(fake.errors, 0);
+    kt_assert!(fake.conn_resp_htt && fake.conn_resp_wmi);
+    kt_assert!(
+        !fake.connect_wmi1_seen && !fake.conn_resp_wmi1,
+        "IPQ5018 never connects MAC1"
+    );
+    kt_assert!(fake.setup_complete_seen && fake.svc_ext_sent && fake.ext2_sent);
+    kt_assert!(fake.init_seen && fake.ready_event_sent);
+    kt_assert!(fake.ver_req_seen && fake.ver_conf_sent);
+    kt_assert!(fake.sring_setup_seen > 0);
+    let Some(dp) = hooks.dp.take() else {
+        return TestResult::Fail("IPQ5018 DP missing after core start");
+    };
+    kt_assert_eq!(dp.pdev_mac_ids(), alloc::vec![0]);
+    // The firmware side advertises two pdevs (DBS); the chip's
+    // `max_radios = 1` is what holds the radio count at one.
+    let ext = core
+        .svc_ext
+        .as_ref()
+        .map(|e| e.pdevs.iter().map(|p| p.pdev_id).collect::<Vec<u32>>());
+    kt_assert_eq!(ext, Some(alloc::vec![1, 2]));
+    let (_shared, r) = super::super::runtime::start_ahb(core, dp);
+    let Ok(macs) = r else {
+        return TestResult::Fail("IPQ5018 start_ahb registered no radio");
+    };
+    kt_assert_eq!(macs, alloc::vec![TGT_MAC]);
+    kt_assert!(
+        narf_wireless::registry::list()
+            .into_iter()
+            .any(|p| p.mac() == TGT_MAC),
+        "IPQ5018 radio netdev registered"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_ipq5018_core_start_ce_fake
 );
 
 // ── post-boot SMP2P crash monitoring / recovery ─────────────────────
