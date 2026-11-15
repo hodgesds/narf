@@ -385,7 +385,7 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_station_facet);
 
 fn smoke_rtw89_8922a_eht_txsb_sub_band_value() -> TestResult {
     // Hand-evaluated `rtw89_phy_get_txsb` (phy.c:875) cases.
-    let cases: [(Width, u8, u8, Width, Option<u8>); 9] = [
+    let cases: [(Width, u8, u8, Width, Option<u8>); 11] = [
         (Width::Mhz20, 36, 36, Width::Mhz20, Some(0)),
         (Width::Mhz40, 40, 38, Width::Mhz20, Some(1)),
         (Width::Mhz80, 36, 42, Width::Mhz20, Some(0)),
@@ -394,6 +394,10 @@ fn smoke_rtw89_8922a_eht_txsb_sub_band_value() -> TestResult {
         (Width::Mhz160, 60, 50, Width::Mhz40, Some(2)),
         (Width::Mhz320, 61, 31, Width::Mhz20, Some(15)),
         (Width::Mhz320, 61, 31, Width::Mhz80, Some(3)),
+        // Lowest primary of a wide channel: the C `int` division
+        // truncates toward zero, so the index is 0, not a refusal.
+        (Width::Mhz160, 36, 50, Width::Mhz40, Some(0)),
+        (Width::Mhz320, 33, 63, Width::Mhz80, Some(0)),
         // Primary below the channel: Linux u8 math would wrap.
         (Width::Mhz80, 30, 42, Width::Mhz20, None),
     ];
@@ -404,12 +408,13 @@ fn smoke_rtw89_8922a_eht_txsb_sub_band_value() -> TestResult {
     }
     // `rtw8922a_set_channel_mac` TX_SUB_BAND_VALUE words:
     // TXSB20 [3:0], TXSB40 [7:4], TXSB80 [11:8], PRI20 bitmap [31:16].
-    let words: [(Width, u8, u8, u32); 6] = [
+    let words: [(Width, u8, u8, u32); 7] = [
         (Width::Mhz20, 36, 36, 0x0001_0000),
         (Width::Mhz40, 40, 38, 0x0002_0001),
         (Width::Mhz80, 36, 42, 0x0001_0000),
         (Width::Mhz80, 48, 42, 0x0008_0013),
         (Width::Mhz160, 60, 50, 0x0040_0126),
+        (Width::Mhz160, 36, 50, 0x0001_0000),
         // 320 takes the Linux default arm: no TXSB fields, bitmap bit 0.
         (Width::Mhz320, 61, 31, 0x0001_0000),
     ];

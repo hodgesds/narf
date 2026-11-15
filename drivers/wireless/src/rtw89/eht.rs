@@ -122,17 +122,22 @@ pub(super) const fn sifs_values(width: Width) -> (u32, u32) {
 /// `dbw`-wide sub-band holding the primary channel inside a `cbw`-wide
 /// channel centred on `central_ch`. Channel numbers are the 5 MHz IEEE
 /// numbers Linux uses (`chan->primary_channel`, `chan->channel`).
-/// Returns `None` when the primary lies outside the channel (the Linux
-/// u8 arithmetic would wrap there; a valid chandef never does).
+/// C integer promotion applies: the subtraction and division run in
+/// `int` and truncate toward zero, so a primary below the center by
+/// less than one divisor step truncates to 0 — the lowest-primary
+/// valid case (`(pri - central + k)` in `(-d, 0)`). Only a primary
+/// further below the channel is refused (`None`): Linux would
+/// truncate that to a negative index and wrap it into a `u8`, and
+/// this owner fails closed instead of programming a wrapped index.
 pub(super) fn get_txsb(cbw: Width, pri_ch: u8, central_ch: u8, dbw: Width) -> Option<u8> {
     if cbw.mhz() == dbw.mhz() || matches!(cbw, Width::Mhz20) {
         return Some(0);
     }
     let above = pri_ch > central_ch;
-    // `(pri_ch - central_ch + k) / d` in Linux u8 arithmetic.
+    // `(pri_ch - central_ch + k) / d` in Linux `int` arithmetic.
     let sub = |k: i16, d: i16| -> Option<u8> {
         let v = pri_ch as i16 - central_ch as i16 + k;
-        if v < 0 {
+        if v <= -d {
             None
         } else {
             Some((v / d) as u8)

@@ -503,6 +503,29 @@ impl Rtw89Device {
         .map(|_| ())
         .map_err(Boot8922aError::Fwdl)
     }
+
+    /// Drive the 8922A set_channel owner for an admitted station
+    /// (`Prepared8922a::set_channel`): the MAC channel program +
+    /// TX-power program for `profile` over BAR2. The station-path
+    /// caller is the follow-up (like `admit_station`, this entry
+    /// exists before any station-path driver calls it); bring-up
+    /// itself programs no channel — it has no admitted station,
+    /// container, or regulatory country.
+    pub(super) fn set_channel_8922a(
+        &self,
+        macid: u8,
+        profile: super::operating_channel_c::Profile,
+        elements: &[super::radio_assets::Element],
+        country: [u8; 2],
+    ) -> Result<super::prepared_8922a::SetChannelOutcome, super::prepared_8922a::Error> {
+        let owner_lock = self
+            .be_8922a
+            .as_ref()
+            .ok_or(super::prepared_8922a::Error::NoOwner)?;
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        let mut owner = owner_lock.lock();
+        owner.set_channel(macid, profile, elements, country, regs)
+    }
 }
 
 /// Production [`super::fwdl_be::Port`] for a probed 8922A device:

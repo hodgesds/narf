@@ -1568,3 +1568,134 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_set_txpwr_writes_program
 );
+
+fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
+    use super::operating_channel_c::{Band as ChanBand, Profile, Width as ChanWidth};
+    let elements = txpwr_elements();
+    // 6 GHz SP ch37, TPE 5 dBm, US: FCC/STD — the proven
+    // set_txpwr geometry.
+    let mut req = base_req();
+    req.band = Band::Ghz6;
+    req.width_mhz = 20;
+    req.primary = 37;
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: Some(5),
+    });
+    let mut owner = match Prepared8922a::new(factory(), 1) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let macid = match owner.admit_station(&req) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("6GHz SP admission refused"),
+    };
+    let Some(profile) = Profile::new20(ChanBand::Ghz6, 37) else {
+        return TestResult::Fail("6GHz ch37 profile refused");
+    };
+    // A set_txpwr refusal AFTER the MAC program leaves the MAC
+    // registers on the new channel with the old power program
+    // and records no channel: only the 5 MAC registers land.
+    let no_byrate: Vec<Element> = txpwr_elements()
+        .into_iter()
+        .filter(|e| e.id != ID_BYRATE)
+        .collect();
+    let mut regs = Model::new();
+    if owner
+        .set_channel(macid, profile, &no_byrate, *b"US", &mut regs)
+        .is_ok()
+        || regs.regs32.len() != 5
+        || regs.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs.regs32.contains_key(&0x11E00)
+        || owner.channel().is_some()
+    {
+        return TestResult::Fail("set_channel without BYRATE did not fail after the MAC program");
+    }
+    // First channel-set: MAC words (rtw8922a_set_channel_mac,
+    // 20 MHz 6 GHz: RFMOD 0, TXSB PRI20 bitmap bit 0, TXRATE_CHK
+    // CCK_EN|RTS6, SIFS 0x3f/0x3e) plus the 194-register
+    // set_txpwr program (by-rate head as in the set_txpwr test).
+    let mut regs = Model::new();
+    let outcome = match owner.set_channel(macid, profile, &elements, *b"US", &mut regs) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("set_channel refused"),
+    };
+    if !outcome.band_changed {
+        return TestResult::Fail("first set_channel must report a band change");
+    }
+    if owner.channel() != Some(profile) {
+        return TestResult::Fail("set_channel did not retain the channel");
+    }
+    if regs.regs32.get(&0x10010) != Some(&0)
+        || regs.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x10828) != Some(&0x03)
+        || regs.regs32.get(&0x1033C) != Some(&0x3F)
+        || regs.regs32.get(&0x10370) != Some(&0x003E_0000)
+        || regs.regs32.get(&0x11E00) != Some(&0x0302_0105)
+        || regs.regs32.len() != 199
+    {
+        return TestResult::Fail("set_channel did not run the MAC + set_txpwr programs");
+    }
+    // Retune across bands: a second station admitted on 5 GHz
+    // 80 MHz primary 36 (center 42). Band change reported, MAC
+    // words for 80 MHz (RFMOD 2, SIFS 0x41/0x41), and the
+    // set_txpwr program ran (by-rate head present).
+    let mut req5 = base_req();
+    req5.width_mhz = 80;
+    let macid5 = match owner.admit_station(&req5) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("5GHz 80MHz admission refused"),
+    };
+    let Some(profile5) = Profile::new_wide(ChanBand::Ghz5, 36, ChanWidth::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile refused");
+    };
+    let mut regs5 = Model::new();
+    let outcome5 = match owner.set_channel(macid5, profile5, &elements, *b"US", &mut regs5) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("5GHz retune set_channel refused"),
+    };
+    if !outcome5.band_changed || owner.channel() != Some(profile5) {
+        return TestResult::Fail("5GHz retune did not report a band change and retain it");
+    }
+    if regs5.regs32.get(&0x10010) != Some(&2)
+        || regs5.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs5.regs32.get(&0x10828) != Some(&0x03)
+        || regs5.regs32.get(&0x1033C) != Some(&0x41)
+        || regs5.regs32.get(&0x10370) != Some(&0x0041_0000)
+        || !regs5.regs32.contains_key(&0x11E00)
+    {
+        return TestResult::Fail("5GHz retune did not run the MAC + set_txpwr programs");
+    }
+    // Refusals write nothing: an unknown MACID, a channel that
+    // disagrees with the admitted station's geometry, and a
+    // 320 MHz channel no station can hold.
+    let mut regs = Model::new();
+    if owner.set_channel(9, profile, &elements, *b"US", &mut regs) != Err(Error::NoStation)
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_channel for an unknown MACID did not refuse cleanly");
+    }
+    let mut regs = Model::new();
+    if owner.set_channel(macid, profile5, &elements, *b"US", &mut regs)
+        != Err(Error::Channel(super::rfk::Error::Policy))
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_channel with mismatched geometry did not refuse cleanly");
+    }
+    let Some(profile320) = Profile::new_6ghz_320(33, 63) else {
+        return TestResult::Fail("6GHz 320MHz profile refused");
+    };
+    let mut regs = Model::new();
+    if owner.set_channel(macid, profile320, &elements, *b"US", &mut regs)
+        != Err(Error::Channel(super::rfk::Error::Policy))
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("320MHz set_channel did not refuse cleanly");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr
+);
