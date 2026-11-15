@@ -377,9 +377,17 @@ impl Harness {
             }
         }
         let station = if let Some(database) = database {
-            ready(Station::initialize_live(adapter, &[], database))?
+            ready(Station::initialize_live(
+                alloc::boxed::Box::new(adapter),
+                &[],
+                database,
+            ))?
         } else {
-            ready(Station::initialize(adapter, &[], domain))?
+            ready(Station::initialize(
+                alloc::boxed::Box::new(adapter),
+                &[],
+                domain,
+            ))?
         }
         .map_err(|_| "PCIe station firmware initialization")?;
         let expected: &[u8] = if channel > 14 {

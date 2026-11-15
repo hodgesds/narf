@@ -29,7 +29,7 @@ impl Fixture {
         nvm[28] = 1;
         Self {
             owner: Some(Owner {
-                hardware,
+                hardware: alloc::boxed::Box::new(hardware),
                 firmware: vec![],
                 profile: gen2_profile::select(0xa0f0, 0x351, 0x10c000).unwrap(),
                 phase: Phase::Configured,
@@ -68,7 +68,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
             // SAFETY: this private RAM/DMA fixture never published to a device.
-            unsafe { runtime::model::destroy(owner.hardware) };
+            unsafe { runtime::model::destroy(*owner.hardware) };
         }
     }
 }

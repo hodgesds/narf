@@ -51,8 +51,12 @@ fn policy() -> Result<(), &'static str> {
         max_power_dbm: 17,
         flags: RegFlags::NO_IR,
     });
-    let mut station = ready(Station::initialize(adapter, &[], domain))?
-        .map_err(|_| "NO_IR dual-band station initialization")?;
+    let mut station = ready(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        domain,
+    ))?
+    .map_err(|_| "NO_IR dual-band station initialization")?;
     if !station.channels.contains(&36) || station.channels.contains(&255) {
         return Err("NO_IR removed passive reception or unknown channel was admitted");
     }
@@ -136,7 +140,11 @@ fn smoke_brcmf_wide_firmware_bandwidth_cannot_publish_the_twenty_mhz_profile() -
     };
     bus.hold_wide_bandwidth();
     if !matches!(
-        ready(Station::initialize(adapter, &[], firmware::domain())),
+        ready(Station::initialize(
+            alloc::boxed::Box::new(adapter),
+            &[],
+            firmware::domain()
+        )),
         Ok(Err(Error::Unsupported))
     ) || bus
         .commands()

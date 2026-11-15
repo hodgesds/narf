@@ -29,8 +29,12 @@ fn frame() -> Vec<u8> {
 
 fn secondary_ifidx() -> Result<(), &'static str> {
     let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
-    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     let features = Features {
         p2p: true,
         mchan: true,
@@ -155,8 +159,12 @@ kernel_test_in!(
 /// secondary port; its deauthentication closes only that port.
 fn secondary_join() -> Result<(), &'static str> {
     let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
-    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     let features = Features {
         p2p: true,
         mchan: true,
@@ -261,8 +269,12 @@ fn primary_station_secondary_ap() -> Result<(), &'static str> {
     bus.set_caps(b"ap sta mchan");
     let database = Arc::new(narf_wireless::reg::db::Database::new());
     database.install(firmware::domain());
-    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize_live(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        database.clone(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     cache(
         &mut station,
         AP,
@@ -411,8 +423,12 @@ fn primary_station_secondary_ap_channel_refusal() -> Result<(), &'static str> {
     bus.set_caps(b"ap sta mchan");
     let database = Arc::new(narf_wireless::reg::db::Database::new());
     database.install(firmware::domain());
-    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize_live(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        database.clone(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     cache(
         &mut station,
         AP,
@@ -529,8 +545,12 @@ fn primary_ap_secondary_ap_mbss() -> Result<(), &'static str> {
     bus.set_caps(b"ap sta mbss");
     let database = Arc::new(narf_wireless::reg::db::Database::new());
     database.install(firmware::domain());
-    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize_live(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        database.clone(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     let owner = block(super::vif::discover(&mut station.runtime, station.mac))
         .map_err(|_| "cap discovery")?
         .ok_or("firmware cap refused")?;
@@ -693,8 +713,12 @@ fn secondary_ap_mbss_channel_mismatch() -> Result<(), &'static str> {
     bus.set_caps(b"ap sta mbss");
     let database = Arc::new(narf_wireless::reg::db::Database::new());
     database.install(firmware::domain());
-    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize_live(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        database.clone(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     let owner = block(super::vif::discover(&mut station.runtime, station.mac))
         .map_err(|_| "cap discovery")?
         .ok_or("firmware cap refused")?;
@@ -831,8 +855,12 @@ fn p2p_go_lifecycle() -> Result<(), &'static str> {
     bus.set_caps(b"ap sta mchan p2p");
     let database = Arc::new(narf_wireless::reg::db::Database::new());
     database.install(firmware::domain());
-    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize_live(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        database.clone(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     cache(
         &mut station,
         AP,
@@ -1026,8 +1054,12 @@ impl crate::brcmfmac::p2p_transport_cases::Model for firmware::Handle {
 /// (`p2p_transport_cases::discovery`).
 fn p2p_discovery() -> Result<(), &'static str> {
     let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
-    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     crate::brcmfmac::p2p_transport_cases::discovery(&mut station, &bus)
 }
 
@@ -1045,8 +1077,12 @@ kernel_test_in!(
 /// P2P_CLIENT connection bsscfg join over the actual CR4/msgbuf rings.
 fn p2p_client() -> Result<(), &'static str> {
     let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
-    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
-        .map_err(|_| "primary station over msgbuf")?;
+    let mut station = block(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))
+    .map_err(|_| "primary station over msgbuf")?;
     crate::brcmfmac::p2p_transport_cases::client_join(&mut station, &bus)
 }
 

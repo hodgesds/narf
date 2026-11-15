@@ -780,7 +780,7 @@ fn scan_result_profile(
 
 fn smoke_cyw_station_boot_scan_open_join_and_disconnect() -> TestResult {
     let Some(Ok(mut station)) = ready(Station::initialize(
-        Runtime::new(Bus::new()),
+        alloc::boxed::Box::new(Runtime::new(Bus::new())),
         &[1; 1030],
         domain(),
     )) else {
@@ -816,8 +816,11 @@ kernel_test_in!(
 fn smoke_cyw_station_wpa2_waits_for_firmware_keys() -> TestResult {
     let mut bus = Bus::new();
     bus.secured = true;
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], domain()))
-    else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        domain(),
+    )) else {
         return TestResult::Fail("station init");
     };
     let mut request = join_request(true);
@@ -847,9 +850,12 @@ fn preauthorization_fixture(
     bus.secured = secured;
     bus.preauthorization_packets = packets;
     bus.preauthorization_loss = loss;
-    let mut station =
-        narf_scheduler::block_on(Station::initialize(Runtime::new(bus), &[1], domain()))
-            .map_err(|_| "preauthorization fixture init")?;
+    let mut station = narf_scheduler::block_on(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        domain(),
+    ))
+    .map_err(|_| "preauthorization fixture init")?;
     narf_scheduler::block_on(station.scan(scan_request()))
         .map_err(|_| "preauthorization fixture scan")?;
     Ok(station)
@@ -966,8 +972,11 @@ kernel_test_in!(
 fn smoke_cyw_station_failed_join_cannot_reuse_late_authorization() -> TestResult {
     let mut bus = Bus::new();
     bus.join_status = 1;
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], domain()))
-    else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        domain(),
+    )) else {
         return TestResult::Fail("failed-join fixture initialization");
     };
     if !matches!(ready(station.scan(scan_request())), Some(Ok(_)))
@@ -990,8 +999,11 @@ kernel_test_in!(
 fn smoke_cyw_station_cancel_between_ioctls_closes_runtime() -> TestResult {
     let mut bus = Bus::new();
     bus.assoc_event = false; // LINK alone never opens the controlled port.
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], domain()))
-    else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        domain(),
+    )) else {
         return TestResult::Fail("station init");
     };
     if !matches!(ready(station.scan(scan_request())), Some(Ok(_)))
@@ -1053,7 +1065,11 @@ fn smoke_cyw_single_band_profile_rejects_firmware_five_ghz_aliases() -> TestResu
         max_power_dbm: 17,
         flags: narf_wireless::reg::RegFlags::empty(),
     });
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], policy)) else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        policy,
+    )) else {
         return TestResult::Fail("single-band profile initialization");
     };
     let mut request = scan_request();
@@ -1074,8 +1090,11 @@ kernel_test_in!(
 fn smoke_cyw_no_ir_preserves_passive_scan_without_association_authority() -> TestResult {
     let mut policy = domain();
     policy.rules[0].flags = narf_wireless::reg::RegFlags::NO_IR;
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(Bus::new()), &[1], policy))
-    else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(Bus::new())),
+        &[1],
+        policy,
+    )) else {
         return TestResult::Fail("NO_IR passive profile initialization");
     };
     if station.channels != [1, 6]
@@ -1125,8 +1144,11 @@ kernel_test_in!(
 fn smoke_cyw_station_rejected_disconnect_cannot_reuse_link() -> TestResult {
     let mut bus = Bus::new();
     bus.disconnect_error = true;
-    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], domain()))
-    else {
+    let Some(Ok(mut station)) = ready(Station::initialize(
+        alloc::boxed::Box::new(Runtime::new(bus)),
+        &[1],
+        domain(),
+    )) else {
         return TestResult::Fail("disconnect-error fixture initialization");
     };
     if !matches!(ready(station.scan(scan_request())), Some(Ok(_)))

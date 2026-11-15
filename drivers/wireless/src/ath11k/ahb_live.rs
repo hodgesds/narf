@@ -1082,7 +1082,7 @@ fn log(args: core::fmt::Arguments<'_>) {
 /// recovery resets the failure count and monitoring continues.
 async fn crash_monitor_task(
     mut live: Box<LiveAhb<NarfAhbEnv>>,
-    p: AhbPlatform,
+    p: Box<AhbPlatform>,
     shared: Arc<NarfAhbShared>,
 ) {
     loop {
@@ -1153,7 +1153,7 @@ async fn crash_monitor_task(
 /// to the runtime ([`super::runtime::start_ahb`]), then the post-boot
 /// crash monitor over the retained bring-up (it owns the SMP2P edges,
 /// the remoteproc and the platform the recovery re-boots with).
-pub async fn bring_up_task(blob: &'static [u8], p: AhbPlatform) {
+pub async fn bring_up_task(blob: &'static [u8], p: Box<AhbPlatform>) {
     let mut live = Box::new(LiveAhb::new(NarfAhbEnv::default(), blob));
     let r = bring_up(&p, &mut *live).await;
     match (r, live.outcome.take()) {
@@ -1190,7 +1190,7 @@ pub async fn bring_up_task(blob: &'static [u8], p: AhbPlatform) {
 }
 
 /// Spawn [`bring_up_task`] for a probed node.
-pub fn spawn_bring_up(blob: &'static [u8], p: AhbPlatform) {
+pub fn spawn_bring_up(blob: &'static [u8], p: Box<AhbPlatform>) {
     narf_scheduler::spawn(bring_up_task(blob, p));
 }
 

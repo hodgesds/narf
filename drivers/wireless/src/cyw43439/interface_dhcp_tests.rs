@@ -241,12 +241,16 @@ impl Harness {
         }
         let station = if let Some(database) = database {
             ready(Station::initialize_live(
-                Runtime::new(bus.clone()),
+                alloc::boxed::Box::new(Runtime::new(bus.clone())),
                 &[1],
                 database,
             ))?
         } else {
-            ready(Station::initialize(Runtime::new(bus.clone()), &[1], domain))?
+            ready(Station::initialize(
+                alloc::boxed::Box::new(Runtime::new(bus.clone())),
+                &[1],
+                domain,
+            ))?
         }
         .map_err(|_| "CYW composition firmware initialization")?;
         if station.mac != OWN {

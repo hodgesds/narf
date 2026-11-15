@@ -2,7 +2,7 @@
 //! Live host-policy observation, separate from firmware/RF quiescence.
 use super::{channel, channel_ceiling, occupied_power, Fullmac, Station};
 use crate::cyw43439::runtime::Error;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     future::{poll_fn, Future},
     task::Poll,
@@ -47,7 +47,7 @@ impl<R: Fullmac> Station<R> {
     /// Live policy for native attachment or an explicitly owned platform DB.
     /// The fixed-domain initialize API retains its snapshot-only contract.
     pub async fn initialize_live(
-        runtime: R,
+        runtime: Box<R>,
         clm: &[u8],
         source: Arc<dyn PolicySource>,
     ) -> Result<Self, Error> {

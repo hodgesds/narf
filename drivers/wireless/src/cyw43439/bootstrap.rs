@@ -147,7 +147,7 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
         let runtime = super::runtime::Runtime::new(transport)
             .with_firmware_vendor(vendor)
             .with_reboot(alloc::boxed::Box::new(reboot));
-        let device = interface::attach_runtime(name, runtime, &assets.clm)
+        let device = interface::attach_runtime(name, alloc::boxed::Box::new(runtime), &assets.clm)
             .await
             .map_err(|_| "station initialization failed")?;
         let generation = alloc::sync::Arc::new(SdioGeneration::with_publisher(
@@ -155,7 +155,7 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             alloc::boxed::Box::new(move |name, runtime| {
                 let clm = clm.lock().clone();
                 alloc::boxed::Box::pin(async move {
-                    interface::attach_runtime(name, runtime, &clm).await
+                    interface::attach_runtime(name, alloc::boxed::Box::new(runtime), &clm).await
                 })
             }),
         ));

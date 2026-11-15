@@ -795,7 +795,10 @@ impl Connection {
         if started.payload.len() != 16 || started.payload[4..12] != [1, 0, 0, 0, 1, 0, 0, 0] {
             return Err("association channel residency rejected");
         }
-        let mut this = Self {
+        // Box the connection: it is several KiB (reorder windows, MLD
+        // state, regulatory program) and holding it by value in this
+        // future overflows the 8 KiB frame budget in the callers.
+        let mut this = alloc::boxed::Box::new(Self {
             beacon,
             local,
             management_queue,
@@ -848,7 +851,7 @@ impl Connection {
             amsdu_memory: None,
             amsdu_memory_attempted: false,
             tlc_notification_version: hw.version(5, 0xf7).map(|v| v.1),
-        };
+        });
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
         this.check_six_pending(hw)?;
@@ -1369,7 +1372,7 @@ impl Connection {
         }
         hw.poll()?;
         this.authorized = true;
-        Ok(this)
+        Ok(*this)
     }
 
     fn rate(&self) -> Option<u32> {

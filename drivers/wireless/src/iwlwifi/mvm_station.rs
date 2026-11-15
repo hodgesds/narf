@@ -69,7 +69,7 @@ impl Owner {
         // has completed. NVM/defaults below still use actual native commands.
         let parsed = super::super::parse_ucode(firmware).unwrap();
         alloc::boxed::Box::new(Self {
-            hardware,
+            hardware: alloc::boxed::Box::new(hardware),
             firmware: firmware.to_vec(),
             profile: super::super::gen2_profile::select(0xa0f0, 0x351, 0x10c000).unwrap(),
             phase: Phase::Starting,
@@ -99,7 +99,7 @@ impl Owner {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) unsafe fn model_destroy(self: alloc::boxed::Box<Self>) {
         // SAFETY: only the private model calls this after dropping control work.
-        unsafe { super::super::runtime::model::destroy(self.hardware) };
+        unsafe { super::super::runtime::model::destroy(*self.hardware) };
     }
     pub(in crate::iwlwifi) fn bind_station_stop(&mut self, stop: Arc<AtomicBool>) {
         self.hardware.bind_station_stop(stop);

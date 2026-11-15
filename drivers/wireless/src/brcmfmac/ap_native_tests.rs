@@ -183,8 +183,12 @@ impl Bound {
         bus.enable_ap();
         let database = Arc::new(narf_wireless::reg::db::Database::new());
         database.install(firmware::domain());
-        let station = ready(Station::initialize_live(adapter, &[], database.clone()))?
-            .map_err(|_| "AP native initial firmware queries")?;
+        let station = ready(Station::initialize_live(
+            alloc::boxed::Box::new(adapter),
+            &[],
+            database.clone(),
+        ))?
+        .map_err(|_| "AP native initial firmware queries")?;
         let name = narf_net::iface::register("wlan%d", OWN, send);
         let device = shell(name.clone(), station);
         device.ap_fixture_setup(database.clone());

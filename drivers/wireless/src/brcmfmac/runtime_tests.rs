@@ -1608,7 +1608,7 @@ fn smoke_fullmac_station_initializes_over_actual_msgbuf() -> TestResult {
         }],
     };
     let mut initialization = pin!(crate::cyw43439::station::Station::initialize(
-        adapter,
+        alloc::boxed::Box::new(adapter),
         &[],
         domain
     ));

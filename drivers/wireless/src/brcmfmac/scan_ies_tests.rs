@@ -26,8 +26,12 @@ fn record(command: &[u8; 4]) -> Vec<u8> {
 }
 fn native(version: u32) -> Result<(), &'static str> {
     let (adapter, bus) = firmware::create(version, false).map_err(|_| "native msgbuf runtime")?;
-    let mut station = ready(Station::initialize(adapter, &[], firmware::domain()))?
-        .map_err(|_| "native station initialization")?;
+    let mut station = ready(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))?
+    .map_err(|_| "native station initialization")?;
     let start = bus.commands().len();
     let found = ready(station.scan(request(VENDOR.to_vec())))?
         .map_err(|_| "native scan with Probe Request IEs")?;
