@@ -68,7 +68,10 @@ pub struct Startup {
     /// RTL8851B radio owner (`radio_51`); unused on B and C.
     radio_51: super::radio_51::Radio,
     /// RTL8852A radio owner (`radio_a`); unused on B, C and RTL8851B.
-    radio_a: super::radio_a::Radio,
+    /// Boxed: the owner is 104 bytes and `Startup` is built and moved by
+    /// value in `claim`/`claim_reset`/`attach_cold`, whose frames grew
+    /// past their budget entries when this field landed (#2118).
+    radio_a: alloc::boxed::Box<super::radio_a::Radio>,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
     /// AP-role control owner (`startup_ap.rs`); exclusive with the station.
@@ -151,7 +154,7 @@ impl Startup {
             full_radio: super::radio_full::Radio::default(),
             radio_c: super::radio_c::Radio::default(),
             radio_51: super::radio_51::Radio::default(),
-            radio_a: super::radio_a::Radio::default(),
+            radio_a: alloc::boxed::Box::default(),
             station_controller: None,
             station_binding: None,
             ap_controller: None,

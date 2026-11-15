@@ -382,8 +382,20 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_bb_hardware_controls_match_frozen_references_and_retain_bases
 );
-/// Minimal MFW container carrying the shipped RTL8852C element order.
+/// Minimal MFW container carrying the shipped RTL8852C element order
+/// (`rf_table = {radiob, radioa}`: RADIO_A idx 1, RADIO_B idx 0).
 fn c_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
+    mfw_container(rf_a, rf_b, 1, 0)
+}
+/// Minimal MFW container carrying the shipped RTL8852A element order
+/// (`rtw8852a_chip_info.rf_table = {radioa, radiob}`): RADIO_A idx 0,
+/// RADIO_B idx 1. The C order is refused for A: fw.c stores a RADIO
+/// element at `rf_radio[reg2.idx]` and phy.c reads `rf_radio[path]`,
+/// so an A container must carry idx == path.
+fn a_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
+    mfw_container(rf_a, rf_b, 0, 1)
+}
+fn mfw_container(rf_a: u32, rf_b: u32, a_idx: u8, b_idx: u8) -> Vec<u8> {
     let mut bytes = vec![0; 48];
     bytes[0] = 255;
     bytes[1] = 1;
@@ -392,8 +404,8 @@ fn c_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
     for (id, idx, address, value) in [
         (2u32, 0u8, 0x0704u32, 0x601e_0100u32),
         (3, 0, 0x0000_0000, 0x0102_0304),
-        (4, 1, rf_a, 0x11),
-        (5, 0, rf_b, 0x22),
+        (4, a_idx, rf_a, 0x11),
+        (5, b_idx, rf_b, 0x22),
         (8, 0, 0x0c60, 0),
     ] {
         let start = bytes.len();
@@ -755,10 +767,6 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_bb_sethw_gpio_and_nctl_post_follow_rtw8851b
 );
-
-fn a_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
-    c_container(rf_a, rf_b)
-}
 
 fn smoke_rtw89_a_table_power_reset_rf_order_matches_rtw8852a() -> TestResult {
     let mut model = Model::new(0x5a, 1, 1);
