@@ -3463,8 +3463,10 @@ is the factory identity — and retains the firmware owner, which runs
   the 8821AE `0x1f0` four-byte layout). Tests
   `smoke_rtl8723ae_coex_dm_registers`, `smoke_rtl8723ae_dm_mech_init_and_query`,
   `smoke_rtl8723ae_dm_all_off_sequences` (written, unexecuted). The
-  1-ant path is a Linux stub, ported as a no-op. The coex owner is still
-  unreachable from probe (chip not admitted).
+  1-ant path is a Linux stub, ported as a no-op. The coex owner binds
+  from the adapter facts probe derives (`Adapter::bt`, as the admission
+  smoke test does); its live feed still runs through the packet owner,
+  whose station admission is still open.
 - `envelope` — signed per-board NAPC power envelopes, 2.4 GHz only
   (#1458): `Calibration::permission_for` mints the `Permission` the
   packet owner transmits under (v1/v2 rows, CCK/OFDM/HT 1SS curves,
@@ -3472,7 +3474,8 @@ is the factory identity — and retains the firmware owner, which runs
 - `packet` — the AE packet owner (#1458): 92CE-style TX descriptor
   fill, RX descriptor query, firmware + envelope admission gates
   (`Owner::admit`, `admit_tx`) and the mailbox service entry
-  (`service_c2h`). The chip is still not admitted (probe diagnostic).
+  (`service_c2h`). Probe admits the chip (#2087); the packet owner
+  itself is not yet admitted — station admission is still open.
 
 ### RTL8192DE retained runtime (2.4 GHz legacy station admitted)
 
