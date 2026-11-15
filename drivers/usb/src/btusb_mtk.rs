@@ -371,6 +371,7 @@ fn device_id(product_id: u16) -> Option<u16> {
     match product_id {
         0x7961 => Some(0x7961),
         0x0616 | 0x7922 | 0x3563 => Some(0x7922),
+        0x3604 => Some(0x7925),
         _ => None,
     }
 }
@@ -390,8 +391,14 @@ async fn read_register(io: &impl MtkUsb, reg: u32) -> Result<u32, MtkError> {
     Ok(u32::from_le_bytes(bytes))
 }
 pub(crate) fn firmware_name(chip: u32, version: u32, flavor: u32) -> Result<String, MtkError> {
-    if !matches!(chip, 0x7922 | 0x7961) {
+    if !matches!(chip, 0x7922 | 0x7925 | 0x7961) {
         return Err(MtkError::UnsupportedDevice);
+    }
+    if chip == 0x7925 {
+        return Ok(format!(
+            "mediatek/mt7925/BT_RAM_CODE_MT7925_1_{:x}_hdr.bin",
+            (version & 0xff) + 1
+        ));
     }
     Ok(format!(
         "mediatek/BT_RAM_CODE_MT{chip:04x}_{}_{:x}_hdr.bin",

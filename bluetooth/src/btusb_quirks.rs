@@ -161,6 +161,11 @@ pub const QUIRK_TABLE: &[QuirkMatch] = &[
         product: 0x3563,
         quirk: Quirk::MediaTek,
     }, // MT7922 Lite-On
+    QuirkMatch {
+        vendor: 0x13d3,
+        product: 0x3604,
+        quirk: Quirk::MediaTek,
+    }, // MT7925 IMC Networks / AzureWave
     // Broadcom BCM4377/4378 (Apple Silicon — uncommon on x86 NARF).
     QuirkMatch {
         vendor: 0x0a5c,
