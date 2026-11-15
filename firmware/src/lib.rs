@@ -463,10 +463,19 @@ pub fn register_initramfs_scan_initcall() {
         };
         match scan_initramfs(fs, &auth) {
             Ok(n) => {
-                let _ = n; // count is informational; logged by the init harness
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  firmware: registered {} blob(s) from initramfs",
+                    n
+                );
                 InitResult::Ok
             }
-            Err(_) => InitResult::Error("scan_initramfs failed"),
+            Err(_) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "  firmware: scan_initramfs failed");
+                InitResult::Error("scan_initramfs failed")
+            }
         }
     });
 }
@@ -565,11 +574,19 @@ pub fn scan_initramfs(
             continue;
         }
         match registry::install_blob(suffix, bytes, BlobSource::Initramfs) {
-            Ok(()) => n_ok += 1,
-            Err(_) => {
-                // Best-effort: skip bad blobs without aborting the
-                // rest of the walk. A future iteration may surface
-                // these via the observability layer.
+            Ok(()) => {
+                n_ok += 1;
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "  firmware: registered '{}'", suffix);
+            }
+            Err(e) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  firmware: FAILED to register '{}': {:?}",
+                    suffix,
+                    e
+                );
             }
         }
     }
