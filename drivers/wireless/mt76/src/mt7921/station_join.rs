@@ -2021,6 +2021,8 @@ impl<B: Backend> Session<B> {
         // RXD3 CH_FREQ of the operating channel (mt792x_get_status_freq_info).
         let rx_channel =
             crate::mt7921::channel::rx_channel(band, bss.channel).ok_or(Error::Bounds)?;
+        let frequency_mhz =
+            crate::mt7921::channel::frequency_in(band, bss.channel).ok_or(Error::Bounds)?;
         let initial_limits = permission
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
@@ -2076,6 +2078,7 @@ impl<B: Backend> Session<B> {
         let mut new_pmksa: Option<([u8; 16], Zeroizing<[u8; 32]>)> = None;
         // Roaming: this join is a reassociation away from that AP.
         let reassociate_from = self.station.reassociate_from.take();
+        let mut join_roc: Option<crate::mt7921::p2p_wire::Request> = None;
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -2135,6 +2138,18 @@ impl<B: Backend> Session<B> {
                 &switch,
             )
             .await?;
+            // Match Linux `mt7921_set_channel` -> `mt792x_mac_set_timeing`:
+            // update TMAC/SIFS/slot/CF-END and clear ARB TX/RX disable.
+            self.backend.pause_ap_timing()?;
+            let paused = self.backend.now_ns();
+            self.wait(20, |backend| {
+                Ok((backend.now_ns().saturating_sub(paused) >= 1_000).then_some(()))
+            })
+            .await?;
+            self.check_station_tx()?;
+            self.backend
+                .finish_ap_timing(!matches!(band, crate::mt7921::channel::Band::Ghz2), false)?;
+            self.check_station_tx()?;
 
             // Publish BSSID and an unauthorized AP WCID before management
             // or EAPOL RX; a scan-only BSS has no peer address installed.
@@ -2144,6 +2159,25 @@ impl<B: Backend> Session<B> {
             crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
+            // Match Linux `mt76_connac_mcu_uni_add_bss` -> `uni_set_chctx`.
+            let tx_streams = info.capabilities.phy.spatial_streams.min(2);
+            let chains = (1 << tx_streams) - 1;
+            let pre_auth_rlm = if six {
+                crate::mt7921::six_ghz::rlm(
+                    bss.channel,
+                    permission.center_channel(),
+                    permission.native_width(),
+                    tx_streams,
+                    chains,
+                )
+            } else {
+                crate::mt7921::csa::rlm(permission.chandef(), tx_streams, chains)
+            };
+            self.exchange_station(
+                Command::Unified { id: 2 },
+                &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), pre_auth_rlm),
+            )
+            .await?;
             let peer_record = plan
                 .peer_record_on(self.station.link, 0, false)
                 .map_err(|_| Error::Bounds)?;
@@ -2165,46 +2199,63 @@ impl<B: Backend> Session<B> {
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
             let aid = loop {
+                let _ = self.abort_join_roc(&mut join_roc).await;
                 let attempt = async {
-                    let assoc_req = match (security, cached.as_ref()) {
-                        // PMKSA caching: Open System authentication and the
-                        // cached PMKID instead of a new SAE exchange.
-                        (Security::Wpa3Sae { .. }, Some((pmkid, pmk))) => {
-                            let auth_req = plan
-                                .start_pmksa_authentication(*pmkid)
-                                .map_err(|_| Error::Busy)?
-                                .to_vec();
-                            self.associate_step = "auth-pmksa-tx";
-                            self.send_management(&auth_req, u16::from(self.station.link.peer()))
+                    self.associate_step = "auth-roc";
+                    self.acquire_join_roc(&mut join_roc, frequency_mhz, 2_000)
+                        .await?;
+                    let auth_result: Result<_, Error> = async {
+                        let assoc_req = match (security, cached.as_ref()) {
+                            // PMKSA caching: Open System authentication and the
+                            // cached PMKID instead of a new SAE exchange.
+                            (Security::Wpa3Sae { .. }, Some((pmkid, pmk))) => {
+                                let auth_req = plan
+                                    .start_pmksa_authentication(*pmkid)
+                                    .map_err(|_| Error::Busy)?
+                                    .to_vec();
+                                self.associate_step = "auth-pmksa-tx";
+                                self.send_management(
+                                    &auth_req,
+                                    u16::from(self.station.link.peer()),
+                                )
                                 .await?;
-                            self.associate_step = "auth-pmksa-rx";
-                            let request = self
-                                .open_authentication_response(&mut plan, rx_channel)
-                                .await?;
-                            sae_pmk = Some(Zeroizing::new(**pmk));
-                            request
-                        }
-                        (Security::Wpa3Sae { password }, None) => {
-                            let (request, pmk) = self
-                                .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
-                                .await?;
-                            new_pmksa = plan
-                                .sae()
-                                .and_then(|join| join.pmkid())
-                                .map(|pmkid| (pmkid, Zeroizing::new(*pmk)));
-                            sae_pmk = Some(pmk);
-                            request
-                        }
-                        _ => {
-                            let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
-                            self.associate_step = "auth-open-tx";
-                            self.send_management(auth_req, u16::from(self.station.link.peer()))
-                                .await?;
-                            // 4. Wait for Authentication Response:
-                            self.open_authentication_response(&mut plan, rx_channel)
-                                .await?
-                        }
-                    };
+                                self.associate_step = "auth-pmksa-rx";
+                                let request = self
+                                    .open_authentication_response(&mut plan, rx_channel)
+                                    .await?;
+                                sae_pmk = Some(Zeroizing::new(**pmk));
+                                request
+                            }
+                            (Security::Wpa3Sae { password }, None) => {
+                                let (request, pmk) = self
+                                    .authenticate_sae(
+                                        &mut plan, bss, ssid, own, password, rx_channel,
+                                    )
+                                    .await?;
+                                new_pmksa = plan
+                                    .sae()
+                                    .and_then(|join| join.pmkid())
+                                    .map(|pmkid| (pmkid, Zeroizing::new(*pmk)));
+                                sae_pmk = Some(pmk);
+                                request
+                            }
+                            _ => {
+                                let auth_req =
+                                    plan.start_authentication().map_err(|_| Error::Busy)?;
+                                self.associate_step = "auth-open-tx";
+                                self.send_management(auth_req, u16::from(self.station.link.peer()))
+                                    .await?;
+                                // 4. Wait for Authentication Response:
+                                self.open_authentication_response(&mut plan, rx_channel)
+                                    .await?
+                            }
+                        };
+                        Ok(assoc_req)
+                    }
+                    .await;
+                    let abort = self.abort_join_roc(&mut join_roc).await;
+                    let assoc_req = auth_result?;
+                    abort?;
 
                     // 5. Send Association Request (a Reassociation Request
                     // when roaming within the ESS):
@@ -2219,6 +2270,9 @@ impl<B: Backend> Session<B> {
                         None => assoc_req,
                     };
                     self.stage(Stage::Associate);
+                    self.associate_step = "assoc-roc";
+                    self.acquire_join_roc(&mut join_roc, frequency_mhz, 2_000)
+                        .await?;
                     self.associate_step = "assoc-tx";
                     self.send_management(&assoc_req, u16::from(self.station.link.peer()))
                         .await?;
@@ -2350,6 +2404,7 @@ impl<B: Backend> Session<B> {
             }
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
+            self.abort_join_roc(&mut join_roc).await?;
             if let Some(he) = plan.he() {
                 // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
                 // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
@@ -2557,6 +2612,7 @@ impl<B: Backend> Session<B> {
                 self.station.security = None;
                 self.station.wmm = None;
                 self.station.wmm_pending = None;
+                let _ = self.abort_join_roc(&mut join_roc).await;
                 self.station.permission = None;
                 self.station.ht20_rx = None;
                 self.station.ht20_profile = None;

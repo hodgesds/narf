@@ -536,9 +536,8 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             }
             let token = turn as u16 + 1;
             let ring = &hw.owner.storage.as_ref().unwrap().data;
-            if ring.word(slot, 1) != (64 << 16) | LAST_SEC1 | (frame.len().min(CT_PARSE_LEN) as u32)
-            {
-                return TestResult::Fail("DMA must publish TXD+TXP and CT parse header");
+            if ring.word(slot, 1) != (64 << 16) | LAST {
+                return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
             }
             if hw.submit_management(
                 crate::mt7921::vif_slots::Vif::HOME,
@@ -623,7 +622,7 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
             || bytes[28..36] != [0, 0, 40, 0, 1, 128, 0, 0]
             || bytes[44..46] != [18, 128]
             || bytes[64..] != frame
-            || ring.word(0, 1) != (64 << 16) | LAST_SEC1 | (frame.len().min(CT_PARSE_LEN) as u32)
+            || ring.word(0, 1) != (64 << 16) | LAST
             || hw.submit_data(
                 crate::mt7921::vif_slots::Link::HOME,
                 &frame,

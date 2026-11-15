@@ -4,6 +4,7 @@ use crate::mt7921::{
     p2p_cnm::Phase,
     p2p_wire::{self, Kind},
 };
+use alloc::vec::Vec;
 use narf_wireless::ap_control::RadioEventAuthority;
 #[path = "p2p_channel.rs"]
 mod admission;
@@ -186,62 +187,21 @@ impl<B: Backend> Session<B> {
                 &request.acquire(),
             )
             .await?;
-            let began = self.backend.now_ns();
-            loop {
-                self.check_p2p_roc_pending()?;
-                let left =
-                    1_000_000_000u64.saturating_sub(self.backend.now_ns().saturating_sub(began));
-                if left < 1_000_000 {
-                    return Err(Error::Timeout);
-                }
-                let queued = self
-                    .events
-                    .iter()
-                    .position(|event| event.get(28) == Some(&0x27));
-                let mut event = if let Some(index) = queued {
-                    self.events.remove(index).ok_or(Error::Ring)?
-                } else {
-                    self.wait(left / 1_000_000, Backend::receive).await?
-                };
-                if event.len() < 36 {
-                    return Err(Error::MalformedEvent);
-                }
-                let length = usize::from(u16::from_le_bytes([event[24], event[25]])) + 24;
-                if length < 36 || length > event.len() {
-                    return Err(Error::MalformedEvent);
-                }
-                event.truncate(length);
-                if event[28] != 0x27 {
-                    if roc_ack(&event) {
-                        continue;
-                    }
-                    if self.events.len() == super::super::MAX_EVENTS {
-                        return Err(Error::EventOverflow);
-                    }
-                    self.events.push_back(event);
-                    continue;
-                }
-                if length != 60 || event[30] & 4 == 0 {
-                    return Err(Error::MalformedEvent);
-                }
-                // A foreign/delayed grant is not this request. The source
-                // ABI has one outstanding acquisition and one terminal grant;
-                // successful finite retirement, unlike timeout/ambiguity,
-                // permits normal opaque-u8 recycling as Linux does.
-                let bss = self.p2p_owner.as_ref().ok_or(Error::Busy)?.vif.index();
-                if event[44] != bss || event[45] != request.token() {
-                    continue;
-                }
-                let now = self.backend.now_ns();
-                let duration = self
-                    .p2p_owner
-                    .as_mut()
-                    .ok_or(Error::Busy)?
-                    .cnm
-                    .grant(&event[36..], now)?;
-                self.check_p2p_roc_pending()?;
-                return Ok(duration);
-            }
+            let bss = self.p2p_owner.as_ref().ok_or(Error::Busy)?.vif.index();
+            let event = self
+                .wait_roc_grant(bss, request.token(), |session| {
+                    session.check_p2p_roc_pending()
+                })
+                .await?;
+            let now = self.backend.now_ns();
+            let duration = self
+                .p2p_owner
+                .as_mut()
+                .ok_or(Error::Busy)?
+                .cnm
+                .grant(&event[36..], now)?;
+            self.check_p2p_roc_pending()?;
+            Ok(duration)
         }
         .await;
         match result {
@@ -391,18 +351,7 @@ impl<B: Backend> Session<B> {
         }
         self.stage(Stage::P2pRocExpire);
         let result = async {
-            self.notify(
-                Command::Unified {
-                    id: p2p_wire::UNIFIED_ROC,
-                },
-                &abort,
-            )
-            .await?;
-            self.confirm_command_progress().await?;
-            // Unified ACK option is set by the source builder even for
-            // wait=false. Retire these inert ROC ACKs; keeping them forever
-            // would invent a small successful-request lifetime limit.
-            self.events.retain(|event| !roc_ack(event));
+            self.send_roc_abort(abort).await?;
             let now = self.backend.now_ns();
             let owner = self.p2p_owner.as_mut().ok_or(Error::Busy)?;
             let lease = owner.cnm.release_expired_after_packets(now)?;
@@ -510,6 +459,120 @@ impl<B: Backend> Session<B> {
             core::task::Poll::Pending
         })
         .await
+    }
+
+    async fn wait_roc_grant(
+        &mut self,
+        bss: u8,
+        token: u8,
+        mut check: impl FnMut(&mut Self) -> Result<(), Error>,
+    ) -> Result<Vec<u8>, Error> {
+        let began = self.backend.now_ns();
+        loop {
+            check(self)?;
+            let left = 1_000_000_000u64.saturating_sub(self.backend.now_ns().saturating_sub(began));
+            if left < 1_000_000 {
+                return Err(Error::Timeout);
+            }
+            let queued = self
+                .events
+                .iter()
+                .position(|event| event.get(28) == Some(&0x27));
+            let mut event = if let Some(index) = queued {
+                self.events.remove(index).ok_or(Error::Ring)?
+            } else {
+                self.wait(left / 1_000_000, Backend::receive).await?
+            };
+            if event.len() < 36 {
+                return Err(Error::MalformedEvent);
+            }
+            let length = usize::from(u16::from_le_bytes([event[24], event[25]])) + 24;
+            if length < 36 || length > event.len() {
+                return Err(Error::MalformedEvent);
+            }
+            event.truncate(length);
+            if event[28] != 0x27 {
+                if roc_ack(&event) {
+                    continue;
+                }
+                if self.events.len() == super::super::MAX_EVENTS {
+                    return Err(Error::EventOverflow);
+                }
+                self.events.push_back(event);
+                continue;
+            }
+            if length != 60 || event[30] & 4 == 0 {
+                return Err(Error::MalformedEvent);
+            }
+            // A foreign/delayed grant is not this request.
+            if event[44] != bss || event[45] != token {
+                continue;
+            }
+            return Ok(event);
+        }
+    }
+
+    async fn send_roc_abort(&mut self, abort: [u8; 16]) -> Result<(), Error> {
+        self.notify(
+            Command::Unified {
+                id: p2p_wire::UNIFIED_ROC,
+            },
+            &abort,
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        // Unified ACK option is set by the source builder even for
+        // wait=false. Retire these inert ROC ACKs; keeping them forever
+        // would invent a small successful-request lifetime limit.
+        self.events.retain(|event| !roc_ack(event));
+        Ok(())
+    }
+
+    /// Acquire a CONNAC2 CNM join grant (`MT7921_ROC_REQ_JOIN`) before station
+    /// management TX when firmware advertises `MT792x_FW_CAP_CNM`, mirroring
+    /// Linux `mt7921_mgd_prepare_tx`.
+    pub(in crate::mt7921::firmware_transport) async fn acquire_join_roc(
+        &mut self,
+        active: &mut Option<p2p_wire::Request>,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<(), Error> {
+        if !self.firmware.cnm_capability()? {
+            return Ok(());
+        }
+        self.abort_join_roc(active).await?;
+        self.confirm_command_progress().await?;
+        self.check_station_tx()?;
+        let token = self.p2p_next;
+        self.p2p_next = if token == u8::MAX { 1 } else { token + 1 };
+        let bss = self.station.link.vif().index();
+        let request = p2p_wire::Request::new(bss, token, frequency_mhz, duration_ms, Kind::Join)?;
+        self.notify(
+            Command::Unified {
+                id: p2p_wire::UNIFIED_ROC,
+            },
+            &request.acquire(),
+        )
+        .await?;
+        *active = Some(request);
+        let event = self
+            .wait_roc_grant(bss, request.token(), Self::check_station_tx)
+            .await?;
+        self.events.retain(|event| !roc_ack(event));
+        let _ = request.grant(&event[36..])?;
+        self.check_station_tx()
+    }
+
+    /// Release an active CNM join grant (`UNI_ROC_ABORT`), mirroring Linux
+    /// `mt7921_mgd_complete_tx`.
+    pub(in crate::mt7921::firmware_transport) async fn abort_join_roc(
+        &mut self,
+        active: &mut Option<p2p_wire::Request>,
+    ) -> Result<(), Error> {
+        let Some(request) = active.take() else {
+            return Ok(());
+        };
+        self.send_roc_abort(request.abort()).await
     }
 }
 fn roc_ack(event: &[u8]) -> bool {

@@ -5392,9 +5392,9 @@ fn readlink_node(
 static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
 /// Translate POSIX `PROT_*` bits into NARF region perms. `PROT_NONE`
-/// (`prot == 0`) maps to `RegionPerms(0)` so guard pages and unmapped
-/// reservations leave leaf PTEs absent and fault with `SIGSEGV` until
-/// `mprotect` enables access.
+/// (a bare reservation) maps to a present READ region — NARF has no
+/// no-access mapping, and the reservation is typically overwritten by a
+/// later MAP_FIXED segment anyway.
 fn perms_of_prot(prot: u32) -> RegionPerms {
     const PROT_READ: u32 = 0x1;
     const PROT_WRITE: u32 = 0x2;
@@ -5408,6 +5408,12 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
     }
     if prot & PROT_EXEC != 0 {
         p = p | RegionPerms::EXEC;
+    }
+    if !p.contains(RegionPerms::READ)
+        && !p.contains(RegionPerms::WRITE)
+        && !p.contains(RegionPerms::EXEC)
+    {
+        p = RegionPerms::READ;
     }
     p
 }

@@ -2474,6 +2474,189 @@ kernel_test_in!(
     mcu_live_join_peer_rejection_and_timeout
 );
 
+fn mcu_live_join_cnm_roc_and_pre_auth_timing_rlm() -> TestResult {
+    fn is_roc_acquire(f: &[u8]) -> bool {
+        f.len() == 76 && f[34..36] == [0x27, 0] && f[56] == 0
+    }
+    fn is_roc_abort(f: &[u8]) -> bool {
+        f.len() == 64 && f[34..36] == [0x27, 0] && f[56] == 0
+    }
+    fn is_rlm(f: &[u8]) -> bool {
+        f.len() == 68 && f[34..36] == [2, 0] && f[43] == 7 && f[52..56] == [2, 0, 16, 0]
+    }
+    fn is_auth_tx((scatter, f): &(bool, Vec<u8>)) -> bool {
+        !*scatter && f.len() >= 24 && f[0] == 0xb0
+    }
+    fn is_assoc_tx((scatter, f): &(bool, Vec<u8>), bssid: [u8; 6]) -> bool {
+        !*scatter && f.len() >= 24 && f[0] == 0x00 && f[16..22] == bssid
+    }
+
+    // (a) + (d) With CNM capability, join programs timing + pre-auth RLM before
+    // Auth TX and wraps both Auth and Assoc management exchanges in Kind::Join
+    // (0) ROC acquire/abort pairs.
+    let (mut session, bss) = wmm_tests::prepared(true, false);
+    let base = firmware(32);
+    let Ok(cnm_fw) = Firmware::prepare(&base.patch, &p2p::wm_features(0x80)) else {
+        return TestResult::Fail("CNM firmware prepare");
+    };
+    session.firmware = cnm_fw.clone();
+    let roc = Arc::new(RocModel::default());
+    session.backend.roc = Some(roc.clone());
+    let start = session.backend.frames.len();
+    if run(session.associate_station(
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Open,
+        test_permission(),
+        &[],
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("CNM open join");
+    }
+    if !matches!(session.state, State::Associated { .. }) {
+        return TestResult::Fail("CNM join did not reach Associated");
+    }
+    if session.backend.ap_timing.is_none() {
+        return TestResult::Fail("pre-auth ap_timing not programmed");
+    }
+    let frames = &session.backend.frames[start..];
+    let acquires: Vec<(usize, &[u8])> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, f))| is_roc_acquire(f))
+        .map(|(i, (_, f))| (i, f.as_slice()))
+        .collect();
+    let aborts: Vec<(usize, &[u8])> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, f))| is_roc_abort(f))
+        .map(|(i, (_, f))| (i, f.as_slice()))
+        .collect();
+    let auth_idx = frames.iter().position(is_auth_tx);
+    let assoc_idx = frames.iter().position(|item| is_assoc_tx(item, bss.bssid));
+    let first_rlm = frames.iter().position(|(_, f)| is_rlm(f));
+    let (Some(auth_i), Some(assoc_i), Some(rlm0)) = (auth_idx, assoc_idx, first_rlm) else {
+        return TestResult::Fail("missing RLM, Auth TX, or Assoc TX frame");
+    };
+    if acquires.len() != 2 || aborts.len() != 2 {
+        return TestResult::Fail("expected 2 Kind::Join ROC acquire+abort pairs");
+    }
+    if acquires[0].1[67] != 0
+        || acquires[1].1[67] != 0
+        || acquires[0].1[57] != aborts[0].1[57]
+        || acquires[1].1[57] != aborts[1].1[57]
+    {
+        return TestResult::Fail("unexpected Join ROC kind or mismatched token");
+    }
+    if !(rlm0 < acquires[0].0
+        && acquires[0].0 < auth_i
+        && auth_i < aborts[0].0
+        && aborts[0].0 < acquires[1].0
+        && acquires[1].0 < assoc_i
+        && assoc_i < aborts[1].0)
+    {
+        return TestResult::Fail("unexpected pre-auth RLM / Join ROC / Auth / Assoc order");
+    }
+    if !roc.seen.load(Ordering::Acquire) {
+        return TestResult::Fail("RocModel did not observe Join ROC acquire");
+    }
+
+    // (b) Failure during Auth must abort the active Kind::Join ROC before returning.
+    let mut rejected = Session::new_boxed(Model::new(), cnm_fw);
+    if run(rejected.run()).is_err() || run(rejected.initialize_radio()).is_err() {
+        return TestResult::Fail("rejected radio init");
+    }
+    let rej_roc = Arc::new(RocModel::default());
+    rejected.backend.roc = Some(rej_roc);
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let ap = [2, 1, 2, 3, 4, 5];
+    let rej_bss = ScanBss {
+        bssid: ap,
+        ssid: b"narf-join".to_vec(),
+        channel: 6,
+        band: None,
+        signal_dbm: Some(-45),
+        capability: 1,
+        beacon_interval: 100,
+        information_elements: vec![
+            0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n', 1, 4, 0x82, 0x84, 0x8b,
+            0x96, 3, 1, 6,
+        ],
+    };
+    let mut auth_resp = vec![0u8; 30];
+    auth_resp[0] = 0xb0;
+    auth_resp[4..10].copy_from_slice(&own);
+    auth_resp[10..16].copy_from_slice(&ap);
+    auth_resp[16..22].copy_from_slice(&ap);
+    auth_resp[24..30].copy_from_slice(&[0, 0, 2, 0, 1, 0]);
+    let mut auth_packet = vec![0u8; 32 + auth_resp.len()];
+    let len = auth_packet.len();
+    auth_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+    auth_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    auth_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    auth_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+    auth_packet[32..].copy_from_slice(&auth_resp);
+    rejected.backend.packets.push_back(auth_packet);
+    let rej_start = rejected.backend.frames.len();
+    if run(rejected.associate_station(
+        &rej_bss,
+        b"narf-join",
+        crate::mt7921::association::Security::Open,
+        test_permission(),
+        &[],
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("peer rejection unexpectedly succeeded");
+    }
+    let rej_frames = &rejected.backend.frames[rej_start..];
+    let rej_acq: Vec<_> = rej_frames
+        .iter()
+        .filter(|(_, f)| is_roc_acquire(f))
+        .collect();
+    let rej_abt: Vec<_> = rej_frames.iter().filter(|(_, f)| is_roc_abort(f)).collect();
+    if rej_acq.len() != 1 || rej_abt.len() != 1 || rej_acq[0].1[57] != rej_abt[0].1[57] {
+        return TestResult::Fail("Auth failure did not abort active Kind::Join ROC");
+    }
+
+    // (c) Without CNM capability, join sends zero UNIFIED_ROC frames while still
+    // programming pre-auth timing and RLM before Auth TX.
+    let (mut non_cnm, non_bss) = wmm_tests::prepared(true, false);
+    let nc_start = non_cnm.backend.frames.len();
+    if run(non_cnm.associate_station(
+        &non_bss,
+        b"narf",
+        crate::mt7921::association::Security::Open,
+        test_permission(),
+        &[],
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("non-CNM open join");
+    }
+    let nc_frames = &non_cnm.backend.frames[nc_start..];
+    if nc_frames
+        .iter()
+        .any(|(scatter, f)| !*scatter && f.len() >= 36 && f[34..36] == [0x27, 0])
+    {
+        return TestResult::Fail("non-CNM firmware emitted UNIFIED_ROC during join");
+    }
+    let nc_rlm0 = nc_frames.iter().position(|(_, f)| is_rlm(f));
+    let nc_auth = nc_frames.iter().position(is_auth_tx);
+    if non_cnm.backend.ap_timing.is_none()
+        || !matches!((nc_rlm0, nc_auth), (Some(r), Some(a)) if r < a)
+    {
+        return TestResult::Fail("non-CNM join skipped pre-auth timing or pre-auth RLM");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mcu_live_join_cnm_roc_and_pre_auth_timing_rlm
+);
+
 fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult {
     let mut model = Model::new();
     let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];

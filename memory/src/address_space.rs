@@ -8509,10 +8509,7 @@ impl AddressSpace {
         {
             return;
         }
-        // Tag-wide across all CPUs: `flush_deferred` can be called from a
-        // foreign CPU (e.g. `anon_reclaim`), where `flush_region_broadcast`
-        // would omit the owner CPU if `active_cpus == 1`.
-        self.flush_range_all_cpus(VirtAddr::new(0), Self::USER_HALF_END >> 12);
+        self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
         if self.root.as_u64() != 0 {
             for region in &batch.regions {
                 self.free_region_frames(region);
@@ -12264,16 +12261,15 @@ impl AddressSpace {
                 .acct
                 .resident_pages
                 .saturating_sub(to_release.len() as u64);
-            if !to_release.is_empty() {
-                // Shoot down remote TLB entries while still holding `regions`
-                // so a peer CPU cannot keep writing through a stale writable
-                // TLB entry into a retired frame while `phys[i] == 0`, nor
-                // fault in a replacement page before the shootdown lands.
-                self.flush_region_broadcast(base, (hi - lo) >> 12);
-            }
         }
         if !touched {
             return Err(AddressSpaceError::Unmapped);
+        }
+        if !to_release.is_empty() {
+            // Shoot down remote TLB entries after releasing `regions` (an
+            // `IrqSafeSpinLock`) and before returning frames to the buddy or
+            // returning to userspace while the VMA remains live.
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
         }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&discarded_swap);
@@ -12667,16 +12663,11 @@ impl AddressSpace {
             // (in-place writes, invisible to the insert/remove accounting
             // primitives).
             g.acct.resident_pages = g.acct.resident_pages.saturating_sub(freed.len() as u64);
-            if !freed.is_empty() {
-                // ONE cross-CPU invalidation across all CPUs while holding
-                // `regions` (`discard_lazyfree_pages` may run from a foreign
-                // reclaimer CPU when `active_cpus == 1` on a victim CPU).
-                self.flush_range_all_cpus(VirtAddr::new(0), Self::USER_HALF_END >> 12);
-            }
         }
         if freed.is_empty() {
             return 0;
         }
+        self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
         crate::frame::free_frame_batch(&freed);
         freed.len()
     }
