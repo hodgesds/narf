@@ -664,7 +664,12 @@ fn parse_program_headers(
     }
     for (index, left) in segments[..segment_count].iter().enumerate() {
         let left_end = left.physical + left.memory_size;
-        for (_right_index, right) in segments[index + 1..segment_count].iter().enumerate() {
+        // The index is used by the #[cfg(not(test))] overlap diagnostic
+        // below, so it is load-bearing in the production build; clippy
+        // only sees the test build, where the diagnostic is compiled out.
+        #[allow(clippy::needless_range_loop)]
+        for right_index in index + 1..segment_count {
+            let right = &segments[right_index];
             let right_end = right.physical + right.memory_size;
             if left.physical < right_end && right.physical < left_end {
                 #[cfg(not(test))]
@@ -673,7 +678,7 @@ fn parse_program_headers(
                     index,
                     left.physical,
                     left_end,
-                    index + 1 + _right_index,
+                    right_index,
                     right.physical,
                     right_end
                 );
