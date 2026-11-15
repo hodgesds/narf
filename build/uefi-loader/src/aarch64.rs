@@ -664,7 +664,7 @@ fn parse_program_headers(
     }
     for (index, left) in segments[..segment_count].iter().enumerate() {
         let left_end = left.physical + left.memory_size;
-        for (right_index, right) in segments[index + 1..segment_count].iter().enumerate() {
+        for (_right_index, right) in segments[index + 1..segment_count].iter().enumerate() {
             let right_end = right.physical + right.memory_size;
             if left.physical < right_end && right.physical < left_end {
                 #[cfg(not(test))]
@@ -673,7 +673,7 @@ fn parse_program_headers(
                     index,
                     left.physical,
                     left_end,
-                    index + 1 + right_index,
+                    index + 1 + _right_index,
                     right.physical,
                     right_end
                 );
