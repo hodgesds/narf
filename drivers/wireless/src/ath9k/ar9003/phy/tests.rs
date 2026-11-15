@@ -1106,13 +1106,10 @@ fn smoke_ath9k_ar9485_mrc_cck_spur_branch() -> TestResult {
 
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
-kernel_test_in!(
-    "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9565_spur_mitigation_and_fast_clock
 );
 
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9485_mrc_cck_spur_branch
-);
 );
