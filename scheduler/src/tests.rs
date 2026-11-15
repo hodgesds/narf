@@ -1332,6 +1332,60 @@ kernel_test_in!(
     smoke_scheduler_spawn_user_carries_address_space
 );
 
+/// `task_last_cpu` must record the CPU a user task ran on and clear on exit.
+fn smoke_scheduler_task_last_cpu_tracks_dispatch() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    crate::__reset_queues_for_test();
+    static OBSERVED: AtomicU32 = AtomicU32::new(u32::MAX);
+    static EXPECTED: AtomicU32 = AtomicU32::new(u32::MAX);
+    OBSERVED.store(u32::MAX, Ordering::SeqCst);
+    EXPECTED.store(u32::MAX, Ordering::SeqCst);
+
+    // SAFETY: Paging is enabled in the kernel test environment (`new_for_user`).
+    let a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    a.map_region(Region {
+        base: VirtAddr::new(0x4000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXEC,
+        phys: alloc::vec![PhysAddr::new(0x2_0000)].into(),
+    })
+    .expect("map");
+    let arc_a = Arc::new(a);
+
+    let tid = crate::spawn_user(
+        crate::alloc_task_id(),
+        async {
+            let expected = narf_lib::percpu::current_cpu() as u32;
+            let seen = crate::task_last_cpu(crate::current_task_id()).unwrap_or(u32::MAX);
+            EXPECTED.store(expected, Ordering::Release);
+            OBSERVED.store(seen, Ordering::Release);
+        },
+        crate::TaskSpec::unthrottled(),
+        Arc::clone(&arc_a),
+    );
+
+    if crate::task_last_cpu(tid).is_none() {
+        return TestResult::Fail("task_last_cpu missing before first slice");
+    }
+
+    crate::run_until_empty();
+
+    let expected = EXPECTED.load(Ordering::Acquire);
+    let observed = OBSERVED.load(Ordering::Acquire);
+    if expected == u32::MAX || observed != expected {
+        return TestResult::Fail("task_last_cpu did not match running CPU inside slice");
+    }
+    if crate::task_last_cpu(tid).is_some() {
+        return TestResult::Fail("task_last_cpu persisted past task completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_task_last_cpu_tracks_dispatch);
+
 /// Remote-memory users (`ptrace`, `process_vm_*`, and `/proc/<pid>/mem`) must
 /// resolve a user mm while its slot is absent from READY during executor and
 /// cross-core handoff transitions.

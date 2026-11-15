@@ -509,6 +509,14 @@ impl Mt76Iface {
     }
 
     async fn finish_teardown(&self, operator_request: bool) -> Result<(), WirelessError> {
+        self.finish_teardown_inner(operator_request, true).await
+    }
+
+    async fn finish_teardown_inner(
+        &self,
+        operator_request: bool,
+        clear_scan: bool,
+    ) -> Result<(), WirelessError> {
         if self.teardown_needed.load(Ordering::Acquire) {
             match crate::mt7921::firmware_transport::disassociate_boot_station().await {
                 Ok(()) => {
@@ -544,7 +552,9 @@ impl Mt76Iface {
             .store(now.saturating_add(delay), Ordering::Release);
         self.lose_link();
         self.teardown_needed.store(true, Ordering::Release);
-        self.clear_scan_cache();
+        if clear_scan {
+            self.clear_scan_cache();
+        }
         crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
@@ -1344,7 +1354,9 @@ impl WirelessNetIface for Mt76Iface {
         let six = self
             .validate_join(&req)
             .inspect_err(|error| note_failure("associate: join validation", error))?;
-        self.finish_teardown(true)
+        // Preserve cached BSS scan results across failed-association recovery
+        // so immediate retries on another BSS/band still find scan entries.
+        self.finish_teardown_inner(true, false)
             .await
             .inspect_err(|error| note_failure("associate: previous-link teardown", error))?;
         if self.link_up() {
@@ -1845,12 +1857,18 @@ pub(crate) fn register_scan_iface_profile(
         use core::fmt::Write;
         let _ = writeln!(narf_console::Writer, "mt76: regulatory policy: {}", error);
     }
-    iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
     let bus_info = match crate::mt7921::pci::bound_bus_addr() {
         Some(narf_bus::BusAddr::Pcie(pci)) => alloc::format!("{pci:?}"),
         _ => alloc::string::String::new(),
     };
-    narf_net::iface::set_driver_info(&iface.name, "mt7921e", Some("0.1.0"), bus_info);
+    iface.name = narf_net::iface::register_with_driver(
+        "wlan%d",
+        info.capabilities.mac,
+        send_frame,
+        "mt7921e",
+        Some("0.1.0"),
+        bus_info,
+    );
     publish_link(&iface.name, false);
     let iface = Arc::new(iface);
     let cap = match narf_net::registry().register(&authority, RegisteredIface(iface.clone())) {
@@ -2915,5 +2933,55 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/association",
         mt76_iface_ring_admission_and_link_cleanup
+    );
+    fn mt76_associate_recovery_preserves_scan_cache() -> TestResult {
+        let iface = Mt76Iface::new(String::from("wlan0"), radio()).unwrap();
+        let bssid = [0x80, 0x2a, 0xa8, 0x58, 0x9c, 0xec];
+        let bss = ScanBss {
+            bssid,
+            ssid: b"narf".to_vec(),
+            channel: 6,
+            band: None,
+            signal_dbm: Some(-55),
+            capability: 0x0401,
+            beacon_interval: 100,
+            information_elements: Vec::new(),
+        };
+        *iface.scan_cache.lock() = vec![bss];
+        *iface.scan_beaconed.lock() = vec![(bssid, 6)];
+        iface.teardown_needed.store(true, Ordering::Release);
+
+        let req = AssociateRequest {
+            bssid,
+            ssid: b"narf".to_vec(),
+            frequency_mhz: 2437,
+            channel: 6,
+            security: narf_wireless::SecurityConfig::Open,
+            ie: Vec::new(),
+        };
+        // No hardware radio is bound here, so teardown exits with HardwareError
+        // after running the associate recovery entry path.
+        let _ = narf_scheduler::block_on_spin(iface.associate(AssociateRequest {
+            bssid: req.bssid,
+            ssid: req.ssid.clone(),
+            frequency_mhz: req.frequency_mhz,
+            channel: req.channel,
+            security: narf_wireless::SecurityConfig::Open,
+            ie: req.ie.clone(),
+        }));
+        if iface.scan_cache.lock().len() != 1 || iface.scan_beaconed.lock().len() != 1 {
+            return TestResult::Fail("associate recovery cleared cached scan entries");
+        }
+        if iface
+            .resolve_join(&req, narf_wireless::SecurityConfig::Open, false, true)
+            .is_err()
+        {
+            return TestResult::Fail("cached BSS no longer resolves after associate recovery");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/association",
+        mt76_associate_recovery_preserves_scan_cache
     );
 }

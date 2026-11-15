@@ -1350,12 +1350,101 @@ pub fn emit_block_device_add_events() -> usize {
     count
 }
 
+// Lock order: NET_PUBLICATION -> IFACES (via `net_snapshots` / `net_snapshot`).
+// Callers in `narf-net` must release `IFACES` before invoking sysfs sync hooks.
+static NET_PUBLICATION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+
+fn pci_net_dir(devices: &Arc<Kobject>, parent: &NetPciParent) -> Option<Arc<Kobject>> {
+    let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
+    let slot_name = format!(
+        "{:04x}:{:02x}:{:02x}.{}",
+        parent.segment, parent.bus, parent.device, parent.function
+    );
+    devices
+        .get_child(&host_name)
+        .and_then(|host| host.get_child(&slot_name))
+        .and_then(|device| device.get_child("net"))
+}
+
+fn find_net_kobjects(devices: &Arc<Kobject>, name: &str) -> Vec<(Arc<Kobject>, Arc<Kobject>)> {
+    let mut found = Vec::new();
+    if let Some(vnet) = devices
+        .get_child("virtual")
+        .and_then(|virtual_devices| virtual_devices.get_child("net"))
+    {
+        if let Some(kobj) = vnet.get_child(name) {
+            found.push((vnet, kobj));
+        }
+    }
+    for host_name in devices.child_names() {
+        if !host_name.starts_with("pci") {
+            continue;
+        }
+        let Some(host) = devices.get_child(&host_name) else {
+            continue;
+        };
+        for slot_name in host.child_names() {
+            let Some(net_dir) = host
+                .get_child(&slot_name)
+                .and_then(|device| device.get_child("net"))
+            else {
+                continue;
+            };
+            if let Some(kobj) = net_dir.get_child(name) {
+                found.push((net_dir, kobj));
+            }
+        }
+    }
+    found
+}
+
+fn remove_phy0_if_unused(root: &Arc<Kobject>, devices: &Arc<Kobject>) {
+    let net_has_phy80211 = |net: &Arc<Kobject>| {
+        net.child_names().into_iter().any(|iface_name| {
+            net.get_child(&iface_name)
+                .is_some_and(|kobj| kobj.get_symlink("phy80211").is_some())
+        })
+    };
+    let still_used = devices.child_names().into_iter().any(|top_name| {
+        if top_name == "virtual" {
+            return devices
+                .get_child("virtual")
+                .and_then(|v| v.get_child("net"))
+                .is_some_and(|net| net_has_phy80211(&net));
+        }
+        if !top_name.starts_with("pci") {
+            return false;
+        }
+        devices.get_child(&top_name).is_some_and(|host| {
+            host.child_names().into_iter().any(|slot_name| {
+                host.get_child(&slot_name)
+                    .and_then(|dev| dev.get_child("net"))
+                    .is_some_and(|net| net_has_phy80211(&net))
+            })
+        })
+    });
+    if still_used {
+        return;
+    }
+    let Some(class_ieee80211) = root
+        .get_child("class")
+        .and_then(|class| class.get_child("ieee80211"))
+    else {
+        return;
+    };
+    if let Some(phy0) = class_ieee80211.get_child("phy0") {
+        kobject_emit_uevent(&phy0, UeventAction::Remove);
+        class_ieee80211.remove_child("phy0");
+    }
+}
+
 /// Populate `/sys/class/net/<iface>/` for every registered net interface.
 /// Linux ref: `netdev_register_kobject` (net/core/net-sysfs.c:1814).
 ///
 /// The net-interface data comes from the hook installed via
 /// `install_net_snapshot_hook` — avoids a hard dep on `narf-net`.
 pub fn populate_net_class() {
+    let _publication = NET_PUBLICATION.lock();
     let root = get_root();
     let class_net = {
         let class_dir = get_or_create_child(&root, "class");
@@ -1366,374 +1455,478 @@ pub fn populate_net_class() {
     let virtual_net = get_or_create_child(&virtual_devices, "net");
 
     for info in net_snapshots() {
-        let name_owned = info.name.clone();
-        // Linux gives every netdev a canonical device kobject and makes the
-        // class entry a discovery symlink. Hardware devices live below their
-        // real bus parent; only parentless devices such as `lo` live below
-        // `/devices/virtual/net`. A class-only DEVPATH cannot be initialized
-        // into udev's database and NetworkManager then leaves the link
-        // unmanaged with NM_DEVICE_STATE_REASON_NOW_UNMANAGED.
-        let (kobj, class_target, subsystem_target) = match info.pci_parent.as_ref() {
-            Some(parent) => {
-                let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
-                let slot_name = format!(
-                    "{:04x}:{:02x}:{:02x}.{}",
-                    parent.segment, parent.bus, parent.device, parent.function
-                );
-                let pci_host = get_or_create_child(&devices, &host_name);
-                let pci_device = get_or_create_child(&pci_host, &slot_name);
-                kobject_add_attr(&pci_device, "vendor", {
-                    let value = parent.vendor_id;
-                    move || format!("0x{value:04x}\n")
-                });
-                kobject_add_attr(&pci_device, "device", {
-                    let value = parent.device_id;
-                    move || format!("0x{value:04x}\n")
-                });
-                kobject_add_attr(&pci_device, "subsystem_vendor", {
-                    let value = parent.subsystem_vendor_id;
-                    move || format!("0x{value:04x}\n")
-                });
-                kobject_add_attr(&pci_device, "subsystem_device", {
-                    let value = parent.subsystem_device_id;
-                    move || format!("0x{value:04x}\n")
-                });
-                kobject_add_attr(&pci_device, "class", {
-                    let value = parent.class;
-                    move || format!("0x{value:06x}\n")
-                });
-                add_writable_uevent(
-                    &pci_device,
-                    format!(
-                        "DRIVER={}\nPCI_CLASS={:06X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={}\n",
-                        parent.driver,
-                        parent.class,
-                        parent.vendor_id,
-                        parent.device_id,
-                        parent.subsystem_vendor_id,
-                        parent.subsystem_device_id,
-                        slot_name,
-                    ),
-                );
-                pci_device.add_symlink("subsystem", "../../../bus/pci");
+        publish_net_iface_entry(&root, &class_net, &devices, &virtual_net, &info, false);
+    }
+}
 
-                let bus = get_or_create_child(&root, "bus");
-                let pci_bus = get_or_create_child(&bus, "pci");
-                let pci_devices = get_or_create_child(&pci_bus, "devices");
-                pci_devices.add_symlink(
+/// Synchronize sysfs `/sys/class/net/<name>` and its canonical `/sys/devices/...`
+/// kobject for an interface registered or updated after boot (for example
+/// async-firmware wireless radios), optionally emitting `ADD`/`CHANGE` (or
+/// `REMOVE` if absent) uevents.
+pub fn sync_net_iface(name: &str, emit: bool) {
+    let _publication = NET_PUBLICATION.lock();
+    let Some(info) = net_snapshot(name) else {
+        unpublish_net_iface_locked(name, emit);
+        return;
+    };
+    let root = get_root();
+    let class_net = {
+        let class_dir = get_or_create_child(&root, "class");
+        get_or_create_child(&class_dir, "net")
+    };
+    let devices = get_or_create_child(&root, "devices");
+    let virtual_devices = get_or_create_child(&devices, "virtual");
+    let virtual_net = get_or_create_child(&virtual_devices, "net");
+    publish_net_iface_entry(&root, &class_net, &devices, &virtual_net, &info, emit);
+}
+
+/// Remove a network interface's `/sys/class/net/<name>` symlink and canonical
+/// `/sys/devices/.../net/<name>` kobject, emitting a `REMOVE` uevent.
+pub fn unpublish_net_iface(name: &str) {
+    let _publication = NET_PUBLICATION.lock();
+    unpublish_net_iface_locked(name, true);
+}
+
+fn unpublish_net_iface_locked(name: &str, emit: bool) {
+    let root = get_root();
+    let Some(devices) = root.get_child("devices") else {
+        return;
+    };
+    let mut removed_wireless = false;
+    for (net_dir, kobj) in find_net_kobjects(&devices, name) {
+        if kobj.get_symlink("phy80211").is_some() {
+            removed_wireless = true;
+        }
+        if emit {
+            kobject_emit_uevent(&kobj, UeventAction::Remove);
+        }
+        net_dir.remove_child(name);
+    }
+    if let Some(class_net) = root
+        .get_child("class")
+        .and_then(|class| class.get_child("net"))
+    {
+        class_net.remove_symlink(name);
+    }
+    if removed_wireless {
+        remove_phy0_if_unused(&root, &devices);
+    }
+}
+
+fn publish_net_iface_entry(
+    root: &Arc<Kobject>,
+    class_net: &Arc<Kobject>,
+    devices: &Arc<Kobject>,
+    virtual_net: &Arc<Kobject>,
+    info: &NetIfaceInfo,
+    emit: bool,
+) {
+    let name_owned = info.name.clone();
+    // If the interface previously lived under a different parent (e.g. under
+    // `/devices/virtual/net` before `set_driver_info` attached its PCI parent),
+    // retire the stale kobject so udev replaces the old devpath cleanly.
+    let canonical_net_dir = match info.pci_parent.as_ref() {
+        Some(parent) => pci_net_dir(devices, parent),
+        None => Some(virtual_net.clone()),
+    };
+    for (existing_net_dir, existing_kobj) in find_net_kobjects(devices, &name_owned) {
+        let same_parent = canonical_net_dir
+            .as_ref()
+            .is_some_and(|canonical| Arc::ptr_eq(&existing_net_dir, canonical));
+        if !same_parent {
+            if emit {
+                kobject_emit_uevent(&existing_kobj, UeventAction::Remove);
+            }
+            existing_net_dir.remove_child(&name_owned);
+        }
+    }
+    let kobj_existed = canonical_net_dir
+        .as_ref()
+        .is_some_and(|dir| dir.get_child(&name_owned).is_some());
+
+    // Linux gives every netdev a canonical device kobject and makes the
+    // class entry a discovery symlink. Hardware devices live below their
+    // real bus parent; only parentless devices such as `lo` live below
+    // `/devices/virtual/net`. A class-only DEVPATH cannot be initialized
+    // into udev's database and NetworkManager then leaves the link
+    // unmanaged with NM_DEVICE_STATE_REASON_NOW_UNMANAGED.
+    let (kobj, class_target, subsystem_target) = match info.pci_parent.as_ref() {
+        Some(parent) => {
+            let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
+            let slot_name = format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                parent.segment, parent.bus, parent.device, parent.function
+            );
+            let pci_host = get_or_create_child(devices, &host_name);
+            let pci_device = get_or_create_child(&pci_host, &slot_name);
+            kobject_add_attr(&pci_device, "vendor", {
+                let value = parent.vendor_id;
+                move || format!("0x{value:04x}\n")
+            });
+            kobject_add_attr(&pci_device, "device", {
+                let value = parent.device_id;
+                move || format!("0x{value:04x}\n")
+            });
+            kobject_add_attr(&pci_device, "subsystem_vendor", {
+                let value = parent.subsystem_vendor_id;
+                move || format!("0x{value:04x}\n")
+            });
+            kobject_add_attr(&pci_device, "subsystem_device", {
+                let value = parent.subsystem_device_id;
+                move || format!("0x{value:04x}\n")
+            });
+            kobject_add_attr(&pci_device, "class", {
+                let value = parent.class;
+                move || format!("0x{value:06x}\n")
+            });
+            add_writable_uevent(
+                &pci_device,
+                format!(
+                    "DRIVER={}\nPCI_CLASS={:06X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={}\n",
+                    parent.driver,
+                    parent.class,
+                    parent.vendor_id,
+                    parent.device_id,
+                    parent.subsystem_vendor_id,
+                    parent.subsystem_device_id,
+                    slot_name,
+                ),
+            );
+            pci_device.add_symlink("subsystem", "../../../bus/pci");
+
+            let bus = get_or_create_child(root, "bus");
+            let pci_bus = get_or_create_child(&bus, "pci");
+            let pci_devices = get_or_create_child(&pci_bus, "devices");
+            pci_devices.add_symlink(
+                slot_name.clone(),
+                format!("../../../devices/{host_name}/{slot_name}"),
+            );
+            if !parent.driver.is_empty() {
+                let drivers = get_or_create_child(&pci_bus, "drivers");
+                let driver = get_or_create_child(&drivers, &parent.driver);
+                driver.add_symlink(
                     slot_name.clone(),
-                    format!("../../../devices/{host_name}/{slot_name}"),
+                    format!("../../../../devices/{host_name}/{slot_name}"),
                 );
-                if !parent.driver.is_empty() {
-                    let drivers = get_or_create_child(&pci_bus, "drivers");
-                    let driver = get_or_create_child(&drivers, &parent.driver);
-                    driver.add_symlink(
-                        slot_name.clone(),
-                        format!("../../../../devices/{host_name}/{slot_name}"),
-                    );
-                    pci_device.add_symlink(
-                        "driver",
-                        format!("../../../bus/pci/drivers/{}", parent.driver),
-                    );
-                }
-
-                let net = get_or_create_child(&pci_device, "net");
-                let device = get_or_create_child(&net, &name_owned);
-                device.add_symlink("device", "../..");
-                (
-                    device,
-                    format!("../../devices/{host_name}/{slot_name}/net/{name_owned}"),
-                    "../../../../../class/net",
-                )
+                pci_device.add_symlink(
+                    "driver",
+                    format!("../../../bus/pci/drivers/{}", parent.driver),
+                );
             }
-            None => (
-                get_or_create_child(&virtual_net, &name_owned),
-                format!("../../devices/virtual/net/{name_owned}"),
-                "../../../../class/net",
-            ),
+
+            let net = get_or_create_child(&pci_device, "net");
+            let device = get_or_create_child(&net, &name_owned);
+            device.add_symlink("device", "../..");
+            (
+                device,
+                format!("../../devices/{host_name}/{slot_name}/net/{name_owned}"),
+                "../../../../../class/net",
+            )
+        }
+        None => (
+            get_or_create_child(virtual_net, &name_owned),
+            format!("../../devices/virtual/net/{name_owned}"),
+            "../../../../class/net",
+        ),
+    };
+    class_net.add_symlink(name_owned.clone(), class_target);
+
+    if info.is_wireless {
+        let class_ieee80211 = {
+            let class_dir = get_or_create_child(root, "class");
+            get_or_create_child(&class_dir, "ieee80211")
         };
-        class_net.add_symlink(name_owned.clone(), class_target);
-
-        if info.is_wireless {
-            let class_ieee80211 = {
-                let class_dir = get_or_create_child(&root, "class");
-                get_or_create_child(&class_dir, "ieee80211")
-            };
-            let phy0 = get_or_create_child(&class_ieee80211, "phy0");
-            kobject_add_attr(&phy0, "index", || "0\n".to_string());
-            kobject_add_attr(&phy0, "name", || "phy0\n".to_string());
+        let phy_existed = class_ieee80211.get_child("phy0").is_some();
+        let phy0 = get_or_create_child(&class_ieee80211, "phy0");
+        kobject_add_attr(&phy0, "index", || "0\n".to_string());
+        kobject_add_attr(&phy0, "name", || "phy0\n".to_string());
+        let mac = info.mac;
+        kobject_add_attr(&phy0, "macaddress", move || {
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )
+        });
+        add_writable_uevent(&phy0, "DEVNAME=phy0\n".to_string());
+        phy0.add_symlink("subsystem", "../../../class/ieee80211");
+        if let Some(parent) = info.pci_parent.as_ref() {
+            let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
+            let slot_name = format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                parent.segment, parent.bus, parent.device, parent.function
+            );
+            phy0.add_symlink(
+                "device",
+                format!("../../../devices/{host_name}/{slot_name}"),
+            );
+        } else {
+            phy0.remove_symlink("device");
+        }
+        let phy_target = if info.pci_parent.is_some() {
+            "../../../../../class/ieee80211/phy0"
+        } else {
+            "../../../../class/ieee80211/phy0"
+        };
+        kobj.add_symlink("phy80211", phy_target);
+        if emit && !phy_existed {
+            kobject_emit_uevent(&phy0, UeventAction::Add);
+        }
+    }
+    let ifindex = info.ifindex;
+    let loopback = info.loopback;
+    // Linux `net/core/net-sysfs.c`. udev keys the device on `ifindex`
+    // (its database file is `n<ifindex>`), so it must be the same number
+    // rtnetlink reports; `type` is the ARPHRD_* NetworkManager and udev's
+    // net_id builtin classify the link by.
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "mtu", move || {
+        format!("{}\n", net_snapshot(&live).map_or(0, |i| i.mtu))
+    });
+    kobject_add_attr(&kobj, "ifindex", move || format!("{}\n", ifindex));
+    kobject_add_attr(&kobj, "iflink", move || format!("{}\n", ifindex));
+    kobject_add_attr(&kobj, "type", move || {
+        format!("{}\n", if loopback { 772 } else { 1 })
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "name_assign_type", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.name_assign_type)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "addr_assign_type", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.addr_assign_type)
+        )
+    });
+    kobject_add_attr(&kobj, "addr_len", || "6\n".to_string());
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "dev_id", move || {
+        format!("{:#x}\n", net_snapshot(&live).map_or(0, |info| info.dev_id))
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "dev_port", move || {
+        format!("{}\n", net_snapshot(&live).map_or(0, |info| info.dev_port))
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "link_mode", move || {
+        format!("{}\n", net_snapshot(&live).map_or(0, |info| info.link_mode))
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "netdev_group", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.netdev_group)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "address", move || {
+        net_snapshot(&live).map_or_else(String::new, |info| {
             let mac = info.mac;
-            kobject_add_attr(&phy0, "macaddress", move || {
-                format!(
-                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                )
-            });
-            add_writable_uevent(&phy0, "DEVNAME=phy0\n".to_string());
-            phy0.add_symlink("subsystem", "../../../class/ieee80211");
-            if let Some(parent) = info.pci_parent.as_ref() {
-                let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
-                let slot_name = format!(
-                    "{:04x}:{:02x}:{:02x}.{}",
-                    parent.segment, parent.bus, parent.device, parent.function
-                );
-                phy0.add_symlink(
-                    "device",
-                    format!("../../../devices/{host_name}/{slot_name}"),
-                );
-            }
-            let phy_target = if info.pci_parent.is_some() {
-                "../../../../../class/ieee80211/phy0"
-            } else {
-                "../../../../class/ieee80211/phy0"
-            };
-            kobj.add_symlink("phy80211", phy_target);
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )
+        })
+    });
+    kobject_add_attr(&kobj, "broadcast", move || {
+        if loopback {
+            "00:00:00:00:00:00\n".to_string()
+        } else {
+            "ff:ff:ff:ff:ff:ff\n".to_string()
         }
-        let ifindex = info.ifindex;
-        let loopback = info.loopback;
-        // Linux `net/core/net-sysfs.c`. udev keys the device on `ifindex`
-        // (its database file is `n<ifindex>`), so it must be the same number
-        // rtnetlink reports; `type` is the ARPHRD_* NetworkManager and udev's
-        // net_id builtin classify the link by.
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "mtu", move || {
-            format!("{}\n", net_snapshot(&live).map_or(0, |i| i.mtu))
-        });
-        kobject_add_attr(&kobj, "ifindex", move || format!("{}\n", ifindex));
-        kobject_add_attr(&kobj, "iflink", move || format!("{}\n", ifindex));
-        kobject_add_attr(&kobj, "type", move || {
-            format!("{}\n", if loopback { 772 } else { 1 })
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "name_assign_type", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.name_assign_type)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "addr_assign_type", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.addr_assign_type)
-            )
-        });
-        kobject_add_attr(&kobj, "addr_len", || "6\n".to_string());
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "dev_id", move || {
-            format!("{:#x}\n", net_snapshot(&live).map_or(0, |info| info.dev_id))
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "dev_port", move || {
-            format!("{}\n", net_snapshot(&live).map_or(0, |info| info.dev_port))
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "link_mode", move || {
-            format!("{}\n", net_snapshot(&live).map_or(0, |info| info.link_mode))
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "netdev_group", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.netdev_group)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "address", move || {
-            net_snapshot(&live).map_or_else(String::new, |info| {
-                let mac = info.mac;
-                format!(
-                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                )
-            })
-        });
-        kobject_add_attr(&kobj, "broadcast", move || {
-            if loopback {
-                "00:00:00:00:00:00\n".to_string()
-            } else {
-                "ff:ff:ff:ff:ff:ff\n".to_string()
-            }
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "operstate", move || match net_snapshot(&live) {
-            Some(i) if i.loopback => "unknown\n".to_string(),
-            Some(i) if i.link_up && i.carrier => "up\n".to_string(),
-            _ => "down\n".to_string(),
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "carrier", move || {
-            format!(
-                "{}\n",
-                u8::from(net_snapshot(&live).is_some_and(|info| info.carrier))
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "speed", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live)
-                    .and_then(|info| info.speed_mbps)
-                    .map_or(-1, |speed| speed as i64)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "duplex", move || {
-            match net_snapshot(&live).and_then(|info| info.duplex) {
-                Some(NetDuplex::Half) => "half\n",
-                Some(NetDuplex::Full) => "full\n",
-                None => "unknown\n",
-            }
-            .to_string()
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "dormant", move || {
-            format!(
-                "{}\n",
-                u8::from(net_snapshot(&live).is_some_and(|info| info.dormant))
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "testing", move || {
-            format!(
-                "{}\n",
-                u8::from(net_snapshot(&live).is_some_and(|info| info.testing))
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "carrier_changes", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.carrier_changes)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "carrier_up_count", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.carrier_up_count)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "carrier_down_count", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.carrier_down_count)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "ifalias", move || {
-            net_snapshot(&live).map_or_else(String::new, |info| info.ifalias)
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "tx_queue_len", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.tx_queue_len)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "gro_flush_timeout", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.gro_flush_timeout_ns)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "napi_defer_hard_irqs", move || {
-            format!(
-                "{}\n",
-                net_snapshot(&live).map_or(0, |info| info.napi_defer_hard_irqs)
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "proto_down", move || {
-            format!(
-                "{}\n",
-                u8::from(net_snapshot(&live).is_some_and(|info| info.proto_down))
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "threaded", move || {
-            format!(
-                "{}\n",
-                u8::from(net_snapshot(&live).is_some_and(|info| info.threaded))
-            )
-        });
-        let live = name_owned.clone();
-        kobject_add_attr(&kobj, "flags", move || {
-            // `dev->flags`: IFF_BROADCAST | IFF_MULTICAST (+ IFF_UP once
-            // up), or IFF_UP | IFF_LOOPBACK for `lo`. The volatile
-            // IFF_RUNNING / IFF_LOWER_UP are never stored there — only
-            // `dev_get_flags` (rtnetlink, SIOCGIFFLAGS) adds them.
-            let snap = net_snapshot(&live);
-            let up = snap.as_ref().is_some_and(|i| i.link_up);
-            let mut flags: u32 = if loopback {
-                0x1 | 0x8
-            } else {
-                0x2 | 0x1000 | if up { 0x1 } else { 0 }
-            };
-            // `__dev_set_promiscuity` / `__dev_set_allmulti` keep IFF_PROMISC
-            // (0x100) / IFF_ALLMULTI (0x200) in `dev->flags` while their
-            // reference counts (packet-socket memberships) are non-zero.
-            if snap.as_ref().is_some_and(|i| i.promisc) {
-                flags |= 0x100;
-            }
-            if snap.as_ref().is_some_and(|i| i.allmulti) {
-                flags |= 0x200;
-            }
-            format!("{:#x}\n", flags)
-        });
-        // A net interface is not a char/block device (no MAJOR/MINOR), but
-        // udev still needs a walkable `uevent` file + a `subsystem` symlink so
-        // the coldplug walker derives SUBSYSTEM=net and `udevadm info` accepts
-        // the syspath. Linux ref: `net/core/net-sysfs.c` (netdev_register_kobject)
-        // exposes INTERFACE + IFINDEX in the netdev uevent.
-        let mut uevent_str = format!("INTERFACE={}\nIFINDEX={}\n", name_owned, ifindex);
-        if info.is_wireless {
-            uevent_str.push_str("DEVTYPE=wlan\n");
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "operstate", move || match net_snapshot(&live) {
+        Some(i) if i.loopback => "unknown\n".to_string(),
+        Some(i) if i.link_up && i.carrier => "up\n".to_string(),
+        _ => "down\n".to_string(),
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "carrier", move || {
+        format!(
+            "{}\n",
+            u8::from(net_snapshot(&live).is_some_and(|info| info.carrier))
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "speed", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live)
+                .and_then(|info| info.speed_mbps)
+                .map_or(-1, |speed| speed as i64)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "duplex", move || {
+        match net_snapshot(&live).and_then(|info| info.duplex) {
+            Some(NetDuplex::Half) => "half\n",
+            Some(NetDuplex::Full) => "full\n",
+            None => "unknown\n",
         }
-        add_writable_uevent(&kobj, uevent_str);
-        kobj.add_symlink("subsystem", subsystem_target);
+        .to_string()
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "dormant", move || {
+        format!(
+            "{}\n",
+            u8::from(net_snapshot(&live).is_some_and(|info| info.dormant))
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "testing", move || {
+        format!(
+            "{}\n",
+            u8::from(net_snapshot(&live).is_some_and(|info| info.testing))
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "carrier_changes", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.carrier_changes)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "carrier_up_count", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.carrier_up_count)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "carrier_down_count", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.carrier_down_count)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "ifalias", move || {
+        net_snapshot(&live).map_or_else(String::new, |info| info.ifalias)
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "tx_queue_len", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.tx_queue_len)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "gro_flush_timeout", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.gro_flush_timeout_ns)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "napi_defer_hard_irqs", move || {
+        format!(
+            "{}\n",
+            net_snapshot(&live).map_or(0, |info| info.napi_defer_hard_irqs)
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "proto_down", move || {
+        format!(
+            "{}\n",
+            u8::from(net_snapshot(&live).is_some_and(|info| info.proto_down))
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "threaded", move || {
+        format!(
+            "{}\n",
+            u8::from(net_snapshot(&live).is_some_and(|info| info.threaded))
+        )
+    });
+    let live = name_owned.clone();
+    kobject_add_attr(&kobj, "flags", move || {
+        // `dev->flags`: IFF_BROADCAST | IFF_MULTICAST (+ IFF_UP once
+        // up), or IFF_UP | IFF_LOOPBACK for `lo`. The volatile
+        // IFF_RUNNING / IFF_LOWER_UP are never stored there — only
+        // `dev_get_flags` (rtnetlink, SIOCGIFFLAGS) adds them.
+        let snap = net_snapshot(&live);
+        let up = snap.as_ref().is_some_and(|i| i.link_up);
+        let mut flags: u32 = if loopback {
+            0x1 | 0x8
+        } else {
+            0x2 | 0x1000 | if up { 0x1 } else { 0 }
+        };
+        // `__dev_set_promiscuity` / `__dev_set_allmulti` keep IFF_PROMISC
+        // (0x100) / IFF_ALLMULTI (0x200) in `dev->flags` while their
+        // reference counts (packet-socket memberships) are non-zero.
+        if snap.as_ref().is_some_and(|i| i.promisc) {
+            flags |= 0x100;
+        }
+        if snap.as_ref().is_some_and(|i| i.allmulti) {
+            flags |= 0x200;
+        }
+        format!("{:#x}\n", flags)
+    });
+    // A net interface is not a char/block device (no MAJOR/MINOR), but
+    // udev still needs a walkable `uevent` file + a `subsystem` symlink so
+    // the coldplug walker derives SUBSYSTEM=net and `udevadm info` accepts
+    // the syspath. Linux ref: `net/core/net-sysfs.c` (netdev_register_kobject)
+    // exposes INTERFACE + IFINDEX in the netdev uevent.
+    let mut uevent_str = format!("INTERFACE={}\nIFINDEX={}\n", name_owned, ifindex);
+    if info.is_wireless {
+        uevent_str.push_str("DEVTYPE=wlan\n");
+    }
+    add_writable_uevent(&kobj, uevent_str);
+    kobj.add_symlink("subsystem", subsystem_target);
 
-        // Linux's `netstat_group` is present on every netdev. Read the same
-        // live counters that back /proc/net/dev and rtnetlink, so the three
-        // compatibility surfaces never drift or manufacture placeholder data.
-        let statistics = get_or_create_child(&kobj, "statistics");
-        for name in [
-            "rx_packets",
-            "tx_packets",
-            "rx_bytes",
-            "tx_bytes",
-            "rx_errors",
-            "tx_errors",
-            "rx_dropped",
-            "tx_dropped",
-            "multicast",
-            "collisions",
-            "rx_length_errors",
-            "rx_over_errors",
-            "rx_crc_errors",
-            "rx_frame_errors",
-            "rx_fifo_errors",
-            "rx_missed_errors",
-            "tx_aborted_errors",
-            "tx_carrier_errors",
-            "tx_fifo_errors",
-            "tx_heartbeat_errors",
-            "tx_window_errors",
-            "rx_compressed",
-            "tx_compressed",
-            "rx_nohandler",
-        ] {
-            let live = name_owned.clone();
-            kobject_add_attr(&statistics, name, move || {
-                format!(
-                    "{}\n",
-                    net_snapshot(&live).map_or(0, |info| net_stat_value(&info.stats, name))
-                )
-            });
-        }
+    // Linux's `netstat_group` is present on every netdev. Read the same
+    // live counters that back /proc/net/dev and rtnetlink, so the three
+    // compatibility surfaces never drift or manufacture placeholder data.
+    let statistics = get_or_create_child(&kobj, "statistics");
+    for name in [
+        "rx_packets",
+        "tx_packets",
+        "rx_bytes",
+        "tx_bytes",
+        "rx_errors",
+        "tx_errors",
+        "rx_dropped",
+        "tx_dropped",
+        "multicast",
+        "collisions",
+        "rx_length_errors",
+        "rx_over_errors",
+        "rx_crc_errors",
+        "rx_frame_errors",
+        "rx_fifo_errors",
+        "rx_missed_errors",
+        "tx_aborted_errors",
+        "tx_carrier_errors",
+        "tx_fifo_errors",
+        "tx_heartbeat_errors",
+        "tx_window_errors",
+        "rx_compressed",
+        "tx_compressed",
+        "rx_nohandler",
+    ] {
+        let live = name_owned.clone();
+        kobject_add_attr(&statistics, name, move || {
+            format!(
+                "{}\n",
+                net_snapshot(&live).map_or(0, |info| net_stat_value(&info.stats, name))
+            )
+        });
+    }
+
+    if emit {
+        kobject_emit_uevent(
+            &kobj,
+            if kobj_existed {
+                UeventAction::Change
+            } else {
+                UeventAction::Add
+            },
+        );
     }
 }
 
@@ -1751,18 +1944,7 @@ pub fn emit_net_device_add_events() -> usize {
     let mut count = 0;
     for info in net_snapshots() {
         let kobj = match info.pci_parent.as_ref() {
-            Some(parent) => {
-                let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
-                let slot_name = format!(
-                    "{:04x}:{:02x}:{:02x}.{}",
-                    parent.segment, parent.bus, parent.device, parent.function
-                );
-                devices
-                    .get_child(&host_name)
-                    .and_then(|host| host.get_child(&slot_name))
-                    .and_then(|device| device.get_child("net"))
-                    .and_then(|net| net.get_child(&info.name))
-            }
+            Some(parent) => pci_net_dir(&devices, parent).and_then(|net| net.get_child(&info.name)),
             None => devices
                 .get_child("virtual")
                 .and_then(|virtual_devices| virtual_devices.get_child("net"))

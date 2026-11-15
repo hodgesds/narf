@@ -323,21 +323,33 @@ pub struct HwAddr {
 }
 
 /// Record `ETHTOOL_GDRVINFO` data for interface `name` (see
-/// [`NetIfaceEntry::driver`]). Drivers call this right after [`register`].
+/// [`NetIfaceEntry::driver`]). Drivers call this right after [`register`],
+/// or pass driver metadata atomically to [`register_with_driver`].
 pub fn set_driver_info(
     name: &str,
     driver: &'static str,
     driver_version: Option<&'static str>,
     bus_info: String,
 ) {
-    if let Some(entry) = IFACES
-        .lock()
-        .as_mut()
-        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
-    {
-        entry.driver = driver;
-        entry.driver_version = driver_version;
-        entry.bus_info = bus_info;
+    let changed = {
+        let mut g = IFACES.lock();
+        if let Some(entry) = g
+            .as_mut()
+            .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+        {
+            let changed = entry.driver != driver
+                || entry.driver_version != driver_version
+                || entry.bus_info != bus_info;
+            entry.driver = driver;
+            entry.driver_version = driver_version;
+            entry.bus_info = bus_info;
+            changed
+        } else {
+            false
+        }
+    };
+    if changed {
+        net_sysfs_notify(NetSysfsEvent::Updated(name));
     }
 }
 
@@ -714,6 +726,40 @@ pub fn install_dev_conf_hook(register: DevConfFn) {
     DEV_CONF_HOOK.store(register as usize, Ordering::Release);
 }
 
+/// Sysfs publication event for post-boot interface lifecycle transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetSysfsEvent<'a> {
+    Added(&'a str),
+    Updated(&'a str),
+    Removed(&'a str),
+}
+
+/// `fn(event)` — synchronize `/sys/class/net/<dev>` after `IFACES` changes.
+pub type NetSysfsFn = fn(NetSysfsEvent<'_>);
+
+static NET_SYSFS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the sysfs interface synchronization hook. Idempotent.
+pub fn install_net_sysfs_hook(hook: NetSysfsFn) {
+    NET_SYSFS_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn swap_net_sysfs_hook(hook: usize) -> usize {
+    NET_SYSFS_HOOK.swap(hook, Ordering::AcqRel)
+}
+
+fn net_sysfs_notify(event: NetSysfsEvent<'_>) {
+    let v = NET_SYSFS_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return;
+    }
+    // SAFETY: `v` was stored by `install_net_sysfs_hook` as a `NetSysfsFn`
+    // fn-pointer; the non-zero check above confirms it is valid.
+    let f: NetSysfsFn = unsafe { core::mem::transmute(v) };
+    f(event);
+}
+
 fn dev_conf_register(iface_name: &str) {
     let v = DEV_CONF_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -801,7 +847,28 @@ pub fn register_loopback_iface() {
 /// pattern the name `dev_alloc_name` chose. Drivers address their device by
 /// the returned name afterwards.
 pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
-    register_inner(name, mac, send, None)
+    register_inner(name, mac, send, None, None)
+}
+
+/// Register a NIC driver as a network interface along with its driver
+/// identity and PCI bus info so sysfs publication sees the canonical bus
+/// parent on the initial `ADD` event instead of starting under
+/// `/devices/virtual/net`.
+pub fn register_with_driver(
+    name: &str,
+    mac: [u8; 6],
+    send: SendFn,
+    driver: &'static str,
+    driver_version: Option<&'static str>,
+    bus_info: String,
+) -> String {
+    register_inner(
+        name,
+        mac,
+        send,
+        None,
+        Some((driver, driver_version, bus_info)),
+    )
 }
 
 fn context_send_placeholder(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
@@ -813,7 +880,13 @@ fn context_send_placeholder(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), (
 /// after releasing it, with the same deadlock/re-entry guarantees as
 /// [`register`]'s plain hook.
 pub fn register_with_context(name: &str, mac: [u8; 6], cookie: u64, send: SendCtxFn) -> String {
-    register_inner(name, mac, context_send_placeholder, Some((cookie, send)))
+    register_inner(
+        name,
+        mac,
+        context_send_placeholder,
+        Some((cookie, send)),
+        None,
+    )
 }
 
 fn register_inner(
@@ -821,6 +894,7 @@ fn register_inner(
     mac: [u8; 6],
     send: SendFn,
     send_context: Option<(u64, SendCtxFn)>,
+    driver_info: Option<(&'static str, Option<&'static str>, String)>,
 ) -> String {
     let _capture = monitor::PUBLISH.lock();
     let enumerated_name = name.contains("%d");
@@ -946,10 +1020,12 @@ fn register_inner(
         open_stop_target: None,
         net_ns_id,
         ifindex,
-        driver: "",
-        driver_version: None,
+        driver: driver_info.as_ref().map_or("", |(driver, _, _)| *driver),
+        driver_version: driver_info.as_ref().and_then(|(_, version, _)| *version),
         fw_version: None,
-        bus_info: String::new(),
+        bus_info: driver_info
+            .map(|(_, _, bus_info)| bus_info)
+            .unwrap_or_default(),
         promiscuity,
         allmulti,
         hw_addrs,
@@ -1012,6 +1088,7 @@ fn register_inner(
     // hook reaches into the procfs registry, which must not be entered under
     // this lock.
     dev_conf_register(&name);
+    net_sysfs_notify(NetSysfsEvent::Added(&name));
     name
 }
 
@@ -1049,6 +1126,7 @@ pub fn unregister(name: &str) -> bool {
         crate::udp_sock::remove_interface(name);
         crate::arp_cache::remove_interface_pending(name);
         crate::tcp_stack::neigh_del_timers_on(name);
+        net_sysfs_notify(NetSysfsEvent::Removed(name));
     }
     removed
 }
@@ -3025,6 +3103,74 @@ mod zc_tx_tests {
     kernel_test_in!(
         "net/iface",
         smoke_iface_retire_for_rebind_keeps_name_and_ifindex
+    );
+
+    fn smoke_iface_sysfs_hook_fires_on_register_driver_update_and_unregister() -> TestResult {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Ev {
+            Added(String, Option<String>),
+            Updated(String, Option<String>),
+            Removed(String),
+        }
+        static EVENTS: IrqSafeSpinLock<Vec<Ev>> = IrqSafeSpinLock::new(Vec::new());
+        fn record(event: NetSysfsEvent<'_>) {
+            let ev = match event {
+                NetSysfsEvent::Added(name) => {
+                    let bus = driver_info(name).map(|(_, _, b)| b);
+                    Ev::Added(String::from(name), bus)
+                }
+                NetSysfsEvent::Updated(name) => {
+                    let bus = driver_info(name).map(|(_, _, b)| b);
+                    Ev::Updated(String::from(name), bus)
+                }
+                NetSysfsEvent::Removed(name) => Ev::Removed(String::from(name)),
+            };
+            EVENTS.lock().push(ev);
+        }
+        fn send(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+            Ok(())
+        }
+
+        EVENTS.lock().clear();
+        let prev = swap_net_sysfs_hook(record as NetSysfsFn as usize);
+        let name = register_with_driver(
+            "wlhook%d",
+            [2, 0, 0, 0, 0x7c, 1],
+            send,
+            "mt7921e",
+            Some("0.1.0"),
+            String::from("0000:02:00.0"),
+        );
+        // Unchanged driver info should not emit a redundant Updated event.
+        set_driver_info(
+            &name,
+            "mt7921e",
+            Some("0.1.0"),
+            String::from("0000:02:00.0"),
+        );
+        set_driver_info(
+            &name,
+            "mt7921e",
+            Some("0.1.0"),
+            String::from("0000:03:00.0"),
+        );
+        unregister(&name);
+        let _ = swap_net_sysfs_hook(prev);
+
+        let recorded = core::mem::take(&mut *EVENTS.lock());
+        let expected = [
+            Ev::Added(name.clone(), Some(String::from("0000:02:00.0"))),
+            Ev::Updated(name.clone(), Some(String::from("0000:03:00.0"))),
+            Ev::Removed(name),
+        ];
+        if recorded.as_slice() != expected.as_slice() {
+            return TestResult::Fail("unexpected sysfs hook sequence");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/iface",
+        smoke_iface_sysfs_hook_fires_on_register_driver_update_and_unregister
     );
 }
 

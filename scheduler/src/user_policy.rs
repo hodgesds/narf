@@ -116,6 +116,9 @@ pub(crate) struct UserControl {
     cell: IrqSafeSpinLock<Weak<crate::WakeCell>>,
     generation: AtomicU64,
     pub(crate) home: AtomicU32,
+    /// Last CPU (`0..`) on which a continuation slice for this task started
+    /// (`u32::MAX` before its first dispatch).
+    pub(crate) last_cpu: AtomicU32,
     pub(crate) inherited_affinity: AtomicBool,
     pub(crate) policy: AtomicU8,
     pub(crate) slice: AtomicU64,
@@ -139,6 +142,7 @@ impl UserControl {
             cell: IrqSafeSpinLock::new(Weak::new()),
             generation: AtomicU64::new(1),
             home: AtomicU32::new(u32::MAX),
+            last_cpu: AtomicU32::new(u32::MAX),
             inherited_affinity: AtomicBool::new(false),
             policy: AtomicU8::new(0),
             slice: AtomicU64::new(0),
@@ -397,6 +401,17 @@ pub(crate) fn note_rt_wake(cell: &crate::WakeCell, cpu: u32) {
 
 pub fn release_user_scheduling(id: TaskId) {
     CONTROLS.lock().remove(&id);
+}
+
+/// Last CPU (`0..`) a user task ran on, or its home CPU before its first slice.
+pub(crate) fn last_cpu(id: TaskId) -> Option<u32> {
+    let control = CONTROLS.lock().get(&id).cloned()?;
+    let cpu = control.last_cpu.load(Ordering::Acquire);
+    if cpu != u32::MAX {
+        return Some(cpu);
+    }
+    let cell = control.cell.lock().upgrade();
+    cell.map(|cell| cell.cpu.load(Ordering::Acquire))
 }
 
 pub(crate) fn refresh(slot: &mut crate::TaskSlot, cpu: usize) {

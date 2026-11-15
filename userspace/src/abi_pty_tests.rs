@@ -366,3 +366,121 @@ kernel_test_in!(
     "syscall_abi/pty",
     smoke_abi_pty_devpts_dirent_ino_matches_fstat
 );
+
+/// `TCSETSF2` (`tcsetattr(..., TCSAFLUSH, ...)` in glibc) must discard queued
+/// input on both slave and master endpoints, matching `TCSETSF`.
+fn smoke_abi_pty_tcsetsf2_flushes_queued_input() -> TestResult {
+    const O_NONBLOCK: u64 = 0o4000;
+    const TCGETS2: u64 = 0x802c_542a;
+    const TCSETSF2: u64 = 0x402c_542d;
+    const EAGAIN: i64 = -11;
+
+    with_setup(|| {
+        let (master, _index) = open_master()?;
+        let slave = match call(
+            Syscall::Ioctl.raw(),
+            a2(master, TIOCGPTPEER, O_RDWR | O_NOCTTY | O_NONBLOCK),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => {
+                close(master);
+                return Err("TIOCGPTPEER failed");
+            }
+        };
+
+        let mut t2 = [0u8; 44];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(slave, TCGETS2, t2.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            close(slave);
+            close(master);
+            return Err("TCGETS2 on slave failed");
+        }
+
+        // Case 1: queued input flushed by TCSETSF2 on the slave fd.
+        if call(
+            Syscall::Write.raw(),
+            a2(master, b"stale\n".as_ptr() as u64, 6),
+        ) != Some(6)
+        {
+            close(slave);
+            close(master);
+            return Err("master write failed");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(slave, TCSETSF2, t2.as_ptr() as u64),
+        ) != Some(0)
+        {
+            close(slave);
+            close(master);
+            return Err("TCSETSF2 on slave failed");
+        }
+        let mut rbuf = [0u8; 16];
+        if call(
+            Syscall::Read.raw(),
+            a2(slave, rbuf.as_mut_ptr() as u64, rbuf.len() as u64),
+        ) != Some(EAGAIN)
+        {
+            close(slave);
+            close(master);
+            return Err("TCSETSF2 on slave did not discard queued input");
+        }
+
+        // Case 2: queued input flushed by TCSETSF2 on the master fd.
+        if call(
+            Syscall::Write.raw(),
+            a2(master, b"again\n".as_ptr() as u64, 6),
+        ) != Some(6)
+        {
+            close(slave);
+            close(master);
+            return Err("second master write failed");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(master, TCSETSF2, t2.as_ptr() as u64),
+        ) != Some(0)
+        {
+            close(slave);
+            close(master);
+            return Err("TCSETSF2 on master failed");
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(slave, rbuf.as_mut_ptr() as u64, rbuf.len() as u64),
+        ) != Some(EAGAIN)
+        {
+            close(slave);
+            close(master);
+            return Err("TCSETSF2 on master did not discard queued input");
+        }
+
+        // Sanity: new input after flush is readable normally.
+        if call(
+            Syscall::Write.raw(),
+            a2(master, b"fresh\n".as_ptr() as u64, 6),
+        ) != Some(6)
+        {
+            close(slave);
+            close(master);
+            return Err("post-flush master write failed");
+        }
+        let n = call(
+            Syscall::Read.raw(),
+            a2(slave, rbuf.as_mut_ptr() as u64, rbuf.len() as u64),
+        );
+        close(slave);
+        close(master);
+        if n != Some(6) || &rbuf[..6] != b"fresh\n" {
+            return Err("post-flush slave read did not return fresh input");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pty",
+    smoke_abi_pty_tcsetsf2_flushes_queued_input
+);

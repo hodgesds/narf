@@ -1165,6 +1165,7 @@ pub struct UserSchedulingAuthority { /* explicit per-CPU Cap<CpuBudget, Spend> g
 pub fn UserSchedulingAuthority::new(budgets: [Cap<CpuBudget, Spend>; MAX_CPUS]) -> Self;
 pub fn inheritable_task_affinity(id: TaskId) -> Option<CpuSet>;
 pub fn alloc_user_task_id() -> TaskId;
+pub fn task_last_cpu(id: TaskId) -> Option<u32>;
 pub fn user_scheduling(id: TaskId) -> Option<UserScheduling>;
 pub fn set_user_scheduling(id: TaskId, config: UserScheduling,
     authority: Option<Arc<UserSchedulingAuthority>>) -> Result<(), UserSchedulingError>;

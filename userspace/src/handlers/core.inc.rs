@@ -16295,11 +16295,21 @@ fn notify_tracer_of_thread_exit(pid: u64, tid: u64) {
 /// until the process exits leaks one Task/TCB allocation per pthread and makes
 /// sustained thread churn progressively slower.
 pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
-    let Some(leader_tid) = pid_to_task_raw(pid) else {
-        return;
-    };
-    if leader_tid == tid {
-        return;
+    match pid_to_task_raw(pid) {
+        Some(leader_tid) if leader_tid == tid => return,
+        Some(_) => {}
+        None => {
+            // When the last exiting thread of a group is a non-leader
+            // `CLONE_THREAD` sibling (e.g. an orphan auto-reaped in
+            // `PROCESS_EXIT_OBSERVERS`), `PID_TO_TASK[pid]` is cleared before
+            // `release_exited_thread_task` runs. Only non-leader siblings have a
+            // `TASK_TO_LINUX_TID` entry (leaders use `pid` directly), so only
+            // bail early when `tid` has no `TASK_TO_LINUX_TID` mapping; otherwise
+            // its task slot, outer TID, pidfd exit, and `cgroup.threads` leak.
+            if task_to_linux_tid_raw(tid).is_none() {
+                return;
+            }
+        }
     }
     notify_tracer_of_thread_exit(pid, tid);
     crate::task::release_task(tid);

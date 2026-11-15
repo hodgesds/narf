@@ -1282,6 +1282,7 @@ impl FileOps for ProcTaskTidStat {
                 info.utime_ticks = thread.utime_ticks;
                 info.stime_ticks = thread.stime_ticks;
                 info.state = thread.state;
+                info.processor = thread.processor;
             }
             // Field 1 is the THREAD's id, which is what makes a reader able to
             // tell two rows of the same process apart.
@@ -1733,6 +1734,7 @@ fn test_thread_stat(tid: u64) -> Option<super::ThreadStat> {
         tgid: Some(1),
         syscall,
         wchan: parked.then(|| alloc::string::String::from("futex")),
+        processor: 0,
     })
 }
 

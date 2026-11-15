@@ -170,6 +170,11 @@ callback. `populate_all()` snapshots callbacks and invokes them without its
 lock. Providers support explicit refresh after probes and use the existing
 kobject/class registration API. Every sysfs mount shares that live graph;
 mounting a new view never repopulates it or emits device ADD events.
+For network interfaces registered or updated after boot population,
+`sysfs::sync_net_iface(name, emit)` publishes or reparents `/sys/class/net/<name>`,
+its canonical `/sys/devices/.../net/<name>` kobject, and any wireless
+`/sys/class/ieee80211/phy0` entry (emitting `ADD`/`CHANGE` when `emit` is set),
+and `sysfs::unpublish_net_iface(name)` tears them down with `REMOVE`.
 
 `sysfs::kobject_notify(kobj, attribute)` publishes a text-attribute change
 after its value changes. Each open has an independent event cursor (shared

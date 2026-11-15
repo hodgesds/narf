@@ -8509,8 +8509,6 @@ impl AddressSpace {
         {
             return;
         }
-        // Tag-wide: the batch spans scattered ranges; any page count past
-        // the ranged ceiling selects the tag-wide form.
         self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
         if self.root.as_u64() != 0 {
             for region in &batch.regions {
@@ -12080,15 +12078,18 @@ impl AddressSpace {
     /// whose backing frame is non-zero, this routine:
     ///
     /// 1. Tears down the leaf PTE for that page (invlpg fires).
-    /// 2. Releases the underlying frame through the COW-aware batched
-    ///    free, which honours the refcount table — a frame still shared
-    ///    with another address space stays live; only sole-owner frames
-    ///    return to the buddy allocator. Sole-owner frames are parked in
-    ///    the deferred-flush quarantine and freed at the batch drain,
-    ///    after the batch invalidation; a discard that touches any
-    ///    COW-shared frame keeps the historical synchronous shape
-    ///    (broadcast, then release, before returning), because the peer
-    ///    address space observes the discard through the owner count.
+    /// 2. Synchronously shoots down remote TLB translations for the span
+    ///    before releasing the region lock, then releases the underlying
+    ///    frames through the COW-aware batched free (which honours the
+    ///    refcount table — a frame still shared with another address
+    ///    space stays live; only sole-owner frames return to the buddy
+    ///    allocator). Unlike `munmap`, `madvise_dontneed` leaves the VMA
+    ///    live and accessible without a subsequent `mmap`, so remote TLBs
+    ///    must be invalidated before returning (otherwise a peer CPU with
+    ///    a stale writable TLB entry can silently write to the retired
+    ///    frame without faulting while `phys[i] == 0`, losing those
+    ///    writes when the TLB entry later evicts and faults in a fresh
+    ///    zero page).
     /// 3. Sets the per-page `phys[i]` slot back to the zero sentinel,
     ///    so the next user-mode access takes the demand-paging path
     ///    in `demand_alloc_page` and gets a freshly-zeroed frame.
@@ -12264,52 +12265,19 @@ impl AddressSpace {
         if !touched {
             return Err(AddressSpaceError::Unmapped);
         }
+        if !to_release.is_empty() {
+            // Shoot down remote TLB entries after releasing `regions` (an
+            // `IrqSafeSpinLock`) and before returning frames to the buddy or
+            // returning to userspace while the VMA remains live.
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
+        }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&discarded_swap);
-        if !to_release.is_empty() {
-            // A frame still COW-shared with another address space keeps the
-            // historical synchronous shape: the peer observes this discard
-            // through the frame's owner count (its COW split decisions read
-            // that count), so the release must land before this call
-            // returns, with the broadcast before it exactly as before. The
-            // count snapshot is stable here: extraction zeroed this AS's
-            // slots, so no new owner can appear, and a peer exit between
-            // the peek and the release only makes the synchronous path
-            // conservative, never wrong.
-            let any_shared = to_release
-                .iter()
-                .any(|f| crate::frame::cow::count(f.start_address()) > 1);
-            if !any_shared && self.root.as_u64() != 0 {
-                // Park the released frames in the deferred-flush quarantine
-                // instead of paying a synchronous cross-CPU broadcast per
-                // call. The extraction above already retired each frame's
-                // leaf locally and dropped its rmap owner under the region
-                // lock, so the parked frames are exactly the loose-frame
-                // shape the splitting punch defers: the batch's one
-                // coalesced tag-wide invalidation runs BEFORE any parked
-                // frame is freed, so no stale translation can observe a
-                // freed backing reused, and the advised span joins the
-                // batch's pending ranges, so a re-mapping publication over
-                // it drains the batch first. Every parked frame is
-                // exclusively owned (checked above), and the drain frees
-                // through the same COW-aware batched free as the
-                // synchronous path.
-                self.defer_punch_flush(lo, (hi - lo) >> 12, to_release, Vec::new());
-            } else {
-                // ONE tagged cross-CPU invalidation over the advised span
-                // BEFORE any frame is freed for reuse. With no published
-                // root no frame could have been materialized into a live
-                // table, so the broadcast fires and nothing is freed,
-                // exactly the historical rootless shape.
-                self.flush_region_broadcast(base, (hi - lo) >> 12);
-                if self.root.as_u64() != 0 {
-                    // `to_release` is authoritative data backing only. The
-                    // batched allocator path consults COW ownership once
-                    // per touched shard; frames shared with another AS
-                    // remain live.
-                    crate::frame::free_frame_batch(&to_release);
-                }
-            }
+        if !to_release.is_empty() && self.root.as_u64() != 0 {
+            // `to_release` is authoritative data backing only. The batched
+            // allocator path consults COW ownership once per touched shard;
+            // frames shared with another AS remain live.
+            crate::frame::free_frame_batch(&to_release);
         }
         Ok(())
     }
@@ -12699,9 +12667,6 @@ impl AddressSpace {
         if freed.is_empty() {
             return 0;
         }
-        // ONE cross-CPU invalidation before any frame is reused. The spans
-        // are scattered across regions, so use the tag-wide form (any page
-        // count past the ranged-flush ceiling selects it).
         self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
         crate::frame::free_frame_batch(&freed);
         freed.len()

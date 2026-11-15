@@ -311,8 +311,10 @@ async fn provision_radio_inner() -> Result<RadioInfo, Error> {
                 |mut transport| {
                     alloc::boxed::Box::pin(async move {
                         let result = async {
-                            transport.run().await?;
-                            transport.initialize_radio().await.map(|_| ())
+                            alloc::boxed::Box::pin(transport.run()).await?;
+                            alloc::boxed::Box::pin(transport.initialize_radio())
+                                .await
+                                .map(|_| ())
                         }
                         .await;
                         (transport, result)
@@ -1944,35 +1946,100 @@ struct Session<B: Backend> {
     wow_nlo: Option<Arc<scan::nlo::Plan>>,
     /// The running host scheduled scan (NL80211_CMD_START_SCHED_SCAN).
     sched: Option<scan::sched::Running>,
+    /// Sub-step within `associate_station_as` for cold timeout diagnostics.
+    pub(super) associate_step: &'static str,
 }
 impl<B: Backend> Session<B> {
+    /// Initializes a fresh `Session` directly in caller-provided uninitialized storage.
+    ///
+    /// # Safety
+    /// `dst` must point to valid, aligned, writable storage for `Self`.
+    unsafe fn init_in(dst: *mut Self, backend: B, firmware: Firmware) {
+        // Compile-time guard: adding a field to `Session` must also initialize it below.
+        let _ = |s: Self| {
+            let Self {
+                backend: _,
+                firmware: _,
+                state: _,
+                seq: _,
+                events: _,
+                transferred: _,
+                boot_started: _,
+                scan_seq: _,
+                data_pending: _,
+                station: _,
+                group: _,
+                go: _,
+                wtbl: _,
+                frag_threshold: _,
+                pmksa: _,
+                receive_epoch: _,
+                scan_packets: _,
+                scanning: _,
+                ap_owner: _,
+                p2p_owner: _,
+                p2p_next: _,
+                ap_keys: _,
+                wow_config: _,
+                wow_nlo: _,
+                sched: _,
+                associate_step: _,
+            } = s;
+        };
+        // SAFETY: Caller guarantees `dst` is writable, aligned storage for `Self`.
+        // Every field is written exactly once before `assume_init`, with caller-supplied
+        // `backend` and `firmware` written last after infallible local field initialization.
+        unsafe {
+            core::ptr::addr_of_mut!((*dst).state).write(State::Prepared);
+            core::ptr::addr_of_mut!((*dst).seq).write(0);
+            core::ptr::addr_of_mut!((*dst).events).write(VecDeque::new());
+            core::ptr::addr_of_mut!((*dst).transferred).write(0);
+            core::ptr::addr_of_mut!((*dst).boot_started).write(None);
+            core::ptr::addr_of_mut!((*dst).scan_seq).write(0);
+            core::ptr::addr_of_mut!((*dst).data_pending).write(group_link::DataPending::default());
+            core::ptr::addr_of_mut!((*dst).station)
+                .write(StationLink::new(crate::mt7921::vif_slots::Link::HOME));
+            core::ptr::addr_of_mut!((*dst).group).write(None);
+            core::ptr::addr_of_mut!((*dst).go).write(None);
+            core::ptr::addr_of_mut!((*dst).wtbl).write(crate::mt7921::vif_slots::Wtbl::default());
+            core::ptr::addr_of_mut!((*dst).frag_threshold).write(u32::MAX);
+            core::ptr::addr_of_mut!((*dst).pmksa).write(crate::mt7921::pmksa::Cache::default());
+            core::ptr::addr_of_mut!((*dst).receive_epoch).write(0);
+            core::ptr::addr_of_mut!((*dst).scan_packets).write(VecDeque::new());
+            core::ptr::addr_of_mut!((*dst).scanning).write(false);
+            core::ptr::addr_of_mut!((*dst).ap_owner).write(None);
+            core::ptr::addr_of_mut!((*dst).p2p_owner).write(None);
+            core::ptr::addr_of_mut!((*dst).p2p_next).write(1);
+            core::ptr::addr_of_mut!((*dst).ap_keys).write(ap_crypto::Keys::default());
+            core::ptr::addr_of_mut!((*dst).wow_config).write(None);
+            core::ptr::addr_of_mut!((*dst).wow_nlo).write(None);
+            core::ptr::addr_of_mut!((*dst).sched).write(None);
+            core::ptr::addr_of_mut!((*dst).associate_step).write("init");
+            core::ptr::addr_of_mut!((*dst).backend).write(backend);
+            core::ptr::addr_of_mut!((*dst).firmware).write(firmware);
+        }
+    }
+
+    /// Constructs a fresh `Session` directly on the heap to avoid a 13 KiB
+    /// stack temporary on the hardware probe/init path.
+    #[inline(never)]
+    pub(super) fn new_boxed(backend: B, firmware: Firmware) -> alloc::boxed::Box<Self> {
+        let mut slot = alloc::boxed::Box::<Self>::new_uninit();
+        // SAFETY: `slot.as_mut_ptr()` points to writable heap storage for `Self`,
+        // and `init_in` initializes all fields before `assume_init`.
+        unsafe {
+            Self::init_in(slot.as_mut_ptr(), backend, firmware);
+            slot.assume_init()
+        }
+    }
+
     fn new(backend: B, firmware: Firmware) -> Self {
-        Self {
-            backend,
-            firmware,
-            state: State::Prepared,
-            seq: 0,
-            events: VecDeque::new(),
-            transferred: 0,
-            boot_started: None,
-            scan_seq: 0,
-            data_pending: group_link::DataPending::default(),
-            station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
-            group: None,
-            go: None,
-            wtbl: crate::mt7921::vif_slots::Wtbl::default(),
-            frag_threshold: u32::MAX,
-            pmksa: crate::mt7921::pmksa::Cache::default(),
-            receive_epoch: 0,
-            scan_packets: VecDeque::new(),
-            scanning: false,
-            ap_owner: None,
-            p2p_owner: None,
-            p2p_next: 1,
-            ap_keys: ap_crypto::Keys::default(),
-            wow_config: None,
-            wow_nlo: None,
-            sched: None,
+        let mut slot = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `slot.as_mut_ptr()` points to writable stack storage for `Self`,
+        // and `init_in` initializes all fields before `assume_init`.
+        unsafe {
+            Self::init_in(slot.as_mut_ptr(), backend, firmware);
+            slot.assume_init()
         }
     }
     fn stage(&mut self, stage: Stage) {

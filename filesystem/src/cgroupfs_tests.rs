@@ -3244,6 +3244,96 @@ kernel_test_in!(
     smoke_clone_thread_cgroup_domain_rules
 );
 
+/// Moving a multi-threaded process across Domain cgroups via `place` must
+/// migrate its non-`Threaded` threads out of the old domain's `cgroup.threads`,
+/// and `task_exited(tgid)` must sweep any remaining sibling TIDs belonging to
+/// that process so `cgroup.events` flips back to `populated 0`.
+fn smoke_cgroup_task_exited_and_place_handle_domain_threads() -> TestResult {
+    const TGID: u64 = 925_001;
+    const SIB_TID: u64 = 925_002;
+    let src_name = "t_dom_thread_src";
+    let dst_name = "t_dom_thread_dst";
+
+    let root = root_dir();
+    let src = match poll_once(root.mkdir(src_name)) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir src failed"),
+    };
+    let dst = match poll_once(root.mkdir(dst_name)) {
+        Some(Ok(d)) => d,
+        _ => {
+            let _ = poll_once(root.rmdir(src_name));
+            return TestResult::Fail("mkdir dst failed");
+        }
+    };
+
+    if crate::cgroupfs::attach_by_path("/t_dom_thread_src", TGID).is_err() {
+        task_exited(TGID);
+        let _ = poll_once(root.rmdir(dst_name));
+        let _ = poll_once(root.rmdir(src_name));
+        return TestResult::Fail("attach_by_path src failed");
+    }
+    crate::cgroupfs::fork_thread_inherit(TGID, TGID, SIB_TID);
+
+    let cleanup = |msg: &'static str| -> TestResult {
+        task_exited(TGID);
+        crate::cgroupfs::thread_exited(SIB_TID);
+        let _ = poll_once(root.rmdir(dst_name));
+        let _ = poll_once(root.rmdir(src_name));
+        TestResult::Fail(msg)
+    };
+
+    if crate::cgroupfs::attach_by_path("/t_dom_thread_dst", TGID).is_err() {
+        return cleanup("attach_by_path dst failed");
+    }
+    if !read_attr(&src, "cgroup.threads")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return cleanup("place() left inherited domain thread in source cgroup.threads");
+    }
+    if !read_attr(&src, "cgroup.events")
+        .unwrap_or_default()
+        .contains("populated 0")
+    {
+        return cleanup("source cgroup stayed populated after migrating process and threads");
+    }
+    if !matches!(poll_once(root.rmdir(src_name)), Some(Ok(()))) {
+        return cleanup("rmdir of vacated source cgroup failed");
+    }
+    if !read_attr(&dst, "cgroup.threads")
+        .unwrap_or_default()
+        .contains("925002")
+    {
+        return cleanup("destination cgroup.threads missing migrated domain thread");
+    }
+
+    // Whole-process exit without a prior `thread_exited(SIB_TID)` must sweep
+    // the sibling entry and flip `populated 0`.
+    task_exited(TGID);
+    if !read_attr(&dst, "cgroup.threads")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return cleanup("task_exited() left sibling TID in cgroup.threads");
+    }
+    if !read_attr(&dst, "cgroup.events")
+        .unwrap_or_default()
+        .contains("populated 0")
+    {
+        return cleanup("destination cgroup stayed populated after task_exited");
+    }
+    crate::cgroupfs::thread_exited(SIB_TID);
+    if !matches!(poll_once(root.rmdir(dst_name)), Some(Ok(()))) {
+        return TestResult::Fail("rmdir of exited destination cgroup failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_task_exited_and_place_handle_domain_threads
+);
+
 // ── Per-page memory-cgroup charging (memcg ids) ──────────────────────
 //
 // The frame allocator charges user pages to the allocating task's memory

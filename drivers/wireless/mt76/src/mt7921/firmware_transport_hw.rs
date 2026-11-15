@@ -849,6 +849,58 @@ impl Hardware {
         }
     }
 
+    /// Snapshot only a terminal association timeout; never runs on the hot path.
+    #[cold]
+    #[inline(never)]
+    fn associate_timeout(
+        &self,
+        stage: super::Stage,
+        step: &str,
+        queued_events: usize,
+        pending_data: usize,
+    ) {
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: associate timeout stage={stage:?} step={step} dma={:x?} irq={:x?} events={queued_events} data={pending_data}",
+            self.read(GLOBAL),
+            self.read(MT_WFDMA0_HOST_INT_STA),
+        );
+        let Some(storage) = &self.owner.storage else {
+            return;
+        };
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: associate tokens={:?} pending_events={} pending_data={} rx_open={}",
+            storage.tokens.pending_head(),
+            storage.pending_events.len(),
+            storage.pending_data.len(),
+            storage.receive_open,
+        );
+        for (name, ring, rx) in [
+            ("tx-data", &storage.data, false),
+            ("rx-pre", &storage.rx[0], true),
+            ("rx-post", &storage.rx[1], true),
+            ("rx-data", &storage.rx[2], true),
+        ] {
+            let slot = if rx || ring.pending {
+                ring.index
+            } else {
+                (ring.index + DEPTH - 1) % DEPTH
+            };
+            dma_barrier();
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: associate ring {name} cidx={:x?} didx={:x?} index={} pending={} slot={slot} ctrl={:#010x}",
+                self.read(ring.base + 8),
+                self.read(ring.base + 12),
+                ring.index,
+                ring.pending,
+                ring.word(slot, 1),
+            );
+        }
+    }
+
     fn program(&self, ring: &Ring, rx: bool) -> Result<(), Error> {
         self.write(ring.base, ring.descriptors.dma_addr().raw() as u32)?;
         self.write(ring.base + 4, DEPTH as u32)?;
@@ -1756,7 +1808,7 @@ impl Transport {
                 ],
             };
             Ok(Self {
-                session: alloc::boxed::Box::new(Session::new(
+                session: Session::new_boxed(
                     Hardware {
                         mmio,
                         device,
@@ -1770,7 +1822,7 @@ impl Transport {
                         wake: wake::Wake::default(),
                     },
                     firmware,
-                )),
+                ),
                 generation,
             })
         })
@@ -1788,6 +1840,21 @@ impl Transport {
                 .backend
                 .boot_timeout(self.session.seq, self.session.events.len());
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn diagnose_associate_timeout(&self) {
+        let stage = match self.session.state {
+            State::Failed { stage, .. } | State::Running(stage) => stage,
+            _ => super::Stage::Authenticate,
+        };
+        self.session.backend.associate_timeout(
+            stage,
+            self.session.associate_step,
+            self.session.events.len(),
+            self.session.data_pending.len(),
+        );
     }
 
     /// Start once. Dropping this borrowed future requests no reset/replay.
@@ -2072,10 +2139,19 @@ impl Transport {
             heard_beacon,
         )
         .ok_or(Error::Authority)?;
-        let aid = self
+        let aid = match self
             .session
             .associate_station_as(bss, ssid, security, permission, extra_ies, network)
-            .await?;
+            .await
+        {
+            Ok(aid) => aid,
+            Err(error) => {
+                if error == Error::Timeout {
+                    self.diagnose_associate_timeout();
+                }
+                return Err(error);
+            }
+        };
         self.session.service_keys().await?;
         self.session.negotiate_transmit_ba().await?;
         self.session.service_keys().await?;

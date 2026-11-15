@@ -2169,10 +2169,11 @@ fn stamp_slice_start(task: &KernelTask, cpu: usize) {
     // hrtick (Linux CONFIG_SCHED_HRTICK): (re)arm the per-task one-shot slice
     // timer so the task is preempted precisely at slice exhaustion instead of at
     // the next coarse periodic tick. Compiled out (and `cpu` unused) by default.
+    if let Some(control) = task.user_scheduling.as_ref() {
+        control.last_cpu.store(cpu as u32, Ordering::Release);
+    }
     #[cfg(feature = "hrtick")]
     crate::hrtick::arm(cpu, now, task.slice_cycles.load(Ordering::Acquire));
-    #[cfg(not(feature = "hrtick"))]
-    let _ = cpu;
 }
 
 /// Attribute only this continuation's execution. Direct handoffs and nested

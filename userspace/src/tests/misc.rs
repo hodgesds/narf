@@ -2667,6 +2667,52 @@ fn smoke_userspace_exit_observer_group_dead_once() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_exit_observer_group_dead_once);
 
+/// When the last exiting thread of an orphan (or already-reaped) thread group
+/// is a non-leader `CLONE_THREAD` sibling, `PID_TO_TASK[pid]` is cleared
+/// before `release_exited_thread_task` runs. It must still clean up the
+/// sibling's `TASK_TO_LINUX_TID` row (and outer TID / cgroup thread state)
+/// rather than returning early on `pid_to_task_raw(pid) == None`.
+fn smoke_userspace_release_exited_thread_when_leader_already_reaped() -> TestResult {
+    use crate::handlers::{
+        __test_forget_thread, __test_register_thread, pid_to_task_raw, release_exited_thread_task,
+        task_to_linux_tid_raw,
+    };
+
+    const GROUP_PID: u64 = 9_500_000_001;
+    const SIB_TID: u64 = 9_500_000_002;
+    const SIB_TASK: u64 = 0xDEAD_BEEF_9502;
+    const REAPED_LEADER_TASK: u64 = 0xDEAD_BEEF_9501;
+
+    __test_register_thread(SIB_TID, SIB_TASK, GROUP_PID);
+    if task_to_linux_tid_raw(SIB_TASK) != Some(SIB_TID) {
+        __test_forget_thread(SIB_TASK);
+        return TestResult::Fail("synthetic CLONE_THREAD sibling mapping missing");
+    }
+    if pid_to_task_raw(GROUP_PID).is_some() {
+        __test_forget_thread(SIB_TASK);
+        return TestResult::Fail("synthetic leader pid unexpectedly present");
+    }
+
+    // Reaped-leader task has no TASK_TO_LINUX_TID entry and must be a safe no-op.
+    release_exited_thread_task(GROUP_PID, REAPED_LEADER_TASK);
+    // Non-leader sibling has TASK_TO_LINUX_TID even with leader already reaped:
+    // release_exited_thread_task must clean up its mapping completely.
+    release_exited_thread_task(GROUP_PID, SIB_TASK);
+
+    if task_to_linux_tid_raw(SIB_TASK).is_some() {
+        __test_forget_thread(SIB_TASK);
+        return TestResult::Fail(
+            "release_exited_thread_task leaked sibling TASK_TO_LINUX_TID when leader was reaped",
+        );
+    }
+    __test_forget_thread(SIB_TASK);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_release_exited_thread_when_leader_already_reaped
+);
+
 /// FUTEX_WAKE_OP (op 5) must atomically read-modify-write `*uaddr2` per the
 /// encoded op AND wake (up to `val`) waiters on `uaddr` — Linux
 /// `futex_wake_op`. Regression: op 5 fell through to the `_ => fail` arm

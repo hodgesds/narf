@@ -10161,17 +10161,27 @@ impl SocketFile {
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
                 let ip =
                     u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
-                // Look up the listener. Loopback (127.x.x.x) and
-                // 0.0.0.0 (INADDR_ANY) listeners both match.
+                // Look up an in-process listener only when `ip` is local to
+                // this namespace (0.0.0.0, 127.0.0.0/8, or an assigned
+                // interface address). Otherwise a wildcard 0.0.0.0 listener
+                // (e.g. local sshd on :22) would hijack outbound remote
+                // connections instead of letting them route through the TCP
+                // stack.
                 let listener = {
                     let ns = self.net_ns_id();
-                    let listeners = INET_LISTENERS.lock();
-                    let m = listeners.as_ref();
-                    m.and_then(|m| {
-                        m.get(&(ns, ip, port))
-                            .or_else(|| m.get(&(ns, 0, port)))
-                            .cloned()
-                    })
+                    let is_local =
+                        ip == 0 || narf_net::iface::is_local_addr_in(ns, ip.to_be_bytes());
+                    if is_local {
+                        let listeners = INET_LISTENERS.lock();
+                        let m = listeners.as_ref();
+                        m.and_then(|m| {
+                            m.get(&(ns, ip, port))
+                                .or_else(|| m.get(&(ns, 0, port)))
+                                .cloned()
+                        })
+                    } else {
+                        None
+                    }
                 };
                 let listener = match listener {
                     Some(l) => l,
@@ -11345,16 +11355,34 @@ impl SocketFile {
                     Ok(v) => v,
                     Err(e) => return SocketOpResult::Err(e),
                 };
+                // Mirror the IPv4 local-destination guard so a wildcard `[::]`
+                // listener only catches local addresses (unspecified `::`,
+                // `::1`, v4-mapped local addresses, or configured interface
+                // addresses in this namespace), never remote destinations.
                 let listener = {
-                    let listeners = INET6_LISTENERS.lock();
-                    let m = listeners.as_ref();
                     let unspecified = [0u8; 16];
                     let net_ns_id = self.net_ns_id();
-                    m.and_then(|m| {
-                        m.get(&(net_ns_id, ip, port))
-                            .or_else(|| m.get(&(net_ns_id, unspecified, port)))
-                            .cloned()
-                    })
+                    let is_v4_mapped_local = ip[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+                        && (ip[12..16] == [0, 0, 0, 0]
+                            || narf_net::iface::is_local_addr_in(
+                                net_ns_id,
+                                [ip[12], ip[13], ip[14], ip[15]],
+                            ));
+                    let is_local = ip == unspecified
+                        || ip == IN6ADDR_LOOPBACK
+                        || is_v4_mapped_local
+                        || narf_net::ipv6::addrs::is_local_in(net_ns_id, &ip);
+                    if is_local {
+                        let listeners = INET6_LISTENERS.lock();
+                        let m = listeners.as_ref();
+                        m.and_then(|m| {
+                            m.get(&(net_ns_id, ip, port))
+                                .or_else(|| m.get(&(net_ns_id, unspecified, port)))
+                                .cloned()
+                        })
+                    } else {
+                        None
+                    }
                 };
                 let listener = match listener {
                     Some(l) => l,

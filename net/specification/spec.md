@@ -154,6 +154,14 @@ pub type SendFn = fn(&[u8], TxMeta) -> Result<(), ()>;
 pub type SendCtxFn = fn(u64, &[u8], TxMeta) -> Result<(), ()>;
 
 pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String;
+pub fn register_with_driver(
+    name: &str,
+    mac: [u8; 6],
+    send: SendFn,
+    driver: &'static str,
+    driver_version: Option<&'static str>,
+    bus_info: String,
+) -> String;
 pub fn register_with_context(
     name: &str,
     mac: [u8; 6],
@@ -163,6 +171,9 @@ pub fn register_with_context(
 pub fn unregister(name: &str) -> bool;
 pub fn retire_for_rebind(name: &str) -> bool;
 pub fn rebind_name(name: &str) -> Option<&'static str>;
+pub enum NetSysfsEvent<'a> { Added(&'a str), Updated(&'a str), Removed(&'a str) }
+pub type NetSysfsFn = fn(NetSysfsEvent<'_>);
+pub fn install_net_sysfs_hook(hook: NetSysfsFn);
 ```
 
 `register_with_context` stores only an opaque cookie and a permanent in-tree

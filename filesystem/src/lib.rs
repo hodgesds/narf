@@ -165,8 +165,9 @@ pub use posix_acl::{
 pub use sysfs::{
     class_device_register, class_register, get_or_create_child, get_root,
     install_net_snapshot_hook, kobject_add_attr, kobject_add_bin_attr, kobject_add_uevent_attr,
-    kobject_add_writable_attr, kobject_emit_uevent, sysfs_root, AttrShow, AttrStore, BinAttrRead,
-    Kobject, NetDuplex, NetIfaceInfo, NetIfaceStats, NetPciParent, SysFs, SysKobjDir,
+    kobject_add_writable_attr, kobject_emit_uevent, sync_net_iface, sysfs_root,
+    unpublish_net_iface, AttrShow, AttrStore, BinAttrRead, Kobject, NetDuplex, NetIfaceInfo,
+    NetIfaceStats, NetPciParent, SysFs, SysKobjDir,
 };
 pub use uevent::{
     current_seqnum as uevent_current_seqnum, emit as emit_uevent,

@@ -172,6 +172,9 @@ fn off_channel() -> Result<(), &'static str> {
         .roc
         .clone()
         .ok_or("actual native ROC model")?;
+    if !native.seen.swap(false, Ordering::AcqRel) {
+        return Err("CNM home join did not acquire Join ROC");
+    }
     native.interval_ms.store(500, Ordering::Release);
     let packet = Arc::new(Hold::default());
     session.backend.packet_hold = Some(packet.clone());

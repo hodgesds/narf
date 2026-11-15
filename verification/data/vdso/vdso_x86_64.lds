@@ -24,7 +24,7 @@ SECTIONS {
 
 PHDRS {
   text    PT_LOAD    FLAGS(5) FILEHDR PHDRS;   /* R+X, includes ehdr+phdrs */
-  dynamic PT_DYNAMIC;
+  dynamic PT_DYNAMIC FLAGS(4);                 /* PF_R only; PF_W makes glibc relocate in-place before Go runtime */
 }
 
 VERSION {

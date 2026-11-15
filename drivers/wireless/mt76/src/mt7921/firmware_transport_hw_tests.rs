@@ -473,7 +473,7 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     let expected = [
         0x2000003eu32,
         0x80026013,
-        0x8000200b,
+        0x8000000b,
         0x10007800,
         0,
         0,
