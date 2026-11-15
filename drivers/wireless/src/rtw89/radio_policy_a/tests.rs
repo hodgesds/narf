@@ -54,6 +54,10 @@ fn fragment_record(request: &fragment::Request) -> [u8; LENGTH] {
     b[54..58].copy_from_slice(&[1, 20, 1, 3]);
     b[58..60].copy_from_slice(&2346u16.to_le_bytes());
     b[60..64].copy_from_slice(&[16, 0, 3, 1]);
+    // N5AF carries no fields past byte 64, unlike the N5AB base record
+    // whose calibration values `header()` stamps at 62..68; clear them so
+    // the record satisfies `from_verified`'s `bytes[64..] == [0; 64]`.
+    b[64..68].copy_from_slice(&[0; 4]);
     b
 }
 fn rule(start: u32, end: u32, bw: u32, flags: RegFlags) -> RegRule {

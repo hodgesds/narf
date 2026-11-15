@@ -590,12 +590,16 @@ fn smoke_rtw89_na_set_txpwr_follows_rtw8852a_and_phy_ax() -> TestResult {
         .iter()
         .filter(|w| matches!(w.0, 0xd200 | 0x15804 | 0x15808 | 0x17804 | 0x17808))
         .collect();
+    // Linux `rtw8852a_set_txpwr_ref` writes the OFDM word on both paths
+    // first, then the CCK word on both paths (the path loop sits inside
+    // each of the OFDM/CCK steps), so the reference words land in
+    // offset-grouped order, not path-grouped order.
     if refs
         != [
             &(0xd200, 0x0fff_fc00, 0),
             &(0x15804, 0x07ff_ffff, (172 << 18) | (312 << 9)),
-            &(0x15808, 0x07ff_ffff, (172 << 18) | (312 << 9)),
             &(0x17804, 0x07ff_ffff, (172 << 18) | (312 << 9)),
+            &(0x15808, 0x07ff_ffff, (172 << 18) | (312 << 9)),
             &(0x17808, 0x07ff_ffff, (172 << 18) | (312 << 9)),
         ]
         || writes.iter().any(|w| {
