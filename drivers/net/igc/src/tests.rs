@@ -3307,3 +3307,68 @@ fn smoke_igc_rx_rearms_from_recycled_buffers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_rx_rearms_from_recycled_buffers);
+
+fn smoke_igc_dynamic_itr_follows_linux_ring_itr() -> TestResult {
+    // Linux igc_update_ring_itr / igc_write_itr at ecd997b0189a, with the
+    // literal ITR values of igc.h (START 648, 4K 980, 20K 196).
+    use crate::itr::{dynamic_mode, eitr, ring_itr, Work};
+    let frames = |bytes: u64, n: u64| Work {
+        rx_packets: n,
+        rx_bytes: bytes * n,
+        ..Work::default()
+    };
+    let gig = Some(1000);
+    check!(
+        dynamic_mode(3) == Some(true)
+            && dynamic_mode(1) == Some(false)
+            && dynamic_mode(0).is_none()
+            && dynamic_mode(166).is_none(),
+        "rx-usecs 1/3 are not the dynamic modes"
+    );
+    check!(
+        eitr(648) == 0x8000_0288 && eitr(0) == 0x8000_7ffc,
+        "EITR word does not match igc_write_itr"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(1514, 10)) == 769,
+        "full-size frames: (1514 + 24) / 2"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(600, 10)) == 208,
+        "mid-size frames get the /3 boost"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(64, 100)) == 196
+            && ring_itr(648, gig, false, frames(64, 100)) == 44,
+        "small frames: conservative floor is 20K interrupts/s"
+    );
+    let tso = Work {
+        rx_packets: 4,
+        rx_bytes: 4 * 66,
+        tx_packets: 1,
+        tx_bytes: 64_000,
+    };
+    check!(
+        ring_itr(648, gig, true, tso) == 1500,
+        "larger direction's mean, capped at 3000 bytes"
+    );
+    check!(
+        ring_itr(777, gig, true, Work::default()) == 777,
+        "an idle vector changed interval"
+    );
+    check!(
+        ring_itr(648, Some(100), true, frames(64, 100)) == 980
+            && ring_itr(648, Some(10), true, Work::default()) == 980,
+        "10/100 links are not fixed at 4K interrupts/s"
+    );
+    check!(
+        ring_itr(648, Some(2500), true, frames(1514, 10)) == 769
+            && ring_itr(648, None, true, frames(1514, 10)) == 769,
+        "gigabit-and-above policy depends on the speed"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dynamic_itr_follows_linux_ring_itr
+);

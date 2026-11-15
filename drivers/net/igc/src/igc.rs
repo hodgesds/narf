@@ -441,6 +441,14 @@ pub struct Igc {
     recovery_requested: AtomicBool,
     completion_autopsy_pending: AtomicBool,
     pub(crate) irq_routes: Vec<IrqRoute>,
+    /// `coalesce_us` as last programmed, for the receive tasks' dynamic
+    /// moderation (Linux `rx_itr_setting`), read without the settings lock.
+    itr_setting: AtomicU32,
+    /// Bumped whenever EITR is reprogrammed, so a receive task drops the
+    /// interval it last wrote.
+    itr_epoch: AtomicU32,
+    /// Negotiated speed as last published, 0 while unknown.
+    link_mbps: AtomicU32,
     state: AtomicU8,
     active: AtomicUsize,
     control_busy: AtomicBool,
@@ -594,7 +602,8 @@ impl Igc {
                 rx_entries: COUNT as u32,
                 tx_entries: COUNT as u32,
                 channels: count as u16,
-                coalesce_us: 166,
+                // Linux `IGC_DEFAULT_ITR`: dynamic, conservative.
+                coalesce_us: 3,
                 rss: narf_net::rss::RssConfig::standard(count, 128),
                 link: narf_net::nic::LinkSettings {
                     advertised: if matches!(device.id.device, IGC_I220_V | IGC_I221_V) {
@@ -615,6 +624,9 @@ impl Igc {
             recovery_requested: AtomicBool::new(false),
             completion_autopsy_pending: AtomicBool::new(false),
             irq_routes,
+            itr_setting: AtomicU32::new(0),
+            itr_epoch: AtomicU32::new(0),
+            link_mbps: AtomicU32::new(0),
             state: AtomicU8::new(STOPPED),
             active: AtomicUsize::new(0),
             control_busy: AtomicBool::new(false),
@@ -910,6 +922,47 @@ impl Igc {
         Ok(())
     }
 
+    /// Linux `igc_ring_irq_enable` → `igc_update_ring_itr`, run by a queue's
+    /// receive task as it re-arms the vector: fold the work done since the
+    /// last re-arm into the vector's interval and write EITR only when it
+    /// changes. `state` is (EITR epoch, interval, counters at last update).
+    fn moderate(&self, route: IrqRoute, queue: &Queue, state: &mut (u32, u32, crate::itr::Work)) {
+        let Some(conservative) = crate::itr::dynamic_mode(self.itr_setting.load(Ordering::Acquire))
+        else {
+            return;
+        };
+        let epoch = self.itr_epoch.load(Ordering::Acquire);
+        if state.0 != epoch {
+            // EITR was reprogrammed to its start value by a reset.
+            *state = (epoch, crate::itr::START_ITR, state.2);
+        }
+        let s = queue.statistics();
+        let now = crate::itr::Work {
+            rx_packets: s[5],
+            rx_bytes: s[6],
+            tx_packets: s[1],
+            tx_bytes: s[2],
+        };
+        let last = state.2;
+        let work = crate::itr::Work {
+            rx_packets: now.rx_packets.saturating_sub(last.rx_packets),
+            rx_bytes: now.rx_bytes.saturating_sub(last.rx_bytes),
+            tx_packets: now.tx_packets.saturating_sub(last.tx_packets),
+            tx_bytes: now.tx_bytes.saturating_sub(last.tx_bytes),
+        };
+        state.2 = now;
+        let speed = match self.link_mbps.load(Ordering::Acquire) {
+            0 => None,
+            mbps => Some(mbps),
+        };
+        let next = crate::itr::ring_itr(state.1, speed, conservative, work);
+        if next != state.1 {
+            state.1 = next;
+            self.hw
+                .write(0x1680 + u64::from(route.index) * 4, crate::itr::eitr(next));
+        }
+    }
+
     fn configure_interrupts(&self) {
         if self.irq_routes.is_empty() {
             return;
@@ -931,10 +984,19 @@ impl Igc {
             self.hw.write(0x1700 + i as u64 * 4, ivar);
         }
         self.hw.write(0x1740, 0x8000);
-        let ticks = (self.settings.lock().coalesce_us * 1000 / 256) & 0x7ffc;
+        let coalesce = self.settings.lock().coalesce_us;
+        // Dynamic modes start at `IGC_START_ITR` and are moved by each
+        // queue's receive task (`igc_update_ring_itr`); otherwise the
+        // interval is fixed.
+        let value = if crate::itr::dynamic_mode(coalesce).is_some() {
+            crate::itr::eitr(crate::itr::START_ITR)
+        } else {
+            ((coalesce * 1000 / 256) & 0x7ffc) | (1 << 31)
+        };
+        self.itr_setting.store(coalesce, Ordering::Release);
+        self.itr_epoch.fetch_add(1, Ordering::AcqRel);
         for r in &self.irq_routes {
-            self.hw
-                .write(0x1680 + u64::from(r.index) * 4, ticks | (1 << 31));
+            self.hw.write(0x1680 + u64::from(r.index) * 4, value);
         }
         let mask = (1u32 << self.irq_routes.len()) - 1;
         self.hw.write(0x152c, mask);
@@ -2032,6 +2094,9 @@ fn spawn_pumps(
         );
         narf_scheduler::spawn_with_spec(
             async move {
+                // This vector's interval and the queue's work counters when
+                // it was last set (`igc_update_ring_itr` state).
+                let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     let waiter = route.map(|r| {
@@ -2107,6 +2172,9 @@ fn spawn_pumps(
                         queue.replenish_rx();
                     }
                     let pending = if let Ok(_op) = rx.operation() {
+                        if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
+                            rx.moderate(r, queue, &mut itr);
+                        }
                         if let Some(r) = route {
                             rx.hw.write(0x1524, 1u32 << r.index);
                         }
@@ -2201,6 +2269,9 @@ fn spawn_pumps(
                         }
                     }
                     crate::publish::publish_link(device.name(), link);
+                    device
+                        .link_mbps
+                        .store(link.speed_mbps.unwrap_or(0), Ordering::Release);
                     *device.published_link.lock() = link;
                 }
                 narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;

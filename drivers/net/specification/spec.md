@@ -239,6 +239,15 @@ counts in `rx_queue_N_alloc_failed`. `ethtool -S` reports
 `tx_queue_N_pool_free`, `tx_queue_N_pool_limit`, `tx_queue_N_pool_misses`,
 `rx_queue_N_pool_free` and `rx_queue_N_pool_misses`.
 
+IGC interrupt moderation follows Linux `rx_itr_setting`: the default
+`coalesce_us` is 3 (`IGC_DEFAULT_ITR`, dynamic conservative) and 1 is dynamic.
+In those modes each queue vector starts at `IGC_START_ITR` (648) and its
+receive task applies `igc_update_ring_itr` as it re-arms the vector: the
+interval follows the larger mean frame of the RX and TX work since the last
+re-arm, conservative mode never drops below `IGC_20K_ITR`, 10/100 Mb/s links
+use `IGC_4K_ITR`, and EITR is written only when the interval changes. Any
+other `coalesce_us` is a fixed interval.
+
 ### Transmit-queue contract (`narf_net::txq`)
 
 A multi-queue driver that wants the stack to wait for transmit room, instead
