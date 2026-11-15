@@ -257,6 +257,18 @@ fn load_and_start() -> Result<(), LoadError> {
     if page_end - page_start > MAX_KERNEL_LOAD_SPAN
         || ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end)
     {
+        // Name the failing sub-check: the bare `InvalidElf` variant cannot
+        // tell a span overrun from a DTB overlap (issue #2125).
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: load span {:#x}-{:#x} ({} bytes, max {}) with DTB {:#x}-{:#x}",
+            page_start,
+            page_end,
+            page_end - page_start,
+            MAX_KERNEL_LOAD_SPAN,
+            dtb,
+            dtb_end
+        );
         return Err(LoadError::InvalidElf);
     }
 
@@ -513,12 +525,26 @@ fn parse_elf_header(bytes: &[u8], file_size: u64) -> Result<ElfHeader, LoadError
     let phentsize = read_u16(bytes, 54)? as usize;
     let phnum = read_u16(bytes, 56)? as usize;
     if phentsize != PROGRAM_HEADER_SIZE || phnum == 0 || phnum > MAX_PROGRAM_HEADERS {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: bad program header table: entry size {} (want {}), count {} (max {})",
+            phentsize,
+            PROGRAM_HEADER_SIZE,
+            phnum,
+            MAX_PROGRAM_HEADERS
+        );
         return Err(LoadError::InvalidElf);
     }
     let table_size = u64::try_from(phentsize.checked_mul(phnum).ok_or(LoadError::Arithmetic)?)
         .map_err(|_| LoadError::Arithmetic)?;
     let table_end = phoff.checked_add(table_size).ok_or(LoadError::Arithmetic)?;
     if table_end > file_size {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: program header table ends at {:#x} but the file is {:#x} bytes",
+            table_end,
+            file_size
+        );
         return Err(LoadError::InvalidElf);
     }
     Ok(ElfHeader {
@@ -537,6 +563,12 @@ fn parse_program_headers(
         .checked_mul(header.program_headers_count)
         .ok_or(LoadError::Arithmetic)?;
     if bytes.len() != expected_size {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: program header table is {} bytes, expected {}",
+            bytes.len(),
+            expected_size
+        );
         return Err(LoadError::InvalidElf);
     }
 
@@ -563,12 +595,27 @@ fn parse_program_headers(
         };
         let alignment = read_u64(bytes, offset + 48)?;
         if segment.file_size > segment.memory_size || segment.memory_size == 0 {
+            #[cfg(not(test))]
+            uefi::println!(
+                "NARF UEFI loader: PT_LOAD {} has filesz {:#x} and memsz {:#x}",
+                index,
+                segment.file_size,
+                segment.memory_size
+            );
             return Err(LoadError::InvalidElf);
         }
         if alignment > 1
             && (!alignment.is_power_of_two()
                 || segment.physical % alignment != segment.file_offset % alignment)
         {
+            #[cfg(not(test))]
+            uefi::println!(
+                "NARF UEFI loader: PT_LOAD {} alignment {:#x} mismatches paddr {:#x} and offset {:#x}",
+                index,
+                alignment,
+                segment.physical,
+                segment.file_offset
+            );
             return Err(LoadError::InvalidElf);
         }
         let file_end = segment
@@ -576,6 +623,13 @@ fn parse_program_headers(
             .checked_add(segment.file_size)
             .ok_or(LoadError::Arithmetic)?;
         if file_end > file_size {
+            #[cfg(not(test))]
+            uefi::println!(
+                "NARF UEFI loader: PT_LOAD {} file range ends at {:#x} but the file is {:#x} bytes",
+                index,
+                file_end,
+                file_size
+            );
             return Err(LoadError::InvalidElf);
         }
         let memory_end = segment
@@ -600,13 +654,34 @@ fn parse_program_headers(
         segment_count += 1;
     }
     if segment_count == 0 || !entry_is_executable {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: entry {:#x} is not inside an executable PT_LOAD ({} segments)",
+            header.entry,
+            segment_count
+        );
         return Err(LoadError::InvalidElf);
     }
     for (index, left) in segments[..segment_count].iter().enumerate() {
         let left_end = left.physical + left.memory_size;
-        for right in &segments[index + 1..segment_count] {
+        // The index is used by the #[cfg(not(test))] overlap diagnostic
+        // below, so it is load-bearing in the production build; clippy
+        // only sees the test build, where the diagnostic is compiled out.
+        #[allow(clippy::needless_range_loop)]
+        for right_index in index + 1..segment_count {
+            let right = &segments[right_index];
             let right_end = right.physical + right.memory_size;
             if left.physical < right_end && right.physical < left_end {
+                #[cfg(not(test))]
+                uefi::println!(
+                    "NARF UEFI loader: PT_LOAD {} ({:#x}-{:#x}) overlaps PT_LOAD {} ({:#x}-{:#x})",
+                    index,
+                    left.physical,
+                    left_end,
+                    right_index,
+                    right.physical,
+                    right_end
+                );
                 return Err(LoadError::InvalidElf);
             }
         }
