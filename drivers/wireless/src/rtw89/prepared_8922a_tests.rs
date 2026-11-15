@@ -1600,9 +1600,10 @@ fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
     let Some(profile) = Profile::new20(ChanBand::Ghz6, 37) else {
         return TestResult::Fail("6GHz ch37 profile refused");
     };
-    // A set_txpwr refusal AFTER the MAC program leaves the MAC
-    // registers on the new channel with the old power program
-    // and records no channel: only the 5 MAC registers land.
+    // A set_txpwr refusal AFTER the MAC+BB program leaves the
+    // MAC+BB registers on the new channel with the old power
+    // program and records no channel: only the 5 MAC registers
+    // and the 20 BB registers land.
     let no_byrate: Vec<Element> = txpwr_elements()
         .into_iter()
         .filter(|e| e.id != ID_BYRATE)
@@ -1611,17 +1612,25 @@ fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
     if owner
         .set_channel(macid, profile, &no_byrate, *b"US", &mut regs)
         .is_ok()
-        || regs.regs32.len() != 5
+        || regs.regs32.len() != 25
         || regs.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x26B4C) != Some(&6135)
+        || regs.regs32.get(&0x26B50) != Some(&43)
+        || regs.regs32.get(&0x20734) != Some(&0x0082_0000)
         || regs.regs32.contains_key(&0x11E00)
         || owner.channel().is_some()
     {
-        return TestResult::Fail("set_channel without BYRATE did not fail after the MAC program");
+        return TestResult::Fail(
+            "set_channel without BYRATE did not fail after the MAC+BB program",
+        );
     }
     // First channel-set: MAC words (rtw8922a_set_channel_mac,
     // 20 MHz 6 GHz: RFMOD 0, TXSB PRI20 bitmap bit 0, TXRATE_CHK
-    // CCK_EN|RTS6, SIFS 0x3f/0x3e) plus the 194-register
-    // set_txpwr program (by-rate head as in the set_txpwr test).
+    // CCK_EN|RTS6, SIFS 0x3f/0x3e), BB words
+    // (rtw8922a_set_channel_bb, 20 MHz 6 GHz: FC0 6135, SCO 43,
+    // chan_idx 0x82, band-select 0, CCK off, RSTB_ASYNC 1, TSSI
+    // pulsed to 1), plus the 194-register set_txpwr program
+    // (by-rate head as in the set_txpwr test).
     let mut regs = Model::new();
     let outcome = match owner.set_channel(macid, profile, &elements, *b"US", &mut regs) {
         Ok(outcome) => outcome,
@@ -1638,10 +1647,18 @@ fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
         || regs.regs32.get(&0x10828) != Some(&0x03)
         || regs.regs32.get(&0x1033C) != Some(&0x3F)
         || regs.regs32.get(&0x10370) != Some(&0x003E_0000)
+        || regs.regs32.get(&0x26B4C) != Some(&6135)
+        || regs.regs32.get(&0x26B50) != Some(&43)
+        || regs.regs32.get(&0x20734) != Some(&0x0082_0000)
+        || regs.regs32.get(&0x24160) != Some(&0)
+        || regs.regs32.get(&0x20520) != Some(&1)
+        || regs.regs32.get(&0x20704) != Some(&0x2)
+        || regs.regs32.get(&0x2E60C) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x2E70C) != Some(&0x0001_0000)
         || regs.regs32.get(&0x11E00) != Some(&0x0302_0105)
-        || regs.regs32.len() != 199
+        || regs.regs32.len() != 219
     {
-        return TestResult::Fail("set_channel did not run the MAC + set_txpwr programs");
+        return TestResult::Fail("set_channel did not run the MAC + BB + set_txpwr programs");
     }
     // Retune across bands: a second station admitted on 5 GHz
     // 80 MHz primary 36 (center 42). Band change reported, MAC
@@ -1669,9 +1686,14 @@ fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
         || regs5.regs32.get(&0x10828) != Some(&0x03)
         || regs5.regs32.get(&0x1033C) != Some(&0x41)
         || regs5.regs32.get(&0x10370) != Some(&0x0041_0000)
+        || regs5.regs32.get(&0x26B4C) != Some(&5210)
+        || regs5.regs32.get(&0x26B50) != Some(&50)
+        || regs5.regs32.get(&0x26B54) != Some(&0x2000)
+        || regs5.regs32.get(&0x20734) != Some(&0x0020_0000)
+        || regs5.regs32.get(&0x2E44C) != Some(&1)
         || !regs5.regs32.contains_key(&0x11E00)
     {
-        return TestResult::Fail("5GHz retune did not run the MAC + set_txpwr programs");
+        return TestResult::Fail("5GHz retune did not run the MAC + BB + set_txpwr programs");
     }
     // Refusals write nothing: an unknown MACID, a channel that
     // disagrees with the admitted station's geometry, and a

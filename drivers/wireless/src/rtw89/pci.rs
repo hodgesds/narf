@@ -505,7 +505,7 @@ impl Rtw89Device {
     }
 
     /// Drive the 8922A set_channel owner for an admitted station
-    /// (`Prepared8922a::set_channel`): the MAC channel program +
+    /// (`Prepared8922a::set_channel`): the MAC+BB channel program +
     /// TX-power program for `profile` over BAR2. The station-path
     /// caller is the follow-up (like `admit_station`, this entry
     /// exists before any station-path driver calls it); bring-up
