@@ -302,6 +302,9 @@ mod efuse_be_tests;
 mod prepared_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
+mod prepared_8922a_mlo_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
 mod eht_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
