@@ -192,11 +192,13 @@ fn smoke_rtw89_a_channel_rfk_iqk_dpk_tssi_follow_rtw8852a() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     }) != Some(Ok(()))
         || channel.state() != State::Calibrated
@@ -316,11 +318,13 @@ fn smoke_rtw89_a_channel_rfk_5ghz_80mhz_follow_rtw8852a() -> TestResult {
         channel.rfk_channel(
             &mut io,
             profile,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     }) != Some(Ok(()))
         || channel.state() != State::Calibrated
@@ -376,11 +380,13 @@ fn smoke_rtw89_a_channel_rfk_stuck_done_fails_closed() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     });
     // SAFETY: same inert model; the failed owner must refuse a replay.
@@ -388,11 +394,13 @@ fn smoke_rtw89_a_channel_rfk_stuck_done_fails_closed() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     });
     if first != Some(Err(Error::Register(power::Error::Timeout)))
@@ -421,11 +429,13 @@ fn smoke_rtw89_a_channel_rfk_dpk_bypass_epa_2g() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [true, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [true, false],
+            },
         )
     }) != Some(Ok(()))
         || channel.state() != State::Calibrated
@@ -472,11 +482,13 @@ fn smoke_rtw89_a_channel_rfk_tssi_scan_and_track() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     }) != Some(Ok(()))
     {
@@ -515,11 +527,13 @@ fn smoke_rtw89_a_channel_rfk_lok_failure_refuses() -> TestResult {
         channel.rfk_channel(
             &mut io,
             Profile::INITIAL,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     }) != Some(Err(Error::Terminal))
         || channel.state() != State::Busy
@@ -550,11 +564,13 @@ fn smoke_rtw89_a_channel_rfk_6ghz_refused() -> TestResult {
         channel.rfk_channel(
             &mut io,
             profile,
-            &calibration,
-            &tracking,
-            0,
-            [0x20, 0x20],
-            [false, false],
+            &ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                cut: 0,
+                thermal: [0x20, 0x20],
+                epa: [false, false],
+            },
         )
     }) != Some(Err(Error::Policy))
         || channel.state() != State::Busy

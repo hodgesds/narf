@@ -558,7 +558,7 @@ impl<I: Interface> Access<'_, I> {
                             self.a_dpk_lbk_rxiqk(path).await?;
                         }
                     }
-                    step = if dgain > DGAIN_UPPER || dgain < DGAIN_LOWER {
+                    step = if !(DGAIN_LOWER..=DGAIN_UPPER).contains(&dgain) {
                         AgcStep::SyncDgain
                     } else {
                         AgcStep::GainLossIdx

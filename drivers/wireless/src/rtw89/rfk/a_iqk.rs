@@ -554,7 +554,7 @@ impl<I: Interface> Access<'_, I> {
         let tmp = self.rr(path, RR_TXMO, RFREG_MASK).await?;
         let core_i = (tmp & RR_TXMO_COI) >> RR_TXMO_COI.trailing_zeros();
         let core_q = (tmp & RR_TXMO_COQ) >> RR_TXMO_COQ.trailing_zeros();
-        Ok(core_i < 0x2 || core_i > 0x1d || core_q < 0x2 || core_q > 0x1d)
+        Ok(!(0x2..=0x1d).contains(&core_i) || !(0x2..=0x1d).contains(&core_q))
     }
 
     /// `_iqk_lok`: coarse + fine one-shots with a 10us gap; returns the

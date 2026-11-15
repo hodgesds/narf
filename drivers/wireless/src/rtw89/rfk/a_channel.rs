@@ -43,6 +43,25 @@ pub(in super::super) struct Channel {
     dpk: Dpk,
 }
 
+/// Per-device inputs to one RTL8852A channel RFK, bundled so
+/// [`Channel::rfk_channel`] stays under clippy's argument limit
+/// (the BE channel takes the same shape as `&Inputs<'_>`).
+#[derive(Clone, Copy, Debug)]
+pub(in super::super) struct ChannelInputs<'a> {
+    /// This device's A factory snapshot.
+    pub calibration: &'a Calibration,
+    /// This container's TXPWR_TRK.
+    pub tracking: &'a Tracking,
+    /// `hal.cv`.
+    pub cut: u8,
+    /// The current averaged thermal per path (for TSSI
+    /// `base_thermal` and DPK `ther_dpk`).
+    pub thermal: [u8; 2],
+    /// The per-path EPA presence (`efuse->epa_2g` / `efuse->epa_5g`)
+    /// for the DPK bypass.
+    pub epa: [bool; 2],
+}
+
 impl Channel {
     pub fn state(&self) -> State {
         self.state
@@ -86,21 +105,13 @@ impl Channel {
     /// `rfk::a::Init::prepare`, retuned to THIS `profile` by the
     /// caller, with exclusive radio ownership and a current channel
     /// grant; Interface enforces current admission at every RFK
-    /// access. `calibration` is this device's A factory snapshot,
-    /// `tracking` this container's TXPWR_TRK, `cut` is `hal.cv`,
-    /// `thermal` the current averaged thermal per path (for TSSI
-    /// `base_thermal` and DPK `ther_dpk`), `epa` the per-path EPA
-    /// presence (`efuse->epa_2g` / `efuse->epa_5g`) for the DPK
-    /// bypass.
+    /// access. `inputs` carries the per-device RFK inputs (see
+    /// [`ChannelInputs`]).
     pub async unsafe fn rfk_channel(
         &mut self,
         io: &mut impl Interface,
         profile: Profile,
-        calibration: &Calibration,
-        tracking: &Tracking,
-        cut: u8,
-        thermal: [u8; 2],
-        epa: [bool; 2],
+        inputs: &ChannelInputs<'_>,
     ) -> Result<(), Error> {
         self.begin(&[State::New, State::Calibrated])?;
         self.channel = Some(profile);
@@ -113,11 +124,30 @@ impl Channel {
         // A failed TSSI leaves the enable state unknown; the owner is
         // terminal (Busy) and the caller terminalizes the radio.
         // SAFETY: same channel after its IQK.
-        unsafe { self.tssi.run(io, profile, calibration, tracking, thermal) }.await?;
+        unsafe {
+            self.tssi.run(
+                io,
+                profile,
+                inputs.calibration,
+                inputs.tracking,
+                inputs.thermal,
+            )
+        }
+        .await?;
         self.tssi_mode = self.tssi.results().ok_or(Error::Terminal)?.tssi_mode;
         Access(io).delay(30_000).await?;
         // SAFETY: same channel after its TSSI.
-        unsafe { self.dpk.run(io, profile, cut, self.tssi_mode, thermal, epa) }.await?;
+        unsafe {
+            self.dpk.run(
+                io,
+                profile,
+                inputs.cut,
+                self.tssi_mode,
+                inputs.thermal,
+                inputs.epa,
+            )
+        }
+        .await?;
         self.conn_rfk = false;
         self.state = State::Calibrated;
         Ok(())
