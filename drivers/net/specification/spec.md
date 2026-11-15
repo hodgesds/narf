@@ -209,8 +209,35 @@ size and SRRCTL drop enable at bit31, with reserved bit28 clear.
 
 Built-in IGC registration opts the interface into the stack's software GRO
 (Linux `NETIF_F_GRO`, `napi_gro_receive`). Each queue's receive task is pinned
-to one CPU and flushes that CPU's held flows when its ring is empty and its
-vector re-armed, the `napi_complete_done` point.
+to the CPU its MSI-X vector is steered to (Linux NAPI polls where the
+interrupt landed), is classified `WorkKind::SoftIrq`, and flushes that CPU's
+held flows when its ring is empty and its vector re-armed, the
+`napi_complete_done` point. The frame-ring transmit consumer and the 10 ms
+maintenance worker have no queue locality and are spawned with
+`TaskSpec::kernel_any()`, never on the boot CPU by default.
+
+IGC buffers are per queue and sized from that queue's rings, never from a
+link speed or a fixed count. Each `Queue` owns a TX pool of `MAX_TSO`-byte
+buffers whose bound is the frames its ring can hold in flight
+(`tx_count - 1`: one descriptor per frame at least, one slot reserved). It
+starts with the ring's worth of worst-case frames (`tx_count / DESC_NEEDED`)
+and grows one buffer at a time on the copy path only while the buffers it
+owns (free plus posted) are below that bound, so demand sets the working set
+and the steady state allocates nothing. Probe and every queue resize publish
+these pools to the stack in queue order; completion and refusal return a
+buffer to the pool of the ring that held it, with no interface lookup. When
+`try_xmit_copy` finds the pool empty at its bound the ring is full of this
+queue's frames: the queue is stopped (`TxQueue::refused`, `Busy`) and the
+reclaim that returns a buffer wakes it. The ordinary send hook copies into
+the same pool and drops at the bound, as it does on a full ring. Each queue
+also owns an RX pool of one spare 2048-byte buffer per RX slot: `receive`
+re-arms a slot from it (never from the page allocator under the RX lock), the
+receive task returns each buffer after dispatch (Linux `igc_reuse_rx_page`),
+and tops the pool back up in task context when consumers kept buffers. A
+frame that finds no spare is dropped, its own buffer re-arms the slot, and it
+counts in `rx_queue_N_alloc_failed`. `ethtool -S` reports
+`tx_queue_N_pool_free`, `tx_queue_N_pool_limit`, `tx_queue_N_pool_misses`,
+`rx_queue_N_pool_free` and `rx_queue_N_pool_misses`.
 
 ### Transmit-queue contract (`narf_net::txq`)
 

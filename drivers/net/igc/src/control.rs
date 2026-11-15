@@ -4,17 +4,11 @@ use narf_net::nic::{Diagnostic, NicControl, Settings, Statistic};
 
 impl Igc {
     fn publish_pools(&self) {
-        let mut pools = Vec::new();
-        for _ in 0..self.num_queues() {
-            let pool = Arc::new(narf_io::pool::DmaPool::new(MAX_TSO, DomainId::DRIVER_0, 8));
-            let _ = pool.prefill(8);
-            pools.push(pool);
-        }
         narf_net::iface::enable_zero_copy_tx_context(
             self.name(),
             self.cookie,
             send_owned,
-            pools,
+            self.tx_pools(),
             0,
             true,
         );
@@ -277,6 +271,24 @@ impl NicControl for Igc {
                 name: alloc::format!("tx_queue_{q}_stopped_long"),
                 value: queue.txq().long_stops(),
             });
+            // Buffer pools: free buffers, the bound a TX pool grows to,
+            // and acquisitions that found no free buffer. A TX miss is a
+            // copy (or a stop once the pool reaches its bound); an RX miss
+            // is a frame dropped for want of a buffer to re-arm its slot.
+            let tx_pool = queue.tx_pool();
+            let rx_pool = queue.rx_pool();
+            for (name, value) in [
+                ("tx_queue_{q}_pool_free", tx_pool.available() as u64),
+                ("tx_queue_{q}_pool_limit", queue.tx_pool_cap() as u64),
+                ("tx_queue_{q}_pool_misses", tx_pool.stats().cache_misses),
+                ("rx_queue_{q}_pool_free", rx_pool.available() as u64),
+                ("rx_queue_{q}_pool_misses", rx_pool.stats().cache_misses),
+            ] {
+                out.push(Statistic {
+                    name: name.replace("{q}", &alloc::format!("{q}")),
+                    value,
+                });
+            }
         }
         for (name, counter) in [
             (
