@@ -2730,10 +2730,28 @@ executed):
 the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers, plus the SerDes `pll_pwrsave`
 selection matrix) and
-`smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: the
-AR9485 board-value deltas and per-chip calibration branches (including
-the 9485 antenna-diversity/LNA-diversity code).
+`smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`, plus
+`smoke_ath9k_ar9485_mrc_cck_spur_branch` for the AR9485-family MRC-CCK
+spur arm below. Delivered after step 1: the AR9485-family MRC-CCK spur
+branch (`ar9003_phy.c:252-322`, 20 MHz) — `phy::spur_mrc_cck` runs the
+band's EEPROM `spurChans` through `fbin2freq` (five entries, range 10,
+`synth_freq` the channel), returns without a write on an empty list, and
+the fixed AR9300 list never runs on this chip; the HT40 form (range 19,
+`synth_freq` primary ± 10 MHz) is not prepared. The AR9485 has no
+`ar9003_hw_set_nf_limits` arm (it keeps the AR9300 limits,
+`ar9003_phy.c:1364`), no `ar9003_hw_override_ini` arm (`:685`), and
+takes `ar9003_hw_power_control_override`'s generic `AR_PHY_TPC_19`
+path (`ar9003_eeprom.c:4944`); its 2 GHz synth selection coincides with
+the AR9300 formula at the 40 MHz reference (`ar9003_phy.c:160`).
+Remainder, not in this step: the board-config-gated deltas — the
+`xatten_margin_cfg` margin-5 override (`ar9003_eeprom.c:3921`, no
+in-tree source for the config value), the `xlna_gpio` xLNA branch
+(`:3657`, default GPIO 9, `ar9003_phy.h:355`), the
+`ant_ctrl_comm2g_switch_enable` mask and the `bt_ant_diversity` arms
+(`:3700`, `:3737`, `:3741`), `alt_mingainidx` (`:3927`) — and the
+ANI-owned antenna-diversity readback (`ar9003_hw_antdiv_comb_conf_get`/
+`_set`, `ar9003_phy.c:1496`, AR9485 `-1`/`-9`/group 2), whose only
+caller is the unported ANI loop.
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
