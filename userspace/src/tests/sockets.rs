@@ -3987,3 +3987,138 @@ fn smoke_bt_sco_drop_teardown() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/bt_sco", smoke_bt_sco_drop_teardown);
+
+/// Wildcard listeners (`0.0.0.0:port` and `[::]:port`) must only accept
+/// in-process connections aimed at local addresses — never outbound remote
+/// connections (which must route out through the TCP stack).
+fn smoke_socket_wildcard_listener_does_not_intercept_remote_connect() -> TestResult {
+    use crate::socket::{
+        make_sockaddr_in, make_sockaddr_in6, SockError, SocketFile, SocketOp, SocketOpResult,
+        AF_INET, AF_INET6, SOCK_STREAM,
+    };
+
+    // --- IPv4 ---
+    let server4 = SocketFile::new(AF_INET, SOCK_STREAM);
+    if !matches!(
+        server4.dispatch_op(SocketOp::Bind {
+            addr: make_sockaddr_in(0, 22_222),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("IPv4 wildcard bind failed");
+    }
+    if !matches!(
+        server4.dispatch_op(SocketOp::Listen { backlog: 8 }),
+        SocketOpResult::Ok(_)
+    ) {
+        server4.unregister();
+        return TestResult::Fail("IPv4 wildcard listen failed");
+    }
+    let remote4 = SocketFile::new(AF_INET, SOCK_STREAM);
+    if matches!(
+        remote4.dispatch_op(SocketOp::Connect {
+            addr: make_sockaddr_in(u32::from_be_bytes([198, 51, 100, 1]), 22_222),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        server4.unregister();
+        return TestResult::Fail("IPv4 0.0.0.0 listener hijacked remote connect()");
+    }
+    if matches!(
+        server4.dispatch_op(SocketOp::Accept),
+        SocketOpResult::Accepted { .. }
+    ) {
+        server4.unregister();
+        return TestResult::Fail("IPv4 0.0.0.0 listener queued an accepted socket for remote IP");
+    }
+    let local4 = SocketFile::new(AF_INET, SOCK_STREAM);
+    if !matches!(
+        local4.dispatch_op(SocketOp::Connect {
+            addr: make_sockaddr_in(0x7F00_0001, 22_222),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        server4.unregister();
+        return TestResult::Fail("IPv4 0.0.0.0 listener stopped matching 127.0.0.1");
+    }
+    if !matches!(
+        server4.dispatch_op(SocketOp::Accept),
+        SocketOpResult::Accepted { .. }
+    ) {
+        server4.unregister();
+        return TestResult::Fail("IPv4 0.0.0.0 listener accept failed for 127.0.0.1");
+    }
+    server4.unregister();
+
+    // --- IPv6 ---
+    let server6 = SocketFile::new(AF_INET6, SOCK_STREAM);
+    if !matches!(
+        server6.dispatch_op(SocketOp::Bind {
+            addr: make_sockaddr_in6([0u8; 16], 22_223),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("IPv6 wildcard bind failed");
+    }
+    if !matches!(
+        server6.dispatch_op(SocketOp::Listen { backlog: 8 }),
+        SocketOpResult::Ok(_)
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 wildcard listen failed");
+    }
+    let remote6 = SocketFile::new(AF_INET6, SOCK_STREAM);
+    let remote6_ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if matches!(
+        remote6.dispatch_op(SocketOp::Connect {
+            addr: make_sockaddr_in6(remote6_ip, 22_223),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 [::] listener hijacked remote connect()");
+    }
+    let v4mapped_remote = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 198, 51, 100, 1];
+    let remote_v4mapped6 = SocketFile::new(AF_INET6, SOCK_STREAM);
+    if matches!(
+        remote_v4mapped6.dispatch_op(SocketOp::Connect {
+            addr: make_sockaddr_in6(v4mapped_remote, 22_223),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 [::] listener hijacked ::ffff:remote connect()");
+    }
+    if !matches!(
+        server6.dispatch_op(SocketOp::Accept),
+        SocketOpResult::Err(SockError::WouldBlock)
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 [::] listener queued an accepted socket for remote IP");
+    }
+    let local6 = SocketFile::new(AF_INET6, SOCK_STREAM);
+    let loopback6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if !matches!(
+        local6.dispatch_op(SocketOp::Connect {
+            addr: make_sockaddr_in6(loopback6, 22_223),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 [::] listener stopped matching ::1");
+    }
+    if !matches!(
+        server6.dispatch_op(SocketOp::Accept),
+        SocketOpResult::Accepted { .. }
+    ) {
+        server6.unregister();
+        return TestResult::Fail("IPv6 [::] listener accept failed for ::1");
+    }
+    server6.unregister();
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_wildcard_listener_does_not_intercept_remote_connect
+);

@@ -297,6 +297,8 @@ pub struct ProcTaskInfo {
     pub seccomp_mode: u8,
     /// `Seccomp_filters:` — the number of filters attached to the task.
     pub seccomp_filters: u32,
+    /// Field 39 of `/proc/[pid]/stat` — CPU number last executed on.
+    pub processor: u32,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -686,6 +688,8 @@ pub struct ThreadStat {
     pub syscall: Option<[u64; 9]>,
     /// The handler this thread is waiting in (`task/<tid>/wchan`).
     pub wchan: Option<String>,
+    /// CPU number last executed on (`processor`, `/proc/[pid]/stat` field 39).
+    pub processor: u32,
 }
 type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
@@ -1833,14 +1837,15 @@ impl FileOps for ProcPidFile {
             };
             // `/proc/<tid>`: the thread's own pid field and state.
             let thread_view = self.thread.map(|tid| {
-                let state = hook_thread_stat(tid).map(|t| t.state);
-                (tid, state)
+                let thread_stat = hook_thread_stat(tid).map(|t| (t.state, t.processor));
+                (tid, thread_stat)
             });
             let body = match field {
                 PidField::Stat => match thread_view {
-                    Some((tid, state)) => render_stat(&ProcTaskInfo {
+                    Some((tid, thread_stat)) => render_stat(&ProcTaskInfo {
                         pid: tid,
-                        state: state.unwrap_or(info.state),
+                        state: thread_stat.map_or(info.state, |(state, _)| state),
+                        processor: thread_stat.map_or(info.processor, |(_, cpu)| cpu),
                         ..info
                     }),
                     None => render_stat(&info),
@@ -1848,9 +1853,9 @@ impl FileOps for ProcPidFile {
                 PidField::Status => match thread_view {
                     // Tgid stays the group's; Pid/NSpid and State are the
                     // thread's (`proc_pid_status`).
-                    Some((tid, state)) => try_render_status(
+                    Some((tid, thread_stat)) => try_render_status(
                         &ProcTaskInfo {
-                            state: state.unwrap_or(info.state),
+                            state: thread_stat.map_or(info.state, |(state, _)| state),
                             ..info
                         },
                         Some(tid),
@@ -3511,7 +3516,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     let rss_pages = info.resident_pages;
     let num_threads = info.num_threads.max(1); // field 20; 0 → 1
     format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.pid,
         info.comm,
         info.state,
@@ -3526,6 +3531,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         info.starttime_ticks,
         vsize,
         rss_pages,
+        info.processor, // field 39 (0-based 38)
     )
 }
 
@@ -4496,6 +4502,7 @@ fn sample_task_info() -> ProcTaskInfo {
         no_new_privs: false,
         seccomp_mode: 0,
         seccomp_filters: 0,
+        processor: 0,
     }
 }
 
@@ -4829,6 +4836,7 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         no_new_privs: false,
         seccomp_mode: 0,
         seccomp_filters: 0,
+        processor: 0,
     };
     let line = render_stat(&info);
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -4941,6 +4949,7 @@ fn sample_info() -> ProcTaskInfo {
         no_new_privs: false,
         seccomp_mode: 0,
         seccomp_filters: 0,
+        processor: 0,
     }
 }
 
@@ -4961,6 +4970,25 @@ fn smoke_pid_stat_ppid_and_nthreads() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_pid_stat_ppid_and_nthreads);
+
+/// /proc/[pid]/stat field 39 (0-based index 38) is `processor`, which tools
+/// like htop read instead of assuming CPU 0.
+fn smoke_pid_stat_reports_processor_field() -> TestResult {
+    let info = ProcTaskInfo {
+        processor: 5,
+        ..sample_info()
+    };
+    let line = render_stat(&info);
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 52 {
+        return TestResult::Fail("stat must have exactly 52 fields");
+    }
+    if f[38] != "5" {
+        return TestResult::Fail("stat field 39 (processor) must match info.processor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_pid_stat_reports_processor_field);
 
 /// A single-threaded task (num_threads 0) still reports one thread in
 /// stat field 20 — the 0→1 normalisation.

@@ -3604,6 +3604,12 @@ pub enum SetAffinityError {
     RealtimePinned,
 }
 
+/// Last CPU (`0..`) a live user task was dispatched onto (for `/proc/[pid]/stat`
+/// field 39 `processor`), falling back to its home CPU before its first slice.
+pub fn task_last_cpu(id: TaskId) -> Option<u32> {
+    user_policy::last_cpu(id)
+}
+
 /// Change a task's hard affinity and migrate a queued slot when necessary.
 ///
 /// A currently-polled task observes the registry update immediately through

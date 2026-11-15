@@ -105,7 +105,7 @@ impl Default for LineState {
 /// Linux keeps this in `n_tty_data` alongside the input buffers; it is
 /// split out here because a PTY's input and output halves are driven from
 /// opposite ends of the pair and are locked independently.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OutputState {
     /// `ldata->column` — the current output column.
     pub column: u32,
@@ -214,6 +214,48 @@ pub fn process_output(out: &mut OutputState, t: &Termios, buf: &[u8], emit: &mut
     for &c in buf {
         output_byte(out, t, c, emit);
     }
+}
+
+/// Run as many leading bytes of `buf` through OPOST processing as fit within
+/// `max_out` emitted output bytes, returning the number of raw input bytes
+/// consumed from `buf`. `out` is only mutated for the consumed prefix.
+pub fn process_output_bounded(
+    out: &mut OutputState,
+    t: &Termios,
+    buf: &[u8],
+    max_out: usize,
+    mut emit: impl FnMut(u8),
+) -> usize {
+    if !t.opost() {
+        let n = buf.len().min(max_out);
+        for &b in &buf[..n] {
+            emit(b);
+        }
+        return n;
+    }
+    let mut char_buf = [0u8; 8];
+    let mut emitted = 0usize;
+    let mut consumed = 0usize;
+    for &c in buf {
+        let mut trial_out = *out;
+        let mut char_len = 0usize;
+        output_byte(&mut trial_out, t, c, &mut |b| {
+            if char_len < char_buf.len() {
+                char_buf[char_len] = b;
+                char_len += 1;
+            }
+        });
+        if emitted + char_len > max_out {
+            break;
+        }
+        *out = trial_out;
+        for &b in &char_buf[..char_len] {
+            emit(b);
+        }
+        emitted += char_len;
+        consumed += 1;
+    }
+    consumed
 }
 
 /// Echo one byte the way `echo_char` does: a control character is shown as

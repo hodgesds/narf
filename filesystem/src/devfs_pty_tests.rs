@@ -2349,3 +2349,92 @@ kernel_test_in!(
     "filesystem/pty",
     smoke_pty_console_redirect_follows_tioccons
 );
+
+/// Slave writes larger than 4 KiB must not silently truncate: the 64 KiB output
+/// ring holds normal bursts (like tmux pane redraws) intact and returns short
+/// writes / `WouldBlock` with cleared `POLL_OUT` when full.
+fn smoke_pty_slave_write_preserves_large_burst_and_backpressures() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+
+    // 1. A 16 KiB burst (4x the old 4 KiB ring) arrives completely intact.
+    let burst = alloc::vec![b'Z'; 16_384];
+    match poll_once(FileOps::write(&slave, 0, &burst)) {
+        Some(Ok(16_384)) => {}
+        _ => return TestResult::Fail("16 KiB slave write was truncated or rejected"),
+    }
+    let mut read_back = alloc::vec![0u8; 20_000];
+    match poll_once(FileOps::read(&*master, 0, &mut read_back)) {
+        Some(Ok(16_384)) if read_back[..16_384].iter().all(|&b| b == b'Z') => {}
+        _ => return TestResult::Fail("master did not receive all 16 KiB intact"),
+    }
+
+    // 2. Filling the 64 KiB ring transitions POLL_OUT -> 0 and returns WouldBlock.
+    let full = alloc::vec![b'Q'; 65_536];
+    match poll_once(FileOps::write(&slave, 0, &full)) {
+        Some(Ok(65_536)) => {}
+        _ => return TestResult::Fail("64 KiB fill write did not accept full capacity"),
+    }
+    if (FileOps::poll_readiness(&slave) & crate::POLL_OUT) != 0 {
+        return TestResult::Fail("slave still advertised POLL_OUT when output ring was full");
+    }
+    if !matches!(
+        poll_once(FileOps::write(&slave, 0, b"overflow")),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("full slave write did not backpressure with WouldBlock");
+    }
+
+    // 3. Draining at master restores POLL_OUT cleanly; partial OPOST boundary
+    // (1 free byte cannot split "\r\n") holds `\n` without dropping or splitting.
+    let mut drain = [0u8; 2];
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut drain)),
+        Some(Ok(2))
+    ) {
+        return TestResult::Fail("master drain failed");
+    }
+    // 2 output bytes free: "x\n" expands under OPOST|ONLCR to "x\r\n" (3 bytes),
+    // so only 'x' (1 input byte) fits; '\n' (2 bytes) waits without partial "\r".
+    match poll_once(FileOps::write(&slave, 0, b"x\n")) {
+        Some(Ok(1)) => {}
+        _ => return TestResult::Fail("OPOST-bounded slave write should consume only 'x'"),
+    }
+    if (FileOps::poll_readiness(&slave) & crate::POLL_OUT) != 0 {
+        return TestResult::Fail("slave advertised POLL_OUT with less than 8 bytes free");
+    }
+    if !matches!(
+        poll_once(FileOps::write(&slave, 0, b"\n")),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("1-byte room wrongly accepted 2-byte \\r\\n expansion");
+    }
+    let mut big_drain = alloc::vec![0u8; 65_536];
+    let mut drained = 0usize;
+    while let Some(Ok(n)) = poll_once(FileOps::read(&*master, 0, &mut big_drain)) {
+        drained += n;
+    }
+    if drained != 65_535 {
+        return TestResult::Fail("drained byte count mismatch after OPOST partial write");
+    }
+    if (FileOps::poll_readiness(&slave) & crate::POLL_OUT) == 0 {
+        return TestResult::Fail("slave POLL_OUT did not return after master drained ring");
+    }
+    if !matches!(poll_once(FileOps::write(&slave, 0, b"\n")), Some(Ok(1))) {
+        return TestResult::Fail("slave write of '\\n' failed after ring drained");
+    }
+    let mut crlf = [0u8; 4];
+    match poll_once(FileOps::read(&*master, 0, &mut crlf)) {
+        Some(Ok(2)) if &crlf[..2] == b"\r\n" => TestResult::Pass,
+        _ => TestResult::Fail("trailing '\\n' did not arrive intact as CRLF"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_slave_write_preserves_large_burst_and_backpressures
+);

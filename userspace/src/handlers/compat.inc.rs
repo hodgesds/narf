@@ -7825,6 +7825,7 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         // thread has no row in `/proc/<pid>/task` to read.
         state: live_task_state(task),
         tgid: task_to_pid_raw(task),
+        processor: narf_scheduler::task_last_cpu(narf_scheduler::TaskId(task)).unwrap_or(0),
     })
 }
 
@@ -8776,6 +8777,7 @@ pub fn proc_task_info(
         no_new_privs: read_prctl(tid).no_new_privs,
         seccomp_mode: crate::seccomp::mode_of(tid),
         seccomp_filters: crate::seccomp::filter_count_of(tid) as u32,
+        processor: narf_scheduler::task_last_cpu(narf_scheduler::TaskId(tid)).unwrap_or(0),
         // `get_task_tracer` is pid-keyed and returns the tracer's pid, so
         // it goes back out through the reader's namespace like every other
         // pid in this file. A tracer the reader cannot see reports 0 —

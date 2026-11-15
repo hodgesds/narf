@@ -205,20 +205,41 @@ pub(crate) struct ByteRing<const N: usize> {
 }
 
 struct ByteRingInner<const N: usize> {
-    buf: [u8; N],
+    buf: alloc::vec::Vec<u8>,
     head: usize, // read pointer
     len: usize,  // bytes currently stored
 }
 
 impl<const N: usize> ByteRing<N> {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: IrqSafeSpinLock::new(ByteRingInner {
-                buf: [0u8; N],
+                buf: alloc::vec![0u8; N],
                 head: 0,
                 len: 0,
             }),
         }
+    }
+
+    /// Remaining byte capacity in the ring.
+    pub(crate) fn free_space(&self) -> usize {
+        N.saturating_sub(self.inner.lock().len)
+    }
+
+    /// OPOST-process as many leading bytes of `buf` as fit in the ring's
+    /// free space, pushing them atomically. Returns the number of raw input
+    /// bytes consumed from `buf`.
+    fn push_processed(&self, out: &mut crate::ntty::OutputState, t: &Termios, buf: &[u8]) -> usize {
+        let mut g = self.inner.lock();
+        let avail = N.saturating_sub(g.len);
+        if avail == 0 {
+            return 0;
+        }
+        crate::ntty::process_output_bounded(out, t, buf, avail, |b| {
+            let tail = (g.head + g.len) % N;
+            g.buf[tail] = b;
+            g.len += 1;
+        })
     }
 
     /// Push bytes; silently discards those that don't fit.
@@ -603,7 +624,7 @@ pub struct Pty {
     /// discipline's echo of master writes also lands here so the master
     /// "sees" what was typed.
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
-    pub(crate) slave_tx_to_master: ByteRing<4096>,
+    pub(crate) slave_tx_to_master: ByteRing<65536>,
 
     /// Durable readiness for the MASTER endpoint (readable ⇔ `slave_tx_to_master`
     /// has deliverable bytes). Set after every queue/state mutation so a parked
@@ -799,11 +820,21 @@ impl Pty {
         mask
     }
 
+    /// Minimum output-ring room before the slave reports `POLL_OUT`. Equal to
+    /// the worst-case single-byte OPOST expansion (`XTABS` = 8 spaces) so a
+    /// writable wake is always guaranteed forward progress.
+    const SLAVE_WRITE_MIN_ROOM: usize = 8;
+
     /// Level readiness of the SLAVE endpoint — shared by `PtySlave::poll_readiness`
     /// and [`Self::sync_slave_readiness`]. Takes the input lock; callers must NOT
     /// already hold it.
     pub(crate) fn slave_poll_mask(&self) -> u32 {
-        let mut mask = crate::POLL_OUT;
+        let mut mask = 0;
+        if self.master_closed.load(Ordering::Acquire)
+            || self.slave_tx_to_master.free_space() >= Self::SLAVE_WRITE_MIN_ROOM
+        {
+            mask |= crate::POLL_OUT;
+        }
         if self.input.lock().readable() > 0 {
             mask |= crate::POLL_IN;
         }
@@ -811,6 +842,17 @@ impl Pty {
             mask |= crate::POLL_HUP;
         }
         mask
+    }
+
+    /// Discard all queued slave input lines/bytes (`TCSETSF` / `TCSETSF2`).
+    pub(crate) fn flush_input(&self) {
+        {
+            let mut st = self.input.lock();
+            st.ready.clear();
+            st.line.clear();
+            st.eof = false;
+        }
+        self.sync_slave_readiness();
     }
 
     /// Every readiness bit the two PTY endpoints ever assert — the clear-mask
@@ -1230,12 +1272,16 @@ impl Pty {
                     self.slave_tx_to_master.clear();
                     // `pty_flush_buffer` (`pty.c:214`).
                     self.raise_pkt(TIOCPKT_FLUSHWRITE, 0);
+                    self.sync_master_readiness();
                 }
+                self.sync_slave_readiness();
                 Ok(0)
             }
             TCOFLUSH => {
                 self.slave_tx_to_master.clear();
                 self.raise_pkt(TIOCPKT_FLUSHWRITE, 0);
+                self.sync_master_readiness();
+                self.sync_slave_readiness();
                 Ok(0)
             }
             _ => Err(FsError::InvalidData),
@@ -2464,6 +2510,8 @@ impl FileOps for PtyMaster {
             let n = self.pty.slave_tx_to_master.pop(&mut buf[1..]);
             if n > 0 {
                 buf[0] = TIOCPKT_DATA;
+                self.pty.sync_master_readiness();
+                self.pty.sync_slave_readiness();
                 return Box::pin(async move { Ok(n + 1) });
             }
             // No data copied. If output is nonetheless pending, the caller's
@@ -2494,8 +2542,10 @@ impl FileOps for PtyMaster {
             return Box::pin(async move { Err(FsError::WouldBlock) });
         }
         // Draining may have emptied the queue — clear the cell's POLL_IN so the
-        // next slave write is a rising edge that actually wakes this reader.
+        // next slave write is a rising edge that actually wakes this reader —
+        // and restoring ring room may unblock a parked slave writer (`POLL_OUT`).
         self.pty.sync_master_readiness();
+        self.pty.sync_slave_readiness();
         Box::pin(async move { Ok(n) })
     }
 
@@ -2692,10 +2742,7 @@ impl FileOps for PtyMaster {
                 // program switching to raw mode must not then read the
                 // keystrokes typed while it was still cooked.
                 if cmd == TCSETSF {
-                    let mut st = self.pty.input.lock();
-                    st.ready.clear();
-                    st.line.clear();
-                    st.eof = false;
+                    self.pty.flush_input();
                 }
                 Ok(0)
             }
@@ -2709,6 +2756,9 @@ impl FileOps for PtyMaster {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
                 self.pty.set_termios_locked(raw);
+                if cmd == TCSETSF2 {
+                    self.pty.flush_input();
+                }
                 Ok(0)
             }
             TIOCEXCL => {
@@ -3007,20 +3057,30 @@ impl FileOps for PtySlave {
         // This is the `tty->ops->write` side of `do_output_char`; ECHO is
         // NOT involved here. Echo reflects INPUT — bytes the master wrote —
         // and is applied on the master write path by `ntty::feed_byte`.
-        let mut processed = alloc::vec::Vec::with_capacity(buf.len() + 8);
-        {
+        if buf.is_empty() {
+            return Box::pin(async move { Ok(0) });
+        }
+        let consumed = {
             let t = *self.pty.termios.lock();
             let mut out = self.pty.output.lock();
-            crate::ntty::process_output(&mut out, &t, buf, &mut |c| processed.push(c));
+            self.pty
+                .slave_tx_to_master
+                .push_processed(&mut out, &t, buf)
+        };
+        if consumed == 0 {
+            if self.pty.master_closed.load(Ordering::Acquire) {
+                return Box::pin(async move { Err(FsError::Io(narf_block::BlockError::IOError)) });
+            }
+            return Box::pin(async move { Err(FsError::WouldBlock) });
         }
-        self.pty.slave_tx_to_master.push(&processed);
-        // The master (terminal emulator) may be parked reading this output.
+        // The master (terminal emulator) may be parked reading this output, and
+        // filling the output ring may have cleared slave POLL_OUT.
         self.pty.sync_master_readiness();
+        self.pty.sync_slave_readiness();
         // Linux reports the bytes the CALLER supplied, not the expanded
         // count: a `\n` that became CR-NL still consumed one byte of the
         // caller's buffer.
-        let n = buf.len();
-        Box::pin(async move { Ok(n) })
+        Box::pin(async move { Ok(consumed) })
     }
 
     fn stat(&self) -> Stat {
@@ -3158,10 +3218,7 @@ impl FileOps for PtySlave {
                 self.pty.set_termios_locked(raw);
                 // TCSETSF discards queued input; TCSETS and TCSETSW do not.
                 if cmd == TCSETSF {
-                    let mut st = self.pty.input.lock();
-                    st.ready.clear();
-                    st.line.clear();
-                    st.eof = false;
+                    self.pty.flush_input();
                 }
                 Ok(0)
             }
@@ -3175,6 +3232,9 @@ impl FileOps for PtySlave {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
                 self.pty.set_termios_locked(raw);
+                if cmd == TCSETSF2 {
+                    self.pty.flush_input();
+                }
                 Ok(0)
             }
             TIOCEXCL => {
