@@ -3333,8 +3333,9 @@ the coexistence owner runs every composed call site.
   - Not composed (follow-ups): ASPM (PCIe programme #1849, not wifi).
     Composed: HT/40 MHz on this profile (`rtl8723be_update_hal_rate_mask`
     N rows via `ht.rs`, `rtl8723be_wide` / `retune_rtl8723be`; the
-    host-API capability publication is a separate follow-up — nl80211
-    still publishes no HT for 8723BE), the `btc_scan_notify` / `connect` /
+    host-API capability publication is composed too
+    (`rtl8723be::ht::host_capabilities`, `station_rtl8723be_host_caps`,
+    `rtl8723be_caps` — nl80211 publishes the composed HT20/40 body), the `btc_scan_notify` / `connect` /
     `special_packet` / IPS call sites from the shared station (handshake
     EAPOL replies produced inside the sync TX path are not covered — no
     async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond

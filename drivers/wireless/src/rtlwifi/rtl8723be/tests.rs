@@ -2265,3 +2265,88 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_station_registers_and_rsvd_page
 );
+
+// ── Host-API HT capability publication (`rtl8723be/ht.rs`) ─────────────────
+
+/// `ht::host_capabilities` / `ht::host_phy`: the host API (nl80211
+/// `GET_WIPHY`) publishes exactly the HT the composed station sends —
+/// RX/TX MCS0-7 on the single path, SGI 20/40, A-MSDU 7935, A-MPDU
+/// factor 3 / density 7, no STBC/LDPC, no MCS8-15 — and nothing when the
+/// envelope admits no HT point.
+fn smoke_rtl8723be_ht_host_capabilities_and_phy() -> TestResult {
+    use envelope::*;
+    let factory = be_factory();
+    let domain = be_us_domain();
+    // v2 envelope: 20 MHz on channel 6 plus 40 MHz above (ch 3) and
+    // below (ch 9), every rate measured.
+    let bytes = be_napc_fixture(
+        2,
+        0,
+        80,
+        &[
+            (6, 20, 0, be_rising),
+            (3, 40, 1, be_rising),
+            (9, 40, 2, be_rising),
+        ],
+    );
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE HT host caps envelope"),
+    };
+    let caps = ht::host_capabilities(&cal, &domain);
+    if caps != ht::HOST_HT_2G | ht::HOST_HT40_2G {
+        return TestResult::Fail("8723BE HT host caps 2.4 GHz 20/40");
+    }
+    // 20 MHz only: HT without the 40 MHz bit.
+    let bytes20 = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
+    let cal20 = match Calibration::from_verified(&bytes20, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE HT host caps 20 MHz envelope"),
+    };
+    let caps20 = ht::host_capabilities(&cal20, &domain);
+    if caps20 != ht::HOST_HT_2G {
+        return TestResult::Fail("8723BE HT host caps 20 MHz only");
+    }
+    // No measured HT curve: no host capability at all — a board without
+    // an admitted HT point gains nothing from this publication.
+    let bytes_no_ht = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_no_ht)]);
+    let cal_no_ht = match Calibration::from_verified(&bytes_no_ht, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE HT host caps no-HT envelope"),
+    };
+    if ht::host_capabilities(&cal_no_ht, &domain) != 0 {
+        return TestResult::Fail("8723BE HT host caps unmeasured HT admitted");
+    }
+    // Published body == composed station body, byte for byte: HT20
+    // [0x2c, 0x08, 0x1f, 255, 0, ...] (SGI20, A-MSDU 7935, factor 3 /
+    // density 7, RX/TX MCS0-7, TX_DEFINED) and HT40 [0x6e, 0x18, ...]
+    // (adds the 20/40 width bit, SGI40 and DSSS-CCK40 — the DSSS bit is
+    // only carried on a 20/40 capability, so the HT20 form has none).
+    match ht::host_phy(caps20, 2400) {
+        Some(phy) if phy.ht == ht::capability(false).capability_body() && phy.vht.is_none() => {}
+        _ => return TestResult::Fail("8723BE HT host phy 20 MHz"),
+    }
+    match ht::host_phy(caps, 2400) {
+        Some(phy) if phy.ht == ht::capability(true).capability_body() && phy.vht.is_none() => {}
+        _ => return TestResult::Fail("8723BE HT host phy 40 MHz"),
+    }
+    let narrow = ht::capability(false).capability_body();
+    if narrow[..3] != [0x2c, 0x08, 0x1f] || narrow[3] != 255 || narrow[4] != 0 || narrow[15] != 1 {
+        return TestResult::Fail("8723BE HT20 published body");
+    }
+    let wide = ht::capability(true).capability_body();
+    if wide[..3] != [0x6e, 0x18, 0x1f] || wide[3] != 255 || wide[4] != 0 || wide[15] != 1 {
+        return TestResult::Fail("8723BE HT40 published body");
+    }
+    if ht::host_phy(0, 2400).is_some()
+        || ht::host_phy(caps, 5000).is_some()
+        || ht::host_phy(caps, 6000).is_some()
+    {
+        return TestResult::Fail("8723BE HT host phy refusal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_ht_host_capabilities_and_phy
+);
