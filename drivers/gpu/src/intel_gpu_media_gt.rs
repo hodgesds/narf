@@ -1079,7 +1079,13 @@ pub(crate) struct MediaGuc<
     M: MmioWindow + Clone,
     A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
 > {
-    gt: crate::intel_gpu_guc_gt::GuCGt<MediaGsi<M>, A>,
+    /// Boxed: `GuCGt` is several KiB (its `Parts` hold the boot state plus
+    /// the scheduler/CT/engine options), and holding it by value in `start`
+    /// next to the `Self` under construction put `MediaGuc::start` over the
+    /// 8 KiB frame budget (10,872 bytes on main run 43626624022). The box
+    /// keeps the owner on the heap; every use is a method call, so
+    /// auto-deref needs no other change.
+    gt: alloc::boxed::Box<crate::intel_gpu_guc_gt::GuCGt<MediaGsi<M>, A>>,
     media: MediaGsi<M>,
     allocator: A,
     registered: bool,
@@ -1135,16 +1141,18 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         let (Some(facts), Some(policy)) = (media.facts(), media.cache_policy()) else {
             return Err(MediaGucError::State);
         };
-        let mut gt = crate::intel_gpu_guc_gt::GuCGt::stage_media(
-            MediaGsi::new(bar.clone()),
-            allocator.clone(),
-            firmware,
-            huc,
-            config,
-            facts.ip,
-            policy,
-        )
-        .map_err(MediaGucError::Gt)?;
+        let mut gt = alloc::boxed::Box::new(
+            crate::intel_gpu_guc_gt::GuCGt::stage_media(
+                MediaGsi::new(bar.clone()),
+                allocator.clone(),
+                firmware,
+                huc,
+                config,
+                facts.ip,
+                policy,
+            )
+            .map_err(MediaGucError::Gt)?,
+        );
         let mask = bar.read32(GUC_SG_INTR_MASK);
         if mask == u32::MAX {
             return Err(MediaGucError::Unavailable);
