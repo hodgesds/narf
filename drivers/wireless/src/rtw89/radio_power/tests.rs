@@ -560,11 +560,11 @@ fn smoke_rtw89_a_power_tables_match_linux_txpwr_tables() -> TestResult {
         return TestResult::Fail("A regd limit fallback differs from phy.c");
     }
     // `rtw89_8852a_trk_cfg` delta-swing rows (fw.h trk types 4..=15).
-    if !tables_a::delta_swing(4, 0).is_some_and(|r| r[..4] == [0, 1, 1, 2])
-        || !tables_a::delta_swing(4, 2).is_some_and(|r| r[29] == 9)
-        || !tables_a::delta_swing(8, 0).is_some_and(|r| r[..4] == [0, 1, 1, 1])
-        || !tables_a::delta_swing(8, 0).is_some_and(|r| r[29] == 7)
-        || !tables_a::delta_swing(15, 0).is_some_and(|r| r[29] == 10)
+    if tables_a::delta_swing(4, 0).is_none_or(|r| r[..4] != [0, 1, 1, 2])
+        || tables_a::delta_swing(4, 2).is_none_or(|r| r[29] != 9)
+        || tables_a::delta_swing(8, 0).is_none_or(|r| r[..4] != [0, 1, 1, 1])
+        || tables_a::delta_swing(8, 0).is_none_or(|r| r[29] != 7)
+        || tables_a::delta_swing(15, 0).is_none_or(|r| r[29] != 10)
         || tables_a::delta_swing(8, 1).is_some()
         || tables_a::delta_swing(0, 0).is_some()
         || tables_a::delta_swing(3, 0).is_some()
