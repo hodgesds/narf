@@ -755,3 +755,189 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_bb_sethw_gpio_and_nctl_post_follow_rtw8851b
 );
+
+fn a_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
+    c_container(rf_a, rf_b)
+}
+
+fn smoke_rtw89_a_table_power_reset_rf_order_matches_rtw8852a() -> TestResult {
+    let mut model = Model::new(0x5a, 1, 1);
+    model.chip = ChipId::Rtl8852A;
+    let mut factory = Factory::default();
+    if ready(factory.read(&mut model)) != Some(Ok(())) {
+        return TestResult::Fail("A factory snapshot failed");
+    }
+    if Qualified::from_factory(&factory).is_some() || Qualified::from_factory_c(&factory).is_some()
+    {
+        return TestResult::Fail("B/C qualification accepted an A factory");
+    }
+    let Some(qualified) = Qualified::from_factory_a(&factory) else {
+        return TestResult::Fail("A qualification refused an actual A factory");
+    };
+    let assets = Assets::parse_for(ChipId::Rtl8852A, &a_container(0x10005, 0x10006)).unwrap();
+    model.clear_trace();
+    let mut init = Init::default();
+    // SAFETY: private model Interface; no hardware.
+    if ready(unsafe { init.prepare(&mut model, qualified, &assets) }) != Some(Ok(()))
+        || init.state() != State::TablesLoaded
+        || init.calibration().is_some()
+        || init.calibration_c().is_some()
+        || init.calibration_51().is_some()
+        || init.calibration_a().is_none()
+    {
+        return TestResult::Fail("A table preparation failed or published the wrong calibration");
+    }
+    // Linux `rf_table = {radioa, radiob}`: path A (0) is written and paged
+    // before path B (1), each with its own path.
+    let rf: Vec<(u8, u32)> = model
+        .operations
+        .iter()
+        .copied()
+        .filter(|(kind, _)| *kind == 16 || *kind == 32)
+        .collect();
+    if rf != [(16, 0x10005), (32, 0), (16, 0x10006), (32, 4)] {
+        return TestResult::Fail("A RF tables were not uploaded in rtw8852a rf_table order");
+    }
+    for (address, value) in [
+        (0x10704, 0x601e_0100 | 2),
+        (0xd248, 0x0776_3333),
+        (0xd220, 0x01eb_f004),
+        (0xd240, 0x0002_f8ff),
+    ] {
+        if model.words[address / 4] != value {
+            return TestResult::Fail("A txpwr unit / BB reset state differs from Linux");
+        }
+    }
+    // A reset clears the MANON/EN bits and writes no B-only HW-SI or UL_TB
+    // address.
+    for address in [0x158dc, 0x15818, 0x178dc, 0x17818] {
+        if model.words[address / 4] != 0 {
+            return TestResult::Fail("A reset left MANON/EN bits set");
+        }
+    }
+    if model
+        .operations
+        .iter()
+        .any(|(kind, a)| *kind == 4 && matches!(*a, 0x11200 | 0x13200 | 0xd288 | 0xd28c | 0xd290))
+    {
+        return TestResult::Fail("A reset/power units used B-only registers");
+    }
+    // Chip mismatch between qualification and assets fails before any write.
+    let (mut b_model, _, b_assets) = Model::setup(0x5a, 1, 1);
+    b_model.clear_trace();
+    let mut init = Init::default();
+    // SAFETY: private model Interface; no hardware.
+    if ready(unsafe { init.prepare(&mut b_model, qualified, &b_assets) })
+        != Some(Err(Error::Profile))
+        || !b_model.operations.is_empty()
+    {
+        return TestResult::Fail("A qualification ran B assets");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_a_bb_sethw_and_nctl_follow_rtw8852a() -> TestResult {
+    let mut io = Model::new(0xa5, 1, 1);
+    if controls_a(&mut io, 1).is_err() {
+        return TestResult::Fail("A bb_sethw cut 1 failed");
+    }
+    // 0xa5a5a5a5 seed: EN_SOUND bit 1 already clear, watchdog bit 0 and
+    // SPOOF bit 15 already set; MANON bit 30 set; PARSING_TIME [19:16]
+    // 0x5 -> 0xf; CFO fields [14:10] set to 0x1f / 0x0c; MAC_SEL [4:2]
+    // cleared; NDP_BRK0 bit 0 cleared, NDP_BRK1 bit 0 set.
+    for (address, value) in [
+        (0x10d7c, 0xa5a5_a5a5),
+        (0x12d7c, 0xa5a5_a5a5),
+        (0x1000c, 0xa5a5_a5a5),
+        (0x10dc0, 0x864f_a000),
+        (0x10dc4, 0x0000_043f),
+        (0x10dc8, 0x0000_7fff),
+        (0x10d84, 0xa5a5_a5a5),
+        (0x158dc, 0xe5a5_a5a5),
+        (0x178dc, 0xe5a5_a5a5),
+        (0x10738, 0xa5af_a5a5),
+        (0x14404, 0xa5a5_fda5),
+        (0x1440c, 0xa5a5_b1a5),
+        (0x109a4, 0xa5a5_a5a1),
+        (0x129a4, 0xa5a5_a5a1),
+        (0x10da0, 0xa5a5_a5a4),
+        (0x10da4, 0xa5a5_a5a5),
+        (0xd36c, 0),
+        (0xd568, 0),
+    ] {
+        if io.words[address / 4] != value {
+            return TestResult::Fail("A bb_sethw cut 1 words differ");
+        }
+    }
+    if io
+        .operations
+        .iter()
+        .any(|(kind, a)| *kind == 4 && matches!(*a, 0x11200 | 0x13200 | 0xd288))
+    {
+        return TestResult::Fail("A bb_sethw writes B-only addresses");
+    }
+    // Cut above CCV (2): the watchdog block is absent, everything else
+    // still applies.
+    let mut io = Model::new(0, 1, 3);
+    if controls_a(&mut io, 3).is_err() {
+        return TestResult::Fail("A bb_sethw cut 3 failed");
+    }
+    for (address, value) in [
+        (0x1000c, 0),
+        (0x10dc0, 0),
+        (0x10d7c, 0),
+        (0x14404, 0x7c00),
+        (0x1440c, 0x3000),
+    ] {
+        if io.words[address / 4] != value {
+            return TestResult::Fail("A bb_sethw cut 3 words differ");
+        }
+    }
+    // Ignored writes fail the readback: EN_SOUND clear, watchdog full
+    // write and MACID zeroing.
+    for address in [0x10d7c, 0x12d7c, 0xd36c, 0xd568, 0x10dc0] {
+        let mut io = Model::new(0xa5, 1, 1);
+        io.words[0x10d7c / 4] |= 2;
+        io.words[0x12d7c / 4] |= 2;
+        io.ignore = Some(address);
+        if controls_a(&mut io, 1).is_ok() {
+            return TestResult::Fail("ignored A bb_sethw write returned readiness");
+        }
+    }
+    // NCTL: preinit once, no second 0x10c60 write, NCTL table follows.
+    let mut io = Model::new(0, 1, 1);
+    io.words[0x18080 / 4] = 4;
+    if ready(nctl_a(&mut io, &[Pair(0x8040, 0x12345)])) != Some(Ok(())) {
+        return TestResult::Fail("A NCTL failed");
+    }
+    for (address, value) in [
+        (0x10c60, 3),
+        (0x10c6c, 1),
+        (0x158ac, 0x0800_0000),
+        (0x178ac, 0x0800_0000),
+        (0x18040, 0x12345),
+    ] {
+        if io.words[address / 4] != value {
+            return TestResult::Fail("A NCTL words differ");
+        }
+    }
+    if io
+        .operations
+        .iter()
+        .filter(|(kind, a)| *kind == 4 && *a == 0x10c60)
+        .count()
+        != 1
+    {
+        return TestResult::Fail("A NCTL preinit wrote 0x10c60 more than once");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_table_power_reset_rf_order_matches_rtw8852a
+);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_bb_sethw_and_nctl_follow_rtw8852a
+);

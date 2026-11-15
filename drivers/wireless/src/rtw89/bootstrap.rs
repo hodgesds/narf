@@ -566,6 +566,16 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
             io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
                 .await?
         }
+        // RTL8852A: its own `radio_a` owner at the same default chandef;
+        // never B's basic/full calibration.
+        Phase::RadioTablesLoaded
+            if io
+                .identity()
+                .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852A) =>
+        {
+            io.prepare_radio_a(super::operating_channel::Profile::INITIAL)
+                .await?
+        }
         Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
         Phase::BasicCalibrated => io.prepare_full_radio().await?,
         Phase::RadioReady => return Ok(true),
