@@ -962,6 +962,11 @@ GPM ring in the DMA buffer itself; this port keeps the CPU-side ring,
 so `mci::sync_gpm_ring` copies between the two at every walk boundary
 (pending slots DMA→CPU into recycled slots only; consumed slots cleared
 in the DMA buffer so a later walk from slot 0 cannot re-process them).
+The `wait_for_gpm` bounded waits (`init_cal_req`'s 50 ms grant wait,
+`start_reset`'s 25 ms calibration-done wait) re-sync the DMA ring into
+the CPU ring before every poll when the owner passes the DMA buffer in,
+so a GPM landing mid-wait is seen instead of timing out (#2027); a wait
+run without the buffer still misses mid-wait GPMs until the next sync.
 `irq::enable`/`resume` carry the MCI bit in the async-cause mask
 (`mac.c::__ath9k_hw_enable_interrupts`); `service_begin` routes
 `Events.mci` to `get_isr` + `handle_interrupt`, and a dead-card latch
