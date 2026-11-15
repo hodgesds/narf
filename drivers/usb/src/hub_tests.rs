@@ -88,9 +88,13 @@ impl HubTransport for HubFirmware {
     }
 }
 
+// Note: HubFirmware mock transports emit no hardware IRQs, and attach_transport
+// awaits sleep_ms(settle_ms). Under kernel-test BSP leaves its timer masked and
+// timer_pump uninitialized while APs install arm_hrtimer_event globally, so
+// mock attaches bridge via block_on_spin (which drives hrtimer_run_softirq).
 fn smoke_hub_negotiates_multiple_tt() -> TestResult {
     let firmware = HubFirmware::new(false);
-    let hub = match narf_scheduler::block_on(UsbHub::attach_transport(
+    let hub = match narf_scheduler::block_on_spin(UsbHub::attach_transport(
         &firmware,
         7,
         0,
@@ -118,7 +122,7 @@ kernel_test_in!("drivers/usb/hub", smoke_hub_negotiates_multiple_tt);
 /// working single-TT ("Using single TT") instead of failing to attach.
 fn smoke_hub_falls_back_to_single_tt_when_switch_fails() -> TestResult {
     let firmware = HubFirmware::new(true);
-    let hub = match narf_scheduler::block_on(UsbHub::attach_transport(
+    let hub = match narf_scheduler::block_on_spin(UsbHub::attach_transport(
         &firmware,
         7,
         0,
@@ -148,7 +152,7 @@ kernel_test_in!(
 fn smoke_hub_single_tt_does_not_switch_alternate() -> TestResult {
     let mut firmware = HubFirmware::new(true);
     firmware.wanted_alternate = 0;
-    let hub = match narf_scheduler::block_on(UsbHub::attach_transport(
+    let hub = match narf_scheduler::block_on_spin(UsbHub::attach_transport(
         &firmware,
         7,
         0,
@@ -179,7 +183,7 @@ fn smoke_hub_rejects_missing_multiple_tt_alternate() -> TestResult {
     // protocol 2 cannot justify publishing multiple-TT mode without alt 1.
     let config = &VIA_DESCRIPTORS[18..18 + 25];
     if !matches!(
-        narf_scheduler::block_on(UsbHub::attach_transport(
+        narf_scheduler::block_on_spin(UsbHub::attach_transport(
             &firmware,
             7,
             0,
@@ -207,7 +211,7 @@ fn smoke_hub_selects_advertised_interface_and_alternate() -> TestResult {
     let mut firmware = HubFirmware::new(false);
     firmware.interface = 2;
     firmware.wanted_alternate = 3;
-    let hub = match narf_scheduler::block_on(UsbHub::attach_transport(
+    let hub = match narf_scheduler::block_on_spin(UsbHub::attach_transport(
         &firmware,
         7,
         2,

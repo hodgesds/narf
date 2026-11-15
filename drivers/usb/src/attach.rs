@@ -552,10 +552,11 @@ const ATTACH_LOG_LIMIT: usize = 64;
 static ATTACH_LOGGED: IrqSafeSpinLock<alloc::collections::BTreeSet<(u8, u8, u32, &'static str)>> =
     IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
 
-pub(crate) fn note_attach_failure(
+fn note_attach_log(
     controller: u8,
     root_port: u8,
     route: u32,
+    is_failure: bool,
     step: &'static str,
     detail: &dyn core::fmt::Debug,
 ) {
@@ -567,15 +568,45 @@ pub(crate) fn note_attach_failure(
         }
     }
     use core::fmt::Write as _;
+    let sep = if is_failure { " failed at " } else { " " };
     let _ = writeln!(
         narf_console::Writer,
-        "  usb-attach: xhci{} root_port={} route=0x{:05x} failed at {}: {:?}",
+        "  usb-attach: xhci{} root_port={} route=0x{:05x}{}{}: {:?}",
         controller,
         root_port,
         route,
+        sep,
         step,
         detail
     );
+}
+
+pub(crate) fn note_attach_failure(
+    controller: u8,
+    root_port: u8,
+    route: u32,
+    step: &'static str,
+    detail: &dyn core::fmt::Debug,
+) {
+    note_attach_log(controller, root_port, route, true, step, detail);
+}
+
+fn note_attach_info(
+    controller: u8,
+    root_port: u8,
+    route: u32,
+    step: &'static str,
+    detail: &dyn core::fmt::Debug,
+) {
+    note_attach_log(controller, root_port, route, false, step, detail);
+}
+
+fn log_attach_outcome(controller: u8, root_port: u8, route: u32, outcome: &AttachOutcome) {
+    if matches!(outcome, AttachOutcome::UnknownClass) {
+        note_attach_failure(controller, root_port, route, "class_match", outcome);
+    } else {
+        note_attach_info(controller, root_port, route, "attached", outcome);
+    }
 }
 
 /// Drive enumeration for a device on root-hub `port`. Returns the
@@ -624,7 +655,7 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
         /*parent_hub_slot*/ None,
     )
     .await;
-    note_attach_failure(xhci_dev.id(), port, 0, "outcome (not a failure)", &outcome);
+    log_attach_outcome(xhci_dev.id(), port, 0, &outcome);
     outcome
 }
 
@@ -710,11 +741,10 @@ pub async fn try_attach_via_hub(
         Some(parent.slot_id),
     )
     .await;
-    note_attach_failure(
+    log_attach_outcome(
         xhci_dev.id(),
         parent_root_port,
         topology.route_string,
-        "outcome (not a failure)",
         &outcome,
     );
     outcome
@@ -900,11 +930,11 @@ async fn dispatch_after_address(
             Ok(d) => {
                 let vid = u16::from_le_bytes([d[8], d[9]]);
                 let pid = u16::from_le_bytes([d[10], d[11]]);
-                note_attach_failure(
+                note_attach_info(
                     xhci_dev.id(),
                     root_port,
                     this_route,
-                    "addressed (not a failure)",
+                    "addressed",
                     &(slot_id, speed, vid, pid, d[4], d[7]),
                 );
                 (d[4], d[6], vid, pid)

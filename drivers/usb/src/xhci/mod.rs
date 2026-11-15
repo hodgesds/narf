@@ -569,8 +569,10 @@ pub struct Xhci {
     /// compiler can't see that.
     #[allow(dead_code)]
     msix: Option<MsixTable>,
+    /// Whether interrupter 0 uses MSI-X, MSI, legacy INTx, or polling.
+    irq_mode: IrqMode,
     /// IDT vector allocated for this controller's interrupter 0,
-    /// or `None` if MSI-X wasn't enabled.
+    /// or `None` if MSI-X/MSI/INTx wasn't enabled.
     pub irq_vector: Option<u8>,
     /// Stable controller index (`xhci<N>`, probe order). Every class
     /// binding records it, because slot IDs and root-port numbers are
@@ -583,6 +585,25 @@ pub struct Xhci {
     /// Waker of this controller's USB supervisor, poked by the demux on a
     /// Port Status Change Event.
     supervisor_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum IrqMode {
+    Msix,
+    Msi,
+    Intx,
+    Polling,
+}
+
+impl IrqMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Msix => "msix",
+            Self::Msi => "msi",
+            Self::Intx => "intx",
+            Self::Polling => "poll",
+        }
+    }
 }
 
 /// Per-slot device state held by the controller after a successful
@@ -1236,12 +1257,31 @@ impl Xhci {
         // SAFETY: caller-authority.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| XhciError::BarMapFailed)?;
 
+        if mmio.len < 0x20 {
+            return Err(XhciError::BarMapFailed);
+        }
+
         // Read caps.
-        // SAFETY: identity-mapped MMIO.
-        let caplength = unsafe { mmio.read32(CAP_CAPLENGTH) } as u8;
-        // SAFETY: same.
-        let hci = unsafe { mmio.read32(0) };
+        // SAFETY: identity-mapped MMIO, BAR0 length checked above.
+        let hci = unsafe { mmio.read32(CAP_CAPLENGTH) };
+        let caplength = (hci & 0xFF) as u8;
         let hciversion = (hci >> 16) as u16;
+        if hci == u32::MAX
+            || hci == 0
+            || u64::from(caplength) < 0x20
+            || u64::from(caplength) + 0x40 > mmio.len
+        {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: {:04x}:{:04x} invalid CAPLENGTH/HCI ({:#010x}, bar_len={:#x})",
+                device.id.vendor,
+                device.id.device,
+                hci,
+                mmio.len,
+            );
+            return Err(XhciError::NotReady);
+        }
         // SAFETY: same.
         let p1 = unsafe { mmio.read32(CAP_HCSPARAMS1) };
         let max_slots = (p1 & 0xFF) as u8;
@@ -1312,6 +1352,9 @@ impl Xhci {
             // Hard cap iterations; spec says lists terminate but
             // a malformed table shouldn't hang us forever.
             for _ in 0..32 {
+                if cap_off + 16 > mmio.len {
+                    break;
+                }
                 // SAFETY: identity-mapped MMIO region.
                 let hdr = unsafe { mmio.read32(cap_off) };
                 let cap_id = (hdr & 0xFF) as u8;
@@ -1559,7 +1602,10 @@ impl Xhci {
             // set bit. Almost every controller advertises bit 0
             // (4 KiB); this is correct fallback.
             // SAFETY: identity-mapped MMIO.
-            let pagesize_bits = unsafe { mmio.read32(op_off + OP_PAGESIZE) };
+            let pagesize_bits = unsafe { mmio.read32(op_off + OP_PAGESIZE) } & 0xFFFF;
+            if pagesize_bits == 0 {
+                return Err(XhciError::NotReady);
+            }
             let page_shift = pagesize_bits.trailing_zeros();
             let page_size = 4096usize << page_shift;
             // Allocate ALL scratchpads (audit F-02 — pre-fix
@@ -1664,16 +1710,18 @@ impl Xhci {
             mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
             mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
             mmio.write32(ir0 + IR_IMOD, 0);
-            mmio.write32(ir0 + IR_IMAN, IMAN_IP | IMAN_IE);
+            // Leave IE=0 and INTE=0 until the IDT vector is installed and
+            // this controller is published in CONTROLLERS (arm_interrupts).
+            mmio.write32(ir0 + IR_IMAN, IMAN_IP);
         }
 
-        // Run! Set INTE so the controller honors the interrupter
-        // enable bits (per §5.4.1.1, USBCMD.INTE is the master
-        // interrupt enable; without it, interrupters never fire).
+        // Run! Leave INTE=0 for now — arm_interrupts sets USBCMD.INTE and
+        // IR_IMAN.IE only after the ISR is registered and CONTROLLERS has
+        // this instance, preventing an early MSI from wedging IMAN.IP=1.
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            mmio.write32(op_off + OP_USBCMD, USBCMD_RS | USBCMD_INTE);
+            mmio.write32(op_off + OP_USBCMD, USBCMD_RS);
         }
         // Wait for HCH = 0. responsive_spin_until keeps cursor/FB
         // alive across the start. xHCI 1.2 §5.4.1.1 says the
@@ -1851,29 +1899,16 @@ impl Xhci {
         // the MSI/INTx path. PCIe Base Spec §6.1 (MSI-X Capability) +
         // §6.1.4 (INTx Emulation) describe the fallback contract.
         //   <https://pcisig.com/specifications/pciexpress/>
-        let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
-            Ok((tbl, v)) => (Some(tbl), Some(v)),
+        let (msix, irq_vector, irq_mode) = match Self::try_enable_msix(cap, device) {
+            Ok((tbl, v)) => (Some(tbl), Some(v), IrqMode::Msix),
             Err(_) => match Self::try_enable_msi(cap, device) {
-                Ok(v) => (None, Some(v)),
+                Ok(v) => (None, Some(v), IrqMode::Msi),
                 Err(_) => match Self::try_install_intx(cap, device) {
-                    Some(v) => (None, Some(v)),
-                    None => (None, None),
+                    Some(v) => (None, Some(v), IrqMode::Intx),
+                    None => (None, None, IrqMode::Polling),
                 },
             },
         };
-        // After MSI/MSI-X enable, re-write IMAN so an implementation that
-        // registers interrupter→vector binding on the IMAN.IE
-        // transition observes IE=1 *while* MSI/MSI-X is already enabled
-        // in PCI cfg.
-        if msix.is_some() || irq_vector.is_some() {
-            // SAFETY: identity-mapped MMIO; same offset as the
-            // earlier write.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe {
-                let cur = mmio.read32(ir0 + IR_IMAN);
-                mmio.write32(ir0 + IR_IMAN, cur | IMAN_IE);
-            }
-        }
 
         Ok(Self {
             mmio,
@@ -1929,11 +1964,40 @@ impl Xhci {
             recovery_epoch: core::sync::atomic::AtomicU64::new(0),
             running: true,
             msix,
+            irq_mode,
             irq_vector,
             id: 0,
             bus_addr: device.addr,
             supervisor_waker: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// Arm interrupter 0 (`IMAN.IE`, `USBCMD.INTE`) and clear PCI
+    /// `INTX_DISABLE` if legacy INTx was selected. Called from [`probe`]
+    /// only after the ISR is installed and `self` is registered in
+    /// `CONTROLLERS`, then drains + acknowledges any event latched
+    /// during bring-up so edge-triggered MSI/MSI-X never wedges with
+    /// `IMAN.IP=1`.
+    fn arm_interrupts(&self, device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) {
+        if self.irq_mode == IrqMode::Polling {
+            return;
+        }
+        if self.irq_mode == IrqMode::Intx {
+            let _ = narf_bus::pci::clear_command(cap, device, narf_bus::pci::cmd::INTX_DISABLE);
+        }
+        let ir0 = self.rts_off + IR_BASE_OFF;
+        // SAFETY: Valid MMIO bounds or trusted driver environment; `self`
+        // is already visible to `xhci_isr` via CONTROLLERS.
+        unsafe {
+            let iman = self.mmio.read32(ir0 + IR_IMAN);
+            self.mmio
+                .write32(ir0 + IR_IMAN, (iman & !IMAN_IP) | IMAN_IE);
+            let cmd = self.mmio.read32(self.op_off + OP_USBCMD);
+            self.mmio
+                .write32(self.op_off + OP_USBCMD, cmd | USBCMD_INTE);
+        }
+        compiler_fence(Ordering::SeqCst);
+        service_interrupt(self);
     }
 
     /// This controller's index (`xhci<N>`); see [`controller_by_id`].
@@ -1981,16 +2045,13 @@ impl Xhci {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
+        // Install the IDT handler BEFORE enabling MSI-X so an early
+        // vector firing cannot land before xhci_isr is bound.
+        narf_interrupts::install_handler(v, xhci_isr);
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| XhciError::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
-        // Real ISR — drains the event ring + acknowledges
-        // interrupter IP. Replaces the previous fire-count-only
-        // pattern; the supervisor pump's wait_for_irq still
-        // observes the fire-count bump but the level-triggered
-        // IRQ now de-asserts cleanly.
-        narf_interrupts::install_handler(v, xhci_isr);
         Ok((msix, v))
     }
 
@@ -2001,11 +2062,15 @@ impl Xhci {
     fn try_enable_msi(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<u8, XhciError> {
         let mut cfg = narf_bus::msi::enable_msi(cap, device, 1).map_err(|_| XhciError::NoMemory)?;
         let v = narf_interrupts::vector::alloc().map_err(|_| XhciError::NoMemory)?;
+        // Install the IDT handler BEFORE enabling MSI so an early
+        // vector firing cannot land before xhci_isr is bound.
+        narf_interrupts::install_handler(v, xhci_isr);
         // SAFETY: caller holds the BusDeviceCap; `cfg` was built by
         // `enable_msi` from that live cap and is `&mut`-borrowed here,
         // so no other writer can touch this device's cfg space during
-        // the call. The message is programmed before the enable bit
-        // below, so the device cannot fire on a half-programmed
+        // the call. The handler is installed above and the message is
+        // programmed before the enable bit below, so the device cannot
+        // fire into an unbound vector or on a half-programmed
         // address/data pair.
         let _ = unsafe { narf_bus::msi::program_msi(&mut cfg, 0, v) }
             .map_err(|_| XhciError::NoMemory)?;
@@ -2013,7 +2078,6 @@ impl Xhci {
         // BusDeviceCap; the message address/data were programmed on the
         // preceding line.
         unsafe { narf_bus::msi::enable(&cfg) }.map_err(|_| XhciError::NoMemory)?;
-        narf_interrupts::install_handler(v, xhci_isr);
         Ok(v)
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -6240,6 +6304,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if !is_xhci_class && !is_explicit_match {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
+    // Wake the function out of D3hot and restore any BARs reset by
+    // NoSoftRst- (e.g. Intel TBT4 xHCI) before enabling MMIO decode.
+    narf_bus::pci::prepare_memory_probe(&cap, &device)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     narf_bus::pci::set_command(
         &cap,
         &device,
@@ -6277,6 +6345,21 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         (controller, alloc::format!("xhci{id}"), hook)
     };
     IS_PROBED.store(true, core::sync::atomic::Ordering::Release);
+    controller.arm_interrupts(&device, &cap);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  xhci{}: {:04x}:{:04x} at {:?} irq={} vec={:?} ports={}",
+            controller.id(),
+            device.id.vendor,
+            device.id.device,
+            device.addr,
+            controller.irq_mode.as_str(),
+            controller.irq_vector,
+            controller.max_ports(),
+        );
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name,
         kind: narf_drivers::BoundKind::UsbHost,
