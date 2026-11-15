@@ -39,6 +39,10 @@ const RR_DCK1_SEL: u32 = 1 << 3;
 const RR_DCK2: u32 = 0x94;
 const RR_DCK2_CYCLE: u32 = 0xfc;
 
+/// rtw8852a_rfk.c `rtw8852a_backup_bb_regs` / `rtw8852a_backup_rf_regs`.
+const BACKUP_BB: [u32; 3] = [0x2344, 0x58f0, 0x78f0];
+const BACKUP_RF: [u32; 8] = [0xef, 0xde, 0x0, 0x1e, 0x2, 0x85, 0x90, 0x5];
+
 // BB registers (reg.h), PHY-relative.
 const R_ANAPAR_PW15: u32 = 0x30c;
 const B_ANAPAR_PW15_H: u32 = 0xf000000;
@@ -575,7 +579,7 @@ impl<I: Interface> Access<'_, I> {
     /// `is_afe`, toggles `RR_DCK_LV` 0 -> 1, sleeps 600us, toggles back,
     /// and restores the full saved RXCK word. The RFC variant
     /// (`is_afe = false`) skips the AFE setup/restore.
-    async fn a_set_rx_dck(&mut self, path: u8, is_afe: bool) -> Result<(), Error> {
+    pub(super) async fn a_set_rx_dck(&mut self, path: u8, is_afe: bool) -> Result<(), Error> {
         let rxck = R_P0_RXCK + (u32::from(path) << 13);
         let nrbw = R_P0_NRBW + (u32::from(path) << 13);
         let rxdc2 = R_S0_RXDC2 + (u32::from(path) << 13);
@@ -630,13 +634,10 @@ impl<I: Interface> Access<'_, I> {
         }
         Ok(())
     }
-    /// `rtw8852a_rx_dck`: BTC RXDCK START, stop_sch_tx (pause),
-    /// `_wait_rx_mode` per path (poll `RR_MOD` != 2, 2us/5000us), the RX
-    /// DCK itself, resume, BTC STOP.
-    async fn a_channel_rxdck(&mut self, tssi_mode: [bool; 2], is_afe: bool) -> Result<(), Error> {
-        self.0.admit()?;
-        self.0.begin(Kind::Rxdck).await?;
-        let saved = self.0.pause().await?;
+    /// rtw8852a_rfk.c `_wait_rx_mode(RF_AB)`: poll `RR_MOD` != 2 per
+    /// path, 2us step, 5000us budget. Shared by the channel RX DCK,
+    /// IQK and DPK.
+    pub(super) async fn a_wait_rx_mode(&mut self) -> Result<(), Error> {
         for path in 0..2u8 {
             let start = self.0.now_us();
             loop {
@@ -649,6 +650,53 @@ impl<I: Interface> Access<'_, I> {
                 self.delay(2).await?;
             }
         }
+        Ok(())
+    }
+    /// rtw8852a_rfk.c `_rfk_backup_bb_reg` / `_rfk_restore_bb_reg`:
+    /// full-word BB backup/restore of `rtw8852a_backup_bb_regs`.
+    /// Shared by IQK (`_doiqk`) and DPK (`_dpk_cal_select`).
+    pub(super) fn a_backup_bb(&mut self) -> Result<[u32; 3], Error> {
+        let mut saved = [0u32; 3];
+        for (slot, address) in saved.iter_mut().zip(BACKUP_BB) {
+            *slot = self.bb(address, u32::MAX)?;
+        }
+        Ok(saved)
+    }
+    pub(super) fn a_restore_bb(&mut self, saved: &[u32; 3]) -> Result<(), Error> {
+        self.0.admit()?;
+        for (&address, &value) in BACKUP_BB.iter().zip(saved) {
+            self.0.write32(0x10000 + address, value)?;
+        }
+        Ok(())
+    }
+    /// rtw8852a_rfk.c `_rfk_backup_rf_reg` / `_rfk_restore_rf_reg` for
+    /// one path: full-word RF backup/restore of
+    /// `rtw8852a_backup_rf_regs`.
+    pub(super) async fn a_backup_rf(&mut self, path: u8) -> Result<[u32; 8], Error> {
+        let mut saved = [0u32; 8];
+        for (slot, address) in saved.iter_mut().zip(BACKUP_RF) {
+            *slot = self.rr(path, address, RFREG_MASK).await?;
+        }
+        Ok(saved)
+    }
+    pub(super) async fn a_restore_rf(&mut self, path: u8, saved: &[u32; 8]) -> Result<(), Error> {
+        for (&address, &value) in BACKUP_RF.iter().zip(saved) {
+            self.wr(path, address, RFREG_MASK, value).await?;
+        }
+        Ok(())
+    }
+    /// `rtw8852a_rx_dck`: BTC RXDCK START, stop_sch_tx (pause),
+    /// `_wait_rx_mode` per path (poll `RR_MOD` != 2, 2us/5000us), the RX
+    /// DCK itself, resume, BTC STOP.
+    pub(super) async fn a_channel_rxdck(
+        &mut self,
+        tssi_mode: [bool; 2],
+        is_afe: bool,
+    ) -> Result<(), Error> {
+        self.0.admit()?;
+        self.0.begin(Kind::Rxdck).await?;
+        let saved = self.0.pause().await?;
+        self.a_wait_rx_mode().await?;
         self.a_rx_dck(tssi_mode, is_afe).await?;
         self.0.resume(saved).await?;
         self.0.end(Kind::Rxdck).await?;

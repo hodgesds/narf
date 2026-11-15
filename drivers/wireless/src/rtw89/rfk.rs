@@ -518,6 +518,19 @@ impl ChannelRxDck {
 /// RTL8852A `rtw8852a_rfk_init` (RCK/DACK/RX DCK).
 #[path = "rfk/a.rs"]
 pub(super) mod a;
+/// RTL8852A channel RFK (`rtw8852a_rfk_channel`, `rtw8852a_rfk_band_changed`
+/// via the TSSI scan, `rtw8852a_rfk_track`).
+#[path = "rfk/a_channel.rs"]
+pub(super) mod a_channel;
+/// RTL8852A channel DPK (`rtw8852a_dpk`).
+#[path = "rfk/a_dpk.rs"]
+pub(super) mod a_dpk;
+/// RTL8852A channel IQK (`rtw8852a_iqk`).
+#[path = "rfk/a_iqk.rs"]
+pub(super) mod a_iqk;
+/// RTL8852A channel TSSI (`rtw8852a_tssi`, `rtw8852a_tssi_scan`).
+#[path = "rfk/a_tssi.rs"]
+pub(super) mod a_tssi;
 /// RTL8922A channel RFK (`rtw8922a_rfk_channel`, `rtw8922a_rfk_band_changed`)
 /// and periodic track (`rtw89_core_rfk_track` / `rtw8922a_rfk_track`).
 #[path = "rfk/be_channel.rs"]
