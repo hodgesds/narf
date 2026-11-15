@@ -43,7 +43,12 @@
 //! per-link RA (phy index = link instance index), and
 //! per-link TXWD EHT fields route through the designated
 //! link; `release_mld_link` / `release_mld` tear links down
-//! one at a time or whole.
+//! one at a time or whole. Link-lifecycle H2Cs
+//! (`mld_link_frames` / `station_link_frames`, issue #2081)
+//! compose + frame the per-link add / assoc / disconnect /
+//! remove bodies from the admitted records + the VIF's
+//! per-instance link contexts, for the PCI owner to submit
+//! over CH12.
 //!
 //! VIF composition lives here too: `add_vif` holds one VIF
 //! record per interface (main MACID + port, Linux
@@ -60,16 +65,11 @@
 //!   rearrange exists.
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
-//! - Link-lifecycle H2Cs (role-maintain / DMAC / join-info /
-//!   CAM around link add/assoc/disconnect, issue #1918) are
-//!   built by `link_h2c_8922a.rs` from the MLD / station
-//!   records admitted here plus a per-link VIF context; the
-//!   MLD composition here still builds CCTL + BA-CAM bodies
-//!   only and never sends them. Still open: this owner must
-//!   allocate the per-instance CAM entries and hold the
-//!   per-instance VIF-link contexts (own link address, CAM
-//!   indices) the transition composers consume, and frame +
-//!   send the bodies over CH12 — the transport lane.
+//! - The VIF-level `rtw89_mac_vif_init` role/join/CAM/DMAC
+//!   sequence (issue #2081, out of scope there): the
+//!   link-lifecycle transitions here cover the per-link add /
+//!   assoc / disconnect / remove around an admitted station
+//!   or MLD link only.
 //!
 //! ## MLO model (Linux grounding)
 //!
@@ -112,10 +112,11 @@
 //!   admission (the station owner's documented difference);
 //!   a VIF reserves only its base slot, not the strided
 //!   `base + 16` slot, so a VIF's second link instance has a
-//!   precomputed identity but no pool reservation yet — the
-//!   per-instance VIF-link contexts (own address, CAM indices)
-//!   the link-lifecycle builders (`link_h2c_8922a`, #1918)
-//!   consume are still to be held here.
+//!   precomputed identity but no pool reservation yet. (The
+//!   per-instance VIF-link contexts — own address, CAM
+//!   indices — the link-lifecycle builders consume ARE held
+//!   here since issue #2081: `add_vif` allocates the CAM
+//!   entries per instance.)
 //! - A TDLS peer release never frees the VIF's MACID here.
 //!   Linux `__rtw89_ops_sta_remove` (`mac80211.c:622`)
 //!   releases the shared main MACID bit for TDLS peers,
@@ -137,6 +138,13 @@
 //!   (`retain_h2c`), and the C2H completion path releases a
 //!   buffer on its matching ack (`release_h2c_by_ack`, surfaced
 //!   in `Outcome::h2c_released`).
+//! - Link-lifecycle H2C composition + framing
+//!   ([`Prepared8922a::mld_link_frames`] /
+//!   [`Prepared8922a::station_link_frames`], issue #2081):
+//!   the per-instance CAM entries + VIF-link contexts
+//!   allocated at `add_vif`, the transition bodies from
+//!   `link_h2c_8922a`, framed in Linux's send order for the
+//!   PCI owner to submit over CH12.
 //! - The TXWD_INFO v2 fill (`prepare_data_with_info`):
 //!   `txrx_be::fill_txwd_info_v2` output appended after the v2
 //!   body with BODY0 bit 22 set. Plain `prepare_data` still
@@ -177,6 +185,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -184,6 +193,7 @@ use narf_io::DmaBuffer;
 
 use super::bacam_v1;
 use super::channel_be;
+use super::chip_8922a;
 use super::completion_8922a;
 use super::dma::{TxBd, DEFAULT_RXBD_NUM, TXCH_NUM};
 use super::dma_8922a;
@@ -193,6 +203,10 @@ use super::eht::{EhtOperation, EhtStation, EHT_8922A};
 use super::fwcmd_8922a::{self, FramedH2c, H2cCmd, Released};
 use super::h2c::H2cSeqAllocator;
 use super::irq_be::BindingBe;
+use super::link_h2c_8922a::{
+    self, CamBody, LinkAdd, LinkCmd, LinkConn, LinkView, MacidPause, VifLinkCtx, CMD_CAM,
+    CMD_DMAC_V2, CMD_JOIN_INFO, CMD_ROLE_MAINTAIN,
+};
 use super::mac_pre_init_8922a::{self, HalChipVer};
 use super::operating_channel_c::{Band as ChanBand, Profile};
 use super::power;
@@ -202,6 +216,7 @@ use super::rx_packet::Ack;
 use super::station_8922a::{self, LinkRequest, MldStation, Request, Station};
 use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained, TXWD_INFO_SIZE};
 use super::tx_transport::Completion;
+use super::txrx::H2C_HEADER_LEN;
 
 /// Maximum BE data-header bytes: 32-byte TXWD_BODY_V2 + 32-byte
 /// TXWD_INFO_V2 + 8-byte WP info + at most 10 v1 address-info
@@ -259,6 +274,12 @@ pub(super) enum Error {
     /// (Linux programs one port id per VIF into every assoc
     /// CCTL).
     PortMismatch,
+    /// Out of address-CAM entries (128-entry pool).
+    NoAddrCam,
+    /// Out of BSSID-CAM entries (20-entry pool).
+    NoBssidCam,
+    /// Link-lifecycle H2C composition failure.
+    LinkH2c(link_h2c_8922a::Error),
     /// Out of DMA-coherent memory (ring allocation, header/frame
     /// allocation, or transport-owner construction).
     NoMemory,
@@ -305,6 +326,12 @@ impl From<ra_mask::Error> for Error {
     }
 }
 
+impl From<link_h2c_8922a::Error> for Error {
+    fn from(error: link_h2c_8922a::Error) -> Self {
+        Error::LinkH2c(error)
+    }
+}
+
 /// Outcome of [`Prepared8922a::set_channel`]: whether this
 /// channel-set crossed a band boundary or is the first
 /// programmed channel (Linux `!entity_active || band_changed`,
@@ -336,6 +363,84 @@ pub(super) enum VifRole {
     Ap,
 }
 
+/// Address-CAM + BSSID-CAM entry pools (`rtw8922a.c:3283..3284`:
+/// 128 addr-CAM entries, 20 BSSID-CAM entries). Linux allocates
+/// one entry of each per VIF link instance at VIF init (`cam.c`
+/// `rtw89_cam_init_addr_cam` / `rtw89_cam_init_bssid_cam`) and
+/// frees them at VIF removal; this owner does the same in
+/// [`Prepared8922a::add_vif`] / [`Prepared8922a::remove_vif`].
+/// Lowest free entry first, like the MACID pool and the port
+/// bitmap. Unreachable in practice while ports bound VIFs
+/// (5 VIFs × 2 instances = 10 entries of each), but the
+/// allocator still refuses correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CamPools {
+    /// `true` = address-CAM entry in use.
+    addr: [bool; chip_8922a::ACAM_NUM],
+    /// `true` = BSSID-CAM entry in use.
+    bssid: [bool; chip_8922a::BCAM_NUM],
+}
+
+impl CamPools {
+    /// Empty pools: every entry free.
+    const fn new() -> Self {
+        Self {
+            addr: [false; chip_8922a::ACAM_NUM],
+            bssid: [false; chip_8922a::BCAM_NUM],
+        }
+    }
+
+    /// Lowest free address-CAM entry, if any.
+    fn alloc_addr(&mut self) -> Option<u8> {
+        let index = self.addr.iter().position(|used| !*used)?;
+        self.addr[index] = true;
+        Some(index as u8)
+    }
+
+    /// Lowest free BSSID-CAM entry, if any.
+    fn alloc_bssid(&mut self) -> Option<u8> {
+        let index = self.bssid.iter().position(|used| !*used)?;
+        self.bssid[index] = true;
+        Some(index as u8)
+    }
+
+    /// Free an address-CAM entry. Out-of-range indices (never
+    /// handed out by [`Self::alloc_addr`]) are ignored.
+    fn free_addr(&mut self, index: u8) {
+        if (index as usize) < chip_8922a::ACAM_NUM {
+            self.addr[index as usize] = false;
+        }
+    }
+
+    /// Free a BSSID-CAM entry. Out-of-range indices are ignored.
+    fn free_bssid(&mut self, index: u8) {
+        if (index as usize) < chip_8922a::BCAM_NUM {
+            self.bssid[index as usize] = false;
+        }
+    }
+}
+
+/// One VIF link instance's CAM allocation + own address: the
+/// per-instance context the link-lifecycle transition
+/// composers (`link_h2c_8922a`) consume. Linux allocates one
+/// addr-CAM entry (128-entry pool) and one BSSID-CAM entry
+/// (20-entry pool) per VIF link instance at VIF init and keys
+/// each instance's CAM SMA by that instance's own link
+/// address; station links share the VIF link instance's
+/// entries (`core.h` `rtw89_get_addr_cam_of` /
+/// `rtw89_get_bssid_cam_of` — only AP links use the sta
+/// link's own addr-CAM entry, only TDLS links use the sta
+/// link's own BSSID-CAM entry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VifLink {
+    /// This link instance's own MAC address (CAM SMA).
+    pub(super) own: [u8; 6],
+    /// This instance's address-CAM entry index.
+    pub(super) addr_cam_idx: u8,
+    /// This instance's BSSID-CAM entry index.
+    pub(super) bssid_cam_idx: u8,
+}
+
 /// One admitted VIF: its address, role, and the one MACID +
 /// port Linux `rtw89_ops_add_interface` (`mac80211.c:165`)
 /// acquires for it. The main MACID is the base
@@ -357,6 +462,12 @@ pub(super) struct Vif {
     pub(super) base_macid: u8,
     /// Hardware port acquired for this VIF.
     pub(super) port: u8,
+    /// Per-instance link contexts (`SUPPORT_LINK_NUM`
+    /// instances): own link address + CAM indices, allocated
+    /// at [`Prepared8922a::add_vif`] and freed at
+    /// [`Prepared8922a::remove_vif`]. Instance 0 is the
+    /// designated link; instance 1 is the second MLD link.
+    pub(super) links: [VifLink; chip_8922a::SUPPORT_LINK_NUM],
 }
 
 impl Vif {
@@ -370,6 +481,63 @@ impl Vif {
     pub(super) fn main_port(self) -> u8 {
         self.port
     }
+}
+
+/// Which link-lifecycle transition to compose + frame
+/// ([`Prepared8922a::mld_link_frames`] /
+/// [`Prepared8922a::station_link_frames`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LinkTransition {
+    /// `rtw89_core_sta_link_add`.
+    Add,
+    /// `rtw89_core_sta_link_assoc`.
+    Assoc,
+    /// `rtw89_core_sta_link_disconnect`.
+    Disconnect,
+    /// `rtw89_core_sta_link_remove`.
+    Remove,
+}
+
+/// Per-transition inputs the link-lifecycle composers need
+/// beyond the admitted records + the held VIF-link context:
+/// the VIF side Linux reads from `rtwvif_link` per
+/// transition (WMM, trigger, BSSID) plus the two
+/// firmware-feature switches. The port, own address and CAM
+/// indices come from the held [`VifLink`]; `ap_or_tdls` is
+/// derived from the VIF role + peer kind by the `*_frames`
+/// methods, never supplied by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkH2cOpts {
+    /// Hardware EDCA set (0..3).
+    pub(super) wmm: u8,
+    /// The AP's HE support on this link (join TGR / CAM TF_TRS
+    /// on assoc; forced false on disconnect).
+    pub(super) trigger: bool,
+    /// BSSID bytes (CAM BSSID).
+    pub(super) bssid: [u8; 6],
+    /// BSSID-CAM entry valid (W13). True while the VIF is up
+    /// (station links) or after the TDLS BSSID-CAM init.
+    pub(super) bssid_valid: bool,
+    /// True while the firmware predates 0.35.84.0
+    /// (`ADDR_CAM_V0`): 60-byte CAM bodies. False selects the
+    /// 64-byte form with W15 `UPD_MODE`.
+    pub(super) addr_cam_v0: bool,
+    /// True once the firmware is >= 0.34.11.0
+    /// (`MACID_PAUSE_SLEEP`): 256-byte SLEEP pause bodies.
+    /// False selects the plain 32-byte form.
+    pub(super) macid_pause_sleep: bool,
+}
+
+/// One framed link-lifecycle H2C body: the FWCMD identity
+/// `frame_h2c` returned plus the wire bytes (8-byte header +
+/// body), ready for `pci::submit_be_h2c` (CH12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FramedLinkH2c {
+    /// FWCMD identity (category, class, function, sequence)
+    /// the C2H ack echoes.
+    pub(super) framed: FramedH2c,
+    /// Wire bytes: 8-byte FWCMD header + H2C body.
+    pub(super) bytes: Vec<u8>,
 }
 
 /// BAR2-backed [`Regs`] for the production path: the `pci::bring_up`
@@ -481,6 +649,9 @@ pub(crate) struct Prepared8922a {
     /// Hardware ports held by admitted VIFs
     /// (`RTW89_PORT_NUM` slots, lowest free first).
     ports_used: [bool; RTW89_PORT_NUM],
+    /// Address-CAM + BSSID-CAM entry pools for the VIF link
+    /// instances ([`CamPools`]).
+    cams: CamPools,
     data: tx_8922a::DataTx,
     h2c: tx_8922a::H2cTx,
     rings_programmed: bool,
@@ -568,6 +739,7 @@ impl Prepared8922a {
             vifs: Vec::new(),
             vif_peers: Vec::new(),
             ports_used: [false; RTW89_PORT_NUM],
+            cams: CamPools::new(),
             data: tx_8922a::DataTx::new()?,
             h2c: tx_8922a::H2cTx::new(tx_8922a::DATA_RING_DEPTH)?,
             rings_programmed: false,
@@ -1266,12 +1438,23 @@ impl Prepared8922a {
     /// Admit one VIF: acquire the lowest free pool MACID as
     /// its base (main MACID) and the lowest free hardware
     /// port, in Linux `rtw89_ops_add_interface` order (MACID
-    /// first, then port). Returns the main MACID. A refused
-    /// request — pool exhausted, no port free, or a VIF with
-    /// this address already admitted — consumes nothing: a
-    /// port failure after a MACID allocation frees the MACID
-    /// again.
-    pub(super) fn add_vif(&mut self, addr: [u8; 6], role: VifRole) -> Result<u8, Error> {
+    /// first, then port), then allocate one address-CAM +
+    /// one BSSID-CAM entry per link instance (Linux
+    /// `rtw89_cam_init_addr_cam` /
+    /// `rtw89_cam_init_bssid_cam` at VIF init). `link_addrs`
+    /// is the own link address of each instance (instance 0
+    /// is the VIF address for a single-link VIF; an MLD VIF
+    /// carries one address per link). Returns the main MACID.
+    /// A refused request — pool exhausted, no port free, no
+    /// CAM entry free, or a VIF with this address already
+    /// admitted — consumes nothing: every partial allocation
+    /// (MACID, port, CAM entries) is freed again.
+    pub(super) fn add_vif(
+        &mut self,
+        addr: [u8; 6],
+        role: VifRole,
+        link_addrs: [[u8; 6]; chip_8922a::SUPPORT_LINK_NUM],
+    ) -> Result<u8, Error> {
         if self.vifs.iter().any(|vif| vif.addr == addr) {
             return Err(Error::VifExists);
         }
@@ -1289,13 +1472,52 @@ impl Prepared8922a {
             }
         };
         self.ports_used[port as usize] = true;
+        // Allocate the per-instance CAM entries before the VIF
+        // record exists, so a failure here frees the port +
+        // MACID and every entry allocated so far.
+        let mut links = [VifLink {
+            own: [0; 6],
+            addr_cam_idx: 0,
+            bssid_cam_idx: 0,
+        }; chip_8922a::SUPPORT_LINK_NUM];
+        for (index, link) in links.iter_mut().enumerate() {
+            let Some(addr_cam_idx) = self.cams.alloc_addr() else {
+                self.free_vif_links(&links[..index]);
+                self.ports_used[port as usize] = false;
+                self.pool.free(base_macid);
+                return Err(Error::NoAddrCam);
+            };
+            let Some(bssid_cam_idx) = self.cams.alloc_bssid() else {
+                self.cams.free_addr(addr_cam_idx);
+                self.free_vif_links(&links[..index]);
+                self.ports_used[port as usize] = false;
+                self.pool.free(base_macid);
+                return Err(Error::NoBssidCam);
+            };
+            *link = VifLink {
+                own: link_addrs[index],
+                addr_cam_idx,
+                bssid_cam_idx,
+            };
+        }
         self.vifs.push(Vif {
             addr,
             role,
             base_macid,
             port,
+            links,
         });
         Ok(base_macid)
+    }
+
+    /// Free the CAM entries a slice of per-instance link
+    /// contexts holds (the `add_vif` rollback path and
+    /// `remove_vif`).
+    fn free_vif_links(&mut self, links: &[VifLink]) {
+        for link in links {
+            self.cams.free_addr(link.addr_cam_idx);
+            self.cams.free_bssid(link.bssid_cam_idx);
+        }
     }
 
     /// Admitted VIF by main MACID, if any.
@@ -1341,7 +1563,8 @@ impl Prepared8922a {
 
     /// Remove a VIF: its base MACID returns to the pool and
     /// its port is freed (Linux `rtw89_ops_remove_interface`
-    /// releases `rtw89_vif_get_main_macid` + the main port).
+    /// releases `rtw89_vif_get_main_macid` + the main port),
+    /// and its per-instance CAM entries return to the pools.
     /// Any TDLS peers admitted against it dissolve with it:
     /// their records die here, and the base returns to the
     /// pool exactly once. Idempotent: removing an unknown
@@ -1353,11 +1576,187 @@ impl Prepared8922a {
             .position(|vif| vif.base_macid == main_macid)
         {
             let vif = self.vifs.remove(index);
+            self.free_vif_links(&vif.links);
             self.vif_peers
                 .retain(|station| station.macid != vif.base_macid);
             self.ports_used[vif.port as usize] = false;
             self.pool.free(vif.base_macid);
         }
+    }
+
+    // ── Link-lifecycle H2C composition + framing (issue #2081) ──
+    //
+    // The transition composers (`link_h2c_8922a`) build the
+    // bodies from an admitted record plus a per-link VIF
+    // context; these methods build that context from the
+    // state this owner holds (the VIF's per-instance CAM
+    // allocation + own address, its port and role) plus the
+    // caller's per-transition inputs, frame each body with
+    // `fwcmd_8922a::frame_h2c` (identities in `LinkCmd`), and
+    // return the framed packets in Linux's send order, ready
+    // for `pci::submit_be_h2c` (CH12). The PCI owner submits
+    // them one at a time (`submit_be_mld_link_h2cs` /
+    // `submit_be_station_link_h2cs`); a failure mid-list
+    // leaves the earlier bodies sent.
+    //
+    // The VIF-level `rtw89_mac_vif_init` role/join/CAM/DMAC
+    // sequence is NOT built here (out of scope, issue #2081):
+    // these transitions cover the per-link add / assoc /
+    // disconnect / remove around an admitted station or MLD
+    // link only.
+
+    /// Compose + frame one MLD link's transition, identified
+    /// by `base_macid` + `link_id`, against the VIF
+    /// `vif_main_macid`, in Linux's send order. Station links
+    /// send nothing on add or remove (empty list); AP-mode
+    /// links send the pause + role CREATE + DMAC triple on
+    /// add and role REMOVE on remove; every link sends
+    /// join-info + CAM on assoc and on disconnect. The MLD's
+    /// port must match the VIF's port (`PortMismatch`
+    /// otherwise); `ap_or_tdls` follows the VIF role (AP-mode
+    /// VIFs only — an MLD TDLS peer is not admitted). Refused
+    /// for an unknown MLD, an unknown VIF, or an unadmitted
+    /// link id.
+    pub(super) fn mld_link_frames(
+        &self,
+        base_macid: u8,
+        link_id: u8,
+        vif_main_macid: u8,
+        transition: LinkTransition,
+        opts: &LinkH2cOpts,
+    ) -> Result<Vec<FramedLinkH2c>, Error> {
+        let mld = self.mld(base_macid).ok_or(Error::NoMld)?;
+        let vif = self.vif(vif_main_macid).ok_or(Error::NoVif)?;
+        if mld.port != vif.port {
+            return Err(Error::PortMismatch);
+        }
+        let link = mld
+            .link(link_id)
+            .ok_or(Error::LinkH2c(link_h2c_8922a::Error::LinkNotFound))?;
+        let ctx = Self::vif_link_ctx(vif, link.index, opts, vif.role == VifRole::Ap);
+        let view = LinkView::for_mld_link(mld, link, &ctx).map_err(Error::LinkH2c)?;
+        match transition {
+            LinkTransition::Add => self.frame_link_add(link_h2c_8922a::link_add_h2cs(&view)?),
+            LinkTransition::Assoc => self.frame_link_conn(link_h2c_8922a::link_assoc_h2cs(&view)?),
+            LinkTransition::Disconnect => {
+                self.frame_link_conn(link_h2c_8922a::link_disconnect_h2cs(&view)?)
+            }
+            LinkTransition::Remove => {
+                let mut frames = Vec::new();
+                if let Some(body) = link_h2c_8922a::link_remove_h2cs(&view)? {
+                    frames.push(self.frame_body(CMD_ROLE_MAINTAIN, &body)?);
+                }
+                Ok(frames)
+            }
+        }
+    }
+
+    /// Compose + frame one admitted single-link station's
+    /// transition (`macid`) against the VIF `vif_main_macid`,
+    /// in Linux's send order (same bodies as
+    /// [`Self::mld_link_frames`], instance 0). A TDLS peer (a
+    /// record in `vif_peers`) takes the AP/TDLS branch; a
+    /// pool station takes it only on an AP-mode VIF. An MLD
+    /// link MACID is refused (`NoStation`: links go through
+    /// [`Self::mld_link_frames`]). Refused for an unknown
+    /// station or VIF. The station record holds no port, so
+    /// the caller must pass the VIF the station was admitted
+    /// against — there is no port check here, unlike the MLD
+    /// path.
+    pub(super) fn station_link_frames(
+        &self,
+        macid: u8,
+        vif_main_macid: u8,
+        transition: LinkTransition,
+        opts: &LinkH2cOpts,
+    ) -> Result<Vec<FramedLinkH2c>, Error> {
+        let station = self.station(macid).ok_or(Error::NoStation)?;
+        let vif = self.vif(vif_main_macid).ok_or(Error::NoVif)?;
+        let ap_or_tdls =
+            vif.role == VifRole::Ap || self.vif_peers.iter().any(|peer| peer.macid == macid);
+        let ctx = Self::vif_link_ctx(vif, 0, opts, ap_or_tdls);
+        let view = LinkView::for_station(station, &ctx);
+        match transition {
+            LinkTransition::Add => self.frame_link_add(link_h2c_8922a::link_add_h2cs(&view)?),
+            LinkTransition::Assoc => self.frame_link_conn(link_h2c_8922a::link_assoc_h2cs(&view)?),
+            LinkTransition::Disconnect => {
+                self.frame_link_conn(link_h2c_8922a::link_disconnect_h2cs(&view)?)
+            }
+            LinkTransition::Remove => {
+                let mut frames = Vec::new();
+                if let Some(body) = link_h2c_8922a::link_remove_h2cs(&view)? {
+                    frames.push(self.frame_body(CMD_ROLE_MAINTAIN, &body)?);
+                }
+                Ok(frames)
+            }
+        }
+    }
+
+    /// The composer input for one VIF link instance: the held
+    /// per-instance context (own address, CAM indices) plus
+    /// the VIF's port and the caller's per-transition inputs.
+    fn vif_link_ctx(vif: &Vif, index: usize, opts: &LinkH2cOpts, ap_or_tdls: bool) -> VifLinkCtx {
+        let link = &vif.links[index];
+        VifLinkCtx {
+            own: link.own,
+            port: vif.port,
+            wmm: opts.wmm,
+            trigger: opts.trigger,
+            bssid: opts.bssid,
+            addr_cam_idx: link.addr_cam_idx,
+            bssid_cam_idx: link.bssid_cam_idx,
+            bssid_valid: opts.bssid_valid,
+            ap_or_tdls,
+            addr_cam_v0: opts.addr_cam_v0,
+            macid_pause_sleep: opts.macid_pause_sleep,
+        }
+    }
+
+    /// Frame one link-lifecycle body with its `LinkCmd`
+    /// identity (sequence from the shared allocator).
+    fn frame_body(&self, cmd: LinkCmd, body: &[u8]) -> Result<FramedLinkH2c, Error> {
+        let mut bytes = vec![0u8; H2C_HEADER_LEN + body.len()];
+        let (framed, len) = self
+            .frame_h2c(cmd.cmd, body, cmd.rec_ack, cmd.done_ack, &mut bytes)
+            .ok_or(Error::Transport(tx_8922a::Error::BadFrame))?;
+        bytes.truncate(len);
+        Ok(FramedLinkH2c { framed, bytes })
+    }
+
+    /// Frame a `LinkAdd` in Linux's send order: MACID
+    /// unpause, role-maintain CREATE, default DMAC. (The
+    /// default CMAC between role and DMAC is admission's,
+    /// already built — never re-sent here.)
+    fn frame_link_add(&self, add: LinkAdd) -> Result<Vec<FramedLinkH2c>, Error> {
+        let mut frames = Vec::new();
+        if let Some(pause) = add.pause {
+            let cmd = pause.cmd();
+            let body = match &pause {
+                MacidPause::Plain(body) => &body[..],
+                MacidPause::Sleep(body) => &body[..],
+            };
+            frames.push(self.frame_body(cmd, body)?);
+        }
+        if let Some(role) = add.role {
+            frames.push(self.frame_body(CMD_ROLE_MAINTAIN, &role)?);
+        }
+        if let Some(dmac) = add.dmac {
+            frames.push(self.frame_body(CMD_DMAC_V2, &dmac)?);
+        }
+        Ok(frames)
+    }
+
+    /// Frame a `LinkConn` in Linux's send order: join-info,
+    /// then the CAM update.
+    fn frame_link_conn(&self, conn: LinkConn) -> Result<Vec<FramedLinkH2c>, Error> {
+        let mut frames = Vec::with_capacity(2);
+        frames.push(self.frame_body(CMD_JOIN_INFO, &conn.join)?);
+        let body = match &conn.cam {
+            CamBody::V0(body) => &body[..],
+            CamBody::V1(body) => &body[..],
+        };
+        frames.push(self.frame_body(CMD_CAM, body)?);
+        Ok(frames)
     }
 
     /// Reserve a data slot, build the header, and fill the TXBD —

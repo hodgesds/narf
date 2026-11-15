@@ -1118,7 +1118,8 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
     let vif_addr = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let main = match owner.add_vif(vif_addr, VifRole::Station) {
+    let link_addrs = [vif_addr, [0x02, 0x11, 0x22, 0x33, 0x44, 0x56]];
+    let main = match owner.add_vif(vif_addr, VifRole::Station, link_addrs) {
         Ok(main) => main,
         Err(_) => return TestResult::Fail("add_vif failed"),
     };
@@ -1141,7 +1142,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
     {
         return TestResult::Fail("vif_by_addr mismatch");
     }
-    if owner.add_vif(vif_addr, VifRole::Station) != Err(Error::VifExists) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Err(Error::VifExists) {
         return TestResult::Fail("duplicate VIF address accepted");
     }
     // The TDLS peer takes the VIF main MACID, not a pool
@@ -1179,7 +1180,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     if owner.admit_tdls_peer(0, &base_req()) != Ok(0) {
@@ -1198,7 +1199,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Ap) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Ap, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     if owner.admit_tdls_peer(0, &base_req()) != Err(Error::NotStationMode) {
@@ -1211,7 +1212,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     let mut wrong_port = base_req();
@@ -1234,7 +1235,7 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // Five VIFs take the five hardware ports (mains 0..4).
     for i in 0..5u8 {
         let addr = [0x02, 0, 0, 0, 0, i];
-        let main = match owner.add_vif(addr, VifRole::Station) {
+        let main = match owner.add_vif(addr, VifRole::Station, [addr, [0x02, 0, 0, 0, 1, i]]) {
             Ok(main) => main,
             Err(_) => return TestResult::Fail("add_vif failed"),
         };
@@ -1248,7 +1249,12 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // The sixth VIF has no port: refused, and the MACID its
     // failed admission allocated is freed again (the next
     // pool station takes it).
-    if owner.add_vif([0x02, 0, 0, 0, 0, 5], VifRole::Station) != Err(Error::NoPort) {
+    if owner.add_vif(
+        [0x02, 0, 0, 0, 0, 5],
+        VifRole::Station,
+        [[0x02, 0, 0, 0, 0, 5], [0x02, 0, 0, 0, 1, 5]],
+    ) != Err(Error::NoPort)
+    {
         return TestResult::Fail("sixth VIF not refused");
     }
     if owner.admit_station(&base_req()) != Ok(5) {
@@ -1257,7 +1263,11 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // Removing a VIF frees its port and base together.
     owner.release_station(5);
     owner.remove_vif(2);
-    let main = match owner.add_vif([0x02, 0, 0, 0, 0, 6], VifRole::Station) {
+    let main = match owner.add_vif(
+        [0x02, 0, 0, 0, 0, 6],
+        VifRole::Station,
+        [[0x02, 0, 0, 0, 0, 6], [0x02, 0, 0, 0, 1, 6]],
+    ) {
         Ok(main) => main,
         Err(_) => return TestResult::Fail("VIF re-add after removal failed"),
     };

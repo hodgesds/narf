@@ -21,8 +21,8 @@ use super::chan::{
     freq_to_band_chan, Band, JoinInfo, DEFAULT_BAND, DEFAULT_CHAN, DEFAULT_FREQ_MHZ,
     JOININFO_W0_BAND, JOININFO_W0_ISHESTA, JOININFO_W0_MACID_MASK, JOININFO_W0_NET_TYPE_SHIFT,
     JOININFO_W0_OP, JOININFO_W0_PORT_ID_SHIFT, JOININFO_W0_SELF_ROLE_SHIFT,
-    JOININFO_W0_WIFI_ROLE_SHIFT, NET_TYPE_AP_MODE, NET_TYPE_INFRA, NET_TYPE_NO_LINK,
-    SELF_ROLE_CLIENT, SELF_ROLE_NONE, WIFI_ROLE_STATION,
+    JOININFO_W0_WIFI_ROLE_SHIFT, NET_TYPE_AP_MODE, NET_TYPE_INFRA, NET_TYPE_NO_LINK, SELF_ROLE_AP,
+    SELF_ROLE_AP_CLIENT, SELF_ROLE_CLIENT, WIFI_ROLE_AP, WIFI_ROLE_NONE, WIFI_ROLE_STATION,
 };
 use super::datapath::{consume_rx_bd, stage_tx, RxChannelState, TxChannelState};
 use super::dma::{
@@ -1398,8 +1398,15 @@ fn smoke_rtw89_joininfo_constants() -> TestResult {
     if NET_TYPE_NO_LINK != 0 || NET_TYPE_INFRA != 2 || NET_TYPE_AP_MODE != 3 {
         return TestResult::Fail("NET_TYPE values drift");
     }
-    // Wi-Fi role / Self role values.
-    if WIFI_ROLE_STATION != 0 || SELF_ROLE_NONE != 0 || SELF_ROLE_CLIENT != 1 {
+    // Wi-Fi role / Self role values (`core.h`: wifi NONE=0,
+    // STATION=1, AP=2; self CLIENT=0, AP=1, AP_CLIENT=2).
+    if WIFI_ROLE_NONE != 0
+        || WIFI_ROLE_STATION != 1
+        || WIFI_ROLE_AP != 2
+        || SELF_ROLE_CLIENT != 0
+        || SELF_ROLE_AP != 1
+        || SELF_ROLE_AP_CLIENT != 2
+    {
         return TestResult::Fail("role enum drift");
     }
     TestResult::Pass
@@ -1426,7 +1433,7 @@ fn smoke_rtw89_joininfo_for_assoc() -> TestResult {
     if net != NET_TYPE_INFRA as u32 {
         return TestResult::Fail("NET_TYPE not INFRA");
     }
-    // SELF_ROLE = CLIENT in bits[31:30] = 0b01.
+    // SELF_ROLE = CLIENT in bits[31:30] = 0b00.
     let sr = (w0 >> JOININFO_W0_SELF_ROLE_SHIFT) & 0x3;
     if sr != SELF_ROLE_CLIENT as u32 {
         return TestResult::Fail("SELF_ROLE not CLIENT");
