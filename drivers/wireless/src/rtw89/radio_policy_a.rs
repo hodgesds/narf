@@ -30,11 +30,10 @@
 //! unprovisioned board stays unadmitted.
 //!
 //! The A RF program itself (`radio_a::Radio`, the `preflight_radio_a` /
-//! `prepare_radio_a` owner) does not exist yet: this module is the signed
-//! program the owner will install, not the owner. Installing an
-//! `OrdinaryGrant::A` without the owner having run the recipe would admit
-//! ordinary TX without the measured RF program, so no production path
-//! installs the grant from here.
+//! `prepare_radio_a` owner) installs this signed program, not the other
+//! way round. Installing an `OrdinaryGrant::A` without the owner having
+//! run the recipe would admit ordinary TX without the measured RF program,
+//! so no production path installs the grant from here.
 use super::operating_channel::{Profile, Width};
 pub(super) use super::radio_policy::Lifecycle;
 use super::radio_policy::Program;

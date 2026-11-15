@@ -161,6 +161,7 @@ mod qos;
 mod ra_mask;
 mod ra_v1;
 mod radio_51;
+mod radio_a;
 mod radio_assets;
 mod radio_be;
 mod radio_c;

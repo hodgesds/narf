@@ -67,6 +67,8 @@ pub struct Startup {
     radio_c: super::radio_c::Radio,
     /// RTL8851B radio owner (`radio_51`); unused on B and C.
     radio_51: super::radio_51::Radio,
+    /// RTL8852A radio owner (`radio_a`); unused on B, C and RTL8851B.
+    radio_a: super::radio_a::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
     /// AP-role control owner (`startup_ap.rs`); exclusive with the station.
@@ -149,6 +151,7 @@ impl Startup {
             full_radio: super::radio_full::Radio::default(),
             radio_c: super::radio_c::Radio::default(),
             radio_51: super::radio_51::Radio::default(),
+            radio_a: super::radio_a::Radio::default(),
             station_controller: None,
             station_binding: None,
             ap_controller: None,
@@ -332,6 +335,67 @@ impl Startup {
                     .transport_mut()
                     .prepare_radio_51(
                         &mut owner.radio_51,
+                        &owner.radio,
+                        assets,
+                        &mut owner.coex,
+                        profile,
+                        preflight,
+                    )
+                    .await
+            }
+            .map_err(Error::Register)?;
+            owner.phase = Phase::RadioReady;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// RTL8852A radio bring-up for one typed `profile` after the RTL8852A
+    /// tables: the pure `Native::preflight_radio_a` (`N5AB` v1
+    /// calibration, `N5AB` v2 base and `N5AC` records; a missing record is
+    /// retryable and touches nothing), then `Native::prepare_radio_a`
+    /// (WLAN-only coex init, phy.c `rtw89_phy_dm_init` with
+    /// `rtw8852a_bb_sethw`, `rtw8852a_rfk_init`, power trim) admitted only
+    /// when the staged records admit exactly `profile`. Any failure after
+    /// the preflight terminalizes this owner. Success is `RadioReady` with
+    /// the RTL8852A ordinary grant installed; no channel is programmed
+    /// yet (the A `set_channel` owner follows #2098).
+    pub(super) async fn prepare_radio_a(
+        &mut self,
+        profile: super::operating_channel::Profile,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::RadioTablesLoaded
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852A)
+        {
+            return Err(Error::Terminal);
+        }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        let preflight = firmware
+            .transport_mut()
+            .preflight_radio_a(self.assets.as_ref().ok_or(Error::Terminal)?)
+            .map_err(Error::Register)?;
+        self.phase = Phase::FullRadioPreparing;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            let firmware = owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            let assets = owner.assets.as_ref().ok_or(Error::Terminal)?;
+            // SAFETY: same retained actual cold/firmware/MAC/RX/table owner;
+            // the outer guard terminalizes Native and retains DMA on failure.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_radio_a(
+                        &mut owner.radio_a,
                         &owner.radio,
                         assets,
                         &mut owner.coex,

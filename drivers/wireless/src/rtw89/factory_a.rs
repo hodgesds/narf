@@ -75,4 +75,19 @@ impl Calibration {
         result.pa_programmed = result.pa_bias.iter().any(|&v| v != 255);
         Some(result)
     }
+    /// rtw8852a.c `rtw8852a_thermal_trim` `__thm_setting` (`rtw8852a.c:788`):
+    /// RR_TM2 OFF value. Linux masks `0x1f` here; the C sibling
+    /// (`factory_c::thermal_setting`) masks `0x0e` instead, which is a
+    /// C-only divergence to leave alone, not a pattern to copy.
+    pub fn thermal_setting(&self, path: usize) -> Option<u8> {
+        let raw = *self.thermal_trim.get(path)?;
+        self.thermal_programmed
+            .then_some(((raw & 1) << 3) | ((raw & 0x1f) >> 1))
+    }
+    /// rtw8852a.c `rtw8852a_pa_bias_trim`: (RR_BIASA_TXG, RR_BIASA_TXA),
+    /// low nibble then high nibble of the programmed PA bias byte.
+    pub fn pa_bias_setting(&self, path: usize) -> Option<(u8, u8)> {
+        let raw = *self.pa_bias.get(path)?;
+        self.pa_programmed.then_some((raw & 0x0f, raw >> 4))
+    }
 }
