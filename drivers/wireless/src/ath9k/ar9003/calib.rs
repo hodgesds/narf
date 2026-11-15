@@ -15,9 +15,11 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 //! AR9300 initial and periodic calibration of one full-reset 20 MHz
-//! channel: `ar9003_phy.c::ar9003_hw_init_bb`, the PCOEM
-//! `ar9003_calib.c::ar9003_hw_init_cal_pcoem` (AR9300 has neither
-//! `ATH9K_HW_CAP_RTT` nor MCI), the `ath9k_hw_reset` tail's
+//! channel: `ar9003_phy.c::ar9003_hw_init_bb`, the init calibration
+//! (`ar9003_calib.c::ar9003_hw_init_cal_pcoem` on PCOEM parts,
+//! `ar9003_hw_init_cal_soc` on AR9300/AR9580 — routed by
+//! `AR_SREV_9003_PCOEM`, `reg.h:913-914`, i.e. 9462/9485/9565 only,
+//! `ar9003_calib.c:1686-1690`), the `ath9k_hw_reset` tail's
 //! `ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`, and the periodic
 //! `ar9003_hw_calibrate` driven by `link.c::ath_ani_calibrate` (ANI is not
 //! part of this owner), with the per-chip `ar9003_hw_set_nf_limits` limits
@@ -37,8 +39,11 @@
 //! with its not-9485 `CORR_COEFF_B1/B2` table); the saved coefficients
 //! are the `TXIQCAL_DONE` state `Calibration::fast_channel_change`
 //! `ar9003_hw_tx_iq_cal_reload`s (not-9485 table likewise). On AR9300
-//! neither runs, exactly as before. The periodic RX IQ calibration
-//! aborts on a saturated (±63) coefficient on AR9565
+//! and AR9580 (`init_cal_soc`) the TX IQ calibration instead runs as
+//! its own step before the AGC calibration — `ar9003_hw_tx_iq_cal_run`
+//! plus the ACTIVE toggle — with the post-processing after the AGC
+//! poll, because `TX_IQ_ON_AGC_CAL` is clear there. The periodic RX IQ
+//! calibration aborts on a saturated (±63) coefficient on AR9565
 //! (`ar9003_calib.c:274`); the calibration is still marked done, only
 //! the writes and the `IQCORR_ENABLE` are skipped.
 //!
@@ -57,16 +62,22 @@
 //! headers @ `cbbddb6`), so the fixture states the bit per case and no
 //! reset value is assumed.
 //!
-//! TX IQ calibration as Linux runs it on AR9300: `ar9003_hw_init_cal_settings`
-//! enables `TX_IQ_CAL`, so `init_cal_pcoem` programs the
-//! `AR_PHY_TX_IQCAL_CONTROL_1` `DELPT` field; without `TX_IQ_ON_AGC_CAL`
-//! `txiqcal_done` stays false, `ath9k_hw_reset` cleared `TXIQCAL_DONE`, and
-//! neither `ar9003_hw_tx_iq_cal_post_proc` nor `_reload` runs.
+//! TX IQ calibration as Linux runs it on AR9300/AR9580:
+//! `ar9003_hw_init_cal_settings` enables `TX_IQ_CAL`, so the SoC path
+//! programs the `AR_PHY_TX_IQCAL_CONTROL_1` `DELPT` field, runs the
+//! separate `ar9003_hw_tx_iq_cal_run` (the ACTIVE toggle follows it),
+//! and runs `ar9003_hw_tx_iq_cal_post_proc` after the AGC calibration
+//! — never the `TX_IQ_ON_AGC_CAL` enable-and-post-proc shape, and never
+//! a reload: a SoC fast channel change re-runs the TX IQ calibration
+//! fresh.
 //!
 //! The carrier-leak table copy into `caldata->tx_clcal` is kept in the
-//! `Report` (`TxClCal`): `run` saves it through
+//! `Report` (`TxClCal`) on PCOEM parts only: `run` saves it through
 //! `ar9003_hw_cl_cal_post_proc` when the AGC calibration reports
 //! `CLC_SUCCESS`, and `Calibration::fast_channel_change` re-applies it.
+//! `init_cal_soc` never calls `cl_cal_post_proc` (its only caller is
+//! `init_cal_pcoem`, `ar9003_calib.c:1525`), so on AR9300/AR9580 the
+//! report carries no table and a fast channel change re-applies none.
 //! `ath9k_hw_reset` clears `TXCLCAL_DONE` before every full-reset
 //! `init_cal` (`hw.c`), and zeroes the whole `caldata` when the channel
 //! changes — so a full reset never consumes the saved table, and only a
@@ -77,11 +88,16 @@
 //! `tx_iq_cal_reload`); the owner's retunes are still full generation
 //! resets, so it has no owner caller yet.
 //!
-//! The SoC init path (`ar9003_hw_init_cal_soc`) is ported where it does
-//! not need an SoC chip: `ar9003_hw_tx_iq_cal_run` and
-//! `ar9003_hw_dynamic_osdac_selection` (AR9550 2 GHz only, from that
-//! path). No modeled chip takes the SoC path, so neither has a live
-//! caller; both are fixture-tested for the day an SoC part is modeled.
+//! The SoC init path (`ar9003_hw_init_cal_soc`,
+//! `ar9003_calib.c:1576-1679`) is the live path for AR9300/AR9580: the
+//! separate TX IQ run (`ar9003_hw_tx_iq_cal_run` + ACTIVE toggle) when
+//! `TX_IQ_ON_AGC_CAL` is clear, the manual peak calibration per RX
+//! chain BEFORE the AGC poll, no CL `RX_DELAY` save/restore dance, and
+//! no `cl_cal_post_proc`. The peak calibration's band LNA gain-override
+//! clear is PCOEM-only (`ar9003_calib.c:1213`); a SoC part keeps the
+//! INI-programmed override. `ar9003_hw_dynamic_osdac_selection`
+//! (AR9550 2 GHz only, from that path) still has no live caller: no
+//! AR9550 is modeled.
 //!
 //! Not ported: the AR9550 three-pass `ar955x_tx_iq_cal_median` (no
 //! AR9550 is modeled in `Revision::Chip`, and the median belongs to the
@@ -328,22 +344,38 @@ async fn wait_clear(
     }
 }
 
-/// `ar9003_hw_manual_peak_cal` for one chain on an `AR_SREV_9003_PCOEM`
-/// part (peak-detect threshold 0); returns the CALDAC the binary search
-/// settled on.
+/// `do_ar9003_agc_cal` (`ar9003_calib.c:1558`): trigger the AGC
+/// calibration and poll for completion. Returns whether it completed;
+/// both init paths treat a timeout as a failed calibration.
+async fn do_agc_cal(io: &mut impl Io) -> Result<bool, BringUpError> {
+    let agc = read(io, AR_PHY_AGC_CONTROL)?;
+    write(io, AR_PHY_AGC_CONTROL, agc | AGC_CAL)?;
+    wait_clear(io, AR_PHY_AGC_CONTROL, AGC_CAL, AH_WAIT_TIMEOUT).await
+}
+
+/// `ar9003_hw_manual_peak_cal` for one chain (peak-detect threshold 0
+/// on every modeled chip — 8 on AR9550/AR9531, 11 on AR9561,
+/// `ar9003_calib.c:1199-1203`, none of which is modeled). The band LNA
+/// gain-override clear is PCOEM-only (`ar9003_calib.c:1213`:
+/// `AR_SREV_9003_PCOEM || AR_SREV_9330_11`); `pcoem` gates it, so a SoC
+/// part keeps the INI-programmed override. Returns the CALDAC the
+/// binary search settled on.
 fn manual_peak_cal(
     io: &mut impl RegisterIo,
     chain: usize,
     two_ghz: bool,
+    pcoem: bool,
 ) -> Result<u8, BringUpError> {
     let (gain, rxtx2, agc) = (GAINSTAGES[chain], RXTX2[chain], RXRF_AGC[chain]);
     // Turn off LNA/SW (RX_OVERRIDE, LNAON_CALDC, the band LNA gain override).
     field(io, gain, 0x8000_0000, 31, 1)?;
     field(io, gain, 0x2, 1, 0)?;
-    if two_ghz {
-        field(io, gain, 0x7000_0000, 28, 0)?;
-    } else {
-        field(io, gain, 0x0380_0000, 23, 0)?;
+    if pcoem {
+        if two_ghz {
+            field(io, gain, 0x7000_0000, 28, 0)?;
+        } else {
+            field(io, gain, 0x0380_0000, 23, 0)?;
+        }
     }
     // Turn off RXON.
     field(io, rxtx2, 0x1000, 12, 1)?;
@@ -409,10 +441,16 @@ pub struct Report {
     pub carrier_leak: Option<bool>,
     /// `ath9k_hw_get_default_nf` per control chain.
     pub default_nf: [i16; 3],
-    /// `ar9003_hw_tx_iq_cal_post_proc`'s saved coefficients
-    /// (`TXIQCAL_DONE`): `Some` only on `TX_IQ_ON_AGC_CAL` chips when the
-    /// post-processing succeeded; `None` on AR9300/AR9580 and when the TX
-    /// IQ calibration failed.
+    /// `ar9003_hw_tx_iq_cal_post_proc`'s saved coefficients: `Some`
+    /// when the post-processing succeeded — on `TX_IQ_ON_AGC_CAL` chips
+    /// after the AGC calibration, on AR9300/AR9580 after the separate
+    /// TX IQ run (`ar9003_hw_init_cal_soc`); `None` when the TX IQ
+    /// calibration failed or did not run. Linux's SoC call passes
+    /// `is_reusable=false`, so the `TXIQCAL_DONE` cal-flag stays clear
+    /// there; the report records the coefficients the post-processing
+    /// applied (tables written, `IQCORR_EN` set), which no SoC consumer
+    /// reads back — a SoC fast channel change re-runs the TX IQ
+    /// calibration fresh instead of reloading.
     pub tx_iq_cal: Option<TxIqCal>,
     /// `ar9003_hw_override_ini`'s `TX_IQ_CAL` decision for the generation
     /// this report calibrates (see the module docs): `init_cal_settings`'
@@ -423,10 +461,11 @@ pub struct Report {
     /// `ar9003_hw_cl_cal_post_proc`'s saved carrier-leak table
     /// (`caldata->tx_clcal`, `TXCLCAL_DONE`): `Some` only when the
     /// carrier-leak calibration ran and the AGC calibration reported
-    /// `CLC_SUCCESS`; `None` when it did not run or did not succeed. A
-    /// full reset never consumes it (`ath9k_hw_reset` clears
-    /// `TXCLCAL_DONE` before every full-reset `init_cal`); only
-    /// `Calibration::fast_channel_change` re-applies it.
+    /// `CLC_SUCCESS`; `None` when it did not run or did not succeed.
+    /// PCOEM only: `init_cal_soc` never calls `cl_cal_post_proc`, so it
+    /// is always `None` on AR9300/AR9580. A full reset never consumes it
+    /// (`ath9k_hw_reset` clears `TXCLCAL_DONE` before every full-reset
+    /// `init_cal`); only `Calibration::fast_channel_change` re-applies it.
     pub tx_clcal: Option<TxClCal>,
 }
 
@@ -451,17 +490,23 @@ impl Calibration {
         self.report
     }
 
-    /// `ar9003_hw_init_bb` then `ar9003_hw_init_cal_pcoem` for the channel
-    /// `prepared` describes, with runtime chain masks equal to the chip's.
-    /// The channel's calibration data is fresh (`TXCLCAL_DONE` and
-    /// `TXIQCAL_DONE` clear, as `ath9k_hw_reset` leaves them). The IQ
-    /// mismatch calibration is left running (`ar9003_hw_init_cal_common`);
-    /// `Periodic::start` performs the reset tail's NF load. `revision`
-    /// gates the per-chip branches: `TX_IQ_ON_AGC_CAL` (AR9485, AR9462,
-    /// AR9565) runs the TX IQ post-processing after the AGC calibration.
-    /// On AR9462/AR9565 `ar9003_hw_override_ini`'s `TX_IQ_CAL` readback
-    /// further gates both the `DELPT` program and that block (see the
-    /// module docs); the decision is carried in the `Report`.
+    /// `ar9003_hw_init_bb` then the init calibration for the channel
+    /// `prepared` describes, with runtime chain masks equal to the chip's:
+    /// `ar9003_hw_init_cal_pcoem` on PCOEM parts (AR9462, AR9485, AR9565),
+    /// `ar9003_hw_init_cal_soc` on AR9300/AR9580
+    /// (`ar9003_calib.c:1686-1690`). The channel's calibration data is
+    /// fresh (`TXCLCAL_DONE` and `TXIQCAL_DONE` clear, as `ath9k_hw_reset`
+    /// leaves them). The IQ mismatch calibration is left running
+    /// (`ar9003_hw_init_cal_common`); `Periodic::start` performs the
+    /// reset tail's NF load. `revision` gates the per-chip branches:
+    /// `TX_IQ_ON_AGC_CAL` (AR9485, AR9462, AR9565) runs the TX IQ
+    /// post-processing after the AGC calibration, while AR9300/AR9580 run
+    /// the separate TX IQ run before the AGC calibration and the peak
+    /// calibration before the AGC poll, with no CL `RX_DELAY` dance and
+    /// no `cl_cal_post_proc`. On AR9462/AR9565
+    /// `ar9003_hw_override_ini`'s `TX_IQ_CAL` readback further gates both
+    /// the `DELPT` program and that block (see the module docs); the
+    /// decision is carried in the `Report`.
     ///
     /// # Safety
     /// Exclusive identified AR9003 part directly after `phy::prepare` for
@@ -510,17 +555,91 @@ impl Calibration {
         if prepared.carrier_leak_cal {
             rmw(io, AR_PHY_CL_CAL_CTL, 0, AR_PHY_CL_CAL_ENABLE)?;
         }
-        // `ar9003_hw_init_cal_settings` (`:321-323`) + `init_cal_pcoem`:
-        // `TX_IQ_CAL` programs `DELPT`; on `TX_IQ_ON_AGC_CAL` chips the
-        // AGC calibration also runs the TX IQ calibration. On
-        // AR9462/AR9565 the `TX_IQ_CAL` half is further gated by
+        // `ar9003_hw_init_cal_settings` (`:321-323`): `TX_IQ_CAL` for
+        // `AR_SREV_9300_20_OR_LATER`, and `TX_IQ_ON_AGC_CAL` for
+        // `AR_SREV_9485_OR_LATER` non-9340. On AR9462/AR9565 the
+        // `TX_IQ_CAL` half is further gated by
         // `ar9003_hw_override_ini`'s `AR_PHY_TX_IQCAL_CONTROL_0`
         // readback (see the module docs), and `init_cal_pcoem` skips
         // both the `DELPT` program and the `TX_IQ_ON_AGC_CAL` block when
-        // it is clear.
+        // it is clear; `init_cal_soc` programs `DELPT` unconditionally
+        // for 20 MHz (NARF is 20 MHz only, so the half-/quarter-rate
+        // `skip_tx_iqcal` never applies).
         let cals = enabled_cals(revision);
         let tx_iq_enabled = tx_iq_cal_enabled(io, revision, &cals)?;
-        if tx_iq_enabled {
+        // The init calibration splits here: `init_cal_pcoem`
+        // (`ar9003_calib.c:1389-1550`) on PCOEM parts,
+        // `init_cal_soc` (`:1576-1679`) on AR9300/AR9580.
+        let (peak_caldac, tx_iq_cal, tx_clcal) = if revision.pcoem() {
+            if tx_iq_enabled {
+                field(
+                    io,
+                    tx_iqcal_control_1(revision.ar9485()),
+                    DELPT_MASK,
+                    DELPT_SHIFT,
+                    DELPT,
+                )?;
+            }
+            let txiqcal_done = if tx_iq_enabled && cals.tx_iq_on_agc_cal {
+                // Fresh channel calibration data: `TXIQCAL_DONE` is clear, as
+                // `ath9k_hw_reset` leaves it.
+                rmw(
+                    io,
+                    tx_iqcal_control_0(revision.ar9485()),
+                    0,
+                    TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
+                )?;
+                true
+            } else {
+                false
+            };
+            let clc = read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0;
+            let mut rx_delay = 0;
+            if clc {
+                rx_delay = read(io, AR_PHY_RX_DELAY)?;
+                write(io, AR_PHY_ACTIVE, 0)?;
+                io.delay_us(5);
+                write(io, AR_PHY_RX_DELAY, AR_PHY_RX_DELAY_DELAY)?;
+                write(io, AR_PHY_ACTIVE, 1)?;
+            }
+            // Full reset (no AH_FASTCC): calibrate the AGC, poll, and run the
+            // manual peak calibration whatever the poll returned.
+            let status = do_agc_cal(io).await?;
+            let mut peak_caldac = [None; 3];
+            for chain in chains(rx) {
+                peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five, true)?);
+            }
+            if read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0 {
+                write(io, AR_PHY_RX_DELAY, rx_delay)?;
+                io.delay_us(5);
+            }
+            if !status {
+                // "offset calibration failed to complete": ath9k_hw_reset -EIO.
+                return Err(BringUpError::Timeout);
+            }
+            // `init_cal_pcoem`: the TX IQ post-processing runs before
+            // `ar9003_hw_cl_cal_post_proc`; a failed TX IQ calibration leaves
+            // no coefficients and the reset continues.
+            let tx_iq_cal = if txiqcal_done {
+                tx_iq_cal_post_proc(io, revision, tx)?
+            } else {
+                None
+            };
+            // `ar9003_hw_cl_cal_post_proc(ah, true)`: with `TXCLCAL_DONE`
+            // clear (fresh channel calibration data, as `ath9k_hw_reset`
+            // leaves it) a successful carrier-leak calibration saves the
+            // table into the report; a fast channel change reloads it, a
+            // full reset never does. Linux gates on
+            // `enabled_cals & TX_CL_CAL`; here that is
+            // `prepared.carrier_leak_cal`, the INI `AR_PHY_CL_CAL_ENABLE`
+            // fact `run` already uses for the `CL_CAL_CTL` program.
+            let tx_clcal = if prepared.carrier_leak_cal {
+                cl_cal_post_proc(io, tx, None)?
+            } else {
+                None
+            };
+            (peak_caldac, tx_iq_cal, tx_clcal)
+        } else {
             field(
                 io,
                 tx_iqcal_control_1(revision.ar9485()),
@@ -528,70 +647,46 @@ impl Calibration {
                 DELPT_SHIFT,
                 DELPT,
             )?;
-        }
-        let txiqcal_done = if tx_iq_enabled && cals.tx_iq_on_agc_cal {
-            // Fresh channel calibration data: `TXIQCAL_DONE` is clear, as
-            // `ath9k_hw_reset` leaves it.
-            rmw(
-                io,
-                tx_iqcal_control_0(revision.ar9485()),
-                0,
-                TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
-            )?;
-            true
-        } else {
-            false
+            // `init_cal_soc` (`:1614-1626`): on `TX_IQ_ON_AGC_CAL` chips
+            // the `ENABLE_TXIQ_CAL` bit is read live (AR9550 in SoC form;
+            // no modeled chip takes that arm); otherwise the separate TX
+            // IQ run. A timeout is "not done" and the AGC calibration
+            // runs alone — the ACTIVE toggle follows the run either way.
+            let txiqcal_done = if cals.tx_iq_on_agc_cal {
+                read(io, tx_iqcal_control_0(revision.ar9485()))? & TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL
+                    != 0
+            } else {
+                let done = tx_iq_cal_run(io, revision.ar9485()).await?;
+                write(io, AR_PHY_ACTIVE, 0)?;
+                io.delay_us(5);
+                write(io, AR_PHY_ACTIVE, 1)?;
+                done
+            };
+            // Full reset (no AH_FASTCC): the manual peak calibration runs
+            // per RX chain BEFORE the AGC poll (`:1630-1648`).
+            let mut peak_caldac = [None; 3];
+            for chain in chains(rx) {
+                peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five, false)?);
+            }
+            // `do_ar9003_agc_cal`; a timeout fails the init calibration
+            // here — no post-processing, no chainmask revert (`:1651-1654`).
+            if !do_agc_cal(io).await? {
+                return Err(BringUpError::Timeout);
+            }
+            let tx_iq_cal = if txiqcal_done {
+                tx_iq_cal_post_proc(io, revision, tx)?
+            } else {
+                None
+            };
+            // No `cl_cal_post_proc` in soc — its only caller is pcoem
+            // (`:1525`) — so no carrier-leak table is saved.
+            (peak_caldac, tx_iq_cal, None)
         };
-        let clc = read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0;
-        let mut rx_delay = 0;
-        if clc {
-            rx_delay = read(io, AR_PHY_RX_DELAY)?;
-            write(io, AR_PHY_ACTIVE, 0)?;
-            io.delay_us(5);
-            write(io, AR_PHY_RX_DELAY, AR_PHY_RX_DELAY_DELAY)?;
-            write(io, AR_PHY_ACTIVE, 1)?;
-        }
-        // Full reset (no AH_FASTCC): calibrate the AGC, poll, and run the
-        // manual peak calibration whatever the poll returned.
-        let agc = read(io, AR_PHY_AGC_CONTROL)?;
-        write(io, AR_PHY_AGC_CONTROL, agc | AGC_CAL)?;
-        let status = wait_clear(io, AR_PHY_AGC_CONTROL, AGC_CAL, AH_WAIT_TIMEOUT).await?;
-        let mut peak_caldac = [None; 3];
-        for chain in chains(rx) {
-            peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five)?);
-        }
-        if read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0 {
-            write(io, AR_PHY_RX_DELAY, rx_delay)?;
-            io.delay_us(5);
-        }
-        if !status {
-            // "offset calibration failed to complete": ath9k_hw_reset -EIO.
-            return Err(BringUpError::Timeout);
-        }
-        // `init_cal_pcoem`: the TX IQ post-processing runs before
-        // `ar9003_hw_cl_cal_post_proc`; a failed TX IQ calibration leaves
-        // no coefficients and the reset continues.
-        let tx_iq_cal = if txiqcal_done {
-            tx_iq_cal_post_proc(io, revision, tx)?
-        } else {
-            None
-        };
-        // ar9003_hw_cl_cal_post_proc's CLC_SUCCESS sample.
+        // `ar9003_hw_cl_cal_post_proc`'s CLC_SUCCESS sample, shared by
+        // both paths: the AGC calibration ran with `CL_CAL_ENABLE` set
+        // when `prepared.carrier_leak_cal`.
         let carrier_leak = if prepared.carrier_leak_cal {
             Some(read(io, AR_PHY_AGC_CONTROL)? & AGC_CLC_SUCCESS != 0)
-        } else {
-            None
-        };
-        // `ar9003_hw_cl_cal_post_proc(ah, true)`: with `TXCLCAL_DONE`
-        // clear (fresh channel calibration data, as `ath9k_hw_reset`
-        // leaves it) a successful carrier-leak calibration saves the
-        // table into the report; a fast channel change reloads it, a
-        // full reset never does. Linux gates on
-        // `enabled_cals & TX_CL_CAL`; here that is
-        // `prepared.carrier_leak_cal`, the INI `AR_PHY_CL_CAL_ENABLE`
-        // fact `run` already uses for the `CL_CAL_CTL` program.
-        let tx_clcal = if prepared.carrier_leak_cal {
-            cl_cal_post_proc(io, tx, None)?
         } else {
             None
         };
@@ -624,26 +719,30 @@ impl Calibration {
         Ok(report)
     }
 
-    /// `ar9003_hw_init_cal_pcoem` with `AH_FASTCC` set, for a channel
+    /// The init calibration with `AH_FASTCC` set, for a channel
     /// change onto `prepared` from the channel `saved` calibrates: the
     /// `ath9k_hw_channel_change` tail of Linux's
     /// `ath9k_hw_do_fastcc` (`hw.c`), without the synth retune and INI
     /// reload that belong to the owner's channel change (this owner has
     /// none yet). `saved` is the previous generation's `Report`, carried
     /// across the change — the `caldata` Linux keeps for the `ath_hw`
-    /// lifetime. On a `TX_IQ_ON_AGC_CAL` chip the AGC calibration and
-    /// the TX IQ post-processing re-run fresh, exactly as Linux's
-    /// `init_cal_pcoem` runs them (`txiqcal_done = run_agc_cal = true`
-    /// there); on other chips the saved coefficients are reloaded
-    /// (`tx_iq_cal_reload`) when `saved` carries them, and the saved
-    /// carrier-leak table is re-applied when `saved` carries it. When a
-    /// saved state is absent the corresponding calibration re-runs
-    /// (AGC calibration when no carrier-leak table was saved), so the
-    /// change still completes — the `ath9k_hw_do_fastcc` AR9462 reuse
-    /// guard (`TXIQCAL_DONE && TXCLCAL_DONE && RTT_DONE`) is a
-    /// channel-change decision, not an `init_cal` property, and belongs
-    /// to the future owner retune path; NARF has no RTT, so no modeled
-    /// chip can satisfy it yet.
+    /// lifetime. On a PCOEM part, on a `TX_IQ_ON_AGC_CAL` chip the AGC
+    /// calibration and the TX IQ post-processing re-run fresh, exactly as
+    /// Linux's `init_cal_pcoem` runs them
+    /// (`txiqcal_done = run_agc_cal = true` there); on other chips the
+    /// saved coefficients are reloaded (`tx_iq_cal_reload`) when `saved`
+    /// carries them, and the saved carrier-leak table is re-applied when
+    /// `saved` carries it. On a SoC part (AR9300/AR9580) the TX IQ
+    /// calibration, the AGC calibration and the peak calibration all
+    /// re-run fresh, exactly as Linux's `init_cal_soc` runs them — no
+    /// reload, no carrier-leak table re-apply. When a saved state is
+    /// absent the corresponding calibration re-runs (AGC calibration when
+    /// no carrier-leak table was saved), so the change still completes —
+    /// the `ath9k_hw_do_fastcc` AR9462 reuse guard
+    /// (`TXIQCAL_DONE && TXCLCAL_DONE && RTT_DONE`) is a channel-change
+    /// decision, not an `init_cal` property, and belongs to the future
+    /// owner retune path; NARF has no RTT, so no modeled chip can satisfy
+    /// it yet.
     ///
     /// # Safety
     /// The caller owns the channel change: TX stopped with nothing
@@ -690,32 +789,125 @@ impl Calibration {
 
         // Use chip chainmask only for calibration.
         set_chain_masks(io, identity, rx, prepared.selfgen_mask)?;
-        // `ar9003_hw_init_cal_pcoem`'s `TX_CL_CAL` branch: a saved table
-        // (`TXCLCAL_DONE`) clears `CL_CAL_ENABLE`; without one the
-        // carrier-leak calibration is enabled and forces the AGC
-        // calibration.
-        let mut run_agc_cal = false;
-        if prepared.carrier_leak_cal {
-            if saved.tx_clcal.is_some() {
-                rmw(io, AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE, 0)?;
-            } else {
-                rmw(io, AR_PHY_CL_CAL_CTL, 0, AR_PHY_CL_CAL_ENABLE)?;
-                run_agc_cal = true;
-            }
-        }
-        // `skip_tx_iqcal`: NARF is 20 MHz only, so there is no half- or
-        // quarter-rate channel to skip for. `TX_IQ_CAL` programs
-        // `DELPT`; on `TX_IQ_ON_AGC_CAL` chips the AGC calibration also
-        // runs the TX IQ calibration — fresh whenever the saved
-        // coefficients are absent, and (Linux's unconditional
-        // `txiqcal_done = run_agc_cal = true`) whenever they are present.
-        // The decision is the carried `override_ini` one from `saved`
-        // (see the module docs), not a fresh readback: `init_cal_pcoem`
-        // rewrites `AR_PHY_TX_IQCAL_CONTROL_0`, so a re-read would
-        // disagree with the `enabled_cals` Linux keeps.
+        // The init calibration splits here, as in `run`: `init_cal_pcoem`
+        // (`ar9003_calib.c:1389-1550`) on PCOEM parts,
+        // `init_cal_soc` (`:1576-1679`) on AR9300/AR9580.
         let cals = enabled_cals(revision);
-        let mut txiqcal_done = false;
-        if saved.tx_iq_cal_enabled {
+        let (peak_caldac, tx_iq_cal, tx_clcal) = if revision.pcoem() {
+            // `ar9003_hw_init_cal_pcoem`'s `TX_CL_CAL` branch: a saved table
+            // (`TXCLCAL_DONE`) clears `CL_CAL_ENABLE`; without one the
+            // carrier-leak calibration is enabled and forces the AGC
+            // calibration.
+            let mut run_agc_cal = false;
+            if prepared.carrier_leak_cal {
+                if saved.tx_clcal.is_some() {
+                    rmw(io, AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE, 0)?;
+                } else {
+                    rmw(io, AR_PHY_CL_CAL_CTL, 0, AR_PHY_CL_CAL_ENABLE)?;
+                    run_agc_cal = true;
+                }
+            }
+            // `skip_tx_iqcal`: NARF is 20 MHz only, so there is no half- or
+            // quarter-rate channel to skip for. `TX_IQ_CAL` programs
+            // `DELPT`; on `TX_IQ_ON_AGC_CAL` chips the AGC calibration also
+            // runs the TX IQ calibration — fresh whenever the saved
+            // coefficients are absent, and (Linux's unconditional
+            // `txiqcal_done = run_agc_cal = true`) whenever they are present.
+            // The decision is the carried `override_ini` one from `saved`
+            // (see the module docs), not a fresh readback: `init_cal_pcoem`
+            // rewrites `AR_PHY_TX_IQCAL_CONTROL_0`, so a re-read would
+            // disagree with the `enabled_cals` Linux keeps.
+            let mut txiqcal_done = false;
+            if saved.tx_iq_cal_enabled {
+                field(
+                    io,
+                    tx_iqcal_control_1(revision.ar9485()),
+                    DELPT_MASK,
+                    DELPT_SHIFT,
+                    DELPT,
+                )?;
+                if cals.tx_iq_on_agc_cal {
+                    if saved.tx_iq_cal.is_none() {
+                        rmw(
+                            io,
+                            tx_iqcal_control_0(revision.ar9485()),
+                            0,
+                            TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
+                        )?;
+                    } else {
+                        rmw(
+                            io,
+                            tx_iqcal_control_0(revision.ar9485()),
+                            TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
+                            0,
+                        )?;
+                    }
+                    txiqcal_done = true;
+                    run_agc_cal = true;
+                }
+            }
+            let clc = read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0;
+            let mut rx_delay = 0;
+            if clc {
+                rx_delay = read(io, AR_PHY_RX_DELAY)?;
+                write(io, AR_PHY_ACTIVE, 0)?;
+                io.delay_us(5);
+                write(io, AR_PHY_RX_DELAY, AR_PHY_RX_DELAY_DELAY)?;
+                write(io, AR_PHY_ACTIVE, 1)?;
+            }
+            // `AH_FASTCC` is set, so the AGC calibration runs only when
+            // `run_agc_cal` forced it; the manual peak calibration runs
+            // whatever the poll returned, as in `run`.
+            let mut peak_caldac = [None; 3];
+            let mut status = true;
+            if run_agc_cal {
+                status = do_agc_cal(io).await?;
+                for chain in chains(rx) {
+                    peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five, true)?);
+                }
+            }
+            if read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0 {
+                write(io, AR_PHY_RX_DELAY, rx_delay)?;
+                io.delay_us(5);
+            }
+            if !status {
+                // "offset calibration failed to complete": ath9k_hw_reset -EIO.
+                return Err(BringUpError::Timeout);
+            }
+            // `init_cal_pcoem`: the TX IQ post-processing runs when the AGC
+            // calibration ran it; otherwise the saved coefficients are
+            // reloaded (`TXIQCAL_DONE` set) — the `tx_iq_cal_reload` call
+            // this path exists for. A failed TX IQ calibration leaves no
+            // coefficients and the change continues.
+            let tx_iq_cal = if txiqcal_done {
+                tx_iq_cal_post_proc(io, revision, tx)?
+            } else if let Some(saved_iq) = saved.tx_iq_cal {
+                tx_iq_cal_reload(io, revision, tx, &saved_iq)?;
+                Some(saved_iq)
+            } else {
+                None
+            };
+            // `ar9003_hw_cl_cal_post_proc(ah, true)`: re-apply the saved
+            // carrier-leak table, or save it when the AGC calibration just
+            // reported success.
+            let tx_clcal = if prepared.carrier_leak_cal {
+                cl_cal_post_proc(io, tx, saved.tx_clcal)?
+            } else {
+                None
+            };
+            (peak_caldac, tx_iq_cal, tx_clcal)
+        } else {
+            // `init_cal_soc` with `AH_FASTCC` set: `TX_CL_CAL` sets the
+            // enable unconditionally — no saved-table (`TXCLCAL_DONE`)
+            // consult, soc never tracks one — and forces the AGC
+            // calibration (`:1587-1590`).
+            if prepared.carrier_leak_cal {
+                rmw(io, AR_PHY_CL_CAL_CTL, 0, AR_PHY_CL_CAL_ENABLE)?;
+            }
+            // `DELPT` programs unconditionally for 20 MHz (NARF is 20 MHz
+            // only, so the half-/quarter-rate `skip_tx_iqcal` never
+            // applies); the carried `override_ini` decision is true for
+            // every modeled SoC chip.
             field(
                 io,
                 tx_iqcal_control_1(revision.ar9485()),
@@ -723,77 +915,45 @@ impl Calibration {
                 DELPT_SHIFT,
                 DELPT,
             )?;
-            if cals.tx_iq_on_agc_cal {
-                if saved.tx_iq_cal.is_none() {
-                    rmw(
-                        io,
-                        tx_iqcal_control_0(revision.ar9485()),
-                        0,
-                        TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
-                    )?;
-                } else {
-                    rmw(
-                        io,
-                        tx_iqcal_control_0(revision.ar9485()),
-                        TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
-                        0,
-                    )?;
-                }
-                txiqcal_done = true;
-                run_agc_cal = true;
-            }
-        }
-        let clc = read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0;
-        let mut rx_delay = 0;
-        if clc {
-            rx_delay = read(io, AR_PHY_RX_DELAY)?;
-            write(io, AR_PHY_ACTIVE, 0)?;
-            io.delay_us(5);
-            write(io, AR_PHY_RX_DELAY, AR_PHY_RX_DELAY_DELAY)?;
-            write(io, AR_PHY_ACTIVE, 1)?;
-        }
-        // `AH_FASTCC` is set, so the AGC calibration runs only when
-        // `run_agc_cal` forced it; the manual peak calibration runs
-        // whatever the poll returned, as in `run`.
-        let mut peak_caldac = [None; 3];
-        let mut status = true;
-        if run_agc_cal {
-            let agc = read(io, AR_PHY_AGC_CONTROL)?;
-            write(io, AR_PHY_AGC_CONTROL, agc | AGC_CAL)?;
-            status = wait_clear(io, AR_PHY_AGC_CONTROL, AGC_CAL, AH_WAIT_TIMEOUT).await?;
+            // `init_cal_soc` (`:1614-1626`): on `TX_IQ_ON_AGC_CAL` chips
+            // the `ENABLE_TXIQ_CAL` bit is read live (AR9550 in SoC form;
+            // no modeled chip takes that arm); otherwise the separate TX
+            // IQ run — the ACTIVE toggle follows it — and the AGC
+            // calibration is forced, so `run_agc_cal` is true on this
+            // path and the `run_agc_cal || !AH_FASTCC` block always runs.
+            let txiqcal_done = if cals.tx_iq_on_agc_cal {
+                read(io, tx_iqcal_control_0(revision.ar9485()))? & TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL
+                    != 0
+            } else {
+                let done = tx_iq_cal_run(io, revision.ar9485()).await?;
+                write(io, AR_PHY_ACTIVE, 0)?;
+                io.delay_us(5);
+                write(io, AR_PHY_ACTIVE, 1)?;
+                done
+            };
+            // No CL `RX_DELAY` dance in soc. The manual peak calibration
+            // runs per RX chain BEFORE the AGC poll (`:1630-1648`).
+            let mut peak_caldac = [None; 3];
             for chain in chains(rx) {
-                peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five)?);
+                peak_caldac[chain] = Some(manual_peak_cal(io, chain, !five, false)?);
             }
-        }
-        if read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0 {
-            write(io, AR_PHY_RX_DELAY, rx_delay)?;
-            io.delay_us(5);
-        }
-        if !status {
-            // "offset calibration failed to complete": ath9k_hw_reset -EIO.
-            return Err(BringUpError::Timeout);
-        }
-        // `init_cal_pcoem`: the TX IQ post-processing runs when the AGC
-        // calibration ran it; otherwise the saved coefficients are
-        // reloaded (`TXIQCAL_DONE` set) — the `tx_iq_cal_reload` call
-        // this path exists for. A failed TX IQ calibration leaves no
-        // coefficients and the change continues.
-        let tx_iq_cal = if txiqcal_done {
-            tx_iq_cal_post_proc(io, revision, tx)?
-        } else if let Some(saved_iq) = saved.tx_iq_cal {
-            tx_iq_cal_reload(io, revision, tx, &saved_iq)?;
-            Some(saved_iq)
-        } else {
-            None
+            // `do_ar9003_agc_cal`; a timeout fails the channel change
+            // here — no post-processing (`:1651-1654`).
+            if !do_agc_cal(io).await? {
+                return Err(BringUpError::Timeout);
+            }
+            // Fresh post-processing; no reload and no `cl_cal_post_proc`
+            // in soc, so the saved coefficients and table are not reused.
+            let tx_iq_cal = if txiqcal_done {
+                tx_iq_cal_post_proc(io, revision, tx)?
+            } else {
+                None
+            };
+            (peak_caldac, tx_iq_cal, None)
         };
-        // `ar9003_hw_cl_cal_post_proc(ah, true)`: re-apply the saved
-        // carrier-leak table, or save it when the AGC calibration just
-        // reported success.
-        let tx_clcal = if prepared.carrier_leak_cal {
-            cl_cal_post_proc(io, tx, saved.tx_clcal)?
-        } else {
-            None
-        };
+        // `ar9003_hw_cl_cal_post_proc`'s CLC_SUCCESS sample, shared by
+        // both paths: the AGC calibration ran with `CL_CAL_ENABLE` set
+        // when `prepared.carrier_leak_cal`.
         let carrier_leak = if prepared.carrier_leak_cal {
             Some(read(io, AR_PHY_AGC_CONTROL)? & AGC_CLC_SUCCESS != 0)
         } else {
@@ -1173,10 +1333,11 @@ fn corr_coeff_table(ar9485: bool) -> [[u64; 3]; MAX_MEASUREMENT] {
 
 /// `ar9003_hw_tx_iq_cal_outlier_detection` for the single `iqcal_idx == 0`
 /// pass: per-chain outlier detection (skipped on AR9550, which is not
-/// modeled), the `iqc_coeff` table writes and the `TXIQCAL_DONE` state
-/// (`is_reusable` is always true here: the calibration itself never
-/// talks to MCI — the owner runs `init_cal_req`/`init_cal_done` around
-/// the run and does not consume the flag). Also sets
+/// modeled), the `iqc_coeff` table writes and the `TXIQCAL_DONE` state.
+/// Linux assigns that state from `is_reusable` (true on the PCOEM call,
+/// false on the SoC call); the port takes no `is_reusable` — the
+/// `Report` records the applied coefficients instead (see
+/// `Report::tx_iq_cal`), and no SoC consumer reads the flag back. Also sets
 /// `AR_PHY_TX_IQCAL_CONTROL_3` `IQCORR_EN` and
 /// `AR_PHY_RX_IQCAL_CORR_B0` `LOOPBACK_IQCORR_EN`.
 fn tx_iq_cal_outlier_detection(
@@ -1240,7 +1401,8 @@ fn tx_iq_cal_outlier_detection(
 /// the calibration completed; Linux's `ar9003_hw_init_cal_soc` caller
 /// treats a timeout as "not done" and falls back to the AGC calibration
 /// alone. Only the SoC init path calls it (non-`TX_IQ_ON_AGC_CAL` SoC
-/// chips: AR9300, AR9331, AR9340 in SoC form); no modeled chip does.
+/// chips: AR9300, AR9331, AR9340 in SoC form) — the live caller for
+/// AR9300/AR9580.
 pub(in crate::ath9k) async fn tx_iq_cal_run(
     io: &mut impl Io,
     ar9485: bool,
@@ -1345,13 +1507,17 @@ pub(in crate::ath9k) async fn dynamic_osdac_selection(
     Ok(true)
 }
 
-/// `ar9003_hw_tx_iq_cal_post_proc(ah, 0, true)`: the single-pass TX IQ
-/// calibration `ar9003_hw_init_cal_pcoem` runs on a `TX_IQ_ON_AGC_CAL`
-/// chip after the AGC calibration. Returns the saved coefficients
+/// `ar9003_hw_tx_iq_cal_post_proc(ah, 0, is_reusable)`: the single-pass
+/// TX IQ calibration the init path runs after the AGC calibration —
+/// `init_cal_pcoem` on a `TX_IQ_ON_AGC_CAL` chip, `init_cal_soc` after
+/// the separate TX IQ run. Returns the saved coefficients
 /// (`TXIQCAL_DONE`), or `None` when the calibration failed — Linux logs
 /// and continues the reset without coefficients. The AR9550 three-pass
 /// median is not implemented (no AR9550 is modeled): `outlier_detect`
-/// stays true, so outlier detection always runs.
+/// stays true, so outlier detection always runs. Linux's SoC call
+/// passes `is_reusable=false`, which only leaves the `TXIQCAL_DONE`
+/// cal-flag clear (see `Report::tx_iq_cal`); the port takes no
+/// `is_reusable`.
 fn tx_iq_cal_post_proc(
     io: &mut impl RegisterIo,
     revision: &Revision,
