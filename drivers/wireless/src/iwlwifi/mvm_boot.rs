@@ -3,6 +3,7 @@
 //! The native transport owns context-v1/RFH/TFH; this owner keeps it through
 //! ALIVE, unified NVM initialization and mandatory awake-runtime defaults.
 use super::{gen2_profile::Profile, runtime::Hardware, station_api::Nvm};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -39,7 +40,10 @@ pub enum Phase {
     Failed,
 }
 pub struct Owner {
-    hardware: Hardware,
+    // Boxed: the transport is several KiB of retained state, and holding
+    // it by value makes `Owner::new`'s frame (and every `Owner` by value)
+    // exceed the 8 KiB stack-frame budget.
+    hardware: Box<Hardware>,
     firmware: Vec<u8>,
     profile: Profile,
     phase: Phase,
@@ -61,7 +65,11 @@ impl core::fmt::Debug for Owner {
     }
 }
 impl Owner {
-    pub fn new(mut hardware: Hardware, firmware: &[u8]) -> Result<Self, &'static str> {
+    pub fn new(hardware: Hardware, firmware: &[u8]) -> Result<Self, &'static str> {
+        // Box the transport up front: the by-value `hardware` parameter
+        // and the returned `Owner` would otherwise both carry it on the
+        // stack, over the frame budget.
+        let mut hardware = Box::new(hardware);
         let parsed = super::parse_ucode(firmware).map_err(|_| "invalid MVM firmware image")?;
         if super::gen2_profile::firmware_api(&parsed) != 77 || !hardware.matches_firmware(&parsed) {
             return Err("MVM boot image/API differs from retained transport");

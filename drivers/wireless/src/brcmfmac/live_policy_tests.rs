@@ -68,7 +68,11 @@ fn smoke_brcmf_live_policy_loss_before_firmware_up_prevents_attachment() -> Test
         };
         bus.clear_policy_on(86, database.clone());
         if !matches!(
-            ready(Station::initialize_live(adapter, &[], database)),
+            ready(Station::initialize_live(
+                alloc::boxed::Box::new(adapter),
+                &[],
+                database
+            )),
             Ok(Err(Error::Authority))
         ) || bus.commands().iter().any(|(command, _, _)| *command == 2)
             || bus.stats().5 != 0

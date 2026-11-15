@@ -477,7 +477,7 @@ pub(crate) fn init_station<const PCIE: bool>(
     fw: Firmware,
 ) -> Result<Station<Mock<PCIE>>, &'static str> {
     let clm: &[u8] = if PCIE { &[] } else { &[0x5a; 16] };
-    ready(Station::initialize(Mock::new(fw), clm, domain()))
+    ready(Station::initialize(Box::new(Mock::new(fw)), clm, domain()))
         .ok_or("station initialization pended")?
         .map_err(|_| "station initialization failed")
 }

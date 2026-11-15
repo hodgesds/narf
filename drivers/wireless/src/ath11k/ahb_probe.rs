@@ -139,7 +139,9 @@ fn probe_error(e: &AhbError) -> narf_bus::ProbeError {
 /// node, then spawn the bring-up task ([`super::ahb_live::spawn_bring_up`]).
 pub fn ahb_dt_probe(blob: &'static [u8], path: &str) -> Result<(), narf_bus::ProbeError> {
     let p = probe_node(blob, path).map_err(|e| probe_error(&e))?;
-    super::ahb_live::spawn_bring_up(blob, p);
+    // The bring-up task's future holds the platform: box it so the
+    // probe's frame (and the task's future) stays under the 8 KiB budget.
+    super::ahb_live::spawn_bring_up(blob, alloc::boxed::Box::new(p));
     Ok(())
 }
 

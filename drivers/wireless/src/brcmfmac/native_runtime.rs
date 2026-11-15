@@ -243,16 +243,17 @@ async fn provision_checked(
         .lock()
         .and_then(narf_net::iface::rebind_name)
         .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
-    let device = crate::cyw43439::interface::attach_runtime(name, adapter, &[])
-        .await
-        .map_err(|_| "BCM43602 station attachment failed")?;
+    let device =
+        crate::cyw43439::interface::attach_runtime(name, alloc::boxed::Box::new(adapter), &[])
+            .await
+            .map_err(|_| "BCM43602 station attachment failed")?;
     *LAST_NAME.lock() = Some(name);
     let generation = Arc::new(PcieGeneration::with_publisher(
         device,
         alloc::boxed::Box::new(|name, adapter| {
             alloc::boxed::Box::pin(crate::cyw43439::interface::attach_runtime(
                 name,
-                adapter,
+                alloc::boxed::Box::new(adapter),
                 &[],
             ))
         }),

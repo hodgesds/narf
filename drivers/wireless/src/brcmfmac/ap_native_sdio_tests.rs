@@ -221,7 +221,7 @@ impl SdioBound {
             )));
         }
         let station = ready(Station::initialize_live(
-            runtime,
+            alloc::boxed::Box::new(runtime),
             &assets.clm,
             database.clone(),
         ))?
@@ -1468,7 +1468,8 @@ fn sdio_reset_rejoin() -> Result<(), &'static str> {
         let database = database.clone();
         let clm = published.lock().clone();
         Box::pin(async move {
-            let station = Station::initialize_live(runtime, &clm, database).await?;
+            let station =
+                Station::initialize_live(alloc::boxed::Box::new(runtime), &clm, database).await?;
             narf_net::iface::register(name, OWN, sdio_send);
             Ok(sdio_shell(String::from(name), station))
         })
@@ -1536,7 +1537,11 @@ fn sdio_station_init_error_surfaces_authority() -> Result<(), &'static str> {
             return Err("native bootstrap owner");
         };
         bus.clear_policy_on(86, database.clone());
-        let result = ready(Station::initialize_live(adapter, &[], database))?;
+        let result = ready(Station::initialize_live(
+            alloc::boxed::Box::new(adapter),
+            &[],
+            database,
+        ))?;
         let Err(error) = result else {
             return Err("policy loss during setup still initialized the station");
         };

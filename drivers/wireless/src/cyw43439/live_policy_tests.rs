@@ -86,7 +86,7 @@ fn smoke_cyw_live_policy_loss_before_firmware_up_prevents_attachment() -> TestRe
     bus.firmware.lock().clear_policy_on(86, database.clone());
     if !matches!(
         ready(Station::initialize_live(
-            Runtime::new(bus.clone()),
+            alloc::boxed::Box::new(Runtime::new(bus.clone())),
             &[1],
             database
         )),
