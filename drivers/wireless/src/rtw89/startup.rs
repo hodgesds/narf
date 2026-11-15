@@ -398,7 +398,7 @@ impl Startup {
                 firmware
                     .transport_mut()
                     .prepare_radio_a(
-                        &mut *owner.radio_a,
+                        &mut owner.radio_a,
                         &owner.radio,
                         assets,
                         &mut owner.coex,
