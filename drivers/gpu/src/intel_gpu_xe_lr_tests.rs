@@ -90,8 +90,11 @@ fn smoke_xe_lr_job_runs_past_watchdog_and_completes_or_cancels_on_destroy() -> T
 
     // 1. Submit an LR job with a USER_FENCE output and run well past both the
     //    5s per-job watchdog and 15s (3 * TIMEOUT) global stall limit.
-    user.wire.store(0x7020, &0u64.to_le_bytes());
-    exec_wire(&user, queue, true, &[sync(2, 0x7020, 0x22, true)]);
+    // The fence address must lie inside the writable data-BO mapping:
+    // ResidentBatch::from_vm rejects a USER_FENCE outside writable
+    // residency (the GT's MI_STORE_DATA_IMM writes the value there), and
+    // the Cpu observes the BO through its 0x4000 mapping (0x4090).
+    exec_wire(&user, queue, true, &[sync(2, 0x2345_0000_0090, 0x22, true)]);
     let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
     assert!(call.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
     let (_, fence1) = mailbox.accept(&mut gt, 100);
@@ -129,7 +132,7 @@ fn smoke_xe_lr_job_runs_past_watchdog_and_completes_or_cancels_on_destroy() -> T
         image[1024 + 5] = tail;
     }
     finish(&mut gt, &w, &fence1, &mut registered, 25_000_000_200);
-    assert_eq!(user.read_u64_acquire(0x7020), Ok(0x22));
+    assert_eq!(user.read_u64_acquire(0x4090), Ok(0x22));
     assert!(registered.is_empty());
 
     // 2. Submit a second LR job, then destroy its exec queue while active:
