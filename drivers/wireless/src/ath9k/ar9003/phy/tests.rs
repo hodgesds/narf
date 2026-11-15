@@ -1053,7 +1053,11 @@ fn smoke_ath9k_ar9485_mrc_cck_spur_branch() -> TestResult {
         return TestResult::Fail("AR9300 spur branch used the EEPROM list");
     }
     // End to end: `prepare` on AR9485 at 2412 mitigates from the EEPROM
-    // spur, and with an empty spur list writes neither spur register.
+    // spur, and with an empty spur list engages no mitigation. The ini
+    // tables program both spur registers on every bring-up
+    // (`AR9485_1_1_BASEBAND_CORE` writes `AR_PHY_CCK_SPUR_MIT`,
+    // `AR9485_1_1_BASEBAND_POSTAMBLE` writes `AR_PHY_AGC_CONTROL`), so
+    // the empty-list check is on the mitigation fields, not the log.
     let revision = Revision {
         chip: Chip::Ar9485,
         mac_rev: 1,
@@ -1091,12 +1095,11 @@ fn smoke_ath9k_ar9485_mrc_cck_spur_branch() -> TestResult {
         40,
     )
     .is_err()
-        || io
-            .writes
-            .iter()
-            .any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT || r == AR_PHY_AGC_CONTROL)
+        || io.regs[&AR_PHY_AGC_CONTROL] & 0x3c0 == 7 << 6
+        || io.regs[&AR_PHY_CCK_SPUR_MIT] & 1 != 0
+        || (io.regs[&AR_PHY_CCK_SPUR_MIT] >> 9) & 0xfffff != 0
     {
-        return TestResult::Fail("AR9485 prepare wrote spur registers for an empty list");
+        return TestResult::Fail("AR9485 prepare engaged spur mitigation for an empty list");
     }
     TestResult::Pass
 }
