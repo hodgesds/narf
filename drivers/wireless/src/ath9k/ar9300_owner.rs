@@ -615,7 +615,12 @@ async fn initialize(
                         // owner always computes fresh ones (one-shot
                         // calibration).
                         let mut is_reusable = true;
-                        ar9003::mci::init_cal_req(&mut io, &mut link.btcoex.mci, &mut is_reusable);
+                        ar9003::mci::init_cal_req(
+                            &mut io,
+                            &mut link.btcoex.mci,
+                            dma.as_deref(),
+                            &mut is_reusable,
+                        );
                     }
                 }
                 Err(error) => {
@@ -856,7 +861,12 @@ async fn reset(
                 if let Some(dma) = &dma {
                     ar9003::mci::sync_gpm_ring(&mut io, dma, &mut link.btcoex.mci);
                 }
-                if ar9003::mci::start_reset(&mut io, &mut link.btcoex.mci, target < 4800) {
+                if ar9003::mci::start_reset(
+                    &mut io,
+                    &mut link.btcoex.mci,
+                    dma.as_deref(),
+                    target < 4800,
+                ) {
                     return Err(BringUpError::RecalibrationNeeded);
                 }
             }
