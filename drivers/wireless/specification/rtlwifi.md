@@ -3009,8 +3009,7 @@ the coexistence owner runs every composed call site.
   is now the exact `rtl8723B_card_enable_flow` after the
   `_rtl8723be_init_mac` prefix (`RSV_CTRL = 0`, `APS_FSMCO+1 &= ~BIT7`),
   parsed with `PWR_CUT_ALL_MSK` as Linux does (so the test-chip-masked
-  `0x68[3]` row is issued). The former shared rows are kept, unchanged, as
-  `RTL8723AE_PWR_ON` for the diagnostic RTL8723AE.
+  `0x68[3]` row is issued).
 - `fw` — `is_fw_header` (`signature & 0xfff0 == 0x5300`), exact RAM-code
   length (linux-firmware `0x7bf2` / `0x77fa`), whole file at most
   `max_fw_size = 0x8000` (eight pages). `rtl8723_download_fw(hw, true,
