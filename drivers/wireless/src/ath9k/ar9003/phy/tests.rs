@@ -872,6 +872,11 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     let spur2g = map::MODAL_2G + modal::SPUR_CHANS;
     image[spur2g] = 120;
     image[spur2g + 1] = 137;
+    // The 2437 case needs the first spur at 2440 (offset +3) so the
+    // second spur at 2437 (offset 0) programs the B mask; the 2412
+    // case below needs the first spur at 2420 (offset +8).
+    let mut image2437 = image;
+    image2437[spur2g] = 140;
     // The 9565 fast-clock first row, column 1.
     let fast = super::super::initvals_ar9565::AR9565_1P0_MODES_FAST_CLOCK[0];
     let fast_write = (u64::from(fast[0]), fast[1]);
@@ -881,7 +886,7 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     // filter is skipped, and the second in-range spur (2437, offset 0)
     // programs the B mask. First spur 2440, offset +3: freq_sd 139,
     // delta phase 157286, A mask index 9.
-    let (io, prepared) = prepare_chip(Chip::Ar9565, 0, &image, 2437);
+    let (io, prepared) = prepare_chip(Chip::Ar9565, 0, &image2437, 2437);
     if prepared.is_err() {
         return TestResult::Fail("AR9565 2437 MHz preparation was refused");
     }
@@ -907,7 +912,7 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
         || mask_a & 0x3ff != 0xa0
         || mask_b != 0xa0
         || fast_count(&io) != 1
-        || expected_chip(Chip::Ar9565, 0, &image, 2437) != prepared
+        || expected_chip(Chip::Ar9565, 0, &image2437, 2437) != prepared
     {
         return TestResult::Fail("AR9565 2437 MHz spur mitigation differs from ar9003_phy.c");
     }
