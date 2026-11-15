@@ -949,7 +949,9 @@ fn extensions(
         let mut ext = [0u8; 48];
         user.read(address, &mut ext)?;
         let property = u32_at(&ext, 16);
-        if property >= 14 || property == 0 || u32_at(&ext, 20) != 0 {
+        // Properties 14/15 are the #1774 query-sampling pair (query
+        // address/size); the bound was 14 when 13 was the max property.
+        if property >= 16 || property == 0 || u32_at(&ext, 20) != 0 {
             return Err(FsError::InvalidData.into());
         }
         params.set(device, from, property, u64_at(&ext, 24))?;
