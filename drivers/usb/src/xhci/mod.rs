@@ -1998,13 +1998,20 @@ impl Xhci {
     /// vector, program delivery to BSP, and enable MSI. Returns the
     /// allocated vector on success.
     #[cfg(target_arch = "x86_64")]
-    fn try_enable_msi(
-        cap: &Cap<BusDeviceCap, Write>,
-        device: &BusDevice,
-    ) -> Result<u8, XhciError> {
+    fn try_enable_msi(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<u8, XhciError> {
         let mut cfg = narf_bus::msi::enable_msi(cap, device, 1).map_err(|_| XhciError::NoMemory)?;
         let v = narf_interrupts::vector::alloc().map_err(|_| XhciError::NoMemory)?;
-        let _ = unsafe { narf_bus::msi::program_msi(&mut cfg, 0, v) }.map_err(|_| XhciError::NoMemory)?;
+        // SAFETY: caller holds the BusDeviceCap; `cfg` was built by
+        // `enable_msi` from that live cap and is `&mut`-borrowed here,
+        // so no other writer can touch this device's cfg space during
+        // the call. The message is programmed before the enable bit
+        // below, so the device cannot fire on a half-programmed
+        // address/data pair.
+        let _ = unsafe { narf_bus::msi::program_msi(&mut cfg, 0, v) }
+            .map_err(|_| XhciError::NoMemory)?;
+        // SAFETY: same `cfg` as above — still exclusively owned via the
+        // BusDeviceCap; the message address/data were programmed on the
+        // preceding line.
         unsafe { narf_bus::msi::enable(&cfg) }.map_err(|_| XhciError::NoMemory)?;
         narf_interrupts::install_handler(v, xhci_isr);
         Ok(v)
