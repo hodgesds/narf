@@ -398,3 +398,62 @@ kernel_test_in!(
     "scheduler/workqueue",
     smoke_workqueue_idle_reaper_trims_the_pool
 );
+
+static UNBOUND_ENTERED: AtomicUsize = AtomicUsize::new(0);
+static UNBOUND_CO_RAN: AtomicBool = AtomicBool::new(false);
+
+fn unbound_barrier_fn(_: WorkRef) {
+    UNBOUND_ENTERED.fetch_add(1, Ordering::AcqRel);
+    let end = narf_time::monotonic_ns() + 1_000_000_000;
+    while narf_time::monotonic_ns() < end {
+        if UNBOUND_ENTERED.load(Ordering::Acquire) >= 2 {
+            UNBOUND_CO_RAN.store(true, Ordering::Release);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `WQ_UNBOUND`: the unbound pool is not concurrency managed. A worker about
+/// to run a work kicks the pool (`process_one_work` → `kick_pool`), so a
+/// second queued work goes to another worker — placed on another CPU — and the
+/// two sync works run at the same time instead of in turn.
+fn smoke_workqueue_unbound_concurrent_across_cpus() -> TestResult {
+    crate::__reset_queues_for_test();
+    let wq = workqueue::system_unbound_wq();
+    let live_aps =
+        (narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap() & !(1u64 << me()))
+            .count_ones();
+    if live_aps == 0 {
+        return TestResult::Skip(
+            "needs at least one live AP to verify concurrent unbound execution",
+        );
+    }
+
+    let prev_steal = crate::STEAL_ENABLED.swap(true, Ordering::AcqRel);
+
+    UNBOUND_ENTERED.store(0, Ordering::Release);
+    UNBOUND_CO_RAN.store(false, Ordering::Release);
+    let w1 = Box::new(WorkStruct::new(WorkFn::Sync(unbound_barrier_fn)));
+    let w2 = Box::new(WorkStruct::new(WorkFn::Sync(unbound_barrier_fn)));
+    // SAFETY: Boxes outlive both works; flushed below before return.
+    unsafe {
+        workqueue::queue_work(wq, &w1);
+        workqueue::queue_work(wq, &w2);
+    }
+    let finished = rounds_until(2000, || UNBOUND_CO_RAN.load(Ordering::Acquire));
+    flush_work_blocking(&w1);
+    flush_work_blocking(&w2);
+    crate::STEAL_ENABLED.store(prev_steal, Ordering::Release);
+
+    if !finished || !UNBOUND_CO_RAN.load(Ordering::Acquire) {
+        return TestResult::Fail(
+            "two WQ_UNBOUND sync works did not execute concurrently across CPUs",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/workqueue",
+    smoke_workqueue_unbound_concurrent_across_cpus
+);

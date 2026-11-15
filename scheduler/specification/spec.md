@@ -859,8 +859,14 @@ pub struct TaskSpec {
 ```
 
 - **Hints, not guarantees.** The executor honours `Affinity.preferred`
-  for initial placement when possible; a completed poll remains on its
-  current CPU while that CPU is allowed. Work-stealing may move a task
+  for initial placement when possible; when `Affinity.preferred` is `None`
+  and SMP work-stealing is enabled across multiple schedulable CPUs, initial
+  placement spreads across the least-loaded allowed online CPUs (using
+  `select_fork_cpu` with a rotating round-robin tie-breaker for zero-load
+  ties; a `WorkKind::UserThread` only once user SMP is enabled). A completed
+  poll remains on its current CPU while that CPU is allowed, and a local
+  enqueue that leaves a migratable task queued behind another wakes an idle
+  allowed peer via `kick_idle_puller`. Work-stealing may move a task
   within `allowed` under load. Idle balancing does not detach a victim's
   final runnable task: the currently executing task and dispatchable queued
   slots together must exceed one before a thief may take a queued slot. A task
@@ -1135,7 +1141,7 @@ control callback.
 | `queue_work(_on)`, `schedule_work`, `queue_delayed_work(_on)`, `schedule_delayed_work`, `mod_delayed_work(_on)` | same; never allocate or block (callable from timer callbacks and interrupt handlers) |
 | `cancel_work_sync`, `cancel_delayed_work(_sync)`, `flush_work` | same, async; `*_blocking` forms drive nested executor rounds |
 | per-CPU normal / highpri `worker_pool`s, unbound pool | same; per-CPU workers are pinned tasks, unbound ones run anywhere |
-| concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy) |
+| concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | per-CPU pools only: a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy). The unbound pool is not concurrency managed (`WORKER_UNBOUND`): queued work always wakes an idle worker, and a worker about to run a work kicks the pool so the rest go to other workers (`process_one_work` → `kick_pool`) |
 | `max_active`, inactive list | per workqueue, queue order kept |
 | rescuer, `send_mayday` | a pool at `MAX_WORKERS_PER_POOL` sends its `WQ_MEM_RECLAIM` work to the workqueue's rescuer task |
 | `may_start_working` / `manage_workers` | a worker about to run a work makes sure the pool keeps an idle worker in reserve |

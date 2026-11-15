@@ -445,6 +445,14 @@ pub struct Pool {
     nr_done: AtomicU64,
 }
 
+impl Pool {
+    /// Per-CPU pools are concurrency managed; the unbound pool is not
+    /// (`WORKER_UNBOUND`).
+    fn concurrency_managed(&self) -> bool {
+        self.cpu.is_some()
+    }
+}
+
 /// `idle_worker_timeout`: while the pool has too many idle workers, ask
 /// the longest-idle one to exit once it has been idle `IDLE_WORKER_TIMEOUT`;
 /// re-arm for the next one.
@@ -639,11 +647,17 @@ fn create_worker(pool: &'static Pool) {
 /// `HIGHPRI_NICE_LEVEL` (`MIN_NICE`).
 const HIGHPRI_NICE_LEVEL: i8 = -20;
 
-/// `kick_pool`: queued work and no running worker — wake an idle one.
-/// Returns whether the pool needs a new worker instead (none idle or
-/// starting).
-fn kick_pool(g: &mut PoolInner) -> bool {
-    if g.worklist.len == 0 || g.nr_running != 0 || g.nr_starting != 0 {
+/// `kick_pool`: queued work the pool's running workers will not get to —
+/// wake an idle worker. Returns whether the pool needs a new worker instead
+/// (none idle).
+///
+/// `need_more_worker`: a concurrency-managed (per-CPU) pool needs one only
+/// with no running or starting worker. The unbound pool is not concurrency
+/// managed — Linux's unbound workers carry `WORKER_UNBOUND`, part of
+/// `WORKER_NOT_RUNNING`, so they never count in `nr_running` — and needs
+/// one whenever work is queued; concurrency there is the scheduler's job.
+fn kick_pool(g: &mut PoolInner, managed: bool) -> bool {
+    if g.worklist.len == 0 || (managed && (g.nr_running != 0 || g.nr_starting != 0)) {
         return false;
     }
     if let Some(w) = g.idle.iter_mut().rev().find(|w| !w.woken) {
@@ -689,7 +703,7 @@ fn insert_work(wq: &'static Workqueue, pool: &'static Pool, w: &WorkStruct) {
         // SAFETY: as above.
         unsafe { pg.worklist.push_back(w) };
         w.flags.fetch_or(ON_POOL, Ordering::AcqRel);
-        kick_pool(&mut pg)
+        kick_pool(&mut pg, pool.concurrency_managed())
     };
     drop(wg);
     if need {
@@ -1011,7 +1025,7 @@ fn activate_inactive(wg: &mut WqInner) {
         // SAFETY: just unlinked; still pending and owned by its queueing.
         unsafe { pg.worklist.push_back(w) };
         w.flags.fetch_or(ON_POOL, Ordering::AcqRel);
-        kick_pool(&mut pg)
+        kick_pool(&mut pg, pool.concurrency_managed())
     };
     if need_worker {
         // The workqueue lock is held: no worker is created under it; the
@@ -1193,7 +1207,7 @@ impl Future for Tracked {
                 let need_worker = {
                     let mut g = pool.inner.lock();
                     g.nr_running -= 1;
-                    kick_pool(&mut g)
+                    kick_pool(&mut g, pool.concurrency_managed())
                 };
                 if need_worker {
                     worker_needed(pool);
@@ -1418,6 +1432,16 @@ async fn worker_main(pool: &'static Pool, id: u64) {
         };
         if spare {
             create_worker(pool);
+        }
+        // `process_one_work` → `kick_pool`: a no-op for a per-CPU pool, whose
+        // running worker is this one; in the unbound pool it chains the
+        // remaining queued works onto other workers instead of this one
+        // running them in turn.
+        if !pool.concurrency_managed() {
+            let need = kick_pool(&mut pool.inner.lock(), false);
+            if need {
+                worker_needed(pool);
+            }
         }
         process_one(pool, w).await;
         // Let the CPU's other tasks run between works. This worker still

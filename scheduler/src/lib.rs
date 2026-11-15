@@ -3946,13 +3946,76 @@ pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
     true
 }
 
+/// Rotating round-robin tie-breaker for unpreferred initial placement of
+/// `TaskSpec::kernel_any()` / `preferred: None` tasks across least-loaded
+/// schedulable CPUs.
+static NEXT_KERNEL_CPU: AtomicU32 = AtomicU32::new(0);
+
+/// Mask of online CPUs within `allowed` whose policy state accepts queued work.
+fn schedulable_cpu_bits(allowed: CpuSet) -> u64 {
+    let mut online = allowed.intersection(online_cpu_set()).bits();
+    let mut schedulable = 0u64;
+    while online != 0 {
+        let cpu = online.trailing_zeros() as usize;
+        online &= online - 1;
+        if cpu < narf_lib::percpu::MAX_CPUS
+            && matches!(
+                policy::cpu_state(CpuId(cpu as u32)),
+                policy::CpuState::Active | policy::CpuState::Idle
+            )
+        {
+            schedulable |= 1u64 << cpu;
+        }
+    }
+    schedulable
+}
+
+/// Pick the `ordinal`-th set CPU bit (wrapping) in a non-zero CPU bitmask.
+fn nth_set_cpu(mut mask: u64, ordinal: usize) -> Option<CpuId> {
+    let count = mask.count_ones() as usize;
+    if count == 0 {
+        return None;
+    }
+    let mut target = ordinal % count;
+    while mask != 0 {
+        let cpu = mask.trailing_zeros();
+        if target == 0 {
+            return Some(CpuId(cpu));
+        }
+        target -= 1;
+        mask &= mask - 1;
+    }
+    None
+}
+
 /// Pick the CPU index a task with `spec` should land on. Honours
-/// `affinity.preferred` when the named CPU is online; otherwise spawns
-/// on the current CPU. Falls back to CPU 0 if the current CPU is
-/// somehow not online (shouldn't happen — current_cpu() returning a
-/// CPU implies that CPU is executing).
+/// `affinity.preferred` when the named CPU is online; when unpreferred and SMP
+/// work-stealing is active with multiple schedulable CPUs, spreads across the
+/// least-loaded allowed CPUs (breaking zero-load ties round-robin) instead of
+/// piling onto the spawning CPU. Falls back to the current CPU, then CPU 0.
+///
+/// Out of line: every generic `spawn*` instance calls this, and inlining the
+/// load scan into each would grow every spawning caller's stack frame.
+#[inline(never)]
 fn target_cpu(spec: &TaskSpec) -> usize {
     let here = narf_lib::percpu::current_cpu();
+    // A user task may leave the spawning CPU only once user SMP is enabled
+    // (the same gate `enqueue_on` applies to pulling one).
+    if spec.affinity.preferred.is_none()
+        && (spec.work_kind != WorkKind::UserThread || user_task_smp_enabled())
+        && STEAL_ENABLED.load(Ordering::Acquire)
+        && narf_lib::smp::online_count() > 1
+    {
+        let schedulable = schedulable_cpu_bits(spec.affinity.allowed);
+        if schedulable.count_ones() > 1 {
+            let seq = NEXT_KERNEL_CPU.fetch_add(1, Ordering::Relaxed) as usize;
+            if let Some(preferred) = nth_set_cpu(schedulable, seq) {
+                if let Some(chosen) = select_fork_cpu(CpuSet::from_bits(schedulable), preferred) {
+                    return chosen.0 as usize;
+                }
+            }
+        }
+    }
     target_cpu_for_affinity(spec.affinity, here)
 }
 
@@ -4658,6 +4721,8 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         policy::cpu_state(CpuId(cpu as u32)),
         policy::CpuState::Active | policy::CpuState::Idle
     );
+    let allowed = slot.spec.affinity.allowed.bits();
+    let pullable = user_task_smp_enabled() || slot.addr_space.is_none();
     if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
         // A target that is awake but not rescheduling drains its inbox only
         // when it gets back to its executor, and an IPI does not bring that
@@ -4666,8 +4731,6 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         // here the enqueuer does it, since the target's own tick may never
         // come. The target still gets its reschedule request (no IPI: it is
         // not halted), so this is still at most one IPI per enqueue.
-        let allowed = slot.spec.affinity.allowed.bits();
-        let pullable = user_task_smp_enabled() || slot.addr_space.is_none();
         wake_list_push(cpu, slot, reason);
         if pullable
             && cpu_not_rescheduling(cpu, narf_time::now_cycles())
@@ -4686,16 +4749,13 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     // remote target the slot is uncontended. No cross-core IPI is needed for the
     // local case (`resched_remote` no-ops for the current CPU); a quiesced remote
     // target is driven by its lifecycle controller, not a wake kick.
-    policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
+    let qlen = policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
         let mut q = READY[cpu].lock();
-        q.as_mut()
-            .expect("scheduler: spawn before init")
-            .push_back(slot);
+        let queue = q.as_mut().expect("scheduler: spawn before init");
+        queue.push_back(slot);
+        let len = queue.len();
         if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
-            let slot = q
-                .as_ref()
-                .and_then(|queue| queue.back())
-                .expect("scheduler slot was just enqueued");
+            let slot = queue.back().expect("scheduler slot was just enqueued");
             scheduler.on_task_queue_event(
                 CpuId(cpu as u32),
                 policy::TaskQueueEvent::Enqueued {
@@ -4704,7 +4764,18 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
                 },
             );
         }
+        len
     });
+    // A local enqueue that leaves this CPU with stealable surplus (the same
+    // rule a thief applies: running task plus queued slots exceed one) wakes
+    // one halted allowed peer, so its steal pass takes the backlog instead of
+    // waiting for its own tick (Linux `nohz_balancer_kick` on nr_running >= 2).
+    if target_drains
+        && pullable
+        && victim_has_stealable_surplus(cpu_running_task(CpuId(cpu as u32)), qlen)
+    {
+        let _ = kick_idle_puller(cpu, allowed & !(1u64 << cpu));
+    }
 }
 
 #[inline]
