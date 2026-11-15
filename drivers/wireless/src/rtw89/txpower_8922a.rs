@@ -13,7 +13,11 @@
 //! `efuse_be::BeFactory::power_trim` (thermal / PA-bias /
 //! pad-bias trim parse from the PHY-cap window). Still open:
 //! periodic thermal / TSSI tracking, TSSI compensation loops,
-//! and the RFK reruns (follow-ups of #1878).
+//! and the RFK reruns (follow-ups of #1878; #1944: no BE TSSI
+//! system/slope tables exist upstream and upstream
+//! `rtw8922a_rfk_track` is an empty stub, so a periodic TSSI loop
+//! has no upstream ground — the groundable remainder is the
+//! thermal-stat/protect piece, decision pending on #1944).
 //!
 //! Inputs are the raw efuse field values, not an efuse
 //! map struct: NARF's 8922A efuse support stops at block
