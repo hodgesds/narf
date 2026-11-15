@@ -1485,29 +1485,34 @@ fn smoke_rtw89_prepared_8922a_set_txpwr_writes_program() -> TestResult {
     // contents (read-modify-write), they do not clobber
     // neighbouring fields: ref fields cleared, shape bit
     // set, TXAGC reference 0, TSSI_K 0x12, SAR 126.
+    // Seeded with 0xA5A5_A5A5, not u32::MAX: `modify32`
+    // treats a u32::MAX read as a gone device, so a MAX
+    // seed refuses before any write lands. The alternating
+    // pattern still exercises the merge (set bits inside
+    // and outside every written field).
     let mut seeded = Model::new()
-        .with32(0x11A20, u32::MAX)
-        .with32(0x20000 + 0x6C04, u32::MAX)
-        .with32(0x20000 + 0xE628, u32::MAX)
-        .with32(0x20000 + 0xE6A0, u32::MAX)
-        .with32(0x20000 + 0xE728, u32::MAX)
-        .with32(0x20000 + 0xE7A0, u32::MAX)
-        .with32(0x20000 + 0xE61C, u32::MAX)
-        .with32(0x20000 + 0xE71C, u32::MAX);
+        .with32(0x11A20, 0xA5A5_A5A5)
+        .with32(0x20000 + 0x6C04, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE628, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE6A0, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE728, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE7A0, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE61C, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE71C, 0xA5A5_A5A5);
     if owner
         .set_txpwr(macid, &elements, *b"US", 37, &mut seeded)
         .is_err()
     {
         return TestResult::Fail("seeded set_txpwr refused");
     }
-    if seeded.regs32.get(&0x11A20) != Some(&0xFFF8_0001)
-        || seeded.regs32.get(&(0x20000 + 0x6C04)) != Some(&0xFFFF_FFFD)
-        || seeded.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_0000)
-        || seeded.regs32.get(&(0x20000 + 0xE6A0)) != Some(&0xC12F_FFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_0000)
-        || seeded.regs32.get(&(0x20000 + 0xE7A0)) != Some(&0xC12F_FFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE61C)) != Some(&0xFFE7_EFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE71C)) != Some(&0xFFE7_EFFF)
+    if seeded.regs32.get(&0x11A20) != Some(&0xA5A0_0001)
+        || seeded.regs32.get(&(0x20000 + 0x6C04)) != Some(&0xA5A5_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE628)) != Some(&0xA5A4_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE6A0)) != Some(&0x8125_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE728)) != Some(&0xA5A4_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE7A0)) != Some(&0x8125_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE61C)) != Some(&0xA5A7_E5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE71C)) != Some(&0xA5A7_E5A5)
     {
         return TestResult::Fail("set_txpwr partial-mask merge differs");
     }
@@ -1523,16 +1528,18 @@ fn smoke_rtw89_prepared_8922a_set_txpwr_writes_program() -> TestResult {
         Err(_) => return TestResult::Fail("6GHz SP admission refused (CAV)"),
     };
     let mut regs = Model::new()
-        .with32(0x20000 + 0xE628, u32::MAX)
-        .with32(0x20000 + 0xE728, u32::MAX);
+        // Non-MAX seed, as above (a u32::MAX read is a
+        // gone device).
+        .with32(0x20000 + 0xE628, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE728, 0xA5A5_A5A5);
     if cav
         .set_txpwr(cav_macid, &elements, *b"US", 37, &mut regs)
         .is_err()
     {
         return TestResult::Fail("CAV set_txpwr refused");
     }
-    if regs.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_8040)
-        || regs.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_8040)
+    if regs.regs32.get(&(0x20000 + 0xE628)) != Some(&0xA5A4_8040)
+        || regs.regs32.get(&(0x20000 + 0xE728)) != Some(&0xA5A4_8040)
     {
         return TestResult::Fail("CAV TXAGC reference differs from rtw8922a_set_txpwr_diff");
     }
