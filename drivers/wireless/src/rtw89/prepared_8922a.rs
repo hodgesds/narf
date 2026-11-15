@@ -151,11 +151,13 @@
 //!   diff / ref / SAR-diff, PHY_0).
 //! - The 8922A set_channel owner ([`Prepared8922a::set_channel`],
 //!   `channel_be`): the `rtw8922a_set_channel_mac` program
-//!   (RFMOD / TX-sub-band / TXRATE_CHK / SIFS) followed by the
-//!   register-level TX-power program ([`Self::set_txpwr`], its
-//!   first live caller), with the programmed channel retained
-//!   and the band change reported for the async channel-RFK
-//!   follow-up. The BB/RF channel programs, the help bracket,
+//!   (RFMOD / TX-sub-band / TXRATE_CHK / SIFS) and the
+//!   `rtw8922a_set_channel_bb` program (minus the gain sub-legs),
+//!   followed by the register-level TX-power program
+//!   ([`Self::set_txpwr`], its first live caller), with the
+//!   programmed channel retained and the band change reported
+//!   for the async channel-RFK follow-up. The RF channel program
+//!   (async, needs a native BE `Interface`), the help bracket,
 //!   the BTC switch-band notify and the async RFK steps are NOT
 //!   programmed here (see `channel_be`).
 //! - The mac_pre_init owner (`mac_pre_init_8922a`): the MAC
@@ -1006,23 +1008,30 @@ impl Prepared8922a {
     /// core.c `__rtw89_set_channel` for the parts this owner
     /// programs (see `channel_be`): the
     /// `rtw8922a_set_channel_mac` program for `profile`, then
-    /// `rtw8922a_set_txpwr` for the admitted station `macid`
-    /// (the first live caller of [`Self::set_txpwr`]), then the
-    /// retained channel record. `center` for the power program
-    /// is `profile.center()` (the `rtw89_chan.channel`; 20 MHz:
-    /// the primary, wider: the channel plan's center).
+    /// the `rtw8922a_set_channel_bb` program (minus the gain
+    /// sub-legs, which need a BE gain owner that does not exist
+    /// yet), then `rtw8922a_set_txpwr` for the admitted station
+    /// `macid` (the first live caller of [`Self::set_txpwr`]),
+    /// then the retained channel record. `center` for the power
+    /// program is `profile.center()` (the `rtw89_chan.channel`;
+    /// 20 MHz: the primary, wider: the channel plan's center).
     ///
     /// The requested channel must match the admitted station's
     /// geometry (band, primary, width) exactly: a channel-set
     /// for a station admitted on another channel is refused
     /// with nothing written, as is a width no station can hold
-    /// (320 MHz). A `set_txpwr` refusal after the MAC program
-    /// leaves the MAC registers on the new channel with the old
-    /// power program and records no channel, so a retry
-    /// re-programs the MAC idempotently before retrying power.
-    /// The BB/RF channel programs, the help bracket, the BTC
-    /// switch-band notify and the async RFK steps are NOT run
-    /// here: the outcome reports the band change
+    /// (320 MHz). A `set_txpwr` refusal after the MAC+BB program
+    /// leaves the MAC+BB registers on the new channel with the
+    /// old power program and records no channel, so a retry
+    /// re-programs the MAC+BB idempotently before retrying power.
+    /// The RF channel program (`rtw8922a_set_channel_rf`) is an
+    /// async `rfk::Interface` owner
+    /// (`channel_be::program_set_channel_rf`) and cannot run in
+    /// this sync owner: it needs 100 us sleeps and an RF
+    /// transport, and no native BE `Interface` exists on the
+    /// 8922A path yet. The BB/RF channel programs, the help
+    /// bracket, the BTC switch-band notify and the async RFK steps
+    /// are NOT run here: the outcome reports the band change
     /// (`!entity_active || band_changed`, core.c:599) for the
     /// follow-up that owns them.
     pub(super) fn set_channel(
@@ -1047,6 +1056,7 @@ impl Prepared8922a {
             return Err(Error::Channel(super::rfk::Error::Policy));
         }
         channel_be::program_set_channel_mac(regs, profile).map_err(Error::Channel)?;
+        channel_be::program_set_channel_bb(regs, profile).map_err(Error::Channel)?;
         self.set_txpwr(macid, elements, country, profile.center(), regs)?;
         let band_changed = self.channel.map(|c| c.band()) != Some(profile.band());
         self.channel = Some(profile);
