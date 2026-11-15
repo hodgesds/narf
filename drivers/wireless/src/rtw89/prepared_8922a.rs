@@ -149,6 +149,15 @@
 //!   over the BAR2 register port in `rtw8922a_set_txpwr`
 //!   order (by-rate / offset / shape / limit / limit-RU /
 //!   diff / ref / SAR-diff, PHY_0).
+//! - The 8922A set_channel owner ([`Prepared8922a::set_channel`],
+//!   `channel_be`): the `rtw8922a_set_channel_mac` program
+//!   (RFMOD / TX-sub-band / TXRATE_CHK / SIFS) followed by the
+//!   register-level TX-power program ([`Self::set_txpwr`], its
+//!   first live caller), with the programmed channel retained
+//!   and the band change reported for the async channel-RFK
+//!   follow-up. The BB/RF channel programs, the help bracket,
+//!   the BTC switch-band notify and the async RFK steps are NOT
+//!   programmed here (see `channel_be`).
 //! - The mac_pre_init owner (`mac_pre_init_8922a`): the MAC
 //!   reset (`reset_pwr_state`) + full `pwr_on_func` tail run in
 //!   `pci::bring_up` between the power-on head and the EFUSE
@@ -174,6 +183,7 @@ use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
 
 use super::bacam_v1;
+use super::channel_be;
 use super::completion_8922a;
 use super::dma::{TxBd, DEFAULT_RXBD_NUM, TXCH_NUM};
 use super::dma_8922a;
@@ -184,6 +194,7 @@ use super::fwcmd_8922a::{self, FramedH2c, H2cCmd, Released};
 use super::h2c::H2cSeqAllocator;
 use super::irq_be::BindingBe;
 use super::mac_pre_init_8922a::{self, HalChipVer};
+use super::operating_channel_c::{Band as ChanBand, Profile};
 use super::power;
 use super::ra_mask::{self, StationCaps};
 use super::radio_assets::Element;
@@ -219,6 +230,11 @@ pub(super) enum Error {
     /// TX-power register program failure (register
     /// read/write during [`Self::set_txpwr`]).
     Txpwr(super::rfk::Error),
+    /// 8922A channel-program failure: the requested channel
+    /// disagrees with the admitted station's geometry, the
+    /// MAC program cannot be built for it, or a MAC register
+    /// read/write failed during [`Self::set_channel`].
+    Channel(super::rfk::Error),
     /// The fail-closed EHT facet (`EhtStation::new_8922ae`) could
     /// not be built, so no station can be admitted.
     EhtUnavailable,
@@ -287,6 +303,18 @@ impl From<ra_mask::Error> for Error {
     fn from(error: ra_mask::Error) -> Self {
         Error::Ra(error)
     }
+}
+
+/// Outcome of [`Prepared8922a::set_channel`]: whether this
+/// channel-set crossed a band boundary or is the first
+/// programmed channel (Linux `!entity_active || band_changed`,
+/// core.c:599). The async follow-up runs the BTC switch-band
+/// notify and `rfk::be_channel::band_changed` (TSSI SCAN)
+/// before the full channel RFK when this is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SetChannelOutcome {
+    /// Band changed (or first programmed channel).
+    pub(super) band_changed: bool,
 }
 
 /// Hardware port count (`RTW89_PORT_NUM`, Linux `core.h:592`:
@@ -487,6 +515,13 @@ pub(crate) struct Prepared8922a {
     /// pre-init runs — the pci owner records it, not the probe
     /// path, so the field is set exactly once per bring-up.
     chip_ver: Option<HalChipVer>,
+    /// Programmed operating channel (`Profile`), if
+    /// `set_channel` completed; `None` until the first
+    /// channel-set. The band of this channel is the
+    /// `entity_active` state Linux's `__rtw89_set_channel`
+    /// compares for the band-change RFK trigger
+    /// (core.c:599).
+    channel: Option<Profile>,
     /// C2H completion worker state (RPQ/RXQ host write pointers
     /// + RXQ assembly). Rebuilt by `program_rings` at the
     ///   programmed depths, reset by `stop_dma`.
@@ -544,6 +579,7 @@ impl Prepared8922a {
             fwcmd_release: VecDeque::new(),
             firmware: None,
             chip_ver: None,
+            channel: None,
             completion: completion_8922a::Worker::new(DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
                 .map_err(Error::Completion)?,
         })
@@ -959,6 +995,62 @@ impl Prepared8922a {
             modify32(regs, address, mask, value)
         })
         .map_err(Error::Txpwr)
+    }
+
+    /// The programmed operating channel, if [`Self::set_channel`]
+    /// completed.
+    pub(super) fn channel(&self) -> Option<Profile> {
+        self.channel
+    }
+
+    /// core.c `__rtw89_set_channel` for the parts this owner
+    /// programs (see `channel_be`): the
+    /// `rtw8922a_set_channel_mac` program for `profile`, then
+    /// `rtw8922a_set_txpwr` for the admitted station `macid`
+    /// (the first live caller of [`Self::set_txpwr`]), then the
+    /// retained channel record. `center` for the power program
+    /// is `profile.center()` (the `rtw89_chan.channel`; 20 MHz:
+    /// the primary, wider: the channel plan's center).
+    ///
+    /// The requested channel must match the admitted station's
+    /// geometry (band, primary, width) exactly: a channel-set
+    /// for a station admitted on another channel is refused
+    /// with nothing written, as is a width no station can hold
+    /// (320 MHz). A `set_txpwr` refusal after the MAC program
+    /// leaves the MAC registers on the new channel with the old
+    /// power program and records no channel, so a retry
+    /// re-programs the MAC idempotently before retrying power.
+    /// The BB/RF channel programs, the help bracket, the BTC
+    /// switch-band notify and the async RFK steps are NOT run
+    /// here: the outcome reports the band change
+    /// (`!entity_active || band_changed`, core.c:599) for the
+    /// follow-up that owns them.
+    pub(super) fn set_channel(
+        &mut self,
+        macid: u8,
+        profile: Profile,
+        elements: &[Element],
+        country: [u8; 2],
+        regs: &mut impl super::irq::Regs,
+    ) -> Result<SetChannelOutcome, Error> {
+        let (band, primary, width_mhz) = {
+            let station = self.station(macid).ok_or(Error::NoStation)?;
+            (station.band, station.primary, station.width_mhz)
+        };
+        let band_ok = matches!(
+            (profile.band(), band),
+            (ChanBand::Ghz2, station_8922a::Band::Ghz2)
+                | (ChanBand::Ghz5, station_8922a::Band::Ghz5)
+                | (ChanBand::Ghz6, station_8922a::Band::Ghz6)
+        );
+        if !band_ok || primary != profile.primary() || width_mhz != profile.width().mhz() {
+            return Err(Error::Channel(super::rfk::Error::Policy));
+        }
+        channel_be::program_set_channel_mac(regs, profile).map_err(Error::Channel)?;
+        self.set_txpwr(macid, elements, country, profile.center(), regs)?;
+        let band_changed = self.channel.map(|c| c.band()) != Some(profile.band());
+        self.channel = Some(profile);
+        Ok(SetChannelOutcome { band_changed })
     }
 
     /// Acquire a BA-CAM bitmap slot for one admitted station's
