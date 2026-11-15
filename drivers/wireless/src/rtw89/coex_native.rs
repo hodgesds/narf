@@ -122,9 +122,6 @@ impl Protocol51 {
 /// older ABI (`fcxtdma` 1, `fcxslots` 1, `fcxinit` 0, `fcxctrl` 0) with
 /// the same init encoding. Linux takes the first row at or below the
 /// firmware; NARF stops at the 0.13 series (no newer ABI guessing).
-/// Only the version row and its tag are bound here (by the A calibration
-/// board); the `init`/`off_policy` owner encodings land with the A coex
-/// owner (`prepare_a`), which does not exist yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProtocolA {
     Tdma3,
@@ -147,6 +144,57 @@ impl ProtocolA {
         match self {
             Self::Tdma3 => 3,
             Self::Tdma1 => 1,
+        }
+    }
+    /// `rtw89_fw_h2c_cxdrv_init` (`fcxinit` 0) from
+    /// `rtw8852a_btc_set_rfe` (`rtw8852a.c:1836`): byte-for-byte B's
+    /// [`Protocol::init`]. A's `btc_set_rfe` is B's verbatim except B's
+    /// 1ANT quirk branch, which A lacks, so `ant_info` is always 0
+    /// (single_pos 0, diversity 0, btg_pos 0, stream_cnt 0); `kt_ver_adie`
+    /// is 0 (only 8851B/8852BT/8922A/8922D ever assign it); `mod_info` is
+    /// the BT position bit (`BTC_BT_ALONE` 0 / `BTC_BT_BTG` 1 at BIT(1)):
+    /// 0 dedicated, 2 shared. `wl_gch` 6, `info` 3 (WL-only + init ok).
+    pub fn init(self, rfe: u8, cut: u8) -> [u8; 14] {
+        let dedicated = rfe != 0 && rfe % 2 == 0;
+        [
+            0,
+            12,
+            u8::from(dedicated),
+            if dedicated { 3 } else { 2 },
+            10,
+            0,
+            rfe,
+            cut,
+            if dedicated { 0 } else { 2 },
+            0,
+            6,
+            3,
+            0,
+            0,
+        ]
+    }
+    /// `_fw_set_policy(BTC_CXP_OFF_BT)`: `_append_tdma` + `_append_slot_v1`
+    /// with the same OFF TDMA and OFF_BT slot0 as B. The TDMA TLV differs
+    /// by row: `fcxtdma` 3 wraps `dm->tdma` (all zero for OFF) in the v3
+    /// struct (`fver` 3 + 12 bytes), `fcxtdma` 1 sends it bare (8 bytes);
+    /// the slot TLV is identical (`fcxslots` 1 on both rows). Returns the
+    /// bytes and their length (26 for Tdma3, 22 for Tdma1).
+    pub fn off_policy(self) -> ([u8; 26], usize) {
+        match self {
+            Self::Tdma3 => (
+                [
+                    0, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 100, 0, 0x55, 0x55,
+                    0x55, 0xe5, 0, 0,
+                ],
+                26,
+            ),
+            Self::Tdma1 => (
+                [
+                    0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 100, 0, 0x55, 0x55, 0x55, 0xe5, 0,
+                    0, 0, 0, 0, 0,
+                ],
+                22,
+            ),
         }
     }
 }
@@ -385,6 +433,93 @@ impl Coex {
         }
         enforce_c(a.0).await?;
         a.cmd(3, &protocol.off_policy(), true).await?;
+        self.state = State::WlanOnly;
+        Ok(())
+    }
+}
+impl Coex {
+    /// RTL8852A coex.c `rtw89_btc_ntfy_init` for the same WLAN-only owner:
+    /// `rtw8852a_btc_set_rfe`, `rtw8852a_btc_init_cfg`
+    /// (`rtw89_mac_coex_init` RTK/inner PTA, same block as B;
+    /// `rtw8852a_btc_set_wl_pri` TX_RESP/BEACON, RR_WLSEL off,
+    /// `rtw8852a_set_trx_mask` by antenna type — shared: SS on both paths
+    /// plus TX on path A, all 0x5ff; dedicated: SS on both paths, 0x5df;
+    /// no path-B TX entry, unlike B — PTA break table, BT counter
+    /// enable/reset), `_write_scbd` (ACTIVE|ON|BTLOG), `_set_init_info`
+    /// (INIT, CTRL), the default WL TX power control
+    /// (`rtw8852a_btc_set_wl_txpwr_ctrl(0xffffffff)`: only the
+    /// force-by-rate / BT-grant EN bits clear, the value fields keep
+    /// whatever the TX-power program set — unlike B/C, which clear the
+    /// whole fields), then `_action_wl_only`: `_set_ant(WONLY)` (the
+    /// generic AX `rtw89_mac_cfg_gnt`, exactly as B) and
+    /// `_set_policy(BTC_CXP_OFF_BT)`.
+    ///
+    /// # Safety
+    /// Same retained exact A radio owner, current signed A records, no
+    /// independent BT/PTA producer, PHY0/SCC and CMAC TX closed.
+    pub async unsafe fn prepare_a(
+        &mut self,
+        io: &mut impl Interface,
+        rfe: u8,
+        cut: u8,
+        protocol: ProtocolA,
+    ) -> Result<(), Error> {
+        if self.state != State::New {
+            return Err(Error::Terminal);
+        }
+        self.state = State::Preparing;
+        let mut a = Access(io);
+        // rtw89_mac_coex_init: Realtek internal PTA, with source byte widths.
+        a.m8(0x40, 0, 0x20)?;
+        a.m8(0xda20, 0, 2)?;
+        a.m8(0xda35, 0, 1)?;
+        a.m8(0xda40, 0, 12)?;
+        a.m8(0xda42, 0, 1)?;
+        a.m8(0xcc07, 2, 0)?;
+        a.m16(0xc340, 0x200, 0x20)?;
+        let value = a.lte_read(0x3c).await? & 0x100;
+        a.lte_write(0x3c, value).await?;
+        a.m8(0x40, 0xc0, 0)?;
+        a.m8(0xda4c, 0, 1)?;
+        a.m8(0xda6c, 0x3f, 5)?;
+        a.m8(0x41, 4, 2)?;
+        // rtw8852a_btc_init_cfg; real RFE-parity antenna layout.
+        a.m32(0xda30, 0, 8)?;
+        a.m32(0xda10, 0, 0x100)?;
+        a.rf(0, 2, 0).await?;
+        a.rf(1, 2, 0).await?;
+        let dedicated = rfe != 0 && rfe % 2 == 0;
+        let masks: &[(u8, u32, u32)] = if dedicated {
+            &[(0, 0, 0x5df), (1, 0, 0x5df)]
+        } else {
+            &[(0, 0, 0x5ff), (1, 0, 0x5ff), (0, 2, 0x5ff)]
+        };
+        for &(path, group, value) in masks {
+            a.rf(path, 0xef, 0x20000).await?;
+            a.rf(path, 0x33, group).await?;
+            a.rf(path, 0x3f, value).await?;
+            a.rf(path, 0xef, 0).await?;
+        }
+        a.w32(0xda2c, 0xf0ffffff)?;
+        a.m32(0xda40, 0, 0x10004)?;
+        scoreboard(a.0, 0x4003).await?;
+        a.cmd(5, &protocol.init(rfe, cut), false).await?;
+        // Driver control v1: no manual testing, no ignore-BT/freerun flag.
+        a.cmd(5, &[6, 4, 0, 0, 0, 0], false).await?;
+        // Source default coex power control is 0xffffffff: disable both
+        // inherited force-by-rate and BT-grant adjustments, keeping the
+        // value fields. No dBm inferred.
+        a.m32(0xd200, 0x200, 0)?;
+        a.m32(0xd220, 0x2, 0)?;
+        if a.r32(0xd200)? & 0x200 != 0 || a.r32(0xd220)? & 0x2 != 0 {
+            return Err(power::Error::Access.into());
+        }
+        // Actual _set_ant(WONLY), not an inferred BT-disabled state.
+        enforce(a.0).await?;
+        // Explicit source OFF policy prevents relying on unknown firmware
+        // TDMA defaults. Wait for actual matching successful DONE_ACK.
+        let (policy, len) = protocol.off_policy();
+        a.cmd(3, &policy[..len], true).await?;
         self.state = State::WlanOnly;
         Ok(())
     }

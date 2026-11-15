@@ -77,10 +77,12 @@
 //!   `irq::Mask::config`, `station_control::Controller::new`;
 //!   `command_queue::descriptor` and `efuse::read_mac_with` now
 //!   route BE instead of refusing).
-//!   (6 GHz admission is done: `station_8922a` TPE + power
-//!   program, 20 MHz only; the register-level
-//!   `rtw8922a_set_txpwr` program and wide-6 GHz TPE are the
-//!   follow-ups.)
+//!   (6 GHz admission is done: `station_8922a` TPE rearranged to
+//!   the full operating width + power program at 20/40/80/160 MHz
+//!   (legacy HE20 20 MHz only); the register-level
+//!   `rtw8922a_set_txpwr` program is delivered
+//!   (`radio_power_be::Plan`, applied by
+//!   `Prepared8922a::set_txpwr`).)
 
 use alloc::vec::Vec;
 

@@ -284,6 +284,122 @@ impl Operating {
         Ok(())
     }
 }
+/// RTL8852A `rtw8852a_dig_regs` addresses that differ from B's and C's
+/// (reg.h). The seg0 PD register and spatial-reuse bit are C's
+/// (`c_regs::R_SEG0R_PD`, BIT(29)); only the PAGCUGC follow registers
+/// are the non-V1 set.
+mod a_regs {
+    pub(super) const R_PATH0_P20_FOLLOW_BY_PAGCUGC: u32 = 0x46a0;
+    pub(super) const R_PATH0_S20_FOLLOW_BY_PAGCUGC: u32 = 0x46a4;
+    pub(super) const R_PATH1_P20_FOLLOW_BY_PAGCUGC: u32 = 0x4774;
+    pub(super) const R_PATH1_S20_FOLLOW_BY_PAGCUGC: u32 = 0x4778;
+}
+impl Operating {
+    /// RTL8852A phy.c `rtw89_phy_dm_init` sub-inits between
+    /// `rtw8852a_bb_sethw` and `rtw89_phy_init_rf_nctl`, PHY_0 non-DBCC,
+    /// default (2.4GHz channel 1 / 20MHz, unlinked) chandef:
+    /// `rtw89_physts_parsing_init` (AX PHYSTS, identical to B),
+    /// `rtw89_phy_dig_init` with `rtw8852a_dig_regs` (core.c: `support_igi`
+    /// true only for `cut <= 1`, which affects runtime DIG only, not
+    /// init; `support_cckpd` true iff `cut > 1`; the non-V1 PAGCUGC
+    /// registers), `rtw89_phy_cfo_init` (XTAL SI SC_XO/SC_XI as B;
+    /// `rtw89_dcfo_comp_init` with `cfo_hw_comp = false`: `R_DCFO` = 1
+    /// and `R_AX_PWR_UL_CTRL2` CFO cleared) and `rtw89_phy_edcca_init`.
+    /// `bb_wrap`/`ch_info` are BE-only, `ul_tb_waveform_ctrl` is false
+    /// and RTL8852A has no antenna diversity (`ant_diversity` is set only
+    /// when `rf_path_num == 1`, mac.c:3269) or `rfe_gpio`; those are
+    /// no-ops.
+    ///
+    /// # Safety
+    /// As [`Self::prepare`], for the actual retained A BB tables/MAC/
+    /// firmware PHY-capability owner directly after `bb_sethw`.
+    pub(super) async unsafe fn prepare_a(
+        &mut self,
+        io: &mut impl Interface,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        if self.state != State::New {
+            return Err(Error::Terminal);
+        }
+        self.state = State::Failed;
+        if identity.chip() != ChipId::Rtl8852A
+            || identity.cut() > 15
+            || !identity.calibration().valid
+            || identity.calibration().rfe_type == 255
+        {
+            return Err(Error::Table);
+        }
+        let mut a = Access(io);
+        physts(&mut a)?;
+        // `rtw89_phy_dig_dyn_pd_th(rssi_nolink, false)`.
+        a.bb(c_regs::R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
+        a.bb(
+            c_regs::R_SEG0R_PD,
+            c_regs::B_SEG0R_PD_SPATIAL_REUSE_EN_MSK,
+            0,
+        )?;
+        // core.c `support_cckpd`: false only for A `cv <= CBV` (cut 0/1).
+        let cck_pd = identity.cut() > 1;
+        if cck_pd {
+            a.bb(R_BMODE_PDTH_EN_V1, B_BMODE_PDTH_LIMIT_EN_MSK_V1, 0)?;
+            // Same first unlinked 20MHz reset as B/C: igi_rssi 0, AX
+            // under-region, clamp to CCKPD_TH_MIN_RSSI (-18), minus
+            // IGI_RSSI_MAX (110).
+            a.bb(
+                R_BMODE_PDTH_V1,
+                B_BMODE_PDTH_LOWER_BOUND_MSK_V1,
+                (-128i32) as u32,
+            )?;
+        }
+        for (address, mask) in [
+            (
+                a_regs::R_PATH0_P20_FOLLOW_BY_PAGCUGC,
+                B_PATH0_P20_FOLLOW_BY_PAGCUGC_EN_MSK,
+            ),
+            (
+                a_regs::R_PATH0_S20_FOLLOW_BY_PAGCUGC,
+                B_PATH0_S20_FOLLOW_BY_PAGCUGC_EN_MSK,
+            ),
+            (
+                a_regs::R_PATH1_P20_FOLLOW_BY_PAGCUGC,
+                B_PATH1_P20_FOLLOW_BY_PAGCUGC_EN_MSK,
+            ),
+            (
+                a_regs::R_PATH1_S20_FOLLOW_BY_PAGCUGC,
+                B_PATH1_S20_FOLLOW_BY_PAGCUGC_EN_MSK,
+            ),
+        ] {
+            a.bb(address, mask, 0)?;
+        }
+        let cap = identity.xtal() & 0x7f;
+        for address in [5, 4] {
+            a.0.admit()?;
+            a.0.xtal_write(address, cap, 255).await?;
+        }
+        for address in [5, 4] {
+            a.0.admit()?;
+            if a.0.xtal_read(address).await? != cap {
+                return Err(Error::Terminal);
+            }
+        }
+        a.bb(R_DCFO_OPT, B_DCFO_OPT_EN, 1)?;
+        a.bb(R_DCFO_WEIGHT, B_DCFO_WEIGHT_MSK, 8)?;
+        a.bb(c_regs::R_DCFO, c_regs::B_DCFO, 1)?;
+        a.modify(R_AX_PWR_UL_CTRL2, B_AX_PWR_UL_CFO_MASK, 0)?;
+        a.bb(R_TX_COLLISION_T2R_ST, B_TX_COLLISION_T2R_ST_M, 0x29)?;
+        a.0.admit()?;
+        self.working = Some(WorkingState {
+            cut: identity.cut(),
+            rfe: identity.calibration().rfe_type,
+            crystal_cap: cap,
+            crystal_lower: cap.saturating_sub(64).max(1),
+            crystal_upper: cap.saturating_add(64).min(127),
+            cck_pd,
+        });
+        self.state = State::Prepared;
+        Ok(())
+    }
+}
 /// AX `__rtw89_physts_parsing_init(PHY_0)` without monitor mode.
 fn physts<I: Interface>(a: &mut Access<'_, I>) -> Result<(), Error> {
     a.bb(R_PLCP_HISTOGRAM, B_STS_DIS_TRIG_BY_FAIL, 1)?;

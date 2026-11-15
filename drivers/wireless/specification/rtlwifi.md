@@ -3009,8 +3009,7 @@ the coexistence owner runs every composed call site.
   is now the exact `rtl8723B_card_enable_flow` after the
   `_rtl8723be_init_mac` prefix (`RSV_CTRL = 0`, `APS_FSMCO+1 &= ~BIT7`),
   parsed with `PWR_CUT_ALL_MSK` as Linux does (so the test-chip-masked
-  `0x68[3]` row is issued). The former shared rows are kept, unchanged, as
-  `RTL8723AE_PWR_ON` for the diagnostic RTL8723AE.
+  `0x68[3]` row is issued).
 - `fw` — `is_fw_header` (`signature & 0xfff0 == 0x5300`), exact RAM-code
   length (linux-firmware `0x7bf2` / `0x77fa`), whole file at most
   `max_fw_size = 0x8000` (eight pages). `rtl8723_download_fw(hw, true,
@@ -3334,8 +3333,9 @@ the coexistence owner runs every composed call site.
   - Not composed (follow-ups): ASPM (PCIe programme #1849, not wifi).
     Composed: HT/40 MHz on this profile (`rtl8723be_update_hal_rate_mask`
     N rows via `ht.rs`, `rtl8723be_wide` / `retune_rtl8723be`; the
-    host-API capability publication is a separate follow-up — nl80211
-    still publishes no HT for 8723BE), the `btc_scan_notify` / `connect` /
+    host-API capability publication is composed too
+    (`rtl8723be::ht::host_capabilities`, `station_rtl8723be_host_caps`,
+    `rtl8723be_caps` — nl80211 publishes the composed HT20/40 body), the `btc_scan_notify` / `connect` /
     `special_packet` / IPS call sites from the shared station (handshake
     EAPOL replies produced inside the sync TX path are not covered — no
     async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond
@@ -3463,8 +3463,10 @@ is the factory identity — and retains the firmware owner, which runs
   the 8821AE `0x1f0` four-byte layout). Tests
   `smoke_rtl8723ae_coex_dm_registers`, `smoke_rtl8723ae_dm_mech_init_and_query`,
   `smoke_rtl8723ae_dm_all_off_sequences` (written, unexecuted). The
-  1-ant path is a Linux stub, ported as a no-op. The coex owner is still
-  unreachable from probe (chip not admitted).
+  1-ant path is a Linux stub, ported as a no-op. The coex owner binds
+  from the adapter facts probe derives (`Adapter::bt`, as the admission
+  smoke test does); its live feed still runs through the packet owner,
+  whose station admission is still open.
 - `envelope` — signed per-board NAPC power envelopes, 2.4 GHz only
   (#1458): `Calibration::permission_for` mints the `Permission` the
   packet owner transmits under (v1/v2 rows, CCK/OFDM/HT 1SS curves,
@@ -3472,7 +3474,8 @@ is the factory identity — and retains the firmware owner, which runs
 - `packet` — the AE packet owner (#1458): 92CE-style TX descriptor
   fill, RX descriptor query, firmware + envelope admission gates
   (`Owner::admit`, `admit_tx`) and the mailbox service entry
-  (`service_c2h`). The chip is still not admitted (probe diagnostic).
+  (`service_c2h`). Probe admits the chip (#2087); the packet owner
+  itself is not yet admitted — station admission is still open.
 
 ### RTL8192DE retained runtime (2.4 GHz legacy station admitted)
 
@@ -3761,9 +3764,9 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE: the per-chip coexistence owners are delivered (8723AE pass-1 owner + 1-/2-ant mechanism trees, #1458/#1470; 8723BE owner with 1-/2-antenna dispatch and every `rtl_btc_ops` call site, #1351); blocked on probe admission for both chips (diagnostic-only) and the 8723AE coex RF halves (pending an `rf.rs` RF-write API) |
+| `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE: the per-chip coexistence owners are delivered (8723AE pass-1 owner + 1-/2-ant mechanism trees, #1458/#1470; 8723BE owner with 1-/2-antenna dispatch and every `rtl_btc_ops` call site, #1351); probe admission landed for both chips (#2087 for 8723AE) and the 8723AE coex RF halves are delivered through the rtl8723com LSSI writer (7259422b6; the `rf.rs` RF-write API is not the path — 12-bit packing cannot carry the 20-bit coex values). Remaining: the 8821AE per-chip algorithm (future work) |
 | `dynamic_antenna_selection` | Native factory type1/2 hardware diversity and SMART type4, actual PHY mux/descriptor/training/restore and separate signed NEAN per-selector/thermal full-program qualification are implemented above, pending release compilation/native acceptance. Original static records remain unchanged; board measurements and physical mapping/RF acceptance remain external |
-| `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
+| `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; RTL8192DE 5 GHz channel operation delivered (#2026 prepare-layer admission; #2089 interface allow_channel + cold bring-up default channel 36). Still blocked on the rtl8821ae chip runtime (RTL8188EE is 2.4GHz-only) |
 | `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |
 | `rf_gain_tracking` | Native thermal TXAGC, actual IQK/LCK/restore and separate signed NETH full-dimensional qualification are implemented above, pending coordinated release compilation/native acceptance. Original NEPC/NEHT/NERT formats remain unchanged; measured board envelopes and physical thermal acceptance remain external |
 | `rts_cts_protection` | Native ERP CTS-to-self and per-device RTS threshold, exact source TXD fields and separate signed NERT full-program qualification are implemented above, pending compilation/native acceptance; physical board measurements remain external |

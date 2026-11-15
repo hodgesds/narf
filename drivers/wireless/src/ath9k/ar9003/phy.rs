@@ -7,7 +7,9 @@
 //! 2484 CCK FIR; `ar9003_hw_override_ini`, `ar9003_hw_set_channel_regs`,
 //! `ar9003_hw_set_chain_masks`, `ath9k_hw_apply_txpower`),
 //! `ar9003_hw_set_rfmode`, `ar9003_hw_set_delta_slope`,
-//! `ar9003_hw_spur_mitigate` (MRC CCK + OFDM), `set_board_values` and
+//! `ar9003_hw_spur_mitigate` (MRC CCK — skipped on the AR9565 — + OFDM,
+//! with the AR9565 self-correlation skip and B-mask second spur),
+//! `set_board_values` and
 //! `ar9003_hw_set_channel`. PHY, interrupts and the receive engine stay
 //! off; HT40, half/quarter rate and PAPRD are not prepared.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
@@ -48,6 +50,9 @@ const AR_PHY_GEN_CTRL: u64 = 0xa204;
 const AR_PHY_MODE: u64 = 0xa208;
 const AR_PHY_ACTIVE: u64 = 0xa20c;
 const AR_PHY_SPUR_MASK_A: u64 = 0xa220;
+/// `ar9003_phy.h::AR_PHY_SPUR_MASK_B(ah)` (`AR_SM_BASE + 0x24`; the
+/// AR9561 uses `+ 0x1c`, which no modeled chip is).
+const AR_PHY_SPUR_MASK_B: u64 = 0xa224;
 const AR_PHY_RX_CHAINMASK: u64 = 0xa2a0;
 const AR_PHY_CAL_CHAINMASK: u64 = 0xa2c0;
 const AR_PHY_AGC_CONTROL: u64 = 0xa2c4;
@@ -147,9 +152,22 @@ fn doubler_fix(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
 }
 
 /// `ar9003_hw_spur_mitigate_mrc_cck` for a 20 MHz channel: the fixed
-/// AR9300 list at range 10, and the AR9462 branch (`ar9003_phy.c:269,275`)
-/// at range 5 with the first and last spurs (2420, 2480) skipped.
-fn spur_mrc_cck(io: &mut impl RegisterIo, chip: Chip, frequency: u16) -> Result<(), BringUpError> {
+/// AR9300 list at range 10, the AR9462 branch (`ar9003_phy.c:269,275`)
+/// at range 5 with the first and last spurs (2420, 2480) skipped, and
+/// the AR9485-family branch (`ar9003_phy.c:252-322`): the band's EEPROM
+/// `spurChans` through `fbin2freq`, five entries at range 10,
+/// `synth_freq` the channel. An empty spur list returns without a
+/// write, as Linux does; the HT40 form (range 19, `synth_freq` primary
+/// ± 10 MHz) is not prepared here.
+fn spur_mrc_cck(
+    io: &mut impl RegisterIo,
+    chip: Chip,
+    image: &Image,
+    frequency: u16,
+) -> Result<(), BringUpError> {
+    if chip == Chip::Ar9485 {
+        return spur_mrc_cck_eeprom(io, image, frequency);
+    }
     let range = if chip == Chip::Ar9462 { 5 } else { 10 };
     for (i, spur) in CCK_SPURS.into_iter().enumerate() {
         if chip == Chip::Ar9462 && (i == 0 || i == 3) {
@@ -157,6 +175,49 @@ fn spur_mrc_cck(io: &mut impl RegisterIo, chip: Chip, frequency: u16) -> Result<
         }
         let offset = spur - i32::from(frequency);
         if offset.abs() < range {
+            let mut cck = (offset.abs() << 19) / 11;
+            if offset < 0 {
+                cck = -cck;
+            }
+            field(io, AR_PHY_AGC_CONTROL, 0x3c0, 6, 7)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 0x1fe, 1, 0x7f)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 0x6000_0000, 29, 2)?;
+            field(io, AR_PHY_CCK_SPUR_MIT, 1, 0, 1)?;
+            field(
+                io,
+                AR_PHY_CCK_SPUR_MIT,
+                0x1fff_fe00,
+                9,
+                (cck & 0xfffff) as u32,
+            )?;
+            return Ok(());
+        }
+    }
+    field(io, AR_PHY_AGC_CONTROL, 0x3c0, 6, 5)?;
+    field(io, AR_PHY_CCK_SPUR_MIT, 1, 0, 0)?;
+    field(io, AR_PHY_CCK_SPUR_MIT, 0x1fff_fe00, 9, 0)
+}
+
+/// The AR9485-family arm of `ar9003_hw_spur_mitigate_mrc_cck`
+/// (`ar9003_phy.c:252-322`, 20 MHz): the band's EEPROM `spurChans`
+/// (`ar9003_get_spur_chan_ptr`), five entries through
+/// `ath9k_hw_fbin2freq` at range 10 against the channel. The first entry
+/// being zero means no spur and returns before any write; a spur outside
+/// the range falls through to the same clear writes as the fixed list.
+fn spur_mrc_cck_eeprom(
+    io: &mut impl RegisterIo,
+    image: &Image,
+    frequency: u16,
+) -> Result<(), BringUpError> {
+    let two = frequency < 4000;
+    let spurs = super::eeprom::modal_base(!two) + super::eeprom::modal::SPUR_CHANS;
+    if image[spurs] == 0 {
+        return Ok(());
+    }
+    for i in 0..5 {
+        let spur = super::eeprom::fbin2freq(image[spurs + i], two);
+        let offset = spur - i32::from(frequency);
+        if offset.abs() < 10 {
             let mut cck = (offset.abs() << 19) / 11;
             if offset < 0 {
                 cck = -cck;
@@ -202,9 +263,40 @@ const OFDM_SPUR_FIELDS: [(u64, u32, u32); 17] = [
     (AR_PHY_CHAN_SPUR_MASK, 0x1f, 0),     // CF_CHAN_MASK_A
 ];
 
+/// `ar9003_hw_spur_ofdm_9565` (`ar9003_phy.c:436`): the AR9565's B spur
+/// mask for a second in-range spur. The mask index is the same
+/// `(offset << 4) / 5` computation as the A mask; the B fields are
+/// `ar9003_phy.h:233-245` (`PILOT_MASK_IDX_B` 0x00fe0000/17,
+/// `PILOT_MASK_B` 0x0001f000/12, `CHAN_MASK_IDX_B` 0x00fe0000/17,
+/// `CHAN_MASK_B` 0x0001f000/12) and the puncture fields reuse the A
+/// names on the B register (`SPUR_MASK_A_CF_PUNC_MASK_IDX_A`
+/// 0x1fc00/10, `CF_PUNC_MASK_A` 0x3ff/0), with the `A == B` values
+/// 0xe/0xe/0xa0.
+fn spur_ofdm_9565(io: &mut impl RegisterIo, offset: i32) -> Result<(), BringUpError> {
+    let mut mask_index = (offset << 4) / 5;
+    if mask_index < 0 {
+        mask_index -= 1;
+    }
+    let mask_index = (mask_index & 0x7f) as u32;
+    field(io, AR_PHY_PILOT_SPUR_MASK, 0x00fe_0000, 17, mask_index)?;
+    field(io, AR_PHY_SPUR_MASK_B, 0x1fc00, 10, mask_index)?;
+    field(io, AR_PHY_CHAN_SPUR_MASK, 0x00fe_0000, 17, mask_index)?;
+    field(io, AR_PHY_PILOT_SPUR_MASK, 0x1f000, 12, 0xe)?;
+    field(io, AR_PHY_CHAN_SPUR_MASK, 0x1f000, 12, 0xe)?;
+    field(io, AR_PHY_SPUR_MASK_B, 0x3ff, 0, 0xa0)
+}
+
 /// `ar9003_hw_spur_mitigate_ofdm` for a 20 MHz channel over the band's
-/// EEPROM `spurChans` (range 10, `synth_freq` the channel).
-fn spur_ofdm(io: &mut impl RegisterIo, image: &Image, frequency: u16) -> Result<(), BringUpError> {
+/// EEPROM `spurChans` (range 10, `synth_freq` the channel), with the
+/// AR9565 branches of `ar9003_hw_spur_ofdm` (`:391`, the
+/// self-correlation skip at 2437 MHz) and
+/// `ar9003_hw_spur_mitigate_ofdm` (`:554`, the B-mask second spur).
+fn spur_ofdm(
+    io: &mut impl RegisterIo,
+    chip: Chip,
+    image: &Image,
+    frequency: u16,
+) -> Result<(), BringUpError> {
     let two = frequency < 4000;
     let spurs = super::eeprom::modal_base(!two) + super::eeprom::modal::SPUR_CHANS;
     if image[spurs] == 0 {
@@ -232,7 +324,14 @@ fn spur_ofdm(io: &mut impl RegisterIo, image: &Image, frequency: u16) -> Result<
         field(io, AR_PHY_TIMING11, 0x000f_ffff, 0, delta_phase as u32)?;
         field(io, AR_PHY_SFCORR_EXT, 0x1000_0000, 28, 0)?;
         field(io, AR_PHY_TIMING11, 0x4000_0000, 30, 1)?;
-        field(io, AR_PHY_TIMING11, 0x8000_0000, 31, 1)?;
+        // `ar9003_phy.c:391` (`ar9003_hw_spur_ofdm`): the AR9565 at
+        // range 10 and synth 2437 MHz skips the self-correlation spur
+        // filter (this owner is HT20-only, so range is always 10 and
+        // the synth frequency is the channel). The clear above already
+        // left the field 0, so skipping the set leaves it clear.
+        if !(chip == Chip::Ar9565 && frequency == 2437) {
+            field(io, AR_PHY_TIMING11, 0x8000_0000, 31, 1)?;
+        }
         field(io, AR_PHY_TIMING4, 0x8000_0000, 31, 1)?;
         field(io, AR_PHY_SPUR_REG, 0xff, 0, 34)?;
         field(io, AR_PHY_SPUR_REG, 0x100, 8, 1)?;
@@ -258,6 +357,17 @@ fn spur_ofdm(io: &mut impl RegisterIo, image: &Image, frequency: u16) -> Result<
         field(io, AR_PHY_CHAN_SPUR_MASK, 0x1f, 0, 0xc)?;
         field(io, AR_PHY_SPUR_MASK_A, 0x3ff, 0, 0xa0)?;
         field(io, AR_PHY_SPUR_REG, 0x03fc_0000, 18, 0xff)?;
+        // `ar9003_phy.c:554-560` (`ar9003_hw_spur_mitigate_ofdm`):
+        // the AR9565 programs the B spur mask from the NEXT spur bin
+        // too, when it is in range and this is not the last entry.
+        // An unused next bin converts to a far-away frequency, so the
+        // range check refuses it exactly as Linux's does.
+        if chip == Chip::Ar9565 && i < 4 {
+            let next = super::eeprom::fbin2freq(image[spurs + i + 1], two) - i32::from(frequency);
+            if next.abs() < 10 {
+                spur_ofdm_9565(io, next)?;
+            }
+        }
         break;
     }
     Ok(())
@@ -334,6 +444,13 @@ pub(in crate::ath9k) fn expected(
         .wrapping_add(tables.rxgain_xlna.len() as u16);
     if five {
         last_cl(tables.fast_clock, modes_index, &mut cl);
+        writes = writes.wrapping_add(tables.fast_clock.len() as u16);
+    }
+    // `ar9003_phy.c:1713` (`ar9003_hw_process_ini`): the AR9565 writes
+    // its fast-clock array (column 1) on every channel, in addition to
+    // the 5 GHz write above. The array holds no `AR_PHY_CL_CAL_CTL`
+    // row, so only the write count changes.
+    if revision.ar9565() {
         writes = writes.wrapping_add(tables.fast_clock.len() as u16);
     }
     if frequency == 2484 {
@@ -420,6 +537,12 @@ pub(in crate::ath9k) fn prepare(
         // IS_CHAN_A_FAST_CLOCK: ATH9K_HW_CAP_FASTCLOCK on every AR9300.
         write_array(io, tables.fast_clock, modes_index, &mut writes);
     }
+    if revision.ar9565() {
+        // `ar9003_phy.c:1713` (`ar9003_hw_process_ini`): the AR9565
+        // writes its fast-clock array (column 1) on every channel, in
+        // addition to the 5 GHz fast-clock write above.
+        write_array(io, tables.fast_clock, 1, &mut writes);
+    }
     if frequency == 2484 {
         prog_ini(io, tables.cck_fir_japan_2484, 1);
     }
@@ -480,8 +603,12 @@ pub(in crate::ath9k) fn prepare(
     let (mantissa, exponent) = slope(9 * coefficient / 10);
     field(io, AR_PHY_SGI_DELTA, 0x7fff0, 4, mantissa)?;
     field(io, AR_PHY_SGI_DELTA, 0xf, 0, exponent)?;
-    spur_mrc_cck(io, revision.chip, frequency)?;
-    spur_ofdm(io, image, frequency)?;
+    // `ar9003_phy.c:571` (`ar9003_hw_spur_mitigate`): the AR9565 never
+    // runs MRC-CCK spur mitigation.
+    if !revision.ar9565() {
+        spur_mrc_cck(io, revision.chip, image, frequency)?;
+    }
+    spur_ofdm(io, revision.chip, image, frequency)?;
     board::set_board_values(io, revision.chip, image, frequency, rx, tx)?;
     // ar9003_hw_set_channel.
     let (select, two) = channel_select(frequency);

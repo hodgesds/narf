@@ -1118,7 +1118,8 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
     let vif_addr = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let main = match owner.add_vif(vif_addr, VifRole::Station) {
+    let link_addrs = [vif_addr, [0x02, 0x11, 0x22, 0x33, 0x44, 0x56]];
+    let main = match owner.add_vif(vif_addr, VifRole::Station, link_addrs) {
         Ok(main) => main,
         Err(_) => return TestResult::Fail("add_vif failed"),
     };
@@ -1141,7 +1142,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
     {
         return TestResult::Fail("vif_by_addr mismatch");
     }
-    if owner.add_vif(vif_addr, VifRole::Station) != Err(Error::VifExists) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Err(Error::VifExists) {
         return TestResult::Fail("duplicate VIF address accepted");
     }
     // The TDLS peer takes the VIF main MACID, not a pool
@@ -1179,7 +1180,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     if owner.admit_tdls_peer(0, &base_req()) != Ok(0) {
@@ -1198,7 +1199,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Ap) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Ap, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     if owner.admit_tdls_peer(0, &base_req()) != Err(Error::NotStationMode) {
@@ -1211,7 +1212,7 @@ fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
         Ok(owner) => owner,
         Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
     };
-    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+    if owner.add_vif(vif_addr, VifRole::Station, link_addrs) != Ok(0) {
         return TestResult::Fail("add_vif failed");
     }
     let mut wrong_port = base_req();
@@ -1234,7 +1235,7 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // Five VIFs take the five hardware ports (mains 0..4).
     for i in 0..5u8 {
         let addr = [0x02, 0, 0, 0, 0, i];
-        let main = match owner.add_vif(addr, VifRole::Station) {
+        let main = match owner.add_vif(addr, VifRole::Station, [addr, [0x02, 0, 0, 0, 1, i]]) {
             Ok(main) => main,
             Err(_) => return TestResult::Fail("add_vif failed"),
         };
@@ -1248,7 +1249,12 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // The sixth VIF has no port: refused, and the MACID its
     // failed admission allocated is freed again (the next
     // pool station takes it).
-    if owner.add_vif([0x02, 0, 0, 0, 0, 5], VifRole::Station) != Err(Error::NoPort) {
+    if owner.add_vif(
+        [0x02, 0, 0, 0, 0, 5],
+        VifRole::Station,
+        [[0x02, 0, 0, 0, 0, 5], [0x02, 0, 0, 0, 1, 5]],
+    ) != Err(Error::NoPort)
+    {
         return TestResult::Fail("sixth VIF not refused");
     }
     if owner.admit_station(&base_req()) != Ok(5) {
@@ -1257,7 +1263,11 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     // Removing a VIF frees its port and base together.
     owner.release_station(5);
     owner.remove_vif(2);
-    let main = match owner.add_vif([0x02, 0, 0, 0, 0, 6], VifRole::Station) {
+    let main = match owner.add_vif(
+        [0x02, 0, 0, 0, 0, 6],
+        VifRole::Station,
+        [[0x02, 0, 0, 0, 0, 6], [0x02, 0, 0, 0, 1, 6]],
+    ) {
         Ok(main) => main,
         Err(_) => return TestResult::Fail("VIF re-add after removal failed"),
     };
@@ -1485,29 +1495,34 @@ fn smoke_rtw89_prepared_8922a_set_txpwr_writes_program() -> TestResult {
     // contents (read-modify-write), they do not clobber
     // neighbouring fields: ref fields cleared, shape bit
     // set, TXAGC reference 0, TSSI_K 0x12, SAR 126.
+    // Seeded with 0xA5A5_A5A5, not u32::MAX: `modify32`
+    // treats a u32::MAX read as a gone device, so a MAX
+    // seed refuses before any write lands. The alternating
+    // pattern still exercises the merge (set bits inside
+    // and outside every written field).
     let mut seeded = Model::new()
-        .with32(0x11A20, u32::MAX)
-        .with32(0x20000 + 0x6C04, u32::MAX)
-        .with32(0x20000 + 0xE628, u32::MAX)
-        .with32(0x20000 + 0xE6A0, u32::MAX)
-        .with32(0x20000 + 0xE728, u32::MAX)
-        .with32(0x20000 + 0xE7A0, u32::MAX)
-        .with32(0x20000 + 0xE61C, u32::MAX)
-        .with32(0x20000 + 0xE71C, u32::MAX);
+        .with32(0x11A20, 0xA5A5_A5A5)
+        .with32(0x20000 + 0x6C04, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE628, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE6A0, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE728, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE7A0, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE61C, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE71C, 0xA5A5_A5A5);
     if owner
         .set_txpwr(macid, &elements, *b"US", 37, &mut seeded)
         .is_err()
     {
         return TestResult::Fail("seeded set_txpwr refused");
     }
-    if seeded.regs32.get(&0x11A20) != Some(&0xFFF8_0001)
-        || seeded.regs32.get(&(0x20000 + 0x6C04)) != Some(&0xFFFF_FFFD)
-        || seeded.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_0000)
-        || seeded.regs32.get(&(0x20000 + 0xE6A0)) != Some(&0xC12F_FFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_0000)
-        || seeded.regs32.get(&(0x20000 + 0xE7A0)) != Some(&0xC12F_FFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE61C)) != Some(&0xFFE7_EFFF)
-        || seeded.regs32.get(&(0x20000 + 0xE71C)) != Some(&0xFFE7_EFFF)
+    if seeded.regs32.get(&0x11A20) != Some(&0xA5A0_0001)
+        || seeded.regs32.get(&(0x20000 + 0x6C04)) != Some(&0xA5A5_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE628)) != Some(&0xA5A4_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE6A0)) != Some(&0x8125_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE728)) != Some(&0xA5A4_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE7A0)) != Some(&0x8125_A5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE61C)) != Some(&0xA5A7_E5A5)
+        || seeded.regs32.get(&(0x20000 + 0xE71C)) != Some(&0xA5A7_E5A5)
     {
         return TestResult::Fail("set_txpwr partial-mask merge differs");
     }
@@ -1523,16 +1538,18 @@ fn smoke_rtw89_prepared_8922a_set_txpwr_writes_program() -> TestResult {
         Err(_) => return TestResult::Fail("6GHz SP admission refused (CAV)"),
     };
     let mut regs = Model::new()
-        .with32(0x20000 + 0xE628, u32::MAX)
-        .with32(0x20000 + 0xE728, u32::MAX);
+        // Non-MAX seed, as above (a u32::MAX read is a
+        // gone device).
+        .with32(0x20000 + 0xE628, 0xA5A5_A5A5)
+        .with32(0x20000 + 0xE728, 0xA5A5_A5A5);
     if cav
         .set_txpwr(cav_macid, &elements, *b"US", 37, &mut regs)
         .is_err()
     {
         return TestResult::Fail("CAV set_txpwr refused");
     }
-    if regs.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_8040)
-        || regs.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_8040)
+    if regs.regs32.get(&(0x20000 + 0xE628)) != Some(&0xA5A4_8040)
+        || regs.regs32.get(&(0x20000 + 0xE728)) != Some(&0xA5A4_8040)
     {
         return TestResult::Fail("CAV TXAGC reference differs from rtw8922a_set_txpwr_diff");
     }
@@ -1567,4 +1584,157 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_set_txpwr_writes_program
+);
+
+fn smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr() -> TestResult {
+    use super::operating_channel_c::{Band as ChanBand, Profile, Width as ChanWidth};
+    let elements = txpwr_elements();
+    // 6 GHz SP ch37, TPE 5 dBm, US: FCC/STD — the proven
+    // set_txpwr geometry.
+    let mut req = base_req();
+    req.band = Band::Ghz6;
+    req.width_mhz = 20;
+    req.primary = 37;
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: Some(5),
+    });
+    let mut owner = match Prepared8922a::new(factory(), 1) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let macid = match owner.admit_station(&req) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("6GHz SP admission refused"),
+    };
+    let Some(profile) = Profile::new20(ChanBand::Ghz6, 37) else {
+        return TestResult::Fail("6GHz ch37 profile refused");
+    };
+    // A set_txpwr refusal AFTER the MAC+BB program leaves the
+    // MAC+BB registers on the new channel with the old power
+    // program and records no channel: only the 5 MAC registers
+    // and the 20 BB registers land.
+    let no_byrate: Vec<Element> = txpwr_elements()
+        .into_iter()
+        .filter(|e| e.id != ID_BYRATE)
+        .collect();
+    let mut regs = Model::new();
+    if owner
+        .set_channel(macid, profile, &no_byrate, *b"US", &mut regs)
+        .is_ok()
+        || regs.regs32.len() != 25
+        || regs.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x26B4C) != Some(&6135)
+        || regs.regs32.get(&0x26B50) != Some(&43)
+        || regs.regs32.get(&0x20734) != Some(&0x0082_0000)
+        || regs.regs32.contains_key(&0x11E00)
+        || owner.channel().is_some()
+    {
+        return TestResult::Fail(
+            "set_channel without BYRATE did not fail after the MAC+BB program",
+        );
+    }
+    // First channel-set: MAC words (rtw8922a_set_channel_mac,
+    // 20 MHz 6 GHz: RFMOD 0, TXSB PRI20 bitmap bit 0, TXRATE_CHK
+    // CCK_EN|RTS6, SIFS 0x3f/0x3e), BB words
+    // (rtw8922a_set_channel_bb, 20 MHz 6 GHz: FC0 6135, SCO 43,
+    // chan_idx 0x82, band-select 0, CCK off, RSTB_ASYNC 1, TSSI
+    // pulsed to 1), plus the 194-register set_txpwr program
+    // (by-rate head as in the set_txpwr test).
+    let mut regs = Model::new();
+    let outcome = match owner.set_channel(macid, profile, &elements, *b"US", &mut regs) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("set_channel refused"),
+    };
+    if !outcome.band_changed {
+        return TestResult::Fail("first set_channel must report a band change");
+    }
+    if owner.channel() != Some(profile) {
+        return TestResult::Fail("set_channel did not retain the channel");
+    }
+    if regs.regs32.get(&0x10010) != Some(&0)
+        || regs.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x10828) != Some(&0x03)
+        || regs.regs32.get(&0x1033C) != Some(&0x3F)
+        || regs.regs32.get(&0x10370) != Some(&0x003E_0000)
+        || regs.regs32.get(&0x26B4C) != Some(&6135)
+        || regs.regs32.get(&0x26B50) != Some(&43)
+        || regs.regs32.get(&0x20734) != Some(&0x0082_0000)
+        || regs.regs32.get(&0x24160) != Some(&0)
+        || regs.regs32.get(&0x20520) != Some(&1)
+        || regs.regs32.get(&0x20704) != Some(&0x2)
+        || regs.regs32.get(&0x2E60C) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x2E70C) != Some(&0x0001_0000)
+        || regs.regs32.get(&0x11E00) != Some(&0x0302_0105)
+        || regs.regs32.len() != 219
+    {
+        return TestResult::Fail("set_channel did not run the MAC + BB + set_txpwr programs");
+    }
+    // Retune across bands: a second station admitted on 5 GHz
+    // 80 MHz primary 36 (center 42). Band change reported, MAC
+    // words for 80 MHz (RFMOD 2, SIFS 0x41/0x41), and the
+    // set_txpwr program ran (by-rate head present).
+    let mut req5 = base_req();
+    req5.width_mhz = 80;
+    let macid5 = match owner.admit_station(&req5) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("5GHz 80MHz admission refused"),
+    };
+    let Some(profile5) = Profile::new_wide(ChanBand::Ghz5, 36, ChanWidth::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile refused");
+    };
+    let mut regs5 = Model::new();
+    let outcome5 = match owner.set_channel(macid5, profile5, &elements, *b"US", &mut regs5) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("5GHz retune set_channel refused"),
+    };
+    if !outcome5.band_changed || owner.channel() != Some(profile5) {
+        return TestResult::Fail("5GHz retune did not report a band change and retain it");
+    }
+    if regs5.regs32.get(&0x10010) != Some(&2)
+        || regs5.regs32.get(&0x10088) != Some(&0x0001_0000)
+        || regs5.regs32.get(&0x10828) != Some(&0x03)
+        || regs5.regs32.get(&0x1033C) != Some(&0x41)
+        || regs5.regs32.get(&0x10370) != Some(&0x0041_0000)
+        || regs5.regs32.get(&0x26B4C) != Some(&5210)
+        || regs5.regs32.get(&0x26B50) != Some(&50)
+        || regs5.regs32.get(&0x26B54) != Some(&0x2000)
+        || regs5.regs32.get(&0x20734) != Some(&0x0020_0000)
+        || regs5.regs32.get(&0x2E44C) != Some(&1)
+        || !regs5.regs32.contains_key(&0x11E00)
+    {
+        return TestResult::Fail("5GHz retune did not run the MAC + BB + set_txpwr programs");
+    }
+    // Refusals write nothing: an unknown MACID, a channel that
+    // disagrees with the admitted station's geometry, and a
+    // 320 MHz channel no station can hold.
+    let mut regs = Model::new();
+    if owner.set_channel(9, profile, &elements, *b"US", &mut regs) != Err(Error::NoStation)
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_channel for an unknown MACID did not refuse cleanly");
+    }
+    let mut regs = Model::new();
+    if owner.set_channel(macid, profile5, &elements, *b"US", &mut regs)
+        != Err(Error::Channel(super::rfk::Error::Policy))
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_channel with mismatched geometry did not refuse cleanly");
+    }
+    let Some(profile320) = Profile::new_6ghz_320(33, 63) else {
+        return TestResult::Fail("6GHz 320MHz profile refused");
+    };
+    let mut regs = Model::new();
+    if owner.set_channel(macid, profile320, &elements, *b"US", &mut regs)
+        != Err(Error::Channel(super::rfk::Error::Policy))
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("320MHz set_channel did not refuse cleanly");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_set_channel_drives_mac_and_txpwr
 );

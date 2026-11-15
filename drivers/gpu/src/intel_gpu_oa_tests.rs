@@ -2872,7 +2872,10 @@ kernel_test_in!(
 );
 
 fn smoke_oa_query_open_validation_and_sampler_lifecycle() -> TestResult {
-    let backend = Backend::new(device(64, MTL, 1270));
+    // Card 64 never validates: the OA registry holds cards 0..63, so
+    // Device::validate rejects 64 with NoDevice and add() unwraps it.
+    // 37 is unused by every other OA test in this crate.
+    let backend = Backend::new(device(37, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let alive = Arc::new(AtomicBool::new(true));

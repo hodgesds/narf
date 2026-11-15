@@ -67,6 +67,7 @@ mod cctl_g7_tests;
 pub mod chan;
 mod channel_51;
 mod channel_bb;
+mod channel_be;
 mod channel_c;
 mod channel_rf;
 mod channel_transition;
@@ -160,6 +161,7 @@ mod qos;
 mod ra_mask;
 mod ra_v1;
 mod radio_51;
+mod radio_a;
 mod radio_assets;
 mod radio_be;
 mod radio_c;
@@ -298,6 +300,9 @@ mod efuse_be_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod prepared_8922a_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod prepared_8922a_mlo_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod eht_tests;

@@ -20,6 +20,7 @@ struct Model {
     denied: bool,
     stuck: bool,
     ignore: Option<u32>,
+    rf_trace: Vec<(u8, u32, u32, u32)>,
 }
 impl Model {
     fn new(seed: u8) -> Self {
@@ -36,6 +37,7 @@ impl Model {
             denied: false,
             stuck: false,
             ignore: None,
+            rf_trace: Vec::new(),
         }
     }
     fn access(&mut self) -> Result<(), power::Error> {
@@ -131,6 +133,7 @@ impl Interface for Model {
     }
     async fn rf_write(&mut self, p: u8, a: u32, m: u32, v: u32) -> Result<(), Error> {
         self.access()?;
+        self.rf_trace.push((p, a, m, v));
         self.values(&[16, u32::from(p), a, m, v]);
         Ok(())
     }
@@ -460,4 +463,124 @@ fn smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg() -> TestRes
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg
+);
+
+fn smoke_rtw89_a_coex_init_and_off_policy_follow_rtw8852a() -> TestResult {
+    // Shared RFE 1: ant shared, 2 antennas, BT at BTG.
+    assert_eq!(
+        ProtocolA::Tdma3.init(1, 1),
+        [0, 12, 0, 2, 10, 0, 1, 1, 2, 0, 6, 3, 0, 0]
+    );
+    assert_eq!(
+        ProtocolA::Tdma1.init(1, 1),
+        [0, 12, 0, 2, 10, 0, 1, 1, 2, 0, 6, 3, 0, 0]
+    );
+    // Dedicated RFE 2: ant dedicated, 3 antennas, BT solo.
+    assert_eq!(
+        ProtocolA::Tdma3.init(2, 2),
+        [0, 12, 1, 3, 10, 0, 2, 2, 0, 0, 6, 3, 0, 0]
+    );
+    // RFE 0 (no shared BT antenna): still valid, ant shared, 2 antennas.
+    assert_eq!(
+        ProtocolA::Tdma3.init(0, 1),
+        [0, 12, 0, 2, 10, 0, 0, 1, 2, 0, 6, 3, 0, 0]
+    );
+    // Tdma3 OFF policy is B's 26 bytes; Tdma1 is the same OFF TDMA + slot
+    // with the 8-byte v1 TDMA TLV (22 bytes).
+    let (tdma3, len3) = ProtocolA::Tdma3.off_policy();
+    assert_eq!(len3, 26);
+    assert_eq!(
+        tdma3,
+        [
+            0, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 100, 0, 0x55, 0x55, 0x55, 0xe5,
+            0, 0
+        ]
+    );
+    let (tdma1, len1) = ProtocolA::Tdma1.off_policy();
+    assert_eq!(len1, 22);
+    assert_eq!(
+        tdma1[..22],
+        [0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 100, 0, 0x55, 0x55, 0x55, 0xe5, 0, 0]
+    );
+    TestResult::Pass
+}
+
+fn smoke_rtw89_a_wlan_only_coex_init_follows_rtw8852a() -> TestResult {
+    for &(rfe, dedicated) in &[(1u8, false), (2u8, true)] {
+        let mut io = Model::new(0);
+        // The A TX-power step clears only the EN bits and keeps the
+        // value fields the TX-power program set.
+        io.bytes[0xd200..0xd204].copy_from_slice(&0x2ffu32.to_le_bytes());
+        io.bytes[0xd220..0xd224].copy_from_slice(&0xffau32.to_le_bytes());
+        let mut owner = Coex::default();
+        // SAFETY: inert owned bytes and explicit model qualification, with no RF/DMA.
+        let result = ready(unsafe { owner.prepare_a(&mut io, rfe, 1, ProtocolA::Tdma3) });
+        if result != Some(Ok(())) || owner.state() != State::WlanOnly {
+            return TestResult::Fail("A WLAN-only coex init did not complete");
+        }
+        let words =
+            |a: u32| u32::from_le_bytes(io.bytes[a as usize..a as usize + 4].try_into().unwrap());
+        if words(0xda30) & 8 != 8
+            || words(0xda10) & 0x100 != 0x100
+            || words(0xda2c) != 0xf0ff_ffff
+            || words(0xda40) & 0x10004 != 0x10004
+            || words(0xd200) & 0x200 != 0
+            || words(0xd200) & 0x1ff != 0xff
+            || words(0xd220) & 0x2 != 0
+            || words(0xd220) & 0xff8 != 0xff8
+            || words(0xac) != 0x8100_4003
+        {
+            return TestResult::Fail("A WLAN-only coex register state differs");
+        }
+        if io.lte[0x38 / 4] != 0x7700_7700 || io.bytes[0x73] & 4 != 4 {
+            return TestResult::Fail("A WLAN-only GNT enforcement differs");
+        }
+        // The exact TRX-mask sequence: shared has the (path 0, TX) entry,
+        // dedicated does not; neither has B's (path 1, TX) entry. Each
+        // mask is a (LUTWA group, LUTWD0 value) pair in trace order.
+        let mut got: Vec<(u8, u32, u32)> = Vec::new();
+        let mut group: Option<(u8, u32)> = None;
+        for (p, a, _, v) in &io.rf_trace {
+            match a {
+                0x33 => group = Some((*p, *v)),
+                0x3f => {
+                    if let Some((gp, gv)) = group.take() {
+                        got.push((gp, gv, *v));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let expected: &[(u8, u32, u32)] = if dedicated {
+            &[(0, 0, 0x5df), (1, 0, 0x5df)]
+        } else {
+            &[(0, 0, 0x5ff), (1, 0, 0x5ff), (0, 2, 0x5ff)]
+        };
+        if got != expected {
+            return TestResult::Fail("A TRX-mask sequence differs");
+        }
+    }
+    // A second prepare on the same owner is terminal.
+    let mut io = Model::new(0);
+    let mut owner = Coex::default();
+    // SAFETY: inert owned bytes and explicit model qualification, with no RF/DMA.
+    let first = ready(unsafe { owner.prepare_a(&mut io, 1, 1, ProtocolA::Tdma3) });
+    if first != Some(Ok(())) {
+        return TestResult::Fail("A coex first prepare did not complete");
+    }
+    // SAFETY: same inert model; the owner is WlanOnly, so this must fail terminally.
+    let second = ready(unsafe { owner.prepare_a(&mut io, 1, 1, ProtocolA::Tdma3) });
+    if second != Some(Err(Error::Terminal)) {
+        return TestResult::Fail("A coex double prepare is not terminal");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_coex_init_and_off_policy_follow_rtw8852a
+);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_wlan_only_coex_init_follows_rtw8852a
 );

@@ -276,6 +276,13 @@ impl Revision {
         self.chip == Chip::Ar9485
     }
 
+    /// `AR_SREV_9003_PCOEM` (`reg.h:913-914`): AR9462, AR9485, AR9565.
+    /// Every other modeled chip (AR9300, AR9580) takes
+    /// `ar9003_hw_init_cal_soc` (`ar9003_calib.c:1686-1690`).
+    pub fn pcoem(&self) -> bool {
+        matches!(self.chip, Chip::Ar9462 | Chip::Ar9485 | Chip::Ar9565)
+    }
+
     /// `AR_SREV_9300_22`.
     pub fn ar9300_22(&self) -> bool {
         self.chip == Chip::Ar9300 && self.mac_rev == AR_SREV_REVISION_9300_22

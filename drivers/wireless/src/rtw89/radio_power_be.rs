@@ -65,10 +65,18 @@
 //!
 //! This is register configuration only: it makes no conducted-power,
 //! regulatory or SAR claim for any board. The periodic thermal /
-//! TSSI tracking loop and the RFK reruns (IQK/DPK/TSSI) are NOT
-//! here: they need the BE TSSI system/slope tables and the
-//! `rtw89_phy_rfk_*_and_wait` machinery, which are follow-ups
-//! (#1878 follow-up issues). The one-shot `rtw8922a_tssi_reset`
+//! TSSI tracking loop and the periodic RFK reruns (IQK/DPK/TSSI)
+//! are NOT here — and they cannot be grounded on BE TSSI
+//! system/slope tables: no such tables exist upstream (#1944 —
+//! no `rtw8922a_rfk_table.c`, and upstream `rtw8922a_rfk_track` is
+//! an empty stub, so Linux runs no periodic IQK/DPK/TSSI rerun for
+//! 8922A; TSSI is HW-continuous plus one-shot at channel set). The
+//! channel-RFK offload itself lives in `rfk::be_channel`
+//! (`rtw8922a_rfk_channel` / `band_changed`, with the
+//! `rtw89_phy_rfk_*_and_wait` machinery in `rfk::be_rfk`) and stays
+//! fixture-only until a native BE `Interface` exists to execute it;
+//! the groundable thermal-stat/protect remainder awaits Daniel's
+//! call on #1944. The one-shot `rtw8922a_tssi_reset`
 //! pulse is included ([`tssi_reset_program`]) because it is a pure
 //! register program on the RX-path control this power program
 //! already touches.

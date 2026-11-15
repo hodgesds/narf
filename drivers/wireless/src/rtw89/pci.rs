@@ -503,6 +503,29 @@ impl Rtw89Device {
         .map(|_| ())
         .map_err(Boot8922aError::Fwdl)
     }
+
+    /// Drive the 8922A set_channel owner for an admitted station
+    /// (`Prepared8922a::set_channel`): the MAC+BB channel program +
+    /// TX-power program for `profile` over BAR2. The station-path
+    /// caller is the follow-up (like `admit_station`, this entry
+    /// exists before any station-path driver calls it); bring-up
+    /// itself programs no channel — it has no admitted station,
+    /// container, or regulatory country.
+    pub(super) fn set_channel_8922a(
+        &self,
+        macid: u8,
+        profile: super::operating_channel_c::Profile,
+        elements: &[super::radio_assets::Element],
+        country: [u8; 2],
+    ) -> Result<super::prepared_8922a::SetChannelOutcome, super::prepared_8922a::Error> {
+        let owner_lock = self
+            .be_8922a
+            .as_ref()
+            .ok_or(super::prepared_8922a::Error::NoOwner)?;
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        let mut owner = owner_lock.lock();
+        owner.set_channel(macid, profile, elements, country, regs)
+    }
 }
 
 /// Production [`super::fwdl_be::Port`] for a probed 8922A device:
@@ -860,6 +883,77 @@ impl Rtw89Device {
             unsafe { self.submit_fwcmd_authorized(FwcmdHold::Ack(framed), buf) }
         })
         .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    /// BE link-lifecycle H2C submit for a probed 8922A device:
+    /// compose + frame one MLD link transition on the Prepared
+    /// owner (`mld_link_frames`), then move each framed body
+    /// across CH12 in Linux's send order
+    /// (`submit_be_h2c` per body). Returns one
+    /// [`H2cPrepared`] per sent body, in send order. A
+    /// failure mid-list leaves the earlier bodies sent (the
+    /// returned error carries no partial list); re-running the
+    /// whole transition re-sends from the start with fresh
+    /// sequences, matching Linux's per-H2C error handling.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_h2c`]:
+    /// rings programmed through the Prepared owner, firmware
+    /// running, no reset/removal racing.
+    pub(super) unsafe fn submit_be_mld_link_h2cs(
+        &self,
+        base_macid: u8,
+        link_id: u8,
+        vif_main_macid: u8,
+        transition: super::prepared_8922a::LinkTransition,
+        opts: &super::prepared_8922a::LinkH2cOpts,
+    ) -> Result<Vec<super::tx_8922a::H2cPrepared>, super::prepared_8922a::Error> {
+        let frames = {
+            let owner_lock = self
+                .be_8922a
+                .as_ref()
+                .ok_or(super::prepared_8922a::Error::NoOwner)?;
+            let owner = owner_lock.lock();
+            owner.mld_link_frames(base_macid, link_id, vif_main_macid, transition, opts)?
+        };
+        let mut prepared = Vec::new();
+        for frame in &frames {
+            // SAFETY: same live-ring contract as `submit_be_h2c`.
+            let one = unsafe { self.submit_be_h2c(frame.framed, &frame.bytes) }?;
+            prepared.push(one);
+        }
+        Ok(prepared)
+    }
+
+    /// BE link-lifecycle H2C submit for one admitted
+    /// single-link station: the station form of
+    /// [`Self::submit_be_mld_link_h2cs`]
+    /// (`station_link_frames`, instance 0).
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_h2c`].
+    pub(super) unsafe fn submit_be_station_link_h2cs(
+        &self,
+        macid: u8,
+        vif_main_macid: u8,
+        transition: super::prepared_8922a::LinkTransition,
+        opts: &super::prepared_8922a::LinkH2cOpts,
+    ) -> Result<Vec<super::tx_8922a::H2cPrepared>, super::prepared_8922a::Error> {
+        let frames = {
+            let owner_lock = self
+                .be_8922a
+                .as_ref()
+                .ok_or(super::prepared_8922a::Error::NoOwner)?;
+            let owner = owner_lock.lock();
+            owner.station_link_frames(macid, vif_main_macid, transition, opts)?
+        };
+        let mut prepared = Vec::new();
+        for frame in &frames {
+            // SAFETY: same live-ring contract as `submit_be_h2c`.
+            let one = unsafe { self.submit_be_h2c(frame.framed, &frame.bytes) }?;
+            prepared.push(one);
+        }
+        Ok(prepared)
     }
 
     /// BE firmware-download submit (`rtw89_h2c_tx`, `core.c:1336`):

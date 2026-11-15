@@ -64,26 +64,29 @@ pub const NET_TYPE_AP_MODE: u8 = 3;
 
 // ── Self-role enumeration ───────────────────────────────────────────
 //
-// Per `rtw89/core.h::enum rtw89_self_role`.
+// Per `rtw89/core.h::enum rtw89_self_role`: CLIENT=0, AP=1,
+// AP_CLIENT=2. There is no NONE member: the client is the
+// default role, so a disconnect still carries the station's
+// own role (see `JoinInfo::for_disconnect`).
 
-/// No role yet (used during transition).
-pub const SELF_ROLE_NONE: u8 = 0;
 /// Acting as a client.
-pub const SELF_ROLE_CLIENT: u8 = 1;
+pub const SELF_ROLE_CLIENT: u8 = 0;
 /// Acting as an AP.
-pub const SELF_ROLE_AP: u8 = 2;
+pub const SELF_ROLE_AP: u8 = 1;
 /// Client of our own SoftAP (used by `RTW89_SELF_ROLE_AP_CLIENT`).
-pub const SELF_ROLE_AP_CLIENT: u8 = 3;
+pub const SELF_ROLE_AP_CLIENT: u8 = 2;
 
 // ── WiFi-role enumeration ───────────────────────────────────────────
 //
-// Per `rtw89/core.h::enum rtw89_wifi_role`. We pin the values we care
-// about for assoc.
+// Per `rtw89/core.h::enum rtw89_wifi_role`: NONE=0, STATION=1,
+// AP=2. We pin the values we care about for assoc.
 
+/// No role yet.
+pub const WIFI_ROLE_NONE: u8 = 0;
 /// Station/Client role.
-pub const WIFI_ROLE_STATION: u8 = 0;
+pub const WIFI_ROLE_STATION: u8 = 1;
 /// AP role.
-pub const WIFI_ROLE_AP: u8 = 1;
+pub const WIFI_ROLE_AP: u8 = 2;
 
 // ── JOININFO encoder ────────────────────────────────────────────────
 
@@ -127,7 +130,11 @@ impl JoinInfo {
         }
     }
 
-    /// Default for disconnect.
+    /// Default for disconnect. The self-role stays CLIENT:
+    /// Linux has no NONE self-role, and the BE composer
+    /// (`link_h2c_8922a`) keeps the station's own role on
+    /// disconnect too — only the OP bit, net type and trigger
+    /// change.
     pub const fn for_disconnect(mac_id: u8) -> Self {
         Self {
             mac_id,
@@ -138,7 +145,7 @@ impl JoinInfo {
             port_id: 0,
             net_type: NET_TYPE_NO_LINK,
             wifi_role: WIFI_ROLE_STATION,
-            self_role: SELF_ROLE_NONE,
+            self_role: SELF_ROLE_CLIENT,
         }
     }
 

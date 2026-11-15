@@ -205,6 +205,12 @@ fn run(
 
 fn init() -> Result<(), &'static str> {
     let mut io = Model::new();
+    // Stage one TX IQ measurement per chain: the SoC path runs the
+    // separate TX IQ run and post-processes it (`init_cal_soc`).
+    io.tx_iq_status(false, 1);
+    for chain in 0..3 {
+        io.tx_iq_measurement(chain, 0, IQ_A);
+    }
     let mut cal = Calibration::default();
     let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
     let report =
@@ -214,27 +220,51 @@ fn init() -> Result<(), &'static str> {
         || (io.raw(RXRF_AGC[0]) >> 19) & 0x3f != 36
         || report.carrier_leak != Some(true)
         || report.default_nf != [-100, -110, -105]
-        || report.tx_iq_cal.is_some()
-        || report.tx_clcal.is_none()
+        || report.tx_iq_cal.is_none()
+        || report.tx_clcal.is_some()
         || cal.state() != State::Ready
         || cal.report() != Some(report)
     {
         return Err("AR9300 peak cal / CLC / default NF report differs");
     }
-    // init_bb activates before calibrating; the CL bracket parks the PHY,
-    // forces RX_DELAY, then restores the INI delay after the AGC cal.
-    let (Some(active), Some(cl), Some(delpt), Some(forced), Some(agc), Some(restored)) = (
+    // The post-processing saved one measurement per chain, magnitude 24 /
+    // phase 3 (`iqc_coeff[0]` 3075); no carrier-leak table was saved —
+    // `init_cal_soc` never calls `cl_cal_post_proc`.
+    let tx_iq_cal = report.tx_iq_cal.expect("checked above");
+    if tx_iq_cal.num_measures != [1, 1, 1] || tx_iq_cal.tx_corr_coeff[0] != [3075, 3075, 3075] {
+        return Err("AR9300 TX IQ post-processing differs");
+    }
+    // init_bb activates before calibrating; `init_cal_soc`
+    // (`ar9003_calib.c:1576-1679`) then enables CL_CAL, programs DELPT,
+    // runs the separate TX IQ calibration with its ACTIVE toggle, and
+    // calibrates the AGC — with no CL `RX_DELAY` dance anywhere.
+    let (Some(active), Some(cl), Some(delpt), Some(txiq), Some(dis), Some(agc)) = (
         io.wrote(AR_PHY_ACTIVE, 1),
         io.wrote(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE),
         io.wrote(AR_PHY_TX_IQCAL_CONTROL_1, DELPT << 18),
-        io.wrote(AR_PHY_RX_DELAY, AR_PHY_RX_DELAY_DELAY),
+        io.wrote(AR_PHY_TX_IQCAL_START, TX_IQCAL_START_DO_CAL),
+        io.wrote(AR_PHY_ACTIVE, 0),
         io.wrote(AR_PHY_AGC_CONTROL, AGC_CLC_SUCCESS | AGC_CAL),
-        io.wrote(AR_PHY_RX_DELAY, 1000),
     ) else {
-        return Err("AR9300 init_cal_pcoem write missing");
+        return Err("AR9300 init_cal_soc write missing");
     };
-    if !(active < cl && cl < delpt && delpt < forced && forced < agc && agc < restored) {
-        return Err("AR9300 init order differs from ar9003_hw_init_cal_pcoem");
+    // The ACTIVE toggle re-enables after the disable.
+    let mut active_on = Vec::new();
+    for (index, write) in io.writes.iter().enumerate() {
+        if *write == (AR_PHY_ACTIVE, 1) {
+            active_on.push(index);
+        }
+    }
+    if active_on.len() != 2
+        || !(active < cl
+            && cl < delpt
+            && delpt < txiq
+            && txiq < dis
+            && dis < active_on[1]
+            && active_on[1] < agc)
+        || io.writes.iter().any(|w| w.0 == AR_PHY_RX_DELAY)
+    {
+        return Err("AR9300 init order differs from ar9003_hw_init_cal_soc");
     }
     // Chain masks written for calibration and again for runtime; the IQ
     // mismatch calibration is left running with PER_MAX_LOG_COUNT.
@@ -246,7 +276,7 @@ fn init() -> Result<(), &'static str> {
         != 2
         || io.raw(AR_PHY_CAL_CHAINMASK) != 7
         || io.raw(AR_PHY_TIMING4) & 0xf000 != 10 << 12
-        || io.wrote(AR_PHY_CALMODE, 0).is_none_or(|m| m < restored)
+        || io.wrote(AR_PHY_CALMODE, 0).is_none_or(|m| m < agc)
     {
         return Err("AR9300 chain masks / IQ kick-off differ");
     }
@@ -331,14 +361,16 @@ fn smoke_ath9k_ar9300_calibration_refusals() -> TestResult {
     {
         return TestResult::Fail("AR9300 calibration ran on an active PHY");
     }
-    // A stuck AGC calibration still runs the peak cal, restores RX_DELAY,
-    // then fails the attempt.
+    // A stuck AGC calibration still runs the peak cal — `init_cal_soc`
+    // runs it BEFORE the AGC poll (`ar9003_calib.c:1630-1648`) — then
+    // fails the attempt at the poll, with no `RX_DELAY` dance and no
+    // post-processing.
     let mut io = Model::new();
     io.agc_stuck = true;
     let mut cal = Calibration::default();
     if run(&mut cal, &mut io, &revision, 7, 5180) != Err(BringUpError::Timeout)
         || cal.state() != State::Failed
-        || io.wrote(AR_PHY_RX_DELAY, 1000).is_none()
+        || io.writes.iter().any(|w| w.0 == AR_PHY_RX_DELAY)
         || (io.raw(RXRF_AGC[0]) >> 9) & 0x3f == 0
         || io.wrote(AR_PHY_CALMODE, 0).is_some()
     {
@@ -383,6 +415,104 @@ fn smoke_ath9k_ar9003_tx_iq_enabled_cals() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9003_tx_iq_enabled_cals
+);
+
+fn init_cal_routing() -> Result<(), &'static str> {
+    // `ar9003_hw_attach_calib_ops` (`ar9003_calib.c:1686-1690`):
+    // `AR_SREV_9003_PCOEM` (`reg.h:913-914`) is 9462/9485/9565 only;
+    // AR9300/AR9580 take `init_cal_soc`.
+    for (srev, chip, pcoem) in [
+        (0x001c_03ff, super::super::Chip::Ar9300, false),
+        (0x001c_04ff, super::super::Chip::Ar9580, false),
+        (0x0024_01ff, super::super::Chip::Ar9485, true),
+        (0x0028_02ff, super::super::Chip::Ar9462, true),
+        (0x002c_02ff, super::super::Chip::Ar9565, true),
+    ] {
+        if rev_for(srev, chip).pcoem() != pcoem {
+            return Err("ar9003_hw_attach_calib_ops routing differs");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9003_init_cal_routing() -> TestResult {
+    match init_cal_routing() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9003_init_cal_routing
+);
+
+fn init_cal_soc() -> Result<(), &'static str> {
+    // `ar9003_hw_init_cal_soc` (`ar9003_calib.c:1576-1679`) for both SoC
+    // chips: the separate TX IQ run + ACTIVE toggle when
+    // `TX_IQ_ON_AGC_CAL` is clear, the peak calibration BEFORE the AGC
+    // poll, no CL `RX_DELAY` dance, no `cl_cal_post_proc` — and the peak
+    // calibration keeps the INI-programmed band LNA gain override
+    // (`ar9003_calib.c:1213` clears it on PCOEM parts only).
+    for (srev, chip) in [
+        (0x001c_03ff, super::super::Chip::Ar9300),
+        (0x001c_04ff, super::super::Chip::Ar9580),
+    ] {
+        let revision = rev_for(srev, chip);
+        let mut io = Model::new();
+        io.tx_iq_status(false, 1);
+        for chain in 0..3 {
+            io.tx_iq_measurement(chain, 0, IQ_A);
+        }
+        for gain in GAINSTAGES {
+            io.values.insert(gain, 0x7000_0000);
+        }
+        let mut cal = Calibration::default();
+        let report =
+            run(&mut cal, &mut io, &revision, 7, 2412).map_err(|_| "SoC init cal refused")?;
+        // One measurement per chain, magnitude 24 / phase 3
+        // (`iqc_coeff[0]` 3075); the carrier-leak table was not saved.
+        let Some(tx_iq_cal) = report.tx_iq_cal else {
+            return Err("SoC TX IQ calibration did not complete");
+        };
+        if tx_iq_cal.num_measures != [1, 1, 1]
+            || tx_iq_cal.tx_corr_coeff[0] != [3075, 3075, 3075]
+            || report.tx_clcal.is_some()
+            || report.peak_caldac != [Some(36), Some(11), Some(49)]
+        {
+            return Err("SoC init cal report differs");
+        }
+        // Peak before AGC: the first peak-calibration write (chain 0's
+        // LNA/SW override) precedes the AGC calibration write; the TX IQ
+        // run precedes both; no `RX_DELAY` write anywhere; the LNA gain
+        // overrides survived the peak calibration.
+        let (Some(txiq), Some(peak), Some(agc)) = (
+            io.wrote(AR_PHY_TX_IQCAL_START, TX_IQCAL_START_DO_CAL),
+            io.wrote(GAINSTAGES[0], 0xf000_0000),
+            io.wrote(AR_PHY_AGC_CONTROL, AGC_CLC_SUCCESS | AGC_CAL),
+        ) else {
+            return Err("SoC init cal write missing");
+        };
+        if !(txiq < peak && peak < agc)
+            || io.writes.iter().any(|w| w.0 == AR_PHY_RX_DELAY)
+            || io.raw(GAINSTAGES[0]) != 0x7000_0000
+            || io.raw(GAINSTAGES[1]) != 0x7000_0000
+            || io.raw(GAINSTAGES[2]) != 0x7000_0000
+        {
+            return Err("SoC init cal order / peak cal differs");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9300_init_cal_soc() -> TestResult {
+    match init_cal_soc() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_init_cal_soc
 );
 
 fn ar9462_nf_limits() -> Result<(), &'static str> {
@@ -994,79 +1124,154 @@ fn fast_channel_change(
     ready(unsafe { cal.fast_channel_change(io, &identity(mask), revision, &prepared, saved) })
 }
 
-fn fast_channel_change_reload() -> Result<(), &'static str> {
-    let mut io = Model::new();
-    let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
-    // Distinctive carrier-leak table entries for the save to keep.
-    io.values.insert(CL_TAB[0], 0x1111_1111);
-    io.values.insert(CL_TAB[1] + 20, 0x2222_2222);
-    io.values.insert(CL_TAB[2] + 60, 0x3333_3333);
-    let mut cal = Calibration::default();
-    let mut saved =
-        run(&mut cal, &mut io, &revision, 7, 2412).map_err(|_| "AR9300 init cal refused")?;
-    // Saved TX IQ coefficients from a direct post-processing, as the
-    // outlier test builds them.
-    let mut gen = Model::new();
-    gen.tx_iq_status(false, 2);
-    for chain in 0..3 {
-        gen.tx_iq_measurement(chain, 0, IQ_A);
-        gen.tx_iq_measurement(chain, 1, IQ_B);
-    }
-    let data = match tx_iq_cal_post_proc(&mut gen, &revision, 7) {
-        Ok(Some(data)) => data,
-        _ => return Err("AR9300 TX IQ post-processing failed"),
-    };
-    saved.tx_iq_cal = Some(data);
-    let saved_cl = match saved.tx_clcal {
-        Some(saved_cl) => saved_cl,
-        None => return Err("AR9300 carrier-leak table was not saved"),
-    };
-    if saved_cl.table[0][0] != 0x1111_1111
-        || saved_cl.table[1][5] != 0x2222_2222
-        || saved_cl.table[2][15] != 0x3333_3333
-    {
-        return Err("AR9300 carrier-leak table save differs");
-    }
-    // The reload path: saved coefficients re-applied, saved table
-    // re-written, no AGC calibration (nothing forced it), no peak cal.
-    let mark = io.writes.len();
-    let mut fast = Calibration::default();
-    let report = fast_channel_change(&mut fast, &mut io, &revision, 7, 2437, &saved)
-        .map_err(|_| "AR9300 fast channel change refused")?;
-    let phase = &io.writes[mark..];
-    if report.frequency_mhz != 2437
-        || report.tx_iq_cal != Some(data)
-        || report.tx_clcal != Some(saved_cl)
-        || report.peak_caldac != [None, None, None]
-        || report.default_nf != [-100, -110, -105]
-        || fast.state() != State::Ready
-        || phase
-            .iter()
-            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
-        || !phase.contains(&(CL_TAB[0], 0x1111_1111))
-        || !phase.contains(&(CL_TAB[1] + 20, 0x2222_2222))
-        || !phase.contains(&(CL_TAB[2] + 60, 0x3333_3333))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 | (259 << 14)))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259 | (259 << 14)))
-        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259 | (259 << 14)))
-    {
-        return Err("AR9300 fast channel change reload differs");
+fn fast_channel_change_soc() -> Result<(), &'static str> {
+    // `ar9003_hw_init_cal_soc` with `AH_FASTCC` set, for both SoC chips:
+    // the TX IQ calibration re-runs fresh (separate run + ACTIVE toggle
+    // + post-processing), the AGC calibration and the peak calibration
+    // re-run, and neither the saved coefficients nor the saved
+    // carrier-leak table are re-applied — soc never calls
+    // `tx_iq_cal_reload` or `cl_cal_post_proc`. The previous
+    // `fast_channel_change_reload` test asserted the PCOEM reload shape
+    // for AR9300; that shape is wrong for a SoC chip per Linux
+    // (`ar9003_calib.c:1576-1679`), so it is replaced here and the
+    // reload coverage moves to AR9462 below.
+    for (srev, chip) in [
+        (0x001c_03ff, super::super::Chip::Ar9300),
+        (0x001c_04ff, super::super::Chip::Ar9580),
+    ] {
+        let revision = rev_for(srev, chip);
+        let mut io = Model::new();
+        io.tx_iq_status(false, 1);
+        for chain in 0..3 {
+            io.tx_iq_measurement(chain, 0, IQ_A);
+        }
+        // Distinctive carrier-leak table entries: the SoC run must not
+        // save them, and the fast channel change must not re-apply them.
+        io.values.insert(CL_TAB[0], 0x1111_1111);
+        io.values.insert(CL_TAB[1] + 20, 0x2222_2222);
+        io.values.insert(CL_TAB[2] + 60, 0x3333_3333);
+        let mut cal = Calibration::default();
+        let saved =
+            run(&mut cal, &mut io, &revision, 7, 2412).map_err(|_| "SoC init cal refused")?;
+        // The full reset saved fresh TX IQ coefficients and no table.
+        if saved.tx_iq_cal.is_none() || saved.tx_clcal.is_some() {
+            return Err("SoC init cal report differs");
+        }
+        // The fresh path: the TX IQ run triggers with its ACTIVE toggle,
+        // the AGC calibration and the peak calibration re-run, the
+        // post-processing computes the same coefficients fresh, and no
+        // table is re-applied.
+        let mark = io.writes.len();
+        let mut fast = Calibration::default();
+        let report = fast_channel_change(&mut fast, &mut io, &revision, 7, 2437, &saved)
+            .map_err(|_| "SoC fast channel change refused")?;
+        let phase = &io.writes[mark..];
+        if report.frequency_mhz != 2437
+            || report.tx_iq_cal != saved.tx_iq_cal
+            || report.tx_clcal.is_some()
+            || report.peak_caldac != [Some(36), Some(11), Some(49)]
+            || report.default_nf != [-100, -110, -105]
+            || fast.state() != State::Ready
+            || !phase.contains(&(AR_PHY_TX_IQCAL_START, TX_IQCAL_START_DO_CAL))
+            || !phase.contains(&(AR_PHY_ACTIVE, 0))
+            || !phase.contains(&(AR_PHY_TX_IQCAL_CONTROL_1, DELPT << 18))
+            || !phase.contains(&(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE))
+            || !phase
+                .iter()
+                .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+            || phase.iter().any(|w| w.0 == AR_PHY_RX_DELAY)
+            || phase.contains(&(CL_TAB[0], 0x1111_1111))
+            || phase.contains(&(CL_TAB[1] + 20, 0x2222_2222))
+            || phase.contains(&(CL_TAB[2] + 60, 0x3333_3333))
+        {
+            return Err("SoC fast channel change differs");
+        }
     }
     Ok(())
 }
 
-fn smoke_ath9k_ar9300_fast_channel_change_reload() -> TestResult {
-    match fast_channel_change_reload() {
+fn smoke_ath9k_ar9300_fast_channel_change_soc() -> TestResult {
+    match fast_channel_change_soc() {
         Ok(()) => TestResult::Pass,
         Err(message) => TestResult::Fail(message),
     }
 }
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
-    smoke_ath9k_ar9300_fast_channel_change_reload
+    smoke_ath9k_ar9300_fast_channel_change_soc
+);
+
+fn fast_channel_change_reload_9462() -> Result<(), &'static str> {
+    // The PCOEM reload path `init_cal_pcoem` takes on a fast channel
+    // change when the TX IQ calibration did not run but saved
+    // coefficients exist (AR9462 with the `override_ini` gate closed, so
+    // `run` saves none; the saved ones are hand-carried here, as the old
+    // AR9300 reload test did). The reload itself — saved coefficients
+    // re-applied, saved table re-written, no AGC calibration, no peak
+    // cal — is unchanged PCOEM behavior.
+    let revision = rev_for(0x0028_02ff, super::super::Chip::Ar9462);
+    let mut io = Model::new();
+    io.values.insert(CL_TAB[0], 0x1111_1111);
+    io.values.insert(CL_TAB[0] + 20, 0x2222_2222);
+    io.values.insert(CL_TAB[0] + 60, 0x3333_3333);
+    let mut cal = Calibration::default();
+    let mut saved =
+        run(&mut cal, &mut io, &revision, 1, 2412).map_err(|_| "AR9462 init cal refused")?;
+    // Gate closed: no coefficients, but the carrier-leak table saved.
+    if saved.tx_iq_cal.is_some() || saved.tx_iq_cal_enabled || saved.tx_clcal.is_none() {
+        return Err("AR9462 gate-closed init cal differs");
+    }
+    let saved_cl = match saved.tx_clcal {
+        Some(saved_cl) => saved_cl,
+        None => return Err("AR9462 carrier-leak table was not saved"),
+    };
+    // Saved TX IQ coefficients from a direct post-processing, as the
+    // outlier test builds them.
+    let mut gen = Model::new();
+    gen.tx_iq_status(false, 2);
+    gen.tx_iq_measurement(0, 0, IQ_A);
+    gen.tx_iq_measurement(0, 1, IQ_B);
+    let data = match tx_iq_cal_post_proc(&mut gen, &revision, 1) {
+        Ok(Some(data)) => data,
+        _ => return Err("AR9462 TX IQ post-processing failed"),
+    };
+    saved.tx_iq_cal = Some(data);
+    // The reload path: saved coefficients re-applied, saved table
+    // re-written, no AGC calibration (nothing forced it), no peak cal.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 1, 2437, &saved)
+        .map_err(|_| "AR9462 fast channel change refused")?;
+    let phase = &io.writes[mark..];
+    if report.frequency_mhz != 2437
+        || report.tx_iq_cal != Some(data)
+        || report.tx_clcal != Some(saved_cl)
+        || report.peak_caldac != [None, None, None]
+        || report.default_nf != [-100, -127, -105]
+        || fast.state() != State::Ready
+        || phase
+            .iter()
+            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+        || !phase.contains(&(CL_TAB[0], 0x1111_1111))
+        || !phase.contains(&(CL_TAB[0] + 20, 0x2222_2222))
+        || !phase.contains(&(CL_TAB[0] + 60, 0x3333_3333))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259))
+        || !phase.contains(&(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 | (259 << 14)))
+    {
+        return Err("AR9462 fast channel change reload differs");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9462_fast_channel_change_reload() -> TestResult {
+    match fast_channel_change_reload_9462() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_fast_channel_change_reload
 );
 
 fn fast_channel_change_fresh() -> Result<(), &'static str> {

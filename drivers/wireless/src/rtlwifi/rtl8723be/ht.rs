@@ -109,3 +109,45 @@ pub fn timing(
     }
     Ok(())
 }
+
+/// Host-capability bits ([`host_capabilities`]).
+pub const HOST_HT_2G: u8 = 1 << 0;
+pub const HOST_HT40_2G: u8 = 1 << 1;
+
+/// The 2.4 GHz capability the host API (nl80211 `GET_WIPHY`) publishes.
+/// Linux `_rtl_init_mac80211` runs `_rtl_init_hw_ht_capab` on the sband
+/// unconditionally; here it carries HT only while the signed `NAPC`
+/// envelope admits it under `domain` at some operating point: HT on an
+/// [`admitted`] 20 MHz point, the 20/40 form on an [`admitted`] 40 MHz
+/// point. RF_1T1R throughout, so there is no second-stream bit: the host
+/// never sees MCS8-15, matching the composed station.
+pub fn host_capabilities(
+    base: &super::envelope::Calibration,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> u8 {
+    use super::envelope::Width;
+    let mut caps = 0;
+    for op in base.operating_points() {
+        let Ok(permission) = base.permission_for(domain, op) else {
+            continue;
+        };
+        if !admitted(&permission) {
+            continue;
+        }
+        caps |= match op.width {
+            Width::W20 => HOST_HT_2G,
+            Width::W40Above | Width::W40Below => HOST_HT_2G | HOST_HT40_2G,
+        };
+    }
+    caps
+}
+
+/// The `PhyCapabilities` of `band` for the [`host_capabilities`] bits: the
+/// same HT body ([`capability`]) the association path sends; `None` off
+/// 2.4 GHz or without HT.
+pub fn host_phy(caps: u8, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+    (band == 2400 && caps & HOST_HT_2G != 0).then(|| narf_wireless::iface::PhyCapabilities {
+        ht: capability(caps & HOST_HT40_2G != 0).capability_body(),
+        vht: None,
+    })
+}

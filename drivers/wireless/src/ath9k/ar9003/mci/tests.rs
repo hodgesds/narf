@@ -405,7 +405,7 @@ fn mci_cal_handshake() -> TestResult {
     // grant means the previous calibration must not be reused.
     let (mut io, mut btcoex) = live();
     let mut reusable = true;
-    init_cal_req(&mut io, &mut btcoex.mci, &mut reusable);
+    init_cal_req(&mut io, &mut btcoex.mci, None, &mut reusable);
     if io.last_write(AR_MCI_TX_PAYLOAD0 + 4) != Some(GpmSubtype::WlanCalReq as u32) {
         return TestResult::Fail("init_cal_req did not send WLAN_CAL_REQ");
     }
@@ -427,17 +427,17 @@ fn mci_cal_handshake() -> TestResult {
     let (mut io, mut btcoex) = live();
     btcoex.mci.bt_state = BtState::Sleep;
     let mut reusable = true;
-    init_cal_req(&mut io, &mut btcoex.mci, &mut reusable);
+    init_cal_req(&mut io, &mut btcoex.mci, None, &mut reusable);
     if io.last_write(AR_MCI_COMMAND0).is_some() {
         return TestResult::Fail("init_cal_req sent while BT sleeps");
     }
     // Start reset only runs from CAL_START.
     let (mut io, mut btcoex) = live();
-    if start_reset(&mut io, &mut btcoex.mci, true) {
+    if start_reset(&mut io, &mut btcoex.mci, None, true) {
         return TestResult::Fail("start_reset ran outside CAL_START");
     }
     btcoex.mci.bt_state = BtState::CalStart;
-    if !start_reset(&mut io, &mut btcoex.mci, true) {
+    if !start_reset(&mut io, &mut btcoex.mci, None, true) {
         return TestResult::Fail("start_reset did not run from CAL_START");
     }
     if btcoex.mci.bt_state != BtState::Awake {
@@ -1632,6 +1632,84 @@ fn mci_sync_gpm_ring() -> TestResult {
     TestResult::Pass
 }
 
+fn mci_wait_for_gpm_syncs_dma_ring() -> TestResult {
+    // A real 512-byte coherent DMA buffer (schedule table + GPM ring),
+    // filled with the reserved pattern as the owner does at probe.
+    let mut dma = match alloc_coherent_masked(
+        MCI_DMA_BUF_BYTES,
+        narf_lib::id::DomainId::DRIVER_0,
+        u64::from(u32::MAX),
+    ) {
+        Ok(dma) => dma,
+        Err(_) => return TestResult::Fail("MCI DMA allocation failed in the fixture"),
+    };
+    {
+        let bytes = dma.as_mut_slice();
+        bytes.fill(MCI_GPM_RSVD_PATTERN);
+        // A BT calibration grant staged in the DMA ring only.
+        bytes[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::BtCalGrant as u8;
+    }
+    // The CPU ring stays empty, as it is mid-wait: `init_cal_req`
+    // must see the grant through the wait's in-loop sync, so the
+    // calibration stays reusable and the granted slot is consumed.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.gpm_buf.fill(MCI_GPM_RSVD_PATTERN);
+    raise_gpm(&mut io, 1);
+    let mut reusable = true;
+    init_cal_req(&mut io, &mut btcoex.mci, Some(&dma), &mut reusable);
+    if !reusable {
+        return TestResult::Fail("wait missed a BT grant staged in the DMA ring");
+    }
+    if btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN {
+        return TestResult::Fail("wait did not recycle the granted slot");
+    }
+    // Same staging, no DMA buffer: the grant is missed and the wait
+    // times out, so the calibration must not be reused.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.gpm_buf.fill(MCI_GPM_RSVD_PATTERN);
+    raise_gpm(&mut io, 1);
+    let mut reusable = true;
+    init_cal_req(&mut io, &mut btcoex.mci, None, &mut reusable);
+    if reusable {
+        return TestResult::Fail("wait saw a DMA-only grant with no DMA buffer");
+    }
+    // The calibration-done wait sees a DMA-only done GPM the same way.
+    {
+        let bytes = dma.as_mut_slice();
+        bytes.fill(MCI_GPM_RSVD_PATTERN);
+        bytes[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::BtCalDone as u8;
+    }
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.gpm_buf.fill(MCI_GPM_RSVD_PATTERN);
+    raise_gpm(&mut io, 1);
+    if wait_for_gpm(
+        &mut io,
+        &mut btcoex.mci,
+        Some(&dma),
+        GpmSubtype::BtCalDone as u8,
+        0,
+        25000,
+    ) == 0
+    {
+        return TestResult::Fail("wait missed a BT cal-done staged in the DMA ring");
+    }
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.gpm_buf.fill(MCI_GPM_RSVD_PATTERN);
+    raise_gpm(&mut io, 1);
+    if wait_for_gpm(
+        &mut io,
+        &mut btcoex.mci,
+        None,
+        GpmSubtype::BtCalDone as u8,
+        0,
+        25000,
+    ) != 0
+    {
+        return TestResult::Fail("wait saw a DMA-only cal-done with no DMA buffer");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_message_exchange);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_send_gating);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_gpio_observation);
@@ -1652,4 +1730,8 @@ kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_scheme);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_status);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_flush);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_sync_gpm_ring);
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    mci_wait_for_gpm_syncs_dma_ring
+);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_header_values);

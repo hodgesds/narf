@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact B fixed WW 2.4/5GHz 20/40/80MHz power *configuration*, never a dBm
+//! Exact B fixed WW 2.4/5GHz 20/40/80MHz power *configuration*, and the
+//! RTL8852A variant of the same program from its static TX-power tables
+//! (`radio_power/tables_a.rs`, `rtw8852a_table.c`), never a dBm
 //! authorization.
 //! Final measured peaks and current host policy independently gate emission.
 use super::operating_channel::{Profile, Width};
@@ -13,10 +15,24 @@ mod channels;
 mod defaults;
 #[path = "radio_power/recipe.rs"]
 mod recipe;
+#[path = "radio_power/tables_a.rs"]
+mod tables_a;
 pub(super) const RECIPE: [u8; 32] = recipe::RECIPE;
+/// Which chip's static TX-power tables back a [`Plan`]: B
+/// (`rtw8852b_table.c`, the frozen `channels`/`defaults` rows) or A
+/// (`rtw8852a_table.c`, [`tables_a`]). The firmware-element override path
+/// (TXPWR element ids 9/10/11/13/14) is shared; only the static fallback
+/// and the shape step differ (A has no `set_tx_shape`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Chip {
+    #[default]
+    B,
+    A,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
     channel: Profile,
+    chip: Chip,
     byrate: [i8; 44],
     offset: [i8; 5],
     limits: [[i8; 8]; 2],
@@ -29,11 +45,13 @@ pub(super) struct Plan {
     shape: [u8; 2],
 }
 /// Linux `rtw89_phy_read_txpwr_limit` source: firmware TXPWR_LMT/LMT_RU
-/// elements (replacing the static table) or the frozen rtw8852b_table.c rows.
+/// elements (replacing the static table) or the frozen rtw8852b_table.c rows
+/// (B) / the transcribed rtw8852a_table.c rows (A).
 struct Source<'a> {
     limit: Option<&'a [u8]>,
     ru: Option<&'a [u8]>,
     ghz5: bool,
+    chip: Chip,
 }
 impl Source<'_> {
     /// `[ntx][bf]` limit of (bw, rs, ch) at WW, `rtw89_channel_to_idx(ch)`.
@@ -47,6 +65,24 @@ impl Source<'_> {
                 }
             }
             return Ok(out);
+        }
+        if self.chip == Chip::A {
+            // phy.c `rtw89_phy_read_txpwr_limit` at regd WW, no DAG/SAR/TPE:
+            // the A static tables carry the limit directly for every
+            // (bw, rs) the fill asks about, so there is no per-channel
+            // flattening and no separate 40/80MHz row table. A supports
+            // 20/40/80MHz only (`rtw8852a_chip_info.support_bandwidths`).
+            let bw = match bw {
+                Width::Mhz20 => 0,
+                Width::Mhz40 => 1,
+                Width::Mhz80 => 2,
+                Width::Mhz160 => return Err(Error::Policy),
+            };
+            return Ok(core::array::from_fn(|ntx| {
+                core::array::from_fn(|bf| {
+                    tables_a::lmt(self.ghz5, bw, ntx as u8, rs, bf as u8, tables_a::WW, index)
+                })
+            }));
         }
         let pick = |row: &[[i8; 8]; 2], base: usize| {
             core::array::from_fn(|n| [row[n][base], row[n][base + 1]])
@@ -80,6 +116,14 @@ impl Source<'_> {
             }
             return Ok(out);
         }
+        if self.chip == Chip::A {
+            // phy.c `rtw89_phy_read_txpwr_limit_ru` at regd WW.
+            return Ok(core::array::from_fn(|ntx| {
+                core::array::from_fn(|ru| {
+                    tables_a::lmt_ru(self.ghz5, ru as u8, ntx as u8, tables_a::WW, index)
+                })
+            }));
+        }
         Ok(self.channel20(ch)?.ru)
     }
     fn channel20(&self, ch: u8) -> Result<channels::ChannelPower, Error> {
@@ -95,6 +139,32 @@ impl Source<'_> {
             Err(Error::Policy)
         }
     }
+}
+/// A 20MHz static row at regd WW in the B `ChannelPower` slot layout:
+/// limits `[cck20, cck40, ofdm, mcs20]` x `[nonbf, bf]` per ntx, ru
+/// `[ru26, ru52, ru106]` per ntx. Reads `rtw89_8852a_txpwr_lmt_{2,5}g` /
+/// `_ru_{2,5}g` through [`tables_a`] at `rtw89_channel_to_idx(primary)`;
+/// primaries the A table does not cover (5GHz 169/173/177) read 0, exactly
+/// as Linux reads the unlisted cells.
+fn channel20_a(channel: Profile) -> ([[i8; 8]; 2], [[i8; 3]; 2]) {
+    let ghz5 = channel.is_5ghz();
+    let idx = channel.power_index();
+    let mut limits = [[0i8; 8]; 2];
+    let mut ru = [[0i8; 3]; 2];
+    for ntx in 0..2u8 {
+        for bf in 0..2u8 {
+            let row = &mut limits[usize::from(ntx)];
+            row[usize::from(bf)] = tables_a::lmt(ghz5, 0, ntx, 0, bf, tables_a::WW, idx);
+            row[2 + usize::from(bf)] = tables_a::lmt(ghz5, 1, ntx, 0, bf, tables_a::WW, idx);
+            row[4 + usize::from(bf)] = tables_a::lmt(ghz5, 0, ntx, 1, bf, tables_a::WW, idx);
+            row[6 + usize::from(bf)] = tables_a::lmt(ghz5, 0, ntx, 2, bf, tables_a::WW, idx);
+        }
+        for r in 0..3u8 {
+            ru[usize::from(ntx)][usize::from(r)] =
+                tables_a::lmt_ru(ghz5, r, ntx, tables_a::WW, idx);
+        }
+    }
+    (limits, ru)
 }
 fn selected(elements: &[Element], id: u32, rfe: u8) -> Result<Option<&[u8]>, Error> {
     let mut out: Option<(u8, &[u8])> = None;
@@ -142,13 +212,27 @@ impl Plan {
     pub(super) fn channel(&self) -> Profile {
         self.channel
     }
+    /// Which chip's static tables back this plan.
+    pub(super) fn chip(&self) -> Chip {
+        self.chip
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::rtw89) fn fixture_defaults() -> Result<Self, Error> {
         Self::from_elements(&[], 1)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::rtw89) fn fixture_defaults_for_channel(channel: Profile) -> Result<Self, Error> {
-        Self::from_elements_for_channel(&[], 1, channel)
+        Self::from_elements_for_channel(&[], 1, channel, Chip::B)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtw89) fn fixture_defaults_a() -> Result<Self, Error> {
+        Self::from_elements_a(&[], 1)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtw89) fn fixture_defaults_a_for_channel(
+        channel: Profile,
+    ) -> Result<Self, Error> {
+        Self::from_elements_a_for_channel(&[], 1, channel)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::rtw89) fn limits_and_ru(&self) -> ([[i8; 8]; 2], [[i8; 3]; 2]) {
@@ -163,36 +247,76 @@ impl Plan {
         rfe: u8,
         channel: Profile,
     ) -> Result<Self, Error> {
-        Self::from_elements_for_channel(assets.elements(), rfe, channel)
+        Self::from_elements_for_channel(assets.elements(), rfe, channel, Chip::B)
+    }
+    /// RTL8852A plan from the container's firmware TXPWR elements over the
+    /// static `rtw8852a_table.c` tables (`tables_a`). The A radio owner
+    /// wires this in; the shape step is absent by construction (Linux
+    /// `rtw8852a_set_txpwr` has none).
+    pub fn from_assets_a(assets: &Assets, rfe: u8) -> Result<Self, Error> {
+        Self::from_elements_a(assets.elements(), rfe)
+    }
+    pub(super) fn from_assets_a_for_channel(
+        assets: &Assets,
+        rfe: u8,
+        channel: Profile,
+    ) -> Result<Self, Error> {
+        Self::from_elements_a_for_channel(assets.elements(), rfe, channel)
     }
     fn from_elements(elements: &[Element], rfe: u8) -> Result<Self, Error> {
-        Self::from_elements_for_channel(elements, rfe, Profile::INITIAL)
+        Self::from_elements_for_channel(elements, rfe, Profile::INITIAL, Chip::B)
+    }
+    fn from_elements_a(elements: &[Element], rfe: u8) -> Result<Self, Error> {
+        Self::from_elements_a_for_channel(elements, rfe, Profile::INITIAL)
+    }
+    fn from_elements_a_for_channel(
+        elements: &[Element],
+        rfe: u8,
+        channel: Profile,
+    ) -> Result<Self, Error> {
+        Self::from_elements_for_channel(elements, rfe, channel, Chip::A)
     }
     fn from_elements_for_channel(
         elements: &[Element],
         rfe: u8,
         channel: Profile,
+        chip: Chip,
     ) -> Result<Self, Error> {
         if rfe == 255 {
             return Err(Error::Policy);
         }
         let mut plan = defaults::DEFAULT;
         plan.channel = channel;
+        plan.chip = chip;
         let band = channel.band_index();
         let index = channel.power_index();
-        let captured = if channel.is_5ghz() {
-            // rtw8852b_table.c `rtw89_8852b_txpwr_byrate` band 1 has no CCK row.
-            plan.byrate[..4].fill(0);
-            let slot = super::operating_channel::GHZ5
-                .iter()
-                .position(|&primary| primary == channel.primary())
-                .ok_or(Error::Policy)?;
-            channels::CHANNELS_5GHZ[slot]
+        if chip == Chip::A {
+            // phy.c `rtw89_phy_load_txpwr_byrate` over
+            // `rtw89_8852a_dflt_parms.byr_tbl`, then the WW 20MHz row of
+            // `rtw89_8852a_txpwr_lmt_{2,5}g` / `_ru_{2,5}g` in the B
+            // `ChannelPower` slot layout (cck20, cck40, ofdm, mcs20 per
+            // [nonbf, bf]; ru26/52/106 per ntx).
+            let (byrate, offset) = tables_a::byrate(band);
+            plan.byrate = byrate;
+            plan.offset = offset;
+            let (limits, ru) = channel20_a(channel);
+            plan.limits = limits;
+            plan.ru = ru;
         } else {
-            channels::CHANNELS[usize::from(index)]
-        };
-        plan.limits = captured.limits;
-        plan.ru = captured.ru;
+            let captured = if channel.is_5ghz() {
+                // rtw8852b_table.c `rtw89_8852b_txpwr_byrate` band 1 has no CCK row.
+                plan.byrate[..4].fill(0);
+                let slot = super::operating_channel::GHZ5
+                    .iter()
+                    .position(|&primary| primary == channel.primary())
+                    .ok_or(Error::Policy)?;
+                channels::CHANNELS_5GHZ[slot]
+            } else {
+                channels::CHANNELS[usize::from(index)]
+            };
+            plan.limits = captured.limits;
+            plan.ru = captured.ru;
+        }
         // Firmware element ids: TXPWR_LMT_{2,5}GHZ = 10/11, LMT_RU_{2,5}GHZ = 13/14.
         let (limit_id, ru_id, channels) = if channel.is_5ghz() {
             (11, 14, 53)
@@ -295,17 +419,23 @@ impl Plan {
                 limit: selected(elements, limit_id, rfe)?,
                 ru: selected(elements, ru_id, rfe)?,
                 ghz5: channel.is_5ghz(),
+                chip,
             };
             plan.fill_wide(&source)?;
         }
-        if let Some(bytes) = selected(elements, 16, rfe)? {
-            plan.shape = [0; 2];
-            for e in entries(bytes, 5, 4)? {
-                if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[4] >= 3 {
-                    return Err(Error::Table);
-                }
-                if e[0] == band && e[2] == 0 && e[4] == 0 {
-                    plan.shape[e[1] as usize] = e[3];
+        // TX_SHAPE_LMT is B-only: `rtw8852a_set_txpwr` has no tx-shape
+        // step, so an A plan never consumes element 16 and keeps shape
+        // [0, 0] (its `visit` emits no shape writes).
+        if chip == Chip::B {
+            if let Some(bytes) = selected(elements, 16, rfe)? {
+                plan.shape = [0; 2];
+                for e in entries(bytes, 5, 4)? {
+                    if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[4] >= 3 {
+                        return Err(Error::Table);
+                    }
+                    if e[0] == band && e[2] == 0 && e[4] == 0 {
+                        plan.shape[e[1] as usize] = e[3];
+                    }
                 }
             }
         }
@@ -373,7 +503,40 @@ impl Plan {
     /// Bind signed source units and the exact fixed power/response profile. These
     /// bytes make no physical power claim; measured conducted maxima are separate.
     pub fn bind(&self, hash: &mut narf_crypto::sha256::Sha256) {
-        if self.channel.width() != Width::Mhz20 {
+        // The chip tag keeps an A plan distinct from a B plan with
+        // identical bytes (e.g. 2.4GHz channel 1, where the A and B WW
+        // rows agree): the binding is per chip program, not per byte row.
+        if self.chip == Chip::A {
+            // Channel identity is hashed directly (band/primary/center/
+            // width): the B `Profile::bind` carries B TSSI/SCO/FIR geometry
+            // the A program does not assert.
+            let identity = [
+                self.channel.band_index(),
+                self.channel.primary(),
+                self.channel.center(),
+                self.channel.width() as u8,
+            ];
+            if self.channel.width() != Width::Mhz20 {
+                hash.update(b"A WW0 native wide40/80 source RF2 MAC1 BB3;equal A/B ref0;actual center/subchannel CCK/OFDM/MCS20/40/80/0p5 and RU sections;no inferred dBm/SAR/antenna offset curves");
+                hash.update(&identity);
+                for n in 0..2 {
+                    for &v in self.extra[n]
+                        .iter()
+                        .chain(self.ru_extra[n].iter().flatten())
+                    {
+                        hash.update(&v.to_le_bytes());
+                    }
+                }
+            } else if self.channel == Profile::INITIAL {
+                hash.update(b"A WW0 ch1 20 source RF2 MAC1 BB3;equal A/B ref0;CCK+OFDM autoresponse;no SAR/antenna offset curves");
+            } else if self.channel.is_5ghz() {
+                hash.update(b"A WW0 native5GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel OFDM/MCS/RU limits, no CCK;no inferred dBm/SAR/antenna offset curves");
+                hash.update(&identity);
+            } else {
+                hash.update(b"A WW0 native noninitial2.4GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel CCK/OFDM/MCS/RU limits;no inferred dBm/SAR/antenna offset curves");
+                hash.update(&identity);
+            }
+        } else if self.channel.width() != Width::Mhz20 {
             hash.update(b"B WW0 native wide40/80 source RF2 MAC1 BB3;equal A/B ref0;actual center/subchannel CCK/OFDM/MCS20/40/80/0p5 and RU sections;no inferred dBm/SAR/antenna offset curves");
             self.channel.bind(hash);
             for n in 0..2 {
@@ -420,14 +583,18 @@ impl Plan {
             offset |= ((i32::from(*v >> 1) as u32) & 15) << (4 * i);
         }
         emit(0xd204, 0xfffff, offset)?;
-        // `rtw8852bx_set_tx_shape`: the CCK DFIR is 2.4GHz only.
-        if !self.channel.is_5ghz() {
-            let fir = self.channel.cck_fir(self.shape[0]);
-            for (i, v) in fir.into_iter().enumerate() {
-                emit(0x10000 + 0x2300 + i as u32 * 4, u32::MAX, v)?;
+        // `rtw8852bx_set_tx_shape`: the CCK DFIR is 2.4GHz only, and only
+        // on B: `rtw8852a_set_txpwr` has no tx-shape step, so an A plan
+        // never writes the CCK DFIR or the 0x14494 shape word.
+        if self.chip == Chip::B {
+            if !self.channel.is_5ghz() {
+                let fir = self.channel.cck_fir(self.shape[0]);
+                for (i, v) in fir.into_iter().enumerate() {
+                    emit(0x10000 + 0x2300 + i as u32 * 4, u32::MAX, v)?;
+                }
             }
+            emit(0x14494, 0x3000000, u32::from(self.shape[1]))?;
         }
-        emit(0x14494, 0x3000000, u32::from(self.shape[1]))?;
         for p in 0..2 {
             let mut page = [0u8; 40];
             for (i, v) in self.limits[p].iter().chain(&self.extra[p]).enumerate() {
@@ -503,7 +670,7 @@ fn apply(io: &mut impl Interface, a: u32, m: u32, v: u32) -> Result<(), Error> {
     Ok(())
 }
 /// # Safety
-/// Same exclusive current measured B preparation as Power::prepare; only the
+/// Same exclusive current measured B/A preparation as Power::prepare; only the
 /// source initial reference-control prefix, no emission authorization.
 pub(super) unsafe fn initial_reference(io: &mut impl Interface) -> Result<(), Error> {
     reference(|a, m, v| apply(io, a, m, v))
@@ -513,7 +680,7 @@ impl Power {
         self.state
     }
     /// # Safety
-    /// Exclusive actual B/PHY0 awake initial owner, CMAC TX/ordinary DMA closed,
+    /// Exclusive actual B/A/PHY0 awake initial owner, CMAC TX/ordinary DMA closed,
     /// current signed full recipe and measured all-path response envelope. This
     /// writes only source controls; caller owns actual RFK and terminal cleanup.
     pub unsafe fn prepare(&mut self, io: &mut impl Interface, plan: &Plan) -> Result<(), Error> {

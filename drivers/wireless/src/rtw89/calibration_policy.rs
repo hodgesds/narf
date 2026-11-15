@@ -210,8 +210,8 @@ impl Board {
     /// `rtw89_8852ae_id_table`: 10ec:8852 and 10ec:a85a): the A factory
     /// logical map and 128-byte PHY-cap window (0x580), cut/RFE/XTAL, the
     /// bound container tables, the A recipe and the A coexistence row
-    /// with its firmware BTC ABI row (`coex_native::ProtocolA`). No A
-    /// coex owner exists yet, so only the chip functions are bound.
+    /// with its firmware BTC ABI row (`coex_native::ProtocolA`, consumed
+    /// by the A coex owner `Coex::prepare_a`).
     pub fn new_a(
         factory: &Factory,
         device: narf_bus::DeviceId,

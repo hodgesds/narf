@@ -84,6 +84,7 @@
 8912 narf_drivers_gpu::intel_gpu_gt::media::MediaGuc<M,A>::start
 8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
 8808 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
+8952 narf_drivers_wireless::brcmfmac::native_runtime::start::{{closure}}
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
 8680 narf_drivers_wireless::cyw43439::bootstrap::probe
 8664 narf_drivers_wireless::iwlwifi::device::ap::<impl narf_drivers_wireless::iwlwifi::device::Device>::ap_control::{{closure}}

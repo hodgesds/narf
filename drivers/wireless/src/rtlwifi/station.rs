@@ -1266,6 +1266,26 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::super::rtl8192ee::ht::host_capabilities(base, &domain)
         })
     }
+    /// RTL8723BE: the host-API capability bits
+    /// (`rtl8723be::ht::host_capabilities`) of the staged `NAPC` envelope
+    /// under current host policy; 0 for every other chip, without an
+    /// envelope or without a regulatory domain.
+    pub(crate) fn station_rtl8723be_host_caps(&self, environment: &impl Environment) -> u8 {
+        if self.chip != super::Chip::Rtl8723be {
+            return 0;
+        }
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8723be())
+        else {
+            return 0;
+        };
+        environment.domain().map_or(0, |domain| {
+            super::super::rtl8723be::ht::host_capabilities(base, &domain)
+        })
+    }
     /// The RTL8821AE owner holds a 5 GHz channel grant.
     pub(crate) fn rtl8821ae_five_ghz(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae

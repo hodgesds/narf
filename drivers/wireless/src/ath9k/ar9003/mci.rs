@@ -2168,9 +2168,17 @@ fn process_gpm_extra(
 /// retargets at the BT calibration done. Any other GPM seen on the
 /// way gets the `process_gpm_extra` treatment; leftover GPMs are
 /// drained the same way. Returns the remaining timeout, 0 on timeout.
+///
+/// `dma` is the owner's shared GPM ring (`Some` when the live-owner
+/// wiring passed it in): the wait re-syncs the DMA ring into the
+/// CPU-side `gpm_buf` before every poll, so a GPM that lands in the
+/// DMA ring mid-wait is seen instead of timing out. `None` keeps the
+/// old behaviour (CPU ring only); the caller is then responsible for
+/// syncing at its walk boundaries.
 fn wait_for_gpm(
     io: &mut impl RegisterIo,
     mci: &mut Mci,
+    dma: Option<&DmaBuffer>,
     mut gpm_type_want: u8,
     gpm_opcode_want: u8,
     mut time_out: u32,
@@ -2196,6 +2204,9 @@ fn wait_for_gpm(
         }
         if time_out == 0 {
             break;
+        }
+        if let Some(dma) = dma {
+            sync_gpm_ring(io, dma, mci);
         }
         let (offset, more) = get_next_gpm_offset(io, mci);
         more_data = more;
@@ -2245,6 +2256,9 @@ fn wait_for_gpm(
         recycle_gpm(mci, off);
     }
     while more_data == MCI_GPM_MORE {
+        if let Some(dma) = dma {
+            sync_gpm_ring(io, dma, mci);
+        }
         let (offset, more) = get_next_gpm_offset(io, mci);
         more_data = more;
         if offset == MCI_GPM_INVALID {
@@ -2722,10 +2736,13 @@ pub(in crate::ath9k) fn switch_2g5g(
 
 /// `ar9003_mci_init_cal_req`: ask BT for a WLAN calibration window and
 /// wait up to 50 ms for the grant. When no grant arrives the caller
-/// must not reuse the previous calibration.
+/// must not reuse the previous calibration. `dma` is the owner's
+/// shared GPM ring, passed through to the `wait_for_gpm` bounded wait
+/// so a grant landing mid-wait is seen.
 pub(in crate::ath9k) fn init_cal_req(
     io: &mut impl RegisterIo,
     mci: &mut Mci,
+    dma: Option<&DmaBuffer>,
     is_reusable: &mut bool,
 ) {
     if mci.bt_state != BtState::Awake || mci.config & ATH_MCI_CONFIG_DISABLE_MCI_CAL != 0 {
@@ -2747,7 +2764,7 @@ pub(in crate::ath9k) fn init_cal_req(
             check_bt: false,
         },
     );
-    if wait_for_gpm(io, mci, GpmSubtype::BtCalGrant as u8, 0, 50000) == 0 {
+    if wait_for_gpm(io, mci, dma, GpmSubtype::BtCalGrant as u8, 0, 50000) == 0 {
         *is_reusable = false;
     }
 }
@@ -2817,10 +2834,10 @@ pub(in crate::ath9k) fn setup(
 /// lost either way (the walk would have skipped it as invalid); BT
 /// re-sends periodic coex messages and re-requests calibration, so the
 /// loss is a delay, not a break. GPMs that arrive during a
-/// `wait_for_gpm` bounded wait are likewise missed — `start_reset`
-/// ignores the wait result and `init_cal_req`'s reusability flag has no
-/// consumer in this port (calibration is never reused) — and are picked
-/// up by the next sync.
+/// `wait_for_gpm` bounded wait are picked up by the wait's in-loop
+/// sync (it takes the same DMA buffer, so no walk-boundary sync is
+/// needed for the wait itself); a wait run with `dma: None` still
+/// misses them until the next sync.
 pub(in crate::ath9k) fn sync_gpm_ring(io: &mut impl RegisterIo, dma: &DmaBuffer, mci: &mut Mci) {
     if dma.len() < MCI_DMA_BUF_BYTES {
         return;
@@ -3226,8 +3243,15 @@ fn two_g5g_changed(mci: &mut Mci, is_2g: bool) {
 
 /// `ar9003_mci_start_reset`: grant BT the calibration window and wait
 /// up to 25 ms for its calibration-done GPM. Returns true when a
-/// calibration reset actually ran.
-pub(in crate::ath9k) fn start_reset(io: &mut impl RegisterIo, mci: &mut Mci, is_2g: bool) -> bool {
+/// calibration reset actually ran. `dma` is the owner's shared GPM
+/// ring, passed through to the `wait_for_gpm` bounded wait so a
+/// calibration-done GPM landing mid-wait is seen.
+pub(in crate::ath9k) fn start_reset(
+    io: &mut impl RegisterIo,
+    mci: &mut Mci,
+    dma: Option<&DmaBuffer>,
+    is_2g: bool,
+) -> bool {
     two_g5g_changed(mci, is_2g);
     if mci.bt_state != BtState::CalStart {
         return false;
@@ -3251,7 +3275,7 @@ pub(in crate::ath9k) fn start_reset(io: &mut impl RegisterIo, mci: &mut Mci, is_
         },
     );
     // Wait for BT calibration to complete (25 ms).
-    wait_for_gpm(io, mci, GpmSubtype::BtCalDone as u8, 0, 25000);
+    wait_for_gpm(io, mci, dma, GpmSubtype::BtCalDone as u8, 0, 25000);
     mci.bt_state = BtState::Awake;
     enable_interrupt(io);
     true

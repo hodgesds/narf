@@ -14606,8 +14606,19 @@ fn aarch64_uefi_boot_cmd(args: &BuildArgs) -> Result<()> {
         aarch64_gic_version(),
         dtb.display()
     ));
+    // Use a named CPU model, not `-cpu max`, for the UEFI leg: AAVMF builds
+    // from edk2 stable202508 through stable202602 (Ubuntu 26.04 ships
+    // 2025.11-3ubuntu7.3) fault on their first instruction after the banner
+    // when the guest CPU exposes LPA2 under TCG, spinning forever in a
+    // Prefetch Abort loop before the loader runs — the uefi-smoke hang
+    // (tianocore/edk2#11962, fixed upstream in edk2-stable202605).
+    // Neoverse-N2 keeps the features the kernel uses (MTE, PAuth, BTI) but
+    // predates LPA2 (Armv8.7), so the bug cannot trigger.
+    // `-cpu max,lpa2=off` is NOT a substitute: the same firmware then faults
+    // while loading its own DXE core. The direct `-kernel` leg and the DTB
+    // dump keep `-cpu max`: neither boots firmware.
     command
-        .args(["-cpu", "max", "-smp", "2", "-m", "512M", "-bios"])
+        .args(["-cpu", "neoverse-n2", "-smp", "2", "-m", "512M", "-bios"])
         .arg(&firmware)
         .args(["-drive"])
         .arg(format!(

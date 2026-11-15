@@ -21,6 +21,8 @@ mod phycap;
 mod radio;
 #[path = "command_native/radio_51.rs"]
 mod radio_51;
+#[path = "command_native/radio_a.rs"]
+mod radio_a;
 pub(in crate::rtw89) use radio::{c_profile, SixGhzChannel};
 #[cfg(any(test, feature = "kernel-test"))]
 pub(in crate::rtw89) use radio::{wide_profiles, wide_profiles_c160};
@@ -81,11 +83,11 @@ pub(super) struct BasicPreflight {
 /// companion (`N5AF`); A-only program accessors ([`Self::a`]) therefore see
 /// "no program" on B, C and RTL8851B.
 ///
-/// No production path installs an `OrdinaryGrant::A` yet: the A RF program
-/// owner (`preflight_radio_a` / `prepare_radio_a`) does not exist, and
-/// installing the grant without the owner having run the recipe would admit
-/// ordinary TX without the measured RF program. The variant is the seam the
-/// owner lane will install through.
+/// `OrdinaryGrant::A` is installed by the A RF program owner
+/// (`preflight_radio_a` / `prepare_radio_a`, #2074) once the A recipe
+/// (`rtw8852a_rfk_init`, set_txpwr_ctrl, power trim) has run; installing
+/// it without the owner having run the recipe would admit ordinary TX
+/// without the measured RF program.
 #[derive(Clone)]
 enum OrdinaryGrant {
     A(alloc::sync::Arc<super::radio_policy_a::Qualification>),
@@ -116,8 +118,9 @@ impl OrdinaryGrant {
     }
     /// The RTL8852A program and its fragment companion; `None` ("no
     /// program") on B, C and RTL8851B.
-    // No consumer yet: the A RF program owner (`preflight_radio_a` /
-    // `prepare_radio_a`) will read the installed A grant through it.
+    // No consumer yet: the A station code will read the installed A grant
+    // through this once the follow-up set_channel lane programs the
+    // channel it admits.
     #[allow(dead_code)]
     fn a(&self) -> Option<&alloc::sync::Arc<super::radio_policy_a::Qualification>> {
         match self {
@@ -206,9 +209,8 @@ pub struct Native {
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
     /// RTL8852A signed full program (N5AB v2 + N5AC records, N5AF fragment
     /// companion) gating every A radio access together with the N5AB
-    /// calibration record. No production path installs it yet: the A RF
-    /// program owner (`preflight_radio_a` / `prepare_radio_a`) does not
-    /// exist.
+    /// calibration record. Installed by the A RF program owner
+    /// (`preflight_radio_a` / `prepare_radio_a`).
     qualification_a: Option<alloc::sync::Arc<super::radio_policy_a::Qualification>>,
     /// RTL8852C signed full program (N5CB v2 + N5CC records) gating every
     /// C radio access together with the C calibration record.
@@ -780,9 +782,10 @@ impl Native {
             .factory
             .as_ref()
             .ok_or(super::radio_init::Error::Profile)?;
-        // Chip dispatch: B, C or RTL8851B tables from the matching factory
+        // Chip dispatch: A, B, C or RTL8851B tables from the matching factory
         // snapshot.
         let qualified = match self.chip {
+            ChipId::Rtl8852A => super::radio_init::Qualified::from_factory_a(factory),
             ChipId::Rtl8852C => super::radio_init::Qualified::from_factory_c(factory),
             ChipId::Rtl8851B => super::radio_init::Qualified::from_factory_51(factory),
             _ => super::radio_init::Qualified::from_factory(factory),

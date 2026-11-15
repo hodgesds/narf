@@ -3,7 +3,7 @@
 //! attempt.
 use super::{
     factory::Factory,
-    factory_51,
+    factory_51, factory_a,
     factory_b::Calibration,
     factory_c,
     mac::ChipId,
@@ -42,6 +42,7 @@ pub(super) trait Interface: Io {
 /// The chip-specific factory calibration that qualified this attempt.
 #[derive(Clone, Copy)]
 enum Inputs {
+    A(factory_a::Calibration),
     B(Calibration),
     C(factory_c::Calibration),
     N51(factory_51::Calibration),
@@ -55,10 +56,26 @@ pub(super) struct Qualified {
 impl Qualified {
     pub fn chip(&self) -> ChipId {
         match self.inputs {
+            Inputs::A(_) => ChipId::Rtl8852A,
             Inputs::B(_) => ChipId::Rtl8852B,
             Inputs::C(_) => ChipId::Rtl8852C,
             Inputs::N51(_) => ChipId::Rtl8851B,
         }
+    }
+    /// RTL8852A: the same actual-factory qualification, from
+    /// `rtw8852a_read_efuse`/`rtw8852a_read_phycap` inputs.
+    pub fn from_factory_a(factory: &Factory) -> Option<Self> {
+        let identity = factory.identity()?;
+        let calibration = identity.calibration();
+        if identity.chip() != ChipId::Rtl8852A || !calibration.valid || calibration.rfe_type == 255
+        {
+            return None;
+        }
+        Some(Self {
+            rfe: calibration.rfe_type,
+            cut: identity.cut(),
+            inputs: Inputs::A(factory_a::Calibration::from_factory(factory)?),
+        })
     }
     /// RTL8851B: the same actual-factory qualification, from
     /// `rtw8851b_read_efuse`/`rtw8851b_read_phycap` inputs.
@@ -115,6 +132,7 @@ pub(super) enum State {
 pub(super) struct Init {
     state: State,
     gain: Option<Gain>,
+    calibration_a: Option<factory_a::Calibration>,
     calibration: Option<Calibration>,
     calibration_c: Option<factory_c::Calibration>,
     calibration_51: Option<factory_51::Calibration>,
@@ -126,6 +144,11 @@ impl Init {
     pub fn gain(&self) -> Option<&Gain> {
         (self.state == State::TablesLoaded)
             .then_some(self.gain.as_ref())
+            .flatten()
+    }
+    pub fn calibration_a(&self) -> Option<&factory_a::Calibration> {
+        (self.state == State::TablesLoaded)
+            .then_some(self.calibration_a.as_ref())
             .flatten()
     }
     pub fn calibration(&self) -> Option<&Calibration> {
@@ -161,11 +184,19 @@ impl Init {
         if n51 != (assets.chip() == ChipId::Rtl8851B) {
             return Err(Error::Profile);
         }
+        // RTL8852A has no static gain table (Linux
+        // `rtw8852a_chip_info.bb_gain_table` is NULL): a container with no
+        // firmware GAIN element leaves an empty gain program, which
+        // `Gain::decode` reads as the default gain.
+        let a = matches!(qualified.inputs, Inputs::A(_));
         // RTL8851B has one RF path (`rf_table = {radioa}`): its path-B
         // program is empty and never written or paged.
         let programs = (0..5)
             .map(|i| {
                 if n51 && i == 3 {
+                    return Ok(Vec::new());
+                }
+                if a && i == 1 && assets.table(1).is_none() {
                     return Ok(Vec::new());
                 }
                 radio_table::program(
@@ -189,6 +220,7 @@ impl Init {
         // both chips (8 gain bands cover C's 6GHz L/M/H/UH).
         self.gain = Some(Gain::decode(&programs[1], qualified.rfe).map_err(Error::Gain)?);
         match qualified.inputs {
+            Inputs::A(calibration) => self.calibration_a = Some(calibration),
             Inputs::B(calibration) => self.calibration = Some(calibration),
             Inputs::C(calibration) => self.calibration_c = Some(calibration),
             Inputs::N51(calibration) => self.calibration_51 = Some(calibration),
@@ -197,6 +229,9 @@ impl Init {
         if c {
             power_units_c(io)?;
             reset_c(io).await?;
+        } else if a {
+            power_units_a(io)?;
+            reset_a(io).await?;
         } else if n51 {
             // rtw8851b_init_txpwr_unit writes the same SCC MAC0 values and
             // UL_TB 1T/2T offsets as rtw8852b; only bb_reset differs.
@@ -436,6 +471,52 @@ fn power_units(io: &mut impl Io) -> Result<(), Error> {
     }
     Ok(())
 }
+/// rtw8852a.c `rtw8852a_init_txpwr_unit(RTW89_PHY_0)`: exactly the three
+/// MAC power-control writes. Unlike B there is no UL_TB enable/offset
+/// step (`set_txpwr_ul_tb_offset` is a runtime call, core.c:7460, not
+/// init) and unlike C the coex control word carries bit 2 (`0x01ebf004`).
+fn power_units_a(io: &mut impl Io) -> Result<(), Error> {
+    io.write32(0xd248, 0x07763333)?;
+    io.write32(0xd220, 0x01ebf004)?;
+    io.write32(0xd240, 0x0002f8ff)?;
+    for (address, value) in [
+        (0xd248, 0x07763333),
+        (0xd220, 0x01ebf004),
+        (0xd240, 0x0002f8ff),
+    ] {
+        if read(io, address)? != value {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
+/// rtw8852a.c `rtw8852a_bb_reset(PHY_0)` (via phy.c `rtw89_phy_bb_reset`):
+/// R_P0/P1_TXPW_RSTB MANON and R_P0/P1_TSSI_TRK EN set, `rtw8852a_bb_reset_all`
+/// (R_RSTB_ASYNC ALL 1 -> 0 -> 1), then the four bits cleared. No HW-SI
+/// trigger hold and no `delay_us(1)`: Linux performs neither for A.
+async fn reset_a(io: &mut impl Io) -> Result<(), Error> {
+    for a in [0x58dc, 0x5818, 0x78dc, 0x7818] {
+        modify(io, 0x10000 + a, 1 << 30, 1)?;
+    }
+    modify(io, 0x10704, 2, 1)?;
+    modify(io, 0x10704, 2, 0)?;
+    modify(io, 0x10704, 2, 1)?;
+    for a in [0x58dc, 0x5818, 0x78dc, 0x7818] {
+        modify(io, 0x10000 + a, 1 << 30, 0)?;
+    }
+    for (a, m, v) in [
+        (0x10704, 2, 2),
+        (0x158dc, 1 << 30, 0),
+        (0x15818, 1 << 30, 0),
+        (0x178dc, 1 << 30, 0),
+        (0x17818, 1 << 30, 0),
+    ] {
+        if read(io, a)? & m != v {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
 /// rtw8851b.c `rtw8851b_bb_reset(PHY_0)`: R_P0_TXPW_RSTB MANON|TSSI = 1 and
 /// R_P0_TSSI_TRK EN set, `rtw8851b_bb_reset_all` (S0 HW-SI trigger only, no
 /// S1), then MANON|TSSI = 3 and TSSI_TRK EN cleared. Every final field is
@@ -592,6 +673,77 @@ pub(super) fn controls_51(io: &mut impl Io) -> Result<[i8; 2], Error> {
         read(io, 0x14a00)? as u8 as i8,
     ])
 }
+/// rtw8852a.c `rtw8852a_bb_sethw`: R_P0/P1_EN_SOUND_WO_NDP clear, the
+/// cut-gated watchdog block (`hal.cv <= CHIP_CCV`, i.e. `cut <= 2`:
+/// R_RSTB_WATCH_DOG, R_BRK_ASYNC_RST_EN_1/2/3, R_SPOOF_ASYNC_RST,
+/// R_P0/P1_TXPW_RSTB MANON set, R_PLCP_HISTOGRAM parsing-time field),
+/// CFO tracking, R_MAC_SEL MOD 0 on both PHYs, NDP break clear/set and
+/// `rtw8852a_bb_macid_ctrl_init` (MACID power-limit table zeroed), each
+/// read back. Returns `()`: Linux parses no gain offset/compensation
+/// for A, so unlike B/C/51 there is no RPL base to keep.
+pub(super) fn controls_a(io: &mut impl Io, cut: u8) -> Result<(), Error> {
+    for address in [0x10d7c, 0x12d7c] {
+        modify(io, address, 2, 0)?;
+    }
+    if cut <= 2 {
+        modify(io, 0x1000c, 1, 1)?;
+        io.write32(0x10dc0, 0x864f_a000)?;
+        io.write32(0x10dc4, 0x43f)?;
+        io.write32(0x10dc8, 0x7fff)?;
+        modify(io, 0x10d84, 1 << 15, 1)?;
+        modify(io, 0x158dc, 1 << 30, 1)?;
+        modify(io, 0x178dc, 1 << 30, 1)?;
+        modify(io, 0x10738, 0xf0000, 0xf)?;
+    }
+    modify(io, 0x14404, 0x7c00, 0x1f)?;
+    modify(io, 0x1440c, 0x7c00, 0x0c)?;
+    modify(io, 0x109a4, 0x1c, 0)?;
+    modify(io, 0x129a4, 0x1c, 0)?;
+    modify(io, 0x10da0, 1, 0)?;
+    modify(io, 0x10da4, 1, 1)?;
+    for address in (0xd36c..=0xd568).step_by(4) {
+        io.write32(address, 0)?;
+    }
+    for address in [0x10d7c, 0x12d7c] {
+        if read(io, address)? & 2 != 0 {
+            return Err(power::Error::Access.into());
+        }
+    }
+    if cut <= 2 {
+        for (address, mask, value) in [
+            (0x1000c, 1, 1),
+            (0x10dc0, u32::MAX, 0x864f_a000),
+            (0x10dc4, u32::MAX, 0x43f),
+            (0x10dc8, u32::MAX, 0x7fff),
+            (0x10d84, 1 << 15, 1 << 15),
+            (0x158dc, 1 << 30, 1 << 30),
+            (0x178dc, 1 << 30, 1 << 30),
+            (0x10738, 0xf0000, 0xf0000),
+        ] {
+            if read(io, address)? & mask != value {
+                return Err(power::Error::Access.into());
+            }
+        }
+    }
+    for (address, mask, value) in [
+        (0x14404, 0x7c00, 0x7c00),
+        (0x1440c, 0x7c00, 0x3000),
+        (0x109a4, 0x1c, 0),
+        (0x129a4, 0x1c, 0),
+        (0x10da0, 1, 0),
+        (0x10da4, 1, 1),
+    ] {
+        if read(io, address)? & mask != value {
+            return Err(power::Error::Access.into());
+        }
+    }
+    for address in (0xd36c..=0xd568).step_by(4) {
+        if read(io, address)? != 0 {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
 /// The register state `rtw8851b_bb_gpio_init` leaves behind (R_P0_TRSW
 /// 0x5868 TRSW_A set, TRSW_X/TRSW_SO_A2 clear, the eight path-A
 /// `rtw8851b_bb_gpio_trsw` fields at [31:16] = 0xa9a9; SEL0/SEL32 bases and
@@ -717,6 +869,13 @@ pub(super) async fn nctl_c(io: &mut impl Io, program: &[Pair]) -> Result<(), Err
 /// there is no post-table step. (Shared with the BE table-application
 /// owner, `radio_be`; the 8852A sibling lane owns the A paths.)
 pub(super) async fn nctl_be(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    nctl_for(io, program, &NCTL_PREINIT[..4]).await
+}
+/// RTL8852A NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` without the
+/// RTL8852B/BT-only second `R_IOQ_IQK_DPK |= 0x2`, then the selected
+/// firmware NCTL table; `rtw8852a_chip_info.nctl_post_table` is NULL
+/// (`rtw8852a.c:2397`), so there is no post-table step.
+pub(super) async fn nctl_a(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
     nctl_for(io, program, &NCTL_PREINIT[..4]).await
 }
 /// RTL8851B NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` with the one-path
