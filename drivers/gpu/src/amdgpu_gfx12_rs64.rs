@@ -30,21 +30,21 @@ pub struct Starts {
     pub mec: u64,
 }
 impl Starts {
-    /// Build the three program counters out of line: `Firmware::images()`
-    /// returns `[Image; 11]` by value (several KiB), and building that
-    /// array in `Rs64::new`'s frame put `new` over the 8 KiB frame budget
-    /// (12,456 bytes on #2152's run 43801613743, after the branch's
-    /// scheduler changes flipped LTO inlining). The array is built in
-    /// this frame, not the caller's; only the 24-byte `Starts` returns.
-    /// Same shape as `stage_media_guc_boxed` in intel_gpu_media_gt.rs.
+    /// Build the three program counters one image at a time: `Firmware::images()`
+    /// returns `[Image; 11]` by value (3872 bytes, measured), and building that
+    /// array in this frame put it over the 8 KiB frame budget (8552 bytes,
+    /// #2163 — the `#[inline(never)]` added by #2152 moved the overage here
+    /// from `Rs64::new` instead of shrinking it). Each `image()` call parses
+    /// a single 352-byte `Image` and only its entry point survives, so the
+    /// frame stays bounded by one image plus parse locals. `#[inline(never)]`
+    /// is kept so none of that lands in `Rs64::new`'s frame either.
     #[inline(never)]
     fn from_firmware(firmware: &fw::Firmware) -> Result<Self, Error> {
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
         let entry = |source| {
-            images
-                .iter()
-                .find(|i| i.source() == source)
-                .and_then(|i| i.entry_points())
+            firmware
+                .image(source)
+                .map_err(|_| Error::Invalid)?
+                .entry_points()
                 .map(|p| p.code)
                 .ok_or(Error::Invalid)
         };
