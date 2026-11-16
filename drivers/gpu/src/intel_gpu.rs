@@ -16,9 +16,10 @@
 //!   cross-check for ADL-S/-P iGPUs.
 //! - **Meteor Lake display PRM** — Xe-LPG display engine.
 //! - **Linux `include/drm/intel/pciids.h`** — the current exact Intel
-//!   graphics PCI-ID families. This is the authority for the device
-//!   table below; IDs are admitted only when their existing platform
-//!   profile already models the corresponding register/firmware family.
+//!   graphics PCI-ID families and primary authority for the device table.
+//!   Six older ADL-P rows retained from public `pci.ids` share its qualified
+//!   profile. IDs are admitted only when the corresponding register/firmware
+//!   family is modeled; source-known but unqualified families fail closed.
 //!
 //! **No GPL Linux `i915` / `xe` source consulted for the driver
 //! logic.** Register *values* in sibling modules are cross-checked
@@ -200,6 +201,15 @@ pub const NVLS_D745: u16 = 0xD745;
 pub const CRI_674C: u16 = 0x674C;
 pub(crate) const CRI_IDS: &[u16] = &[CRI_674C];
 
+// Arctic Sound-M. Linux `INTEL_ATS_M_IDS`: M150 = 56C0/56C2, M75 = 56C1.
+// These use the DG2 platform machinery but are display-less, SR-IOV-capable
+// accelerator profiles; they remain a distinct fail-closed identity until
+// NARF separates those policies from its display-capable Alchemist owner.
+pub const ATSM_56C0: u16 = 0x56C0;
+pub const ATSM_56C1: u16 = 0x56C1;
+pub const ATSM_56C2: u16 = 0x56C2;
+pub(crate) const ATSM_IDS: &[u16] = &[ATSM_56C0, ATSM_56C1, ATSM_56C2];
+
 // ── Generation classifier ────────────────────────────────────────
 
 /// Gen12 sub-architecture identifier. Tiger Lake / Alder Lake /
@@ -305,9 +315,10 @@ pub struct DeviceEntry {
 }
 
 /// The canonical integrated device table. Contents are pinned against
-/// spec §5 by the census fixture in this module's tests; the exact IDs
-/// are transcribed from Linux `include/drm/intel/pciids.h` only when the
-/// matching generation profile is already qualified.
+/// spec §5 by the census fixture in this module's tests. Current families
+/// are transcribed from Linux `include/drm/intel/pciids.h`; the six retained
+/// public-`pci.ids` ADL-P rows are called out in the spec. Every row requires
+/// an already-qualified matching generation profile.
 pub const DEVICE_TABLE: &[DeviceEntry] = &[
     // MIT Linux include/drm/intel/pciids.h: INTEL_LNL_IDS (exactly three).
     DeviceEntry {
@@ -962,7 +973,7 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
 ];
 
 pub(crate) fn source_known_unqualified(did: u16) -> bool {
-    CRI_IDS.contains(&did)
+    CRI_IDS.contains(&did) || ATSM_IDS.contains(&did)
 }
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
@@ -1419,7 +1430,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    if source_known_unqualified(device.id.device) {
+    if ATSM_IDS.contains(&device.id.device) {
+        log_probe(
+            "recognized Arctic Sound-M — distinct headless/SR-IOV profile not yet qualified",
+            &device,
+        );
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    if CRI_IDS.contains(&device.id.device) {
         log_probe(
             "recognized Crescent Island — GuC firmware profile absent; execution gated",
             &device,
@@ -2127,6 +2145,7 @@ pub fn register_pci_driver() {
         ("intel-gpu-dg1", crate::intel_gpu_gt::DG1_IDS),
         ("intel-gpu-dg2", crate::intel_gpu_gt::DG2_IDS),
         ("intel-gpu-bmg", crate::intel_gpu_gt::BMG_IDS),
+        ("intel-gpu-atsm-gated", ATSM_IDS),
         ("intel-gpu-cri-gated", CRI_IDS),
     ] {
         for &device in ids {
@@ -3757,6 +3776,27 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_crescent_island_identity_is_exact_and_fail_closed
+    );
+
+    fn smoke_arctic_sound_m_identity_is_exact_and_fail_closed() -> TestResult {
+        for did in [ATSM_56C0, ATSM_56C1, ATSM_56C2] {
+            if !source_known_unqualified(did)
+                || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
+                || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did).is_some()
+            {
+                return TestResult::Fail("Arctic Sound-M fail-closed identity boundary");
+            }
+        }
+        for did in [0x56bfu16, 0x56c3] {
+            if source_known_unqualified(did) {
+                return TestResult::Fail("Arctic Sound-M identity widened beyond Linux IDs");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_arctic_sound_m_identity_is_exact_and_fail_closed
     );
 
     fn smoke_headless_gt_requires_every_display_fetcher_stopped() -> TestResult {

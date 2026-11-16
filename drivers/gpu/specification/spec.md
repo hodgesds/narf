@@ -1859,6 +1859,12 @@ refuses before D-state/BAR/command/MMIO effects: Linux describes DMA52, VA57,
 root4, non-flat CCS and graphics 35.11/media 35.03, while its current GuC
 firmware table contains no `CRESCENTISLAND` entry. No other family's firmware
 or memory policy is substituted.
+The exact ATS-M 56C0/56C1/56C2 VGA IDs are likewise registered and announced
+before the same no-effects refusal. Linux gives ATS-M the DG2 platform and
+GuC (`i915/dg2_guc_70.bin` 70.53.0+) but a distinct display-less, SR-IOV
+descriptor (graphics/media 12.55, DMA46, flat CCS, VA48/root3 and 64 KiB VRAM
+granularity). It is not aliased to NARF's display-capable `Alchemist` owner;
+execution waits for a separately qualified headless/SR-IOV policy.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

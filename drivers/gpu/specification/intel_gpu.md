@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.65** (v0.64 plus a typed, read-only census of all current
+> Status: **v0.66** (v0.65 plus exact fail-closed Arctic Sound-M discovery;
+> a typed, read-only census of all current
 > Linux GMD display identities, including distinct Wildcat Lake 30.02 and
 > Nova Lake-S 35.00 refusal proofs; exact Nova Lake-S headless GT/GuC/media
 > identity and exact fail-closed Crescent Island discovery; a distinct Wildcat Lake GT profile admitting
@@ -203,9 +204,11 @@ Stage-3 driver core consumes these codecs through the
 The canonical table lives in code as `intel_gpu::DEVICE_TABLE`;
 PCI registration and classification both derive from it, and the
 `smoke_device_table_census` fixture pins the code table to this
-section. IDs are exact members of Linux
-`include/drm/intel/pciids.h`; a row is added only when its existing
-platform profile already models that register and GuC-firmware family.
+section. Current Linux `include/drm/intel/pciids.h` is the primary family
+census; six older ADL-P rows retained from the public `pci.ids` database
+(4636/4638/463A/46B6/46B8/46BA) share the already-qualified ADL-P profile.
+A row is added only when its existing platform profile already models that
+register and GuC-firmware family.
 The current census restores Tiger Lake 9A59/9AC0/9AC9/9AD9/9AF8 and
 Alder Lake-P 46A2/46B2/46C2, which an older `pci.ids` extract had
 incorrectly caused this driver to reject, and adds Rocket Lake only after
@@ -213,11 +216,13 @@ giving it its own exact pre-GMD platform profile.
 
 Discrete identities are kept in their own exact lists rather than inserted
 into the integrated `DEVICE_TABLE`: DG1 is 4905, 4906, 4907, 4908 and 4909;
-DG2 and BMG retain their existing exact lists. The same exact-match PCI
-registration and class backstop rules apply.
+DG2 and BMG retain their existing exact lists. ATS-M is 56C0/56C1/56C2 and
+is registered as a guarded identity rather than aliased to display-capable
+DG2. The same exact-match PCI registration and class backstop rules apply.
 
 | ASIC (`ChipInfo::asic`) | Device IDs |
 | ----------------------- | ---------- |
+| lunarlake (Xe2-LPG; display 20 opt-in) | 6420, 64A0, 64B0 |
 | tigerlake (Gen12) | 9A40, 9A49, 9A59, 9A60, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8 |
 | rocketlake (Gen12 GT; display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
 | alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A2, 46A3, 46A6, 46A8, 46AA, 46B6, 46B8, 46BA |
@@ -285,6 +290,15 @@ discrete DMA52, VA57, root4, non-flat-CCS Xe3p_XPC profile, but the current
 `xe_uc_fw.c` manifest has no `CRESCENTISLAND` GuC entry. NARF therefore
 announces the exact identity and refuses before D-state, BAR, command or MMIO
 effects. It is not aliased to NVL-S firmware or BMG memory policy.
+
+Arctic Sound-M IDs 56C0/56C2 (M150) and 56C1 (M75) are exact
+`INTEL_ATS_M_IDS`. Linux describes them as display-less DG2-platform
+accelerators: pre-GMD graphics/media 12.55, DMA46, flat CCS, 48-bit VA/root3,
+64 KiB VRAM granularity, SR-IOV, and `i915/dg2_guc_70.bin` 70.53.0 or newer.
+NARF's current `Alchemist` owner also implies display-capable DG2 policy and
+device-specific reset/workaround tables, so ATS-M is not silently inserted
+there. Its exact IDs are announced and refuse before D-state, BAR, command or
+MMIO effects until a distinct headless/SR-IOV profile is qualified.
 
 Arrow Lake (#1023): the five IDs classify
 `Generation::MeteorLake` under `asic: "arrowlake"` — the table
