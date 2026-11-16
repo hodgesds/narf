@@ -30,6 +30,14 @@ pub struct Starts {
     pub mec: u64,
 }
 impl Starts {
+    /// Build the three program counters out of line: `Firmware::images()`
+    /// returns `[Image; 11]` by value (several KiB), and building that
+    /// array in `Rs64::new`'s frame put `new` over the 8 KiB frame budget
+    /// (12,456 bytes on #2152's run 43801613743, after the branch's
+    /// scheduler changes flipped LTO inlining). The array is built in
+    /// this frame, not the caller's; only the 24-byte `Starts` returns.
+    /// Same shape as `stage_media_guc_boxed` in intel_gpu_media_gt.rs.
+    #[inline(never)]
     fn from_firmware(firmware: &fw::Firmware) -> Result<Self, Error> {
         let images = firmware.images().map_err(|_| Error::Invalid)?;
         let entry = |source| {
