@@ -83,10 +83,13 @@
 //! - F$12 multi-source ATTN reads use a 5-object register read,
 //!   mirroring the I2C-HID sibling lane; the true object count from
 //!   the F$12 query registers is a follow-up.
-//! - The Elan mute LED (`HAS_LED`) is recorded in the binding and
-//!   drivable via [`set_mute_led_for_slot`]; Linux only registers
-//!   it as a led-class device and never writes it at bind time, so
-//!   no LED write happens during probe.
+//! - The Elan mute LED (`HAS_LED`) is registered at bind time as
+//!   the `elan:red:mute` led-class device
+//!   ([`elan::register_mute_led`], issue #1720) and driven from
+//!   the pump, which syncs the evdev node's `LED_MUTE` bit to
+//!   hardware on state change. Linux only registers the
+//!   led-class device and never writes it at bind time, so no
+//!   LED write happens during probe.
 
 extern crate alloc;
 
@@ -100,7 +103,8 @@ use narf_input::rmi4::{PdtEntry, TouchpadReport};
 use narf_input::{
     abs,
     evdev::{
-        key as evkey, prop, DeviceCaps, DeviceId, DeviceNode, MtContactUpdate, MtEvdevState, ROUTER,
+        key as evkey, led as evled, prop, DeviceCaps, DeviceId, DeviceNode, MtContactUpdate,
+        MtEvdevState, ROUTER,
     },
     push_global, AxisInfo, InputEvent, PointerButtons, PointerEvent, TouchEvent, TouchState,
 };
@@ -897,10 +901,59 @@ fn pump_rmi_report(
 
 /// Decode one Elan USB input report into contacts + button state,
 /// then emit. Returns the number of events pushed.
+/// Push the Elan touchpad node's mute-LED state to the device
+/// when it moved since the last successful send. Sync analogue
+/// of the i2c-HID pump's `sync_elan_mute_led`
+/// (`drivers/input/src/i2c_hid_bind.rs`): the input core owns
+/// the mute state (`EV_LED` `LED_MUTE` bit on the node's bitmap,
+/// written by userspace `EV_LED` writes or by the
+/// `elan:red:mute` LED class device); this diffs it against the
+/// last driven state and issues the 0xBC feature report only on
+/// change. A failed send leaves the driven state stale so the
+/// next report retries. Non-LED bindings never reach a send —
+/// their `ElanMuteLed` answers `None` to every decision.
+///
+/// Runs in the supervisor's sync pump cycle. The transfer goes
+/// through `UsbHidIo::set_feature` → `block_on_spin`, the same
+/// bridge the bind path uses: the spinning variant cannot
+/// deadlock the executor (only the halting `block_on` panics in
+/// executor poll), and the send happens at most once per mute
+/// transition — a single short control transfer, never on the
+/// touch hot path.
+fn sync_elan_mute_led(binding: &RmiElanBinding) {
+    let RmiElanKind::Elan { io, .. } = &binding.kind else {
+        return;
+    };
+    let Some(on) = binding
+        .mute_led
+        .lock()
+        .pending_drive(elan::mute_from_led_bitmap(binding.evdev_node.led_state()))
+    else {
+        return;
+    };
+    // `ElanMuteLed::set_muted` is generic over `T: ElanHidIo`
+    // and cannot take the boxed `dyn` transport; use the
+    // pending-drive / mark-driven pair around the trait method
+    // directly — the same split `set_mute_led_for_slot` uses,
+    // and the same body `elan::set_mute_led` runs.
+    let body = elan::encode_mute_led(on);
+    if io.lock().set_feature(&body).is_ok() {
+        binding.mute_led.lock().mark_driven(on);
+    }
+}
+
 fn pump_elan_report(binding: &RmiElanBinding, max_y: u16, report: &[u8]) -> usize {
     if report.is_empty() {
         return 0;
     }
+    // Mute LED follows the node's LED_MUTE bit (issue #1720);
+    // a change since the last send issues the 0xBC feature
+    // report, a failure retries on the next Elan report. The
+    // sync runs on every non-empty Elan report regardless of
+    // whether it decodes — mute state is independent of the
+    // touch decode, and `pending_drive` makes the check a
+    // no-op when nothing moved.
+    sync_elan_mute_led(binding);
     match report[0] {
         elan::ELAN_SINGLE_FINGER => {
             let Some(rep) = ElanReport::decode_usb_single_finger(report, max_y) else {
@@ -1042,6 +1095,12 @@ pub struct RmiElanBinding {
     pub hub_port: Option<(u8, u8)>,
     pub kind: RmiElanKind,
     pub pump: IrqSafeSpinLock<PumpState>,
+    /// Mute-LED drive state (Elan `HAS_LED` bindings only; the
+    /// state machine answers `NotPresent` on any other binding).
+    /// The pump syncs the evdev node's `LED_MUTE` bit through
+    /// this on every Elan report (issue #1720) — the sync
+    /// analogue of the i2c-HID pump's `sync_elan_mute_led`.
+    pub mute_led: IrqSafeSpinLock<elan::ElanMuteLed>,
     /// Normalisation ranges for the global-ring TouchEvents:
     /// RMI F$12 is full-range u16, F$11 is 12-bit; Elan uses the
     /// probed max-X / max-Y.
@@ -1062,6 +1121,7 @@ impl fmt::Debug for RmiElanBinding {
             .field("hub_port", &self.hub_port)
             .field("kind", &self.kind)
             .field("pump", &self.pump)
+            .field("mute_led", &self.mute_led)
             .field("x_range", &self.x_range)
             .field("y_range", &self.y_range)
             .field("evdev_id", &self.evdev_id)
@@ -1131,8 +1191,12 @@ fn rmi_caps() -> DeviceCaps {
 /// Caps for an Elan touchpad: slot-protocol-B axes over the probed
 /// max-X / max-Y (with the probed resolution, as Linux sets
 /// `input_abs_set_res`), clickpad button, `INPUT_PROP_POINTER |
-/// INPUT_PROP_BUTTONPAD`.
-fn elan_caps(params: &ElanDeviceParams) -> DeviceCaps {
+/// INPUT_PROP_BUTTONPAD`. `has_led` adds `LED_MUTE` to the ledbit
+/// (mirrors `i2c_hid_touch::build_elan_caps`): the mute LED's
+/// userspace surface — evdev `EV_LED` writes and the
+/// `elan:red:mute` led-class device — both converge on that bit,
+/// which the pump syncs to hardware.
+fn elan_caps(params: &ElanDeviceParams, has_led: bool) -> DeviceCaps {
     let mut caps = DeviceCaps::new();
     let x = AxisInfo {
         min: 0,
@@ -1158,6 +1222,9 @@ fn elan_caps(params: &ElanDeviceParams) -> DeviceCaps {
     caps.add_key(evkey::BTN_LEFT);
     caps.add_prop(prop::POINTER);
     caps.add_prop(prop::BUTTONPAD);
+    if has_led {
+        caps.add_led(evled::LED_MUTE);
+    }
     caps
 }
 
@@ -1391,6 +1458,7 @@ async fn probe_and_register(
                     transport: IrqSafeSpinLock::new(Box::new(transport)),
                 },
                 pump: IrqSafeSpinLock::new(PumpState::new()),
+                mute_led: IrqSafeSpinLock::new(elan::ElanMuteLed::new(false)),
                 x_range: (0, 0xFFFF),
                 y_range: (0, 0xFFFF),
                 evdev_id,
@@ -1426,7 +1494,8 @@ async fn probe_and_register(
             // `elan_probe` → `elan_start_multitouch`).
             let params = elan::read_device_params(&mut io).map_err(|_| NOT_BOUND)?;
             elan::enable_absolute_mode(&mut io).map_err(|_| NOT_BOUND)?;
-            let mut caps = elan_caps(&params);
+            let has_led = quirks.contains(ElanQuirks::HAS_LED);
+            let mut caps = elan_caps(&params, has_led);
             if let Some(id) = resolve_usb_identity(
                 xhci_dev,
                 slot_id,
@@ -1439,6 +1508,14 @@ async fn probe_and_register(
                 apply_identity(&mut caps, &id);
             }
             let (evdev_id, evdev_node) = ROUTER.register_device(caps);
+            if has_led {
+                // Publishes `/sys/class/leds/elan:red:mute/`;
+                // brightness writes land on the node's LED_MUTE
+                // bit, which the pump syncs to hardware below.
+                // Linux registers only, never writes at bind
+                // time — no LED write happens here (issue #1720).
+                elan::register_mute_led(evdev_node.clone());
+            }
             let binding = Arc::new(RmiElanBinding {
                 slot_id,
                 in_dci,
@@ -1450,6 +1527,7 @@ async fn probe_and_register(
                     quirks,
                 },
                 pump: IrqSafeSpinLock::new(PumpState::new()),
+                mute_led: IrqSafeSpinLock::new(elan::ElanMuteLed::new(has_led)),
                 x_range: (0, params.max_x as i32),
                 y_range: (0, params.max_y as i32),
                 evdev_id,
@@ -1561,6 +1639,11 @@ pub fn unregister_all_rmi_elan(controller: u8) {
 /// device has no LED, or the Feature write fails. Best-effort:
 /// the LED is a userspace led-class concern, never load-bearing
 /// for the touch path.
+///
+/// Direct-drive entry point: it sends unconditionally, without
+/// tracking driven state. The steady-state path is the pump's
+/// [`sync_elan_mute_led`], which sends only on a mute-state
+/// change; this helper is for diagnostics and direct callers.
 pub fn set_mute_led_for_slot(controller: u8, slot_id: u8, on: bool) -> bool {
     let binding = {
         let g = RMI_ELAN_DEVICES.of(controller).lock();
@@ -1794,6 +1877,7 @@ pub(crate) mod tests {
                 transport: IrqSafeSpinLock::new(Box::new(transport)),
             },
             pump: IrqSafeSpinLock::new(PumpState::new()),
+            mute_led: IrqSafeSpinLock::new(elan::ElanMuteLed::new(false)),
             x_range: (0, 0xFFFF),
             y_range: (0, 0xFFFF),
             evdev_id,
@@ -1803,9 +1887,22 @@ pub(crate) mod tests {
 
     /// Build a standalone Elan binding for pump tests.
     fn elan_binding_for_test(params: ElanDeviceParams) -> Arc<RmiElanBinding> {
-        let caps = elan_caps(&params);
-        let (evdev_id, evdev_node) = ROUTER.register_device(caps);
         let io = UsbHidIo::new(0, 7, 0, 3, None, DeviceQuirks::empty());
+        elan_binding_for_test_with_io(params, ElanQuirks::empty(), Box::new(io))
+    }
+
+    /// Build a standalone Elan binding over a caller-supplied
+    /// transport, for pump tests that must observe Feature SETs
+    /// (the binding boxes the transport, so a shared-capture fake
+    /// is the only way to read them back).
+    fn elan_binding_for_test_with_io(
+        params: ElanDeviceParams,
+        quirks: ElanQuirks,
+        io: Box<dyn ElanHidIo + Send + Sync>,
+    ) -> Arc<RmiElanBinding> {
+        let has_led = quirks.contains(ElanQuirks::HAS_LED);
+        let caps = elan_caps(&params, has_led);
+        let (evdev_id, evdev_node) = ROUTER.register_device(caps);
         Arc::new(RmiElanBinding {
             slot_id: 7,
             in_dci: 3,
@@ -1813,15 +1910,56 @@ pub(crate) mod tests {
             hub_port: None,
             kind: RmiElanKind::Elan {
                 params,
-                io: IrqSafeSpinLock::new(Box::new(io) as Box<dyn ElanHidIo + Send + Sync>),
-                quirks: ElanQuirks::empty(),
+                io: IrqSafeSpinLock::new(io),
+                quirks,
             },
             pump: IrqSafeSpinLock::new(PumpState::new()),
+            mute_led: IrqSafeSpinLock::new(elan::ElanMuteLed::new(has_led)),
             x_range: (0, params.max_x as i32),
             y_range: (0, params.max_y as i32),
             evdev_id,
             evdev_node,
         })
+    }
+
+    /// Fake Elan transport that captures Feature SETs in a shared
+    /// sink the test keeps a handle on (the binding boxes the
+    /// transport, so the test cannot read it back afterwards).
+    struct CaptureElanIo {
+        sets: Arc<IrqSafeSpinLock<Vec<Vec<u8>>>>,
+    }
+
+    impl ElanHidIo for CaptureElanIo {
+        fn set_feature(&mut self, report: &[u8]) -> Result<(), TransportError> {
+            if report.is_empty() {
+                return Err(TransportError::Short);
+            }
+            self.sets.lock().push(report.to_vec());
+            Ok(())
+        }
+
+        fn get_feature(
+            &mut self,
+            _report_id: u8,
+            _dst: &mut [u8],
+        ) -> Result<usize, TransportError> {
+            Err(TransportError::Short)
+        }
+    }
+
+    /// Set a node's mute bit the way `ElanMuteLedClass::
+    /// set_brightness` does (same two dispatches): a userspace
+    /// `EV_LED` write and a sysfs brightness write converge on
+    /// this bitmap, which the pump syncs to hardware.
+    fn set_node_mute(node: &DeviceNode, on: bool) {
+        let now = narf_time::monotonic_ns();
+        let _ = node.dispatch(narf_input::evdev::EvdevEvent {
+            time: now,
+            type_: narf_input::evdev::EventType::Led,
+            code: narf_input::evdev::led::LED_MUTE,
+            value: i32::from(on),
+        });
+        let _ = node.dispatch(narf_input::evdev::EvdevEvent::syn_report(now));
     }
 
     fn smoke_classify_rmi_elan_tables() -> TestResult {
@@ -2312,4 +2450,139 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/hid/rmi-elan", smoke_elan_mt_pair_pump);
+
+    fn smoke_elan_caps_ledbit() -> TestResult {
+        let params = ElanDeviceParams {
+            max_x: 1000,
+            max_y: 500,
+            res_x_dots_per_mm: 10,
+            res_y_dots_per_mm: 10,
+        };
+        // HAS_LED caps declare LED_MUTE; non-LED caps declare
+        // none (mirrors the i2c-HID `build_elan_caps` cases in
+        // `drivers/input/src/tests.rs`).
+        let caps = elan_caps(&params, true);
+        if !caps.ledbit.get(narf_input::evdev::led::LED_MUTE) {
+            return TestResult::Fail("HAS_LED caps must declare LED_MUTE");
+        }
+        let plain = elan_caps(&params, false);
+        if plain.ledbit.get(narf_input::evdev::led::LED_MUTE) {
+            return TestResult::Fail("non-LED caps must not declare LED_MUTE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/hid/rmi-elan", smoke_elan_caps_ledbit);
+
+    fn smoke_elan_mute_led_userspace_path() -> TestResult {
+        let params = ElanDeviceParams {
+            max_x: 0x1234,
+            max_y: 0x5678,
+            res_x_dots_per_mm: 43,
+            res_y_dots_per_mm: 22,
+        };
+        let sets = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+        let binding = elan_binding_for_test_with_io(
+            params,
+            ElanQuirks::HAS_LED,
+            Box::new(CaptureElanIo { sets: sets.clone() }),
+        );
+        let plain_sets = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+        let plain = elan_binding_for_test_with_io(
+            params,
+            ElanQuirks::empty(),
+            Box::new(CaptureElanIo {
+                sets: plain_sets.clone(),
+            }),
+        );
+        init_global_ring(64);
+        __reset_global_ring_for_test();
+        let fail = |msg: &'static str| {
+            RMI_ELAN_DEVICES.of(0).lock().retain(|b| b.slot_id != 7);
+            elan::unregister_mute_led();
+            ROUTER.unregister_device(binding.evdev_id);
+            ROUTER.unregister_device(plain.evdev_id);
+            TestResult::Fail(msg)
+        };
+        // Register the led-class device exactly as the bind path
+        // does — proves registration composes with the USB node.
+        let _led = elan::register_mute_led(binding.evdev_node.clone());
+        // 0x81 single-finger report (same bytes as
+        // `smoke_elan_usb_single_finger_pump`).
+        let report: Vec<u8> = alloc::vec![0x81, 0x00, 0x09, 0x14, 0x00, 0x78, 0x00, 0x80];
+        // Mute clear at bind: the pump must not touch the LED —
+        // Linux never writes it at bind time, and neither do we.
+        if pump_report(&binding, &report) < 1 {
+            return fail("Elan 0x81 pump pushed 0 events");
+        }
+        if !sets.lock().is_empty() {
+            return fail("pump must not write the LED while mute is clear");
+        }
+        // Userspace mutes (EV_LED write / sysfs brightness 1):
+        // the next report drives the 0xBC mute SET_REPORT to
+        // the fake transport.
+        set_node_mute(&binding.evdev_node, true);
+        if pump_report(&binding, &report) < 1 {
+            return fail("Elan 0x81 pump pushed 0 events after mute");
+        }
+        let captured: Vec<Vec<u8>> = sets.lock().clone();
+        if captured.len() != 1 {
+            return fail("exactly one mute SET_REPORT must reach the transport");
+        }
+        if captured[0] != elan::encode_mute_led(true) {
+            return fail("mute SET_REPORT must be the 0xBC encode_mute_led(true) body");
+        }
+        // No state change, no second write.
+        if pump_report(&binding, &report) < 1 {
+            return fail("Elan 0x81 pump pushed 0 events on repeat");
+        }
+        if sets.lock().len() != 1 {
+            return fail("repeat pump with unchanged mute must not re-send");
+        }
+        // Userspace unmutes: the next report drives the LED off.
+        set_node_mute(&binding.evdev_node, false);
+        if pump_report(&binding, &report) < 1 {
+            return fail("Elan 0x81 pump pushed 0 events after unmute");
+        }
+        if sets.lock().len() != 2 {
+            return fail("unmute must drive exactly one more SET_REPORT");
+        }
+        if sets.lock()[1] != elan::encode_mute_led(false) {
+            return fail("unmute SET_REPORT must be the 0xBC encode_mute_led(false) body");
+        }
+        // A non-LED binding never writes, even with the mute bit
+        // set on its node.
+        set_node_mute(&plain.evdev_node, true);
+        if pump_report(&plain, &report) < 1 {
+            return fail("non-LED Elan 0x81 pump pushed 0 events");
+        }
+        if !plain_sets.lock().is_empty() {
+            return fail("non-LED binding must never write the LED");
+        }
+        // The direct-drive helper reaches the same transport.
+        RMI_ELAN_DEVICES.of(0).lock().push(binding.clone());
+        if !set_mute_led_for_slot(0, 7, true) {
+            return fail("set_mute_led_for_slot must drive the bound HAS_LED slot");
+        }
+        if sets.lock().len() != 3 || sets.lock()[2] != elan::encode_mute_led(true) {
+            return fail("set_mute_led_for_slot must send encode_mute_led(true)");
+        }
+        if set_mute_led_for_slot(0, 99, true) {
+            return fail("set_mute_led_for_slot must fail for an unbound slot");
+        }
+        if !set_mute_led_for_slot(0, 7, false) {
+            return fail("set_mute_led_for_slot must drive the bound slot off");
+        }
+        if sets.lock().len() != 4 || sets.lock()[3] != elan::encode_mute_led(false) {
+            return fail("set_mute_led_for_slot off must send encode_mute_led(false)");
+        }
+        RMI_ELAN_DEVICES.of(0).lock().retain(|b| b.slot_id != 7);
+        elan::unregister_mute_led();
+        ROUTER.unregister_device(binding.evdev_id);
+        ROUTER.unregister_device(plain.evdev_id);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/hid/rmi-elan",
+        smoke_elan_mute_led_userspace_path
+    );
 }

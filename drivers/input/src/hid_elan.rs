@@ -35,7 +35,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_drivers_leds::{register_led, LedDevice, Trigger};
+use narf_drivers_leds::{register_led, unregister_led, LedDevice, Trigger};
 use narf_input::evdev::{led as evled, DeviceNode, EvdevEvent, EventType};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -694,6 +694,19 @@ pub fn register_mute_led(node: Arc<DeviceNode>) -> Arc<ElanMuteLedClass> {
     let dev = Arc::new(ElanMuteLedClass::new(node));
     register_led(dev.clone());
     dev
+}
+
+/// Unregister the mute LED class device, removing
+/// `/sys/class/leds/elan:red:mute/`. No-op if not registered.
+///
+/// Test-teardown helper (and for any future detach path): the
+/// production detach paths leave the class device registered,
+/// matching the i2c-HID pump's give-up path, which unregisters
+/// the evdev nodes but not the LED — the class device holds an
+/// `Arc<DeviceNode>`, so it stays valid, and a same-name
+/// re-registration replaces it.
+pub fn unregister_mute_led() {
+    unregister_led(ELAN_MUTE_LED_NAME);
 }
 
 // ── Clickpad classification ────────────────────────────────────────
