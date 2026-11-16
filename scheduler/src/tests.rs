@@ -7159,3 +7159,105 @@ kernel_test_in!(
     "scheduler/bridge",
     smoke_block_on_bridge_is_kicked_by_cross_cpu_wake
 );
+
+/// `TaskSpec::kernel_any()` spreads initial placement across schedulable online
+/// CPUs when SMP stealing is active rather than collapsing onto the spawning CPU,
+/// and a multi-slot local enqueue kicks an idle puller.
+fn smoke_scheduler_kernel_any_load_balances_initial_placement() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // Exercise deterministic selection against fake online APs when no real AP
+    // is driving `CPU_HALTED`/`READY[1]`, and exercise live AP execution on SMP.
+    let me = narf_lib::percpu::current_cpu();
+    let live_aps =
+        narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap() & !(1u64 << me);
+    if live_aps == 0 {
+        crate::__reset_queues_for_test();
+        let prev_steal = crate::STEAL_ENABLED.swap(true, Ordering::AcqRel);
+        let prev_state = crate::policy::cpu_state(crate::CpuId(1));
+        narf_lib::smp::__test_fake_online(1);
+        crate::policy::__test_set_cpu_state(crate::CpuId(1), crate::policy::CpuState::Idle);
+        crate::__test_set_cpu_halted(1, true);
+
+        let c0 = crate::target_cpu(&crate::TaskSpec::kernel_any());
+        let c1 = crate::target_cpu(&crate::TaskSpec::kernel_any());
+
+        // A user task spawned while user SMP is off stays on the spawning CPU.
+        let user_spec = crate::TaskSpec {
+            work_kind: crate::WorkKind::UserThread,
+            ..crate::TaskSpec::kernel_any()
+        };
+        let user_stays =
+            crate::user_task_smp_enabled() || (0..4).all(|_| crate::target_cpu(&user_spec) == me);
+
+        // Two migratable runnable tasks queued locally on `me` must kick
+        // halted AP 1 (the first alone leaves nothing behind the running one).
+        let local = crate::TaskSpec {
+            affinity: crate::Affinity {
+                allowed: crate::affinity::CpuSet::ALL,
+                preferred: Some(crate::CpuId(me as u32)),
+            },
+            ..crate::TaskSpec::kernel_any()
+        };
+        let (sent_before, _) = crate::dbg_resched_counts();
+        let _ = crate::spawn_with_spec(async {}, local);
+        let (sent_one, _) = crate::dbg_resched_counts();
+        let _ = crate::spawn_with_spec(async {}, local);
+        let (sent_two, _) = crate::dbg_resched_counts();
+
+        crate::__test_set_cpu_halted(1, false);
+        crate::policy::__test_set_cpu_state(crate::CpuId(1), prev_state);
+        narf_lib::smp::mark_offline(1);
+        crate::STEAL_ENABLED.store(prev_steal, Ordering::Release);
+        crate::__reset_queues_for_test();
+
+        if !user_stays {
+            return TestResult::Fail("user task spread off the spawning CPU with user SMP off");
+        }
+        if c0 == c1 {
+            return TestResult::Fail(
+                "successive kernel_any target_cpu calls collapsed onto one CPU",
+            );
+        }
+        if sent_one != sent_before || sent_two != sent_before + 1 {
+            return TestResult::Fail("local multi-slot backlog did not kick idle puller");
+        }
+        return TestResult::Pass;
+    }
+
+    static CPU_MASK: AtomicU64 = AtomicU64::new(0);
+    static DONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    CPU_MASK.store(0, Ordering::Release);
+    DONE.store(0, Ordering::Release);
+    let prev_steal = crate::STEAL_ENABLED.swap(true, Ordering::AcqRel);
+    let n = (narf_lib::smp::online_count() as usize).clamp(2, 8);
+    for _ in 0..n {
+        let _ = crate::spawn_with_spec(
+            async {
+                let c = narf_lib::percpu::current_cpu();
+                if c < 64 {
+                    CPU_MASK.fetch_or(1u64 << c, Ordering::AcqRel);
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            crate::TaskSpec::kernel_any(),
+        );
+    }
+    let end = narf_time::monotonic_ns() + 2_000_000_000;
+    while DONE.load(Ordering::Acquire) < n && narf_time::monotonic_ns() < end {
+        let _ = crate::poll_one_round();
+        core::hint::spin_loop();
+    }
+    crate::STEAL_ENABLED.store(prev_steal, Ordering::Release);
+    if DONE.load(Ordering::Acquire) < n {
+        return TestResult::Fail("kernel_any burst did not complete");
+    }
+    if (CPU_MASK.load(Ordering::Acquire) & live_aps) == 0 {
+        return TestResult::Fail("no task of the kernel_any burst ran on an AP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_kernel_any_load_balances_initial_placement
+);
