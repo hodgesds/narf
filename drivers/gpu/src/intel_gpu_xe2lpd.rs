@@ -514,9 +514,7 @@ pub(crate) fn probe_route(
     if narf_bus::pci::set_command(
         cap,
         device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
+        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .is_err()
     {

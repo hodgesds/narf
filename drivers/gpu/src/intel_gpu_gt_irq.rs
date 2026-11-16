@@ -1033,7 +1033,7 @@ impl GtIrq {
             mmio,
             PciMsi::new(cap, device)?,
             engines,
-            !platform.is_gen12(),
+            platform.has_tile_irq(),
         )
     }
 }

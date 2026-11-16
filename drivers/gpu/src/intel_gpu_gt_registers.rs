@@ -186,6 +186,21 @@ mod tests {
         smoke_global_register_dg2_subplatform_vectors
     );
 
+    fn smoke_global_register_dg1_platform_workarounds_are_exact() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let (w, init) = fixture(platform, 0x4905, 10, 0, false, 1 << 5);
+        w.regs.borrow_mut().extend([(0x9528, 0), (0x94e4, 0)]);
+        assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
+        let regs = w.regs.borrow();
+        assert_eq!(regs[&0x9528], 1 << 9);
+        assert_eq!(regs[&0x94e4], 1 << 19);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_global_register_dg1_platform_workarounds_are_exact
+    );
+
     fn smoke_global_register_dg2_vram_requires_stable_owned_layout() -> TestResult {
         struct Capture<'a> {
             window: &'a Window,
@@ -822,6 +837,10 @@ impl RegisterInit {
                 add(0x20ec, 2, 2, true, Direct);
                 add(0xe18c, 0x8001, 0x8001, true, Dss);
                 add(0x20e0, 0x4000, 0x4000, true, Direct);
+                if family == crate::intel_gpu_gt::Gen12Platform::Dg1 {
+                    add(0x9528, 1 << 9, 1 << 9, false, Dss); // 1409420604
+                    add(0x94e4, 1 << 19, 1 << 19, false, Direct); // 1408615072
+                }
                 if matches!(
                     family,
                     crate::intel_gpu_gt::Gen12Platform::TigerLake
@@ -891,7 +910,8 @@ impl RegisterInit {
                     }); // Wa_14012342262 forbids readback
                 }
             }
-            _ if self.platform.is_ptl() => {
+            GtPlatform::WildcatLake
+            | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => {
                 // PTL GT lifetime (not hwe.reg_sr / ADS).
                 if self.seed.graphics == 3000 && self.seed.step < 4 {
                     add(0x9454, 0x10, 0x10, false, Direct);

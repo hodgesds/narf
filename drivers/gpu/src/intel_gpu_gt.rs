@@ -71,7 +71,11 @@ impl GraphicsIp {
         if platform.is_gen12() {
             // xe_pci.c's pre-GMD descriptor; these GTs have no GMD_ID.
             return Ok(Self {
-                version: 1200,
+                version: if platform == GtPlatform::Gen12(Gen12Platform::Dg1) {
+                    1210
+                } else {
+                    1200
+                },
                 step: 0,
             });
         }
@@ -92,6 +96,7 @@ impl GraphicsIp {
         let version = (a >> 22) * 100 + ((a >> 14) & 255);
         let supported = match platform {
             GtPlatform::Battlemage => matches!(version, 2001 | 2002),
+            GtPlatform::WildcatLake => matches!(version, 3003 | 3004 | 3005),
             GtPlatform::Integrated(Generation::LunarLake) => version == 2004,
             GtPlatform::Integrated(Generation::PantherLake) => matches!(version, 3000 | 3001),
             _ => matches!(version, 1270 | 1271 | 1274),
@@ -114,6 +119,9 @@ pub(crate) const GUC_GGTT_MIN: u32 = 8 * 1024 * 1024;
 pub enum GtPlatform {
     Integrated(Generation),
     Gen12(Gen12Platform),
+    /// Wildcat Lake: PTL device descriptor/firmware, distinct 30.02 media
+    /// and 30.03-30.05 graphics GMD contract.
+    WildcatLake,
     Alchemist,
     Battlemage,
 }
@@ -123,6 +131,9 @@ pub enum GtPlatform {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Gen12Platform {
     TigerLake,
+    RocketLake,
+    /// DG1 — discrete Xe-LP+ graphics 12.10, not a DG2 alias.
+    Dg1,
     AlderLakeP,
     AlderLakeS,
     AlderLakeN,
@@ -132,11 +143,13 @@ pub enum Gen12Platform {
 pub(crate) const PTL_IDS: &[u16] = &[
     0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0, 0xb0b0,
 ];
+pub(crate) const WCL_IDS: &[u16] = &[0xfd80, 0xfd81];
 pub(crate) const DG2_IDS: &[u16] = &[
     0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0, 0x56b1,
     0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2, 0x56b3, 0x5696,
     0x5697,
 ];
+pub(crate) const DG1_IDS: &[u16] = &[0x4905, 0x4906, 0x4907, 0x4908, 0x4909];
 pub(crate) const BMG_IDS: &[u16] = &[
     0xe202, 0xe209, 0xe20b, 0xe20c, 0xe20d, 0xe210, 0xe211, 0xe212, 0xe216, 0xe220, 0xe221, 0xe222,
     0xe223,
@@ -158,19 +171,28 @@ impl GtPlatform {
             .iter()
             .find(|entry| entry.did == device)
         {
-            if entry.generation == Generation::PantherLake && !PTL_IDS.contains(&device) {
+            if entry.generation == Generation::PantherLake
+                && !PTL_IDS.contains(&device)
+                && !WCL_IDS.contains(&device)
+            {
                 return None;
             }
             let family = match entry.asic {
                 "tigerlake" => Some(Gen12Platform::TigerLake),
+                "rocketlake" => Some(Gen12Platform::RocketLake),
                 "alderlake-p" | "alderlake-m" | "raptorlake-p" => Some(Gen12Platform::AlderLakeP),
                 "alderlake-s" | "raptorlake-s" => Some(Gen12Platform::AlderLakeS),
                 "alderlake-n" => Some(Gen12Platform::AlderLakeN),
                 _ => None,
             };
+            if entry.asic == "wildcatlake" {
+                return Some(Self::WildcatLake);
+            }
             return Some(family.map_or(Self::Integrated(entry.generation), Self::Gen12));
         }
-        if DG2_IDS.contains(&device) {
+        if DG1_IDS.contains(&device) {
+            Some(Self::Gen12(Gen12Platform::Dg1))
+        } else if DG2_IDS.contains(&device) {
             Some(Self::Alchemist)
         } else if BMG_IDS.contains(&device) {
             Some(Self::Battlemage)
@@ -180,7 +202,10 @@ impl GtPlatform {
     }
 
     pub const fn is_discrete(self) -> bool {
-        matches!(self, Self::Alchemist | Self::Battlemage)
+        matches!(
+            self,
+            Self::Gen12(Gen12Platform::Dg1) | Self::Alchemist | Self::Battlemage
+        )
     }
 
     pub const fn is_gen12(self) -> bool {
@@ -192,7 +217,10 @@ impl GtPlatform {
         matches!(self, Self::Integrated(Generation::LunarLake))
     }
     pub const fn is_ptl(self) -> bool {
-        matches!(self, Self::Integrated(Generation::PantherLake))
+        matches!(
+            self,
+            Self::Integrated(Generation::PantherLake) | Self::WildcatLake
+        )
     }
     /// Integrated GT-only profiles with retained full-device takeover.
     pub const fn is_headless_integrated(self) -> bool {
@@ -203,7 +231,12 @@ impl GtPlatform {
         self.is_headless_integrated() || matches!(self, Self::Battlemage)
     }
     pub const fn multiple_ccs(self) -> bool {
-        self.is_discrete() || self.is_headless_integrated()
+        matches!(self, Self::Alchemist | Self::Battlemage) || self.is_headless_integrated()
+    }
+    /// DG1 introduced the tile-master interrupt register even though its
+    /// graphics IP remains in the pre-GMD Gen12 family.
+    pub(crate) const fn has_tile_irq(self) -> bool {
+        !self.is_gen12() || matches!(self, Self::Gen12(Gen12Platform::Dg1))
     }
     pub(crate) const fn ppgtt_root_level(self) -> u8 {
         if self.is_headless_integrated() {
@@ -245,6 +278,7 @@ impl GtPlatform {
             Self::Integrated(
                 Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake,
             )
+            | Self::WildcatLake
             | Self::Battlemage => Some(0xdfc),
             Self::Alchemist | Self::Gen12(_) => Some(0x130044),
             _ => None,
@@ -254,6 +288,7 @@ impl GtPlatform {
     /// Supported GuC boot ABI, not permission to publish a display or engine.
     pub const fn guc(self) -> Option<GuCProfile> {
         let (firmware, minimum_version) = match self {
+            Self::Gen12(Gen12Platform::Dg1) => ("i915/dg1_guc_70.bin", (70, 44, 1)),
             Self::Gen12(Gen12Platform::AlderLakeP) => ("i915/adlp_guc_70.bin", (70, 44, 1)),
             Self::Gen12(_) => ("i915/tgl_guc_70.bin", (70, 44, 1)),
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
@@ -261,6 +296,7 @@ impl GtPlatform {
             Self::Battlemage => ("xe/bmg_guc_70.bin", (70, 54, 0)),
             Self::Integrated(Generation::LunarLake) => ("xe/lnl_guc_70.bin", (70, 53, 0)),
             Self::Integrated(Generation::PantherLake) => ("xe/ptl_guc_70.bin", (70, 54, 0)),
+            Self::WildcatLake => ("xe/ptl_guc_70.bin", (70, 54, 0)),
             _ => return None,
         };
         Some(GuCProfile {
@@ -281,6 +317,18 @@ mod tests {
                 0x9a49,
                 GtPlatform::Gen12(Gen12Platform::TigerLake),
                 "i915/tgl_guc_70.bin",
+                (70, 44, 1),
+            ),
+            (
+                0x4c80,
+                GtPlatform::Gen12(Gen12Platform::RocketLake),
+                "i915/tgl_guc_70.bin",
+                (70, 44, 1),
+            ),
+            (
+                0x4905,
+                GtPlatform::Gen12(Gen12Platform::Dg1),
+                "i915/dg1_guc_70.bin",
                 (70, 44, 1),
             ),
             (
@@ -337,6 +385,12 @@ mod tests {
                 "xe/bmg_guc_70.bin",
                 (70, 54, 0),
             ),
+            (
+                0xfd80,
+                GtPlatform::WildcatLake,
+                "xe/ptl_guc_70.bin",
+                (70, 54, 0),
+            ),
         ] {
             if GtPlatform::from_pci(0x8086, device) != Some(platform)
                 || platform.guc().map(|p| (p.firmware, p.minimum_version)) != Some((name, version))
@@ -346,15 +400,73 @@ mod tests {
         }
         if GtPlatform::from_pci(0x1002, 0x56a0).is_some()
             || GtPlatform::from_pci(0x8086, 0x56a7).is_some()
+            || GtPlatform::from_pci(0x8086, 0x4904).is_some()
+            || GtPlatform::from_pci(0x8086, 0x490a).is_some()
             || GtPlatform::Integrated(Generation::PantherLake)
                 .guc()
                 .is_none()
             || DG2_IDS.len() != 25
+            || DG1_IDS.len() != 5
             || BMG_IDS.len() != 13
+            || PTL_IDS.len() != 12
+            || WCL_IDS.len() != 2
         {
             return TestResult::Fail("unsupported GT or approximate PCI range admitted");
         }
+        let dg1 = GtPlatform::Gen12(Gen12Platform::Dg1);
+        if !dg1.is_discrete()
+            || dg1.multiple_ccs()
+            || dg1.physical_bits() != 39
+            || dg1.ppgtt_root_level() != 3
+            || !dg1.has_tile_irq()
+            || GtPlatform::Gen12(Gen12Platform::TigerLake).has_tile_irq()
+            || GraphicsIp::read(&NoMmio, dg1)
+                != Ok(GraphicsIp {
+                    version: 1210,
+                    step: 0,
+                })
+        {
+            return TestResult::Fail("DG1 Xe-LP+ architecture profile");
+        }
+        for version in [3003, 3004, 3005] {
+            let raw = (version / 100) << 22 | (version % 100) << 14 | 2;
+            if GraphicsIp::read(&FixedMmio(raw), GtPlatform::WildcatLake)
+                != Ok(GraphicsIp {
+                    version: version as u16,
+                    step: 2,
+                })
+            {
+                return TestResult::Fail("WCL graphics GMD profile");
+            }
+        }
+        for version in [3002, 3006] {
+            let raw = (version / 100) << 22 | (version % 100) << 14;
+            if GraphicsIp::read(&FixedMmio(raw), GtPlatform::WildcatLake)
+                != Err(GraphicsError::Unsupported)
+            {
+                return TestResult::Fail("WCL graphics GMD boundary");
+            }
+        }
         TestResult::Pass
+    }
+
+    struct NoMmio;
+    impl crate::intel_gpu_aux::MmioWindow for NoMmio {
+        fn read32(&self, _: u64) -> u32 {
+            panic!("pre-GMD identity read MMIO")
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("pre-GMD identity wrote MMIO")
+        }
+    }
+    struct FixedMmio(u32);
+    impl crate::intel_gpu_aux::MmioWindow for FixedMmio {
+        fn read32(&self, _: u64) -> u32 {
+            self.0
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("identity probe wrote MMIO")
+        }
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",

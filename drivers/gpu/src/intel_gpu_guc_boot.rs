@@ -2113,6 +2113,8 @@ mod tests {
             });
         let device_id = match platform {
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake) => 0x4c80,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) => 0x4905,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,

@@ -228,7 +228,9 @@ impl GmbusPinTable {
     pub const fn for_generation(generation: crate::intel_gpu::Generation) -> Self {
         use crate::intel_gpu::Generation;
         match generation {
-            Generation::TigerLake | Generation::AlderLake => GmbusPinTable::Icp,
+            Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                GmbusPinTable::Icp
+            }
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }

@@ -32,7 +32,31 @@ pub(crate) fn mocs(index: usize) -> (u32, u16) {
     }
 }
 
-pub(crate) fn cache(mmio: &impl MmioWindow) -> Result<(), HardwareError> {
+/// DG1's source table. Undefined entries copy index5 (WB-L3), while the
+/// reserved tail is explicitly UC. DG1 has no LLC control value.
+pub(crate) fn dg1_mocs(index: usize) -> (u32, u16) {
+    let l3 = match index {
+        1 | 49 | 60..=63 => 0x10,
+        6 => 0x33,
+        7 => 0x37,
+        8 => 0x3f,
+        5 | 48 => 0x30,
+        _ => 0x30,
+    };
+    (0, l3)
+}
+
+pub(crate) fn cache(
+    mmio: &impl MmioWindow,
+    family: crate::intel_gpu_gt::Gen12Platform,
+) -> Result<(), HardwareError> {
+    let entry = |index| {
+        if family == crate::intel_gpu_gt::Gen12Platform::Dg1 {
+            dg1_mocs(index)
+        } else {
+            mocs(index)
+        }
+    };
     for (reg, value) in [(0x4800, 3), (0x4804, 1), (0x4808, 2), (0x480c, 0)] {
         mmio.write32(reg, value);
         if mmio.read32(reg) != value {
@@ -41,7 +65,7 @@ pub(crate) fn cache(mmio: &impl MmioWindow) -> Result<(), HardwareError> {
     }
     for index in 0..64 {
         let reg = 0x4000 + index as u64 * 4;
-        let value = mocs(index).0;
+        let value = entry(index).0;
         mmio.write32(reg, value);
         if mmio.read32(reg) != value {
             return Err(HardwareError::Unavailable);
@@ -49,13 +73,39 @@ pub(crate) fn cache(mmio: &impl MmioWindow) -> Result<(), HardwareError> {
     }
     for index in 0..32 {
         let reg = 0xb020 + index as u64 * 4;
-        let value = u32::from(mocs(index * 2).1) | u32::from(mocs(index * 2 + 1).1) << 16;
+        let value = u32::from(entry(index * 2).1) | u32::from(entry(index * 2 + 1).1) << 16;
         mmio.write32(reg, value);
         if mmio.read32(reg) != value {
             return Err(HardwareError::Unavailable);
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "kernel-test")]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_dg1_mocs_is_the_exact_linux_table() -> TestResult {
+        for index in 0..64 {
+            let expected = match index {
+                1 | 49 | 60..=63 => (0, 0x10),
+                6 => (0, 0x33),
+                7 => (0, 0x37),
+                8 => (0, 0x3f),
+                _ => (0, 0x30),
+            };
+            if dg1_mocs(index) != expected {
+                return TestResult::Fail("DG1 MOCS differs from xe_mocs.c");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_dg1_mocs_is_the_exact_linux_table
+    );
 }
 
 /// One private timestamp restore sequence. The target is this context's

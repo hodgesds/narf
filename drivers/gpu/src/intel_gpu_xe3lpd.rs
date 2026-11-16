@@ -12,7 +12,7 @@
 //! `INTEL_PTL_IDS` and `INTEL_WCL_IDS` both bind `ptl_desc`, which carries
 //! no display info, so the IP is known only from `GMD_ID_DISPLAY`.
 //! [`DisplayIp::decode_all`] admits 30.00 only; 30.02 stays a typed refusal
-//! (the WCL PCI IDs are not in the driver table, and its PHY map, DMC
+//! (the WCL PCI IDs use the PTL headless GT profile, while WCL's PHY map, DMC
 //! container, CDCLK ceiling and bandwidth parameters differ). For display
 //! \>= 30 `__intel_display_device_info_runtime_init` also reads
 //! `PICA_PHY_CONFIG_CONTROL.EDP_ON_TYPEC` (`edp_typec_support`).
@@ -79,7 +79,8 @@
 //! LUTs, DSB transactions, and the Xe `SCANOUT` create flag.
 //! Refused on display 30: eDP on Type-C, the C20 tables, every external
 //! output, PSR and panel replay, FBC (and its dirty rectangles), compressed
-//! primaries, DC states, system suspend and relight, and Wildcat Lake (30.02).
+//! primaries, DC states, system suspend and relight, and Wildcat Lake display
+//! 30.02. Wildcat Lake headless GT execution uses the shared PTL descriptor.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -181,9 +182,7 @@ pub(crate) fn probe_route(
     if narf_bus::pci::set_command(
         cap,
         device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
+        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .is_err()
     {

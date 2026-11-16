@@ -86,6 +86,9 @@ impl GuCFirmware {
             Generation::TigerLake => {
                 GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
             }
+            Generation::RocketLake => {
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            }
             // ADL spans different firmware families; an ambiguous generation
             // cannot choose ADL-P versus ADL-S/N's asset. Use PCI identity.
             Generation::AlderLake => return Err(FirmwareError::Unsupported),

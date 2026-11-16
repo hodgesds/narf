@@ -384,6 +384,7 @@ impl XeFile {
                             0
                         }
                     }
+                    crate::intel_gpu_gt::GtPlatform::WildcatLake => 0,
                 };
                 // xe_gem_create_ioctl's EINVAL classes, then refused features.
                 if size == 0

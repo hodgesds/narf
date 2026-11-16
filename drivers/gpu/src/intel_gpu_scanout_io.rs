@@ -53,6 +53,7 @@ pub(crate) const fn owned_status(generation: Generation) -> u32 {
 pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8)> {
     match generation {
         Generation::TigerLake | Generation::AlderLake => Some((PteFormat::Gen12, 0)),
+        Generation::RocketLake => None,
         Generation::MeteorLake => Some((PteFormat::XeLpg, 1)),
         Generation::LunarLake => Some((PteFormat::Xe2, 3)),
         Generation::PantherLake => None,
@@ -162,6 +163,7 @@ pub(crate) fn display_pat_programmed(
 ) -> bool {
     match generation {
         Generation::TigerLake | Generation::AlderLake => true,
+        Generation::RocketLake => false,
         Generation::MeteorLake => io.read32(0x4804) == 4,
         Generation::LunarLake => io.read32(0x480c) == 0x3c,
         Generation::PantherLake => false,

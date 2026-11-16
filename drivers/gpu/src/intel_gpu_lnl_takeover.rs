@@ -468,7 +468,7 @@ impl MediaProof {
         // Wa22019338487: media20.00 all steps; media30.00 A0 only.
         // The immutable GMD was captured under the retained media wake.
         let version = (self.gmd >> 22) * 100 + ((self.gmd >> 14) & 255);
-        if version == 1301 || version == 3000 && self.gmd & 63 >= 4 {
+        if version == 1301 || version == 3002 || version == 3000 && self.gmd & 63 >= 4 {
             return Ok(());
         }
         let next = count.get() + 1;
@@ -493,7 +493,13 @@ pub(crate) struct MediaQuiesce {
 impl MediaQuiesce {
     pub(crate) fn for_platform(platform: crate::intel_gpu_gt::GtPlatform) -> Self {
         let mut state = Self::new();
-        state.expected = if platform.is_ptl() { 3000 } else { 2000 };
+        state.expected = if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+            3002
+        } else if platform.is_ptl() {
+            3000
+        } else {
+            2000
+        };
         state
     }
     pub(crate) fn for_bmg() -> Self {
@@ -627,7 +633,9 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
     }
     let platform =
         crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, device).ok_or(Error::Unsupported)?;
-    let expected = if platform.is_ptl() {
+    let expected = if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+        3002
+    } else if platform.is_ptl() {
         3000
     } else if platform.is_lnl() {
         2000
@@ -815,7 +823,10 @@ mod tests {
         assert!(crate::intel_gpu::Generation::LunarLake
             .region_generation()
             .is_none());
-        assert!(crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80).is_none());
+        assert_eq!(
+            crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
+            Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)
+        );
         let (device, bar) = identity();
         for (reg, value) in [(0x10100c, 0x80000000), (0x1901f8, 1)] {
             let m = Registers::new();
@@ -1060,7 +1071,10 @@ mod tests {
         assert!(crate::intel_gpu::Generation::PantherLake
             .region_generation()
             .is_none());
-        assert!(crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80).is_none());
+        assert_eq!(
+            crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
+            Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)
+        );
         let (mut device, bar) = identity();
         device.id.device = 0xb080;
         for (reg, value) in [(0x10100c, 0x80000000), (0x1901f8, 1)] {
@@ -1199,5 +1213,69 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_ptl_driver_flr_profiles_media_steps_and_first_pte_refusal
+    );
+    fn smoke_wcl_distinct_graphics_media_and_display_identity() -> TestResult {
+        let platform = crate::intel_gpu_gt::GtPlatform::WildcatLake;
+        for id in [0xfd80, 0xfd81] {
+            assert_eq!(
+                crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
+                Some(platform)
+            );
+        }
+        assert_eq!(media_version(3002), 30 << 22 | 2 << 14);
+
+        let m = Registers::new();
+        m.set(0x380d8c, media_version(3002));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert_eq!(media.expected, 3002);
+        assert!(media.poll(&m, 0).is_pending());
+        m.set(0x380dfc, 1);
+        assert!(media.poll(&m, 1).is_pending());
+        m.set(0x38941c, 0);
+        m.set(0x38c000, 1);
+        assert!(media.poll(&m, 2).is_pending());
+        m.set(0x38941c, 0);
+        let Poll::Ready(Ok(proof)) = media.poll(&m, 3) else {
+            panic!("WCL media 30.02 proof")
+        };
+        let count = Cell::new(0);
+        for _ in 0..126 {
+            proof.after_pte(&m, &count).unwrap();
+        }
+        assert_eq!(count.get(), 0);
+        assert!(m
+            .writes
+            .borrow()
+            .iter()
+            .all(|(register, _)| *register != 0x380d8c));
+
+        let wrong = Registers::new();
+        wrong.set(0x380d8c, media_version(3000));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert!(media.poll(&wrong, 0).is_pending());
+        wrong.set(0x380dfc, 1);
+        assert!(matches!(
+            media.poll(&wrong, 1),
+            Poll::Ready(Err(Error::Unsupported))
+        ));
+
+        let display = Registers::new();
+        display.set(0x10100c, 1 << 9);
+        display.set(0x510a0, media_version(3002));
+        display.set(0x42000, 0x0c000000);
+        assert_eq!(
+            post_flr_display(&display, 0xfd80),
+            Ok(Some(media_version(3002)))
+        );
+        display.set(0x510a0, media_version(3000));
+        assert_eq!(post_flr_display(&display, 0xfd80), Err(Error::Unsupported));
+        TestResult::Pass
+    }
+    const fn media_version(version: u32) -> u32 {
+        (version / 100) << 22 | (version % 100) << 14
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_wcl_distinct_graphics_media_and_display_identity
     );
 }

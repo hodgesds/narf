@@ -17,6 +17,8 @@ impl Profile {
     pub(crate) fn gen12(family: crate::intel_gpu_gt::Gen12Platform) -> Self {
         match family {
             crate::intel_gpu_gt::Gen12Platform::TigerLake
+            | crate::intel_gpu_gt::Gen12Platform::Dg1
+            | crate::intel_gpu_gt::Gen12Platform::RocketLake
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeS => Self::Display12,
             crate::intel_gpu_gt::Gen12Platform::AlderLakeP
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => Self::Display13,

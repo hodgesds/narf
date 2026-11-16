@@ -339,8 +339,8 @@ pub const PLANE_OFFSET_OFFSET: u64 = 0x0024;
 pub(crate) const fn gen12_plane_count(family: crate::intel_gpu_gt::Gen12Platform) -> u64 {
     use crate::intel_gpu_gt::Gen12Platform::*;
     match family {
-        TigerLake => 7,
-        AlderLakeS | AlderLakeP | AlderLakeN => 5,
+        TigerLake | Dg1 => 7,
+        RocketLake | AlderLakeS | AlderLakeP | AlderLakeN => 5,
     }
 }
 
@@ -351,7 +351,10 @@ pub(crate) const fn gen12_plane_count(family: crate::intel_gpu_gt::Gen12Platform
 pub(crate) fn gen12_xrgb_control(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
     use crate::intel_gpu_gt::Gen12Platform;
     match family {
-        Gen12Platform::TigerLake | Gen12Platform::AlderLakeS => 0x84000000,
+        Gen12Platform::TigerLake
+        | Gen12Platform::RocketLake
+        | Gen12Platform::Dg1
+        | Gen12Platform::AlderLakeS => 0x84000000,
         Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
     }
 }

@@ -2044,8 +2044,15 @@ pub(crate) fn gen12_family_for_chip(
         Some(crate::intel_gpu_gt::GtPlatform::Gen12(family))
             if (chip.generation == Generation::TigerLake
                 && family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
+                || (chip.generation == Generation::RocketLake
+                    && family == crate::intel_gpu_gt::Gen12Platform::RocketLake)
                 || (chip.generation == Generation::AlderLake
-                    && family != crate::intel_gpu_gt::Gen12Platform::TigerLake) =>
+                    && matches!(
+                        family,
+                        crate::intel_gpu_gt::Gen12Platform::AlderLakeS
+                            | crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                            | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+                    )) =>
         {
             Some(family)
         }
@@ -2062,7 +2069,9 @@ pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     let family = gen12_family_for_chip(chip);
     if matches!(
         chip.generation,
-        crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
+        crate::intel_gpu::Generation::TigerLake
+            | crate::intel_gpu::Generation::RocketLake
+            | crate::intel_gpu::Generation::AlderLake
     ) && family.is_none()
     {
         return Err(ModesetError::UnsupportedGeneration);
@@ -2104,7 +2113,9 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        Generation::LunarLake | Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
+        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
+            Err(ModesetError::UnsupportedGeneration)
+        }
     };
     if let Ok(committed) = &result {
         // Per-modeset VRR/CMRR compute for the panel (#1771): a
@@ -3623,6 +3634,7 @@ pub mod tests {
         use crate::intel_gpu_gt::Gen12Platform;
         for (family, expected) in [
             (Gen12Platform::TigerLake, 0x84000000),
+            (Gen12Platform::RocketLake, 0x84000000),
             (Gen12Platform::AlderLakeS, 0x84000000),
             (Gen12Platform::AlderLakeP, 0x94000000),
             (Gen12Platform::AlderLakeN, 0x94000000),
@@ -3658,6 +3670,7 @@ pub mod tests {
         use crate::intel_gpu_gt::Gen12Platform;
         for (did, generation, family) in [
             (0x9a49, Generation::TigerLake, Gen12Platform::TigerLake),
+            (0x4c80, Generation::RocketLake, Gen12Platform::RocketLake),
             (0x4680, Generation::AlderLake, Gen12Platform::AlderLakeS),
             (0x46a6, Generation::AlderLake, Gen12Platform::AlderLakeP),
             (0x46d0, Generation::AlderLake, Gen12Platform::AlderLakeN),

@@ -65,7 +65,10 @@ impl Io {
         let p = pipe.base() + 0x180;
         let t = pipe.trans_base();
         let ctl = match family {
-            Gen12Platform::TigerLake | Gen12Platform::AlderLakeS => 0x84000000,
+            Gen12Platform::TigerLake
+            | Gen12Platform::Dg1
+            | Gen12Platform::RocketLake
+            | Gen12Platform::AlderLakeS => 0x84000000,
             Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
         };
         for (r, v) in [

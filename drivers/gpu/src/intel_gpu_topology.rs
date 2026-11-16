@@ -43,7 +43,7 @@ impl L3Rule {
             GtPlatform::Alchemist => Self::Dg2,
             GtPlatform::Integrated(Generation::MeteorLake) => Self::XeLpg,
             GtPlatform::Battlemage | GtPlatform::Integrated(Generation::LunarLake) => Self::Xe2,
-            GtPlatform::Integrated(Generation::PantherLake) => Self::Xe3,
+            GtPlatform::WildcatLake | GtPlatform::Integrated(Generation::PantherLake) => Self::Xe3,
             GtPlatform::Integrated(_) => return None,
         })
     }

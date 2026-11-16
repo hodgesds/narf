@@ -678,7 +678,10 @@ impl HardwareInit {
             self.quiesce = 3;
         }
         if self.platform.is_gen12() {
-            crate::intel_gpu_gt::gen12::cache(mmio)?;
+            let GtPlatform::Gen12(family) = self.platform else {
+                unreachable!("is_gen12 accepted a non-Gen12 platform")
+            };
+            crate::intel_gpu_gt::gen12::cache(mmio, family)?;
             self.ready = true;
             let mask = mmio.read32(0x1900e8);
             if mask == u32::MAX {
@@ -745,7 +748,7 @@ impl HardwareInit {
                 }
                 0
             }
-            GtPlatform::Battlemage | GtPlatform::Integrated(_) => {
+            GtPlatform::Battlemage | GtPlatform::WildcatLake | GtPlatform::Integrated(_) => {
                 mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
                 if self.platform.is_headless_integrated() {
                     mmio.write32(0x480c, 0x3c);

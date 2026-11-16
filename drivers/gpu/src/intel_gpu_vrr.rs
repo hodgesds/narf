@@ -131,7 +131,7 @@ pub enum DisplayVrrIp {
 impl DisplayVrrIp {
     pub const fn from_generation(gen: Generation) -> Self {
         match gen {
-            Generation::TigerLake => Self::Gen12,
+            Generation::TigerLake | Generation::RocketLake => Self::Gen12,
             Generation::AlderLake => Self::Display13,
             Generation::MeteorLake => Self::Display14,
             Generation::LunarLake => Self::Display20,
@@ -143,7 +143,9 @@ impl DisplayVrrIp {
     /// path knows the family, not the `Generation`).
     pub const fn from_gen12_platform(family: crate::intel_gpu_gt::Gen12Platform) -> Self {
         match family {
-            crate::intel_gpu_gt::Gen12Platform::TigerLake => Self::Gen12,
+            crate::intel_gpu_gt::Gen12Platform::TigerLake
+            | crate::intel_gpu_gt::Gen12Platform::Dg1
+            | crate::intel_gpu_gt::Gen12Platform::RocketLake => Self::Gen12,
             crate::intel_gpu_gt::Gen12Platform::AlderLakeP
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeS
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => Self::Display13,

@@ -132,7 +132,9 @@ pub enum SubmissionProfile {
 impl SubmissionProfile {
     pub const fn for_generation(generation: Generation) -> Self {
         match generation {
-            Generation::TigerLake | Generation::AlderLake => Self::Gen12GuC,
+            Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                Self::Gen12GuC
+            }
             Generation::MeteorLake => Self::XeLpgGuC,
             Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
@@ -3624,7 +3626,9 @@ pub(crate) mod tests {
         check(|| {
             for entry in crate::intel_gpu::DEVICE_TABLE {
                 let expected = match entry.generation {
-                    Generation::TigerLake | Generation::AlderLake => SubmissionProfile::Gen12GuC,
+                    Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                        SubmissionProfile::Gen12GuC
+                    }
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
                     Generation::LunarLake | Generation::PantherLake => {
                         SubmissionProfile::Unsupported

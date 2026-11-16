@@ -1,6 +1,14 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.58** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.63** (v0.62 plus a distinct Wildcat Lake GT profile admitting
+> exact graphics 30.03-30.05 and media 30.02 while display 30.02 remains
+> fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
+> display-idle and cache-policy profile; DG1 display programming and local-
+> memory publication remain fail-closed; the exact Rocket Lake PCI-ID and
+> GuC/GT profile keeps Rocket Lake display programming fail-closed;
+> family-wide D0/BAR probe normalization, display-less GT admission, and the
+> current exact Linux TGL/ADL/RKL PCI-ID census;
+> Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -47,7 +55,7 @@
 > see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
-> render foundations also cover Arc Alchemist and Battlemage.
+> render foundations also cover DG1, Arc Alchemist and Battlemage.
 > References include Intel PRMs and the cited MIT-licensed Linux i915 ABI,
 > command and register definitions.
 
@@ -61,6 +69,7 @@ narrowing surface as the generation gets newer:
 | Generation                | PRM coverage                                         | Verdict                |
 | ------------------------- | ---------------------------------------------------- | ---------------------- |
 | Tiger Lake (Gen12 Xe-LP)  | full multi-volume PRMs                               | full driver feasible   |
+| Rocket Lake (Gen12 Xe-LP) | Gen12 PRMs plus Linux's exact pre-GMD platform data  | GT feasible; display separately qualifies |
 | Alder Lake / Raptor Lake  | full PRMs (Gen12 carries forward)                    | full driver feasible   |
 | Meteor Lake (Xe-LPG)      | display + media PRMs published; 3D / compute thinner | display / KMS feasible |
 | Lunar Lake (Xe2)          | architecture whitepapers only as of mid-2026        | wait for PRM           |
@@ -173,7 +182,7 @@ Stage-3 driver core consumes these codecs through the
   (§9).
 - Single-rectangle scanout from a CPU-mapped buffer.
 
-### Stage 5+ (partially landed) — 3D / compute (TGL only)
+### Stage 5+ (partially landed) — 3D / compute (qualified Gen12 families)
 - Command streamer (RCS0) ring submission — **landed** as the
   execlists path in `intel_gpu_rcs` (§8), with GGTT batches and
   attached-context PPGTT batches (§18).
@@ -191,28 +200,72 @@ Stage-3 driver core consumes these codecs through the
 The canonical table lives in code as `intel_gpu::DEVICE_TABLE`;
 PCI registration and classification both derive from it, and the
 `smoke_device_table_census` fixture pins the code table to this
-section. IDs are sourced from the public **`pci.ids`** database
-(v2.2, Intel graphics rows). IDs that do not appear in pci.ids
-(9A59 / 9AC9 / 9AC0 / 46B2 / 46A2) are **not** listed — an
-earlier coverage pass named them in error.
+section. IDs are exact members of Linux
+`include/drm/intel/pciids.h`; a row is added only when its existing
+platform profile already models that register and GuC-firmware family.
+The current census restores Tiger Lake 9A59/9AC0/9AC9/9AD9/9AF8 and
+Alder Lake-P 46A2/46B2/46C2, which an older `pci.ids` extract had
+incorrectly caused this driver to reject, and adds Rocket Lake only after
+giving it its own exact pre-GMD platform profile.
+
+Discrete identities are kept in their own exact lists rather than inserted
+into the integrated `DEVICE_TABLE`: DG1 is 4905, 4906, 4907, 4908 and 4909;
+DG2 and BMG retain their existing exact lists. The same exact-match PCI
+registration and class backstop rules apply.
 
 | ASIC (`ChipInfo::asic`) | Device IDs |
 | ----------------------- | ---------- |
-| tigerlake (Gen12) | 9A40, 9A49, 9A60, 9A68, 9A70, 9A78 |
-| alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A3, 46A6, 46A8, 46AA, 46B6, 46B8, 46BA |
-| raptorlake-p (Gen12) | 46B0, 46B1, 46B3, A720, A721, A7A0, A7A1, A7A8, A7A9, A7AA, A7AB, A7AC, A7AD |
-| alderlake-m (Gen12) | 46C0, 46C1, 46C3 |
+| tigerlake (Gen12) | 9A40, 9A49, 9A59, 9A60, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8 |
+| rocketlake (Gen12 GT; display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
+| alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A2, 46A3, 46A6, 46A8, 46AA, 46B6, 46B8, 46BA |
+| raptorlake-p (Gen12) | 46B0, 46B1, 46B2, 46B3, A720, A721, A7A0, A7A1, A7A8, A7A9, A7AA, A7AB, A7AC, A7AD |
+| alderlake-m (Gen12) | 46C0, 46C1, 46C2, 46C3 |
 | alderlake-n (Gen12) | 46D0, 46D1, 46D2, 46D3, 46D4 |
 | alderlake-s (Gen12) | 4680, 4682, 4688, 468A, 468B, 4690, 4692, 4693 |
 | raptorlake-s (Gen12) | A780, A781, A782, A783, A788, A789, A78A, A78B |
 | meteorlake (Xe-LPG) | 7D40, 7D45, 7D55, 7D60, 7DD5 |
 | arrowlake (Xe-LPG) | 7D41, 7D51, 7D67, 7DD1, B640 |
 | pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0B0 |
+| wildcatlake (Xe3-LPG; display 30.02 gated) | FD80, FD81 |
 
 Note: pci.ids labels 46B0/46B1/46B3 as AlderLake-P silicon; the
 driver has always classified them `raptorlake-p` and the census
 pins that existing behaviour (re-classification is out of scope
 for lane 1).
+
+Rocket Lake is not a Tiger Lake device-ID alias. Linux
+`include/drm/intel/pciids.h` supplies the exact six-ID census;
+`drivers/gpu/drm/xe/xe_pci.c` gives it the pre-GMD Xe-LP, 39-bit-DMA,
+three-level-VM integrated profile; and `xe_uc_fw.c` selects
+`i915/tgl_guc_70.bin` at ABI 70.44.1 or newer. The separate
+`Gen12Platform::RocketLake` identity preserves those GT facts. Linux display
+data also gives RKL three pipes, the display-12 minimized plane set, and the
+distinct A/B/TC1/TC2-to-combo-PHY A/B/C/D map. NARF records those VBT facts
+but does not yet admit RKL display programming: no RKL DPLL/clock sequence
+has been qualified, so a firmware-lit display is preserved and only an
+all-pipes-stopped function may start the display-less GuC owner.
+
+DG1 is likewise not a DG2 alias. Linux `xe_pci.c` identifies it as discrete
+Xe-LP+ graphics 12.10 with a 39-bit DMA mask and three-level VM, and
+`xe_uc_fw.c` selects `i915/dg1_guc_70.bin` at ABI 70.44.1 or newer. The
+dedicated `Gen12Platform::Dg1` preserves those facts and selects DG1's exact
+64-entry MOCS/L3CC table (undefined rows copy WB-L3 index 5; the published UC,
+fractional-cache and reserved rows remain literal). Before the Gen12 reset,
+the discrete owner proves all four pipes' primary plus six sprite fetchers are
+disabled; an unavailable or live plane fails closed. System-memory GuC
+execution may then start. DG1 local-memory geometry is not the DG2 flat-CCS
+layout, so BAR2 is retained but no VRAM pool is published. DG1 shares RKL's
+display-12 port/AUX mapping and has its own DG1 GMBUS/default-pin metadata,
+but no KMS route is admitted yet.
+
+Wildcat Lake IDs FD80/FD81 are exact `INTEL_WCL_IDS`. Linux deliberately binds
+them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
+`ChipInfo` retains broad `Generation::PantherLake` display gating and
+`asic: "wildcatlake"`, while GT policy uses the distinct
+`GtPlatform::WildcatLake`. The headless owner admits only live graphics
+30.03/30.04/30.05 and media 30.02, applies the source Xe3 policy without PTL's
+graphics-30.00 A0 workaround, and skips the media-30.00-only GGTT dummy-write
+workaround. Display 30.02 remains a typed refusal pending its separate policy.
 
 Arrow Lake (#1023): the five IDs classify
 `Generation::MeteorLake` under `asic: "arrowlake"` — the table
@@ -243,8 +296,10 @@ table is announced on the console as an unsupported ASIC and the
 probe returns `NotForThisDriver` — it no longer collapses
 silently into the same `BadDevice` used for dead hardware.
 
-Internal display programming admits Gen12 (Tiger Lake / Alder Lake /
-Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence.
+Internal display programming admits qualified Gen12 (Tiger Lake / Alder Lake /
+Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence. Rocket Lake
+has an exact GT and VBT metadata profile but its display-programming gate stays
+closed until its distinct clocks and port sequence are qualified.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
 display descriptor. Panther Lake refuses display programming. Lunar Lake
 keeps its headless execution profile unless a per-device display-20 route
@@ -2079,11 +2134,16 @@ write-combining index). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
-validating D0, live PCI identity, PF registers and disabled SR-IOV VFs. MTL/Arrow
-requires owned scanout takeover; DG2/BMG requires disabled inherited display
-planes. Each owner retains the registered card, current PCI authority, dedicated
-arena and immutable firmware asset. Async system-PM preparation proves stop
-before saving configuration; the synchronous callback only verifies readiness.
+validating D0, live PCI identity, PF registers and disabled SR-IOV VFs. An
+integrated Gen12 or MTL/Arrow owner requires either an owned scanout or a
+probe-time proof that Pipe A-D all have both `PIPECONF_ENABLE` and
+`PIPECONF_STATE` clear; an unavailable register fails closed. The no-scanout
+profile remains D0-only because stopped fetchers do not confer runtime-PM
+authority. LNL/PTL retain their separate FLR-gated profiles, and DG2/BMG require
+disabled inherited display planes. Each owner retains the registered card,
+current PCI authority, dedicated arena and immutable firmware asset. Async
+system-PM preparation proves stop before saving configuration; the synchronous
+callback only verifies readiness.
 Async resume restores D0/configuration and any owned display, then
 rebuilds using a fresh arena/cache-policy proof. Failed cleanup retains uncertain
 resources without an unbounded reset retry.

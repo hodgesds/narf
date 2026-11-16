@@ -85,7 +85,8 @@ pub(crate) enum ProfileRefusal {
     /// LNL/PTL: every cold start needs a client-free driver FLR, so no
     /// runtime-parked epoch can continue across a resume.
     HeadlessTakeover,
-    /// An integrated GT owner starts only with an owned display.
+    /// An integrated GT without an owned display remains D0-only even when
+    /// probe proved every display fetcher stopped and admitted GT startup.
     NoDisplayOwner,
 }
 

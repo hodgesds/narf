@@ -514,6 +514,8 @@ fn vbt_platform_tables_match_linux() -> TestResult {
     use VbtPlatform::*;
     // Port masks (intel_display_device.c).
     if TigerLake.port_mask() != 0b1_1111_1011
+        || RocketLake.port_mask() != 0b1_1011
+        || Dg1.port_mask() != 0b1_1011
         || AlderLakeS.port_mask() != 0b111_1001
         || AlderLakeP.port_mask() != 0b111_1011
         || MeteorLake.port_mask() != 0b111_1011
@@ -545,6 +547,11 @@ fn vbt_platform_tables_match_linux() -> TestResult {
         || TigerLake.dvo_port_to_port(dvo_port::DPD) != Some(3)
         || TigerLake.dvo_port_to_port(dvo_port::CRT) != Some(4)
         || TigerLake.dvo_port_to_port(dvo_port::HDMII) != Some(8)
+        || RocketLake.dvo_port_to_port(dvo_port::HDMIC) != Some(3)
+        || RocketLake.dvo_port_to_port(dvo_port::DPD) != Some(4)
+        || RocketLake.dvo_port_to_port(dvo_port::HDMIE).is_some()
+        || Dg1.dvo_port_to_port(dvo_port::HDMIC) != Some(3)
+        || Dg1.dvo_port_to_port(dvo_port::DPD) != Some(4)
         || MeteorLake.dvo_port_to_port(dvo_port::MIPIC) != Some(1)
         || MeteorLake.dvo_port_to_port(dvo_port::CRT).is_some()
     {
@@ -557,6 +564,11 @@ fn vbt_platform_tables_match_linux() -> TestResult {
         || AlderLakeS.map_aux_ch(dp_aux::B) != Some(3)
         || AlderLakeS.map_aux_ch(dp_aux::F).is_some()
         || TigerLake.map_aux_ch(dp_aux::D) != Some(3)
+        || RocketLake.map_aux_ch(dp_aux::D) != Some(2)
+        || RocketLake.map_aux_ch(dp_aux::E) != Some(3)
+        || RocketLake.map_aux_ch(dp_aux::C).is_some()
+        || Dg1.map_aux_ch(dp_aux::D) != Some(2)
+        || Dg1.map_aux_ch(dp_aux::E) != Some(3)
         || TigerLake.map_aux_ch(0x11).is_some()
     {
         return TestResult::Fail("aux channel maps differ from intel_bios.c");
@@ -566,6 +578,10 @@ fn vbt_platform_tables_match_linux() -> TestResult {
         || MeteorLake.map_ddc_pin(6) != 12
         || MeteorLake.map_ddc_pin(7) != 0
         || AlderLakeS.map_ddc_pin(2) != 9
+        || RocketLake.map_ddc_pin(2) != 2
+        || RocketLake.map_ddc_pin(3) != 9
+        || RocketLake.map_ddc_pin(5) != 0
+        || Dg1.map_ddc_pin(3) != 9
         || TigerLake.map_ddc_pin(4) != 9
         || TigerLake.map_ddc_pin(9) != 14
         || TigerLake.map_ddc_pin(10) != 0
@@ -582,6 +598,11 @@ fn vbt_platform_tables_match_linux() -> TestResult {
         || AlderLakeP.default_ddc_pin(6) != 12
         || AlderLakeS.default_ddc_pin(0) != 1
         || AlderLakeS.default_ddc_pin(4) != 10
+        || RocketLake.default_ddc_pin(0) != 0
+        || RocketLake.default_ddc_pin(4) != 0
+        || Dg1.default_ddc_pin(0) != 1
+        || Dg1.default_ddc_pin(3) != 3
+        || Dg1.default_ddc_pin(4) != 4
     {
         return TestResult::Fail("default DDC pins differ from intel_hdmi.c");
     }
@@ -589,6 +610,14 @@ fn vbt_platform_tables_match_linux() -> TestResult {
     if !MeteorLake.port_is_tc(3)
         || MeteorLake.port_is_tc(1)
         || AlderLakeS.port_is_tc(3)
+        || RocketLake.port_is_tc(3)
+        || RocketLake.port_to_phy(3) != 2
+        || RocketLake.port_to_phy(4) != 3
+        || RocketLake.default_aux_ch(3) != 2
+        || RocketLake.default_aux_ch(4) != 3
+        || Dg1.port_is_tc(3)
+        || Dg1.port_to_phy(3) != 2
+        || Dg1.port_to_phy(4) != 3
         || !TigerLake.port_is_tc(8)
         || TigerLake.port_is_tc(2)
     {

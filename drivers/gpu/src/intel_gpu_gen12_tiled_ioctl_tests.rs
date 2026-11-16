@@ -20,7 +20,10 @@ fn geometry(pitch: u32) -> Geometry {
 fn control(family: Gen12Platform) -> u32 {
     match family {
         Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
-        Gen12Platform::TigerLake | Gen12Platform::AlderLakeS => 0x84000000,
+        Gen12Platform::TigerLake
+        | Gen12Platform::Dg1
+        | Gen12Platform::RocketLake
+        | Gen12Platform::AlderLakeS => 0x84000000,
     }
 }
 fn families() -> [Gen12Platform; 4] {

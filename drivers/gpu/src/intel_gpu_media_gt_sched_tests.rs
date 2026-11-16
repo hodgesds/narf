@@ -593,7 +593,9 @@ fn smoke_media_gt_video_ring_ops_and_lrc_layout() -> TestResult {
         crate::intel_gpu_engine::media_seed(GtPlatform::Gen12(
             crate::intel_gpu_gt::Gen12Platform::TigerLake
         )),
-        crate::intel_gpu_engine::gen12_nonrender_seed()
+        crate::intel_gpu_engine::gen12_nonrender_seed(GtPlatform::Gen12(
+            crate::intel_gpu_gt::Gen12Platform::TigerLake,
+        ))
     );
     // dg2_xcs_offsets for MTL VCS/VECS; Gen12 media keeps gen12_xcs.
     let image =

@@ -156,10 +156,22 @@ impl ContextSeed {
     /// Direct privileged ring commands, only while priming owns RCS0.
     pub(crate) fn commands(self) -> Vec<u32> {
         if self.platform.is_gen12() {
-            // xe_wa.c lrc_was for graphics1200: no XeHP SVG or L3SQCREG5.
+            // xe_wa.c lrc_was for graphics1200/1210: no XeHP SVG or
+            // L3SQCREG5. DG1 adds two platform-specific masked bits.
+            let hiz = if self.platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+            {
+                0x60006000
+            } else {
+                0x20002000
+            };
+            let common3 =
+                if self.platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+                    0x12000200
+                } else {
+                    0x02000200
+                };
             let mut words = vec![
-                0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
-                0x02000200,
+                0, 0x11000007, 0x2580, 0x00060002, 0x7018, hiz, 0x7300, 0x00400040, 0x7304, common3,
             ];
             // Wa16011163337/1604555607: nonmasked FF_MODE2, preserve low16.
             rmw(&mut words, 0x6604, 0xffff0000, 0xe0040000, 0);
@@ -587,6 +599,15 @@ pub(crate) mod tests {
         ] {
             assert_eq!(regs[&reg], value);
         }
+        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let dg1_topology = GtTopology::read(&w, dg1).unwrap();
+        let dg1_seed = ContextSeed::read(&w, dg1, &dg1_topology, None).unwrap();
+        assert_eq!(dg1_seed.graphics, 1210);
+        let mut dg1_regs = BTreeMap::from([(0x7018, 0), (0x7304, 0x1000)]);
+        let (svg, _) = execute(&dg1_seed.commands(), &mut dg1_regs);
+        assert!(svg.is_empty());
+        assert_eq!(dg1_regs[&0x7018], 0x6000);
+        assert_eq!(dg1_regs[&0x7304], 0x200);
         TestResult::Pass
     }
     kernel_test_in!(

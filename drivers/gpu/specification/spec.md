@@ -1808,12 +1808,43 @@ No ambient firmware authority or direct filesystem access is introduced.
 Registry authorization does not establish GuC boot-ROM authentication.
 
 `intel_gpu_gt::GtPlatform::from_pci` separates integrated display generation
-from GT identity: the canonical integrated table plus exact Linux DG2 (25)
-and BMG (13) PCI IDs. `guc()` selects MTL/Arrow, Alchemist or Battlemage's
-firmware profile; other generations have no new GuC bootstrap profile.
+from GT identity: the canonical integrated table plus exact Linux DG1 (5),
+DG2 (25) and BMG (13) PCI IDs. Every census is exact (never a numeric range)
+and includes every currently qualified TGL/ADL variant from Linux
+`include/drm/intel/pciids.h`, including TGL 9A59/9AC0/9AC9/9AD9/9AF8 and
+ADL 46A2/46B2/46C2, plus the six exact RKL IDs
+4C80/4C8A/4C8B/4C8C/4C90/4C9A and WCL FD80/FD81. Every row must resolve to a qualified `guc()` profile in
+the native census fixture. Initial probe first parks decode/mastering, returns
+the function to D0 and restores BARs lost across D3hot; only the selected
+generation path then enables memory and DMA. `guc()` selects the exact TGL,
+RKL, DG1, ADL-P, MTL/Arrow, Alchemist, Battlemage, Lunar Lake or Panther Lake
+firmware profile. RKL is a distinct pre-GMD `Gen12Platform` while selecting
+the source-mandated TGL GuC image; its display gate stays closed, so live
+firmware scanout is preserved and only the all-pipes-stopped display-less GT
+route is admitted.
+DG1 is a distinct discrete `Gen12Platform`, exact IDs 4905–4909 only, with
+pre-GMD graphics 12.10, 39-bit DMA, a three-level VM and
+`i915/dg1_guc_70.bin` >=70.44.1. It uses the source DG1 MOCS/L3CC table rather
+than the integrated Gen12 or DG2 table. Cold start proves all four Display-12
+pipes' seven fetcher planes stopped before reset. No DG1 display owner or
+local-memory pool is published; BAR2 is retained for a future separately
+qualified non-flat-CCS layout.
+WCL uses Linux's PTL device descriptor and PTL GuC selection but keeps its
+product identity in the canonical census and its GT policy in the distinct
+`GtPlatform::WildcatLake`. Runtime GMD checks admit only graphics
+30.03/30.04/30.05 and media 30.02. WCL skips the media-30.00-only GGTT dummy
+write and PTL graphics-30.00 A0 workarounds; display 30.02 still refuses before
+takeover.
+An integrated Gen12 or MTL/Arrow function without an owned scanout may start
+its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
+`PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This
+display-less owner stays D0-only (`NoDisplayOwner`); it never infers runtime-PM
+authority from stopped pipes. LNL/PTL remain on their separate FLR-gated
+headless/display-preserving profiles.
 Identity discovery alone neither registers an Arc display driver nor reports
 system RAM as discrete GPU memory. `GuCFirmware::open_for_platform` uses the
-same invoked-capability acquisition for `i915/dg2_guc_70.bin` (70.53.0+) and
+same invoked-capability acquisition for `i915/dg1_guc_70.bin` (70.44.1+),
+`i915/dg2_guc_70.bin` (70.53.0+) and
 `xe/bmg_guc_70.bin` (70.54.0+), retaining the selected platform with the bytes.
 
 `intel_gpu_guc_boot::GuCBoot::stage` consumes a GT `BootAllocator`, an invoked-
@@ -3002,14 +3033,16 @@ advertise acceleration.
 
 ### Intel Gen12 GuC physical owner
 
-`GtPlatform::Gen12(Gen12Platform)` distinguishes TigerLake, AlderLakeP,
-AlderLakeS and AlderLakeN using the canonical exact PCI table; Raptor products
-inherit their P/S firmware family. All use the source pre-GMD graphics1200
-descriptor and never read `GMD_ID`. ADL-P/M/RPL-P selects
-`i915/adlp_guc_70.bin`; TGL/ADL-S/RPL-S/ADL-N selects
+`GtPlatform::Gen12(Gen12Platform)` distinguishes TigerLake, RocketLake, Dg1,
+AlderLakeP, AlderLakeS and AlderLakeN using exact PCI tables; AlderLake-M
+maps to AlderLakeP and Raptor products inherit their P/S firmware family. All
+are pre-GMD and never read `GMD_ID`: integrated families use graphics1200,
+while DG1 uses graphics1210. ADL-P/M/RPL-P selects
+`i915/adlp_guc_70.bin`; TGL/RKL/ADL-S/RPL-S/ADL-N selects
 `i915/tgl_guc_70.bin`, both at least 70.44.1. Generation-only firmware opening
-can select unambiguous Tiger Lake; ambiguous Alder Lake requires the explicit
-PCI-derived platform. An owned scanout grants the asynchronous GT owner and
+can select unambiguous Tiger Lake or Rocket Lake; DG1 selects
+`i915/dg1_guc_70.bin` at the same baseline; ambiguous Alder Lake requires
+the explicit PCI-derived platform. An owned scanout grants the asynchronous GT owner and
 excludes the old Gen12 forcewake/RC6 PM owner on that function.
 
 Before pending startup or firmware staging, the runtime atomically claims
@@ -3177,12 +3210,16 @@ writing any GGTT entry. Legacy PPGTT attachment rejects roots outside that
 limit before patching its retained context image. A qualified DG2 arena keeps
 its distinct 46-bit DMA limit; the shared wire codec is not platform proof.
 
-### Intel headless LNL/PTL main-GT execution
+### Intel headless LNL/PTL/WCL main-GT execution
 
 LNL accepts only PCI 6420/64a0/64b0, observed graphics 20.04/media 20.00 and
 `xe/lnl_guc_70.bin` 70.53.0+. PTL accepts only PCI
 b080/b081/b082/b083/b084/b085/b086/b087/b08f/b090/b0a0/b0b0,
 graphics 30.00/30.01, media 30.00 and `xe/ptl_guc_70.bin` 70.54.0+.
+WCL IDs fd80/fd81 select that same Linux PTL descriptor and firmware profile,
+but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
+media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
+still refuses pending its separate display policy.
 These integrated profiles use DMA46, default 2 MiB WOPCM and source-selected
 five-level PPGTT root4 with a 48-bit VA ceiling. Existing constructors retain
 root3; explicit root4 requires the Xe2 encoding. Only programmed uncompressed
