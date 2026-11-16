@@ -680,7 +680,7 @@ mod tests {
             ..TaskSpec::default()
         };
         let affinity_generation = crate::register_task_affinity(id, spec.affinity, false);
-        crate::TaskSlot {
+        let slot = crate::TaskSlot {
             origin: "test",
             site: core::panic::Location::caller(),
             user_scheduling: Some(attach(id, None)),
@@ -707,7 +707,11 @@ mod tests {
             rt_reservation: None,
             nproc_guard: None,
             vruntime: 0,
-        }
+        };
+        // Test-fixture slot: keep the maintained live-task count
+        // balanced — `Drop for TaskSlot` decrements it (issue #2134).
+        crate::TOTAL_TASKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        slot
     }
 
     fn configure(

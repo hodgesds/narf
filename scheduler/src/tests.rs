@@ -2877,6 +2877,93 @@ fn smoke_scheduler_all_task_ids_lists_spawned() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_all_task_ids_lists_spawned);
 
+// ── Maintained O(1) task counters (issue #2134) ─────────────────────
+
+/// Maintained O(1) task counters track spawns, parks, wakes and exits:
+/// `total_task_count` / `parked_task_count` move in lockstep with the
+/// `all_task_ids()` enumeration, without scanning a queue. Deltas, not
+/// absolutes: the running test task itself is executor-owned, counted
+/// in the total but invisible to any queue scan.
+fn smoke_scheduler_maintained_task_counts() -> TestResult {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    static PARKED_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+    static READY: AtomicBool = AtomicBool::new(false);
+
+    struct Parked;
+    impl Future for Parked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if READY.load(Ordering::Relaxed) {
+                return Poll::Ready(());
+            }
+            *PARKED_WAKER.lock() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    READY.store(false, Ordering::Relaxed);
+    *PARKED_WAKER.lock() = None;
+
+    crate::__reset_queues_for_test();
+    // Empty queues: nothing parked (validates clear() accounting).
+    if crate::parked_task_count() != 0 {
+        return TestResult::Fail("parked count nonzero on empty queues");
+    }
+    let pre_total = crate::total_task_count();
+    let pre_ids = crate::all_task_ids().len();
+    let pre_parked = crate::parked_task_count();
+
+    crate::spawn(Parked);
+    // Spawned, not yet polled: total +1, parked unchanged, enumeration +1.
+    if crate::total_task_count() != pre_total + 1 {
+        return TestResult::Fail("spawn didn't bump total_task_count");
+    }
+    if crate::all_task_ids().len() != pre_ids + 1 {
+        return TestResult::Fail("spawn didn't bump all_task_ids count");
+    }
+    if crate::parked_task_count() != pre_parked {
+        return TestResult::Fail("fresh spawn counted as parked");
+    }
+
+    crate::run_until_empty();
+    // Parked until woken: total +1, parked +1, enumeration +1.
+    if crate::total_task_count() != pre_total + 1 {
+        return TestResult::Fail("parked task left total_task_count");
+    }
+    if crate::parked_task_count() != pre_parked + 1 {
+        return TestResult::Fail("parked task didn't bump parked_task_count");
+    }
+    if crate::all_task_ids().len() != pre_ids + 1 {
+        return TestResult::Fail("parked task left all_task_ids");
+    }
+    if crate::unparked_task_count() != crate::total_task_count() - crate::parked_task_count() {
+        return TestResult::Fail("unparked count inconsistent with total/parked");
+    }
+
+    READY.store(true, Ordering::Relaxed);
+    if let Some(w) = PARKED_WAKER.lock().take() {
+        w.wake();
+    }
+    crate::run_until_empty();
+    // Completed and dropped: all three back to baseline.
+    if crate::total_task_count() != pre_total {
+        return TestResult::Fail("completed task didn't drop total_task_count");
+    }
+    if crate::parked_task_count() != pre_parked {
+        return TestResult::Fail("completed task didn't drop parked_task_count");
+    }
+    if crate::all_task_ids().len() != pre_ids {
+        return TestResult::Fail("completed task didn't leave all_task_ids");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_maintained_task_counts);
+
 // ── YieldNow ───────────────────────────────────────────────────────
 
 fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
