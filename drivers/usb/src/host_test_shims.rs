@@ -1,10 +1,11 @@
 //! Host-only definitions for the kernel-provided symbols the USB lib-test
-//! binary links against (#1579).
+//! binary links against (#1579, #2139).
 //!
 //! On a kernel target the linker scripts (`build/linker/*.ld`) define the
-//! `__text_start` / `__build_id_note_*` / `__narf_probes_*` /
-//! `__kernel_phys_bounds` anchors, and `frame/src/bare_main.rs` defines
-//! the `#[no_mangle]` NUMA topology hooks. The host `cargo test` binary
+//! `__text_start` / `__text_end` / `__rodata_end` / `__build_id_note_*` /
+//! `__narf_probes_*` / `__kernel_phys_bounds` anchors, and
+//! `frame/src/bare_main.rs` defines the `#[no_mangle]` NUMA topology
+//! hooks. The host `cargo test` binary
 //! has neither, but the lib-test link still pulls in the referencing
 //! code: `narf-memory`'s `text_poke`/KASLR paths, `narf-filesystem`'s
 //! sysfs/procfs NUMA and build-ID readers, `narf-tracing`'s `probes()`,
@@ -39,6 +40,22 @@ static __kernel_phys_bounds: [u64; 2] = [0; 2];
 /// it. Zeroed: the host test binary has no kernel image layout.
 #[no_mangle]
 static __text_start: u8 = 0;
+
+/// End of the kernel `.text` section, as the linker script emits it
+/// (`build/linker/*.ld`). Zeroed, equal to `__text_start`, so the text
+/// range is empty: `scheduler::note_abandoned_stack` passes the range
+/// to `scan_abandoned_stack`, which never runs under the host test
+/// harness (no stackful task is ever current there).
+#[no_mangle]
+static __text_end: u8 = 0;
+
+/// End of the kernel `.rodata` section, as the linker script emits it
+/// (`build/linker/*.ld`). Zeroed, equal to `__text_start`, so the
+/// `[image_lo, image_hi)` range `userspace::narf_mm_holders_report`
+/// sweeps for image words is empty; that report path never runs under
+/// the host test harness.
+#[no_mangle]
+static __rodata_end: u8 = 0;
 
 /// Bounds of the GNU build-ID note, as the linker script emits them.
 /// Equal addresses give `kernel_notes_read` an empty note, matching a
