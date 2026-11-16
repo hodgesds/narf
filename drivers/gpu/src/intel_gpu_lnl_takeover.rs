@@ -630,38 +630,41 @@ impl MediaQuiesce {
 /// documented whole-display reset; a powered-off read is never interpreted
 /// as a disabled plane. This profile never initializes display or DMC.
 fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Error> {
+    use crate::intel_gpu_xe2lpd::DisplayIdentity;
     if read(m, 0x10100c)? & (1 << 9) == 0 {
         return Ok(None);
     }
     let platform =
         crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, device).ok_or(Error::Unsupported)?;
     let expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
-        3500
+        DisplayIdentity::NovaLakeS
     } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
-        3002
+        DisplayIdentity::WildcatLake
     } else if platform.is_ptl() {
-        3000
+        DisplayIdentity::Xe3Lpd
     } else if platform.is_lnl() {
-        2000
+        DisplayIdentity::Xe2Lpd
     } else if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-        1401
+        DisplayIdentity::Xe2Hpd
     } else {
         return Err(Error::Unsupported);
     };
     let a = read(m, 0x510a0)?;
-    if a != read(m, 0x510a0)? || (a >> 22) * 100 + ((a >> 14) & 255) != expected {
+    if a != read(m, 0x510a0)? || DisplayIdentity::decode(a) != Ok(expected) {
         return Err(Error::Unsupported);
     }
+    let profile = expected.profile();
     // Secondary refusal probes only: distribution or gated zeroes are not an
     // inactive proof. Inherited producer retirement comes from completed FLR.
     if read(m, 0x42000)? & 0x0c000000 != 0x0c000000 {
         return Err(Error::Unavailable);
     }
-    if read(m, 0x45504)? != 0 || read(m, 0x45250)? & 0x1111 != 0 {
+    if read(m, 0x45504)? != 0 || read(m, 0x45250)? & profile.pipedmc_enable_mask() != 0 {
         return Err(Error::Busy);
     }
-    let mask = (3 << 2) | (3 << 10) | (3 << 12) | (3 << 14) | (3 << 16);
-    // PW2 and pipe A-D wells must remain off, including other agents' refs.
+    let mask = profile.pipe_power_well_mask();
+    // PW2 and every real pipe well must remain off, including other agents'
+    // refs. WCL has A-C; the other admitted identities have A-D.
     // Display30.00 changes PGB's parent toPG1 (power_map.c:1596ff),
     // but keeps these exact request/state indices. No well is enabled here.
     for reg in [0x45400, 0x45404, 0x45408, 0x4540c] {
@@ -672,13 +675,8 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
     if read(m, 0x70008)? & 0xc0000000 != 0 {
         return Err(Error::Busy);
     }
-    let fbc_count = if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-        2
-    } else {
-        4
-    };
-    for id in 0..fbc_count {
-        if read(m, 0x43208 + id * 0x40)? & 0x80000000 != 0 {
+    for id in 0..4u64 {
+        if profile.fbc_mask & (1 << id) != 0 && read(m, 0x43208 + id * 0x40)? & 0x80000000 != 0 {
             return Err(Error::Busy);
         }
     }
@@ -1271,6 +1269,17 @@ mod tests {
             post_flr_display(&display, 0xfd80),
             Ok(Some(media_version(3002)))
         );
+        // WCL has no Pipe-D DMC or power well. Reserved/nonexistent D bits
+        // are not part of its proof.
+        display.set(0x45250, 0x1000);
+        for register in [0x45400, 0x45404, 0x45408, 0x4540c] {
+            display.set(register, 3 << 16);
+        }
+        display.set(0x43208 + 3 * 0x40, 1 << 31);
+        assert_eq!(
+            post_flr_display(&display, 0xfd80),
+            Ok(Some(media_version(3002)))
+        );
         display.set(0x510a0, media_version(3000));
         assert_eq!(post_flr_display(&display, 0xfd80), Err(Error::Unsupported));
         TestResult::Pass
@@ -1329,6 +1338,17 @@ mod tests {
             post_flr_display(&display, 0xd740),
             Ok(Some(media_version(3500)))
         );
+        // NVL-S maps the four-pipe xe2_lpd_display descriptor, so the same
+        // Pipe-D state is live and must fail closed.
+        display.set(0x45250, 0x1000);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x45250, 0);
+        display.set(0x45400, 3 << 16);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x45400, 0);
+        display.set(0x43208 + 3 * 0x40, 1 << 31);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x43208 + 3 * 0x40, 0);
         display.set(0x510a0, media_version(3002));
         assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Unsupported));
         TestResult::Pass

@@ -378,8 +378,12 @@ Gen12 orchestrator use.
 ### Lunar Lake display 20 (Xe2_LPD)
 
 `intel_gpu_xe2lpd` (crate-private) identifies and drives display 20.
-`DisplayIp::{Xelpdp, Xe2Lpd}` comes from `decode`/`read` of
-`GMD_ID_DISPLAY`. Every other IP is a typed `IpError`: `Absent`,
+`DisplayIdentity` decodes the complete current Linux `gmdid_display_map`
+(14.00, 14.01, 20.00, 30.00, 30.02 and 35.00) for read-only identity
+proofs. Recognition grants no programming authority: `DisplayIp::{Xelpdp,
+Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 admitted
+only through the explicitly opted-in `decode_all` route. Every other
+operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
 admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,
@@ -388,6 +392,16 @@ admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,
 `modeset(io, fb, mode)` is the display-20 owned Pipe-A modeset. It refuses
 read-only unless the GMD is 20.00. `takeover(io)` runs that modeset on the
 firmware-lit Pipe A.
+
+`DisplayIdentity::profile` records the source DMC container, payload ceiling
+and maximum CDCLK plus exact pipe/FBC/DBUF topology for all six identities
+without granting a write route.
+Notably WCL 30.02 selects `xe3lpd_3002_dmc.bin` with a 480 MHz ceiling and
+three pipes/FBCs; NVL-S 35.00 selects `xe3p_lpd_dmc.bin` with a 787.2 MHz
+ceiling and the four-pipe/FBC `xe2_lpd_display` topology. Both remain read-only
+identities. The post-driver-FLR proof checks only power-well and pipe-DMC bits
+owned by the observed topology; WCL's nonexistent Pipe-D bits are not treated
+as hardware state, while NVL-S Pipe D remains fail-closed.
 
 The module also holds the display-20 facts: `CDCLK_TABLE`,
 `mdclk_cdclk_ratio`, `mbus_throttle`, `dbuf_min_tracker`, `dbuf_ctl`,

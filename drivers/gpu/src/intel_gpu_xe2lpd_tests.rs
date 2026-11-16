@@ -73,6 +73,59 @@ fn smoke_xe2lpd_gmd_decode_and_typed_refusals() -> TestResult {
     assert_eq!(DisplayIp::decode(14 << 22), Ok(DisplayIp::Xelpdp));
     assert_eq!(DisplayIp::decode((20 << 22) | 3), Ok(DisplayIp::Xe2Lpd));
     assert_eq!(DisplayIp::decode(0), Err(IpError::Absent));
+    // The complete source census is observable without widening the
+    // operational DisplayIp set.
+    for (gmd, identity) in [
+        (14 << 22, DisplayIdentity::Xelpdp),
+        ((14 << 22) | (1 << 14), DisplayIdentity::Xe2Hpd),
+        (20 << 22, DisplayIdentity::Xe2Lpd),
+        (30 << 22, DisplayIdentity::Xe3Lpd),
+        ((30 << 22) | (2 << 14), DisplayIdentity::WildcatLake),
+        (35 << 22, DisplayIdentity::NovaLakeS),
+    ] {
+        assert_eq!(DisplayIdentity::decode(gmd | 0x2a), Ok(identity));
+    }
+    assert_eq!(DisplayIdentity::decode(0), Err(IpError::Absent));
+    assert_eq!(
+        DisplayIdentity::decode((35 << 22) | (1 << 14)),
+        Err(IpError::Unqualified { ver: 35, rel: 1 })
+    );
+    assert_eq!(
+        DisplayIdentity::WildcatLake.profile(),
+        DisplayIdentityProfile {
+            dmc_firmware: "i915/xe3lpd_3002_dmc.bin",
+            dmc_max_size: 0x8000,
+            max_cdclk_khz: 480_000,
+            pipe_mask: 0x07,
+            fbc_mask: 0x07,
+            has_dbuf_overlap_detection: false,
+        }
+    );
+    assert_eq!(
+        DisplayIdentity::NovaLakeS.profile(),
+        DisplayIdentityProfile {
+            dmc_firmware: "i915/xe3p_lpd_dmc.bin",
+            dmc_max_size: 0x8000,
+            max_cdclk_khz: 787_200,
+            pipe_mask: 0x0f,
+            fbc_mask: 0x0f,
+            has_dbuf_overlap_detection: true,
+        }
+    );
+    assert_eq!(
+        DisplayIdentity::WildcatLake.profile().pipedmc_enable_mask(),
+        0x0111
+    );
+    assert_eq!(
+        DisplayIdentity::WildcatLake
+            .profile()
+            .pipe_power_well_mask(),
+        (3 << 2) | (3 << 10) | (3 << 12) | (3 << 14)
+    );
+    assert_eq!(
+        DisplayIdentity::NovaLakeS.profile().pipedmc_enable_mask(),
+        0x1111
+    );
     for (gmd, ver, rel) in [
         ((14 << 22) | (1 << 14), 14, 1),
         (30 << 22, 30, 0),
@@ -89,6 +142,7 @@ fn smoke_xe2lpd_gmd_decode_and_typed_refusals() -> TestResult {
     }
     // Two equal reads are required; all-ones is lost access.
     let io = Regs::with(&[(0x510a0, 20 << 22)]);
+    assert_eq!(DisplayIdentity::read(&io), Ok(DisplayIdentity::Xe2Lpd));
     assert_eq!(DisplayIp::read(&io), Ok(DisplayIp::Xe2Lpd));
     io.unstable.set(0x510a0);
     assert_eq!(DisplayIp::read(&io), Err(IpError::NoDevice));

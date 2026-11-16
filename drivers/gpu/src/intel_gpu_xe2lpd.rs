@@ -113,6 +113,71 @@ pub(crate) enum DisplayIp {
     Xe3Lpd,
 }
 
+/// Exact `GMD_ID_DISPLAY` identities published by Linux's
+/// `gmdid_display_map`.
+///
+/// This is deliberately wider than [`DisplayIp`]: recognizing a live IP is
+/// not authority to program it.  In particular, Wildcat Lake 30.02 and Nova
+/// Lake-S 35.00 can be used as read-only reset/admission proofs while they
+/// remain outside every operational modeset route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisplayIdentity {
+    /// 14.00, `xe_lpdp_display`.
+    Xelpdp,
+    /// 14.01, `xe2_hpd_display` (Battlemage).
+    Xe2Hpd,
+    /// 20.00, `xe2_lpd_display` (Lunar Lake).
+    Xe2Lpd,
+    /// 30.00, `xe2_lpd_display` (Panther Lake).
+    Xe3Lpd,
+    /// 30.02, the distinct `wcl_display` descriptor.
+    WildcatLake,
+    /// 35.00, `xe2_lpd_display` with the Xe3P_LPD clock/DMC policy.
+    NovaLakeS,
+}
+
+/// Source-selected immutable metadata for an observed display identity.
+/// This is diagnostic/qualification data, not a modeset capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DisplayIdentityProfile {
+    pub(crate) dmc_firmware: &'static str,
+    pub(crate) dmc_max_size: usize,
+    pub(crate) max_cdclk_khz: u32,
+    /// Source `pipe_mask` / `cpu_transcoder_mask` (A = bit 0).
+    pub(crate) pipe_mask: u8,
+    /// Source `fbc_mask` (FBC A = bit 0).
+    pub(crate) fbc_mask: u8,
+    pub(crate) has_dbuf_overlap_detection: bool,
+}
+
+impl DisplayIdentityProfile {
+    /// `MTL_PIPEDMC_CONTROL` enable bits for the identity's real pipes.
+    pub(crate) const fn pipedmc_enable_mask(self) -> u32 {
+        let mut mask = 0;
+        let mut pipe = 0;
+        while pipe < 4 {
+            if self.pipe_mask & (1 << pipe) != 0 {
+                mask |= 1 << (pipe * 4);
+            }
+            pipe += 1;
+        }
+        mask
+    }
+
+    /// `PWR_WELL_CTL*` request/state pairs: PW2 plus each real pipe well.
+    pub(crate) const fn pipe_power_well_mask(self) -> u32 {
+        let mut mask = 3 << 2;
+        let mut pipe = 0;
+        while pipe < 4 {
+            if self.pipe_mask & (1 << pipe) != 0 {
+                mask |= 3 << (10 + pipe * 2);
+            }
+            pipe += 1;
+        }
+        mask
+    }
+}
+
 /// Discrete Arc display IP families:
 /// - `Dg2`: Alchemist pre-GMD Display 13.
 /// - `Xe2Hpd`: Battlemage `GMD_ID_DISPLAY` 14.01 (`xe2_hpd_display`).
@@ -253,8 +318,8 @@ pub(crate) enum IpError {
     Unqualified { ver: u16, rel: u8 },
 }
 
-impl DisplayIp {
-    /// `probe_gmdid_display` restricted to the qualified IPs.
+impl DisplayIdentity {
+    /// Decode exactly the current Linux `gmdid_display_map` census.
     pub(crate) const fn decode(gmd: u32) -> Result<Self, IpError> {
         if gmd == 0 {
             return Err(IpError::Absent);
@@ -263,12 +328,16 @@ impl DisplayIp {
         let rel = ((gmd >> 14) & 0xff) as u8;
         match (ver, rel) {
             (14, 0) => Ok(Self::Xelpdp),
+            (14, 1) => Ok(Self::Xe2Hpd),
             (20, 0) => Ok(Self::Xe2Lpd),
+            (30, 0) => Ok(Self::Xe3Lpd),
+            (30, 2) => Ok(Self::WildcatLake),
+            (35, 0) => Ok(Self::NovaLakeS),
             _ => Err(IpError::Unqualified { ver, rel }),
         }
     }
 
-    /// Read and decode `GMD_ID_DISPLAY`; two equal reads are required.
+    /// Read a stable live identity. Recognition remains read-only.
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, IpError> {
         let a = io.read32(GMD_ID_DISPLAY);
         let b = io.read32(GMD_ID_DISPLAY);
@@ -278,28 +347,125 @@ impl DisplayIp {
         Self::decode(a)
     }
 
+    /// `(DISPLAY_VER, DISPLAY_REL)` for typed refusal reporting.
+    pub(crate) const fn version(self) -> (u16, u8) {
+        match self {
+            Self::Xelpdp => (14, 0),
+            Self::Xe2Hpd => (14, 1),
+            Self::Xe2Lpd => (20, 0),
+            Self::Xe3Lpd => (30, 0),
+            Self::WildcatLake => (30, 2),
+            Self::NovaLakeS => (35, 0),
+        }
+    }
+
+    /// Linux `dmc_firmware_default` plus `intel_update_max_cdclk` for the
+    /// exact observed identity. No caller may infer programming support from
+    /// this metadata; [`DisplayIp`] remains the authority boundary.
+    pub(crate) const fn profile(self) -> DisplayIdentityProfile {
+        match self {
+            Self::Xelpdp => DisplayIdentityProfile {
+                dmc_firmware: "i915/mtl_dmc.bin",
+                dmc_max_size: 0x7000,
+                max_cdclk_khz: 652_800,
+                pipe_mask: 0x0f,
+                fbc_mask: 0x03,
+                has_dbuf_overlap_detection: false,
+            },
+            Self::Xe2Hpd => DisplayIdentityProfile {
+                dmc_firmware: "i915/bmg_dmc.bin",
+                dmc_max_size: 0x7000,
+                max_cdclk_khz: 652_800,
+                pipe_mask: 0x0f,
+                fbc_mask: 0x03,
+                has_dbuf_overlap_detection: false,
+            },
+            Self::Xe2Lpd => DisplayIdentityProfile {
+                dmc_firmware: XE2LPD_DMC_FIRMWARE,
+                dmc_max_size: XE2LPD_DMC_MAX_FW_SIZE,
+                max_cdclk_khz: 652_800,
+                pipe_mask: 0x0f,
+                fbc_mask: 0x0f,
+                has_dbuf_overlap_detection: true,
+            },
+            Self::Xe3Lpd => DisplayIdentityProfile {
+                dmc_firmware: crate::intel_gpu_xe3lpd::XE3LPD_DMC_FIRMWARE,
+                dmc_max_size: XE2LPD_DMC_MAX_FW_SIZE,
+                max_cdclk_khz: 691_200,
+                pipe_mask: 0x0f,
+                fbc_mask: 0x0f,
+                has_dbuf_overlap_detection: true,
+            },
+            Self::WildcatLake => DisplayIdentityProfile {
+                dmc_firmware: "i915/xe3lpd_3002_dmc.bin",
+                dmc_max_size: XE2LPD_DMC_MAX_FW_SIZE,
+                max_cdclk_khz: 480_000,
+                pipe_mask: 0x07,
+                fbc_mask: 0x07,
+                has_dbuf_overlap_detection: false,
+            },
+            Self::NovaLakeS => DisplayIdentityProfile {
+                dmc_firmware: "i915/xe3p_lpd_dmc.bin",
+                dmc_max_size: XE2LPD_DMC_MAX_FW_SIZE,
+                max_cdclk_khz: 787_200,
+                pipe_mask: 0x0f,
+                fbc_mask: 0x0f,
+                has_dbuf_overlap_detection: true,
+            },
+        }
+    }
+}
+
+impl DisplayIp {
+    const fn from_identity(identity: DisplayIdentity, xe3: bool) -> Result<Self, IpError> {
+        match identity {
+            DisplayIdentity::Xelpdp => Ok(Self::Xelpdp),
+            DisplayIdentity::Xe2Lpd => Ok(Self::Xe2Lpd),
+            DisplayIdentity::Xe3Lpd if xe3 => Ok(Self::Xe3Lpd),
+            other => {
+                let (ver, rel) = other.version();
+                Err(IpError::Unqualified { ver, rel })
+            }
+        }
+    }
+
+    /// `probe_gmdid_display` restricted to the qualified IPs.
+    pub(crate) const fn decode(gmd: u32) -> Result<Self, IpError> {
+        match DisplayIdentity::decode(gmd) {
+            Ok(identity) => Self::from_identity(identity, false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read and decode `GMD_ID_DISPLAY`; two equal reads are required.
+    pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, IpError> {
+        match DisplayIdentity::read(io) {
+            Ok(identity) => Self::from_identity(identity, false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// [`DisplayIp::decode`] widened by display 30.00 (Xe3_LPD). Only the
     /// display-30 route and the per-IP owners behind it use it; the Meteor
     /// Lake and Lunar Lake entries keep [`DisplayIp::decode`], so 30.00
     /// stays a typed refusal there. 30.02 (`wcl_display`: three pipes, C10
     /// on PHY A and B, `xe3lpd_3002_dmc.bin`, a 480 MHz CDCLK ceiling and
-    /// `xe3lpd_3002_sa_info`) belongs to Wildcat Lake, whose PCI IDs
-    /// (`INTEL_WCL_IDS`) are not in the driver table, and is refused.
+    /// `xe3lpd_3002_sa_info`) belongs to Wildcat Lake. Its PCI IDs are
+    /// recognized for headless GT execution, but display programming is
+    /// still refused here.
     pub(crate) const fn decode_all(gmd: u32) -> Result<Self, IpError> {
-        match Self::decode(gmd) {
-            Err(IpError::Unqualified { ver: 30, rel: 0 }) => Ok(Self::Xe3Lpd),
-            other => other,
+        match DisplayIdentity::decode(gmd) {
+            Ok(identity) => Self::from_identity(identity, true),
+            Err(error) => Err(error),
         }
     }
 
     /// [`DisplayIp::read`] over [`DisplayIp::decode_all`].
     pub(crate) fn read_all(io: &(impl MmioWindow + ?Sized)) -> Result<Self, IpError> {
-        let a = io.read32(GMD_ID_DISPLAY);
-        let b = io.read32(GMD_ID_DISPLAY);
-        if a == u32::MAX || a != b || !io.display_access_ok() {
-            return Err(IpError::NoDevice);
+        match DisplayIdentity::read(io) {
+            Ok(identity) => Self::from_identity(identity, true),
+            Err(error) => Err(error),
         }
-        Self::decode_all(a)
     }
 
     /// The IP a PCI generation's display is (only for the platforms whose

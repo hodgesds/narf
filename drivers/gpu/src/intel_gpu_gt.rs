@@ -96,8 +96,8 @@ impl GraphicsIp {
         let version = (a >> 22) * 100 + ((a >> 14) & 255);
         let supported = match platform {
             GtPlatform::Battlemage => matches!(version, 2001 | 2002),
-            GtPlatform::WildcatLake => matches!(version, 3003 | 3004 | 3005),
-            GtPlatform::NovaLakeS => matches!(version, 3003 | 3004 | 3005),
+            GtPlatform::WildcatLake => matches!(version, 3003..=3005),
+            GtPlatform::NovaLakeS => matches!(version, 3003..=3005),
             GtPlatform::Integrated(Generation::LunarLake) => version == 2004,
             GtPlatform::Integrated(Generation::PantherLake) => matches!(version, 3000 | 3001),
             _ => matches!(version, 1270 | 1271 | 1274),

@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.64** (v0.63 plus exact Nova Lake-S headless GT/GuC/media
+> Status: **v0.65** (v0.64 plus a typed, read-only census of all current
+> Linux GMD display identities, including distinct Wildcat Lake 30.02 and
+> Nova Lake-S 35.00 refusal proofs; exact Nova Lake-S headless GT/GuC/media
 > identity and exact fail-closed Crescent Island discovery; a distinct Wildcat Lake GT profile admitting
 > exact graphics 30.03-30.05 and media 30.02 while display 30.02 remains
 > fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
@@ -1729,10 +1731,19 @@ trusted.
 Lunar Lake's display is version 20.00 (`xe2_lpd_display`: the display-14
 `XE_LPDP_FEATURES` plus FBC on all four pipes and DBUF overlap detection).
 `INTEL_LNL_IDS` binds 6420/64a0/64b0 to `lnl_desc`, which names no display:
-the IP is known only from `GMD_ID_DISPLAY`. `DisplayIp` decodes it; 14.00
-and 20.00 are dispatched, while an absent display (GMD zero), 14.01 (BMG),
-30.00/30.02 (PTL/WCL) and 35.00 are typed refusals. Display 20 runs the
-display-14 code with version dispatch, not a copy of it.
+the IP is known only from `GMD_ID_DISPLAY`. `DisplayIdentity` decodes the
+complete current Linux map (14.00, 14.01, 20.00, 30.00, 30.02 and 35.00)
+for read-only proofs and pins each identity's DMC container/payload ceiling
+and maximum CDCLK plus pipe/FBC/DBUF topology. In particular, WCL selects
+`xe3lpd_3002_dmc.bin`/480 MHz and has only pipes/FBC A-C; NVL-S selects
+`xe3p_lpd_dmc.bin`/787.2 MHz and the four-pipe/FBC `xe2_lpd_display` topology.
+The headless post-FLR proof uses those masks, so WCL does not sample a
+nonexistent Pipe D while NVL-S still refuses live Pipe-D state. `DisplayIp`
+grants programming authority only to its qualified routes: 14.00 and 20.00
+normally, plus 30.00 through the explicit Panther Lake entry. An absent
+display (GMD zero), 14.01 (BMG), 30.02 (WCL) and 35.00 (NVL-S) remain typed
+refusals on this route. Display 20 runs the display-14 code with version
+dispatch, not a copy of it.
 
 Admission and the headless profile. Lunar Lake's existing profile is the
 headless main GT, which owns the function through a driver FLR
