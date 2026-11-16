@@ -97,6 +97,7 @@ impl GraphicsIp {
         let supported = match platform {
             GtPlatform::Battlemage => matches!(version, 2001 | 2002),
             GtPlatform::WildcatLake => matches!(version, 3003 | 3004 | 3005),
+            GtPlatform::NovaLakeS => matches!(version, 3003 | 3004 | 3005),
             GtPlatform::Integrated(Generation::LunarLake) => version == 2004,
             GtPlatform::Integrated(Generation::PantherLake) => matches!(version, 3000 | 3001),
             _ => matches!(version, 1270 | 1271 | 1274),
@@ -122,6 +123,9 @@ pub enum GtPlatform {
     /// Wildcat Lake: PTL device descriptor/firmware, distinct 30.02 media
     /// and 30.03-30.05 graphics GMD contract.
     WildcatLake,
+    /// Nova Lake-S: distinct 70.55.4 GuC with display/media 35.00 and the
+    /// source Xe3-LPG graphics 30.03-30.05 live-GMD set.
+    NovaLakeS,
     Alchemist,
     Battlemage,
 }
@@ -144,6 +148,7 @@ pub(crate) const PTL_IDS: &[u16] = &[
     0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0, 0xb0b0,
 ];
 pub(crate) const WCL_IDS: &[u16] = &[0xfd80, 0xfd81];
+pub(crate) const NVLS_IDS: &[u16] = &[0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745];
 pub(crate) const DG2_IDS: &[u16] = &[
     0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0, 0x56b1,
     0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2, 0x56b3, 0x5696,
@@ -174,6 +179,7 @@ impl GtPlatform {
             if entry.generation == Generation::PantherLake
                 && !PTL_IDS.contains(&device)
                 && !WCL_IDS.contains(&device)
+                && !NVLS_IDS.contains(&device)
             {
                 return None;
             }
@@ -187,6 +193,9 @@ impl GtPlatform {
             };
             if entry.asic == "wildcatlake" {
                 return Some(Self::WildcatLake);
+            }
+            if entry.asic == "novalake-s" {
+                return Some(Self::NovaLakeS);
             }
             return Some(family.map_or(Self::Integrated(entry.generation), Self::Gen12));
         }
@@ -222,9 +231,22 @@ impl GtPlatform {
             Self::Integrated(Generation::PantherLake) | Self::WildcatLake
         )
     }
+    /// Xe3-LPG graphics 30.xx topology/register family. NVL-S shares these
+    /// mechanics but not policy keyed specifically to XE_PANTHERLAKE.
+    pub const fn is_xe3_lpg(self) -> bool {
+        self.is_ptl() || matches!(self, Self::NovaLakeS)
+    }
+    /// PCI families eligible for the display-30 route. Nova Lake-S shares
+    /// Xe3 GT machinery but its display is 35.00 and must never pass this gate.
+    pub const fn has_ptl_display_route(self) -> bool {
+        matches!(
+            self,
+            Self::Integrated(Generation::PantherLake) | Self::WildcatLake
+        )
+    }
     /// Integrated GT-only profiles with retained full-device takeover.
     pub const fn is_headless_integrated(self) -> bool {
-        self.is_lnl() || self.is_ptl()
+        self.is_lnl() || self.is_xe3_lpg()
     }
     /// xe_pci.c graphics_xe2 descriptor, shared by qualified Xe2 and Xe3-LPG.
     pub const fn is_xe2(self) -> bool {
@@ -279,6 +301,7 @@ impl GtPlatform {
                 Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake,
             )
             | Self::WildcatLake
+            | Self::NovaLakeS
             | Self::Battlemage => Some(0xdfc),
             Self::Alchemist | Self::Gen12(_) => Some(0x130044),
             _ => None,
@@ -297,6 +320,7 @@ impl GtPlatform {
             Self::Integrated(Generation::LunarLake) => ("xe/lnl_guc_70.bin", (70, 53, 0)),
             Self::Integrated(Generation::PantherLake) => ("xe/ptl_guc_70.bin", (70, 54, 0)),
             Self::WildcatLake => ("xe/ptl_guc_70.bin", (70, 54, 0)),
+            Self::NovaLakeS => ("xe/nvl_guc_70.bin", (70, 55, 4)),
             _ => return None,
         };
         Some(GuCProfile {
@@ -391,6 +415,12 @@ mod tests {
                 "xe/ptl_guc_70.bin",
                 (70, 54, 0),
             ),
+            (
+                0xd740,
+                GtPlatform::NovaLakeS,
+                "xe/nvl_guc_70.bin",
+                (70, 55, 4),
+            ),
         ] {
             if GtPlatform::from_pci(0x8086, device) != Some(platform)
                 || platform.guc().map(|p| (p.firmware, p.minimum_version)) != Some((name, version))
@@ -410,6 +440,7 @@ mod tests {
             || BMG_IDS.len() != 13
             || PTL_IDS.len() != 12
             || WCL_IDS.len() != 2
+            || NVLS_IDS.len() != 6
         {
             return TestResult::Fail("unsupported GT or approximate PCI range admitted");
         }
@@ -446,6 +477,34 @@ mod tests {
             {
                 return TestResult::Fail("WCL graphics GMD boundary");
             }
+        }
+        for version in [3003, 3004, 3005] {
+            let raw = (version / 100) << 22 | (version % 100) << 14 | 3;
+            if GraphicsIp::read(&FixedMmio(raw), GtPlatform::NovaLakeS)
+                != Ok(GraphicsIp {
+                    version: version as u16,
+                    step: 3,
+                })
+            {
+                return TestResult::Fail("NVL-S graphics GMD profile");
+            }
+        }
+        for version in [3002, 3511] {
+            let raw = (version / 100) << 22 | (version % 100) << 14;
+            if GraphicsIp::read(&FixedMmio(raw), GtPlatform::NovaLakeS)
+                != Err(GraphicsError::Unsupported)
+            {
+                return TestResult::Fail("NVL-S graphics GMD boundary");
+            }
+        }
+        let nvl = GtPlatform::NovaLakeS;
+        if nvl.is_ptl()
+            || !nvl.is_xe3_lpg()
+            || !nvl.is_headless_integrated()
+            || nvl.has_ptl_display_route()
+            || !GtPlatform::WildcatLake.is_ptl()
+        {
+            return TestResult::Fail("NVL-S Xe3 mechanics leaked PTL-only policy");
         }
         TestResult::Pass
     }

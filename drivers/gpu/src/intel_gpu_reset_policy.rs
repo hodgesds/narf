@@ -199,7 +199,8 @@ impl ResetPolicy {
                         add(0xe420, mcr | 1);
                     }
                 }
-                GtPlatform::WildcatLake
+                GtPlatform::NovaLakeS
+                | GtPlatform::WildcatLake
                 | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => {
                     for offset in [0xe194, 0xe4c4, 0xe4f0, 0xe5f4] {
                         add(offset, mcr | 1);

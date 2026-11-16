@@ -250,7 +250,7 @@ pub(crate) fn ptl_profile(
     if !platform.is_headless_integrated() {
         return None;
     }
-    match (ptl_display, platform.is_ptl() && has_mode) {
+    match (ptl_display, platform.has_ptl_display_route() && has_mode) {
         (false, _) => Some(LnlProfile::Headless),
         (true, true) => Some(LnlProfile::DisplayPreserving),
         (true, false) => None,

@@ -105,6 +105,7 @@ impl EnginePolicy {
             }),
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
+            | GtPlatform::NovaLakeS
             | GtPlatform::Integrated(
                 crate::intel_gpu::Generation::MeteorLake
                 | crate::intel_gpu::Generation::LunarLake
@@ -112,7 +113,7 @@ impl EnginePolicy {
             ) => Ok(Self {
                 engines,
                 gen12: false,
-                ptl: platform.is_ptl(),
+                ptl: platform.is_xe3_lpg(),
                 lnl_pre_b0: platform.is_lnl() && step < 4,
                 media_gt: false,
             }),

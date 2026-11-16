@@ -285,6 +285,7 @@ pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
         _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
         GtPlatform::WildcatLake => matches!(pat, 1 | 2 | 4 | 5 | 7),
+        GtPlatform::NovaLakeS => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
     }
 }

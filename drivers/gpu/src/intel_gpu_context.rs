@@ -95,7 +95,7 @@ impl ContextSeed {
         if per_group == 0 || per_group > 32 {
             return Err(ContextError::Hwconfig);
         }
-        if platform.is_ptl() {
+        if platform.is_xe3_lpg() {
             // Source says modern GuC must supply physical-layout maxima.
             // Refuse missing values and any live DSS whose exact selector
             // would overflow the source four-bit group/instance fields.
@@ -189,7 +189,7 @@ impl ContextSeed {
                 (0x731c, 0x40004000), // 16013271637
                 (0x83a4, 0xffff4000), // 14014947963
             ],
-            _ if self.platform.is_ptl() => {
+            _ if self.platform.is_xe3_lpg() => {
                 let mut entries = vec![
                     (0x6208, 0x00200020),
                     (0x7300, 0x10001000),
@@ -242,13 +242,13 @@ impl ContextSeed {
             words.extend_from_slice(&[reg, value]);
         }
         if self.platform.is_lnl()
-            || (self.platform.is_ptl() && self.graphics == 3000 && self.step < 4)
+            || (self.platform.is_xe3_lpg() && self.graphics == 3000 && self.step < 4)
         {
             rmw(&mut words, 0x6210, 0x18000, 0x18000, self.dss);
         } else if self.graphics == 2001 {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
-        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_ptl() {
+        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_xe3_lpg() {
             if self.platform == GtPlatform::Alchemist {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
@@ -260,7 +260,11 @@ impl ContextSeed {
         ]);
         // Wa_14019789679 also covers Xe-LPG and Xe2. Omitted headers
         // otherwise let a later context inherit the previous context's state.
-        for &(subopcode, size) in if self.platform.is_ptl() { &[][..] } else { SVG } {
+        for &(subopcode, size) in if self.platform.is_xe3_lpg() {
+            &[][..]
+        } else {
+            SVG
+        } {
             let opcode = if self.graphics >= 2000 && subopcode == 0x100 {
                 0 // Xe2 replaces DRAWING_RECTANGLE with pipelined _FAST.
             } else {

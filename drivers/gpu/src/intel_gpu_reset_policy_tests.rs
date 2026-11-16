@@ -69,7 +69,8 @@ fn expected_saves(
             (0xe7c8, 0),
             (0xe7cc, 0),
         ],
-        GtPlatform::WildcatLake
+        GtPlatform::NovaLakeS
+        | GtPlatform::WildcatLake
         | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake)
             if release == 0 && step < 4 =>
         &[
@@ -81,7 +82,8 @@ fn expected_saves(
             (0xe530, 0),
             (0xe5f4, 1),
         ],
-        GtPlatform::WildcatLake
+        GtPlatform::NovaLakeS
+        | GtPlatform::WildcatLake
         | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => &[
             (0xe194, 1),
             (0xe4c4, 1),

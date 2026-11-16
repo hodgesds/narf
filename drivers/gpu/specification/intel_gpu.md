@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.63** (v0.62 plus a distinct Wildcat Lake GT profile admitting
+> Status: **v0.64** (v0.63 plus exact Nova Lake-S headless GT/GuC/media
+> identity and exact fail-closed Crescent Island discovery; a distinct Wildcat Lake GT profile admitting
 > exact graphics 30.03-30.05 and media 30.02 while display 30.02 remains
 > fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
 > display-idle and cache-policy profile; DG1 display programming and local-
@@ -227,6 +228,7 @@ registration and class backstop rules apply.
 | arrowlake (Xe-LPG) | 7D41, 7D51, 7D67, 7DD1, B640 |
 | pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0B0 |
 | wildcatlake (Xe3-LPG; display 30.02 gated) | FD80, FD81 |
+| novalake-s (Xe3-LPG; display 35.00 gated) | D740, D741, D742, D743, D744, D745 |
 
 Note: pci.ids labels 46B0/46B1/46B3 as AlderLake-P silicon; the
 driver has always classified them `raptorlake-p` and the census
@@ -266,6 +268,21 @@ them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
 30.03/30.04/30.05 and media 30.02, applies the source Xe3 policy without PTL's
 graphics-30.00 A0 workaround, and skips the media-30.00-only GGTT dummy-write
 workaround. Display 30.02 remains a typed refusal pending its separate policy.
+
+Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
+distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
+MOCS table, display/media 35.00, and `xe/nvl_guc_70.bin` exactly at 70.55.4 or
+newer. `GtPlatform::NovaLakeS` retains that firmware identity and admits the
+source graphics-GMD set 30.03/30.04/30.05 plus media 35.00 on the driver-FLR
+headless route. It never enters the display-30 route; display 35.00 remains
+gated until its clock/PHY/modeset policy is qualified.
+
+Crescent Island ID 674C is exact `INTEL_CRI_IDS` and uses an exact PCI-device
+registration because Linux does not classify it as VGA. Linux describes its
+discrete DMA52, VA57, root4, non-flat-CCS Xe3p_XPC profile, but the current
+`xe_uc_fw.c` manifest has no `CRESCENTISLAND` GuC entry. NARF therefore
+announces the exact identity and refuses before D-state, BAR, command or MMIO
+effects. It is not aliased to NVL-S firmware or BMG memory policy.
 
 Arrow Lake (#1023): the five IDs classify
 `Generation::MeteorLake` under `asic: "arrowlake"` — the table

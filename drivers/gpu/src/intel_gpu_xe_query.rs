@@ -198,7 +198,7 @@ fn query_wire(
             if crate::intel_gpu_xe::low_latency_supported(info) {
                 config_flags |= crate::intel_gpu_xe_uapi::QUERY_CONFIG_HAS_LOW_LATENCY;
             }
-            if info.platform.is_xe2() && !info.platform.is_ptl() {
+            if info.platform.is_xe2() && !info.platform.is_xe3_lpg() {
                 config_flags |= 8;
             }
             if info.vram.is_some() {
@@ -268,7 +268,7 @@ fn query_wire(
                 .filter(|t| t.platform() == info.platform)
                 .ok_or(FsError::NoDevice)?;
             let mut reply = Vec::new();
-            let width = if info.platform.is_ptl() { 12 } else { 4 };
+            let width = if info.platform.is_xe3_lpg() { 12 } else { 4 };
             let mut masks = vec![
                 (
                     0u16,

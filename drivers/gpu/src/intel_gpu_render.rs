@@ -1475,7 +1475,7 @@ impl RenderFile {
             _ => return Err(FsError::InvalidData),
         }
         let topology = observed_topology(info)?;
-        if info.platform.is_ptl() {
+        if info.platform.is_xe3_lpg() {
             return Err(FsError::NoDevice);
         }
         let eus = match topology.eu_type() {

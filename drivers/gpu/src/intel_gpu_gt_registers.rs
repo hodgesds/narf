@@ -519,7 +519,7 @@ impl RegisterInit {
         let mut last = None;
         let mut discontiguous = false;
         let live = topology.geometry_dss() | topology.compute_dss();
-        for i in 0..if platform.is_ptl() { 96 } else { 32 } {
+        for i in 0..if platform.is_xe3_lpg() { 96 } else { 32 } {
             if live & (1u128 << i) == 0 {
                 continue;
             }
@@ -910,7 +910,8 @@ impl RegisterInit {
                     }); // Wa_14012342262 forbids readback
                 }
             }
-            GtPlatform::WildcatLake
+            GtPlatform::NovaLakeS
+            | GtPlatform::WildcatLake
             | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => {
                 // PTL GT lifetime (not hwe.reg_sr / ADS).
                 if self.seed.graphics == 3000 && self.seed.step < 4 {

@@ -1813,7 +1813,8 @@ DG2 (25) and BMG (13) PCI IDs. Every census is exact (never a numeric range)
 and includes every currently qualified TGL/ADL variant from Linux
 `include/drm/intel/pciids.h`, including TGL 9A59/9AC0/9AC9/9AD9/9AF8 and
 ADL 46A2/46B2/46C2, plus the six exact RKL IDs
-4C80/4C8A/4C8B/4C8C/4C90/4C9A and WCL FD80/FD81. Every row must resolve to a qualified `guc()` profile in
+4C80/4C8A/4C8B/4C8C/4C90/4C9A, WCL FD80/FD81 and NVL-S
+D740/D741/D742/D743/D744/D745. Every row must resolve to a qualified `guc()` profile in
 the native census fixture. Initial probe first parks decode/mastering, returns
 the function to D0 and restores BARs lost across D3hot; only the selected
 generation path then enables memory and DMA. `guc()` selects the exact TGL,
@@ -1835,6 +1836,15 @@ product identity in the canonical census and its GT policy in the distinct
 30.03/30.04/30.05 and media 30.02. WCL skips the media-30.00-only GGTT dummy
 write and PTL graphics-30.00 A0 workarounds; display 30.02 still refuses before
 takeover.
+NVL-S has a distinct `GtPlatform::NovaLakeS`, `xe/nvl_guc_70.bin` >=70.55.4,
+DMA46/root4/VA48 and source Xe2 cache policy. Its live identity admits only
+graphics 30.03/30.04/30.05 and media 35.00; display 35.00 remains on the
+headless driver-FLR route and is never treated as PTL display 30.00.
+The exact CRI 674C PCI-device ID is registered separately and announced, but
+refuses before D-state/BAR/command/MMIO effects: Linux describes DMA52, VA57,
+root4, non-flat CCS and graphics 35.11/media 35.03, while its current GuC
+firmware table contains no `CRESCENTISLAND` entry. No other family's firmware
+or memory policy is substituted.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This
@@ -3210,7 +3220,7 @@ writing any GGTT entry. Legacy PPGTT attachment rejects roots outside that
 limit before patching its retained context image. A qualified DG2 arena keeps
 its distinct 46-bit DMA limit; the shared wire codec is not platform proof.
 
-### Intel headless LNL/PTL/WCL main-GT execution
+### Intel headless LNL/PTL/WCL/NVL-S main-GT execution
 
 LNL accepts only PCI 6420/64a0/64b0, observed graphics 20.04/media 20.00 and
 `xe/lnl_guc_70.bin` 70.53.0+. PTL accepts only PCI
@@ -3220,6 +3230,9 @@ WCL IDs fd80/fd81 select that same Linux PTL descriptor and firmware profile,
 but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
 media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
 still refuses pending its separate display policy.
+NVL-S accepts only PCI d740-d745, graphics 30.03/30.04/30.05, media 35.00 and
+`xe/nvl_guc_70.bin` 70.55.4+. Its display 35.00 identity is checked only as a
+post-FLR refusal proof; it has no display-preserving route.
 These integrated profiles use DMA46, default 2 MiB WOPCM and source-selected
 five-level PPGTT root4 with a 48-bit VA ceiling. Existing constructors retain
 root3; explicit root4 requires the Xe2 encoding. Only programmed uncompressed
@@ -3242,7 +3255,8 @@ and cache proofs replace every pre-reset observation. Secondary display-status
 checks are refusal probes, not substitutes for whole-display reset retirement.
 
 The retained media proof covers all arena mapping/invalidation writes. Source
-63-PTE media-GMD dummy-write ordering applies to LNL and pre-B0 media 30.00 PTL.
+63-PTE media-GMD dummy-write ordering applies to LNL and pre-B0 media 30.00 PTL;
+WCL media 30.02 and NVL-S media 35.00 do not receive that workaround.
 `BootAllocator::retire_ggtt` defaults to refusal; successful sealing invalidates
 all tracked ranges before media wake release. Later backing drops issue no
 MMIO. Unknown or failed retirement retains pages, ranges and wake ownership.

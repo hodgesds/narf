@@ -186,6 +186,20 @@ pub const PTL_B0B0: u16 = 0xB0B0;
 pub const WCL_FD80: u16 = 0xFD80;
 pub const WCL_FD81: u16 = 0xFD81;
 
+// Nova Lake-S. Linux gives this family a distinct descriptor and GuC image;
+// display 35.00 remains on the headless route until its modeset is qualified.
+pub const NVLS_D740: u16 = 0xD740;
+pub const NVLS_D741: u16 = 0xD741;
+pub const NVLS_D742: u16 = 0xD742;
+pub const NVLS_D743: u16 = 0xD743;
+pub const NVLS_D744: u16 = 0xD744;
+pub const NVLS_D745: u16 = 0xD745;
+
+// Crescent Island is source-known but execution remains gated: the current
+// Linux xe firmware manifest has no CRESCENTISLAND GuC entry.
+pub const CRI_674C: u16 = 0x674C;
+pub(crate) const CRI_IDS: &[u16] = &[CRI_674C];
+
 // ── Generation classifier ────────────────────────────────────────
 
 /// Gen12 sub-architecture identifier. Tiger Lake / Alder Lake /
@@ -907,7 +921,49 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         generation: Generation::PantherLake,
         asic: "wildcatlake",
     },
+    // Nova Lake-S retains the broad post-Xe2 display-generation gate here;
+    // GtPlatform carries its distinct GT, firmware and live-GMD identity.
+    DeviceEntry {
+        name: "intel-gpu-nvls-D740",
+        did: NVLS_D740,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D741",
+        did: NVLS_D741,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D742",
+        did: NVLS_D742,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D743",
+        did: NVLS_D743,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D744",
+        did: NVLS_D744,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D745",
+        did: NVLS_D745,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
 ];
+
+pub(crate) fn source_known_unqualified(did: u16) -> bool {
+    CRI_IDS.contains(&did)
+}
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != INTEL_VENDOR {
@@ -1361,6 +1417,13 @@ const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != INTEL_VENDOR {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    if source_known_unqualified(device.id.device) {
+        log_probe(
+            "recognized Crescent Island — GuC firmware profile absent; execution gated",
+            &device,
+        );
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     // Normalize every admitted Intel graphics function before any route
@@ -2064,6 +2127,7 @@ pub fn register_pci_driver() {
         ("intel-gpu-dg1", crate::intel_gpu_gt::DG1_IDS),
         ("intel-gpu-dg2", crate::intel_gpu_gt::DG2_IDS),
         ("intel-gpu-bmg", crate::intel_gpu_gt::BMG_IDS),
+        ("intel-gpu-cri-gated", CRI_IDS),
     ] {
         for &device in ids {
             narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -3618,6 +3682,12 @@ pub mod tests {
             (0xB0B0, "pantherlake"),
             (0xFD80, "wildcatlake"),
             (0xFD81, "wildcatlake"),
+            (0xD740, "novalake-s"),
+            (0xD741, "novalake-s"),
+            (0xD742, "novalake-s"),
+            (0xD743, "novalake-s"),
+            (0xD744, "novalake-s"),
+            (0xD745, "novalake-s"),
         ];
         if DEVICE_TABLE.len() != EXPECTED.len() {
             return TestResult::Fail("device table size drifted from the spec §5 census");
@@ -3662,7 +3732,9 @@ pub mod tests {
         }
         // Exact IDs only: nearby values outside Linux's family macros must
         // not bleed into a platform profile through an approximate range.
-        for did in [0x9A5Au16, 0x9ACA, 0x4C81, 0x46A4, 0x46B4, 0x46C4, 0xFD82] {
+        for did in [
+            0x9A5Au16, 0x9ACA, 0x4C81, 0x46A4, 0x46B4, 0x46C4, 0xFD82, 0xD746,
+        ] {
             if chip_info_for_pci_id(INTEL_VENDOR, did).is_some() {
                 return TestResult::Fail("unlisted DID present in table");
             }
@@ -3670,6 +3742,22 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_unknown_ids_do_not_classify);
+
+    fn smoke_crescent_island_identity_is_exact_and_fail_closed() -> TestResult {
+        if !source_known_unqualified(CRI_674C)
+            || source_known_unqualified(0x674b)
+            || source_known_unqualified(0x674d)
+            || chip_info_for_pci_id(INTEL_VENDOR, CRI_674C).is_some()
+            || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, CRI_674C).is_some()
+        {
+            return TestResult::Fail("Crescent Island fail-closed identity boundary");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_crescent_island_identity_is_exact_and_fail_closed
+    );
 
     fn smoke_headless_gt_requires_every_display_fetcher_stopped() -> TestResult {
         use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};

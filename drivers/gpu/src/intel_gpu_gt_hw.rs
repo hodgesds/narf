@@ -748,7 +748,10 @@ impl HardwareInit {
                 }
                 0
             }
-            GtPlatform::Battlemage | GtPlatform::WildcatLake | GtPlatform::Integrated(_) => {
+            GtPlatform::Battlemage
+            | GtPlatform::WildcatLake
+            | GtPlatform::NovaLakeS
+            | GtPlatform::Integrated(_) => {
                 mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
                 if self.platform.is_headless_integrated() {
                     mmio.write32(0x480c, 0x3c);

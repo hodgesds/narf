@@ -154,6 +154,7 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> 
         }
         GtPlatform::Battlemage => ((fuse4 >> 16) & 0xf) as u8,
         GtPlatform::WildcatLake => ((fuse4 >> 16) & 0xf) as u8,
+        GtPlatform::NovaLakeS => ((fuse4 >> 16) & 0xf) as u8,
     }
 }
 
@@ -453,6 +454,7 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
         GtPlatform::Alchemist => 1,
         GtPlatform::Battlemage => 3,
         GtPlatform::WildcatLake => 3,
+        GtPlatform::NovaLakeS => 3,
     }
 }
 

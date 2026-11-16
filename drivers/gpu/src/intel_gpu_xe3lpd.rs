@@ -175,7 +175,7 @@ pub(crate) fn probe_route(
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> bool {
     let ptl = crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-        .is_some_and(|p| p.is_ptl());
+        .is_some_and(|p| p.has_ptl_display_route());
     if !ptl || !requested(narf_boot::args()) {
         return false;
     }

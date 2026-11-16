@@ -193,7 +193,7 @@ impl Receipt {
             || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
                 .is_some_and(|p| match ip {
                     DisplayIp::Xe2Lpd => p.is_lnl(),
-                    DisplayIp::Xe3Lpd => p.is_ptl(),
+                    DisplayIp::Xe3Lpd => p.has_ptl_display_route(),
                     DisplayIp::Xelpdp => false,
                 })
             || bar.phys.raw() == 0
@@ -468,7 +468,7 @@ impl MediaProof {
         // Wa22019338487: media20.00 all steps; media30.00 A0 only.
         // The immutable GMD was captured under the retained media wake.
         let version = (self.gmd >> 22) * 100 + ((self.gmd >> 14) & 255);
-        if version == 1301 || version == 3002 || version == 3000 && self.gmd & 63 >= 4 {
+        if matches!(version, 1301 | 3002 | 3500 | 3503) || version == 3000 && self.gmd & 63 >= 4 {
             return Ok(());
         }
         let next = count.get() + 1;
@@ -493,7 +493,9 @@ pub(crate) struct MediaQuiesce {
 impl MediaQuiesce {
     pub(crate) fn for_platform(platform: crate::intel_gpu_gt::GtPlatform) -> Self {
         let mut state = Self::new();
-        state.expected = if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+        state.expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
+            3500
+        } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
             3002
         } else if platform.is_ptl() {
             3000
@@ -633,7 +635,9 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
     }
     let platform =
         crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, device).ok_or(Error::Unsupported)?;
-    let expected = if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+    let expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
+        3500
+    } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
         3002
     } else if platform.is_ptl() {
         3000
@@ -1277,5 +1281,60 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_wcl_distinct_graphics_media_and_display_identity
+    );
+    fn smoke_nvls_distinct_firmware_media_and_display_identity() -> TestResult {
+        let platform = crate::intel_gpu_gt::GtPlatform::NovaLakeS;
+        for id in [0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745] {
+            assert_eq!(
+                crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
+                Some(platform)
+            );
+        }
+        let profile = platform.guc().unwrap();
+        assert_eq!(
+            (profile.firmware, profile.minimum_version),
+            ("xe/nvl_guc_70.bin", (70, 55, 4))
+        );
+
+        let m = Registers::new();
+        m.set(0x380d8c, media_version(3500));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert_eq!(media.expected, 3500);
+        assert!(media.poll(&m, 0).is_pending());
+        m.set(0x380dfc, 1);
+        assert!(media.poll(&m, 1).is_pending());
+        m.set(0x38941c, 0);
+        m.set(0x38c000, 1);
+        assert!(media.poll(&m, 2).is_pending());
+        m.set(0x38941c, 0);
+        let Poll::Ready(Ok(proof)) = media.poll(&m, 3) else {
+            panic!("NVL-S media 35.00 proof")
+        };
+        let count = Cell::new(0);
+        for _ in 0..126 {
+            proof.after_pte(&m, &count).unwrap();
+        }
+        assert_eq!(count.get(), 0);
+        assert!(m
+            .writes
+            .borrow()
+            .iter()
+            .all(|(register, _)| *register != 0x380d8c));
+
+        let display = Registers::new();
+        display.set(0x10100c, 1 << 9);
+        display.set(0x510a0, media_version(3500));
+        display.set(0x42000, 0x0c000000);
+        assert_eq!(
+            post_flr_display(&display, 0xd740),
+            Ok(Some(media_version(3500)))
+        );
+        display.set(0x510a0, media_version(3002));
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Unsupported));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_nvls_distinct_firmware_media_and_display_identity
     );
 }

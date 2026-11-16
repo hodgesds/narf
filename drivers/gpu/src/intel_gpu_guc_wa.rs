@@ -45,6 +45,7 @@ impl GuCWorkarounds {
             }
             _ if platform.is_ptl() => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
             GtPlatform::WildcatLake => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
+            GtPlatform::NovaLakeS => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
             _ if platform.is_lnl() => (
                 0,
                 &[
