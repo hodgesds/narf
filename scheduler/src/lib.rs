@@ -351,6 +351,8 @@ impl ParkedTasks {
         }
         self.slots[index].task = Some(entry);
         self.len += 1;
+        // Maintained parked count (issue #2134): balances `take`/`clear`.
+        PARKED_TASKS.fetch_add(1, Ordering::Relaxed);
         index
     }
 
@@ -378,6 +380,8 @@ impl ParkedTasks {
         entry.next_free = self.free;
         self.free = Some(index);
         self.len -= 1;
+        // Maintained parked count (issue #2134): balances `insert`.
+        PARKED_TASKS.fetch_sub(1, Ordering::Relaxed);
         // Stable while parked: only the task itself changes it, when it runs.
         if task.slot.awake.idle_worker.load(Ordering::Acquire) {
             self.idle_workers -= 1;
@@ -407,6 +411,9 @@ impl ParkedTasks {
     }
 
     fn clear(&mut self) {
+        // Maintained parked count (issue #2134): every live entry below
+        // is dropped, so subtract the whole count once at the end.
+        let parked = self.len;
         for entry in self.slots.iter_mut() {
             if let Some(task) = entry.task.take() {
                 let token = task
@@ -420,6 +427,7 @@ impl ParkedTasks {
         self.slots.clear();
         self.free = None;
         self.len = 0;
+        PARKED_TASKS.fetch_sub(parked, Ordering::Relaxed);
         self.idle_workers = 0;
         self.capped.clear();
     }
@@ -539,6 +547,23 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Live user-task count (processes + threads) for the fork-bomb guard.
 static LIVE_USER_TASKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Live `TaskSlot` count (every kernel + user task), maintained by the
+/// three `TaskSlot` construction sites (`spawn_with_spec_in_domain`,
+/// `spawn_realtime_with_options`, `spawn_user`) and `Drop for TaskSlot`
+/// — the O(1) source for `/proc/stat`'s `processes` and `/proc/loadavg`'s
+/// total, replacing the per-read `all_task_ids()` enumeration (issue
+/// #2134). Diagnostic only: no scheduling decision reads this counter,
+/// so a transient miscount could only skew `/proc` numbers, never
+/// dispatch, preemption, affinity, budgets, or domain transitions.
+static TOTAL_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Live parked-slot count (tasks sitting in a per-CPU PARKED map),
+/// maintained by `ParkedTasks::insert` / `take` / `clear` — the O(1)
+/// counterpart to `TOTAL_TASKS`. `TOTAL_TASKS - PARKED_TASKS` is the
+/// runnable-or-running count (Linux `nr_running` analogue) that
+/// `/proc/loadavg` and `/proc/stat` render without scanning queues.
+static PARKED_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Hard cap on concurrent user tasks. `fork`/`clone` return `EAGAIN` at the
 /// cap, containing a fork bomb before it exhausts kernel memory and the
@@ -693,6 +718,10 @@ pub fn transfer_task_cap(
 
 impl Drop for TaskSlot {
     fn drop(&mut self) {
+        // Maintained live-task count (issue #2134): balances the
+        // construction-site increment. The slot's final drop is the
+        // one place every task lifetime ends, whatever removal path ran.
+        TOTAL_TASKS.fetch_sub(1, Ordering::Relaxed);
         // The task's user reference, unless its exit already gave it up
         // (`exit_mm`). The registry entry, not `addr_space`, is the one
         // `scheduler_attach_user_task` paired with: an exec moves it at once,
@@ -728,6 +757,35 @@ impl Drop for TaskSlot {
 /// Current number of live user tasks (processes + threads).
 pub fn live_user_task_count() -> usize {
     LIVE_USER_TASKS.load(Ordering::Relaxed)
+}
+
+/// Current number of live scheduler tasks (kernel + user). O(1)
+/// maintained count (issue #2134) — the `/proc/stat` `processes` and
+/// `/proc/loadavg` total source. Counts every live `TaskSlot`, including
+/// one currently being polled by an executor (which no queue scan can
+/// see); that makes it exact where `all_task_ids().len()` is only a
+/// transient snapshot, and it never locks a queue or allocates.
+pub fn total_task_count() -> usize {
+    TOTAL_TASKS.load(Ordering::Relaxed)
+}
+
+/// Current number of live tasks sitting in a per-CPU PARKED map. O(1)
+/// maintained count (issue #2134).
+pub fn parked_task_count() -> usize {
+    PARKED_TASKS.load(Ordering::Relaxed)
+}
+
+/// Runnable-or-running task count: live tasks NOT parked — READY queues
+/// + wake inboxes + tasks currently being polled. O(1) maintained
+///   counts (issue #2134); the `/proc/loadavg` R field, the loadavg EWMA
+///   sample, and `/proc/stat` `procs_running` source. This is Linux's
+///   `nr_running` analogue: it counts budget-throttled READY slots and
+///   the currently-running task, where [`runnable_task_count`] counts
+///   only dispatchable READY slots. The stall watchdog keeps the exact
+///   dispatchable scan; `/proc` takes this cheaper value because a
+///   throttled-or-running task is still load from a monitor's view.
+pub fn unparked_task_count() -> usize {
+    total_task_count().saturating_sub(parked_task_count())
 }
 
 /// Whether another user task may be spawned under [`MAX_USER_TASKS`]. `fork`
@@ -4853,6 +4911,9 @@ where
         nproc_guard: None,
         vruntime: 0,
     };
+    // Maintained live-task count (issue #2134): balances `Drop for
+    // TaskSlot`.
+    TOTAL_TASKS.fetch_add(1, Ordering::Relaxed);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
 }
@@ -4922,6 +4983,9 @@ where
         nproc_guard: None,
         vruntime: 0,
     };
+    // Maintained live-task count (issue #2134): balances `Drop for
+    // TaskSlot`.
+    TOTAL_TASKS.fetch_add(1, Ordering::Relaxed);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     Ok(id)
 }
@@ -5211,6 +5275,9 @@ where
         nproc_guard: Some(NprocGuard::new()),
         vruntime: 0,
     };
+    // Maintained live-task count (issue #2134): balances `Drop for
+    // TaskSlot`.
+    TOTAL_TASKS.fetch_add(1, Ordering::Relaxed);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
 }
@@ -7947,12 +8014,19 @@ pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
     out
 }
 
-/// Count of RUNNABLE tasks across online CPUs. Sleeping tasks live in the
-/// separate parked maps and therefore do not inflate this value. The
-/// /proc/loadavg sample source: Linux's calc_load counts running +
-/// uninterruptible, and dispatchable-in-queue is NARF's equivalent. try_lock
-/// like the stall watchdog — a contended queue is skipped for one
-/// sample rather than deadlocking a procfs read against the executor.
+/// Count of RUNNABLE tasks across online CPUs — the exact dispatchable
+/// scan: only READY slots whose waker flag is set and whose budget is
+/// not throttled. Sleeping tasks live in the separate parked maps and
+/// therefore do not inflate this value. try_lock like the stall
+/// watchdog — a contended queue is skipped for one sample rather than
+/// deadlocking the caller against the executor.
+///
+/// Retained for the stall watchdog, which needs the precise
+/// "dispatchable work stranded" notion. `/proc` does NOT use this:
+/// `/proc/loadavg` and `/proc/stat` read [`unparked_task_count`]
+/// instead, because scanning every READY queue on each procfs read is
+/// the O(tasks) cost issue #2134 removes (and a throttled-or-running
+/// task is still load from a monitor's view).
 pub fn runnable_task_count() -> usize {
     let mut n = 0;
     for (cpu, ready) in READY.iter().enumerate().take(narf_lib::percpu::MAX_CPUS) {

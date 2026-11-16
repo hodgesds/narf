@@ -3280,11 +3280,16 @@ pub fn loadavg_sysinfo_fixed16() -> (u64, u64, u64) {
 /// in FIXED_1 units.  Called on every `/proc/loadavg` read.
 fn loadavg_update() -> (u64, u64, u64) {
     let now_ns = narf_time::monotonic_ns();
-    // Instantaneous RUNNABLE count — awake ready-queue slots, NOT the
-    // full live-task list (which counts every parked getty/daemon and
-    // pinned the rendered load at the task count — the alpine probe
-    // read a flat "14.00 14.00 14.00").
-    let runnable = narf_scheduler::runnable_task_count() as u64;
+    // Instantaneous RUNNABLE count — live tasks NOT parked (READY +
+    // wake inbox + currently polling), NOT the full live-task list
+    // (which counts every parked getty/daemon and pinned the rendered
+    // load at the task count — the alpine probe read a flat
+    // "14.00 14.00 14.00"). O(1) maintained counts (issue #2134): the
+    // old `runnable_task_count()` scan locked every READY queue and
+    // walked every slot on each read. The sample is Linux's `nr_running`
+    // analogue — a throttled READY slot or the running task still counts
+    // as load.
+    let runnable = narf_scheduler::unparked_task_count() as u64;
 
     let mut last_ns = LOADAVG_LAST_NS.lock();
     let mut avg1 = LOADAVG_AVG1.lock();
@@ -3340,15 +3345,15 @@ fn gen_loadavg() -> String {
     let (i1, f1) = fmt_avg(a1);
     let (i5, f5) = fmt_avg(a5);
     let (i15, f15) = fmt_avg(a15);
-    let total = narf_scheduler::all_task_ids().len();
+    let total = narf_scheduler::total_task_count();
     // Floor at 1 — the reading process itself is running (Linux never
-    // renders 0/T), and a momentarily all-contended try_lock sample
-    // would otherwise show 0.
-    let running = narf_scheduler::runnable_task_count().max(1);
-    // Linux reports the most recently allocated PID, not the live-task
-    // count. NARF does not yet retain a high-water mark, so the greatest
-    // currently visible PID is the closest non-fabricated approximation.
-    let last_pid = list_pids().into_iter().max().unwrap_or(0);
+    // renders 0/T).
+    let running = narf_scheduler::unparked_task_count().max(1);
+    // Linux reports the most recently allocated PID. `ns_last_pid` is
+    // exactly that value (the pid allocator's cursor minus one), read
+    // O(1) through the installed sysctl hook; 0 before the hooks land.
+    // The previous `list_pids().max()` enumeration is gone (issue #2134).
+    let last_pid = sys_kernel::ns_last_pid_value().max(0) as u64;
     format!(
         "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
         i1, f1, i5, f5, i15, f15, running, total, last_pid
@@ -3382,7 +3387,6 @@ fn gen_stat() -> String {
     let up_ns = narf_time::monotonic_ns();
     // USER_HZ = 100 → jiffies are centiseconds.
     let elapsed = up_ns / 10_000_000;
-    let depths = narf_scheduler::cpu_queue_depths();
     // Per-CPU lines with REAL idle time — the scheduler folds each
     // CPU's actual sleep (HLT / idle pump) into a per-cpu counter
     // (`narf_scheduler::cpu_idle_ns`) — and busy derived as
@@ -3392,17 +3396,24 @@ fn gen_stat() -> String {
     // is reported in the steal column and excluded from busy, so a
     // preempted vCPU no longer inflates `user` (issue #660).
     // Columns: user nice system idle iowait irq softirq steal guest gnice.
+    // Online CPUs via the SMP bitmap — no queue locks (issue #2134:
+    // `cpu_queue_depths()` locked every READY queue per read). The
+    // per-CPU lines need only the cpu id plus the O(1) idle/steal
+    // counters, never a queue depth.
     let mut busy_sum: u64 = 0;
     let mut idle_sum: u64 = 0;
     let mut steal_sum: u64 = 0;
     let mut cpu_lines = String::new();
-    for (cpu, _) in &depths {
-        let idle = (narf_scheduler::cpu_idle_ns(*cpu as usize) / 10_000_000).min(elapsed);
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        let idle = (narf_scheduler::cpu_idle_ns(cpu) / 10_000_000).min(elapsed);
         // Clamp steal to what idle does not already cover so
         // busy = elapsed − idle − steal can never go negative even if
         // the two counters are sampled at slightly different instants.
-        let steal = (narf_scheduler::cpu_steal_ns(*cpu as usize) / 10_000_000)
-            .min(elapsed.saturating_sub(idle));
+        let steal =
+            (narf_scheduler::cpu_steal_ns(cpu) / 10_000_000).min(elapsed.saturating_sub(idle));
         let busy = elapsed - idle - steal;
         busy_sum += busy;
         idle_sum += idle;
@@ -3434,9 +3445,10 @@ fn gen_stat() -> String {
     // btime = wall-now minus uptime (UNIX seconds the system booted).
     let btime = (narf_time::now_wall().secs as u64).saturating_sub(up_ns / 1_000_000_000);
     let _ = writeln!(s, "btime {}", btime);
-    let tasks = narf_scheduler::all_task_ids().len();
+    // O(1) maintained counts (issue #2134) — no queue scan, no Vec.
+    let tasks = narf_scheduler::total_task_count();
     let _ = writeln!(s, "processes {}", tasks);
-    let running: usize = depths.iter().map(|(_, n)| *n).sum();
+    let running = narf_scheduler::unparked_task_count();
     let _ = writeln!(s, "procs_running {}", running.max(1));
     let _ = writeln!(s, "procs_blocked 0");
     // HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU.
@@ -3444,18 +3456,23 @@ fn gen_stat() -> String {
     s
 }
 
+/// NARF debug surface (not a Linux file): scheduler totals. Was
+/// per-CPU ready depths via `cpu_queue_depths()`; now O(1) maintained
+/// counts (issue #2134). No per-CPU ready breakdown is kept — no
+/// maintained per-CPU depth exists, and the file has no consumer that
+/// parses it.
 fn gen_sched() -> String {
     use core::fmt::Write as _;
     let mut s = String::new();
-    let tasks = narf_scheduler::all_task_ids().len();
-    let depths = narf_scheduler::cpu_queue_depths();
-    let online = depths.len();
+    let online = narf_scheduler::online_cpu_set().bits().count_ones();
     let _ = writeln!(s, "online_cpus:\t{}", online);
-    let _ = writeln!(s, "total_tasks:\t{}", tasks);
-    let _ = writeln!(s, "per_cpu_ready:");
-    for (cpu, len) in depths {
-        let _ = writeln!(s, "  cpu{:<3} {:>6}", cpu, len);
-    }
+    let _ = writeln!(s, "total_tasks:\t{}", narf_scheduler::total_task_count());
+    let _ = writeln!(
+        s,
+        "runnable_tasks:\t{}",
+        narf_scheduler::unparked_task_count()
+    );
+    let _ = writeln!(s, "parked_tasks:\t{}", narf_scheduler::parked_task_count());
     s
 }
 
@@ -3481,10 +3498,15 @@ fn gen_uptime() -> String {
     let frac_centi = (now_ns / 10_000_000) % 100;
     // Linux's second field is the combined idle time of all CPUs, so it
     // legitimately grows faster than wall uptime on SMP systems.
-    let idle_ns: u64 = narf_scheduler::cpu_queue_depths()
-        .iter()
-        .map(|(cpu, _)| narf_scheduler::cpu_idle_ns(*cpu as usize))
-        .sum();
+    // O(1) per-CPU idle counters over the online bitmap (issue #2134) —
+    // no queue locks, where `cpu_queue_depths()` locked every READY
+    // queue per read.
+    let mut idle_ns: u64 = 0;
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if narf_lib::smp::is_online(cpu as u32) {
+            idle_ns += narf_scheduler::cpu_idle_ns(cpu);
+        }
+    }
     let idle_seconds = idle_ns / 1_000_000_000;
     let idle_frac_centi = (idle_ns / 10_000_000) % 100;
     format!(
@@ -4461,6 +4483,65 @@ fn smoke_stat_btime_positive() -> TestResult {
     TestResult::Fail("stat: btime line missing")
 }
 kernel_test_in!("filesystem/procfs", smoke_stat_btime_positive);
+
+/// `/proc/stat` and `/proc/loadavg` render the maintained O(1) task
+/// counters, not a queue enumeration (issue #2134): `processes` and the
+/// loadavg T field equal `total_task_count()`, `procs_running` and the
+/// R field equal `unparked_task_count()` (floored at 1). Counters are
+/// sampled immediately after each generator call; the harness runs
+/// tests one at a time with no churning background tasks, so exact
+/// equality is the expectation (same quiescence assumption as the
+/// scheduler's own spawn-count test).
+fn smoke_stat_and_loadavg_match_maintained_counts() -> TestResult {
+    let stat = gen_stat();
+    let total = narf_scheduler::total_task_count();
+    let runnable = narf_scheduler::unparked_task_count();
+    let mut processes: Option<usize> = None;
+    let mut procs_running: Option<usize> = None;
+    for line in stat.lines() {
+        if let Some(rest) = line.strip_prefix("processes ") {
+            processes = rest.trim().parse().ok();
+        }
+        if let Some(rest) = line.strip_prefix("procs_running ") {
+            procs_running = rest.trim().parse().ok();
+        }
+    }
+    match (processes, procs_running) {
+        (Some(p), Some(r)) if p == total && r == runnable.max(1) => {}
+        _ => {
+            return TestResult::Fail(
+                "stat processes/procs_running do not match maintained counters",
+            );
+        }
+    }
+    let loadavg = gen_loadavg();
+    let parts: Vec<&str> = loadavg.trim_end_matches('\n').split_whitespace().collect();
+    if parts.len() < 5 {
+        return TestResult::Fail("loadavg: fewer than 5 whitespace tokens");
+    }
+    let mut rt = parts[3].split('/');
+    let r: usize = match rt.next().and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return TestResult::Fail("loadavg: R is not an integer"),
+    };
+    let t: usize = match rt.next().and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return TestResult::Fail("loadavg: T is not an integer"),
+    };
+    if t != narf_scheduler::total_task_count() || r != narf_scheduler::unparked_task_count().max(1)
+    {
+        return TestResult::Fail("loadavg R/T do not match maintained counters");
+    }
+    // Last field parses as a pid (its value depends on hook installation).
+    if parts[4].parse::<u64>().is_err() {
+        return TestResult::Fail("loadavg: last_pid is not an integer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_stat_and_loadavg_match_maintained_counts
+);
 
 /// A minimal `ProcTaskInfo` for renderer tests: everything zeroed but the
 /// identity, so a case only has to set the fields it is actually about.
