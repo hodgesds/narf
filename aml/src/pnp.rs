@@ -1,4 +1,5 @@
-//! PnP device query: match devices by `_HID`, decode `_CRS` resources.
+//! PnP device query: match devices by `_HID`, filter by `_STA`,
+//! decode `_CRS` resources.
 //!
 //! The namespace builder already knows every `Device` node and its
 //! `_HID` (string or EISA-integer form) plus `_CRS` evaluation
@@ -7,14 +8,16 @@
 //! "give me every device with this HID and the I/O base + IRQ the
 //! firmware assigned it".
 //!
-//! Reference: ACPI 6.5 §5.6.7 (`_HID` / EISA IDs), §6.4 (`_CRS`
-//! resource templates). Linux consumer reference for the serial case:
-//! `drivers/tty/serial/8250/8250_acpi.c`.
-//!
-//! Known limitation: `_STA` is not consulted — a device whose `_STA`
-//! reports absent still appears. Linux's ACPI core skips such devices
-//! during enumeration; if a platform ever needs that filtering it
-//! belongs here, behind `_STA` evaluation, not in each consumer.
+//! Reference: ACPI 6.5 §5.6.7 (`_HID` / EISA IDs), §6.1 (`_STA`
+//! status; bit 0 = present — a device whose `_STA` reports the
+//! present bit clear is not enumerated), §6.4 (`_CRS` resource
+//! templates). Linux consumer reference for the serial case:
+//! `drivers/tty/serial/8250/8250_acpi.c`; Linux's ACPI core
+//! (`acpi_bus_get_status` / `acpi_bus_check_add`) likewise skips
+//! devices whose present bit is clear, and assumes a device with
+//! no `_STA` at all is present. `_STA` is evaluated via
+//! [`crate::prt_crs::evaluate_sta_for`] (`Method` returning an
+//! integer, or `Name` holding an integer).
 
 extern crate alloc;
 
@@ -43,9 +46,12 @@ pub struct PnpDevice {
 /// Find every device whose `_HID` equals `hid` and decode its `_CRS`
 /// into I/O base + IRQ.
 ///
-/// Devices without an I/O base in `_CRS` — no `_CRS` at all, an
-/// unevaluatable `_CRS`, or a `_CRS` with no I/O descriptor — are
-/// omitted: a consumer that needs an I/O base cannot use them.
+/// Devices whose `_STA` reports not-present (present bit 0 clear)
+/// are skipped, as are devices without an I/O base in `_CRS` — no
+/// `_CRS` at all, an unevaluatable `_CRS`, or a `_CRS` with no I/O
+/// descriptor. Devices with no `_STA` at all keep today's behavior
+/// (present); so does a device whose `_STA` exists but cannot be
+/// evaluated — see [`device_present`].
 ///
 /// Returns an empty `Vec` when the namespace hasn't been built yet
 /// (graceful no-op for early-boot callers); never panics.
@@ -56,6 +62,9 @@ pub struct PnpDevice {
 pub fn pnp_devices(hid: &str) -> Vec<PnpDevice> {
     let mut out = Vec::new();
     for dev in crate::find_all_devices_by_hid(hid) {
+        if !device_present(&dev.path) {
+            continue;
+        }
         let Ok(items) = crate::prt_crs::evaluate_crs_for(&dev.path) else {
             continue;
         };
@@ -69,6 +78,26 @@ pub fn pnp_devices(hid: &str) -> Vec<PnpDevice> {
         });
     }
     out
+}
+
+/// Whether the device at `device_path` is present per `_STA`
+/// (ACPI 6.5 §6.1, bit 0).
+///
+/// No `_STA` object → present: the spec mandates that a device
+/// without `_STA` is assumed present, enabled, shown, and
+/// functioning, and Linux's `acpi_bus_get_status` makes the same
+/// assumption. An `_STA` that exists but cannot be evaluated
+/// (evaluator limitation, malformed return) is likewise treated
+/// as present rather than silently dropping a device the
+/// evaluator could not assess — the serial consumer already
+/// tolerates absent hardware (its `init()` fails and the port
+/// is skipped), so the fail-open direction only risks a
+/// redundant probe, never a lost device.
+fn device_present(device_path: &str) -> bool {
+    match crate::prt_crs::evaluate_sta_for(device_path) {
+        Ok(sta) => sta & crate::prt_crs::STA_DEVICE_PRESENT != 0,
+        Err(_) => true,
+    }
 }
 
 /// First `Io` (`min`) / `FixedIo` (`base`) descriptor in `_CRS`.
@@ -284,3 +313,85 @@ fn smoke_pnp_devices_empty_namespace() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml/pnp", smoke_pnp_devices_empty_namespace);
+
+/// `Method(_STA, 0, NotSerialized) { Return(<imm>) }`.
+/// Single-byte PkgLength form (total < 64): 1 (PkgLength) + 4
+/// (name) + 1 (flags) + body (`ReturnOp` + immediate).
+fn sta_method(imm: &[u8]) -> Vec<u8> {
+    let mut body = alloc::vec![0xA4]; // ReturnOp
+    body.extend_from_slice(imm);
+    let pkg_len = 1 + 4 + 1 + body.len();
+    let mut v = alloc::vec![0x14, pkg_len as u8, b'_', b'S', b'T', b'A', 0x00];
+    v.extend_from_slice(&body);
+    v
+}
+
+/// `Name(_STA, <integer literal>)`.
+fn sta_name(imm: &[u8]) -> Vec<u8> {
+    let mut v = alloc::vec![0x08, b'_', b'S', b'T', b'A'];
+    v.extend_from_slice(imm);
+    v
+}
+
+/// Fake namespace for the `_STA` filter: COM1 (Method `_STA`
+/// returning 0x0F — present) and COM3 (Name `_STA` holding 0x0F —
+/// present) are kept; COM2 (Method `_STA` returning 0) and COM4
+/// (Name `_STA` holding 0) are dropped; COM6 (Method `_STA`
+/// returning 0x0E — enabled/UI/functioning but present bit clear)
+/// is dropped, pinning the "bit 0 only" rule; COM5 (no `_STA` at
+/// all) is kept, pinning the assumed-present default.
+fn fake_pnp0501_sta_namespace() -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut com1 = hid_name_eisa(0x0105_D041);
+    com1.extend_from_slice(&crs_name(&com_resources(0x3F8, 0x0010)));
+    com1.extend_from_slice(&sta_method(&[0x0A, 0x0F])); // Return(Byte 0x0F)
+    body.extend_from_slice(&device(b"COM1", &com1));
+    let mut com2 = hid_name_eisa(0x0105_D041);
+    com2.extend_from_slice(&crs_name(&com_resources(0x2F8, 0x0008)));
+    com2.extend_from_slice(&sta_method(&[0x00])); // Return(Zero)
+    body.extend_from_slice(&device(b"COM2", &com2));
+    let mut com3 = hid_name_eisa(0x0105_D041);
+    com3.extend_from_slice(&crs_name(&com_resources(0x2E8, 0x0010)));
+    com3.extend_from_slice(&sta_name(&[0x0A, 0x0F])); // Name(_STA, 0x0F)
+    body.extend_from_slice(&device(b"COM3", &com3));
+    let mut com4 = hid_name_eisa(0x0105_D041);
+    com4.extend_from_slice(&crs_name(&com_resources(0x3E8, 0x0008)));
+    com4.extend_from_slice(&sta_name(&[0x00])); // Name(_STA, Zero)
+    body.extend_from_slice(&device(b"COM4", &com4));
+    let mut com5 = hid_name_eisa(0x0105_D041);
+    com5.extend_from_slice(&crs_name(&com_resources(0x2E0, 0x0008)));
+    body.extend_from_slice(&device(b"COM5", &com5));
+    let mut com6 = hid_name_eisa(0x0105_D041);
+    com6.extend_from_slice(&crs_name(&com_resources(0x2F0, 0x0008)));
+    com6.extend_from_slice(&sta_method(&[0x0A, 0x0E])); // Return(Byte 0x0E)
+    body.extend_from_slice(&device(b"COM6", &com6));
+    body
+}
+
+/// `pnp_devices("PNP0501")` honors `_STA`: only the present
+/// devices (COM1, COM3, COM5) are returned.
+fn smoke_pnp_devices_honors_sta() -> TestResult {
+    crate::__reset_for_test();
+    if crate::__parse_body_for_test(&fake_pnp0501_sta_namespace(), "\\").is_err() {
+        return TestResult::Fail("pnp: fake _STA namespace parse failed");
+    }
+    let devs = pnp_devices("PNP0501");
+    if devs.len() != 3 {
+        return TestResult::Fail("pnp: expected 3 present PNP0501 devices");
+    }
+    let expect: [(&str, u16, u8); 3] = [
+        ("\\COM1", 0x3F8, 4),
+        ("\\COM3", 0x2E8, 4),
+        ("\\COM5", 0x2E0, 3),
+    ];
+    for (path, base, irq) in expect {
+        let Some(d) = devs.iter().find(|d| d.path == path) else {
+            return TestResult::Fail("pnp: expected present device missing");
+        };
+        if d.io_base != Some(base) || d.irq != Some(irq) {
+            return TestResult::Fail("pnp: present device base/irq mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/pnp", smoke_pnp_devices_honors_sta);
