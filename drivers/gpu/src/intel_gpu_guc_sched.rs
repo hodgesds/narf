@@ -1700,6 +1700,27 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
             }
+            // A long-running job whose queue was destroyed while its context
+            // was still being brought up must never be enabled: Linux
+            // discards pending jobs on exec-queue kill
+            // (xe_exec_queue_kill), so the batch must not run to completion
+            // after the queue is dead. Only phases GuC already registered
+            // (Policy and later) can be disabled; an Invalidate/Register
+            // context is picked up here once its registration lands, still
+            // before any enable is sent.
+            if matches!(
+                context.phase,
+                Phase::Policy | Phase::Enable | Phase::Enabling | Phase::Dispatch
+            ) && context
+                .user
+                .as_ref()
+                .is_some_and(|u| u.is_lr() && u.banned())
+                && !context.killed
+            {
+                context.killed = true;
+                context.phase = Phase::Disable;
+                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+            }
             if now >= context.deadline {
                 // Protocol transitions, kernel work and a second expiry
                 // remain bounded by wall clock and require a full GT reset.
@@ -2293,7 +2314,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
                 let finished = c.all_finished() && c.parallel.as_ref().is_none_or(|g| g.valid_wq());
-                if !finished && !c.timed_out && !c.reset {
+                // A killed job is unfinished by design: its queue was torn
+                // down before (or while) it ran, so its breadcrumb was never
+                // written. Without this the RetireInvalidate below is
+                // unreachable for every ban kill and the poll fails the GT
+                // with a protocol error instead of retiring the job as Hang.
+                if !finished && !c.timed_out && !c.reset && !c.killed {
                     return Err(SchedulingError::Protocol);
                 }
                 // A job that completed while it was being disabled was slow,
