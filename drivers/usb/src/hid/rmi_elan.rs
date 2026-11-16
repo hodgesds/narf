@@ -80,9 +80,10 @@
 //!   could not be verified in-session, so only the explicit
 //!   VID/PID tables match. Group-route devices fall through to the
 //!   PTP / generic binders below, never dropped.
-//! - F$12 multi-source ATTN reads use a 5-object register read,
-//!   mirroring the I2C-HID sibling lane; the true object count from
-//!   the F$12 query registers is a follow-up.
+//! - F$12 multi-source ATTN reads fetch the object count decoded
+//!   at probe time from the F$12 Data-1 register descriptor
+//!   ([`RmiProbe::f12_max_objects`], issue #1719), falling back
+//!   to 5 objects when the descriptor read fails.
 //! - The Elan mute LED (`HAS_LED`) is registered at bind time as
 //!   the `elan:red:mute` led-class device
 //!   ([`elan::register_mute_led`], issue #1720) and driven from
@@ -114,9 +115,10 @@ use narf_input_driver::{
     },
     hid_rmi::{self as rmi, clickpad_btn_left, AttnReport, DeviceQuirks, HidIo, HidRmiTransport},
     rmi4_core::{
-        decode_f12_data1, decode_f30_buttons, find_function, walk_pdt_page, F01ProductInfo,
-        F30Query, Rmi4Transport, TransportError, F01_DEVICE_CONTROL, F11_2D_TOUCHPAD,
-        F12_2D_TOUCHPAD_NEXT, F12_OBJECT_SIZE, F30_GPIO_LED,
+        decode_f12_data1, decode_f12_sensor, decode_f30_buttons, find_function, walk_pdt_page,
+        F01ProductInfo, F12SensorInfo, F30Query, Rmi4Transport, TransportError, F01_DEVICE_CONTROL,
+        F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT, F12_OBJECT_SIZE, F30_GPIO_LED,
+        RMI4_FALLBACK_MAX_COUNT,
     },
 };
 use narf_lib::sync::IrqSafeSpinLock;
@@ -526,7 +528,8 @@ pub fn build_interrupt_map(table: &[PdtEntry]) -> Vec<(u8, u8)> {
 }
 
 /// Probed RMI4 device: the PDT table plus the functions the pump
-/// needs, the F$30 GPIO count, and the interrupt-source map.
+/// needs, the F$30 GPIO count, the F$12 sensor limits, and the
+/// interrupt-source map.
 #[derive(Debug)]
 pub struct RmiProbe {
     pub table: Vec<PdtEntry>,
@@ -536,6 +539,10 @@ pub struct RmiProbe {
     pub f12: Option<PdtEntry>,
     pub f30: Option<PdtEntry>,
     pub f30_gpio_count: u8,
+    /// Decoded F$12 sensor limits (`None` when the device has
+    /// no F$12 function or the query/descriptor reads failed —
+    /// the pump falls back to the 5-object placeholder then).
+    pub f12_sensor: Option<F12SensorInfo>,
     pub interrupt_map: Vec<(u8, u8)>,
 }
 
@@ -576,6 +583,10 @@ impl RmiProbe {
             }
         }
         let interrupt_map = build_interrupt_map(&table);
+        // F$12 object count from its query registers
+        // (best-effort — a failed read leaves the probe field
+        // `None` and the pump falls back to the placeholders).
+        let f12_sensor = f12.as_ref().and_then(|f| decode_f12_sensor(transport, f));
         Ok(Self {
             table,
             product,
@@ -584,8 +595,18 @@ impl RmiProbe {
             f12,
             f30,
             f30_gpio_count,
+            f12_sensor,
             interrupt_map,
         })
+    }
+
+    /// Maximum F$12 objects the sensor reports (fallback 5,
+    /// the placeholder the pump used before the F$12 query
+    /// was decoded).
+    pub fn f12_max_objects(&self) -> usize {
+        self.f12_sensor
+            .map(|s| s.max_objects)
+            .unwrap_or(RMI4_FALLBACK_MAX_COUNT)
     }
 
     /// Interrupt-source mask for `function_number` (0 when the
@@ -824,12 +845,13 @@ fn pump_rmi_report(
                     decode_f12_data1(attn.data, nobj).ok()
                 } else {
                     // Multi-source ATTN: read Data 1 back from the
-                    // register (5 objects; the true object count
-                    // comes from the F$12 query at probe time —
-                    // remainder).
-                    let mut buf = alloc::vec![0u8; 5 * F12_OBJECT_SIZE];
+                    // register — `probe.f12_max_objects()` objects,
+                    // decoded at probe time from the F$12 Data-1
+                    // descriptor (fallback 5).
+                    let nobj = probe.f12_max_objects();
+                    let mut buf = alloc::vec![0u8; nobj * F12_OBJECT_SIZE];
                     match t.read_block(f12.data_base as u16, &mut buf) {
-                        Ok(()) => decode_f12_data1(&buf, 5).ok(),
+                        Ok(()) => decode_f12_data1(&buf, nobj).ok(),
                         Err(_) => None,
                     }
                 };
@@ -1761,11 +1783,29 @@ pub(crate) mod tests {
                     let len = u16::from_le_bytes([report[4], report[5]]) as usize;
                     // The transport stages read-data responses for
                     // page 0 only (the fixture image is page 0).
+                    // Silicon chunks reads at the input-report
+                    // size, so a read longer than one 62-byte
+                    // chunk stages one read-data response per
+                    // chunk, in order — the transport's drain
+                    // loop polls until the request is filled.
                     let lo = (addr & 0xFF) as usize;
-                    let take = len.min(self.page.len().saturating_sub(lo)).min(62);
-                    let mut resp = alloc::vec![rmi::RMI_READ_DATA_REPORT_ID, take as u8];
-                    resp.extend_from_slice(&self.page[lo..lo + take]);
-                    self.staged_in.push_back(resp);
+                    if len == 0 {
+                        self.staged_in
+                            .push_back(alloc::vec![rmi::RMI_READ_DATA_REPORT_ID, 0]);
+                    }
+                    let mut off = lo;
+                    let mut remaining = len;
+                    while remaining > 0 {
+                        let take = remaining.min(self.page.len().saturating_sub(off)).min(62);
+                        if take == 0 {
+                            break;
+                        }
+                        let mut resp = alloc::vec![rmi::RMI_READ_DATA_REPORT_ID, take as u8];
+                        resp.extend_from_slice(&self.page[off..off + take]);
+                        self.staged_in.push_back(resp);
+                        off += take;
+                        remaining -= take;
+                    }
                     Ok(())
                 }
                 _ => Ok(()),
@@ -1815,10 +1855,14 @@ pub(crate) mod tests {
     }
 
     /// Page-0 register image with a three-function PDT (F$01, F$12,
-    /// F$30) + terminator, an F$01 product-info block at 0x10, and
-    /// an F$30 query block at its query base 0x90. Same layout as the
+    /// F$30) + terminator, an F$01 product-info block at 0x10, the
+    /// F$12 query + register descriptors at 0x50, and ten F$12
+    /// finger objects in Data 1 at 0x80. Same layout as the
     /// `smoke_rmi4_pdt_three_function_walk` fixture in
     /// `drivers/input/src/tests.rs`, with F$12 in place of F$11.
+    /// F$30's query/data bases sit outside the 80-byte F$12 Data-1
+    /// block (0x80..0xCF) so the object bytes never alias the
+    /// button registers.
     fn rmi_page_image() -> [u8; 256] {
         let mut page = [0u8; 256];
         let last = PDT_LAST_SLOT_OFFSET as usize;
@@ -1839,10 +1883,10 @@ pub(crate) mod tests {
         page[s2 + 5] = F12_2D_TOUCHPAD_NEXT;
         // F$30 entry at PDT_LAST_SLOT_OFFSET - 12.
         let s3 = last - 2 * PDT_ENTRY_SIZE;
-        page[s3] = 0x90;
-        page[s3 + 1] = 0xA0;
-        page[s3 + 2] = 0xB0;
-        page[s3 + 3] = 0xC0;
+        page[s3] = 0x40; // query base (outside F$12 Data 1)
+        page[s3 + 1] = 0xA0; // command base
+        page[s3 + 2] = 0xB0; // control base
+        page[s3 + 3] = 0xD0; // data base (outside F$12 Data 1)
         page[s3 + 4] = 0x01; // 1 IRQ source
         page[s3 + 5] = F30_GPIO_LED;
         // Terminator (function_number = 0) at the next slot.
@@ -1851,11 +1895,71 @@ pub(crate) mod tests {
         // firmware 0x1234, date, tester, serial.
         page[0x10..0x10 + 11]
             .copy_from_slice(&[0x01, 0x10, 0x34, 0x12, 24, 5, 29, 0x42, 0x42, 0xCA, 0xFE]);
-        // F$30 query at its query base 0x90 (the PDT entry's
-        // query base — 0xB0 is the control base, not the query
-        // base): HAS_GPIO + 8 lines.
-        page[0x90] = 0x08;
-        page[0x90 + 1] = 0x08;
+        // F$30 query at its query base 0x40: HAS_GPIO + 8 lines.
+        page[0x40] = 0x08;
+        page[0x40 + 1] = 0x08;
+        // F$30 data at 0xD0: all lines high = no button pressed
+        // (active-low).
+        page[0xD0] = 0xFF;
+        // F$12 query + register descriptors at query base 0x50.
+        // Query 0 bit 0 set: register descriptors present.
+        // Descriptor reads are packet registers (all bytes of one
+        // packet share a single RMI address), but this fake is a
+        // flat page image — the bytes below are packed so the
+        // overlapping presence/structure reads agree, mirroring
+        // the `mem_transport_with_sensor_maxima` fixture in
+        // `drivers/input/src/tests.rs`:
+        //   control descriptor at 0x54: presence [0x04, 0x01,
+        //   0x03] (structure size 4, bitmap regs {0, 8, 9} —
+        //   reg 9 is dropped by the short-structure tolerance),
+        //   structure [0x01, 0x03, 0x0F, 0x1F] (reg 0: size 1,
+        //   subpackets 0-1; reg 8: size 15, subpackets 0-4 —
+        //   the sensor tuning).
+        //   data descriptor at 0x57: presence [0x0F, 0x1F, 0x00]
+        //   (structure size 15, bitmap regs {0..4}), structure
+        //   [0x1F, 0x00, 0x50, 0xFF, 0x07, ...] (reg 0: size 31,
+        //   no subpackets; regs 1-4: size 80, subpackets 0-9 —
+        //   Data 1 reports 10 objects).
+        // Flat-image overlap check: 0x56 holds presence[1] and
+        // the reg-0 size (0x01); 0x57 holds presence[2], the
+        // reg-0 map, and the data size (0x03); 0x58 holds the
+        // reg-8 size and the data structure size (0x0F); 0x59
+        // holds the reg-8 map, the data bitmap, and the reg-0
+        // size (0x1F); 0x5A holds the data bitmap byte 1 and the
+        // reg-0 map (0x00).
+        page[0x50] = 0x01;
+        // Flat merge of the six descriptor reads (each address
+        // listed with the reads that observe it):
+        //   0x54 ctrl size 0x03 | 0x55 ctrl presence[0] 0x04 |
+        //   0x56 ctrl presence[1] = ctrl struct reg-0 size 0x01 |
+        //   0x57 ctrl presence[2] = ctrl struct reg-0 map = data
+        //   size 0x03 | 0x58 ctrl struct reg-8 size = data
+        //   presence[0] 0x0F | 0x59 ctrl struct reg-8 map = data
+        //   presence[1] = data struct reg-0 size 0x1F | 0x5A
+        //   data presence[2] = data struct reg-0 map 0x00 |
+        //   0x5B.. data struct regs 1-4 (size 0x50, map 0xFF,
+        //   0x07 each) | 0x67 trailing structure byte 0x00.
+        page[0x54..0x54 + 20].copy_from_slice(&[
+            0x03, 0x04, 0x01, 0x03, 0x0F, 0x1F, 0x00, 0x50, 0xFF, 0x07, //
+            0x50, 0xFF, 0x07, 0x50, 0xFF, 0x07, 0x50, 0xFF, 0x07, 0x00,
+        ]);
+        // F$12 Control-8 sensor tuning at control_base + 1
+        // (0x71): maxima 0x1234 x 0x2345 in the first 4 bytes.
+        page[0x71..0x71 + 4].copy_from_slice(&[0x34, 0x12, 0x45, 0x23]);
+        // F$12 Data 1 at data base 0x80: ten finger objects with
+        // distinct coordinates (object i at X = 0x0100 * (i + 1),
+        // Y = 0x0200 + 0x0100 * i, pressure 0x40).
+        for i in 0..10 {
+            let base = 0x80 + i * F12_OBJECT_SIZE;
+            page[base] = 0x01; // object type: FINGER
+            let x = 0x0100u16 * (i as u16 + 1);
+            let y = 0x0200u16 + 0x0100u16 * i as u16;
+            page[base + 1..base + 3].copy_from_slice(&x.to_le_bytes());
+            page[base + 3..base + 5].copy_from_slice(&y.to_le_bytes());
+            page[base + 5] = 0x40; // Z
+            page[base + 6] = 0x05; // Wx
+            page[base + 7] = 0x06; // Wy
+        }
         page
     }
 
@@ -2157,6 +2261,21 @@ pub(crate) mod tests {
         if probe.f30.is_none() || probe.f30_gpio_count != 8 {
             return TestResult::Fail("F30 must be present with 8 GPIO lines");
         }
+        // F$12 sensor limits from the query registers: the
+        // fixture's Data-1 descriptor reports 10 objects and
+        // Control-8 tuning gives 0x1234 x 0x2345 maxima.
+        if probe.f12_sensor
+            != Some(F12SensorInfo {
+                max_x: 0x1234,
+                max_y: 0x2345,
+                max_objects: 10,
+            })
+        {
+            return TestResult::Fail("F12 sensor maxima / object count wrong");
+        }
+        if probe.f12_max_objects() != 10 {
+            return TestResult::Fail("probe must decode 10 F12 objects, not the fallback 5");
+        }
         // Interrupt map: F01 owns bit 0, F12 owns bits 1-2, F30
         // owns bit 3 (sequential assignment down the PDT).
         if probe.source_mask_for(F01_DEVICE_CONTROL) != 0x01 {
@@ -2254,6 +2373,83 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usb/hid/rmi-elan",
         smoke_rmi_attn_pump_emits_touch_events
+    );
+
+    fn smoke_rmi_attn_pump_multi_source_ten_objects() -> TestResult {
+        let fake = FakeUsbHidIo::new(rmi_page_image());
+        let mut transport = HidRmiTransport::new(fake, 19, DeviceQuirks::empty());
+        if transport.set_mode(rmi::RMI_MODE_ATTN_REPORTS).is_err() {
+            return TestResult::Fail("set_mode failed over fake HID");
+        }
+        let probe = match RmiProbe::probe(&mut transport) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("RMI probe failed over fake HID"),
+        };
+        // The fixture's F$12 Data-1 descriptor reports 10
+        // objects: the multi-source re-read must fetch all of
+        // them, not the old 5-object placeholder.
+        if probe.f12_max_objects() != 10 {
+            return TestResult::Fail("probe must decode 10 F12 objects");
+        }
+        let binding = rmi_binding_for_test(probe, transport);
+        init_global_ring(32);
+        __reset_global_ring_for_test();
+        // Multi-source ATTN: F12 sources (bits 1-2 = 0x06) plus
+        // F30 (bit 3 = 0x08). The packed data is not
+        // self-describing with several sources set, so the pump
+        // re-reads F12 Data 1 from the registers; the report
+        // carries no inline objects.
+        let attn: Vec<u8> = alloc::vec![rmi::RMI_ATTN_REPORT_ID, 0x0E];
+        let pushed = pump_report(&binding, &attn);
+        if pushed != 10 {
+            return TestResult::Fail("multi-source ATTN must push 10 touch events");
+        }
+        let mut seen = [false; 10];
+        let mut xs = [0i32; 10];
+        for _ in 0..10 {
+            match pop_touch() {
+                Some(t) if t.state == TouchState::Down => {
+                    let slot = t.slot as usize;
+                    if slot >= 10 || seen[slot] {
+                        return TestResult::Fail(
+                            "duplicate or out-of-range slot in 10-object ATTN",
+                        );
+                    }
+                    seen[slot] = true;
+                    if t.x == 0 || t.y == 0 {
+                        return TestResult::Fail(
+                            "10-object ATTN contact coordinates must be non-zero",
+                        );
+                    }
+                    xs[slot] = t.x;
+                }
+                Some(_) => {
+                    return TestResult::Fail("expected Down on every 10-object ATTN contact");
+                }
+                None => return TestResult::Fail("fewer than 10 TouchEvents after 10-object ATTN"),
+            }
+        }
+        if pop_touch().is_some() {
+            return TestResult::Fail("extra TouchEvent after 10-object ATTN");
+        }
+        // Every slot arrived, with a distinct X (the fixture
+        // stages a different X per object).
+        for slot in 0..10 {
+            if !seen[slot] {
+                return TestResult::Fail("a slot is missing from the 10-object ATTN");
+            }
+            for other in slot + 1..10 {
+                if xs[slot] == xs[other] {
+                    return TestResult::Fail("10-object ATTN contacts must have distinct X");
+                }
+            }
+        }
+        ROUTER.unregister_device(binding.evdev_id);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/hid/rmi-elan",
+        smoke_rmi_attn_pump_multi_source_ten_objects
     );
 
     fn smoke_fake_hid_io_records_and_replays() -> TestResult {
