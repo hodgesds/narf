@@ -52,6 +52,8 @@ pub struct ReservedRegion {
 }
 
 pub mod dma;
+#[cfg(test)]
+mod host_test_shims;
 pub mod nvmem;
 pub mod pci;
 mod tests;
