@@ -1489,7 +1489,7 @@ impl Device {
                 if mlo {
                     *self.mlo_report.lock() = connection.mlo_report();
                 }
-                state.connection = Some(connection);
+                state.connection = Some(*connection);
                 if self.install_station_policy(&mut state).is_err() {
                     self.stop_locked(&mut state).await;
                     return Err(WirelessError::HardwareError);
@@ -2472,7 +2472,7 @@ impl WirelessNetIface for Device {
         .await
         {
             Ok(connection) => {
-                state.connection = Some(connection);
+                state.connection = Some(*connection);
                 if self.install_station_policy(&mut state).is_err() {
                     self.stop_locked(&mut state).await;
                     return Err(WirelessError::HardwareError);

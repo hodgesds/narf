@@ -331,13 +331,13 @@ pub async fn attach<T: PacketTransport + 'static>(
     transport: T,
     clm: &[u8],
 ) -> Result<Arc<Device<Runtime<T>>>, Error> {
-    attach_runtime(name, Runtime::new(transport), clm).await
+    attach_runtime(name, Box::new(Runtime::new(transport)), clm).await
 }
 /// Common station publication for an already booted, retained firmware runtime.
 /// All initialization/key capabilities and authenticated policy checks still run.
 pub async fn attach_runtime<R: Fullmac + 'static>(
     name: &str,
-    runtime: R,
+    runtime: Box<R>,
     clm: &[u8],
 ) -> Result<Arc<Device<R>>, Error> {
     let slot = active_slot(R::FAMILY);
@@ -1827,7 +1827,7 @@ mod tests {
             reads: Arc::new(AtomicUsize::new(0)),
         };
         let mut initialize = pin!(Station::initialize(
-            Runtime::new(bus.clone()),
+            Box::new(Runtime::new(bus.clone())),
             &[1],
             station_tests::domain()
         ));

@@ -46,7 +46,7 @@ impl Fixture {
         bytes[28] = 1;
         Self {
             owner: Some(Box::new(Owner {
-                hardware,
+                hardware: alloc::boxed::Box::new(hardware),
                 firmware: vec![],
                 profile: gen2_profile::select(0xa0f0, 0x351, 0x10c000).unwrap(),
                 phase: Phase::ChannelPrepared,
@@ -109,7 +109,7 @@ impl Drop for Fixture {
         if let Some(owner) = self.owner.take() {
             // SAFETY: only private RAM/RFH/TFH fixtures observed these DMA
             // addresses. No physical PCI function or MMIO producer exists.
-            unsafe { runtime::model::destroy(owner.hardware) };
+            unsafe { runtime::model::destroy(*owner.hardware) };
         }
     }
 }

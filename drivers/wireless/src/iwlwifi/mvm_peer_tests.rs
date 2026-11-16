@@ -43,7 +43,7 @@ impl Fixture {
         bytes[28] = 1;
         Self {
             owner: Some(Owner {
-                hardware,
+                hardware: alloc::boxed::Box::new(hardware),
                 firmware: vec![],
                 profile: gen2_profile::select(0xa0f0, 0x351, 0x10c000).unwrap(),
                 phase: Phase::ChannelPrepared,
@@ -76,7 +76,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
             // SAFETY: only the private RAM/RFH/TFH fixture saw these addresses.
-            unsafe { runtime::model::destroy(owner.hardware) };
+            unsafe { runtime::model::destroy(*owner.hardware) };
         }
     }
 }

@@ -2999,7 +2999,10 @@ kernel_test_in!(
 );
 
 fn smoke_oa_per_context_stale_queue_fails_enable() -> TestResult {
-    let backend = Backend::new(device(59, MTL, 1270));
+    // Card 36: the OA config registry is global per card for the boot, so
+    // this test needs a card no earlier test registered uuid(1) on — card
+    // 59 is already taken by smoke_oa_descriptor_authority_blocking_config_and_reopen (EADDRINUSE).
+    let backend = Backend::new(device(36, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let alive = Arc::new(AtomicBool::new(true));
@@ -3105,7 +3108,10 @@ kernel_test_in!(
 fn smoke_oa_syncs_infence_outfence_and_user_fence() -> TestResult {
     use crate::drm::syncobj::{BinaryFence, SyncObjTable};
 
-    let backend = Backend::new(device(53, MTL, 1270));
+    // Card 35: the OA config registry is global per card for the boot, so
+    // this test needs a card no earlier test registered uuid(1) on — card
+    // 53 is already taken by smoke_oa_source_register_sequences_per_profile (EADDRINUSE).
+    let backend = Backend::new(device(35, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let table = Arc::new(IrqSafeSpinLock::new(SyncObjTable::new()));

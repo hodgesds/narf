@@ -20,6 +20,9 @@ const ZERO: u64 = 0x1234_0010_0000;
 const TARGET: u64 = 0x2345_0000_0000;
 const CHUNK: u64 = 64 * 1024 * 1024;
 
+/// Build the trusted flat-CCS clear batch for a VRAM object. This performs
+/// the CCS-clear claim itself (`begin_ccs_clear`, ccs 1 -> 2): callers must
+/// not claim it first, or the second claim fails with `InvalidData`.
 pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch, FsError> {
     object.begin_ccs_clear()?;
     let size = object.size();

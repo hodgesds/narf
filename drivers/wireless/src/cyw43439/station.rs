@@ -10,7 +10,7 @@ use super::{
 };
 #[cfg(any(test, feature = "kernel-test"))]
 use super::{runtime::Runtime, PacketTransport};
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig};
 
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ impl<R: Fullmac> Station<R> {
     /// The caller supplies a completed firmware-loader transport and an
     /// authenticated host policy; no interface may be published before success.
     pub async fn initialize(
-        runtime: R,
+        runtime: Box<R>,
         clm: &[u8],
         domain: narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, Error> {
@@ -83,7 +83,7 @@ impl<R: Fullmac> Station<R> {
     }
 
     async fn initialize_inner(
-        mut runtime: R,
+        mut runtime: Box<R>,
         clm: &[u8],
         domain: Arc<narf_wireless::reg::RegulatoryDomain>,
         policy: Option<Arc<dyn PolicySource>>,
@@ -109,38 +109,42 @@ impl<R: Fullmac> Station<R> {
             payload[2..4].copy_from_slice(&2u16.to_le_bytes());
             payload[4..8].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
             payload[12..].copy_from_slice(chunk);
-            set_var(&mut runtime, "clmload", &payload).await?;
+            set_var(&mut *runtime, "clmload", &payload).await?;
         }
-        if !clm.is_empty() && get_var(&mut runtime, "clmload_status", 4).await?.as_slice() != [0; 4]
+        if !clm.is_empty()
+            && get_var(&mut *runtime, "clmload_status", 4)
+                .await?
+                .as_slice()
+                != [0; 4]
         {
             return Err(Error::Firmware(1));
         }
         let mut country = [0; 12];
         country[..2].copy_from_slice(&domain.country_code);
         country[8..10].copy_from_slice(&domain.country_code);
-        set_var(&mut runtime, "country", &country).await?;
+        set_var(&mut *runtime, "country", &country).await?;
         runtime.configure_bus().await?;
-        let phy = phy::probe(&mut runtime).await?;
-        set_int(&mut runtime, ioctl::WLC_SET_PM, 0).await?;
-        set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
-        set_int(&mut runtime, 22, 0).await?; // Open-system 802.11 authentication.
-                                             // This profile pins the selected BSSID and does not consume ROAM
-                                             // events. Firmware must not silently move the authorized peer.
-        set_var(&mut runtime, "roam_off", &1u32.to_le_bytes()).await?;
-        let address = get_var(&mut runtime, "cur_etheraddr", 6).await?;
+        let phy = phy::probe(&mut *runtime).await?;
+        set_int(&mut *runtime, ioctl::WLC_SET_PM, 0).await?;
+        set_int(&mut *runtime, 20, 1).await?; // Infrastructure station.
+        set_int(&mut *runtime, 22, 0).await?; // Open-system 802.11 authentication.
+                                              // This profile pins the selected BSSID and does not consume ROAM
+                                              // events. Firmware must not silently move the authorized peer.
+        set_var(&mut *runtime, "roam_off", &1u32.to_le_bytes()).await?;
+        let address = get_var(&mut *runtime, "cur_etheraddr", 6).await?;
         let mac: [u8; 6] = address.try_into().map_err(|_| Error::Malformed)?;
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        write_events(&mut runtime, roam::event_mask(false), true).await?;
-        let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
+        write_events(&mut *runtime, roam::event_mask(false), true).await?;
+        let supplicant = match get_var(&mut *runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
             Err(error) => return Err(error),
         };
         // Linux feature.c probes this exact native iovar; host RSN flags
         // alone do not establish firmware management-protection support.
-        let mfp_supported = match get_var(&mut runtime, "mfp", 4).await {
+        let mfp_supported = match get_var(&mut *runtime, "mfp", 4).await {
             Ok(bytes) if bytes.len() == 4 && le32(&bytes, 0)? <= 2 => true,
             Ok(_) => return Err(Error::Malformed),
             Err(Error::Firmware(_)) => false,
@@ -152,22 +156,22 @@ impl<R: Fullmac> Station<R> {
         // native MFP, so all three firmware features are required.
         let sae_offload = supplicant
             && mfp_supported
-            && match get_var(&mut runtime, "cap", sae::CAP_LEN).await {
+            && match get_var(&mut *runtime, "cap", sae::CAP_LEN).await {
                 Ok(caps) => sae::has_capability(&caps, b"sae"),
                 Err(Error::Firmware(_)) => false,
                 Err(error) => return Err(error),
             };
-        let pmkid_v3 = match get_var(&mut runtime, "wlc_ver", pmksa::WLC_VERSION_LEN).await {
+        let pmkid_v3 = match get_var(&mut *runtime, "wlc_ver", pmksa::WLC_VERSION_LEN).await {
             // A reply shorter than brcmf_wlc_version_le carries no WLC
             // major version: keep the v1 list.
             Ok(reply) => pmksa::v3_from_wlc_version(&reply).unwrap_or(false),
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
-        let wowl = wowl::probe(&mut runtime).await?;
-        policy::check_initial(&mut runtime, &policy, &domain)?;
-        policy::enable(&mut runtime, &policy, &domain).await?;
-        policy::check_initial(&mut runtime, &policy, &domain)?;
+        let wowl = wowl::probe(&mut *runtime).await?;
+        policy::check_initial(&mut *runtime, &policy, &domain)?;
+        policy::enable(&mut *runtime, &policy, &domain).await?;
+        policy::check_initial(&mut *runtime, &policy, &domain)?;
         let reply = runtime
             .command(Direction::Get, 217, &64u32.to_le_bytes(), 260)
             .await?;
@@ -191,9 +195,11 @@ impl<R: Fullmac> Station<R> {
         if channels.is_empty() {
             return Err(Error::Unsupported);
         }
-        policy::check_initial(&mut runtime, &policy, &domain)?;
+        policy::check_initial(&mut *runtime, &policy, &domain)?;
         Ok(Self {
-            runtime,
+            // Unbox here: the runtime is only held by value in the
+            // returned station, never across an await in this fn.
+            runtime: *runtime,
             mac,
             channels,
             domain,

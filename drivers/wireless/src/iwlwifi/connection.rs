@@ -6,7 +6,7 @@ use super::{
     runtime::Hardware,
     scan_api, security, station_api,
 };
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug)]
@@ -317,7 +317,7 @@ impl Connection {
         tx_chains: u32,
         local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Box<Self>, &'static str> {
         let domain = narf_wireless::reg::db::ensure_domain()
             .map_err(|_| "wireless regulatory domain is not configured")?;
         let policy = super::mld_policy::Source::native();
@@ -345,7 +345,7 @@ impl Connection {
         local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Box<Self>, &'static str> {
         Self::associate_client_in_domain(
             hw, local, beacon, auth, tx_chains, local_phy, roam_from, domain, None,
         )
@@ -362,7 +362,7 @@ impl Connection {
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
         client: Option<(super::p2p_client::Plan, narf_net::native_emission::Lifetime)>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Box<Self>, &'static str> {
         Self::associate_links_in_domain(
             hw,
             local,
@@ -391,7 +391,7 @@ impl Connection {
         tx_chains: u32,
         local_phy: super::ht_vht::Local,
         further: Vec<super::MldLinkCandidate>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Box<Self>, &'static str> {
         let domain = narf_wireless::reg::db::ensure_domain()
             .map_err(|_| "wireless regulatory domain is not configured")?;
         let policy = super::mld_policy::Source::native();
@@ -419,7 +419,7 @@ impl Connection {
         domain: &narf_wireless::reg::RegulatoryDomain,
         client: Option<(super::p2p_client::Plan, narf_net::native_emission::Lifetime)>,
         further: Vec<super::MldLinkCandidate>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Box<Self>, &'static str> {
         if let Some((plan, _)) = &client {
             if !super::p2p_go::host_allows(domain, plan.channel) {
                 return Err("P2P client current host NO_P2P prohibits association");
@@ -795,7 +795,10 @@ impl Connection {
         if started.payload.len() != 16 || started.payload[4..12] != [1, 0, 0, 0, 1, 0, 0, 0] {
             return Err("association channel residency rejected");
         }
-        let mut this = Self {
+        // Box the connection: it is several KiB (reorder windows, MLD
+        // state, regulatory program) and holding it by value in this
+        // future overflows the 8 KiB frame budget in the callers.
+        let mut this = alloc::boxed::Box::new(Self {
             beacon,
             local,
             management_queue,
@@ -848,7 +851,7 @@ impl Connection {
             amsdu_memory: None,
             amsdu_memory_attempted: false,
             tlc_notification_version: hw.version(5, 0xf7).map(|v| v.1),
-        };
+        });
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
         this.check_six_pending(hw)?;

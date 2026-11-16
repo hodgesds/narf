@@ -397,6 +397,24 @@ fn read_ns_last_pid() -> String {
     let f: NsLastPidReadFn = unsafe { core::mem::transmute(v) };
     format!("{}\n", f())
 }
+
+/// O(1) `ns_last_pid` value for `/proc/loadavg`'s tail field: the most
+/// recently allocated pid in the caller's namespace (Linux semantics),
+/// or 0 when the pid hooks are not installed yet. Reuses the installed
+/// `NS_LAST_PID_READ` hook — no new hook plumbing (issue #2134). The
+/// previous `list_pids().max()` enumeration is gone; this is also more
+/// faithful than it was, since Linux reports the most recently
+/// allocated pid, not the greatest currently-live one.
+pub fn ns_last_pid_value() -> i64 {
+    let v = NS_LAST_PID_READ.load(Ordering::Acquire);
+    if v == 0 {
+        return 0;
+    }
+    // SAFETY: v was stored by install_ns_last_pid_hooks as a
+    // NsLastPidReadFn fn-pointer; non-zero confirms it.
+    let f: NsLastPidReadFn = unsafe { core::mem::transmute(v) };
+    f()
+}
 fn write_ns_last_pid(v: &str) -> Result<(), FsError> {
     let p = NS_LAST_PID_WRITE.load(Ordering::Acquire);
     if p == 0 {

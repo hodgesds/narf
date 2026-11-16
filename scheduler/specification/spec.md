@@ -817,6 +817,22 @@ charged to per-CPU counters and subtracted from task dispatch time, while
 deferred interrupt work uses `SoftIrq`. The same public guard exists for NMI;
 architecture NMI/FIQ entry wiring remains a gate.
 
+### Diagnostic task counters (O(1) `/proc` sources)
+
+`total_task_count()`, `parked_task_count()` and `unparked_task_count()`
+are maintained `Relaxed` atomics, not scans: the total increments at
+each `TaskSlot` construction site and decrements in `Drop for TaskSlot`;
+the parked count moves in `ParkedTasks::insert` / `take` / `clear`.
+`unparked_task_count()` is `total - parked` (Linux `nr_running`
+analogue: READY + wake inbox + currently polling; throttled READY
+slots count). `/proc/stat` (`processes`, `procs_running`) and
+`/proc/loadavg` (total, R, EWMA sample) read these instead of
+`all_task_ids()` / `cpu_queue_depths()` / the dispatchable scan, so a
+procfs read never locks a queue or allocates. The counters are
+diagnostic only — no scheduling decision reads them. The exact
+dispatchable scan survives as `runnable_task_count()` for the stall
+watchdog, which needs the precise "dispatchable work stranded" notion.
+
 ### 3.2 CPU topology
 
 ```rust

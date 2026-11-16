@@ -11,7 +11,9 @@ use core::task::Poll as Step;
 fn publisher() -> Publish<TestAdapter> {
     Box::new(|name, adapter| {
         Box::pin(async move {
-            let station = Station::initialize(adapter, &[], firmware::domain()).await?;
+            let station =
+                Station::initialize(alloc::boxed::Box::new(adapter), &[], firmware::domain())
+                    .await?;
             narf_net::iface::register(name, OWN, send);
             Ok(shell(String::from(name), station))
         })

@@ -68,8 +68,12 @@ impl Bound {
         bus.enable_monitor(profile);
         let database = Arc::new(narf_wireless::reg::db::Database::new());
         database.install(firmware::domain());
-        let station = run(Station::initialize_live(adapter, &[], database.clone()))
-            .map_err(|_| "monitor native initialization")?;
+        let station = run(Station::initialize_live(
+            alloc::boxed::Box::new(adapter),
+            &[],
+            database.clone(),
+        ))
+        .map_err(|_| "monitor native initialization")?;
         let name = narf_net::iface::register("wlan%d", OWN, send);
         let device = shell(name.clone(), station);
         narf_net::iface::set_link_state(&name, false);

@@ -186,7 +186,14 @@ fn smoke_hardware_guc_capture_timeout_manual_fallback_snapshot() -> TestResult {
     ready(&mut gt, HANG_TIMEOUT + 100);
     service_contexts(&w, &mut registered, false);
     w.0.borrow_mut().regs.extend([(0x2068, 0x7a00_0004), (0x20b0, 0x10)]);
-    model_runtime(&w, registered[&u32::from(id)], 0, 15_000_000, true);
+    model_runtime(
+        &w,
+        crate::intel_gpu_engine::Engine::Rcs0,
+        registered[&u32::from(id)],
+        0,
+        15_000_000,
+        true,
+    );
     ready(&mut gt, HANG_TIMEOUT + 130);
     let report = gt.take_error_report().expect("timeout capture before disable");
     let index = 58;

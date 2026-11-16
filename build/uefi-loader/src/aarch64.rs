@@ -254,20 +254,32 @@ fn load_and_start() -> Result<(), LoadError> {
 
     let page_start = align_down(elf.load_start, PAGE_SIZE);
     let page_end = align_up(elf.load_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
-    if page_end - page_start > MAX_KERNEL_LOAD_SPAN
-        || ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end)
-    {
-        // Name the failing sub-check: the bare `InvalidElf` variant cannot
-        // tell a span overrun from a DTB overlap (issue #2125).
+    // Each sub-check names itself. #2127 printed the operands but not which
+    // disjunct fired, so every InvalidElf sighting since showed the span
+    // line and then a bare `InvalidElf` (issue #2125): the span overrun and
+    // the DTB overlap are now separate refusals. The file-backed end in the
+    // overlap line tells the DTB-relocation follow-up whether the DTB sits
+    // in file-backed bytes or in the .bss tail.
+    if page_end - page_start > MAX_KERNEL_LOAD_SPAN {
         #[cfg(not(test))]
         uefi::println!(
-            "NARF UEFI loader: load span {:#x}-{:#x} ({} bytes, max {}) with DTB {:#x}-{:#x}",
+            "NARF UEFI loader: load span {:#x}-{:#x} ({} bytes) exceeds max {}",
             page_start,
             page_end,
             page_end - page_start,
-            MAX_KERNEL_LOAD_SPAN,
+            MAX_KERNEL_LOAD_SPAN
+        );
+        return Err(LoadError::InvalidElf);
+    }
+    if ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end) {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: DTB {:#x}-{:#x} overlaps load span {:#x}-{:#x} (file-backed end {:#x})",
             dtb,
-            dtb_end
+            dtb_end,
+            page_start,
+            page_end,
+            elf.file_backed_end
         );
         return Err(LoadError::InvalidElf);
     }

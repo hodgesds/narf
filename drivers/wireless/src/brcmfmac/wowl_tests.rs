@@ -14,8 +14,12 @@ fn harness(cap: Option<u32>) -> Result<Harness, &'static str> {
     if let Some(cap) = cap {
         bus.wowl_profile(cap);
     }
-    let station = ready(Station::initialize(adapter, &[], firmware::domain()))?
-        .map_err(|_| "PCIe station firmware initialization")?;
+    let station = ready(Station::initialize(
+        alloc::boxed::Box::new(adapter),
+        &[],
+        firmware::domain(),
+    ))?
+    .map_err(|_| "PCIe station firmware initialization")?;
     let name = narf_net::iface::register("wlan%d", OWN, send);
     let device = shell(name.clone(), station);
     narf_net::iface::set_link_state(&name, true);
