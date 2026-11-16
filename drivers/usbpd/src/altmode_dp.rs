@@ -28,9 +28,9 @@
 //! 3. Pull responses with `Tcpc::receive`, decode the VDM header,
 //!    and pump the wrapped `DpAltModeDriver` until it reports
 //!    `Active` (with the negotiated `DpConfigureVdo`) or `Failed`.
-//! 4. When `Active` is reached, **log** that DP Alt Mode is up —
-//!    GPU-side display-pipe wiring lives in `drivers/gpu/` (separate
-//!    agent), so we don't touch it here.
+//! 4. When `Active` is reached, dispatch the negotiated configuration to the
+//!    registered GPU bridge. A bridge that is not ready yet, or whose first
+//!    AUX EDID read races sink wakeup, is retried while Alt Mode remains live.
 
 extern crate alloc;
 
@@ -48,7 +48,7 @@ use narf_usbpd::tcpc::TcpcError;
 use narf_usbpd::vdm::{AltModeState, AltStepOutcome, DpAltModeDriver, DpConfigureVdo, VdmHeader};
 use narf_usbpd::UsbPd;
 
-use crate::dp_gpu_bridge::{self, ConnectorId, DpLinkConfig};
+use crate::dp_gpu_bridge::{self, ConnectorId, DpBridgeError, DpLinkConfig};
 use crate::tcpm::TcpmPort;
 
 /// Error from the port-side DP Alt Mode driver.
@@ -106,9 +106,23 @@ pub struct DpAltModePort {
     typec: Arc<narf_drivers_extcon::typec::TypecConnector>,
     driver: IrqSafeSpinLock<DpAltModeDriver>,
     next_msg_id: AtomicU8,
-    /// Once we go `Active`, dispatch to the GPU bridge exactly once
-    /// per attach.
+    /// GPU handoff state. Dispatch and detach have distinct claimed states so
+    /// concurrent task-loop callers cannot enter and tear down the bridge at
+    /// the same time. Every state except IDLE still requires or awaits detach.
     gpu_wiring_dispatched: AtomicU8,
+}
+
+const GPU_WIRING_IDLE: u8 = 0;
+const GPU_WIRING_DISPATCHING: u8 = 1;
+const GPU_WIRING_ACCEPTED: u8 = 2;
+const GPU_WIRING_RETRY: u8 = 3;
+const GPU_WIRING_DETACHING: u8 = 4;
+
+const fn bridge_error_is_retryable(error: DpBridgeError) -> bool {
+    matches!(
+        error,
+        DpBridgeError::NotReady | DpBridgeError::EdidUnavailable
+    )
 }
 
 impl DpAltModePort {
@@ -194,13 +208,33 @@ impl DpAltModePort {
             self.port.state(),
             crate::tcpm::PortState::Unattached | crate::tcpm::PortState::ErrorRecovery
         ) {
-            if self.gpu_wiring_dispatched.load(Ordering::Acquire) != 0 {
-                // Retry a refused local stop on later detached polls. Do
-                // not reset the state machine and replay over a live owner.
-                if dp_gpu_bridge::notify_dp_exited(self.connector).is_err() {
+            let wiring = self.gpu_wiring_dispatched.load(Ordering::Acquire);
+            if wiring != GPU_WIRING_IDLE {
+                // An entry already in flight owns the next transition. Wait
+                // for it to publish ACCEPTED/RETRY before claiming teardown.
+                if matches!(wiring, GPU_WIRING_DISPATCHING | GPU_WIRING_DETACHING) {
                     return Ok(DpAltStep::NotReady);
                 }
-                self.gpu_wiring_dispatched.store(0, Ordering::Release);
+                if self
+                    .gpu_wiring_dispatched
+                    .compare_exchange(
+                        wiring,
+                        GPU_WIRING_DETACHING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return Ok(DpAltStep::NotReady);
+                }
+                // Retry a refused local stop on later detached polls. Do not
+                // reset discovery and replay over a live or uncertain owner.
+                if dp_gpu_bridge::notify_dp_exited(self.connector).is_err() {
+                    self.gpu_wiring_dispatched.store(wiring, Ordering::Release);
+                    return Ok(DpAltStep::NotReady);
+                }
+                self.gpu_wiring_dispatched
+                    .store(GPU_WIRING_IDLE, Ordering::Release);
             }
             *self.driver.lock() = DpAltModeDriver::new();
             self.next_msg_id.store(0, Ordering::Release);
@@ -229,9 +263,14 @@ impl DpAltModePort {
             return Ok(DpAltStep::Advanced(self.driver.lock().state));
         }
         if matches!(sm.state, AltModeState::Active) {
-            return Ok(DpAltStep::Active(sm.active_cfg.unwrap_or_else(|| {
-                DpConfigureVdo::dfp_source(narf_usbpd::vdm::DpPinAssignment::C)
-            })));
+            let cfg = sm
+                .active_cfg
+                .unwrap_or_else(|| DpConfigureVdo::dfp_source(narf_usbpd::vdm::DpPinAssignment::C));
+            drop(sm);
+            if self.gpu_wiring_dispatched.load(Ordering::Acquire) == GPU_WIRING_RETRY {
+                self.dispatch_to_gpu_bridge(&cfg);
+            }
+            return Ok(DpAltStep::Active(cfg));
         }
         if matches!(sm.state, AltModeState::Failed) {
             return Ok(DpAltStep::Failed);
@@ -266,26 +305,41 @@ impl DpAltModePort {
         }
     }
 
-    /// Once-per-attach dispatch into the GPU bridge. Builds a
+    /// Per-attach dispatch into the GPU bridge. Builds a
     /// `DpLinkConfig` from the negotiated VDO + this port's
-    /// connector id, then forwards to every registered bridge.
-    /// First bridge that recognises the connector wins.
+    /// connector id, then forwards to every registered bridge. First bridge
+    /// that recognises the connector wins. Not-ready and EDID-wakeup failures
+    /// are retried by the Active task loop; accepted or hard-failed handoffs
+    /// remain latched until detach.
     fn dispatch_to_gpu_bridge(&self, cfg: &DpConfigureVdo) {
-        // Atomic CAS so the dispatch fires once per attach even if
-        // step() is racing in two tasks. The flag is cleared if the
-        // port goes back through `Idle` (e.g. cable yank → re-attach)
-        // and step() resets it only after a detached bridge has stopped.
-        if self
-            .gpu_wiring_dispatched
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
+        // Atomic claim prevents two task-loop callers from entering a GPU
+        // bridge concurrently. RETRY remains nonzero so physical detach still
+        // calls exit even when a failed attempt retained uncertain hardware.
+        let previous = loop {
+            let state = self.gpu_wiring_dispatched.load(Ordering::Acquire);
+            if !matches!(state, GPU_WIRING_IDLE | GPU_WIRING_RETRY) {
+                return;
+            }
+            if self
+                .gpu_wiring_dispatched
+                .compare_exchange(
+                    state,
+                    GPU_WIRING_DISPATCHING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break state;
+            }
+        };
+        let first_attempt = previous == GPU_WIRING_IDLE;
         let link = DpLinkConfig::from_vdo(self.connector, cfg);
         use core::fmt::Write as _;
         match dp_gpu_bridge::notify_dp_entered(&link) {
             Some((bridge_name, Ok(()))) => {
+                self.gpu_wiring_dispatched
+                    .store(GPU_WIRING_ACCEPTED, Ordering::Release);
                 let _ = writeln!(
                     narf_console::Writer,
                     "  altmode-dp: {} entered DP Alt Mode ({}, {} lanes, pin {:?}); \
@@ -298,28 +352,47 @@ impl DpAltModePort {
                 );
             }
             Some((bridge_name, Err(e))) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  altmode-dp: {} entered DP Alt Mode ({}, {} lanes, pin {:?}); \
-                     bridge {} reported {:?}",
-                    self.port.label,
-                    link.connector,
-                    link.lanes,
-                    link.pin_assignment,
-                    bridge_name,
-                    e,
+                self.gpu_wiring_dispatched.store(
+                    if bridge_error_is_retryable(e) {
+                        GPU_WIRING_RETRY
+                    } else {
+                        GPU_WIRING_ACCEPTED
+                    },
+                    Ordering::Release,
                 );
+                if first_attempt {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  altmode-dp: {} entered DP Alt Mode ({}, {} lanes, pin {:?}); \
+                         bridge {} reported {:?}{}",
+                        self.port.label,
+                        link.connector,
+                        link.lanes,
+                        link.pin_assignment,
+                        bridge_name,
+                        e,
+                        if bridge_error_is_retryable(e) {
+                            "; retrying while attached"
+                        } else {
+                            ""
+                        },
+                    );
+                }
             }
             None => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  altmode-dp: {} entered DP Alt Mode ({}, {} lanes, pin {:?}); \
-                     no GPU bridge claims this connector",
-                    self.port.label,
-                    link.connector,
-                    link.lanes,
-                    link.pin_assignment,
-                );
+                self.gpu_wiring_dispatched
+                    .store(GPU_WIRING_RETRY, Ordering::Release);
+                if first_attempt {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  altmode-dp: {} entered DP Alt Mode ({}, {} lanes, pin {:?}); \
+                         no GPU bridge claims this connector yet; retrying while attached",
+                        self.port.label,
+                        link.connector,
+                        link.lanes,
+                        link.pin_assignment,
+                    );
+                }
             }
         }
         // #1211: reflect DP entry in the Type-C class. The GPU bridge
@@ -562,6 +635,24 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/altmode-dp",
         smoke_dp_altmode_step_returns_not_ready_before_contract
+    );
+
+    fn smoke_dp_bridge_retry_policy_keeps_transient_failures_live() -> TestResult {
+        if !bridge_error_is_retryable(DpBridgeError::NotReady)
+            || !bridge_error_is_retryable(DpBridgeError::EdidUnavailable)
+        {
+            return TestResult::Fail("transient bridge admission must remain retryable");
+        }
+        if bridge_error_is_retryable(DpBridgeError::NoSuchConnector)
+            || bridge_error_is_retryable(DpBridgeError::ModesetFailed)
+        {
+            return TestResult::Fail("hard bridge outcomes must stay latched until detach");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/altmode-dp",
+        smoke_dp_bridge_retry_policy_keeps_transient_failures_live
     );
 
     fn smoke_dp_altmode_full_walk_to_active() -> TestResult {

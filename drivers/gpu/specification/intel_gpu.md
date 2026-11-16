@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.66** (v0.65 plus exact fail-closed Arctic Sound-M discovery;
+> Status: **v0.67** (v0.66 plus serial-owned Gen12 USB-C DP scanout
+> publication and exact detach withdrawal; exact fail-closed Arctic Sound-M discovery;
 > a typed, read-only census of all current
 > Linux GMD display identities, including distinct Wildcat Lake 30.02 and
 > Nova Lake-S 35.00 refusal proofs; exact Nova Lake-S headless GT/GuC/media
@@ -7460,6 +7461,13 @@ BUF_TRANS. The bridge acquires TC-cold, AUX and PHY ownership before EDID,
 limits link negotiation to the PD lane count, and stops/releases its session
 through the USB-PD detach hook. Uncertain stop keeps the pipe, surface and
 power reference; detach retries, and discovery resets only on success.
+A successful native modeset publishes its physical surface to the framebuffer
+consumer under the shared external-output serial namespace. Detach withdraws
+only that exact serial before freeing the contiguous backing; a failed stop
+keeps both, while a superseded session cannot withdraw the newer internal,
+SST or Display-14 image. A transient NotReady or AUX/EDID wake failure is
+retried by the active USB-PD task instead of being latched until the next
+cable attach.
 Alder Lake-S/N and unknown families remain refused on this path.
 The older bridge requires native TC connector numbering, exposes TC1..TC5
 (ADL-P admits only TC1..TC4), and does not translate arbitrary UCSI numbering.

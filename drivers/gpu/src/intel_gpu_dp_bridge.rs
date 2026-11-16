@@ -18,7 +18,9 @@
 //!   adapter for the BAR0 `MmioRegion`, dispatch into AUX + Modeset.
 //! - A session retains its pipe, scanout and TC-cold/AUX/PHY ownership.
 //!   Detach stops the pipe, DDI transport and Dekel PLL before release;
-//!   uncertain stop retains the session and vetoes display power retirement.
+//!   uncertain stop retains the session, published image and backing, and
+//!   vetoes display power retirement. Successful modeset publication carries
+//!   a unique session serial, so stale detach cannot withdraw a newer output.
 //! - Tiger Lake and Alder Lake-P use their own banked Dekel PLL, clock
 //!   routing and TX presets. Negotiation respects the PD lane limit and
 //!   source training patterns/levels track the shared sink algorithm.
@@ -59,6 +61,7 @@ struct BridgeSession {
     port: DklPort,
     bar: u64,
     pipe: Option<Pipe>,
+    publication_serial: u64,
 }
 static SESSIONS: narf_lib::mutex::Mutex<[Option<BridgeSession>; 8]> =
     narf_lib::mutex::Mutex::new([None; 8]);
@@ -210,6 +213,8 @@ impl IntelDpBridge {
         }
         let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)
             .ok_or(DpBridgeError::NoSuchConnector)?;
+        let publication_serial =
+            intel_gpu::next_external_scanout_serial().ok_or(DpBridgeError::NotReady)?;
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -237,6 +242,7 @@ impl IntelDpBridge {
                 port,
                 bar: gpu.gtt_mmadr.phys.raw(),
                 pipe: None,
+                publication_serial,
             });
         }
         port.connect(&mmio, gpu.gtt_mmadr.phys.raw(), cfg.lanes)
@@ -394,6 +400,19 @@ impl IntelDpBridge {
                         crate::intel_gpu_vrr::msa_timing_par_ignore_wanted(1),
                     );
                 }
+                // The native pipe/surface witnesses above precede
+                // publication. The retained session serial makes a later
+                // detach exact even if another output supersedes this image.
+                intel_gpu::publish_external_scanout(
+                    narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base(),
+                        u32::from(mode.h_active),
+                        u32::from(mode.v_active),
+                        fb.stride_bytes,
+                        32,
+                    ),
+                    publication_serial,
+                );
                 Ok(())
             }
             Err(ModesetError::EdidUnavailable) => {
@@ -450,6 +469,10 @@ fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeEr
     if let Some(pipe) = session.pipe {
         intel_gpu_multipipe::release_pipe(pipe, ddi);
     }
+    // Stop is locally proven at this point. Withdraw before releasing the
+    // physical backing; a stale serial is a no-op and therefore cannot blank
+    // a newer internal, SST or Display-14 publication.
+    intel_gpu::withdraw_external_scanout(session.publication_serial);
     let allocation = BRIDGE_SCANOUTS.lock()[ddi as usize].take();
     if let Some(allocation) = allocation {
         crate::intel_gpu_gtt::free_contiguous_scanout(&allocation);

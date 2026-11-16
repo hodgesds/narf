@@ -23,6 +23,13 @@ exists to avoid competing with firmware for the same controller.
   discovery retries a refused stop while detached and resets discovery and
   per-attach dispatch only after exit succeeds; reattach can then configure
   a fresh session. Contract renegotiation alone does not tear down DP.
+  Once DP Alt Mode is active, `NotReady`, `EdidUnavailable`, or an empty GPU
+  bridge registry keeps a retry state and re-attempts handoff from the bounded
+  100 ms task loop. A successful handoff or hard `ModesetFailed` result stays
+  latched until detach. Retry state is still an owner for detach purposes, so
+  uncertain hardware from an unsuccessful attempt cannot escape its exit hook.
+  Dispatch and detach use separate atomically claimed states; detach waits out
+  an in-flight entry, and a refused exit restores its prior owner state.
 
 - `ucsi::Transport` supplies bounded version, CCI, control and message accesses.
 - `ucsi::Ppm<T>` owns and serializes async reset, initialization, polling and

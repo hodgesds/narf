@@ -107,11 +107,15 @@ stream; this does not create a multi-monitor compositor or a new DRM ABI.
 Alder Lake-P Dekel banked PLL/clock/TX operations. The Gen12 USB-PD bridge
 holds TC-cold/AUX/PHY ownership across a session and negotiates within the
 PD lane limit. Its detach hook proves pipe/link stop before releasing the
-scanout, pipe claim and power reference. Alder Lake-S/N are not admitted
-through the Dekel Type-C path. This bridge requires native TC connector
-numbering and exposes TC1..TC5 (TC1..TC4 on ADL-P); arbitrary UCSI numbering
-needs board routing data. These transports have native models; Intel silicon
-and dock interoperability remain separate acceptance work.
+scanout, pipe claim and power reference. A successful modeset publishes the
+physical scanout under a serial from the shared Intel external-output
+namespace. Detach withdraws that exact serial before freeing its backing;
+failed or uncertain stop retains both publication and backing, while a stale
+detach cannot blank a newer output. Alder Lake-S/N are not admitted through
+the Dekel Type-C path. This bridge requires native TC connector numbering and
+exposes TC1..TC5 (TC1..TC4 on ADL-P); arbitrary UCSI numbering needs board
+routing data. These transports have native models; Intel silicon and dock
+interoperability remain separate acceptance work.
 
 ### Intel scanout takeover and restore
 

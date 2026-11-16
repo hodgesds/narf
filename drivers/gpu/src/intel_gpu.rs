@@ -2236,6 +2236,47 @@ fn publish_scanout_owned(scanout: Option<narf_graphics_driver::generic::GenericF
     }
 }
 
+/// Reserve a nonzero identity for an external display publication.
+///
+/// Gen12 SST, the USB-C DP bridge and the Display-14 external route share one
+/// namespace so a delayed detach can never mistake another route's image for
+/// its own. Exhaustion is fail-closed instead of wrapping and reusing an
+/// identity.
+pub(crate) fn next_external_scanout_serial() -> Option<u64> {
+    NEXT_DP_SESSION
+        .fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .ok()
+}
+
+/// Publish one successfully activated external scanout under its owner serial.
+pub(crate) fn publish_external_scanout(
+    scanout: narf_graphics_driver::generic::GenericFb,
+    serial: u64,
+) {
+    debug_assert_ne!(serial, 0);
+    publish_scanout_owned(Some(scanout), serial);
+}
+
+/// Withdraw an external image only while `serial` still owns the publication.
+/// Returns whether the active image was withdrawn.
+pub(crate) fn withdraw_external_scanout(serial: u64) -> bool {
+    let withdrew = {
+        let mut active = ACTIVE_GENERIC.lock();
+        external_stop::withdraw(&mut active, serial)
+    };
+    if withdrew {
+        let observer = *SCANOUT_OBSERVER.lock();
+        if let Some(observer) = observer {
+            observer(None);
+        }
+    }
+    withdrew
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
@@ -2475,14 +2516,14 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                     session.as_ref().map(|s| (s.alloc, s.fb, s.serial))
                 };
                 if let Some((alloc, fb, serial)) = stored {
-                    publish_scanout_owned(
-                        Some(narf_graphics_driver::generic::GenericFb::new(
+                    publish_external_scanout(
+                        narf_graphics_driver::generic::GenericFb::new(
                             alloc.phys_base,
                             conn.mode.h_active as u32,
                             conn.mode.v_active as u32,
                             fb.stride_bytes,
                             32,
-                        )),
+                        ),
                         serial,
                     );
                 }
@@ -2566,13 +2607,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
     if DP_SESSION.lock().is_some() {
         return None;
     }
-    let serial = NEXT_DP_SESSION
-        .fetch_update(
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-            |n| n.checked_add(1),
-        )
-        .ok()?;
+    let serial = next_external_scanout_serial()?;
     with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported()
             || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
@@ -2801,19 +2836,10 @@ fn step_external_sst_inner(bar: &MmioRegion, stop: bool) -> Result<bool, narf_fi
     });
     drop(slot);
     if let Some(fb) = publish {
-        publish_scanout_owned(Some(fb), serial);
+        publish_external_scanout(fb, serial);
     }
     if done {
-        let withdrew = {
-            let mut active = ACTIVE_GENERIC.lock();
-            external_stop::withdraw(&mut active, serial)
-        };
-        if withdrew {
-            let observer = *SCANOUT_OBSERVER.lock();
-            if let Some(observer) = observer {
-                observer(None);
-            }
-        }
+        withdraw_external_scanout(serial);
     }
     Ok(done)
 }
@@ -3025,13 +3051,7 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
                 *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
             })
             .map(|(_, retained)| retained.phys_base);
-        let serial = NEXT_DP_SESSION
-            .fetch_update(
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Acquire,
-                |n| n.checked_add(1),
-            )
-            .ok();
+        let serial = next_external_scanout_serial();
         if let (Some(phys), Some(serial)) = (phys, serial) {
             MTL_PUBLISHED.store(serial, core::sync::atomic::Ordering::Release);
             publication(MtlPublication::Publish(
@@ -3063,19 +3083,11 @@ fn mtl_publish(request: MtlPublication) {
     match request {
         MtlPublication::Publish(fb, serial, pipe) => {
             MTL_PUBLISHED_PIPE.store(pipe as u8 + 1, core::sync::atomic::Ordering::Release);
-            publish_scanout_owned(Some(fb), serial)
+            publish_external_scanout(fb, serial)
         }
         MtlPublication::Withdraw(serial) => {
-            let withdrew = {
-                let mut active = ACTIVE_GENERIC.lock();
-                external_stop::withdraw(&mut active, serial)
-            };
-            if withdrew {
+            if withdraw_external_scanout(serial) {
                 MTL_PUBLISHED_PIPE.store(0, core::sync::atomic::Ordering::Release);
-                let observer = *SCANOUT_OBSERVER.lock();
-                if let Some(observer) = observer {
-                    observer(None);
-                }
             }
         }
     }
