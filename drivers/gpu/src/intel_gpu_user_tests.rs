@@ -2,6 +2,7 @@
 // only transports calls to the !Send device model; all fences come from GuCGt.
 use super::*;
 use crate::{
+    intel_gpu_engine::Engine,
     intel_gpu_exec::PpgttProbeResult,
     intel_gpu_fence::{CompletionFence, JobError},
     intel_gpu_render::{tests::User, DeviceInfo, RenderFile},
@@ -531,7 +532,6 @@ fn engines_param(user: &User, context: u32, entries: &[(u16, u16)], at: u64) -> 
 }
 
 fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
-    use crate::intel_gpu_engine::Engine;
     let platform = GtPlatform::Alchemist;
     let (w, arena, mut gt) = hardware_model(platform, 0x130044);
     prime(&mut gt, &w, 0x130044);
@@ -970,7 +970,7 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             ready(&mut gt, HANG_TIMEOUT + 100);
             assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
             let base = registered[&u32::from(id)];
-            model_runtime(&w, base, 0, 15_000_000, true);
+            model_runtime(&w, Engine::Rcs0, base, 0, 15_000_000, true);
             ready(&mut gt, HANG_TIMEOUT + 130);
             // The snapshot precedes servicing the disable request, which can
             // induce firmware engine reset. It owns no LRC/command addresses.
@@ -1067,19 +1067,22 @@ fn complete_by_hand(w: &Window, base: u32) {
 
 /// Hardware-style private timestamp/start stores and context switch state.
 /// The reference clock is 3 MHz for this fixture's RPM_CONFIG0 = 0.
-fn model_runtime(w: &Window, base: u32, start: u32, current: u32, active: bool) {
+/// The CTX_TIMESTAMP value slot follows the second LRI group, which
+/// #1821 moved on non-Gen12 render (issue #1871): 0x25 on non-Gen12
+/// Rcs0, 0x23 elsewhere — the same predicate production resolves
+/// through Engine::timestamp_value_slot (job_timeout::setup_inner).
+/// The slot is the *job's engine's* slot: a user batch on a CCS engine
+/// (a for_engine(Ccs3) context) takes 0x23 on Battlemage, not Rcs0's
+/// 0x25 — the caller passes the context's engine.
+fn model_runtime(w: &Window, engine: Engine, base: u32, start: u32, current: u32, active: bool) {
     let image = w.0.borrow().memory[&base].clone();
     let ring_base = image.borrow()[1024 + 9];
     let ring = w.0.borrow().memory[&ring_base].clone();
     let stamp = ring.borrow()[7];
-    // The CTX_TIMESTAMP value slot follows the second LRI group, which
-    // #1821 moved on non-Gen12 render (issue #1871): 0x25 on non-Gen12
-    // Rcs0, 0x23 elsewhere — the same predicate production resolves
-    // through Engine::timestamp_value_slot. The user-batch path always
-    // runs on Rcs0 (submit_user_inner → submit_ppgtt_probe_on(Rcs0)).
-    let slot = w.0.borrow().profile.map_or(0x23, |platform| {
-        crate::intel_gpu_engine::Engine::Rcs0.timestamp_value_slot(platform)
-    });
+    let slot =
+        w.0.borrow()
+            .profile
+            .map_or(0x23, |platform| engine.timestamp_value_slot(platform));
     assert_eq!(
         &ring.borrow()[..7],
         &[
@@ -1372,7 +1375,14 @@ fn smoke_userspace_unrecoverable_hangs_reset_the_gt() -> TestResult {
         let lost = match case {
             0 => {
                 // First expiry sends the disable, which is never answered.
-                model_runtime(&w, registered[&u32::from(id)], 0, 15_000_000, true);
+                model_runtime(
+                    &w,
+                    Engine::Rcs0,
+                    registered[&u32::from(id)],
+                    0,
+                    15_000_000,
+                    true,
+                );
                 ready(&mut gt, HANG_TIMEOUT + 130);
                 gt.poll(2 * HANG_TIMEOUT + 130)
             }
@@ -1426,14 +1436,14 @@ fn smoke_userspace_runtime_excludes_queueing_and_preemption() -> TestResult {
     }
     // A saved counter belongs to a preempted job; another context's live
     // MMIO value must not be added to this job's budget.
-    model_runtime(&w, base, 0, 3_000_000, false);
+    model_runtime(&w, Engine::Rcs0, base, 0, 3_000_000, false);
     w.0.borrow_mut().regs.insert(0x23a8, 900_000_000);
     ready(&mut gt, 3 * HANG_TIMEOUT + 130);
-    model_runtime(&w, base, 0, 6_000_000, true);
+    model_runtime(&w, Engine::Rcs0, base, 0, 6_000_000, true);
     ready(&mut gt, 4 * HANG_TIMEOUT + 130);
-    model_runtime(&w, base, 0, 6_000_000, false);
+    model_runtime(&w, Engine::Rcs0, base, 0, 6_000_000, false);
     ready(&mut gt, 5 * HANG_TIMEOUT + 130);
-    model_runtime(&w, base, 0, 9_000_000, true);
+    model_runtime(&w, Engine::Rcs0, base, 0, 9_000_000, true);
     ready(&mut gt, 6 * HANG_TIMEOUT + 130);
     assert!(fence.result().is_none());
     assert!(!context.banned());
@@ -1470,7 +1480,14 @@ fn smoke_userspace_runtime_stuck_active_counter_is_a_hang() -> TestResult {
         ready(&mut gt, now);
         service_contexts(&w, &mut registered, false);
     }
-    model_runtime(&w, registered[&u32::from(id)], 0, 3_000_000, true);
+    model_runtime(
+        &w,
+        Engine::Rcs0,
+        registered[&u32::from(id)],
+        0,
+        3_000_000,
+        true,
+    );
     ready(&mut gt, HANG_TIMEOUT + 130);
     assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
     ready(&mut gt, 2 * HANG_TIMEOUT + 130);
@@ -1517,7 +1534,14 @@ fn smoke_userspace_runtime_unknown_or_unreadable_requires_full_reset() -> TestRe
             ready(&mut gt, 2 * HANG_TIMEOUT + 130);
             gt.poll(3 * HANG_TIMEOUT + 130)
         } else {
-            model_runtime(&w, registered[&u32::from(id)], 0, 3_000_000, true);
+            model_runtime(
+                &w,
+                Engine::Rcs0,
+                registered[&u32::from(id)],
+                0,
+                3_000_000,
+                true,
+            );
             match case {
                 1 => w.0.borrow_mut().fail_cpu_sync = true,
                 2 => {
@@ -1600,7 +1624,6 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_i915_copy1_query_map_and_execution() -> TestResult {
-    use crate::intel_gpu_engine::Engine;
     let platform = GtPlatform::Battlemage;
     let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
     prime(&mut gt, &w, 0xdfc);

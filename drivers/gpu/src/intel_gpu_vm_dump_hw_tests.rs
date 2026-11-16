@@ -53,7 +53,14 @@ fn smoke_hardware_vm_dump_retains_closed_user_bo_through_capture_and_full_reset(
     }
     // First expiry attempts isolated context recovery. Leave its disable
     // unanswered so the bounded second expiry requires a full GT reset.
-    model_runtime(&w, registered[&u32::from(id)], 0, 15_000_000, true);
+    model_runtime(
+        &w,
+        crate::intel_gpu_engine::Engine::Rcs0,
+        registered[&u32::from(id)],
+        0,
+        15_000_000,
+        true,
+    );
     ready(&mut gt, HANG_TIMEOUT + 130);
     let lost_at = 2 * HANG_TIMEOUT + 130;
     assert!(matches!(
