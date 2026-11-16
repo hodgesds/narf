@@ -43,8 +43,6 @@
 14632 narf_drivers_wireless::rtlwifi::prepare_native::prepare_rtl8723be::{{closure}}
 14408 narf_drivers_gpu::amdgpu_mes12_hw::Engine<I>::start::{{closure}}
 14408 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe::{{closure}}
-14296 narf_drivers_wireless::brcmfmac::native_runtime::start
-13960 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::service_media_guc
 13848 narf_time::timer::timers_prepare_cpu
 13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
 13560 narf_drivers_wireless::ath10k::interface::publish_with_mac
@@ -84,9 +82,7 @@
 8912 narf_drivers_gpu::intel_gpu_gt::media::MediaGuc<M,A>::start
 8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
 8808 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
-8952 narf_drivers_wireless::brcmfmac::native_runtime::start::{{closure}}
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
-8680 narf_drivers_wireless::cyw43439::bootstrap::probe
 8664 narf_drivers_wireless::iwlwifi::device::ap::<impl narf_drivers_wireless::iwlwifi::device::Device>::ap_control::{{closure}}
 8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
 8576 narf_userspace::sysvipc::sys_msgget
