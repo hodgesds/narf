@@ -3134,7 +3134,18 @@ fn build_tcb_frame(
         ipv4_frame_len(options.len(), payload.len())
     };
     if dev.zero_copy_tx() {
-        let frame = if t.is_ipv6 {
+        // A connection bound to a transmit queue builds in that queue's
+        // pool: the frame is posted on that queue's ring and its buffer
+        // recycled there, so each pool covers only its own ring. Before the
+        // binding exists (the first frame) the flow hash picks the pool.
+        let bound = t
+            .tx_bind
+            .as_ref()
+            .map(|bind| bind.queue)
+            .filter(|&queue| usize::from(queue) < dev.tx_pool_queues());
+        let frame = if let Some(queue) = bound {
+            dev.tx_acquire_on_queue(total, queue)
+        } else if t.is_ipv6 {
             dev.tx_acquire(total)
         } else {
             dev.tx_acquire_ipv4_flow(

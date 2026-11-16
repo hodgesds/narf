@@ -1715,6 +1715,21 @@ impl NetIfaceSnapshot {
         self.tx_acquire_from_pool(len, pools.acquire_ipv4_flow(src, dst, src_port, dst_port)?)
     }
 
+    /// Acquire from transmit queue `queue`'s own pool and no other, for a
+    /// connection already bound to that queue: its frame is then posted and
+    /// recycled on the ring whose pool it came from, so that pool covers
+    /// exactly what its ring holds in flight. `None` when the queue has no
+    /// pool, the frame does not fit, or the pool is empty (backpressure).
+    pub(crate) fn tx_acquire_on_queue(&self, len: usize, queue: u16) -> Option<crate::Frame> {
+        let pools = self.tx_pools.as_ref()?;
+        self.tx_acquire_from_pool(len, pools.acquire_pool_on(usize::from(queue))?)
+    }
+
+    /// Number of per-queue zero-copy pools; 0 when zero-copy TX is off.
+    pub(crate) fn tx_pool_queues(&self) -> usize {
+        self.tx_pools.as_ref().map_or(0, |pools| pools.pools.len())
+    }
+
     fn tx_acquire_from_pool(
         &self,
         len: usize,
@@ -3046,6 +3061,55 @@ mod zc_tx_tests {
         TestResult::Pass
     }
     kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_ipv4_flow_affinity);
+
+    /// A connection bound to transmit queue N must build in queue N's pool
+    /// even when its flow hash names another queue, and an empty bound pool
+    /// is backpressure, never a buffer borrowed from another queue's ring.
+    fn smoke_iface_zero_copy_tx_bound_queue_pool() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_lib::id::DomainId;
+
+        let name = register("zc-bound-selftest", [2, 0, 0, 0, 0, 4], dummy_send);
+        let q0 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 1));
+        let q1 = Arc::new(DmaPool::new(2048, DomainId::DRIVER_0, 1));
+        if q0.prefill(1) != 1 || q1.prefill(1) != 1 {
+            return TestResult::Fail("could not prefill bound-queue TX pools");
+        }
+        enable_zero_copy_tx_pools_with_affinity(
+            &name,
+            dummy_send_frame,
+            alloc::vec![Arc::clone(&q0), Arc::clone(&q1)],
+            16,
+            true,
+        );
+        let snapshot = match lookup(&name) {
+            Some(snapshot) => snapshot,
+            None => return TestResult::Fail("bound-queue interface lookup failed"),
+        };
+        if snapshot.tx_pool_queues() != 2 {
+            return TestResult::Fail("snapshot did not report one pool per queue");
+        }
+        let frame = match snapshot.tx_acquire_on_queue(64, 1) {
+            Some(frame) => frame,
+            None => return TestResult::Fail("bound-queue acquire failed"),
+        };
+        if frame.queue() != 1 || q1.available() != 0 || q0.available() != 1 {
+            return TestResult::Fail("bound acquire did not draw from its own queue's pool");
+        }
+        if snapshot.tx_acquire_on_queue(64, 1).is_some() || q0.available() != 1 {
+            return TestResult::Fail("empty bound pool borrowed another queue's buffer");
+        }
+        if snapshot.tx_acquire_on_queue(64, 2).is_some() {
+            return TestResult::Fail("acquire succeeded on a queue with no pool");
+        }
+        let (buf, _off, _len, queue) = frame.into_parts_with_offset_and_queue();
+        tx_release_on(&name, queue, buf);
+        if q1.available() != 1 {
+            return TestResult::Fail("bound frame did not recycle to its queue");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_bound_queue_pool);
 
     fn smoke_iface_software_gro_is_per_device() -> TestResult {
         let enabled = register("gro-enabled-selftest", [2, 0, 0, 0, 0, 2], dummy_send);

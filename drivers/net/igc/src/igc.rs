@@ -169,9 +169,8 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use narf_bus::{enable_msix, map_bar_control, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
-use narf_io::alloc_coherent;
 use narf_ipc::{channel, Consumer, Producer};
-use narf_lib::{id::DomainId, sync::IrqSafeSpinLock};
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, OffloadCapabilities, TxMeta, RX_RING_N, TX_RING_N};
 
 const STOPPED: u8 = 0;
@@ -442,6 +441,14 @@ pub struct Igc {
     recovery_requested: AtomicBool,
     completion_autopsy_pending: AtomicBool,
     pub(crate) irq_routes: Vec<IrqRoute>,
+    /// `coalesce_us` as last programmed, for the receive tasks' dynamic
+    /// moderation (Linux `rx_itr_setting`), read without the settings lock.
+    itr_setting: AtomicU32,
+    /// Bumped whenever EITR is reprogrammed, so a receive task drops the
+    /// interval it last wrote.
+    itr_epoch: AtomicU32,
+    /// Negotiated speed as last published, 0 while unknown.
+    link_mbps: AtomicU32,
     state: AtomicU8,
     active: AtomicUsize,
     control_busy: AtomicBool,
@@ -595,7 +602,8 @@ impl Igc {
                 rx_entries: COUNT as u32,
                 tx_entries: COUNT as u32,
                 channels: count as u16,
-                coalesce_us: 166,
+                // Linux `IGC_DEFAULT_ITR`: dynamic, conservative.
+                coalesce_us: 3,
                 rss: narf_net::rss::RssConfig::standard(count, 128),
                 link: narf_net::nic::LinkSettings {
                     advertised: if matches!(device.id.device, IGC_I220_V | IGC_I221_V) {
@@ -616,6 +624,9 @@ impl Igc {
             recovery_requested: AtomicBool::new(false),
             completion_autopsy_pending: AtomicBool::new(false),
             irq_routes,
+            itr_setting: AtomicU32::new(0),
+            itr_epoch: AtomicU32::new(0),
+            link_mbps: AtomicU32::new(0),
             state: AtomicU8::new(STOPPED),
             active: AtomicUsize::new(0),
             control_busy: AtomicBool::new(false),
@@ -684,6 +695,20 @@ impl Igc {
     }
     fn queues(&self) -> Arc<Vec<Arc<Queue>>> {
         self.queues.lock().clone()
+    }
+    /// Each queue's own TX pool, in queue order, for the stack's zero-copy
+    /// acquire: a frame is built in the pool of the queue it is sent on.
+    fn tx_pools(&self) -> Vec<Arc<narf_io::pool::DmaPool>> {
+        self.queues().iter().map(|q| q.tx_pool().clone()).collect()
+    }
+    /// The CPU queue `q`'s MSI-X vector is steered to, where its receive
+    /// pump runs (Linux NAPI polls on the CPU that took the interrupt).
+    fn queue_cpu_of(&self, q: usize) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(route) = self.route(q) {
+            return route.cpu;
+        }
+        queue_cpu(q)
     }
     fn route(&self, q: usize) -> Option<IrqRoute> {
         if self.irq_routes.is_empty() {
@@ -897,6 +922,47 @@ impl Igc {
         Ok(())
     }
 
+    /// Linux `igc_ring_irq_enable` → `igc_update_ring_itr`, run by a queue's
+    /// receive task as it re-arms the vector: fold the work done since the
+    /// last re-arm into the vector's interval and write EITR only when it
+    /// changes. `state` is (EITR epoch, interval, counters at last update).
+    fn moderate(&self, route: IrqRoute, queue: &Queue, state: &mut (u32, u32, crate::itr::Work)) {
+        let Some(conservative) = crate::itr::dynamic_mode(self.itr_setting.load(Ordering::Acquire))
+        else {
+            return;
+        };
+        let epoch = self.itr_epoch.load(Ordering::Acquire);
+        if state.0 != epoch {
+            // EITR was reprogrammed to its start value by a reset.
+            *state = (epoch, crate::itr::START_ITR, state.2);
+        }
+        let s = queue.statistics();
+        let now = crate::itr::Work {
+            rx_packets: s[5],
+            rx_bytes: s[6],
+            tx_packets: s[1],
+            tx_bytes: s[2],
+        };
+        let last = state.2;
+        let work = crate::itr::Work {
+            rx_packets: now.rx_packets.saturating_sub(last.rx_packets),
+            rx_bytes: now.rx_bytes.saturating_sub(last.rx_bytes),
+            tx_packets: now.tx_packets.saturating_sub(last.tx_packets),
+            tx_bytes: now.tx_bytes.saturating_sub(last.tx_bytes),
+        };
+        state.2 = now;
+        let speed = match self.link_mbps.load(Ordering::Acquire) {
+            0 => None,
+            mbps => Some(mbps),
+        };
+        let next = crate::itr::ring_itr(state.1, speed, conservative, work);
+        if next != state.1 {
+            state.1 = next;
+            self.hw
+                .write(0x1680 + u64::from(route.index) * 4, crate::itr::eitr(next));
+        }
+    }
+
     fn configure_interrupts(&self) {
         if self.irq_routes.is_empty() {
             return;
@@ -918,10 +984,19 @@ impl Igc {
             self.hw.write(0x1700 + i as u64 * 4, ivar);
         }
         self.hw.write(0x1740, 0x8000);
-        let ticks = (self.settings.lock().coalesce_us * 1000 / 256) & 0x7ffc;
+        let coalesce = self.settings.lock().coalesce_us;
+        // Dynamic modes start at `IGC_START_ITR` and are moved by each
+        // queue's receive task (`igc_update_ring_itr`); otherwise the
+        // interval is fixed.
+        let value = if crate::itr::dynamic_mode(coalesce).is_some() {
+            crate::itr::eitr(crate::itr::START_ITR)
+        } else {
+            ((coalesce * 1000 / 256) & 0x7ffc) | (1 << 31)
+        };
+        self.itr_setting.store(coalesce, Ordering::Release);
+        self.itr_epoch.fetch_add(1, Ordering::AcqRel);
         for r in &self.irq_routes {
-            self.hw
-                .write(0x1680 + u64::from(r.index) * 4, ticks | (1 << 31));
+            self.hw.write(0x1680 + u64::from(r.index) * 4, value);
         }
         let mask = (1u32 << self.irq_routes.len()) - 1;
         self.hw.write(0x152c, mask);
@@ -958,22 +1033,34 @@ impl Igc {
         self.queues().len()
     }
 
-    pub fn tx(&self, bytes: &[u8], meta: &TxMeta) -> Result<(), IgcError> {
-        if bytes.len() < 14 || bytes.len() > MAX_TSO {
-            return Err(IgcError::QueueTooSmall);
+    /// Copy a borrowed frame into a buffer of the queue it will be posted
+    /// on ([`Queue::tx_copy`]). An empty pool whose ring already holds every
+    /// frame it can is a full ring: the frame is refused as one would be.
+    fn copy_for_queue(&self, bytes: &[u8], timing: narf_net::TxTiming) -> Result<Frame, IgcError> {
+        let q = timing
+            .queue
+            .map_or_else(|| self.settings.lock().rss.rx_queue(bytes), usize::from);
+        let queues = self.queues();
+        let queue = queues.get(q).ok_or(IgcError::QueueTooSmall)?;
+        match queue.tx_copy(bytes) {
+            Ok(mut frame) => {
+                frame.set_tx_timing(timing);
+                Ok(frame)
+            }
+            Err(crate::queue::TxCopyRefusal::Exhausted) => {
+                self.stats.lock().tx_rejected += 1;
+                Err(IgcError::QueueTooSmall)
+            }
+            Err(crate::queue::TxCopyRefusal::Invalid) => Err(IgcError::QueueTooSmall),
         }
-        let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
-            .map_err(|_| IgcError::Other("TX allocation failed"))?;
-        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        self.submit_frame(Frame::new(buffer, bytes.len() as u32), *meta)
+    }
+    pub fn tx(&self, bytes: &[u8], meta: &TxMeta) -> Result<(), IgcError> {
+        let frame = self.copy_for_queue(bytes, Default::default())?;
+        self.submit_frame(frame, *meta)
     }
     /// Borrowed frames are copied; only submit_frame transfers DMA ownership.
     pub fn tx_frame(&self, frame: &Frame) -> Result<(), IgcError> {
-        let mut buffer = alloc_coherent(frame.len() as usize, DomainId::DRIVER_0)
-            .map_err(|_| IgcError::QueueTooSmall)?;
-        buffer.as_mut_slice()[..frame.len() as usize].copy_from_slice(frame.payload());
-        let mut owned = Frame::new(buffer, frame.len());
-        owned.set_tx_timing(frame.tx_timing());
+        let owned = self.copy_for_queue(frame.payload(), frame.tx_timing())?;
         self.submit_frame(owned, frame.tx_meta())
     }
     pub fn submit_frame(&self, frame: Frame, meta: TxMeta) -> Result<(), IgcError> {
@@ -1580,13 +1667,25 @@ impl narf_net::txq::TxBackpressure for Igc {
         meta: TxMeta,
         charge: Option<narf_net::txq::TxCharge>,
     ) -> Result<(), narf_net::txq::TxRefusal> {
-        if bytes.len() < 14 || bytes.len() > MAX_TSO {
-            return Err(narf_net::txq::TxRefusal::Dropped);
-        }
-        let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
-            .map_err(|_| narf_net::txq::TxRefusal::Dropped)?;
-        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        let queues = self.queues();
+        let queue = queues
+            .get(usize::from(q))
+            .ok_or(narf_net::txq::TxRefusal::Dropped)?;
+        // The stack copies only when its zero-copy acquire found this
+        // queue's pool empty. The copy goes into the same pool; when that is
+        // still empty and the ring already holds every frame it can, the
+        // queue is full: stop it (`NETDEV_TX_BUSY`) and let the completion
+        // that returns a buffer wake it, as a full descriptor ring does.
+        let mut frame = match queue.tx_copy(bytes) {
+            Ok(frame) => frame,
+            Err(crate::queue::TxCopyRefusal::Exhausted) => {
+                queue.txq().refused();
+                return Err(narf_net::txq::TxRefusal::Busy);
+            }
+            Err(crate::queue::TxCopyRefusal::Invalid) => {
+                return Err(narf_net::txq::TxRefusal::Dropped)
+            }
+        };
         if let Some(charge) = charge {
             frame.set_tx_charge(charge);
         }
@@ -1729,17 +1828,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         controller.link_sample(),
     );
     narf_net::iface::set_offloads(&name, OFFLOADS);
-    let mut pools = Vec::new();
-    for _ in 0..controller.num_queues() {
-        let pool = Arc::new(narf_io::pool::DmaPool::new(MAX_TSO, DomainId::DRIVER_0, 8));
-        let _ = pool.prefill(8);
-        pools.push(pool);
-    }
     narf_net::iface::enable_zero_copy_tx_context(
         &name,
         controller.cookie,
         send_owned,
-        pools,
+        controller.tx_pools(),
         0,
         true,
     );
@@ -1942,7 +2035,7 @@ impl narf_net::Interface for IgcInterface {
     }
     fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
         narf_net::rss::QueueAffinity {
-            core: queue_cpu(q as usize),
+            core: self.0.queue_cpu_of(q as usize),
             irq: self.0.route(q as usize).map(|r| r.vector),
         }
     }
@@ -1991,12 +2084,19 @@ fn spawn_pumps(
     for q in 0..4 {
         let rx = device.clone();
         let producer = producer.clone();
-        let mut spec = narf_scheduler::TaskSpec::unthrottled();
+        // Linux NAPI: a queue is polled in softirq context on the CPU its
+        // vector interrupts, so its ring, its transmit completions and the
+        // flows RSS steers to it stay on one core.
+        let mut spec = narf_scheduler::TaskSpec::unthrottled()
+            .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
         spec.affinity = narf_scheduler::affinity::Affinity::pinned(
-            narf_scheduler::affinity::CpuId(queue_cpu(q)),
+            narf_scheduler::affinity::CpuId(device.queue_cpu_of(q)),
         );
         narf_scheduler::spawn_with_spec(
             async move {
+                // This vector's interval and the queue's work counters when
+                // it was last set (`igc_update_ring_itr` state).
+                let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     let waiter = route.map(|r| {
@@ -2005,71 +2105,80 @@ fn spawn_pumps(
                             narf_time::Deadline::after_ms(10),
                         )
                     });
-                    let frames = if let Ok(_op) = rx.operation() {
-                        let queues = rx.queues();
-                        if let Some(queue) = queues.get(q) {
+                    // Only a reset replaces the queue set; one handle serves
+                    // the whole poll.
+                    let queue = rx.queues().get(q).cloned();
+                    let frames = match (rx.operation(), queue.as_ref()) {
+                        (Ok(_op), Some(queue)) => {
                             queue.poll_xsk(&rx.hw, q, rx.mtu());
-                            let (f, drops) = queue.receive(&rx.hw, q, rx.mtu(), 64);
-                            rx.stats.lock().rx_drops += drops;
-                            narf_net::iface::note_rx_drop(rx.name(), drops);
+                            let budget = narf_net::napi::DEFAULT_BUDGET as usize;
+                            let (f, drops) = queue.receive(&rx.hw, q, rx.mtu(), budget);
+                            // Device-wide counters only when there is
+                            // something to count: no shared lock per poll.
+                            if drops != 0 {
+                                rx.stats.lock().rx_drops += drops;
+                                narf_net::iface::note_rx_drop(rx.name(), drops);
+                            }
                             f
-                        } else {
-                            Vec::new()
                         }
-                    } else {
-                        Vec::new()
+                        _ => Vec::new(),
                     };
-                    {
-                        // One interface lookup for the whole poll; its frame and
-                        // byte counts are folded in when the batch ends.
-                        let mut batch =
-                            (!frames.is_empty()).then(|| narf_net::iface::rx_batch(rx.name()));
+                    if !frames.is_empty() {
+                        // One interface lookup and one mirror check for the
+                        // whole poll; frame and byte counts are folded in
+                        // when the batch ends.
+                        let name = rx.name();
+                        let mut batch = narf_net::iface::rx_batch(name);
+                        let mirrored = crate::publish::rx_mirror_attached(name);
                         for mut frame in frames {
-                            let name = rx.name();
-                            crate::publish::mirror_rx(
-                                &frame,
-                                crate::publish::rx_mirror_attached(name),
-                                |f| {
-                                    let _ = producer.lock().try_send(f);
-                                },
-                            );
+                            use narf_net::bypass::classifier::XdpAction;
+                            crate::publish::mirror_rx(&frame, mirrored, |f| {
+                                let _ = producer.lock().try_send(f);
+                            });
                             let (action, len) =
                                 narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
                             frame.truncate(len as u32);
-                            if action == narf_net::bypass::classifier::XdpAction::Tx {
+                            if action == XdpAction::Tx {
+                                // The transmit completion recycles it.
                                 if rx.submit_frame(frame, TxMeta::plain()).is_err() {
                                     narf_net::bypass::classifier::count_xdp_tx_drop();
                                 }
-                            } else {
-                                let timestamp = frame.rx_meta().timestamp_ns;
-                                use narf_net::bypass::classifier::XdpAction;
-                                match (action, batch.as_mut()) {
-                                    (
-                                        XdpAction::Pass | XdpAction::RedirectCpu { .. },
-                                        Some(batch),
-                                    ) => batch.receive(frame.payload_mut(), timestamp),
-                                    _ => native_redirect(
-                                        name,
-                                        frame.payload_mut(),
-                                        action,
-                                        timestamp,
-                                    ),
+                                continue;
+                            }
+                            let timestamp = frame.rx_meta().timestamp_ns;
+                            match action {
+                                XdpAction::Pass | XdpAction::RedirectCpu { .. } => {
+                                    batch.receive(frame.payload_mut(), timestamp)
                                 }
+                                _ => native_redirect(name, frame.payload_mut(), action, timestamp),
+                            }
+                            // Dispatch copied what it keeps, so the buffer
+                            // re-arms a slot on a later poll instead of
+                            // going back to the page allocator (Linux
+                            // `igc_reuse_rx_page`).
+                            if let Some(queue) = queue.as_ref() {
+                                queue.recycle(frame.into_parts().0);
                             }
                         }
                     }
-                    // The wake pass, once per poll: this poll reclaimed the
-                    // queue's transmit completions (`poll_xsk`), so resume
-                    // the connections that were waiting for them. No queue
-                    // lock is held here.
-                    if let Some(queue) = rx.queues().get(q) {
+                    if let Some(queue) = queue.as_ref() {
+                        // The wake pass, once per poll: this poll reclaimed
+                        // the queue's transmit completions (`poll_xsk`), so
+                        // resume the connections that were waiting for them.
+                        // No queue lock is held here.
                         queue.txq().run_wakeups();
+                        // Replace RX buffers a consumer kept, here in task
+                        // context and never inside `receive`.
+                        queue.replenish_rx();
                     }
                     let pending = if let Ok(_op) = rx.operation() {
+                        if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
+                            rx.moderate(r, queue, &mut itr);
+                        }
                         if let Some(r) = route {
                             rx.hw.write(0x1524, 1u32 << r.index);
                         }
-                        rx.queues().get(q).is_some_and(|queue| queue.pending_rx())
+                        queue.as_ref().is_some_and(|queue| queue.pending_rx())
                     } else {
                         false
                     };
@@ -2093,68 +2202,83 @@ fn spawn_pumps(
             spec,
         );
     }
+    // The frame-ring transmit consumer and the maintenance worker have no
+    // queue locality: frames are steered to a queue by flow hash after this
+    // task takes them, and maintenance touches device-wide state. Both run
+    // wherever the scheduler has room instead of on the boot CPU, where
+    // they competed with queue 0's receive pump.
     let tx = device.clone();
-    narf_scheduler::spawn(async move {
-        while !tx.removed.load(Ordering::Acquire) {
-            let result = {
-                use core::future::Future;
-                let receive = tx_cons.recv();
-                let timer = narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000));
-                let mut receive = core::pin::pin!(receive);
-                let mut timer = core::pin::pin!(timer);
-                core::future::poll_fn(|cx| {
-                    if let core::task::Poll::Ready(v) = receive.as_mut().poll(cx) {
-                        return core::task::Poll::Ready(Some(v));
+    narf_scheduler::spawn_with_spec(
+        async move {
+            while !tx.removed.load(Ordering::Acquire) {
+                let result = {
+                    use core::future::Future;
+                    let receive = tx_cons.recv();
+                    let timer = narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000));
+                    let mut receive = core::pin::pin!(receive);
+                    let mut timer = core::pin::pin!(timer);
+                    core::future::poll_fn(|cx| {
+                        if let core::task::Poll::Ready(v) = receive.as_mut().poll(cx) {
+                            return core::task::Poll::Ready(Some(v));
+                        }
+                        if timer.as_mut().poll(cx).is_ready() {
+                            return core::task::Poll::Ready(None);
+                        }
+                        core::task::Poll::Pending
+                    })
+                    .await
+                };
+                match result {
+                    Some(Ok(frame)) => {
+                        if !tx.removed.load(Ordering::Acquire) {
+                            let meta = frame.tx_meta();
+                            let _ = tx.submit_frame(frame, meta);
+                        }
                     }
-                    if timer.as_mut().poll(cx).is_ready() {
-                        return core::task::Poll::Ready(None);
-                    }
-                    core::task::Poll::Pending
-                })
-                .await
-            };
-            match result {
-                Some(Ok(frame)) => {
-                    if !tx.removed.load(Ordering::Acquire) {
-                        let meta = frame.tx_meta();
-                        let _ = tx.submit_frame(frame, meta);
-                    }
+                    Some(Err(_)) => break,
+                    None => {}
                 }
-                Some(Err(_)) => break,
-                None => {}
             }
-        }
-    });
+        },
+        narf_scheduler::TaskSpec::kernel_any(),
+    );
     // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues the
     // reset when a queue's transmit is stuck; it stops with the device.
     let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
         Arc::downgrade(&device) as _;
     narf_net::watchdog::DevWatchdog::start_for_device(weak, IGC_TX_TIMEOUT_NS);
-    narf_scheduler::spawn(async move {
-        while !device.removed.load(Ordering::Acquire) {
-            device.maintain_admin();
-            if device.recovery_requested.swap(false, Ordering::AcqRel) {
-                let _ = device.recover();
-            }
-            device.maintain();
-            let link = device.link_sample();
-            let last = *device.published_link.lock();
-            if link != last {
-                if let Ok(_control) = device.control() {
-                    if let Ok(_op) = device.operation() {
-                        let pause = device.settings.lock().pause;
-                        let _ = hardware::update_pause(&device.hw, pause, device.mtu());
-                        if device.schedule.lock().active() || device.merge.lock().config.enabled {
-                            crate::traffic::adjust_offset(&device.hw);
+    narf_scheduler::spawn_with_spec(
+        async move {
+            while !device.removed.load(Ordering::Acquire) {
+                device.maintain_admin();
+                if device.recovery_requested.swap(false, Ordering::AcqRel) {
+                    let _ = device.recover();
+                }
+                device.maintain();
+                let link = device.link_sample();
+                let last = *device.published_link.lock();
+                if link != last {
+                    if let Ok(_control) = device.control() {
+                        if let Ok(_op) = device.operation() {
+                            let pause = device.settings.lock().pause;
+                            let _ = hardware::update_pause(&device.hw, pause, device.mtu());
+                            if device.schedule.lock().active() || device.merge.lock().config.enabled
+                            {
+                                crate::traffic::adjust_offset(&device.hw);
+                            }
                         }
                     }
+                    crate::publish::publish_link(device.name(), link);
+                    device
+                        .link_mbps
+                        .store(link.speed_mbps.unwrap_or(0), Ordering::Release);
+                    *device.published_link.lock() = link;
                 }
-                crate::publish::publish_link(device.name(), link);
-                *device.published_link.lock() = link;
+                narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
             }
-            narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
-        }
-    });
+        },
+        narf_scheduler::TaskSpec::kernel_any(),
+    );
 }
 
 /// `dev->watchdog_timeo`: a queue whose transmit waited this long with

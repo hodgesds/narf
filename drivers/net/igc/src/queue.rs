@@ -11,7 +11,7 @@ use core::{
     ptr,
     sync::atomic::{fence, Ordering},
 };
-use narf_io::{alloc_coherent, DmaBuffer};
+use narf_io::{alloc_coherent, pool::DmaPool, DmaBuffer};
 use narf_lib::{id::DomainId, sync::IrqSafeSpinLock};
 use narf_net::bypass::{
     umem::DmaLease,
@@ -48,6 +48,39 @@ pub(crate) const COUNT: usize = 256;
 /// descriptor, and the two descriptors of the launch-time workaround.
 pub(crate) const MAX_FRAME_DESCS: u32 = (crate::packet::MAX_TSO + 4095).div_ceil(4096) as u32 + 3;
 const BUFFER: usize = 2048;
+
+/// Most frames a TX ring of `tx_count` descriptors holds in flight: one
+/// slot stays empty to tell full from empty, and a frame takes at least one
+/// data descriptor (a frame with no offload has no context descriptor).
+/// Linux maps one skb per descriptor chain and needs no pool; a queue whose
+/// stack builds frames in pool buffers needs one buffer for each frame the
+/// ring can hold, and no more can ever be posted.
+pub(crate) const fn tx_frame_capacity(tx_count: usize) -> usize {
+    tx_count - 1
+}
+
+/// Buffers a TX pool starts with: the frames of worst-case size the ring
+/// holds (`ring / DESC_NEEDED`). Demand beyond that grows the pool towards
+/// [`tx_frame_capacity`] on the copy path; it never shrinks below what is in
+/// flight, and it never allocates while the ring's frames reach the cap.
+pub(crate) const fn tx_pool_prefill(tx_count: usize) -> usize {
+    let n = tx_count / MAX_FRAME_DESCS as usize;
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
+
+/// Why [`Queue::tx_copy`] produced no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxCopyRefusal {
+    /// Every buffer the ring can hold is free-listed or posted and none is
+    /// free (or the growth allocation failed): wait for a completion.
+    Exhausted,
+    /// The frame is malformed or larger than a pool buffer.
+    Invalid,
+}
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default)]
@@ -101,8 +134,8 @@ struct Rx {
     /// Completed frames whose descriptor reported an L3/L4 checksum error
     /// (Linux `rx_queue_%u_csum_err`).
     csum_err: u64,
-    /// Frames dropped because no RX buffer could be allocated (Linux
-    /// `rx_queue_%u_alloc_failed`).
+    /// Frames dropped because no RX buffer was ready to re-arm their slot
+    /// (Linux `rx_queue_%u_alloc_failed`): the stack held every spare.
     alloc_failed: u64,
 }
 
@@ -118,6 +151,17 @@ pub(crate) struct Queue {
     /// Stop/wake state and waiters shared with the stack. Its thresholds
     /// come from this ring's length, whatever `ethtool -G` made it.
     txq: Arc<narf_net::txq::TxQueue>,
+    /// This ring's TX buffers (Linux has none: it maps the skb). The stack
+    /// builds zero-copy frames in them and the copy path copies into them;
+    /// completion returns them here, on the core that cleans this ring.
+    tx_pool: Arc<DmaPool>,
+    /// Most buffers `tx_pool` may own: [`tx_frame_capacity`] of this ring.
+    tx_pool_cap: usize,
+    /// Replacement RX buffers. A received frame leaves its buffer with the
+    /// stack and the slot is re-armed from here; the pump returns the buffer
+    /// once dispatch is done (Linux `igc_reuse_rx_page`), so the receive path
+    /// never calls the page allocator with the RX lock held.
+    rx_pool: DmaPool,
     merge_events: core::sync::atomic::AtomicU8,
     rx: IrqSafeSpinLock<Rx>,
 }
@@ -234,6 +278,21 @@ impl Queue {
         for _ in 0..rx_count {
             buffers.push(allocate(BUFFER)?);
         }
+        let tx_pool_cap = tx_frame_capacity(tx_count);
+        let tx_pool = Arc::new(DmaPool::new(
+            crate::packet::MAX_TSO,
+            DomainId::DRIVER_0,
+            tx_pool_cap,
+        ));
+        if tx_pool.prefill(tx_pool_prefill(tx_count)) == 0 {
+            return Err(IgcError::Other("DMA allocation failed"));
+        }
+        // One spare buffer for every RX slot: a whole ring of frames can be
+        // in the stack while the ring is armed again.
+        let rx_pool = DmaPool::new(BUFFER, DomainId::DRIVER_0, rx_count);
+        if rx_pool.prefill(rx_count) != rx_count {
+            return Err(IgcError::Other("DMA allocation failed"));
+        }
         let q = Self {
             tx_ring: allocate(tx_count * 16)?,
             rx_ring: allocate(rx_count * 16)?,
@@ -246,6 +305,9 @@ impl Queue {
                 ring_len: tx_count as u32,
                 max_frame_descs: MAX_FRAME_DESCS,
             }),
+            tx_pool,
+            tx_pool_cap,
+            rx_pool,
             merge_events: core::sync::atomic::AtomicU8::new(0),
             rx: IrqSafeSpinLock::new(Rx {
                 head: 0,
@@ -272,6 +334,70 @@ impl Queue {
 
     pub(crate) fn txq(&self) -> &Arc<narf_net::txq::TxQueue> {
         &self.txq
+    }
+
+    /// The pool the stack builds this queue's zero-copy frames in.
+    pub(crate) fn tx_pool(&self) -> &Arc<DmaPool> {
+        &self.tx_pool
+    }
+    /// Most buffers the TX pool may own.
+    pub(crate) fn tx_pool_cap(&self) -> usize {
+        self.tx_pool_cap
+    }
+    /// Spare RX buffers ready to re-arm a slot.
+    pub(crate) fn rx_pool(&self) -> &DmaPool {
+        &self.rx_pool
+    }
+
+    /// Copy `bytes` into one of this ring's TX buffers. A free buffer is
+    /// used if there is one. Otherwise the pool grows by one buffer, but only
+    /// while the buffers it already owns (free plus posted) are fewer than
+    /// the frames the ring can hold: past that point an empty pool means the
+    /// ring is full of this queue's frames, and the caller must wait for the
+    /// completion that returns one ([`TxCopyRefusal::Exhausted`]). Growth is
+    /// therefore bounded per ring and stops once demand is covered; the
+    /// steady state never allocates.
+    pub(crate) fn tx_copy(&self, bytes: &[u8]) -> Result<Frame, TxCopyRefusal> {
+        if bytes.len() < 14 || bytes.len() > self.tx_pool.buf_len() {
+            return Err(TxCopyRefusal::Invalid);
+        }
+        let mut buffer = match self.tx_pool.try_acquire() {
+            Some(buffer) => buffer,
+            None => {
+                let posted = self.tx.lock().pending.len();
+                if self.tx_pool.available() + posted >= self.tx_pool_cap {
+                    return Err(TxCopyRefusal::Exhausted);
+                }
+                alloc_coherent(self.tx_pool.buf_len(), DomainId::DRIVER_0)
+                    .map_err(|_| TxCopyRefusal::Exhausted)?
+            }
+        };
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        Ok(Frame::new(buffer, bytes.len() as u32))
+    }
+
+    /// Return a buffer whose frame is finished with to the pool it fits:
+    /// a TX-sized buffer to the TX pool, a receive buffer (one that went out
+    /// through XDP_TX, or one the pump finished dispatching) to the RX pool.
+    /// Anything smaller, or a buffer a full pool cannot keep, is freed.
+    pub(crate) fn recycle(&self, buffer: DmaBuffer) {
+        if buffer.len() >= self.tx_pool.buf_len() {
+            self.tx_pool.release(buffer);
+        } else if buffer.len() >= BUFFER {
+            self.rx_pool.release(buffer);
+        }
+    }
+
+    /// Top the RX pool back up to one buffer per slot, in task context with
+    /// no queue lock held (the allocation half of Linux
+    /// `igc_alloc_rx_buffers`). Buffers leave the pool for good only when a
+    /// frame is kept by its consumer, so this is normally a no-op check.
+    pub(crate) fn replenish_rx(&self) -> usize {
+        let free = self.rx_pool.available();
+        if free >= self.rx_count / 2 {
+            return 0;
+        }
+        self.rx_pool.prefill(self.rx_count - free)
     }
     pub(crate) fn set_owner(&self, name: &'static str) {
         *self.owner.lock() = name;
@@ -548,13 +674,10 @@ impl Queue {
             tx.bytes += u64::from(p.frame.len());
             bytes += u64::from(p.frame.len());
             tx.clean = (p.end + 1) % self.tx_count;
-            // Owned Frames may come from the stack's DMA pool; return them
-            // using its existing release hook after completion.
+            // The buffer goes back to this ring's pool, on the core that
+            // cleans this ring: no interface lookup, no shared pool.
             match p.frame {
-                Packet::Frame(frame) => {
-                    let q = frame.queue();
-                    narf_net::iface::tx_release_on(*self.owner.lock(), q, frame.into_parts().0);
-                }
+                Packet::Frame(frame) => self.recycle(frame.into_parts().0),
                 Packet::Umem { lease, socket, len } => {
                     tx.completed_umem
                         .push_back(Completed { lease, socket, len })
@@ -668,12 +791,9 @@ impl Queue {
             r.write(0xe018 + q as u64 * 0x40, tx.next as u32);
             // The frame was not posted, so its buffer goes back where a
             // completed frame's does. Dropping it instead freed the pages
-            // and shrank the queue's eight-buffer zero-copy pool by one per
-            // refusal, for good: after eight, every frame on the queue was
-            // built in a `Vec`, copied into a fresh 64 KiB allocation, and
-            // carried no charge. `into_parts` returns the charge.
-            let pool = frame.queue();
-            narf_net::iface::tx_release_on(*self.owner.lock(), pool, frame.into_parts().0);
+            // and shrank the queue's zero-copy pool by one per refusal, for
+            // good. `into_parts` returns the charge.
+            self.recycle(frame.into_parts().0);
             return Err(IgcError::TxBusy);
         }
         if needed > free {
@@ -990,7 +1110,7 @@ impl Queue {
                     rx.dropping = true;
                     rx.partial = None;
                 } else if eop && rx.partial.is_none() && status & 8 == 0 {
-                    if let Ok(replacement) = allocate(BUFFER) {
+                    if let Some(replacement) = self.rx_pool.try_acquire() {
                         let filled = core::mem::replace(&mut rx.buffers[slot], replacement);
                         let mut frame = Frame::with_offset_on_queue(
                             filled,

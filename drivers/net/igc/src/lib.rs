@@ -26,6 +26,8 @@ mod hardware;
 #[cfg(feature = "builtin")]
 mod irq_tests;
 #[cfg(feature = "builtin")]
+mod itr;
+#[cfg(feature = "builtin")]
 mod merge;
 #[cfg(feature = "builtin")]
 mod packet;

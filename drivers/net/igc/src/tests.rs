@@ -3111,11 +3111,12 @@ fn smoke_igc_refused_frame_returns_its_buffer_to_the_pool() -> TestResult {
     const NAME: &str = "igc-pool-selftest";
     let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 10], plain);
     check!(name == NAME, "the test interface was renamed");
-    let pool = alloc::sync::Arc::new(narf_io::pool::DmaPool::new(2048, DomainId::DRIVER_0, 8));
-    check!(pool.prefill(8) == 8, "pool prefill failed");
-    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
     let q = Queue::new_sized(64, 64).unwrap();
     q.set_owner(NAME);
+    // The stack builds in the queue's own pool, as probe publishes it.
+    let pool = q.tx_pool().clone();
+    let prefilled = pool.available();
+    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
     let m = Model::new();
     let aware = crate::queue::TxOptions {
         backpressure: true,
@@ -3142,7 +3143,7 @@ fn smoke_igc_refused_frame_returns_its_buffer_to_the_pool() -> TestResult {
     let available = pool.available();
     let _ = narf_net::iface::unregister(NAME);
     check!(
-        available == 8,
+        available == prefilled,
         "refused frames were not returned to their pool"
     );
     TestResult::Pass
@@ -3150,4 +3151,224 @@ fn smoke_igc_refused_frame_returns_its_buffer_to_the_pool() -> TestResult {
 kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_refused_frame_returns_its_buffer_to_the_pool
+);
+
+fn smoke_igc_tx_pool_sized_from_ring() -> TestResult {
+    // The pool is bounded by what its ring can hold in flight (one frame per
+    // descriptor, one slot reserved) and starts with the ring's worth of
+    // worst-case frames (`ring / DESC_NEEDED`), whatever `ethtool -G` set.
+    for tx in [64usize, 256, 1024] {
+        let q = Queue::new_sized(tx, 64).unwrap();
+        check!(
+            q.tx_pool_cap() == tx - 1,
+            "TX pool bound is not the ring's frame capacity"
+        );
+        check!(
+            q.tx_pool().available() == tx / crate::queue::MAX_FRAME_DESCS as usize,
+            "TX pool did not start with one ring of worst-case frames"
+        );
+        check!(
+            q.tx_pool().buf_len() == crate::packet::MAX_TSO,
+            "TX pool buffers cannot hold the largest frame the device takes"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_tx_pool_sized_from_ring);
+
+fn smoke_igc_tx_pool_exhaustion_backpressures_until_clean() -> TestResult {
+    // Hardware boot 414df61d: eight 64 KiB buffers per queue against a
+    // 256-slot ring left every TCP frame past the eighth in flight to be
+    // copied into a fresh allocation ("transmit pool empty", 2,595 times).
+    // The pool must grow to cover the ring, never past it, then refuse
+    // until a completion returns a buffer, and never allocate again.
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    let bytes = tcp4(0);
+    let cap = q.tx_pool_cap();
+    for i in 0..cap {
+        let Ok(frame) = q.tx_copy(&bytes) else {
+            return TestResult::Fail("copy refused before the ring was full");
+        };
+        let meta = TxMeta::plain().with_more(i + 1 != cap);
+        check!(
+            q.post(&m, 0, frame, meta, 1500).is_ok(),
+            "a frame of the pool did not fit the ring"
+        );
+    }
+    check!(
+        q.tx_copy(&bytes).err() == Some(crate::queue::TxCopyRefusal::Exhausted),
+        "the pool grew past the frames its ring can hold"
+    );
+    // The driver stops the queue on exhaustion (`try_xmit_copy`)...
+    q.txq().refused();
+    check!(q.txq().is_stopped(), "exhaustion did not stop the queue");
+    // ...and cleaning the ring wakes it and refills the pool.
+    for slot in 0..cap {
+        complete_tx(&q, slot);
+    }
+    check!(q.reclaim() == cap, "completed frames not reclaimed");
+    check!(
+        !q.txq().is_stopped() && q.tx_pool().available() == cap,
+        "cleaning did not wake the queue and return every buffer"
+    );
+    q.txq().run_wakeups();
+    // Warm: a second ring's worth is served without one miss.
+    let misses = q.tx_pool().stats().cache_misses;
+    let mut held = Vec::new();
+    for _ in 0..cap {
+        match q.tx_copy(&bytes) {
+            Ok(frame) => held.push(frame),
+            Err(_) => return TestResult::Fail("a warm pool refused a frame"),
+        }
+    }
+    check!(
+        q.tx_pool().stats().cache_misses == misses,
+        "a warm pool missed (allocated) on the steady-state path"
+    );
+    // Malformed and oversized frames are errors, not backpressure.
+    check!(
+        q.tx_copy(&bytes[..10]).err() == Some(crate::queue::TxCopyRefusal::Invalid)
+            && q.tx_copy(&vec![0; crate::packet::MAX_TSO + 1]).err()
+                == Some(crate::queue::TxCopyRefusal::Invalid),
+        "an unsendable frame was reported as backpressure"
+    );
+    for frame in held {
+        q.recycle(frame.into_parts().0);
+    }
+    check!(
+        q.tx_pool().available() == cap,
+        "recycled TX buffers were not kept"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_pool_exhaustion_backpressures_until_clean
+);
+
+fn smoke_igc_rx_rearms_from_recycled_buffers() -> TestResult {
+    // Linux igc_clean_rx_irq re-arms from reused pages; the receive path
+    // here took a fresh page from the allocator for every frame, under the
+    // RX lock with interrupts off. It must re-arm from the queue's pool and
+    // get every dispatched buffer back.
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    let b = tcp4(0);
+    let spare = q.rx_pool().available();
+    check!(spare == 64, "RX pool does not hold one spare per slot");
+    for slot in 0..4 {
+        inject(&q, slot, &b, 3, 0, 0);
+    }
+    let (frames, drops) = q.receive(&m, 0, 1500, 64);
+    check!(
+        frames.len() == 4 && drops == 0 && q.rx_pool().available() == spare - 4,
+        "received frames were not replaced from the RX pool"
+    );
+    check!(
+        q.rx_pool().stats().cache_misses == 0,
+        "re-arming missed the RX pool"
+    );
+    for frame in frames {
+        q.recycle(frame.into_parts().0);
+    }
+    check!(
+        q.rx_pool().available() == spare,
+        "dispatched RX buffers were not recycled"
+    );
+    // Every spare held by consumers: the frame is dropped and its own
+    // buffer re-arms the slot, so the ring never shrinks.
+    let mut held = Vec::new();
+    while let Some(buffer) = q.rx_pool().try_acquire() {
+        held.push(buffer);
+    }
+    inject(&q, 4, &b, 3, 0, 0);
+    let (frames, drops) = q.receive(&m, 0, 1500, 64);
+    check!(
+        frames.is_empty() && drops == 1 && q.statistics()[9] == 1,
+        "a frame with no spare buffer was not dropped and counted"
+    );
+    inject(&q, 5, &b, 3, 0, 0);
+    let (frames, _) = q.receive(&m, 0, 1500, 64);
+    check!(
+        frames.is_empty() && m.value(0xc018) == 5,
+        "the slot was not re-armed after the drop"
+    );
+    // Consumers kept the spares: the pump's replenish restores them.
+    drop(held);
+    check!(
+        q.replenish_rx() == spare && q.rx_pool().available() == spare,
+        "replenish did not restore one spare per slot"
+    );
+    check!(
+        q.replenish_rx() == 0,
+        "a full RX pool was replenished again"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_rx_rearms_from_recycled_buffers);
+
+fn smoke_igc_dynamic_itr_follows_linux_ring_itr() -> TestResult {
+    // Linux igc_update_ring_itr / igc_write_itr at ecd997b0189a, with the
+    // literal ITR values of igc.h (START 648, 4K 980, 20K 196).
+    use crate::itr::{dynamic_mode, eitr, ring_itr, Work};
+    let frames = |bytes: u64, n: u64| Work {
+        rx_packets: n,
+        rx_bytes: bytes * n,
+        ..Work::default()
+    };
+    let gig = Some(1000);
+    check!(
+        dynamic_mode(3) == Some(true)
+            && dynamic_mode(1) == Some(false)
+            && dynamic_mode(0).is_none()
+            && dynamic_mode(166).is_none(),
+        "rx-usecs 1/3 are not the dynamic modes"
+    );
+    check!(
+        eitr(648) == 0x8000_0288 && eitr(0) == 0x8000_7ffc,
+        "EITR word does not match igc_write_itr"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(1514, 10)) == 769,
+        "full-size frames: (1514 + 24) / 2"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(600, 10)) == 208,
+        "mid-size frames get the /3 boost"
+    );
+    check!(
+        ring_itr(648, gig, true, frames(64, 100)) == 196
+            && ring_itr(648, gig, false, frames(64, 100)) == 44,
+        "small frames: conservative floor is 20K interrupts/s"
+    );
+    let tso = Work {
+        rx_packets: 4,
+        rx_bytes: 4 * 66,
+        tx_packets: 1,
+        tx_bytes: 64_000,
+    };
+    check!(
+        ring_itr(648, gig, true, tso) == 1500,
+        "larger direction's mean, capped at 3000 bytes"
+    );
+    check!(
+        ring_itr(777, gig, true, Work::default()) == 777,
+        "an idle vector changed interval"
+    );
+    check!(
+        ring_itr(648, Some(100), true, frames(64, 100)) == 980
+            && ring_itr(648, Some(10), true, Work::default()) == 980,
+        "10/100 links are not fixed at 4K interrupts/s"
+    );
+    check!(
+        ring_itr(648, Some(2500), true, frames(1514, 10)) == 769
+            && ring_itr(648, None, true, frames(1514, 10)) == 769,
+        "gigabit-and-above policy depends on the speed"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dynamic_itr_follows_linux_ring_itr
 );

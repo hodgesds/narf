@@ -257,7 +257,12 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
 - A zero-copy TX allocator chooses its queue before handing out a `Frame` and
   records that choice in the frame. The driver submits and recycles the buffer
   on the same queue; it must not return it to an interface-wide pool shared by
-  independent completion cores.
+  independent completion cores. A TCP connection bound to a transmit queue
+  (`Tcb::tx_bind`) acquires only from that queue's pool
+  (`NetIfaceSnapshot::tx_acquire_on_queue`); an empty bound pool falls back to
+  the copy path, never to another queue's pool, so each pool covers exactly
+  the frames its own ring holds in flight. Only a connection's first frame,
+  before the binding exists, uses the flow hash or round-robin choice.
 - Resolved interface snapshots retain references to their TX recyclers. The
   routing/TCP fast path acquires from that snapshot, not by taking the global
   interface-registry lock once per packet.
