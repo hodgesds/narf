@@ -476,6 +476,13 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         }
         self.packet.check_bt().map_err(Error::Transport)
     }
+    /// A relative worker wakeup only; the packet owner retains MMIO.
+    pub(super) fn coex_wait_us(&self) -> Option<u64> {
+        if self.terminal() || self.service_held() {
+            return None;
+        }
+        self.packet.coex_wait_us()
+    }
     /// Stop (if still running) and report whether the packet owner proved
     /// DMA quiescence and released its storage.
     pub(super) fn retire(&mut self) -> bool {

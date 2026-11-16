@@ -31,11 +31,9 @@
 //! - `btcoex_enable` / `btcoex_disable`: the scheme dispatcher,
 //!   including the BT-active pull-down programming on enable.
 //!
-//! Not this file: the live-owner integration (the owner holds `Btcoex`
-//! and calls `init_btcoex_hw` / `init_2wire` / `init_3wire` /
-//! `btcoex_enable` / `btcoex_disable` / `deinit`; see #1931), the
-//! driver-layer BT profile list and duty-cycle scheme (#1932 / #2056),
-//! and the WoW `mci_enabled` flag integration (#1935).
+//! `MciLink` also owns live MCI duty deadlines (`duty_cycle`), serviced
+//! by the EDMA packet owner. The profile calculation lives in `mci.rs`.
+//! Native 2WIRE/3WIRE enable/init call sites remain separate work.
 
 use super::mci::{
     gpio_request_out, Mci, AR_BTCOEX_WL_WEIGHTS0, AR_BTCOEX_WL_WEIGHTS1, AR_BTCOEX_WL_WEIGHTS2,
@@ -300,13 +298,32 @@ pub(in crate::ath9k) struct MciLink {
     /// no-op). Never program address 0: the DMA addresses are only
     /// handed to the engine once this is `Some`.
     pub(in crate::ath9k) dma: Option<Arc<DmaBuffer>>,
+    duty: duty_cycle::DutyCycle,
 }
+
+mod duty_cycle;
 
 /// The shared MCI link, behind the lock the owner and the packet engine
 /// both take (never held across an await).
 pub(in crate::ath9k) type SharedMciLink = Arc<IrqSafeSpinLock<MciLink>>;
 
 impl MciLink {
+    /// Driver timer defaults (`gpio.c::ath_init_btcoex_timer`), distinct
+    /// from the zeroed hardware-only MCI engine. No timer runs at probe.
+    pub(in crate::ath9k) fn new(mut btcoex: Btcoex, dma: Option<Arc<DmaBuffer>>) -> Self {
+        if btcoex.scheme == Scheme::Mci {
+            let profile = &mut btcoex.mci.profiles;
+            profile.duty_cycle = 55;
+            profile.btcoex_period = 45;
+            profile.btcoex_no_stomp = 20;
+            profile.bt_stomp_type = StompType::Low;
+        }
+        Self {
+            btcoex,
+            dma,
+            duty: duty_cycle::DutyCycle::default(),
+        }
+    }
     /// The live-MCI gate: the scheme is MCI and the DMA ring exists.
     /// `init_scheme` with coexistence compiled in selects MCI exactly
     /// when `mci_is_enabled(true, hw_caps)` holds, so this is that

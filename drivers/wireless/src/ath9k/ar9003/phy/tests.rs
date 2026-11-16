@@ -881,6 +881,26 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     let fast = super::super::initvals_ar9565::AR9565_1P0_MODES_FAST_CLOCK[0];
     let fast_write = (u64::from(fast[0]), fast[1]);
     let fast_count = |io: &Regs| io.writes.iter().filter(|w| **w == fast_write).count();
+    // ar9565_1p0_baseband_core initializes this register even though
+    // ar9003_hw_spur_mitigate_mrc_cck is skipped on AR9565. Require that
+    // sole literal INI write, rather than incorrectly requiring no write.
+    let cck_unchanged = |io: &Regs| {
+        io.writes
+            .iter()
+            .filter(|&&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+            .copied()
+            .eq([(AR_PHY_CCK_SPUR_MIT, 0x4000_0014)])
+    };
+
+    // AR9300/AR9565 baseband-core INI also initializes the B mask.
+    // An out-of-range second spur must leave that sole zero write intact.
+    let bmask_unchanged = |io: &Regs| {
+        io.writes
+            .iter()
+            .filter(|&&(r, _)| r == AR_PHY_SPUR_MASK_B)
+            .copied()
+            .eq([(AR_PHY_SPUR_MASK_B, 0)])
+    };
 
     // AR9565 at 2437: MRC-CCK never runs, the OFDM self-correlation
     // filter is skipped, and the second in-range spur (2437, offset 0)
@@ -895,7 +915,7 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     let chan = io.regs.get(&AR_PHY_CHAN_SPUR_MASK).copied().unwrap_or(0);
     let mask_a = io.regs.get(&AR_PHY_SPUR_MASK_A).copied().unwrap_or(0);
     let mask_b = io.regs.get(&AR_PHY_SPUR_MASK_B).copied().unwrap_or(0);
-    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+    if !cck_unchanged(&io)
         || timing11 & 0x8000_0000 != 0
         || timing11 & 0x4000_0000 == 0
         || (timing11 >> 20) & 0x3ff != 139
@@ -914,6 +934,12 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
         || fast_count(&io) != 1
         || expected_chip(Chip::Ar9565, 0, &image2437, 2437) != prepared
     {
+        narf_console::klog!(
+            "AR9565 spur: cck_writes={} timing11={:#x} pilot={:#x} chan={:#x} mask_a={:#x} mask_b={:#x} fast={} expected={}\n",
+            io.writes.iter().filter(|&&(r, _)| r == AR_PHY_CCK_SPUR_MIT).count(),
+            timing11, pilot, chan, mask_a, mask_b, fast_count(&io),
+            expected_chip(Chip::Ar9565, 0, &image2437, 2437) == prepared
+        );
         return TestResult::Fail("AR9565 2437 MHz spur mitigation differs from ar9003_phy.c");
     }
 
@@ -926,8 +952,8 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     }
     let timing11 = io.regs.get(&AR_PHY_TIMING11).copied().unwrap_or(0);
     let pilot = io.regs.get(&AR_PHY_PILOT_SPUR_MASK).copied().unwrap_or(0);
-    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
-        || io.writes.iter().any(|&(r, _)| r == AR_PHY_SPUR_MASK_B)
+    if !cck_unchanged(&io)
+        || !bmask_unchanged(&io)
         || timing11 & 0x8000_0000 == 0
         || (timing11 >> 20) & 0x3ff != 372
         || (pilot >> 12) & 0x1f != 0
@@ -943,10 +969,7 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     let (io, _) = prepare_chip(Chip::Ar9300, 3, &image, 2412);
     let cck = io.regs.get(&AR_PHY_CCK_SPUR_MIT).copied().unwrap_or(0);
     let timing11 = io.regs.get(&AR_PHY_TIMING11).copied().unwrap_or(0);
-    if cck & 1 != 1
-        || timing11 & 0x8000_0000 == 0
-        || io.writes.iter().any(|&(r, _)| r == AR_PHY_SPUR_MASK_B)
-        || fast_count(&io) != 0
+    if cck & 1 != 1 || timing11 & 0x8000_0000 == 0 || !bmask_unchanged(&io) || fast_count(&io) != 0
     {
         return TestResult::Fail("AR9300 2412 MHz spur contrast differs from ar9003_phy.c");
     }
@@ -961,7 +984,7 @@ fn smoke_ath9k_ar9565_spur_mitigation_and_fast_clock() -> TestResult {
     if prepared.is_err() {
         return TestResult::Fail("AR9565 5180 MHz preparation was refused");
     }
-    if io.writes.iter().any(|&(r, _)| r == AR_PHY_CCK_SPUR_MIT)
+    if !cck_unchanged(&io)
         || fast_count(&io) != 2
         || expected_chip(Chip::Ar9565, 0, &image5g, 5180) != prepared
     {

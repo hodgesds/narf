@@ -20,6 +20,7 @@ struct Model {
     signal: RefCell<Option<Arc<crate::ath9k::irq::Signal>>>,
     delivered: RefCell<Vec<bool>>,
     writes: RefCell<Vec<(u64, u32)>>,
+    fail_write: Cell<Option<u64>>,
 }
 
 impl Model {
@@ -43,6 +44,7 @@ impl Model {
             signal: RefCell::new(None),
             delivered: RefCell::new(Vec::new()),
             writes: RefCell::new(Vec::new()),
+            fail_write: Cell::new(None),
         }
     }
     fn reg(&self, register: u64) -> u32 {
@@ -130,6 +132,9 @@ impl Port for &Model {
         Ok(self.reg(register))
     }
     fn write(&self, register: u64, value: u32) -> Result<(), Error> {
+        if self.fail_write.get() == Some(register) {
+            return Err(Error::Access);
+        }
         self.writes.borrow_mut().push((register, value));
         match register {
             0x0074 => self.hp.borrow_mut().push(value),
@@ -198,7 +203,7 @@ fn no_mci_link() -> SharedMciLink {
     super::super::btcoex::init_scheme(&mut btcoex, true, 0);
     super::super::btcoex::init_mci(&mut btcoex);
     Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-        super::super::btcoex::MciLink { btcoex, dma: None },
+        super::super::btcoex::MciLink::new(btcoex, None),
     ))
 }
 
@@ -453,10 +458,7 @@ fn check_mci_service_begin() -> Result<(), &'static str> {
     btcoex.mci.gpm_len = mci::MCI_GPM_MAX_ENTRY as u32;
     btcoex.mci.bt_state = mci::BtState::Awake;
     let link = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-        super::super::btcoex::MciLink {
-            btcoex,
-            dma: Some(Arc::new(dma)),
-        },
+        super::super::btcoex::MciLink::new(btcoex, Some(Arc::new(dma))),
     ));
     // SAFETY: isolated model begins parked; no physical controller is touched.
     let mut packet =
@@ -767,3 +769,5 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_edma_mci_service_begin
 );
+
+mod mci_duty;

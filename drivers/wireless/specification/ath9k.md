@@ -928,7 +928,7 @@ tree (the same `true` the owner wiring passes to `init_scheme`);
 upstream Linux defaults it off (`init.c`: the `btcoex_enable` module
 parameter, `0` unless passed `1`), so the enablement default is a
 maintainer-visible choice, and the owner-held `Btcoex` becomes the
-single source for the flag once #2028 lands.
+single source for the operational flag through `MciLink::mci_enabled`.
 
 Scheme: `btcoex::init_scheme` selects NONE when coexistence is
 disabled, MCI when the capability is set, 3WIRE otherwise (every AR9003
@@ -1058,12 +1058,33 @@ period halving; `ATH_MCI_CONFIG_DISABLE_TUNING` (`0x4000`) skips the
 tuning block while the period halving and BDR bonus still apply. The
 scheme outputs (`duty_cycle`, `btcoex_period`, `bt_stomp_type`,
 `btcoex_no_stomp`, `aggr_limit`, `concur_txprio`) are stored on the
-list for the owner to apply (weights via `bt_stomp`, enable/disable);
-Linux applies them inline from the `mci_work` workqueue with a btcoex
-timer pause/resume and hw enable/disable, which have no in-tree
-equivalent yet, so the scheme runs inline in the interrupt path
-instead of deferred. `is_ht` is recorded by the owner on channel
-change; until then the scheme uses the non-HT branch.
+list. The state calculation runs inline in the GPM walk; each update
+increments a scheme revision. The EDMA packet owner applies that revision
+before returning from interrupt service, cancelling both old deadlines,
+disabling weights, copying the concurrent-TX priorities and starting a
+new period on 2 GHz. A 5 GHz transition disables weights and cancels
+timed work. The current signed owner is legacy20 (`is_ht` remains false).
+
+`MciLink::new` initializes the driver timer defaults from
+`gpio.c::ath_init_btcoex_timer`: period 45 ms, duty 55%, LOW stomp,
+no-stomp edge at 20 ms. Profile updates use the MCI scheme above (for
+example PAN's 53 ms period becomes 26 ms on legacy 2 GHz, with a 16 ms
+no-stomp edge on AR9462 or 15 ms on AR9565). `service_duty_cycle` follows
+`ath_btcoex_period_timer` / `ath_btcoex_no_stomp_timer`: LOW becomes NONE
+at the second edge, ALL becomes LOW, and a new period restores the
+selected stomp weights. Late service starts one fresh period and discards
+the previous period's no-stomp edge. Zero periods and a no-stomp edge
+beyond the period fail the owner rather than spinning the worker.
+
+The existing async netdev worker sleeps until the earlier of its 20 ms
+housekeeping tick and `Engine::coex_wait_us`; no lock spans the await.
+Timed edges are serviced even without an IRQ cause. They use the original
+packet port's current authority and register checks; the deadline grants
+none. Stop, reset preparation and WoW cancel both deadlines before
+hardware mutation; successful start/reset completion or WoW interrupt
+restoration requests an immediate fresh period. An access or MMIO failure
+cancels both deadlines and fails the packet owner, suppressing later
+writes. No independent timer task can race calibration or power changes.
 
 Deliberate deviations, all documented in code: the Linux deadbeef spin
 loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
@@ -1073,22 +1094,20 @@ assigns `mci->wlan_ver_major/minor`, so the coex version response
 answers 0.0, kept verbatim. AIC is hard-disabled in Linux
 (`ar9003_aic.c` returns false), so the AIC states read 0.
 
-Not in this step: the live-owner integration (owner holds `Btcoex`,
-`service_begin` routes `Events.mci`, reset path calls
-`start_reset`/`end_reset`, periodic `check_bt`, channel change calls
-`switch_2g5g`/`update_wlan_channels`, applying the computed scheme and
-recording HT state, and the owner calls
-`init_btcoex_hw` / `init_2wire` / `init_3wire` / `btcoex_enable` /
-`btcoex_disable` / `deinit` for the 2WIRE/3WIRE schemes). Fixture tests
-cover the message exchange end to end, capability
-Not in this step: the 2WIRE/3WIRE btcoex enable/init paths; the WoW
-`mci_enabled` flag integration (issue #1935 wires it once MCI lands).
-Fixture tests cover the message exchange end to end, capability
+Remaining: RSSI-driven concurrent-TX enablement with calibrated TX-power
+transitions, FTP/audio traffic feedback, and the native 2WIRE/3WIRE
+enable/init call sites. Priority values are applied to the weight engine;
+production does not yet enable concurrent TX. MCI DMA/message/IRQ/reset/channel
+and periodic-check integration, plus the WoW flag, are already wired as
+described above. Fixture tests cover the message exchange, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
 walk, the calibration handshake, and the BT profile list + duty-cycle
 scheme (profile add/update/remove, the SCO/ACL caps, status-update
 management counting, the flush on stale BT info, and every scheme
-branch including `DISABLE_TUNING`), plus the WoW `mci_enabled`
+branch including `DISABLE_TUNING`). Native EDMA/DMA-GPM tests also cover
+both chips' timer boundaries and literal weight images, equal-output
+profile rearming, critical-management ALL-to-LOW, late service, 5 GHz,
+reset/WoW/stop cancellation and failed authority/MMIO suppression, plus the WoW `mci_enabled`
 wiring (flag storage, the probe-time capability computation, and the
 `AR_RTC_KEEP_AWAKE` / `AR_STA_ID1_PWR_SAV` branches in `enable`).
 
@@ -2573,7 +2592,7 @@ program, matching the AR9280 station scope; ANI is not ported. Smokes
 `smoke_ath9k_ar9300_disable_and_full_sleep`. No physical AR9380/AR9390
 board record or receipt exists in-tree.
 
-**AR9580 (`ar9580_enablement`, in progress — not claimed).** Step 1
+**AR9580 (`ar9580_enablement`, implemented; validation pending).** Step 1
 (identity and INI): `ar9003::Chip::Ar9580` is PCIe `0x0033`
 (`hw.h::AR9300_DEVID_AR9580`, chip_chainmask 7). Linux tells it from an
 AR9300 only by `reg.h::AR_SREV_9580` (macVersion `AR_SREV_VERSION_9580`
@@ -2602,6 +2621,15 @@ unchanged. Smoke (written, not executed):
 `smoke_ath9k_ar9580_revision_split_and_ini_selection` (FNV-1a oracle over
 the 886 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers).
+
+The retained `ar9300_owner` also registers `0x0033`, binds its separate
+`N95A` per-board/per-channel admission record, dispatches its INI/gain
+tables and EEPROM board values, and runs the AR9300/AR9580
+`ar9003_hw_init_cal_soc` calibration path. The native EDMA station,
+in-place reset and retiring suspend/cold resume use that same owner.
+This completes the initial AR9300-equivalent legacy20 profile; ANI,
+HT/QoS/BA/power-save programs and physical board acceptance are outside
+that profile. Software and RF validation remain separate.
 
 **AR9462 (`ar9462_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2685,8 +2713,11 @@ link-loss window cannot expire first. Not done: PCI PME_En / D-state
 MCI engine work in suspend (setup, GPM handling, profile flush); the
 WoW `mci_enabled` flag itself is wired at probe (§3.12). Smoke (written, not executed):
 `smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation`.
-Remainder, not in this step: the AR9462 board-value
-deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
+The per-chip EEPROM board values (`board.rs`, including `thermo_cal`
+and switch tables), noise limits and PCOEM calibration branches are
+implemented, including live MCI profile duty-cycle application (§3.12).
+Remaining: MCI traffic/RSSI/power feedback, optional
+board-configuration deltas with no in-tree input, and physical acceptance.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
 `ar9003::Chip::Ar9485` is PCIe `0x0032`
@@ -2802,8 +2833,11 @@ every TX/RX gain mode, computed from the local Linux headers, plus
 the SerDes `pll_pwrsave` selection matrix) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
 WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
-`0x0034` subsystems). Remainder, not in this step: the AR9565 board-value
-deltas and per-chip calibration branches.
+`0x0034` subsystems). The per-chip EEPROM board values, noise limits,
+PCOEM calibration, saturated RX-IQ refusal and two-spur OFDM branch are
+implemented, including live MCI profile duty-cycle application (§3.12).
+Remaining: MCI traffic/RSSI/power feedback, optional
+board-configuration/antenna-diversity inputs and physical acceptance.
 
 **SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**
 `ah->config.pll_pwrsave` (`hw.h`, u8: CONTROL `BIT(0)`, ON_D3

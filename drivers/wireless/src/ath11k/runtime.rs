@@ -2651,6 +2651,7 @@ type RestartFut<'a, Q> = core::pin::Pin<
 >;
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
+    #[inline(never)]
     pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
         let clock = rt.core.hif.clock;
@@ -2658,7 +2659,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
         let tx_power_stats = rt.tx_power_stats.clone();
         let radar = rt.radar.clone();
-        Arc::new(Shared {
+        // Reserve the final allocation before constructing the large
+        // runtime and vdev bookkeeping; avoid Arc::new's value temporary.
+        let mut shared = Arc::<Self>::new_uninit();
+        Arc::get_mut(&mut shared).unwrap().write(Shared {
             rt: Mutex::new(Some(rt)),
             irq,
             clock,
@@ -2694,7 +2698,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             ops: IrqSafeSpinLock::new(VecDeque::new()),
             dead: AtomicBool::new(false),
             parked: IrqSafeSpinLock::new(Vec::new()),
-        })
+        });
+        // SAFETY: the unique Arc was fully initialized above and no
+        // reference or clone has been published yet.
+        unsafe { shared.assume_init() }
     }
 
     /// A recovery failed; nothing will bring the device back.
@@ -3270,22 +3277,24 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         pdev_id: u32,
     ) -> Result<Recovered, TransportError> {
         let power_cycle = matches!(notice, FwNotice::Reset(_));
-        self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| {
-                alloc::boxed::Box::pin(async move {
-                    qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
-                        TransportError::new(
-                            step::RECOVERY_FW,
-                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                            e.errno,
-                        )
+        super::future_heap::build(|| {
+            self.rebuild_after_transport_reset(
+                move |qmi: &mut Q| {
+                    alloc::boxed::Box::pin(async move {
+                        qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
+                            TransportError::new(
+                                step::RECOVERY_FW,
+                                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                                e.errno,
+                            )
+                        })
                     })
-                })
-            },
-            true,
-            matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
-            pdev_id,
-        )
+                },
+                true,
+                matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
+                pdev_id,
+            )
+        })
         .await
     }
 
@@ -4641,6 +4650,7 @@ pub type AhbStart<Io, Irq, Q> = (
 /// alive (see `AHB_RUNTIME`) because the firmware owns the core's
 /// memory until the device is torn down — mirroring `start_pci`'s
 /// `STRANDED_RT` handling.
+#[inline(never)]
 pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
@@ -4669,6 +4679,19 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     }
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, secure_random);
+    register_ahb_radios(shared, hw_cfg, single, radios, initial_reg)
+}
+
+/// Registration starts after the core/DP construction temporaries have
+/// left the stack. The same Shared retains every radio on all outcomes.
+#[inline(never)]
+fn register_ahb_radios<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
+    shared: Arc<Shared<Io, Irq, Q>>,
+    hw_cfg: super::mac::MacConfig,
+    single: bool,
+    radios: Vec<(u32, DeviceCaps)>,
+    initial_reg: Option<alloc::boxed::Box<wmi::RegInfo>>,
+) -> AhbStart<Io, Irq, Q> {
     let mut macs = Vec::with_capacity(radios.len());
     for (slot, (mac_id, caps)) in radios.iter().enumerate() {
         let slot = slot as u32;

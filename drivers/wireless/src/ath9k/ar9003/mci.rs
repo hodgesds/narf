@@ -1125,6 +1125,9 @@ pub(in crate::ath9k) struct Mci {
     /// Driver-layer BT profile list (`mci.c::ath_mci_profile`) and the
     /// duty-cycle scheme it selects (`ath_mci_update_scheme`).
     pub(super) profiles: ProfileList,
+    /// Every driver scheme update cancels/rearms the live duty timers,
+    /// even when the newly computed outputs equal their prior values.
+    pub(super) scheme_revision: u64,
     /// An UNHALT GPM is owed to BT.
     pub(super) unhalt_bt_gpm: bool,
     /// A HALT GPM was sent and not yet unhalted.
@@ -1179,6 +1182,7 @@ impl Mci {
             is_ht: false,
             query_bt: false,
             profiles: ProfileList::new(),
+            scheme_revision: 0,
             unhalt_bt_gpm: false,
             halted_bt_gpm: false,
             need_flush_btinfo: false,
@@ -2050,13 +2054,12 @@ fn adjust_aggr_limit(mci: &mut Mci) {
 /// bonus, and on 2 GHz a basic-rate profile adds 20% duty capped at
 /// 90% and the no-stomp airtime is recomputed.
 ///
-/// Deliberate deviation: Linux defers this to the `mci_work`
-/// workqueue and then pauses the btcoex timer, disables/enables the
-/// hw coexistence and resumes the timer. There is no workqueue or
-/// btcoex timer in-tree, so the scheme runs inline here (pure state,
-/// no hardware writes) and the owner applies the stored outputs
-/// (`bt_stomp` for the stomp type, enable/disable).
+/// Linux defers this to `mci_work`. Here the state calculation runs
+/// inline while walking GPMs; the packet owner observes the revision
+/// before returning from service and applies the disable/rearm and
+/// weights under the same station lock.
 fn update_scheme(mci: &mut Mci) {
+    mci.scheme_revision = mci.scheme_revision.wrapping_add(1);
     if mci.config & ATH_MCI_CONFIG_DISABLE_TUNING == 0 {
         let is_ar9565 = mci.chip == Chip::Ar9565;
         let profiles = &mut mci.profiles;

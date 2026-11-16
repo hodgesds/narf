@@ -71,6 +71,10 @@ pub(in crate::ath9k) trait Engine {
     /// One periodic MCI coexistence poll (`ar9003_mci_check_bt`); a
     /// no-op on engines without a live MCI link.
     fn check_bt(&mut self) -> Result<(), Error>;
+    /// Relative microseconds until a timed coexistence transition.
+    fn coex_wait_us(&self) -> Option<u64> {
+        None
+    }
     fn interrupt(&self) -> Option<Arc<irq::Signal>>;
     fn service_begin(&mut self) -> Result<Option<irq::Events>, Error>;
     fn service_end(&mut self) -> Result<(), Error>;
@@ -435,6 +439,9 @@ impl<P: Port> Engine for Dispatch<P> {
     }
     fn check_bt(&mut self) -> Result<(), Error> {
         dispatch!(self.check_bt())
+    }
+    fn coex_wait_us(&self) -> Option<u64> {
+        dispatch!(self.coex_wait_us())
     }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         dispatch!(self.interrupt())

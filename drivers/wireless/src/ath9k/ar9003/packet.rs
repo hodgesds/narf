@@ -510,6 +510,7 @@ impl<P: Port> Packet<P> {
             return Err(Error::Descriptor);
         }
         self.phase = Phase::Running;
+        self.mci.lock().resume_duty_cycle();
         Ok(())
     }
     /// The AR9002 `Packet::check_transmit` without the HT/EDCA/QoS/BA
@@ -571,6 +572,27 @@ impl<P: Port> Packet<P> {
             }
             mci::check_bt(io, &mut link.btcoex.mci)
         })
+    }
+    /// The worker's next weight transition, relative to the port clock.
+    pub(in crate::ath9k) fn coex_wait_us(&self) -> Option<u64> {
+        if self.phase != Phase::Running {
+            return None;
+        }
+        self.mci.lock().duty_cycle_wait_us(self.port.now_us())
+    }
+    fn service_coex(&mut self) -> Result<(), Error> {
+        let now = self.port.now_us();
+        if self.mci.lock().duty_cycle_wait_us(now) != Some(0) {
+            return Ok(());
+        }
+        let result = self.port.access(true, || {
+            with_io(&self.port, |io| self.mci.lock().service_duty_cycle(io, now))
+        });
+        if result.is_err() {
+            self.mci.lock().pause_duty_cycle();
+            self.phase = Phase::Failed;
+        }
+        result
     }
     /// Legacy frame at `rate` (`descriptor::transmit`).
     pub(in crate::ath9k) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
@@ -819,6 +841,10 @@ impl<P: Port> Packet<P> {
     /// fails this owner and queues the in-place reset
     /// ([`Self::reset_request`]), as `ath9k_queue_reset` does.
     pub(in crate::ath9k) fn service_begin(&mut self) -> Result<Option<irq::Events>, Error> {
+        // Timed edges must run even when no hardware interrupt is pending.
+        if self.phase == Phase::Running {
+            self.service_coex()?;
+        }
         let Some(mask) = self.irq else {
             return Ok(None);
         };
@@ -839,6 +865,7 @@ impl<P: Port> Packet<P> {
             } else {
                 ResetType::BbWatchdog
             });
+            self.mci.lock().pause_duty_cycle();
             self.phase = Phase::Failed;
             return Err(Error::Access);
         }
@@ -868,9 +895,12 @@ impl<P: Port> Packet<P> {
                 Ok((live, outcome))
             })?;
             if !isr_live || outcome.reset_requested {
+                self.mci.lock().pause_duty_cycle();
                 self.phase = Phase::Failed;
                 return Err(Error::Access);
             }
+            // Profile GPMs rearm weights immediately, in this service pass.
+            self.service_coex()?;
         }
         if events.rx_eol && mask.imr & irq::RX_EOL_ORN != 0 {
             // ath_isr: drop RXEOL|RXORN until the RX tasklet ran.
@@ -977,6 +1007,7 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Stopped;
+        self.mci.lock().pause_duty_cycle();
         let rx = self.stop_receive();
         let tx = self.abort_transmit();
         let interrupts = irq::kill(&self.port, self.irq.is_some_and(|m| m.msi)).and(
@@ -1004,6 +1035,7 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        self.mci.lock().pause_duty_cycle();
         irq::wow(&self.port, mask)?;
         self.irq = Some(irq::Mask {
             imr: irq::WOW_IMR,
@@ -1026,6 +1058,7 @@ impl<P: Port> Packet<P> {
         irq::restore(&self.port, full)?;
         self.irq = Some(full);
         self.phase = Phase::Running;
+        self.mci.lock().resume_duty_cycle();
         Ok(())
     }
     /// The cause the last failure queued for an in-place reset.
@@ -1050,6 +1083,7 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        self.mci.lock().pause_duty_cycle();
         let interrupts = self.irq.take();
         let killed = irq::kill(&self.port, interrupts.is_some_and(|m| m.msi));
         let rx = self.stop_receive();

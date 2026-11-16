@@ -217,6 +217,9 @@ impl<P: Port> station::Engine for Packet<P> {
     fn check_bt(&mut self) -> Result<(), Error> {
         Packet::check_bt(self)
     }
+    fn coex_wait_us(&self) -> Option<u64> {
+        Packet::coex_wait_us(self)
+    }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         Packet::interrupt(self)
     }

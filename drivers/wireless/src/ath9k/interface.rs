@@ -1459,17 +1459,23 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
                 worker.drain();
                 break;
             }
+            // Sample after drain: it may have consumed a BT profile GPM
+            // or started a new period. Release the radio lock before await.
+            let coex_wait = worker.radio.try_lock().and_then(|r| r.coex_wait_us());
+            let wait_ns = coex_wait.map_or(HOUSEKEEPING_NS, |us| {
+                us.saturating_mul(1000).clamp(1000, HOUSEKEEPING_NS)
+            });
             match (signal, seen) {
                 (Some(signal), Some(seen)) => {
-                    // MLME/RSNA deadlines are millisecond timers; the slow
-                    // housekeeping tick replaces 1 ms polling.
+                    // MCI duty edges can precede the housekeeping tick.
                     let tick = Box::pin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
-                        HOUSEKEEPING_NS,
+                        wait_ns,
                     )));
                     signal.wait(seen, tick).await;
                 }
                 _ => {
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(wait_ns.min(1_000_000)))
+                        .await;
                 }
             }
         }

@@ -3157,8 +3157,9 @@ the coexistence owner runs every composed call site.
   CCK LNA table, no `cck_highpwr` step) and
   `rtl8723be_dm_refresh_rate_adaptive_mask` (low threshold
   `low2high_rssi_thresh_for_ra40m` = 0, the 8821AE rule). Only the RA mask
-  refresh of `rtl8723be_dm_watchdog` is composed (DIG, false alarm, EDCCA,
-  CCK PD, EDCA turbo, ATC and TX-power tracking are not).
+  refresh was initially composed; the retained watchdog now also runs
+  false-alarm/RSSI collection, DIG, EDCCA, CCK PD and linked ATC.
+  EDCA turbo and calibrated TX-power tracking remain open.
   `power_runtime::disable_rtl8723be` = `_rtl8723be_poweroff_adapter`
   (LPS-enter flow, self-reset on MCUFWDL BIT7 + ready, MCU reset,
   MCUFWDL 0, card-disable flow, RSV_CTRL+1 pulse, RSV_CTRL 0x0e); the
@@ -3339,7 +3340,7 @@ the coexistence owner runs every composed call site.
     `special_packet` / IPS call sites from the shared station (handshake
     EAPOL replies produced inside the sync TX path are not covered — no
     async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond
-    the RA refresh except EDCA turbo, the ATC switch's linked branch and
+    the RA refresh except EDCA turbo and
     TX-power tracking (see `dm.rs`), short-preamble TX, TX-report
     matching for the station. Tests
     `smoke_rtl8723be_station_registers_and_rsvd_page`,
@@ -3352,6 +3353,19 @@ the coexistence owner runs every composed call site.
     `smoke_rtl8723be_dm_steps_false_alarm_dig_cck_edcca_atc`,
     `smoke_rtl8723be_dm_watchdog_linked_refresh` (written,
     unexecuted).
+
+**Linked ATC continuation (2026-11-16).** The original RTL8723BE RX
+owner now retains signed `phy_status_rpt.path_cfotail` samples at bytes
+9/10 only from error-free non-CCK frames matching its programmed BSSID.
+Samples survive lazy watchdog initialization. The linked watchdog uses
+path A for RF_1T1R, the source 3125/1280 kHz conversion, packet-count
+deduplication, large-jump filtering, 10/20 kHz crystal hysteresis, 0..63
+cap limits and the strict (-80,80) kHz ATC window. The unlinked helper
+retains the initial factory cap separately so an adjustment cannot become
+the new restore value. Native tests cover wire offsets/BSSID selection,
+signed extremes, stale samples, hysteresis, clamps and RX-to-watchdog
+composition. EDCA turbo, calibrated TX-power tracking, handshake-EAPOL
+coexistence before synchronous TX and PCIe ASPM remain open.
 
 ### RTL8723AE retained runtime (probe-admitted; station admission open)
 

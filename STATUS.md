@@ -172,6 +172,37 @@ validation remain required. The initial software paths are
 implemented; broader chip/PHY/feature/lifecycle coverage remains required before
 the branch target is met.
 
+The 2026-11-16 remaining-row continuation starts from `4daa0b5a9` after
+checking open PRs for overlap. It adds a retained IPQ6018
+WLFW-to-core conversation and RTL8723BE native CFO/linked-ATC handling,
+and reconciles delivered chip work against the TSV. AR9580's initial
+signed legacy20 owner moves to implementation pending validation;
+broader radio profiles and physical acceptance remain open. The family
+specs and TSV retain the actual residuals, including MCI traffic/RSSI/power
+feedback, A/BE channel/station composition and platform host ports.
+IPQ6018 also moves to pending validation after the composed native
+conversation passes. The ledgers now hold 13 open rows and 94 implemented
+pending validation.
+The same branch now also applies AR9462/AR9565 profile GPMs through live
+MCI duty deadlines in the existing async worker, including weight/priorities,
+5 GHz suppression and reset/WoW/stop cancellation. Native regression tests
+exercise both chips' literal timer/weight images and failed-access handling.
+Large ath11k runtime/netdev and Gen2 station construction state moves off
+callers' stacks; AHB bring-up/recovery and the Qualcomm fixture runner
+retain their futures on the heap. Six reported Wi-Fi/SoC stack-budget
+failures are resolved and five obsolete exceptions are removed, with no
+budget increases. The expanded suites pass 563/0/2 on x86_64 (diagnostic
+QEMU) and 563/0/3 on aarch64; the full aarch64 ath9k suite also passes
+317/0/0. Scoped strict release clippy and debug checks pass on both
+architectures, and formatting passes. The earlier normal x86_64 launch
+was blocked only by the GPU RS64 frame overage from PR #2164. That fix
+has since merged; this branch is rebased onto `8b34296a0` without
+duplicating it. The final normal x86_64 gate passes 563/0/2, its stack
+budget check, production boot and both btrfs postflight checks; scoped
+strict clippy, debug checking and formatting also pass. The aarch64
+repeat after rebasing was skipped at the user's request; the preceding
+aarch64 results above are retained. Physical acceptance remains pending.
+
 The first parallel feature wave adds retained API77 Intel management-queue
 ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
 eight-byte removal response), MT7921/MT7922 active scans with four directed or

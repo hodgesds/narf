@@ -628,10 +628,7 @@ fn btcoex_mci_link_gate() -> TestResult {
     let Some(dma) = mci_dma() else {
         return TestResult::Fail("MCI DMA allocation failed in the fixture");
     };
-    let link = MciLink {
-        btcoex,
-        dma: Some(Arc::new(dma)),
-    };
+    let link = MciLink::new(btcoex, Some(Arc::new(dma)));
     if !link.mci_enabled() {
         return TestResult::Fail("MCI scheme + DMA did not gate live");
     }
@@ -640,7 +637,7 @@ fn btcoex_mci_link_gate() -> TestResult {
     let mut btcoex = Btcoex::new(Chip::Ar9462);
     init_scheme(&mut btcoex, true, HW_CAP_MCI);
     init_mci(&mut btcoex);
-    let link = MciLink { btcoex, dma: None };
+    let link = MciLink::new(btcoex, None);
     if link.mci_enabled() {
         return TestResult::Fail("MCI scheme without DMA gated live");
     }
@@ -651,10 +648,7 @@ fn btcoex_mci_link_gate() -> TestResult {
     let Some(dma) = mci_dma() else {
         return TestResult::Fail("MCI DMA allocation failed in the fixture");
     };
-    let link = MciLink {
-        btcoex,
-        dma: Some(Arc::new(dma)),
-    };
+    let link = MciLink::new(btcoex, Some(Arc::new(dma)));
     if link.mci_enabled() {
         return TestResult::Fail("3WIRE scheme with DMA gated live");
     }

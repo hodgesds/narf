@@ -573,6 +573,65 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         iftype: u32,
         virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
     ) -> (Self, Consumer<Frame, TX_RING_N>) {
+        Self::build_on_vdev_with_lifecycle(
+            name,
+            shared,
+            mac,
+            mac_addr,
+            sinks,
+            vdev_id,
+            iftype,
+            virtual_lifecycle,
+            |device| device,
+        )
+    }
+
+    /// Construct a virtual netdev in its final allocation. No registry
+    /// sees the Arc until both rings and all owner fields are initialized.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // Same inputs as the by-value constructor.
+    fn new_arc_on_vdev_with_lifecycle(
+        name: &'static str,
+        shared: Arc<Shared<Io, Irq, Q>>,
+        mac: RtMac<Io, Irq, Q>,
+        mac_addr: [u8; 6],
+        sinks: Sinks,
+        vdev_id: u32,
+        iftype: u32,
+        virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
+    ) -> (Arc<Self>, Consumer<Frame, TX_RING_N>) {
+        let mut device = Arc::<Self>::new_uninit();
+        let ((), tx) = Self::build_on_vdev_with_lifecycle(
+            name,
+            shared,
+            mac,
+            mac_addr,
+            sinks,
+            vdev_id,
+            iftype,
+            virtual_lifecycle,
+            |value| {
+                Arc::get_mut(&mut device).unwrap().write(value);
+            },
+        );
+        // SAFETY: the unique allocation was fully written by the
+        // constructor; no reference or clone has been published.
+        (unsafe { device.assume_init() }, tx)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)] // Constructor inputs plus its placement closure.
+    fn build_on_vdev_with_lifecycle<T>(
+        name: &'static str,
+        shared: Arc<Shared<Io, Irq, Q>>,
+        mac: RtMac<Io, Irq, Q>,
+        mac_addr: [u8; 6],
+        sinks: Sinks,
+        vdev_id: u32,
+        iftype: u32,
+        virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
+        finish: impl FnOnce(Self) -> T,
+    ) -> (T, Consumer<Frame, TX_RING_N>) {
         let radio = RadioInfo::from_mac(&mac);
         let pdev_id = mac.pdev_id();
         // MBSSID's TX_IFINDEX resolution is physical-radio-local. Bind the
@@ -582,7 +641,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
         (
-            Ath11kNetdev {
+            finish(Ath11kNetdev {
                 name,
                 mac_addr,
                 vdev_id,
@@ -621,7 +680,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 monitor_channel: IrqSafeSpinLock::new(None),
                 monitor_open: AtomicBool::new(false),
                 monitor_token: IrqSafeSpinLock::new(None),
-            },
+            }),
             tx_cons,
         )
     }
@@ -4356,7 +4415,7 @@ fn pci_virtual_create(
             config.with_vdev(vdev_id),
             reg_info.as_deref(),
         );
-        let (child, tx_cons) = Ath11kNetdev::new_on_vdev_with_lifecycle(
+        let (child, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
             name,
             parent.shared.clone(),
             mac,
@@ -4366,7 +4425,6 @@ fn pci_virtual_create(
             iftype,
             Some(lifecycle),
         );
-        let child = Arc::new(child);
         register_pci_netdev(child.clone(), tx_cons, false);
         Ok(child as Arc<dyn WirelessNetIface>)
     })();
@@ -4593,7 +4651,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
 ) -> &'static str {
     use core::fmt::Write as _;
     let name = narf_net::iface::reserve_name("wlan%d");
-    let (dev, tx_cons) = Ath11kNetdev::new_on_vdev_with_lifecycle(
+    let (dev, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
         name,
         shared,
         mac,
@@ -4603,7 +4661,6 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         2,
         None,
     );
-    let dev = Arc::new(dev);
     AHB_ACTIVE.lock().push(dev.clone());
     register_netdev(
         dev.clone(),

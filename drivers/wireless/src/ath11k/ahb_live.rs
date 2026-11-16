@@ -1155,7 +1155,7 @@ async fn crash_monitor_task(
 /// the remoteproc and the platform the recovery re-boots with).
 pub async fn bring_up_task(blob: &'static [u8], p: Box<AhbPlatform>) {
     let mut live = Box::new(LiveAhb::new(NarfAhbEnv::default(), blob));
-    let r = bring_up(&p, &mut *live).await;
+    let r = super::future_heap::build(|| bring_up(&p, &mut *live)).await;
     match (r, live.outcome.take()) {
         (Ok(()), Some(LiveOutcome::Ready(core, dp))) => {
             let (shared, r) = super::runtime::start_ahb(*core, *dp);

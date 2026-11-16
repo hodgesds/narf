@@ -428,10 +428,9 @@ pub(super) fn probe(
             }
         }
     }
-    let mci_link = Arc::new(IrqSafeSpinLock::new(ar9003::btcoex::MciLink {
-        btcoex,
-        dma: mci_dma,
-    }));
+    let mci_link = Arc::new(IrqSafeSpinLock::new(ar9003::btcoex::MciLink::new(
+        btcoex, mci_dma,
+    )));
     let (vendor, device_id) = (device.id.vendor, device.id.device);
     // `hw.h::ath9k_hw_mci_is_enabled`: `common.btcoex_enabled &&
     // hw_caps & ATH9K_HW_CAP_MCI`, with `hw_caps` from `fill_cap_info`
@@ -777,19 +776,39 @@ fn compose(
     let _ = native.arm_msi();
     // SAFETY: complete parked MAC/key-cache/queue preparation succeeded on
     // this same non-cloneable native adapter; prepare does not start DMA.
-    let packet = unsafe { ar9003::packet::Packet::prepare(native, mac, o.mci_link.clone()) }?;
+    let packet =
+        Box::new(unsafe { ar9003::packet::Packet::prepare(native, mac, o.mci_link.clone()) }?);
     // `channels` routes this generation's retunes (either band) to
     // `transition`; HT40 requests fail closed (no AR9300 HT owner).
-    let station = Arc::new(Mutex::new(station::Radio::new(
-        packet.into(),
-        mac,
-        noise,
-        station::NativeEnvironment {
-            generation: o.generation,
-        },
-    )));
+    let station = retain_station(packet, mac, noise, o.generation);
     o.station = Some(station.clone());
     Ok(station)
+}
+
+/// Keep the Radio initialization off the frame that owns the native
+/// calibration and EDMA preparation temporaries. Transfer the packet on
+/// the heap so the two construction stages do not copy it on the stack.
+#[inline(never)]
+fn retain_station(
+    packet: Box<ar9003::packet::Packet<packet_native::Native>>,
+    mac: [u8; 6],
+    noise: i16,
+    generation: u32,
+) -> RetainedRadio {
+    // Reserve the final Arc first, avoiding a second full Radio temporary
+    // for Arc::new on this kernel stack. The allocation is still unique.
+    let mut retained = Arc::<Mutex<super::NativeRadio>>::new_uninit();
+    Arc::get_mut(&mut retained)
+        .unwrap()
+        .write(Mutex::new(station::Radio::new(
+            station::Dispatch::Ar9003(packet),
+            mac,
+            noise,
+            station::NativeEnvironment { generation },
+        )));
+    // SAFETY: the unique allocation was completely initialized above;
+    // no Arc clone or reference to the inner Radio has been published.
+    unsafe { retained.assume_init() }
 }
 
 /// Driver-owned transition for `channels`: the retained AR9300 owner is

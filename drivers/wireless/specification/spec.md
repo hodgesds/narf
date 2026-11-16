@@ -689,6 +689,35 @@ configuration-order case and one order-dependent iwlwifi 6 GHz case.
 brcmfmac, cyw43439, mt76 and rtl8xxxu were not run in that batch. aarch64
 native runs and physical acceptance remain separate.
 
+**2026-11-16 — remaining-row reconciliation.** The branch starts at
+`4daa0b5a9`, matching GitHub main. Open PRs #2162, #2083, #1054 and
+#1045 were checked, including the file lists of the board/device-tree
+and driver-configuration programmes. None changes the Wi-Fi files in
+this continuation. Board SPI/SDHCI work in #1054 stays with that PR;
+CYW43439 platform opening and gSPI packet service remain explicit gaps.
+The final PR recheck found three additional GPU-only proposals (#2164,
+#2166, #2168). #2164 owns the unrelated RS64 frame-size fix that blocks
+the normal x86_64 kernel-test launch; it is not duplicated here.
+The existing AR9580 signed legacy20 owner and the newly composed IPQ6018
+bring-up move to the validation ledger (13 open rows, 94 pending validation);
+the remaining chip rows now distinguish delivered native owners from
+their actual residual work. AR9462/AR9565 MCI message ownership does not
+complete live coexistence duty-cycle scheduling. RTL8852A has an initial
+RF owner and isolated channel RFK, but still lacks the native channel
+program. This continuation adds the retained IPQ6018 WLFW-to-core
+conversation and RTL8723BE linked ATC. Neither establishes RF acceptance.
+The validation pass also corrects AR9003 INI tests that compared constant
+addresses instead of register/value rows, MCI expectations that omitted
+the source 90% duty-cycle clamp, an NF expectation on a disabled chain,
+and inherited INI/RCR expectations in AR9565/RTL8723BE configuration tests.
+Independent source-derived table digests remain unchanged.
+Scoped validation of ath11k, AR9003 and RTL8723BE passes 525/0/2 on
+x86_64 in a direct diagnostic QEMU boot and 524/0/3 on aarch64 through
+the normal xtask gate, including production boot and btrfs postflight.
+The x86_64 normal gate remains blocked by the untouched GPU frame above.
+Strict scoped release Clippy and debug compilation pass on both arches;
+workspace formatting passes. Physical acceptance remains pending.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 0 | Multiple-active-link MLO; WoWLAN is implemented pending validation; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -1762,6 +1791,47 @@ receipt; newly pending input leaves the command unissued for a bounded retry,
 and nothing is retried after publication. Family `rtw88.md` lists the cases.
 2026-11-02 recount: 52 open features plus 26 implemented pending validation.
 
+
+### 3.19 RTL8723BE native CFO and linked ATC
+
+The original native RX owner retains signed path CFO samples and a
+wrapping packet counter separately from lazy DM initialization. Only
+error-free non-CCK frames with a complete PHY prefix and the currently
+programmed BSSID contribute. Disconnect clears that BSSID. The linked
+watchdog consumes fresh samples once, after RA refresh, and follows the
+RF_1T1R path-A ATC/crystal adjustment. The initial crystal cap is retained
+separately from the adjusted cap. Register access uses the same owner's
+authority and terminal failure handling; a CFO sample grants no TX or
+calibration authority. The family spec records hysteresis, clamps,
+remaining DM work and native regression coverage.
+
+### 3.20 AR9003 live MCI duty-cycle service
+
+AR9462/AR9565 share one `MciLink` between the hardware owner and EDMA
+packet engine. Driver timer defaults and profile GPM updates feed timed
+stomp/no-stomp weight writes through that original packet port.
+`Engine::coex_wait_us` reports a relative deadline to the existing async
+netdev worker, which releases the station lock before waiting and services
+due edges without requiring an interrupt. Reset, stop and WoW cancel the
+deadlines; successful resume starts a fresh period. Current authority and
+register checks remain mandatory for every write. Profile priorities are
+copied into the weight engine; concurrent-TX enablement still requires
+RSSI and calibrated power-policy integration. The family spec §3.12 owns
+the source timer boundaries, lifecycle and failure contract.
+
+### 3.21 Driver construction and recovery storage
+
+AR9300 station and ath11k runtime/netdev construction reserve the final
+`Arc` allocation before initializing the large owner; an allocation is
+published only after every field is initialized. Gen2 USB station handoff
+retains its radio in a box across the construction boundary. AHB bring-up
+and transport recovery use the existing pinned heap-future wrapper, with
+the original future and cancellation guards retained. These construction
+boundaries keep large values out of their callers' kernel stack frames;
+they do not change capability checks, hardware sequencing or ownership
+on failure. The Qualcomm kernel-test runner also retains its future on
+the heap. Stack-budget exceptions are removed when the measured frame
+fits; budgets are never increased for these changes.
 
 ## 4. Interaction with `narf-wireless`
 

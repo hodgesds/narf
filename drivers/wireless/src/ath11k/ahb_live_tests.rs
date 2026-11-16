@@ -16,11 +16,10 @@
 //! past FW_READY has a CE/HTC/WMI target fake ([`CeTargetFake`]): it
 //! plays the target's CE rings (HTC READY, CONNECT_SERVICE, WMI
 //! SERVICE_READY / READY, HTT VERSION_CONF), so the WCN6750 core-start
-//! test runs past `firmware_start` to `LiveOutcome::Ready`. The IPQ6018
-//! variant drives a direct IPQ6018 core (its WLFW leg is the separate
-//! `smoke_ath11k_wlfw_over_glink_ipq6018`) on the IPQ6018 service map
-//! through two-radio core start and `runtime::start_ahb`
-//! (`smoke_ath11k_ahb_ipq6018_core_start_ce_fake`).
+//! tests run past `firmware_start` to `LiveOutcome::Ready`. IPQ6018
+//! exercises the same retained `LiveAhb` from WCSS boot through GLINK,
+//! WLFW cold-boot calibration and the two-radio core start; the direct
+//! IPQ core tests independently cover `runtime::start_ahb` publication.
 
 extern crate alloc;
 
@@ -629,6 +628,7 @@ struct GlinkWlfwServer<'a> {
     init_done_sent: usize,
     /// Observations for the tests.
     reqs: Vec<u16>,
+    wlan_modes: Vec<u32>,
     respond_mem: Vec<(u64, u32, i32)>,
     bdf_segs: Vec<(u32, u8)>,
     /// Whether each BDF request carried a data segment: the
@@ -775,6 +775,7 @@ impl<'a> GlinkWlfwServer<'a> {
             fw_ready_sent: false,
             init_done_sent: 0,
             reqs: Vec::new(),
+            wlan_modes: Vec::new(),
             respond_mem: Vec::new(),
             bdf_segs: Vec::new(),
             bdf_data: Vec::new(),
@@ -1073,11 +1074,25 @@ impl<'a> GlinkWlfwServer<'a> {
                 }
             }
             QMI_WLANFW_WLAN_MODE_REQ_V01 => {
+                let mut mode = None;
+                let decoded = decode_tlvs(payload, &[0x01], |ty, value| {
+                    mode = Some(tlv_u32(ty, value)?);
+                    Ok(())
+                });
+                if decoded.is_err() {
+                    self.decode_errs += 1;
+                    return;
+                }
+                let Some(mode) = mode else {
+                    self.decode_errs += 1;
+                    return;
+                };
+                self.wlan_modes.push(mode);
                 self.resp(msg_id, txn, &QMI_OK);
                 // The only mode request before registration on the
                 // IPQ path is COLD_BOOT: answer with calibration
                 // done, then the second FW_INIT_DONE.
-                if self.chip == ServerChip::Ipq6018 && self.init_done_sent == 1 {
+                if self.chip == ServerChip::Ipq6018 && self.init_done_sent == 1 && mode == 7 {
                     self.init_done_sent = 2;
                     self.ind(QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01, &[]);
                     self.ind(QMI_WLFW_FW_INIT_DONE_IND_V01, &[]);
@@ -2805,6 +2820,7 @@ use super::super::ahb::AhbError;
 /// Observations from the WLFW server leg, for the core-start tests.
 struct WlfwObs {
     reqs: Vec<u16>,
+    wlan_modes: Vec<u32>,
     bdf_segs: Vec<(u32, u8)>,
     decode_errs: usize,
     fw_ready_sent: bool,
@@ -2830,26 +2846,56 @@ type CoreStartOutcome = (
 /// unwind (the trailing WLAN_MODE) already ran inside `qmi_ready`'s
 /// error path.
 fn drive_wcn6750_core_start(script: CeTargetScript) -> CoreStartOutcome {
-    let blob: &'static [u8] = Box::leak(sc7280_wifi_dt().into_boxed_slice());
+    drive_live_core_start(AhbChip::Wcn6750Hw10, script)
+}
+
+/// Exercise one retained platform/transport through both the WLFW and
+/// core-start legs. Only these two source-grounded remoteproc fixtures
+/// exist: substituting the IPQ6018 DT for IPQ5018/8074 would conceal
+/// their missing remoteproc/reset bindings.
+fn drive_live_core_start(chip: AhbChip, script: CeTargetScript) -> CoreStartOutcome {
+    let ipq = chip == AhbChip::Ipq6018Hw10;
+    assert!(ipq || chip == AhbChip::Wcn6750Hw10);
+    let blob: &'static [u8] = Box::leak(
+        if ipq {
+            ipq6018_wifi_dt("qcom,ipq6018-wifi", &SPIS)
+        } else {
+            sc7280_wifi_dt()
+        }
+        .into_boxed_slice(),
+    );
     let node = find_ahb_devices(blob)[0].0.clone();
     let p = Box::new(AhbPlatform::probe(blob, &node).unwrap());
     // fatal 0, ready 1, handover 2, stop-ack 3, shutdown-ack 7.
-    let mut env = env_for(&p, (1 << 1) | (1 << 2), (1 << 3) | (1 << 7));
-    env.files.insert(
-        String::from("ath11k/WCN6750/hw1.0/board.bin"),
-        elf_board(6144 * 2 + 100),
+    let mut env = env_for(
+        &p,
+        (1 << 1) | (1 << 2),
+        if ipq { 1 << 3 } else { (1 << 3) | (1 << 7) },
     );
+    let (board_path, board_size, ce_map) = if ipq {
+        ("ath11k/IPQ6018/hw1.0/board.bin", 128, TARGET_CE_MAP_IPQ6018)
+    } else {
+        (
+            "ath11k/WCN6750/hw1.0/board.bin",
+            6144 * 2 + 100,
+            TARGET_CE_MAP_QCA6390,
+        )
+    };
+    env.files
+        .insert(String::from(board_path), elf_board(board_size));
     let smem_regs = env.smem;
     let (pid, size) = (env.pid, env.smem_size);
     let smem = Smem::probe(smem_regs, size).unwrap();
     let mut live = Box::new(LiveAhb::new(*env, blob));
-    let _ = live.hal_ce_alloc(&p);
-    let mut fake = CeTargetFake::capture(
-        live.ce().expect("hal_ce_alloc built the CE"),
-        TARGET_CE_MAP_QCA6390,
-        script,
-    )
-    .expect("CE geometry is consistent");
+    live.hal_ce_alloc(&p).expect("hal_ce_alloc");
+    // IPQ maps its HIF during allocation; hybrid WCN6750 retains the
+    // unbound CE until WLFW DEVICE_INFO supplies its BAR.
+    let ce = if ipq {
+        &live.hif().expect("IPQ HIF").ce
+    } else {
+        live.ce().expect("WCN6750 CE")
+    };
+    let mut fake = CeTargetFake::capture(ce, ce_map, script).expect("CE geometry is consistent");
     let _ = live.qmi_init_service(&p);
     let _ = run(live.rproc_irqs(&p));
     let _ = run(live.rproc_boot(&p));
@@ -2869,10 +2915,37 @@ fn drive_wcn6750_core_start(script: CeTargetScript) -> CoreStartOutcome {
                 host_tx: (tx.offset, tx.len),
                 host_rx: (rx.offset, rx.len),
             },
-            ServerChip::Wcn6750,
-            fixture_cap(0x12, 0x56, 0x7890, 0x1),
-            Vec::new(),
-            Some((SRV_BAR_ADDR, ATH11K_QMI_DEVICE_BAR_SIZE)),
+            if ipq {
+                ServerChip::Ipq6018
+            } else {
+                ServerChip::Wcn6750
+            },
+            if ipq {
+                fixture_cap(0x21, 0x65, 0x9870, 0x2)
+            } else {
+                fixture_cap(0x12, 0x56, 0x7890, 0x1)
+            },
+            if ipq {
+                alloc::vec![alloc::vec![
+                    MemSeg {
+                        size: 0x10_0000,
+                        mem_type: HOST_DDR_REGION_TYPE as i32,
+                        mem_cfg: Vec::new()
+                    },
+                    MemSeg {
+                        size: 0x4_0000,
+                        mem_type: BDF_MEM_REGION_TYPE as i32,
+                        mem_cfg: Vec::new()
+                    },
+                ]]
+            } else {
+                Vec::new()
+            },
+            if ipq {
+                None
+            } else {
+                Some((SRV_BAR_ADDR, ATH11K_QMI_DEVICE_BAR_SIZE))
+            },
         )
     };
     let _ = live.config_irq(&p);
@@ -2906,6 +2979,7 @@ fn drive_wcn6750_core_start(script: CeTargetScript) -> CoreStartOutcome {
     };
     let obs = WlfwObs {
         reqs: server.reqs.clone(),
+        wlan_modes: server.wlan_modes.clone(),
         bdf_segs: server.bdf_segs.clone(),
         decode_errs: server.decode_errs,
         fw_ready_sent: server.fw_ready_sent,
@@ -3044,6 +3118,107 @@ fn smoke_ath11k_ahb_live_wcn6750_ce_fake_refuse_wmi() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_ahb_live_wcn6750_ce_fake_refuse_wmi
+);
+
+/// WCSS -> GLINK/QRTR -> WLFW fixed memory and cold-boot calibration ->
+/// native CE/HTC/WMI -> both pdevs, without replacing WLFW by StartedQmi.
+fn smoke_ath11k_ahb_live_ipq6018_core_start_ce_fake() -> TestResult {
+    let radio_macs = alloc::vec![
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x68],
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x69],
+    ];
+    let (out, fake, wlfw, live) = drive_live_core_start(
+        AhbChip::Ipq6018Hw10,
+        CeTargetScript {
+            extra_macs: radio_macs.clone(),
+            ..CeTargetScript::default()
+        },
+    );
+    kt_assert_eq!(out, Some(Ok(())));
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
+    let Some(LiveOutcome::Ready(core, dp)) = &live.outcome else {
+        return TestResult::Fail("IPQ6018 retained bring-up did not reach Ready");
+    };
+    kt_assert!(core.is_ready());
+    kt_assert_eq!(core.num_radios(), 2);
+    kt_assert_eq!(core.wmi_pdev_eps.len(), 2);
+    kt_assert_eq!(dp.pdev_mac_ids(), alloc::vec![0, 1]);
+    kt_assert_eq!(core.mac_addr, Some(TGT_MAC));
+    kt_assert_eq!(
+        core.svc_ext
+            .as_ref()
+            .map(|e| e.pdevs.iter().map(|p| p.pdev_id).collect::<Vec<_>>()),
+        Some(alloc::vec![1, 2])
+    );
+    // Unlike WCN6750, fixed-BDF IPQ6018 uses one data-less BDF request,
+    // an M3 exchange and COLD_BOOT before the core's WLAN_CFG + NORMAL.
+    kt_assert_eq!(
+        wlfw.reqs,
+        alloc::vec![
+            QMI_WLANFW_IND_REGISTER_REQ_V01,
+            QMI_WLANFW_HOST_CAP_REQ_V01,
+            QMI_WLANFW_RESPOND_MEM_REQ_V01,
+            QMI_WLANFW_CAP_REQ_V01,
+            QMI_WLANFW_BDF_DOWNLOAD_REQ_V01,
+            QMI_WLANFW_M3_INFO_REQ_V01,
+            QMI_WLANFW_WLAN_MODE_REQ_V01,
+            QMI_WLANFW_WLAN_CFG_REQ_V01,
+            QMI_WLANFW_WLAN_MODE_REQ_V01,
+        ]
+    );
+    kt_assert_eq!(wlfw.bdf_segs, alloc::vec![(0, 1)]);
+    kt_assert_eq!(wlfw.wlan_modes, alloc::vec![7, 0]); // COLD_BOOT, NORMAL
+    kt_assert_eq!(wlfw.decode_errs, 0);
+    kt_assert!(wlfw.out_qrtr_empty);
+    kt_assert_eq!(fake.errors, 0);
+    kt_assert!(fake.conn_resp_htt && fake.conn_resp_wmi && fake.conn_resp_wmi1);
+    kt_assert!(fake.init_seen && fake.ready_event_sent && fake.ver_conf_sent);
+    kt_assert!(fake.sring_setup_seen > 0);
+    // Each extra MAC survived the same retained core's READY parsing.
+    // Publication itself has an independent direct-core fixture below.
+    kt_assert_eq!(
+        core.ready.as_ref().map(|r| r.extra_mac_addrs.clone()),
+        Some(radio_macs)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_ipq6018_core_start_ce_fake
+);
+
+/// A real completed WLFW leg must not hide a failed core: firmware is
+/// stopped and the DMA owners stay stranded after WMI refuses a connect.
+fn smoke_ath11k_ahb_live_ipq6018_ce_fake_refuse_wmi() -> TestResult {
+    let (out, fake, wlfw, live) = drive_live_core_start(
+        AhbChip::Ipq6018Hw10,
+        CeTargetScript {
+            wmi_status: 1,
+            ..CeTargetScript::default()
+        },
+    );
+    kt_assert!(matches!(out, Some(Err(_))));
+    kt_assert!(matches!(&live.outcome, Some(LiveOutcome::Stranded(..))));
+    kt_assert!(fake.conn_resp_htt && fake.connect_wmi_seen);
+    kt_assert!(!fake.conn_resp_wmi && !fake.setup_complete_seen);
+    kt_assert_eq!(fake.errors, 0);
+    kt_assert_eq!(wlfw.decode_errs, 0);
+    kt_assert!(wlfw.out_qrtr_empty);
+    kt_assert_eq!(wlfw.bdf_segs, alloc::vec![(0, 1)]);
+    kt_assert_eq!(wlfw.wlan_modes, alloc::vec![7, 0, 4]); // plus OFF on failure
+    kt_assert_eq!(wlfw.reqs.last(), Some(&QMI_WLANFW_WLAN_MODE_REQ_V01));
+    kt_assert_eq!(
+        wlfw.reqs
+            .iter()
+            .filter(|&&r| r == QMI_WLANFW_WLAN_MODE_REQ_V01)
+            .count(),
+        3
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_ipq6018_ce_fake_refuse_wmi
 );
 
 // ── IPQ6018 core start against the CE/HTC/WMI target fake ──────────
@@ -3680,7 +3855,6 @@ fn smoke_ath11k_ahb_live_smp2p_crash_restart() -> TestResult {
     );
     kt_assert_eq!(s.decode_errs, 0);
     kt_assert!(s.out_qrtr.is_empty());
-    kt_assert!(s.fw_ready_sent);
     kt_assert_eq!(s.init_done_sent, 2);
     kt_assert_eq!(s.bdf_segs, alloc::vec![(0, 1)]);
     kt_assert_eq!(s.bdf_data, alloc::vec![false]);

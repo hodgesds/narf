@@ -78,6 +78,8 @@ pub(in super::super) struct State {
     /// `rtl8723be_dm_watchdog` state (`dig_t` + `rtl_dm` fields), lazily
     /// initialised from the live BB state on the first watchdog run.
     pub(in super::super) dm: Option<dm::Dm>,
+    pub(in super::super) cfo: dm::Cfo,
+    bssid: [u8; 6],
     /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
     pub(in super::super) min_space_cfg: u8,
     /// `bss_conf->use_short_preamble` / `use_short_slot` as programmed.
@@ -102,6 +104,8 @@ impl State {
             link: None,
             ratr_state: 0,
             dm: None,
+            cfo: dm::Cfo::default(),
+            bssid: [0; 6],
             min_space_cfg: 0,
             erp_timing: None,
             reports: c2h::TxReportState::default(),
@@ -392,6 +396,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let channel = permission.channel();
         let forty = permission.operating().forty();
         let ht = self.packet.ht;
+        let mut cfo = self.packet.be8723.cfo;
+        let bssid = self.packet.be8723.bssid;
         let (consumed, packet, report) = self.io.authority(true, || {
             ring.sync();
             let offset = slot * RX_BYTES;
@@ -457,6 +463,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     } else {
                         None
                     };
+                    if status.physt && status.drvinfo_size >= 16 {
+                        let mut phy = [0; 16];
+                        buffer.read_bytes(status.shift, &mut phy)?;
+                        cfo.observe(&phy, &bytes, bssid, status.is_cck());
+                    }
                     packet = Some(Mpdu {
                         bytes,
                         channel,
@@ -485,6 +496,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             ring.sync();
             Ok((true, packet, report))
         })?;
+        self.packet.be8723.cfo = cfo;
         if let Some((bytes, take)) = report {
             // `rtl_c2hcmd_enqueue`: bounded, the oldest dropped.
             if self.packet.be8723.c2h.len() >= C2H_QUEUE {
@@ -591,6 +603,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         hw::set_bssid(&self.io, peer)?;
         let timing = hw::configure_rates(&self.io, rates, basic, capability, None, false)?;
         self.packet.be8723.erp_timing = Some(timing);
+        self.packet.be8723.bssid = peer;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -922,11 +935,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// The composed part of `rtl8723be_dm_watchdog` (`dm.c`, in the Linux
     /// order): common info, false-alarm statistics, RSSI monitor, DIG,
     /// dynamic EDCCA, CCK PD, the RA mask refresh (with `update_bw`), the
-    /// ATC switch's unlinked branch and the (empty) dynamic-TX-power step,
+    /// ATC switch and the (empty) dynamic-TX-power step,
     /// then `rtl_watchdog_wq_callback`'s `btc_periodical` through the
     /// coexistence owner (with the queued C2H first, as `c2hcmd_wq` runs
     /// ahead of it; the coexistence step also runs in leisure PS, the DM
-    /// steps do not). EDCA turbo, the ATC switch's linked branch and
+    /// steps do not). EDCA turbo and
     /// TX-power tracking are not composed (`dm.rs` module note). Returns
     /// whether a mask was sent.
     pub(super) async fn be8723_dm_watchdog(
@@ -962,14 +975,6 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             dm::dig(&self.io, dm, linked, fa.cnt_all)?;
             dm::dynamic_edcca(&self.io, dm.pre_edcca_enable)?;
             dm::cck_packet_detection_thresh(&self.io, dm, linked, fa.cnt_cck_fail)?;
-            if !linked {
-                let bt_disabled = self
-                    .rtl8723be_coex
-                    .as_deref()
-                    .is_some_and(|coex| coex.btc.is_bt_disabled());
-                dm::atc_switch_unlinked(&self.io, dm, bt_disabled)?;
-            }
-            dm::dynamic_txpower();
             self.phase = Phase::Running;
             if let Some((peer, bw40, _)) = self.packet.be8723.link {
                 if let Some(state) = dm::ra_state(undec_sm_pwdb, self.packet.be8723.ratr_state) {
@@ -978,6 +983,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     refreshed = true;
                 }
             }
+            // Linux refreshes the RA mask before adjusting ATC. Reborrow
+            // the watchdog state after the mailbox await, with its usual
+            // terminal-on-access-failure discipline.
+            self.phase = Phase::Failed;
+            let dm = self.packet.be8723.dm.as_mut().ok_or(Error::State)?;
+            if linked {
+                dm::atc_switch_linked(&self.io, dm, &self.packet.be8723.cfo)?;
+            } else {
+                let bt_disabled = self
+                    .rtl8723be_coex
+                    .as_deref()
+                    .is_some_and(|coex| coex.btc.is_bt_disabled());
+                dm::atc_switch_unlinked(&self.io, dm, bt_disabled)?;
+            }
+            dm::dynamic_txpower();
+            self.phase = Phase::Running;
         }
         self.phase = Phase::Failed;
         let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
@@ -1039,6 +1060,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.be8723.link = None;
         self.packet.be8723.ratr_state = 0;
         self.packet.be8723.erp_timing = None;
+        self.packet.be8723.bssid = [0; 6];
         hw::network_type_station(&self.io, &mut self.packet.be8723.receive, false)?;
         self.rtl8723be_coex
             .as_deref_mut()

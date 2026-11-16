@@ -1010,8 +1010,9 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         let Slot::Idle(radio) = core::mem::replace(&mut state.slot, Slot::Failed) else {
             return Err(WirelessError::Busy);
         };
-        let mut station = match Station::new(*radio, candidate, &request.ssid, mode, pmk, wide) {
-            Ok(station) => Box::new(station),
+        let mut station = match Station::new_boxed(radio, candidate, &request.ssid, mode, pmk, wide)
+        {
+            Ok(station) => station,
             Err(error) => {
                 self.fail(&mut state);
                 return Err(station_error(error));
