@@ -510,7 +510,6 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
     );
     for props in [
         &[(0u32, 0u64)][..],
-        &[(14, 0)],
         &[(1, 1)],
         &[(4, 1 << 8)],
         &[(5, 32)],
@@ -524,6 +523,13 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
     ] {
         assert_eq!(open_at(props, DENY, &none), invalid);
     }
+    // Property 14 (query address) is a valid property since #2131 (#1774
+    // query sampling); 0 means no query sampling, so a DENY open of it is
+    // refused by the privilege check, like the (2, 1) case below.
+    assert_eq!(
+        open_at(&[(14, 0)], DENY, &none),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
     assert_eq!(
         open_at(&[(7, 5)], DENY, &render_queue),
         Err(Error::Fs(FsError::NotFound))
