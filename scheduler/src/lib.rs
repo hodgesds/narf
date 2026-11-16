@@ -777,13 +777,13 @@ pub fn parked_task_count() -> usize {
 
 /// Runnable-or-running task count: live tasks NOT parked — READY queues
 /// + wake inboxes + tasks currently being polled. O(1) maintained
-/// counts (issue #2134); the `/proc/loadavg` R field, the loadavg EWMA
-/// sample, and `/proc/stat` `procs_running` source. This is Linux's
-/// `nr_running` analogue: it counts budget-throttled READY slots and
-/// the currently-running task, where [`runnable_task_count`] counts
-/// only dispatchable READY slots. The stall watchdog keeps the exact
-/// dispatchable scan; `/proc` takes this cheaper value because a
-/// throttled-or-running task is still load from a monitor's view.
+///   counts (issue #2134); the `/proc/loadavg` R field, the loadavg EWMA
+///   sample, and `/proc/stat` `procs_running` source. This is Linux's
+///   `nr_running` analogue: it counts budget-throttled READY slots and
+///   the currently-running task, where [`runnable_task_count`] counts
+///   only dispatchable READY slots. The stall watchdog keeps the exact
+///   dispatchable scan; `/proc` takes this cheaper value because a
+///   throttled-or-running task is still load from a monitor's view.
 pub fn unparked_task_count() -> usize {
     total_task_count().saturating_sub(parked_task_count())
 }
