@@ -166,6 +166,17 @@ impl Firmware {
         }
         Ok(result)
     }
+    /// Parse a single firmware image, without materializing the whole
+    /// `[Image; 11]` set. `Starts::from_firmware` needs only Pfp/Me/Mec;
+    /// building all eleven images (3872 bytes, measured) in its frame put
+    /// it over the 8 KiB frame budget (8552 bytes, #2163).
+    pub fn image(&self, source: Source) -> Result<Image<'_>, Error> {
+        let index = Source::ALL
+            .iter()
+            .position(|s| *s == source)
+            .ok_or(Error::Invalid)?;
+        Image::parse(source, &self.bytes[index]).map_err(|e| Error::Image(source, e))
+    }
     pub fn dmcub_bytes(&self) -> &[u8] {
         &self.bytes[10]
     }
