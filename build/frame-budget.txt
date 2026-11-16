@@ -79,7 +79,6 @@
 9064 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe
 9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
-8912 narf_drivers_gpu::intel_gpu_gt::media::MediaGuc<M,A>::start
 8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
 8808 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table

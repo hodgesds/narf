@@ -1122,6 +1122,33 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     }
 }
 
+/// Stage the media GuC's owner out of line: `GuCGt` is several KiB, and
+/// building it in `start`'s frame and then moving it into the box put
+/// `MediaGuc::start` over the 8 KiB frame budget (8,832 bytes on main run
+/// 43655774791, after #2111 boxed the field). The staged owner is built in
+/// this frame, not the caller's; only the pointer returns. Same shape as
+/// `out_of_line::OutOfLine::build` for futures.
+#[inline(never)]
+fn stage_media_guc_boxed<M, A>(
+    mmio: MediaGsi<M>,
+    allocator: A,
+    firmware: &crate::intel_gpu_guc_firmware::GuCFirmware,
+    huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
+    config: crate::intel_gpu_guc_boot::BootConfig,
+    ip: crate::intel_gpu_gt::media::MediaIp,
+    policy: crate::intel_gpu_gt_hw::CachePolicy,
+) -> Result<
+    alloc::boxed::Box<crate::intel_gpu_guc_gt::GuCGt<MediaGsi<M>, A>>,
+    crate::intel_gpu_guc_gt::GtError,
+>
+where
+    M: MmioWindow,
+    A: crate::intel_gpu_guc_boot::BootAllocator,
+{
+    crate::intel_gpu_guc_gt::GuCGt::stage_media(mmio, allocator, firmware, huc, config, ip, policy)
+        .map(alloc::boxed::Box::new)
+}
+
 impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> MediaGuc<M, A> {
     /// Stage and begin after `MediaGt` initialized this incarnation and
     /// released its own wake. `firmware` is GT0's MTL GuC image (xe_uc_fw.c
@@ -1141,18 +1168,16 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         let (Some(facts), Some(policy)) = (media.facts(), media.cache_policy()) else {
             return Err(MediaGucError::State);
         };
-        let mut gt = alloc::boxed::Box::new(
-            crate::intel_gpu_guc_gt::GuCGt::stage_media(
-                MediaGsi::new(bar.clone()),
-                allocator.clone(),
-                firmware,
-                huc,
-                config,
-                facts.ip,
-                policy,
-            )
-            .map_err(MediaGucError::Gt)?,
-        );
+        let mut gt = stage_media_guc_boxed(
+            MediaGsi::new(bar.clone()),
+            allocator.clone(),
+            firmware,
+            huc,
+            config,
+            facts.ip,
+            policy,
+        )
+        .map_err(MediaGucError::Gt)?;
         let mask = bar.read32(GUC_SG_INTR_MASK);
         if mask == u32::MAX {
             return Err(MediaGucError::Unavailable);
