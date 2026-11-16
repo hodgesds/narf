@@ -345,7 +345,7 @@ fn smoke_multi_ccs_timeout_bans_only_physical_ccs3_after_terminal_retirement() -
     finish_policy(&mut gt, &w, &good, &mut registered, 531, 3);
     assert_eq!(good_result.verify(), Ok(()));
     let base = registered[&u32::from(bad_id)];
-    model_runtime(&w, base, 0, 15_000_000, true);
+    model_runtime(&w, Engine::Ccs3, base, 0, 15_000_000, true);
     assert_eq!(
         gt.poll(5_000_001_000),
         Poll::Ready(Ok(GtState::SchedulingReady))
