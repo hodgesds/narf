@@ -209,6 +209,22 @@ MSR access. Later sensor reads repeat admission on the executing CPU and
 return unavailable on recoverable MSR faults. Non-x86_64 probes return
 `NotPresent` without a hardware access.
 
+`hwmon::k10temp` matches the Linux Data Fabric function-3 IDs for
+Renoir/Lucienne, Cezanne, Rembrandt, Raphael/Granite Ridge, Phoenix/HawkPoint,
+and Strix Point. These client parts bind node 0 at bus 0, D18F3 and resolve
+the AMD D0F0 host bridge in the same PCI segment for SMN access. An absent
+root or unreadable package register fails probe; other node layouts are
+unsupported. The index/data transaction at PCI offsets 0x60/0x64 is serialized.
+All-ones PCI responses are unavailable, not temperatures.
+
+Tctl reads SMN 0x59800, including the range/Tj-select 49 C correction.
+`K10tempChip::ccd_offset` selects the family-specific CCD register bank;
+only valid discovered CCDs are published. CCD values use their own low-bit
+encoding and 49 C bias. Sysfs exposes Tctl and valid TccdN labels; a duplicate
+Tdie is omitted when its offset is zero. Internal `read_temp("Tdie")` remains
+available for the power-service die-temperature provider. Failed reads yield
+`None` (empty sysfs input under the existing hwmon bridge contract).
+
 ### 3.6 GSC proxy component hand-off (`narf_drivers::gsc_proxy`)
 
 Linux binds the MEI GSC proxy client to the Intel display driver

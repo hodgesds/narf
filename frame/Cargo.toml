@@ -303,6 +303,7 @@ kernel-test  = [
     "narf-drivers-video/kernel-test",
     "narf-drivers-usbpd/kernel-test",
     "narf-drivers-gpu/kernel-test",
+    "narf-drivers-hwmon/kernel-test",
     "narf-drivers-nvidia/kernel-test",
     "narf-drivers-fingerprint/kernel-test",
     "narf-drivers-serial/kernel-test",

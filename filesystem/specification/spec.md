@@ -1760,6 +1760,10 @@ request cancellation removes the slot and its registration.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+The built-in thermal and hwmon providers create class directories only.
+Real sensor/thermal drivers own their device nodes and live attributes;
+provider refresh never creates a fallback acpitz temperature or overwrites a
+driver reading. Without a discovered sensor, no temperature device is exposed.
 Sound cards and PCM/control endpoints are projected by the sound-card registry
 under `/sys/devices`, with class and character-device discovery symlinks,
 writable uevents, and physical PCI parent links where applicable. Registry

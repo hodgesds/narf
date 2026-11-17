@@ -10,45 +10,32 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── k10temp ───────────────────────────────────────────────────────────
 
-/// PCI IDs for Zen2 (Renoir 0x1448) and Zen4 (Phoenix 0x14F4) are
+/// PCI IDs for Zen2 (Renoir 0x144b) and Zen4 (Phoenix 0x14f3) are
 /// present in the chip table.
 fn smoke_k10temp_device_ids() -> TestResult {
     use crate::k10temp;
     let zen2 = k10temp::chip_info(k10temp::AMD_RENOIR_NB);
     if zen2.is_none() {
-        return TestResult::Fail("Zen2 Renoir NB ID 0x1448 missing from chip table");
+        return TestResult::Fail("Zen2 Renoir NB ID 0x144b missing from chip table");
     }
     let zen4 = k10temp::chip_info(k10temp::AMD_PHOENIX_NB);
     if zen4.is_none() {
-        return TestResult::Fail("Zen4 Phoenix NB ID 0x14F4 missing from chip table");
+        return TestResult::Fail("Zen4 Phoenix NB ID 0x14f3 missing from chip table");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/hwmon/k10temp", smoke_k10temp_device_ids);
 
-/// Strix Point (Zen5) ID 0x1590 also present.
+/// Strix Point (Zen5) ID 0x16fb also present.
 fn smoke_k10temp_zen5_id() -> TestResult {
     use crate::k10temp;
     let zen5 = k10temp::chip_info(k10temp::AMD_STRIX_NB);
     if zen5.is_none() {
-        return TestResult::Fail("Zen5 Strix NB ID 0x1590 missing from chip table");
+        return TestResult::Fail("Zen5 Strix NB ID 0x16fb missing from chip table");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/hwmon/k10temp", smoke_k10temp_zen5_id);
-
-/// SMN address decode: Tdie lives at 0x00059E3C.
-fn smoke_k10temp_smn_tdie_addr() -> TestResult {
-    use crate::k10temp;
-    if k10temp::SMN_TDIE != 0x0005_9E3C {
-        return TestResult::Fail("SMN_TDIE address mismatch");
-    }
-    if k10temp::SMN_TCCD0 != 0x0005_9800 {
-        return TestResult::Fail("SMN_TCCD0 address mismatch");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/hwmon/k10temp", smoke_k10temp_smn_tdie_addr);
 
 /// raw_to_mc decode: verify the formula `(raw >> 21) * 125`.
 ///
@@ -90,6 +77,7 @@ fn smoke_k10temp_pci_registration() -> TestResult {
     let want = &[
         (k10temp::AMD_VENDOR, k10temp::AMD_RENOIR_NB),
         (k10temp::AMD_VENDOR, k10temp::AMD_PHOENIX_NB),
+        (k10temp::AMD_VENDOR, k10temp::AMD_RAPHAEL_NB),
     ];
     for &(v, d) in want {
         let found = regs.iter().any(|m| {
