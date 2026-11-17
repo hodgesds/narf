@@ -484,6 +484,12 @@ are pure admission/planning helpers and do not enable a modeset route. Its
 pure underrun decoder covers `UNDERRUN_DBG1/2`, the optional FBC debug latch
 and `XE3P_UNDERRUN_PKGC`, returning the exact W1C image for each latched source.
 It installs no interrupt handler and performs no MMIO.
+The same Display-35 capability plan omits the legacy PCH reset handshake and
+shared DPLL manager (port PLLs belong to LT PHY), and skips bottom-color
+gamma/CSC-enable readback without claiming that commit-arm stops writing that
+register. A primary plane on Pipe A or B receives the source 17x17x17,
+tetrahedrally interpolated, bypassable 3D-LUT capability; other pipes and plane
+types do not. These facts are disconnected from color UAPI and MMIO.
 Its pure memory profile decodes `MTL_MEM_SS_INFO_GLOBAL` and selects the
 65 GB/s `xe3lpd_sa_info` programmed-bandwidth ceiling. If
 `XE3P_ECC_IMPACTING_DE` is set it refuses admission: Linux warns that Bspec

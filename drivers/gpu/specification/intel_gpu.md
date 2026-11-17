@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.04** (v1.04 adds Nova Lake's disconnected HDMI TMDS LT-PHY
+> Status: **v1.05** (v1.05 pins Display-35 core power/PLL/readout boundaries
+> and its Pipe-A/B primary 17^3 LUT capability; v1.04 adds Nova Lake's disconnected HDMI TMDS LT-PHY
 > enable order and source DP1.4 signal-table reuse; v1.03 ports Nova Lake LT PHY's bounded arbitrary-clock
 > HDMI PLL synthesizer without enabling its route; v1.02 transcribes Nova Lake LT PHY's five literal HDMI
 > PLL images while leaving the arbitrary-clock synthesizer and live HDMI route closed; v1.01 models Display-35's four-source FIFO-underrun
@@ -409,6 +410,12 @@ decompression starvation and the package-C-state memory-blocking latch. It
 returns Linux's exact write-one-to-clear images (full nonzero DBG1; only the
 frozen/FBC/package bits for the other registers), but no IRQ or MMIO caller is
 installed.
+Display 35's core capability plan installs no shared DPLL manager because each
+PLL belongs to its LT PHY, performs no legacy PCH reset handshake, and does not
+read gamma/CSC enable state from `SKL_BOTTOM_COLOR` (while retaining the
+separate commit-arm register contract). Its plane-color pipeline exposes a
+17x17x17 tetrahedrally interpolated, bypassable 3D LUT only for primary planes
+on Pipes A/B. These are disconnected admission facts, not color UAPI or MMIO.
 The same module decodes Display 35's `MTL_MEM_SS_INFO_GLOBAL` and retains the
 source 65 GB/s `xe3lpd_sa_info` ceiling. `XE3P_ECC_IMPACTING_DE` is a typed
 refusal because Linux 7.0-rc7 states that Bspec supplies no handling rule;

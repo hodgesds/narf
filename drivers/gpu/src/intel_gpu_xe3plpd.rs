@@ -2,7 +2,9 @@
 //!
 //! Pinned source: local Linux 7.0-rc7
 //! `i915/display/{intel_display.c,intel_plane.c,skl_universal_plane.c,
-//! intel_fifo_underrun.c,intel_display_regs.h,intel_fbc.c,intel_fbc_regs.h}`.
+//! intel_fifo_underrun.c,intel_display_regs.h,intel_fbc.c,intel_fbc_regs.h,
+//! intel_display_power.c,intel_dpll_mgr.c,intel_color.c,
+//! intel_color_pipeline.c}`.
 //! These helpers capture only the branches that must not inherit Display 30
 //! behavior: no `TRANS_VSYNCSHIFT` write or transcoder interlace field,
 //! linear horizontal reflection is allowed while Tile4 reflection is not,
@@ -29,6 +31,66 @@ pub(crate) const GEN12_DCPR_STATUS_1: u64 = 0x46440;
 pub(crate) const FBC_UNDERRUN_DECMPR: u32 = 1 << 27;
 pub(crate) const UNDERRUN_FRAME_LINE_COUNTERS_FROZEN: u32 = 1 << 31;
 pub(crate) const XE3P_UNDERRUN_PKGC: u32 = 1 << 21;
+
+/// Source capability branches that a future Display-35 core-init/readout path
+/// must not inherit from Display 30.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CoreCapabilities {
+    /// `intel_pch_reset_handshake` returns before touching its legacy register.
+    pub(crate) pch_reset_handshake: bool,
+    /// `intel_dpll_init` installs no shared manager; PLLs live in each LT PHY.
+    pub(crate) shared_dplls: bool,
+    /// `skl_get_config` does not read gamma/CSC enables from bottom color.
+    /// This does not imply that the register is absent from commit-arm writes.
+    pub(crate) read_bottom_color_enables: bool,
+    /// `HAS_UNDERRUN_DBG_INFO` gates the Display-35 decoder below.
+    pub(crate) underrun_debug: bool,
+}
+
+pub(crate) const CORE_CAPABILITIES: CoreCapabilities = CoreCapabilities {
+    pch_reset_handshake: false,
+    shared_dplls: false,
+    read_bottom_color_enables: false,
+    underrun_debug: true,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColorPlaneKind {
+    Primary,
+    Overlay,
+    Cursor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lut3dInterpolation {
+    Tetrahedral,
+}
+
+/// Display-35 primary-plane colorop inserted between plane CSC and post-CSC
+/// LUT. `edge_size = 17` represents 17^3 = 4913 RGB entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lut3dCapability {
+    pub(crate) edge_size: u8,
+    pub(crate) entries: u16,
+    pub(crate) interpolation: Lut3dInterpolation,
+    pub(crate) allow_bypass: bool,
+}
+
+/// `intel_color_pipeline_register_plane` plus
+/// `intel_color_crtc_has_3dlut`: only primary planes on Pipes A/B receive the
+/// Display-35 3D LUT colorop.
+pub(crate) const fn plane_lut3d(pipe: Pipe, kind: ColorPlaneKind) -> Option<Lut3dCapability> {
+    if matches!(pipe, Pipe::A | Pipe::B) && matches!(kind, ColorPlaneKind::Primary) {
+        Some(Lut3dCapability {
+            edge_size: 17,
+            entries: 17 * 17 * 17,
+            interpolation: Lut3dInterpolation::Tetrahedral,
+            allow_bypass: true,
+        })
+    } else {
+        None
+    }
+}
 
 /// `UNDERRUN_DBG1(pipe)`; the source A/B addresses establish a 0x1000 stride.
 pub(crate) const fn underrun_dbg1(pipe: Pipe) -> u64 {
@@ -456,5 +518,34 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_underrun_decode_and_w1c_images
+    );
+
+    fn smoke_nvl_display35_core_and_color_capabilities() -> TestResult {
+        assert_eq!(
+            CORE_CAPABILITIES,
+            CoreCapabilities {
+                pch_reset_handshake: false,
+                shared_dplls: false,
+                read_bottom_color_enables: false,
+                underrun_debug: true,
+            }
+        );
+        let lut = Lut3dCapability {
+            edge_size: 17,
+            entries: 4_913,
+            interpolation: Lut3dInterpolation::Tetrahedral,
+            allow_bypass: true,
+        };
+        assert_eq!(plane_lut3d(Pipe::A, ColorPlaneKind::Primary), Some(lut));
+        assert_eq!(plane_lut3d(Pipe::B, ColorPlaneKind::Primary), Some(lut));
+        assert_eq!(plane_lut3d(Pipe::C, ColorPlaneKind::Primary), None);
+        assert_eq!(plane_lut3d(Pipe::D, ColorPlaneKind::Primary), None);
+        assert_eq!(plane_lut3d(Pipe::A, ColorPlaneKind::Overlay), None);
+        assert_eq!(plane_lut3d(Pipe::A, ColorPlaneKind::Cursor), None);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_core_and_color_capabilities
     );
 }
