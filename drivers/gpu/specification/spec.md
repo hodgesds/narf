@@ -410,7 +410,10 @@ only through the explicitly opted-in `decode_all` route.
 display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
 MMIO image. No decode/read/route returns it and it grants no LT-PHY or modeset
-authority. Every other operational IP is a typed `IpError`: `Absent`,
+authority. `intel_gpu_lt_phy` is an additional pure model of the WCL TC1/TC2
+LT-PHY boundary: exact RBR-through-UHBR20 DP PLL/VDR images, transmitter
+ownership/masking and DP 1.4/UHBR signal tables. It performs no MMIO and is not
+an operational route. Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
 admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,

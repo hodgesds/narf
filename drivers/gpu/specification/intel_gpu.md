@@ -1,8 +1,10 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.80** (v0.79 plus the pure Wildcat Lake display-30.02
-> three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings,
-> while its LT-PHY output route remains fail-closed; the source-qualified Panther Lake display-30
+> Status: **v0.81** (v0.80 plus Wildcat Lake's pure LT-PHY TC1/TC2
+> DP PLL/write-image, transmitter-ownership and DP 1.4/UHBR signal models,
+> while every display-30.02 output route remains fail-closed; the pure Wildcat
+> Lake three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings;
+> the source-qualified Panther Lake display-30
 > TC1–TC4 USB-C DP route and mandatory fixed-refresh VRR timing generator;
 > the Lunar Lake display-20 TC1–TC4 USB-C DP route, PICA/TCSS ownership and
 > display-IP-aware external resource transactions; the source ADL-N
@@ -298,8 +300,12 @@ workaround. `DisplayIp::WildcatLake` retains display 30's timing-generator,
 PM-demand, watermark and CDCLK rules for pure resource admission, with only
 Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
 programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
-D. This type does not grant programming authority: display 30.02 remains a
-typed route refusal pending its LT-PHY and output policy.
+D. `intel_gpu_lt_phy` separately models WCL's TC1/TC2-only LT-PHY boundary:
+the seven source DP PLL images from RBR through UHBR20, their exact committed
+VDR write image, LT transmitter ownership/masking, and the DP 1.4/UHBR signal
+tables. It performs no MMIO and does not construct `DisplayIp::WildcatLake`.
+Neither pure model grants programming authority: display 30.02 remains a typed
+route refusal pending the LT-PHY transaction/power sequence and output policy.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2

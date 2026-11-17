@@ -826,6 +826,8 @@ mod intel_gpu_hwmon;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_lt_phy;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_media_gt_sysfs;
