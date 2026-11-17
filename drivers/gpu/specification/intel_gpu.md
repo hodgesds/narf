@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.02** (v1.02 transcribes Nova Lake LT PHY's five literal HDMI
+> Status: **v1.03** (v1.03 ports Nova Lake LT PHY's bounded arbitrary-clock
+> HDMI PLL synthesizer without enabling its route; v1.02 transcribes Nova Lake LT PHY's five literal HDMI
 > PLL images while leaving the arbitrary-clock synthesizer and live HDMI route closed; v1.01 models Display-35's four-source FIFO-underrun
 > evidence and exact W1C images without installing an IRQ path; v1.00 models the exact family-wide Xe3 GPIO
 > bit-bash mask workaround for Panther Lake 30.00, Wildcat Lake 30.02 and
@@ -363,8 +364,9 @@ The disconnected eDP selector adds the five intermediate 216/243/324/432/675
 MHz images to the four shared 162/270/540/810 MHz DP images. Each preserves the
 source VDR config bytes and all thirteen PLL registers; no production caller
 programs them yet. The HDMI table selector likewise preserves the five literal
-25.2/27.2/74.25/148.5/594 MHz images and returns no image for other clocks;
-Linux's separate arbitrary-clock fixed-point synthesizer is not yet modeled.
+25.2/27.2/74.25/148.5/594 MHz images. Every other clock uses a source-order,
+bounded Q32 DCO/divider search that emits all thirteen PLL registers or refuses
+the clock; table hits retain priority. Neither path enables live HDMI.
 The separate ten-entry eDP signal table preserves its lower
 main-cursor values and is exercised through the disconnected per-lane
 `TXY_CTL{8,2,3,4}` writer rather than reusing external DP 1.4 levels.

@@ -452,8 +452,9 @@ The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be
 applied only through the same disconnected LT transport. HDMI table selection
-is likewise pure and returns no image for a non-table clock; Linux's
-arbitrary-clock fixed-point synthesizer and the live HDMI route remain absent.
+is likewise pure; non-table clocks use Linux's bounded Q32 DCO/divider search
+to form a complete thirteen-register image or return no solution. Literal
+table hits retain priority, and the live HDMI route remains absent.
 The disconnected display-35 watermark calculation ignores the reported
 level-0 latency before applying the 6-us WaWmMemoryReadLatency adjustment and
 selects method 2 for every linear plane; Tile4 retains the display-30

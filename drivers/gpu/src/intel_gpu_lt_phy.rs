@@ -669,6 +669,158 @@ pub(crate) const fn hdmi_table_pll_state(clock_khz: u32) -> Option<&'static LtPl
     }
 }
 
+const DCO_MIN_FREQ_MHZ: u64 = 11_850;
+const REF_CLK_KHZ: u64 = 38_400;
+const TDC_RES_MULTIPLIER: u64 = 10_000_000;
+
+/// Linux's split-word Q32 multiply. Keeping the same operation order avoids
+/// silently changing truncation in the HDMI PLL search and register image.
+fn mul_q32_u32(a_q32: u64, b: u32) -> u64 {
+    let x_hi = a_q32 >> 32;
+    let x_lo = a_q32 & 0xffff_ffff;
+    let p0 = x_lo.wrapping_mul(u64::from(b));
+    let p1 = x_hi.wrapping_mul(u64::from(b));
+    let carry = p0 >> 32;
+    (p1 << 32)
+        .wrapping_add(carry << 32)
+        .wrapping_add(p0 & 0xffff_ffff)
+}
+
+/// `calculate_target_dco_and_loop_cnt`, including its source search order and
+/// Q32 rounding to two decimal places.
+fn hdmi_target_dco(frequency_khz: u32) -> Option<(u64, u32)> {
+    let mut dco_min = DCO_MIN_FREQ_MHZ;
+    let mut dco_max = 16_200;
+    for ppm_count in 0..5 {
+        let ppm_limit = if ppm_count == 2 { 2 } else { 1 };
+        for dco_count in 0..2 {
+            if dco_count == 1 {
+                dco_min = 10_000;
+                dco_max = 12_000;
+            }
+            let mut y = 2u32;
+            while y <= 255 {
+                let value = u64::from(y).wrapping_mul(u64::from(frequency_khz)) / 200;
+                if value == 0 {
+                    y += 2;
+                    continue;
+                }
+                let m2div = mul_q32_u32(value.wrapping_shl(32) / REF_CLK_KHZ, 500);
+                let value_with_fraction = mul_q32_u32(m2div, REF_CLK_KHZ as u32) / 500;
+                let integer = value_with_fraction >> 32;
+                let delta = integer.abs_diff(value);
+                let ppm = delta / value;
+                if integer >= dco_min && integer <= dco_max && ppm < ppm_limit {
+                    let scale = (1u64 << 32) / 100;
+                    let rounded = value_with_fraction
+                        .checked_add(scale - 1)?
+                        .checked_div(scale)?;
+                    return Some((rounded.checked_mul(scale)?, y));
+                }
+                y += 2;
+            }
+        }
+    }
+    None
+}
+
+/// Exact port of `intel_lt_phy_calculate_hdmi_state`. It creates an owned PLL
+/// image for clocks absent from [`hdmi_table_pll_state`]; no MMIO is performed.
+pub(crate) fn hdmi_calculated_pll_state(frequency_khz: u32) -> Option<LtPllState> {
+    let (target_dco_mhz, loop_count) = hdmi_target_dco(frequency_khz)?;
+    let mut m2div = target_dco_mhz / REF_CLK_KHZ;
+    m2div = mul_q32_u32(m2div, 1_000);
+    if m2div >> 32 > 511 {
+        return None;
+    }
+
+    let m2div_int = (m2div >> 32) as u32;
+    let m2div_frac = m2div as u32;
+    let fractional = u32::from(m2div_frac > 0);
+    let tdc_res = if fractional != 0 { 70u64 } else { 36u64 };
+    let tdc_fine = u32::from(tdc_res > 50);
+    let temp0 = tdc_res * 40 * 11;
+    let temp1 = ((4 * TDC_RES_MULTIPLIER + temp0) * 500) / (temp0 * REF_CLK_KHZ);
+    let temp2 = temp0 * REF_CLK_KHZ / 1_000;
+    let temp3 = (8 * TDC_RES_MULTIPLIER + temp2) / temp2;
+    let tdc_target_count = if tdc_res < 50 { temp1 } else { temp3 } / 2;
+    let target_times_res = mul_q32_u32(target_dco_mhz, tdc_res as u32) >> 32;
+    if m2div_frac > 0 && target_times_res == 0 {
+        return None;
+    }
+    let feed_forward_gain = if m2div_frac > 0 {
+        TDC_RES_MULTIPLIER / target_times_res
+    } else {
+        0
+    };
+    let dco_mhz = target_dco_mhz >> 32;
+    let high_dco = dco_mhz >= DCO_MIN_FREQ_MHZ;
+    let prop_coeff = if high_dco { 3 } else { 4 };
+    let int_coeff = if high_dco { 7 } else { 8 };
+    let ana_cfg = if high_dco { 8 } else { 6 };
+    let dco_12g = !high_dco;
+    let d7 = if dco_mhz > 12_960 { 10 } else { 8 };
+    let d8 = loop_count / 2;
+    let d4 = d8 * 2;
+
+    let values = [
+        (38 << 17) + (1 << 9) + (1 << 4),
+        (d4 << 21) + (5 << 18) + (2 << 15) + (m2div_int << 5),
+        m2div_frac,
+        (d7 << 24) + (9 << 15) + (d8 << 7) + 40,
+        (fractional << 31)
+            + (1 << 30)
+            + (fractional << 29)
+            + (fractional << 28)
+            + (tdc_fine << 27)
+            + (2 << 24)
+            + ((feed_forward_gain as u32) << 16)
+            + (int_coeff << 12)
+            + (prop_coeff << 8)
+            + tdc_target_count as u32,
+        (2 << 30)
+            + (15 << 16)
+            + (1 << 15)
+            + (1 << 14)
+            + (1 << 12)
+            + (2 << 10)
+            + (1 << 8)
+            + ((if tdc_fine != 0 { 5 } else { 11 }) << 4)
+            + if tdc_fine != 0 { 3 } else { 5 },
+        (1 << 31) + (ana_cfg << 24),
+        (1 << 23) + (1 << 24) + (32 << 16) + (1 << 8),
+        (1 << 30) + (11 << 24),
+        (39 << 24) + (8 << 21),
+        (2 << 19)
+            + ((if dco_12g { 4 } else { 3 }) << 16)
+            + (5 << 11)
+            + ((if dco_12g { 2 } else { 1 }) << 8)
+            + (2 << 3)
+            + if dco_12g { 4 } else { 3 },
+        0,
+        0,
+    ];
+    let use_pll_a = matches!(frequency_khz, 2_500 | 10_000 | 20_000) || dco_12g;
+    Some(LtPllState {
+        clock_khz: frequency_khz,
+        config: [0x84, 0x2d, 0],
+        addresses: if use_pll_a {
+            PLL_A_ADDRESSES
+        } else {
+            PLL_B_ADDRESSES
+        },
+        data: values.map(u32::to_be_bytes),
+    })
+}
+
+/// Linux table-first HDMI PLL selection. Literal clocks retain their exact
+/// source images; every other clock is offered to the bounded synthesizer.
+pub(crate) fn hdmi_pll_state(clock_khz: u32) -> Option<LtPllState> {
+    hdmi_table_pll_state(clock_khz)
+        .copied()
+        .or_else(|| hdmi_calculated_pll_state(clock_khz))
+}
+
 /// One committed VDR write in `intel_lt_phy_program_pll` order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LtVdrWrite {
@@ -1920,6 +2072,93 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_nvl_lt_phy_hdmi_table_pll_images
+    );
+
+    fn smoke_nvl_lt_phy_hdmi_calculated_pll_images() -> TestResult {
+        let expected = [
+            (
+                27_000,
+                [
+                    0x004c_0210,
+                    0x0b15_26a0,
+                    0x6010_9938,
+                    0x0804_9628,
+                    0xfa0c_7322,
+                    0x800f_d953,
+                    0x8800_0000,
+                    0x01a0_0100,
+                    0x4b00_0000,
+                    0x2800_0000,
+                    0x0013_2913,
+                    0,
+                    0,
+                ],
+            ),
+            (
+                297_000,
+                [
+                    0x004c_0210,
+                    0x0115_26a0,
+                    0x6010_9938,
+                    0x0804_8228,
+                    0xfa0c_7322,
+                    0x800f_d953,
+                    0x8800_0000,
+                    0x01a0_0100,
+                    0x4b00_0000,
+                    0x2800_0000,
+                    0x0013_2913,
+                    0,
+                    0,
+                ],
+            ),
+            (
+                533_250,
+                [
+                    0x004c_0210,
+                    0x00d5_3400,
+                    0x96bb_1c40,
+                    0x0a04_81a8,
+                    0xfa08_7322,
+                    0x800f_d953,
+                    0x8800_0000,
+                    0x01a0_0100,
+                    0x4b00_0000,
+                    0x2800_0000,
+                    0x0013_2913,
+                    0,
+                    0,
+                ],
+            ),
+        ];
+        for (clock, words) in expected {
+            let state = hdmi_pll_state(clock).unwrap();
+            assert_eq!(state.clock_khz, clock);
+            assert_eq!(state.config, [0x84, 0x2d, 0]);
+            assert_eq!(state.addresses, PLL_B_ADDRESSES);
+            assert_eq!(state.data.map(u32::from_be_bytes), words);
+        }
+
+        // Table hits always win over a newly calculated image.
+        assert_eq!(hdmi_pll_state(25_200), Some(HDMI_25_2));
+        assert_ne!(hdmi_calculated_pll_state(25_200), Some(HDMI_25_2));
+        // Preserve Linux's explicit PLL-A selection for these low clocks.
+        assert_eq!(
+            hdmi_calculated_pll_state(10_000).unwrap().addresses,
+            PLL_A_ADDRESSES
+        );
+        assert_eq!(
+            hdmi_calculated_pll_state(20_000).unwrap().addresses,
+            PLL_A_ADDRESSES
+        );
+        assert!(hdmi_pll_state(0).is_none());
+        assert!(hdmi_pll_state(1).is_none());
+        assert!(hdmi_pll_state(2_500).is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_lt_phy_hdmi_calculated_pll_images
     );
 
     fn smoke_nvl_lt_phy_write_image_and_transmitters() -> TestResult {
