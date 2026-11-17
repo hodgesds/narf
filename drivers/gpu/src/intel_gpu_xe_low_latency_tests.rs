@@ -217,9 +217,11 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
     );
     user.fail_report
         .store(false, core::sync::atomic::Ordering::Relaxed);
+    // The readable hang-replay create above already consumed queue id 1,
+    // so this second successful create returns id 2.
     assert_eq!(
         create_hint(&file, &info, &user, vm, 1, &[[0, 0, 0, 0]], 1),
-        Ok(1)
+        Ok(2)
     );
     assert_eq!(arena.live_allocations(), before);
     assert_eq!(
