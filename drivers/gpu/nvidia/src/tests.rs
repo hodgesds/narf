@@ -1532,7 +1532,7 @@ kernel_test_in!(
 // GSP (Turing+)
 // ────────────────────────────────────────────────────────────────
 
-use crate::gsp::{Gsp, GspRpcFn, GspRpcRing, FBIF_OFFSET, WPR2_HI_SCRATCH};
+use crate::gsp::{Gsp, GspRpcRing, FBIF_OFFSET, WPR2_HI_SCRATCH};
 
 fn smoke_gsp_present_only_on_turing_plus() -> TestResult {
     if !Gsp::family_has_gsp(ChipFamily::Turing) {
@@ -1566,25 +1566,26 @@ fn smoke_gsp_register_constants_pinned() -> TestResult {
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_register_constants_pinned);
 
 fn smoke_gsp_rpc_ring_empty_full_invariants() -> TestResult {
-    let mut r = GspRpcRing::new(0x1000_0000, 4096);
-    if !r.is_empty() {
+    // Page-index ring with 8 message slots.
+    let mut r = GspRpcRing::new(0x1000_0000, 8);
+    if !r.is_empty() || r.used() != 0 {
         return TestResult::Fail("fresh ring must be empty");
     }
-    if r.is_full(64) {
-        return TestResult::Fail("fresh ring is not full");
+    // One slot kept empty: 8 slots -> 7 usable.
+    if r.free() != 7 || r.is_full(7) {
+        return TestResult::Fail("fresh ring must have count-1 free slots");
     }
-    // Wrap-around full check: wptr just before rptr.
-    r.wptr = 4096 - 64;
-    r.rptr = 4096 - 128;
-    if r.is_empty() {
-        return TestResult::Fail("filled ring is not empty");
+    // Advance the write pointer by 3 messages.
+    r.wptr = 3;
+    if r.is_empty() || r.used() != 3 || r.free() != 4 {
+        return TestResult::Fail("used/free must track the page-index pointers");
     }
-    // RPC function-id table — Nop is 0x0001, AllocRoot is 0x0003.
-    if GspRpcFn::Nop as u32 != 0x0001 {
-        return TestResult::Fail("Nop RPC fn id mismatches Nouveau");
+    if !r.is_full(5) {
+        return TestResult::Fail("a 5-slot message must not fit in 4 free slots");
     }
-    if GspRpcFn::AllocRoot as u32 != 0x0003 {
-        return TestResult::Fail("AllocRoot RPC fn id mismatches Nouveau");
+    // Entry offsets are one page apart, starting one page in.
+    if GspRpcRing::entry_offset(0) != 0x1000 || GspRpcRing::entry_offset(2) != 0x3000 {
+        return TestResult::Fail("entry offsets must be entry_off + idx*page");
     }
     TestResult::Pass
 }
@@ -2436,8 +2437,9 @@ fn smoke_gsp_rpc_function_ids_match_rpcfn_h() -> TestResult {
     if GspRpcCmd::GspRmControl as u32 != 76 {
         return TestResult::Fail("GspRmControl = 76");
     }
-    if GSP_RPC_SIGNATURE != 0x36C9_72A7 {
-        return TestResult::Fail("GSP RPC signature 0x36c972a7");
+    // Verified against rpc.c:623 ('C','P','R','V').
+    if GSP_RPC_SIGNATURE != 0x4350_5256 {
+        return TestResult::Fail("GSP RPC signature must be 'CPRV' 0x43505256");
     }
     TestResult::Pass
 }
@@ -2447,24 +2449,31 @@ kernel_test_in!(
 );
 
 fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
-    let h = GspRpcHeader::new(GspRpcCmd::AllocRoot, 64);
+    // 32-byte nvfw_gsp_rpc header; length includes the header.
+    let h = GspRpcHeader::new(GspRpcCmd::AllocRoot as u32, 64, 7);
     let bytes = h.to_bytes();
+    if bytes.len() != 32 {
+        return TestResult::Fail("inner RPC header must be 32 bytes");
+    }
     let back = GspRpcHeader::from_bytes(&bytes);
     if back != h {
         return TestResult::Fail("header round-trip should be identity");
     }
-    if !back.signature_ok() {
-        return TestResult::Fail("fresh header should have valid signature");
+    if !back.signature_ok() || back.header_version != 0x0300_0000 {
+        return TestResult::Fail("fresh header must carry version + valid signature");
     }
-    if back.function != 2 {
-        return TestResult::Fail("function id propagates");
+    if back.function != 2 || back.sequence != 7 {
+        return TestResult::Fail("function id + sequence propagate");
     }
-    if back.length != 64 {
-        return TestResult::Fail("length propagates");
+    if back.length != 32 + 64 {
+        return TestResult::Fail("length must include the 32-byte header");
     }
-    // Corrupting the signature should be detected.
+    if back.rpc_result != 0xFFFF_FFFF {
+        return TestResult::Fail("send-side rpc_result must be the 0xffffffff sentinel");
+    }
+    // Corrupting the signature (bytes[4..8]) should be detected.
     let mut bad = bytes;
-    bad[0] ^= 0xFF;
+    bad[4] ^= 0xFF;
     let corrupt = GspRpcHeader::from_bytes(&bad);
     if corrupt.signature_ok() {
         return TestResult::Fail("signature mismatch must be detected");
@@ -2473,47 +2482,51 @@ fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
 }
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_header_pack_roundtrip);
 
-fn smoke_gsp_enqueue_dequeue_round_trip() -> TestResult {
-    use crate::gsp::GspRpcRing;
-    // We can't easily build a real Gsp without an MmioRegion, but
-    // the enqueue/dequeue logic is on the rings — synthesize them
-    // and exercise the path through a stub.
-    let mut cmdq = GspRpcRing::new(0x4000_0000, 4096);
-    let msgq = GspRpcRing::new(0x4000_4000, 4096);
-    // Stage a fake RPC.
-    let mut out = [0u8; 256];
-    let info = GspSetSystemInfo::new(6, 4, 0x0005_0000);
-    let body = info.to_bytes();
-    // Manually pack — we can't construct `Gsp` here without an
-    // MmioRegion; the wptr-advance code on the ring is the
-    // load-bearing piece.
-    let hdr = GspRpcHeader::new(GspRpcCmd::SetGuestSystemInfo, body.len() as u32);
-    out[..16].copy_from_slice(&hdr.to_bytes());
-    out[16..16 + body.len()].copy_from_slice(&body);
-    let advance = ((16 + body.len()) as u32).next_multiple_of(16);
-    cmdq.wptr = cmdq.wptr.wrapping_add(advance) & (cmdq.size_bytes - 1);
-    if cmdq.wptr != 32 {
-        return TestResult::Fail("cmdq wptr should advance to 32 (16+16 aligned)");
+fn smoke_gsp_rpc_message_build_parse_round_trip() -> TestResult {
+    use crate::gsp::{
+        build_rpc_message, parse_rpc_message, rpc_checksum, rpc_message_slots, GSP_PAGE_SIZE,
+        NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+    };
+    // A small payload fits in a single page slot.
+    let body = GspSetSystemInfo::new(6, 4, 0x0005_0000).to_bytes();
+    if rpc_message_slots(body.len()) != 1 {
+        return TestResult::Fail("a small message occupies one page slot");
     }
-    // Decode it back.
-    let decoded = GspRpcHeader::from_bytes(&out[..16].try_into().unwrap());
-    if decoded.function != GspRpcCmd::SetGuestSystemInfo as u32 {
-        return TestResult::Fail("function id round-trip");
+    let mut out = alloc::vec![0u8; GSP_PAGE_SIZE];
+    let n = match build_rpc_message(NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, 9, &body, &mut out) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("message must build"),
+    };
+    if n != GSP_PAGE_SIZE {
+        return TestResult::Fail("one-slot message must be page-aligned length");
     }
-    if decoded.length != 16 {
-        return TestResult::Fail("body length round-trip");
+    // The element checksum must fold the whole message to zero.
+    if rpc_checksum(&out[..n]) != 0 {
+        return TestResult::Fail("checksum must fold the message to zero");
     }
-    // Decode body.
-    let body_bytes = &out[16..16 + decoded.length as usize];
-    let os_major = u32::from_le_bytes([body_bytes[0], body_bytes[1], body_bytes[2], body_bytes[3]]);
-    if os_major != 6 {
-        return TestResult::Fail("body field round-trip");
+    // Parse it back.
+    let (hdr, payload) = match parse_rpc_message(&out[..n]) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("message must parse"),
+    };
+    if hdr.function != NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO || hdr.sequence != 9 {
+        return TestResult::Fail("function + sequence must round-trip");
     }
-    // msgq is empty; dequeue should yield None at offset 0.
-    let _ = msgq.is_empty();
+    if payload != body {
+        return TestResult::Fail("payload must round-trip");
+    }
+    // A corrupted payload byte breaks the checksum fold.
+    let mut bad = out.clone();
+    bad[80] ^= 0xFF;
+    if parse_rpc_message(&bad[..n]).is_ok() {
+        return TestResult::Fail("a corrupt message must fail the checksum");
+    }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_enqueue_dequeue_round_trip);
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp_rpc_message_build_parse_round_trip
+);
 
 fn smoke_gsp_set_system_info_body_layout() -> TestResult {
     let info = GspSetSystemInfo::new(5, 19, 0x0005_1100);
@@ -4834,3 +4847,62 @@ fn smoke_gsp3_radix3_sizing() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_radix3_sizing);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 4 — RPC wire format corrections (lane GSP-4)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_gsp4_element_doorbell_and_sequence() -> TestResult {
+    use crate::gsp::{
+        GspMsgElement, GSP_DOORBELL_OFFSET, GSP_INIT_SEQUENCE, GSP_MSG_HDR_SIZE,
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+        NV_VGPU_MSG_FUNCTION_NOP, NV_VGPU_MSG_FUNCTION_SET_REGISTRY,
+    };
+    // Outer element header is 48 bytes with checksum/seq/count packed
+    // after the two 16-byte tag buffers.
+    let elem = GspMsgElement {
+        auth_tag_buffer: [0; 16],
+        aad_buffer: [0; 16],
+        checksum: 0x1122_3344,
+        sequence: 5,
+        elem_count: 2,
+        pad: 0,
+    };
+    let b = elem.to_bytes();
+    if b.len() != 48 || GSP_MSG_HDR_SIZE != 48 {
+        return TestResult::Fail("outer element must be 48 bytes");
+    }
+    if u32::from_le_bytes([b[32], b[33], b[34], b[35]]) != 0x1122_3344
+        || u32::from_le_bytes([b[40], b[41], b[42], b[43]]) != 2
+    {
+        return TestResult::Fail("checksum/elem_count must pack at 0x20/0x28");
+    }
+    // Verified function/event ids.
+    if NV_VGPU_MSG_FUNCTION_NOP != 0
+        || NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO != 72
+        || NV_VGPU_MSG_FUNCTION_SET_REGISTRY != 73
+        || NV_VGPU_MSG_EVENT_GSP_INIT_DONE != 0x1001
+    {
+        return TestResult::Fail("function/event ids drifted from rpcfn.h");
+    }
+    // Doorbell is the GSP Falcon base + 0xc00.
+    if GSP_DOORBELL_OFFSET != 0x0011_0000 + 0xC00 {
+        return TestResult::Fail("doorbell must be GSP falcon base + 0xc00");
+    }
+    // Init handshake order: SET_SYSTEM_INFO, SET_REGISTRY, then wait
+    // for the GSP_INIT_DONE event.
+    if GSP_INIT_SEQUENCE
+        != [
+            NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+            NV_VGPU_MSG_FUNCTION_SET_REGISTRY,
+            NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+        ]
+    {
+        return TestResult::Fail("init handshake order drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp4_element_doorbell_and_sequence
+);
