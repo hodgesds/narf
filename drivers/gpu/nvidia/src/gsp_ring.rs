@@ -18,8 +18,8 @@
 //!   `cmdq.rx.readPtr` as it consumes.
 //!
 //! The pure ring math + header layout are unit-tested; the send /
-//! receive / handshake are hardware (QEMU has no NVIDIA GPU) and are
-//! the part to validate on a real card.
+//! receive / handshake are hardware. The cross-wiring + handshake
+//! ordering are the parts most worth confirming against silicon.
 
 #![allow(dead_code)]
 

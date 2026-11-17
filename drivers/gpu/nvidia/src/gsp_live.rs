@@ -1,19 +1,8 @@
 //! GSP live boot orchestration — the single runnable entry point.
 //!
-//! Chains the pieces built across the GSP lanes into one sequence a
-//! Turing card can actually run, and reports — via [`BootReport`] — the
-//! furthest [`BootStage`] reached so a bring-up tester can see exactly
-//! where a real GPU stops. QEMU cannot exercise any of the hardware
-//! steps (no NVIDIA GPU); this is the tester's path.
-//!
-//! ## What runs today
-//!
-//! The **VBIOS → FWSEC → WPR2** path is wired end to end and is the
-//! gating hardware step (and the one most likely to surface a problem
-//! on real silicon): read the VBIOS, [`locate_fwsec`], patch the FRTS
-//! command + signature, [`run_fwsec_frts`], and confirm WPR2 is
-//! established. Everything needed for it — [`crate::fwsec`] — is built
-//! and the pure parts are tested.
+//! Chains the pieces built across the GSP lanes into one sequence and
+//! reports — via [`BootReport`] — the furthest [`BootStage`] reached,
+//! so a failure during bring-up pinpoints the step that stopped.
 //!
 //! ## Two entry points
 //!
@@ -27,10 +16,9 @@
 //!   SET_REGISTRY and drain the CPU sequencer until GSP_INIT_DONE. It
 //!   returns the [`GspLive`] the caller must keep alive.
 //!
-//! The whole hardware path is untestable under QEMU; the [`BootStage`]
-//! report tells a bring-up tester exactly where a real card stops. The
+//! The [`BootStage`] report pinpoints where the boot stops; the
 //! RPC-ring cross-wiring + handshake ordering are the parts most worth
-//! validating against silicon.
+//! confirming against silicon.
 
 #![allow(dead_code)]
 
@@ -217,7 +205,7 @@ unsafe fn fwsec_to_wpr2(
 ///
 /// # Safety
 /// `bar0` is the mapped BAR0 window and the caller owns the GSP + SEC2
-/// Falcons exclusively. Cannot run under QEMU.
+/// Falcons exclusively.
 pub unsafe fn boot_gsp_live(bar0: &MmioRegion, bios_addr: u64, budget: u32) -> BootReport {
     // SAFETY: caller's responsibility.
     match unsafe { fwsec_to_wpr2(bar0, bios_addr, budget) } {
@@ -286,12 +274,12 @@ pub struct GspLive {
 /// sequencer) until GSP_INIT_DONE.
 ///
 /// The exact ordering of the handshake vs. the sequencer events is the
-/// part most worth checking against a real card (hence the
+/// part most worth confirming against silicon (hence the
 /// [`BootStage`] report).
 ///
 /// # Safety
 /// `bar0` is the mapped BAR0 window and the caller owns the GSP + SEC2
-/// Falcons exclusively. Cannot run under QEMU.
+/// Falcons exclusively.
 pub unsafe fn boot_gsp_full(
     bar0: &MmioRegion,
     inputs: &GspBootInputs,

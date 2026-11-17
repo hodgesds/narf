@@ -24,8 +24,8 @@
 //!   `rm/r535/gsp.c::nvkm_gsp_radix3_sg`.
 //!
 //! Allocating the VRAM/sysmem pages, writing the tables, and DMA-
-//! syncing the descriptor need a VRAM allocator and real silicon
-//! (QEMU has no NVIDIA GPU); those are a later lane.
+//! syncing the descriptor are handled by the live boot path
+//! ([`crate::gsp_image`]).
 
 #![allow(dead_code)]
 

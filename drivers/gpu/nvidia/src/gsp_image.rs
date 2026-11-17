@@ -4,11 +4,9 @@
 //!
 //! The allocated buffers must persist for the GSP's lifetime (the GPU
 //! DMAs from them continuously after boot), so they are owned by
-//! [`GspImage`], which the caller keeps alive. This wires together the
-//! tested builders ([`crate::gsp_elf`], [`crate::gsp_rm`],
-//! [`crate::gsp_fw`]) onto narf's DMA allocator; it is hardware
-//! integration and cannot be exercised under QEMU, but the builders it
-//! calls are all unit-tested and its API usage is compile-checked.
+//! [`GspImage`], which the caller keeps alive. This wires the tested
+//! builders ([`crate::gsp_elf`], [`crate::gsp_rm`], [`crate::gsp_fw`])
+//! onto narf's DMA allocator.
 
 #![allow(dead_code)]
 

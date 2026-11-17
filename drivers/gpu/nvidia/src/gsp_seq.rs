@@ -8,7 +8,7 @@
 //! `gsp/sequencer.rs`.
 //!
 //! The opcode **decode** is pure and unit-tested; the **execute**
-//! (register pokes, Falcon ops) is hardware and cannot run under QEMU.
+//! (register pokes, Falcon ops) is hardware.
 
 #![allow(dead_code)]
 
@@ -155,7 +155,7 @@ pub fn decode_all(buf: &[u8], cmd_dwords: u32) -> Result<Vec<SeqCmd>, SeqError> 
     Ok(cmds)
 }
 
-// ── Execute (hardware; QEMU cannot exercise this) ────────────────
+// ── Execute (hardware) ───────────────────────────────────────────
 //
 // Register offsets relative to a Falcon base (GSP = 0x110000,
 // SEC2 = 0x840000) unless an absolute BAR0 offset is noted.

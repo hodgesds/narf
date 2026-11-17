@@ -434,7 +434,7 @@ pub fn fwsec_dmem_slice<'a>(ucode: &'a [u8], desc: &FalconUcodeDescV3) -> Option
 ///
 /// # Safety
 /// `bar0` is the mapped BAR0 window and the caller owns the GSP Falcon
-/// exclusively. Cannot be exercised under QEMU (no NVIDIA GPU).
+/// exclusively.
 pub unsafe fn run_fwsec_frts(
     bar0: &MmioRegion,
     ucode: &[u8],
