@@ -1028,8 +1028,9 @@ pub const fn quirk_count() -> usize {
 // class devices bound to the `audio-mute` / `mic-mute` triggers,
 // driven on the platform side by the Lenovo WMI hotkey-utilities
 // driver. NARF has the LED registry (`drivers/leds`), the ACPI
-// HID lookup (`narf_aml::find_device_by_hid`), and WMI hotkey
-// *event* decoding — but no `audio-mute` / `mic-mute` LED
+// HID lookup (`narf_aml::find_device_by_hid`), WMI hotkey
+// *event* decoding, and now the `audio-mute` trigger itself
+// (`Trigger::AudioMute`, #1716) — but still no `mic-mute`
 // trigger, no vmaster mute hook in the HDA path, and no Lenovo
 // WMI hotkey-utilities LED driver, so there is no sink for the
 // fixup half to drive. The pin half is why

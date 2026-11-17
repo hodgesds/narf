@@ -478,17 +478,19 @@ pub fn set_mute_led<T: ElanHidIo>(io: &mut T, on: bool) -> Result<(), TransportE
 //
 // The LED is the *audio*-mute LED (Linux default trigger
 // `audio-mute`): it lights when the audio mixer is muted, not on
-// microphone mute specifically. NARF has no `audio-mute` trigger
-// in the LED trigger engine yet (remainder: file the trigger
-// wiring as a follow-up), so the mute state the driver follows is
-// the input core's per-device EV_LED bitmap — `LED_MUTE` (0x07) on
-// the Elan evdev node — owned by `narf_input::evdev::DeviceNode`
-// and written by userspace EV_LED writes or by the
-// `elan:red:mute` LED class device below. The i2c-HID pump polls
-// that bitmap after every Elan report (the tree's established
-// pattern for pump-owned producers; see `sync_kbd_leds`) and
-// issues the 0xBC Feature report only when the mute state moved
-// since the last successful send.
+// microphone mute specifically. The trigger engine drives it from
+// the mixer Master Playback Switch via `Trigger::AudioMute`
+// (`drivers/leds/src/triggers.rs`, fed by
+// `drivers/sound/src/mixer.rs::set`); the mute state the driver
+// follows is the input core's per-device EV_LED bitmap —
+// `LED_MUTE` (0x07) on the Elan evdev node — owned by
+// `narf_input::evdev::DeviceNode` and written by userspace EV_LED
+// writes, by the `elan:red:mute` LED class device below, or by the
+// trigger engine. The i2c-HID pump polls that bitmap after every
+// Elan report (the tree's established pattern for pump-owned
+// producers; see `sync_kbd_leds`) and issues the 0xBC Feature
+// report only when the mute state moved since the last
+// successful send.
 
 /// LED class name for the Elan mute LED (Linux
 /// `elan_init_mute_led()`, `hid-elan.c:451`).
@@ -619,9 +621,13 @@ pub fn mute_from_led_bitmap(led_bitmap: u16) -> bool {
 /// `EV_LED` write converge on the same bitmap, and the i2c-HID
 /// pump (the only task that can issue the async feature report)
 /// polls that bitmap and drives the hardware. The trigger is
-/// `Trigger::None` — NARF has no `audio-mute` trigger in the LED
-/// trigger engine yet, so nothing drives the LED automatically
-/// from mixer state; that wiring is a follow-up, not this lane.
+/// `Trigger::AudioMute` (Linux `default_trigger = "audio-mute"`,
+/// `hid-elan.c:452`): the trigger engine drives `set_brightness`
+/// from the mixer Master Playback Switch, so the LED follows
+/// mixer mute automatically. A manual brightness write still
+/// lands on the same bitmap, but the engine re-asserts the mixer
+/// state on its next 100 ms tick — the trigger owns the LED,
+/// matching Linux.
 pub struct ElanMuteLedClass {
     node: Arc<DeviceNode>,
     trigger: IrqSafeSpinLock<Trigger>,
@@ -634,7 +640,7 @@ impl ElanMuteLedClass {
     pub fn new(node: Arc<DeviceNode>) -> Self {
         Self {
             node,
-            trigger: IrqSafeSpinLock::new(Trigger::None),
+            trigger: IrqSafeSpinLock::new(Trigger::AudioMute),
         }
     }
 }

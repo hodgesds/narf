@@ -5400,6 +5400,10 @@ fn smoke_hid_elan_mute_led_class_device() -> TestResult {
         TestResult::Fail(msg)
     };
     let dev = crate::hid_elan::register_mute_led(node.clone());
+    // Linux default trigger: audio-mute (hid-elan.c:452).
+    if dev.current_trigger() != narf_drivers_leds::Trigger::AudioMute {
+        return fail("elan:red:mute trigger must be AudioMute");
+    }
     let found = match narf_drivers_leds::lookup_led_by_name(ELAN_MUTE_LED_NAME) {
         Some(d) => d,
         None => return fail("elan:red:mute not in the LED registry"),
