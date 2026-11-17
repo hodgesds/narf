@@ -3794,13 +3794,17 @@ pub mod tests {
         for did in [ATSM_56C0, ATSM_56C1, ATSM_56C2] {
             if !source_known_unqualified(did)
                 || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
-                || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did).is_some()
+                || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
+                    != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
             {
-                return TestResult::Fail("Arctic Sound-M fail-closed identity boundary");
+                return TestResult::Fail("Arctic Sound-M typed fail-closed identity boundary");
             }
         }
         for did in [0x56bfu16, 0x56c3] {
-            if source_known_unqualified(did) {
+            if source_known_unqualified(did)
+                || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
+                    == Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
+            {
                 return TestResult::Fail("Arctic Sound-M identity widened beyond Linux IDs");
             }
         }

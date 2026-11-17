@@ -281,7 +281,7 @@ pub(crate) struct Bind {
 /// PAT indices coherent with CPU caches that this driver programs.
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
     match platform {
-        GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
         _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
         GtPlatform::WildcatLake => matches!(pat, 1 | 2 | 4 | 5 | 7),

@@ -849,12 +849,9 @@ impl RegisterInit {
                     add(0x2050, 0x1080, 0x1080, true, Direct);
                 }
             }
-            GtPlatform::Alchemist => {
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
-                if matches!(
-                    self.device,
-                    0x56a0 | 0x56a1 | 0x56a2 | 0x56be | 0x56bf | 0x5690 | 0x5691 | 0x5692
-                ) {
+                if crate::intel_gpu_gt::is_dg2_g10(self.device) {
                     add(0x9434, 0x20000, 0x20000, false, Direct); // 22010523718 G10
                     add(0x9524, 0x10000000, 0x10000000, false, Dss); // 14011006942 G10
                 }
@@ -866,20 +863,7 @@ impl RegisterInit {
                 add(0xb188, 8, 8, false, L3); // blend-fill tuning
                 add(0x8724, 0x40000000, 0x40000000, false, Implicit); // 32B access tuning
                 add(0x20ec, 2, 2, true, Direct); // 18019627453
-                let g11 = matches!(
-                    self.device,
-                    0x56a5
-                        | 0x56a6
-                        | 0x56b0
-                        | 0x56b1
-                        | 0x56ba
-                        | 0x56bb
-                        | 0x56bc
-                        | 0x56bd
-                        | 0x5693
-                        | 0x5694
-                        | 0x5695
-                );
+                let g11 = crate::intel_gpu_gt::is_dg2_g11(self.device);
                 add(
                     0xe7cc,
                     if g11 { 0x048000f0 } else { 0x04800010 },

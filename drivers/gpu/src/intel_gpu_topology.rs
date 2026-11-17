@@ -40,7 +40,7 @@ impl L3Rule {
     pub(crate) const fn for_platform(platform: GtPlatform) -> Option<Self> {
         Some(match platform {
             GtPlatform::Gen12(_) => Self::XeLp,
-            GtPlatform::Alchemist => Self::Dg2,
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => Self::Dg2,
             GtPlatform::Integrated(Generation::MeteorLake) => Self::XeLpg,
             GtPlatform::Battlemage | GtPlatform::Integrated(Generation::LunarLake) => Self::Xe2,
             GtPlatform::NovaLakeS

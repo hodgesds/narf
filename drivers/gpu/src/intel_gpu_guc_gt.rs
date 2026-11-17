@@ -597,7 +597,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     pub(crate) fn vram_needs_ccs_clear(&self) -> bool {
-        self.parts.boot.platform() == GtPlatform::Alchemist
+        self.parts.boot.platform().is_dg2()
     }
 
     #[cfg(any(test, feature = "kernel-test"))]
@@ -950,7 +950,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             (value != u32::MAX && value == window.read32(offset)).then_some(value)
         };
         // GMD_ID exists from graphics 12.70; gt->info.gmdid is 0 before it.
-        let gmd_id = if platform.is_gen12() || platform == GtPlatform::Alchemist {
+        let gmd_id = if platform.is_gen12() || platform.is_dg2() {
             0
         } else {
             stable(0xd8c).ok_or(FsError::NoDevice)?
@@ -1173,7 +1173,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 self.parts.boot.platform() != GtPlatform::Battlemage
                     || self.user_epoch() != Some(epoch)
             } else {
-                self.parts.boot.platform() != GtPlatform::Alchemist
+                !self.parts.boot.platform().is_dg2()
             }
         {
             return Err(GtError::State);

@@ -79,7 +79,7 @@ impl GraphicsIp {
                 step: 0,
             });
         }
-        if platform == GtPlatform::Alchemist {
+        if platform.is_dg2() {
             return Ok(Self {
                 version: 1255,
                 step: 0,
@@ -126,6 +126,10 @@ pub enum GtPlatform {
     /// Nova Lake-S: distinct 70.55.4 GuC with display/media 35.00 and the
     /// source Xe3-LPG graphics 30.03-30.05 live-GMD set.
     NovaLakeS,
+    /// Arctic Sound-M: display-less DG2 accelerator identity. Execution stays
+    /// probe-gated until its SR-IOV and device-specific policy are separated,
+    /// but source-defined GT, address and firmware facts remain typed.
+    ArcticSoundM,
     Alchemist,
     Battlemage,
 }
@@ -159,6 +163,33 @@ pub(crate) const BMG_IDS: &[u16] = &[
     0xe202, 0xe209, 0xe20b, 0xe20c, 0xe20d, 0xe210, 0xe211, 0xe212, 0xe216, 0xe220, 0xe221, 0xe222,
     0xe223,
 ];
+
+/// Linux `dg2_g10_ids`: DG2 G10 plus ATS-M150.
+pub(crate) const fn is_dg2_g10(device: u16) -> bool {
+    matches!(
+        device,
+        0x56a0 | 0x56a1 | 0x56a2 | 0x56be | 0x56bf | 0x5690 | 0x5691 | 0x5692 | 0x56c0 | 0x56c2
+    )
+}
+
+/// Linux `dg2_g11_ids`: DG2 G11 plus ATS-M75.
+pub(crate) const fn is_dg2_g11(device: u16) -> bool {
+    matches!(
+        device,
+        0x56a5
+            | 0x56a6
+            | 0x56b0
+            | 0x56b1
+            | 0x56ba
+            | 0x56bb
+            | 0x56bc
+            | 0x56bd
+            | 0x5693
+            | 0x5694
+            | 0x5695
+            | 0x56c1
+    )
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GuCProfile {
@@ -201,6 +232,8 @@ impl GtPlatform {
         }
         if DG1_IDS.contains(&device) {
             Some(Self::Gen12(Gen12Platform::Dg1))
+        } else if crate::intel_gpu::ATSM_IDS.contains(&device) {
+            Some(Self::ArcticSoundM)
         } else if DG2_IDS.contains(&device) {
             Some(Self::Alchemist)
         } else if BMG_IDS.contains(&device) {
@@ -213,12 +246,21 @@ impl GtPlatform {
     pub const fn is_discrete(self) -> bool {
         matches!(
             self,
-            Self::Gen12(Gen12Platform::Dg1) | Self::Alchemist | Self::Battlemage
+            Self::Gen12(Gen12Platform::Dg1)
+                | Self::ArcticSoundM
+                | Self::Alchemist
+                | Self::Battlemage
         )
     }
 
     pub const fn is_gen12(self) -> bool {
         matches!(self, Self::Gen12(_))
+    }
+
+    /// Shared Xe-HPG 12.55 mechanics. ATS-M remains a distinct policy
+    /// identity even though Linux assigns it the DG2 platform architecture.
+    pub const fn is_dg2(self) -> bool {
+        matches!(self, Self::ArcticSoundM | Self::Alchemist)
     }
 
     /// Architecture properties are independent of discrete-memory ownership.
@@ -253,7 +295,7 @@ impl GtPlatform {
         self.is_headless_integrated() || matches!(self, Self::Battlemage)
     }
     pub const fn multiple_ccs(self) -> bool {
-        matches!(self, Self::Alchemist | Self::Battlemage) || self.is_headless_integrated()
+        self.is_dg2() || matches!(self, Self::Battlemage) || self.is_headless_integrated()
     }
     /// DG1 introduced the tile-master interrupt register even though its
     /// graphics IP remains in the pre-GMD Gen12 family.
@@ -270,7 +312,7 @@ impl GtPlatform {
     pub(crate) const fn pte_format(self) -> crate::intel_gpu_gtt::PteFormat {
         if self.is_headless_integrated() {
             crate::intel_gpu_gtt::PteFormat::Xe2
-        } else if self.is_gen12() || matches!(self, Self::Alchemist) {
+        } else if self.is_gen12() || self.is_dg2() {
             crate::intel_gpu_gtt::PteFormat::Gen12
         } else {
             crate::intel_gpu_gtt::PteFormat::XeLpg
@@ -278,12 +320,22 @@ impl GtPlatform {
     }
 
     pub(crate) const fn physical_bits(self) -> u32 {
-        if self.is_headless_integrated() {
-            46
-        } else if self.is_gen12() {
-            39
-        } else {
-            52
+        match self {
+            Self::Gen12(_) => 39,
+            // Current Linux xe descriptors give every admitted post-Gen12
+            // platform a 46-bit DMA mask. PTE address capacity is a separate
+            // contract and must not widen DMA admission (notably DG2/BMG).
+            Self::Integrated(
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake,
+            )
+            | Self::WildcatLake
+            | Self::NovaLakeS
+            | Self::ArcticSoundM
+            | Self::Alchemist
+            | Self::Battlemage => 46,
+            Self::Integrated(
+                Generation::TigerLake | Generation::RocketLake | Generation::AlderLake,
+            ) => 39,
         }
     }
 
@@ -303,7 +355,7 @@ impl GtPlatform {
             | Self::WildcatLake
             | Self::NovaLakeS
             | Self::Battlemage => Some(0xdfc),
-            Self::Alchemist | Self::Gen12(_) => Some(0x130044),
+            Self::ArcticSoundM | Self::Alchemist | Self::Gen12(_) => Some(0x130044),
             _ => None,
         }
     }
@@ -315,7 +367,7 @@ impl GtPlatform {
             Self::Gen12(Gen12Platform::AlderLakeP) => ("i915/adlp_guc_70.bin", (70, 44, 1)),
             Self::Gen12(_) => ("i915/tgl_guc_70.bin", (70, 44, 1)),
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
-            Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
+            Self::ArcticSoundM | Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
             Self::Battlemage => ("xe/bmg_guc_70.bin", (70, 54, 0)),
             Self::Integrated(Generation::LunarLake) => ("xe/lnl_guc_70.bin", (70, 53, 0)),
             Self::Integrated(Generation::PantherLake) => ("xe/ptl_guc_70.bin", (70, 54, 0)),
@@ -398,6 +450,12 @@ mod tests {
                 (70, 53, 0),
             ),
             (
+                0x56c0,
+                GtPlatform::ArcticSoundM,
+                "i915/dg2_guc_70.bin",
+                (70, 53, 0),
+            ),
+            (
                 0xe20b,
                 GtPlatform::Battlemage,
                 "xe/bmg_guc_70.bin",
@@ -458,6 +516,38 @@ mod tests {
                 })
         {
             return TestResult::Fail("DG1 Xe-LP+ architecture profile");
+        }
+        if GraphicsIp::read(&NoMmio, GtPlatform::ArcticSoundM)
+            != Ok(GraphicsIp {
+                version: 1255,
+                step: 0,
+            })
+        {
+            return TestResult::Fail("ATS-M pre-GMD graphics identity");
+        }
+        for (platform, bits) in [
+            (GtPlatform::Gen12(Gen12Platform::TigerLake), 39),
+            (GtPlatform::Gen12(Gen12Platform::Dg1), 39),
+            (GtPlatform::Integrated(Generation::MeteorLake), 46),
+            (GtPlatform::ArcticSoundM, 46),
+            (GtPlatform::Alchemist, 46),
+            (GtPlatform::Battlemage, 46),
+            (GtPlatform::Integrated(Generation::LunarLake), 46),
+            (GtPlatform::Integrated(Generation::PantherLake), 46),
+            (GtPlatform::WildcatLake, 46),
+            (GtPlatform::NovaLakeS, 46),
+        ] {
+            if platform.physical_bits() != bits {
+                return TestResult::Fail("Linux xe descriptor DMA width");
+            }
+        }
+        if !is_dg2_g10(0x56c0)
+            || !is_dg2_g10(0x56c2)
+            || is_dg2_g10(0x56c1)
+            || !is_dg2_g11(0x56c1)
+            || is_dg2_g11(0x56c0)
+        {
+            return TestResult::Fail("ATS-M DG2 subplatform identity");
         }
         for version in [3003, 3004, 3005] {
             let raw = (version / 100) << 22 | (version % 100) << 14 | 2;

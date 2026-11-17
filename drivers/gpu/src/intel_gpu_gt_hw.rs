@@ -694,7 +694,10 @@ impl HardwareInit {
                 media: None,
             }));
         }
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !matches!(
+            self.platform,
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist
+        );
         if modern {
             let sem = mmio.read32(0xfd0);
             if sem == u32::MAX {
@@ -738,7 +741,7 @@ impl HardwareInit {
                 }
                 3
             }
-            GtPlatform::Alchemist => {
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 mmio.write32(0x4800, 3); // Xe-LP PAT0: WB, coherent
                 let l3 = [0x90, 0xd0, 0x50, 0xb0];
                 for i in 0..32 {

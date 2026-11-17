@@ -239,7 +239,7 @@ pub(crate) enum Profile {
 impl Profile {
     pub(crate) fn of(platform: GtPlatform, graphics: u16) -> Option<Self> {
         match platform {
-            GtPlatform::Alchemist if graphics == 1255 => Some(Self::Dg2),
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist if graphics == 1255 => Some(Self::Dg2),
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake)
                 if matches!(graphics, 1270 | 1271 | 1274) =>
             {

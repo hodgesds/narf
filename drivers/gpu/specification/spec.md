@@ -1827,7 +1827,8 @@ Registry authorization does not establish GuC boot-ROM authentication.
 
 `intel_gpu_gt::GtPlatform::from_pci` separates integrated display generation
 from GT identity: the canonical integrated table plus exact Linux DG1 (5),
-DG2 (25) and BMG (13) PCI IDs. Every census is exact (never a numeric range)
+DG2 (25), ATS-M (3) and BMG (13) PCI IDs. Every census is exact (never a
+numeric range)
 and includes every currently qualified TGL/ADL variant from Linux
 `include/drm/intel/pciids.h`, including TGL 9A59/9AC0/9AC9/9AD9/9AF8 and
 ADL 46A2/46B2/46C2, plus the six exact RKL IDs
@@ -1841,6 +1842,10 @@ firmware profile. RKL is a distinct pre-GMD `Gen12Platform` while selecting
 the source-mandated TGL GuC image; its display gate stays closed, so live
 firmware scanout is preserved and only the all-pipes-stopped display-less GT
 route is admitted.
+`GtPlatform::physical_bits()` is the source xe descriptor's PCI DMA mask, not
+the wider address capacity of a PTE: qualified Gen12/DG1 profiles are DMA39;
+MTL/Arrow, DG2/ATS-M, BMG, LNL, PTL/WCL and NVL-S are DMA46. Every GGTT/PPGTT
+publication rejects physical addresses above that platform mask.
 DG1 is a distinct discrete `Gen12Platform`, exact IDs 4905–4909 only, with
 pre-GMD graphics 12.10, 39-bit DMA, a three-level VM and
 `i915/dg1_guc_70.bin` >=70.44.1. It uses the source DG1 MOCS/L3CC table rather
@@ -1864,11 +1869,12 @@ root4, non-flat CCS and graphics 35.11/media 35.03, while its current GuC
 firmware table contains no `CRESCENTISLAND` entry. No other family's firmware
 or memory policy is substituted.
 The exact ATS-M 56C0/56C1/56C2 VGA IDs are likewise registered and announced
-before the same no-effects refusal. Linux gives ATS-M the DG2 platform and
-GuC (`i915/dg2_guc_70.bin` 70.53.0+) but a distinct display-less, SR-IOV
-descriptor (graphics/media 12.55, DMA46, flat CCS, VA48/root3 and 64 KiB VRAM
-granularity). It is not aliased to NARF's display-capable `Alchemist` owner;
-execution waits for a separately qualified headless/SR-IOV policy.
+before the same no-effects refusal. `GtPlatform::ArcticSoundM` records Linux's
+DG2 platform and GuC (`i915/dg2_guc_70.bin` 70.53.0+), pre-GMD graphics/media
+12.55, DMA46/root3/VA48, Flat-CCS and exact M150=G10 / M75=G11 subplatform
+mechanics without aliasing the display-capable `Alchemist` policy identity.
+Probe still refuses before D-state/BAR/command/MMIO effects; execution waits
+for a separately qualified display-less SR-IOV lifecycle and reset owner.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

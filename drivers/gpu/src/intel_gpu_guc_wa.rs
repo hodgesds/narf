@@ -18,21 +18,8 @@ impl GuCWorkarounds {
         let (flags, klvs): (_, &'static [u32]) = match platform {
             // POLLCS + PRE_PARSER. No CCS, TSC or XeHP register-state WA.
             GtPlatform::Gen12(_) => (0x44000, &[0x900b0000]),
-            GtPlatform::Alchemist => {
-                let isolation = matches!(
-                    device,
-                    0x56a5
-                        | 0x56a6
-                        | 0x56b0
-                        | 0x56b1
-                        | 0x56ba
-                        | 0x56bb
-                        | 0x56bc
-                        | 0x56bd
-                        | 0x5693
-                        | 0x5694
-                        | 0x5695
-                );
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
+                let isolation = crate::intel_gpu_gt::is_dg2_g11(device);
                 // HOLD_CCS_SWITCHOUT, DUAL_QUEUE, PRE_PARSER, TSC check;
                 // G11 additionally requires CONTEXT_ISOLATION.
                 (

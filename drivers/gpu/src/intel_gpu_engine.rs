@@ -145,7 +145,7 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> 
         _ if platform.is_xe2() => ((fuse4 >> 16) & 0xf) as u8,
         GtPlatform::Gen12(_) => 0,
         GtPlatform::Integrated(_) => 1,
-        GtPlatform::Alchemist => {
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
             // get_num_dss_regs: one geometry and one compute register, so
             // each quadrant is 8 DSS of the geometry|compute union.
             (0..4)
@@ -451,7 +451,7 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
         _ if platform.is_headless_integrated() => 3,
         GtPlatform::Gen12(_) => 3,
         GtPlatform::Integrated(_) => 9,
-        GtPlatform::Alchemist => 1,
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => 1,
         GtPlatform::Battlemage => 3,
         GtPlatform::WildcatLake => 3,
         GtPlatform::NovaLakeS => 3,

@@ -1172,7 +1172,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             return None;
         }
         state.gt.as_ref()?;
-        let raw = if self.platform == GtPlatform::Alchemist || self.platform.is_gen12() {
+        let raw = if self.platform.is_dg2() || self.platform.is_gen12() {
             let rpstat = owner.pending.window.read32(0x1381b4);
             if rpstat == u32::MAX {
                 return None;

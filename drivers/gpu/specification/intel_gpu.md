@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.67** (v0.66 plus serial-owned Gen12 USB-C DP scanout
+> Status: **v0.68** (v0.67 plus a typed, still probe-gated Arctic Sound-M
+> GT/GuC/DMA/subplatform profile and exact per-family DMA masks; serial-owned
+> Gen12 USB-C DP scanout
 > publication and exact detach withdrawal; exact fail-closed Arctic Sound-M discovery;
 > a typed, read-only census of all current
 > Linux GMD display identities, including distinct Wildcat Lake 30.02 and
@@ -297,9 +299,17 @@ Arctic Sound-M IDs 56C0/56C2 (M150) and 56C1 (M75) are exact
 accelerators: pre-GMD graphics/media 12.55, DMA46, flat CCS, 48-bit VA/root3,
 64 KiB VRAM granularity, SR-IOV, and `i915/dg2_guc_70.bin` 70.53.0 or newer.
 NARF's current `Alchemist` owner also implies display-capable DG2 policy and
-device-specific reset/workaround tables, so ATS-M is not silently inserted
-there. Its exact IDs are announced and refuse before D-state, BAR, command or
-MMIO effects until a distinct headless/SR-IOV profile is qualified.
+device-specific lifecycle policy, so ATS-M is not silently inserted there.
+`GtPlatform::ArcticSoundM` now types its pre-GMD 12.55 identity, DMA46/root3,
+DG2 GuC/cache/topology mechanics and exact M150=G10 / M75=G11 workaround
+subplatform. The exact IDs remain announced-but-gated before D-state, BAR,
+command or MMIO effects until a display-less SR-IOV lifecycle and reset owner
+is qualified.
+
+PCI DMA width is independent of PTE address capacity. The exact Linux xe
+descriptor matrix is enforced at every qualified GGTT/PPGTT publication:
+Gen12 and DG1 are DMA39; MTL/Arrow, DG2/ATS-M, BMG, LNL, PTL/WCL and NVL-S
+are DMA46. This corrects the former DG2, MTL and BMG fall-through to 52 bits.
 
 Arrow Lake (#1023): the five IDs classify
 `Generation::MeteorLake` under `asic: "arrowlake"` — the table
