@@ -293,7 +293,12 @@ Gen12 default DDC pin, `None` for a DDI the family lacks.
 `GmbusBus::xfer(&mut [I2cMsg])` is `do_gmbus_xfer` (wait phase between
 messages, one STOP, index transfers, first-message NAK retry);
 `read_edid_block`/`read_edid_eddc` follow `drm_do_probe_ddc_edid` including
-the E-DDC segment pointer.
+the E-DDC segment pointer. The pure Wa_16025573575 GPIO helpers admit exactly
+GMD display 30.00, 30.02 and 35.00, set and clear all four direction/value
+mask bits around a transfer, and preserve those bits plus both pull-up-disable
+bits in each line image. No production caller uses the helpers: NARF has no
+GPIO bit-bash fallback yet, hardware GMBUS is unchanged, and USB-C DP DDC
+continues to use AUX rather than this GPIO path.
 
 `intel_gpu_vbt` parses the VBT (`validate_vbt`, `Vbt::parse`, `children`,
 `encoders(platform)`, `use_ssc`, `panel_type`, `edp_panel`, `psr_panel`,

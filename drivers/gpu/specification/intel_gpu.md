@@ -1,7 +1,9 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.99** (v0.99 adds fail-closed Nova Lake ECC/display-bandwidth
-> admission; v0.98 isolates Nova Lake's Display-35 transcoder and
+> Status: **v1.00** (v1.00 models the exact family-wide Xe3 GPIO
+> bit-bash mask workaround for Panther Lake 30.00, Wildcat Lake 30.02 and
+> Nova Lake 35.00 without connecting a GPIO fallback; v0.99 adds fail-closed
+> Nova Lake ECC/display-bandwidth admission; v0.98 isolates Nova Lake's Display-35 transcoder and
 > plane/reflection/subsampling dialect; v0.97 adds Nova Lake's distinct ten-entry eDP
 > transmitter-level table; v0.96 transcribes Nova Lake LT-PHY's complete nine-rate
 > eDP PLL table without enabling its route; v0.95 models Nova Lake Display-35 FBC formats, its
@@ -191,6 +193,10 @@ the canonical bit definition without re-deriving it.
   transfers) and the E-DDC EDID reader. Register map corrected against
   PRM Vol. 12 + i915 `intel_gmbus_regs.h` in #1018 (base
   0xC5100, GMBUS5 at +0x20, HW_WAIT_PHASE at GMBUS2[14]).
+  Its disconnected Wa_16025573575 helpers exactly select display
+  30.00/30.02/35.00 and form the GPIO mask pre-transfer, preserved-line and
+  post-transfer images required by Linux 7.0-rc7. They do not add a GPIO
+  bit-bash fallback, alter hardware GMBUS, or participate in Type-C DP AUX.
   Source: TGL PRM Vol. 12 "GMBUS Programming".
 - **`intel_gpu_pll`** — DPLL register layout for Gen12 Combo PHY +
   TC PHY: `DPLL_CTRL{1,2,3}`, `DPLL_CFGCR0`, `DPLL_CFGCR1`,
