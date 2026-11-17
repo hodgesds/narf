@@ -51,7 +51,10 @@ struct Pending {
     id: u16,
     command: u32,
     direction: ioctl::Direction,
+    /// Caller-visible output prefix, independent of a longer iovar query.
     maximum: usize,
+    /// BCDC msg.len advertised to firmware for this original transaction.
+    logical_length: usize,
 }
 
 /// One interface (firmware ifidx zero), with no aggregation or firmware
@@ -394,10 +397,15 @@ impl<T: PacketTransport> Runtime<T> {
             return Ok(());
         }
         let length = (header.len & 0xffff) as usize;
-        if length > pending.maximum || length > payload.len() - BCDC_HEADER_LEN {
+        if length > pending.logical_length || length > payload.len() - BCDC_HEADER_LEN {
             return Err(Error::Malformed);
         }
-        self.response = Some(Ok(payload[16..16 + length].to_vec()));
+        // fwil.c::brcmf_fil_iovar_data_get passes the whole query buffer to
+        // BCDC, then copies only the caller's requested output prefix. The
+        // reply may cover a longer query name (clmload_status, nmode, MAC)
+        // without enlarging the caller's output or hiding a truncated reply.
+        let copied = length.min(pending.maximum);
+        self.response = Some(Ok(payload[16..16 + copied].to_vec()));
         Ok(())
     }
 
@@ -446,15 +454,28 @@ impl<T: PacketTransport> Runtime<T> {
         if self.pending.is_some() || self.suspended {
             return Err(Error::Busy);
         }
-        if payload.len() > MAX_CONTROL_INPUT || maximum > MAX_CONTROL {
+        if payload.len() > MAX_CONTROL || maximum > MAX_CONTROL {
             return Err(Error::Malformed);
         }
+        let copied = payload.len().min(MAX_CONTROL_INPUT);
+        // bcdc.c preserves the logical dcmd length while capping the wire
+        // prefix (header included) at1518. Only omitted zero padding may
+        // exceed that prefix: never truncate meaningful action/key bytes.
+        if payload[copied..].iter().any(|&byte| byte != 0) {
+            return Err(Error::Malformed);
+        }
+        let logical_length = if direction == ioctl::Direction::Get {
+            maximum.max(payload.len())
+        } else {
+            payload.len()
+        };
         self.transaction = self.transaction.wrapping_add(1);
         let pending = Pending {
             id: self.transaction,
             command,
             direction,
             maximum,
+            logical_length,
         };
         self.pending = Some(pending);
         self.response = None;
@@ -475,14 +496,9 @@ impl<T: PacketTransport> Runtime<T> {
         // Linux bcdc.c advertises the logical query buffer length and
         // transmits its zero-filled prefix (at most 1518 minus the dcmd
         // header). Firmware reads query arguments from that buffer.
-        let logical_length = if direction == ioctl::Direction::Get {
-            maximum.max(payload.len())
-        } else {
-            payload.len()
-        };
         let wire_length = logical_length.min(MAX_CONTROL_INPUT);
         let mut body = zeroize::Zeroizing::new(vec![0; wire_length]);
-        body[..payload.len()].copy_from_slice(payload);
+        body[..copied].copy_from_slice(&payload[..copied]);
         let mut request = zeroize::Zeroizing::new(ioctl::build_request(
             transaction.runtime.tx_sequence,
             pending.id,
@@ -491,9 +507,7 @@ impl<T: PacketTransport> Runtime<T> {
             command,
             &body,
         ));
-        if direction == ioctl::Direction::Get {
-            request[16..20].copy_from_slice(&(logical_length as u32).to_le_bytes());
-        }
+        request[16..20].copy_from_slice(&(logical_length as u32).to_le_bytes());
         // The hardware header excludes physical alignment padding.
         request[..4].copy_from_slice(
             &HwHeader {

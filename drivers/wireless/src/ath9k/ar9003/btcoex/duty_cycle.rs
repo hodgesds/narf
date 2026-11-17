@@ -92,11 +92,19 @@ impl MciLink {
         let period = u64::from(profile.btcoex_period) * 1000;
         let no_stomp = u64::from(profile.btcoex_no_stomp) * 1000;
         let stomp = profile.bt_stomp_type;
+        let has_audio = profile.num_sco != 0 || profile.num_a2dp != 0;
         if period == 0 || no_stomp > period {
             self.pause_duty_cycle();
             return Err(BringUpError::BadState);
         }
         if self.duty.period.is_some_and(|due| now >= due) {
+            // The temporary AUDIO choice does not alter the configured
+            // profile stomp used by the no-stomp callback below.
+            let stomp = if self.audio.period(has_audio) {
+                StompType::Audio
+            } else {
+                stomp
+            };
             bt_stomp(&mut self.btcoex, stomp);
             enable_mci(io, &mut self.btcoex)?;
             self.duty.period = Some(now.saturating_add(period));

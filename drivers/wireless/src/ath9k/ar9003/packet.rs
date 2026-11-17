@@ -534,6 +534,12 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
         crate::ath9k::mac::peer_clocked(&self.port, peer, slot_us, self.port.mac_clock())?;
+        // The station calls this at completed association. Linux resets
+        // its RSSI filter even for same-BSSID/same-AID reassociation; an
+        // in-place reset rewrites the saved peer directly instead.
+        if peer.is_some() {
+            self.mci.lock().association_changed();
+        }
         self.peer = Some((peer, slot_us));
         self.phase = Phase::Running;
         Ok(())

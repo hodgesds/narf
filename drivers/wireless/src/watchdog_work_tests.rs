@@ -6,6 +6,22 @@ use super::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+struct ExecutorFixture;
+impl ExecutorFixture {
+    fn new() -> Self {
+        // Earlier native fixtures can retain driver workers along with
+        // their DMA owners. This smoke drives its own task graph; polling
+        // those unrelated workers can stall in a fixture with no target.
+        narf_scheduler::__reset_queues_for_test();
+        Self
+    }
+}
+impl Drop for ExecutorFixture {
+    fn drop(&mut self) {
+        narf_scheduler::__reset_queues_for_test();
+    }
+}
+
 struct Probe {
     steps: AtomicU32,
     stopped: AtomicBool,
@@ -33,6 +49,7 @@ fn wait(done: impl Fn() -> bool) -> bool {
 }
 
 fn smoke_wireless_watchdog_work_requeues_and_frees_itself() -> TestResult {
+    let _executor = ExecutorFixture::new();
     let probe = Arc::new(Probe {
         steps: AtomicU32::new(0),
         stopped: AtomicBool::new(false),

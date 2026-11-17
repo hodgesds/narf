@@ -299,8 +299,10 @@ pub(in crate::ath9k) struct MciLink {
     /// handed to the engine once this is `Some`.
     pub(in crate::ath9k) dma: Option<Arc<DmaBuffer>>,
     duty: duty_cycle::DutyCycle,
+    audio: audio::Audio,
 }
 
+mod audio;
 mod duty_cycle;
 
 /// The shared MCI link, behind the lock the owner and the packet engine
@@ -322,7 +324,18 @@ impl MciLink {
             btcoex,
             dma,
             duty: duty_cycle::DutyCycle::default(),
+            audio: audio::Audio::new(),
         }
+    }
+    /// Associated, validated native beacon sample; no MMIO or authority grant.
+    pub(in crate::ath9k) fn beacon_rssi(&mut self, native_rssi: i8) {
+        if self.mci_enabled() {
+            self.audio.beacon(native_rssi);
+        }
+    }
+    /// A successful association program starts a fresh source RSSI filter.
+    pub(in crate::ath9k) fn association_changed(&mut self) {
+        self.audio.association_changed();
     }
     /// The live-MCI gate: the scheme is MCI and the DMA ring exists.
     /// `init_scheme` with coexistence compiled in selects MCI exactly

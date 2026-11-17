@@ -143,6 +143,7 @@ pub(in crate::iwlwifi) struct Device {
     held: Vec<Receipt>,
     enabled: bool,
     api: u8,
+    legacy_rx_rate: u32,
     tx_pn: u64,
     m4: bool,
     pair_adds: usize,
@@ -247,6 +248,7 @@ impl Device {
         }
         let mut next = Self::new(self.api)?;
         next.sync = self.sync;
+        next.legacy_rx_rate = self.legacy_rx_rate;
         next.events = core::mem::take(&mut self.events);
         next.data = core::mem::take(&mut self.data);
         next.expected_group_floor = Some(expected_group_floor);
@@ -320,6 +322,7 @@ impl Device {
             held: Vec::new(),
             enabled: false,
             api,
+            legacy_rx_rate: 0,
             tx_pn: 0,
             m4: false,
             pair_adds: 0,
@@ -335,8 +338,19 @@ impl Device {
             expected_group_floor: None,
         })
     }
+    /// The actual P2P fixture peer advertises only 6/12/24 Mbps. Preserve
+    /// ordinary CCK fixture defaults while its independent authenticator
+    /// emits M1/M3/rekey and encrypted data using rates-v2 OFDM 6 Mbps.
+    pub(in crate::iwlwifi) fn use_legacy_ofdm_rx(&mut self) {
+        self.legacy_rx_rate = 0x100;
+    }
+    fn envelope(&self, frame: &[u8], status: u32) -> Vec<u8> {
+        let mut packet = envelope(frame, status);
+        packet[28..32].copy_from_slice(&self.legacy_rx_rate.to_le_bytes());
+        packet
+    }
     fn seed(&self, fw: &mut runtime::model::Firmware) {
-        fw.inject(0xc1, 0, 0x8000, &envelope(&self.m1, 3));
+        fw.inject(0xc1, 0, 0x8000, &self.envelope(&self.m1, 3));
     }
     fn inject(fw: &mut runtime::model::Firmware, receipt: Receipt) {
         fw.inject(
@@ -712,7 +726,7 @@ impl Device {
                             command: 0xc1,
                             group: 0,
                             sequence: 0x8000,
-                            body: envelope(&reply, 3),
+                            body: self.envelope(&reply, 3),
                         });
                     }
                 }
@@ -822,7 +836,7 @@ impl Device {
         frame.truncate(header);
         frame.extend_from_slice(&cipher[..8]);
         frame.extend_from_slice(&plain);
-        Ok(envelope(&frame, 0xa4f))
+        Ok(self.envelope(&frame, 0xa4f))
     }
     /// Independent authenticator aggregate: one genuine CCMP ciphertext/MIC
     /// authenticates all inner DA/SA/length/LLC bytes before this fake device
@@ -891,7 +905,7 @@ impl Device {
             frame[16..22].copy_from_slice(&h[6..12]);
             frame.extend_from_slice(&cipher[..8]);
             frame.extend_from_slice(sub);
-            let mut packet = envelope(&frame, 0xa4f);
+            let mut packet = self.envelope(&frame, 0xa4f);
             packet[3] |= 0x40;
             packet[4] = index as u8 | if index + 1 == frames.len() { 0x80 } else { 0 };
             packet[28..32].copy_from_slice(&0x00100207u32.to_le_bytes());
@@ -923,7 +937,7 @@ impl Device {
         let envelope = if let Some(nonce) = anonce {
             key.key_nonce = nonce;
             key.key_information = 0x8a;
-            envelope(&data_from_ap(&ap_ethernet(&key.into_eapol()), 14), 3)
+            self.envelope(&data_from_ap(&ap_ethernet(&key.into_eapol()), 14), 3)
         } else {
             key.key_information = 0x1382;
             key.key_rsc = rsc.to_le_bytes();

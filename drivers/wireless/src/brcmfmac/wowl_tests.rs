@@ -322,7 +322,11 @@ fn unwind() -> Result<(), &'static str> {
         .map_err(|_| "SET_WOWLAN refused")?;
     harness.bus.d3_ack(false);
     let mark = harness.bus.commands().len();
-    if narf_scheduler::block_on(Endpoint::suspend(&*harness.device)).is_ok() {
+    // This deliberately missing D3_ACK reaches the real 2000 ms deadline.
+    // The test harness precedes the BSP timer pump; APs may have installed
+    // the global hrtimer callback, so drive timers without halting for an
+    // unavailable BSP timer IRQ. Keep the awake-configuration unwind intact.
+    if narf_scheduler::block_on_spin(Endpoint::suspend(&*harness.device)).is_ok() {
         return Err("unacknowledged D3 suspend succeeded");
     }
     let commands = since(&harness, mark);

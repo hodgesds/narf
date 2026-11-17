@@ -13,12 +13,12 @@
 //! (thermal + PA bias trim). `rtw8852a.c` `.cfg_txrx_path` is NULL, so
 //! there is no txrx-path step and no `RF_GET_MCCCH` body.
 //!
-//! No channel is programmed here: the A `set_channel` / `rfk_channel`
-//! owner follows the open channel-RFK lane (#2098, IQK/DPK/TSSI flows +
-//! def tables), so [`Radio::channel`] stays `None` and the native
-//! caller leaves its operating channel unset until that lane lands.
+//! After this init, [`Radio::program_channel`] composes A MAC/BB/RF
+//! channel control and the qualified per-channel power plan. This yields
+//! Programmed only: channel RFK still requires live thermal/TSSI inputs,
+//! so [`Radio::channel`] and native ordinary readiness stay unset.
 use super::{
-    factory_a, radio_init,
+    channel_a, factory_a, radio_init,
     radio_power::initial_reference,
     radio_table::Pair,
     rfk::{self, a::Init, Error, Interface},
@@ -59,10 +59,9 @@ pub(super) enum State {
     Ready,
 }
 
-/// Inputs bound by the native caller to the actual A factory calibration.
-/// The gain/power/tracking inputs the C/51 owners carry are not consumed
-/// until the A `set_channel` lane lands; they are added there, not as
-/// dead fields here.
+/// Actual A factory calibration for initial DM/RFK. Per-channel power
+/// is supplied separately to `program_channel`; live channel-RFK inputs
+/// remain separate from both initialization and channel programming.
 pub(super) struct Inputs<'a> {
     pub calibration: &'a factory_a::Calibration,
 }
@@ -71,6 +70,7 @@ pub(super) struct Inputs<'a> {
 pub(super) struct Radio {
     state: State,
     init: Init,
+    channel: channel_a::Channel,
     epoch: u32,
 }
 
@@ -86,10 +86,17 @@ impl Radio {
     pub fn state(&self) -> State {
         self.state
     }
-    /// No channel is programmed yet (the A `set_channel` owner follows
-    /// #2098); always `None` until that lane lands.
+    /// No channel-RFK completion yet. Programmed does not establish
+    /// calibrated RF or ordinary station/AP readiness.
     pub fn channel(&self) -> Option<super::operating_channel::Profile> {
         None
+    }
+    pub fn programmed_channel(&self) -> Option<super::operating_channel::Profile> {
+        if self.state == State::Ready {
+            self.channel.programmed()
+        } else {
+            None
+        }
     }
     pub fn epoch(&self) -> u32 {
         self.epoch
@@ -165,6 +172,32 @@ impl Radio {
             io.admit()?;
             io.rf_write(path, address, mask, value).await?;
         }
+        self.epoch = self.epoch.wrapping_add(1);
+        self.state = State::Ready;
+        Ok(())
+    }
+
+    /// Source A channel control and `set_txpwr` after the completed A
+    /// init. The source help window is closed only after the exact power
+    /// prefix succeeds; failed/cancelled attempts remain non-Ready.
+    ///
+    /// # Safety
+    /// Same retained A owner as `prepare`, with ordinary TX/autonomous
+    /// responses closed. Actual A firmware power elements and current
+    /// signed channel/calibration authority cover this typed profile.
+    /// This does not execute or claim complete channel RFK.
+    pub async unsafe fn program_channel(
+        &mut self,
+        io: &mut impl Interface,
+        profile: super::operating_channel::Profile,
+        power: &super::radio_power_c::Plan,
+    ) -> Result<(), Error> {
+        if self.state != State::Ready {
+            return Err(Error::Terminal);
+        }
+        self.state = State::Preparing;
+        // SAFETY: caller contract; retained A init completed above.
+        unsafe { self.channel.set_channel(io, profile, power) }.await?;
         self.epoch = self.epoch.wrapping_add(1);
         self.state = State::Ready;
         Ok(())

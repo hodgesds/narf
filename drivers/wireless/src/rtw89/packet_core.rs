@@ -681,6 +681,20 @@ impl Core {
                         rate,
                         agg,
                     )?
+                } else if fragment.is_some() {
+                    // Both A and B require the explicit fragment TXWD path.
+                    // Their ordinary emitters deliberately reject MoreFrag
+                    // and nonzero fragment numbers before publication.
+                    format::transmit_fragment(
+                        self.chip,
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                    )?
                 } else if self.chip == ChipId::Rtl8852A {
                     format::transmit_a(
                         bytes,
@@ -703,16 +717,6 @@ impl Core {
                         radio_report,
                         rate,
                         agg,
-                    )?
-                } else if fragment.is_some() {
-                    format::transmit_fragment(
-                        bytes,
-                        source,
-                        self.mac_id,
-                        ticket.sequence,
-                        packet.body.dma_addr().raw(),
-                        radio_report,
-                        rate,
                     )?
                 } else {
                     format::transmit_profile(

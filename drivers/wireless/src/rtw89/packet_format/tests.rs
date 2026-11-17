@@ -487,3 +487,61 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_bounds_amsdu
 );
+
+// A and B use the same source AX v0 body and address-info. A fragmented
+// frame must reach this explicit path, retain its host sequence and never
+// inherit the ordinary management HW_SSN selector/mode (core.c body0/3).
+fn smoke_rtw89_ab_fragment_txwd_matches_literal_v0_and_keeps_ordinary_closed() -> TestResult {
+    for management in [false, true] {
+        let mut bytes = frame(100, management);
+        bytes[1] |= 4; // More Fragments, fragment number0.
+        let index = usize::from(management);
+        let mut expected = HEADERS[index];
+        expected[0] &= !7; // Host sequence for every fragment, including mgmt.
+        for chip in [ChipId::Rtl8852A, ChipId::Rtl8852B] {
+            for rate in [0, OFDM6] {
+                let mut floor = expected;
+                floor[26] = rate; // RTW89_TXWD_INFO0_DATA_RATE[24:16].
+                let result =
+                    transmit_fragment(chip, &bytes, OWN, 0, index as u16, 0x1234_5000, false, rate);
+                if result.as_ref().map(|(header, _)| header.as_slice()) != Ok(floor.as_slice()) {
+                    return TestResult::Fail(
+                        "A/B fragment TXWD differs from literal AX v0 reference",
+                    );
+                }
+                // The final part carries a nonzero fragment number; SW_SEQ
+                // is still the shared upper12 bits of the original sequence.
+                let mut last = bytes.clone();
+                last[1] &= !4;
+                last[22] |= 1;
+                let result =
+                    transmit_fragment(chip, &last, OWN, 0, index as u16, 0x1234_5000, false, rate);
+                if result.as_ref().map(|(header, _)| header.as_slice()) != Ok(floor.as_slice()) {
+                    return TestResult::Fail(
+                        "final fragment changed original SW_SEQ or AX v0 format",
+                    );
+                }
+            }
+        }
+        if transmit_a(&bytes, OWN, 0, 0, 0x1000, false, 0, None, None).is_ok()
+            || transmit(&bytes, OWN, 0, 0, 0x1000, false).is_ok()
+        {
+            return TestResult::Fail("ordinary A/B emitter admitted a fragmented frame");
+        }
+        for chip in [ChipId::Rtl8852C, ChipId::Rtl8851B, ChipId::Rtl8922A] {
+            if transmit_fragment(chip, &bytes, OWN, 0, 0, 0x1000, false, 0).is_ok() {
+                return TestResult::Fail("fragment emitter admitted an unqualified chip profile");
+            }
+        }
+        for rate in [1, FIRMWARE_RA, DATA_ER] {
+            if transmit_fragment(ChipId::Rtl8852A, &bytes, OWN, 0, 0, 0x1000, false, rate).is_ok() {
+                return TestResult::Fail("fragment emitter admitted an unsigned rate mode");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/fragmentation",
+    smoke_rtw89_ab_fragment_txwd_matches_literal_v0_and_keeps_ordinary_closed
+);

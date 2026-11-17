@@ -30,6 +30,7 @@ pub(super) struct Model {
     pub(super) ops: Vec<Op>,
     physical: Vec<u8>,
     fw_bytes: usize,
+    mac_off_stuck: bool,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,7 @@ impl Fake {
             ops: Vec::new(),
             physical: physical_stream(&logical_map()),
             fw_bytes: 0,
+            mac_off_stuck: false,
         })))
     }
     pub(super) fn writes(&self, addr: u16) -> Vec<Vec<u8>> {
@@ -128,6 +130,15 @@ impl ControlIo for Fake {
         if addr == REG_APS_FSMCO && out.len() == 4 {
             g.regs[a + 1] &= !1; // MAC_ENABLE handshake completes
             g.regs[a + 2] |= 2; // power ready (bit 17) is read-only status
+        }
+        if addr == REG_APS_FSMCO + 1
+            && out.len() == 1
+            && g.regs[a] & (1 << 1) != 0
+            && !g.mac_off_stuck
+        {
+            // rtl8723bu_active_to_emu requests MAC_OFF in byte1 bit1;
+            // hardware clears that request before the byte poll completes.
+            g.regs[a] &= !(1 << 1);
         }
         if addr == REG_MCU_FW_DL && out.len() == 4 {
             if g.regs[a] & MCU_FW_DL_ENABLE == 0 && g.fw_bytes != 0 {
@@ -245,7 +256,7 @@ fn smoke_rtl8723bu_power_and_firmware() -> TestResult {
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
     let payload = 4096 + 1500;
-    if narf_scheduler::block_on(owner.initialize(&image(payload))).is_err() {
+    if narf_scheduler::block_on(owner.initialize_device(&image(payload))).is_err() {
         return TestResult::Fail("8723bu lifecycle failed");
     }
     if owner.status().stage != Stage::RadioReady || owner.status().error.is_some() {
@@ -323,13 +334,15 @@ fn smoke_rtl8723bu_rejects_mismatched_sie() -> TestResult {
     io.0.lock().regs[0xfe66] = 0x00;
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
     // No SIE: falls back to the three bulk-OUT endpoints.
-    if narf_scheduler::block_on(owner.initialize(&image(64))).is_err() {
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))).is_err() {
         return TestResult::Fail("8723bu no-SIE fallback");
     }
     let io = Fake::new();
     io.0.lock().regs[0xf0..0xf4].copy_from_slice(&(1u32 << 23).to_le_bytes());
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
-    if narf_scheduler::block_on(owner.initialize(&image(64))) != Err(Error::UnsupportedSilicon) {
+    if narf_scheduler::block_on(owner.initialize_device(&image(64)))
+        != Err(Error::UnsupportedSilicon)
+    {
         return TestResult::Fail("8723bu test silicon accepted");
     }
     TestResult::Pass
@@ -355,7 +368,7 @@ fn smoke_rtl8723bu_tables_antenna_and_lck() -> TestResult {
     }
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
-    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+    if narf_scheduler::block_on(owner.initialize_device(&image(256))).is_err()
         || owner.status().stage != Stage::RadioReady
     {
         return TestResult::Fail("8723bu did not reach RadioReady");
@@ -417,16 +430,17 @@ kernel_test_in!("drivers/wireless/rtl8xxxu/8723bu", smoke_rtl8723bu_tx_power);
 fn smoke_rtl8723bu_post_tables_and_calibration() -> TestResult {
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
-    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+    if narf_scheduler::block_on(owner.initialize_device(&image(256))).is_err()
         || owner.status().stage != Stage::RadioReady
     {
         return TestResult::Fail("8723bu did not reach RadioReady");
     }
-    // rtl8xxxu_init_burst with the 8723bu fops values.
+    // Linux 8723b.c MAC table writes AMPDU/time bytes first; core.c
+    // rtl8xxxu_init_burst repeats them using the 8723bu fops values.
     if io.writes(0x04ca) != vec![0x0c14u16.to_le_bytes().to_vec()]
-        || io.writes(0x0456) != vec![vec![0x5e]]
-        || io.writes(0x055c) != vec![vec![0x50]]
-        || io.writes(0x0638) != vec![vec![0x50]]
+        || io.writes(0x0456) != vec![vec![0x5e], vec![0x5e]]
+        || io.writes(0x055c) != vec![vec![0x50], vec![0x50]]
+        || io.writes(0x0638) != vec![vec![0x50], vec![0x50]]
         || io.writes(0x0290).last().map(|v| v[0] & 0x3e) != Some(0x1e)
         || io.writes(0x04c7).last().map(|v| v[0] & 0x80) != Some(0x80)
         || io.writes(0x001c).last().map(|v| v[0] & 0x60) != Some(0x60)
@@ -442,8 +456,12 @@ fn smoke_rtl8723bu_post_tables_and_calibration() -> TestResult {
     // DPDT handover to the 8051 and init_statistics.
     if io.writes(0x004e).last().map(|v| v[0] & 0x80) != Some(0x80)
         || io.writes(0x0896) != vec![0x2710u16.to_le_bytes().to_vec()]
-        || io.writes(0x0898) != vec![0xffff_ff52u32.to_le_bytes().to_vec()]
-        || io.writes(0x0460) != vec![vec![0, 0]]
+        || io.writes(0x0898)
+            != vec![
+                0x4030_2010u32.to_le_bytes().to_vec(), // Linux BB table.
+                0xffff_ff52u32.to_le_bytes().to_vec(), // NHM statistics.
+            ]
+        || io.writes(0x0460) != vec![vec![0x66], vec![0, 0]]
     {
         return TestResult::Fail("8723bu DPDT / statistics");
     }
@@ -464,9 +482,19 @@ fn smoke_rtl8723bu_post_tables_and_calibration() -> TestResult {
         return TestResult::Fail("8723bu LC calibration TXPAUSE");
     }
     let lssi: Vec<u32> = io.writes(0x0840).iter().map(|v| word(v)).collect();
-    let s0s1 = [0xb0 << 20 | 0xdfbe0, 0xb0 << 20 | 0xdffe0];
-    if lssi.iter().filter(|&&v| v == s0s1[0]).count() != 2
-        || lssi.iter().filter(|&&v| v == s0s1[1]).count() != 2
+    let s0s1: Vec<u32> = lssi.iter().copied().filter(|v| v >> 20 == 0xb0).collect();
+    // Linux 8723b.c's RF table writes S0S1 first as0xdffe0, then
+    // as0xff9f0. init_phy_rf and the later generic LC calibration each
+    // add a0xdfbe0 ->0xdffe0 bracket after those two table writes.
+    if s0s1
+        != [
+            0xb0 << 20 | 0xdffe0,
+            0xb0 << 20 | 0xff9f0,
+            0xb0 << 20 | 0xdfbe0,
+            0xb0 << 20 | 0xdffe0,
+            0xb0 << 20 | 0xdfbe0,
+            0xb0 << 20 | 0xdffe0,
+        ]
         || lssi.last() != Some(&(0x42 << 20 | 0x37cf8))
         || !lssi.contains(&(0x43 << 20 | 0x300bd))
     {
@@ -479,7 +507,8 @@ fn smoke_rtl8723bu_post_tables_and_calibration() -> TestResult {
     if radio.iqk.candidate != 0 || radio.iqk.row[..4] != [0x100, 5, 0x100, 4] {
         return TestResult::Fail("8723bu IQK candidate/row");
     }
-    if io.writes(0x0652) != vec![vec![235]] {
+    // Linux MAC table default0xc8, then core.c NAV upper ceil(30000/128).
+    if io.writes(0x0652) != vec![vec![0xc8], vec![235]] {
         return TestResult::Fail("8723bu NAV upper");
     }
     TestResult::Pass
@@ -520,7 +549,7 @@ fn smoke_rtl8723bu_iqk_failure_is_terminal() -> TestResult {
     let io = Fake::new();
     io.0.lock().regs[0xe94..0xe98].fill(0);
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
-    if narf_scheduler::block_on(owner.initialize(&image(256))) != Err(Error::Calibration)
+    if narf_scheduler::block_on(owner.initialize_device(&image(256))) != Err(Error::Calibration)
         || owner.radio_8723b().is_some()
     {
         return TestResult::Fail("8723bu failed IQK not terminal");
@@ -539,7 +568,7 @@ kernel_test_in!(
 fn ready_owner() -> Option<(Fake, Owner<Fake>)> {
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
-    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+    if narf_scheduler::block_on(owner.initialize_device(&image(256))).is_err()
         || owner.status().stage != Stage::RadioReady
     {
         return None;
@@ -702,11 +731,111 @@ fn smoke_rtl8723bu_power_off() -> TestResult {
     {
         return TestResult::Fail("8723bu power_off stuck queue");
     }
+    // A requested MAC_OFF that never self-clears stops at the source's
+    // bounded byte poll, before analog shutdown, HW suspend or wake setup.
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    {
+        let mut g = io.0.lock();
+        g.regs[0x0286] |= 1 << 1;
+        g.regs[0x0080] &= !MCU_FW_RAM_SEL;
+        g.mac_off_stuck = true;
+    }
+    if narf_scheduler::block_on(super::rtl8723b_power::power_off(&owner))
+        != Err(Error::PowerTimeout)
+    {
+        return TestResult::Fail("8723bu power_off stuck MAC request accepted");
+    }
+    let mac_reads =
+        io.0.lock()
+            .ops
+            .iter()
+            .filter(|op| **op == Op::Read(REG_APS_FSMCO + 1, 1))
+            .count();
+    if mac_reads != 501 // One request RMW read, then500 source poll reads.
+        || io.writes(REG_APS_FSMCO + 1) != vec![vec![1 << 1]]
+        || !io.writes(0x0010).is_empty()
+        || !io.writes(REG_SYS_ISO_CTRL).is_empty()
+        || !io.writes(0x0020).is_empty()
+        || !io.writes(0x004a).is_empty()
+    {
+        return TestResult::Fail("8723bu stuck MAC poll exceeded bounds or continued shutdown");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_power_off
+);
+
+fn smoke_rtl8723bu_ra_admitted_tx_paths_and_reports() -> TestResult {
+    use super::rtl8192e_packet::RaReport;
+    use super::rtl8192e_ra::{Peer, Ra};
+    let one_ss = Peer {
+        legacy: 0xfff,
+        mcs: [0xff, 0],
+        ht: true,
+        sgi: true,
+    };
+    // Qualified TX authority still has to fit the actual hardware. This
+    // applies even when the negotiated peer mask itself uses only 1SS.
+    for admitted in [0x0010_0fff, 0x0fff_ffff] {
+        if Ra::new(one_ss, admitted, 1, false).is_ok() {
+            return TestResult::Fail("1TX RA accepted MCS8..15 authority");
+        }
+    }
+    if Ra::new(one_ss, 0x100f_ffff, 2, false).is_ok()
+        || Ra::new(one_ss, 0x000f_ffff, 0, false).is_ok()
+        || Ra::new(one_ss, 0x000f_ffff, 3, false).is_ok()
+    {
+        return TestResult::Fail("RA accepted unsupported rate/path authority");
+    }
+    let mut one = match Ra::new(one_ss, 0x000f_ffff, 1, false) {
+        Ok(one) => one,
+        Err(_) => return TestResult::Fail("1TX RA refused MCS0..7 authority"),
+    };
+    let report = RaReport {
+        rate: 20, // DESC_RATE_MCS8
+        sgi: true,
+        macid: 0,
+        ldpc: false,
+        txbf: false,
+        noisy: false,
+        bandwidth40: Some(false),
+    };
+    one.report(&report);
+    if one.tx_rate().is_some() {
+        return TestResult::Fail("1TX RA folded a 2SS firmware report");
+    }
+    one.report(&RaReport { rate: 19, ..report }); // DESC_RATE_MCS7
+    if one
+        .tx_rate()
+        .is_none_or(|r| r.desc_rate != 19 || !r.sgi || r.bandwidth40)
+    {
+        return TestResult::Fail("1TX RA failed to fold its MCS7 report");
+    }
+    one.report(&RaReport { rate: 27, ..report }); // DESC_RATE_MCS15
+    if one.tx_rate().map(|r| r.desc_rate) != Some(19) {
+        return TestResult::Fail("2SS report replaced a valid 1TX rate");
+    }
+    let two_ss = Peer {
+        mcs: [0xff, 0xff],
+        ..one_ss
+    };
+    let mut two = match Ra::new(two_ss, 0x0fff_ffff, 2, false) {
+        Ok(two) => two,
+        Err(_) => return TestResult::Fail("2TX RA refused MCS0..15 authority"),
+    };
+    two.report(&RaReport { rate: 27, ..report });
+    if two.tx_rate().map(|r| r.desc_rate) != Some(27) {
+        return TestResult::Fail("2TX RA failed to fold MCS15");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_ra_admitted_tx_paths_and_reports
 );
 
 fn smoke_rtl8723bu_packet_signal_and_ra() -> TestResult {
@@ -727,7 +856,7 @@ fn smoke_rtl8723bu_packet_signal_and_ra() -> TestResult {
     if rssi_setting(0, 42) != [0x42, 0, 0, 42] {
         return TestResult::Fail("8723bu 4-byte RSSI setting");
     }
-    // 1T1R: a 2SS peer is refused rather than narrowed.
+    // 1T1R: qualified TX authority cannot admit 2SS rates.
     let two_ss = Peer {
         legacy: 0xfff,
         mcs: [0xff, 0xff],
@@ -739,7 +868,7 @@ fn smoke_rtl8723bu_packet_signal_and_ra() -> TestResult {
         ..two_ss
     };
     if Ra::new(two_ss, 0x0fff_ffff, 1, false).is_ok() {
-        return TestResult::Fail("8723bu admitted a 2SS peer");
+        return TestResult::Fail("8723bu admitted 2SS TX authority");
     }
     let mut ra = match Ra::new(one_ss, 0x000f_ffff, 1, false) {
         Ok(ra) => ra,

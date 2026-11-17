@@ -135,6 +135,7 @@ fn public_probe(f: &Fixture, both: bool, index: u8) -> R {
             if done {
                 break;
             }
+            management_wait_tick();
         }
         require(
             done,
@@ -241,6 +242,7 @@ fn go_profiles() -> R {
     Ok(())
 }
 fn smoke_iwl_p2p_go_native_sc_bz_api89_ofdm_noa_prefix_and_secured_data_owner() -> TestResult {
+    let _executor = ExecutorFixture::new();
     go_profiles().map_or_else(TestResult::Fail, |_| TestResult::Pass)
 }
 kernel_test_in!(
@@ -416,6 +418,7 @@ fn source_denials() -> R {
     Ok(())
 }
 fn smoke_iwl_p2p_go_native_shape_no_cck_and_current_source_policy_refusals() -> TestResult {
+    let _executor = ExecutorFixture::new();
     check(|| {
         schema_denials()?;
         source_denials()
@@ -771,6 +774,7 @@ fn go_ps() -> R {
     Ok(())
 }
 fn smoke_iwl_p2p_go_native_ps_setter_beacon_template() -> TestResult {
+    let _executor = ExecutorFixture::new();
     check(go_ps)
 }
 kernel_test_in!(

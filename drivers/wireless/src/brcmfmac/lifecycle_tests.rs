@@ -23,6 +23,14 @@ fn poll_once<F: Future + ?Sized>(future: core::pin::Pin<&mut F>) -> Step<F::Outp
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
+fn drive_reset_model<F: Future>(future: F) -> F::Output {
+    // FWHALT removal/recovery and cold resume reach Runtime::reset_device's
+    // real 100 ms watchdog settle. Tests run before the BSP timer pump;
+    // APs can install the global hrtimer callback without a BSP timer IRQ.
+    // Pump the actual monotonic waits instead of halting for that IRQ.
+    narf_scheduler::block_on_spin(future)
+}
+
 fn joined() -> Result<Harness, &'static str> {
     let harness = Harness::new(6, false, false)?;
     harness.associate(false)?;
@@ -122,7 +130,7 @@ fn smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims() -> TestResult 
         return TestResult::Fail("FWHALT left the carrier up");
     }
     let generation = Generation::new(harness.device.clone());
-    if narf_scheduler::block_on(generation.remove()) != Removal::Reclaimed {
+    if drive_reset_model(generation.remove()) != Removal::Reclaimed {
         return TestResult::Fail("halted generation was not reclaimed by the dead stop");
     }
     let (allocated, dropped) = harness.bus.mappings();
@@ -159,7 +167,7 @@ fn smoke_brcmf_fwhalt_reset_reboots_replays_and_rejoins_same_netdev() -> TestRes
         return TestResult::Fail("FWHALT did not mark the transport terminal");
     }
     let generation = Generation::with_publisher(harness.device.clone(), publisher());
-    if narf_scheduler::block_on(generation.recover()).is_err() {
+    if drive_reset_model(generation.recover()).is_err() {
         return TestResult::Fail("transport reset did not republish the station");
     }
     let Some(device) = generation.current() else {
@@ -217,7 +225,7 @@ fn smoke_brcmf_remove_racing_reset_never_republishes() -> TestResult {
     if poll_once(removal.as_mut()).is_ready() {
         return TestResult::Fail("removal did not wait for the in-flight reset");
     }
-    if narf_scheduler::block_on(recovery.as_mut()) != Err(crate::cyw43439::runtime::Error::Busy) {
+    if drive_reset_model(recovery.as_mut()) != Err(crate::cyw43439::runtime::Error::Busy) {
         return TestResult::Fail("reset published after a removal request");
     }
     if narf_scheduler::block_on(removal.as_mut()) != Removal::Absent {
@@ -252,7 +260,7 @@ fn smoke_brcmf_reset_failures_stay_terminal_or_pinned() -> TestResult {
     harness.device.drain();
     harness.bus.fail_tcm(true);
     let generation = Generation::with_publisher(harness.device.clone(), publisher());
-    if narf_scheduler::block_on(generation.recover()).is_ok()
+    if drive_reset_model(generation.recover()).is_ok()
         || generation.current().is_some()
         || narf_net::iface::lookup(&harness.name).is_some()
     {
@@ -311,7 +319,7 @@ fn smoke_brcmf_cold_resume_swaps_generation_and_keeps_netdev() -> TestResult {
         return TestResult::Fail("D3 suspend failed");
     }
     harness.bus.power_lost();
-    if narf_scheduler::block_on(generation.resume()).is_err() {
+    if drive_reset_model(generation.resume()).is_err() {
         return TestResult::Fail("cold resume did not re-probe the function");
     }
     let Some(device) = generation.current() else {

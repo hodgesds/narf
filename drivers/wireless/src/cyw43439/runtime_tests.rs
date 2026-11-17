@@ -18,6 +18,10 @@ struct Bus {
     firmware_error: Option<u32>,
     /// Reply with BCDC_DCMD_IF bits cleared (no ifidx echo).
     zero_ifidx: bool,
+    /// Exact successful response bytes; None keeps the original scalar.
+    response_bytes: Option<Vec<u8>>,
+    /// Declared native BCDC length, for whole-response extent faults.
+    response_length: Option<u32>,
 }
 impl Transport for Bus {
     fn read32(&mut self, _: Function, _: u32) -> Result<u32, TransportError> {
@@ -67,8 +71,9 @@ impl PacketTransport for Bus {
             if self.zero_ifidx {
                 reply.flags &= !bcdc_flag::IF_MASK;
             }
+            let response = self.response_bytes.as_deref().unwrap_or(&[1, 2, 3, 4]);
             if !self.header_only {
-                reply.len = 4;
+                reply.len = self.response_length.unwrap_or(response.len() as u32);
             }
             if let Some(error) = self.firmware_error {
                 reply.flags |= bcdc_flag::ERROR;
@@ -76,7 +81,7 @@ impl PacketTransport for Bus {
             }
             let mut body = reply.encode().to_vec();
             if !self.header_only {
-                body.extend_from_slice(&[1, 2, 3, 4]);
+                body.extend_from_slice(response);
             }
             self.rx.push_back(frame(3, CHANNEL_CONTROL, 8, &body));
         }
@@ -531,4 +536,146 @@ fn smoke_cyw_f2_secondary_ifidx_demux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/runtime",
     smoke_cyw_f2_secondary_ifidx_demux
+);
+
+fn smoke_cyw_bcdc_get_reply_validates_whole_query_extent_and_copies_output_prefix() -> TestResult {
+    // Linux fwil.c iovar_data_get copies the caller's output prefix from
+    // the larger BCDC query buffer. Literal full-buffer replies exercise
+    // the actual Runtime command/control parser, not a Station stub.
+    for (input, maximum, bytes, declared, expected) in [
+        (
+            &b"clmload_status\0"[..],
+            4usize,
+            vec![0; 15],
+            15,
+            Ok(vec![0; 4]),
+        ),
+        (
+            &b"nmode\0"[..],
+            4,
+            vec![1, 0, 0, 0, 0xaa, 0xbb],
+            6,
+            Ok(vec![1, 0, 0, 0]),
+        ),
+        (
+            &b"cur_etheraddr\0"[..],
+            6,
+            vec![2, 1, 2, 3, 4, 5, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 6, 7],
+            14,
+            Ok(vec![2, 1, 2, 3, 4, 5]),
+        ),
+        // A short successful reply stays short; scalar shape belongs to
+        // its caller and must not be repaired with invented zero bytes.
+        (&b"nmode\0"[..], 4, vec![1, 2, 3], 3, Ok(vec![1, 2, 3])),
+        // Reject a reply beyond the original advertised query bound.
+        (&b"nmode\0"[..], 4, vec![0; 7], 7, Err(Error::Malformed)),
+        (&[][..], 4, vec![0; 6], 6, Err(Error::Malformed)),
+        // The requested4-byte prefix fits, but the full declared6-byte
+        // reply is truncated; prefix copying must not hide that fault.
+        (&b"nmode\0"[..], 4, vec![0; 5], 6, Err(Error::Malformed)),
+    ] {
+        for ifidx in [0, 1] {
+            let mut runtime = Runtime::new(Bus {
+                auto_reply: true,
+                zero_ifidx: true,
+                response_bytes: Some(bytes.clone()),
+                response_length: Some(declared),
+                ..Bus::default()
+            });
+            runtime.tx_max = 8;
+            let result =
+                ready(runtime.command_on(ifidx, ioctl::Direction::Get, 262, input, maximum));
+            if result != Some(expected.clone())
+                || runtime.pending.is_some() != expected.is_err()
+                || runtime.is_failed() != expected.is_err()
+                || runtime.pop_data() != Some(ethernet())
+            {
+                return TestResult::Fail(
+                    "BCDC query/output bounds, full native extent or correlation",
+                );
+            }
+            let tx = &runtime.transport.as_ref().unwrap().tx;
+            let header = BcdcHeader::decode(&tx[0][12..]).unwrap();
+            if tx.len() != 1
+                || header.len as usize != maximum.max(input.len())
+                || (header.flags & bcdc_flag::IF_MASK) >> 12 != u32::from(ifidx)
+            {
+                return TestResult::Fail(
+                    "BCDC output-prefix copy changed original request identity/extent",
+                );
+            }
+            if expected.is_err()
+                && (ready(runtime.command(ioctl::Direction::Get, 1, &[], 4))
+                    != Some(Err(Error::Failed))
+                    || runtime.transport.as_ref().unwrap().tx.len() != 1)
+            {
+                return TestResult::Fail("malformed native GET was replayed or its owner released");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/runtime",
+    smoke_cyw_bcdc_get_reply_validates_whole_query_extent_and_copies_output_prefix
+);
+
+fn smoke_cyw_f2_padded_action_input_keeps_logical_and_wire_bounds() -> TestResult {
+    let mut frame = vec![0; 32];
+    frame[0] = 0xd0;
+    frame[4..10].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame[16..22].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
+    frame[24..].copy_from_slice(&[4, 9, 0x50, 0x6f, 0x9a, 9, 0, 7]);
+    let params = match crate::brcmfmac::p2p_wire::af_params(&frame, 6, 400, 9) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("F2 padded action params"),
+    };
+    let input = match crate::brcmfmac::vif_wire::bsscfg_iovar(1, b"actframe", &params) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("F2 padded action bsscfg"),
+    };
+    let mut runtime = Runtime::new(Bus {
+        auto_reply: true,
+        header_only: true,
+        ..Bus::default()
+    });
+    runtime.tx_max = 8;
+    for bad in [
+        {
+            let mut bad = input.clone();
+            bad[1502] = 1;
+            bad
+        },
+        vec![0; 8193],
+    ] {
+        if ready(runtime.command_on(1, ioctl::Direction::Set, 263, &bad, bad.len()))
+            != Some(Err(Error::Malformed))
+            || !runtime.transport.as_ref().unwrap().tx.is_empty()
+            || runtime.is_failed()
+            || runtime.pending.is_some()
+        {
+            return TestResult::Fail("refused F2 unsent input published or poisoned owner");
+        }
+    }
+    if ready(runtime.command_on(1, ioctl::Direction::Set, 263, &input, input.len()))
+        != Some(Ok(Vec::new()))
+    {
+        return TestResult::Fail("F2 padded Linux action input refused");
+    }
+    let bytes = &runtime.transport.as_ref().unwrap().tx[0];
+    let header = BcdcHeader::decode(&bytes[12..]).unwrap();
+    if !header.is_set()
+        || header.cmd != 263
+        || header.len != 1848
+        || header.if_idx() != 1
+        || usize::from(HwHeader::decode(bytes).unwrap().length) != 28 + 1502
+        || bytes[28..28 + 1502] != input[..1502]
+    {
+        return TestResult::Fail("F2 logical action length, ifidx or bounded wire prefix differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/runtime",
+    smoke_cyw_f2_padded_action_input_keeps_logical_and_wire_bounds
 );

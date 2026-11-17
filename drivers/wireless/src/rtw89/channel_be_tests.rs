@@ -352,13 +352,15 @@ fn smoke_rtw89_be_set_channel_bb_refusals() -> TestResult {
     let mut seeded = Model::new()
         .with32(BB_PHY + 0x6b4c, 0xFFFF_F000)
         .with32(BB_PHY + 0x6b54, 0xFFFF_0FFF)
-        .with32(BB_PHY + 0x0520, 0xFFFF_FFFE);
+        // Keep a reserved sentinel bit clear: setting RXCCA bit0 must
+        // not produce the all-ones value that readback treats as gone.
+        .with32(BB_PHY + 0x0520, 0xFFFE_FFFE);
     if program_set_channel_bb(&mut seeded, p).is_err() {
         return TestResult::Fail("seeded set_channel_bb refused");
     }
     if seeded.regs32.get(&(BB_PHY + 0x6b4c)) != Some(&0x7FFF_F45A)
         || seeded.regs32.get(&(BB_PHY + 0x6b54)) != Some(&0xFFFF_20FF)
-        || seeded.regs32.get(&(BB_PHY + 0x0520)) != Some(&0xFFFF_FFFF)
+        || seeded.regs32.get(&(BB_PHY + 0x0520)) != Some(&0xFFFE_FFFF)
     {
         return TestResult::Fail("set_channel_bb partial-mask merge differs");
     }

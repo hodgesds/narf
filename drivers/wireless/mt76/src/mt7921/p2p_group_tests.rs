@@ -96,7 +96,17 @@ fn client() -> Result<(), &'static str> {
                 return Err("P2P client did not retain the station association/key owner");
             }
             let joined = basic_bss(&session.backend.frames[before..]);
-            if joined.len() < 2 || joined.iter().any(|body| body[12..16] != expected) {
+            // uni_add_dev's initial STATION BSS is INFRA_STA even for P2P
+            // (Linux connac_mcu.c:1258..1260). Only subsequent uni_add_bss
+            // records select P2P_GC from vif->p2p (1672..1677).
+            let initial = [
+                0, 0, 0, 0, 0, 0, 32, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0,
+                0, 0, 0, 19, 0, 0, 0, 0, 0,
+            ];
+            if joined.len() != 3
+                || joined[0] != initial
+                || joined[1..].iter().any(|body| body[12..16] != expected)
+            {
                 return Err("P2P client BSS-basic records used the wrong connection type");
             }
             // mt76_connac_mcu_sta_basic_tlv keeps INFRA_AP for the GO peer
@@ -874,6 +884,7 @@ fn group_service() -> Result<(), &'static str> {
     // ADDBA leaves on the group vif; the home originator stays idle.
     session.backend.tx_ba_offer = Some((64, 0));
     let tx = session.backend.tx_vifs.len();
+    let commands = session.backend.frames.len();
     if run(Box::pin(session.negotiate_group_transmit_ba(link))) != Ok(true)
         || !session
             .group
@@ -883,6 +894,20 @@ fn group_service() -> Result<(), &'static str> {
         || session.backend.tx_vifs[tx..].iter().any(|&v| v != 1)
     {
         return Err("group originator BA left its owner or vif");
+    }
+    // alloc_sta_req and its nested alloc_wtbl_req name the same WCID2.
+    let wtbl = [
+        1, 2, 1, 0, 1, 1, 0, 0, 13, 0, 40, 0, 2, 2, 1, 0, 0, 0, 0, 0, 8, 0, 28, 0, 0, 1, 0, 0, 0,
+        0, 1, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let station = [1, 2, 1, 0, 1, 1, 0, 0, 6, 0, 12, 0, 0, 1, 0, 1, 0, 0, 64, 0];
+    let frames = &session.backend.frames[commands..];
+    if frames.len() != 3
+        || frames[0].1.get(24..) != Some(&[3, 0, 1, 3, 16, 0, 0, 0, 0][..])
+        || frames[1].1.get(48..) != Some(&wtbl[..])
+        || frames[2].1.get(48..) != Some(&station[..])
+    {
+        return Err("group ADDBA/WTBL/STA records lost literal peer/owner/order");
     }
     if run(Box::pin(
         session.negotiate_group_transmit_ba_tid(Link::HOME, 1),
@@ -918,18 +943,74 @@ fn go_beside_station() -> Result<(), &'static str> {
     use crate::mt7921::packet_tx::Completion;
     use crate::mt7921::vif_slots::{Link, Vif};
     let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    // Keep the home association and GO on one explicit local20MHz policy.
+    // The physical registration retains its firmware MAC; a separate
+    // registered GO request target owns the distinct per-vif address.
+    let policy = Arc::new(CurrentPolicy {
+        database: narf_wireless::reg::db::Database::new(),
+        hold_bss_ack: AtomicBool::new(false),
+    });
+    policy
+        .database
+        .install(narf_wireless::reg::RegulatoryDomain {
+            country_code: *b"US",
+            rules: vec![narf_wireless::reg::RegRule {
+                freq_start_mhz: 2402,
+                freq_end_mhz: 2472,
+                max_bandwidth_mhz: 20,
+                max_power_dbm: 17,
+                flags: narf_wireless::reg::RegFlags::empty(),
+            }],
+        });
+    session.backend.tx_policy = Some(policy);
+    run(Box::pin(session.associate_station(
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] },
+        test_permission(),
+        &[],
+    )))
+    .map_err(|_| "home station actual secure association on channel6")?;
     let home = session.state;
-    if !matches!(home, State::Associated { channel: 6, .. }) {
+    let State::Associated {
+        info, channel: 6, ..
+    } = home
+    else {
         return Err("home station fixture is not associated on channel 6");
-    }
-    let (_physical, binding, source) = super::concrete()?;
+    };
+    let home_mac = info.capabilities.mac;
+    let own = crate::mt7921::vif_slots::mac_candidates(home_mac)
+        .into_iter()
+        .find(|candidate| *candidate != home_mac)
+        .ok_or("distinct GO source address")?;
+    let binding = crate::iface::ap_tests::bind(info)?;
     binding
         .iface
-        .set_iftype(9)
-        .map_err(|_| "GO-mode authority interface")?;
-    narf_net::iface::set_link_state(binding.iface.name(), true);
-    let authority = super::bound(&binding, &source)?;
-    let own = binding.iface.mac();
+        .set_iftype(2)
+        .map_err(|_| "physical parent station mode")?;
+    // This tests the native per-vif owner under actual registry/admin/source
+    // checks. The concrete NEW_INTERFACE constructor separately requires the
+    // retained BOOT_OWNER, which this local hardware-model Session is not.
+    let go_request = super::super::fixture_for(own, 9, true)?;
+    let authority = Arc::new(
+        ApControlAuthority::bind(
+            go_request.admin.clone(),
+            &go_request.iface,
+            0,
+            go_request.ifindex,
+            go_request.source.clone(),
+        )
+        .and_then(ApControlAuthority::reserve)
+        .map_err(|_| "distinct registered GO request authority")?,
+    );
+    if binding.iface.mac() != home_mac
+        || binding.iface.current_iftype() != 2
+        || own == home_mac
+        || authority.identity().map_err(|_| "GO identity")?.mac() != own
+    {
+        return Err("GO request replaced the physical radio identity");
+    }
+    let home_floor = session.station.epoch;
     let vif = Vif::new(1).map_err(|_| "vif")?;
     session.open_go(vif, own).map_err(|_| "GO reservation")?;
     if session.open_go(vif, own) != Err(Error::Busy)
@@ -945,7 +1026,14 @@ fn go_beside_station() -> Result<(), &'static str> {
         config(own),
         narf_wireless::ApStartSettings::default(),
     )))
-    .map_err(|_| "GO START beside the home station")?;
+    .map_err(|error| match error {
+        Error::Busy => "GO START beside the home station: Busy",
+        Error::Authority => "GO START beside the home station: Authority",
+        Error::Bounds => "GO START beside the home station: Bounds",
+        Error::Timeout => "GO START beside the home station: Timeout",
+        Error::MalformedEvent => "GO START beside the home station: MalformedEvent",
+        _ => "GO START beside the home station: other native error",
+    })?;
     let frames = &session.backend.frames[before..];
     let started = basic_bss(frames);
     if session.state != home
@@ -968,8 +1056,41 @@ fn go_beside_station() -> Result<(), &'static str> {
     }
     if session.go_receive_current(epoch) != Ok(true)
         || session.receive_current(session.receive_epoch) != Ok(true)
+        || session.backend.receive_epoch != epoch
+        || !session.backend.receive_open
+        || session.station.epoch != home_floor
+        || binding.iface.mac() != home_mac
+        || binding.iface.current_iftype() != 2
     {
         return Err("GO and home station are not both receive-current");
+    }
+    // A GO fence moves only its own floor. The capture must first observe
+    // each new nonzero stamp before it reopens for the still-current home
+    // station; reopening the GO then fences out every copy from its gap.
+    {
+        let mut role = session.enter_go().map_err(|_| "GO fence role")?;
+        role.renew_receive_epoch().map_err(|_| "GO receive fence")?;
+        if role.backend.receive_epoch != role.receive_epoch
+            || !role.backend.receive_open
+            || role.station.epoch != home_floor
+            || role.ap_owner.as_ref().is_none_or(|owner| !owner.fenced)
+        {
+            return Err("GO fence did not retain the current home capture stamp");
+        }
+        role.open_ap_capture().map_err(|_| "GO capture reopen")?;
+        if role.backend.receive_epoch != role.receive_epoch
+            || !role.backend.receive_open
+            || role.ap_owner.as_ref().is_none_or(|owner| owner.fenced)
+        {
+            return Err("GO reopened an unobserved stamp or kept its fence");
+        }
+    }
+    if session.go_receive_current(epoch) != Ok(false)
+        || session.go_receive_current(session.receive_epoch) != Ok(true)
+        || session.receive_current(epoch) != Ok(true)
+        || session.station.epoch != home_floor
+    {
+        return Err("GO fence admitted an old GO copy or retired the home owner");
     }
     // RX demux in the home role: a copy to the GO address is the GO's,
     // the home peer's WCID stays home.
@@ -1030,11 +1151,9 @@ fn go_beside_station() -> Result<(), &'static str> {
         return Err("GO STOP differs from mt7921_stop_ap + mt792x_remove_interface");
     }
     session.close_go().map_err(|_| "idle GO close")?;
-    narf_net::iface::set_link_state(binding.iface.name(), false);
-    binding
-        .iface
-        .set_iftype(2)
-        .map_err(|_| "authority interface did not return to STATION")?;
+    if binding.iface.mac() != home_mac || binding.iface.current_iftype() != 2 {
+        return Err("GO STOP changed the physical radio identity or role");
+    }
     Ok(())
 }
 /// The extended MCU command id of a native command frame, if any.

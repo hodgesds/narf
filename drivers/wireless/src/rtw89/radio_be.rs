@@ -292,7 +292,7 @@ mod tests {
             &mut bytes,
             4,
             0,
-            &[pair(0x60, 0x5), pair(0x100, 0x00c0ffee)].concat(),
+            &[pair(0x60, 0x5), pair(0x10055, 0x000c0ffe)].concat(),
         );
         add(&mut bytes, 5, 1, &pair(0x60, 0x6));
         add(&mut bytes, 8, 0, &pair(0x100, 0xaaaa0000));
@@ -321,21 +321,23 @@ mod tests {
             ]
             || tables.gain_program() != [Pair(0x00000000, 0x01020304)]
             || tables.gain().lna[0][0][..4] != [4, 3, 2, 1]
-            || tables.rf(0) != [Pair(0x60, 0x5), Pair(0x100, 0x00c0ffee)]
+            || tables.rf(0) != [Pair(0x60, 0x5), Pair(0x10055, 0x000c0ffe)]
             || tables.rf(1) != [Pair(0x60, 0x6)]
             || tables.nctl() != [Pair(0x100, 0xaaaa0000)]
         {
             return TestResult::Fail("8922A program selection or gain decode wrong");
         }
-        // RF page bytes: only the >= 0x100 entry packs, as
-        // `(address << 20) | data`, little-endian.
+        // Source RF-v1 ADSEL is bit16, with an8-bit register address;
+        // bit8 alone is outside the retained RF address profile. The
+        // unsigned32-bit page store of0x10055/c0ffe is055c0ffe.
         let Ok(pages) = tables.rf_pages(0) else {
             return TestResult::Fail("8922A RF-A pages refused");
         };
-        if pages != ((0x100u32 << 20) | 0x00c0ffee).to_le_bytes()
-            || !tables.rf_pages(1).unwrap().is_empty()
-        {
+        if pages != [0xfe, 0x0f, 0x5c, 0x05] || !tables.rf_pages(1).unwrap().is_empty() {
             return TestResult::Fail("8922A RF page packing wrong");
+        }
+        if radio_init::rf_pages(&[Pair(0x100, 0x000c0ffe)]).is_ok() {
+            return TestResult::Fail("invalid bit8 RF address admitted");
         }
         // A C container (RADIO_A idx1 / RADIO_B idx0) must not select
         // as a BE table set: idx must equal path.
@@ -482,11 +484,11 @@ mod tests {
         }
         // RF A (idx0 == path 0) before RF B, each with the full-field
         // mask, then one H2C page per path that has page entries.
-        if io.rf_writes[..2] != [(0, 0x60, 0xfffff, 0x5), (0, 0x100, 0xfffff, 0x00c0ffee)]
+        if io.rf_writes[..2] != [(0, 0x60, 0xfffff, 0x5), (0, 0x10055, 0xfffff, 0x000c0ffe)]
             || io.rf_writes[2] != (1, 0x60, 0xfffff, 0x6)
             || io.pages.len() != 1
             || io.pages[0].0 != 0
-            || io.pages[0].2 != ((0x100u32 << 20) | 0x00c0ffee).to_le_bytes()
+            || io.pages[0].2 != [0xfe, 0x0f, 0x5c, 0x05]
         {
             return TestResult::Fail("8922A RF A/B order or H2C page upload wrong");
         }

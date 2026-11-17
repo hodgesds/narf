@@ -7,7 +7,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_firmware::FirmwareError;
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 const HEADER: usize = 32;
 const PAGE: usize = 4096;
@@ -146,6 +146,8 @@ pub struct Owner<I: Io> {
     native_claimed: AtomicBool,
     status: IrqSafeSpinLock<Status>,
     identity: IrqSafeSpinLock<Option<Identity>>,
+    // Allocated only for AE and retained across all firmware/table awaits.
+    ae_cold: Mutex<Option<Box<super::rtl8723ae::init::Owner>>>,
 }
 /// Exact image of the successful retained CPU owner; not an upload receipt.
 #[derive(Clone, Copy)]
@@ -291,7 +293,16 @@ impl<I: Io> Owner<I> {
                 error: None,
             }),
             identity: IrqSafeSpinLock::new(None),
+            ae_cold: Mutex::new(None),
         }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) async fn rtl8723ae_cold_phase(&self) -> Option<super::rtl8723ae::init::Phase> {
+        self.ae_cold
+            .lock()
+            .await
+            .as_ref()
+            .map(|owner| owner.phase())
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
@@ -403,28 +414,26 @@ impl<I: Io> Owner<I> {
     /// `_rtl8723e_read_chip_version` over this owner's registers.
     pub(super) fn rtl8723ae_version(&self) -> Result<super::rtl8723ae::version::Version, Error> {
         use super::rtl8723ae::version::{
-            Version, REG_GPIO_OUTSTS, REG_MULTI_FUNC_CTRL, REG_SYS_CFG,
+            Version, BT_FUNC, REG_GPIO_OUTSTS, REG_MULTI_FUNC_CTRL, REG_SYS_CFG, TRP_VAUX_EN,
         };
         let sys_cfg = self.io.read32(REG_SYS_CFG)?;
         if sys_cfg == u32::MAX {
             return Err(Error::Gone);
         }
-        let mut gpio = Ok(0);
-        let mut multi = Ok(0);
-        let version = Version::from_registers(
-            sys_cfg,
-            || {
-                gpio = self.io.read32(REG_GPIO_OUTSTS);
-                *gpio.as_ref().unwrap_or(&0)
-            },
-            || {
-                multi = self.io.read32(REG_MULTI_FUNC_CTRL);
-                *multi.as_ref().unwrap_or(&0)
-            },
-        );
-        gpio?;
-        multi?;
-        version.map_err(|_| Error::Unsupported)
+        // Preserve the source's conditional dependent reads: test chips
+        // and non-8723 parts never reach GPIO or multifunction controls.
+        if sys_cfg & TRP_VAUX_EN != 0 || sys_cfg & BT_FUNC == 0 {
+            return Err(Error::Unsupported);
+        }
+        let gpio = self.io.read32(REG_GPIO_OUTSTS)?;
+        if gpio == u32::MAX {
+            return Err(Error::Gone);
+        }
+        let multi = self.io.read32(REG_MULTI_FUNC_CTRL)?;
+        if multi == u32::MAX {
+            return Err(Error::Gone);
+        }
+        Version::from_registers(sys_cfg, || gpio, || multi).map_err(|_| Error::Unsupported)
     }
     /// `_rtl92ce_read_chip_version` over this owner's registers.
     pub(super) fn rtl8192ce_version(&self) -> Result<super::rtl8192ce::version::Version, Error> {
@@ -797,33 +806,53 @@ impl<I: Io> Owner<I> {
         .await
         .unwrap_or(Err(Error::Deadline))
     }
-    /// `rtl8723e_hw_init` up to and including `rtl8723_download_fw`, with
-    /// packet engines still closed. The chip version is measured first (a
-    /// test chip or a part without `BT_FUNC` is refused before any write).
-    /// Probe has already run `REG_RSV_CTRL = 0` and
-    /// `RTL8723_NIC_ENABLE_FLOW`; this runs the rest of the
-    /// `_rtl8712e_init_mac` power segment
-    /// (`rtl8723ae::power::post_flow`). `REG_CR = 0x2ff`, the LLT and the
-    /// ring bases belong to the retained ring owner, so the CR DMA/MAC gates
-    /// are cleared as for the other profiles. Then `rtl8723_download_fw`,
-    /// which itself stops a still-running RAM image.
+    /// RTL8723AE cold MAC/firmware/BB/RF continuation, with packet engines
+    /// closed. Probe already qualified the factory map and ran card-enable.
+    /// The measured version and EFUSE/autoload mode are checked before new
+    /// writes. Source order: ePHY -> parked LLT/MAC -> firmware download ->
+    /// MAC/BB/RF tables, UMC fixups and defaults. CR gate enables and ring
+    /// bases are excluded; factory identity/coexistence/IQK/calibrated power
+    /// remain with the future radio owner. No station admission follows.
     async fn run_8723ae(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
-        // 100 ePHY rounds (300 us each), 999 undelayed checksum reads and
-        // 1001 x 5 ms WINTINI polls bound the Linux wait at ~5.1 s.
+        // Worst source firmware poll is about 5.1 s; the additional RF
+        // table's four 50 ms delays and BB/LSSI settles fit the 6 s bound.
         narf_time::timeout(narf_time::Deadline::after_ms(6_000), async {
+            use super::rtl8723ae::{adapter, init, power};
+            let cold_error = |error| match error {
+                super::prepare::Error::Access(error) => error,
+                _ => Error::Gate,
+            };
             self.set(Stage::Preparing, None);
             if self.io.read32(MCU)? == u32::MAX {
                 return Err(Error::Gone);
             }
-            self.rtl8723ae_version()?;
-            super::rtl8723ae::power::post_flow(&self.io).await?;
+            let version = self.rtl8723ae_version()?;
+            let mode = self.io.read8(adapter::REG_9346CR)?;
+            if mode & (adapter::CR9346_AUTOLOAD_OK | adapter::CR9346_EEPROM)
+                != adapter::CR9346_AUTOLOAD_OK
+            {
+                return Err(Error::Unsupported);
+            }
+            // A regular async Mutex keeps the same chip owner retained;
+            // no IRQ-disabling guard crosses any await.
+            let mut retained = self.ae_cold.lock().await;
+            let cold = retained.get_or_insert_with(|| Box::new(init::Owner::new()));
+            // Card-enable and ePHY setup do not write CR. Preserve the
+            // source's pre-power `CR == 0xff` LLT-skip observation before
+            // parking the gates below.
             let control = self.read8(0x100).await?;
+            let retries = power::post_flow_with_retries(&self.io).await?;
             self.io.write8(0x100, control & !0xcf)?;
             if self.read8(0x100).await? & 0xcf != 0 {
                 return Err(Error::Gate);
             }
+            cold.prepare_mac(&self.io, retries, control == 0xff)
+                .await
+                .map_err(cold_error)?;
             self.set(Stage::Downloading, None);
-            super::rtl8723ae::fw::download(&self.io, payload).await?;
+            cold.download_and_configure(&self.io, version, payload)
+                .await
+                .map_err(cold_error)?;
             Ok(info)
         })
         .await

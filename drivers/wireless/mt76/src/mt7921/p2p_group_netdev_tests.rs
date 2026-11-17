@@ -16,10 +16,17 @@ fn group_netdev() -> Result<(), &'static str> {
         return Err("group netdev admitted beside a home AP");
     }
     parent.set_iftype(2).map_err(|_| "home station role")?;
+    // GO metadata has a constructor, but unlike a client it first reserves
+    // the actual retained native GO owner. This local Session is not the
+    // boot owner: fail closed, publish nothing and release the unused slot.
     if !matches!(
         parent.new_virtual_interface("p2p-grp0", 9, None),
-        Err(WirelessError::NotSupported)
-    ) {
+        Err(WirelessError::Denied)
+    ) || narf_net::iface::lookup("p2p-grp0").is_some()
+        || narf_wireless::registry::list()
+            .iter()
+            .any(|iface| iface.name() == "p2p-grp0")
+    {
         return Err("GO netdev invented without a non-home AP owner");
     }
     let group = parent

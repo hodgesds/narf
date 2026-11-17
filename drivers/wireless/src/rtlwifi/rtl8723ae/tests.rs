@@ -215,6 +215,10 @@ impl Io for FwFake {
                 v |= fw::WINTINI_RDY;
             }
         }
+        // LLT command completes in the firmware bring-up fixture.
+        if reg == 0x01e0 {
+            v &= !(3 << 30);
+        }
         Ok(v)
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
@@ -269,6 +273,7 @@ impl Io for FwFake {
 
 fn fw_fake(checksum: bool, start: bool, running: bool, honours_reset: bool) -> FwFake {
     let mut regs = vec![0u8; 0x2000];
+    regs[usize::from(adapter::REG_9346CR)] = adapter::CR9346_AUTOLOAD_OK;
     if running {
         regs[usize::from(fw::REG_MCUFWDL)] = fw::RAM_DL_SEL;
     }

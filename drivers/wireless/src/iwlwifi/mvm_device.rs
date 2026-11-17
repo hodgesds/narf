@@ -1339,6 +1339,10 @@ impl Device {
             let memory = super::runtime::dma_alloc(bytes.len())?;
             let mut frame = Frame::new(memory, bytes.len() as u32);
             frame.payload_mut().copy_from_slice(bytes);
+            frame.set_tx_meta(narf_net::TxMeta {
+                more: false,
+                ..meta
+            });
             let _publication = self.admission.lock();
             authority.invoke(&(self.environment.policy)()?, || {
                 if self.terminal.load(Ordering::Acquire)

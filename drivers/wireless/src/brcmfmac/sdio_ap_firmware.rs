@@ -23,6 +23,15 @@ impl Firmware {
     pub(crate) fn capability(&mut self, bytes: &[u8]) {
         self.1 = bytes.to_vec();
     }
+    /// The actual modeled CM3 reset edge retires its firmware conversation.
+    /// Keep the fixture's configured primary role and immutable cap tokens.
+    pub(crate) fn reboot(&mut self) {
+        let primary_ap = self.0.ap.is_some();
+        self.0.reboot();
+        if primary_ap {
+            self.0.ap = Some(ap_model::Profile::default());
+        }
+    }
     /// One BCDC IOCTL; `ifidx` is its `BCDC_DCMD_IF_SHIFT` field.
     pub(crate) fn command(
         &mut self,

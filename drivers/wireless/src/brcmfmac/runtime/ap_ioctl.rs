@@ -64,9 +64,7 @@ impl<B: Bus> Runtime<B> {
         if self.down || self.pending.is_some() {
             return Err(Error::Busy);
         }
-        if input.len() > INPUT || maximum > CONTROL {
-            return Err(Error::Bounds);
-        }
+        let submitted = control_input(input, maximum)?;
         if !original.lifecycle() || !original.native.belongs_to(&self.ap_live) {
             return Err(Error::Access);
         }
@@ -152,7 +150,7 @@ impl<B: Bus> Runtime<B> {
             .publish(|| {
                 entered = true;
                 zero(memory)?;
-                memory.write(0, input)?;
+                memory.write(0, submitted)?;
                 memory.to_device(0, wire_length);
                 // Original identity is retained before any write-pointer attempt.
                 *transaction = id;

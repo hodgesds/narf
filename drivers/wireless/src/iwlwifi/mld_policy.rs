@@ -19,6 +19,27 @@ impl Source {
     pub fn native() -> Self {
         Self(Provider::Native)
     }
+    /// Initial public request follows this selected policy source. Only
+    /// Native may bootstrap the staged global deployment, as before; a
+    /// missing selected Database is absence of authority, never a fallback.
+    pub fn request_snapshot(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
+        self.request_snapshot_with(|| {
+            narf_wireless::reg::db::ensure_snapshot()
+                .map_err(|_| "Intel initial regulatory policy unavailable")
+        })
+    }
+    fn request_snapshot_with(
+        &self,
+        native: impl FnOnce() -> Result<Arc<RegulatoryDomain>, &'static str>,
+    ) -> Result<Arc<RegulatoryDomain>, &'static str> {
+        match &self.0 {
+            Provider::Native => native(),
+            #[cfg(any(test, feature = "kernel-test"))]
+            Provider::Database(database) => database
+                .snapshot()
+                .ok_or("Intel selected regulatory policy unavailable"),
+        }
+    }
     pub fn snapshot(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
         let snapshot = match &self.0 {
             Provider::Native => narf_wireless::reg::db::snapshot(),
@@ -644,6 +665,45 @@ mod tests {
             }],
         }
     }
+    fn smoke_iwl_policy_request_snapshot_keeps_selected_source_and_no_fallback() -> TestResult {
+        (|| {
+            let db = Arc::new(Database::new());
+            let source = Source::database(db.clone());
+            let other = Arc::new(domain());
+            let calls = core::cell::Cell::new(0usize);
+            let global = || {
+                calls.set(calls.get() + 1);
+                Ok(other.clone())
+            };
+            if source.request_snapshot_with(global).is_ok() || calls.get() != 0 {
+                return Err("missing selected policy borrowed a different native/global source");
+            }
+            db.install(domain());
+            let selected = db.snapshot().ok_or("selected policy fixture absent")?;
+            let request = source.request_snapshot_with(global)?;
+            if !Arc::ptr_eq(&request, &selected) || calls.get() != 0 {
+                return Err("public request did not retain exact selected policy snapshot");
+            }
+            let transaction = source.transaction(&request)?;
+            db.clear();
+            if source.request_snapshot_with(global).is_ok()
+                || transaction.check().is_ok()
+                || calls.get() != 0
+            {
+                return Err("selected policy loss fell back or kept an old transaction current");
+            }
+            let native = Source::native().request_snapshot_with(global)?;
+            if calls.get() != 1 || !Arc::ptr_eq(&native, &other) {
+                return Err("Native initial request did not invoke its bootstrap provider");
+            }
+            Ok(())
+        })()
+        .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/policy",
+        smoke_iwl_policy_request_snapshot_keeps_selected_source_and_no_fallback
+    );
     fn smoke_iwl_mld_current_policy_span_country_ceiling_and_replacement_fences() -> TestResult {
         (|| {
             let db = Arc::new(Database::new());

@@ -251,6 +251,14 @@ impl SdioBound {
         .admin;
         let iface: Arc<dyn WirelessNetIface> = device.clone();
         narf_wireless::registry::register(iface.clone());
+        // Production attachment binds this exact receiver's ndo open/stop
+        // target before administrative UP. Exercise the same AP DOWN
+        // carrier retirement when a Program setup callback retires it.
+        let receiver =
+            narf_net::iface::lookup(&name).ok_or("SDIO AP original open/stop receiver")?;
+        if !narf_net::iface::set_open_stop_target(&receiver, device.monitor_target()) {
+            return Err("SDIO AP original open/stop target");
+        }
         narf_net::iface::set_link_state(&name, true);
         Ok(Self {
             device,
@@ -357,6 +365,117 @@ impl Drop for SdioBound {
     }
 }
 
+/// Native AP packet validation must bind both wire headers to the original
+/// scope and keep the original peer, before any actual F2 COMMAND enters.
+fn packet_refusals(b: &SdioBound, secondary: bool) -> Result<(), &'static str> {
+    use crate::brcmfmac::ap_scope::Capture;
+    use crate::cyw43439::transport::{PacketTransport, TransportError};
+    let ethernet = ethernet();
+    let (control, data): (Capture, Capture) = {
+        let state = b.device.state.try_lock().ok_or("packet scope state")?;
+        let session = if secondary {
+            state
+                .secondaries
+                .first()
+                .and_then(|slot| slot.ap_fixture_session())
+        } else {
+            state.ap.as_deref()
+        }
+        .ok_or("packet scope AP")?;
+        (
+            session
+                .publication()
+                .map_err(|_| "packet lifecycle scope")?,
+            session
+                .data_capture(&ethernet)
+                .map_err(|_| "packet original peer scope")?,
+        )
+    };
+    let packets = b.bus.physical_packets();
+    let packet = |channel| -> Result<Vec<u8>, &'static str> {
+        let wire = packets
+            .iter()
+            .rev()
+            .find(|p| p[5] == channel)
+            .ok_or("native packet vector")?;
+        let logical = usize::from(u16::from_le_bytes(wire[..2].try_into().unwrap()));
+        Ok(wire[..logical.next_multiple_of(4)].to_vec())
+    };
+    let command = packet(0)?;
+    let payload = packet(2)?;
+    // Reuse the actual copied DATA bytes, including its source address.
+    let logical = usize::from(u16::from_le_bytes(payload[..2].try_into().unwrap()));
+    if !data.transmit(&payload[16..logical]) {
+        return Err("native DATA did not retain the captured peer");
+    }
+    let before = b.data_commands();
+    let mut state = b.device.state.try_lock().ok_or("packet native state")?;
+    let transport = state
+        .station
+        .runtime
+        .transport_mut()
+        .ok_or("packet native transport")?;
+    for kind in 0..3 {
+        let mut wrong = command.clone();
+        let mut flags = u32::from_le_bytes(wrong[20..24].try_into().unwrap());
+        match kind {
+            0 => flags = (flags & !0xf000) | (u32::from(control.interface_index() ^ 1) << 12),
+            1 => flags |= 1 << 2, // reserved BCDC flag, not IF/ID/SET
+            _ => wrong[24..28].copy_from_slice(&1u32.to_le_bytes()),
+        }
+        wrong[20..24].copy_from_slice(&flags.to_le_bytes());
+        if PacketTransport::transmit_ap_control(transport, &wrong, &control)
+            != Err(TransportError::BadFraming)
+        {
+            return Err("native AP control admitted foreign ifidx/reserved/status bits");
+        }
+    }
+    for kind in 0..4 {
+        let mut wrong = payload.clone();
+        match kind {
+            0 => wrong[14] = data.interface_index() ^ 1,
+            1 => wrong[14] |= 0x10, // high reserved BDC flags2 bits
+            2 => wrong[15] = 1,     // native packet has no data-offset words
+            _ => wrong[16..22].copy_from_slice(&[2, 9, 8, 7, 6, 5]),
+        }
+        if PacketTransport::transmit_ap_packet(transport, &wrong, &data)
+            != Err(TransportError::BadFraming)
+        {
+            return Err("native AP DATA admitted foreign ifidx/offset/peer");
+        }
+    }
+    drop(state);
+    if b.data_commands() != before || b.bus.physical_packets().len() != packets.len() {
+        return Err("refused native AP packet entered an actual F2 COMMAND");
+    }
+    Ok(())
+}
+
+fn secondary_data(b: &SdioBound, name: &str, own: [u8; 6]) -> Result<(), &'static str> {
+    let mut frame = ethernet();
+    frame[6..12].copy_from_slice(&own);
+    let before = b.bus.packets();
+    narf_net::iface::send_on(name, &frame).map_err(|_| "SDIO secondary Ethernet enqueue")?;
+    for _ in 0..4 {
+        ready(b.device.vif_worker())?;
+    }
+    let packets = b.bus.physical_packets();
+    let wire = packets
+        .iter()
+        .rev()
+        .find(|p| p[5] == 2)
+        .ok_or("SDIO secondary actual DATA packet")?;
+    let logical = usize::from(u16::from_le_bytes(wire[..2].try_into().unwrap()));
+    if b.bus.packets() != before + 1
+        || wire[12..16] != [0x20, 0, 1, 0]
+        || wire[16..logical] != frame
+        || !b.bus.vif_change(|p| p.packets.contains(&frame))
+    {
+        return Err("SDIO secondary DATA left original ifidx or peer");
+    }
+    packet_refusals(b, true)
+}
+
 fn open_and_block() -> Result<(), &'static str> {
     for caps in [b"apextra sta wme\0".as_slice(), b"sta wme\0"] {
         let b = SdioBound::new_capability(caps, false)?;
@@ -412,6 +531,7 @@ fn open_and_block() -> Result<(), &'static str> {
     {
         return Err("SDIO AP one COMMAND/logical length/zero tail/firmware SME contract");
     }
+    packet_refusals(&b, false)?;
     ready(b.device.stop_ap_async(&b.authority()))?.map_err(|_| "SDIO AP native STOP")?;
     if b.device.link_up() || b.bus.change(|p| p.active || !p.peers.is_empty()) {
         return Err("SDIO AP native BSS/SCB STOP receipts");
@@ -1079,6 +1199,7 @@ fn secondary_ap(joined: bool) -> Result<(), &'static str> {
         if rx() != before + 1 || b.rx_packets() != primary_rx {
             return Err("SDIO secondary AP downlink not received on ifidx 1 only");
         }
+        secondary_data(&b, name, vif_mac)?;
         ready(vap.stop_ap_async(&authority))?.map_err(|_| "SDIO secondary AP STOP")?;
         if b.bus.vif_change(|p| p.active || !p.peers.is_empty())
             || vap.link_up()
@@ -1375,6 +1496,7 @@ fn p2p_go() -> Result<(), &'static str> {
         if source.count(19) != 1 {
             return Err("SDIO GO NEW_STATION not observed on its shell");
         }
+        secondary_data(&b, NAME, vif_mac)?;
         let before = b.bus.commands().len();
         ready(go.stop_ap_async(&authority))?.map_err(|_| "SDIO P2P GO STOP")?;
         let mut disable = b"bss\0".to_vec();
@@ -1437,6 +1559,9 @@ fn sdio_reset_rejoin() -> Result<(), &'static str> {
     use crate::cyw43439::interface::generation::{Generation, Publish, Removal};
     let clm: crate::cyw43439::sdio_reset::Clm = Arc::new(IrqSafeSpinLock::new(Vec::new()));
     let mut b = SdioBound::build(b"sta wme\0", false, true, Some(clm.clone()))?;
+    if b.bus.boots() != 1 || b.bus.cm3_resets() != [1, 0] {
+        return Err("SDIO initial loader did not release actual CM3 reset");
+    }
     {
         let mut state = b.device.state.try_lock().ok_or("state")?;
         let station = &mut state.station;
@@ -1475,7 +1600,9 @@ fn sdio_reset_rejoin() -> Result<(), &'static str> {
         })
     });
     let generation = Generation::with_publisher(b.device.clone(), publish);
-    narf_scheduler::block_on(generation.recover())
+    // The RAM SDHCI/card model has no hardware IRQ for any timed reset or
+    // station-control poll reached by this real generation continuation.
+    narf_scheduler::block_on_spin(generation.recover())
         .map_err(|_| "SDIO transport reset did not republish the station")?;
     let device = generation
         .current()
@@ -1494,6 +1621,8 @@ fn sdio_reset_rejoin() -> Result<(), &'static str> {
         || device.withdrawn()
         || device.interface_name() != b.name
         || generation.resets() != 1
+        || b.bus.boots() != 2
+        || b.bus.cm3_resets() != [1, 0, 1, 0]
         || device.transport_failed()
     {
         return Err("SDIO reset did not publish a fresh generation under the same name");
@@ -1501,7 +1630,7 @@ fn sdio_reset_rejoin() -> Result<(), &'static str> {
     if WirelessNetIface::connected_bssid(&*device) != Some(AP) {
         return Err("retained association was not rejoined after the SDIO reset");
     }
-    if narf_scheduler::block_on(generation.remove()) != Removal::Reclaimed {
+    if narf_scheduler::block_on_spin(generation.remove()) != Removal::Reclaimed {
         return Err("rebooted SDIO generation was not stopped and released");
     }
     // The harness drop tears down its (withdrawn) original shell.

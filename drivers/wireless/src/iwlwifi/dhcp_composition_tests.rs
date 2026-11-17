@@ -1931,8 +1931,13 @@ impl Guard {
         } else {
             policy()
         });
+        // The physical adapter caches iwl_ifname for its lifetime. A
+        // fixture must keep that name reserved: registering/unregistering
+        // it consumes the reservation and lets another driver allocate it.
+        // Explicit names still exercise their original endpoint identity.
+        let test_name = Some(name.unwrap_or_else(|| narf_net::iface::reserve_name("iwlsc%d")));
         let device = Arc::new_cyclic(|me| Device {
-            test_name: name,
+            test_name,
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),

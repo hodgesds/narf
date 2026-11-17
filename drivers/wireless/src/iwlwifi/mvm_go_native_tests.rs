@@ -1,6 +1,14 @@
 //! Original API77 GO9, separate tag9 and actual Qu/NoA/TX9 owner.
 use super::*;
 use crate::iwlwifi::p2p_go_fixture as wire;
+
+/// Actual GO peer advertises OFDM6/12/24 only. API4 descriptor rate_n_flags
+/// uses rates-v2 legacy OFDM format1/index0 =6Mbps (fw/api/rs.h).
+fn uplink(pn: u64) -> Vec<u8> {
+    let mut packet = super::uplink(pn);
+    packet[28..32].copy_from_slice(&0x100u32.to_le_bytes());
+    packet
+}
 #[inline(never)]
 fn start_go(f: &Fixture) -> Result<(), &'static str> {
     f.admin.set_link(false).map_err(|_| "API77 GO DOWN")?;
@@ -106,6 +114,12 @@ fn public_probe(f: &Fixture, both: bool, index: u8) -> Result<(), &'static str> 
             if done {
                 break;
             }
+            // Native FRAME waits on Activity's real 1 ms fallback when
+            // this RAM target supplies no IRQ. Drive that clock between
+            // rounds, as once() does for the direct native conversation.
+            narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+                2_000_000,
+            )));
         }
         require(
             done,
@@ -127,15 +141,30 @@ fn public_probe(f: &Fixture, both: bool, index: u8) -> Result<(), &'static str> 
     wire::check_probe(&frame, OWN, Some(index))
 }
 fn native_go() -> Result<(), &'static str> {
+    // Declared first so the native fixture drops before its task graph.
+    let _executor = ExecutorFixture::new();
     let _platform = Platform::new();
     let f = Fixture::new_emission(9)?;
+    let result = native_go_conversation(&f);
+    if result.is_err() {
+        // Finish the actual retained native STOP before the fixture's
+        // registration/source/Actor owners go away. This earns its own
+        // firmware queue/DMA receipts; no fake owner reset hides an error.
+        let stopped = run(f.h.device.stop_ap_retained());
+        if !matches!(stopped, Ok(Ok(()))) {
+            f.diagnose("GO first-error retained native STOP", &stopped);
+        }
+    }
+    result
+}
+fn native_go_conversation(f: &Fixture) -> Result<(), &'static str> {
     f.h.actor
         .lock()
         .native_ap
         .as_mut()
         .unwrap()
         .arm_initial_noa();
-    start_go(&f)?;
+    start_go(f)?;
     require(
         f.h.device.current_iftype() == 9
             && f.h.device.link_up()
@@ -143,23 +172,58 @@ fn native_go() -> Result<(), &'static str> {
             && f.h.device.p2p_interface_types().contains(&8),
         "API77 GO source scope/role",
     )?;
-    keys(&f)?;
-    probe(&f, Some(5))?;
-    public_probe(&f, false, 5)?;
-    public_probe(&f, true, 5)?;
-    group_sequences(&f)?;
+    keys(f)?;
+    probe(f, Some(5))?;
+    public_probe(f, false, 5)?;
+    public_probe(f, true, 5)?;
+    group_sequences(f)?;
     for _ in 0..65 {
-        notice(&f, 1, 8, true);
+        notice(f, 1, 8, true);
     }
-    notice(&f, 0, 7, true);
-    probe(&f, Some(7))?;
-    notice(&f, 1, 9, true);
-    probe(&f, Some(7))?;
-    notice(&f, 0, 0, false);
-    probe(&f, None)?;
+    notice(f, 0, 7, true);
+    probe(f, Some(7))?;
+    notice(f, 1, 9, true);
+    probe(f, Some(7))?;
+    notice(f, 0, 0, false);
+    probe(f, None)?;
+    let pending = {
+        let mut state = f.h.device.state.try_lock().ok_or("API77 GO prefix State")?;
+        let hw = state
+            .owner
+            .as_mut()
+            .ok_or("API77 GO prefix owner")?
+            .ap_hardware();
+        let foreign = hw
+            .notifications
+            .iter()
+            .filter(|packet| {
+                packet.header.group_id == 3
+                    && packet.header.cmd == 0xfc
+                    && packet.payload.get(..4) == Some(&1u32.to_le_bytes())
+            })
+            .count();
+        (hw.notifications.len(), foreign)
+    };
+    // Final probe publication drained real RFH to observe MAC0's NoA behind
+    // the65-record MAC1 prefix and one later foreign update. Those66 foreign
+    // Session notifications still precede DATA; ap_step consumes at most64
+    // of them in one pass. A second native pass reaches the original DATA.
+    require(
+        pending == (66, 66),
+        "API77 GO lost actual >64 foreign NoA prefix",
+    )?;
     f.h.actor.lock().inject(0xc1, 0, 0x8000, &uplink(6));
     require(
-        f.h.device.step(None).len() == 1,
+        f.h.device.step(None).is_empty(),
+        "API77 GO DATA overtook unfinished native notification prefix",
+    )?;
+    f.h.actor.lock().serve()?;
+    let copied = f.h.device.step(None);
+    let mut expected = OWN.to_vec();
+    expected.extend_from_slice(&PEER);
+    expected.extend_from_slice(&[0x88, 0xb5, 7]);
+    require(
+        copied.len() == 1 && copied[0].0 == expected,
         "API77 GO physical key/PN DATA",
     )?;
     f.h.actor.lock().inject(0xc1, 0, 0x8000, &uplink(6));
@@ -235,8 +299,14 @@ kernel_test_in!(
 fn sequence(f: &Fixture, id: u8, pn: u64) -> Result<(), &'static str> {
     {
         let a = f.authority()?;
-        let seq = run(f.h.device.key_sequence_ap_async(&a, id, false, None))?
-            .map_err(|_| "API77 GO actual group sequence")?;
+        let result = run(f.h.device.key_sequence_ap_async(&a, id, false, None))?;
+        if result.is_err() {
+            f.diagnose(
+                "GO key sequence (index, expected PN, result)",
+                &(id, pn, &result),
+            );
+        }
+        let seq = result.map_err(|_| "API77 GO actual group sequence")?;
         require(
             seq.seq == pn.to_le_bytes()[..6],
             "API77 GO group PN estimate/reset",
@@ -283,6 +353,45 @@ fn group_sequences(f: &Fixture) -> Result<(), &'static str> {
             "API77 GO invented firmware PTK sequence",
         )?;
     }
+    // Independently current admin/source/role facts do not make a second
+    // Owner allocation the original Session-to-hardware START owner.
+    let wrong_owner = {
+        let authority = f.authority()?;
+        let iface: Arc<dyn WirelessNetIface> = f.h.device.clone();
+        crate::iwlwifi::ap_owner::Owner::new(
+            Arc::downgrade(&iface),
+            authority
+                .identity()
+                .map_err(|_| "API77 GO foreign owner identity")?,
+            authority
+                .event_authority()
+                .map_err(|_| "API77 GO foreign owner event")?,
+            authority
+                .native_emission_for(f.h.device.as_ref())
+                .map_err(|_| "API77 GO foreign current emission")?,
+            f.h.device.ap_host.role.lock().observe(),
+            Arc::new(AtomicBool::new(false)),
+        )?
+    };
+    let (mcast, bcast) = {
+        let actor = f.h.actor.lock();
+        let model = actor
+            .native_ap
+            .as_ref()
+            .ok_or("API77 GO native queue model")?;
+        let queue = |station| {
+            model
+                .queues
+                .iter()
+                .find(|queue| queue.live && queue.station == station)
+                .map(|queue| queue.id)
+                .ok_or("API77 GO actual internal queue absent")
+        };
+        (
+            queue(crate::iwlwifi::ap_wire::MCAST)?,
+            queue(crate::iwlwifi::ap_wire::BCAST)?,
+        )
+    };
     let mut ethernet = vec![255; 6];
     ethernet.extend_from_slice(&OWN);
     ethernet.extend_from_slice(&[0x88, 0xb5, 1, 2, 3]);
@@ -297,8 +406,32 @@ fn group_sequences(f: &Fixture) -> Result<(), &'static str> {
         let (mut frame, header) =
             crate::iwlwifi::ap_wire::ethernet_qos_from_ap(OWN, 0, &ethernet, true, None)
                 .ok_or("API77 GO physical group frame")?;
+        let before = session
+            .key_sequence(1, false, None)
+            .map_err(|_| "API77 GO current host PN before queue refusal")?;
+        let original = core::mem::replace(&mut session.proof, wrong_owner);
+        let wrong = hw.enqueue_go_group(session, mcast, &mut frame, header, None);
+        session.proof = original;
+        require(
+            wrong.is_err(),
+            "API77 GO host GTK accepted another current Owner allocation",
+        )?;
+        require(
+            hw.enqueue_go_group(session, bcast, &mut frame, header, None)
+                .is_err(),
+            "API77 GO host GTK posted through foreign BCAST queue",
+        )?;
+        require(
+            session.key_sequence(1, false, None) == Ok(before),
+            "API77 GO wrong owner/queue consumed GTK PN",
+        )?;
         hw.source_fence()?
             .invoke(|| session.protect_go_group(&mut frame, header))?;
+        require(
+            hw.enqueue_transmit_ap(mcast, &frame, header, None, false, 0)
+                .is_err(),
+            "API77 GO raw protected bytes bypassed actual host key owner",
+        )?;
         require(
             hw.enqueue_transmit_ap(u16::MAX, &frame, header, None, false, 0)
                 .is_err(),

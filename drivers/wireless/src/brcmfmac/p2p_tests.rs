@@ -28,7 +28,9 @@ fn p2p_features() -> Features {
 }
 
 fn block<F: core::future::Future>(future: F) -> F::Output {
-    narf_scheduler::block_on(future)
+    // Scripted firmware supplies no IRQ; P2P/control waits still use real
+    // monotonic delays before the BSP test timer is necessarily armed.
+    narf_scheduler::block_on_spin(future)
 }
 
 /// GO Negotiation Request public action frame from the device to PEER.

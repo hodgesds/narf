@@ -197,15 +197,12 @@ impl Owner {
         }
         self.power.phy.ba.clear_packets();
         self.phase = Phase::Failed;
-        #[cfg(any(test, feature = "kernel-test"))]
-        let model = super::super::runtime::model::is_model(&self.hardware);
-        #[cfg(not(any(test, feature = "kernel-test")))]
-        let model = false;
-        if model {
-            self.hardware.fail();
-        } else {
-            self.hardware.stop_for_suspend().await?;
-        }
+        // The explicit RAM backend also uses the transport's retained stop
+        // boundary. Marking it failed alone leaves P2P/session ownership
+        // live and cannot stand in for terminal DMA retirement. The common
+        // path invokes current device authority and retires native ownership
+        // only after its backend's stop/BME-off proof succeeds.
+        self.hardware.stop_for_suspend().await?;
         // DMA stop is acknowledged: no installed key can be used again.
         self.retire_security_after_reset()
     }

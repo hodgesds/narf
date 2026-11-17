@@ -354,7 +354,7 @@ pub(super) fn prepare_header_amsdu(
     }
     prepare_header_profile(chip, info, sequence, frame_dma, frame, true, false)
 }
-/// Explicit RTL8852B software-fragment descriptor path. Ordinary transport
+/// Explicit RTL8852A/B software-fragment descriptor path. Ordinary transport
 /// keeps refusing fragments; same actual qualified native owner is mandatory.
 pub(super) fn prepare_header_fragment(
     chip: ChipId,

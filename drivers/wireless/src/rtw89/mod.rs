@@ -66,6 +66,7 @@ mod cctl_g7;
 mod cctl_g7_tests;
 pub mod chan;
 mod channel_51;
+mod channel_a;
 mod channel_bb;
 mod channel_be;
 mod channel_c;

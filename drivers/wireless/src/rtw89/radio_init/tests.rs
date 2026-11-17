@@ -816,11 +816,12 @@ fn smoke_rtw89_a_table_power_reset_rf_order_matches_rtw8852a() -> TestResult {
             return TestResult::Fail("A txpwr unit / BB reset state differs from Linux");
         }
     }
-    // A reset clears the MANON/EN bits and writes no B-only HW-SI or UL_TB
-    // address.
+    // Linux rtw8852a.c:1293..1296 clears only MANON/EN bit30. The
+    // 0x5a5a5a5a model seed must survive in every unrelated bit; A reset
+    // writes no B-only HW-SI or UL_TB address.
     for address in [0x158dc, 0x15818, 0x178dc, 0x17818] {
-        if model.words[address / 4] != 0 {
-            return TestResult::Fail("A reset left MANON/EN bits set");
+        if model.words[address / 4] != 0x1a5a_5a5a {
+            return TestResult::Fail("A reset did not clear MANON/EN while preserving other bits");
         }
     }
     if model

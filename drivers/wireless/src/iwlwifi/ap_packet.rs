@@ -314,16 +314,12 @@ impl Session {
                 .management_rate(self.chains & self.chains.wrapping_neg())
         });
         if host_group {
-            self.protect_go_group(&mut frame, header)?;
+            // Keep the actual mutable key/PN owner through source-checked
+            // posting; a raw protected frame cannot disable firmware crypto.
+            hw.enqueue_go_group(self, queue, &mut frame, header, rate)?;
+        } else {
+            hw.enqueue_transmit_ap(queue, &frame, header, rate, encrypt, assist)?;
         }
-        hw.enqueue_transmit_ap(
-            queue,
-            &frame,
-            header,
-            rate,
-            encrypt && !host_group,
-            if host_group { 0 } else { assist },
-        )?;
         self.sequence = self.sequence.wrapping_add(1);
         Ok(true)
     }

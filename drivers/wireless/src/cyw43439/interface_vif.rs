@@ -97,6 +97,13 @@ pub(super) struct Secondary<R: Fullmac> {
     ap_tx: vif_ap::PendingTx,
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
+impl<R: Fullmac> Secondary<R> {
+    pub(super) fn ap_fixture_session(&self) -> Option<&crate::brcmfmac::ap::Session> {
+        self.ap.as_deref()
+    }
+}
+
 /// Type-erased primary role entry points for the non-generic shell.
 #[async_trait::async_trait]
 pub(super) trait Roles: Send + Sync {

@@ -211,10 +211,35 @@ policy, recognition, RX/TX-to-watchdog path and access failures; all four
 pass in x86 QEMU. The release kernel and stack gate, strict release clippy,
 debug checking and formatting pass. The broader rtlwifi run exposed stale
 RTL8192DE HT capability/timing expectations; their final width-filtered
-correction awaits the combined-branch rerun. A full wireless attempt also
+correction is included in the combined checkpoint below. A full wireless attempt also
 found RTL8723BU and Intel P2P fixture failures and stalled in the watchdog
-work smoke; it was stopped for focused investigation. The full gate remains
-open; aarch64 stays skipped as requested. No physical acceptance is claimed.
+work smoke; those findings are resolved in that checkpoint. Aarch64 stays
+skipped as requested. No physical acceptance is claimed.
+
+The parallel continuation now adds RTL8723AE native cold MAC/LLT ->
+firmware -> BB/RF/default setup, separate source IQK/RF6052 preparation
+owners, RTL8852A native MAC/BB/RF channel control with Programmed-only
+readiness, and AR9462/AR9565 associated-beacon audio coexistence feedback.
+The broad-run findings are addressed by the full-runtime RTL8723BU
+fixtures and hardware TX-mask validation, Intel RAM retained-stop cleanup,
+and a hermetic watchdog executor fixture. Native corrections retain exact
+Intel host-GTK/checksum, policy/client and firmware-marker owners, actual
+MediaTek peer WCIDs/GO receive epochs, RTL8852A fragment identity and
+FullMAC logical/physical response boundaries. CYW AP packets bind the
+original interface, and final RX publication invokes the SDIO source once
+while retaining peer/key epochs. Intel model fixtures use their own names
+instead of consuming the physical adapter's cached wlan reservation.
+
+The 2026-11-17 combined x86_64 gate passes **4404/0/9** (pass/fail/expected
+physical-device skip). The release kernel and stack gate, strict release
+library Clippy for wireless and MT76, debug checks and formatting pass.
+The normal production boot and both btrfs postflight checks also pass with
+persistent disk writes. Ath10k retains station Security on the heap; its
+obsolete startup exception and one obsolete RTL8xxxU probe exception are
+removed without increasing any stack budget. Aarch64 is skipped at the
+user's request. The TSV remains 13 open rows and 94 implemented pending
+validation; calibrated radio/station prerequisites and physical acceptance
+remain open.
 
 The first parallel feature wave adds retained API77 Intel management-queue
 ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native

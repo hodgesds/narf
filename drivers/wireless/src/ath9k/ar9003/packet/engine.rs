@@ -239,7 +239,13 @@ impl<P: Port> station::Engine for Packet<P> {
     fn periodic_bound(&self) -> bool {
         false
     }
-    fn periodic_beacon(&mut self, _rssi: i8) {}
+    // Radio::cache admits the bound peer beacon after native descriptor/CRC
+    // validation. Share that one sample with MCI without enabling HT ANI.
+    fn periodic_beacon(&mut self, rssi: i8) {
+        if self.phase() == Phase::Running {
+            self.mci.lock().beacon_rssi(rssi);
+        }
+    }
     fn periodic_service(&mut self, _eligible: bool) -> Result<(), Error> {
         Ok(())
     }

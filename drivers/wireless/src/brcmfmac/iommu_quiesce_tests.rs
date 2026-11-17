@@ -126,7 +126,9 @@ fn smoke_brcmf_iommu_dead_firmware_blocks_before_reclaim() -> TestResult {
             return Err("FWHALT did not fail the generation");
         }
         IOMMU.clear_events();
-        narf_scheduler::block_on(owner.stop_dead()).map_err(|_| "dead-firmware stop failed")?;
+        // stop_dead reaches reset_device's real 100 ms watchdog settle.
+        // Use the parent's BSP-harness timer-driving model bridge.
+        drive_timed_model(owner.stop_dead()).map_err(|_| "dead-firmware stop failed")?;
         {
             let st = s.lock();
             if st.watchdogs_at_block != Some(0)
@@ -208,6 +210,7 @@ fn smoke_brcmf_iommu_unproven_stop_reclaims_only_behind_block() -> TestResult {
         let mut owner = runtime::Runtime::attach(booted(bus)).map_err(|_| "attach failed")?;
         owner.fail();
         s.lock().gone = true;
+        // The gone BAR refuses before reset_device or any timed wait.
         if narf_scheduler::block_on(owner.stop_dead()) != Err(runtime::Error::Access)
             || owner.is_reclaimable()
             || s.lock().watchdogs != 0

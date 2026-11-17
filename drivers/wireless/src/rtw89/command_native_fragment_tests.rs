@@ -206,7 +206,7 @@ fn terminal_a() -> Result<(), &'static str> {
                 .ok_or("retained issued maps")?;
         let word =
             |offset| u32::from_le_bytes(snapshot.header[offset..offset + 4].try_into().unwrap());
-        // The A TXWD is the AX v0 body shared with B (`transmit_a`), so the
+        // The A TXWD is the AX v0 body shared with B (`transmit_fragment`), so the
         // same descriptor invariants hold: SW_SN/rate/NAV/bytes unaltered.
         if snapshot.id != id
             || &snapshot.body != expected

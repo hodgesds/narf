@@ -312,6 +312,26 @@ impl DataQueue {
         }
         self.send_inner(mmio, frame, header_len, rate, assist, Some(encrypt))
     }
+    /// Linux mvm/tx.c and mld/tx.c set ENCRYPT_DIS when mac80211 supplies
+    /// actual host crypto (`control.hw_key == NULL`). Retain that distinction:
+    /// this entry borrows the real GO host key/PN owner, while send_ap_assisted
+    /// continues to refuse a raw Protected frame with firmware crypto disabled.
+    pub(super) fn send_go_group(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        session: &mut super::ap_session::Session,
+        frame: &mut Vec<u8>,
+        header: usize,
+        rate: Option<u32>,
+    ) -> Result<u16, &'static str> {
+        if !self.belongs_to(super::ap_wire::MCAST, 0)
+            || self.id.is_none_or(|id| !session.owns_go_group_queue(id))
+        {
+            return Err("GO host group requires its exact multicast queue");
+        }
+        session.protect_go_group(frame, header)?;
+        self.send_inner(mmio, frame, header, rate, 0, Some(false))
+    }
     #[allow(clippy::too_many_arguments)]
     fn send_inner(
         &mut self,

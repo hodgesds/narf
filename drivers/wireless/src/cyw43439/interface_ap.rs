@@ -483,6 +483,14 @@ impl<R: Fullmac + 'static> Device<R> {
                 {
                     return Err(WirelessError::Busy);
                 }
+                // A completed STOP may leave the initialized station's
+                // snapshot behind a same-country policy replacement. Refresh
+                // from its original source before binding the new AP; prepare
+                // still requires the exact policy captured for this request.
+                state
+                    .station
+                    .check_connection_policy()
+                    .map_err(wireless_error)?;
                 let session = Session::prepare(
                     &state.station,
                     *config,
@@ -764,24 +772,25 @@ impl<R: Fullmac + 'static> Device<R> {
                     // monotonic for this copied event, mirroring the station
                     // `deliver_received` break on a failed publication.
                     let admitted = self.ap_final(&original)
-                        && original
-                            .publish(|| {
-                                let Some(mut state) = self.state.try_lock() else {
-                                    return false;
-                                };
-                                // Retain State through the actual ring copy:
-                                // a concurrent peer/key transition cannot
-                                // finish between its final epoch check and
-                                // this independent IPC publication.
-                                if original.current().is_err() || state.ap.is_none() {
-                                    return false;
-                                }
-                                if let Some(frame) = frame {
-                                    let _ = state.rx.try_send(frame);
-                                }
-                                true
-                            })
-                            .unwrap_or(false);
+                        && self.state.try_lock().is_some_and(|mut state| {
+                            // Retain State through the final source invocation
+                            // and ring copy. publish rechecks the fixed epochs
+                            // under that original native lifetime; calling
+                            // current there would recursively lock the same
+                            // SDIO owner. No peer/key transition can finish
+                            // between this check and the IPC publication.
+                            if state.ap.is_none() {
+                                return false;
+                            }
+                            original
+                                .publish(|| {
+                                    if let Some(frame) = frame {
+                                        let _ = state.rx.try_send(frame);
+                                    }
+                                    true
+                                })
+                                .unwrap_or(false)
+                        });
                     if !admitted {
                         continue;
                     }

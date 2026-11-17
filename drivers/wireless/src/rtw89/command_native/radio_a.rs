@@ -112,9 +112,10 @@ impl Native {
     /// RTL8852A ordinary grant (`OrdinaryGrant::A`, the same retained
     /// signed program, rechecked) is installed; it carries no B companion
     /// program, so every B-only program accessor reports "no program".
-    /// No channel is programmed yet: the A `set_channel` / `rfk_channel`
-    /// owner follows the open channel-RFK lane (#2098), so the native
-    /// operating channel stays unset until that lane lands.
+    /// The A channel-control and exact `set_txpwr` prefix run next, inside
+    /// their scheduler/help window. Programmed is distinct from complete
+    /// channel RFK: the native operating channel remains unset until the
+    /// live thermal/TSSI prerequisites and channel RFK are composed.
     ///
     /// # Safety
     /// Same retained Startup owner after RTL8852A `prepare_radio_tables`;
@@ -239,7 +240,15 @@ impl Native {
         }
         .await
         .map_err(crate::rtw89::radio_c::error)?;
-        if owner.state() != radio_a::State::Ready {
+        // SAFETY: the selected signed A profile/plan and retained init
+        // above are current; no ordinary station or response producer.
+        unsafe { owner.program_channel(self, profile, &plan) }
+            .await
+            .map_err(crate::rtw89::radio_c::error)?;
+        if owner.state() != radio_a::State::Ready
+            || owner.programmed_channel() != Some(profile)
+            || owner.channel().is_some()
+        {
             return Err(power::Error::Terminal);
         }
         let qualification = self.qualification_a.clone().ok_or(power::Error::Access)?;
@@ -247,9 +256,9 @@ impl Native {
         if qualification.active() != profile {
             return Err(power::Error::Access);
         }
-        // No channel is programmed yet (no A set_channel owner): the
-        // native operating channel stays unset; the grant below admits
-        // ordinary TX only once the follow-up lane programs it.
+        // Keep Native.channel unset: programming alone does not establish
+        // calibrated RF. Existing station/AP gates remain closed until
+        // the separate live-input/channel-RFK continuation completes.
         self.ordinary = Some(OrdinaryGrant::A(qualification));
         Ok(())
     }

@@ -4384,54 +4384,69 @@ fn pci_virtual_create(
         if !parent.shared.prepare_vdev_slot(vdev_id) {
             return Err(WirelessError::Busy);
         }
-        let lifecycle = parent
-            .virtual_lifecycle
-            .clone()
-            .ok_or(WirelessError::NotSupported)?;
-        let config = parent.mac.try_lock().ok_or(WirelessError::Busy)?.config();
-        // The physical radio may have completed a firmware recovery since
-        // its root netdev was registered.  Read the live capability and
-        // regulatory snapshots rather than a registration-time copy before
-        // building a later virtual vdev.  The caps are the parent's
-        // radio's, not pdev 0's (a radio-1 parent's child would
-        // otherwise come up with radio-0 bands/chains).
-        let (mut caps, reg_info) = {
-            let rt = parent.shared.try_lock().ok_or(WirelessError::Busy)?;
-            let caps = if parent.pdev_id == 0 {
-                rt.device_caps()
-            } else {
-                rt.device_caps_for(parent.pdev_id)
-            }
-            .map_err(|_| WirelessError::HardwareError)?;
-            (caps, rt.core.reg_info.clone())
-        };
-        let name = Box::leak(alloc::string::String::from(requested_name).into_boxed_str());
-        let mac_addr = requested_mac.unwrap_or_else(|| virtual_mac(parent.mac_addr, vdev_id));
-        caps.mac_addr = mac_addr;
-        let mac = Mac::new(
-            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
-            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
-            caps,
-            config.with_vdev(vdev_id),
-            reg_info.as_deref(),
-        );
-        let (child, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
-            name,
-            parent.shared.clone(),
-            mac,
-            mac_addr,
-            netdev_sinks(),
-            vdev_id,
-            iftype,
-            Some(lifecycle),
-        );
-        register_pci_netdev(child.clone(), tx_cons, false);
-        Ok(child as Arc<dyn WirelessNetIface>)
+        pci_virtual_publish(parent, requested_name, iftype, requested_mac, vdev_id)
     })();
     if result.is_err() {
         parent.shared.release_vdev(vdev_id);
     }
     result
+}
+
+// Keep slot-preparation temporaries out of the MAC/netdev construction
+// frame. The caller still owns reservation rollback on every error.
+#[inline(never)]
+fn pci_virtual_publish(
+    parent: &PciNetdev,
+    requested_name: &str,
+    iftype: u32,
+    requested_mac: Option<[u8; 6]>,
+    vdev_id: u32,
+) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+    let lifecycle = parent
+        .virtual_lifecycle
+        .clone()
+        .ok_or(WirelessError::NotSupported)?;
+    let config = parent.mac.try_lock().ok_or(WirelessError::Busy)?.config();
+    // The physical radio may have completed a firmware recovery since
+    // its root netdev was registered.  Read the live capability and
+    // regulatory snapshots rather than a registration-time copy before
+    // building a later virtual vdev.  The caps are the parent's
+    // radio's, not pdev 0's (a radio-1 parent's child would
+    // otherwise come up with radio-0 bands/chains).
+    let (mut caps, reg_info) = {
+        let rt = parent.shared.try_lock().ok_or(WirelessError::Busy)?;
+        let caps = if parent.pdev_id == 0 {
+            rt.device_caps()
+        } else {
+            rt.device_caps_for(parent.pdev_id)
+        }
+        .map_err(|_| WirelessError::HardwareError)?;
+        (caps, rt.core.reg_info.clone())
+    };
+    let name = Box::leak(alloc::string::String::from(requested_name).into_boxed_str());
+    let mac_addr = requested_mac.unwrap_or_else(|| virtual_mac(parent.mac_addr, vdev_id));
+    caps.mac_addr = mac_addr;
+    // Retain the large MAC in transient heap storage while preparing
+    // the child allocation and registry state.
+    let mac = Box::new(Mac::new(
+        Port(parent.shared.clone(), vdev_id, parent.pdev_id),
+        Port(parent.shared.clone(), vdev_id, parent.pdev_id),
+        caps,
+        config.with_vdev(vdev_id),
+        reg_info.as_deref(),
+    ));
+    let (child, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
+        name,
+        parent.shared.clone(),
+        *mac,
+        mac_addr,
+        netdev_sinks(),
+        vdev_id,
+        iftype,
+        Some(lifecycle),
+    );
+    register_pci_netdev(child.clone(), tx_cons, false);
+    Ok(child as Arc<dyn WirelessNetIface>)
 }
 
 fn pci_virtual_delete(dev: &PciNetdev) -> Result<(), WirelessError> {

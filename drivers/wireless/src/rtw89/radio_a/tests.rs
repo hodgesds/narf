@@ -188,12 +188,13 @@ fn calibration() -> factory_a::Calibration {
 
 /// `rtw8852a_power_trim` is the pure tail of the owner recipe:
 /// `__thm_setting` (0x1f mask, not C's 0x0e) then PA bias TXG/TXA.
+/// Raw 0x1e retains bit4 through the shift, producing 0xf rather than 0x7.
 fn smoke_rtw89_a_power_trim_writes_follow_rtw8852a() -> TestResult {
     let writes = power_trim_writes(&calibration());
     if writes
         != vec![
             (0, 0x43, 0xf_0000, 0xd),
-            (1, 0x43, 0xf_0000, 0x7),
+            (1, 0x43, 0xf_0000, 0xf),
             (0, 0x60, 0xf000, 0xa),
             (0, 0x60, 0xf_0000, 0x5),
             (1, 0x60, 0xf000, 0xc),
@@ -271,7 +272,7 @@ fn smoke_rtw89_a_owner_prepare_controls_then_prepare() -> TestResult {
     }
     // Power trim landed in the RF pages: TM2 OFF then BIASA TXG/TXA.
     if io.rf[0][0x43] != 0xd0000
-        || io.rf[1][0x43] != 0x70000
+        || io.rf[1][0x43] != 0xf0000
         || io.rf[0][0x60] != 0x5a000
         || io.rf[1][0x60] != 0x3c000
     {

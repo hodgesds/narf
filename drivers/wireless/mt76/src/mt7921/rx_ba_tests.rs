@@ -1027,31 +1027,75 @@ kernel_test_in!(
 
 /// Per-link recipient BA records: Linux mt76_connac_mcu_sta_ba ->
 /// mt76_connac_mcu_alloc_sta_req stamps `bss_idx = mvif->idx`, `wlan_idx`
-/// and `muar_idx = omac_idx`; every TLV byte after the header is the same.
+/// and `muar_idx = omac_idx`; alloc_wtbl_req independently stamps the same
+/// peer WCID in its nested request header. Remaining TLV bytes stay exact.
 fn link_headers() -> Result<(), &'static str> {
     use crate::mt7921::vif_slots::{on_bss, Link, Vif};
     let request = super::super::ba::Request::parse(&request_frame(3, 10, 32, 0), 64)
         .ok_or("ADDBA request")?;
     let group = Link::new(Vif::new(1).map_err(|_| "vif")?, 2).map_err(|_| "link")?;
-    for (home, link) in [
-        (
-            request.wtbl(Link::HOME, AP, true),
-            request.wtbl(group, AP, true),
-        ),
-        (
-            request.station(Link::HOME, true),
-            request.station(group, true),
-        ),
-        (
-            request.wtbl(Link::HOME, AP, false),
-            request.wtbl(group, AP, false),
-        ),
-    ] {
-        if home[..8] != [0, 1, 1, 0, 1, 0, 0, 0]
-            || link[..8] != [1, 2, 1, 0, 1, 1, 0, 0]
-            || home[8..] != link[8..]
-        {
-            return Err("per-link BA STA_REC header");
+    let originator = super::super::tx_ba::Agreement::default();
+    for enable in [false, true] {
+        for (home, link) in [
+            (
+                request.station(Link::HOME, enable),
+                request.station(group, enable),
+            ),
+            (
+                originator.station(Link::HOME, enable),
+                originator.station(group, enable),
+            ),
+        ] {
+            if home[..8] != [0, 1, 1, 0, 1, 0, 0, 0]
+                || link[..8] != [1, 2, 1, 0, 1, 1, 0, 0]
+                || home[8..] != link[8..]
+            {
+                return Err("per-link BA STA_REC header");
+            }
+        }
+        for (vif, peer) in [(1, 2), (3, 14)] {
+            let link =
+                Link::new(Vif::new(vif).map_err(|_| "BA vif")?, peer).map_err(|_| "BA peer")?;
+            for (home, actual, recipient) in [
+                (
+                    request.wtbl(Link::HOME, AP, enable),
+                    request.wtbl(link, AP, enable),
+                    true,
+                ),
+                (
+                    originator.wtbl(Link::HOME, enable),
+                    originator.wtbl(link, enable),
+                    false,
+                ),
+            ] {
+                // Linux alloc_sta_req + alloc_wtbl_req use the same wcid;
+                // WTBL_SET2, one nested WTBL_BA. HOME remains WCID1.
+                let mut expected = [
+                    vif, peer, 1, 0, 1, vif, 0, 0, 13, 0, 40, 0, peer, 2, 1, 0, 0, 0, 0, 0, 8, 0,
+                    28, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ];
+                if recipient {
+                    expected[24] = 3;
+                    expected[25] = 2;
+                    expected[32] = if enable { 32 } else { 0 };
+                    expected[34..40].copy_from_slice(&AP);
+                    expected[40] = 3;
+                    expected[42] = 1;
+                } else {
+                    expected[30] = u8::from(enable);
+                }
+                if actual != expected || home[12..16] != [1, 2, 1, 0] {
+                    return Err("literal non-home TX/RX WTBL outer/nested peer or BA fields");
+                }
+                let mut expected_home = expected;
+                expected_home[0] = 0;
+                expected_home[1] = 1;
+                expected_home[5] = 0;
+                expected_home[12] = 1;
+                if home != expected_home {
+                    return Err("HOME TX/RX WTBL bytes changed");
+                }
+            }
         }
     }
     let rlm = [0x5a; 20];

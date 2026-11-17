@@ -60,7 +60,8 @@ impl<F: SdioFunction> SdioTransport<F> {
             if !original.lifecycle()
                 || software.channel != 0
                 || bcdc.status != 0
-                || bcdc.flags & !(bcdc_flag::ID_MASK | bcdc_flag::SET) != 0
+                || bcdc.flags & !(bcdc_flag::ID_MASK | bcdc_flag::IF_MASK | bcdc_flag::SET) != 0
+                || bcdc.if_idx() != original.interface_index()
                 || bcdc.len > super::super::runtime::MAX_CONTROL as u32
                 || logical - 28 != (bcdc.len as usize).min(1502)
             {
@@ -70,7 +71,8 @@ impl<F: SdioFunction> SdioTransport<F> {
             || software.channel != 2
             || packet[12] != 0x20
             || packet[13] > 7
-            || packet[14..16] != [0, 0]
+            || packet[14] != original.interface_index()
+            || packet[15] != 0
             || !original.transmit(&packet[16..logical])
         {
             return Err(TransportError::BadFraming);

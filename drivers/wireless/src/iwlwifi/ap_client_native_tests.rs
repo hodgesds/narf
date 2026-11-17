@@ -1,6 +1,34 @@
 //! Actual original CLIENT8/STA7, retained peer P2P IEs and MAC CTWindow ACK.
 use super::*;
 use crate::iwlwifi::p2p_client_fixture as p2p;
+/// A quiet wire round can still retain MAC7 control or a receive prefix.
+/// This RAM target has no IRQ: poll that actual owner across its Activity
+/// timer instead of declaring completion before its native receipt. Keep
+/// the shared fixture's 32-round bound and every production deadline.
+fn flush() -> R {
+    for _ in 0..32 {
+        let progress = drain();
+        let (device, error) = {
+            let h = HARNESS.lock();
+            let (device, wire) = h.as_ref().ok_or("CLIENT drain fixture absent")?;
+            (device.clone(), wire.error)
+        };
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let control = device.control.try_lock().is_none_or(|slot| slot.is_some());
+        let pending = device.state.try_lock().is_none_or(|state| {
+            state.hardware.client_filter_pending()
+                || state.hardware.has_pending_rx()
+                || !state.hardware.notifications.is_empty()
+        });
+        if !progress && !control && !pending {
+            return Ok(());
+        }
+        management_wait_tick();
+    }
+    Err("CLIENT native packet/maintenance drain did not become idle")
+}
 fn data() -> Vec<u8> {
     let mut out = NETWORK.bssid.to_vec();
     out.extend_from_slice(&OWN);
@@ -38,23 +66,49 @@ fn send(f: &Fixture, window: u32) -> R {
     f.device()
         .enqueue(&data(), narf_net::TxMeta::default())
         .map_err(|_| "P2P client real DATA enqueue")?;
-    flush()?;
-    let (sent, last) = {
-        let h = HARNESS.lock();
-        let wire = &h.as_ref().unwrap().1;
-        (
-            wire.data.len(),
-            wire.commands
-                .iter()
-                .rev()
-                .find(|(g, c, b)| (*g, *c) == (3, 8) && word(b, 8) == 7)
-                .map(|(_, _, b)| word(b, 48)),
-        )
+    let native = {
+        let state = f.device().state.try_lock().ok_or("CLIENT DATA State")?;
+        state
+            .hardware
+            .p2p_client_native()
+            .ok_or("CLIENT DATA native role")?
     };
-    require(
-        sent > before && last == Some(window),
-        "P2P client DATA crossed an unacknowledged/current CTWindow",
-    )
+    // A TX-time drain can discover the next NoA after step computed its
+    // maintenance predicate. No packet or command is published in that
+    // round: absence of immediate wire progress is not terminal idleness.
+    // Keep flush's32-round bound while driving the actual retained owner.
+    for _ in 0..32 {
+        drain();
+        let (sent, last, error) = {
+            let h = HARNESS.lock();
+            let wire = &h.as_ref().unwrap().1;
+            (
+                wire.data.len(),
+                wire.commands
+                    .iter()
+                    .rev()
+                    .find(|(g, c, b)| (*g, *c) == (3, 8) && word(b, 8) == 7)
+                    .map(|(_, _, b)| word(b, 48)),
+                wire.error,
+            )
+        };
+        if let Some(error) = error {
+            return Err(error);
+        }
+        require(
+            sent == before || !native.pending(),
+            "P2P client DATA published while actual CTWindow receipt pending",
+        )?;
+        if sent > before {
+            return require(
+                last == Some(window),
+                "P2P client DATA crossed an unacknowledged/current CTWindow",
+            );
+        }
+        // RAM target has no IRQ; the real command future awaits1ms Activity.
+        management_wait_tick();
+    }
+    Err("P2P client DATA crossed an unacknowledged/current CTWindow")
 }
 #[inline(never)]
 fn public_frame(f: &Fixture, frame: &[u8], both: bool, success: bool) -> R {
@@ -105,6 +159,7 @@ fn public_frame(f: &Fixture, frame: &[u8], both: bool, success: bool) -> R {
         if done {
             break;
         }
+        management_wait_tick();
     }
     let after = HARNESS.lock().as_ref().unwrap().1.client_public.len();
     require(
@@ -155,6 +210,7 @@ fn register_kind(f: &Fixture, both: bool, probe: bool) -> R {
         if done {
             break;
         }
+        management_wait_tick();
     }
     require(
         done,
@@ -582,6 +638,7 @@ fn profiles() -> R {
     Ok(())
 }
 fn smoke_iwl_p2p_client_sc_bz_api89_real_station7_peer_ie_noa_and_key_data() -> TestResult {
+    let _executor = ExecutorFixture::new();
     profiles().map_or_else(TestResult::Fail, |_| TestResult::Pass)
 }
 kernel_test_in!(
@@ -680,6 +737,7 @@ fn refusals() -> R {
     receive_retirement()
 }
 fn smoke_iwl_p2p_client_original_request_role_and_current_policy_refuse_before_rf() -> TestResult {
+    let _executor = ExecutorFixture::new();
     check(refusals)
 }
 kernel_test_in!(

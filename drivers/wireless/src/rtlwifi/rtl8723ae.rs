@@ -6,7 +6,8 @@
 //! (`hal_btc.c` + `hal_bt_coexist.c`). Probe admits it under qualification
 //! (qualified 8723-series version with `BT_FUNC`, provisioned EFUSE map
 //! whose MAC is the factory identity); its firmware owner runs
-//! `run_8723ae`. Station admission (`prepare_rtl8723ae`,
+//! `run_8723ae`, retaining cold MAC/LLT and BB/RF setup across firmware
+//! download without opening packet DMA/MAC gates. Station admission (`prepare_rtl8723ae`,
 //! `prepare::Chip::Rtl8723ae`, packet path) is still open.
 //!
 //! ## References (GPL-2.0; NARF is GPL-2.0-or-later)
@@ -15,6 +16,17 @@
 //! - `rtlwifi/rtl8723com/fw_common.{c,h}`
 //!
 //! ## Modules
+//!
+//! - [`init`] — retained, terminal cold initialization in source order:
+//!   LLT/MAC before firmware download, then MAC/BB/RF tables and UMC/default
+//!   programming. Factory identity, coex/IQK and calibrated TX power remain
+//!   deferred; TablesReady grants no station or emission authority.
+//! - [`tables`] — exact AE MAC/PHY/PG/AGC/RF programming data.
+//! - [`llt`] / [`mac`] — AE queue boundaries and parked MAC defaults.
+//! - [`phy`] — AE BB/RF configuration, channel/bandwidth primitives and LCK.
+//! - [`iqk`] / [`txpower`] — source IQK and factory/RF6052 preparation
+//!   owners with terminal failure handling; not invoked by firmware-only
+//!   startup or a station, and not signed emission grants.
 //!
 //! - [`version`] — `_rtl8723e_read_chip_version` (normal 8723-series parts
 //!   only), the `def.h` predicates and the `rtl8723e_init_sw_vars`
@@ -33,7 +45,7 @@
 //!   Caller: [`packet::Owner::service_c2h`], which schedules `c2h::drain`
 //!   when `irq::IsrStatus::c2h_pending` is set. It has no production
 //!   caller yet (only fixture tests): the chip is not admitted, so no IRQ
-//!   path reaches it.
+//!   station path reaches it.
 //! - [`coex`] — the 8723AE Bluetooth-coexistence owner (pass 1): board
 //!   binding, `BtInfo` ingestion, the periodical decision, and the DM
 //!   primitives (`hal_bt_coexist.c`, including the RF halves through the
@@ -55,11 +67,22 @@ pub mod coex;
 pub mod dm;
 pub mod envelope;
 pub mod fw;
+pub mod init;
+pub mod iqk;
+pub mod llt;
+pub mod mac;
 pub mod packet;
+pub mod phy;
 pub mod power;
 pub mod pwrseq;
+pub mod tables;
+pub mod txpower;
 pub mod version;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod preparation_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod runtime_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
 

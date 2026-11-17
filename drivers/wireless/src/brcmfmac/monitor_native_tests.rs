@@ -8,7 +8,9 @@ use narf_capabilities::{Cap, Invoke};
 use narf_net::raw_sock::{PacketSock, ETH_P_ALL, SOCK_RAW};
 use narf_wireless::WirelessNetIface;
 fn run<F: Future>(future: F) -> F::Output {
-    narf_scheduler::block_on(future)
+    // RAM msgbuf controls/teardown can reach real polling/reset delays.
+    // Pump them without waiting for a hardware IRQ absent from this model.
+    narf_scheduler::block_on_spin(future)
 }
 fn channel() -> narf_wireless::monitor::Channel {
     narf_wireless::monitor::Channel {

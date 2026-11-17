@@ -64,17 +64,46 @@ fn current() -> Arc<CurrentPolicy> {
 
 #[inline(never)]
 fn radio(associated: bool, secure: bool) -> Result<NativeSession, &'static str> {
+    let policy = current();
     let mut session = if associated {
-        joined(secure)?
+        let (mut session, bss) = super::super::ht20_tests::prepared(6, secure);
+        // Install the independent current snapshot before real MLME/RSNA.
+        // Replacing an arbitrary suite-global applied policy after joining
+        // can select the AP's HT40 preference during regulatory service,
+        // which correctly refuses the old fixture's HT20-only operation.
+        session.backend.tx_policy = Some(policy.clone());
+        run(Box::pin(session.associate_station(
+            &bss,
+            b"narf",
+            if secure {
+                crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] }
+            } else {
+                crate::mt7921::association::Security::Open
+            },
+            test_permission(),
+            &[],
+        )))
+        .map_err(|_| "NLO genuine station fixture")?;
+        let snapshot = policy.database.snapshot().ok_or("NLO current snapshot")?;
+        if session
+            .station
+            .applied_policy
+            .as_ref()
+            .is_none_or(|applied| !Arc::ptr_eq(applied, &snapshot))
+        {
+            return Err("NLO join did not retain its exact independent policy");
+        }
+        session
     } else {
-        let mut session = Box::new(Session::new(Model::new(), firmware(32)));
+        let mut backend = Model::new();
+        backend.tx_policy = Some(policy);
+        let mut session = Box::new(Session::new(backend, firmware(32)));
         run(session.run()).map_err(|_| "NLO firmware fixture")?;
         run(session.initialize_radio()).map_err(|_| "NLO actual radio identity")?;
-        session.backend.pm.dma_enabled = true;
         session
     };
+    session.backend.pm.dma_enabled = true;
     session.backend.pm.wow.route_available = true;
-    session.backend.tx_policy = Some(current());
     Ok(session)
 }
 

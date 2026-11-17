@@ -783,6 +783,11 @@ impl Session {
         }
         open_epoch(hw, self.epoch, &self.peers, self.own, self.plan.channel).await
     }
+    /// Queue identity is metadata; the native send still checks the original
+    /// hardware owner, current role/key/port, and the exact queue binding.
+    pub(in crate::iwlwifi) fn owns_go_group_queue(&self, queue: u16) -> bool {
+        self.plan.go.is_some() && self.mcast == queue
+    }
     pub(in crate::iwlwifi) fn protect_go_group(
         &mut self,
         frame: &mut Vec<u8>,

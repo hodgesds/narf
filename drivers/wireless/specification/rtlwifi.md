@@ -3406,7 +3406,7 @@ cover literal Cisco/default values, strict direction boundaries and wraparound,
 vendor bounds/window/precedence, actual RX/TX accounting, LPS suppression
 and failed-access handling. Silicon validation remains pending.
 
-### RTL8723AE retained runtime (probe-admitted; station admission open)
+### RTL8723AE retained runtime (native cold setup; station admission open)
 
 `rtl8723ae/` + `rtl8723ae.rs` port Linux `rtl8723ae` and the `rtl8723com`
 pieces it uses (PCI `0x8723`, 1T1R 2.4 GHz HT with Bluetooth; the
@@ -3460,19 +3460,48 @@ is the factory identity — and retains the firmware owner, which runs
   `~WINTINI_RDY` with no 8051 reset, `WINTINI_RDY` over 1001 reads x 5 ms.
   A failed `rtl8723_fw_free_to_go` is an error here (Linux returns 0).
   `firmware_transport::Owner` admits `0x8723` (`run_8723ae`, 6 s bound):
-  identify before any write, `power::post_flow`, clear the CR DMA/MAC gates
-  (ring owner), download; only the image the measured version selects is
+  qualify version and EFUSE/autoload before writes, retain the ePHY retry
+  count, snapshot warm `CR == 0xff`, park CR DMA/MAC gates, prepare LLT/MAC,
+  download, then configure the AE MAC/BB/AGC/RF tables, UMC fixups and
+  hardware defaults. A warm MAC skips LLT as Linux does. The same boxed
+  cold owner lives under a regular async Mutex; failure/cancellation is
+  terminal before every asynchronous stage. LLT/RQPN/MAC writes never
+  replay after firmware starts. No ring base or CR enabling gate is
+  written by the cold stages. Only the measured version's image is
   accepted. Tests `smoke_rtl8723ae_chip_version_and_firmware_names`,
   `smoke_rtl8723ae_adapter_facts_bt_and_oem`,
   `smoke_rtl8723ae_firmware_header_geometry`,
   `smoke_rtl8723ae_firmware_paged_download`,
   `smoke_rtl8723ae_init_mac_post_flow_ephy`,
-  `smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow` (written,
-  unexecuted). Probe admission is justified by the composed
+  `smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow` pass in the
+  coordinated x86_64 run. Probe admission is justified by the composed
   `smoke_rtl8723ae_pci_startup_admission` (version → adapter → card-enable
   flow → post-flow power → firmware download → C2H, with clean refusals
   of a test chip, a non-BT part, an unprovisioned map and a
   wrong-signature image).
+- `init`, `llt`, `mac`, `phy`, `tables` — source cold initialization and
+  AE-specific MAC/PHY/AGC/RF/PG tables, cached original BB/RF values,
+  channel/bandwidth and LCK programs. The firmware owner reaches
+  `TablesReady`; factory MAC, coexistence tail, IQK and calibrated power
+  remain the future radio owner's work. Six new native smokes include the
+  actual `FirmwareOwner::initialize` path, pre/post-download register
+  ordering, warm LLT retention, eligibility refusal before writes, late
+  failure and cancellation. These fixtures are not physical receipts.
+  The six cold-start and four preparation cases below pass in the
+  coordinated x86_64 Wi-Fi run; aarch64 is skipped at the user's request.
+- `iqk`, `txpower` — separate preparation APIs, not native startup or
+  station callers. IQK preserves 1T1R trials/candidate selection, matrix
+  writes and ten-register recovery. `Complete` records source completion;
+  candidate `0xff` or zero TX results admit no calibrated radio. The
+  RF6052 plan decodes AE EFUSE offsets and PG groups, including BT1/BT2
+  word subtraction and per-byte clamps. Observed bytes are not replaced
+  by guessed factory defaults. Plans/raw indices carry no signed or
+  regulatory authority. Four native regressions cover source vectors,
+  register programs and terminal failure/cancellation. Native composition
+  still needs measured PA-bias byte `0x1fa`, a factory-bound radio handoff,
+  factory-capped signed grants and current-capability invocation. NAPC
+  curves need not be monotonic: lowering a selected index alone is not a
+  proof that the lower entry meets the signed ceiling.
 - `c2h` — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`,
   `hal_btc.c:1690`): header byte at `REG_C2HEVT_MSG_NORMAL` (`0x01A0`,
   id low nibble / len high nibble, sequence at `0x01A1`, body from
@@ -3665,6 +3694,19 @@ is the factory identity — and retains the firmware owner, which runs
   RX RSSI from the PHY status (`rx_pwdb_all`). Not composed: ASPM,
   and the software-LPS RF sleep/awake execution
   (`rtl_ps_set_rf_state` has no NARF primitive).
+
+  Native software LPS also needs the stack's actual requested PS state
+  and AP notification. Linux `base.c:383..389` delegates Null frames to
+  mac80211; `core.c:603..626` schedules sleep only after the PS change,
+  and `pci.c:1561..1565` marks subsequent data frames with PM. The
+  decision-only NARF beacon hook currently supplies policy placeholders;
+  they cannot authorize real sleep. A continuation must compose the
+  native Null/PM path, five-ms sleep and DTIM wake work, queue/traffic/key
+  gates and wake-before-TX/lifecycle handling with the original signed
+  radio owner. `phy.c:2273..2452` grounds the RF sleep/wake register
+  sequences, including five RF0 retries and the awake fallback. They
+  must preserve current qualification at every effect; an unconfirmed
+  restore cannot publish awake readiness or DMA retirement.
 
 ## 4. Invariants
 

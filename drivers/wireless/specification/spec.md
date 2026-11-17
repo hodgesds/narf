@@ -1816,7 +1816,11 @@ due edges without requiring an interrupt. Reset, stop and WoW cancel the
 deadlines; successful resume starts a fresh period. Current authority and
 register checks remain mandatory for every write. Profile priorities are
 copied into the weight engine; concurrent-TX enablement still requires
-RSSI and calibrated power-policy integration. The family spec §3.12 owns
+RSSI and calibrated power-policy integration. Associated-beacon RSSI now
+also drives the source fifth-weak-period AUDIO selection; association
+resets marker 127 while timer/profile pauses preserve history. The
+configured profile still determines the later no-stomp edge. FTP requires
+native network-sleep/traffic inputs. The family spec §3.12 owns
 the source timer boundaries, lifecycle and failure contract.
 
 ### 3.21 Driver construction and recovery storage
@@ -1842,6 +1846,13 @@ AHB runtime construction uses transient heap storage
 before moving the same runtime into Shared; failed registration still
 retains it. These boundaries keep compiler inlining from combining the
 large cold construction and registration frames.
+Virtual ath11k MAC construction also uses transient heap storage and a
+separate constructor boundary before publishing the child netdev.
+The ath10k RAW station State retains its Security owner in a Box, built
+at the original startup point through a synchronous constructor boundary.
+Hardware ordering, key/M4 deadlines and failed/cancelled retained ownership
+remain the same; asynchronous startup no longer carries the inline security
+construction and State-move temporaries together.
 
 ### 3.22 RTL8723BE native EDCA watchdog
 
@@ -1856,6 +1867,91 @@ enables a new PHY mode. The family specification records exact register
 values, source arithmetic/window behavior and native regression coverage.
 The chip state is boxed to keep additions out of generic packet-owner
 move/removal stack frames.
+
+### 3.23 Native preparation and retained cleanup continuation
+
+RTL8723AE firmware startup retains one boxed cold owner across warm-aware
+LLT/MAC preparation, firmware download and post-download table/default
+setup. Cancellation and access failure are terminal; DMA/MAC gates remain
+parked. Separate source IQK/RF6052 preparation owners grant no emission
+authority or station readiness. Factory-bound radio handoff, physical
+PA-bias input and factory-capped current signed grants remain prerequisites
+for native calibration/station composition.
+
+RTL8852A native channel control and the qualified power prefix produce
+only Programmed state. The existing signed full-radio identity binds the
+new program; calibrated channel/station/AP admission still requires live
+RFK inputs and completion. Hardware TX-path bounds also constrain the
+admitted legacy-USB rate-control set: one TX path supports MCS0..7 and two
+support MCS0..15. A wider AP capability is negotiated separately; authority
+is never silently narrowed by the constructor.
+
+An already-qualified RTL8852A fragment train selects the explicit A/B
+fragment descriptor encoder before ordinary A dispatch and retains the
+actual chip identity. Ordinary emitters still refuse fragments; all native
+source, immutable-part and terminal-receipt checks precede progress.
+
+The Intel RAM test backend uses the same retained transport-stop boundary
+as production before retiring P2P state, preserving driver emission/source
+fences. The watchdog smoke isolates its executor graph with the
+existing scheduler test reset hook, so polling it cannot run retained
+workers from earlier target fixtures. No scheduler-core change is needed.
+Intel GO/client deferred-netlink smokes likewise own their executor graph
+and drive real Activity deadlines between unfinished polls. Public Intel
+association obtains its initial policy from the same selected source used
+by its transaction; only Native bootstraps the global deployment policy.
+A missing selected model database never borrows global authority.
+The response-refined client program retains its original client binding,
+including current NO_P2P checks. GO host GTK enqueue borrows the actual
+Session and requires its original hardware-owner identity and exact
+multicast queue; ordinary raw-protected bypass remains refused. Gen2
+enqueue retains admitted checksum metadata on the actual Frame until
+software completion before GTK encryption. Client target fixtures wait
+for retained native control, notifications and RX prefixes across quiet
+polls within their existing bound.
+Gen2's target model keeps the pre-MAC7 receive-prefix cookie separate
+from the later RSNA marker owner. GO receive tests retain the real
+66-record foreign NoA prefix, deny DATA in its first bounded pass, then
+verify exact delivery and repeated-PN refusal after that prefix retires.
+SC and private Intel model fixtures use their own allocated test names.
+They leave the physical adapter's cached `wlan` reservation untouched,
+so later all-family fixtures cannot reuse it between Intel tests. The
+original active-owner and physical-name vacancy checks remain in force;
+registry-revocation tests also check the unchanged private TX endpoint
+and absence of published network/wireless entries.
+MediaTek TX/RX block-ack control carries the same owned peer WCID in both
+outer STA_REC and nested WTBL requests, including disable. Group fixtures
+retain their real association, distinct MAC and current policy before
+coexistence or sleep; reply descriptors name the actual submitting peer.
+GO renewal stamps its new receive epoch into the closed backend before
+reopening current home traffic; the home floor stays intact while old GO
+copies retire.
+
+FullMAC control separates logical, physical-prefix and caller-output bounds.
+Fixed control structures may omit only zero padding beyond the bounded
+physical prefix. BCDC validates the complete advertised native response
+before returning a shorter caller prefix. Correlation, publication and
+terminal-resource checks still govern both ordinary and AP transactions.
+The CYW AP ring holds State through one final source invocation, avoiding
+recursive SDIO lifetime acquisition while retaining peer/key/epoch checks.
+Fresh primary START refreshes its original same-country station policy
+before binding the request's exact current snapshot.
+
+Timed register-model smokes use the existing spin bridge when they run
+before the BSP timer pump. APs may already have installed the global
+hrtimer programmer while the BSP has no timer interrupt; the spin bridge
+drives the actual monotonic deadlines instead of waiting for that absent
+interrupt. D3 timeouts and watchdog-reset delays retain their full duration
+and cleanup assertions. Production wait paths are unchanged.
+
+The coordinated 2026-11-17 x86_64 Wi-Fi gate passes4404/0 fail/9 expected
+physical-device skips, including the native cases above. Strict release
+library Clippy for wireless/MT76, debug checks, formatting and the stack
+gate pass. The production boot and both host btrfs postflights pass with
+persistent guest disk writes. Aarch64 is skipped at the user's request;
+calibrated readiness and physical acceptance remain the explicit gates
+described by each family. The ledgers retain13 open/94 implemented pending
+validation rows, without closing partial chip/host continuations.
 
 ## 4. Interaction with `narf-wireless`
 

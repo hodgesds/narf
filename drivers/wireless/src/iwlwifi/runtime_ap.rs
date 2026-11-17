@@ -135,6 +135,37 @@ impl Hardware {
         }
         Ok(())
     }
+    /// Host CCMP is posted only with the original live GO Session borrowed
+    /// through encryption and DMA publication. No bypass flag accepts bytes
+    /// supplied without that concrete key/PN/controlled-port owner.
+    pub(in crate::iwlwifi) fn enqueue_go_group(
+        &mut self,
+        session: &mut super::super::ap_session::Session,
+        id: u16,
+        frame: &mut Vec<u8>,
+        header: usize,
+        rate: Option<u32>,
+    ) -> Result<(), &'static str> {
+        if self.is_failed()
+            || !self
+                .ap_owner
+                .as_ref()
+                .is_some_and(|owner| alloc::sync::Arc::ptr_eq(owner, &session.proof))
+        {
+            return Err("GO host group differs from original native role owner");
+        }
+        let source = self.source_fence()?;
+        self.check_six_tx_publication()?;
+        let queue = self
+            .resources
+            .data
+            .iter_mut()
+            .find(|queue| queue.id() == Some(id))
+            .ok_or("GO host group native queue absent")?;
+        source.invoke(|| queue.send_go_group(&mut self.mmio, session, frame, header, rate))?;
+        self.count_protected(frame);
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     pub(in crate::iwlwifi) fn enqueue_transmit_ap(
         &mut self,

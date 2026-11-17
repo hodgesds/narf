@@ -1086,6 +1086,24 @@ restoration requests an immediate fresh period. An access or MMIO failure
 cancels both deadlines and fails the packet owner, suppressing later
 writes. No independent timer task can race calibration or power changes.
 
+Audio feedback follows `ath9k_mci_stomp_audio` and
+`ath_btcoex_period_timer`. The station's existing associated-beacon hook
+feeds the exact `BeaconRssi` LPF after native RX validation. Association
+resets the RSSI observation to marker 127; timer pause/resume and profile
+gaps retain the audio-period history. SCO/A2DP clears the counter above
+25, increments it at or below 25, and selects the literal AUDIO weights
+on the fifth weak period. The later no-stomp edge still uses the configured
+profile stomp, rather than the temporary AUDIO choice. Native station over
+EDMA/GPM tests cover both chips, foreign/invalid observations, literal LPF
+boundaries, lifecycle history, new-peer reset and access failure. All three
+audio cases pass in the coordinated x86_64 Wi-Fi run; physical coexistence
+and the remaining calibrated-power/NETWORK_SLEEP producers remain open.
+
+FTP feedback consumes skipped NETWORK_SLEEP time and accepted DATA counts
+in Linux. The current AR9003 owner has no native network-sleep path, so an
+elapsed awake interval does not substitute for that input. AR9565's source
+config `0xa4c1` also disables FTP stomping; AR9462's `0x2201` does not.
+
 Deliberate deviations, all documented in code: the Linux deadbeef spin
 loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
 iterations instead of looping forever on a dead card; `end_reset` does
@@ -1095,7 +1113,7 @@ answers 0.0, kept verbatim. AIC is hard-disabled in Linux
 (`ar9003_aic.c` returns false), so the AIC states read 0.
 
 Remaining: RSSI-driven concurrent-TX enablement with calibrated TX-power
-transitions, FTP/audio traffic feedback, and the native 2WIRE/3WIRE
+transitions, eligible FTP traffic feedback, and the native 2WIRE/3WIRE
 enable/init call sites. Priority values are applied to the weight engine;
 production does not yet enable concurrent TX. MCI DMA/message/IRQ/reset/channel
 and periodic-check integration, plus the WoW flag, are already wired as
@@ -2716,8 +2734,8 @@ WoW `mci_enabled` flag itself is wired at probe (§3.12). Smoke (written, not ex
 The per-chip EEPROM board values (`board.rs`, including `thermo_cal`
 and switch tables), noise limits and PCOEM calibration branches are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Remaining: MCI traffic/RSSI/power feedback, optional
-board-configuration deltas with no in-tree input, and physical acceptance.
+Remaining: MCI concurrent-TX RSSI/power transitions, network-sleep-driven
+FTP feedback, optional board-configuration deltas and physical acceptance.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
 `ar9003::Chip::Ar9485` is PCIe `0x0032`
@@ -2836,7 +2854,7 @@ WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
 `0x0034` subsystems). The per-chip EEPROM board values, noise limits,
 PCOEM calibration, saturated RX-IQ refusal and two-spur OFDM branch are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Remaining: MCI traffic/RSSI/power feedback, optional
+Remaining: MCI concurrent-TX RSSI/power transitions, optional
 board-configuration/antenna-diversity inputs and physical acceptance.
 
 **SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**

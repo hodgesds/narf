@@ -280,6 +280,9 @@ impl Agreement {
         out[0] = link.bss();
         out[1] = link.peer();
         out[5] = link.omac();
+        // alloc_wtbl_req receives the same WCID as alloc_sta_req; its
+        // nested wlan_idx_lo must name this link's peer too.
+        out[12] = link.peer();
         out[20..26].copy_from_slice(&[8, 0, 28, 0, 0, 1]);
         out[24] = self.tid;
         // mac80211's TX_OPERATIONAL callback has native SN0; no guessed

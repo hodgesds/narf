@@ -287,3 +287,6 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     mci_duty_authority_and_mmio_failure
 );
+
+#[path = "mci_audio.rs"]
+mod audio;

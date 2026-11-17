@@ -1320,7 +1320,7 @@ impl Connection {
         }
         // The response-refined native span/power is the handshake's owner;
         // a beacon received during M4 can update that same shared proof.
-        this.regulatory = if let Some(six) = &this.six {
+        let regulatory = if let Some(six) = &this.six {
             super::mld_policy::Program::new_six(
                 domain,
                 permissions,
@@ -1343,6 +1343,13 @@ impl Connection {
             .with_he(this.he.is_some())?
         }
         .with_eht(this.eht.is_some())?;
+        // Response refinement must retain the original physical client role.
+        // Every copied final policy still checks current NO_P2P, including
+        // after the association's native span and power become authoritative.
+        this.regulatory = match &this.client {
+            Some(client) => regulatory.with_client(client.plan.binding())?,
+            None => regulatory,
+        };
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {

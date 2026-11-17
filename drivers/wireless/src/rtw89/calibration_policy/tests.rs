@@ -317,7 +317,9 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
     };
     let mut model = FactoryModel {
         chip: ChipId::Rtl8852A,
-        rfe: 5,
+        // Linux rtw8852a_table.c RF headlines include RFE1/cut1;
+        // RFE5 has neither a matching headline nor an RF wildcard.
+        rfe: 1,
         cut: 1,
         trim: 255,
     };
@@ -334,7 +336,10 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
         )
         .unwrap();
         let assets = Assets::from_prepared(&image).unwrap();
-        let next = Board::new_a(&factory, device, &assets).unwrap().identity();
+        let Ok(board) = Board::new_a(&factory, device, &assets) else {
+            return TestResult::Fail("source-supported A factory/assets identity refused");
+        };
+        let next = board.identity();
         if identity == Some(next) {
             return TestResult::Fail("both A BTC ABI rows reused one calibration identity");
         }
@@ -368,6 +373,17 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
     if Board::new_a(&factory, bad_device, &assets).is_ok() {
         return TestResult::Fail("B device acquired an A board identity");
     }
+    // The static RF package cannot qualify an unsupported physical RFE.
+    // Linux phy.c:1734..1813 rejects an unmatched headline; identity
+    // binding must retain that source refusal rather than substitute RFE1.
+    model.rfe = 5;
+    let mut unsupported = Factory::default();
+    if ready(unsupported.read(&mut model)) != Some(Ok(())) {
+        return TestResult::Fail("unsupported A RFE factory fixture");
+    }
+    if Board::new_a(&unsupported, device, &assets) != Err(Error::Identity) {
+        return TestResult::Fail("unsupported A RF package acquired a calibration identity");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -385,6 +401,22 @@ pub(in crate::rtw89) fn revocable_model() -> (Calibration, Cap<FirmwareBlob, Rea
     calibration.model_domain = Some(domain());
     (calibration, cap)
 }
+/// Inert signed A calibration boundary for actual Native register tests.
+/// This creates no production attach, physical receipt or global policy.
+pub(in crate::rtw89) fn revocable_model_a() -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let board = Board {
+        device: 0x8852,
+        chip: ChipId::Rtl8852A,
+        ..board()
+    };
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N5AB");
+    let cap = authority();
+    let mut calibration = Calibration::from_verified(&bytes, Some([3; 32]), board, cap).unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+
 fn smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record() -> TestResult {
     let b = board();
     let c = Board {

@@ -33,6 +33,9 @@ struct State {
     revoke_before_command: Option<Arc<crate::brcmfmac::provision::Proof>>,
     loss_before_command: Option<[u8; 6]>,
     physical_packets: Vec<Vec<u8>>,
+    /// Observed CM3 RESETCTRL asserted-to-released edges.
+    boots: usize,
+    cm3_resets: Vec<u32>,
 }
 impl State {
     fn packet(&mut self, channel: u8, payload: &[u8]) {
@@ -177,6 +180,12 @@ impl Handle {
     pub(super) fn packets(&self) -> usize {
         self.0.lock().packets
     }
+    pub(super) fn boots(&self) -> usize {
+        self.0.lock().boots
+    }
+    pub(super) fn cm3_resets(&self) -> Vec<u32> {
+        self.0.lock().cm3_resets.clone()
+    }
     pub(super) fn drops(&self) -> usize {
         self.0.lock().drops
     }
@@ -213,6 +222,8 @@ impl Device {
             revoke_before_command: None,
             loss_before_command: None,
             physical_packets: Vec::new(),
+            boots: 0,
+            cm3_resets: Vec::new(),
         };
         state.registers.insert(0x18000000, 0x1000a9af);
         state.registers.insert(0x180000fc, 0x18100000);
@@ -226,7 +237,6 @@ impl Device {
         }
         state.registers.insert(0x18004000, 0x40);
         state.registers.insert(0x18004040, 7);
-        state.packet(0, &[]);
         let state = Arc::new(IrqSafeSpinLock::new(state));
         (Self(state.clone()), Handle(state))
     }
@@ -373,6 +383,28 @@ impl Endpoint for Device {
         for (index, bytes) in bytes.chunks_exact(4).enumerate() {
             let at = physical + index as u32 * 4;
             let value = u32::from_le_bytes(bytes.try_into().unwrap());
+            if at == 0x18114800 {
+                state.cm3_resets.push(value);
+            }
+            // The literal EROM above pairs CM3 core 0x82a with wrapper
+            // 0x18114000 (D11's wrapper is separately 0x18118000).
+            // FirmwareLoader::bring_wlan_arm_up uses Chip::reset_core,
+            // which releases RESETCTRL only after an observed assertion.
+            // A new host Runtime must obtain its initial credit from this
+            // real firmware output, not inherit the old sequence/queues.
+            if at == 0x18114800
+                && value & 1 == 0
+                && state.registers.get(&at).is_some_and(|old| old & 1 != 0)
+            {
+                state.firmware.reboot();
+                state.receive.clear();
+                state.read = 0;
+                state.transmit.clear();
+                state.sequence = 0;
+                state.credit = 16;
+                state.boots += 1;
+                state.packet(0, &[]);
+            }
             if at == CORE + 0x20 {
                 let previous = state.registers.get(&at).copied().unwrap_or(0);
                 state.registers.insert(at, previous & !value);

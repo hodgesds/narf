@@ -59,7 +59,6 @@
 10920 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
 10808 narf_drivers_wireless::rtl8xxxu::service_runtime::Service<C,B,E>::connect::{{closure}}
 10680 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::cold_start
-10568 narf_drivers_wireless::ath10k::wmi_runtime::data::<impl narf_drivers_wireless::ath10k::wmi_runtime::Radio<T>>::start_data_with_nonce_checked::{{closure}}
 10504 narf_drivers_wireless::rtw89::bootstrap::advance::{{closure}}
 10264 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::new
 10248 narf_drivers_wireless::rtw89::pci_reset::<impl narf_drivers_wireless::rtw89::startup::Startup>::claim_reset
@@ -69,7 +68,6 @@
 9896 narf_drivers_wireless::iwlwifi::mvm_device::Device::execute::{{closure}}
 9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin
 9160 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::search_config
-9064 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe
 9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
 8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
