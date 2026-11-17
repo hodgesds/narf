@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.95** (v0.95 models Nova Lake Display-35 FBC formats, its
+> Status: **v0.96** (v0.96 transcribes Nova Lake LT-PHY's complete nine-rate
+> eDP PLL table without enabling its route; v0.95 models Nova Lake Display-35 FBC formats, its
 > FP16 pixel normalizer and Wa_14025769978-safe system-cache image without
 > enabling the live route; v0.94 gives Panther, Wildcat and Nova Lake exact DMC
 > identities and enables the retained Panther/Wildcat DC service; v0.93 models
@@ -334,8 +335,9 @@ select LT PHY.
 
 `intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
-VDR write image, LT transmitter ownership/masking, and the DP 1.4/UHBR signal
-tables. `MmioWindow::has_lt_phy()` preserves Linux's exact
+VDR write image, the complete nine-rate eDP table, LT transmitter
+ownership/masking, and the DP 1.4/UHBR signal tables.
+`MmioWindow::has_lt_phy()` preserves Linux's exact
 `HAS_LT_PHY(display) == platform.novalake` boundary instead of inferring the
 PHY from display version. Its crate-private, disconnected transport serializes
 the 81 committed PLL writes through the display-35 Cx0 bus and implements Linux's three-attempt
@@ -346,6 +348,10 @@ table with committed per-lane LT `TXY_CTL{8,2,3,4}` RMWs. It does not construct
 an operational display IP. The complete disconnected DP enable/disable machine
 adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
 rate-update calibration and DDI clock-value programming in Linux source order.
+The disconnected eDP selector adds the five intermediate 216/243/324/432/675
+MHz images to the four shared 162/270/540/810 MHz DP images. Each preserves the
+source VDR config bytes and all thirteen PLL registers; no production caller
+programs them yet.
 The disconnected CDCLK model pins all 31 `xe3p_lpd_cdclk_table` rungs from
 151.2 through 787.2 MHz, including the ratio-21 squash waveforms, the 19.2 MHz
 crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. It

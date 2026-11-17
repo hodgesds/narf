@@ -4,10 +4,10 @@
 //! `platform.novalake`; Panther/Wildcat Lake remain on C10/C20. Nova Lake's
 //! A/B and Type-C TC1/TC2 ports have the LT register layout. This module
 //! contains the source-qualified portion of Linux's `intel_lt_phy.c` contract:
-//! port/register selection, DP PLL images, VDR write-image construction,
-//! transmitter ownership/masking, DP signal-level tables and the disconnected
-//! MMIO transport. A strict, read-only display-35 route proof grants no
-//! programming authority; production remains disconnected.
+//! port/register selection, DP and eDP PLL images, VDR write-image
+//! construction, transmitter ownership/masking, DP signal-level tables and
+//! the disconnected MMIO transport. A strict, read-only display-35 route proof
+//! grants no programming authority; production remains disconnected.
 //!
 //! Pinned source: the local Linux tree's
 //! `drivers/gpu/drm/i915/display/{intel_lt_phy.c,intel_lt_phy_regs.h,
@@ -200,6 +200,52 @@ impl LtDpRate {
     }
 }
 
+/// eDP rates in Linux's `xe3plpd_lt_edp_tables`, including the four shared
+/// DP 1.4 images and five eDP-only images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LtEdpRate {
+    Rbr,
+    Edp216,
+    Edp243,
+    Hbr,
+    Edp324,
+    Edp432,
+    Hbr2,
+    Edp675,
+    Hbr3,
+}
+
+impl LtEdpRate {
+    pub(crate) const fn clock_khz(self) -> u32 {
+        match self {
+            Self::Rbr => 162_000,
+            Self::Edp216 => 216_000,
+            Self::Edp243 => 243_000,
+            Self::Hbr => 270_000,
+            Self::Edp324 => 324_000,
+            Self::Edp432 => 432_000,
+            Self::Hbr2 => 540_000,
+            Self::Edp675 => 675_000,
+            Self::Hbr3 => 810_000,
+        }
+    }
+
+    pub(crate) const fn from_clock_khz(clock_khz: u32) -> Option<Self> {
+        match clock_khz {
+            162_000 => Some(Self::Rbr),
+            216_000 => Some(Self::Edp216),
+            243_000 => Some(Self::Edp243),
+            270_000 => Some(Self::Hbr),
+            324_000 => Some(Self::Edp324),
+            432_000 => Some(Self::Edp432),
+            540_000 => Some(Self::Hbr2),
+            675_000 => Some(Self::Edp675),
+            810_000 => Some(Self::Hbr3),
+            _ => None,
+        }
+    }
+}
+
 /// One internal PLL register and its big-endian VDR byte image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LtPllRegister {
@@ -370,6 +416,111 @@ const DP_UHBR20: LtPllState = LtPllState {
     data: DP_UHBR10.data,
 };
 
+const EDP_216: LtPllState = LtPllState {
+    clock_khz: 216_000,
+    config: [0xa3, 0x2d, 0x01],
+    addresses: PLL_B_ADDRESSES,
+    data: [
+        [0x00, 0x4c, 0x02, 0x00],
+        [0x03, 0xca, 0x2a, 0x20],
+        [0x80, 0x00, 0x00, 0x00],
+        [0x06, 0x04, 0x81, 0xbc],
+        [0xfa, 0x16, 0x83, 0x11],
+        [0x80, 0x0f, 0xf9, 0x53],
+        [0x84, 0x26, 0x05, 0x04],
+        [0x00, 0xe0, 0x01, 0x00],
+        [0x4b, 0x48, 0x00, 0x00],
+        [0x27, 0x08, 0x00, 0x00],
+        [0x5a, 0x13, 0x29, 0x13],
+        [0x00, 0x5b, 0xe0, 0x0a],
+        [0x00, 0x00, 0x00, 0x00],
+    ],
+};
+
+const EDP_243: LtPllState = LtPllState {
+    clock_khz: 243_000,
+    config: [0xab, 0x2d, 0x01],
+    addresses: PLL_B_ADDRESSES,
+    data: [
+        [0x00, 0x4c, 0x02, 0x00],
+        [0x03, 0xca, 0x2f, 0x60],
+        [0xb0, 0x00, 0x00, 0x00],
+        [0x06, 0x04, 0x81, 0xbc],
+        [0xfa, 0x13, 0x83, 0x11],
+        [0x80, 0x0f, 0xf9, 0x53],
+        [0x84, 0x26, 0x06, 0x04],
+        [0x00, 0xe0, 0x01, 0x00],
+        [0x47, 0x48, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00],
+        [0x5a, 0x13, 0x29, 0x13],
+        [0x00, 0x5b, 0xe0, 0x0c],
+        [0x00, 0x00, 0x00, 0x00],
+    ],
+};
+
+const EDP_324: LtPllState = LtPllState {
+    clock_khz: 324_000,
+    config: [0xb3, 0x2d, 0x01],
+    addresses: PLL_B_ADDRESSES,
+    data: [
+        [0x00, 0x4c, 0x02, 0x00],
+        [0x02, 0x8a, 0x2a, 0x20],
+        [0x80, 0x00, 0x00, 0x00],
+        [0x06, 0x04, 0x81, 0x28],
+        [0xfa, 0x16, 0x83, 0x11],
+        [0x80, 0x0f, 0xf9, 0x53],
+        [0x84, 0x26, 0x05, 0x04],
+        [0x00, 0xe0, 0x01, 0x00],
+        [0x4b, 0x48, 0x00, 0x00],
+        [0x27, 0x08, 0x00, 0x00],
+        [0x5a, 0x13, 0x29, 0x13],
+        [0x00, 0x5b, 0xe0, 0x0a],
+        [0x00, 0x00, 0x00, 0x00],
+    ],
+};
+
+const EDP_432: LtPllState = LtPllState {
+    clock_khz: 432_000,
+    config: [0xbb, 0x2d, 0x01],
+    addresses: PLL_B_ADDRESSES,
+    data: [
+        [0x00, 0x4c, 0x02, 0x00],
+        [0x01, 0x4d, 0x2a, 0x20],
+        [0x80, 0x00, 0x00, 0x00],
+        [0x0c, 0x04, 0x81, 0xbc],
+        [0xfa, 0x16, 0x83, 0x11],
+        [0x80, 0x0f, 0xf9, 0x53],
+        [0x84, 0x26, 0x05, 0x04],
+        [0x00, 0xe0, 0x01, 0x00],
+        [0x4b, 0x48, 0x00, 0x00],
+        [0x27, 0x08, 0x00, 0x00],
+        [0x5a, 0x13, 0x29, 0x13],
+        [0x00, 0x5b, 0xe0, 0x0a],
+        [0x00, 0x00, 0x00, 0x00],
+    ],
+};
+
+const EDP_675: LtPllState = LtPllState {
+    clock_khz: 675_000,
+    config: [0xdb, 0x2d, 0x01],
+    addresses: PLL_B_ADDRESSES,
+    data: [
+        [0x00, 0x4c, 0x02, 0x00],
+        [0x01, 0x4a, 0x2b, 0xe0],
+        [0x90, 0x00, 0x00, 0x00],
+        [0x06, 0x04, 0x80, 0xa8],
+        [0xfa, 0x15, 0x83, 0x11],
+        [0x80, 0x0f, 0xf9, 0x53],
+        [0x84, 0x26, 0x06, 0x04],
+        [0x00, 0xe0, 0x01, 0x00],
+        [0x49, 0x48, 0x00, 0x00],
+        [0x27, 0x08, 0x00, 0x00],
+        [0x5a, 0x13, 0x29, 0x13],
+        [0x00, 0x57, 0xe0, 0x0c],
+        [0x00, 0x00, 0x00, 0x00],
+    ],
+};
+
 pub(crate) const fn dp_pll_state(rate: LtDpRate) -> &'static LtPllState {
     match rate {
         LtDpRate::Rbr => &DP_RBR,
@@ -379,6 +530,23 @@ pub(crate) const fn dp_pll_state(rate: LtDpRate) -> &'static LtPllState {
         LtDpRate::Uhbr10 => &DP_UHBR10,
         LtDpRate::Uhbr13_5 => &DP_UHBR13_5,
         LtDpRate::Uhbr20 => &DP_UHBR20,
+    }
+}
+
+/// Exact `xe3plpd_lt_edp_tables` selection. The common 162/270/540/810 MHz
+/// entries intentionally reuse the DP images; the intermediate eDP rates use
+/// their own config byte and PLL data.
+pub(crate) const fn edp_pll_state(rate: LtEdpRate) -> &'static LtPllState {
+    match rate {
+        LtEdpRate::Rbr => &DP_RBR,
+        LtEdpRate::Edp216 => &EDP_216,
+        LtEdpRate::Edp243 => &EDP_243,
+        LtEdpRate::Hbr => &DP_HBR,
+        LtEdpRate::Edp324 => &EDP_324,
+        LtEdpRate::Edp432 => &EDP_432,
+        LtEdpRate::Hbr2 => &DP_HBR2,
+        LtEdpRate::Edp675 => &EDP_675,
+        LtEdpRate::Hbr3 => &DP_HBR3,
     }
 }
 
@@ -1542,6 +1710,46 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_nvl_lt_phy_dp_pll_images
+    );
+
+    fn smoke_nvl_lt_phy_edp_pll_images() -> TestResult {
+        let expected = [
+            (LtEdpRate::Rbr, 162_000, 0x83, 0x00),
+            (LtEdpRate::Edp216, 216_000, 0xa3, 0x01),
+            (LtEdpRate::Edp243, 243_000, 0xab, 0x01),
+            (LtEdpRate::Hbr, 270_000, 0x8b, 0x00),
+            (LtEdpRate::Edp324, 324_000, 0xb3, 0x01),
+            (LtEdpRate::Edp432, 432_000, 0xbb, 0x01),
+            (LtEdpRate::Hbr2, 540_000, 0x93, 0x00),
+            (LtEdpRate::Edp675, 675_000, 0xdb, 0x01),
+            (LtEdpRate::Hbr3, 810_000, 0x9b, 0x00),
+        ];
+        for (rate, clock, config0, config2) in expected {
+            let state = edp_pll_state(rate);
+            assert_eq!(rate.clock_khz(), clock);
+            assert_eq!(state.clock_khz, clock);
+            assert_eq!(state.config, [config0, 0x2d, config2]);
+            assert_eq!(state.register(0).unwrap().address, 0x8710);
+            assert_eq!(LtEdpRate::from_clock_khz(clock), Some(rate));
+            assert!(pll_program_write(state, BOTH_LANES, LT_PLL_PROGRAM_WRITE_COUNT).is_none());
+        }
+        assert_eq!(LtEdpRate::from_clock_khz(1_000_000), None);
+        // The four ordinary DP rates are shared by pointer, not copied into
+        // subtly divergent eDP images.
+        assert!(core::ptr::eq(edp_pll_state(LtEdpRate::Rbr), &DP_RBR));
+        assert!(core::ptr::eq(edp_pll_state(LtEdpRate::Hbr), &DP_HBR));
+        assert!(core::ptr::eq(edp_pll_state(LtEdpRate::Hbr2), &DP_HBR2));
+        assert!(core::ptr::eq(edp_pll_state(LtEdpRate::Hbr3), &DP_HBR3));
+        assert_eq!(EDP_216.register(1).unwrap().data, [0x03, 0xca, 0x2a, 0x20]);
+        assert_eq!(EDP_243.register(8).unwrap().data, [0x47, 0x48, 0, 0]);
+        assert_eq!(EDP_324.register(3).unwrap().data, [0x06, 0x04, 0x81, 0x28]);
+        assert_eq!(EDP_432.register(1).unwrap().data, [0x01, 0x4d, 0x2a, 0x20]);
+        assert_eq!(EDP_675.register(11).unwrap().data, [0x00, 0x57, 0xe0, 0x0c]);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_lt_phy_edp_pll_images
     );
 
     fn smoke_nvl_lt_phy_write_image_and_transmitters() -> TestResult {
