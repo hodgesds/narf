@@ -522,6 +522,29 @@ pub(crate) const UHBR_LEVELS: [LtTxLevel; 16] = [
     level(1, 0, 2, 26, 2),
 ];
 
+/// Signal table selected by the negotiated DP encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LtSignalProtocol {
+    Dp14,
+    Uhbr,
+}
+
+pub(crate) const fn signal_level(protocol: LtSignalProtocol, index: usize) -> Option<LtTxLevel> {
+    match protocol {
+        LtSignalProtocol::Dp14 if index < DP14_LEVELS.len() => Some(DP14_LEVELS[index]),
+        LtSignalProtocol::Uhbr if index < UHBR_LEVELS.len() => Some(UHBR_LEVELS[index]),
+        LtSignalProtocol::Dp14 | LtSignalProtocol::Uhbr => None,
+    }
+}
+
+const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
+    if tx < 2 {
+        Some(0x0400 + tx as u16 * 0x0200 + register)
+    } else {
+        None
+    }
+}
+
 // ── Disconnected WCL transport ──────────────────────────────────
 //
 // These fields are the shared Cx0 message-bus encoding.  The LT P2P flow
@@ -749,6 +772,43 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         }
         Ok(())
     }
+
+    /// Program per-link-lane swing/cursor values through committed VDR RMWs.
+    pub(crate) fn program_signal_levels(
+        &self,
+        protocol: LtSignalProtocol,
+        level_indices: &[u8],
+    ) -> Result<(), Cx0Error> {
+        if level_indices.is_empty() || level_indices.len() > 4 {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let cx0 = self.cx0();
+        for (link_lane, &index) in level_indices.iter().enumerate() {
+            let phy_lane = (link_lane / 2) as u8;
+            let tx = (link_lane % 2) as u8;
+            let lane_mask = 1 << phy_lane;
+            if lane_mask & self.lanes.owned_mask() == 0 {
+                continue;
+            }
+            let level =
+                signal_level(protocol, usize::from(index)).ok_or(Cx0Error::UnsupportedRate)?;
+            let ctl8 = txy_ctl(tx, 8).ok_or(Cx0Error::ProtocolMismatch)?;
+            let ctl2 = txy_ctl(tx, 2).ok_or(Cx0Error::ProtocolMismatch)?;
+            let ctl3 = txy_ctl(tx, 3).ok_or(Cx0Error::ProtocolMismatch)?;
+            let ctl4 = txy_ctl(tx, 4).ok_or(Cx0Error::ProtocolMismatch)?;
+            cx0.rmw(
+                lane_mask,
+                ctl8,
+                0xf8,
+                (level.tx_swing_level << 4) | (level.tx_swing << 3),
+                true,
+            )?;
+            cx0.rmw(lane_mask, ctl2, 0x3f, level.pre_cursor, true)?;
+            cx0.rmw(lane_mask, ctl3, 0x3f, level.main_cursor, true)?;
+            cx0.rmw(lane_mask, ctl4, 0x3f, level.post_cursor, true)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "kernel-test")]
@@ -768,6 +828,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeLtMmio {
         regs: RefCell<BTreeMap<u64, u32>>,
+        vdr: RefCell<BTreeMap<(u8, u16), u8>>,
         transactions: RefCell<Vec<Transaction>>,
         resets: Cell<u32>,
         bad_ack: Cell<bool>,
@@ -778,6 +839,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 regs: RefCell::new(BTreeMap::new()),
+                vdr: RefCell::new(BTreeMap::new()),
                 transactions: RefCell::new(Vec::new()),
                 resets: Cell::new(0),
                 bad_ack: Cell::new(false),
@@ -846,7 +908,18 @@ mod tests {
             }
 
             let address = (value & 0x0fff) as u16;
+            let command = value & P2M_COMMAND_MASK;
+            if command == 0x3 << 27 {
+                let data = *self.vdr.borrow().get(&(lane, address)).unwrap_or(&0);
+                self.regs.borrow_mut().insert(off, 0);
+                self.regs.borrow_mut().insert(
+                    off + 8,
+                    P2M_RESPONSE_READY | (0x4 << 27) | (u32::from(data) << M2P_DATA_SHIFT),
+                );
+                return;
+            }
             let data = ((value >> M2P_DATA_SHIFT) & 0xff) as u8;
+            self.vdr.borrow_mut().insert((lane, address), data);
             self.transactions.borrow_mut().push(Transaction {
                 lane,
                 address,
@@ -1002,6 +1075,19 @@ mod tests {
         assert_eq!(DP14_LEVELS[9], level(0, 3, 0, 48, 0));
         assert_eq!(UHBR_LEVELS[0], level(0, 0, 0, 48, 0));
         assert_eq!(UHBR_LEVELS[15], level(1, 0, 2, 26, 2));
+        assert_eq!(
+            signal_level(LtSignalProtocol::Dp14, 9),
+            Some(DP14_LEVELS[9])
+        );
+        assert_eq!(signal_level(LtSignalProtocol::Dp14, 10), None);
+        assert_eq!(
+            signal_level(LtSignalProtocol::Uhbr, 15),
+            Some(UHBR_LEVELS[15])
+        );
+        assert_eq!(signal_level(LtSignalProtocol::Uhbr, 16), None);
+        assert_eq!(txy_ctl(0, 8), Some(0x0408));
+        assert_eq!(txy_ctl(1, 4), Some(0x0604));
+        assert_eq!(txy_ctl(2, 2), None);
         TestResult::Pass
     }
     kernel_test_in!(
@@ -1097,5 +1183,37 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_wcl_lt_phy_transport_rejects_family_and_bad_ack
+    );
+
+    fn smoke_wcl_lt_phy_transport_programs_signal_levels() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        phy.program_signal_levels(LtSignalProtocol::Dp14, &[1, 9, 0, 6])
+            .unwrap();
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0408)).copied(), Some(0x18));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0403)).copied(), Some(24));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0404)).copied(), Some(3));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0608)).copied(), Some(0x30));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0603)).copied(), Some(48));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x0403)).copied(), Some(21));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x0603)).copied(), Some(39));
+        assert_eq!(
+            phy.program_signal_levels(LtSignalProtocol::Dp14, &[10]),
+            Err(Cx0Error::UnsupportedRate)
+        );
+
+        let alt2 = FakeLtMmio::default();
+        let phy2 = LtPhy::new(&alt2, WclLtPort::Tc2, true, 2, false).unwrap();
+        phy2.program_signal_levels(LtSignalProtocol::Uhbr, &[15, 0])
+            .unwrap();
+        assert_eq!(alt2.vdr.borrow().get(&(0, 0x0402)).copied(), Some(2));
+        assert_eq!(alt2.vdr.borrow().get(&(0, 0x0403)).copied(), Some(26));
+        assert_eq!(alt2.vdr.borrow().get(&(0, 0x0404)).copied(), Some(2));
+        assert!(alt2.vdr.borrow().keys().all(|(lane, _)| *lane == 0));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_wcl_lt_phy_transport_programs_signal_levels
     );
 }

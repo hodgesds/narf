@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.82** (v0.81 plus Wildcat Lake's disconnected LT-PHY TC1/TC2
-> VDR and retrying P2P transmitter transport; its DP PLL/write-image,
+> Status: **v0.83** (v0.82 plus Wildcat Lake's source DP 1.4/UHBR
+> per-lane swing/cursor programming; its disconnected LT-PHY TC1/TC2 VDR
+> and retrying P2P transmitter transport; its DP PLL/write-image,
 > transmitter-ownership and DP 1.4/UHBR signal models,
 > while every display-30.02 output route remains fail-closed; the pure Wildcat
 > Lake three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings;
@@ -308,7 +309,9 @@ tables. Its crate-private, disconnected transport serializes the 81 committed
 PLL writes through the display-30 Cx0 bus and implements Linux's three-attempt
 P2P transmitter flow, including ordinary ACK validation, bus reset on failure,
 the 150 us settle bound and P2P-ready clearing. Fake-MMIO fixtures are its only
-caller. It does not construct `DisplayIp::WildcatLake`; display 30.02 remains a
+caller. The same disconnected transport applies the selected DP 1.4 or UHBR
+table with committed per-lane LT `TXY_CTL{8,2,3,4}` RMWs. It does not construct
+`DisplayIp::WildcatLake`; display 30.02 remains a
 typed route refusal pending the LT-PHY power/clock sequence and output policy.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a

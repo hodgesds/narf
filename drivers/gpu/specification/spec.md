@@ -415,7 +415,8 @@ LT-PHY boundary: exact RBR-through-UHBR20 DP PLL/VDR images, transmitter
 ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
 executes those images only for a display-30-qualified window and implements the
 retrying LT P2P transmitter transaction with ACK/error validation and bounded
-settling; only fake-MMIO fixtures call it. It is not an operational route.
+settling, plus source DP 1.4/UHBR per-lane swing/cursor RMWs; only fake-MMIO
+fixtures call it. It is not an operational route.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
