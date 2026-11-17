@@ -1905,8 +1905,13 @@ kernel_test_in!("drivers/gpu/intel_gpu_oa", smoke_oa_query_units_with_oam);
 
 fn smoke_oa_sysfs_telemetry_and_status() -> TestResult {
     use narf_filesystem::sysfs::Kobject;
-    let card = Kobject::new_root("card47");
-    install_metrics_for_test(47, &card);
+    // Card 33: the OA config registry is per-card for the device lifetime
+    // and never cleared by teardown, so this test needs a card no earlier
+    // test in the boot registered a config on. Card 47 was taken by the
+    // mmap test (uuid(1)), which made the `oa_configs: 0` assertion below
+    // fail; cards 0-34 have no OA use crate-wide (see #2175).
+    let card = Kobject::new_root("card33");
+    install_metrics_for_test(33, &card);
 
     let oa = card.get_child("oa").expect("oa child exists");
     let status = oa.attr_show("oa_status").expect("oa_status attr");
