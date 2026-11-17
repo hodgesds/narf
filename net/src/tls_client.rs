@@ -60,8 +60,8 @@ use crate::tls::{
     ALERT_UNSUPPORTED_CERTIFICATE, CIPHER_TLS_AES_128_GCM_SHA256,
     CIPHER_TLS_CHACHA20_POLY1305_SHA256, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
     CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE, EXT_COOKIE, EXT_EARLY_DATA,
-    EXT_EXTENDED_MASTER_SECRET, EXT_KEY_SHARE, EXT_PSK_KEY_EXCHANGE_MODES, EXT_RECORD_SIZE_LIMIT,
-    EXT_RENEGOTIATION_INFO, EXT_SERVER_NAME, EXT_SIGNATURE_ALGORITHMS, EXT_SUPPORTED_GROUPS,
+    EXT_KEY_SHARE, EXT_PSK_KEY_EXCHANGE_MODES, EXT_RECORD_SIZE_LIMIT, EXT_RENEGOTIATION_INFO,
+    EXT_SERVER_NAME, EXT_SESSION_TICKET, EXT_SIGNATURE_ALGORITHMS, EXT_SUPPORTED_GROUPS,
     EXT_SUPPORTED_VERSIONS, GROUP_X25519, HRR_RANDOM, HS_CERTIFICATE, HS_CERTIFICATE_REQUEST,
     HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_KEY_UPDATE, HS_MESSAGE_HASH,
     HS_NEW_SESSION_TICKET, HS_SERVER_HELLO, MAX_PLAINTEXT_LEN, SIG_ECDSA_SECP256R1_SHA256,
@@ -347,9 +347,8 @@ pub struct ClientConfig<'a> {
     /// Offer `renegotiation_info` (fixture seam only). Production:
     /// `false`.
     pub offer_renegotiation_info: bool,
-    /// Offer `extended_master_secret` (fixture seam only). Production:
-    /// `false`.
-    pub offer_extended_master_secret: bool,
+    /// Offer `session_ticket` (fixture seam only — the RFC 8448 §3 trace includes an empty session_ticket extension, type 35, OpenSSL's session-ticket indication). Production: `false`.
+    pub offer_session_ticket: bool,
 }
 
 impl<'a> ClientConfig<'a> {
@@ -377,7 +376,7 @@ impl<'a> ClientConfig<'a> {
             offer_psk_modes: false,
             record_size_limit: None,
             offer_renegotiation_info: false,
-            offer_extended_master_secret: false,
+            offer_session_ticket: false,
         }
     }
 }
@@ -605,7 +604,7 @@ fn build_client_hello_inner(
         push_ext(&mut exts, EXT_SERVER_NAME, &v);
     }
     // Extension order follows the RFC 8448 §3 trace (server_name,
-    // renegotiation_info, supported_groups, extended_master_secret,
+    // renegotiation_info, supported_groups, session_ticket,
     // key_share, supported_versions, signature_algorithms,
     // psk_key_exchange_modes, record_size_limit) so the fixture
     // ClientHello reproduces the trace byte-exactly. Extension order
@@ -624,9 +623,13 @@ fn build_client_hello_inner(
         }
         push_ext(&mut exts, EXT_SUPPORTED_GROUPS, &v);
     }
-    // extended_master_secret (fixture seam only; empty).
-    if config.offer_extended_master_secret {
-        push_ext(&mut exts, EXT_EXTENDED_MASTER_SECRET, &[]);
+    // session_ticket (fixture seam only; empty — the RFC 8448 §3
+    // trace carries an empty session_ticket extension, type 35.
+    // This is NOT extended_master_secret (type 23): the trace's
+    // 0x0023 is decimal 35, and the code previously read the hex
+    // as decimal 23 and emitted the wrong type.
+    if config.offer_session_ticket {
+        push_ext(&mut exts, EXT_SESSION_TICKET, &[]);
     }
     // key_share: one X25519 entry.
     {

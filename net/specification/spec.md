@@ -1778,7 +1778,7 @@ its Ethernet driver brings up a link. References (public-only):
 ### TLS 1.3 client (`tls_client`, `tls_x25519`, `tls_x509`)
 - **RFC 8446** — TLS 1.3 (E. Rescorla, Aug 2018). §4.1.2 ClientHello
   (extension order: SNI, renegotiation_info, supported_groups,
-  extended_master_secret, key_share, supported_versions,
+  session_ticket, key_share, supported_versions,
   signature_algorithms, psk_key_exchange_modes, record_size_limit).
   §4.1.3 ServerHello + HelloRetryRequest (magic random, cookie as
   first extension, second HRR is fatal). §7.1 key schedule
