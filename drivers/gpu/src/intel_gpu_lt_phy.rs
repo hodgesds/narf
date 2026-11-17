@@ -769,18 +769,33 @@ pub(crate) const UHBR_LEVELS: [LtTxLevel; 16] = [
     level(1, 0, 2, 26, 2),
 ];
 
+pub(crate) const EDP_LEVELS: [LtTxLevel; 10] = [
+    level(1, 0, 0, 12, 0),
+    level(1, 1, 0, 13, 1),
+    level(1, 2, 0, 15, 3),
+    level(1, 3, 0, 19, 7),
+    level(1, 1, 0, 14, 0),
+    level(1, 2, 0, 16, 2),
+    level(1, 3, 0, 21, 5),
+    level(1, 2, 0, 18, 0),
+    level(1, 3, 0, 22, 4),
+    level(1, 3, 0, 26, 0),
+];
+
 /// Signal table selected by the negotiated DP encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LtSignalProtocol {
     Dp14,
     Uhbr,
+    Edp,
 }
 
 pub(crate) const fn signal_level(protocol: LtSignalProtocol, index: usize) -> Option<LtTxLevel> {
     match protocol {
         LtSignalProtocol::Dp14 if index < DP14_LEVELS.len() => Some(DP14_LEVELS[index]),
         LtSignalProtocol::Uhbr if index < UHBR_LEVELS.len() => Some(UHBR_LEVELS[index]),
-        LtSignalProtocol::Dp14 | LtSignalProtocol::Uhbr => None,
+        LtSignalProtocol::Edp if index < EDP_LEVELS.len() => Some(EDP_LEVELS[index]),
+        LtSignalProtocol::Dp14 | LtSignalProtocol::Uhbr | LtSignalProtocol::Edp => None,
     }
 }
 
@@ -1818,6 +1833,8 @@ mod tests {
         assert_eq!(DP14_LEVELS[9], level(0, 3, 0, 48, 0));
         assert_eq!(UHBR_LEVELS[0], level(0, 0, 0, 48, 0));
         assert_eq!(UHBR_LEVELS[15], level(1, 0, 2, 26, 2));
+        assert_eq!(EDP_LEVELS[0], level(1, 0, 0, 12, 0));
+        assert_eq!(EDP_LEVELS[9], level(1, 3, 0, 26, 0));
         assert_eq!(
             signal_level(LtSignalProtocol::Dp14, 9),
             Some(DP14_LEVELS[9])
@@ -1828,6 +1845,8 @@ mod tests {
             Some(UHBR_LEVELS[15])
         );
         assert_eq!(signal_level(LtSignalProtocol::Uhbr, 16), None);
+        assert_eq!(signal_level(LtSignalProtocol::Edp, 9), Some(EDP_LEVELS[9]));
+        assert_eq!(signal_level(LtSignalProtocol::Edp, 10), None);
         assert_eq!(txy_ctl(0, 8), Some(0x0408));
         assert_eq!(txy_ctl(1, 4), Some(0x0604));
         assert_eq!(txy_ctl(2, 2), None);
@@ -1959,6 +1978,15 @@ mod tests {
         assert_eq!(alt2.vdr.borrow().get(&(0, 0x0403)).copied(), Some(26));
         assert_eq!(alt2.vdr.borrow().get(&(0, 0x0404)).copied(), Some(2));
         assert!(alt2.vdr.borrow().keys().all(|(lane, _)| *lane == 0));
+
+        let panel = FakeLtMmio::default();
+        let panel_phy = LtPhy::new(&panel, LtPort::A, false, 4, false).unwrap();
+        panel_phy
+            .program_signal_levels(LtSignalProtocol::Edp, &[0, 9])
+            .unwrap();
+        assert_eq!(panel.vdr.borrow().get(&(0, 0x0403)).copied(), Some(12));
+        assert_eq!(panel.vdr.borrow().get(&(0, 0x0603)).copied(), Some(26));
+        assert_eq!(panel.vdr.borrow().get(&(0, 0x0608)).copied(), Some(0x38));
         TestResult::Pass
     }
     kernel_test_in!(
