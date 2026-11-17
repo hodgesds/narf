@@ -449,6 +449,12 @@ Its disconnected MDCLK resource image uses
 `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE` bits 20:16. The lowest CDCLK rung has
 ratio 6, or 12 when joined, so the display-20 three-bit DBUF field is never
 reused. These pure images perform no MMIO and grant no programming authority.
+The disconnected Display-35 FBC model likewise keeps its 64-bit integer and
+ARGB/ABGR FP16 formats out of the live Display-20 owner, forms the FP16-only
+1.0 pixel-normalizer image for HDR planes 1--3, and forms the 2 MiB system-
+cache image from a 4 KiB-aligned stolen-memory offset. Wa_14025769978 leaves
+cache-read-enable clear. These helpers perform no MMIO and do not enable Nova
+Lake FBC.
 `intel_gpu_dmc::DmcPlatform` keeps `Xe3Lpd`, `WildcatLake` and `Xe3pLpd`
 distinct despite their shared 0x8000 container ceiling. Display 30's DC
 service is admitted only from KMS's retained exact identity and selects
@@ -3874,6 +3880,9 @@ spawned job whose survey chunks each hold the KMS mutex and yield between
 chunks; the present path never surveys. Every session invalidates; a
 latched `present` flushes; console restore, legacy guards and recovery
 disable.
+The same module exposes disconnected Display-35 format admission,
+pixel-normalizer and system-cache images. They do not broaden the live
+Display-20 owner or perform MMIO.
 
 `intel_gpu_psr` is display 14's PSR1 and PSR2 with selective fetch:
 `Sink::read`,

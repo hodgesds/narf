@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.94** (v0.94 gives Panther, Wildcat and Nova Lake exact DMC
+> Status: **v0.95** (v0.95 models Nova Lake Display-35 FBC formats, its
+> FP16 pixel normalizer and Wa_14025769978-safe system-cache image without
+> enabling the live route; v0.94 gives Panther, Wildcat and Nova Lake exact DMC
 > identities and enables the retained Panther/Wildcat DC service; v0.93 models
 > Display 35's widened MBUS/DBUF MDCLK-ratio fields; v0.92 models its forced level-0 latency WA and linear-plane
 > watermark method 2; v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
@@ -360,6 +362,13 @@ Its disconnected MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
 and the five-bit DBUF minimum tracker at bits 20:16. The lowest clock's ratio
 is 6 and becomes 12 when MBUS is joined, which would be truncated by the
 display-20 field. The register images are pure and perform no MMIO.
+Display 35's disconnected FBC helpers preserve the source format boundary:
+the Lunar five-format set, four 64-bit integer formats, and only ARGB/ABGR
+FP16. Only the FP16 pair receives `PLANE_PIXEL_NORMALIZE_ENABLE` with the 1.0
+factor on HDR planes 1--3. The 2 MiB system-cache image uses the stolen offset
+in 4 KiB units and the range in 64 KiB units, with cache reads disabled for
+Wa_14025769978. The live FBC owner and production Nova route do not call these
+helpers.
 The DMC parser separately tags Panther (`xe3lpd_dmc.bin`), Wildcat
 (`xe3lpd_3002_dmc.bin`) and Nova (`xe3p_lpd_dmc.bin`) under their shared
 0x8000 ceiling. Panther/Wildcat KMS passes its retained exact identity and
