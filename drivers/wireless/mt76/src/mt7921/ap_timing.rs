@@ -4,20 +4,30 @@ use super::{Error, Hardware};
 const ARB: u32 = 0x820e3080;
 const STOP: u32 = 3 << 8;
 impl Hardware {
-    pub(super) fn pause_ap_timing(&mut self) -> Result<(), Error> {
-        let value = self.read(ARB)?;
-        self.write(ARB, value | STOP)?;
-        if self.read(ARB)? & STOP != STOP {
+    fn verify_ap_timing(&self, reg: u32, expected: u32, mask: u32) -> Result<(), Error> {
+        let observed = self.read(reg)?;
+        if observed & mask != expected & mask {
+            // Only failed association/retiming paths print: preserve the
+            // exact read that failed instead of perturbing normal MMIO.
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: MAC timing readback {reg:#010x}: observed={observed:#010x} expected={expected:#010x} mask={mask:#010x}"
+            );
             return Err(Error::Register);
         }
         Ok(())
     }
+
+    pub(super) fn pause_ap_timing(&mut self) -> Result<(), Error> {
+        let value = self.read(ARB)?;
+        self.write(ARB, value | STOP)?;
+        self.verify_ap_timing(ARB, STOP, STOP)
+    }
     /// Called only after the native pause and a bounded at-least1us wait.
     /// This fresh-reset AP owns MAC TX/RX; unrelated ARB bits are preserved.
     pub(super) fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error> {
-        if self.read(ARB)? & STOP != STOP {
-            return Err(Error::Register);
-        }
+        self.verify_ap_timing(ARB, STOP, STOP)?;
         let short = five || short_slot;
         let values = [
             (0x820e4090, 231 | 48 << 16),
@@ -31,24 +41,22 @@ impl Hardware {
         ];
         for (reg, value) in values {
             self.write(reg, value)?;
-            if self.read(reg)? != value {
-                return Err(Error::Register);
-            }
+            self.verify_ap_timing(reg, value, u32::MAX)?;
         }
         let cfend = self.read(0x820e2084)?;
         let rate = if short { 0x49 } else { 3 };
         self.write(0x820e2084, cfend & !0x3fff | rate)?;
-        if self.read(0x820e2084)? & 0x3fff != rate {
-            return Err(Error::Register);
-        }
+        self.verify_ap_timing(0x820e2084, rate, 0x3fff)?;
         let current = self.read(ARB)?;
         if current & STOP != STOP {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: MAC timing resume {ARB:#010x}: observed={current:#010x} expected={STOP:#010x} mask={STOP:#010x}"
+            );
             return Err(Error::Register);
         }
         self.write(ARB, current & !STOP)?;
-        if self.read(ARB)? & STOP != 0 {
-            return Err(Error::Register);
-        }
-        Ok(())
+        self.verify_ap_timing(ARB, 0, STOP)
     }
 }
