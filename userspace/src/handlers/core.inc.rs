@@ -1683,9 +1683,33 @@ fn proc_namespace_fd_from_path(
     let relative = path.strip_prefix(proc_prefix)?.strip_prefix('/')?;
     let mut components = relative.split('/');
     let process = components.next()?;
-    if components.next()? != "ns" {
-        return None;
-    }
+    let process_task = match process {
+        "self" | "thread-self" => caller,
+        visible => {
+            let inner = visible.parse::<u64>().ok()?;
+            let outer = accept_pid_from(caller, inner)?;
+            pid_to_task_raw(outer).or_else(|| linux_tid_to_task_raw(outer))?
+        }
+    };
+    let target_task = match components.next()? {
+        "ns" => process_task,
+        "task" if process != "thread-self" => {
+            let tid = components.next()?.parse::<u64>().ok()?;
+            let thread = task_of_visible_tid(tid)?;
+            // Match proc_task_lookup: a real tid from a different process
+            // must not make an otherwise nonexistent pathname usable.
+            if components.next()? != "ns"
+                || !same_thread_group(process_task, thread)
+                || crate::task::task_get(thread)?
+                    .state
+                    .load(Ordering::Acquire) == crate::task::TASK_ZOMBIE
+            {
+                return None;
+            }
+            thread
+        }
+        _ => return None,
+    };
     let flavour = match components.next()? {
         "uts" => NsFlavour::Uts,
         "net" => NsFlavour::Net,
@@ -1699,14 +1723,6 @@ fn proc_namespace_fd_from_path(
     if components.next().is_some() {
         return None;
     }
-    let target_task = match process {
-        "self" | "thread-self" => caller,
-        visible => {
-            let inner = visible.parse::<u64>().ok()?;
-            let outer = accept_pid_from(caller, inner)?;
-            pid_to_task_raw(outer)?
-        }
-    };
     namespace_fd_for_task(target_task, flavour)
 }
 

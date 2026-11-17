@@ -4934,7 +4934,9 @@ pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
 #[cfg(feature = "container")]
 pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
     use narf_filesystem::procfs::ns_tag;
-    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let task = pid_to_task_raw(pid)
+        .or_else(|| linux_tid_to_task_raw(pid))
+        .unwrap_or(pid);
     let flavour = match tag {
         ns_tag::UTS => crate::namespaces::NsFlavour::Uts,
         ns_tag::NET => crate::namespaces::NsFlavour::Net,

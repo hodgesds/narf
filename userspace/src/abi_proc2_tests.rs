@@ -3071,6 +3071,97 @@ fn tg_readlink(path: &str) -> Result<alloc::string::String, &'static str> {
     }
 }
 
+#[cfg(feature = "container")]
+fn check_thread_namespace_paths(namespaced: bool) -> TestResult {
+    use narf_filesystem::FileOps;
+    with_thread_group(namespaced, |v| {
+        narf_filesystem::procfs::install_ns_proc_hooks(
+            crate::handlers::proc_ns_readlink,
+            crate::handlers::proc_ns_mountinfo,
+            crate::handlers::proc_ns_idmap_open,
+            crate::handlers::proc_ns_idmap_owners,
+        );
+        set_task(TG_THREAD_TASK);
+        crate::namespaces::unshare_uts(TG_THREAD_TASK);
+        let result = (|| {
+            let leader = crate::handlers::namespace_fd_for_task(
+                TG_LEADER_TASK,
+                crate::namespaces::NsFlavour::Uts,
+            )
+            .ok_or("leader UTS namespace missing")?;
+            for (name, flavour) in [
+                ("pid", crate::namespaces::NsFlavour::Pid),
+                ("uts", crate::namespaces::NsFlavour::Uts),
+            ] {
+                let expected = crate::handlers::namespace_fd_for_task(TG_THREAD_TASK, flavour)
+                    .ok_or("thread namespace missing")?;
+                if name == "uts" && expected.ino() == leader.ino() {
+                    return Err("fixture did not give the thread a distinct namespace");
+                }
+                let directory = alloc::format!("/proc/{}/task/{}", v.pid, v.tid);
+                let path = alloc::format!("{directory}/ns/{name}");
+                if tg_stat_ino(&path) != Ok(expected.ino())
+                    || tg_readlink(&path)? != expected.link_text()
+                    || tg_readlink(&alloc::format!("/proc/thread-self/ns/{name}"))?
+                        != expected.link_text()
+                {
+                    return Err("thread namespace path lost its identity or reader PID view");
+                }
+                // htop holds the thread directory and calls fstatat("ns/pid").
+                let directory = alloc::format!("{directory}\0");
+                let fd = match call_open(directory.as_ptr() as u64, 0o200000) {
+                    Some(fd) if fd >= 0 => fd as u64,
+                    _ => return Err("thread directory open failed"),
+                };
+                let relative = alloc::format!("ns/{name}\0");
+                let mut stat = [0u64; 32];
+                let got = call(
+                    Syscall::Newfstatat.raw(),
+                    a3(fd, relative.as_ptr() as u64, stat.as_mut_ptr() as u64, 0),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                if got != Some(0) || stat[1] != expected.ino() {
+                    return Err("relative thread namespace stat failed or returned link inode");
+                }
+            }
+            if !namespaced {
+                let wrong_group =
+                    alloc::format!("/proc/{TG_OTHER_PID}/task/{TG_THREAD_TID}/ns/pid");
+                if tg_stat_ino(&wrong_group) != Err(Some(ENOENT)) {
+                    return Err("namespace shortcut accepted a thread from the wrong process");
+                }
+            }
+            let missing = alloc::format!("/proc/{}/task/999999/ns/pid", v.pid);
+            if tg_stat_ino(&missing) != Err(Some(ENOENT)) {
+                return Err("namespace shortcut accepted an absent thread");
+            }
+            Ok(())
+        })();
+        crate::namespaces::release_task(TG_THREAD_TASK);
+        result
+    })
+}
+
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_thread_namespace_paths() -> TestResult {
+    check_thread_namespace_paths(false)
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_thread_namespace_paths
+);
+
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_thread_namespace_paths_in_pid_namespace() -> TestResult {
+    check_thread_namespace_paths(true)
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_thread_namespace_paths_in_pid_namespace
+);
+
 /// `stat(path)` → `Ok(st_ino)` or `Err(raw return)`. `st_ino` is the second
 /// u64 of `struct stat` on both x86_64 and the generic (aarch64) layout.
 fn tg_stat_ino(path: &str) -> Result<u64, Option<i64>> {

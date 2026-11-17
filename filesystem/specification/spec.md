@@ -625,6 +625,11 @@ trailing newline, as Linux `proc_pid_wchan`. It also serves the `fd` and
 `fdinfo` directories (`tid_base_stuff`), which are the process's — a thread's
 descriptor table is its process's — so `/proc/thread-self/fd/<n>` is the link
 `/proc/self/fd/<n>` is.
+The thread directory also exposes `ns/<flavour>` and its readlink text.
+Following that magic link with stat or open uses the named thread's namespace,
+including after that thread unshares UTS state; the leader's namespace is not
+substituted. Thread IDs are translated through the reader's PID namespace and
+must belong to the process named by the path.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
