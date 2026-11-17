@@ -1873,8 +1873,13 @@ before the same no-effects refusal. `GtPlatform::ArcticSoundM` records Linux's
 DG2 platform and GuC (`i915/dg2_guc_70.bin` 70.53.0+), pre-GMD graphics/media
 12.55, DMA46/root3/VA48, Flat-CCS and exact M150=G10 / M75=G11 subplatform
 mechanics without aliasing the display-capable `Alchemist` policy identity.
-Probe still refuses before D-state/BAR/command/MMIO effects; execution waits
-for a separately qualified display-less SR-IOV lifecycle and reset owner.
+`GtPlatform::has_display()` retains Linux's descriptor fact: it is false only
+for ATS-M among the currently typed platforms. PCI validation therefore never
+inventories display planes for ATS-M, and discrete probe never reads
+`DiscreteDisplayIp`; fixtures require both paths to complete without a display
+MMIO read. Probe still refuses before D-state/BAR/command/MMIO effects;
+execution waits for a separately qualified display-less SR-IOV lifecycle and
+reset owner.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

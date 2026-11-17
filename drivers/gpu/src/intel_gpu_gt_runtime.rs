@@ -1715,7 +1715,7 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
         return Err(RuntimeError::Device);
     }
     if let Some(platform) = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
-        .filter(|platform| platform.is_discrete() && !p.smallbar)
+        .filter(|platform| platform.is_discrete() && platform.has_display() && !p.smallbar)
     {
         validate_discrete_display_idle(platform, mmio)?;
     }
@@ -1736,6 +1736,9 @@ fn validate_discrete_display_idle(
 ) -> Result<(), RuntimeError> {
     if !platform.is_discrete() {
         return Err(RuntimeError::Device);
+    }
+    if !platform.has_display() {
+        return Ok(());
     }
     let planes = if platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
         7
@@ -3872,8 +3875,10 @@ pub(crate) fn probe_discrete(
         unsafe { card.install_lmem_bar(lmem) };
     }
     let display_window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-    let discrete_display =
-        crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform).ok();
+    let discrete_display = platform
+        .has_display()
+        .then(|| crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform))
+        .and_then(Result::ok);
     let discrete_console = discrete_display
         .and_then(|_| crate::intel_gpu_xe2lpd::discrete_pipe_a_scanout(&display_window));
     let assigned = if let Some(ip) = discrete_display {
@@ -4203,6 +4208,10 @@ mod tests {
                 panic!("non-discrete inventory wrote display registers")
             }
         }
+        assert_eq!(
+            validate_discrete_display_idle(GtPlatform::ArcticSoundM, &NoRead),
+            Ok(())
+        );
         for platform in [
             GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
             GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),

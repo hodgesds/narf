@@ -1,7 +1,9 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.68** (v0.67 plus a typed, still probe-gated Arctic Sound-M
-> GT/GuC/DMA/subplatform profile and exact per-family DMA masks; serial-owned
+> Status: **v0.69** (v0.68 plus an explicit display-less Arctic Sound-M
+> descriptor that forbids display inventory and identity reads; a typed,
+> still probe-gated Arctic Sound-M GT/GuC/DMA/subplatform profile and exact
+> per-family DMA masks; serial-owned
 > Gen12 USB-C DP scanout
 > publication and exact detach withdrawal; exact fail-closed Arctic Sound-M discovery;
 > a typed, read-only census of all current
@@ -302,9 +304,11 @@ NARF's current `Alchemist` owner also implies display-capable DG2 policy and
 device-specific lifecycle policy, so ATS-M is not silently inserted there.
 `GtPlatform::ArcticSoundM` now types its pre-GMD 12.55 identity, DMA46/root3,
 DG2 GuC/cache/topology mechanics and exact M150=G10 / M75=G11 workaround
-subplatform. The exact IDs remain announced-but-gated before D-state, BAR,
-command or MMIO effects until a display-less SR-IOV lifecycle and reset owner
-is qualified.
+subplatform. Its source `has_display=false` descriptor is a separate typed
+fact: validation never inventories display planes and discrete probe never
+reads display identity for ATS-M. The exact IDs remain announced-but-gated
+before D-state, BAR, command or MMIO effects until a display-less SR-IOV
+lifecycle and reset owner is qualified.
 
 PCI DMA width is independent of PTE address capacity. The exact Linux xe
 descriptor matrix is enforced at every qualified GGTT/PPGTT publication:

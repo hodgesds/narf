@@ -253,6 +253,12 @@ impl GtPlatform {
         )
     }
 
+    /// Physical display-engine presence from the source device descriptor.
+    /// This is distinct from whether NARF has admitted a KMS route.
+    pub const fn has_display(self) -> bool {
+        !matches!(self, Self::ArcticSoundM)
+    }
+
     pub const fn is_gen12(self) -> bool {
         matches!(self, Self::Gen12(_))
     }
@@ -522,8 +528,11 @@ mod tests {
                 version: 1255,
                 step: 0,
             })
+            || !GtPlatform::ArcticSoundM.is_discrete()
+            || GtPlatform::ArcticSoundM.has_display()
+            || !GtPlatform::Alchemist.has_display()
         {
-            return TestResult::Fail("ATS-M pre-GMD graphics identity");
+            return TestResult::Fail("ATS-M pre-GMD headless graphics identity");
         }
         for (platform, bits) in [
             (GtPlatform::Gen12(Gen12Platform::TigerLake), 39),
