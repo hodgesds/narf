@@ -1196,10 +1196,18 @@ Open file descriptions retain the mount ID visible at open time, including for
 ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
 The procfs view hides mounts outside the queried task's root and projects that
 root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
-The procfs task-info hook takes a `TaskInfoQuery`: ordinary liveness,
-`stat`, `status`, `statm`, `cmdline`, and `comm` requests use allocation-free
-aggregate memory counters and leave the VMA vector empty; only `maps` and
-`numa_maps` request the potentially large per-region detail snapshot.
+The procfs task-info hook takes a `TaskInfoQuery`: liveness, inode ownership
+and `comm` use `Identity` (pid/comm/effective uid/gid only, no mm, argv, fd or
+signal snapshot); `statm` uses `Statm` (maintained mm counters and exec text
+extent only). `stat`, `status` and `cmdline` use `Basic`, whose memory fields
+use aggregate counters and whose VMA vector remains empty. `maps`
+requests only VMA metadata (`Maps`); `smaps`, `smaps_rollup`, and `numa_maps`
+request page residency/PSS/NUMA detail (`Vmas`). Maps never walks backing
+pages or reads COW refcounts. `statm` uses the aggregate virtual/resident,
+resident file/shmem, and data+stack counters, plus the exec-time main ELF
+code extent. Its shared field counts resident external RAM, not the virtual
+length of MAP_SHARED mappings or private COW sharers. NARF's current private
+file fault path allocates anonymous copies, which remain anonymous RSS.
 Every `/proc/<pid>/maps` and `smaps` header follows Linux's token grammar
 `start-end perms offset dev inode [pathname]`. Exec-published loader image
 VMAs retain their original file offset, `st_dev`/`st_ino`, and resolved

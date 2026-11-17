@@ -3991,7 +3991,7 @@ fn smoke_memory_change_perms_updates_region() -> TestResult {
             .map(|r| r.perms.contains(RegionPerms::WRITE))
             .unwrap_or(false)
     };
-    if !originally_writable {
+    if !originally_writable || a.memory_stats().data_stack_bytes != 0x1000 {
         core::mem::forget(a);
         return TestResult::Fail("initial region didn't store WRITE perm");
     }
@@ -4009,8 +4009,9 @@ fn smoke_memory_change_perms_updates_region() -> TestResult {
             .map(|r| !r.perms.contains(RegionPerms::WRITE) && r.perms.contains(RegionPerms::READ))
             .unwrap_or(false)
     };
+    let data_stack_after = a.memory_stats().data_stack_bytes;
     core::mem::forget(a);
-    if !now_readonly {
+    if !now_readonly || data_stack_after != 0 {
         return TestResult::Fail("region didn't lose WRITE after change_perms");
     }
     TestResult::Pass
@@ -16479,6 +16480,9 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
         if destination_residency != Ok(alloc::vec![1]) {
             return Err("shared Duplicate left the DESTINATION non-resident");
         }
+        if address_space.memory_stats().shared_resident_pages != 2 {
+            return Err("shared Duplicate did not count both resident file mappings");
+        }
         Ok(())
     })();
     drop(address_space);
@@ -16554,7 +16558,13 @@ fn smoke_memory_shared_relocation_splits_and_grows() -> TestResult {
             && region.perms.contains(RegionPerms::LOCKED)
             && region.phys == alloc::vec![backing[1], backing[2], PhysAddr::new(0)].into()
     });
-    if moved.is_ok() && head && removed && tail && destination_correct {
+    if moved.is_ok()
+        && head
+        && removed
+        && tail
+        && destination_correct
+        && address_space.memory_stats().shared_resident_pages == 4
+    {
         TestResult::Pass
     } else {
         TestResult::Fail("shared relocation did not preserve split/backing metadata")
@@ -16749,6 +16759,9 @@ fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
         if address_space.lookup(rollback_destination).is_some() {
             return TestResult::Fail("shared relocation rollback left destination metadata");
         }
+        if address_space.memory_stats().shared_resident_pages != 2 {
+            return TestResult::Fail("shared relocation rollback changed statm RSS");
+        }
     }
 
     // SAFETY: wrapper supplies both transactions; root/backing remain live.
@@ -16771,6 +16784,7 @@ fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
         && old_first.is_none()
         && old_second.is_none()
         && new_first == Some(first)
+        && address_space.memory_stats().shared_resident_pages == 1
         && crate::rmap::owner_count(first) == 1
         && crate::rmap::contains_owner(first, address_space.root, destination)
         && crate::rmap::owner_count(second) == 0

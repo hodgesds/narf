@@ -208,6 +208,12 @@ pub struct ProcTaskInfo {
     /// remain populated even when `vmas` was not requested.
     pub vm_size_bytes: u64,
     pub resident_pages: u64,
+    /// Linux statm shared: resident file/shmem pages, not MAP_SHARED length.
+    pub shared_resident_pages: u64,
+    /// Exec-time main program code extent, in base pages (excludes libraries).
+    pub text_pages: u64,
+    /// Linux statm data: data_vm + stack_vm, independent of the VMA query.
+    pub data_stack_bytes: u64,
     /// Linux `mm->locked_vm` — the status `VmLck:` line. stress-ng's mlock
     /// stressor parses it after every mlock (`stress_mlock_pages`), and
     /// real allocators read it to verify a lock took effect.
@@ -382,7 +388,9 @@ pub struct ProcVma {
     /// Optional Linux-style label (`[heap]`, `[stack]`, `[vdso]`).
     /// Empty for anonymous mappings.
     pub label: &'static str,
-    /// Linux MPOL_* mode and effective node mask for numa_maps.
+    /// Linux MPOL_* mode and effective node mask for numa_maps. These and
+    /// the residency fields below are populated only for TaskInfoQuery::Vmas;
+    /// metadata-only Maps queries leave them zero, not sampled.
     pub numa_policy: u32,
     pub numa_nodemask: u64,
     /// Resident 4 KiB page equivalents by node.
@@ -405,7 +413,14 @@ type ListPidsFn = fn() -> Vec<u64>;
 /// detail vector. Most `/proc/<pid>` fields need only basic metadata.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskInfoQuery {
+    /// PID liveness, comm and effective uid/gid only. No mm or fd lookup.
+    Identity,
+    /// Maintained mm counters and exec text extent only.
+    Statm,
     Basic,
+    /// VMA metadata only: no backing-page, NUMA, or PSS accounting.
+    Maps,
+    /// VMA metadata plus residency accounting for smaps/numa_maps.
     Vmas,
 }
 
@@ -488,7 +503,7 @@ pub fn current_process_id() -> u64 {
 
 /// The name (`comm`) of process `pid`, if it is alive.
 pub fn process_comm(pid: u64) -> Option<String> {
-    task_info(pid, TaskInfoQuery::Basic).map(|task| task.comm)
+    task_info(pid, TaskInfoQuery::Identity).map(|task| task.comm)
 }
 
 pub(crate) fn current_pid() -> u64 {
@@ -1745,7 +1760,7 @@ impl FileOps for ProcStaticFile {
 /// fall back to root, and so does a task we cannot resolve -- root ownership
 /// is the conservative end, denying rather than granting.
 pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
-    match task_info(pid, TaskInfoQuery::Basic) {
+    match task_info(pid, TaskInfoQuery::Identity) {
         Some(info) => (info.uid, info.gid),
         None => (0, 0),
     }
@@ -1813,13 +1828,11 @@ impl FileOps for ProcPidFile {
                     return slice_read(body.as_bytes(), offset, buf);
                 }
             }
-            let query = if matches!(
-                field,
-                PidField::Maps | PidField::NumaMaps | PidField::Smaps | PidField::SmapsRollup
-            ) {
-                TaskInfoQuery::Vmas
-            } else {
-                TaskInfoQuery::Basic
+            let query = match field {
+                PidField::Comm => TaskInfoQuery::Identity,
+                PidField::Maps => TaskInfoQuery::Maps,
+                PidField::NumaMaps | PidField::Smaps | PidField::SmapsRollup => TaskInfoQuery::Vmas,
+                _ => TaskInfoQuery::Basic,
             };
             let info = match task_info(pid, query) {
                 Some(i) => i,
@@ -2607,7 +2620,7 @@ impl DirOps for ProcRoot {
                         return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
                     }
                     if let Some(pid) = pid_resolve(n) {
-                        if task_info(pid, TaskInfoQuery::Basic).is_some() {
+                        if task_info(pid, TaskInfoQuery::Identity).is_some() {
                             return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
                         }
                     }
@@ -2656,7 +2669,7 @@ impl DirOps for ProcRoot {
                 }));
             }
             if let Some(pid) = pid_resolve(n) {
-                if task_info(pid, TaskInfoQuery::Basic).is_some() {
+                if task_info(pid, TaskInfoQuery::Identity).is_some() {
                     return Some(Arc::new(ProcPidDir { pid, thread: None }));
                 }
             }
@@ -4556,6 +4569,9 @@ fn sample_task_info() -> ProcTaskInfo {
         vmas: Vec::new(),
         vm_size_bytes: 0,
         resident_pages: 0,
+        shared_resident_pages: 0,
+        text_pages: 0,
+        data_stack_bytes: 0,
         locked_bytes: 0,
         data_bytes: 0,
         stack_bytes: 0,
@@ -4586,6 +4602,66 @@ fn sample_task_info() -> ProcTaskInfo {
         processor: 0,
     }
 }
+
+fn smoke_proc_maps_query_skips_residency() -> TestResult {
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    fn snapshot(_pid: u64, query: TaskInfoQuery) -> Option<ProcTaskInfo> {
+        LAST.store(
+            match query {
+                TaskInfoQuery::Identity => 4,
+                TaskInfoQuery::Statm => 5,
+                TaskInfoQuery::Basic => 1,
+                TaskInfoQuery::Maps => 2,
+                TaskInfoQuery::Vmas => 3,
+            },
+            Ordering::Relaxed,
+        );
+        Some(ProcTaskInfo::default())
+    }
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TASK_INFO_HOOK.store(self.0, Ordering::Release);
+        }
+    }
+    let _restore = Restore(TASK_INFO_HOOK.swap(snapshot as TaskInfoFn as usize, Ordering::AcqRel));
+    for (field, expected) in [
+        (PidField::Maps, 2),
+        (PidField::Smaps, 3),
+        (PidField::SmapsRollup, 3),
+        (PidField::NumaMaps, 3),
+        (PidField::Stat, 1),
+        (PidField::Status, 1),
+        (PidField::Comm, 4),
+    ] {
+        let file = ProcPidFile {
+            pid: 7,
+            thread: None,
+            field,
+            ino: 0,
+            rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
+        };
+        let mut buf = [0; 256];
+        if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(_)))
+            || LAST.load(Ordering::Relaxed) != expected
+        {
+            return TestResult::Fail("proc file selected the wrong metadata/residency query");
+        }
+    }
+    task_file_owners(7);
+    if LAST.load(Ordering::Relaxed) != 4 {
+        return TestResult::Fail("proc ownership lookup requested a full process snapshot");
+    }
+    let statm = pid_ext::lookup_pid_ext(7, "statm").expect("statm file exists");
+    let mut buf = [0; 128];
+    if !matches!(poll_once(statm.read(0, &mut buf)), Some(Ok(_)))
+        || LAST.load(Ordering::Relaxed) != 5
+    {
+        return TestResult::Fail("statm requested unrelated process metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_proc_maps_query_skips_residency);
 
 /// `TracerPid` and `FDSize` report live state, not constants.
 ///
@@ -4891,6 +4967,9 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         vm_size_bytes: 8192,
         locked_bytes: 0,
         resident_pages: 2,
+        shared_resident_pages: 0,
+        text_pages: 0,
+        data_stack_bytes: 0,
         data_bytes: 0,
         stack_bytes: 0,
         ppid: 2,
@@ -5003,6 +5082,9 @@ fn sample_info() -> ProcTaskInfo {
         vmas: Vec::new(),
         vm_size_bytes: 0,
         resident_pages: 0,
+        shared_resident_pages: 0,
+        text_pages: 0,
+        data_stack_bytes: 0,
         locked_bytes: 0,
         data_bytes: 0,
         stack_bytes: 0,

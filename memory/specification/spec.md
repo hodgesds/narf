@@ -991,8 +991,17 @@ impl AddressSpace {
     pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64>;
     /// Sum base-page and hardware-huge VMA spans without allocation.
     pub fn mapped_bytes(&self) -> u64;
-    /// Allocation-free mapped/resident/writable-nonexec aggregate counters.
+    /// Allocation-free mapped/resident/writable-nonexec/locked counters,
+    /// plus data+stack bytes and resident external RAM (file/shmem) pages.
+    /// Private file copies and fork COW pages are anonymous RSS; device PFNs
+    /// and special non-pinnable mappings do not count as file/shmem RSS.
     pub fn memory_stats(&self) -> AddressSpaceMemoryStats;
+    /// Non-owning (base, len, perms) records for maps. Copies no backing
+    /// vectors and performs no page, refcount, or NUMA walk. Allocation and
+    /// sorting happen outside the region locks. Each table's metadata copy
+    /// is locked; base and huge tables are observed separately. Like the
+    /// diagnostic NUMA snapshot, allocation failure may return a short list.
+    pub fn regions_metadata_snapshot(&self) -> Vec<RegionMetadata>;
     /// Length of the base-page or hardware-huge region starting at `base`.
     pub fn region_len_at_base(&self, base: VirtAddr) -> Option<u64>;
     /// Copy resident bytes through owned physical backing without user faults.

@@ -1010,6 +1010,54 @@ fn smoke_abi_proc2_pid_statm_seven_ints() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_statm_seven_ints);
 
+fn smoke_abi_proc2_lightweight_queries_keep_identity_and_counters() -> TestResult {
+    use narf_filesystem::procfs::TaskInfoQuery;
+    const PID: u64 = 0x574b;
+    with_procfs(PID, "proc-light", &["proc-light", "argument"], 0, |_| {
+        let identity = crate::handlers::proc_task_info(PID, TaskInfoQuery::Identity)
+            .ok_or("identity query lost live PID")?;
+        let statm = crate::handlers::proc_task_info(PID, TaskInfoQuery::Statm)
+            .ok_or("statm query lost live PID")?;
+        let full = crate::handlers::proc_task_info(PID, TaskInfoQuery::Basic)
+            .ok_or("basic query lost live PID")?;
+        if identity.pid != full.pid
+            || identity.comm != "proc-light"
+            || (identity.uid, identity.gid) != (full.uid, full.gid)
+            || !identity.cmdline.is_empty()
+            || !identity.vmas.is_empty()
+            || identity.num_threads != 0
+            || identity.fd_table_size != 0
+        {
+            return Err("identity query changed ownership or built unrelated process fields");
+        }
+        if (
+            statm.vm_size_bytes,
+            statm.resident_pages,
+            statm.shared_resident_pages,
+            statm.text_pages,
+            statm.data_stack_bytes,
+        ) != (
+            full.vm_size_bytes,
+            full.resident_pages,
+            full.shared_resident_pages,
+            full.text_pages,
+            full.data_stack_bytes,
+        ) || !statm.cmdline.is_empty()
+            || !statm.comm.is_empty()
+            || statm.num_threads != 0
+            || statm.fd_table_size != 0
+            || full.cmdline.is_empty()
+        {
+            return Err("statm query lost counters or built unrelated process fields");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_lightweight_queries_keep_identity_and_counters
+);
+
 // ── /proc/<pid>/comm — matches the process comm (+ 15-byte truncation) ──
 
 fn smoke_abi_proc2_pid_comm_matches() -> TestResult {
@@ -3173,6 +3221,7 @@ fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
         let mapping = crate::process::LoadedMapping {
             addr: v.region,
             len: TG_REGION_LEN,
+            file_len: TG_REGION_LEN,
             pgoff: 0x3000,
             prot: 3,
             device: (8 << 8) | 19,
@@ -3205,6 +3254,46 @@ fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_maps_preserve_loader_image_provenance
+);
+
+fn smoke_abi_proc2_statm_main_image_text_extent() -> TestResult {
+    with_thread_group(false, |v| {
+        let mut mappings = alloc::vec![crate::process::LoadedMapping {
+            addr: v.region,
+            len: 0x9000,
+            file_len: 0x1001,
+            pgoff: 0,
+            prot: 5,
+            device: 0,
+            inode: 0,
+            filename: None,
+        }];
+        // Two main executable segments with a gap: Linux counts the extent,
+        // not their sum. File size, not BSS/memsz, determines end_code.
+        let mut second = mappings[0].clone();
+        second.addr += 0x4000;
+        mappings.push(second);
+        let mut interpreter = mappings[0].clone();
+        interpreter.addr += 0x100000;
+        interpreter.filename = Some(alloc::string::String::from("/lib/ld.so"));
+        mappings.push(interpreter);
+        crate::handlers::__test_set_proc_image_mappings(TG_LEADER_TASK, &mappings, "/bin/test");
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let statm = tg_read(&alloc::format!("{}/self/statm", v.base))?;
+            let fields: alloc::vec::Vec<&str> = statm.split_whitespace().collect();
+            if fields.len() != 7 || fields[3] != "6" || fields[5] == "0" {
+                return Err("statm lost the main ELF extent or aggregate data/stack count");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_clear_proc_image_mappings(TG_LEADER_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_statm_main_image_text_extent
 );
 
 /// A scheduler-spawned user task with `count` one-page anonymous VMAs, each
