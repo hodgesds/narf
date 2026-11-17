@@ -28,8 +28,8 @@ impl AuthorizedWindow {
             headless: None,
         }
     }
-    /// Exact source-profile constructor. It performs only the Linux bootstrap
-    /// four-zero root writes + VF_CAP probe before recording PF permission.
+    /// Exact source-profile constructor. Integrated Xe2/Xe3 performs the Linux
+    /// bootstrap four-zero root writes before VF_CAP; ATS-M needs only VF_CAP.
     /// Every raw access independently invokes current capability and validates
     /// current PCI identity/BAR/command/D0 and inherited-VF exclusion.
     pub(crate) fn for_device(
@@ -37,9 +37,10 @@ impl AuthorizedWindow {
         cap: Cap<narf_bus::BusDeviceCap, Write>,
         device: narf_bus::BusDevice,
     ) -> Self {
-        if !GtPlatform::from_pci(device.id.vendor, device.id.device)
-            .is_some_and(|p| p.is_headless_integrated())
-        {
+        let Some(platform) = GtPlatform::from_pci(device.id.vendor, device.id.device) else {
+            return Self::new(bar, cap);
+        };
+        if !platform.is_headless_integrated() && platform != GtPlatform::ArcticSoundM {
             return Self::new(bar, cap);
         }
         let this = Self {
@@ -49,7 +50,7 @@ impl AuthorizedWindow {
                 device,
                 pf: core::sync::atomic::AtomicBool::new(false),
                 local: None,
-                flush: true,
+                flush: platform.is_headless_integrated(),
             })),
         };
         let _ = this.read32(0x1901f8);
@@ -306,17 +307,18 @@ impl HeadlessAccess {
         if u64::from(high) << 32 | u64::from(low & !15) != bar.phys.raw() {
             return false;
         }
-        if !self.flush {
-            if crate::intel_gpu_gt::GtPlatform::from_pci(
-                self.device.id.vendor,
-                self.device.id.device,
-            ) != Some(crate::intel_gpu_gt::GtPlatform::Battlemage)
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(self.device.id.vendor, self.device.id.device);
+        if self.flush {
+            if !platform.is_some_and(|platform| platform.is_headless_integrated())
+                || self.local.is_some()
             {
                 return false;
             }
-            let Some(local) = self.local else {
+        } else if let Some(local) = self.local {
+            if platform != Some(crate::intel_gpu_gt::GtPlatform::Battlemage) {
                 return false;
-            };
+            }
             let Some(low) = read(0x18) else {
                 return false;
             };
@@ -331,6 +333,8 @@ impl HeadlessAccess {
             {
                 return false;
             }
+        } else if platform != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM) {
+            return false;
         }
         no_inherited_vfs(read)
     }
@@ -1058,6 +1062,39 @@ mod read_order_tests {
             assert_eq!(ops.len(), if valid { 5 } else { 0 });
             assert_eq!(pf.load(Ordering::Acquire), valid);
         }
+        // ATS-M is protected by the same current PF/VF proof without the
+        // integrated four-zero read workaround. Bootstrap admits only VF_CAP,
+        // then each ordinary access is a single authorized operation.
+        let pf = AtomicBool::new(false);
+        let mut ops = Vec::new();
+        assert_eq!(
+            profile_read_ordered(0xc000, Some(&pf), false, |r, w, _| {
+                ops.push((r, w));
+                Some(0)
+            }),
+            u32::MAX
+        );
+        assert!(ops.is_empty());
+        assert_eq!(
+            profile_read_ordered(VF_CAP, Some(&pf), false, |r, w, bootstrap| {
+                assert!(bootstrap);
+                ops.push((r, w));
+                Some(0)
+            }),
+            0
+        );
+        assert_eq!(ops, [(VF_CAP, None)]);
+        assert!(pf.load(Ordering::Acquire));
+        ops.clear();
+        assert_eq!(
+            profile_read_ordered(0xc000, Some(&pf), false, |r, w, bootstrap| {
+                assert!(!bootstrap);
+                ops.push((r, w));
+                Some(7)
+            }),
+            7
+        );
+        assert_eq!(ops, [(0xc000, None)]);
         TestResult::Pass
     }
     kernel_test_in!(

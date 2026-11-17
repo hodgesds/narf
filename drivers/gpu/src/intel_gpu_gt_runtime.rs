@@ -1782,7 +1782,9 @@ fn pci_identity(
         if header == 0 {
             return Ok(revision as u8);
         }
-        if header as u16 == 0x10 && (off > 0xff4 || read(off + 8)? & 1 != 0) {
+        if header as u16 == 0x10
+            && (off > 0xfec || read(off + 8)? & 1 != 0 || read(off + 0x10)? & 0xffff != 0)
+        {
             return Err(RuntimeError::Device);
         }
         let next = (header >> 20) as u16;
@@ -2042,6 +2044,11 @@ impl Owner {
             .map_err(|_| RuntimeError::State)?;
             state.lnl_flr = None; // completed receipt was consumed by this fresh arena
             SharedArena::new(arena)
+        } else if platform == GtPlatform::ArcticSoundM {
+            SharedArena::new(
+                GgttArena::for_pf_gt(p.bar, mmio.clone(), platform)
+                    .map_err(|_| RuntimeError::State)?,
+            )
         } else {
             SharedArena::new(GgttArena::for_gt(p.bar, p.cap, platform))
         };
@@ -4069,6 +4076,12 @@ mod tests {
             Err(RuntimeError::Device)
         );
         cfg.insert(0x208, 0);
+        cfg.insert(0x210, 1);
+        assert_eq!(
+            pci_identity(|off| Ok(*cfg.get(&off).unwrap_or(&0)), 0x8086, 0x7d55),
+            Err(RuntimeError::Device)
+        );
+        cfg.insert(0x210, 0);
         cfg.insert(0x180, 0x2001000f);
         assert_eq!(
             pci_identity(|off| Ok(*cfg.get(&off).unwrap_or(&0)), 0x8086, 0x7d55),

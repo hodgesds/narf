@@ -126,9 +126,8 @@ pub enum GtPlatform {
     /// Nova Lake-S: distinct 70.55.4 GuC with display/media 35.00 and the
     /// source Xe3-LPG graphics 30.03-30.05 live-GMD set.
     NovaLakeS,
-    /// Arctic Sound-M: display-less DG2 accelerator identity. Execution stays
-    /// probe-gated until its SR-IOV and device-specific policy are separated,
-    /// but source-defined GT, address and firmware facts remain typed.
+    /// Arctic Sound-M: display-less DG2 accelerator identity. NARF owns only
+    /// the physical function with SR-IOV disabled; VF lifecycle stays refused.
     ArcticSoundM,
     Alchemist,
     Battlemage,
@@ -257,6 +256,12 @@ impl GtPlatform {
     /// This is distinct from whether NARF has admitted a KMS route.
     pub const fn has_display(self) -> bool {
         !matches!(self, Self::ArcticSoundM)
+    }
+
+    /// Source descriptor fan-control capability. ATS-M shares DG2 graphics
+    /// mechanics but deliberately omits retail Arc's fan-control feature.
+    pub const fn has_fan_control(self) -> bool {
+        matches!(self, Self::Alchemist | Self::Battlemage)
     }
 
     pub const fn is_gen12(self) -> bool {

@@ -1868,8 +1868,8 @@ refuses before D-state/BAR/command/MMIO effects: Linux describes DMA52, VA57,
 root4, non-flat CCS and graphics 35.11/media 35.03, while its current GuC
 firmware table contains no `CRESCENTISLAND` entry. No other family's firmware
 or memory policy is substituted.
-The exact ATS-M 56C0/56C1/56C2 VGA IDs are likewise registered and announced
-before the same no-effects refusal. `GtPlatform::ArcticSoundM` records Linux's
+The exact ATS-M 56C0/56C1/56C2 VGA IDs bind a display-less, PF-only owner.
+`GtPlatform::ArcticSoundM` records Linux's
 DG2 platform and GuC (`i915/dg2_guc_70.bin` 70.53.0+), pre-GMD graphics/media
 12.55, DMA46/root3/VA48, Flat-CCS and exact M150=G10 / M75=G11 subplatform
 mechanics without aliasing the display-capable `Alchemist` policy identity.
@@ -1886,8 +1886,18 @@ GuC log/stream format and non-privileged register policy. Trusted VRAM clear
 takes and retains the actual DG2 platform identity so scheduler admission
 cannot reject an otherwise valid ATS-M batch as cross-platform. These shared
 mechanics do not grant display, fan-control or SR-IOV lifecycle authority.
-Probe still refuses before D-state/BAR/command/MMIO effects; execution waits
-for a separately qualified display-less SR-IOV lifecycle and reset owner.
+NARF exposes no ATS-M VF lifecycle. `pci_identity` requires SR-IOV VF Enable
+and NumVFs both zero. ATS-M's authorized window bootstraps only through the
+MMIO PF/VF capability read (without the integrated four-zero workaround), then
+requires current PCI identity/class, BAR0, command, D0, `VF_CAP`, VF Enable and
+NumVFs before every GT register access. `GgttArena::for_pf_gt` retains that
+same window for every PTE write. Any inherited or newly enabled VF therefore
+closes execution; the PF uses the isolated DG2 GT reset and never a function-
+level reset. Display programming remains absent.
+`GtPlatform::has_fan_control()` separately retains the source descriptor bit:
+true for retail DG2 and BMG, false for ATS-M. ATS-M may use the DG2 cached
+temperature/voltage/energy and non-mailbox package-power monitor, but fan
+sampling returns before any fan MMIO and sysfs publishes no fan attributes.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

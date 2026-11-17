@@ -1,9 +1,11 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.70** (v0.69 plus source-qualified DG2 execution mechanics for
-> the still-gated Arctic Sound-M identity; an explicit display-less Arctic
-> Sound-M descriptor that forbids display inventory and identity reads; a typed,
-> still probe-gated Arctic Sound-M GT/GuC/DMA/subplatform profile and exact
+> Status: **v0.72** (v0.71 plus PF-only Arctic Sound-M execution with current
+> SR-IOV exclusion on every GT/GGTT access; descriptor-qualified ATS-M
+> telemetry without retail Arc fan assumptions; source-qualified DG2 execution
+> mechanics for Arctic Sound-M; an explicit display-less descriptor that
+> forbids display inventory and identity reads; a typed Arctic Sound-M
+> GT/GuC/DMA/subplatform profile and exact
 > per-family DMA masks; serial-owned
 > Gen12 USB-C DP scanout
 > publication and exact detach withdrawal; exact fail-closed Arctic Sound-M discovery;
@@ -223,8 +225,9 @@ giving it its own exact pre-GMD platform profile.
 Discrete identities are kept in their own exact lists rather than inserted
 into the integrated `DEVICE_TABLE`: DG1 is 4905, 4906, 4907, 4908 and 4909;
 DG2 and BMG retain their existing exact lists. ATS-M is 56C0/56C1/56C2 and
-is registered as a guarded identity rather than aliased to display-capable
-DG2. The same exact-match PCI registration and class backstop rules apply.
+is registered as a PF-only display-less profile rather than aliased to
+display-capable DG2. The same exact-match PCI registration and class backstop
+rules apply.
 
 | ASIC (`ChipInfo::asic`) | Device IDs |
 | ----------------------- | ---------- |
@@ -313,9 +316,25 @@ steering, GT/LRC workarounds, context and reset images, Gen12 PTE/PAT rules,
 64-KiB VRAM mapping, Flat-CCS copy/clear, SLPC, GuC log/stream and non-privilege
 policies for ATS-M as well as display-capable DG2. Trusted CCS-clear batches
 retain the actual platform identity instead of being mislabeled Alchemist.
-Display, fan and SR-IOV lifecycle policy remains separate. The exact IDs remain
-announced-but-gated before D-state, BAR, command or MMIO effects until a
-display-less SR-IOV lifecycle and reset owner is qualified.
+Display, fan and SR-IOV policy remains separate.
+
+The exact IDs now bind the display-less physical-function owner. NARF does not
+implement an ATS-M VF lifecycle: initial PCI admission and every later GT/GGTT
+access require SR-IOV `VF Enable == 0`, `NumVFs == 0`, and the MMIO `VF_CAP`
+PF bit clear, along with current PCI identity, BAR0, command and D0. The
+authorized window bootstraps with the VF-capability read but does not apply the
+integrated four-zero workaround. GGTT PTE writes retain that same window, so an
+external VF enablement revokes execution instead of leaving an independently
+DMA-capable VF outside the client gate. The PF uses the existing isolated DG2
+GT reset path; no function-level reset or display transaction is performed.
+
+ATS-M and retail DG2 share the source package-temperature, VRAM-temperature,
+voltage, energy and non-mailbox package-power register policy. They do not
+share fan capability: Linux sets `has_fan_control` only on the retail `dg2_desc`
+and omits it from `ats_m_desc`. `GtPlatform::has_fan_control()` preserves that
+descriptor fact; ATS-M publishes no fan attributes and its telemetry service
+performs no fan-counter reads. Battlemage and retail DG2 retain their existing
+fan services.
 
 PCI DMA width is independent of PTE address capacity. The exact Linux xe
 descriptor matrix is enforced at every qualified GGTT/PPGTT publication:

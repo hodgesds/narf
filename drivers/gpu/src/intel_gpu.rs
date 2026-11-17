@@ -203,8 +203,7 @@ pub(crate) const CRI_IDS: &[u16] = &[CRI_674C];
 
 // Arctic Sound-M. Linux `INTEL_ATS_M_IDS`: M150 = 56C0/56C2, M75 = 56C1.
 // These use the DG2 platform machinery but are display-less, SR-IOV-capable
-// accelerator profiles; they remain a distinct fail-closed identity until
-// NARF separates those policies from its display-capable Alchemist owner.
+// accelerator profiles. NARF binds only a PF with VF Enable and NumVFs zero.
 pub const ATSM_56C0: u16 = 0x56C0;
 pub const ATSM_56C1: u16 = 0x56C1;
 pub const ATSM_56C2: u16 = 0x56C2;
@@ -973,7 +972,7 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
 ];
 
 pub(crate) fn source_known_unqualified(did: u16) -> bool {
-    CRI_IDS.contains(&did) || ATSM_IDS.contains(&did)
+    CRI_IDS.contains(&did)
 }
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
@@ -1428,13 +1427,6 @@ const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != INTEL_VENDOR {
-        return Err(narf_bus::ProbeError::NotForThisDriver);
-    }
-    if ATSM_IDS.contains(&device.id.device) {
-        log_probe(
-            "recognized Arctic Sound-M — distinct headless/SR-IOV profile not yet qualified",
-            &device,
-        );
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     if CRI_IDS.contains(&device.id.device) {
@@ -2145,7 +2137,7 @@ pub fn register_pci_driver() {
         ("intel-gpu-dg1", crate::intel_gpu_gt::DG1_IDS),
         ("intel-gpu-dg2", crate::intel_gpu_gt::DG2_IDS),
         ("intel-gpu-bmg", crate::intel_gpu_gt::BMG_IDS),
-        ("intel-gpu-atsm-gated", ATSM_IDS),
+        ("intel-gpu-atsm", ATSM_IDS),
         ("intel-gpu-cri-gated", CRI_IDS),
     ] {
         for &device in ids {
@@ -3790,14 +3782,14 @@ pub mod tests {
         smoke_crescent_island_identity_is_exact_and_fail_closed
     );
 
-    fn smoke_arctic_sound_m_identity_is_exact_and_fail_closed() -> TestResult {
+    fn smoke_arctic_sound_m_identity_is_exact_and_pf_only() -> TestResult {
         for did in [ATSM_56C0, ATSM_56C1, ATSM_56C2] {
-            if !source_known_unqualified(did)
+            if source_known_unqualified(did)
                 || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
                 || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
                     != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
             {
-                return TestResult::Fail("Arctic Sound-M typed fail-closed identity boundary");
+                return TestResult::Fail("Arctic Sound-M typed PF identity boundary");
             }
         }
         for did in [0x56bfu16, 0x56c3] {
@@ -3812,7 +3804,7 @@ pub mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
-        smoke_arctic_sound_m_identity_is_exact_and_fail_closed
+        smoke_arctic_sound_m_identity_is_exact_and_pf_only
     );
 
     fn smoke_headless_gt_requires_every_display_fetcher_stopped() -> TestResult {

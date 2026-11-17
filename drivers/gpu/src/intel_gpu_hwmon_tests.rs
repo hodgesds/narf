@@ -33,22 +33,27 @@ fn smoke_hwmon_dg2_native_sample_units_and_whitelist() -> TestResult {
         0
     )
     .is_none());
-    let monitor = Monitor::new(GtPlatform::Alchemist, 0).unwrap();
-    let mut accesses = Vec::new();
-    monitor.sample(7, 0, |_| panic!("unactivated sensor read hardware"));
-    monitor.activate(7);
-    monitor.sample(7, 0, |register| {
-        accesses.push(register);
-        dg2(register)
-    });
-    assert_eq!(accesses, [0x145978, 0x1382c0, 0x1381b4, 0x145938, 0x14593c]);
-    assert_eq!(monitor.show("temp2_input", 0), "65000\n");
-    assert_eq!(monitor.show("temp3_input", 0), "83000\n");
-    assert_eq!(monitor.show("in1_input", 0), "803\n");
-    assert_eq!(monitor.show("energy2_input", 0), "1000000\n");
-    assert_eq!(monitor.show("in1_label", 0), "pkg\n");
-    assert!(monitor.show("power2_cap", 0).is_empty());
-    assert!(monitor.show("temp6_input", 0).is_empty());
+    assert!(!GtPlatform::ArcticSoundM.has_fan_control());
+    assert!(GtPlatform::Alchemist.has_fan_control());
+    assert!(GtPlatform::Battlemage.has_fan_control());
+    for platform in [GtPlatform::ArcticSoundM, GtPlatform::Alchemist] {
+        let monitor = Monitor::new(platform, 0).unwrap();
+        let mut accesses = Vec::new();
+        monitor.sample(7, 0, |_| panic!("unactivated sensor read hardware"));
+        monitor.activate(7);
+        monitor.sample(7, 0, |register| {
+            accesses.push(register);
+            dg2(register)
+        });
+        assert_eq!(accesses, [0x145978, 0x1382c0, 0x1381b4, 0x145938, 0x14593c]);
+        assert_eq!(monitor.show("temp2_input", 0), "65000\n");
+        assert_eq!(monitor.show("temp3_input", 0), "83000\n");
+        assert_eq!(monitor.show("in1_input", 0), "803\n");
+        assert_eq!(monitor.show("energy2_input", 0), "1000000\n");
+        assert_eq!(monitor.show("in1_label", 0), "pkg\n");
+        assert!(monitor.show("power2_cap", 0).is_empty());
+        assert!(monitor.show("temp6_input", 0).is_empty());
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -258,6 +263,7 @@ kernel_test_in!(
 fn smoke_hwmon_real_sysfs_is_card_scoped_read_only_and_cached() -> TestResult {
     let dg2 = Monitor::register(987, GtPlatform::Alchemist, 0).unwrap();
     let bmg = Monitor::register(988, GtPlatform::Battlemage, 0).unwrap();
+    let _ats = Monitor::register(989, GtPlatform::ArcticSoundM, 0).unwrap();
     let class = class_register("hwmon");
     let find = |card| {
         class
@@ -271,12 +277,18 @@ fn smoke_hwmon_real_sysfs_is_card_scoped_read_only_and_cached() -> TestResult {
     };
     let node = find(987);
     let other = find(988);
+    let ats = find(989);
     assert_eq!(node.attr_show("name").as_deref(), Some("xe\n"));
     assert!(node.has_attr("energy2_input"));
     assert!(!node.has_attr("temp6_input"));
     assert!(other.has_attr("temp21_input"));
     assert!(other.has_attr("energy2_input"));
     assert!(other.attr_show("energy2_input").unwrap().is_empty());
+    assert!(ats.has_attr("energy2_input"));
+    assert!(ats.has_attr("in1_input"));
+    assert!(!ats.has_attr("fan1_input"));
+    assert!(node.has_attr("fan1_input"));
+    assert!(other.has_attr("fan3_input"));
     let dir = narf_filesystem::sysfs::SysKobjDir { kobj: node.clone() };
     let file = dir.lookup("temp2_input").unwrap();
     assert_eq!(file.stat().mode.perms, 0o444);
@@ -299,6 +311,7 @@ fn smoke_hwmon_real_sysfs_is_card_scoped_read_only_and_cached() -> TestResult {
     assert!(node.attr_show("temp2_input").unwrap().is_empty());
     assert!(class.remove_child(node.name()));
     assert!(class.remove_child(other.name()));
+    assert!(class.remove_child(ats.name()));
     TestResult::Pass
 }
 kernel_test_in!(

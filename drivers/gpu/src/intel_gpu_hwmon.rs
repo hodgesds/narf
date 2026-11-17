@@ -154,7 +154,7 @@ pub(crate) struct Monitor {
 }
 impl Monitor {
     fn new(platform: GtPlatform, bar_len: u64) -> Option<Self> {
-        if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+        if !platform.is_dg2() && platform != GtPlatform::Battlemage {
             return None;
         }
         Some(Self {
@@ -300,7 +300,7 @@ impl Monitor {
         if epoch == 0 || self.admission.load(Ordering::Acquire) != epoch {
             return;
         }
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             self.power.service(epoch, now, io);
         } else {
             let (mut discovery, mut mailbox, mut control_owner, mut control_next) = {
@@ -423,6 +423,9 @@ impl Monitor {
     }
 
     fn sample_fans(&self, epoch: u64, now: u64, io: &mut impl Io) {
+        if !self.platform.has_fan_control() {
+            return;
+        }
         let (mut fans, count) = {
             let state = self.state.lock();
             if state.epoch != epoch
@@ -433,7 +436,7 @@ impl Monitor {
             {
                 return;
             }
-            let count = if self.platform == GtPlatform::Alchemist {
+            let count = if self.platform.is_dg2() {
                 // xe_hwmon_pcode_read_fan_control explicitly uses two for DG2;
                 // that firmware's reported count is known to be incorrect.
                 2
@@ -496,7 +499,7 @@ impl Monitor {
         };
         let result = (|| {
             let mut reading = Reading::default();
-            let package = if self.platform == GtPlatform::Alchemist {
+            let package = if self.platform.is_dg2() {
                 DG2_TEMP
             } else {
                 BMG_TEMP
@@ -617,7 +620,7 @@ impl Monitor {
         if attribute.starts_with("power2_") {
             return if attribute == "power2_label" {
                 "pkg\n".into()
-            } else if self.platform == GtPlatform::Alchemist {
+            } else if self.platform.is_dg2() {
                 self.power.show(attribute, now)
             } else {
                 self.bmg_power.show(attribute, now)
@@ -676,9 +679,7 @@ impl Monitor {
                 .map_or_else(String::new, |value| format!("{value}\n"));
         }
         match attribute {
-            "in1_label" | "energy2_label" if self.platform == GtPlatform::Alchemist => {
-                "pkg\n".into()
-            }
+            "in1_label" | "energy2_label" if self.platform.is_dg2() => "pkg\n".into(),
             "in1_input" => self
                 .reading(now)
                 .and_then(|r| r.voltage_mv)
@@ -713,7 +714,7 @@ impl Monitor {
                 });
             }
         }
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             for attribute in ["in1_input", "in1_label", "energy2_input", "energy2_label"] {
                 let monitor = self.clone();
                 kobject_add_attr(&node, attribute, move || {
@@ -766,14 +767,14 @@ impl Monitor {
             "power2_max",
             move || show.show("power2_max", narf_time::monotonic_ns()),
             move |bytes| {
-                if store.platform == GtPlatform::Alchemist {
+                if store.platform.is_dg2() {
                     store.power.store(bytes, narf_time::monotonic_ns())
                 } else {
                     store.bmg_power.store(bytes, narf_time::monotonic_ns())
                 }
             },
         );
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             for attribute in ["power2_max_interval_min", "power2_max_interval_max"] {
                 let monitor = self.clone();
                 kobject_add_attr(&node, attribute, move || {
@@ -885,7 +886,9 @@ impl Monitor {
                 );
             }
         }
-        for attribute in if self.platform == GtPlatform::Alchemist {
+        for attribute in if !self.platform.has_fan_control() {
+            &[][..]
+        } else if self.platform.is_dg2() {
             &["fan1_input", "fan2_input"][..]
         } else {
             &["fan1_input", "fan2_input", "fan3_input"][..]
