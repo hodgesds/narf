@@ -8,9 +8,8 @@
 //! [`crate::gsp`] for the RPC/ring layer). The very first step of
 //! that flow — *locating and validating the firmware blobs* — is
 //! what this module does. It does **not** stage anything into the
-//! live Falcon yet (that needs real silicon; QEMU exposes no NVIDIA
-//! GPU) and it does not construct the RM image's VRAM page tables.
-//! Those are later lanes.
+//! live Falcon and it does not construct the RM image's VRAM page
+//! tables; those are [`crate::gsp_boot`] / [`crate::gsp_image`].
 //!
 //! The blobs come from the redistributable `linux-firmware` tree
 //! under `nvidia/<chip>/gsp/`. NARF's [`narf_firmware`] registry

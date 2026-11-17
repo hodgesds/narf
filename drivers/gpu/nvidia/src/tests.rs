@@ -4906,3 +4906,833 @@ kernel_test_in!(
     "drivers/nvidia/gsp",
     smoke_gsp4_element_doorbell_and_sequence
 );
+
+// ────────────────────────────────────────────────────────────────
+// GSP payloads — GspSystemInfo + PACKED_REGISTRY_TABLE
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_payload::{
+    build_default_registry, build_registry, build_system_info, default_registry_entries,
+    RegistryValue, GSP_SYSTEM_INFO_SIZE, PCI_CONFIG_MIRROR_BASE, PCI_CONFIG_MIRROR_SIZE,
+};
+
+fn smoke_gsp_system_info_layout() -> TestResult {
+    let si = build_system_info(0x8000_0000, 0x9000_0000, 0xA000_0000, 0x01, 0x18, 0x1234);
+    if si.len() != GSP_SYSTEM_INFO_SIZE || GSP_SYSTEM_INFO_SIZE != 664 {
+        return TestResult::Fail("GspSystemInfo must be exactly 664 bytes");
+    }
+    let rd64 = |o: usize| u64::from_le_bytes(si[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(si[o..o + 4].try_into().unwrap());
+    if rd64(0x00) != 0x8000_0000 || rd64(0x08) != 0x9000_0000 || rd64(0x10) != 0xA000_0000 {
+        return TestResult::Fail("BAR0/1/2 phys must pack at 0x00/0x08/0x10");
+    }
+    // nvDomainBusDeviceFunc = (bus<<8)|devfn.
+    if rd64(0x18) != ((0x01u64 << 8) | 0x18) {
+        return TestResult::Fail("nvDomainBusDeviceFunc must be (bus<<8)|devfn at 0x18");
+    }
+    if rd64(0x38) != 0x1234 {
+        return TestResult::Fail("maxUserVa must pack at 0x38");
+    }
+    if rd32(0x40) != PCI_CONFIG_MIRROR_BASE || rd32(0x44) != PCI_CONFIG_MIRROR_SIZE {
+        return TestResult::Fail("pciConfigMirror base/size must pack at 0x40/0x44");
+    }
+    // A field the driver leaves zero (e.g. gspVFInfo at 0x278) stays zero.
+    if rd64(0x278) != 0 {
+        return TestResult::Fail("unpopulated fields must stay zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_payload", smoke_gsp_system_info_layout);
+
+fn smoke_gsp_registry_default_table() -> TestResult {
+    // The baseline 3-DWORD table has a known exact byte layout.
+    let t = build_default_registry();
+    let rd32 = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    // size=117, numEntries=3.
+    if t.len() != 117 || rd32(0) != 117 || rd32(4) != 3 {
+        return TestResult::Fail("default registry must be 117 bytes, 3 entries");
+    }
+    // Entry 0: nameOffset=56, type=1 (DWORD), data=1, length=4.
+    if rd32(8) != 56 || t[12] != 1 || rd32(16) != 1 || rd32(20) != 4 {
+        return TestResult::Fail("entry 0 fields drifted");
+    }
+    // The 3 padding bytes after `type` must be zero.
+    if t[13] != 0 || t[14] != 0 || t[15] != 0 {
+        return TestResult::Fail("entry type padding must be zero");
+    }
+    // Entry 1 nameOffset = 56 + len("RMSecBusResetEnable\0") = 56+20 = 76.
+    if rd32(24) != 76 {
+        return TestResult::Fail("entry 1 nameOffset must follow entry 0's name");
+    }
+    // The first key name is NUL-terminated at its offset.
+    if &t[56..75] != b"RMSecBusResetEnable" || t[75] != 0 {
+        return TestResult::Fail("first key name must be NUL-terminated at nameOffset");
+    }
+    if default_registry_entries().len() != 3 {
+        return TestResult::Fail("there are 3 default entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_payload",
+    smoke_gsp_registry_default_table
+);
+
+fn smoke_gsp_registry_string_and_dword_mix() -> TestResult {
+    // A DWORD followed by a string exercises both the inline-data and
+    // data-section-offset paths.
+    let entries = [
+        ("Flag", RegistryValue::Dword(0xABCD)),
+        ("Name", RegistryValue::Str("hi")),
+    ];
+    let t = build_registry(&entries);
+    let rd32 = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    // header 8 + 2*16 entries = 40 data start.
+    // data: "Flag\0"(5) + "Name\0"(5) + "hi\0"(3) = 13 => total 53.
+    if t.len() != 53 || rd32(0) != 53 || rd32(4) != 2 {
+        return TestResult::Fail("mixed table size/count wrong");
+    }
+    // Entry 0 (DWORD): type=1, data=0xABCD inline, length=4.
+    if t[12] != 1 || rd32(16) != 0xABCD || rd32(20) != 4 {
+        return TestResult::Fail("dword entry must store value inline");
+    }
+    // Entry 1 (STRING): type=3, data=offset to "hi\0", length=3.
+    if t[28] != 3 || rd32(36) != 3 {
+        return TestResult::Fail("string entry length must include the NUL");
+    }
+    let name_data_off = rd32(32) as usize; // data = offset of "hi\0"
+    if &t[name_data_off..name_data_off + 2] != b"hi" || t[name_data_off + 2] != 0 {
+        return TestResult::Fail("string value must be NUL-terminated at its data offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_payload",
+    smoke_gsp_registry_string_and_dword_mix
+);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot args — rmargs, libos regions, radix3 fill
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_args::{
+    build_libos_args, build_rmargs, create_pte_array, libos_id8, shared_region_pte_count,
+    GSP_QUEUE_MSG_COUNT, GSP_QUEUE_SIZE, LIBOS_KIND_CONTIGUOUS, LIBOS_LOC_SYSMEM,
+};
+use crate::gsp_rm::{build_radix3, GSP_PAGE_SIZE as GSP3_PAGE_SIZE};
+
+fn smoke_gsp_rmargs_layout() -> TestResult {
+    // 63 message slots per 256 KiB queue; one empty header page.
+    if GSP_QUEUE_MSG_COUNT != 63 || GSP_QUEUE_SIZE != 0x40000 {
+        return TestResult::Fail("queue geometry drifted");
+    }
+    // 128 data pages + ceil(128*8/4096)=1 => 129? verify formula.
+    // data = (0x40000+0x40000)/0x1000 = 128; +ceil(128*8/4096)=+1 => 129.
+    if shared_region_pte_count() != 129 {
+        return TestResult::Fail("shared region PTE count must be 129");
+    }
+    let page = build_rmargs(0x1_0000_0000, 129, 0x1000, 0x41000);
+    if page.len() != 4096 {
+        return TestResult::Fail("rmargs must be one page");
+    }
+    let rd64 = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(page[o..o + 4].try_into().unwrap());
+    if rd64(0x00) != 0x1_0000_0000 || rd32(0x08) != 129 {
+        return TestResult::Fail("sharedMemPhysAddr/pageTableEntryCount offsets wrong");
+    }
+    // cmdQueueOffset/statQueueOffset after the 4-byte pad at 0x0C.
+    if rd64(0x10) != 0x1000 || rd64(0x18) != 0x41000 {
+        return TestResult::Fail("cmd/stat queue offsets must pack at 0x10/0x18");
+    }
+    // Fresh boot: sr args / gpuInstance / profiler all zero.
+    if rd64(0x30) != 0 || rd32(0x3C) != 0 {
+        return TestResult::Fail("fresh-boot sr/gpuInstance fields must be zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_rmargs_layout);
+
+fn smoke_gsp_libos_args_layout() -> TestResult {
+    // id8 packs chars big-endian: "RMARGS" = 0x524d41524753.
+    if libos_id8("RMARGS") != 0x0000_524D_4152_4753 {
+        return TestResult::Fail("libos_id8 must pack chars big-endian");
+    }
+    let page = build_libos_args(0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000);
+    let rd64 = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
+    // Entry 0 = LOGINIT @ 0: id8, pa, size=0x10000, kind, loc.
+    if rd64(0) != libos_id8("LOGINIT") || rd64(8) != 0x1000_0000 || rd64(16) != 0x10000 {
+        return TestResult::Fail("LOGINIT region mis-packed");
+    }
+    if page[24] != LIBOS_KIND_CONTIGUOUS || page[25] != LIBOS_LOC_SYSMEM {
+        return TestResult::Fail("region kind/loc must be CONTIGUOUS/SYSMEM");
+    }
+    // Entry 3 = RMARGS @ 96: pa, size=0x1000 (one page).
+    if rd64(96) != libos_id8("RMARGS") || rd64(96 + 8) != 0x4000_0000 || rd64(96 + 16) != 0x1000 {
+        return TestResult::Fail("RMARGS region mis-packed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_libos_args_layout);
+
+fn smoke_gsp_create_pte_array() -> TestResult {
+    let mut ptes = [0u64; 4];
+    // 3 pages worth of size -> 3 entries, each a page apart.
+    create_pte_array(&mut ptes, 0x5000_0000, 2 * GSP3_PAGE_SIZE + 1);
+    if ptes[0] != 0x5000_0000 || ptes[1] != 0x5000_1000 || ptes[2] != 0x5000_2000 {
+        return TestResult::Fail("PTE entries must be base + i*page");
+    }
+    if ptes[3] != 0 {
+        return TestResult::Fail("entries past the page count must stay zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_create_pte_array);
+
+fn smoke_gsp_radix3_build() -> TestResult {
+    // Image of 3 pages mapped across a 1-page lvl2.
+    let image = [0xA000u64, 0xB000, 0xC000];
+    let lvl2_pages = [0x2_0000u64]; // one lvl2 page
+    let mut lvl0 = [0u64; 1];
+    let mut lvl1 = [0u64; 512];
+    let mut lvl2 = [0u64; 512];
+    if !build_radix3(
+        &mut lvl0,
+        &mut lvl1,
+        &mut lvl2,
+        0x1_0000,
+        &lvl2_pages,
+        &image,
+    ) {
+        return TestResult::Fail("radix3 build must succeed when tables fit");
+    }
+    if lvl0[0] != 0x1_0000 {
+        return TestResult::Fail("lvl0[0] must point at the lvl1 page");
+    }
+    if lvl1[0] != 0x2_0000 {
+        return TestResult::Fail("lvl1[0] must point at the lvl2 page");
+    }
+    if lvl2[0] != 0xA000 || lvl2[1] != 0xB000 || lvl2[2] != 0xC000 {
+        return TestResult::Fail("lvl2 must point at each image page");
+    }
+    // Too-small tables are rejected.
+    let mut tiny = [0u64; 1];
+    if build_radix3(&mut lvl0, &mut tiny, &mut lvl2, 0x1_0000, &[1, 2], &image) {
+        return TestResult::Fail("undersized lvl1 must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_radix3_build);
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC-FRTS — descriptor parse + FRTS/signature patch (core)
+// ────────────────────────────────────────────────────────────────
+
+use crate::fwsec::{
+    frts_cmd_bytes, patch_frts, patch_signature, select_signature_index, FalconUcodeDescV3,
+    FwsecError, DMEMMAPPER_CMD_FRTS, FRTS_CMD_SIZE, FRTS_REGION_TYPE_FB, RSA3K_SIG_SIZE,
+};
+
+/// Build a 44-byte v3 descriptor with the fixture's layout.
+fn fwsec_desc_bytes() -> [u8; 0x2c] {
+    let mut d = [0u8; 0x2c];
+    let p32 = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // Hdr: header_size 0x2c, version 3, valid.
+    p32(&mut d, 0x00, (0x2c << 16) | (3 << 8) | 1);
+    p32(&mut d, 0x08, 0x100); // pkc_data_offset
+    p32(&mut d, 0x0c, 0x10); // interface_offset
+    p32(&mut d, 0x14, 0x100); // imem_load_size
+    d[0x27] = 1; // signature_count
+    d[0x28] = 1; // signature_versions (bit 0)
+    d
+}
+
+/// Build a 0x400-byte FWSEC ucode image with a DMEMMAPPER appif.
+fn fwsec_ucode_fixture() -> alloc::vec::Vec<u8> {
+    let mut u = alloc::vec![0u8; 0x400];
+    let p32 = |u: &mut [u8], o: usize, v: u32| u[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // appif header @ dmem(0x100)+interface_offset(0x10) = 0x110.
+    u[0x110] = 1; // ver
+    u[0x111] = 4; // header size
+    u[0x112] = 8; // entry len
+    u[0x113] = 1; // entry count
+                  // appif entry 0 @ 0x114: id=DMEMMAPPER, dmem_base=0x40.
+    p32(&mut u, 0x114, 0x4);
+    p32(&mut u, 0x118, 0x40);
+    // DMEMMAPPER @ dmem+0x40 = 0x140; cmd_in_buffer_offset @ +0x08.
+    p32(&mut u, 0x140 + 0x08, 0x80); // cmd buffer at dmem+0x80 = 0x180
+    u
+}
+
+fn smoke_fwsec_desc_parse() -> TestResult {
+    let desc = match FalconUcodeDescV3::parse(&fwsec_desc_bytes()) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("v3 descriptor must parse"),
+    };
+    if desc.version() != 3 || !desc.valid() || desc.header_size() != 0x2c {
+        return TestResult::Fail("Hdr fields mis-decoded");
+    }
+    if desc.imem_load_size != 0x100 || desc.dmem_base_img() != 0x100 {
+        return TestResult::Fail("v3 DMEM must pack immediately after IMEM");
+    }
+    if desc.sig_base_img() != 0x100 + 0x100 {
+        return TestResult::Fail("sig_base_img = dmem_base + pkc_data_offset");
+    }
+    // A non-v3 / invalid descriptor is rejected.
+    let mut bad = fwsec_desc_bytes();
+    bad[0] = 0; // clear valid bit
+    if FalconUcodeDescV3::parse(&bad) != Err(FwsecError::BadDescriptor) {
+        return TestResult::Fail("invalid descriptor must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_desc_parse);
+
+fn smoke_fwsec_frts_cmd_bytes() -> TestResult {
+    let c = frts_cmd_bytes(0x1234_5000, 0x10_0000);
+    if c.len() != FRTS_CMD_SIZE {
+        return TestResult::Fail("FrtsCmd must be 44 bytes");
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+    // read_vbios: ver=1, hdr=24, flags=2.
+    if rd32(0x00) != 1 || rd32(0x04) != 24 || rd32(0x14) != 2 {
+        return TestResult::Fail("read_vbios header drifted");
+    }
+    // frts_region: ver=1, hdr=20, addr=frts>>12, size>>12, type=FB.
+    if rd32(0x18) != 1 || rd32(0x1c) != 20 {
+        return TestResult::Fail("frts_region header drifted");
+    }
+    if rd32(0x20) != (0x1234_5000 >> 12) || rd32(0x24) != (0x10_0000 >> 12) {
+        return TestResult::Fail("frts addr/size must be page-granular");
+    }
+    if rd32(0x28) != FRTS_REGION_TYPE_FB {
+        return TestResult::Fail("frts region type must be FB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_frts_cmd_bytes);
+
+fn smoke_fwsec_patch_frts() -> TestResult {
+    let desc = FalconUcodeDescV3::parse(&fwsec_desc_bytes()).unwrap();
+    let mut ucode = fwsec_ucode_fixture();
+    let cmd_off = match patch_frts(&mut ucode, &desc, 0x8000_0000, 0x10_0000) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("patch must succeed on a well-formed ucode"),
+    };
+    // cmd buffer at dmem(0x100) + cmd_in_buffer_offset(0x80) = 0x180.
+    if cmd_off != 0x180 {
+        return TestResult::Fail("command buffer offset mis-computed");
+    }
+    // init_cmd (DMEMMAPPER@0x140 + 0x2c = 0x16C) must be FRTS.
+    let init = u32::from_le_bytes(ucode[0x16C..0x170].try_into().unwrap());
+    if init != DMEMMAPPER_CMD_FRTS {
+        return TestResult::Fail("init_cmd must be patched to FRTS");
+    }
+    // The FrtsCmd must be written at cmd_off, carrying the region addr.
+    let region_addr = u32::from_le_bytes(ucode[cmd_off + 0x20..cmd_off + 0x24].try_into().unwrap());
+    if region_addr != (0x8000_0000u64 >> 12) as u32 {
+        return TestResult::Fail("FrtsCmd region addr not written");
+    }
+    // A ucode with no DMEMMAPPER entry is rejected.
+    let mut blank = alloc::vec![0u8; 0x400];
+    blank[0x110] = 1; // valid appif header, zero entries
+    if patch_frts(&mut blank, &desc, 0, 0x10_0000) != Err(FwsecError::NoDmemMapper) {
+        return TestResult::Fail("missing DMEMMAPPER must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_patch_frts);
+
+fn smoke_fwsec_signature_select_and_patch() -> TestResult {
+    // Turing: fuse version 0 -> index 0 when bit 0 is present.
+    if select_signature_index(0b001, 0) != Ok(0) {
+        return TestResult::Fail("fuse 0 with bit0 present must select index 0");
+    }
+    // popcount of bits below the fuse bit.
+    if select_signature_index(0b110, 2) != Ok(1) {
+        return TestResult::Fail("index must be popcount below the fuse bit");
+    }
+    // Missing fuse version is rejected.
+    if select_signature_index(0b100, 1) != Err(FwsecError::NoMatchingSignature) {
+        return TestResult::Fail("absent fuse version must be rejected");
+    }
+    // Patch writes the 384-byte signature at sig_base_img (0x200).
+    let desc = FalconUcodeDescV3::parse(&fwsec_desc_bytes()).unwrap();
+    let mut ucode = alloc::vec![0u8; 0x400];
+    let sig = alloc::vec![0xABu8; RSA3K_SIG_SIZE];
+    if patch_signature(&mut ucode, &desc, &sig).is_err() {
+        return TestResult::Fail("signature patch must succeed");
+    }
+    if ucode[0x200] != 0xAB || ucode[0x200 + RSA3K_SIG_SIZE - 1] != 0xAB {
+        return TestResult::Fail("signature must land at sig_base_img");
+    }
+    if ucode[0x200 - 1] != 0 {
+        return TestResult::Fail("signature must not spill before sig_base_img");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/fwsec",
+    smoke_fwsec_signature_select_and_patch
+);
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC F2 — locate the ucode in the VBIOS (BIT → PMU → desc)
+// ────────────────────────────────────────────────────────────────
+
+use crate::fwsec::{find_bit_offset, find_falcon_data_ptr, locate_fwsec, BIT_TOKEN_FALCON_DATA};
+
+/// Build a synthetic VBIOS with a BIT table → falcon-data token →
+/// PMU lookup table → FWSEC_PROD entry → FalconUCodeDesc.
+fn fwsec_rom_fixture() -> alloc::vec::Vec<u8> {
+    let mut r = alloc::vec![0u8; 0x500];
+    let p16 = |r: &mut [u8], o: usize, v: u16| r[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let p32 = |r: &mut [u8], o: usize, v: u32| r[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // BIT table @ 0x60.
+    r[0x60..0x65].copy_from_slice(&[0xff, 0xb8, b'B', b'I', b'T']);
+    r[0x69] = 6; // entry stride
+    r[0x6A] = 2; // entry count
+                 // entry 0 @ 0x6C: some other token.
+    r[0x6C] = 0x41;
+    // entry 1 @ 0x72: falcon-data token 0x70, offset field @ +4.
+    r[0x72] = BIT_TOKEN_FALCON_DATA;
+    p16(&mut r, 0x76, 0x100); // falcon-data pointer location
+                              // @ 0x100: u32 = PMU table offset.
+    p32(&mut r, 0x100, 0x120);
+    // PMU table header @ 0x120: ver, hdr=4, entry-len=6, count=2.
+    r[0x120] = 1;
+    r[0x121] = 4;
+    r[0x122] = 6;
+    r[0x123] = 2;
+    // PMU entry 0 @ 0x124: app_id 0x01 (skip).
+    r[0x124] = 0x01;
+    // PMU entry 1 @ 0x12A: app_id 0x85 (FWSEC_PROD), data @ +2 = desc.
+    r[0x12A] = 0x85;
+    p32(&mut r, 0x12C, 0x200);
+    // FalconUCodeDesc @ 0x200: header_size 0x1AC (0x2c + one 384B sig),
+    // version 3, valid; imem/dmem load sizes 0x40 each; 1 signature.
+    p32(&mut r, 0x200, (0x1AC << 16) | (3 << 8) | 1);
+    p32(&mut r, 0x214, 0x40); // imem_load_size
+    p32(&mut r, 0x220, 0x40); // dmem_load_size
+    r[0x227] = 1; // signature_count
+    r[0x228] = 1; // signature_versions
+    r
+}
+
+fn smoke_fwsec_locate_in_vbios() -> TestResult {
+    let rom = fwsec_rom_fixture();
+    // BIT scan.
+    if find_bit_offset(&rom) != Some(0x60) {
+        return TestResult::Fail("BIT table must be found at its signature");
+    }
+    // Falcon-data token resolution.
+    if find_falcon_data_ptr(&rom, 0x60) != Some(0x100) {
+        return TestResult::Fail("falcon-data token must resolve to its pointer");
+    }
+    // Full chain.
+    let loc = match locate_fwsec(&rom) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("FWSEC must be located in a well-formed VBIOS"),
+    };
+    if loc.desc_offset != 0x200 {
+        return TestResult::Fail("descriptor offset must come from the 0x85 entry");
+    }
+    // ucode at desc + header_size (0x1AC); sig at desc + 0x2c.
+    if loc.ucode_offset != 0x200 + 0x1AC || loc.ucode_len != 0x80 {
+        return TestResult::Fail("ucode must be sized from the descriptor");
+    }
+    if loc.sig_offset != 0x200 + 0x2c {
+        return TestResult::Fail("signatures must start right after the descriptor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_locate_in_vbios);
+
+fn smoke_fwsec_locate_rejects_missing() -> TestResult {
+    // No BIT table at all.
+    let blank = alloc::vec![0u8; 0x200];
+    if locate_fwsec(&blank) != Err(crate::fwsec::FwsecError::VbiosNoBit) {
+        return TestResult::Fail("a VBIOS with no BIT table must be rejected");
+    }
+    // BIT present but no FWSEC_PROD entry.
+    let mut rom = fwsec_rom_fixture();
+    rom[0x12A] = 0x01; // demote the 0x85 entry
+    if locate_fwsec(&rom) != Err(crate::fwsec::FwsecError::VbiosNoFwsec) {
+        return TestResult::Fail("a VBIOS with no FWSEC entry must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_locate_rejects_missing);
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC F3 — run helpers (slicing + scratch decode); run() is HW-only
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_fwsec_run_helpers() -> TestResult {
+    use crate::fwsec::{frts_scratch_error, fwsec_dmem_slice, fwsec_imem_slice};
+    // v3 descriptor: 0x40 IMEM, 0x20 DMEM (DMEM follows IMEM).
+    let desc = FalconUcodeDescV3 {
+        hdr: (0x2c << 16) | (3 << 8) | 1,
+        stored_size: 0,
+        pkc_data_offset: 0,
+        interface_offset: 0,
+        imem_phys_base: 0,
+        imem_load_size: 0x40,
+        imem_virt_base: 0,
+        dmem_phys_base: 0,
+        dmem_load_size: 0x20,
+        engine_id_mask: 0,
+        ucode_id: 0,
+        signature_count: 0,
+        signature_versions: 0,
+    };
+    let ucode = alloc::vec![0u8; 0x100];
+    let imem = fwsec_imem_slice(&ucode, &desc).unwrap();
+    let dmem = fwsec_dmem_slice(&ucode, &desc).unwrap();
+    if imem.len() != 0x40 {
+        return TestResult::Fail("IMEM slice must be the whole code region");
+    }
+    if dmem.len() != 0x20 {
+        return TestResult::Fail("DMEM slice must follow IMEM, sized by dmem_load_size");
+    }
+    // The FRTS error code is the upper 16 bits of the scratch register.
+    if frts_scratch_error(0x1234_abcd) != 0x1234 {
+        return TestResult::Fail("scratch error must be the upper 16 bits");
+    }
+    if frts_scratch_error(0x0000_ffff) != 0 {
+        return TestResult::Fail("a clean scratch (low bits only) means no error");
+    }
+    // A ucode too small for the declared sizes yields no slice.
+    let tiny = alloc::vec![0u8; 0x10];
+    if fwsec_imem_slice(&tiny, &desc).is_some() {
+        return TestResult::Fail("an undersized ucode must not slice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_run_helpers);
+
+// ────────────────────────────────────────────────────────────────
+// GSP CPU sequencer — opcode decode (execute is HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_seq::{decode_all, decode_cmd, payload_dwords, SeqCmd, SeqError};
+
+fn smoke_gsp_seq_decode_each_opcode() -> TestResult {
+    let w = |v: &[u32]| -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec::Vec::new();
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
+    // REG_WRITE (12 bytes).
+    let (c, n) = decode_cmd(&w(&[0, 0x100, 0xABCD])).unwrap();
+    if c != (SeqCmd::RegWrite {
+        addr: 0x100,
+        val: 0xABCD,
+    }) || n != 12
+    {
+        return TestResult::Fail("REG_WRITE decode");
+    }
+    // REG_MODIFY (16 bytes).
+    let (c, n) = decode_cmd(&w(&[1, 0x200, 0xF0, 0x30])).unwrap();
+    if c != (SeqCmd::RegModify {
+        addr: 0x200,
+        mask: 0xF0,
+        val: 0x30,
+    }) || n != 16
+    {
+        return TestResult::Fail("REG_MODIFY decode");
+    }
+    // REG_POLL (24 bytes); the 6th word (error) is skipped.
+    let (c, n) = decode_cmd(&w(&[2, 0x300, 0xFF, 0x5, 1000, 0xDEAD])).unwrap();
+    if c != (SeqCmd::RegPoll {
+        addr: 0x300,
+        mask: 0xFF,
+        val: 0x5,
+        timeout_us: 1000,
+    }) || n != 24
+    {
+        return TestResult::Fail("REG_POLL decode");
+    }
+    // DELAY_US (8), REG_STORE (12).
+    let (c, n) = decode_cmd(&w(&[3, 42])).unwrap();
+    if c != (SeqCmd::DelayUs { us: 42 }) || n != 8 {
+        return TestResult::Fail("DELAY_US decode");
+    }
+    let (c, n) = decode_cmd(&w(&[4, 0x400, 3])).unwrap();
+    if c != (SeqCmd::RegStore {
+        addr: 0x400,
+        index: 3,
+    }) || n != 12
+    {
+        return TestResult::Fail("REG_STORE decode");
+    }
+    // CORE_* opcodes are a bare 4-byte word.
+    for (op, exp) in [
+        (5u32, SeqCmd::CoreReset),
+        (6, SeqCmd::CoreStart),
+        (7, SeqCmd::CoreWaitForHalt),
+        (8, SeqCmd::CoreResume),
+    ] {
+        let (c, n) = decode_cmd(&w(&[op])).unwrap();
+        if c != exp || n != 4 {
+            return TestResult::Fail("CORE_* decode");
+        }
+    }
+    // Unknown opcode / truncation are rejected.
+    if decode_cmd(&w(&[9])) != Err(SeqError::BadOpcode(9)) {
+        return TestResult::Fail("opcode 9 must be rejected");
+    }
+    if decode_cmd(&w(&[0, 0x100])) != Err(SeqError::Truncated) {
+        return TestResult::Fail("a truncated command must be rejected");
+    }
+    if payload_dwords(2) != Some(5) || payload_dwords(5) != Some(0) || payload_dwords(9).is_some() {
+        return TestResult::Fail("payload_dwords table drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_seq", smoke_gsp_seq_decode_each_opcode);
+
+fn smoke_gsp_seq_decode_buffer_walk() -> TestResult {
+    // A buffer of: REG_WRITE (3 dw) + CORE_RESET (1 dw) + DELAY_US (2 dw)
+    // = 6 dwords total.
+    let mut b = alloc::vec::Vec::new();
+    for x in [0u32, 0x10, 0x20, 5, 3, 7] {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    let cmds = match decode_all(&b, 6) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("well-formed buffer must decode"),
+    };
+    if cmds.len() != 3 {
+        return TestResult::Fail("buffer must decode to three commands");
+    }
+    if cmds[0]
+        != (SeqCmd::RegWrite {
+            addr: 0x10,
+            val: 0x20,
+        })
+        || cmds[1] != SeqCmd::CoreReset
+        || cmds[2] != (SeqCmd::DelayUs { us: 7 })
+    {
+        return TestResult::Fail("commands decoded out of order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_seq", smoke_gsp_seq_decode_buffer_walk);
+
+// ────────────────────────────────────────────────────────────────
+// GSP live orchestration — pure helpers (boot_gsp_live is HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_live::{
+    frts_region, signature_range, BootError, BootReport, BootStage, FRTS_SIZE, VBIOS_ROM_OFFSET,
+};
+
+fn smoke_gsp_live_frts_region() -> TestResult {
+    // frts.addr = align_down(bios_addr, 0x20000) - 0x100000; size 1 MiB.
+    let fb_size = 8u64 << 30;
+    let bios = fb_size - 0x10_0000;
+    let frts = frts_region(bios);
+    let expect_addr = (bios & !(0x2_0000 - 1)) - 0x10_0000;
+    if frts.addr != expect_addr || frts.size != FRTS_SIZE {
+        return TestResult::Fail("FRTS region must follow tu102_gsp_oneinit");
+    }
+    // FRTS sits just below the (0x20000-aligned) VBIOS area.
+    if frts.end() > bios {
+        return TestResult::Fail("FRTS must lie below the VBIOS base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_frts_region);
+
+fn smoke_gsp_live_signature_range() -> TestResult {
+    // Each signature is 384 bytes; idx selects the slot.
+    let r0 = signature_range(0x1000, 0);
+    let r2 = signature_range(0x1000, 2);
+    if r0.start != 0x1000 || r0.end != 0x1000 + 384 {
+        return TestResult::Fail("signature 0 range wrong");
+    }
+    if r2.start != 0x1000 + 2 * 384 || r2.end - r2.start != 384 {
+        return TestResult::Fail("signature 2 range wrong");
+    }
+    // ROM window offset is the documented BAR0 location.
+    if VBIOS_ROM_OFFSET != 0x0030_0000 {
+        return TestResult::Fail("VBIOS ROM window offset drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_signature_range);
+
+fn smoke_gsp_live_boot_report() -> TestResult {
+    // A report carries the furthest stage + the reason it stopped.
+    let r = BootReport {
+        reached: BootStage::Wpr2Established,
+        result: Err(BootError::NotImplemented("elf")),
+    };
+    if r.reached != BootStage::Wpr2Established {
+        return TestResult::Fail("report must carry the reached stage");
+    }
+    if r.result != Err(BootError::NotImplemented("elf")) {
+        return TestResult::Fail("report must carry the stop reason");
+    }
+    // A FWSEC error converts into a BootError.
+    let be: BootError = crate::fwsec::FwsecError::VbiosNoBit.into();
+    if be != BootError::Fwsec(crate::fwsec::FwsecError::VbiosNoBit) {
+        return TestResult::Fail("FwsecError must convert into BootError::Fwsec");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_boot_report);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM extraction — ELF sections + RISC-V bootloader descriptor
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_elf::{
+    elf64_section, gsp_rm_sections, parse_riscv_desc, signature_section, FWIMAGE_SECTION,
+    NVFW_BIN_MAGIC,
+};
+
+/// A minimal ELF64 with a `.fwimage` section + `.shstrtab`.
+fn gsp_elf_fixture() -> alloc::vec::Vec<u8> {
+    let mut e = alloc::vec![0u8; 0x120];
+    let p16 = |e: &mut [u8], o: usize, v: u16| e[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let p64 = |e: &mut [u8], o: usize, v: u64| e[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let p32 = |e: &mut [u8], o: usize, v: u32| e[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // e_ident (ELF64, little-endian).
+    e[0..8].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+    p64(&mut e, 0x28, 0x60); // e_shoff
+    p16(&mut e, 0x3c, 3); // e_shnum
+    p16(&mut e, 0x3e, 2); // e_shstrndx
+                          // .fwimage data @ 0x40 (8 bytes).
+    e[0x40..0x48].copy_from_slice(b"FWIMG123");
+    // .shstrtab @ 0x48: "\0.fwimage\0.shstrtab\0".
+    e[0x49..0x51].copy_from_slice(b".fwimage"); // index 1..9, NUL at 9
+    e[0x52..0x5B].copy_from_slice(b".shstrtab"); // index 10..19, NUL at 19
+                                                 // shdr[1] (.fwimage) @ 0xA0.
+    p32(&mut e, 0xA0, 1); // sh_name = 1
+    p64(&mut e, 0xA0 + 0x18, 0x40); // sh_offset
+    p64(&mut e, 0xA0 + 0x20, 8); // sh_size
+                                 // shdr[2] (.shstrtab) @ 0xE0.
+    p32(&mut e, 0xE0, 10); // sh_name = 10
+    p64(&mut e, 0xE0 + 0x18, 0x48); // sh_offset
+    p64(&mut e, 0xE0 + 0x20, 20); // sh_size
+    e
+}
+
+fn smoke_gsp_elf_section_lookup() -> TestResult {
+    let elf = gsp_elf_fixture();
+    match elf64_section(&elf, FWIMAGE_SECTION) {
+        Some(d) if d == b"FWIMG123" => {}
+        _ => return TestResult::Fail(".fwimage section must be found with its data"),
+    }
+    // A missing section returns None.
+    if elf64_section(&elf, ".fwsignature_tu10x").is_some() {
+        return TestResult::Fail("an absent section must return None");
+    }
+    // Signature section naming per family.
+    if signature_section(ChipFamily::Turing, "tu102") != Some(".fwsignature_tu10x")
+        || signature_section(ChipFamily::Turing, "tu116") != Some(".fwsignature_tu11x")
+        || signature_section(ChipFamily::Ada, "ad102") != Some(".fwsignature_ad10x")
+    {
+        return TestResult::Fail("signature section name drifted");
+    }
+    if signature_section(ChipFamily::Pascal, "gp104").is_some() {
+        return TestResult::Fail("a non-GSP family has no signature section");
+    }
+    // gsp_rm_sections needs both sections; our fixture lacks the sig.
+    if gsp_rm_sections(&elf, ChipFamily::Turing, "tu102").is_some() {
+        return TestResult::Fail("extraction must fail when the sig section is absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_elf", smoke_gsp_elf_section_lookup);
+
+fn smoke_gsp_elf_riscv_desc() -> TestResult {
+    // nvfw_bin_hdr + RM_RISCV_UCODE_DESC fixture.
+    let mut b = alloc::vec![0u8; 0x100];
+    let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    p32(&mut b, 0, NVFW_BIN_MAGIC); // bin_magic
+    p32(&mut b, 12, 0x40); // header_offset -> RM_RISCV_UCODE_DESC
+    p32(&mut b, 16, 0x80); // data_offset -> ucode payload
+    p32(&mut b, 20, 0x40); // data_size
+                           // Descriptor @ 0x40.
+    p32(&mut b, 0x40 + 28, 0x1234); // app_version
+    p32(&mut b, 0x40 + 32, 0x111); // manifest_offset
+    p32(&mut b, 0x40 + 40, 0x222); // monitor_data_offset
+    p32(&mut b, 0x40 + 48, 0x333); // monitor_code_offset
+    let d = match parse_riscv_desc(&b) {
+        Some(d) => d,
+        None => return TestResult::Fail("well-formed bootloader blob must parse"),
+    };
+    if d.code_offset != 0x333 || d.data_offset != 0x222 || d.manifest_offset != 0x111 {
+        return TestResult::Fail("monitor/manifest offsets mis-decoded");
+    }
+    if d.app_version != 0x1234 {
+        return TestResult::Fail("app_version mis-decoded");
+    }
+    if d.ucode_start != 0x80 || d.ucode_len != 0x40 {
+        return TestResult::Fail("ucode payload range mis-decoded");
+    }
+    // Wrong magic is rejected.
+    let mut bad = b.clone();
+    bad[0] ^= 0xFF;
+    if parse_riscv_desc(&bad).is_some() {
+        return TestResult::Fail("a bad nvfw magic must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_elf", smoke_gsp_elf_riscv_desc);
+
+// ────────────────────────────────────────────────────────────────
+// GSP RPC rings — pure geometry + ring math (send/recv are HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_ring::{
+    msgq_tx_header, ring_free, ring_used, CMDQ_OFFSET, ENTRY_OFF, MSGQ_OFFSET, MSG_COUNT,
+    SHARED_SIZE,
+};
+
+fn smoke_gsp_ring_geometry() -> TestResult {
+    // cmdq one page in; msgq after the first 256 KiB queue.
+    if CMDQ_OFFSET != 0x1000 || MSGQ_OFFSET != 0x1000 + 0x40000 {
+        return TestResult::Fail("queue offsets drifted");
+    }
+    if SHARED_SIZE != 0x1000 + 2 * 0x40000 || ENTRY_OFF != 0x1000 || MSG_COUNT != 63 {
+        return TestResult::Fail("shared region geometry drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_geometry);
+
+fn smoke_gsp_ring_pointer_math() -> TestResult {
+    // used = (wptr + count - rptr) % count; free = count-1-used.
+    if ring_used(0, 0, 63) != 0 || ring_free(0, 0, 63) != 62 {
+        return TestResult::Fail("empty ring must have count-1 free");
+    }
+    if ring_used(3, 0, 63) != 3 || ring_free(3, 0, 63) != 59 {
+        return TestResult::Fail("used must track wptr-rptr");
+    }
+    // Wrap-around: wptr behind rptr.
+    if ring_used(1, 60, 63) != 4 {
+        return TestResult::Fail("wrap-around used must be modular");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_pointer_math);
+
+fn smoke_gsp_ring_tx_header() -> TestResult {
+    // msgqTxHeader: version 0, size, msgSize=page, msgCount, writePtr 0,
+    // flags 1, rxHdrOff 32, entryOff page.
+    let h = msgq_tx_header(0x40000, 63);
+    let rd = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+    if rd(0) != 0 || rd(4) != 0x40000 || rd(8) != 4096 || rd(12) != 63 {
+        return TestResult::Fail("tx header version/size/msgSize/msgCount wrong");
+    }
+    if rd(16) != 0 || rd(20) != 1 || rd(24) != 32 || rd(28) != 4096 {
+        return TestResult::Fail("tx header writePtr/flags/rxHdrOff/entryOff wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_tx_header);

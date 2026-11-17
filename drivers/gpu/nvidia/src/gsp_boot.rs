@@ -36,9 +36,9 @@
 //!
 //! The pure, unit-testable logic (section slicing, IMEM tag/pad math
 //! in [`crate::falcon`], WPR2 / mailbox / RISC-V-status decode) plus
-//! the host staging orchestration. The live run can only be proven on
-//! real silicon (QEMU has no NVIDIA GPU) and needs GSP-3's WPR
-//! metadata; those steps are `unsafe` and clearly marked.
+//! the host staging orchestration. The live run consumes the WPR
+//! metadata from [`crate::gsp_image`]; those steps are `unsafe` and
+//! clearly marked.
 
 #![allow(dead_code)]
 
@@ -201,7 +201,7 @@ fn slice<'a>(
         .ok_or(BooterLayoutError::OutOfBounds(tag))
 }
 
-// ── Host orchestration (hardware; QEMU cannot exercise these) ─────
+// ── Host orchestration (hardware) ────────────────────────────────
 
 /// Error running the booter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
