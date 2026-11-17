@@ -1532,7 +1532,7 @@ kernel_test_in!(
 // GSP (Turing+)
 // ────────────────────────────────────────────────────────────────
 
-use crate::gsp::{Gsp, GspRpcFn, GspRpcRing, FBIF_OFFSET, WPR2_HI_SCRATCH};
+use crate::gsp::{Gsp, GspRpcRing, FBIF_OFFSET, WPR2_HI_SCRATCH};
 
 fn smoke_gsp_present_only_on_turing_plus() -> TestResult {
     if !Gsp::family_has_gsp(ChipFamily::Turing) {
@@ -1566,25 +1566,26 @@ fn smoke_gsp_register_constants_pinned() -> TestResult {
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_register_constants_pinned);
 
 fn smoke_gsp_rpc_ring_empty_full_invariants() -> TestResult {
-    let mut r = GspRpcRing::new(0x1000_0000, 4096);
-    if !r.is_empty() {
+    // Page-index ring with 8 message slots.
+    let mut r = GspRpcRing::new(0x1000_0000, 8);
+    if !r.is_empty() || r.used() != 0 {
         return TestResult::Fail("fresh ring must be empty");
     }
-    if r.is_full(64) {
-        return TestResult::Fail("fresh ring is not full");
+    // One slot kept empty: 8 slots -> 7 usable.
+    if r.free() != 7 || r.is_full(7) {
+        return TestResult::Fail("fresh ring must have count-1 free slots");
     }
-    // Wrap-around full check: wptr just before rptr.
-    r.wptr = 4096 - 64;
-    r.rptr = 4096 - 128;
-    if r.is_empty() {
-        return TestResult::Fail("filled ring is not empty");
+    // Advance the write pointer by 3 messages.
+    r.wptr = 3;
+    if r.is_empty() || r.used() != 3 || r.free() != 4 {
+        return TestResult::Fail("used/free must track the page-index pointers");
     }
-    // RPC function-id table — Nop is 0x0001, AllocRoot is 0x0003.
-    if GspRpcFn::Nop as u32 != 0x0001 {
-        return TestResult::Fail("Nop RPC fn id mismatches Nouveau");
+    if !r.is_full(5) {
+        return TestResult::Fail("a 5-slot message must not fit in 4 free slots");
     }
-    if GspRpcFn::AllocRoot as u32 != 0x0003 {
-        return TestResult::Fail("AllocRoot RPC fn id mismatches Nouveau");
+    // Entry offsets are one page apart, starting one page in.
+    if GspRpcRing::entry_offset(0) != 0x1000 || GspRpcRing::entry_offset(2) != 0x3000 {
+        return TestResult::Fail("entry offsets must be entry_off + idx*page");
     }
     TestResult::Pass
 }
@@ -2436,8 +2437,9 @@ fn smoke_gsp_rpc_function_ids_match_rpcfn_h() -> TestResult {
     if GspRpcCmd::GspRmControl as u32 != 76 {
         return TestResult::Fail("GspRmControl = 76");
     }
-    if GSP_RPC_SIGNATURE != 0x36C9_72A7 {
-        return TestResult::Fail("GSP RPC signature 0x36c972a7");
+    // Verified against rpc.c:623 ('C','P','R','V').
+    if GSP_RPC_SIGNATURE != 0x4350_5256 {
+        return TestResult::Fail("GSP RPC signature must be 'CPRV' 0x43505256");
     }
     TestResult::Pass
 }
@@ -2447,24 +2449,31 @@ kernel_test_in!(
 );
 
 fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
-    let h = GspRpcHeader::new(GspRpcCmd::AllocRoot, 64);
+    // 32-byte nvfw_gsp_rpc header; length includes the header.
+    let h = GspRpcHeader::new(GspRpcCmd::AllocRoot as u32, 64, 7);
     let bytes = h.to_bytes();
+    if bytes.len() != 32 {
+        return TestResult::Fail("inner RPC header must be 32 bytes");
+    }
     let back = GspRpcHeader::from_bytes(&bytes);
     if back != h {
         return TestResult::Fail("header round-trip should be identity");
     }
-    if !back.signature_ok() {
-        return TestResult::Fail("fresh header should have valid signature");
+    if !back.signature_ok() || back.header_version != 0x0300_0000 {
+        return TestResult::Fail("fresh header must carry version + valid signature");
     }
-    if back.function != 2 {
-        return TestResult::Fail("function id propagates");
+    if back.function != 2 || back.sequence != 7 {
+        return TestResult::Fail("function id + sequence propagate");
     }
-    if back.length != 64 {
-        return TestResult::Fail("length propagates");
+    if back.length != 32 + 64 {
+        return TestResult::Fail("length must include the 32-byte header");
     }
-    // Corrupting the signature should be detected.
+    if back.rpc_result != 0xFFFF_FFFF {
+        return TestResult::Fail("send-side rpc_result must be the 0xffffffff sentinel");
+    }
+    // Corrupting the signature (bytes[4..8]) should be detected.
     let mut bad = bytes;
-    bad[0] ^= 0xFF;
+    bad[4] ^= 0xFF;
     let corrupt = GspRpcHeader::from_bytes(&bad);
     if corrupt.signature_ok() {
         return TestResult::Fail("signature mismatch must be detected");
@@ -2473,47 +2482,51 @@ fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
 }
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_header_pack_roundtrip);
 
-fn smoke_gsp_enqueue_dequeue_round_trip() -> TestResult {
-    use crate::gsp::GspRpcRing;
-    // We can't easily build a real Gsp without an MmioRegion, but
-    // the enqueue/dequeue logic is on the rings — synthesize them
-    // and exercise the path through a stub.
-    let mut cmdq = GspRpcRing::new(0x4000_0000, 4096);
-    let msgq = GspRpcRing::new(0x4000_4000, 4096);
-    // Stage a fake RPC.
-    let mut out = [0u8; 256];
-    let info = GspSetSystemInfo::new(6, 4, 0x0005_0000);
-    let body = info.to_bytes();
-    // Manually pack — we can't construct `Gsp` here without an
-    // MmioRegion; the wptr-advance code on the ring is the
-    // load-bearing piece.
-    let hdr = GspRpcHeader::new(GspRpcCmd::SetGuestSystemInfo, body.len() as u32);
-    out[..16].copy_from_slice(&hdr.to_bytes());
-    out[16..16 + body.len()].copy_from_slice(&body);
-    let advance = ((16 + body.len()) as u32).next_multiple_of(16);
-    cmdq.wptr = cmdq.wptr.wrapping_add(advance) & (cmdq.size_bytes - 1);
-    if cmdq.wptr != 32 {
-        return TestResult::Fail("cmdq wptr should advance to 32 (16+16 aligned)");
+fn smoke_gsp_rpc_message_build_parse_round_trip() -> TestResult {
+    use crate::gsp::{
+        build_rpc_message, parse_rpc_message, rpc_checksum, rpc_message_slots, GSP_PAGE_SIZE,
+        NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+    };
+    // A small payload fits in a single page slot.
+    let body = GspSetSystemInfo::new(6, 4, 0x0005_0000).to_bytes();
+    if rpc_message_slots(body.len()) != 1 {
+        return TestResult::Fail("a small message occupies one page slot");
     }
-    // Decode it back.
-    let decoded = GspRpcHeader::from_bytes(&out[..16].try_into().unwrap());
-    if decoded.function != GspRpcCmd::SetGuestSystemInfo as u32 {
-        return TestResult::Fail("function id round-trip");
+    let mut out = alloc::vec![0u8; GSP_PAGE_SIZE];
+    let n = match build_rpc_message(NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, 9, &body, &mut out) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("message must build"),
+    };
+    if n != GSP_PAGE_SIZE {
+        return TestResult::Fail("one-slot message must be page-aligned length");
     }
-    if decoded.length != 16 {
-        return TestResult::Fail("body length round-trip");
+    // The element checksum must fold the whole message to zero.
+    if rpc_checksum(&out[..n]) != 0 {
+        return TestResult::Fail("checksum must fold the message to zero");
     }
-    // Decode body.
-    let body_bytes = &out[16..16 + decoded.length as usize];
-    let os_major = u32::from_le_bytes([body_bytes[0], body_bytes[1], body_bytes[2], body_bytes[3]]);
-    if os_major != 6 {
-        return TestResult::Fail("body field round-trip");
+    // Parse it back.
+    let (hdr, payload) = match parse_rpc_message(&out[..n]) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("message must parse"),
+    };
+    if hdr.function != NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO || hdr.sequence != 9 {
+        return TestResult::Fail("function + sequence must round-trip");
     }
-    // msgq is empty; dequeue should yield None at offset 0.
-    let _ = msgq.is_empty();
+    if payload != body {
+        return TestResult::Fail("payload must round-trip");
+    }
+    // A corrupted payload byte breaks the checksum fold.
+    let mut bad = out.clone();
+    bad[80] ^= 0xFF;
+    if parse_rpc_message(&bad[..n]).is_ok() {
+        return TestResult::Fail("a corrupt message must fail the checksum");
+    }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_enqueue_dequeue_round_trip);
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp_rpc_message_build_parse_round_trip
+);
 
 fn smoke_gsp_set_system_info_body_layout() -> TestResult {
     let info = GspSetSystemInfo::new(5, 19, 0x0005_1100);
@@ -4402,6 +4415,10 @@ fn gsp_booter_fixture() -> alloc::vec::Vec<u8> {
     gsp_put_u32(&mut buf, 0xA8, 0x20); // os_code_size
     gsp_put_u32(&mut buf, 0xAC, 0x20); // os_data_offset
     gsp_put_u32(&mut buf, 0xB0, 0x20); // os_data_size
+    gsp_put_u32(&mut buf, 0xB4, 1); // num_apps
+                                    // app[0] @ 0xB8 (secure HS section descriptor).
+    gsp_put_u32(&mut buf, 0xB8, 0x30); // app[0].offset (secure IMEM dst)
+    gsp_put_u32(&mut buf, 0xBC, 0x10); // app[0].size   (secure section size)
     buf
 }
 
@@ -4531,3 +4548,361 @@ fn smoke_gsp_fw_report_completeness() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_report_completeness);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 2 — Falcon secure PIO + booter staging (lane GSP-2)
+// ────────────────────────────────────────────────────────────────
+
+use crate::falcon::{
+    imem_pio_imemc, imem_pio_padded_words, imem_pio_tag_for_word, FalconMem, IMEMC_AINCR_WRITE,
+    IMEMC_SECURE, IMEM_PIO_BLOCK_WORDS,
+};
+use crate::gsp_boot::{
+    booter_sections, riscv_active, section_tag, wpr2_addr, wpr2_set, BooterLayoutError,
+    RISCV_STATUS_ACTIVE,
+};
+use crate::gsp_fw::{parse_booter as gsp2_parse_booter, BooterImage};
+
+fn smoke_gsp2_imem_pio_imemc_bits() -> TestResult {
+    // Non-secure: destination in low 16 bits + auto-increment-write.
+    let c = imem_pio_imemc(0x0100, false);
+    if c & 0xFFFF != 0x0100 {
+        return TestResult::Fail("IMEMC must carry the destination in low 16 bits");
+    }
+    if c & IMEMC_AINCR_WRITE == 0 {
+        return TestResult::Fail("IMEMC must set auto-increment-write");
+    }
+    if c & IMEMC_SECURE != 0 {
+        return TestResult::Fail("non-secure IMEMC must not set the SECURE bit");
+    }
+    // Secure HS: adds the SECURE page bit.
+    if imem_pio_imemc(0x0100, true) & IMEMC_SECURE == 0 {
+        return TestResult::Fail("secure IMEMC must set the SECURE bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_imem_pio_imemc_bits);
+
+fn smoke_gsp2_imem_pio_tag_and_pad() -> TestResult {
+    // Tag latched once per 256-byte (0x40-word) block, incrementing.
+    let base = 0x12u16;
+    if imem_pio_tag_for_word(base, 0) != Some(0x12) {
+        return TestResult::Fail("first word must latch the base tag");
+    }
+    if imem_pio_tag_for_word(base, 1).is_some()
+        || imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS - 1).is_some()
+    {
+        return TestResult::Fail("mid-block words must not re-latch a tag");
+    }
+    if imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS) != Some(0x13) {
+        return TestResult::Fail("second block must latch base+1");
+    }
+    if imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS * 2) != Some(0x14) {
+        return TestResult::Fail("third block must latch base+2");
+    }
+    // Padding rounds up to the 0x40-word block.
+    if imem_pio_padded_words(1) != IMEM_PIO_BLOCK_WORDS {
+        return TestResult::Fail("1 byte must pad to one full block");
+    }
+    if imem_pio_padded_words(256) != IMEM_PIO_BLOCK_WORDS {
+        return TestResult::Fail("256 bytes is exactly one block");
+    }
+    if imem_pio_padded_words(257) != IMEM_PIO_BLOCK_WORDS * 2 {
+        return TestResult::Fail("257 bytes must pad to two blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_imem_pio_tag_and_pad);
+
+fn smoke_gsp2_booter_image_parses_secure_section() -> TestResult {
+    // The GSP-1 fixture now declares an app[0]; parse must surface it.
+    let buf = gsp_booter_fixture();
+    let img = match gsp2_parse_booter(&buf) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("fixture must parse"),
+    };
+    if img.sec_offset != 0x30 || img.sec_size != 0x10 {
+        return TestResult::Fail("app[0] secure section mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_boot",
+    smoke_gsp2_booter_image_parses_secure_section
+);
+
+fn smoke_gsp2_booter_sections_slice() -> TestResult {
+    let buf = gsp_booter_fixture();
+    let img = gsp2_parse_booter(&buf).unwrap();
+    let load = match booter_sections(&buf, &img) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("well-formed booter must slice"),
+    };
+    // Non-secure IMEM: image[0..code_size], dst = code_offset.
+    if load.ns.mem != FalconMem::Imem
+        || load.ns.secure
+        || load.ns.data.len() != img.code_size as usize
+        || load.ns.dst != img.code_offset
+        || load.ns.tag != section_tag(img.code_offset)
+    {
+        return TestResult::Fail("non-secure section mis-sliced");
+    }
+    // Secure IMEM: image[code_size..+sec_size], dst = sec_offset, SECURE.
+    if load.sec.mem != FalconMem::Imem
+        || !load.sec.secure
+        || load.sec.data.len() != img.sec_size as usize
+        || load.sec.dst != img.sec_offset
+        || load.sec.tag != section_tag(img.sec_offset)
+    {
+        return TestResult::Fail("secure section mis-sliced");
+    }
+    // DMEM: image[data_offset..+data_size], dst = 0.
+    if load.dmem.mem != FalconMem::Dmem
+        || load.dmem.data.len() != img.data_size as usize
+        || load.dmem.dst != 0
+    {
+        return TestResult::Fail("dmem section mis-sliced");
+    }
+    // Boot vector is the OS code offset.
+    if load.bootvec != img.code_offset {
+        return TestResult::Fail("bootvec must be os_code_offset");
+    }
+    // section_tag is dst >> 8.
+    if section_tag(0x1234) != 0x12 {
+        return TestResult::Fail("section_tag must be dst >> 8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_booter_sections_slice);
+
+fn smoke_gsp2_booter_sections_requires_secure() -> TestResult {
+    // A container with no secure section is rejected (Turing booter
+    // must have one).
+    let img = BooterImage {
+        bin_magic: 0,
+        bin_ver: 0,
+        image_offset: 0,
+        image_size: 0x40,
+        sig_offset: 0,
+        sig_size: 0,
+        code_offset: 0,
+        code_size: 0x20,
+        data_offset: 0x20,
+        data_size: 0x20,
+        sec_offset: 0,
+        sec_size: 0,
+    };
+    let buf = alloc::vec![0u8; 0x40];
+    if booter_sections(&buf, &img) != Err(BooterLayoutError::NoSecureSection) {
+        return TestResult::Fail("a booter with no secure section must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_boot",
+    smoke_gsp2_booter_sections_requires_secure
+);
+
+fn smoke_gsp2_wpr2_and_riscv_decode() -> TestResult {
+    // WPR2 register: zero means not set; otherwise field[31:4] << 12.
+    if wpr2_set(0) {
+        return TestResult::Fail("zero WPR2 register must read as not-set");
+    }
+    if !wpr2_set(0x0000_0010) {
+        return TestResult::Fail("non-zero WPR2 register must read as set");
+    }
+    // raw 0x0000_1230 -> (0x1230 >> 4) << 12 = 0x123 << 12 = 0x123000.
+    if wpr2_addr(0x0000_1230) != 0x0012_3000 {
+        return TestResult::Fail("WPR2 address decode drifted");
+    }
+    // RISC-V status: bit 0 = active.
+    if riscv_active(0) || !riscv_active(RISCV_STATUS_ACTIVE) {
+        return TestResult::Fail("riscv_active must test bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_wpr2_and_riscv_decode);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 3 — WPR meta + FB layout + radix3 (lane GSP-3)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_rm::{
+    align_down as gsp3_align_down, align_up as gsp3_align_up, fb_layout, radix3_fits,
+    radix3_lvl2_bytes, radix3_lvl2_entries, radix3_max_image_size, WprMeta, GSP_FW_WPR_META_MAGIC,
+    GSP_FW_WPR_META_REVISION, GSP_PAGE_SIZE, WPR_META_SIZE,
+};
+
+fn smoke_gsp3_align_helpers() -> TestResult {
+    if gsp3_align_down(0x1_2345, 0x1000) != 0x1_2000 {
+        return TestResult::Fail("align_down drifted");
+    }
+    if gsp3_align_up(0x1_2001, 0x1000) != 0x1_3000 {
+        return TestResult::Fail("align_up drifted");
+    }
+    if gsp3_align_up(0x1_2000, 0x1000) != 0x1_2000 {
+        return TestResult::Fail("align_up of an aligned value must be identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_align_helpers);
+
+fn smoke_gsp3_wpr_meta_packs_to_256() -> TestResult {
+    // A representative layout, then the packed descriptor.
+    let fb = fb_layout(
+        8 << 30,                  // 8 GiB VRAM
+        (8u64 << 30) - 0x10_0000, // bios/vga at top - 1 MiB
+        0x1_0000,                 // bootloader size
+        0x80_0000,                // elf size (8 MiB)
+        0x800_0000,               // wpr heap size (128 MiB)
+    );
+    let meta = WprMeta::from_layout(
+        &fb,
+        0xAABB_C000,
+        0x1234_0000,
+        0x1_0000,
+        0,
+        0x800,
+        0x1000,
+        0x5000_0000,
+        0x100,
+    );
+    let bytes = meta.to_bytes();
+    if bytes.len() != WPR_META_SIZE || WPR_META_SIZE != 256 {
+        return TestResult::Fail("GspFwWprMeta must be exactly 256 bytes");
+    }
+    let rd = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    if rd(0x00) != GSP_FW_WPR_META_MAGIC {
+        return TestResult::Fail("magic must be at offset 0x00");
+    }
+    if rd(0x08) != GSP_FW_WPR_META_REVISION {
+        return TestResult::Fail("revision must be at offset 0x08");
+    }
+    if rd(0x10) != 0xAABB_C000 {
+        return TestResult::Fail("sysmemAddrOfRadix3Elf must be at 0x10");
+    }
+    if rd(0x18) != fb.elf.size {
+        return TestResult::Fail("sizeOfRadix3Elf must be the ELF size at 0x18");
+    }
+    if rd(0x70) != fb.wpr2.addr {
+        return TestResult::Fail("gspFwWprStart must be the WPR2 base at 0x70");
+    }
+    // verified must be left zero (the booter writes the sentinel back).
+    if rd(0xF8) != 0 {
+        return TestResult::Fail("verified must be initialised to 0 at 0xF8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_wpr_meta_packs_to_256);
+
+fn smoke_gsp3_fb_layout_ordering() -> TestResult {
+    let fb_size = 8u64 << 30;
+    let bios = fb_size - 0x10_0000;
+    let fb = fb_layout(fb_size, bios, 0x1_0000, 0x80_0000, 0x800_0000);
+    // Top-down carve: heap < wpr2 < ... < frts < vga, all below fb_size.
+    if !(fb.heap.addr < fb.wpr2.addr
+        && fb.wpr2_heap.addr < fb.elf.addr
+        && fb.elf.addr < fb.boot.addr
+        && fb.boot.addr < fb.frts.addr
+        && fb.frts.end() <= fb.vga_workspace.addr
+        && fb.vga_workspace.end() == fb_size)
+    {
+        return TestResult::Fail("regions must stack top-down without overlap");
+    }
+    // Alignment invariants from tu102_gsp_oneinit.
+    if fb.boot.addr % 0x1000 != 0
+        || fb.elf.addr % 0x1_0000 != 0
+        || fb.wpr2_heap.addr % 0x10_0000 != 0
+        || fb.wpr2.addr % 0x10_0000 != 0
+    {
+        return TestResult::Fail("region alignments drifted from the reference");
+    }
+    // frts is a fixed 1 MiB; WPR2 spans its base up to frts.end().
+    if fb.frts.size != 0x10_0000 || fb.wpr2.end() != fb.frts.end() {
+        return TestResult::Fail("WPR2 must span up to the end of FRTS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_fb_layout_ordering);
+
+fn smoke_gsp3_radix3_sizing() -> TestResult {
+    // Entry count = ceil(size / page).
+    if radix3_lvl2_entries(GSP_PAGE_SIZE) != 1
+        || radix3_lvl2_entries(GSP_PAGE_SIZE + 1) != 2
+        || radix3_lvl2_entries(0) != 0
+    {
+        return TestResult::Fail("lvl2 entry count must be ceil(size/page)");
+    }
+    // One page of image -> one 8-byte PTE -> padded to a full page.
+    if radix3_lvl2_bytes(GSP_PAGE_SIZE) != GSP_PAGE_SIZE {
+        return TestResult::Fail("lvl2 bytes must pad up to a page");
+    }
+    // Max image = 512 * 512 * page = 1 GiB; one more page does not fit.
+    if radix3_max_image_size() != 1 << 30 {
+        return TestResult::Fail("radix3 must address exactly 1 GiB");
+    }
+    if !radix3_fits(1 << 30) || radix3_fits((1 << 30) + GSP_PAGE_SIZE) {
+        return TestResult::Fail("radix3_fits must bound at 1 GiB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_radix3_sizing);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 4 — RPC wire format corrections (lane GSP-4)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_gsp4_element_doorbell_and_sequence() -> TestResult {
+    use crate::gsp::{
+        GspMsgElement, GSP_DOORBELL_OFFSET, GSP_INIT_SEQUENCE, GSP_MSG_HDR_SIZE,
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+        NV_VGPU_MSG_FUNCTION_NOP, NV_VGPU_MSG_FUNCTION_SET_REGISTRY,
+    };
+    // Outer element header is 48 bytes with checksum/seq/count packed
+    // after the two 16-byte tag buffers.
+    let elem = GspMsgElement {
+        auth_tag_buffer: [0; 16],
+        aad_buffer: [0; 16],
+        checksum: 0x1122_3344,
+        sequence: 5,
+        elem_count: 2,
+        pad: 0,
+    };
+    let b = elem.to_bytes();
+    if b.len() != 48 || GSP_MSG_HDR_SIZE != 48 {
+        return TestResult::Fail("outer element must be 48 bytes");
+    }
+    if u32::from_le_bytes([b[32], b[33], b[34], b[35]]) != 0x1122_3344
+        || u32::from_le_bytes([b[40], b[41], b[42], b[43]]) != 2
+    {
+        return TestResult::Fail("checksum/elem_count must pack at 0x20/0x28");
+    }
+    // Verified function/event ids.
+    if NV_VGPU_MSG_FUNCTION_NOP != 0
+        || NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO != 72
+        || NV_VGPU_MSG_FUNCTION_SET_REGISTRY != 73
+        || NV_VGPU_MSG_EVENT_GSP_INIT_DONE != 0x1001
+    {
+        return TestResult::Fail("function/event ids drifted from rpcfn.h");
+    }
+    // Doorbell is the GSP Falcon base + 0xc00.
+    if GSP_DOORBELL_OFFSET != 0x0011_0000 + 0xC00 {
+        return TestResult::Fail("doorbell must be GSP falcon base + 0xc00");
+    }
+    // Init handshake order: SET_SYSTEM_INFO, SET_REGISTRY, then wait
+    // for the GSP_INIT_DONE event.
+    if GSP_INIT_SEQUENCE
+        != [
+            NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
+            NV_VGPU_MSG_FUNCTION_SET_REGISTRY,
+            NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+        ]
+    {
+        return TestResult::Fail("init handshake order drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp4_element_doorbell_and_sequence
+);
