@@ -1209,8 +1209,9 @@ mod tests {
     kernel_test_in!("net/sntp", smoke_sntp_exchange_slew_end_to_end);
 
     fn smoke_sntp_exchange_step_end_to_end() -> TestResult {
-        // Server is 3600 s ahead: the sample steps the wall clock at once.
-        e2e_setup(3_600_000_000_000, true);
+        // Server is 500 s ahead: over the 128 ms step threshold (STEPT) and
+        // under the 1000 s panic threshold (PANICT), so the sample steps.
+        e2e_setup(500_000_000_000, true);
         let cfg = SntpConfig::new(E2E_SERVER);
         let before = narf_time::wall_offset_ns();
         let (sample, outcome) = match sync_once(&cfg) {
@@ -1228,8 +1229,8 @@ mod tests {
         if moved != sample.offset_ns {
             return TestResult::Fail("a step should move the wall by exactly the sample offset");
         }
-        if !(3_600_000_000_000..=3_600_001_000_000).contains(&sample.offset_ns) {
-            return TestResult::Fail("fixture offset should read ~+3600 s");
+        if !(500_000_000_000..=500_001_000_000).contains(&sample.offset_ns) {
+            return TestResult::Fail("fixture offset should read ~+500 s");
         }
         TestResult::Pass
     }
