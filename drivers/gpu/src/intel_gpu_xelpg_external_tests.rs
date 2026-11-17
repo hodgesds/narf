@@ -1110,8 +1110,40 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
             != Some(ExternalError::UnsupportedPort)
         || probe_sink(&NoAccess, Generation::LunarLake, XeLpgPort::B, false).err()
             != Some(ExternalError::UnsupportedPort)
+        || probe_link_profile(
+            &NoAccess,
+            ExternalDisplayProfile::WILDCAT_LAKE,
+            XeLpgPort::Tc3,
+            false,
+        )
+        .err()
+            != Some(ExternalError::UnsupportedPort)
     {
         return TestResult::Fail("generation/port refusals must precede MMIO");
+    }
+    if !ExternalDisplayProfile::WILDCAT_LAKE.admits_port(XeLpgPort::Tc1)
+        || !ExternalDisplayProfile::WILDCAT_LAKE.admits_port(XeLpgPort::Tc2)
+        || ExternalDisplayProfile::WILDCAT_LAKE.admits_port(XeLpgPort::Tc3)
+        || ExternalDisplayProfile::WILDCAT_LAKE.display_ip() != DisplayIp::WildcatLake
+    {
+        return TestResult::Fail("WCL must retain its TC1/TC2 profile");
+    }
+    if !matches!(
+        free_pipe(
+            &ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024())),
+            ExternalDisplayProfile::WILDCAT_LAKE
+        ),
+        Ok(Pipe::B)
+    ) {
+        return TestResult::Fail("WCL must allocate its real Pipe B");
+    }
+    let pipes = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    pipes.set_conf(1, ENABLE);
+    pipes.set_conf(2, ENABLE);
+    if free_pipe(&pipes, ExternalDisplayProfile::WILDCAT_LAKE) != Err(ExternalError::NoFreePipe)
+        || free_pipe(&pipes, ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd)) != Ok(Pipe::D)
+    {
+        return TestResult::Fail("WCL must not scan or allocate absent Pipe D");
     }
     let io = ExtFake::new(XeLpgPort::Tc4, Sink::new(0x14, edid_1024()));
     io.pica_isr.set(pica_tbt_hotplug(3));

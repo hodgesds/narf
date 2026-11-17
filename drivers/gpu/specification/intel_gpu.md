@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.84** (v0.83 plus Wildcat Lake's disconnected source-order
+> Status: **v0.85** (v0.84 plus Wildcat Lake's disconnected TC1/TC2-only
+> external-display and Pipe-B/C allocation profile; Wildcat Lake's disconnected source-order
 > MacCLK, lane-reset, PLL-rate and disable state machines; its DP 1.4/UHBR
 > per-lane swing/cursor programming; its disconnected LT-PHY TC1/TC2 VDR
 > and retrying P2P transmitter transport; its DP PLL/write-image,
@@ -303,7 +304,11 @@ workaround. `DisplayIp::WildcatLake` retains display 30's timing-generator,
 PM-demand, watermark and CDCLK rules for pure resource admission, with only
 Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
 programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
-D. `intel_gpu_lt_phy` separately models WCL's TC1/TC2-only LT-PHY boundary:
+D. The disconnected `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits
+only TC1/TC2 and scans only Pipes B/C, so sharing Panther Lake's graphics
+generation cannot silently grant TC3/TC4, Pipe D or C20 authority. No
+production probe or hotplug entry selects it. `intel_gpu_lt_phy` separately
+models WCL's TC1/TC2-only LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
 VDR write image, LT transmitter ownership/masking, and the DP 1.4/UHBR signal
 tables. Its crate-private, disconnected transport serializes the 81 committed

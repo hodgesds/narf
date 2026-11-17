@@ -202,7 +202,7 @@ impl MtlMstRoute {
                 // Local admission leaves all already-running streams alone.
                 continue;
             }
-            let pipe = match free_pipe(io) {
+            let pipe = match free_pipe(io, ExternalDisplayProfile::for_ip(self.link.display_ip)) {
                 Ok(pipe) => pipe,
                 Err(ExternalError::NoFreePipe) => break,
                 Err(error) => return Err(error),
@@ -425,7 +425,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     pipes: Pipes,
     payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    let pipe = match free_pipe(io) {
+    let pipe = match free_pipe(io, ExternalDisplayProfile::for_ip(probe.display_ip)) {
         Ok(pipe) => pipe,
         Err(error) => return Err(ActivateError::Refused(probe, error)),
     };

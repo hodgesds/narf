@@ -161,6 +161,47 @@ use crate::intel_gpu_xelpg_tc::{
     disconnect as tc_disconnect, TcConnection, TcError, TcMode,
 };
 
+/// Source-qualified external-display limits which cannot be inferred from
+/// [`Generation`].  Wildcat Lake shares the Panther Lake graphics generation
+/// but has the distinct display-30.02 descriptor: only TC1/TC2, Pipes A-C and
+/// LT PHYs.  Keeping that identity here prevents a future route from silently
+/// inheriting Panther Lake's TC3/TC4, Pipe D or C20 programming.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalDisplayProfile {
+    display_ip: DisplayIp,
+}
+
+impl ExternalDisplayProfile {
+    pub(crate) const WILDCAT_LAKE: Self = Self {
+        display_ip: DisplayIp::WildcatLake,
+    };
+
+    const fn for_generation(generation: Generation) -> Option<Self> {
+        match DisplayIp::for_generation(generation) {
+            Some(display_ip) => Some(Self { display_ip }),
+            None => None,
+        }
+    }
+
+    const fn for_ip(display_ip: DisplayIp) -> Self {
+        Self { display_ip }
+    }
+
+    pub(crate) const fn display_ip(self) -> DisplayIp {
+        self.display_ip
+    }
+
+    pub(crate) const fn admits_port(self, port: XeLpgPort) -> bool {
+        match self.display_ip {
+            DisplayIp::Xelpdp => !matches!(port, XeLpgPort::A),
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => port.tc_index().is_some(),
+            DisplayIp::WildcatLake => {
+                matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
+            }
+        }
+    }
+}
+
 /// DPCD receiver-capability bytes read at probe (0x000..0x00F, the span
 /// `read_caps` decodes; `DP_MAX_DOWNSPREAD` is byte 3).
 const DPCD_RECEIVER_CAP_BYTES: usize = 16;
@@ -462,10 +503,17 @@ pub(crate) fn request_pipe_wells<M: MmioWindow + ?Sized>(
     request_well(io, pipe_well(pipe))
 }
 
-/// The lowest Pipe B–D whose transcoder, primary plane and transcoder
-/// function are all off (Linux assigns CRTCs; Pipe A stays the panel's).
-fn free_pipe<M: MmioWindow + ?Sized>(io: &M) -> Result<Pipe, ExternalError> {
+/// The lowest real external pipe whose transcoder, primary plane and
+/// transcoder function are all off (Linux assigns CRTCs; Pipe A stays the
+/// panel's). WCL has no Pipe D, so its profile never reads Pipe-D MMIO.
+fn free_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+) -> Result<Pipe, ExternalError> {
     for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        if pipe as usize >= profile.display_ip.pipe_count() {
+            continue;
+        }
         let conf = read(io, pipe.base() + CONF)?;
         let plane = read(io, pipe.base() + PLANE_CTL_1)?;
         let func = read(io, trans_ddi_func_ctl(pipe.transcoder()))?;
@@ -532,7 +580,7 @@ fn preflight_clock_ip<M: MmioWindow + ?Sized>(
     if ddi & DDI_BUF_CTL_ENABLE != 0 || clock & clock_mask != 0 {
         return Err(ExternalError::PortBusy);
     }
-    let pipe = free_pipe(io)?;
+    let pipe = free_pipe(io, ExternalDisplayProfile::for_ip(ip))?;
     let panel = read(io, Pipe::A.base() + CONF)? & (ENABLE | STATE);
     let pipes = match (panel, display.panel) {
         (0, _) => Pipes::adopt_ip(ip, None, 0),
@@ -704,19 +752,26 @@ fn probe_link<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     legacy_port: bool,
 ) -> Result<LinkProbe, ExternalError> {
-    let display_ip =
-        DisplayIp::for_generation(generation).ok_or(ExternalError::UnsupportedGeneration)?;
+    let profile = ExternalDisplayProfile::for_generation(generation)
+        .ok_or(ExternalError::UnsupportedGeneration)?;
+    probe_link_profile(io, profile, port, legacy_port)
+}
+
+fn probe_link_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+) -> Result<LinkProbe, ExternalError> {
+    let display_ip = profile.display_ip;
     // Display >= 20 relocates combo DDI B's PHY/AUX register views into PICA.
     // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort;
     // admit only that source-qualified USB-C path for now. Display 30's
     // mandatory fixed-refresh VRR timing generator is owned by Pipes.
-    if display_ip.xe2_plus() && port.tc_index().is_none() {
+    if !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort);
     }
     let display20 = display_ip.xe2_plus();
-    if port == XeLpgPort::A {
-        return Err(ExternalError::UnsupportedPort);
-    }
     // Do not acquire/release Type-C ownership behind an inherited live DDI.
     if read(io, port.ddi_buf_ctl())? & DDI_BUF_CTL_ENABLE != 0 {
         return Err(ExternalError::PortBusy);

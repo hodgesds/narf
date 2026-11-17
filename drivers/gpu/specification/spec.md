@@ -406,11 +406,15 @@ Gen12 orchestrator use.
 proofs. Recognition grants no programming authority: `DisplayIp::{Xelpdp,
 Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 admitted
 only through the explicitly opted-in `decode_all` route.
-`DisplayIp::WildcatLake` is constructed only for pure resource modelling:
+`DisplayIp::WildcatLake` is constructed only for pure resource and external
+profile modelling:
 display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
-MMIO image. No decode/read/route returns it and it grants no LT-PHY or modeset
-authority. `intel_gpu_lt_phy` is an additional pure model of the WCL TC1/TC2
+MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
+future external owner to TC1/TC2 and scans only Pipes B/C; it is not selected
+by a production entry point. No decode/read/route returns the IP and the
+profile grants no LT-PHY or modeset authority. `intel_gpu_lt_phy` is an
+additional pure model of the WCL TC1/TC2
 LT-PHY boundary: exact RBR-through-UHBR20 DP PLL/VDR images, transmitter
 ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
 executes those images only for a display-30-qualified window and implements the
