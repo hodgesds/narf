@@ -1655,6 +1655,8 @@ observable error state, for which `read(2)` returns EOF. Only a group leader
 may select `pinned` or `exclusive`. An exclusive hardware group runs only
 while no hardware event outside that group owns a counter on the CPU.
 
+Perf event descriptors have read/write access (`O_RDWR`), allowing the
+shared writable mapping that consumers use to advance `data_tail`.
 A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.
 The metadata seqlock publishes the count and enabled/running times; `index`
