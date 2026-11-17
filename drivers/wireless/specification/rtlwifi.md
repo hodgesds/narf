@@ -3159,7 +3159,8 @@ the coexistence owner runs every composed call site.
   `low2high_rssi_thresh_for_ra40m` = 0, the 8821AE rule). Only the RA mask
   refresh was initially composed; the retained watchdog now also runs
   false-alarm/RSSI collection, DIG, EDCCA, CCK PD and linked ATC.
-  EDCA turbo and calibrated TX-power tracking remain open.
+  EDCA turbo is composed as described below; calibrated TX-power tracking
+  remains open.
   `power_runtime::disable_rtl8723be` = `_rtl8723be_poweroff_adapter`
   (LPS-enter flow, self-reset on MCUFWDL BIT7 + ready, MCU reset,
   MCUFWDL 0, card-disable flow, RSV_CTRL+1 pulse, RSV_CTRL 0x0e); the
@@ -3340,7 +3341,7 @@ the coexistence owner runs every composed call site.
     `special_packet` / IPS call sites from the shared station (handshake
     EAPOL replies produced inside the sync TX path are not covered — no
     async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond
-    the RA refresh except EDCA turbo and
+    the RA refresh including EDCA turbo, except
     TX-power tracking (see `dm.rs`), short-preamble TX, TX-report
     matching for the station. Tests
     `smoke_rtl8723be_station_registers_and_rsvd_page`,
@@ -3364,8 +3365,46 @@ cap limits and the strict (-80,80) kHz ATC window. The unlinked helper
 retains the initial factory cap separately so an adjustment cannot become
 the new restore value. Native tests cover wire offsets/BSSID selection,
 signed extremes, stale samples, hysteresis, clamps and RX-to-watchdog
-composition. EDCA turbo, calibrated TX-power tracking, handshake-EAPOL
+composition. Calibrated TX-power tracking, handshake-EAPOL
 coexistence before synchronous TX and PCIe ASPM remain open.
+
+**EDCA turbo continuation.** `dm::edca` ports
+`rtl8723be_dm_check_edca_turbo`, `rtl8723_dm_init_edca_turbo` and
+`base.c::rtl_recognize_peer`. The native owner retains per-owner unicast
+TX/RX byte totals and watchdog snapshots before lazy DM initialization.
+Every accepted unicast MPDU counts (including management and Null), with
+the four RX FCS bytes counted as in Linux's skb. TX totals advance after
+successful descriptor publication and doorbell; failed submissions never
+train the watchdog. Counts, deltas and the four-times comparison wrap as
+u64, matching the source's unsigned arithmetic.
+
+The watchdog runs EDCA after RA refresh and before ATC, under the same
+signed station/calibration invocation. Every eligible pass writes BE at
+`0x508`: `0x6ea42b` normally; Cisco N24 uses `0x3ea430` for upload or
+`0x5ea630` for download. Download requires RX > 4*TX except Ralink/Atheros,
+whose receive bias selects download unless TX > 4*RX. B mode skips the
+write and retains the previous turbo/direction flags, while still latching
+the byte snapshots. Firmware LPS skips the DM steps. Non-BE traffic or
+disabled framebursting exits turbo; BE restoration is the source's
+software flag reset, with no BE register write. These flags retain their
+source defaults in the native profile; no tuning API is added. Live WMM
+parameter application and an ERP slot-time change reset the software
+turbo flags; a preamble-only change does not.
+
+Peer recognition uses only complete beacons from the programmed BSSID
+through the second linked watchdog period. It follows the source's vendor
+IE OUIs, BSSID-prefix fallbacks and precedence. IE extents are validated
+before reading an OUI, fixing the source's late bounds check. A new peer
+or disconnection clears recognition state. Peer identity and traffic
+samples grant no channel, rate or TX-power authority. Access failures,
+including lazy DM initialization and the EDCA write, leave the native
+owner Failed and prevent later watchdog writes.
+
+The chip state is boxed so these statistics do not enlarge generic
+packet-owner moves and the cold removal/rebuild stack frame. Native tests
+cover literal Cisco/default values, strict direction boundaries and wraparound,
+vendor bounds/window/precedence, actual RX/TX accounting, LPS suppression
+and failed-access handling. Silicon validation remains pending.
 
 ### RTL8723AE retained runtime (probe-admitted; station admission open)
 

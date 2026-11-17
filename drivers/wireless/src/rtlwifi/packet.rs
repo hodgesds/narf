@@ -5,7 +5,7 @@
 use super::{
     extent, Error, Io, Memory, Phase, Prepared, RX_BASE, RX_BUFFER, RX_BYTES, TX_BASES, TX_BYTES,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 /// A transport operation executes inside current PCI authority, including
 /// actual descriptor/payload accesses. No DMA pointer or authority escapes.
@@ -111,7 +111,9 @@ pub(super) struct State<M: Memory> {
     pub(super) ce92: ce92::State,
     /// RTL8723BE receive/beacon-control cache, RA link and RX C2H queue
     /// (`rtl8723be/packet_owner.rs`).
-    pub(super) be8723: be8723::State,
+    // Keep chip-specific DM/statistics out of every generic Prepared
+    // move, including the cold removal/rebuild future's kernel frame.
+    pub(super) be8723: Box<be8723::State>,
     /// RTL8192DE chip facts, mailbox, beacon-control/RCR caches and RA link
     /// (`rtl8192de/packet_owner.rs`).
     pub(super) de92: de92::State,
@@ -146,7 +148,7 @@ impl<M: Memory> State<M> {
             ae: ae::State::new(),
             ee92: ee92::State::new(),
             ce92: ce92::State::new(),
-            be8723: be8723::State::new(),
+            be8723: Box::new(be8723::State::new()),
             de92: de92::State::new(),
             rate_mask: None,
             retired: Vec::new(),

@@ -169,17 +169,24 @@ pub async fn provision() -> Result<(), &'static str> {
     let authority = super::provision::authority().map_err(|_| "firmware authority unavailable")?;
     provision_using(&owner, &authority, super::provision::MANIFEST).await
 }
-async fn provision_using(
-    owner: &Bootstrap,
-    authority: &narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
-    manifest: &str,
-) -> Result<(), &'static str> {
-    provision_checked(owner, authority, manifest, || {
-        narf_wireless::reg::db::ensure_domain()
-            .map(|_| ())
-            .map_err(|_| "signed regulatory policy unavailable")
+#[inline(never)]
+fn provision_using<'a>(
+    owner: &'a Bootstrap,
+    authority: &'a narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    manifest: &'a str,
+) -> core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), &'static str>> + Send + 'a>,
+> {
+    // Keep provisioning's poll frame separate from the scheduled retry
+    // task even under fat LTO. Cancellation still drops the same guards.
+    alloc::boxed::Box::pin(async move {
+        provision_checked(owner, authority, manifest, || {
+            narf_wireless::reg::db::ensure_domain()
+                .map(|_| ())
+                .map_err(|_| "signed regulatory policy unavailable")
+        })
+        .await
     })
-    .await
 }
 async fn provision_checked(
     owner: &Bootstrap,

@@ -1043,6 +1043,7 @@ pub const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x03];
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// A runtime over a ready core and its DP.
+    #[inline(never)]
     pub fn new(core: Ath11kCore<CeHif<Io, Irq>, Q>, dp: Dp) -> Self {
         let own = core.mac_addr.unwrap_or_default();
         let mut vdevs = Vec::with_capacity(WCN6855_MAX_VDEVS);
@@ -4655,7 +4656,9 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
-    let rt = Rt::new(core, dp);
+    // Keep construction separate from registration and the retained
+    // Shared allocation; do not reserve another runtime-sized local.
+    let rt = alloc::boxed::Box::new(Rt::new(core, dp));
     let hw_cfg = super::mac::MacConfig::for_hw(
         rt.dp.cfg.hw.hw_rev,
         rt.dp.cfg.num_rxdma_per_pdev,
@@ -4665,7 +4668,7 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         Ok(r) => r,
         Err(e) => {
             e.report("ath11k mac register");
-            return (Shared::new(rt, secure_random), Err(e));
+            return (Shared::new(*rt, secure_random), Err(e));
         }
     };
     if radios.is_empty() {
@@ -4673,12 +4676,12 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         // (unreachable after a successful `pdev_create` that reported
         // the READY extra addresses): keep the runtime unregistered.
         return (
-            Shared::new(rt, secure_random),
+            Shared::new(*rt, secure_random),
             Err(TransportError::new(step::MAC_CAPS, 8, ENODEV)),
         );
     }
     let initial_reg = rt.core.reg_info.clone();
-    let shared = Shared::new(rt, secure_random);
+    let shared = Shared::new(*rt, secure_random);
     register_ahb_radios(shared, hw_cfg, single, radios, initial_reg)
 }
 

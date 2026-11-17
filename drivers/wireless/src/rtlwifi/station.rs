@@ -1490,7 +1490,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     /// Program all four EDCA rows inside the retained calibration (or HT
     /// grant) invocation. Every row is admitted before the first write and
     /// every write is read back, both at association and for a live update.
-    fn program_station_edca(&self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
+    fn program_station_edca(&mut self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
         let calibration = self.station.calibration.as_ref().ok_or(Error::Profile)?;
         let program = || {
             if self.chip == super::Chip::Rtl8821ae {
@@ -1528,6 +1528,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             ht.invoke(program)?;
         } else {
             calibration.with_current(program)?;
+        }
+        if self.chip == super::Chip::Rtl8723be {
+            self.packet.be8723.edca.reset();
         }
         Ok(())
     }
@@ -1604,6 +1607,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 super::super::rtl8723be::station::erp_changed(&self.io, old, new)
                     .map_err(|_| RadioError::State)
             })?;
+            if old.1 != new.1 {
+                // HW_VAR_SLOT_TIME runs the AC_PARAM software resets.
+                self.packet.be8723.edca.reset();
+            }
             self.packet.be8723.erp_timing = Some(new);
         } else if ce {
             let prime_sc = self.rtl8192ce_prime_sc();

@@ -31,7 +31,6 @@
 19112 narf_drivers_gpu::amdgpu_navi48_platform::restart::{{closure}}
 18760 <narf_drivers_gpu::amdgpu_navi48_boot::Hardware as narf_drivers_gpu::amdgpu_navi48_boot::Backend>::step::{{closure}}
 18392 narf_drivers_gpu::amdgpu_navi48_platform::status
-18088 narf_drivers_wireless::ath11k::iface::pci_virtual_create
 18040 narf_drivers_wireless::rtlwifi::prepare_native::prepare_rtl8192ee::{{closure}}
 18008 <narf_drivers_wireless::iwlwifi::device::Device as narf_wireless::WirelessNetIface>::roam::{{closure}}
 16632 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::after_reset
@@ -45,7 +44,6 @@
 13848 narf_time::timer::timers_prepare_cpu
 13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
 13560 narf_drivers_wireless::ath10k::interface::publish_with_mac
-13512 narf_drivers_wireless::iwlwifi::probe
 13448 narf_drivers_wireless::ath9k::ar9287_owner::compose
 13416 narf_drivers_wireless::ath9k::ar5008_owner::compose
 13416 narf_drivers_wireless::ath9k::ar9280_owner::compose

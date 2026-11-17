@@ -79,6 +79,7 @@ pub(in super::super) struct State {
     /// initialised from the live BB state on the first watchdog run.
     pub(in super::super) dm: Option<dm::Dm>,
     pub(in super::super) cfo: dm::Cfo,
+    pub(in super::super) edca: dm::edca::Edca,
     bssid: [u8; 6],
     /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
     pub(in super::super) min_space_cfg: u8,
@@ -105,6 +106,7 @@ impl State {
             ratr_state: 0,
             dm: None,
             cfo: dm::Cfo::default(),
+            edca: dm::edca::Edca::default(),
             bssid: [0; 6],
             min_space_cfg: 0,
             erp_timing: None,
@@ -379,6 +381,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         })?;
         self.io.kick(poll)?;
         self.phase = Phase::Running;
+        self.packet.be8723.edca.transmitted(frame);
         Ok(id)
     }
 
@@ -497,6 +500,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             Ok((true, packet, report))
         })?;
         self.packet.be8723.cfo = cfo;
+        if let Some(mpdu) = &packet {
+            self.packet.be8723.edca.received(
+                mpdu.bytes(),
+                bssid,
+                self.packet.be8723.link.is_some(),
+            );
+        }
         if let Some((bytes, take)) = report {
             // `rtl_c2hcmd_enqueue`: bounded, the oldest dropped.
             if self.packet.be8723.c2h.len() >= C2H_QUEUE {
@@ -604,6 +614,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let timing = hw::configure_rates(&self.io, rates, basic, capability, None, false)?;
         self.packet.be8723.erp_timing = Some(timing);
         self.packet.be8723.bssid = peer;
+        self.packet.be8723.edca.clear_peer();
         self.phase = Phase::Running;
         Ok(())
     }
@@ -939,8 +950,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// then `rtl_watchdog_wq_callback`'s `btc_periodical` through the
     /// coexistence owner (with the queued C2H first, as `c2hcmd_wq` runs
     /// ahead of it; the coexistence step also runs in leisure PS, the DM
-    /// steps do not). EDCA turbo and
-    /// TX-power tracking are not composed (`dm.rs` module note). Returns
+    /// steps do not). EDCA turbo runs after RA refresh and before ATC;
+    /// TX-power tracking is not composed (`dm.rs` module note). Returns
     /// whether a mask was sent.
     pub(super) async fn be8723_dm_watchdog(
         &mut self,
@@ -951,15 +962,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.be8723_service_c2h().await?;
+        self.packet
+            .be8723
+            .edca
+            .linked_tick(self.packet.be8723.link.is_some());
         let mut refreshed = false;
         // The DM steps run only with the firmware out of power save;
         // `btc_periodical` runs from `rtl_watchdog_wq_callback` either way.
         if !self.packet.leisure {
             let linked = self.packet.be8723.link.is_some();
+            self.phase = Phase::Failed;
             if self.packet.be8723.dm.is_none() {
                 self.packet.be8723.dm = Some(dm::Dm::init(&self.io)?);
             }
-            self.phase = Phase::Failed;
             let dm = self.packet.be8723.dm.as_mut().ok_or(Error::State)?;
             dm.one_entry_only = dm::common_info(linked);
             let fa = dm::false_alarm(&self.io)?;
@@ -987,6 +1002,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             // the watchdog state after the mailbox await, with its usual
             // terminal-on-access-failure discipline.
             self.phase = Phase::Failed;
+            let mode = self
+                .packet
+                .be8723
+                .link
+                .map_or(h2c::WirelessMode::G, |(peer, _, _)| peer.mode());
+            self.packet.be8723.edca.watchdog(&self.io, mode)?;
             let dm = self.packet.be8723.dm.as_mut().ok_or(Error::State)?;
             if linked {
                 dm::atc_switch_linked(&self.io, dm, &self.packet.be8723.cfo)?;
@@ -1061,6 +1082,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.be8723.ratr_state = 0;
         self.packet.be8723.erp_timing = None;
         self.packet.be8723.bssid = [0; 6];
+        self.packet.be8723.edca.clear_peer();
         hw::network_type_station(&self.io, &mut self.packet.be8723.receive, false)?;
         self.rtl8723be_coex
             .as_deref_mut()

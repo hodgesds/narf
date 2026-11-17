@@ -203,6 +203,19 @@ strict clippy, debug checking and formatting also pass. The aarch64
 repeat after rebasing was skipped at the user's request; the preceding
 aarch64 results above are retained. Physical acceptance remains pending.
 
+The next same-branch continuation composes RTL8723BE EDCA turbo with
+native unicast byte accounting, bounded associated-beacon vendor
+recognition and source Cisco/default contention values. It also makes a
+failed lazy DM initialization terminal. Four native regressions cover the
+policy, recognition, RX/TX-to-watchdog path and access failures; all four
+pass in x86 QEMU. The release kernel and stack gate, strict release clippy,
+debug checking and formatting pass. The broader rtlwifi run exposed stale
+RTL8192DE HT capability/timing expectations; their final width-filtered
+correction awaits the combined-branch rerun. A full wireless attempt also
+found RTL8723BU and Intel P2P fixture failures and stalled in the watchdog
+work smoke; it was stopped for focused investigation. The full gate remains
+open; aarch64 stays skipped as requested. No physical acceptance is claimed.
+
 The first parallel feature wave adds retained API77 Intel management-queue
 ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
 eight-byte removal response), MT7921/MT7922 active scans with four directed or

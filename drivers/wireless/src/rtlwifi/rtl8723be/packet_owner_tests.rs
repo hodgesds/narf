@@ -66,6 +66,8 @@ struct Model {
     kicks: Vec<u16>,
     master: bool,
     next: u64,
+    deny: bool,
+    fail_write32: Option<u16>,
 }
 #[derive(Clone)]
 struct BePort(Arc<IrqSafeSpinLock<Model>>);
@@ -77,6 +79,8 @@ impl BePort {
             kicks: Vec::new(),
             master: false,
             next: 0x10_0000,
+            deny: false,
+            fail_write32: None,
         })))
     }
     fn block(&self, bytes: usize) -> Block {
@@ -114,13 +118,22 @@ impl BePort {
 #[async_trait::async_trait]
 impl Io for BePort {
     fn read8(&self, reg: u16) -> Result<u8, AccessError> {
+        if self.0.lock().deny {
+            return Err(AccessError::Access);
+        }
         Ok(self.reg8(reg))
     }
     fn read32(&self, reg: u16) -> Result<u32, AccessError> {
+        if self.0.lock().deny {
+            return Err(AccessError::Access);
+        }
         Ok(self.reg32(reg))
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny {
+            return Err(AccessError::Access);
+        }
         // The modelled firmware takes every H2C box at once and reports
         // BCN_VALID for every reserved-page upload.
         m.regs[usize::from(reg)] = match reg {
@@ -132,6 +145,9 @@ impl Io for BePort {
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny {
+            return Err(AccessError::Access);
+        }
         let r = usize::from(reg);
         m.regs[r..r + 2].copy_from_slice(&value.to_le_bytes());
         m.writes.push((2, reg, value.into()));
@@ -139,6 +155,9 @@ impl Io for BePort {
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny || m.fail_write32 == Some(reg) {
+            return Err(AccessError::Access);
+        }
         let r = usize::from(reg);
         m.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
         m.writes.push((4, reg, value));
@@ -156,6 +175,9 @@ impl Port for BePort {
         _active: bool,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
+        if self.0.lock().deny {
+            return Err(Error::State);
+        }
         operation()
     }
     fn allocate_packet(&self, bytes: usize) -> Result<Block, Error> {
@@ -270,6 +292,9 @@ fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
 fn owner40() -> Option<(Prepared<BePort, Block>, BePort)> {
     owner_with(true)
 }
+
+#[path = "packet_owner_tests/edca.rs"]
+mod edca;
 
 fn tx_word(owner: &Prepared<BePort, Block>, queue: usize, slot: usize, word: usize) -> u32 {
     owner.tx[queue].read32(slot * 64 + word * 4).unwrap()

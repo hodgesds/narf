@@ -22,10 +22,9 @@
 //! CCK PD, **RA mask refresh**, EDCA turbo, ATC switch, TX-power tracking,
 //! dynamic TX power (empty in Linux). This profile composes the common
 //! info, false-alarm statistics, RSSI monitor, DIG, dynamic EDCCA, CCK PD
-//! and RA mask refresh steps, plus both ATC branches and
+//! and RA mask refresh steps, EDCA turbo, both ATC branches and
 //! the (empty) dynamic-TX-power step. Not composed, with the reason in the
-//! step's note: EDCA turbo (no unicast byte counters in the retained
-//! owner), TX-power tracking (no swing tables or calibrated tracking
+//! step's note: TX-power tracking (no swing tables or calibrated tracking
 //! owner composed with the RF register helper). The retained watchdog only invokes
 //! these steps when linked (the `station.rs` gate, as for RTL8192CE), so
 //! the unlinked branches run in fixtures, not in production.
@@ -34,6 +33,8 @@ use super::super::rate_adaptive::{rx_power_percentage, STA_HIGH, STA_LOW, STA_MI
 use super::{mac, phy};
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;
+
+pub(crate) mod edca;
 
 /// `DM_DIG_FA_TH0/TH1/TH2` (`rtl8723be/dm.h`).
 pub const DM_DIG_FA_TH0: u32 = 0x200;

@@ -404,8 +404,11 @@ where
     }
     Err(last_err)
 }
+#[inline(never)]
 pub(super) fn schedule(owner: Arc<Owner>) {
-    narf_scheduler::spawn(async move {
+    // Keep the large startup future out of the PCI probe's stack frame.
+    // The scheduler then retains only this pinned heap owner by value.
+    narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
         let phase_owner = owner.clone();
         if let Err(reason) = drive_scheduled(
             120,
@@ -422,7 +425,7 @@ pub(super) fn schedule(owner: Arc<Owner>) {
                 reason
             );
         }
-    });
+    }));
 }
 /// Retry newly staged inputs before firmware/runtime startup; Sc identity-only
 /// discovery retains the same mapping with bus mastering disabled.

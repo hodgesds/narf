@@ -1832,6 +1832,30 @@ they do not change capability checks, hardware sequencing or ownership
 on failure. The Qualcomm kernel-test runner also retains its future on
 the heap. Stack-budget exceptions are removed when the measured frame
 fits; budgets are never increased for these changes.
+The rtw89 generation supervisor also retains its phase-dependent
+firmware/radio advance future on the heap, keeping that state out of the
+supervisor's frame while preserving its existing borrows and cancellation.
+Cold rtw89 generation and brcmfmac provisioning polls have opaque boxed
+future boundaries. Intel startup also constructs its future on the heap
+behind a separate probe/scheduler boundary.
+AHB runtime construction uses transient heap storage
+before moving the same runtime into Shared; failed registration still
+retains it. These boundaries keep compiler inlining from combining the
+large cold construction and registration frames.
+
+### 3.22 RTL8723BE native EDCA watchdog
+
+The retained RTL8723BE owner counts accepted unicast MPDUs and recognizes
+the associated AP from bounded beacon IEs/address prefixes. Its linked
+watchdog applies the source's EDCA policy after RA refresh and before ATC,
+through the existing station/calibration authority. Counter snapshots and
+recognition are per owner; disconnect clears the peer, WMM/ERP-slot
+programming resets turbo flags, firmware LPS suppresses the DM step, and an access
+failure makes the owner terminal. No sample grants emission authority or
+enables a new PHY mode. The family specification records exact register
+values, source arithmetic/window behavior and native regression coverage.
+The chip state is boxed to keep additions out of generic packet-owner
+move/removal stack frames.
 
 ## 4. Interaction with `narf-wireless`
 
