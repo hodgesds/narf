@@ -6253,7 +6253,7 @@ impl SocketFile {
             None => return SocketOpResult::Err(SockError::InvalidArg),
         };
         let Some(dev) = Self::bt_route_controller(&local) else {
-            return SocketOpResult::Err(SockError::NoDevice);
+            return SocketOpResult::Err(SockError::WouldBlock);
         };
         let Some((handle, peer, mtu, dev_class)) =
             narf_filesystem::bluetooth::bt_take_pending_sco(dev)
