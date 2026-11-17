@@ -842,6 +842,8 @@ pub mod intel_gpu_multipipe;
 #[cfg(feature = "intel")]
 mod intel_gpu_nonpriv;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_nvl_resources;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_oa;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pcode;

@@ -448,6 +448,16 @@ caller. Its strict `narf.intel.nvl_display=1` route proof is read-only and
 requires exact `GtPlatform::NovaLakeS`, GMD 35.00, an unfused and firmware-lit
 Pipe A, and a non-Type-C eDP panel; it constructs no operational `DisplayIp`
 and is not a production route.
+`intel_gpu_nvl_resources::NovaResourcePlan` is the pure, crate-private
+ownership contract for a future live route. It binds eDP A to Pipe A, combo-B
+DP/HDMI and TC1/TC2 USB-C DP-alt to Pipes B-D, retaining the same-index
+transcoder, HPD source, DC-off/D2D requirements, PW1/PW2/per-pipe wells, and
+the Type-C-only PICA/TCSS dependencies. DP/eDP plans retain their LT AUX
+register plus both request and power-status bits; native HDMI retains no AUX
+lease and requires a VBT-qualified GMBUS/DDC route. Invalid port/connector
+roles and external use of Pipe A are
+typed refusals before MMIO. The plan grants no `DisplayIp`, and
+therefore does not enable Nova modesetting or claim hardware USB-C operation.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be

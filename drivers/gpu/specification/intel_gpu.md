@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.05** (v1.05 pins Display-35 core power/PLL/readout boundaries
+> Status: **v1.06** (v1.06 adds a pure Nova Lake output-resource plan for
+> eDP A, combo-B DP/HDMI and TC1/TC2 USB-C DP-alt without enabling MMIO;
+> v1.05 pins Display-35 core power/PLL/readout boundaries
 > and its Pipe-A/B primary 17^3 LUT capability; v1.04 adds Nova Lake's disconnected HDMI TMDS LT-PHY
 > enable order and source DP1.4 signal-table reuse; v1.03 ports Nova Lake LT PHY's bounded arbitrary-clock
 > HDMI PLL synthesizer without enabling its route; v1.02 transcribes Nova Lake LT PHY's five literal HDMI
@@ -385,6 +387,18 @@ production route supplies those preconditions. A strict
 GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants
 no programming authority: display 35.00 remains operationally gated pending
 Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
+`intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
+owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
+port B/Pipes B-D, and DP-alt on LT TC1/TC2/Pipes B-D. Each plan retains the
+same-index transcoder and HPD source; DC-off, PW1 and the pipe well; PW2 for
+Pipes C/D or either Type-C lane domain; and the D2D requirement. DP/eDP plans
+retain the exact AUX control register and LT-only request/status handshake,
+while native HDMI retains no AUX lease and requires a VBT-qualified GMBUS/DDC
+route. TC1/TC2 plans additionally
+retain PICA_TC and the TCSS PHY index. Crossed port/connector roles and an
+external Pipe A refuse before MMIO. These plans are crate-private and
+disconnected: they neither create an operational `DisplayIp` nor claim that
+Nova USB-C DP works on hardware.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.
