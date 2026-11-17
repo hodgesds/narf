@@ -155,7 +155,7 @@ pub(crate) const fn has_double_buffered_lut(generation: Generation) -> bool {
 /// `HAS_DOUBLE_BUFFERED_LUT`).
 #[allow(dead_code)]
 pub(crate) const fn has_double_buffered_lut_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> bool {
-    matches!(ip, crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+    ip.is_display30()
 }
 
 /// MTL/Arrow's native post-CSC LUT: 1024 RGB entries, ten bits/channel.

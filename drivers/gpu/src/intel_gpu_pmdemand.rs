@@ -75,7 +75,8 @@ pub(crate) enum Layout {
 impl Layout {
     pub(crate) const fn for_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
         match ip {
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => Self::Xe3,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => Self::Xe3,
             _ => Self::PreXe3,
         }
     }

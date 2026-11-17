@@ -194,7 +194,7 @@ impl Receipt {
                 .is_some_and(|p| match ip {
                     DisplayIp::Xe2Lpd => p.is_lnl(),
                     DisplayIp::Xe3Lpd => p.has_ptl_display_route(),
-                    DisplayIp::Xelpdp => false,
+                    DisplayIp::Xelpdp | DisplayIp::WildcatLake => false,
                 })
             || bar.phys.raw() == 0
             || bar.phys.raw() & 4095 != 0

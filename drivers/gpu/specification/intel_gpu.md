@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.79** (v0.78 plus the source-qualified Panther Lake display-30
+> Status: **v0.80** (v0.79 plus the pure Wildcat Lake display-30.02
+> three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings,
+> while its LT-PHY output route remains fail-closed; the source-qualified Panther Lake display-30
 > TC1–TC4 USB-C DP route and mandatory fixed-refresh VRR timing generator;
 > the Lunar Lake display-20 TC1–TC4 USB-C DP route, PICA/TCSS ownership and
 > display-IP-aware external resource transactions; the source ADL-N
@@ -292,7 +294,12 @@ them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
 `GtPlatform::WildcatLake`. The headless owner admits only live graphics
 30.03/30.04/30.05 and media 30.02, applies the source Xe3 policy without PTL's
 graphics-30.00 A0 workaround, and skips the media-30.00-only GGTT dummy-write
-workaround. Display 30.02 remains a typed refusal pending its separate policy.
+workaround. `DisplayIp::WildcatLake` retains display 30's timing-generator,
+PM-demand, watermark and CDCLK rules for pure resource admission, with only
+Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
+programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
+D. This type does not grant programming authority: display 30.02 remains a
+typed route refusal pending its LT-PHY and output policy.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
@@ -1825,15 +1832,18 @@ the IP is known only from `GMD_ID_DISPLAY`. `DisplayIdentity` decodes the
 complete current Linux map (14.00, 14.01, 20.00, 30.00, 30.02 and 35.00)
 for read-only proofs and pins each identity's DMC container/payload ceiling
 and maximum CDCLK plus pipe/FBC/DBUF topology. In particular, WCL selects
-`xe3lpd_3002_dmc.bin`/480 MHz and has only pipes/FBC A-C; NVL-S selects
+`xe3lpd_3002_dmc.bin`/480 MHz, has only pipes/FBC A-C and uses a 22 GB/s
+programmed-bandwidth limit; NVL-S selects
 `xe3p_lpd_dmc.bin`/787.2 MHz and the four-pipe/FBC `xe2_lpd_display` topology.
 The headless post-FLR proof uses those masks, so WCL does not sample a
-nonexistent Pipe D while NVL-S still refuses live Pipe-D state. `DisplayIp`
-grants programming authority only to its qualified routes: 14.00 and 20.00
-normally, plus 30.00 through the explicit Panther Lake entry. An absent
-display (GMD zero), 14.01 (BMG), 30.02 (WCL) and 35.00 (NVL-S) remain typed
-refusals on this route. Display 20 runs the display-14 code with version
-dispatch, not a copy of it.
+nonexistent Pipe D while NVL-S still refuses live Pipe-D state.
+`DisplayIp::{Xelpdp,Xe2Lpd,Xe3Lpd}` grants programming authority only through
+its qualified route: 14.00 and 20.00 normally, plus 30.00 through the explicit
+Panther Lake entry. `DisplayIp::WildcatLake` is a pure resource profile only;
+it is never returned by a decode/read or operational route. An absent display
+(GMD zero), 14.01 (BMG), 30.02 (WCL) and 35.00 (NVL-S) remain typed refusals
+on this route. Display 20 runs the display-14 code with version dispatch, not
+a copy of it.
 
 Admission and the headless profile. Lunar Lake's existing profile is the
 headless main GT, which owns the function through a driver FLR

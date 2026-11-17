@@ -2,7 +2,8 @@
 //!
 //! Compute (pure) → check (typed refusal before any write) → commit (source
 //! ordering, readback proofs, restoration of every touched register on
-//! failure). The computation is the multi-pipe one: up to four pipes with
+//! failure). The computation is the multi-pipe one: up to four pipes (three
+//! on Wildcat Lake 30.02) with
 //! up to five universal planes each, DBUF slice selection and MBUS joining,
 //! per-pipe and per-plane DDB, display-14 watermarks, CDCLK and PM demand.
 //!
@@ -37,6 +38,10 @@
 //! enabled: the QGV peak bandwidth is `U16_MAX`
 //! (`mtl_find_qgv_points` with a SAGV-rejecting pipe), so no DRAM QGV
 //! bandwidth derating is required for admission.
+//! Wildcat Lake retains those display-30 rules with its source three-pipe
+//! boundary, 480 MHz CDCLK ceiling and `xe3lpd_3002_sa_info` 22 GB/s
+//! programmed-bandwidth limit. Pure register images and idle/all-off proofs
+//! omit the nonexistent Pipe D; no operational WCL route exists here.
 
 use alloc::vec::Vec;
 
@@ -205,6 +210,7 @@ fn timing(p: &PipeRequest, vblank_start: Option<u16>) -> wm::Timing {
 const fn prefill_ip(ip: DisplayIp) -> DisplayIp {
     match ip {
         DisplayIp::Xe3Lpd => DisplayIp::Xe3Lpd,
+        DisplayIp::WildcatLake => DisplayIp::WildcatLake,
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => DisplayIp::Xelpdp,
     }
 }
@@ -236,6 +242,9 @@ pub(crate) fn compute_ip_vblank(
     latency: &Latency,
     vblank_start: [Option<u16>; PIPES],
 ) -> Result<State, ResourceError> {
+    if request.pipes[ip.pipe_count()..].iter().any(Option::is_some) {
+        return Err(ResourceError::Unsupported);
+    }
     let mut active = request
         .pipes
         .iter()
@@ -249,7 +258,7 @@ pub(crate) fn compute_ip_vblank(
         let Some(p) = p else { continue };
         if let Some(slave) = p.bigjoiner_slave {
             let slave_idx = slave as usize;
-            if slave_idx == pipe || slave_idx >= PIPES {
+            if slave_idx == pipe || slave_idx >= ip.pipe_count() {
                 return Err(ResourceError::Unsupported);
             }
             if request.pipes[slave_idx].is_some() || (active & (1 << slave_idx)) != 0 {
@@ -492,7 +501,7 @@ pub(crate) fn plane_wm_image_ip(
     w: &PlaneWm,
 ) -> Option<[(u64, u32); 9]> {
     let mut out = plane_wm_image(pipe, plane, w)?;
-    if ip == DisplayIp::Xe3Lpd {
+    if ip.is_display30() {
         if computed(&w.levels[0]) {
             out[0].1 |= PLANE_WM_AUTO_MIN_ALLOC_EN;
         }
@@ -600,13 +609,15 @@ impl State {
     pub(crate) fn dbuf_ctl(&self, slice: usize, old: u32, enabled: u8) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => self.dbuf.dbuf_ctl(slice, old, enabled),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => crate::intel_gpu_xe2lpd::dbuf_ctl(
-                slice,
-                old,
-                enabled,
-                crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
-                self.dbuf.joined,
-            ),
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
+                crate::intel_gpu_xe2lpd::dbuf_ctl(
+                    slice,
+                    old,
+                    enabled,
+                    crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
+                    self.dbuf.joined,
+                )
+            }
         }
     }
 
@@ -615,7 +626,7 @@ impl State {
     pub(crate) fn dbuf_ctl_mask(&self) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => 0xc0ff_0000,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
                 0xc000_0000 | crate::intel_gpu_xe2lpd::DBUF_MIN_TRACKER_MASK
             }
         }
@@ -625,7 +636,7 @@ impl State {
     pub(crate) fn dbox(&self, pipe: usize) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => self.dbuf.dbox(pipe),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
                 crate::intel_gpu_xe2lpd::dbox(self.dbuf.joined)
             }
         }
@@ -637,7 +648,7 @@ impl State {
         let join = self.dbuf.mbus_ctl_select(pipe);
         match self.ip {
             DisplayIp::Xelpdp => join,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
                 join | crate::intel_gpu_xe2lpd::mbus_throttle(
                     crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
                 )
@@ -649,7 +660,7 @@ impl State {
     pub(crate) fn mbus_ctl_mask(&self) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => dbuf::MBUS_CTL_MASK,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
                 dbuf::MBUS_CTL_MASK | crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
             }
         }
@@ -660,7 +671,7 @@ impl State {
     /// state for disabled planes; a hidden cursor keeps only its DDB.
     pub(crate) fn plane_registers(&self) -> Option<Vec<(u64, u32)>> {
         let mut regs = Vec::with_capacity(PIPES * (PLANES + 1) * 10);
-        for pipe in 0..PIPES {
+        for pipe in 0..self.ip.pipe_count() {
             regs.extend(self.pipe_registers(pipe, self.cursor_visible[pipe])?);
         }
         Some(regs)
@@ -682,7 +693,7 @@ impl State {
             let ddb = if active { ddb.reg() } else { 0 };
             regs.push((plane_buf_cfg(pipe, plane), ddb));
             // skl_write_plane_wm, display >= 30.
-            if self.ip == DisplayIp::Xe3Lpd {
+            if self.ip.is_display30() {
                 regs.push((plane_min_buf_cfg(pipe, plane), min_ddb_value(&w)?));
             }
         }
@@ -761,7 +772,7 @@ pub(crate) fn require_idle_ip(
             return Err(ResourceError::Busy);
         }
     }
-    for pipe in 0..PIPES as u64 {
+    for pipe in 0..ip.pipe_count() as u64 {
         if read(io, 0x70008 + pipe * 0x1000)? & 0xc000_0000 != 0
             || read(io, 0x70080 + pipe * 0x1000)? & 0x27 != 0
         {
@@ -810,7 +821,7 @@ impl Snapshot {
         }
         let mbus_ctl = read(io, dbuf::MBUS_CTL)?;
         let mut dbox = [0; PIPES];
-        for (pipe, v) in dbox.iter_mut().enumerate() {
+        for (pipe, v) in dbox.iter_mut().enumerate().take(state.ip.pipe_count()) {
             *v = read(io, dbuf::dbox_ctl(pipe))?;
         }
         let mut planes = Vec::new();
@@ -917,7 +928,7 @@ fn apply(
     *stage = Stage::Cdclk;
     match state.ip {
         DisplayIp::Xelpdp => cdclk::program(io, &snap.cdclk, state.cdclk)?,
-        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
             // bxt_set_cdclk, display >= 20: the MDCLK/CDCLK ratio goes in
             // before a lowering and after a raising (an unknown clock is
             // sanitized to 0, so it is raised), with the new MBUS join.
@@ -1013,7 +1024,7 @@ fn restore(
         let mask = ratio_mask(crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK);
         let kept = ratio_fields(dbuf::MBUS_CTL, mask)?;
         checked(io, dbuf::MBUS_CTL, (snap.mbus_ctl & !mask) | kept)?;
-        for (pipe, v) in snap.dbox.iter().enumerate() {
+        for (pipe, v) in snap.dbox.iter().enumerate().take(state.ip.pipe_count()) {
             checked(io, dbuf::dbox_ctl(pipe), *v)?;
         }
     }
@@ -1034,7 +1045,7 @@ fn restore(
     if stage >= Stage::Cdclk {
         match state.ip {
             DisplayIp::Xelpdp => cdclk::restore(io, &snap.cdclk)?,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
                 let now = cdclk::Current::read_ip(io, state.ip)?;
                 let lowering = snap.cdclk.actual_khz < now.actual_khz;
                 if lowering {
@@ -1088,7 +1099,7 @@ pub(crate) fn all_off_pmdemand_ip(ip: DisplayIp, latency: &Latency, cdclk: Rung)
         qgv_peak_bw: latency
             .qgv
             .as_ref()
-            .and_then(|q| crate::intel_gpu_xelpg_bw::qgv_peak_bw(q, 0, 0)),
+            .and_then(|q| crate::intel_gpu_xelpg_bw::qgv_peak_bw_ip(ip, q, 0, 0)),
         enabled_slices: 1,
         active_pipes: 0,
         voltage_level: cdclk::voltage_level_ip(ip, cdclk.cdclk_khz),
@@ -1096,7 +1107,7 @@ pub(crate) fn all_off_pmdemand_ip(ip: DisplayIp, latency: &Latency, cdclk: Rung)
         max_port_clock_khz: 0,
         combo_phys: 0,
     }
-    .params()
+    .params_for(pmdemand::Layout::for_ip(ip))
 }
 
 /// The post-plane half of the commit that turns the last pipe off
@@ -1132,14 +1143,17 @@ pub(crate) fn settle_all_off_ip(
     let clock = cdclk::Current::read_ip(io, ip)?;
     let joined = read(io, dbuf::MBUS_CTL)? & (1 << 31) != 0;
     let result = (|| {
-        for pipe in 0..PIPES {
+        for pipe in 0..ip.pipe_count() {
             for plane in 0..PLANES {
-                for (r, v) in plane_wm_image(pipe, plane, &PlaneWm::default())
+                for (r, v) in plane_wm_image_ip(ip, pipe, plane, &PlaneWm::default())
                     .ok_or(ResourceError::Unsupported)?
                 {
                     checked(io, r, v)?;
                 }
                 checked(io, plane_buf_cfg(pipe, plane), 0)?;
+                if ip.is_display30() {
+                    checked(io, plane_min_buf_cfg(pipe, plane), 0)?;
+                }
             }
             for (r, v) in
                 cursor_wm_image(pipe, &PlaneWm::default()).ok_or(ResourceError::Unsupported)?

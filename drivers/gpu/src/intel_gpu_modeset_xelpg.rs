@@ -772,7 +772,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // (intel_vrr_always_use_vrr_tg): its fixed-refresh guardband
         // (intel_vrr_compute_guardband) is known before the first
         // destructive write, and a mode it cannot describe is refused.
-        let guardband = if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+        let guardband = if self.ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             Some(
@@ -1719,7 +1719,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         }
         // intel_ddi_post_disable_hdmi_or_sst, display 30: the always-used
         // VRR timing generator stops after the transcoder.
-        if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+        if self.ip.is_display30() {
             crate::intel_gpu_xe3lpd::tg_disable(self.mmio)
                 .map_err(|_| ModesetError::PipelineStopUnavailable)?;
         }
@@ -1769,7 +1769,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             Err(_) => return,
         };
         let base = Transcoder::A.base();
-        let xe3 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd;
+        let xe3 = self.ip.is_display30();
         let xe2 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd;
         if xe3 || xe2 {
             // intel_set_transcoder_timings, display >= 13: the set-context
@@ -2009,7 +2009,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd => {
                 Some(crate::intel_gpu_vrr::DisplayVrrIp::Display20)
             }
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => None,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => None,
         }
     }
 

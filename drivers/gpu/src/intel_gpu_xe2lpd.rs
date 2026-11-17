@@ -111,6 +111,10 @@ pub(crate) enum DisplayIp {
     /// Lake, reached only through [`DisplayIp::decode_all`] and the
     /// opted-in Panther Lake route ([`crate::intel_gpu_xe3lpd`]).
     Xe3Lpd,
+    /// 30.02 (`wcl_display`): Wildcat Lake's three-pipe Xe3_LPD
+    /// descriptor. This is retained for pure platform/resource modelling;
+    /// no operational route constructs it until the LT PHY is owned.
+    WildcatLake,
 }
 
 /// Exact `GMD_ID_DISPLAY` identities published by Linux's
@@ -485,7 +489,22 @@ impl DisplayIp {
         match self {
             Self::Xelpdp => 14,
             Self::Xe2Lpd => 20,
-            Self::Xe3Lpd => 30,
+            Self::Xe3Lpd | Self::WildcatLake => 30,
+        }
+    }
+
+    /// `DISPLAY_VER >= 30`: the mandatory VRR timing generator, Xe3 PM
+    /// demand fields and display-30 watermark programming.
+    pub(crate) const fn is_display30(self) -> bool {
+        matches!(self, Self::Xe3Lpd | Self::WildcatLake)
+    }
+
+    /// Source `pipe_mask` width. Wildcat Lake has only A-C; the other
+    /// admitted integrated descriptors have A-D.
+    pub(crate) const fn pipe_count(self) -> usize {
+        match self {
+            Self::WildcatLake => 3,
+            Self::Xelpdp | Self::Xe2Lpd | Self::Xe3Lpd => 4,
         }
     }
 
@@ -498,11 +517,12 @@ impl DisplayIp {
     }
 
     /// Number of FBC instances (`fbc_mask`): A–B on 14.00, A–D on 20.00
-    /// and 30.00 (both `xe2_lpd_display`).
+    /// and 30.00, and A–C on Wildcat Lake 30.02.
     pub(crate) const fn fbc_instances(self) -> u64 {
         match self {
             Self::Xelpdp => 2,
             Self::Xe2Lpd | Self::Xe3Lpd => 4,
+            Self::WildcatLake => 3,
         }
     }
 
@@ -523,7 +543,9 @@ impl DisplayIp {
         };
         match self {
             Self::Xelpdp => DC_STATE_EN_DC9 | DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6,
-            Self::Xe2Lpd | Self::Xe3Lpd => DC_STATE_EN_DC9 | DC_STATE_EN_UPTO_DC6,
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => {
+                DC_STATE_EN_DC9 | DC_STATE_EN_UPTO_DC6
+            }
         }
     }
 
@@ -537,6 +559,7 @@ impl DisplayIp {
                 crate::intel_gpu_xe3lpd::XE3LPD_DMC_FIRMWARE,
                 XE2LPD_DMC_MAX_FW_SIZE,
             ),
+            Self::WildcatLake => ("i915/xe3lpd_3002_dmc.bin", XE2LPD_DMC_MAX_FW_SIZE),
         }
     }
 
@@ -544,7 +567,7 @@ impl DisplayIp {
     pub(crate) const fn chicken_trans(self) -> (u32, u32) {
         match self {
             Self::Xelpdp => (DP_DSC_INSERT_SF_AT_EOL_WA, DP_FEC_BS_JITTER_WA),
-            Self::Xe2Lpd | Self::Xe3Lpd => (DP_DSC_INSERT_SF_AT_EOL_WA, 0),
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => (DP_DSC_INSERT_SF_AT_EOL_WA, 0),
         }
     }
 
@@ -557,7 +580,7 @@ impl DisplayIp {
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE,
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_STATE,
             ),
-            Self::Xe2Lpd | Self::Xe3Lpd => (
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => (
                 ddi_buf_ctl(port),
                 DDI_BUF_D2D_LINK_ENABLE,
                 DDI_BUF_D2D_LINK_STATE,

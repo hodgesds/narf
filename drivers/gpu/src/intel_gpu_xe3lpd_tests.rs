@@ -77,7 +77,8 @@ impl MmioWindow for Regs {
 fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult {
     use crate::intel_gpu_xe2lpd::IpError;
     // gmdid_display_map: 30.00 is xe2_lpd_display (Panther Lake), 30.02
-    // wcl_display (Wildcat Lake, not in the device table).
+    // is the distinct wcl_display. The latter is recognized as a pure
+    // resource profile below but remains outside every operational route.
     assert_eq!(DisplayIp::decode_all(30 << 22), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(DisplayIp::decode_all((30 << 22) | 5), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(
@@ -127,6 +128,19 @@ fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult 
     // mtl_ddi_enable_d2d, display >= 20: DDI_BUF_CTL bits 29/28.
     assert_eq!(
         ip.d2d(crate::intel_gpu_xelpg::XeLpgPort::A),
+        (0x64000, 1 << 29, 1 << 28)
+    );
+    let wcl = DisplayIp::WildcatLake;
+    assert!(wcl.is_display30() && wcl.xe2_plus());
+    assert_eq!(
+        (wcl.ver(), wcl.pipe_count(), wcl.fbc_instances()),
+        (30, 3, 3)
+    );
+    assert_eq!(wcl.allowed_dc_mask(), (1 << 3) | 2);
+    assert_eq!(wcl.dmc_firmware(), ("i915/xe3lpd_3002_dmc.bin", 0x8000));
+    assert_eq!(wcl.chicken_trans(), (1 << 4, 0));
+    assert_eq!(
+        wcl.d2d(crate::intel_gpu_xelpg::XeLpgPort::A),
         (0x64000, 1 << 29, 1 << 28)
     );
     TestResult::Pass
@@ -343,6 +357,7 @@ fn smoke_xe3lpd_cdclk_table_ctl_voltage_and_ceiling() -> TestResult {
     );
     assert_eq!(cdclk::calc_cdclk_ip(DisplayIp::Xe3Lpd, 691_201), None);
     assert_eq!(cdclk::max_cdclk_khz(DisplayIp::Xe3Lpd), 691_200);
+    assert_eq!(cdclk::max_cdclk_khz(DisplayIp::WildcatLake), 480_000);
     assert_eq!(cdclk::max_cdclk_khz(DisplayIp::Xe2Lpd), 652_800);
     // bxt_cdclk_ctl, display >= 30: DIV_SEL_1, no CD2X pipe field, the
     // MDCLK source select. Display 20 keeps CD2X_PIPE_NONE.
@@ -359,6 +374,7 @@ fn smoke_xe3lpd_cdclk_table_ctl_voltage_and_ceiling() -> TestResult {
         assert_eq!(cdclk::voltage_level_ip(DisplayIp::Xe3Lpd, khz), 0);
     }
     assert_eq!(cdclk::voltage_level_ip(DisplayIp::Xe2Lpd, 652_800), 3);
+    assert_eq!(cdclk::voltage_level_ip(DisplayIp::WildcatLake, 480_000), 0);
     // bxt_get_cdclk + bxt_sanitize_cdclk on display 30: a CD2X pipe field
     // left by firmware is ignored, a decimal field is not.
     let io = Regs::with(&[
@@ -533,6 +549,7 @@ fn smoke_xe3lpd_pmdemand_xe3_layout() -> TestResult {
     let split = Params::decode(0xf0, 0);
     assert_eq!((split.active_pipes, split.active_dbufs), (3, 3));
     assert_eq!(Layout::for_ip(DisplayIp::Xe3Lpd), Layout::Xe3);
+    assert_eq!(Layout::for_ip(DisplayIp::WildcatLake), Layout::Xe3);
     assert_eq!(Layout::for_ip(DisplayIp::Xe2Lpd), Layout::PreXe3);
     TestResult::Pass
 }
@@ -702,6 +719,36 @@ fn smoke_xe3lpd_resources_auto_min_alloc_and_min_buf_cfg() -> TestResult {
         res::compute_ip(DisplayIp::Xe2Lpd, &request, &std_latency()),
         Err(res::ResourceError::CdclkUnsatisfiable)
     );
+    // Wildcat Lake retains display-30 watermark/PM rules but has a 480 MHz
+    // ceiling and no Pipe D in wcl_display. Its register image must never
+    // touch the absent Pipe-D watermark block.
+    let wcl = res::compute_ip_vblank(
+        DisplayIp::WildcatLake,
+        &panel_request(),
+        &std_latency(),
+        vblank,
+    )
+    .unwrap();
+    assert_eq!(wcl.cdclk.cdclk_khz, 153_600);
+    let off = res::all_off_pmdemand_ip(DisplayIp::WildcatLake, &std_latency(), rung(153_600));
+    assert_eq!((off.active_pipes, off.active_dbufs, off.scalers), (0, 0, 0));
+    assert!(wcl
+        .plane_registers()
+        .unwrap()
+        .iter()
+        .all(|(r, _)| !(0x73000..0x74000).contains(r)));
+    let mut too_fast = panel_request();
+    too_fast.min_cdclk_khz = 480_001;
+    assert_eq!(
+        res::compute_ip_vblank(DisplayIp::WildcatLake, &too_fast, &std_latency(), vblank),
+        Err(res::ResourceError::CdclkUnsatisfiable)
+    );
+    let mut pipe_d = panel_request();
+    pipe_d.pipes[3] = pipe_d.pipes[0];
+    assert_eq!(
+        res::compute_ip_vblank(DisplayIp::WildcatLake, &pipe_d, &std_latency(), vblank),
+        Err(res::ResourceError::Unsupported)
+    );
     TestResult::Pass
 }
 kernel_test_in!(
@@ -744,6 +791,15 @@ fn smoke_xe3lpd_bandwidth_sa_info_limit() -> TestResult {
         Some(768)
     );
     assert_eq!(qgv_peak_bw_ip(DisplayIp::Xe3Lpd, &qgv, 50_000, 1), None);
+    // xe3lpd_3002_sa_info clamps programmed bandwidth to 22 GB/s.
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 20_000, 1),
+        Some(768)
+    );
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 30_000, 1),
+        None
+    );
     assert_eq!(
         qgv_peak_bw_ip(DisplayIp::Xe2Lpd, &qgv, 30_000, 1),
         qgv_peak_bw(&qgv, 30_000, 1)

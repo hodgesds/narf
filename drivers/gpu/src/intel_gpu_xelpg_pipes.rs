@@ -351,7 +351,7 @@ impl Pipes {
         let dsc = crate::intel_gpu_display_resources::pipe_a_dsc(io, mode)
             .map_err(|_| PipeEnableError::Resource(ResourceError::NoDevice))?;
         let mut vblank_start = [None; 4];
-        if ip == DisplayIp::Xe3Lpd {
+        if ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
                 .map_err(|_| PipeEnableError::NoDevice)?;
             let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
@@ -512,7 +512,7 @@ impl Pipes {
             res::require_idle_ip(io, fresh.ip)?;
         }
         let mut vblank_start = fresh.vblank_start;
-        if fresh.ip == DisplayIp::Xe3Lpd {
+        if fresh.ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
                 .map_err(|_| PipeEnableError::NoDevice)?;
             let guardband =
@@ -610,7 +610,7 @@ impl Pipes {
             crate::intel_gpu_vrr::set_context_latency_for_crtc(pipe as u32 + 1),
         )?;
         checked(io, base + TRANS_VSYNCSHIFT_OFFSET, 0)?;
-        let vtotal = if self.ip == DisplayIp::Xe3Lpd {
+        let vtotal = if self.ip.is_display30() {
             crate::intel_gpu_xe3lpd::trans_vtotal(&ext.mode)
         } else {
             trans.vtotal
@@ -626,7 +626,7 @@ impl Pipes {
         ] {
             checked(io, base + off, v)?;
         }
-        if self.ip == DisplayIp::Xe3Lpd {
+        if self.ip.is_display30() {
             // intel_dp_compute_min_hblank is zero for this qualified 8b/10b
             // SST route. Display 30 requires the register on every pipe.
             checked(io, base + DP_MIN_HBLANK_CTL_OFFSET, 0)?;
@@ -648,7 +648,7 @@ impl Pipes {
         })?;
         checked(io, wm_linetime(pipe), linetime)?;
         let chicken = read(io, pipe.base() + PIPE_CHICKEN_OFFSET)?;
-        let pipe_chicken = if self.ip == DisplayIp::Xe3Lpd {
+        let pipe_chicken = if self.ip.is_display30() {
             PIPE_CHICKEN_BITS & !UNDERRUN_RECOVERY_DISABLE_ADLP
         } else {
             PIPE_CHICKEN_BITS
@@ -679,7 +679,7 @@ impl Pipes {
         pipe: Pipe,
     ) -> Result<(), PipeEnableError> {
         let ext = self.reserved(pipe)?;
-        if self.ip != DisplayIp::Xe3Lpd {
+        if !self.ip.is_display30() {
             return Ok(());
         }
         let vblank_start = self.vblank_start[pipe as usize].ok_or(PipeEnableError::Unsupported)?;
@@ -803,7 +803,7 @@ impl Pipes {
         let old = read(io, conf)?;
         io.write32(conf, old & !(PIPECONF_ENABLE | PIPECONF_STATE));
         wait_conf(io, pipe, false)?;
-        if self.ip == DisplayIp::Xe3Lpd {
+        if self.ip.is_display30() {
             let trans = match pipe {
                 Pipe::A => return Err(PipeEnableError::Unsupported),
                 Pipe::B => crate::intel_gpu_vrr::VrrTranscoder::B,

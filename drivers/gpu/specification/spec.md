@@ -405,8 +405,12 @@ Gen12 orchestrator use.
 (14.00, 14.01, 20.00, 30.00, 30.02 and 35.00) for read-only identity
 proofs. Recognition grants no programming authority: `DisplayIp::{Xelpdp,
 Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 admitted
-only through the explicitly opted-in `decode_all` route. Every other
-operational IP is a typed `IpError`: `Absent`,
+only through the explicitly opted-in `decode_all` route.
+`DisplayIp::WildcatLake` is constructed only for pure resource modelling:
+display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
+480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
+MMIO image. No decode/read/route returns it and it grants no LT-PHY or modeset
+authority. Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
 admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,
@@ -419,10 +423,12 @@ firmware-lit Pipe A.
 `DisplayIdentity::profile` records the source DMC container, payload ceiling
 and maximum CDCLK plus exact pipe/FBC/DBUF topology for all six identities
 without granting a write route.
-Notably WCL 30.02 selects `xe3lpd_3002_dmc.bin` with a 480 MHz ceiling and
-three pipes/FBCs; NVL-S 35.00 selects `xe3p_lpd_dmc.bin` with a 787.2 MHz
-ceiling and the four-pipe/FBC `xe2_lpd_display` topology. Both remain read-only
-identities. The post-driver-FLR proof checks only power-well and pipe-DMC bits
+Notably WCL 30.02 selects `xe3lpd_3002_dmc.bin` with a 480 MHz ceiling,
+22 GB/s programmed-bandwidth limit and three pipes/FBCs; NVL-S 35.00 selects
+`xe3p_lpd_dmc.bin` with a 787.2 MHz ceiling and the four-pipe/FBC
+`xe2_lpd_display` topology. Both remain read-only route identities; WCL's
+separately constructible pure resource profile performs no MMIO. The
+post-driver-FLR proof checks only power-well and pipe-DMC bits
 owned by the observed topology; WCL's nonexistent Pipe-D bits are not treated
 as hardware state, while NVL-S Pipe D remains fail-closed.
 

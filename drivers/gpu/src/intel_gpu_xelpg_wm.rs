@@ -235,7 +235,8 @@ enum Rules {
 impl Rules {
     const fn for_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
         match ip {
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => Self::Display30 { panned: false },
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => Self::Display30 { panned: false },
             _ => Self::Display14,
         }
     }

@@ -11,9 +11,10 @@
 //! 30.02 to `wcl_display` (Wildcat Lake: pipes A–C, ports A/B/TC1/TC2).
 //! `INTEL_PTL_IDS` and `INTEL_WCL_IDS` both bind `ptl_desc`, which carries
 //! no display info, so the IP is known only from `GMD_ID_DISPLAY`.
-//! [`DisplayIp::decode_all`] admits 30.00 only; 30.02 stays a typed refusal
-//! (the WCL PCI IDs use the PTL headless GT profile, while WCL's PHY map, DMC
-//! container, CDCLK ceiling and bandwidth parameters differ). For display
+//! [`DisplayIp::decode_all`] admits 30.00 only; 30.02 stays a typed route
+//! refusal while [`DisplayIp::WildcatLake`] retains its pure resource profile
+//! (the WCL PCI IDs use the PTL headless GT profile, while WCL's LT PHY, DMC
+//! container and output protocol remain unowned). For display
 //! \>= 30 `__intel_display_device_info_runtime_init` also reads
 //! `PICA_PHY_CONFIG_CONTROL.EDP_ON_TYPEC` (`edp_typec_support`).
 //!
@@ -424,7 +425,7 @@ pub(crate) const fn parent(ip: DisplayIp, well: Well) -> Option<Well> {
     match (ip, well) {
         (_, Well::Pw1) => None,
         (_, Well::Pw2 | Well::PwA) => Some(Well::Pw1),
-        (DisplayIp::Xe3Lpd, Well::PwB) => Some(Well::Pw1),
+        (DisplayIp::Xe3Lpd | DisplayIp::WildcatLake, Well::PwB) => Some(Well::Pw1),
         (DisplayIp::Xelpdp | DisplayIp::Xe2Lpd, Well::PwB) => Some(Well::Pw2),
         (_, Well::PwC | Well::PwD) => Some(Well::Pw2),
     }
@@ -455,7 +456,7 @@ pub(crate) enum Domain {
 /// `AUDIO_MMIO`, `AUDIO_PLAYBACK`) on display 30.
 pub(crate) const fn dc_off_domains(ip: DisplayIp) -> &'static [Domain] {
     match ip {
-        DisplayIp::Xe3Lpd => &[
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => &[
             Domain::PipeC,
             Domain::PipeD,
             Domain::TranscoderC,
@@ -520,12 +521,16 @@ pub(crate) const CDCLK_TABLE: [Rung; 29] = [
 
 /// `intel_update_max_cdclk`, display 30.00.
 pub(crate) const MAX_CDCLK_KHZ: u32 = 691_200;
+/// `intel_update_max_cdclk`, display 30.02 (Wildcat Lake).
+pub(crate) const WCL_MAX_CDCLK_KHZ: u32 = 480_000;
 
 // ── Bandwidth ────────────────────────────────────────────────────
 
 /// `xe3lpd_sa_info.deprogbwlimit` (GB/s); deburst 32, displayrtids 256 and
 /// derating 10 equal `mtl_sa_info`.
 pub(crate) const DEPROGBWLIMIT_GBPS: i64 = 65;
+/// `xe3lpd_3002_sa_info.deprogbwlimit` (GB/s) on Wildcat Lake.
+pub(crate) const WCL_DEPROGBWLIMIT_GBPS: i64 = 22;
 
 // ── PHY ──────────────────────────────────────────────────────────
 

@@ -31,6 +31,9 @@
 //! wa_15010685871 (`pll_enable_wa_needed`) does not apply and
 //! Wa_13012396614 (`icl_cdclk_pll_disable`) selects CD2XCLK as the MDCLK
 //! source before the PLL is disabled.
+//! Display 30.02 (Wildcat Lake) uses the same table and programming
+//! functions but `intel_update_max_cdclk` caps admission at 480 MHz;
+//! Wa_13012396614 remains specific to display 30.00.
 //!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
@@ -121,12 +124,13 @@ fn rung(cdclk_khz: u32) -> Option<Rung> {
 }
 
 /// `intel_init_cdclk_hooks`' table for `ip`: `mtl_cdclk_table` on 14.00,
-/// `xe2lpd_cdclk_table` on display 20 (both `rplu_cdclk_funcs`).
+/// `xe2lpd_cdclk_table` on display 20 (both `rplu_cdclk_funcs`) and
+/// `xe3lpd_cdclk_table` on both display-30 releases.
 pub(crate) fn table(ip: DisplayIp) -> &'static [Rung] {
     match ip {
         DisplayIp::Xelpdp => &TABLE,
         DisplayIp::Xe2Lpd => &crate::intel_gpu_xe2lpd::CDCLK_TABLE,
-        DisplayIp::Xe3Lpd => &crate::intel_gpu_xe3lpd::CDCLK_TABLE,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => &crate::intel_gpu_xe3lpd::CDCLK_TABLE,
     }
 }
 
@@ -135,6 +139,7 @@ pub(crate) const fn max_cdclk_khz(ip: DisplayIp) -> u32 {
     match ip {
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => MAX_CDCLK_KHZ,
         DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::MAX_CDCLK_KHZ,
+        DisplayIp::WildcatLake => crate::intel_gpu_xe3lpd::WCL_MAX_CDCLK_KHZ,
     }
 }
 
@@ -144,7 +149,7 @@ pub(crate) const fn max_cdclk_khz(ip: DisplayIp) -> u32 {
 pub(crate) fn voltage_level_ip(ip: DisplayIp, cdclk_khz: u32) -> u8 {
     match ip {
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => voltage_level(cdclk_khz),
-        DisplayIp::Xe3Lpd => 0,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => 0,
     }
 }
 
@@ -161,7 +166,7 @@ pub(crate) fn calc_cdclk_ip(ip: DisplayIp, min_khz: u32) -> Option<Rung> {
 fn rung_ip(ip: DisplayIp, cdclk_khz: u32) -> Option<Rung> {
     match ip {
         DisplayIp::Xelpdp => rung(cdclk_khz),
-        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
             table(ip).iter().copied().find(|r| r.cdclk_khz == cdclk_khz)
         }
     }
@@ -205,7 +210,9 @@ pub(crate) fn ctl_value_ip(ip: DisplayIp, target: Rung) -> u32 {
     match ip {
         DisplayIp::Xelpdp => ctl_value(target),
         DisplayIp::Xe2Lpd => CD2X_PIPE_NONE | crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
-        DisplayIp::Xe3Lpd => crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
+            crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+        }
     }
 }
 
