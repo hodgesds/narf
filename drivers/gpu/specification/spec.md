@@ -471,7 +471,10 @@ separate from the Display-30 writer: it omits `TRANS_VSYNCSHIFT` and all
 `TRANSCONF` interlace fields, treats pipe interlace readback as false, admits
 horizontal reflection for linear/X surfaces but not Tile4, and requires 2x
 vertical alignment for semiplanar YUV (2x in both axes when rotated). These
-are pure admission/planning helpers and do not enable a modeset route.
+are pure admission/planning helpers and do not enable a modeset route. Its
+pure underrun decoder covers `UNDERRUN_DBG1/2`, the optional FBC debug latch
+and `XE3P_UNDERRUN_PKGC`, returning the exact W1C image for each latched source.
+It installs no interrupt handler and performs no MMIO.
 Its pure memory profile decodes `MTL_MEM_SS_INFO_GLOBAL` and selects the
 65 GB/s `xe3lpd_sa_info` programmed-bandwidth ceiling. If
 `XE3P_ECC_IMPACTING_DE` is set it refuses admission: Linux warns that Bspec

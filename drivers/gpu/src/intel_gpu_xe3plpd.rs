@@ -1,16 +1,18 @@
-//! Disconnected Display 35 (Xe3P_LPD) plane and transcoder dialect.
+//! Disconnected Display 35 (Xe3P_LPD) plane, transcoder and underrun dialect.
 //!
 //! Pinned source: local Linux 7.0-rc7
-//! `i915/display/{intel_display.c,intel_plane.c,skl_universal_plane.c}`.
+//! `i915/display/{intel_display.c,intel_plane.c,skl_universal_plane.c,
+//! intel_fifo_underrun.c,intel_display_regs.h,intel_fbc.c,intel_fbc_regs.h}`.
 //! These helpers capture only the branches that must not inherit Display 30
 //! behavior: no `TRANS_VSYNCSHIFT` write or transcoder interlace field,
 //! linear horizontal reflection is allowed while Tile4 reflection is not,
-//! and semiplanar YUV restores vertical 2x subsampling. They form no MMIO
-//! transaction and grant no Nova Lake programming authority.
+//! semiplanar YUV restores vertical 2x subsampling, and the four Display-35
+//! underrun latches have exact decode/write-one-to-clear images. They form no
+//! MMIO transaction and grant no Nova Lake programming authority.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use crate::intel_gpu_xelpg_wm::Tiling;
+use crate::{intel_gpu_pipes::Pipe, intel_gpu_xelpg_wm::Tiling};
 
 const TRANSCONF_ENABLE: u32 = 1 << 31;
 /// `MTL_MEM_SS_INFO_GLOBAL`.
@@ -19,6 +21,118 @@ pub(crate) const MEM_SS_INFO_GLOBAL: u64 = 0x45700;
 pub(crate) const ECC_IMPACTING_DE: u32 = 1 << 12;
 /// Display 35 uses `xe3lpd_sa_info`, not Wildcat's 30.02 table.
 pub(crate) const DEPROGBWLIMIT_GBPS: i64 = crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS;
+
+/// Per-pipe Display-35 underrun debug registers.
+pub(crate) const UNDERRUN_DBG1_A: u64 = 0x70064;
+pub(crate) const UNDERRUN_DBG2_A: u64 = 0x70068;
+pub(crate) const GEN12_DCPR_STATUS_1: u64 = 0x46440;
+pub(crate) const FBC_UNDERRUN_DECMPR: u32 = 1 << 27;
+pub(crate) const UNDERRUN_FRAME_LINE_COUNTERS_FROZEN: u32 = 1 << 31;
+pub(crate) const XE3P_UNDERRUN_PKGC: u32 = 1 << 21;
+
+/// `UNDERRUN_DBG1(pipe)`; the source A/B addresses establish a 0x1000 stride.
+pub(crate) const fn underrun_dbg1(pipe: Pipe) -> u64 {
+    UNDERRUN_DBG1_A + pipe as u64 * 0x1000
+}
+
+/// `UNDERRUN_DBG2(pipe)`; the source A/B addresses establish a 0x1000 stride.
+pub(crate) const fn underrun_dbg2(pipe: Pipe) -> u64 {
+    UNDERRUN_DBG2_A + pipe as u64 * 0x1000
+}
+
+/// Six-plane masks decoded from `UNDERRUN_DBG1`: bit 0 is the cursor and bits
+/// 1--5 are universal planes 1--5.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnderrunPlaneCauses {
+    pub(crate) dbuf_block_not_valid: u8,
+    pub(crate) ddb_empty: u8,
+    pub(crate) dbuf_not_filled: u8,
+    pub(crate) below_wm0: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnderrunCounters {
+    /// Eleven-bit frame count from bits 30:20.
+    pub(crate) frame: u16,
+    /// Twenty-bit line count from bits 19:0.
+    pub(crate) line: u32,
+}
+
+/// Decoded, latched Display-35 underrun evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnderrunSnapshot {
+    pub(crate) planes: UnderrunPlaneCauses,
+    pub(crate) counters: Option<UnderrunCounters>,
+    pub(crate) fbc_decompressing: bool,
+    pub(crate) package_c_state_blocked_memory: bool,
+}
+
+/// Exact write-one-to-clear images. `None` means Linux performs no write for
+/// that register because its corresponding latch was clear or no FBC belongs
+/// to the pipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnderrunClear {
+    pub(crate) dbg1: Option<u32>,
+    pub(crate) dbg2: Option<u32>,
+    pub(crate) fbc_debug: Option<u32>,
+    pub(crate) dcpr_status1: Option<u32>,
+}
+
+/// Pure `read_underrun_dbg_info` decode. `fbc_debug` is `None` when
+/// `intel_fbc_for_pipe` finds no FBC instance. The DBG1 clear deliberately
+/// echoes the complete nonzero value, while the other three clear images carry
+/// only their source W1C bit.
+pub(crate) const fn underrun_snapshot(
+    dbg1: u32,
+    dbg2: u32,
+    fbc_debug: Option<u32>,
+    dcpr_status1: u32,
+) -> (UnderrunSnapshot, UnderrunClear) {
+    let counters_frozen = dbg2 & UNDERRUN_FRAME_LINE_COUNTERS_FROZEN != 0;
+    let fbc_decompressing = match fbc_debug {
+        Some(value) => value & FBC_UNDERRUN_DECMPR != 0,
+        None => false,
+    };
+    let package_c_state_blocked_memory = dcpr_status1 & XE3P_UNDERRUN_PKGC != 0;
+    (
+        UnderrunSnapshot {
+            planes: UnderrunPlaneCauses {
+                dbuf_block_not_valid: ((dbg1 >> 24) & 0x3f) as u8,
+                ddb_empty: ((dbg1 >> 16) & 0x3f) as u8,
+                dbuf_not_filled: ((dbg1 >> 8) & 0x3f) as u8,
+                below_wm0: (dbg1 & 0x3f) as u8,
+            },
+            counters: if counters_frozen {
+                Some(UnderrunCounters {
+                    frame: ((dbg2 >> 20) & 0x7ff) as u16,
+                    line: dbg2 & 0x000f_ffff,
+                })
+            } else {
+                None
+            },
+            fbc_decompressing,
+            package_c_state_blocked_memory,
+        },
+        UnderrunClear {
+            dbg1: if dbg1 != 0 { Some(dbg1) } else { None },
+            dbg2: if counters_frozen {
+                Some(UNDERRUN_FRAME_LINE_COUNTERS_FROZEN)
+            } else {
+                None
+            },
+            fbc_debug: if fbc_decompressing {
+                Some(FBC_UNDERRUN_DECMPR)
+            } else {
+                None
+            },
+            dcpr_status1: if package_c_state_blocked_memory {
+                Some(XE3P_UNDERRUN_PKGC)
+            } else {
+                None
+            },
+        },
+    )
+}
 
 /// The Display-35 transcoder decisions made by `intel_set_transcoder_timings`,
 /// `hsw_set_transconf` and `intel_pipe_is_interlaced`.
@@ -290,5 +404,57 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_bandwidth_ecc_is_fail_closed
+    );
+
+    fn smoke_nvl_display35_underrun_decode_and_w1c_images() -> TestResult {
+        assert_eq!(
+            [Pipe::A, Pipe::B, Pipe::C, Pipe::D].map(underrun_dbg1),
+            [0x70064, 0x71064, 0x72064, 0x73064]
+        );
+        assert_eq!(
+            [Pipe::A, Pipe::B, Pipe::C, Pipe::D].map(underrun_dbg2),
+            [0x70068, 0x71068, 0x72068, 0x73068]
+        );
+        assert_eq!(GEN12_DCPR_STATUS_1, 0x46440);
+
+        let dbg1 = (1 << 24) | (2 << 16) | (4 << 8) | 8;
+        let dbg2 = UNDERRUN_FRAME_LINE_COUNTERS_FROZEN | (0x3ab << 20) | 0xabcde;
+        let (snapshot, clear) =
+            underrun_snapshot(dbg1, dbg2, Some(FBC_UNDERRUN_DECMPR), XE3P_UNDERRUN_PKGC);
+        assert_eq!(
+            snapshot,
+            UnderrunSnapshot {
+                planes: UnderrunPlaneCauses {
+                    dbuf_block_not_valid: 1,
+                    ddb_empty: 2,
+                    dbuf_not_filled: 4,
+                    below_wm0: 8,
+                },
+                counters: Some(UnderrunCounters {
+                    frame: 0x3ab,
+                    line: 0xabcde,
+                }),
+                fbc_decompressing: true,
+                package_c_state_blocked_memory: true,
+            }
+        );
+        assert_eq!(
+            clear,
+            UnderrunClear {
+                dbg1: Some(dbg1),
+                dbg2: Some(1 << 31),
+                fbc_debug: Some(1 << 27),
+                dcpr_status1: Some(1 << 21),
+            }
+        );
+
+        let (snapshot, clear) = underrun_snapshot(0, 0x7fff_ffff, None, 0);
+        assert_eq!(snapshot, UnderrunSnapshot::default());
+        assert_eq!(clear, UnderrunClear::default());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_underrun_decode_and_w1c_images
     );
 }

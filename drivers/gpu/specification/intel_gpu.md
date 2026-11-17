@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.00** (v1.00 models the exact family-wide Xe3 GPIO
+> Status: **v1.01** (v1.01 models Display-35's four-source FIFO-underrun
+> evidence and exact W1C images without installing an IRQ path; v1.00 models the exact family-wide Xe3 GPIO
 > bit-bash mask workaround for Panther Lake 30.00, Wildcat Lake 30.02 and
 > Nova Lake 35.00 without connecting a GPIO fallback; v0.99 adds fail-closed
 > Nova Lake ECC/display-bandwidth admission; v0.98 isolates Nova Lake's Display-35 transcoder and
@@ -391,7 +392,12 @@ through display 30: no `TRANS_VSYNCSHIFT` write or transcoder interlace bits,
 interlace readback always false, linear/X reflection admitted with Tile4
 reflection refused, and semiplanar YUV aligned vertically by two (both axes
 when rotated). Its fixtures produce only typed plans/refusals; KMS does not
-call it.
+call it. The same disconnected module decodes each pipe's four six-plane
+`UNDERRUN_DBG1` reasons, frozen 11-bit frame/20-bit line counters, optional FBC
+decompression starvation and the package-C-state memory-blocking latch. It
+returns Linux's exact write-one-to-clear images (full nonzero DBG1; only the
+frozen/FBC/package bits for the other registers), but no IRQ or MMIO caller is
+installed.
 The same module decodes Display 35's `MTL_MEM_SS_INFO_GLOBAL` and retains the
 source 65 GB/s `xe3lpd_sa_info` ceiling. `XE3P_ECC_IMPACTING_DE` is a typed
 refusal because Linux 7.0-rc7 states that Bspec supplies no handling rule;
