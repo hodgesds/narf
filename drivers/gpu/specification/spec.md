@@ -412,8 +412,11 @@ display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 MMIO image. No decode/read/route returns it and it grants no LT-PHY or modeset
 authority. `intel_gpu_lt_phy` is an additional pure model of the WCL TC1/TC2
 LT-PHY boundary: exact RBR-through-UHBR20 DP PLL/VDR images, transmitter
-ownership/masking and DP 1.4/UHBR signal tables. It performs no MMIO and is not
-an operational route. Every other operational IP is a typed `IpError`: `Absent`,
+ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
+executes those images only for a display-30-qualified window and implements the
+retrying LT P2P transmitter transaction with ACK/error validation and bounded
+settling; only fake-MMIO fixtures call it. It is not an operational route.
+Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
 admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,

@@ -13,7 +13,10 @@
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use crate::intel_gpu_xelpg::XeLpgPort;
+use core::sync::atomic::{compiler_fence, Ordering};
+
+use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_xelpg::{Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort};
 
 pub(crate) const LANE0: u8 = 1;
 pub(crate) const LANE1: u8 = 2;
@@ -64,6 +67,13 @@ impl WclLtPort {
         match lane {
             0 | 1 => Some(base + lane as u64 * 4),
             _ => None,
+        }
+    }
+
+    const fn xelpg(self) -> XeLpgPort {
+        match self {
+            Self::Tc1 => XeLpgPort::Tc1,
+            Self::Tc2 => XeLpgPort::Tc2,
         }
     }
 }
@@ -512,10 +522,351 @@ pub(crate) const UHBR_LEVELS: [LtTxLevel; 16] = [
     level(1, 0, 2, 26, 2),
 ];
 
+// ── Disconnected WCL transport ──────────────────────────────────
+//
+// These fields are the shared Cx0 message-bus encoding.  The LT P2P flow
+// differs after the committed write: it waits for the normal P2M write ACK,
+// leaves 150 us for the PHY to settle, then clears both the normal response
+// and the WCL-only P2P-ready latch.  Linux currently carries the expected MAC
+// address/value through this API but does not compare them with a register
+// read; the descriptor consistency check below does not invent that read.
+
+const M2P_TRANSACTION_PENDING: u32 = 1 << 31;
+const M2P_COMMAND_WRITE_COMMITTED: u32 = 0x2 << 27;
+const M2P_DATA_SHIFT: u32 = 16;
+const M2P_TRANSACTION_RESET: u32 = 1 << 15;
+const P2M_RESPONSE_READY: u32 = 1 << 31;
+const P2M_COMMAND_MASK: u32 = 0xf << 27;
+const P2M_COMMAND_WRITE_ACK: u32 = 0x5 << 27;
+const P2M_ERROR_SET: u32 = 1 << 15;
+const MSGBUS_ATTEMPTS: u8 = 3;
+const MSGBUS_TIMEOUT_US: u64 = 1_000;
+const P2P_SETTLE_US: u64 = 150;
+
+/// WCL LT-PHY message-bus transport.  Construction is family-qualified but
+/// this type is not reachable from any display route.
+pub(crate) struct LtPhy<'a, M: MmioWindow + ?Sized> {
+    mmio: &'a M,
+    port: WclLtPort,
+    lanes: PhyLaneConfig,
+    dp_alt: bool,
+}
+
+impl<M: MmioWindow + ?Sized> core::fmt::Debug for LtPhy<'_, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LtPhy")
+            .field("port", &self.port)
+            .field("lanes", &self.lanes)
+            .field("dp_alt", &self.dp_alt)
+            .finish()
+    }
+}
+
+impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
+    pub(crate) fn new(
+        mmio: &'a M,
+        port: WclLtPort,
+        dp_alt: bool,
+        max_lanes: u8,
+        reversed: bool,
+    ) -> Result<Self, Cx0Error> {
+        // LT PHY only exists on display 30.02.  A generic MTL/C20 window must
+        // never receive these same-looking Cx0 transactions.
+        if !mmio.cx0_xe3() {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let lanes = PhyLaneConfig::for_route(dp_alt, max_lanes, reversed)?;
+        Ok(Self {
+            mmio,
+            port,
+            lanes,
+            dp_alt,
+        })
+    }
+
+    fn cx0(&self) -> Cx0Phy<'_, M> {
+        Cx0Phy::with_lanes(self.mmio, self.port.xelpg(), self.lanes)
+    }
+
+    fn m2p_ctl(&self, lane: u8) -> u64 {
+        self.port.xelpg().msgbus_ctl_ln0() + u64::from(lane) * 4
+    }
+
+    fn p2m_status(&self, lane: u8) -> u64 {
+        self.m2p_ctl(lane) + 8
+    }
+
+    fn wait_for(&self, off: u64, mask: u32, want: u32, timeout_us: u64) -> bool {
+        let mut lost = false;
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                let value = self.mmio.read32(off);
+                lost = value == u32::MAX || !self.mmio.display_access_ok();
+                lost || value & mask == want
+            },
+            narf_time::Deadline::after_us(timeout_us),
+        );
+        done && !lost
+    }
+
+    fn clear_response_ready(&self, lane: u8) {
+        let off = self.p2m_status(lane);
+        let value = self.mmio.read32(off);
+        self.mmio
+            .write32(off, value | P2M_RESPONSE_READY | P2M_ERROR_SET);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    fn clear_p2p_ready(&self, lane: u8) -> Result<(), Cx0Error> {
+        let off = self
+            .port
+            .p2m_status_p2p(lane)
+            .ok_or(Cx0Error::ProtocolMismatch)?;
+        let value = self.mmio.read32(off);
+        if value == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(Cx0Error::PhyError);
+        }
+        self.mmio.write32(off, value & !P2M_RESPONSE_READY);
+        compiler_fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn bus_reset(&self, lane: u8) {
+        let ctl = self.m2p_ctl(lane);
+        self.mmio.write32(ctl, M2P_TRANSACTION_RESET);
+        compiler_fence(Ordering::SeqCst);
+        let _ = self.wait_for(ctl, M2P_TRANSACTION_RESET, 0, MSGBUS_TIMEOUT_US);
+        self.clear_response_ready(lane);
+    }
+
+    fn wait_for_write_ack(&self, lane: u8) -> Result<u32, Cx0Error> {
+        let off = self.p2m_status(lane);
+        if !self.wait_for(
+            off,
+            P2M_RESPONSE_READY,
+            P2M_RESPONSE_READY,
+            MSGBUS_TIMEOUT_US,
+        ) {
+            self.bus_reset(lane);
+            return Err(Cx0Error::Timeout);
+        }
+        let value = self.mmio.read32(off);
+        if value & P2M_ERROR_SET != 0 {
+            self.bus_reset(lane);
+            return Err(Cx0Error::PhyError);
+        }
+        if value & P2M_COMMAND_MASK != P2M_COMMAND_WRITE_ACK {
+            self.bus_reset(lane);
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        Ok(value)
+    }
+
+    fn p2p_write_once(&self, lane: u8, address: u16, data: u8) -> Result<(), Cx0Error> {
+        let ctl = self.m2p_ctl(lane);
+        if !self.wait_for(ctl, M2P_TRANSACTION_PENDING, 0, MSGBUS_TIMEOUT_US) {
+            self.bus_reset(lane);
+            return Err(Cx0Error::Timeout);
+        }
+
+        // `intel_de_rmw(status, 0, 0)`: read/write the current W1C status so
+        // stale response/error flags cannot satisfy this transaction.
+        let status = self.p2m_status(lane);
+        let old = self.mmio.read32(status);
+        if old == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(Cx0Error::PhyError);
+        }
+        self.mmio.write32(status, old);
+        compiler_fence(Ordering::SeqCst);
+
+        self.mmio.write32(
+            ctl,
+            M2P_TRANSACTION_PENDING
+                | M2P_COMMAND_WRITE_COMMITTED
+                | (u32::from(data) << M2P_DATA_SHIFT)
+                | (u32::from(address) & 0x0fff),
+        );
+        compiler_fence(Ordering::SeqCst);
+        self.wait_for_write_ack(lane)?;
+
+        let deadline = narf_time::Deadline::after_us(P2P_SETTLE_US);
+        let _ = narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
+        self.clear_response_ready(lane);
+        self.clear_p2p_ready(lane)
+    }
+
+    fn p2p_write(&self, lane_mask: u8, address: u16, data: u8) -> Result<(), Cx0Error> {
+        if lane_mask == 0 || lane_mask & !BOTH_LANES != 0 {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        for lane in 0..2u8 {
+            if lane_mask & (1 << lane) == 0 {
+                continue;
+            }
+            let mut result = Err(Cx0Error::Timeout);
+            for _ in 0..MSGBUS_ATTEMPTS {
+                result = self.p2p_write_once(lane, address, data);
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Program the source DP PLL image through the normal Cx0 VDR transport.
+    pub(crate) fn program_dp_pll(&self, rate: LtDpRate) -> Result<(), Cx0Error> {
+        let state = dp_pll_state(rate);
+        let cx0 = self.cx0();
+        for index in 0..LT_PLL_PROGRAM_WRITE_COUNT {
+            let write = pll_program_write(state, self.lanes.owned_mask(), index)
+                .ok_or(Cx0Error::ProtocolMismatch)?;
+            cx0.write(write.lane_mask, write.address, write.data, true)?;
+        }
+        Ok(())
+    }
+
+    /// Enable/disable all four transmitters through the LT-specific P2P flow.
+    pub(crate) fn program_transmitters(
+        &self,
+        lane_count: u8,
+        pin_assignment_d: bool,
+    ) -> Result<(), Cx0Error> {
+        let mask = transmitter_mask(
+            lane_count,
+            self.lanes.reversed(),
+            self.dp_alt,
+            pin_assignment_d,
+        )
+        .ok_or(Cx0Error::ProtocolMismatch)?;
+        let writes = tx_enable_writes(mask).ok_or(Cx0Error::ProtocolMismatch)?;
+        for write in writes {
+            if write.address != write.mac_offset || write.data != write.expected_mac {
+                return Err(Cx0Error::ProtocolMismatch);
+            }
+            self.p2p_write(write.lane_mask, write.address, write.data)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
+    use alloc::{collections::BTreeMap, vec::Vec};
+    use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Transaction {
+        lane: u8,
+        address: u16,
+        data: u8,
+    }
+
+    #[derive(Debug)]
+    struct FakeLtMmio {
+        regs: RefCell<BTreeMap<u64, u32>>,
+        transactions: RefCell<Vec<Transaction>>,
+        resets: Cell<u32>,
+        bad_ack: Cell<bool>,
+        xe3: bool,
+    }
+
+    impl Default for FakeLtMmio {
+        fn default() -> Self {
+            Self {
+                regs: RefCell::new(BTreeMap::new()),
+                transactions: RefCell::new(Vec::new()),
+                resets: Cell::new(0),
+                bad_ack: Cell::new(false),
+                xe3: true,
+            }
+        }
+    }
+
+    impl FakeLtMmio {
+        fn ctl_lane(off: u64) -> Option<(WclLtPort, u8)> {
+            for (port, base) in [(WclLtPort::Tc1, 0x16_f240), (WclLtPort::Tc2, 0x16_f440)] {
+                if off == base {
+                    return Some((port, 0));
+                }
+                if off == base + 4 {
+                    return Some((port, 1));
+                }
+            }
+            None
+        }
+
+        fn ordinary_status(off: u64) -> bool {
+            matches!(off, 0x16_f248 | 0x16_f24c | 0x16_f448 | 0x16_f44c)
+        }
+
+        fn p2p_status(off: u64) -> bool {
+            matches!(off, 0x16_f2a0 | 0x16_f2a4 | 0x16_f4a0 | 0x16_f4a4)
+        }
+    }
+
+    impl MmioWindow for FakeLtMmio {
+        fn display_access_ok(&self) -> bool {
+            true
+        }
+
+        fn cx0_xe3(&self) -> bool {
+            self.xe3
+        }
+
+        fn read32(&self, off: u64) -> u32 {
+            *self.regs.borrow().get(&off).unwrap_or(&0)
+        }
+
+        fn write32(&self, off: u64, value: u32) {
+            if Self::ordinary_status(off) {
+                let old = self.read32(off);
+                self.regs.borrow_mut().insert(off, old & !value);
+                return;
+            }
+            if Self::p2p_status(off) {
+                self.regs.borrow_mut().insert(off, value);
+                return;
+            }
+            let Some((port, lane)) = Self::ctl_lane(off) else {
+                self.regs.borrow_mut().insert(off, value);
+                return;
+            };
+            if value & M2P_TRANSACTION_RESET != 0 {
+                self.resets.set(self.resets.get() + 1);
+                self.regs.borrow_mut().insert(off, 0);
+                return;
+            }
+            if value & M2P_TRANSACTION_PENDING == 0 {
+                self.regs.borrow_mut().insert(off, value);
+                return;
+            }
+
+            let address = (value & 0x0fff) as u16;
+            let data = ((value >> M2P_DATA_SHIFT) & 0xff) as u8;
+            self.transactions.borrow_mut().push(Transaction {
+                lane,
+                address,
+                data,
+            });
+            self.regs.borrow_mut().insert(off, 0);
+            let ack = if self.bad_ack.get() {
+                0x4 << 27
+            } else {
+                P2M_COMMAND_WRITE_ACK
+            };
+            self.regs
+                .borrow_mut()
+                .insert(off + 8, P2M_RESPONSE_READY | ack);
+            let p2p = port.p2m_status_p2p(lane).unwrap();
+            self.regs
+                .borrow_mut()
+                .insert(p2p, P2M_RESPONSE_READY | u32::from(address));
+        }
+    }
 
     fn smoke_wcl_lt_phy_ports_and_ownership() -> TestResult {
         assert_eq!(WclLtPort::from_xelpg(XeLpgPort::Tc1), Some(WclLtPort::Tc1));
@@ -656,5 +1007,95 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_wcl_lt_phy_signal_tables
+    );
+
+    fn smoke_wcl_lt_phy_transport_programs_pll_and_p2p_tx() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        phy.program_dp_pll(LtDpRate::Hbr3).unwrap();
+        let transactions = fake.transactions.borrow();
+        // 81 logical writes: config 0 and 2 fan out to both owned lanes.
+        assert_eq!(transactions.len(), LT_PLL_PROGRAM_WRITE_COUNT + 2);
+        assert_eq!(
+            transactions[0],
+            Transaction {
+                lane: 0,
+                address: 0x0c02,
+                data: 0x9b,
+            }
+        );
+        assert_eq!(transactions[1].lane, 1);
+        assert_eq!(
+            (transactions[2].address, transactions[2].data),
+            (0x0c03, 0x2d)
+        );
+        assert_eq!(
+            (transactions[5].address, transactions[5].data),
+            (0x0c04, 0x87)
+        );
+        assert_eq!(transactions.last().unwrap().address, 0x0c51);
+        drop(transactions);
+
+        fake.transactions.borrow_mut().clear();
+        phy.program_transmitters(4, false).unwrap();
+        assert_eq!(
+            fake.transactions.borrow().as_slice(),
+            &[
+                Transaction {
+                    lane: 0,
+                    address: 0x040a,
+                    data: 1,
+                },
+                Transaction {
+                    lane: 0,
+                    address: 0x060a,
+                    data: 1,
+                },
+                Transaction {
+                    lane: 1,
+                    address: 0x040a,
+                    data: 1,
+                },
+                Transaction {
+                    lane: 1,
+                    address: 0x060a,
+                    data: 1,
+                },
+            ]
+        );
+        assert_eq!(fake.read32(0x16_f248), 0);
+        assert_eq!(fake.read32(0x16_f24c), 0);
+        assert_eq!(fake.read32(0x16_f2a0) & P2M_RESPONSE_READY, 0);
+        assert_eq!(fake.read32(0x16_f2a4) & P2M_RESPONSE_READY, 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_wcl_lt_phy_transport_programs_pll_and_p2p_tx
+    );
+
+    fn smoke_wcl_lt_phy_transport_rejects_family_and_bad_ack() -> TestResult {
+        let wrong_family = FakeLtMmio {
+            xe3: false,
+            ..FakeLtMmio::default()
+        };
+        assert!(matches!(
+            LtPhy::new(&wrong_family, WclLtPort::Tc1, true, 4, false),
+            Err(Cx0Error::ProtocolMismatch)
+        ));
+
+        let fake = FakeLtMmio::default();
+        fake.bad_ack.set(true);
+        let phy = LtPhy::new(&fake, WclLtPort::Tc2, true, 2, false).unwrap();
+        assert_eq!(
+            phy.program_transmitters(2, false),
+            Err(Cx0Error::ProtocolMismatch)
+        );
+        assert_eq!(fake.resets.get(), u32::from(MSGBUS_ATTEMPTS));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_wcl_lt_phy_transport_rejects_family_and_bad_ack
     );
 }
