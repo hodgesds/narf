@@ -1,7 +1,10 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.87** (v0.86 plus a disconnected exact WCL external owner that
-> exercises TC1/TC2 DP-alt through C20 and Pipes B/C; v0.85 corrected against Linux 7.0-rc7 so LT PHY is
+> Status: **v0.88** (v0.87 plus exact, separately opted-in WCL display-30.02
+> route admission and Pipe-A modeset dispatch while its production probe and
+> hotplug entry remain closed; v0.86 plus a disconnected exact WCL external
+> owner that exercises TC1/TC2 DP-alt through C20 and Pipes B/C; v0.85
+> corrected against Linux 7.0-rc7 so LT PHY is
 > source-qualified to Nova Lake display 35.00 A/B/TC1/TC2 while Wildcat Lake
 > remains on C10/C20; Wildcat Lake's disconnected TC1/TC2-only
 > external-display and Pipe-B/C allocation profile; Nova Lake's disconnected source-order
@@ -9,7 +12,8 @@
 > per-lane swing/cursor programming; its disconnected LT-PHY A/B/TC1/TC2 VDR
 > and retrying P2P transmitter transport; its DP PLL/write-image,
 > transmitter-ownership and DP 1.4/UHBR signal models,
-> while every display-30.02 output route remains fail-closed; the pure Wildcat
+> while every production display-30.02 output route remains fail-closed; the
+> Wildcat
 > Lake three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings;
 > the source-qualified Panther Lake display-30
 > TC1–TC4 USB-C DP route and mandatory fixed-refresh VRR timing generator;
@@ -33,8 +37,8 @@
 > Linux GMD display identities, including distinct Wildcat Lake 30.02 and
 > Nova Lake-S 35.00 refusal proofs; exact Nova Lake-S headless GT/GuC/media
 > identity and exact fail-closed Crescent Island discovery; a distinct Wildcat Lake GT profile admitting
-> exact graphics 30.03-30.05 and media 30.02 while display 30.02 remains
-> fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
+> exact graphics 30.03-30.05 and media 30.02 while its production display entry
+> remains fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
 > display-idle and cache-policy profile; DG1 display programming and local-
 > memory publication remain fail-closed; the exact Rocket Lake PCI-ID and
 > GuC/GT profile keeps Rocket Lake display programming fail-closed;
@@ -304,7 +308,7 @@ them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
 30.03/30.04/30.05 and media 30.02, applies the source Xe3 policy without PTL's
 graphics-30.00 A0 workaround, and skips the media-30.00-only GGTT dummy-write
 workaround. `DisplayIp::WildcatLake` retains display 30's timing-generator,
-PM-demand, watermark and CDCLK rules for pure resource admission, with only
+PM-demand, watermark and CDCLK rules for exact resource admission, with only
 Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
 programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
 D. The disconnected `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits
@@ -312,8 +316,12 @@ only TC1/TC2 and scans only Pipes B/C, so sharing Panther Lake's graphics
 generation cannot silently grant TC3/TC4 or Pipe D authority. No production
 probe or hotplug entry selects it. The service retains the exact profile and
 native fixtures exercise C20 enable/training/fixed-TG/stop on TC1/TC2 and
-Pipes B/C. Linux keeps WCL on the Panther Lake C20 path; it does not select
-LT PHY.
+Pipes B/C. `DisplayIp::decode_all` and the display-30 modeset accept 30.02,
+but `display_route` binds it only to exact `GtPlatform::WildcatLake` plus the
+distinct `narf.intel.wcl_display=1` request. Crossed PTL/WCL identities refuse
+read-only. The production probe remains PTL-only until KMS and hotplug retain
+the exact IP end-to-end. Linux keeps WCL on the Panther Lake C20 path; it does
+not select LT PHY.
 
 `intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
@@ -331,8 +339,8 @@ adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
 rate-update calibration and DDI clock-value programming in Linux source order.
 It requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
 production route supplies those preconditions. Display 35.00 remains a typed
-route refusal pending Nova Lake display and output ownership; WCL display 30.02
-remains a separate C20 route refusal.
+route refusal pending Nova Lake display and output ownership; WCL stays on the
+separate C10/C20 route above.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
@@ -1817,9 +1825,10 @@ trusted.
   TC1–TC4 route and the display-30 PICA/Cx0 view. Its live transaction uses
   Xe3 PM demand and guardband-aware watermarks; every external transcoder
   programs and runs the mandatory fixed-refresh VRR timing generator between
-  the DDI-function and transcoder enables. Combo DDI B, HDMI, Wildcat Lake
-  display 30.02 and a headless/unqualified Panther Lake function remain
-  refused.
+  the DDI-function and transcoder enables. The exact WCL 30.02 model uses the
+  same Pipe-A/display-30 core and a distinct TC1/TC2, Pipes B/C C20 profile,
+  but its production probe remains closed. Combo DDI B, HDMI and a
+  headless/unqualified function remain refused.
 - Pipe A's DMC is reported dark after this lane's crtc disable and lit
   before its port PLL (`intel_dmc_disable_pipe` / `intel_dmc_enable_pipe`
   call sites); a successful owned modeset records its panel mode
@@ -1870,13 +1879,15 @@ programmed-bandwidth limit; NVL-S selects
 `xe3p_lpd_dmc.bin`/787.2 MHz and the four-pipe/FBC `xe2_lpd_display` topology.
 The headless post-FLR proof uses those masks, so WCL does not sample a
 nonexistent Pipe D while NVL-S still refuses live Pipe-D state.
-`DisplayIp::{Xelpdp,Xe2Lpd,Xe3Lpd}` grants programming authority only through
-its qualified route: 14.00 and 20.00 normally, plus 30.00 through the explicit
-Panther Lake entry. `DisplayIp::WildcatLake` is a pure resource profile only;
-it is never returned by a decode/read or operational route. An absent display
-(GMD zero), 14.01 (BMG), 30.02 (WCL) and 35.00 (NVL-S) remain typed refusals
-on this route. Display 20 runs the display-14 code with version dispatch, not
-a copy of it.
+`DisplayIp::{Xelpdp,Xe2Lpd,Xe3Lpd,WildcatLake}` grants programming authority
+only through its qualified route: 14.00 and 20.00 normally, plus 30.00/30.02
+through the display-30 decoder. `display_route` binds 30.00 to exact Panther
+Lake with `narf.intel.ptl_display=1`, and 30.02 to exact Wildcat Lake with
+`narf.intel.wcl_display=1`; crossed identities refuse before any write. The
+production probe still selects only 30.00 until exact-IP KMS and hotplug state
+lands. An absent display (GMD zero), 14.01 (BMG) and 35.00 (NVL-S) remain
+typed refusals. Display 20/30 runs the display-14 code with version dispatch,
+not a copy of it.
 
 Admission and the headless profile. Lunar Lake's existing profile is the
 headless main GT, which owns the function through a driver FLR

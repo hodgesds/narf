@@ -8,6 +8,7 @@
 //! hardware acknowledgements.
 use super::*;
 use crate::intel_gpu::Generation;
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError, PixelFormat};
 use crate::intel_gpu_pmdemand::{Demand, Layout, Params};
 use crate::intel_gpu_xelpg_cdclk::{self as cdclk, Current, Step};
@@ -74,16 +75,16 @@ impl MmioWindow for Regs {
 
 // ── Identification and route ─────────────────────────────────────
 
-fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult {
+fn smoke_xe3lpd_gmd_decode_admits_display30_through_decode_all() -> TestResult {
     use crate::intel_gpu_xe2lpd::IpError;
     // gmdid_display_map: 30.00 is xe2_lpd_display (Panther Lake), 30.02
-    // is the distinct wcl_display. The latter is recognized as a pure
-    // resource profile below but remains outside every operational route.
+    // is the distinct wcl_display. Both require the exact display-30 route;
+    // the normal Meteor/Lunar decoder still refuses both.
     assert_eq!(DisplayIp::decode_all(30 << 22), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(DisplayIp::decode_all((30 << 22) | 5), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(
         DisplayIp::decode_all((30 << 22) | (2 << 14)),
-        Err(IpError::Unqualified { ver: 30, rel: 2 })
+        Ok(DisplayIp::WildcatLake)
     );
     // The Meteor/Lunar Lake entries keep refusing 30.00.
     assert_eq!(
@@ -112,6 +113,12 @@ fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult 
     );
     let io = Regs::with(&[(0x510a0, u32::MAX)]);
     assert_eq!(DisplayIp::read_all(&io), Err(IpError::NoDevice));
+    let io = Regs::with(&[(0x510a0, (30 << 22) | (2 << 14))]);
+    assert_eq!(DisplayIp::read_all(&io), Ok(DisplayIp::WildcatLake));
+    assert_eq!(
+        DisplayIp::read(&io),
+        Err(IpError::Unqualified { ver: 30, rel: 2 })
+    );
     // Display-30 properties of xe2_lpd_display and the display >= 20
     // branches it shares.
     let ip = DisplayIp::Xe3Lpd;
@@ -147,7 +154,7 @@ fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult 
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3lpd",
-    smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all
+    smoke_xe3lpd_gmd_decode_admits_display30_through_decode_all
 );
 
 fn lit_ptl() -> Regs {
@@ -161,25 +168,39 @@ fn lit_ptl() -> Regs {
 
 fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult {
     use crate::intel_gpu_xe2lpd::IpError;
+    let ptl = GtPlatform::Integrated(Generation::PantherLake);
     let io = lit_ptl();
-    assert_eq!(
-        display_route(Generation::PantherLake, true, &io),
-        Ok(DisplayIp::Xe3Lpd)
-    );
+    assert_eq!(display_route(ptl, true, &io), Ok(DisplayIp::Xe3Lpd));
     for other in [
-        Generation::LunarLake,
-        Generation::MeteorLake,
-        Generation::TigerLake,
+        GtPlatform::Integrated(Generation::LunarLake),
+        GtPlatform::Integrated(Generation::MeteorLake),
+        GtPlatform::Integrated(Generation::TigerLake),
+        GtPlatform::NovaLakeS,
     ] {
         assert_eq!(
             display_route(other, true, &io),
-            Err(RouteRefusal::NotPantherLake)
+            Err(RouteRefusal::UnsupportedPlatform)
         );
     }
+    let wcl = lit_ptl();
+    wcl.set(0x510a0, (30 << 22) | (2 << 14));
+    assert_eq!(
+        display_route(GtPlatform::WildcatLake, true, &wcl),
+        Ok(DisplayIp::WildcatLake)
+    );
+    assert_eq!(
+        display_route(ptl, true, &wcl),
+        Err(RouteRefusal::Ip(IpError::Unqualified { ver: 30, rel: 2 }))
+    );
+    assert_eq!(
+        display_route(GtPlatform::WildcatLake, true, &io),
+        Err(RouteRefusal::Ip(IpError::Unqualified { ver: 30, rel: 0 }))
+    );
+    assert!(wcl.writes.borrow().is_empty());
     // Without the option nothing is read.
     let io = lit_ptl();
     assert_eq!(
-        display_route(Generation::PantherLake, false, &io),
+        display_route(ptl, false, &io),
         Err(RouteRefusal::NotRequested)
     );
     assert_eq!(io.reads.get(), 0);
@@ -209,27 +230,27 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
     ] {
         let io = lit_ptl();
         io.set(r, v);
-        assert_eq!(
-            display_route(Generation::PantherLake, true, &io),
-            Err(refusal),
-            "{r:#x}={v:#x}"
-        );
+        assert_eq!(display_route(ptl, true, &io), Err(refusal), "{r:#x}={v:#x}");
         assert!(io.writes.borrow().is_empty(), "refusal wrote");
     }
     // A fused-out pipe B/C/D or other PICA config bits do not refuse.
     let io = lit_ptl();
     io.set(0x51000, 1 << 28);
     io.set(0x16fe68, 0x7fff_ffff);
-    assert_eq!(
-        display_route(Generation::PantherLake, true, &io),
-        Ok(DisplayIp::Xe3Lpd)
-    );
+    assert_eq!(display_route(ptl, true, &io), Ok(DisplayIp::Xe3Lpd));
     assert!(io.writes.borrow().is_empty());
     // The strict opt-in grammar; the Lunar Lake option does not request it.
     use narf_boot::args::KernelCmdline;
     assert!(requested(KernelCmdline::new("narf.intel.ptl_display=1")));
     assert!(requested(KernelCmdline::new(
         "quiet narf.intel.ptl_display=1 root=/dev/sda"
+    )));
+    assert!(wcl_requested(KernelCmdline::new(
+        "quiet narf.intel.wcl_display=1 root=/dev/sda"
+    )));
+    assert!(!requested(KernelCmdline::new("narf.intel.wcl_display=1")));
+    assert!(!wcl_requested(KernelCmdline::new(
+        "narf.intel.ptl_display=1"
     )));
     for line in [
         "",
@@ -241,6 +262,7 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
         "narf.intel.lnl_display=1",
     ] {
         assert!(!requested(KernelCmdline::new(line)), "{line}");
+        assert!(!wcl_requested(KernelCmdline::new(line)), "{line}");
     }
     TestResult::Pass
 }
@@ -1263,12 +1285,32 @@ kernel_test_in!(
 );
 
 fn smoke_xe3lpd_entry_refuses_without_display30_read_only() -> TestResult {
-    for gmd in [14 << 22, 20 << 22, 0, (30 << 22) | (2 << 14)] {
+    for gmd in [14 << 22, 20 << 22, 0] {
         let io = Ptl::new();
         io.values.borrow_mut().insert(0x510a0, gmd);
         assert_eq!(io.run(), Err(ModesetError::UnsupportedGeneration));
         assert!(io.writes.borrow().is_empty(), "{gmd:#x}");
     }
+    // WCL uses the same display-30 Pipe-A sequence but retains its exact
+    // three-pipe resource profile and never accesses Pipe D.
+    let io = Ptl::new();
+    io.values
+        .borrow_mut()
+        .insert(0x510a0, (30 << 22) | (2 << 14));
+    assert_eq!(io.run(), Ok(Mode::VESA_1024X768_60));
+    assert!(io
+        .writes
+        .borrow()
+        .iter()
+        .all(|(r, _)| !(0x73000..0x74000).contains(r)));
+    assert_eq!(
+        crate::intel_gpu_display_resources::Profile::capture(
+            &View::new(&io, false),
+            &Mode::VESA_1024X768_60,
+        )
+        .map(|profile| profile.ip),
+        Ok(DisplayIp::WildcatLake)
+    );
     // The entry needs the display-30 view (the PICA dialect).
     let io = Ptl::new();
     assert_eq!(

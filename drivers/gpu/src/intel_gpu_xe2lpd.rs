@@ -85,6 +85,13 @@
 //! Meteor and Lunar Lake entries here keep refusing 30.00 through
 //! [`DisplayIp::decode`]. Its opted-in route, deltas and owned modeset entry
 //! live in [`crate::intel_gpu_xe3lpd`].
+//!
+//! ## Wildcat Lake (display 30.02)
+//!
+//! [`DisplayIp::WildcatLake`] is decoded only by [`DisplayIp::decode_all`]
+//! and admitted only for the exact [`crate::intel_gpu_gt::GtPlatform::WildcatLake`]
+//! route. It keeps the source three-pipe topology and C10/C20 PHY split; it
+//! is not an LT-PHY platform.
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_xelpg::XeLpgPort;
@@ -112,8 +119,8 @@ pub(crate) enum DisplayIp {
     /// opted-in Panther Lake route ([`crate::intel_gpu_xe3lpd`]).
     Xe3Lpd,
     /// 30.02 (`wcl_display`): Wildcat Lake's three-pipe Xe3_LPD
-    /// descriptor. This is retained for pure platform/resource modelling;
-    /// no operational route constructs it until the LT PHY is owned.
+    /// descriptor. Only the exact opted-in Wildcat Lake route constructs it;
+    /// broad Panther Lake generation dispatch remains insufficient.
     WildcatLake,
 }
 
@@ -121,9 +128,8 @@ pub(crate) enum DisplayIp {
 /// `gmdid_display_map`.
 ///
 /// This is deliberately wider than [`DisplayIp`]: recognizing a live IP is
-/// not authority to program it.  In particular, Wildcat Lake 30.02 and Nova
-/// Lake-S 35.00 can be used as read-only reset/admission proofs while they
-/// remain outside every operational modeset route.
+/// not authority to program it. In particular, Nova Lake-S 35.00 remains a
+/// read-only reset/admission proof outside every operational modeset route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayIdentity {
     /// 14.00, `xe_lpdp_display`.
@@ -421,11 +427,12 @@ impl DisplayIdentity {
 }
 
 impl DisplayIp {
-    const fn from_identity(identity: DisplayIdentity, xe3: bool) -> Result<Self, IpError> {
+    const fn from_identity(identity: DisplayIdentity, display30: bool) -> Result<Self, IpError> {
         match identity {
             DisplayIdentity::Xelpdp => Ok(Self::Xelpdp),
             DisplayIdentity::Xe2Lpd => Ok(Self::Xe2Lpd),
-            DisplayIdentity::Xe3Lpd if xe3 => Ok(Self::Xe3Lpd),
+            DisplayIdentity::Xe3Lpd if display30 => Ok(Self::Xe3Lpd),
+            DisplayIdentity::WildcatLake if display30 => Ok(Self::WildcatLake),
             other => {
                 let (ver, rel) = other.version();
                 Err(IpError::Unqualified { ver, rel })
@@ -449,14 +456,13 @@ impl DisplayIp {
         }
     }
 
-    /// [`DisplayIp::decode`] widened by display 30.00 (Xe3_LPD). Only the
+    /// [`DisplayIp::decode`] widened by display 30.00 and 30.02. Only the
     /// display-30 route and the per-IP owners behind it use it; the Meteor
     /// Lake and Lunar Lake entries keep [`DisplayIp::decode`], so 30.00
-    /// stays a typed refusal there. 30.02 (`wcl_display`: three pipes, C10
-    /// on PHY A and B, `xe3lpd_3002_dmc.bin`, a 480 MHz CDCLK ceiling and
-    /// `xe3lpd_3002_sa_info`) belongs to Wildcat Lake. Its PCI IDs are
-    /// recognized for headless GT execution, but display programming is
-    /// still refused here.
+    /// and 30.02 stay typed refusals there. 30.02 (`wcl_display`: three
+    /// pipes, C10 on PHY A and B, `xe3lpd_3002_dmc.bin`, a 480 MHz CDCLK
+    /// ceiling and `xe3lpd_3002_sa_info`) belongs to the exact Wildcat Lake
+    /// route; decoding it here does not bypass that platform admission.
     pub(crate) const fn decode_all(gmd: u32) -> Result<Self, IpError> {
         match DisplayIdentity::decode(gmd) {
             Ok(identity) => Self::from_identity(identity, true),

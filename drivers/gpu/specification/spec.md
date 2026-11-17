@@ -404,10 +404,10 @@ Gen12 orchestrator use.
 `DisplayIdentity` decodes the complete current Linux `gmdid_display_map`
 (14.00, 14.01, 20.00, 30.00, 30.02 and 35.00) for read-only identity
 proofs. Recognition grants no programming authority: `DisplayIp::{Xelpdp,
-Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 admitted
-only through the explicitly opted-in `decode_all` route.
-`DisplayIp::WildcatLake` is constructed only for pure resource and external
-profile modelling:
+Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 and 30.02
+admitted only through the explicitly opted-in `decode_all` route.
+`DisplayIp::WildcatLake` carries the exact resource, Pipe-A modeset and
+external profile:
 display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
 MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
@@ -415,8 +415,11 @@ future external owner to TC1/TC2 and scans only Pipes B/C; it is not selected
 by a production entry point. `MtlExternalService` retains that exact profile
 instead of reconstructing it from broad `Generation::PantherLake`; native
 fixtures run the existing display-30 C20/PICA DP-alt enable, training, fixed
-VRR-TG and stop path on TC1/TC2 and Pipes B/C. No decode/read/production route
-returns the IP. Linux's source boundary is
+VRR-TG and stop path on TC1/TC2 and Pipes B/C. `display_route` returns it only
+for exact `GtPlatform::WildcatLake` with the distinct
+`narf.intel.wcl_display=1` request; crossed PTL/WCL identities refuse
+read-only. The production probe remains PTL-only until KMS and hotplug retain
+the exact display IP end-to-end. Linux's source boundary is
 explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
 LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
 additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact
@@ -446,8 +449,9 @@ without granting a write route.
 Notably WCL 30.02 selects `xe3lpd_3002_dmc.bin` with a 480 MHz ceiling,
 22 GB/s programmed-bandwidth limit and three pipes/FBCs; NVL-S 35.00 selects
 `xe3p_lpd_dmc.bin` with a 787.2 MHz ceiling and the four-pipe/FBC
-`xe2_lpd_display` topology. Both remain read-only route identities; WCL's
-separately constructible pure resource profile performs no MMIO. The
+`xe2_lpd_display` topology. NVL-S remains a read-only route identity; WCL's
+route decision is read-only and its exact modeset remains disconnected from
+the production probe. The
 post-driver-FLR proof checks only power-well and pipe-DMC bits
 owned by the observed topology; WCL's nonexistent Pipe-D bits are not treated
 as hardware state, while NVL-S Pipe D remains fail-closed.
@@ -3336,7 +3340,8 @@ graphics 30.00/30.01, media 30.00 and `xe/ptl_guc_70.bin` 70.54.0+.
 WCL IDs fd80/fd81 select that same Linux PTL descriptor and firmware profile,
 but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
 media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
-still refuses pending its separate display policy.
+has an exact, separately opted-in route and modeset model, but production
+probe/KMS/hotplug admission remains closed pending exact-IP plumbing.
 NVL-S accepts only PCI d740-d745, graphics 30.03/30.04/30.05, media 35.00 and
 `xe/nvl_guc_70.bin` 70.55.4+. Its display 35.00 identity is checked only as a
 post-FLR refusal proof; it has no display-preserving route.

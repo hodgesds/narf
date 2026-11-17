@@ -99,9 +99,9 @@ fn idle_ip(io: &(impl MmioWindow + ?Sized), ip: DisplayIp) -> Result<(), FsError
         _ => FsError::NoDevice,
     })
 }
-/// The display IP this owner programs: 14.00, 20.00 or 30.00 (`None` for
-/// every other GMD, which keeps the inherited layout). Display 30 is only
-/// reached through the opted-in Panther Lake route.
+/// The display IP this owner programs: 14.00, 20.00, 30.00 or 30.02 (`None`
+/// for every other GMD, which keeps the inherited layout). Display 30 is only
+/// reached through the exact opted-in Panther or Wildcat Lake route.
 fn display_ip(io: &(impl MmioWindow + ?Sized)) -> Result<Option<DisplayIp>, FsError> {
     let gmd = read(io, 0x510a0)?;
     Ok(DisplayIp::decode_all(gmd).ok())
