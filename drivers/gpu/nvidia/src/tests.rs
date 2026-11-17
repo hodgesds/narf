@@ -4402,6 +4402,10 @@ fn gsp_booter_fixture() -> alloc::vec::Vec<u8> {
     gsp_put_u32(&mut buf, 0xA8, 0x20); // os_code_size
     gsp_put_u32(&mut buf, 0xAC, 0x20); // os_data_offset
     gsp_put_u32(&mut buf, 0xB0, 0x20); // os_data_size
+    gsp_put_u32(&mut buf, 0xB4, 1); // num_apps
+                                    // app[0] @ 0xB8 (secure HS section descriptor).
+    gsp_put_u32(&mut buf, 0xB8, 0x30); // app[0].offset (secure IMEM dst)
+    gsp_put_u32(&mut buf, 0xBC, 0x10); // app[0].size   (secure section size)
     buf
 }
 
@@ -4531,3 +4535,177 @@ fn smoke_gsp_fw_report_completeness() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_report_completeness);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 2 — Falcon secure PIO + booter staging (lane GSP-2)
+// ────────────────────────────────────────────────────────────────
+
+use crate::falcon::{
+    imem_pio_imemc, imem_pio_padded_words, imem_pio_tag_for_word, FalconMem, IMEMC_AINCR_WRITE,
+    IMEMC_SECURE, IMEM_PIO_BLOCK_WORDS,
+};
+use crate::gsp_boot::{
+    booter_sections, riscv_active, section_tag, wpr2_addr, wpr2_set, BooterLayoutError,
+    RISCV_STATUS_ACTIVE,
+};
+use crate::gsp_fw::{parse_booter as gsp2_parse_booter, BooterImage};
+
+fn smoke_gsp2_imem_pio_imemc_bits() -> TestResult {
+    // Non-secure: destination in low 16 bits + auto-increment-write.
+    let c = imem_pio_imemc(0x0100, false);
+    if c & 0xFFFF != 0x0100 {
+        return TestResult::Fail("IMEMC must carry the destination in low 16 bits");
+    }
+    if c & IMEMC_AINCR_WRITE == 0 {
+        return TestResult::Fail("IMEMC must set auto-increment-write");
+    }
+    if c & IMEMC_SECURE != 0 {
+        return TestResult::Fail("non-secure IMEMC must not set the SECURE bit");
+    }
+    // Secure HS: adds the SECURE page bit.
+    if imem_pio_imemc(0x0100, true) & IMEMC_SECURE == 0 {
+        return TestResult::Fail("secure IMEMC must set the SECURE bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_imem_pio_imemc_bits);
+
+fn smoke_gsp2_imem_pio_tag_and_pad() -> TestResult {
+    // Tag latched once per 256-byte (0x40-word) block, incrementing.
+    let base = 0x12u16;
+    if imem_pio_tag_for_word(base, 0) != Some(0x12) {
+        return TestResult::Fail("first word must latch the base tag");
+    }
+    if imem_pio_tag_for_word(base, 1).is_some()
+        || imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS - 1).is_some()
+    {
+        return TestResult::Fail("mid-block words must not re-latch a tag");
+    }
+    if imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS) != Some(0x13) {
+        return TestResult::Fail("second block must latch base+1");
+    }
+    if imem_pio_tag_for_word(base, IMEM_PIO_BLOCK_WORDS * 2) != Some(0x14) {
+        return TestResult::Fail("third block must latch base+2");
+    }
+    // Padding rounds up to the 0x40-word block.
+    if imem_pio_padded_words(1) != IMEM_PIO_BLOCK_WORDS {
+        return TestResult::Fail("1 byte must pad to one full block");
+    }
+    if imem_pio_padded_words(256) != IMEM_PIO_BLOCK_WORDS {
+        return TestResult::Fail("256 bytes is exactly one block");
+    }
+    if imem_pio_padded_words(257) != IMEM_PIO_BLOCK_WORDS * 2 {
+        return TestResult::Fail("257 bytes must pad to two blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_imem_pio_tag_and_pad);
+
+fn smoke_gsp2_booter_image_parses_secure_section() -> TestResult {
+    // The GSP-1 fixture now declares an app[0]; parse must surface it.
+    let buf = gsp_booter_fixture();
+    let img = match gsp2_parse_booter(&buf) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("fixture must parse"),
+    };
+    if img.sec_offset != 0x30 || img.sec_size != 0x10 {
+        return TestResult::Fail("app[0] secure section mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_boot",
+    smoke_gsp2_booter_image_parses_secure_section
+);
+
+fn smoke_gsp2_booter_sections_slice() -> TestResult {
+    let buf = gsp_booter_fixture();
+    let img = gsp2_parse_booter(&buf).unwrap();
+    let load = match booter_sections(&buf, &img) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("well-formed booter must slice"),
+    };
+    // Non-secure IMEM: image[0..code_size], dst = code_offset.
+    if load.ns.mem != FalconMem::Imem
+        || load.ns.secure
+        || load.ns.data.len() != img.code_size as usize
+        || load.ns.dst != img.code_offset
+        || load.ns.tag != section_tag(img.code_offset)
+    {
+        return TestResult::Fail("non-secure section mis-sliced");
+    }
+    // Secure IMEM: image[code_size..+sec_size], dst = sec_offset, SECURE.
+    if load.sec.mem != FalconMem::Imem
+        || !load.sec.secure
+        || load.sec.data.len() != img.sec_size as usize
+        || load.sec.dst != img.sec_offset
+        || load.sec.tag != section_tag(img.sec_offset)
+    {
+        return TestResult::Fail("secure section mis-sliced");
+    }
+    // DMEM: image[data_offset..+data_size], dst = 0.
+    if load.dmem.mem != FalconMem::Dmem
+        || load.dmem.data.len() != img.data_size as usize
+        || load.dmem.dst != 0
+    {
+        return TestResult::Fail("dmem section mis-sliced");
+    }
+    // Boot vector is the OS code offset.
+    if load.bootvec != img.code_offset {
+        return TestResult::Fail("bootvec must be os_code_offset");
+    }
+    // section_tag is dst >> 8.
+    if section_tag(0x1234) != 0x12 {
+        return TestResult::Fail("section_tag must be dst >> 8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_booter_sections_slice);
+
+fn smoke_gsp2_booter_sections_requires_secure() -> TestResult {
+    // A container with no secure section is rejected (Turing booter
+    // must have one).
+    let img = BooterImage {
+        bin_magic: 0,
+        bin_ver: 0,
+        image_offset: 0,
+        image_size: 0x40,
+        sig_offset: 0,
+        sig_size: 0,
+        code_offset: 0,
+        code_size: 0x20,
+        data_offset: 0x20,
+        data_size: 0x20,
+        sec_offset: 0,
+        sec_size: 0,
+    };
+    let buf = alloc::vec![0u8; 0x40];
+    if booter_sections(&buf, &img) != Err(BooterLayoutError::NoSecureSection) {
+        return TestResult::Fail("a booter with no secure section must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_boot",
+    smoke_gsp2_booter_sections_requires_secure
+);
+
+fn smoke_gsp2_wpr2_and_riscv_decode() -> TestResult {
+    // WPR2 register: zero means not set; otherwise field[31:4] << 12.
+    if wpr2_set(0) {
+        return TestResult::Fail("zero WPR2 register must read as not-set");
+    }
+    if !wpr2_set(0x0000_0010) {
+        return TestResult::Fail("non-zero WPR2 register must read as set");
+    }
+    // raw 0x0000_1230 -> (0x1230 >> 4) << 12 = 0x123 << 12 = 0x123000.
+    if wpr2_addr(0x0000_1230) != 0x0012_3000 {
+        return TestResult::Fail("WPR2 address decode drifted");
+    }
+    // RISC-V status: bit 0 = active.
+    if riscv_active(0) || !riscv_active(RISCV_STATUS_ACTIVE) {
+        return TestResult::Fail("riscv_active must test bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_wpr2_and_riscv_decode);

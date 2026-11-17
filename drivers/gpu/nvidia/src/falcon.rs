@@ -98,6 +98,43 @@ pub enum FalconMem {
     Dmem,
 }
 
+// ── v1 PIO IMEM upload helpers (pure ABI logic) ──────────────────
+//
+// Factored out of `Falcon::load_imem_v1` so the tag/pad/secure
+// arithmetic — the part that must match `nvkm/falcon/v1.c` exactly —
+// is unit-testable without MMIO.
+
+/// Words per IMEM physical page / tag block (256 bytes ÷ 4).
+pub const IMEM_PIO_BLOCK_WORDS: usize = 0x40;
+
+/// IMEMC latch value for a v1 PIO IMEM upload to `dst`: destination
+/// address, auto-increment-write, and the SECURE page bit for HS
+/// ucode. Cite v1.c `reg = start | BIT(24) | (secure ? BIT(28) : 0)`.
+pub const fn imem_pio_imemc(dst: u32, secure: bool) -> u32 {
+    (dst & 0x0000_FFFF) | IMEMC_AINCR_WRITE | if secure { IMEMC_SECURE } else { 0 }
+}
+
+/// The physical-page tag to latch before writing word `word_idx`, or
+/// `None` when the word is mid-block. The tag starts at `base_tag`
+/// and advances once per 256-byte block. Cite v1.c
+/// `if ((i & 0x3f) == 0) wr32(IMEMT, tag++)`.
+pub const fn imem_pio_tag_for_word(base_tag: u16, word_idx: usize) -> Option<u16> {
+    if word_idx % IMEM_PIO_BLOCK_WORDS == 0 {
+        Some(base_tag.wrapping_add((word_idx / IMEM_PIO_BLOCK_WORDS) as u16))
+    } else {
+        None
+    }
+}
+
+/// Word count a `size_bytes` IMEM image occupies once padded up to
+/// the 0x40-word block the Falcon requires. Cite v1.c's trailing
+/// `for (; i & 0x3f; i++)` zero-pad loop.
+pub const fn imem_pio_padded_words(size_bytes: usize) -> usize {
+    size_bytes
+        .div_ceil(4)
+        .next_multiple_of(IMEM_PIO_BLOCK_WORDS)
+}
+
 /// Generic Falcon handle. Wraps the MMIO region (BAR0 view of the
 /// whole register window) and the base offset of the engine's
 /// Falcon block within it.
@@ -206,6 +243,56 @@ impl<'a> Falcon<'a> {
             }
         }
         Ok(())
+    }
+
+    /// HS/secure PIO IMEM upload following the exact Falcon v1
+    /// sequence: latch IMEMC with auto-increment (+ SECURE for HS
+    /// pages), re-latch the physical-page TAG every 256 bytes, write
+    /// the (rem-masked) words, then zero-pad to a 0x40-word block.
+    /// This is what the signed "booter" / FWSEC HS ucode needs and
+    /// differs from [`Self::load_imem`], which latches the tag only
+    /// once and cannot mark pages secure. Cite
+    /// `nvkm/falcon/v1.c::nvkm_falcon_v1_load_imem` and the secure
+    /// call sites in `nvkm/falcon/gm200.c::gm200_flcn_fw_load`.
+    ///
+    /// `base_tag` is the first block's physical-page tag (the caller
+    /// passes `dst >> 8`); it auto-increments once per 256-byte block.
+    ///
+    /// # Safety
+    /// Caller owns the Falcon; `dst`/`data` fit in IMEM.
+    pub unsafe fn load_imem_v1(&self, data: &[u8], dst: u32, base_tag: u16, secure: bool) {
+        let words = data.len() / 4;
+        let rem = data.len() % 4;
+        // SAFETY: caller's responsibility.
+        unsafe {
+            self.wr32(FALCON_IMEMC, imem_pio_imemc(dst, secure));
+            let mut i = 0usize;
+            while i < words {
+                if let Some(tag) = imem_pio_tag_for_word(base_tag, i) {
+                    self.wr32(FALCON_IMEMT, tag as u32);
+                }
+                let o = i * 4;
+                let w = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                self.wr32(FALCON_IMEMD, w);
+                i += 1;
+            }
+            // A trailing sub-word is masked so no garbage lands in IMEM.
+            if rem != 0 {
+                if let Some(tag) = imem_pio_tag_for_word(base_tag, i) {
+                    self.wr32(FALCON_IMEMT, tag as u32);
+                }
+                let o = i * 4;
+                let mut last = [0u8; 4];
+                last[..rem].copy_from_slice(&data[o..o + rem]);
+                self.wr32(FALCON_IMEMD, u32::from_le_bytes(last));
+                i += 1;
+            }
+            // Code must be padded to a 0x40-word (256-byte) boundary.
+            while i % IMEM_PIO_BLOCK_WORDS != 0 {
+                self.wr32(FALCON_IMEMD, 0);
+                i += 1;
+            }
+        }
     }
 
     /// Programme the boot vector and start the CPU. Cite

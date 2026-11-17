@@ -244,10 +244,10 @@ impl NvfwHsHeaderV2 {
     }
 }
 
-/// HS load header v2. Splits the image into OS code / OS data.
-/// Cite `include/nvfw/hs.h` `struct nvfw_hs_load_header_v2` — the
-/// fixed leading fields (per-app descriptors follow `num_apps` and
-/// are not needed by GSP-1).
+/// HS load header v2. Splits the image into OS code / OS data and is
+/// followed by `num_apps` per-app descriptors. Cite `include/nvfw/hs.h`
+/// `struct nvfw_hs_load_header_v2` — the fixed leading fields plus the
+/// `app[]` tail (each app = `{offset, size, data_offset, data_size}`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NvfwHsLoadHeaderV2 {
     pub os_code_offset: u32,
@@ -258,7 +258,10 @@ pub struct NvfwHsLoadHeaderV2 {
 }
 
 impl NvfwHsLoadHeaderV2 {
+    /// Size of the fixed leading fields (the `app[]` tail follows).
     pub const SIZE: usize = 20;
+    /// Size of one `app[]` descriptor (offset, size, data_offset, data_size).
+    pub const APP_SIZE: usize = 16;
 
     fn parse_at(buf: &[u8], at: u32) -> Result<Self, NvfwError> {
         let s = slice_at(buf, at, Self::SIZE, "hs_load_header_v2")?;
@@ -269,6 +272,20 @@ impl NvfwHsLoadHeaderV2 {
             os_data_size: rd32(s, 12),
             num_apps: rd32(s, 16),
         })
+    }
+
+    /// Read `app[idx]`'s `(offset, size)`. The app array begins right
+    /// after the fixed fields at `load_at + SIZE`.
+    fn app_at(buf: &[u8], load_at: u32, idx: u32) -> Result<(u32, u32), NvfwError> {
+        let off = (load_at as u64)
+            .checked_add(Self::SIZE as u64)
+            .and_then(|b| b.checked_add((idx as u64) * (Self::APP_SIZE as u64)))
+            .ok_or(NvfwError::OutOfBounds("hs_load_header_v2.app"))?;
+        if off > u32::MAX as u64 {
+            return Err(NvfwError::OutOfBounds("hs_load_header_v2.app"));
+        }
+        let s = slice_at(buf, off as u32, Self::APP_SIZE, "hs_load_header_v2.app")?;
+        Ok((rd32(s, 0), rd32(s, 4)))
     }
 }
 
@@ -286,12 +303,20 @@ pub struct BooterImage {
     /// Production signature within the blob.
     pub sig_offset: u32,
     pub sig_size: u32,
-    /// OS code segment, relative to `image_offset`.
+    /// OS (non-secure) code segment, relative to `image_offset`.
     pub code_offset: u32,
     pub code_size: u32,
     /// OS data segment, relative to `image_offset`.
     pub data_offset: u32,
     pub data_size: u32,
+    /// Secure (HS) code segment = `app[0]` `(offset, size)`, relative
+    /// to `image_offset`. On Turing the booter stages this as a
+    /// SECURE-marked IMEM section after the non-secure `code` section;
+    /// `(0, 0)` when the container declares no apps. Cite
+    /// `nvkm/subdev/gsp/tu102.c::tu102_gsp_booter_ctor` (`imem_base =
+    /// lhdr->app[0].offset`).
+    pub sec_offset: u32,
+    pub sec_size: u32,
 }
 
 /// Parse and validate a booter (HS) container. Every declared
@@ -321,6 +346,15 @@ pub fn parse_booter(buf: &[u8]) -> Result<BooterImage, NvfwError> {
         load.os_data_size,
         "load.data",
     )?;
+    // Secure HS section = app[0], when the container declares one.
+    // The booter always does; a zero-app HS blob leaves it (0, 0).
+    let (sec_offset, sec_size) = if load.num_apps >= 1 {
+        let (off, size) = NvfwHsLoadHeaderV2::app_at(buf, hs.header_offset, 0)?;
+        end_within(bin.data_size as usize, off, size, "load.app0")?;
+        (off, size)
+    } else {
+        (0, 0)
+    };
     Ok(BooterImage {
         bin_magic: bin.bin_magic,
         bin_ver: bin.bin_ver,
@@ -332,6 +366,8 @@ pub fn parse_booter(buf: &[u8]) -> Result<BooterImage, NvfwError> {
         code_size: load.os_code_size,
         data_offset: load.os_data_offset,
         data_size: load.os_data_size,
+        sec_offset,
+        sec_size,
     })
 }
 
