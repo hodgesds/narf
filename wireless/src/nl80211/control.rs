@@ -1198,6 +1198,15 @@ fn parse_operation_caps(
                 }
                 Credential::Open
             };
+            // An Open network has no handshake owner: when the supplicant
+            // asked for the control port over nl80211 but no external
+            // supplicant exists to receive EAPOL, the AP-authenticator
+            // capability alone cannot serve a station-side control port.
+            // PSK/SAE (driver-owned handshake) and External (supplicant
+            // present) are unaffected; `ConnectCaps::of` is unchanged.
+            if port.over_nl80211 && !caps.external && matches!(cred, Credential::Open) {
+                return Err(EOPNOTSUPP);
+            }
             if let Some(ie) = attr(attrs, 42) {
                 elements(ie)?;
             }
