@@ -2615,8 +2615,9 @@ below owns the CT flush/ack protocol.
 
 `/dev/dri/guc-log-streamN` exports NARFGSTR version 2 through the existing
 exclusive GuC flush/ACK owner. Exactly one `narf.intel.guc_stream=1` boot token
-enables it. Only actual registered runtime workers for pinned GuC 70 Gen12
-TGL/ADL-P/S/N, DG2, MTL/ARL and BMG advertise service. Other platforms/firmware
+enables it. Only actual registered runtime workers whose typed profile selects
+GuC 70 advertise service: Gen12, DG1, DG2/ATS-M, MTL/ARL, BMG, LNL, PTL/WCL
+and NVL-S. Each profile enforces its exact minimum release; other firmware
 majors and incoherent live backing are refused. Open, read (including
 zero-length), readiness and poll require current CAP_SYSLOG and CAP_SYS_ADMIN;
 DRM master does not substitute for either.

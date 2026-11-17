@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.74** (v0.73 plus the source Tiger Lake TC6 / DDI-I USB-C DP
-> route; descriptor-qualified PF-only SR-IOV exclusion
+> Status: **v0.75** (v0.74 plus typed GuC 70 log-stream admission for LNL,
+> PTL, WCL and NVL-S; the source Tiger Lake TC6 / DDI-I USB-C DP route;
+> descriptor-qualified PF-only SR-IOV exclusion
 > on every GT/GGTT access for Tiger Lake, Alder/Raptor Lake, Panther/Wildcat
 > Lake and Battlemage as well as ATS-M; descriptor-qualified ATS-M
 > telemetry without retail Arc fan assumptions; source-qualified DG2 execution
@@ -3431,7 +3432,9 @@ without broadening timing, output or plane admission:
   counter yields observed lower bounds only. Actual firmware incarnation and
   a nonreused publication serial prevent queued-open replay across park,
   reset, reupload or republication. All descriptor operations use host copies
-  and current admin/syslog authority.
+  and current admin/syslog authority. Admission follows the exact typed GuC 70
+  profile and per-family minimum version, covering Gen12, DG1, DG2/ATS-M,
+  MTL/ARL, BMG, LNL, PTL/WCL and NVL-S without architecture aliases.
 - The legacy Gen12 GGTT arena and PPGTT-root attachment enforce DMA39 before
   mapping/image writes; qualified DG2 arenas keep DMA46.
 

@@ -118,6 +118,16 @@ fn smoke_guc_log_exact_copy_header_and_profiles() -> TestResult {
             2,
         ),
         (GtPlatform::Battlemage, 3),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
+            4,
+        ),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+            5,
+        ),
+        (GtPlatform::WildcatLake, 6),
+        (GtPlatform::NovaLakeS, 7),
     ] {
         let memory = Memory::new();
         let index = slot();
