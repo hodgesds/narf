@@ -1571,6 +1571,14 @@ impl RenderFile {
                 pointer
                     .checked_add(size as u64)
                     .ok_or(FsError::BadAddress)?;
+                // Mirror copy_ioctl: writes into a read-only object are
+                // refused. Linux i915_gem_pwrite_ioctl rejects them with
+                // -EINVAL; NARF uses PermissionDenied here, matching
+                // copy_ioctl and the render smokes.
+                let write = cmd == abi::GEM_PWRITE;
+                if write && object.is_read_only() {
+                    return Err(FsError::PermissionDenied);
+                }
                 let mut done = 0;
                 // Bound temporary copies while accepting uploads larger than
                 // one copy buffer. A later EFAULT may leave a written prefix,
@@ -1628,6 +1636,13 @@ impl RenderFile {
                     return Err(FsError::InvalidData);
                 }
                 let write = cpu_domain_write(cmd, &request)?;
+                // Mirror domain_ioctl: a write domain on a read-only
+                // object is refused. Scoped to SET_DOMAIN: cpu_domain_write
+                // returns true for the other commands in this arm, and
+                // GEM_BUSY/GEM_WAIT must still work on read-only objects.
+                if cmd == abi::GEM_SET_DOMAIN && write && object.is_read_only() {
+                    return Err(FsError::InvalidData);
+                }
                 if cmd == abi::GEM_BUSY {
                     put32(&mut request, 4, object.busy());
                     return user.write(arg, &request);
@@ -1804,6 +1819,16 @@ impl RenderFile {
                 namespaces.initialize();
                 if !namespaces.contexts.contains_key(&request.context_id) {
                     return Err(FsError::NotFound);
+                }
+                if cmd == abi::GEM_EXECBUFFER2_WR {
+                    // Mirror exec_ioctl: Linux i915_gem_check_execbuffer
+                    // fixes a 0xffffffff DR4 up to 0, and the _WR variant
+                    // copies the args back to userspace, so write the
+                    // fixed-up DR4 (0) back once the request has validated.
+                    let wire = read(user, arg, 64)?;
+                    if u32_at(&wire, 24) == u32::MAX {
+                        let _ = user.write(arg + 24, &0u32.to_ne_bytes());
+                    }
                 }
                 if info.submission_ready() {
                     Err(FsError::WouldBlock)
