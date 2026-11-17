@@ -4906,3 +4906,107 @@ kernel_test_in!(
     "drivers/nvidia/gsp",
     smoke_gsp4_element_doorbell_and_sequence
 );
+
+// ────────────────────────────────────────────────────────────────
+// GSP payloads — GspSystemInfo + PACKED_REGISTRY_TABLE
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_payload::{
+    build_default_registry, build_registry, build_system_info, default_registry_entries,
+    RegistryValue, GSP_SYSTEM_INFO_SIZE, PCI_CONFIG_MIRROR_BASE, PCI_CONFIG_MIRROR_SIZE,
+};
+
+fn smoke_gsp_system_info_layout() -> TestResult {
+    let si = build_system_info(0x8000_0000, 0x9000_0000, 0xA000_0000, 0x01, 0x18, 0x1234);
+    if si.len() != GSP_SYSTEM_INFO_SIZE || GSP_SYSTEM_INFO_SIZE != 664 {
+        return TestResult::Fail("GspSystemInfo must be exactly 664 bytes");
+    }
+    let rd64 = |o: usize| u64::from_le_bytes(si[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(si[o..o + 4].try_into().unwrap());
+    if rd64(0x00) != 0x8000_0000 || rd64(0x08) != 0x9000_0000 || rd64(0x10) != 0xA000_0000 {
+        return TestResult::Fail("BAR0/1/2 phys must pack at 0x00/0x08/0x10");
+    }
+    // nvDomainBusDeviceFunc = (bus<<8)|devfn.
+    if rd64(0x18) != ((0x01u64 << 8) | 0x18) {
+        return TestResult::Fail("nvDomainBusDeviceFunc must be (bus<<8)|devfn at 0x18");
+    }
+    if rd64(0x38) != 0x1234 {
+        return TestResult::Fail("maxUserVa must pack at 0x38");
+    }
+    if rd32(0x40) != PCI_CONFIG_MIRROR_BASE || rd32(0x44) != PCI_CONFIG_MIRROR_SIZE {
+        return TestResult::Fail("pciConfigMirror base/size must pack at 0x40/0x44");
+    }
+    // A field the driver leaves zero (e.g. gspVFInfo at 0x278) stays zero.
+    if rd64(0x278) != 0 {
+        return TestResult::Fail("unpopulated fields must stay zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_payload", smoke_gsp_system_info_layout);
+
+fn smoke_gsp_registry_default_table() -> TestResult {
+    // The baseline 3-DWORD table has a known exact byte layout.
+    let t = build_default_registry();
+    let rd32 = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    // size=117, numEntries=3.
+    if t.len() != 117 || rd32(0) != 117 || rd32(4) != 3 {
+        return TestResult::Fail("default registry must be 117 bytes, 3 entries");
+    }
+    // Entry 0: nameOffset=56, type=1 (DWORD), data=1, length=4.
+    if rd32(8) != 56 || t[12] != 1 || rd32(16) != 1 || rd32(20) != 4 {
+        return TestResult::Fail("entry 0 fields drifted");
+    }
+    // The 3 padding bytes after `type` must be zero.
+    if t[13] != 0 || t[14] != 0 || t[15] != 0 {
+        return TestResult::Fail("entry type padding must be zero");
+    }
+    // Entry 1 nameOffset = 56 + len("RMSecBusResetEnable\0") = 56+20 = 76.
+    if rd32(24) != 76 {
+        return TestResult::Fail("entry 1 nameOffset must follow entry 0's name");
+    }
+    // The first key name is NUL-terminated at its offset.
+    if &t[56..75] != b"RMSecBusResetEnable" || t[75] != 0 {
+        return TestResult::Fail("first key name must be NUL-terminated at nameOffset");
+    }
+    if default_registry_entries().len() != 3 {
+        return TestResult::Fail("there are 3 default entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_payload",
+    smoke_gsp_registry_default_table
+);
+
+fn smoke_gsp_registry_string_and_dword_mix() -> TestResult {
+    // A DWORD followed by a string exercises both the inline-data and
+    // data-section-offset paths.
+    let entries = [
+        ("Flag", RegistryValue::Dword(0xABCD)),
+        ("Name", RegistryValue::Str("hi")),
+    ];
+    let t = build_registry(&entries);
+    let rd32 = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    // header 8 + 2*16 entries = 40 data start.
+    // data: "Flag\0"(5) + "Name\0"(5) + "hi\0"(3) = 13 => total 53.
+    if t.len() != 53 || rd32(0) != 53 || rd32(4) != 2 {
+        return TestResult::Fail("mixed table size/count wrong");
+    }
+    // Entry 0 (DWORD): type=1, data=0xABCD inline, length=4.
+    if t[12] != 1 || rd32(16) != 0xABCD || rd32(20) != 4 {
+        return TestResult::Fail("dword entry must store value inline");
+    }
+    // Entry 1 (STRING): type=3, data=offset to "hi\0", length=3.
+    if t[28] != 3 || rd32(36) != 3 {
+        return TestResult::Fail("string entry length must include the NUL");
+    }
+    let name_data_off = rd32(32) as usize; // data = offset of "hi\0"
+    if &t[name_data_off..name_data_off + 2] != b"hi" || t[name_data_off + 2] != 0 {
+        return TestResult::Fail("string value must be NUL-terminated at its data offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_payload",
+    smoke_gsp_registry_string_and_dword_mix
+);
