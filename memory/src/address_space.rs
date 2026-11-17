@@ -22,8 +22,13 @@ use core::cell::Cell;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "demand_wait.rs"]
+mod demand_wait;
 #[path = "device_revoke.rs"]
 mod device_revoke;
+pub use demand_wait::{
+    install_demand_page_wait_hook, DemandPageWait, DemandPageWaitHook, MAX_DEMAND_WAITERS,
+};
 #[path = "region_index.rs"]
 mod region_index;
 #[path = "remote_access.rs"]
@@ -1029,8 +1034,10 @@ struct DemandClaimEntry {
 /// address space. Claims are not CPU-owned: a fault may migrate in future, and
 /// nested fault contexts must not alias a per-CPU slot. The overflow map keeps
 /// capacity exhaustion correct instead of turning it into an ownerless retry.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DemandClaims {
+    /// Distinguishes identical virtual addresses/tickets in different mms.
+    wait_id: u64,
     /// Preallocated separately so this MAX_CPUS-sized fast path does not make
     /// every by-value `AddressSpace` temporary consume another KiB of kernel
     /// stack. Fault handling still performs no allocation until overflow.
@@ -1054,6 +1061,7 @@ impl DemandClaims {
             },
         );
         Ok(Self {
+            wait_id: demand_wait::new_id(),
             inline: inline.into_boxed_slice(),
             len: 0,
             overflow: BTreeMap::new(),
@@ -1068,6 +1076,7 @@ impl DemandClaims {
     /// safe to construct in an atomic (IRQ-masked) context.
     fn empty_placeholder() -> Self {
         Self {
+            wait_id: 0,
             inline: Vec::new().into_boxed_slice(),
             len: 0,
             overflow: BTreeMap::new(),
@@ -1103,7 +1112,7 @@ impl DemandClaims {
     }
 
     fn remove(&mut self, vaddr: u64) -> Option<u64> {
-        if let Some(index) = self.inline[..self.len]
+        let removed = if let Some(index) = self.inline[..self.len]
             .iter()
             .position(|entry| entry.vaddr == vaddr)
         {
@@ -1114,7 +1123,11 @@ impl DemandClaims {
             Some(ticket)
         } else {
             self.overflow.remove(&vaddr)
+        };
+        if let Some(ticket) = removed {
+            demand_wait::notify(self.wait_id, vaddr, ticket);
         }
+        removed
     }
 
     fn retain_outside(&mut self, lo: u64, hi: u64) {
@@ -1122,14 +1135,35 @@ impl DemandClaims {
         while index < self.len {
             let vaddr = self.inline[index].vaddr;
             if vaddr >= lo && vaddr < hi {
+                let ticket = self.inline[index].ticket;
                 self.len -= 1;
                 self.inline[index] = self.inline[self.len];
                 self.inline[self.len] = DemandClaimEntry::default();
+                demand_wait::notify(self.wait_id, vaddr, ticket);
             } else {
                 index += 1;
             }
         }
-        self.overflow.retain(|&vaddr, _| vaddr < lo || vaddr >= hi);
+        self.overflow.retain(|&vaddr, &mut ticket| {
+            if vaddr < lo || vaddr >= hi {
+                true
+            } else {
+                demand_wait::notify(self.wait_id, vaddr, ticket);
+                false
+            }
+        });
+    }
+}
+
+impl Clone for DemandClaims {
+    fn clone(&self) -> Self {
+        Self {
+            wait_id: demand_wait::new_id(),
+            inline: self.inline.clone(),
+            len: self.len,
+            overflow: self.overflow.clone(),
+            next_ticket: self.next_ticket,
+        }
     }
 }
 
@@ -2054,10 +2088,9 @@ enum DemandPageClaim {
     /// The leaf was already present or was repaired while the region lock was
     /// held; the faulting instruction can retry immediately.
     Resolved,
-    /// A peer owns the slow part of this exact page fault.  Retrying cannot
-    /// observe a half-published frame because publication also takes the
-    /// region lock.
-    InProgress,
+    /// A peer owns this page. Wait for its exact ticket outside the region
+    /// lock before retrying; returning to an absent leaf would busy-fault.
+    InProgress(u64),
     /// The page's SHARED backing frame is in a live device revocation: the
     /// caller waits for the driver's refault with no lock held, then retries.
     Revoked(PhysAddr),
@@ -2755,8 +2788,9 @@ impl Drop for MmUser {
 // tables belong behind preallocated stable storage, not inline here.
 // (1056: the maintained mm-counters [`RegionAcct`] added 40 inline bytes,
 // net +24 after the retired mapped_bytes_cache Cell; statm's file/shmem RSS
-// and data+stack counters add another 16 bytes, for a 1072-byte ceiling.)
-const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1072);
+// and data+stack counters add another 16 bytes; the demand-wait identity
+// adds 8 more, for a 1080-byte ceiling.)
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1080);
 
 const MEMBARRIER_STATE_MASK: u32 = 0xFF;
 const LIVE_USER_TASKS_SHIFT: u32 = 8;
@@ -9584,8 +9618,8 @@ impl AddressSpace {
             repair_backed(phys, perms)?;
             return Ok(DemandPageClaim::Resolved);
         }
-        if regions.demand_pages.get(v).is_some() {
-            return Ok(DemandPageClaim::InProgress);
+        if let Some(ticket) = regions.demand_pages.get(v) {
+            return Ok(DemandPageClaim::InProgress(ticket));
         }
         // Reserve the authoritative slot before the filesystem hook can take
         // an external page-cache reference. If metadata growth fails, no
@@ -10406,6 +10440,9 @@ impl AddressSpace {
         if let DemandPageClaim::Revoked(phys) = claim {
             return device_revoke::await_refault(phys);
         }
+        if let DemandPageClaim::InProgress(ticket) = claim {
+            return demand_wait::wait(self, v, ticket);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -10742,6 +10779,9 @@ impl AddressSpace {
         })?;
         if let DemandPageClaim::Revoked(phys) = claim {
             return device_revoke::await_refault(phys);
+        }
+        if let DemandPageClaim::InProgress(ticket) = claim {
+            return demand_wait::wait(self, v, ticket);
         }
         let DemandPageClaim::Owner {
             ticket,
@@ -16505,7 +16545,7 @@ fn smoke_memory_demand_tickets_are_page_scoped() -> TestResult {
         Ok(DemandPageClaim::Owner { ticket, .. }) => ticket,
         _ => return TestResult::Fail("first page did not grant a demand ticket"),
     };
-    if a.claim_demand_page(base, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress) {
+    if a.claim_demand_page(base, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress(first)) {
         return TestResult::Fail("same page admitted two demand owners");
     }
     let second = match a.claim_demand_page(base + 0x1000, |_, _| Ok(())) {
@@ -16711,7 +16751,10 @@ fn smoke_memory_demand_claim_inline_overflow_is_lossless() -> TestResult {
         }
     }
     let overflow_va = base + INLINE_DEMAND_CLAIMS as u64 * 4096;
-    if a.claim_demand_page(overflow_va, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress) {
+    if !matches!(
+        a.claim_demand_page(overflow_va, |_, _| Ok(())),
+        Ok(DemandPageClaim::InProgress(_))
+    ) {
         return TestResult::Fail("overflow claim did not dedupe the same page");
     }
     if a.unmap_region(VirtAddr::new(base)).is_err() {

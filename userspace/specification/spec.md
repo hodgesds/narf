@@ -1521,6 +1521,11 @@ to the target's VMA count.
 `Identity` snapshots stop after PID validation and comm/effective credential
 lookup; `Statm` stops after the shared mm counters and exec-time text extent.
 Neither constructs argv, signal dispositions, fd metadata or a thread census.
+The per-task initialization installs memory's demand-page waiter. A fault
+competing with a live page claim parks its own-stack continuation, without
+holding mm locks, until that claim is published or cancelled. SIGKILL ends
+the wait without cancelling the owner's I/O; a caller without a parkable
+task fails explicitly instead of spinning the executor.
 Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata

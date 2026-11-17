@@ -1384,8 +1384,52 @@ impl narf_filesystem::procfs::ProcFile for NarfMmOrphansFile {
     }
 }
 
+/// Linux's killable folio wait: competitors sleep while one fault owns the
+/// page, and SIGKILL can end that sleep without cancelling the owner's I/O.
+fn wait_for_demand_owner(
+    mut wait: narf_memory::address_space::DemandPageWait<'_>,
+) -> Result<(), narf_memory::AddressSpaceError> {
+    use core::future::Future;
+    const _: () =
+        assert!(narf_memory::address_space::MAX_DEMAND_WAITERS >= narf_scheduler::MAX_USER_TASKS);
+    // No fallback spin inside an executor poll or an IRQ handler. A synchronous
+    // caller without its own stack cannot wait for another task to run.
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return Err(narf_memory::AddressSpaceError::NotImplemented);
+    }
+    struct SignalWait {
+        task: u64,
+        armed: bool,
+    }
+    impl Drop for SignalWait {
+        fn drop(&mut self) {
+            if self.armed {
+                drop_signal_waker(self.task);
+            }
+        }
+    }
+    let mut signal = SignalWait { task: current_task_id(), armed: false };
+    poll_blocking(core::future::poll_fn(|cx| {
+        let result = core::pin::Pin::new(&mut wait).poll(cx);
+        if result.is_ready() {
+            return result;
+        }
+        // Register before testing pending signals: a kill between the check
+        // and park must leave a durable wake, just like the page completion.
+        register_signal_waker(signal.task, cx.waker().clone());
+        signal.armed = true;
+        if current_task_fatal_signal_pending() {
+            Poll::Ready(Err(narf_memory::AddressSpaceError::Bus))
+        } else {
+            Poll::Pending
+        }
+    }))
+    .unwrap_or(Err(narf_memory::AddressSpaceError::Bus))
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
+    narf_memory::address_space::install_demand_page_wait_hook(wait_for_demand_owner);
     // Publish the descriptor-allocation bound to the fd table. Until this is
     // installed every table is unbounded, which is what the boot path needs
     // while it seeds stdio into tables whose tasks do not exist yet.

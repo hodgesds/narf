@@ -884,6 +884,21 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
     ) -> Result<(), AddressSpaceError>;
+    /// When a peer owns the exact page's demand ticket, release the region
+    /// lock and wait through `install_demand_page_wait_hook` before retrying
+    /// the instruction. It is not a resolved fault while that ticket is live.
+    /// Registration and ticket recheck share the region lock with retirement.
+    /// Publish, failure, cancellation and overlapping VMA removal wake every
+    /// waiter on that ticket; replacement tickets and other mms cannot alias.
+    /// Wait storage is fixed at MAX_DEMAND_WAITERS (at least the user-task
+    /// admission limit), allocation-free and released on waiter drop. Wakes
+    /// occur by reference under the region lock and require IRQ-safe wakers.
+    /// The installed task-layer hook parks without any AS lock, checks fatal
+    /// signals, and fails when it cannot park; it never spins an executor.
+    ///
+    /// pub type DemandPageWaitHook = for<'a> fn(DemandPageWait<'a>)
+    ///     -> Result<(), AddressSpaceError>;
+    /// pub fn install_demand_page_wait_hook(hook: DemandPageWaitHook);
     /// Bulk demand paging (#737): claim, fill, and install every
     /// claimable page of `[vaddr, vaddr + pages * 4096)` as one
     /// operation, returning how many pages were installed. The claim
