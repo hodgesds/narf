@@ -3263,7 +3263,13 @@ kernel_test_in!(
 );
 
 fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
-    let mut mtl = device(54, MTL, 1270);
+    // Card 33: the OA config registry is per-card for the device lifetime
+    // and never cleared by teardown, so this test needs a card no other OA
+    // test uses — card 54 collides with
+    // smoke_oa_source_register_sequences_per_profile's 12.71 half, which
+    // registers uuid(1) on card 54 first (EADDRINUSE at the shared add()
+    // helper, #2176).
+    let mut mtl = device(33, MTL, 1270);
     mtl.media_engines = Some(EngineSet::of(&[Engine::Vcs0, Engine::Vcs1, Engine::Vecs0]));
     mtl.media_timestamp = Some(19_200_000);
     assert!(mtl.has_oam());
@@ -3355,9 +3361,9 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     assert_eq!(fd_oag, 41);
     let oag_file = wire.file();
 
-    // Both units active on card 54:
-    assert!(ACTIVE[54][0].load(Ordering::Acquire));
-    assert!(ACTIVE[54][1].load(Ordering::Acquire));
+    // Both units active on card 33:
+    assert!(ACTIVE[33][0].load(Ordering::Acquire));
+    assert!(ACTIVE[33][1].load(Ordering::Acquire));
 
     // Trying to open Unit 0 again also returns Busy:
     let at_oag_busy = wire.chain(0x1300, &oag_props);
@@ -3375,8 +3381,8 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
 
     // Close Unit 1: Unit 1 becomes idle while Unit 0 remains active:
     drop(oam_file);
-    assert!(!ACTIVE[54][1].load(Ordering::Acquire));
-    assert!(ACTIVE[54][0].load(Ordering::Acquire));
+    assert!(!ACTIVE[33][1].load(Ordering::Acquire));
+    assert!(ACTIVE[33][0].load(Ordering::Acquire));
 
     // Now Unit 1 can be opened again with MPEC 128:
     let oam128_props = [
@@ -3400,8 +3406,8 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     let oam_file2 = wire.file();
     drop(oam_file2);
     drop(oag_file);
-    assert!(!ACTIVE[54][0].load(Ordering::Acquire));
-    assert!(!ACTIVE[54][1].load(Ordering::Acquire));
+    assert!(!ACTIVE[33][0].load(Ordering::Acquire));
+    assert!(!ACTIVE[33][1].load(Ordering::Acquire));
 
     // 4. Reject non-MPEC formats on OAM Unit 1:
     let non_mpec_on_oam = [
