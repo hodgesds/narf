@@ -448,6 +448,12 @@ fn smoke_abi_tid_process_vm_readv_non_leader() -> TestResult {
         // caller), so the source bytes live in a page of the shared test mm.
         const REMOTE_VA: u64 = 0x0000_0072_0000_0000;
         let mm = crate::handlers::active_user_as().ok_or("test address space missing")?;
+        // Test-only (#2195): the harness installs a test address space that
+        // no scheduler task ever attaches to, so its live-user count stays 0
+        // and `task_mm`'s `mmget_not_zero()` fails with ESRCH. A real task's
+        // mm always has a live user; attach one here so process_vm_readv on
+        // a thread of the caller's own process can reach the shared mm.
+        mm.scheduler_attach_user_task();
         let frame = narf_memory::alloc_frame()
             .map_err(|_| "frame allocator drained")?
             .start_address();
