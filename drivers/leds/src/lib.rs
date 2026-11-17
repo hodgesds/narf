@@ -11,8 +11,8 @@
 //!   [`leds_input_caps::LedCapsLock`],
 //!   [`leds_input_num::LedNumLock`],
 //!   [`leds_input_scroll::LedScrollLock`].
-//! - Trigger engine ([`triggers`]) — drives Heartbeat, Timer, and
-//!   OneShot patterns at 100 ms resolution.
+//! - Trigger engine ([`triggers`]) — drives Heartbeat, Timer,
+//!   OneShot, and AudioMute patterns at 100 ms resolution.
 //!
 //! ## Architecture
 //!

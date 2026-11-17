@@ -11,8 +11,11 @@
 //! - `drivers/leds/trigger/ledtrig-disk.c` — disk-activity blink.
 //! - `drivers/leds/trigger/ledtrig-netdev.c` — network-activity blink.
 //! - `drivers/leds/trigger/ledtrig-oneshot.c` — one-shot pulse.
+//! - `drivers/leds/trigger/ledtrig-audio.c` — audio-mute level.
 
 extern crate alloc;
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -79,6 +82,15 @@ pub enum Trigger {
     /// Mirrors battery charging state.
     /// Matches Linux's `charging` trigger.
     BatteryCharging,
+
+    /// LED on while the audio mixer is muted, off otherwise.
+    /// Mirrors Linux's `audio-mute` trigger
+    /// (`drivers/leds/trigger/ledtrig-audio.c`: `ledtrig_audio_mute`
+    /// drives the LED to `LED_FULL` on mute, `LED_OFF` on unmute).
+    /// The mute state is fed by the sound subsystem — see
+    /// [`set_audio_muted`]; the engine samples it on every tick,
+    /// so the LED follows the mixer within one 100 ms tick.
+    AudioMute,
 }
 
 // ── Trigger engine ─────────────────────────────────────────────────
@@ -96,6 +108,33 @@ struct EngineState {
 
 static ENGINE: IrqSafeSpinLock<alloc::vec::Vec<EngineState>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Current audio-mute state, as reported by the sound subsystem.
+///
+/// Linux's `ledtrig-audio` keeps the mute state in the trigger's
+/// private data, updated by `ledtrig_audio_mute()` from
+/// `sound/core/control_led.c` whenever the Master Playback Switch
+/// changes. NARF keeps the same single bit here: the mixer feed
+/// (`drivers/sound/src/mixer.rs::set`) writes it, the engine reads
+/// it. Default `false` (unmuted) matches the mixer's initial
+/// Master Playback Switch value (`ControlValue::boolean(true)` =
+/// unmute) at `register_standard_realtek` time.
+static AUDIO_MUTED: AtomicBool = AtomicBool::new(false);
+
+/// Report a mixer mute change into the audio-mute trigger.
+///
+/// Called by the sound subsystem when the Master Playback Switch
+/// changes (`true` = muted). The trigger engine picks the new state
+/// up on its next 100 ms tick; no LED is driven synchronously here.
+pub fn set_audio_muted(muted: bool) {
+    AUDIO_MUTED.store(muted, Ordering::Release);
+}
+
+/// Current audio-mute state as last reported by the sound
+/// subsystem (`false` before any mixer mute change).
+pub fn audio_muted() -> bool {
+    AUDIO_MUTED.load(Ordering::Acquire)
+}
 
 /// Drive one tick of the trigger engine (called every 100 ms).
 ///
@@ -152,6 +191,17 @@ pub(crate) fn compute_brightness(trigger: &Trigger, ticks: u32, max: u32) -> u32
         | Trigger::KeyboardScrollLock
         | Trigger::AcOnline
         | Trigger::BatteryCharging => 0,
+
+        // Audio-mute: level, not a pattern — on while muted, off
+        // while unmuted. Matches Linux `ledtrig_audio_mute()`
+        // (`drivers/leds/trigger/ledtrig-audio.c`).
+        Trigger::AudioMute => {
+            if audio_muted() {
+                max
+            } else {
+                0
+            }
+        }
 
         Trigger::DefaultOn => max,
 
@@ -210,6 +260,7 @@ pub(crate) fn compute_brightness(trigger: &Trigger, ticks: u32, max: u32) -> u32
 #[doc(hidden)]
 pub fn __reset_for_test() {
     ENGINE.lock().clear();
+    AUDIO_MUTED.store(false, Ordering::Release);
 }
 
 /// Test helper: expose `compute_brightness` for smoke tests.

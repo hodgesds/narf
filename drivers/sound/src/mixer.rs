@@ -526,6 +526,22 @@ pub fn get(controller_index: usize, id: ControlId) -> Result<ControlValue, Mixer
 }
 
 /// Set a control's value. Range-checks against the control's info.
+///
+/// A successful Master Playback Switch write also reports the mute
+/// state into the LED trigger engine
+/// (`narf_drivers_leds::triggers::set_audio_muted`), so LEDs bound
+/// to `Trigger::AudioMute` — e.g. the Elan `elan:red:mute` LED —
+/// follow the mixer within one trigger-engine tick. This is the
+/// NARF analogue of Linux `sound/core/control_led.c`
+/// (`snd_ctl_led_set_state` watches the Master Playback Switch and
+/// calls `ledtrig_audio_mute()`); the ALSA value convention is
+/// `Boolean(true)` = unmute, so the trigger receives the negation.
+///
+/// Only the mixer surface feeds the trigger: the USB UAC card
+/// (`drivers/usb/src/uac_card.rs`) and virtio-snd
+/// (`drivers/virtio/src/snd_pci.rs`) keep independent mute stores
+/// and do not route through `set`, so a mute on those cards does
+/// not light the LED yet — follow-up, not this change.
 pub fn set(controller_index: usize, id: ControlId, value: ControlValue) -> Result<(), MixerError> {
     let mx = MIXER_REGISTRY.lock();
     let card = mx
@@ -537,7 +553,14 @@ pub fn set(controller_index: usize, id: ControlId, value: ControlValue) -> Resul
         .iter()
         .find(|c| c.info.id == id)
         .ok_or(MixerError::NoSuchControl)?;
-    ctrl.write(value)
+    let kind = ctrl.info.id.kind;
+    ctrl.write(value)?;
+    if let (ControlKind::MasterMute, ControlValue::Boolean(unmuted)) = (kind, value) {
+        // `true` = unmute on the ALSA switch; the trigger wants
+        // `true` = muted.
+        narf_drivers_leds::triggers::set_audio_muted(!unmuted);
+    }
+    Ok(())
 }
 
 /// Drive a jack-sense event — called from the unsolicited-response

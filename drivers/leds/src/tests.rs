@@ -4,7 +4,8 @@
 //! - Registry add/lookup/remove.
 //! - GPIO LED: active-high and active-low brightness → pin state.
 //! - PWM LED: duty cycle calculation.
-//! - Trigger engine: Heartbeat ramp, Timer duty, default trigger.
+//! - Trigger engine: Heartbeat ramp, Timer duty, AudioMute level,
+//!   default trigger.
 //! - HID kbd Caps Lock LED → SET_REPORT byte.
 
 extern crate alloc;
@@ -17,6 +18,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::class::{
     __reset_for_test, led_devices, lookup_led_by_name, register_led, unregister_led, LedDevice,
+    SimpleLed,
 };
 use crate::leds_gpio::{DefaultState, LedGpio};
 use crate::leds_input_caps::{
@@ -24,7 +26,7 @@ use crate::leds_input_caps::{
 };
 use crate::leds_pwm::LedPwm;
 use crate::sysfs_bridge::populate_leds_class;
-use crate::triggers::{Trigger, __compute_brightness_for_test};
+use crate::triggers::{__compute_brightness_for_test, set_audio_muted, Trigger};
 
 // ── Mock GPIO controller ───────────────────────────────────────────
 
@@ -262,7 +264,58 @@ fn smoke_trigger_timer_duty() -> TestResult {
 }
 kernel_test_in!("drivers/leds", smoke_trigger_timer_duty);
 
-// ── Test 8: default trigger is None ──────────────────────────────
+// ── Test 8: Trigger::AudioMute level follows reported mute state ────
+
+fn smoke_trigger_audio_mute_level() -> TestResult {
+    crate::triggers::__reset_for_test();
+    // Default state is unmuted → off.
+    if __compute_brightness_for_test(&Trigger::AudioMute, 0, 1) != 0 {
+        return TestResult::Fail("audio-mute must be off while unmuted");
+    }
+    set_audio_muted(true);
+    if __compute_brightness_for_test(&Trigger::AudioMute, 0, 1) != 1 {
+        return TestResult::Fail("audio-mute must be on while muted");
+    }
+    if __compute_brightness_for_test(&Trigger::AudioMute, 7, 255) != 255 {
+        return TestResult::Fail("audio-mute must drive max brightness while muted");
+    }
+    set_audio_muted(false);
+    if __compute_brightness_for_test(&Trigger::AudioMute, 0, 1) != 0 {
+        return TestResult::Fail("audio-mute must turn off on unmute");
+    }
+    crate::triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_trigger_audio_mute_level);
+
+// ── Test 9: trigger engine tick drives an AudioMute LED ─────────────
+
+fn smoke_trigger_audio_mute_tick() -> TestResult {
+    crate::__reset_all_for_test();
+    let led = Arc::new(SimpleLed::onoff("test::audiomute"));
+    led.set_trigger(Trigger::AudioMute);
+    register_led(led.clone());
+    // Muted → next tick lights the LED.
+    set_audio_muted(true);
+    crate::triggers::tick();
+    if led.brightness() != 1 {
+        unregister_led("test::audiomute");
+        return TestResult::Fail("tick must light the audio-mute LED while muted");
+    }
+    // Unmuted → next tick turns it off.
+    set_audio_muted(false);
+    crate::triggers::tick();
+    if led.brightness() != 0 {
+        unregister_led("test::audiomute");
+        return TestResult::Fail("tick must turn off the audio-mute LED on unmute");
+    }
+    unregister_led("test::audiomute");
+    crate::__reset_all_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_trigger_audio_mute_tick);
+
+// ── Test 10: default trigger is None ──────────────────────────────
 
 fn smoke_led_default_trigger_is_none() -> TestResult {
     let gpio = Arc::new(MockGpio::new(4));
@@ -274,7 +327,7 @@ fn smoke_led_default_trigger_is_none() -> TestResult {
 }
 kernel_test_in!("drivers/leds", smoke_led_default_trigger_is_none);
 
-// ── Test 9: HID Caps Lock LED → SET_REPORT 0x02 byte ─────────────
+// ── Test 11: HID Caps Lock LED → SET_REPORT 0x02 byte ─────────────
 
 fn smoke_hid_capslock_set_report() -> TestResult {
     // Reset shared HID LED byte.
@@ -305,7 +358,7 @@ fn smoke_hid_capslock_set_report() -> TestResult {
 }
 kernel_test_in!("drivers/leds", smoke_hid_capslock_set_report);
 
-// ── Test 10: multiple LEDs coexist in registry ───────────────────
+// ── Test 12: multiple LEDs coexist in registry ───────────────────
 
 fn smoke_led_registry_multi() -> TestResult {
     __reset_for_test();

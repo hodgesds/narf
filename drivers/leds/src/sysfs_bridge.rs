@@ -27,6 +27,7 @@
 //! - `"netdev"` — `Trigger::NetworkActivity { .. }`
 //! - `"ac-online"` — `Trigger::AcOnline`
 //! - `"charging"` — `Trigger::BatteryCharging`
+//! - `"audio-mute"` — `Trigger::AudioMute`
 //!
 //! `delay_on` / `delay_off` are read/write at all times; they only
 //! take effect when the trigger is `timer` (written before or after).
@@ -73,6 +74,7 @@ fn trigger_name(t: &Trigger) -> &'static str {
         Trigger::KeyboardScrollLock => "scrolllock",
         Trigger::AcOnline => "ac-online",
         Trigger::BatteryCharging => "charging",
+        Trigger::AudioMute => "audio-mute",
     }
 }
 
@@ -97,6 +99,7 @@ fn parse_trigger(name: &str) -> Option<Trigger> {
         "netdev" | "network-activity" => Some(Trigger::NetworkActivity { iface: "eth0" }),
         "ac-online" => Some(Trigger::AcOnline),
         "charging" => Some(Trigger::BatteryCharging),
+        "audio-mute" => Some(Trigger::AudioMute),
         _ => None,
     }
 }

@@ -72,6 +72,9 @@ Software-only registered cards retain their synthetic test behavior.
 
 `mixer(card)` delegates control enumeration, reads and writes to the hardware
 backend when one exists. It must not report synthetic controls for native cards.
+A Master Playback Switch write through `mixer::set` also reports the mute state
+to the LED trigger engine (`Trigger::AudioMute`), so the Elan `elan:red:mute`
+LED follows mixer mute (Linux `sound/core/control_led.c`).
 
 `sound_fs_initcall` publishes `/dev/snd`, sysfs and procfs card information.
 Each successful PCM open acquires its own exclusive lease after access checks;

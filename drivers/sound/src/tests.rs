@@ -262,6 +262,54 @@ fn smoke_mixer_jack_sense_event() -> TestResult {
 }
 kernel_test_in!("drivers/sound", smoke_mixer_jack_sense_event);
 
+// ── #17: Mixer — MasterMute write feeds the audio-mute trigger ─────
+
+fn smoke_mixer_master_mute_drives_audio_trigger() -> TestResult {
+    use narf_drivers_leds::triggers as led_triggers;
+    mixer::__reset_for_test();
+    led_triggers::__reset_for_test();
+    mixer::register_standard_realtek(/*ctrl=*/ 101, true, true, false);
+    let ids = mixer::list_for_controller(101);
+    let Some(mute) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterMute))
+        .copied()
+    else {
+        return TestResult::Fail("master mute not registered");
+    };
+    // Starts unmuted (Master Playback Switch = true).
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("audio-mute trigger must start unmuted");
+    }
+    // Mute (switch false) → trigger reports muted.
+    mixer::set(101, mute, ControlValue::boolean(false)).unwrap();
+    if !led_triggers::audio_muted() {
+        return TestResult::Fail("muting the master must report audio muted");
+    }
+    // Unmute (switch true) → trigger reports unmuted.
+    mixer::set(101, mute, ControlValue::boolean(true)).unwrap();
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("unmuting the master must clear audio muted");
+    }
+    // A volume write must not touch the mute state.
+    let Some(master) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
+        .copied()
+    else {
+        return TestResult::Fail("master volume not registered");
+    };
+    mixer::set(101, master, ControlValue::integer(10, 10)).unwrap();
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("volume write must not change audio muted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sound",
+    smoke_mixer_master_mute_drives_audio_trigger
+);
+
 // ── #18: Format support filter ─────────────────────────────────────
 
 fn smoke_format_filter() -> TestResult {

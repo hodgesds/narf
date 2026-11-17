@@ -2188,6 +2188,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-drivers-leds",
  "narf-filesystem",
  "narf-init",
  "narf-interrupts",
