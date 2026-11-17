@@ -23,6 +23,8 @@ narf-interrupts      = { path = "../../../interrupts" }
 narf-firmware        = { path = "../../../firmware" }
 narf-crypto          = { path = "../../../crypto" }
 narf-scheduler       = { path = "../../../scheduler" }
+narf-io              = { path = "../../../io" }
+narf-lib             = { path = "../../../lib" }
 
 [features]
 kernel-test = []

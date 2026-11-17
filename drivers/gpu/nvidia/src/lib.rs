@@ -52,6 +52,7 @@ pub mod gsp_args;
 pub mod gsp_boot;
 pub mod gsp_elf;
 pub mod gsp_fw;
+pub mod gsp_image;
 pub mod gsp_live;
 pub mod gsp_payload;
 pub mod gsp_rm;

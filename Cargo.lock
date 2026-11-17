@@ -2043,7 +2043,9 @@ dependencies = [
  "narf-firmware",
  "narf-init",
  "narf-interrupts",
+ "narf-io",
  "narf-kernel-test",
+ "narf-lib",
  "narf-memory",
  "narf-scheduler",
 ]
