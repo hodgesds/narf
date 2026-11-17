@@ -1010,6 +1010,54 @@ fn smoke_abi_proc2_pid_statm_seven_ints() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_statm_seven_ints);
 
+fn smoke_abi_proc2_lightweight_queries_keep_identity_and_counters() -> TestResult {
+    use narf_filesystem::procfs::TaskInfoQuery;
+    const PID: u64 = 0x574b;
+    with_procfs(PID, "proc-light", &["proc-light", "argument"], 0, |_| {
+        let identity = crate::handlers::proc_task_info(PID, TaskInfoQuery::Identity)
+            .ok_or("identity query lost live PID")?;
+        let statm = crate::handlers::proc_task_info(PID, TaskInfoQuery::Statm)
+            .ok_or("statm query lost live PID")?;
+        let full = crate::handlers::proc_task_info(PID, TaskInfoQuery::Basic)
+            .ok_or("basic query lost live PID")?;
+        if identity.pid != full.pid
+            || identity.comm != "proc-light"
+            || (identity.uid, identity.gid) != (full.uid, full.gid)
+            || !identity.cmdline.is_empty()
+            || !identity.vmas.is_empty()
+            || identity.num_threads != 0
+            || identity.fd_table_size != 0
+        {
+            return Err("identity query changed ownership or built unrelated process fields");
+        }
+        if (
+            statm.vm_size_bytes,
+            statm.resident_pages,
+            statm.shared_resident_pages,
+            statm.text_pages,
+            statm.data_stack_bytes,
+        ) != (
+            full.vm_size_bytes,
+            full.resident_pages,
+            full.shared_resident_pages,
+            full.text_pages,
+            full.data_stack_bytes,
+        ) || !statm.cmdline.is_empty()
+            || !statm.comm.is_empty()
+            || statm.num_threads != 0
+            || statm.fd_table_size != 0
+            || full.cmdline.is_empty()
+        {
+            return Err("statm query lost counters or built unrelated process fields");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_lightweight_queries_keep_identity_and_counters
+);
+
 // ── /proc/<pid>/comm — matches the process comm (+ 15-byte truncation) ──
 
 fn smoke_abi_proc2_pid_comm_matches() -> TestResult {
@@ -3023,6 +3071,97 @@ fn tg_readlink(path: &str) -> Result<alloc::string::String, &'static str> {
     }
 }
 
+#[cfg(feature = "container")]
+fn check_thread_namespace_paths(namespaced: bool) -> TestResult {
+    use narf_filesystem::FileOps;
+    with_thread_group(namespaced, |v| {
+        narf_filesystem::procfs::install_ns_proc_hooks(
+            crate::handlers::proc_ns_readlink,
+            crate::handlers::proc_ns_mountinfo,
+            crate::handlers::proc_ns_idmap_open,
+            crate::handlers::proc_ns_idmap_owners,
+        );
+        set_task(TG_THREAD_TASK);
+        crate::namespaces::unshare_uts(TG_THREAD_TASK);
+        let result = (|| {
+            let leader = crate::handlers::namespace_fd_for_task(
+                TG_LEADER_TASK,
+                crate::namespaces::NsFlavour::Uts,
+            )
+            .ok_or("leader UTS namespace missing")?;
+            for (name, flavour) in [
+                ("pid", crate::namespaces::NsFlavour::Pid),
+                ("uts", crate::namespaces::NsFlavour::Uts),
+            ] {
+                let expected = crate::handlers::namespace_fd_for_task(TG_THREAD_TASK, flavour)
+                    .ok_or("thread namespace missing")?;
+                if name == "uts" && expected.ino() == leader.ino() {
+                    return Err("fixture did not give the thread a distinct namespace");
+                }
+                let directory = alloc::format!("/proc/{}/task/{}", v.pid, v.tid);
+                let path = alloc::format!("{directory}/ns/{name}");
+                if tg_stat_ino(&path) != Ok(expected.ino())
+                    || tg_readlink(&path)? != expected.link_text()
+                    || tg_readlink(&alloc::format!("/proc/thread-self/ns/{name}"))?
+                        != expected.link_text()
+                {
+                    return Err("thread namespace path lost its identity or reader PID view");
+                }
+                // htop holds the thread directory and calls fstatat("ns/pid").
+                let directory = alloc::format!("{directory}\0");
+                let fd = match call_open(directory.as_ptr() as u64, 0o200000) {
+                    Some(fd) if fd >= 0 => fd as u64,
+                    _ => return Err("thread directory open failed"),
+                };
+                let relative = alloc::format!("ns/{name}\0");
+                let mut stat = [0u64; 32];
+                let got = call(
+                    Syscall::Newfstatat.raw(),
+                    a3(fd, relative.as_ptr() as u64, stat.as_mut_ptr() as u64, 0),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                if got != Some(0) || stat[1] != expected.ino() {
+                    return Err("relative thread namespace stat failed or returned link inode");
+                }
+            }
+            if !namespaced {
+                let wrong_group =
+                    alloc::format!("/proc/{TG_OTHER_PID}/task/{TG_THREAD_TID}/ns/pid");
+                if tg_stat_ino(&wrong_group) != Err(Some(ENOENT)) {
+                    return Err("namespace shortcut accepted a thread from the wrong process");
+                }
+            }
+            let missing = alloc::format!("/proc/{}/task/999999/ns/pid", v.pid);
+            if tg_stat_ino(&missing) != Err(Some(ENOENT)) {
+                return Err("namespace shortcut accepted an absent thread");
+            }
+            Ok(())
+        })();
+        crate::namespaces::release_task(TG_THREAD_TASK);
+        result
+    })
+}
+
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_thread_namespace_paths() -> TestResult {
+    check_thread_namespace_paths(false)
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_thread_namespace_paths
+);
+
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_thread_namespace_paths_in_pid_namespace() -> TestResult {
+    check_thread_namespace_paths(true)
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_thread_namespace_paths_in_pid_namespace
+);
+
 /// `stat(path)` → `Ok(st_ino)` or `Err(raw return)`. `st_ino` is the second
 /// u64 of `struct stat` on both x86_64 and the generic (aarch64) layout.
 fn tg_stat_ino(path: &str) -> Result<u64, Option<i64>> {
@@ -3173,6 +3312,7 @@ fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
         let mapping = crate::process::LoadedMapping {
             addr: v.region,
             len: TG_REGION_LEN,
+            file_len: TG_REGION_LEN,
             pgoff: 0x3000,
             prot: 3,
             device: (8 << 8) | 19,
@@ -3205,6 +3345,46 @@ fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_maps_preserve_loader_image_provenance
+);
+
+fn smoke_abi_proc2_statm_main_image_text_extent() -> TestResult {
+    with_thread_group(false, |v| {
+        let mut mappings = alloc::vec![crate::process::LoadedMapping {
+            addr: v.region,
+            len: 0x9000,
+            file_len: 0x1001,
+            pgoff: 0,
+            prot: 5,
+            device: 0,
+            inode: 0,
+            filename: None,
+        }];
+        // Two main executable segments with a gap: Linux counts the extent,
+        // not their sum. File size, not BSS/memsz, determines end_code.
+        let mut second = mappings[0].clone();
+        second.addr += 0x4000;
+        mappings.push(second);
+        let mut interpreter = mappings[0].clone();
+        interpreter.addr += 0x100000;
+        interpreter.filename = Some(alloc::string::String::from("/lib/ld.so"));
+        mappings.push(interpreter);
+        crate::handlers::__test_set_proc_image_mappings(TG_LEADER_TASK, &mappings, "/bin/test");
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let statm = tg_read(&alloc::format!("{}/self/statm", v.base))?;
+            let fields: alloc::vec::Vec<&str> = statm.split_whitespace().collect();
+            if fields.len() != 7 || fields[3] != "6" || fields[5] == "0" {
+                return Err("statm lost the main ELF extent or aggregate data/stack count");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_clear_proc_image_mappings(TG_LEADER_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_abi_proc2_statm_main_image_text_extent
 );
 
 /// A scheduler-spawned user task with `count` one-page anonymous VMAs, each

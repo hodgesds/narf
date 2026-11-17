@@ -22,8 +22,13 @@ use core::cell::Cell;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "demand_wait.rs"]
+mod demand_wait;
 #[path = "device_revoke.rs"]
 mod device_revoke;
+pub use demand_wait::{
+    install_demand_page_wait_hook, DemandPageWait, DemandPageWaitHook, MAX_DEMAND_WAITERS,
+};
 #[path = "region_index.rs"]
 mod region_index;
 #[path = "remote_access.rs"]
@@ -1029,8 +1034,10 @@ struct DemandClaimEntry {
 /// address space. Claims are not CPU-owned: a fault may migrate in future, and
 /// nested fault contexts must not alias a per-CPU slot. The overflow map keeps
 /// capacity exhaustion correct instead of turning it into an ownerless retry.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DemandClaims {
+    /// Distinguishes identical virtual addresses/tickets in different mms.
+    wait_id: u64,
     /// Preallocated separately so this MAX_CPUS-sized fast path does not make
     /// every by-value `AddressSpace` temporary consume another KiB of kernel
     /// stack. Fault handling still performs no allocation until overflow.
@@ -1054,6 +1061,7 @@ impl DemandClaims {
             },
         );
         Ok(Self {
+            wait_id: demand_wait::new_id(),
             inline: inline.into_boxed_slice(),
             len: 0,
             overflow: BTreeMap::new(),
@@ -1068,6 +1076,7 @@ impl DemandClaims {
     /// safe to construct in an atomic (IRQ-masked) context.
     fn empty_placeholder() -> Self {
         Self {
+            wait_id: 0,
             inline: Vec::new().into_boxed_slice(),
             len: 0,
             overflow: BTreeMap::new(),
@@ -1103,7 +1112,7 @@ impl DemandClaims {
     }
 
     fn remove(&mut self, vaddr: u64) -> Option<u64> {
-        if let Some(index) = self.inline[..self.len]
+        let removed = if let Some(index) = self.inline[..self.len]
             .iter()
             .position(|entry| entry.vaddr == vaddr)
         {
@@ -1114,7 +1123,11 @@ impl DemandClaims {
             Some(ticket)
         } else {
             self.overflow.remove(&vaddr)
+        };
+        if let Some(ticket) = removed {
+            demand_wait::notify(self.wait_id, vaddr, ticket);
         }
+        removed
     }
 
     fn retain_outside(&mut self, lo: u64, hi: u64) {
@@ -1122,14 +1135,35 @@ impl DemandClaims {
         while index < self.len {
             let vaddr = self.inline[index].vaddr;
             if vaddr >= lo && vaddr < hi {
+                let ticket = self.inline[index].ticket;
                 self.len -= 1;
                 self.inline[index] = self.inline[self.len];
                 self.inline[self.len] = DemandClaimEntry::default();
+                demand_wait::notify(self.wait_id, vaddr, ticket);
             } else {
                 index += 1;
             }
         }
-        self.overflow.retain(|&vaddr, _| vaddr < lo || vaddr >= hi);
+        self.overflow.retain(|&vaddr, &mut ticket| {
+            if vaddr < lo || vaddr >= hi {
+                true
+            } else {
+                demand_wait::notify(self.wait_id, vaddr, ticket);
+                false
+            }
+        });
+    }
+}
+
+impl Clone for DemandClaims {
+    fn clone(&self) -> Self {
+        Self {
+            wait_id: demand_wait::new_id(),
+            inline: self.inline.clone(),
+            len: self.len,
+            overflow: self.overflow.clone(),
+            next_ticket: self.next_ticket,
+        }
     }
 }
 
@@ -1236,6 +1270,11 @@ struct RegionAcct {
     wnx_bytes: u64,
     /// Count of nonzero backing slots (Linux RSS).
     resident_pages: u64,
+    /// Resident externally owned RAM (file cache/shmem), not private COW
+    /// sharers or device PFNs. Linux statm's FILEPAGES + SHMEMPAGES.
+    shared_resident_pages: u64,
+    /// Linux data_vm + stack_vm: private writable mappings and stacks.
+    data_stack_bytes: u64,
 }
 
 /// Nonzero backing slots in a phys list — a region's resident-page count.
@@ -1270,6 +1309,33 @@ fn rollback_backing_retain(phys: &RegionBacking, end: usize) {
 }
 
 impl RegionAcct {
+    fn shared_resident_accountable(perms: RegionPerms) -> bool {
+        perms.contains(RegionPerms::SHARED)
+            && (!perms.contains(RegionPerms::LOCK_EXEMPT)
+                || perms.contains(RegionPerms::PINNABLE_RAM))
+            && !perms.contains(RegionPerms::STACK_GUARD)
+    }
+
+    fn data_stack_accountable(perms: RegionPerms) -> bool {
+        !perms.contains(RegionPerms::STACK_GUARD)
+            && (perms.contains(RegionPerms::STACK_SEGMENT)
+                || (perms.contains(RegionPerms::WRITE) && !perms.contains(RegionPerms::SHARED)))
+    }
+
+    fn add_resident(&mut self, perms: RegionPerms, pages: u64) {
+        self.resident_pages = self.resident_pages.saturating_add(pages);
+        if Self::shared_resident_accountable(perms) {
+            self.shared_resident_pages = self.shared_resident_pages.saturating_add(pages);
+        }
+    }
+
+    fn sub_resident(&mut self, perms: RegionPerms, pages: u64) {
+        self.resident_pages = self.resident_pages.saturating_sub(pages);
+        if Self::shared_resident_accountable(perms) {
+            self.shared_resident_pages = self.shared_resident_pages.saturating_sub(pages);
+        }
+    }
+
     #[inline]
     fn locked_accountable(perms: RegionPerms) -> bool {
         perms.contains(RegionPerms::LOCKED)
@@ -1295,6 +1361,9 @@ impl RegionAcct {
         if Self::wnx_accountable(perms) {
             self.wnx_bytes = self.wnx_bytes.saturating_add(len);
         }
+        if Self::data_stack_accountable(perms) {
+            self.data_stack_bytes = self.data_stack_bytes.saturating_add(len);
+        }
     }
 
     #[inline]
@@ -1309,22 +1378,21 @@ impl RegionAcct {
         if Self::wnx_accountable(perms) {
             self.wnx_bytes = self.wnx_bytes.saturating_sub(len);
         }
+        if Self::data_stack_accountable(perms) {
+            self.data_stack_bytes = self.data_stack_bytes.saturating_sub(len);
+        }
     }
 
     #[inline]
     fn add_region(&mut self, region: &Region) {
         self.add_flat(region.perms, region.len);
-        self.resident_pages = self
-            .resident_pages
-            .saturating_add(resident_count(&region.phys));
+        self.add_resident(region.perms, resident_count(&region.phys));
     }
 
     #[inline]
     fn sub_region(&mut self, region: &Region) {
         self.sub_flat(region.perms, region.len);
-        self.resident_pages = self
-            .resident_pages
-            .saturating_sub(resident_count(&region.phys));
+        self.sub_resident(region.perms, resident_count(&region.phys));
     }
 }
 
@@ -2020,10 +2088,9 @@ enum DemandPageClaim {
     /// The leaf was already present or was repaired while the region lock was
     /// held; the faulting instruction can retry immediately.
     Resolved,
-    /// A peer owns the slow part of this exact page fault.  Retrying cannot
-    /// observe a half-published frame because publication also takes the
-    /// region lock.
-    InProgress,
+    /// A peer owns this page. Wait for its exact ticket outside the region
+    /// lock before retrying; returning to an absent leaf would busy-fault.
+    InProgress(u64),
     /// The page's SHARED backing frame is in a live device revocation: the
     /// caller waits for the driver's refault with no lock held, then retries.
     Revoked(PhysAddr),
@@ -2146,6 +2213,15 @@ fn pinned_slots_mask(slots: &[PhysAddr]) -> u64 {
         .fold(0, |mask, (index, _)| mask | 1 << index)
 }
 
+/// Non-owning VMA metadata. Contains no backing-frame references or residency
+/// information; copying this must never walk, clone, or retain physical pages.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RegionMetadata {
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
+}
+
 /// Non-owning NUMA residency summary for one registered virtual region.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NumaRegionSnapshot {
@@ -2182,6 +2258,8 @@ pub struct NumaRegionSnapshot {
 pub struct AddressSpaceMemoryStats {
     pub mapped_bytes: u64,
     pub resident_pages: u64,
+    pub shared_resident_pages: u64,
+    pub data_stack_bytes: u64,
     pub writable_nonexec_bytes: u64,
     /// Linux `mm->locked_vm` equivalent — feeds `/proc/<pid>/status` VmLck.
     pub locked_bytes: u64,
@@ -2709,8 +2787,10 @@ impl Drop for MmUser {
 // a material fraction of the 32 KiB kernel-task stack again. Large bounded
 // tables belong behind preallocated stable storage, not inline here.
 // (1056: the maintained mm-counters [`RegionAcct`] added 40 inline bytes,
-// net +24 after the retired mapped_bytes_cache Cell.)
-const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1056);
+// net +24 after the retired mapped_bytes_cache Cell; statm's file/shmem RSS
+// and data+stack counters add another 16 bytes; the demand-wait identity
+// adds 8 more, for a 1080-byte ceiling.)
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1080);
 
 const MEMBARRIER_STATE_MASK: u32 = 0xFF;
 const LIVE_USER_TASKS_SHIFT: u32 = 8;
@@ -6246,11 +6326,8 @@ impl AddressSpace {
             // backing leave this region here.
             regions.acct.sub_flat(acct_perms, acct_old_len);
             regions.acct.add_flat(acct_perms, acct_new_len);
-            regions.acct.resident_pages = regions
-                .acct
-                .resident_pages
-                .saturating_sub(acct_old_resident)
-                .saturating_add(acct_new_resident);
+            regions.acct.sub_resident(acct_perms, acct_old_resident);
+            regions.acct.add_resident(acct_perms, acct_new_resident);
             regions.invalidate_mapping(source_region_base);
         }
         // As for a private relocation: the kept span's guard markers move
@@ -6553,10 +6630,7 @@ impl AddressSpace {
         // in-place mutation the insert/remove accounting primitives can't
         // see. The destination's own insert re-adds it.
         let acct_moved_resident = resident_count(&moved_phys);
-        regions.acct.resident_pages = regions
-            .acct
-            .resident_pages
-            .saturating_sub(acct_moved_resident);
+        regions.acct.sub_resident(source_perms, acct_moved_resident);
         let mut moved = Region {
             base: new_base,
             len,
@@ -6574,10 +6648,7 @@ impl AddressSpace {
                     .get_mut(old_lo)
                     .expect("DONTUNMAP rollback source disappeared")
                     .phys = core::mem::take(&mut moved.phys);
-                regions.acct.resident_pages = regions
-                    .acct
-                    .resident_pages
-                    .saturating_add(acct_moved_resident);
+                regions.acct.add_resident(source_perms, acct_moved_resident);
                 drop(regions);
                 drop(huge);
                 // x86 leaf removal above is deliberately local so normal
@@ -8216,6 +8287,7 @@ impl AddressSpace {
         // Fire in the same lock hold, before any leaf, slot or frame retires.
         self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Clear);
         let mut retired = 0u64;
+        let mut shared_retired = 0u64;
         regions.for_each_overlapping_mut(lo, hi, |region| {
             let rb = region.base.as_u64();
             let re = rb.saturating_add(region.len);
@@ -8237,6 +8309,7 @@ impl AddressSpace {
                 unsafe { self.unmap_region_window_local(region, p_first, p_last) };
             }
             let shared_region = region.perms.contains(RegionPerms::SHARED);
+            let shared_rss = RegionAcct::shared_resident_accountable(region.perms);
             region
                 .phys
                 .for_each_chunk_mut(p_first, p_last, |chunk_first, slots| {
@@ -8258,6 +8331,7 @@ impl AddressSpace {
                         }
                         *slot = PhysAddr::new(0);
                         retired += 1;
+                        shared_retired += u64::from(shared_rss);
                     }
                 });
         });
@@ -8287,6 +8361,10 @@ impl AddressSpace {
         // the commit pass zeroed or replaced discards itself.)
         regions.demand_pages.retain_outside(lo, hi);
         regions.acct.resident_pages = regions.acct.resident_pages.saturating_sub(retired);
+        regions.acct.shared_resident_pages = regions
+            .acct
+            .shared_resident_pages
+            .saturating_sub(shared_retired);
         drop(regions);
         drop(huge);
 
@@ -9340,6 +9418,51 @@ impl AddressSpace {
         copied
     }
 
+    /// Copy only VMA metadata for `/proc/PID/maps`, like Linux show_map_vma.
+    /// Reserve outside the locks and recheck capacity after acquiring them:
+    /// neither allocation nor page-level accounting runs under these locks.
+    /// Base and huge tables are observed separately, as for NUMA snapshots;
+    /// this is a diagnostic view, not a transaction spanning concurrent mmap.
+    pub fn regions_metadata_snapshot(&self) -> Vec<RegionMetadata> {
+        let mut out = Vec::new();
+        loop {
+            let huge = self.huge_regions.lock();
+            let needed = huge.len();
+            if out.capacity() < needed {
+                drop(huge);
+                if out.try_reserve(needed).is_err() {
+                    return out;
+                }
+                continue;
+            }
+            out.extend(huge.iter().map(|r| RegionMetadata {
+                base: r.base,
+                len: r.len,
+                perms: r.perms,
+            }));
+            break;
+        }
+        loop {
+            let regions = self.regions.lock();
+            let needed = regions.len();
+            if out.capacity() - out.len() < needed {
+                drop(regions);
+                if out.try_reserve(needed).is_err() {
+                    break;
+                }
+                continue;
+            }
+            out.extend(regions.iter().map(|r| RegionMetadata {
+                base: r.base,
+                len: r.len,
+                perms: r.perms,
+            }));
+            break;
+        }
+        out.sort_unstable_by_key(|r| r.base.as_u64());
+        out
+    }
+
     /// Snapshot region-level NUMA residency without cloning or transferring
     /// ownership of any physical backing.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot> {
@@ -9495,8 +9618,8 @@ impl AddressSpace {
             repair_backed(phys, perms)?;
             return Ok(DemandPageClaim::Resolved);
         }
-        if regions.demand_pages.get(v).is_some() {
-            return Ok(DemandPageClaim::InProgress);
+        if let Some(ticket) = regions.demand_pages.get(v) {
+            return Ok(DemandPageClaim::InProgress(ticket));
         }
         // Reserve the authoritative slot before the filesystem hook can take
         // an external page-cache reference. If metadata growth fails, no
@@ -9563,7 +9686,7 @@ impl AddressSpace {
         *slot = phys;
         // Demand fill: one more resident page (the slot was verified zero
         // above; in-place backing writes bypass the insert/remove accounting).
-        regions.acct.resident_pages = regions.acct.resident_pages.saturating_add(1);
+        regions.acct.add_resident(perms, 1);
         // Publication, reverse-map ownership, and ticket retirement are one
         // region-lock transaction. An overlapping unmap cannot free `phys`
         // between the leaf install and rmap registration.
@@ -10317,6 +10440,9 @@ impl AddressSpace {
         if let DemandPageClaim::Revoked(phys) = claim {
             return device_revoke::await_refault(phys);
         }
+        if let DemandPageClaim::InProgress(ticket) = claim {
+            return demand_wait::wait(self, v, ticket);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -10653,6 +10779,9 @@ impl AddressSpace {
         })?;
         if let DemandPageClaim::Revoked(phys) = claim {
             return device_revoke::await_refault(phys);
+        }
+        if let DemandPageClaim::InProgress(ticket) = claim {
+            return demand_wait::wait(self, v, ticket);
         }
         let DemandPageClaim::Owner {
             ticket,
@@ -11653,6 +11782,13 @@ impl AddressSpace {
                 return;
             }
             acct_sub.add_flat(r.perms, r.len);
+            if RegionAcct::shared_resident_accountable(r.perms)
+                != RegionAcct::shared_resident_accountable(new_perms)
+            {
+                let resident = resident_count(&r.phys);
+                acct_sub.add_resident(r.perms, resident);
+                acct_delta.add_resident(new_perms, resident);
+            }
             downgrade |= access_downgrade(r.perms, new_perms);
             r.perms = new_perms;
             acct_delta.add_flat(r.perms, r.len);
@@ -11678,6 +11814,16 @@ impl AddressSpace {
             .wnx_bytes
             .saturating_add(acct_delta.wnx_bytes)
             .saturating_sub(acct_sub.wnx_bytes);
+        g.acct.data_stack_bytes = g
+            .acct
+            .data_stack_bytes
+            .saturating_add(acct_delta.data_stack_bytes)
+            .saturating_sub(acct_sub.data_stack_bytes);
+        g.acct.shared_resident_pages = g
+            .acct
+            .shared_resident_pages
+            .saturating_add(acct_delta.shared_resident_pages)
+            .saturating_sub(acct_sub.shared_resident_pages);
         if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
         }
@@ -12012,6 +12158,8 @@ impl AddressSpace {
         let ordinary_touched = g.overlapping(lo, hi).next().is_some();
         let mut wnx_add = 0u64;
         let mut wnx_sub = 0u64;
+        let mut data_stack_add = 0u64;
+        let mut data_stack_sub = 0u64;
         let mut cursor = lo;
         loop {
             let next = {
@@ -12031,9 +12179,18 @@ impl AddressSpace {
                     .get_mut(region_base)
                     .expect("mprotect overlap disappeared under region lock");
                 let was_wnx = RegionAcct::wnx_accountable(region.perms);
+                let was_data_stack = RegionAcct::data_stack_accountable(region.perms);
                 let preserved_flags = RegionPerms(region.perms.0 & !RegionPerms::PROT_MASK.0);
                 region.perms = RegionPerms(prot.0 | preserved_flags.0);
                 let is_wnx = RegionAcct::wnx_accountable(region.perms);
+                match (
+                    was_data_stack,
+                    RegionAcct::data_stack_accountable(region.perms),
+                ) {
+                    (false, true) => data_stack_add = data_stack_add.saturating_add(region.len),
+                    (true, false) => data_stack_sub = data_stack_sub.saturating_add(region.len),
+                    _ => {}
+                }
                 match (was_wnx, is_wnx) {
                     (false, true) => wnx_add = wnx_add.saturating_add(region.len),
                     (true, false) => wnx_sub = wnx_sub.saturating_add(region.len),
@@ -12048,6 +12205,11 @@ impl AddressSpace {
             .wnx_bytes
             .saturating_add(wnx_add)
             .saturating_sub(wnx_sub);
+        g.acct.data_stack_bytes = g
+            .acct
+            .data_stack_bytes
+            .saturating_add(data_stack_add)
+            .saturating_sub(data_stack_sub);
 
         if !ordinary_touched && !huge_touched {
             return Err(AddressSpaceError::Unmapped);
@@ -13117,6 +13279,14 @@ impl AddressSpace {
                 stats.resident_pages = stats
                     .resident_pages
                     .saturating_add((region.frames.len() as u64).saturating_mul(page_bytes >> 12));
+                if RegionAcct::shared_resident_accountable(region.perms) {
+                    stats.shared_resident_pages = stats.shared_resident_pages.saturating_add(
+                        (region.frames.len() as u64).saturating_mul(page_bytes >> 12),
+                    );
+                }
+                if RegionAcct::data_stack_accountable(region.perms) {
+                    stats.data_stack_bytes = stats.data_stack_bytes.saturating_add(region.len);
+                }
                 if region.perms.contains(RegionPerms::WRITE)
                     && !region.perms.contains(RegionPerms::EXEC)
                 {
@@ -13134,6 +13304,12 @@ impl AddressSpace {
             stats.resident_pages = stats
                 .resident_pages
                 .saturating_add(regions.acct.resident_pages);
+            stats.shared_resident_pages = stats
+                .shared_resident_pages
+                .saturating_add(regions.acct.shared_resident_pages);
+            stats.data_stack_bytes = stats
+                .data_stack_bytes
+                .saturating_add(regions.acct.data_stack_bytes);
             stats.writable_nonexec_bytes = stats
                 .writable_nonexec_bytes
                 .saturating_add(regions.acct.wnx_bytes);
@@ -15945,6 +16121,78 @@ kernel_test_in!(
     smoke_memory_region_accounting_caches_track_mutation
 );
 
+fn smoke_memory_proc_metadata_and_statm_accounting() -> TestResult {
+    let space = AddressSpace::empty();
+    let base = 0x0000_0082_0000_0000;
+    let cases = [
+        // Private RWX is data; a read-only stack still counts as stack.
+        (
+            RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC | RegionPerms::COW,
+            0,
+        ),
+        (RegionPerms::READ | RegionPerms::STACK_SEGMENT, 0),
+        (
+            RegionPerms::READ | RegionPerms::SHARED | RegionPerms::FILE_DEMAND,
+            1,
+        ),
+        // Device PFNs/vDSO are not file/shmem RSS; pinnable file RAM is.
+        (
+            RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
+            0,
+        ),
+        (
+            RegionPerms::READ
+                | RegionPerms::SHARED
+                | RegionPerms::LOCK_EXEMPT
+                | RegionPerms::PINNABLE_RAM,
+            1,
+        ),
+    ];
+    // Only the RegionTable owns these synthetic slot values. Remove them
+    // before dropping the AS: no frame ownership or page table is fabricated.
+    {
+        let mut table = space.regions.lock();
+        for (i, &(perms, _)) in cases.iter().enumerate() {
+            table
+                .insert(Region {
+                    base: VirtAddr::new(base + i as u64 * 0x10000),
+                    len: 0x4000,
+                    perms,
+                    phys: alloc::vec![PhysAddr::new(0x4000), PhysAddr::new(0)].into(),
+                })
+                .expect("proc accounting fixture insertion");
+        }
+    }
+    let metadata = space.regions_metadata_snapshot();
+    let stats = space.memory_stats();
+    let mut table = space.regions.lock();
+    let initial_correct = metadata.len() == 5
+        && metadata
+            .iter()
+            .zip(cases)
+            .enumerate()
+            .all(|(i, (r, (perms, _)))| {
+                r.base.as_u64() == base + i as u64 * 0x10000 && r.len == 0x4000 && r.perms == perms
+            })
+        && stats.resident_pages == 5
+        && stats.shared_resident_pages == 2
+        && stats.data_stack_bytes == 0x8000;
+    let mut removals_correct = true;
+    let mut shared = 2;
+    for (i, &(_, contribution)) in cases.iter().enumerate() {
+        table.remove(base + i as u64 * 0x10000);
+        shared -= contribution;
+        removals_correct &=
+            table.acct.shared_resident_pages == shared && table.acct == table.debug_recount_acct();
+    }
+    if initial_correct && removals_correct && table.acct == RegionAcct::default() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("proc metadata or file/shmem/data counters diverged")
+    }
+}
+kernel_test_in!("memory", smoke_memory_proc_metadata_and_statm_accounting);
+
 /// LOCKED-flag accounting: `locked_bytes` tracks `set_region_flag_range`
 /// splits (drain + reinsert) and the in-place mlockall/munlockall sweeps,
 /// verified against a full recount.
@@ -16297,7 +16545,7 @@ fn smoke_memory_demand_tickets_are_page_scoped() -> TestResult {
         Ok(DemandPageClaim::Owner { ticket, .. }) => ticket,
         _ => return TestResult::Fail("first page did not grant a demand ticket"),
     };
-    if a.claim_demand_page(base, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress) {
+    if a.claim_demand_page(base, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress(first)) {
         return TestResult::Fail("same page admitted two demand owners");
     }
     let second = match a.claim_demand_page(base + 0x1000, |_, _| Ok(())) {
@@ -16503,7 +16751,10 @@ fn smoke_memory_demand_claim_inline_overflow_is_lossless() -> TestResult {
         }
     }
     let overflow_va = base + INLINE_DEMAND_CLAIMS as u64 * 4096;
-    if a.claim_demand_page(overflow_va, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress) {
+    if !matches!(
+        a.claim_demand_page(overflow_va, |_, _| Ok(())),
+        Ok(DemandPageClaim::InProgress(_))
+    ) {
         return TestResult::Fail("overflow claim did not dedupe the same page");
     }
     if a.unmap_region(VirtAddr::new(base)).is_err() {
@@ -16678,6 +16929,8 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     } else if !untouched {
         // A routing that populated the whole region would defeat demand paging.
         TestResult::Fail("the sparse prefix did not preserve untouched pages")
+    } else if a.memory_stats().shared_resident_pages != 1 {
+        TestResult::Fail("shared demand fill did not update statm RSS")
     } else {
         TestResult::Pass
     };

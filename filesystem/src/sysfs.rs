@@ -3340,40 +3340,16 @@ pub fn populate_power_supply() {
     }
 }
 
-/// Populate `/sys/class/thermal/thermal_zone0/` with `type`, `temp`
-/// (millidegrees C), `mode` and `policy`, plus a `cooling_device0`.
-///
-/// Linux ref: `drivers/thermal/thermal_sysfs.c`,
-/// Documentation/ABI/testing/sysfs-class-thermal.
+/// Create the thermal class; the power subsystem publishes real thermal
+/// zones and cooling devices. Refresh must not replace their live attributes.
 pub fn populate_thermal() {
-    let class = class_register("thermal");
-
-    let zone = class_device_register(class.clone(), "thermal_zone0");
-    kobject_add_attr(&zone, "type", || "acpitz\n".to_string());
-    kobject_add_attr(&zone, "temp", || "42000\n".to_string());
-    kobject_add_attr(&zone, "mode", || "enabled\n".to_string());
-    kobject_add_attr(&zone, "policy", || "step_wise\n".to_string());
-    add_writable_uevent(&zone, "DEVNAME=thermal/thermal_zone0\n".to_string());
-
-    let cdev = class_device_register(class.clone(), "cooling_device0");
-    kobject_add_attr(&cdev, "type", || "Processor\n".to_string());
-    kobject_add_attr(&cdev, "cur_state", || "0\n".to_string());
-    kobject_add_attr(&cdev, "max_state", || "10\n".to_string());
-    add_writable_uevent(&cdev, "DEVNAME=thermal/cooling_device0\n".to_string());
+    class_register("thermal");
 }
 
-/// Populate `/sys/class/hwmon/hwmon0/` with `name`, `temp1_input`
-/// (millidegrees C) and `temp1_label`. lm-sensors enumerates `hwmonN` then
-/// reads `tempN_input`. Linux ref: `drivers/hwmon/hwmon.c`,
-/// Documentation/ABI/testing/sysfs-class-hwmon.
+/// Create the hwmon class; sensor drivers publish devices through the hwmon
+/// bridge. No device is preferable to a fabricated CPU temperature.
 pub fn populate_hwmon() {
-    let class = class_register("hwmon");
-
-    let hwmon0 = class_device_register(class.clone(), "hwmon0");
-    kobject_add_attr(&hwmon0, "name", || "acpitz\n".to_string());
-    kobject_add_attr(&hwmon0, "temp1_input", || "42000\n".to_string());
-    kobject_add_attr(&hwmon0, "temp1_label", || "CPU\n".to_string());
-    add_writable_uevent(&hwmon0, "DEVNAME=hwmon/hwmon0\n".to_string());
+    class_register("hwmon");
 }
 
 /// Populate `/sys/class/rtc/rtc0/` — the real-time clock class node.

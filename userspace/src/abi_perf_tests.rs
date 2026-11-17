@@ -3,6 +3,10 @@
 //! Covers perf_event_open parameter validation, CPU checking,
 //! task checks, and configuration validation.
 
+#[path = "abi_perf_software_tests.rs"]
+#[cfg(feature = "kernel-test")]
+mod software_clock_tests;
+
 use crate::abi_test_support::*;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
@@ -293,9 +297,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
             }
             #[cfg(target_arch = "x86_64")]
-            Some(EOPNOTSUPP) => {
+            Some(error) if error == -crate::errno::ENODEV => {
                 // TCG's x86 `-cpu max` currently advertises no architectural
-                // PMU; backend filter encoding is covered in arch/pmu.
+                // PMU. ENODEV allows perf's software fallback; backend filter
+                // encoding is covered in arch/pmu.
             }
             _ => return Err("hardware exclude_kernel filter was not programmed"),
         }
@@ -1416,7 +1421,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_perf_event_open_validation);
+kernel_test_in!("syscall_abi/perf", smoke_abi_perf_event_open_validation);
 
 fn smoke_abi_perf_inherited_software_clock_survives_thread_exit() -> TestResult {
     with_setup(|| {
@@ -1516,7 +1521,7 @@ fn smoke_abi_perf_inherited_software_clock_survives_thread_exit() -> TestResult 
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/perf",
     smoke_abi_perf_inherited_software_clock_survives_thread_exit
 );
 
@@ -1644,7 +1649,7 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
     })
 }
 #[cfg(target_arch = "aarch64")]
-kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_overflow_record);
+kernel_test_in!("syscall_abi/perf", smoke_abi_perf_pmuv3_overflow_record);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
@@ -1717,7 +1722,7 @@ fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/perf",
     smoke_abi_perf_pmuv3_programmable_overflow_record
 );
 
@@ -1789,7 +1794,7 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
     })
 }
 #[cfg(target_arch = "aarch64")]
-kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_frequency_record);
+kernel_test_in!("syscall_abi/perf", smoke_abi_perf_pmuv3_frequency_record);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_abi_perf_pmuv3_frequency_adaptation_gate() -> TestResult {
@@ -1875,6 +1880,6 @@ fn smoke_abi_perf_pmuv3_frequency_adaptation_gate() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/perf",
     smoke_abi_perf_pmuv3_frequency_adaptation_gate
 );

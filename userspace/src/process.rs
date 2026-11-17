@@ -60,6 +60,9 @@ pub const DEFAULT_USER_STACK_BASE: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_S
 pub struct LoadedMapping {
     pub addr: u64,
     pub len: u64,
+    /// Bytes from the rounded mapping start through the segment's file end.
+    /// Retains p_filesz (rather than p_memsz) for Linux's end_code accounting.
+    pub file_len: u64,
     pub pgoff: u64,
     pub prot: u32,
     /// Backing filesystem identity in Linux `st_dev` encoding and `st_ino`.
@@ -335,6 +338,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         }
         LoadedMapping {
             addr: vaddr & !0xfff,
+            file_len: (vaddr & 0xfff).saturating_add(seg.file_size),
             len: ((vaddr & 0xfff)
                 .saturating_add(seg.mem_size)
                 .saturating_add(0xfff))
@@ -547,6 +551,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
     loaded_mappings.push(LoadedMapping {
         addr: DEFAULT_USER_STACK_BASE,
+        file_len: 0,
         len: DEFAULT_USER_STACK_RESERVED,
         pgoff: 0,
         prot: if stack_perms.contains(RegionPerms::EXEC) {

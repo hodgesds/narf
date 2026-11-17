@@ -132,6 +132,20 @@ hardware admission rules are in [CPU power §2](cpu-power.md#2-c-states-idle).
 
 ### 3.2 DVFS
 
+On x86, `cpu_frequency::start()` installs a read-only procfs frequency
+provider and starts a pinned telemetry worker on each online CPU, independent
+of governor availability. `current_khz(cpu)` returns a cached busy-frequency
+measurement or `None`. Workers sample CPUID-admitted APERF/MPERF counters
+every 100 ms using GP-safe reads with local IRQs masked. CPU base frequency
+comes from CPUID 16h or AMD P0, with calibrated invariant TSC as fallback;
+base frequency times delta APERF / delta MPERF yields kHz. TSC calibration
+separately governs sample age. No counter is
+reset and no performance-control register is written. Missing calibration,
+zero deltas, counter resets/read faults and samples older than 500 ms are
+unavailable. Proc readers never read MSRs or wait for another CPU. Workers
+cover CPUs online at startup; bringing a later hotplugged CPU into telemetry
+is not implemented yet.
+
 ```rust
 pub struct Opp { pub freq_khz: u32, pub voltage_uv: u32 }
 

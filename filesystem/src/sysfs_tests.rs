@@ -2118,69 +2118,45 @@ fn smoke_sysfs_power_supply_class() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_sysfs_power_supply_class);
 
-/// thermal class — thermal_zone0 enumerates; temp == "42000".
-fn smoke_sysfs_thermal_class() -> TestResult {
+/// Empty classes must not invent a sensor or overwrite driver attributes
+/// when a provider refresh runs after the real thermal/hwmon bridge.
+fn smoke_sysfs_temperature_classes_require_hardware() -> TestResult {
+    use crate::sysfs::{class_device_register, class_register, kobject_add_attr};
     crate::sysfs::__reset_for_test();
-    crate::sysfs::populate_thermal();
-
-    let names = class_device_names("thermal");
-    if !names.iter().any(|n| n == "thermal_zone0") {
-        return TestResult::Fail("thermal_zone0 not in /sys/class/thermal");
-    }
-
-    let root = crate::sysfs::sysfs_root();
-    let zone = match root
-        .get_child("class")
-        .and_then(|c| c.get_child("thermal"))
-        .and_then(|t| t.get_child("thermal_zone0"))
-    {
-        Some(k) => k,
-        None => return TestResult::Fail("thermal_zone0 kobject missing"),
-    };
-    if attr_trimmed(&zone, "temp").as_deref() != Some("42000") {
-        return TestResult::Fail("thermal_zone0/temp != 42000");
-    }
-    if attr_trimmed(&zone, "type").as_deref() != Some("acpitz") {
-        return TestResult::Fail("thermal_zone0/type != acpitz");
-    }
-    if attr_trimmed(&zone, "policy").as_deref() != Some("step_wise") {
-        return TestResult::Fail("thermal_zone0/policy != step_wise");
+    for (class_name, device_name, attribute, populate) in [
+        (
+            "thermal",
+            "thermal_zone0",
+            "temp",
+            crate::sysfs::populate_thermal as fn(),
+        ),
+        (
+            "hwmon",
+            "hwmon0",
+            "temp1_input",
+            crate::sysfs::populate_hwmon as fn(),
+        ),
+    ] {
+        populate();
+        if !class_device_names(class_name).is_empty() {
+            return TestResult::Fail("temperature provider invented hardware");
+        }
+        let device = class_device_register(class_register(class_name), device_name);
+        kobject_add_attr(&device, attribute, || "51250\n".into());
+        kobject_add_attr(&device, "name", || "real-sensor\n".into());
+        populate();
+        if attr_trimmed(&device, attribute).as_deref() != Some("51250")
+            || attr_trimmed(&device, "name").as_deref() != Some("real-sensor")
+        {
+            return TestResult::Fail("temperature provider overwrote a live sensor");
+        }
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_thermal_class);
-
-/// hwmon class — hwmon0 enumerates; temp1_input == "42000".
-fn smoke_sysfs_hwmon_class() -> TestResult {
-    crate::sysfs::__reset_for_test();
-    crate::sysfs::populate_hwmon();
-
-    let names = class_device_names("hwmon");
-    if !names.iter().any(|n| n == "hwmon0") {
-        return TestResult::Fail("hwmon0 not in /sys/class/hwmon");
-    }
-
-    let root = crate::sysfs::sysfs_root();
-    let hwmon0 = match root
-        .get_child("class")
-        .and_then(|c| c.get_child("hwmon"))
-        .and_then(|h| h.get_child("hwmon0"))
-    {
-        Some(k) => k,
-        None => return TestResult::Fail("hwmon0 kobject missing"),
-    };
-    if attr_trimmed(&hwmon0, "name").as_deref() != Some("acpitz") {
-        return TestResult::Fail("hwmon0/name != acpitz");
-    }
-    if attr_trimmed(&hwmon0, "temp1_input").as_deref() != Some("42000") {
-        return TestResult::Fail("hwmon0/temp1_input != 42000");
-    }
-    if attr_trimmed(&hwmon0, "temp1_label").as_deref() != Some("CPU") {
-        return TestResult::Fail("hwmon0/temp1_label != CPU");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("filesystem", smoke_sysfs_hwmon_class);
+kernel_test_in!(
+    "filesystem/sysfs_temperature",
+    smoke_sysfs_temperature_classes_require_hardware
+);
 
 /// End-to-end VFS read of /sys/class/power_supply/BAT0/capacity.
 /// Mounts sysfs, resolves the attr path, reads it back == "100\n".

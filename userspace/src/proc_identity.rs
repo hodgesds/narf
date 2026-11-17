@@ -52,6 +52,7 @@ pub(crate) struct Snapshot {
     pub environ: Option<Arc<Vec<u8>>>,
     pub auxv: Option<Arc<Vec<u8>>>,
     pub mappings: Option<Arc<Vec<ImageMapping>>>,
+    pub text_pages: u64,
 }
 
 pub(crate) struct Identity {

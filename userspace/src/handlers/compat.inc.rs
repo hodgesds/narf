@@ -4934,7 +4934,9 @@ pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
 #[cfg(feature = "container")]
 pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
     use narf_filesystem::procfs::ns_tag;
-    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let task = pid_to_task_raw(pid)
+        .or_else(|| linux_tid_to_task_raw(pid))
+        .unwrap_or(pid);
     let flavour = match tag {
         ns_tag::UTS => crate::namespaces::NsFlavour::Uts,
         ns_tag::NET => crate::namespaces::NsFlavour::Net,
@@ -7574,12 +7576,18 @@ fn set_proc_image_mappings(
     mappings: &[crate::process::LoadedMapping],
     main_program_path: &str,
 ) {
+    // Linux task_statm uses the main ELF's start_code/end_code, not the
+    // sum of every executable VMA (libraries, JIT and executable stacks).
+    let text_pages = proc_image_text_pages(mappings);
     let main_program_path = proc_absolute_path(task, main_program_path);
     let mut image_mappings = alloc::vec::Vec::new();
     if image_mappings.try_reserve(mappings.len()).is_err() {
         // `/proc/maps` provenance is diagnostic metadata. A failure to retain
         // it must not turn an otherwise successful exec into a kernel panic.
-        drop(crate::proc_identity::update(task, |state| state.mappings.take()));
+        drop(crate::proc_identity::update(task, |state| {
+            state.text_pages = text_pages;
+            state.mappings.take()
+        }));
         return;
     }
     for mapping in mappings {
@@ -7605,8 +7613,25 @@ fn set_proc_image_mappings(
     // Retain one immutable snapshot. Fork/clone only clone this reference.
     let snapshot = Arc::try_new(image_mappings).ok();
     drop(crate::proc_identity::update(task, |state| {
+        state.text_pages = text_pages;
         core::mem::replace(&mut state.mappings, snapshot)
     }));
+}
+
+fn proc_image_text_pages(mappings: &[crate::process::LoadedMapping]) -> u64 {
+    let mut start = u64::MAX;
+    let mut end = 0;
+    for mapping in mappings {
+        if mapping.filename.is_none() && mapping.prot & 4 != 0 {
+            start = start.min(mapping.addr & !0xfff);
+            end = end.max(mapping.addr.saturating_add(mapping.file_len));
+        }
+    }
+    if start == u64::MAX {
+        0
+    } else {
+        (end.saturating_add(0xfff) & !0xfff).saturating_sub(start) >> 12
+    }
 }
 
 /// Kernel-test seam for `/proc/maps` loader-provenance coverage.
@@ -7622,7 +7647,10 @@ pub fn __test_set_proc_image_mappings(
 /// Kernel-test cleanup for `/proc/maps` loader-provenance coverage.
 #[doc(hidden)]
 pub fn __test_clear_proc_image_mappings(task: u64) {
-    drop(crate::proc_identity::update(task, |state| state.mappings.take()));
+    drop(crate::proc_identity::update(task, |state| {
+        state.text_pages = 0;
+        state.mappings.take()
+    }));
 }
 
 fn proc_image_mapping_for_range(
@@ -8481,6 +8509,25 @@ pub fn proc_task_info(
     if !live {
         return None;
     }
+    // lookup/stat ownership checks do not need an mm, argv, descriptors,
+    // thread census or signal table. htop performs these for every proc file
+    // it opens, often several times per PID during one refresh.
+    if query == TaskInfoQuery::Identity {
+        let credentials = read_uidgid(tid);
+        return Some(ProcTaskInfo {
+            pid: visible_pid,
+            comm: proc_comm_of_task(tid).unwrap_or_else(|| {
+                if pid == 0 {
+                    alloc::string::String::from("kernel")
+                } else {
+                    alloc::format!("task-{pid}")
+                }
+            }),
+            uid: credentials.euid,
+            gid: credentials.egid,
+            ..Default::default()
+        });
+    }
     // The group's mm — Linux `proc_mem_open` -> `mm_access(task)` reads
     // `task->mm`, which every CLONE_THREAD sibling shares, for as long as the
     // task lives. The scheduler's live registry is that lifetime: it holds a
@@ -8517,6 +8564,21 @@ pub fn proc_task_info(
                     narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member))
                 })
         });
+    if query == TaskInfoQuery::Statm {
+        let stats = as_arc
+            .as_ref()
+            .map(|space| space.memory_stats())
+            .unwrap_or_default();
+        return Some(ProcTaskInfo {
+            pid: visible_pid,
+            vm_size_bytes: stats.mapped_bytes,
+            resident_pages: stats.resident_pages,
+            shared_resident_pages: stats.shared_resident_pages,
+            text_pages: crate::proc_identity::read(tid, |state| state.text_pages).unwrap_or(0),
+            data_stack_bytes: stats.data_stack_bytes,
+            ..Default::default()
+        });
+    }
     // brk top — the break is ADDRESS-SPACE state now (not per-task), so read it
     // off the group's AS. This also gives every CLONE_VM thread the same `[heap]`
     // range in its /proc/<tid>/maps (per-task keying showed threads no heap).
@@ -8552,7 +8614,7 @@ pub fn proc_task_info(
     // regions (the latter has no VFS-path dependency). Snapshot it once so
     // maps rendering neither locks on every VMA nor exposes a half-updated
     // exec image.
-    let image_mappings = if query == TaskInfoQuery::Vmas {
+    let image_mappings = if query != TaskInfoQuery::Basic {
         proc_image_mappings_snapshot(tid)
     } else {
         None
@@ -8571,7 +8633,7 @@ pub fn proc_task_info(
     use narf_filesystem::procfs::ProcVma;
     use narf_memory::RegionPerms;
     let mut vmas = alloc::vec::Vec::new();
-    if query == TaskInfoQuery::Vmas {
+    if query != TaskInfoQuery::Basic {
         if let Some(as_arc) = as_arc {
             // Per-mmap file identity, carried by the file-owner rows so it
             // follows munmap splits, mremap and fork exactly as the mapping
@@ -8585,22 +8647,24 @@ pub fn proc_task_info(
             // unlinked; NARF keeps no dentry state here, so an unlinked
             // mapped file still renders its original path.
             let reader = current_task_id();
-            let mut snapshot = as_arc.numa_regions_snapshot();
-            // Fallible: this runs on the fatal-fault diagnostic path, where the
-            // kernel heap may be exhausted. If the output can't be reserved, drop
-            // the VMA list (empty snapshot => the loop is a no-op) rather than
-            // abort the whole kernel — a userspace fault must never panic it via a
-            // diagnostic allocation.
-            if vmas.try_reserve(snapshot.len()).is_err() {
-                snapshot.clear();
-            }
-            for r in snapshot {
+            let mut append_vma = |r: narf_memory::RegionMetadata,
+                                  detail: Option<&narf_memory::NumaRegionSnapshot>| {
+                // Diagnostics must remain fallible under heap pressure.
+                if vmas.try_reserve(1).is_err() {
+                    return;
+                }
                 let base = r.base.as_u64();
                 let end = base + r.len;
                 let prot = r.perms.prot_only();
-                let policy = resolve_policy(tid, base);
-                let effective_nodemask =
-                    mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid));
+                let (numa_policy, numa_nodemask) = if detail.is_some() {
+                    let policy = resolve_policy(tid, base);
+                    (
+                        policy.mode,
+                        mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid)),
+                    )
+                } else {
+                    (0, 0)
+                };
                 let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
                     "[stack]"
                 } else if base == 0x8000_0000_0000_u64
@@ -8647,22 +8711,41 @@ pub fn proc_task_info(
                     writable: prot.contains(RegionPerms::WRITE),
                     executable: prot.contains(RegionPerms::EXEC),
                     // From the UN-stripped perms — prot_only() drops the
-                    // SHARED bit. Feeds maps' s/p column + statm's shared.
+                    // SHARED bit. Feeds maps' s/p column.
                     shared: r.perms.contains(RegionPerms::SHARED),
                     file_offset,
                     device,
                     inode,
                     pathname,
                     label,
-                    numa_policy: policy.mode,
-                    numa_nodemask: effective_nodemask,
-                    numa_node_pages: r.node_pages,
-                    resident_pages: r.resident_pages,
-                    kernel_page_kb: r.kernel_page_kb,
-                    pss_bytes: r.pss_bytes,
-                    shared_pages: r.shared_pages,
-                    private_pages: r.private_pages,
+                    numa_policy,
+                    numa_nodemask,
+                    numa_node_pages: detail
+                        .map_or([0; narf_memory::frame::MAX_NUMA_NODES], |d| d.node_pages),
+                    resident_pages: detail.map_or(0, |d| d.resident_pages),
+                    kernel_page_kb: detail.map_or(0, |d| d.kernel_page_kb),
+                    pss_bytes: detail.map_or(0, |d| d.pss_bytes),
+                    shared_pages: detail.map_or(0, |d| d.shared_pages),
+                    private_pages: detail.map_or(0, |d| d.private_pages),
                 });
+            };
+            // Keep maps on a metadata-only API. Neither NUMA policy nor any
+            // physical backing/COW refcount is consulted for this query.
+            if query == TaskInfoQuery::Maps {
+                for r in as_arc.regions_metadata_snapshot() {
+                    append_vma(r, None);
+                }
+            } else {
+                for r in as_arc.numa_regions_snapshot() {
+                    append_vma(
+                        narf_memory::RegionMetadata {
+                            base: r.base,
+                            len: r.len,
+                            perms: r.perms,
+                        },
+                        Some(&r),
+                    );
+                }
             }
         }
     }
@@ -8717,6 +8800,9 @@ pub fn proc_task_info(
         vmas,
         vm_size_bytes: memory_stats.mapped_bytes,
         resident_pages: memory_stats.resident_pages,
+        shared_resident_pages: memory_stats.shared_resident_pages,
+        text_pages: crate::proc_identity::read(tid, |state| state.text_pages).unwrap_or(0),
+        data_stack_bytes: memory_stats.data_stack_bytes,
         locked_bytes: memory_stats.locked_bytes,
         data_bytes: memory_stats
             .writable_nonexec_bytes
@@ -13031,7 +13117,7 @@ pub fn default_sync_signal_delivery(
                 let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
                 {
                     if let Some(info) =
-                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
+                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Maps)
                     {
                         for vma in info.vmas.iter().filter(|vma| vma.executable) {
                             let _ = writeln!(
@@ -13053,7 +13139,7 @@ pub fn default_sync_signal_delivery(
                 // the task wrongly wrote to. This single line disambiguates.
                 {
                     if let Some(pinfo) =
-                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
+                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Maps)
                     {
                         match pinfo
                             .vmas

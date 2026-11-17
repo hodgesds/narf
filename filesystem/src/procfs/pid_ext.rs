@@ -895,60 +895,21 @@ fn loginuid_set(pid: u64, uid: u32) {
 ///   data     — data + stack pages
 ///   dt       — dirty pages (always 0 in Linux ≥2.6)
 ///
-/// We derive `size` from the sum of all VMA spans and `resident` from
-/// the anonymous + file-backed extents (same denominator — the kernel
-/// tracks these separately only with a page-table walk, which NARF
-/// doesn't have yet). Fields without a data source are zeroed with a
-/// LINUX-GAP note, matching the style of `render_io` and other partial
-/// files in this module.
-///
-/// Linux ref: `fs/proc/array.c:proc_pid_statm`.
+/// Linux `task_statm` uses maintained mm counters and the exec-time code
+/// extent. No per-VMA detail vector or backing-page walk is needed.
 fn render_statm(pid: u64) -> String {
-    const PAGE_SIZE: u64 = 4096;
-    let info = task_info(pid, super::TaskInfoQuery::Basic);
-    let size_pages = info.as_ref().map_or(0, |i| i.vm_size_bytes / PAGE_SIZE);
-    let resident_pages = info.as_ref().map_or(0, |i| i.resident_pages);
-    // shared: MAP_SHARED VMA pages — the `shared` flag every VMA
-    // already carries (same residency approximation as `resident`).
-    let shared_pages = info
-        .as_ref()
-        .map(|i| {
-            i.vmas
-                .iter()
-                .filter(|v| v.shared)
-                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
-    // text: executable VMA pages.
-    let text_pages = info
-        .as_ref()
-        .map(|i| {
-            i.vmas
-                .iter()
-                .filter(|v| v.executable && !v.writable)
-                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
-    // lib: always 0 on Linux ≥2.6.
-    let lib_pages: u64 = 0;
-    // data: writable non-executable VMA pages (heap + stack + data).
-    let data_pages = info
-        .as_ref()
-        .map(|i| {
-            i.vmas
-                .iter()
-                .filter(|v| v.writable && !v.executable)
-                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
-    // dt: dirty pages — always 0 on Linux ≥2.6.
-    let dt_pages: u64 = 0;
+    let info = task_info(pid, super::TaskInfoQuery::Statm).unwrap_or_default();
+    render_statm_info(&info)
+}
+
+fn render_statm_info(info: &super::ProcTaskInfo) -> String {
     format!(
-        "{} {} {} {} {} {} {}\n",
-        size_pages, resident_pages, shared_pages, text_pages, lib_pages, data_pages, dt_pages
+        "{} {} {} {} 0 {} 0\n",
+        info.vm_size_bytes / 4096,
+        info.resident_pages,
+        info.shared_resident_pages,
+        info.text_pages,
+        info.data_stack_bytes / 4096,
     )
 }
 
@@ -1384,7 +1345,9 @@ impl DirOps for ProcTaskTidDir {
                 ino: proc_pid_ino(self.ino, name),
                 wchan: name == "wchan",
             })),
-            "fd" | "fdinfo" => Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name)))),
+            "fd" | "fdinfo" | "ns" => {
+                Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name))))
+            }
             _ => None,
         }
     }
@@ -1396,6 +1359,11 @@ impl DirOps for ProcTaskTidDir {
         match name {
             "fd" => Some(Arc::new(ProcFdDir { pid: self.pid })),
             "fdinfo" => Some(Arc::new(ProcFdInfoDir { pid: self.pid })),
+            // Namespace membership is per thread. Resolve the reader-visible
+            // tid to its outer number; never substitute the group leader.
+            "ns" => Some(Arc::new(super::ProcNsDir {
+                pid: super::pid_resolve(self.tid)?,
+            })),
             _ => None,
         }
     }
@@ -1403,7 +1371,7 @@ impl DirOps for ProcTaskTidDir {
         let files = ["comm", "mem", "stat", "syscall", "wchan"]
             .into_iter()
             .map(|name| (name, FileType::File));
-        let dirs = ["fd", "fdinfo"]
+        let dirs = ["fd", "fdinfo", "ns"]
             .into_iter()
             .map(|name| (name, FileType::Dir));
         Box::new(files.chain(dirs).map(|(name, file_type)| DirEntry {
@@ -2221,6 +2189,26 @@ kernel_test_in!(
 );
 
 // ── statm + magic symlink smokes ────────────────────────────────────────
+
+fn smoke_statm_uses_counters_without_vmas() -> TestResult {
+    let info = super::ProcTaskInfo {
+        vm_size_bytes: 100 * 4096,
+        resident_pages: 17,
+        shared_resident_pages: 3,
+        text_pages: 5,
+        data_stack_bytes: 42 * 4096,
+        ..Default::default()
+    };
+    if render_statm_info(&info) == "100 17 3 5 0 42 0\n" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("statm ignored aggregate counters when VMA details were absent")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_statm_uses_counters_without_vmas
+);
 
 /// Smoke: `render_statm` produces exactly 7 space-separated fields + newline.
 fn smoke_statm_has_seven_fields() -> TestResult {

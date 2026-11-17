@@ -43,6 +43,16 @@ fn dma_barrier() {
 }
 
 const DEPTH: usize = packet_tx::RING_SLOTS;
+
+#[cold]
+fn register_access_error(operation: &str, addr: u32, error: registers::Error) -> Error {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "mt76: register {operation} {addr:#010x} failed: {error:?}"
+    );
+    Error::Register
+}
 const GLOBAL: u32 = 0xd4208;
 const BUSY: u32 = 0xa;
 const ENABLE: u32 = 5;
@@ -748,8 +758,8 @@ impl Hardware {
         }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: exclusive retained aperture/L1 latch inside current invocation.
-            let value =
-                unsafe { registers::read32(&self.mmio, addr) }.map_err(|_| Error::Register)?;
+            let value = unsafe { registers::read32(&self.mmio, addr) }
+                .map_err(|error| register_access_error("read", addr, error))?;
             if value == u32::MAX {
                 Err(Error::DeviceGone)
             } else {
@@ -764,7 +774,8 @@ impl Hardware {
         }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: bounded register plan and current retained PCI invocation.
-            unsafe { registers::write32(&self.mmio, addr, value) }.map_err(|_| Error::Register)
+            unsafe { registers::write32(&self.mmio, addr, value) }
+                .map_err(|error| register_access_error("write", addr, error))
         })
         .map_err(|_| Error::Authority)?
     }

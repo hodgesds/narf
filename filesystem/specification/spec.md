@@ -625,6 +625,11 @@ trailing newline, as Linux `proc_pid_wchan`. It also serves the `fd` and
 `fdinfo` directories (`tid_base_stuff`), which are the process's — a thread's
 descriptor table is its process's — so `/proc/thread-self/fd/<n>` is the link
 `/proc/self/fd/<n>` is.
+The thread directory also exposes `ns/<flavour>` and its readlink text.
+Following that magic link with stat or open uses the named thread's namespace,
+including after that thread unshares UTS state; the leader's namespace is not
+substituted. Thread IDs are translated through the reader's PID namespace and
+must belong to the process named by the path.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
@@ -1196,10 +1201,25 @@ Open file descriptions retain the mount ID visible at open time, including for
 ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
 The procfs view hides mounts outside the queried task's root and projects that
 root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
-The procfs task-info hook takes a `TaskInfoQuery`: ordinary liveness,
-`stat`, `status`, `statm`, `cmdline`, and `comm` requests use allocation-free
-aggregate memory counters and leave the VMA vector empty; only `maps` and
-`numa_maps` request the potentially large per-region detail snapshot.
+`/proc/cpuinfo` emits one record per online logical CPU, preserving sparse
+CPU IDs. `install_cpu_frequency_hook(fn(u32) -> Option<u64>)` supplies cached
+per-CPU busy frequency in kHz; procfs formats `cpu MHz` with three decimal
+places. Unavailable/zero readings print `Unknown`, never an invented value.
+The provider must not wait, access hardware or issue remote CPU calls while
+serving proc reads. On x86 the power telemetry workers supply this hook.
+
+The procfs task-info hook takes a `TaskInfoQuery`: liveness, inode ownership
+and `comm` use `Identity` (pid/comm/effective uid/gid only, no mm, argv, fd or
+signal snapshot); `statm` uses `Statm` (maintained mm counters and exec text
+extent only). `stat`, `status` and `cmdline` use `Basic`, whose memory fields
+use aggregate counters and whose VMA vector remains empty. `maps`
+requests only VMA metadata (`Maps`); `smaps`, `smaps_rollup`, and `numa_maps`
+request page residency/PSS/NUMA detail (`Vmas`). Maps never walks backing
+pages or reads COW refcounts. `statm` uses the aggregate virtual/resident,
+resident file/shmem, and data+stack counters, plus the exec-time main ELF
+code extent. Its shared field counts resident external RAM, not the virtual
+length of MAP_SHARED mappings or private COW sharers. NARF's current private
+file fault path allocates anonymous copies, which remain anonymous RSS.
 Every `/proc/<pid>/maps` and `smaps` header follows Linux's token grammar
 `start-end perms offset dev inode [pathname]`. Exec-published loader image
 VMAs retain their original file offset, `st_dev`/`st_ino`, and resolved
@@ -1760,6 +1780,10 @@ request cancellation removes the slot and its registration.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+The built-in thermal and hwmon providers create class directories only.
+Real sensor/thermal drivers own their device nodes and live attributes;
+provider refresh never creates a fallback acpitz temperature or overwrites a
+driver reading. Without a discovered sensor, no temperature device is exposed.
 Sound cards and PCM/control endpoints are projected by the sound-card registry
 under `/sys/devices`, with class and character-device discovery symlinks,
 writable uevents, and physical PCI parent links where applicable. Registry

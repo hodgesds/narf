@@ -27,7 +27,7 @@ narf-aml          = { path = "../../aml" }
 narf-drivers-platform = { path = "../platform" }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-bus/kernel-test"]
 
 [lints]
 workspace = true
