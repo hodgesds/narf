@@ -411,16 +411,16 @@ external profile:
 display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
 MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
-future external owner to TC1/TC2 and scans only Pipes B/C; it is not selected
-by a production entry point. `MtlExternalService` retains that exact profile
-instead of reconstructing it from broad `Generation::PantherLake`; native
+external owner to TC1/TC2 and scans only Pipes B/C. `MtlExternalService`
+retains that exact profile instead of reconstructing it from broad
+`Generation::PantherLake`; native
 fixtures run the existing display-30 C20/PICA DP-alt enable, training, fixed
 VRR-TG and stop path on TC1/TC2 and Pipes B/C. `display_route` returns it only
 for exact `GtPlatform::WildcatLake` with the distinct
 `narf.intel.wcl_display=1` request; crossed PTL/WCL identities refuse
-read-only. KMS retains the exact display IP through install, resource capture
-and recovery; the production probe remains PTL-only until hotplug retains it
-end-to-end. Linux's source boundary is
+read-only. The distinct production option carries that exact display IP
+through KMS install, resource capture, recovery and the hotplug actor. Linux's
+source boundary is
 explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
 LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
 additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact
@@ -451,8 +451,7 @@ Notably WCL 30.02 selects `xe3lpd_3002_dmc.bin` with a 480 MHz ceiling,
 22 GB/s programmed-bandwidth limit and three pipes/FBCs; NVL-S 35.00 selects
 `xe3p_lpd_dmc.bin` with a 787.2 MHz ceiling and the four-pipe/FBC
 `xe2_lpd_display` topology. NVL-S remains a read-only route identity; WCL's
-route decision is read-only and its exact modeset remains disconnected from
-the production probe. The
+exact route is production-gated by `narf.intel.wcl_display=1`. The
 post-driver-FLR proof checks only power-well and pipe-DMC bits
 owned by the observed topology; WCL's nonexistent Pipe-D bits are not treated
 as hardware state, while NVL-S Pipe D remains fail-closed.

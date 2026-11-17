@@ -1452,10 +1452,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // display path below and never the headless profile's driver FLR;
     // every other Lunar Lake function keeps the headless profile.
     let lnl_display = crate::intel_gpu_xe2lpd::probe_route(&device, &cap);
-    // The Panther Lake display-30 route (`narf.intel.ptl_display=1`, GMD
-    // 30.00, Pipe A fused in and lit, eDP not on Type-C) likewise takes the
-    // integrated display path and never the headless driver FLR. Without
-    // the option it reads nothing.
+    // The exact display-30 route (Panther Lake 30.00 with
+    // `narf.intel.ptl_display=1`, or Wildcat Lake 30.02 with
+    // `narf.intel.wcl_display=1`) likewise takes the integrated display path
+    // and never the headless driver FLR. Without its option it reads nothing.
     let ptl_display = !lnl_display && crate::intel_gpu_xe3lpd::probe_route(&device, &cap);
     if !lnl_display
         && !ptl_display
@@ -1745,8 +1745,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
         panel_mode = mode;
     } else if ptl_display {
-        // Panther Lake display 30 (Xe3_LPD), admitted per device: the Lunar
-        // Lake sequence through the display-30 view (`intel_gpu_xe3lpd::
+        // Panther/Wildcat Lake display 30 (Xe3_LPD), admitted per device: the
+        // Lunar Lake sequence through the display-30 view (`intel_gpu_xe3lpd::
         // View`: PICA-relocated DDI A PHY/AUX registers, the display-30 Cx0
         // dialect, and Wa_15015404425's flush only before media B0).
         let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
@@ -2974,9 +2974,9 @@ enum MtlPublication {
 // The hooks and sinks are the pass's whole caller contract; grouping them
 // would only rename the parameters.
 #[allow(clippy::too_many_arguments)]
-fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
+fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     io: &M,
-    generation: Generation,
+    profile: crate::intel_gpu_xelpg_external::ExternalDisplayProfile,
     bar: u64,
     display: &crate::intel_gpu_xelpg_external::MtlDisplay,
     before_event: &mut dyn FnMut(),
@@ -2985,7 +2985,8 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     publication: &mut dyn FnMut(MtlPublication),
 ) -> bool {
     use crate::intel_gpu_xelpg_external::ServiceOutcome;
-    let Some(event) = crate::intel_gpu_xelpg_external::poll_mtl_event(io, generation) else {
+    let Some(event) = crate::intel_gpu_xelpg_external::poll_mtl_event_for_profile(io, profile)
+    else {
         return false;
     };
     before_event();
@@ -3034,9 +3035,9 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         })
     };
-    let outcome = crate::intel_gpu_xelpg_external::handle_mtl_event_for(
+    let outcome = crate::intel_gpu_xelpg_external::handle_mtl_event_for_profile(
         io,
-        generation,
+        profile,
         event,
         display,
         &mut alloc_fb,
@@ -3073,6 +3074,38 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     true
 }
 
+/// Generation-only adapter retained for the native runtime-hook fixtures.
+/// Production uses [`mtl_external_pass_profile`] so WCL cannot be widened to
+/// the broad Panther Lake profile.
+#[cfg(any(test, feature = "kernel-test"))]
+#[allow(clippy::too_many_arguments)]
+fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
+    io: &M,
+    generation: Generation,
+    bar: u64,
+    display: &crate::intel_gpu_xelpg_external::MtlDisplay,
+    before_event: &mut dyn FnMut(),
+    after_event: &mut dyn FnMut(),
+    alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
+    publication: &mut dyn FnMut(MtlPublication),
+) -> bool {
+    let Some(profile) =
+        crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_generation(generation)
+    else {
+        return false;
+    };
+    mtl_external_pass_profile(
+        io,
+        profile,
+        bar,
+        display,
+        before_event,
+        after_event,
+        alloc,
+        publication,
+    )
+}
+
 /// Production publication: the same ACTIVE + observer protocol and exact
 /// serial-matched withdrawal the Gen12 SST owner uses; the image's pipe is
 /// recorded for [`active_external_pipe`] before it becomes ACTIVE.
@@ -3097,13 +3130,28 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             return false;
         }
         let gtt = gpu.gtt_mmadr;
+        let kms = crate::intel_gpu_kms::display_for_bar(&gtt);
         if matches!(
             gpu.chip.generation,
             Generation::LunarLake | Generation::PantherLake
-        ) && crate::intel_gpu_kms::display_for_bar(&gtt).is_none()
+        ) && kms.is_none()
         {
             return false;
         }
+        let display_ip = match gpu.chip.generation {
+            Generation::MeteorLake => crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+            Generation::LunarLake | Generation::PantherLake => {
+                let Some(ip) = kms
+                    .as_ref()
+                    .and_then(|display| display.integrated_display_ip())
+                else {
+                    return false;
+                };
+                ip
+            }
+            _ => return false,
+        };
+        let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(display_ip);
         let window = gpu.mode_window();
         // The owned panel the route adopts next to it, and the display-14/20/30
         // DC service's pipe-DMC sink.
@@ -3139,9 +3187,9 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
         match gpu.chip.generation {
             Generation::LunarLake => {
                 let view = crate::intel_gpu_xe2lpd::Flushed(&window);
-                mtl_external_pass(
+                mtl_external_pass_profile(
                     &view,
-                    gpu.chip.generation,
+                    profile,
                     gtt.phys.raw(),
                     &display,
                     before_event,
@@ -3153,9 +3201,9 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             Generation::PantherLake => {
                 let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
                 let view = crate::intel_gpu_xe3lpd::View::new(&window, flush);
-                mtl_external_pass(
+                mtl_external_pass_profile(
                     &view,
-                    gpu.chip.generation,
+                    profile,
                     gtt.phys.raw(),
                     &display,
                     before_event,
@@ -3164,9 +3212,9 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
                     &mut mtl_publish,
                 )
             }
-            _ => mtl_external_pass(
+            _ => mtl_external_pass_profile(
                 &window,
-                gpu.chip.generation,
+                profile,
                 gtt.phys.raw(),
                 &display,
                 before_event,

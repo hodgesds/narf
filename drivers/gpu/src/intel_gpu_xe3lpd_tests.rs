@@ -252,6 +252,26 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
     assert!(!wcl_requested(KernelCmdline::new(
         "narf.intel.ptl_display=1"
     )));
+    assert!(platform_requested(
+        ptl,
+        KernelCmdline::new("narf.intel.ptl_display=1")
+    ));
+    assert!(!platform_requested(
+        ptl,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
+    assert!(platform_requested(
+        GtPlatform::WildcatLake,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
+    assert!(!platform_requested(
+        GtPlatform::WildcatLake,
+        KernelCmdline::new("narf.intel.ptl_display=1")
+    ));
+    assert!(!platform_requested(
+        GtPlatform::NovaLakeS,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
     for line in [
         "",
         "narf.intel.ptl_display",

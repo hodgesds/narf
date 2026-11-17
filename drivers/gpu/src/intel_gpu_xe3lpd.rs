@@ -82,10 +82,9 @@
 //! Refused on display 30: eDP on Type-C and its untranscribed intermediate
 //! C20 tables, combo DDI B, HDMI, PSR and panel replay, FBC (and its dirty
 //! rectangles), compressed primaries, DC states, system suspend and relight.
-//! Wildcat Lake additionally
-//! retains only Pipes A-C and ports A/B/TC1/TC2; its production probe remains
-//! closed until exact-IP hotplug state is installed end-to-end. KMS retains
-//! the proved 30.02 identity through resource capture and recovery.
+//! Wildcat Lake additionally retains only Pipes A-C and ports A/B/TC1/TC2;
+//! its distinct production option carries the proved 30.02 identity through
+//! KMS, hotplug, resource capture and recovery.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -114,6 +113,20 @@ pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
 /// generation identity cannot opt a Wildcat Lake function into display.
 pub(crate) fn wcl_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
     crate::intel_gpu_gt::boot_opt_in(args, WCL_OPT_IN)
+}
+
+/// Select only the exact platform's destructive display option. Keeping this
+/// decision typed prevents either Panther or Wildcat Lake from inheriting the
+/// other's request through their shared graphics generation.
+pub(crate) fn platform_requested(
+    platform: GtPlatform,
+    args: narf_boot::args::KernelCmdline<'_>,
+) -> bool {
+    match platform {
+        GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => requested(args),
+        GtPlatform::WildcatLake => wcl_requested(args),
+        _ => false,
+    }
 }
 
 /// `PICA_PHY_CONFIG_CONTROL` and `EDP_ON_TYPEC` (`intel_cx0_phy_regs.h`).
@@ -185,21 +198,22 @@ pub(crate) fn display_route(
     Ok(ip)
 }
 
-/// The probe's route decision for one Panther Lake function: `true` only
-/// when [`display_route`] admits the display. Without the option no
-/// register is touched (and BAR0 is not even mapped), so the headless
-/// profile's probe runs exactly as before.
+/// The probe's route decision for one Panther or Wildcat Lake function:
+/// `true` only when [`display_route`] admits the exact display. Without that
+/// platform's option no register is touched (and BAR0 is not even mapped),
+/// so the headless profile's probe runs exactly as before.
 pub(crate) fn probe_route(
     device: &narf_bus::BusDevice,
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> bool {
-    // WCL has a fully typed route decision and exact-IP KMS state, but its
-    // production entry stays closed until hotplug retains that identity.
-    let ptl = GtPlatform::from_pci(device.id.vendor, device.id.device)
-        == Some(GtPlatform::Integrated(
-            crate::intel_gpu::Generation::PantherLake,
-        ));
-    if !ptl || !requested(narf_boot::args()) {
+    let Some(
+        platform @ (GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake)
+        | GtPlatform::WildcatLake),
+    ) = GtPlatform::from_pci(device.id.vendor, device.id.device)
+    else {
+        return false;
+    };
+    if !platform_requested(platform, narf_boot::args()) {
         return false;
     }
     if narf_bus::pci::set_command(
@@ -216,16 +230,13 @@ pub(crate) fn probe_route(
     let Ok(bar) = (unsafe { narf_bus::bar::map_bar(device, 0) }) else {
         return false;
     };
-    let route = display_route(
-        GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
-        true,
-        &crate::intel_gpu_edp::BarWindow(&bar),
-    );
+    let route = display_route(platform, true, &crate::intel_gpu_edp::BarWindow(&bar));
     {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "intel-gpu: Panther Lake display route (PCI {:04x}:{:04x}): {:?}",
+            "intel-gpu: display-30 route {:?} (PCI {:04x}:{:04x}): {:?}",
+            platform,
             device.id.vendor,
             device.id.device,
             route,

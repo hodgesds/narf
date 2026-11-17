@@ -1280,6 +1280,21 @@ pub(crate) struct Device<M: Platform> {
 pub(crate) type Display = Device<Physical>;
 
 impl Display {
+    /// Exact integrated display identity proved when this physical owner was
+    /// installed. Wildcat Lake must remain 30.02 instead of being rebuilt
+    /// from its broad Panther Lake graphics generation.
+    pub(crate) fn integrated_display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        if self.platform.discrete_display.is_some() {
+            return None;
+        }
+        match self.generation {
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
+                Some(resource_ip(&self.platform, self.generation))
+            }
+            _ => None,
+        }
+    }
+
     /// Admission epoch is published by the GT owner after reset recovery;
     /// reading it never acquires the GT or display transaction mutex.
     pub(crate) fn epoch(&self) -> u64 {

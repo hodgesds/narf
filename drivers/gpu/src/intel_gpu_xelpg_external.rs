@@ -95,8 +95,8 @@
 //! Wildcat Lake retains the same display-30 C20/PICA sequence but its distinct
 //! descriptor admits only TC1/TC2 and Pipes A–C. The service stores an exact
 //! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
-//! widen it to TC3/TC4 or Pipe D. That profile remains disconnected from the
-//! production probe/hotplug entry; native fixtures select it directly.
+//! widen it to TC3/TC4 or Pipe D. The production hotplug entry receives that
+//! profile from the exact KMS owner; native fixtures also select it directly.
 //!
 //! ## DSC with FEC
 //!
@@ -184,7 +184,7 @@ impl ExternalDisplayProfile {
         generation: Generation::PantherLake,
     };
 
-    const fn for_generation(generation: Generation) -> Option<Self> {
+    pub(crate) const fn for_generation(generation: Generation) -> Option<Self> {
         match DisplayIp::for_generation(generation) {
             Some(display_ip) => Some(Self {
                 display_ip,
@@ -194,7 +194,7 @@ impl ExternalDisplayProfile {
         }
     }
 
-    const fn for_ip(display_ip: DisplayIp) -> Self {
+    pub(crate) const fn for_ip(display_ip: DisplayIp) -> Self {
         let generation = match display_ip {
             DisplayIp::Xelpdp => Generation::MeteorLake,
             DisplayIp::Xe2Lpd => Generation::LunarLake,
@@ -2877,9 +2877,23 @@ pub fn handle_mtl_event_for<M: MmioWindow + ?Sized>(
     display: &MtlDisplay,
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
+    let profile = ExternalDisplayProfile::for_generation(generation)?;
+    handle_mtl_event_for_profile(io, profile, event, display, alloc)
+}
+
+/// Act on one hotplug event under an exact display identity. This is the
+/// production entry for identities which share a graphics generation (WCL
+/// 30.02 and PTL 30.00).
+pub(crate) fn handle_mtl_event_for_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    event: MtlHpdEvent,
+    display: &MtlDisplay,
+    alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+) -> Option<ServiceOutcome> {
     let mut service = SERVICE.try_lock()?;
     service.set_display(*display);
-    service.set_generation(generation);
+    service.set_profile(profile);
     let port = event.pin.port();
     // A refused DC exit is protocol-neutral; it is reported through the
     // DP route error that carries ExternalError::DisplayPower.
@@ -2905,6 +2919,16 @@ pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
     with_dc_off(|| crate::intel_gpu_xelpg_hpd::poll_hpd_event(io, generation))
         .ok()
         .flatten()
+}
+
+/// Poll under an exact display profile and discard pins the source descriptor
+/// does not own. In particular WCL never turns a TC3/TC4 or DDI-B pulse into
+/// an external-display transaction.
+pub(crate) fn poll_mtl_event_for_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+) -> Option<MtlHpdEvent> {
+    poll_mtl_event(io, profile.generation()).filter(|event| profile.admits_port(event.pin.port()))
 }
 
 /// Process-wide entry for the display runtime: poll the PICA/XELPDP hotplug

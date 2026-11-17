@@ -311,18 +311,18 @@ workaround. `DisplayIp::WildcatLake` retains display 30's timing-generator,
 PM-demand, watermark and CDCLK rules for exact resource admission, with only
 Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
 programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
-D. The disconnected `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits
-only TC1/TC2 and scans only Pipes B/C, so sharing Panther Lake's graphics
-generation cannot silently grant TC3/TC4 or Pipe D authority. No production
-probe or hotplug entry selects it. The service retains the exact profile and
-native fixtures exercise C20 enable/training/fixed-TG/stop on TC1/TC2 and
-Pipes B/C. `DisplayIp::decode_all` and the display-30 modeset accept 30.02,
+D. `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits only TC1/TC2 and
+scans only Pipes B/C, so sharing Panther Lake's graphics generation cannot
+silently grant TC3/TC4 or Pipe D authority. The production KMS and hotplug
+owners retain that exact profile, and native fixtures exercise C20
+enable/training/fixed-TG/stop on TC1/TC2 and Pipes B/C.
+`DisplayIp::decode_all` and the display-30 modeset accept 30.02,
 but `display_route` binds it only to exact `GtPlatform::WildcatLake` plus the
 distinct `narf.intel.wcl_display=1` request. Crossed PTL/WCL identities refuse
-read-only. KMS retains the exact 30.02 identity through install, resource
-capture and recovery; the production probe remains PTL-only until hotplug
-retains the same identity. Linux keeps WCL on the Panther Lake C20 path; it
-does not select LT PHY.
+read-only. The production probe selects that route only for the distinct WCL
+option and carries 30.02 through KMS install, resource capture, recovery and
+the hotplug actor. Linux keeps WCL on the Panther Lake C20 path; it does not
+select LT PHY.
 
 `intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
@@ -1827,9 +1827,9 @@ trusted.
   Xe3 PM demand and guardband-aware watermarks; every external transcoder
   programs and runs the mandatory fixed-refresh VRR timing generator between
   the DDI-function and transcoder enables. The exact WCL 30.02 model uses the
-  same Pipe-A/display-30 core and a distinct TC1/TC2, Pipes B/C C20 profile,
-  but its production probe remains closed. Combo DDI B, HDMI and a
-  headless/unqualified function remain refused.
+  same Pipe-A/display-30 core and a distinct TC1/TC2, Pipes B/C C20 profile.
+  Its production entry requires `narf.intel.wcl_display=1`; combo DDI B,
+  HDMI and a headless/unqualified function remain refused.
 - Pipe A's DMC is reported dark after this lane's crtc disable and lit
   before its port PLL (`intel_dmc_disable_pipe` / `intel_dmc_enable_pipe`
   call sites); a successful owned modeset records its panel mode
@@ -1885,9 +1885,9 @@ only through its qualified route: 14.00 and 20.00 normally, plus 30.00/30.02
 through the display-30 decoder. `display_route` binds 30.00 to exact Panther
 Lake with `narf.intel.ptl_display=1`, and 30.02 to exact Wildcat Lake with
 `narf.intel.wcl_display=1`; crossed identities refuse before any write. The
-production probe still selects only 30.00 until exact-IP hotplug state lands;
-KMS already retains 30.02. An absent display (GMD zero), 14.01 (BMG) and
-35.00 (NVL-S) remain
+production probe selects each exact identity only under its own option, and
+the WCL hotplug actor retains 30.02 rather than rebuilding broad Panther Lake.
+An absent display (GMD zero), 14.01 (BMG) and 35.00 (NVL-S) remain
 typed refusals. Display 20/30 runs the display-14 code with version dispatch,
 not a copy of it.
 
@@ -2060,8 +2060,9 @@ modeset window (`probe_window`: panel power sequencing, the takeover and the
 PPS backlight gate) applies Wa_15015404425 like the KMS owner and the DC
 service; only the read-only route decision ahead of it does not. Panther
 Lake (display 30.00) uses the same TC1–TC4 route only when its opted-in KMS
-owner has proved display 30.00; its fixed-TG and resource deltas are recorded
-in `intel_gpu_xe3lpd`.
+owner has proved display 30.00. Wildcat Lake (30.02) uses the exact TC1/TC2,
+Pipes B/C profile under its distinct option; both fixed-TG and resource deltas
+are recorded in `intel_gpu_xe3lpd`.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
