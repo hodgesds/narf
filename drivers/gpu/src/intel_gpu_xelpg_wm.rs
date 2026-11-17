@@ -33,6 +33,11 @@
 //! The level-0 and SAGV auto minimum allocation and `PLANE_MIN_BUF_CFG`
 //! are register-image deltas ([`crate::intel_gpu_xe3lpd`]).
 //!
+//! Display 35 (Xe3P_LPD) stays outside operational `DisplayIp` dispatch.
+//! Its disconnected calculation forces latency level 0 through
+//! WaWmMemoryReadLatency and selects method 2 for every linear plane, matching
+//! Linux's `DISPLAY_VER >= 35` branches.
+//!
 //! Gen12 keeps its own transcription in [`crate::intel_gpu_wm`]; nothing
 //! here changes Gen12 results.
 
@@ -94,6 +99,13 @@ impl Latency {
             sagv_block_us,
             qgv: None,
         }
+    }
+
+    /// Display 35 ignores the reported level-0 latency before the common
+    /// sanitizer so WaWmMemoryReadLatency always supplies the 6-us baseline.
+    pub(crate) fn adjust_display35(mut raw: [u16; LEVELS], sagv_block_us: u16) -> Self {
+        raw[0] = 0;
+        Self::adjust(raw, sagv_block_us)
     }
 
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, FsError> {
@@ -230,6 +242,9 @@ enum Rules {
     Display14,
     /// Display >= 30, with `pan_x != 0` when the surface is panned.
     Display30 { panned: bool },
+    /// Display >= 35: display-30 Tile4 rules plus method 2 for every linear
+    /// surface.
+    Display35 { panned: bool },
 }
 
 impl Rules {
@@ -275,7 +290,7 @@ fn params_rules(timing: Timing, surface: Surface, rules: Rules) -> Result<Params
     // block on display 10..29, and on display >= 30 only when panned.
     let y_extra = match rules {
         Rules::Display14 => 1,
-        Rules::Display30 { panned } => u64::from(panned),
+        Rules::Display30 { panned } | Rules::Display35 { panned } => u64::from(panned),
     };
     let blocks_per_line = if y_tiled {
         (((bytes_per_line * 4).div_ceil(BLOCK) + y_extra) * FX).div_ceil(4)
@@ -320,6 +335,8 @@ fn level_rules(
     let method2 = (lat * rate).div_ceil(u64::from(timing.htotal) * 1000) * wp.blocks_per_line;
     let selected = if wp.y_tiled {
         method2.max(wp.y_tile_minimum)
+    } else if matches!(rules, Rules::Display35 { .. }) {
+        method2
     } else if (wp.cpp * u64::from(timing.htotal) / BLOCK < 1 && wp.bytes_per_line / BLOCK < 1)
         || u64::from(latency) >= wp.linetime_us
     {
@@ -359,6 +376,28 @@ fn level_rules(
         lines: lines as u16,
         min_ddb_alloc: min_ddb_alloc as u16,
     })
+}
+
+/// Disconnected display-35 plane calculation. It uses Nova Lake's 787.2 MHz
+/// ceiling and never constructs an operational [`crate::intel_gpu_xe2lpd::DisplayIp`].
+pub(crate) fn plane_display35(
+    timing: Timing,
+    surface: Surface,
+    latency: &Latency,
+) -> Result<PlaneWm, WmError> {
+    if !matches!(surface.cpp, 1 | 2 | 4 | 8)
+        || surface.width == 0
+        || surface.width > 8192
+        || timing.htotal == 0
+        || timing.htotal > 16384
+        || !(1..=2 * crate::intel_gpu_xelpg_cdclk::NOVA_LAKE_MAX_CDCLK_KHZ)
+            .contains(&timing.pixel_rate_khz)
+    {
+        return Err(WmError::Unsupported);
+    }
+    let rules = Rules::Display35 { panned: false };
+    let wp = params_rules(timing, surface, rules)?;
+    plane_with(timing, &wp, latency, rules)
 }
 
 /// `skl_compute_transition_wm` (display >= 11, IPC enabled). A disabled

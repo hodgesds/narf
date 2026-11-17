@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.91** (v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
+> Status: **v0.92** (v0.92 models Display 35's forced level-0 latency WA and
+> linear-plane watermark method 2; v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
 > CDCLK ladder and hooks; v0.90 adds the exact, separately opted-in read-only Nova
 > Lake-S display-35 route proof; v0.89 carries WCL 30.02 through the production
 > probe, KMS and hotplug actor; v0.88 added exact, separately opted-in WCL
@@ -350,6 +351,9 @@ production route supplies those preconditions. A strict
 GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants
 no programming authority: display 35.00 remains operationally gated pending
 Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
+Display 35's disconnected watermark path forces the reported level-0 latency
+to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
+for every linear plane; unpanned Tile4 retains the display-30 calculation.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2

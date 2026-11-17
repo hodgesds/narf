@@ -34,6 +34,65 @@ fn level(lines: u16) -> Level {
     }
 }
 
+fn smoke_xe3p_lpd_wm_forces_latency_wa_and_linear_method2() -> TestResult {
+    let adjusted = Latency::adjust_display35([9, 10, 0, 20, 30, 40], 7);
+    assert_eq!(adjusted.levels, [6, 16, 0, 0, 0, 0]);
+    assert_eq!(adjusted.sagv_block_us, 7);
+
+    let timing = ten_us_lines();
+    let lat = latency([6, 0, 0, 0, 0, 0]);
+    let linear = Surface {
+        width: 128,
+        cpp: 4,
+        tiling: Tiling::Linear,
+    };
+    let xe3 = plane_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        timing,
+        linear,
+        &lat,
+    )
+    .unwrap();
+    let xe3p = plane_display35(timing, linear, &lat).unwrap();
+    assert_eq!(
+        (
+            xe3.levels[0].blocks,
+            xe3.levels[0].lines,
+            xe3.levels[0].min_ddb_alloc,
+        ),
+        (6, 3, 8)
+    );
+    assert_eq!(
+        (
+            xe3p.levels[0].blocks,
+            xe3p.levels[0].lines,
+            xe3p.levels[0].min_ddb_alloc,
+        ),
+        (2, 1, 4)
+    );
+
+    // Tile4 already selected method 2 on display 30, so display 35 keeps the
+    // same unpanned result; only the linear branch changes.
+    let tile4 = Surface {
+        tiling: Tiling::Tile4,
+        ..linear
+    };
+    let xe3 = plane_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        timing,
+        tile4,
+        &lat,
+    )
+    .unwrap();
+    let xe3p = plane_display35(timing, tile4, &lat).unwrap();
+    assert_eq!(xe3.levels[0], xe3p.levels[0]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_wm",
+    smoke_xe3p_lpd_wm_forces_latency_wa_and_linear_method2
+);
+
 fn smoke_xelpg_wm_level_disabled_follows_skl_wm_check_vblank() -> TestResult {
     let t = ten_us_lines();
     // prefill.full with no wm0 lines: framestart delay (1 line) + 20 µs

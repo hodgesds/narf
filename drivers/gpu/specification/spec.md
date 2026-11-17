@@ -440,6 +440,10 @@ caller. Its strict `narf.intel.nvl_display=1` route proof is read-only and
 requires exact `GtPlatform::NovaLakeS`, GMD 35.00, an unfused and firmware-lit
 Pipe A, and a non-Type-C eDP panel; it constructs no operational `DisplayIp`
 and is not a production route.
+The disconnected display-35 watermark calculation ignores the reported
+level-0 latency before applying the 6-us WaWmMemoryReadLatency adjustment and
+selects method 2 for every linear plane; Tile4 retains the display-30
+unpanned rule. It does not feed an operational resource transaction.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
