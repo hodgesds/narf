@@ -53,8 +53,12 @@ impl MmioWindow for Regs {
             v ^= u32::from(self.flip.get());
         }
         if let Some((reg, request, status)) = self.mirror.get() {
-            if reg == r && v & request != 0 {
-                v |= status;
+            if reg == r {
+                v = if v & request != 0 {
+                    v | status
+                } else {
+                    v & !status
+                };
             }
         }
         v
@@ -555,12 +559,20 @@ fn smoke_xe2lpd_pica_well_and_d2d_link() -> TestResult {
     let io = Regs::with(&[(0x64000, 1 << 31)]);
     io.mirror.set(Some((0x64000, 1 << 29, 1 << 28)));
     assert_eq!(enable_d2d(&io, DisplayIp::Xe2Lpd, XeLpgPort::A), Ok(()));
-    assert_eq!(io.written(0x64000), [(1 << 31) | (1 << 29)]);
+    assert_eq!(disable_d2d(&io, DisplayIp::Xe2Lpd, XeLpgPort::A), Ok(()));
+    assert_eq!(
+        io.written(0x64000),
+        [(1 << 31) | (1 << 29), (1 << 31) | (1 << 28)]
+    );
     assert!(io.written(0x64004).is_empty());
     let io = Regs::with(&[(0x64004, 1 << 24)]);
     io.mirror.set(Some((0x64004, 1 << 29, 1 << 28)));
     assert_eq!(enable_d2d(&io, DisplayIp::Xelpdp, XeLpgPort::A), Ok(()));
-    assert_eq!(io.written(0x64004), [(1 << 24) | (1 << 29)]);
+    assert_eq!(disable_d2d(&io, DisplayIp::Xelpdp, XeLpgPort::A), Ok(()));
+    assert_eq!(
+        io.written(0x64004),
+        [(1 << 24) | (1 << 29), (1 << 24) | (1 << 28)]
+    );
     let stuck = Regs::with(&[(0x64300, 0)]);
     assert_eq!(
         enable_d2d(&stuck, DisplayIp::Xe2Lpd, XeLpgPort::Tc1),

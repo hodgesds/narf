@@ -377,6 +377,18 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             HdmiError::Route(ExternalError::UnsupportedGeneration),
         ),
         (
+            Generation::LunarLake,
+            XeLpgPort::Tc1,
+            true,
+            HdmiError::Route(ExternalError::UnsupportedGeneration),
+        ),
+        (
+            Generation::PantherLake,
+            XeLpgPort::Tc1,
+            true,
+            HdmiError::Route(ExternalError::UnsupportedGeneration),
+        ),
+        (
             Generation::MeteorLake,
             XeLpgPort::A,
             false,

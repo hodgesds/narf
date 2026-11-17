@@ -215,6 +215,7 @@ impl MtlMstRoute {
                 .first()
                 .map_or(pipe.transcoder(), |s| s.route.pipe.transcoder());
             let mut probe = MtlSinkProbe {
+                display_ip: self.link.display_ip,
                 mst: Some(MstStreamConfig {
                     master,
                     slots: slots as u8,

@@ -1,4 +1,5 @@
-//! Intel Xe-LPDP (Meteor Lake / Arrow Lake) owned external DP SST route.
+//! Intel Xe-LPDP/Xe2_LPD owned external DP SST route (Meteor/Arrow Lake and
+//! Lunar Lake USB-C).
 //!
 //! The internal-panel orchestrator ([`crate::intel_gpu_modeset_xelpg`])
 //! only re-programs an already-enabled DDI A. An external sink arrives
@@ -84,6 +85,12 @@
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
 //! flip remains a TCSS mux operation.
+//! Lunar Lake admits TC1–TC4 only: PICA power and display-20 TCSS pin
+//! assignment are retained by the probe, D2D enable/state move to
+//! `DDI_BUF_CTL`, and the Pipe B–D owner uses display-20 CDCLK/MDCLK/DBUF
+//! resource transactions. Combo DDI B (relocated PICA PHY/AUX), HDMI and
+//! Panther Lake's mandatory display-30 VRR timing generator remain typed
+//! refusals.
 //!
 //! ## DSC with FEC
 //!
@@ -135,11 +142,12 @@ use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
 use crate::intel_gpu_vbt::{dp_ssc_enabled, Vbt, VbtEncoder, VbtPlatform, DP_MAX_DOWNSPREAD};
+use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp, DDI_BUF_D2D_LINK_ENABLE};
 use crate::intel_gpu_xelpg::{
-    disable_d2d, disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, enable_d2d,
-    enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, set_signal_levels,
-    wait_port_buf_active, wait_port_buf_idle, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort,
-    PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
+    disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, enable_port_pll_state,
+    enable_tbt_clock, program_port_buf_ctl, set_signal_levels, wait_port_buf_active,
+    wait_port_buf_idle, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT,
+    PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
@@ -222,11 +230,23 @@ const fn ddi_port_width(lanes: u8) -> u32 {
     w << 1
 }
 
+/// `intel_dp->DP` when `intel_ddi_buf_enable` starts the port. Linux keeps
+/// the display >= 20 D2D request in `DDI_BUF_CTL` across that full write.
+const fn ddi_enable_value(ip: DisplayIp, lanes: u8) -> u32 {
+    ddi_port_width(lanes)
+        | DDI_BUF_CTL_ENABLE
+        | if ip.xe2_plus() {
+            DDI_BUF_D2D_LINK_ENABLE
+        } else {
+            0
+        }
+}
+
 /// Typed refusal or failure of the MTL external route.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExternalError {
     Mst(MstFailure),
-    /// Not a Meteor Lake (display 14) device.
+    /// Not a qualified Xe-LPDP/Xe2_LPD/Xe3_LPD display route.
     UnsupportedGeneration,
     /// DDI A is the internal panel port; it is never an external route.
     UnsupportedPort,
@@ -494,6 +514,16 @@ fn preflight_clock<M: MmioWindow + ?Sized>(
     display: &MtlDisplay,
     clock_mask: u32,
 ) -> Result<PipeChoice, ExternalError> {
+    preflight_clock_ip(io, port, display, clock_mask, DisplayIp::Xelpdp)
+}
+
+fn preflight_clock_ip<M: MmioWindow + ?Sized>(
+    io: &M,
+    port: XeLpgPort,
+    display: &MtlDisplay,
+    clock_mask: u32,
+    ip: DisplayIp,
+) -> Result<PipeChoice, ExternalError> {
     if !io.display_access_ok() {
         return Err(ExternalError::AccessLost);
     }
@@ -505,8 +535,8 @@ fn preflight_clock<M: MmioWindow + ?Sized>(
     let pipe = free_pipe(io)?;
     let panel = read(io, Pipe::A.base() + CONF)? & (ENABLE | STATE);
     let pipes = match (panel, display.panel) {
-        (0, _) => Pipes::adopt(None, 0),
-        (lit, Some(mode)) if lit == ENABLE | STATE => Pipes::adopt_panel(io, &mode)?,
+        (0, _) => Pipes::adopt_ip(ip, None, 0),
+        (lit, Some(mode)) if lit == ENABLE | STATE => Pipes::adopt_panel_ip(io, &mode, ip)?,
         _ => return Err(ExternalError::PipeBusy),
     };
     Ok(PipeChoice { pipe, pipes })
@@ -566,11 +596,19 @@ fn phy_err(e: Cx0Error) -> ExternalError {
     })
 }
 
+fn d2d_err(_: crate::intel_gpu_xe2lpd::IpError) -> ExternalError {
+    // The display-14 helper reports the same failed 100-us state
+    // observation as a PHY timeout.
+    phy_err(Cx0Error::Timeout)
+}
+
 /// Everything [`activate`] needs, owning the Type-C connection and the
 /// AUX power request from probe until [`release_probe`] or a route
 /// release.
 #[derive(Clone, Debug)]
 pub struct MtlSinkProbe {
+    /// Qualified display register layout retained from probe.
+    display_ip: DisplayIp,
     /// MST stream transport; absent for SST.
     pub mst: Option<MstStreamConfig>,
     /// Board wiring from the VBT; DP-alt cable flip is handled by TCSS.
@@ -611,6 +649,11 @@ pub struct MstStreamConfig {
 }
 
 impl MtlSinkProbe {
+    /// Display version whose register layout this probe owns.
+    pub fn display_version(&self) -> u16 {
+        self.display_ip.ver()
+    }
+
     fn tbt(&self) -> bool {
         self.tc.is_some_and(|tc| tc.mode == TcMode::TbtAlt)
     }
@@ -661,10 +704,20 @@ fn probe_link<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     legacy_port: bool,
 ) -> Result<LinkProbe, ExternalError> {
-    if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
+    let display_ip =
+        DisplayIp::for_generation(generation).ok_or(ExternalError::UnsupportedGeneration)?;
+    // Display 30 requires its always-on VRR timing generator on every
+    // external pipe; keep it fail-closed until that pipe sequence is owned.
+    if display_ip == DisplayIp::Xe3Lpd {
         return Err(ExternalError::UnsupportedGeneration);
     }
-    let display20 = matches!(generation, Generation::LunarLake | Generation::PantherLake);
+    // Display 20 relocates combo DDI B's PHY/AUX register views into PICA.
+    // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort;
+    // admit only that source-qualified USB-C path for now.
+    if display_ip == DisplayIp::Xe2Lpd && port.tc_index().is_none() {
+        return Err(ExternalError::UnsupportedPort);
+    }
+    let display20 = display_ip.xe2_plus();
     if port == XeLpgPort::A {
         return Err(ExternalError::UnsupportedPort);
     }
@@ -698,11 +751,17 @@ fn probe_link<M: MmioWindow + ?Sized>(
     let mut raw = [0u8; DPCD_RECEIVER_CAP_BYTES];
     aux.dpcd_read(0, &mut raw)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
-    Ok(LinkProbe { port, tc, raw })
+    Ok(LinkProbe {
+        display_ip,
+        port,
+        tc,
+        raw,
+    })
 }
 
 #[derive(Copy, Clone, Debug)]
 struct LinkProbe {
+    display_ip: DisplayIp,
     port: XeLpgPort,
     tc: Option<TcConnection>,
     raw: [u8; 16],
@@ -737,7 +796,12 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     io: &M,
     link: LinkProbe,
 ) -> Result<MtlSinkProbe, ExternalError> {
-    let LinkProbe { port, tc, raw } = link;
+    let LinkProbe {
+        display_ip,
+        port,
+        tc,
+        raw,
+    } = link;
     let rollback = |error| {
         let _ = link.release(io);
         error
@@ -838,6 +902,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         return Err(rollback(ExternalError::AccessLost));
     }
     Ok(MtlSinkProbe {
+        display_ip,
         mst: None,
         lane_reversal: false,
         port,
@@ -990,11 +1055,12 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
-    let choice = match preflight_clock(
+    let choice = match preflight_clock_ip(
         io,
         probe.port,
         display,
         probe.clock_mask().expect("validated above"),
+        probe.display_ip,
     ) {
         Ok(choice) => choice,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
@@ -1173,7 +1239,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
                 0
             },
     )?;
-    enable_d2d(io, port).map_err(phy_err)?;
+    enable_d2d(io, route.probe.display_ip, port).map_err(d2d_err)?;
     let phy = Cx0Phy::with_lanes(io, port, route.probe.phy_lanes()?);
     if !route.probe.tbt()
         && route
@@ -1187,7 +1253,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
     write(
         io,
         port.ddi_buf_ctl(),
-        ddi_port_width(lanes) | DDI_BUF_CTL_ENABLE,
+        ddi_enable_value(route.probe.display_ip, lanes),
     )?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // 6.k DisplayPort training over the owned AUX channel.
@@ -1274,7 +1340,7 @@ fn training_update<M: MmioWindow + ?Sized>(
                 let ddi = read(io, port.ddi_buf_ctl())?;
                 write(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
                 wait_port_buf_idle(io, port).map_err(phy_err)?;
-                disable_d2d(io, port).map_err(phy_err)?;
+                disable_d2d(io, probe.display_ip, port).map_err(d2d_err)?;
                 if probe.tbt() {
                     disable_tbt_clock(io, port).map_err(phy_err)?;
                 } else {
@@ -1290,12 +1356,12 @@ fn training_update<M: MmioWindow + ?Sized>(
                     )
                     .map_err(phy_err)?;
                 }
-                enable_d2d(io, port).map_err(phy_err)?;
+                enable_d2d(io, probe.display_ip, port).map_err(d2d_err)?;
                 program_port_buf_ctl(io, port, state.lanes);
                 write(
                     io,
                     port.ddi_buf_ctl(),
-                    ddi_port_width(state.lanes) | DDI_BUF_CTL_ENABLE,
+                    ddi_enable_value(probe.display_ip, state.lanes),
                 )?;
                 wait_port_buf_active(io, port).map_err(phy_err)?;
             }
@@ -1581,7 +1647,7 @@ fn stop_port<M: MmioWindow + ?Sized>(
     let ddi = read(io, port.ddi_buf_ctl())?;
     write(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
-    disable_d2d(io, port).map_err(|_| stop_failed)?;
+    disable_d2d(io, route.probe.display_ip, port).map_err(|_| stop_failed)?;
     let tp = read(io, dp_tp_ctl(trans))?;
     write(io, dp_tp_ctl(trans), tp & !DP_TP_CTL_ENABLE)?;
     // intel_ddi_disable_fec and intel_ddi_wait_for_fec_status(false) (a
@@ -2259,7 +2325,17 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let legacy = live == LiveMode::Legacy;
-        let plan = route_plan(port, self.policy.decl(port), live);
+        let mut plan = route_plan(port, self.policy.decl(port), live);
+        // The display-20 DP path is source-qualified below. HDMI still
+        // carries display-14 PHY/D2D programming, so do not reach it by a
+        // DDI-B fallback or a VBT HDMI-only declaration.
+        if self.generation == Generation::LunarLake {
+            plan = match plan {
+                RoutePlan::DpThenHdmi => RoutePlan::Dp,
+                RoutePlan::Hdmi => RoutePlan::Refuse,
+                other => other,
+            };
+        }
         let outcome = match plan {
             RoutePlan::Refuse => ServiceOutcome::Refused {
                 port,

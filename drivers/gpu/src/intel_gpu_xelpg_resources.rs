@@ -750,13 +750,8 @@ pub(crate) fn wait(
     }
 }
 
-/// Every pipe, universal plane, cursor, DSB engine and FBC instance off.
-pub(crate) fn require_idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), ResourceError> {
-    require_idle_ip(io, DisplayIp::Xelpdp)
-}
-
-/// [`require_idle`] over `ip`'s FBC instances (A–B on 14.00, A–D on
-/// display 20).
+/// Every pipe, universal plane, cursor, DSB engine and `ip`'s FBC instances
+/// off (A–B on 14.00, A–D on display 20).
 pub(crate) fn require_idle_ip(
     io: &(impl MmioWindow + ?Sized),
     ip: DisplayIp,
@@ -875,7 +870,7 @@ fn program_slices(
     Ok(())
 }
 
-fn program_ratio(
+pub(crate) fn program_ratio(
     io: &(impl MmioWindow + ?Sized),
     target: Rung,
     joined: bool,
@@ -886,7 +881,10 @@ fn program_ratio(
 
 /// Display 20: put the captured MBUS throttle and DBUF minimum trackers
 /// back (the ratio fields of the original clock).
-fn restore_ratio(io: &(impl MmioWindow + ?Sized), snap: &Snapshot) -> Result<(), ResourceError> {
+pub(crate) fn restore_ratio(
+    io: &(impl MmioWindow + ?Sized),
+    snap: &Snapshot,
+) -> Result<(), ResourceError> {
     use crate::intel_gpu_xe2lpd::{DBUF_MIN_TRACKER_MASK, MBUS_THROTTLE_MASK};
     let mbus = read(io, dbuf::MBUS_CTL)?;
     checked(
@@ -1081,6 +1079,11 @@ pub(crate) fn commit(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(
 /// level; no port clock or PHY; and the QGV point `mtl_find_qgv_points`
 /// picks for no plane when SAGV is controllable, nothing rejecting it).
 pub(crate) fn all_off_pmdemand(latency: &Latency, cdclk: Rung) -> Params {
+    all_off_pmdemand_ip(DisplayIp::Xelpdp, latency, cdclk)
+}
+
+/// [`all_off_pmdemand`] for `ip`'s CDCLK voltage-level rule.
+pub(crate) fn all_off_pmdemand_ip(ip: DisplayIp, latency: &Latency, cdclk: Rung) -> Params {
     Demand {
         qgv_peak_bw: latency
             .qgv
@@ -1088,7 +1091,7 @@ pub(crate) fn all_off_pmdemand(latency: &Latency, cdclk: Rung) -> Params {
             .and_then(|q| crate::intel_gpu_xelpg_bw::qgv_peak_bw(q, 0, 0)),
         enabled_slices: 1,
         active_pipes: 0,
-        voltage_level: cdclk::voltage_level(cdclk.cdclk_khz),
+        voltage_level: cdclk::voltage_level_ip(ip, cdclk.cdclk_khz),
         cdclk_khz: cdclk.cdclk_khz,
         max_port_clock_khz: 0,
         combo_phys: 0,
@@ -1111,11 +1114,22 @@ pub(crate) fn settle_all_off(
     io: &(impl MmioWindow + ?Sized),
     latency: &Latency,
 ) -> Result<(), ResourceError> {
-    require_idle(io)?;
-    let target = cdclk::calc_cdclk(0).ok_or(ResourceError::Unsupported)?;
-    let new = all_off_pmdemand(latency, target);
-    let old = pmdemand::current(io)?;
-    let clock = cdclk::Current::read(io)?;
+    settle_all_off_ip(io, DisplayIp::Xelpdp, latency)
+}
+
+/// [`settle_all_off`] for `ip`: the idle CDCLK, PM-demand layout and the
+/// display >= 20 MDCLK/CDCLK ratio fields follow the admitted display.
+pub(crate) fn settle_all_off_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    latency: &Latency,
+) -> Result<(), ResourceError> {
+    require_idle_ip(io, ip)?;
+    let target = cdclk::calc_cdclk_ip(ip, 0).ok_or(ResourceError::Unsupported)?;
+    let new = all_off_pmdemand_ip(ip, latency, target);
+    let layout = pmdemand::Layout::for_ip(ip);
+    let old = pmdemand::current_for(io, layout)?;
+    let clock = cdclk::Current::read_ip(io, ip)?;
     let joined = read(io, dbuf::MBUS_CTL)? & (1 << 31) != 0;
     let result = (|| {
         for pipe in 0..PIPES {
@@ -1135,7 +1149,19 @@ pub(crate) fn settle_all_off(
             checked(io, cursor_buf_cfg(pipe), 0)?;
         }
         for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
-            let value = dbuf::dbuf_ctl_value(slice, read(io, r)?, 1, joined);
+            let old = read(io, r)?;
+            let value = if ip.xe2_plus() {
+                // Keep the ratio-derived minimum tracker until
+                // `program_ratio` moves it with the clock below.
+                (old & !dbuf::DBUF_POWER_REQUEST)
+                    | if slice == 0 {
+                        dbuf::DBUF_POWER_REQUEST
+                    } else {
+                        0
+                    }
+            } else {
+                dbuf::dbuf_ctl_value(slice, old, 1, joined)
+            };
             io.write32(r, value);
             let want = if slice == 0 {
                 dbuf::DBUF_POWER_STATE
@@ -1145,13 +1171,19 @@ pub(crate) fn settle_all_off(
             wait(io, r, dbuf::DBUF_POWER_STATE, want)?;
         }
         if clock.known != Some(target) {
-            cdclk::program(io, &clock, target)?;
+            if ip.xe2_plus() && target.cdclk_khz < clock.actual_khz {
+                program_ratio(io, target, joined)?;
+            }
+            cdclk::program_ip(io, ip, &clock, target)?;
+            if ip.xe2_plus() && target.cdclk_khz >= clock.actual_khz {
+                program_ratio(io, target, joined)?;
+            }
         }
-        pmdemand::program(io, &new, None)?;
+        pmdemand::program_for(io, layout, &new, None)?;
         Ok(())
     })();
     if result.is_err() && io.display_access_ok() {
-        let _ = pmdemand::program(io, &old, Some(&new));
+        let _ = pmdemand::program_for(io, layout, &old, Some(&new));
     }
     result
 }

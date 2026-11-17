@@ -468,13 +468,14 @@ impl DisplayIp {
         }
     }
 
-    /// The IP a PCI generation's display is (only for the platforms whose
-    /// descriptor maps to exactly one qualified IP).
-    #[cfg(any(test, feature = "kernel-test"))]
+    /// The qualified display IP retained by an admitted integrated-display
+    /// route. The caller must already have excluded alternate descriptors
+    /// sharing a generation (notably Wildcat Lake display 30.02).
     pub(crate) const fn for_generation(generation: crate::intel_gpu::Generation) -> Option<Self> {
         match generation {
             crate::intel_gpu::Generation::MeteorLake => Some(Self::Xelpdp),
             crate::intel_gpu::Generation::LunarLake => Some(Self::Xe2Lpd),
+            crate::intel_gpu::Generation::PantherLake => Some(Self::Xe3Lpd),
             _ => None,
         }
     }
@@ -1172,6 +1173,23 @@ pub(crate) fn enable_d2d(
     }
     io.write32(reg, v | enable);
     wait(io, reg, state, state, 100)
+}
+
+/// `mtl_ddi_disable_d2d` on `ip`: clear the enable bit, then wait 100 µs
+/// for the state bit to clear. Display 14 owns the link in `PORT_BUF_CTL1`;
+/// display 20 and 30 own it in `DDI_BUF_CTL`.
+pub(crate) fn disable_d2d(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    port: XeLpgPort,
+) -> Result<(), IpError> {
+    let (reg, enable, state) = ip.d2d(port);
+    let v = io.read32(reg);
+    if v == u32::MAX || !io.display_access_ok() {
+        return Err(IpError::NoDevice);
+    }
+    io.write32(reg, v & !enable);
+    wait(io, reg, state, 0, 100)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -394,6 +394,20 @@ impl Profile {
         Self::check_cdclk(io, profile.ip, mode)?;
         Ok(profile)
     }
+
+    /// [`Self::capture`] while requiring the caller's admitted display IP.
+    pub(crate) fn capture_ip(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        ip: DisplayIp,
+    ) -> Result<Self, FsError> {
+        let profile = Self::capture(io, mode)?;
+        if profile.ip == ip {
+            Ok(profile)
+        } else {
+            Err(FsError::Unsupported)
+        }
+    }
     /// The running CDCLK covers `mode` and the acknowledged PM demand covers
     /// the clock: `ip`'s ceiling (691.2 MHz on display 30) and voltage level
     /// (`xe3lpd_calc_voltage_level` is 0); both PM demand layouts keep the
@@ -442,12 +456,11 @@ impl Profile {
             Err(FsError::Unsupported) => {}
             Err(error) => return Err(error),
         }
-        // Only the display-14 Pipe B–D owner publishes multi-pipe layouts.
-        if ip != DisplayIp::Xelpdp {
-            return Err(FsError::Unsupported);
-        }
         let layout =
             crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
+        if layout.state.ip != ip {
+            return Err(FsError::Unsupported);
+        }
         Ok((
             Self::capture_multi(io, mode, &layout, dsc)?,
             Some(Box::new(layout)),

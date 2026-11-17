@@ -1,5 +1,6 @@
-//! Display-14.00 live repartitioning: add or remove pipes while other
-//! pipes stay lit.
+//! Display-14/20 live repartitioning: add or remove pipes while other pipes
+//! stay lit. Display 20 carries its MDCLK/CDCLK ratio through DBUF minimum
+//! trackers and the MBUS translation throttle around each clock change.
 //!
 //! MIT Linux b90c984d `intel_display.c::intel_atomic_commit_tail` and
 //! `skl_commit_modeset_enables`: PM demand pre-plane, CDCLK pre-plane only
@@ -119,6 +120,9 @@ pub(crate) fn order(
 /// Plan the live transition from `old` (programmed) to `new` with the
 /// `live` pipes lit throughout. Pure.
 pub(crate) fn plan(old: &State, new: &State, live: u8) -> Result<Vec<Step>, ResourceError> {
+    if old.ip != new.ip {
+        return Err(ResourceError::Unsupported);
+    }
     let old_active = old.dbuf.active_pipes;
     let new_active = new.dbuf.active_pipes;
     if live == 0 || live & !(old_active & new_active) != 0 {
@@ -389,7 +393,18 @@ fn wait_frame(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<(), Resour
     }
 }
 
-fn trackers(io: &(impl MmioWindow + ?Sized), joined: bool) -> Result<(), ResourceError> {
+fn with_joined(state: &State, joined: bool) -> State {
+    let mut state = *state;
+    state.dbuf.joined = joined;
+    state
+}
+
+fn trackers(
+    io: &(impl MmioWindow + ?Sized),
+    state: &State,
+    joined: bool,
+) -> Result<(), ResourceError> {
+    let state = with_joined(state, joined);
     for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
         let old = read(io, r)?;
         let enabled = if old & dbuf::DBUF_POWER_REQUEST != 0 {
@@ -397,14 +412,19 @@ fn trackers(io: &(impl MmioWindow + ?Sized), joined: bool) -> Result<(), Resourc
         } else {
             0
         };
-        checked_masked(io, r, dbuf::dbuf_ctl_value(slice, old, enabled, joined))?;
+        checked_masked(io, &state, r, state.dbuf_ctl(slice, old, enabled))?;
     }
     Ok(())
 }
 
-fn checked_masked(io: &(impl MmioWindow + ?Sized), r: u64, v: u32) -> Result<(), ResourceError> {
+fn checked_masked(
+    io: &(impl MmioWindow + ?Sized),
+    state: &State,
+    r: u64,
+    v: u32,
+) -> Result<(), ResourceError> {
     io.write32(r, v);
-    let mask = dbuf::DBUF_POWER_REQUEST | dbuf::DBUF_TRACKER_MASK;
+    let mask = (dbuf::DBUF_POWER_REQUEST | state.dbuf_ctl_mask()) & !dbuf::DBUF_POWER_STATE;
     if read(io, r)? & mask == v & mask {
         Ok(())
     } else {
@@ -412,10 +432,16 @@ fn checked_masked(io: &(impl MmioWindow + ?Sized), r: u64, v: u32) -> Result<(),
     }
 }
 
-fn slices(io: &(impl MmioWindow + ?Sized), enabled: u8, joined: bool) -> Result<(), ResourceError> {
+fn slices(
+    io: &(impl MmioWindow + ?Sized),
+    state: &State,
+    enabled: u8,
+    joined: bool,
+) -> Result<(), ResourceError> {
+    let state = with_joined(state, joined);
     for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
         let old = read(io, r)?;
-        checked_masked(io, r, dbuf::dbuf_ctl_value(slice, old, enabled, joined))?;
+        checked_masked(io, &state, r, state.dbuf_ctl(slice, old, enabled))?;
         let want = if enabled & (1 << slice) != 0 {
             dbuf::DBUF_POWER_STATE
         } else {
@@ -429,7 +455,7 @@ fn slices(io: &(impl MmioWindow + ?Sized), enabled: u8, joined: bool) -> Result<
 fn dboxes(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(), ResourceError> {
     for pipe in 0..PIPES {
         if state.dbuf.active_pipes & (1 << pipe) != 0 {
-            checked(io, dbuf::dbox_ctl(pipe), state.dbuf.dbox(pipe))?;
+            checked(io, dbuf::dbox_ctl(pipe), state.dbox(pipe))?;
         }
     }
     Ok(())
@@ -444,8 +470,24 @@ fn mbus(
     checked(
         io,
         dbuf::MBUS_CTL,
-        (old & !dbuf::MBUS_CTL_MASK) | state.dbuf.mbus_ctl_select(select),
+        (old & !state.mbus_ctl_mask()) | state.mbus_ctl_select(select),
     )
+}
+
+fn program_clock(io: &(impl MmioWindow + ?Sized), target: &State) -> Result<(), ResourceError> {
+    let now = cdclk::Current::read_ip(io, target.ip)?;
+    let lowering = now.known.is_some() && target.cdclk.cdclk_khz < now.actual_khz;
+    let raising = now
+        .known
+        .is_none_or(|_| target.cdclk.cdclk_khz > now.actual_khz);
+    if target.ip.xe2_plus() && lowering {
+        crate::intel_gpu_xelpg_resources::program_ratio(io, target.cdclk, target.dbuf.joined)?;
+    }
+    cdclk::program_ip(io, target.ip, &now, target.cdclk)?;
+    if target.ip.xe2_plus() && raising {
+        crate::intel_gpu_xelpg_resources::program_ratio(io, target.cdclk, target.dbuf.joined)?;
+    }
+    Ok(())
 }
 
 fn execute(
@@ -456,35 +498,44 @@ fn execute(
     snap: &Snapshot,
     step: Step,
 ) -> Result<(), ResourceError> {
+    // A raising transition has already installed `new`'s clock and ratio
+    // before the DBUF/MBUS steps. A lowering transition keeps `old`'s
+    // ratio until its post-plane clock step.
+    let ratio = if new.cdclk.cdclk_khz > old.cdclk.cdclk_khz {
+        new
+    } else {
+        old
+    };
+    let layout = pmdemand::Layout::for_ip(new.ip);
     match step {
         Step::PmDemandPre => {
-            pmdemand::program(io, &new.pmdemand, Some(&snap.pmdemand))?;
+            pmdemand::program_for(io, layout, &new.pmdemand, Some(&snap.pmdemand))?;
         }
         Step::CdclkPre | Step::CdclkPost => {
-            let now = cdclk::Current::read(io)?;
-            cdclk::program(io, &now, new.cdclk)?;
+            program_clock(io, new)?;
         }
         Step::DbufPre => slices(
             io,
+            ratio,
             old.dbuf.enabled_slices | new.dbuf.enabled_slices,
             old.dbuf.joined,
         )?,
         Step::MbusJoin { select } => {
-            mbus(io, new, select)?;
+            mbus(io, &with_joined(ratio, true), select)?;
             dboxes(io, new)?;
-            trackers(io, true)?;
+            trackers(io, ratio, true)?;
         }
         Step::UpdatePipe { pipe, wait_vblank } => update_pipe(io, new, pipe, wait_vblank)?,
         Step::MbusUnjoin { select } => {
-            trackers(io, false)?;
+            trackers(io, ratio, false)?;
             dboxes(io, new)?;
-            mbus(io, new, select)?;
+            mbus(io, &with_joined(ratio, false), select)?;
             if let Some(pipe) = select {
                 wait_frame(io, pipe)?;
             }
         }
         Step::MbusRebalance => {
-            trackers(io, new.dbuf.joined)?;
+            trackers(io, ratio, new.dbuf.joined)?;
             dboxes(io, new)?;
         }
         Step::OffPipes => {
@@ -499,9 +550,9 @@ fn execute(
                 }
             }
         }
-        Step::DbufPost => slices(io, new.dbuf.enabled_slices, new.dbuf.joined)?,
+        Step::DbufPost => slices(io, ratio, new.dbuf.enabled_slices, new.dbuf.joined)?,
         Step::PmDemandPost => {
-            pmdemand::program(io, &new.pmdemand, None)?;
+            pmdemand::program_for(io, layout, &new.pmdemand, None)?;
         }
     }
     Ok(())
@@ -519,11 +570,17 @@ fn undo(
     snap: &Snapshot,
     done: &[Step],
 ) -> Result<(), ResourceError> {
+    let layout = pmdemand::Layout::for_ip(old.ip);
+    let ratio = if new.cdclk.cdclk_khz > old.cdclk.cdclk_khz {
+        new
+    } else {
+        old
+    };
     // A failed post-plane request may have lowered PM demand to `new`
     // before undo raises the clock or DBUF back to `old`: re-raise
     // max(old, new) first, as the forward pre-plane request did.
     if done.contains(&Step::PmDemandPost) {
-        pmdemand::program(io, &new.pmdemand, Some(&snap.pmdemand))?;
+        pmdemand::program_for(io, layout, &new.pmdemand, Some(&snap.pmdemand))?;
     }
     let mut i = done.len();
     while i > 0 {
@@ -561,25 +618,40 @@ fn undo(
             }
             Step::PmDemandPre | Step::PmDemandPost => {}
             Step::CdclkPre | Step::CdclkPost => {
-                let now = cdclk::Current::read(io)?;
-                cdclk::program(io, &now, old.cdclk)?;
-                if cdclk::Current::read(io)?.ctl != snap.cdclk.ctl {
-                    checked(io, cdclk::CDCLK_CTL, snap.cdclk.ctl)?;
+                if old.ip.xe2_plus() {
+                    let now = cdclk::Current::read_ip(io, old.ip)?;
+                    let lowering = snap.cdclk.actual_khz < now.actual_khz;
+                    if lowering {
+                        crate::intel_gpu_xelpg_resources::restore_ratio(io, snap)?;
+                    }
+                    cdclk::restore_ip(io, old.ip, &snap.cdclk)?;
+                    if !lowering {
+                        crate::intel_gpu_xelpg_resources::restore_ratio(io, snap)?;
+                    }
+                } else {
+                    cdclk::restore(io, &snap.cdclk)?;
                 }
             }
-            Step::DbufPre => slices(io, old.dbuf.enabled_slices, old.dbuf.joined)?,
+            Step::DbufPre => slices(io, ratio, old.dbuf.enabled_slices, old.dbuf.joined)?,
             Step::DbufPost => slices(
                 io,
+                ratio,
                 old.dbuf.enabled_slices | new.dbuf.enabled_slices,
                 new.dbuf.joined,
             )?,
             Step::MbusJoin { select } => {
                 // Reverse of a join: the unjoin protocol back to `old`.
-                trackers(io, false)?;
+                trackers(io, ratio, false)?;
                 for (pipe, v) in snap.dbox.iter().enumerate() {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
-                checked(io, dbuf::MBUS_CTL, snap.mbus_ctl)?;
+                let keep = if old.ip.xe2_plus() {
+                    crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
+                } else {
+                    0
+                };
+                let value = (snap.mbus_ctl & !keep) | (read(io, dbuf::MBUS_CTL)? & keep);
+                checked(io, dbuf::MBUS_CTL, value)?;
                 if let Some(pipe) = select {
                     wait_frame(io, pipe)?;
                 }
@@ -589,10 +661,10 @@ fn undo(
                 for (pipe, v) in snap.dbox.iter().enumerate() {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
-                trackers(io, true)?;
+                trackers(io, ratio, true)?;
             }
             Step::MbusRebalance => {
-                trackers(io, old.dbuf.joined)?;
+                trackers(io, ratio, old.dbuf.joined)?;
                 for (pipe, v) in snap.dbox.iter().enumerate() {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
@@ -618,7 +690,7 @@ fn undo(
         }
     }
     if done.contains(&Step::PmDemandPre) {
-        pmdemand::program(io, &snap.pmdemand, None)?;
+        pmdemand::program_for(io, layout, &snap.pmdemand, None)?;
     }
     Ok(())
 }
@@ -635,13 +707,21 @@ pub(crate) fn commit_live(
     let steps = plan(old, new, live)?;
     check_pipes(io, live)?;
     // The programmed state must be what the hardware holds now.
-    let clock = cdclk::Current::read(io)?;
+    let clock = cdclk::Current::read_ip(io, old.ip)?;
     match clock.known {
         None => return Err(ResourceError::RequiresPipesOff),
         Some(rung) if rung != old.cdclk => return Err(ResourceError::Diverged),
         Some(_) => {}
     }
-    if read(io, dbuf::MBUS_CTL)? & ((1 << 31) | (1 << 30)) != old.dbuf.mbus_ctl() & (3 << 30) {
+    let mbus = read(io, dbuf::MBUS_CTL)?;
+    let ratio_mask = if old.ip.xe2_plus() {
+        crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
+    } else {
+        0
+    };
+    if mbus & ((1 << 31) | (1 << 30)) != old.dbuf.mbus_ctl() & (3 << 30)
+        || mbus & ratio_mask != old.mbus_ctl_select(None) & ratio_mask
+    {
         return Err(ResourceError::Diverged);
     }
     for pipe in 0..PIPES {

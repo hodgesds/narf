@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.77** (v0.76 plus the source ADL-N display-13 USB-C DP route;
+> Status: **v0.78** (v0.77 plus the source-qualified Lunar Lake display-20
+> TC1–TC4 USB-C DP route, PICA/TCSS ownership and display-IP-aware external
+> resource transactions; the source ADL-N display-13 USB-C DP route;
 > BMG's source Xe2 five-level PPGTT profile;
 > typed GuC 70 log-stream admission for LNL,
 > PTL, WCL and NVL-S; the source Tiger Lake TC6 / DDI-I USB-C DP route;
@@ -1765,6 +1767,10 @@ trusted.
   Type-C, their HDMI DDC pins and the SSC preference come from the
   board VBT (`intel_gpu_vbt`, §20 "VBT parser") when the OpRegion
   carries one.
+- Lunar Lake reuses that service only for source-qualified TC1–TC4 USB-C
+  DP. It uses PICA power, display-20 TCSS pin assignment, D2D in
+  `DDI_BUF_CTL`, and display-20 live resource transactions. Combo DDI B,
+  HDMI and Panther Lake external pipes remain refused.
 - Pipe A's DMC is reported dark after this lane's crtc disable and lit
   before its port PLL (`intel_dmc_disable_pipe` / `intel_dmc_enable_pipe`
   call sites); a successful owned modeset records its panel mode
@@ -1982,8 +1988,9 @@ display-14 program windows, so the display-14 window checks apply unchanged.
 
 Refused or not wired on display 20: PSR1 (above), PSR2 and panel replay,
 FBC, compressed primaries, panning of a tiled primary, XR30, system suspend
-and relight, external outputs (Type-C/PICA, TCSS pin assignment and HDMI),
-multi-pipe layouts, the VBT and backlight PWM. The route's probe-time
+and relight, combo DDI B, HDMI and backlight PWM. TC1–TC4 USB-C DP,
+PICA/TCSS ownership, external multi-pipe layouts and the VBT port policy are
+wired. The route's probe-time
 modeset window (`probe_window`: panel power sequencing, the takeover and the
 PPS backlight gate) applies Wa_15015404425 like the KMS owner and the DC
 service; only the read-only route decision ahead of it does not. Panther
@@ -7570,14 +7577,15 @@ register/sideband fixtures. Test and build results are recorded in STATUS.md.
   objects), automatic exec re-migration of `preferred_vram()` BOs, and
   system-suspend drain (`allow_scanout = true`) are active across DG2 and
   Battlemage.
-- **Integrated Display 20 / 30 (Lunar Lake & Panther Lake) Parity**:
+- **Integrated Display 20 (Lunar Lake) progress**:
   Display-20 PSR1 (`SRD_STATUS` SCL >= 1 precondition, entry setup frames,
   `Wa_18037818876`, `Wa_16025596647`), FBC on HDR planes (`Wa_18038517565`,
   skipping `Wa_22014263786`), DPT tiled panning via `DptLayout::with_origin`,
-  S3 `panel_off` / `panel_on` relight & `system_suspend_admitted` (for
-  display 20 and proved display 30), and PICA / Type-C external output +
-  HPD/HDMI/DP routing (`MtlExternalService` across Meteor Lake, Lunar Lake,
-  and Panther Lake) are wired into the shared KMS/external paths.
+  S3 `panel_off` / `panel_on` relight and `system_suspend_admitted`, and
+  PICA / Type-C TC1–TC4 DP output and HPD routing are wired into the shared
+  KMS/external paths. Lunar Lake combo DDI B and HDMI remain refused;
+  Panther Lake display-30 external routing remains refused until its
+  mandatory always-on VRR timing-generator path is implemented.
 - **Discrete Arc Display Bring-Up (`DG2` Display 13 & `BMG` `Xe2_HPD` 14.01)**:
   `DiscreteDisplayIp::{Dg2, Xe2Hpd}` identifies discrete display engines on
   `Alchemist` and `Battlemage` (`GMD_ID_DISPLAY` 14.01), seeding DRM mode

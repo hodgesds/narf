@@ -1777,10 +1777,11 @@ pub enum VbtInstall {
 }
 
 /// Probe-time discovery and installation (`intel_bios_init`'s place in
-/// probe): Meteor Lake gets [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`]
-/// (ports, legacy Type-C, DDC pins, SSC) or `NO_VBT`, and the Pipe-A eDP
-/// PSR facts ([`crate::intel_gpu_psr::VbtPsr`]); Gen12 gets its HDMI
-/// DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
+/// probe): Meteor and Lunar Lake get
+/// [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`] (ports,
+/// legacy Type-C, DDC pins, SSC) or `NO_VBT`; Meteor Lake also gets the
+/// Pipe-A eDP PSR facts ([`crate::intel_gpu_psr::VbtPsr`]); Gen12 gets its
+/// HDMI DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
 pub fn install_for_probe(
     generation: crate::intel_gpu::Generation,
     gen12: Option<crate::intel_gpu_gt::Gen12Platform>,
@@ -1789,7 +1790,7 @@ pub fn install_for_probe(
     use crate::intel_gpu::Generation;
     use crate::intel_gpu_xelpg_external::{install_mtl_port_policy, MtlPortPolicy};
     let applicable = match generation {
-        Generation::MeteorLake => true,
+        Generation::MeteorLake | Generation::LunarLake => true,
         Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
         _ => false,
     };
@@ -1830,10 +1831,12 @@ pub fn install_for_probe(
         );
     }
     let ok = match (generation, &found) {
-        (Generation::MeteorLake, Some((vbt, _))) => {
+        (Generation::MeteorLake | Generation::LunarLake, Some((vbt, _))) => {
             install_mtl_port_policy(MtlPortPolicy::from_vbt(vbt))
         }
-        (Generation::MeteorLake, None) => install_mtl_port_policy(MtlPortPolicy::NO_VBT),
+        (Generation::MeteorLake | Generation::LunarLake, None) => {
+            install_mtl_port_policy(MtlPortPolicy::NO_VBT)
+        }
         (_, Some((vbt, _))) => match gen12 {
             Some(family) => {
                 install_gen12_ddc(Gen12DdcOverrides::from_vbt(vbt, family));

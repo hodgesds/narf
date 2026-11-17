@@ -54,8 +54,8 @@ pub const fn tcss_ddi_status(tc: u8) -> u64 {
 }
 /// `TCSS_DDI_STATUS_READY`.
 pub const TCSS_DDI_STATUS_READY: u32 = 1 << 2;
-/// `TCSS_DDI_STATUS_PIN_ASSIGNMENT_MASK` (`GENMASK(23, 20)` on Display >= 20).
-pub const TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT: u32 = 20;
+/// `TCSS_DDI_STATUS_PIN_ASSIGNMENT_MASK` (`GENMASK(28, 25)` on Display >= 20).
+pub const TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT: u32 = 25;
 /// `_FIA(fia)` for the modular-FIA instance housing `tc`
 /// (`tc_phy_load_fia_params(tc, true)`: FIA = tc / 2).
 pub const fn fia_base(tc: u8) -> u64 {
@@ -275,7 +275,7 @@ pub fn pin_assignment<M: MmioWindow + ?Sized>(io: &M, tc: u8) -> Result<u8, TcEr
 }
 
 /// `get_pin_assignment` for `display20`: Display >= 20 (`Xe2_LPD` / `Xe3_LPD`)
-/// reads the pin assignment from `TCSS_DDI_STATUS(tc)` bits 23:20 rather
+/// reads the pin assignment from `TCSS_DDI_STATUS(tc)` bits 28:25 rather
 /// than FIA `PORT_TX_DFLEXPA1`.
 pub fn pin_assignment_for<M: MmioWindow + ?Sized>(
     io: &M,

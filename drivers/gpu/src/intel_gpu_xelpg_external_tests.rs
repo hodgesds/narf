@@ -17,7 +17,7 @@ use crate::intel_gpu_xelpg_hpd::{
 };
 use crate::intel_gpu_xelpg_tc::{
     pin_assignment_shift, port_tx_dflexpa1, tcss_ddi_status, PIN_ASSIGNMENT_C,
-    TCSS_DDI_STATUS_READY,
+    TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT, TCSS_DDI_STATUS_READY,
 };
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -306,6 +306,7 @@ fn surflive_pipe(off: u64) -> Option<usize> {
 pub struct ExtFake {
     pub phy: FakePhy,
     pub port: XeLpgPort,
+    display_ip: Cell<DisplayIp>,
     pub access: Cell<bool>,
     pub pica_isr: Cell<u32>,
     pub sde_isr: Cell<u32>,
@@ -356,6 +357,7 @@ impl ExtFake {
         Self {
             phy,
             port,
+            display_ip: Cell::new(DisplayIp::Xelpdp),
             access: Cell::new(true),
             pica_isr: Cell::new(pica),
             sde_isr: Cell::new(sde),
@@ -403,11 +405,18 @@ impl ExtFake {
     /// primary on. The write log is cleared; the panel mode is returned
     /// (`None` if the fixture could not commit it).
     pub fn light_panel(&self) -> Option<Mode> {
+        self.light_panel_ip(DisplayIp::Xelpdp)
+    }
+
+    /// Light the owned panel with `ip`'s resource state.
+    fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
         let mode = Mode::VESA_1024X768_60;
-        self.phy.write32(0x5_10A0, 14 << 22);
+        self.display_ip.set(ip);
+        self.phy.write32(0x5_10A0, u32::from(ip.ver()) << 22);
         self.phy.write32(0x4_5004, 1 << 3);
         let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
-        let state = crate::intel_gpu_xelpg_resources::compute(
+        let state = crate::intel_gpu_xelpg_resources::compute_ip(
+            ip,
             &crate::intel_gpu_display_resources::request(
                 &mode,
                 crate::intel_gpu_xelpg_wm::Tiling::Linear,
@@ -499,6 +508,24 @@ impl MmioWindow for ExtFake {
             let s = self.phy.read32(off);
             return s | ((s & 0xAAAA_AAAA) >> 1);
         }
+        if off == crate::intel_gpu_xe2lpd::PICA_PW_CTL {
+            let value = self.phy.read32(off);
+            return (value & !crate::intel_gpu_xe2lpd::PICA_POWER_STATUS)
+                | if value & crate::intel_gpu_xe2lpd::PICA_POWER_REQUEST != 0 {
+                    crate::intel_gpu_xe2lpd::PICA_POWER_STATUS
+                } else {
+                    0
+                };
+        }
+        if off == self.port.ddi_buf_ctl() && self.display_ip.get().xe2_plus() {
+            let value = self.phy.read32(off);
+            return (value & !crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_STATE)
+                | if value & crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE != 0 {
+                    crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_STATE
+                } else {
+                    0
+                };
+        }
         if off == CDCLK_PLL {
             // LOCK follows ENABLE; FREQ_REQ_ACK follows FREQ_REQ (crawl).
             let mut s = self.cdclk_pll.get();
@@ -552,6 +579,7 @@ impl MmioWindow for ExtFake {
                 let requested = self.phy.read32(self.port.buf_ctl1()) & TCSS_POWER_REQUEST != 0;
                 return if requested && self.ready.get() {
                     TCSS_DDI_STATUS_READY
+                        | (u32::from(self.pin.get()) << TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT)
                 } else {
                     0
                 };
@@ -776,6 +804,77 @@ kernel_test_in!(
     smoke_mtl_external_tc_dp_alt_full_route
 );
 
+fn smoke_lnl_external_tc_dp_alt_uses_display20_d2d() -> TestResult {
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel_ip(DisplayIp::Xe2Lpd) else {
+        return TestResult::Fail("the fixture must light the display-20 panel");
+    };
+    let probe = match probe_sink(&io, Generation::LunarLake, XeLpgPort::Tc1, false) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("LNL TC1 probe must own PICA/TCSS/AUX"),
+    };
+    if probe.display_version() != 20 || probe.tc.is_none_or(|tc| !tc.display20) {
+        return TestResult::Fail("the sink probe must retain the display-20 layout");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    let mut route = match activate(&io, probe, fb, &display) {
+        Ok(route) => route,
+        Err(_) => return TestResult::Fail("LNL USB-C DP must activate beside Pipe A"),
+    };
+    let ddi = io.read32(XeLpgPort::Tc1.ddi_buf_ctl());
+    if ddi
+        & (DDI_BUF_CTL_ENABLE
+            | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+            | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_STATE)
+        != DDI_BUF_CTL_ENABLE
+            | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+            | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_STATE
+        || io.read32(XeLpgPort::Tc1.buf_ctl1()) & crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE
+            != 0
+    {
+        return TestResult::Fail("display 20 must keep D2D in DDI_BUF_CTL only");
+    }
+    if io
+        .writes_to(XeLpgPort::Tc1.ddi_buf_ctl())
+        .iter()
+        .all(|value| value & crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE == 0)
+    {
+        return TestResult::Fail("the full DDI enable must preserve the D2D request");
+    }
+    // Display 20 has no PLANE_CHICKEN_DISABLE_DPT and does not set the
+    // display-14 FEC jitter workaround in CHICKEN_TRANS.
+    for plane in 0..4u64 {
+        if !io
+            .writes_to(Pipe::B.base() + 0x180 + plane * 0x100 + 0xec)
+            .is_empty()
+        {
+            return TestResult::Fail("display 20 must not write the no-DPT chicken");
+        }
+    }
+    if io.read32(Pipe::B.transcoder().base() + 0x4e0) & crate::intel_gpu_xe2lpd::DP_FEC_BS_JITTER_WA
+        != 0
+    {
+        return TestResult::Fail("display 20 must leave the display-14 FEC WA clear");
+    }
+    if route.stop(&io).is_err()
+        || route.release(&io).is_err()
+        || io.read32(crate::intel_gpu_xe2lpd::PICA_PW_CTL)
+            & crate::intel_gpu_xe2lpd::PICA_POWER_REQUEST
+            != 0
+    {
+        return TestResult::Fail("LNL stop must drop D2D and release PICA ownership");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_lnl_external_tc_dp_alt_uses_display20_d2d
+);
+
 fn smoke_mtl_external_ddi_b_route_stop_and_release() -> TestResult {
     let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1024()));
     let mut route = match live_route(&io, XeLpgPort::B) {
@@ -935,7 +1034,11 @@ kernel_test_in!(
 fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     if probe_sink(&NoAccess, Generation::TigerLake, XeLpgPort::Tc1, false).err()
         != Some(ExternalError::UnsupportedGeneration)
+        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::Tc1, false).err()
+            != Some(ExternalError::UnsupportedGeneration)
         || probe_sink(&NoAccess, Generation::MeteorLake, XeLpgPort::A, false).err()
+            != Some(ExternalError::UnsupportedPort)
+        || probe_sink(&NoAccess, Generation::LunarLake, XeLpgPort::B, false).err()
             != Some(ExternalError::UnsupportedPort)
     {
         return TestResult::Fail("generation/port refusals must precede MMIO");
@@ -2137,12 +2240,11 @@ fn smoke_mtl_no_vbt_install_keeps_missing_defaults() -> TestResult {
     {
         return TestResult::Fail("Gen12 without a VBT keeps the default DDC pins");
     }
-    if install_for_probe(Generation::LunarLake, None, Some(0x1234_5000))
-        != VbtInstall::NotApplicable
+    if install_for_probe(Generation::LunarLake, None, None) != VbtInstall::Missing
         || install_for_probe(Generation::TigerLake, None, Some(0x1234_5000))
             != VbtInstall::NotApplicable
     {
-        return TestResult::Fail("generations without a consumer must not read the OpRegion");
+        return TestResult::Fail("LNL uses the port policy; consumer-less routes read nothing");
     }
     TestResult::Pass
 }

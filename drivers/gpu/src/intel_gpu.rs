@@ -3034,8 +3034,13 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         })
     };
-    let outcome =
-        crate::intel_gpu_xelpg_external::handle_mtl_event(io, event, display, &mut alloc_fb);
+    let outcome = crate::intel_gpu_xelpg_external::handle_mtl_event_for(
+        io,
+        generation,
+        event,
+        display,
+        &mut alloc_fb,
+    );
     after_event();
     if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
         let phys = (*MTL_SCANOUT.lock())

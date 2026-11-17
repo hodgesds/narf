@@ -469,7 +469,9 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
             }
             if off == tcss_ddi_status(self.inner.tc()) {
                 let base = self.inner.read32(off);
-                return base | ((u32::from(self.tcss_pin.get()) & 0xF) << 20);
+                return base
+                    | ((u32::from(self.tcss_pin.get()) & 0xF)
+                        << TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT);
             }
             self.inner.read32(off)
         }
