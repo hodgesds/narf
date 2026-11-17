@@ -74,8 +74,10 @@ using a laptop touchpad in Windows-compliant multi-touch mode.
 - `descriptor::parse(blob) -> ReportDescriptor` — walks a report
   descriptor's Main / Global / Local item state machine, returns
   the ordered Field list, top-level Application Collection
-  identifiers, and a flag indicating whether any `Report ID` global
-  item appeared.
+  identifiers, every Usage pending at each Collection open
+  (`collections` — the set Linux's `hid_scan_report()` inspects
+  for device-group assignment, issue #1718), and a flag
+  indicating whether any `Report ID` global item appeared.
 - `report::extract(field, body) -> Vec<i32>` — runtime report value
   decoder. Accepts the body *after* the optional report-id byte;
   applies sign-extension iff `logical_min < 0`.

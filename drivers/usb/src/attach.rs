@@ -1107,10 +1107,12 @@ async fn dispatch_after_address(
         }
         // USB-HID RMI4 / Elan touchpad — Synaptics / Elan silicon
         // that speaks the vendor RMI4-over-HID / Elan HID protocols
-        // instead of PTP (issue #1681). VID/PID-classified; runs
-        // after PTP so a PTP-shaped device keeps its PTP bind, and
-        // a failed vendor probe falls back to generic HID inside
-        // the binder, so the device is never dropped here.
+        // instead of PTP (issue #1681). VID/PID-classified, plus
+        // the HID_GROUP_RMI group route for Synaptics VIDs with
+        // no table row (issue #1718); runs after PTP so a PTP-shaped
+        // device keeps its PTP bind, and a failed vendor probe falls
+        // back to generic HID inside the binder, so the device is
+        // never dropped here.
         if let Ok(outcome) = hid::rmi_elan::try_bind_rmi_elan_already_addressed(
             xhci_dev,
             slot_id,

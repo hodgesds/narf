@@ -75,11 +75,16 @@
 //!
 //! ## Remainders (filed as issues, not guessed)
 //!
-//! - The Linux `HID_GROUP_RMI` catch-all ("any HID device on the
-//!   RMI bus group") is not implemented: the group-assignment rule
-//!   could not be verified in-session, so only the explicit
-//!   VID/PID tables match. Group-route devices fall through to the
-//!   PTP / generic binders below, never dropped.
+//! - The Linux `HID_GROUP_RMI` catch-all (issue #1718) is
+//!   implemented by [`classify_group`]: a Synaptics VID with no
+//!   table row still binds as RMI when its report descriptor
+//!   carries a Generic Desktop Pointer collection and a
+//!   vendor-page (≥ 0xFF00) collection, per Linux
+//!   `hid_scan_report()` — unless a Digitizer Contact ID input
+//!   assigns it to MULTITOUCH (PTP owns it then). Group-route
+//!   devices fall through to the PTP / generic binders below
+//!   only when the descriptor lacks the group signals, never
+//!   dropped.
 //! - F$12 multi-source ATTN reads fetch the object count decoded
 //!   at probe time from the F$12 Data-1 register descriptor
 //!   ([`RmiProbe::f12_max_objects`], issue #1719), falling back
@@ -99,7 +104,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use narf_hid::descriptor::{FieldKind, ReportDescriptor};
+use narf_hid::descriptor::{FieldFlags, FieldKind, ReportDescriptor};
+use narf_hid::usage::{digitizer, generic_desktop};
 use narf_input::rmi4::{PdtEntry, TouchpadReport};
 use narf_input::{
     abs,
@@ -195,6 +201,92 @@ pub fn classify(vendor: u16, product: u16) -> Option<VendorKind> {
         }
     }
     None
+}
+
+/// Vendor usage-page floor (Linux `HID_UP_MSVENDOR`,
+/// `include/linux/hid.h:305`: `0xff000000`, i.e. page `≥ 0xFF00`).
+/// Linux's descriptor scan sets `HID_SCAN_FLAG_VENDOR_SPECIFIC`
+/// when a Collection opens with the Usage Page in force at or
+/// above this floor.
+pub const HID_VENDOR_USAGE_PAGE_FLOOR: u16 = 0xFF00;
+
+/// Group-route classification (issue #1718): the Linux
+/// `HID_GROUP_RMI` catch-all, `drivers/hid/hid-rmi.c:1447`
+/// (`{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_RMI, HID_ANY_ID,
+/// HID_ANY_ID) }` — any VID/PID in group RMI binds `hid-rmi`).
+///
+/// Linux assigns the group in `hid_scan_report()`
+/// (`drivers/hid/hid-core.c:1691-1814`, torvalds/linux master):
+/// the group starts at `HID_GROUP_GENERIC`; a Digitizer Contact ID
+/// usage on a non-constant Input item (`HID_DG_CONTACTID`,
+/// `include/linux/hid.h:581`) moves it to
+/// `HID_GROUP_MULTITOUCH` (`hid_scan_input_usage`,
+/// `hid-core.c:1525-1536`); then, for a Synaptics VID
+/// (`USB_VENDOR_ID_SYNAPTICS`, 0x06CB) whose group is still
+/// Generic, the group becomes `HID_GROUP_RMI` iff the scan saw
+/// BOTH `HID_SCAN_FLAG_GD_POINTER` — a Collection opened with a
+/// Generic Desktop Pointer usage (`HID_GD_POINTER`,
+/// `include/linux/hid.h:327`) — and `HID_SCAN_FLAG_VENDOR_SPECIFIC`
+/// — a Collection opened on a vendor usage page (≥ 0xFF00)
+/// (`hid_scan_collection`, `hid-core.c:1559-1612`).
+///
+/// Returns `Some(VendorKind::Rmi)` with no quirks (the catch-all
+/// row carries no `driver_data`) iff `vendor` is Synaptics and the
+/// parsed descriptor carries both signals without a Contact ID
+/// input. A Contact ID means Linux assigned MULTITOUCH, and the
+/// PTP binder — which runs before this one — owns the device, so
+/// this returns `None` for it. Returns `None` for anything else;
+/// the caller then falls through to the next binder.
+/// Table-matched devices never reach this path — [`classify`]
+/// claims them first.
+///
+/// Fidelity notes (deliberate, documented):
+/// - Linux keys `VENDOR_SPECIFIC` on the *global* Usage Page in
+///   force at Collection-open, while NARF keys it on each
+///   collection usage's own page (see
+///   [`ReportDescriptor::collections`]). The two agree whenever
+///   usages use the short form — the page in force — which covers
+///   every shipping RMI descriptor; they can differ only for
+///   4-byte extended-form usages.
+/// - Linux also assigns `HID_GROUP_SENSOR_HUB` when a Sensor-page
+///   (0x20) Physical/Application Collection opens, which would
+///   equally block the RMI assignment; that case is not mirrored
+///   here (it needs collection *kinds*, which the parser does not
+///   record, and no Synaptics touchpad descriptor carries a
+///   sensor collection). A device that hits it would fail the
+///   vendor PDT probe and fall back to generic HID, never be
+///   dropped.
+pub fn classify_group(vendor: u16, desc: &ReportDescriptor) -> Option<VendorKind> {
+    if vendor != rmi::USB_VENDOR_ID_SYNAPTICS {
+        return None;
+    }
+    // Contact ID on a non-constant Input field → MULTITOUCH, not
+    // RMI (Linux `hid_scan_input_usage`).
+    let has_contact_id = desc.fields.iter().any(|f| {
+        f.kind == FieldKind::Input
+            && !f.flags.contains(FieldFlags::CONSTANT)
+            && f.usages
+                .iter()
+                .any(|&(p, u)| p == digitizer::PAGE && u == digitizer::CONTACT_ID)
+    });
+    if has_contact_id {
+        return None;
+    }
+    let has_gd_pointer = desc
+        .collections
+        .iter()
+        .any(|&(p, u)| p == generic_desktop::PAGE && u == generic_desktop::POINTER);
+    let has_vendor_collection = desc
+        .collections
+        .iter()
+        .any(|&(p, _)| p >= HID_VENDOR_USAGE_PAGE_FLOOR);
+    if has_gd_pointer && has_vendor_collection {
+        Some(VendorKind::Rmi {
+            quirks: DeviceQuirks::empty(),
+        })
+    } else {
+        None
+    }
 }
 
 // ── Config-blob endpoint finder ──────────────────────────────────────
@@ -1258,7 +1350,8 @@ fn elan_caps(params: &ElanDeviceParams, has_led: bool) -> DeviceCaps {
 /// arm interrupt-IN → vendor probe → evdev register.
 ///
 /// Returns `Err(HidError::NotBootKeyboard)` when the VID/PID is
-/// not in either vendor table, when no HID interface qualifies,
+/// not in either vendor table and the descriptor carries no
+/// `HID_GROUP_RMI` group signals, when no HID interface qualifies,
 /// or when the vendor probe fails — the attach dispatcher treats
 /// any error as "try the next binder". A probe failure is NOT
 /// returned to the dispatcher directly: this function falls back
@@ -1275,10 +1368,20 @@ pub async fn try_bind_rmi_elan_already_addressed(
     cfg: &[u8],
     topo: BindTopology,
 ) -> Result<AttachOutcome, HidError> {
-    let kind = classify(vendor, product).ok_or(HidError::NotBootKeyboard)?;
-    let prefer = match kind {
-        VendorKind::Elan { .. } => Some(ELAN_TP_USB_INTF),
-        VendorKind::Rmi { .. } => None,
+    // Table match first. A Synaptics device with no table row can
+    // still be RMI via the HID_GROUP_RMI group route (issue
+    // #1718), decided from the report descriptor fetched below —
+    // so only Synaptics VIDs proceed past this point without a
+    // table hit. Any other vendor cannot be group-routed (Linux
+    // assigns HID_GROUP_RMI to Synaptics VIDs only), so fail fast
+    // exactly as before, with no extra GET_DESCRIPTOR round trip.
+    let table_kind = classify(vendor, product);
+    if table_kind.is_none() && vendor != rmi::USB_VENDOR_ID_SYNAPTICS {
+        return Err(HidError::NotBootKeyboard);
+    }
+    let prefer = match table_kind {
+        Some(VendorKind::Elan { .. }) => Some(ELAN_TP_USB_INTF),
+        _ => None,
     };
     let eps = find_rmi_elan_interface(cfg, prefer).ok_or(HidError::NoInterruptIn)?;
     let report_len =
@@ -1299,6 +1402,15 @@ pub async fn try_bind_rmi_elan_already_addressed(
         .await
         .map_err(HidError::Xhci)?;
     let parsed = narf_hid::descriptor::parse(&blob).map_err(|_| HidError::NoInterruptIn)?;
+
+    // Group route: a table miss on a Synaptics VID is decided by
+    // the descriptor, here — before any endpoint configuration —
+    // so a non-RMI Synaptics device falls through to the next
+    // binder untouched.
+    let kind = match table_kind {
+        Some(kind) => kind,
+        None => classify_group(vendor, &parsed).ok_or(HidError::NotBootKeyboard)?,
+    };
 
     // Configure xHC-side endpoint contexts (IN + OUT when the
     // interface offers one).
@@ -2118,6 +2230,185 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/hid/rmi-elan", smoke_classify_rmi_elan_tables);
+
+    /// Synthetic report descriptor for a group-routed RMI device
+    /// (issue #1718): a Generic Desktop Pointer Application
+    /// Collection carrying a mouse-emulation report (ID 1), plus a
+    /// vendor-page (0xFF00) Application Collection carrying the
+    /// RMI reports — ATTN Input (ID 0x0C), write Output (ID 0x09),
+    /// set-mode Feature (ID 0x0F). Modelled on the shape of a real
+    /// Synaptics RMI descriptor; the VID/PID used with it
+    /// (0x06CB/0x9999) is in neither vendor table.
+    fn group_rmi_descriptor() -> &'static [u8] {
+        &[
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x01, // Usage (Pointer)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x01, //   Report ID (1)
+            0x09, 0x02, //   Usage (Mouse)
+            0x05, 0x09, //   Usage Page (Button)
+            0x19, 0x01, //   Usage Minimum (1)
+            0x29, 0x03, //   Usage Maximum (3)
+            0x15, 0x00, //   Logical Minimum (0)
+            0x25, 0x01, //   Logical Maximum (1)
+            0x75, 0x01, //   Report Size (1)
+            0x95, 0x03, //   Report Count (3)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0x75, 0x05, //   Report Size (5)
+            0x95, 0x01, //   Report Count (1)
+            0x81, 0x01, //   Input (Constant) — padding
+            0x05, 0x01, //   Usage Page (Generic Desktop)
+            0x09, 0x30, //   Usage (X)
+            0x09, 0x31, //   Usage (Y)
+            0x15, 0x81, //   Logical Minimum (-127)
+            0x25, 0x7F, //   Logical Maximum (127)
+            0x75, 0x08, //   Report Size (8)
+            0x95, 0x02, //   Report Count (2)
+            0x81, 0x06, //   Input (Data, Variable, Relative)
+            0xC0, // End Collection
+            0x06, 0x00, 0xFF, // Usage Page (Vendor 0xFF00)
+            0x09, 0x01, // Usage (0x01)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x0C, //   Report ID (12) — RMI ATTN
+            0x75, 0x08, //   Report Size (8)
+            0x95, 0x20, //   Report Count (32)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0x85, 0x09, //   Report ID (9) — RMI write
+            0x95, 0x13, //   Report Count (19)
+            0x91, 0x02, //   Output (Data, Variable, Absolute)
+            0x85, 0x0F, //   Report ID (15) — RMI set-mode
+            0x95, 0x02, //   Report Count (2)
+            0xB1, 0x02, //   Feature (Data, Variable, Absolute)
+            0xC0, // End Collection
+        ]
+    }
+
+    fn smoke_classify_group_rmi_catchall() -> TestResult {
+        use narf_hid::descriptor::parse;
+        use narf_input_driver::hid_rmi::USB_VENDOR_ID_SYNAPTICS;
+
+        // A VID/PID in neither table: the fixture PID 0x9999 is
+        // not the Acer Switch 5 (0x81A7) or any other table row.
+        const GROUP_PID: u16 = 0x9999;
+        if classify(USB_VENDOR_ID_SYNAPTICS, GROUP_PID).is_some() {
+            return TestResult::Fail("fixture VID/PID must miss both vendor tables");
+        }
+        let parsed = match parse(group_rmi_descriptor()) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("group fixture descriptor must parse"),
+        };
+        // The group route claims it as RMI with no quirks — the
+        // Linux catch-all row carries no driver_data.
+        match classify_group(USB_VENDOR_ID_SYNAPTICS, &parsed) {
+            Some(VendorKind::Rmi { quirks }) => {
+                if quirks != DeviceQuirks::empty() {
+                    return TestResult::Fail("group-routed RMI must carry no quirks");
+                }
+            }
+            _ => return TestResult::Fail("group-routed device must classify as RMI"),
+        }
+        // The group is Synaptics-only: the same descriptor on
+        // another vendor's VID must not route to RMI.
+        if classify_group(0x046D, &parsed).is_some() {
+            return TestResult::Fail("group route must not claim a non-Synaptics VID");
+        }
+        // Without the vendor collection, the Pointer collection
+        // alone is just a mouse — no group route. (First 49 bytes
+        // of the group fixture: the Pointer Application Collection
+        // only.)
+        let pointer_only: &[u8] = &[
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x01, // Usage (Pointer)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x01, //   Report ID (1)
+            0x09, 0x02, //   Usage (Mouse)
+            0x05, 0x09, //   Usage Page (Button)
+            0x19, 0x01, //   Usage Minimum (1)
+            0x29, 0x03, //   Usage Maximum (3)
+            0x15, 0x00, //   Logical Minimum (0)
+            0x25, 0x01, //   Logical Maximum (1)
+            0x75, 0x01, //   Report Size (1)
+            0x95, 0x03, //   Report Count (3)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0x75, 0x05, //   Report Size (5)
+            0x95, 0x01, //   Report Count (1)
+            0x81, 0x01, //   Input (Constant) — padding
+            0x05, 0x01, //   Usage Page (Generic Desktop)
+            0x09, 0x30, //   Usage (X)
+            0x09, 0x31, //   Usage (Y)
+            0x15, 0x81, //   Logical Minimum (-127)
+            0x25, 0x7F, //   Logical Maximum (127)
+            0x75, 0x08, //   Report Size (8)
+            0x95, 0x02, //   Report Count (2)
+            0x81, 0x06, //   Input (Data, Variable, Relative)
+            0xC0, // End Collection
+        ];
+        let pointer_only = match parse(pointer_only) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("pointer-only fixture must parse"),
+        };
+        if classify_group(USB_VENDOR_ID_SYNAPTICS, &pointer_only).is_some() {
+            return TestResult::Fail(
+                "Pointer collection without a vendor collection must not route",
+            );
+        }
+        // Without the Pointer collection, the vendor collection
+        // alone is not an RMI device either. (Last 28 bytes of the
+        // group fixture: the vendor-page Application Collection
+        // only.)
+        let vendor_only: &[u8] = &[
+            0x06, 0x00, 0xFF, // Usage Page (Vendor 0xFF00)
+            0x09, 0x01, // Usage (0x01)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x0C, //   Report ID (12) — RMI ATTN
+            0x75, 0x08, //   Report Size (8)
+            0x95, 0x20, //   Report Count (32)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0x85, 0x09, //   Report ID (9) — RMI write
+            0x95, 0x13, //   Report Count (19)
+            0x91, 0x02, //   Output (Data, Variable, Absolute)
+            0x85, 0x0F, //   Report ID (15) — RMI set-mode
+            0x95, 0x02, //   Report Count (2)
+            0xB1, 0x02, //   Feature (Data, Variable, Absolute)
+            0xC0, // End Collection
+        ];
+        let vendor_only = match parse(vendor_only) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("vendor-only fixture must parse"),
+        };
+        if classify_group(USB_VENDOR_ID_SYNAPTICS, &vendor_only).is_some() {
+            return TestResult::Fail(
+                "vendor collection without a Pointer collection must not route",
+            );
+        }
+        // A Digitizer Contact ID input assigns MULTITOUCH in
+        // Linux, so the group route must refuse — the PTP binder
+        // owns such a device.
+        let mut multitouch: Vec<u8> = Vec::from(group_rmi_descriptor());
+        multitouch.extend_from_slice(&[
+            0x05, 0x0D, // Usage Page (Digitizer)
+            0x09, 0x05, // Usage (Touch Pad)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x02, //   Report ID (2)
+            0x09, 0x51, //   Usage (Contact ID)
+            0x75, 0x08, //   Report Size (8)
+            0x95, 0x01, //   Report Count (1)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0xC0, // End Collection
+        ]);
+        let multitouch = match parse(&multitouch) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("multitouch fixture must parse"),
+        };
+        if classify_group(USB_VENDOR_ID_SYNAPTICS, &multitouch).is_some() {
+            return TestResult::Fail("Contact ID input must exclude the RMI group route");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/hid/rmi-elan",
+        smoke_classify_group_rmi_catchall
+    );
 
     fn smoke_find_rmi_elan_interface() -> TestResult {
         // Config blob: iface 0 (HID, 1 IN ep) + iface 1 (HID, IN +

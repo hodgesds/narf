@@ -120,10 +120,12 @@ pub struct DeviceMatch {
 }
 
 /// The explicit device list (Linux `rmi_id[]:754-759`). The
-/// "any device in HID_GROUP_RMI" catch-all is NOT implemented
-/// (issue #1718): only this explicit table matches, and the
-/// USB-HID glue falls through to the PTP / generic binders for
-/// group-route devices.
+/// "any device in HID_GROUP_RMI" catch-all row (`hid-rmi.c:1447`)
+/// is implemented in the USB-HID glue
+/// (`drivers/usb/src/hid/rmi_elan.rs::classify_group`, issue
+/// #1718): a Synaptics VID with no row here still binds as RMI
+/// when its report descriptor carries the group signals. This
+/// table itself stays explicit-only.
 pub const RMI_DEVICE_TABLE: &[DeviceMatch] = &[
     DeviceMatch {
         vendor: USB_VENDOR_ID_RAZER,
