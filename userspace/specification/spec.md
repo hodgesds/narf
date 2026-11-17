@@ -1636,6 +1636,19 @@ Linux, privilege exclusion flags do not split software CPU/task clocks:
 same scheduled time. Hardware `exclude_kernel` and
 `exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
 P/U exclusions on allocation and preserve them across overflow rearming.
+Software CPU/task-clock sampling uses pinned hard hrtimers independently of
+PMU overflow support. Frequency requests convert once to nanoseconds
+(`1_000_000_000 / Hz`, with Linux's 10 microsecond minimum timer interval).
+Task timers stop off-CPU and retain each task's remaining interval across
+migration; inherited descendants have independent intervals. Per-CPU timers
+remain attached to the requested CPU. Timer callbacks capture the interrupted
+IP, privilege, CPU, registers and bounded resident user stack into the existing
+deferred sample queue; callbacks without an interrupted context never invent
+one. Privilege exclusions filter samples, while clock counts retain the
+scheduled-time semantics above. Disable and final close cancel timers before
+their stable storage is freed. `PERF_EVENT_IOC_PERIOD` updates a disabled
+software sampler (interpreting the value as Hz for frequency-mode events);
+updating a live sampler returns an error.
 Pinned task groups are scheduled atomically before flexible groups and are
 never multiplexed; failure to place the complete group enters Linux's
 observable error state, for which `read(2)` returns EOF. Only a group leader
@@ -1654,8 +1667,10 @@ interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
 hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
 the complete Linux-numbered user register file, up to 8 KiB of resident user
 stack, counter identity, and the overflow's exact period into a bounded
-64-entry per-CPU ring without allocation or user faults. Normal
-syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
+64-entry per-CPU ring without allocation or user faults. A dedicated task is
+woken through an IRQ-safe readiness cell; timer and PMI callbacks do not call
+the allocating global I/O-waiter wake hook. That task and normal syscall
+context drain those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
 If that IRQ ring is full, loss is aggregated by the event ID active on each
 overflowed physical counter, so later counter reuse cannot transfer loss to a
@@ -1680,9 +1695,9 @@ event's mapped ring while retaining loss accounting on the source event; the
 target must describe the same task and CPU context, and `-1` detaches it.
 `PERF_EVENT_IOC_REFRESH` is accepted only for non-inherited sampling events.
 Its argument adds real-overflow credits and enables the event; each hardware
-overflow consumes one credit, and consuming the last credit synchronously
-stops the PMU event and exposes `POLLHUP`. A later refresh clears the terminal
-readiness and adds a new budget. A zero argument retains Linux's effectively
+overflow or admitted timer sample consumes one credit, and consuming the last
+credit synchronously stops the event source and exposes `POLLHUP`. A later
+refresh clears the terminal readiness and adds a new budget. A zero argument retains Linux's effectively
 unlimited behavior.
 `PERF_SAMPLE_READ` appends the event's authoritative counter snapshot using
 the same standalone or group `read_format` layout as fd `read(2)`, including
@@ -1696,6 +1711,10 @@ start at the exact interrupted IP and walk validated, monotonically increasing
 x86 RBP or aarch64 X29 frames only within the captured stack. The register and
 stack payload also gives upstream perf the real input needed for offline DWARF
 and symbol unwind; mapping records name the corresponding ELF images.
+Sample headers identify user versus kernel context through `misc`, and their
+CPU field identifies the captured source CPU even when another CPU drains it.
+Sample and COMM/MMAP/FORK/EXIT records export Linux process/thread IDs;
+private scheduler TaskIds remain internal to event matching and memory lookup.
 `CODE_PAGE_SIZE` is resolved against the sampled
 task's registered address-space mapping and reports its real 4 KiB, 2 MiB, or
 1 GiB hardware leaf size (or `0` when the IP is unmapped). The two weight
@@ -1732,6 +1751,9 @@ main-stack VMA is emitted as `[stack]`; guard and kernel-private TLS mappings
 are not exposed.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly.
+An absent PMU returns `ENODEV`, permitting upstream perf record/top to retry
+legacy cycles with software CPU/task clocks. Unsupported events/layouts retain
+`EOPNOTSUPP`; exhausted hardware counters retain `EBUSY`.
 
 Task-scoped x86_64 and aarch64 hardware events are scheduler-attributed: a switch hook
 allocates and programs a counter in the destination CPU's PMU bank immediately
