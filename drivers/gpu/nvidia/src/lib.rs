@@ -45,6 +45,7 @@ pub mod fb;
 pub mod fence;
 pub mod fifo;
 pub mod flip;
+pub mod fwsec;
 pub mod gr;
 pub mod gsp;
 pub mod gsp_args;

@@ -5122,3 +5122,155 @@ fn smoke_gsp_radix3_build() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_radix3_build);
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC-FRTS — descriptor parse + FRTS/signature patch (core)
+// ────────────────────────────────────────────────────────────────
+
+use crate::fwsec::{
+    frts_cmd_bytes, patch_frts, patch_signature, select_signature_index, FalconUcodeDescV3,
+    FwsecError, DMEMMAPPER_CMD_FRTS, FRTS_CMD_SIZE, FRTS_REGION_TYPE_FB, RSA3K_SIG_SIZE,
+};
+
+/// Build a 44-byte v3 descriptor with the fixture's layout.
+fn fwsec_desc_bytes() -> [u8; 0x2c] {
+    let mut d = [0u8; 0x2c];
+    let p32 = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // Hdr: header_size 0x2c, version 3, valid.
+    p32(&mut d, 0x00, (0x2c << 16) | (3 << 8) | 1);
+    p32(&mut d, 0x08, 0x100); // pkc_data_offset
+    p32(&mut d, 0x0c, 0x10); // interface_offset
+    p32(&mut d, 0x14, 0x100); // imem_load_size
+    d[0x27] = 1; // signature_count
+    d[0x28] = 1; // signature_versions (bit 0)
+    d
+}
+
+/// Build a 0x400-byte FWSEC ucode image with a DMEMMAPPER appif.
+fn fwsec_ucode_fixture() -> alloc::vec::Vec<u8> {
+    let mut u = alloc::vec![0u8; 0x400];
+    let p32 = |u: &mut [u8], o: usize, v: u32| u[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // appif header @ dmem(0x100)+interface_offset(0x10) = 0x110.
+    u[0x110] = 1; // ver
+    u[0x111] = 4; // header size
+    u[0x112] = 8; // entry len
+    u[0x113] = 1; // entry count
+                  // appif entry 0 @ 0x114: id=DMEMMAPPER, dmem_base=0x40.
+    p32(&mut u, 0x114, 0x4);
+    p32(&mut u, 0x118, 0x40);
+    // DMEMMAPPER @ dmem+0x40 = 0x140; cmd_in_buffer_offset @ +0x08.
+    p32(&mut u, 0x140 + 0x08, 0x80); // cmd buffer at dmem+0x80 = 0x180
+    u
+}
+
+fn smoke_fwsec_desc_parse() -> TestResult {
+    let desc = match FalconUcodeDescV3::parse(&fwsec_desc_bytes()) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("v3 descriptor must parse"),
+    };
+    if desc.version() != 3 || !desc.valid() || desc.header_size() != 0x2c {
+        return TestResult::Fail("Hdr fields mis-decoded");
+    }
+    if desc.imem_load_size != 0x100 || desc.dmem_base_img() != 0x100 {
+        return TestResult::Fail("v3 DMEM must pack immediately after IMEM");
+    }
+    if desc.sig_base_img() != 0x100 + 0x100 {
+        return TestResult::Fail("sig_base_img = dmem_base + pkc_data_offset");
+    }
+    // A non-v3 / invalid descriptor is rejected.
+    let mut bad = fwsec_desc_bytes();
+    bad[0] = 0; // clear valid bit
+    if FalconUcodeDescV3::parse(&bad) != Err(FwsecError::BadDescriptor) {
+        return TestResult::Fail("invalid descriptor must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_desc_parse);
+
+fn smoke_fwsec_frts_cmd_bytes() -> TestResult {
+    let c = frts_cmd_bytes(0x1234_5000, 0x10_0000);
+    if c.len() != FRTS_CMD_SIZE {
+        return TestResult::Fail("FrtsCmd must be 44 bytes");
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+    // read_vbios: ver=1, hdr=24, flags=2.
+    if rd32(0x00) != 1 || rd32(0x04) != 24 || rd32(0x14) != 2 {
+        return TestResult::Fail("read_vbios header drifted");
+    }
+    // frts_region: ver=1, hdr=20, addr=frts>>12, size>>12, type=FB.
+    if rd32(0x18) != 1 || rd32(0x1c) != 20 {
+        return TestResult::Fail("frts_region header drifted");
+    }
+    if rd32(0x20) != (0x1234_5000 >> 12) || rd32(0x24) != (0x10_0000 >> 12) {
+        return TestResult::Fail("frts addr/size must be page-granular");
+    }
+    if rd32(0x28) != FRTS_REGION_TYPE_FB {
+        return TestResult::Fail("frts region type must be FB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_frts_cmd_bytes);
+
+fn smoke_fwsec_patch_frts() -> TestResult {
+    let desc = FalconUcodeDescV3::parse(&fwsec_desc_bytes()).unwrap();
+    let mut ucode = fwsec_ucode_fixture();
+    let cmd_off = match patch_frts(&mut ucode, &desc, 0x8000_0000, 0x10_0000) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("patch must succeed on a well-formed ucode"),
+    };
+    // cmd buffer at dmem(0x100) + cmd_in_buffer_offset(0x80) = 0x180.
+    if cmd_off != 0x180 {
+        return TestResult::Fail("command buffer offset mis-computed");
+    }
+    // init_cmd (DMEMMAPPER@0x140 + 0x2c = 0x16C) must be FRTS.
+    let init = u32::from_le_bytes(ucode[0x16C..0x170].try_into().unwrap());
+    if init != DMEMMAPPER_CMD_FRTS {
+        return TestResult::Fail("init_cmd must be patched to FRTS");
+    }
+    // The FrtsCmd must be written at cmd_off, carrying the region addr.
+    let region_addr = u32::from_le_bytes(ucode[cmd_off + 0x20..cmd_off + 0x24].try_into().unwrap());
+    if region_addr != (0x8000_0000u64 >> 12) as u32 {
+        return TestResult::Fail("FrtsCmd region addr not written");
+    }
+    // A ucode with no DMEMMAPPER entry is rejected.
+    let mut blank = alloc::vec![0u8; 0x400];
+    blank[0x110] = 1; // valid appif header, zero entries
+    if patch_frts(&mut blank, &desc, 0, 0x10_0000) != Err(FwsecError::NoDmemMapper) {
+        return TestResult::Fail("missing DMEMMAPPER must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_patch_frts);
+
+fn smoke_fwsec_signature_select_and_patch() -> TestResult {
+    // Turing: fuse version 0 -> index 0 when bit 0 is present.
+    if select_signature_index(0b001, 0) != Ok(0) {
+        return TestResult::Fail("fuse 0 with bit0 present must select index 0");
+    }
+    // popcount of bits below the fuse bit.
+    if select_signature_index(0b110, 2) != Ok(1) {
+        return TestResult::Fail("index must be popcount below the fuse bit");
+    }
+    // Missing fuse version is rejected.
+    if select_signature_index(0b100, 1) != Err(FwsecError::NoMatchingSignature) {
+        return TestResult::Fail("absent fuse version must be rejected");
+    }
+    // Patch writes the 384-byte signature at sig_base_img (0x200).
+    let desc = FalconUcodeDescV3::parse(&fwsec_desc_bytes()).unwrap();
+    let mut ucode = alloc::vec![0u8; 0x400];
+    let sig = alloc::vec![0xABu8; RSA3K_SIG_SIZE];
+    if patch_signature(&mut ucode, &desc, &sig).is_err() {
+        return TestResult::Fail("signature patch must succeed");
+    }
+    if ucode[0x200] != 0xAB || ucode[0x200 + RSA3K_SIG_SIZE - 1] != 0xAB {
+        return TestResult::Fail("signature must land at sig_base_img");
+    }
+    if ucode[0x200 - 1] != 0 {
+        return TestResult::Fail("signature must not spill before sig_base_img");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/fwsec",
+    smoke_fwsec_signature_select_and_patch
+);
