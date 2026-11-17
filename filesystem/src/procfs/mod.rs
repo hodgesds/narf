@@ -2889,7 +2889,30 @@ impl FsInstance for ProcFs {
 
 // ── Generators (system-wide) ────────────────────────────────────
 
+/// Cached per-CPU busy frequency in kHz. The provider must not perform
+/// remote CPU calls, wait for a sample, or access hardware from this reader.
+pub type CpuFrequencyHook = fn(u32) -> Option<u64>;
+static CPU_FREQUENCY_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_cpu_frequency_hook(hook: CpuFrequencyHook) {
+    CPU_FREQUENCY_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn cpu_frequency_khz(cpu: u32) -> Option<u64> {
+    let raw = CPU_FREQUENCY_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: only CpuFrequencyHook function pointers are published above.
+    let hook: CpuFrequencyHook = unsafe { core::mem::transmute(raw) };
+    hook(cpu)
+}
+
 fn gen_cpuinfo() -> String {
+    gen_cpuinfo_with(narf_lib::smp::online_bitmap(), cpu_frequency_khz)
+}
+
+fn gen_cpuinfo_with(online: u64, frequency: impl Fn(u32) -> Option<u64>) -> String {
     use core::fmt::Write as _;
     let mut s = String::new();
     #[cfg(target_arch = "x86_64")]
@@ -2907,28 +2930,74 @@ fn gen_cpuinfo() -> String {
         };
         let brand = ident::brand_str(&id);
         let model_name = if brand.is_empty() { "(unknown)" } else { brand };
-        // One block per logical CPU. SMP enumeration lands when the
-        // userspace AP-count surface is wired through; today we
-        // report the BSP only — matches what /proc/cpuinfo on a
-        // single-CPU Linux config would show, and the fields are
-        // identical per-block on a homogeneous system anyway.
-        let _ = writeln!(s, "processor\t: 0");
-        let _ = writeln!(s, "vendor_id\t: {}", vendor_str);
-        let _ = writeln!(s, "cpu family\t: {}", id.family);
-        let _ = writeln!(s, "model\t\t: {}", id.model);
-        let _ = writeln!(s, "model name\t: {}", model_name);
-        let _ = writeln!(s, "stepping\t: {}", id.stepping);
-        let _ = writeln!(s);
+        // Identity is shared on the currently supported homogeneous systems;
+        // frequency must be indexed by the reported CPU, never the reader's.
+        for cpu in 0..narf_lib::percpu::MAX_CPUS as u32 {
+            if online & (1u64 << cpu) == 0 {
+                continue;
+            }
+            let _ = writeln!(s, "processor\t: {}", cpu);
+            let _ = writeln!(s, "vendor_id\t: {}", vendor_str);
+            let _ = writeln!(s, "cpu family\t: {}", id.family);
+            let _ = writeln!(s, "model\t\t: {}", id.model);
+            let _ = writeln!(s, "model name\t: {}", model_name);
+            let _ = writeln!(s, "stepping\t: {}", id.stepping);
+            write_cpu_frequency(&mut s, frequency(cpu));
+            let _ = writeln!(s);
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = writeln!(s, "processor\t: 0");
-        let _ = writeln!(s, "vendor_id\t: NARF");
-        let _ = writeln!(s, "model name\t: (arch ident not yet wired)");
-        let _ = writeln!(s);
+        for cpu in 0..narf_lib::percpu::MAX_CPUS as u32 {
+            if online & (1u64 << cpu) == 0 {
+                continue;
+            }
+            let _ = writeln!(s, "processor\t: {}", cpu);
+            let _ = writeln!(s, "vendor_id\t: NARF");
+            let _ = writeln!(s, "model name\t: (arch ident not yet wired)");
+            write_cpu_frequency(&mut s, frequency(cpu));
+            let _ = writeln!(s);
+        }
     }
     s
 }
+
+fn write_cpu_frequency(out: &mut String, khz: Option<u64>) {
+    use core::fmt::Write as _;
+    match khz.filter(|value| *value != 0) {
+        Some(khz) => {
+            let _ = writeln!(out, "cpu MHz\t\t: {}.{:03}", khz / 1000, khz % 1000);
+        }
+        None => {
+            let _ = writeln!(out, "cpu MHz\t\t: Unknown");
+        }
+    }
+}
+
+fn smoke_proc_cpuinfo_frequency_per_online_cpu() -> narf_kernel_test::TestResult {
+    // Sparse online IDs must stay aligned with htop's processor/MHz pairs.
+    let text = gen_cpuinfo_with((1 << 0) | (1 << 2) | (1 << 5), |cpu| match cpu {
+        0 => Some(5_123_456),
+        2 => Some(800_007),
+        _ => None,
+    });
+    let records: Vec<_> = text.trim_end().split("\n\n").collect();
+    if records.len() != 3
+        || !records[0].starts_with("processor\t: 0\n")
+        || !records[0].contains("cpu MHz\t\t: 5123.456")
+        || !records[1].starts_with("processor\t: 2\n")
+        || !records[1].contains("cpu MHz\t\t: 800.007")
+        || !records[2].starts_with("processor\t: 5\n")
+        || !records[2].contains("cpu MHz\t\t: Unknown")
+    {
+        return narf_kernel_test::TestResult::Fail("cpuinfo lost per-CPU frequency or online IDs");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/procfs/frequency",
+    smoke_proc_cpuinfo_frequency_per_online_cpu
+);
 
 /// What the mapped-file page cache (in `narf_userspace`) holds, for
 /// `/proc/meminfo`.

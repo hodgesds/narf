@@ -1196,6 +1196,13 @@ Open file descriptions retain the mount ID visible at open time, including for
 ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
 The procfs view hides mounts outside the queried task's root and projects that
 root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
+`/proc/cpuinfo` emits one record per online logical CPU, preserving sparse
+CPU IDs. `install_cpu_frequency_hook(fn(u32) -> Option<u64>)` supplies cached
+per-CPU busy frequency in kHz; procfs formats `cpu MHz` with three decimal
+places. Unavailable/zero readings print `Unknown`, never an invented value.
+The provider must not wait, access hardware or issue remote CPU calls while
+serving proc reads. On x86 the power telemetry workers supply this hook.
+
 The procfs task-info hook takes a `TaskInfoQuery`: liveness, inode ownership
 and `comm` use `Identity` (pid/comm/effective uid/gid only, no mm, argv, fd or
 signal snapshot); `statm` uses `Statm` (maintained mm counters and exec text

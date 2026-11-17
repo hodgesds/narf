@@ -24,6 +24,8 @@ pub mod acpi_thermal;
 pub mod battery;
 pub mod button;
 #[cfg(target_arch = "x86_64")]
+pub mod cpu_frequency;
+#[cfg(target_arch = "x86_64")]
 pub mod cpu_idle;
 #[cfg(target_arch = "x86_64")]
 mod cpu_idle_tests;
@@ -368,6 +370,11 @@ pub fn register_initcalls() {
     //            thermal_sysfs.c:thermal_zone_device_register (6.9 line 344)
     narf_init::register(Stage::Late, "power-sysfs-bridge", || {
         sysfs_bridge::populate_power_supply_and_thermal();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Late, "cpu-frequency-telemetry", || {
+        cpu_frequency::start();
         InitResult::Ok
     });
     // CPUFreq governor bring-up. Runs after `cpu-pstate` (Stage::Subsys)
