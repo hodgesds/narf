@@ -50,6 +50,7 @@ pub mod gr;
 pub mod gsp;
 pub mod gsp_args;
 pub mod gsp_boot;
+pub mod gsp_elf;
 pub mod gsp_fw;
 pub mod gsp_live;
 pub mod gsp_payload;

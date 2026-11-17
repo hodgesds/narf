@@ -5584,3 +5584,103 @@ fn smoke_gsp_live_boot_report() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_boot_report);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM extraction — ELF sections + RISC-V bootloader descriptor
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_elf::{
+    elf64_section, gsp_rm_sections, parse_riscv_desc, signature_section, FWIMAGE_SECTION,
+    NVFW_BIN_MAGIC,
+};
+
+/// A minimal ELF64 with a `.fwimage` section + `.shstrtab`.
+fn gsp_elf_fixture() -> alloc::vec::Vec<u8> {
+    let mut e = alloc::vec![0u8; 0x120];
+    let p16 = |e: &mut [u8], o: usize, v: u16| e[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let p64 = |e: &mut [u8], o: usize, v: u64| e[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let p32 = |e: &mut [u8], o: usize, v: u32| e[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // e_ident (ELF64, little-endian).
+    e[0..8].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+    p64(&mut e, 0x28, 0x60); // e_shoff
+    p16(&mut e, 0x3c, 3); // e_shnum
+    p16(&mut e, 0x3e, 2); // e_shstrndx
+                          // .fwimage data @ 0x40 (8 bytes).
+    e[0x40..0x48].copy_from_slice(b"FWIMG123");
+    // .shstrtab @ 0x48: "\0.fwimage\0.shstrtab\0".
+    e[0x49..0x51].copy_from_slice(b".fwimage"); // index 1..9, NUL at 9
+    e[0x52..0x5B].copy_from_slice(b".shstrtab"); // index 10..19, NUL at 19
+                                                 // shdr[1] (.fwimage) @ 0xA0.
+    p32(&mut e, 0xA0, 1); // sh_name = 1
+    p64(&mut e, 0xA0 + 0x18, 0x40); // sh_offset
+    p64(&mut e, 0xA0 + 0x20, 8); // sh_size
+                                 // shdr[2] (.shstrtab) @ 0xE0.
+    p32(&mut e, 0xE0, 10); // sh_name = 10
+    p64(&mut e, 0xE0 + 0x18, 0x48); // sh_offset
+    p64(&mut e, 0xE0 + 0x20, 20); // sh_size
+    e
+}
+
+fn smoke_gsp_elf_section_lookup() -> TestResult {
+    let elf = gsp_elf_fixture();
+    match elf64_section(&elf, FWIMAGE_SECTION) {
+        Some(d) if d == b"FWIMG123" => {}
+        _ => return TestResult::Fail(".fwimage section must be found with its data"),
+    }
+    // A missing section returns None.
+    if elf64_section(&elf, ".fwsignature_tu10x").is_some() {
+        return TestResult::Fail("an absent section must return None");
+    }
+    // Signature section naming per family.
+    if signature_section(ChipFamily::Turing, "tu102") != Some(".fwsignature_tu10x")
+        || signature_section(ChipFamily::Turing, "tu116") != Some(".fwsignature_tu11x")
+        || signature_section(ChipFamily::Ada, "ad102") != Some(".fwsignature_ad10x")
+    {
+        return TestResult::Fail("signature section name drifted");
+    }
+    if signature_section(ChipFamily::Pascal, "gp104").is_some() {
+        return TestResult::Fail("a non-GSP family has no signature section");
+    }
+    // gsp_rm_sections needs both sections; our fixture lacks the sig.
+    if gsp_rm_sections(&elf, ChipFamily::Turing, "tu102").is_some() {
+        return TestResult::Fail("extraction must fail when the sig section is absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_elf", smoke_gsp_elf_section_lookup);
+
+fn smoke_gsp_elf_riscv_desc() -> TestResult {
+    // nvfw_bin_hdr + RM_RISCV_UCODE_DESC fixture.
+    let mut b = alloc::vec![0u8; 0x100];
+    let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    p32(&mut b, 0, NVFW_BIN_MAGIC); // bin_magic
+    p32(&mut b, 12, 0x40); // header_offset -> RM_RISCV_UCODE_DESC
+    p32(&mut b, 16, 0x80); // data_offset -> ucode payload
+    p32(&mut b, 20, 0x40); // data_size
+                           // Descriptor @ 0x40.
+    p32(&mut b, 0x40 + 28, 0x1234); // app_version
+    p32(&mut b, 0x40 + 32, 0x111); // manifest_offset
+    p32(&mut b, 0x40 + 40, 0x222); // monitor_data_offset
+    p32(&mut b, 0x40 + 48, 0x333); // monitor_code_offset
+    let d = match parse_riscv_desc(&b) {
+        Some(d) => d,
+        None => return TestResult::Fail("well-formed bootloader blob must parse"),
+    };
+    if d.code_offset != 0x333 || d.data_offset != 0x222 || d.manifest_offset != 0x111 {
+        return TestResult::Fail("monitor/manifest offsets mis-decoded");
+    }
+    if d.app_version != 0x1234 {
+        return TestResult::Fail("app_version mis-decoded");
+    }
+    if d.ucode_start != 0x80 || d.ucode_len != 0x40 {
+        return TestResult::Fail("ucode payload range mis-decoded");
+    }
+    // Wrong magic is rejected.
+    let mut bad = b.clone();
+    bad[0] ^= 0xFF;
+    if parse_riscv_desc(&bad).is_some() {
+        return TestResult::Fail("a bad nvfw magic must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_elf", smoke_gsp_elf_riscv_desc);
