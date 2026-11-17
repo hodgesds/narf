@@ -2027,7 +2027,9 @@ initialization succeeds. The physical owner acquires render kernel wake at
 GRDOM_FULL before changing cache policy or publishing new mappings.
 
 The owned system-memory policies are MTL PAT3=2, DG2 PAT0=3 and BMG PAT2=0xf,
-with their source-defined MOCS/LNCF tables. MTL additionally installs UC PAT2=0xc
+with their source-defined MOCS/LNCF tables. BMG uses the source Xe2 five-bit
+PPGTT encoding and `vm_max_level=4` five-level root; DG2/ATS-M remain Gen12
+root3 and MTL remains Xe-LPG root3. MTL additionally installs UC PAT2=0xc
 for non-leaf PPGTT reads, and leaves inherited display PAT0
 unchanged. MCR multicast writes preserve the selector and use the hardware
 steering semaphore where required; no await occurs while holding it. Only

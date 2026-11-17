@@ -113,7 +113,7 @@ impl ExecRequest {
             }
             GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
-            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
@@ -623,7 +623,7 @@ impl ResidentBatch {
             }
             GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
-            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };

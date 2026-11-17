@@ -330,14 +330,14 @@ impl GtPlatform {
         !self.is_gen12() || matches!(self, Self::Gen12(Gen12Platform::Dg1))
     }
     pub(crate) const fn ppgtt_root_level(self) -> u8 {
-        if self.is_headless_integrated() {
+        if self.is_headless_integrated() || matches!(self, Self::Battlemage) {
             4
         } else {
             3
         }
     }
     pub(crate) const fn pte_format(self) -> crate::intel_gpu_gtt::PteFormat {
-        if self.is_headless_integrated() {
+        if self.is_headless_integrated() || matches!(self, Self::Battlemage) {
             crate::intel_gpu_gtt::PteFormat::Xe2
         } else if self.is_gen12() || self.is_dg2() {
             crate::intel_gpu_gtt::PteFormat::Gen12
@@ -554,6 +554,13 @@ mod tests {
             || !GtPlatform::Alchemist.has_display()
         {
             return TestResult::Fail("ATS-M pre-GMD headless graphics identity");
+        }
+        if GtPlatform::Battlemage.ppgtt_root_level() != 4
+            || GtPlatform::Battlemage.pte_format() != crate::intel_gpu_gtt::PteFormat::Xe2
+            || GtPlatform::Alchemist.ppgtt_root_level() != 3
+            || GtPlatform::Alchemist.pte_format() != crate::intel_gpu_gtt::PteFormat::Gen12
+        {
+            return TestResult::Fail("BMG source five-level Xe2 PPGTT profile");
         }
         for (platform, sriov) in [
             (GtPlatform::Gen12(Gen12Platform::TigerLake), true),

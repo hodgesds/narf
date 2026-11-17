@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.75** (v0.74 plus typed GuC 70 log-stream admission for LNL,
+> Status: **v0.76** (v0.75 plus BMG's source Xe2 five-level PPGTT profile;
+> typed GuC 70 log-stream admission for LNL,
 > PTL, WCL and NVL-S; the source Tiger Lake TC6 / DDI-I USB-C DP route;
 > descriptor-qualified PF-only SR-IOV exclusion
 > on every GT/GGTT access for Tiger Lake, Alder/Raptor Lake, Panther/Wildcat
@@ -354,6 +355,10 @@ PCI DMA width is independent of PTE address capacity. The exact Linux xe
 descriptor matrix is enforced at every qualified GGTT/PPGTT publication:
 Gen12 and DG1 are DMA39; MTL/Arrow, DG2/ATS-M, BMG, LNL, PTL/WCL and NVL-S
 are DMA46. This corrects the former DG2, MTL and BMG fall-through to 52 bits.
+BMG separately follows its source graphics-20 descriptor: `vm_max_level = 4`
+selects a five-level walk, and its 32-entry Xe2 PAT uses the Xe2 PPGTT leaf
+encoding even though current system-memory WB leaves remain PAT2. DG2/ATS-M
+retain the three-level root and Gen12 leaf format; MTL retains Xe-LPG.
 
 Arrow Lake (#1023): the five IDs classify
 `Generation::MeteorLake` under `asic: "arrowlake"` — the table
@@ -2225,7 +2230,8 @@ the physical service retains its runtime-PM references.
 `intel_gpu_gt_hw` adds capability-invoked MMIO, render-well wake and bounded
 initial GuC/full-engine quiescence before PAT/MOCS programming. Staged physical
 allocations reserve frames/VA without writing inherited GGTT entries. Installed
-policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL also installs UC PAT2 for
+policies use MTL PAT3, DG2 PAT0 and BMG PAT2; BMG uses the Xe2 five-bit leaf
+encoding and source five-level root. MTL also installs UC PAT2 for
 non-leaf PPGTT reads and Linux's non-coherent WT PAT1 (Mesa's scanout and
 write-combining index). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
