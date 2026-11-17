@@ -55,6 +55,7 @@ pub mod gsp_fw;
 pub mod gsp_image;
 pub mod gsp_live;
 pub mod gsp_payload;
+pub mod gsp_ring;
 pub mod gsp_rm;
 pub mod gsp_seq;
 pub mod hdcp;

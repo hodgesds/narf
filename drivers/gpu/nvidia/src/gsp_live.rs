@@ -19,17 +19,18 @@
 //!
 //! - [`boot_gsp_live`] — the FWSEC → WPR2 path alone (needs only BAR0
 //!   + `bios_addr`).
-//! - [`boot_gsp_full`] — FWSEC → WPR2, then build the GSP-RM image +
-//!   radix3 + WprMeta ([`crate::gsp_image`]), stage + run the booter on
-//!   SEC2 ([`crate::gsp_boot`]), and wait for the GSP RISC-V core to go
-//!   active. It returns the [`GspImage`] the caller must keep alive.
+//! - [`boot_gsp_full`] — the **complete** boot to `GSP_INIT_DONE`:
+//!   FWSEC → WPR2, build the GSP-RM image + radix3 + WprMeta
+//!   ([`crate::gsp_image`]), set up the RPC rings + rmargs/libos
+//!   ([`crate::gsp_ring`]), run the booter on SEC2 ([`crate::gsp_boot`]),
+//!   wait for the GSP RISC-V core, then send SET_SYSTEM_INFO +
+//!   SET_REGISTRY and drain the CPU sequencer until GSP_INIT_DONE. It
+//!   returns the [`GspLive`] the caller must keep alive.
 //!
-//! `boot_gsp_full` stops at [`BootStage::BooterRun`]: the RPC-ring
-//! handshake (SET_SYSTEM_INFO / SET_REGISTRY), the CPU sequencer loop,
-//! and the GSP_INIT_DONE poll are the hardware-in-the-loop remainder —
-//! all their components are built ([`crate::gsp`], [`crate::gsp_seq`],
-//! [`crate::gsp_args`], [`crate::gsp_payload`]) but wiring the ring
-//! receive loop is best iterated against a real card.
+//! The whole hardware path is untestable under QEMU; the [`BootStage`]
+//! report tells a bring-up tester exactly where a real card stops. The
+//! RPC-ring cross-wiring + handshake ordering are the parts most worth
+//! validating against silicon.
 
 #![allow(dead_code)]
 
@@ -38,14 +39,18 @@ use alloc::vec::Vec;
 use narf_driver_runtime::MmioRegion;
 
 use crate::chip::ChipFamily;
-use crate::falcon::{Falcon, FALCON_BASE_SEC2};
+use crate::falcon::{Falcon, FALCON_BASE_GSP, FALCON_BASE_SEC2, FALCON_MAILBOX0, FALCON_MAILBOX1};
 use crate::fwsec::{
     locate_fwsec, patch_frts, patch_signature, run_fwsec_frts, select_signature_index,
     FalconUcodeDescV3, FwsecError, RSA3K_SIG_SIZE,
 };
 use crate::gsp_boot::{booter_sections, load_booter, run_booter, wait_riscv_active};
 use crate::gsp_image::{build_gsp_image, GspImage, ImageError};
+use crate::gsp_ring::{system_info_payload, GspRings, RingError};
 use crate::gsp_rm::{align_down, FbRegion};
+
+/// GSP Falcon OS register (`app_version` goes here before RISC-V start).
+const FLCN_OS: u64 = 0x080;
 
 /// BAR0 offset of the VBIOS expansion ROM window. Cite nova-core
 /// `vbios.rs` `ROM_OFFSET`.
@@ -88,8 +93,16 @@ pub enum BootError {
     Image(ImageError),
     /// The booter run / RISC-V bring-up failed.
     Booter(crate::gsp_boot::BootError),
+    /// The RPC ring handshake / CPU sequencer failed.
+    Ring(RingError),
     /// A later stage's component exists but is not yet wired.
     NotImplemented(&'static str),
+}
+
+impl From<RingError> for BootError {
+    fn from(e: RingError) -> Self {
+        BootError::Ring(e)
+    }
 }
 
 impl From<FwsecError> for BootError {
@@ -240,21 +253,41 @@ pub struct GspBootInputs<'a> {
     pub bios_addr: u64,
     /// WPR heap size (`tu102_gsp_wpr_heap_size`).
     pub wpr_heap_size: u64,
+    /// BAR0/BAR1/BAR2 physical bases (for `GspSystemInfo`).
+    pub bar0_phys: u64,
+    pub bar1_phys: u64,
+    pub bar2_phys: u64,
+    /// PCI bus + devfn (`nvDomainBusDeviceFunc`).
+    pub pci_bus: u8,
+    pub pci_devfn: u8,
+    /// Kernel user-VA limit (`maxUserVa`).
+    pub max_user_va: u64,
 }
 
-/// Run the live GSP boot through booter + RISC-V bring-up, returning
-/// the [`BootReport`] and — if it got far enough to allocate — the
-/// [`GspImage`] the caller must keep alive (the GPU DMAs from it for
-/// its whole lifetime).
+/// The live GSP state the caller must keep alive for the card's
+/// lifetime: the RM image buffers + the RPC rings (the GPU DMAs from
+/// both continuously).
+#[derive(Debug)]
+pub struct GspLive {
+    pub image: GspImage,
+    pub rings: GspRings,
+}
+
+/// Run the complete live GSP boot to `GSP_INIT_DONE`, returning the
+/// [`BootReport`] and — once allocated — the [`GspLive`] the caller
+/// must keep alive (the GPU DMAs from it for its whole lifetime).
 ///
-/// Sequence: FWSEC → WPR2, then build the GSP-RM image + radix3 +
-/// WprMeta ([`build_gsp_image`]), stage + run the booter on SEC2
-/// ([`crate::gsp_boot`]), and wait for the GSP RISC-V core to go
-/// active. It stops at [`BootStage::BooterRun`] with
-/// [`BootError::NotImplemented`] for the RPC-ring handshake + CPU
-/// sequencer loop — the part that benefits from hardware-in-the-loop
-/// iteration (its components, [`crate::gsp`] + [`crate::gsp_seq`] +
-/// [`crate::gsp_args`] + [`crate::gsp_payload`], are all built).
+/// Sequence, grounded in `tu102_gsp_{oneinit,init}` + `r535_gsp_init`:
+/// FWSEC → WPR2; build the GSP-RM image + radix3 + WprMeta; set up the
+/// RPC rings + rmargs/libos; write the libOS address to the GSP
+/// mailboxes; stage + run the booter on SEC2; write `app_version` and
+/// wait for the GSP RISC-V core; then run the handshake — send
+/// SET_SYSTEM_INFO + SET_REGISTRY and drain the msgq (running the CPU
+/// sequencer) until GSP_INIT_DONE.
+///
+/// The exact ordering of the handshake vs. the sequencer events is the
+/// part most worth checking against a real card (hence the
+/// [`BootStage`] report).
 ///
 /// # Safety
 /// `bar0` is the mapped BAR0 window and the caller owns the GSP + SEC2
@@ -263,7 +296,7 @@ pub unsafe fn boot_gsp_full(
     bar0: &MmioRegion,
     inputs: &GspBootInputs,
     budget: u32,
-) -> (BootReport, Option<GspImage>) {
+) -> (BootReport, Option<GspLive>) {
     // SAFETY: caller's responsibility.
     if let Err((reached, err)) = unsafe { fwsec_to_wpr2(bar0, inputs.bios_addr, budget) } {
         return (
@@ -290,47 +323,82 @@ pub unsafe fn boot_gsp_full(
         Err(e) => return (BootReport::stop(BootStage::Wpr2Established, e.into()), None),
     };
 
+    // Set up the RPC rings + rmargs/libos.
+    let mut rings = match GspRings::init() {
+        Ok(r) => r,
+        Err(e) => return (BootReport::stop(BootStage::GspImageBuilt, e.into()), None),
+    };
+    let live = |image, rings| GspLive { image, rings };
+
+    // Hand the libOS args address to the GSP via its mailboxes before
+    // the booter releases the RISC-V core.
+    let gsp = Falcon::new(bar0, FALCON_BASE_GSP, "gsp");
+    // SAFETY: caller owns the GSP Falcon.
+    unsafe {
+        gsp.wr32(FALCON_MAILBOX0, rings.libos_dma as u32);
+        gsp.wr32(FALCON_MAILBOX1, (rings.libos_dma >> 32) as u32);
+    }
+
     // Stage + run the booter on SEC2; it copies the RM image into WPR2.
+    let sec2 = Falcon::new(bar0, FALCON_BASE_SEC2, "sec2");
     let load = match booter_sections(inputs.booter_load, &image.booter) {
         Ok(l) => l,
         Err(_) => {
             return (
                 BootReport::stop(BootStage::GspImageBuilt, ImageError::BadBooter.into()),
-                Some(image),
+                Some(live(image, rings)),
             )
         }
     };
-    let sec2 = Falcon::new(bar0, FALCON_BASE_SEC2, "sec2");
     // SAFETY: caller owns the SEC2 Falcon.
     if let Err(e) = unsafe { load_booter(&sec2, &load) } {
         return (
             BootReport::stop(BootStage::GspImageBuilt, e.into()),
-            Some(image),
+            Some(live(image, rings)),
         );
     }
     // SAFETY: SEC2 is staged; the WprMeta phys is live DMA memory.
     if let Err(e) = unsafe { run_booter(&sec2, image.bootvec, image.wpr_meta_phys, budget) } {
         return (
             BootReport::stop(BootStage::GspImageBuilt, e.into()),
-            Some(image),
-        );
-    }
-    // SAFETY: BAR0 window; the GSP RISC-V status is a plain read.
-    if let Err(e) = unsafe { wait_riscv_active(bar0, budget) } {
-        return (
-            BootReport::stop(BootStage::GspImageBuilt, e.into()),
-            Some(image),
+            Some(live(image, rings)),
         );
     }
 
-    // RISC-V is active. The RPC-ring handshake (SET_SYSTEM_INFO /
-    // SET_REGISTRY), the CPU sequencer loop, and the GSP_INIT_DONE poll
-    // are the hardware-in-the-loop remainder.
-    (
-        BootReport::stop(
-            BootStage::BooterRun,
-            BootError::NotImplemented("RPC ring handshake + CPU sequencer + GSP_INIT_DONE"),
+    // app_version → GSP OS register, then wait for the RISC-V core.
+    // SAFETY: caller owns the GSP Falcon.
+    unsafe { gsp.wr32(FLCN_OS, image.app_version) };
+    // SAFETY: BAR0 window; the GSP RISC-V status is a plain read.
+    if let Err(e) = unsafe { wait_riscv_active(bar0, budget) } {
+        return (
+            BootReport::stop(BootStage::BooterRun, e.into()),
+            Some(live(image, rings)),
+        );
+    }
+
+    // Handshake: SET_SYSTEM_INFO + SET_REGISTRY, then drain the CPU
+    // sequencer until GSP_INIT_DONE.
+    let sysinfo = system_info_payload(
+        inputs.bar0_phys,
+        inputs.bar1_phys,
+        inputs.bar2_phys,
+        inputs.pci_bus,
+        inputs.pci_devfn,
+        inputs.max_user_va,
+    );
+    // SAFETY: GSP is up; caller owns the Falcons + BAR0.
+    let result = unsafe { rings.run_handshake(bar0, &sysinfo, image.app_version, budget) };
+    match result {
+        Ok(()) => (
+            BootReport {
+                reached: BootStage::InitDone,
+                result: Ok(()),
+            },
+            Some(live(image, rings)),
         ),
-        Some(image),
-    )
+        Err(e) => (
+            BootReport::stop(BootStage::HandshakeSent, e.into()),
+            Some(live(image, rings)),
+        ),
+    }
 }

@@ -5684,3 +5684,55 @@ fn smoke_gsp_elf_riscv_desc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_elf", smoke_gsp_elf_riscv_desc);
+
+// ────────────────────────────────────────────────────────────────
+// GSP RPC rings — pure geometry + ring math (send/recv are HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_ring::{
+    msgq_tx_header, ring_free, ring_used, CMDQ_OFFSET, ENTRY_OFF, MSGQ_OFFSET, MSG_COUNT,
+    SHARED_SIZE,
+};
+
+fn smoke_gsp_ring_geometry() -> TestResult {
+    // cmdq one page in; msgq after the first 256 KiB queue.
+    if CMDQ_OFFSET != 0x1000 || MSGQ_OFFSET != 0x1000 + 0x40000 {
+        return TestResult::Fail("queue offsets drifted");
+    }
+    if SHARED_SIZE != 0x1000 + 2 * 0x40000 || ENTRY_OFF != 0x1000 || MSG_COUNT != 63 {
+        return TestResult::Fail("shared region geometry drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_geometry);
+
+fn smoke_gsp_ring_pointer_math() -> TestResult {
+    // used = (wptr + count - rptr) % count; free = count-1-used.
+    if ring_used(0, 0, 63) != 0 || ring_free(0, 0, 63) != 62 {
+        return TestResult::Fail("empty ring must have count-1 free");
+    }
+    if ring_used(3, 0, 63) != 3 || ring_free(3, 0, 63) != 59 {
+        return TestResult::Fail("used must track wptr-rptr");
+    }
+    // Wrap-around: wptr behind rptr.
+    if ring_used(1, 60, 63) != 4 {
+        return TestResult::Fail("wrap-around used must be modular");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_pointer_math);
+
+fn smoke_gsp_ring_tx_header() -> TestResult {
+    // msgqTxHeader: version 0, size, msgSize=page, msgCount, writePtr 0,
+    // flags 1, rxHdrOff 32, entryOff page.
+    let h = msgq_tx_header(0x40000, 63);
+    let rd = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+    if rd(0) != 0 || rd(4) != 0x40000 || rd(8) != 4096 || rd(12) != 63 {
+        return TestResult::Fail("tx header version/size/msgSize/msgCount wrong");
+    }
+    if rd(16) != 0 || rd(20) != 1 || rd(24) != 32 || rd(28) != 4096 {
+        return TestResult::Fail("tx header writePtr/flags/rxHdrOff/entryOff wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_tx_header);
