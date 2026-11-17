@@ -454,7 +454,12 @@ transmitter table is retained separately from external DP 1.4 and can be
 applied only through the same disconnected LT transport. HDMI table selection
 is likewise pure; non-table clocks use Linux's bounded Q32 DCO/divider search
 to form a complete thirteen-register image or return no solution. Literal
-table hits retain priority, and the live HDMI route remains absent.
+table hits retain priority. The disconnected HDMI TMDS enable path shares the
+source lane-reset, P2/P0, VDR rate-update and transmitter sequence, requires
+four non-DP-alt lanes, and excludes FRL. `xe3plpd_get_lt_buf_trans` has no HDMI
+branch, so HDMI uses the DP1.4 table with entry zero as its default and a valid
+VBT index as its override. No display resource owner calls this path, and the
+live HDMI route remains absent.
 The disconnected display-35 watermark calculation ignores the reported
 level-0 latency before applying the 6-us WaWmMemoryReadLatency adjustment and
 selects method 2 for every linear plane; Tile4 retains the display-30

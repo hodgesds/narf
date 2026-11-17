@@ -1053,21 +1053,38 @@ pub(crate) const EDP_LEVELS: [LtTxLevel; 10] = [
     level(1, 3, 0, 26, 0),
 ];
 
-/// Signal table selected by the negotiated DP encoding.
+/// Signal table selected by the output protocol. Linux reuses the DP 1.4
+/// table for LT-PHY HDMI because `xe3plpd_get_lt_buf_trans` has no HDMI branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LtSignalProtocol {
     Dp14,
     Uhbr,
     Edp,
+    Hdmi,
 }
 
 pub(crate) const fn signal_level(protocol: LtSignalProtocol, index: usize) -> Option<LtTxLevel> {
     match protocol {
-        LtSignalProtocol::Dp14 if index < DP14_LEVELS.len() => Some(DP14_LEVELS[index]),
+        LtSignalProtocol::Dp14 | LtSignalProtocol::Hdmi if index < DP14_LEVELS.len() => {
+            Some(DP14_LEVELS[index])
+        }
         LtSignalProtocol::Uhbr if index < UHBR_LEVELS.len() => Some(UHBR_LEVELS[index]),
         LtSignalProtocol::Edp if index < EDP_LEVELS.len() => Some(EDP_LEVELS[index]),
-        LtSignalProtocol::Dp14 | LtSignalProtocol::Uhbr | LtSignalProtocol::Edp => None,
+        LtSignalProtocol::Dp14
+        | LtSignalProtocol::Uhbr
+        | LtSignalProtocol::Edp
+        | LtSignalProtocol::Hdmi => None,
     }
+}
+
+/// `intel_ddi_hdmi_level` over the LT table. Missing or out-of-range VBT
+/// levels fall back to the table's zero-initialized `hdmi_default_entry`.
+pub(crate) const fn hdmi_signal_level(vbt_level: Option<u8>) -> (u8, LtTxLevel) {
+    let index = match vbt_level {
+        Some(index) if (index as usize) < DP14_LEVELS.len() => index,
+        Some(_) | None => 0,
+    };
+    (index, DP14_LEVELS[index as usize])
 }
 
 const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
@@ -1104,6 +1121,9 @@ const MACCLK_TURNOFF_TIMEOUT_US: u64 = 1;
 const RATE_CALIBRATION_TIMEOUT_US: u64 = 1_000;
 const RESET_START_TIMEOUT_US: u64 = 10;
 const RESET_END_TIMEOUT_US: u64 = 2_000;
+const HDMI_MIN_TMDS_KHZ: u32 = 25_000;
+const HDMI_MAX_TMDS_KHZ: u32 = 600_000;
+const HDMI_FRL_CLOCKS_KHZ: [u32; 5] = [300_000, 600_000, 800_000, 1_000_000, 1_200_000];
 
 const MACCLK_RESET_0: u32 = 1 << 11;
 const MACCLK_RATE_MASK: u32 = 0x1f;
@@ -1123,6 +1143,24 @@ pub(crate) struct LtDpEnable {
     pub(crate) lane_count: u8,
     pub(crate) pin_assignment_d: bool,
     pub(crate) ssc_enabled: bool,
+}
+
+/// Inputs to the disconnected LT-PHY HDMI TMDS PLL enable sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LtHdmiEnable {
+    pub(crate) clock_khz: u32,
+    /// HDMI TMDS drives all four transmitters on Display 14+.
+    pub(crate) lane_count: u8,
+}
+
+struct LtEnablePlan<'a> {
+    state: &'a LtPllState,
+    clock_khz: u32,
+    lane_count: u8,
+    pin_assignment_d: bool,
+    plla_ssc: bool,
+    pllb_ssc: bool,
+    hdmi_frl: bool,
 }
 
 /// Nova Lake LT-PHY message-bus transport. Construction is family-qualified but
@@ -1392,7 +1430,12 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         self.rmw(port.buf_ctl2(), pulse, 0)
     }
 
-    fn program_port_clock(&self, rate: LtDpRate, ssc_enabled: bool) -> Result<(), Cx0Error> {
+    fn program_port_clock_for(
+        &self,
+        plla_ssc: bool,
+        pllb_ssc: bool,
+        hdmi_frl: bool,
+    ) -> Result<(), Cx0Error> {
         let port = self.port.xelpg();
         self.rmw(
             port.buf_ctl1(),
@@ -1403,10 +1446,15 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
                 0
             },
         )?;
-        let mut value = FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK;
-        if matches!(rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20) {
+        let mut value = FORWARD_CLOCK_UNGATE
+            | if hdmi_frl {
+                0x9 << 12
+            } else {
+                DDI_CLOCK_SELECT_MAXPCLK
+            };
+        if plla_ssc {
             value |= SSC_ENABLE_PLLA;
-        } else if ssc_enabled {
+        } else if pllb_ssc {
             value |= SSC_ENABLE_PLLB;
         }
         self.rmw(
@@ -1420,9 +1468,12 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         )
     }
 
-    /// Program the source DP PLL image through the normal Cx0 VDR transport.
-    pub(crate) fn program_dp_pll(&self, rate: LtDpRate) -> Result<(), Cx0Error> {
-        let state = dp_pll_state(rate);
+    fn program_port_clock(&self, rate: LtDpRate, ssc_enabled: bool) -> Result<(), Cx0Error> {
+        let plla_ssc = matches!(rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20);
+        self.program_port_clock_for(plla_ssc, !plla_ssc && ssc_enabled, false)
+    }
+
+    fn program_pll_state(&self, state: &LtPllState) -> Result<(), Cx0Error> {
         let cx0 = self.cx0();
         for index in 0..LT_PLL_PROGRAM_WRITE_COUNT {
             let write = pll_program_write(state, self.lanes.owned_mask(), index)
@@ -1432,13 +1483,12 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         Ok(())
     }
 
-    /// Run Linux's Nova Lake LT-PHY DP PLL enable order. The caller must already
-    /// own DC-off, the Type-C PHY and the D2D/AUX power wells; no production
-    /// route currently establishes those preconditions.
-    pub(crate) fn enable_dp(&self, request: LtDpEnable) -> Result<(), Cx0Error> {
-        if !matches!(request.lane_count, 1 | 2 | 4) || request.lane_count > self.max_lanes {
-            return Err(Cx0Error::ProtocolMismatch);
-        }
+    /// Program the source DP PLL image through the normal Cx0 VDR transport.
+    pub(crate) fn program_dp_pll(&self, rate: LtDpRate) -> Result<(), Cx0Error> {
+        self.program_pll_state(dp_pll_state(rate))
+    }
+
+    fn enable_pll_state(&self, plan: LtEnablePlan<'_>) -> Result<(), Cx0Error> {
         let port = self.port.xelpg();
         let owned = self.lanes.owned_mask();
         let mut pulse = 0;
@@ -1449,9 +1499,9 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         }
 
         self.lane_reset()?;
-        self.program_port_clock(request.rate, request.ssc_enabled)?;
+        self.program_port_clock_for(plan.plla_ssc, plan.pllb_ssc, plan.hdmi_frl)?;
         self.powerdown_change(P2_STATE_READY)?;
-        self.program_dp_pll(request.rate)?;
+        self.program_pll_state(plan.state)?;
         self.p2p_write(owned, LT_PHY_RATE_UPDATE, LT_PHY_RATE_CONTROL_VDR_UPDATE)?;
 
         let clock_ctl = port.port_clock_ctl();
@@ -1463,7 +1513,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         }
         self.mmio.write32(
             port.clk_valfreq().ok_or(Cx0Error::ProtocolMismatch)?,
-            request.rate.clock_khz(),
+            plan.clock_khz,
         );
         compiler_fence(Ordering::SeqCst);
         self.rmw(clock_ctl, pll_request, pll_request)?;
@@ -1486,7 +1536,50 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         }
         self.rmw(port.buf_ctl2(), pulse, pulse)?;
         self.powerdown_change(P0_STATE_ACTIVE)?;
-        self.program_transmitters(request.lane_count, request.pin_assignment_d)
+        self.program_transmitters(plan.lane_count, plan.pin_assignment_d)
+    }
+
+    /// Run Linux's Nova Lake LT-PHY DP PLL enable order. The caller must already
+    /// own DC-off, the Type-C PHY and the D2D/AUX power wells; no production
+    /// route currently establishes those preconditions.
+    pub(crate) fn enable_dp(&self, request: LtDpEnable) -> Result<(), Cx0Error> {
+        if !matches!(request.lane_count, 1 | 2 | 4) || request.lane_count > self.max_lanes {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let plla_ssc = matches!(request.rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20);
+        self.enable_pll_state(LtEnablePlan {
+            state: dp_pll_state(request.rate),
+            clock_khz: request.rate.clock_khz(),
+            lane_count: request.lane_count,
+            pin_assignment_d: request.pin_assignment_d,
+            plla_ssc,
+            pllb_ssc: !plla_ssc && request.ssc_enabled,
+            hdmi_frl: false,
+        })
+    }
+
+    /// Run the source LT-PHY PLL/transmitter enable order for HDMI TMDS. This
+    /// remains disconnected from the display route and deliberately refuses
+    /// HDMI 2.1 FRL clocks, whose packet/training owner is not implemented.
+    pub(crate) fn enable_hdmi_tmds(&self, request: LtHdmiEnable) -> Result<(), Cx0Error> {
+        if self.dp_alt
+            || request.lane_count != 4
+            || request.lane_count > self.max_lanes
+            || !(HDMI_MIN_TMDS_KHZ..=HDMI_MAX_TMDS_KHZ).contains(&request.clock_khz)
+            || HDMI_FRL_CLOCKS_KHZ.contains(&request.clock_khz)
+        {
+            return Err(Cx0Error::UnsupportedRate);
+        }
+        let state = hdmi_pll_state(request.clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+        self.enable_pll_state(LtEnablePlan {
+            state: &state,
+            clock_khz: request.clock_khz,
+            lane_count: request.lane_count,
+            pin_assignment_d: false,
+            plla_ssc: false,
+            pllb_ssc: false,
+            hdmi_frl: false,
+        })
     }
 
     /// Assert lane reset and gate MacCLK in Linux's LT-PHY disable order.
@@ -2241,6 +2334,14 @@ mod tests {
         assert_eq!(signal_level(LtSignalProtocol::Uhbr, 16), None);
         assert_eq!(signal_level(LtSignalProtocol::Edp, 9), Some(EDP_LEVELS[9]));
         assert_eq!(signal_level(LtSignalProtocol::Edp, 10), None);
+        assert_eq!(
+            signal_level(LtSignalProtocol::Hdmi, 9),
+            Some(DP14_LEVELS[9])
+        );
+        assert_eq!(signal_level(LtSignalProtocol::Hdmi, 10), None);
+        assert_eq!(hdmi_signal_level(None), (0, DP14_LEVELS[0]));
+        assert_eq!(hdmi_signal_level(Some(6)), (6, DP14_LEVELS[6]));
+        assert_eq!(hdmi_signal_level(Some(10)), (0, DP14_LEVELS[0]));
         assert_eq!(txy_ctl(0, 8), Some(0x0408));
         assert_eq!(txy_ctl(1, 4), Some(0x0604));
         assert_eq!(txy_ctl(2, 2), None);
@@ -2381,6 +2482,16 @@ mod tests {
         assert_eq!(panel.vdr.borrow().get(&(0, 0x0403)).copied(), Some(12));
         assert_eq!(panel.vdr.borrow().get(&(0, 0x0603)).copied(), Some(26));
         assert_eq!(panel.vdr.borrow().get(&(0, 0x0608)).copied(), Some(0x38));
+
+        let hdmi = FakeLtMmio::default();
+        let hdmi_phy = LtPhy::new(&hdmi, LtPort::B, false, 4, false).unwrap();
+        let (level, _) = hdmi_signal_level(None);
+        hdmi_phy
+            .program_signal_levels(LtSignalProtocol::Hdmi, &[level; 4])
+            .unwrap();
+        assert_eq!(hdmi.vdr.borrow().get(&(0, 0x0408)).copied(), Some(0x08));
+        assert_eq!(hdmi.vdr.borrow().get(&(0, 0x0403)).copied(), Some(21));
+        assert_eq!(hdmi.vdr.borrow().get(&(1, 0x0603)).copied(), Some(21));
         TestResult::Pass
     }
     kernel_test_in!(
@@ -2454,6 +2565,67 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_nvl_lt_phy_enable_disable_sequence
+    );
+
+    fn smoke_nvl_lt_phy_hdmi_tmds_enable_sequence() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, LtPort::Tc1, false, 4, false).unwrap();
+        phy.enable_hdmi_tmds(LtHdmiEnable {
+            clock_khz: 297_000,
+            lane_count: 4,
+        })
+        .unwrap();
+
+        let clock = fake.read32(0x16_f260);
+        assert_eq!(clock & lane_pclk_pll_request(0), lane_pclk_pll_request(0));
+        assert_eq!(clock & lane_pclk_pll_ack(0), lane_pclk_pll_ack(0));
+        assert_eq!(clock & FORWARD_CLOCK_UNGATE, FORWARD_CLOCK_UNGATE);
+        assert_eq!(clock & XE3_DDI_CLOCK_SELECT_MASK, DDI_CLOCK_SELECT_MAXPCLK);
+        assert_eq!(clock & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB), 0);
+        assert_eq!(fake.read32(0x6_4330), 297_000);
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0c02)).copied(), Some(0x84));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x0c02)).copied(), Some(0x84));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0c03)).copied(), Some(0x2d));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x040a)).copied(), Some(1));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x060a)).copied(), Some(1));
+
+        let dp_alt = FakeLtMmio::default();
+        let dp_alt_phy = LtPhy::new(&dp_alt, LtPort::Tc1, true, 4, false).unwrap();
+        assert_eq!(
+            dp_alt_phy.enable_hdmi_tmds(LtHdmiEnable {
+                clock_khz: 297_000,
+                lane_count: 4,
+            }),
+            Err(Cx0Error::UnsupportedRate)
+        );
+        for request in [
+            LtHdmiEnable {
+                clock_khz: 297_000,
+                lane_count: 2,
+            },
+            LtHdmiEnable {
+                clock_khz: 24_999,
+                lane_count: 4,
+            },
+            LtHdmiEnable {
+                clock_khz: 300_000,
+                lane_count: 4,
+            },
+            LtHdmiEnable {
+                clock_khz: 600_001,
+                lane_count: 4,
+            },
+        ] {
+            assert_eq!(
+                phy.enable_hdmi_tmds(request),
+                Err(Cx0Error::UnsupportedRate)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_lt_phy_hdmi_tmds_enable_sequence
     );
 
     fn smoke_nvl_lt_phy_clock_selection_and_width_refusal() -> TestResult {
