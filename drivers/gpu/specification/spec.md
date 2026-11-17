@@ -444,6 +444,11 @@ The disconnected display-35 watermark calculation ignores the reported
 level-0 latency before applying the 6-us WaWmMemoryReadLatency adjustment and
 selects method 2 for every linear plane; Tile4 retains the display-30
 unpanned rule. It does not feed an operational resource transaction.
+Its disconnected MDCLK resource image uses
+`XE3P_MBUS_TRANSLATION_THROTTLE_MIN` bits 16:13 and
+`XE3P_DBUF_MIN_TRACKER_STATE_SERVICE` bits 20:16. The lowest CDCLK rung has
+ratio 6, or 12 when joined, so the display-20 three-bit DBUF field is never
+reused. These pure images perform no MMIO and grant no programming authority.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the

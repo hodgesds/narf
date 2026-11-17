@@ -38,8 +38,11 @@
 //! Display 35.00 (Nova Lake-S / Xe3P_LPD) is kept outside operational
 //! [`DisplayIp`] dispatch, but its exact `xe3p_lpd_cdclk_table` is modeled
 //! here for the disconnected route: ratio 21 squashed rungs from 151.2 to
-//! 403.2 MHz, then crawl rungs through 787.2 MHz. Linux selects the same
-//! `xe3lpd_cdclk_funcs`; modeling the table grants no modeset authority.
+//! 403.2 MHz, then crawl rungs through 787.2 MHz. Its disconnected MDCLK
+//! image uses the widened Xe3P MBUS and DBUF minimum-tracker fields; this is
+//! required because the lowest rung reaches a joined ratio of 12. Linux
+//! selects the same `xe3lpd_cdclk_funcs`; modeling these images grants no
+//! modeset authority.
 //!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
@@ -280,6 +283,11 @@ pub(crate) const NOVA_LAKE_TABLE: [Rung; 31] = [
 
 pub(crate) const NOVA_LAKE_MAX_CDCLK_KHZ: u32 = 787_200;
 
+/// `XE3P_MBUS_TRANSLATION_THROTTLE_MIN_MASK` (display >= 35).
+pub(crate) const NOVA_LAKE_MBUS_THROTTLE_MASK: u32 = 0xf << 13;
+/// `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE_MASK` (display >= 35).
+pub(crate) const NOVA_LAKE_DBUF_MIN_TRACKER_MASK: u32 = 0x1f << 16;
+
 /// `bxt_calc_cdclk` over the disconnected display-35 table.
 pub(crate) fn calc_nova_lake_cdclk(min_khz: u32) -> Option<Rung> {
     NOVA_LAKE_TABLE
@@ -297,6 +305,40 @@ pub(crate) const fn nova_lake_ctl_value() -> u32 {
 /// Display 35 selects `xe3lpd_cdclk_funcs`, whose voltage level is always 0.
 pub(crate) const fn nova_lake_voltage_level(_cdclk_khz: u32) -> u8 {
     0
+}
+
+/// `intel_mdclk_cdclk_ratio` for a disconnected display-35 rung: MDCLK is
+/// sourced from the CDCLK PLL, so the ratio is `DIV_ROUND_UP(vco, cdclk)`.
+pub(crate) fn nova_lake_mdclk_cdclk_ratio(rung: Rung) -> u32 {
+    (rung.ratio * REF_KHZ).div_ceil(rung.cdclk_khz)
+}
+
+/// `XE3P_MBUS_TRANSLATION_THROTTLE_MIN(ratio - 1)`.
+pub(crate) fn nova_lake_mbus_throttle(ratio: u32) -> u32 {
+    (ratio.saturating_sub(1) << 13) & NOVA_LAKE_MBUS_THROTTLE_MASK
+}
+
+/// `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE(ratio - 1)`, with the ratio doubled
+/// when the MBUS is joined.
+pub(crate) fn nova_lake_dbuf_min_tracker(ratio: u32, joined: bool) -> u32 {
+    let ratio = if joined { ratio * 2 } else { ratio };
+    (ratio.saturating_sub(1) << 16) & NOVA_LAKE_DBUF_MIN_TRACKER_MASK
+}
+
+/// Disconnected display-35 `MBUS_CTL` image over `old`. This models only the
+/// Xe3P throttle field and performs no MMIO.
+pub(crate) fn nova_lake_mbus_ctl(old: u32, rung: Rung) -> u32 {
+    let ratio = nova_lake_mdclk_cdclk_ratio(rung);
+    (old & !NOVA_LAKE_MBUS_THROTTLE_MASK) | nova_lake_mbus_throttle(ratio)
+}
+
+/// Disconnected display-35 `DBUF_CTL_S(slice)` image over `old`. As in the
+/// operational display-20 path, the read-only power-state bit is not written
+/// back; all fields outside the Xe3P minimum tracker are retained.
+pub(crate) fn nova_lake_dbuf_ctl(old: u32, rung: Rung, joined: bool) -> u32 {
+    let ratio = nova_lake_mdclk_cdclk_ratio(rung);
+    (old & !(NOVA_LAKE_DBUF_MIN_TRACKER_MASK | (1 << 30)))
+        | nova_lake_dbuf_min_tracker(ratio, joined)
 }
 
 /// `bxt_calc_cdclk`: the first rung at or above `min_khz`. Linux WARNs and

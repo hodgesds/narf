@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.92** (v0.92 models Display 35's forced level-0 latency WA and
-> linear-plane watermark method 2; v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
+> Status: **v0.93** (v0.93 models Display 35's widened MBUS/DBUF MDCLK-ratio
+> fields; v0.92 models its forced level-0 latency WA and linear-plane
+> watermark method 2; v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
 > CDCLK ladder and hooks; v0.90 adds the exact, separately opted-in read-only Nova
 > Lake-S display-35 route proof; v0.89 carries WCL 30.02 through the production
 > probe, KMS and hotplug actor; v0.88 added exact, separately opted-in WCL
@@ -354,6 +355,10 @@ Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.
+Its disconnected MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
+and the five-bit DBUF minimum tracker at bits 20:16. The lowest clock's ratio
+is 6 and becomes 12 when MBUS is joined, which would be truncated by the
+display-20 field. The register images are pure and perform no MMIO.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2

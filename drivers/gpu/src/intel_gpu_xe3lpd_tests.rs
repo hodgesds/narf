@@ -542,6 +542,51 @@ kernel_test_in!(
     smoke_xe3lpd_cdclk_plan_crawl_squash_and_wa_13012396614
 );
 
+fn smoke_xe3p_lpd_mdclk_uses_wide_mbus_and_dbuf_fields() -> TestResult {
+    use crate::intel_gpu_xelpg_cdclk::{
+        nova_lake_dbuf_ctl, nova_lake_dbuf_min_tracker, nova_lake_mbus_ctl,
+        nova_lake_mbus_throttle, nova_lake_mdclk_cdclk_ratio, NOVA_LAKE_DBUF_MIN_TRACKER_MASK,
+        NOVA_LAKE_MBUS_THROTTLE_MASK, NOVA_LAKE_TABLE,
+    };
+
+    assert_eq!(NOVA_LAKE_MBUS_THROTTLE_MASK, 0x0001_e000);
+    assert_eq!(NOVA_LAKE_DBUF_MIN_TRACKER_MASK, 0x001f_0000);
+    for (khz, ratio) in [
+        (151_200, 6),
+        (176_400, 5),
+        (201_600, 4),
+        (277_200, 3),
+        (403_200, 2),
+        (787_200, 2),
+    ] {
+        let rung = NOVA_LAKE_TABLE
+            .iter()
+            .copied()
+            .find(|rung| rung.cdclk_khz == khz)
+            .unwrap();
+        assert_eq!(nova_lake_mdclk_cdclk_ratio(rung), ratio, "{khz}");
+    }
+    assert!(NOVA_LAKE_TABLE
+        .iter()
+        .all(|rung| nova_lake_mdclk_cdclk_ratio(*rung) * 2 - 1 <= 0x1f));
+
+    let lowest = NOVA_LAKE_TABLE[0];
+    assert_eq!(nova_lake_mbus_throttle(6), 5 << 13);
+    assert_eq!(nova_lake_dbuf_min_tracker(6, false), 5 << 16);
+    assert_eq!(nova_lake_dbuf_min_tracker(6, true), 11 << 16);
+    assert_eq!(nova_lake_mbus_ctl(0xdc01_e001, lowest), 0xdc00_a001);
+    assert_eq!(nova_lake_dbuf_ctl(0xc0f8_0001, lowest, true), 0x80eb_0001);
+
+    // Display 20's three-bit field cannot represent Nova Lake's joined
+    // ratio 12. Keeping the images separate prevents silent truncation.
+    assert_eq!(crate::intel_gpu_xe2lpd::dbuf_min_tracker(6, true), 3 << 16);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3p_lpd_mdclk_uses_wide_mbus_and_dbuf_fields
+);
+
 // ── PM demand ────────────────────────────────────────────────────
 
 fn smoke_xe3lpd_pmdemand_xe3_layout() -> TestResult {
