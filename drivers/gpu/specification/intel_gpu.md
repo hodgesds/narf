@@ -1,9 +1,11 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.85** (v0.84 plus Wildcat Lake's disconnected TC1/TC2-only
-> external-display and Pipe-B/C allocation profile; Wildcat Lake's disconnected source-order
+> Status: **v0.86** (v0.85 corrected against Linux 7.0-rc7 so LT PHY is
+> source-qualified to Nova Lake display 35.00 A/B/TC1/TC2 while Wildcat Lake
+> remains on C10/C20; Wildcat Lake's disconnected TC1/TC2-only
+> external-display and Pipe-B/C allocation profile; Nova Lake's disconnected source-order
 > MacCLK, lane-reset, PLL-rate and disable state machines; its DP 1.4/UHBR
-> per-lane swing/cursor programming; its disconnected LT-PHY TC1/TC2 VDR
+> per-lane swing/cursor programming; its disconnected LT-PHY A/B/TC1/TC2 VDR
 > and retrying P2P transmitter transport; its DP PLL/write-image,
 > transmitter-ownership and DP 1.4/UHBR signal models,
 > while every display-30.02 output route remains fail-closed; the pure Wildcat
@@ -306,23 +308,28 @@ Pipes/FBC A–C, the 480 MHz maximum and `xe3lpd_3002_sa_info`'s 22 GB/s
 programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
 D. The disconnected `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits
 only TC1/TC2 and scans only Pipes B/C, so sharing Panther Lake's graphics
-generation cannot silently grant TC3/TC4, Pipe D or C20 authority. No
-production probe or hotplug entry selects it. `intel_gpu_lt_phy` separately
-models WCL's TC1/TC2-only LT-PHY boundary:
+generation cannot silently grant TC3/TC4 or Pipe D authority. No production
+probe or hotplug entry selects it. Linux keeps WCL on the Panther Lake C20
+path; it does not select LT PHY.
+
+`intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
 VDR write image, LT transmitter ownership/masking, and the DP 1.4/UHBR signal
-tables. Its crate-private, disconnected transport serializes the 81 committed
-PLL writes through the display-30 Cx0 bus and implements Linux's three-attempt
+tables. `MmioWindow::has_lt_phy()` preserves Linux's exact
+`HAS_LT_PHY(display) == platform.novalake` boundary instead of inferring the
+PHY from display version. Its crate-private, disconnected transport serializes
+the 81 committed PLL writes through the display-35 Cx0 bus and implements Linux's three-attempt
 P2P transmitter flow, including ordinary ACK validation, bus reset on failure,
 the 150 us settle bound and P2P-ready clearing. Fake-MMIO fixtures are its only
 caller. The same disconnected transport applies the selected DP 1.4 or UHBR
 table with committed per-lane LT `TXY_CTL{8,2,3,4}` RMWs. It does not construct
-`DisplayIp::WildcatLake`. The complete disconnected DP enable/disable machine
-adds LT lane reset, P2/P0 power transitions, display-30 clock selection,
+an operational display IP. The complete disconnected DP enable/disable machine
+adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
 rate-update calibration and DDI clock-value programming in Linux source order.
 It requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
-production route supplies those preconditions. Display 30.02 remains a
-typed route refusal pending the LT-PHY power/clock sequence and output policy.
+production route supplies those preconditions. Display 35.00 remains a typed
+route refusal pending Nova Lake display and output ownership; WCL display 30.02
+remains a separate C20 route refusal.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2

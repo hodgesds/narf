@@ -13,7 +13,7 @@
 //! no display info, so the IP is known only from `GMD_ID_DISPLAY`.
 //! [`DisplayIp::decode_all`] admits 30.00 only; 30.02 stays a typed route
 //! refusal while [`DisplayIp::WildcatLake`] retains its pure resource profile
-//! (the WCL PCI IDs use the PTL headless GT profile, while WCL's LT PHY, DMC
+//! (the WCL PCI IDs use the PTL headless GT profile, while WCL's C20 PHY, DMC
 //! container and output protocol remain unowned). For display
 //! \>= 30 `__intel_display_device_info_runtime_init` also reads
 //! `PICA_PHY_CONFIG_CONTROL.EDP_ON_TYPEC` (`edp_typec_support`).

@@ -1,11 +1,13 @@
-//! Wildcat Lake display-30.02 LT-PHY protocol model.
+//! Nova Lake display-35.00 LT-PHY protocol model.
 //!
-//! WCL's Type-C ports TC1/TC2 are LT PHYs, not the C20 PHYs used by
-//! Meteor/Lunar/Panther Lake.  This module deliberately contains only the
-//! pure, source-qualified portion of Linux's `intel_lt_phy.c` contract:
+//! Linux selects LT PHY through `HAS_LT_PHY(display)`, which is exactly
+//! `platform.novalake`; Panther/Wildcat Lake remain on C10/C20. Nova Lake's
+//! A/B and Type-C TC1/TC2 ports have the LT register layout. This module
+//! deliberately contains only the pure, source-qualified portion of Linux's
+//! `intel_lt_phy.c` contract:
 //! port/register selection, DP PLL images, VDR write-image construction,
 //! transmitter ownership/masking and DP signal-level tables.  It performs no
-//! MMIO, does not decode display 30.02 and grants no route authority.
+//! MMIO, does not decode display 35.00 and grants no route authority.
 //!
 //! Pinned source: the local Linux tree's
 //! `drivers/gpu/drm/i915/display/{intel_lt_phy.c,intel_lt_phy_regs.h,
@@ -40,25 +42,31 @@ pub(crate) const LT_PHY_TX_LANE_ENABLE: u8 = 1;
 pub(crate) const LT_PLL_REGISTER_COUNT: usize = 13;
 pub(crate) const LT_PLL_PROGRAM_WRITE_COUNT: usize = 3 + LT_PLL_REGISTER_COUNT * 6;
 
-/// The two LT-PHY ports present in Linux's `wcl_display` descriptor.
+/// Ports covered by Linux's two LT-PHY register ranges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WclLtPort {
+pub(crate) enum LtPort {
+    A,
+    B,
     Tc1,
     Tc2,
 }
 
-impl WclLtPort {
+impl LtPort {
     pub(crate) const fn from_xelpg(port: XeLpgPort) -> Option<Self> {
         match port {
+            XeLpgPort::A => Some(Self::A),
+            XeLpgPort::B => Some(Self::B),
             XeLpgPort::Tc1 => Some(Self::Tc1),
             XeLpgPort::Tc2 => Some(Self::Tc2),
-            XeLpgPort::A | XeLpgPort::B | XeLpgPort::Tc3 | XeLpgPort::Tc4 => None,
+            XeLpgPort::Tc3 | XeLpgPort::Tc4 => None,
         }
     }
 
     /// `XE3PLPD_PORT_BUF_CTL5(port)`.
     pub(crate) const fn buf_ctl5(self) -> u64 {
         match self {
+            Self::A => 0x64_038,
+            Self::B => 0x64_138,
             Self::Tc1 => 0x16_f234,
             Self::Tc2 => 0x16_f434,
         }
@@ -67,6 +75,8 @@ impl WclLtPort {
     /// `XE3PLPD_PORT_P2M_MSGBUS_STATUS_P2P(port, lane)`.
     pub(crate) const fn p2m_status_p2p(self, lane: u8) -> Option<u64> {
         let base = match self {
+            Self::A => 0x64_0a0,
+            Self::B => 0x64_1a0,
             Self::Tc1 => 0x16_f2a0,
             Self::Tc2 => 0x16_f4a0,
         };
@@ -78,6 +88,8 @@ impl WclLtPort {
 
     const fn xelpg(self) -> XeLpgPort {
         match self {
+            Self::A => XeLpgPort::A,
+            Self::B => XeLpgPort::B,
             Self::Tc1 => XeLpgPort::Tc1,
             Self::Tc2 => XeLpgPort::Tc2,
         }
@@ -551,12 +563,12 @@ const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
     }
 }
 
-// ── Disconnected WCL transport ──────────────────────────────────
+// ── Disconnected Nova Lake transport ────────────────────────────
 //
 // These fields are the shared Cx0 message-bus encoding.  The LT P2P flow
 // differs after the committed write: it waits for the normal P2M write ACK,
 // leaves 150 us for the PHY to settle, then clears both the normal response
-// and the WCL-only P2P-ready latch.  Linux currently carries the expected MAC
+// and the LT-only P2P-ready latch. Linux currently carries the expected MAC
 // address/value through this API but does not compare them with a register
 // read; the descriptor consistency check below does not invent that read.
 
@@ -598,11 +610,11 @@ pub(crate) struct LtDpEnable {
     pub(crate) ssc_enabled: bool,
 }
 
-/// WCL LT-PHY message-bus transport.  Construction is family-qualified but
+/// Nova Lake LT-PHY message-bus transport. Construction is family-qualified but
 /// this type is not reachable from any display route.
 pub(crate) struct LtPhy<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
-    port: WclLtPort,
+    port: LtPort,
     lanes: PhyLaneConfig,
     dp_alt: bool,
     max_lanes: u8,
@@ -622,14 +634,15 @@ impl<M: MmioWindow + ?Sized> core::fmt::Debug for LtPhy<'_, M> {
 impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
     pub(crate) fn new(
         mmio: &'a M,
-        port: WclLtPort,
+        port: LtPort,
         dp_alt: bool,
         max_lanes: u8,
         reversed: bool,
     ) -> Result<Self, Cx0Error> {
-        // LT PHY only exists on display 30.02.  A generic MTL/C20 window must
-        // never receive these same-looking Cx0 transactions.
-        if !mmio.cx0_xe3() {
+        // Linux gates LT PHY on `platform.novalake`, not display version.
+        // A Panther/Wildcat Lake C20 window must never receive these
+        // same-looking Cx0 transactions.
+        if !mmio.has_lt_phy() {
             return Err(Cx0Error::ProtocolMismatch);
         }
         let lanes = PhyLaneConfig::for_route(dp_alt, max_lanes, reversed)?;
@@ -904,7 +917,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         Ok(())
     }
 
-    /// Run Linux's WCL LT-PHY DP PLL enable order.  The caller must already
+    /// Run Linux's Nova Lake LT-PHY DP PLL enable order. The caller must already
     /// own DC-off, the Type-C PHY and the D2D/AUX power wells; no production
     /// route currently establishes those preconditions.
     pub(crate) fn enable_dp(&self, request: LtDpEnable) -> Result<(), Cx0Error> {
@@ -1082,7 +1095,7 @@ mod tests {
         transactions: RefCell<Vec<Transaction>>,
         resets: Cell<u32>,
         bad_ack: Cell<bool>,
-        xe3: bool,
+        lt_phy: bool,
     }
 
     impl Default for FakeLtMmio {
@@ -1090,6 +1103,8 @@ mod tests {
             let mut regs = BTreeMap::new();
             // The disabled LT PHY enters with both lanes held in pipe reset
             // and the corresponding current-status bits asserted.
+            regs.insert(0x64_008, 0xf000_0000);
+            regs.insert(0x64_108, 0xf000_0000);
             regs.insert(0x16_f204, 0xf000_0000);
             regs.insert(0x16_f404, 0xf000_0000);
             Self {
@@ -1098,14 +1113,19 @@ mod tests {
                 transactions: RefCell::new(Vec::new()),
                 resets: Cell::new(0),
                 bad_ack: Cell::new(false),
-                xe3: true,
+                lt_phy: true,
             }
         }
     }
 
     impl FakeLtMmio {
-        fn ctl_lane(off: u64) -> Option<(WclLtPort, u8)> {
-            for (port, base) in [(WclLtPort::Tc1, 0x16_f240), (WclLtPort::Tc2, 0x16_f440)] {
+        fn ctl_lane(off: u64) -> Option<(LtPort, u8)> {
+            for (port, base) in [
+                (LtPort::A, 0x64_040),
+                (LtPort::B, 0x64_140),
+                (LtPort::Tc1, 0x16_f240),
+                (LtPort::Tc2, 0x16_f440),
+            ] {
                 if off == base {
                     return Some((port, 0));
                 }
@@ -1117,11 +1137,31 @@ mod tests {
         }
 
         fn ordinary_status(off: u64) -> bool {
-            matches!(off, 0x16_f248 | 0x16_f24c | 0x16_f448 | 0x16_f44c)
+            matches!(
+                off,
+                0x64_048
+                    | 0x64_04c
+                    | 0x64_148
+                    | 0x64_14c
+                    | 0x16_f248
+                    | 0x16_f24c
+                    | 0x16_f448
+                    | 0x16_f44c
+            )
         }
 
         fn p2p_status(off: u64) -> bool {
-            matches!(off, 0x16_f2a0 | 0x16_f2a4 | 0x16_f4a0 | 0x16_f4a4)
+            matches!(
+                off,
+                0x64_0a0
+                    | 0x64_0a4
+                    | 0x64_1a0
+                    | 0x64_1a4
+                    | 0x16_f2a0
+                    | 0x16_f2a4
+                    | 0x16_f4a0
+                    | 0x16_f4a4
+            )
         }
     }
 
@@ -1131,7 +1171,11 @@ mod tests {
         }
 
         fn cx0_xe3(&self) -> bool {
-            self.xe3
+            true
+        }
+
+        fn has_lt_phy(&self) -> bool {
+            self.lt_phy
         }
 
         fn read32(&self, off: u64) -> u32 {
@@ -1139,7 +1183,7 @@ mod tests {
         }
 
         fn write32(&self, off: u64, value: u32) {
-            if matches!(off, 0x16_f260 | 0x16_f460) {
+            if matches!(off, 0x64_0e0 | 0x64_1e0 | 0x16_f260 | 0x16_f460) {
                 let mut next = value;
                 if value & lane_pclk_pll_request(0) != 0 {
                     next |= lane_pclk_pll_ack(0);
@@ -1149,7 +1193,7 @@ mod tests {
                 self.regs.borrow_mut().insert(off, next);
                 return;
             }
-            if matches!(off, 0x16_f204 | 0x16_f404) {
+            if matches!(off, 0x64_008 | 0x64_108 | 0x16_f204 | 0x16_f404) {
                 let old = self.read32(off);
                 let reset_mask = lane_pipe_reset(0) | lane_pipe_reset(1);
                 let status_mask = lane_phy_current_status(0) | lane_phy_current_status(1);
@@ -1201,8 +1245,10 @@ mod tests {
             self.vdr.borrow_mut().insert((lane, address), data);
             if address == LT_PHY_RATE_UPDATE && data & LT_PHY_RATE_CONTROL_VDR_UPDATE == 0 {
                 let buf_ctl2 = match port {
-                    WclLtPort::Tc1 => 0x16_f204,
-                    WclLtPort::Tc2 => 0x16_f404,
+                    LtPort::A => 0x64_008,
+                    LtPort::B => 0x64_108,
+                    LtPort::Tc1 => 0x16_f204,
+                    LtPort::Tc2 => 0x16_f404,
                 };
                 let current = self.read32(buf_ctl2);
                 self.regs
@@ -1230,13 +1276,17 @@ mod tests {
         }
     }
 
-    fn smoke_wcl_lt_phy_ports_and_ownership() -> TestResult {
-        assert_eq!(WclLtPort::from_xelpg(XeLpgPort::Tc1), Some(WclLtPort::Tc1));
-        assert_eq!(WclLtPort::from_xelpg(XeLpgPort::Tc2), Some(WclLtPort::Tc2));
-        assert_eq!(WclLtPort::from_xelpg(XeLpgPort::Tc3), None);
-        assert_eq!(WclLtPort::Tc1.buf_ctl5(), 0x16_f234);
-        assert_eq!(WclLtPort::Tc2.p2m_status_p2p(1), Some(0x16_f4a4));
-        assert_eq!(WclLtPort::Tc2.p2m_status_p2p(2), None);
+    fn smoke_nvl_lt_phy_ports_and_ownership() -> TestResult {
+        assert_eq!(LtPort::from_xelpg(XeLpgPort::A), Some(LtPort::A));
+        assert_eq!(LtPort::from_xelpg(XeLpgPort::B), Some(LtPort::B));
+        assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc1), Some(LtPort::Tc1));
+        assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc2), Some(LtPort::Tc2));
+        assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc3), None);
+        assert_eq!(LtPort::A.buf_ctl5(), 0x64_038);
+        assert_eq!(LtPort::B.p2m_status_p2p(1), Some(0x64_1a4));
+        assert_eq!(LtPort::Tc1.buf_ctl5(), 0x16_f234);
+        assert_eq!(LtPort::Tc2.p2m_status_p2p(1), Some(0x16_f4a4));
+        assert_eq!(LtPort::Tc2.p2m_status_p2p(2), None);
         assert_eq!(owned_lane_mask(false, 2), Some(BOTH_LANES));
         assert_eq!(owned_lane_mask(true, 2), Some(LANE0));
         assert_eq!(owned_lane_mask(true, 4), Some(BOTH_LANES));
@@ -1245,10 +1295,10 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_ports_and_ownership
+        smoke_nvl_lt_phy_ports_and_ownership
     );
 
-    fn smoke_wcl_lt_phy_dp_pll_images() -> TestResult {
+    fn smoke_nvl_lt_phy_dp_pll_images() -> TestResult {
         let expected = [
             (LtDpRate::Rbr, 162_000, 0x83, 0x8710),
             (LtDpRate::Hbr, 270_000, 0x8b, 0x8710),
@@ -1295,10 +1345,10 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_dp_pll_images
+        smoke_nvl_lt_phy_dp_pll_images
     );
 
-    fn smoke_wcl_lt_phy_write_image_and_transmitters() -> TestResult {
+    fn smoke_nvl_lt_phy_write_image_and_transmitters() -> TestResult {
         let first = pll_program_write(&DP_HBR3, BOTH_LANES, 0).unwrap();
         assert_eq!(
             first,
@@ -1356,10 +1406,10 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_write_image_and_transmitters
+        smoke_nvl_lt_phy_write_image_and_transmitters
     );
 
-    fn smoke_wcl_lt_phy_signal_tables() -> TestResult {
+    fn smoke_nvl_lt_phy_signal_tables() -> TestResult {
         assert_eq!(DP14_LEVELS[0], level(1, 0, 0, 21, 0));
         assert_eq!(DP14_LEVELS[9], level(0, 3, 0, 48, 0));
         assert_eq!(UHBR_LEVELS[0], level(0, 0, 0, 48, 0));
@@ -1381,12 +1431,12 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_signal_tables
+        smoke_nvl_lt_phy_signal_tables
     );
 
-    fn smoke_wcl_lt_phy_transport_programs_pll_and_p2p_tx() -> TestResult {
+    fn smoke_nvl_lt_phy_transport_programs_pll_and_p2p_tx() -> TestResult {
         let fake = FakeLtMmio::default();
-        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        let phy = LtPhy::new(&fake, LtPort::Tc1, true, 4, false).unwrap();
         phy.program_dp_pll(LtDpRate::Hbr3).unwrap();
         let transactions = fake.transactions.borrow();
         // 81 logical writes: config 0 and 2 fan out to both owned lanes.
@@ -1442,26 +1492,32 @@ mod tests {
         assert_eq!(fake.read32(0x16_f24c), 0);
         assert_eq!(fake.read32(0x16_f2a0) & P2M_RESPONSE_READY, 0);
         assert_eq!(fake.read32(0x16_f2a4) & P2M_RESPONSE_READY, 0);
+
+        let combo = FakeLtMmio::default();
+        let combo_phy = LtPhy::new(&combo, LtPort::A, false, 4, false).unwrap();
+        combo_phy.program_transmitters(4, false).unwrap();
+        assert_eq!(combo.read32(0x64_0a0) & P2M_RESPONSE_READY, 0);
+        assert_eq!(combo.read32(0x64_0a4) & P2M_RESPONSE_READY, 0);
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_transport_programs_pll_and_p2p_tx
+        smoke_nvl_lt_phy_transport_programs_pll_and_p2p_tx
     );
 
-    fn smoke_wcl_lt_phy_transport_rejects_family_and_bad_ack() -> TestResult {
+    fn smoke_nvl_lt_phy_transport_rejects_family_and_bad_ack() -> TestResult {
         let wrong_family = FakeLtMmio {
-            xe3: false,
+            lt_phy: false,
             ..FakeLtMmio::default()
         };
         assert!(matches!(
-            LtPhy::new(&wrong_family, WclLtPort::Tc1, true, 4, false),
+            LtPhy::new(&wrong_family, LtPort::Tc1, true, 4, false),
             Err(Cx0Error::ProtocolMismatch)
         ));
 
         let fake = FakeLtMmio::default();
         fake.bad_ack.set(true);
-        let phy = LtPhy::new(&fake, WclLtPort::Tc2, true, 2, false).unwrap();
+        let phy = LtPhy::new(&fake, LtPort::Tc2, true, 2, false).unwrap();
         assert_eq!(
             phy.program_transmitters(2, false),
             Err(Cx0Error::ProtocolMismatch)
@@ -1471,12 +1527,12 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_transport_rejects_family_and_bad_ack
+        smoke_nvl_lt_phy_transport_rejects_family_and_bad_ack
     );
 
-    fn smoke_wcl_lt_phy_transport_programs_signal_levels() -> TestResult {
+    fn smoke_nvl_lt_phy_transport_programs_signal_levels() -> TestResult {
         let fake = FakeLtMmio::default();
-        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        let phy = LtPhy::new(&fake, LtPort::Tc1, true, 4, false).unwrap();
         phy.program_signal_levels(LtSignalProtocol::Dp14, &[1, 9, 0, 6])
             .unwrap();
         assert_eq!(fake.vdr.borrow().get(&(0, 0x0408)).copied(), Some(0x18));
@@ -1492,7 +1548,7 @@ mod tests {
         );
 
         let alt2 = FakeLtMmio::default();
-        let phy2 = LtPhy::new(&alt2, WclLtPort::Tc2, true, 2, false).unwrap();
+        let phy2 = LtPhy::new(&alt2, LtPort::Tc2, true, 2, false).unwrap();
         phy2.program_signal_levels(LtSignalProtocol::Uhbr, &[15, 0])
             .unwrap();
         assert_eq!(alt2.vdr.borrow().get(&(0, 0x0402)).copied(), Some(2));
@@ -1503,12 +1559,12 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_transport_programs_signal_levels
+        smoke_nvl_lt_phy_transport_programs_signal_levels
     );
 
-    fn smoke_wcl_lt_phy_enable_disable_sequence() -> TestResult {
+    fn smoke_nvl_lt_phy_enable_disable_sequence() -> TestResult {
         let fake = FakeLtMmio::default();
-        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        let phy = LtPhy::new(&fake, LtPort::Tc1, true, 4, false).unwrap();
         phy.enable_dp(LtDpEnable {
             rate: LtDpRate::Hbr3,
             lane_count: 4,
@@ -1571,12 +1627,12 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_enable_disable_sequence
+        smoke_nvl_lt_phy_enable_disable_sequence
     );
 
-    fn smoke_wcl_lt_phy_clock_selection_and_width_refusal() -> TestResult {
+    fn smoke_nvl_lt_phy_clock_selection_and_width_refusal() -> TestResult {
         let fake = FakeLtMmio::default();
-        let phy = LtPhy::new(&fake, WclLtPort::Tc2, true, 2, false).unwrap();
+        let phy = LtPhy::new(&fake, LtPort::Tc2, true, 2, false).unwrap();
         phy.program_port_clock(LtDpRate::Uhbr10, true).unwrap();
         assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, SSC_ENABLE_PLLA);
         assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, 0);
@@ -1596,6 +1652,6 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
-        smoke_wcl_lt_phy_clock_selection_and_width_refusal
+        smoke_nvl_lt_phy_clock_selection_and_width_refusal
     );
 }

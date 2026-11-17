@@ -413,15 +413,18 @@ display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
 future external owner to TC1/TC2 and scans only Pipes B/C; it is not selected
 by a production entry point. No decode/read/route returns the IP and the
-profile grants no LT-PHY or modeset authority. `intel_gpu_lt_phy` is an
-additional pure model of the WCL TC1/TC2
-LT-PHY boundary: exact RBR-through-UHBR20 DP PLL/VDR images, transmitter
+profile grants no C20-PHY or modeset authority. Linux's source boundary is
+explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
+LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
+additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact
+RBR-through-UHBR20 DP PLL/VDR images, transmitter
 ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
-executes those images only for a display-30-qualified window and implements the
+executes those images only when `MmioWindow::has_lt_phy()` carries that exact
+platform fact and implements the
 retrying LT P2P transmitter transaction with ACK/error validation and bounded
 settling, plus source DP 1.4/UHBR per-lane swing/cursor RMWs; only fake-MMIO
 fixtures call it. Its disconnected enable/disable state machine covers LT
-MacCLK/lane reset, P2/P0 transitions, PLL rate calibration and display-30 clock
+MacCLK/lane reset, P2/P0 transitions, PLL rate calibration and display-35 clock
 selection, but requires DC-off and Type-C/D2D/AUX ownership from a future
 caller. It is not an operational route.
 Every other operational IP is a typed `IpError`: `Absent`,

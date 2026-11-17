@@ -244,6 +244,13 @@ pub trait MmioWindow {
     fn cx0_xe3(&self) -> bool {
         false
     }
+    /// Whether this exact source platform has Linux's LT PHY. This is a
+    /// platform fact, not a display-version test: current Linux defines
+    /// `HAS_LT_PHY(display)` as `platform.novalake`, while display-30
+    /// Panther/Wildcat Lake still use C10/C20.
+    fn has_lt_phy(&self) -> bool {
+        false
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;
