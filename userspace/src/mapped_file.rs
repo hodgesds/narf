@@ -3198,6 +3198,11 @@ pub(crate) fn publish_shared_file_pages_checked(
     // For the coherence check's report: read before the cache lock.
     let checks = writeback::checks_enabled();
     let ino = if checks { ops.ino() } else { 0 };
+    // The file's size at publish time, read before the cache lock like
+    // `cache_generation`: a fill the file shrank past has nothing left to
+    // re-read, so the stale branch below publishes it instead of freeing
+    // it (see there).
+    let file_size = ops.stat().size;
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         let stale_fill = changes_at_read.is_some_and(|changes| {
@@ -3219,7 +3224,18 @@ pub(crate) fn publish_shared_file_pages_checked(
                                 || page.wb_pins != 0)
                     })
             });
-            if !all_cached {
+            // A stale fill is normally freed so the caller reads again —
+            // but when the file shrank past every candidate offset while
+            // the fill was in flight, there is nothing left to re-read:
+            // the next attempt would fail the EOF check in
+            // `load_file_demand_page` and turn a zap-cancelled fault into
+            // a SIGBUS instead of the silent drop. Fall through to the
+            // publish loop instead: the candidate is published as
+            // canonical with `cache_generation` unset, so it is never
+            // authoritative and never mapped — the zap revoked the
+            // registration and cancelled the demand ticket, so finish
+            // refuses it.
+            if !all_cached && offset < file_size {
                 drop(pages);
                 for candidate in candidates {
                     if candidate.raw() != 0 {
@@ -3268,8 +3284,16 @@ pub(crate) fn publish_shared_file_pages_checked(
                         .get(&stale_phys)
                         .is_some_and(|stale| stale.mappings == 0 && stale.pending == 0));
                     // A fill read across a change to the file may be the stale side.
+                    // A page published without a generation — a fill the file
+                    // shrank past — carries no generation discipline, so its
+                    // bytes cannot be compared against a fresh read: skip the
+                    // check, or a later regrow reports a false WB-INVARIANT.
                     if checks && cache_generation.is_some() {
-                        if let Some(stale) = pages.by_phys.get(&stale_phys) {
+                        if let Some(stale) = pages
+                            .by_phys
+                            .get(&stale_phys)
+                            .filter(|stale| stale.cache_generation.is_some())
+                        {
                             check_replaced_page(stale, candidate, ino);
                         }
                     }
