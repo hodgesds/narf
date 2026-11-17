@@ -152,11 +152,11 @@ const SERVER_CLOSE_NOTIFY_RECORD: &str = "1703030013b58fd67166ebf599d24720cfbe7e
 /// First 21 bytes of the trace's encrypted server-flight record
 /// (header + 16 ciphertext bytes) — the anchor for the constructed
 /// flight record.
-const FLIGHT_RECORD_PREFIX: &str = "17030302a2d1ff334a56f5bff6594a077869fcf40aa4";
+const FLIGHT_RECORD_PREFIX: &str = "17030302a2d1ff334a56f5bff6594a07cc87b58023";
 /// First 21 bytes of the trace's NewSessionTicket record.
 const NST_RECORD_PREFIX: &str = "17030300de3a6b8f90414a97d6959c3487680de513";
 /// First 21 bytes of the trace's server application-data record.
-const SERVER_APP_RECORD_PREFIX: &str = "17030300432e937e11ef4ac740e538ad36005fc4a469";
+const SERVER_APP_RECORD_PREFIX: &str = "17030300432e937e11ef4ac740e538ad36005fc4a4";
 
 /// The application-data payload both sides send, RFC 8448 §3.
 fn app_payload() -> Vec<u8> {
@@ -379,9 +379,15 @@ fn key_schedule_matches_rfc8448() -> TestResult {
     kt_assert_eq!(res, arr32(RES_MASTER));
 
     // Finished verify_data values.
+    // The server Finished verify_data is over the transcript WITHOUT
+    // the Finished message itself (RFC 8446 §4.4.4); `full` includes
+    // it, which is correct for the client Finished check below but
+    // not for this one.
+    let mut pre_finished = full.clone();
+    pre_finished.truncate(pre_finished.len() - hex(SERVER_FINISHED).len());
     let s_finished_key = hkdf_expand_label(&s_hs, "finished", b"", 32);
     kt_assert_eq!(
-        hmac_sha256(&s_finished_key, &sha256(&full)).as_slice(),
+        hmac_sha256(&s_finished_key, &sha256(&pre_finished)).as_slice(),
         hex(SERVER_FINISHED_VERIFY).as_slice()
     );
     let c_finished_key = hkdf_expand_label(&c_hs, "finished", b"", 32);
@@ -725,8 +731,9 @@ fn rfc_cert_parses_and_self_verifies() -> TestResult {
     kt_assert_eq!(cert.cn, Some(b"rsa".as_slice()));
     kt_assert!(cert.san_dns.is_empty());
     kt_assert!(!cert.is_ca);
-    kt_assert_eq!(cert.not_before, 1_469_829_039); // 2016-07-30T01:23:59Z
-    kt_assert_eq!(cert.not_after, 1_785_452_239); // 2026-07-30T01:23:59Z
+    // UTC epochs of the DER's UTCTime validity fields.
+    kt_assert_eq!(cert.not_before, 1_469_841_839); // 2016-07-30T01:23:59Z
+    kt_assert_eq!(cert.not_after, 1_785_374_639); // 2026-07-30T01:23:59Z
     kt_assert!(matches!(
         cert.spki,
         crate::tls_x509::Spki::Rsa { e: 65537, .. }
