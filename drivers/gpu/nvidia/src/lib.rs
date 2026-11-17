@@ -47,6 +47,7 @@ pub mod fifo;
 pub mod flip;
 pub mod gr;
 pub mod gsp;
+pub mod gsp_fw;
 pub mod hdcp;
 pub mod hpd;
 pub mod irq;
@@ -73,4 +74,12 @@ pub fn register_initcalls() {
         pci::register_pci_driver();
         InitResult::Ok
     });
+}
+
+/// Register the `Stage::Late` GSP firmware acquisition pass (Turing+).
+/// Must be called *after* the firmware initramfs/rootfs scans are
+/// registered so the registry is populated when the pass runs; see
+/// [`gsp_fw::register_gsp_firmware_pass`].
+pub fn register_gsp_firmware_pass() {
+    gsp_fw::register_gsp_firmware_pass();
 }

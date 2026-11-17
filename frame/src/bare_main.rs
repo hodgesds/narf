@@ -4031,6 +4031,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             narf_bluetooth::register_firmware_initcalls();
             narf_drivers_net::register_late_firmware_initcalls();
+            // GSP firmware acquisition (Turing+). Registered here, after the
+            // firmware scans, so the registry is populated when the Late pass
+            // runs (registration order is execution order within a stage).
+            narf_drivers_nvidia::register_gsp_firmware_pass();
 
             // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
             // and pacman-shaped writes on the mounted root, run only when the

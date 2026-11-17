@@ -4289,3 +4289,245 @@ fn smoke_nvidia_single_pci_probe_owner() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/pci", smoke_nvidia_single_pci_probe_owner);
+
+// ────────────────────────────────────────────────────────────────
+// GSP firmware acquisition + nvfw container parse (lane GSP-1)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_fw::{
+    acquire, blob_name, fw_dir, parse_booter, required_blobs, AcquireError, BlobOutcome,
+    BlobResult, GspBlobKind, GspFirmware, NvfwError, GSP_FW_VERSION,
+};
+
+/// Write a little-endian u32 at `off` into a test fixture buffer.
+fn gsp_put_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn smoke_gsp_fw_required_blobs_per_family() -> TestResult {
+    // Turing: booter pair + bootloader + RM image.
+    if required_blobs(ChipFamily::Turing).len() != 4 {
+        return TestResult::Fail("Turing should need exactly four GSP blobs");
+    }
+    // Ampere/Ada add the VRAM scrubber HS ucode.
+    for fam in [ChipFamily::Ampere, ChipFamily::Ada] {
+        let set = required_blobs(fam);
+        if set.len() != 5 {
+            return TestResult::Fail("Ampere/Ada should need five GSP blobs");
+        }
+        if !set.contains(&GspBlobKind::Scrubber) {
+            return TestResult::Fail("Ampere/Ada must include the scrubber blob");
+        }
+    }
+    // Pre-GSP families need nothing from this path.
+    for fam in [ChipFamily::Maxwell, ChipFamily::Pascal, ChipFamily::Volta] {
+        if !required_blobs(fam).is_empty() {
+            return TestResult::Fail("pre-Turing families need no GSP blobs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_fw",
+    smoke_gsp_fw_required_blobs_per_family
+);
+
+fn smoke_gsp_fw_dir_and_name() -> TestResult {
+    // Discrete ASIC tags match linux-firmware directories 1:1.
+    if fw_dir("tu102") != Some("tu102") || fw_dir("ga102") != Some("ga102") {
+        return TestResult::Fail("discrete GSP ASICs must map to their own fw dir");
+    }
+    // Mobile AD106M shares the AD106 firmware directory.
+    if fw_dir("ad106m") != Some("ad106") {
+        return TestResult::Fail("ad106m must fold onto the ad106 firmware dir");
+    }
+    // A non-GSP ASIC has no firmware directory.
+    if fw_dir("gp104").is_some() {
+        return TestResult::Fail("pre-Turing ASIC must have no GSP fw dir");
+    }
+    // Canonical blob name format.
+    let name = blob_name("tu102", GspBlobKind::BooterLoad, GSP_FW_VERSION);
+    if name != "nvidia/tu102/gsp/booter_load-535.113.01.bin" {
+        return TestResult::Fail("blob_name format drifted from nvidia/<dir>/gsp/<stem>-<ver>.bin");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_dir_and_name);
+
+fn smoke_gsp_fw_blob_kind_classification() -> TestResult {
+    // Booter pair + scrubber are HS containers GSP-1 parses.
+    for k in [
+        GspBlobKind::BooterLoad,
+        GspBlobKind::BooterUnload,
+        GspBlobKind::Scrubber,
+    ] {
+        if !k.is_hs_container() {
+            return TestResult::Fail("booter/scrubber blobs must be HS containers");
+        }
+    }
+    // The RM image and RISC-V bootloader are not HS-container-parsed here.
+    for k in [GspBlobKind::Bootloader, GspBlobKind::GspRm] {
+        if k.is_hs_container() {
+            return TestResult::Fail("bootloader/gsp image must not parse as HS in GSP-1");
+        }
+    }
+    if GspBlobKind::GspRm.stem() != "gsp" || GspBlobKind::BooterUnload.stem() != "booter_unload" {
+        return TestResult::Fail("blob stem drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_fw",
+    smoke_gsp_fw_blob_kind_classification
+);
+
+/// Build a minimal-but-well-formed booter (HS) container fixture.
+fn gsp_booter_fixture() -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0u8; 0x100];
+    // nvfw_bin_hdr @ 0.
+    gsp_put_u32(&mut buf, 0, 0x10DE_1234); // bin_magic
+    gsp_put_u32(&mut buf, 4, 2); // bin_ver
+    gsp_put_u32(&mut buf, 8, 0x100); // bin_size
+    gsp_put_u32(&mut buf, 12, 0x80); // header_offset -> hs header
+    gsp_put_u32(&mut buf, 16, 0x40); // data_offset  -> image
+    gsp_put_u32(&mut buf, 20, 0x40); // data_size
+                                     // nvfw_hs_header_v2 @ 0x80.
+    gsp_put_u32(&mut buf, 0x80, 0xC0); // sig_prod_offset
+    gsp_put_u32(&mut buf, 0x84, 0x10); // sig_prod_size
+    gsp_put_u32(&mut buf, 0x98, 1); // num_sig
+    gsp_put_u32(&mut buf, 0x9C, 0xA4); // header_offset -> load header
+    gsp_put_u32(&mut buf, 0xA0, 0x14); // header_size
+                                       // nvfw_hs_load_header_v2 @ 0xA4.
+    gsp_put_u32(&mut buf, 0xA4, 0); // os_code_offset
+    gsp_put_u32(&mut buf, 0xA8, 0x20); // os_code_size
+    gsp_put_u32(&mut buf, 0xAC, 0x20); // os_data_offset
+    gsp_put_u32(&mut buf, 0xB0, 0x20); // os_data_size
+    buf
+}
+
+fn smoke_gsp_fw_parse_booter_valid() -> TestResult {
+    let buf = gsp_booter_fixture();
+    let img = match parse_booter(&buf) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("well-formed booter fixture failed to parse"),
+    };
+    if img.bin_magic != 0x10DE_1234 || img.bin_ver != 2 {
+        return TestResult::Fail("bin header fields mis-decoded");
+    }
+    if img.image_offset != 0x40 || img.image_size != 0x40 {
+        return TestResult::Fail("image offset/size mis-decoded");
+    }
+    if img.sig_offset != 0xC0 || img.sig_size != 0x10 {
+        return TestResult::Fail("production signature mis-decoded");
+    }
+    if img.code_offset != 0 || img.code_size != 0x20 {
+        return TestResult::Fail("os code segment mis-decoded");
+    }
+    if img.data_offset != 0x20 || img.data_size != 0x20 {
+        return TestResult::Fail("os data segment mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_parse_booter_valid);
+
+fn smoke_gsp_fw_parse_booter_rejects_malformed() -> TestResult {
+    // Too small for even the bin header.
+    if parse_booter(&[0u8; 8]) != Err(NvfwError::TooSmall) {
+        return TestResult::Fail("short buffer must be TooSmall");
+    }
+    // Image that runs off the end of the blob.
+    let mut buf = gsp_booter_fixture();
+    gsp_put_u32(&mut buf, 20, 0xFFFF_FFFF); // data_size
+    match parse_booter(&buf) {
+        Err(NvfwError::OutOfBounds("bin.data")) => {}
+        _ => return TestResult::Fail("oversized image must be rejected OutOfBounds(bin.data)"),
+    }
+    // HS header offset past the end of the blob.
+    let mut buf = gsp_booter_fixture();
+    gsp_put_u32(&mut buf, 12, 0xF000); // header_offset
+    match parse_booter(&buf) {
+        Err(NvfwError::OutOfBounds("hs_header_v2")) => {}
+        _ => return TestResult::Fail("far hs header must be rejected OutOfBounds(hs_header_v2)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_fw",
+    smoke_gsp_fw_parse_booter_rejects_malformed
+);
+
+fn smoke_gsp_fw_acquire_family_gate() -> TestResult {
+    let (_w, fw) = narf_firmware::bootstrap_authority();
+    // Pre-Turing card: acquisition refuses outright.
+    let pascal = crate::chip::chip_info_for_pci_id(NVIDIA_VENDOR, GP104_GTX_1080).unwrap();
+    if acquire(pascal, &fw) != Err(AcquireError::NotGspFamily) {
+        return TestResult::Fail("acquire must refuse a non-GSP family");
+    }
+    // Turing card: produces a report with one outcome per required
+    // blob, names fully formed. (Presence depends on the registry;
+    // we assert only the invariant shape so the test is hermetic.)
+    let turing =
+        crate::chip::chip_info_for_pci_id(NVIDIA_VENDOR, crate::chip::TU102_RTX_2080_TI).unwrap();
+    let report = match acquire(turing, &fw) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("acquire must succeed for a GSP family"),
+    };
+    if report.blobs.len() != required_blobs(ChipFamily::Turing).len() {
+        return TestResult::Fail("report must carry one outcome per required blob");
+    }
+    let first = &report.blobs[0];
+    if first.kind != GspBlobKind::BooterLoad
+        || first.name != "nvidia/tu102/gsp/booter_load-535.113.01.bin"
+    {
+        return TestResult::Fail("first Turing blob must be the formatted booter_load name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_acquire_family_gate);
+
+fn smoke_gsp_fw_report_completeness() -> TestResult {
+    use alloc::string::String;
+    use alloc::vec;
+    let loaded = |kind: GspBlobKind| BlobOutcome {
+        kind,
+        name: String::from("x"),
+        result: BlobResult::Loaded {
+            size: 1,
+            booter: None,
+        },
+    };
+    let complete = GspFirmware {
+        asic: "tu102",
+        family: ChipFamily::Turing,
+        blobs: vec![loaded(GspBlobKind::Bootloader), loaded(GspBlobKind::GspRm)],
+    };
+    if !complete.is_complete() || complete.missing_count() != 0 {
+        return TestResult::Fail("all-Loaded report must be complete with zero missing");
+    }
+    let partial = GspFirmware {
+        asic: "tu102",
+        family: ChipFamily::Turing,
+        blobs: vec![
+            loaded(GspBlobKind::Bootloader),
+            BlobOutcome {
+                kind: GspBlobKind::GspRm,
+                name: String::from("y"),
+                result: BlobResult::Missing,
+            },
+        ],
+    };
+    if partial.is_complete() || partial.missing_count() != 1 {
+        return TestResult::Fail("report with a Missing blob must not be complete");
+    }
+    // An empty report is not "complete".
+    let empty = GspFirmware {
+        asic: "tu102",
+        family: ChipFamily::Turing,
+        blobs: vec![],
+    };
+    if empty.is_complete() {
+        return TestResult::Fail("empty report must not count as complete");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_fw", smoke_gsp_fw_report_completeness);
