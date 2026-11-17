@@ -900,6 +900,8 @@ pub(crate) mod intel_gpu_xe2lpd;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xe3lpd;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xe3plpd;
+#[cfg(feature = "intel")]
 mod intel_gpu_xe_query;
 #[cfg(feature = "intel")]
 mod intel_gpu_xe_sync;

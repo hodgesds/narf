@@ -461,6 +461,12 @@ ARGB/ABGR FP16 formats out of the live Display-20 owner, forms the FP16-only
 cache image from a 4 KiB-aligned stolen-memory offset. Wa_14025769978 leaves
 cache-read-enable clear. These helpers perform no MMIO and do not enable Nova
 Lake FBC.
+`intel_gpu_xe3plpd` keeps the remaining Display-35 plane/transcoder dialect
+separate from the Display-30 writer: it omits `TRANS_VSYNCSHIFT` and all
+`TRANSCONF` interlace fields, treats pipe interlace readback as false, admits
+horizontal reflection for linear/X surfaces but not Tile4, and requires 2x
+vertical alignment for semiplanar YUV (2x in both axes when rotated). These
+are pure admission/planning helpers and do not enable a modeset route.
 `intel_gpu_dmc::DmcPlatform` keeps `Xe3Lpd`, `WildcatLake` and `Xe3pLpd`
 distinct despite their shared 0x8000 container ceiling. Display 30's DC
 service is admitted only from KMS's retained exact identity and selects
@@ -3889,6 +3895,9 @@ disable.
 The same module exposes disconnected Display-35 format admission,
 pixel-normalizer and system-cache images. They do not broaden the live
 Display-20 owner or perform MMIO.
+`intel_gpu_xe3plpd::{transcoder_dialect,check_plane}` exposes the disconnected
+Display-35 transcoder and source-coordinate decisions described above; neither
+helper writes registers.
 
 `intel_gpu_psr` is display 14's PSR1 and PSR2 with selective fetch:
 `Sink::read`,
