@@ -65,6 +65,12 @@ pub enum FwsecError {
     /// The fuse version is not among the descriptor's signature
     /// versions.
     NoMatchingSignature,
+    /// No BIT table (`\xff\xb8BIT`) was found in the VBIOS.
+    VbiosNoBit,
+    /// No falcon-data (`0x70`) token was found in the BIT table.
+    VbiosNoFalconData,
+    /// No production FWSEC (`0x85`) entry was found in the PMU table.
+    VbiosNoFwsec,
 }
 
 /// The v3 Falcon ucode descriptor (44 bytes). Cite
@@ -273,4 +279,108 @@ pub fn patch_signature(
         .ok_or(FwsecError::OutOfBounds("sig_dst"))?
         .copy_from_slice(sig);
     Ok(())
+}
+
+// ── F2: locate FWSEC in the VBIOS (BIT → PMU → desc) ─────────────
+//
+// On a raw ROM read the chain uses absolute byte offsets (the nvkm
+// flat-ROM model): scan for the BIT table, follow its falcon-data
+// (0x70) token to the PMU lookup table, find the production FWSEC
+// (0x85) entry, and read the FalconUCodeDesc offset from it. Cite
+// `nvkm/subdev/bios/{bit,pmu}.c` + nova-core `vbios.rs`.
+
+/// BIT table signature (`0xff 0xb8 "BIT"`).
+pub const BIT_MAGIC: [u8; 5] = [0xff, 0xb8, b'B', b'I', b'T'];
+/// BIT token id for the falcon/PMU data pointer.
+pub const BIT_TOKEN_FALCON_DATA: u8 = 0x70;
+
+/// Where the FWSEC ucode lives within the VBIOS image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FwsecLocation {
+    /// Offset of the `FalconUCodeDesc`.
+    pub desc_offset: usize,
+    /// Offset of the ucode image (`desc + header_size`).
+    pub ucode_offset: usize,
+    /// Length of the ucode image (`imem_load_size + dmem_load_size`).
+    pub ucode_len: usize,
+    /// Offset of the first RSA signature (`desc + descriptor size`).
+    pub sig_offset: usize,
+}
+
+fn rom_rd16(rom: &[u8], o: usize) -> Option<u16> {
+    rom.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn rom_rd32(rom: &[u8], o: usize) -> Option<u32> {
+    rom.get(o..o + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Scan the VBIOS for the BIT table, returning the offset of its
+/// signature.
+pub fn find_bit_offset(rom: &[u8]) -> Option<usize> {
+    rom.windows(BIT_MAGIC.len()).position(|w| w == BIT_MAGIC)
+}
+
+/// Follow the BIT table's falcon-data (`0x70`) token to the location
+/// that holds the PMU-table pointer. The BIT header carries the entry
+/// stride at `+9` and the entry count at `+10`; entries start at
+/// `+12`, each `{id@0, version@1, length@2 (u16), offset@4 (u16)}`.
+pub fn find_falcon_data_ptr(rom: &[u8], bit_off: usize) -> Option<usize> {
+    let stride = *rom.get(bit_off + 9)? as usize;
+    let count = *rom.get(bit_off + 10)? as usize;
+    let base = bit_off + 12;
+    for i in 0..count {
+        let e = base + i * stride;
+        if *rom.get(e)? == BIT_TOKEN_FALCON_DATA {
+            return Some(rom_rd16(rom, e + 4)? as usize);
+        }
+    }
+    None
+}
+
+/// Locate the production FWSEC ucode in a raw VBIOS image. Walks
+/// BIT → falcon-data pointer → PMU lookup table → the `0x85`
+/// (FWSEC_PROD) entry → the `FalconUCodeDesc`, then reads the
+/// descriptor to bound the ucode + signature regions. All offsets are
+/// absolute within `rom` and bounds-checked.
+pub fn locate_fwsec(rom: &[u8]) -> Result<FwsecLocation, FwsecError> {
+    let bit = find_bit_offset(rom).ok_or(FwsecError::VbiosNoBit)?;
+    let fdp = find_falcon_data_ptr(rom, bit).ok_or(FwsecError::VbiosNoFalconData)?;
+    // The PMU lookup table pointer is a u32 at the falcon-data location.
+    let pmu = rom_rd32(rom, fdp).ok_or(FwsecError::VbiosNoFalconData)? as usize;
+    // PMU header: ver@0, hdr@1, entry-len@2, count@3.
+    let hdr = *rom.get(pmu + 1).ok_or(FwsecError::VbiosNoFwsec)? as usize;
+    let len = *rom.get(pmu + 2).ok_or(FwsecError::VbiosNoFwsec)? as usize;
+    let cnt = *rom.get(pmu + 3).ok_or(FwsecError::VbiosNoFwsec)? as usize;
+    // Entries: {application_id@0 (u8), target_id@1 (u8), data@2 (u32)}.
+    let mut desc_offset = None;
+    for i in 0..cnt {
+        let e = pmu + hdr + i * len;
+        if *rom.get(e).ok_or(FwsecError::VbiosNoFwsec)? == APPID_FWSEC_PROD {
+            desc_offset = Some(rom_rd32(rom, e + 2).ok_or(FwsecError::VbiosNoFwsec)? as usize);
+            break;
+        }
+    }
+    let desc_offset = desc_offset.ok_or(FwsecError::VbiosNoFwsec)?;
+    // Read the descriptor to size the ucode + signature regions.
+    let desc_bytes = rom
+        .get(desc_offset..desc_offset + FalconUcodeDescV3::SIZE)
+        .ok_or(FwsecError::OutOfBounds("vbios_desc"))?;
+    let desc = FalconUcodeDescV3::parse(desc_bytes)?;
+    let ucode_offset = desc_offset + desc.header_size();
+    let ucode_len = desc.imem_load_size as usize + desc.dmem_load_size as usize;
+    // The ucode image must lie within the ROM.
+    if ucode_offset
+        .checked_add(ucode_len)
+        .is_none_or(|end| end > rom.len())
+    {
+        return Err(FwsecError::OutOfBounds("vbios_ucode"));
+    }
+    Ok(FwsecLocation {
+        desc_offset,
+        ucode_offset,
+        ucode_len,
+        sig_offset: desc_offset + FalconUcodeDescV3::SIZE,
+    })
 }

@@ -5274,3 +5274,91 @@ kernel_test_in!(
     "drivers/nvidia/fwsec",
     smoke_fwsec_signature_select_and_patch
 );
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC F2 — locate the ucode in the VBIOS (BIT → PMU → desc)
+// ────────────────────────────────────────────────────────────────
+
+use crate::fwsec::{find_bit_offset, find_falcon_data_ptr, locate_fwsec, BIT_TOKEN_FALCON_DATA};
+
+/// Build a synthetic VBIOS with a BIT table → falcon-data token →
+/// PMU lookup table → FWSEC_PROD entry → FalconUCodeDesc.
+fn fwsec_rom_fixture() -> alloc::vec::Vec<u8> {
+    let mut r = alloc::vec![0u8; 0x500];
+    let p16 = |r: &mut [u8], o: usize, v: u16| r[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let p32 = |r: &mut [u8], o: usize, v: u32| r[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // BIT table @ 0x60.
+    r[0x60..0x65].copy_from_slice(&[0xff, 0xb8, b'B', b'I', b'T']);
+    r[0x69] = 6; // entry stride
+    r[0x6A] = 2; // entry count
+                 // entry 0 @ 0x6C: some other token.
+    r[0x6C] = 0x41;
+    // entry 1 @ 0x72: falcon-data token 0x70, offset field @ +4.
+    r[0x72] = BIT_TOKEN_FALCON_DATA;
+    p16(&mut r, 0x76, 0x100); // falcon-data pointer location
+                              // @ 0x100: u32 = PMU table offset.
+    p32(&mut r, 0x100, 0x120);
+    // PMU table header @ 0x120: ver, hdr=4, entry-len=6, count=2.
+    r[0x120] = 1;
+    r[0x121] = 4;
+    r[0x122] = 6;
+    r[0x123] = 2;
+    // PMU entry 0 @ 0x124: app_id 0x01 (skip).
+    r[0x124] = 0x01;
+    // PMU entry 1 @ 0x12A: app_id 0x85 (FWSEC_PROD), data @ +2 = desc.
+    r[0x12A] = 0x85;
+    p32(&mut r, 0x12C, 0x200);
+    // FalconUCodeDesc @ 0x200: header_size 0x1AC (0x2c + one 384B sig),
+    // version 3, valid; imem/dmem load sizes 0x40 each; 1 signature.
+    p32(&mut r, 0x200, (0x1AC << 16) | (3 << 8) | 1);
+    p32(&mut r, 0x214, 0x40); // imem_load_size
+    p32(&mut r, 0x220, 0x40); // dmem_load_size
+    r[0x227] = 1; // signature_count
+    r[0x228] = 1; // signature_versions
+    r
+}
+
+fn smoke_fwsec_locate_in_vbios() -> TestResult {
+    let rom = fwsec_rom_fixture();
+    // BIT scan.
+    if find_bit_offset(&rom) != Some(0x60) {
+        return TestResult::Fail("BIT table must be found at its signature");
+    }
+    // Falcon-data token resolution.
+    if find_falcon_data_ptr(&rom, 0x60) != Some(0x100) {
+        return TestResult::Fail("falcon-data token must resolve to its pointer");
+    }
+    // Full chain.
+    let loc = match locate_fwsec(&rom) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("FWSEC must be located in a well-formed VBIOS"),
+    };
+    if loc.desc_offset != 0x200 {
+        return TestResult::Fail("descriptor offset must come from the 0x85 entry");
+    }
+    // ucode at desc + header_size (0x1AC); sig at desc + 0x2c.
+    if loc.ucode_offset != 0x200 + 0x1AC || loc.ucode_len != 0x80 {
+        return TestResult::Fail("ucode must be sized from the descriptor");
+    }
+    if loc.sig_offset != 0x200 + 0x2c {
+        return TestResult::Fail("signatures must start right after the descriptor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_locate_in_vbios);
+
+fn smoke_fwsec_locate_rejects_missing() -> TestResult {
+    // No BIT table at all.
+    let blank = alloc::vec![0u8; 0x200];
+    if locate_fwsec(&blank) != Err(crate::fwsec::FwsecError::VbiosNoBit) {
+        return TestResult::Fail("a VBIOS with no BIT table must be rejected");
+    }
+    // BIT present but no FWSEC_PROD entry.
+    let mut rom = fwsec_rom_fixture();
+    rom[0x12A] = 0x01; // demote the 0x85 entry
+    if locate_fwsec(&rom) != Err(crate::fwsec::FwsecError::VbiosNoFwsec) {
+        return TestResult::Fail("a VBIOS with no FWSEC entry must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_locate_rejects_missing);
