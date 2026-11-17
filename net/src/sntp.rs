@@ -1166,10 +1166,18 @@ mod tests {
                 return TestResult::Fail("exchange against the fixture server failed");
             }
         };
-        // theta = offset + (1 ms - RTT)/2: 50.0–50.5 ms in this fixture.
-        if !(50_000_000..=51_000_000).contains(&sample.offset_ns) {
+        // The NTP offset reads low by RTT/2 under TCG: the exchange
+        // (UDP send + fixture deliver + recv) takes milliseconds of
+        // wall time, so the raw offset is 50.5 ms - RTT/2, not the
+        // 50.0-50.5 ms the old window assumed (RTT ~ 0). The
+        // RTT-corrected value offset + delay/2 is 50 ms for any
+        // round-trip time, so that is the invariant asserted here.
+        let corrected = sample.offset_ns + sample.delay_ns / 2;
+        if !(49_000_000..=51_000_000).contains(&corrected) {
             e2e_teardown();
-            return TestResult::Fail("fixture offset should read ~+50 ms");
+            return TestResult::Fail(
+                "fixture offset, corrected for the measured round trip, should read ~+50 ms",
+            );
         }
         if sample.stratum != 2 || sample.leap != 0 {
             e2e_teardown();
@@ -1194,14 +1202,17 @@ mod tests {
             return TestResult::Fail("no NTP request frame reached UDP/123");
         }
         // One discipline second: 1/16 of ~50 ms ≈ 3.1 ms into the wall.
-        // The range admits a second chunk if a live tick boundary crossed
-        // mid-test and the `on_tick` hook ran `tick_second` concurrently
-        // (the hook fires once per wall second from IRQ context).
+        // The floor is 2.4 ms, not 2.9 ms: the slew folds 1/16 of the
+        // measured offset, which reads low by RTT/2 under TCG, so one
+        // chunk of a ~40-50 ms offset is 2.5-3.1 ms. The range admits
+        // a second chunk if a live tick boundary crossed mid-test and
+        // the `on_tick` hook ran `tick_second` concurrently (the hook
+        // fires once per wall second from IRQ context).
         let before = narf_time::wall_offset_ns();
         narf_time::ntp::tick_second();
         let moved = narf_time::wall_offset_ns() - before;
         e2e_teardown();
-        if !(2_900_000..=6_400_000).contains(&moved) {
+        if !(2_400_000..=6_400_000).contains(&moved) {
             return TestResult::Fail("one discipline second should slew ~3.1 ms");
         }
         TestResult::Pass
@@ -1263,9 +1274,12 @@ mod tests {
         let mut st = PollState::new(PollConfig::new());
         match poll_round(&cfg, &mut st) {
             PollRoundOutcome::Synced { sample, outcome } => {
-                if !(50_000_000..=51_000_000).contains(&sample.offset_ns) {
+                let corrected = sample.offset_ns + sample.delay_ns / 2;
+                if !(49_000_000..=51_000_000).contains(&corrected) {
                     e2e_teardown();
-                    return TestResult::Fail("first poll round should read ~+50 ms");
+                    return TestResult::Fail(
+                        "first poll round, corrected for the measured round trip, should read ~+50 ms",
+                    );
                 }
                 if !matches!(outcome, DisciplineOutcome::Slewed(_)) {
                     e2e_teardown();
@@ -1409,9 +1423,12 @@ mod tests {
             e2e_teardown();
             return TestResult::Fail("the sample should come from the DHCP server");
         }
-        if !(50_000_000..=51_000_000).contains(&sample.offset_ns) {
+        let corrected = sample.offset_ns + sample.delay_ns / 2;
+        if !(49_000_000..=51_000_000).contains(&corrected) {
             e2e_teardown();
-            return TestResult::Fail("fixture offset should read ~+50 ms");
+            return TestResult::Fail(
+                "fixture offset, corrected for the measured round trip, should read ~+50 ms",
+            );
         }
         if !matches!(outcome, DisciplineOutcome::Slewed(_)) {
             e2e_teardown();
