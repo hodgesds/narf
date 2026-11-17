@@ -412,8 +412,11 @@ display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 480 MHz, `xe3lpd_3002_sa_info`'s 22 GB/s limit, Pipes/FBC A–C, and no Pipe-D
 MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
 future external owner to TC1/TC2 and scans only Pipes B/C; it is not selected
-by a production entry point. No decode/read/route returns the IP and the
-profile grants no C20-PHY or modeset authority. Linux's source boundary is
+by a production entry point. `MtlExternalService` retains that exact profile
+instead of reconstructing it from broad `Generation::PantherLake`; native
+fixtures run the existing display-30 C20/PICA DP-alt enable, training, fixed
+VRR-TG and stop path on TC1/TC2 and Pipes B/C. No decode/read/production route
+returns the IP. Linux's source boundary is
 explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
 LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
 additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact

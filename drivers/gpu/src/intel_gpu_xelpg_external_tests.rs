@@ -416,7 +416,7 @@ impl ExtFake {
         self.phy.write32(0x4_5004, 1 << 3);
         let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
         let mut vblank_start = [None; 4];
-        if ip == DisplayIp::Xe3Lpd {
+        if ip.is_display30() {
             let guardband =
                 crate::intel_gpu_xe3lpd::vrr_guardband_for(self, &mode, None, &latency).ok()?;
             vblank_start[0] = Some(mode.v_total - guardband);
@@ -501,7 +501,7 @@ impl MmioWindow for ExtFake {
         self.access.get()
     }
     fn cx0_xe3(&self) -> bool {
-        self.display_ip.get() == DisplayIp::Xe3Lpd
+        self.display_ip.get().is_display30()
     }
     fn read32(&self, off: u64) -> u32 {
         if !self.access.get() {
@@ -945,6 +945,61 @@ fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_ptl_external_tc_dp_uses_fixed_vrr_tg
+);
+
+fn smoke_wcl_external_tc_dp_uses_c20_and_three_pipe_profile() -> TestResult {
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel_ip(DisplayIp::WildcatLake) else {
+        return TestResult::Fail("the fixture must light the WCL panel profile");
+    };
+    let mut service = MtlExternalService::new();
+    service.set_profile(ExternalDisplayProfile::WILDCAT_LAKE);
+    service.set_display(MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    });
+    let event = MtlHpdEvent {
+        pin: MtlHpdPin::Tc1,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    if !matches!(
+        service.handle(&io, event, &mut fb_for),
+        ServiceOutcome::Activated {
+            port: XeLpgPort::Tc1,
+            protocol: MtlProtocol::Dp,
+            pipe: Pipe::B,
+            ..
+        }
+    ) {
+        return TestResult::Fail("WCL TC1 must activate on its first real external pipe");
+    }
+    let port = XeLpgPort::Tc1;
+    if io.writes_to(port.msgbus_ctl_ln0()).is_empty()
+        || !io.writes_to(0x16_f234).is_empty()
+        || io.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE == 0
+    {
+        return TestResult::Fail("WCL must use C20 and never the Nova Lake LT registers");
+    }
+    if !matches!(
+        service.handle(
+            &io,
+            MtlHpdEvent {
+                pin: MtlHpdPin::Tc1,
+                kind: MtlHpdKind::Disconnected,
+            },
+            &mut fb_for,
+        ),
+        ServiceOutcome::Withdrawn {
+            port: XeLpgPort::Tc1
+        }
+    ) {
+        return TestResult::Fail("WCL TC1 must stop and release on detach");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_wcl_external_tc_dp_uses_c20_and_three_pipe_profile
 );
 
 fn smoke_mtl_external_ddi_b_route_stop_and_release() -> TestResult {

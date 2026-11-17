@@ -1,11 +1,12 @@
-//! Intel Xe-LPDP/Xe2_LPD owned external DP SST route (Meteor/Arrow Lake and
-//! Lunar Lake USB-C).
+//! Intel Xe-LPDP/Xe2_LPD/Xe3_LPD owned external DP SST route (Meteor/Arrow,
+//! Lunar, Panther and Wildcat Lake USB-C).
 //!
 //! The internal-panel orchestrator ([`crate::intel_gpu_modeset_xelpg`])
 //! only re-programs an already-enabled DDI A. An external sink arrives
 //! with its DDI, PHY PLL, D2D link and (on Type-C) PHY ownership all off,
 //! so this module owns the complete off→on→off route for one DisplayPort
-//! SST stream on DDI B (C10) or TC1–TC4 (C20, DP-alt or declared legacy):
+//! SST stream on DDI B (C10) or TC1–TC4 (C20, DP-alt or declared legacy).
+//! Wildcat Lake's exact profile narrows this to TC1/TC2 and Pipes B/C:
 //!
 //! 1. [`probe_sink`] — Type-C connect ([`crate::intel_gpu_xelpg_tc`]), the
 //!    Xe-LPDP AUX power well, DPCD capabilities, complete EDID and
@@ -91,6 +92,11 @@
 //! resource transaction; on display 30 it also computes the fixed-refresh
 //! guardband and runs the mandatory VRR timing generator. Combo DDI B and
 //! HDMI remain typed refusals on both IPs.
+//! Wildcat Lake retains the same display-30 C20/PICA sequence but its distinct
+//! descriptor admits only TC1/TC2 and Pipes A–C. The service stores an exact
+//! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
+//! widen it to TC3/TC4 or Pipe D. That profile remains disconnected from the
+//! production probe/hotplug entry; native fixtures select it directly.
 //!
 //! ## DSC with FEC
 //!
@@ -163,32 +169,49 @@ use crate::intel_gpu_xelpg_tc::{
 
 /// Source-qualified external-display limits which cannot be inferred from
 /// [`Generation`].  Wildcat Lake shares the Panther Lake graphics generation
-/// but has the distinct display-30.02 descriptor: only TC1/TC2, Pipes A-C and
-/// LT PHYs.  Keeping that identity here prevents a future route from silently
-/// inheriting Panther Lake's TC3/TC4, Pipe D or C20 programming.
+/// but has the distinct display-30.02 descriptor: only external TC1/TC2 and
+/// Pipes A-C. Keeping that identity here prevents a future C20 route from
+/// silently inheriting Panther Lake's TC3/TC4 or Pipe D.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalDisplayProfile {
     display_ip: DisplayIp,
+    generation: Generation,
 }
 
 impl ExternalDisplayProfile {
     pub(crate) const WILDCAT_LAKE: Self = Self {
         display_ip: DisplayIp::WildcatLake,
+        generation: Generation::PantherLake,
     };
 
     const fn for_generation(generation: Generation) -> Option<Self> {
         match DisplayIp::for_generation(generation) {
-            Some(display_ip) => Some(Self { display_ip }),
+            Some(display_ip) => Some(Self {
+                display_ip,
+                generation,
+            }),
             None => None,
         }
     }
 
     const fn for_ip(display_ip: DisplayIp) -> Self {
-        Self { display_ip }
+        let generation = match display_ip {
+            DisplayIp::Xelpdp => Generation::MeteorLake,
+            DisplayIp::Xe2Lpd => Generation::LunarLake,
+            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => Generation::PantherLake,
+        };
+        Self {
+            display_ip,
+            generation,
+        }
     }
 
     pub(crate) const fn display_ip(self) -> DisplayIp {
         self.display_ip
+    }
+
+    const fn generation(self) -> Generation {
+        self.generation
     }
 
     pub(crate) const fn admits_port(self, port: XeLpgPort) -> bool {
@@ -2280,8 +2303,9 @@ pub struct MtlExternalService {
     route: Option<MtlRoute>,
     /// The live mode the retained route was connected in (for `Redetect`).
     live: LiveMode,
-    /// Active display generation for `probe_link` / `probe_hdmi`.
-    generation: Generation,
+    /// Active source-qualified display profile for probe/resource decisions;
+    /// absent for a generation outside this owner.
+    profile: Option<ExternalDisplayProfile>,
     policy: MtlPortPolicy,
     /// What activations share the display with (panel, pipe-DMC sink).
     display: MtlDisplay,
@@ -2306,7 +2330,7 @@ impl MtlExternalService {
         Self {
             route: None,
             live: LiveMode::Native,
-            generation: Generation::MeteorLake,
+            profile: Some(ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp)),
             policy,
             display: MtlDisplay::NONE,
             presence: None,
@@ -2322,9 +2346,17 @@ impl MtlExternalService {
     }
 
     /// Set the display generation (`MeteorLake`, `LunarLake`, `PantherLake`)
-    /// used on subsequent connect passes.
+    /// used on subsequent connect passes. Wildcat Lake needs
+    /// [`Self::set_profile`] because graphics generation is not a sufficient
+    /// display identity.
     pub fn set_generation(&mut self, generation: Generation) {
-        self.generation = generation;
+        self.profile = ExternalDisplayProfile::for_generation(generation);
+    }
+
+    /// Select an exact external-display profile which broad graphics
+    /// generation cannot distinguish (currently Wildcat Lake 30.02).
+    pub(crate) fn set_profile(&mut self, profile: ExternalDisplayProfile) {
+        self.profile = Some(profile);
     }
 
     /// What activations share the display with.
@@ -2378,14 +2410,20 @@ impl MtlExternalService {
         live: LiveMode,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
+        let Some(profile) = self.profile else {
+            return ServiceOutcome::Refused {
+                port,
+                error: RouteError::Dp(ExternalError::UnsupportedGeneration),
+            };
+        };
         let legacy = live == LiveMode::Legacy;
         let mut plan = route_plan(port, self.policy.decl(port), live);
         // The display-20 DP path is source-qualified below. HDMI still
         // carries display-14 PHY/D2D programming, so do not reach it by a
         // DDI-B fallback or a VBT HDMI-only declaration.
         if matches!(
-            self.generation,
-            Generation::LunarLake | Generation::PantherLake
+            profile.display_ip,
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake
         ) {
             plan = match plan {
                 RoutePlan::DpThenHdmi => RoutePlan::Dp,
@@ -2403,7 +2441,7 @@ impl MtlExternalService {
             },
             RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
             RoutePlan::Dp | RoutePlan::DpThenHdmi => {
-                match probe_link(io, self.generation, port, legacy) {
+                match probe_link_profile(io, profile, port, legacy) {
                     Ok(link) => self.connect_output(io, link, alloc),
                     Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
                         self.connect_hdmi(io, port, legacy, alloc)
@@ -2521,7 +2559,11 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let ddc = self.policy.ddc_pin(port);
-        let mut probe = match probe_hdmi(io, self.generation, port, legacy, ddc) {
+        let generation = self
+            .profile
+            .expect("HDMI connect follows a source-qualified route plan")
+            .generation();
+        let mut probe = match probe_hdmi(io, generation, port, legacy, ddc) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {

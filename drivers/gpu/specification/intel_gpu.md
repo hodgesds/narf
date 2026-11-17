@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.86** (v0.85 corrected against Linux 7.0-rc7 so LT PHY is
+> Status: **v0.87** (v0.86 plus a disconnected exact WCL external owner that
+> exercises TC1/TC2 DP-alt through C20 and Pipes B/C; v0.85 corrected against Linux 7.0-rc7 so LT PHY is
 > source-qualified to Nova Lake display 35.00 A/B/TC1/TC2 while Wildcat Lake
 > remains on C10/C20; Wildcat Lake's disconnected TC1/TC2-only
 > external-display and Pipe-B/C allocation profile; Nova Lake's disconnected source-order
@@ -309,8 +310,10 @@ programmed-bandwidth limit. Resource images and idle proofs never touch Pipe
 D. The disconnected `ExternalDisplayProfile::WILDCAT_LAKE` likewise admits
 only TC1/TC2 and scans only Pipes B/C, so sharing Panther Lake's graphics
 generation cannot silently grant TC3/TC4 or Pipe D authority. No production
-probe or hotplug entry selects it. Linux keeps WCL on the Panther Lake C20
-path; it does not select LT PHY.
+probe or hotplug entry selects it. The service retains the exact profile and
+native fixtures exercise C20 enable/training/fixed-TG/stop on TC1/TC2 and
+Pipes B/C. Linux keeps WCL on the Panther Lake C20 path; it does not select
+LT PHY.
 
 `intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
