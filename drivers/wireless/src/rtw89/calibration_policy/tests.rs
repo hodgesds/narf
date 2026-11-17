@@ -315,9 +315,11 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
         subsystem_vendor: 1,
         subsystem_id: 2,
     };
+    // RFE 1: the 8852A RF tables admit RFE {1, 2, 3, 0x25, 0x26,
+    // 0x32..0x36}; RFE 5 has no A profile (it is a B RFE).
     let mut model = FactoryModel {
         chip: ChipId::Rtl8852A,
-        rfe: 5,
+        rfe: 1,
         cut: 1,
         trim: 255,
     };
