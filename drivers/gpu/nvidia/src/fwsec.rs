@@ -23,6 +23,10 @@
 
 #![allow(dead_code)]
 
+use narf_driver_runtime::MmioRegion;
+
+use crate::falcon::{Falcon, FALCON_BASE_GSP, FALCON_MAILBOX0};
+
 // ── Constants (verified vs fwsec.c / nova-core fwsec.rs) ──────────
 
 /// VBIOS PMU-table application id for the production FWSEC ucode.
@@ -71,6 +75,15 @@ pub enum FwsecError {
     VbiosNoFalconData,
     /// No production FWSEC (`0x85`) entry was found in the PMU table.
     VbiosNoFwsec,
+    /// The GSP Falcon did not idle / halt within the poll budget.
+    FalconTimeout,
+    /// FWSEC halted with a non-zero MAILBOX0 status (its error code).
+    RunFailed(u32),
+    /// FWSEC ran but reported an FRTS error in the PBUS scratch
+    /// register (upper 16 bits).
+    FrtsRejected(u16),
+    /// FWSEC completed without establishing the WPR2 window.
+    Wpr2NotSet,
 }
 
 /// The v3 Falcon ucode descriptor (44 bytes). Cite
@@ -383,4 +396,84 @@ pub fn locate_fwsec(rom: &[u8]) -> Result<FwsecLocation, FwsecError> {
         ucode_len,
         sig_offset: desc_offset + FalconUcodeDescV3::SIZE,
     })
+}
+
+// ── F3: run FWSEC-FRTS on the GSP Falcon (hardware) ──────────────
+//
+// Turing loads FWSEC by PIO: the whole code region is a single secure
+// IMEM section, DMEM follows it. After it halts, success = MAILBOX0 == 0
+// + the PBUS FRTS scratch error == 0 + the WPR2 window established.
+// Cite `fwsec.c::nvkm_gsp_fwsec_{boot,frts}` + `gm200_flcn_fw_{load,boot}`.
+
+/// `NV_PBUS_SW_SCRATCH[0xe]` — carries the FWSEC-FRTS error code in
+/// bits[31:16]. Cite `fwsec.c` `nvkm_rd32(0x001400 + 0xe*4)`.
+pub const PBUS_FRTS_SCRATCH: u64 = 0x0000_1438;
+
+/// Decode the FRTS error code (upper 16 bits) from the scratch value.
+pub const fn frts_scratch_error(scratch: u32) -> u16 {
+    (scratch >> 16) as u16
+}
+
+/// The secure-IMEM slice of a v3 FWSEC ucode (the whole code region).
+pub fn fwsec_imem_slice<'a>(ucode: &'a [u8], desc: &FalconUcodeDescV3) -> Option<&'a [u8]> {
+    ucode.get(0..desc.imem_load_size as usize)
+}
+
+/// The DMEM slice of a v3 FWSEC ucode (follows IMEM in the image).
+pub fn fwsec_dmem_slice<'a>(ucode: &'a [u8], desc: &FalconUcodeDescV3) -> Option<&'a [u8]> {
+    let s = desc.dmem_base_img();
+    ucode.get(s..s + desc.dmem_load_size as usize)
+}
+
+/// Run the patched FWSEC-FRTS ucode on the GSP Falcon to carve WPR2.
+///
+/// `ucode` must already be patched ([`patch_frts`] + [`patch_signature`]).
+/// Stages the secure IMEM + DMEM by PIO, boots with MAILBOX0 = 0 and
+/// boot vector 0, waits for halt, then verifies MAILBOX0 == 0, the
+/// PBUS FRTS scratch error == 0, and that WPR2 is now established.
+///
+/// # Safety
+/// `bar0` is the mapped BAR0 window and the caller owns the GSP Falcon
+/// exclusively. Cannot be exercised under QEMU (no NVIDIA GPU).
+pub unsafe fn run_fwsec_frts(
+    bar0: &MmioRegion,
+    ucode: &[u8],
+    desc: &FalconUcodeDescV3,
+    max_polls: u32,
+) -> Result<(), FwsecError> {
+    let gsp = Falcon::new(bar0, FALCON_BASE_GSP, "fwsec");
+    let imem = fwsec_imem_slice(ucode, desc).ok_or(FwsecError::OutOfBounds("imem"))?;
+    let dmem = fwsec_dmem_slice(ucode, desc).ok_or(FwsecError::OutOfBounds("dmem"))?;
+    // SAFETY: caller owns the GSP Falcon + BAR0.
+    unsafe {
+        gsp.reset();
+        gsp.wait_idle(10_000)
+            .map_err(|_| FwsecError::FalconTimeout)?;
+        // v3: the whole code region is one SECURE IMEM section.
+        gsp.load_imem_v1(
+            imem,
+            desc.imem_phys_base,
+            (desc.imem_phys_base >> 8) as u16,
+            true,
+        );
+        gsp.load_dmem(dmem, desc.dmem_phys_base)
+            .map_err(|_| FwsecError::OutOfBounds("dmem_align"))?;
+        // Boot: mbox0 = 0, boot vector 0 (the BROM knows the entry).
+        gsp.wr32(FALCON_MAILBOX0, 0);
+        gsp.start(0);
+        gsp.wait_halt(max_polls)
+            .map_err(|_| FwsecError::FalconTimeout)?;
+        let status = gsp.mailbox0();
+        if status != 0 {
+            return Err(FwsecError::RunFailed(status));
+        }
+        let err = frts_scratch_error(bar0.read32(PBUS_FRTS_SCRATCH));
+        if err != 0 {
+            return Err(FwsecError::FrtsRejected(err));
+        }
+        if !crate::gsp_boot::wpr2_active(bar0) {
+            return Err(FwsecError::Wpr2NotSet);
+        }
+    }
+    Ok(())
 }

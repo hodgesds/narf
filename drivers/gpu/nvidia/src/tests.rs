@@ -5362,3 +5362,50 @@ fn smoke_fwsec_locate_rejects_missing() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_locate_rejects_missing);
+
+// ────────────────────────────────────────────────────────────────
+// FWSEC F3 — run helpers (slicing + scratch decode); run() is HW-only
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_fwsec_run_helpers() -> TestResult {
+    use crate::fwsec::{frts_scratch_error, fwsec_dmem_slice, fwsec_imem_slice};
+    // v3 descriptor: 0x40 IMEM, 0x20 DMEM (DMEM follows IMEM).
+    let desc = FalconUcodeDescV3 {
+        hdr: (0x2c << 16) | (3 << 8) | 1,
+        stored_size: 0,
+        pkc_data_offset: 0,
+        interface_offset: 0,
+        imem_phys_base: 0,
+        imem_load_size: 0x40,
+        imem_virt_base: 0,
+        dmem_phys_base: 0,
+        dmem_load_size: 0x20,
+        engine_id_mask: 0,
+        ucode_id: 0,
+        signature_count: 0,
+        signature_versions: 0,
+    };
+    let ucode = alloc::vec![0u8; 0x100];
+    let imem = fwsec_imem_slice(&ucode, &desc).unwrap();
+    let dmem = fwsec_dmem_slice(&ucode, &desc).unwrap();
+    if imem.len() != 0x40 {
+        return TestResult::Fail("IMEM slice must be the whole code region");
+    }
+    if dmem.len() != 0x20 {
+        return TestResult::Fail("DMEM slice must follow IMEM, sized by dmem_load_size");
+    }
+    // The FRTS error code is the upper 16 bits of the scratch register.
+    if frts_scratch_error(0x1234_abcd) != 0x1234 {
+        return TestResult::Fail("scratch error must be the upper 16 bits");
+    }
+    if frts_scratch_error(0x0000_ffff) != 0 {
+        return TestResult::Fail("a clean scratch (low bits only) means no error");
+    }
+    // A ucode too small for the declared sizes yields no slice.
+    let tiny = alloc::vec![0u8; 0x10];
+    if fwsec_imem_slice(&tiny, &desc).is_some() {
+        return TestResult::Fail("an undersized ucode must not slice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_run_helpers);
