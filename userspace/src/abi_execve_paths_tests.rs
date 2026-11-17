@@ -74,7 +74,63 @@ kernel_test_in!(
     execve_directory_in_installed_root_is_eacces
 );
 
-fn execve_path_errors_remain_distinct() -> TestResult {
+fn execve_empty_file_in_installed_root_is_enoexec() -> TestResult {
+    rooted(|| {
+        let path = b"/file\0";
+        if call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) != Some(ENOEXEC) {
+            return Err("execve /file did not return ENOEXEC");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/exec_path",
+    execve_empty_file_in_installed_root_is_enoexec
+);
+
+fn execve_missing_path_in_installed_root_is_enoent() -> TestResult {
+    rooted(|| {
+        let path = b"/missing\0";
+        if call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) != Some(ENOENT) {
+            return Err("execve /missing did not return ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/exec_path",
+    execve_missing_path_in_installed_root_is_enoent
+);
+
+fn execve_file_trailing_slash_in_installed_root_is_enotdir() -> TestResult {
+    rooted(|| {
+        let path = b"/file/\0";
+        if call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) != Some(ENOTDIR) {
+            return Err("execve /file/ did not return ENOTDIR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/exec_path",
+    execve_file_trailing_slash_in_installed_root_is_enotdir
+);
+
+fn execve_missing_under_file_in_installed_root_is_enotdir() -> TestResult {
+    rooted(|| {
+        let path = b"/file/missing\0";
+        if call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) != Some(ENOTDIR) {
+            return Err("execve /file/missing did not return ENOTDIR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/exec_path",
+    execve_missing_under_file_in_installed_root_is_enotdir
+);
+
+fn execve_self_symlink_in_installed_root_is_eloop() -> TestResult {
     rooted(|| {
         let loop_name = b"/loop\0";
         if call(
@@ -88,18 +144,13 @@ fn execve_path_errors_remain_distinct() -> TestResult {
         {
             return Err("symlink-loop fixture failed");
         }
-        for (path, expected) in [
-            (&b"/file\0"[..], ENOEXEC),
-            (&b"/missing\0"[..], ENOENT),
-            (&b"/file/\0"[..], ENOTDIR),
-            (&b"/file/missing\0"[..], ENOTDIR),
-            (&loop_name[..], ELOOP),
-        ] {
-            if call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) != Some(expected) {
-                return Err("exec lookup lost its specific Linux errno");
-            }
+        if call(Syscall::Execve.raw(), a2(loop_name.as_ptr() as u64, 0, 0)) != Some(ELOOP) {
+            return Err("execve /loop did not return ELOOP");
         }
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi/exec_path", execve_path_errors_remain_distinct);
+kernel_test_in!(
+    "syscall_abi/exec_path",
+    execve_self_symlink_in_installed_root_is_eloop
+);
