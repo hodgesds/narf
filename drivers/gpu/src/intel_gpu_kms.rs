@@ -41,8 +41,15 @@ fn x_tiled_profile(
 ) -> Result<(), FsError> {
     tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X).map(|_| ())
 }
-/// The display IP the KMS owner of `generation` proves its resources on.
-fn resource_ip(generation: Generation) -> crate::intel_gpu_xe2lpd::DisplayIp {
+/// The exact display IP the KMS owner proves its resources on. Display 30.02
+/// must survive the broad Panther Lake generation used by the rest of KMS.
+fn resource_ip(
+    io: &impl DisplayAccess,
+    generation: Generation,
+) -> crate::intel_gpu_xe2lpd::DisplayIp {
+    if let Some(ip) = io.display_ip() {
+        return ip;
+    }
     match generation {
         Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
         Generation::PantherLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
@@ -357,8 +364,8 @@ pub(crate) struct Physical {
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     window: crate::intel_gpu_gt_hw::AuthorizedWindow,
     generation: Generation,
-    /// Panther Lake only: the install proved display 30.00 behind the
-    /// opted-in route. `None` on every other generation.
+    /// Panther/Wildcat Lake only: the install proved the exact display-30 IP
+    /// behind its opted-in route. `None` on every other generation.
     display30: Option<Display30>,
     /// Discrete Arc display IP proved by [`DiscreteDisplayIp::identify`].
     discrete_display: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
@@ -369,9 +376,11 @@ pub(crate) struct Physical {
     /// The off-path FBC CFB carve, shared by every clone.
     fbc_carve: Arc<crate::intel_gpu_stolen::CarveSlot>,
 }
-/// What a Panther Lake KMS owner's install proved about display 30.
+/// What a Panther/Wildcat Lake KMS owner's install proved about display 30.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Display30 {
+    /// Exact GMD identity: 30.00 (Panther Lake) or 30.02 (Wildcat Lake).
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
     /// Wa_15015404425 still applies (`intel_gpu_xe3lpd::wa_15015404425`:
     /// a media GT before B0).
     flush: bool,
@@ -536,8 +545,7 @@ unsafe impl DisplayAccess for Physical {
     }
 
     fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
-        self.display30
-            .map(|_| crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+        self.display30.map(|display| display.ip)
     }
 
     fn discrete_display(&self) -> Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp> {
@@ -742,7 +750,13 @@ impl Platform for Physical {
         if !self.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
+        fetchers_with_cursor(
+            self,
+            self.generation,
+            self.display_ip(),
+            false,
+            owned_cursor,
+        )?;
         if self.discrete_display.is_none() {
             if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
                 return Err(FsError::NoDevice);
@@ -764,7 +778,13 @@ impl Platform for Physical {
         if !self.console_access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
+        fetchers_with_cursor(
+            self,
+            self.generation,
+            self.display_ip(),
+            false,
+            owned_cursor,
+        )?;
         if self.discrete_display.is_none() {
             if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
                 return Err(FsError::NoDevice);
@@ -819,7 +839,13 @@ impl Platform for Physical {
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(&fresh, fresh.generation, owned_dsb, owned_cursor)?;
+        fetchers_with_cursor(
+            &fresh,
+            fresh.generation,
+            fresh.display_ip(),
+            owned_dsb,
+            owned_cursor,
+        )?;
         if fresh.discrete_display.is_none() {
             if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(fresh.bar.phys) {
                 return Err(FsError::NoDevice);
@@ -937,7 +963,8 @@ fn panel_modeset_error(_: crate::intel_gpu_modeset::ModesetError) -> FsError {
 }
 
 /// Run a synchronous `XeLpgModeset` step over `io` using the generation's
-/// required MMIO wrapper and display IP (`XeLpg` / `Xe2Lpd` / `Xe3Lpd`).
+/// required MMIO wrapper and exact display IP (`XeLpg`, `Xe2Lpd`, `Xe3Lpd`
+/// or `WildcatLake`).
 fn with_panel_modeset<R>(
     io: &Physical,
     f: impl FnOnce(
@@ -968,7 +995,7 @@ fn with_panel_modeset<R>(
             let d30 = io.display30.ok_or(FsError::Unsupported)?;
             let ptl = View::new(io, d30.flush);
             let view: &dyn MmioWindow = &ptl;
-            let mut ms = XeLpgModeset::new(view, XeLpgPort::A).with_display_ip(DisplayIp::Xe3Lpd);
+            let mut ms = XeLpgModeset::new(view, XeLpgPort::A).with_display_ip(d30.ip);
             f(&mut ms).map_err(panel_modeset_error)
         }
         _ => Err(FsError::Unsupported),
@@ -1081,33 +1108,27 @@ fn fetchers_idle(
     generation: Generation,
     owned_dsb: bool,
 ) -> Result<(), FsError> {
-    fetchers_with_cursor(mmio, generation, owned_dsb, false)
-}
-/// The inventory a KMS owner's fetcher proofs read: a Panther Lake owner is
-/// display 30.00, whose `xe2_lpd_display` inventory (FBC A–D, five
-/// universal planes) is display 20's.
-fn fetcher_generation(platform: &Physical) -> Generation {
-    if platform.display30.is_some() {
-        Generation::LunarLake
-    } else {
-        platform.generation
-    }
+    fetchers_with_cursor(mmio, generation, None, owned_dsb, false)
 }
 fn fetchers_with_cursor(
     mmio: &impl MmioWindow,
     generation: Generation,
+    display_ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
     owned_dsb: bool,
     owned_cursor: bool,
 ) -> Result<(), FsError> {
     // MIT Linux intel_cursor_regs.h, intel_fbc.c and intel_display_device.c:
     // neither cursor DMA nor FBC compression tracking belongs to this owner.
     // Refuse them rather than treating a primary latch as their retirement.
-    let fbc_count = match generation {
-        Generation::MeteorLake => 2,
-        // xe2_lpd_display.fbc_mask: FBC A–D.
-        Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd.fbc_instances(),
-        _ => 1,
-    };
+    let fbc_count = display_ip.map_or_else(
+        || match generation {
+            Generation::MeteorLake => 2,
+            // xe2_lpd_display.fbc_mask: FBC A–D.
+            Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd.fbc_instances(),
+            _ => 1,
+        },
+        crate::intel_gpu_xe2lpd::DisplayIp::fbc_instances,
+    );
     for fbc in 0..fbc_count {
         let ctl = mmio.read32(0x43208 + fbc * 0x40);
         if ctl == u32::MAX {
@@ -1120,9 +1141,13 @@ fn fetchers_with_cursor(
     // All admitted ADL-S/P/N source families have four sprites; TGL has
     // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION. Display 13+
     // (MTL's 14, LNL's 20) has four.
-    let count = match generation {
-        Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
-        _ => 7,
+    let count = if display_ip.is_some() {
+        5
+    } else {
+        match generation {
+            Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
+            _ => 7,
+        }
     };
     // Display 14: a Pipe B–D primary the MTL external route lit through the
     // Pipe B–D owner scans its own allocation, outside this owner's GEM
@@ -1133,7 +1158,8 @@ fn fetchers_with_cursor(
     } else {
         [None; 4]
     };
-    for pipe in 0..4u64 {
+    let pipe_count = display_ip.map_or(4, crate::intel_gpu_xe2lpd::DisplayIp::pipe_count);
+    for pipe in 0..pipe_count as u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
         if cursor == u32::MAX {
             return Err(FsError::NoDevice);
@@ -1330,8 +1356,9 @@ pub(crate) fn install(
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     console: ActiveScanout,
 ) {
-    // Panther Lake is owned only as display 30.00 behind the opted-in
-    // route, which holds Pipe A for its eDP panel: linear, X-tiled and Tile4
+    // Panther/Wildcat Lake is owned only as its exact display-30 identity
+    // behind the opted-in route, which holds Pipe A for its eDP panel:
+    // linear, X-tiled and Tile4
     // primary flips through DPT, the 64x64 cursor, CTM and double-buffered LUTs,
     // and DSB transactions on the console's Pipe A. XR30, FBC and PSR are not offered.
     let display30 = if generation == Generation::PantherLake {
@@ -1340,13 +1367,21 @@ pub(crate) fn install(
         }
         let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
         let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
-        if crate::intel_gpu_xe2lpd::DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(
-            &window, flush,
-        )) != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+        use crate::intel_gpu_gt::GtPlatform;
+        use crate::intel_gpu_xe2lpd::DisplayIp;
+        let expected = match GtPlatform::from_pci(device.id.vendor, device.id.device) {
+            Some(GtPlatform::Integrated(Generation::PantherLake)) => DisplayIp::Xe3Lpd,
+            Some(GtPlatform::WildcatLake) => DisplayIp::WildcatLake,
+            _ => return,
+        };
+        if DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(&window, flush)) != Ok(expected)
         {
             return;
         }
-        Some(Display30 { flush })
+        Some(Display30 {
+            ip: expected,
+            flush,
+        })
     } else {
         None
     };
@@ -4268,7 +4303,7 @@ impl<M: Platform> Guard<'_, M> {
                             Some(crate::intel_gpu_display_resources::Primary::capture_ip(
                                 &self.device.platform,
                                 timing,
-                                resource_ip(self.device.generation),
+                                resource_ip(&self.device.platform, self.device.generation),
                             )?);
                     }
                     let id = self.prepare_surface(object.clone(), *geometry, *view)?;

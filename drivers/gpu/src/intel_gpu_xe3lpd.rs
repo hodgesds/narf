@@ -84,7 +84,8 @@
 //! rectangles), compressed primaries, DC states, system suspend and relight.
 //! Wildcat Lake additionally
 //! retains only Pipes A-C and ports A/B/TC1/TC2; its production probe remains
-//! closed until exact-IP KMS and hotplug state are installed end-to-end.
+//! closed until exact-IP hotplug state is installed end-to-end. KMS retains
+//! the proved 30.02 identity through resource capture and recovery.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -192,8 +193,8 @@ pub(crate) fn probe_route(
     device: &narf_bus::BusDevice,
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> bool {
-    // WCL has a fully typed route decision, but its production entry stays
-    // closed until KMS and hotplug retain DisplayIp::WildcatLake end-to-end.
+    // WCL has a fully typed route decision and exact-IP KMS state, but its
+    // production entry stays closed until hotplug retains that identity.
     let ptl = GtPlatform::from_pci(device.id.vendor, device.id.device)
         == Some(GtPlatform::Integrated(
             crate::intel_gpu::Generation::PantherLake,

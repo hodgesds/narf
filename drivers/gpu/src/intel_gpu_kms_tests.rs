@@ -1147,6 +1147,7 @@ impl Platform for MockPlatform {
                 Some(_) => Generation::AlderLake,
                 None => Generation::MeteorLake,
             },
+            fresh.display_ip(),
             owned_dsb,
             owned_cursor,
         )?;
@@ -1953,6 +1954,38 @@ fn smoke_kms_inherited_fetchers_block_arena_claim() -> TestResult {
     platform.0.lock().allowed = false;
     assert_eq!(
         inherited_fetchers_idle(&platform, Generation::MeteorLake),
+        Err(FsError::NoDevice)
+    );
+    // Exact display-30 identity controls the inventory. WCL has FBC/Pipes
+    // A-C only: poisoned nonexistent Pipe-D/FBC-D registers are never read,
+    // while losing a real FBC-C register still fails closed.
+    let wcl = MockPlatform::new();
+    wcl.0.lock().display_ip = Some(crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake);
+    wcl.set(0x432c8, u32::MAX); // FBC D.
+    wcl.set(0x73080, u32::MAX); // Pipe D cursor.
+    assert_eq!(
+        fetchers_with_cursor(
+            &wcl,
+            Generation::PantherLake,
+            Some(crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake),
+            false,
+            false,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        resource_ip(&wcl, Generation::PantherLake),
+        crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake
+    );
+    wcl.set(0x43288, u32::MAX); // FBC C.
+    assert_eq!(
+        fetchers_with_cursor(
+            &wcl,
+            Generation::PantherLake,
+            Some(crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake),
+            false,
+            false,
+        ),
         Err(FsError::NoDevice)
     );
     TestResult::Pass

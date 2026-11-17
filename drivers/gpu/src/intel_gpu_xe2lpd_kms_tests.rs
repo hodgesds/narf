@@ -146,7 +146,7 @@ fn smoke_xe2lpd_kms_fetcher_inventory_and_refused_services() -> TestResult {
             let platform = MockPlatform::new();
             platform.set(register, 0x8000_0001);
             assert_eq!(
-                fetchers_with_cursor(&platform, generation, false, false).is_ok(),
+                fetchers_with_cursor(&platform, generation, None, false, false).is_ok(),
                 admitted,
                 "{register:#x} {generation:?}"
             );

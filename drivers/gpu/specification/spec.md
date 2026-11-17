@@ -418,8 +418,9 @@ fixtures run the existing display-30 C20/PICA DP-alt enable, training, fixed
 VRR-TG and stop path on TC1/TC2 and Pipes B/C. `display_route` returns it only
 for exact `GtPlatform::WildcatLake` with the distinct
 `narf.intel.wcl_display=1` request; crossed PTL/WCL identities refuse
-read-only. The production probe remains PTL-only until KMS and hotplug retain
-the exact display IP end-to-end. Linux's source boundary is
+read-only. KMS retains the exact display IP through install, resource capture
+and recovery; the production probe remains PTL-only until hotplug retains it
+end-to-end. Linux's source boundary is
 explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
 LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
 additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact

@@ -319,9 +319,10 @@ native fixtures exercise C20 enable/training/fixed-TG/stop on TC1/TC2 and
 Pipes B/C. `DisplayIp::decode_all` and the display-30 modeset accept 30.02,
 but `display_route` binds it only to exact `GtPlatform::WildcatLake` plus the
 distinct `narf.intel.wcl_display=1` request. Crossed PTL/WCL identities refuse
-read-only. The production probe remains PTL-only until KMS and hotplug retain
-the exact IP end-to-end. Linux keeps WCL on the Panther Lake C20 path; it does
-not select LT PHY.
+read-only. KMS retains the exact 30.02 identity through install, resource
+capture and recovery; the production probe remains PTL-only until hotplug
+retains the same identity. Linux keeps WCL on the Panther Lake C20 path; it
+does not select LT PHY.
 
 `intel_gpu_lt_phy` separately models Nova Lake's A/B/TC1/TC2 LT-PHY boundary:
 the seven source DP PLL images from RBR through UHBR20, their exact committed
@@ -1884,8 +1885,9 @@ only through its qualified route: 14.00 and 20.00 normally, plus 30.00/30.02
 through the display-30 decoder. `display_route` binds 30.00 to exact Panther
 Lake with `narf.intel.ptl_display=1`, and 30.02 to exact Wildcat Lake with
 `narf.intel.wcl_display=1`; crossed identities refuse before any write. The
-production probe still selects only 30.00 until exact-IP KMS and hotplug state
-lands. An absent display (GMD zero), 14.01 (BMG) and 35.00 (NVL-S) remain
+production probe still selects only 30.00 until exact-IP hotplug state lands;
+KMS already retains 30.02. An absent display (GMD zero), 14.01 (BMG) and
+35.00 (NVL-S) remain
 typed refusals. Display 20/30 runs the display-14 code with version dispatch,
 not a copy of it.
 
