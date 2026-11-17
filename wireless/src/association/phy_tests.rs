@@ -478,9 +478,13 @@ fn local_encoding() -> Result<(), &'static str> {
         7,
     )
     .unwrap();
+    // The 0x42 mask is the HT Capabilities Info field: 20/40 width (bit 1)
+    // plus Short GI for 40 MHz (bit 6), both in body[0]. body[2] is the
+    // A-MPDU Parameters field (factor | density << 2), where bit 6 is
+    // reserved-zero, so indexing [2] could never pass.
     check!(
         mcs32.capability_body()[7] == 1
-            && mcs32.capability_body()[2] & 0x42 == 0x42
+            && mcs32.capability_body()[0] & 0x42 == 0x42
             && mcs32
                 .with_tx_selection([255, 0, 0, 0, 1, 0, 0, 0, 0, 0])
                 .is_err(),
