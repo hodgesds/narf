@@ -7837,18 +7837,31 @@ fn live_task_state(task: u64) -> char {
     }
 }
 
+/// Own-stack CPU slices include kernel execution. Export a monotonic split
+/// instead of adding the syscall ledger a second time to htop's utime+stime.
+fn proc_cpu_times_ns(task: u64) -> (u64, u64) {
+    let kernel = kern_time_ns_of(task);
+    let runtime_or_user = cpu_time_ns_of(task);
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        crate::task::adjusted_proc_cpu_times(task, runtime_or_user, kernel)
+    } else {
+        (runtime_or_user, kernel)
+    }
+}
+
 /// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
 /// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
     const NS_PER_TICK: u64 = 10_000_000;
     let task = task_of_visible_tid(tid)?;
     let syscall = proc_task_syscall_frame(task);
+    let (user_ns, kernel_ns) = proc_cpu_times_ns(task);
     Some(narf_filesystem::procfs::ThreadStat {
         wchan: proc_wchan_of_frame(syscall),
         syscall,
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
-        utime_ticks: cpu_time_ns_of(task) / NS_PER_TICK,
-        stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
+        utime_ticks: user_ns / NS_PER_TICK,
+        stime_ticks: kernel_ns / NS_PER_TICK,
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
         state: live_task_state(task),
@@ -7888,7 +7901,10 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         .as_ref()
         .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
-        run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
+        run_ns: {
+            let (user, kernel) = proc_cpu_times_ns(task);
+            user.saturating_add(kernel)
+        },
         timeslices,
         voluntary_switches,
         involuntary_switches,
@@ -8441,6 +8457,38 @@ pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
     }
 }
 
+fn proc_stat_tty(tid: u64) -> (u64, i64) {
+    // stat fields 7-8: controlling terminal device (tty_nr) + its foreground
+    // process group (tpgid). `task_ctty` resolves the boot-console default and
+    // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
+    // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
+    // (Linux). Linux dev_t = (major << 8) | minor: tty1 (4,1); ttyS0 (4,64); pts/N
+    // (136,N).
+    match task_ctty(tid) {
+        None => (0, -1),
+        Some(ctty) => {
+            let (tty_nr, fg) = if let Some(port) = narf_filesystem::console_tty::port_by_id(ctty) {
+                (port.rdev(), port.fg_pgrp())
+            } else {
+                // `tty_devnum`: new_encode_dev(MKDEV(136, index)) — the
+                // controlling-tty key is the pty's system-wide id, so map it
+                // to its index within its devpts instance.
+                match narf_filesystem::devfs_pty::pty_index(ctty) {
+                    Some(index) => (
+                        (u64::from(index) & 0xff)
+                            | (136u64 << 8)
+                            | ((u64::from(index) & !0xff) << 12),
+                        narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
+                    ),
+                    None => (0, 0),
+                }
+            };
+            let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
+            (tty_nr, tpgid)
+        }
+    }
+}
+
 /// /proc/[pid]/* metadata accessor.
 pub fn proc_task_info(
     pid: u64,
@@ -8528,6 +8576,13 @@ pub fn proc_task_info(
             ..Default::default()
         });
     }
+    if query == TaskInfoQuery::Cmdline {
+        return Some(ProcTaskInfo {
+            pid: visible_pid,
+            cmdline: proc_argv_of(pid),
+            ..Default::default()
+        });
+    }
     // The group's mm — Linux `proc_mem_open` -> `mm_access(task)` reads
     // `task->mm`, which every CLONE_THREAD sibling shares, for as long as the
     // task lives. The scheduler's live registry is that lifetime: it holds a
@@ -8576,6 +8631,41 @@ pub fn proc_task_info(
             shared_resident_pages: stats.shared_resident_pages,
             text_pages: crate::proc_identity::read(tid, |state| state.text_pages).unwrap_or(0),
             data_stack_bytes: stats.data_stack_bytes,
+            ..Default::default()
+        });
+    }
+    if query == TaskInfoQuery::Stat {
+        let stats = as_arc
+            .as_ref()
+            .map(|space| space.memory_stats())
+            .unwrap_or_default();
+        let (tty_nr, tpgid) = proc_stat_tty(tid);
+        let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
+        const NS_PER_TICK: u64 = 10_000_000;
+        return Some(ProcTaskInfo {
+            pid: visible_pid,
+            comm: proc_comm_of_task(tid).unwrap_or_else(|| {
+                if pid == 0 {
+                    alloc::string::String::from("kernel")
+                } else {
+                    alloc::format!("task-{pid}")
+                }
+            }),
+            state: if zombie { 'Z' } else { live_task_state(tid) },
+            ppid: parent_of_get(pid)
+                .map(|parent| report_pid_to(current, task_to_pid_raw(parent).unwrap_or(parent)))
+                .unwrap_or(0),
+            pgrp: pgid_to_user(read_pgid(tid)),
+            session: pgid_to_user(read_sid(tid)),
+            tty_nr,
+            tpgid,
+            utime_ticks: user_ns / NS_PER_TICK,
+            stime_ticks: kernel_ns / NS_PER_TICK,
+            num_threads: thread_group_live_count(pid),
+            starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
+            vm_size_bytes: stats.mapped_bytes,
+            resident_pages: stats.resident_pages,
+            processor: narf_scheduler::task_last_cpu(narf_scheduler::TaskId(tid)).unwrap_or(0),
             ..Default::default()
         });
     }
@@ -8749,39 +8839,14 @@ pub fn proc_task_info(
             }
         }
     }
-    // stat fields 7-8: controlling terminal device (tty_nr) + its foreground
-    // process group (tpgid). `task_ctty` resolves the boot-console default and
-    // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
-    // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
-    // (Linux). Linux dev_t = (major << 8) | minor: tty1 (4,1); ttyS0 (4,64); pts/N
-    // (136,N).
-    let (tty_nr, tpgid): (u64, i64) = match task_ctty(tid) {
-        None => (0, -1),
-        Some(ctty) => {
-            let (tty_nr, fg) = if let Some(port) = narf_filesystem::console_tty::port_by_id(ctty) {
-                (port.rdev(), port.fg_pgrp())
-            } else {
-                // `tty_devnum`: new_encode_dev(MKDEV(136, index)) — the
-                // controlling-tty key is the pty's system-wide id, so map it
-                // to its index within its devpts instance.
-                match narf_filesystem::devfs_pty::pty_index(ctty) {
-                    Some(index) => (
-                        (u64::from(index) & 0xff) | (136u64 << 8) | ((u64::from(index) & !0xff) << 12),
-                        narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
-                    ),
-                    None => (0, 0),
-                }
-            };
-            let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
-            (tty_nr, tpgid)
-        }
-    };
+    let (tty_nr, tpgid) = proc_stat_tty(tid);
     // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
     // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
     const NS_PER_TICK: u64 = 10_000_000;
     // One pass over the disposition table; it is behind a lock.
     let dispositions = sig_disposition_masks(tid);
+    let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
     Some(ProcTaskInfo {
         // Report the pid the reader asked for (its namespace view), not the
         // outer ProcessId — stat field 1 must echo /proc/<N>.
@@ -8822,8 +8887,8 @@ pub fn proc_task_info(
         session: pgid_to_user(read_sid(tid)),
         tty_nr,
         tpgid,
-        utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
-        stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
+        utime_ticks: user_ns / NS_PER_TICK,
+        stime_ticks: kernel_ns / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
         // Effective uid/gid from the per-task credential table — surfaced as
         // the status Uid:/Gid: lines. Defaults to 0/0 (root) for tasks that

@@ -78,6 +78,7 @@ pub mod pidfd;
 pub mod pipe;
 pub mod poll;
 pub mod posix_timer;
+mod proc_cpu_time;
 mod proc_identity;
 pub mod process;
 pub mod ptrace;

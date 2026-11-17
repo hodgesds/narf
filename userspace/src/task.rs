@@ -110,6 +110,8 @@ pub struct Task {
     /// Time spent executing syscall continuations for this task. Kept beside
     /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
     kernel_cpu_ns: AtomicU64,
+    /// Cold procfs readers serialize only the adjusted view, never accounting.
+    proc_cpu_time: IrqSafeSpinLock<crate::proc_cpu_time::AdjustedCpuTime>,
     /// Run slices this task has completed — Linux's third
     /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
     /// at the same slice boundary as `user_cpu_ns`.
@@ -241,6 +243,7 @@ impl Task {
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
             kernel_cpu_ns: AtomicU64::new(0),
+            proc_cpu_time: IrqSafeSpinLock::new(crate::proc_cpu_time::AdjustedCpuTime::default()),
             timeslices: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
@@ -719,6 +722,16 @@ pub(crate) fn cpu_times(tid: u64) -> (u64, u64) {
     })
 }
 
+/// A per-task monotonic procfs split, retained through zombie inspection.
+pub(crate) fn adjusted_proc_cpu_times(tid: u64, runtime: u64, kernel: u64) -> (u64, u64) {
+    if let Some(task) = task_get(tid) {
+        task.proc_cpu_time.lock().sample(runtime, kernel)
+    } else {
+        // Bootstrap/test contexts have no Task and no persistent proc view.
+        crate::proc_cpu_time::AdjustedCpuTime::default().sample(runtime, kernel)
+    }
+}
+
 /// Test hook: add CPU time to a registry entry directly.
 ///
 /// The production path (`account_current_cpu_ns`) writes these same fields,
@@ -747,6 +760,7 @@ pub fn __test_reset_cpu_ns(tid: u64) {
     if let Some(task) = task_get(tid) {
         task.user_cpu_ns.store(0, Ordering::Relaxed);
         task.kernel_cpu_ns.store(0, Ordering::Relaxed);
+        *task.proc_cpu_time.lock() = Default::default();
     }
 }
 
@@ -811,6 +825,7 @@ pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
 #[doc(hidden)]
 pub(crate) fn reset_cpu_times(tid: u64, user: bool, kernel: bool) {
     if let Some(task) = task_get(tid) {
+        *task.proc_cpu_time.lock() = Default::default();
         if user {
             task.user_cpu_ns.store(0, Ordering::Relaxed);
         }

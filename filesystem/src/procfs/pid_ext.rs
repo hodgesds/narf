@@ -1233,7 +1233,7 @@ impl FileOps for ProcTaskTidStat {
         let pid = self.pid;
         let tid = self.tid;
         Box::pin(async move {
-            let Some(mut info) = task_info(pid, super::TaskInfoQuery::Basic) else {
+            let Some(mut info) = task_info(pid, super::TaskInfoQuery::Stat) else {
                 // Thread gone: Linux answers ESRCH, and every other per-pid
                 // file here surfaces that as a zero-length read.
                 return Ok(0);
