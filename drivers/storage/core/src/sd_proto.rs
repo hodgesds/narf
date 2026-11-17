@@ -145,7 +145,7 @@ impl Scr {
     /// Parse the 8-byte SCR in wire order (byte 0 first).
     pub fn parse(bytes: &[u8; 8]) -> Self {
         Self {
-            sd_spec: (bytes[0] >> 4) & 0x0F,
+            sd_spec: bytes[0] & 0x0F,
             bus_widths: bytes[1] & 0x0F,
         }
     }
