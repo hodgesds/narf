@@ -85,12 +85,12 @@
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
 //! flip remains a TCSS mux operation.
-//! Lunar Lake admits TC1–TC4 only: PICA power and display-20 TCSS pin
-//! assignment are retained by the probe, D2D enable/state move to
-//! `DDI_BUF_CTL`, and the Pipe B–D owner uses display-20 CDCLK/MDCLK/DBUF
-//! resource transactions. Combo DDI B (relocated PICA PHY/AUX), HDMI and
-//! Panther Lake's mandatory display-30 VRR timing generator remain typed
-//! refusals.
+//! Lunar and Panther Lake admit TC1–TC4 only: PICA power and display-20+
+//! TCSS pin assignment are retained by the probe and D2D enable/state move
+//! to `DDI_BUF_CTL`. The Pipe B–D owner uses the exact display-20/30
+//! resource transaction; on display 30 it also computes the fixed-refresh
+//! guardband and runs the mandatory VRR timing generator. Combo DDI B and
+//! HDMI remain typed refusals on both IPs.
 //!
 //! ## DSC with FEC
 //!
@@ -706,15 +706,11 @@ fn probe_link<M: MmioWindow + ?Sized>(
 ) -> Result<LinkProbe, ExternalError> {
     let display_ip =
         DisplayIp::for_generation(generation).ok_or(ExternalError::UnsupportedGeneration)?;
-    // Display 30 requires its always-on VRR timing generator on every
-    // external pipe; keep it fail-closed until that pipe sequence is owned.
-    if display_ip == DisplayIp::Xe3Lpd {
-        return Err(ExternalError::UnsupportedGeneration);
-    }
-    // Display 20 relocates combo DDI B's PHY/AUX register views into PICA.
+    // Display >= 20 relocates combo DDI B's PHY/AUX register views into PICA.
     // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort;
-    // admit only that source-qualified USB-C path for now.
-    if display_ip == DisplayIp::Xe2Lpd && port.tc_index().is_none() {
+    // admit only that source-qualified USB-C path for now. Display 30's
+    // mandatory fixed-refresh VRR timing generator is owned by Pipes.
+    if display_ip.xe2_plus() && port.tc_index().is_none() {
         return Err(ExternalError::UnsupportedPort);
     }
     let display20 = display_ip.xe2_plus();
@@ -1533,6 +1529,9 @@ fn finish<M: MmioWindow + ?Sized>(
         payload(trans)?;
     }
     write(io, trans_ddi_func_ctl(trans), func)?;
+    // Display 30 always scans out through the VRR timing generator. Linux
+    // programs and enables it after TRANS_DDI_FUNC_CTL and before TRANSCONF.
+    rp.pipes.enable_fixed_tg(io, pipe)?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
     // intel_ddi_wait_for_fec_status(true): Linux only logs a timeout.
@@ -2329,7 +2328,10 @@ impl MtlExternalService {
         // The display-20 DP path is source-qualified below. HDMI still
         // carries display-14 PHY/D2D programming, so do not reach it by a
         // DDI-B fallback or a VBT HDMI-only declaration.
-        if self.generation == Generation::LunarLake {
+        if matches!(
+            self.generation,
+            Generation::LunarLake | Generation::PantherLake
+        ) {
             plan = match plan {
                 RoutePlan::DpThenHdmi => RoutePlan::Dp,
                 RoutePlan::Hdmi => RoutePlan::Refuse,

@@ -873,14 +873,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // block shared with Gen12 — the shared codecs build them),
         // then bdw_set_pipe_misc.
         self.program_transcoder(&mode);
-        if guardband.is_some() {
-            // hsw_configure_cpu_transcoder: intel_vrr_set_transcoder_timings
-            // follows intel_set_transcoder_timings.
-            crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
-                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
-        }
         // Non-Xe3 VRR timings for the mode this run commits (the Xe3
-        // branch above programs its always-on TG instead).
+        // enable sequence below programs its always-on TG instead).
         self.program_vrr_for_modeset(&mode)?;
         if let Some((src_w, src_h, ref scaler)) = scaler_plan {
             self.program_pipe_source(src_w, src_h);
@@ -1032,12 +1026,6 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             // enable on display 20 (no DP_FEC_BS_JITTER_WA there).
             self.chicken_trans()?;
         }
-        if let Some(guardband) = guardband {
-            // intel_ddi_enable_dp: intel_vrr_transcoder_enable between
-            // intel_ddi_enable_transcoder_func and intel_enable_transcoder.
-            crate::intel_gpu_xe3lpd::tg_enable(self.mmio, guardband)
-                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
-        }
         let frame = self.mmio.read32(0x70040);
         if frame == u32::MAX || !self.mmio.display_access_ok() {
             return Err(ModesetError::PipelineEnableUnavailable);
@@ -1045,6 +1033,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_ddi_enable: the transcoder function, then the transcoder.
         if cold.is_some() {
             self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
+        }
+        if let Some(guardband) = guardband {
+            // Display 30 follows Linux's intel_ddi_enable_dp ordering:
+            // the fixed VRR timing registers are unsafe before the DDI
+            // transcoder function is enabled, and its TG starts before
+            // intel_enable_transcoder sets TRANSCONF_ENABLE.
+            crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            crate::intel_gpu_xe3lpd::tg_enable(self.mmio, guardband)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
         }
         self.enable_transcoder()?;
         // VRR enable, after the transcoder is live (non-Xe3 only).

@@ -76,11 +76,13 @@
 //!
 //! Supported on display 30: opted-in eDP takeover, linear, X-tiled and
 //! Tile4 primary flips through DPT, the 64x64 cursor, CTM and double-buffered
-//! LUTs, DSB transactions, and the Xe `SCANOUT` create flag.
-//! Refused on display 30: eDP on Type-C, the C20 tables, every external
-//! output, PSR and panel replay, FBC (and its dirty rectangles), compressed
-//! primaries, DC states, system suspend and relight, and Wildcat Lake display
-//! 30.02. Wildcat Lake headless GT execution uses the shared PTL descriptor.
+//! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and TC1–TC4 USB-C
+//! DP 1.4 beside the panel through the fixed-refresh VRR timing generator.
+//! Refused on display 30: eDP on Type-C and its untranscribed intermediate
+//! C20 tables, combo DDI B, HDMI, PSR and panel replay, FBC (and its dirty
+//! rectangles), compressed primaries, DC states, system suspend and relight,
+//! and Wildcat Lake display 30.02. Wildcat Lake headless GT execution uses
+//! the shared PTL descriptor.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -547,15 +549,7 @@ pub(crate) const fn power_control_disable_val(kind: PhyKind, edp: bool) -> u32 {
 
 // ── VRR timing generator ─────────────────────────────────────────
 
-/// Transcoder-A registers of `intel_vrr_regs.h` and `intel_display_regs.h`.
-pub(crate) const TRANS_VRR_CTL_A: u64 = 0x60420;
-pub(crate) const TRANS_VRR_VMAX_A: u64 = 0x60424;
-pub(crate) const TRANS_VRR_STATUS_A: u64 = 0x6042c;
-pub(crate) const TRANS_VRR_VMIN_A: u64 = 0x60434;
-pub(crate) const TRANS_VRR_FLIPLINE_A: u64 = 0x60438;
-pub(crate) const TRANS_VRR_VSYNC_A: u64 = 0x60078;
-pub(crate) const TRANS_PUSH_A: u64 = 0x60a70;
-pub(crate) const EMP_AS_SDP_TL_A: u64 = 0x60204;
+/// Transcoder-A registers that are not expressed by the generic VRR offsets.
 pub(crate) const TRANS_SET_CONTEXT_LATENCY_A: u64 = 0x6007c;
 pub(crate) const DP_MIN_HBLANK_CTL_A: u64 = 0x600ac;
 pub(crate) const VRR_CTL_VRR_ENABLE: u32 = 1 << 31;
@@ -692,23 +686,38 @@ pub(crate) fn vrr_guardband_for(
     vrr_guardband(mode, latency, dsc.is_some(), num_scalers(io)?).ok_or(IpError::NoDevice)
 }
 
-/// `intel_vrr_transcoder_disable` → `intel_vrr_tg_disable` for the old
-/// state read back (`intel_vrr_get_config`: VRR is possible when
-/// `VRR_CTL_FLIP_LINE_EN` is set): `TRANS_VRR_CTL` keeps only the flip
-/// line enable and the old guardband, `VRR_STATUS_VRR_EN_LIVE` clears
-/// within 1 s, then `TRANS_PUSH` is cleared.
-pub(crate) fn tg_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
-    let ctl = read(io, TRANS_VRR_CTL_A)?;
+/// `intel_vrr_transcoder_disable` → `intel_vrr_tg_disable` for `trans`'s
+/// old state read back (`intel_vrr_get_config`: VRR is possible when
+/// `VRR_CTL_FLIP_LINE_EN` is set): `TRANS_VRR_CTL` keeps only the flip-line
+/// enable and old guardband, `VRR_STATUS_VRR_EN_LIVE` clears within 1 s,
+/// then `TRANS_PUSH` is cleared.
+pub(crate) fn tg_disable_for(
+    io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
+) -> Result<(), IpError> {
+    let base = trans.base();
+    let ctl = read(io, base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET)?;
     if ctl & VRR_CTL_FLIP_LINE_EN == 0 {
         return Ok(());
     }
     io.write32(
-        TRANS_VRR_CTL_A,
+        base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET,
         VRR_CTL_FLIP_LINE_EN | (ctl & VRR_CTL_GUARDBAND_MASK),
     );
-    wait(io, TRANS_VRR_STATUS_A, VRR_STATUS_VRR_EN_LIVE, 0, 1_000_000)?;
-    io.write32(TRANS_PUSH_A, 0);
+    wait(
+        io,
+        base + crate::intel_gpu_vrr::TRANS_VRR_STATUS_OFFSET,
+        VRR_STATUS_VRR_EN_LIVE,
+        0,
+        1_000_000,
+    )?;
+    io.write32(base + crate::intel_gpu_vrr::TRANS_PUSH_OFFSET, 0);
     Ok(())
+}
+
+/// [`tg_disable_for`] on the owned Pipe-A panel.
+pub(crate) fn tg_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
+    tg_disable_for(io, crate::intel_gpu_vrr::VrrTranscoder::A)
 }
 
 /// `TRANS_VTOTAL` on display 30: `intel_vrr_always_use_vrr_tg` makes
@@ -718,31 +727,45 @@ pub(crate) const fn trans_vtotal(mode: &Mode) -> u32 {
     (mode.v_active as u32).saturating_sub(1) & 0xffff
 }
 
-/// `intel_vrr_set_transcoder_timings` for Pipe A at fixed refresh
+/// `intel_vrr_set_transcoder_timings` for `trans` at fixed refresh
 /// (`intel_vrr_compute_fixed_rr_timings`): `intel_vrr_set_fixed_rr_timings`
 /// writes VMIN/VMAX/FLIPLINE = vtotal - 1 (no display < 13 offsets), then
 /// `TRANS_VRR_VSYNC` (`HAS_AS_SDP`: `vtotal - vsync_end` / `vtotal -
 /// vsync_start`) and `EMP_AS_SDP_TL` (display >= 20: the adaptive-sync
 /// transmission line at `vtotal - vsync_start`). `TRANS_VRR_CTL` is left to
 /// the enable: the timing generator is always used.
-pub(crate) fn program_vrr_timings(
+pub(crate) fn program_vrr_timings_for(
     io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
     mode: &Mode,
 ) -> Result<(), IpError> {
+    let base = trans.base();
     let vtotal = u32::from(mode.v_total);
     if mode.v_sync_end > mode.v_total || mode.v_sync_start > mode.v_sync_end || vtotal == 0 {
         return Err(IpError::NoDevice);
     }
     let vsync_start = vtotal - u32::from(mode.v_sync_start);
     let vsync_end = vtotal - u32::from(mode.v_sync_end);
-    io.write32(TRANS_VRR_VMIN_A, vtotal - 1);
-    io.write32(TRANS_VRR_VMAX_A, vtotal - 1);
-    io.write32(TRANS_VRR_FLIPLINE_A, vtotal - 1);
     io.write32(
-        TRANS_VRR_VSYNC_A,
+        base + crate::intel_gpu_vrr::TRANS_VRR_VMIN_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_VMAX_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_FLIPLINE_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_VSYNC_OFFSET,
         ((vsync_end & 0x1fff) << 16) | (vsync_start & 0x1fff),
     );
-    io.write32(EMP_AS_SDP_TL_A, vsync_start & 0x1fff);
+    io.write32(
+        base + crate::intel_gpu_vrr::EMP_AS_SDP_TL_OFFSET,
+        vsync_start & 0x1fff,
+    );
     if io.display_access_ok() {
         Ok(())
     } else {
@@ -750,13 +773,29 @@ pub(crate) fn program_vrr_timings(
     }
 }
 
+/// [`program_vrr_timings_for`] on the owned Pipe-A panel.
+pub(crate) fn program_vrr_timings(
+    io: &(impl MmioWindow + ?Sized),
+    mode: &Mode,
+) -> Result<(), IpError> {
+    program_vrr_timings_for(io, crate::intel_gpu_vrr::VrrTranscoder::A, mode)
+}
+
 /// `intel_vrr_transcoder_enable` → `intel_vrr_tg_enable` (no CMRR):
 /// `TRANS_PUSH` = `TRANS_PUSH_EN`, then `TRANS_VRR_CTL` = enable, flip line
 /// enable and the guardband (`trans_vrr_ctl`, display >= 14).
-pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Result<(), IpError> {
-    io.write32(TRANS_PUSH_A, TRANS_PUSH_EN);
+pub(crate) fn tg_enable_for(
+    io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
+    guardband: u16,
+) -> Result<(), IpError> {
+    let base = trans.base();
     io.write32(
-        TRANS_VRR_CTL_A,
+        base + crate::intel_gpu_vrr::TRANS_PUSH_OFFSET,
+        TRANS_PUSH_EN,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET,
         VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN | u32::from(guardband),
     );
     if io.display_access_ok() {
@@ -764,6 +803,11 @@ pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Resu
     } else {
         Err(IpError::NoDevice)
     }
+}
+
+/// [`tg_enable_for`] on the owned Pipe-A panel.
+pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Result<(), IpError> {
+    tg_enable_for(io, crate::intel_gpu_vrr::VrrTranscoder::A, guardband)
 }
 
 fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, IpError> {

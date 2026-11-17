@@ -185,12 +185,12 @@ on, as Linux's `intel_atomic_commit_tail` does for an inactive crtc
   `DisplayResourceUnavailable` before the PLL, the DDI or the transcoder.
 - No connector `DPMS` property is exposed.
 
-### Meteor/Arrow and Lunar Lake external DP SST, Type-C and hotplug
+### Meteor/Arrow, Lunar and Panther Lake external DP SST, Type-C and hotplug
 
 `intel_gpu_xelpg_external` owns at most one external DisplayPort SST route on
 the lowest free Pipe B–D and its same-index transcoder for
-`Generation::MeteorLake`, or on Lunar Lake TC1–TC4, next to the lit internal
-panel (Pipe A is never driven by it):
+`Generation::MeteorLake`, or on Lunar/Panther Lake TC1–TC4, next to the lit
+internal panel (Pipe A is never driven by it):
 `probe_sink(io, generation, port, legacy_port)` returns an `MtlSinkProbe`
 that holds the Type-C connection and the AUX power request, plus the sink's
 `max_downspread` and the `ssc` decision (`intel_gpu_vbt::dp_ssc_enabled`: the
@@ -213,9 +213,9 @@ complete the lifecycle. `service_mtl_external(io, generation, display, alloc)`
 polls the process-wide hotplug owner once and returns a `ServiceOutcome`
 (Activated with the pipe, mode and framebuffer to publish, Refused, Withdrawn,
 Retained or Unchanged). `teardown_mtl_external` runs from the KMS suspend and
-GT-reset retirement paths. Panther Lake, DDI A, Lunar Lake combo DDI B,
-display-20 HDMI, TBT-alt sinks, Type-C pin
-assignment D, over-budget streams, an active DDI (`PortBusy`), no free
+GT-reset retirement paths. DDI A, Lunar/Panther Lake combo DDI B,
+display-20/30 HDMI, Type-C pin assignment D, over-budget streams, an active
+DDI (`PortBusy`), no free
 Pipe B–D (`NoFreePipe`), a lit Pipe A that is not the owned panel profile
 (`PipeBusy`) and the Pipe B–D owner's admission (`Pipe(PipeRefusal)`) refuse
 with typed `ExternalError`s before any register write. A stop that cannot be
@@ -231,8 +231,8 @@ source Type-C connect/disconnect and the display-14 AUX power well
 (`IntelAux::with_base`/`IntelAux::xelpdp`) preserves the AUX power request on
 each control word. The Gen12 `IntelAux::new` encoding is unchanged.
 `intel_gpu::poll_dp_hpd_events` and the runtime actor's `service_external_sst`
-run the external hotplug pass with the admitted Meteor- or Lunar-Lake
-generation; an activated route is published
+run the external hotplug pass with the admitted Meteor-, Lunar- or
+Panther-Lake generation; an activated route is published
 with a session serial and its pipe (`intel_gpu::active_external_pipe`) and
 withdrawn by exactly that serial, and `external_routes_stopped` counts it.
 `routes_stopped()`/`route_live()` read the `RoutePresence` the service
@@ -271,15 +271,20 @@ on DDI B or a declared legacy Type-C port. `ServiceOutcome::Activated` carries
 the `MtlProtocol`; Refused/Retained carry a `RouteError` (`Dp`/`Hdmi`).
 `route_live`/`routes_stopped` and teardown cover both protocols.
 
-On Lunar Lake the DP probe retains `DisplayIp::Xe2Lpd`, requests the PICA
-power well, reads the pin assignment from `TCSS_DDI_STATUS`, and keeps the
-D2D request in `DDI_BUF_CTL` bits 29/28 across the full DDI enable write.
-The Pipe B–D owner computes and proves display-20 CDCLK, MDCLK ratio,
-DBUF/MBUS and PM-demand state for both all-off and live-panel transitions;
-it omits the display-14 no-DPT plane chicken and FEC-jitter transcoder bit.
-VBT discovery installs the same XE_LPDP TC1–TC4 port policy and SSC facts.
-Combo DDI B needs its relocated PICA PHY/AUX view and remains refused, as do
-HDMI and Panther Lake display-30 external pipes.
+On Lunar/Panther Lake the DP probe retains `DisplayIp::Xe2Lpd`/`Xe3Lpd`,
+requests the PICA power well, reads the pin assignment from
+`TCSS_DDI_STATUS`, and keeps the D2D request in `DDI_BUF_CTL` bits 29/28
+across the full DDI enable write. The Pipe B–D owner computes and proves the
+exact display-20/30 CDCLK, MDCLK ratio, DBUF/MBUS, PM-demand and watermark
+state for both all-off and live-panel transitions; it omits the display-14
+no-DPT plane chicken and FEC-jitter transcoder bit. Display 30 uses
+`vrr_guardband_for` as each pipe's vblank-prefill budget, writes VTOTAL with
+only VACTIVE plus `DP_MIN_HBLANK_CTL`, then programs and starts fixed-refresh
+VMIN/VMAX/FLIPLINE, AS-SDP and `TRANS_VRR_CTL` after
+`TRANS_DDI_FUNC_CTL` and before `TRANSCONF`; stop disables the transcoder
+before the timing generator. VBT discovery installs the same XE_LPDP
+TC1–TC4 port policy and SSC facts. Combo DDI B remains refused on both IPs,
+as does HDMI.
 
 `intel_gpu_gmbus::PinPair` is the `GMBUS_PIN_*` number (DDI A/B/C = 1/2/3,
 TC1-TC6 = 9-14); `GmbusPinTable` is the per-PCH table

@@ -1,8 +1,10 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.78** (v0.77 plus the source-qualified Lunar Lake display-20
-> TC1–TC4 USB-C DP route, PICA/TCSS ownership and display-IP-aware external
-> resource transactions; the source ADL-N display-13 USB-C DP route;
+> Status: **v0.79** (v0.78 plus the source-qualified Panther Lake display-30
+> TC1–TC4 USB-C DP route and mandatory fixed-refresh VRR timing generator;
+> the Lunar Lake display-20 TC1–TC4 USB-C DP route, PICA/TCSS ownership and
+> display-IP-aware external resource transactions; the source ADL-N
+> display-13 USB-C DP route;
 > BMG's source Xe2 five-level PPGTT profile;
 > typed GuC 70 log-stream admission for LNL,
 > PTL, WCL and NVL-S; the source Tiger Lake TC6 / DDI-I USB-C DP route;
@@ -1770,15 +1772,22 @@ trusted.
 - Lunar Lake reuses that service only for source-qualified TC1–TC4 USB-C
   DP. It uses PICA power, display-20 TCSS pin assignment, D2D in
   `DDI_BUF_CTL`, and display-20 live resource transactions. Combo DDI B,
-  HDMI and Panther Lake external pipes remain refused.
+  HDMI and UHBR remain refused.
+- An opted-in, GMD-qualified Panther Lake display-30 owner reuses the same
+  TC1–TC4 route and the display-30 PICA/Cx0 view. Its live transaction uses
+  Xe3 PM demand and guardband-aware watermarks; every external transcoder
+  programs and runs the mandatory fixed-refresh VRR timing generator between
+  the DDI-function and transcoder enables. Combo DDI B, HDMI, Wildcat Lake
+  display 30.02 and a headless/unqualified Panther Lake function remain
+  refused.
 - Pipe A's DMC is reported dark after this lane's crtc disable and lit
   before its port PLL (`intel_dmc_disable_pipe` / `intel_dmc_enable_pipe`
   call sites); a successful owned modeset records its panel mode
   (`owned_panel_mode`) for the Pipe B–D owner's adoption.
-- Not programmed by this lane: watermark / DBUF allocation and
-  PM demand outside a qualified display14.00 all-pipes-off modeset
-  (that case runs the display14 resource transaction of §20; other
-  cases retain firmware's allocation, and an inherited layout cannot be
+- Not programmed by this lane: watermark / DBUF allocation and PM demand
+  outside qualified display-14/20/30 all-pipes-off or live-panel layouts
+  (those cases run the matching resource transaction of §20; other cases
+  retain firmware's allocation, and an inherited layout cannot be
   adopted by the external route), the owned panel's PM demand at its
   trained eDP rate (it keeps the HBR3 reservation the KMS fixed profile
   checks), computed (non-table) HDMI
@@ -1994,8 +2003,9 @@ wired. The route's probe-time
 modeset window (`probe_window`: panel power sequencing, the takeover and the
 PPS backlight gate) applies Wa_15015404425 like the KMS owner and the DC
 service; only the read-only route decision ahead of it does not. Panther
-Lake (display 30.00) stays refused; its recorded deltas are in the
-`intel_gpu_xe2lpd` module header.
+Lake (display 30.00) uses the same TC1–TC4 route only when its opted-in KMS
+owner has proved display 30.00; its fixed-TG and resource deltas are recorded
+in `intel_gpu_xe3lpd`.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
@@ -7056,11 +7066,11 @@ Fixtures, all new and unexecuted in this slice:
   `smoke_xe2lpd_dmc_parse_ceiling_and_load_order` and
   `smoke_xe2lpd_pipe_dmc_flip_queue_and_interrupts`.
 
-Remaining for the workstream, in order: a display-preserving Lunar Lake GT
-owner (it gives KMS its arena, the Xe2 scanout PAT and the DMC
-acquisition), the KMS owner's display-20 resource profile and FBC count,
-PSR1's display-20 deltas, then Type-C/PICA externals. Panther Lake's
-display 30 deltas are recorded in the `intel_gpu_xe2lpd` header.
+The display-preserving Lunar Lake GT/KMS owner, display-20 resource profile,
+FBC count, PSR1 deltas and TC1–TC4 Type-C/PICA external route described by
+this workstream are implemented. Remaining output work includes combo DDI B,
+HDMI and UHBR. Panther Lake's additional display-30 deltas are recorded in
+`intel_gpu_xe3lpd`.
 
 ### Lunar Lake display 20: GT owner, KMS flips and DC6 — native fixtures added
 
@@ -7577,15 +7587,16 @@ register/sideband fixtures. Test and build results are recorded in STATUS.md.
   objects), automatic exec re-migration of `preferred_vram()` BOs, and
   system-suspend drain (`allow_scanout = true`) are active across DG2 and
   Battlemage.
-- **Integrated Display 20 (Lunar Lake) progress**:
+- **Integrated Display 20/30 (Lunar/Panther Lake) progress**:
   Display-20 PSR1 (`SRD_STATUS` SCL >= 1 precondition, entry setup frames,
   `Wa_18037818876`, `Wa_16025596647`), FBC on HDR planes (`Wa_18038517565`,
   skipping `Wa_22014263786`), DPT tiled panning via `DptLayout::with_origin`,
   S3 `panel_off` / `panel_on` relight and `system_suspend_admitted`, and
   PICA / Type-C TC1–TC4 DP output and HPD routing are wired into the shared
-  KMS/external paths. Lunar Lake combo DDI B and HDMI remain refused;
-  Panther Lake display-30 external routing remains refused until its
-  mandatory always-on VRR timing-generator path is implemented.
+  KMS/external paths. Panther Lake reuses the DP 1.4 C20 tables through its
+  PICA/Cx0 register view and runs each external pipe through the mandatory
+  fixed-refresh VRR timing generator with guardband-aware watermarks. Combo
+  DDI B and HDMI remain refused on display 20/30.
 - **Discrete Arc Display Bring-Up (`DG2` Display 13 & `BMG` `Xe2_HPD` 14.01)**:
   `DiscreteDisplayIp::{Dg2, Xe2Hpd}` identifies discrete display engines on
   `Alchemist` and `Battlemage` (`GMD_ID_DISPLAY` 14.01), seeding DRM mode

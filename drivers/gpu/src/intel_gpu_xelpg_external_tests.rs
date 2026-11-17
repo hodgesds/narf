@@ -415,7 +415,13 @@ impl ExtFake {
         self.phy.write32(0x5_10A0, u32::from(ip.ver()) << 22);
         self.phy.write32(0x4_5004, 1 << 3);
         let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
-        let state = crate::intel_gpu_xelpg_resources::compute_ip(
+        let mut vblank_start = [None; 4];
+        if ip == DisplayIp::Xe3Lpd {
+            let guardband =
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(self, &mode, None, &latency).ok()?;
+            vblank_start[0] = Some(mode.v_total - guardband);
+        }
+        let state = crate::intel_gpu_xelpg_resources::compute_ip_vblank(
             ip,
             &crate::intel_gpu_display_resources::request(
                 &mode,
@@ -423,6 +429,7 @@ impl ExtFake {
                 0,
             ),
             &latency,
+            vblank_start,
         )
         .ok()?;
         crate::intel_gpu_xelpg_resources::commit(self, &state).ok()?;
@@ -492,6 +499,9 @@ impl ExtFake {
 impl MmioWindow for ExtFake {
     fn display_access_ok(&self) -> bool {
         self.access.get()
+    }
+    fn cx0_xe3(&self) -> bool {
+        self.display_ip.get() == DisplayIp::Xe3Lpd
     }
     fn read32(&self, off: u64) -> u32 {
         if !self.access.get() {
@@ -875,6 +885,68 @@ kernel_test_in!(
     smoke_lnl_external_tc_dp_alt_uses_display20_d2d
 );
 
+fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel_ip(DisplayIp::Xe3Lpd) else {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    };
+    let probe = match probe_sink(&io, Generation::PantherLake, XeLpgPort::Tc1, false) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("PTL TC1 probe must own PICA/TCSS/AUX"),
+    };
+    if probe.display_version() != 30 || probe.tc.is_none_or(|tc| !tc.display20) {
+        return TestResult::Fail("the sink probe must retain the display-30 layout");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    let mut route = match activate(&io, probe, fb, &display) {
+        Ok(route) => route,
+        Err(_) => return TestResult::Fail("PTL USB-C DP must activate beside Pipe A"),
+    };
+    let pipe = Pipe::B;
+    let trans = pipe.transcoder();
+    let base = trans.base();
+    let ctl = io.read32(base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET);
+    if ctl & (crate::intel_gpu_vrr::VRR_CTL_VRR_ENABLE | crate::intel_gpu_vrr::VRR_CTL_FLIP_LINE_EN)
+        != crate::intel_gpu_vrr::VRR_CTL_VRR_ENABLE | crate::intel_gpu_vrr::VRR_CTL_FLIP_LINE_EN
+        || ctl & crate::intel_gpu_vrr::VRR_CTL_GUARDBAND_MASK == 0
+        || io.read32(base + crate::intel_gpu_pipes::TRANS_VTOTAL_OFFSET) != 767
+        || io.read32(base + 0x0ac) != 0
+    {
+        return TestResult::Fail("display 30 must program its fixed-refresh VRR TG");
+    }
+    let func =
+        io.first_write(|o, v| o == trans_ddi_func_ctl(trans) && v & TRANS_DDI_FUNC_ENABLE != 0);
+    let timings = io.first_write(|o, _| o == base + crate::intel_gpu_vrr::TRANS_VRR_VMIN_OFFSET);
+    let tg = io.first_write(|o, v| {
+        o == base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET
+            && v & crate::intel_gpu_vrr::VRR_CTL_VRR_ENABLE != 0
+    });
+    let transcoder = io.first_write(|o, v| o == pipe.base() + CONF && v & ENABLE != 0);
+    if !matches!((func, timings, tg, transcoder), (Some(a), Some(b), Some(c), Some(d)) if a < b && b < c && c < d)
+    {
+        return TestResult::Fail("fixed TG must start between function and transcoder enable");
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("PTL USB-C DP must stop and release");
+    }
+    if io.read32(base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET)
+        & crate::intel_gpu_vrr::VRR_CTL_VRR_ENABLE
+        != 0
+        || io.read32(base + crate::intel_gpu_vrr::TRANS_PUSH_OFFSET) != 0
+    {
+        return TestResult::Fail("display 30 stop must disable the fixed TG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_external_tc_dp_uses_fixed_vrr_tg
+);
+
 fn smoke_mtl_external_ddi_b_route_stop_and_release() -> TestResult {
     let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1024()));
     let mut route = match live_route(&io, XeLpgPort::B) {
@@ -1034,8 +1106,6 @@ kernel_test_in!(
 fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     if probe_sink(&NoAccess, Generation::TigerLake, XeLpgPort::Tc1, false).err()
         != Some(ExternalError::UnsupportedGeneration)
-        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::Tc1, false).err()
-            != Some(ExternalError::UnsupportedGeneration)
         || probe_sink(&NoAccess, Generation::MeteorLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
         || probe_sink(&NoAccess, Generation::LunarLake, XeLpgPort::B, false).err()
@@ -2241,10 +2311,11 @@ fn smoke_mtl_no_vbt_install_keeps_missing_defaults() -> TestResult {
         return TestResult::Fail("Gen12 without a VBT keeps the default DDC pins");
     }
     if install_for_probe(Generation::LunarLake, None, None) != VbtInstall::Missing
+        || install_for_probe(Generation::PantherLake, None, None) != VbtInstall::Missing
         || install_for_probe(Generation::TigerLake, None, Some(0x1234_5000))
             != VbtInstall::NotApplicable
     {
-        return TestResult::Fail("LNL uses the port policy; consumer-less routes read nothing");
+        return TestResult::Fail("LNL/PTL use the port policy; consumer-less routes read nothing");
     }
     TestResult::Pass
 }

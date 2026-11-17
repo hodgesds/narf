@@ -1,4 +1,4 @@
-//! Display-14/20 Pipe B–D owner for the external outputs.
+//! Display-14/20/30 Pipe B–D owner for the external outputs.
 //!
 //! The owned Pipe-A panel is adopted, never stopped or replaned; this
 //! owner adds and removes Pipes B–D around it. Its caller is the MTL
@@ -86,6 +86,8 @@ const TRANS_VSYNCSHIFT_OFFSET: u64 = 0x28;
 const TRANS_MULT_OFFSET: u64 = 0x2c;
 const TRANS_SET_CONTEXT_LATENCY_OFFSET: u64 = 0x7c;
 const TRANS_VRR_CTL_OFFSET: u64 = 0x420;
+/// `DP_MIN_HBLANK_CTL(cpu_transcoder)` on display 30.
+const DP_MIN_HBLANK_CTL_OFFSET: u64 = 0x0ac;
 const CHICKEN_TRANS_OFFSET: u64 = 0x4e0;
 /// `HSW_FRAME_START_DELAY_MASK`; `framestart_delay` is 1, so the field
 /// (`framestart_delay - 1`) is 0.
@@ -290,6 +292,9 @@ pub(crate) struct Pipes {
     // use their scratch space on the 64 KiB ARM bootstrap stack.
     state: Option<Box<State>>,
     ip: DisplayIp,
+    /// Adjusted vblank start used by display-30 watermark admission. It is
+    /// `vtotal - fixed-refresh VRR-TG guardband` for each owned pipe.
+    vblank_start: [Option<u16>; 4],
     lit: u8,
     reserved: [Option<ExternalPipe>; 4],
 }
@@ -306,9 +311,11 @@ impl Pipes {
     /// have been computed for the same register layout.
     pub(crate) fn adopt_ip(ip: DisplayIp, state: Option<State>, lit: u8) -> Self {
         debug_assert!(state.as_ref().is_none_or(|state| state.ip == ip));
+        let vblank_start = state.as_ref().map_or([None; 4], |state| state.vblank_start);
         Self {
             state: state.map(Box::new),
             ip,
+            vblank_start,
             lit,
             reserved: [None; 4],
         }
@@ -343,10 +350,19 @@ impl Pipes {
         // A compressing panel keeps its VDSC term (read back from Pipe A).
         let dsc = crate::intel_gpu_display_resources::pipe_a_dsc(io, mode)
             .map_err(|_| PipeEnableError::Resource(ResourceError::NoDevice))?;
+        let mut vblank_start = [None; 4];
+        if ip == DisplayIp::Xe3Lpd {
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
+                .map_err(|_| PipeEnableError::NoDevice)?;
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+                .map_err(|_| PipeEnableError::Unsupported)?;
+            vblank_start[0] = Some(mode.v_total - guardband);
+        }
         let state = Self::compute(
             ip,
             io,
             &crate::intel_gpu_display_resources::request_dsc(mode, tiling, 0, dsc),
+            vblank_start,
         )?;
         let lit = read(io, Pipe::A.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE)
             == PIPECONF_ENABLE | PIPECONF_STATE;
@@ -443,6 +459,7 @@ impl Pipes {
         ip: DisplayIp,
         io: &(impl MmioWindow + ?Sized),
         request: &res::Request,
+        vblank_start: [Option<u16>; 4],
     ) -> Result<State, PipeEnableError> {
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
@@ -454,7 +471,7 @@ impl Pipes {
         if let Some(plane) = primary {
             plane.tiling = Tiling::Linear;
         }
-        let state = res::compute_ip(ip, &baseline, &latency)?;
+        let state = res::compute_ip_vblank(ip, &baseline, &latency, vblank_start)?;
         match tiling {
             Some(tiling) => Ok(state.retile(0, tiling, &latency)?),
             None => Ok(state),
@@ -466,7 +483,7 @@ impl Pipes {
         &self,
         io: &(impl MmioWindow + ?Sized),
         ext: &ExternalPipe,
-    ) -> Result<State, PipeEnableError> {
+    ) -> Result<(State, [Option<u16>; 4]), PipeEnableError> {
         let p = ext.pipe as usize;
         if ext.pipe == Pipe::A
             || ext.surface & 0xfff != 0
@@ -494,11 +511,22 @@ impl Pipes {
         } else {
             res::require_idle_ip(io, fresh.ip)?;
         }
+        let mut vblank_start = fresh.vblank_start;
+        if fresh.ip == DisplayIp::Xe3Lpd {
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
+                .map_err(|_| PipeEnableError::NoDevice)?;
+            let guardband =
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(io, &ext.mode, ext.dsc, &latency)
+                    .map_err(|_| PipeEnableError::Unsupported)?;
+            vblank_start[p] = Some(ext.mode.v_total - guardband);
+        }
         Self::compute(
             fresh.ip,
             io,
             &fresh.request_with(|r| r.pipes[p] = Some(request(ext))),
+            vblank_start,
         )
+        .map(|state| (state, vblank_start))
     }
 
     /// Step 0: admission. Every refusal [`Self::reserve`] can make from the
@@ -521,10 +549,11 @@ impl Pipes {
         ext: &ExternalPipe,
         dmc: &dyn PipeDmc,
     ) -> Result<(), PipeEnableError> {
-        let new = self.check(io, ext)?;
+        let (new, vblank_start) = self.check(io, ext)?;
         self.sync_panel(io)?;
         self.refresh_panel(io)?;
         self.transition(io, new)?;
+        self.vblank_start = vblank_start;
         let p = ext.pipe as usize;
         self.reserved[p] = Some(*ext);
         self.publish();
@@ -581,16 +610,26 @@ impl Pipes {
             crate::intel_gpu_vrr::set_context_latency_for_crtc(pipe as u32 + 1),
         )?;
         checked(io, base + TRANS_VSYNCSHIFT_OFFSET, 0)?;
+        let vtotal = if self.ip == DisplayIp::Xe3Lpd {
+            crate::intel_gpu_xe3lpd::trans_vtotal(&ext.mode)
+        } else {
+            trans.vtotal
+        };
         for (off, v) in [
             (TRANS_HTOTAL_OFFSET, trans.htotal),
             (TRANS_HBLANK_OFFSET, trans.hblank),
             (TRANS_HSYNC_OFFSET, trans.hsync),
-            (TRANS_VTOTAL_OFFSET, trans.vtotal),
+            (TRANS_VTOTAL_OFFSET, vtotal),
             // Display 13+ clears VBLANK_START (intel_set_transcoder_timings).
             (TRANS_VBLANK_OFFSET, trans.vblank_display13()),
             (TRANS_VSYNC_OFFSET, trans.vsync),
         ] {
             checked(io, base + off, v)?;
+        }
+        if self.ip == DisplayIp::Xe3Lpd {
+            // intel_dp_compute_min_hblank is zero for this qualified 8b/10b
+            // SST route. Display 30 requires the register on every pipe.
+            checked(io, base + DP_MIN_HBLANK_CTL_OFFSET, 0)?;
         }
         checked(io, base + TRANS_VRR_CTL_OFFSET, 0)?;
         checked(io, base + TRANS_MULT_OFFSET, 0)?;
@@ -628,6 +667,37 @@ impl Pipes {
             }
         }
         Ok(())
+    }
+
+    /// Display 30's `intel_vrr_transcoder_enable`: after the caller enables
+    /// `TRANS_DDI_FUNC_CTL` and before [`Self::enable`] turns on the
+    /// transcoder, program fixed-refresh VRR timings and start the mandatory
+    /// timing generator. Earlier IPs are a no-op.
+    pub(crate) fn enable_fixed_tg(
+        &self,
+        io: &(impl MmioWindow + ?Sized),
+        pipe: Pipe,
+    ) -> Result<(), PipeEnableError> {
+        let ext = self.reserved(pipe)?;
+        if self.ip != DisplayIp::Xe3Lpd {
+            return Ok(());
+        }
+        let vblank_start = self.vblank_start[pipe as usize].ok_or(PipeEnableError::Unsupported)?;
+        let guardband = ext
+            .mode
+            .v_total
+            .checked_sub(vblank_start)
+            .ok_or(PipeEnableError::Unsupported)?;
+        let trans = match pipe {
+            Pipe::A => return Err(PipeEnableError::Unsupported),
+            Pipe::B => crate::intel_gpu_vrr::VrrTranscoder::B,
+            Pipe::C => crate::intel_gpu_vrr::VrrTranscoder::C,
+            Pipe::D => crate::intel_gpu_vrr::VrrTranscoder::D,
+        };
+        crate::intel_gpu_xe3lpd::program_vrr_timings_for(io, trans, &ext.mode)
+            .map_err(|_| PipeEnableError::NoDevice)?;
+        crate::intel_gpu_xe3lpd::tg_enable_for(io, trans, guardband)
+            .map_err(|_| PipeEnableError::NoDevice)
     }
 
     /// Step 4: `intel_enable_transcoder` (with its display-14
@@ -721,7 +791,8 @@ impl Pipes {
         Ok(())
     }
 
-    /// Step 6b: `intel_disable_transcoder` with its STATE ack.
+    /// Step 6b: `intel_disable_transcoder` with its STATE ack, followed on
+    /// display 30 by `intel_vrr_transcoder_disable` for the mandatory TG.
     pub(crate) fn disable(
         &mut self,
         io: &(impl MmioWindow + ?Sized),
@@ -732,6 +803,16 @@ impl Pipes {
         let old = read(io, conf)?;
         io.write32(conf, old & !(PIPECONF_ENABLE | PIPECONF_STATE));
         wait_conf(io, pipe, false)?;
+        if self.ip == DisplayIp::Xe3Lpd {
+            let trans = match pipe {
+                Pipe::A => return Err(PipeEnableError::Unsupported),
+                Pipe::B => crate::intel_gpu_vrr::VrrTranscoder::B,
+                Pipe::C => crate::intel_gpu_vrr::VrrTranscoder::C,
+                Pipe::D => crate::intel_gpu_vrr::VrrTranscoder::D,
+            };
+            crate::intel_gpu_xe3lpd::tg_disable_for(io, trans)
+                .map_err(|_| PipeEnableError::Timeout)?;
+        }
         self.lit &= !(1 << pipe as usize);
         Ok(())
     }
@@ -759,6 +840,8 @@ impl Pipes {
         self.refresh_panel(io)?;
         dmc.disable_pipe(p as u32);
         let request = self.request_with(|r| r.pipes[p] = None);
+        let mut vblank_start = self.vblank_start;
+        vblank_start[p] = None;
         if request.pipes.iter().all(Option::is_none) {
             // Every pipe is off: the post-plane steps of that commit lower
             // DBUF, CDCLK and PM demand to the all-off minimum. Best effort:
@@ -766,12 +849,14 @@ impl Pipes {
             // see settle_all_off) and the next reservation is the all-off
             // commit either way.
             self.state = None;
+            self.vblank_start = vblank_start;
             if let Ok(latency) = crate::intel_gpu_xelpg_wm::Latency::read(io) {
                 let _ = res::settle_all_off_ip(io, self.ip, &latency);
             }
         } else {
-            let new = Self::compute(self.ip, io, &request)?;
+            let new = Self::compute(self.ip, io, &request, vblank_start)?;
             self.transition(io, new)?;
+            self.vblank_start = vblank_start;
         }
         self.reserved[p] = None;
         self.publish();
