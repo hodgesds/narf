@@ -5520,3 +5520,67 @@ fn smoke_gsp_seq_decode_buffer_walk() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_seq", smoke_gsp_seq_decode_buffer_walk);
+
+// ────────────────────────────────────────────────────────────────
+// GSP live orchestration — pure helpers (boot_gsp_live is HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_live::{
+    frts_region, signature_range, BootError, BootReport, BootStage, FRTS_SIZE, VBIOS_ROM_OFFSET,
+};
+
+fn smoke_gsp_live_frts_region() -> TestResult {
+    // frts.addr = align_down(bios_addr, 0x20000) - 0x100000; size 1 MiB.
+    let fb_size = 8u64 << 30;
+    let bios = fb_size - 0x10_0000;
+    let frts = frts_region(bios);
+    let expect_addr = (bios & !(0x2_0000 - 1)) - 0x10_0000;
+    if frts.addr != expect_addr || frts.size != FRTS_SIZE {
+        return TestResult::Fail("FRTS region must follow tu102_gsp_oneinit");
+    }
+    // FRTS sits just below the (0x20000-aligned) VBIOS area.
+    if frts.end() > bios {
+        return TestResult::Fail("FRTS must lie below the VBIOS base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_frts_region);
+
+fn smoke_gsp_live_signature_range() -> TestResult {
+    // Each signature is 384 bytes; idx selects the slot.
+    let r0 = signature_range(0x1000, 0);
+    let r2 = signature_range(0x1000, 2);
+    if r0.start != 0x1000 || r0.end != 0x1000 + 384 {
+        return TestResult::Fail("signature 0 range wrong");
+    }
+    if r2.start != 0x1000 + 2 * 384 || r2.end - r2.start != 384 {
+        return TestResult::Fail("signature 2 range wrong");
+    }
+    // ROM window offset is the documented BAR0 location.
+    if VBIOS_ROM_OFFSET != 0x0030_0000 {
+        return TestResult::Fail("VBIOS ROM window offset drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_signature_range);
+
+fn smoke_gsp_live_boot_report() -> TestResult {
+    // A report carries the furthest stage + the reason it stopped.
+    let r = BootReport {
+        reached: BootStage::Wpr2Established,
+        result: Err(BootError::NotImplemented("elf")),
+    };
+    if r.reached != BootStage::Wpr2Established {
+        return TestResult::Fail("report must carry the reached stage");
+    }
+    if r.result != Err(BootError::NotImplemented("elf")) {
+        return TestResult::Fail("report must carry the stop reason");
+    }
+    // A FWSEC error converts into a BootError.
+    let be: BootError = crate::fwsec::FwsecError::VbiosNoBit.into();
+    if be != BootError::Fwsec(crate::fwsec::FwsecError::VbiosNoBit) {
+        return TestResult::Fail("FwsecError must convert into BootError::Fwsec");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_live", smoke_gsp_live_boot_report);
