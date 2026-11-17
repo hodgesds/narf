@@ -1,4 +1,4 @@
-//! Tiger Lake / Alder Lake-P Dekel Type-C PHY and its per-port PLL.
+//! Tiger Lake / Alder Lake-P/N Dekel Type-C PHY and its per-port PLL.
 //!
 //! Reference: Linux intel_dpll_mgr.c (icl_calc_mg_pll_state,
 //! dkl_pll_write, mg_pll_enable), intel_dkl_phy.c, intel_tc.c and
@@ -19,6 +19,13 @@ struct ColdOwner {
 }
 static COLD: narf_lib::mutex::Mutex<alloc::vec::Vec<ColdOwner>> =
     narf_lib::mutex::Mutex::new(alloc::vec::Vec::new());
+
+const fn is_adlp_family(family: Gen12Platform) -> bool {
+    matches!(
+        family,
+        Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN
+    )
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DklPllState {
@@ -103,7 +110,7 @@ impl DklPort {
             .ok_or(ModesetError::UnsupportedGeneration)?;
         let count = match family {
             Gen12Platform::TigerLake => 6,
-            Gen12Platform::AlderLakeP => 4,
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 4,
             _ => return Err(ModesetError::UnsupportedGeneration),
         };
         if tc >= count {
@@ -166,14 +173,15 @@ impl DklPort {
 
     pub fn pll_enable_register(self) -> u64 {
         match self.family {
-            Gen12Platform::AlderLakeP => 0x46038 + u64::from(self.tc) * 8,
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => {
+                0x46038 + u64::from(self.tc) * 8
+            }
             _ => 0x46030 + u64::from(self.tc) * 4,
         }
     }
 
     fn fia(self, io: &(impl MmioWindow + ?Sized)) -> Result<(u64, u8), ModesetError> {
-        let modular =
-            self.family == Gen12Platform::AlderLakeP || self.read(io, 0x1638A0)? & (1 << 4) != 0;
+        let modular = is_adlp_family(self.family) || self.read(io, 0x1638A0)? & (1 << 4) != 0;
         let (fia, idx) = if modular {
             (self.tc / 2, self.tc % 2)
         } else {
@@ -452,10 +460,10 @@ impl DklPort {
             return Err(ModesetError::UnsupportedGeneration);
         }
         // DISPLAY_VER 12 selects the port; display 13 selects the PHY.
-        // TC1 is PORT_D on TGL and PHY_F on ADL-P (intel_port_to_phy).
+        // TC1 is PORT_D on TGL and PHY_F on ADL-P/N (intel_port_to_phy).
         let select = match self.family {
             Gen12Platform::TigerLake => 4 + self.tc,
-            Gen12Platform::AlderLakeP => 6 + self.tc,
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 6 + self.tc,
             _ => return Err(ModesetError::UnsupportedGeneration),
         };
         Ok((
@@ -547,8 +555,12 @@ impl DklPort {
     ) -> Result<(), ModesetError> {
         let high = matches!(rate, LinkRate::DpHbr2 | LinkRate::DpHbr3);
         let de = match (self.family, high) {
-            (Gen12Platform::AlderLakeP, true) => [0, 4, 10, 24, 0, 6, 20, 0, 9, 0],
-            (Gen12Platform::AlderLakeP, false) => [1, 6, 11, 23, 0, 8, 20, 0, 11, 0],
+            (Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN, true) => {
+                [0, 4, 10, 24, 0, 6, 20, 0, 9, 0]
+            }
+            (Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN, false) => {
+                [1, 6, 11, 23, 0, 8, 20, 0, 11, 0]
+            }
             (_, true) => [0, 5, 11, 25, 0, 8, 20, 0, 11, 0],
             _ => [0, 5, 11, 24, 0, 8, 20, 0, 11, 0],
         };
@@ -566,12 +578,12 @@ impl DklPort {
                 )?;
             }
             let mask = (1 << 2)
-                | if self.family == Gen12Platform::AlderLakeP {
+                | if is_adlp_family(self.family) {
                     (1 << 12) | 0x78
                 } else {
                     0
                 };
-            let loadgen = if self.family == Gen12Platform::AlderLakeP && rate == LinkRate::DpRbr {
+            let loadgen = if is_adlp_family(self.family) && rate == LinkRate::DpRbr {
                 1 << 12
             } else {
                 0
@@ -689,10 +701,14 @@ mod tests {
         }
         let tgl = Model::new(Gen12Platform::TigerLake);
         let adlp = Model::new(Gen12Platform::AlderLakeP);
+        let adln = Model::new(Gen12Platform::AlderLakeN);
         if DklPort::new(&tgl, Ddi::D).unwrap().pll_enable_register() != 0x46030
             || DklPort::new(&adlp, Ddi::D).unwrap().pll_enable_register() != 0x46038
             || DklPort::new(&adlp, Ddi::G).unwrap().pll_enable_register() != 0x46050
             || DklPort::new(&adlp, Ddi::H).is_ok()
+            || DklPort::new(&adln, Ddi::D).unwrap().pll_enable_register() != 0x46038
+            || DklPort::new(&adln, Ddi::G).unwrap().pll_enable_register() != 0x46050
+            || DklPort::new(&adln, Ddi::H).is_ok()
             || DklPort::new(&tgl, Ddi::I).unwrap().pll_enable_register() != 0x46044
             || DklPort::new(&Model::new(Gen12Platform::AlderLakeS), Ddi::D).is_ok()
         {
@@ -833,6 +849,7 @@ mod tests {
         for (family, clock, drive, bar) in [
             (Gen12Platform::TigerLake, 0x4000_0000, 0x802, 0xC0DE3000),
             (Gen12Platform::AlderLakeP, 0x6000_0000, 0x602, 0xC0DE4000),
+            (Gen12Platform::AlderLakeN, 0x6000_0000, 0x602, 0xC0DE5000),
         ] {
             let io = Model::new(family);
             let port = DklPort::new(&io, Ddi::D).unwrap();

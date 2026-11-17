@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.76** (v0.75 plus BMG's source Xe2 five-level PPGTT profile;
+> Status: **v0.77** (v0.76 plus the source ADL-N display-13 USB-C DP route;
+> BMG's source Xe2 five-level PPGTT profile;
 > typed GuC 70 log-stream admission for LNL,
 > PTL, WCL and NVL-S; the source Tiger Lake TC6 / DDI-I USB-C DP route;
 > descriptor-qualified PF-only SR-IOV exclusion
@@ -7518,7 +7519,9 @@ on AArch64's 64 KiB bootstrap stack. Cloned snapshots keep independent
 ownership; a failed transition retains the previous state.
 
 The older Intel bridge now uses a source-qualified Dekel PLL for Tiger Lake
-and Alder Lake-P rather than combo DPLL0. Bank selection and access are
+and Alder Lake-P/N rather than combo DPLL0. Linux binds ADL-N through the
+ADL-P display descriptor as a display-13 subplatform with the same four
+Type-C PHY ports. Bank selection and access are
 serialized, masks preserve unrelated PLL fields, the DSSM reference selects
 19.2/24/38.4 MHz coefficients, and rate-specific TX settings replace combo
 BUF_TRANS. The bridge acquires TC-cold, AUX and PHY ownership before EDID,
@@ -7532,10 +7535,10 @@ keeps both, while a superseded session cannot withdraw the newer internal,
 SST or Display-14 image. A transient NotReady or AUX/EDID wake failure is
 retried by the active USB-PD task instead of being latched until the next
 cable attach.
-Alder Lake-S/N and unknown families remain refused on this path.
+Alder Lake-S and unknown families remain refused on this path.
 The older bridge requires native TC connector numbering. Its shared DDI type,
 DDC map, retained session slots and DP bridge now expose Tiger Lake TC1..TC6
-as `Ddi::D`..`Ddi::I`; ADL-P still admits only TC1..TC4 through its typed
+as `Ddi::D`..`Ddi::I`; ADL-P/N admit only TC1..TC4 through their typed
 Dekel port count. It does not translate arbitrary UCSI numbering.
 Source CR/EQ patterns and voltage/pre-emphasis precede matching sink AUX
 writes. Fallback retunes the source with the buffer stopped; transcoder clock

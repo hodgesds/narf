@@ -104,16 +104,17 @@ the source and all backing. The boot-console publication selects the first
 stream; this does not create a multi-monitor compositor or a new DRM ABI.
 
 `intel_gpu_gen12_tc::DklPort` supplies source-qualified Tiger Lake and
-Alder Lake-P Dekel banked PLL/clock/TX operations. The Gen12 USB-PD bridge
+Alder Lake-P/N Dekel banked PLL/clock/TX operations. Linux binds ADL-N as an
+ADL-P display subplatform with the same display-13 Type-C PHY profile. The Gen12 USB-PD bridge
 holds TC-cold/AUX/PHY ownership across a session and negotiates within the
 PD lane limit. Its detach hook proves pipe/link stop before releasing the
 scanout, pipe claim and power reference. A successful modeset publishes the
 physical scanout under a serial from the shared Intel external-output
 namespace. Detach withdraws that exact serial before freeing its backing;
 failed or uncertain stop retains both publication and backing, while a stale
-detach cannot blank a newer output. Alder Lake-S/N are not admitted through
+detach cannot blank a newer output. Alder Lake-S is not admitted through
 the Dekel Type-C path. This bridge requires native TC connector numbering and
-exposes Tiger Lake TC1..TC6 as `Ddi::D`..`Ddi::I` (TC1..TC4 on ADL-P);
+exposes Tiger Lake TC1..TC6 as `Ddi::D`..`Ddi::I` (TC1..TC4 on ADL-P/N);
 arbitrary UCSI numbering needs board routing data. These transports have
 native models; Intel silicon and dock
 interoperability remain separate acceptance work.

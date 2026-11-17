@@ -21,7 +21,7 @@
 //!   uncertain stop retains the session, published image and backing, and
 //!   vetoes display power retirement. Successful modeset publication carries
 //!   a unique session serial, so stale detach cannot withdraw a newer output.
-//! - Tiger Lake and Alder Lake-P use their own banked Dekel PLL, clock
+//! - Tiger Lake and Alder Lake-P/N use their own banked Dekel PLL, clock
 //!   routing and TX presets. Negotiation respects the PD lane limit and
 //!   source training patterns/levels track the shared sink algorithm.
 //!
@@ -29,7 +29,7 @@
 //!
 //! This bridge exposes TC1..TC6 as DDIs D..I and requires native TC
 //! numbering from its TCPM connector registration. Tiger Lake has all six;
-//! Alder Lake-P has four and its typed Dekel owner rejects TC5/TC6 before
+//! Alder Lake-P/N have four and their typed Dekel owner rejects TC5/TC6 before
 //! MMIO. A successful PD negotiation alone does not establish
 //! board wiring. Arbitrary firmware/UCSI connector numbering needs a
 //! board routing map before it can use this bridge.
