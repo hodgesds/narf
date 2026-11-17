@@ -430,7 +430,8 @@ explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
 LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` models Nova
 Lake's A/B/TC1/TC2 LT-PHY boundary: exact
 RBR-through-UHBR20 DP PLL/VDR images, the complete nine-rate eDP table
-(162/216/243/270/324/432/540/675/810 MHz), transmitter
+(162/216/243/270/324/432/540/675/810 MHz), the five literal HDMI PLL images
+(25.2/27.2/74.25/148.5/594 MHz), transmitter
 ownership/masking and distinct DP 1.4/UHBR/eDP signal tables. Its crate-private
 transport
 executes those images only when `MmioWindow::has_lt_phy()` carries that exact
@@ -450,7 +451,9 @@ and is not a production route.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be
-applied only through the same disconnected LT transport.
+applied only through the same disconnected LT transport. HDMI table selection
+is likewise pure and returns no image for a non-table clock; Linux's
+arbitrary-clock fixed-point synthesizer and the live HDMI route remain absent.
 The disconnected display-35 watermark calculation ignores the reported
 level-0 latency before applying the 6-us WaWmMemoryReadLatency adjustment and
 selects method 2 for every linear plane; Tile4 retains the display-30
