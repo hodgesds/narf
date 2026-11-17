@@ -1020,6 +1020,45 @@ fn smoke_abi_proc2_lightweight_queries_keep_identity_and_counters() -> TestResul
             .ok_or("statm query lost live PID")?;
         let full = crate::handlers::proc_task_info(PID, TaskInfoQuery::Basic)
             .ok_or("basic query lost live PID")?;
+        let stat = crate::handlers::proc_task_info(PID, TaskInfoQuery::Stat)
+            .ok_or("stat query lost live PID")?;
+        let cmdline = crate::handlers::proc_task_info(PID, TaskInfoQuery::Cmdline)
+            .ok_or("cmdline query lost live PID")?;
+        let stat_fields = |i: &narf_filesystem::procfs::ProcTaskInfo| {
+            [
+                i.pid,
+                i.ppid,
+                i.pgrp,
+                i.session,
+                i.tty_nr,
+                i.tpgid as u64,
+                i.utime_ticks,
+                i.stime_ticks,
+                i.num_threads,
+                i.starttime_ticks,
+                i.vm_size_bytes,
+                i.resident_pages,
+                u64::from(i.processor),
+            ]
+        };
+        if stat_fields(&stat) != stat_fields(&full)
+            || stat.comm != full.comm
+            || stat.state != full.state
+            || !stat.cmdline.is_empty()
+            || !stat.vmas.is_empty()
+            || stat.fd_table_size != 0
+            || stat.caps != [0; 5]
+        {
+            return Err("stat query changed rendered fields or built unrelated status metadata");
+        }
+        if cmdline.cmdline != full.cmdline
+            || !cmdline.comm.is_empty()
+            || !cmdline.vmas.is_empty()
+            || cmdline.fd_table_size != 0
+            || cmdline.vm_size_bytes != 0
+        {
+            return Err("cmdline query changed argv or built unrelated process metadata");
+        }
         if identity.pid != full.pid
             || identity.comm != "proc-light"
             || (identity.uid, identity.gid) != (full.uid, full.gid)
@@ -4317,4 +4356,56 @@ fn smoke_abi_proc2_pkey_fork_copies_and_drop_retires() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_pkey_fork_copies_and_drop_retires
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_proc_cpu_time_split_matches_thread_and_sched_views() -> TestResult {
+    with_setup(|| {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::handlers::__test_reset_cpu_times_for(FAKE_TASK);
+                if !self.0 {
+                    narf_scheduler::stackful::__reset_user_own_stack_for_test();
+                }
+            }
+        }
+        let _restore = Restore(narf_scheduler::stackful::user_own_stack_enabled());
+        narf_scheduler::stackful::enable_user_own_stack();
+        crate::handlers::__test_reset_cpu_times_for(FAKE_TASK);
+        for (total_add, kernel_add, expected) in [
+            (300_000_000, 100_000_000, (20, 10)),
+            (0, 100_000_000, (20, 10)),
+            (100_000_000, 0, (20, 20)),
+            (200_000_000, 100_000_000, (30, 30)),
+        ] {
+            if !crate::task::__test_add_cpu_ns(FAKE_TASK, total_add, kernel_add) {
+                return Err("missing CPU-accounting fixture task");
+            }
+            for query in [
+                narf_filesystem::procfs::TaskInfoQuery::Stat,
+                narf_filesystem::procfs::TaskInfoQuery::Basic,
+            ] {
+                let info = crate::handlers::proc_task_info(FAKE_TASK, query)
+                    .ok_or("missing proc CPU fixture")?;
+                if (info.utime_ticks, info.stime_ticks) != expected {
+                    return Err("process proc CPU time double-counts or regresses");
+                }
+            }
+            let thread =
+                crate::handlers::proc_thread_stat(FAKE_TASK).ok_or("missing thread CPU fixture")?;
+            if (thread.utime_ticks, thread.stime_ticks) != expected
+                || crate::handlers::proc_sched_snapshot(FAKE_TASK).run_ns
+                    != (expected.0 + expected.1) * 10_000_000
+            {
+                return Err("thread/sched CPU views disagree with process time");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_proc_cpu_time_split_matches_thread_and_sched_views
 );

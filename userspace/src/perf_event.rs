@@ -4623,7 +4623,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: install_flags,
-            status_flags: 0,
+            // Linux creates the perf anon inode with O_RDWR. perf record/top
+            // map the sample ring MAP_SHARED|PROT_WRITE to advance data_tail.
+            status_flags: crate::fd::O_RDWR,
         })
     });
 

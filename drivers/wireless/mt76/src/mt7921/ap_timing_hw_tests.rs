@@ -42,3 +42,32 @@ kernel_test_in!(
     "drivers/wireless/mt7921/ap",
     mt76_ap_actual_mac_timing_layout_preserves_arb_and_current_device_authority
 );
+
+fn mt76_mac_timing_stop_control_is_not_a_status_ack() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("native MAC timing DMA fixture"),
+    };
+    if hw.pause_ap_timing() != Ok(()) {
+        return TestResult::Fail("MAC timing control write");
+    }
+    // Hardware need not retain the stop-control bits. The MT7922 native
+    // association failure read zero here; Linux never treats it as an ACK.
+    // Preserve unrelated bits from the fresh read when clearing STOP.
+    words[0x20c80 / 4] = 0x00400000;
+    words[0x20884 / 4] = 0xabcdffff;
+    if hw.finish_ap_timing(true, false) != Ok(())
+        || words[0x20c80 / 4] != 0x00400000
+        || words[0x21090 / 4] != 0x003000e7
+        || words[0x21094 / 4] != 0x001c003c
+        || words[0x210a4 / 4] != 0x09100968
+        || words[0x20884 / 4] != 0xabcdc049
+    {
+        return TestResult::Fail("MAC timing requires a fabricated stop acknowledgement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ap",
+    mt76_mac_timing_stop_control_is_not_a_status_ack
+);

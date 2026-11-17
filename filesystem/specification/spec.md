@@ -1211,8 +1211,16 @@ serving proc reads. On x86 the power telemetry workers supply this hook.
 The procfs task-info hook takes a `TaskInfoQuery`: liveness, inode ownership
 and `comm` use `Identity` (pid/comm/effective uid/gid only, no mm, argv, fd or
 signal snapshot); `statm` uses `Statm` (maintained mm counters and exec text
-extent only). `stat`, `status` and `cmdline` use `Basic`, whose memory fields
-use aggregate counters and whose VMA vector remains empty. `maps`
+extent only). Process and thread `stat` use `Stat`, which gathers only the
+rendered identity, parent/terminal, CPU, thread count and mm-counter fields;
+it never clones argv or snapshots signal dispositions, capabilities or fds.
+`cmdline` uses `Cmdline` (saved exec arguments only). `status` uses `Basic`,
+whose memory fields use aggregate counters and whose VMA vector remains empty.
+For own-stack tasks, procfs splits total scheduler runtime into monotonic
+user/system counters instead of adding syscall time a second time. Readers
+serialize a per-task previous split; no read-side lock enters accounting or
+scheduler hot paths. The nanosecond pair sums to folded total runtime before
+USER_HZ conversion, even when syscall accounting is published first. `maps`
 requests only VMA metadata (`Maps`); `smaps`, `smaps_rollup`, and `numa_maps`
 request page residency/PSS/NUMA detail (`Vmas`). Maps never walks backing
 pages or reads COW refcounts. `statm` uses the aggregate virtual/resident,

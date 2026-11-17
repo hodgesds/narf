@@ -417,6 +417,10 @@ pub enum TaskInfoQuery {
     Identity,
     /// Maintained mm counters and exec text extent only.
     Statm,
+    /// Fields rendered by stat only: no argv, signals, caps, fd table or VMAs.
+    Stat,
+    /// Saved exec arguments only; no mm or status metadata.
+    Cmdline,
     Basic,
     /// VMA metadata only: no backing-page, NUMA, or PSS accounting.
     Maps,
@@ -1830,6 +1834,8 @@ impl FileOps for ProcPidFile {
             }
             let query = match field {
                 PidField::Comm => TaskInfoQuery::Identity,
+                PidField::Stat => TaskInfoQuery::Stat,
+                PidField::Cmdline => TaskInfoQuery::Cmdline,
                 PidField::Maps => TaskInfoQuery::Maps,
                 PidField::NumaMaps | PidField::Smaps | PidField::SmapsRollup => TaskInfoQuery::Vmas,
                 _ => TaskInfoQuery::Basic,
@@ -4679,6 +4685,8 @@ fn smoke_proc_maps_query_skips_residency() -> TestResult {
             match query {
                 TaskInfoQuery::Identity => 4,
                 TaskInfoQuery::Statm => 5,
+                TaskInfoQuery::Stat => 6,
+                TaskInfoQuery::Cmdline => 7,
                 TaskInfoQuery::Basic => 1,
                 TaskInfoQuery::Maps => 2,
                 TaskInfoQuery::Vmas => 3,
@@ -4699,7 +4707,8 @@ fn smoke_proc_maps_query_skips_residency() -> TestResult {
         (PidField::Smaps, 3),
         (PidField::SmapsRollup, 3),
         (PidField::NumaMaps, 3),
-        (PidField::Stat, 1),
+        (PidField::Stat, 6),
+        (PidField::Cmdline, 7),
         (PidField::Status, 1),
         (PidField::Comm, 4),
     ] {
@@ -4730,7 +4739,10 @@ fn smoke_proc_maps_query_skips_residency() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/procfs", smoke_proc_maps_query_skips_residency);
+kernel_test_in!(
+    "filesystem/procfs/metadata",
+    smoke_proc_maps_query_skips_residency
+);
 
 /// `TracerPid` and `FDSize` report live state, not constants.
 ///

@@ -326,3 +326,54 @@ fn smoke_perf_records_use_linux_thread_ids() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/perf", smoke_perf_records_use_linux_thread_ids);
+
+// Unlike the direct mmap_frames fixtures, this crosses sys_mmap's actual
+// open-file access checks used by perf record/top.
+fn smoke_perf_software_clock_writable_mmap_syscall() -> TestResult {
+    with_setup(|| {
+        install_test_address_space()?;
+        let attr = PerfEventAttr {
+            type_: PERF_TYPE_SOFTWARE,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: PERF_COUNT_SW_CPU_CLOCK,
+            sample_period_or_freq: 10_000_000,
+            sample_type: PERF_SAMPLE_IP,
+            flags: PERF_ATTR_FLAG_DISABLED,
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("perf clock open failed"),
+        };
+        let mapping = call(
+            Syscall::Mmap.raw(),
+            SyscallArgs {
+                arg0: 0,
+                arg1: 8192,
+                arg2: 3, // PROT_READ | PROT_WRITE
+                arg3: 1, // MAP_SHARED
+                arg4: fd,
+                arg5: 0,
+            },
+        );
+        let result = match mapping {
+            Some(addr) if addr > 0 => {
+                if call(Syscall::Munmap.raw(), a1(addr as u64, 8192)) == Some(0) {
+                    Ok(())
+                } else {
+                    Err("perf sample ring munmap failed")
+                }
+            }
+            _ => Err("perf sample ring writable mmap was rejected"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/perf_software_clock",
+    smoke_perf_software_clock_writable_mmap_syscall
+);
