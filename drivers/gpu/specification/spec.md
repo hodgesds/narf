@@ -416,7 +416,10 @@ ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
 executes those images only for a display-30-qualified window and implements the
 retrying LT P2P transmitter transaction with ACK/error validation and bounded
 settling, plus source DP 1.4/UHBR per-lane swing/cursor RMWs; only fake-MMIO
-fixtures call it. It is not an operational route.
+fixtures call it. Its disconnected enable/disable state machine covers LT
+MacCLK/lane reset, P2/P0 transitions, PLL rate calibration and display-30 clock
+selection, but requires DC-off and Type-C/D2D/AUX ownership from a future
+caller. It is not an operational route.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the

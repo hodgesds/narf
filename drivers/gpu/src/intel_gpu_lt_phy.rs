@@ -16,7 +16,13 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_xelpg::{Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort};
+use crate::intel_gpu_xelpg::{
+    lane_pclk_pll_ack, lane_pclk_pll_request, lane_phy_current_status, lane_pipe_reset,
+    lane_powerdown_new_state, lane_powerdown_update, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort,
+    FORWARD_CLOCK_UNGATE, LANE1_PHY_CLOCK_SELECT, P0_STATE_ACTIVE, P2_STATE_READY, P2_STATE_RESET,
+    PLL_LANE_STAGGERING_DELAY_MASK, PORT_BUF_REVERSAL, POWER_STATE_ACTIVE_MASK,
+    POWER_STATE_READY_MASK, SSC_ENABLE_PLLA, SSC_ENABLE_PLLB, XE3_DDI_CLOCK_SELECT_MASK,
+};
 
 pub(crate) const LANE0: u8 = 1;
 pub(crate) const LANE1: u8 = 2;
@@ -565,6 +571,32 @@ const P2M_ERROR_SET: u32 = 1 << 15;
 const MSGBUS_ATTEMPTS: u8 = 3;
 const MSGBUS_TIMEOUT_US: u64 = 1_000;
 const P2P_SETTLE_US: u64 = 150;
+const POWERDOWN_UPDATE_TIMEOUT_US: u64 = 2_000;
+const MACCLK_TURNON_TIMEOUT_US: u64 = 2_000;
+const MACCLK_TURNOFF_TIMEOUT_US: u64 = 1;
+const RATE_CALIBRATION_TIMEOUT_US: u64 = 1_000;
+const RESET_START_TIMEOUT_US: u64 = 10;
+const RESET_END_TIMEOUT_US: u64 = 2_000;
+
+const MACCLK_RESET_0: u32 = 1 << 11;
+const MACCLK_RATE_MASK: u32 = 0x1f;
+const MACCLK_RATE_DEFAULT: u32 = 0x1f;
+const PHY_MODE_MASK: u32 = 0xf << 12;
+const PHY_MODE_DP: u32 = 0x3 << 12;
+const DDI_CLOCK_SELECT_MAXPCLK: u32 = 0x8 << 12;
+
+const fn phy_pulse_status(lane: u8) -> u32 {
+    1 << (27 - lane)
+}
+
+/// Inputs to the LT-PHY DP PLL enable sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LtDpEnable {
+    pub(crate) rate: LtDpRate,
+    pub(crate) lane_count: u8,
+    pub(crate) pin_assignment_d: bool,
+    pub(crate) ssc_enabled: bool,
+}
 
 /// WCL LT-PHY message-bus transport.  Construction is family-qualified but
 /// this type is not reachable from any display route.
@@ -573,6 +605,7 @@ pub(crate) struct LtPhy<'a, M: MmioWindow + ?Sized> {
     port: WclLtPort,
     lanes: PhyLaneConfig,
     dp_alt: bool,
+    max_lanes: u8,
 }
 
 impl<M: MmioWindow + ?Sized> core::fmt::Debug for LtPhy<'_, M> {
@@ -581,6 +614,7 @@ impl<M: MmioWindow + ?Sized> core::fmt::Debug for LtPhy<'_, M> {
             .field("port", &self.port)
             .field("lanes", &self.lanes)
             .field("dp_alt", &self.dp_alt)
+            .field("max_lanes", &self.max_lanes)
             .finish()
     }
 }
@@ -604,6 +638,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
             port,
             lanes,
             dp_alt,
+            max_lanes,
         })
     }
 
@@ -630,6 +665,16 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
             narf_time::Deadline::after_us(timeout_us),
         );
         done && !lost
+    }
+
+    fn rmw(&self, off: u64, clear: u32, set: u32) -> Result<(), Cx0Error> {
+        let value = self.mmio.read32(off);
+        if value == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(Cx0Error::PhyError);
+        }
+        self.mmio.write32(off, (value & !clear) | set);
+        compiler_fence(Ordering::SeqCst);
+        Ok(())
     }
 
     fn clear_response_ready(&self, lane: u8) {
@@ -738,6 +783,115 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         Ok(())
     }
 
+    fn powerdown_change(&self, state: u32) -> Result<(), Cx0Error> {
+        let owned = self.lanes.owned_mask();
+        let port = self.port.xelpg();
+        let buf_ctl2 = port.buf_ctl2();
+        let mut new_state = 0;
+        let mut update = 0;
+        for lane in 0..2u8 {
+            if owned & (1 << lane) != 0 {
+                new_state |= lane_powerdown_new_state(u32::from(lane), state);
+                update |= lane_powerdown_update(u32::from(lane));
+            }
+        }
+        self.rmw(buf_ctl2, 0xff << 16, new_state)?;
+        for lane in 0..2u8 {
+            if owned & (1 << lane) != 0
+                && !self.wait_for(
+                    self.m2p_ctl(lane),
+                    M2P_TRANSACTION_PENDING,
+                    0,
+                    MSGBUS_TIMEOUT_US,
+                )
+            {
+                self.bus_reset(lane);
+                return Err(Cx0Error::Timeout);
+            }
+        }
+        self.rmw(buf_ctl2, (1 << 25) | (1 << 24), update)?;
+        if !self.wait_for(buf_ctl2, update, 0, POWERDOWN_UPDATE_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        Ok(())
+    }
+
+    fn setup_powerdown(&self) -> Result<(), Cx0Error> {
+        let port = self.port.xelpg();
+        self.rmw(port.buf_ctl2(), POWER_STATE_READY_MASK, P2_STATE_READY << 4)?;
+        self.rmw(
+            port.buf_ctl3(),
+            POWER_STATE_ACTIVE_MASK | PLL_LANE_STAGGERING_DELAY_MASK,
+            P0_STATE_ACTIVE,
+        )
+    }
+
+    fn lane_reset(&self) -> Result<(), Cx0Error> {
+        let port = self.port.xelpg();
+        let owned = self.lanes.owned_mask();
+        let mut resets = 0;
+        let mut current = 0;
+        let mut pulse = 0;
+        for lane in 0..2u8 {
+            if owned & (1 << lane) != 0 {
+                resets |= lane_pipe_reset(u32::from(lane));
+                current |= lane_phy_current_status(u32::from(lane));
+                pulse |= phy_pulse_status(lane);
+            }
+        }
+
+        self.rmw(self.port.buf_ctl5(), MACCLK_RATE_MASK, MACCLK_RATE_DEFAULT)?;
+        self.rmw(port.buf_ctl1(), PHY_MODE_MASK, PHY_MODE_DP)?;
+        self.setup_powerdown()?;
+        self.powerdown_change(P2_STATE_RESET)?;
+        self.rmw(self.port.buf_ctl5(), MACCLK_RESET_0, 0)?;
+
+        let clock_ctl = port.port_clock_ctl();
+        let request = lane_pclk_pll_request(0);
+        let ack = lane_pclk_pll_ack(0);
+        self.rmw(clock_ctl, request, request)?;
+        if !self.wait_for(clock_ctl, ack, ack, MACCLK_TURNON_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(clock_ctl, FORWARD_CLOCK_UNGATE, FORWARD_CLOCK_UNGATE)?;
+        self.rmw(port.buf_ctl2(), resets | pulse, 0)?;
+        if !self.wait_for(port.buf_ctl2(), current, 0, RESET_END_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        if !self.wait_for(port.buf_ctl2(), pulse, pulse, RATE_CALIBRATION_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(port.buf_ctl2(), pulse, 0)
+    }
+
+    fn program_port_clock(&self, rate: LtDpRate, ssc_enabled: bool) -> Result<(), Cx0Error> {
+        let port = self.port.xelpg();
+        self.rmw(
+            port.buf_ctl1(),
+            PORT_BUF_REVERSAL,
+            if self.lanes.reversed() {
+                PORT_BUF_REVERSAL
+            } else {
+                0
+            },
+        )?;
+        let mut value = FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK;
+        if matches!(rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20) {
+            value |= SSC_ENABLE_PLLA;
+        } else if ssc_enabled {
+            value |= SSC_ENABLE_PLLB;
+        }
+        self.rmw(
+            port.port_clock_ctl(),
+            LANE1_PHY_CLOCK_SELECT
+                | FORWARD_CLOCK_UNGATE
+                | XE3_DDI_CLOCK_SELECT_MASK
+                | SSC_ENABLE_PLLA
+                | SSC_ENABLE_PLLB,
+            value,
+        )
+    }
+
     /// Program the source DP PLL image through the normal Cx0 VDR transport.
     pub(crate) fn program_dp_pll(&self, rate: LtDpRate) -> Result<(), Cx0Error> {
         let state = dp_pll_state(rate);
@@ -748,6 +902,102 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
             cx0.write(write.lane_mask, write.address, write.data, true)?;
         }
         Ok(())
+    }
+
+    /// Run Linux's WCL LT-PHY DP PLL enable order.  The caller must already
+    /// own DC-off, the Type-C PHY and the D2D/AUX power wells; no production
+    /// route currently establishes those preconditions.
+    pub(crate) fn enable_dp(&self, request: LtDpEnable) -> Result<(), Cx0Error> {
+        if !matches!(request.lane_count, 1 | 2 | 4) || request.lane_count > self.max_lanes {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let port = self.port.xelpg();
+        let owned = self.lanes.owned_mask();
+        let mut pulse = 0;
+        for lane in 0..2u8 {
+            if owned & (1 << lane) != 0 {
+                pulse |= phy_pulse_status(lane);
+            }
+        }
+
+        self.lane_reset()?;
+        self.program_port_clock(request.rate, request.ssc_enabled)?;
+        self.powerdown_change(P2_STATE_READY)?;
+        self.program_dp_pll(request.rate)?;
+        self.p2p_write(owned, LT_PHY_RATE_UPDATE, LT_PHY_RATE_CONTROL_VDR_UPDATE)?;
+
+        let clock_ctl = port.port_clock_ctl();
+        let pll_request = lane_pclk_pll_request(0);
+        let pll_ack = lane_pclk_pll_ack(0);
+        self.rmw(clock_ctl, pll_request, 0)?;
+        if !self.wait_for(clock_ctl, pll_ack, 0, MACCLK_TURNOFF_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.mmio.write32(
+            port.clk_valfreq().ok_or(Cx0Error::ProtocolMismatch)?,
+            request.rate.clock_khz(),
+        );
+        compiler_fence(Ordering::SeqCst);
+        self.rmw(clock_ctl, pll_request, pll_request)?;
+        if !self.wait_for(clock_ctl, pll_ack, pll_ack, MACCLK_TURNON_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(clock_ctl, FORWARD_CLOCK_UNGATE, FORWARD_CLOCK_UNGATE)?;
+        self.rmw(port.buf_ctl2(), pulse, pulse)?;
+
+        let cx0 = self.cx0();
+        let update = cx0.read(LANE0, LT_PHY_RATE_UPDATE)?;
+        cx0.write(
+            owned,
+            LT_PHY_RATE_UPDATE,
+            update & !LT_PHY_RATE_CONTROL_VDR_UPDATE,
+            true,
+        )?;
+        if !self.wait_for(port.buf_ctl2(), pulse, pulse, RATE_CALIBRATION_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(port.buf_ctl2(), pulse, pulse)?;
+        self.powerdown_change(P0_STATE_ACTIVE)?;
+        self.program_transmitters(request.lane_count, request.pin_assignment_d)
+    }
+
+    /// Assert lane reset and gate MacCLK in Linux's LT-PHY disable order.
+    pub(crate) fn disable(&self) -> Result<(), Cx0Error> {
+        let port = self.port.xelpg();
+        let owned = self.lanes.owned_mask();
+        let mut resets = 0;
+        let mut current = 0;
+        let mut pulse = 0;
+        for lane in 0..2u8 {
+            if owned & (1 << lane) != 0 {
+                resets |= lane_pipe_reset(u32::from(lane));
+                current |= lane_phy_current_status(u32::from(lane));
+                pulse |= phy_pulse_status(lane);
+            }
+        }
+        self.rmw(port.buf_ctl2(), pulse, pulse)?;
+        self.rmw(port.buf_ctl2(), resets, resets)?;
+        if !self.wait_for(port.buf_ctl2(), current, current, RESET_START_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(port.buf_ctl2(), pulse, pulse)?;
+
+        let clock_ctl = port.port_clock_ctl();
+        let request = lane_pclk_pll_request(0);
+        let ack = lane_pclk_pll_ack(0);
+        self.rmw(clock_ctl, request, 0)?;
+        self.mmio
+            .write32(port.clk_valfreq().ok_or(Cx0Error::ProtocolMismatch)?, 0);
+        compiler_fence(Ordering::SeqCst);
+        if !self.wait_for(clock_ctl, ack, 0, MACCLK_TURNOFF_TIMEOUT_US) {
+            return Err(Cx0Error::Timeout);
+        }
+        self.rmw(
+            clock_ctl,
+            XE3_DDI_CLOCK_SELECT_MASK | FORWARD_CLOCK_UNGATE,
+            0,
+        )?;
+        self.rmw(self.port.buf_ctl5(), MACCLK_RESET_0, MACCLK_RESET_0)
     }
 
     /// Enable/disable all four transmitters through the LT-specific P2P flow.
@@ -837,8 +1087,13 @@ mod tests {
 
     impl Default for FakeLtMmio {
         fn default() -> Self {
+            let mut regs = BTreeMap::new();
+            // The disabled LT PHY enters with both lanes held in pipe reset
+            // and the corresponding current-status bits asserted.
+            regs.insert(0x16_f204, 0xf000_0000);
+            regs.insert(0x16_f404, 0xf000_0000);
             Self {
-                regs: RefCell::new(BTreeMap::new()),
+                regs: RefCell::new(regs),
                 vdr: RefCell::new(BTreeMap::new()),
                 transactions: RefCell::new(Vec::new()),
                 resets: Cell::new(0),
@@ -884,6 +1139,30 @@ mod tests {
         }
 
         fn write32(&self, off: u64, value: u32) {
+            if matches!(off, 0x16_f260 | 0x16_f460) {
+                let mut next = value;
+                if value & lane_pclk_pll_request(0) != 0 {
+                    next |= lane_pclk_pll_ack(0);
+                } else {
+                    next &= !lane_pclk_pll_ack(0);
+                }
+                self.regs.borrow_mut().insert(off, next);
+                return;
+            }
+            if matches!(off, 0x16_f204 | 0x16_f404) {
+                let old = self.read32(off);
+                let reset_mask = lane_pipe_reset(0) | lane_pipe_reset(1);
+                let status_mask = lane_phy_current_status(0) | lane_phy_current_status(1);
+                let pulse_mask = phy_pulse_status(0) | phy_pulse_status(1);
+                let update_mask = lane_powerdown_update(0) | lane_powerdown_update(1);
+                let resets = value & reset_mask;
+                let released = old & reset_mask & !resets;
+                let mut next = value & !(status_mask | pulse_mask | update_mask);
+                next |= resets >> 2;
+                next |= released >> 4;
+                self.regs.borrow_mut().insert(off, next);
+                return;
+            }
             if Self::ordinary_status(off) {
                 let old = self.read32(off);
                 self.regs.borrow_mut().insert(off, old & !value);
@@ -920,6 +1199,16 @@ mod tests {
             }
             let data = ((value >> M2P_DATA_SHIFT) & 0xff) as u8;
             self.vdr.borrow_mut().insert((lane, address), data);
+            if address == LT_PHY_RATE_UPDATE && data & LT_PHY_RATE_CONTROL_VDR_UPDATE == 0 {
+                let buf_ctl2 = match port {
+                    WclLtPort::Tc1 => 0x16_f204,
+                    WclLtPort::Tc2 => 0x16_f404,
+                };
+                let current = self.read32(buf_ctl2);
+                self.regs
+                    .borrow_mut()
+                    .insert(buf_ctl2, current | phy_pulse_status(lane));
+            }
             self.transactions.borrow_mut().push(Transaction {
                 lane,
                 address,
@@ -1215,5 +1504,98 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_wcl_lt_phy_transport_programs_signal_levels
+    );
+
+    fn smoke_wcl_lt_phy_enable_disable_sequence() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, WclLtPort::Tc1, true, 4, false).unwrap();
+        phy.enable_dp(LtDpEnable {
+            rate: LtDpRate::Hbr3,
+            lane_count: 4,
+            pin_assignment_d: false,
+            ssc_enabled: false,
+        })
+        .unwrap();
+
+        let clock = fake.read32(0x16_f260);
+        assert_eq!(clock & lane_pclk_pll_request(0), lane_pclk_pll_request(0));
+        assert_eq!(clock & lane_pclk_pll_ack(0), lane_pclk_pll_ack(0));
+        assert_eq!(clock & FORWARD_CLOCK_UNGATE, FORWARD_CLOCK_UNGATE);
+        assert_eq!(clock & XE3_DDI_CLOCK_SELECT_MASK, DDI_CLOCK_SELECT_MAXPCLK);
+        assert_eq!(clock & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB), 0);
+        assert_eq!(fake.read32(0x6_4330), 810_000);
+        assert_eq!(
+            fake.read32(0x16_f234) & MACCLK_RATE_MASK,
+            MACCLK_RATE_DEFAULT
+        );
+        assert_eq!(fake.read32(0x16_f234) & MACCLK_RESET_0, 0);
+        assert_eq!(fake.read32(0x16_f200) & PHY_MODE_MASK, PHY_MODE_DP);
+        assert_eq!(
+            fake.vdr.borrow().get(&(0, LT_PHY_RATE_UPDATE)).copied(),
+            Some(0)
+        );
+        assert_eq!(
+            fake.vdr.borrow().get(&(1, LT_PHY_RATE_UPDATE)).copied(),
+            Some(0)
+        );
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x040a)).copied(), Some(1));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x060a)).copied(), Some(1));
+        let buf2 = fake.read32(0x16_f204);
+        assert_eq!(
+            buf2 & (lane_pipe_reset(0)
+                | lane_pipe_reset(1)
+                | lane_phy_current_status(0)
+                | lane_phy_current_status(1)
+                | phy_pulse_status(0)
+                | phy_pulse_status(1)),
+            0
+        );
+
+        phy.disable().unwrap();
+        let clock = fake.read32(0x16_f260);
+        assert_eq!(
+            clock
+                & (lane_pclk_pll_request(0)
+                    | lane_pclk_pll_ack(0)
+                    | FORWARD_CLOCK_UNGATE
+                    | XE3_DDI_CLOCK_SELECT_MASK),
+            0
+        );
+        assert_eq!(fake.read32(0x6_4330), 0);
+        assert_eq!(fake.read32(0x16_f234) & MACCLK_RESET_0, MACCLK_RESET_0);
+        assert_eq!(
+            fake.read32(0x16_f204) & (lane_phy_current_status(0) | lane_phy_current_status(1)),
+            lane_phy_current_status(0) | lane_phy_current_status(1)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_wcl_lt_phy_enable_disable_sequence
+    );
+
+    fn smoke_wcl_lt_phy_clock_selection_and_width_refusal() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, WclLtPort::Tc2, true, 2, false).unwrap();
+        phy.program_port_clock(LtDpRate::Uhbr10, true).unwrap();
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, SSC_ENABLE_PLLA);
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, 0);
+        phy.program_port_clock(LtDpRate::Hbr3, true).unwrap();
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, 0);
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, SSC_ENABLE_PLLB);
+        assert_eq!(
+            phy.enable_dp(LtDpEnable {
+                rate: LtDpRate::Hbr3,
+                lane_count: 4,
+                pin_assignment_d: false,
+                ssc_enabled: false,
+            }),
+            Err(Cx0Error::ProtocolMismatch)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_wcl_lt_phy_clock_selection_and_width_refusal
     );
 }
