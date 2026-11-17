@@ -3,11 +3,11 @@
 //! Linux selects LT PHY through `HAS_LT_PHY(display)`, which is exactly
 //! `platform.novalake`; Panther/Wildcat Lake remain on C10/C20. Nova Lake's
 //! A/B and Type-C TC1/TC2 ports have the LT register layout. This module
-//! deliberately contains only the pure, source-qualified portion of Linux's
-//! `intel_lt_phy.c` contract:
+//! contains the source-qualified portion of Linux's `intel_lt_phy.c` contract:
 //! port/register selection, DP PLL images, VDR write-image construction,
-//! transmitter ownership/masking and DP signal-level tables.  It performs no
-//! MMIO, does not decode display 35.00 and grants no route authority.
+//! transmitter ownership/masking, DP signal-level tables and the disconnected
+//! MMIO transport. A strict, read-only display-35 route proof grants no
+//! programming authority; production remains disconnected.
 //!
 //! Pinned source: the local Linux tree's
 //! `drivers/gpu/drm/i915/display/{intel_lt_phy.c,intel_lt_phy_regs.h,
@@ -18,6 +18,8 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_gt::GtPlatform;
+use crate::intel_gpu_xe2lpd::{DisplayIdentity, IpError, DFSM_PIPE_A_DISABLE, SKL_DFSM};
 use crate::intel_gpu_xelpg::{
     lane_pclk_pll_ack, lane_pclk_pll_request, lane_phy_current_status, lane_pipe_reset,
     lane_powerdown_new_state, lane_powerdown_update, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort,
@@ -25,6 +27,65 @@ use crate::intel_gpu_xelpg::{
     PLL_LANE_STAGGERING_DELAY_MASK, PORT_BUF_REVERSAL, POWER_STATE_ACTIVE_MASK,
     POWER_STATE_READY_MASK, SSC_ENABLE_PLLA, SSC_ENABLE_PLLB, XE3_DDI_CLOCK_SELECT_MASK,
 };
+
+/// Destructive display option reserved for the exact Nova Lake-S route.
+pub(crate) const OPT_IN: &str = "narf.intel.nvl_display";
+const PICA_PHY_CONFIG_CONTROL: u64 = 0x16_fe68;
+const EDP_ON_TYPEC: u32 = 1 << 31;
+const TRANSCONF_A: u64 = 0x70_008;
+
+/// Strict option grammar shared by Intel's destructive route gates.
+pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, OPT_IN)
+}
+
+/// Why display 35.00 remains on the headless profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteRefusal {
+    UnsupportedPlatform,
+    NotRequested,
+    Ip(IpError),
+    PipeAFused,
+    EdpOnTypeC,
+    PipeADark,
+}
+
+/// Exact, read-only Nova Lake-S display-35 route proof. This does not build a
+/// [`crate::intel_gpu_xe2lpd::DisplayIp`] and therefore grants no modeset or
+/// LT-PHY programming authority.
+pub(crate) fn display_route(
+    platform: GtPlatform,
+    requested: bool,
+    io: &(impl MmioWindow + ?Sized),
+) -> Result<DisplayIdentity, RouteRefusal> {
+    if platform != GtPlatform::NovaLakeS {
+        return Err(RouteRefusal::UnsupportedPlatform);
+    }
+    if !requested {
+        return Err(RouteRefusal::NotRequested);
+    }
+    let identity = DisplayIdentity::read(io).map_err(RouteRefusal::Ip)?;
+    if identity != DisplayIdentity::NovaLakeS {
+        let (ver, rel) = identity.version();
+        return Err(RouteRefusal::Ip(IpError::Unqualified { ver, rel }));
+    }
+    let dfsm = io.read32(SKL_DFSM);
+    let pica = io.read32(PICA_PHY_CONFIG_CONTROL);
+    let conf = io.read32(TRANSCONF_A);
+    if dfsm == u32::MAX || pica == u32::MAX || conf == u32::MAX || !io.display_access_ok() {
+        return Err(RouteRefusal::Ip(IpError::NoDevice));
+    }
+    if dfsm & DFSM_PIPE_A_DISABLE != 0 {
+        return Err(RouteRefusal::PipeAFused);
+    }
+    if pica & EDP_ON_TYPEC != 0 {
+        return Err(RouteRefusal::EdpOnTypeC);
+    }
+    if conf & (3 << 30) != 3 << 30 {
+        return Err(RouteRefusal::PipeADark);
+    }
+    Ok(identity)
+}
 
 pub(crate) const LANE0: u8 = 1;
 pub(crate) const LANE1: u8 = 2;
@@ -1117,6 +1178,84 @@ mod tests {
             }
         }
     }
+
+    fn lit_nvl() -> FakeLtMmio {
+        let io = FakeLtMmio::default();
+        io.regs.borrow_mut().extend([
+            (crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY, 35 << 22),
+            (SKL_DFSM, 0),
+            (PICA_PHY_CONFIG_CONTROL, 0),
+            (TRANSCONF_A, 3 << 30),
+        ]);
+        io
+    }
+
+    fn smoke_nvl_display_route_is_exact_and_read_only() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+
+        let io = lit_nvl();
+        let before = io.regs.borrow().clone();
+        assert_eq!(
+            display_route(GtPlatform::NovaLakeS, true, &io),
+            Ok(DisplayIdentity::NovaLakeS)
+        );
+        assert_eq!(*io.regs.borrow(), before);
+        assert_eq!(
+            display_route(
+                GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+                true,
+                &io,
+            ),
+            Err(RouteRefusal::UnsupportedPlatform)
+        );
+        assert_eq!(
+            display_route(GtPlatform::NovaLakeS, false, &FakeLtMmio::default()),
+            Err(RouteRefusal::NotRequested)
+        );
+
+        for (reg, value, refusal) in [
+            (
+                crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY,
+                (30 << 22) | (2 << 14),
+                RouteRefusal::Ip(IpError::Unqualified { ver: 30, rel: 2 }),
+            ),
+            (SKL_DFSM, DFSM_PIPE_A_DISABLE, RouteRefusal::PipeAFused),
+            (
+                PICA_PHY_CONFIG_CONTROL,
+                EDP_ON_TYPEC,
+                RouteRefusal::EdpOnTypeC,
+            ),
+            (TRANSCONF_A, 0, RouteRefusal::PipeADark),
+            (TRANSCONF_A, u32::MAX, RouteRefusal::Ip(IpError::NoDevice)),
+        ] {
+            let io = lit_nvl();
+            io.regs.borrow_mut().insert(reg, value);
+            assert_eq!(
+                display_route(GtPlatform::NovaLakeS, true, &io),
+                Err(refusal),
+                "{reg:#x}={value:#x}"
+            );
+        }
+
+        assert!(requested(KernelCmdline::new(
+            "quiet narf.intel.nvl_display=1"
+        )));
+        for line in [
+            "",
+            "narf.intel.nvl_display",
+            "narf.intel.nvl_display=0",
+            "narf.intel.nvl_display=01",
+            "narf.intel.ptl_display=1",
+            "narf.intel.wcl_display=1",
+        ] {
+            assert!(!requested(KernelCmdline::new(line)), "{line}");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_display_route_is_exact_and_read_only
+    );
 
     impl FakeLtMmio {
         fn ctl_lane(off: u64) -> Option<(LtPort, u8)> {

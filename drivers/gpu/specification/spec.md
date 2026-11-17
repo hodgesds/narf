@@ -422,8 +422,8 @@ read-only. The distinct production option carries that exact display IP
 through KMS install, resource capture, recovery and the hotplug actor. Linux's
 source boundary is
 explicit: Wildcat Lake is a Panther Lake subplatform and remains on C10/C20;
-LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` is an
-additional pure model of Nova Lake's A/B/TC1/TC2 LT-PHY boundary: exact
+LT PHY is selected only by `platform.novalake`. `intel_gpu_lt_phy` models Nova
+Lake's A/B/TC1/TC2 LT-PHY boundary: exact
 RBR-through-UHBR20 DP PLL/VDR images, transmitter
 ownership/masking and DP 1.4/UHBR signal tables. Its crate-private transport
 executes those images only when `MmioWindow::has_lt_phy()` carries that exact
@@ -433,7 +433,10 @@ settling, plus source DP 1.4/UHBR per-lane swing/cursor RMWs; only fake-MMIO
 fixtures call it. Its disconnected enable/disable state machine covers LT
 MacCLK/lane reset, P2/P0 transitions, PLL rate calibration and display-35 clock
 selection, but requires DC-off and Type-C/D2D/AUX ownership from a future
-caller. It is not an operational route.
+caller. Its strict `narf.intel.nvl_display=1` route proof is read-only and
+requires exact `GtPlatform::NovaLakeS`, GMD 35.00, an unfused and firmware-lit
+Pipe A, and a non-Type-C eDP panel; it constructs no operational `DisplayIp`
+and is not a production route.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
@@ -3340,11 +3343,11 @@ graphics 30.00/30.01, media 30.00 and `xe/ptl_guc_70.bin` 70.54.0+.
 WCL IDs fd80/fd81 select that same Linux PTL descriptor and firmware profile,
 but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
 media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
-has an exact, separately opted-in route and modeset model, but production
-probe/KMS/hotplug admission remains closed pending exact-IP plumbing.
+has an exact, separately opted-in production probe/KMS/hotplug route.
 NVL-S accepts only PCI d740-d745, graphics 30.03/30.04/30.05, media 35.00 and
-`xe/nvl_guc_70.bin` 70.55.4+. Its display 35.00 identity is checked only as a
-post-FLR refusal proof; it has no display-preserving route.
+`xe/nvl_guc_70.bin` 70.55.4+. Its display 35.00 identity has post-FLR refusal
+proofs and a separately opted-in read-only route decision; it has no
+display-preserving route.
 These integrated profiles use DMA46, default 2 MiB WOPCM and source-selected
 five-level PPGTT root4 with a 48-bit VA ceiling. Existing constructors retain
 root3; explicit root4 requires the Xe2 encoding. Only programmed uncompressed

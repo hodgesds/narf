@@ -1,8 +1,10 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.88** (v0.87 plus exact, separately opted-in WCL display-30.02
-> route admission and Pipe-A modeset dispatch while its production probe and
-> hotplug entry remain closed; v0.86 plus a disconnected exact WCL external
+> Status: **v0.90** (v0.90 adds the exact, separately opted-in read-only Nova
+> Lake-S display-35 route proof; v0.89 carries WCL 30.02 through the production
+> probe, KMS and hotplug actor; v0.88 added exact, separately opted-in WCL
+> display-30.02 route admission and Pipe-A modeset dispatch while its production
+> probe and hotplug entry were still closed; v0.86 plus a disconnected exact WCL external
 > owner that exercises TC1/TC2 DP-alt through C20 and Pipes B/C; v0.85
 > corrected against Linux 7.0-rc7 so LT PHY is
 > source-qualified to Nova Lake display 35.00 A/B/TC1/TC2 while Wildcat Lake
@@ -12,7 +14,7 @@
 > per-lane swing/cursor programming; its disconnected LT-PHY A/B/TC1/TC2 VDR
 > and retrying P2P transmitter transport; its DP PLL/write-image,
 > transmitter-ownership and DP 1.4/UHBR signal models,
-> while every production display-30.02 output route remains fail-closed; the
+> while every production display-30.02 output route was still fail-closed; the
 > Wildcat
 > Lake three-pipe resource profile and its 480 MHz/22 GB/s admission ceilings;
 > the source-qualified Panther Lake display-30
@@ -35,10 +37,10 @@
 > publication and exact detach withdrawal; exact fail-closed Arctic Sound-M discovery;
 > a typed, read-only census of all current
 > Linux GMD display identities, including distinct Wildcat Lake 30.02 and
-> Nova Lake-S 35.00 refusal proofs; exact Nova Lake-S headless GT/GuC/media
+> Nova Lake-S 35.00 refusal and read-only route proofs; exact Nova Lake-S headless GT/GuC/media
 > identity and exact fail-closed Crescent Island discovery; a distinct Wildcat Lake GT profile admitting
-> exact graphics 30.03-30.05 and media 30.02 while its production display entry
-> remains fail-closed; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
+> exact graphics 30.03-30.05 and media 30.02 with a separately opted-in
+> production display route; the exact Linux DG1 PCI-ID, Xe-LP+ GuC/GT,
 > display-idle and cache-policy profile; DG1 display programming and local-
 > memory publication remain fail-closed; the exact Rocket Lake PCI-ID and
 > GuC/GT profile keeps Rocket Lake display programming fail-closed;
@@ -339,17 +341,20 @@ an operational display IP. The complete disconnected DP enable/disable machine
 adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
 rate-update calibration and DDI clock-value programming in Linux source order.
 It requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
-production route supplies those preconditions. Display 35.00 remains a typed
-route refusal pending Nova Lake display and output ownership; WCL stays on the
-separate C10/C20 route above.
+production route supplies those preconditions. A strict
+`narf.intel.nvl_display=1` read-only route decision requires exact Nova Lake-S,
+GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants
+no programming authority: display 35.00 remains operationally gated pending
+Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
 MOCS table, display/media 35.00, and `xe/nvl_guc_70.bin` exactly at 70.55.4 or
 newer. `GtPlatform::NovaLakeS` retains that firmware identity and admits the
 source graphics-GMD set 30.03/30.04/30.05 plus media 35.00 on the driver-FLR
-headless route. It never enters the display-30 route; display 35.00 remains
-gated until its clock/PHY/modeset policy is qualified.
+headless route. It never enters the display-30 route; its distinct read-only
+display option proves 35.00 without selecting the disconnected LT transport.
+Programming remains gated until its clock/PHY/modeset policy is qualified.
 
 Crescent Island ID 674C is exact `INTEL_CRI_IDS` and uses an exact PCI-device
 registration because Linux does not classify it as VGA. Linux describes its
