@@ -5409,3 +5409,114 @@ fn smoke_fwsec_run_helpers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/fwsec", smoke_fwsec_run_helpers);
+
+// ────────────────────────────────────────────────────────────────
+// GSP CPU sequencer — opcode decode (execute is HW-only)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_seq::{decode_all, decode_cmd, payload_dwords, SeqCmd, SeqError};
+
+fn smoke_gsp_seq_decode_each_opcode() -> TestResult {
+    let w = |v: &[u32]| -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec::Vec::new();
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
+    // REG_WRITE (12 bytes).
+    let (c, n) = decode_cmd(&w(&[0, 0x100, 0xABCD])).unwrap();
+    if c != (SeqCmd::RegWrite {
+        addr: 0x100,
+        val: 0xABCD,
+    }) || n != 12
+    {
+        return TestResult::Fail("REG_WRITE decode");
+    }
+    // REG_MODIFY (16 bytes).
+    let (c, n) = decode_cmd(&w(&[1, 0x200, 0xF0, 0x30])).unwrap();
+    if c != (SeqCmd::RegModify {
+        addr: 0x200,
+        mask: 0xF0,
+        val: 0x30,
+    }) || n != 16
+    {
+        return TestResult::Fail("REG_MODIFY decode");
+    }
+    // REG_POLL (24 bytes); the 6th word (error) is skipped.
+    let (c, n) = decode_cmd(&w(&[2, 0x300, 0xFF, 0x5, 1000, 0xDEAD])).unwrap();
+    if c != (SeqCmd::RegPoll {
+        addr: 0x300,
+        mask: 0xFF,
+        val: 0x5,
+        timeout_us: 1000,
+    }) || n != 24
+    {
+        return TestResult::Fail("REG_POLL decode");
+    }
+    // DELAY_US (8), REG_STORE (12).
+    let (c, n) = decode_cmd(&w(&[3, 42])).unwrap();
+    if c != (SeqCmd::DelayUs { us: 42 }) || n != 8 {
+        return TestResult::Fail("DELAY_US decode");
+    }
+    let (c, n) = decode_cmd(&w(&[4, 0x400, 3])).unwrap();
+    if c != (SeqCmd::RegStore {
+        addr: 0x400,
+        index: 3,
+    }) || n != 12
+    {
+        return TestResult::Fail("REG_STORE decode");
+    }
+    // CORE_* opcodes are a bare 4-byte word.
+    for (op, exp) in [
+        (5u32, SeqCmd::CoreReset),
+        (6, SeqCmd::CoreStart),
+        (7, SeqCmd::CoreWaitForHalt),
+        (8, SeqCmd::CoreResume),
+    ] {
+        let (c, n) = decode_cmd(&w(&[op])).unwrap();
+        if c != exp || n != 4 {
+            return TestResult::Fail("CORE_* decode");
+        }
+    }
+    // Unknown opcode / truncation are rejected.
+    if decode_cmd(&w(&[9])) != Err(SeqError::BadOpcode(9)) {
+        return TestResult::Fail("opcode 9 must be rejected");
+    }
+    if decode_cmd(&w(&[0, 0x100])) != Err(SeqError::Truncated) {
+        return TestResult::Fail("a truncated command must be rejected");
+    }
+    if payload_dwords(2) != Some(5) || payload_dwords(5) != Some(0) || payload_dwords(9).is_some() {
+        return TestResult::Fail("payload_dwords table drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_seq", smoke_gsp_seq_decode_each_opcode);
+
+fn smoke_gsp_seq_decode_buffer_walk() -> TestResult {
+    // A buffer of: REG_WRITE (3 dw) + CORE_RESET (1 dw) + DELAY_US (2 dw)
+    // = 6 dwords total.
+    let mut b = alloc::vec::Vec::new();
+    for x in [0u32, 0x10, 0x20, 5, 3, 7] {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    let cmds = match decode_all(&b, 6) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("well-formed buffer must decode"),
+    };
+    if cmds.len() != 3 {
+        return TestResult::Fail("buffer must decode to three commands");
+    }
+    if cmds[0]
+        != (SeqCmd::RegWrite {
+            addr: 0x10,
+            val: 0x20,
+        })
+        || cmds[1] != SeqCmd::CoreReset
+        || cmds[2] != (SeqCmd::DelayUs { us: 7 })
+    {
+        return TestResult::Fail("commands decoded out of order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_seq", smoke_gsp_seq_decode_buffer_walk);
