@@ -2295,7 +2295,7 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     if cmd6_arg(true, 0, 1) != 0x80FFFFF1 {
         return TestResult::Fail("CMD6 switch to SDR25 must be 0x80FFFFF1");
     }
-    if cmd6_arg(true, 2, 3) != 0x80FFFF3F {
+    if cmd6_arg(true, 1, 3) != 0x80FFFF3F {
         return TestResult::Fail("CMD6 switch of group 2 to 3 must be 0x80FFFF3F");
     }
     // Switch-status parsing: support in byte 13, current

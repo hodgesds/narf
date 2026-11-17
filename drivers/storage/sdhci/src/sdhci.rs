@@ -524,6 +524,8 @@ impl UhsMode {
 /// bit 31 is the mode (0 = check, 1 = switch), each function
 /// group occupies 4 bits (group 1 in [3:0], group 2 in [7:4],
 /// …), and every group except the target keeps 0xF ("no change").
+/// `group` is 0-based: 0 selects function group 1 ([3:0]),
+/// 1 selects function group 2 ([7:4]).
 pub const fn cmd6_arg(switch: bool, group: u8, value: u8) -> u32 {
     let mode = if switch { 1u32 << 31 } else { 0 };
     let shift = (group as u32) * 4;
