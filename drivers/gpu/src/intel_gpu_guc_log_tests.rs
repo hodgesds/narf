@@ -111,6 +111,7 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 
 fn smoke_guc_log_exact_copy_header_and_profiles() -> TestResult {
     for (platform, tag) in [
+        (GtPlatform::ArcticSoundM, 1),
         (GtPlatform::Alchemist, 1),
         (
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),

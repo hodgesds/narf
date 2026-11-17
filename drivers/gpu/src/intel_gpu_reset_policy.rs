@@ -56,7 +56,7 @@ impl ResetPolicy {
             || dss & 0x40000000 == 0
             || group > 15
             || instance
-                > if platform.is_gen12() || platform == GtPlatform::Alchemist {
+                > if platform.is_gen12() || platform.is_dg2() {
                     7
                 } else {
                     15

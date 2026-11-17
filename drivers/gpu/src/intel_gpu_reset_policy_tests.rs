@@ -283,7 +283,7 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
                     }) << 16,
                 );
             }
-            if !platform.is_gen12() && platform != GtPlatform::Alchemist {
+            if !platform.is_gen12() && !platform.is_dg2() {
                 d.regs.insert(
                     0xd8c,
                     if platform.is_ptl() {

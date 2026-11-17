@@ -1182,7 +1182,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         let batch = if gpu_only {
             crate::intel_gpu_exec::prepare_smallbar_clear(object)
         } else {
-            crate::intel_gpu_exec::prepare_vram_clear(object)
+            crate::intel_gpu_exec::prepare_vram_clear(self.parts.boot.platform(), object)
         }
         .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
         // SAFETY: factory retains all private mappings and zero source, emits

@@ -132,7 +132,7 @@ impl ContextSeed {
                 return Err(ContextError::Topology);
             }
             let slice = mslices.trailing_zeros();
-            if platform == GtPlatform::Alchemist {
+            if platform.is_dg2() {
                 let bank = slice * 8;
                 steering((bank >> 2) & 7, bank & 3)?
             } else {
@@ -181,7 +181,7 @@ impl ContextSeed {
             return words;
         }
         let mut masked = match self.platform {
-            GtPlatform::Alchemist => vec![
+            _ if self.platform.is_dg2() => vec![
                 (0x6208, 0x00200020), // TBIMR tuning
                 (0x7004, 0x08000800), // 18019271663
                 (0x703c, 0x00200020), // 18018764978
@@ -249,7 +249,7 @@ impl ContextSeed {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
         } else if self.platform != GtPlatform::Battlemage && !self.platform.is_xe3_lpg() {
-            if self.platform == GtPlatform::Alchemist {
+            if self.platform.is_dg2() {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
             rmw(&mut words, 0xb158, 0x3ff, 0x7f, self.l3);
@@ -474,6 +474,7 @@ pub(crate) mod tests {
 
     fn smoke_context_workaround_and_steering_vectors() -> TestResult {
         for platform in [
+            GtPlatform::ArcticSoundM,
             GtPlatform::Alchemist,
             GtPlatform::Battlemage,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
@@ -512,13 +513,13 @@ pub(crate) mod tests {
                 assert_eq!(regs[&0xb158], 0xa500007f);
                 assert_eq!(
                     seed.l3,
-                    if platform == GtPlatform::Alchemist {
+                    if platform.is_dg2() {
                         0x43000000
                     } else {
                         0x41820000
                     }
                 );
-                if platform == GtPlatform::Alchemist {
+                if platform.is_dg2() {
                     assert_eq!(regs[&0x6604], 0xa5041234);
                     assert_eq!(regs[&0x83a4], 0x4000);
                 }

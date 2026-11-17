@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.69** (v0.68 plus an explicit display-less Arctic Sound-M
-> descriptor that forbids display inventory and identity reads; a typed,
+> Status: **v0.70** (v0.69 plus source-qualified DG2 execution mechanics for
+> the still-gated Arctic Sound-M identity; an explicit display-less Arctic
+> Sound-M descriptor that forbids display inventory and identity reads; a typed,
 > still probe-gated Arctic Sound-M GT/GuC/DMA/subplatform profile and exact
 > per-family DMA masks; serial-owned
 > Gen12 USB-C DP scanout
@@ -306,9 +307,15 @@ device-specific lifecycle policy, so ATS-M is not silently inserted there.
 DG2 GuC/cache/topology mechanics and exact M150=G10 / M75=G11 workaround
 subplatform. Its source `has_display=false` descriptor is a separate typed
 fact: validation never inventories display planes and discrete probe never
-reads display identity for ATS-M. The exact IDs remain announced-but-gated
-before D-state, BAR, command or MMIO effects until a display-less SR-IOV
-lifecycle and reset owner is qualified.
+reads display identity for ATS-M. Linux assigns the descriptor `PLATFORM(DG2)`,
+so NARF's `is_dg2()` architecture predicate now selects the shared MCR
+steering, GT/LRC workarounds, context and reset images, Gen12 PTE/PAT rules,
+64-KiB VRAM mapping, Flat-CCS copy/clear, SLPC, GuC log/stream and non-privilege
+policies for ATS-M as well as display-capable DG2. Trusted CCS-clear batches
+retain the actual platform identity instead of being mislabeled Alchemist.
+Display, fan and SR-IOV lifecycle policy remains separate. The exact IDs remain
+announced-but-gated before D-state, BAR, command or MMIO effects until a
+display-less SR-IOV lifecycle and reset owner is qualified.
 
 PCI DMA width is independent of PTE address capacity. The exact Linux xe
 descriptor matrix is enforced at every qualified GGTT/PPGTT publication:

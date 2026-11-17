@@ -111,7 +111,8 @@ impl ExecRequest {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
@@ -620,7 +621,8 @@ impl ResidentBatch {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
@@ -650,8 +652,7 @@ impl ResidentBatch {
                 }
                 if object.is_vram()
                     && object.vram_page_size() == 65536
-                    && (platform != GtPlatform::Alchemist
-                        || (m.va | m.offset | m.length) & 65535 != 0)
+                    && (!platform.is_dg2() || (m.va | m.offset | m.length) & 65535 != 0)
                 {
                     return Err(FsError::InvalidData);
                 }

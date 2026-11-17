@@ -426,8 +426,7 @@ impl Bind {
             let object = gem.object(object)?;
             if object.is_vram()
                 && object.vram_page_size() == 65536
-                && (platform != crate::intel_gpu_gt::GtPlatform::Alchemist
-                    || (address | offset | length) & 65535 != 0)
+                && (!platform.is_dg2() || (address | offset | length) & 65535 != 0)
             {
                 return Err(FsError::InvalidData);
             }

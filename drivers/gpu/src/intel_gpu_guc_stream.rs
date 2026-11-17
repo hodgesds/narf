@@ -1108,6 +1108,7 @@ pub(crate) fn supported(platform: crate::intel_gpu_gt::GtPlatform, version: (u8,
     matches!(
         platform,
         GtPlatform::Gen12(_)
+            | GtPlatform::ArcticSoundM
             | GtPlatform::Alchemist
             | GtPlatform::Battlemage
             | GtPlatform::Integrated(Generation::MeteorLake)

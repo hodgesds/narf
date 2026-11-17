@@ -1877,9 +1877,17 @@ mechanics without aliasing the display-capable `Alchemist` policy identity.
 for ATS-M among the currently typed platforms. PCI validation therefore never
 inventories display planes for ATS-M, and discrete probe never reads
 `DiscreteDisplayIp`; fixtures require both paths to complete without a display
-MMIO read. Probe still refuses before D-state/BAR/command/MMIO effects;
-execution waits for a separately qualified display-less SR-IOV lifecycle and
-reset owner.
+MMIO read. Linux's ATS-M descriptor expands `DG2_FEATURES` and therefore has
+the same `PLATFORM(DG2)` architecture as retail DG2. Internal GT code must use
+`GtPlatform::is_dg2()`—not equality with the display-capable policy identity—
+for MCR steering and implicit selectors, GT/LRC/reset workarounds, Gen12
+PTE/PAT and 64-KiB VRAM rules, Flat-CCS copy/clear commands, SLPC fuse decoding,
+GuC log/stream format and non-privileged register policy. Trusted VRAM clear
+takes and retains the actual DG2 platform identity so scheduler admission
+cannot reject an otherwise valid ATS-M batch as cross-platform. These shared
+mechanics do not grant display, fan-control or SR-IOV lifecycle authority.
+Probe still refuses before D-state/BAR/command/MMIO effects; execution waits
+for a separately qualified display-less SR-IOV lifecycle and reset owner.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

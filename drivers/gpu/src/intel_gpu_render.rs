@@ -1736,6 +1736,7 @@ impl RenderFile {
                 let low_latency_admitted = matches!(
                     info.platform,
                     GtPlatform::Gen12(_)
+                        | GtPlatform::ArcticSoundM
                         | GtPlatform::Alchemist
                         | GtPlatform::Integrated(Generation::MeteorLake)
                 ) && crate::intel_gpu_xe::low_latency_supported(info);
@@ -2072,6 +2073,7 @@ fn create_extensions(
             if matches!(
                 info.platform,
                 GtPlatform::Gen12(_)
+                    | GtPlatform::ArcticSoundM
                     | GtPlatform::Alchemist
                     | GtPlatform::Integrated(Generation::TigerLake | Generation::AlderLake)
             ) {

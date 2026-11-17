@@ -104,7 +104,7 @@ mod tests {
         flat: bool,
         live: u32,
     ) -> (Window, RegisterInit) {
-        let modern = platform != GtPlatform::Alchemist;
+        let modern = !platform.is_gen12() && !platform.is_dg2();
         let first = live.trailing_zeros();
         let dss = 0x80000000
             | if modern {
@@ -151,12 +151,15 @@ mod tests {
     }
 
     fn smoke_global_register_dg2_subplatform_vectors() -> TestResult {
-        for (device, g10, g11) in [
-            (0x56a0, true, false),
-            (0x56a5, false, true),
-            (0x56a3, false, false),
+        for (platform, device, g10, g11) in [
+            (GtPlatform::Alchemist, 0x56a0, true, false),
+            (GtPlatform::Alchemist, 0x56a5, false, true),
+            (GtPlatform::Alchemist, 0x56a3, false, false),
+            (GtPlatform::ArcticSoundM, 0x56c0, true, false),
+            (GtPlatform::ArcticSoundM, 0x56c1, false, true),
+            (GtPlatform::ArcticSoundM, 0x56c2, true, false),
         ] {
-            let (w, init) = fixture(GtPlatform::Alchemist, device, 55, 0, false, 1 << 18);
+            let (w, init) = fixture(platform, device, 55, 0, false, 1 << 18);
             w.regs.borrow_mut().insert(0xe7cc, 0x12345678);
             assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
             let r = w.regs.borrow();
@@ -622,7 +625,7 @@ impl RegisterInit {
         {
             return Poll::Ready(Err(RegisterError::Identity));
         }
-        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && !self.platform.is_dg2();
         if modern {
             let semaphore = mmio.read32(0xfd0);
             if semaphore == u32::MAX {
@@ -660,7 +663,7 @@ impl RegisterInit {
         selector: u64,
         target: Target,
     ) -> Result<(), RegisterError> {
-        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && !self.platform.is_dg2();
         let (group, instance) = match target {
             Target::Direct | Target::Implicit => return Ok(()),
             Target::Dss => ((self.seed.dss >> 23) & 127, (self.seed.dss >> 16) & 127),
@@ -689,7 +692,7 @@ impl RegisterInit {
         mmio: &impl MmioWindow,
         selector: u64,
     ) -> Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError> {
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             // DG2 SF/SQIDI implicit ranges use instance two. GAM ranges
             // retain their separate hardware-default instance-one selector.
             mmio.write32(0xfd0, 0x02000000);
@@ -699,7 +702,7 @@ impl RegisterInit {
             }
         }
         let mut vram = None;
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             // 0x4910 is in DG2's GAM implicit-steering range (xe_gt_mcr.c),
             // independent of the explicit MCR selector. Read all layout
             // words twice; an absent layout merely withholds VRAM while the

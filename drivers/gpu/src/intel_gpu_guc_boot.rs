@@ -2118,6 +2118,7 @@ mod tests {
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
+            GtPlatform::ArcticSoundM => 0x56c0,
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
             _ if platform.is_ptl() => 0xb080,

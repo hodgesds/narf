@@ -260,7 +260,7 @@ fn valid_state(index: usize, words: &[u32; 9]) -> bool {
 }
 pub(crate) fn platform_tag(platform: GtPlatform) -> u32 {
     match platform {
-        GtPlatform::Alchemist => 1,
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => 1,
         GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => 2,
         GtPlatform::Battlemage => 3,
         _ => 0,

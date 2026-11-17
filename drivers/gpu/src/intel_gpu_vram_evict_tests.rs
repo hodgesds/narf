@@ -78,7 +78,7 @@ impl UserBackend for EvictBackend {
             // prepare_vram_clear owns the CCS-clear claim (ccs 1 -> 2);
             // claiming it here first would make the factory call fail
             // with InvalidData (see #2157).
-            let batch = crate::intel_gpu_exec::prepare_vram_clear(object)?;
+            let batch = crate::intel_gpu_exec::prepare_vram_clear(self.platform, object)?;
             let vm = batch.diagnostic_vm();
             assert!(vram_clear::execute_fixture(vm.root, vm.address));
             let fence = Arc::new(CompletionFence::new());

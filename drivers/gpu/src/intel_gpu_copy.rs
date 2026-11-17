@@ -113,15 +113,13 @@ impl CopyRequest {
     }
 
     pub(crate) fn prepare(self, platform: GtPlatform) -> Result<ResidentBatch, FsError> {
-        if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+        if !platform.is_dg2() && platform != GtPlatform::Battlemage {
             return Err(FsError::Unsupported);
         }
         // DG2's compressed data and auxiliary representation must travel
         // together. An ordinary system destination without a CCS backup
         // buffer cannot retain that CCS.
-        let save_ccs = platform == GtPlatform::Alchemist
-            && self.source.is_vram()
-            && !self.destination.is_vram();
+        let save_ccs = platform.is_dg2() && self.source.is_vram() && !self.destination.is_vram();
         if save_ccs && self.ccs_backup.is_none() {
             return Err(FsError::Unsupported);
         }
@@ -155,7 +153,7 @@ impl CopyRequest {
                 pat,
             ),
         ];
-        let ccs = platform == GtPlatform::Alchemist && (self.destination.is_vram() || save_ccs);
+        let ccs = platform.is_dg2() && (self.destination.is_vram() || save_ccs);
         if save_ccs {
             let backup = self.ccs_backup.clone().expect("checked CCS backup");
             mappings.push(mapping(backup.clone(), CCS_ZERO, 0, backup.size(), true, 0));
