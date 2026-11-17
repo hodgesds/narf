@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.90** (v0.90 adds the exact, separately opted-in read-only Nova
+> Status: **v0.91** (v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
+> CDCLK ladder and hooks; v0.90 adds the exact, separately opted-in read-only Nova
 > Lake-S display-35 route proof; v0.89 carries WCL 30.02 through the production
 > probe, KMS and hotplug actor; v0.88 added exact, separately opted-in WCL
 > display-30.02 route admission and Pipe-A modeset dispatch while its production
@@ -340,7 +341,10 @@ table with committed per-lane LT `TXY_CTL{8,2,3,4}` RMWs. It does not construct
 an operational display IP. The complete disconnected DP enable/disable machine
 adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
 rate-update calibration and DDI clock-value programming in Linux source order.
-It requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
+The disconnected CDCLK model pins all 31 `xe3p_lpd_cdclk_table` rungs from
+151.2 through 787.2 MHz, including the ratio-21 squash waveforms, the 19.2 MHz
+crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. It
+requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
 production route supplies those preconditions. A strict
 `narf.intel.nvl_display=1` read-only route decision requires exact Nova Lake-S,
 GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants

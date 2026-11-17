@@ -1257,6 +1257,63 @@ mod tests {
         smoke_nvl_display_route_is_exact_and_read_only
     );
 
+    fn smoke_nvl_display35_cdclk_table_and_hooks() -> TestResult {
+        use crate::intel_gpu_xelpg_cdclk as cdclk;
+
+        let table = &cdclk::NOVA_LAKE_TABLE;
+        assert_eq!(table.len(), 31);
+        for rung in table {
+            assert_eq!(
+                rung.ratio * 38_400 * rung.waveform.count_ones() / 32,
+                rung.cdclk_khz,
+                "{rung:?}"
+            );
+        }
+        assert_eq!(
+            table[..11]
+                .iter()
+                .map(|rung| (rung.cdclk_khz, rung.ratio, rung.waveform))
+                .collect::<Vec<_>>(),
+            [
+                (151_200, 21, 0xa4a4),
+                (176_400, 21, 0xaa54),
+                (201_600, 21, 0xaaaa),
+                (226_800, 21, 0xad5a),
+                (252_000, 21, 0xb6b6),
+                (277_200, 21, 0xdbb6),
+                (302_400, 21, 0xeeee),
+                (327_600, 21, 0xf7de),
+                (352_800, 21, 0xfefe),
+                (378_000, 21, 0xfffe),
+                (403_200, 21, 0xffff),
+            ]
+        );
+        assert!(table[11..].windows(2).all(|rungs| {
+            rungs[1].cdclk_khz - rungs[0].cdclk_khz == 19_200
+                && rungs[1].ratio == rungs[0].ratio + 1
+                && rungs[0].waveform == 0xffff
+        }));
+        assert_eq!(
+            table
+                .last()
+                .map(|rung| (rung.cdclk_khz, rung.ratio, rung.waveform)),
+            Some((787_200, 41, 0xffff))
+        );
+        assert_eq!(cdclk::NOVA_LAKE_MAX_CDCLK_KHZ, 787_200);
+        assert_eq!(
+            cdclk::calc_nova_lake_cdclk(403_201).map(|rung| rung.cdclk_khz),
+            Some(422_400)
+        );
+        assert_eq!(cdclk::calc_nova_lake_cdclk(787_201), None);
+        assert_eq!(cdclk::nova_lake_ctl_value(), 1 << 25);
+        assert_eq!(cdclk::nova_lake_voltage_level(787_200), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_display35_cdclk_table_and_hooks
+    );
+
     impl FakeLtMmio {
         fn ctl_lane(off: u64) -> Option<(LtPort, u8)> {
             for (port, base) in [

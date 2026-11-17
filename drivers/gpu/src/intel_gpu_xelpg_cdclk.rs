@@ -35,6 +35,12 @@
 //! functions but `intel_update_max_cdclk` caps admission at 480 MHz;
 //! Wa_13012396614 remains specific to display 30.00.
 //!
+//! Display 35.00 (Nova Lake-S / Xe3P_LPD) is kept outside operational
+//! [`DisplayIp`] dispatch, but its exact `xe3p_lpd_cdclk_table` is modeled
+//! here for the disconnected route: ratio 21 squashed rungs from 151.2 to
+//! 403.2 MHz, then crawl rungs through 787.2 MHz. Linux selects the same
+//! `xe3lpd_cdclk_funcs`; modeling the table grants no modeset authority.
+//!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
 //! always `TGL_CDCLK_CD2X_PIPE_NONE` and both raising and lowering happen in
@@ -112,6 +118,186 @@ pub(crate) const TABLE: [Rung; 6] = [
         waveform: 0,
     },
 ];
+
+/// Linux `xe3p_lpd_cdclk_table` for Nova Lake-S display 35.00.
+pub(crate) const NOVA_LAKE_TABLE: [Rung; 31] = [
+    Rung {
+        cdclk_khz: 151_200,
+        ratio: 21,
+        waveform: 0xa4a4,
+    },
+    Rung {
+        cdclk_khz: 176_400,
+        ratio: 21,
+        waveform: 0xaa54,
+    },
+    Rung {
+        cdclk_khz: 201_600,
+        ratio: 21,
+        waveform: 0xaaaa,
+    },
+    Rung {
+        cdclk_khz: 226_800,
+        ratio: 21,
+        waveform: 0xad5a,
+    },
+    Rung {
+        cdclk_khz: 252_000,
+        ratio: 21,
+        waveform: 0xb6b6,
+    },
+    Rung {
+        cdclk_khz: 277_200,
+        ratio: 21,
+        waveform: 0xdbb6,
+    },
+    Rung {
+        cdclk_khz: 302_400,
+        ratio: 21,
+        waveform: 0xeeee,
+    },
+    Rung {
+        cdclk_khz: 327_600,
+        ratio: 21,
+        waveform: 0xf7de,
+    },
+    Rung {
+        cdclk_khz: 352_800,
+        ratio: 21,
+        waveform: 0xfefe,
+    },
+    Rung {
+        cdclk_khz: 378_000,
+        ratio: 21,
+        waveform: 0xfffe,
+    },
+    Rung {
+        cdclk_khz: 403_200,
+        ratio: 21,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 422_400,
+        ratio: 22,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 441_600,
+        ratio: 23,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 460_800,
+        ratio: 24,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 480_000,
+        ratio: 25,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 499_200,
+        ratio: 26,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 518_400,
+        ratio: 27,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 537_600,
+        ratio: 28,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 556_800,
+        ratio: 29,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 576_000,
+        ratio: 30,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 595_200,
+        ratio: 31,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 614_400,
+        ratio: 32,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 633_600,
+        ratio: 33,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 652_800,
+        ratio: 34,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 672_000,
+        ratio: 35,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 691_200,
+        ratio: 36,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 710_400,
+        ratio: 37,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 729_600,
+        ratio: 38,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 748_800,
+        ratio: 39,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 768_000,
+        ratio: 40,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 787_200,
+        ratio: 41,
+        waveform: 0xffff,
+    },
+];
+
+pub(crate) const NOVA_LAKE_MAX_CDCLK_KHZ: u32 = 787_200;
+
+/// `bxt_calc_cdclk` over the disconnected display-35 table.
+pub(crate) fn calc_nova_lake_cdclk(min_khz: u32) -> Option<Rung> {
+    NOVA_LAKE_TABLE
+        .iter()
+        .copied()
+        .find(|rung| rung.cdclk_khz >= min_khz)
+}
+
+/// `bxt_cdclk_ctl` on display 35: like display 30, no CD2X pipe field and
+/// MDCLK sourced from the CDCLK PLL.
+pub(crate) const fn nova_lake_ctl_value() -> u32 {
+    crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+}
+
+/// Display 35 selects `xe3lpd_cdclk_funcs`, whose voltage level is always 0.
+pub(crate) const fn nova_lake_voltage_level(_cdclk_khz: u32) -> u8 {
+    0
+}
 
 /// `bxt_calc_cdclk`: the first rung at or above `min_khz`. Linux WARNs and
 /// clamps past the table; the owned transaction refuses instead.

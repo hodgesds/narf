@@ -432,7 +432,10 @@ retrying LT P2P transmitter transaction with ACK/error validation and bounded
 settling, plus source DP 1.4/UHBR per-lane swing/cursor RMWs; only fake-MMIO
 fixtures call it. Its disconnected enable/disable state machine covers LT
 MacCLK/lane reset, P2/P0 transitions, PLL rate calibration and display-35 clock
-selection, but requires DC-off and Type-C/D2D/AUX ownership from a future
+selection. The disconnected CDCLK model pins the complete 31-rung
+`xe3p_lpd_cdclk_table` (151.2–787.2 MHz), its ratio-21 squash waveforms,
+19.2 MHz crawl ladder, MDCLK source and zero-voltage-level hook, but requires
+DC-off and Type-C/D2D/AUX ownership from a future
 caller. Its strict `narf.intel.nvl_display=1` route proof is read-only and
 requires exact `GtPlatform::NovaLakeS`, GMD 35.00, an unfused and firmware-lit
 Pipe A, and a non-Type-C eDP panel; it constructs no operational `DisplayIp`
