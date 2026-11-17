@@ -4709,3 +4709,128 @@ fn smoke_gsp2_wpr2_and_riscv_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_boot", smoke_gsp2_wpr2_and_riscv_decode);
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot step 3 — WPR meta + FB layout + radix3 (lane GSP-3)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_rm::{
+    align_down as gsp3_align_down, align_up as gsp3_align_up, fb_layout, radix3_fits,
+    radix3_lvl2_bytes, radix3_lvl2_entries, radix3_max_image_size, WprMeta, GSP_FW_WPR_META_MAGIC,
+    GSP_FW_WPR_META_REVISION, GSP_PAGE_SIZE, WPR_META_SIZE,
+};
+
+fn smoke_gsp3_align_helpers() -> TestResult {
+    if gsp3_align_down(0x1_2345, 0x1000) != 0x1_2000 {
+        return TestResult::Fail("align_down drifted");
+    }
+    if gsp3_align_up(0x1_2001, 0x1000) != 0x1_3000 {
+        return TestResult::Fail("align_up drifted");
+    }
+    if gsp3_align_up(0x1_2000, 0x1000) != 0x1_2000 {
+        return TestResult::Fail("align_up of an aligned value must be identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_align_helpers);
+
+fn smoke_gsp3_wpr_meta_packs_to_256() -> TestResult {
+    // A representative layout, then the packed descriptor.
+    let fb = fb_layout(
+        8 << 30,                  // 8 GiB VRAM
+        (8u64 << 30) - 0x10_0000, // bios/vga at top - 1 MiB
+        0x1_0000,                 // bootloader size
+        0x80_0000,                // elf size (8 MiB)
+        0x800_0000,               // wpr heap size (128 MiB)
+    );
+    let meta = WprMeta::from_layout(
+        &fb,
+        0xAABB_C000,
+        0x1234_0000,
+        0x1_0000,
+        0,
+        0x800,
+        0x1000,
+        0x5000_0000,
+        0x100,
+    );
+    let bytes = meta.to_bytes();
+    if bytes.len() != WPR_META_SIZE || WPR_META_SIZE != 256 {
+        return TestResult::Fail("GspFwWprMeta must be exactly 256 bytes");
+    }
+    let rd = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    if rd(0x00) != GSP_FW_WPR_META_MAGIC {
+        return TestResult::Fail("magic must be at offset 0x00");
+    }
+    if rd(0x08) != GSP_FW_WPR_META_REVISION {
+        return TestResult::Fail("revision must be at offset 0x08");
+    }
+    if rd(0x10) != 0xAABB_C000 {
+        return TestResult::Fail("sysmemAddrOfRadix3Elf must be at 0x10");
+    }
+    if rd(0x18) != fb.elf.size {
+        return TestResult::Fail("sizeOfRadix3Elf must be the ELF size at 0x18");
+    }
+    if rd(0x70) != fb.wpr2.addr {
+        return TestResult::Fail("gspFwWprStart must be the WPR2 base at 0x70");
+    }
+    // verified must be left zero (the booter writes the sentinel back).
+    if rd(0xF8) != 0 {
+        return TestResult::Fail("verified must be initialised to 0 at 0xF8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_wpr_meta_packs_to_256);
+
+fn smoke_gsp3_fb_layout_ordering() -> TestResult {
+    let fb_size = 8u64 << 30;
+    let bios = fb_size - 0x10_0000;
+    let fb = fb_layout(fb_size, bios, 0x1_0000, 0x80_0000, 0x800_0000);
+    // Top-down carve: heap < wpr2 < ... < frts < vga, all below fb_size.
+    if !(fb.heap.addr < fb.wpr2.addr
+        && fb.wpr2_heap.addr < fb.elf.addr
+        && fb.elf.addr < fb.boot.addr
+        && fb.boot.addr < fb.frts.addr
+        && fb.frts.end() <= fb.vga_workspace.addr
+        && fb.vga_workspace.end() == fb_size)
+    {
+        return TestResult::Fail("regions must stack top-down without overlap");
+    }
+    // Alignment invariants from tu102_gsp_oneinit.
+    if fb.boot.addr % 0x1000 != 0
+        || fb.elf.addr % 0x1_0000 != 0
+        || fb.wpr2_heap.addr % 0x10_0000 != 0
+        || fb.wpr2.addr % 0x10_0000 != 0
+    {
+        return TestResult::Fail("region alignments drifted from the reference");
+    }
+    // frts is a fixed 1 MiB; WPR2 spans its base up to frts.end().
+    if fb.frts.size != 0x10_0000 || fb.wpr2.end() != fb.frts.end() {
+        return TestResult::Fail("WPR2 must span up to the end of FRTS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_fb_layout_ordering);
+
+fn smoke_gsp3_radix3_sizing() -> TestResult {
+    // Entry count = ceil(size / page).
+    if radix3_lvl2_entries(GSP_PAGE_SIZE) != 1
+        || radix3_lvl2_entries(GSP_PAGE_SIZE + 1) != 2
+        || radix3_lvl2_entries(0) != 0
+    {
+        return TestResult::Fail("lvl2 entry count must be ceil(size/page)");
+    }
+    // One page of image -> one 8-byte PTE -> padded to a full page.
+    if radix3_lvl2_bytes(GSP_PAGE_SIZE) != GSP_PAGE_SIZE {
+        return TestResult::Fail("lvl2 bytes must pad up to a page");
+    }
+    // Max image = 512 * 512 * page = 1 GiB; one more page does not fit.
+    if radix3_max_image_size() != 1 << 30 {
+        return TestResult::Fail("radix3 must address exactly 1 GiB");
+    }
+    if !radix3_fits(1 << 30) || radix3_fits((1 << 30) + GSP_PAGE_SIZE) {
+        return TestResult::Fail("radix3_fits must bound at 1 GiB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm", smoke_gsp3_radix3_sizing);

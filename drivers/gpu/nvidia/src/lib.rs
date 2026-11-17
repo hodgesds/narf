@@ -49,6 +49,7 @@ pub mod gr;
 pub mod gsp;
 pub mod gsp_boot;
 pub mod gsp_fw;
+pub mod gsp_rm;
 pub mod hdcp;
 pub mod hpd;
 pub mod irq;
