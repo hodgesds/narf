@@ -182,6 +182,36 @@ pub const fn radix3_fits(image_size: u64) -> bool {
     image_size <= radix3_max_image_size()
 }
 
+/// Fill the three radix3 levels in place, given the DMA page addresses.
+/// Each level is the `u64` view of its DMA-coherent page(s):
+///
+/// - `lvl0[0] = lvl1_pa` (single pointer to level 1),
+/// - `lvl1[i] = lvl2_page_pas[i]` (one pointer per level-2 page),
+/// - `lvl2[i] = image_page_pas[i]` (one pointer per firmware page).
+///
+/// Cite `rm/r535/gsp.c::nvkm_gsp_radix3_sg`. Returns `false` if the
+/// provided tables are too small for the page lists.
+pub fn build_radix3(
+    lvl0: &mut [u64],
+    lvl1: &mut [u64],
+    lvl2: &mut [u64],
+    lvl1_pa: u64,
+    lvl2_page_pas: &[u64],
+    image_page_pas: &[u64],
+) -> bool {
+    if lvl0.is_empty() || lvl1.len() < lvl2_page_pas.len() || lvl2.len() < image_page_pas.len() {
+        return false;
+    }
+    lvl0[0] = lvl1_pa;
+    for (dst, &pa) in lvl1.iter_mut().zip(lvl2_page_pas) {
+        *dst = pa;
+    }
+    for (dst, &pa) in lvl2.iter_mut().zip(image_page_pas) {
+        *dst = pa;
+    }
+    true
+}
+
 // ── GspFwWprMeta (256-byte wire struct) ──────────────────────────
 
 /// The fields of `GspFwWprMeta` the host fills for a fresh Turing

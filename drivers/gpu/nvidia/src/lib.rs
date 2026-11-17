@@ -47,6 +47,7 @@ pub mod fifo;
 pub mod flip;
 pub mod gr;
 pub mod gsp;
+pub mod gsp_args;
 pub mod gsp_boot;
 pub mod gsp_fw;
 pub mod gsp_payload;

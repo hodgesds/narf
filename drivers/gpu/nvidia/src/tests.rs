@@ -5010,3 +5010,115 @@ kernel_test_in!(
     "drivers/nvidia/gsp_payload",
     smoke_gsp_registry_string_and_dword_mix
 );
+
+// ────────────────────────────────────────────────────────────────
+// GSP boot args — rmargs, libos regions, radix3 fill
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_args::{
+    build_libos_args, build_rmargs, create_pte_array, libos_id8, shared_region_pte_count,
+    GSP_QUEUE_MSG_COUNT, GSP_QUEUE_SIZE, LIBOS_KIND_CONTIGUOUS, LIBOS_LOC_SYSMEM,
+};
+use crate::gsp_rm::{build_radix3, GSP_PAGE_SIZE as GSP3_PAGE_SIZE};
+
+fn smoke_gsp_rmargs_layout() -> TestResult {
+    // 63 message slots per 256 KiB queue; one empty header page.
+    if GSP_QUEUE_MSG_COUNT != 63 || GSP_QUEUE_SIZE != 0x40000 {
+        return TestResult::Fail("queue geometry drifted");
+    }
+    // 128 data pages + ceil(128*8/4096)=1 => 129? verify formula.
+    // data = (0x40000+0x40000)/0x1000 = 128; +ceil(128*8/4096)=+1 => 129.
+    if shared_region_pte_count() != 129 {
+        return TestResult::Fail("shared region PTE count must be 129");
+    }
+    let page = build_rmargs(0x1_0000_0000, 129, 0x1000, 0x41000);
+    if page.len() != 4096 {
+        return TestResult::Fail("rmargs must be one page");
+    }
+    let rd64 = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(page[o..o + 4].try_into().unwrap());
+    if rd64(0x00) != 0x1_0000_0000 || rd32(0x08) != 129 {
+        return TestResult::Fail("sharedMemPhysAddr/pageTableEntryCount offsets wrong");
+    }
+    // cmdQueueOffset/statQueueOffset after the 4-byte pad at 0x0C.
+    if rd64(0x10) != 0x1000 || rd64(0x18) != 0x41000 {
+        return TestResult::Fail("cmd/stat queue offsets must pack at 0x10/0x18");
+    }
+    // Fresh boot: sr args / gpuInstance / profiler all zero.
+    if rd64(0x30) != 0 || rd32(0x3C) != 0 {
+        return TestResult::Fail("fresh-boot sr/gpuInstance fields must be zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_rmargs_layout);
+
+fn smoke_gsp_libos_args_layout() -> TestResult {
+    // id8 packs chars big-endian: "RMARGS" = 0x524d41524753.
+    if libos_id8("RMARGS") != 0x0000_524D_4152_4753 {
+        return TestResult::Fail("libos_id8 must pack chars big-endian");
+    }
+    let page = build_libos_args(0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000);
+    let rd64 = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
+    // Entry 0 = LOGINIT @ 0: id8, pa, size=0x10000, kind, loc.
+    if rd64(0) != libos_id8("LOGINIT") || rd64(8) != 0x1000_0000 || rd64(16) != 0x10000 {
+        return TestResult::Fail("LOGINIT region mis-packed");
+    }
+    if page[24] != LIBOS_KIND_CONTIGUOUS || page[25] != LIBOS_LOC_SYSMEM {
+        return TestResult::Fail("region kind/loc must be CONTIGUOUS/SYSMEM");
+    }
+    // Entry 3 = RMARGS @ 96: pa, size=0x1000 (one page).
+    if rd64(96) != libos_id8("RMARGS") || rd64(96 + 8) != 0x4000_0000 || rd64(96 + 16) != 0x1000 {
+        return TestResult::Fail("RMARGS region mis-packed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_libos_args_layout);
+
+fn smoke_gsp_create_pte_array() -> TestResult {
+    let mut ptes = [0u64; 4];
+    // 3 pages worth of size -> 3 entries, each a page apart.
+    create_pte_array(&mut ptes, 0x5000_0000, 2 * GSP3_PAGE_SIZE + 1);
+    if ptes[0] != 0x5000_0000 || ptes[1] != 0x5000_1000 || ptes[2] != 0x5000_2000 {
+        return TestResult::Fail("PTE entries must be base + i*page");
+    }
+    if ptes[3] != 0 {
+        return TestResult::Fail("entries past the page count must stay zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_create_pte_array);
+
+fn smoke_gsp_radix3_build() -> TestResult {
+    // Image of 3 pages mapped across a 1-page lvl2.
+    let image = [0xA000u64, 0xB000, 0xC000];
+    let lvl2_pages = [0x2_0000u64]; // one lvl2 page
+    let mut lvl0 = [0u64; 1];
+    let mut lvl1 = [0u64; 512];
+    let mut lvl2 = [0u64; 512];
+    if !build_radix3(
+        &mut lvl0,
+        &mut lvl1,
+        &mut lvl2,
+        0x1_0000,
+        &lvl2_pages,
+        &image,
+    ) {
+        return TestResult::Fail("radix3 build must succeed when tables fit");
+    }
+    if lvl0[0] != 0x1_0000 {
+        return TestResult::Fail("lvl0[0] must point at the lvl1 page");
+    }
+    if lvl1[0] != 0x2_0000 {
+        return TestResult::Fail("lvl1[0] must point at the lvl2 page");
+    }
+    if lvl2[0] != 0xA000 || lvl2[1] != 0xB000 || lvl2[2] != 0xC000 {
+        return TestResult::Fail("lvl2 must point at each image page");
+    }
+    // Too-small tables are rejected.
+    let mut tiny = [0u64; 1];
+    if build_radix3(&mut lvl0, &mut tiny, &mut lvl2, 0x1_0000, &[1, 2], &image) {
+        return TestResult::Fail("undersized lvl1 must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_args", smoke_gsp_radix3_build);
