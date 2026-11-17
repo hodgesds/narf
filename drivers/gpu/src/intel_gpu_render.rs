@@ -1289,6 +1289,15 @@ impl RenderFile {
         let object = self.gem.object(u32_at(&request, 0))?;
         let offset = u64_at(&request, 8);
         let size = usize::try_from(u64_at(&request, 16)).map_err(|_| FsError::InvalidData)?;
+        let write = cmd == abi::GEM_PWRITE;
+        // Same ordering as the sync arm: the read-only refusal must
+        // come before range(), which rejects every userptr object, or
+        // a pwrite on a read-only userptr reports InvalidData instead
+        // of PermissionDenied. Zero-size writes still return Ok(())
+        // below, matching Linux's `if (args->size == 0) return 0;`.
+        if write && size != 0 && object.is_read_only() {
+            return Err(FsError::PermissionDenied);
+        }
         object.range(offset, size)?;
         if size == 0 {
             return Ok(());
@@ -1304,10 +1313,6 @@ impl RenderFile {
         pointer
             .checked_add(size as u64)
             .ok_or(FsError::BadAddress)?;
-        let write = cmd == abi::GEM_PWRITE;
-        if write && object.is_read_only() {
-            return Err(FsError::PermissionDenied);
-        }
         let mut done = 0;
         while done < size {
             let count = (size - done).min(16 * 1024);
@@ -1563,6 +1568,16 @@ impl RenderFile {
                 let offset = u64_at(&request, 8);
                 let size =
                     usize::try_from(u64_at(&request, 16)).map_err(|_| FsError::InvalidData)?;
+                let write = cmd == abi::GEM_PWRITE;
+                // The read-only refusal must come before range():
+                // range() rejects every userptr object, so a pwrite on
+                // a read-only userptr would otherwise report
+                // InvalidData instead of PermissionDenied. Zero-size
+                // writes still return Ok(()) below, matching Linux's
+                // `if (args->size == 0) return 0;` first.
+                if write && size != 0 && object.is_read_only() {
+                    return Err(FsError::PermissionDenied);
+                }
                 object.range(offset, size)?;
                 if size == 0 {
                     return Ok(());
@@ -1571,14 +1586,6 @@ impl RenderFile {
                 pointer
                     .checked_add(size as u64)
                     .ok_or(FsError::BadAddress)?;
-                // Mirror copy_ioctl: writes into a read-only object are
-                // refused. Linux i915_gem_pwrite_ioctl rejects them with
-                // -EINVAL; NARF uses PermissionDenied here, matching
-                // copy_ioctl and the render smokes.
-                let write = cmd == abi::GEM_PWRITE;
-                if write && object.is_read_only() {
-                    return Err(FsError::PermissionDenied);
-                }
                 let mut done = 0;
                 // Bound temporary copies while accepting uploads larger than
                 // one copy buffer. A later EFAULT may leave a written prefix,
