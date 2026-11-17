@@ -278,7 +278,7 @@ impl GmbusPinTable {
 pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
     match (family, ddi) {
         (_, Ddi::A) => Some(PinPair::Pin1Bxt),
-        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H) => None,
+        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H | Ddi::I) => None,
         (_, Ddi::B) => Some(PinPair::Pin2Bxt),
         (_, Ddi::C) => None,
         (_, Ddi::D) => Some(PinPair::Pin9Tc1),
@@ -287,6 +287,8 @@ pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
         (_, Ddi::G) => Some(PinPair::Pin12Tc4),
         (Gen12Platform::TigerLake, Ddi::H) => Some(PinPair::Pin13Tc5),
         (_, Ddi::H) => None,
+        (Gen12Platform::TigerLake, Ddi::I) => Some(PinPair::Pin14Tc6),
+        (_, Ddi::I) => None,
     }
 }
 
@@ -2034,8 +2036,9 @@ pub mod tests {
             Ddi::F,
             Ddi::G,
             Ddi::H,
+            Ddi::I,
         ];
-        let rows: [(Gen12Platform, [Option<u32>; 8]); 4] = [
+        let rows: [(Gen12Platform, [Option<u32>; 9]); 4] = [
             (
                 TigerLake,
                 [
@@ -2047,6 +2050,7 @@ pub mod tests {
                     Some(11),
                     Some(12),
                     Some(13),
+                    Some(14),
                 ],
             ),
             (
@@ -2059,6 +2063,7 @@ pub mod tests {
                     Some(10),
                     Some(11),
                     Some(12),
+                    None,
                     None,
                 ],
             ),
@@ -2073,6 +2078,7 @@ pub mod tests {
                     Some(11),
                     Some(12),
                     None,
+                    None,
                 ],
             ),
             (
@@ -2085,6 +2091,7 @@ pub mod tests {
                     Some(10),
                     Some(11),
                     Some(12),
+                    None,
                     None,
                 ],
             ),

@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.73** (v0.72 plus descriptor-qualified PF-only SR-IOV exclusion
+> Status: **v0.74** (v0.73 plus the source Tiger Lake TC6 / DDI-I USB-C DP
+> route; descriptor-qualified PF-only SR-IOV exclusion
 > on every GT/GGTT access for Tiger Lake, Alder/Raptor Lake, Panther/Wildcat
 > Lake and Battlemage as well as ATS-M; descriptor-qualified ATS-M
 > telemetry without retail Arc fan assumptions; source-qualified DG2 execution
@@ -7523,8 +7524,10 @@ SST or Display-14 image. A transient NotReady or AUX/EDID wake failure is
 retried by the active USB-PD task instead of being latched until the next
 cable attach.
 Alder Lake-S/N and unknown families remain refused on this path.
-The older bridge requires native TC connector numbering, exposes TC1..TC5
-(ADL-P admits only TC1..TC4), and does not translate arbitrary UCSI numbering.
+The older bridge requires native TC connector numbering. Its shared DDI type,
+DDC map, retained session slots and DP bridge now expose Tiger Lake TC1..TC6
+as `Ddi::D`..`Ddi::I`; ADL-P still admits only TC1..TC4 through its typed
+Dekel port count. It does not translate arbitrary UCSI numbering.
 Source CR/EQ patterns and voltage/pre-emphasis precede matching sink AUX
 writes. Fallback retunes the source with the buffer stopped; transcoder clock
 selection follows each platform's port/PHY mapping and clears at teardown.

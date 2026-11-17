@@ -693,6 +693,7 @@ mod tests {
             || DklPort::new(&adlp, Ddi::D).unwrap().pll_enable_register() != 0x46038
             || DklPort::new(&adlp, Ddi::G).unwrap().pll_enable_register() != 0x46050
             || DklPort::new(&adlp, Ddi::H).is_ok()
+            || DklPort::new(&tgl, Ddi::I).unwrap().pll_enable_register() != 0x46044
             || DklPort::new(&Model::new(Gen12Platform::AlderLakeS), Ddi::D).is_ok()
         {
             return TestResult::Fail("Dekel port/PLL qualification must be platform-specific");

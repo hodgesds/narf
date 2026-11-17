@@ -113,8 +113,9 @@ namespace. Detach withdraws that exact serial before freeing its backing;
 failed or uncertain stop retains both publication and backing, while a stale
 detach cannot blank a newer output. Alder Lake-S/N are not admitted through
 the Dekel Type-C path. This bridge requires native TC connector numbering and
-exposes TC1..TC5 (TC1..TC4 on ADL-P); arbitrary UCSI numbering needs board
-routing data. These transports have native models; Intel silicon and dock
+exposes Tiger Lake TC1..TC6 as `Ddi::D`..`Ddi::I` (TC1..TC4 on ADL-P);
+arbitrary UCSI numbering needs board routing data. These transports have
+native models; Intel silicon and dock
 interoperability remain separate acceptance work.
 
 ### Intel scanout takeover and restore
