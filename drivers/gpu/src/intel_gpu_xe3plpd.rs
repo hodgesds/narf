@@ -13,6 +13,12 @@
 use crate::intel_gpu_xelpg_wm::Tiling;
 
 const TRANSCONF_ENABLE: u32 = 1 << 31;
+/// `MTL_MEM_SS_INFO_GLOBAL`.
+pub(crate) const MEM_SS_INFO_GLOBAL: u64 = 0x45700;
+/// `XE3P_ECC_IMPACTING_DE`.
+pub(crate) const ECC_IMPACTING_DE: u32 = 1 << 12;
+/// Display 35 uses `xe3lpd_sa_info`, not Wildcat's 30.02 table.
+pub(crate) const DEPROGBWLIMIT_GBPS: i64 = crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS;
 
 /// The Display-35 transcoder decisions made by `intel_set_transcoder_timings`,
 /// `hsw_set_transconf` and `intel_pipe_is_interlaced`.
@@ -116,6 +122,63 @@ pub(crate) const fn check_plane(source: PlaneSource) -> Result<PlaneSampling, Pl
     Ok(PlaneSampling { hsub, vsub })
 }
 
+/// Integrated memory type decoded by `xelpdp_get_dram_info`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DramType {
+    Ddr4,
+    Ddr5,
+    Lpddr5,
+    Lpddr4,
+    Ddr3,
+    Lpddr3,
+}
+
+/// Display-35 facts from `MTL_MEM_SS_INFO_GLOBAL` that precede
+/// `tgl_get_bw_info(..., xe3lpd_sa_info)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BandwidthProfile {
+    pub(crate) dram_type: DramType,
+    pub(crate) populated_channels: u8,
+    pub(crate) enabled_qgv_points: u8,
+    pub(crate) deprogbwlimit_gbps: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BandwidthRefusal {
+    NoDevice,
+    UnknownDramType(u8),
+    /// Linux 7.0-rc7 warns because Bspec supplies no derating instructions.
+    /// A future NARF Display-35 transaction instead refuses to invent one.
+    EccImpactingDisplay,
+}
+
+/// Pure Display-35 decode/admission for `MTL_MEM_SS_INFO_GLOBAL`. Linux uses
+/// `xe3lpd_sa_info` after warning on ECC that impacts display bandwidth. NARF
+/// fails closed on that bit until a source-qualified derating rule exists.
+pub(crate) const fn bandwidth_profile(raw: u32) -> Result<BandwidthProfile, BandwidthRefusal> {
+    if raw == u32::MAX {
+        return Err(BandwidthRefusal::NoDevice);
+    }
+    let dram_type = match (raw & 0xf) as u8 {
+        0 => DramType::Ddr4,
+        1 => DramType::Ddr5,
+        2 => DramType::Lpddr5,
+        3 => DramType::Lpddr4,
+        4 => DramType::Ddr3,
+        5 => DramType::Lpddr3,
+        other => return Err(BandwidthRefusal::UnknownDramType(other)),
+    };
+    if raw & ECC_IMPACTING_DE != 0 {
+        return Err(BandwidthRefusal::EccImpactingDisplay);
+    }
+    Ok(BandwidthProfile {
+        dram_type,
+        populated_channels: ((raw >> 4) & 0xf) as u8,
+        enabled_qgv_points: ((raw >> 8) & 0xf) as u8,
+        deprogbwlimit_gbps: DEPROGBWLIMIT_GBPS,
+    })
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
@@ -199,5 +262,33 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_plane_reflection_and_subsampling
+    );
+
+    fn smoke_nvl_display35_bandwidth_ecc_is_fail_closed() -> TestResult {
+        assert_eq!((MEM_SS_INFO_GLOBAL, ECC_IMPACTING_DE), (0x45700, 1 << 12));
+        assert_eq!(DEPROGBWLIMIT_GBPS, 65);
+        assert_eq!(
+            bandwidth_profile((4 << 8) | (8 << 4) | 2),
+            Ok(BandwidthProfile {
+                dram_type: DramType::Lpddr5,
+                populated_channels: 8,
+                enabled_qgv_points: 4,
+                deprogbwlimit_gbps: 65,
+            })
+        );
+        assert_eq!(
+            bandwidth_profile(ECC_IMPACTING_DE | (4 << 8) | (8 << 4) | 2),
+            Err(BandwidthRefusal::EccImpactingDisplay)
+        );
+        assert_eq!(
+            bandwidth_profile(6),
+            Err(BandwidthRefusal::UnknownDramType(6))
+        );
+        assert_eq!(bandwidth_profile(u32::MAX), Err(BandwidthRefusal::NoDevice));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_bandwidth_ecc_is_fail_closed
     );
 }

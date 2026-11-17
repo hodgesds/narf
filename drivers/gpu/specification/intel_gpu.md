@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.98** (v0.98 isolates Nova Lake's Display-35 transcoder and
+> Status: **v0.99** (v0.99 adds fail-closed Nova Lake ECC/display-bandwidth
+> admission; v0.98 isolates Nova Lake's Display-35 transcoder and
 > plane/reflection/subsampling dialect; v0.97 adds Nova Lake's distinct ten-entry eDP
 > transmitter-level table; v0.96 transcribes Nova Lake LT-PHY's complete nine-rate
 > eDP PLL table without enabling its route; v0.95 models Nova Lake Display-35 FBC formats, its
@@ -385,6 +386,10 @@ interlace readback always false, linear/X reflection admitted with Tile4
 reflection refused, and semiplanar YUV aligned vertically by two (both axes
 when rotated). Its fixtures produce only typed plans/refusals; KMS does not
 call it.
+The same module decodes Display 35's `MTL_MEM_SS_INFO_GLOBAL` and retains the
+source 65 GB/s `xe3lpd_sa_info` ceiling. `XE3P_ECC_IMPACTING_DE` is a typed
+refusal because Linux 7.0-rc7 states that Bspec supplies no handling rule;
+there is no guessed derating and no live resource transaction.
 The DMC parser separately tags Panther (`xe3lpd_dmc.bin`), Wildcat
 (`xe3lpd_3002_dmc.bin`) and Nova (`xe3p_lpd_dmc.bin`) under their shared
 0x8000 ceiling. Panther/Wildcat KMS passes its retained exact identity and

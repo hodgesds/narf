@@ -467,6 +467,10 @@ separate from the Display-30 writer: it omits `TRANS_VSYNCSHIFT` and all
 horizontal reflection for linear/X surfaces but not Tile4, and requires 2x
 vertical alignment for semiplanar YUV (2x in both axes when rotated). These
 are pure admission/planning helpers and do not enable a modeset route.
+Its pure memory profile decodes `MTL_MEM_SS_INFO_GLOBAL` and selects the
+65 GB/s `xe3lpd_sa_info` programmed-bandwidth ceiling. If
+`XE3P_ECC_IMPACTING_DE` is set it refuses admission: Linux warns that Bspec
+does not yet define the required derating, so NARF does not invent one.
 `intel_gpu_dmc::DmcPlatform` keeps `Xe3Lpd`, `WildcatLake` and `Xe3pLpd`
 distinct despite their shared 0x8000 container ceiling. Display 30's DC
 service is admitted only from KMS's retained exact identity and selects
@@ -3898,6 +3902,8 @@ Display-20 owner or perform MMIO.
 `intel_gpu_xe3plpd::{transcoder_dialect,check_plane}` exposes the disconnected
 Display-35 transcoder and source-coordinate decisions described above; neither
 helper writes registers.
+`bandwidth_profile` is the corresponding pure DRAM/ECC admission and returns a
+typed refusal before any future resource transaction.
 
 `intel_gpu_psr` is display 14's PSR1 and PSR2 with selective fetch:
 `Sink::read`,
