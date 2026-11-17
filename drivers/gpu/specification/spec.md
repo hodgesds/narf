@@ -1890,7 +1890,7 @@ NARF exposes no ATS-M VF lifecycle. `pci_identity` requires SR-IOV VF Enable
 and NumVFs both zero. ATS-M's authorized window bootstraps only through the
 MMIO PF/VF capability read (without the integrated four-zero workaround), then
 requires current PCI identity/class, BAR0, command, D0, `VF_CAP`, VF Enable and
-NumVFs before every GT register access. `GgttArena::for_pf_gt` retains that
+NumVFs before every GT register access. `GgttArena::for_sriov_pf_gt` retains that
 same window for every PTE write. Any inherited or newly enabled VF therefore
 closes execution; the PF uses the isolated DG2 GT reset and never a function-
 level reset. Display programming remains absent.
@@ -1898,6 +1898,12 @@ level reset. Display programming remains absent.
 true for retail DG2 and BMG, false for ATS-M. ATS-M may use the DG2 cached
 temperature/voltage/energy and non-mailbox package-power monitor, but fan
 sampling returns before any fan MMIO and sysfs publishes no fan attributes.
+`GtPlatform::has_sriov()` separately records the Linux descriptor bit for
+Tiger Lake, Alder/Raptor Lake P/S/N, ATS-M, BMG, PTL and WCL. Because NARF
+implements no VF lifecycle, each of those PFs uses the same current
+identity/class/BAR/command/D0, MMIO PF-role, VF Enable and NumVFs proof for
+every GT register and GGTT PTE access. Integrated Xe2/Xe3 keeps its required
+four-zero bootstrap ordering; other capable PFs bootstrap only `VF_CAP`.
 An integrated Gen12 or MTL/Arrow function without an owned scanout may start
 its GuC owner only after Pipe A-D each read with both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear. An unavailable/all-ones register fails closed. This

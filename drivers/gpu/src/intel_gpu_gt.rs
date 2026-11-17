@@ -264,6 +264,22 @@ impl GtPlatform {
         matches!(self, Self::Alchemist | Self::Battlemage)
     }
 
+    /// Source `xe_device_desc.has_sriov`. NARF implements no VF lifecycle, so
+    /// these families retain a current PF-only proof for every GT/GGTT access.
+    pub const fn has_sriov(self) -> bool {
+        matches!(
+            self,
+            Self::Gen12(Gen12Platform::TigerLake)
+                | Self::Gen12(Gen12Platform::AlderLakeP)
+                | Self::Gen12(Gen12Platform::AlderLakeS)
+                | Self::Gen12(Gen12Platform::AlderLakeN)
+                | Self::Integrated(Generation::PantherLake)
+                | Self::WildcatLake
+                | Self::ArcticSoundM
+                | Self::Battlemage
+        )
+    }
+
     pub const fn is_gen12(self) -> bool {
         matches!(self, Self::Gen12(_))
     }
@@ -538,6 +554,26 @@ mod tests {
             || !GtPlatform::Alchemist.has_display()
         {
             return TestResult::Fail("ATS-M pre-GMD headless graphics identity");
+        }
+        for (platform, sriov) in [
+            (GtPlatform::Gen12(Gen12Platform::TigerLake), true),
+            (GtPlatform::Gen12(Gen12Platform::RocketLake), false),
+            (GtPlatform::Gen12(Gen12Platform::Dg1), false),
+            (GtPlatform::Gen12(Gen12Platform::AlderLakeP), true),
+            (GtPlatform::Gen12(Gen12Platform::AlderLakeS), true),
+            (GtPlatform::Gen12(Gen12Platform::AlderLakeN), true),
+            (GtPlatform::Integrated(Generation::MeteorLake), false),
+            (GtPlatform::Integrated(Generation::LunarLake), false),
+            (GtPlatform::Integrated(Generation::PantherLake), true),
+            (GtPlatform::WildcatLake, true),
+            (GtPlatform::NovaLakeS, false),
+            (GtPlatform::ArcticSoundM, true),
+            (GtPlatform::Alchemist, false),
+            (GtPlatform::Battlemage, true),
+        ] {
+            if platform.has_sriov() != sriov {
+                return TestResult::Fail("Linux xe descriptor SR-IOV capability");
+            }
         }
         for (platform, bits) in [
             (GtPlatform::Gen12(Gen12Platform::TigerLake), 39),

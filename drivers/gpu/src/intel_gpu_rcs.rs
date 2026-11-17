@@ -967,15 +967,15 @@ impl GgttArena {
         arena
     }
 
-    /// A display-less SR-IOV-capable PF with no enabled/inherited VFs. Every
-    /// PTE write retains the same per-access PCI identity/BAR/D0/VF proof as
-    /// the GT register window; no VF lifecycle is implemented here.
-    pub(crate) fn for_pf_gt(
+    /// An SR-IOV-capable PF with no enabled/inherited VFs. Every PTE write
+    /// retains the same per-access PCI identity/BAR/D0/VF proof as the GT
+    /// register window; no VF lifecycle is implemented here.
+    pub(crate) fn for_sriov_pf_gt(
         bar: narf_bus::bar::MmioRegion,
         mmio: crate::intel_gpu_gt_hw::AuthorizedWindow,
         platform: crate::intel_gpu_gt::GtPlatform,
     ) -> Result<Self, SubmitError> {
-        if platform != crate::intel_gpu_gt::GtPlatform::ArcticSoundM || !mmio.current() {
+        if !platform.has_sriov() || !mmio.current() {
             return Err(SubmitError::NoEngine);
         }
         let mut arena = Self::new(bar);

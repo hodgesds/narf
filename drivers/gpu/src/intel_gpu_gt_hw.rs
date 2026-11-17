@@ -28,8 +28,9 @@ impl AuthorizedWindow {
             headless: None,
         }
     }
-    /// Exact source-profile constructor. Integrated Xe2/Xe3 performs the Linux
-    /// bootstrap four-zero root writes before VF_CAP; ATS-M needs only VF_CAP.
+    /// Exact PF/profile constructor. Integrated Xe2/Xe3 performs the Linux
+    /// bootstrap four-zero root writes before VF_CAP; source SR-IOV families
+    /// need only VF_CAP when they do not use that workaround.
     /// Every raw access independently invokes current capability and validates
     /// current PCI identity/BAR/command/D0 and inherited-VF exclusion.
     pub(crate) fn for_device(
@@ -40,7 +41,7 @@ impl AuthorizedWindow {
         let Some(platform) = GtPlatform::from_pci(device.id.vendor, device.id.device) else {
             return Self::new(bar, cap);
         };
-        if !platform.is_headless_integrated() && platform != GtPlatform::ArcticSoundM {
+        if !platform.is_headless_integrated() && !platform.has_sriov() {
             return Self::new(bar, cap);
         }
         let this = Self {
@@ -333,7 +334,7 @@ impl HeadlessAccess {
             {
                 return false;
             }
-        } else if platform != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM) {
+        } else if !platform.is_some_and(crate::intel_gpu_gt::GtPlatform::has_sriov) {
             return false;
         }
         no_inherited_vfs(read)
@@ -1062,9 +1063,8 @@ mod read_order_tests {
             assert_eq!(ops.len(), if valid { 5 } else { 0 });
             assert_eq!(pf.load(Ordering::Acquire), valid);
         }
-        // ATS-M is protected by the same current PF/VF proof without the
-        // integrated four-zero read workaround. Bootstrap admits only VF_CAP,
-        // then each ordinary access is a single authorized operation.
+        // Source SR-IOV families without the integrated four-zero workaround
+        // bootstrap through VF_CAP only; each later access is one operation.
         let pf = AtomicBool::new(false);
         let mut ops = Vec::new();
         assert_eq!(

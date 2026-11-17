@@ -2044,9 +2044,9 @@ impl Owner {
             .map_err(|_| RuntimeError::State)?;
             state.lnl_flr = None; // completed receipt was consumed by this fresh arena
             SharedArena::new(arena)
-        } else if platform == GtPlatform::ArcticSoundM {
+        } else if platform.has_sriov() {
             SharedArena::new(
-                GgttArena::for_pf_gt(p.bar, mmio.clone(), platform)
+                GgttArena::for_sriov_pf_gt(p.bar, mmio.clone(), platform)
                     .map_err(|_| RuntimeError::State)?,
             )
         } else {

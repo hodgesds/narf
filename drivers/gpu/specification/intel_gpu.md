@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.72** (v0.71 plus PF-only Arctic Sound-M execution with current
-> SR-IOV exclusion on every GT/GGTT access; descriptor-qualified ATS-M
+> Status: **v0.73** (v0.72 plus descriptor-qualified PF-only SR-IOV exclusion
+> on every GT/GGTT access for Tiger Lake, Alder/Raptor Lake, Panther/Wildcat
+> Lake and Battlemage as well as ATS-M; descriptor-qualified ATS-M
 > telemetry without retail Arc fan assumptions; source-qualified DG2 execution
 > mechanics for Arctic Sound-M; an explicit display-less descriptor that
 > forbids display inventory and identity reads; a typed Arctic Sound-M
@@ -335,6 +336,17 @@ and omits it from `ats_m_desc`. `GtPlatform::has_fan_control()` preserves that
 descriptor fact; ATS-M publishes no fan attributes and its telemetry service
 performs no fan-counter reads. Battlemage and retail DG2 retain their existing
 fan services.
+
+SR-IOV capability is also kept as a source descriptor fact rather than inferred
+from architecture. `GtPlatform::has_sriov()` is true for Tiger Lake,
+Alder/Raptor Lake P/S/N, ATS-M, Battlemage, Panther Lake and Wildcat Lake, and
+false for Rocket Lake, DG1, Meteor/Arrow Lake, Lunar Lake, retail DG2 and Nova
+Lake-S. NARF implements no VF lifecycle on any of them. Every capable PF uses
+the same bounded extended-capability proof and MMIO `VF_CAP` role check for
+each GT register and GGTT PTE access; an enabled or externally created VF
+therefore revokes execution on all source-capable families, not only ATS-M.
+The integrated Xe2/Xe3 takeover keeps its separately required four-zero
+bootstrap ordering, while other capable PFs bootstrap only the `VF_CAP` read.
 
 PCI DMA width is independent of PTE address capacity. The exact Linux xe
 descriptor matrix is enforced at every qualified GGTT/PPGTT publication:
@@ -2217,7 +2229,9 @@ write-combining index). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
-validating D0, live PCI identity, PF registers and disabled SR-IOV VFs. An
+validating D0, live PCI identity, PF registers and disabled SR-IOV VFs. Source
+descriptors with `has_sriov` retain that PF-only proof in their GT window and
+GGTT arena, so every later register or PTE operation revalidates it. An
 integrated Gen12 or MTL/Arrow owner requires either an owned scanout or a
 probe-time proof that Pipe A-D all have both `PIPECONF_ENABLE` and
 `PIPECONF_STATE` clear; an unavailable register fails closed. The no-scanout
