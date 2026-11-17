@@ -449,6 +449,12 @@ Its disconnected MDCLK resource image uses
 `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE` bits 20:16. The lowest CDCLK rung has
 ratio 6, or 12 when joined, so the display-20 three-bit DBUF field is never
 reused. These pure images perform no MMIO and grant no programming authority.
+`intel_gpu_dmc::DmcPlatform` keeps `Xe3Lpd`, `WildcatLake` and `Xe3pLpd`
+distinct despite their shared 0x8000 container ceiling. Display 30's DC
+service is admitted only from KMS's retained exact identity and selects
+`xe3lpd_dmc.bin` or `xe3lpd_3002_dmc.bin`; both restore Pipe C/D DMC MMIO and
+use the display-20 flip-queue/interrupt brackets. The Nova Lake parser keeps
+the same Pipe C/D rule but has no production DC-service admission.
 Every other operational IP is a typed `IpError`: `Absent`,
 `Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
 `XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the

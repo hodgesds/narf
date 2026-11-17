@@ -1462,6 +1462,9 @@ fn install_platform(
     console: ActiveScanout,
 ) {
     let discrete = platform.discrete_display.is_some();
+    let dc_display30 = platform
+        .display30
+        .map(|display| (display.ip, display.flush));
     let display = Arc::new(Device::new(platform, generation, bar.len, console.clone()));
     let mut displays = DISPLAYS.lock();
     if displays
@@ -1473,9 +1476,9 @@ fn install_platform(
     displays.push(display.clone());
     drop(displays);
     if !discrete {
-        // Display-14 DC service: DC states exited and held off (Init) until
-        // the card worker loads the DMC program. Inert for every other IP.
-        crate::intel_gpu_dc_states::install(generation, bar, cap);
+        // Qualified display-14/20/30 DC service: DC states exited and held
+        // off (Init) until the card worker loads the exact DMC container.
+        crate::intel_gpu_dc_states::install(generation, dc_display30, bar, cap);
         // Wa_14015648006's input: the display-14+ watermark code's Pipe-A
         // wm_level_disabled for the watermarks proved programmed.
         if matches!(

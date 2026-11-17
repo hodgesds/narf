@@ -139,6 +139,17 @@
 //! that consumes a loaded display-14 program, and ties pipe DMC
 //! enables to pipe lifetimes, lives in `intel_gpu_dc_states`.
 //!
+//! ## Display 20, 30 and 35
+//!
+//! Their exact [`DmcPlatform`] variants share the display >= 13 register and
+//! program windows and the 0x8000 `XE2LPD_DMC_MAX_FW_SIZE` ceiling. All write
+//! `DMC_FQ_W2_PTS_CFG_SEL` after loading and bracket pipe enables with the
+//! display >= 20 flip-queue/interrupt sequence. Linux's
+//! `need_pipedmc_load_mmio` is kept exact: Lunar Lake restores no pipe table,
+//! while Panther Lake, Wildcat Lake and Nova Lake restore Pipe C/D tables.
+//! The DC service admits only exact, KMS-retained Panther/Wildcat identities;
+//! Nova Lake parsing remains disconnected from production admission.
+//!
 //! ## Composition
 //!
 //! Like the other Gen12 modules, this one owns no
@@ -246,9 +257,9 @@ pub const fn pipedmc_enable_mtl(pipe: u32) -> u32 {
 /// (`intel_dmc_update_dc6_allowed_count`).
 pub const DG1_DMC_DEBUG_DC5_COUNT: u64 = 0x134154;
 
-/// The display IP whose DMC rules a container is validated and
-/// loaded against. Gen12 keeps this module's original behaviour;
-/// Xe-LPDP is display 14 (Meteor Lake and Arrow Lake).
+/// The display IP whose DMC rules a container is validated and loaded
+/// against. The variants remain exact even where the container geometry is
+/// shared: their firmware names and Pipe C/D restore rules differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmcPlatform {
     /// Display 12 (TGL-class): TGL ranges and event fixups.
@@ -264,6 +275,38 @@ pub enum DmcPlatform {
     /// `DMC_FQ_W2_PTS_CFG_SEL` after every load and the pipe-DMC
     /// interrupt/flip-queue programming around each pipe enable/disable.
     Xe2Lpd,
+    /// Display 30.00 (Panther Lake, `xe3lpd_dmc.bin`): display-14 geometry,
+    /// the 0x8000 ceiling and display-20 pipe hooks, with Pipe C/D MMIO
+    /// restored before enable.
+    Xe3Lpd,
+    /// Display 30.02 (Wildcat Lake, `xe3lpd_3002_dmc.bin`): the same DMC
+    /// execution rules as display 30.00 but an exact, distinct container.
+    WildcatLake,
+    /// Display 35.00 (Nova Lake-S, `xe3p_lpd_dmc.bin`): the 0x8000 ceiling,
+    /// display-20 pipe hooks and Pipe C/D MMIO restore. No production DC
+    /// service selects this variant yet.
+    Xe3pLpd,
+}
+
+impl DmcPlatform {
+    const fn uses_xelpdp_layout(self) -> bool {
+        !matches!(self, Self::Gen12)
+    }
+
+    const fn has_display20_pipe_hooks(self) -> bool {
+        matches!(
+            self,
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake | Self::Xe3pLpd
+        )
+    }
+
+    const fn pipe_needs_mmio_restore(self, pipe: u32) -> bool {
+        pipe >= 2
+            && matches!(
+                self,
+                Self::Xelpdp | Self::Xe3Lpd | Self::WildcatLake | Self::Xe3pLpd
+            )
+    }
 }
 
 // ── DMC ids ─────────────────────────────────────────────────
@@ -364,7 +407,11 @@ impl DmcId {
     pub fn evt_reg_base_for(self, platform: DmcPlatform) -> Option<u32> {
         match platform {
             DmcPlatform::Gen12 => self.evt_reg_base(),
-            DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd => Some(match self {
+            DmcPlatform::Xelpdp
+            | DmcPlatform::Xe2Lpd
+            | DmcPlatform::Xe3Lpd
+            | DmcPlatform::WildcatLake
+            | DmcPlatform::Xe3pLpd => Some(match self {
                 DmcId::Main => 0x8F000,
                 pipe => ADLP_PIPEDMC_REG_MMIO_BASE_A + 0x400 * (pipe as u32 - 1),
             }),
@@ -711,8 +758,8 @@ fn parse_program<'a>(
                 .ok_or(DmcError::MmioOutOfRange { addr: mmioaddr[0] })?,
             // dmc_mmio_addr_sanity_check: main uses the TGL main
             // window, display >= 13 pipes the ADL-P pipe window.
-            DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd if id == DmcId::Main => TGL_MAIN_MMIO_RANGE,
-            DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd => ADLP_PIPE_MMIO_RANGE,
+            _ if id == DmcId::Main => TGL_MAIN_MMIO_RANGE,
+            _ => ADLP_PIPE_MMIO_RANGE,
         }
     };
     for &addr in mmioaddr.iter().take(mmio_count) {
@@ -742,10 +789,8 @@ fn parse_program<'a>(
         // Display 20 keeps the same windows: the shipped xe2lpd_dmc.bin
         // (v2.29) loads main at 0x80000..0x859c7 and pipes A–C at
         // 0x90000..0x93997, 0x98000..0x9bac7 and 0x52000..0x537e7.
-        DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd if id == DmcId::Main => {
-            Some(XELPDP_MAIN_PROGRAM_WINDOW)
-        }
-        DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd => Some(id.program_range()),
+        _ if id == DmcId::Main => Some(XELPDP_MAIN_PROGRAM_WINDOW),
+        _ => Some(id.program_range()),
     };
     if let Some((lo, hi)) = window {
         let end = start_mmioaddr as u64 + payload_bytes as u64 - 1;
@@ -839,6 +884,57 @@ pub fn parse_dmc_firmware_xe2lpd(
     )
 }
 
+/// Parse and validate a display-30.00 Panther Lake container —
+/// `i915/xe3lpd_dmc.bin` — with the common display >= 13 geometry and the
+/// 0x8000 `XE2LPD_DMC_MAX_FW_SIZE` ceiling.
+pub fn parse_dmc_firmware_xe3lpd(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(
+        blob,
+        DmcPlatform::Xe3Lpd,
+        stepping,
+        substepping,
+        crate::intel_gpu_xe2lpd::XE2LPD_DMC_MAX_FW_SIZE,
+    )
+}
+
+/// Parse and validate a display-30.02 Wildcat Lake container —
+/// `i915/xe3lpd_3002_dmc.bin` — without aliasing its firmware identity to
+/// Panther Lake.
+pub fn parse_dmc_firmware_wildcat_lake(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(
+        blob,
+        DmcPlatform::WildcatLake,
+        stepping,
+        substepping,
+        crate::intel_gpu_xe2lpd::XE2LPD_DMC_MAX_FW_SIZE,
+    )
+}
+
+/// Parse and validate a disconnected display-35.00 Nova Lake-S container —
+/// `i915/xe3p_lpd_dmc.bin` — with its exact platform identity and the common
+/// 0x8000 ceiling.
+pub fn parse_dmc_firmware_xe3p_lpd(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(
+        blob,
+        DmcPlatform::Xe3pLpd,
+        stepping,
+        substepping,
+        crate::intel_gpu_xe2lpd::XE2LPD_DMC_MAX_FW_SIZE,
+    )
+}
+
 fn parse_for(
     blob: &[u8],
     platform: DmcPlatform,
@@ -918,7 +1014,11 @@ fn parse_for(
         };
         let skipped = match platform {
             DmcPlatform::Gen12 => matches!(id, DmcId::PipeC | DmcId::PipeD),
-            DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd => false,
+            DmcPlatform::Xelpdp
+            | DmcPlatform::Xe2Lpd
+            | DmcPlatform::Xe3Lpd
+            | DmcPlatform::WildcatLake
+            | DmcPlatform::Xe3pLpd => false,
         };
         if skipped {
             skipped_mask |= 1 << id.index();
@@ -1021,7 +1121,11 @@ pub fn load_mmiodata(id: DmcId, addr: u32, data: u32) -> u32 {
 pub fn load_mmiodata_for(platform: DmcPlatform, id: DmcId, addr: u32, data: u32) -> u32 {
     match platform {
         DmcPlatform::Gen12 => load_mmiodata(id, addr, data),
-        DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd => {
+        DmcPlatform::Xelpdp
+        | DmcPlatform::Xe2Lpd
+        | DmcPlatform::Xe3Lpd
+        | DmcPlatform::WildcatLake
+        | DmcPlatform::Xe3pLpd => {
             if id != DmcId::Main && evt_ctl_handler_for(platform, id, addr).is_some() {
                 evt_ctl_disable(data)
             } else {
@@ -1064,7 +1168,7 @@ pub fn load_program<M: MmioWindow + ?Sized>(regs: &M, fw: &DmcFirmware<'_>) {
     }
     // intel_dmc_load_program, display >= 20: each pipe DMC's W2 PTS
     // configuration selects its own pipe.
-    if fw.platform == DmcPlatform::Xe2Lpd {
+    if fw.platform.has_display20_pipe_hooks() {
         regs.write32(
             crate::intel_gpu_xe2lpd::DMC_FQ_W2_PTS_CFG_SEL,
             crate::intel_gpu_xe2lpd::W2_PTS_CONFIG,
@@ -1193,9 +1297,10 @@ pub fn pipe_dmc_id(pipe: u32) -> Option<DmcId> {
         .filter(|id| *id != DmcId::Main)
 }
 
-/// `need_pipedmc_load_mmio` for display 13..14 (ADL/MTL): pipe A/B
-/// DMC state is saved and restored by the main DMC; pipe C/D state
-/// needs its MMIO table re-applied when the pipe is enabled.
+/// `need_pipedmc_load_mmio` for display 13..14 (ADL/MTL): pipe A/B DMC
+/// state is saved and restored by the main DMC; pipe C/D state needs its
+/// MMIO table re-applied when the pipe is enabled. Display 30/35 use the same
+/// predicate; display 20 is the explicit exception.
 pub fn xelpdp_pipe_needs_mmio(pipe: u32) -> bool {
     pipe >= 2
 }
@@ -1209,7 +1314,7 @@ pub fn enable_pipe<M: MmioWindow + ?Sized>(
     fw: &DmcFirmware<'_>,
     pipe: u32,
 ) -> Result<bool, PipeDmcError> {
-    if !matches!(fw.platform, DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd) {
+    if !fw.platform.uses_xelpdp_layout() {
         return Err(PipeDmcError::Unsupported);
     }
     let id = pipe_dmc_id(pipe).ok_or(PipeDmcError::Unsupported)?;
@@ -1220,8 +1325,9 @@ pub fn enable_pipe<M: MmioWindow + ?Sized>(
     if control == u32::MAX {
         return Err(PipeDmcError::Unavailable);
     }
-    // need_pipedmc_load_mmio: display 20 never restores pipe MMIO.
-    if fw.platform == DmcPlatform::Xelpdp && xelpdp_pipe_needs_mmio(pipe) {
+    // need_pipedmc_load_mmio: display 20 never restores pipe MMIO; display
+    // 30/35 restore Pipe C/D just like display 14.
+    if fw.platform.pipe_needs_mmio_restore(pipe) {
         for i in 0..prog.mmio_count {
             regs.write32(
                 prog.mmioaddr[i] as u64,
@@ -1230,7 +1336,7 @@ pub fn enable_pipe<M: MmioWindow + ?Sized>(
         }
     }
     verify_program(regs, fw, id).map_err(PipeDmcError::Verify)?;
-    if fw.platform == DmcPlatform::Xe2Lpd {
+    if fw.platform.has_display20_pipe_hooks() {
         crate::intel_gpu_xe2lpd::pipe_dmc_enable_prologue(regs, pipe);
     }
     regs.write32(MTL_PIPEDMC_CONTROL, control | pipedmc_enable_mtl(pipe));
@@ -1245,7 +1351,7 @@ pub fn disable_pipe<M: MmioWindow + ?Sized>(
     fw: &DmcFirmware<'_>,
     pipe: u32,
 ) -> Result<bool, PipeDmcError> {
-    if !matches!(fw.platform, DmcPlatform::Xelpdp | DmcPlatform::Xe2Lpd) {
+    if !fw.platform.uses_xelpdp_layout() {
         return Err(PipeDmcError::Unsupported);
     }
     let id = pipe_dmc_id(pipe).ok_or(PipeDmcError::Unsupported)?;
@@ -1257,7 +1363,7 @@ pub fn disable_pipe<M: MmioWindow + ?Sized>(
         return Err(PipeDmcError::Unavailable);
     }
     regs.write32(MTL_PIPEDMC_CONTROL, control & !pipedmc_enable_mtl(pipe));
-    if fw.platform == DmcPlatform::Xe2Lpd {
+    if fw.platform.has_display20_pipe_hooks() {
         crate::intel_gpu_xe2lpd::pipe_dmc_disable_epilogue(regs, pipe);
     }
     Ok(true)
@@ -2556,5 +2662,44 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe2lpd_dmc",
         smoke_xe2lpd_pipe_dmc_flip_queue_and_interrupts
+    );
+
+    fn smoke_xe3_dmc_platforms_keep_identity_and_restore_pipe_c() -> TestResult {
+        let blob = xe2lpd_blob(alloc::vec![0xAAAA_0001, 0xAAAA_0002]);
+        let firmwares = [
+            parse_dmc_firmware_xe3lpd(&blob, b'*', b'*').unwrap(),
+            parse_dmc_firmware_wildcat_lake(&blob, b'*', b'*').unwrap(),
+            parse_dmc_firmware_xe3p_lpd(&blob, b'*', b'*').unwrap(),
+        ];
+        for (fw, platform) in firmwares.iter().zip([
+            DmcPlatform::Xe3Lpd,
+            DmcPlatform::WildcatLake,
+            DmcPlatform::Xe3pLpd,
+        ]) {
+            assert_eq!(fw.platform, platform);
+            let fake = FakeDmc::new();
+            load_program(&fake, fw);
+            assert!(fake.writes().contains(&(0x8f240, 0x0302_0100)));
+            assert!(!fake
+                .writes()
+                .iter()
+                .any(|&(register, _)| register == GEN9_CLKGATE_DIS_0));
+
+            let before = fake.writes().len();
+            assert_eq!(enable_pipe(&fake, fw, 2), Ok(true));
+            assert_eq!(
+                &fake.writes()[before..before + 3],
+                &[(0x5f874, 0x53fc0), (0x5f834, 0x8003_0100), (0x5f804, 0x40),]
+            );
+            assert_eq!(
+                fake.regs.borrow().get(&MTL_PIPEDMC_CONTROL),
+                Some(&(1 << 8))
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3_dmc",
+        smoke_xe3_dmc_platforms_keep_identity_and_restore_pipe_c
     );
 }

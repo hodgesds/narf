@@ -1,7 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.93** (v0.93 models Display 35's widened MBUS/DBUF MDCLK-ratio
-> fields; v0.92 models its forced level-0 latency WA and linear-plane
+> Status: **v0.94** (v0.94 gives Panther, Wildcat and Nova Lake exact DMC
+> identities and enables the retained Panther/Wildcat DC service; v0.93 models
+> Display 35's widened MBUS/DBUF MDCLK-ratio fields; v0.92 models its forced level-0 latency WA and linear-plane
 > watermark method 2; v0.91 pins Nova Lake-S display 35's complete Xe3P_LPD
 > CDCLK ladder and hooks; v0.90 adds the exact, separately opted-in read-only Nova
 > Lake-S display-35 route proof; v0.89 carries WCL 30.02 through the production
@@ -359,6 +360,13 @@ Its disconnected MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
 and the five-bit DBUF minimum tracker at bits 20:16. The lowest clock's ratio
 is 6 and becomes 12 when MBUS is joined, which would be truncated by the
 display-20 field. The register images are pure and perform no MMIO.
+The DMC parser separately tags Panther (`xe3lpd_dmc.bin`), Wildcat
+(`xe3lpd_3002_dmc.bin`) and Nova (`xe3p_lpd_dmc.bin`) under their shared
+0x8000 ceiling. Panther/Wildcat KMS passes its retained exact identity and
+read-flush fact to the DC service, which restores Pipe C/D DMC MMIO and uses
+the display >= 20 flip-queue/interrupt brackets; a broad generation cannot
+select either container. Nova's parser has the same Pipe C/D rule but remains
+disconnected from the production DC service.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2

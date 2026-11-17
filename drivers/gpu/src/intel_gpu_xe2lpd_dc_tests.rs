@@ -74,32 +74,49 @@ fn container(payload_dwords: usize) -> Vec<u8> {
 
 fn smoke_xe2lpd_dc_service_profile_and_firmware() -> TestResult {
     use crate::intel_gpu::Generation;
-    // KMS-owned generations: display 14 and display 20 install a service;
-    // both target DC6 only; only display 20 flushes reads.
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+    // KMS-owned generations: display 14/20 and an exact display-30 identity
+    // install a service; all target DC6 only.
     assert_eq!(
-        service_profile(Generation::MeteorLake),
+        service_profile(Generation::MeteorLake, None),
         Some((DmcPlatform::Xelpdp, DC_STATE_EN_UPTO_DC6, false))
     );
     assert_eq!(
-        service_profile(Generation::LunarLake),
+        service_profile(Generation::LunarLake, None),
         Some((DmcPlatform::Xe2Lpd, DC_STATE_EN_UPTO_DC6, true))
     );
-    for other in [
-        Generation::TigerLake,
-        Generation::AlderLake,
-        Generation::PantherLake,
-    ] {
-        assert_eq!(service_profile(other), None);
-    }
+    assert_eq!(
+        service_profile(Generation::PantherLake, Some((DisplayIp::Xe3Lpd, true))),
+        Some((DmcPlatform::Xe3Lpd, DC_STATE_EN_UPTO_DC6, true))
+    );
+    assert_eq!(
+        service_profile(
+            Generation::PantherLake,
+            Some((DisplayIp::WildcatLake, false))
+        ),
+        Some((DmcPlatform::WildcatLake, DC_STATE_EN_UPTO_DC6, false))
+    );
+    assert_eq!(service_profile(Generation::PantherLake, None), None);
+    assert_eq!(service_profile(Generation::TigerLake, None), None);
+    assert_eq!(service_profile(Generation::AlderLake, None), None);
     assert_eq!(XE2LPD_ALLOWED_DC_MASK, 2);
     assert_eq!(XE2LPD_ALLOWED_DC_MASK & DC_STATE_EN_DC3CO, 0);
     assert_eq!(firmware_path(DmcPlatform::Xelpdp), "i915/mtl_dmc.bin");
     assert_eq!(firmware_path(DmcPlatform::Xe2Lpd), "i915/xe2lpd_dmc.bin");
+    assert_eq!(firmware_path(DmcPlatform::Xe3Lpd), "i915/xe3lpd_dmc.bin");
+    assert_eq!(
+        firmware_path(DmcPlatform::WildcatLake),
+        "i915/xe3lpd_3002_dmc.bin"
+    );
+    assert_eq!(firmware_path(DmcPlatform::Xe3pLpd), "i915/xe3p_lpd_dmc.bin");
     // The ceilings: 0x7800 payload bytes exceed display 14's 0x7000 and
     // fit display 20's 0x8000; 0x8004 fits neither.
     let big = container(0x7800 / 4);
     assert!(parse_for(DmcPlatform::Xelpdp, &big).is_err());
     assert!(parse_for(DmcPlatform::Xe2Lpd, &big).is_ok());
+    assert!(parse_for(DmcPlatform::Xe3Lpd, &big).is_ok());
+    assert!(parse_for(DmcPlatform::WildcatLake, &big).is_ok());
+    assert!(parse_for(DmcPlatform::Xe3pLpd, &big).is_ok());
     assert!(parse_for(DmcPlatform::Xe2Lpd, &container(0x8004 / 4)).is_err());
 
     // Wa_15015404425 on the service's view: four dummy writes to
