@@ -130,7 +130,7 @@ pub(crate) enum ResourceError {
     VblankTooShort,
     /// The DDB cannot hold level 0 of every plane.
     DdbExhausted,
-    /// Required CDCLK exceeds the 652.8 MHz maximum.
+    /// Required CDCLK exceeds the platform maximum.
     CdclkUnsatisfiable,
     /// SAGV is allowed but no QGV point carries the display data rate
     /// (`mtl_find_qgv_points` -EINVAL).
@@ -187,13 +187,6 @@ impl From<CdclkError> for ResourceError {
         Self::Clock(e)
     }
 }
-
-/// The cursor surface this driver can show (`intel_gpu_cursor`).
-const CURSOR: Surface = Surface {
-    width: 64,
-    cpp: 4,
-    tiling: Tiling::Linear,
-};
 
 fn timing(p: &PipeRequest, vblank_start: Option<u16>) -> wm::Timing {
     wm::Timing {
@@ -320,7 +313,7 @@ pub(crate) fn compute_ip_vblank(
                 latency,
             )?;
         }
-        let mut cursor_wm = wm::plane_ip(ip, t, CURSOR, latency)?;
+        let mut cursor_wm = wm::plane_ip(ip, t, wm::CURSOR, latency)?;
         {
             let mut all: Vec<&mut PlaneWm> = plane_wm.iter_mut().collect();
             all.push(&mut cursor_wm);
@@ -500,8 +493,17 @@ pub(crate) fn plane_wm_image_ip(
     plane: usize,
     w: &PlaneWm,
 ) -> Option<[(u64, u32); 9]> {
+    plane_wm_image_with_min_alloc(ip.is_display30(), pipe, plane, w)
+}
+
+fn plane_wm_image_with_min_alloc(
+    auto_min_alloc: bool,
+    pipe: usize,
+    plane: usize,
+    w: &PlaneWm,
+) -> Option<[(u64, u32); 9]> {
     let mut out = plane_wm_image(pipe, plane, w)?;
-    if ip.is_display30() {
+    if auto_min_alloc {
         if computed(&w.levels[0]) {
             out[0].1 |= PLANE_WM_AUTO_MIN_ALLOC_EN;
         }
@@ -684,16 +686,35 @@ impl State {
         pipe: usize,
         cursor_visible: bool,
     ) -> Option<Vec<(u64, u32)>> {
-        let mut regs = Vec::with_capacity((PLANES + 1) * 10);
-        let alloc = self.dbuf.pipes.get(pipe)?;
-        let active = self.dbuf.active_pipes & (1 << pipe) != 0;
+        self.dbuf
+            .pipe_wm_registers(pipe, cursor_visible, self.ip.is_display30())
+    }
+}
+
+impl Dbuf {
+    /// Final plane and cursor images. Display 30 and later encode the
+    /// automatic minimum allocation and its separate DDB register.
+    pub(crate) fn pipe_wm_registers(
+        &self,
+        pipe: usize,
+        cursor_visible: bool,
+        auto_min_alloc: bool,
+    ) -> Option<Vec<(u64, u32)>> {
+        let mut regs = Vec::with_capacity((PLANES + 1) * 10 + usize::from(auto_min_alloc) * PLANES);
+        let alloc = self.pipes.get(pipe)?;
+        let active = self.active_pipes & (1 << pipe) != 0;
         for (plane, (wm, ddb)) in alloc.wm.iter().zip(alloc.planes).enumerate() {
             let w = if active { *wm } else { PlaneWm::default() };
-            regs.extend(plane_wm_image_ip(self.ip, pipe, plane, &w)?);
+            regs.extend(plane_wm_image_with_min_alloc(
+                auto_min_alloc,
+                pipe,
+                plane,
+                &w,
+            )?);
             let ddb = if active { ddb.reg() } else { 0 };
             regs.push((plane_buf_cfg(pipe, plane), ddb));
             // skl_write_plane_wm, display >= 30.
-            if self.ip.is_display30() {
+            if auto_min_alloc {
                 regs.push((plane_min_buf_cfg(pipe, plane), min_ddb_value(&w)?));
             }
         }

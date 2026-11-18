@@ -577,8 +577,8 @@ mod tests {
             })
         );
         assert_eq!(panel.hpd, NovaHpd::A);
-        assert_eq!(panel.power_well_request_mask, (0x2 << 0) | (0x2 << 10));
-        assert_eq!(panel.power_well_state_mask, (0x1 << 0) | (0x1 << 10));
+        assert_eq!(panel.power_well_request_mask, 0x0802);
+        assert_eq!(panel.power_well_state_mask, 0x0401);
         assert!(!panel.pica_tc);
         assert_eq!(panel.typec_phy, None);
         assert!(panel.dc_off && panel.d2d);
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(combo.transcoder, Transcoder::B);
         assert_eq!(combo.aux, None);
         assert_eq!(combo.hpd, NovaHpd::B);
-        assert_eq!(combo.power_well_request_mask, (0x2 << 0) | (0x2 << 12));
+        assert_eq!(combo.power_well_request_mask, 0x2002);
         assert!(!combo.pica_tc);
         assert!(combo.gmbus_ddc && combo.dc_off);
     }
@@ -612,10 +612,7 @@ mod tests {
                 })
             );
             assert_eq!(plan.hpd, hpd);
-            assert_eq!(
-                plan.power_well_request_mask,
-                (0x2 << 0) | (0x2 << 2) | (0x2 << pipe_shift)
-            );
+            assert_eq!(plan.power_well_request_mask, 0x000a | (0x2 << pipe_shift));
         }
     }
 
@@ -642,10 +639,7 @@ mod tests {
     #[test]
     fn combo_pipe_c_inherits_pw2_from_the_xe3_hierarchy() {
         let plan = NovaResourcePlan::new(LtPort::B, Pipe::C, NovaOutput::DisplayPort).unwrap();
-        assert_eq!(
-            plan.power_well_request_mask,
-            (0x2 << 0) | (0x2 << 2) | (0x2 << 14)
-        );
+        assert_eq!(plan.power_well_request_mask, 0x800a);
     }
 }
 

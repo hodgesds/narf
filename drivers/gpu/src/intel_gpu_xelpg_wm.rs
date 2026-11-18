@@ -194,6 +194,19 @@ pub(crate) struct Surface {
     pub(crate) tiling: Tiling,
 }
 
+/// The 64x64 ARGB8888 cursor exposed by the Intel cursor owner.
+pub(crate) const CURSOR: Surface = Surface {
+    width: 64,
+    cpp: 4,
+    tiling: Tiling::Linear,
+};
+
+/// Linux budgets the maximum cursor width even for a smaller or hidden cursor.
+const CURSOR_RESERVATION: Surface = Surface {
+    width: CURSOR_ALLOC_WIDTH,
+    ..CURSOR
+};
+
 /// Pipe timing inputs (unscaled: plane pixel rate == pipe pixel rate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timing {
@@ -385,6 +398,11 @@ pub(crate) fn plane_display35(
     surface: Surface,
     latency: &Latency,
 ) -> Result<PlaneWm, WmError> {
+    let wp = params_display35(timing, surface)?;
+    plane_with(timing, &wp, latency, Rules::Display35 { panned: false })
+}
+
+fn params_display35(timing: Timing, surface: Surface) -> Result<Params, WmError> {
     if !matches!(surface.cpp, 1 | 2 | 4 | 8)
         || surface.width == 0
         || surface.width > 8192
@@ -395,9 +413,7 @@ pub(crate) fn plane_display35(
     {
         return Err(WmError::Unsupported);
     }
-    let rules = Rules::Display35 { panned: false };
-    let wp = params_rules(timing, surface, rules)?;
-    plane_with(timing, &wp, latency, rules)
+    params_rules(timing, surface, Rules::Display35 { panned: false })
 }
 
 /// `skl_compute_transition_wm` (display >= 11, IPC enabled). A disabled
@@ -534,14 +550,7 @@ pub(crate) fn cursor_allocation(
     latency: &Latency,
     num_active: u32,
 ) -> Result<u16, WmError> {
-    let wp = params(
-        timing,
-        Surface {
-            width: CURSOR_ALLOC_WIDTH,
-            cpp: 4,
-            tiling: Tiling::Linear,
-        },
-    )?;
+    let wp = params(timing, CURSOR_RESERVATION)?;
     cursor_allocation_with(timing, &wp, latency, num_active, Rules::Display14)
 }
 
@@ -552,15 +561,7 @@ pub(crate) fn cursor_allocation_ip(
     latency: &Latency,
     num_active: u32,
 ) -> Result<u16, WmError> {
-    let wp = params_ip(
-        ip,
-        timing,
-        Surface {
-            width: CURSOR_ALLOC_WIDTH,
-            cpp: 4,
-            tiling: Tiling::Linear,
-        },
-    )?;
+    let wp = params_ip(ip, timing, CURSOR_RESERVATION)?;
     cursor_allocation_with(timing, &wp, latency, num_active, Rules::for_ip(ip))
 }
 
@@ -584,6 +585,21 @@ fn cursor_allocation_with(
         min_ddb_alloc = wm.min_ddb_alloc;
     }
     Ok(min_ddb_alloc.max(if num_active == 1 { 32 } else { 8 }))
+}
+
+pub(crate) fn cursor_allocation_display35(
+    timing: Timing,
+    latency: &Latency,
+    num_active: u32,
+) -> Result<u16, WmError> {
+    let wp = params_display35(timing, CURSOR_RESERVATION)?;
+    cursor_allocation_with(
+        timing,
+        &wp,
+        latency,
+        num_active,
+        Rules::Display35 { panned: false },
+    )
 }
 
 /// `prefill_usecs_to_lines` (.16 lines).
@@ -635,11 +651,6 @@ impl Prefill {
         dsc: bool,
         scaler: bool,
     ) -> Result<Self, WmError> {
-        if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
-            return Err(WmError::Unsupported);
-        }
-        // prefill_init: framestart_delay 1 + 20 us of translation walks.
-        let fixed = (1u64 << 16) + usecs_to_lines(timing, 20);
         // prefill_lines_nocdclk: DSC (1.5 lines when compressing),
         // scaler (4.0 lines on display 14 when crtc scaler is enabled),
         // then the worst wm0 lines.
@@ -661,9 +672,23 @@ impl Prefill {
             ip,
             crate::intel_gpu_xelpg_cdclk::pixel_rate_to_cdclk(timing.pixel_rate_khz),
         )
-        .ok_or(WmError::Unsupported)?
-        .cdclk_khz;
-        let adj = ((u64::from(timing.pixel_rate_khz) << 16).div_ceil(2 * u64::from(cdclk))).min(FX);
+        .ok_or(WmError::Unsupported)?;
+        Self::with_clock(timing, wm0, cdclk)
+    }
+
+    fn with_clock(
+        timing: Timing,
+        wm0: u64,
+        cdclk: crate::intel_gpu_xelpg_cdclk::Rung,
+    ) -> Result<Self, WmError> {
+        if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
+            return Err(WmError::Unsupported);
+        }
+        // prefill_init: framestart_delay 1 + 20 us of translation walks.
+        let fixed = FX + usecs_to_lines(timing, 20);
+        let adj = ((u64::from(timing.pixel_rate_khz) << 16)
+            .div_ceil(2 * u64::from(cdclk.cdclk_khz)))
+        .min(FX);
         Ok(Self {
             timing,
             full: fixed + (wm0 * adj).div_ceil(FX),
@@ -772,6 +797,29 @@ pub(crate) fn check_vblank_dsc_scaler_ip(
 ) -> Result<bool, WmError> {
     let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
     let prefill = Prefill::new_ip_scaler(ip, timing, wm0, dsc, scaler)?;
+    limit_vblank(prefill, latency, planes)
+}
+
+/// Unscaled, uncompressed scanout using the Display-35 clock table and
+/// the VRR timing generator's adjusted vblank start.
+pub(crate) fn check_vblank_display35(
+    timing: Timing,
+    latency: &Latency,
+    planes: &mut [&mut PlaneWm],
+) -> Result<bool, WmError> {
+    use crate::intel_gpu_xelpg_cdclk::{calc_nova_lake_cdclk, pixel_rate_to_cdclk};
+    let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
+    let clock = calc_nova_lake_cdclk(pixel_rate_to_cdclk(timing.pixel_rate_khz))
+        .ok_or(WmError::Unsupported)?;
+    let prefill = Prefill::with_clock(timing, u64::from(wm0) << 16, clock)?;
+    limit_vblank(prefill, latency, planes)
+}
+
+fn limit_vblank(
+    prefill: Prefill,
+    latency: &Latency,
+    planes: &mut [&mut PlaneWm],
+) -> Result<bool, WmError> {
     let max_level = prefill.max_level(latency)?;
     for plane in planes.iter_mut() {
         for level in plane.levels.iter_mut().skip(max_level + 1) {

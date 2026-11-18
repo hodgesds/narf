@@ -517,6 +517,16 @@ Its disconnected MDCLK resource image uses
 `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE` bits 20:16. The lowest CDCLK rung has
 ratio 6, or 12 when joined, so the display-20 three-bit DBUF field is never
 reused. These pure images perform no MMIO and grant no programming authority.
+`intel_gpu_nvl_dbuf::NovaDbufPlan::compute` takes the complete set of
+unscaled XR24 primary scanouts, the runtime pipe mask, raw latency fields,
+SAGV block time and a CDCLK floor. Each scanout supplies its adjusted VRR
+guardband, linear or unpanned Tile4 layout, and cursor visibility. The plan
+admits a single-pipe primary up to 6144 pixels wide and 4320 lines high,
+following the Display 35 plane callbacks. It provides full-modeset MBUS/DBUF
+and active DBOX values plus the WM/DDB
+registers of every available pipe, including zero images for disabled
+planes. It rejects requests for fused pipes, an insufficient prefill interval,
+unrepresentable allocations, or an unsatisfiable clock floor.
 The disconnected Display-35 FBC model likewise keeps its 64-bit integer and
 ARGB/ABGR FP16 formats out of the live Display-20 owner, forms the FP16-only
 1.0 pixel-normalizer image for HDR planes 1--3, and forms the 2 MiB system-

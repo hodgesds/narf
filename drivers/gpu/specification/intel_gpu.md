@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.12** (v1.12 sequences Nova port preparation and retryable
+> Status: **v1.13** (v1.13 computes Nova Lake primary and cursor DBUF/DDB
+> images across the available pipes. v1.12 sequences Nova port preparation and retryable
 > teardown; v1.11 gives Nova's disconnected plan an ordered main-well
 > lease with partial-grant rollback and foreign-request preservation; v1.10 gives it an exact
 > Display-20-style D2D lease; v1.09 replaces the shared Type-C display20 boolean with
@@ -466,6 +467,17 @@ Its disconnected MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
 and the five-bit DBUF minimum tracker at bits 20:16. The lowest clock's ratio
 is 6 and becomes 12 when MBUS is joined, which would be truncated by the
 display-20 field. The register images are pure and perform no MMIO.
+
+`intel_gpu_nvl_dbuf::NovaDbufPlan` computes a complete set of primary and
+cursor allocations for unscaled XR24 scanout on the available Pipes A through
+D. Each pipe supplies its VRR guardband. The plan takes the maximum of the
+caller, pixel-rate and DBUF bandwidth clock floors and selects the first Nova
+CDCLK rung that meets it. A single Pipe A or B joins both MBUS banks. When
+pipes share a bank, the allocator splits it by active width and reserves the
+cursor at the end of each pipe's range. A hidden cursor retains its allocation.
+The plan produces the full-modeset MBUS, slice request/tracker, active DBOX,
+and plane/cursor watermark and DDB images. The live commit and PM-demand
+transaction are pending.
 Display 35's disconnected FBC helpers preserve the source format boundary:
 the Lunar five-format set, four 64-bit integer formats, and only ARGB/ABGR
 FP16. Only the FP16 pair receives `PLANE_PIXEL_NORMALIZE_ENABLE` with the 1.0
