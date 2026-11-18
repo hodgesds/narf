@@ -1429,7 +1429,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    if CRI_IDS.contains(&device.id.device) {
+    if source_known_unqualified(device.id.device) {
         log_probe(
             "recognized Crescent Island — GuC firmware profile absent; execution gated",
             &device,

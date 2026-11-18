@@ -2517,6 +2517,7 @@ impl Card {
     /// Every format any plane takes, primaries then overlays not already
     /// listed (drm_any_plane_has_format, for the amdgpu framebuffer
     /// checks).
+    #[cfg(feature = "amdgpu")]
     fn all_plane_formats(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self.plane_formats.unwrap_or(&[]).to_vec();
         for &format in self.overlay_formats.unwrap_or(&[]) {

@@ -298,11 +298,13 @@ pub(crate) fn calc_nova_lake_cdclk(min_khz: u32) -> Option<Rung> {
 
 /// `bxt_cdclk_ctl` on display 35: like display 30, no CD2X pipe field and
 /// MDCLK sourced from the CDCLK PLL.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) const fn nova_lake_ctl_value() -> u32 {
     crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
 }
 
 /// Display 35 selects `xe3lpd_cdclk_funcs`, whose voltage level is always 0.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) const fn nova_lake_voltage_level(_cdclk_khz: u32) -> u8 {
     0
 }
@@ -343,6 +345,7 @@ pub(crate) fn nova_lake_dbuf_ctl(old: u32, rung: Rung, joined: bool) -> u32 {
 
 /// `bxt_calc_cdclk`: the first rung at or above `min_khz`. Linux WARNs and
 /// clamps past the table; the owned transaction refuses instead.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn calc_cdclk(min_khz: u32) -> Option<Rung> {
     TABLE.iter().copied().find(|r| r.cdclk_khz >= min_khz)
 }
@@ -490,6 +493,7 @@ fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, CdclkError> {
 }
 
 impl Current {
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, CdclkError> {
         Self::read_ip(io, DisplayIp::Xelpdp)
     }

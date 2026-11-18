@@ -272,6 +272,7 @@ pub(crate) fn wait_idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> 
 }
 
 /// Current parameters after the previous transaction completed.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn current(io: &(impl MmioWindow + ?Sized)) -> Result<Params, FsError> {
     wait_idle(io)?;
     Ok(Params::decode(read(io, REQUEST0)?, read(io, REQUEST1)?))
@@ -294,6 +295,7 @@ pub(crate) fn current_for(
 /// pre-plane request uses `old = Some`, the post-plane one `None`. Returns
 /// whether a request was initiated. The resulting request is proved by
 /// readback, completion and the absence of a response timeout.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn program(
     io: &(impl MmioWindow + ?Sized),
     new: &Params,

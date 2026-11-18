@@ -16,7 +16,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::amdgpu_hdr::HdrOutputMetadata;
+use crate::drm::hdr::HdrOutputMetadata;
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
 

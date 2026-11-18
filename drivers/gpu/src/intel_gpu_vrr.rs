@@ -229,16 +229,14 @@ impl VrrRange {
 
     /// Parse VRR range from an EDID byte slice (monitor range descriptor or DisplayID).
     pub fn from_edid(edid: &[u8]) -> Option<Self> {
-        let r = crate::amdgpu_freesync::monitor_range(edid)
-            .filter(|r| r.min_vfreq != 0 && r.max_vfreq != 0)
-            .or_else(|| crate::amdgpu_freesync::displayid_range(edid))?;
+        let r = crate::dp_edid::adaptive_sync_range(edid)?;
         Self::new(r.min_vfreq, r.max_vfreq)
     }
 
     /// Parse VRR range from an EDID and optional DPCD block.
     pub fn from_edid_and_dpcd(edid: &[u8], dpcd: Option<&[u8; 16]>) -> Option<Self> {
         if let Some(dpcd) = dpcd {
-            if dpcd[7] & crate::amdgpu_freesync::DPCD_MSA_TIMING_PAR_IGNORED == 0 {
+            if !crate::dp_link_training::sink_ignores_msa_timing(dpcd) {
                 return None;
             }
         }

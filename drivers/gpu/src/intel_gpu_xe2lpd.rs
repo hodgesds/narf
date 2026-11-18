@@ -441,6 +441,7 @@ impl DisplayIp {
     }
 
     /// `probe_gmdid_display` restricted to the qualified IPs.
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) const fn decode(gmd: u32) -> Result<Self, IpError> {
         match DisplayIdentity::decode(gmd) {
             Ok(identity) => Self::from_identity(identity, false),

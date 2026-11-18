@@ -72,6 +72,13 @@ rest of that backend. Generic DRM/DP fixtures stay enabled with either or
 both vendors disabled. The registration census has its own test subsystem,
 `drivers/gpu/vendor_features`, for focused boot checks.
 
+Intel and AMD share the DRM HDR metadata decoder in `drm::hdr` and the
+monitor and DisplayID range readers in `dp_edid`. The DP receiver capability
+decoder supplies the MSA timing bit for both drivers. The AMD module paths
+re-export the existing public types, constants and range readers for callers
+that enable `amdgpu`. The AMD GEM handle path for GETFB/GETFB2 requires that
+feature.
+
 The DRM framebuffer hook distinguishes a kernel copy destination from a
 userspace-mappable fbdev backing. A rebased boot framebuffer can receive DRM
 copies through its kernel mapping only while its live physical range and

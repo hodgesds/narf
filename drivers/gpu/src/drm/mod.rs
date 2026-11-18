@@ -31,6 +31,7 @@ pub mod card;
 pub mod edid_gen;
 pub mod fb_cmd;
 pub mod gem;
+pub mod hdr;
 pub mod ioctl;
 pub mod prime;
 pub mod render_node;

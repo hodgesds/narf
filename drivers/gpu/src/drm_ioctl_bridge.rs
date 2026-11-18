@@ -2158,7 +2158,7 @@ fn note_drm_fd_resource_failure(cmd: u32, error: FsError) {
 
 /// Whether ioctl number `nr`'s first resource failure has been logged.
 /// Read by the x86_64 `drm_kwin_replay` tests only.
-#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[cfg(all(feature = "amdgpu", feature = "kernel-test", target_arch = "x86_64"))]
 pub(crate) fn drm_fd_failure_noted(nr: u32) -> bool {
     FD_FAILURE_SEEN[((nr & 0xff) / 64) as usize].load(core::sync::atomic::Ordering::Relaxed)
         & (1u64 << (nr % 64))
@@ -2196,6 +2196,7 @@ pub(crate) fn refused(reason: &'static str) -> FsError {
 }
 
 /// The source line [`invalid_at`] last recorded (0: none since the reset).
+#[cfg(any(feature = "amdgpu", feature = "kernel-test"))]
 pub(crate) fn last_invalid_line() -> u32 {
     LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -4832,6 +4833,7 @@ fn handle_getfb(
 /// namespace) a new handle in the caller's own table for the framebuffer's BO (drm_gem_handle_create, one
 /// handle shared by both planes of a two-plane format); 0 for anyone else,
 /// and for a framebuffer without an amdgpu BO. `None` for other requests.
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_getfb_bo(
     card_index: u32,
     open_id: u64,
@@ -7815,6 +7817,7 @@ pub(crate) fn crtc_size_after(
         .map(|m| (m.width, m.height))
 }
 
+#[cfg(feature = "amdgpu")]
 fn planes_admitted(hdmi: bool, search_admits_planes: bool, display: impl FnOnce() -> bool) -> bool {
     (hdmi && search_admits_planes) || display()
 }

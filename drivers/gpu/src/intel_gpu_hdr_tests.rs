@@ -5,7 +5,7 @@ use core::cell::{Cell, RefCell};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    amdgpu_hdr::{HdrMetadataInfoframe, HdrOutputMetadata},
+    drm::hdr::{HdrMetadataInfoframe, HdrOutputMetadata},
     intel_gpu_aux::MmioWindow,
     intel_gpu_hdr::{
         pack_drm_infoframe, program_drm_infoframe, update_avi_colorimetry, COLORSPACE_BT2020_RGB,

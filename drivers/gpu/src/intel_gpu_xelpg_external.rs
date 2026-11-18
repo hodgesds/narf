@@ -179,6 +179,7 @@ pub(crate) struct ExternalDisplayProfile {
 }
 
 impl ExternalDisplayProfile {
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) const WILDCAT_LAKE: Self = Self {
         display_ip: DisplayIp::WildcatLake,
         generation: Generation::PantherLake,
@@ -206,6 +207,7 @@ impl ExternalDisplayProfile {
         }
     }
 
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) const fn display_ip(self) -> DisplayIp {
         self.display_ip
     }

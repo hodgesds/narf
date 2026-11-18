@@ -213,6 +213,7 @@ pub(crate) fn max_bw_index(
 /// `mtl_find_qgv_points` with SAGV allowed: the QGV peak bandwidth in
 /// 100 MB/s units of the point with the least derated headroom that still
 /// carries `data_rate_mbps`; `None` when no point does.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn qgv_peak_bw(q: &Qgv, data_rate_mbps: u32, num_planes: u32) -> Option<u16> {
     qgv_peak_bw_ip(
         crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,

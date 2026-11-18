@@ -209,6 +209,7 @@ const fn prefill_ip(ip: DisplayIp) -> DisplayIp {
 }
 
 /// Compute and check the complete state. Pure: no register access.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, ResourceError> {
     compute_ip(DisplayIp::Xelpdp, request, latency)
 }
@@ -217,6 +218,7 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
 /// DDB, bandwidth and PM demand arithmetic (`DISPLAY_VER >= 14`
 /// branches, `mtl_sa_info`) and differs in its CDCLK table and in the
 /// MDCLK-ratio dependent DBUF/MBUS values ([`State::dbuf_ctl`]).
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn compute_ip(
     ip: DisplayIp,
     request: &Request,
@@ -1110,6 +1112,7 @@ pub(crate) fn commit(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(
 /// slice, `intel_dbuf_enabled_slices`; the actual CDCLK and its voltage
 /// level; no port clock or PHY; and the QGV point `mtl_find_qgv_points`
 /// picks for no plane when SAGV is controllable, nothing rejecting it).
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn all_off_pmdemand(latency: &Latency, cdclk: Rung) -> Params {
     all_off_pmdemand_ip(DisplayIp::Xelpdp, latency, cdclk)
 }

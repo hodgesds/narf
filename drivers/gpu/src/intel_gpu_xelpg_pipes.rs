@@ -303,6 +303,7 @@ impl Pipes {
     /// Adopt an already programmed state with the `lit` pipes on. `None`
     /// means nothing is programmed that a lit pipe depends on (every pipe
     /// off): the next reservation is the all-off commit.
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn adopt(state: Option<State>, lit: u8) -> Self {
         Self::adopt_ip(DisplayIp::Xelpdp, state, lit)
     }
@@ -324,6 +325,7 @@ impl Pipes {
     /// Adopt the state of the owned Pipe-A modeset for `mode`, proving it
     /// is what the hardware holds. The primary's tiling is the one Pipe A
     /// scans out (the KMS owner may have flipped to X or Tile4).
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn adopt_panel(
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,

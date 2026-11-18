@@ -30,6 +30,125 @@
 
 use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest};
 
+/// drm_display_info.monitor_range: the EDID's vertical rate limits in Hz.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorRange {
+    pub min_vfreq: u16,
+    pub max_vfreq: u16,
+}
+
+/// amdgpu_dm's DisplayID dynamic-video-timing-range fallback. Linux
+/// searches the first declared DisplayID extension; use only bounds that
+/// fit inside that actual block and accept revision0/1, length9 as it does.
+pub fn displayid_range(edid: &[u8]) -> Option<MonitorRange> {
+    let base = edid.get(..128)?;
+    let ext = edid
+        .chunks_exact(128)
+        .skip(1)
+        .take(usize::from(base[126]))
+        .find(|b| b[0] == 0x70)?;
+    for j in 0..115 {
+        if ext[j] == 0x25 && ext[j + 1] & 0xfe == 0 && ext[j + 2] == 9 {
+            let min = u16::from(ext[j + 9]);
+            let max = u16::from(ext[j + 10])
+                | if ext[j + 1] & 7 != 0 {
+                    u16::from(ext[j + 11] & 3) << 8
+                } else {
+                    0
+                };
+            if min != 0 && max != 0 {
+                return Some(MonitorRange {
+                    min_vfreq: min,
+                    max_vfreq: max,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The display descriptor tag of a Monitor Range Limits descriptor.
+const RANGE_DESCRIPTOR: u8 = 0xfd;
+/// DRM_EDID_RANGE_LIMITS_ONLY_FLAG: the only variant promising every timing
+/// inside the range, so the only one usable for VRR.
+const RANGE_LIMITS_ONLY: u8 = 0x01;
+/// DRM_EDID_RANGE_OFFSET_{MIN,MAX}_VFREQ (EDID 1.4): add 255 Hz.
+const OFFSET_MIN_VFREQ: u8 = 1 << 0;
+const OFFSET_MAX_VFREQ: u8 = 1 << 1;
+/// DRM_EDID_FEATURE_CONTINUOUS_FREQ.
+const CONTINUOUS_FREQ: u8 = 1 << 0;
+
+/// drm_get_monitor_range over a whole EDID (base block then extensions):
+/// EDID 1.4 with continuous frequency, every 18-byte detailed block (the base
+/// block's four, a CTA-861 extension's DTD area, a VTB extension's), the
+/// last matching "range limits only" descriptor winning, with the 1.4 +255
+/// offsets. None when no descriptor qualifies (Linux's 0..0).
+pub fn monitor_range(edid: &[u8]) -> Option<MonitorRange> {
+    let base = edid.get(..128)?;
+    let revision = base[0x13];
+    if revision < 4 || base[0x18] & CONTINUOUS_FREQ == 0 {
+        return None;
+    }
+    let mut range = None;
+    let mut visit = |d: &[u8]| {
+        // is_display_descriptor: pixel clock 0, pad1 0, the tag.
+        if d.len() < 18 || d[0] != 0 || d[1] != 0 || d[2] != 0 || d[3] != RANGE_DESCRIPTOR {
+            return;
+        }
+        if d[10] != RANGE_LIMITS_ONLY {
+            return;
+        }
+        let mut r = MonitorRange {
+            min_vfreq: u16::from(d[5]),
+            max_vfreq: u16::from(d[6]),
+        };
+        // revision >= 4 already holds.
+        if d[4] & OFFSET_MIN_VFREQ != 0 {
+            r.min_vfreq += 255;
+        }
+        if d[4] & OFFSET_MAX_VFREQ != 0 {
+            r.max_vfreq += 255;
+        }
+        range = Some(r);
+    };
+    for i in 0..4 {
+        let at = 54 + 18 * i;
+        visit(&base[at..at + 18]);
+    }
+    // drm_edid_block_count: the declared extensions, limited by the size.
+    let blocks = (usize::from(base[0x7e]) + 1).min(edid.len() / 128);
+    for ext in edid.chunks_exact(128).take(blocks).skip(1) {
+        match ext[0] {
+            // cea_for_each_detailed_block
+            0x02 => {
+                let d = usize::from(ext[2]);
+                if !(4..=127).contains(&d) {
+                    continue;
+                }
+                for i in 0..(127 - d) / 18 {
+                    visit(&ext[d + 18 * i..d + 18 * i + 18]);
+                }
+            }
+            // vtb_for_each_detailed_block
+            0x10 if ext[1] == 1 => {
+                for i in 0..usize::from(ext[2]).min(6) {
+                    visit(&ext[5 + 18 * i..5 + 18 * i + 18]);
+                }
+            }
+            _ => {}
+        }
+    }
+    range
+}
+
+/// Monitor range limits take precedence over the DisplayID fallback.
+#[cfg(any(feature = "intel", feature = "amdgpu"))]
+pub(crate) fn adaptive_sync_range(edid: &[u8]) -> Option<MonitorRange> {
+    monitor_range(edid)
+        .filter(|r| r.min_vfreq != 0 && r.max_vfreq != 0)
+        .or_else(|| displayid_range(edid))
+}
+
 /// Standard DDC/CI EDID slave address — the 7-bit I²C address,
 /// as the AUX address field carries it (Linux `DDC_ADDR`).
 const EDID_I2C_ADDR: u32 = 0x50;
