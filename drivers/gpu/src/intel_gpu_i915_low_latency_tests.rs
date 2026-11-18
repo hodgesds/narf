@@ -898,15 +898,7 @@ fn smoke_i915_context_freq_hint_obeys_global_slpc_and_mixed_async_reservations()
         assert_eq!(code.busy(), 0x10001);
         assert_eq!(data.busy(), 0x10001);
         data_writer.signal(Ok(()));
-        let deadline = narf_time::monotonic_ns() + 10_000_000;
-        while mailbox.pending.lock().is_empty() {
-            assert!(call
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending());
-            assert!(narf_time::monotonic_ns() < deadline);
-            narf_scheduler::sleep_pumps::run();
-        }
+        mailbox.poll_until_queued(call.as_mut());
         assert!(
             code_writer.result().is_none(),
             "ASYNC silently waited on code writer"

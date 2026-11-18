@@ -558,20 +558,6 @@ impl IoctlContext for Fds {
         Ok(17)
     }
 }
-fn reach<F: Future>(mut call: core::pin::Pin<&mut F>, mailbox: &Mailbox) {
-    let deadline = narf_time::monotonic_ns() + 10_000_000;
-    while mailbox.pending.lock().is_empty() {
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-        assert!(
-            narf_time::monotonic_ns() < deadline,
-            "copied ASYNC dependency did not resume"
-        );
-        narf_scheduler::sleep_pumps::run();
-    }
-}
 fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> TestResult {
     let platform = GtPlatform::Battlemage;
     let (w, arena, mut gt, ack) = discover(platform, 10);
@@ -638,8 +624,7 @@ fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> 
             handles_to_close.extend([input, out]);
         }
         fds.wire.store(64, &wire);
-        let mut call =
-            core::pin::pin!(file.dispatch_card_user(card, abi::GEM_EXECBUFFER2_WR, 64, &fds));
+        let mut call = Box::pin(file.dispatch_card_user(card, abi::GEM_EXECBUFFER2_WR, 64, &fds));
         assert!(call
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -655,7 +640,7 @@ fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> 
         fds.wire.store(256, &[0; 112]);
         fds.wire.store(1024, &[0; 16]);
         dependency.signal(Ok(())); // foreign producer, independent of native job
-        reach(call.as_mut(), &mailbox);
+        mailbox.poll_until_queued(call.as_mut());
         let (_, fence) = mailbox.accept(&mut gt, 500 + kind * 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -683,8 +668,7 @@ fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> 
     let (_, base) = held(&mut gt, &w, &producer, &mut registered, 901);
     raw(&user.wire, handles, id, 3);
     {
-        let mut same =
-            core::pin::pin!(file.dispatch_card_user(card, abi::GEM_EXECBUFFER2_WR, 64, &user));
+        let mut same = Box::pin(file.dispatch_card_user(card, abi::GEM_EXECBUFFER2_WR, 64, &user));
         assert!(same
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -1049,7 +1033,7 @@ fn smoke_i915_object_async_raw_mixed_final_conflict_retries_without_partial_fenc
         .is_pending());
     assert!(mailbox.pending.lock().is_empty());
     foreign.signal(Ok(())); // independent foreign CPU/GPU reservation producer
-    reach(call.as_mut(), &mailbox);
+    mailbox.poll_until_queued(call.as_mut());
     let (same_context, fence) = mailbox.accept(&mut gt, 600);
     assert!(Arc::ptr_eq(&context, &same_context));
     assert_eq!(

@@ -533,18 +533,7 @@ fn smoke_i915_xe_shared_wb_reservations_syncobjs_and_private_vm_lifetimes() -> T
         assert!(core.fence().is_none());
         let mut registered = BTreeMap::new();
         finish(&mut gt, &w, &native, &mut registered, 501);
-        let deadline = narf_time::monotonic_ns() + 10_000_000;
-        while mailbox.pending.lock().is_empty() {
-            assert!(call
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending());
-            assert!(
-                narf_time::monotonic_ns() < deadline,
-                "reservation waiter did not resume"
-            );
-            narf_scheduler::sleep_pumps::run();
-        }
+        mailbox.poll_until_queued(call.as_mut());
         let accepted = mailbox.accept(&mut gt, 600);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
