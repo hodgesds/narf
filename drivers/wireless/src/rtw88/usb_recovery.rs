@@ -44,7 +44,7 @@ use super::{
     system_pm_worker::{self, Control, Phase},
     usb_driver::{self, Generation, Origin},
 };
-use crate::rtl8xxxu::firmware_transport::UsbControl;
+use crate::{future_heap, rtl8xxxu::firmware_transport::UsbControl};
 use alloc::{boxed::Box, sync::Arc};
 use narf_drivers_usb::device::USBDevice;
 use narf_power::device_pm::DevicePmError;
@@ -118,7 +118,8 @@ pub(super) async fn unpark(parked: Parked) -> Result<Generation, Error> {
     if !usb_driver::is_current(&parked.device, &parked.old) {
         return Err(Error::Removed);
     }
-    let (backend, factory) = usb_driver::power_up(&parked.device, &parked.origin).await?;
+    let (backend, factory) =
+        future_heap::build(|| usb_driver::power_up(&parked.device, &parked.origin)).await?;
     Generation::publish(
         &parked.device,
         Some(&parked.old),
@@ -205,11 +206,12 @@ impl system_pm_worker::Backend for Native {
         let lock = usb_driver::provisioning(self.slot_id).ok_or(DevicePmError::DriverError)?;
         let generation = {
             let _provision = lock.lock().await;
-            unpark(parked)
+            future_heap::build(|| unpark(parked))
                 .await
                 .map_err(|_| DevicePmError::DriverError)?
         };
-        match generation.provision_once().await {
+        let provisioned = future_heap::build(|| generation.provision_once()).await;
+        match provisioned {
             Ok(()) => Ok(()),
             // `system_pm_native::resume_cold`: a station that was not
             // operating before the park keeps retrying its missing
@@ -221,7 +223,7 @@ impl system_pm_worker::Backend for Native {
                 Ok(())
             }
             Err(_) => {
-                generation.abort().await;
+                future_heap::build(|| generation.abort()).await;
                 Err(DevicePmError::DriverError)
             }
         }

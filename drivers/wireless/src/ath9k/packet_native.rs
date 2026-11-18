@@ -202,15 +202,21 @@ pub(super) struct Native {
     active: AtomicBool,
     antenna: narf_lib::sync::IrqSafeSpinLock<Option<super::ar9003::antenna::Binding>>,
     manual: alloc::sync::Arc<super::ar9003::antenna::manual::Latch>,
-    ani: narf_lib::sync::IrqSafeSpinLock<Option<super::ar9003::ani::Owner>>,
+    // AR9003-only retained state must not enlarge every other chip's Native
+    // construction/copy frames. Boxes retain the same original owners.
+    ani: narf_lib::sync::IrqSafeSpinLock<Option<alloc::boxed::Box<super::ar9003::ani::Owner>>>,
     ani_expected: narf_lib::sync::IrqSafeSpinLock<Option<super::ar9003::ani::Settings>>,
-    ani_request: narf_lib::sync::OnceLock<super::ar9003::ani::Request>,
-    ar9003_plan: Option<super::ar9003::power::Plan>,
+    ani_request: narf_lib::sync::OnceLock<alloc::boxed::Box<super::ar9003::ani::Request>>,
+    ar9003_plan: Option<alloc::boxed::Box<super::ar9003::power::Plan>>,
     calibrated: Calibrated,
     channel_mask: u64,
     powers: Option<InstalledPower>,
     /// Exact mutable expectation for the two MCI calibrated power states.
-    mci_power: Option<narf_lib::sync::IrqSafeSpinLock<super::ar9003::btcoex::concurrent::Power>>,
+    mci_power: Option<
+        alloc::boxed::Box<
+            narf_lib::sync::IrqSafeSpinLock<super::ar9003::btcoex::concurrent::Power>,
+        >,
+    >,
     rf_silent: Option<(u8, bool)>,
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
     ht_facts: Option<super::ht::Facts>,
@@ -566,7 +572,8 @@ impl Native {
         let powers = super::ar9003::power::rate_words(&prepared.power.targets).to_vec();
         let mci_power =
             super::ar9003::btcoex::concurrent::Power::new(device.id.device, &grant, prepared.power)
-                .map(narf_lib::sync::IrqSafeSpinLock::new);
+                .map(narf_lib::sync::IrqSafeSpinLock::new)
+                .map(alloc::boxed::Box::new);
         let ps_ar9003 = super::ar9003::ps::Base::new(
             device.id.device,
             grant.clone(),
@@ -597,7 +604,7 @@ impl Native {
             None,
         );
         native.mci_power = mci_power;
-        native.ar9003_plan = Some(prepared.power);
+        native.ar9003_plan = Some(alloc::boxed::Box::new(prepared.power));
         *native.ps_ar9003.lock() = ps_ar9003;
         Ok(native)
     }

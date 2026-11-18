@@ -214,7 +214,7 @@ fn run<F: Future>(f: F) -> F::Output {
 }
 type Native = Prepared<Model, Block>;
 struct Harness {
-    owner: Native,
+    owner: Box<Native>,
     model: Model,
     base: Arc<envelope::Calibration>,
     firmware: crate::rtlwifi::firmware_transport::Identity,
@@ -226,13 +226,15 @@ struct Harness {
 }
 fn harness() -> Result<Harness, &'static str> {
     let model = Model::new();
-    let mut owner = Prepared::allocate_for(
-        crate::rtlwifi::prepare::Chip::Rtl8723be,
-        model.clone(),
-        4,
-        |n| model.allocate_packet(n),
-    )
-    .map_err(|_| "NBTH allocation")?;
+    let mut owner = Box::new(
+        Prepared::allocate_for(
+            crate::rtlwifi::prepare::Chip::Rtl8723be,
+            model.clone(),
+            4,
+            |n| model.allocate_packet(n),
+        )
+        .map_err(|_| "NBTH allocation")?,
+    );
     for (r, m) in super::super::super::TX_BASES.iter().zip(&owner.tx) {
         model.word(*r, m.address() as u32);
     }
@@ -704,7 +706,7 @@ kernel_test_in!(
 /// Source-only shared station cases reuse this same real RF/descriptor actor.
 /// The fixture's radio/peer metadata still bypasses over-air/physical proof.
 pub(crate) struct StationFixture {
-    pub(crate) owner: Native,
+    pub(crate) owner: Box<Native>,
     pub(crate) model: Model,
     pub(crate) base: Arc<envelope::Calibration>,
     pub(crate) firmware: crate::rtlwifi::firmware_transport::Identity,

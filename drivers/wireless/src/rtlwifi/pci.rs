@@ -479,7 +479,7 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
     let Some(owner) = detach(device.addr) else {
         return;
     };
-    narf_scheduler::spawn(async move {
+    narf_scheduler::spawn(crate::future_heap::build(|| async move {
         let reclaimed = finish_removal(owner, device.addr).await;
         narf_console::klog!(
             "rtlwifi: removed; DMA {}\n",
@@ -489,7 +489,7 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
                 "pinned, address quarantined"
             }
         );
-    });
+    }));
 }
 /// Take the bound owner for `address` out of the controller slot and
 /// quarantine the address until its removal proves DMA idle.
@@ -580,7 +580,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // holding it by value in this block blew the 8 KiB kernel
         // stack-frame budget (`rtlwifi::pci::probe` measured 20_984 bytes
         // on main). Behaviour is unchanged.
-        narf_scheduler::spawn(async move {
+        narf_scheduler::spawn(crate::future_heap::build(|| async move {
             if let Err(error) = Box::pin(drive_scheduled(
                 120,
                 || {
@@ -604,10 +604,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     error
                 );
             }
-        });
+        }));
     }
     if let Some(ae) = ae {
-        narf_scheduler::spawn(async move {
+        narf_scheduler::spawn(crate::future_heap::build(|| async move {
             let _ = Box::pin(drive_scheduled(
                 120,
                 || ae.can_retry(),
@@ -615,7 +615,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
             ))
             .await;
-        });
+        }));
     }
     Ok(())
 }
@@ -712,10 +712,12 @@ pub unsafe fn bring_up(
             }
         }
 
-        // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
-        // the helper. PCI function selects the dual-MAC 8192DE factory address.
-        let factory =
-            unsafe { efuse::read_factory(&registers, did, function) }.map_err(ProbeError::Efuse)?;
+        let factory = Box::new(
+            // SAFETY: BAR2 is mapped and exclusively owned, with EFUSE read
+            // clocks configured by the helper. The actual PCI function picks
+            // the dual-MAC factory address; boxing changes metadata storage.
+            unsafe { efuse::read_factory(&registers, did, function) }.map_err(ProbeError::Efuse)?,
+        );
 
         // RTL8192EE: the facts `configure_rtl8192ee` re-derives, checked
         // before the function is retained. A test chip, an unprovisioned
@@ -857,7 +859,7 @@ pub unsafe fn bring_up(
     let (factory, admissible) = factory;
     let retained = retained && admissible;
     let mac = factory.mac;
-    let factory = retained.then(|| Arc::new(factory));
+    let factory = retained.then(|| Arc::<efuse::Factory>::from(factory));
 
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();

@@ -990,8 +990,8 @@ impl Device {
                 )?;
                 owner.restrict_offer(&(self.environment.policy)()?);
                 let (source, binding) = (self.environment.power)(owner)?;
-                owner
-                    .station_join(
+                crate::future_heap::build(|| {
+                    owner.station_join(
                         request.bssid,
                         &request.ssid,
                         request.channel,
@@ -1003,7 +1003,8 @@ impl Device {
                         || (self.environment.policy)(),
                         || (self.environment.nonce)(),
                     )
-                    .await?;
+                })
+                .await?;
                 Ok(Outcome::Joined(request.bssid))
             }
             Operation::Maintain => {

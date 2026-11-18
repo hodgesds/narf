@@ -556,12 +556,15 @@ async fn terminalize(shell: &Device<startup::Startup>, lifecycle: &Lifecycle<sta
 }
 #[inline(never)]
 async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
+    // Keep each stage's retained control state on the heap. The original
+    // startup future still owns its source checks and cancellation guards;
+    // constructing the wrapper performs no hardware work.
     match io.phase() {
         // B has no C-only PCI_BER quirk. pcie::Pcie rejects that quirk for B.
-        Phase::Discovered => io.start(false).await?,
-        Phase::Running => io.prepare_mac().await?,
-        Phase::MacPrepared => io.prepare_receive().await?,
-        Phase::Receiving => io.prepare_radio_tables().await?,
+        Phase::Discovered => crate::future_heap::build(|| io.start(false)).await?,
+        Phase::Running => crate::future_heap::build(|| io.prepare_mac()).await?,
+        Phase::MacPrepared => crate::future_heap::build(|| io.prepare_receive()).await?,
+        Phase::Receiving => crate::future_heap::build(|| io.prepare_radio_tables()).await?,
         // RTL8852C: one owner for DM/RFK/channel at Linux's default unlinked
         // chandef (2.4GHz channel 1, 20MHz; core.c `rtw89_get_default_chandef`).
         Phase::RadioTablesLoaded
@@ -569,8 +572,10 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C) =>
         {
-            io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
+            })
+            .await?
         }
         // RTL8851B: its own `radio_51` owner at the same default chandef;
         // never B's basic/full calibration.
@@ -579,8 +584,10 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B) =>
         {
-            io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
+            })
+            .await?
         }
         // RTL8852A: its own `radio_a` owner at the same default chandef;
         // never B's basic/full calibration.
@@ -589,11 +596,15 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852A) =>
         {
-            io.prepare_radio_a(super::operating_channel::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_a(super::operating_channel::Profile::INITIAL)
+            })
+            .await?
         }
-        Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
-        Phase::BasicCalibrated => io.prepare_full_radio().await?,
+        Phase::RadioTablesLoaded => {
+            crate::future_heap::build(|| io.prepare_basic_calibration()).await?
+        }
+        Phase::BasicCalibrated => crate::future_heap::build(|| io.prepare_full_radio()).await?,
         Phase::RadioReady => return Ok(true),
         _ => return Err(startup::Error::Terminal),
     }

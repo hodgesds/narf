@@ -66,11 +66,14 @@ struct Runtime {
     prepared: Option<CheckedPrepared>,
     // Retain the actual selected/signature-verified source snapshots even
     // after failure; later qualification cannot substitute another image.
-    plans: Option<(download_plan::DownloadPlan, download_plan::DownloadPlan)>,
+    plans: Option<(
+        Box<download_plan::DownloadPlan>,
+        Box<download_plan::DownloadPlan>,
+    )>,
     factory: Option<efuse_be::checked::Snapshot>,
     chip_version: Option<super::mac_pre_init_8922a::HalChipVer>,
     radio_assets: Option<super::radio_assets::Assets>,
-    radio_tables: Option<super::radio_be::Tables>,
+    radio_tables: Option<Box<super::radio_be::Tables>>,
     firmware_events: Vec<super::completion_8922a::RoutedC2h>,
     rfk_features: Option<super::rfk::be_features::Features>,
     radio: Option<super::native_radio_be::Radio>,
@@ -353,25 +356,31 @@ impl Supervisor {
         let bb_image = image.bbmcu(cv, 0).map_err(Error::Firmware)?;
         let blacklist = super::secure::Blacklist::upstream(mac::ChipId::Rtl8922A);
         let fuses = prepared.secure_fuses();
-        let normal =
-            download_plan::DownloadPlan::new(image, fuses, blacklist).map_err(Error::Plan)?;
-        let bb =
-            download_plan::DownloadPlan::new(bb_image, fuses, blacklist).map_err(Error::Plan)?;
+        // Retain the separately selected plans directly in heap storage;
+        // later stages borrow the exact same immutable image snapshots.
+        let normal = Box::new(
+            download_plan::DownloadPlan::new(image, fuses, blacklist).map_err(Error::Plan)?,
+        );
+        let bb = Box::new(
+            download_plan::DownloadPlan::new(bb_image, fuses, blacklist).map_err(Error::Plan)?,
+        );
         // Pure preflight of the actual signed element region: no BB/RF effect
         // and no calibration qualification or emission authority is created.
         let assets = super::radio_assets::Assets::from_prepared_be(normal.firmware(), chip_version)
             .map_err(Error::Assets)?;
-        let tables = super::radio_be::Tables::from_assets(
-            &assets,
-            runtime
-                .factory
-                .as_ref()
-                .ok_or(Error::Identity)?
-                .factory
-                .rfe_type,
-            cv,
-        )
-        .map_err(Error::Radio)?;
+        let tables = Box::new(
+            super::radio_be::Tables::from_assets(
+                &assets,
+                runtime
+                    .factory
+                    .as_ref()
+                    .ok_or(Error::Identity)?
+                    .factory
+                    .rfe_type,
+                cv,
+            )
+            .map_err(Error::Radio)?,
+        );
         runtime.radio_assets = Some(assets);
         runtime.radio_tables = Some(tables);
         let features =

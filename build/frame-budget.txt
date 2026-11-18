@@ -5,8 +5,6 @@
 30840 narf_drivers_wireless::iwlwifi::bootstrap::schedule::{{closure}}
 30728 narf_drivers_wireless::iwlwifi::bootstrap::Owner::start::{{closure}}
 29832 narf_drivers_wireless::iwlwifi::device::dhcp_composition::Guard::build_native_wide
-29768 narf_drivers_wireless::ath11k::ahb_live::crash_monitor_task::{{closure}}
-29672 narf_drivers_wireless::rtl8xxxu::interface::interface_power::<impl narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E>>::request_admin::{{closure}}
 29096 narf_drivers_wireless::rtl8xxxu::receive_runtime::receive_retune::<impl narf_drivers_wireless::rtl8xxxu::receive_runtime::Receiver<C,B>>::restore_channel::{{closure}}
 28904 narf_drivers_gpu::amdgpu::claim_navi48
 28248 narf_drivers_wireless::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
@@ -64,7 +62,6 @@
 10248 narf_drivers_wireless::rtw89::pci_reset::<impl narf_drivers_wireless::rtw89::startup::Startup>::claim_reset
 10184 narf_drivers_wireless::ath9k::initialize_owner_inner::{{closure}}
 10184 narf_drivers_wireless::cyw43439::station::policy::<impl narf_drivers_wireless::cyw43439::station::Station<R>>::initialize_live::{{closure}}
-10168 narf_drivers_wireless::ath9k::reset_owner_geometry_inner::{{closure}}
 9896 narf_drivers_wireless::iwlwifi::mvm_device::Device::execute::{{closure}}
 9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin
 9160 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::search_config

@@ -352,12 +352,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8821ae(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8821ae(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192ee {
@@ -366,12 +365,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192ee(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192ee(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192ce {
@@ -380,12 +378,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192ce(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192ce(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8723be {
@@ -394,12 +391,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8723be(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8723be(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192de {
@@ -408,12 +404,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192de(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192de(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if matches!(
@@ -447,7 +442,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         if owner.station_phase() == station::Phase::Dormant && owner.phase() == Phase::MacConfigured
         {
-            if let Err(error) = owner.prepare_station_bus_power(&self.environment).await {
+            if let Err(error) =
+                crate::future_heap::build(|| owner.prepare_station_bus_power(&self.environment))
+                    .await
+            {
                 self.close();
                 return Err(error);
             }
@@ -467,7 +465,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             // Starting the original station can install its separately
             // qualified N21C20MHz base. Publish capabilities only after that
             // continuation succeeds, so old NAPC width/VHT bits cannot escape.
-            owner.start_station_service(&self.environment).await?;
+            crate::future_heap::build(|| owner.start_station_service(&self.environment)).await?;
             self.ae_ht20.store(owner.rtl8723ae_ht(), Ordering::Release);
             self.coex_channel.store(
                 if owner.station_full_coex() {

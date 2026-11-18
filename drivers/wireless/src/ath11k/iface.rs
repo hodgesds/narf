@@ -4097,16 +4097,17 @@ impl Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw> {
         if self.shared.is_dead() {
             return Err(super::runtime::EIO);
         }
-        let dev = self
-            .shared
-            .resume_after_system_suspend()
+        let dev = super::future_heap::build(|| self.shared.resume_after_system_suspend())
             .await
             .map_err(|e| e.errno)?;
         for iface in pci_radio_devices(self.shared.radio_id) {
-            iface
-                .rebuild_after_cold_resume(dev.caps.clone(), dev.reg_info.clone())
-                .await
-                .map_err(|e| e.errno)?;
+            // Each original netdev retains its own MAC reconstruction and
+            // guards in the heap future; PM's poll holds only the handle.
+            super::future_heap::build(|| {
+                iface.rebuild_after_cold_resume(dev.caps.clone(), dev.reg_info.clone())
+            })
+            .await
+            .map_err(|e| e.errno)?;
         }
         self.shared.reconfig_complete().await;
         Ok(())
@@ -4147,8 +4148,8 @@ impl Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw> {
         };
         match mode {
             SystemPmMode::Idle => Ok(()),
-            SystemPmMode::Wowlan => self.system_resume_wowlan().await,
-            SystemPmMode::Cold => self.system_resume_cold().await,
+            SystemPmMode::Wowlan => super::future_heap::build(|| self.system_resume_wowlan()).await,
+            SystemPmMode::Cold => super::future_heap::build(|| self.system_resume_cold()).await,
         }
     }
 }

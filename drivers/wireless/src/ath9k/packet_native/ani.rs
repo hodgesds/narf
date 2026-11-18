@@ -93,11 +93,11 @@ impl Native {
             grant.clone(),
             *permission,
             report,
-            self.ar9003_plan.as_ref().ok_or(Error::State)?,
+            self.ar9003_plan.as_deref().ok_or(Error::State)?,
             ini,
         )?;
         self.ani_request
-            .set(base.request())
+            .set(alloc::boxed::Box::new(base.request()))
             .map_err(|_| Error::State)?;
         let Some(source) = ani::Grant::optional(base)? else {
             return Ok(());
@@ -111,7 +111,7 @@ impl Native {
                 source.ini(),
             )?;
             *self.ani_expected.lock() = Some(owner.settings());
-            *self.ani.lock() = Some(owner);
+            *self.ani.lock() = Some(alloc::boxed::Box::new(owner));
             Ok(())
         });
         if result.is_err() {
@@ -120,7 +120,9 @@ impl Native {
         result
     }
     pub(in crate::ath9k) fn ar9003_ani_request(&self) -> Option<ani::Request> {
-        self.ani_request.get().cloned()
+        self.ani_request
+            .get()
+            .map(|request| request.as_ref().clone())
     }
     pub(super) fn ar9003_ani_service(&self, eligible: bool) -> Result<(), Error> {
         if !self.manual.ani_bound() {

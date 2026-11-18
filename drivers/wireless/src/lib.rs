@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+mod future_heap;
+
 pub mod ath10k;
 pub mod ath11k;
 pub mod ath9k;

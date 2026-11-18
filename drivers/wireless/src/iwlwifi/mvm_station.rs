@@ -1,6 +1,6 @@
 //! Composed legacy station lifecycle for the native API77 interface.
 use super::{Owner, Phase};
-use crate::firmware_asset::Asset;
+use crate::{firmware_asset::Asset, future_heap};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicBool;
 use narf_wireless::{
@@ -421,41 +421,55 @@ impl Owner {
         .host_ceiling(&policy()?)?;
         if self.hardware.p2p_client_native().is_some() {
             let epoch = self.hardware.close_receive_epoch()?;
-            self.hardware.prepare_p2p_client().await?;
+            future_heap::build(|| self.hardware.prepare_p2p_client()).await?;
             self.hardware.commit_receive_epoch(epoch)?;
         }
-        self.prepare_channel_in_domain(channel, &policy()?).await?;
-        self.prepare_peer_in_domain(bssid, &policy()?).await?;
-        self.prepare_management_queue().await?;
-        self.prepare_power_using(source, binding, &mut policy)
-            .await?;
+        // Each original child future retains its own source/receipt and
+        // cancellation rules. Keep those large state machines out of this
+        // orchestration poll rather than storing all variants inline.
+        {
+            let domain = policy()?;
+            future_heap::build(|| self.prepare_channel_in_domain(channel, &domain)).await?;
+        }
+        {
+            let domain = policy()?;
+            future_heap::build(|| self.prepare_peer_in_domain(bssid, &domain)).await?;
+        }
+        future_heap::build(|| self.prepare_management_queue()).await?;
+        future_heap::build(|| self.prepare_power_using(source, binding, &mut policy)).await?;
         self.power.prepared.as_mut().unwrap().stop = Some(stop);
-        self.activate_link_using(&mut policy).await?;
+        future_heap::build(|| self.activate_link_using(&mut policy)).await?;
         let authenticated = match &credential {
             Credential::Sae(password) => {
                 let ssid_owned = ssid.to_vec();
-                self.authenticate_sae_using(
-                    ssid,
-                    elements,
-                    narf_wireless::association::SaePwe::Both,
-                    |join, own, peer| {
-                        super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
-                    },
-                    &mut policy,
-                )
+                future_heap::build(|| {
+                    self.authenticate_sae_using(
+                        ssid,
+                        elements,
+                        narf_wireless::association::SaePwe::Both,
+                        |join, own, peer| {
+                            super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
+                        },
+                        &mut policy,
+                    )
+                })
                 .await?
             }
-            _ => self.authenticate_open_using(&mut policy).await?,
+            _ => future_heap::build(|| self.authenticate_open_using(&mut policy)).await?,
         };
         if authenticated.status != 0 {
             return Err("MVM AP refused authentication");
         }
-        self.associate_elements_using(ssid, mode, elements, &mut policy)
+        future_heap::build(|| self.associate_elements_using(ssid, mode, elements, &mut policy))
             .await?;
-        self.prepare_data_using(&mut policy).await?;
+        future_heap::build(|| self.prepare_data_using(&mut policy)).await?;
         match credential {
-            Credential::Psk(pmk) => self.secure_using(*pmk, &mut nonce, &mut policy).await?,
-            Credential::Sae(_) => self.secure_sae_using(&mut nonce, &mut policy).await?,
+            Credential::Psk(pmk) => {
+                future_heap::build(|| self.secure_using(*pmk, &mut nonce, &mut policy)).await?
+            }
+            Credential::Sae(_) => {
+                future_heap::build(|| self.secure_sae_using(&mut nonce, &mut policy)).await?
+            }
             Credential::Open => {}
         }
         if !self.data_port_using(&mut policy) {

@@ -51,7 +51,7 @@ fn smoke_be_native_thermal_enable_waits_old_lease_and_retains_joint_after_restor
     let model = h.model.clone();
     let cap = h.cap;
     let grant = h.grant.clone();
-    let storage = Arc::new(Mutex::new(Some(h.owner)));
+    let storage = Arc::new(Mutex::new(Some(*h.owner)));
     let admission = Arc::new(station::Admission::new());
     let device = Device::new(
         "be-thermal-inert",
@@ -132,7 +132,7 @@ fn smoke_be_native_lifecycle_wakes_bound_lps_before_original_bb_restore() -> Tes
     };
     let model = h.model.clone();
     let grant = h.grant.clone();
-    let storage = Arc::new(Mutex::new(Some(h.owner)));
+    let storage = Arc::new(Mutex::new(Some(*h.owner)));
     let admission = Arc::new(station::Admission::new());
     let device = Device::new(
         "be-thermal-lps-lifecycle",
@@ -183,7 +183,7 @@ fn smoke_be_native_lps_restore_cancellation_or_source_loss_stays_terminal() -> T
         let model = h.model.clone();
         let cap = h.cap;
         let grant = h.grant.clone();
-        let storage = Arc::new(Mutex::new(Some(h.owner)));
+        let storage = Arc::new(Mutex::new(Some(*h.owner)));
         let admission = Arc::new(station::Admission::new());
         let device = Device::new(
             "be-thermal-lps-loss",

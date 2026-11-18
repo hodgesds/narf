@@ -191,15 +191,15 @@ impl Retained<PciIo> {
     ) -> Result<(), Error> {
         let phase = self.state.lock().await.phase;
         if matches!(phase, Phase::Allocated | Phase::InputsReady) {
-            self.prepare_registered(op).await?;
+            crate::future_heap::build(|| self.prepare_registered(op)).await?;
         }
         let phase = self.state.lock().await.phase;
         if phase == Phase::Prepared {
-            self.prepare_station_transport().await?;
+            crate::future_heap::build(|| self.prepare_station_transport()).await?;
         }
         let phase = self.state.lock().await.phase;
         if phase == Phase::RingsReady {
-            self.activate_station().await?;
+            crate::future_heap::build(|| self.activate_station()).await?;
         }
         if self.state.lock().await.phase == Phase::MacReady && self.registered_for(self.firmware())
         {

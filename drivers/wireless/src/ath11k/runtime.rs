@@ -3304,22 +3304,26 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// `restart_work`, but it must not count toward the crash-reset failure
     /// throttling or be reported as a firmware failure.
     pub async fn resume_after_system_suspend(&self) -> Result<Recovered, TransportError> {
-        self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| {
-                alloc::boxed::Box::pin(async move {
-                    qmi.recover(true).await.map(|()| None).map_err(|e| {
-                        TransportError::new(
-                            step::RECOVERY_FW,
-                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                            e.errno,
-                        )
+        // The cold-resume caller must not embed the entire transport
+        // reconstruction future or inline its large poll into PM resume.
+        super::future_heap::build(|| {
+            self.rebuild_after_transport_reset(
+                move |qmi: &mut Q| {
+                    alloc::boxed::Box::pin(async move {
+                        qmi.recover(true).await.map(|()| None).map_err(|e| {
+                            TransportError::new(
+                                step::RECOVERY_FW,
+                                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                                e.errno,
+                            )
+                        })
                     })
-                })
-            },
-            false,
-            false,
-            0,
-        )
+                },
+                false,
+                false,
+                0,
+            )
+        })
         .await
     }
 
@@ -3336,7 +3340,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     where
         F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
     {
-        self.rebuild_after_transport_reset(restart, true, false, 0)
+        super::future_heap::build(|| self.rebuild_after_transport_reset(restart, true, false, 0))
             .await
     }
 
@@ -3377,7 +3381,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         self.bss_surveys.lock().clear();
         *self.mbssid_beacons.lock() = core::array::from_fn(|_| None);
         *self.mbssid_transmitters.lock() = [None; WCN6855_MAX_VDEVS];
-        let taken = self.rt.lock().await.take();
+        // Keep the original large runtime heap-owned while transport
+        // restart awaits. Moving it into this future's inline state made
+        // recovery polls reserve a second full runtime on the kernel stack.
+        let taken = self.rt.lock().await.take().map(alloc::boxed::Box::new);
         let Some(mut rt) = taken else {
             return Err(TransportError::new(step::RECOVERY_CORE, 0, ENODEV));
         };
@@ -3389,7 +3396,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             // `ath11k_core_reset` turns the radio over. A failed diagnostic
             // capture is reported by the transport but never prevents the
             // safety-critical reset/recovery sequence.
-            rt.core.qmi.collect_crash_dump().await;
+            super::future_heap::build(|| rt.core.qmi.collect_crash_dump()).await;
             if let Some(dump) = rt.core.qmi.take_crash_dump() {
                 self.publish_firmware_crash_dump(dump);
             }
@@ -3402,7 +3409,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 if record_recovery_failure {
                     Self::recovery_failed(&mut rt);
                 }
-                self.park(alloc::boxed::Box::new(rt));
+                self.park(rt);
                 return Err(te);
             }
         }
@@ -3414,7 +3421,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             stats,
             reset,
             ..
-        } = rt;
+        } = *rt;
         let (dp_cfg, sizes, msi) = (dp.cfg, dp.sizes, dp.msi());
         let (mut hif, qmi, cfg) = core.into_parts();
         dp.pdev_free(&mut hif.ce.hal);
@@ -3443,7 +3450,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             }
         };
         let mut hooks = alloc::boxed::Box::new(DpHooks::new(Some(dp_cfg), 0, sizes, msi));
-        let r = core.qmi_firmware_ready(&mut *hooks).await;
+        // Heap-own the nested firmware/DP setup future too: boxed core and
+        // hooks alone do not bound an inlined child poll's temporary frame.
+        let r = super::future_heap::build(|| core.qmi_firmware_ready(&mut *hooks)).await;
         let dp = hooks.dp.take();
         let (core, dp) = match (r, dp) {
             (Ok(()), Some(dp)) => (*core, dp),
@@ -3461,7 +3470,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 return Err(te);
             }
         };
-        let mut rt = Rt::new(core, dp);
+        let mut rt = alloc::boxed::Box::new(Rt::new(core, dp));
         // A completed physical transport reset terminates old untagged
         // statistics transactions; reuse the physical cache identity.
         self.tx_power_stats.lock().reset();
@@ -3496,7 +3505,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         if r.is_err() && record_recovery_failure {
             Self::recovery_failed(&mut rt);
         }
-        *self.rt.lock().await = Some(rt);
+        *self.rt.lock().await = Some(*rt);
         r
     }
 

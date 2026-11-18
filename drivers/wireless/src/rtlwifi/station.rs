@@ -5,7 +5,7 @@ use super::{
     packet::{Mpdu, Port},
     Error as RadioError, Io, Memory, Phase as Hardware, Prepared,
 };
-use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -342,82 +342,117 @@ fn delba(peer: [u8; 6], own: [u8; 6], tid: u16, reason: u16) -> Vec<u8> {
 /// `ht::wait` over the chip's signed power base: the 88EE form with its
 /// optional grants, or the 8821AE / 8192EE envelope forms (which have none).
 #[allow(clippy::too_many_arguments)]
-async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
+fn power_wait<'a, F: Future<Output = Result<(), RadioError>> + 'a>(
     base: super::super::station_power::Base,
     ht: Option<Arc<super::super::ht::Grant>>,
     protection: Option<Arc<super::super::protection::Grant>>,
     tracking: Option<Arc<super::super::tracking::Grant>>,
     antenna: Option<Arc<super::super::antenna::Grant>>,
     grant: super::super::station_power::Grant,
-    environment: &impl Environment,
+    environment: &'a impl Environment,
     future: F,
-) -> Result<(), RadioError> {
-    use super::super::station_power::{Base, Grant};
-    match (base, grant) {
-        (Base::Rtl8188ee(base), Grant::Rtl8188ee(permission)) => {
-            super::super::ht::wait(
-                base,
-                ht,
-                protection,
-                tracking,
-                antenna,
-                permission,
-                environment,
-                future,
-            )
-            .await
+) -> impl Future<Output = Result<(), RadioError>> + 'a {
+    // Own the original continuation before constructing the variant-specific
+    // poll state. An inline F otherwise appears in both the initial state and
+    // each selected await arm, multiplying large station futures on the stack.
+    // Allocation performs no driver effect; the selected current source still
+    // encloses every poll and F retains its original cancellation/drop order.
+    let future = Box::pin(future);
+    async move {
+        use super::super::station_power::{Base, Grant};
+        match (base, grant) {
+            (Base::Rtl8188ee(base), Grant::Rtl8188ee(permission)) => {
+                super::super::ht::wait(
+                    base,
+                    ht,
+                    protection,
+                    tracking,
+                    antenna,
+                    permission,
+                    environment,
+                    future,
+                )
+                .await
+            }
+            (Base::Rtl8821ae(base), Grant::Rtl8821ae(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8821ae(base, permission, environment, future)
+                    .await
+            }
+            (Base::Rtl8821aeCoex(program), Grant::Rtl8821ae(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none()
+                    && program.permission() == permission =>
+            {
+                program.wait(future).await
+            }
+            (Base::Rtl8192ee(base), Grant::Rtl8192ee(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8192ee(base, permission, environment, future)
+                    .await
+            }
+            (Base::Rtl8192ce(base), Grant::Rtl8192ce(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8192ce(base, permission, environment, future)
+                    .await
+            }
+            (Base::Rtl8192de(base), Grant::Rtl8192de(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8192de(base, permission, environment, future)
+                    .await
+            }
+            (Base::Rtl8723ae(base), Grant::Rtl8723ae(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8723ae(base, permission, environment, future)
+                    .await
+            }
+            (Base::Rtl8723beTracking(base), Grant::Rtl8723be(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8723be_tracking(
+                    base,
+                    permission,
+                    environment,
+                    future,
+                )
+                .await
+            }
+            (Base::Rtl8723be(base), Grant::Rtl8723be(permission))
+                if ht.is_none()
+                    && protection.is_none()
+                    && tracking.is_none()
+                    && antenna.is_none() =>
+            {
+                super::super::station_power::wait_rtl8723be(base, permission, environment, future)
+                    .await
+            }
+            _ => Err(RadioError::State),
         }
-        (Base::Rtl8821ae(base), Grant::Rtl8821ae(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8821ae(base, permission, environment, future).await
-        }
-        (Base::Rtl8821aeCoex(program), Grant::Rtl8821ae(permission))
-            if ht.is_none()
-                && protection.is_none()
-                && tracking.is_none()
-                && antenna.is_none()
-                && program.permission() == permission =>
-        {
-            program.wait(future).await
-        }
-        (Base::Rtl8192ee(base), Grant::Rtl8192ee(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8192ee(base, permission, environment, future).await
-        }
-        (Base::Rtl8192ce(base), Grant::Rtl8192ce(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8192ce(base, permission, environment, future).await
-        }
-        (Base::Rtl8192de(base), Grant::Rtl8192de(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8192de(base, permission, environment, future).await
-        }
-        (Base::Rtl8723ae(base), Grant::Rtl8723ae(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8723ae(base, permission, environment, future).await
-        }
-        (Base::Rtl8723beTracking(base), Grant::Rtl8723be(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8723be_tracking(
-                base,
-                permission,
-                environment,
-                future,
-            )
-            .await
-        }
-        (Base::Rtl8723be(base), Grant::Rtl8723be(permission))
-            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
-        {
-            super::super::station_power::wait_rtl8723be(base, permission, environment, future).await
-        }
-        _ => Err(RadioError::State),
     }
 }
 pub(crate) struct Publication {
@@ -1960,7 +1995,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             armed: true,
         };
         self.station.phase = Phase::Starting;
-        let result = async {
+        let result = crate::future_heap::build(|| async {
             self.check_station_policy(environment)?;
             power_wait(
                 self.station
@@ -2030,7 +2065,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.station.last_peer = now;
             self.station.phase = Phase::Passive;
             Ok(())
-        }
+        })
         .await;
         attempt.armed = false;
         if result.is_err() {
@@ -2133,13 +2168,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.station.antenna.as_ref().map(|s| s.grant.clone()),
             self.station_grant().ok_or(Error::State)?,
             environment,
-            async {
+            crate::future_heap::build(|| async {
                 if self.rtl8821ae_full_coex() {
                     self.ae_coex_special(packet).await
                 } else {
                     self.be8723_special_packet_notify(packet).await
                 }
-            },
+            }),
         )
         .await
         .map_err(Error::Radio);
@@ -2169,7 +2204,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = async {
+        let result = crate::future_heap::build(|| async {
             if environment.now_ms() >= deadline {
                 return Err(Error::Timeout);
             }
@@ -2192,7 +2227,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 false,
                 environment,
             )
-        }
+        })
         .await;
         attempt.armed = false;
         if result.is_err() {
@@ -2584,7 +2619,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = async {
+        let result = crate::future_heap::build(|| async {
             let offered = self.station.plan.as_ref().and_then(|p| p.offered_phy());
             let eighty = self.chip == super::Chip::Rtl8821ae
                 && offered.is_some_and(|p| p.width() == association::phy::Width::Eighty);
@@ -3069,7 +3104,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
                 environment.pause().await;
             }
-        }
+        })
         .await;
         attempt.armed = false;
         if result.is_err() {

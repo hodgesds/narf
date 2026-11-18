@@ -95,7 +95,9 @@ fn refusal() -> Result<(), &'static str> {
                 )),
                 None,
             );
-            native.mci_power = Some(narf_lib::sync::IrqSafeSpinLock::new(fixture.power));
+            native.mci_power = Some(alloc::boxed::Box::new(
+                narf_lib::sync::IrqSafeSpinLock::new(fixture.power),
+            ));
             if pci_lost {
                 pci.revoke();
             } else {
