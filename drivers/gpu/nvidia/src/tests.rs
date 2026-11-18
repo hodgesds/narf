@@ -5835,3 +5835,81 @@ fn smoke_gsp_rm_object_tree() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_rm_api", smoke_gsp_rm_object_tree);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM display control calls (NV0073_CTRL_CMD_*)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_disp::{
+    disp_control_rpc, get_connect_state_params, get_edid_v2_params, get_supported_params,
+    parse_connect_state, parse_edid, parse_supported, CMD_SYSTEM_GET_SUPPORTED, EDID_MAX_BYTES,
+    EDID_V2_PARAMS_SIZE,
+};
+use crate::gsp_rm_api::{HANDLE_DISP as DISP_OBJ, RM_CONTROL_HDR_SIZE as CTRL_HDR};
+
+fn smoke_gsp_disp_control_wrap() -> TestResult {
+    // A display control targets the disp-common object via GSP_RM_CONTROL.
+    let p = get_supported_params();
+    let rpc = disp_control_rpc(0xc1d0_0000, CMD_SYSTEM_GET_SUPPORTED, &p);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    if rd(&rpc, 0) != 0xc1d0_0000
+        || rd(&rpc, 4) != DISP_OBJ
+        || rd(&rpc, 8) != CMD_SYSTEM_GET_SUPPORTED
+    {
+        return TestResult::Fail("display control must target HANDLE_DISP with the cmd");
+    }
+    if rd(&rpc, 0x10) != p.len() as u32 || rpc.len() != CTRL_HDR + p.len() {
+        return TestResult::Fail("control paramsSize/length wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_control_wrap);
+
+fn smoke_gsp_disp_supported_connect() -> TestResult {
+    // GET_SUPPORTED reply: displayMask @4, displayMaskDDC @8.
+    let mut reply = [0u8; 12];
+    reply[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+    reply[8..12].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+    if parse_supported(&reply) != Some((0x101, 0x1)) {
+        return TestResult::Fail("GET_SUPPORTED parse wrong");
+    }
+    // GET_CONNECT_STATE: request sets displayMask @8; reply reads it back.
+    let req = get_connect_state_params(0x0000_0100);
+    if u32::from_le_bytes(req[8..12].try_into().unwrap()) != 0x100 {
+        return TestResult::Fail("connect-state request mask not set");
+    }
+    let mut creply = [0u8; 16];
+    creply[8..12].copy_from_slice(&0x0000_0100u32.to_le_bytes());
+    if parse_connect_state(&creply) != Some(0x100) {
+        return TestResult::Fail("GET_CONNECT_STATE parse wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_supported_connect);
+
+fn smoke_gsp_disp_edid() -> TestResult {
+    // Request: displayId @4, bufferSize @8 = 2048; full 2 KiB reserved.
+    let req = get_edid_v2_params(0x0000_0100);
+    if req.len() != EDID_V2_PARAMS_SIZE || EDID_V2_PARAMS_SIZE != 16 + EDID_MAX_BYTES {
+        return TestResult::Fail("EDID params size wrong");
+    }
+    if u32::from_le_bytes(req[4..8].try_into().unwrap()) != 0x100
+        || u32::from_le_bytes(req[8..12].try_into().unwrap()) != EDID_MAX_BYTES as u32
+    {
+        return TestResult::Fail("EDID request displayId/bufferSize wrong");
+    }
+    // Reply: bufferSize @8 bounds the EDID; bytes start at offset 16.
+    let mut reply = alloc::vec![0u8; EDID_V2_PARAMS_SIZE];
+    reply[8..12].copy_from_slice(&128u32.to_le_bytes()); // one block
+    reply[16] = 0x00;
+    reply[17] = 0xFF; // EDID header start
+    let edid = match parse_edid(&reply) {
+        Some(e) => e,
+        None => return TestResult::Fail("EDID parse failed"),
+    };
+    if edid.len() != 128 || edid[1] != 0xFF {
+        return TestResult::Fail("EDID slice bounds/content wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_edid);
