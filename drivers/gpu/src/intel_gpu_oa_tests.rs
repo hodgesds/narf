@@ -1137,7 +1137,10 @@ kernel_test_in!(
 );
 
 fn smoke_oa_read_wrap_clear_enospc_status_eio_and_info() -> TestResult {
-    let backend = Backend::new(device(58, MTL, 1270));
+    // Card 30: the OA config registry is global per card for the boot, so
+    // this test needs a card no earlier test registered uuid(1) on — card
+    // 58 is already taken by smoke_oa_per_context_open_with_dead_queue_fails_clean (EADDRINUSE, #2235).
+    let backend = Backend::new(device(30, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
     // OAC192 is per-context-only since d9594ad0d1: a system-wide open is
