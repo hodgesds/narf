@@ -199,7 +199,7 @@ const OPENSSL_NOW: u64 = 1_798_761_600;
 /// The RFC 8448 extension set (the fixture seam): suites 1301/1303/
 /// 1302, groups 001d/0017/0018/0019/0100/0101/0102/0103/0104, the
 /// trace's 15 signature schemes, psk modes, record_size_limit 16385,
-/// renegotiation_info, extended_master_secret.
+/// renegotiation_info, session_ticket.
 fn rfc_config<'a>(roots: &'a RootStore<'a>) -> ClientConfig<'a> {
     let mut config = ClientConfig::new(roots, RFC_NOW);
     config.server_name = Some("server");
@@ -220,7 +220,7 @@ fn rfc_config<'a>(roots: &'a RootStore<'a>) -> ClientConfig<'a> {
     config.offer_psk_modes = true;
     config.record_size_limit = Some(0x4001);
     config.offer_renegotiation_info = true;
-    config.offer_extended_master_secret = true;
+    config.offer_session_ticket = true;
     config
 }
 

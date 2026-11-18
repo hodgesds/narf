@@ -124,6 +124,7 @@ pub const EXT_SIGNATURE_ALGORITHMS_CERT: u16 = 50;
 pub const EXT_KEY_SHARE: u16 = 51;
 pub const EXT_RECORD_SIZE_LIMIT: u16 = 28;
 pub const EXT_EXTENDED_MASTER_SECRET: u16 = 23;
+pub const EXT_SESSION_TICKET: u16 = 35;
 pub const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
 // ── CipherSuite (RFC 8446 §B.4) ─────────────────────────────────────
