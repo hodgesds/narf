@@ -532,6 +532,9 @@ impl<F: SdioFunction> crate::brcmfmac::chip::Backplane for SdioTransport<F> {
     }
 }
 impl<F: SdioFunction> Transport for SdioTransport<F> {
+    fn loader_mode(&self) -> super::transport::LoaderMode {
+        super::transport::LoaderMode::Sdio
+    }
     fn read32(&mut self, function: Function, address: u32) -> Result<u32, TransportError> {
         self.check_qualification()?;
         let mut bytes = [0; 4];

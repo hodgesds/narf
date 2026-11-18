@@ -111,6 +111,16 @@ impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     }
 }
 
+impl Runtime<super::host_ports::gspi_port::GspiPackets> {
+    /// Called only by the consumed boot-ready gSPI protocol owner. The source
+    /// seeds one initial control credit; every subsequent window comes from RX.
+    pub(super) fn new_gspi(transport: super::host_ports::gspi_port::GspiPackets) -> Self {
+        let mut runtime = Self::new(transport);
+        runtime.tx_max = 1;
+        runtime
+    }
+}
+
 impl<T: PacketTransport> Runtime<T> {
     /// Attach only after the firmware loader completed. Credit begins at
     /// zero: a real firmware SDPCM header must grant the initial TX window.
