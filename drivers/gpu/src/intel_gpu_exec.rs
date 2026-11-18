@@ -283,8 +283,24 @@ impl ExecWire {
         u64_at(&self.request, 40) as u32
     }
 
-    pub(crate) fn dr4_fixed_up(&self) -> bool {
-        u32_at(&self.request, 24) == u32::MAX
+    pub(crate) fn resolve_ioctl(
+        self,
+        gem: &GemState,
+        cmd: u32,
+        user: &dyn IoctlContext,
+        address: u64,
+    ) -> Result<ExecRequest, FsError> {
+        let report_dr4 = cmd == abi::GEM_EXECBUFFER2_WR && u32_at(&self.request, 24) == u32::MAX;
+        let request = self.resolve(gem);
+        // i915_gem_check_execbuffer normalizes UXA's DR4 sentinel. Only the
+        // read/write ioctl returns that field to the caller.
+        if report_dr4 {
+            user.write(
+                address.checked_add(24).ok_or(FsError::BadAddress)?,
+                &0u32.to_le_bytes(),
+            )?;
+        }
+        request
     }
 
     pub(crate) fn flags(&self) -> u64 {

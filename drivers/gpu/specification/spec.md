@@ -1800,6 +1800,9 @@ UXA's 0xffffffff, batch start/length alignment), then the exec-object copy
 ignored. Relocations, more than 4096 objects and, on the synchronous path,
 fence flags are refused (EINVAL) with the header checks. rsvd2 is read only
 for FENCE_IN/SUBMIT/OUT; otherwise any value is ignored.
+Both ioctl paths select the context and engine before resolving object
+handles. For the UXA DR4 sentinel, `GEM_EXECBUFFER2_WR` writes zero back
+to the DR4 field during resolution and reports a failed copyout as EFAULT.
 `read_submission` then copies explicit synchronization once, and only after
 it resolves the objects (eb_lookup_vmas);
 `address_space(format, pat_index)` constructs immutable private PPGTT
