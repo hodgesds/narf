@@ -412,7 +412,9 @@ impl ExtFake {
     fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
         let mode = Mode::VESA_1024X768_60;
         self.display_ip.set(ip);
-        self.phy.write32(0x5_10A0, u32::from(ip.ver()) << 22);
+        let release = if ip == DisplayIp::WildcatLake { 2 } else { 0 };
+        self.phy
+            .write32(0x5_10A0, (u32::from(ip.ver()) << 22) | (release << 14));
         self.phy.write32(0x4_5004, 1 << 3);
         let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
         let mut vblank_start = [None; 4];
@@ -969,6 +971,16 @@ fn smoke_wcl_external_tc_dp_uses_c20_and_three_pipe_profile() -> TestResult {
     let Some(panel) = io.light_panel_ip(DisplayIp::WildcatLake) else {
         return TestResult::Fail("the fixture must light the WCL panel profile");
     };
+    // Pipe D does not decode on 30.02. The third FBC is real and must be idle.
+    io.confs[Pipe::D as usize].set(u32::MAX);
+    let fbc_c = 0x43288;
+    io.phy.write32(fbc_c, ENABLE);
+    if crate::intel_gpu_xelpg_live::check_pipes(&io, DisplayIp::WildcatLake, 1)
+        != Err(crate::intel_gpu_xelpg_resources::ResourceError::Busy)
+    {
+        return TestResult::Fail("WCL must refuse live repartition while FBC C is enabled");
+    }
+    io.phy.write32(fbc_c, 0);
     let mut service = MtlExternalService::new();
     service.set_profile(ExternalDisplayProfile::WILDCAT_LAKE);
     service.set_display(MtlDisplay {
@@ -1011,6 +1023,14 @@ fn smoke_wcl_external_tc_dp_uses_c20_and_three_pipe_profile() -> TestResult {
         }
     ) {
         return TestResult::Fail("WCL TC1 must stop and release on detach");
+    }
+    if io
+        .first_write(|r, _| {
+            (0x73000..0x74000).contains(&r) || r == crate::intel_gpu_xelpg_dbuf::dbox_ctl(3)
+        })
+        .is_some()
+    {
+        return TestResult::Fail("WCL connect and release must skip Pipe D registers");
     }
     TestResult::Pass
 }

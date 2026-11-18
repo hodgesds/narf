@@ -427,7 +427,8 @@ display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
 MMIO image. `ExternalDisplayProfile::WILDCAT_LAKE` additionally fixes the
 external owner to TC1/TC2 and scans only Pipes B/C. `MtlExternalService`
 retains that exact profile instead of reconstructing it from broad
-`Generation::PantherLake`; native
+`Generation::PantherLake`. Live repartition checks all three FBC instances
+and limits plane programming and DBOX rollback to Pipes A–C. Native
 fixtures run the existing display-30 C20/PICA DP-alt enable, training, fixed
 VRR-TG and stop path on TC1/TC2 and Pipes B/C. `display_route` returns it only
 for exact `GtPlatform::WildcatLake` with the distinct

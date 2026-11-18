@@ -693,6 +693,9 @@ impl State {
         pipe: usize,
         cursor_visible: bool,
     ) -> Option<Vec<(u64, u32)>> {
+        if pipe >= self.ip.pipe_count() {
+            return None;
+        }
         self.dbuf
             .pipe_wm_registers(pipe, cursor_visible, self.ip.is_display30())
     }
@@ -795,34 +798,7 @@ pub(crate) fn require_idle_ip(
     io: &(impl MmioWindow + ?Sized),
     ip: DisplayIp,
 ) -> Result<(), ResourceError> {
-    for fbc in 2..ip.fbc_instances() {
-        if read(io, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
-            return Err(ResourceError::Busy);
-        }
-    }
-    for pipe in 0..ip.pipe_count() as u64 {
-        if read(io, 0x70008 + pipe * 0x1000)? & 0xc000_0000 != 0
-            || read(io, 0x70080 + pipe * 0x1000)? & 0x27 != 0
-        {
-            return Err(ResourceError::Busy);
-        }
-        for plane in 0..PLANES as u64 {
-            if read(io, 0x70180 + pipe * 0x1000 + plane * 0x100)? & (1 << 31) != 0 {
-                return Err(ResourceError::Busy);
-            }
-        }
-        for dsb in 0..3 {
-            if read(io, 0x70b08 + pipe * 0x1000 + dsb * 0x100)? & ((1 << 31) | 1) != 0 {
-                return Err(ResourceError::Busy);
-            }
-        }
-    }
-    for r in [0x43208, 0x43248] {
-        if read(io, r)? & (1 << 31) != 0 {
-            return Err(ResourceError::Busy);
-        }
-    }
-    Ok(())
+    crate::intel_gpu_xelpg_live::check_pipes(io, ip, 0)
 }
 
 /// Everything a commit may change, captured before its first write.

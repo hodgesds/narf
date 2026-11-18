@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_pmdemand as pmdemand;
+use crate::intel_gpu_xe2lpd::DisplayIp;
 use crate::intel_gpu_xelpg_cdclk as cdclk;
 use crate::intel_gpu_xelpg_dbuf::{self as dbuf, Entry};
 use crate::intel_gpu_xelpg_resources::{
@@ -227,8 +228,12 @@ fn cursor_wm_on(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<bool, Re
 
 /// Lit pipes stay lit, every other pipe is completely off, and no DSB or
 /// FBC can race the update. Read-only; also the Pipe B–D owner's admission.
-pub(crate) fn check_pipes(io: &(impl MmioWindow + ?Sized), live: u8) -> Result<(), ResourceError> {
-    for pipe in 0..PIPES {
+pub(crate) fn check_pipes(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    live: u8,
+) -> Result<(), ResourceError> {
+    for pipe in 0..ip.pipe_count() {
         let conf = read(io, pipe_reg(CONF, pipe))? & 0xc000_0000;
         if live & (1 << pipe) != 0 {
             if conf != 0xc000_0000 {
@@ -250,8 +255,8 @@ pub(crate) fn check_pipes(io: &(impl MmioWindow + ?Sized), live: u8) -> Result<(
             }
         }
     }
-    for r in [0x43208, 0x43248] {
-        if read(io, r)? & (1 << 31) != 0 {
+    for fbc in 0..ip.fbc_instances() {
+        if read(io, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
             return Err(ResourceError::Busy);
         }
     }
@@ -539,7 +544,7 @@ fn execute(
             dboxes(io, new)?;
         }
         Step::OffPipes => {
-            for pipe in 0..PIPES {
+            for pipe in 0..new.ip.pipe_count() {
                 if live & (1 << pipe) == 0 {
                     let image = new
                         .pipe_registers(pipe, new.cursor_visible[pipe])
@@ -642,7 +647,7 @@ fn undo(
             Step::MbusJoin { select } => {
                 // Reverse of a join: the unjoin protocol back to `old`.
                 trackers(io, ratio, false)?;
-                for (pipe, v) in snap.dbox.iter().enumerate() {
+                for (pipe, v) in snap.dbox.iter().enumerate().take(old.ip.pipe_count()) {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
                 let keep = if old.ip.xe2_plus() {
@@ -658,19 +663,19 @@ fn undo(
             }
             Step::MbusUnjoin { select } => {
                 mbus(io, old, select)?;
-                for (pipe, v) in snap.dbox.iter().enumerate() {
+                for (pipe, v) in snap.dbox.iter().enumerate().take(old.ip.pipe_count()) {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
                 trackers(io, ratio, true)?;
             }
             Step::MbusRebalance => {
                 trackers(io, ratio, old.dbuf.joined)?;
-                for (pipe, v) in snap.dbox.iter().enumerate() {
+                for (pipe, v) in snap.dbox.iter().enumerate().take(old.ip.pipe_count()) {
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
             }
             Step::OffPipes => {
-                for pipe in 0..PIPES {
+                for pipe in 0..new.ip.pipe_count() {
                     if live & (1 << pipe) != 0 {
                         continue;
                     }
@@ -705,7 +710,7 @@ pub(crate) fn commit_live(
     live: u8,
 ) -> Result<(), ResourceError> {
     let steps = plan(old, new, live)?;
-    check_pipes(io, live)?;
+    check_pipes(io, old.ip, live)?;
     // The programmed state must be what the hardware holds now.
     let clock = cdclk::Current::read_ip(io, old.ip)?;
     match clock.known {

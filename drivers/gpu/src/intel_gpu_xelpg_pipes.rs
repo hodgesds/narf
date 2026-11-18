@@ -350,7 +350,10 @@ impl Pipes {
             .map_err(|_| PipeEnableError::Resource(ResourceError::Diverged))?;
         // Only the owned single-pipe layout is adopted: one external route
         // runs at a time, so a lit Pipe B–D here is not this owner's.
-        for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        for pipe in [Pipe::B, Pipe::C, Pipe::D]
+            .into_iter()
+            .take(ip.pipe_count() - 1)
+        {
             if read(io, pipe.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
                 return Err(PipeEnableError::Resource(ResourceError::Diverged));
             }
@@ -494,7 +497,8 @@ impl Pipes {
         ext: &ExternalPipe,
     ) -> Result<(State, [Option<u16>; 4]), PipeEnableError> {
         let p = ext.pipe as usize;
-        if ext.pipe == Pipe::A
+        if p >= self.ip.pipe_count()
+            || ext.pipe == Pipe::A
             || ext.surface & 0xfff != 0
             || ext.stride_bytes % 64 != 0
             || u32::from(ext.mode.h_active) * 4 > ext.stride_bytes
@@ -515,11 +519,7 @@ impl Pipes {
         }
         // The transaction's hardware precondition: the lit pipes are lit
         // and every other pipe, plane, cursor, DSB and FBC is idle.
-        if fresh.lit != 0 {
-            crate::intel_gpu_xelpg_live::check_pipes(io, fresh.lit)?;
-        } else {
-            res::require_idle_ip(io, fresh.ip)?;
-        }
+        crate::intel_gpu_xelpg_live::check_pipes(io, fresh.ip, fresh.lit)?;
         let mut vblank_start = fresh.vblank_start;
         if fresh.ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
