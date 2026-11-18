@@ -5736,3 +5736,758 @@ fn smoke_gsp_ring_tx_header() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_tx_header);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM object model over RPC (post-INIT_DONE foundation)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_rm_api::{
+    alloc_device_rpc, alloc_disp_common_rpc, alloc_disp_rpc, alloc_root_rpc, alloc_subdevice_rpc,
+    build_rm_alloc, build_rm_control, class_handle, client_handle, nv0000_root_params,
+    nv0080_device_params, HANDLE_DEVICE, HANDLE_DISP, HANDLE_SUBDEVICE, NV01_DEVICE_0, NV01_ROOT,
+    NV04_DISPLAY_COMMON, NV20_SUBDEVICE_0, RM_ALLOC_HDR_SIZE, RM_CONTROL_HDR_SIZE,
+    TU102_DISP as RM_TU102_DISP,
+};
+
+fn smoke_gsp_rm_handles() -> TestResult {
+    if client_handle(5) != 0xc1d0_0005 || HANDLE_DEVICE != 0xde1d_0000 {
+        return TestResult::Fail("canonical handles drifted");
+    }
+    // Display channel / root handles are (class << 16) | inst.
+    if class_handle(RM_TU102_DISP, 0) != 0xc570_0000 || HANDLE_DISP != 0x0073_0000 {
+        return TestResult::Fail("class_handle / disp handle wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm_api", smoke_gsp_rm_handles);
+
+fn smoke_gsp_rm_alloc_control_headers() -> TestResult {
+    // GSP_RM_ALLOC: 32-byte header + params; paramsSize carries len.
+    let a = build_rm_alloc(0x1111, 0x2222, 0x3333, 0x80, &[0xAA, 0xBB]);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    if a.len() != RM_ALLOC_HDR_SIZE + 2 {
+        return TestResult::Fail("alloc payload length wrong");
+    }
+    if rd(&a, 0) != 0x1111 || rd(&a, 4) != 0x2222 || rd(&a, 8) != 0x3333 || rd(&a, 0xc) != 0x80 {
+        return TestResult::Fail("alloc header handles/class mis-packed");
+    }
+    if rd(&a, 0x14) != 2 || a[0x20..0x22] != [0xAA, 0xBB] {
+        return TestResult::Fail("alloc paramsSize / params mis-packed");
+    }
+    // GSP_RM_CONTROL: 24-byte header (hClient, hObject, cmd, …).
+    let c = build_rm_control(0x1111, 0x3333, 0x730152, &[0xCC]);
+    if c.len() != RM_CONTROL_HDR_SIZE + 1 {
+        return TestResult::Fail("control payload length wrong");
+    }
+    if rd(&c, 0) != 0x1111 || rd(&c, 4) != 0x3333 || rd(&c, 8) != 0x730152 || rd(&c, 0x10) != 1 {
+        return TestResult::Fail("control header mis-packed");
+    }
+    if c[0x18] != 0xCC {
+        return TestResult::Fail("control params mis-packed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_rm_api",
+    smoke_gsp_rm_alloc_control_headers
+);
+
+fn smoke_gsp_rm_object_tree() -> TestResult {
+    let hc = client_handle(0);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    // root: self-parented NV01_ROOT; NV0000 params (108 bytes) with
+    // hClient + processID=~0.
+    let root = alloc_root_rpc(hc);
+    if rd(&root, 0) != hc || rd(&root, 4) != hc || rd(&root, 8) != hc || rd(&root, 0xc) != NV01_ROOT
+    {
+        return TestResult::Fail("root alloc handles/class wrong");
+    }
+    let p = nv0000_root_params(hc);
+    if p.len() != 108 || u32::from_le_bytes(p[4..8].try_into().unwrap()) != 0xFFFF_FFFF {
+        return TestResult::Fail("NV0000 params wrong");
+    }
+    // device: hObject = DEVICE, class NV01_DEVICE_0, NV0080 params
+    // carrying hClientShare.
+    let dev = alloc_device_rpc(hc);
+    if rd(&dev, 8) != HANDLE_DEVICE || rd(&dev, 0xc) != NV01_DEVICE_0 {
+        return TestResult::Fail("device alloc wrong");
+    }
+    let dp = nv0080_device_params(hc);
+    if dp.len() != 56 || u32::from_le_bytes(dp[4..8].try_into().unwrap()) != hc {
+        return TestResult::Fail("NV0080 params wrong");
+    }
+    // subdevice, disp-common, disp root.
+    let sub = alloc_subdevice_rpc(hc);
+    if rd(&sub, 4) != HANDLE_DEVICE
+        || rd(&sub, 8) != HANDLE_SUBDEVICE
+        || rd(&sub, 0xc) != NV20_SUBDEVICE_0
+    {
+        return TestResult::Fail("subdevice alloc wrong");
+    }
+    let com = alloc_disp_common_rpc(hc);
+    if rd(&com, 8) != HANDLE_DISP || rd(&com, 0xc) != NV04_DISPLAY_COMMON || rd(&com, 0x14) != 0 {
+        return TestResult::Fail("disp-common alloc wrong");
+    }
+    let disp = alloc_disp_rpc(hc);
+    if rd(&disp, 8) != class_handle(RM_TU102_DISP, 0) || rd(&disp, 0xc) != RM_TU102_DISP {
+        return TestResult::Fail("disp root alloc wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm_api", smoke_gsp_rm_object_tree);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM display control calls (NV0073_CTRL_CMD_*)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_disp::{
+    disp_control_rpc, get_connect_state_params, get_edid_v2_params, get_supported_params,
+    parse_connect_state, parse_edid, parse_supported, CMD_SYSTEM_GET_SUPPORTED, EDID_MAX_BYTES,
+    EDID_V2_PARAMS_SIZE,
+};
+use crate::gsp_rm_api::{HANDLE_DISP as DISP_OBJ, RM_CONTROL_HDR_SIZE as CTRL_HDR};
+
+fn smoke_gsp_disp_control_wrap() -> TestResult {
+    // A display control targets the disp-common object via GSP_RM_CONTROL.
+    let p = get_supported_params();
+    let rpc = disp_control_rpc(0xc1d0_0000, CMD_SYSTEM_GET_SUPPORTED, &p);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    if rd(&rpc, 0) != 0xc1d0_0000
+        || rd(&rpc, 4) != DISP_OBJ
+        || rd(&rpc, 8) != CMD_SYSTEM_GET_SUPPORTED
+    {
+        return TestResult::Fail("display control must target HANDLE_DISP with the cmd");
+    }
+    if rd(&rpc, 0x10) != p.len() as u32 || rpc.len() != CTRL_HDR + p.len() {
+        return TestResult::Fail("control paramsSize/length wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_control_wrap);
+
+fn smoke_gsp_disp_supported_connect() -> TestResult {
+    // GET_SUPPORTED reply: displayMask @4, displayMaskDDC @8.
+    let mut reply = [0u8; 12];
+    reply[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+    reply[8..12].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+    if parse_supported(&reply) != Some((0x101, 0x1)) {
+        return TestResult::Fail("GET_SUPPORTED parse wrong");
+    }
+    // GET_CONNECT_STATE: request sets displayMask @8; reply reads it back.
+    let req = get_connect_state_params(0x0000_0100);
+    if u32::from_le_bytes(req[8..12].try_into().unwrap()) != 0x100 {
+        return TestResult::Fail("connect-state request mask not set");
+    }
+    let mut creply = [0u8; 16];
+    creply[8..12].copy_from_slice(&0x0000_0100u32.to_le_bytes());
+    if parse_connect_state(&creply) != Some(0x100) {
+        return TestResult::Fail("GET_CONNECT_STATE parse wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_supported_connect);
+
+fn smoke_gsp_disp_edid() -> TestResult {
+    // Request: displayId @4, bufferSize @8 = 2048; full 2 KiB reserved.
+    let req = get_edid_v2_params(0x0000_0100);
+    if req.len() != EDID_V2_PARAMS_SIZE || EDID_V2_PARAMS_SIZE != 16 + EDID_MAX_BYTES {
+        return TestResult::Fail("EDID params size wrong");
+    }
+    if u32::from_le_bytes(req[4..8].try_into().unwrap()) != 0x100
+        || u32::from_le_bytes(req[8..12].try_into().unwrap()) != EDID_MAX_BYTES as u32
+    {
+        return TestResult::Fail("EDID request displayId/bufferSize wrong");
+    }
+    // Reply: bufferSize @8 bounds the EDID; bytes start at offset 16.
+    let mut reply = alloc::vec![0u8; EDID_V2_PARAMS_SIZE];
+    reply[8..12].copy_from_slice(&128u32.to_le_bytes()); // one block
+    reply[16] = 0x00;
+    reply[17] = 0xFF; // EDID header start
+    let edid = match parse_edid(&reply) {
+        Some(e) => e,
+        None => return TestResult::Fail("EDID parse failed"),
+    };
+    if edid.len() != 128 || edid[1] != 0xFF {
+        return TestResult::Fail("EDID slice bounds/content wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_edid);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM display channel allocation
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_chan::{
+    alloc_channel_rpc, channel_pushbuffer_params, channel_user_offset, channeldma_alloc_params,
+    pushbuffer_rpc, ADDR_FBMEM, CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER, DISP_CORE_CHANNEL_DMA,
+    DISP_WINDOW_CHANNEL_DMA,
+};
+use crate::gsp_rm_api::{class_handle as ch2, TU102_DISP as RM_DISP};
+
+fn smoke_gsp_chan_user_offsets() -> TestResult {
+    // Core channel GET/PUT page = BAR0 0x680000 (0x10000); this is where
+    // disp::nv50 kicks PUT.
+    if channel_user_offset(DISP_CORE_CHANNEL_DMA, 0) != Some((0x68_0000, 0x1_0000)) {
+        return TestResult::Fail("core channel user offset wrong");
+    }
+    // Window channels are per-head at 0x690000 + head*0x1000.
+    if channel_user_offset(DISP_WINDOW_CHANNEL_DMA, 2) != Some((0x69_0000 + 2 * 0x1000, 0x1000)) {
+        return TestResult::Fail("window channel user offset wrong");
+    }
+    if channel_user_offset(0x1234, 0).is_some() {
+        return TestResult::Fail("unknown class must have no user offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_user_offsets);
+
+fn smoke_gsp_chan_pushbuffer_params() -> TestResult {
+    // addressSpace@0, physicalAddr@8, limit@16, hclass@28, chanInst@32, valid@36.
+    let p = channel_pushbuffer_params(
+        ADDR_FBMEM,
+        0x1_2345_6000,
+        0xFFFF,
+        DISP_CORE_CHANNEL_DMA,
+        0,
+        true,
+    );
+    let rd32 = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    if rd32(0) != ADDR_FBMEM || rd64(8) != 0x1_2345_6000 || rd64(16) != 0xFFFF {
+        return TestResult::Fail("pushbuffer addr/phys/limit mis-packed");
+    }
+    if rd32(28) != DISP_CORE_CHANNEL_DMA || rd32(32) != 0 || p[36] != 1 {
+        return TestResult::Fail("pushbuffer hclass/inst/valid mis-packed");
+    }
+    // The control targets the internal subdevice with the pushbuffer cmd.
+    let rpc = pushbuffer_rpc(
+        0xc1d0_0000,
+        0x5d1d_0000,
+        ADDR_FBMEM,
+        0x1000,
+        0xFFF,
+        0xc57d,
+        0,
+        true,
+    );
+    let r = |o: usize| u32::from_le_bytes(rpc[o..o + 4].try_into().unwrap());
+    if r(4) != 0x5d1d_0000 || r(8) != CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER {
+        return TestResult::Fail("pushbuffer RPC target/cmd wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_pushbuffer_params);
+
+fn smoke_gsp_chan_alloc() -> TestResult {
+    // Channel object = (hclass<<16)|inst, parented to the disp root.
+    let rpc = alloc_channel_rpc(0xc1d0_0000, DISP_CORE_CHANNEL_DMA, 0);
+    let rd = |o: usize| u32::from_le_bytes(rpc[o..o + 4].try_into().unwrap());
+    if rd(4) != ch2(RM_DISP, 0) {
+        return TestResult::Fail("channel parent must be the disp root");
+    }
+    if rd(8) != ch2(DISP_CORE_CHANNEL_DMA, 0) || rd(0xc) != DISP_CORE_CHANNEL_DMA {
+        return TestResult::Fail("channel object handle/class wrong");
+    }
+    // NV50VAIO params: channelInstance @0.
+    let p = channeldma_alloc_params(3);
+    if p.len() != 32 || u32::from_le_bytes(p[0..4].try_into().unwrap()) != 3 {
+        return TestResult::Fail("channeldma params wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_alloc);
+
+// ────────────────────────────────────────────────────────────────
+// GET_GSP_STATIC_INFO parse
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_static::{parse_static_info, FbRegion, GSP_STATIC_INFO_SIZE};
+
+fn smoke_gsp_static_info_parse() -> TestResult {
+    let mut p = alloc::vec![0u8; GSP_STATIC_INFO_SIZE];
+    let p64 = |p: &mut [u8], o: usize, v: u64| p[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let p32 = |p: &mut [u8], o: usize, v: u32| p[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // numFBRegions @840 = 2; two regions at 848 + n*48.
+    p32(&mut p, 840, 2);
+    // region 0: usable (base/limit, reserved 0, compressed+iso).
+    p64(&mut p, 848, 0x1_0000_0000);
+    p64(&mut p, 848 + 8, 0x1_FFFF_FFFF);
+    p[848 + 28] = 1; // supportCompressed
+    p[848 + 29] = 1; // supportISO
+                     // region 1: protected (not usable).
+    p64(&mut p, 848 + 48, 0x2_0000_0000);
+    p64(&mut p, 848 + 48 + 8, 0x2_0000_FFFF);
+    p[848 + 48 + 30] = 1; // bProtected
+                          // fb_length @1752, bar PDEs @2088/2096.
+    p64(&mut p, 1752, 0x2_0000_0000);
+    p64(&mut p, 2088, 0x1111_0000);
+    p64(&mut p, 2096, 0x2222_0000);
+    // internal handles @2152/2156/2160.
+    p32(&mut p, 2152, 0xc1d0_0042);
+    p32(&mut p, 2156, 0xde1d_0000);
+    p32(&mut p, 2160, 0x5d1d_0000);
+
+    let si = match parse_static_info(&p) {
+        Some(s) => s,
+        None => return TestResult::Fail("full-size payload must parse"),
+    };
+    if si.internal_client != 0xc1d0_0042
+        || si.internal_device != 0xde1d_0000
+        || si.internal_subdevice != 0x5d1d_0000
+    {
+        return TestResult::Fail("internal handles mis-read (offset drift)");
+    }
+    if si.bar1_pde_base != 0x1111_0000 || si.bar2_pde_base != 0x2222_0000 {
+        return TestResult::Fail("BAR PDE bases mis-read");
+    }
+    if si.fb_length != 0x2_0000_0000 {
+        return TestResult::Fail("fb_length mis-read");
+    }
+    if si.fb_regions.len() != 2 {
+        return TestResult::Fail("must read both FB regions");
+    }
+    let r0: &FbRegion = &si.fb_regions[0];
+    if r0.base != 0x1_0000_0000 || r0.size() != 0x1_0000_0000 || !r0.is_usable() {
+        return TestResult::Fail("region 0 fields / usability wrong");
+    }
+    if si.fb_regions[1].is_usable() {
+        return TestResult::Fail("protected region must not be usable");
+    }
+    // Short payload is rejected.
+    if parse_static_info(&p[..GSP_STATIC_INFO_SIZE - 1]).is_some() {
+        return TestResult::Fail("a short payload must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_static", smoke_gsp_static_info_parse);
+
+// ────────────────────────────────────────────────────────────────
+// NvDisplay C57D method layer (Turing modeset) + WRITE_INST_MEM
+// ────────────────────────────────────────────────────────────────
+
+use crate::dispc57d::{
+    head_method as c57d_head_method, output_resource, pixel_clock_hz, raster_blank_end,
+    raster_blank_start, raster_size, raster_sync_end, window_method, C57D_HEAD_SET_RASTER_SIZE,
+    C57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS, PIXEL_DEPTH_BPP_24_444,
+};
+use crate::gsp_chan::{write_inst_mem_params, write_inst_mem_rpc, NV_MEMORY_WRITECOMBINED};
+
+fn mode_1080p60() -> crate::disp::Mode {
+    crate::disp::Mode {
+        clock_khz: 148_500,
+        h_display: 1920,
+        h_sync_start: 2008,
+        h_sync_end: 2052,
+        h_total: 2200,
+        v_display: 1080,
+        v_sync_start: 1084,
+        v_sync_end: 1089,
+        v_total: 1125,
+        flags: crate::disp::ModeFlags::default(),
+    }
+}
+
+fn smoke_c57d_method_addressing() -> TestResult {
+    if c57d_head_method(C57D_HEAD_SET_RASTER_SIZE, 1) != 0x2464 {
+        return TestResult::Fail("head method addressing wrong");
+    }
+    if window_method(C57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS, 2) != 0x1004 + 2 * 0x80 {
+        return TestResult::Fail("window method addressing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_method_addressing);
+
+fn smoke_c57d_raster_encoders() -> TestResult {
+    let m = mode_1080p60();
+    if raster_size(&m) != (2200 | (1125u32 << 16)) {
+        return TestResult::Fail("raster_size wrong");
+    }
+    if raster_sync_end(&m) != (43 | (4u32 << 16)) {
+        return TestResult::Fail("raster_sync_end wrong");
+    }
+    if raster_blank_end(&m) != (191 | (40u32 << 16)) {
+        return TestResult::Fail("raster_blank_end wrong");
+    }
+    if raster_blank_start(&m) != (2111 | (1120u32 << 16)) {
+        return TestResult::Fail("raster_blank_start wrong");
+    }
+    if pixel_clock_hz(&m) != 148_500_000 {
+        return TestResult::Fail("pixel clock Hz wrong");
+    }
+    if output_resource(PIXEL_DEPTH_BPP_24_444) != (4 << 4) {
+        return TestResult::Fail("output resource pixel depth wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_raster_encoders);
+
+fn smoke_c57d_write_inst_mem() -> TestResult {
+    let p = write_inst_mem_params(0x1_0000_0000, 0x1_0000, ADDR_FBMEM, NV_MEMORY_WRITECOMBINED);
+    let rd64 = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    if rd64(0) != 0x1_0000_0000 || rd64(8) != 0x1_0000 {
+        return TestResult::Fail("inst-mem phys/size mis-packed");
+    }
+    if rd32(16) != ADDR_FBMEM || rd32(20) != NV_MEMORY_WRITECOMBINED {
+        return TestResult::Fail("inst-mem addr-space/cache-attr wrong");
+    }
+    let rpc = write_inst_mem_rpc(0xc1d0_0000, 0x5d1d_0000, 0x1000, 0x1_0000);
+    if u32::from_le_bytes(rpc[4..8].try_into().unwrap()) != 0x5d1d_0000 {
+        return TestResult::Fail("WRITE_INST_MEM must target the internal subdevice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_write_inst_mem);
+
+// ────────────────────────────────────────────────────────────────
+// NvDisplay C57E window-channel surface scanout (Turing)
+// ────────────────────────────────────────────────────────────────
+
+use crate::dispc57e::{
+    offset_units, params, plane_method, size_wh, storage, C57E_SET_CONTEXT_DMA_ISO,
+    C57E_SET_OFFSET, FORMAT_A8R8G8B8, MEMORY_LAYOUT_PITCH,
+};
+
+fn smoke_c57e_surface_encoders() -> TestResult {
+    // SET_SIZE = width | height<<16.
+    if size_wh(1920, 1080) != (1920 | (1080u32 << 16)) {
+        return TestResult::Fail("size_wh wrong");
+    }
+    // STORAGE: pitch layout at bit 4, block height at 3:0.
+    if storage(MEMORY_LAYOUT_PITCH, 0) != (1 << 4) {
+        return TestResult::Fail("pitch storage wrong");
+    }
+    if storage(0, 4) != 4 {
+        return TestResult::Fail("block-linear block height wrong");
+    }
+    // PARAMS: XRGB8888 format in bits[7:0].
+    if params(FORMAT_A8R8G8B8) != 0xcf {
+        return TestResult::Fail("format wrong");
+    }
+    // OFFSET is byte offset >> 8 (256-byte units).
+    if offset_units(0x1_0000) != 0x100 || offset_units(0xFF) != 0 {
+        return TestResult::Fail("offset units wrong");
+    }
+    // Per-plane method stride is 4 bytes.
+    if plane_method(C57E_SET_CONTEXT_DMA_ISO, 0) != 0x240
+        || plane_method(C57E_SET_OFFSET, 1) != 0x264
+    {
+        return TestResult::Fail("plane method addressing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57e", smoke_c57e_surface_encoders);
+
+fn smoke_c57e_stage_surface() -> TestResult {
+    // The staging emits a sequence of methods into a pushbuffer; verify
+    // it builds without overflow and encodes the first method.
+    use crate::dispc57e::{stage_surface, stage_update};
+    let mut buf = alloc::vec![0u8; 256];
+    let mut pb = crate::pb::PbBuilder::new(&mut buf);
+    if stage_surface(&mut pb, 0xcafe, 0x2_0000, 1920, 1080).is_err() {
+        return TestResult::Fail("stage_surface must fit the pushbuffer");
+    }
+    if stage_update(&mut pb).is_err() {
+        return TestResult::Fail("stage_update must fit");
+    }
+    // Something was written (header + data words).
+    if pb.is_empty() {
+        return TestResult::Fail("staging must emit pushbuffer words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57e", smoke_c57e_stage_surface);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM DisplayPort link training (NV0073_CTRL_CMD_DP_*)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_dp_ctrl_link_config() -> TestResult {
+    use crate::gsp_dp::{
+        parse_dp_ctrl, set_link_config_params, CMD_SET_ENHANCED_FRAMING, CMD_SET_LANE_COUNT,
+        CMD_SET_LINK_BW, DATA_ENHANCED_FRAMING, LINK_BW_5_40GBPS,
+    };
+    // 4-lane HBR2 (5.40 Gbps) link, enhanced framing.
+    let p = set_link_config_params(0x100, 4, LINK_BW_5_40GBPS);
+    // displayId @4.
+    if u32::from_le_bytes([p[4], p[5], p[6], p[7]]) != 0x100 {
+        return TestResult::Fail("displayId wrong");
+    }
+    // cmd @8 = SET_LANE_COUNT | SET_LINK_BW | SET_ENHANCED_FRAMING.
+    let cmd = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    if cmd != (CMD_SET_LANE_COUNT | CMD_SET_LINK_BW | CMD_SET_ENHANCED_FRAMING) {
+        return TestResult::Fail("cmd wrong");
+    }
+    // data @12 = lanes(4) | bw(0x14<<8) | enhanced(1<<18).
+    let data = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+    if data != (4 | (0x14 << 8) | DATA_ENHANCED_FRAMING) {
+        return TestResult::Fail("data wrong");
+    }
+    // Reply parse: err @16, data @12.
+    let mut reply = p;
+    reply[16..20].copy_from_slice(&0u32.to_le_bytes()); // err = 0 → ok
+    match parse_dp_ctrl(&reply) {
+        Some((0, d)) if d == data => TestResult::Pass,
+        _ => TestResult::Fail("parse_dp_ctrl wrong"),
+    }
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_ctrl_link_config);
+
+fn smoke_dp_set_lane_data() -> TestResult {
+    use crate::gsp_dp::{lane_data, set_lane_data_params};
+    // 4 lanes, drive=1 preemph=2 each → code 0x6.
+    let code = lane_data(1, 2);
+    if code != ((2) | (1 << 2)) {
+        return TestResult::Fail("lane_data encode wrong");
+    }
+    let p = set_lane_data_params(0x100, &[code; 4]);
+    // numLanes @8.
+    if u32::from_le_bytes([p[8], p[9], p[10], p[11]]) != 4 {
+        return TestResult::Fail("numLanes wrong");
+    }
+    // data[0] @12, data[3] @24.
+    if u32::from_le_bytes([p[12], p[13], p[14], p[15]]) != code
+        || u32::from_le_bytes([p[24], p[25], p[26], p[27]]) != code
+    {
+        return TestResult::Fail("lane data placement wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_set_lane_data);
+
+fn smoke_dp_auxch() -> TestResult {
+    use crate::gsp_dp::{
+        aux_cmd, aux_read_params, aux_write_params, parse_aux_reply, AUX_REQ_READ, AUX_TYPE_AUX,
+    };
+    // Native-AUX read cmd = REQ_READ(1) | TYPE_AUX(1<<3) = 0x9.
+    if aux_cmd(AUX_REQ_READ, true) != (1 | AUX_TYPE_AUX) {
+        return TestResult::Fail("aux_cmd wrong");
+    }
+    // Read 1 byte at DPCD 0x0 (DPCD_REV): size field = len-1 = 0.
+    let r = aux_read_params(0x100, 0x0, 1);
+    if u32::from_le_bytes([r[12], r[13], r[14], r[15]]) != (1 | AUX_TYPE_AUX) {
+        return TestResult::Fail("read cmd wrong");
+    }
+    if u32::from_le_bytes([r[36], r[37], r[38], r[39]]) != 0 {
+        return TestResult::Fail("read size (len-1) wrong");
+    }
+    // Write 2 bytes (LINK_BW_SET, LANE_COUNT_SET) at 0x100: size = 1.
+    let w = aux_write_params(0x100, 0x100, &[0x14, 0x84]);
+    if u32::from_le_bytes([w[16], w[17], w[18], w[19]]) != 0x100 {
+        return TestResult::Fail("write addr wrong");
+    }
+    if w[20] != 0x14 || w[21] != 0x84 {
+        return TestResult::Fail("write data wrong");
+    }
+    if u32::from_le_bytes([w[36], w[37], w[38], w[39]]) != 1 {
+        return TestResult::Fail("write size (len-1) wrong");
+    }
+    // Reply parse: size=0 → 1 byte at offset 20.
+    let mut reply = r;
+    reply[20] = 0x12; // DPCD rev 1.2
+    match parse_aux_reply(&reply) {
+        Some(d) if d.len() == 1 && d[0] == 0x12 => TestResult::Pass,
+        _ => TestResult::Fail("parse_aux_reply wrong"),
+    }
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_auxch);
+
+// ────────────────────────────────────────────────────────────────
+// Turing GSP modeset plan (ordered RPC + pushbuffer sequence)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_modeset_plan() -> TestResult {
+    use crate::disp::{Mode, ModeFlags};
+    use crate::gsp_dp::LINK_BW_5_40GBPS;
+    use crate::gsp_modeset::{build_modeset_plan, ModesetInputs, Step};
+    use crate::gsp_rm_api::{FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL};
+
+    // 1920x1080@60.
+    let mode = Mode {
+        clock_khz: 148500,
+        h_display: 1920,
+        h_sync_start: 2008,
+        h_sync_end: 2052,
+        h_total: 2200,
+        v_display: 1080,
+        v_sync_start: 1084,
+        v_sync_end: 1089,
+        v_total: 1125,
+        flags: ModeFlags {
+            hsync_positive: true,
+            vsync_positive: true,
+            interlaced: false,
+            double_scan: false,
+        },
+    };
+    let lane_data = [crate::gsp_dp::lane_data(0, 0); 4];
+    let inputs = ModesetInputs {
+        h_client: 0xc1d0_0001,
+        h_internal_subdevice: 0x5d1d_0000,
+        display_id: 0x100,
+        inst_mem_phys: 0x1_0000,
+        inst_mem_size: 0x1000,
+        dp_lanes: 4,
+        dp_bw_code: LINK_BW_5_40GBPS,
+        dp_lane_data: &lane_data,
+        core_pb_phys: 0x20_0000,
+        core_pb_limit: 0xfff,
+        window_pb_phys: 0x21_0000,
+        window_pb_limit: 0xfff,
+        mode: &mode,
+        head: 0,
+        fb_handle: 0xcafe,
+        fb_offset: 0x4_0000,
+        fb_width: 1920,
+        fb_height: 1080,
+    };
+
+    let plan = match build_modeset_plan(&inputs) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("plan build failed"),
+    };
+
+    // Exactly the 9-step bring-up order.
+    if plan.len() != 9 {
+        return TestResult::Fail("expected 9 steps");
+    }
+    // First five RPCs: inst-mem(ctrl), dp-ctrl(ctrl), lane-data(ctrl),
+    // core-pb(ctrl), core-alloc(alloc).
+    let is_ctrl =
+        |s: &Step| matches!(s, Step::Rpc { function, .. } if *function == FUNCTION_GSP_RM_CONTROL);
+    let is_alloc =
+        |s: &Step| matches!(s, Step::Rpc { function, .. } if *function == FUNCTION_GSP_RM_ALLOC);
+    if !(is_ctrl(&plan[0])
+        && is_ctrl(&plan[1])
+        && is_ctrl(&plan[2])
+        && is_ctrl(&plan[3])
+        && is_alloc(&plan[4]))
+    {
+        return TestResult::Fail("core-channel RPC ordering wrong");
+    }
+    if !(is_ctrl(&plan[5]) && is_alloc(&plan[6])) {
+        return TestResult::Fail("window-channel RPC ordering wrong");
+    }
+    // Last two steps are the core then window pushbuffers.
+    match (&plan[7], &plan[8]) {
+        (
+            Step::Push {
+                class: c0,
+                head: 0,
+                pb: p0,
+            },
+            Step::Push {
+                class: c1,
+                head: 0,
+                pb: p1,
+            },
+        ) => {
+            if *c0 != gsp_chan_core() || *c1 != gsp_chan_window() {
+                return TestResult::Fail("push channel classes wrong");
+            }
+            // Core pushbuffer leads with the RASTER_SIZE method header,
+            // window with SET_SIZE — both non-empty.
+            if p0.is_empty() || p1.is_empty() {
+                return TestResult::Fail("empty pushbuffers");
+            }
+            // Core first method id = HEAD_SET_RASTER_SIZE on head 0
+            // (pb_header stores the raw method in the low 16 bits).
+            let m0 = u16::from_le_bytes([p0[0], p0[1]]);
+            if m0 != crate::dispc57d::C57D_HEAD_SET_RASTER_SIZE {
+                return TestResult::Fail("core pb first method wrong");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("final steps must be core+window pushes"),
+    }
+}
+fn gsp_chan_core() -> u32 {
+    crate::gsp_chan::DISP_CORE_CHANNEL_DMA
+}
+fn gsp_chan_window() -> u32 {
+    crate::gsp_chan::DISP_WINDOW_CHANNEL_DMA
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_modeset_plan);
+
+// ────────────────────────────────────────────────────────────────
+// RPC request/reply + modeset executor decision helpers
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_rpc_reply_matching() -> TestResult {
+    use crate::gsp::{NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER};
+    use crate::gsp_ring::is_rpc_reply;
+    use crate::gsp_rm_api::{FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL};
+    // A control reply echoes the control function id.
+    if !is_rpc_reply(FUNCTION_GSP_RM_CONTROL, FUNCTION_GSP_RM_CONTROL) {
+        return TestResult::Fail("control reply must match");
+    }
+    if !is_rpc_reply(FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_ALLOC) {
+        return TestResult::Fail("alloc reply must match");
+    }
+    // A different function is not our reply.
+    if is_rpc_reply(FUNCTION_GSP_RM_CONTROL, FUNCTION_GSP_RM_ALLOC) {
+        return TestResult::Fail("mismatched function must not match");
+    }
+    // Events (0x1000+) are never replies, even if the id coincides.
+    if is_rpc_reply(
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+    ) {
+        return TestResult::Fail("INIT_DONE is an event, not a reply");
+    }
+    if is_rpc_reply(
+        NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER,
+        NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER,
+    ) {
+        return TestResult::Fail("sequencer is an event, not a reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_rpc_reply_matching);
+
+fn smoke_rm_reply_status() -> TestResult {
+    use crate::gsp_rm_api::{
+        build_rm_alloc, build_rm_control, rm_alloc_status, rm_control_status, rm_reply_ok,
+        FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL, NV_OK,
+    };
+    // A freshly built control payload has status 0 (NV_OK).
+    let mut ctrl = build_rm_control(0xc1d0_0001, 0x0073_0000, 0x0073_0120, &[0u8; 8]);
+    if rm_control_status(&ctrl) != Some(NV_OK) {
+        return TestResult::Fail("fresh control status must be NV_OK");
+    }
+    if !rm_reply_ok(FUNCTION_GSP_RM_CONTROL, &ctrl) {
+        return TestResult::Fail("rm_reply_ok(control, ok) must be true");
+    }
+    // Simulate RM writing an error status @0x0c.
+    ctrl[0x0c..0x10].copy_from_slice(&0x55u32.to_le_bytes());
+    if rm_reply_ok(FUNCTION_GSP_RM_CONTROL, &ctrl) {
+        return TestResult::Fail("non-zero status must fail rm_reply_ok");
+    }
+    // Alloc status lives at a different offset (0x10).
+    let alloc = build_rm_alloc(0xc1d0_0001, 0xde1d_0000, 0x5d1d_0000, 0x2080, &[0u8; 4]);
+    if rm_alloc_status(&alloc) != Some(NV_OK) {
+        return TestResult::Fail("fresh alloc status must be NV_OK");
+    }
+    if !rm_reply_ok(FUNCTION_GSP_RM_ALLOC, &alloc) {
+        return TestResult::Fail("rm_reply_ok(alloc, ok) must be true");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_rm_reply_status);
+
+fn smoke_push_target() -> TestResult {
+    use crate::gsp_modeset::{push_target, PushTarget};
+    if push_target(crate::gsp_chan::DISP_CORE_CHANNEL_DMA) != PushTarget::Core {
+        return TestResult::Fail("core class must map to Core");
+    }
+    if push_target(crate::gsp_chan::DISP_WINDOW_CHANNEL_DMA) != PushTarget::Window {
+        return TestResult::Fail("window class must map to Window");
+    }
+    if push_target(0xdead) != PushTarget::Unknown {
+        return TestResult::Fail("unknown class must map to Unknown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_push_target);
