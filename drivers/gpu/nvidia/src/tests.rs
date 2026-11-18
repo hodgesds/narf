@@ -5913,3 +5913,87 @@ fn smoke_gsp_disp_edid() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_disp", smoke_gsp_disp_edid);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM display channel allocation
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_chan::{
+    alloc_channel_rpc, channel_pushbuffer_params, channel_user_offset, channeldma_alloc_params,
+    pushbuffer_rpc, ADDR_FBMEM, CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER, DISP_CORE_CHANNEL_DMA,
+    DISP_WINDOW_CHANNEL_DMA,
+};
+use crate::gsp_rm_api::{class_handle as ch2, TU102_DISP as RM_DISP};
+
+fn smoke_gsp_chan_user_offsets() -> TestResult {
+    // Core channel GET/PUT page = BAR0 0x680000 (0x10000); this is where
+    // disp::nv50 kicks PUT.
+    if channel_user_offset(DISP_CORE_CHANNEL_DMA, 0) != Some((0x68_0000, 0x1_0000)) {
+        return TestResult::Fail("core channel user offset wrong");
+    }
+    // Window channels are per-head at 0x690000 + head*0x1000.
+    if channel_user_offset(DISP_WINDOW_CHANNEL_DMA, 2) != Some((0x69_0000 + 2 * 0x1000, 0x1000)) {
+        return TestResult::Fail("window channel user offset wrong");
+    }
+    if channel_user_offset(0x1234, 0).is_some() {
+        return TestResult::Fail("unknown class must have no user offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_user_offsets);
+
+fn smoke_gsp_chan_pushbuffer_params() -> TestResult {
+    // addressSpace@0, physicalAddr@8, limit@16, hclass@28, chanInst@32, valid@36.
+    let p = channel_pushbuffer_params(
+        ADDR_FBMEM,
+        0x1_2345_6000,
+        0xFFFF,
+        DISP_CORE_CHANNEL_DMA,
+        0,
+        true,
+    );
+    let rd32 = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    if rd32(0) != ADDR_FBMEM || rd64(8) != 0x1_2345_6000 || rd64(16) != 0xFFFF {
+        return TestResult::Fail("pushbuffer addr/phys/limit mis-packed");
+    }
+    if rd32(28) != DISP_CORE_CHANNEL_DMA || rd32(32) != 0 || p[36] != 1 {
+        return TestResult::Fail("pushbuffer hclass/inst/valid mis-packed");
+    }
+    // The control targets the internal subdevice with the pushbuffer cmd.
+    let rpc = pushbuffer_rpc(
+        0xc1d0_0000,
+        0x5d1d_0000,
+        ADDR_FBMEM,
+        0x1000,
+        0xFFF,
+        0xc57d,
+        0,
+        true,
+    );
+    let r = |o: usize| u32::from_le_bytes(rpc[o..o + 4].try_into().unwrap());
+    if r(4) != 0x5d1d_0000 || r(8) != CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER {
+        return TestResult::Fail("pushbuffer RPC target/cmd wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_pushbuffer_params);
+
+fn smoke_gsp_chan_alloc() -> TestResult {
+    // Channel object = (hclass<<16)|inst, parented to the disp root.
+    let rpc = alloc_channel_rpc(0xc1d0_0000, DISP_CORE_CHANNEL_DMA, 0);
+    let rd = |o: usize| u32::from_le_bytes(rpc[o..o + 4].try_into().unwrap());
+    if rd(4) != ch2(RM_DISP, 0) {
+        return TestResult::Fail("channel parent must be the disp root");
+    }
+    if rd(8) != ch2(DISP_CORE_CHANNEL_DMA, 0) || rd(0xc) != DISP_CORE_CHANNEL_DMA {
+        return TestResult::Fail("channel object handle/class wrong");
+    }
+    // NV50VAIO params: channelInstance @0.
+    let p = channeldma_alloc_params(3);
+    if p.len() != 32 || u32::from_le_bytes(p[0..4].try_into().unwrap()) != 3 {
+        return TestResult::Fail("channeldma params wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_alloc);
