@@ -2100,7 +2100,10 @@ fn attached_session(backend: &Arc<Backend>) -> Arc<Session> {
 }
 
 fn smoke_i915_ctx_handle_open_pins_context_and_releases_on_close() -> TestResult {
-    let backend = Backend::new(device(40, MTL, 1270));
+    // Card 29: smoke_oa_oactxcontrol_pinned_image_lifecycle already registers
+    // uuid(1) on card 40, so this test collided there with EADDRINUSE at :398
+    // (issue #2237; card census: tip uses 35-63, open PRs claim 30-34).
+    let backend = Backend::new(device(29, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let model = PinModel::new();
