@@ -437,6 +437,62 @@ kernel_test_in!(
     smoke_mtl_tc_aux_power_well_request_and_busy_refusal
 );
 
+fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
+    struct LtAux {
+        phy: FakePhy,
+        stuck: bool,
+    }
+    impl LtAux {
+        fn new(stuck: bool) -> Self {
+            Self {
+                phy: FakePhy::new(XeLpgPort::Tc1),
+                stuck,
+            }
+        }
+    }
+    impl MmioWindow for LtAux {
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            let value = self.phy.read32(off);
+            if off != XeLpgPort::Tc1.aux_ctl() || self.stuck {
+                return value;
+            }
+            if value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0 {
+                value | XELPDP_AUX_CH_CTL_POWER_STATUS
+            } else {
+                value & !XELPDP_AUX_CH_CTL_POWER_STATUS
+            }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.phy.write32(off, value);
+        }
+    }
+
+    let io = LtAux::new(false);
+    if aux_power_enable(&io, XeLpgPort::Tc1).is_err()
+        || aux_power_requested(&io, XeLpgPort::Tc1) != Ok(true)
+        || aux_power_disable(&io, XeLpgPort::Tc1).is_err()
+        || aux_power_requested(&io, XeLpgPort::Tc1) != Ok(false)
+    {
+        return TestResult::Fail("LT AUX status handshake must complete both transitions");
+    }
+    if io.phy.writes_to(XeLpgPort::Tc1.aux_ctl()) != [XELPDP_AUX_CH_CTL_POWER_REQUEST, 0] {
+        return TestResult::Fail("LT AUX owner must write only request then release");
+    }
+
+    let stuck = LtAux::new(true);
+    if aux_power_enable(&stuck, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout) {
+        return TestResult::Fail("LT AUX power-up without status must time out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_tc",
+    smoke_nvl_lt_aux_power_waits_for_status
+);
+
 fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
     use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL};
 

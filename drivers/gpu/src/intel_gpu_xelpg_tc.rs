@@ -27,7 +27,8 @@
 //!   every MTL AUX well (A, B, TC1–TC4) is the
 //!   `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` bit; without an LT PHY the status
 //!   bit is not a completion signal and the source waits a fixed 600 µs
-//!   after the request (10 µs after release).
+//!   after the request (10 µs after release). Exact Nova/LT windows instead
+//!   wait up to 2 ms for `POWER_STATUS` set and 1 ms for it to clear.
 //!
 //! ## Qualified profile and refusals
 //!
@@ -42,7 +43,9 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use crate::intel_gpu_aux::{MmioWindow, AUX_CTL_SEND_BUSY, XELPDP_AUX_CH_CTL_POWER_REQUEST};
+use crate::intel_gpu_aux::{
+    MmioWindow, AUX_CTL_SEND_BUSY, XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS,
+};
 use crate::intel_gpu_xelpg::{XeLpgPort, TCSS_POWER_REQUEST, TCSS_POWER_STATE, TC_PHY_OWNERSHIP};
 use crate::intel_gpu_xelpg_hpd::{
     pica_dp_alt_hotplug, pica_tbt_hotplug, sde_tc_hotplug, PICA_ISR, SDE_ISR,
@@ -148,6 +151,8 @@ pub enum TcError {
     },
     /// A foreign AUX transaction is in flight on this port.
     AuxBusy,
+    /// An LT-PHY AUX power-status transition missed its source timeout.
+    AuxPowerTimeout,
 }
 
 /// A connected (display-owned) Type-C PHY.
@@ -589,10 +594,11 @@ pub fn connection_intact<M: MmioWindow + ?Sized>(
         && tcss_power_enabled(io, conn.port)?)
 }
 
-/// `xelpdp_aux_power_well_enable` (no LT PHY): raise
-/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` and wait the fixed 600 µs. A
-/// foreign in-flight transaction (SEND_BUSY) is refused rather than
-/// re-triggered by the read-modify-write.
+/// `xelpdp_aux_power_well_enable`: raise
+/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST`. C10/C20 waits the fixed 600 µs;
+/// exact LT-PHY windows poll `POWER_STATUS` for up to 2 ms. A foreign
+/// in-flight transaction (SEND_BUSY) is refused rather than re-triggered by
+/// the read-modify-write.
 pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Result<(), TcError> {
     let cur = read_checked(io, port.aux_ctl())?;
     if cur & AUX_CTL_SEND_BUSY != 0 {
@@ -600,7 +606,16 @@ pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Resu
     }
     io.write32(port.aux_ctl(), cur | XELPDP_AUX_CH_CTL_POWER_REQUEST);
     compiler_fence(Ordering::SeqCst);
-    delay_ns(AUX_POWER_UP_NS);
+    if io.has_lt_phy() {
+        let ready = poll_until(io, 2_000_000, || {
+            Ok(read_checked(io, port.aux_ctl())? & XELPDP_AUX_CH_CTL_POWER_STATUS != 0)
+        })?;
+        if !ready {
+            return Err(TcError::AuxPowerTimeout);
+        }
+    } else {
+        delay_ns(AUX_POWER_UP_NS);
+    }
     if io.display_access_ok() {
         Ok(())
     } else {
@@ -608,8 +623,8 @@ pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Resu
     }
 }
 
-/// `xelpdp_aux_power_well_disable` (no LT PHY): drop the request, wait
-/// 10 µs.
+/// `xelpdp_aux_power_well_disable`: drop the request. C10/C20 waits 10 µs;
+/// exact LT-PHY windows poll `POWER_STATUS` clear for up to 1 ms.
 pub fn aux_power_disable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Result<(), TcError> {
     let cur = read_checked(io, port.aux_ctl())?;
     if cur & AUX_CTL_SEND_BUSY != 0 {
@@ -617,7 +632,16 @@ pub fn aux_power_disable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Res
     }
     io.write32(port.aux_ctl(), cur & !XELPDP_AUX_CH_CTL_POWER_REQUEST);
     compiler_fence(Ordering::SeqCst);
-    delay_ns(AUX_POWER_DOWN_NS);
+    if io.has_lt_phy() {
+        let down = poll_until(io, 1_000_000, || {
+            Ok(read_checked(io, port.aux_ctl())? & XELPDP_AUX_CH_CTL_POWER_STATUS == 0)
+        })?;
+        if !down {
+            return Err(TcError::AuxPowerTimeout);
+        }
+    } else {
+        delay_ns(AUX_POWER_DOWN_NS);
+    }
     if io.display_access_ok() {
         Ok(())
     } else {

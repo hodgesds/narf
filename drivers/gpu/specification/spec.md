@@ -458,6 +458,11 @@ lease and requires a VBT-qualified GMBUS/DDC route. Invalid port/connector
 roles and external use of Pipe A are
 typed refusals before MMIO. The plan grants no `DisplayIp`, and
 therefore does not enable Nova modesetting or claim hardware USB-C operation.
+`intel_gpu_xelpg_tc::{aux_power_enable,aux_power_disable}` selects the LT
+request/status handshake only when the exact MMIO owner reports
+`has_lt_phy()`: 2 ms for status set and 1 ms for status clear, with typed busy,
+access-loss and timeout failures. Non-LT C10/C20 owners retain the 600-us/10-us
+fixed delays. No production Nova caller is installed by this helper.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be

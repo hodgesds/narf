@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.06** (v1.06 adds a pure Nova Lake output-resource plan for
+> Status: **v1.07** (v1.07 adds Nova Lake's exact LT AUX power-status waits
+> without changing C10/C20 fixed-delay behavior; v1.06 adds a pure Nova Lake output-resource plan for
 > eDP A, combo-B DP/HDMI and TC1/TC2 USB-C DP-alt without enabling MMIO;
 > v1.05 pins Display-35 core power/PLL/readout boundaries
 > and its Pipe-A/B primary 17^3 LUT capability; v1.04 adds Nova Lake's disconnected HDMI TMDS LT-PHY
@@ -399,6 +400,13 @@ retain PICA_TC and the TCSS PHY index. Crossed port/connector roles and an
 external Pipe A refuse before MMIO. These plans are crate-private and
 disconnected: they neither create an operational `DisplayIp` nor claim that
 Nova USB-C DP works on hardware.
+The shared Xe-LPDP AUX power owner branches only on the exact
+`MmioWindow::has_lt_phy()` platform fact. Nova LT windows raise the same
+per-channel request bit but require `POWER_STATUS` within 2 ms and require it
+to clear within 1 ms on release; timeout, lost access and an in-flight AUX
+transaction are distinct typed failures. C10/C20 windows retain their existing
+600-us enable and 10-us disable delays. This qualifies the AUX prerequisite
+but does not connect the Nova resource plan to a production route.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.
