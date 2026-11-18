@@ -115,10 +115,13 @@ static ENGINE: IrqSafeSpinLock<alloc::vec::Vec<EngineState>> =
 /// private data, updated by `ledtrig_audio_mute()` from
 /// `sound/core/control_led.c` whenever the Master Playback Switch
 /// changes. NARF keeps the same single bit here: the mixer feed
-/// (`drivers/sound/src/mixer.rs::set`) writes it, the engine reads
-/// it. Default `false` (unmuted) matches the mixer's initial
-/// Master Playback Switch value (`ControlValue::boolean(true)` =
-/// unmute) at `register_standard_realtek` time.
+/// (`drivers/sound/src/mixer.rs::set`) writes it, as do the USB UAC
+/// card (`drivers/usb/src/uac_card.rs`) and virtio-snd
+/// (`drivers/virtio/src/snd_pci/sound_card.rs`) from their own mute
+/// writes, and the engine reads it. Default `false` (unmuted)
+/// matches the mixer's initial Master Playback Switch value
+/// (`ControlValue::boolean(true)` = unmute) at
+/// `register_standard_realtek` time.
 static AUDIO_MUTED: AtomicBool = AtomicBool::new(false);
 
 /// Report a mixer mute change into the audio-mute trigger.

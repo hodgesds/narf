@@ -539,9 +539,12 @@ pub fn get(controller_index: usize, id: ControlId) -> Result<ControlValue, Mixer
 ///
 /// Only the mixer surface feeds the trigger: the USB UAC card
 /// (`drivers/usb/src/uac_card.rs`) and virtio-snd
-/// (`drivers/virtio/src/snd_pci.rs`) keep independent mute stores
-/// and do not route through `set`, so a mute on those cards does
-/// not light the LED yet — follow-up, not this change.
+/// (`drivers/virtio/src/snd_pci/sound_card.rs`) report their own
+/// mute writes into `set_audio_muted` from their `set_control`
+/// paths — the UAC Feature Unit mute bit and the virtio-snd mute
+/// element both carry `true` = muted, the opposite polarity from
+/// the ALSA switch negated here — so a mute on those cards lights
+/// the LED too.
 pub fn set(controller_index: usize, id: ControlId, value: ControlValue) -> Result<(), MixerError> {
     let mx = MIXER_REGISTRY.lock();
     let card = mx

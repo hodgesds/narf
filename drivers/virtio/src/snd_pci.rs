@@ -45,6 +45,10 @@ use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
 };
+/// Re-exported for the kernel tests: the mute-report helper lives
+/// with `Card::set_control` in `sound_card`, and the tests pin its
+/// polarity from here.
+pub(crate) use sound_card::report_mute_write;
 
 // ── Spec constants (VirtIO 1.2 §5.14.6) ─────────────────────────────
 

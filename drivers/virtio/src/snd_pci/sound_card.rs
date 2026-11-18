@@ -282,7 +282,27 @@ impl PcmDevice for Card {
         let _gate = ReqGate::acquire(&self.0.req_gate);
         self.0
             .ctl_write_value(elem.id, &raw)
-            .map_err(|_| SoundError::BadState)
+            .map_err(|_| SoundError::BadState)?;
+        // Only a write the device accepted reports into the trigger:
+        // a rejected CTL_WRITE leaves the LED on the old state.
+        report_mute_write(id, value);
+        Ok(())
+    }
+}
+
+/// Report a successful output-mute write into the LED trigger engine.
+///
+/// A virtio-snd mute element carries the mute bit itself (1.4
+/// §5.14.6.10): a `BOOLEAN` value of `true` means muted — the same
+/// convention as the UAC Feature Unit mute bit and the HDA amplifier
+/// mute bit, and the opposite polarity from the ALSA Master Playback
+/// Switch, where `true` means unmute. Linux passes the element value
+/// through verbatim (`sound/virtio/virtio_kctl.c::virtsnd_kctl_put`),
+/// so no inversion happens on either side of the wire. Non-mute
+/// kinds and non-boolean values report nothing.
+pub(crate) fn report_mute_write(id: ControlId, value: ControlValue) {
+    if let (ControlKind::MasterMute, ControlValue::Boolean(muted)) = (id.kind, value) {
+        narf_drivers_leds::triggers::set_audio_muted(muted);
     }
 }
 

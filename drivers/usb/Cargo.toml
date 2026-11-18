@@ -36,6 +36,7 @@ narf-firmware     = { path = "../../firmware" }
 narf-drivers-video = { path = "../video" }
 narf-drivers-fingerprint = { path = "../fingerprint" }
 narf-drivers-sound = { path = "../sound" }
+narf-drivers-leds = { path = "../leds" }
 narf-power        = { path = "../../power" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }

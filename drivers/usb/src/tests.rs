@@ -9450,6 +9450,205 @@ fn smoke_uac_card_publication() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_card_publication);
 
+/// Fake control-transfer transport for UAC fixture cards: records
+/// the last Feature Unit SET_CUR payload per control selector and
+/// answers GET_CUR from it, so a fixture card's `set_control` can
+/// complete with no xHCI controller present. `fail` makes every
+/// transfer fail, proving a rejected device write leaves the mute
+/// state (and the LED trigger) untouched.
+#[derive(Debug)]
+struct FakeControlTransport {
+    mute: narf_lib::sync::IrqSafeSpinLock<u8>,
+    volume: narf_lib::sync::IrqSafeSpinLock<[u8; 2]>,
+    fail: core::sync::atomic::AtomicBool,
+}
+
+impl FakeControlTransport {
+    fn new() -> Self {
+        Self {
+            mute: narf_lib::sync::IrqSafeSpinLock::new(0),
+            volume: narf_lib::sync::IrqSafeSpinLock::new([0, 0]),
+            fail: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl crate::uac_card::ControlTransport for FakeControlTransport {
+    fn control_out(
+        &self,
+        _rt: u8,
+        _req: u8,
+        value: u16,
+        _index: u16,
+        data: &[u8],
+    ) -> Result<(), narf_drivers_sound::SoundError> {
+        if self.fail.load(core::sync::atomic::Ordering::SeqCst) {
+            return Err(narf_drivers_sound::SoundError::BadState);
+        }
+        match (value >> 8) as u8 {
+            crate::uac::FU_CS_MUTE => {
+                if let Some(b) = data.first() {
+                    *self.mute.lock() = *b;
+                }
+            }
+            crate::uac::FU_CS_VOLUME => {
+                if data.len() >= 2 {
+                    *self.volume.lock() = [data[0], data[1]];
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn control_in(
+        &self,
+        _rt: u8,
+        _req: u8,
+        value: u16,
+        _index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, narf_drivers_sound::SoundError> {
+        if self.fail.load(core::sync::atomic::Ordering::SeqCst) {
+            return Err(narf_drivers_sound::SoundError::BadState);
+        }
+        match (value >> 8) as u8 {
+            crate::uac::FU_CS_MUTE => {
+                if out.is_empty() {
+                    return Ok(0);
+                }
+                out[0] = *self.mute.lock();
+                Ok(1)
+            }
+            crate::uac::FU_CS_VOLUME => {
+                let n = out.len().min(2);
+                let v = *self.volume.lock();
+                out[..n].copy_from_slice(&v[..n]);
+                Ok(n)
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
+// ── #2226: UAC MasterMute write feeds the audio-mute trigger ──────
+//
+// The mixer-path test (#1716) proves `mixer::set` reports; this one
+// proves the USB UAC card's own `set_control` does, through the real
+// `Mixer` handle and a fake control transport standing in for the
+// xHCI controller. Polarity is the UAC mute bit: `Boolean(true)` =
+// muted (the opposite of the ALSA Master Playback Switch).
+fn smoke_uac_card_master_mute_drives_audio_trigger() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    use narf_drivers_leds::triggers as led_triggers;
+    use narf_drivers_sound::mixer::{ControlKind, ControlValue};
+
+    led_triggers::__reset_for_test();
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(7, &topo, &choices, &BindOutcome::default());
+    let transport = alloc::sync::Arc::new(FakeControlTransport::new());
+    state.__set_control_transport_for_test(transport.clone());
+    let idx = match crate::uac_card::register_card(&state) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("register_card"),
+    };
+    let mx = match narf_drivers_sound::mixer(idx) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("mixer(idx)"),
+    };
+    let ids = mx.list_controls();
+    let Some(mute) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterMute))
+        .copied()
+    else {
+        return TestResult::Fail("master mute not listed");
+    };
+    // Starts unmuted.
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("audio-mute trigger must start unmuted");
+    }
+    // Mute (`Boolean(true)` = muted on the UAC mute bit) → the
+    // trigger reports muted, and the device saw the SET_CUR byte 1.
+    if mx
+        .set_control_value(mute, ControlValue::boolean(true))
+        .is_err()
+    {
+        return TestResult::Fail("mute write failed");
+    }
+    if *transport.mute.lock() != 1 {
+        return TestResult::Fail("mute SET_CUR did not carry 1");
+    }
+    if !led_triggers::audio_muted() {
+        return TestResult::Fail("muting the UAC card must report audio muted");
+    }
+    match mx.get_control_value(mute) {
+        Ok(ControlValue::Boolean(true)) => {}
+        _ => return TestResult::Fail("mute not reflected in read-back"),
+    }
+    // Unmute → the trigger clears, and the device saw byte 0.
+    if mx
+        .set_control_value(mute, ControlValue::boolean(false))
+        .is_err()
+    {
+        return TestResult::Fail("unmute write failed");
+    }
+    if *transport.mute.lock() != 0 {
+        return TestResult::Fail("unmute SET_CUR did not carry 0");
+    }
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("unmuting the UAC card must clear audio muted");
+    }
+    // A volume write must not touch the mute state.
+    let Some(master) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
+        .copied()
+    else {
+        return TestResult::Fail("master volume not listed");
+    };
+    if mx
+        .set_control_value(master, ControlValue::integer(10, 10))
+        .is_err()
+    {
+        return TestResult::Fail("volume write failed");
+    }
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("volume write must not change audio muted");
+    }
+    // A failed device write must not light the LED: the transport
+    // rejects, the write errors, and the trigger stays unmuted.
+    transport
+        .fail
+        .store(true, core::sync::atomic::Ordering::SeqCst);
+    if mx
+        .set_control_value(mute, ControlValue::boolean(true))
+        .is_ok()
+    {
+        return TestResult::Fail("failing transport must fail the mute write");
+    }
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("failed mute write must not report audio muted");
+    }
+    match mx.get_control_value(mute) {
+        Ok(ControlValue::Boolean(false)) => {}
+        _ => return TestResult::Fail("failed mute must leave the stored state unmuted"),
+    }
+    state.detach();
+    led_triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_card_master_mute_drives_audio_trigger
+);
+
 #[derive(Clone)]
 struct FakeIsoState {
     out_log: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>>,
