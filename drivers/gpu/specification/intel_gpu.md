@@ -517,8 +517,10 @@ disconnected from the production DC service.
 
 Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
-MOCS table, display/media 35.00, and `xe/nvl_guc_70.bin` exactly at 70.55.4 or
-newer. `GtPlatform::NovaLakeS` retains that firmware identity and admits the
+MOCS table and display/media 35.00. Firmware packages supply
+`xe/nvl_guc_70.bin`. If that name is absent, the loader tries
+`xe/nvl_guc_70.55.4.bin` from Linux 7.0-rc7's `xe_uc_fw.c`. Both images
+must meet the 70.55.4 minimum. `GtPlatform::NovaLakeS` admits the
 source graphics-GMD set 30.03/30.04/30.05 plus media 35.00 on the driver-FLR
 headless route. It never enters the display-30 route; its distinct read-only
 display option proves 35.00 without selecting the disconnected LT transport.

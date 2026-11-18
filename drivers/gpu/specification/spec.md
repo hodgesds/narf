@@ -2053,8 +2053,10 @@ product identity in the canonical census and its GT policy in the distinct
 30.03/30.04/30.05 and media 30.02. WCL skips the media-30.00-only GGTT dummy
 write and PTL graphics-30.00 A0 workarounds; display 30.02 still refuses before
 takeover.
-NVL-S has a distinct `GtPlatform::NovaLakeS`, `xe/nvl_guc_70.bin` >=70.55.4,
-DMA46/root4/VA48 and source Xe2 cache policy. Its live identity admits only
+NVL-S has a distinct `GtPlatform::NovaLakeS`, DMA46/root4/VA48 and source
+Xe2 cache policy. It requests `xe/nvl_guc_70.bin` first. A missing registry
+entry triggers lookup of Linux 7.0-rc7's `xe/nvl_guc_70.55.4.bin`.
+Both names require GuC 70.55.4 or newer. Its live identity admits only
 graphics 30.03/30.04/30.05 and media 35.00; display 35.00 remains on the
 headless driver-FLR route and is never treated as PTL display 30.00.
 The exact CRI 674C PCI-device ID is registered separately and announced, but
@@ -3487,7 +3489,7 @@ but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
 media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
 has an exact, separately opted-in production probe/KMS/hotplug route.
 NVL-S accepts only PCI d740-d745, graphics 30.03/30.04/30.05, media 35.00 and
-`xe/nvl_guc_70.bin` 70.55.4+. Its display 35.00 identity has post-FLR refusal
+Nova Lake-S GuC firmware 70.55.4+. Its display 35.00 identity has post-FLR refusal
 proofs and a separately opted-in read-only route decision; it has no
 display-preserving route.
 These integrated profiles use DMA46, default 2 MiB WOPCM and source-selected
