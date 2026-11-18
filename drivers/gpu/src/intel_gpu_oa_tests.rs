@@ -251,6 +251,7 @@ struct Backend {
     device: Device,
     hw: Arc<Hw>,
     unit: IrqSafeSpinLock<Option<Unit<Allocator>>>,
+    configs: IrqSafeSpinLock<Vec<Arc<Config>>>,
     jobs: IrqSafeSpinLock<Vec<Vec<u32>>>,
     now: AtomicU64,
 }
@@ -277,6 +278,7 @@ impl Backend {
             device,
             hw,
             unit: IrqSafeSpinLock::new(Some(unit)),
+            configs: IrqSafeSpinLock::new(Vec::new()),
             jobs: IrqSafeSpinLock::new(Vec::new()),
             now: AtomicU64::new(0),
         })
@@ -297,6 +299,27 @@ impl Backend {
                 Window(self.hw.clone()).write32(u64::from(pair[0]), pair[1]);
             }
             at += 1 + 2 * n;
+        }
+    }
+}
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let card = self.device.card;
+        let configs = self.configs.lock();
+        if configs.is_empty() {
+            return;
+        }
+        let mut registry = REGISTRY[card as usize].lock();
+        for config in configs.iter() {
+            // REMOVE_CONFIG can recycle an ID while an older stream retains
+            // its configuration. Remove only entries this fixture published.
+            if registry
+                .configs
+                .get(&config.id)
+                .is_some_and(|c| Arc::ptr_eq(c, config))
+            {
+                registry.remove(card, config.id).unwrap();
+            }
         }
     }
 }
@@ -395,7 +418,10 @@ fn config_wire(wire: &Wire, at: u64, uuid: [u8; 36], regs: &[(u32, u32)]) -> u64
 }
 fn add(backend: &Backend, wire: &Wire, n: u8, regs: &[(u32, u32)]) -> u64 {
     let at = config_wire(wire, 0x10000, uuid(n), regs);
-    add_config(Some(backend), at, wire, ALLOW).unwrap()
+    let id = add_config(Some(backend), at, wire, ALLOW).unwrap();
+    let config = lookup(backend.device.card, id).unwrap();
+    backend.configs.lock().push(config);
+    id
 }
 const A24U40: u64 = 5 << 8;
 const OAC192: u64 = 3 | 2 << 8;
@@ -3268,7 +3294,10 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     mtl.media_timestamp = Some(19_200_000);
     assert!(mtl.has_oam());
 
+    // The logical card shares its configuration namespace and stream permits.
+    // Each synthetic GT has its own register window, buffer, and stream owner.
     let backend = Backend::new(mtl);
+    let graphics = Backend::new(mtl);
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
 
@@ -3344,7 +3373,7 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     ];
     let at_oag = wire.chain(0x1200, &oag_props);
     let fd_oag = ready(open(
-        Some(backend.clone()),
+        Some(graphics.clone()),
         at_oag,
         &wire,
         &queues,
@@ -3354,6 +3383,8 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     .unwrap();
     assert_eq!(fd_oag, 41);
     let oag_file = wire.file();
+    assert_eq!(session_of(&graphics).oa_unit(), 0);
+    assert!(Arc::ptr_eq(&session_of(&backend), &oam_session));
 
     // Both units active on card 54:
     assert!(ACTIVE[54][0].load(Ordering::Acquire));
@@ -3363,7 +3394,7 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     let at_oag_busy = wire.chain(0x1300, &oag_props);
     assert_eq!(
         ready(open(
-            Some(backend.clone()),
+            Some(graphics.clone()),
             at_oag_busy,
             &wire,
             &queues,
@@ -3506,6 +3537,7 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     );
 
     backend.poll(1);
+    graphics.poll(1);
     TestResult::Pass
 }
 kernel_test_in!(
