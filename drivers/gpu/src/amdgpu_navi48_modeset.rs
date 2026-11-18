@@ -5183,20 +5183,27 @@ impl ColdBoot {
         let old: Vec<_> = running.iter().map(|m| m.plan).collect();
         for k in det_update_order(&old, &plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
-            unsafe { self.update_live_display_plan(running[k].pipe, &plans[k], true) }.await?;
+            crate::out_of_line::boxed!(unsafe {
+                self.update_live_display_plan(running[k].pipe, &plans[k], true)
+            })
+            .await?;
         }
         self.disable_display_fams2().await?;
         // Exact watermarks precede the acknowledged firmware configuration
         // and clock relaxation. Hardware-only methods leave FAMS2 disabled.
         for (m, plan) in running.iter_mut().zip(&plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
-            let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
+            let d = crate::out_of_line::boxed!(unsafe {
+                self.update_live_display_plan(m.pipe, plan, false)
+            })
+            .await?;
             m.plan = d.plan;
             m.scanout.plan = d.plan;
             self.modesets.retain(m.clone());
         }
         if let Some(phantom) = &s.phantom {
-            let hw = self.stage_display_subvp(running[0].pipe, phantom).await?;
+            let hw = crate::out_of_line::boxed!(self.stage_display_subvp(running[0].pipe, phantom))
+                .await?;
             configs[0].as_mut().ok_or(otg::Error::Invalid)?.phantom = Some(hw);
         }
         if s.fams2_required {

@@ -20,7 +20,7 @@ use crate::intel_gpu_nonpriv::EnginePolicy;
 use crate::intel_gpu_rcs::GpuBacking;
 use crate::intel_gpu_slpc::SlpcState;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
@@ -107,7 +107,9 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
 /// Drop only reclaims an unpublished or fully stopped owner. Every uncertain
 /// state retains the allocator, firmware, CT and MMIO windows together.
 pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
-    parts: ManuallyDrop<Parts<M, A>>,
+    // The staged owner crosses several fallible returns before publication.
+    // Keep its firmware, transport and scheduler storage at one heap address.
+    parts: Box<ManuallyDrop<Parts<M, A>>>,
     state: GtState,
     deadline: u64,
     requested: bool,
@@ -290,7 +292,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     pub(crate) fn from_staged(boot: GuCBoot<M, A>) -> Self {
         assert_eq!(boot.state(), BootState::Staged);
         Self {
-            parts: ManuallyDrop::new(Parts {
+            parts: Box::new(ManuallyDrop::new(Parts {
                 boot,
                 ct: None,
                 discovery_mailbox: None,
@@ -300,7 +302,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 oa: None,
                 mert: None,
                 capture: None,
-            }),
+            })),
             state: GtState::Staged,
             deadline: 0,
             requested: false,
@@ -742,7 +744,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             self.log_stream = Some(actor);
             return Ok(());
         }
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let window = parts.boot.window();
         let ack = parts
             .boot
@@ -841,7 +843,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.admit_scheduling()
             .map_err(|_| narf_filesystem::FsError::NoDevice)?;
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         let collector = parts
             .eu_stall
@@ -866,7 +868,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             return;
         }
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         if let Some(collector) = parts.eu_stall.as_mut() {
             let window = parts.boot.window();
@@ -1026,7 +1028,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     ) -> Result<alloc::vec::Vec<crate::intel_gpu_oa::Job>, narf_filesystem::FsError> {
         self.oa_unit(&mut access, false)?;
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         let window = parts.boot.window();
         let unit = parts.oa.as_mut().expect("checked OA unit");
@@ -1104,7 +1106,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     ) -> Result<(), narf_filesystem::FsError> {
         self.oa_unit(&mut access, false)?;
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         let window = parts.boot.window();
         let unit = parts.oa.as_mut().expect("checked OA unit");
@@ -1122,7 +1124,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     ) -> Result<usize, narf_filesystem::FsError> {
         self.oa_unit(&mut access, true)?;
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         let window = parts.boot.window();
         let unit = parts.oa.as_mut().expect("checked OA unit");
@@ -1142,7 +1144,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             return;
         }
         let hardware = self.hardware.as_ref();
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let platform = parts.boot.platform();
         if let Some(unit) = parts.oa.as_mut() {
             let window = parts.boot.window();
@@ -1778,7 +1780,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
         self.admit_scheduling()?;
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         parts
             .scheduler
             .as_mut()
@@ -1835,7 +1837,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             let limits = self.slpc_status().ok_or(GtError::State)?.limits;
             self.parts.mert = Some(mert::Mert::new(limits, epoch, now).map_err(map)?);
         }
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         let owner = parts.mert.as_mut().expect("MERT owner");
         match owner.prepare(parts.boot.window(), now, epoch, &mut current) {
             Poll::Pending => return Ok(false),
@@ -2384,7 +2386,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 }
                 self.awake()?;
                 self.registers = None;
-                let parts = &mut *self.parts;
+                let parts = &mut **self.parts;
                 let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
                 scheduler
                     .enable_engine(parts.boot.window())
@@ -2537,7 +2539,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 return Poll::Pending;
             }
             GtState::StoppingMert => {
-                let parts = &mut *self.parts;
+                let parts = &mut **self.parts;
                 let mert = parts.mert.as_mut().expect("stopping host-L2 owner");
                 match mert.finish_stopped(parts.boot.window(), now, &mut *current) {
                     Poll::Pending => return Poll::Pending,
@@ -2621,7 +2623,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Stopping => {
                 if self.parts.boot.state() != BootState::Stopping {
                     let hardware = self.hardware.as_ref();
-                    let parts = &mut *self.parts;
+                    let parts = &mut **self.parts;
                     let platform = parts.boot.platform();
                     if let Some(collector) = parts.eu_stall.as_mut() {
                         let window = parts.boot.window();
@@ -2656,7 +2658,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             GtState::Ready | GtState::CtReady => {}
             GtState::SchedulingReady => {
-                let parts = &mut *self.parts;
+                let parts = &mut **self.parts;
                 let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
                 let ct = parts.ct.as_mut().expect("owned CT");
                 scheduler.poll(ct, now).map_err(GtError::Scheduling)?;
@@ -2988,7 +2990,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if !core::mem::take(&mut self.media_power) {
             return;
         }
-        let parts = &mut *self.parts;
+        let parts = &mut **self.parts;
         if let (Some(scheduler), Some(ct)) = (parts.scheduler.as_mut(), parts.ct.as_mut()) {
             scheduler.release_gucrc(ct);
         }

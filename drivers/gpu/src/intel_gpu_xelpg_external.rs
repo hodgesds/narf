@@ -900,8 +900,8 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     let caps = DpcdCaps::decode(&raw);
     let max_downspread = raw[DP_MAX_DOWNSPREAD];
     let mut edid = alloc::boxed::Box::new([0u8; EDID_CAPACITY]);
-    let edid_len =
-        read_full_edid(&mut aux, edid.as_mut_slice()).map_err(|e| rollback(ExternalError::Edid(e)))?;
+    let edid_len = read_full_edid(&mut aux, edid.as_mut_slice())
+        .map_err(|e| rollback(ExternalError::Edid(e)))?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len]).map_err(|e| {
         rollback(match e {
             crate::intel_gpu_dp::DpError::Edid(e) => ExternalError::Edid(e),
