@@ -185,3 +185,53 @@ pub fn alloc_disp_rpc(h_client: u32) -> Vec<u8> {
         &[],
     )
 }
+
+// ── RM reply parsing ─────────────────────────────────────────────
+//
+// A GSP_RM_ALLOC / GSP_RM_CONTROL reply comes back in the same header
+// layout, with `status` filled by RM and the `params[]` updated in
+// place (output fields written). `status == 0` (NV_OK) means success.
+
+/// Byte offset of `status` in a `GSP_RM_CONTROL` reply header.
+pub const RM_CONTROL_STATUS_OFFSET: usize = 0x0c;
+/// Byte offset of `status` in a `GSP_RM_ALLOC` reply header.
+pub const RM_ALLOC_STATUS_OFFSET: usize = 0x10;
+/// `NV_OK`.
+pub const NV_OK: u32 = 0;
+
+fn rd32(b: &[u8], o: usize) -> Option<u32> {
+    b.get(o..o + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// RM status from a `GSP_RM_CONTROL` reply (`NV_OK` on success).
+pub fn rm_control_status(reply: &[u8]) -> Option<u32> {
+    rd32(reply, RM_CONTROL_STATUS_OFFSET)
+}
+
+/// RM status from a `GSP_RM_ALLOC` reply.
+pub fn rm_alloc_status(reply: &[u8]) -> Option<u32> {
+    rd32(reply, RM_ALLOC_STATUS_OFFSET)
+}
+
+/// The params payload of a `GSP_RM_CONTROL` reply (after the header).
+pub fn rm_control_params(reply: &[u8]) -> Option<&[u8]> {
+    reply.get(RM_CONTROL_HDR_SIZE..)
+}
+
+/// The params payload of a `GSP_RM_ALLOC` reply (after the header).
+pub fn rm_alloc_params(reply: &[u8]) -> Option<&[u8]> {
+    reply.get(RM_ALLOC_HDR_SIZE..)
+}
+
+/// Is `reply` a successful reply to an RPC sent with `function`
+/// (ALLOC or CONTROL)? Checks the status field at the function's
+/// header offset is `NV_OK`.
+pub fn rm_reply_ok(function: u32, reply: &[u8]) -> bool {
+    let status = match function {
+        FUNCTION_GSP_RM_ALLOC => rm_alloc_status(reply),
+        FUNCTION_GSP_RM_CONTROL => rm_control_status(reply),
+        _ => return true, // non-RM RPCs carry no RM status
+    };
+    status == Some(NV_OK)
+}

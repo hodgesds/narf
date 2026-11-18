@@ -214,3 +214,107 @@ pub fn build_modeset_plan(inputs: &ModesetInputs) -> Result<Vec<Step>, PbError> 
 
     Ok(steps)
 }
+
+// ── Plan execution (hardware) ────────────────────────────────────
+
+use narf_driver_runtime::MmioRegion;
+use narf_io::DmaBuffer;
+
+use crate::gsp_ring::{GspRings, RingError};
+use crate::gsp_rm_api::rm_reply_ok;
+
+/// Which channel a [`Step::Push`] targets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PushTarget {
+    Core,
+    Window,
+    Unknown,
+}
+
+/// Classify a push step's channel class.
+pub const fn push_target(class: u32) -> PushTarget {
+    match class {
+        gsp_chan::DISP_CORE_CHANNEL_DMA => PushTarget::Core,
+        gsp_chan::DISP_WINDOW_CHANNEL_DMA => PushTarget::Window,
+        _ => PushTarget::Unknown,
+    }
+}
+
+/// Error from executing a modeset plan.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ModesetError {
+    /// An RPC step failed on the ring (send/receive/timeout).
+    Ring(RingError),
+    /// An RM reply returned a non-`NV_OK` status for the given step.
+    RmStatus(usize),
+    /// A push step named a channel with no registered pushbuffer.
+    UnknownChannel,
+    /// A staged pushbuffer is larger than its channel buffer.
+    PushTooLarge,
+}
+
+impl From<RingError> for ModesetError {
+    fn from(e: RingError) -> Self {
+        ModesetError::Ring(e)
+    }
+}
+
+/// The hardware resources a plan executes against: the live rings, and
+/// for each display channel its user-MMIO window + the DMA pushbuffer
+/// registered with GSP ([`gsp_chan::pushbuffer_rpc`]).
+pub struct ModesetChannels<'a> {
+    pub core_mmio: &'a MmioRegion,
+    pub core_pb: &'a mut DmaBuffer,
+    pub window_mmio: &'a MmioRegion,
+    pub window_pb: &'a mut DmaBuffer,
+}
+
+impl core::fmt::Debug for ModesetChannels<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ModesetChannels").finish_non_exhaustive()
+    }
+}
+
+/// Execute a modeset [`Step`] plan against live hardware: send each
+/// `Rpc` and check its RM status, and for each `Push` copy the staged
+/// methods into the channel's pushbuffer and advance PUT.
+///
+/// # Safety
+/// `bar0` + the channel windows are live MMIO; the pushbuffers are the
+/// DMA buffers registered with GSP; the GSP is up and the caller owns
+/// the Falcons + BAR0.
+pub unsafe fn execute_plan(
+    rings: &mut GspRings,
+    bar0: &MmioRegion,
+    channels: &mut ModesetChannels<'_>,
+    plan: &[Step],
+    budget: u32,
+) -> Result<(), ModesetError> {
+    for (i, step) in plan.iter().enumerate() {
+        match step {
+            Step::Rpc { function, payload } => {
+                // SAFETY: caller's responsibility.
+                let reply = unsafe { rings.call(bar0, *function, payload, budget)? };
+                if !rm_reply_ok(*function, &reply) {
+                    return Err(ModesetError::RmStatus(i));
+                }
+            }
+            Step::Push { class, pb, .. } => {
+                let (mmio, buf) = match push_target(*class) {
+                    PushTarget::Core => (channels.core_mmio, &mut *channels.core_pb),
+                    PushTarget::Window => (channels.window_mmio, &mut *channels.window_pb),
+                    PushTarget::Unknown => return Err(ModesetError::UnknownChannel),
+                };
+                let dst = buf.as_mut_slice();
+                if pb.len() > dst.len() {
+                    return Err(ModesetError::PushTooLarge);
+                }
+                dst[..pb.len()].copy_from_slice(pb);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: mmio is the channel's user window; PUT = len.
+                unsafe { crate::disp::nv50::doorbell_kick(mmio, pb.len() as u32) };
+            }
+        }
+    }
+    Ok(())
+}

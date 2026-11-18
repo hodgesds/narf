@@ -76,6 +76,14 @@ pub const fn ring_free(wptr: u32, rptr: u32, count: u32) -> u32 {
     count - 1 - ring_used(wptr, rptr, count)
 }
 
+/// Does a received message with function id `recv` reply to an RPC
+/// sent with function id `sent`? RM replies echo the request function;
+/// asynchronous events use the disjoint `0x1000+` range, so an exact
+/// match (and not an event) identifies the reply.
+pub const fn is_rpc_reply(sent: u32, recv: u32) -> bool {
+    recv == sent && recv < NV_VGPU_MSG_EVENT_GSP_INIT_DONE
+}
+
 /// Build a 32-byte `msgqTxHeader`. Cite `r535_gsp_shared_init`:
 /// version 0, size, msgSize = page, msgCount, writePtr 0, flags 1,
 /// rxHdrOff = 32, entryOff = page.
@@ -299,6 +307,72 @@ impl GspRings {
         Some((hdr.function, payload))
     }
 
+    /// Send an RPC and wait for its reply, servicing any CPU-sequencer
+    /// events that arrive in the meantime. Returns the reply payload.
+    ///
+    /// RM replies echo the request's `function` id (events use the
+    /// `0x1000+` range), so the first message whose function matches is
+    /// this call's reply — see [`is_rpc_reply`]. Used by the modeset
+    /// executor for the request/reply `GSP_RM_CONTROL` / `GSP_RM_ALLOC`
+    /// calls, which return params + an RM status in place.
+    ///
+    /// # Safety
+    /// `bar0` live; the GSP is up (handshake completed); caller owns the
+    /// GSP + SEC2 Falcons + BAR0.
+    pub unsafe fn call(
+        &mut self,
+        bar0: &MmioRegion,
+        function: u32,
+        payload: &[u8],
+        budget: u32,
+    ) -> Result<Vec<u8>, RingError> {
+        // SAFETY: caller's responsibility.
+        unsafe { self.send(bar0, function, payload)? };
+        let libos_dma = self.libos_dma;
+        for _ in 0..budget {
+            // SAFETY: caller's responsibility.
+            let Some((recv_fn, body)) = (unsafe { self.recv(budget) }) else {
+                continue;
+            };
+            if is_rpc_reply(function, recv_fn) {
+                return Ok(body);
+            }
+            if recv_fn == NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER {
+                // SAFETY: caller owns the Falcons + BAR0.
+                unsafe { self.service_sequencer(&body, bar0, libos_dma, 0, budget)? };
+            }
+            // Other events are intermediate; keep draining.
+        }
+        Err(RingError::InitTimeout)
+    }
+
+    /// Decode + run one `RUN_CPU_SEQUENCER` event payload. Shared by
+    /// [`run_handshake`] and [`call`].
+    ///
+    /// # Safety
+    /// `bar0` live; caller owns the GSP + SEC2 Falcons.
+    unsafe fn service_sequencer(
+        &self,
+        payload: &[u8],
+        bar0: &MmioRegion,
+        libos_dma: u64,
+        app_version: u32,
+        budget: u32,
+    ) -> Result<(), RingError> {
+        // payload: bufferSizeDWord, cmdIndex, regSaveArea[8], cmds[].
+        if payload.len() < 0x28 {
+            return Err(RingError::BadReply);
+        }
+        let cmd_dwords = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let cmds = decode_all(&payload[0x28..], cmd_dwords).map_err(|_| RingError::Sequencer)?;
+        for cmd in &cmds {
+            // SAFETY: caller owns the Falcons + BAR0.
+            unsafe { execute(cmd, bar0, libos_dma, app_version, budget) }
+                .map_err(|_| RingError::Sequencer)?;
+        }
+        Ok(())
+    }
+
     /// The full init handshake: send SET_SYSTEM_INFO + SET_REGISTRY,
     /// then drain the msgq (running any CPU sequencer) until
     /// GSP_INIT_DONE. `sysinfo` is the [`build_system_info`] payload.
@@ -329,19 +403,8 @@ impl GspRings {
                 return Ok(());
             }
             if function == NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER {
-                // payload: bufferSizeDWord, cmdIndex, regSaveArea[8], cmds[].
-                if payload.len() < 0x28 {
-                    return Err(RingError::BadReply);
-                }
-                let cmd_dwords =
-                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let cmds =
-                    decode_all(&payload[0x28..], cmd_dwords).map_err(|_| RingError::Sequencer)?;
-                for cmd in &cmds {
-                    // SAFETY: caller owns the Falcons + BAR0.
-                    unsafe { execute(cmd, bar0, libos_dma, app_version, budget) }
-                        .map_err(|_| RingError::Sequencer)?;
-                }
+                // SAFETY: caller owns the Falcons + BAR0.
+                unsafe { self.service_sequencer(&payload, bar0, libos_dma, app_version, budget)? };
             }
             // Other events are intermediate; keep draining.
         }

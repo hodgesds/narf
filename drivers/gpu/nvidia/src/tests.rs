@@ -6410,3 +6410,84 @@ fn gsp_chan_window() -> u32 {
     crate::gsp_chan::DISP_WINDOW_CHANNEL_DMA
 }
 kernel_test_in!("drivers/nvidia/modeset", smoke_modeset_plan);
+
+// ────────────────────────────────────────────────────────────────
+// RPC request/reply + modeset executor decision helpers
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_rpc_reply_matching() -> TestResult {
+    use crate::gsp::{NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER};
+    use crate::gsp_ring::is_rpc_reply;
+    use crate::gsp_rm_api::{FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL};
+    // A control reply echoes the control function id.
+    if !is_rpc_reply(FUNCTION_GSP_RM_CONTROL, FUNCTION_GSP_RM_CONTROL) {
+        return TestResult::Fail("control reply must match");
+    }
+    if !is_rpc_reply(FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_ALLOC) {
+        return TestResult::Fail("alloc reply must match");
+    }
+    // A different function is not our reply.
+    if is_rpc_reply(FUNCTION_GSP_RM_CONTROL, FUNCTION_GSP_RM_ALLOC) {
+        return TestResult::Fail("mismatched function must not match");
+    }
+    // Events (0x1000+) are never replies, even if the id coincides.
+    if is_rpc_reply(
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+        NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
+    ) {
+        return TestResult::Fail("INIT_DONE is an event, not a reply");
+    }
+    if is_rpc_reply(
+        NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER,
+        NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER,
+    ) {
+        return TestResult::Fail("sequencer is an event, not a reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_rpc_reply_matching);
+
+fn smoke_rm_reply_status() -> TestResult {
+    use crate::gsp_rm_api::{
+        build_rm_alloc, build_rm_control, rm_alloc_status, rm_control_status, rm_reply_ok,
+        FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL, NV_OK,
+    };
+    // A freshly built control payload has status 0 (NV_OK).
+    let mut ctrl = build_rm_control(0xc1d0_0001, 0x0073_0000, 0x0073_0120, &[0u8; 8]);
+    if rm_control_status(&ctrl) != Some(NV_OK) {
+        return TestResult::Fail("fresh control status must be NV_OK");
+    }
+    if !rm_reply_ok(FUNCTION_GSP_RM_CONTROL, &ctrl) {
+        return TestResult::Fail("rm_reply_ok(control, ok) must be true");
+    }
+    // Simulate RM writing an error status @0x0c.
+    ctrl[0x0c..0x10].copy_from_slice(&0x55u32.to_le_bytes());
+    if rm_reply_ok(FUNCTION_GSP_RM_CONTROL, &ctrl) {
+        return TestResult::Fail("non-zero status must fail rm_reply_ok");
+    }
+    // Alloc status lives at a different offset (0x10).
+    let alloc = build_rm_alloc(0xc1d0_0001, 0xde1d_0000, 0x5d1d_0000, 0x2080, &[0u8; 4]);
+    if rm_alloc_status(&alloc) != Some(NV_OK) {
+        return TestResult::Fail("fresh alloc status must be NV_OK");
+    }
+    if !rm_reply_ok(FUNCTION_GSP_RM_ALLOC, &alloc) {
+        return TestResult::Fail("rm_reply_ok(alloc, ok) must be true");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_rm_reply_status);
+
+fn smoke_push_target() -> TestResult {
+    use crate::gsp_modeset::{push_target, PushTarget};
+    if push_target(crate::gsp_chan::DISP_CORE_CHANNEL_DMA) != PushTarget::Core {
+        return TestResult::Fail("core class must map to Core");
+    }
+    if push_target(crate::gsp_chan::DISP_WINDOW_CHANNEL_DMA) != PushTarget::Window {
+        return TestResult::Fail("window class must map to Window");
+    }
+    if push_target(0xdead) != PushTarget::Unknown {
+        return TestResult::Fail("unknown class must map to Unknown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_push_target);
