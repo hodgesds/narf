@@ -467,6 +467,10 @@ The exact display-30 MMIO view also runs Wa_14020908590 around every TCSS
 power-request transition: two bounded 10-ms mailbox-idle waits around data
 0/1 and command 1 with RUN_BUSY. Mailbox timeout is typed and prevents the
 unprotected request write. Other display versions never touch this mailbox.
+`TcDisplayProfile` replaces the former `display20` boolean and preserves exact
+14.00, 20.00, 30.00, 30.02 and 35.00 identities through connect/disconnect.
+It selects PICA, TCSS pin assignment, Display-30 mailbox use and Nova LT-PHY
+admission; a profile/MMIO mismatch refuses before Type-C register access.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be

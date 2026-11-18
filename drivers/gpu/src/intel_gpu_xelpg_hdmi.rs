@@ -93,7 +93,7 @@ use crate::intel_gpu_xelpg_external::{
 use crate::intel_gpu_xelpg_pipes::PipeEnableError;
 use crate::intel_gpu_xelpg_tc::{
     connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
-    TcMode,
+    TcDisplayProfile, TcMode,
 };
 
 include!("intel_gpu_xelpg_hdmi_tables.rs");
@@ -446,7 +446,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     // A legacy Type-C port is owned in legacy mode before its DDC is used,
     // as the DP probe owns the PHY before AUX.
     let tc = if type_c {
-        let conn = tc_connect_for(io, port, true, HDMI_LANES, false)?;
+        let conn = tc_connect_for(io, port, true, HDMI_LANES, TcDisplayProfile::XeLpdp)?;
         if conn.mode != TcMode::Legacy {
             let _ = tc_disconnect(io, &conn);
             return Err(HdmiError::NotLegacy);

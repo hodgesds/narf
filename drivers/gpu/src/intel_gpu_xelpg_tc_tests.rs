@@ -559,15 +559,31 @@ fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
         }
     }
 
+    struct NovaTc(Display20Tc);
+    impl MmioWindow for NovaTc {
+        fn display_access_ok(&self) -> bool {
+            self.0.display_access_ok()
+        }
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            self.0.read32(off)
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value);
+        }
+    }
+
     let io = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D);
     // Keep PORT_TX_DFLEXPA1 distinct so only TCSS_DDI_STATUS supplies PIN_ASSIGNMENT_D.
     io.inner.pin.set(PIN_ASSIGNMENT_C);
     io.inner.pica_isr.set(pica_dp_alt_hotplug(0));
-    let conn = match connect_for(&io, XeLpgPort::Tc1, false, 2, true) {
+    let conn = match connect_for(&io, XeLpgPort::Tc1, false, 2, TcDisplayProfile::Xe2Lpd) {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("Display 20 TC DP-alt connect_for must succeed"),
     };
-    if !conn.display20
+    if conn.profile != TcDisplayProfile::Xe2Lpd
         || conn.pin_assignment != PIN_ASSIGNMENT_D
         || conn.max_lanes != 2
         || io.pica_req.get() & PICA_POWER_REQUEST == 0
@@ -578,7 +594,7 @@ fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
         return TestResult::Fail("Display 20 TC disconnect must drop PICA_PW_CTL");
     }
     // Rollback on insufficient lanes must also drop PICA_PW_CTL.
-    if connect_for(&io, XeLpgPort::Tc1, false, 4, true)
+    if connect_for(&io, XeLpgPort::Tc1, false, 4, TcDisplayProfile::Xe2Lpd)
         != Err(TcError::InsufficientLanes {
             max: 2,
             required: 4,
@@ -590,11 +606,45 @@ fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
 
     let busy = MailboxBusy(Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D));
     busy.0.inner.pica_isr.set(pica_dp_alt_hotplug(0));
-    if connect_for(&busy, XeLpgPort::Tc1, false, 2, true) != Err(TcError::TcssMailboxTimeout)
+    if connect_for(&busy, XeLpgPort::Tc1, false, 2, TcDisplayProfile::Xe3Lpd)
+        != Err(TcError::TcssMailboxTimeout)
         || busy.0.pica_req.get() & PICA_POWER_REQUEST != 0
         || !busy.0.inner.buf_writes().is_empty()
     {
         return TestResult::Fail("Display 30 busy mailbox must refuse before TCSS request");
+    }
+
+    let nova = NovaTc(Display20Tc::new(XeLpgPort::Tc2, PIN_ASSIGNMENT_C));
+    nova.0.inner.pica_isr.set(pica_dp_alt_hotplug(1));
+    let nova_conn = match connect_for(&nova, XeLpgPort::Tc2, false, 4, TcDisplayProfile::NovaLakeS)
+    {
+        Ok(conn) => conn,
+        Err(_) => return TestResult::Fail("Nova TC2 must use the exact LT/PICA profile"),
+    };
+    if nova_conn.profile != TcDisplayProfile::NovaLakeS
+        || nova.0.pica_req.get() & PICA_POWER_REQUEST == 0
+        || !nova
+            .0
+            .inner
+            .phy
+            .writes_to(TCSS_DISP_MAILBOX_IN_CMD)
+            .is_empty()
+        || disconnect(&nova, &nova_conn).is_err()
+    {
+        return TestResult::Fail("Nova TC must retain PICA without Display-30 mailbox writes");
+    }
+
+    let crossed = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_C);
+    if connect_for(
+        &crossed,
+        XeLpgPort::Tc1,
+        false,
+        1,
+        TcDisplayProfile::NovaLakeS,
+    ) != Err(TcError::ProfileMismatch)
+        || crossed.pica_req.get() != 0
+    {
+        return TestResult::Fail("Nova profile must refuse a non-LT MMIO view before writes");
     }
     TestResult::Pass
 }

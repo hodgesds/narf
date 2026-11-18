@@ -164,7 +164,7 @@ use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
 use crate::intel_gpu_xelpg_resources::ResourceError;
 use crate::intel_gpu_xelpg_tc::{
     aux_power_disable, aux_power_enable, connect_for as tc_connect_for, connection_intact,
-    disconnect as tc_disconnect, TcConnection, TcError, TcMode,
+    disconnect as tc_disconnect, TcConnection, TcDisplayProfile, TcError, TcMode,
 };
 
 /// Source-qualified external-display limits which cannot be inferred from
@@ -208,6 +208,15 @@ impl ExternalDisplayProfile {
 
     pub(crate) const fn display_ip(self) -> DisplayIp {
         self.display_ip
+    }
+
+    const fn tc_profile(self) -> TcDisplayProfile {
+        match self.display_ip {
+            DisplayIp::Xelpdp => TcDisplayProfile::XeLpdp,
+            DisplayIp::Xe2Lpd => TcDisplayProfile::Xe2Lpd,
+            DisplayIp::Xe3Lpd => TcDisplayProfile::Xe3Lpd,
+            DisplayIp::WildcatLake => TcDisplayProfile::WildcatLake,
+        }
     }
 
     const fn generation(self) -> Generation {
@@ -794,13 +803,18 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
     if !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort);
     }
-    let display20 = display_ip.xe2_plus();
     // Do not acquire/release Type-C ownership behind an inherited live DDI.
     if read(io, port.ddi_buf_ctl())? & DDI_BUF_CTL_ENABLE != 0 {
         return Err(ExternalError::PortBusy);
     }
     let tc = match port.tc_index() {
-        Some(_) => Some(tc_connect_for(io, port, legacy_port, 1, display20)?),
+        Some(_) => Some(tc_connect_for(
+            io,
+            port,
+            legacy_port,
+            1,
+            profile.tc_profile(),
+        )?),
         None => None,
     };
     let rollback = |e: ExternalError| {

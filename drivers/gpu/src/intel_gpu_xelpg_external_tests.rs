@@ -826,7 +826,11 @@ fn smoke_lnl_external_tc_dp_alt_uses_display20_d2d() -> TestResult {
         Ok(probe) => probe,
         Err(_) => return TestResult::Fail("LNL TC1 probe must own PICA/TCSS/AUX"),
     };
-    if probe.display_version() != 20 || probe.tc.is_none_or(|tc| !tc.display20) {
+    if probe.display_version() != 20
+        || probe
+            .tc
+            .is_none_or(|tc| tc.profile != TcDisplayProfile::Xe2Lpd)
+    {
         return TestResult::Fail("the sink probe must retain the display-20 layout");
     }
     let fb = fb_for(&probe.mode).unwrap();
@@ -897,7 +901,11 @@ fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
         Ok(probe) => probe,
         Err(_) => return TestResult::Fail("PTL TC1 probe must own PICA/TCSS/AUX"),
     };
-    if probe.display_version() != 30 || probe.tc.is_none_or(|tc| !tc.display20) {
+    if probe.display_version() != 30
+        || probe
+            .tc
+            .is_none_or(|tc| tc.profile != TcDisplayProfile::Xe3Lpd)
+    {
         return TestResult::Fail("the sink probe must retain the display-30 layout");
     }
     if io.writes_to(crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_IN_DATA) != [1]

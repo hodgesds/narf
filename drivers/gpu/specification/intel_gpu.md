@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.08** (v1.08 restores Display-30 Type-C power-request mailbox
+> Status: **v1.09** (v1.09 replaces the shared Type-C display20 boolean with
+> exact Meteor/Lunar/Panther/Wildcat/Nova policy; v1.08 restores Display-30 Type-C power-request mailbox
 > Wa_14020908590; v1.07 adds Nova Lake's exact LT AUX power-status waits
 > without changing C10/C20 fixed-delay behavior; v1.06 adds a pure Nova Lake output-resource plan for
 > eDP A, combo-B DP/HDMI and TC1/TC2 USB-C DP-alt without enabling MMIO;
@@ -415,6 +416,14 @@ RUN_BUSY, and wait another 10 ms for completion. The exact display-30 MMIO
 view selects the workaround; Meteor/Lunar and Nova do not inherit it. A busy
 mailbox is a typed refusal instead of continuing through the documented
 request/ack hazard.
+The shared Type-C owner retains `TcDisplayProfile` instead of a broad
+`display20` boolean: Xe-LPDP 14.00, Xe2-LPD 20.00, Xe3-LPD 30.00, Wildcat
+30.02 and Nova 35.00 are distinct values. The profile selects PICA, TCSS pin
+assignment and the Display-30 mailbox workaround, and it must agree with the
+MMIO view's exact `cx0_xe3`/`has_lt_phy` facts before any Type-C access. Nova
+therefore exercises PICA/TCSS ownership without inheriting the Display-30
+mailbox; Meteor retains FIA pin assignment and no PICA. This qualifies the
+Nova Type-C lease lifecycle but still does not install a live Nova route.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.
