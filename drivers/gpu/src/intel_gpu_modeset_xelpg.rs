@@ -3793,9 +3793,7 @@ pub mod tests {
     /// through its PPS, with the PHY's idle and D2D state modelled.
     fn lit_panel(fake: &MtlFake, dmc: &DmcLog<'_>) -> Result<Mode, &'static str> {
         forget_panel_off();
-        fake.pps.set(true);
-        fake.phy.model_ddi_idle.set(true);
-        fake.phy.model_d2d.set(true);
+        fake.model_panel_power();
         let mode = Mode::VESA_1024X768_60;
         if XeLpgModeset::new(fake, XeLpgPort::A)
             .with_pipe_dmc(dmc)
@@ -4070,7 +4068,10 @@ pub mod tests {
     fn smoke_mtl_modeset_panel_fitting_scaler_and_pipe_source() -> TestResult {
         use crate::intel_gpu_xelpg_scaler::{Filter, ScalingMode, PS_SCALER_EN};
 
+        forget_panel_off();
         let fake = MtlFake::new(XeLpgPort::A);
+        fake.model_panel_power();
+        fake.phy.write32(PP_CONTROL, 1 | 4);
         // Native panel mode: 2880x1800 OLED
         let mode = oled_mode();
         oled_panel(&fake, 0x14, 2);
@@ -4117,9 +4118,9 @@ pub mod tests {
             return TestResult::Fail("SKL_PS_WIN_SZ must match panel window dimensions");
         }
 
-        // 5. PLANE_SIZE_1_A (0x70190) must receive (1919 << 16) | 1199
+        // PLANE_SIZE packs height in the upper half and width in the lower half.
         let plane_size = fake.writes_to(0x70190);
-        if plane_size.last() != Some(&((1919 << 16) | 1199)) {
+        if plane_size.last() != Some(&((1199 << 16) | 1919)) {
             return TestResult::Fail("PLANE_SIZE_1_A must receive source dimensions");
         }
 
@@ -4150,7 +4151,10 @@ pub mod tests {
         use crate::intel_gpu_xelpg_dsc::{dss_ctl1, JOINER_ENABLE};
         const SECONDARY_BIG_JOINER_ENABLE: u32 = 1 << 29;
 
+        forget_panel_off();
         let fake = MtlFake::new(XeLpgPort::A);
+        fake.model_panel_power();
+        fake.phy.write32(PP_CONTROL, 1 | 4);
         let mode = Mode::VESA_1024X768_60;
         let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_bigjoiner(PipeIdx::B);
         let res = ms.modeset_fixed(&test_fb(), &mode);
