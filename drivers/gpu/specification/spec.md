@@ -471,6 +471,10 @@ unprotected request write. Other display versions never touch this mailbox.
 14.00, 20.00, 30.00, 30.02 and 35.00 identities through connect/disconnect.
 It selects PICA, TCSS pin assignment, Display-30 mailbox use and Nova LT-PHY
 admission; a profile/MMIO mismatch refuses before Type-C register access.
+The disconnected `NovaResourcePlan` can acquire/release its D2D dependency
+through the Display >=20 `DDI_BUF_CTL` enable/state bits with 100-us bounds.
+It requires the exact LT-PHY MMIO fact before the first access and does not
+construct an operational `DisplayIp` or enable a route.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be

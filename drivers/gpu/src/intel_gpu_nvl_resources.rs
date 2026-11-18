@@ -20,9 +20,12 @@
 // production authority in the meantime.
 #![allow(dead_code)]
 
-use crate::intel_gpu_aux::{XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS};
+use crate::intel_gpu_aux::{
+    MmioWindow, XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS,
+};
 use crate::intel_gpu_lt_phy::LtPort;
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
+use crate::intel_gpu_xe2lpd::{self as xe2lpd, IpError};
 
 /// `PWR_WELL_CTL2` indices used by Xe3 LPD and Xe3P LPD.
 const PW_1_INDEX: u8 = 0;
@@ -58,6 +61,15 @@ pub(crate) enum NovaPlanRefusal {
     PortRole,
     /// Pipe A belongs to eDP; external outputs use Pipes B-D.
     PipeRole,
+}
+
+/// Failure while realizing a disconnected Nova resource dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NovaResourceError {
+    /// The MMIO owner is not the exact Nova/LT platform view.
+    ProfileMismatch,
+    /// Access was lost or the D2D state transition timed out.
+    D2d(IpError),
 }
 
 /// LT AUX power-well handshake retained by DP/eDP outputs.
@@ -178,6 +190,29 @@ impl NovaResourcePlan {
             d2d: true,
         })
     }
+
+    /// Acquire Display >= 20's D2D link through `DDI_BUF_CTL`. The exact LT
+    /// platform fact is required before the first read or write.
+    pub(crate) fn enable_d2d(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+    ) -> Result<(), NovaResourceError> {
+        if !io.has_lt_phy() {
+            return Err(NovaResourceError::ProfileMismatch);
+        }
+        xe2lpd::enable_d2d_xe2_plus(io, self.port.xelpg()).map_err(NovaResourceError::D2d)
+    }
+
+    /// Release the exact Nova D2D link and observe its state clear.
+    pub(crate) fn disable_d2d(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+    ) -> Result<(), NovaResourceError> {
+        if !io.has_lt_phy() {
+            return Err(NovaResourceError::ProfileMismatch);
+        }
+        xe2lpd::disable_d2d_xe2_plus(io, self.port.xelpg()).map_err(NovaResourceError::D2d)
+    }
 }
 
 #[cfg(test)]
@@ -267,4 +302,94 @@ mod tests {
             (0x2 << 0) | (0x2 << 2) | (0x2 << 14)
         );
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod kernel_tests {
+    extern crate alloc;
+
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    struct D2dFake {
+        reg: u64,
+        value: Cell<u32>,
+        writes: RefCell<Vec<u32>>,
+        lt: bool,
+        acknowledge: bool,
+    }
+
+    impl D2dFake {
+        fn new(port: LtPort, lt: bool, acknowledge: bool) -> Self {
+            Self {
+                reg: port.xelpg().ddi_buf_ctl(),
+                value: Cell::new(0),
+                writes: RefCell::new(Vec::new()),
+                lt,
+                acknowledge,
+            }
+        }
+    }
+
+    impl MmioWindow for D2dFake {
+        fn has_lt_phy(&self) -> bool {
+            self.lt
+        }
+        fn read32(&self, off: u64) -> u32 {
+            if off != self.reg {
+                return 0;
+            }
+            let value = self.value.get();
+            value
+                | if self.acknowledge && value & xe2lpd::DDI_BUF_D2D_LINK_ENABLE != 0 {
+                    xe2lpd::DDI_BUF_D2D_LINK_STATE
+                } else {
+                    0
+                }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            if off == self.reg {
+                self.writes.borrow_mut().push(value);
+                self.value.set(value & !xe2lpd::DDI_BUF_D2D_LINK_STATE);
+            }
+        }
+    }
+
+    fn smoke_nvl_resource_plan_owns_display20_d2d() -> TestResult {
+        let plan = match NovaResourcePlan::new(LtPort::Tc2, Pipe::D, NovaOutput::UsbCDpAlt) {
+            Ok(plan) => plan,
+            Err(_) => return TestResult::Fail("Nova TC2/Pipe-D plan must be admitted"),
+        };
+        let io = D2dFake::new(LtPort::Tc2, true, true);
+        if plan.enable_d2d(&io).is_err()
+            || io.value.get() & xe2lpd::DDI_BUF_D2D_LINK_ENABLE == 0
+            || plan.disable_d2d(&io).is_err()
+            || io.value.get() & xe2lpd::DDI_BUF_D2D_LINK_ENABLE != 0
+            || io.writes.borrow().len() != 2
+        {
+            return TestResult::Fail("Nova must observe DDI_BUF_CTL D2D up and down");
+        }
+
+        let crossed = D2dFake::new(LtPort::Tc2, false, true);
+        if plan.enable_d2d(&crossed) != Err(NovaResourceError::ProfileMismatch)
+            || !crossed.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("Nova D2D must refuse a non-LT view before MMIO");
+        }
+
+        let stuck = D2dFake::new(LtPort::Tc2, true, false);
+        if !matches!(
+            plan.enable_d2d(&stuck),
+            Err(NovaResourceError::D2d(IpError::NoDevice))
+        ) {
+            return TestResult::Fail("Nova D2D missing state must time out");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_nvl_resources",
+        smoke_nvl_resource_plan_owns_display20_d2d
+    );
 }

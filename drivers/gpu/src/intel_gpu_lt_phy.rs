@@ -151,7 +151,7 @@ impl LtPort {
         self.xelpg().aux_ctl()
     }
 
-    const fn xelpg(self) -> XeLpgPort {
+    pub(crate) const fn xelpg(self) -> XeLpgPort {
         match self {
             Self::A => XeLpgPort::A,
             Self::B => XeLpgPort::B,

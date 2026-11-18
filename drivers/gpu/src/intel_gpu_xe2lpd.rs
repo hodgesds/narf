@@ -1196,12 +1196,35 @@ pub(crate) fn enable_d2d(
     port: XeLpgPort,
 ) -> Result<(), IpError> {
     let (reg, enable, state) = ip.d2d(port);
+    enable_d2d_at(io, reg, enable, state)
+}
+
+fn enable_d2d_at(
+    io: &(impl MmioWindow + ?Sized),
+    reg: u64,
+    enable: u32,
+    state: u32,
+) -> Result<(), IpError> {
     let v = io.read32(reg);
     if v == u32::MAX || !io.display_access_ok() {
         return Err(IpError::NoDevice);
     }
     io.write32(reg, v | enable);
     wait(io, reg, state, state, 100)
+}
+
+/// Display >= 20 `DDI_BUF_CTL` D2D owner, also used by the disconnected
+/// exact Nova profile without constructing an operational [`DisplayIp`].
+pub(crate) fn enable_d2d_xe2_plus(
+    io: &(impl MmioWindow + ?Sized),
+    port: XeLpgPort,
+) -> Result<(), IpError> {
+    enable_d2d_at(
+        io,
+        ddi_buf_ctl(port),
+        DDI_BUF_D2D_LINK_ENABLE,
+        DDI_BUF_D2D_LINK_STATE,
+    )
 }
 
 /// `mtl_ddi_disable_d2d` on `ip`: clear the enable bit, then wait 100 µs
@@ -1213,12 +1236,35 @@ pub(crate) fn disable_d2d(
     port: XeLpgPort,
 ) -> Result<(), IpError> {
     let (reg, enable, state) = ip.d2d(port);
+    disable_d2d_at(io, reg, enable, state)
+}
+
+fn disable_d2d_at(
+    io: &(impl MmioWindow + ?Sized),
+    reg: u64,
+    enable: u32,
+    state: u32,
+) -> Result<(), IpError> {
     let v = io.read32(reg);
     if v == u32::MAX || !io.display_access_ok() {
         return Err(IpError::NoDevice);
     }
     io.write32(reg, v & !enable);
     wait(io, reg, state, 0, 100)
+}
+
+/// Display >= 20 `DDI_BUF_CTL` D2D release for an exact non-`DisplayIp`
+/// owner such as disconnected Nova.
+pub(crate) fn disable_d2d_xe2_plus(
+    io: &(impl MmioWindow + ?Sized),
+    port: XeLpgPort,
+) -> Result<(), IpError> {
+    disable_d2d_at(
+        io,
+        ddi_buf_ctl(port),
+        DDI_BUF_D2D_LINK_ENABLE,
+        DDI_BUF_D2D_LINK_STATE,
+    )
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
