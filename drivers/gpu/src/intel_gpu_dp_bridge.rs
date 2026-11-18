@@ -246,8 +246,10 @@ impl IntelDpBridge {
                 publication_serial,
             });
         }
-        port.connect(&mmio, gpu.gtt_mmadr.phys.raw(), cfg.lanes)
+        let assigned_lanes = port
+            .acquire_dp_alt(&mmio, gpu.gtt_mmadr.phys.raw())
             .map_err(|_| DpBridgeError::NotReady)?;
+        let max_lanes = cfg.lanes.min(assigned_lanes);
 
         // Try an EDID readback over AUX. AUX may not yet be reachable
         // (DPRX side could still be waking up); a failure here isn't
@@ -314,7 +316,7 @@ impl IntelDpBridge {
         // machine, the pipe gets its DBUF share and the pipes
         // already live are reprogrammed to theirs.
         let mut modeset = Modeset::for_pipe(&mmio, ddi, pipe);
-        modeset.set_typec_width(cfg.lanes);
+        modeset.set_typec_width(max_lanes);
         let active = intel_gpu_multipipe::active_pipes();
         if active.len() >= 2 {
             if let Some((start, end)) = intel_gpu_multipipe::share_for(&active, pipe) {
@@ -329,7 +331,7 @@ impl IntelDpBridge {
                     .and_then(|caps| {
                         let source = crate::dp_link_training::SourceCaps {
                             max_rate: crate::dp_link_training::LinkRate::Hbr3,
-                            max_lanes: cfg.lanes,
+                            max_lanes,
                         };
                         let plan = crate::dp_link_training::negotiate(
                             &source,

@@ -113,8 +113,11 @@ stream; this does not create a multi-monitor compositor or a new DRM ABI.
 `intel_gpu_gen12_tc::DklPort` supplies source-qualified Tiger Lake and
 Alder Lake-P/N Dekel banked PLL/clock/TX operations. Linux binds ADL-N as an
 ADL-P display subplatform with the same display-13 Type-C PHY profile. The Gen12 USB-PD bridge
-holds TC-cold/AUX/PHY ownership across a session and negotiates within the
-PD lane limit. Its detach hook proves pipe/link stop before releasing the
+holds TC-cold/AUX/PHY ownership across a session and bounds negotiation by
+the USB-PD assignment, the live FIA lane mask and sink capabilities. Each
+training attempt programs its width into the port's `DFLEXDPMLE1` field.
+SST requires the trained link to carry the mode's 24-bit RGB payload before
+the pipe is enabled. A shortfall returns `ModesetError::LinkBandwidthInsufficient`. Its detach hook proves pipe/link stop before releasing the
 scanout, pipe claim and power reference. A successful modeset publishes the
 physical scanout under a serial from the shared Intel external-output
 namespace. Detach withdraws that exact serial before freeing its backing;

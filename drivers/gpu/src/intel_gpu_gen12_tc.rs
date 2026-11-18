@@ -201,6 +201,20 @@ impl DklPort {
         if !matches!(width, 1 | 2 | 4) {
             return Err(ModesetError::PhyBusFailure);
         }
+        let limit = self.acquire_dp_alt(io, bar)?;
+        if width > limit {
+            return Err(ModesetError::PhyBusFailure);
+        }
+        self.set_fia_lanes(io, width)
+    }
+
+    /// Acquire the port for AUX discovery and return its physical lane ceiling.
+    /// The bridge selects a stream width after reading the sink capabilities.
+    pub(crate) fn acquire_dp_alt(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        bar: u64,
+    ) -> Result<u8, ModesetError> {
         self.check(io)?;
         let mut cold = COLD.try_lock().ok_or(ModesetError::PhyBusFailure)?;
         let pos = match cold.iter().position(|owner| owner.bar == bar) {
@@ -229,7 +243,6 @@ impl DklPort {
         }
         // From here on, any failure retains a cold reference. Reuse is
         // refused until the owner has proved a local stop and disconnected.
-        cold[pos].ports |= bit;
         let aux_idx = 3 + u32::from(self.tc);
         let aux_request = 2 << (aux_idx * 2);
         if self.read(io, 0x45444)? & aux_request == 0 {
@@ -241,24 +254,55 @@ impl DklPort {
         if self.family == Gen12Platform::TigerLake {
             self.wait_timeout(io, fia + 0x890, 1 << idx, true, 500)?;
             self.rmw(io, fia + 0x894, 0, 1 << idx)?;
-            let live = self.read(io, fia + 0x8A0)?;
-            let assigned = ((live >> (idx * 8)) & 0xF).count_ones();
-            if live & (1 << (idx * 8 + 5)) == 0 || assigned < u32::from(width) {
-                return Err(ModesetError::PhyBusFailure);
-            }
         } else {
             self.wait_timeout(io, 0x161500 + u64::from(self.tc) * 4, 1 << 2, true, 500)?;
             self.rmw(io, self.ddi.base(), 0, 1 << 6)?;
-            let live = self.read(io, 0x44470)?;
-            let pin = (self.read(io, fia + 0x880)? >> (idx * 4)) & 15;
-            let lanes = match pin {
-                3 | 5 => 4,
-                4 | 6 => 2,
-                _ => 0,
-            };
-            if live & (1 << (16 + self.tc)) == 0 || lanes < width {
+        }
+        self.dp_alt_lane_limit(io, fia, idx)
+    }
+
+    fn dp_alt_lane_limit(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        fia: u64,
+        idx: u8,
+    ) -> Result<u8, ModesetError> {
+        // DFLEXDPSP has one byte per port. TC5/6 require a modular FIA.
+        let status = self
+            .read(io, fia + 0x8A0)?
+            .checked_shr(u32::from(idx) * 8)
+            .ok_or(ModesetError::PhyBusFailure)?;
+        // icl_get_max_lane_count applies to both display 12 and 13.
+        let lanes = match status & 0xF {
+            1 | 2 | 4 | 8 => 1,
+            3 | 12 => 2,
+            15 => 4,
+            _ => return Err(ModesetError::PhyBusFailure),
+        };
+        if self.family == Gen12Platform::TigerLake {
+            if status & (1 << 5) == 0 || self.read(io, fia + 0x894)? & (1 << idx) == 0 {
                 return Err(ModesetError::PhyBusFailure);
             }
+            return Ok(lanes);
+        }
+        if self.read(io, 0x44470)? & (1 << (16 + self.tc)) == 0
+            || self.read(io, self.ddi.base())? & (1 << 6) == 0
+        {
+            return Err(ModesetError::PhyBusFailure);
+        }
+        match (self.read(io, fia + 0x880)? >> (idx * 4)) & 15 {
+            3 | 5 => Ok(lanes),
+            4 | 6 => Ok(lanes.min(2)),
+            _ => Err(ModesetError::PhyBusFailure),
+        }
+    }
+
+    fn set_fia_lanes(self, io: &(impl MmioWindow + ?Sized), width: u8) -> Result<(), ModesetError> {
+        // Multiple ports share DFLEXDPMLE1. Serialize their read/modify/write.
+        let _cold = COLD.try_lock().ok_or(ModesetError::PhyBusFailure)?;
+        let (fia, idx) = self.fia(io)?;
+        if !matches!(width, 1 | 2 | 4) || width > self.dp_alt_lane_limit(io, fia, idx)? {
+            return Err(ModesetError::PhyBusFailure);
         }
         self.rmw(
             io,
@@ -424,6 +468,7 @@ impl DklPort {
             )?;
             self.route_clock(io)?;
         }
+        self.set_fia_lanes(io, lanes)?;
         self.configure_lanes(io, lanes)?;
         self.signal_levels(io, rate, &[(0, 0); 4])?;
         self.rmw(io, clock, 0xF << 28, select)?;
@@ -614,7 +659,7 @@ mod tests {
         fn new(family: Gen12Platform) -> Self {
             Self {
                 family,
-                regs: Default::default(),
+                regs: RefCell::new(BTreeMap::from([(0x1638A0, 0x3F3F), (0x163880, 0x33)])),
                 phy: Default::default(),
                 hip: Cell::new(0),
                 writes: Default::default(),
@@ -637,9 +682,7 @@ mod tests {
             let raw = self.regs.borrow().get(&off).copied().unwrap_or(0);
             match off {
                 0x138124 | 0x138128 => 0,
-                0x1638A0 => 0x3F3F, // modular FIA, two live four-lane DP-alt ports
                 0x163890 => 3,
-                0x163880 => 0x33, // pin C on TC1/TC2
                 0x161500 | 0x161504 => 1 << 2,
                 0x44470 => 3 << 16,
                 0x64300 | 0x64400 => {
@@ -814,6 +857,61 @@ mod tests {
         smoke_gen12_tc_cold_reference_survives_other_port_disconnect
     );
 
+    fn smoke_gen12_tc_fia_assignment_limits_negotiation() -> TestResult {
+        for (family, bar) in [
+            (Gen12Platform::TigerLake, 0xC0DE6000),
+            (Gen12Platform::AlderLakeP, 0xC0DE7000),
+            (Gen12Platform::AlderLakeN, 0xC0DE8000),
+        ] {
+            let io = Model::new(family);
+            let port = DklPort::new(&io, Ddi::E).unwrap();
+            // TC1 owns four lanes. TC2 reports two upper lanes on pin C.
+            io.regs.borrow_mut().insert(0x1638A0, 0x2C3F);
+            io.regs.borrow_mut().insert(0x1638C0, 0x000F);
+            if port.acquire_dp_alt(&io, bar) != Ok(2)
+                || port.set_fia_lanes(&io, 4).is_ok()
+                || io.read32(0x1638C0) != 0x000F
+                || port.set_fia_lanes(&io, 2).is_err()
+                || io.read32(0x1638C0) != 0x003F
+            {
+                return TestResult::Fail("TC2 must respect FIA assignment and preserve TC1");
+            }
+            for mask in 0..16 {
+                io.regs.borrow_mut().insert(0x1638A0, 0x203F | (mask << 8));
+                let expected = match mask {
+                    1 | 2 | 4 | 8 => Ok(1),
+                    3 | 12 => Ok(2),
+                    15 => Ok(4),
+                    _ => Err(ModesetError::PhyBusFailure),
+                };
+                if port.dp_alt_lane_limit(&io, 0x163000, 1) != expected {
+                    return TestResult::Fail("invalid or fragmented FIA lane assignment");
+                }
+            }
+            if is_adlp_family(family) {
+                io.regs.borrow_mut().insert(0x163880, 0x43);
+                if port.dp_alt_lane_limit(&io, 0x163000, 1) != Ok(2) {
+                    return TestResult::Fail("pin D must cap the display at two lanes");
+                }
+            }
+            if port.disconnect(&io, bar).is_err() {
+                return TestResult::Fail("failed to release test port");
+            }
+        }
+        let io = Model::new(Gen12Platform::TigerLake);
+        io.regs.borrow_mut().insert(0x1638A0, 0x2F);
+        let port = DklPort::new(&io, Ddi::H).unwrap();
+        let (fia, idx) = port.fia(&io).unwrap();
+        if port.dp_alt_lane_limit(&io, fia, idx).is_ok() {
+            return TestResult::Fail("TC5 requires a modular FIA lane field");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_tc",
+        smoke_gen12_tc_fia_assignment_limits_negotiation
+    );
+
     fn smoke_gen12_tc_training_programs_source_before_sink_pattern() -> TestResult {
         use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
         use crate::intel_gpu_modeset::training::{State, TrainingAux};
@@ -882,6 +980,13 @@ mod tests {
                 if aux.dpcd_write(0x102, &[pattern]).is_err() {
                     return TestResult::Fail("source pattern must precede sink pattern");
                 }
+            }
+            if aux.dpcd_write(0x100, &[0x0A, 1]).is_err()
+                || aux.dpcd_write(0x102, &[1]).is_err()
+                || io.read32(0x1638C0) & 0xF != 1
+                || io.read32(0x64300) & (7 << 1) != 0
+            {
+                return TestResult::Fail("fallback must train at one lane in both FIA and DDI");
             }
             io.write32(0x64300, io.read32(0x64300) & !(1 << 31));
             if port.stop_transport(&io, Transcoder::B).is_err()

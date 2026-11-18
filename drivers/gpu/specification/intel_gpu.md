@@ -7772,9 +7772,14 @@ ADL-P display descriptor as a display-13 subplatform with the same four
 Type-C PHY ports. Bank selection and access are
 serialized, masks preserve unrelated PLL fields, the DSSM reference selects
 19.2/24/38.4 MHz coefficients, and rate-specific TX settings replace combo
-BUF_TRANS. The bridge acquires TC-cold, AUX and PHY ownership before EDID,
-limits link negotiation to the PD lane count, and stops/releases its session
-through the USB-PD detach hook. Uncertain stop keeps the pipe, surface and
+BUF_TRANS. The bridge acquires TC-cold, AUX and PHY ownership before EDID.
+It limits the link to the USB-PD grant, the sink's capabilities and the
+physical assignment in `PORT_TX_DFLEXDPSP`. The register exposes single
+lanes, adjacent low or high pairs, or all four lanes. Training writes the
+chosen width into the port's `DFLEXDPMLE1` field before each attempt,
+including fallback. SST checks the payload of the achieved link before
+enabling the transcoder. The USB-PD detach hook releases the session after
+verifying that the output stopped. Uncertain stop keeps the pipe, surface and
 power reference; detach retries, and discovery resets only on success.
 A successful native modeset publishes its physical surface to the framebuffer
 consumer under the shared external-output serial namespace. Detach withdraws

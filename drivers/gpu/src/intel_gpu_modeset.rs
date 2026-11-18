@@ -301,6 +301,8 @@ pub enum ModesetError {
     /// Link training failed at every configuration Linux's fallback
     /// (`intel_dp_get_link_train_fallback_values`) reaches.
     LinkTrainingExhausted,
+    /// The selected DP link cannot carry the uncompressed RGB stream.
+    LinkBandwidthInsufficient,
     /// MTL source enable, primary image or a fresh common frame was not observed.
     /// This is not evidence of complete sink training or visible pixels.
     PipelineEnableUnavailable,
@@ -321,6 +323,16 @@ pub struct LinkPlan {
     pub rate: crate::dp_link_training::LinkRate,
     /// Negotiated lane count (1, 2, or 4).
     pub lanes: u8,
+}
+
+impl LinkPlan {
+    fn check_rgb8_capacity(self, mode: &Mode) -> Result<(), ModesetError> {
+        let demand = crate::dp_link_training::stream_demand_kbps(mode.pixel_clock_khz, 24);
+        if self.rate.payload_kbps(self.lanes) < demand {
+            return Err(ModesetError::LinkBandwidthInsufficient);
+        }
+        Ok(())
+    }
 }
 
 /// Convert a training-core link rate to the PLL module's rate
@@ -702,15 +714,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             LinkStep::Trained(t) => Some(t),
             _ => None,
         };
-        if self.ddi as u8 >= Ddi::D as u8 {
+        let dekel = self.ddi as u8 >= Ddi::D as u8;
+        if dekel {
             let lanes = plan
                 .map(|plan| plan.lanes)
                 .or_else(|| already_trained.map(|link| link.lanes))
                 .unwrap_or(self.tc_width);
-            if lanes > self.tc_width {
+            if !matches!(lanes, 1 | 2 | 4) || lanes > self.tc_width {
                 return Err(ModesetError::PhyBusFailure);
             }
-            self.tc_width = lanes;
         }
 
         // Step 1: sessions and resume supply an exact mode. Only legacy
@@ -731,6 +743,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         };
 
         validate_framebuffer_mode(primary_fb, &mode)?;
+        let dekel_sst = dekel && ddi_mode == crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST;
+        if dekel_sst {
+            if let Some(plan) = plan {
+                plan.check_rgb8_capacity(&mode)?;
+            }
+        }
 
         // Step 2: enable PG1 (the always-required power well).
         // PG0 is power-good from BIOS / pre-boot firmware; we
@@ -764,6 +782,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         match (plan, already_trained) {
             (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
             (None, Some(_)) => {}
+            (None, None) if dekel => self.program_dpll_with_rate(&mode, LinkRate::DpHbr2)?,
             (None, None) => self.program_dpll(&mode)?,
         }
 
@@ -865,53 +884,41 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // An MST secondary stream skips the whole step: the
         // link is already trained and BUF_TRANS already loaded
         // by the primary stream's run on this DDI.
-        let (trained_pll, trained_link) = match already_trained {
-            Some(t) => (to_pll_rate(t.rate), Some(t)),
+        let trained_link = match already_trained {
+            Some(link) => Some(link),
+            None if dekel => self.train_dp_link(plan)?.1,
             None => {
                 let start_rate = plan
                     .map(|p| to_pll_rate(p.rate))
                     .unwrap_or(LinkRate::DpHbr2);
-                self.load_buf_trans(start_rate)?;
+                self.load_combo_buf_trans(start_rate)?;
                 let (pll, trained) = self.train_dp_link(plan)?;
                 if pll != start_rate {
-                    self.load_buf_trans(pll)?;
+                    self.load_combo_buf_trans(pll)?;
                 }
-                (pll, trained)
+                trained
             }
         };
 
-        // Step 9b (plan path, #1092): if the fallback ladder
-        // settled somewhere other than the plan, reprogram the
-        // blocks that were written from the plan — DPLL, M/N and
-        // the TRANS_DDI_FUNC_CTL port width — to the trained
-        // configuration, before anything is enabled. The legacy
-        // path keeps its historical behaviour exactly.
-        if let (Some(p), Some(t)) = (plan, trained_link) {
-            if t.rate != p.rate {
-                self.program_dpll_with_rate(&mode, trained_pll)?;
+        if let Some(t) = trained_link {
+            let trained = LinkPlan {
+                rate: t.rate,
+                lanes: t.lanes,
+            };
+            if dekel_sst {
+                trained.check_rgb8_capacity(&mode)?;
             }
-            if t.rate != p.rate || t.lanes != p.lanes {
+            // Dekel's training callback already retuned the PLL and enabled
+            // the source at the final width before the sink acknowledged it.
+            if !dekel && plan.is_some_and(|p| p.rate != t.rate) {
+                self.program_dpll_with_rate(&mode, to_pll_rate(t.rate))?;
+            }
+            if already_trained.is_none() && plan != Some(trained) {
                 self.program_mn_link(&mode, t.rate, t.lanes);
                 self.program_trans_ddi_func_ctl_mode(t.lanes, ddi_mode);
             }
         }
-
-        if self.ddi as u8 >= Ddi::D as u8 {
-            if let Some(trained) = trained_link {
-                let mut levels = [(0, 0); 4];
-                for (level, trained) in levels.iter_mut().zip(trained.vswing_pe.lanes) {
-                    *level = (trained.swing, trained.pre_emph);
-                }
-                let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
-                port.configure_lanes(self.mmio, trained.lanes)?;
-                port.signal_levels(self.mmio, trained_pll, &levels)?;
-            }
-        }
-
-        // Step 10: enable DDI buffer — physical output drivers
-        // on. Skipped for an MST secondary stream: the buffer
-        // is already driving the link for the primary stream.
-        if already_trained.is_none() {
+        if !dekel && already_trained.is_none() {
             self.enable_ddi_buffer(trained_link.map(|t| t.lanes).unwrap_or(4));
         }
 
@@ -1379,7 +1386,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // the negotiated configuration (#1092).
         let (initial_rate, lanes) = match plan {
             Some(p) => (p.rate, p.lanes),
-            None => (TrainRate::Hbr2, 4),
+            None => (TrainRate::Hbr2, self.tc_width),
         };
         let result = if self.ddi as u8 >= Ddi::D as u8 {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
@@ -1418,10 +1425,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         match result {
             Ok(trained) => {
                 let pll = to_pll_rate(trained.rate);
-                // The legacy path historically discarded the
-                // trained configuration; keep that behaviour
-                // byte-identical there. The plan path consumes it.
-                let out = if plan.is_some() { Some(trained) } else { None };
+                // Dekel and negotiated modesets need the achieved width
+                // and payload. Legacy combo callers only use the PLL rate.
+                let out = if plan.is_some() || self.ddi as u8 >= Ddi::D as u8 {
+                    Some(trained)
+                } else {
+                    None
+                };
                 Ok((pll, out))
             }
             Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
@@ -1437,12 +1447,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// into this DDI's translation registers (two dwords per
     /// entry at DDI base + 0x10 + n*8). Before lane 1 the tables
     /// in `intel_gpu_ddi` had zero writers tree-wide.
-    fn load_buf_trans(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
-        if self.ddi as u8 >= Ddi::D as u8 {
-            let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
-            port.configure_lanes(self.mmio, self.tc_width)?;
-            return port.signal_levels(self.mmio, rate, &[(0, 0); 4]);
-        }
+    fn load_combo_buf_trans(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
         use crate::intel_gpu_ddi::{dp_buf_trans_table, DDI_BUF_TRANS_BASE_OFFSET};
         let bw = match rate.dpcd_link_bw_set() {
             Some(b) => b,
@@ -2942,11 +2947,38 @@ pub mod tests {
         smoke_program_routing_and_watermarks
     );
 
+    fn smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes() -> TestResult {
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::D, Pipe::B);
+        let mut mode = Mode::VESA_1024X768_60;
+        // One RBR lane carries RGB8 at up to 54 MHz.
+        let plan = LinkPlan {
+            rate: crate::dp_link_training::LinkRate::Rbr,
+            lanes: 1,
+        };
+        mode.pixel_clock_khz = 54_000;
+        if plan.check_rgb8_capacity(&mode).is_err() {
+            return TestResult::Fail("exact RGB8 link capacity should be admitted");
+        }
+        mode.pixel_clock_khz += 1;
+        if ms.modeset_with_plan(&fb_1080p(), &mode, plan)
+            != Err(ModesetError::LinkBandwidthInsufficient)
+            || !mmio.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("an undersized Type-C plan must refuse before MMIO");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes
+    );
+
     fn smoke_load_buf_trans_writes_table() -> TestResult {
         use crate::intel_gpu_ddi::{DDI_BUF_TRANS_BASE_OFFSET, HBR2_BUF_TRANS};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.load_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2)
+        ms.load_combo_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2)
             .unwrap();
         for (i, e) in HBR2_BUF_TRANS.iter().enumerate() {
             let off = Ddi::A.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
