@@ -241,6 +241,51 @@ user's request. The TSV remains 13 open rows and 94 implemented pending
 validation; calibrated radio/station prerequisites and physical acceptance
 remain open.
 
+The next same-branch continuation links AR9485 canonical PCI board settings
+and a retained qualified RX antenna scanner, AR9462/AR9565 calibrated
+concurrent-power transitions, AR9462 separately qualified NETWORK_SLEEP/
+PM-control/DTIM and sleep-only FTP feedback, and RTL8723AE's original retained
+legacy20 native station/coexistence handoff under separate NASR qualification.
+RTL8723BE now has separately qualified BBSWING thermal tracking with immutable
+original IQK/BB state and terminal lifecycle restoration. RTL8821AE has distinct
+one-/two-antenna source algorithms, original RX/H2C ownership and actual native
+scan/connect/EAPOL/LPS/watchdog/stop composition under optional fresh N21C.
+RTL8723BE and full RTL8821AE special frames require their own async preflight
+before native TX. BE/DE ASPM uses each chip's actual source recipe and PCI policy.
+
+RTL8922A now retains a separately reserved, checked closed bootstrap, BE
+MAC/BB/gain/RF/C2H owners and distinct N22P partial/N22W WLAN-only complete
+radio profiles. Separate response-bound N22O inactive-ring and no-link BE
+initialization is implemented; ordinary packet/station publication remains
+closed. N22P/N22W supply no ordinary packet authority.
+CYW43439 has a coherent whole-CS gSPI protocol/loader seam, with native
+attachment closed pending its actual exclusive host and signed selection.
+RTL8852A now has source-complete initial TSSI/channel RFK, own native MAC/
+RX/LTR startup and pre-station retune dispatch under fresh N5AM/N5ABv2/N5AC.
+Live retune and incomplete periodic adapters remain closed. DE's unsupported TX-report
+bits are removed; native Null-PM/ACK and software sleep remain closed.
+
+Explicit N48D/N65D manual antenna-sharing programs now retain actual local
+coexistence-off receipts and joint ownership across old/new IRQ, DMA and
+publication paths. AR9565 uses its own local MCI shutdown and group3 scanner;
+original MCI storage remains retained without claiming remote RF or DMA stop.
+Distinct optional N46P/N48P/N65P now compose actual native counter-driven ANI
+with original NF/IQ and stable publication ownership; P and S/D combinations
+refuse before effects.
+AE additionally has a distinct NASR2 HT20/SGI20 recipient-BA/A-MSDU path and
+NASR3 complete HT20/ASPM program. Old legacy/HT20 records cannot upgrade to
+ASPM, and source descriptor completion never substitutes for on-air ACK.
+Production-only x86_64 checks pass at intermediate boundaries. New native
+regressions are authored; **all test execution is deferred until the very end
+at the user's request**. These changes are not covered by the preceding
+4404-pass checkpoint. Broader chip profiles and the exact TSV residuals remain
+open; Aarch64 stays skipped and no new physical acceptance is claimed.
+
+The current source ledger moves the delivered RTL8723BE thermal program and
+rtlwifi coexistence feature to implemented-pending-validation: **11 open rows,
+96 implemented pending validation, 107 total**. Chip rows remain open when a
+narrow qualified profile leaves broader native functionality unfinished.
+
 The first parallel feature wave adds retained API77 Intel management-queue
 ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
 eight-byte removal response), MT7921/MT7922 active scans with four directed or
