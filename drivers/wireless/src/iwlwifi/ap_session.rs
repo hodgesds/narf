@@ -99,7 +99,10 @@ impl Session {
         hw.install_rf_policy(super::mld_policy::Authority::Transaction(
             policy.transaction(&domain)?,
         ))?;
-        let mcc = super::connection::regulatory_channels_in_domain(hw, &domain).await?;
+        let mcc = crate::future_heap::build(|| {
+            super::connection::regulatory_channels_in_domain(hw, &domain)
+        })
+        .await?;
         let power =
             super::connection::channel_power(&domain, plan.channel.number, &mcc.channels, true)
                 .ok_or("AP native MCC/host ACTIVE/non-radar permission absent")?;
@@ -122,9 +125,11 @@ impl Session {
         hw.install_rf_policy(super::mld_policy::Authority::Station(
             policy.bind(program.clone())?,
         ))?;
-        Self::prepare_native(
-            hw, plan, settings, own, chains, proof, history, program, None,
-        )
+        crate::future_heap::build(|| {
+            Self::prepare_native(
+                hw, plan, settings, own, chains, proof, history, program, None,
+            )
+        })
         .await
     }
     #[allow(clippy::too_many_arguments)]

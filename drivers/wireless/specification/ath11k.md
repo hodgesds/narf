@@ -1449,7 +1449,13 @@ concurrently).
 
 **Runtime** (`Rt` = core + `Dp` + `LinkState` + management TX IDR;
 `Shared` = `Mutex<Rt>` + a clone of the interrupt source + clock / RNG /
-`max_msg_len`). Every locked step is synchronous; waits happen on the
+`max_msg_len`). The public `Rt::core` field retains
+`Box<Ath11kCore<CeHif<Io, Irq>, Q>>`; `Rt::new(core, dp)` still accepts
+the core by value and allocates it once. Recovery retains the newly prepared
+core's existing allocation through runtime reconstruction, including failure
+parking, rather than copying its complete state through each control poll.
+The original transport, capability and cancellation owners remain attached.
+Every locked step is synchronous; waits happen on the
 interrupt source with the lock released (`Shared::wait_until`), and each
 step starts with `Rt::service()`:
 

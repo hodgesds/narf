@@ -395,17 +395,19 @@ impl Device {
                 Operation::Start(_, settings) => *settings,
                 _ => return Err(22),
             };
-            let result = Box::pin(super::super::ap_session::Session::prepare(
-                &mut state.hardware,
-                *plan,
-                settings,
-                self.mac,
-                self.tx_chains,
-                &self.policy,
-                proof.clone(),
-                self.ap_host.history.clone(),
-                request.clone(),
-            ))
+            let result = crate::future_heap::build(|| {
+                super::super::ap_session::Session::prepare(
+                    &mut state.hardware,
+                    *plan,
+                    settings,
+                    self.mac,
+                    self.tx_chains,
+                    &self.policy,
+                    proof.clone(),
+                    self.ap_host.history.clone(),
+                    request.clone(),
+                )
+            })
             .await;
             let mut ap = match result {
                 Ok(ap) => ap,

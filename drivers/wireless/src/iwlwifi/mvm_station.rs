@@ -160,6 +160,24 @@ impl Owner {
         self.restart_hardware(mac).await?;
         // DMA stop is acknowledged: retire installed keys into PN history.
         self.retire_security_after_reset()?;
+        self.reset_after_hardware_restart()?;
+        self.configure(mac).await?;
+        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
+        if nvm.channels != original.channels
+            || nvm.tx_chains != original.tx_chains
+            || nvm.rx_chains != original.rx_chains
+            || nvm.phy != original.phy
+            || nvm.he != original.he
+        {
+            return Err("MVM recovery changed NVM identity");
+        }
+        Ok(())
+    }
+
+    // Power embeds the large inline MLME context. Its fresh construction is
+    // synchronous and must not share the recovery poll's transport temporaries.
+    #[inline(never)]
+    fn reset_after_hardware_restart(&mut self) -> Result<(), &'static str> {
         let parsed = super::super::parse_ucode(&self.firmware)
             .map_err(|_| "invalid retained MVM firmware")?;
         // Every per-association owner named firmware objects or DMA of the
@@ -173,16 +191,6 @@ impl Owner {
         self.mac = None;
         self.nvm = None;
         self.phase = Phase::Starting;
-        self.configure(mac).await?;
-        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
-        if nvm.channels != original.channels
-            || nvm.tx_chains != original.tx_chains
-            || nvm.rx_chains != original.rx_chains
-            || nvm.phy != original.phy
-            || nvm.he != original.he
-        {
-            return Err("MVM recovery changed NVM identity");
-        }
         Ok(())
     }
 

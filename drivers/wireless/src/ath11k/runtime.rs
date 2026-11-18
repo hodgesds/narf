@@ -933,7 +933,7 @@ pub struct MgmtTxBuf {
 /// `struct ath11k` as the running driver sees them).
 #[allow(missing_debug_implementations)]
 pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
-    pub core: Ath11kCore<CeHif<Io, Irq>, Q>,
+    pub core: alloc::boxed::Box<Ath11kCore<CeHif<Io, Irq>, Q>>,
     pub dp: Dp,
     /// The three independently addressable vdev slots NARF currently admits.
     /// Entry index always equals its WMI `vdev_id`.
@@ -1045,6 +1045,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// A runtime over a ready core and its DP.
     #[inline(never)]
     pub fn new(core: Ath11kCore<CeHif<Io, Irq>, Q>, dp: Dp) -> Self {
+        Self::from_retained_core(alloc::boxed::Box::new(core), dp)
+    }
+
+    // Recovery already owns this same core allocation. Retain it while
+    // rebuilding the smaller runtime rather than copying the core twice.
+    #[inline(never)]
+    fn from_retained_core(core: alloc::boxed::Box<Ath11kCore<CeHif<Io, Irq>, Q>>, dp: Dp) -> Self {
         let own = core.mac_addr.unwrap_or_default();
         let mut vdevs = Vec::with_capacity(WCN6855_MAX_VDEVS);
         for _ in 0..WCN6855_MAX_VDEVS {
@@ -3435,7 +3442,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             ..
         } = *rt;
         let (dp_cfg, sizes, msi) = (dp.cfg, dp.sizes, dp.msi());
-        let (mut hif, qmi, cfg) = core.into_parts();
+        let (mut hif, qmi, cfg) = (*core).into_parts();
         dp.pdev_free(&mut hif.ce.hal);
         hif.ce.cleanup_pipes();
         dp.pdev_reo_cleanup(&mut hif.ce.hal);
@@ -3446,8 +3453,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // structs, and holding them by value across `qmi_firmware_ready`
         // blew the 8 KiB kernel stack-frame budget (this closure measured
         // 17_896 bytes on main at 4a67c1cc). Holding `Box`es keeps the
-        // future's state and the poll's by-value moves pointer-sized; the
-        // core is unboxed once, for `Rt::new`, after the await.
+        // future's state and the poll's by-value moves pointer-sized. The
+        // original core allocation is retained in the rebuilt runtime.
         let mut core = match Ath11kCore::new(hif, qmi, cfg) {
             Ok(c) => alloc::boxed::Box::new(c),
             Err((e, hif, qmi)) => {
@@ -3467,7 +3474,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let r = super::future_heap::build(|| core.qmi_firmware_ready(&mut *hooks)).await;
         let dp = hooks.dp.take();
         let (core, dp) = match (r, dp) {
-            (Ok(()), Some(dp)) => (*core, dp),
+            (Ok(()), Some(dp)) => (core, dp),
             (r, dp) => {
                 let e = r
                     .err()
@@ -3482,7 +3489,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 return Err(te);
             }
         };
-        let mut rt = alloc::boxed::Box::new(Rt::new(core, dp));
+        let mut rt = alloc::boxed::Box::new(Rt::from_retained_core(core, dp));
         // A completed physical transport reset terminates old untagged
         // statistics transactions; reuse the physical cache identity.
         self.tx_power_stats.lock().reset();
