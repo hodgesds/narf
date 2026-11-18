@@ -178,7 +178,7 @@ impl Session {
         hw.ap_phy(&super::station_api::phy_channel(1, plan.channel))
             .await?;
         let qualification = if let Some(power) = power {
-            Some(alloc::boxed::Box::new(power.apply(hw).await?))
+            Some(power.apply(hw).await?)
         } else {
             None
         };
