@@ -516,7 +516,7 @@ impl Backend for Hardware {
                     .map_err(Error::Mes)?,
                 );
                 // SAFETY: same exclusive completed cold-start prerequisites.
-                unsafe { self.mes.as_mut().unwrap().start() }
+                crate::out_of_line::boxed!(unsafe { self.mes.as_mut().unwrap().start() })
                     .await
                     .map_err(Error::Mes)?;
             }

@@ -254,12 +254,13 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let base = self.memory.address();
         let map = self.memory.mapping();
-        let mqds = [
-            api::mqd(queue_memory(base, 0)),
-            api::mqd(queue_memory(base, 1)),
-        ];
-        let [mqd0, mqd1] = mqds.map(|m| m.map_err(|_| Error::Invalid));
-        let mqds = [mqd0?, mqd1?];
+        // Build both 2 KiB descriptors before any queue programming.
+        let mqd = |pipe| {
+            api::mqd(queue_memory(base, pipe))
+                .map(alloc::boxed::Box::new)
+                .map_err(|_| Error::Invalid)
+        };
+        let mqds = [mqd(0)?, mqd(1)?];
         self.access(|io| {
             let fb = u64::from(checked(io.read(l.gc + 0x1614 * 4))? & 0xffffff) << 24;
             let end = (u64::from(checked(io.read(l.gc + 0x1615 * 4))? & 0xffffff) + 1) << 24;
@@ -360,6 +361,7 @@ impl<I: Io> Engine<I> {
                 io.w(l.gc + 0x1fab * 4, 1)
             })
         })?;
+        drop(mqds);
         self.versions[1] = self.version(1).await?;
         self.resources(1).await?;
         let sched = api::KernelQueue {

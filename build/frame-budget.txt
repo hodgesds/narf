@@ -33,7 +33,6 @@
 16472 narf_userspace::abi_test_support::with_setup
 16064 narf_drivers_wireless::rtlwifi::prepare::station::<impl narf_drivers_wireless::rtlwifi::prepare::Prepared<I,M>>::connect_station::{{closure}}::{{closure}}
 15320 narf_drivers_wireless::rtlwifi::prepare_native::initialize_registered_on_channel::{{closure}}
-14408 narf_drivers_gpu::amdgpu_mes12_hw::Engine<I>::start::{{closure}}
 14408 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe::{{closure}}
 13848 narf_time::timer::timers_prepare_cpu
 13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
