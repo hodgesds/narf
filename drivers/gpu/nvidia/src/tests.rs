@@ -6199,3 +6199,97 @@ fn smoke_c57e_stage_surface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/dispc57e", smoke_c57e_stage_surface);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM DisplayPort link training (NV0073_CTRL_CMD_DP_*)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_dp_ctrl_link_config() -> TestResult {
+    use crate::gsp_dp::{
+        parse_dp_ctrl, set_link_config_params, CMD_SET_ENHANCED_FRAMING, CMD_SET_LANE_COUNT,
+        CMD_SET_LINK_BW, DATA_ENHANCED_FRAMING, LINK_BW_5_40GBPS,
+    };
+    // 4-lane HBR2 (5.40 Gbps) link, enhanced framing.
+    let p = set_link_config_params(0x100, 4, LINK_BW_5_40GBPS);
+    // displayId @4.
+    if u32::from_le_bytes([p[4], p[5], p[6], p[7]]) != 0x100 {
+        return TestResult::Fail("displayId wrong");
+    }
+    // cmd @8 = SET_LANE_COUNT | SET_LINK_BW | SET_ENHANCED_FRAMING.
+    let cmd = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    if cmd != (CMD_SET_LANE_COUNT | CMD_SET_LINK_BW | CMD_SET_ENHANCED_FRAMING) {
+        return TestResult::Fail("cmd wrong");
+    }
+    // data @12 = lanes(4) | bw(0x14<<8) | enhanced(1<<18).
+    let data = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+    if data != (4 | (0x14 << 8) | DATA_ENHANCED_FRAMING) {
+        return TestResult::Fail("data wrong");
+    }
+    // Reply parse: err @16, data @12.
+    let mut reply = p;
+    reply[16..20].copy_from_slice(&0u32.to_le_bytes()); // err = 0 → ok
+    match parse_dp_ctrl(&reply) {
+        Some((0, d)) if d == data => TestResult::Pass,
+        _ => TestResult::Fail("parse_dp_ctrl wrong"),
+    }
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_ctrl_link_config);
+
+fn smoke_dp_set_lane_data() -> TestResult {
+    use crate::gsp_dp::{lane_data, set_lane_data_params};
+    // 4 lanes, drive=1 preemph=2 each → code 0x6.
+    let code = lane_data(1, 2);
+    if code != ((2) | (1 << 2)) {
+        return TestResult::Fail("lane_data encode wrong");
+    }
+    let p = set_lane_data_params(0x100, &[code; 4]);
+    // numLanes @8.
+    if u32::from_le_bytes([p[8], p[9], p[10], p[11]]) != 4 {
+        return TestResult::Fail("numLanes wrong");
+    }
+    // data[0] @12, data[3] @24.
+    if u32::from_le_bytes([p[12], p[13], p[14], p[15]]) != code
+        || u32::from_le_bytes([p[24], p[25], p[26], p[27]]) != code
+    {
+        return TestResult::Fail("lane data placement wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_set_lane_data);
+
+fn smoke_dp_auxch() -> TestResult {
+    use crate::gsp_dp::{
+        aux_cmd, aux_read_params, aux_write_params, parse_aux_reply, AUX_REQ_READ, AUX_TYPE_AUX,
+    };
+    // Native-AUX read cmd = REQ_READ(1) | TYPE_AUX(1<<3) = 0x9.
+    if aux_cmd(AUX_REQ_READ, true) != (1 | AUX_TYPE_AUX) {
+        return TestResult::Fail("aux_cmd wrong");
+    }
+    // Read 1 byte at DPCD 0x0 (DPCD_REV): size field = len-1 = 0.
+    let r = aux_read_params(0x100, 0x0, 1);
+    if u32::from_le_bytes([r[12], r[13], r[14], r[15]]) != (1 | AUX_TYPE_AUX) {
+        return TestResult::Fail("read cmd wrong");
+    }
+    if u32::from_le_bytes([r[36], r[37], r[38], r[39]]) != 0 {
+        return TestResult::Fail("read size (len-1) wrong");
+    }
+    // Write 2 bytes (LINK_BW_SET, LANE_COUNT_SET) at 0x100: size = 1.
+    let w = aux_write_params(0x100, 0x100, &[0x14, 0x84]);
+    if u32::from_le_bytes([w[16], w[17], w[18], w[19]]) != 0x100 {
+        return TestResult::Fail("write addr wrong");
+    }
+    if w[20] != 0x14 || w[21] != 0x84 {
+        return TestResult::Fail("write data wrong");
+    }
+    if u32::from_le_bytes([w[36], w[37], w[38], w[39]]) != 1 {
+        return TestResult::Fail("write size (len-1) wrong");
+    }
+    // Reply parse: size=0 → 1 byte at offset 20.
+    let mut reply = r;
+    reply[20] = 0x12; // DPCD rev 1.2
+    match parse_aux_reply(&reply) {
+        Some(d) if d.len() == 1 && d[0] == 0x12 => TestResult::Pass,
+        _ => TestResult::Fail("parse_aux_reply wrong"),
+    }
+}
+kernel_test_in!("drivers/nvidia/dp", smoke_dp_auxch);

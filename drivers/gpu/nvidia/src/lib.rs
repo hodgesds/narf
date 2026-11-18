@@ -54,6 +54,7 @@ pub mod gsp_args;
 pub mod gsp_boot;
 pub mod gsp_chan;
 pub mod gsp_disp;
+pub mod gsp_dp;
 pub mod gsp_elf;
 pub mod gsp_fw;
 pub mod gsp_image;
