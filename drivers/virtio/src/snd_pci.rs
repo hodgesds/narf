@@ -47,7 +47,10 @@ use crate::{
 };
 /// Re-exported for the kernel tests: the mute-report helper lives
 /// with `Card::set_control` in `sound_card`, and the tests pin its
-/// polarity from here.
+/// polarity from here. Gated to x86_64 because the test module
+/// (`tests.rs`) compiles only on that arch; without the gate the
+/// re-export is unused on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub(crate) use sound_card::report_mute_write;
 
 // ── Spec constants (VirtIO 1.2 §5.14.6) ─────────────────────────────
