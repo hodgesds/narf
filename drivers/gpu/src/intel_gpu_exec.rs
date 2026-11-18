@@ -1005,7 +1005,11 @@ impl PpgttProbeResult {
     /// Call after a successful terminal fence. Check the complete destination
     /// and unchanged code page, including all bytes outside the written word.
     pub fn verify(&self) -> Result<(), FsError> {
-        let mut bytes = [0; 4096];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(PAGE as usize)
+            .map_err(|_| FsError::OutOfMemory)?;
+        bytes.resize(PAGE as usize, 0);
         self.data.read(0, &mut bytes)?;
         for (i, byte) in bytes.iter().enumerate() {
             let expected = if (0x80..0x84).contains(&i) {
