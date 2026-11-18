@@ -2683,7 +2683,12 @@ kernel_test_in!(
 );
 
 fn smoke_oa_per_context_enable_disable_sequence() -> TestResult {
-    let backend = Backend::new(device(61, MTL, 1270));
+    // Card 31: the OA config registry is per-card for the device lifetime
+    // and never cleared by teardown, so this test needs a card no earlier
+    // test in the boot registered a config on. Card 61 was taken by the
+    // buffer_size test (uuid(1)); cards 32-34 are claimed by open PRs
+    // #2178/#2177/#2174 and 35-37 by earlier fixes (see #2233).
+    let backend = Backend::new(device(31, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let alive = Arc::new(AtomicBool::new(true));
