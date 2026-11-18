@@ -322,8 +322,12 @@ impl<I: Io> Access<'_, I> {
         }
         Ok(())
     }
-    async fn dmac(&mut self, n51: bool) -> Result<(), Error> {
-        self.scc(n51).await?;
+    async fn dmac(&mut self, n51: bool, a: bool) -> Result<(), Error> {
+        if a {
+            self.scc_a().await?;
+        } else {
+            self.scc(n51).await?;
+        }
         self.m8(R_AX_SS_CTRL, B_AX_SS_EN, B_AX_SS_EN)?;
         self.poll(R_AX_SS_CTRL, B_AX_SS_INIT_DONE_1, B_AX_SS_INIT_DONE_1, 2000)
             .await?;
@@ -354,7 +358,7 @@ impl<I: Io> Access<'_, I> {
             B_AX_APPEND_ICV | B_AX_APPEND_MIC,
         )
     }
-    async fn cmac(&mut self) -> Result<(), Error> {
+    async fn cmac(&mut self, a_cut: Option<u8>) -> Result<(), Error> {
         self.f32(
             R_AX_PREBKF_CFG_1,
             B_AX_SIFS_MACTXEN_T1_MASK,
@@ -457,7 +461,14 @@ impl<I: Io> Access<'_, I> {
             R_AX_TRXPTCL_RESP_0,
             B_AX_WMAC_SPEC_SIFS_CCK_MASK | B_AX_WMAC_SPEC_SIFS_OFDM_MASK,
             field(B_AX_WMAC_SPEC_SIFS_CCK_MASK, WMAC_SPEC_SIFS_CCK)
-                | field(B_AX_WMAC_SPEC_SIFS_OFDM_MASK, WMAC_SPEC_SIFS_OFDM_52B),
+                | field(
+                    B_AX_WMAC_SPEC_SIFS_OFDM_MASK,
+                    if a_cut.is_some() {
+                        0x15
+                    } else {
+                        WMAC_SPEC_SIFS_OFDM_52B
+                    },
+                ),
         )?;
         self.m32(
             R_AX_RXTRIG_TEST_USER_2,
@@ -484,7 +495,18 @@ impl<I: Io> Access<'_, I> {
         self.m8(R_AX_RCR, B_AX_CH_EN_MASK, field(B_AX_CH_EN_MASK, 1))?;
         // B SCC cma0_dma minimum89*128=11392 bytes is below Linux's
         //11454+512 cap. Flooring to512-byte units therefore yields22.
-        self.f32(R_AX_RX_FLTR_OPT, B_AX_RX_MPDU_MAX_LEN_MASK, 22)?;
+        // A cma0_dma356*128 exceeds RX_SPEC_MAX_LEN (11454+512);
+        // source min/cap/floor in512-byte units therefore yields23.
+        self.f32(
+            R_AX_RX_FLTR_OPT,
+            B_AX_RX_MPDU_MAX_LEN_MASK,
+            if a_cut.is_some() { 23 } else { 22 },
+        )?;
+        if a_cut == Some(1) {
+            // Actual corrected CHIP_CBV; never guess a cut on the A route.
+            self.m16(R_AX_DLK_PROTECT_CTL, B_AX_RX_DLK_CCA_TIME_MASK, 0)?;
+            self.m16(R_AX_RCR, 1 << 12, 1 << 12)?;
+        }
         self.m8(R_AX_PLCP_HDR_FLTR, B_AX_VHT_SU_SIGB_CRC_CHK, 0)?;
         self.m32(
             R_AX_TX_SUB_CARRIER_VALUE,
@@ -524,7 +546,7 @@ impl<I: Io> Access<'_, I> {
         self.f32(R_AX_AGG_LEN_VHT_0, B_AX_AMPDU_MAX_LEN_VHT_MASK, 0x3ff80)?;
         self.m8(R_AX_RXDMA_CTRL_0, RX_FULL_MODE, 0)
     }
-    fn interrupts(&mut self) -> Result<(), Error> {
+    fn interrupts(&mut self, a: bool) -> Result<(), Error> {
         // These are internal MAC error masks, not PCI/MSI delivery. Preserve
         // original per-register clr/set ordering, including Linux's zero sets.
         for (reg, clear, set) in [
@@ -593,7 +615,15 @@ impl<I: Io> Access<'_, I> {
                 B_AX_SORT_NON_IDLE_ERR_INT_EN | B_AX_FSM_TIMEOUT_ERR_INT_EN,
                 B_AX_FSM_TIMEOUT_ERR_INT_EN,
             ),
-            (R_AX_PTCL_IMR0, B_AX_PTCL_IMR_CLR_ALL, B_AX_PTCL_IMR_SET),
+            (
+                R_AX_PTCL_IMR0,
+                if a {
+                    0xff80_df01
+                } else {
+                    B_AX_PTCL_IMR_CLR_ALL
+                },
+                B_AX_PTCL_IMR_SET,
+            ),
             (R_AX_DLE_CTRL, B_AX_DLE_IMR_CLR, B_AX_DLE_IMR_SET),
             (R_AX_PHYINFO_ERR_IMR, 0, 0),
             (R_AX_RMAC_ERR_ISR, B_AX_RMAC_IMR_CLR, B_AX_RMAC_IMR_SET),
@@ -635,6 +665,8 @@ impl Mac {
     /// owner. WCPU is actually initialized and CH12 consumption is drained;
     /// no packet DMA, IRQ, radio/channel, key, reset or station producer exists.
     /// The caller retains all previously published DMA even on error or drop.
+    /// A additionally requires the fresh exact N5AM recipe on every effect;
+    /// historical cold N5AB-v1 is not its newly routed MAC authority.
     pub async unsafe fn prepare(
         &mut self,
         io: &mut impl Io,
@@ -644,7 +676,9 @@ impl Mac {
             return Err(Error::Terminal);
         }
         let identity = factory.identity().ok_or(Error::Unsupported)?;
+        let a = identity.chip() == ChipId::Rtl8852A;
         let (c, n51) = match identity.chip() {
+            ChipId::Rtl8852A if factory.a_phycap().is_some() => (false, false),
             ChipId::Rtl8852B if factory.b_phycap().is_some() => (false, false),
             ChipId::Rtl8852C if factory.c_phycap().is_some() => (true, false),
             // RTL8851B: B's download geometry (download_dma) and B MAC with
@@ -662,7 +696,7 @@ impl Mac {
         let (stopped, rx, hci_reg) = if c {
             (0x000b_ff00, 1 << 15, 0x7880)
         } else {
-            (0x000b_0f00, 1 << 13, 0x8380)
+            (if a { 0x000b_ff00 } else { 0x000b_0f00 }, 1 << 13, 0x8380)
         };
         self.state = State::Preparing;
         let mut a = Access(io);
@@ -681,6 +715,9 @@ impl Mac {
         if stops & stopped != stopped || init & rx != 0 || hci & 2 != 0 {
             return Err(Error::Access);
         }
+        if identity.chip() == ChipId::Rtl8852A {
+            a.mac1_off_a()?;
+        }
         if c {
             a.enable_bb_rf_c().await?;
             a.system_c()?;
@@ -690,11 +727,16 @@ impl Mac {
             a.host_rpq()?;
             a.trx_tail_c()?;
         } else {
-            a.enable_bb_rf(n51).await?;
+            if identity.chip() == ChipId::Rtl8852A {
+                a.enable_bb_rf_a()?;
+            } else {
+                a.enable_bb_rf(n51).await?;
+            }
             a.system()?;
-            a.dmac(n51).await?;
-            a.cmac().await?;
-            a.interrupts()?;
+            a.dmac(n51, identity.chip() == ChipId::Rtl8852A).await?;
+            a.cmac((identity.chip() == ChipId::Rtl8852A).then_some(identity.cut()))
+                .await?;
+            a.interrupts(identity.chip() == ChipId::Rtl8852A)?;
             a.host_rpq()?;
         }
         let dmac = if c { c::B_AX_H_AXIDMA_EN } else { 0 }
@@ -738,6 +780,8 @@ impl Mac {
     }
 }
 
+#[path = "mac_runtime/a.rs"]
+pub(in crate::rtw89) mod a;
 #[path = "mac_runtime/c.rs"]
 mod c;
 

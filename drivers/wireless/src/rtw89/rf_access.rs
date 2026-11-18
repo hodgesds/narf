@@ -49,7 +49,11 @@ impl Rf {
         if self.state != State::Idle {
             return Err(Error::Terminal);
         }
-        if path > 1 || address & !0x100ff != 0 || mask & RF_MASK == 0 {
+        if self.chip == ChipId::Rtl8922A
+            || path > 1
+            || address & !0x100ff != 0
+            || mask & RF_MASK == 0
+        {
             return Err(Error::Unsupported);
         }
         self.state = State::Busy;

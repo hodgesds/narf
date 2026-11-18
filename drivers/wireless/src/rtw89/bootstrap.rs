@@ -458,7 +458,10 @@ impl Bootstrap {
                                     Phase::Discovered
                                         | Phase::RadioTablesLoaded
                                         | Phase::BasicCalibrated
-                                )
+                                ) || (owner.io.phase() == Phase::Running
+                                    && owner.io.identity().is_some_and(|id| {
+                                        id.chip() == super::mac::ChipId::Rtl8852A
+                                    }))
                             });
                             (
                                 retry,

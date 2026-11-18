@@ -13,9 +13,38 @@
 //! bytes are reserved in `struct rtw8852a_efuse`), so this calibration
 //! carries none, unlike the B one.
 use super::{
-    factory::{Factory, A_PHYCAP_ADDR},
+    factory::{Factory, Identity, A_PHYCAP_ADDR},
     mac::ChipId,
 };
+
+/// `rtw8852a_fem_setup`: flags are indexed by band (2G, 5G), not RF
+/// path. RFE presence is a factory fact; this grants no RF operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Fem {
+    pub epa: [bool; 2],
+    pub elna: [bool; 2],
+}
+impl Fem {
+    pub fn from_identity(identity: Identity) -> Option<Self> {
+        (identity.chip() == ChipId::Rtl8852A)
+            .then(|| Self::from_rfe(identity.calibration().rfe_type))
+            .flatten()
+    }
+    /// Literal source switch including its 2G -> 5G fallthrough. An
+    /// erased RFE cannot replace the actual qualified factory identity.
+    pub const fn from_rfe(rfe: u8) -> Option<Self> {
+        let flags = match rfe {
+            255 => return None,
+            11 | 12 | 17 | 18 | 51 | 53 => [true, true],
+            9 | 10 | 15 | 16 => [false, true],
+            _ => [false, false],
+        };
+        Some(Self {
+            epa: flags,
+            elna: flags,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Calibration {

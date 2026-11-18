@@ -57,8 +57,19 @@ mod bacam_v1;
 #[cfg(any(test, feature = "kernel-test"))]
 mod bacam_v1_tests;
 mod bdram;
+mod be_coex;
+mod be_control;
+mod be_mac1;
+mod be_mailbox;
+mod be_mlme;
+mod be_packet_qualification;
+mod be_path;
+mod be_qualification;
+mod be_scheduler;
+mod be_wlan_qualification;
 mod block_ack;
 mod bootstrap;
+mod bootstrap_8922a;
 pub mod btc;
 mod calibration_policy;
 mod cctl_g7;
@@ -72,9 +83,11 @@ mod channel_be;
 mod channel_c;
 mod channel_rf;
 mod channel_transition;
+mod checked_fwdl_8922a;
 mod chip_8922a;
 mod coex_native;
 mod cold;
+mod cold_8922a;
 mod cold_native;
 mod command_native;
 mod command_queue;
@@ -103,6 +116,7 @@ mod factory;
 mod factory_51;
 mod factory_a;
 mod factory_b;
+mod factory_be;
 mod factory_c;
 mod fifo;
 mod fifo_regs;
@@ -126,12 +140,17 @@ mod lps;
 mod lps_packets;
 mod lps_wire;
 pub mod mac;
+mod mac_a_policy;
 pub mod mac_init;
 mod mac_pre_init_8922a;
 mod mac_runtime;
 mod mac_runtime_regs;
+mod mac_system_8922a;
 mod monitor;
 mod monitor_wire;
+mod native_packet_be;
+mod native_radio_be;
+mod native_radio_be_io;
 mod nhm;
 mod operating_channel;
 mod operating_channel_c;
@@ -148,6 +167,7 @@ mod pcie_regs;
 pub mod phy;
 mod phy_access;
 mod phy_operating;
+mod phy_operating_be;
 pub mod phy_table;
 mod power;
 mod power_native;
@@ -168,6 +188,7 @@ mod radio_be;
 mod radio_c;
 mod radio_full;
 mod radio_gain;
+mod radio_gain_be;
 mod radio_init;
 mod radio_policy;
 mod radio_policy_51;
@@ -183,6 +204,7 @@ mod radio_tables_a;
 mod radio_tables_b;
 mod radio_trim;
 mod rf_access;
+mod rf_access_be;
 mod rf_tracking;
 mod rfk;
 mod rfk_regs;
@@ -199,6 +221,7 @@ mod station_composition_tests;
 pub(super) mod station_control;
 mod station_lifecycle;
 mod track;
+mod trx_8922a;
 mod tssi;
 mod tx_8922a;
 #[cfg(any(test, feature = "kernel-test"))]
@@ -275,7 +298,12 @@ pub const ALL_DEV_IDS: &[u16] = &[
 pub const fn bootstrap_did(did: u16) -> bool {
     matches!(
         did,
-        RTL_DEV_8852BE | RTL_DEV_8852BE_ALT | RTL_DEV_8852CE | RTL_DEV_8851BE
+        RTL_DEV_8852AE
+            | RTL_DEV_8852AE_VT
+            | RTL_DEV_8852BE
+            | RTL_DEV_8852BE_ALT
+            | RTL_DEV_8852CE
+            | RTL_DEV_8851BE
     )
 }
 

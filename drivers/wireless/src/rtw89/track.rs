@@ -15,6 +15,8 @@
 //! `dcfo_comp_sft` 12) on its admitted 2.4/5 GHz 20 MHz station profiles;
 //! DIG takes `fa_th_5g` on a 5 GHz link (`rtw89_phy_dig_update_para`).
 use super::power;
+#[path = "track/a.rs"]
+pub(super) mod a;
 
 /// `RTW89_TRACK_WORK_PERIOD` (2 s).
 pub(super) const PERIOD_MS: u64 = 2000;
@@ -190,6 +192,9 @@ pub(super) struct Profile {
 }
 /// Register access for track work, enclosed by the owner's current authority.
 pub(super) trait Hw {
+    fn width(&mut self) -> Result<crate::rtw89::operating_channel::Width, power::Error> {
+        Ok(crate::rtw89::operating_channel::Width::Mhz20)
+    }
     /// Optional actual same-radio periodic DPK; old qualified profiles no-op.
     async fn rfk(&mut self) -> Result<(), power::Error> {
         Ok(())
@@ -425,6 +430,15 @@ impl Dig {
     /// `__rtw89_phy_dig` decisions for one period (pure). `ghz5` is the
     /// operating band `rtw89_phy_dig_update_para` reads at a link change.
     pub(super) fn step(&mut self, rssi_min: Option<u8>, fa_permil: u32, ghz5: bool) -> DigOutput {
+        self.step_width(rssi_min, fa_permil, ghz5, PD_TH_BW20_CMP_VAL)
+    }
+    fn step_width(
+        &mut self,
+        rssi_min: Option<u8>,
+        fa_permil: u32,
+        ghz5: bool,
+        width_offset: u8,
+    ) -> DigOutput {
         let linked = rssi_min.is_some();
         // rtw89_phy_dig_update_rssi_info
         let igi_rssi = rssi_min.map_or(RSSI_NOLINK, |rssi| rssi >> 1);
@@ -462,7 +476,7 @@ impl Dig {
             dyn_max
         };
         // rtw89_phy_dig_dyn_pd_th (enable) with dyn_pd_th_max = igi_rssi
-        let under = PD_LOW_TH_OFFSET + PD_TH_SB_FLTR_CMP_VAL + PD_TH_BW20_CMP_VAL;
+        let under = PD_LOW_TH_OFFSET + PD_TH_SB_FLTR_CMP_VAL + width_offset;
         let final_rssi = self.igi_fa_rssi.min(igi_rssi);
         let ofdm = final_rssi.clamp(PD_TH_MIN_RSSI + under, PD_TH_MAX_RSSI + under);
         let cck = (final_rssi.wrapping_sub(under) as i8).max(CCKPD_TH_MIN_RSSI);
@@ -682,6 +696,9 @@ impl Cfo {
 /// Track-work state for the single station link.
 #[derive(Debug, Default)]
 pub(super) struct Tracker {
+    a_cut: Option<u8>,
+    a_gain: Option<crate::rtw89::dig_a::Gains>,
+    a_nhm: Option<crate::rtw89::nhm::NhmState>,
     next_ms: u64,
     initialized: bool,
     env: Env,
@@ -800,14 +817,33 @@ impl Tracker {
                 B_AX_FWD_PPDU_STAT_MASK,
                 RTW89_PRPT_DEST_HOST,
             )?;
-            self.env.init(hw)?;
-            self.cfo.init(profile);
+            if self.a_cut.is_none() {
+                self.env.init(hw)?;
+                self.cfo.init(profile);
+            }
             self.initialized = true;
         }
         self.throughput();
         let rssi_min = peer.map(|_| self.rssi.read());
         self.env.track(hw)?;
-        let output = self.dig.step(rssi_min, self.env.fa_permil(), ghz5);
+        let output = if let Some(cut) = self.a_cut {
+            if layout != a::LAYOUT || profile.cck_pd != (cut > 1) {
+                return Err(power::Error::Unsupported);
+            }
+            let offset = match hw.width()? {
+                crate::rtw89::operating_channel::Width::Mhz20 => 0,
+                crate::rtw89::operating_channel::Width::Mhz40 => 3,
+                crate::rtw89::operating_channel::Width::Mhz80 => 6,
+                _ => return Err(power::Error::Unsupported),
+            };
+            let output = self
+                .dig
+                .step_width(rssi_min, self.env.fa_permil(), ghz5, offset);
+            a::program_gain(hw, cut, self.a_gain, self.dig.igi_fa_rssi, ghz5)?;
+            output
+        } else {
+            self.dig.step(rssi_min, self.env.fa_permil(), ghz5)
+        };
         Dig::program(hw, &layout, output, profile.cck_pd)?;
         hw.rfk().await?;
         if self.cfo.track(self.tx_throughput()) {

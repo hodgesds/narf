@@ -68,6 +68,36 @@ const A_RECIPE: &[u8] = b"rtw89_mac_init(A) then phy.c rtw89_phy_dm_init: rtw89_
 /// scbd/cxinit/cxctrl/`_set_ant` owner steps.
 const A_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8852a_btc_set_rfe (rfe>0 ant num 2 odd/3 even else 2, num 3 dedicated alone else shared BTG with WL path B, isolation 10), rtw8852a_btc_init_cfg (rtw89_mac_coex_init RTK inner, wl_pri TX_RESP/BEACON, RR_WLSEL 0 both paths, trx mask SS 0x5ff shared/0x5df dedicated + TX 0x5ff path A shared, break 0xf0ffffff, BT cnt en|rst), OFF_BT policy";
 impl Board {
+    pub(super) fn new_packet_be(
+        facts: &super::be_qualification::Facts<'_>,
+        response: &super::be_packet_qualification::Response,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            identity: super::be_packet_qualification::identity(facts, response)?,
+            mac: facts.factory.factory.mac,
+            device: facts.device.device,
+            chip: ChipId::Rtl8922A,
+        })
+    }
+    pub(super) fn new_wlan_be(facts: &super::be_qualification::Facts<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            identity: super::be_wlan_qualification::identity(facts)?,
+            mac: facts.factory.factory.mac,
+            device: facts.device.device,
+            chip: ChipId::Rtl8922A,
+        })
+    }
+    pub(super) fn new_partial_be(
+        facts: &super::be_qualification::Facts<'_>,
+    ) -> Result<Self, Error> {
+        let identity = super::be_qualification::identity(facts)?;
+        Ok(Self {
+            identity,
+            mac: facts.factory.factory.mac,
+            device: facts.device.device,
+            chip: ChipId::Rtl8922A,
+        })
+    }
     pub fn new(
         factory: &Factory,
         device: narf_bus::DeviceId,
@@ -333,45 +363,76 @@ pub(super) struct Calibration {
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
 }
-struct Decode(Board);
+struct Decode {
+    board: Board,
+    magic: &'static [u8; 4],
+}
 impl CapOp<FirmwareBlob, Read> for Decode {
     type Output = Result<Calibration, Error>;
     fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
         Ok((|| {
             let view = narf_firmware::view_of(cap).map_err(Error::Firmware)?;
-            Calibration::from_verified(view.bytes, view.signer, self.0, *cap)
+            Calibration::decode_record(view.bytes, view.signer, self.board, *cap, self.magic)
         })())
     }
 }
 impl Calibration {
     pub fn load(board: Board) -> Result<Self, Error> {
+        Self::load_record(board, board.family().0, board.family().1)
+    }
+    /// Separate NARF-local partial BE program record. This does not change
+    /// historical N22A-v1's identity, loader name or admitted recipe.
+    pub(super) fn load_partial_be(board: Board) -> Result<Self, Error> {
+        if board.chip != ChipId::Rtl8922A {
+            return Err(Error::Identity);
+        }
+        Self::load_record(board, b"N22P", "8922a-partial")
+    }
+    pub(super) fn load_wlan_be(board: Board) -> Result<Self, Error> {
+        if board.chip != ChipId::Rtl8922A {
+            return Err(Error::Identity);
+        }
+        Self::load_record(board, b"N22W", "8922a-wlan")
+    }
+    pub(super) fn load_packet_be(board: Board) -> Result<Self, Error> {
+        if board.chip != ChipId::Rtl8922A {
+            return Err(Error::Identity);
+        }
+        Self::load_record(board, b"N22O", "8922a-packet")
+    }
+    fn load_record(board: Board, magic: &'static [u8; 4], family: &str) -> Result<Self, Error> {
         let m = board.mac;
         let name = format!(
             "rtw89/rtw{}-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            board.family().1,
-            m[0],
-            m[1],
-            m[2],
-            m[3],
-            m[4],
-            m[5]
+            family, m[0], m[1], m[2], m[3], m[4], m[5]
         );
         let loader = narf_firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
         let cap = narf_firmware::open(&name, &loader).map_err(Error::Firmware)?;
-        cap.invoke(Decode(board)).map_err(|_| Error::Authority)?
+        cap.invoke(Decode { board, magic })
+            .map_err(|_| Error::Authority)?
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn from_verified(
         bytes: &[u8],
         signer: Option<[u8; 32]>,
         board: Board,
         authority: Cap<FirmwareBlob, Read>,
     ) -> Result<Self, Error> {
+        Self::decode_record(bytes, signer, board, authority, board.family().0)
+    }
+    fn decode_record(
+        bytes: &[u8],
+        signer: Option<[u8; 32]>,
+        board: Board,
+        authority: Cap<FirmwareBlob, Read>,
+        magic: &[u8; 4],
+    ) -> Result<Self, Error> {
         authority.invoke(Current).map_err(|_| Error::Authority)?;
         signer.ok_or(Error::Unsigned)?;
         if bytes.len() != LENGTH
-            || &bytes[..4] != board.family().0
+            || &bytes[..4] != magic
             || bytes[4..8] != [1, 0, 96, 0]
             || bytes[8..12] != (LENGTH as u32).to_le_bytes()
             || bytes[12..14] != 0x10ecu16.to_le_bytes()
@@ -421,12 +482,22 @@ impl Calibration {
         &self,
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
+        self.with_current_result(operation)
+    }
+    /// Preserve a checked owner's concrete error while enclosing its actual
+    /// descriptor/RX-memory operation in the same signed current-policy scope.
+    pub(super) fn with_current_result<T, E: From<super::power::Error>>(
+        &self,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         struct Invoke<'a, F> {
             qualification: &'a Calibration,
             operation: F,
         }
-        impl<T, F: FnOnce() -> Result<T, super::power::Error>> CapOp<FirmwareBlob, Read> for Invoke<'_, F> {
-            type Output = Result<T, super::power::Error>;
+        impl<T, E: From<super::power::Error>, F: FnOnce() -> Result<T, E>> CapOp<FirmwareBlob, Read>
+            for Invoke<'_, F>
+        {
+            type Output = Result<T, E>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
                     #[cfg(any(test, feature = "kernel-test"))]
@@ -450,7 +521,7 @@ impl Calibration {
                 qualification: self,
                 operation,
             })
-            .map_err(|_| super::power::Error::Access)?
+            .map_err(|_| E::from(super::power::Error::Access))?
     }
     fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {

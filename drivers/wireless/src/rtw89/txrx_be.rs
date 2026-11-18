@@ -9,9 +9,9 @@
 //!
 //! Bit-field source: `txrx.h:154..246` (BE TXD) and `txrx.h:490..560`
 //! (BE RXD dword0..dword5). The BE TXWD fill in Linux `core.c` uses
-//! the `_V1` dword-2 fields (QSEL_V1, TID_IND_V1, MACID_V1); the
-//! un-suffixed dword-2 fields are the AX positions and are NOT used
-//! here. RXD dword4 (PPDU rate report) belongs to the PHY-status path
+//! the original dword-2 fields (QSEL[22:17], TID23, MACID[31:24]):
+//! rtw8922a selects fill_txdesc_v2. The later v3 callback uses the
+//! differently placed _V1 fields and is not selected for this chip. RXD dword4 (PPDU rate report) belongs to the PHY-status path
 //! and is intentionally not decoded by the short parser; RXD dword6+
 //! belong to the long descriptor only.
 
@@ -32,21 +32,21 @@ pub(super) const BODY0_CH_DMA_SHIFT: u32 = 16;
 pub(super) const BODY0_CH_DMA_MASK: u32 = 0xF << BODY0_CH_DMA_SHIFT;
 /// BODY2 `TXPKTSIZE` bits 13..0.
 pub(super) const BODY2_TXPKTSIZE_MASK: u32 = 0x3FFF;
-/// BODY2 `QSEL_V1` bits 20..15.
-pub(super) const BODY2_QSEL_V1_SHIFT: u32 = 15;
-/// BODY2 `QSEL_V1` mask.
-pub(super) const BODY2_QSEL_V1_MASK: u32 = 0x3F << BODY2_QSEL_V1_SHIFT;
-/// BODY2 `MACID_V1` bits 31..22.
-pub(super) const BODY2_MACID_V1_SHIFT: u32 = 22;
-/// BODY2 `MACID_V1` mask.
-pub(super) const BODY2_MACID_V1_MASK: u32 = 0x3FF << BODY2_MACID_V1_SHIFT;
+/// BODY2 `QSEL` bits 22..17.
+pub(super) const BODY2_QSEL_SHIFT: u32 = 17;
+/// BODY2 `QSEL` mask.
+pub(super) const BODY2_QSEL_MASK: u32 = 0x3F << BODY2_QSEL_SHIFT;
+/// BODY2 `MACID` bits 31..24.
+pub(super) const BODY2_MACID_SHIFT: u32 = 24;
+/// BODY2 `MACID` mask.
+pub(super) const BODY2_MACID_MASK: u32 = 0xFF << BODY2_MACID_SHIFT;
 
 /// Routing fields for one BE TXWD body, mirroring `txrx::TxwdInfo`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct TxwdBeInfo {
     /// DMA channel / TX ring index.
     pub(super) channel: u8,
-    /// TX queue selector (BE `QSEL_V1` field).
+    /// TX queue selector (BE v2 `QSEL` field).
     pub(super) qsel: u8,
     /// Firmware-assigned MAC-ID for the destination station.
     pub(super) mac_id: u16,
@@ -61,7 +61,12 @@ pub(super) struct TxwdBeInfo {
 /// so the firmware's defaults apply — same contract as the AX codec.
 /// This body-only codec is not a complete PCI submission.
 pub(super) fn encode_txwd_be(info: &TxwdBeInfo, out: &mut [u8]) -> Option<()> {
-    if out.len() < TXWD_BODY_V2_SIZE {
+    if out.len() < TXWD_BODY_V2_SIZE
+        || info.channel > 15
+        || info.qsel > 63
+        || info.mac_id > 255
+        || info.pkt_size > 0x3fff
+    {
         return None;
     }
     let dw0: u32 =
@@ -69,10 +74,10 @@ pub(super) fn encode_txwd_be(info: &TxwdBeInfo, out: &mut [u8]) -> Option<()> {
     out[0..4].copy_from_slice(&dw0.to_le_bytes());
     // Dword 1: aggregation / security — zeroed for unencrypted.
     out[4..8].fill(0);
-    // Dword 2: packet size + queue selector + MAC-ID (all _V1 fields).
+    // Dword 2: original v2 packet size/QSEL/MACID fields, not v3 _V1.
     let dw2: u32 = (info.pkt_size as u32 & BODY2_TXPKTSIZE_MASK)
-        | ((info.qsel as u32) << BODY2_QSEL_V1_SHIFT & BODY2_QSEL_V1_MASK)
-        | ((info.mac_id as u32) << BODY2_MACID_V1_SHIFT & BODY2_MACID_V1_MASK);
+        | ((info.qsel as u32) << BODY2_QSEL_SHIFT & BODY2_QSEL_MASK)
+        | ((info.mac_id as u32) << BODY2_MACID_SHIFT & BODY2_MACID_MASK);
     out[8..12].copy_from_slice(&dw2.to_le_bytes());
     // Dwords 3-7: sequence, checksum, IV, rate — zeroed.
     out[12..TXWD_BODY_V2_SIZE].fill(0);

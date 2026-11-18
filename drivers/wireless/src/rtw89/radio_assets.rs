@@ -30,12 +30,11 @@
 //! order). With no static rtw8922a_table.c copy, a container missing
 //! any of the five tables is refused (`Error::Element`).
 //!
-//! Aid note (all chips): core.c assigns `hal.aid` from XTAL only for
-//! BE; fw.c ignores an element whose nonzero aid differs from
-//! `hal.aid`. NARF keeps only aid-0 elements and skips every other
-//! element entirely — a documented narrowing, not a silent default:
-//! a BE container whose PHY tables all carry a nonzero aid is refused
-//! for missing tables rather than matched against an unknown aid.
+//! Legacy selection keeps aid-0 elements only. The checked native BE owner
+//! supplies its actual XTAL AID to `from_prepared_be`, matching fw.c's aid-0
+//! wildcard or exact nonzero AID, in original first-element order. That
+//! selection is bound separately; existing legacy board identities do not
+//! silently gain a new table-selection authority.
 use super::{
     mac::ChipId, prepared::PreparedFirmware, radio_table::Pair, radio_tables_a, radio_tables_b,
 };
@@ -60,6 +59,7 @@ pub(super) struct Assets {
     elements: Vec<Element>,
     container_digest: [u8; 32],
     firmware_version: [u8; 4],
+    observed_aid: Option<u16>,
 }
 fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, Error> {
     Ok(u32::from_le_bytes(
@@ -78,6 +78,39 @@ fn copy(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 impl Assets {
+    pub(super) fn matches_be_identity(
+        &self,
+        identity: super::mac_pre_init_8922a::HalChipVer,
+    ) -> bool {
+        self.chip == ChipId::Rtl8922A && self.observed_aid == Some(identity.aid)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn fixture_be_observed(bytes: &[u8], aid: u16) -> Self {
+        Self::parse_selected(ChipId::Rtl8922A, bytes, Some(aid))
+            .expect("BE observed-AID asset fixture")
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn fixture_be_observed_version(bytes: &[u8], aid: u16, version: [u8; 4]) -> Self {
+        let mut assets = Self::fixture_be_observed(bytes, aid);
+        assets.firmware_version = version;
+        assets
+    }
+    pub(super) fn from_prepared_be(
+        image: &PreparedFirmware,
+        identity: super::mac_pre_init_8922a::HalChipVer,
+    ) -> Result<Self, Error> {
+        if image.chip() != ChipId::Rtl8922A {
+            return Err(Error::Unsupported);
+        }
+        let mut result = Self::parse_selected(image.chip(), image.container(), Some(identity.aid))?;
+        result.firmware_version = image
+            .image()
+            .get(4..8)
+            .ok_or(Error::Container)?
+            .try_into()
+            .map_err(|_| Error::Container)?;
+        Ok(result)
+    }
     pub fn from_prepared(image: &PreparedFirmware) -> Result<Self, Error> {
         if !matches!(
             image.chip(),
@@ -103,6 +136,16 @@ impl Assets {
         Self::parse_for(ChipId::Rtl8852B, bytes)
     }
     pub(super) fn parse_for(chip: ChipId, bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_selected(chip, bytes, None)
+    }
+    fn parse_selected(
+        chip: ChipId,
+        bytes: &[u8],
+        observed_aid: Option<u16>,
+    ) -> Result<Self, Error> {
+        if observed_aid.is_some() && chip != ChipId::Rtl8922A {
+            return Err(Error::Unsupported);
+        }
         let c = chip == ChipId::Rtl8852C;
         let n51 = chip == ChipId::Rtl8851B;
         let be = chip == ChipId::Rtl8922A;
@@ -116,6 +159,7 @@ impl Assets {
             elements: Vec::new(),
             container_digest: digest.finalize(),
             firmware_version: [0; 4],
+            observed_aid,
         };
         // Legacy single-image firmware has no MFW element region. B retains
         // Linux's explicit static-table transition fallback for that format.
@@ -160,9 +204,10 @@ impl Assets {
                 .filter(|&v| v <= bytes.len())
                 .ok_or(Error::Element)?;
             let aid = u16::from_le_bytes(bytes[cursor + 12..cursor + 14].try_into().unwrap());
-            // core.c assigns hal.aid from XTAL only for BE; B uses the AX
-            // layout's aid0. This is chip semantics, never an invented board ID.
-            if aid == 0 {
+            // fw.c::rtw89_fw_recognize_elements ignores only a nonzero AID
+            // different from the actually observed hal.aid. Legacy callers
+            // retain their narrower aid-0-only behavior and identity.
+            if aid == 0 || observed_aid == Some(aid) {
                 if let Some(index) = match id {
                     2 => Some(0),
                     3 => Some(1),
@@ -231,6 +276,10 @@ impl Assets {
     ) -> Result<(), Error> {
         hash.update(&self.container_digest);
         hash.update(&self.firmware_version);
+        if let Some(aid) = self.observed_aid {
+            hash.update(b"BE XTAL AID selection v1\0");
+            hash.update(&aid.to_le_bytes());
+        }
         for i in 0..5 {
             if i == 3 && self.chip == ChipId::Rtl8851B {
                 // One RF path: no RADIO_B program exists to bind.
@@ -533,6 +582,54 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/rtw89",
         smoke_rtw89_be_radio_assets_follow_linux_empty_rf_table
+    );
+    fn smoke_rtw89_be_assets_use_observed_aid_first_match_and_separate_binding() -> TestResult {
+        let mut bytes = container();
+        for (id, idx) in [(2, 0), (3, 0), (4, 0), (5, 1), (8, 0)] {
+            for (aid, value) in [(0x5678, 1u32), (0x1234, 2), (0, 3)] {
+                let pair = [0x100u32.to_le_bytes(), value.to_le_bytes()].concat();
+                add(&mut bytes, id, aid, idx, &pair);
+            }
+        }
+        let observed = Assets::parse_selected(ChipId::Rtl8922A, &bytes, Some(0x1234)).unwrap();
+        let other = Assets::parse_selected(ChipId::Rtl8922A, &bytes, Some(0x5678)).unwrap();
+        let legacy = Assets::parse_for(ChipId::Rtl8922A, &bytes).unwrap();
+        for i in 0..5 {
+            if observed.table(i) != Some(&[Pair(0x100, 2)][..])
+                || other.table(i) != Some(&[Pair(0x100, 1)][..])
+                || legacy.table(i) != Some(&[Pair(0x100, 3)][..])
+            {
+                return TestResult::Fail("BE AID selector/default/first-match changed");
+            }
+        }
+        let wildcard = Assets::parse_selected(ChipId::Rtl8922A, &bytes, Some(0x9999)).unwrap();
+        let bind = |assets: &Assets| {
+            let mut hash = narf_crypto::sha256::Sha256::new();
+            assets.bind(&mut hash, 1, 0).unwrap();
+            hash.finalize()
+        };
+        if wildcard.table(0) != legacy.table(0) || bind(&wildcard) == bind(&legacy) {
+            return TestResult::Fail("actual AID binding reused legacy identity");
+        }
+        if Assets::parse_selected(ChipId::Rtl8852B, &bytes, Some(0x1234)).is_ok() {
+            return TestResult::Fail("BE AID selector admitted an AX chip");
+        }
+        // A wildcard occurring first remains first, as in fw.c; an exact
+        // match is not an invented priority over an earlier aid-0 element.
+        let mut first = container();
+        for (id, idx) in [(2, 0), (3, 0), (4, 0), (5, 1), (8, 0)] {
+            add(&mut first, id, 0, idx, &[0; 8]);
+            add(&mut first, id, 0x1234, idx, &[1; 8]);
+        }
+        let selected = Assets::parse_selected(ChipId::Rtl8922A, &first, Some(0x1234)).unwrap();
+        if selected.table(0) != Some(&[Pair(0, 0)][..]) {
+            return TestResult::Fail("BE wildcard-first element reordered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw89_be_assets_use_observed_aid_first_match_and_separate_binding
     );
     fn smoke_rtw89_a_radio_assets_follow_linux_static_tables_and_optional_gain() -> TestResult {
         let pair = |a: u32| [a.to_le_bytes(), 0x12345u32.to_le_bytes()].concat();

@@ -459,6 +459,45 @@ pub(super) fn set_channel_bb_program(profile: Profile) -> Option<Vec<ProgramEntr
     Some(program)
 }
 
+/// Complete both source ctrl_ch gain sub-legs from actual retained BE gain
+/// tables and the factory RF logical map. This is a pure program; it does not
+/// install a channel/calibration receipt or bypass the separate help/RFK owner.
+pub(super) fn set_channel_bb_program_with_gain(
+    profile: Profile,
+    gain: &super::radio_gain_be::Gain,
+    calibration: &super::factory_be::Calibration,
+) -> Option<Vec<ProgramEntry>> {
+    let original = set_channel_bb_program(profile)?;
+    let mut out = Vec::new();
+    let ctrl = if profile.band() == Band::Ghz2 { 2 } else { 0 };
+    out.extend_from_slice(&original[..ctrl]);
+    for (address, mask, value) in gain.channel_program(profile).ok()? {
+        out.push((PHY + address, mask, pos(mask, value)));
+    }
+    // Source set_gain(A/B) precedes band-select(A/B), then factory normal
+    // RX gain(A/B), followed by FC0/SCO and the rest of the same BB program.
+    out.extend_from_slice(&original[ctrl..ctrl + 2]);
+    for (address, mask, value) in calibration.rx_gain_program(profile) {
+        out.push((PHY + address, mask, pos(mask, value)));
+    }
+    out.extend_from_slice(&original[ctrl + 2..]);
+    Some(out)
+}
+
+pub(super) fn program_set_channel_bb_with_gain(
+    regs: &mut impl Regs,
+    profile: Profile,
+    gain: &super::radio_gain_be::Gain,
+    calibration: &super::factory_be::Calibration,
+) -> Result<(), rfk::Error> {
+    let program =
+        set_channel_bb_program_with_gain(profile, gain, calibration).ok_or(rfk::Error::Policy)?;
+    for &(address, mask, value) in &program {
+        apply_entry(regs, address, mask, value)?;
+    }
+    verify_program(regs, &program)
+}
+
 /// Read back the final state of a program whose addresses
 /// repeat: entries are folded per address (later and
 /// overlapping writes win, as on hardware — the

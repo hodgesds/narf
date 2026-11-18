@@ -416,6 +416,90 @@ pub(in crate::rtw89) fn revocable_model_a() -> (Calibration, Cap<FirmwareBlob, R
     calibration.model_domain = Some(domain());
     (calibration, cap)
 }
+/// Inert new partial BE scope. It shares only envelope/policy mechanics;
+/// the different magic and the caller's exact N22P identity remain required.
+pub(in crate::rtw89) fn revocable_model_partial_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22P");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22P").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+
+pub(in crate::rtw89) fn revocable_model_wlan_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22W");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22W").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+pub(in crate::rtw89) fn revocable_model_packet_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22O");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22O").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+
+fn smoke_rtw8922a_wlan_measurement_never_upgrades_partial_or_historical_magic() -> TestResult {
+    let be = Board {
+        chip: ChipId::Rtl8922A,
+        device: 0x8922,
+        ..board()
+    };
+    let mut bytes = image(be);
+    let cap = authority();
+    for magic in [b"N22A", b"N22P", b"N22W", b"N22O"] {
+        bytes[..4].copy_from_slice(magic);
+        for requested in [b"N22A", b"N22P", b"N22W", b"N22O"] {
+            if Calibration::decode_record(&bytes, Some([3; 32]), be, cap, requested).is_ok()
+                != (magic == requested)
+            {
+                return TestResult::Fail("BE WLAN-only scope crossed record magic");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8922a_wlan_measurement_never_upgrades_partial_or_historical_magic
+);
+
+fn smoke_rtw8922a_partial_measurement_never_reuses_historical_n22a() -> TestResult {
+    let be = Board {
+        chip: ChipId::Rtl8922A,
+        device: 0x8922,
+        ..board()
+    };
+    let mut bytes = image(be);
+    let cap = authority();
+    for magic in [b"N22A", b"N22P"] {
+        bytes[..4].copy_from_slice(magic);
+        let historical = Calibration::from_verified(&bytes, Some([3; 32]), be, cap);
+        let partial = Calibration::decode_record(&bytes, Some([3; 32]), be, cap, b"N22P");
+        if historical.is_ok() != (magic == b"N22A") || partial.is_ok() != (magic == b"N22P") {
+            return TestResult::Fail("BE calibration scopes crossed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8922a_partial_measurement_never_reuses_historical_n22a
+);
 
 fn smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record() -> TestResult {
     let b = board();

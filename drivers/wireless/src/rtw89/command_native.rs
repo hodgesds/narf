@@ -15,6 +15,8 @@ use narf_lib::id::DomainId;
 // Linux pci.c::rtw89_pci_setup_mapping negotiates36 bits (then32). The
 // baseline TXBD/RXBD wire fields can encode40; that is not a device DMA grant.
 const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
+#[path = "command_native/mac_a.rs"]
+mod mac_a;
 #[path = "command_native/phycap.rs"]
 mod phycap;
 #[path = "command_native/radio.rs"]
@@ -196,6 +198,7 @@ pub struct Native {
     sleep_blocked: bool,
     sleep_reset: Option<super::pci_reset::Reset<super::pci_reset::Native>>,
     calibration: Option<super::calibration_policy::Calibration>,
+    mac_a: Option<alloc::sync::Arc<super::mac_a_policy::Qualification>>,
     coex_ready: bool,
     nctl_ready: bool,
     calibrating: Option<super::rfk::Kind>,
@@ -388,6 +391,7 @@ impl Native {
             sleep_blocked: false,
             sleep_reset: None,
             calibration: None,
+            mac_a: None,
             coex_ready: false,
             nctl_ready: false,
             calibrating: None,
@@ -425,6 +429,9 @@ impl Native {
         mac: &mut super::mac_runtime::Mac,
     ) -> Result<(), super::power::Error> {
         use super::power::Error as RegisterError;
+        if self.chip == ChipId::Rtl8852A {
+            return Err(RegisterError::Unsupported);
+        }
         // B, C or RTL8851B, each with its own completed factory PHY-cap
         // window; the chip-specific MAC branches live in `mac_runtime` (C:
         // `mac_runtime/c.rs`; RTL8851B: the B sequence's `n51` branches).
@@ -432,6 +439,7 @@ impl Native {
             .factory
             .as_ref()
             .is_some_and(|factory| match self.chip {
+                ChipId::Rtl8852A => factory.a_phycap().is_some(),
                 ChipId::Rtl8852B => factory.b_phycap().is_some(),
                 ChipId::Rtl8852C => factory.c_phycap().is_some(),
                 ChipId::Rtl8851B => factory.n51_phycap().is_some(),
@@ -519,10 +527,15 @@ impl Native {
         mac: &super::mac_runtime::Mac,
     ) -> Result<(), super::rx_dma::Error> {
         use super::{power::Error as RegisterError, rx_dma::Error as ReceiveError};
+        if self.chip == ChipId::Rtl8852A {
+            // SAFETY: same enclosing original Startup attempt; the A adapter
+            // retains its actual N5AM scope through RX/config publication.
+            return unsafe { self.prepare_receive_a(mac) }.await;
+        }
         if self.state != State::Active
             || !matches!(
                 self.chip,
-                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+                ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
             )
             || mac.state() != super::mac_runtime::State::Ready
             || self.identity().is_none()
@@ -632,6 +645,12 @@ impl Native {
         if self.state != State::Active {
             return Err(super::power::Error::Terminal);
         }
+        if self.chip == ChipId::Rtl8852A {
+            self.mac_a
+                .as_ref()
+                .ok_or(super::power::Error::Unsupported)?
+                .current()?;
+        }
         self.ordinary
             .as_ref()
             .ok_or(super::power::Error::Unsupported)?
@@ -653,6 +672,10 @@ impl Native {
             .clone();
         let authority = self.authority;
         crate::rtw88::pci_park::invoke(&authority, || {
+            if self.chip == ChipId::Rtl8852A {
+                let mac = self.mac_a.clone().ok_or(super::power::Error::Unsupported)?;
+                return mac.with_current(|| grant.with_current(|| operation(self)));
+            }
             grant.with_current(|| {
                 if self.state != State::Active {
                     return Err(super::power::Error::Terminal);
@@ -1001,6 +1024,12 @@ impl Native {
                 narf_bus::pci::cmd::BUS_MASTER,
             )
         });
+        if self.chip == ChipId::Rtl8852A {
+            // Exact A restrictive PMAC/TMAC + mac.c disable_bb_rf, on
+            // original Bus authority even after the RF scope is revoked.
+            // This supplies no reset, physical RF-idle or DMA-stop receipt.
+            let _ = super::radio_a::stop::close(&mut self.io, self.radio_started);
+        }
         // rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical to
         // `__rtw8852bx_mac_disable_bb_rf`, and RTL8851B shares the AX PMAC/
         // MAC_SEL/NCTL/KIP closure registers, so it takes B's closure.
@@ -1018,12 +1047,20 @@ impl Native {
             || self.state != State::Terminal
             || !matches!(
                 self.chip,
-                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+                ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
             )
         {
             return Err(super::power::Error::Terminal);
         }
         self.fail();
+        if self.chip == ChipId::Rtl8852A {
+            // A's source disable_bb_rf is exactly these synchronous masks;
+            // it has no B/C XTAL RF00S/RF10S tail. Reobserve the restrictive
+            // closure under original current PCI, never RF qualification.
+            // Success proves only those accesses/readbacks, not RF-idle,
+            // an independent DMA fence, reset or permission to reclaim maps.
+            return super::radio_a::stop::close(&mut self.io, self.radio_started);
+        }
         // RTL8851B: rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical
         // to `__rtw8852bx_mac_disable_bb_rf` (RF00S_EN at XTAL_SI_WL_RFC_S0
         // and RF10S_EN at S1 are both cleared even on the one-path chip), so
@@ -1459,6 +1496,20 @@ impl super::scheduler_mailbox::Interface for Native {
 }
 impl super::rfk::Interface for Native {
     fn admit(&mut self) -> Result<(), super::rfk::Error> {
+        if self.chip == ChipId::Rtl8852A {
+            // Only the original fresh full A recipe can reach its newly
+            // composed observations/channel-RFK/TSSI/PMAC effects.
+            self.qualification_a
+                .as_ref()
+                .ok_or(super::rfk::Error::Policy)?
+                .current()
+                .map_err(|_| super::rfk::Error::Policy)?;
+            self.mac_a
+                .as_ref()
+                .ok_or(super::rfk::Error::Policy)?
+                .current()
+                .map_err(super::rfk::Error::Register)?;
+        }
         if !self.coex_ready || !self.nctl_ready {
             return Err(super::rfk::Error::Policy);
         }
@@ -1553,7 +1604,13 @@ impl super::rfk::Interface for Native {
     }
     async fn pause(&mut self) -> Result<u32, super::rfk::Error> {
         super::rfk::Interface::admit(self)?;
-        let saved = self.io.read16(0xc348)?;
+        let saved = if self.chip == ChipId::Rtl8852A {
+            // A's new full composition keeps even the saved scheduler read
+            // within its actual signed scope and original Bus invocation.
+            super::power::Io::read16(self, 0xc348)?
+        } else {
+            self.io.read16(0xc348)?
+        };
         let mut mailbox = self.scheduler.take().ok_or(super::rfk::Error::Terminal)?;
         let result = mailbox.scheduler(self, 0).await;
         self.scheduler = Some(mailbox);

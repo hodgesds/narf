@@ -12,7 +12,7 @@ fn smoke_rtw89_be_txwd_encode() -> TestResult {
     let info = TxwdBeInfo {
         channel: 0xF,
         qsel: 0x3F,
-        mac_id: 0x3FF,
+        mac_id: 0xFF,
         pkt_size: 0x3FFF,
     };
     let mut out = [0u8; 32];
@@ -28,14 +28,11 @@ fn smoke_rtw89_be_txwd_encode() -> TestResult {
     if out[4..8] != [0, 0, 0, 0] {
         return TestResult::Fail("BE TXWD dword1 must be zeroed");
     }
-    // dword2 = TXPKTSIZE (13..0) | QSEL_V1 (20..15) | MACID_V1 (31..22).
-    // With all-ones fields every field bit is set and only AGG_EN
-    // (bit 14) and TID_IND_V1 (bit 21) stay clear (`txrx.h`
-    // BE_TXD_BODY2_*): a wrong _V1 shift (e.g. the AX QSEL 22..17 /
-    // MACID 31..24 positions) breaks it.
+    // Actual rtw8922a fill_txdesc_v2: size[13:0], QSEL[22:17],
+    // MACID[31:24], with AGG/BK/EXTEND/TID left clear.
     let dw2 = u32::from_le_bytes([out[8], out[9], out[10], out[11]]);
-    if dw2 != 0xFFDF_BFFF {
-        return TestResult::Fail("BE TXWD dword2 _V1 fields wrong");
+    if dw2 != 0xFF7E_3FFF {
+        return TestResult::Fail("BE TXWD dword2 source v2 fields wrong");
     }
     if out[12..32] != [0; 20] {
         return TestResult::Fail("BE TXWD dwords 3..7 must be zeroed");
@@ -53,7 +50,7 @@ fn smoke_rtw89_be_txwd_encode() -> TestResult {
     }
     let dw0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
     let dw2 = u32::from_le_bytes([out[8], out[9], out[10], out[11]]);
-    if dw0 != (1 << 22) | (3 << 16) || dw2 != 100 | (7 << 15) | (5 << 22) {
+    if dw0 != (1 << 22) | (3 << 16) || dw2 != 100 | (7 << 17) | (5 << 24) {
         return TestResult::Fail("BE TXWD sparse fields wrong");
     }
     // Short buffer is rejected, not truncated.

@@ -4,24 +4,19 @@
 //! [`Profile`].
 //!
 //! The thermal rows come only from the container's TXPWR_TRK element
-//! (fw.c `rtw89_build_txpwr_trk_tbl_from_elm`), reused here as
-//! [`Tracking`] from the C port: NARF carries no copy of the static
+//! (fw.c `rtw89_build_txpwr_trk_tbl_from_elm`), with A's actual2G/5G
+//! required bitmap0xfff0. NARF carries no copy of the static
 //! `rtw89_8852a_trk_cfg`, so a container without the element is
 //! refused rather than calibrated from invented rows. `thermal` in
 //! [`Calibration`] is the efuse thermal (`path_a/b_therm`); it feeds
 //! the tmeter table only.
 //!
-//! This flow ends at `_tssi_set_efuse_to_de`, exactly like the C port:
-//! `_tssi_high_power` needs the TX-power limit tables (a separate
-//! follow-on), and `_tssi_pre_tx` needs the BB TX machinery
-//! (`bb_set_plcp_tx`, `bb_cfg_tx_path`, `bb_set_power`,
-//! `bb_set_pmac_pkt_tx`, `bb_tx_mode_switch`). Until those land,
-//! `tracking_check` stays false and `_tssi_track` is a no-op, and
-//! `base_thermal` is recorded from the caller-supplied live thermal
-//! instead of `ewma_thermal_read` (NARF has no live-thermal plumbing
-//! yet). The `TSSI_TRACKING_DEFS` and `TSSI_ENABLE_DEFS_AB` tables
-//! are landed as defs but unused until `_tssi_high_power` and the
-//! wifi-scan-notify path (`rtw8852a_tssi_set_avg`) land.
+//! `run` programs through `_tssi_set_efuse_to_de`; `finish_tail` composes
+//! source `_tssi_high_power` and `_tssi_pre_tx` from exact retained power
+//! queries. Only the latter issues a complete receipt. Native supplies
+//! live retained EWMA separately from factory thermal. The tail retains
+//! actual PMAC counters and optional TXAGC observations, never defaults
+//! them to a fabricated measurement. Scan's partial path remains separate.
 //!
 //! DE groups are A-local: `Profile::tssi_groups()` is the C-flavored
 //! shared helper, and its trim table carries EXTRA arms for 49-51 and
@@ -34,7 +29,11 @@ use super::super::{
     factory_a::Calibration,
     operating_channel_c::{Band, Profile, TSSI_EXTRA},
 };
-use super::c_tssi::Tracking;
+#[path = "a_tracking.rs"]
+mod tracking;
+pub(in crate::rtw89) use tracking::Tracking;
+#[path = "a_tssi_tail.rs"]
+pub(in crate::rtw89) mod tail;
 use super::{Access, Error, Interface, Kind};
 #[path = "a_tssi_tables.rs"]
 mod tables;
@@ -209,7 +208,7 @@ const fn a_trim_group(ch: u8) -> u32 {
     }
 }
 
-/// Results retained by one A TSSI.
+/// Results retained by one partial A TSSI program, before high-power/pre-TX.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in super::super) struct Results {
     /// Thermal-offset words written at 0x5c00/0x7c00.
@@ -219,7 +218,7 @@ pub(in super::super) struct Results {
     /// `rtwdev->is_tssi_mode[path]` after `_tssi_enable`.
     pub tssi_mode: [bool; 2],
     /// `base_thermal[path]` after `_tssi_enable` (live thermal at
-    /// enable time; no in-tree live source yet, supplied by the caller).
+    /// enable time; supplied by the caller, separate from factory thermal).
     pub base_thermal: [u8; 2],
     /// `extra_ofst[path]` from `_tssi_track`.
     pub extra_ofst: [i8; 2],
@@ -232,7 +231,10 @@ pub(in super::super) struct Results {
 #[derive(Default)]
 pub(in super::super) struct Tssi {
     results: Results,
-    calibrated: bool,
+    programmed: bool,
+    complete: Option<tail::Report>,
+    profile: Option<Profile>,
+    default_txagc: [Option<u8>; 2],
 }
 
 impl<I: Interface> Access<'_, I> {
@@ -407,7 +409,10 @@ impl<I: Interface> Access<'_, I> {
 
 impl Tssi {
     pub fn results(&self) -> Option<&Results> {
-        self.calibrated.then_some(&self.results)
+        self.programmed.then_some(&self.results)
+    }
+    pub fn complete(&self) -> Option<tail::Report> {
+        self.programmed.then_some(self.complete).flatten()
     }
 
     /// rtw8852a_rfk.c `rtw8852a_tssi(PHY_0)`: `_tssi_disable`, the
@@ -479,8 +484,14 @@ impl Tssi {
         if channel.band() == Band::Ghz6 {
             return Err(Error::Policy);
         }
-        self.calibrated = false;
+        self.programmed = false;
+        self.complete = None;
+        self.profile = Some(channel);
+        let extra_ofst = self.results.extra_ofst;
+        let tracking_check = self.results.tracking_check;
         self.results = Results::default();
+        self.results.extra_ofst = extra_ofst;
+        self.results.tracking_check = tracking_check;
         io.admit()?;
         io.begin(Kind::Tssi).await?;
         let mut access = Access(io);
@@ -530,7 +541,7 @@ impl Tssi {
         }
         access.0.admit()?;
         access.0.end(Kind::Tssi).await?;
-        self.calibrated = true;
+        self.programmed = true;
         Ok(())
     }
 

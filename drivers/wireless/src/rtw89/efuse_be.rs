@@ -684,7 +684,7 @@ impl BeFactory {
         cut_is_cav: bool,
         hci: Hci,
     ) -> Result<BeFactory, BeEfuseError> {
-        let _ = io.read32(SYS_WL_EFUSE_CTRL as u64) & AUTOLOAD_SUS;
+        let _ = io.read16(SYS_WL_EFUSE_CTRL as u64) & AUTOLOAD_SUS as u16;
         let mut phy_map = [0u8; chip_8922a::PHYSICAL_EFUSE_SIZE];
         dump_physical(io, cut_is_cav, 0, &mut phy_map)?;
         let hci_block = match hci {
@@ -827,3 +827,6 @@ impl BeEfuseError {
         }
     }
 }
+
+#[path = "efuse_be_checked.rs"]
+pub(super) mod checked;

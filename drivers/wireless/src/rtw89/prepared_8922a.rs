@@ -2014,3 +2014,6 @@ impl Prepared8922a {
         self.chip_ver
     }
 }
+
+#[path = "prepared_checked_8922a.rs"]
+pub(super) mod checked;

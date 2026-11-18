@@ -105,6 +105,7 @@ impl Fixture {
             ordinary: None,
             full_qualification: None,
             qualification_a: None,
+            mac_a: None,
             qualification_c: None,
             qualification_51: None,
             operating: Some(super::super::phy_operating::Operating::default()),

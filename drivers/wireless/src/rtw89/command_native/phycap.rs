@@ -6,22 +6,22 @@ use crate::rtw89::{firmware_phycap::Receipt, power, scheduler_mailbox};
 struct Port<'a>(&'a mut Native);
 impl power::Io for Port<'_> {
     fn read8(&mut self, a: u32) -> Result<u8, power::Error> {
-        self.0.io.read8(a)
+        self.0.mac_access(|io| io.read8(a))
     }
     fn read16(&mut self, a: u32) -> Result<u16, power::Error> {
-        self.0.io.read16(a)
+        self.0.mac_access(|io| io.read16(a))
     }
     fn read32(&mut self, a: u32) -> Result<u32, power::Error> {
-        self.0.io.read32(a)
+        self.0.mac_access(|io| io.read32(a))
     }
     fn write8(&mut self, a: u32, v: u8) -> Result<(), power::Error> {
-        self.0.io.write8(a, v)
+        self.0.mac_access(|io| io.write8(a, v))
     }
     fn write16(&mut self, a: u32, v: u16) -> Result<(), power::Error> {
-        self.0.io.write16(a, v)
+        self.0.mac_access(|io| io.write16(a, v))
     }
     fn write32(&mut self, a: u32, v: u32) -> Result<(), power::Error> {
-        self.0.io.write32(a, v)
+        self.0.mac_access(|io| io.write32(a, v))
     }
     fn now_us(&self) -> u64 {
         self.0.io.now_us()
@@ -50,6 +50,10 @@ impl scheduler_mailbox::Interface for Port<'_> {
                 || self.0.nctl_ready
             {
                 return Err(power::Error::Terminal);
+            }
+            if self.0.chip == ChipId::Rtl8852A {
+                let grant = self.0.mac_a.clone().ok_or(power::Error::Unsupported)?;
+                return grant.with_current(|| self.0.radio_access());
             }
             self.0.radio_access()
         })

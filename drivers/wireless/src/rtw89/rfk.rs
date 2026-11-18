@@ -535,6 +535,12 @@ pub(super) mod a_tssi;
 /// and periodic track (`rtw89_core_rfk_track` / `rtw8922a_rfk_track`).
 #[path = "rfk/be_channel.rs"]
 pub(super) mod be_channel;
+#[path = "rfk/be_features.rs"]
+pub(super) mod be_features;
+#[path = "rfk/be_late.rs"]
+pub(super) mod be_late;
+#[path = "rfk/be_notify.rs"]
+pub(super) mod be_notify;
 /// RTL8922A firmware-offloaded RFK (`rtw89_phy_rfk_*_and_wait`):
 /// report kinds/states, the OUTSRC RFK H2C bodies and the C2H report
 /// parse, plus the single-outstanding report-wait runner.

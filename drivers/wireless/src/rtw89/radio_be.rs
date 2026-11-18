@@ -25,11 +25,10 @@
 //!   idx0 then RADIO_B idx1), each followed by its H2C RF-page upload
 //!   (`rtw89_phy_config_rf_reg_fw`). `by_acv` is false: it is set only
 //!   for RTL8922D.
-//! * `rtw89_phy_init_rf_nctl` (`phy.c`): `rtw89_phy_preinit_rf_nctl_ax`
-//!   with the P1 reset (the chip is not RTL8851B) and no second
-//!   `R_IOQ_IQK_DPK` write (that is RTL8852B/BT-only), then the NCTL
-//!   table; `rtw8922a_chip_info.nctl_post_table` is NULL
-//!   (`rtw8922a.c:3246`), so there is no post-table step.
+//! * `rtw89_phy_init_rf_nctl`: phy_be.c::rtw89_phy_preinit_rf_nctl_be,
+//!   including GOTX paths/clock/reset/CFIR fields and the10000×10us
+//!   check, then NCTL. The BE CR base is0x20000 and nctl_post_table is
+//!   NULL. The AX preinit/base is not an RTL8922A source program.
 //! * `rtw89_phy_dm_init` continues with `rtw8922a_set_txpwr_ctrl`
 //!   (which is only `rtw8922a_set_txpwr_ref`, `rtw8922a.c:2554`,
 //!   both reference fields zero) and `rtw8922a_power_trim`
@@ -47,7 +46,7 @@ use super::{
     mac::ChipId,
     power,
     radio_assets::Assets,
-    radio_gain::{self, Gain},
+    radio_gain_be::{self, Gain},
     radio_init,
     radio_table::{self, Pair},
 };
@@ -55,7 +54,7 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
     Table(radio_table::Error),
-    Gain(radio_gain::Error),
+    Gain(radio_gain_be::Error),
     Profile,
     Init(radio_init::Error),
     Register(power::Error),
@@ -108,6 +107,13 @@ impl Tables {
         // Validate the BB and NCTL programs before the first PHY write.
         radio_init::validate_bb(&programs[0]).map_err(Error::Init)?;
         radio_init::validate_bb(&programs[4]).map_err(Error::Init)?;
+        // RF-v2's actual register field is20 bits/8-bit address plus ADSEL.
+        // Preflight both complete selected RF streams and the source callback's
+        // three-page upload bound before any BB/RF effect, not mid-program.
+        for program in &programs[2..4] {
+            validate_rf(program)?;
+            radio_init::rf_pages(program).map_err(Error::Init)?;
+        }
         let gain = Gain::decode(&programs[1], rfe).map_err(Error::Gain)?;
         let [bb, gain_program, rf_a, rf_b, nctl] = programs;
         Ok(Self {
@@ -134,11 +140,26 @@ impl Tables {
         &self.nctl
     }
     /// H2C RF-page bytes for one path program (no RF write), rebuilt
-    /// from the same retained signed tables — the `noio` half of
-    /// `rtw89_phy_init_rf_reg`.
+    /// from the same retained signed tables. fw.c assigns BE elements the
+    /// config_rf_reg_v1 table callback even though actual RF access is v2;
+    /// this is that I/O callback's upload, not the different noio helper.
     pub(super) fn rf_pages(&self, path: usize) -> Result<Vec<u8>, Error> {
         radio_init::rf_pages(&self.rf[path]).map_err(Error::Init)
     }
+}
+fn validate_rf(program: &[Pair]) -> Result<(), Error> {
+    if !program.iter().any(|pair| pair.0 != 0xfe) {
+        return Err(Error::Profile);
+    }
+    for &Pair(address, value) in program {
+        if address == 0xfe {
+            continue;
+        }
+        if address & !0x100ff != 0 || value & !0xfffff != 0 {
+            return Err(Error::Profile);
+        }
+    }
+    Ok(())
 }
 /// `rtw8922a_pa_bias_trim` then `rtw8922a_pad_bias_trim`
 /// (`rtw8922a.c:965..1040`), as (RF path, `RR_BIASA`, mask, value)
@@ -170,9 +191,10 @@ pub(super) fn power_trim_writes(trim: &PowerTrim) -> Vec<(u8, u32, u32, u32)> {
 /// TX-power-unit step is a NULL no-op and the BB reset is an empty
 /// function for 8922A, so neither writes), RF path A then B with
 /// their H2C page uploads, then the NCTL table after its BE preinit.
-/// The BB-gain program is decoded by [`Tables::from_assets`], not
-/// written here — it feeds later gain compensation, as in
-/// `radio_init::Init::prepare` for the AX chips.
+/// The BB-gain program is decoded by [`Tables::from_assets`]; source cfg_type15
+/// direct high-half writes run here, while decoded per-band/BW values feed
+/// later gain compensation. The caller must supply BE RF-v2 access and the
+/// BE0x20000 CR aperture, never an AX adapter.
 ///
 /// # Safety
 /// Same contract as `radio_init::Init::prepare`: the caller owns the
@@ -182,7 +204,20 @@ pub(super) async unsafe fn apply_tables(
     io: &mut impl radio_init::Interface,
     tables: &Tables,
 ) -> Result<(), Error> {
-    radio_init::bb(io, tables.bb()).await.map_err(Error::Init)?;
+    radio_init::bb_be(io, tables.bb())
+        .await
+        .map_err(Error::Init)?;
+    for &(address, mask, value) in tables.gain().direct() {
+        let address = 0x20000 + address;
+        let old = io.read32(address)?;
+        if old == u32::MAX {
+            return Err(power::Error::Gone.into());
+        }
+        io.write32(
+            address,
+            (old & !mask) | ((value << mask.trailing_zeros()) & mask),
+        )?;
+    }
     // `rtw89_phy_init_rf_reg` walks `rf_radio[path]` in path order;
     // for BE the element idx equals the path (RADIO_A idx0, RADIO_B
     // idx1), unlike C's `{radiob, radioa}` static order.
@@ -308,6 +343,46 @@ mod tests {
             pg_pa_pad: true,
         }
     }
+    fn smoke_rtw8922a_rf_streams_preflight_before_any_table_effect() -> TestResult {
+        let from_rf = |rf: &[Pair]| {
+            let mut bytes = container();
+            for (id, idx, pairs) in [
+                (2, 0, vec![Pair(0x100, 1)]),
+                (3, 0, vec![Pair(0, 0)]),
+                (4, 0, rf.to_vec()),
+                (5, 1, vec![Pair(0x60, 1)]),
+                (8, 0, vec![Pair(0x100, 1)]),
+            ] {
+                let mut payload = Vec::new();
+                for Pair(address, value) in pairs {
+                    payload.extend_from_slice(&pair(address, value));
+                }
+                add(&mut bytes, id, idx, &payload);
+            }
+            Assets::parse_for(ChipId::Rtl8922A, &bytes).unwrap()
+        };
+        for invalid in [
+            vec![Pair(0x100, 1)],          // unsupported bit8 address
+            vec![Pair(0x10055, 0x100000)], // data would corrupt packed H2C address bits
+            vec![Pair(0xfe, 0)],           // no actual RF program, only delay
+            vec![Pair(0x10055, 1); 1501],  // source three500-word page limit
+        ] {
+            if Tables::from_assets(&from_rf(&invalid), 1, 0).is_ok() {
+                return TestResult::Fail("BE invalid RF stream survived complete pure preflight");
+            }
+        }
+        // The element callback is config_rf_reg_v1: raw0xfd is an actual
+        // analog register, unlike the generic/noio helper's delay handling.
+        let valid = from_rf(&[Pair(0xfd, 1), Pair(0x10055, 0xfffff)]);
+        if Tables::from_assets(&valid, 1, 0).is_err() {
+            return TestResult::Fail("BE source RF callback address/data boundary refused");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89/8922a",
+        smoke_rtw8922a_rf_streams_preflight_before_any_table_effect
+    );
     fn smoke_rtw89_be_tables_select_five_programs_and_decode_gain() -> TestResult {
         let assets = assets();
         let Ok(tables) = Tables::from_assets(&assets, 1, 0) else {
@@ -320,7 +395,7 @@ mod tests {
                 Pair(0xfe, 0),
             ]
             || tables.gain_program() != [Pair(0x00000000, 0x01020304)]
-            || tables.gain().lna[0][0][..4] != [4, 3, 2, 1]
+            || tables.gain().lna[0][0][0][..4] != [4, 3, 2, 1]
             || tables.rf(0) != [Pair(0x60, 0x5), Pair(0x10055, 0x000c0ffe)]
             || tables.rf(1) != [Pair(0x60, 0x6)]
             || tables.nctl() != [Pair(0x100, 0xaaaa0000)]
@@ -401,7 +476,7 @@ mod tests {
     impl Model {
         fn new() -> Self {
             Self {
-                words: vec![0; 0x20000 / 4],
+                words: vec![0; 0x40000 / 4],
                 bb_writes: Vec::new(),
                 rf_writes: Vec::new(),
                 pages: Vec::new(),
@@ -479,7 +554,7 @@ mod tests {
             return TestResult::Fail("8922A table application failed on the fixture");
         }
         // BB first: the two BB writes at the PHY aperture, in order.
-        if io.bb_writes[..2] != [(0x10100, 0x11111111), (0x10104, 0x22222222)] {
+        if io.bb_writes[..2] != [(0x20100, 0x11111111), (0x20104, 0x22222222)] {
             return TestResult::Fail("8922A BB program not written first at the PHY aperture");
         }
         // RF A (idx0 == path 0) before RF B, each with the full-field
@@ -492,28 +567,34 @@ mod tests {
         {
             return TestResult::Fail("8922A RF A/B order or H2C page upload wrong");
         }
-        // NCTL last: BE preinit set-bits (0x10c60, 0x10c6c, 0x158ac,
-        // 0x178ac — no second 0x10c60 write), the 0x18000 = 8 config
-        // write, the 0x18080 poll write, then the NCTL table write.
+        // phy_be.c generation-specific preinit at BE CR base0x20000,
+        // including both GOTX paths, clocks, reset/path fields and10us check.
         let preinit: Vec<(u32, u32)> = io
             .bb_writes
             .iter()
             .copied()
-            .filter(|(a, _)| matches!(a, 0x10c60 | 0x10c6c | 0x158ac | 0x178ac | 0x18000 | 0x18080))
+            .filter(|(a, _)| !matches!(a, 0x20100 | 0x20104))
             .collect();
         if preinit
             != [
-                (0x10c60, 3),
-                (0x10c6c, 1),
-                (0x158ac, 0x08000000),
-                (0x178ac, 0x08000000),
-                (0x18000, 8),
-                (0x18080, 4),
+                (0x2e464, 0x18000000),
+                (0x2e564, 0x18000000),
+                (0x22ab8, 0x10000000),
+                (0x21008, 0x000fffff),
+                (0x20c60, 3),
+                (0x20c6c, 1),
+                (0x2e4ac, 0x08000000),
+                (0x2e5ac, 0x08000000),
+                (0x20c7c, 0x00200000),
+                (0x20c70, 0x200),
+                (0x20c70, 0x260),
+                (0x28000, 8),
+                (0x28080, 4),
             ]
-            || io.bb_writes.last() != Some(&(0x10100, 0xaaaa0000))
-            || io.delays != [50_000, 1]
+            || io.bb_writes.last() != Some(&(0x20100, 0xaaaa0000))
+            || io.delays != [50_000, 10]
         {
-            return TestResult::Fail("8922A NCTL preinit/poll/table order wrong");
+            return TestResult::Fail("8922A generation-specific NCTL/aperture order wrong");
         }
         // Power trim after the tables: PA then pad, path A then B.
         let mut io = Model::new();

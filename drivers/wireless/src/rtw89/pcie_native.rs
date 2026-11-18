@@ -18,7 +18,7 @@ impl Native<'_> {
     fn config<T>(&self, address: u16, operation: impl FnOnce(*mut u8) -> T) -> Result<T, Error> {
         self.config_width(address, 1, operation)
     }
-    fn config_width<T>(
+    pub(in crate::rtw89) fn config_width<T>(
         &self,
         address: u16,
         width: u16,

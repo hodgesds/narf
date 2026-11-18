@@ -191,7 +191,32 @@ impl Board {
         h.update(&base.identity());
         h.update(&phycap.fingerprint());
         h.update(RECIPE);
+        h.update(super::mac_runtime::a::RECIPE);
+        h.update(super::dig_a::RECIPE);
+        h.update(super::track::a::RECIPE);
+        h.update(
+            &super::mac_a_policy::Board::new(lifecycle, factory, device, assets)
+                .map_err(|_| Error::Identity)?
+                .identity(),
+        );
         h.update(super::channel_a::RECIPE);
+        h.update(super::radio_a::observations::RECIPE);
+        h.update(super::radio_a::stop::RECIPE);
+        h.update(super::radio_a::RETUNE_RECIPE);
+        // Pure preflight of actual container TSSI rows/limit inputs. A source
+        // prefix record cannot silently acquire new PMAC emissions.
+        super::rfk::a_tssi::Tracking::from_assets(assets).map_err(|_| Error::Identity)?;
+        super::rfk::a_tssi::tail::Inputs::from_assets(
+            assets,
+            factory
+                .identity()
+                .ok_or(Error::Identity)?
+                .calibration()
+                .rfe_type,
+            power.channel(),
+        )
+        .map_err(|_| Error::Identity)?
+        .bind(&mut h);
         // A 40/80MHz record also binds the shared wide station capability
         // its channel lets the station offer (`station_control::wide_phy`).
         if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {

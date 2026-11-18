@@ -6,16 +6,18 @@
 //! (`rtw8852a_tssi_scan`) and `rtw8852a_rfk_track` (`dpk_track` +
 //! `tssi_track`).
 //!
-//! Differences from the C port (`c_channel.rs`): A has no MCC
-//! (`rtw8852a_rfk_channel` returns nothing and sends no H2C body), no
-//! `set_channel` yet (the BB/RF channel program is a separate
-//! follow-on; `rfk_channel` takes the profile directly and the caller
-//! owns the retune), and no coexistence notification in-tree, so
+//! A has no MCC (`rtw8852a_rfk_channel` sends no H2C body). This generic
+//! owner takes the profile directly; the separate `channel_a` owner
+//! programs MAC/BB/RF. `tail:None` retains explicit `PartialTssi`;
+//! `Some` composes actual firmware limits, high-power and pre-TX PMAC before
+//! DPK, so only that path can return Calibrated. Native uses Some and
+//! separately requires live nonzero thermal and positive PMAC/DPK receipts.
+//! The source connection-RFK notification is software state only, so
 //! `conn_rfk` is state only and both 30ms BT preserves always wait
 //! the full 30ms. `scan` here is the band-change TSSI scan, gated on
 //! the retained TSSI enable state.
 use super::super::{factory_a::Calibration, operating_channel_c::Profile};
-use super::c_tssi::Tracking;
+use super::a_tssi::{tail, Tracking};
 use super::{a_dpk::Dpk, a_iqk::Iqk, a_tssi::Tssi, Access, Error, Interface};
 
 /// Channel RFK lifecycle.
@@ -24,7 +26,17 @@ pub(in super::super) enum State {
     #[default]
     New,
     Busy,
-    /// `rtw8852a_rfk_channel` completed for the retained channel.
+    /// IQK, partial TSSI and DPK effects ran; source high-power/pre-TX
+    /// TSSI tails did not. No calibration or periodic-tracking receipt.
+    PartialTssi,
+    /// Complete source TSSI tail plus all channel RFK effects completed.
+    Calibrated,
+}
+
+/// Returning success cannot be mistaken for complete channel RFK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum Outcome {
+    PartialTssi,
     Calibrated,
 }
 
@@ -57,9 +69,12 @@ pub(in super::super) struct ChannelInputs<'a> {
     /// The current averaged thermal per path (for TSSI
     /// `base_thermal` and DPK `ther_dpk`).
     pub thermal: [u8; 2],
-    /// The per-path EPA presence (`efuse->epa_2g` / `efuse->epa_5g`)
+    /// EPA presence by band (2G, 5G), from `fem.epa_2g/epa_5g`,
     /// for the DPK bypass.
     pub epa: [bool; 2],
+    /// Exact retained firmware power inputs; None keeps the historical
+    /// explicitly partial generic prefix. Native always supplies Some.
+    pub tail: Option<tail::Inputs>,
 }
 
 impl Channel {
@@ -69,6 +84,11 @@ impl Channel {
     /// The channel of the last completed channel RFK.
     pub fn calibrated(&self) -> Option<Profile> {
         (self.state == State::Calibrated)
+            .then_some(self.channel)
+            .flatten()
+    }
+    pub fn partial_programmed(&self) -> Option<Profile> {
+        (self.state == State::PartialTssi)
             .then_some(self.channel)
             .flatten()
     }
@@ -97,7 +117,10 @@ impl Channel {
     /// retained `is_tssi_mode`, `rtw8852a_iqk`,
     /// `btc_ntfy_preserve_bt_time(30)`, `rtw8852a_tssi`, 30ms,
     /// `rtw8852a_dpk`, `conn_rfk = false`. No MCC H2C body: Linux A
-    /// sends none. 8852A is Wi-Fi 6: a 6GHz channel is refused with
+    /// sends none. A supplied exact tail composes `_tssi_high_power` and
+    /// `_tssi_pre_tx`; without it success is `Outcome::PartialTssi` and
+    /// `calibrated()` remains None.
+    /// 8852A is Wi-Fi 6: a 6GHz channel is refused with
     /// `Error::Policy` by the IQK/DPK/TSSI owners.
     ///
     /// # Safety
@@ -112,8 +135,11 @@ impl Channel {
         io: &mut impl Interface,
         profile: Profile,
         inputs: &ChannelInputs<'_>,
-    ) -> Result<(), Error> {
-        self.begin(&[State::New, State::Calibrated])?;
+    ) -> Result<Outcome, Error> {
+        if inputs.tail.is_some_and(|tail| !tail.matches(profile)) {
+            return Err(Error::Policy);
+        }
+        self.begin(&[State::New, State::PartialTssi, State::Calibrated])?;
         self.channel = Some(profile);
         self.conn_rfk = true;
         io.admit()?;
@@ -134,6 +160,11 @@ impl Channel {
             )
         }
         .await?;
+        if let Some(tail) = inputs.tail {
+            // SAFETY: same actual channel, prefix and measured source limits;
+            // native's outer attempt owns finite restrictive PMAC closure.
+            unsafe { self.tssi.finish_tail(io, tail) }.await?;
+        }
         self.tssi_mode = self.tssi.results().ok_or(Error::Terminal)?.tssi_mode;
         Access(io).delay(30_000).await?;
         // SAFETY: same channel after its TSSI.
@@ -149,8 +180,13 @@ impl Channel {
         }
         .await?;
         self.conn_rfk = false;
-        self.state = State::Calibrated;
-        Ok(())
+        if self.tssi.complete().is_some() {
+            self.state = State::Calibrated;
+            Ok(Outcome::Calibrated)
+        } else {
+            self.state = State::PartialTssi;
+            Ok(Outcome::PartialTssi)
+        }
     }
 
     /// rtw8852a_rfk.c `rtw8852a_rfk_band_changed` (`rtw8852a_tssi_scan`
@@ -168,6 +204,9 @@ impl Channel {
         tracking: &Tracking,
         thermal: [u8; 2],
     ) -> Result<bool, Error> {
+        if self.state == State::Busy {
+            return Err(Error::Terminal);
+        }
         // SAFETY: forwarded caller contract.
         let ran = unsafe {
             self.tssi
@@ -176,6 +215,7 @@ impl Channel {
         .await?;
         if ran {
             self.tssi_mode = self.tssi.results().ok_or(Error::Terminal)?.tssi_mode;
+            self.state = State::PartialTssi;
         }
         Ok(ran)
     }
@@ -184,7 +224,8 @@ impl Channel {
     /// retained TSSI `extra_ofst`) then `_tssi_track`.
     ///
     /// # Safety
-    /// Same retained owner after [`Self::rfk_channel`]; no concurrent
+    /// Same retained owner after actually complete source channel RFK;
+    /// a `PartialTssi` outcome is refused before any effect. No concurrent
     /// RFK/PHY/reset/PM owner. `thermal` is the current averaged
     /// thermal per path, read back from `R_TSSI_THER` inside the
     /// owners.

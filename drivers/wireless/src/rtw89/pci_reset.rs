@@ -46,7 +46,10 @@ impl Binding {
             }
             _ => return Err(Error::Unsupported),
         };
-        if device.id.vendor != 0x10ec || !super::bootstrap_did(device.id.device) {
+        if device.id.vendor != 0x10ec
+            || !(super::bootstrap_did(device.id.device)
+                || matches!(device.id.device, 0x8922 | 0x892b))
+        {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -63,8 +66,9 @@ struct Caps {
     msi: Option<u16>,
     msix: Option<u16>,
 }
-/// The sole consumer is Startup::claim_reset below. No Clone, caller-created
-/// field, generic consume operation or BME/power-only constructor is exposed.
+/// Consumers are the ordinary AX Startup::claim_reset below and the separate
+/// packet-closed BE supervisor. BE reset support adds no station admission.
+/// No Clone, caller-created field or BME/power-only constructor is exposed.
 pub(super) struct Fence {
     lifecycle: super::radio_policy::Lifecycle,
     binding: Binding,
@@ -103,6 +107,7 @@ pub(super) struct Native {
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     binding: Binding,
+    cancelled: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
 }
 impl Native {
     fn new(device: BusDevice, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
@@ -115,6 +120,7 @@ impl Native {
             device,
             authority,
             binding,
+            cancelled: None,
         })
     }
     fn access<T>(
@@ -123,6 +129,13 @@ impl Native {
         width: u16,
         operation: impl FnOnce(u64) -> T,
     ) -> Result<T, Error> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(core::sync::atomic::Ordering::Acquire))
+        {
+            return Err(Error::Terminal);
+        }
         if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
             return Err(Error::Unsupported);
         }
@@ -231,6 +244,15 @@ impl<I> Drop for Attempt<'_, I> {
     }
 }
 impl Reset<Native> {
+    /// Denial-only removal check for the retained closed BE owner. Existing AX
+    /// callers keep their original lifetime protocol and do not set this flag.
+    pub(super) fn cancel_with(
+        mut self,
+        flag: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.io.cancelled = Some(flag);
+        self
+    }
     /// # Safety
     /// The caller already retains the exclusive function reservation for this exact
     /// function. No other config/MMIO/IRQ/reset or driver producer may run.
