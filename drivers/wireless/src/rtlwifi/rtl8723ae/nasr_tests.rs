@@ -87,10 +87,25 @@ fn smoke_ae_nasr3_original_port_profile_refuses_legacy_upgrade_and_revocation() 
                 .unwrap()
                 .name
                 .contains("station-v3-"));
+            let cr = raw.port.reg32(0x100) as u8;
             cap.revoke();
             kt_assert!(port.require_ae_aspm_profile().is_err());
+            // The dead NASR source permits no backdoor access. Independent
+            // current PCI still performs only the terminal restrictive close.
+            let writes = raw.port.writes();
+            kt_assert_eq!(
+                &writes[before..],
+                &[
+                    (4, 0x3a8, 0),
+                    (4, 0x3ac, 0),
+                    (1, 0x522, 0xff),
+                    (1, 0x100, u32::from(cr & !0xcf))
+                ]
+            );
             kt_assert!(port.write8(0x34b, 0x93).is_err());
-            kt_assert_eq!(raw.port.writes().len(), before);
+            kt_assert_eq!(raw.port.writes().len(), writes.len());
+            kt_assert!(!root.registered_for(root.firmware()));
+            kt_assert!(root.cold.bound().is_ok());
         }
     }
     TestResult::Pass

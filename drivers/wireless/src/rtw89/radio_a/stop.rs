@@ -23,7 +23,10 @@ fn clear(io: &mut impl Io, a: u32, mask: u32) -> Result<(), Error> {
 fn clear8(io: &mut impl Io, a: u32, mask: u8) -> Result<(), Error> {
     let old = io.read8(a)?;
     if old == u8::MAX {
-        return Err(Error::Gone);
+        // A valid byte can have every bit set while its containing register
+        // is live. Confirm the full-word device sentinel before refusing the
+        // restrictive clear; both observations use current original Bus I/O.
+        read(io, a & !3)?;
     }
     io.write8(a, old & !mask)?;
     if io.read8(a)? & mask != 0 {

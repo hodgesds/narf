@@ -2595,6 +2595,18 @@ kernel_test_in!(
 #[cfg(feature = "kernel-test")]
 fn smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down() -> TestResult {
     check(|| {
+        // This smoke drives the real release worker's executor graph. Earlier
+        // fake-device registrations retain tasks whose immediate IRQ waits
+        // need not yield a poll; those tasks do not belong to this fixture.
+        // Declare this first so exit reset follows native fixture retirement.
+        struct ExecutorFixture;
+        impl Drop for ExecutorFixture {
+            fn drop(&mut self) {
+                narf_scheduler::__reset_queues_for_test();
+            }
+        }
+        narf_scheduler::__reset_queues_for_test();
+        let _executor = ExecutorFixture;
         const NAME: &str = "sc-owner-close-test";
         const PORTID: u32 = 0x5343_c103;
         let mut guard = Guard::new_named(true, Fault::HoldM4, Some(NAME))?;

@@ -163,14 +163,18 @@ impl Io for Port {
         Ok(())
     }
     async fn delay_us(&self, micros: u64) {
-        let park = {
-            let mut g = self.0.lock();
-            g.events.push(Event::Delay(micros));
-            g.pause_delay == Some(micros)
-        };
-        if park {
-            core::future::pending::<()>().await;
-        }
+        self.0.lock().events.push(Event::Delay(micros));
+        core::future::poll_fn(|cx| {
+            // Clearing the model hold resumes the same mandatory source wait.
+            let paused = self.0.lock().pause_delay == Some(micros);
+            if paused {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(())
+            }
+        })
+        .await;
     }
 }
 

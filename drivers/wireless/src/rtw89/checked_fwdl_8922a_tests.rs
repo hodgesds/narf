@@ -603,7 +603,23 @@ fn native_enabled(
     // SAFETY: inert same original source-program model; no hardware/DMA grant.
     unsafe { owner.enable_ch12(&mut model) }.unwrap();
     for (address, value) in &model.words {
-        ram[*address as usize / 4] = *value;
+        // The model keys each source register independently. BE packs two
+        // 16-bit NUM registers in one dword; preserve the sibling halfword
+        // when projecting those actual ring lengths into the native BAR.
+        // Other modeled registers, including combined RP/WP, stay 32-bit.
+        let number = BE_DMA_ADDR_SET
+            .tx
+            .iter()
+            .map(|ring| ring.num)
+            .chain(BE_DMA_ADDR_SET.rx.iter().map(|ring| ring.num))
+            .any(|number| number == u64::from(*address));
+        let word = &mut ram[*address as usize / 4];
+        if number {
+            let shift = (*address & 2) * 8;
+            *word = (*word & !(0xffff << shift)) | ((*value & 0xffff) << shift);
+        } else {
+            *word = *value;
+        }
     }
     (owner, drops)
 }

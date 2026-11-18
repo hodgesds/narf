@@ -310,13 +310,19 @@ fn joined<'a>(
         let mut cx = Context::from_waker(Waker::noop());
         let mut completed = false;
         for _ in 0..512 {
-            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+            let result = future.as_mut().poll(&mut cx);
+            // A completed pause advances the station clock even when this
+            // poll completes association. Preserve that time before Radio's
+            // next poll projects the device clock back into the station Env.
+            model
+                .now
+                .set(model.now.get().max(env.now.load(Ordering::Acquire) * 1000));
+            if let Poll::Ready(result) = result {
                 result.map_err(|_| "N46S actual association")?;
                 completed = true;
                 break;
             }
             actor.service(model, peer)?;
-            model.now.set(env.now.load(Ordering::Acquire) * 1000);
         }
         if !completed {
             return Err("N46S native association progress");
