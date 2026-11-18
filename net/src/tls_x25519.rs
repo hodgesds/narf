@@ -132,7 +132,7 @@ mod tests {
     fn x25519_matches_rfc7748_vectors() -> TestResult {
         let alice_priv = arr32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
         let alice_pub = arr32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
-        let bob_priv = arr32("5dab087e624a8a4b79e17f8b83800ee66df3cb12973937ecf3c9ad771c5feaa5");
+        let bob_priv = arr32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
         let bob_pub = arr32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
         let shared = arr32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
         kt_assert_eq!(x25519_public(&alice_priv), Some(alice_pub));
