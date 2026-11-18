@@ -237,7 +237,12 @@ also consult upstream Linux GPL sources.
 - USB-HID RMI4 / Elan touchpads (issue #1681): after the PTP branch
   in the attach cascade, `hid::rmi_elan` classifies by VID/PID
   against the existing `RMI_DEVICE_TABLE` / `ELAN_DEVICE_TABLE`
-  (Elan I2C-HID rows never match on USB), binds the HID interface
+  (Elan I2C-HID rows never match on USB), or — for a Synaptics VID
+  with no table row — by the Linux `HID_GROUP_RMI` group route
+  (issue #1718): a Generic Desktop Pointer collection plus a
+  vendor-page (≥ 0xFF00) collection in the report descriptor, with
+  no Digitizer Contact ID input (which would assign MULTITOUCH /
+  PTP instead). It binds the HID interface
   (Elan prefers interface 1, per Linux `hid-elan.c`), and probes
   through a synchronous `HidIo` / `ElanHidIo` backend over xHCI
   (interrupt-OUT output reports, control SET_REPORT Feature

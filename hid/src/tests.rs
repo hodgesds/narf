@@ -52,6 +52,47 @@ fn smoke_hid_descriptor_long_item_skipped() -> TestResult {
 }
 kernel_test_in!("hid", smoke_hid_descriptor_long_item_skipped);
 
+fn smoke_hid_descriptor_collections_recorded() -> TestResult {
+    // Two Application Collections — Generic Desktop Pointer, then
+    // vendor page 0xFF00 — each with one Input field. Every Usage
+    // pending at each Collection open must be recorded in
+    // `collections` (the set Linux's group scan inspects, issue
+    // #1718), including a collection whose Usage list holds two
+    // entries: both are recorded, not just the first.
+    let blob = [
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x01, // Usage (Pointer)
+        0x09, 0x02, // Usage (Mouse)
+        0xA1, 0x01, // Collection (Application)
+        0x85, 0x01, //   Report ID (1)
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x01, //   Report Count (1)
+        0x81, 0x02, //   Input (Data, Variable, Absolute)
+        0xC0, // End Collection
+        0x06, 0x00, 0xFF, // Usage Page (Vendor 0xFF00)
+        0x09, 0x01, // Usage (0x01)
+        0xA1, 0x01, // Collection (Application)
+        0x85, 0x02, //   Report ID (2)
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x01, //   Report Count (1)
+        0x81, 0x02, //   Input (Data, Variable, Absolute)
+        0xC0, // End Collection
+    ];
+    let d = parse(&blob).expect("parse");
+    if d.collections != alloc::vec![(0x01, 0x01), (0x01, 0x02), (0xFF00, 0x01)] {
+        return TestResult::Fail(
+            "collections must hold every Usage pending at each Collection open",
+        );
+    }
+    // The top-level apps still record only the first Usage of each
+    // Application Collection.
+    if d.top_level_apps != alloc::vec![(0x01, 0x01), (0xFF00, 0x01)] {
+        return TestResult::Fail("top_level_apps must hold the first Usage of each top-level app");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_descriptor_collections_recorded);
+
 fn smoke_hid_descriptor_unit_exponent_encodings() -> TestResult {
     // One Input field under a Unit Exponent item with the given
     // encoding; returns the field's decoded exponent.

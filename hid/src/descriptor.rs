@@ -192,6 +192,19 @@ pub struct ReportDescriptor {
     /// order. A modern PTP descriptor declares two: the Touch Pad
     /// (Digitizer / TouchPad) and the Mouse compatibility shim.
     pub top_level_apps: Vec<(u16, u16)>,
+    /// Every `Usage` pending when a `Collection` item opened, in
+    /// declaration order — one entry per pending Usage at each
+    /// collection open, not just the first. This is the raw
+    /// material Linux's `hid_scan_report()` inspects when it
+    /// assigns a device group (`drivers/hid/hid-core.c`): the scan
+    /// checks *each* pending Usage at each collection open, so a
+    /// collection declared with several usages contributes all of
+    /// them here. A collection with no pending Usage contributes
+    /// nothing (matching Linux, whose scan then sees no usage for
+    /// it); the collection's own usage as recorded on the
+    /// [`Field::collection_path`] of enclosed fields is the first
+    /// pending Usage instead.
+    pub collections: Vec<(u16, u16)>,
 }
 
 impl ReportDescriptor {
@@ -250,6 +263,7 @@ struct LocalState {
 pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
     let mut fields: Vec<Field> = Vec::new();
     let mut top_level_apps: Vec<(u16, u16)> = Vec::new();
+    let mut collections: Vec<(u16, u16)> = Vec::new();
 
     let mut global = GlobalState::default();
     let mut local = LocalState::default();
@@ -334,6 +348,11 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
                         if collection_stack.len() >= MAX_NESTED_COLLECTIONS {
                             return Err(DescriptorError::CollectionTooDeep);
                         }
+                        // Record every Usage pending at this
+                        // Collection open (see `collections` on
+                        // `ReportDescriptor`): the scan set Linux
+                        // inspects for group assignment.
+                        collections.extend(local.usages.iter().copied());
                         let usage = first_usage(&local).unwrap_or((global.usage_page, 0));
                         if matches!(
                             CollectionKind::from_byte(raw_u as u8),
@@ -427,6 +446,7 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
         fields,
         has_report_ids,
         top_level_apps,
+        collections,
     })
 }
 
