@@ -11,23 +11,38 @@ repository.workspace   = true
 name = "narf_drivers_nvidia"
 path = "src/lib.rs"
 
-[dependencies]
-narf-capabilities    = { path = "../../../capabilities" }
-narf-kernel-test     = { path = "../../../verification/kernel-test" }
-narf-driver-runtime  = { path = "../../runtime", default-features = false, features = ["kernel"] }
-narf-drivers         = { path = "../.." }
-narf-bus             = { path = "../../../bus" }
-narf-memory          = { path = "../../../memory" }
-narf-init            = { path = "../../../init" }
-narf-interrupts      = { path = "../../../interrupts" }
-narf-firmware        = { path = "../../../firmware" }
-narf-crypto          = { path = "../../../crypto" }
-narf-scheduler       = { path = "../../../scheduler" }
-narf-io              = { path = "../../../io" }
-narf-lib             = { path = "../../../lib" }
-
 [features]
-kernel-test = []
+# Dual-build: built-in (rlib, linked into the kernel) or a loadable `.ko`.
+# `default = builtin` so the built kernel is unchanged. The `module` build
+# (`--no-default-features --features module`) drops every kernel crate and
+# registers through the narf_register_pci_driver KSYMTAB export. See
+# `narf-drivers-net-e1000`.
+default = ["builtin"]
+builtin = [
+    "dep:narf-capabilities", "dep:narf-driver-runtime", "dep:narf-drivers",
+    "dep:narf-bus", "dep:narf-memory", "dep:narf-init", "dep:narf-interrupts",
+    "dep:narf-firmware", "dep:narf-crypto", "dep:narf-scheduler", "dep:narf-io",
+    "dep:narf-lib",
+]
+module = []
+# Kernel-test harness: the driver body + the test crate. Implies `builtin`.
+kernel-test = ["builtin", "dep:narf-kernel-test"]
+
+[dependencies]
+narf-driver-macros   = { path = "../../../driver-macros" }
+narf-capabilities    = { path = "../../../capabilities", optional = true }
+narf-kernel-test     = { path = "../../../verification/kernel-test", optional = true }
+narf-driver-runtime  = { path = "../../runtime", default-features = false, features = ["kernel"], optional = true }
+narf-drivers         = { path = "../..", optional = true }
+narf-bus             = { path = "../../../bus", optional = true }
+narf-memory          = { path = "../../../memory", optional = true }
+narf-init            = { path = "../../../init", optional = true }
+narf-interrupts      = { path = "../../../interrupts", optional = true }
+narf-firmware        = { path = "../../../firmware", optional = true }
+narf-crypto          = { path = "../../../crypto", optional = true }
+narf-scheduler       = { path = "../../../scheduler", optional = true }
+narf-io              = { path = "../../../io", optional = true }
+narf-lib             = { path = "../../../lib", optional = true }
 
 [lints]
 workspace = true

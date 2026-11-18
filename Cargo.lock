@@ -2038,6 +2038,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-crypto",
+ "narf-driver-macros",
  "narf-driver-runtime",
  "narf-drivers",
  "narf-firmware",
