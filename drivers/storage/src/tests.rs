@@ -1196,7 +1196,7 @@ fn smoke_sd_scr_bus_widths() -> TestResult {
     // SD_BUS_WIDTHS 0x5 (1-bit + 4-bit) in byte 1.
     let scr = Scr::parse(&[0x02, 0x05, 0, 0, 0, 0, 0, 0]);
     if scr.sd_spec != 2 {
-        return TestResult::Fail("SD_SPEC must be the high nibble of byte 0");
+        return TestResult::Fail("SD_SPEC must be bits [59:56] (low nibble of byte 0)");
     }
     if scr.bus_widths != 0x05 || !scr.supports_4bit() {
         return TestResult::Fail("bus widths 0x5 must report 4-bit support");
