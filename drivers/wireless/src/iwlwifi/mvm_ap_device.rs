@@ -444,16 +444,18 @@ impl Device {
                 _ => return Err(22),
             };
             self.ap_stopped.store(false, Ordering::Release);
-            let result = Box::pin(owner.ap_prepare(
-                *plan,
-                settings,
-                &self.environment.ap_policy,
-                proof.clone(),
-                request.clone(),
-                self.ap_host.history.clone(),
-                source,
-                binding,
-            ))
+            let result = crate::future_heap::build(|| {
+                owner.ap_prepare(
+                    *plan,
+                    settings,
+                    &self.environment.ap_policy,
+                    proof.clone(),
+                    request.clone(),
+                    self.ap_host.history.clone(),
+                    source,
+                    binding,
+                )
+            })
             .await;
             let mut ap = match result {
                 Ok(ap) => Box::new(ap),

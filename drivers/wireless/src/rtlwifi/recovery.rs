@@ -130,14 +130,14 @@ where
         };
         drop(retired);
 
-        let prepared = self
-            .environment
-            .rebuild(
+        let prepared = crate::future_heap::build(|| {
+            self.environment.rebuild(
                 self.prepared.clone(),
                 self.factory.clone(),
                 self.lifecycle.channel.load(Ordering::Acquire),
             )
-            .await;
+        })
+        .await;
         if let Err(reason) = prepared {
             self.park_failed_rebuild().await;
             return Err(reason);

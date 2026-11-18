@@ -1008,12 +1008,13 @@ impl Device {
                 Ok(Outcome::Joined(request.bssid))
             }
             Operation::Maintain => {
-                owner
-                    .station_security(
+                crate::future_heap::build(|| {
+                    owner.station_security(
                         || (self.environment.nonce)(),
                         || (self.environment.policy)(),
                     )
-                    .await?;
+                })
+                .await?;
                 Ok(Outcome::Done)
             }
             Operation::Transmit => {

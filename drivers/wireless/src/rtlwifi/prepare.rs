@@ -210,8 +210,11 @@ pub struct Prepared<I: Io, M: Memory> {
     /// from the PROM and refuses a mismatch.
     rtl8192de_mode: Option<super::rtl8192de::MacPhyMode>,
     permission: Option<super::channel_power::Permission>,
-    packet: packet::State<M>,
-    station: station::State,
+    // Retain these complete state machines once at cold allocation. Moving
+    // the exclusive Prepared owner through async admission/recovery must not
+    // copy packet and station bookkeeping onto each caller's kernel stack.
+    packet: alloc::boxed::Box<packet::State<M>>,
+    station: alloc::boxed::Box<station::State>,
     ae8723: Option<alloc::boxed::Box<super::rtl8723ae::station_owner::State>>,
 }
 impl<I: Io, M: Memory> core::fmt::Debug for Prepared<I, M> {
@@ -325,8 +328,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192de_power: None,
             rtl8192de_mode: None,
             permission: None,
-            packet: packet::State::new(),
-            station: station::State::new(),
+            packet: alloc::boxed::Box::new(packet::State::new()),
+            station: alloc::boxed::Box::new(station::State::new()),
             ae8723: None,
         }
     }

@@ -547,7 +547,7 @@ impl<E: AhbEnv> LiveAhb<E> {
             DpRingSizes::LINUX,
             msi,
         ));
-        let r = core.qmi_firmware_ready(&mut *hooks).await;
+        let r = super::future_heap::build(|| core.qmi_firmware_ready(&mut *hooks)).await;
         let dp = hooks.dp.take().map(Box::new);
         match (r, dp) {
             (Ok(()), Some(dp)) => {
@@ -840,8 +840,8 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
     }
 
     async fn qmi_ready(&mut self, p: &AhbPlatform) -> Result<(), AhbError> {
-        let w = self.wlfw_ready(p).await?;
-        self.core_ready(p, w).await
+        let w = super::future_heap::build(|| self.wlfw_ready(p)).await?;
+        super::future_heap::build(|| self.core_ready(p, w)).await
     }
 
     async fn rproc_shutdown(&mut self, p: &AhbPlatform) {

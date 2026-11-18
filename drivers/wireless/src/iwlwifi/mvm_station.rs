@@ -409,16 +409,18 @@ impl Owner {
             signer: source.signer,
             digest: source.digest,
         };
-        super::power::parse_for(
-            probe,
-            binding,
-            self.mac.unwrap(),
-            channel,
-            self.power.phy.emission(),
-        )?
-        .with_span(self.power.phy.span())
-        .with_client(self.hardware.p2p_client_native())?
-        .host_ceiling(&policy()?)?;
+        {
+            let mut prepared = super::power::parse_retained(
+                probe,
+                binding,
+                self.mac.unwrap(),
+                channel,
+                self.power.phy.emission(),
+            )?;
+            prepared.bind_span(self.power.phy.span());
+            prepared.bind_client(self.hardware.p2p_client_native())?;
+            prepared.host_ceiling(&policy()?)?;
+        }
         if self.hardware.p2p_client_native().is_some() {
             let epoch = self.hardware.close_receive_epoch()?;
             future_heap::build(|| self.hardware.prepare_p2p_client()).await?;

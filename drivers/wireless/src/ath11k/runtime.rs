@@ -3344,6 +3344,15 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             .await
     }
 
+    // Taking and boxing the large inline runtime needs one transient move.
+    // Keep that move out of the reconstruction poll's other core/DP locals.
+    #[inline(never)]
+    fn take_recovery_runtime(
+        current: &mut Option<Rt<Io, Irq, Q>>,
+    ) -> Option<alloc::boxed::Box<Rt<Io, Irq, Q>>> {
+        current.take().map(alloc::boxed::Box::new)
+    }
+
     /// The common reconstruction tail for a firmware-reset recovery and an
     /// expected system-suspend cold cycle. `record_recovery_failure` is true
     /// only for a transport-reported crash: system resume failures still park
@@ -3384,7 +3393,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // Keep the original large runtime heap-owned while transport
         // restart awaits. Moving it into this future's inline state made
         // recovery polls reserve a second full runtime on the kernel stack.
-        let taken = self.rt.lock().await.take().map(alloc::boxed::Box::new);
+        let taken = {
+            let mut current = self.rt.lock().await;
+            Self::take_recovery_runtime(&mut current)
+        };
         let Some(mut rt) = taken else {
             return Err(TransportError::new(step::RECOVERY_CORE, 0, ENODEV));
         };

@@ -54,7 +54,9 @@ pub struct Startup {
     phase: Phase,
     cold: Option<Cold<Owned>>,
     native: Option<Native>,
-    firmware: Option<Firmware<Native>>,
+    // Retain the original transport and selected plan without moving their
+    // combined state through the startup control future's polling frame.
+    firmware: Option<alloc::boxed::Box<Firmware<Native>>>,
     identity: Option<Identity>,
     mac: super::mac_runtime::Mac,
     radio: super::radio_init::Init,
@@ -974,7 +976,7 @@ impl Startup {
         unsafe { native.configure() }.map_err(Error::Command)?;
         native.enable_download().map_err(Error::Command)?;
         let native = self.native.take().ok_or(Error::Terminal)?;
-        self.firmware = Some(Firmware::new(native, plan).map_err(Error::Boot)?);
+        self.firmware = Some(retain_firmware(native, plan)?);
         self.phase = Phase::Firmware;
         self.firmware
             .as_mut()
@@ -994,6 +996,18 @@ impl Startup {
             firmware.transport_mut().fail();
         }
     }
+}
+// Construct the final retained owner in a separate frame: Firmware combines
+// the large Native transport and DownloadPlan, and returning it by value to
+// start_plan duplicates both in its enclosing future's stack frame.
+#[inline(never)]
+fn retain_firmware(
+    native: Native,
+    plan: DownloadPlan,
+) -> Result<alloc::boxed::Box<Firmware<Native>>, Error> {
+    Ok(alloc::boxed::Box::new(
+        Firmware::new(native, plan).map_err(Error::Boot)?,
+    ))
 }
 impl Drop for Startup {
     fn drop(&mut self) {

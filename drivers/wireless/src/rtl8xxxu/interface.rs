@@ -37,7 +37,7 @@ impl Environment for NativeEnvironment {
     }
 }
 struct State<C: ControlIo, B: PacketIo, E: Environment> {
-    service: Service<C, B, E>,
+    service: Box<Service<C, B, E>>,
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
@@ -123,7 +123,15 @@ impl<C: ControlIo, B: PacketIo, E: Environment> core::fmt::Debug for Device<C, B
     }
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
-    pub(super) fn new(name: &str, mut service: Service<C, B, E>) -> Self {
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn new(name: &str, service: Service<C, B, E>) -> Self {
+        Self::from_boxed_service(name, Box::new(service))
+    }
+
+    /// Keep the retained service in its final allocation while publishing
+    /// the frontend, rather than copy its packet/station state into callers.
+    #[inline(never)]
+    fn from_boxed_service(name: &str, mut service: Box<Service<C, B, E>>) -> Self {
         let parked = service.phase() == service_runtime::Phase::Parked;
         let mac = service.local();
         let (rx, rx_consumer) = narf_ipc::channel();
@@ -468,7 +476,7 @@ pub async fn wait_attach(
             narf_wireless::reg::policy::load(),
             power_policy::Calibration::load_registered(factory, vid, pid),
         )? {
-            Admission::Ready => return attach(firmware).await,
+            Admission::Ready => return crate::future_heap::build(|| attach(firmware)).await,
             Admission::PendingAssets => {
                 narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
             }
@@ -511,16 +519,20 @@ pub async fn attach(
         .map_err(|_| service_runtime::Error::State)?;
     let mut receiver =
         Receiver::new(firmware, UsbIo::new(usb), receive).map_err(service_runtime::Error::Radio)?;
-    receiver
-        .prepare_profile(profile)
+    crate::future_heap::build(|| receiver.prepare_profile(profile))
         .await
         .map_err(service_runtime::Error::Radio)?;
-    let mut service = Service::start(receiver, power, NativeEnvironment).await?;
+    let mut service = crate::future_heap::build(|| async {
+        Service::start(receiver, power, NativeEnvironment)
+            .await
+            .map(Box::new)
+    })
+    .await?;
     // register_netdevice starts IFF_DOWN. Finish actual USB/MAC/card park
     // before publication, rather than leave an RX stream running under DOWN.
-    service.park().await?;
+    crate::future_heap::build(|| service.park()).await?;
     let name = narf_net::iface::reserve_name("wlan%d");
-    let device = Arc::new(Device::new(name, service));
+    let device = Arc::new(Device::from_boxed_service(name, service));
     narf_net::registry()
         .register(&authority, Registered(device.clone()))
         .map_err(|_| service_runtime::Error::Profile)?;

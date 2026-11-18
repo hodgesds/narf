@@ -8,7 +8,6 @@
 29096 narf_drivers_wireless::rtl8xxxu::receive_runtime::receive_retune::<impl narf_drivers_wireless::rtl8xxxu::receive_runtime::Receiver<C,B>>::restore_channel::{{closure}}
 28904 narf_drivers_gpu::amdgpu::claim_navi48
 28248 narf_drivers_wireless::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
-27592 <narf_drivers_wireless::ath11k::iface::Ath11kNetdev<narf_drivers_wireless::ath11k::core::Bar0,narf_drivers_wireless::ath11k::ce::MsiCeIrq,narf_drivers_wireless::ath11k::wlfw::Wlfw<narf_drivers_wireless::ath11k::mhi_host::MhiController<narf_drivers_wireless::ath11k::pci::Bar0Mhi>,narf_drivers_wireless::ath11k::wlfw::NarfFirmware,narf_drivers_wireless::ath11k::wlfw::Dma32>> as narf_power::system_pm::AsyncSystemPm>::resume_from_suspend::{{closure}}
 26728 <narf_drivers_wireless::iwlwifi::device::dhcp_composition::Guard as core::ops::drop::Drop>::drop
 26376 <narf_drivers_wireless::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
 25688 narf_drivers_wireless::rtw89::bootstrap::Bootstrap::generation::{{closure}}
@@ -35,16 +34,12 @@
 16472 narf_userspace::abi_test_support::with_setup
 16064 narf_drivers_wireless::rtlwifi::prepare::station::<impl narf_drivers_wireless::rtlwifi::prepare::Prepared<I,M>>::connect_station::{{closure}}::{{closure}}
 15320 narf_drivers_wireless::rtlwifi::prepare_native::initialize_registered_on_channel::{{closure}}
-14776 narf_drivers_wireless::iwlwifi::mvm_device::ap::<impl narf_drivers_wireless::iwlwifi::mvm_device::Device>::ap_control::{{closure}}::{{closure}}
 14632 narf_drivers_wireless::rtlwifi::prepare_native::prepare_rtl8723be::{{closure}}
 14408 narf_drivers_gpu::amdgpu_mes12_hw::Engine<I>::start::{{closure}}
 14408 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe::{{closure}}
 13848 narf_time::timer::timers_prepare_cpu
 13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
 13560 narf_drivers_wireless::ath10k::interface::publish_with_mac
-13448 narf_drivers_wireless::ath9k::ar9287_owner::compose
-13416 narf_drivers_wireless::ath9k::ar5008_owner::compose
-13416 narf_drivers_wireless::ath9k::ar9280_owner::compose
 13080 narf_drivers_wireless::iwlwifi::ap_session::Session::prepare_native::{{closure}}
 12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
 12408 narf_scheduler::block_on_inner
@@ -57,10 +52,8 @@
 10920 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
 10808 narf_drivers_wireless::rtl8xxxu::service_runtime::Service<C,B,E>::connect::{{closure}}
 10680 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::cold_start
-10504 narf_drivers_wireless::rtw89::bootstrap::advance::{{closure}}
 10264 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::new
 10248 narf_drivers_wireless::rtw89::pci_reset::<impl narf_drivers_wireless::rtw89::startup::Startup>::claim_reset
-10184 narf_drivers_wireless::ath9k::initialize_owner_inner::{{closure}}
 10184 narf_drivers_wireless::cyw43439::station::policy::<impl narf_drivers_wireless::cyw43439::station::Station<R>>::initialize_live::{{closure}}
 9896 narf_drivers_wireless::iwlwifi::mvm_device::Device::execute::{{closure}}
 9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin

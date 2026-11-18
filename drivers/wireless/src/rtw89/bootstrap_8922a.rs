@@ -352,18 +352,9 @@ impl Supervisor {
         prepared.reset_program(&mut dma_port).map_err(Error::Dma)?;
         self.stage(Stage::Rings);
         // Select/authenticate both actual suits before granting PCI DMA.
-        let image = firmware_registry::load(mac::ChipId::Rtl8922A, cv).map_err(Error::Firmware)?;
-        let bb_image = image.bbmcu(cv, 0).map_err(Error::Firmware)?;
-        let blacklist = super::secure::Blacklist::upstream(mac::ChipId::Rtl8922A);
-        let fuses = prepared.secure_fuses();
         // Retain the separately selected plans directly in heap storage;
         // later stages borrow the exact same immutable image snapshots.
-        let normal = Box::new(
-            download_plan::DownloadPlan::new(image, fuses, blacklist).map_err(Error::Plan)?,
-        );
-        let bb = Box::new(
-            download_plan::DownloadPlan::new(bb_image, fuses, blacklist).map_err(Error::Plan)?,
-        );
+        let (normal, bb) = select_firmware_plans(prepared, cv)?;
         // Pure preflight of the actual signed element region: no BB/RF effect
         // and no calibration qualification or emission authority is created.
         let assets = super::radio_assets::Assets::from_prepared_be(normal.firmware(), chip_version)
@@ -439,6 +430,31 @@ impl Supervisor {
         );
         Ok(())
     }
+}
+// Keep the large signed-image and plan-construction return values out of
+// start_closed's frame. Only the final heap-retained plans cross this
+// boundary; their selection, fuse checks and drop order are unchanged.
+#[inline(never)]
+fn select_firmware_plans(
+    prepared: &CheckedPrepared,
+    cv: u8,
+) -> Result<
+    (
+        Box<download_plan::DownloadPlan>,
+        Box<download_plan::DownloadPlan>,
+    ),
+    Error,
+> {
+    let image = firmware_registry::load(mac::ChipId::Rtl8922A, cv).map_err(Error::Firmware)?;
+    let bb_image = image.bbmcu(cv, 0).map_err(Error::Firmware)?;
+    let blacklist = super::secure::Blacklist::upstream(mac::ChipId::Rtl8922A);
+    let fuses = prepared.secure_fuses();
+    let normal =
+        Box::new(download_plan::DownloadPlan::new(image, fuses, blacklist).map_err(Error::Plan)?);
+    let bb = Box::new(
+        download_plan::DownloadPlan::new(bb_image, fuses, blacklist).map_err(Error::Plan)?,
+    );
+    Ok((normal, bb))
 }
 fn storage() -> Result<dma::Storage<DmaBuffer>, Error> {
     let allocate = |length| {
