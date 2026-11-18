@@ -493,7 +493,7 @@ kernel_test_in!(
     smoke_nvl_lt_aux_power_waits_for_status
 );
 
-fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
+fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
     use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL};
 
     struct Display20Tc {
@@ -539,6 +539,26 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
         }
     }
 
+    struct MailboxBusy(Display20Tc);
+    impl MmioWindow for MailboxBusy {
+        fn display_access_ok(&self) -> bool {
+            self.0.display_access_ok()
+        }
+        fn cx0_xe3(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            if off == TCSS_DISP_MAILBOX_IN_CMD {
+                TCSS_DISP_MAILBOX_RUN_BUSY
+            } else {
+                self.0.read32(off)
+            }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value);
+        }
+    }
+
     let io = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D);
     // Keep PORT_TX_DFLEXPA1 distinct so only TCSS_DDI_STATUS supplies PIN_ASSIGNMENT_D.
     io.inner.pin.set(PIN_ASSIGNMENT_C);
@@ -567,9 +587,18 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
     {
         return TestResult::Fail("Display 20 TC failure rollback must drop PICA_PW_CTL");
     }
+
+    let busy = MailboxBusy(Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D));
+    busy.0.inner.pica_isr.set(pica_dp_alt_hotplug(0));
+    if connect_for(&busy, XeLpgPort::Tc1, false, 2, true) != Err(TcError::TcssMailboxTimeout)
+        || busy.0.pica_req.get() & PICA_POWER_REQUEST != 0
+        || !busy.0.inner.buf_writes().is_empty()
+    {
+        return TestResult::Fail("Display 30 busy mailbox must refuse before TCSS request");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_tc",
-    smoke_display20_tc_pica_and_tcss_pin_assignment
+    smoke_display20_tc_pica_pin_and_display30_mailbox
 );

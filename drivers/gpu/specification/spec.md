@@ -463,6 +463,10 @@ request/status handshake only when the exact MMIO owner reports
 `has_lt_phy()`: 2 ms for status set and 1 ms for status clear, with typed busy,
 access-loss and timeout failures. Non-LT C10/C20 owners retain the 600-us/10-us
 fixed delays. No production Nova caller is installed by this helper.
+The exact display-30 MMIO view also runs Wa_14020908590 around every TCSS
+power-request transition: two bounded 10-ms mailbox-idle waits around data
+0/1 and command 1 with RUN_BUSY. Mailbox timeout is typed and prevents the
+unprotected request write. Other display versions never touch this mailbox.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be

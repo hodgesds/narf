@@ -90,6 +90,12 @@ pub const PIN_ASSIGNMENT_E: u8 = 5;
 const PHY_READY_TIMEOUT_NS: u64 = 500_000_000;
 /// `xelpdp_tc_phy_wait_for_tcss_power`: 5 ms.
 const TCSS_POWER_TIMEOUT_NS: u64 = 5_000_000;
+/// Wa_14020908590 mailbox idle/completion timeout: 10 ms.
+const TCSS_MAILBOX_TIMEOUT_NS: u64 = 10_000_000;
+/// `TCSS_DISP_MAILBOX_IN_CMD` and `TCSS_DISP_MAILBOX_IN_DATA`.
+pub(crate) const TCSS_DISP_MAILBOX_IN_CMD: u64 = 0x16_1300;
+pub(crate) const TCSS_DISP_MAILBOX_IN_DATA: u64 = 0x16_1304;
+pub(crate) const TCSS_DISP_MAILBOX_RUN_BUSY: u32 = 1 << 31;
 /// `xelpdp_aux_power_well_enable`: fixed 600 µs after the request.
 const AUX_POWER_UP_NS: u64 = 600_000;
 /// `xelpdp_aux_power_well_disable`: 10 µs after the release.
@@ -140,6 +146,8 @@ pub enum TcError {
     PhyNotReady,
     /// TCSS power did not reach the requested state in 5 ms.
     TcssPowerTimeout,
+    /// Display-30 Wa_14020908590's TCSS mailbox remained busy.
+    TcssMailboxTimeout,
     /// The DP-alt live status dropped during connect.
     SuddenDisconnect,
     /// The pin assignment carries fewer lanes than required.
@@ -366,13 +374,40 @@ const fn default_mode(legacy_port: bool) -> TcMode {
     }
 }
 
+/// Display-30 Wa_14020908590: serialize TCSS power-request changes through
+/// the display mailbox before touching `XELPDP_TCSS_POWER_REQUEST`.
+fn display30_tcss_power_request_wa<M: MmioWindow + ?Sized>(
+    io: &M,
+    enable: bool,
+) -> Result<(), TcError> {
+    let idle = poll_until(io, TCSS_MAILBOX_TIMEOUT_NS, || {
+        Ok(read_checked(io, TCSS_DISP_MAILBOX_IN_CMD)? & TCSS_DISP_MAILBOX_RUN_BUSY == 0)
+    })?;
+    if !idle {
+        return Err(TcError::TcssMailboxTimeout);
+    }
+    io.write32(TCSS_DISP_MAILBOX_IN_DATA, u32::from(enable));
+    compiler_fence(Ordering::SeqCst);
+    io.write32(TCSS_DISP_MAILBOX_IN_CMD, TCSS_DISP_MAILBOX_RUN_BUSY | 1);
+    compiler_fence(Ordering::SeqCst);
+    let complete = poll_until(io, TCSS_MAILBOX_TIMEOUT_NS, || {
+        Ok(read_checked(io, TCSS_DISP_MAILBOX_IN_CMD)? & TCSS_DISP_MAILBOX_RUN_BUSY == 0)
+    })?;
+    if complete {
+        Ok(())
+    } else {
+        Err(TcError::TcssMailboxTimeout)
+    }
+}
+
 fn set_tcss_power_request<M: MmioWindow + ?Sized>(
     io: &M,
     port: XeLpgPort,
     enable: bool,
 ) -> Result<(), TcError> {
-    // `__xelpdp_tc_phy_enable_tcss_power` (the display-30 mailbox WA does
-    // not apply to display 14).
+    if io.cx0_xe3() {
+        display30_tcss_power_request_wa(io, enable)?;
+    }
     if enable {
         rmw(io, port.buf_ctl1(), 0, TCSS_POWER_REQUEST)
     } else {

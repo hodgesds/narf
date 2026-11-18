@@ -507,6 +507,9 @@ impl MmioWindow for ExtFake {
         if !self.access.get() {
             return u32::MAX;
         }
+        if off == crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_IN_CMD {
+            return self.phy.read32(off) & !crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_RUN_BUSY;
+        }
         if (0..4).any(|p| off == 0x60544 + p * 0x1000) {
             let mut value = self.phy.read32(off);
             if self.phy.read32(off - 4) & (7 << 8) == 2 << 8 {
@@ -896,6 +899,12 @@ fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
     };
     if probe.display_version() != 30 || probe.tc.is_none_or(|tc| !tc.display20) {
         return TestResult::Fail("the sink probe must retain the display-30 layout");
+    }
+    if io.writes_to(crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_IN_DATA) != [1]
+        || io.writes_to(crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_IN_CMD)
+            != [crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_RUN_BUSY | 1]
+    {
+        return TestResult::Fail("PTL TCSS power-up must run Wa_14020908590 first");
     }
     let fb = fb_for(&probe.mode).unwrap();
     let display = MtlDisplay {
