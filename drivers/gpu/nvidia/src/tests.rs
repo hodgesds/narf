@@ -6293,3 +6293,120 @@ fn smoke_dp_auxch() -> TestResult {
     }
 }
 kernel_test_in!("drivers/nvidia/dp", smoke_dp_auxch);
+
+// ────────────────────────────────────────────────────────────────
+// Turing GSP modeset plan (ordered RPC + pushbuffer sequence)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_modeset_plan() -> TestResult {
+    use crate::disp::{Mode, ModeFlags};
+    use crate::gsp_dp::LINK_BW_5_40GBPS;
+    use crate::gsp_modeset::{build_modeset_plan, ModesetInputs, Step};
+    use crate::gsp_rm_api::{FUNCTION_GSP_RM_ALLOC, FUNCTION_GSP_RM_CONTROL};
+
+    // 1920x1080@60.
+    let mode = Mode {
+        clock_khz: 148500,
+        h_display: 1920,
+        h_sync_start: 2008,
+        h_sync_end: 2052,
+        h_total: 2200,
+        v_display: 1080,
+        v_sync_start: 1084,
+        v_sync_end: 1089,
+        v_total: 1125,
+        flags: ModeFlags {
+            hsync_positive: true,
+            vsync_positive: true,
+            interlaced: false,
+            double_scan: false,
+        },
+    };
+    let lane_data = [crate::gsp_dp::lane_data(0, 0); 4];
+    let inputs = ModesetInputs {
+        h_client: 0xc1d0_0001,
+        h_internal_subdevice: 0x5d1d_0000,
+        display_id: 0x100,
+        inst_mem_phys: 0x1_0000,
+        inst_mem_size: 0x1000,
+        dp_lanes: 4,
+        dp_bw_code: LINK_BW_5_40GBPS,
+        dp_lane_data: &lane_data,
+        core_pb_phys: 0x20_0000,
+        core_pb_limit: 0xfff,
+        window_pb_phys: 0x21_0000,
+        window_pb_limit: 0xfff,
+        mode: &mode,
+        head: 0,
+        fb_handle: 0xcafe,
+        fb_offset: 0x4_0000,
+        fb_width: 1920,
+        fb_height: 1080,
+    };
+
+    let plan = match build_modeset_plan(&inputs) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("plan build failed"),
+    };
+
+    // Exactly the 9-step bring-up order.
+    if plan.len() != 9 {
+        return TestResult::Fail("expected 9 steps");
+    }
+    // First five RPCs: inst-mem(ctrl), dp-ctrl(ctrl), lane-data(ctrl),
+    // core-pb(ctrl), core-alloc(alloc).
+    let is_ctrl =
+        |s: &Step| matches!(s, Step::Rpc { function, .. } if *function == FUNCTION_GSP_RM_CONTROL);
+    let is_alloc =
+        |s: &Step| matches!(s, Step::Rpc { function, .. } if *function == FUNCTION_GSP_RM_ALLOC);
+    if !(is_ctrl(&plan[0])
+        && is_ctrl(&plan[1])
+        && is_ctrl(&plan[2])
+        && is_ctrl(&plan[3])
+        && is_alloc(&plan[4]))
+    {
+        return TestResult::Fail("core-channel RPC ordering wrong");
+    }
+    if !(is_ctrl(&plan[5]) && is_alloc(&plan[6])) {
+        return TestResult::Fail("window-channel RPC ordering wrong");
+    }
+    // Last two steps are the core then window pushbuffers.
+    match (&plan[7], &plan[8]) {
+        (
+            Step::Push {
+                class: c0,
+                head: 0,
+                pb: p0,
+            },
+            Step::Push {
+                class: c1,
+                head: 0,
+                pb: p1,
+            },
+        ) => {
+            if *c0 != gsp_chan_core() || *c1 != gsp_chan_window() {
+                return TestResult::Fail("push channel classes wrong");
+            }
+            // Core pushbuffer leads with the RASTER_SIZE method header,
+            // window with SET_SIZE — both non-empty.
+            if p0.is_empty() || p1.is_empty() {
+                return TestResult::Fail("empty pushbuffers");
+            }
+            // Core first method id = HEAD_SET_RASTER_SIZE on head 0
+            // (pb_header stores the raw method in the low 16 bits).
+            let m0 = u16::from_le_bytes([p0[0], p0[1]]);
+            if m0 != crate::dispc57d::C57D_HEAD_SET_RASTER_SIZE {
+                return TestResult::Fail("core pb first method wrong");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("final steps must be core+window pushes"),
+    }
+}
+fn gsp_chan_core() -> u32 {
+    crate::gsp_chan::DISP_CORE_CHANNEL_DMA
+}
+fn gsp_chan_window() -> u32 {
+    crate::gsp_chan::DISP_WINDOW_CHANNEL_DMA
+}
+kernel_test_in!("drivers/nvidia/modeset", smoke_modeset_plan);
