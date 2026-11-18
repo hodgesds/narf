@@ -1498,6 +1498,9 @@ fn smoke_intel_vrr_readback_decode() -> TestResult {
 kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_vrr_readback_decode);
 
 fn smoke_intel_vrr_reconcile_fixed_rr() -> TestResult {
+    let enabled = VRR_STATE.is_enabled(1);
+    let cmrr = VRR_STATE.is_cmrr_enabled(1);
+    let timings = VRR_STATE.timings(1);
     let base = TRANSCODER_A_BASE;
     let stale = VrrTimings {
         vmin: 1125,
@@ -1564,6 +1567,11 @@ fn smoke_intel_vrr_reconcile_fixed_rr() -> TestResult {
     assert!(VRR_STATE.is_enabled(1));
     assert_eq!(VRR_STATE.timings(1), Some(stale));
 
+    // The dead-MMIO case deliberately leaves variable refresh enabled. Restore
+    // the original pipe state so independent panel tests can qualify PSR.
+    VRR_STATE.set_timings(1, timings);
+    VRR_STATE.set_cmrr_enabled(1, cmrr);
+    VRR_STATE.set_enabled(1, enabled);
     TestResult::Pass
 }
 kernel_test_in!(

@@ -162,10 +162,14 @@ fn smoke_xe2lpd_gmd_decode_and_typed_refusals() -> TestResult {
         DisplayIp::for_generation(Generation::LunarLake),
         Some(DisplayIp::Xe2Lpd)
     );
+    assert_eq!(
+        DisplayIp::for_generation(Generation::PantherLake),
+        Some(DisplayIp::Xe3Lpd)
+    );
     for generation in [
         Generation::TigerLake,
+        Generation::RocketLake,
         Generation::AlderLake,
-        Generation::PantherLake,
     ] {
         assert_eq!(DisplayIp::for_generation(generation), None);
     }
