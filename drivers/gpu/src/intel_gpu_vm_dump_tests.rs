@@ -136,7 +136,7 @@ fn smoke_coredump_vm_wire_owned_tables_corruption_and_immutable_reads() -> TestR
     // A corrupt hardware-visible link cannot redirect capture to foreign RAM.
     let view = batch.diagnostic_vm();
     let table_pages: Vec<_> = view.memory.diagnostic_tables().collect();
-    assert_eq!(table_pages.len(), 4);
+    assert_eq!(table_pages.len(), 5);
     let root = narf_memory::PhysAddr::new(view.root).kernel_mut_ptr::<u64>();
     // SAFETY: root is one of this batch's retained private table pages. Its
     // entries are restored before teardown, and no device owns this fixture.
@@ -179,7 +179,7 @@ fn smoke_coredump_vm_wire_owned_tables_corruption_and_immutable_reads() -> TestR
             word(record, 40),
             word(record, 44)
         ),
-        (4, 4, 2, 2)
+        (5, 5, 2, 2)
     );
     for (index, phys) in table_pages.iter().enumerate() {
         let descriptor = &record[128 + index * 16..];
@@ -300,7 +300,8 @@ fn smoke_coredump_vm_limits_and_payload_prefix_are_explicit() -> TestResult {
     );
     for index in 0..4 {
         let record = &section[64 + index * 0x30380..];
-        assert_eq!((word(record, 32), word(record, 36)), (23, 16));
+        // Twenty leaf tables share the four upper tables on Battlemage.
+        assert_eq!((word(record, 32), word(record, 36)), (24, 16));
         assert_eq!(
             (word(record, 40), word(record, 44), word(record, 52)),
             (9, 8, 28)
@@ -348,10 +349,12 @@ fn smoke_coredump_vm_access_loss_zeros_current_payload_and_suppresses_later_jobs
         || {
             let n = calls.get() + 1;
             calls.set(n);
-            n < 12
+            // Both access checks for each of the five table pages succeed.
+            // Lose access during the first range's payload copy.
+            n < 14
         },
     );
-    assert_eq!(calls.get(), 12);
+    assert_eq!(calls.get(), 14);
     let dump = snapshot(index).unwrap();
     assert!(clear(index, dump.generation));
     assert_eq!(word(&dump.bytes, 168), 35);
@@ -363,7 +366,7 @@ fn smoke_coredump_vm_access_loss_zeros_current_payload_and_suppresses_later_jobs
     let record = &section[64..];
     assert_eq!(
         (word(record, 36), word(record, 44), word(record, 52)),
-        (4, 1, 34)
+        (5, 1, 34)
     );
     let range = &record[0x10180..];
     assert_eq!(
