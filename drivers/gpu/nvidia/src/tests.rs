@@ -5736,3 +5736,102 @@ fn smoke_gsp_ring_tx_header() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_ring", smoke_gsp_ring_tx_header);
+
+// ────────────────────────────────────────────────────────────────
+// GSP-RM object model over RPC (post-INIT_DONE foundation)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_rm_api::{
+    alloc_device_rpc, alloc_disp_common_rpc, alloc_disp_rpc, alloc_root_rpc, alloc_subdevice_rpc,
+    build_rm_alloc, build_rm_control, class_handle, client_handle, nv0000_root_params,
+    nv0080_device_params, HANDLE_DEVICE, HANDLE_DISP, HANDLE_SUBDEVICE, NV01_DEVICE_0, NV01_ROOT,
+    NV04_DISPLAY_COMMON, NV20_SUBDEVICE_0, RM_ALLOC_HDR_SIZE, RM_CONTROL_HDR_SIZE,
+    TU102_DISP as RM_TU102_DISP,
+};
+
+fn smoke_gsp_rm_handles() -> TestResult {
+    if client_handle(5) != 0xc1d0_0005 || HANDLE_DEVICE != 0xde1d_0000 {
+        return TestResult::Fail("canonical handles drifted");
+    }
+    // Display channel / root handles are (class << 16) | inst.
+    if class_handle(RM_TU102_DISP, 0) != 0xc570_0000 || HANDLE_DISP != 0x0073_0000 {
+        return TestResult::Fail("class_handle / disp handle wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm_api", smoke_gsp_rm_handles);
+
+fn smoke_gsp_rm_alloc_control_headers() -> TestResult {
+    // GSP_RM_ALLOC: 32-byte header + params; paramsSize carries len.
+    let a = build_rm_alloc(0x1111, 0x2222, 0x3333, 0x80, &[0xAA, 0xBB]);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    if a.len() != RM_ALLOC_HDR_SIZE + 2 {
+        return TestResult::Fail("alloc payload length wrong");
+    }
+    if rd(&a, 0) != 0x1111 || rd(&a, 4) != 0x2222 || rd(&a, 8) != 0x3333 || rd(&a, 0xc) != 0x80 {
+        return TestResult::Fail("alloc header handles/class mis-packed");
+    }
+    if rd(&a, 0x14) != 2 || a[0x20..0x22] != [0xAA, 0xBB] {
+        return TestResult::Fail("alloc paramsSize / params mis-packed");
+    }
+    // GSP_RM_CONTROL: 24-byte header (hClient, hObject, cmd, …).
+    let c = build_rm_control(0x1111, 0x3333, 0x730152, &[0xCC]);
+    if c.len() != RM_CONTROL_HDR_SIZE + 1 {
+        return TestResult::Fail("control payload length wrong");
+    }
+    if rd(&c, 0) != 0x1111 || rd(&c, 4) != 0x3333 || rd(&c, 8) != 0x730152 || rd(&c, 0x10) != 1 {
+        return TestResult::Fail("control header mis-packed");
+    }
+    if c[0x18] != 0xCC {
+        return TestResult::Fail("control params mis-packed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gsp_rm_api",
+    smoke_gsp_rm_alloc_control_headers
+);
+
+fn smoke_gsp_rm_object_tree() -> TestResult {
+    let hc = client_handle(0);
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    // root: self-parented NV01_ROOT; NV0000 params (108 bytes) with
+    // hClient + processID=~0.
+    let root = alloc_root_rpc(hc);
+    if rd(&root, 0) != hc || rd(&root, 4) != hc || rd(&root, 8) != hc || rd(&root, 0xc) != NV01_ROOT
+    {
+        return TestResult::Fail("root alloc handles/class wrong");
+    }
+    let p = nv0000_root_params(hc);
+    if p.len() != 108 || u32::from_le_bytes(p[4..8].try_into().unwrap()) != 0xFFFF_FFFF {
+        return TestResult::Fail("NV0000 params wrong");
+    }
+    // device: hObject = DEVICE, class NV01_DEVICE_0, NV0080 params
+    // carrying hClientShare.
+    let dev = alloc_device_rpc(hc);
+    if rd(&dev, 8) != HANDLE_DEVICE || rd(&dev, 0xc) != NV01_DEVICE_0 {
+        return TestResult::Fail("device alloc wrong");
+    }
+    let dp = nv0080_device_params(hc);
+    if dp.len() != 56 || u32::from_le_bytes(dp[4..8].try_into().unwrap()) != hc {
+        return TestResult::Fail("NV0080 params wrong");
+    }
+    // subdevice, disp-common, disp root.
+    let sub = alloc_subdevice_rpc(hc);
+    if rd(&sub, 4) != HANDLE_DEVICE
+        || rd(&sub, 8) != HANDLE_SUBDEVICE
+        || rd(&sub, 0xc) != NV20_SUBDEVICE_0
+    {
+        return TestResult::Fail("subdevice alloc wrong");
+    }
+    let com = alloc_disp_common_rpc(hc);
+    if rd(&com, 8) != HANDLE_DISP || rd(&com, 0xc) != NV04_DISPLAY_COMMON || rd(&com, 0x14) != 0 {
+        return TestResult::Fail("disp-common alloc wrong");
+    }
+    let disp = alloc_disp_rpc(hc);
+    if rd(&disp, 8) != class_handle(RM_TU102_DISP, 0) || rd(&disp, 0xc) != RM_TU102_DISP {
+        return TestResult::Fail("disp root alloc wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_rm_api", smoke_gsp_rm_object_tree);
