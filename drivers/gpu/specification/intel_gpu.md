@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.10** (v1.10 gives Nova's disconnected resource plan an exact
+> Status: **v1.11** (v1.11 gives Nova's disconnected plan an ordered main-well
+> lease with partial-grant rollback and foreign-request preservation; v1.10 gives it an exact
 > Display-20-style D2D lease; v1.09 replaces the shared Type-C display20 boolean with
 > exact Meteor/Lunar/Panther/Wildcat/Nova policy; v1.08 restores Display-30 Type-C power-request mailbox
 > Wa_14020908590; v1.07 adds Nova Lake's exact LT AUX power-status waits
@@ -431,6 +432,15 @@ dependency through Display >=20's `DDI_BUF_CTL` bits 29/28 and the source
 operational `DisplayIp`, but Nova requires `has_lt_phy()` before its first
 register access. Missing state is typed and a crossed non-LT view writes
 nothing. This remains a disconnected prerequisite rather than a modeset.
+`NovaResourcePlan::acquire_main_wells` requests PW1, optional PW2 and the
+selected PW_A--D in dependency order, waits up to 1 ms for each state and
+fuse-distribution indication (failing closed where Linux only warns), and
+returns a token containing only DRIVER
+requests absent on entry. A failed partial grant is unwound; token release is
+reverse ordered and never clears pre-existing DRIVER requests. BIOS, KVMR or
+debug requests may keep a released well raised, matching Linux's forced-on
+rule. The exact LT-PHY platform fact is checked before the first register read.
+This raw disconnected lease is not the future live owner's global refcount.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.

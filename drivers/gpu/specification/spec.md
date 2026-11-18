@@ -475,6 +475,13 @@ The disconnected `NovaResourcePlan` can acquire/release its D2D dependency
 through the Display >=20 `DDI_BUF_CTL` enable/state bits with 100-us bounds.
 It requires the exact LT-PHY MMIO fact before the first access and does not
 construct an operational `DisplayIp` or enable a route.
+Its main-well lease requests PW1, optional PW2 and the selected PW_A--D in
+dependency order, rolls back partial grants, and releases in reverse order.
+Only DRIVER requests absent on entry belong to the token; BIOS, KVMR and debug
+requesters are observed before waiting for a released state to clear. Every
+state and fuse-distribution wait is bounded at 1 ms; NARF fails a missing fuse
+closed where Linux logs a warning. A non-LT view refuses before MMIO. The lease
+remains disconnected from the live resource refcount.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be
