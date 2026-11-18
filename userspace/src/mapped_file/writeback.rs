@@ -1359,6 +1359,9 @@ enum Caller {
 /// In-syscall scheduling points where the caller really was a task on its
 /// own stack (`cond_resched` could yield). Kernel tests read it.
 pub(super) static SYSCALL_YIELD_POINTS: AtomicU64 = AtomicU64::new(0);
+/// Task scheduling points the flusher hit between batches (`yield_now`
+/// on the executor). Kernel tests read it.
+pub(super) static TASK_YIELD_POINTS: AtomicU64 = AtomicU64::new(0);
 
 async fn scheduling_point(caller: Caller) {
     match caller {
@@ -1367,7 +1370,10 @@ async fn scheduling_point(caller: Caller) {
                 SYSCALL_YIELD_POINTS.fetch_add(1, Ordering::Relaxed);
             }
         }
-        Caller::Task => narf_scheduler::yield_now().await,
+        Caller::Task => {
+            TASK_YIELD_POINTS.fetch_add(1, Ordering::Relaxed);
+            narf_scheduler::yield_now().await;
+        }
     }
 }
 
