@@ -2026,10 +2026,11 @@ fn smoke_i915_perf_open_add_remove_config_and_stream() -> TestResult {
     assert_eq!(u16::from_le_bytes([out[4], out[5]]), 0); // pad
     assert_eq!(u16::from_le_bytes([out[6], out[7]]), 264); // size (8 + 256)
 
-    // 5. remove_config:
-    wire.put(0x4000, &id1.to_le_bytes());
-    assert_eq!(remove_config(Some(&*backend), 0x4000, &wire, ALLOW), Ok(0));
-    assert!(query_config_by_id(60, id1).is_none());
+    for id in [id1, id2] {
+        wire.put(0x4000, &id.to_le_bytes());
+        assert_eq!(remove_config(Some(&*backend), 0x4000, &wire, ALLOW), Ok(0));
+        assert!(query_config_by_id(60, id).is_none());
+    }
 
     drop(file);
     backend.poll(1);
