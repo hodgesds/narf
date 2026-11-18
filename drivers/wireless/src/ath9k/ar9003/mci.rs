@@ -3033,6 +3033,9 @@ pub(in crate::ath9k) fn set_power_awake(io: &mut impl RegisterIo) -> Result<(), 
         }
         io.delay_us(10);
     }
+    if btcoex_ctrl2 == 0xdeadbeef || btcoex_ctrl2 == u32::MAX || !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
     io.write32(AR_BTCOEX_CTRL2, btcoex_ctrl2 | AR_BTCOEX_CTRL2_GPIO_OBS_SEL);
     let mut diag_sw = 0u32;
     for _ in 0..POWER_AWAKE_WAIT_BOUND {
@@ -3041,6 +3044,14 @@ pub(in crate::ath9k) fn set_power_awake(io: &mut impl RegisterIo) -> Result<(), 
             break;
         }
         io.delay_us(10);
+    }
+    if diag_sw == 0xdeadbeef || diag_sw == u32::MAX || !io.authorized() {
+        // Return the observation mux before refusing the ambiguous wake.
+        // The retained source still gates this write; lost I/O suppresses it.
+        if io.authorized() {
+            io.write32(AR_BTCOEX_CTRL2, btcoex_ctrl2);
+        }
+        return Err(BringUpError::DeviceGone);
     }
     io.write32(AR_DIAG_SW, diag_sw | (1 << 27) | (1 << 19) | (1 << 18));
     let lna_ctrl = io.read32(AR_OBS_BUS_CTRL) & 0x3;

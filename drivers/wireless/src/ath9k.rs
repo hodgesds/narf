@@ -42,6 +42,12 @@ mod rates;
 mod rx_ba;
 mod station;
 mod tx_ba;
+pub use ar9003::ani::Request as PeriodicAniQualificationRequest;
+pub use ar9003::antenna::manual::Request as ManualBtSharingQualificationRequest;
+pub use ar9300_owner::{
+    manual_bt_sharing_request, manual_bt_sharing_requested, native_ani_request,
+    set_manual_bt_sharing,
+};
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use ht40::Request as Ht40QualificationRequest;

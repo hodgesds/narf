@@ -290,3 +290,5 @@ kernel_test_in!(
 
 #[path = "mci_audio.rs"]
 mod audio;
+#[path = "mci_ps.rs"]
+mod ps;

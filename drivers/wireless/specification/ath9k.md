@@ -366,7 +366,7 @@ exactly `timeout * 1024us`; valid current-TID data and BAR refresh activity.
 Expiry drops the session/buffered originals and queues a recipient DELBA
 (initiator0, reason39). Its actual legacy native descriptor, ACK, queue idle
 and RX idle retire the teardown ticket before replacement. Timers are serviced
-by the existing1ms worker rather than a claimed IRQ path. Current policy,
+by the existing 1ms worker rather than a claimed IRQ path. Current policy,
 power/readbacks and both signed sources still gate descriptor/copy/doorbell,
 receipt and final publication. Pending key replies take priority; CPU teardown
 ownership survives the held reply without authorizing DATA. Incoming peer
@@ -1096,13 +1096,30 @@ on the fifth weak period. The later no-stomp edge still uses the configured
 profile stomp, rather than the temporary AUDIO choice. Native station over
 EDMA/GPM tests cover both chips, foreign/invalid observations, literal LPF
 boundaries, lifecycle history, new-peer reset and access failure. All three
-audio cases pass in the coordinated x86_64 Wi-Fi run; physical coexistence
-and the remaining calibrated-power/NETWORK_SLEEP producers remain open.
+audio cases pass in the preceding coordinated x86_64 Wi-Fi run. The next
+calibrated-power/NETWORK_SLEEP continuation below is newly implemented and
+has not executed its tests; physical coexistence remains unmeasured.
 
-FTP feedback consumes skipped NETWORK_SLEEP time and accepted DATA counts
-in Linux. The current AR9003 owner has no native network-sleep path, so an
-elapsed awake interval does not substitute for that input. AR9565's source
-config `0xa4c1` also disables FTP stomping; AR9462's `0x2201` does not.
+The new concurrent-TX callback shares the associated-beacon RSSI LPF and
+marker 127 with audio. Five consecutive periods at RSSI>=40 enable it and
+five below 40 withdraw it; opposite-sign history resets, while timer pauses
+and profile gaps preserve source history. Only 2GHz with the source config
+CONCUR_TX bits admits a transition. The immutable selected calibrated Plan
+is retained: concurrent mode caps exactly fourteen HT20 targets 8..22 at
+0x14 half-dBm, preserving legacy/HT40/calibration fields. This grants no HT
+packet profile. The actual retained N46A/N65A CapOp encloses complete power
+programming and readback, with current PCI/host/RFkill/RTC checks per access.
+Concurrent flags/weights commit after full verification; ordinary accesses
+compare against that last verified table. Partial mutation closes admission
+and can retain uncertain DMA. Reset restores base expectations only after
+real parked reset/calibration and full base-plan readback. Revised N46A/N65A
+identities bind both plans and this recipe, requiring fresh qualified records;
+magic, 128-byte layouts and filenames remain unchanged.
+
+FTP now consumes only the real N46S NETWORK_SLEEP observation in §3.13 and
+validated DATA-present counts. An awake interval or late elapsed time is
+not sleep credit. AR9565 config 0xa4c1 still disables FTP stomping;
+AR9462's 0x2201 permits its source path.
 
 Deliberate deviations, all documented in code: the Linux deadbeef spin
 loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
@@ -1112,12 +1129,12 @@ assigns `mci->wlan_ver_major/minor`, so the coex version response
 answers 0.0, kept verbatim. AIC is hard-disabled in Linux
 (`ar9003_aic.c` returns false), so the AIC states read 0.
 
-Remaining: RSSI-driven concurrent-TX enablement with calibrated TX-power
-transitions, eligible FTP traffic feedback, and the native 2WIRE/3WIRE
-enable/init call sites. Priority values are applied to the weight engine;
-production does not yet enable concurrent TX. MCI DMA/message/IRQ/reset/channel
-and periodic-check integration, plus the WoW flag, are already wired as
-described above. Fixture tests cover the message exchange, capability
+The new concurrent-power and N46S/FTP producers are linked, with 14 authored
+native cases and execution deferred until final validation. Native 2WIRE/
+3WIRE enable/init call sites remain separate work. MCI DMA/message/IRQ/reset/
+channel and periodic-check integration, plus the WoW flag, remain wired as
+described above; first and in-place reset now share the actual source MCI
+calibration handshake and close producers before mutation. Fixture tests cover the message exchange, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
 walk, the calibration handshake, and the BT profile list + duty-cycle
 scheme (profile add/update/remove, the SCO/ACL caps, status-update
@@ -1128,6 +1145,267 @@ profile rearming, critical-management ALL-to-LOW, late service, 5 GHz,
 reset/WoW/stop cancellation and failed authority/MMIO suppression, plus the WoW `mci_enabled`
 wiring (flag storage, the probe-time capability computation, and the
 `AR_RTC_KEEP_AWAKE` / `AR_STA_ID1_PWR_SAV` branches in `enable`).
+
+### 3.13 AR9462 qualified native NETWORK_SLEEP and FTP continuation
+
+The actual retained AR9462 2GHz legacy20 owner can request a separate signed
+N46S v1 companion. It binds original N46A identity, actual MAC and complete
+calibration report, exact-primary/country/current host permission, immutable
+original/capped power plans, WARegVal, measured antenna and complete static/
+transition envelope. Source identity cannot be borrowed from AR9285 HT/N85S
+or AR9565. N85S request/record bytes are unchanged. No measured record is
+provided; missing N46S leaves the station awake and PS unsupported. A current
+N46S advertises the existing false default until an explicit desired request.
+
+The retained PS owner composes actual AR9003 EDMA PM Null and PS-Poll with
+terminal on-air ACK receipts, matching-peer TIM/AID/TSF programming and
+AUTOSLEEP timeout 80, with S2 TIM/DTIM/CAB/TSFOOR IRQ or existing 1ms poll
+ownership. Controls use no CCMP PN; DATA still passes its independent key/
+PN/replay admission and only gains the current PM bit. Queued controls,
+security replies, RX/CAB and buffered peer receipts keep it awake. A desired
+state supersession retains the published original notice until its real
+ACK, then sends the current corrective notice.
+
+Sleep requires actual all-QCU idle, running RX FIFOs/mode, installed timers/
+IRQ/MCI state and RTC ON. It follows source order: STA_PWR_SAV, clear MCI
+RX_HW_MSG_MASK0x23e, clear ForceWakeEN, 30us, WA without D3_L1_DISABLE,
+then bounded actual RTC SLEEP4. Wake restores WA before ForceWake/50us/ON,
+the source MCI LNA workaround and clearing STA_PWR_SAV. Only then may
+ordinary PHY/rate/DMA accesses resume. SHUTDOWN or partial clock mutation
+fails terminally with original mapped DMA retained.
+
+FTP receives a one-use current N46S sleep observation before ordinary
+service wakes the device. Actual RTC/PM/ForceWake/WA/MCI readbacks and the
+retained successful native sleep owner produce it. One due source callback
+adds one configured period only for that real sleeping owner; delayed
+service does not fabricate missed callbacks. A later awake period with
+accumulated wait>100ms, NeedFtpStomp, PAN/otherACL and fewer than five
+validated DATA-present MPDUs selects LOW_FTP, then counters reset. Null,
+CRC/rate/descriptor failures and multi-buffer continuations do not count.
+AR9565's source config disables FTP and receives no N46S alias.
+
+First and same-channel reset share source start_reset/reset/init_cal_req/
+init_cal_done/end_reset/enable/check_bt/channel-map under the original
+Grant. Producers close before reset and reopen only after the complete
+tail. If S was ever loaded, a changed calibration report closes that
+generation; an established S source is never replaced. Otherwise actual
+new report facts may refresh. Successful same-channel recovery resyncs
+TIM/TSF and requires a fresh beacon. Bound N46S excludes separately
+qualified WoW; ordinary suspend still retires DMA through FULL_SLEEP.
+Existing WoW remains available when S was never bound. Bounded deadbeef
+wake polls now refuse ambiguous completion.
+
+Raw sleep/wake reads and writes check the original EEPROM-decoded RFkill
+GPIO/polarity inside the current N46S/N46A/PCI invocation before the requested
+MMIO. This includes the first WA/ForceWake/MCI/STA access while sleeping,
+before ordinary post-wake physical readback can run. Asserted, all-ones or
+deadbeef GPIO observations latch terminal power failure and retain sleeping
+ownership. Switch release cannot revive that generation or prove RF reset,
+awake completion or DMA retirement. A scoped RAM ECAM/BAR native case covers
+both polarities, assertion between raw accesses and source/PCI revocation.
+
+N46S is 128 bytes, little endian: `N46S`/v1/flags0/header128; total128;
+vendor168c/device0034; identity32; actual MAC6; channel/20MHz/RXmask/TXmask;
+measured antenna/complete-program peak/qualified ceiling as i16 half-units;
+fixed 16-byte program body; actual facts digest32; reserved16 zero. The
+filename is `ath9k/ar9462-sta-ps-v1-ch<N>-<mac>.bin`, loaded through current
+trusted firmware authority. Original N46A, N46S and current occupied-span
+policy all enclose effects. Power indices are not radiated measurements.
+
+Fourteen native cases are authored across concurrent power/RSSI, actual
+Native revoked-source refusal, legacy/WPA2 association/control/PSPoll/
+buffered DATA/replay/PN/wake order, real sleep-only FTP and late callback,
+supersession/source loss, malformed/cross-part/changed-calibration/current
+policy records, partial clock mutation and bounded deadbeef wake. They have
+not run. The complete production boundary passes the x86_64 library check
+with zero warnings; final strict/native/stack validation remains deferred,
+and physical board/transient/coexistence/suspend acceptance remains open.
+
+### 3.14 Explicit AR9485 manual WLAN/BT RX antenna sharing
+
+`ath9k::manual_bt_sharing_request()` returns the factual
+`ManualBtSharingQualificationRequest` for the exact completed original
+N48A, calibrated report, immutable power plan, EEPROM/PCI inputs, current
+host permission and selected source bodies. It grants no setting or effect.
+`manual_bt_sharing_requested()` reports the requested setting under current
+sources, without claiming physical measurement. The async
+`set_manual_bt_sharing(bool)` is an explicit physical-radio request consumer;
+it is separate from the nl80211 TX/RX chain-mask interface. Record presence
+and PCI flags never request enablement.
+
+The implemented scope is canonical BT-capable `168c:0032` with raw combining
+capability and a complete current legacy20 station. `0037` does not acquire
+BT capability from the AR1111 name. An EEPROM RFkill pin that conflicts with
+the source WLAN-active GPIO5 refuses before effects. The setter serializes
+CONTROL, the retained physical owner and its station, withdraws the receive
+epoch and proves the existing EDMA pause/BME-off path while retaining rings.
+It then installs a distinct current N48D companion, drains older counted
+source/publication scopes, and runs the source program. Cancellation while
+installation is pending closes the latch permanently.
+
+Coexistence-off is established by `btcoex.c:406..437`: canonical3WIRE
+GPIO5 plain output, `AR_BT_COEX_MODE = 0x1c00`, mode2 and both WLAN/four BT
+weights zero. Readbacks precede manual switch effects. The exact
+`ar9003_phy.c:1554..1628` AR9485 helper selects EEPROM or canonical CUS
+switch-COM2, raw LNA/gain and LNADIV/fast-div fields, then capable LNA1/LNA2.
+Each scalar retains original PCI, N48A, N48D, power/PHY and configured RFkill
+checks; write/readback uncertainty closes the generation. Scanner history
+is rebased against the actual resulting fields and resumes group2 only
+for an explicit enabled setting. The same retained rings resume afterward.
+Normal native accesses re-prove the off registers and retained switch,
+LNADIV/fast-div and preserved fields; scanner-owned fields keep their existing
+checked receipt protocol.
+
+N48D v1 is128 bytes: magic `N48D`, `[1,0,128,0]` at4, length128 at8,
+PCI `168c:0032` at12, request identity at16, MAC at48,
+`[channel,20,1,1]` at54, signed little-endian half-dB antenna gain/conducted
+peak/EIRP ceiling at58/60/62, and64 reserved zero bytes. The signed measured
+antenna gain must cover the original gain; the complete-program peak plus
+gain must fit the current host ceiling and signed ceiling. It covers every
+enabled/disabled/manual transition, scanner state, original periodic
+NF/IQ, retry/automatic response and EDMA pause/resume state. No measured
+record is supplied. The registry filename is returned by the request API.
+
+A stable dynamic latch belongs to the physical owner and every native and
+host publication token, including tokens captured before manual enablement.
+Actual scalar/config/DMA/IRQ effects, RX copying, rings, carrier-up and stack
+callbacks invoke the current companion. Counted scopes permit callback
+reentry without holding a spin lock. Explicit disable retains N48D; it never
+downgrades to the baseline grant. Revocation, failure or cancellation retains
+the companion and closes later effects.
+
+This first manual program takes the terminal-park lifecycle branch:
+reset, retune or system suspend retires host and actual DMA under the old
+current companion, then permanently parks and reserves the physical owner.
+An unproven stop retains DMA. Removal also keeps the physical address/source
+reserved; DMA-idle alone proves no antenna reset or companion retirement.
+There is no plain N48A rebuild, enabled-state replay or fabricated cleanup
+receipt. A future restartable program needs a separately qualified transition
+and a companion matching the new actual report before publication.
+
+The separate AR9565 N65D scope is specified in §3.15. It uses actual MCI
+stop/cleanup and permanent producer retirement rather than treating
+STOMP_NONE weights as off. No missing EEPROM value is inferred, and no
+group2 alias is admitted.
+Three source/model regressions are written; execution is deferred to the
+coordinated final validation.
+
+### 3.15 Explicit AR9565 local coexistence shutdown and group3 manual sharing
+
+The same explicit request/status/setter API (§3.14) selects a distinct N65D
+request for canonical BT-diversity-capable `168c:0036`. Fixed EEPROM
+`0xc9`, the exact13 WB335 combining exceptions, original N65A preparation,
+actual completed calibration/power plan and a sealed live MCI owner's
+configuration/GPM/schedule addresses enter its identity. An absent or
+not-ready MCI owner supplies no live-shutdown fact and refuses the first
+request; a retired owner retains its original sealed facts for later disable.
+The new signed128-byte layout uses `N65D` and PCI0036; other fields follow
+N48D, with a separate source recipe/identity and registry filename. N48D,
+N65A and PCI capability alone cannot authorize this program.
+
+CONTROL/physical-owner/radio serialization first pauses actual EDMA. Under
+current N65D/N65A and original PCI/RFkill/host gates, the transition verifies
+the real MCI-mode bit, GPM address/length and schedule address against that
+retained owner before mutations. The actual concurrent-power owner restores
+and reads back its immutable uncapped source plan before priorities are
+withdrawn. It cannot clear a power flag to invent that restoration.
+
+Every GPM, duty/FTP/audio, interrupt, calibration/reset and re-enable producer
+is then permanently retired while keeping the original live engine state for
+the source stop operation. The exact `ar9003_mci_stop_bt(false)` mute,
+LNA-update-disable, optional LNA_TAKE and SYS_SLEEPING message sequence runs,
+followed by unconditional `ar9003_mci_cleanup`
+(`ar9003_mci.c:785..815,1038..1051,1281..1287`). Readbacks of
+`BTCOEX_CTRL=0`, both MCI interrupt enables zero and LNA-update-disable set
+prove **local coexistence off**. They prove neither remote Bluetooth RF
+sleep nor DMA idle/reset. The original GPM storage, engine state, IRQ/source
+ownership and physical address remain retained; source, pointer or readback
+uncertainty closes the shared latch before any antenna program or restart.
+Pending MCI causes cannot copy GPM or re-enable the retired engine. Ordinary
+concurrent-power and calibration/reset entry points also reject this bound
+manual scope.
+
+Only after those receipts does `ar9003_phy.c:1629..1658`'s AR9565 helper
+write raw LNA/gain fields, then LNADIV, RX-protect, fast-diversity,
+RESTART/M2FLAG and WLAN-LNADIV force-on in source order. Disable clears those
+same fields and restores main LNA1/alternate LNA2. It writes no AR9485
+switch-COM2 or3WIRE GPIO program. Normal accesses verify local MCI off and
+the installed manual/preserved fields under the retained joint sources.
+
+The retained RX owner instantiates the distinct source group3 program:
+early LNA2/LNA1 threshold -3, LNA1/LNA2 threshold +3, scan threshold -9,
+strict final switch delta +3 in normal and quick scans, and the full group3
+bias table including `0x39`, `0x3f` and6 (`antenna.c:123..133,544..590`;
+`ar9003_phy.c:1516..1519`). Common scan bookkeeping is shared; group2
+thresholds and bias choices are never used for AR9565. Valid native legacy
+EDMA observations and the existing per-effect receipt protocol remain
+mandatory.
+
+N65D's measured complete-program peak/gain must cover both original power
+states, every group3 antenna/bias state and manual/shutdown transition,
+periodic NF/IQ, retries and automatic responses, pending/timed-out MCI
+messages and Bluetooth that remains active or whose remote state is unknown.
+No remote acknowledgement or physical measurement is invented. The same
+dynamic latch covers earlier and later publication tokens; explicit disable
+retains N65D and never restarts MCI. Reset/retune/suspend/removal take the
+terminal retained-owner path from §3.14, with no plain N65A reconstruction.
+Three additional source/model regressions are written; no physical RF,
+DMA terminal or system acceptance result is claimed.
+
+### 3.16 Optional separately measured AR9462/AR9485/AR9565 ANI
+
+`native_ani_request() -> Result<PeriodicAniQualificationRequest, BringUpError>`
+returns captured original-generation request metadata: identity, MAC and
+registry filename. It performs no measurement, asset lookup or live upgrade.
+The original cold native composition makes one optional lookup before any
+packet effect. Only `NotFound` keeps the ordinary A program. A present bad,
+unsigned, mismatched or revoked P record is terminal. PCI0034/0032/0036 use
+distinct N46P/N48P/N65P records; AR1111/0037 is outside this continuation.
+
+P v1 is128 bytes, with family magic at0, `[1,0,128,0]` at4, length128 at8,
+vendor/device at12, request identity at16, MAC at48, channel/20/RX-mask/TX-mask
+at54, independently measured antenna gain, complete-program conducted peak
+and ceiling as signed little-endian half-dBm at58/60/62, then64 reserved zero
+bytes. Filenames are `ath9k/ar9462-ani-v1-ch<FREQ>-<MAC>.bin` (similarly
+ar9485/ar9565). Identity frames selected actual source bodies and binds the
+original A identity, full actual completed calibration report and immutable
+power Plan, actual masked INI coefficients, source44MHz full-rate20 clock,
+current country/host ceiling and both native MCI power plans. Report/Plan
+field serialization uses their source-bound Debug representation; it never
+hashes Rust padding or claims compiler/binary identity. The complete measured
+peak must cover every enabled ANI level/transition together with original
+NF/IQ, firmware-free retry/automatic response, board/antenna and MCI states.
+No existing A, N46S, N48D or N65D meaning is widened.
+
+`ar9003/ani.rs` composes Linux `ani.c`, `ar9003_phy.c:1062..1450` and
+`ath/hw.c:142..190`. The original Native reads actual MIB and PHY-error
+counters, freezes/reads/clears/unfreezes the actual cycle counters and uses
+`(cycles-rx-tx)/44000` listen milliseconds. Zero/negative listen restarts;
+decreasing/overflowed PHY counters fail closed. The station's admitted bound
+peer beacon producer supplies the source fixed-point RSSI filter. Due1000ms
+polls run only at actual eligible packet idle, after the ordinary receive
+drain, with no in-flight TX. The source300ms accumulated-listen decision uses
+AR9003 OFDM high3500/1000 and low900/400, CCK high600/low300, alternating
+lowering, the low-RSSI CCK cap, full OFDM/CCK tables and actual INI-relative
+firstep/spur fields clamped to20/22. AR9462/9565 skip weak-detector threshold
+writes; their USE_SELF_CORR_LOW bit still follows source. AR9485 restores
+the captured weak thresholds or sets source off values. Only AR9462 with
+actual multichain RX changes MRC-CCK; AR9485/9565 never access that control.
+Preserved fields survive each checked RMW, and live expected coefficients
+advance only after every actual write/readback and counter restart succeeds.
+
+The same stable physical latch used by native and captured host publication
+tokens now jointly invokes P/A/current host policy/PCI. Every later ordinary
+native operation checks the installed ANI coefficients; only the serialized
+ANI adapter may mutate its changing receipt, retaining fixed power/clock/
+RFkill/PCI checks per scalar. Existing NF/IQ continues through its original
+owner. P refuses N46S power-save binding and manual D requests before effects.
+P reset/retune/suspend/removal takes the retained terminal-owner path from
+§3.14; no plain A rebuild or DMA/RF terminal proof is inferred. Source,
+hardware or receipt loss closes later effects and keeps the original sources,
+address, MCI state and uncertain DMA owned. Two source/model regressions are
+authored for actual counter decisions/chip controls, zero listen, ignored
+writes and independent P-cap revocation; they have not been executed.
 
 ## 4. Invariants
 
@@ -2734,8 +3012,15 @@ WoW `mci_enabled` flag itself is wired at probe (§3.12). Smoke (written, not ex
 The per-chip EEPROM board values (`board.rs`, including `thermo_cal`
 and switch tables), noise limits and PCOEM calibration branches are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Remaining: MCI concurrent-TX RSSI/power transitions, network-sleep-driven
-FTP feedback, optional board-configuration deltas and physical acceptance.
+Calibrated concurrent-TX and actual N46S NETWORK_SLEEP/FTP are now linked
+(§3.12–3.13), with new validation deferred. Distinct N46P now composes actual
+source ANI (§3.16), separately from N46S; validation is deferred. The current source's CUS217
+PCI matches (`pci.c:315..326`) add only a diagnostic in
+`init.c::ath9k_init_pcoem_platform`; they select no missing AR9462 GPIO,
+xatten, antenna or calibration program. Exact EEPROM board programming is
+already retained. Broader HT/QoS/A-MPDU EDMA station profiles and physical
+acceptance remain open; a platform-specific change needs its actual supplied
+board data and a fresh preparation identity, not a guessed CUS flag.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
 `ar9003::Chip::Ar9485` is PCIe `0x0032`
@@ -2792,15 +3077,68 @@ the fixed AR9300 list never runs on this chip; the HT40 form (range 19,
 takes `ar9003_hw_power_control_override`'s generic `AR_PHY_TPC_19`
 path (`ar9003_eeprom.c:4944`); its 2 GHz synth selection coincides with
 the AR9300 formula at the 40 MHz reference (`ar9003_phy.c:160`).
-Remainder, not in this step: the board-config-gated deltas — the
-`xatten_margin_cfg` margin-5 override (`ar9003_eeprom.c:3921`, no
-in-tree source for the config value), the `xlna_gpio` xLNA branch
-(`:3657`, default GPIO 9, `ar9003_phy.h:355`), the
-`ant_ctrl_comm2g_switch_enable` mask and the `bt_ant_diversity` arms
-(`:3700`, `:3737`, `:3741`), `alt_mingainidx` (`:3927`) — and the
-ANI-owned antenna-diversity readback (`ar9003_hw_antdiv_comb_conf_get`/
-`_set`, `ar9003_phy.c:1496`, AR9485 `-1`/`-9`/group 2), whose only
-caller is the unported ANI loop.
+The next continuation implements the source PCI board settings and retained
+legacy20 RX antenna owner. `board::Config::for_pci` derives the six exact
+CUS198/CUS230 subsystem matches from the current PCI identity. It carries
+GPIO9, margin5, the extra chain0 `alt_mingainidx` RMW and the source
+`0x000bbb88` switch mask; that mask remains inactive while manual BT sharing
+is closed. Raw RX-gain index0 selects the source GPIO9 fallback on both
+0032 and0037. Probe, expected preparation, cold setup and reset all use the
+same canonical config. No arbitrary platform pin or factory byte is supplied.
+
+`ar9003::antenna` derives combining capability from raw EEPROM byte124 high
+bits11 and keeps the20 exact0032 BT-board matches separate from0037. Default
+antenna tracking runs before the BT scanner gate; manual sharing requires an
+explicit request and an independently owned coexistence-off fact, neither of
+which is inferred from PCI flags. The group2 scanner ports
+`antenna.c::ath_ant_comb_scan` and its normal/quick scans, signed RSSI_ctl,
+512/256-packet and50ms boundaries, source ratios, LNA/add/subtract selections,
+gain/bias values and three consecutive default-antenna mismatches.
+
+The existing EDMA receive call supplies a private copied observation only
+after descriptor/profile admission. Rejected CRC, split, aggregate or empty
+descriptors supply no observation; no shared Mpdu or raw DMA borrow is widened.
+The physical owner retains scanner/logical history across association,
+retune, reset and suspend. Old bindings retire before reset reads; fresh
+generations require current qualifications and exact register readbacks.
+The actual default is captured immediately before reset and restored by
+the MAC tail (zero uses the source fallback1). Ordinary FULL_SLEEP does not
+promise preservation of the pre-suspend hardware default.
+
+Every new capture/restore/scanner effect executes inside the actual retained
+N48A invocation and the existing Native/current PCI access. A failed write,
+readback or source check closes the continuation and retains uncertain DMA.
+N48A keeps its128-byte v1 wire layout, but the identity now binds canonical
+board inputs, raw capability/PCI gates and the whole reachable antenna recipe;
+old signatures cannot authorize the expanded program. Fresh measured signed
+qualification remains required, with no record or firmware binary committed.
+
+Eleven antenna/controller cases plus two board cases and one admission case
+are written. They exercise source vectors, actual EDMA admission, current
+record/PCI revocation, saved-default readback and retained reset ownership.
+Execution is deferred until the final validation pass at the user's request.
+N48A alone keeps manual BT sharing off. The explicit N48D continuation
+below composes its separate manual scope (§3.14); broader HT/AMPDU/control-frame
+sampling and physical PCI/PHY/system-suspend acceptance remain profile limits.
+
+**Source delta correction.** Group2 has scan-admission delta -9 and
+final LNA-selection switch delta -1 (`ar9003_phy.c:1512..1515`,
+`antenna.c:335,621,809`). These had been reversed in the first port.
+The production scanner and literal boundary/normal-scan expectations are
+corrected; an additional source marker enters N48A identity so an earlier
+signature cannot authorize the changed reachable scanner program.
+
+Manual sharing now has an explicit serialized native consumer and a separate
+N48D complete-program companion (§3.14). It establishes source3WIRE off by
+actual writes/readbacks, pauses/rebases the scanner and retains N48D in every
+old/new native and host publication token. Linux `init.c:720..728` supplies
+the three independent request/capability/coexistence gates; neither asset
+presence nor a PCI bit supplies the manual request. This first scope parks
+on reset/retune/suspend rather than replaying the enabled state under plain
+N48A. Restartable manual cold/reset replay (`ar9003_eeprom.c:3701..3772`)
+needs its own qualified transition and actual new-report companion.
+Distinct N48P composes source ANI (§3.16) separately from manual N48D; neither
+record is upgraded to authorize the combination. Validation is deferred.
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2854,8 +3192,39 @@ WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
 `0x0034` subsystems). The per-chip EEPROM board values, noise limits,
 PCOEM calibration, saturated RX-IQ refusal and two-spur OFDM branch are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Remaining: MCI concurrent-TX RSSI/power transitions, optional
-board-configuration/antenna-diversity inputs and physical acceptance.
+Calibrated concurrent-TX is now linked (§3.12), with new validation deferred.
+The current canonical PCI board/antenna slice is also linked: Linux's generic
+0036 row advertises BT_ANT_DIV, while its thirteen exact WB335 1-ANT rows
+without that flag suppress the otherwise fixed0xc9 combining capability
+(`pci.c:422..486`, `init.c:488..500`). Current PCI identity selects that
+suppression; it is part of the revised N65A identity. EEPROM byte124 does
+not override AR9565's fixed source0xc9. The actual no-manual-BT board path
+now preserves source order when clearing LNADIV/RX-protect/BT force-on,
+retains fixed fast diversity, and performs the final combining write only
+for a capable board (`ar9003_eeprom.c:3739..3801`).
+
+The same native/current-N65A antenna Binding now retains AR9565's default
+antenna count/history across reset and suspend. Its actual1p0/1p1 base has
+bias3; only a valid admitted EDMA MPDU can produce a copied observation,
+and three consecutive mismatches change the default. All combining-capable
+AR9565 PCI rows also have BT_ANT_DIV, so the source scanner remains closed
+without the explicit manual-sharing/coexistence-off owner described above.
+No AR9485 group2 algorithm is aliased to AR9565 group3. Source-only cases
+cover exact PCI exceptions, board write order, retained/current-cap default
+tracking and the actual EDMA admission/revocation boundary; validation is
+deferred. Revised N65A keeps its128-byte layout but requires fresh measured
+qualification for this complete program and its transitions.
+
+CUS252 is diagnostic-only in `ath9k_init_pcoem_platform`; no additional
+GPIO/power delta can be inferred from its name. Explicit N65D now composes
+the actual local MCI shutdown/permanent producer retirement and distinct
+group3 manual program (§3.15), retaining all MCI storage and sources.
+Distinct N65P composes source ANI (§3.16) separately from manual N65D, with
+validation deferred and no combined-record inference.
+Restartable manual reset replay and broader HT/QoS/A-MPDU native profiles
+remain software work; physical board/coexistence/PM acceptance stays
+external. Source config0xa4c1 disables FTP; no AR9462 N46S program is aliased
+to AR9565.
 
 **SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**
 `ah->config.pll_pwrsave` (`hw.h`, u8: CONTROL `BIT(0)`, ON_D3

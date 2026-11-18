@@ -661,7 +661,7 @@ fn smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom() -> TestResult {
     if io.regs.get(&0x1628c).copied().unwrap_or(0) & 0x300 != 0x300
         || io.regs.get(&0xa288).copied().unwrap_or(0) != 0xabcdef
         || io.regs.get(&0x20044).copied().unwrap_or(0) != 0xf0f1
-        || io.regs.get(&0x9e28).copied().unwrap_or(0) != 0x1300_0000
+        || io.regs.get(&0x9e28).copied().unwrap_or(0) != 0x1200_0000
         || io.regs.get(&0x9fc0).copied().unwrap_or(0) != 0x2000
         || io.regs.get(&0x16340).copied().unwrap_or(0) != 0x1234_5678
         || io.regs.get(&0x16298).copied().unwrap_or(0) & 0x7ffe_0000 != 0x2b56_0000
@@ -1136,3 +1136,5 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9485_mrc_cck_spur_branch
 );
+
+mod board_config;

@@ -23,9 +23,9 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct DutyCycle {
-    running: bool,
-    applied: Option<(u64, bool)>,
-    period: Option<u64>,
+    pub(super) running: bool,
+    pub(super) applied: Option<(u64, bool)>,
+    pub(super) period: Option<u64>,
     no_stomp: Option<u64>,
 }
 
@@ -67,6 +67,7 @@ impl MciLink {
         &mut self,
         io: &mut impl RegisterIo,
         now: u64,
+        mut power: impl FnMut(bool) -> Result<bool, BringUpError>,
     ) -> Result<(), BringUpError> {
         if self.duty_cycle_wait_us(now) != Some(0) {
             return Ok(());
@@ -98,6 +99,19 @@ impl MciLink {
             return Err(BringUpError::BadState);
         }
         if self.duty.period.is_some_and(|due| now >= due) {
+            // `ath9k_mci_update_rssi`: use the same associated-beacon
+            // LPF as audio, once per period. A flag/priority change is
+            // published only after the exact calibrated native program
+            // completed under its current signed owner. Unqualified
+            // ports report false and keep concurrent TX closed.
+            if self.btcoex.mci.config & 3 != 0 {
+                if let Some(enabled) = self.concurrent_rssi.period(self.audio.rssi()) {
+                    if enabled != self.btcoex.mci.concur_tx && power(enabled)? {
+                        self.btcoex.mci.concur_tx = enabled;
+                    }
+                }
+            }
+            self.adjust_ftp(io)?;
             // The temporary AUDIO choice does not alter the configured
             // profile stomp used by the no-stomp callback below.
             let stomp = if self.audio.period(has_audio) {

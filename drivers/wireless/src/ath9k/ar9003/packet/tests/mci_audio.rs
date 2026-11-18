@@ -253,3 +253,119 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_mci_native_audio_history
 );
+
+fn concurrent_power_radio(chip: Chip, fail: bool) -> Result<(), &'static str> {
+    let model = Model::new();
+    let fixture =
+        concurrent::tests::fixture(if chip == Chip::Ar9462 { 0x0034 } else { 0x0036 }, 2412)?;
+    let base = fixture.base;
+    model.mci_pci.set(Some(Cap::bootstrap()));
+    model.set(0x7044, 2);
+    concurrent::tests::install(&model, &fixture).map_err(|_| "native MCI power install")?;
+    *model.mci_power.borrow_mut() = Some(fixture);
+    let link = live_link(&model, chip)?;
+    let mut radio = audio_radio(&model, link.clone())?;
+    let beacon = station::tests::Peer::new_rates(false, None).beacon();
+    radio_receive(&model, &mut radio, &beacon, 0, false)?;
+    station::tests::bind_cached_peer_for_mci(&mut radio, station::tests::AP)?;
+    radio_receive(&model, &mut radio, &beacon, 40, false)?;
+    model.now.set(1);
+    gpm(&model, &link, 0, [0x0004_050c, 0x0001_0101, 0]); // PAN, period26ms.
+    radio.poll().map_err(|_| "native MCI PAN")?;
+    clear_irq(&model);
+    for n in 1..=3 {
+        radio_period(&model, &mut radio, 1 + n * 26_000)?;
+    }
+    if link.lock().btcoex.mci.concur_tx
+        || crate::ath9k::ar9003::power::rate_words(&base.targets)
+            .iter()
+            .any(|&(r, v)| model.reg(r) != v)
+    {
+        return Err("concurrent power changed before fifth admitted strong period");
+    }
+    if fail {
+        let before = weight_writes(&model);
+        model.fail_write.set(Some(0xa3d0));
+        model.now.set(104_001);
+        if radio.poll().is_ok()
+            || link.lock().btcoex.mci.concur_tx
+            || weight_writes(&model) != before
+            || model
+                .mci_power
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .power
+                .words()
+                .is_ok()
+        {
+            return Err("failed native power published concurrent flag/weights");
+        }
+        let writes = model.writes.borrow().len();
+        model.fail_write.set(None);
+        model.now.set(200_000);
+        let _ = radio.poll();
+        if model.writes.borrow().len() != writes {
+            return Err("uncertain native power owner emitted after failure");
+        }
+        // Real DMA was published. A failed fixed-power stop pins it rather
+        // than freeing device-owned mappings; this is not a reset receipt.
+        return Ok(());
+    }
+    radio_period(&model, &mut radio, 104_001)?;
+    let capped = concurrent::plan(&base, true);
+    if !link.lock().btcoex.mci.concur_tx
+        || crate::ath9k::ar9003::power::rate_words(&capped.targets)
+            .iter()
+            .any(|&(r, v)| model.reg(r) != v)
+    {
+        return Err("fifth native strong period lacked verified calibrated cap");
+    }
+    radio_period(
+        &model,
+        &mut radio,
+        if chip == Chip::Ar9462 {
+            120_001
+        } else {
+            119_001
+        },
+    )?;
+    if weights(&model) != [0x0101_7d01, 0x3401_0101, 0x0134_0101, 0x0134_0134] {
+        return Err("verified native cap did not reach concurrent PAN priorities");
+    }
+    model.now.set(120_002);
+    radio_receive(&model, &mut radio, &beacon, 0, false)?; // LPF40 ->36.
+    for n in 1..=5 {
+        radio_period(&model, &mut radio, 104_001 + n * 26_000)?;
+        if link.lock().btcoex.mci.concur_tx != (n != 5) {
+            return Err("native weak RSSI fifth-period disable boundary");
+        }
+    }
+    if crate::ath9k::ar9003::power::rate_words(&base.targets)
+        .iter()
+        .any(|&(r, v)| model.reg(r) != v)
+    {
+        return Err("native MCI disable lost original calibrated power");
+    }
+    radio.stop().map_err(|_| "native MCI concurrent stop")?;
+    Ok(())
+}
+fn smoke_ath9k_mci_native_rssi_calibrated_concurrent_power() -> TestResult {
+    for chip in [Chip::Ar9462, Chip::Ar9565] {
+        if let Err(error) = concurrent_power_radio(chip, false) {
+            return TestResult::Fail(error);
+        }
+    }
+    TestResult::Pass
+}
+fn smoke_ath9k_mci_native_concurrent_power_failure_is_terminal() -> TestResult {
+    concurrent_power_radio(Chip::Ar9462, true).map_or_else(TestResult::Fail, |_| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_mci_native_rssi_calibrated_concurrent_power
+);
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_mci_native_concurrent_power_failure_is_terminal
+);

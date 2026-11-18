@@ -359,6 +359,9 @@ pub(in crate::ath9k) struct Packet<P: Port> {
     /// plus the DMA GPM ring. The owner holds the other clone; the
     /// engine is reached only through this lock.
     mci: SharedMciLink,
+    ps: Option<alloc::sync::Arc<crate::ath9k::ps::Grant>>,
+    ps_timers_valid: bool,
+    ps_irq_created: bool,
 }
 /// One `set_peer` program: BSSID/AID (or none) and the slot time.
 type PeerProgram = (Option<([u8; 6], u16)>, u32);
@@ -459,6 +462,9 @@ impl<P: Port> Packet<P> {
             paused: None,
             peer: None,
             mci,
+            ps: None,
+            ps_timers_valid: false,
+            ps_irq_created: false,
         })
     }
     pub(in crate::ath9k) fn phase(&self) -> Phase {
@@ -508,6 +514,9 @@ impl<P: Port> Packet<P> {
         self.port.write(DIAG, diag & !RX_PARK)?;
         if self.port.read(DIAG)? & RX_PARK != 0 || self.port.read(irq::IER)? & 1 != 0 {
             return Err(Error::Descriptor);
+        }
+        if let Some(binding) = self.port.ar9003_antenna() {
+            binding.resume(&self.port)?;
         }
         self.phase = Phase::Running;
         self.mci.lock().resume_duty_cycle();
@@ -571,12 +580,14 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         let mci = &self.mci;
-        with_io(&self.port, |io| {
-            let mut link = mci.lock();
-            if !link.mci_enabled() {
-                return Ok(());
-            }
-            mci::check_bt(io, &mut link.btcoex.mci)
+        self.port.coex_access(true, || {
+            with_io(&self.port, |io| {
+                let mut link = mci.lock();
+                if !link.mci_enabled() {
+                    return Ok(());
+                }
+                mci::check_bt(io, &mut link.btcoex.mci)
+            })
         })
     }
     /// The worker's next weight transition, relative to the port clock.
@@ -591,10 +602,22 @@ impl<P: Port> Packet<P> {
         if self.mci.lock().duty_cycle_wait_us(now) != Some(0) {
             return Ok(());
         }
-        let result = self.port.access(true, || {
-            with_io(&self.port, |io| self.mci.lock().service_duty_cycle(io, now))
+        let result = self.port.coex_access(true, || {
+            let mut power_error = None;
+            let result = with_io(&self.port, |io| {
+                self.mci.lock().service_duty_cycle(io, now, |enabled| {
+                    self.port.mci_concurrent(enabled).map_err(|error| {
+                        power_error = Some(error);
+                        BringUpError::BadState
+                    })
+                })
+            });
+            power_error.map_or(result, Err)
         });
         if result.is_err() {
+            if let Some(binding) = self.port.ar9003_antenna() {
+                binding.pause();
+            }
             self.mci.lock().pause_duty_cycle();
             self.phase = Phase::Failed;
         }
@@ -603,8 +626,9 @@ impl<P: Port> Packet<P> {
     /// Legacy frame at `rate` (`descriptor::transmit`).
     pub(in crate::ath9k) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
         let local = self.local;
+        let copy = self.ps_unmark(frame)?;
         self.submit_with(frame, |address| {
-            descriptor::transmit(frame, local, address, rate)
+            descriptor::transmit(copy.as_deref().unwrap_or(frame), local, address, rate)
         })
     }
     /// Legacy frame with a rate-control series (`descriptor::transmit_series`).
@@ -614,8 +638,9 @@ impl<P: Port> Packet<P> {
         series: crate::ath9k::rates::Series,
     ) -> Result<u64, Error> {
         let local = self.local;
+        let copy = self.ps_unmark(frame)?;
         self.submit_with(frame, |address| {
-            descriptor::transmit_series(frame, local, address, series)
+            descriptor::transmit_series(copy.as_deref().unwrap_or(frame), local, address, series)
         })
     }
     fn submit_with(
@@ -764,6 +789,7 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
         let port = &self.port;
+        let reset = &mut self.reset;
         for fifo in self.fifos.iter_mut() {
             let index = *fifo.order.first().ok_or(Error::State)?;
             let buffer = &storage.rx[index];
@@ -794,9 +820,30 @@ impl<P: Port> Packet<P> {
                     let mut legacy = [0; WORDS];
                     legacy[4..9].copy_from_slice(&w[1..6]);
                     legacy[descriptor::RX_DONE] = w[11];
-                    descriptor::receive(&legacy, &payload).map_err(|_| Error::Descriptor)?
+                    match self.ps.as_ref() {
+                        Some(source) => descriptor::receive_legacy_ps(&legacy, &payload, source),
+                        None => descriptor::receive(&legacy, &payload),
+                    }
+                    .map_err(|_| Error::Descriptor)?
                 };
+                let observation = frame.as_ref().map(|_| super::antenna::Observation {
+                    ctl: status.rssi_ctl,
+                    antenna: status.antenna,
+                    more_aggr: status.more_aggr,
+                });
+                if let (Some(binding), Some(observation)) = (port.ar9003_antenna(), observation) {
+                    if let Err(error) = binding.observe(port, observation) {
+                        *reset = Some(ResetType::Calibration);
+                        return Err(error);
+                    }
+                }
                 fifo.discarding = status.more;
+                if frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.bytes().first().is_some_and(|fc| fc & 0x4c == 8))
+                {
+                    self.mci.lock().received_data();
+                }
                 // ath_rx_edma_buf_link: clear the status, hand it back.
                 buffer.put_words(0, &[0; RXS_BYTES / 4])?;
                 buffer.sync();
@@ -871,6 +918,9 @@ impl<P: Port> Packet<P> {
             } else {
                 ResetType::BbWatchdog
             });
+            if let Some(binding) = self.port.ar9003_antenna() {
+                binding.pause();
+            }
             self.mci.lock().pause_duty_cycle();
             self.phase = Phase::Failed;
             return Err(Error::Access);
@@ -883,24 +933,32 @@ impl<P: Port> Packet<P> {
             // `RESET_TYPE_MCI` (the same code shape as the fatal path
             // above).
             let mci = &self.mci;
-            let (isr_live, outcome) = with_io(&self.port, |io| {
-                let mut link = mci.lock();
-                // Clone the ring out of the link first: the sync takes
-                // the DMA buffer by reference while mutating the engine
-                // behind the same lock.
-                let dma = link.dma.clone();
-                if let Some(dma) = &dma {
-                    mci::sync_gpm_ring(io, dma, &mut link.btcoex.mci);
-                }
-                let live = mci::get_isr(io, &mut link.btcoex.mci);
-                let outcome = if live {
-                    mci::handle_interrupt(io, &mut link.btcoex.mci)?
-                } else {
-                    mci::InterruptOutcome::default()
-                };
-                Ok((live, outcome))
+            let (isr_live, outcome) = self.port.coex_access(true, || {
+                with_io(&self.port, |io| {
+                    let mut link = mci.lock();
+                    // Clone the ring out of the link first: the sync takes
+                    // the DMA buffer by reference while mutating the engine
+                    // behind the same lock.
+                    if !link.mci_enabled() {
+                        return Ok((true, mci::InterruptOutcome::default()));
+                    }
+                    let dma = link.dma.clone();
+                    if let Some(dma) = &dma {
+                        mci::sync_gpm_ring(io, dma, &mut link.btcoex.mci);
+                    }
+                    let live = mci::get_isr(io, &mut link.btcoex.mci);
+                    let outcome = if live {
+                        mci::handle_interrupt(io, &mut link.btcoex.mci)?
+                    } else {
+                        mci::InterruptOutcome::default()
+                    };
+                    Ok((live, outcome))
+                })
             })?;
             if !isr_live || outcome.reset_requested {
+                if let Some(binding) = self.port.ar9003_antenna() {
+                    binding.pause();
+                }
                 self.mci.lock().pause_duty_cycle();
                 self.phase = Phase::Failed;
                 return Err(Error::Access);
@@ -1013,6 +1071,9 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Stopped;
+        if let Some(binding) = self.port.ar9003_antenna() {
+            binding.pause();
+        }
         self.mci.lock().pause_duty_cycle();
         let rx = self.stop_receive();
         let tx = self.abort_transmit();
@@ -1041,6 +1102,9 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        if let Some(binding) = self.port.ar9003_antenna() {
+            binding.pause();
+        }
         self.mci.lock().pause_duty_cycle();
         irq::wow(&self.port, mask)?;
         self.irq = Some(irq::Mask {
@@ -1063,6 +1127,9 @@ impl<P: Port> Packet<P> {
         };
         irq::restore(&self.port, full)?;
         self.irq = Some(full);
+        if let Some(binding) = self.port.ar9003_antenna() {
+            binding.resume(&self.port)?;
+        }
         self.phase = Phase::Running;
         self.mci.lock().resume_duty_cycle();
         Ok(())
@@ -1081,6 +1148,7 @@ impl<P: Port> Packet<P> {
     /// (`disable_irq`, not teardown). Any failure is terminal. Returns the
     /// id of the drained frame.
     pub(in crate::ath9k) fn pause_for_reset(&mut self) -> Result<Option<u64>, Error> {
+        self.ps_timers_valid = false;
         if matches!(self.phase, Phase::Stopped | Phase::Prepared)
             || self.paused.is_some()
             || self.storage.is_none()
@@ -1089,6 +1157,9 @@ impl<P: Port> Packet<P> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        if let Some(binding) = self.port.ar9003_antenna() {
+            binding.pause();
+        }
         self.mci.lock().pause_duty_cycle();
         let interrupts = self.irq.take();
         let killed = irq::kill(&self.port, interrupts.is_some_and(|m| m.msi));
@@ -1197,6 +1268,7 @@ impl<P: Port> Packet<P> {
 }
 
 mod engine;
+mod ps;
 
 #[cfg(feature = "kernel-test")]
 mod tests;

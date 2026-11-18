@@ -106,6 +106,7 @@ pub(super) struct Device<P: Port, E: Environment, K: Engine = Packet<P>> {
     admitted: AtomicBool,
     closed: Arc<AtomicBool>,
     publication: Arc<IrqSafeSpinLock<()>>,
+    manual: Option<Arc<super::ar9003::antenna::manual::Latch>>,
     up: AtomicBool,
     bssid: AtomicU64,
     epoch: AtomicU64,
@@ -158,9 +159,14 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         rings: Arc<Rings>,
         seat: Option<(Arc<Seat>, u64)>,
     ) -> Result<Self, Error> {
-        let (own, closed, publication) = {
+        let (own, closed, publication, manual) = {
             let owner = radio.try_lock().ok_or(Error::Busy)?;
-            (owner.local(), owner.closed(), owner.publication())
+            (
+                owner.local(),
+                owner.closed(),
+                owner.publication(),
+                owner.manual_scope(),
+            )
         };
         Ok(Self {
             radio,
@@ -172,6 +178,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
             admitted: AtomicBool::new(false),
             closed,
             publication,
+            manual,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
@@ -186,6 +193,12 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         self.seat
             .as_ref()
             .is_none_or(|(seat, token)| seat.serial.load(Ordering::Acquire) == *token)
+    }
+    fn source_publication<T>(&self, action: impl FnOnce() -> T) -> Result<T, ()> {
+        match &self.manual {
+            Some(latch) => latch.current(true, || Ok(action())).map_err(|_| ()),
+            None => Ok(action()),
+        }
     }
     fn clear_state(&self, state: &mut State) {
         if self.current() {
@@ -215,7 +228,15 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
     }
     fn link(&self, peer: Option<[u8; 6]>) {
         let _publication = self.publication.lock();
-        self.publish_link(peer.filter(|_| !self.closed.load(Ordering::Acquire)));
+        let peer = peer.filter(|_| !self.closed.load(Ordering::Acquire));
+        if peer.is_some() {
+            if self.source_publication(|| self.publish_link(peer)).is_err() {
+                self.closed.store(true, Ordering::Release);
+                self.publish_link(None);
+            }
+        } else {
+            self.publish_link(None);
+        }
     }
     fn start(&self, radio: &mut Radio<P, E, K>) -> Result<(), Error> {
         if !self.admitted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
@@ -443,18 +464,20 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
-        frame.payload_mut().copy_from_slice(bytes);
+        self.source_publication(|| frame.payload_mut().copy_from_slice(bytes))?;
         frame.set_tx_meta(meta);
         if !self.permission(None) {
             return Err(());
         }
-        self.rings
-            .tx
-            .lock()
-            .as_mut()
-            .ok_or(())?
-            .try_send(frame)
-            .map_err(|_| ())?;
+        self.source_publication(|| {
+            self.rings
+                .tx
+                .lock()
+                .as_mut()
+                .ok_or(())?
+                .try_send(frame)
+                .map_err(|_| ())
+        })??;
         // Interrupt-driven service sleeps until a vector fires; stack TX is
         // the other wake source.
         if let Some(signal) = self.radio.try_lock().and_then(|r| r.interrupt()) {
@@ -587,14 +610,18 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
                     narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
                     let mut frame = Frame::new(buffer, bytes.len() as u32);
-                    frame.payload_mut().copy_from_slice(bytes);
+                    self.source_publication(|| frame.payload_mut().copy_from_slice(bytes))
+                        .map_err(|_| Error::State)?;
                     #[cfg(feature = "kernel-test")]
                     self.receive_hook(ReceivePoint::AfterFrameAllocation);
                     if !radio.current_receive(epoch)? {
                         self.clear_rx();
                         return Ok(Vec::new());
                     }
-                    let _ = state.rx.try_send(frame);
+                    self.source_publication(|| {
+                        let _ = state.rx.try_send(frame);
+                    })
+                    .map_err(|_| Error::State)?;
                 }
             }
             Ok(frames)
@@ -657,7 +684,16 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
                 if !self.current() {
                     break;
                 }
-                narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+                if self
+                    .source_publication(|| {
+                        narf_net::iface::on_rx_frame_from(&self.name, &mut frame)
+                    })
+                    .is_err()
+                {
+                    self.close();
+                    self.clear_rx();
+                    break;
+                }
             }
         }
         // Native checks/copy/callback admission may have woken a dozing

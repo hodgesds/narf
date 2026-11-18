@@ -171,6 +171,7 @@ fn identity(mask: u8) -> Identity {
 
 fn prepared(frequency: u16, mask: u8) -> Prepared {
     Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: 4,
         carrier_leak_cal: true,

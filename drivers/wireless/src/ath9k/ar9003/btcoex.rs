@@ -300,10 +300,55 @@ pub(in crate::ath9k) struct MciLink {
     pub(in crate::ath9k) dma: Option<Arc<DmaBuffer>>,
     duty: duty_cycle::DutyCycle,
     audio: audio::Audio,
+    concurrent_rssi: concurrent::Rssi,
+    ftp: ftp::Ftp,
+    /// A failed physical reset disables producers until a complete reset
+    /// and calibration handshake explicitly reopen this retained link.
+    closed: bool,
+    manual_retired: bool,
+}
+/// Sealed facts from the actual retained live MCI owner, not caller flags.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::ath9k) struct ManualMciFacts {
+    config: u32,
+    gpm: u32,
+    len: u32,
+    schedule: u32,
+}
+impl ManualMciFacts {
+    pub(in crate::ath9k) fn bytes(self) -> [u8; 16] {
+        let mut out = [0; 16];
+        for (i, v) in [self.config, self.gpm, self.len, self.schedule]
+            .iter()
+            .enumerate()
+        {
+            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+    pub(in crate::ath9k) fn validate_live(
+        self,
+        io: &mut impl RegisterIo,
+    ) -> Result<(), BringUpError> {
+        let ctrl = io.read32(0x18ac);
+        if !io.authorized()
+            || matches!(ctrl, u32::MAX | 0xdeadbeef)
+            || ctrl & 4 == 0
+            || io.read32(0x1820) != self.gpm
+            || io.read32(0x1818) != self.schedule
+            || io.read32(0x1824) & 0xffff != self.len
+            || !io.authorized()
+        {
+            return Err(BringUpError::DeviceGone);
+        }
+        Ok(())
+    }
 }
 
 mod audio;
+pub(in crate::ath9k) mod concurrent;
 mod duty_cycle;
+mod ftp;
 
 /// The shared MCI link, behind the lock the owner and the packet engine
 /// both take (never held across an await).
@@ -325,6 +370,10 @@ impl MciLink {
             dma,
             duty: duty_cycle::DutyCycle::default(),
             audio: audio::Audio::new(),
+            concurrent_rssi: concurrent::Rssi::default(),
+            ftp: ftp::Ftp::default(),
+            closed: false,
+            manual_retired: false,
         }
     }
     /// Associated, validated native beacon sample; no MMIO or authority grant.
@@ -337,14 +386,118 @@ impl MciLink {
     pub(in crate::ath9k) fn association_changed(&mut self) {
         self.audio.association_changed();
     }
+    /// The actual reset restored the original calibrated power program.
+    /// Source RSSI counter history, like audio history, survives timer pause.
+    pub(in crate::ath9k) fn reset_concurrent(&mut self) {
+        self.btcoex.mci.concur_tx = false;
+    }
     /// The live-MCI gate: the scheme is MCI and the DMA ring exists.
     /// `init_scheme` with coexistence compiled in selects MCI exactly
     /// when `mci_is_enabled(true, hw_caps)` holds, so this is that
     /// predicate (`hw.h::ath9k_hw_mci_is_enabled`), plus the DMA the
     /// engine must have before any address is programmed.
     pub(in crate::ath9k) fn mci_enabled(&self) -> bool {
-        self.btcoex.scheme == Scheme::Mci && self.dma.is_some()
+        self.can_reset() && !self.closed
     }
+    /// Retained factual hardware resources, including a closed generation.
+    /// This predicate is not permission to service the engine.
+    pub(in crate::ath9k) fn can_reset(&self) -> bool {
+        !self.manual_retired && self.btcoex.scheme == Scheme::Mci && self.dma.is_some()
+    }
+    pub(in crate::ath9k) fn manual_facts(&self) -> Result<ManualMciFacts, BringUpError> {
+        if self.btcoex.mci.chip != Chip::Ar9565
+            || self.dma.is_none()
+            || self.btcoex.mci.gpm_addr == 0
+            || self.btcoex.mci.sched_addr == 0
+            || self.btcoex.mci.gpm_len != 16
+            || (!self.manual_retired && !self.ready())
+        {
+            return Err(BringUpError::BadState);
+        }
+        Ok(ManualMciFacts {
+            config: self.btcoex.mci.config,
+            gpm: self.btcoex.mci.gpm_addr,
+            len: self.btcoex.mci.gpm_len,
+            schedule: self.btcoex.mci.sched_addr,
+        })
+    }
+    /// Close every future GPM/timer/reset producer before the actual stop.
+    /// Keep ready until stop_bt consumes the original live engine state.
+    pub(in crate::ath9k) fn retire_manual_producers(&mut self) {
+        self.manual_retired = true;
+        self.closed = true;
+        self.pause_duty_cycle();
+    }
+    pub(in crate::ath9k) fn manually_retired(&self) -> bool {
+        self.manual_retired
+    }
+    /// Actual source stop+cleanup and local-control receipts. No DMA or
+    /// remote RF terminal fact is returned; the original ring stays retained.
+    pub(in crate::ath9k) fn stop_for_manual(
+        &mut self,
+        io: &mut impl RegisterIo,
+        expected: ManualMciFacts,
+    ) -> Result<(), BringUpError> {
+        let result = (|| {
+            if self.manual_facts()? != expected {
+                return Err(BringUpError::BadIdentity);
+            }
+            if !self.manually_retired() {
+                expected.validate_live(io)?;
+                self.retire_manual_producers();
+                super::mci::stop_bt(io, &mut self.btcoex.mci, false)?;
+                super::mci::cleanup(io);
+            }
+            super::antenna::manual::check_mci_off(io)?;
+            self.btcoex.enabled = false;
+            self.btcoex.mci.concur_tx = false;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.retire_manual_producers();
+        }
+        result
+    }
+    /// The actual retained engine completed setup/reset for this generation.
+    pub(in crate::ath9k) fn ready(&self) -> bool {
+        self.mci_enabled() && self.btcoex.mci.ready
+    }
+    pub(in crate::ath9k) fn close(&mut self) {
+        self.closed = true;
+        self.btcoex.mci.ready = false;
+        self.pause_duty_cycle();
+    }
+    pub(in crate::ath9k) fn reset_ready(&mut self) -> Result<(), BringUpError> {
+        if !self.can_reset() || !self.btcoex.mci.ready {
+            return Err(BringUpError::BadState);
+        }
+        self.closed = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+pub(in crate::ath9k) fn synthetic_manual_mci() -> Result<(MciLink, ManualMciFacts), BringUpError> {
+    // Explicit RAM-only engine facts. No setup/calibration/physical receipt
+    // is asserted by these seeded addresses and ready marker.
+    let dma = Arc::new(
+        narf_io::alloc_coherent_masked(
+            super::mci::MCI_DMA_BUF_BYTES,
+            narf_lib::id::DomainId::DRIVER_0,
+            u64::from(u32::MAX),
+        )
+        .map_err(|_| BringUpError::BadState)?,
+    );
+    let mut bt = Btcoex::new(Chip::Ar9565);
+    init_scheme(&mut bt, true, HW_CAP_MCI);
+    init_mci(&mut bt);
+    bt.mci.gpm_addr = dma.dma_addr_at(super::mci::MCI_GPM_DMA_OFFSET as u64).raw() as u32;
+    bt.mci.sched_addr = dma.dma_addr().raw() as u32;
+    bt.mci.gpm_len = 16;
+    bt.mci.ready = true;
+    let link = MciLink::new(bt, Some(dma));
+    let facts = link.manual_facts()?;
+    Ok((link, facts))
 }
 
 /// `hw.h::ath9k_hw_mci_is_enabled`: coexistence is globally enabled

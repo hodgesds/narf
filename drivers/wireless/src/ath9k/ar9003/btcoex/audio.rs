@@ -47,12 +47,16 @@ impl Audio {
         self.unsampled_rssi = 127;
     }
 
+    pub(super) fn rssi(&self) -> u8 {
+        self.rssi.value().unwrap_or(self.unsampled_rssi)
+    }
+
     /// Linux's default `avgbrssi` is zero until an associated beacon
     /// arrives. Only an audio profile changes its weak-period count.
     /// The period callback selects AUDIO on the fifth weak period.
     pub(super) fn period(&mut self, has_audio: bool) -> bool {
         if has_audio {
-            if self.rssi.value().unwrap_or(self.unsampled_rssi) > 25 {
+            if self.rssi() > 25 {
                 self.weak_periods = 0;
             } else {
                 self.weak_periods += 1;

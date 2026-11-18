@@ -705,6 +705,25 @@ fn mci_state_sweep() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_ath9k_mci_awake_deadbeef_poll_is_bounded_and_refuses_transition() -> TestResult {
+    for register in [AR_BTCOEX_CTRL2, AR_DIAG_SW] {
+        let (mut io, _) = live();
+        io.regs.insert(register, 0xdeadbeef);
+        if set_power_awake(&mut io).is_ok()
+            || io.delays_us != u64::from(POWER_AWAKE_WAIT_BOUND) * 10
+            || !io.writes(AR_BTCOEX_RC).is_empty()
+            || register == AR_BTCOEX_CTRL2 && !io.ops.is_empty()
+        {
+            return TestResult::Fail("deadbeef MCI wake loop fabricated completion/effects");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_mci_awake_deadbeef_poll_is_bounded_and_refuses_transition
+);
+
 fn mci_update_wlan_channels() -> TestResult {
     // Channel 1 (2412 MHz, HT20) clears the WLAN channel ±10 plus the
     // 7-channel guard from the map. Linux clears BT channels 0..26

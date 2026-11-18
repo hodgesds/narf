@@ -71,6 +71,8 @@ const CCK_SPURS: [i32; 4] = [2420, 2440, 2464, 2480];
 /// The facts a prepared channel retains for calibration and the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::ath9k) struct Prepared {
+    /// Canonical PCI-derived board program used by this preparation.
+    pub board_config: board::Config,
     pub frequency: u16,
     /// `ah->modes_index`.
     pub modes_index: usize,
@@ -412,6 +414,35 @@ pub(in crate::ath9k) fn expected(
     ctl: u16,
     power_limit: u8,
 ) -> Result<Prepared, BringUpError> {
+    expected_with_board(
+        revision,
+        identity,
+        pll_pwrsave,
+        image,
+        frequency,
+        ctl,
+        power_limit,
+        board::Config::default(),
+    )
+}
+
+/// Same source preparation with canonical PCI board inputs retained in
+/// the preparation facts and independently checked by signed admission.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep canonical board, device and channel power inputs explicit"
+)]
+pub(in crate::ath9k) fn expected_with_board(
+    revision: &Revision,
+    identity: &Identity,
+    pll_pwrsave: PllPwrsave,
+    image: &Image,
+    frequency: u16,
+    ctl: u16,
+    power_limit: u8,
+    board_config: board::Config,
+) -> Result<Prepared, BringUpError> {
+    board_config.check_chip(revision.chip)?;
     if !channel_supported(identity, frequency) {
         return Err(BringUpError::Policy);
     }
@@ -460,6 +491,7 @@ pub(in crate::ath9k) fn expected(
     let apm = image[super::eeprom::field::MISC_CONFIGURATION] & 0x8 != 0;
     let tx = identity.tx_chainmask;
     Ok(Prepared {
+        board_config,
         frequency,
         modes_index,
         carrier_leak_cal: cl & 0x2 != 0,
@@ -487,6 +519,37 @@ pub(in crate::ath9k) fn prepare(
     ctl: u16,
     power_limit: u8,
 ) -> Result<Prepared, BringUpError> {
+    prepare_with_board(
+        io,
+        revision,
+        identity,
+        pll_pwrsave,
+        image,
+        frequency,
+        ctl,
+        power_limit,
+        board::Config::default(),
+    )
+}
+
+/// Same source preparation with canonical PCI board inputs retained in
+/// the preparation facts and independently checked by signed admission.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep canonical board, device and channel power inputs explicit"
+)]
+pub(in crate::ath9k) fn prepare_with_board(
+    io: &mut impl RegisterIo,
+    revision: &Revision,
+    identity: &Identity,
+    pll_pwrsave: PllPwrsave,
+    image: &Image,
+    frequency: u16,
+    ctl: u16,
+    power_limit: u8,
+    board_config: board::Config,
+) -> Result<Prepared, BringUpError> {
+    board_config.check_chip(revision.chip)?;
     if !channel_supported(identity, frequency) {
         return Err(BringUpError::Policy);
     }
@@ -609,7 +672,7 @@ pub(in crate::ath9k) fn prepare(
         spur_mrc_cck(io, revision.chip, image, frequency)?;
     }
     spur_ofdm(io, revision.chip, image, frequency)?;
-    board::set_board_values(io, revision.chip, image, frequency, rx, tx)?;
+    board::set_board_values_configured(io, revision.chip, image, frequency, rx, tx, board_config)?;
     // ar9003_hw_set_channel.
     let (select, two) = channel_select(frequency);
     io.write32(AR_PHY_SYNTH_CONTROL, u32::from(two) << 29);
@@ -624,6 +687,7 @@ pub(in crate::ath9k) fn prepare(
         return Err(BringUpError::DeviceGone);
     }
     Ok(Prepared {
+        board_config,
         frequency,
         modes_index,
         carrier_leak_cal: cl & 0x2 != 0,

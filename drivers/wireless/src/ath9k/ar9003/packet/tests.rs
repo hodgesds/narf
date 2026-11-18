@@ -1,6 +1,8 @@
+use super::super::btcoex::concurrent::{self, tests::Fixture as MciPowerFixture};
 use super::*;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 const LOCAL: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -21,6 +23,15 @@ struct Model {
     delivered: RefCell<Vec<bool>>,
     writes: RefCell<Vec<(u64, u32)>>,
     fail_write: Cell<Option<u64>>,
+    antenna: RefCell<Option<super::super::antenna::Binding>>,
+    mci_power: RefCell<Option<MciPowerFixture>>,
+    mci_pci: Cell<Option<Cap<narf_bus::BusDeviceCap, Write>>>,
+    ps: RefCell<Option<Arc<crate::ath9k::ps::Grant>>>,
+    ps_base: RefCell<Option<Arc<crate::ath9k::ar9003::ps::Base>>>,
+    ps_bound: Cell<bool>,
+    ps_sleeping: Cell<bool>,
+    ps_failed: Cell<bool>,
+    station_env: RefCell<Option<Arc<crate::ath9k::station::tests::Env>>>,
 }
 
 impl Model {
@@ -45,6 +56,15 @@ impl Model {
             delivered: RefCell::new(Vec::new()),
             writes: RefCell::new(Vec::new()),
             fail_write: Cell::new(None),
+            antenna: RefCell::new(None),
+            mci_power: RefCell::new(None),
+            mci_pci: Cell::new(None),
+            ps: RefCell::new(None),
+            ps_base: RefCell::new(None),
+            ps_bound: Cell::new(false),
+            ps_sleeping: Cell::new(false),
+            ps_failed: Cell::new(false),
+            station_env: RefCell::new(None),
         }
     }
     fn reg(&self, register: u64) -> u32 {
@@ -52,6 +72,59 @@ impl Model {
     }
     fn set(&self, register: u64, value: u32) {
         self.registers.borrow_mut().insert(register, value);
+    }
+    fn mci_bus<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        self.mci_pci
+            .get()
+            .ok_or(Error::Access)?
+            .invoke(CurrentMci(action))
+            .map_err(|_| Error::Access)?
+    }
+    fn mci_admit<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        let snapshot = self
+            .mci_power
+            .borrow()
+            .as_ref()
+            .map(|f| f.power.words().map(|words| (f.grant.clone(), words)))
+            .transpose()?;
+        let Some((grant, words)) = snapshot else {
+            return action();
+        };
+        self.ps_access(|| {
+            grant
+                .invoke(|| {
+                    Ok(self.mci_bus(|| {
+                        if words
+                            .iter()
+                            .any(|&(register, value)| self.reg(register) != value)
+                        {
+                            return Err(Error::Descriptor);
+                        }
+                        action()
+                    }))
+                })
+                .map_err(|_| Error::Access)?
+        })
+    }
+    fn write_register(&self, register: u64, value: u32) -> Result<(), Error> {
+        if self.fail_write.get() == Some(register) {
+            return Err(Error::Access);
+        }
+        self.writes.borrow_mut().push((register, value));
+        match register {
+            0x0074 => self.hp.borrow_mut().push(value),
+            0x0078 => self.lp.borrow_mut().push(value),
+            QTXDP => self.pushed.borrow_mut().push(value),
+            CR if value & CR_RXD != 0 => self.set(CR, 0),
+            CR => self.set(CR, if value == 0 { CR_RXE } else { value }),
+            0x4028 => self.set(register, self.reg(register) & !value),
+            0x704c => {
+                self.set(register, value);
+                self.set(0x7044, if value & 1 != 0 { 2 } else { 4 });
+            }
+            _ => self.set(register, value),
+        }
+        Ok(())
     }
     fn pointer(&self, address: u32, length: usize) -> *mut u8 {
         let address = u64::from(address);
@@ -109,14 +182,85 @@ impl Model {
         self.put(address + 20, 0x3000_0000);
         self.put(address + 44, 3);
     }
+    /// Device-authored raw EDMA metadata; no shared Mpdu interface change.
+    fn antenna_receive(
+        &self,
+        high: bool,
+        frame: &[u8],
+        ctl: [u8; 3],
+        antenna: u8,
+        more: bool,
+        status: u32,
+    ) {
+        let address = if high {
+            self.hp.borrow()[0]
+        } else {
+            self.lp.borrow()[0]
+        };
+        self.receive(high, frame, more);
+        self.put(
+            address + 4,
+            u32::from_le_bytes([ctl[0], ctl[1], ctl[2], 0x1b]),
+        );
+        self.put(address + 16, u32::from(antenna & 7) << 8);
+        self.put(address + 44, status);
+    }
 }
 
 impl Port for &Model {
+    fn ps_request(&self) -> Option<crate::ath9k::ps::Request> {
+        self.ps_base.borrow().as_ref().map(|base| base.request())
+    }
+    fn ps_grant(&self) -> Option<Arc<crate::ath9k::ps::Grant>> {
+        self.ps.borrow().clone()
+    }
+    fn bind_ps(&self, source: &Arc<crate::ath9k::ps::Grant>) -> Result<(), Error> {
+        if self
+            .ps
+            .borrow()
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, source))
+        {
+            return Err(Error::Access);
+        }
+        source.check()?;
+        self.mci_admit(|| {
+            self.ps_bound.set(true);
+            Ok(())
+        })
+    }
+    fn network_sleep(&self) -> Result<(), Error> {
+        self.enter_ps()
+    }
+    fn mci_network_sleep(&self) -> Result<Option<crate::ath9k::ar9003::ps::NetworkSleep>, Error> {
+        if !self.ps_sleeping.get() {
+            return Ok(None);
+        }
+        if self.ps_failed.get() || !self.ps_bound.get() {
+            return Err(Error::Access);
+        }
+        let source = self.ps.borrow().clone().ok_or(Error::Access)?;
+        crate::ath9k::ar9003::ps::NetworkSleep::observe(source, *self).map(Some)
+    }
+    fn mci_concurrent(&self, enabled: bool) -> Result<bool, Error> {
+        let mut fixture = self.mci_power.borrow_mut();
+        let Some(fixture) = fixture.as_mut() else {
+            return Ok(false);
+        };
+        fixture.power.transition(*self, &fixture.grant, enabled)?;
+        Ok(true)
+    }
+    fn ar9003_antenna(&self) -> Option<super::super::antenna::Binding> {
+        self.antenna.borrow().clone()
+    }
     fn tx_chainmask(&self) -> u8 {
-        7
+        self.mci_power
+            .borrow()
+            .as_ref()
+            .map_or(7, |fixture| fixture.base.tx_chainmask)
     }
     fn transmit_allowed(&self) -> Result<(), Error> {
-        Ok(())
+        self.mci_admit(|| Ok(()))
     }
     fn access<T>(
         &self,
@@ -126,30 +270,13 @@ impl Port for &Model {
         if self.master.get() != active {
             return Err(Error::Access);
         }
-        operation()
+        self.mci_admit(operation)
     }
     fn read(&self, register: u64) -> Result<u32, Error> {
-        Ok(self.reg(register))
+        self.mci_admit(|| Ok(self.reg(register)))
     }
     fn write(&self, register: u64, value: u32) -> Result<(), Error> {
-        if self.fail_write.get() == Some(register) {
-            return Err(Error::Access);
-        }
-        self.writes.borrow_mut().push((register, value));
-        match register {
-            0x0074 => self.hp.borrow_mut().push(value),
-            0x0078 => self.lp.borrow_mut().push(value),
-            QTXDP => self.pushed.borrow_mut().push(value),
-            // AR_CR_RXD stops both receive queues.
-            CR if value & CR_RXD != 0 => self.set(CR, 0),
-            CR => self.set(CR, if value == 0 { CR_RXE } else { value }),
-            // `AR_INTR_SYNC_CAUSE` is write-one-to-clear: the
-            // `ath9k_hw_init_interrupt_masks` all-ones write and
-            // `ar9003_hw_get_isr`'s write-back clear causes, never set them.
-            0x4028 => self.set(register, self.reg(register) & !value),
-            _ => self.set(register, value),
-        }
-        Ok(())
+        self.mci_admit(|| self.write_register(register, value))
     }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
         let memory = narf_io::alloc_coherent_masked(
@@ -184,6 +311,22 @@ impl Port for &Model {
     fn deliver(&self, enabled: bool) -> Result<(), Error> {
         self.delivered.borrow_mut().push(enabled);
         Ok(())
+    }
+}
+
+struct CurrentMci<F>(F);
+impl<T, F: FnOnce() -> Result<T, Error>> CapOp<narf_bus::BusDeviceCap, Write> for CurrentMci<F> {
+    type Output = Result<T, Error>;
+    fn execute(self, _: &Cap<narf_bus::BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        Ok((self.0)())
+    }
+}
+impl concurrent::Raw for Model {
+    fn read(&self, register: u64) -> Result<u32, Error> {
+        self.mci_bus(|| Ok(self.reg(register)))
+    }
+    fn write(&self, register: u64, value: u32) -> Result<(), Error> {
+        self.mci_bus(|| self.write_register(register, value))
     }
 }
 
@@ -771,3 +914,338 @@ kernel_test_in!(
 );
 
 mod mci_duty;
+
+/// These are actual posted EDMA buffers and Packet::receive, not scanner
+/// callbacks. The format-only N48A marker grants no physical RF measurement.
+fn smoke_ath9k_ar9485_native_edma_observations_follow_descriptor_admission() -> TestResult {
+    use super::super::antenna::{
+        self,
+        tests::{device, fixture, history},
+    };
+    let run = || -> Result<(), &'static str> {
+        let (profile, grant, _) = fixture(device(), 0xc0).map_err(|_| "qualification fixture")?;
+        let model = Model::new();
+        model.set(0x9e28, 0x13ef_0200);
+        model.set(0x8058, 1);
+        let shared = antenna::Shared::new(profile);
+        let binding = shared
+            .bind(&&model, grant, profile)
+            .map_err(|_| "antenna bind")?;
+        *model.antenna.borrow_mut() = Some(binding);
+        // SAFETY: isolated parked RAM target, sole retained coherent owner.
+        let mut packet =
+            unsafe { Packet::prepare(&model, LOCAL, no_mci_link()) }.map_err(|_| "prepare")?;
+        packet.start().map_err(|_| "start")?;
+        let frame = received();
+        let empty = packet.receive().map_err(|_| "empty descriptor")?;
+        if empty.consumed || empty.frame.is_some() || history(&shared) != (0, 0, true) {
+            return Err("unfinished descriptor supplied an observation");
+        }
+        // CRC failure, a split start and its continuation cannot contribute.
+        for (ant, more, status) in [
+            (1, false, 1),
+            (2, true, 3),
+            (3, false, 3),
+            (4, false, 0x10003),
+        ] {
+            model.antenna_receive(true, &frame, [40, 20, 0x18], ant, more, status);
+            let step = packet.receive().map_err(|_| "rejected receive")?;
+            if !step.consumed || step.frame.is_some() || history(&shared) != (0, 0, true) {
+                return Err("rejected/split EDMA supplied antenna observation");
+            }
+        }
+        for ant in [1, 2, 3] {
+            model.antenna_receive(ant != 2, &frame, [40, 20, 0x18], ant, false, 3);
+            if packet
+                .receive()
+                .map_err(|_| "admitted receive")?
+                .frame
+                .is_none()
+            {
+                return Err("valid native frame lost descriptor admission");
+            }
+        }
+        if history(&shared) != (3, 0, true) || model.reg(0x8058) != 3 {
+            return Err("validated sidecar was not applied once before descriptor repost");
+        }
+        // Three valid samples already counted. Negative raw RSSI0x80 must
+        // not advance the source window, despite valid descriptor admission.
+        model.antenna_receive(true, &frame, [0x80, 20, 0x18], 3, false, 3);
+        packet.receive().map_err(|_| "signed native observation")?;
+        for _ in 0..508 {
+            model.antenna_receive(true, &frame, [40, 20, 0x18], 3, false, 3);
+            packet.receive().map_err(|_| "native scan window")?;
+        }
+        if model.reg(0x9e28) != 0x13ef_0200 {
+            return Err("negative/duplicate/rejected sidecar advanced scanner window");
+        }
+        model.antenna_receive(true, &frame, [40, 20, 0x18], 3, false, 3);
+        packet.receive().map_err(|_| "native decision")?;
+        if model.reg(0x9e28) != 0x0def_0200 {
+            return Err(
+                "native RSSI_ctl/config bits did not compose literal LNA/gain/bias decision",
+            );
+        }
+        packet.stop().map_err(|_| "stop")?;
+        if history(&shared) != (3, 0, false) {
+            return Err("DMA stop retained live observations");
+        }
+        Ok(())
+    };
+    run().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9485/antenna",
+    smoke_ath9k_ar9485_native_edma_observations_follow_descriptor_admission
+);
+
+fn smoke_ath9k_ar9485_native_edma_revoked_qualification_keeps_dma_owned() -> TestResult {
+    use super::super::antenna::{
+        self,
+        tests::{device, fixture, history},
+    };
+    let run = || -> Result<(), &'static str> {
+        let (profile, grant, cap) = fixture(device(), 0xc0).map_err(|_| "qualification fixture")?;
+        let model = Model::new();
+        model.set(0x9e28, 0x13ef_0200);
+        model.set(0x8058, 1);
+        let shared = antenna::Shared::new(profile);
+        *model.antenna.borrow_mut() = Some(
+            shared
+                .bind(&&model, grant, profile)
+                .map_err(|_| "binding")?,
+        );
+        // SAFETY: isolated parked RAM target, sole retained coherent owner.
+        let mut packet =
+            unsafe { Packet::prepare(&model, LOCAL, no_mci_link()) }.map_err(|_| "prepare")?;
+        packet.start().map_err(|_| "start")?;
+        let address = model.hp.borrow()[0];
+        model.antenna_receive(true, &received(), [40, 20, 0x18], 1, false, 3);
+        let writes = model.writes.borrow().len();
+        cap.revoke();
+        if !matches!(packet.receive(), Err(Error::Access))
+            || packet.phase() != Phase::Failed
+            || packet.reset_request() != Some(ResetType::Calibration)
+            || model.get(address + 44) != 3
+            || model.hp.borrow().len() != RX_HP - 1
+            || !model.released.borrow().is_empty()
+            || model.writes.borrow().len() != writes
+            || history(&shared) != (0, 0, false)
+        {
+            return Err(
+                "revoked observer cleared/reposted DMA, wrote hardware or committed history",
+            );
+        }
+        // The failed generation deliberately retains all published buffers.
+        // This fixture does not assert physical cleanup under a dead record.
+        drop(packet);
+        if !model.released.borrow().is_empty() {
+            return Err("failed owner released uncertain DMA");
+        }
+        Ok(())
+    };
+    run().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+
+fn smoke_ath9k_ar9565_native_edma_default_antenna_requires_current_source_and_valid_status(
+) -> TestResult {
+    use super::super::antenna::{
+        self,
+        tests::{device, fixture, history},
+    };
+    let run = || -> Result<(), &'static str> {
+        let id = narf_bus::DeviceId {
+            device: 0x0036,
+            ..device()
+        };
+        let (profile, grant, cap) = fixture(id, 0).map_err(|_| "N65A native antenna fixture")?;
+        let model = Model::new();
+        model.set(0x9e28, 0x126f0600);
+        model.set(0x8058, 1);
+        let shared = antenna::Shared::new(profile);
+        *model.antenna.borrow_mut() = Some(
+            shared
+                .bind(&&model, grant, profile)
+                .map_err(|_| "N65A native binding")?,
+        );
+        // SAFETY: isolated parked RAM EDMA target, no physical radio proof.
+        let mut packet = unsafe { Packet::prepare(&model, LOCAL, no_mci_link()) }
+            .map_err(|_| "N65A native packet")?;
+        packet.start().map_err(|_| "N65A native start")?;
+        let frame = received();
+        model.antenna_receive(true, &frame, [40, 20, 0x18], 2, false, 1);
+        packet.receive().map_err(|_| "N65A CRC rejection")?;
+        if history(&shared) != (0, 0, true) || model.reg(0x8058) != 1 {
+            return Err("rejected native EDMA status advanced default antenna");
+        }
+        for _ in 0..3 {
+            model.antenna_receive(true, &frame, [40, 20, 0x18], 2, false, 3);
+            if packet
+                .receive()
+                .map_err(|_| "N65A admitted native observation")?
+                .frame
+                .is_none()
+            {
+                return Err("N65A valid legacy frame lost native admission");
+            }
+        }
+        if history(&shared) != (2, 0, true)
+            || model.reg(0x8058) != 2
+            || model.reg(0x9e28) != 0x126f0600
+        {
+            return Err("N65A default tracker ran group2 scan/manual BT mutation");
+        }
+        cap.revoke();
+        model.antenna_receive(true, &frame, [40, 20, 0x18], 3, false, 3);
+        if packet.receive().is_ok() || !model.released.borrow().is_empty() || history(&shared).2 {
+            return Err("N65A source loss reposted/freed DMA or kept RX antenna authority");
+        }
+        Ok(())
+    };
+    run().map_or_else(TestResult::Fail, |_| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9565_native_edma_default_antenna_requires_current_source_and_valid_status
+);
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9485/antenna",
+    smoke_ath9k_ar9485_native_edma_revoked_qualification_keeps_dma_owned
+);
+
+/// Use the existing resettable controller model and production pause/MAC
+/// tail/resume paths. Modeled register loss is the same explicit event as
+/// check_in_place_reset; this proves no physical PCI/PHY calibration fact.
+fn smoke_ath9k_ar9485_controller_reset_restores_saved_default_and_retained_history() -> TestResult {
+    use super::super::antenna::{
+        self,
+        tests::{device, factory, fixture, history, sampled_history},
+        Qualified,
+    };
+    let run = || -> Result<(), &'static str> {
+        let (image, identity) = factory(0xc0);
+        let (profile, grant, _) = fixture(device(), 0xc0).map_err(|_| "reset fixture")?;
+        let model = Model::new();
+        let raw = &model;
+        model.set(0x9e28, 0x13ef_0200);
+        model.set(0x8058, 1);
+        let shared = antenna::Shared::new(profile);
+        let old = shared
+            .bind(&raw, grant.clone(), profile)
+            .map_err(|_| "reset bind")?;
+        *model.antenna.borrow_mut() = Some(old.clone());
+        // SAFETY: isolated parked RAM controller, sole coherent DMA owner.
+        let mut packet = unsafe { Packet::prepare(&model, identity.mac, no_mci_link()) }
+            .map_err(|_| "reset prepare")?;
+        let ring = model.reg(Q_STATUS_RING_START);
+        packet.start().map_err(|_| "reset start")?;
+        let mut posted: Vec<u32> = model
+            .hp
+            .borrow()
+            .iter()
+            .chain(model.lp.borrow().iter())
+            .copied()
+            .collect();
+        posted.sort_unstable();
+        for ant in [1, 2, 3, 1, 2] {
+            model.antenna_receive(true, &received(), [40, 20, 0x18], ant, false, 3);
+            if packet
+                .receive()
+                .map_err(|_| "reset history RX")?
+                .frame
+                .is_none()
+            {
+                return Err("reset valid descriptor rejected");
+            }
+        }
+        if history(&shared) != (3, 2, true) || model.reg(0x8058) != 3 {
+            return Err("reset lacked actual selected default/mismatch history");
+        }
+        let before = sampled_history(&shared);
+        let pending = model.hp.borrow()[0];
+        model.antenna_receive(true, &received(), [40, 20, 0x18], 7, false, 3);
+        if packet.pause_for_reset() != Ok(None)
+            || model.master.get()
+            || history(&shared) != (3, 2, false)
+            || sampled_history(&shared) != before
+            || model.get(pending + 44) != 0
+            || !model.released.borrow().is_empty()
+        {
+            return Err("reset pause consumed old metadata, lost history or released DMA");
+        }
+        let qualified = Qualified::new(&raw, &grant);
+        let saved = qualified
+            .capture_default()
+            .map_err(|_| "save actual default")?;
+        // Existing controller-model reset event: hardware drops ring/FIFO,
+        // default and MAC state. Fresh PHY/board base is modeled explicitly.
+        for reg in [
+            Q_STATUS_RING_START,
+            Q_STATUS_RING_END,
+            DATABUF_SIZE,
+            0x8008,
+            0x800c,
+            irq::IMR,
+            0x8058,
+        ] {
+            model.set(reg, 0);
+        }
+        model.hp.borrow_mut().clear();
+        model.lp.borrow_mut().clear();
+        model.status_tail.set(0);
+        model.set(0xa20c, 1);
+        model.set(0x9e28, 0x13ef_0200);
+        let (same, fresh, _) =
+            fixture(device(), 0xc0).map_err(|_| "fresh reset qualification fixture")?;
+        let qualified = Qualified::new(&raw, &fresh);
+        qualified
+            .prepare_mac(&identity, &image, identity.mac, false, Some(saved))
+            .map_err(|_| "saved default reset tail")?;
+        if saved != 3 || model.reg(0x8058) != 3 || sampled_history(&shared) != before {
+            return Err("reset tail changed logical history or lost actual default");
+        }
+        let next = shared
+            .bind(&raw, fresh, same)
+            .map_err(|_| "fresh reset bind")?;
+        *model.antenna.borrow_mut() = Some(next);
+        if old.resume(&raw) != Err(Error::State) {
+            return Err("old reset binding adopted fresh installed state");
+        }
+        packet.resume_after_reset().map_err(|_| "reset resume")?;
+        let mut reposted: Vec<u32> = model
+            .hp
+            .borrow()
+            .iter()
+            .chain(model.lp.borrow().iter())
+            .copied()
+            .collect();
+        reposted.sort_unstable();
+        if reposted != posted
+            || model.reg(Q_STATUS_RING_START) != ring
+            || history(&shared) != (3, 2, true)
+            || sampled_history(&shared) != before
+            || !model.released.borrow().is_empty()
+        {
+            return Err("reset resume replaced DMA or reset retained scanner/default history");
+        }
+        let empty = packet.receive().map_err(|_| "discarded old prefix")?;
+        if empty.consumed || empty.frame.is_some() || sampled_history(&shared) != before {
+            return Err("old completed metadata replayed after reset");
+        }
+        model.antenna_receive(false, &received(), [40, 20, 0x18], 2, false, 3);
+        packet.receive().map_err(|_| "post-reset RX")?;
+        if history(&shared) != (2, 0, true) || model.reg(0x8058) != 2 {
+            return Err("post-reset third mismatch lost original source counter");
+        }
+        packet.stop().map_err(|_| "reset terminal stop")?;
+        if !packet.reclaimed() || history(&shared) != (2, 0, false) {
+            return Err("reset terminal stop did not close observation/DMA owner");
+        }
+        Ok(())
+    };
+    run().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9485/antenna",
+    smoke_ath9k_ar9485_controller_reset_restores_saved_default_and_retained_history
+);
