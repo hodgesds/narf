@@ -4431,6 +4431,7 @@ fn smoke_blocked_syscall_frame_reports_user_sp_and_pc() -> TestResult {
             ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
             ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
             ((*tf).rsp, (*tf).rip, (*tf).ss) = (SP, PC, 0x1b);
+            (*tf).vector = 0x80;
         }
         if uc.blocked_syscall_frame() != Some(want(61)) {
             return TestResult::Fail("int 0x80 TrapFrame: wrong sp/pc");
