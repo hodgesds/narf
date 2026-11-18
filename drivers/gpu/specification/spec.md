@@ -238,7 +238,9 @@ long pulse with a low level removes a sink. `intel_gpu_xelpg_tc` exposes the
 source Type-C connect/disconnect and the display-14 AUX power well
 (`aux_power_enable`/`aux_power_disable`). Every display-14 AUX transport
 (`IntelAux::with_base`/`IntelAux::xelpdp`) preserves the AUX power request on
-each control word. The Gen12 `IntelAux::new` encoding is unchanged.
+each control word. Gen12 native AUX (`IntelAux::new`) uses the SKL sync
+fields for 32 normal and 18 fast-wake pulses on eDP, combo DP and USB-C DP
+Alt Mode. Bit 11 selects Thunderbolt AUX only on an explicit tunneled route.
 `intel_gpu::poll_dp_hpd_events` and the runtime actor's `service_external_sst`
 run the external hotplug pass with the admitted Meteor-, Lunar- or
 Panther-Lake generation; an activated route is published

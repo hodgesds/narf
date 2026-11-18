@@ -3434,9 +3434,10 @@ pub mod tests {
                         let msgsize =
                             ((val & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT) as usize;
                         let reply_len = self.aux_engine(msgsize);
-                        let ctl = (val & !AUX_CTL_SEND_BUSY & !AUX_CTL_MSGSIZE_MASK)
-                            | ((reply_len as u32) << AUX_CTL_MSGSIZE_SHIFT)
-                            | crate::intel_gpu_aux::AUX_CTL_DONE;
+                        // Sending clears the W1C error bits. A successful
+                        // completion publishes DONE and the new reply length.
+                        let ctl = crate::intel_gpu_aux::AUX_CTL_DONE
+                            | ((reply_len as u32) << AUX_CTL_MSGSIZE_SHIFT);
                         self.set(off, ctl);
                     } else {
                         self.set(off, val);

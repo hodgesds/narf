@@ -4717,7 +4717,8 @@ Lake). Sources are Linux b90c984d `intel_tc.c` (`xelpdp_tc_phy_ops`),
   `PWR_WELL_CTL_AUX2` (0x45444) request the MTL modeset used before is
   removed. Display-14 AUX transports write the `skl_get_aux_send_ctl` word,
   which preserves bit 19, sets TBT_IO only for TBT-alt and polls without the
-  done interrupt. The Gen12 control word is unchanged and pinned. The fixtures
+  done interrupt. Gen12 native AUX uses the same sync fields with the native
+  route selected and bit 19 clear. The fixtures
   that pinned the AUX2 write now pin the corrected register.
 - Type-C ownership (`intel_gpu_xelpg_tc`). Follows the source sequence: live
   mode from PICA/SDE, legacy-flag fixup, TCSS power request with IOM ready
