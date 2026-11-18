@@ -1,6 +1,7 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.11** (v1.11 gives Nova's disconnected plan an ordered main-well
+> Status: **v1.12** (v1.12 sequences Nova port preparation and retryable
+> teardown; v1.11 gives Nova's disconnected plan an ordered main-well
 > lease with partial-grant rollback and foreign-request preservation; v1.10 gives it an exact
 > Display-20-style D2D lease; v1.09 replaces the shared Type-C display20 boolean with
 > exact Meteor/Lunar/Panther/Wildcat/Nova policy; v1.08 restores Display-30 Type-C power-request mailbox
@@ -435,12 +436,29 @@ nothing. This remains a disconnected prerequisite rather than a modeset.
 `NovaResourcePlan::acquire_main_wells` requests PW1, optional PW2 and the
 selected PW_A--D in dependency order, waits up to 1 ms for each state and
 fuse-distribution indication (failing closed where Linux only warns), and
-returns a token containing only DRIVER
-requests absent on entry. A failed partial grant is unwound; token release is
-reverse ordered and never clears pre-existing DRIVER requests. BIOS, KVMR or
+records only DRIVER requests absent on entry. The same token retains partial
+grants for reverse-order release and never clears pre-existing DRIVER
+requests. BIOS, KVMR or
 debug requests may keep a released well raised, matching Linux's forced-on
 rule. The exact LT-PHY platform fact is checked before the first register read.
 This raw disconnected lease is not the future live owner's global refcount.
+`NovaPortLease` prepares a dark DDI with the caller holding DC-off and
+serializing access to the port and PICA. It acquires main wells, then PICA and
+TCSS ownership for live native DP-alt on TC1/TC2, then LT AUX for DP/eDP.
+Combo ports A and B use the PICA bases `0x16fa00` and `0x16fc00` for
+AUX and PHY, including BUF_CTL5 and P2P responses. The shared mapping
+preserves the separate DDI control and clock value/frequency addresses.
+The Type-C connection retains the negotiated pin assignment and lane ceiling
+for the LT PHY. Existing PICA, TCSS and AUX ownership, a live DDI, and
+fabric-only USB4/TBT HPD cause refusal. An opted-in firmware-lit panel must
+first be retired by a future live owner.
+Following the i915 `intel_ddi_pre_pll_enable` and
+`mtl_ddi_prepare_link_retrain` phases, D2D is requested separately after PLL
+setup. D2D release requires the DDI enable bit clear and PHY idle observed.
+After retiring the PLL, the caller releases AUX, Type-C ownership, TCSS,
+PICA, and the main wells. Failed preparation attempts reverse-order cleanup.
+An unconfirmed release returns the failing step and leaves the outstanding
+requests with the same lease for retry. The production route remains gated.
 Display 35's disconnected watermark path forces the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.

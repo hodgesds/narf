@@ -23,11 +23,14 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::{
-    MmioWindow, XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS,
+    MmioWindow, AUX_CTL_SEND_BUSY, XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS,
 };
-use crate::intel_gpu_lt_phy::LtPort;
+use crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE;
+use crate::intel_gpu_lt_phy::{LtPort, LtPortView};
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
 use crate::intel_gpu_xe2lpd::{self as xe2lpd, IpError};
+use crate::intel_gpu_xelpg::PORT_BUF_PHY_IDLE;
+use crate::intel_gpu_xelpg_tc::{self as tc, NovaDpAltLease, TcConnection, TcError};
 
 /// `PWR_WELL_CTL2` indices used by Xe3 LPD and Xe3P LPD.
 const PW_1_INDEX: u8 = 0;
@@ -85,13 +88,18 @@ pub(crate) enum NovaResourceError {
     PowerGateFuseTimeout(u8),
     /// Access was lost or the D2D state transition timed out.
     D2d(IpError),
+    TypeC(TcError),
+    Aux(TcError),
+    LaneCount,
+    PortBusy,
+    LeaseState,
 }
 
 /// Main-well requests newly acquired by one disconnected Nova transaction.
 ///
 /// Pre-existing DRIVER requests are observed but never released by this
 /// token. A future live owner must still serialize/refcount leases globally.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 #[must_use = "main-well requests remain held until the lease is released"]
 pub(crate) struct NovaMainWellLease {
     owned_request_mask: u32,
@@ -105,9 +113,19 @@ impl NovaMainWellLease {
 
     /// Release newly acquired wells in reverse dependency order. A BIOS,
     /// KVMR or debug request is allowed to keep the hardware state raised.
-    pub(crate) fn release(self, io: &(impl MmioWindow + ?Sized)) -> Result<(), NovaResourceError> {
+    pub(crate) fn release(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+    ) -> Result<(), NovaResourceError> {
         require_nova(io)?;
-        release_owned(io, self.owned_request_mask)
+        for index in (PW_1_INDEX..=PW_A_INDEX + Pipe::D as u8).rev() {
+            let request = well_request(index);
+            if self.owned_request_mask & request != 0 {
+                disable_well(io, index)?;
+                self.owned_request_mask &= !request;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -174,7 +192,7 @@ const fn fuse_status_mask(index: u8) -> u32 {
 }
 
 fn require_nova(io: &(impl MmioWindow + ?Sized)) -> Result<(), NovaResourceError> {
-    if io.has_lt_phy() {
+    if io.has_lt_phy() && !io.cx0_xe3() {
         Ok(())
     } else {
         Err(NovaResourceError::ProfileMismatch)
@@ -198,21 +216,17 @@ fn wait_mask(
     off: u64,
     mask: u32,
     expected: u32,
+    timeout_ns: u64,
 ) -> Result<bool, NovaResourceError> {
-    let budget = narf_time::wall::ns_to_cycles(POWER_WELL_TIMEOUT_NS);
-    let start = narf_time::now_cycles();
-    loop {
-        // Match read_poll_timeout: the read that can satisfy the condition
-        // still occurs after the deadline sample.
-        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
-        if read_checked(io, off)? & mask == expected {
-            return Ok(true);
-        }
-        if expired {
-            return Ok(false);
-        }
-        core::hint::spin_loop();
-    }
+    let mut last = Ok(0);
+    let reached = narf_scheduler::responsive_spin_until(
+        || {
+            last = read_checked(io, off);
+            last.is_err() || last.is_ok_and(|value| value & mask == expected)
+        },
+        narf_time::Deadline::after_ns(timeout_ns),
+    );
+    last.map(|_| reached)
 }
 
 fn wait_fuse(
@@ -220,14 +234,18 @@ fn wait_fuse(
     gate: u8,
     mask: u32,
 ) -> Result<(), NovaResourceError> {
-    if wait_mask(io, SKL_FUSE_STATUS, mask, mask)? {
+    if wait_mask(io, SKL_FUSE_STATUS, mask, mask, POWER_WELL_TIMEOUT_NS)? {
         Ok(())
     } else {
         Err(NovaResourceError::PowerGateFuseTimeout(gate))
     }
 }
 
-fn enable_well(io: &(impl MmioWindow + ?Sized), index: u8) -> Result<bool, NovaResourceError> {
+fn enable_well(
+    io: &(impl MmioWindow + ?Sized),
+    index: u8,
+    lease: &mut NovaMainWellLease,
+) -> Result<(), NovaResourceError> {
     if index == PW_1_INDEX {
         // PW1 additionally requires the HW-controlled PG0 fuse first.
         wait_fuse(io, 0, 1 << 27)?;
@@ -235,29 +253,15 @@ fn enable_well(io: &(impl MmioWindow + ?Sized), index: u8) -> Result<bool, NovaR
     let request = well_request(index);
     let state = well_state(index);
     let current = read_checked(io, PWR_WELL_CTL2)?;
-    let acquired = current & request == 0;
-    if acquired {
+    if current & request == 0 {
+        lease.owned_request_mask |= request;
         io.write32(PWR_WELL_CTL2, current | request);
         compiler_fence(Ordering::SeqCst);
     }
-    let enabled = wait_mask(io, PWR_WELL_CTL2, state, state);
-    if !matches!(enabled, Ok(true)) {
-        if acquired {
-            let _ = disable_well(io, index);
-        }
-        return match enabled {
-            Ok(false) => Err(NovaResourceError::PowerWellTimeout(index)),
-            Err(error) => Err(error),
-            Ok(true) => unreachable!(),
-        };
+    if !wait_mask(io, PWR_WELL_CTL2, state, state, POWER_WELL_TIMEOUT_NS)? {
+        return Err(NovaResourceError::PowerWellTimeout(index));
     }
-    if let Err(error) = wait_fuse(io, index + 1, fuse_status_mask(index)) {
-        if acquired {
-            let _ = disable_well(io, index);
-        }
-        return Err(error);
-    }
-    Ok(acquired)
+    wait_fuse(io, index + 1, fuse_status_mask(index))
 }
 
 fn foreign_requesters(
@@ -281,23 +285,13 @@ fn disable_well(io: &(impl MmioWindow + ?Sized), index: u8) -> Result<(), NovaRe
     if foreign_requesters(io, request)? {
         return Ok(());
     }
-    if wait_mask(io, PWR_WELL_CTL2, state, 0)? {
+    if wait_mask(io, PWR_WELL_CTL2, state, 0, POWER_WELL_TIMEOUT_NS)?
+        || foreign_requesters(io, request)?
+    {
         Ok(())
     } else {
         Err(NovaResourceError::PowerWellTimeout(index))
     }
-}
-
-fn release_owned(
-    io: &(impl MmioWindow + ?Sized),
-    owned_request_mask: u32,
-) -> Result<(), NovaResourceError> {
-    for index in (PW_1_INDEX..=PW_A_INDEX + Pipe::D as u8).rev() {
-        if owned_request_mask & well_request(index) != 0 {
-            disable_well(io, index)?;
-        }
-    }
-    Ok(())
 }
 
 impl NovaResourcePlan {
@@ -364,31 +358,26 @@ impl NovaResourcePlan {
     }
 
     /// Acquire PW1, optional PW2 and the selected pipe well in source order.
-    /// Only requests absent on entry are retained by the returned lease.
+    /// Record requests absent on entry, including ones that fail to grant,
+    /// so the transaction can unwind them in reverse order.
     pub(crate) fn acquire_main_wells(
         self,
         io: &(impl MmioWindow + ?Sized),
-    ) -> Result<NovaMainWellLease, NovaResourceError> {
+        lease: &mut NovaMainWellLease,
+    ) -> Result<(), NovaResourceError> {
         require_nova(io)?;
-        let mut owned = 0;
+        if lease.owned_request_mask != 0 {
+            return Err(NovaResourceError::LeaseState);
+        }
         let indices = [
             Some(PW_1_INDEX),
             needs_pw2(self.port, self.pipe).then_some(PW_2_INDEX),
             Some(pipe_well_index(self.pipe)),
         ];
         for index in indices.into_iter().flatten() {
-            match enable_well(io, index) {
-                Ok(true) => owned |= well_request(index),
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = release_owned(io, owned);
-                    return Err(error);
-                }
-            }
+            enable_well(io, index, lease)?;
         }
-        Ok(NovaMainWellLease {
-            owned_request_mask: owned,
-        })
+        Ok(())
     }
 
     /// Acquire Display >= 20's D2D link through `DDI_BUF_CTL`. The exact LT
@@ -411,6 +400,166 @@ impl NovaResourcePlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NovaPrepareError {
+    pub(crate) cause: NovaResourceError,
+    /// A failed unwind keeps the outstanding steps in the same lease.
+    pub(crate) rollback: Option<NovaResourceError>,
+}
+
+/// One serialized, disconnected output transaction. The caller keeps
+/// DC-off held until release succeeds and excludes all other users of the
+/// port and PICA, including AUX probes. Global sharing needs a live owner.
+#[must_use = "prepared Nova display resources need explicit release"]
+pub(crate) struct NovaPortLease<'a, M: MmioWindow + ?Sized> {
+    io: &'a M,
+    plan: NovaResourcePlan,
+    main: NovaMainWellLease,
+    typec: NovaDpAltLease,
+    aux: bool,
+    d2d: bool,
+    prepared: bool,
+}
+
+impl<'a, M: MmioWindow + ?Sized> NovaPortLease<'a, M> {
+    pub(crate) fn new(io: &'a M, plan: NovaResourcePlan) -> Self {
+        Self {
+            io,
+            plan,
+            main: NovaMainWellLease::default(),
+            typec: NovaDpAltLease::Idle,
+            aux: false,
+            d2d: false,
+            prepared: false,
+        }
+    }
+
+    /// Prepare a dark output before PLL setup. The returned connection
+    /// supplies the negotiated lane ceiling and pin assignment to the PHY.
+    pub(crate) fn prepare(&mut self, lanes: u8) -> Result<Option<TcConnection>, NovaPrepareError> {
+        if self.prepared
+            || self.main.owned_request_mask != 0
+            || self.typec != NovaDpAltLease::Idle
+            || self.aux
+        {
+            return Err(NovaPrepareError {
+                cause: NovaResourceError::LeaseState,
+                rollback: None,
+            });
+        }
+        match self.prepare_port(lanes) {
+            Ok(connection) => {
+                self.prepared = true;
+                Ok(connection)
+            }
+            Err(cause) => {
+                let rollback = self.release().err();
+                Err(NovaPrepareError { cause, rollback })
+            }
+        }
+    }
+
+    fn prepare_port(&mut self, lanes: u8) -> Result<Option<TcConnection>, NovaResourceError> {
+        require_nova(self.io)?;
+        if !matches!(lanes, 1 | 2 | 4) || (self.plan.output == NovaOutput::HdmiTmds && lanes != 4) {
+            return Err(NovaResourceError::LaneCount);
+        }
+        self.plan.acquire_main_wells(self.io, &mut self.main)?;
+        self.check_ddi_unused()?;
+        let port = self.plan.port.xelpg();
+        let connection = if self.plan.typec_phy.is_some() {
+            Some(
+                self.typec
+                    .acquire(self.io, port, lanes)
+                    .map_err(NovaResourceError::TypeC)?,
+            )
+        } else {
+            None
+        };
+        if let Some(aux) = self.plan.aux {
+            if read_checked(self.io, aux.ctl)?
+                & (aux.request_mask | aux.status_mask | AUX_CTL_SEND_BUSY)
+                != 0
+            {
+                return Err(NovaResourceError::PortBusy);
+            }
+            self.aux = true;
+            tc::aux_power_enable(&LtPortView(self.io), port).map_err(NovaResourceError::Aux)?;
+        }
+        Ok(connection)
+    }
+
+    fn check_ddi_unused(&self) -> Result<(), NovaResourceError> {
+        let ddi = read_checked(self.io, self.plan.port.xelpg().ddi_buf_ctl())?;
+        if ddi
+            & (DDI_BUF_CTL_ENABLE
+                | xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+                | xe2lpd::DDI_BUF_D2D_LINK_STATE)
+            != 0
+        {
+            return Err(NovaResourceError::PortBusy);
+        }
+        Ok(())
+    }
+
+    /// Enable D2D during port setup, after PLL programming. A timeout
+    /// leaves the request with this lease so the caller can disable it.
+    pub(crate) fn enable_d2d(&mut self) -> Result<(), NovaResourceError> {
+        if !self.prepared || self.d2d {
+            return Err(NovaResourceError::LeaseState);
+        }
+        self.check_ddi_unused()?;
+        self.d2d = true;
+        self.plan.enable_d2d(self.io)
+    }
+
+    /// Release D2D after blanking the DDI and proving it idle, before
+    /// stopping the PHY PLL. Keep the dependencies if the proof fails.
+    pub(crate) fn disable_d2d(&mut self) -> Result<(), NovaResourceError> {
+        if !self.d2d {
+            return Ok(());
+        }
+        let port = self.plan.port.xelpg();
+        if read_checked(self.io, port.ddi_buf_ctl())? & DDI_BUF_CTL_ENABLE != 0
+            || !wait_mask(
+                self.io,
+                self.plan.port.buf_ctl1(),
+                PORT_BUF_PHY_IDLE,
+                PORT_BUF_PHY_IDLE,
+                10_000_000,
+            )?
+        {
+            return Err(NovaResourceError::PortBusy);
+        }
+        self.plan.disable_d2d(self.io)?;
+        self.d2d = false;
+        Ok(())
+    }
+
+    /// Call after retiring the PHY PLL and D2D, or to retry an incomplete
+    /// preparation rollback. A failed step retains all lower dependencies.
+    pub(crate) fn release(&mut self) -> Result<(), NovaResourceError> {
+        if self.d2d {
+            return Err(NovaResourceError::LeaseState);
+        }
+        self.prepared = false;
+        let port = self.plan.port.xelpg();
+        if self.aux {
+            tc::aux_power_disable(&LtPortView(self.io), port).map_err(NovaResourceError::Aux)?;
+            self.aux = false;
+        }
+        if self.typec != NovaDpAltLease::Idle {
+            self.typec
+                .release(self.io, port)
+                .map_err(NovaResourceError::TypeC)?;
+        }
+        if self.main.owned_request_mask != 0 {
+            self.main.release(self.io)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +571,7 @@ mod tests {
         assert_eq!(
             panel.aux,
             Some(NovaAux {
-                ctl: 0x6_4010,
+                ctl: 0x16_fa10,
                 request_mask: 1 << 19,
                 status_mask: 1 << 18,
             })
@@ -505,6 +654,7 @@ mod kernel_tests {
     extern crate alloc;
 
     use super::*;
+    use crate::intel_gpu_xelpg::{TCSS_POWER_REQUEST, TCSS_POWER_STATE, TC_PHY_OWNERSHIP};
     use alloc::vec::Vec;
     use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -579,6 +729,199 @@ mod kernel_tests {
         }
     }
 
+    const TC2_BUF: u64 = 0x16_f400;
+    const TC2_AUX: u64 = 0x16_f410;
+    const TC2_DDI: u64 = 0x6_4400;
+    const PICA: u64 = 0x16_fe04;
+
+    struct Tc2PortFake {
+        main: MainWellFake,
+        pica: Cell<u32>,
+        buf: Cell<u32>,
+        aux: Cell<u32>,
+        ddi: Cell<u32>,
+        stuck_aux_status: Cell<bool>,
+        pin: Cell<u32>,
+        hpd: Cell<u32>,
+        writes: RefCell<Vec<(u64, u32)>>,
+    }
+
+    impl Tc2PortFake {
+        fn connected() -> Self {
+            Self {
+                main: MainWellFake::new(true),
+                pica: Cell::new(0),
+                buf: Cell::new(0),
+                aux: Cell::new(0),
+                ddi: Cell::new(0),
+                stuck_aux_status: Cell::new(false),
+                pin: Cell::new(4),       // pin D, two lanes plus USB
+                hpd: Cell::new(1 << 17), // TC2 DP-alt live
+                writes: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MmioWindow for Tc2PortFake {
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            match off {
+                0x16_fe50 => self.hpd.get(),
+                0x16_1504 => (self.pin.get() << 25) | (1 << 2),
+                PICA => self.pica.get() | if self.pica.get() != 0 { 1 << 30 } else { 0 },
+                TC2_BUF => {
+                    self.buf.get()
+                        | PORT_BUF_PHY_IDLE
+                        | if self.buf.get() & TCSS_POWER_REQUEST != 0 {
+                            TCSS_POWER_STATE
+                        } else {
+                            0
+                        }
+                }
+                TC2_AUX => {
+                    self.aux.get()
+                        | if self.aux.get() != 0 || self.stuck_aux_status.get() {
+                            1 << 18
+                        } else {
+                            0
+                        }
+                }
+                TC2_DDI => {
+                    self.ddi.get()
+                        | if self.ddi.get() & (1 << 29) != 0 {
+                            1 << 28
+                        } else {
+                            0
+                        }
+                }
+                _ => self.main.read32(off),
+            }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.writes.borrow_mut().push((off, value));
+            match off {
+                PICA => self.pica.set(value & (1 << 31)),
+                TC2_BUF => self
+                    .buf
+                    .set(value & (TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP)),
+                TC2_AUX => self.aux.set(value & (1 << 19)),
+                TC2_DDI => self.ddi.set(value & ((1 << 29) | (1 << 31))),
+                _ => self.main.write32(off, value),
+            }
+        }
+    }
+
+    fn smoke_nvl_tc2_port_lease_holds_dependencies_until_safe() -> TestResult {
+        let plan = NovaResourcePlan::new(LtPort::Tc2, Pipe::D, NovaOutput::UsbCDpAlt).unwrap();
+        let io = Tc2PortFake::connected();
+        let mut lease = NovaPortLease::new(&io, plan);
+        if !matches!(
+            lease.prepare(2),
+            Ok(Some(TcConnection {
+                max_lanes: 2,
+                pin_assignment: 4,
+                ..
+            }))
+        ) || lease.enable_d2d().is_err()
+        {
+            return TestResult::Fail("TC2 pin D should prepare and enable D2D separately");
+        }
+        let acquisition = [
+            (PWR_WELL_CTL2, 1 << 1),
+            (PWR_WELL_CTL2, (1 << 1) | (1 << 3) | 1),
+            (
+                PWR_WELL_CTL2,
+                (1 << 17) | (1 << 3) | (1 << 2) | (1 << 1) | 1,
+            ),
+            (PICA, 1 << 31),
+            (TC2_BUF, PORT_BUF_PHY_IDLE | TCSS_POWER_REQUEST),
+            (
+                TC2_BUF,
+                PORT_BUF_PHY_IDLE | TCSS_POWER_REQUEST | TCSS_POWER_STATE | TC_PHY_OWNERSHIP,
+            ),
+            (TC2_AUX, 1 << 19),
+            (TC2_DDI, 1 << 29),
+        ];
+        if io.writes.borrow().as_slice() != acquisition {
+            return TestResult::Fail(
+                "TC2 preparation must order main wells, PICA, TCSS, AUX and D2D",
+            );
+        }
+        io.ddi.set(io.ddi.get() | DDI_BUF_CTL_ENABLE);
+        if lease.disable_d2d() != Err(NovaResourceError::PortBusy)
+            || lease.release() != Err(NovaResourceError::LeaseState)
+            || io.writes.borrow().len() != acquisition.len()
+        {
+            return TestResult::Fail("a live DDI must retain D2D and all prerequisites");
+        }
+        io.ddi.set(io.ddi.get() & !DDI_BUF_CTL_ENABLE);
+        io.stuck_aux_status.set(true);
+        if lease.disable_d2d().is_err()
+            || lease.release() != Err(NovaResourceError::Aux(TcError::AuxPowerTimeout))
+            || io.pica.get() == 0
+            || io.buf.get() & TC_PHY_OWNERSHIP == 0
+            || io.main.driver.get() == 0
+        {
+            return TestResult::Fail("a stuck AUX release must retain Type-C and main wells");
+        }
+        io.stuck_aux_status.set(false);
+        if lease.release().is_err()
+            || io.pica.get() != 0
+            || io.aux.get() != 0
+            || io.buf.get() != 0
+            || io.ddi.get() != 0
+            || io.main.driver.get() != 0
+        {
+            return TestResult::Fail("retry must release every remaining dependency");
+        }
+
+        io.writes.borrow_mut().clear();
+        if lease.prepare(4)
+            != Err(NovaPrepareError {
+                cause: NovaResourceError::TypeC(TcError::InsufficientLanes {
+                    max: 2,
+                    required: 4,
+                }),
+                rollback: None,
+            })
+            || io.buf.get() != 0
+            || io.pica.get() != 0
+            || io.main.driver.get() != 0
+            || io
+                .writes
+                .borrow()
+                .iter()
+                .any(|(off, _)| matches!(*off, TC2_AUX | TC2_DDI))
+        {
+            return TestResult::Fail(
+                "insufficient lanes must unwind TCSS before touching AUX or D2D",
+            );
+        }
+
+        io.hpd.set(1 << 1); // TC2 Thunderbolt live, without DP-alt.
+        io.writes.borrow_mut().clear();
+        if lease.prepare(2)
+            != Err(NovaPrepareError {
+                cause: NovaResourceError::TypeC(TcError::DpAltUnavailable),
+                rollback: None,
+            })
+            || io
+                .writes
+                .borrow()
+                .iter()
+                .any(|(off, _)| *off != PWR_WELL_CTL2)
+        {
+            return TestResult::Fail("fabric-only HPD must never take local Type-C ownership");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_nvl_resources",
+        smoke_nvl_tc2_port_lease_holds_dependencies_until_safe
+    );
+
     struct D2dFake {
         reg: u64,
         value: Cell<u32>,
@@ -629,10 +972,10 @@ mod kernel_tests {
             Err(_) => return TestResult::Fail("Nova TC2/Pipe-D plan must be admitted"),
         };
         let io = MainWellFake::new(true);
-        let lease = match plan.acquire_main_wells(&io) {
-            Ok(lease) => lease,
-            Err(_) => return TestResult::Fail("Nova main wells must grant in source order"),
-        };
+        let mut lease = NovaMainWellLease::default();
+        if plan.acquire_main_wells(&io, &mut lease).is_err() {
+            return TestResult::Fail("Nova main wells must grant in source order");
+        }
         let all = well_request(PW_1_INDEX)
             | well_request(PW_2_INDEX)
             | well_request(pipe_well_index(Pipe::D));
@@ -656,10 +999,9 @@ mod kernel_tests {
             Ok(plan) => plan,
             Err(_) => return TestResult::Fail("Nova panel plan must be admitted"),
         };
-        let lease = match panel.acquire_main_wells(&shared) {
-            Ok(lease) => lease,
-            Err(_) => return TestResult::Fail("pre-owned PW1 must satisfy the panel plan"),
-        };
+        if panel.acquire_main_wells(&shared, &mut lease).is_err() {
+            return TestResult::Fail("pre-owned PW1 must satisfy the panel plan");
+        }
         if lease.owned_request_mask() != well_request(pipe_well_index(Pipe::A))
             || lease.release(&shared).is_err()
             || shared.driver.get() != well_request(PW_1_INDEX)
@@ -668,10 +1010,9 @@ mod kernel_tests {
         }
 
         let foreign = MainWellFake::new(true);
-        let lease = match panel.acquire_main_wells(&foreign) {
-            Ok(lease) => lease,
-            Err(_) => return TestResult::Fail("Nova panel wells must grant"),
-        };
+        if panel.acquire_main_wells(&foreign, &mut lease).is_err() {
+            return TestResult::Fail("Nova panel wells must grant");
+        }
         foreign.bios.set(well_request(pipe_well_index(Pipe::A)));
         if lease.release(&foreign).is_err()
             || foreign.driver.get() != 0
@@ -684,7 +1025,9 @@ mod kernel_tests {
         stuck
             .acknowledged_requests
             .set(stuck.acknowledged_requests.get() & !well_request(PW_2_INDEX));
-        if plan.acquire_main_wells(&stuck) != Err(NovaResourceError::PowerWellTimeout(PW_2_INDEX))
+        if plan.acquire_main_wells(&stuck, &mut lease)
+            != Err(NovaResourceError::PowerWellTimeout(PW_2_INDEX))
+            || lease.release(&stuck).is_err()
             || stuck.driver.get() != 0
             || stuck
                 .writes
@@ -699,15 +1042,16 @@ mod kernel_tests {
         unfused
             .fuse_status
             .set(unfused.fuse_status.get() & !fuse_status_mask(PW_2_INDEX));
-        if plan.acquire_main_wells(&unfused)
+        if plan.acquire_main_wells(&unfused, &mut lease)
             != Err(NovaResourceError::PowerGateFuseTimeout(PW_2_INDEX + 1))
+            || lease.release(&unfused).is_err()
             || unfused.driver.get() != 0
         {
             return TestResult::Fail("a missing Nova gate fuse must fail closed and roll back");
         }
 
         let crossed = MainWellFake::new(false);
-        if plan.acquire_main_wells(&crossed) != Err(NovaResourceError::ProfileMismatch)
+        if plan.acquire_main_wells(&crossed, &mut lease) != Err(NovaResourceError::ProfileMismatch)
             || !crossed.writes.borrow().is_empty()
         {
             return TestResult::Fail("Nova wells must refuse a non-LT view before MMIO");

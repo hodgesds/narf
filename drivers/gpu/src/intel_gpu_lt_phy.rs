@@ -126,8 +126,8 @@ impl LtPort {
     /// `XE3PLPD_PORT_BUF_CTL5(port)`.
     pub(crate) const fn buf_ctl5(self) -> u64 {
         match self {
-            Self::A => 0x64_038,
-            Self::B => 0x64_138,
+            Self::A => 0x16_fa34,
+            Self::B => 0x16_fc34,
             Self::Tc1 => 0x16_f234,
             Self::Tc2 => 0x16_f434,
         }
@@ -136,8 +136,8 @@ impl LtPort {
     /// `XE3PLPD_PORT_P2M_MSGBUS_STATUS_P2P(port, lane)`.
     pub(crate) const fn p2m_status_p2p(self, lane: u8) -> Option<u64> {
         let base = match self {
-            Self::A => 0x64_0a0,
-            Self::B => 0x64_1a0,
+            Self::A => 0x16_faa0,
+            Self::B => 0x16_fca0,
             Self::Tc1 => 0x16_f2a0,
             Self::Tc2 => 0x16_f4a0,
         };
@@ -148,7 +148,11 @@ impl LtPort {
     }
 
     pub(crate) const fn aux_ctl(self) -> u64 {
-        self.xelpg().aux_ctl()
+        lt_port_reg(self.xelpg().aux_ctl())
+    }
+
+    pub(crate) const fn buf_ctl1(self) -> u64 {
+        lt_port_reg(self.xelpg().buf_ctl1())
     }
 
     pub(crate) const fn xelpg(self) -> XeLpgPort {
@@ -158,6 +162,32 @@ impl LtPort {
             Self::Tc1 => XeLpgPort::Tc1,
             Self::Tc2 => XeLpgPort::Tc2,
         }
+    }
+}
+
+/// Resolve the shared PHY and AUX offsets through the Display >=20 PICA map.
+/// DDI control and frequency registers retain their original offsets.
+const fn lt_port_reg(off: u64) -> u64 {
+    match crate::intel_gpu_xe3lpd::pica_port_reg(off) {
+        Some(reg) => reg,
+        None => off,
+    }
+}
+
+pub(crate) struct LtPortView<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for LtPortView<'_, M> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn has_lt_phy(&self) -> bool {
+        self.0.has_lt_phy()
+    }
+    fn read32(&self, off: u64) -> u32 {
+        self.0.read32(lt_port_reg(off))
+    }
+    fn write32(&self, off: u64, value: u32) {
+        self.0.write32(lt_port_reg(off), value);
     }
 }
 
@@ -1170,7 +1200,7 @@ struct LtEnablePlan<'a> {
 /// Nova Lake LT-PHY message-bus transport. Construction is family-qualified but
 /// this type is not reachable from any display route.
 pub(crate) struct LtPhy<'a, M: MmioWindow + ?Sized> {
-    mmio: &'a M,
+    mmio: LtPortView<'a, M>,
     port: LtPort,
     lanes: PhyLaneConfig,
     dp_alt: bool,
@@ -1199,12 +1229,12 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         // Linux gates LT PHY on `platform.novalake`, not display version.
         // A Panther/Wildcat Lake C20 window must never receive these
         // same-looking Cx0 transactions.
-        if !mmio.has_lt_phy() {
+        if !mmio.has_lt_phy() || mmio.cx0_xe3() {
             return Err(Cx0Error::ProtocolMismatch);
         }
         let lanes = PhyLaneConfig::for_route(dp_alt, max_lanes, reversed)?;
         Ok(Self {
-            mmio,
+            mmio: LtPortView(mmio),
             port,
             lanes,
             dp_alt,
@@ -1212,8 +1242,8 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         })
     }
 
-    fn cx0(&self) -> Cx0Phy<'_, M> {
-        Cx0Phy::with_lanes(self.mmio, self.port.xelpg(), self.lanes)
+    fn cx0(&self) -> Cx0Phy<'_, LtPortView<'a, M>> {
+        Cx0Phy::with_lanes(&self.mmio, self.port.xelpg(), self.lanes)
     }
 
     fn m2p_ctl(&self, lane: u8) -> u64 {
@@ -1544,8 +1574,8 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
     }
 
     /// Run Linux's Nova Lake LT-PHY DP PLL enable order. The caller must already
-    /// own DC-off, the Type-C PHY and the D2D/AUX power wells; no production
-    /// route currently establishes those preconditions.
+    /// hold DC-off, the display wells, AUX and any required Type-C ownership.
+    /// D2D is enabled later when preparing the DDI for link training.
     pub(crate) fn enable_dp(&self, request: LtDpEnable) -> Result<(), Cx0Error> {
         if !matches!(request.lane_count, 1 | 2 | 4) || request.lane_count > self.max_lanes {
             return Err(Cx0Error::ProtocolMismatch);
@@ -1715,8 +1745,8 @@ mod tests {
             let mut regs = BTreeMap::new();
             // The disabled LT PHY enters with both lanes held in pipe reset
             // and the corresponding current-status bits asserted.
-            regs.insert(0x64_008, 0xf000_0000);
-            regs.insert(0x64_108, 0xf000_0000);
+            regs.insert(0x16_fa04, 0xf000_0000);
+            regs.insert(0x16_fc04, 0xf000_0000);
             regs.insert(0x16_f204, 0xf000_0000);
             regs.insert(0x16_f404, 0xf000_0000);
             Self {
@@ -1868,8 +1898,8 @@ mod tests {
     impl FakeLtMmio {
         fn ctl_lane(off: u64) -> Option<(LtPort, u8)> {
             for (port, base) in [
-                (LtPort::A, 0x64_040),
-                (LtPort::B, 0x64_140),
+                (LtPort::A, 0x16_fa40),
+                (LtPort::B, 0x16_fc40),
                 (LtPort::Tc1, 0x16_f240),
                 (LtPort::Tc2, 0x16_f440),
             ] {
@@ -1886,10 +1916,10 @@ mod tests {
         fn ordinary_status(off: u64) -> bool {
             matches!(
                 off,
-                0x64_048
-                    | 0x64_04c
-                    | 0x64_148
-                    | 0x64_14c
+                0x16_fa48
+                    | 0x16_fa4c
+                    | 0x16_fc48
+                    | 0x16_fc4c
                     | 0x16_f248
                     | 0x16_f24c
                     | 0x16_f448
@@ -1900,10 +1930,10 @@ mod tests {
         fn p2p_status(off: u64) -> bool {
             matches!(
                 off,
-                0x64_0a0
-                    | 0x64_0a4
-                    | 0x64_1a0
-                    | 0x64_1a4
+                0x16_faa0
+                    | 0x16_faa4
+                    | 0x16_fca0
+                    | 0x16_fca4
                     | 0x16_f2a0
                     | 0x16_f2a4
                     | 0x16_f4a0
@@ -1917,10 +1947,6 @@ mod tests {
             true
         }
 
-        fn cx0_xe3(&self) -> bool {
-            true
-        }
-
         fn has_lt_phy(&self) -> bool {
             self.lt_phy
         }
@@ -1930,7 +1956,7 @@ mod tests {
         }
 
         fn write32(&self, off: u64, value: u32) {
-            if matches!(off, 0x64_0e0 | 0x64_1e0 | 0x16_f260 | 0x16_f460) {
+            if matches!(off, 0x16_fa60 | 0x16_fc60 | 0x16_f260 | 0x16_f460) {
                 let mut next = value;
                 if value & lane_pclk_pll_request(0) != 0 {
                     next |= lane_pclk_pll_ack(0);
@@ -1940,7 +1966,7 @@ mod tests {
                 self.regs.borrow_mut().insert(off, next);
                 return;
             }
-            if matches!(off, 0x64_008 | 0x64_108 | 0x16_f204 | 0x16_f404) {
+            if matches!(off, 0x16_fa04 | 0x16_fc04 | 0x16_f204 | 0x16_f404) {
                 let old = self.read32(off);
                 let reset_mask = lane_pipe_reset(0) | lane_pipe_reset(1);
                 let status_mask = lane_phy_current_status(0) | lane_phy_current_status(1);
@@ -1992,8 +2018,8 @@ mod tests {
             self.vdr.borrow_mut().insert((lane, address), data);
             if address == LT_PHY_RATE_UPDATE && data & LT_PHY_RATE_CONTROL_VDR_UPDATE == 0 {
                 let buf_ctl2 = match port {
-                    LtPort::A => 0x64_008,
-                    LtPort::B => 0x64_108,
+                    LtPort::A => 0x16_fa04,
+                    LtPort::B => 0x16_fc04,
                     LtPort::Tc1 => 0x16_f204,
                     LtPort::Tc2 => 0x16_f404,
                 };
@@ -2029,8 +2055,12 @@ mod tests {
         assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc1), Some(LtPort::Tc1));
         assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc2), Some(LtPort::Tc2));
         assert_eq!(LtPort::from_xelpg(XeLpgPort::Tc3), None);
-        assert_eq!(LtPort::A.buf_ctl5(), 0x64_038);
-        assert_eq!(LtPort::B.p2m_status_p2p(1), Some(0x64_1a4));
+        assert_eq!(LtPort::A.buf_ctl5(), 0x16_fa34);
+        assert_eq!(LtPort::B.p2m_status_p2p(1), Some(0x16_fca4));
+        assert_eq!(LtPort::A.aux_ctl(), 0x16_fa10);
+        assert_eq!(LtPort::B.aux_ctl(), 0x16_fc10);
+        assert_eq!(lt_port_reg(0x64_000), 0x64_000);
+        assert_eq!(lt_port_reg(0x64_130), 0x64_130);
         assert_eq!(LtPort::Tc1.buf_ctl5(), 0x16_f234);
         assert_eq!(LtPort::Tc2.p2m_status_p2p(1), Some(0x16_f4a4));
         assert_eq!(LtPort::Tc2.p2m_status_p2p(2), None);
@@ -2418,8 +2448,8 @@ mod tests {
         let combo = FakeLtMmio::default();
         let combo_phy = LtPhy::new(&combo, LtPort::A, false, 4, false).unwrap();
         combo_phy.program_transmitters(4, false).unwrap();
-        assert_eq!(combo.read32(0x64_0a0) & P2M_RESPONSE_READY, 0);
-        assert_eq!(combo.read32(0x64_0a4) & P2M_RESPONSE_READY, 0);
+        assert_eq!(combo.read32(0x16_faa0) & P2M_RESPONSE_READY, 0);
+        assert_eq!(combo.read32(0x16_faa4) & P2M_RESPONSE_READY, 0);
         TestResult::Pass
     }
     kernel_test_in!(

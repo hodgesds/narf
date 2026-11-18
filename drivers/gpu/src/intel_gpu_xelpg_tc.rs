@@ -166,6 +166,10 @@ pub enum TcError {
     AuxBusy,
     /// An LT-PHY AUX power-status transition missed its source timeout.
     AuxPowerTimeout,
+    /// The Nova DP-alt path found an existing PICA or TCSS owner.
+    PortBusy,
+    /// The port does not report live native DP alternate mode.
+    DpAltUnavailable,
 }
 
 /// Exact display-family policy for the shared Xe-LPDP Type-C owner.
@@ -502,6 +506,122 @@ fn take_ownership<M: MmioWindow + ?Sized>(
     }
 }
 
+/// Exclusive, retryable Type-C handoff for the disconnected Nova owner.
+/// Record each request before waiting for its completion so a failed wait
+/// does not lose cleanup authority.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) enum NovaDpAltLease {
+    #[default]
+    Idle,
+    Pica,
+    Tcss,
+    Phy,
+}
+
+impl NovaDpAltLease {
+    pub(crate) fn acquire(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        port: XeLpgPort,
+        required_lanes: u8,
+    ) -> Result<TcConnection, TcError> {
+        use crate::intel_gpu_xe2lpd::{
+            pica_enable, PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL,
+        };
+
+        let profile = TcDisplayProfile::NovaLakeS;
+        profile.validate(io)?;
+        let tc = port
+            .tc_index()
+            .filter(|tc| *tc < 2)
+            .ok_or(TcError::NotTypeC)?;
+        if *self != Self::Idle
+            || read_checked(io, PICA_PW_CTL)? & (PICA_POWER_REQUEST | PICA_POWER_STATUS) != 0
+        {
+            return Err(TcError::PortBusy);
+        }
+        if TcMode::from_live_mask(live_status_mask(io, tc, false)?) != TcMode::DpAlt {
+            return Err(TcError::DpAltUnavailable);
+        }
+        *self = Self::Pica;
+        pica_enable(io).map_err(|_| TcError::TcssPowerTimeout)?;
+        if read_checked(io, port.buf_ctl1())?
+            & (TCSS_POWER_REQUEST | TCSS_POWER_STATE | TC_PHY_OWNERSHIP)
+            != 0
+        {
+            return Err(TcError::PortBusy);
+        }
+        *self = Self::Tcss;
+        set_tcss_power_request(io, port, true, profile)?;
+        if !poll_until(io, PHY_READY_TIMEOUT_NS, || phy_is_ready(io, tc))? {
+            return Err(TcError::PhyNotReady);
+        }
+        if !wait_tcss_power(io, port, true)? {
+            return Err(TcError::TcssPowerTimeout);
+        }
+        *self = Self::Phy;
+        take_ownership(io, port, true)?;
+        verify_connection(io, port, tc, false, TcMode::DpAlt, required_lanes, profile)
+    }
+
+    pub(crate) fn release(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        port: XeLpgPort,
+    ) -> Result<(), TcError> {
+        let profile = TcDisplayProfile::NovaLakeS;
+        profile.validate(io)?;
+        let tc = port.tc_index().ok_or(TcError::NotTypeC)?;
+        if *self == Self::Phy {
+            take_ownership(io, port, false)?;
+            *self = Self::Tcss;
+        }
+        if *self == Self::Tcss {
+            enable_tcss_power(io, port, tc, false, TcMode::DpAlt, profile)?;
+            *self = Self::Pica;
+        }
+        if *self == Self::Pica {
+            read_checked(io, crate::intel_gpu_xe2lpd::PICA_PW_CTL)?;
+            crate::intel_gpu_xe2lpd::pica_disable(io).map_err(|_| TcError::TcssPowerTimeout)?;
+            *self = Self::Idle;
+        }
+        Ok(())
+    }
+}
+
+fn verify_connection(
+    io: &(impl MmioWindow + ?Sized),
+    port: XeLpgPort,
+    tc: u8,
+    legacy_port: bool,
+    mode: TcMode,
+    required_lanes: u8,
+    profile: TcDisplayProfile,
+) -> Result<TcConnection, TcError> {
+    let pin_assignment = pin_assignment_for(io, tc, profile)?;
+    let max_lanes = max_lane_count(mode, pin_assignment);
+    if mode == TcMode::DpAlt {
+        if live_status_mask(io, tc, legacy_port)? & TcMode::DpAlt.bit() == 0 {
+            return Err(TcError::SuddenDisconnect);
+        }
+        if max_lanes < required_lanes {
+            return Err(TcError::InsufficientLanes {
+                max: max_lanes,
+                required: required_lanes,
+            });
+        }
+    }
+    Ok(TcConnection {
+        port,
+        tc,
+        mode,
+        legacy_port,
+        pin_assignment,
+        max_lanes,
+        profile,
+    })
+}
+
 /// `xelpdp_tc_phy_connect` for one target mode.
 fn connect_mode<M: MmioWindow + ?Sized>(
     io: &M,
@@ -547,31 +667,7 @@ fn connect_mode<M: MmioWindow + ?Sized>(
         }
         return Err(e);
     }
-    let checked = (|| {
-        let pin = pin_assignment_for(io, tc, profile)?;
-        let max_lanes = max_lane_count(mode, pin);
-        // `tc_phy_verify_legacy_or_dp_alt_mode`.
-        if mode == TcMode::DpAlt {
-            if live_status_mask(io, tc, legacy_port)? & TcMode::DpAlt.bit() == 0 {
-                return Err(TcError::SuddenDisconnect);
-            }
-            if max_lanes < required_lanes {
-                return Err(TcError::InsufficientLanes {
-                    max: max_lanes,
-                    required: required_lanes,
-                });
-            }
-        }
-        Ok(TcConnection {
-            port,
-            tc,
-            mode,
-            legacy_port,
-            pin_assignment: pin,
-            max_lanes,
-            profile,
-        })
-    })();
+    let checked = verify_connection(io, port, tc, legacy_port, mode, required_lanes, profile);
     match checked {
         Ok(conn) => Ok(conn),
         Err(e) => {

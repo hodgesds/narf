@@ -476,12 +476,26 @@ through the Display >=20 `DDI_BUF_CTL` enable/state bits with 100-us bounds.
 It requires the exact LT-PHY MMIO fact before the first access and does not
 construct an operational `DisplayIp` or enable a route.
 Its main-well lease requests PW1, optional PW2 and the selected PW_A--D in
-dependency order, rolls back partial grants, and releases in reverse order.
+dependency order and retains partial grants for reverse-order release.
 Only DRIVER requests absent on entry belong to the token; BIOS, KVMR and debug
 requesters are observed before waiting for a released state to clear. Every
 state and fuse-distribution wait is bounded at 1 ms; NARF fails a missing fuse
 closed where Linux logs a warning. A non-LT view refuses before MMIO. The lease
 remains disconnected from the live resource refcount.
+`NovaPortLease` prepares one dark DDI while its caller holds DC-off and
+serializes access to the port and PICA. It orders main wells, native
+DP-alt Type-C ownership when applicable, and LT AUX for DP/eDP. USB-C
+preparation returns the exact pin assignment and lane ceiling and refuses
+fabric-only HPD and pre-existing PICA/TCSS ownership. D2D is a separate
+step after PLL setup. It is released after DDI disable and PHY-idle proof.
+After PHY PLL retirement, release unwinds AUX, Type-C and the main wells.
+Acquisition failure rolls back in reverse dependency order. A failed release
+retains the remaining requests and their dependencies for retry in the same
+lease. The owner remains disconnected from production display routing.
+On Display 35, LT PHY and AUX use the PICA ranges at `0x16fa00` and
+`0x16fc00` for combo ports A and B, including the LT-specific BUF_CTL5
+and P2P response registers. DDI buffer control and clock value/frequency
+retain their original per-DDI addresses.
 The eDP table is also disconnected: it selects exact PLL images but neither
 programs them nor grants the read-only route modeset authority. Its ten-entry
 transmitter table is retained separately from external DP 1.4 and can be
