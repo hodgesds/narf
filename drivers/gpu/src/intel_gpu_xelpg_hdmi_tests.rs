@@ -267,7 +267,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         sink: SinkScdc::default(),
         link: TmdsLink::default(),
         ddc: PinPair::Pin2Bxt,
-        edid: [0; crate::intel_gpu_hdmi::EDID_CAPACITY],
+        edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
 }

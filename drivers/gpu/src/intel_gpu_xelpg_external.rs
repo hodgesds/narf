@@ -712,7 +712,7 @@ pub struct MtlSinkProbe {
     /// no-VBT preference, which is on; the service applies its policy).
     pub ssc: bool,
     /// Complete EDID bytes (`edid_len` valid).
-    pub edid: [u8; EDID_CAPACITY],
+    pub edid: alloc::boxed::Box<[u8; EDID_CAPACITY]>,
     /// Valid EDID length.
     pub edid_len: usize,
     /// The DSC configuration when the stream needs compression; the
@@ -899,9 +899,9 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     let mut aux = link.aux(io);
     let caps = DpcdCaps::decode(&raw);
     let max_downspread = raw[DP_MAX_DOWNSPREAD];
-    let mut edid = [0u8; EDID_CAPACITY];
+    let mut edid = alloc::boxed::Box::new([0u8; EDID_CAPACITY]);
     let edid_len =
-        read_full_edid(&mut aux, &mut edid).map_err(|e| rollback(ExternalError::Edid(e)))?;
+        read_full_edid(&mut aux, edid.as_mut_slice()).map_err(|e| rollback(ExternalError::Edid(e)))?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len]).map_err(|e| {
         rollback(match e {
             crate::intel_gpu_dp::DpError::Edid(e) => ExternalError::Edid(e),

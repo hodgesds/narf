@@ -115,7 +115,7 @@ fn smoke_xelpg_pipes_external_enable_and_release_with_panel_lit() -> TestResult 
     assert_eq!(hw.get(0x71188), 5120 / 64);
     assert_eq!(hw.get(0x71190), (719 << 16) | 1279);
     assert_eq!(hw.get(0x711ac), 0x0200_0000);
-    let ab = *pipes.state().unwrap();
+    let ab = pipes.state().unwrap();
     for (r, v) in ab.pipe_registers(1, false).unwrap() {
         assert_eq!(hw.get(r), v, "external resources {r:#x}");
     }
@@ -460,7 +460,7 @@ fn smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip() -> TestResul
     let Some(layout) = published_layout() else {
         return TestResult::Fail("the reservation must publish the layout");
     };
-    if Some(&layout.state) != pipes.state()
+    if Some(layout.state.as_ref()) != pipes.state()
         || layout.surfaces != [None, Some(0x0200_0000), None, None]
     {
         return TestResult::Fail("the published layout must be the programmed one");

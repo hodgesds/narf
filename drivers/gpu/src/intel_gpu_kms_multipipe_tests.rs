@@ -74,7 +74,7 @@ pub(super) fn beside_external(
         platform.set(r, v);
     }
     publish_layout_for_test(Some(Layout {
-        state,
+        state: state.clone().into(),
         surfaces: [None, Some(EXT_SURFACE), None, None],
     }));
     (timing, state)
@@ -249,7 +249,7 @@ fn layouts(
 fn add_external(platform: &MockPlatform, single: &res::State, multi: &res::State) {
     crate::intel_gpu_xelpg_live::commit_live(platform, single, multi, 1).unwrap();
     publish_layout_for_test(Some(Layout {
-        state: *multi,
+        state: multi.clone().into(),
         surfaces: [None, Some(EXT_SURFACE), None, None],
     }));
     for (r, v) in [

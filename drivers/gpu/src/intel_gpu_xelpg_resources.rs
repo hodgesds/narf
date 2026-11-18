@@ -102,7 +102,7 @@ pub(crate) struct Request {
 }
 
 /// Computed resource state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct State {
     pub(crate) dbuf: Dbuf,
     pub(crate) cdclk: Rung,
@@ -263,7 +263,7 @@ pub(crate) fn compute_ip_vblank(
         }
     }
     let num_active = active.count_ones();
-    let mut inputs: [Option<PipeInput>; PIPES] = [None; PIPES];
+    let mut inputs = alloc::boxed::Box::new([None; PIPES]);
     let mut min_cdclk = request.min_cdclk_khz;
     let mut min_voltage = 0u8;
     let mut max_port = 0u32;
@@ -584,22 +584,27 @@ impl State {
             .and_then(|p| p.planes[0].as_mut())
             .ok_or(ResourceError::Unsupported)?;
         if plane.tiling == tiling {
-            return Ok(*self);
+            return Ok(self.clone());
         }
         plane.tiling = tiling;
         let fresh = compute_ip_vblank(self.ip, &request, latency, self.vblank_start)?;
         if fresh.dbuf.active_pipes != self.dbuf.active_pipes
             || fresh.dbuf.joined != self.dbuf.joined
             || fresh.dbuf.slices != self.dbuf.slices
-            || fresh.dbuf.pipes.iter().zip(&self.dbuf.pipes).any(|(a, b)| {
-                a.absolute != b.absolute || a.planes != b.planes || a.cursor != b.cursor
-            })
+            || fresh
+                .dbuf
+                .pipes
+                .iter()
+                .zip(self.dbuf.pipes.iter())
+                .any(|(a, b)| {
+                    a.absolute != b.absolute || a.planes != b.planes || a.cursor != b.cursor
+                })
         {
             return Err(ResourceError::Diverged);
         }
-        let mut out = *self;
+        let mut out = self.clone();
         out.requests = fresh.requests;
-        out.dbuf.pipes[pipe].wm[0] = fresh.dbuf.pipes[pipe].wm[0];
+        alloc::sync::Arc::make_mut(&mut out.dbuf.pipes)[pipe].wm[0] = fresh.dbuf.pipes[pipe].wm[0];
         if out.plane_registers().is_none() {
             return Err(ResourceError::Unsupported);
         }

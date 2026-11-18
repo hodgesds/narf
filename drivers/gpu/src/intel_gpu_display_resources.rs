@@ -449,7 +449,7 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
         dsc: Option<DscTerm>,
-    ) -> Result<(Self, Option<Box<Layout>>, DisplayIp), FsError> {
+    ) -> Result<(Self, Option<Layout>, DisplayIp), FsError> {
         let ip = display_ip(io)?.ok_or(FsError::Unsupported)?;
         match Self::capture_single(io, ip, mode, dsc) {
             Ok(profile) => return Ok((profile, None, ip)),
@@ -463,7 +463,7 @@ impl Profile {
         }
         Ok((
             Self::capture_multi(io, mode, &layout, dsc)?,
-            Some(Box::new(layout)),
+            Some(layout),
             ip,
         ))
     }
@@ -638,7 +638,7 @@ impl Profile {
             _ => return Err(FsError::Unsupported),
         };
         if let Some(tiling) = tiling {
-            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_deref(), dsc)?;
+            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_ref(), dsc)?;
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
@@ -783,7 +783,7 @@ impl Primary {
             return Err(FsError::Unsupported);
         }
         let tile4 =
-            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_deref(), dsc)?;
+            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
         Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.

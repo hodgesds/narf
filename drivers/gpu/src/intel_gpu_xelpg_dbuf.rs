@@ -190,13 +190,14 @@ pub(crate) struct PipeAlloc {
 }
 
 /// The global DBUF state (`struct intel_dbuf_state`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Dbuf {
     pub(crate) active_pipes: u8,
     pub(crate) joined: bool,
     pub(crate) slices: [u8; PIPES],
     pub(crate) enabled_slices: u8,
-    pub(crate) pipes: [PipeAlloc; PIPES],
+    // Live transitions can change MBUS joining while retaining the same plane allocations.
+    pub(crate) pipes: alloc::sync::Arc<[PipeAlloc; PIPES]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,7 +327,8 @@ pub(crate) fn compute(pipes: &[Option<PipeInput>; PIPES]) -> Result<Dbuf, DdbErr
         *slices = dbuf_slices(pipe, active_pipes, joined);
     }
     out.enabled_slices = out.slices.iter().fold(S1, |m, s| m | s);
-    let weight = |p: usize| pipes[p].map_or(0u32, |p| u32::from(p.hdisplay));
+    let allocations = alloc::sync::Arc::get_mut(&mut out.pipes).expect("new DBUF state");
+    let weight = |p: usize| pipes[p].as_ref().map_or(0u32, |p| u32::from(p.hdisplay));
     for (pipe, input) in pipes.iter().enumerate() {
         let Some(input) = input else { continue };
         let mask = out.slices[pipe];
@@ -359,7 +361,7 @@ pub(crate) fn compute(pipes: &[Option<PipeInput>; PIPES]) -> Result<Dbuf, DdbErr
             start: offset + ddb.start,
             end: offset + ddb.end,
         };
-        out.pipes[pipe] = alloc;
+        allocations[pipe] = alloc;
     }
     for (a, first) in out.pipes.iter().enumerate() {
         if out.pipes[a + 1..]

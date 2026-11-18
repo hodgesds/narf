@@ -394,7 +394,7 @@ fn wait_frame(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<(), Resour
 }
 
 fn with_joined(state: &State, joined: bool) -> State {
-    let mut state = *state;
+    let mut state = state.clone();
     state.dbuf.joined = joined;
     state
 }

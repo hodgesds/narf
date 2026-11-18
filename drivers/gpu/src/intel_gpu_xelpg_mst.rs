@@ -228,7 +228,7 @@ impl MtlMstRoute {
                 negotiated,
                 max_downspread: self.link.raw[DP_MAX_DOWNSPREAD],
                 ssc: false,
-                edid: [0; EDID_CAPACITY],
+                edid: Box::new([0; EDID_CAPACITY]),
                 edid_len: 128,
                 dsc: None,
                 pipe_bpp: 24,

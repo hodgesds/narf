@@ -216,7 +216,9 @@ pipe through the Pipe B–D owner (live resource transaction with the panel lit,
 PM demand at the route's port clock) and releases it on stop;
 `MtlExternalRoute::pipe()`/`reserved()` report it.
 `MtlExternalRoute::stop`/`release`/`link_ok` and `MtlExternalService::handle`
-complete the lifecycle. `service_mtl_external(io, generation, display, alloc)`
+complete the lifecycle. The DP and HDMI probes own their 512-byte EDID buffers
+as `Box<[u8; 512]>`, with `edid_len` giving the number of valid bytes.
+`service_mtl_external(io, generation, display, alloc)`
 polls the process-wide hotplug owner once and returns a `ServiceOutcome`
 (Activated with the pipe, mode and framebuffer to publish, Refused, Withdrawn,
 Retained or Unchanged). `teardown_mtl_external` runs from the KMS suspend and

@@ -54,7 +54,7 @@ use crate::intel_gpu_xelpg_resources::{
     self as res, checked, read, PipeRequest, PlaneRequest, ResourceError, State, PLANES,
 };
 use crate::intel_gpu_xelpg_wm::Tiling;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 /// `PIPE_FRMCOUNT_G4X` relative to the pipe block.
 const FRMCOUNT_OFFSET: u64 = 0x40;
@@ -239,13 +239,13 @@ fn wait_conf(io: &(impl MmioWindow + ?Sized), pipe: Pipe, on: bool) -> Result<()
 /// Pipe B–D is reserved; absent means the owned single-pipe layout (or
 /// nothing) is programmed. It is a description, never a proof: every
 /// reader still verifies the hardware against it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     /// The programmed state. Pipe A's primary watermarks are those of the
     /// tiling it scanned out when the owner last transitioned; its cursor
     /// watermarks, every DDB entry and the globals are the linear-baseline
     /// computation, as the KMS owner programs them.
-    pub(crate) state: State,
+    pub(crate) state: Arc<State>,
     /// The GGTT scanout surface of each reserved Pipe B–D primary.
     pub(crate) surfaces: [Option<u32>; 4],
 }
@@ -256,20 +256,27 @@ static LAYOUT: narf_lib::sync::IrqSafeSpinLock<Option<Layout>> =
 
 /// The layout the Pipe B–D owner last programmed (see [`Layout`]).
 pub(crate) fn published_layout() -> Option<Layout> {
-    *LAYOUT.lock()
+    LAYOUT.lock().clone()
+}
+
+fn publish_layout(layout: Option<Layout>) {
+    // The last reader can release the previous DBUF allocation here.
+    // Drop the displaced snapshot after the publication lock is released.
+    let previous = core::mem::replace(&mut *LAYOUT.lock(), layout);
+    drop(previous);
 }
 
 /// Fixtures start from the single-pipe description.
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn reset_published_layout() {
-    *LAYOUT.lock() = None;
+    publish_layout(None);
 }
 
 /// Publish `layout` as programmed (fixtures that program a multi-pipe
 /// register image directly).
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn publish_layout_for_test(layout: Option<Layout>) {
-    *LAYOUT.lock() = layout;
+    publish_layout(layout);
 }
 
 /// The owner's Pipe-A primary tiling read from `PLANE_CTL` (the KMS owner
@@ -290,13 +297,13 @@ fn panel_tiling(io: &(impl MmioWindow + ?Sized)) -> Result<Tiling, PipeEnableErr
 pub(crate) struct Pipes {
     // Keep route, choice and cloned-owner values small while nested planners
     // use their scratch space on the 64 KiB ARM bootstrap stack.
-    state: Option<Box<State>>,
+    state: Option<Arc<State>>,
     ip: DisplayIp,
     /// Adjusted vblank start used by display-30 watermark admission. It is
     /// `vtotal - fixed-refresh VRR-TG guardband` for each owned pipe.
     vblank_start: [Option<u16>; 4],
     lit: u8,
-    reserved: [Option<ExternalPipe>; 4],
+    reserved: Box<[Option<ExternalPipe>; 4]>,
 }
 
 impl Pipes {
@@ -314,11 +321,11 @@ impl Pipes {
         debug_assert!(state.as_ref().is_none_or(|state| state.ip == ip));
         let vblank_start = state.as_ref().map_or([None; 4], |state| state.vblank_start);
         Self {
-            state: state.map(Box::new),
+            state: state.map(Arc::new),
             ip,
             vblank_start,
             lit,
-            reserved: [None; 4],
+            reserved: Box::new([None; 4]),
         }
     }
 
@@ -376,12 +383,12 @@ impl Pipes {
     fn publish(&self) {
         let layout = self
             .state
-            .as_deref()
+            .as_ref()
             .filter(|s| s.requests[1..].iter().any(Option::is_some));
-        *LAYOUT.lock() = layout.map(|state| Layout {
-            state: *state,
+        publish_layout(layout.map(|state| Layout {
+            state: Arc::clone(state),
             surfaces: core::array::from_fn(|p| self.reserved[p].map(|ext| ext.surface)),
-        });
+        }));
     }
 
     /// Pipe A belongs to the panel's KMS owner, which turns it off and on
@@ -417,7 +424,7 @@ impl Pipes {
         let tiling = panel_tiling(io)?;
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
-        self.state = Some(Box::new((*state).retile(0, tiling, &latency)?));
+        self.state = Some(Arc::new(state.retile(0, tiling, &latency)?));
         Ok(())
     }
 
@@ -434,7 +441,7 @@ impl Pipes {
     ) -> Result<(), PipeEnableError> {
         // Allocate before programming; an uncertain transaction keeps the old
         // snapshot, and successful ownership transfer needs no later allocation.
-        let new = Box::new(new);
+        let new = Arc::new(new);
         match (&self.state, self.lit) {
             (Some(old), lit) if lit != 0 => {
                 crate::intel_gpu_xelpg_live::commit_live(io, old, &new, lit)?
@@ -475,8 +482,8 @@ impl Pipes {
         }
         let state = res::compute_ip_vblank(ip, &baseline, &latency, vblank_start)?;
         match tiling {
+            Some(Tiling::Linear) | None => Ok(state),
             Some(tiling) => Ok(state.retile(0, tiling, &latency)?),
-            None => Ok(state),
         }
     }
 

@@ -403,7 +403,7 @@ pub struct MtlHdmiProbe {
     /// `intel_hdmi_ddc_pin` result).
     pub ddc: PinPair,
     /// EDID bytes (`edid_len` valid).
-    pub edid: [u8; crate::intel_gpu_hdmi::EDID_CAPACITY],
+    pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
     pub edid_len: usize,
 }
@@ -478,7 +478,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
         sink,
         link,
         ddc: pin,
-        edid,
+        edid: alloc::boxed::Box::new(edid),
         edid_len,
     })
 }
