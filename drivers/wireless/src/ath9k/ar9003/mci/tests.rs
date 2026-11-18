@@ -705,6 +705,25 @@ fn mci_state_sweep() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_ath9k_mci_awake_deadbeef_poll_is_bounded_and_refuses_transition() -> TestResult {
+    for register in [AR_BTCOEX_CTRL2, AR_DIAG_SW] {
+        let (mut io, _) = live();
+        io.regs.insert(register, 0xdeadbeef);
+        if set_power_awake(&mut io).is_ok()
+            || io.delays_us != u64::from(POWER_AWAKE_WAIT_BOUND) * 10
+            || !io.writes(AR_BTCOEX_RC).is_empty()
+            || register == AR_BTCOEX_CTRL2 && !io.ops.is_empty()
+        {
+            return TestResult::Fail("deadbeef MCI wake loop fabricated completion/effects");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_mci_awake_deadbeef_poll_is_bounded_and_refuses_transition
+);
+
 fn mci_update_wlan_channels() -> TestResult {
     // Channel 1 (2412 MHz, HT20) clears the WLAN channel ±10 plus the
     // 7-channel guard from the map. Linux clears BT channels 0..26
@@ -1201,7 +1220,13 @@ fn mci_bt_profile_list() -> TestResult {
     if profiles.num_other_acl != 7 || profiles.num_sco != 0 || profiles.num_profiles() != 7 {
         return TestResult::Fail("ACL cap admitted too many profiles");
     }
-    if profiles.duty_cycle != 95 || profiles.aggr_limit != 4 || profiles.btcoex_period != 20 {
+    // mci.c's table entry is 95, but ath_mci_update_scheme clamps
+    // the final 2 GHz duty cycle to mci.h ATH_MCI_MAX_DUTY_CYCLE (90).
+    if profiles.duty_cycle != 90
+        || profiles.aggr_limit != 4
+        || profiles.btcoex_period != 20
+        || profiles.btcoex_no_stomp != 2
+    {
         return TestResult::Fail("seven-profile scheme is wrong");
     }
     TestResult::Pass
@@ -1324,10 +1349,10 @@ fn mci_bt_profile_scheme() -> TestResult {
     }
     let profiles = &btcoex.mci.profiles;
     if profiles.num_profiles() != 8
-        || profiles.duty_cycle != 98
+        || profiles.duty_cycle != 90
         || profiles.btcoex_period != 40
         || profiles.aggr_limit != 0
-        || profiles.btcoex_no_stomp != 0
+        || profiles.btcoex_no_stomp != 4
     {
         return TestResult::Fail("eight-profile HT scheme is wrong");
     }

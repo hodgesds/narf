@@ -99,7 +99,10 @@ impl Session {
         hw.install_rf_policy(super::mld_policy::Authority::Transaction(
             policy.transaction(&domain)?,
         ))?;
-        let mcc = super::connection::regulatory_channels_in_domain(hw, &domain).await?;
+        let mcc = crate::future_heap::build(|| {
+            super::connection::regulatory_channels_in_domain(hw, &domain)
+        })
+        .await?;
         let power =
             super::connection::channel_power(&domain, plan.channel.number, &mcc.channels, true)
                 .ok_or("AP native MCC/host ACTIVE/non-radar permission absent")?;
@@ -122,9 +125,11 @@ impl Session {
         hw.install_rf_policy(super::mld_policy::Authority::Station(
             policy.bind(program.clone())?,
         ))?;
-        Self::prepare_native(
-            hw, plan, settings, own, chains, proof, history, program, None,
-        )
+        crate::future_heap::build(|| {
+            Self::prepare_native(
+                hw, plan, settings, own, chains, proof, history, program, None,
+            )
+        })
         .await
     }
     #[allow(clippy::too_many_arguments)]
@@ -173,7 +178,7 @@ impl Session {
         hw.ap_phy(&super::station_api::phy_channel(1, plan.channel))
             .await?;
         let qualification = if let Some(power) = power {
-            Some(alloc::boxed::Box::new(power.apply(hw).await?))
+            Some(power.apply(hw).await?)
         } else {
             None
         };
@@ -782,6 +787,11 @@ impl Session {
             }
         }
         open_epoch(hw, self.epoch, &self.peers, self.own, self.plan.channel).await
+    }
+    /// Queue identity is metadata; the native send still checks the original
+    /// hardware owner, current role/key/port, and the exact queue binding.
+    pub(in crate::iwlwifi) fn owns_go_group_queue(&self, queue: u16) -> bool {
+        self.plan.go.is_some() && self.mcast == queue
     }
     pub(in crate::iwlwifi) fn protect_go_group(
         &mut self,

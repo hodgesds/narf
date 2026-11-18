@@ -926,6 +926,7 @@ fn ar9003_facts(
         rx_gain: 0,
     };
     let prepared = phy::Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: if frequency >= 4800 { 1 } else { 4 },
         carrier_leak_cal: true,
@@ -1083,6 +1084,7 @@ fn ar9462_facts(frequency: u16, ctl: u16) -> Result<Facts, BringUpError> {
         rx_gain: 0,
     };
     let prepared = phy::Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: if frequency >= 4800 { 1 } else { 4 },
         carrier_leak_cal: true,
@@ -1186,6 +1188,7 @@ fn ar9565_facts(frequency: u16, ctl: u16) -> Result<Facts, BringUpError> {
         rx_gain: 0,
     };
     let prepared = phy::Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: if frequency >= 4800 { 1 } else { 4 },
         carrier_leak_cal: true,
@@ -1224,6 +1227,7 @@ fn ar9485_facts(id: u16, frequency: u16, ctl: u16) -> Result<Facts, BringUpError
         rx_gain: 0,
     };
     let prepared = phy::Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: if frequency >= 4800 { 1 } else { 4 },
         carrier_leak_cal: true,
@@ -1381,4 +1385,102 @@ fn smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic() -> TestRes
 kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic
+);
+
+fn ar9485_configured_facts(
+    id: &narf_bus::DeviceId,
+    config: crate::ath9k::ar9003::board::Config,
+) -> Result<Facts, BringUpError> {
+    use crate::ath9k::ar9003::{eeprom, phy, serdes, templates::AR9300_DEFAULT, Chip, Revision};
+    let mut image = AR9300_DEFAULT;
+    image[eeprom::field::TXRX_MASK] = 0x11;
+    image[eeprom::field::OP_FLAGS] = 2;
+    image[eeprom::field::TXRX_GAIN] = 0;
+    let identity = eeprom::Identity {
+        mac: [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        eeprom_version: image[0],
+        template_version: image[1],
+        regulatory_domains: [0x3a, 0],
+        op_flags: 2,
+        rx_chainmask: 1,
+        tx_chainmask: 1,
+        tx_gain: 0,
+        rx_gain: 0,
+    };
+    let revision = Revision {
+        chip: Chip::Ar9485,
+        mac_rev: 1,
+        pcie: true,
+    };
+    let pll = serdes::PllPwrsave::resolve(Chip::Ar9485, id.subsystem_vendor, id.subsystem_id);
+    let prepared =
+        phy::expected_with_board(&revision, &identity, pll, &image, 2412, 0x12, 0, config)?;
+    Facts::new_ar9003(id, &revision, &identity, &prepared, &image, 2412, 0x12)
+}
+
+fn smoke_ath9k_ar9485_n48a_canonical_board_program_binding() -> TestResult {
+    use crate::ath9k::ar9003::board::Config;
+    let generic = device(0x0032);
+    let Ok(base) = ar9485_configured_facts(&generic, Config::default()) else {
+        return TestResult::Fail("default N48A board-program facts");
+    };
+    let mut seen = Vec::new();
+    for (sv, si) in [
+        (0x1a3b, 0x2086),
+        (0x1a3b, 0x1237),
+        (0x1a3b, 0x2126),
+        (0x1a3b, 0x126a),
+        (0x1a3b, 0x2152),
+        (0x105b, 0xe075),
+    ] {
+        let mut id = generic;
+        id.subsystem_vendor = sv;
+        id.subsystem_id = si;
+        let config = Config::for_pci(&id);
+        let Ok(facts) = ar9485_configured_facts(&id, config) else {
+            return TestResult::Fail("CUS N48A board-program facts");
+        };
+        if ar9485_configured_facts(&id, Config::default()).is_ok()
+            || ar9485_configured_facts(&generic, config).is_ok()
+            || facts.request().identity == base.request().identity
+            || seen.contains(&facts.request().identity)
+        {
+            return TestResult::Fail("N48A admitted mismatched board program or subsystem");
+        }
+        seen.push(facts.request().identity);
+        let factory = facts.factory_antenna;
+        let record = ar9485_record(&facts, 1, factory, 30);
+        if load(facts.clone(), record.clone(), true).is_err() {
+            return TestResult::Fail("canonical CUS N48A qualification refused");
+        }
+        let mut foreign = record;
+        foreign[16..48].copy_from_slice(&base.request().identity);
+        if load(facts, foreign, true).is_ok() {
+            return TestResult::Fail("signed default board-program record admitted CUS hardware");
+        }
+    }
+    let mut ar1111 = generic;
+    ar1111.device = 0x0037;
+    ar1111.subsystem_vendor = 0x1a3b;
+    ar1111.subsystem_id = 0x2086;
+    if Config::for_pci(&ar1111) != Config::default()
+        || ar9485_configured_facts(&ar1111, Config::default()).is_err()
+        || ar9485_configured_facts(
+            &ar1111,
+            Config::for_pci(&{
+                let mut id = ar1111;
+                id.device = 0x0032;
+                id
+            }),
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("AR1111 inherited an AR9485 CUS subsystem quirk");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9485_n48a_canonical_board_program_binding
 );

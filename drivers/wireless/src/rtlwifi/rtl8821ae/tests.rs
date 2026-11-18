@@ -2775,7 +2775,7 @@ kernel_test_in!(
 fn smoke_rtl8821ae_coex_bind_facts_pattern_and_lps_gate() -> TestResult {
     use crate::rtlwifi::btcoex::btc::{ChipInterface, ChipType, BTC_ANTENNA_AT_MAIN_PORT};
     use crate::rtlwifi::btcoex::{encode_tdma, BtState, TdmaPattern, WifiState};
-    let mut coex = coex::Owner::bind();
+    let mut coex = coex::Owner::bind(1);
     let btc = &coex.btc;
     if !btc.bt_exist
         || btc.board_info.bt_chip_type != ChipType::Rtl8821

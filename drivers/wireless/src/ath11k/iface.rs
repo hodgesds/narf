@@ -573,6 +573,65 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         iftype: u32,
         virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
     ) -> (Self, Consumer<Frame, TX_RING_N>) {
+        Self::build_on_vdev_with_lifecycle(
+            name,
+            shared,
+            mac,
+            mac_addr,
+            sinks,
+            vdev_id,
+            iftype,
+            virtual_lifecycle,
+            |device| device,
+        )
+    }
+
+    /// Construct a virtual netdev in its final allocation. No registry
+    /// sees the Arc until both rings and all owner fields are initialized.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // Same inputs as the by-value constructor.
+    fn new_arc_on_vdev_with_lifecycle(
+        name: &'static str,
+        shared: Arc<Shared<Io, Irq, Q>>,
+        mac: RtMac<Io, Irq, Q>,
+        mac_addr: [u8; 6],
+        sinks: Sinks,
+        vdev_id: u32,
+        iftype: u32,
+        virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
+    ) -> (Arc<Self>, Consumer<Frame, TX_RING_N>) {
+        let mut device = Arc::<Self>::new_uninit();
+        let ((), tx) = Self::build_on_vdev_with_lifecycle(
+            name,
+            shared,
+            mac,
+            mac_addr,
+            sinks,
+            vdev_id,
+            iftype,
+            virtual_lifecycle,
+            |value| {
+                Arc::get_mut(&mut device).unwrap().write(value);
+            },
+        );
+        // SAFETY: the unique allocation was fully written by the
+        // constructor; no reference or clone has been published.
+        (unsafe { device.assume_init() }, tx)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)] // Constructor inputs plus its placement closure.
+    fn build_on_vdev_with_lifecycle<T>(
+        name: &'static str,
+        shared: Arc<Shared<Io, Irq, Q>>,
+        mac: RtMac<Io, Irq, Q>,
+        mac_addr: [u8; 6],
+        sinks: Sinks,
+        vdev_id: u32,
+        iftype: u32,
+        virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
+        finish: impl FnOnce(Self) -> T,
+    ) -> (T, Consumer<Frame, TX_RING_N>) {
         let radio = RadioInfo::from_mac(&mac);
         let pdev_id = mac.pdev_id();
         // MBSSID's TX_IFINDEX resolution is physical-radio-local. Bind the
@@ -582,7 +641,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
         (
-            Ath11kNetdev {
+            finish(Ath11kNetdev {
                 name,
                 mac_addr,
                 vdev_id,
@@ -621,7 +680,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 monitor_channel: IrqSafeSpinLock::new(None),
                 monitor_open: AtomicBool::new(false),
                 monitor_token: IrqSafeSpinLock::new(None),
-            },
+            }),
             tx_cons,
         )
     }
@@ -4038,16 +4097,17 @@ impl Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw> {
         if self.shared.is_dead() {
             return Err(super::runtime::EIO);
         }
-        let dev = self
-            .shared
-            .resume_after_system_suspend()
+        let dev = super::future_heap::build(|| self.shared.resume_after_system_suspend())
             .await
             .map_err(|e| e.errno)?;
         for iface in pci_radio_devices(self.shared.radio_id) {
-            iface
-                .rebuild_after_cold_resume(dev.caps.clone(), dev.reg_info.clone())
-                .await
-                .map_err(|e| e.errno)?;
+            // Each original netdev retains its own MAC reconstruction and
+            // guards in the heap future; PM's poll holds only the handle.
+            super::future_heap::build(|| {
+                iface.rebuild_after_cold_resume(dev.caps.clone(), dev.reg_info.clone())
+            })
+            .await
+            .map_err(|e| e.errno)?;
         }
         self.shared.reconfig_complete().await;
         Ok(())
@@ -4088,8 +4148,8 @@ impl Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw> {
         };
         match mode {
             SystemPmMode::Idle => Ok(()),
-            SystemPmMode::Wowlan => self.system_resume_wowlan().await,
-            SystemPmMode::Cold => self.system_resume_cold().await,
+            SystemPmMode::Wowlan => super::future_heap::build(|| self.system_resume_wowlan()).await,
+            SystemPmMode::Cold => super::future_heap::build(|| self.system_resume_cold()).await,
         }
     }
 }
@@ -4325,55 +4385,69 @@ fn pci_virtual_create(
         if !parent.shared.prepare_vdev_slot(vdev_id) {
             return Err(WirelessError::Busy);
         }
-        let lifecycle = parent
-            .virtual_lifecycle
-            .clone()
-            .ok_or(WirelessError::NotSupported)?;
-        let config = parent.mac.try_lock().ok_or(WirelessError::Busy)?.config();
-        // The physical radio may have completed a firmware recovery since
-        // its root netdev was registered.  Read the live capability and
-        // regulatory snapshots rather than a registration-time copy before
-        // building a later virtual vdev.  The caps are the parent's
-        // radio's, not pdev 0's (a radio-1 parent's child would
-        // otherwise come up with radio-0 bands/chains).
-        let (mut caps, reg_info) = {
-            let rt = parent.shared.try_lock().ok_or(WirelessError::Busy)?;
-            let caps = if parent.pdev_id == 0 {
-                rt.device_caps()
-            } else {
-                rt.device_caps_for(parent.pdev_id)
-            }
-            .map_err(|_| WirelessError::HardwareError)?;
-            (caps, rt.core.reg_info.clone())
-        };
-        let name = Box::leak(alloc::string::String::from(requested_name).into_boxed_str());
-        let mac_addr = requested_mac.unwrap_or_else(|| virtual_mac(parent.mac_addr, vdev_id));
-        caps.mac_addr = mac_addr;
-        let mac = Mac::new(
-            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
-            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
-            caps,
-            config.with_vdev(vdev_id),
-            reg_info.as_deref(),
-        );
-        let (child, tx_cons) = Ath11kNetdev::new_on_vdev_with_lifecycle(
-            name,
-            parent.shared.clone(),
-            mac,
-            mac_addr,
-            netdev_sinks(),
-            vdev_id,
-            iftype,
-            Some(lifecycle),
-        );
-        let child = Arc::new(child);
-        register_pci_netdev(child.clone(), tx_cons, false);
-        Ok(child as Arc<dyn WirelessNetIface>)
+        pci_virtual_publish(parent, requested_name, iftype, requested_mac, vdev_id)
     })();
     if result.is_err() {
         parent.shared.release_vdev(vdev_id);
     }
     result
+}
+
+// Keep slot-preparation temporaries out of the MAC/netdev construction
+// frame. The caller still owns reservation rollback on every error.
+#[inline(never)]
+fn pci_virtual_publish(
+    parent: &PciNetdev,
+    requested_name: &str,
+    iftype: u32,
+    requested_mac: Option<[u8; 6]>,
+    vdev_id: u32,
+) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+    let lifecycle = parent
+        .virtual_lifecycle
+        .clone()
+        .ok_or(WirelessError::NotSupported)?;
+    let config = parent.mac.try_lock().ok_or(WirelessError::Busy)?.config();
+    // The physical radio may have completed a firmware recovery since
+    // its root netdev was registered.  Read the live capability and
+    // regulatory snapshots rather than a registration-time copy before
+    // building a later virtual vdev.  The caps are the parent's
+    // radio's, not pdev 0's (a radio-1 parent's child would
+    // otherwise come up with radio-0 bands/chains).
+    let (mut caps, reg_info) = {
+        let rt = parent.shared.try_lock().ok_or(WirelessError::Busy)?;
+        let caps = if parent.pdev_id == 0 {
+            rt.device_caps()
+        } else {
+            rt.device_caps_for(parent.pdev_id)
+        }
+        .map_err(|_| WirelessError::HardwareError)?;
+        (caps, rt.core.reg_info.clone())
+    };
+    let name = Box::leak(alloc::string::String::from(requested_name).into_boxed_str());
+    let mac_addr = requested_mac.unwrap_or_else(|| virtual_mac(parent.mac_addr, vdev_id));
+    caps.mac_addr = mac_addr;
+    // Retain the large MAC in transient heap storage while preparing
+    // the child allocation and registry state.
+    let mac = Box::new(Mac::new(
+        Port(parent.shared.clone(), vdev_id, parent.pdev_id),
+        Port(parent.shared.clone(), vdev_id, parent.pdev_id),
+        caps,
+        config.with_vdev(vdev_id),
+        reg_info.as_deref(),
+    ));
+    let (child, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
+        name,
+        parent.shared.clone(),
+        *mac,
+        mac_addr,
+        netdev_sinks(),
+        vdev_id,
+        iftype,
+        Some(lifecycle),
+    );
+    register_pci_netdev(child.clone(), tx_cons, false);
+    Ok(child as Arc<dyn WirelessNetIface>)
 }
 
 fn pci_virtual_delete(dev: &PciNetdev) -> Result<(), WirelessError> {
@@ -4593,7 +4667,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
 ) -> &'static str {
     use core::fmt::Write as _;
     let name = narf_net::iface::reserve_name("wlan%d");
-    let (dev, tx_cons) = Ath11kNetdev::new_on_vdev_with_lifecycle(
+    let (dev, tx_cons) = Ath11kNetdev::new_arc_on_vdev_with_lifecycle(
         name,
         shared,
         mac,
@@ -4603,7 +4677,6 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         2,
         None,
     );
-    let dev = Arc::new(dev);
     AHB_ACTIVE.lock().push(dev.clone());
     register_netdev(
         dev.clone(),

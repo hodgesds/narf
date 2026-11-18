@@ -75,6 +75,10 @@ impl Native {
         }
         admission.check()?;
         self.ordinary_current()?;
+        if self.chip == ChipId::Rtl8852A {
+            // No A measured tracking companion/native adapter is composed.
+            return Ok(());
+        }
         if self.chip == ChipId::Rtl8852C {
             // No signed C RF-tracking companion: the program does no RF work.
             return Ok(());

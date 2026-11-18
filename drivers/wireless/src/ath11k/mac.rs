@@ -1701,6 +1701,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// capabilities and apply the default regdomain built from the
     /// REG_CHAN_LIST_CC event the core received during start-up
     /// (`initial_reg`; `None` → `ath11k_world_regd`).
+    #[inline(never)]
     pub fn new(
         wmi: P,
         dp: D,

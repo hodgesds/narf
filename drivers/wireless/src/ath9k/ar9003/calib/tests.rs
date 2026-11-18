@@ -171,6 +171,7 @@ fn identity(mask: u8) -> Identity {
 
 fn prepared(frequency: u16, mask: u8) -> Prepared {
     Prepared {
+        board_config: crate::ath9k::ar9003::board::Config::default(),
         frequency,
         modes_index: 4,
         carrier_leak_cal: true,
@@ -559,8 +560,9 @@ fn ar9462_nf_limits() -> Result<(), &'static str> {
     // End to end: the reset tail loads the AR9462 nominal (-127) for a
     // chain with no calibration pier, and the Model's NF measurement
     // reports -90/-130/-50 dBm on chains 0/1/2, so the periodic long
-    // calibration sanitizes chain 1's -130 to the -127 nominal and
-    // chain 2's -50 to the -60 maximum (`Limits::sanitize`).
+    // calibration sanitizes chain 1's -130 to the -127 nominal.
+    // RX mask 0x3 enables only chains 0/1: chain 2's unmeasured -105
+    // history must remain unchanged, even though its register says -50.
     let mut io = Model::new();
     let mut cal = Calibration::default();
     let revision = rev_for(0x0028_02ff, super::super::Chip::Ar9462);
@@ -584,7 +586,8 @@ fn ar9462_nf_limits() -> Result<(), &'static str> {
     let tick = periodic
         .tick(&mut io, 30_000)
         .map_err(|_| "AR9462 NF tick failed")?;
-    if !tick.longcal || tick.noise_floor != Some(-90) || periodic.private_nf() != [-90, -127, -60] {
+    if !tick.longcal || tick.noise_floor != Some(-90) || periodic.private_nf() != [-90, -127, -105]
+    {
         return Err("AR9462 periodic NF limits differ");
     }
     Ok(())

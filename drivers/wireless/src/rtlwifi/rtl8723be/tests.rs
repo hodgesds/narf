@@ -805,15 +805,26 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
         let mac0 = tables::MAC[0];
         let phy0 = tables::PHY_REG[0];
         let agc0 = tables::AGCTAB[0];
-        let (Some(m0), Some(mac_tail), Some(s948), Some(p0), Some(a0), Some(r0)) = (
+        let (Some(m0), Some(mac_tail), Some(s948), Some(p0), Some(a0)) = (
             w((mac0[0] as u16, mac0[1] & 0xff, 1)),
             w((0x4ca, 0x0b, 1)),
             w((0x948, 0x280, 4)),
             w((phy0[0] as u16, phy0[1], 4)),
             w((agc0[0] as u16, agc0[1], 4)),
-            rf(0x000, 0x1_0000),
         ) else {
             return TestResult::Fail("8723BE PHY rows missing");
+        };
+        // PHY_REG also initializes the LSSI port 0x840 to 0x10000.
+        // The RF table's identical first serial write is the one after
+        // AGC, rather than that earlier BB initialization (table.c).
+        let Some(r0) = g
+            .writes
+            .iter()
+            .enumerate()
+            .skip(a0 + 1)
+            .find_map(|(i, row)| (*row == (0x840, 0x1_0000, 4)).then_some(i))
+        else {
+            return TestResult::Fail("8723BE RF table start missing after AGC");
         };
         let cap = 0x22u32 | (0x22 << 6);
         let r32 =
@@ -831,9 +842,20 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
             || (r32(0x2c) >> 12) & 0xfff != cap
             || r32(0x670) != 0xc000_0000
             || g.regs[0x610..0x616] != [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe]
-            || radio.receive_config != mac::RCR & !mac::RCR_ACRC32_AICV
+            // The MAC table overwrites 0x608/0x609 with 0x0e/0x2a
+            // before the RCR trim clears bits 8/9 (Linux table.c +
+            // rtl8723be_hw_init). The pre-table receive_config is stale.
+            || radio.receive_config != 0xf000_280e
             || radio.chnlval != [0x0c00, 0]
         {
+            narf_console::klog!(
+                "RTL8723BE config: hp={} order={:?} rf51={:?}/{:?} rf52={:?} rf_ctrl={:#x} sys_func={:#x} xtal={:#x} cap={:#x} cam={:#x} mac={:?} rcr={:#x} channel={:?}\n",
+                hp, (m0, mac_tail, s948, p0, a0, r0),
+                rf(0x51, 0x6f10e), rf(0x51, 0x6b04e), rf(0x52, 0x7e4bd),
+                g.regs[0x1f], g.regs[0x02], g.regs[0x25],
+                (r32(0x2c) >> 12) & 0xfff, r32(0x670), &g.regs[0x610..0x616],
+                radio.receive_config, radio.chnlval
+            );
             return TestResult::Fail("8723BE MAC/BB/RF configuration values");
         }
     }

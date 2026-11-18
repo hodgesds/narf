@@ -4229,9 +4229,10 @@ fn de_tx_owner() -> Option<packet::Owner> {
     ))
 }
 
-/// TX-report frames (EAPOL / nullfunc): `SPE_RPT` (dword 2 bit 19)
-/// plus the `SW_DEFINE` sequence `(++sn & 0x3f) << 2`; ordinary data
-/// carries neither. `sectype`: none 0, WEP/TKIP 1, CCMP 3.
+/// rtl8192de/trx.c:44..229 never calls rtl_set_tx_report: ordinary,
+/// EAPOL and Null frames retain cleared SPE_RPT / SW_DEFINE fields.
+/// Compatibility report inputs must not invent a DE firmware request.
+/// `sectype`: none 0, WEP/TKIP 1, CCMP 3.
 fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
     use packet::*;
     let Some(mut owner) = de_tx_owner() else {
@@ -4263,7 +4264,7 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
     {
         return TestResult::Fail("8192DE TX report ordinary data");
     }
-    // EAPOL: report with sn 4, then 8.
+    // EAPOL classifications do not add a request or software sequence.
     let mut slot = trx::TxDesc::default();
     if owner
         .fill_tx_slot(
@@ -4274,8 +4275,8 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[2] & (1 << 19) == 0
-        || slot.dw[6] & 0xfff != 4
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report EAPOL first");
     }
@@ -4289,11 +4290,12 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[6] & 0xfff != 8
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report EAPOL second");
     }
-    // Nullfunc: report with sn 12.
+    // A Null-PM frame likewise cannot solicit the newer chips' report.
     let mut slot = trx::TxDesc::default();
     if owner
         .fill_tx_slot(
@@ -4304,8 +4306,8 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[2] & (1 << 19) == 0
-        || slot.dw[6] & 0xfff != 12
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report nullfunc");
     }
@@ -4325,11 +4327,24 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             return TestResult::Fail("8192DE TX sectype");
         }
     }
-    // The report helpers agree with the descriptor bits.
+    // Direct callers cannot bypass the source rule through old public
+    // inputs. Those inputs remain inert for API compatibility.
+    let direct = trx::TxDesc::fill(&trx::TxParams {
+        spe_rpt: true,
+        sw_define: 0x0fff,
+        ..trx::TxParams::default()
+    });
+    if direct.dw[2] & (1 << 19) != 0 || direct.dw[6] & 0x0fff != 0 {
+        return TestResult::Fail("8192DE compatibility inputs invented a report request");
+    }
+    // Common classification/sequence helpers remain software metadata;
+    // actual descriptor fills above never advanced the sequence.
     if !wants_tx_report(true, false)
         || !wants_tx_report(false, true)
         || wants_tx_report(false, false)
         || ETH_P_PAE != 0x888e
+        || owner.next_report_sn() != 4
+        || owner.next_report_sn() != 8
     {
         return TestResult::Fail("8192DE TX report predicate");
     }
@@ -5083,11 +5098,13 @@ kernel_test_in!(
 /// HT40 capability bodies (`base.c::_rtl_init_hw_ht_capab`), the
 /// host capability bits, and the `BSS_CHANGED_HT` timing order.
 fn smoke_rtl8192de_ht40_capability() -> TestResult {
-    // 2T2R 40 MHz, two-stream, A-MSDU on: cap 0x1c6e,
+    // MAX_AMSDU is bit 11 (0x0800), DSSSCCK40 bit 12 (0x1000);
+    // delayed Block Ack (bit 10) is not advertised by this source.
+    // 2T2R 40 MHz, two-stream, A-MSDU on: cap 0x186e,
     // factor/density 0x1f, RX mask [255, 255], TX == RX.
     let body = ht::capability(true, RfType::TwoT2R, true, false).capability_body();
     if body[0] != 0x6e
-        || body[1] != 0x1c
+        || body[1] != 0x18
         || body[2] != 0x1f
         || body[3] != 255
         || body[4] != 255
@@ -5095,11 +5112,11 @@ fn smoke_rtl8192de_ht40_capability() -> TestResult {
     {
         return TestResult::Fail("8192DE HT40 2T2R capability body");
     }
-    // 1T1R 20 MHz, no two-stream, A-MSDU off: cap 0x082c,
-    // RX mask [255, 0].
+    // 1T1R 20 MHz, no two-stream, A-MSDU off: cap 0x002c.
+    // LocalHt clears DSSSCCK40 at 20 MHz; RX mask [255, 0].
     let body = ht::capability(false, RfType::OneT1R, false, true).capability_body();
     if body[0] != 0x2c
-        || body[1] != 0x08
+        || body[1] != 0
         || body[2] != 0x1f
         || body[3] != 255
         || body[4] != 0
@@ -5171,7 +5188,8 @@ fn smoke_rtl8192de_ht40_capability() -> TestResult {
         _ => return TestResult::Fail("8192DE HT host phy 5 GHz"),
     }
     // BSS_CHANGED_HT order with the fake MAC: density 5 raises to 7,
-    // factor 2 leaves the single-MAC base, min-space lands at 0x97.
+    // factor 2 leaves the single-MAC base. The 2T2R density base is
+    // 0x98, so replacing its low three bits with 7 produces 0x9f.
     let io = de_mac_fake();
     let mut cfg = 0;
     if ht::timing(
@@ -5183,9 +5201,9 @@ fn smoke_rtl8192de_ht40_capability() -> TestResult {
         5,
     )
     .is_err()
-        || cfg != 0x97
+        || cfg != 0x9f
         || de_mac_read32(&io, mac::REG_AGGLEN_LMT) != 0xb972_a841
-        || de_mac_read8(&io, mac::REG_AMPDU_MIN_SPACE) != 0x97
+        || de_mac_read8(&io, mac::REG_AMPDU_MIN_SPACE) != 0x9f
     {
         return TestResult::Fail("8192DE HT BSS_CHANGED_HT timing");
     }

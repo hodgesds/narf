@@ -191,9 +191,11 @@ impl RxReport {
         self.drv_info_bytes + self.shift
     }
 
-    /// Payload length: packet length minus the offset, saturating.
+    /// MPDU bytes including FCS. Linux pci.c puts exactly RXPKT_LEN bytes
+    /// after reserving the driver-info/shift prefix; that prefix is an offset
+    /// into the buffer, not bytes to subtract from the reported frame length.
     pub const fn payload_len(self) -> u32 {
-        self.pkt_len.saturating_sub(self.payload_offset())
+        self.pkt_len
     }
 }
 

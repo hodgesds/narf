@@ -114,6 +114,20 @@ impl Blacklist {
     }
 }
 impl Fuses {
+    /// Actual retained fuse identity for A's authenticated startup records.
+    pub(super) fn bind(&self, h: &mut narf_crypto::sha256::Sha256) {
+        h.update(&[
+            self.chip as u8,
+            u8::from(self.enabled),
+            self.legacy.unwrap_or(255),
+        ]);
+        if let Some(modern) = self.modern {
+            h.update(&[1, modern.device, modern.customer, modern.key]);
+        } else {
+            h.update(&[0, 0, 0, 0]);
+        }
+        h.update(&self.sb_sel_mgn.to_le_bytes());
+    }
     /// Native callers must read BOTH bytes at DDV0x5ec successfully. A failed
     /// read must never be replaced with erased bytes. Unknown programmed fuses
     /// are an error rather than an insecure-boot fallback.

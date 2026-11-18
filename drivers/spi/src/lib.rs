@@ -56,6 +56,7 @@ pub mod intel_lpss;
 pub mod intel_spi_flash;
 pub mod pl022;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -135,12 +136,60 @@ pub enum SpiError {
 
 // ── SpiBus trait ───────────────────────────────────────────────────
 
+/// Electrical data-pad topology required by a device lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiWiring {
+    SeparateData,
+    /// The host releases its output before the first receive clock.
+    SharedData,
+}
+
+/// Configuration installed atomically while claiming an exclusive device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpiDeviceConfig {
+    pub mode: SpiMode,
+    pub freq_hz: u32,
+    pub cs: u8,
+    pub wiring: SpiWiring,
+    /// Minimum CS-high settling interval before returning or reusing the pad.
+    pub post_cs_delay_ns: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiClaimError {
+    Unsupported,
+    Busy,
+    Bus(SpiError),
+}
+
+/// Exclusive, non-cloneable device session. The producer retains the original
+/// controller/pad owner and excludes all legacy and other-session accesses.
+/// This wire contract carries no radio/firmware-selection or confirmed-stop
+/// authority. A producer must independently enforce current native authority.
+pub trait SpiDevice: Send + core::fmt::Debug {
+    /// One CS-low transaction: write the exact bytes, then clock/read the exact
+    /// receive length, with no CS edge or interleaving between phases. For
+    /// shared-data wiring the host must release the data pad before read clocks.
+    /// No hidden opcode, byte swapping, chunk CS edges or status bytes are allowed.
+    /// The producer releases CS and observes the configured settling time on
+    /// success AND failure. If electrical retirement cannot be proven, it retains
+    /// the original owner in quarantine; dropping a session is not a stop receipt.
+    fn transaction(&mut self, write: &[u8], read: &mut [u8]) -> Result<(), SpiError>;
+}
+
 /// SPI bus controller interface.
 ///
 /// Implementors own the controller's MMIO and serialise concurrent
 /// callers via their own internal lock. The trait is object-safe so
 /// it can be stored as `Arc<dyn SpiBus>` in the registry.
 pub trait SpiBus: Send + Sync + core::fmt::Debug {
+    /// Atomically configure and exclusively claim a complete-transaction port.
+    /// Legacy transfer/set_cs implementations do not imply this stronger
+    /// contract. Unsupported hosts must refuse without touching hardware.
+    fn claim_device(&self, _config: SpiDeviceConfig) -> Result<Box<dyn SpiDevice>, SpiClaimError> {
+        Err(SpiClaimError::Unsupported)
+    }
+
     /// Full-duplex or half-duplex transfer.
     ///
     /// Clocks out `tx` bytes (or zero-bytes if `tx` is shorter than

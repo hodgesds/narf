@@ -193,15 +193,21 @@ pub struct Ra {
 }
 
 impl Ra {
-    /// Refuses (`RuntimeState`) an empty peer mask or one carrying any rate
-    /// outside `admitted` (no narrowing: a 1T board whose admitted set lacks
-    /// MCS8..15 refuses a 2SS peer), and 40 MHz for a non-HT peer.
+    /// Refuses an empty negotiated peer mask, rates outside `admitted`,
+    /// an admitted TX set outside the actual hardware paths, and 40 MHz
+    /// for a non-HT peer. A wider AP RX capability is handled by association
+    /// negotiation; this constructor never narrows authority.
     pub fn new(peer: Peer, admitted: u32, tx_paths: u8, bandwidth40: bool) -> Result<Self, Error> {
+        let hardware = match tx_paths {
+            1 => 0x000f_ffff, // legacy + MCS0..7
+            2 => 0x0fff_ffff, // legacy + MCS0..15
+            _ => return Err(Error::RuntimeState),
+        };
         let mask = peer.mask();
-        if mask == 0 || mask & !admitted != 0 || mask >> 28 != 0 {
+        if admitted & !hardware != 0 || mask == 0 || mask & !admitted != 0 {
             return Err(Error::RuntimeState);
         }
-        if bandwidth40 && !peer.ht || !matches!(tx_paths, 1 | 2) {
+        if bandwidth40 && !peer.ht {
             return Err(Error::RuntimeState);
         }
         Ok(Self {

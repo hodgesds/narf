@@ -223,6 +223,15 @@ impl Native {
     pub(in crate::rtw89) fn station_regulatory(
         &self,
     ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
+        if self.a_ordinary()? {
+            return self
+                .qualification_a
+                .as_ref()
+                .ok_or(power::Error::Terminal)?
+                .policy()
+                .map(Some)
+                .map_err(|_| power::Error::Access);
+        }
         match self.full_radio_scope() {
             Some(qualification) => qualification
                 .policy()

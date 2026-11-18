@@ -38,6 +38,7 @@ impl Native {
         crate::rtw88::pci_park::invoke(&self.authority, || {
             if self.state != State::Active
                 || self.chip != ChipId::Rtl8852A
+                || self.mac_a.is_none()
                 || self.receive.state() != crate::rtw89::rx_dma::State::Polling
                 || self.calibration.is_some()
                 || self.qualification_a.is_some()
@@ -47,6 +48,10 @@ impl Native {
                 return Err(power::Error::Terminal);
             }
             self.radio_profile_current()?;
+            self.mac_a
+                .as_ref()
+                .ok_or(power::Error::Terminal)?
+                .current()?;
             let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
             let rfe = factory
                 .identity()
@@ -112,9 +117,11 @@ impl Native {
     /// RTL8852A ordinary grant (`OrdinaryGrant::A`, the same retained
     /// signed program, rechecked) is installed; it carries no B companion
     /// program, so every B-only program accessor reports "no program".
-    /// No channel is programmed yet: the A `set_channel` / `rfk_channel`
-    /// owner follows the open channel-RFK lane (#2098), so the native
-    /// operating channel stays unset until that lane lands.
+    /// The A channel-control and exact `set_txpwr` prefix run next, inside
+    /// their scheduler/help window. Programmed is distinct from complete
+    /// channel RFK. Actual live non-TSSI observations, source TSSI high-power/
+    /// pre-TX and complete channel RFK run before channel publication. The
+    /// outer original Attempt closes A autonomous engines on failure/drop.
     ///
     /// # Safety
     /// Same retained Startup owner after RTL8852A `prepare_radio_tables`;
@@ -131,6 +138,7 @@ impl Native {
     ) -> Result<(), power::Error> {
         if self.state != State::Active
             || self.chip != ChipId::Rtl8852A
+            || self.mac_a.is_none()
             || owner.state() != radio_a::State::New
             || self.ordinary.is_some()
             || self.full_qualification.is_some()
@@ -144,6 +152,18 @@ impl Native {
             return Err(power::Error::Terminal);
         }
         self.radio_profile_current()?;
+        let mac_board = crate::rtw89::mac_a_policy::Board::new(
+            self.lifecycle,
+            self.factory.as_ref().ok_or(power::Error::Unsupported)?,
+            self.device.id,
+            assets,
+        )
+        .map_err(denied)?;
+        let mac_grant = self.mac_a.as_ref().ok_or(power::Error::Terminal)?;
+        if !mac_grant.matches(mac_board) {
+            return Err(power::Error::Access);
+        }
+        mac_grant.current()?;
         let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
         let rfe = factory
             .identity()
@@ -152,6 +172,10 @@ impl Native {
             .rfe_type;
         let plan = radio_power_c::Plan::from_elements_a(assets.elements(), rfe, profile)
             .map_err(denied)?;
+        let tracking = crate::rtw89::rfk::a_tssi::Tracking::from_assets(assets).map_err(denied)?;
+        let tail =
+            crate::rtw89::rfk::a_tssi::tail::Inputs::from_assets(assets, rfe, plan.channel())
+                .map_err(denied)?;
         let cal_board =
             calibration_policy::Board::new_a(factory, self.device.id, assets).map_err(denied)?;
         let board = radio_policy_a::Board::new(
@@ -239,7 +263,37 @@ impl Native {
         }
         .await
         .map_err(crate::rtw89::radio_c::error)?;
-        if owner.state() != radio_a::State::Ready {
+        // SAFETY: the selected signed A profile/plan and retained init
+        // above are current; no ordinary station or response producer.
+        unsafe { owner.program_channel(self, profile, &plan) }
+            .await
+            .map_err(crate::rtw89::radio_c::error)?;
+        // SAFETY: same retained current measured A owner after its actual
+        // source channel and live observations; original Attempt owns A
+        // restrictive terminal PMAC/BB closure on failure or cancellation.
+        unsafe {
+            owner.complete_channel(
+                self,
+                radio_a::ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    tail,
+                },
+            )
+        }
+        .await
+        .map_err(crate::rtw89::radio_c::error)?;
+        if owner.state() != radio_a::State::Ready
+            || owner.programmed_channel() != Some(profile)
+            || owner.channel() != Some(profile)
+            || owner.observations().is_none()
+            || owner.fem()
+                != self
+                    .factory
+                    .as_ref()
+                    .and_then(|factory| factory.identity())
+                    .and_then(factory_a::Fem::from_identity)
+        {
             return Err(power::Error::Terminal);
         }
         let qualification = self.qualification_a.clone().ok_or(power::Error::Access)?;
@@ -247,10 +301,215 @@ impl Native {
         if qualification.active() != profile {
             return Err(power::Error::Access);
         }
-        // No channel is programmed yet (no A set_channel owner): the
-        // native operating channel stays unset; the grant below admits
-        // ordinary TX only once the follow-up lane programs it.
+        // Only the complete actual source RFK/PMAC receipt above permits
+        // channel publication. Missing thermal/tail/DPK evidence fails closed.
+        self.channel = Some((
+            OperatingChannel::new(plan.channel().band(), profile.primary()),
+            owner.epoch(),
+        ));
         self.ordinary = Some(OrdinaryGrant::A(qualification));
         Ok(())
+    }
+}
+
+impl Native {
+    pub(super) fn a_ordinary(&self) -> Result<bool, power::Error> {
+        if self.chip != ChipId::Rtl8852A {
+            return Ok(false);
+        }
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            self.ordinary_current()?;
+            let q = self
+                .qualification_a
+                .as_ref()
+                .ok_or(power::Error::Terminal)?;
+            if !self.ordinary.as_ref().is_some_and(
+                |grant| matches!(grant, OrdinaryGrant::A(original) if Arc::ptr_eq(original,q)),
+            ) {
+                return Err(power::Error::Terminal);
+            }
+            q.current().map_err(denied)?;
+            Ok(true)
+        })
+        .map_err(denied)?
+    }
+    pub(super) fn a_program(
+        &self,
+        program: crate::rtw89::radio_policy::Program,
+    ) -> Result<bool, power::Error> {
+        if !self.a_ordinary()? {
+            return Err(power::Error::Unsupported);
+        }
+        self.qualification_a
+            .as_ref()
+            .ok_or(power::Error::Terminal)?
+            .allows(program)
+            .map_err(denied)
+    }
+    pub(super) fn a_admitted_channels(&self) -> Result<u64, power::Error> {
+        if !self.a_ordinary()? {
+            return Err(power::Error::Unsupported);
+        }
+        let q = self
+            .qualification_a
+            .as_ref()
+            .ok_or(power::Error::Terminal)?;
+        let mut mask = 0;
+        for primary in (1..=13).chain(crate::rtw89::operating_channel::GHZ5) {
+            let profile = Profile::from_primary(primary).ok_or(power::Error::Unsupported)?;
+            if q.channel_active(profile).map_err(denied)? {
+                mask |= 1u64
+                    << crate::rtw89::operating_channel::slot(primary)
+                        .ok_or(power::Error::Unsupported)?;
+            }
+        }
+        Ok(mask)
+    }
+    pub(super) fn a_admitted_wide(&self) -> Result<alloc::vec::Vec<Profile>, power::Error> {
+        if !self.a_ordinary()? {
+            return Err(power::Error::Unsupported);
+        }
+        let q = self
+            .qualification_a
+            .as_ref()
+            .ok_or(power::Error::Terminal)?;
+        let mut profiles = alloc::vec::Vec::new();
+        for profile in crate::rtw89::command_native::radio::wide_profiles() {
+            if q.channel_active(profile).map_err(denied)? {
+                profiles.push(profile);
+            }
+        }
+        Ok(profiles)
+    }
+    /// # Safety
+    /// Original Startup A radio/tables/assets, no competing reset/IRQ/PHY/PM
+    /// producer. The enclosing retained Attempt terminalizes after any grant
+    /// withdrawal, access failure or dropped future. No replacement owner.
+    pub(in crate::rtw89) async unsafe fn retune_radio_a(
+        &mut self,
+        owner: &mut radio_a::Radio,
+        tables: &radio_init::Init,
+        assets: &radio_assets::Assets,
+        profile: Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.chip != ChipId::Rtl8852A {
+            return Err(power::Error::Unsupported);
+        }
+        self.radio_profile_current()?;
+        if !self.a_ordinary()?
+            || owner.state() != radio_a::State::Ready
+            || !self.coex_ready
+            || !self.nctl_ready
+            || self.full_qualification.is_some()
+        {
+            return Err(power::Error::Terminal);
+        }
+        if !radio_policy_a::admissible(profile) {
+            return Err(power::Error::Unsupported);
+        }
+        let q = self.qualification_a.clone().ok_or(power::Error::Terminal)?;
+        if owner.channel() == Some(profile) {
+            if q.active() != profile
+                || self.operating_channel()
+                    != Some((OperatingChannel::legacy(profile.primary()), owner.epoch()))
+            {
+                return Err(power::Error::Terminal);
+            }
+            return Ok(owner.epoch());
+        }
+        // A live station needs an actual RXQ/RPQ epoch/quarantine handoff,
+        // not only software backlog and Core readiness. That continuation
+        // is not composed; refuse before withdrawing any source authority.
+        if self.station_runtime.started() {
+            return Err(power::Error::Unsupported);
+        }
+        if !q.channel_allowed(profile).map_err(denied)? {
+            return Err(power::Error::Unsupported);
+        }
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+        let rfe = identity.calibration().rfe_type;
+        let plan = radio_power_c::Plan::from_elements_a(assets.elements(), rfe, profile)
+            .map_err(denied)?;
+        let board = radio_policy_a::Board::new(
+            self.lifecycle,
+            factory,
+            self.device.id,
+            assets,
+            profile,
+            &plan,
+            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+        )
+        .map_err(denied)?;
+        if !q.channel_matches(board) {
+            return Err(power::Error::Access);
+        }
+        let calibration = *tables.calibration_a().ok_or(power::Error::Unsupported)?;
+        if factory_a::Calibration::from_factory(factory) != Some(calibration) {
+            return Err(power::Error::Access);
+        }
+        let tracking = crate::rtw89::rfk::a_tssi::Tracking::from_assets(assets).map_err(denied)?;
+        let tail =
+            crate::rtw89::rfk::a_tssi::tail::Inputs::from_assets(assets, rfe, plan.channel())
+                .map_err(denied)?;
+        self.poll().map_err(|_| power::Error::Access)?;
+        if self.sleep_blocked
+            || self.sleep_reset.is_some()
+            || self.station_runtime.peer.is_some() != linked
+            || self.station_runtime.monitor.is_some()
+            || self.station_runtime.ap.is_some()
+            || (linked && self.station_runtime.core.is_none())
+            || self.queue.pending() != 0
+            || !self.station_runtime.backlog.is_empty()
+            || self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(|core| !core.ready())
+        {
+            return Err(power::Error::Busy);
+        }
+        self.with_ordinary_current(|native| crate::rtw89::station_control::awake(&mut native.io))?;
+        let grant = self.ordinary.take().ok_or(power::Error::Terminal)?;
+        self.channel = None;
+        q.select(profile).map_err(denied)?;
+        // SAFETY: this is the same original A Radio/tables/assets, with its
+        // exact target qualification selected above before effects. The live
+        // packet runtime is refused, actual command/Core/awake checks passed,
+        // and ordinary publication is withdrawn. Interface invokes current
+        // source/device authority; the enclosing Attempt retains DMA and
+        // closes uncertain help/PMAC/scheduler ownership on failure or drop.
+        unsafe {
+            owner.retune(
+                self,
+                profile,
+                &plan,
+                radio_a::ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    tail,
+                },
+            )
+        }
+        .await
+        .map_err(crate::rtw89::radio_c::error)?;
+        self.radio_profile_current()?;
+        q.current().map_err(denied)?;
+        if owner.channel() != Some(profile) || q.active() != profile {
+            return Err(power::Error::Terminal);
+        }
+        self.channel = Some((
+            OperatingChannel::new(plan.channel().band(), profile.primary()),
+            owner.epoch(),
+        ));
+        if let Some(core) = self.station_runtime.core.as_mut() {
+            core.set_operating_width(
+                profile.width() as u8,
+                profile.width() as u8 != 0 && profile.is_5ghz(),
+            );
+        }
+        self.ordinary = Some(grant);
+        Ok(owner.epoch())
     }
 }

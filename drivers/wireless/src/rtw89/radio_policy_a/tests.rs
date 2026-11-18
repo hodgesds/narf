@@ -86,6 +86,28 @@ fn base(cap: Cap<FirmwareBlob, Read>) -> Qualification {
     ]));
     q
 }
+/// Inert authenticated A-program boundary for actual Native observation
+/// tests. No production asset, global policy or calibrated receipt.
+pub(in crate::rtw89) fn revocable_model() -> (Qualification, Cap<FirmwareBlob, Read>) {
+    let cap = authority();
+    (base(cap), cap)
+}
+/// Inert signed boundary with the complete A base optional-program bits;
+/// this constructs no radio/channel receipt or aggregation companion.
+pub(in crate::rtw89) fn programs_model() -> (Qualification, Cap<FirmwareBlob, Read>) {
+    let cap = authority();
+    let exact = board(Profile::INITIAL, 7);
+    let flags = Program::ALL
+        .into_iter()
+        .fold(BASE_FLAGS, |flags, program| flags | program.bit());
+    let mut image = base_image(exact);
+    image[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+    image[57] = flags;
+    let mut qualification =
+        Qualification::from_verified(&image, Some([3; 32]), exact, cap).unwrap();
+    qualification.model_domain = base(cap).model_domain;
+    (qualification, cap)
+}
 /// Explicit inert authenticated-record boundary for native register tests;
 /// no production attach, measured RF envelope or physical receipt is minted.
 pub(in crate::rtw89) fn fragment_model() -> (

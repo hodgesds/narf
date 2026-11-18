@@ -850,13 +850,15 @@ fn preauthorization_fixture(
     bus.secured = secured;
     bus.preauthorization_packets = packets;
     bus.preauthorization_loss = loss;
-    let mut station = narf_scheduler::block_on(Station::initialize(
+    // This scripted F2 bus has no IRQ for real control/idle-fence delays;
+    // keep those deadlines while driving the RAM model on the test BSP.
+    let mut station = narf_scheduler::block_on_spin(Station::initialize(
         alloc::boxed::Box::new(Runtime::new(bus)),
         &[1],
         domain(),
     ))
     .map_err(|_| "preauthorization fixture init")?;
-    narf_scheduler::block_on(station.scan(scan_request()))
+    narf_scheduler::block_on_spin(station.scan(scan_request()))
         .map_err(|_| "preauthorization fixture scan")?;
     Ok(station)
 }
@@ -866,7 +868,7 @@ fn smoke_cyw_station_idle_fence_drops_fifo_backlog_beyond_control_and_receive_bu
         let Ok(mut station) = preauthorization_fixture(secure, 64, false) else {
             return TestResult::Fail("SDPCM idle fixture");
         };
-        if narf_scheduler::block_on(station.associate(join_request(secure))) != Ok(())
+        if narf_scheduler::block_on_spin(station.associate(join_request(secure))) != Ok(())
             || station.bssid != Some(AP)
             || station.runtime.poll() != Ok(0)
             || station.runtime.pop_data().is_some()
@@ -885,7 +887,7 @@ fn smoke_cyw_station_idle_fence_observes_peer_loss_after_more_than_one_rx_budget
     let Ok(mut station) = preauthorization_fixture(true, 64, true) else {
         return TestResult::Fail("SDPCM delayed peer-loss fixture");
     };
-    if narf_scheduler::block_on(station.associate(join_request(true))).is_ok()
+    if narf_scheduler::block_on_spin(station.associate(join_request(true))).is_ok()
         || station.bssid.is_some()
         || !station.runtime.is_failed()
         || station.poll().is_ok()

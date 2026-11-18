@@ -70,6 +70,9 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) amsdu: Option<usize>,
     pub(in crate::rtw89) revoke_amsdu_on_allocate: bool,
     peer_live: bool,
+    // Station descriptors use MACID0; the AP fixture explicitly binds its
+    // peer's MACID before issuing a descriptor.
+    expected_mac_id: u8,
     fragment: Option<crate::rtw89::command_native::FragmentPart>,
     pub(in crate::rtw89) peer: Option<crate::rtw89::station_control::Peer>,
     deny_after_allocation: Option<bool>,
@@ -110,6 +113,7 @@ impl Model {
             amsdu: None,
             revoke_amsdu_on_allocate: false,
             peer_live: true,
+            expected_mac_id: 0,
             fragment: None,
             peer: None,
             deny_after_allocation: None,
@@ -362,7 +366,7 @@ impl Model {
         let sequence = u16::from_le_bytes(header[48..50].try_into().unwrap());
         if word(0) != expected0
             || word(4) != 0
-            || word(8) >> 24 != 0
+            || word(8) >> 24 != u32::from(self.expected_mac_id)
             || body[0] != 0x88 && word(8) >> 23 & 1 != 0
             || word(8) >> 17 & 0x3f != u32::from(kind.qsel())
             || header[16..24] != [0; 8]
@@ -1102,8 +1106,8 @@ pub(in crate::rtw89) fn native_fragment_core(
     native_fragment_core_for_chip(ChipId::Rtl8852B, own)
 }
 /// [`native_fragment_core`] for the given chip: the Core's chip selects its
-/// ring registers and TXWD profile (`transmit_a` on RTL8852A, the AX v0
-/// body shared with B).
+/// ring registers and actual fragment TXWD chip profile (the AX v0 body
+/// shared by RTL8852A and B).
 pub(in crate::rtw89) fn native_fragment_core_for_chip(
     chip: ChipId,
     own: [u8; 6],
@@ -1399,9 +1403,18 @@ fn smoke_rtw89_a_packet_station_amsdu_aggregate_ap() -> TestResult {
         report: false,
         rate: format::FIRMWARE_RA,
     };
-    let Ok(id) = ap.submit_ap(&mut model, &frame(), tx) else {
+    // frame() is a station ToDS fixture. AP data must carry FromDS;
+    // retain a real unicast source in address3 as an Ethernet sender.
+    let mut ap_frame = frame();
+    ap_frame[1] = 2;
+    ap_frame[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+    model.expected_mac_id = tx.mac_id;
+    let Ok(id) = ap.submit_ap(&mut model, &ap_frame, tx) else {
         return TestResult::Fail("A AP frame refused");
     };
+    if model.transmitted.last() != Some(&ap_frame) {
+        return TestResult::Fail("A AP FromDS publication changed its source frame");
+    }
     let history = model.history.clone();
     model.consumed(history[0]);
     model.report(history[0], 0).unwrap();

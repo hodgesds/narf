@@ -26,7 +26,7 @@ use super::backplane::{split as window_split, window_writes};
 use super::chipclk;
 use super::core::{D11, SDIO_DEVICE, SOC_RAM, SOC_RAM_BASE, WLAN_ARM};
 use super::sdio::{CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL};
-use super::transport::{Function, Transport, TransportError};
+use super::transport::{Function, LoaderMode, Transport, TransportError};
 use crate::brcmfmac::chip::{Backplane, Chip, Core};
 
 /// Existing loader image-size ceiling, also checked before native F1 setup.
@@ -184,9 +184,9 @@ pub struct FirmwareLoader<'fw, T: Transport> {
     firmware: &'fw [u8],
     nvram: &'fw [u8],
     soc_ram_size: u32,
-    /// Whether the transport is gSPI (and therefore needs the
-    /// endian self-check + bus-control register dance) versus SDIO.
-    pub is_gspi: bool,
+    /// Requested mode, checked against the immutable transport-owned mode
+    /// before every step. This boolean alone supplies no protocol proof.
+    is_gspi: bool,
     layout: Option<(Core, Core)>,
     next_step: usize,
     failed: bool,
@@ -264,6 +264,15 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         if self.failed || LOAD_SEQUENCE.get(self.next_step) != Some(&step) {
             return Err(LoadError::InvalidState);
         }
+        let requested = if self.is_gspi {
+            LoaderMode::Gspi
+        } else {
+            LoaderMode::Sdio
+        };
+        if self.transport.loader_mode() != requested {
+            self.failed = true;
+            return Err(LoadError::Transport(TransportError::NotReady));
+        }
         if self.next_step == 0 {
             self.validate_images()?;
         }
@@ -290,16 +299,15 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         if !self.is_gspi {
             return Ok(());
         }
-        let val = self
-            .transport
-            .read32(Function::Bus, super::gspi::REG_TEST_RO)?;
-        if val != super::gspi::TEST_RO_PATTERN {
-            return Err(LoadError::EndianMismatch);
-        }
+        self.transport.initialize_gspi()?;
         Ok(())
     }
 
     fn bus_init(&mut self) -> Result<(), LoadError> {
+        if self.is_gspi {
+            // F0 offsets 2/3 are SPI controls, not SDIO CCCR enable/ready.
+            return Ok(());
+        }
         // Enable F1. The bus width belongs to the host's SDIO enumeration
         // (Linux mmc sdio_enable_4bit_bus); brcmfmac never rewrites CCCR_IF.
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 1 << 1)?; // F1
@@ -418,6 +426,13 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
     }
     fn enable_wlan_function(&mut self) -> Result<(), LoadError> {
         let (_, sdio) = self.layout.ok_or(LoadError::InvalidState)?;
+        if self.is_gspi {
+            // MIT cyw43_ll_bus_init: SDIO_INT_HOST_MASK/I_HMB_SW_MASK.
+            // The SDIO protocol mailbox write below is not part of this path.
+            self.backplane_write32(sdio.base + 0x24, 0xf0)?;
+            self.transport.finish_gspi_boot()?;
+            return Ok(());
+        }
         self.backplane_write32(sdio.base + 0x48, 4 << 16)?;
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 6)?;
         self.poll_byte(Function::Bus, CCCR_IO_READY, 4)
@@ -658,6 +673,9 @@ ccode=US
     }
 
     impl Transport for MockTransport {
+        fn loader_mode(&self) -> LoaderMode {
+            LoaderMode::Sdio
+        }
         fn read32(&mut self, _f: Function, addr: u32) -> Result<u32, TransportError> {
             Ok(*self
                 .words
@@ -784,6 +802,139 @@ ccode=US
     kernel_test_in!(
         "drivers/wireless/cyw43439/firmware",
         smoke_loader_drives_full_sequence
+    );
+
+    /// This actor exposes the discovered AI cores but refuses SDIO F0 aliases.
+    /// Wire bootstrap/dummy/packet semantics are exercised by gspi_port tests.
+    struct GspiLoaderModel {
+        inner: MockTransport,
+        initialized: bool,
+        ready: bool,
+    }
+    impl Transport for GspiLoaderModel {
+        fn loader_mode(&self) -> LoaderMode {
+            LoaderMode::Gspi
+        }
+        fn initialize_gspi(&mut self) -> Result<(), TransportError> {
+            if self.initialized {
+                return Err(TransportError::NotReady);
+            }
+            self.initialized = true;
+            Ok(())
+        }
+        fn finish_gspi_boot(&mut self) -> Result<(), TransportError> {
+            if self.inner.words.get(&0x18011024) != Some(&0xf0)
+                || self.inner.words.contains_key(&0x18011048)
+            {
+                return Err(TransportError::BadFraming);
+            }
+            self.ready = true;
+            Ok(())
+        }
+        fn read32(&mut self, f: Function, a: u32) -> Result<u32, TransportError> {
+            if !self.initialized || f == Function::Bus {
+                return Err(TransportError::BadFraming);
+            }
+            self.inner.read32(f, a)
+        }
+        fn write32(&mut self, f: Function, a: u32, v: u32) -> Result<(), TransportError> {
+            if !self.initialized || f == Function::Bus {
+                return Err(TransportError::BadFraming);
+            }
+            self.inner.write32(f, a, v)
+        }
+        fn read_burst(&mut self, f: Function, a: u32, b: &mut [u8]) -> Result<(), TransportError> {
+            if !self.initialized || f == Function::Bus {
+                return Err(TransportError::BadFraming);
+            }
+            self.inner.read_burst(f, a, b)
+        }
+        fn write_burst(&mut self, f: Function, a: u32, b: &[u8]) -> Result<(), TransportError> {
+            if !self.initialized || f == Function::Bus {
+                return Err(TransportError::BadFraming);
+            }
+            self.inner.write_burst(f, a, b)
+        }
+    }
+    fn smoke_gspi_loader_never_uses_sdio_cccr_or_mailbox() -> TestResult {
+        let model = GspiLoaderModel {
+            inner: mock(),
+            initialized: false,
+            ready: false,
+        };
+        let nvram = build_nvram_blob("ccode=US\n").unwrap();
+        let firmware = [0xa5; 67];
+        let mut loader = FirmwareLoader::new(model, &firmware, &nvram, 256 * 1024, true);
+        if loader.run().is_err()
+            || !loader.transport.ready
+            || !loader
+                .transport
+                .inner
+                .log
+                .iter()
+                .any(|(_, _, b)| b == &firmware)
+            || !loader
+                .transport
+                .inner
+                .log
+                .iter()
+                .any(|(_, _, b)| b == &nvram)
+        {
+            return TestResult::Fail(
+                "gSPI loader aliased SDIO controls or lost exact firmware/NVRAM",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/firmware",
+        smoke_gspi_loader_never_uses_sdio_cccr_or_mailbox
+    );
+
+    fn smoke_loader_refuses_sdio_gspi_mismatch_and_unknown_mode_without_effects() -> TestResult {
+        let nvram = build_nvram_blob("ccode=US\n").unwrap();
+        let mut loader = FirmwareLoader::new(mock(), &[0xa5; 64], &nvram, 0, true);
+        if loader.run() != Err(LoadError::Transport(TransportError::NotReady))
+            || !loader.transport.log.is_empty()
+            || loader.transport.word_writes != 0
+            || loader.transport.poll_call != 0
+        {
+            return TestResult::Fail("SDIO-owned transport accepted gSPI loader mode");
+        }
+        struct Unknown;
+        impl Transport for Unknown {
+            fn read32(&mut self, _: Function, _: u32) -> Result<u32, TransportError> {
+                panic!("unidentified transport must refuse before I/O")
+            }
+            fn write32(&mut self, _: Function, _: u32, _: u32) -> Result<(), TransportError> {
+                panic!("unidentified transport must refuse before I/O")
+            }
+            fn read_burst(
+                &mut self,
+                _: Function,
+                _: u32,
+                _: &mut [u8],
+            ) -> Result<(), TransportError> {
+                panic!("unidentified transport must refuse before I/O")
+            }
+            fn write_burst(&mut self, _: Function, _: u32, _: &[u8]) -> Result<(), TransportError> {
+                panic!("unidentified transport must refuse before I/O")
+            }
+        }
+        for requested_gspi in [false, true] {
+            let mut loader = FirmwareLoader::new(Unknown, &[0xa5; 64], &nvram, 0, requested_gspi);
+            if loader.run() != Err(LoadError::Transport(TransportError::NotReady))
+                || loader.run() != Err(LoadError::InvalidState)
+                || loader.packet_core().is_some()
+            {
+                return TestResult::Fail("unknown loader mode accepted a caller boolean or replay");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/firmware",
+        smoke_loader_refuses_sdio_gspi_mismatch_and_unknown_mode_without_effects
     );
     fn smoke_cyw_signed_selected_chip_revision_precedes_core_mutation_and_payload() -> TestResult {
         use crate::brcmfmac::provision::{tests::selected_fixture, Family};

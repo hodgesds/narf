@@ -84,6 +84,9 @@ impl Request {
         let mut body = vec![0; 48];
         body[..8].copy_from_slice(&[link.bss(), link.peer(), 1, 0, 1, link.omac(), 0, 0]);
         body[8..20].copy_from_slice(&[13, 0, 40, 0, 1, 2, 1, 0, 0, 0, 0, 0]);
+        // mt76_connac_mcu_alloc_wtbl_req uses this same peer WCID,
+        // independently of the outer STA_REC_UPDATE WLAN index.
+        body[12] = link.peer();
         body[20..24].copy_from_slice(&[8, 0, 28, 0]);
         body[24] = self.tid;
         body[25] = 2; // MT_BA_TYPE_RECIPIENT.

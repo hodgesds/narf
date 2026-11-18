@@ -52,16 +52,29 @@ impl<R: Fullmac> Station<R> {
         source: Arc<dyn PolicySource>,
     ) -> Result<Self, Error> {
         let domain = source.snapshot().ok_or(Error::Authority)?;
-        let mut station = Self::initialize_inner(runtime, clm, domain, Some(source)).await?;
-        station.refresh_policy()?;
-        let domain = station.domain.clone();
-        station
-            .channels
+        let mut station = crate::future_heap::build(|| async {
+            Self::initialize_inner(runtime, clm, domain, Some(source))
+                .await
+                .map(Box::new)
+        })
+        .await?;
+        station.finish_live_initialization()?;
+        Ok(*station)
+    }
+
+    // The complete returned station contains the original runtime by value.
+    // Keep its policy check and final move separate from initialization's
+    // command and transport temporaries in the async polling frame.
+    #[inline(never)]
+    fn finish_live_initialization(&mut self) -> Result<(), Error> {
+        self.refresh_policy()?;
+        let domain = self.domain.clone();
+        self.channels
             .retain(|&ch| channel_ceiling(&domain, ch, false).is_some());
-        if station.channels.is_empty() {
-            return Err(station.deny_policy());
+        if self.channels.is_empty() {
+            return Err(self.deny_policy());
         }
-        Ok(station)
+        Ok(())
     }
 
     pub(super) fn deny_policy(&mut self) -> Error {

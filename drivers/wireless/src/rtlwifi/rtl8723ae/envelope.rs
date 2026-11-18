@@ -31,13 +31,12 @@
 //!   `phy_get_tx_swing_8812A`, an 8812A-specific source with no 8723AE
 //!   grounding, so [`Permission`] carries no swing value and the packet
 //!   owner never programs swing from the envelope.
-//! - No factory per-rate TXAGC cap: no 8723AE `ByRate` table exists
-//!   in-tree (the 8192EE `PHY_REG_PG` table is 8192EE-specific). Rate
-//!   selection scans the full TXAGC index range `0..=63` for the
-//!   highest measured index whose output plus antenna gain fits the
-//!   ceiling; a factory-cap refinement is a documented remainder. The
-//!   regulatory ceiling plus the qualified EIRP still bound every
-//!   admitted index, and every index comes from a signed measured curve.
+//! - The existing [`Calibration::permission_for`] remains NAPC metadata
+//!   selection over `0..=63`. The draft native preparation policy composes
+//!   a separate exact NAQR companion and AE factory/PG cap, then searches
+//!   measured entries inside that cap. Neither this old NAPC record nor a
+//!   lower unmeasured index can authorize the physical PA/IQK recipe. Native
+//!   calibration/station invocation remains unwired pending retained lifecycle.
 //! - Station rates are the 20 full-order rates CCK 0..3, OFDM 4..11,
 //!   HT MCS0-7 12..19. Every one must be admitted or the operating
 //!   point is not admitted ([`Error::NoMeasuredGain`]).
@@ -192,6 +191,8 @@ pub struct Calibration {
     qualified: i16,
     curves: Vec<Curve>,
     authority: Option<Cap<FirmwareBlob, Read>>,
+    /// Exact loaded NAPC payload, never a later registry lookup.
+    pub(super) digest: [u8; 32],
 }
 
 impl core::fmt::Debug for Calibration {
@@ -218,6 +219,11 @@ pub struct Permission {
 }
 
 impl Permission {
+    /// A narrower separately signed station profile cannot expose the old
+    /// metadata envelope's unused HT bits as active station authority.
+    pub(super) fn restrict_station_rates(&mut self, mask: u64) {
+        self.admitted &= mask;
+    }
     /// The admitted primary channel.
     pub fn channel(&self) -> u8 {
         self.op.channel
@@ -233,8 +239,9 @@ impl Permission {
         self.eirp
     }
 
-    /// Admitted TXAGC index for a full-order rate (0 for unadmitted or
-    /// non-station rates).
+    /// Factory-capped programmed index for a full-order rate. A narrow NASR
+    /// profile retains unused hardware indices unchanged; only `admits`
+    /// authorizes naming a rate on air. Non-station rates return0.
     pub fn index(&self, rate: u8) -> u8 {
         self.index.get(usize::from(rate)).copied().unwrap_or(0)
     }
@@ -385,6 +392,11 @@ impl Calibration {
             qualified,
             curves,
             authority: None,
+            digest: {
+                let mut hash = narf_crypto::sha256::Sha256::new();
+                hash.update(bytes);
+                hash.finalize()
+            },
         })
     }
 
@@ -456,6 +468,131 @@ impl Calibration {
         })
     }
 
+    /// Metadata selection for the separate exact-program companion. This
+    /// alone is not a live native grant and never changes old NAPC semantics.
+    /// No monotonicity assumption: search measured entries INSIDE each cap.
+    pub(super) fn factory_permission(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        op: Operating,
+        caps: &[u8; 20],
+        antenna: i16,
+        qualified: i16,
+    ) -> Result<Permission, Error> {
+        self.current()?;
+        if caps.iter().any(|c| *c > 63) || antenna < self.antenna || !(0..=128).contains(&antenna) {
+            return Err(Error::FactoryPower);
+        }
+        let eirp = span_ceiling(domain, op)?.min(self.qualified).min(qualified);
+        let curve = self
+            .curves
+            .iter()
+            .find(|c| c.op == op)
+            .ok_or(Error::NoMeasuredGain)?;
+        self.select_factory(op, caps, antenna, eirp, &curve.output)
+    }
+    /// A separately current NASR source supplies independently measured
+    /// worst-case station/coexistence curves; old NAPC rows keep their old
+    /// meaning. Native caller encloses this calculation AND effects in NASR.
+    pub(super) fn joint_permission(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        op: Operating,
+        caps: &[u8; 20],
+        antenna: i16,
+        qualified: i16,
+        output: &[[i16; 64]; 3],
+    ) -> Result<Permission, Error> {
+        self.current()?;
+        if caps.iter().any(|cap| *cap > 63)
+            || antenna < self.antenna
+            || !(0..=128).contains(&antenna)
+        {
+            return Err(Error::FactoryPower);
+        }
+        let eirp = span_ceiling(domain, op)?.min(self.qualified).min(qualified);
+        self.select_factory(op, caps, antenna, eirp, output)
+    }
+    fn select_factory(
+        &self,
+        op: Operating,
+        caps: &[u8; 20],
+        antenna: i16,
+        eirp: i16,
+        output: &[[i16; 64]; 3],
+    ) -> Result<Permission, Error> {
+        let mut index = [0; 20];
+        for rate in STATION_RATES {
+            let family = match rate {
+                0..=3 => 0,
+                4..=11 => 1,
+                _ => 2,
+            };
+            let cap = if rate == 3 {
+                0
+            } else {
+                caps[usize::from(rate)]
+            };
+            let selected = (0..=cap)
+                .rev()
+                .find(|gain| {
+                    let out = output[family][usize::from(*gain)];
+                    out != UNKNOWN && i32::from(out) + i32::from(antenna) <= i32::from(eirp)
+                })
+                .ok_or(Error::NoMeasuredGain)?;
+            index[usize::from(rate)] = selected;
+        }
+        Ok(Permission {
+            identity: self.identity,
+            op,
+            index,
+            admitted: LEGACY_MASK,
+            eirp,
+        })
+    }
+    pub(super) fn board_identity(&self) -> [u8; 32] {
+        self.identity
+    }
+    pub(super) fn antenna(&self) -> i16 {
+        self.antenna
+    }
+    pub(super) fn qualified(&self) -> i16 {
+        self.qualified
+    }
+
+    /// The closure performs the actual operation inside current authority.
+    /// Constructing/returning a future here is not operation admission.
+    pub(super) fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>,
+    ) -> Result<T, crate::rtlwifi::prepare::Error> {
+        use narf_capabilities::{CapError, CapOp};
+        struct Invoke<F>(F);
+        impl<T, F: FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>> CapOp<FirmwareBlob, Read>
+            for Invoke<F>
+        {
+            type Output = Result<T, crate::rtlwifi::prepare::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        if let Some(cap) = &self.authority {
+            return cap
+                .invoke(Invoke(operation))
+                .map_err(|_| crate::rtlwifi::prepare::Error::Power(Error::Authority))?;
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        return operation(); // Only inert metadata fixtures have no retained asset.
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        Err(crate::rtlwifi::prepare::Error::Power(Error::Authority))
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn bind_fixture_authority(mut self, cap: Cap<FirmwareBlob, Read>) -> Self {
+        self.authority = Some(cap);
+        self
+    }
+
     /// Loader-authority recency, mirroring `rtl8821ae::envelope`: a live
     /// authority must still invoke; inert verified-metadata fixtures
     /// pass under test / kernel-test configuration.
@@ -473,7 +610,7 @@ impl Calibration {
 /// Regulatory ceiling (quarter dBm) for an operating point: the shared
 /// 2.4 GHz legacy20 ceiling for 20 MHz points; the spanning-rule
 /// ceiling (mirroring `rtl8821ae::envelope::span_ceiling`) for 40 MHz.
-fn span_ceiling(
+pub(super) fn span_ceiling(
     domain: &narf_wireless::reg::RegulatoryDomain,
     op: Operating,
 ) -> Result<i16, Error> {

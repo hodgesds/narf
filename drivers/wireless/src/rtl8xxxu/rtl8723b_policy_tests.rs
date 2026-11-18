@@ -95,7 +95,7 @@ fn smoke_rtl8723bu_record_format() -> TestResult {
     {
         return TestResult::Fail("8723bu record validation");
     }
-    if Calibration::asset_name(&f) != "rtl8xxxu/rtl8723bu-cal-v1-00e04c8723b0" {
+    if Calibration::asset_name(&f) != "rtl8xxxu/rtl8723bu-cal-v1-00e04c8723b0.bin" {
         return TestResult::Fail("8723bu asset name");
     }
     TestResult::Pass

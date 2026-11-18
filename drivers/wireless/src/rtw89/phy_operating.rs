@@ -39,6 +39,8 @@ pub(super) struct WorkingState {
 pub(super) struct Operating {
     state: State,
     working: Option<WorkingState>,
+    a_gains: Option<super::dig_a::Gains>,
+    a_tracker: Option<alloc::boxed::Box<super::track::Tracker>>,
 }
 struct Access<'a, I>(&'a mut I);
 impl<I: Interface> Access<'_, I> {
@@ -70,6 +72,18 @@ impl<I: Interface> Access<'_, I> {
     }
 }
 impl Operating {
+    pub(super) fn take_a_tracker(&mut self) -> Option<alloc::boxed::Box<super::track::Tracker>> {
+        if self.state == State::Prepared {
+            self.a_tracker.take()
+        } else {
+            None
+        }
+    }
+    pub(super) fn a_gains(&self) -> Option<super::dig_a::Gains> {
+        (self.state == State::Prepared)
+            .then_some(self.a_gains)
+            .flatten()
+    }
     pub(super) fn state(&self) -> State {
         self.state
     }
@@ -300,9 +314,8 @@ impl Operating {
     /// default (2.4GHz channel 1 / 20MHz, unlinked) chandef:
     /// `rtw89_physts_parsing_init` (AX PHYSTS, identical to B),
     /// `rtw89_phy_dig_init` with `rtw8852a_dig_regs` (core.c: `support_igi`
-    /// true only for `cut <= 1`, which affects runtime DIG only, not
-    /// init; `support_cckpd` true iff `cut > 1`; the non-V1 PAGCUGC
-    /// registers), `rtw89_phy_cfo_init` (XTAL SI SC_XO/SC_XI as B;
+    /// true only for `cut <= 1`, including actual gain reads/initial IGI; `support_cckpd` true iff `cut > 1`; the non-V1 PAGCUGC
+    /// registers), `rtw89_phy_cfo_init` (A direct XTAL_ON_CTRL0 SC_XO/SC_XI;
     /// `rtw89_dcfo_comp_init` with `cfo_hw_comp = false`: `R_DCFO` = 1
     /// and `R_AX_PWR_UL_CTRL2` CFO cleared) and `rtw89_phy_edcca_init`.
     /// `bb_wrap`/`ch_info` are BE-only, `ul_tb_waveform_ctrl` is false
@@ -329,8 +342,36 @@ impl Operating {
         {
             return Err(Error::Table);
         }
+        // Source DM environment/NHM precedes PHYSTS/DIG. Store the owner
+        // before its first access, including cancellation/error histories.
+        self.a_tracker = Some(alloc::boxed::Box::default());
+        self.a_tracker
+            .as_mut()
+            .ok_or(Error::Terminal)?
+            .prepare_a(io, identity)?;
         let mut a = Access(io);
         physts(&mut a)?;
+        let gains = if identity.cut() <= 1 {
+            let gains = super::dig_a::Gains::read(|address, mask| {
+                let raw = a.read(0x10000 + address)?;
+                Ok((raw & mask) >> mask.trailing_zeros())
+            })?;
+            self.a_gains = Some(gains);
+            self.a_tracker
+                .as_mut()
+                .ok_or(Error::Terminal)?
+                .a_gains(Some(gains))?;
+            for &(address, mask, value) in super::dig_a::MAX_GAIN_WRITES {
+                a.bb(address, mask, value)?;
+            }
+            Some(gains)
+        } else {
+            self.a_tracker
+                .as_mut()
+                .ok_or(Error::Terminal)?
+                .a_gains(None)?;
+            None
+        };
         // `rtw89_phy_dig_dyn_pd_th(rssi_nolink, false)`.
         a.bb(c_regs::R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
         a.bb(
@@ -372,13 +413,13 @@ impl Operating {
             a.bb(address, mask, 0)?;
         }
         let cap = identity.xtal() & 0x7f;
-        for address in [5, 4] {
-            a.0.admit()?;
-            a.0.xtal_write(address, cap, 255).await?;
+        // A has non-NULL xtal_info: phy.c sets direct SC_XO/SC_XI
+        // fields in XTAL_ON_CTRL0, never B/C's XTAL SI addresses5/4.
+        for mask in [0x00fe_0000, 0x0001_fc00] {
+            a.modify(0x0280, mask, u32::from(cap))?;
         }
-        for address in [5, 4] {
-            a.0.admit()?;
-            if a.0.xtal_read(address).await? != cap {
+        for mask in [0x00fe_0000, 0x0001_fc00] {
+            if (a.read(0x0280)? & mask) >> mask.trailing_zeros() != u32::from(cap) {
                 return Err(Error::Terminal);
             }
         }
@@ -396,6 +437,7 @@ impl Operating {
             crystal_upper: cap.saturating_add(64).min(127),
             cck_pd,
         });
+        self.a_gains = gains;
         self.state = State::Prepared;
         Ok(())
     }

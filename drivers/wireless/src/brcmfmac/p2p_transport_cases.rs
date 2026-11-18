@@ -38,7 +38,10 @@ pub(crate) trait Model {
 }
 
 fn block<F: core::future::Future>(future: F) -> F::Output {
-    narf_scheduler::block_on(future)
+    // Both RAM transport models can reach the real Runtime IOCTL polling
+    // delay. They supply no IRQ, and the BSP test timer may be parked;
+    // repoll the bounded conversation without inventing a completion.
+    narf_scheduler::block_on_spin(future)
 }
 
 pub(crate) fn features() -> Features {

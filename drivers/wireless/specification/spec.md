@@ -689,6 +689,35 @@ configuration-order case and one order-dependent iwlwifi 6 GHz case.
 brcmfmac, cyw43439, mt76 and rtl8xxxu were not run in that batch. aarch64
 native runs and physical acceptance remain separate.
 
+**2026-11-16 — remaining-row reconciliation.** The branch starts at
+`4daa0b5a9`, matching GitHub main. Open PRs #2162, #2083, #1054 and
+#1045 were checked, including the file lists of the board/device-tree
+and driver-configuration programmes. None changes the Wi-Fi files in
+this continuation. Board SPI/SDHCI work in #1054 stays with that PR;
+CYW43439 platform opening and gSPI packet service remain explicit gaps.
+The final PR recheck found three additional GPU-only proposals (#2164,
+#2166, #2168). #2164 owns the unrelated RS64 frame-size fix that blocks
+the normal x86_64 kernel-test launch; it is not duplicated here.
+The existing AR9580 signed legacy20 owner and the newly composed IPQ6018
+bring-up move to the validation ledger (13 open rows, 94 pending validation);
+the remaining chip rows now distinguish delivered native owners from
+their actual residual work. AR9462/AR9565 MCI message ownership does not
+complete live coexistence duty-cycle scheduling. RTL8852A has an initial
+RF owner and isolated channel RFK, but still lacks the native channel
+program. This continuation adds the retained IPQ6018 WLFW-to-core
+conversation and RTL8723BE linked ATC. Neither establishes RF acceptance.
+The validation pass also corrects AR9003 INI tests that compared constant
+addresses instead of register/value rows, MCI expectations that omitted
+the source 90% duty-cycle clamp, an NF expectation on a disabled chain,
+and inherited INI/RCR expectations in AR9565/RTL8723BE configuration tests.
+Independent source-derived table digests remain unchanged.
+Scoped validation of ath11k, AR9003 and RTL8723BE passes 525/0/2 on
+x86_64 in a direct diagnostic QEMU boot and 524/0/3 on aarch64 through
+the normal xtask gate, including production boot and btrfs postflight.
+The x86_64 normal gate remains blocked by the untouched GPU frame above.
+Strict scoped release Clippy and debug compilation pass on both arches;
+workspace formatting passes. Physical acceptance remains pending.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 0 | Multiple-active-link MLO; WoWLAN is implemented pending validation; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -1762,6 +1791,461 @@ receipt; newly pending input leaves the command unissued for a bounded retry,
 and nothing is retried after publication. Family `rtw88.md` lists the cases.
 2026-11-02 recount: 52 open features plus 26 implemented pending validation.
 
+
+### 3.19 RTL8723BE native CFO and linked ATC
+
+The original native RX owner retains signed path CFO samples and a
+wrapping packet counter separately from lazy DM initialization. Only
+error-free non-CCK frames with a complete PHY prefix and the currently
+programmed BSSID contribute. Disconnect clears that BSSID. The linked
+watchdog consumes fresh samples once, after RA refresh, and follows the
+RF_1T1R path-A ATC/crystal adjustment. The initial crystal cap is retained
+separately from the adjusted cap. Register access uses the same owner's
+authority and terminal failure handling; a CFO sample grants no TX or
+calibration authority. The family spec records hysteresis, clamps,
+remaining DM work and native regression coverage.
+
+### 3.20 AR9003 live MCI duty-cycle service
+
+AR9462/AR9565 share one `MciLink` between the hardware owner and EDMA
+packet engine. Driver timer defaults and profile GPM updates feed timed
+stomp/no-stomp weight writes through that original packet port.
+`Engine::coex_wait_us` reports a relative deadline to the existing async
+netdev worker, which releases the station lock before waiting and services
+due edges without requiring an interrupt. Reset, stop and WoW cancel the
+deadlines; successful resume starts a fresh period. Current authority and
+register checks remain mandatory for every write. Profile priorities are
+copied into the weight engine; concurrent-TX enablement still requires
+RSSI and calibrated power-policy integration. Associated-beacon RSSI now
+also drives the source fifth-weak-period AUDIO selection; association
+resets marker 127 while timer/profile pauses preserve history. The
+configured profile still determines the later no-stomp edge. FTP requires
+native network-sleep/traffic inputs. The family spec §3.12 owns
+the source timer boundaries, lifecycle and failure contract.
+
+### 3.21 Driver construction and recovery storage
+
+AR9300 station and ath11k runtime/netdev construction reserve the final
+`Arc` allocation before initializing the large owner; an allocation is
+published only after every field is initialized. Gen2 USB station handoff
+retains its radio in a box across the construction boundary. AHB bring-up
+and transport recovery use the existing pinned heap-future wrapper, with
+the original future and cancellation guards retained. These construction
+boundaries keep large values out of their callers' kernel stack frames;
+they do not change capability checks, hardware sequencing or ownership
+on failure. The Qualcomm kernel-test runner also retains its future on
+the heap. Stack-budget exceptions are removed when the measured frame
+fits; budgets are never increased for these changes.
+The rtw89 generation supervisor also retains its phase-dependent
+firmware/radio advance future on the heap, keeping that state out of the
+supervisor's frame while preserving its existing borrows and cancellation.
+Cold rtw89 generation and brcmfmac provisioning polls have opaque boxed
+future boundaries. Intel startup also constructs its future on the heap
+behind a separate probe/scheduler boundary.
+AHB runtime construction uses transient heap storage
+before moving the same runtime into Shared; failed registration still
+retains it. These boundaries keep compiler inlining from combining the
+large cold construction and registration frames.
+Virtual ath11k MAC construction also uses transient heap storage and a
+separate constructor boundary before publishing the child netdev.
+The ath10k RAW station State retains its Security owner in a Box, built
+at the original startup point through a synchronous constructor boundary.
+Hardware ordering, key/M4 deadlines and failed/cancelled retained ownership
+remain the same; asynchronous startup no longer carries the inline security
+construction and State-move temporaries together.
+
+### 3.22 RTL8723BE native EDCA watchdog
+
+The retained RTL8723BE owner counts accepted unicast MPDUs and recognizes
+the associated AP from bounded beacon IEs/address prefixes. Its linked
+watchdog applies the source's EDCA policy after RA refresh and before ATC,
+through the existing station/calibration authority. Counter snapshots and
+recognition are per owner; disconnect clears the peer, WMM/ERP-slot
+programming resets turbo flags, firmware LPS suppresses the DM step, and an access
+failure makes the owner terminal. No sample grants emission authority or
+enables a new PHY mode. The family specification records exact register
+values, source arithmetic/window behavior and native regression coverage.
+The chip state is boxed to keep additions out of generic packet-owner
+move/removal stack frames.
+
+### 3.23 Native preparation and retained cleanup continuation
+
+RTL8723AE firmware startup retains one boxed cold owner across warm-aware
+LLT/MAC preparation, firmware download and post-download table/default
+setup. Cancellation and access failure are terminal; DMA/MAC gates remain
+parked. Separate source IQK/RF6052 preparation owners grant no emission
+authority or station readiness. Factory-bound radio handoff, physical
+PA-bias input and factory-capped current signed grants remain prerequisites
+for native calibration/station composition.
+
+RTL8852A native channel control and the qualified power prefix produce
+only Programmed state. The existing signed full-radio identity binds the
+new program; calibrated channel/station/AP admission still requires live
+RFK inputs and completion. Hardware TX-path bounds also constrain the
+admitted legacy-USB rate-control set: one TX path supports MCS0..7 and two
+support MCS0..15. A wider AP capability is negotiated separately; authority
+is never silently narrowed by the constructor.
+
+An already-qualified RTL8852A fragment train selects the explicit A/B
+fragment descriptor encoder before ordinary A dispatch and retains the
+actual chip identity. Ordinary emitters still refuse fragments; all native
+source, immutable-part and terminal-receipt checks precede progress.
+
+The Intel RAM test backend uses the same retained transport-stop boundary
+as production before retiring P2P state, preserving driver emission/source
+fences. The watchdog smoke isolates its executor graph with the
+existing scheduler test reset hook, so polling it cannot run retained
+workers from earlier target fixtures. No scheduler-core change is needed.
+Intel GO/client deferred-netlink smokes likewise own their executor graph
+and drive real Activity deadlines between unfinished polls. Public Intel
+association obtains its initial policy from the same selected source used
+by its transaction; only Native bootstraps the global deployment policy.
+A missing selected model database never borrows global authority.
+The response-refined client program retains its original client binding,
+including current NO_P2P checks. GO host GTK enqueue borrows the actual
+Session and requires its original hardware-owner identity and exact
+multicast queue; ordinary raw-protected bypass remains refused. Gen2
+enqueue retains admitted checksum metadata on the actual Frame until
+software completion before GTK encryption. Client target fixtures wait
+for retained native control, notifications and RX prefixes across quiet
+polls within their existing bound.
+Gen2's target model keeps the pre-MAC7 receive-prefix cookie separate
+from the later RSNA marker owner. GO receive tests retain the real
+66-record foreign NoA prefix, deny DATA in its first bounded pass, then
+verify exact delivery and repeated-PN refusal after that prefix retires.
+SC and private Intel model fixtures use their own allocated test names.
+They leave the physical adapter's cached `wlan` reservation untouched,
+so later all-family fixtures cannot reuse it between Intel tests. The
+original active-owner and physical-name vacancy checks remain in force;
+registry-revocation tests also check the unchanged private TX endpoint
+and absence of published network/wireless entries.
+MediaTek TX/RX block-ack control carries the same owned peer WCID in both
+outer STA_REC and nested WTBL requests, including disable. Group fixtures
+retain their real association, distinct MAC and current policy before
+coexistence or sleep; reply descriptors name the actual submitting peer.
+GO renewal stamps its new receive epoch into the closed backend before
+reopening current home traffic; the home floor stays intact while old GO
+copies retire.
+
+FullMAC control separates logical, physical-prefix and caller-output bounds.
+Fixed control structures may omit only zero padding beyond the bounded
+physical prefix. BCDC validates the complete advertised native response
+before returning a shorter caller prefix. Correlation, publication and
+terminal-resource checks still govern both ordinary and AP transactions.
+The CYW AP ring holds State through one final source invocation, avoiding
+recursive SDIO lifetime acquisition while retaining peer/key/epoch checks.
+Fresh primary START refreshes its original same-country station policy
+before binding the request's exact current snapshot.
+
+Timed register-model smokes use the existing spin bridge when they run
+before the BSP timer pump. APs may already have installed the global
+hrtimer programmer while the BSP has no timer interrupt; the spin bridge
+drives the actual monotonic deadlines instead of waiting for that absent
+interrupt. D3 timeouts and watchdog-reset delays retain their full duration
+and cleanup assertions. Production wait paths are unchanged.
+
+The coordinated 2026-11-17 x86_64 Wi-Fi gate passes4404/0 fail/9 expected
+physical-device skips, including the native cases above. Strict release
+library Clippy for wireless/MT76, debug checks, formatting and the stack
+gate pass. The production boot and both host btrfs postflights pass with
+persistent guest disk writes. Aarch64 is skipped at the user's request;
+calibrated readiness and physical acceptance remain the explicit gates
+described by each family. The ledgers retain13 open/94 implemented pending
+validation rows, without closing partial chip/host continuations.
+
+### 3.24 AR9485 board and retained RX antenna continuation
+
+AR9485/AR1111 preparation now carries canonical PCI-derived board inputs
+through expected, cold, admission and reset paths. Raw RX-gain0 uses the
+source GPIO9 fallback; exact CUS board matches add margin/minimum-gain
+settings. The raw EEPROM capability and separate PCI BT flags bind the
+retained legacy20 EDMA antenna scanner. Rejected native descriptors supply
+no antenna observation, and no shared frame metadata or PHY profile expands.
+
+One physical owner keeps scan/logical history while reset retires old
+bindings. Saved-default capture, MAC restoration and scanner transactions
+execute inside the actual retained N48A CapOp plus current PCI access, with
+readback before history commits. N48A's v1 wire layout is unchanged; its
+expanded recipe identity requires a fresh signed measured qualification.
+Separate N48D manual sharing is described in §3.32; broader sampling stays
+closed. New cases are authored, with execution deferred to final validation. This continuation
+is not covered by the preceding 4404-pass checkpoint or physical acceptance.
+The family spec owns the exact board, lifecycle and profile boundaries.
+
+### 3.25 CYW43439 whole-transaction gSPI protocol continuation
+
+`HostPort` candidate enumeration grants no station/source authority.
+`GspiTransport` requires the optional exclusive `SpiBus::claim_device`
+contract, never split legacy `set_cs`/`transfer`. The linked protocol now
+composes one-shot 16-bit bootstrap, normal little-endian commands, F1
+64-byte bursts/16-byte read delay, backplane access flags and exact padded
+whole F2 packets. Wire uncertainty is terminal. The adapter-owned
+`Transport::loader_mode()` identifies SDIO or gSPI; the default
+Unknown refuses. Before every loader step, the requested mode must match
+that actual adapter fact, including for preinitialized diagnostic ports.
+Mismatch is terminal before loader I/O. This keeps gSPI startup/readiness
+separate from SDIO CCCR/mailbox accesses while preserving discovered cores,
+revision/RAM admission and exact selected bytes. F1 range preflight normalizes
+the RAM-access flag before chunking: a burst cannot cross a32KiB RAM window
+into local registers, whether the caller supplied that flag or not.
+
+A private consumed boot-ready packet owner alone seeds one initial control
+credit; ordinary SDIO runtime construction remains zero-credit. Public gSPI
+register diagnostics cannot implement station attachment. Existing SPI
+controllers refuse the stronger session by default. A real platform owner,
+per-access current authority, signed gSPI host/board asset selection and
+complete original reset/IRQ/bus retirement are still required before native
+station publication. Platform SDHCI work remains with its host owner.
+Native regression cases are authored; all execution is deferred to final
+validation and no physical acceptance is claimed. The family spec records
+wire vectors, source revisions and exact limits.
+
+### 3.26 RTL8723BE retained special-packet preflight
+
+Synchronous station EAPOL queuing retains owned reply bytes with a deadline
+and no TX identifier until actual async coexistence notification/LPS leave
+completes under the current calibrated station grant. The join loop and
+post-open worker serve the same pending owner. Cancellation/error closes
+the generation; RX queued during the H2C wait is consumed before publication.
+Actual descriptor retirement remains the only reply-delivery receipt.
+
+Each queued special Ethernet Frame also requires its own completed
+notification before synchronous stack drain may emit it. The endpoint
+holds that exact pending frame through the await and consumes the receipt
+only with its submission. This replaces latest-class overwrite and
+best-effort after-the-fact notification. Post-wait lifecycle/current-source
+checks remain mandatory. The new native regressions are authored and
+execution is deferred to the final validation pass.
+
+### 3.27 RTL8723BE/RTL8192DE native ASPM continuation
+
+The retained original PCI function selects source-specific BE MDIO/DBI or
+DE DBI preparation. Actual bounded completion and exact readbacks precede
+its preparation receipt. The existing PCI capability adapter limits endpoint
+ASPM/CLKREQ to current capabilities and actual enabled parent policy,
+preserves unrelated Link Control bits and rereads policy after waits. It
+does not change the shared bridge or common-clock settings. Source loss,
+timeout, cancellation and ignored writes cannot enable an unprepared
+endpoint. Fresh rebuilt control ownership requires fresh internal receipts.
+AE/other uncomposed chips remain disabled. Native regressions are authored;
+all execution is deferred to final validation. The family spec records the
+exact source programs and lifecycle constraints.
+
+### 3.28 AR9462 station sleep and MCI power continuation (validation deferred)
+
+AR9462/AR9565 MCI concurrent-TX callbacks now retain the original calibrated
+power plan and program/read back the source fourteen-target HT20 cap before
+publishing the concurrent flags or priorities. The surrounding packet profile
+remains legacy20. Revised N46A/N65A recipe identities require fresh measured
+records; the existing 128-byte wire layouts are unchanged. Every actual
+power/coexistence effect executes inside its original qualification and PCI
+authority. An incomplete change closes the station and retains uncertain DMA.
+
+AR9462 NETWORK_SLEEP additionally requires the disjoint optional N46S record,
+an explicit requested state, real EDMA PM-Null/PS-Poll ACKs, peer TIM/AID/TSF,
+AUTOSLEEP timers and S2 wake IRQs (or the retained polling owner). The actual
+WA/MCI/RTC sleep and wake sequence gates ordinary traffic. FTP history counts
+only callbacks that really observe sleep and validated DATA on the subsequent
+awake interval. AR9565's source configuration disables FTP and does not admit
+N46S. Missing N46S keeps AR9462 awake; no measured record is supplied in source.
+The family specification §3.13 owns the record and lifecycle details.
+
+Raw sleep/wake accesses invoke the same original N46S/N46A/PCI sources and
+check the EEPROM-decoded GPIO/polarity before any requested register effect.
+Asserted or ambiguous RFkill observations latch terminal power failure while
+retaining the original owner; releasing the switch supplies no wake/reset or
+DMA-retirement receipt.
+
+### 3.29 RTL8821A coexistence continuation (validation pending)
+
+RTL8821AE antenna selection now uses its actual factory EFUSE 0xc3 bit 0;
+Wi-Fi stream count does not establish the BT antenna count. The source
+RTL8821A one- and two-antenna algorithms, chip-specific RF/H2C/BT-controlled LPS
+adapter and cancellation-terminal notify state are linked. The adapter shares the
+original station mailbox rotation and uses the RTL8821AE RF path-A program.
+Its RX foundation copies the full bounded two-byte-header/16-byte C2H command
+and uses the same original-ring read/rearm operation during MP waits. Ordinary
+frames encountered there retain their bytes and PHY facts for later security
+processing. Arrivals and deferred reports use separate bounded queues.
+
+Native activation uses one actual original-ring BT-version/build inquiry and
+a separately signed N21C record for the exact 20 MHz operating point. Missing
+observation or record retains the coarse LPS-only owner. Actual scan/connect/
+media, C2H, EAPOL/special-packet, LPS, watchdog and healthy-stop call sites now
+drive the retained full owner. Its joint station power base encloses actual
+accesses, resumed polls and old/new stack publications. Complete later BT
+version/build contradictions poison that one-shot source before RX rearm.
+Cancellation/failure closes admission and invokes an independently fenced
+restrictive PCI park; this supplies no RF-stop, DMA-idle or reset receipt.
+An old normal-power NAPC envelope does not qualify these coexistence RF states.
+Wider profiles and WoW/replay remain closed while N21C is installed. New native
+regression cases are authored; tests and physical qualification remain pending.
+
+`RtlwifiDevice::rtl8821ae_coexistence_request()` returns the original native
+owner's optional historical N21C filename and binding. The single initial
+inquiry must have observed a complete actual GET_BT_VERSION value/build;
+callers cannot supply a BT identity. Request retention occurs inside the
+original selected-image and NAPC source invocations before signed-asset lookup,
+so a missing N21C still leaves the exact provisioning request available.
+Reading it only clones metadata under the current Native prepared-owner lock:
+it sends no H2C, checks no current RF authority, installs no grant and retries
+no qualification. Once retained, the request cannot be replaced or upgraded
+on an open station; a missing record requires a fresh original-owner rebuild
+before another qualification attempt. Historical metadata remains historical
+after source revocation or terminal retirement.
+
+The current source ledger has11 open rows and96 implemented pending
+validation (107 total). This continuation moves the delivered BE thermal and
+rtlwifi coexistence feature rows only; broader chip rows stay open. This is
+source accounting, not a claim of new test or physical acceptance.
+
+### 3.30 RTL8723AE separately qualified HT20 continuation (implementation)
+
+`rtl8723ae_ht20_station_request()` reports a distinct NASR2 filename/binding
+from the same completed original calibration. It runs no station I/O and
+cannot upgrade a live NASR1 owner. After the optional NASR3 inquiry below,
+the one original attempt selects NASR2 before effects; only NotFound falls
+back to NASR1. Present invalid,
+unsigned, mismatched or revoked NASR2 refuses rather than falling back.
+
+NASR2 keeps the640-byte record geometry but requires version/profile2,
+rate mask0xfffff, a different source recipe and independent complete-program
+CCK/OFDM/MCS0-7 curves. Old NASR1 remains version/profile1/mask0xfff and its
+active grant is narrowed to that mask without changing programmed unused
+indices. Neither an old NAPC/NAQR nor NASR1 supplies HT authority.
+
+The fixed point permits one-stream HT20/SGI20, actual N24 H2C rate masks,
+source SIFS/aggregation timing and software recipient BA64/reorder/A-MSDU3839.
+RX MCS and aggregation require actual negotiated `packet.ht`; exact short
+compressed BARs are bounded and peer-address checked before normal MAC-header
+indexing. The original AE receive source reports no GI metadata. Single-MPDU
+TX retains source AE descriptors and software CCMP; shared TX aggregation and
+DD-triggered sender BA initiation remain disabled. Current original sources
+enclose hardware effects, resumed polls and publication, including the actual
+negotiated legacy/HT input to the retained coexistence algorithm.
+
+Wider points, TX A-MPDU, LPS/IPS, ASPM, retune/reset/reclaim and physical
+acceptance remain separate. No signed measurement or firmware is supplied.
+Four native NASR2 cases are authored, including original-ring RX and actual
+original shared-mailbox N24 mask effects. Execution remains deferred until
+the final coordinated validation.
+
+### 3.31 RTL8723AE separately qualified HT20/ASPM continuation (implementation)
+
+`rtl8723ae_ht20_aspm_station_request()` derives a distinct NASR3 filename and
+binding from actual completed calibration. Its640-byte version/profile3
+record measures the complete HT20 station/firmware/coexistence and automatic
+response program across actual link states/transitions. Selection before any
+station effect is3,2,1; only NotFound falls back. Old profiles never gain ASPM
+authority and an active owner cannot upgrade.
+
+Only NASR3 calls the refusing-by-default
+`packet::Port::prepare_rtl8723ae_aspm(enabled)` before packet opening. Actual
+PacketIo profile gating and per-access current original source/PCI invocation
+enclose AE's own byte/word internal program and endpoint configuration effects.
+Bounded DBI completion/readback precedes endpoint policy, which intersects
+actual capabilities with the current enabled parent policy and rechecks around
+its wait. Disabled policy does no internal setup; bridge/common-clock state is
+preserved. Missing/uncertain/current-source receipts leave the original owner
+failed and retained, without granting DMA-idle, RF-stop, reset or reclaim.
+
+NASR1/2 keep their wire meanings. NASR3 admits no IPS/LPS, sender BA or retune.
+Terminal park independently withdraws endpoint ASPM/CLKREQ under current PCI,
+including after a MAC readback failure. Four source/native-model cases are
+authored; execution remains deferred.
+The family specification records exact literals, record shape and limitations.
+
+### 3.32 Explicit AR9485/AR9565 manual antenna sharing (implementation)
+
+`ath9k::manual_bt_sharing_request()`, `manual_bt_sharing_requested()` and
+`set_manual_bt_sharing(bool)` expose a factual request, retained requested
+state and explicit serialized physical transition. Canonical BT-capable
+AR9485 PCI0032 selects N48D; AR9565 PCI0036 with an actual retained live MCI
+owner selects distinct N65D. Their128-byte signed records bind original
+completed calibration/power/EEPROM/PCI facts and measured complete-program
+antenna/power/transient bounds. Ordinary N48A/N65A or capability flags supply
+no manual authority. PCI0037 never borrows PCI0032's program.
+
+The transition pauses actual EDMA and withdraws receive publication first.
+N48D verifies the source local3WIRE-off program before AR9485 switch/LNA
+effects. N65D validates original MCI configuration/GPM/schedule pointers,
+restores and reads back actual uncapped source power, permanently retires all
+GPM/duty/interrupt/reset/re-enable producers, then executes source
+`stop_bt(false)` and cleanup. CTRL/interrupt/LNA-update-disable readbacks
+prove local coexistence off, without proving remote Bluetooth RF sleep or
+MCI DMA idle. Original MCI buffers/link/IRQ/source ownership remain retained.
+Only those receipts permit the distinct AR9565 manual program and group3
+scanner; group2 thresholds/biases and AR9485 switch writes are not aliases.
+
+The same counted current-source latch covers scalar effects, IRQ, DMA,
+copies/rings and carrier/callback publications captured before or after the
+request. Explicit disable retains its companion and never restarts MCI.
+Uncertainty closes admission; reset/retune/suspend/removal take a terminal
+retained-owner path, without reconstructing a plain N48A/N65A owner or
+inventing reset/reclaim proof. Source/model cases remain unrun; broader
+HT/aggregation/control-frame profiles and physical acceptance remain open.
+
+### 3.33 Separately measured AR9003 periodic ANI (implementation)
+
+`ath9k::native_ani_request()` returns retained original-generation metadata
+for distinct N46P/N48P/N65P records on AR9462/AR9485/AR9565. The original cold
+composition selects an optional128-byte signed record before packet effects;
+only NotFound retains A alone. A present invalid/revoked record refuses, with
+no later upgrade. Identity binds actual completed calibration/power/INI/clock,
+host policy and both MCI power plans. Independent complete-program bounds
+cover NF/IQ, every enabled ANI state/transition, retries/automatic responses
+and board/coexistence state; existing A/S/D meanings remain unchanged.
+
+The real native adapter reads MIB/listen/PHY-error counters and retains
+source peer-RSSI filtering. Eligible idle station polls drive exact chip
+controls and INI-relative coefficients, with complete current-source/PCI/
+power/RFkill scopes and readback before receipt commits. AR9462/9565 skip
+weak-detector threshold writes; AR9485 uses its captured thresholds. Only
+multichain AR9462 changes MRC-CCK. Existing NF/IQ continues on its own owner.
+The stable physical/publication latch jointly invokes P and A for earlier
+and later tokens. Existing S power-save or manual D requests refuse while P
+is bound; reset/retune/suspend/removal retain terminal ownership without a
+plain A rebuild or invented DMA/RF stop. Two authored source/model cases
+remain unrun. The family specification owns the exact counters and record.
+
+### 3.34 RTL8852A native source startup continuation (implementation)
+
+Actual DIDs8852/a85a select A's retained firmware/factory assets and source
+MAC/RX/LTR startup. Fresh N5AM encloses actual MAC and polling RX/configuration
+effects; programmed secure fuses require the separately authenticated N5AS
+blacklist snapshot before firmware effects. Full N5ABv2/N5AC bind A's own
+factory FEM/live thermal observations, complete initial RXDCK/IQK/TSSI/DPK,
+source scheduler/TX-path ownership and channel/power program. Cold-v1 alone
+cannot authorize changed DIG/IB/XTAL/thermal/TSSI effects.
+
+Native channel publication requires complete actual calibration and fresh
+source PMAC counter/offset receipts. Retained pre-station20/40/80 retune uses
+A's own current records; a started station refuses retune before effects
+because hardware RX drain/epoch ownership is not composed. Initial CCX/IFS/
+NHM, actual early-cut gain inputs and direct A XTAL state remain retained;
+incomplete native periodic adapters stay closed. AP/protocol, measured wider
+aggregate/sleep/tracking owners and complete chip acceptance remain source
+work. Authored cases are unrun and no signed measurement/firmware is supplied.
+
+### 3.35 RTL8922A WLAN-only and packet-closed no-link continuation (implementation)
+
+The original checked reset/factory/firmware/CH12/RX owner now composes distinct
+N22W WLAN-only complete DM, a source MAC1 power window with off receipt, and
+actual late/channel RFK. N22P partial and old N22A cannot acquire that meaning.
+Fresh N22O additionally binds actual retained RESP1/RRSR0/RRSR1 observations,
+selected source inputs and the complete ordinary/autonomous-response program;
+its one original inquiry precedes effects and cannot upgrade after NotFound.
+
+Original-ring inactive preflight preserves all DMA identities/cursors and
+refuses start. Own BE no-link initialization then uses actual source BA-user
+band0/band1 DONE commands, crypto/PHY-report/RTS/port widths, version-selected
+CAM and role/join/G7 CCTL. REC-only MACID pause and no-ACK DMAC keep their
+source contracts, without inventing execution status or MAC1 host access.
+Every actual register, DMA/control poll and resumed operation invokes the
+original Radio/N22W plus N22O and PCI sources; a prior metadata check is
+insufficient. Success remains MlmeConfiguredClosed. Ordinary HCI/packets,
+peer/station/AP/EHT/IRQ publication remain source work. Authored cases are
+unrun; measured deployment assets and physical acceptance are separate gates.
 
 ## 4. Interaction with `narf-wireless`
 

@@ -317,7 +317,9 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
     };
     let mut model = FactoryModel {
         chip: ChipId::Rtl8852A,
-        rfe: 5,
+        // Linux rtw8852a_table.c RF headlines include RFE1/cut1;
+        // RFE5 has neither a matching headline nor an RF wildcard.
+        rfe: 1,
         cut: 1,
         trim: 255,
     };
@@ -334,7 +336,10 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
         )
         .unwrap();
         let assets = Assets::from_prepared(&image).unwrap();
-        let next = Board::new_a(&factory, device, &assets).unwrap().identity();
+        let Ok(board) = Board::new_a(&factory, device, &assets) else {
+            return TestResult::Fail("source-supported A factory/assets identity refused");
+        };
+        let next = board.identity();
         if identity == Some(next) {
             return TestResult::Fail("both A BTC ABI rows reused one calibration identity");
         }
@@ -368,6 +373,17 @@ fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> Tes
     if Board::new_a(&factory, bad_device, &assets).is_ok() {
         return TestResult::Fail("B device acquired an A board identity");
     }
+    // The static RF package cannot qualify an unsupported physical RFE.
+    // Linux phy.c:1734..1813 rejects an unmatched headline; identity
+    // binding must retain that source refusal rather than substitute RFE1.
+    model.rfe = 5;
+    let mut unsupported = Factory::default();
+    if ready(unsupported.read(&mut model)) != Some(Ok(())) {
+        return TestResult::Fail("unsupported A RFE factory fixture");
+    }
+    if Board::new_a(&unsupported, device, &assets) != Err(Error::Identity) {
+        return TestResult::Fail("unsupported A RF package acquired a calibration identity");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -385,6 +401,106 @@ pub(in crate::rtw89) fn revocable_model() -> (Calibration, Cap<FirmwareBlob, Rea
     calibration.model_domain = Some(domain());
     (calibration, cap)
 }
+/// Inert signed A calibration boundary for actual Native register tests.
+/// This creates no production attach, physical receipt or global policy.
+pub(in crate::rtw89) fn revocable_model_a() -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let board = Board {
+        device: 0x8852,
+        chip: ChipId::Rtl8852A,
+        ..board()
+    };
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N5AB");
+    let cap = authority();
+    let mut calibration = Calibration::from_verified(&bytes, Some([3; 32]), board, cap).unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+/// Inert new partial BE scope. It shares only envelope/policy mechanics;
+/// the different magic and the caller's exact N22P identity remain required.
+pub(in crate::rtw89) fn revocable_model_partial_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22P");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22P").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+
+pub(in crate::rtw89) fn revocable_model_wlan_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22W");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22W").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+pub(in crate::rtw89) fn revocable_model_packet_be(
+    board: Board,
+) -> (Calibration, Cap<FirmwareBlob, Read>) {
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N22O");
+    let cap = authority();
+    let mut calibration =
+        Calibration::decode_record(&bytes, Some([3; 32]), board, cap, b"N22O").unwrap();
+    calibration.model_domain = Some(domain());
+    (calibration, cap)
+}
+
+fn smoke_rtw8922a_wlan_measurement_never_upgrades_partial_or_historical_magic() -> TestResult {
+    let be = Board {
+        chip: ChipId::Rtl8922A,
+        device: 0x8922,
+        ..board()
+    };
+    let mut bytes = image(be);
+    let cap = authority();
+    for magic in [b"N22A", b"N22P", b"N22W", b"N22O"] {
+        bytes[..4].copy_from_slice(magic);
+        for requested in [b"N22A", b"N22P", b"N22W", b"N22O"] {
+            if Calibration::decode_record(&bytes, Some([3; 32]), be, cap, requested).is_ok()
+                != (magic == requested)
+            {
+                return TestResult::Fail("BE WLAN-only scope crossed record magic");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8922a_wlan_measurement_never_upgrades_partial_or_historical_magic
+);
+
+fn smoke_rtw8922a_partial_measurement_never_reuses_historical_n22a() -> TestResult {
+    let be = Board {
+        chip: ChipId::Rtl8922A,
+        device: 0x8922,
+        ..board()
+    };
+    let mut bytes = image(be);
+    let cap = authority();
+    for magic in [b"N22A", b"N22P"] {
+        bytes[..4].copy_from_slice(magic);
+        let historical = Calibration::from_verified(&bytes, Some([3; 32]), be, cap);
+        let partial = Calibration::decode_record(&bytes, Some([3; 32]), be, cap, b"N22P");
+        if historical.is_ok() != (magic == b"N22A") || partial.is_ok() != (magic == b"N22P") {
+            return TestResult::Fail("BE calibration scopes crossed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8922a_partial_measurement_never_reuses_historical_n22a
+);
+
 fn smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record() -> TestResult {
     let b = board();
     let c = Board {

@@ -25,6 +25,7 @@ struct Model {
     trace: Vec<(u8, u32, u32)>,
     now: u64,
     stuck: Option<u32>,
+    stall_delay: Option<u64>,
 }
 impl Model {
     fn new() -> Self {
@@ -35,6 +36,7 @@ impl Model {
             trace: Vec::new(),
             now: 0,
             stuck: None,
+            stall_delay: None,
         }
     }
     fn word(&self, address: u32) -> u32 {
@@ -42,11 +44,11 @@ impl Model {
     }
 }
 impl Io for Model {
-    fn read8(&mut self, _: u32) -> Result<u8, power::Error> {
-        Err(power::Error::Access)
+    fn read8(&mut self, address: u32) -> Result<u8, power::Error> {
+        Ok((self.words[address as usize / 4] >> ((address & 3) * 8)) as u8)
     }
-    fn read16(&mut self, _: u32) -> Result<u16, power::Error> {
-        Err(power::Error::Access)
+    fn read16(&mut self, address: u32) -> Result<u16, power::Error> {
+        Ok((self.words[address as usize / 4] >> ((address & 3) * 8)) as u16)
     }
     fn read32(&mut self, a: u32) -> Result<u32, power::Error> {
         let mut v = self.words[a as usize / 4];
@@ -55,6 +57,18 @@ impl Io for Model {
         }
         let r = a - 0x10000;
         match r {
+            0xbff8 => v = 0x55,
+            0x80fc => {
+                let sel = (self.word(0x80d4) >> 16) & 0x3f;
+                let cfg = (self.word(0x80c0) >> 24) & 0xff;
+                v = match (sel, cfg) {
+                    (0, _) => 0x03e8_c800,
+                    (9, _) => 0x0064_0064,
+                    (6, 0x1f) => 0x0200_0230,
+                    (6, _) => 0x0100_0130,
+                    _ => 0,
+                };
+            }
             // ADDCK done BIT(0); Q [19:10] = 0x2ab, I [9:0] = 0x155.
             0x1e00 | 0x3e00 => v = (0x2ab << 10) | 0x155,
             // DACK MSBK done BIT(15).
@@ -79,11 +93,19 @@ impl Io for Model {
         }
         Ok(v)
     }
-    fn write8(&mut self, _: u32, _: u8) -> Result<(), power::Error> {
-        Err(power::Error::Access)
+    fn write8(&mut self, address: u32, value: u8) -> Result<(), power::Error> {
+        let shift = (address & 3) * 8;
+        let word = &mut self.words[address as usize / 4];
+        *word = (*word & !(0xff << shift)) | (u32::from(value) << shift);
+        self.trace.push((1, address, u32::from(value)));
+        Ok(())
     }
-    fn write16(&mut self, _: u32, _: u16) -> Result<(), power::Error> {
-        Err(power::Error::Access)
+    fn write16(&mut self, address: u32, value: u16) -> Result<(), power::Error> {
+        let shift = (address & 3) * 8;
+        let word = &mut self.words[address as usize / 4];
+        *word = (*word & !(0xffff << shift)) | (u32::from(value) << shift);
+        self.trace.push((2, address, u32::from(value)));
+        Ok(())
     }
     fn write32(&mut self, a: u32, v: u32) -> Result<(), power::Error> {
         self.words[a as usize / 4] = v;
@@ -94,7 +116,15 @@ impl Io for Model {
         self.now
     }
     async fn delay_us(&mut self, us: u64) {
+        if self.stall_delay == Some(us) {
+            core::future::pending::<()>().await;
+        }
         self.now += us;
+        if us == 15_000 && self.word(0x09c4) & 0x10 != 0 {
+            self.words[0x11a40 / 4] = self.word(0x1a40).wrapping_add(3);
+            self.words[0x11c60 / 4] = 0x1200_0000;
+            self.words[0x13c60 / 4] = 0x3400_0000;
+        }
     }
     async fn read_ecv(&mut self) -> Result<Option<u8>, power::Error> {
         Err(power::Error::Unsupported)
@@ -107,6 +137,7 @@ impl rfk::Interface for Model {
     async fn rf_read(&mut self, path: u8, address: u32, mask: u32) -> Result<u32, rfk::Error> {
         let mut value = self.rf[usize::from(path)][(address & 0xff) as usize];
         match address {
+            0x58 => value = 0x84000,
             0x1c => value |= 8,
             0x1b if value == 0x240 => value |= 0x4800,
             _ => {}
@@ -188,12 +219,13 @@ fn calibration() -> factory_a::Calibration {
 
 /// `rtw8852a_power_trim` is the pure tail of the owner recipe:
 /// `__thm_setting` (0x1f mask, not C's 0x0e) then PA bias TXG/TXA.
+/// Raw 0x1e retains bit4 through the shift, producing 0xf rather than 0x7.
 fn smoke_rtw89_a_power_trim_writes_follow_rtw8852a() -> TestResult {
     let writes = power_trim_writes(&calibration());
     if writes
         != vec![
             (0, 0x43, 0xf_0000, 0xd),
-            (1, 0x43, 0xf_0000, 0x7),
+            (1, 0x43, 0xf_0000, 0xf),
             (0, 0x60, 0xf000, 0xa),
             (0, 0x60, 0xf_0000, 0x5),
             (1, 0x60, 0xf000, 0xc),
@@ -231,6 +263,22 @@ fn smoke_rtw89_a_owner_prepare_controls_then_prepare() -> TestResult {
     }
     if operating.state() != phy_operating::State::Prepared {
         return TestResult::Fail("RTL8852A DM sub-inits did not prepare");
+    }
+    let cap = id.xtal() & 0x7f;
+    if io.words[0x0280 / 4] & 0x00ff_fc00 != ((u32::from(cap) << 17) | (u32::from(cap) << 10))
+        || io.trace.iter().any(|event| event.0 == 8)
+        || io.word(0x0c08) & (1 << 18) == 0
+        || io.word(0x0c14) & 0x30000 != 0x30000
+        || (id.cut() <= 1
+            && (operating.a_gains().is_none()
+                || (io.word(0x4668) >> 24) & 7 != 6
+                || (io.word(0x473c) >> 24) & 7 != 6
+                || (io.word(0x4674) >> 17) & 1 != 1
+                || (io.word(0x4748) >> 17) & 1 != 1
+                || (io.word(0x4658) >> 5) & 31 != 31
+                || (io.word(0x472c) >> 5) & 31 != 31))
+    {
+        return TestResult::Fail("A retained environment/gain init or direct XTAL source differs");
     }
     if io.words[0x10dc0 / 4] != 0x864f_a000
         || io.words[0x14404 / 4] != 0x7c00
@@ -271,11 +319,67 @@ fn smoke_rtw89_a_owner_prepare_controls_then_prepare() -> TestResult {
     }
     // Power trim landed in the RF pages: TM2 OFF then BIASA TXG/TXA.
     if io.rf[0][0x43] != 0xd0000
-        || io.rf[1][0x43] != 0x70000
+        || io.rf[1][0x43] != 0xf0000
         || io.rf[0][0x60] != 0x5a000
         || io.rf[1][0x60] != 0x3c000
     {
         return TestResult::Fail("RTL8852A power trim RF words differ");
+    }
+    io.rf[0][0x42] = 22 << 1;
+    io.rf[1][0x42] = 42 << 1;
+    let plan = crate::rtw89::channel_a::tests::power_plan(
+        crate::rtw89::operating_channel::Profile::INITIAL,
+    );
+    // SAFETY: same exclusively owned inert source model after its actual
+    // init, with no ordinary packet/TSSI/PM producer or calibration claim.
+    let programmed = ready(unsafe {
+        radio.program_channel(
+            &mut io,
+            crate::rtw89::operating_channel::Profile::INITIAL,
+            &plan,
+        )
+    });
+    if programmed != Some(Ok(()))
+        || radio.epoch() != 2
+        || radio.programmed_channel() != Some(crate::rtw89::operating_channel::Profile::INITIAL)
+        || radio.channel().is_some()
+        || radio.fem() != factory_a::Fem::from_identity(id)
+        || radio.observations()
+            != Some(observations::Snapshot {
+                sample: [22, 42],
+                average: [22, 42],
+                last_thermal_max: 42,
+            })
+    {
+        return TestResult::Fail(
+            "A programmed channel did not retain actual FEM/live sensor facts",
+        );
+    }
+    let mut track_bytes = vec![2; 608];
+    track_bytes[..8].copy_from_slice(&[0xf0, 0xff, 0, 0, 0, 0, 0, 0]);
+    let tracking = rfk::a_tssi::Tracking::parse(&track_bytes).unwrap();
+    // SAFETY: same retained inert A radio, actual modeled FEM/live thermal
+    // after channel programming, exact source-tail actor, no station grants.
+    let completed = ready(unsafe {
+        radio.complete_channel(
+            &mut io,
+            ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                tail: rfk::a_tssi::tail::Inputs::fixture(
+                    crate::rtw89::operating_channel_c::Profile::INITIAL,
+                    60,
+                    36,
+                ),
+            },
+        )
+    });
+    if completed != Some(Ok(()))
+        || radio.epoch() != 3
+        || radio.channel() != Some(crate::rtw89::operating_channel::Profile::INITIAL)
+        || radio.channel_rfk().tssi().complete().map(|r| r.count) != Some(3)
+    {
+        return TestResult::Fail("A retained source radio composed no actual complete RFK receipt");
     }
     // A second prepare on the same (now Ready) owner is terminal. (Prepare
     // before controls is not: like the C/51 owners, `prepare` runs from
@@ -291,6 +395,102 @@ fn smoke_rtw89_a_owner_prepare_controls_then_prepare() -> TestResult {
     });
     if again != Some(Err(rfk::Error::Terminal)) {
         return TestResult::Fail("RTL8852A double prepare is not terminal");
+    }
+    // Retunes retain the original RFK/TSSI/DPK and source EWMA owners.
+    // First stay in-band, then cross to a genuine 5GHz/80MHz source plan.
+    for (profile, epoch, thermal) in [
+        (
+            crate::rtw89::operating_channel::Profile::from_primary(6).unwrap(),
+            4,
+            [30, 0],
+        ),
+        (
+            crate::rtw89::operating_channel::Profile::new_5ghz(
+                36,
+                crate::rtw89::operating_channel::Width::Mhz80,
+            )
+            .unwrap(),
+            5,
+            [34, 46],
+        ),
+    ] {
+        let plan = crate::rtw89::channel_a::tests::power_plan(profile);
+        io.words[0x11c10 / 4] = thermal[0] << 24;
+        io.words[0x13c10 / 4] = thermal[1] << 24;
+        let old_counter = io.word(0x1a40);
+        // SAFETY: same retained inert source model after completed TSSI;
+        // exact target plan/thermal actor, no ordinary producer exists.
+        if ready(unsafe {
+            radio.retune(
+                &mut io,
+                profile,
+                &plan,
+                ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    tail: rfk::a_tssi::tail::Inputs::fixture(plan.channel(), 60, 36),
+                },
+            )
+        }) != Some(Ok(()))
+            || radio.channel() != Some(profile)
+            || radio.epoch() != epoch
+            || radio.channel_rfk().tssi_mode() != [true, true]
+            || radio
+                .channel_rfk()
+                .tssi()
+                .complete()
+                .map(|r| (r.before, r.after, r.count))
+                != Some((old_counter as u16, old_counter.wrapping_add(3) as u16, 3))
+        {
+            return TestResult::Fail(
+                "A retune lost retained RFK/TSSI history or fresh PMAC receipt",
+            );
+        }
+    }
+    if radio.observations().map(|s| s.average) != Some([26, 43]) {
+        return TestResult::Fail("A retune replaced source EWMA history");
+    }
+    let target = crate::rtw89::operating_channel::Profile::from_primary(11).unwrap();
+    let plan = crate::rtw89::channel_a::tests::power_plan(target);
+    io.stall_delay = Some(40);
+    // SAFETY: drop actual retained source operation in the channel help wait.
+    if ready(unsafe {
+        radio.retune(
+            &mut io,
+            target,
+            &plan,
+            ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                tail: rfk::a_tssi::tail::Inputs::fixture(plan.channel(), 60, 36),
+            },
+        )
+    })
+    .is_some()
+        || radio.state() != State::Preparing
+        || radio.channel().is_some()
+        || radio.epoch() != 5
+        || radio.channel.state() != crate::rtw89::channel_a::State::Busy
+    {
+        return TestResult::Fail("A dropped retune published old/new channel or reset owner");
+    }
+    let before = io.trace.len();
+    // SAFETY: same uncertain retained owner must refuse any new effect.
+    if ready(unsafe {
+        radio.retune(
+            &mut io,
+            target,
+            &plan,
+            ChannelInputs {
+                calibration: &calibration,
+                tracking: &tracking,
+                tail: rfk::a_tssi::tail::Inputs::fixture(plan.channel(), 60, 36),
+            },
+        )
+    }) != Some(Err(rfk::Error::Terminal))
+        || io.trace.len() != before
+    {
+        return TestResult::Fail("A dropped retained retune replayed failed source owner");
     }
     TestResult::Pass
 }

@@ -24,9 +24,9 @@
 //! `rfk_channel` returns `Err` on a failed offload (Linux ignores the
 //! returns and continues; NARF fails closed) and leaves the owner Busy
 //! (terminal); the caller terminalizes the radio, as with the C/51
-//! owners. The pre-notify MCC H2C (`rtw89_fw_h2c_rf_pre_ntfy_mcc`) is
-//! NOT sent here: it is firmware-version-gated and needs the RFK MCC
-//! channel-context table, neither of which this owner has.
+//! owners. Actual retained NORMAL-suit features and the completed source
+//! channel-context reload choose PRE/MCC, IQK and RXDCK formats. A newer
+//! default body cannot stand in for firmware-version selection.
 
 use super::super::{
     operating_channel_c::{Band, Profile},
@@ -34,9 +34,11 @@ use super::super::{
     rfk_regs::{RR_MOD, RR_MOD_MASK},
 };
 use super::{
+    be_features::Features,
+    be_notify::{self, Context},
     be_rfk::{
-        self, check, dpk_body, iqk_body, pre_ntfy_body, rxdck_body, txgapk_body, Report,
-        ReportKind, FUNC_DPK_OFFLOAD, FUNC_IQK_OFFLOAD, FUNC_PRE_NOTIFY, FUNC_RXDCK_OFFLOAD,
+        self, check, dpk_body, iqk_body, iqk_v0_body, rxdck_body, rxdck_v0_body, txgapk_body,
+        Report, ReportKind, FUNC_DPK_OFFLOAD, FUNC_IQK_OFFLOAD, FUNC_RXDCK_OFFLOAD,
         FUNC_TSSI_OFFLOAD, FUNC_TXGAPK_OFFLOAD, REPORT_KINDS, RF_AB,
     },
     be_tssi::{self, Inputs, TssiMode},
@@ -105,6 +107,15 @@ pub(in super::super) struct Channel {
 }
 
 impl Channel {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtw89) fn fixture_packet_refusal_metadata() -> Self {
+        Self {
+            state: State::Calibrated,
+            channel: Some(Profile::INITIAL),
+            band: Some(Band::Ghz2),
+            ..Self::default()
+        }
+    }
     pub fn state(&self) -> State {
         self.state
     }
@@ -162,8 +173,8 @@ impl Channel {
     /// on both RF paths, PRE_NTFY, TXGAPK, IQK, TSSI NORMAL, DPK, RXDCK
     /// (PHY_0, `is_chl_k`), resume scheduler TX, BTC WL RFK STOP.
     /// `tssi` carries the TSSI H2C inputs (efuse DE profile, trim,
-    /// TXPWR_TRK rows, RFE type, cut); `mlo_mode` is the pre-notify
-    /// MLO mode (`MLO_NOT_SUPPORT` for the single-PHY non-MLO owner).
+    /// TXPWR_TRK rows, RFE type, cut). Features come from the actual retained
+    /// NORMAL suit; context is the completed SCC post-channel RF reload.
     /// Re-runnable on a channel change (New or Calibrated).
     ///
     /// # Safety
@@ -177,8 +188,12 @@ impl Channel {
         io: &mut impl Interface,
         profile: Profile,
         tssi: &Inputs<'_>,
-        mlo_mode: u32,
+        features: Features,
+        context: &Context,
     ) -> Result<(), Error> {
+        if !context.matches(profile, features) {
+            return Err(Error::Policy);
+        }
         self.begin(&[State::New, State::Calibrated])?;
         self.channel = None;
         io.admit()?;
@@ -202,14 +217,16 @@ impl Channel {
         let bw = profile.width() as u8;
         let ch = profile.center();
         let cv = tssi.cv;
-        self.step(
-            access.0,
-            ReportKind::PreNtfy,
-            FUNC_PRE_NOTIFY,
-            &pre_ntfy_body(0, mlo_mode, false),
-            PRE_NTFY_MS,
-        )
-        .await?;
+        if let Some(report) = be_notify::pre(access.0, features, context, tssi.rfe_type).await? {
+            self.set_record(ReportKind::PreNtfy, report);
+            check(report)?;
+        }
+        be_notify::mcc(access.0, features, context).await?;
+        let iqk = if features.iqk_v0 {
+            iqk_v0_body(0, false)
+        } else {
+            iqk_body(0, RF_AB, band, bw, ch, cv)
+        };
         self.step(
             access.0,
             ReportKind::Txgapk,
@@ -218,14 +235,15 @@ impl Channel {
             TXGAPK_MS,
         )
         .await?;
-        self.step(
-            access.0,
-            ReportKind::Iqk,
-            FUNC_IQK_OFFLOAD,
-            &iqk_body(0, RF_AB, band, bw, ch, cv),
-            IQK_MS,
-        )
-        .await?;
+        self.step(access.0, ReportKind::Iqk, FUNC_IQK_OFFLOAD, &iqk, IQK_MS)
+            .await?;
+        let rx_v0 = rxdck_v0_body(0, band, bw, ch, false);
+        let rx_current = rxdck_body(0, band, bw, ch, false, true);
+        let rxdck = if features.rxdck_v0 {
+            &rx_v0[..]
+        } else {
+            &rx_current[..]
+        };
         self.step(
             access.0,
             ReportKind::Tssi,
@@ -246,7 +264,7 @@ impl Channel {
             access.0,
             ReportKind::RxDck,
             FUNC_RXDCK_OFFLOAD,
-            &rxdck_body(0, band, bw, ch, false, true),
+            rxdck,
             RXDCK_MS,
         )
         .await?;

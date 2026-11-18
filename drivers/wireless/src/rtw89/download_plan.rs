@@ -45,6 +45,11 @@ pub struct DownloadPlan {
 /// descriptor's 14-bit `RPKT_LEN` (`fwcmd_8922a::fwcmd_txdesc`).
 const BE_MAX_PART_SIZE: usize = 0x3fff;
 impl DownloadPlan {
+    /// Immutable signed container already owned by this exact selected plan.
+    /// This observation grants no transfer, RF, or station authority.
+    pub(super) fn firmware(&self) -> &PreparedFirmware {
+        &self.image
+    }
     pub fn new(
         image: PreparedFirmware,
         fuses: Fuses,

@@ -59,6 +59,7 @@ kernel_test_in!(
 #[derive(Debug, Clone)]
 enum Op {
     Read(u16),
+    ReadWord(u16),
     Write(u16, Vec<u8>),
     Delay(u64),
 }
@@ -117,6 +118,18 @@ impl Io for Fake {
         }
         Ok(u32::from_le_bytes(
             m.regs[reg as usize..reg as usize + 4].try_into().unwrap(),
+        ))
+    }
+    fn read16(&self, reg: u16) -> Result<u16, Error> {
+        if reg & 1 != 0 {
+            return Err(Error::Access);
+        }
+        let mut model = self.0.lock();
+        model.ops.push(Op::ReadWord(reg));
+        Ok(u16::from_le_bytes(
+            model.regs[usize::from(reg)..usize::from(reg) + 2]
+                .try_into()
+                .unwrap(),
         ))
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), Error> {
@@ -348,6 +361,33 @@ fn smoke_rtl8188ee_native_claim_is_exact_ready_and_one_shot() -> TestResult {
     }
     TestResult::Pass
 }
+fn smoke_rtlwifi_native_exact_word_read_keeps_transport_gate() -> TestResult {
+    let io = Fake::new();
+    let owner = Arc::new(Owner::new(io.clone(), super::super::regs::RTL_DEV_8188EE));
+    if narf_scheduler::block_on(owner.initialize(&image(17))).is_err() {
+        return TestResult::Fail("word-read native firmware fixture refused");
+    }
+    let packet = owner.claim_packet_io().unwrap();
+    io.0.lock().regs[0x18..0x1c].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    if packet.read16(0x18) != Ok(0x3412)
+        || !matches!(io.0.lock().ops.last(), Some(Op::ReadWord(0x18)))
+    {
+        return TestResult::Fail("native PacketIo lost exact word forwarding");
+    }
+    let before = io.0.lock().ops.len();
+    if packet.read16(0x19) != Err(Error::Access) || io.0.lock().ops.len() != before {
+        return TestResult::Fail("unaligned word reached backend");
+    }
+    owner.set(Stage::Failed, Some(Error::Access));
+    if packet.read16(0x18) != Err(Error::Gate) || io.0.lock().ops.len() != before {
+        return TestResult::Fail("word forwarding bypassed firmware terminal gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_native_exact_word_read_keeps_transport_gate
+);
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_native_claim_is_exact_ready_and_one_shot

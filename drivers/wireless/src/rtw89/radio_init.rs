@@ -314,6 +314,13 @@ pub(super) fn rf_pages(program: &[Pair]) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 pub(super) async fn bb(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    bb_at(io, program, 0x10000).await
+}
+/// phy_be.c::rtw89_phy_gen_be uses its own CR base (0x20000).
+pub(super) async fn bb_be(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    bb_at(io, program, 0x20000).await
+}
+async fn bb_at(io: &mut impl Io, program: &[Pair], base: u32) -> Result<(), Error> {
     for &Pair(address, data) in program {
         let delay = match address {
             0xfe => 50_000,
@@ -327,7 +334,7 @@ pub(super) async fn bb(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> 
         if delay != 0 {
             io.delay_us(delay).await;
         } else if data != 0xbabecafe {
-            io.write32(0x10000 + address, data)?;
+            io.write32(base + address, data)?;
         }
     }
     Ok(())
@@ -862,14 +869,37 @@ pub(super) async fn nctl(io: &mut impl Io, program: &[Pair]) -> Result<(), Error
 pub(super) async fn nctl_c(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
     nctl_for(io, program, &NCTL_PREINIT[..4]).await
 }
-/// RTL8922A NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` with the P1 reset
-/// (the chip is not RTL8851B) and no RTL8852B/BT second `R_IOQ_IQK_DPK`
-/// write, then the selected firmware NCTL table;
-/// `rtw8922a_chip_info.nctl_post_table` is NULL (`rtw8922a.c:3246`), so
-/// there is no post-table step. (Shared with the BE table-application
-/// owner, `radio_be`; the 8852A sibling lane owns the A paths.)
+/// RTL8922A: phy_be.c `rtw89_phy_preinit_rf_nctl_be`, the BE CR base
+/// and source10000×10us handshake, then the selected NCTL table. Its
+/// nctl_post_table hook is NULL. AX preinit/apertures remain separate.
 pub(super) async fn nctl_be(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
-    nctl_for(io, program, &NCTL_PREINIT[..4]).await
+    validate_bb(program)?;
+    // phy_be.c::rtw89_phy_preinit_rf_nctl_be, non-DBCC RTL8922A.
+    for (address, mask, value) in [
+        (0xe464, 0x1800_0000, 3),
+        (0xe564, 0x1800_0000, 3),
+        (0x2ab8, 0x1000_0000, 1),
+        (0x1008, 0x01ff_ffff, 0x000f_ffff),
+        (0x0c60, 3, 3),
+        (0x0c6c, 1, 1),
+        (0xe4ac, 0x0800_0000, 1),
+        (0xe5ac, 0x0800_0000, 1),
+        (0x0c7c, 0x00e0_0000, 1),
+        (0x0c70, 0x200, 1),
+        (0x0c70, 0x60, 3),
+    ] {
+        modify(io, 0x20000 + address, mask, value)?;
+    }
+    io.write32(0x28000, 8)?;
+    for _ in 0..10000 {
+        io.write32(0x28080, 4)?;
+        io.delay_us(10).await;
+        if read(io, 0x28080)? == 4 {
+            return bb_be(io, program).await;
+        }
+    }
+    // Source warns after its10000 attempts; native prerequisites fail closed.
+    Err(power::Error::Timeout.into())
 }
 /// RTL8852A NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` without the
 /// RTL8852B/BT-only second `R_IOQ_IQK_DPK |= 0x2`, then the selected

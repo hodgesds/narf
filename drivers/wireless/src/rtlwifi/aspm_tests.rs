@@ -21,6 +21,7 @@ struct State {
     registers: [u8; 0x400],
     config: [u32; 2],
     address: u16,
+    mdio: [u16; 32],
     writes: Vec<Write>,
 }
 pub(crate) struct Model {
@@ -45,6 +46,7 @@ impl Model {
                 registers: [0; 0x400],
                 config: [0x12345678, 0xa5000005],
                 address: 0,
+                mdio: [0; 32],
                 writes: Vec::new(),
             }),
             live: AtomicBool::new(true),
@@ -79,6 +81,15 @@ impl Io for Model {
         }
         Ok(())
     }
+    fn read16(&self, reg: u16) -> Result<u16, Error> {
+        self.current()?;
+        let state = self.state.lock();
+        Ok(u16::from_le_bytes(
+            state.registers[usize::from(reg)..usize::from(reg) + 2]
+                .try_into()
+                .unwrap(),
+        ))
+    }
     fn read8(&self, reg: u16) -> Result<u8, Error> {
         self.current()?;
         Ok(self.state.lock().registers[usize::from(reg)])
@@ -108,15 +119,31 @@ impl Io for Model {
                     let value = state.config[index];
                     state.registers[0x34c..0x350].copy_from_slice(&value.to_le_bytes());
                 }
-                1 if state.address & 0xf000 == 0xf000 => {
+                1 if state.address & 0xf000 != 0 => {
                     if !self.ignore.load(Ordering::Acquire) {
-                        state.config[index] =
-                            u32::from_le_bytes(state.registers[0x348..0x34c].try_into().unwrap());
+                        let mut bytes = state.config[index].to_le_bytes();
+                        for (lane, byte) in bytes.iter_mut().enumerate() {
+                            if state.address & (1 << (lane + 12)) != 0 {
+                                *byte = state.registers[0x348 + lane];
+                            }
+                        }
+                        state.config[index] = u32::from_le_bytes(bytes);
                     }
                 }
                 _ => return Err(Error::Gate),
             }
             state.registers[0x352] = 0;
+        }
+        if reg == 0x358 && !self.hold.load(Ordering::Acquire) {
+            let index = (value & 0x1f) as usize;
+            if value & 0x40 != 0 {
+                let read = state.mdio[index].to_le_bytes();
+                state.registers[0x356..0x358].copy_from_slice(&read);
+            } else if value & 0x20 != 0 && !self.ignore.load(Ordering::Acquire) {
+                state.mdio[index] =
+                    u16::from_le_bytes(state.registers[0x354..0x356].try_into().unwrap());
+            }
+            state.registers[0x358] = value & 0x1f;
         }
         Ok(())
     }
@@ -258,6 +285,233 @@ impl PolicyPort for Model {
         &self.configured
     }
 }
+
+fn smoke_ae_aspm_own_byte_program_and_parent_policy() -> TestResult {
+    let model = Model::new();
+    if complete(configure_for(&model, Profile::Rtl8723ae, true)).is_err()
+        || model.control.load(Ordering::Acquire) != 0x143
+        || !model.configured.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("AE source internal byte program did not precede endpoint policy");
+    }
+    let state = model.state.lock();
+    if state.config != [0x93345678, 0xa5001b05]
+        || state.writes[..6]
+            != [
+                Write::Byte(0x34b, 0x93),
+                Write::Word(0x350, 0x870c),
+                Write::Byte(0x352, 1),
+                Write::Byte(0x349, 0x1b),
+                Write::Word(0x350, 0x2718),
+                Write::Byte(0x352, 1),
+            ]
+        || state
+            .writes
+            .iter()
+            .any(|w| matches!(w, Write::Word(0x354 | 0x358, _) | Write::Dword(0x348, _)))
+    {
+        return TestResult::Fail("AE borrowed another chip's MDIO or full-dword program");
+    }
+    drop(state);
+    let model = Model::new();
+    model.withdraw_parent_on_wait.store(true, Ordering::Release);
+    if complete(configure_for(&model, Profile::Rtl8723ae, true)).is_err()
+        || model.control.load(Ordering::Acquire) != 0x40
+    {
+        return TestResult::Fail("AE endpoint retained policy withdrawn during wait");
+    }
+    let model = Model::new();
+    if complete(configure_for(&model, Profile::Rtl8723ae, false)).is_err()
+        || !model.state.lock().writes.is_empty()
+        || model.configured.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("AE disabled link performed a backdoor program");
+    }
+    TestResult::Pass
+}
+fn smoke_ae_aspm_incomplete_or_revoked_program_never_enables_endpoint() -> TestResult {
+    for mode in 0..4 {
+        let model = Box::new(Model::new());
+        model.control.store(0x40, Ordering::Release);
+        match mode {
+            0 => model.ignore.store(true, Ordering::Release),
+            1 => model.hold.store(true, Ordering::Release),
+            2 => {
+                model.hold.store(true, Ordering::Release);
+                model.revoke_on_wait.store(true, Ordering::Release);
+            }
+            _ => {
+                model.hold.store(true, Ordering::Release);
+                {
+                    let mut work = pin!(configure_for(&*model, Profile::Rtl8723ae, true));
+                    if !work
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                    {
+                        return TestResult::Fail("AE cancellation fixture never waited");
+                    }
+                }
+                if model.control.load(Ordering::Acquire) != 0x40
+                    || model.configured.load(Ordering::Acquire)
+                {
+                    return TestResult::Fail("AE dropped DBI wait enabled the endpoint");
+                }
+                continue;
+            }
+        }
+        if complete(configure_for(&*model, Profile::Rtl8723ae, true)).is_ok()
+            || model.control.load(Ordering::Acquire) != 0x40
+            || model.configured.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("AE missing DBI/readback/current authority enabled endpoint");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_ae_aspm_own_byte_program_and_parent_policy
+);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_ae_aspm_incomplete_or_revoked_program_never_enables_endpoint
+);
+
+fn smoke_be_de_aspm_exact_internal_program_before_parent_bounded_enable() -> TestResult {
+    for profile in [Profile::Rtl8723be, Profile::Rtl8192de] {
+        let model = Model::new();
+        if complete(configure_for(&model, profile, true)).is_err()
+            || model.control.load(Ordering::Acquire) != 0x143
+            || !model.configured.load(Ordering::Acquire)
+        {
+            return TestResult::Fail(
+                "BE/DE internal program did not authorize bounded endpoint enable",
+            );
+        }
+        let state = model.state.lock();
+        let expected = match profile {
+            Profile::Rtl8723be => [0xba345678, 0xa5001805],
+            Profile::Rtl8192de => [0x93345678, 0xa5001b05],
+            _ => unreachable!(),
+        };
+        if state.config != expected {
+            return TestResult::Fail("BE latency/L0s or DE source byte program differs");
+        }
+        if profile == Profile::Rtl8723be {
+            for (address, value) in [
+                (1, 0x0663),
+                (4, 0x7544),
+                (6, 0xb880),
+                (7, 0x4000),
+                (8, 0x9003),
+                (9, 0x0d03),
+                (10, 0x4037),
+                (11, 0x0070),
+            ] {
+                if state.mdio[address] != value {
+                    return TestResult::Fail("BE exact ePHY compatibility words missing");
+                }
+            }
+        } else if state
+            .writes
+            .iter()
+            .any(|write| matches!(write, Write::Word(0x354, _)))
+        {
+            return TestResult::Fail("DE inherited EE/BE ePHY writes");
+        }
+        if !state.writes.contains(&Write::Word(0x350, 0x870c))
+            || !state.writes.contains(&Write::Word(0x350, 0x2718))
+        {
+            return TestResult::Fail("source DBI byte enables were widened");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_be_de_aspm_exact_internal_program_before_parent_bounded_enable
+);
+
+fn smoke_be_de_aspm_busy_ignored_write_and_lost_source_never_enable() -> TestResult {
+    for profile in [Profile::Rtl8723be, Profile::Rtl8192de] {
+        for mode in 0..3 {
+            let model = Model::new();
+            match mode {
+                0 => model.hold.store(true, Ordering::Release),
+                1 => model.ignore.store(true, Ordering::Release),
+                _ => {
+                    model.hold.store(true, Ordering::Release);
+                    model.revoke_on_wait.store(true, Ordering::Release);
+                }
+            }
+            if complete(configure_for(&model, profile, true)).is_ok()
+                || model.control.load(Ordering::Acquire) & CONTROL_MASK != 0
+                || model.configured.load(Ordering::Acquire)
+            {
+                return TestResult::Fail("BE/DE missing internal receipt became link readiness");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_be_de_aspm_busy_ignored_write_and_lost_source_never_enable
+);
+
+fn smoke_be_de_aspm_disabled_parent_and_postwait_withdrawal() -> TestResult {
+    for profile in [Profile::Rtl8723be, Profile::Rtl8192de] {
+        let model = Model::new();
+        model.parent.store(0x40, Ordering::Release);
+        if complete(configure_for(&model, profile, true)).is_err()
+            || !model.state.lock().writes.is_empty()
+            || model.control.load(Ordering::Acquire) != 0x40
+        {
+            return TestResult::Fail("disabled parent still programmed/enabled endpoint");
+        }
+        model.parent.store(0x43, Ordering::Release);
+        model.withdraw_parent_on_wait.store(true, Ordering::Release);
+        if complete(configure_for(&model, profile, true)).is_err()
+            || model.control.load(Ordering::Acquire) != 0x40
+        {
+            return TestResult::Fail("BE/DE reused parent policy across wait");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_be_de_aspm_disabled_parent_and_postwait_withdrawal
+);
+
+fn smoke_be_de_aspm_cancelled_internal_wait_keeps_endpoint_off() -> TestResult {
+    for profile in [Profile::Rtl8723be, Profile::Rtl8192de] {
+        let model = Model::new();
+        model.hold.store(true, Ordering::Release);
+        {
+            let work = configure_for(&model, profile, true);
+            let mut work = pin!(work);
+            if !work
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+            {
+                return TestResult::Fail("BE/DE native internal wait did not pend");
+            }
+        }
+        if model.control.load(Ordering::Acquire) & CONTROL_MASK != 0
+            || model.configured.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("cancelled BE/DE internal wait published preparation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/aspm",
+    smoke_be_de_aspm_cancelled_internal_wait_keeps_endpoint_off
+);
 fn smoke_rtl8188ee_aspm_cancelled_native_wait_does_not_enable_endpoint() -> TestResult {
     let model = Model::new();
     model.hold.store(true, Ordering::Release);

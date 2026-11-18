@@ -222,7 +222,9 @@ pub fn rtl8xxxu_probe(
             narf_console::Writer,
             "  rtl8188eu:   firmware required at /firmware/rtlwifi/rtl8188eufw.bin"
         );
-        narf_scheduler::spawn(async move {
+        // Initialization futures contain calibration/attachment state well
+        // beyond this probe. Retain it on the heap before scheduler transfer.
+        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
@@ -245,13 +247,13 @@ pub fn rtl8xxxu_probe(
                     service
                 );
             }
-        });
+        }));
     } else if family == regs::ChipFamily::Rtl8192eu {
         let _ = writeln!(
             narf_console::Writer,
             "  rtl8192eu:   firmware required at /firmware/rtlwifi/rtl8192eu_nic.bin"
         );
-        narf_scheduler::spawn(async move {
+        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
@@ -288,13 +290,13 @@ pub fn rtl8xxxu_probe(
                 "  rtl8192eu: station {:?}",
                 device.as_ref().map(|_| ())
             );
-        });
+        }));
     } else if family == regs::ChipFamily::Rtl8723bu {
         let _ = writeln!(
             narf_console::Writer,
             "  rtl8723bu:   firmware required at /firmware/rtlwifi/rtl8723bu_nic.bin"
         );
-        narf_scheduler::spawn(async move {
+        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
@@ -329,7 +331,7 @@ pub fn rtl8xxxu_probe(
                 "  rtl8723bu: station {:?}",
                 device.as_ref().map(|_| ())
             );
-        });
+        }));
     }
 
     Ok(())

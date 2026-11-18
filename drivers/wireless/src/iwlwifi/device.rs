@@ -2333,9 +2333,11 @@ impl WirelessNetIface for Device {
         if !matches!(self.current_iftype(), 2 | 8) {
             return Err(WirelessError::Busy);
         }
-        let domain =
-            narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::HardwareError)?;
-        self.associate_in_domain(request, &domain).await
+        let domain = self
+            .policy
+            .request_snapshot()
+            .map_err(|_| WirelessError::HardwareError)?;
+        self.associate_in_domain(request, domain.as_ref()).await
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {

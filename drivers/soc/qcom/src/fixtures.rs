@@ -12,7 +12,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
-use core::pin::pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -26,7 +25,9 @@ use crate::scm::{ScmAlloc, ScmBuffer, SmcConduit};
 
 /// Drive a future whose waits are all [`FakeDelay`] (always ready).
 pub fn run<F: Future>(f: F) -> Option<F::Output> {
-    let mut f = pin!(f);
+    // AHB bring-up futures include the transport reconstruction state;
+    // retain it on the heap rather than in this polling frame.
+    let mut f = Box::pin(f);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..1_000_000 {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

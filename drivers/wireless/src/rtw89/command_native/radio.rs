@@ -239,6 +239,9 @@ impl Native {
         Ok(true)
     }
     pub(in crate::rtw89) fn station_ht_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::Ht);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::Ht);
         }
@@ -248,6 +251,9 @@ impl Native {
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_he_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::He);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::He);
         }
@@ -260,6 +266,9 @@ impl Native {
     /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
     /// operating PHY and current ordinary authority.
     fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
+        if self.chip == ChipId::Rtl8852A {
+            return Err(power::Error::Unsupported);
+        }
         if self.sleep_blocked {
             return Err(power::Error::Terminal);
         }
@@ -284,6 +293,11 @@ impl Native {
     /// likewise its own ordinary grant, factory/receipt and the B-sequence
     /// operating owner (`support_cckpd` true on every RTL8851B cut).
     fn track_operating_current(&self) -> Result<(), power::Error> {
+        if self.chip == ChipId::Rtl8852A {
+            // Its retained source initialization/projection state is not a
+            // completed native periodic adapter or measured RF window.
+            return Err(power::Error::Unsupported);
+        }
         if !matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) {
             return self.operating_current();
         }
@@ -313,6 +327,9 @@ impl Native {
     pub(in crate::rtw89) fn station_track_layout(
         &self,
     ) -> Result<(crate::rtw89::track::Layout, bool), power::Error> {
+        if self.chip == ChipId::Rtl8852A {
+            return Err(power::Error::Unsupported);
+        }
         if self.chip == ChipId::Rtl8851B {
             self.track_operating_current()?;
             let active = self
@@ -426,6 +443,9 @@ impl Native {
         Ok(xi)
     }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::Ampdu);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::Ampdu);
         }
@@ -435,6 +455,9 @@ impl Native {
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_firmware_ra_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::FirmwareRa);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::FirmwareRa);
         }
@@ -444,6 +467,9 @@ impl Native {
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_amsdu_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return Ok(false);
+        } // no signed A aggregation companion yet.
         if self.c_ordinary()? {
             return Ok(false);
         }
@@ -453,6 +479,9 @@ impl Native {
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_qos_all_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::QosAll);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::QosAll);
         }
@@ -462,6 +491,9 @@ impl Native {
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_program(radio_policy::Program::Wmm);
+        }
         if self.c_ordinary()? {
             return self.c_program(radio_policy::Program::Wmm);
         }
@@ -692,6 +724,9 @@ impl Native {
     /// 5GHz after) of primaries with a current signed full program whose
     /// host rule currently permits active emission.
     pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u64, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_admitted_channels();
+        }
         if self.c_ordinary()? {
             if self.chip == ChipId::Rtl8851B {
                 return self.admitted_channels_51();
@@ -764,6 +799,9 @@ impl Native {
     pub(in crate::rtw89) fn admitted_wide(
         &self,
     ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
+        if self.a_ordinary()? {
+            return self.a_admitted_wide();
+        }
         if self.c_ordinary()? && self.chip == ChipId::Rtl8851B {
             // RTL8851B: the same 40/80MHz chandefs (`support_bandwidths`
             // 20/40/80), each with a loaded signed `N51C` record wholly
@@ -1205,6 +1243,20 @@ impl crate::rtw89::channel_bb::Interface for Native {
 
 impl crate::rtw89::phy_operating::Interface for Native {
     fn admit(&mut self) -> Result<(), rfk::Error> {
+        if self.chip == ChipId::Rtl8852A {
+            // New A DIG/IB/direct-XTAL effects are covered by the fresh
+            // recipe-bound full A program, never cold N5AB-v1 alone.
+            self.qualification_a
+                .as_ref()
+                .ok_or(rfk::Error::Policy)?
+                .current()
+                .map_err(|_| rfk::Error::Policy)?;
+            self.mac_a
+                .as_ref()
+                .ok_or(rfk::Error::Policy)?
+                .current()
+                .map_err(rfk::Error::Register)?;
+        }
         // B: phy_profile_current unchanged; C: its own identity + V1 receipt.
         self.radio_profile_current().map_err(rfk::Error::Register)?;
         if !self.coex_ready || self.nctl_ready {

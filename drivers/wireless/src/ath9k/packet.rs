@@ -100,6 +100,44 @@ pub(super) trait Port {
         super::channel_width::Geometry::from_frequency_dual(self.frequency_mhz())
             .expect("prepared physical primary")
     }
+    /// Private exact AR9485 RX continuation. Unknown ports cannot fabricate
+    /// antenna ownership from advertised capabilities or register offsets.
+    fn ar9003_antenna(&self) -> Option<super::ar9003::antenna::Binding> {
+        None
+    }
+    fn manual_scope(&self) -> Option<alloc::sync::Arc<super::ar9003::antenna::manual::Latch>> {
+        None
+    }
+    fn ar9003_ani_bound(&self) -> bool {
+        false
+    }
+    fn ar9003_ani_service(&self, _eligible: bool) -> Result<(), Error> {
+        Ok(())
+    }
+    fn ar9003_ani_beacon(&self, _rssi: i8) {}
+    fn ar9003_ani_epoch(&self) {}
+    /// A calibrated AR9462/AR9565 power transition, before MCI publishes
+    /// concurrent priorities. `false` means this port has no such measured
+    /// native program; no register/flag authority is inferred from RSSI.
+    fn mci_concurrent(&self, _enabled: bool) -> Result<bool, Error> {
+        Ok(false)
+    }
+    /// The native retained record encloses the whole timed coexistence
+    /// operation, including priority writes after a power transition.
+    fn coex_access<T>(
+        &self,
+        active: bool,
+        action: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.access(active, action)
+    }
+    fn ps_request(&self) -> Option<super::ps::Request> {
+        self.ht_grant().map(|base| super::ps::request(&base))
+    }
+    /// A private current N46S observation, never a caller-supplied sleep bit.
+    fn mci_network_sleep(&self) -> Result<Option<super::ar9003::ps::NetworkSleep>, Error> {
+        Ok(None)
+    }
     fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
         None
     }

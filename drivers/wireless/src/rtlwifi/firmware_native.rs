@@ -21,10 +21,14 @@ struct Msi {
     vector: u8,
     signal: alloc::sync::Arc<super::irq::Signal>,
 }
+#[path = "rtl8723ae/park_native.rs"]
+mod ae_park;
 #[path = "aspm_native.rs"]
 mod aspm_native;
 #[path = "irq_routes.rs"]
 mod irq_routes;
+#[path = "rtl8821ae/park_native.rs"]
+mod park_8821;
 static SIGNALS: narf_lib::sync::IrqSafeSpinLock<irq_routes::Routes> =
     narf_lib::sync::IrqSafeSpinLock::new(irq_routes::Routes::new());
 fn vector_irq(cookie: u64) -> narf_interrupts::IrqStatus {
@@ -69,6 +73,25 @@ fn command_gate(command: u16, packet_mode: bool) -> Result<(), Error> {
         return Err(Error::Access);
     }
     Ok(())
+}
+impl super::rtl8723ae::retained::Backend for PciIo {
+    fn restrict_packets(&self) -> Result<(), Error> {
+        self.restrict_ae_packets()
+    }
+    fn address(&self) -> narf_bus::BusAddr {
+        self.device.addr
+    }
+    fn current<T>(&self, operation: impl FnOnce(&Self) -> Result<T, Error>) -> Result<T, Error> {
+        self.access(0, 1, || {
+            self.check_identity()?;
+            operation(self)
+        })?
+    }
+    fn identity(&self) -> Result<super::rtl8723ae::cold_storage::PciIdentity, Error> {
+        <Self as super::rtl8723ae::retained::Backend>::current(self, |_| {
+            super::rtl8723ae::cold_storage::PciIdentity::read(self.device, &self.cap)
+        })
+    }
 }
 impl core::fmt::Debug for PciIo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -501,8 +524,71 @@ narf_kernel_test::kernel_test_in!(
     "drivers/wireless/rtlwifi/packet",
     smoke_rtl8188ee_native_pci_absence_cannot_authorize_active_dma
 );
+
+#[cfg(feature = "kernel-test")]
+fn smoke_rtlwifi_native_word_access_is_current_aligned_and_bounded() -> narf_kernel_test::TestResult
+{
+    use narf_kernel_test::{kt_assert_eq, TestResult};
+    let mut config = alloc::vec![0u32; 4096 / 4];
+    let mut bar = alloc::vec![0u32; 0x100 / 4];
+    config[1] = 0x402; // MEM + INTX_DISABLE, BME parked.
+    bar[0] = 0x3412_7856;
+    let physical = narf_memory::PhysAddr::new(0xd000_0000);
+    // SAFETY: this smoke owns both inert RAM windows; no physical function,
+    // reset or other config/BAR accessor uses these temporary mappings.
+    let _windows =
+        unsafe { narf_bus::ecam::__test_windows(&[(physical, config.as_mut_ptr().cast(), 4096)]) };
+    let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
+    let device = BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        id: narf_bus::DeviceId {
+            vendor: 0x10ec,
+            device: 0x8723,
+            class: 0x028000,
+            subsystem_vendor: 0x103c,
+            subsystem_id: 0x1629,
+        },
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: physical,
+        },
+    };
+    let region = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: bar.as_mut_ptr() as u64,
+        len: 0x100,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+    // SAFETY: exact private RAM/config function is exclusively owned above.
+    let mut native = unsafe { PciIo::new(device, cap, region) };
+    kt_assert_eq!(native.read16(2), Ok(0x3412));
+    kt_assert_eq!(native.read16(3), Err(Error::Access));
+    kt_assert_eq!(native.read16(0x100), Err(Error::Access));
+    native.registers.len = 3;
+    kt_assert_eq!(native.read16(2), Err(Error::Access));
+    native.registers.len = 0x100;
+    config[1] = 0x406; // BME is not authorized for this parked port.
+    kt_assert_eq!(native.read16(2), Err(Error::Access));
+    config[1] = u32::MAX;
+    kt_assert_eq!(native.read16(2), Err(Error::Gone));
+    config[1] = 0x402;
+    cap.revoke();
+    kt_assert_eq!(native.read16(2), Err(Error::Access));
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_native_word_access_is_current_aligned_and_bounded
+);
 #[async_trait::async_trait]
 impl Io for PciIo {
+    fn restrict_8821_packets(&self) -> Result<(), Error> {
+        PciIo::restrict_8821_packets(self)
+    }
     fn read8(&self, reg: u16) -> Result<u8, Error> {
         // SAFETY: access checks live authority, parked DMA and complete byte extent.
         self.access(reg, 1, || unsafe { self.registers.read8(u64::from(reg)) })
@@ -513,6 +599,14 @@ impl Io for PciIo {
         }
         // SAFETY: aligned dword extent checked inside the live invocation.
         self.access(reg, 4, || unsafe { self.registers.read32(u64::from(reg)) })
+    }
+    fn read16(&self, reg: u16) -> Result<u16, Error> {
+        if reg & 1 != 0 {
+            return Err(Error::Access);
+        }
+        // SAFETY: aligned full word extent checked inside this actual
+        // current PCI invocation, including command/BAR access policy.
+        self.access(reg, 2, || unsafe { self.registers.read16(u64::from(reg)) })
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), Error> {
         // SAFETY: access checks live authority, parked DMA and complete byte extent.

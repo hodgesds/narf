@@ -10,8 +10,8 @@
 //! a one-shot timeout and returns 1; NARF fails the attempt closed.
 //!
 //! `thermal` is the current averaged thermal per path
-//! (`ewma_thermal_read`); NARF has no live-thermal plumbing yet, so the
-//! caller supplies it. `epa` is the FEM external-PA presence
+//! (`ewma_thermal_read`); the native A caller supplies its actual retained
+//! non-TSSI observations. `epa` is the factory FEM external-PA presence
 //! (`epa_2g`, `epa_5g`); a present external PA forces the bypass
 //! (`_dpk_bypass_check` / `_dpk_force_bypass`).
 //!

@@ -58,23 +58,21 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
         if let Some(bus) = self.bus_power.lock().as_ref() {
             bus.fresh_owner();
         }
-        let mut owner = Prepared::allocate(
+        let mut owner = Box::new(Prepared::allocate(
             firmware.claim_packet_io().map_err(Error::Access)?,
             4,
             |bytes| Ok(self.packet.allocate(bytes)),
-        )?;
+        )?);
         owner.prepare().await?;
-        owner
-            .configure_radio(radio::Profile::from_factory(&factory).unwrap())
-            .await?;
+        let profile = radio::Profile::from_factory(&factory).unwrap();
+        crate::future_heap::build(|| owner.configure_radio(profile)).await?;
         let calibration = power::calibration_for_channel(&factory, channel);
         let domain = self.domain()?;
-        owner
-            .configure_channel(calibration.permission(&domain, channel).unwrap())
-            .await?;
+        let permission = calibration.permission(&domain, channel).unwrap();
+        crate::future_heap::build(|| owner.configure_channel(permission)).await?;
         owner.configure_mac(&factory)?;
         owner.stage_station_calibration(calibration, &domain)?;
-        *retained.lock().await = Some(owner);
+        *retained.lock().await = Some(*owner);
         self.beacon.store(false, Ordering::Release);
         Ok(())
     }

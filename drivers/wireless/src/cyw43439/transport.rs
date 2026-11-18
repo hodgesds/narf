@@ -1,7 +1,7 @@
 //! CYW43439 transport-abstraction trait.
 //!
 //! The chip exposes the same logical address space behind two
-//! physically-different host interfaces: gSPI (datasheet §6.4) and
+//! physically-different host interfaces: gSPI (datasheet §4.2) and
 //! 4-bit SDIO (datasheet §3.1 + §6.5). Both expose the same
 //! `(function, address) → bytes` model from the driver's
 //! perspective. This trait is the seam between those host adapters
@@ -18,7 +18,7 @@ use core::fmt;
 
 /// Logical access function on the chip. The numeric encoding
 /// matches both the SDIO function index (datasheet §3.1) and the
-/// gSPI function field (datasheet §6.4 Table 6-2), so the same
+/// gSPI function field (datasheet §4.2 Table 5), so the same
 /// enum drives both transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -37,6 +37,15 @@ impl Function {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+}
+
+/// Immutable host protocol established by the transport implementation.
+/// Unknown adapters cannot authorize either loader register namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderMode {
+    Unknown,
+    Sdio,
+    Gspi,
 }
 
 /// Errors a transport adapter may report up to the driver. Adapters
@@ -86,6 +95,25 @@ impl fmt::Display for TransportError {
 /// Mutable ownership serializes individual accesses. A caller must also
 /// serialize the entire backplane window-select/access transaction.
 pub trait Transport {
+    /// Actual protocol owned by this adapter, fixed for its lifetime and
+    /// observed without hardware access. A caller's requested loader mode
+    /// cannot replace this producer fact.
+    fn loader_mode(&self) -> LoaderMode {
+        LoaderMode::Unknown
+    }
+
+    /// One-shot gSPI bootstrap after actual platform reset. SDIO and unknown
+    /// adapters refuse; an endian register read alone is not bus initialization.
+    fn initialize_gspi(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// After firmware/HT and the discovered core host mask: set the gSPI F2
+    /// watermark and observe real STATUS readiness. No SDIO CCCR accesses.
+    fn finish_gspi_boot(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
     /// Read a single 32-bit register through `function:address`.
     /// Address auto-increments unless the adapter explicitly fixes
     /// it (FIFO mode); for register reads the auto-increment policy
@@ -102,7 +130,7 @@ pub trait Transport {
 
     /// Read `buf.len()` bytes from `function:address` (auto-
     /// increment). The split into transport-sized bursts (gSPI
-    /// max 2047 bytes, SDIO max 511 blocks of 64 bytes) is the
+    /// F1 max 64 bytes, SDIO max 511 blocks of 64 bytes) is the
     /// adapter's responsibility.
     fn read_burst(
         &mut self,

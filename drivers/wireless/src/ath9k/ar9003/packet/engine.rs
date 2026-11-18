@@ -5,7 +5,7 @@
 //! inherent EDMA methods; `Delivery` and `ReceiveStep` are the shared
 //! station types already.
 //!
-//! This owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
+//! This owner carries no HT, EDCA, QoS, block-ack or aggregation
 //! program (no AR9003 `ar9003_txc` HT/aggregate encoding, no measured
 //! records for them). Every such operation returns exactly what the AR9002
 //! `packet::Packet` returns when that program is absent: no grant is
@@ -22,19 +22,10 @@ use crate::ath9k::{
 use alloc::{sync::Arc, vec::Vec};
 use narf_wireless::association::phy::Offer;
 
-/// AR9002 `submit`/`submit_rates`: a PM-marked frame needs the power-save
-/// program (`descriptor::ps_unmark` under `ps`), which is absent here.
-fn unmarked(frame: &[u8]) -> Result<(), Error> {
-    if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
-        return Err(Error::State);
-    }
-    Ok(())
-}
-
 /// The station's view of `ar9003_hw_get_isr`'s causes: RX is either FIFO
 /// (`ATH9K_INT_RXHP | ATH9K_INT_RXLP`); EDMA never fills `ah->intr_txqs`
-/// (TX completion is the status ring), and the AR9300 imask carries no
-/// `ATH9K_INT_TIM_TIMER` (no power-save program). FATAL and the BB
+/// (TX completion is the status ring). AUTOSLEEP S2 TIM/DTIM causes are
+/// translated into the shared station's beacon-wait wake. FATAL and the BB
 /// watchdog already failed the owner in `service_begin`, queueing an
 /// in-place reset (`reset_request`).
 fn shared_events(events: super::irq::Events) -> irq::Events {
@@ -45,7 +36,7 @@ fn shared_events(events: super::irq::Events) -> irq::Events {
         rx_eol: events.rx_eol,
         rx_overrun: events.rx_overrun,
         fatal: events.fatal,
-        tim_timer: false,
+        tim_timer: events.tim || events.dtim || events.dtim_sync,
         bmiss: events.bmiss,
         tsf_oor: events.tsf_oor,
         sync_cause: events.sync_cause,
@@ -64,6 +55,9 @@ impl<P: Port> station::Engine for Packet<P> {
     }
     fn check_transmit(&self) -> Result<(), Error> {
         Packet::check_transmit(self)
+    }
+    fn manual_scope(&self) -> Option<Arc<crate::ath9k::ar9003::antenna::manual::Latch>> {
+        self.port.manual_scope()
     }
     fn geometry(&self) -> Geometry {
         self.port.geometry()
@@ -84,38 +78,42 @@ impl<P: Port> station::Engine for Packet<P> {
         None
     }
     fn ps_grant(&self) -> Option<Arc<ps::Grant>> {
-        None
+        self.port
+            .ps_grant()
+            .filter(|source| source.ar9003_wa().is_some())
     }
-    fn enable_ps(&mut self, _source: &Arc<ps::Grant>) -> Result<(), Error> {
-        Err(Error::State)
+    fn ps_request(&self) -> Option<ps::Request> {
+        self.port.ps_request()
+    }
+    fn sleep_service(&mut self) -> Result<(), Error> {
+        Packet::sleep_service(self)
+    }
+    fn enable_ps(&mut self, source: &Arc<ps::Grant>) -> Result<(), Error> {
+        Packet::enable_ps(self, source)
     }
     fn ps_receive_on(&self) -> Result<(), Error> {
-        Err(Error::State)
+        Packet::ps_receive_on(self)
     }
-    fn ps_timers(&mut self, _plan: ps::tim::Plan) -> Result<(), Error> {
-        Err(Error::State)
+    fn ps_timers(&mut self, plan: ps::tim::Plan) -> Result<(), Error> {
+        Packet::ps_timers(self, plan)
     }
     fn ps_awake_mode(&mut self) -> Result<(), Error> {
-        Err(Error::State)
+        Packet::ps_awake_mode(self)
     }
     fn ps_sleep(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Running || self.pending.is_some() {
-            return Err(Error::Busy);
-        }
-        Packet::check_transmit(self)?;
-        Err(Error::State)
+        Packet::ps_sleep(self)
     }
     fn ps_tsf(&self) -> Result<u64, Error> {
-        Err(Error::State)
+        Packet::ps_tsf(self)
     }
     fn submit_ps(
         &mut self,
-        _frame: &[u8],
-        _ap: [u8; 6],
-        _aid: u16,
-        _basic: usize,
+        frame: &[u8],
+        ap: [u8; 6],
+        aid: u16,
+        basic: usize,
     ) -> Result<u64, Error> {
-        Err(Error::State)
+        Packet::submit_ps(self, frame, ap, aid, basic)
     }
     fn tx_ba_grant(&self) -> Option<Arc<tx_ba::Grant>> {
         None
@@ -165,11 +163,9 @@ impl<P: Port> station::Engine for Packet<P> {
         Packet::start(self)
     }
     fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
-        unmarked(frame)?;
         Packet::submit(self, frame, rate)
     }
     fn submit_rates(&mut self, frame: &[u8], series: rates::Series) -> Result<u64, Error> {
-        unmarked(frame)?;
         Packet::submit_rates(self, frame, series)
     }
     fn submit_ba_response(&mut self, _frame: &[u8], _rate: usize) -> Result<u64, Error> {
@@ -217,6 +213,9 @@ impl<P: Port> station::Engine for Packet<P> {
     fn check_bt(&mut self) -> Result<(), Error> {
         Packet::check_bt(self)
     }
+    fn coex_wait_us(&self) -> Option<u64> {
+        Packet::coex_wait_us(self)
+    }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         Packet::interrupt(self)
     }
@@ -229,16 +228,24 @@ impl<P: Port> station::Engine for Packet<P> {
     fn stop(&mut self) -> Result<(), Error> {
         Packet::stop(self)
     }
-    // No HT program, so the shared `periodic::Owner` (HT20 ANI/NF under a
-    // measured grant) is never bound; the AR9003 calibration runs through
-    // `long_calibration` on the port.
-    fn periodic_epoch(&mut self) {}
-    fn periodic_bound(&self) -> bool {
-        false
+    // Distinct original AR9003 P owner; no AR9285 HT/ANI alias.
+    fn periodic_epoch(&mut self) {
+        self.port.ar9003_ani_epoch();
     }
-    fn periodic_beacon(&mut self, _rssi: i8) {}
-    fn periodic_service(&mut self, _eligible: bool) -> Result<(), Error> {
-        Ok(())
+    fn periodic_bound(&self) -> bool {
+        self.port.ar9003_ani_bound()
+    }
+    // Radio::cache admits the bound peer beacon after native descriptor/CRC
+    // validation. The exact same bound-peer sample feeds MCI and AR9003 P.
+    fn periodic_beacon(&mut self, rssi: i8) {
+        if self.phase() == Phase::Running {
+            self.mci.lock().beacon_rssi(rssi);
+            self.port.ar9003_ani_beacon(rssi);
+        }
+    }
+    fn periodic_service(&mut self, eligible: bool) -> Result<(), Error> {
+        self.port
+            .ar9003_ani_service(eligible && self.pending.is_none())
     }
     fn periodic_deferred(&self) -> Result<bool, Error> {
         Ok(false)

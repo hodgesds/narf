@@ -18,6 +18,9 @@ pub(in crate::ath9k) trait Engine {
     fn reclaimed(&self) -> bool;
     fn idle_admissible(&self) -> bool;
     fn check_transmit(&self) -> Result<(), Error>;
+    fn manual_scope(&self) -> Option<Arc<crate::ath9k::ar9003::antenna::manual::Latch>> {
+        None
+    }
     fn geometry(&self) -> Geometry;
     fn frequency_mhz(&self) -> u16;
     fn channel_mask(&self) -> u64;
@@ -25,6 +28,13 @@ pub(in crate::ath9k) trait Engine {
     fn ht_grant(&self) -> Option<Arc<ht::Grant>>;
     fn rx_ba_grant(&self) -> Option<Arc<rx_ba::Grant>>;
     fn ps_grant(&self) -> Option<Arc<ps::Grant>>;
+    fn ps_request(&self) -> Option<ps::Request> {
+        self.ht_grant().map(|base| ps::request(&base))
+    }
+    /// Observe a qualified sleep owner before ordinary access wakes it.
+    fn sleep_service(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
     fn enable_ps(&mut self, source: &Arc<ps::Grant>) -> Result<(), Error>;
     fn ps_receive_on(&self) -> Result<(), Error>;
     fn ps_timers(&mut self, plan: ps::tim::Plan) -> Result<(), Error>;
@@ -71,6 +81,10 @@ pub(in crate::ath9k) trait Engine {
     /// One periodic MCI coexistence poll (`ar9003_mci_check_bt`); a
     /// no-op on engines without a live MCI link.
     fn check_bt(&mut self) -> Result<(), Error>;
+    /// Relative microseconds until a timed coexistence transition.
+    fn coex_wait_us(&self) -> Option<u64> {
+        None
+    }
     fn interrupt(&self) -> Option<Arc<irq::Signal>>;
     fn service_begin(&mut self) -> Result<Option<irq::Events>, Error>;
     fn service_end(&mut self) -> Result<(), Error>;
@@ -307,6 +321,9 @@ impl<P: Port> Engine for Dispatch<P> {
     fn check_transmit(&self) -> Result<(), Error> {
         dispatch!(self.check_transmit())
     }
+    fn manual_scope(&self) -> Option<Arc<crate::ath9k::ar9003::antenna::manual::Latch>> {
+        dispatch!(self.manual_scope())
+    }
     fn geometry(&self) -> Geometry {
         dispatch!(self.geometry())
     }
@@ -327,6 +344,12 @@ impl<P: Port> Engine for Dispatch<P> {
     }
     fn ps_grant(&self) -> Option<Arc<ps::Grant>> {
         dispatch!(self.ps_grant())
+    }
+    fn ps_request(&self) -> Option<ps::Request> {
+        dispatch!(self.ps_request())
+    }
+    fn sleep_service(&mut self) -> Result<(), Error> {
+        dispatch!(self.sleep_service())
     }
     fn enable_ps(&mut self, source: &Arc<ps::Grant>) -> Result<(), Error> {
         dispatch!(self.enable_ps(source))
@@ -435,6 +458,9 @@ impl<P: Port> Engine for Dispatch<P> {
     }
     fn check_bt(&mut self) -> Result<(), Error> {
         dispatch!(self.check_bt())
+    }
+    fn coex_wait_us(&self) -> Option<u64> {
+        dispatch!(self.coex_wait_us())
     }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         dispatch!(self.interrupt())

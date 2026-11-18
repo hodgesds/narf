@@ -353,138 +353,153 @@ impl Bootstrap {
         self.generation.fetch_add(1, Ordering::AcqRel);
         Some(kept)
     }
-    async fn generation(&self, kept: Option<&str>) -> Result<(), Error> {
-        let retained_lifecycle = {
-            let owner = self.lifecycle.lock();
-            owner.clone()
-        };
-        let lifecycle = match retained_lifecycle {
-            Some(lifecycle) => lifecycle,
-            None => {
-                self.set_stage(Stage::Reset);
-                // The reset guard stays held until the lifecycle is
-                // published, so removal sees either the reset or the owner.
-                let mut reset = self.reset.lock().await;
-                let fence = reset
+    #[inline(never)]
+    fn generation<'a>(
+        &'a self,
+        kept: Option<&'a str>,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), Error>> + Send + 'a>,
+    > {
+        // An opaque boxed poll boundary keeps LTO from merging this
+        // generation's large cold frame into the supervisor's poll.
+        alloc::boxed::Box::pin(async move {
+            let retained_lifecycle = {
+                let owner = self.lifecycle.lock();
+                owner.clone()
+            };
+            let lifecycle = match retained_lifecycle {
+                Some(lifecycle) => lifecycle,
+                None => {
+                    self.set_stage(Stage::Reset);
+                    // The reset guard stays held until the lifecycle is
+                    // published, so removal sees either the reset or the owner.
+                    let mut reset = self.reset.lock().await;
+                    let fence = reset
+                        .as_mut()
+                        .ok_or(Error::Cancelled)?
+                        .run()
+                        .await
+                        .map_err(Error::Reset)?;
+                    if self.removed.load(Ordering::Acquire) {
+                        return Err(Error::Cancelled);
+                    }
+                    let startup = startup::Startup::claim_reset(self.device, self.authority, fence)
+                        .map_err(Error::Startup)?;
+                    // Retain the exact startup before its first cold/firmware attempt.
+                    let lifecycle = Arc::new(Lifecycle::new(startup));
+                    *self.lifecycle.lock() = Some(lifecycle.clone());
+                    drop(reset);
+                    lifecycle
+                }
+            };
+            self.set_stage(Stage::Discovery);
+            let identity = {
+                let mut retained = lifecycle.retained.lock().await;
+                retained
                     .as_mut()
                     .ok_or(Error::Cancelled)?
-                    .run()
+                    .io
+                    .discover()
                     .await
-                    .map_err(Error::Reset)?;
-                if self.removed.load(Ordering::Acquire) {
-                    return Err(Error::Cancelled);
-                }
-                let startup = startup::Startup::claim_reset(self.device, self.authority, fence)
-                    .map_err(Error::Startup)?;
-                // Retain the exact startup before its first cold/firmware attempt.
-                let lifecycle = Arc::new(Lifecycle::new(startup));
-                *self.lifecycle.lock() = Some(lifecycle.clone());
-                drop(reset);
-                lifecycle
+                    .map_err(Error::Startup)?
+            };
+            let name = kept
+                .and_then(narf_net::iface::rebind_name)
+                .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
+            let shell = Arc::new(Device::new_selected(
+                name,
+                identity.mac(),
+                lifecycle.clone(),
+                Arc::new(station::NativeEnvironment),
+                self.desired.clone(),
+            ));
+            {
+                let (config, wakeup) = self.wowlan.lock().clone();
+                shell.restore_wowlan(config, wakeup);
             }
-        };
-        self.set_stage(Stage::Discovery);
-        let identity = {
-            let mut retained = lifecycle.retained.lock().await;
-            retained
-                .as_mut()
-                .ok_or(Error::Cancelled)?
-                .io
-                .discover()
-                .await
-                .map_err(Error::Startup)?
-        };
-        let name = kept
-            .and_then(narf_net::iface::rebind_name)
-            .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
-        let shell = Arc::new(Device::new_selected(
-            name,
-            identity.mac(),
-            lifecycle.clone(),
-            Arc::new(station::NativeEnvironment),
-            self.desired.clone(),
-        ));
-        {
-            let (config, wakeup) = self.wowlan.lock().clone();
-            shell.restore_wowlan(config, wakeup);
-        }
-        *self.shell.lock() = Some(shell.clone());
-        // Source factory discovery ended with BME off. The exact same shell
-        // reaches all registries before the first CH12/firmware BME attempt.
-        if self.removed.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
-        }
-        super::interface::publish(shell.clone()).map_err(Error::Station)?;
-        // A removal that read no shell before this publication withdraws it.
-        if self.removed.load(Ordering::Acquire) {
-            super::interface::withdraw(&shell);
-            return Err(Error::Cancelled);
-        }
-        loop {
-            if shell.closed() || self.suspended.load(Ordering::Acquire) {
-                terminalize(&shell, &lifecycle).await;
+            *self.shell.lock() = Some(shell.clone());
+            // Source factory discovery ended with BME off. The exact same shell
+            // reaches all registries before the first CH12/firmware BME attempt.
+            if self.removed.load(Ordering::Acquire) {
                 return Err(Error::Cancelled);
             }
-            let result = {
-                let mut retained = lifecycle.retained.lock().await;
-                let owner = retained.as_mut().ok_or(Error::Cancelled)?;
-                self.set_stage(if owner.io.phase() == Phase::Discovered {
-                    Stage::Firmware
-                } else {
-                    Stage::Radio
-                });
-                advance(&mut owner.io).await
-            };
-            match result {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => {
-                    let (retry, request) = {
-                        let retained = lifecycle.retained.lock().await;
-                        let retry = retained.as_ref().is_some_and(|owner| {
-                            matches!(
-                                owner.io.phase(),
-                                Phase::Discovered
-                                    | Phase::RadioTablesLoaded
-                                    | Phase::BasicCalibrated
+            super::interface::publish(shell.clone()).map_err(Error::Station)?;
+            // A removal that read no shell before this publication withdraws it.
+            if self.removed.load(Ordering::Acquire) {
+                super::interface::withdraw(&shell);
+                return Err(Error::Cancelled);
+            }
+            loop {
+                if shell.closed() || self.suspended.load(Ordering::Acquire) {
+                    terminalize(&shell, &lifecycle).await;
+                    return Err(Error::Cancelled);
+                }
+                let result = {
+                    let mut retained = lifecycle.retained.lock().await;
+                    let owner = retained.as_mut().ok_or(Error::Cancelled)?;
+                    self.set_stage(if owner.io.phase() == Phase::Discovered {
+                        Stage::Firmware
+                    } else {
+                        Stage::Radio
+                    });
+                    // Keep the phase-dependent firmware/radio future in heap
+                    // storage rather than embedding it in this supervisor.
+                    alloc::boxed::Box::pin(advance(&mut owner.io)).await
+                };
+                match result {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        let (retry, request) = {
+                            let retained = lifecycle.retained.lock().await;
+                            let retry = retained.as_ref().is_some_and(|owner| {
+                                matches!(
+                                    owner.io.phase(),
+                                    Phase::Discovered
+                                        | Phase::RadioTablesLoaded
+                                        | Phase::BasicCalibrated
+                                ) || (owner.io.phase() == Phase::Running
+                                    && owner.io.identity().is_some_and(|id| {
+                                        id.chip() == super::mac::ChipId::Rtl8852A
+                                    }))
+                            });
+                            (
+                                retry,
+                                retained
+                                    .as_ref()
+                                    .and_then(|owner| owner.io.qualification_request().ok()),
                             )
-                        });
-                        (
-                            retry,
-                            retained
-                                .as_ref()
-                                .and_then(|owner| owner.io.qualification_request().ok()),
-                        )
-                    };
-                    if !retry {
-                        return Err(Error::Startup(error));
+                        };
+                        if !retry {
+                            return Err(Error::Startup(error));
+                        }
+                        self.set_stage(Stage::WaitingAssets);
+                        self.report_request(request);
+                        self.report(Error::Startup(error));
+                        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
                     }
-                    self.set_stage(Stage::WaitingAssets);
-                    self.report_request(request);
-                    self.report(Error::Startup(error));
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
                 }
             }
-        }
-        shell.activate().await.map_err(Error::Station)?;
-        // rtw89_pci_ops_start: the packet runtime is live, enable MSI.
-        match shell.arm_interrupts().await {
-            Ok(vector) => narf_console::klog!("rtw8852b: MSI delivery on vector {}\n", vector),
-            Err(error) => narf_console::klog!("rtw8852b: polled delivery ({:?})\n", error),
-        }
-        self.set_stage(Stage::Station);
-        *self.error.lock() = None;
-        // Device's independent bounded drain worker handles stack progress.
-        // Terminal analog shutdown awaits after the explicit disconnect's
-        // reservation is released, preserving its CH12/media-down operation.
-        loop {
-            if shell.closed() && !shell.admission().teardown_pending() {
-                terminalize(&shell, &lifecycle).await;
-                break;
+            shell.activate().await.map_err(Error::Station)?;
+            // rtw89_pci_ops_start: the packet runtime is live, enable MSI.
+            match shell.arm_interrupts().await {
+                Ok(vector) => narf_console::klog!("rtw8852b: MSI delivery on vector {}\n", vector),
+                Err(error) => narf_console::klog!("rtw8852b: polled delivery ({:?})\n", error),
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
-        }
-        Ok(())
+            self.set_stage(Stage::Station);
+            *self.error.lock() = None;
+            // Device's independent bounded drain worker handles stack progress.
+            // Terminal analog shutdown awaits after the explicit disconnect's
+            // reservation is released, preserving its CH12/media-down operation.
+            loop {
+                if shell.closed() && !shell.admission().teardown_pending() {
+                    terminalize(&shell, &lifecycle).await;
+                    break;
+                }
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            }
+            Ok(())
+        })
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -539,13 +554,17 @@ async fn terminalize(shell: &Device<startup::Startup>, lifecycle: &Lifecycle<sta
         return;
     }
 }
+#[inline(never)]
 async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
+    // Keep each stage's retained control state on the heap. The original
+    // startup future still owns its source checks and cancellation guards;
+    // constructing the wrapper performs no hardware work.
     match io.phase() {
         // B has no C-only PCI_BER quirk. pcie::Pcie rejects that quirk for B.
-        Phase::Discovered => io.start(false).await?,
-        Phase::Running => io.prepare_mac().await?,
-        Phase::MacPrepared => io.prepare_receive().await?,
-        Phase::Receiving => io.prepare_radio_tables().await?,
+        Phase::Discovered => crate::future_heap::build(|| io.start(false)).await?,
+        Phase::Running => crate::future_heap::build(|| io.prepare_mac()).await?,
+        Phase::MacPrepared => crate::future_heap::build(|| io.prepare_receive()).await?,
+        Phase::Receiving => crate::future_heap::build(|| io.prepare_radio_tables()).await?,
         // RTL8852C: one owner for DM/RFK/channel at Linux's default unlinked
         // chandef (2.4GHz channel 1, 20MHz; core.c `rtw89_get_default_chandef`).
         Phase::RadioTablesLoaded
@@ -553,8 +572,10 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C) =>
         {
-            io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
+            })
+            .await?
         }
         // RTL8851B: its own `radio_51` owner at the same default chandef;
         // never B's basic/full calibration.
@@ -563,8 +584,10 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B) =>
         {
-            io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
+            })
+            .await?
         }
         // RTL8852A: its own `radio_a` owner at the same default chandef;
         // never B's basic/full calibration.
@@ -573,11 +596,15 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852A) =>
         {
-            io.prepare_radio_a(super::operating_channel::Profile::INITIAL)
-                .await?
+            crate::future_heap::build(|| {
+                io.prepare_radio_a(super::operating_channel::Profile::INITIAL)
+            })
+            .await?
         }
-        Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
-        Phase::BasicCalibrated => io.prepare_full_radio().await?,
+        Phase::RadioTablesLoaded => {
+            crate::future_heap::build(|| io.prepare_basic_calibration()).await?
+        }
+        Phase::BasicCalibrated => crate::future_heap::build(|| io.prepare_full_radio()).await?,
         Phase::RadioReady => return Ok(true),
         _ => return Err(startup::Error::Terminal),
     }

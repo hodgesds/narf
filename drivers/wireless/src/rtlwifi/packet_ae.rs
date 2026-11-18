@@ -33,7 +33,7 @@ use super::{
     extent, queue, Delivery, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN,
     RX_BASE, RX_BUFFER, RX_BYTES, TX_BASES, TX_BYTES,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::sync::atomic::Ordering;
 
 /// `RATR_INX_WIRELESS_MC`: descriptor RATE_ID for frames without a station
@@ -69,8 +69,50 @@ pub(in super::super) struct State {
     /// arrives) and whether `rtl8821ae_dm_update_init_rate` is still due.
     ra_rate: Option<u8>,
     ra_due: bool,
+    /// Actual peer legacy-rate intersection, before the first RA mask.
+    legacy_b: bool,
     /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
     pub(super) min_space_cfg: u8,
+    /// Allocated before installing the full coexistence grant. The original
+    /// coarse owner neither captures reports nor gains RF effects from this.
+    coex_rx: Option<Box<CoexRx>>,
+}
+#[derive(Default)]
+struct CoexRx {
+    inbox: super::super::super::rtl8821ae::coex_inbox::Inbox,
+    /// Ordinary frames met by an MP wait keep their original bytes/PHY facts
+    /// until normal station security/PN processing resumes after the wait.
+    deferred: VecDeque<Mpdu>,
+    capture: bool,
+    traffic: super::super::super::watchdog_traffic::History,
+    cnt_after_linked: u8,
+}
+
+/// A dropped/erroring helper closes only through the original PCI-only
+/// restrictive callback. This is never a reset or DMA reclamation receipt.
+pub(in crate::rtlwifi) struct CoexAttempt {
+    park: Option<super::TerminalPark>,
+    armed: bool,
+}
+impl CoexAttempt {
+    pub(in crate::rtlwifi) fn new(io: &impl Port) -> Self {
+        Self {
+            park: io.terminal_park(),
+            armed: true,
+        }
+    }
+    pub(in crate::rtlwifi) fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for CoexAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(park) = &self.park {
+                let _ = park.park();
+            }
+        }
+    }
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -85,13 +127,15 @@ impl State {
             report: None,
             ra_rate: None,
             ra_due: false,
+            legacy_b: false,
             min_space_cfg: 0,
+            coex_rx: None,
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
-    /// BT info/MP reports are ignored: boards with the BT function are not
-    /// admitted, so `btc_ops` never runs.
-    fn c2h(&mut self, packet: &[u8]) {
+    /// Full-coexistence reports stay with this owner until async dispatch.
+    /// The original coarse owner performs no BT-info-driven RF effects.
+    fn c2h(&mut self, packet: &[u8]) -> Result<(), Error> {
         match c2h::parse(packet) {
             Ok(c2h::Event::TxReport { sn, st, retry }) => {
                 self.reports.record(sn);
@@ -108,8 +152,14 @@ impl State {
                 self.ra_rate = Some(hw_rate);
                 self.ra_due = true;
             }
+            Ok(c2h::Event::BtInfo(_) | c2h::Event::BtMp(_)) => {
+                if let Some(rx) = self.coex_rx.as_mut().filter(|rx| rx.capture) {
+                    rx.inbox.push(packet)?;
+                }
+            }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -131,8 +181,8 @@ pub(super) fn wants_report(frame: &[u8]) -> bool {
 
 /// Bound on outstanding TX-report requests (the 6-bit `SW_DEFINE` space).
 const REPORT_WAIT: usize = 64;
-/// Maximum C2H bytes inspected (`C2H_DATA_OFFSET` plus the V1 TX report).
-const C2H_BYTES: usize = 16;
+/// The source command buffer is 16 bytes after its two-byte header.
+const C2H_BYTES: usize = super::super::super::rtl8821ae::btc::C2H_MAX;
 
 fn closed(admission: Option<&super::super::station::Admission>) -> bool {
     admission.is_some_and(|control| control.closed.load(Ordering::Acquire))
@@ -153,7 +203,428 @@ fn ratr_index(payload: &[u8; 7]) -> Option<u8> {
     }
 }
 
+impl<I: super::super::Io, M: Memory> Prepared<I, M> {
+    pub(crate) fn rtl8821ae_full_coex(&self) -> bool {
+        self.rtl8821ae_coex
+            .as_ref()
+            .is_some_and(|coex| coex.program.is_some())
+    }
+}
+
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    pub(crate) fn ae_coex_terminal_park(&self) -> Option<super::TerminalPark> {
+        self.io.terminal_park()
+    }
+
+    fn ae_rx_policy(&self) -> Result<RxPolicy, Error> {
+        let permission = self.rtl8821ae_power.ok_or(Error::State)?;
+        Ok(RxPolicy {
+            channel: permission.channel(),
+            ht: self.packet.ht,
+            forty: self.packet.width.is_some(),
+            eighty: permission.operating().width
+                == super::super::super::rtl8821ae::envelope::Width::W80,
+            vht: self.packet.vht_highest.is_some(),
+        })
+    }
+
+    /// RX is live under the original Normal envelope, with no station TX
+    /// pending. Only the read-only BT GET_VERSION command precedes N21C.
+    /// The original ring/state/mailbox are retained before the first await.
+    pub(crate) async fn ae_prepare_coex(
+        &mut self,
+        base: alloc::sync::Arc<super::super::super::rtl8821ae::envelope::Calibration>,
+    ) -> Result<
+        Option<alloc::sync::Arc<super::super::super::rtl8821ae::coex_program::Program>>,
+        Error,
+    > {
+        use super::super::super::{
+            btcoex::btc::Ctx,
+            rtl8821ae::{
+                btc, coex_dispatch::Dispatch, coex_program::BtIdentity, coex_runtime::Notify,
+            },
+        };
+        if self.chip != super::super::Chip::Rtl8821ae || self.rtl8821ae_coex.is_none() {
+            return Ok(None);
+        }
+        if self.phase != Phase::Running || self.packet.pending.is_some() {
+            return Err(Error::State);
+        }
+        if !matches!(
+            self.station_phase(),
+            super::super::station::Phase::Dormant | super::super::station::Phase::Starting
+        ) {
+            // No late qualification replacement while station publications
+            // or a peer generation may already hold the old Normal base.
+            return Err(Error::State);
+        }
+        if let Some(coex) = &self.rtl8821ae_coex {
+            if coex.probed {
+                return Ok(coex.program.clone());
+            }
+        }
+        let policy = self.ae_rx_policy()?;
+        let permission = self.rtl8821ae_power.ok_or(Error::State)?;
+        let Some(factory) = self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.factory.clone())
+        else {
+            return Ok(None);
+        };
+        let mut terminal = CoexAttempt::new(&self.io);
+        self.phase = Phase::Failed;
+        self.rtl8821ae_coex.as_mut().ok_or(Error::State)?.probed = true;
+        self.packet.ae.coex_rx = Some(Box::new(CoexRx::default()));
+        let mut observed_bt = None;
+        let (version, build) = {
+            let state = &mut self.packet.ae;
+            let rx = state.coex_rx.as_mut().ok_or(Error::State)?;
+            let mut pump = RxPump {
+                io: &self.io,
+                ring: self.receive.as_mut().ok_or(Error::State)?,
+                buffers: &mut self.buffers,
+                next: &mut self.packet.receive,
+                depth: self.depth,
+                remaining: 0,
+                policy,
+                inbox: &mut rx.inbox,
+                deferred: &mut rx.deferred,
+                traffic: &mut rx.traffic,
+                program: None,
+                observed_bt: Some(&mut observed_bt),
+            };
+            let mut mp = btc::RxBtMp {
+                io: &self.io,
+                source: &mut pump,
+            };
+            let mut lps = btc::LpsGate::default();
+            let mut hal = btc::BtcHal::new(&self.io, &mut state.mailbox, &mut lps, &mut mp);
+            let coex = self.rtl8821ae_coex.as_mut().ok_or(Error::State)?;
+            Ctx::new(&mut coex.btc, &mut hal).bt_patch_version().await?;
+            (coex.btc.bt_info.bt_real_fw_ver, coex.btc.bt_info.bt_fw_ver)
+        };
+        let Some(bt) = observed_bt.filter(|observed| {
+            BtIdentity::observed(version, build).ok().as_ref() == Some(observed)
+        }) else {
+            // A timeout is not a version observation or a radio grant.
+            self.phase = Phase::Running;
+            self.ae_discard_unqualified_coex()?;
+            terminal.complete();
+            return Ok(None);
+        };
+        let strap = self
+            .io
+            .read32(super::super::super::rtl8821ae::headerfile::REG_MULTI_FUNC_CTRL)?;
+        if strap == u32::MAX || strap & super::super::RTL8821AE_BT_FUNCTION == 0 {
+            return Err(Error::State);
+        }
+        let Some(program) = self
+            .io
+            .bind_rtl8821ae_coex(base, &factory, permission, bt)?
+        else {
+            self.phase = Phase::Running;
+            self.ae_discard_unqualified_coex()?;
+            terminal.complete();
+            return Ok(None);
+        };
+        if !program.matches(bt, factory.logical[0xc3], permission) {
+            return Err(Error::State);
+        }
+        let (fw_version, fw_subversion) = program.wifi_version()?;
+        let coex = self.rtl8821ae_coex.as_mut().ok_or(Error::State)?;
+        coex.full = Some(Dispatch::new(factory.logical[0xc3]));
+        coex.program = Some(program.clone());
+        coex.btc.wifi.fw_version = fw_version;
+        coex.btc.wifi.fw_subversion = u16::from(fw_subversion);
+        self.packet.ae.coex_rx.as_mut().ok_or(Error::State)?.capture = true;
+        self.phase = Phase::Running;
+        self.ae_coex_notify(Notify::Init).await?;
+        self.ae_service_coex().await?;
+        terminal.complete();
+        Ok(Some(program))
+    }
+
+    fn ae_discard_unqualified_coex(&mut self) -> Result<(), Error> {
+        // With capture false, normal TX/RA reports retain their usual effect;
+        // BT reports cannot drive an unqualified RF algorithm.
+        loop {
+            let report = self
+                .packet
+                .ae
+                .coex_rx
+                .as_mut()
+                .and_then(|rx| rx.inbox.pop());
+            let Some((n, bytes)) = report else {
+                return Ok(());
+            };
+            self.packet.ae.c2h(&bytes[..n])?;
+        }
+    }
+
+    pub(crate) async fn ae_coex_notify(
+        &mut self,
+        op: super::super::super::rtl8821ae::coex_runtime::Notify<'_>,
+    ) -> Result<(), Error> {
+        use super::super::super::{
+            btcoex::btc::{ChanBw, WifiMode},
+            rtl8821ae::{btc, coex_runtime::Notify},
+        };
+        let Some(program) = self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.program.clone())
+        else {
+            return Ok(());
+        };
+        if self.phase != Phase::Running || self.rtl8821ae_power != Some(program.permission()) {
+            return Err(Error::State);
+        }
+        let policy = self.ae_rx_policy()?;
+        let mut terminal = CoexAttempt::new(&self.io);
+        self.phase = Phase::Failed;
+        let future = async {
+            let coex = self.rtl8821ae_coex.as_mut().ok_or(Error::State)?;
+            let full = coex.full.as_mut().ok_or(Error::State)?;
+            let wifi = &mut coex.btc.wifi;
+            wifi.current_channel = program
+                .permission()
+                .operating()
+                .wide_channel()
+                .ok_or(Error::State)?;
+            wifi.under_5g = program.permission().channel() >= 36;
+            wifi.chan_bw = ChanBw::Ht20;
+            wifi.mode = if self.packet.ht {
+                WifiMode::N
+            } else if self.packet.ae.legacy_b {
+                WifiMode::B
+            } else {
+                WifiMode::G
+            };
+            match op {
+                Notify::Scan(start) => wifi.scanning = start,
+                Notify::Connect(start) => wifi.linking = start,
+                Notify::Media(link) => {
+                    wifi.station_linked = link;
+                    full.lps_gate().linked = link;
+                    full.lps_gate().report_linked = link;
+                }
+                _ => {}
+            }
+            let state = &mut self.packet.ae;
+            let rx = state.coex_rx.as_mut().ok_or(Error::State)?;
+            let mut pump = RxPump {
+                io: &self.io,
+                ring: self.receive.as_mut().ok_or(Error::State)?,
+                buffers: &mut self.buffers,
+                next: &mut self.packet.receive,
+                depth: self.depth,
+                remaining: 0,
+                policy,
+                inbox: &mut rx.inbox,
+                deferred: &mut rx.deferred,
+                traffic: &mut rx.traffic,
+                program: Some(program.as_ref()),
+                observed_bt: None,
+            };
+            let mut mp = btc::RxBtMp {
+                io: &self.io,
+                source: &mut pump,
+            };
+            full.notify(&mut coex.btc, &mut state.mailbox, &self.io, &mut mp, op)
+                .await?;
+            self.packet.leisure = !full.lps_gate().active;
+            Ok(())
+        };
+        program.wait(future).await?;
+        terminal.complete();
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    pub(crate) async fn ae_service_coex(&mut self) -> Result<(), Error> {
+        use super::super::super::rtl8821ae::coex_runtime::Notify;
+        if !self.rtl8821ae_full_coex() {
+            return Ok(());
+        }
+        let mut terminal = CoexAttempt::new(&self.io);
+        // Each dispatch pops one packet. Its MP wait cannot see deferred work
+        // from that same dispatch, so source BT-info traffic remains finite.
+        for _ in 0..super::super::super::rtl8821ae::coex_inbox::CAPACITY {
+            let Some((n, bytes)) = self
+                .packet
+                .ae
+                .coex_rx
+                .as_mut()
+                .and_then(|rx| rx.inbox.pop())
+            else {
+                break;
+            };
+            if let Some(program) = self
+                .rtl8821ae_coex
+                .as_ref()
+                .and_then(|coex| coex.program.as_ref())
+            {
+                if let Err(error) = program.check_bt_report(&bytes[..n]) {
+                    self.phase = Phase::Failed;
+                    return Err(error);
+                }
+            }
+            match c2h::parse(&bytes[..n]) {
+                Ok(c2h::Event::BtInfo(body)) => self.ae_coex_notify(Notify::BtInfo(body)).await?,
+                Ok(c2h::Event::BtMp(body)) => {
+                    self.rtl8821ae_coex
+                        .as_mut()
+                        .ok_or(Error::State)?
+                        .btc
+                        .btmpinfo_notify(body);
+                }
+                _ => self.packet.ae.c2h(&bytes[..n])?,
+            }
+        }
+        terminal.complete();
+        Ok(())
+    }
+
+    pub(crate) async fn ae_coex_special(
+        &mut self,
+        packet: super::super::super::btcoex::btc::Packet,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8821ae::coex_runtime::Notify;
+        self.ae_coex_notify(Notify::Special(packet)).await?;
+        if self.packet.leisure {
+            self.ae_coex_lps(false).await?;
+        }
+        Ok(())
+    }
+
+    /// Reusable disassociation keeps the original algorithm/history alive.
+    /// Its actual LPS and link notifications precede the raw MAC withdrawal.
+    pub(crate) async fn ae_coex_leave_peer(&mut self) -> Result<(), Error> {
+        if self.packet.leisure {
+            self.ae_coex_lps(false).await?;
+        }
+        self.ae_coex_notify(super::super::super::rtl8821ae::coex_runtime::Notify::Media(
+            false,
+        ))
+        .await
+    }
+
+    pub(crate) async fn ae_coex_before_disconnect(&mut self) -> Result<(), Error> {
+        self.ae_coex_leave_peer().await?;
+        self.ae_coex_notify(super::super::super::rtl8821ae::coex_runtime::Notify::Halt)
+            .await
+    }
+
+    pub(crate) async fn ae_coex_watchdog(
+        &mut self,
+        now: u64,
+        pwdb: i64,
+        ap_num: u8,
+        encryption: bool,
+        ps_allowed: bool,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8821ae::btc;
+        let Some(program) = self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.program.clone())
+        else {
+            return Ok(());
+        };
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if !self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.full.as_ref())
+            .is_some_and(|full| full.due(now))
+        {
+            return Ok(());
+        }
+        let policy = self.ae_rx_policy()?;
+        let mut terminal = CoexAttempt::new(&self.io);
+        let no_pending = self.packet.pending.is_none();
+        self.phase = Phase::Failed;
+        program
+            .wait(async {
+                let coex = self.rtl8821ae_coex.as_mut().ok_or(Error::State)?;
+                let full = coex.full.as_mut().ok_or(Error::State)?;
+                let state = &mut self.packet.ae;
+                let rx = state.coex_rx.as_mut().ok_or(Error::State)?;
+                let linked = coex.btc.wifi.station_linked;
+                rx.cnt_after_linked = if linked {
+                    rx.cnt_after_linked.saturating_add(1).min(20)
+                } else {
+                    0
+                };
+                let traffic = rx.traffic.snapshot(linked);
+                coex.btc.wifi.busy = traffic.busy;
+                coex.btc.wifi.tx_busy = traffic.tx_busy;
+                coex.btc.wifi.undec_sm_pwdb = pwdb as i32;
+                coex.btc.wifi.ap_num = ap_num;
+                coex.btc.wifi.encryption = encryption;
+                full.lps_gate().enter_allowed =
+                    ps_allowed && !traffic.busy && rx.cnt_after_linked >= 5 && no_pending;
+                let mut pump = RxPump {
+                    io: &self.io,
+                    ring: self.receive.as_mut().ok_or(Error::State)?,
+                    buffers: &mut self.buffers,
+                    next: &mut self.packet.receive,
+                    depth: self.depth,
+                    remaining: 0,
+                    policy,
+                    inbox: &mut rx.inbox,
+                    deferred: &mut rx.deferred,
+                    traffic: &mut rx.traffic,
+                    program: Some(program.as_ref()),
+                    observed_bt: None,
+                };
+                let mut mp = btc::RxBtMp {
+                    io: &self.io,
+                    source: &mut pump,
+                };
+                full.watchdog(&mut coex.btc, &mut state.mailbox, &self.io, &mut mp, now)
+                    .await?;
+                self.packet.leisure = !full.lps_gate().active;
+                rx.traffic.finish_period();
+                Ok(())
+            })
+            .await?;
+        terminal.complete();
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    async fn ae_coex_lps(&mut self, enter: bool) -> Result<(), Error> {
+        let program = self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.program.clone())
+            .ok_or(Error::State)?;
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let mut terminal = CoexAttempt::new(&self.io);
+        self.phase = Phase::Failed;
+        program
+            .wait(async {
+                let coex = self.rtl8821ae_coex.as_mut().ok_or(Error::State)?;
+                let full = coex.full.as_mut().ok_or(Error::State)?;
+                // The actual watchdog's linked/security/traffic/settle facts
+                // own enter_allowed; an explicit request cannot invent them.
+                full.lps(&mut coex.btc, &mut self.packet.ae.mailbox, &self.io, enter)
+                    .await?;
+                self.packet.leisure = !full.lps_gate().active;
+                Ok(())
+            })
+            .await?;
+        terminal.complete();
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
     /// `mac->min_space_cfg` for `rtl8821ae::ht::timing`.
     pub(crate) fn rtl8821ae_min_space_cfg(&self) -> u8 {
         self.packet.ae.min_space_cfg
@@ -271,6 +742,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         hw::set_bssid(&self.io, peer)?;
         let five_ghz = self.rtl8821ae_five_ghz();
         hw::configure_rates(&self.io, rates, basic, capability, false, five_ghz)?;
+        self.packet.ae.legacy_b = rates & 0x0ff0 == 0;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -341,6 +813,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Running;
+        self.ae_coex_notify(super::super::super::rtl8821ae::coex_runtime::Notify::Media(
+            true,
+        ))
+        .await?;
+        self.ae_coex_notify(super::super::super::rtl8821ae::coex_runtime::Notify::Connect(false))
+            .await?;
         Ok(())
     }
 
@@ -581,6 +1059,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
+        if self.rtl8821ae_full_coex() {
+            return self.ae_coex_lps(true).await;
+        }
         // Coexistence holds LPS off while BT owns the shared antenna
         // outright (`rtl8821ae/coex.rs`): a held-off enter is a
         // successful no-op, not an error — `leisure` stays false, so
@@ -603,6 +1084,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
         }
+        if self.rtl8821ae_full_coex() {
+            return self.ae_coex_lps(false).await;
+        }
         self.phase = Phase::Failed;
         h2c::fwlps_leave(&self.io, &mut self.packet.ae.mailbox).await?;
         self.packet.leisure = false;
@@ -616,7 +1100,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// mac80211 `BSS_CHANGED_BSSID` zero BSSID. Linux leaves AID alone.
     pub(super) async fn ae_disconnected(&mut self) -> Result<(), Error> {
         if core::mem::take(&mut self.packet.leisure) {
-            h2c::fwlps_leave(&self.io, &mut self.packet.ae.mailbox).await?;
+            let ctrl = self
+                .rtl8821ae_coex
+                .as_ref()
+                .filter(|coex| coex.program.is_some())
+                .map(|coex| coex.btc.lps_ctrl());
+            let bt = ctrl.filter(|ctrl| ctrl.bt_ctrl_lps).map(|ctrl| h2c::BtLps {
+                lps_on: ctrl.bt_lps_on,
+                lps_val: ctrl.lps_val,
+                rpwm_val: ctrl.rpwm_val,
+            });
+            h2c::fwlps_leave_bt(&self.io, &mut self.packet.ae.mailbox, bt).await?;
         }
         hw::network_type_station(&self.io, &mut self.packet.ae.receive, false)?;
         self.packet
@@ -661,7 +1155,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         policy: impl Fn(&Self) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let own = self.local().ok_or(Error::State)?;
-        if !self.transmit_ready() || self.packet.reserved.is_none() {
+        if !self.transmit_ready() || self.packet.reserved.is_none() || self.rtl8821ae_full_coex() {
             return Err(Error::State);
         }
         wow::validate(config)?;
@@ -791,6 +1285,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase = Phase::Failed;
         let (inta, intb) = h2c::service_interrupt(&self.io)?;
+        if let Some(rx) = self.packet.ae.coex_rx.as_mut() {
+            rx.traffic.observe_tx_dok((inta & 0x3c).count_ones());
+        }
         self.phase = Phase::Running;
         Ok(super::super::super::irq::Recognized { inta, intb })
     }
@@ -1055,6 +1552,26 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
+        let mut terminal = self
+            .rtl8821ae_full_coex()
+            .then(|| CoexAttempt::new(&self.io));
+        let deferred = self.io.authority(true, || {
+            Ok(self
+                .packet
+                .ae
+                .coex_rx
+                .as_mut()
+                .and_then(|rx| rx.deferred.pop_front()))
+        })?;
+        if let Some(packet) = deferred {
+            if let Some(terminal) = &mut terminal {
+                terminal.complete();
+            }
+            return Ok(ReceiveStep {
+                consumed: true,
+                packet: Some(packet),
+            });
+        }
         self.phase = Phase::Failed;
         let slot = self.packet.receive;
         let ring = self.receive.as_mut().ok_or(Error::State)?;
@@ -1066,115 +1583,268 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             p.operating().width == super::super::super::rtl8821ae::envelope::Width::W80
         });
         let vht = self.packet.vht_highest.is_some();
-        let (consumed, packet, report) = self.io.authority(true, || {
-            ring.sync();
-            let offset = slot * RX_BYTES;
-            let mut dw = [0u32; 8];
-            for (word, value) in dw.iter_mut().enumerate() {
-                *value = ring.read32(offset + word * 4)?;
-            }
-            let Some(status) = trx::RxStatus::parse(&dw) else {
-                return Ok((false, None, None));
-            };
-            let end = if slot + 1 == self.depth { 1 << 30 } else { 0 };
-            if dw[0] & (1 << 30) != end || dw[6] != extent(buffer, RX_BUFFER, 4)? || dw[7] != 0 {
-                return Err(Error::Descriptor);
-            }
-            let length = usize::from(status.length);
-            let start = status.drvinfo_size + status.shift;
-            if !status.c2h
-                && (length < 4 || start.checked_add(length).is_none_or(|n| n > RX_BUFFER))
-            {
-                return Err(Error::Descriptor);
-            }
-            let mut packet = None;
-            let mut report = None;
-            if status.c2h && length >= c2h::C2H_DATA_OFFSET && start + length <= RX_BUFFER {
-                buffer.sync();
-                let mut bytes = [0u8; C2H_BYTES];
-                let take = length.min(C2H_BYTES);
-                buffer.read_bytes(start, &mut bytes[..take])?;
-                report = Some((bytes, take));
-            }
-            // HT link: MCS0-7 (1T1R) and A-MPDU members (the station BA
-            // owner gates them) up to a 7935-byte A-MSDU MPDU.
-            // VHT link: VHT 1SS MCS0-9 (`rtl8821ae_get_rx_vht_nss` 1).
-            let rate_ok = status.rate <= trx::DESC_RATE54M
-                || ht
-                    && status.is_ht()
-                    && status.rate <= super::super::super::rtl8821ae::ht::DESC_RATEMCS7
-                || vht
-                    && status.is_vht()
-                    && status.vht_nss() == 1
-                    && (super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS0
-                        ..=super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS9)
-                        .contains(&status.rate);
-            let longest = if ht {
-                26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
-            } else {
-                2304 + 4
-            };
-            if !status.c2h
-                && !status.hw_error()
-                && (!status.ampdu || ht)
-                && rate_ok
-                && (status.bw == 0 || forty && status.bw == 1 || eighty && status.bw == 2)
-                && (24..=longest).contains(&length)
-            {
-                buffer.sync();
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(length - 4)
-                    .map_err(|_| Error::Memory)?;
-                bytes.resize(length - 4, 0);
-                buffer.read_bytes(start, &mut bytes)?;
-                let fc = u16::from_le_bytes([bytes[0], bytes[1]]);
-                // Protected frames keep IV/ciphertext/MIC: SECR 0 means the
-                // hardware never decrypts (SWDEC set).
-                if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
-                {
-                    let pwdb = if status.physt {
-                        if status.drvinfo_size < trx::PHY_STATUS_PWDB_BYTES {
-                            return Err(Error::Descriptor);
-                        }
-                        let mut phy = [0u8; trx::PHY_STATUS_PWDB_BYTES];
-                        buffer.read_bytes(status.shift, &mut phy)?;
-                        Some(trx::rx_pwdb(&phy, trx::is_cck(status.rate)))
-                    } else {
-                        None
-                    };
-                    // Linux reports `is_short_gi = !SPLCP` for rate
-                    // statistics only; every GI is advertised, so nothing
-                    // is gated on it here.
-                    packet = Some(Mpdu {
-                        bytes,
-                        channel,
-                        ht: status.is_ht(),
-                        short_gi: false,
-                        width40: status.bw == 1,
-                        aggregated: status.ampdu,
-                        pwdb,
-                        antenna_mux: None,
-                    });
-                }
-            }
-            for word in 1..6 {
-                ring.write32(offset + word * 4, 0)?;
-            }
-            buffer.sync();
-            ring.sync();
-            ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
-            ring.sync();
-            Ok((true, packet, report))
-        })?;
+        let (consumed, packet, report) = read_rx_slot(
+            &self.io,
+            ring,
+            buffer,
+            slot,
+            self.depth,
+            RxPolicy {
+                channel,
+                ht,
+                forty,
+                eighty,
+                vht,
+            },
+            self.rtl8821ae_coex
+                .as_ref()
+                .and_then(|coex| coex.program.as_deref()),
+        )?;
         if let Some((bytes, take)) = report {
-            self.packet.ae.c2h(&bytes[..take]);
+            if let Some(program) = self
+                .rtl8821ae_coex
+                .as_ref()
+                .and_then(|coex| coex.program.as_ref())
+            {
+                program.check_bt_report(&bytes[..take])?;
+            }
+            self.packet.ae.c2h(&bytes[..take])?;
+        }
+        if let Some(rx) = self.packet.ae.coex_rx.as_mut() {
+            if let Some(packet) = &packet {
+                observe_coex_rx(&mut rx.traffic, packet);
+            }
         }
         if consumed {
             self.packet.receive = (slot + 1) % self.depth;
         }
         self.phase = Phase::Running;
+        if let Some(terminal) = &mut terminal {
+            terminal.complete();
+        }
         Ok(ReceiveStep { consumed, packet })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RxPolicy {
+    channel: u8,
+    ht: bool,
+    forty: bool,
+    eighty: bool,
+    vht: bool,
+}
+type RxSlot = (bool, Option<Mpdu>, Option<([u8; C2H_BYTES], usize)>);
+fn read_rx_slot<I: Port<Buffer = M>, M: Memory>(
+    io: &I,
+    ring: &mut M,
+    buffer: &M,
+    slot: usize,
+    depth: usize,
+    policy: RxPolicy,
+    program: Option<&super::super::super::rtl8821ae::coex_program::Program>,
+) -> Result<RxSlot, Error> {
+    let RxPolicy {
+        channel,
+        ht,
+        forty,
+        eighty,
+        vht,
+    } = policy;
+    io.authority(true, || {
+        ring.sync();
+        let offset = slot * RX_BYTES;
+        let mut dw = [0u32; 8];
+        for (word, value) in dw.iter_mut().enumerate() {
+            *value = ring.read32(offset + word * 4)?;
+        }
+        let Some(status) = trx::RxStatus::parse(&dw) else {
+            return Ok((false, None, None));
+        };
+        let end = if slot + 1 == depth { 1 << 30 } else { 0 };
+        if dw[0] & (1 << 30) != end || dw[6] != extent(buffer, RX_BUFFER, 4)? || dw[7] != 0 {
+            return Err(Error::Descriptor);
+        }
+        let length = usize::from(status.length);
+        let start = status.drvinfo_size + status.shift;
+        if !status.c2h && (length < 4 || start.checked_add(length).is_none_or(|n| n > RX_BUFFER)) {
+            return Err(Error::Descriptor);
+        }
+        let mut packet = None;
+        let mut report = None;
+        if status.c2h && length >= c2h::C2H_DATA_OFFSET && start + length <= RX_BUFFER {
+            buffer.sync();
+            let mut bytes = [0u8; C2H_BYTES];
+            let take = length.min(C2H_BYTES);
+            buffer.read_bytes(start, &mut bytes[..take])?;
+            if matches!(bytes[0], c2h::C2H_BT_INFO | c2h::C2H_BT_MP) && length > C2H_BYTES {
+                // Never turn an oversized BT body into a valid prefix.
+                return Err(Error::Descriptor);
+            }
+            if let Some(program) = program {
+                program.check_bt_report(&bytes[..take])?;
+            }
+            report = Some((bytes, take));
+        }
+        // HT link: MCS0-7 (1T1R) and A-MPDU members (the station BA
+        // owner gates them) up to a 7935-byte A-MSDU MPDU.
+        // VHT link: VHT 1SS MCS0-9 (`rtl8821ae_get_rx_vht_nss` 1).
+        let rate_ok = status.rate <= trx::DESC_RATE54M
+            || ht
+                && status.is_ht()
+                && status.rate <= super::super::super::rtl8821ae::ht::DESC_RATEMCS7
+            || vht
+                && status.is_vht()
+                && status.vht_nss() == 1
+                && (super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS0
+                    ..=super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS9)
+                    .contains(&status.rate);
+        let longest = if ht {
+            26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
+        } else {
+            2304 + 4
+        };
+        if !status.c2h
+            && !status.hw_error()
+            && (!status.ampdu || ht)
+            && rate_ok
+            && (status.bw == 0 || forty && status.bw == 1 || eighty && status.bw == 2)
+            && (28..=longest).contains(&length)
+        {
+            buffer.sync();
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length - 4)
+                .map_err(|_| Error::Memory)?;
+            bytes.resize(length - 4, 0);
+            buffer.read_bytes(start, &mut bytes)?;
+            let fc = u16::from_le_bytes([bytes[0], bytes[1]]);
+            // Protected frames keep IV/ciphertext/MIC: SECR 0 means the
+            // hardware never decrypts (SWDEC set).
+            if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted) {
+                let pwdb = if status.physt {
+                    if status.drvinfo_size < trx::PHY_STATUS_PWDB_BYTES {
+                        return Err(Error::Descriptor);
+                    }
+                    let mut phy = [0u8; trx::PHY_STATUS_PWDB_BYTES];
+                    buffer.read_bytes(status.shift, &mut phy)?;
+                    Some(trx::rx_pwdb(&phy, trx::is_cck(status.rate)))
+                } else {
+                    None
+                };
+                // Linux reports `is_short_gi = !SPLCP` for rate
+                // statistics only; every GI is advertised, so nothing
+                // is gated on it here.
+                packet = Some(Mpdu {
+                    bytes,
+                    channel,
+                    ht: status.is_ht(),
+                    short_gi: false,
+                    width40: status.bw == 1,
+                    aggregated: status.ampdu,
+                    pwdb,
+                    antenna_mux: None,
+                });
+            }
+        }
+        for word in 1..6 {
+            ring.write32(offset + word * 4, 0)?;
+        }
+        buffer.sync();
+        ring.sync();
+        ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
+        ring.sync();
+        Ok((true, packet, report))
+    })
+}
+
+/// A disjoint borrow of the *original* RX ring during a coexistence MP
+/// wait. The ordinary receive path uses the same read/rearm function.
+/// Reports keep order on their two queues; DATA retains bytes and PHY facts
+/// until normal station security/PN processing resumes after the wait.
+struct RxPump<'a, I: Port<Buffer = M>, M: Memory> {
+    io: &'a I,
+    ring: &'a mut M,
+    buffers: &'a mut [M],
+    next: &'a mut usize,
+    depth: usize,
+    remaining: usize,
+    policy: RxPolicy,
+    inbox: &'a mut super::super::super::rtl8821ae::coex_inbox::Inbox,
+    deferred: &'a mut VecDeque<Mpdu>,
+    traffic: &'a mut super::super::super::watchdog_traffic::History,
+    program: Option<&'a super::super::super::rtl8821ae::coex_program::Program>,
+    observed_bt: Option<&'a mut Option<super::super::super::rtl8821ae::coex_program::BtIdentity>>,
+}
+impl<I: Port<Buffer = M>, M: Memory> RxPump<'_, I, M> {
+    fn observe_report(&mut self, packet: &[u8]) -> Result<(), Error> {
+        use super::super::super::rtl8821ae::{btc, coex_program::BtIdentity};
+        if let Some(program) = self.program {
+            program.check_bt_report(packet)?;
+        }
+        if let (Some(observed), Ok(c2h::Event::BtMp(body))) =
+            (self.observed_bt.as_deref_mut(), c2h::parse(packet))
+        {
+            if let Some((version, build)) = btc::version_report(body)? {
+                *observed = BtIdentity::observed(version, build).ok();
+            }
+        }
+        Ok(())
+    }
+}
+impl<I: Port<Buffer = M>, M: Memory> super::super::super::rtl8821ae::btc::C2hSource
+    for RxPump<'_, I, M>
+{
+    fn begin_round(&mut self) {
+        self.remaining = self.depth;
+    }
+    fn poll_c2h(&mut self, out: &mut [u8; C2H_BYTES]) -> Result<Option<usize>, Error> {
+        use super::super::super::rtl8821ae::coex_inbox::CAPACITY;
+        while self.remaining != 0 {
+            self.remaining -= 1;
+            if let Some(n) = self.inbox.poll_c2h(out)? {
+                self.observe_report(&out[..n])?;
+                return Ok(Some(n));
+            }
+            let slot = *self.next;
+            let buffer = self.buffers.get(slot).ok_or(Error::State)?;
+            let (consumed, packet, report) = read_rx_slot(
+                self.io,
+                self.ring,
+                buffer,
+                slot,
+                self.depth,
+                self.policy,
+                self.program,
+            )?;
+            if !consumed {
+                return Ok(None);
+            }
+            *self.next = (slot + 1) % self.depth;
+            if let Some(packet) = packet {
+                observe_coex_rx(self.traffic, &packet);
+                if self.deferred.len() >= CAPACITY {
+                    return Err(Error::Memory);
+                }
+                self.deferred.try_reserve(1).map_err(|_| Error::Memory)?;
+                self.deferred.push_back(packet);
+            }
+            if let Some((bytes, n)) = report {
+                self.observe_report(&bytes[..n])?;
+                out[..n].copy_from_slice(&bytes[..n]);
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+    fn defer_c2h(&mut self, packet: &[u8]) -> Result<(), Error> {
+        self.inbox.defer_c2h(packet)
+    }
+}
+
+fn observe_coex_rx(traffic: &mut super::super::super::watchdog_traffic::History, packet: &Mpdu) {
+    if packet.bytes.len() >= 24 && packet.bytes[0] & 0x0c == 8 && packet.bytes[4] & 1 == 0 {
+        traffic.observe_unicast_data_rx();
     }
 }
 

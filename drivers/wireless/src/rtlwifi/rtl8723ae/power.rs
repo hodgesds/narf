@@ -33,6 +33,13 @@ pub const EPHY_RETRIES: u16 = 100;
 /// `_rtl8712e_init_mac` after `RTL8723_NIC_ENABLE_FLOW`, up to but not
 /// including `REG_CR = 0x2ff`.
 pub async fn post_flow<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
+    post_flow_with_retries(io).await.map(|_| ())
+}
+
+/// The same power segment, retaining the successful ePHY retry count for
+/// the shared APSD retry counter in `_rtl8712e_init_mac`. The original
+/// `post_flow` entry remains compatible with firmware-only callers.
+pub async fn post_flow_with_retries<I: Io + ?Sized>(io: &I) -> Result<u16, Error> {
     let value = io.read8(REG_PCIE_CTRL_REG + 2)?;
     io.write8(REG_PCIE_CTRL_REG + 2, value | (1 << 4))?;
     let value = io.read8(REG_EMAC_TIMEOUT)?;
@@ -57,5 +64,5 @@ pub async fn post_flow<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
         // Linux: "InitMAC(): ePHY configure fail!!!", return false.
         return Err(Error::Gate);
     }
-    Ok(())
+    Ok(retry)
 }

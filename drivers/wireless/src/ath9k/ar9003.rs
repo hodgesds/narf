@@ -13,6 +13,8 @@
 //! the device.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+pub(super) mod ani;
+pub(super) mod antenna;
 pub(super) mod board;
 pub(super) mod btcoex;
 pub(super) mod calib;
@@ -31,6 +33,7 @@ pub(super) mod mci;
 pub(super) mod packet;
 pub(super) mod phy;
 pub(super) mod power;
+pub(super) mod ps;
 pub(super) mod serdes;
 pub(super) mod templates;
 pub(super) mod wow;

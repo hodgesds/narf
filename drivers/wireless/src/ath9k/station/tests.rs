@@ -1300,3 +1300,24 @@ kernel_test_in!(
     "drivers/wireless/ath9k/station",
     smoke_ath9k_in_place_reset_keeps_association_and_keys
 );
+
+/// Explicit fixture bypass: bind/program a DMA-observed candidate without
+/// an authentication/association exchange. Used only to test the existing
+/// associated-beacon admission and native MCI audio continuation.
+pub(in crate::ath9k) fn bind_cached_peer_for_mci<P: Port, E: Environment, K: Engine>(
+    radio: &mut Radio<P, E, K>,
+    bssid: [u8; 6],
+) -> Result<(), &'static str> {
+    let peer = radio
+        .cache
+        .iter()
+        .find(|entry| entry.candidate.bss.bssid == bssid)
+        .map(|entry| entry.candidate.clone())
+        .ok_or("no DMA-observed peer to bind")?;
+    radio
+        .packet
+        .set_peer(Some((bssid, 42)), 9)
+        .map_err(|_| "native fixture peer program")?;
+    radio.peer = Some(peer);
+    Ok(())
+}

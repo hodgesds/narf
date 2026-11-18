@@ -9,11 +9,17 @@ fn data() -> Vec<u8> {
 }
 #[inline(never)]
 fn join(f: &Fixture) -> Result<(), &'static str> {
-    f.h.scan()?;
+    if let Err(error) = f.h.scan() {
+        f.diagnose("CLIENT scan", &error);
+        return Err(error);
+    }
     let mut request = f.h.request();
     request.ie = p2p::request();
-    run(f.h.device.associate(request))?
-        .map_err(|_| "API77 P2P client actual tag10 native association/key/port")?;
+    let result = run(f.h.device.associate(request));
+    if !matches!(result, Ok(Ok(()))) {
+        f.diagnose("CLIENT association", &result);
+    }
+    result?.map_err(|_| "API77 P2P client actual tag10 native association/key/port")?;
     require(
         f.h.device.current_iftype() == 8
             && f.h.device.link_up()
@@ -36,10 +42,26 @@ fn send(f: &Fixture, window: u32) -> Result<(), &'static str> {
     f.h.device
         .enqueue(&data(), narf_net::TxMeta::default())
         .map_err(|_| "API77 P2P client native DATA enqueue")?;
+    let mut terminal = false;
     for _ in 0..128 {
         f.h.actor.lock().serve()?;
         f.h.device.step(None);
         f.h.actor.lock().serve()?;
+        let completed = f.h.actor.lock().security.data.len() > before;
+        let idle =
+            f.h.device
+                .control
+                .try_lock()
+                .is_some_and(|slot| slot.is_none());
+        if completed && idle {
+            terminal = true;
+            break;
+        }
+        // Native MAC7/TX service awaits Hardware's Activity timer; this
+        // RAM target supplies actual receipts through serve(), without IRQs.
+        narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+            2_000_000,
+        )));
     }
     let (after, last) = {
         let actor = f.h.actor.lock();
@@ -56,7 +78,7 @@ fn send(f: &Fixture, window: u32) -> Result<(), &'static str> {
         )
     };
     require(
-        after > before && last == Some(window),
+        terminal && after > before && last == Some(window),
         "API77 P2P client DATA escaped current acknowledged CTWindow",
     )
 }
@@ -102,6 +124,12 @@ fn public_frame(f: &Fixture, both: bool) -> Result<(), &'static str> {
         if done {
             break;
         }
+        // A real native FRAME completion awaits Activity's 1 ms fallback;
+        // no IRQ arrives from this RAM target. Preserve the same clock
+        // progression that once() gives the direct native calls.
+        narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+            2_000_000,
+        )));
     }
     require(
         done && f.h.actor.lock().client_public.len() == transmitted + 1,
@@ -159,6 +187,8 @@ fn register_kind(f: &Fixture, probe: bool) -> Result<(), &'static str> {
 }
 #[inline(never)]
 fn native() -> Result<(), &'static str> {
+    // Declared first so the native fixture drops before its task graph.
+    let _executor = ExecutorFixture::new();
     let _platform = Platform::new();
     let f = Fixture::new_emission(10)?;
     register(&f)?;
@@ -172,6 +202,35 @@ fn native() -> Result<(), &'static str> {
         "API77 pre-association metadata invented native RX",
     )?;
     join(&f)?;
+    let original_prefixes = {
+        let actor = f.h.actor.lock();
+        let add = actor
+            .commands
+            .iter()
+            .position(|(g, c, b)| (*g, *c) == (3, 8) && word(b, 4) == 1 && word(b, 8) == 7);
+        let last_key = actor
+            .commands
+            .iter()
+            .rposition(|(g, c, _)| (*g, *c) == (1, 0x17));
+        let prefixes: Vec<_> = actor
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, (g, c, _))| (*g, *c) == (5, 2))
+            .collect();
+        let expected = [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0];
+        actor.client_prefix_sync == 1
+            && prefixes.len() == 2
+            && add.is_some_and(|add| prefixes[0].0 < add && add < prefixes[1].0)
+            && last_key.is_some_and(|key| key < prefixes[1].0)
+            && prefixes
+                .iter()
+                .all(|(_, (_, _, b))| b.as_slice() == expected)
+    };
+    require(
+        original_prefixes,
+        "API77 CLIENT startup and RSNA RX receivers lost exact independent cookie/order",
+    )?;
     f.h.actor
         .lock()
         .inject(0xc1, 0, 0x8000, &envelope(&incoming));
@@ -183,11 +242,47 @@ fn native() -> Result<(), &'static str> {
         p2p::received(&f.source.messages.lock(), &incoming) == 1,
         "API77 original native CLIENT RX absent",
     )?;
+    let native = {
+        let mut state =
+            f.h.device
+                .state
+                .try_lock()
+                .ok_or("API77 P2P client State")?;
+        state
+            .owner
+            .as_mut()
+            .unwrap()
+            .ap_hardware()
+            .p2p_client_native()
+            .ok_or("API77 P2P client native role absent")?
+    };
     register_kind(&f, true)?;
     for _ in 0..128 {
         f.h.actor.lock().serve()?;
         let _ = f.h.device.step(None);
+        f.h.actor.lock().serve()?;
+        let idle =
+            f.h.device
+                .control
+                .try_lock()
+                .is_some_and(|slot| slot.is_none());
+        if native.probe_receipt() && !native.pending() && idle {
+            break;
+        }
+        narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+            2_000_000,
+        )));
     }
+    require(
+        native.probe_receipt()
+            && !native.pending()
+            && f.h
+                .device
+                .control
+                .try_lock()
+                .is_some_and(|slot| slot.is_none()),
+        "API77 CLIENT filter lacks completed current MAC7 receipt",
+    )?;
     let probe = p2p::probe_request(OWN, AP);
     f.h.actor.lock().inject(0xc1, 0, 0x8000, &envelope(&probe));
     for _ in 0..4 {
@@ -206,20 +301,6 @@ fn native() -> Result<(), &'static str> {
         probe_filter && p2p::received(&f.source.messages.lock(), &probe) == 1,
         "API77 post-association probe RX lacks actual MAC7 filter receipt",
     )?;
-    let native = {
-        let mut state =
-            f.h.device
-                .state
-                .try_lock()
-                .ok_or("API77 P2P client State")?;
-        state
-            .owner
-            .as_mut()
-            .unwrap()
-            .ap_hardware()
-            .p2p_client_native()
-            .ok_or("API77 P2P client native role absent")?
-    };
     require(
         native.plan.own == OWN
             && native.plan.peer == AP
@@ -256,10 +337,29 @@ fn native() -> Result<(), &'static str> {
     let mut down = OWN.to_vec();
     down.extend_from_slice(&AP);
     down.extend_from_slice(&[0x88, 0xb5, 7, 8, 9]);
-    f.h.actor.lock().downlink(&down)?;
+    let packet = {
+        let mut actor = f.h.actor.lock();
+        actor.ap_pn += 1;
+        let packet = actor.security.encrypted_rx(&down, actor.ap_pn, false)?;
+        require(
+            word(&packet, 28) == 0x100,
+            "API77 OFDM-only peer emitted a non-OFDM6 native RX descriptor",
+        )?;
+        let mut cck = packet.clone();
+        cck[28..32].fill(0);
+        // Bypass Actor's peer-rate stamping only for this negative input.
+        // All other descriptor, ciphertext/key and PN bytes are identical.
+        actor.firmware.inject(0xc1, 0, 0x8000, &cck);
+        packet
+    };
+    require(
+        f.h.device.step(None).is_empty(),
+        "API77 OFDM-only client admitted a CCK-rate native MPDU",
+    )?;
+    f.h.actor.lock().firmware.inject(0xc1, 0, 0x8000, &packet);
     require(
         f.h.device.step(None).len() == 1,
-        "API77 P2P client actual key/PN RX missing",
+        "API77 P2P client actual OFDM6 key/PN RX missing after CCK refusal",
     )?;
     run(f.h.device.disassociate())?.map_err(|_| "API77 P2P client actual native terminal close")?;
     let restored = f.h.actor.lock().client_mac == 4;

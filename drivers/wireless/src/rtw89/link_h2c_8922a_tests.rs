@@ -127,12 +127,12 @@ fn smoke_rtw89_link_h2c_role_maintain() -> TestResult {
         return TestResult::Fail("station role CREATE word wrong");
     }
     // AP peer REMOVE: macid 5 | AP_CLIENT 2<<8 | REMOVE 1<<10 |
-    // AP 2<<13 | mac_idx 0 | port 1<<19 = 0x00084205.
+    // AP 2<<13 | mac_idx 0 | port 1<<19 = 0x00084605.
     let remove = match role_maintain(5, 2, UpdMode::Remove, 2, 0, 1) {
         Ok(body) => body,
         Err(_) => return TestResult::Fail("AP peer role REMOVE refused"),
     };
-    if remove != [0x05, 0x42, 0x08, 0x00] {
+    if remove != [0x05, 0x46, 0x08, 0x00] {
         return TestResult::Fail("AP peer role REMOVE word wrong");
     }
     // Out-of-field inputs refuse, never truncate.
@@ -345,34 +345,35 @@ fn smoke_rtw89_link_h2c_join_info_v1() -> TestResult {
 }
 
 fn smoke_rtw89_link_h2c_macid_pause_sleep() -> TestResult {
-    // macid 33: grp 1, bit 1<<1. Paused: pause_grp[1], mask[1],
-    // sleep_grp[1], sleep_mask[1] all set (dwords 1, 5, 9, 13).
-    let paused = match macid_pause_sleep(33, true) {
+    // 8922A supports 32 MACIDs (rtw8922a.c::support_macid_num).
+    // Last valid MACID31: grp0, bit31 in pause/mask/sleep/sleep_mask
+    // (dwords0/4/8/12); the other three groups stay zero.
+    let paused = match macid_pause_sleep(31, true) {
         Ok(body) => body,
-        Err(_) => return TestResult::Fail("SLEEP pause refused macid 33"),
+        Err(_) => return TestResult::Fail("SLEEP pause refused macid31"),
     };
     if paused.len() != 256 {
         return TestResult::Fail("SLEEP pause length must be 256");
     }
-    for index in [1, 5, 9, 13] {
-        if word(&paused, index) != 0x2 {
+    for index in [0, 4, 8, 12] {
+        if word(&paused, index) != 0x8000_0000 {
             return TestResult::Fail("SLEEP pause paused word wrong");
         }
     }
-    for index in (0..64).filter(|i| ![1, 5, 9, 13].contains(i)) {
+    for index in (0..64).filter(|i| ![0, 4, 8, 12].contains(i)) {
         if word(&paused, index) != 0 {
             return TestResult::Fail("SLEEP pause must leave other groups zero");
         }
     }
     // Unpaused: masks stay, pause/sleep groups clear.
-    let unpaused = match macid_pause_sleep(33, false) {
+    let unpaused = match macid_pause_sleep(31, false) {
         Ok(body) => body,
-        Err(_) => return TestResult::Fail("SLEEP unpause refused macid 33"),
+        Err(_) => return TestResult::Fail("SLEEP unpause refused macid31"),
     };
-    if word(&unpaused, 1) != 0 || word(&unpaused, 9) != 0 {
+    if word(&unpaused, 0) != 0 || word(&unpaused, 8) != 0 {
         return TestResult::Fail("SLEEP unpause must clear pause/sleep groups");
     }
-    if word(&unpaused, 5) != 0x2 || word(&unpaused, 13) != 0x2 {
+    if word(&unpaused, 4) != 0x8000_0000 || word(&unpaused, 12) != 0x8000_0000 {
         return TestResult::Fail("SLEEP unpause must keep the masks");
     }
     if macid_pause_sleep(32, true).is_ok() {
@@ -556,7 +557,9 @@ fn smoke_rtw89_link_h2c_mld_transitions() -> TestResult {
     }
     // Assoc, link 1 (non-designated): join W0 = 16 | 1<<9 |
     // 1<<12 | 2<<24 | 1<<26 = 0x06001210; W1 gains INIT_PS
-    // 1<<15 and LINK_ID 1<<25 = 0x022C901A. The two links must
+    // 1<<15 and LINK_ID 1<<25 = 0x022C900A. MAIN_MACID stays
+    // the common MLD base0 for both links (fw.c::rtw89_fw_h2c_join_info).
+    // The two links must
     // differ exactly there — a single-link fixture would pass
     // with either index hard-coded.
     let assoc1 = match mld_link_assoc_h2cs(&mld, 1, &vif1) {
@@ -564,7 +567,7 @@ fn smoke_rtw89_link_h2c_mld_transitions() -> TestResult {
         Err(_) => return TestResult::Fail("MLD link 1 assoc refused"),
     };
     if assoc1.join[0..4] != [0x10, 0x12, 0x00, 0x06]
-        || assoc1.join[4..8] != [0x1A, 0x90, 0x2C, 0x02]
+        || assoc1.join[4..8] != [0x0A, 0x90, 0x2C, 0x02]
     {
         return TestResult::Fail("MLD link 1 assoc join-info wrong");
     }

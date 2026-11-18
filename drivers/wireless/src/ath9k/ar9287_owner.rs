@@ -338,14 +338,8 @@ fn compose(
     let packet = unsafe { packet::Packet::prepare(native, mac) }?;
     // `channels` routes this generation's retunes to `transition`; HT40
     // requests fail closed (no AR9287 HT owner).
-    let station = Arc::new(Mutex::new(station::Radio::new(
-        packet.into(),
-        mac,
-        noise,
-        station::NativeEnvironment {
-            generation: o.generation,
-        },
-    )));
+    let station =
+        super::retain_packet_station(alloc::boxed::Box::new(packet), mac, noise, o.generation);
     o.station = Some(station.clone());
     Ok(station)
 }

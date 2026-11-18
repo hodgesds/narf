@@ -90,6 +90,7 @@ pub mod pwrseq;
 pub mod rsvd_page;
 pub mod station;
 pub mod tables;
+pub(crate) mod tracking;
 pub mod trx;
 pub mod txpower;
 pub mod version;

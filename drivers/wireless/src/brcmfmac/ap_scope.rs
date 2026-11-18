@@ -133,6 +133,11 @@ impl core::fmt::Debug for Capture {
     }
 }
 impl Capture {
+    /// Firmware interface bound by the original AP Program. A native packet
+    /// must address this interface rather than selecting another BSS.
+    pub(crate) fn interface_index(&self) -> u8 {
+        self.scope.indices().0
+    }
     /// Consumed records remain queued until Session applies them. A native
     /// GET can inspect firmware without opening a port or publishing RF/key
     /// state, but Program SET must not step past an unapplied denial or

@@ -210,6 +210,33 @@ pub(in crate::ath9k) fn enable(
     Ok(mask)
 }
 
+/// `ath9k_hw_set_interrupts` AUTOSLEEP station beacon causes. No AR9002
+/// GENTMR/TIM_TIMER bit is invented; the current S2 TIM cause wakes the
+/// shared station receipt owner instead.
+pub(in crate::ath9k) fn power_save(
+    port: &impl Port,
+    mut mask: Mask,
+    enabled: bool,
+) -> Result<Mask, Error> {
+    mask.imr = if enabled {
+        mask.imr | ISR_BMISS
+    } else {
+        mask.imr & !ISR_BMISS
+    };
+    let s2 = STATION_IMR_S2
+        | if enabled {
+            S2_TIM | S2_DTIM | S2_DTIMSYNC | S2_CABEND | S2_TSFOOR
+        } else {
+            0
+        };
+    port.write(IMR, mask.imr)?;
+    port.write(IMR_S2, s2)?;
+    if port.read(IMR)? != mask.imr || port.read(IMR_S2)? != s2 {
+        return Err(Error::Descriptor);
+    }
+    Ok(mask)
+}
+
 /// `__ath9k_hw_enable_interrupts`, including the bounded AR_PCIE_MSI re-arm.
 pub(in crate::ath9k) fn resume(port: &impl Port, mask: Mask) -> Result<(), Error> {
     resume_with(port, mask, MSI_MASK)

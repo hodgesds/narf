@@ -20,9 +20,10 @@
 //!
 //! Version selection is firmware-feature-gated in Linux
 //! (`RTW89_CHK_FW_FEATURE(RFK_IQK_V0 / RFK_RXDCK_V0 / RFK_PRE_NOTIFY_V*)`).
-//! NARF has no firmware-feature query for these, so this module builds
-//! the default (newest) body in each case and keeps the older variant as
-//! a documented builder for the day the query lands.
+//! `be_features` earns the selector from the actual retained NORMAL suit;
+//! `be_notify` builds the A chip's versioned PRE/MCC context and channel/late
+//! owners choose the corresponding IQK/RXDCK body. The V3 helper below is
+//! retained as a wire primitive, never an RTL8922A default selector.
 
 use super::super::h2c::{H2C_CAT_OUTSRC, H2C_CL_OUTSRC_RF_FW_RFK, H2C_FUNC_RFK_IQK_OFFLOAD};
 use super::{Error, Interface};

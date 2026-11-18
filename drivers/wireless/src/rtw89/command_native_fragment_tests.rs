@@ -158,6 +158,7 @@ fn setup_a() -> (
     f.activate().unwrap();
     let (qualification, base, companion) = crate::rtw89::radio_policy_a::tests::fragment_model();
     let qualification = Arc::new(qualification);
+    f.native.mac_a = Some(Arc::new(crate::rtw89::mac_a_policy::tests::model().0));
     f.native.ordinary = Some(OrdinaryGrant::A(Arc::clone(&qualification)));
     // The installed A program also backs `station_tx_current`, so the
     // fragment submit exercises the A envelope arm, not the B fallback.
@@ -206,7 +207,7 @@ fn terminal_a() -> Result<(), &'static str> {
                 .ok_or("retained issued maps")?;
         let word =
             |offset| u32::from_le_bytes(snapshot.header[offset..offset + 4].try_into().unwrap());
-        // The A TXWD is the AX v0 body shared with B (`transmit_a`), so the
+        // The A TXWD is the AX v0 body shared with B (`transmit_fragment`), so the
         // same descriptor invariants hold: SW_SN/rate/NAV/bytes unaltered.
         if snapshot.id != id
             || &snapshot.body != expected

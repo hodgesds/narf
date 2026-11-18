@@ -25,6 +25,19 @@ pub use reset::DeadStop;
 
 const INPUT: usize = 1518;
 const CONTROL: usize = 8192;
+/// Linux msgbuf.c advertises the logical dcmd size but transmits at most
+/// BRCMF_TX_IOCTL_MAX_MSG_SIZE bytes. Accept a larger fixed structure only
+/// when the unsent tail is zero padding; meaningful input is never truncated.
+fn control_input(input: &[u8], maximum: usize) -> Result<&[u8], Error> {
+    if input.len() > CONTROL || maximum > CONTROL {
+        return Err(Error::Bounds);
+    }
+    let copied = input.len().min(INPUT);
+    if input[copied..].iter().any(|&byte| byte != 0) {
+        return Err(Error::Bounds);
+    }
+    Ok(&input[..copied])
+}
 const POOL: usize = 8;
 const BUDGET: usize = 32;
 const EVENTS: usize = 32;
@@ -667,9 +680,7 @@ impl<B: Bus> Runtime<B> {
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
-        if input.len() > INPUT || maximum > CONTROL {
-            return Err(Error::Bounds);
-        }
+        let submitted = control_input(input, maximum)?;
         let id = self
             .next_transaction
             .checked_add(1)
@@ -678,7 +689,7 @@ impl<B: Bus> Runtime<B> {
         let wire_length = logical.min(INPUT);
         let memory = &mut self.resources.as_mut().unwrap().input;
         zero(memory)?;
-        memory.write(0, input)?;
+        memory.write(0, submitted)?;
         memory.to_device(0, wire_length);
         let request = IoctlReq {
             hdr: CommonHdr {

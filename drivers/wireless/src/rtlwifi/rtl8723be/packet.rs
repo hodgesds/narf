@@ -40,13 +40,10 @@
 //! meets are deferred back into the queue and drained by the outer
 //! loop, so none is lost.
 //!
-//! Termination of the drain loop: each iteration pops one packet and
-//! dispatches it; a dispatch's MP wait only defers packets it meets
-//! while polling, and a deferred packet, when outer-dispatched, meets
-//! an empty-or-MP-only queue on its own wait. No packet is ever
-//! re-enqueued by its own dispatch, so the loop ends with the queue
-//! empty. The queue is empty between `service_rx` calls by the same
-//! argument.
+//! MP waits consume only fresh arrivals and place other reports on a
+//! separate deferred queue. The outer dispatcher consumes deferred work
+//! first. A wait cannot poll its own deferred report again, so a non-MP
+//! arrival cannot prevent its timeout or multiply delivery.
 //!
 //! ## Single-segment scope
 //!
@@ -214,18 +211,19 @@ pub enum RxOutcome<'a> {
 #[derive(Debug, Default)]
 pub struct C2hQueue {
     queue: VecDeque<(usize, [u8; C2H_MAX])>,
+    deferred: VecDeque<(usize, [u8; C2H_MAX])>,
 }
 
 impl C2hQueue {
     /// Number of packets currently queued (0 between `service_rx`
     /// calls, by the drain-loop invariant).
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + self.deferred.len()
     }
 
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && self.deferred.is_empty()
     }
 
     /// Enqueue one RX C2H payload, truncated to [`C2H_MAX`].
@@ -238,13 +236,13 @@ impl C2hQueue {
 
     /// Pop the oldest queued packet.
     pub(crate) fn pop(&mut self) -> Option<(usize, [u8; C2H_MAX])> {
-        self.queue.pop_front()
+        self.deferred.pop_front().or_else(|| self.queue.pop_front())
     }
 }
 
 impl C2hSource for C2hQueue {
     fn poll_c2h(&mut self, out: &mut [u8; C2H_MAX]) -> Result<Option<usize>, PrepareError> {
-        match self.pop() {
+        match self.queue.pop_front() {
             Some((n, buf)) => {
                 out[..n].copy_from_slice(&buf[..n]);
                 Ok(Some(n))
@@ -254,7 +252,10 @@ impl C2hSource for C2hQueue {
     }
 
     fn defer_c2h(&mut self, packet: &[u8]) -> Result<(), PrepareError> {
-        self.push(packet);
+        let n = packet.len().min(C2H_MAX);
+        let mut buf = [0; C2H_MAX];
+        buf[..n].copy_from_slice(&packet[..n]);
+        self.deferred.push_back((n, buf));
         Ok(())
     }
 }

@@ -202,7 +202,7 @@ pub(super) enum Error {
 /// framing a link-lifecycle body with `fwcmd_8922a::frame_h2c`.
 /// The ack pair is Linux's `rtw89_h2c_pkt_set_hdr(..., rack,
 /// dack, len)` for that builder: role-maintain, join-info, CAM
-/// and DMAC take DONE_ACK only (`0, 1`); MACID pause takes
+/// take DONE_ACK only (`0, 1`); default DMAC v2 requests no ACK, and MACID pause takes
 /// REC_ACK only (`1, 0`, `fw.c:5618`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LinkCmd {
@@ -252,7 +252,7 @@ pub(super) const CMD_CAM: LinkCmd = LinkCmd {
 };
 
 /// Default DMAC table v2: `H2C_CAT_MAC` / `H2C_CL_MAC_FR_EXCHG` /
-/// `H2C_FUNC_MAC_DCTLINFO_UD_V2`, DONE_ACK only.
+/// `H2C_FUNC_MAC_DCTLINFO_UD_V2`, no ACK (`fw.c` default_dmac_tbl_v2).
 pub(super) const CMD_DMAC_V2: LinkCmd = LinkCmd {
     cmd: H2cCmd {
         cat: H2C_CAT_MAC,
@@ -260,7 +260,7 @@ pub(super) const CMD_DMAC_V2: LinkCmd = LinkCmd {
         func: H2C_FUNC_MAC_DCTLINFO_UD_V2,
     },
     rec_ack: false,
-    done_ack: true,
+    done_ack: false,
 };
 
 /// MACID pause (plain): `H2C_CAT_MAC` / `H2C_CL_MAC_FW_OFLD` /

@@ -631,10 +631,12 @@ pub(crate) fn smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt() -> TestRe
         }
     }
     if Chip::from_device(0xb723) != Some(Chip::Rtl8723be)
-        || Chip::from_device(0x8723).is_some()
+        || Chip::from_device(0x8723) != Some(Chip::Rtl8723ae)
+        || Chip::from_device(0xdead).is_some()
         || Chip::Rtl8723be.next_desc_offset() != Some(48)
+        || Chip::Rtl8723ae.next_desc_offset() != Some(40)
     {
-        return TestResult::Fail("8723BE ring profile selection (8723AE excluded)");
+        return TestResult::Fail("8723AE/BE require distinct source ring profiles");
     }
     // `rtl_pci_start` → `btc_init_variables` precedes `hw_init`; an unbound
     // owner refuses before the 0x301 stop's successor writes.

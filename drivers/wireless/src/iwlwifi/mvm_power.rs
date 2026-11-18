@@ -10,7 +10,7 @@ use super::super::{
 use super::phy::Span;
 use super::{Owner, Phase};
 use crate::firmware_asset::Asset;
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;
 
@@ -218,10 +218,10 @@ pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<Sp
 }
 
 impl Prepared {
-    pub(super) fn with_client(
-        mut self,
+    pub(super) fn bind_client(
+        &mut self,
         client: Option<Arc<super::super::p2p_client::Native>>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<(), &'static str> {
         if (self.emission == Emission::P2pClient) != client.is_some() {
             return Err("MVM client/ordinary power purpose differs");
         }
@@ -232,7 +232,7 @@ impl Prepared {
             }
         }
         self.client = client;
-        Ok(self)
+        Ok(())
     }
 
     pub(in crate::iwlwifi) fn is_ap(&self) -> bool {
@@ -257,9 +257,8 @@ impl Prepared {
         self.applied = Some(planned);
     }
     /// Bind the span of a granted HT40/VHT program.
-    pub(super) fn with_span(mut self, span: Option<Span>) -> Self {
+    pub(super) fn bind_span(&mut self, span: Option<Span>) {
         self.span = span;
-        self
     }
     pub(super) fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
         if self.emission == Emission::P2pClient {
@@ -369,6 +368,23 @@ pub(super) fn parse_for(
         mlme: super::assoc::Context::default(),
         stop: None,
     })
+}
+
+// Parsing produces a large MLME-capable owner. Keep its return place out
+// of async orchestration frames and configure the retained allocation in place.
+#[inline(never)]
+pub(super) fn parse_retained(
+    source: Asset,
+    binding: [u8; 32],
+    mac: [u8; 6],
+    channel: u8,
+    emission: Emission,
+) -> Result<Box<Prepared>, &'static str> {
+    if emission == Emission::Legacy {
+        parse(source, binding, mac, channel).map(Box::new)
+    } else {
+        parse_for(source, binding, mac, channel, emission).map(Box::new)
+    }
 }
 
 pub(super) struct Values {
@@ -875,31 +891,22 @@ impl Owner {
         if !nvm.channels.contains(&channel) || self.power.nvm_permissions.is_none() {
             return Err("MVM power channel lacks actual retained NVM permission");
         }
-        let prepared = if self.power.phy.emission() == Emission::Legacy {
-            parse(
-                source,
-                binding,
-                self.mac.ok_or("MVM power MAC unavailable")?,
-                channel,
-            )?
-        } else {
-            parse_for(
-                source,
-                binding,
-                self.mac.ok_or("MVM power MAC unavailable")?,
-                channel,
-                self.power.phy.emission(),
-            )?
-        }
-        .with_span(self.power.phy.span())
-        .with_client(self.hardware.p2p_client_native())?;
+        let mut prepared = parse_retained(
+            source,
+            binding,
+            self.mac.ok_or("MVM power MAC unavailable")?,
+            channel,
+            self.power.phy.emission(),
+        )?;
+        prepared.bind_span(self.power.phy.span());
+        prepared.bind_client(self.hardware.p2p_client_native())?;
         let domain = policy()?;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase)
             || span_power(&domain, channel, self.power.phy.span()).is_none()
         {
             return Err("MVM platform power prohibited by current host policy");
         }
-        self.power.prepared = Some(prepared);
+        self.power.prepared = Some(*prepared);
         self.phase = Phase::PreparingTransmitPower;
         let result = self.prepare_power_inner(&mut policy).await;
         match result {

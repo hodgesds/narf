@@ -933,7 +933,7 @@ pub struct MgmtTxBuf {
 /// `struct ath11k` as the running driver sees them).
 #[allow(missing_debug_implementations)]
 pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
-    pub core: Ath11kCore<CeHif<Io, Irq>, Q>,
+    pub core: alloc::boxed::Box<Ath11kCore<CeHif<Io, Irq>, Q>>,
     pub dp: Dp,
     /// The three independently addressable vdev slots NARF currently admits.
     /// Entry index always equals its WMI `vdev_id`.
@@ -1043,7 +1043,15 @@ pub const PAE_GROUP_ADDR: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x03];
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// A runtime over a ready core and its DP.
+    #[inline(never)]
     pub fn new(core: Ath11kCore<CeHif<Io, Irq>, Q>, dp: Dp) -> Self {
+        Self::from_retained_core(alloc::boxed::Box::new(core), dp)
+    }
+
+    // Recovery already owns this same core allocation. Retain it while
+    // rebuilding the smaller runtime rather than copying the core twice.
+    #[inline(never)]
+    fn from_retained_core(core: alloc::boxed::Box<Ath11kCore<CeHif<Io, Irq>, Q>>, dp: Dp) -> Self {
         let own = core.mac_addr.unwrap_or_default();
         let mut vdevs = Vec::with_capacity(WCN6855_MAX_VDEVS);
         for _ in 0..WCN6855_MAX_VDEVS {
@@ -2651,6 +2659,7 @@ type RestartFut<'a, Q> = core::pin::Pin<
 >;
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
+    #[inline(never)]
     pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
         let clock = rt.core.hif.clock;
@@ -2658,7 +2667,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
         let tx_power_stats = rt.tx_power_stats.clone();
         let radar = rt.radar.clone();
-        Arc::new(Shared {
+        // Reserve the final allocation before constructing the large
+        // runtime and vdev bookkeeping; avoid Arc::new's value temporary.
+        let mut shared = Arc::<Self>::new_uninit();
+        Arc::get_mut(&mut shared).unwrap().write(Shared {
             rt: Mutex::new(Some(rt)),
             irq,
             clock,
@@ -2694,7 +2706,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             ops: IrqSafeSpinLock::new(VecDeque::new()),
             dead: AtomicBool::new(false),
             parked: IrqSafeSpinLock::new(Vec::new()),
-        })
+        });
+        // SAFETY: the unique Arc was fully initialized above and no
+        // reference or clone has been published yet.
+        unsafe { shared.assume_init() }
     }
 
     /// A recovery failed; nothing will bring the device back.
@@ -3270,22 +3285,24 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         pdev_id: u32,
     ) -> Result<Recovered, TransportError> {
         let power_cycle = matches!(notice, FwNotice::Reset(_));
-        self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| {
-                alloc::boxed::Box::pin(async move {
-                    qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
-                        TransportError::new(
-                            step::RECOVERY_FW,
-                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                            e.errno,
-                        )
+        super::future_heap::build(|| {
+            self.rebuild_after_transport_reset(
+                move |qmi: &mut Q| {
+                    alloc::boxed::Box::pin(async move {
+                        qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
+                            TransportError::new(
+                                step::RECOVERY_FW,
+                                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                                e.errno,
+                            )
+                        })
                     })
-                })
-            },
-            true,
-            matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
-            pdev_id,
-        )
+                },
+                true,
+                matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
+                pdev_id,
+            )
+        })
         .await
     }
 
@@ -3294,22 +3311,26 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// `restart_work`, but it must not count toward the crash-reset failure
     /// throttling or be reported as a firmware failure.
     pub async fn resume_after_system_suspend(&self) -> Result<Recovered, TransportError> {
-        self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| {
-                alloc::boxed::Box::pin(async move {
-                    qmi.recover(true).await.map(|()| None).map_err(|e| {
-                        TransportError::new(
-                            step::RECOVERY_FW,
-                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                            e.errno,
-                        )
+        // The cold-resume caller must not embed the entire transport
+        // reconstruction future or inline its large poll into PM resume.
+        super::future_heap::build(|| {
+            self.rebuild_after_transport_reset(
+                move |qmi: &mut Q| {
+                    alloc::boxed::Box::pin(async move {
+                        qmi.recover(true).await.map(|()| None).map_err(|e| {
+                            TransportError::new(
+                                step::RECOVERY_FW,
+                                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                                e.errno,
+                            )
+                        })
                     })
-                })
-            },
-            false,
-            false,
-            0,
-        )
+                },
+                false,
+                false,
+                0,
+            )
+        })
         .await
     }
 
@@ -3326,8 +3347,17 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     where
         F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
     {
-        self.rebuild_after_transport_reset(restart, true, false, 0)
+        super::future_heap::build(|| self.rebuild_after_transport_reset(restart, true, false, 0))
             .await
+    }
+
+    // Taking and boxing the large inline runtime needs one transient move.
+    // Keep that move out of the reconstruction poll's other core/DP locals.
+    #[inline(never)]
+    fn take_recovery_runtime(
+        current: &mut Option<Rt<Io, Irq, Q>>,
+    ) -> Option<alloc::boxed::Box<Rt<Io, Irq, Q>>> {
+        current.take().map(alloc::boxed::Box::new)
     }
 
     /// The common reconstruction tail for a firmware-reset recovery and an
@@ -3367,7 +3397,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         self.bss_surveys.lock().clear();
         *self.mbssid_beacons.lock() = core::array::from_fn(|_| None);
         *self.mbssid_transmitters.lock() = [None; WCN6855_MAX_VDEVS];
-        let taken = self.rt.lock().await.take();
+        // Keep the original large runtime heap-owned while transport
+        // restart awaits. Moving it into this future's inline state made
+        // recovery polls reserve a second full runtime on the kernel stack.
+        let taken = {
+            let mut current = self.rt.lock().await;
+            Self::take_recovery_runtime(&mut current)
+        };
         let Some(mut rt) = taken else {
             return Err(TransportError::new(step::RECOVERY_CORE, 0, ENODEV));
         };
@@ -3379,7 +3415,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             // `ath11k_core_reset` turns the radio over. A failed diagnostic
             // capture is reported by the transport but never prevents the
             // safety-critical reset/recovery sequence.
-            rt.core.qmi.collect_crash_dump().await;
+            super::future_heap::build(|| rt.core.qmi.collect_crash_dump()).await;
             if let Some(dump) = rt.core.qmi.take_crash_dump() {
                 self.publish_firmware_crash_dump(dump);
             }
@@ -3392,7 +3428,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 if record_recovery_failure {
                     Self::recovery_failed(&mut rt);
                 }
-                self.park(alloc::boxed::Box::new(rt));
+                self.park(rt);
                 return Err(te);
             }
         }
@@ -3404,9 +3440,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             stats,
             reset,
             ..
-        } = rt;
+        } = *rt;
         let (dp_cfg, sizes, msi) = (dp.cfg, dp.sizes, dp.msi());
-        let (mut hif, qmi, cfg) = core.into_parts();
+        let (mut hif, qmi, cfg) = (*core).into_parts();
         dp.pdev_free(&mut hif.ce.hal);
         hif.ce.cleanup_pipes();
         dp.pdev_reo_cleanup(&mut hif.ce.hal);
@@ -3417,8 +3453,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // structs, and holding them by value across `qmi_firmware_ready`
         // blew the 8 KiB kernel stack-frame budget (this closure measured
         // 17_896 bytes on main at 4a67c1cc). Holding `Box`es keeps the
-        // future's state and the poll's by-value moves pointer-sized; the
-        // core is unboxed once, for `Rt::new`, after the await.
+        // future's state and the poll's by-value moves pointer-sized. The
+        // original core allocation is retained in the rebuilt runtime.
         let mut core = match Ath11kCore::new(hif, qmi, cfg) {
             Ok(c) => alloc::boxed::Box::new(c),
             Err((e, hif, qmi)) => {
@@ -3433,10 +3469,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             }
         };
         let mut hooks = alloc::boxed::Box::new(DpHooks::new(Some(dp_cfg), 0, sizes, msi));
-        let r = core.qmi_firmware_ready(&mut *hooks).await;
+        // Heap-own the nested firmware/DP setup future too: boxed core and
+        // hooks alone do not bound an inlined child poll's temporary frame.
+        let r = super::future_heap::build(|| core.qmi_firmware_ready(&mut *hooks)).await;
         let dp = hooks.dp.take();
         let (core, dp) = match (r, dp) {
-            (Ok(()), Some(dp)) => (*core, dp),
+            (Ok(()), Some(dp)) => (core, dp),
             (r, dp) => {
                 let e = r
                     .err()
@@ -3451,7 +3489,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 return Err(te);
             }
         };
-        let mut rt = Rt::new(core, dp);
+        let mut rt = alloc::boxed::Box::new(Rt::from_retained_core(core, dp));
         // A completed physical transport reset terminates old untagged
         // statistics transactions; reuse the physical cache identity.
         self.tx_power_stats.lock().reset();
@@ -3486,7 +3524,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         if r.is_err() && record_recovery_failure {
             Self::recovery_failed(&mut rt);
         }
-        *self.rt.lock().await = Some(rt);
+        *self.rt.lock().await = Some(*rt);
         r
     }
 
@@ -4641,11 +4679,14 @@ pub type AhbStart<Io, Irq, Q> = (
 /// alive (see `AHB_RUNTIME`) because the firmware owns the core's
 /// memory until the device is torn down — mirroring `start_pci`'s
 /// `STRANDED_RT` handling.
+#[inline(never)]
 pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
-    let rt = Rt::new(core, dp);
+    // Keep construction separate from registration and the retained
+    // Shared allocation; do not reserve another runtime-sized local.
+    let rt = alloc::boxed::Box::new(Rt::new(core, dp));
     let hw_cfg = super::mac::MacConfig::for_hw(
         rt.dp.cfg.hw.hw_rev,
         rt.dp.cfg.num_rxdma_per_pdev,
@@ -4655,7 +4696,7 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         Ok(r) => r,
         Err(e) => {
             e.report("ath11k mac register");
-            return (Shared::new(rt, secure_random), Err(e));
+            return (Shared::new(*rt, secure_random), Err(e));
         }
     };
     if radios.is_empty() {
@@ -4663,12 +4704,25 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         // (unreachable after a successful `pdev_create` that reported
         // the READY extra addresses): keep the runtime unregistered.
         return (
-            Shared::new(rt, secure_random),
+            Shared::new(*rt, secure_random),
             Err(TransportError::new(step::MAC_CAPS, 8, ENODEV)),
         );
     }
     let initial_reg = rt.core.reg_info.clone();
-    let shared = Shared::new(rt, secure_random);
+    let shared = Shared::new(*rt, secure_random);
+    register_ahb_radios(shared, hw_cfg, single, radios, initial_reg)
+}
+
+/// Registration starts after the core/DP construction temporaries have
+/// left the stack. The same Shared retains every radio on all outcomes.
+#[inline(never)]
+fn register_ahb_radios<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
+    shared: Arc<Shared<Io, Irq, Q>>,
+    hw_cfg: super::mac::MacConfig,
+    single: bool,
+    radios: Vec<(u32, DeviceCaps)>,
+    initial_reg: Option<alloc::boxed::Box<wmi::RegInfo>>,
+) -> AhbStart<Io, Irq, Q> {
     let mut macs = Vec::with_capacity(radios.len());
     for (slot, (mac_id, caps)) in radios.iter().enumerate() {
         let slot = slot as u32;

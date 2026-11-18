@@ -42,6 +42,12 @@ mod rates;
 mod rx_ba;
 mod station;
 mod tx_ba;
+pub use ar9003::ani::Request as PeriodicAniQualificationRequest;
+pub use ar9003::antenna::manual::Request as ManualBtSharingQualificationRequest;
+pub use ar9300_owner::{
+    manual_bt_sharing_request, manual_bt_sharing_requested, native_ani_request,
+    set_manual_bt_sharing,
+};
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use ht40::Request as Ht40QualificationRequest;
@@ -314,14 +320,19 @@ async fn initialize_owner_inner(owner: &Retained) -> Result<RadioCalibration, Br
     if narf_net::trusted_net_authority().is_none() {
         return Err(BringUpError::Policy);
     }
-    let station = prepare_packets(owner).await.map_err(|error| {
-        let _ = writeln!(
-            narf_console::Writer,
-            "ath9k: native packet preparation closed: {:?}",
-            error
-        );
-        BringUpError::BadState
-    })?;
+    // Packet preparation retains native calibration/transport state. Keep
+    // that child state on the heap instead of enlarging this supervisor's
+    // stack frame while it awaits the original owner lock.
+    let station = alloc::boxed::Box::pin(prepare_packets(owner))
+        .await
+        .map_err(|error| {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: native packet preparation closed: {:?}",
+                error
+            );
+            BringUpError::BadState
+        })?;
     interface::publish(station).map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
@@ -525,19 +536,41 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
         .idle
         .use_awake(true)
         .map_err(|_| packet::Error::State)?;
-    let station = Arc::new(Mutex::new(station::Radio::new(
-        packet.into(),
+    let station = retain_packet_station(
+        alloc::boxed::Box::new(packet),
         controller.identity.mac,
         report.noise_dbm,
-        station::NativeEnvironment {
-            generation: controller.generation,
-        },
-    )));
+        controller.generation,
+    );
     // The exact native owner is retained before packet start or NIC exposure.
     // Interface/control/drain callers clone only this same Arc.
     controller.station = Some(station.clone());
     controller.station_use = Some(station_use);
     Ok(station)
+}
+
+/// Separate pure station construction from frames holding the original
+/// calibrated Native and packet-preparation temporaries. The packet already
+/// owns its original native adapter and DMA; no effect or authority changes.
+#[inline(never)]
+fn retain_packet_station(
+    packet: alloc::boxed::Box<packet::Packet<packet_native::Native>>,
+    mac: [u8; 6],
+    noise: i16,
+    generation: u32,
+) -> RetainedRadio {
+    let mut retained = Arc::<Mutex<NativeRadio>>::new_uninit();
+    Arc::get_mut(&mut retained)
+        .unwrap()
+        .write(Mutex::new(station::Radio::new(
+            station::Dispatch::Ar9002(packet),
+            mac,
+            noise,
+            station::NativeEnvironment { generation },
+        )));
+    // SAFETY: this unique allocation was completely initialized above.
+    // No Arc clone or inner-Radio reference escaped before initialization.
+    unsafe { retained.assume_init() }
 }
 
 /// Retire the current station generation: withdraw its interface, stop the

@@ -32,6 +32,9 @@
 
 use super::dma_be::Regs;
 
+#[path = "pci_pre_init_8922a_checked.rs"]
+pub(super) mod checked;
+
 /// `R_BE_SYS_PW_CTRL`. `reg.h:3828`.
 const R_BE_SYS_PW_CTRL: u32 = 0x0004;
 /// `B_BE_PSUS_OFF_CAPC_EN`. `reg.h:3846`.

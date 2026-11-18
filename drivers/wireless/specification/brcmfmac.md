@@ -187,6 +187,12 @@ nonwrapping transaction/buffer IDs, zero-filled physical query prefixes,
 posted-buffer identity plus command/transaction/interface correlation, and
 copy-before-repost. `command(...).await` drives bounded polling with a 2-second
 deadline; cancellation poisons the owner and preserves active input bytes.
+The logical control bound is 8192 bytes, independently of the 1518-byte
+physical input prefix. Larger fixed structures are accepted only when every
+omitted byte is zero padding; a nonzero truncated tail refuses before
+publication. The descriptor retains the full logical output/query length
+and the actual copied input length separately. Ordinary and AP control use
+the same bound check, with the original AP publication fences intact.
 `poll` consumes at most10 completions per each of three rings (30 total)
 per call, so control pressure cannot starve TX/RX; `pop_event` returns owned
 event payloads. Stale IDs, malformed extents/indices,

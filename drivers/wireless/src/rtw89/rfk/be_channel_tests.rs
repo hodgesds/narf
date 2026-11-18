@@ -251,8 +251,15 @@ fn smoke_rtw89_be_channel_rfk_and_track() -> TestResult {
         Model::ok(6),
     ]);
     io.rx_mode_polls = [1, 1];
-    // SAFETY: private inert register/RF model; no hardware.
-    let rfk = unsafe { channel.rfk_channel(&mut io, wide, &inputs, MLO_NOT_SUPPORT) };
+    let features = Features::fixture([0, 35, 48, 0]); // PRE-v1, current IQK/RXDCK.
+    let mut context = be_notify::Context::default();
+    // SAFETY: inert model; explicit source SCC table-reload before RFK.
+    let reload = unsafe { context.reload(&mut io, wide, features) };
+    if ready(reload) != Some(Ok(())) {
+        return TestResult::Fail("BE source channel context reload");
+    }
+    // SAFETY: private inert model, source context reloaded above; no hardware.
+    let rfk = unsafe { channel.rfk_channel(&mut io, wide, &inputs, features, &context) };
     if ready(rfk) != Some(Ok(())) {
         return TestResult::Fail("BE rfk_channel failed on a ready model");
     }
@@ -269,8 +276,13 @@ fn smoke_rtw89_be_channel_rfk_and_track() -> TestResult {
     {
         return TestResult::Fail("BE rfk_channel order/timeouts/notify differ from rtw8922a");
     }
-    // Spot-check the offload bodies: pre_ntfy V3, IQK, TSSI, RXDCK.
-    if io.h2c[0].3 != vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    // PRE-v1 packed common: channels[path][table], bands[path][table],
+    // MLO mode, current channel/band per path, PHY0, mlo_1_1=false.
+    let pre_words = [
+        42u32, 0, 0, 42, 0, 0, 1, 0, 0, 1, 0, 0, 1, 42, 42, 1, 1, 0, 0,
+    ];
+    let pre: Vec<u8> = pre_words.into_iter().flat_map(u32::to_le_bytes).collect();
+    if io.h2c[0].3 != pre
         || io.h2c[2].3 != vec![8, 0, 0, 3, 1, 2, 42, 0]
         || io.h2c[3].3.len() != 300
         || io.h2c[3].3[3] != 42
@@ -324,7 +336,7 @@ fn smoke_rtw89_be_channel_rfk_and_track() -> TestResult {
         },
     ]);
     // SAFETY: private inert register/RF model; no hardware.
-    let rfk_fail = unsafe { channel.rfk_channel(&mut io, wide, &inputs, MLO_NOT_SUPPORT) };
+    let rfk_fail = unsafe { channel.rfk_channel(&mut io, wide, &inputs, features, &context) };
     if ready(rfk_fail) != Some(Err(Error::Report))
         || channel.state() != State::Busy
         || channel.calibrated().is_some()
@@ -342,7 +354,7 @@ fn smoke_rtw89_be_channel_rfk_and_track() -> TestResult {
     let mut io = Model::new(vec![]);
     io.rx_mode_polls = [u8::MAX; 2];
     // SAFETY: private inert register/RF model; no hardware.
-    let rfk_timeout = unsafe { channel.rfk_channel(&mut io, wide, &inputs, MLO_NOT_SUPPORT) };
+    let rfk_timeout = unsafe { channel.rfk_channel(&mut io, wide, &inputs, features, &context) };
     if ready(rfk_timeout) != Some(Err(Error::Register(power::Error::Timeout)))
         || channel.state() != State::Busy
         || !io.h2c.is_empty()

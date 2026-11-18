@@ -256,6 +256,27 @@ holding a stale binding is safe. The MEI implementation, its errnos and
 limits are documented in `drivers/platform/src/mei_gsc_proxy.rs` and
 `drivers/platform/src/mei.rs`.
 
+### 3.7 Exclusive SPI device transactions
+
+`narf_drivers_spi::SpiBus::claim_device(SpiDeviceConfig)` is an optional
+stronger contract, with a default `SpiClaimError::Unsupported` before any
+hardware access. The producer atomically installs mode/frequency/CS/wiring
+and grants a non-cloneable `Box<dyn SpiDevice>`. It excludes other sessions
+and legacy accesses until its own proven retirement. `Busy` denotes a refused
+second claim, not a completed hardware stop.
+
+`SpiDevice::transaction(write, read)` keeps one CS assertion across both
+phases, writes raw bytes without implicit opcodes/swaps/chunk edges, releases
+a shared data pad before receive clocks, deasserts CS on every result and
+observes the configured CS-high settling interval. An uncertain retirement
+retains the original host/pad owner in quarantine. Session drop is not a
+radio/DMA/IRQ stop receipt. The host enforces current capability authority;
+the wire contract itself grants no selected firmware/radio authority.
+
+Existing AMD FCH, LPSS, PL022 and Cadence legacy methods do not implement
+this contract by implication. CYW43439 diagnostics require the actual
+whole-CS/shared-pad session and refuse the unsupported default.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

@@ -16,7 +16,9 @@ use crate::brcmfmac::{
 use crate::cyw43439::fullmac_fixture::{cache, request};
 
 fn block<F: Future>(future: F) -> F::Output {
-    narf_scheduler::block_on(future)
+    // This RAM ring model supplies no IRQ for timed control/retirement
+    // polls; the spin bridge preserves their actual deadlines and receipts.
+    narf_scheduler::block_on_spin(future)
 }
 
 fn frame() -> Vec<u8> {

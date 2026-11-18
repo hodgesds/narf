@@ -186,7 +186,9 @@ fn superseded() -> Result<(), &'static str> {
             .set_power_save(false)
             .map_err(|_| "superseding awake request")?;
         harness.bus.firmware.lock().hold_power_save(0);
-        narf_scheduler::block_on(transition);
+        // The held IOCTL already awaits Runtime's 1 ms polling delay.
+        // This RAM-only bus has no IRQ and the BSP test timer may be parked.
+        narf_scheduler::block_on_spin(transition);
     }
     if !harness
         .device
@@ -248,7 +250,9 @@ fn disconnect_during_power_save() -> Result<(), &'static str> {
         return Err("disconnect failed to close admission before waiting on PS");
     }
     harness.bus.firmware.lock().hold_power_save(0);
-    narf_scheduler::block_on(transition);
+    // Resume the real pending polling delay without requiring a model IRQ
+    // or an armed BSP timer; keep its deadline and receipt checks intact.
+    narf_scheduler::block_on_spin(transition);
     if harness.device.link_up() || harness.device.connected_bssid().is_some() {
         return Err("older power receipt reopened a concurrently disconnecting port");
     }

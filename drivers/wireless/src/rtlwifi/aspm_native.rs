@@ -85,10 +85,16 @@ impl PciIo {
         if !self.aspm_prepared.load(Ordering::Acquire) {
             return Ok(());
         }
-        aspm::configure(self, enabled).await
+        self.prepare_aspm(enabled).await
     }
     pub(in crate::rtlwifi) async fn prepare_aspm(&self, enabled: bool) -> Result<(), Error> {
-        aspm::configure(self, enabled).await
+        let profile = match self.device.id.device {
+            super::super::regs::RTL_DEV_8188EE => aspm::Profile::Rtl8188ee,
+            super::super::regs::RTL_DEV_8723BE => aspm::Profile::Rtl8723be,
+            super::super::regs::RTL_DEV_8192DE => aspm::Profile::Rtl8192de,
+            _ => return Err(Error::Unsupported),
+        };
+        aspm::configure_for(self, profile, enabled).await
     }
 }
 impl aspm::PolicyPort for PciIo {

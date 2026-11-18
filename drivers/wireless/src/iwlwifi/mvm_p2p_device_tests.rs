@@ -777,6 +777,23 @@ fn held() -> Result<(), &'static str> {
     f.h.actor.lock().release();
     run(f.h.device.p2p.stop_retained())?
         .map_err(|_| "P2P Gen2 dropped source lost retained stop")?;
+    let retired = {
+        let mut state =
+            f.h.device
+                .state
+                .try_lock()
+                .ok_or("P2P Gen2 retained stop still owns State")?;
+        state.owner.as_mut().is_some_and(|owner| {
+            owner.phase() == super::super::super::mvm_boot::Phase::Failed && {
+                let hw = owner.p2p_hardware();
+                hw.is_failed() && !hw.p2p_started() && hw.p2p_cookie().is_none()
+            }
+        })
+    };
+    require(
+        retired && !f.h.device.p2p.active(),
+        "P2P Gen2 lost source did not retire native producers at transport stop",
+    )?;
     let no_tx = {
         let a = f.h.actor.lock();
         let m = a.native_p2p.as_ref().unwrap();

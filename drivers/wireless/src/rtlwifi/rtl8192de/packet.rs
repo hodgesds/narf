@@ -24,10 +24,11 @@
 //! Bluetooth combo part, so there is no coexistence owner to feed and
 //! no C2H queue. [`Owner::service_rx`] decodes a delivered RX
 //! descriptor and returns the frame; the caller strips the trailing
-//! FCS and handles `hw_error` frames. The TX-report *request* side
-//! (SPE_RPT / SW_DEFINE, [`Owner::next_report_sn`]) is implemented;
-//! matching a returned report needs the C2H path, which does not
-//! exist for 92D in-tree, and is a follow-up.
+//! FCS and handles `hw_error` frames. DE's source descriptor fill never
+//! calls `rtl_set_tx_report` or writes SPE_RPT / SW_DEFINE, so no report
+//! request is emitted. The compatibility sequence helper is software
+//! metadata only. An actual on-air Null-PM ACK producer is a prerequisite
+//! for native software LPS; host descriptor retirement cannot supply it.
 //!
 //! ## Single-segment scope
 //!
@@ -38,9 +39,8 @@
 //! frame is aggregated under an operational BA session), RDG + HTC
 //! (behind `rdg_en`, which upstream never sets), the LPS hardware
 //! sequence rule (behind the link's `fwctrl_lps`), encryption
-//! `sectype` from the key cipher, TX-report requests (EAPOL or
-//! nullfunc), and rate-id / MAC-id from the H2C rate-mask send
-//! ([`Link::from_rate_mask`]). Ring-slot allocation,
+//! `sectype` from the key cipher and rate-id / MAC-id from the H2C
+//! rate-mask send ([`Link::from_rate_mask`]). Ring-slot allocation,
 //! descriptor-ring base programming, the doorbell, and OWN
 //! publication stay with the caller: this module fills a
 //! caller-provided [`super::trx::TxDesc`] (OWN left clear) and the
@@ -169,10 +169,11 @@ pub struct TxFrame {
     /// paces the rate (`use_driver_rate = false`). Without a link
     /// this falls back to the driver rate.
     pub adaptive: bool,
-    /// EAPOL frame (`ether_type` `0x888e` after the SNAP prefix):
-    /// a TX-report frame.
+    /// Compatibility EAPOL classification (`ether_type` `0x888e` after
+    /// SNAP); this does not request a TX report on DE.
     pub eapol: bool,
-    /// Nullfunc frame: a TX-report frame.
+    /// Compatibility Nullfunc classification; this does not request a
+    /// TX report on DE.
     pub nullfunc: bool,
     /// `mac->rdg_en` (QoS data only; upstream never sets it).
     pub rdg_en: bool,
@@ -200,8 +201,8 @@ impl KeyCipher {
     }
 }
 
-/// `rtl_is_tx_report_skb`: an EAPOL frame or a nullfunc frame
-/// requests a TX report from the firmware.
+/// Common `rtl_is_tx_report_skb` classification retained for compatibility.
+/// DE's descriptor path does not consume it or request a report.
 pub const fn wants_tx_report(eapol: bool, nullfunc: bool) -> bool {
     eapol || nullfunc
 }
@@ -287,8 +288,8 @@ pub struct RxFrame<'a> {
 }
 
 /// The DE packet owner: firmware admission + envelope permission,
-/// plus the installed link, the MAC/PHY mode, and the TX-report
-/// sequence counter.
+/// plus the installed link and MAC/PHY mode. The compatibility report
+/// sequence is software metadata, unused by the actual descriptor path.
 #[derive(Debug)]
 pub struct Owner {
     /// Firmware download result (proof of admission).
@@ -300,8 +301,8 @@ pub struct Owner {
     /// MAC/PHY mode (for the dual-MAC MCS7 short-GI rule; bound
     /// by the radio owner, defaulting to single-MAC).
     mode: MacPhyMode,
-    /// `rtlpriv->tx_report` sequence counter
-    /// (`rtl_get_tx_report_sn`: `(++sn & 0x3f) << 2`).
+    /// Compatibility-only software sequence; never placed in a DE
+    /// descriptor or used as an acknowledgement.
     report_sn: u16,
 }
 
@@ -367,9 +368,9 @@ impl Owner {
         self.link = Some(link);
     }
 
-    /// Next TX-report sequence (`rtl_get_tx_report_sn`):
-    /// `(++sn & 0x3f) << 2`. `SW_DEFINE` bits 11:8 and 1:0 stay
-    /// zero (reserved for driver padding and firmware).
+    /// Compatibility software sequence (`(++sn & 0x3f) << 2`).
+    /// This emits no request and supplies no hardware/ACK receipt;
+    /// `fill_tx_slot` never consumes or advances it.
     pub fn next_report_sn(&mut self) -> u16 {
         self.report_sn = self.report_sn.wrapping_add(1);
         (self.report_sn & 0x3f) << 2
@@ -388,8 +389,8 @@ impl Owner {
     /// any descriptor byte is written when admission fails or the
     /// length is invalid. OWN is left clear: the caller publishes
     /// the slot after the payload buffer is visible, and sets the
-    /// ring link from `tx.next_desc` (written here). Takes `&mut`
-    /// for the TX-report sequence counter.
+    /// ring link from `tx.next_desc` (written here). The existing `&mut`
+    /// signature is retained; no report sequence is advanced.
     pub fn fill_tx_slot(&mut self, slot: &mut TxDesc, tx: &TxFrame) -> Result<(), Error> {
         self.admit_tx(tx.op, tx.rate)?;
         if tx.len == 0 || tx.len > 0xffff {
@@ -428,11 +429,6 @@ impl Owner {
         // `useramask` is always set on this chip, so the rule is the
         // identity (kept explicit: the `0x0c +` offset never applies).
         let (rate_id, mac_id) = trx::rate_id_macid(true, rate_id, mac_id);
-        let (spe_rpt, sw_define) = if wants_tx_report(tx.eapol, tx.nullfunc) {
-            (true, self.next_report_sn())
-        } else {
-            (false, 0)
-        };
         *slot = TxDesc::fill(&TxParams {
             pkt_size: tx.len as u16,
             queue_sel: tx.class.queue_sel(),
@@ -464,8 +460,8 @@ impl Owner {
             dual_mac_dual_phy: self.mode == MacPhyMode::DualMacDualPhy,
             fwctrl_lps: self.link.map(|link| link.fwctrl_lps).unwrap_or(false),
             rdg_en: tx.rdg_en,
-            spe_rpt,
-            sw_define,
+            spe_rpt: false,
+            sw_define: 0,
         });
         slot.set_next(tx.next_desc);
         Ok(())

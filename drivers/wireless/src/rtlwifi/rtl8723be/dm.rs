@@ -22,12 +22,10 @@
 //! CCK PD, **RA mask refresh**, EDCA turbo, ATC switch, TX-power tracking,
 //! dynamic TX power (empty in Linux). This profile composes the common
 //! info, false-alarm statistics, RSSI monitor, DIG, dynamic EDCCA, CCK PD
-//! and RA mask refresh steps, plus the ATC switch's unlinked branch and
-//! the (empty) dynamic-TX-power step. Not composed, with the reason in the
-//! step's note: EDCA turbo (no unicast byte counters in the retained
-//! owner), the ATC switch's linked branch (no CFO / packet count in the
-//! retained RX path), TX-power tracking (no RF register read/write helper
-//! and no swing-table port in tree). The retained watchdog only invokes
+//! and RA mask refresh steps, EDCA turbo, both ATC branches and
+//! the (empty) dynamic-TX-power step. Explicit NBTH-qualified tracking now
+//! occupies the source thermal slot through tracking_packet.rs, with its own
+//! BBSWING/LCK/IQK program; ordinary NAPC never enables it. The retained watchdog only invokes
 //! these steps when linked (the `station.rs` gate, as for RTL8192CE), so
 //! the unlinked branches run in fixtures, not in production.
 
@@ -35,6 +33,8 @@ use super::super::rate_adaptive::{rx_power_percentage, STA_HIGH, STA_LOW, STA_MI
 use super::{mac, phy};
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;
+
+pub(crate) mod edca;
 
 /// `DM_DIG_FA_TH0/TH1/TH2` (`rtl8723be/dm.h`).
 pub const DM_DIG_FA_TH0: u32 = 0x200;
@@ -104,8 +104,15 @@ pub struct Dm {
     pub pre_edcca_enable: bool,
     /// `rtldm->crystal_cap` (`dm_init_dynamic_atc_switch` input).
     pub crystal_cap: u8,
+    /// Factory cap captured before the first tracking adjustment.
+    pub default_crystal_cap: u8,
     /// `rtldm->atc_status` (`dm_init_dynamic_atc_switch` input).
     pub atc_status: u8,
+    pub cfo_threshold: i32,
+    pub cfo_ave_pre: i32,
+    pub packet_count_pre: u32,
+    pub large_cfo_hit: bool,
+    pub is_freeze: bool,
     /// `dm->useramask` (`DM_TYPE_BYDRIVER` ⇒ true; driver RA).
     pub useramask: bool,
 }
@@ -137,7 +144,13 @@ impl Dm {
             one_entry_only: false,
             pre_edcca_enable: false,
             crystal_cap,
+            default_crystal_cap: crystal_cap,
             atc_status,
+            cfo_threshold: 10,
+            cfo_ave_pre: 0,
+            packet_count_pre: 0,
+            large_cfo_hit: false,
+            is_freeze: false,
             useramask: true,
         })
     }
@@ -421,9 +434,8 @@ pub fn cck_packet_detection_thresh(
 /// `REG_MAC_PHY_CTRL` field the PHY init programmed from efuse — is
 /// compared against a fresh read of that field instead. The only writer
 /// of the field in the retained driver is this step, so the two
-/// comparisons coincide. The linked branch needs `cfo_tail` and
-/// `packet_count` from the RX PHY status, which the retained RX path
-/// does not parse: it is not composed (see the module note).
+/// comparisons coincide before tracking. After tracking the saved
+/// default restores the factory cap rather than the last adjustment.
 pub fn atc_switch_unlinked(io: &impl Io, dm: &mut Dm, bt_disabled: bool) -> Result<(), Error> {
     if dm.atc_status == ATC_STATUS_OFF {
         mac::set_bbreg(io, ROFDM1_CFOTRACKING, 1 << 11, u32::from(ATC_STATUS_ON))?;
@@ -433,9 +445,92 @@ pub fn atc_switch_unlinked(io: &impl Io, dm: &mut Dm, bt_disabled: bool) -> Resu
         return Ok(());
     }
     let live = (phy::get_bb(io, REG_MAC_PHY_CTRL, 0xFFF000)? & 0x3f) as u8;
-    if dm.crystal_cap != live {
-        let cap = u32::from(dm.crystal_cap & 0x3f);
+    if dm.crystal_cap != dm.default_crystal_cap || dm.default_crystal_cap != live {
+        dm.crystal_cap = dm.default_crystal_cap;
+        let cap = u32::from(dm.default_crystal_cap & 0x3f);
         mac::set_bbreg(io, REG_MAC_PHY_CTRL, 0xFFF000, cap | (cap << 6))?;
+    }
+    Ok(())
+}
+
+/// `trx.c::_rtl8723be_query_rxphystatus` CFO state. Keep it outside the
+/// lazily initialized watchdog so the first RX samples are not lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Cfo {
+    pub tail: [i8; 2],
+    pub packet_count: u32,
+}
+
+impl Cfo {
+    /// Only error-free non-CCK frames matching the programmed BSSID
+    /// contribute. RXD error gates are applied by the native caller.
+    pub(crate) fn observe(&mut self, phy: &[u8], frame: &[u8], bssid: [u8; 6], cck: bool) {
+        if cck || frame.len() < 24 || bssid == [0; 6] {
+            return;
+        }
+        let fc = u16::from_le_bytes([frame[0], frame[1]]);
+        if fc & 0x0c == 0x04 {
+            return;
+        }
+        let address = if fc & 0x0100 != 0 {
+            4
+        } else if fc & 0x0200 != 0 {
+            10
+        } else {
+            16
+        };
+        if frame[address..address + 6] != bssid {
+            return;
+        }
+        let Some(tails) = phy.get(9..11) else {
+            return;
+        };
+        self.tail = [tails[0] as i8, tails[1] as i8];
+        self.packet_count = self.packet_count.wrapping_add(1);
+    }
+}
+
+/// Linked `rtl8723be_dm_dynamic_atc_switch` for the admitted RF_1T1R
+/// profile: signed path-A CFO in 3125/1280 kHz units, one-cycle large
+/// jump filter, 10/20 kHz crystal hysteresis, 0..63 cap and strict
+/// (-80, 80) kHz ATC-disable window (`dm.c`, `dm.h`).
+pub(crate) fn atc_switch_linked(io: &impl Io, dm: &mut Dm, cfo: &Cfo) -> Result<(), Error> {
+    if cfo.packet_count == dm.packet_count_pre {
+        return Ok(());
+    }
+    dm.packet_count_pre = cfo.packet_count;
+    let average = i32::from(cfo.tail[0]) * 3125 / 1280;
+    if (dm.cfo_ave_pre - average).abs() > 20 && !dm.large_cfo_hit {
+        dm.large_cfo_hit = true;
+        return Ok(());
+    }
+    dm.large_cfo_hit = false;
+    dm.cfo_ave_pre = average;
+    if (-dm.cfo_threshold..=dm.cfo_threshold).contains(&average) && !dm.is_freeze {
+        if dm.cfo_threshold == 10 {
+            dm.cfo_threshold = 20;
+            dm.is_freeze = true;
+        } else {
+            dm.cfo_threshold = 10;
+        }
+    }
+    let adjustment = if average > dm.cfo_threshold && dm.crystal_cap < 63 {
+        ((average - 10) >> 1) + 1
+    } else if average < -dm.cfo_threshold && dm.crystal_cap > 0 {
+        ((average + 10) >> 1) - 1
+    } else {
+        0
+    };
+    if adjustment != 0 {
+        dm.is_freeze = false;
+        let cap = (i32::from(dm.crystal_cap) + adjustment).clamp(0, 63) as u8;
+        mac::set_bbreg(io, REG_MAC_PHY_CTRL, 0xFFF000, u32::from(cap) * 0x41)?;
+        dm.crystal_cap = cap;
+    }
+    let atc = u8::from(!(-79..=79).contains(&average));
+    if dm.atc_status != atc {
+        mac::set_bbreg(io, ROFDM1_CFOTRACKING, 1 << 11, u32::from(atc))?;
+        dm.atc_status = atc;
     }
     Ok(())
 }

@@ -1,19 +1,11 @@
-//! gSPI host-interface codec for the CYW43439.
-//!
-//! Reference: **CYW43439 datasheet Rev. 03 §6.4 ("gSPI host-interface
-//! protocol")**. The chip exposes a single-function variant of the
-//! SDIO interface for hosts that lack an SDIO controller — the
-//! Raspberry Pi Pico-W use case. Every gSPI transaction begins with
-//! a 32-bit *command word* sent MSB-first; the chip then either
-//! consumes (write) or supplies (read) the requested payload.
-//!
-//! Permissively-licensed cross-checks: `soypat/cyw43439` (MIT) and
-//! Embassy `cyw43` (Apache-2.0 / MIT). **No GPL `brcmfmac` /
-//! `bcmdhd` source consulted.**
+//! CYW43439 command codec, Infineon 002-30348 Rev. *D §4.2.
+//! Normal raw commands and integer payloads are little endian. Bootstrap
+//! swaps bytes within each 16-bit word; RAM/SDPCM bytes stay unchanged.
+//! Cross-check: MIT cyw43-driver fa9627e6076c61b58632289a36fcab4811f32c3a.
 
 use core::fmt;
 
-/// gSPI access function (datasheet §6.4 Table 6-2).
+/// gSPI access function (datasheet §4.2 Table 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Function {
@@ -54,14 +46,14 @@ impl From<super::transport::Function> for Function {
     }
 }
 
-/// Direction bit of the command word (datasheet §6.4 Figure 6-2).
+/// Direction bit of the command word (datasheet §4.2 Figure 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Read,
     Write,
 }
 
-/// Address-increment policy for the access (datasheet §6.4).
+/// Address-increment policy for the access (datasheet §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrMode {
     /// Address is held constant for every byte of the burst (FIFO
@@ -72,15 +64,16 @@ pub enum AddrMode {
 }
 
 /// Maximum payload length encoded in a single gSPI command word.
-/// 11 address-length bits → 2047 bytes (datasheet §6.4 Table 6-3).
-pub const MAX_LEN: u16 = 0x7FF;
+/// The zero length field encodes 2048 bytes. F1 separately limits bursts to 64.
+pub const MAX_LEN: u16 = 2048;
+const LENGTH_MASK: u32 = 0x7ff;
 
-/// Address mask: 17 bits per datasheet §6.4 Table 6-3.
+/// Address mask: 17 bits per datasheet §4.2 Table 5.
 pub const ADDR_MASK: u32 = 0x1FFFF;
 
 /// 32-bit gSPI command word.
 ///
-/// Layout (MSB → LSB), per datasheet §6.4 Figure 6-2:
+/// Layout (MSB → LSB), per datasheet §4.2 Figure 10:
 ///
 /// ```text
 ///  31    30    29-28  27-11      10-0
@@ -108,7 +101,7 @@ pub struct CommandWord {
 pub enum CommandError {
     /// Address exceeds the 17-bit field.
     AddressOverflow,
-    /// Length exceeds the 11-bit field (max 2047 bytes).
+    /// Length is zero or exceeds 2048 bytes.
     LengthOverflow,
 }
 
@@ -116,7 +109,7 @@ impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CommandError::AddressOverflow => f.write_str("gSPI address > 17 bits"),
-            CommandError::LengthOverflow => f.write_str("gSPI length > 11 bits"),
+            CommandError::LengthOverflow => f.write_str("gSPI length outside 1..=2048"),
         }
     }
 }
@@ -143,7 +136,7 @@ impl CommandWord {
         if address & !ADDR_MASK != 0 {
             return Err(CommandError::AddressOverflow);
         }
-        if u32::from(length) > u32::from(MAX_LEN) {
+        if length == 0 || length > MAX_LEN {
             return Err(CommandError::LengthOverflow);
         }
         Ok(Self {
@@ -168,7 +161,7 @@ impl CommandWord {
         };
         let fn_bits: u32 = u32::from(self.function.as_u8()) & 0b11;
         let addr_bits: u32 = self.address & ADDR_MASK;
-        let len_bits: u32 = u32::from(self.length) & u32::from(MAX_LEN);
+        let len_bits: u32 = u32::from(self.length) & LENGTH_MASK;
         (rw << 31) | (ai << 30) | (fn_bits << 28) | (addr_bits << 11) | len_bits
     }
 
@@ -187,7 +180,12 @@ impl CommandWord {
         // Function field is 2 bits; from_u8 always succeeds for that mask.
         let function = Function::from_u8(((word >> 28) & 0b11) as u8).unwrap_or(Function::Bus);
         let address = (word >> 11) & ADDR_MASK;
-        let length = (word & u32::from(MAX_LEN)) as u16;
+        let encoded_length = (word & LENGTH_MASK) as u16;
+        let length = if encoded_length == 0 {
+            MAX_LEN
+        } else {
+            encoded_length
+        };
         Self {
             direction,
             addr_mode,
@@ -198,21 +196,23 @@ impl CommandWord {
     }
 }
 
-// ── Bus-control register addresses (datasheet §6.4 Table 6-5) ─────
+// ── Bus-control register addresses (datasheet §4.2 Table 6) ─────
 
-/// gSPI bus setup / endianness control (datasheet §6.4 Table 6-5).
+/// gSPI bus setup / endianness control (datasheet §4.2 Table 6).
 pub const REG_BUS_CTRL: u32 = 0x0000;
-/// gSPI bus response delay (datasheet §6.4 Table 6-5).
-pub const REG_RESPONSE_DELAY_F0: u32 = 0x0001;
-/// gSPI status register (datasheet §6.4 Table 6-5). Sampled by the
-/// host after every transaction to detect overflows / underflows.
+/// gSPI bus response delay (datasheet §4.2 Table 6).
+pub const REG_RESPONSE_DELAY_F0: u32 = 0x001c;
+/// Individual F1 read response delay.
+pub const REG_RESPONSE_DELAY_F1: u32 = 0x001d;
+/// gSPI status register (datasheet §4.2 Table 6). Read explicitly;
+/// the source profile disables automatic status trailers.
 pub const REG_STATUS: u32 = 0x0008;
 /// gSPI test read register — pre-initialised by silicon to a fixed
 /// value the host uses to confirm endianness selection (datasheet
-/// §6.4 Table 6-5). The factory default value is `0xFEEDBEAD`.
+/// §6.4 Table 6). The factory default value is `0xFEEDBEAD`.
 pub const REG_TEST_RO: u32 = 0x0014;
 /// Factory pattern returned in `REG_TEST_RO` when the host has the
-/// gSPI byte-order configured correctly (datasheet §6.4 Table 6-5).
+/// gSPI byte-order configured correctly (datasheet §4.2 Table 6).
 pub const TEST_RO_PATTERN: u32 = 0xFEED_BEAD;
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -284,5 +284,30 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/cyw43439/gspi",
         smoke_gspi_cmd_word_validation
+    );
+
+    fn smoke_gspi_zero_field_encodes_2048_not_empty() -> TestResult {
+        let cmd = CommandWord::new(
+            Direction::Write,
+            AddrMode::Increment,
+            Function::Wlan,
+            0,
+            2048,
+        )
+        .unwrap();
+        if cmd.encode().to_le_bytes() != [0, 0, 0, 0xe0]
+            || CommandWord::decode(0xe0000000).length != 2048
+            || !matches!(
+                CommandWord::new(Direction::Read, AddrMode::Increment, Function::Wlan, 0, 0),
+                Err(CommandError::LengthOverflow)
+            )
+        {
+            return TestResult::Fail("zero length field confused with an empty transaction");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/gspi",
+        smoke_gspi_zero_field_encodes_2048_not_empty
     );
 }

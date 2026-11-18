@@ -15,11 +15,11 @@ use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     address: u64,
     bytes: Arc<IrqSafeSpinLock<Vec<u8>>>,
 }
@@ -65,18 +65,26 @@ struct Model {
     writes: Vec<(u8, u16, u32)>,
     kicks: Vec<u16>,
     master: bool,
+    events: Vec<(bool, u16)>,
+    yield_delay: bool,
     next: u64,
+    deny: bool,
+    fail_write32: Option<u16>,
 }
 #[derive(Clone)]
-struct BePort(Arc<IrqSafeSpinLock<Model>>);
+pub(crate) struct BePort(Arc<IrqSafeSpinLock<Model>>);
 impl BePort {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(IrqSafeSpinLock::new(Model {
             regs: vec![0; 0x1000],
             writes: Vec::new(),
             kicks: Vec::new(),
             master: false,
+            events: Vec::new(),
+            yield_delay: false,
             next: 0x10_0000,
+            deny: false,
+            fail_write32: None,
         })))
     }
     fn block(&self, bytes: usize) -> Block {
@@ -114,13 +122,22 @@ impl BePort {
 #[async_trait::async_trait]
 impl Io for BePort {
     fn read8(&self, reg: u16) -> Result<u8, AccessError> {
+        if self.0.lock().deny {
+            return Err(AccessError::Access);
+        }
         Ok(self.reg8(reg))
     }
     fn read32(&self, reg: u16) -> Result<u32, AccessError> {
+        if self.0.lock().deny {
+            return Err(AccessError::Access);
+        }
         Ok(self.reg32(reg))
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny {
+            return Err(AccessError::Access);
+        }
         // The modelled firmware takes every H2C box at once and reports
         // BCN_VALID for every reserved-page upload.
         m.regs[usize::from(reg)] = match reg {
@@ -128,26 +145,49 @@ impl Io for BePort {
             _ => value,
         };
         m.writes.push((1, reg, value.into()));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny {
+            return Err(AccessError::Access);
+        }
         let r = usize::from(reg);
         m.regs[r..r + 2].copy_from_slice(&value.to_le_bytes());
         m.writes.push((2, reg, value.into()));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
         let mut m = self.0.lock();
+        if m.deny || m.fail_write32 == Some(reg) {
+            return Err(AccessError::Access);
+        }
         let r = usize::from(reg);
         m.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
         m.writes.push((4, reg, value));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), AccessError> {
         Err(AccessError::Access)
     }
-    async fn delay_us(&self, _micros: u64) {}
+    async fn delay_us(&self, _micros: u64) {
+        let yield_delay = self.0.lock().yield_delay;
+        if yield_delay {
+            let mut first = true;
+            core::future::poll_fn(|cx| {
+                if core::mem::take(&mut first) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+        }
+    }
 }
 impl Port for BePort {
     type Buffer = Block;
@@ -156,6 +196,9 @@ impl Port for BePort {
         _active: bool,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
+        if self.0.lock().deny {
+            return Err(Error::State);
+        }
         operation()
     }
     fn allocate_packet(&self, bytes: usize) -> Result<Block, Error> {
@@ -166,7 +209,9 @@ impl Port for BePort {
         Ok(())
     }
     fn kick(&self, queue_bit: u16) -> Result<(), Error> {
-        self.0.lock().kicks.push(queue_bit);
+        let mut model = self.0.lock();
+        model.kicks.push(queue_bit);
+        model.events.push((true, queue_bit));
         Ok(())
     }
 }
@@ -271,6 +316,35 @@ fn owner40() -> Option<(Prepared<BePort, Block>, BePort)> {
     owner_with(true)
 }
 
+pub(crate) fn station_fixture() -> Option<(Prepared<BePort, Block>, BePort)> {
+    let (mut owner, port) = owner()?;
+    let factory = be::be_factory();
+    let fixture = be::be_napc_fixture(1, 0, 80, &[(6, 20, 0, be::be_rising)]);
+    let cal = envelope::Calibration::from_verified(&fixture, Some([0xab; 32]), &factory).ok()?;
+    owner
+        .stage_rtl8723be_calibration(cal, &be::be_us_domain())
+        .ok()?;
+    owner.start_packets().ok()?;
+    run(owner.prepare_station_peer(PEER, 0xfff, 0x15, 0x421)).ok()?;
+    Some((owner, port))
+}
+impl BePort {
+    pub(crate) fn special_events(&self) -> Vec<(bool, u16)> {
+        self.0.lock().events.clone()
+    }
+    pub(crate) fn stall_special(&self) {
+        let mut model = self.0.lock();
+        model.regs[0x1cc] = 0xff;
+        model.yield_delay = true;
+    }
+    pub(crate) fn deny_special(&self) {
+        self.0.lock().deny = true;
+    }
+}
+
+#[path = "packet_owner_tests/edca.rs"]
+mod edca;
+
 fn tx_word(owner: &Prepared<BePort, Block>, queue: usize, slot: usize, word: usize) -> u32 {
     owner.tx[queue].read32(slot * 64 + word * 4).unwrap()
 }
@@ -372,6 +446,70 @@ fn smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx() -> TestResult
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx
+);
+
+/// Use the production queue, rather than a fake with already separate
+/// arrivals/deferred storage: a non-MP report cannot re-enter its own wait.
+fn smoke_rtl8723be_real_c2h_queue_mp_deferral_and_timeout() -> TestResult {
+    use super::super::super::super::rtl8723be::{
+        btc::{BtMpSource, C2hSource, RxBtMp, C2H_MAX},
+        c2h,
+        packet::C2hQueue,
+    };
+    let Some((_, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    let info = [c2h::C2H_BT_INFO, 0, 0, 7, 0, 0, 0];
+    let report = [c2h::C2H_TX_REPORT, 0, 0, 0, 2, 0, 0, 0, 4];
+    let mp = [c2h::C2H_BT_MP, 0, 1, 0, 0xe0, 0x34, 0x12, 7];
+    let mut queue = C2hQueue::default();
+    queue.push(&info);
+    queue.push(&report);
+    let mut bytes = [0; C2H_MAX];
+    for expected in [&info[..], &report[..]] {
+        if queue.poll_c2h(&mut bytes) != Ok(Some(expected.len()))
+            || &bytes[..expected.len()] != expected
+        {
+            return TestResult::Fail("fresh arrival order");
+        }
+        if queue.defer_c2h(expected).is_err() {
+            return TestResult::Fail("defer");
+        }
+    }
+    if queue.poll_c2h(&mut bytes) != Ok(None) || queue.len() != 2 {
+        return TestResult::Fail("deferred packet re-enters the same MP wait");
+    }
+    if run(RxBtMp {
+        io: &port,
+        source: &mut queue,
+    }
+    .next_bt_mp(1))
+        != Ok(None)
+    {
+        return TestResult::Fail("real queue MP timeout");
+    }
+    queue.push(&mp);
+    let got = run(RxBtMp {
+        io: &port,
+        source: &mut queue,
+    }
+    .next_bt_mp(1));
+    if !matches!(got, Ok(Some(value)) if value.body() == &mp[2..]) {
+        return TestResult::Fail("fresh MP bypasses deferred non-MP work");
+    }
+    for expected in [&info[..], &report[..]] {
+        if !matches!(queue.pop(), Some((n, bytes)) if &bytes[..n] == expected) {
+            return TestResult::Fail("deferred reports delivered exactly once in order");
+        }
+    }
+    if !queue.is_empty() {
+        return TestResult::Fail("duplicate report");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_real_c2h_queue_mp_deferral_and_timeout
 );
 
 /// Authentication-time registers, the association `JOINBSSRPT`
@@ -761,4 +899,167 @@ fn smoke_rtl8723be_dm_watchdog_linked_refresh() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_dm_watchdog_linked_refresh
+);
+
+/// Literal PHY-report offsets and 802.11 BSSID selection from trx.c.
+fn smoke_rtl8723be_cfo_samples_match_bssid_and_phy() -> TestResult {
+    let mut cfo = dm::Cfo::default();
+    let mut phy = [0; 16];
+    phy[9] = 0xf8; // signed -8, not 248
+    phy[10] = 7;
+    let mut frame = [0; 24];
+    frame[0] = 0x80;
+    frame[16..22].copy_from_slice(&PEER);
+    cfo.observe(&phy, &frame, PEER, true);
+    cfo.observe(&phy[..10], &frame, PEER, false);
+    cfo.observe(&phy, &frame[..23], PEER, false);
+    cfo.observe(&phy, &frame, [0; 6], false);
+    cfo.observe(&phy, &frame, [2; 6], false);
+    kt_assert_eq!(cfo.packet_count, 0);
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.tail, [-8, 7]);
+    kt_assert_eq!(cfo.packet_count, 1);
+    // FromDS picks A2, ToDS picks A1 (also for a four-address frame).
+    frame[0] = 0x08;
+    frame[1] = 2;
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.packet_count, 1);
+    frame[10..16].copy_from_slice(&PEER);
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.packet_count, 2);
+    frame[1] = 3;
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.packet_count, 2);
+    frame[4..10].copy_from_slice(&PEER);
+    cfo.packet_count = u32::MAX;
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.packet_count, 0);
+    frame[0] = 0x04;
+    cfo.observe(&phy, &frame, PEER, false);
+    kt_assert_eq!(cfo.packet_count, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_cfo_samples_match_bssid_and_phy
+);
+
+/// Fixed source examples: 8 -> 19 kHz -> +5 caps; extreme signed
+/// offsets need two samples and clamp at 0/63. No fresh RX means no I/O.
+fn smoke_rtl8723be_linked_atc_hysteresis_clamps_and_restore() -> TestResult {
+    let port = BePort::new();
+    port.set32(dm::REG_MAC_PHY_CTRL, 0x20 << 12);
+    let mut state = dm::Dm::init(&port).unwrap();
+    let mut cfo = dm::Cfo {
+        tail: [8, -128],
+        packet_count: 1,
+    };
+    kt_assert!(dm::atc_switch_linked(&port, &mut state, &cfo).is_ok());
+    kt_assert_eq!(state.crystal_cap, 37);
+    kt_assert_eq!(port.reg32(dm::REG_MAC_PHY_CTRL) & 0xfff000, 0x965000);
+    cfo.tail[0] = 127;
+    let before = port.0.lock().writes.len();
+    kt_assert!(dm::atc_switch_linked(&port, &mut state, &cfo).is_ok());
+    kt_assert_eq!(port.0.lock().writes.len(), before);
+    for (tail, cap, atc) in [(127, 63, 1), (-128, 0, 1), (0, 0, 0)] {
+        cfo.tail[0] = tail;
+        cfo.packet_count += 1;
+        let old_cap = state.crystal_cap;
+        kt_assert!(dm::atc_switch_linked(&port, &mut state, &cfo).is_ok());
+        kt_assert!(state.large_cfo_hit);
+        kt_assert_eq!(state.crystal_cap, old_cap);
+        cfo.packet_count += 1;
+        kt_assert!(dm::atc_switch_linked(&port, &mut state, &cfo).is_ok());
+        kt_assert!(!state.large_cfo_hit);
+        kt_assert_eq!(state.crystal_cap, cap);
+        kt_assert_eq!(state.atc_status, atc);
+    }
+    kt_assert_eq!(state.cfo_threshold, 20);
+    kt_assert!(state.is_freeze);
+    // BT coexistence holds the adjusted cap; BT-disabled restores efuse.
+    kt_assert!(dm::atc_switch_unlinked(&port, &mut state, false).is_ok());
+    kt_assert_eq!(state.crystal_cap, 0);
+    kt_assert!(dm::atc_switch_unlinked(&port, &mut state, true).is_ok());
+    kt_assert_eq!(state.crystal_cap, 32);
+    kt_assert_eq!(port.reg32(dm::REG_MAC_PHY_CTRL) & 0xfff000, 0x820000);
+    // 32/33 PHY units truncate to 78/80 kHz: the source window is
+    // strict at both +/-80, including the negative division boundary.
+    for (tail, atc) in [(32, 0), (33, 1), (-32, 0), (-33, 1)] {
+        cfo.tail[0] = tail;
+        for _ in 0..2 {
+            cfo.packet_count += 1;
+            kt_assert!(dm::atc_switch_linked(&port, &mut state, &cfo).is_ok());
+        }
+        kt_assert_eq!(state.atc_status, atc);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_linked_atc_hysteresis_clamps_and_restore
+);
+
+/// The original native DMA owner must retain PHY samples before the
+/// first watchdog initialization, reject error/foreign-BSSID reports,
+/// and consume each sample just once through the linked watchdog.
+fn smoke_rtl8723be_native_rx_drives_linked_atc() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    port.set8(hw::REG_BCN_PSR_RPT + 1, 0xc0);
+    if owner.start_packets().is_err()
+        || run(owner.prepare_station_peer(PEER, 0x0fff, 0x0015, 0x0421)).is_err()
+        || run(owner.complete_station_peer(PEER, 5)).is_err()
+        || run(owner.install_rtl8723be_rate_mask(
+            h2c::Peer {
+                legacy: 0x0fff,
+                ht: None,
+                sgi20: false,
+                sgi40: false,
+            },
+            false,
+            0,
+        ))
+        .is_err()
+    {
+        return TestResult::Fail("linked owner");
+    }
+    port.set32(dm::REG_MAC_PHY_CTRL, 0x20 << 12);
+    // No payload is sent to hardware: DMA blocks hold literal RXD/PHY
+    // bytes. One CRC-error and one foreign beacon cannot train the CFO.
+    for (bssid, crc) in [([2; 6], false), (PEER, true), (PEER, false)] {
+        let slot = owner.packet.receive;
+        let mut payload = [0; 44]; // PHY16 + beacon24 + FCS4
+        payload[4] = 140;
+        payload[9] = 8;
+        payload[10] = 0x80; // path B is not used by RF_1T1R
+        payload[16] = 0x80;
+        payload[20..26].fill(0xff);
+        payload[26..32].copy_from_slice(&bssid);
+        payload[32..38].copy_from_slice(&bssid);
+        owner.buffers[slot].write_bytes(0, &payload).unwrap();
+        let ring = owner.receive.as_mut().unwrap();
+        let eor = if slot + 1 == owner.depth { 1 << 30 } else { 0 };
+        ring.write32(
+            slot * 32,
+            28 | (2 << 16) | (1 << 26) | (u32::from(crc) << 14) | eor,
+        )
+        .unwrap();
+        ring.write32(slot * 32 + 12, 4).unwrap(); // OFDM 6 Mbps
+        kt_assert!(owner.poll_receive_step().is_ok());
+        kt_assert_eq!(
+            owner.packet.be8723.cfo.packet_count,
+            u32::from(bssid == PEER && !crc)
+        );
+    }
+    kt_assert!(owner.packet.be8723.dm.is_none());
+    kt_assert!(run(owner.rtl8723be_dm_watchdog(40, 1000)).is_ok());
+    kt_assert_eq!(owner.packet.be8723.dm.as_ref().unwrap().crystal_cap, 37);
+    kt_assert!(run(owner.rtl8723be_dm_watchdog(40, 2000)).is_ok());
+    kt_assert_eq!(owner.packet.be8723.dm.as_ref().unwrap().crystal_cap, 37);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_native_rx_drives_linked_atc
 );

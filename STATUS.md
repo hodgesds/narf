@@ -172,6 +172,120 @@ validation remain required. The initial software paths are
 implemented; broader chip/PHY/feature/lifecycle coverage remains required before
 the branch target is met.
 
+The 2026-11-16 remaining-row continuation starts from `4daa0b5a9` after
+checking open PRs for overlap. It adds a retained IPQ6018
+WLFW-to-core conversation and RTL8723BE native CFO/linked-ATC handling,
+and reconciles delivered chip work against the TSV. AR9580's initial
+signed legacy20 owner moves to implementation pending validation;
+broader radio profiles and physical acceptance remain open. The family
+specs and TSV retain the actual residuals, including MCI traffic/RSSI/power
+feedback, A/BE channel/station composition and platform host ports.
+IPQ6018 also moves to pending validation after the composed native
+conversation passes. The ledgers now hold 13 open rows and 94 implemented
+pending validation.
+The same branch now also applies AR9462/AR9565 profile GPMs through live
+MCI duty deadlines in the existing async worker, including weight/priorities,
+5 GHz suppression and reset/WoW/stop cancellation. Native regression tests
+exercise both chips' literal timer/weight images and failed-access handling.
+Large ath11k runtime/netdev and Gen2 station construction state moves off
+callers' stacks; AHB bring-up/recovery and the Qualcomm fixture runner
+retain their futures on the heap. Six reported Wi-Fi/SoC stack-budget
+failures are resolved and five obsolete exceptions are removed, with no
+budget increases. The expanded suites pass 563/0/2 on x86_64 (diagnostic
+QEMU) and 563/0/3 on aarch64; the full aarch64 ath9k suite also passes
+317/0/0. Scoped strict release clippy and debug checks pass on both
+architectures, and formatting passes. The earlier normal x86_64 launch
+was blocked only by the GPU RS64 frame overage from PR #2164. That fix
+has since merged; this branch is rebased onto `8b34296a0` without
+duplicating it. The final normal x86_64 gate passes 563/0/2, its stack
+budget check, production boot and both btrfs postflight checks; scoped
+strict clippy, debug checking and formatting also pass. The aarch64
+repeat after rebasing was skipped at the user's request; the preceding
+aarch64 results above are retained. Physical acceptance remains pending.
+
+The next same-branch continuation composes RTL8723BE EDCA turbo with
+native unicast byte accounting, bounded associated-beacon vendor
+recognition and source Cisco/default contention values. It also makes a
+failed lazy DM initialization terminal. Four native regressions cover the
+policy, recognition, RX/TX-to-watchdog path and access failures; all four
+pass in x86 QEMU. The release kernel and stack gate, strict release clippy,
+debug checking and formatting pass. The broader rtlwifi run exposed stale
+RTL8192DE HT capability/timing expectations; their final width-filtered
+correction is included in the combined checkpoint below. A full wireless attempt also
+found RTL8723BU and Intel P2P fixture failures and stalled in the watchdog
+work smoke; those findings are resolved in that checkpoint. Aarch64 stays
+skipped as requested. No physical acceptance is claimed.
+
+The parallel continuation now adds RTL8723AE native cold MAC/LLT ->
+firmware -> BB/RF/default setup, separate source IQK/RF6052 preparation
+owners, RTL8852A native MAC/BB/RF channel control with Programmed-only
+readiness, and AR9462/AR9565 associated-beacon audio coexistence feedback.
+The broad-run findings are addressed by the full-runtime RTL8723BU
+fixtures and hardware TX-mask validation, Intel RAM retained-stop cleanup,
+and a hermetic watchdog executor fixture. Native corrections retain exact
+Intel host-GTK/checksum, policy/client and firmware-marker owners, actual
+MediaTek peer WCIDs/GO receive epochs, RTL8852A fragment identity and
+FullMAC logical/physical response boundaries. CYW AP packets bind the
+original interface, and final RX publication invokes the SDIO source once
+while retaining peer/key epochs. Intel model fixtures use their own names
+instead of consuming the physical adapter's cached wlan reservation.
+
+The 2026-11-17 combined x86_64 gate passes **4404/0/9** (pass/fail/expected
+physical-device skip). The release kernel and stack gate, strict release
+library Clippy for wireless and MT76, debug checks and formatting pass.
+The normal production boot and both btrfs postflight checks also pass with
+persistent disk writes. Ath10k retains station Security on the heap; its
+obsolete startup exception and one obsolete RTL8xxxU probe exception are
+removed without increasing any stack budget. Aarch64 is skipped at the
+user's request. The TSV remains 13 open rows and 94 implemented pending
+validation; calibrated radio/station prerequisites and physical acceptance
+remain open.
+
+The next same-branch continuation links AR9485 canonical PCI board settings
+and a retained qualified RX antenna scanner, AR9462/AR9565 calibrated
+concurrent-power transitions, AR9462 separately qualified NETWORK_SLEEP/
+PM-control/DTIM and sleep-only FTP feedback, and RTL8723AE's original retained
+legacy20 native station/coexistence handoff under separate NASR qualification.
+RTL8723BE now has separately qualified BBSWING thermal tracking with immutable
+original IQK/BB state and terminal lifecycle restoration. RTL8821AE has distinct
+one-/two-antenna source algorithms, original RX/H2C ownership and actual native
+scan/connect/EAPOL/LPS/watchdog/stop composition under optional fresh N21C.
+RTL8723BE and full RTL8821AE special frames require their own async preflight
+before native TX. BE/DE ASPM uses each chip's actual source recipe and PCI policy.
+
+RTL8922A now retains a separately reserved, checked closed bootstrap, BE
+MAC/BB/gain/RF/C2H owners and distinct N22P partial/N22W WLAN-only complete
+radio profiles. Separate response-bound N22O inactive-ring and no-link BE
+initialization is implemented; ordinary packet/station publication remains
+closed. N22P/N22W supply no ordinary packet authority.
+CYW43439 has a coherent whole-CS gSPI protocol/loader seam, with native
+attachment closed pending its actual exclusive host and signed selection.
+RTL8852A now has source-complete initial TSSI/channel RFK, own native MAC/
+RX/LTR startup and pre-station retune dispatch under fresh N5AM/N5ABv2/N5AC.
+Live retune and incomplete periodic adapters remain closed. DE's unsupported TX-report
+bits are removed; native Null-PM/ACK and software sleep remain closed.
+
+Explicit N48D/N65D manual antenna-sharing programs now retain actual local
+coexistence-off receipts and joint ownership across old/new IRQ, DMA and
+publication paths. AR9565 uses its own local MCI shutdown and group3 scanner;
+original MCI storage remains retained without claiming remote RF or DMA stop.
+Distinct optional N46P/N48P/N65P now compose actual native counter-driven ANI
+with original NF/IQ and stable publication ownership; P and S/D combinations
+refuse before effects.
+AE additionally has a distinct NASR2 HT20/SGI20 recipient-BA/A-MSDU path and
+NASR3 complete HT20/ASPM program. Old legacy/HT20 records cannot upgrade to
+ASPM, and source descriptor completion never substitutes for on-air ACK.
+Production-only x86_64 checks pass at intermediate boundaries. New native
+regressions are authored; **all test execution is deferred until the very end
+at the user's request**. These changes are not covered by the preceding
+4404-pass checkpoint. Broader chip profiles and the exact TSV residuals remain
+open; Aarch64 stays skipped and no new physical acceptance is claimed.
+
+The current source ledger moves the delivered RTL8723BE thermal program and
+rtlwifi coexistence feature to implemented-pending-validation: **11 open rows,
+96 implemented pending validation, 107 total**. Chip rows remain open when a
+narrow qualified profile leaves broader native functionality unfinished.
+
 The first parallel feature wave adds retained API77 Intel management-queue
 ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
 eight-byte removal response), MT7921/MT7922 active scans with four directed or

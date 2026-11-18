@@ -180,11 +180,12 @@ fn smoke_rtw89_name_for_known_ids() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_name_for_known_ids);
 
-/// RTL8851BE joins B/C on the retained bootstrap (rtw8851be.c
-/// `rtw89_8851be_id_table`), so probe, cold attach, FLR binding and the
-/// remove hook all admit it; A and 8922A stay on the diagnostic probe.
+/// A/B/C/51 use their chip-specific retained startup through the same
+/// PCI match/remove fence. BE has its separate packet-closed bootstrap.
 fn smoke_rtw89_bootstrap_routes_8851be_with_b_and_c() -> TestResult {
     for did in [
+        RTL_DEV_8852AE,
+        RTL_DEV_8852AE_VT,
         RTL_DEV_8852BE,
         RTL_DEV_8852BE_ALT,
         RTL_DEV_8852CE,
@@ -194,13 +195,7 @@ fn smoke_rtw89_bootstrap_routes_8851be_with_b_and_c() -> TestResult {
             return TestResult::Fail("retained bootstrap ID routed to diagnostic probe");
         }
     }
-    for did in [
-        RTL_DEV_8852AE,
-        RTL_DEV_8852AE_VT,
-        RTL_DEV_8922AE,
-        RTL_DEV_8922AE_ALT,
-        0xb520,
-    ] {
+    for did in [RTL_DEV_8922AE, RTL_DEV_8922AE_ALT, 0xb520] {
         if super::bootstrap_did(did) {
             return TestResult::Fail("unqualified ID routed to retained bootstrap");
         }

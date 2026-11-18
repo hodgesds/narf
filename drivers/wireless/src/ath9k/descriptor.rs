@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 
 #[path = "descriptor_ps.rs"]
 mod power_save;
+pub(super) use power_save::receive_legacy_ps;
 pub(super) use power_save::{receive_ps, transmit_ps, unmark as ps_unmark};
 
 pub(super) const WORDS: usize = 24;

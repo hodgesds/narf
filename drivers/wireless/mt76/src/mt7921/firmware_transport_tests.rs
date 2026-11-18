@@ -1039,7 +1039,7 @@ impl Backend for Model {
         &mut self,
         vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
-        _wcid: u16,
+        wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.check()?;
@@ -1133,7 +1133,13 @@ impl Backend for Model {
                             _ => {}
                         }
                         let mut native = descriptor(&reply);
-                        native[4] = 1;
+                        // The reactive AP response belongs to the original
+                        // management submit's peer, not always HOME WCID1.
+                        // RXD1 WLAN_IDX is bits9:0 (connac2_mac.h).
+                        if wcid > 0x3ff {
+                            return Err(Error::Bounds);
+                        }
+                        native[4..8].copy_from_slice(&u32::from(wcid).to_le_bytes());
                         native[12..16]
                             .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         if self.tx_ba_fault == 6 {

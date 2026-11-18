@@ -400,3 +400,65 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_native_join_rsvd_page_ra_mask_and_leave
 );
+
+/// The actual retained DE ring path follows rtl8192de/trx.c:44..229,
+/// which never writes the common report request. PM=1 still refuses at
+/// the native queue gate. An ordinary Null DD only retires its exact DMA
+/// buffer and cannot authorize AP buffering agreement or radio sleep.
+fn smoke_rtl8192de_native_null_pm_refusal_and_host_dd_do_not_enter_sleep() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("native DE start");
+    }
+    let mut eapol = vec![0u8; 34];
+    eapol[0] = 0x08;
+    eapol[1] = 0x01;
+    eapol[4..10].copy_from_slice(&PEER);
+    eapol[10..16].copy_from_slice(&de::de_factory().mac);
+    eapol[16..22].copy_from_slice(&PEER);
+    eapol[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    let mut null_pm = eapol[..24].to_vec();
+    null_pm[0] = 0x48;
+    null_pm[1] = 0x11; // To-DS and PM=1 need a separately composed owner.
+    if owner.submit(&null_pm, 0) != Err(Error::Packet)
+        || owner.packet.pending.is_some()
+        || !port.0.lock().kicks.is_empty()
+    {
+        return TestResult::Fail("native DE admitted uncomposed Null-PM request");
+    }
+    null_pm[1] = 0x01; // Ordinary PM-clear Null, admitted by the existing gate.
+    for frame in [&eapol, &null_pm] {
+        let Ok(id) = owner.submit(frame, 0) else {
+            return TestResult::Fail("native DE EAPOL/ordinary Null submit");
+        };
+        let pending = owner.packet.pending.as_ref().unwrap();
+        let queue = pending.queue;
+        let slot = pending.slot;
+        let dw0 = tx_word(&owner, queue, slot, 0);
+        if tx_word(&owner, queue, slot, 2) & (1 << 19) != 0
+            || tx_word(&owner, queue, slot, 6) & 0x0fff != 0
+        {
+            return TestResult::Fail("native DE invented SPE_RPT/SW_DEFINE request");
+        }
+        owner.tx[queue].write32(slot * 64, dw0 & !OWN).unwrap();
+        match owner.poll_delivery() {
+            Ok(Some(delivery)) if delivery.id == id && delivery.bytes == *frame => {}
+            _ => return TestResult::Fail("native DE exact host DMA receipt"),
+        }
+        if run(owner.enter_leisure()).is_err()
+            || owner.leisure()
+            || owner.phase != Phase::Running
+            || port.wrote(1, 0x522, 0xff).is_some()
+            || port.wrote(1, 0x600, 0x40).is_some()
+        {
+            return TestResult::Fail("host DD became RF sleep/AP acknowledgement");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_native_null_pm_refusal_and_host_dd_do_not_enter_sleep
+);

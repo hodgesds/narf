@@ -20,7 +20,7 @@ use super::{
     security_runtime::Security,
     station_runtime::{ethernet, private_eapol},
 };
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +191,22 @@ impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
 }
 
 impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
+    /// Transfer a retained radio without materializing the station in the
+    /// caller's async poll frame. Admission and teardown remain `new`'s.
+    #[inline(never)]
+    // The box keeps the radio out of the caller's kernel stack frame.
+    #[allow(clippy::boxed_local)]
+    pub(super) fn new_boxed(
+        radio: Box<Radio<C, B>>,
+        candidate: Candidate,
+        ssid: &[u8],
+        mode: SecurityMode,
+        pmk: Option<Zeroizing<[u8; 32]>>,
+        wide: Option<gen2_radio::Grant>,
+    ) -> Result<Box<Self>, Error> {
+        Self::new(*radio, candidate, ssid, mode, pmk, wide).map(Box::new)
+    }
+
     pub fn new(
         mut radio: Radio<C, B>,
         candidate: Candidate,

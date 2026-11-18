@@ -1664,3 +1664,73 @@ kernel_test_in!(
 
 #[path = "mailbox_tests.rs"]
 mod mailbox_tests;
+
+/// Linux p2p.c sends sizeof(af_params), though msgbuf.c transmits only
+///1518 bytes. The full logical1828-byte struct has an explicit body length;
+/// its unused fixed tail is zero. Do not admit a nonzero unsent byte.
+fn smoke_brcmf_msgbuf_padded_action_input_keeps_logical_and_dma_bounds() -> TestResult {
+    let (bus, s) = model();
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("padded action attach"),
+    };
+    let mut frame = vec![0; 32];
+    frame[0] = 0xd0;
+    frame[4..10].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame[16..22].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
+    frame[24..].copy_from_slice(&[4, 9, 0x50, 0x6f, 0x9a, 9, 0, 7]);
+    let params = match super::p2p_wire::af_params(&frame, 6, 400, 9) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("padded action params"),
+    };
+    let input = match super::vif_wire::bsscfg_iovar(1, b"actframe", &params) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("padded action bsscfg"),
+    };
+    if input.len() != 1848 {
+        return TestResult::Fail("literal padded action logical extent");
+    }
+    let before = {
+        let st = s.lock();
+        (word(&st, H2DW), st.doorbells)
+    };
+    for bad in [
+        {
+            let mut bad = input.clone();
+            bad[1518] = 1;
+            bad
+        },
+        vec![0; 8193],
+    ] {
+        if !matches!(
+            owner.begin_ioctl_on(1, 263, &bad, bad.len()),
+            Err(runtime::Error::Bounds)
+        ) {
+            return TestResult::Fail("meaningful unsent/oversized input accepted");
+        }
+        let st = s.lock();
+        if (word(&st, H2DW), st.doorbells) != before || owner.is_failed() {
+            return TestResult::Fail("refused input published or poisoned unissued owner");
+        }
+    }
+    if owner.begin_ioctl_on(1, 263, &input, input.len()).is_err() {
+        return TestResult::Fail("zero-padded Linux action input refused");
+    }
+    let st = s.lock();
+    let ring = pointer(&st, RINGS + 8);
+    let request = &st.dma[&ring][16 * 40..17 * 40];
+    let address = u64::from_le_bytes(request[24..32].try_into().unwrap());
+    if request[1] != 1
+        || request[14..16] != 1518u16.to_le_bytes()
+        || request[16..18] != 1848u16.to_le_bytes()
+        || st.dma[&address].len() != 1518
+        || st.dma[&address][..1518] != input[..1518]
+    {
+        return TestResult::Fail("logical action length or bounded current DMA prefix differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_msgbuf_padded_action_input_keeps_logical_and_dma_bounds
+);

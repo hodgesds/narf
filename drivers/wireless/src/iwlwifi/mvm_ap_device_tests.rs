@@ -9,6 +9,25 @@ use narf_capabilities::Invoke;
 use narf_net::netlink_generic::DeferredReplySink;
 use narf_wireless::ap_control::ApControlAuthority;
 
+/// Private executor graph of the GO/client smokes' deferred nl80211 calls.
+/// ath11k registration models leave run/TX tasks retaining their fake DMA
+/// owners after the scripted target is gone; its immediate fake IRQ wait
+/// cannot yield a worker poll. Those tasks do not belong to this graph.
+/// Only these test entry points reset queues, before native ownership is
+/// constructed and after its fixture drops, as the watchdog smoke does.
+struct ExecutorFixture;
+impl ExecutorFixture {
+    fn new() -> Self {
+        narf_scheduler::__reset_queues_for_test();
+        Self
+    }
+}
+impl Drop for ExecutorFixture {
+    fn drop(&mut self) {
+        narf_scheduler::__reset_queues_for_test();
+    }
+}
+
 const PEER: [u8; 6] = [2, 0x77, 1, 2, 3, 4];
 const GTK: [u8; 16] = [0x71; 16];
 const IGTK: [u8; 16] = [0x72; 16];
@@ -505,6 +524,23 @@ impl Fixture {
             narf_console::Writer,
             "API77 AP actor held={held:?} model(started,beacon,peers,queues,keys,mcc)={native:?}"
         );
+        if actor.client {
+            let client = (
+                actor.client_mac,
+                actor.security.ap.phase(),
+                actor.data_added,
+                actor.m1_sent,
+                actor.security.holding(),
+                actor.security.events.last(),
+                actor.hold_phy,
+                actor.hold_m4,
+                actor.hold_close,
+            );
+            let _ = writeln!(
+                narf_console::Writer,
+                "API77 CLIENT actor(mac-stage,peer-phase,data-added,m1-sent,held-security,last-security,hold-phy,hold-m4,hold-close)={client:?}"
+            );
+        }
         for (g, c, b) in actor.commands.iter().rev().take(14).rev() {
             // Public command selectors only; never print key/nonce material.
             let selectors = matches!((*g, *c), (3, 8) | (3, 9) | (1, 8) | (1, 0x9f) | (1, 0xc8))

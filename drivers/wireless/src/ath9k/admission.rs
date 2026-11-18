@@ -421,6 +421,7 @@ impl Facts {
         if id.vendor != 0x168c
             || Chip::for_device(id.device) != Some(revision.chip)
             || prepared.frequency != frequency
+            || prepared.board_config != super::ar9003::board::Config::for_pci(id)
             || prepared.modes_index != if five { 1 } else { 4 }
             || !(1..=7).contains(&identity.rx_chainmask)
             || !(1..=7).contains(&identity.tx_chainmask)
@@ -459,7 +460,7 @@ impl Facts {
             Chip::Ar9485 => (
                 b"N48A",
                 b"NARF AR9485 N48A single-chain ar9300_eeprom legacy20 2.4GHz-only board admission v1",
-                b"ar9300_eeprom_restore_internal image; ar9485_1_1 INI modes column 4 (2G), BB pre, allmodes radio postamble, rx/tx gain by txrxgain, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
+                b"ar9300_eeprom_restore_internal image; ar9485_1_1 INI modes column 4 (2G), BB pre, allmodes radio postamble, rx/tx gain by txrxgain, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values with raw-rx-gain0 GPIO9 fallback and exact PCI CUS198/CUS230 xLNA/xatten-margin/alt-mingain inputs; BT sharing disabled; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
                 "ar9485",
             ),
         };
@@ -467,6 +468,30 @@ impl Facts {
         h.update(magic);
         h.update(label);
         h.update(recipe);
+        if matches!(revision.chip, Chip::Ar9462 | Chip::Ar9565) {
+            // Expanding the live concurrent-power program invalidates old
+            // N46A/N65A identities without changing their record layout.
+            h.update(super::ar9003::btcoex::concurrent::RECIPE);
+            h.update(&super::ar9003::btcoex::concurrent::plan(&plan, true).targets);
+        }
+        if revision.chip == Chip::Ar9485 {
+            // Revised recipe and canonical source inputs deliberately require
+            // fresh qualification; an old N48A record cannot authorize the
+            // expanded GPIO/margin program, even with the same EEPROM/PCI IDs.
+            h.update(&prepared.board_config.identity_bytes());
+            let antenna = super::ar9003::antenna::Profile::for_device(id, image)
+                .ok_or(BringUpError::BadIdentity)?;
+            h.update(super::ar9003::antenna::RECIPE);
+            h.update(super::ar9003::antenna::SOURCE_DELTAS);
+            h.update(&antenna.identity_bytes());
+        }
+        if revision.chip == Chip::Ar9565 {
+            h.update(&prepared.board_config.identity_bytes());
+            h.update(super::ar9003::antenna::AR9565_RECIPE);
+            let antenna = super::ar9003::antenna::Profile::for_device(id, image)
+                .ok_or(BringUpError::BadIdentity)?;
+            h.update(&antenna.identity_bytes());
+        }
         for v in [
             id.vendor,
             id.device,
@@ -638,8 +663,16 @@ impl Grant {
         &self,
         operation: impl FnOnce() -> Result<T, BringUpError>,
     ) -> Result<T, BringUpError> {
-        self.cap.invoke(NoopOp).map_err(|_| BringUpError::Policy)?;
-        operation()
+        struct Invoke<F>(F);
+        impl<T, F: FnOnce() -> Result<T, BringUpError>> CapOp<FirmwareBlob, Read> for Invoke<F> {
+            type Output = Result<T, BringUpError>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        self.cap
+            .invoke(Invoke(operation))
+            .map_err(|_| BringUpError::Policy)?
     }
 }
 

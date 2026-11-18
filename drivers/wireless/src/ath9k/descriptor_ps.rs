@@ -72,3 +72,16 @@ pub(in crate::ath9k) fn receive_ps(
     source.check().map_err(|_| Error::Profile)?;
     receive_inner(words, payload, Some(profile), ba, true)
 }
+/// N46S keeps the original legacy rate and size admission, admitting only
+/// its separately qualified plaintext Null response without an HT profile.
+pub(in crate::ath9k) fn receive_legacy_ps(
+    words: &[u32; WORDS],
+    payload: &[u8],
+    source: &crate::ath9k::ps::Grant,
+) -> Result<Option<Mpdu>, Error> {
+    if source.ar9003_wa().is_none() {
+        return Err(Error::Profile);
+    }
+    source.check().map_err(|_| Error::Profile)?;
+    receive_inner(words, payload, None, false, true)
+}

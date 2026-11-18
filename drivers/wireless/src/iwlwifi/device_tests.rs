@@ -36,7 +36,10 @@ impl Fixture {
         let mut phy = super::super::ht_vht::Local::from_nvm(0, 1, 1);
         phy.eht = eht;
         let device = Arc::new_cyclic(|me| Device {
-            test_name: None,
+            // Private model owners must not consume the adapter's cached
+            // production wlan-name reservation. Other families legitimately
+            // allocate a name once its test registration is removed.
+            test_name: Some(narf_net::iface::reserve_name("iwlprivate%d")),
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),
@@ -353,6 +356,13 @@ fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> T
     let fixture = Fixture::new(false);
     let device = fixture.device.as_ref().unwrap();
     let authority = Cap::<narf_net::NetIface, Grant>::bootstrap();
+    let original_tx = device.state.try_lock().unwrap().tx[1]
+        .as_ref()
+        .unwrap()
+        .__ring_ptr_for_test();
+    if device.name() == super::super::iwl_ifname() {
+        return TestResult::Fail("private publication fixture borrowed production wlan name");
+    }
     let mut called = false;
     let result = device.publish_with_registration(Some(&authority), |authority, interface| {
         called = true;
@@ -368,6 +378,15 @@ fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> T
         || device.rx.lock().is_some()
         || device.tx.iter().any(|tx| tx.lock().is_some())
         || device.state.try_lock().unwrap().producer.is_some()
+        || device.state.try_lock().unwrap().tx[1]
+            .as_ref()
+            .unwrap()
+            .__ring_ptr_for_test()
+            != original_tx
+        || narf_net::iface::lookup(device.name()).is_some()
+        || narf_wireless::registry::list()
+            .iter()
+            .any(|iface| iface.name() == device.name())
     {
         return TestResult::Fail("registry failure committed staged endpoint ownership");
     }

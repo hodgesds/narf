@@ -7,6 +7,10 @@ use super::{
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+#[path = "packet_native/ani.rs"]
+mod ar9003_ani;
+#[path = "packet_native/coex.rs"]
+mod coex;
 #[path = "packet_native/periodic.rs"]
 mod live_calibration;
 enum InstalledPower {
@@ -82,6 +86,7 @@ pub(super) enum Calibrated {
         rf_kill: Option<super::ar9003::mac::RfKill>,
         periodic: narf_lib::mutex::Mutex<super::ar9003::calib::Periodic>,
         totals: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<super::ar9003::calib::IqTotals>>,
+        antenna_profile: Option<super::ar9003::antenna::Profile>,
     },
 }
 /// Raw BAR access for the AR9287 long calibration, only inside `access`.
@@ -195,9 +200,23 @@ pub(super) struct Native {
     cap: Cap<BusDeviceCap, Write>,
     bar: MmioRegion,
     active: AtomicBool,
+    antenna: narf_lib::sync::IrqSafeSpinLock<Option<super::ar9003::antenna::Binding>>,
+    manual: alloc::sync::Arc<super::ar9003::antenna::manual::Latch>,
+    // AR9003-only retained state must not enlarge every other chip's Native
+    // construction/copy frames. Boxes retain the same original owners.
+    ani: narf_lib::sync::IrqSafeSpinLock<Option<alloc::boxed::Box<super::ar9003::ani::Owner>>>,
+    ani_expected: narf_lib::sync::IrqSafeSpinLock<Option<super::ar9003::ani::Settings>>,
+    ani_request: narf_lib::sync::OnceLock<alloc::boxed::Box<super::ar9003::ani::Request>>,
+    ar9003_plan: Option<alloc::boxed::Box<super::ar9003::power::Plan>>,
     calibrated: Calibrated,
     channel_mask: u64,
     powers: Option<InstalledPower>,
+    /// Exact mutable expectation for the two MCI calibrated power states.
+    mci_power: Option<
+        alloc::boxed::Box<
+            narf_lib::sync::IrqSafeSpinLock<super::ar9003::btcoex::concurrent::Power>,
+        >,
+    >,
     rf_silent: Option<(u8, bool)>,
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
     ht_facts: Option<super::ht::Facts>,
@@ -205,6 +224,7 @@ pub(super) struct Native {
     tx_ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::tx_ba::Grant>>>,
     qos: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::qos::Grant>>>,
     ps: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ps::Grant>>>,
+    ps_ar9003: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ar9003::ps::Base>>>,
     ps_bound: AtomicBool,
     ps_sleeping: AtomicBool,
     ps_failed: AtomicBool,
@@ -309,9 +329,16 @@ impl Native {
             cap,
             bar,
             active: AtomicBool::new(false),
+            antenna: narf_lib::sync::IrqSafeSpinLock::new(None),
+            manual: super::ar9003::antenna::manual::Latch::new(),
+            ani: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ani_expected: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ani_request: narf_lib::sync::OnceLock::new(),
+            ar9003_plan: None,
             calibrated,
             channel_mask,
             powers,
+            mci_power: None,
             rf_silent,
             ht: narf_lib::sync::IrqSafeSpinLock::new(None),
             ht_facts: None,
@@ -319,6 +346,7 @@ impl Native {
             tx_ba: narf_lib::sync::IrqSafeSpinLock::new(None),
             qos: narf_lib::sync::IrqSafeSpinLock::new(None),
             ps: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ps_ar9003: narf_lib::sync::IrqSafeSpinLock::new(None),
             ps_bound: AtomicBool::new(false),
             ps_sleeping: AtomicBool::new(false),
             ps_failed: AtomicBool::new(false),
@@ -506,6 +534,8 @@ impl Native {
         identity: &super::ar9003::eeprom::Identity,
         image: &super::ar9003::power::Image,
         prepared: &super::ar9003::phy::Prepared,
+        wa: u32,
+        mci_enabled: bool,
         periodic: super::ar9003::calib::Periodic,
         totals: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<super::ar9003::calib::IqTotals>>,
         channel_mask: u64,
@@ -523,6 +553,7 @@ impl Native {
             || request.frequency_mhz != frequency
             || request.mac != identity.mac
             || prepared.frequency != frequency
+            || prepared.board_config != super::ar9003::board::Config::for_pci(&device.id)
             || prepared.power.frequency != frequency
             || prepared.power.tx_chainmask != tx
             || prepared.power.max_power_level > permission.budget()
@@ -539,7 +570,20 @@ impl Native {
         // The twelve rate words the plan programmed are re-proved by every
         // physical readback.
         let powers = super::ar9003::power::rate_words(&prepared.power.targets).to_vec();
-        Ok(Self::assemble(
+        let mci_power =
+            super::ar9003::btcoex::concurrent::Power::new(device.id.device, &grant, prepared.power)
+                .map(narf_lib::sync::IrqSafeSpinLock::new)
+                .map(alloc::boxed::Box::new);
+        let ps_ar9003 = super::ar9003::ps::Base::new(
+            device.id.device,
+            grant.clone(),
+            permission,
+            &report,
+            &prepared.power,
+            wa,
+            mci_enabled,
+        )?;
+        let mut native = Self::assemble(
             device,
             cap,
             bar,
@@ -553,11 +597,16 @@ impl Native {
                 rf_kill,
                 periodic: narf_lib::mutex::Mutex::new(periodic),
                 totals,
+                antenna_profile: super::ar9003::antenna::Profile::for_device(&device.id, image),
             },
             channel_mask,
             Some(InstalledPower::Rates(powers)),
             None,
-        ))
+        );
+        native.mci_power = mci_power;
+        native.ar9003_plan = Some(alloc::boxed::Box::new(prepared.power));
+        *native.ps_ar9003.lock() = ps_ar9003;
+        Ok(native)
     }
     /// The `ath9k_hw_reset` tail for `AR_SREV_9300_20_OR_LATER` after the
     /// MAC profile, before packet DMA: `AR_CFG_LED` = `saveLedState |
@@ -582,6 +631,9 @@ impl Native {
         report: super::ar9003::calib::Report,
         periodic: super::ar9003::calib::Periodic,
     ) -> Result<(), Error> {
+        if self.manual.retained() {
+            return Err(Error::State);
+        }
         let Calibrated::Ar9300 {
             report: current,
             periodic: retained,
@@ -598,6 +650,18 @@ impl Native {
         {
             return Err(Error::Packet);
         }
+        let base = self.ps_ar9003.lock().clone();
+        if let Some(base) = base {
+            if !base.matches_report(&report) {
+                // An established S capability/Radio owner is never silently
+                // replaced after its calibration identity changed. A fresh
+                // generation can request a newly qualified record instead.
+                if self.ps_bound.load(Ordering::Acquire) || self.ps.lock().is_some() {
+                    return Err(Error::State);
+                }
+                *self.ps_ar9003.lock() = base.recalibrated(&report)?;
+            }
+        }
         *retained.try_lock().ok_or(Error::Busy)? = periodic;
         Ok(())
     }
@@ -607,6 +671,109 @@ impl Native {
             Calibrated::Ar9300 { permission, .. } => Some(*permission),
             _ => None,
         }
+    }
+    /// A failed physical MCI reset cannot retain the old optional sleep
+    /// source, even if a partially written MCI_MODE_EN happens to read1.
+    pub(super) fn ar9300_mci_closed(&self) -> Result<(), Error> {
+        if self.ps_bound.load(Ordering::Acquire) || self.ps.lock().is_some() {
+            return Err(Error::State);
+        }
+        self.ps_ar9003.lock().take();
+        Ok(())
+    }
+    /// Rebind only after a full signed preparation/reset, with DMA parked.
+    /// The profile was independently derived from this Native's EEPROM/PCI.
+    pub(super) fn ar9485_bind_antenna(
+        &self,
+        shared: &super::ar9003::antenna::Shared,
+    ) -> Result<(), Error> {
+        let Calibrated::Ar9300 {
+            grant,
+            antenna_profile: Some(profile),
+            ..
+        } = &self.calibrated
+        else {
+            return Err(Error::State);
+        };
+        if self.active.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let binding = shared.bind(self, grant.clone(), *profile)?;
+        *self.antenna.lock() = Some(binding);
+        Ok(())
+    }
+    pub(super) fn ar9003_manual_latch(
+        &mut self,
+        latch: alloc::sync::Arc<super::ar9003::antenna::manual::Latch>,
+    ) {
+        self.manual = latch;
+    }
+    pub(super) fn ar9003_manual_apply(&self, enabled: bool) -> Result<(), Error> {
+        if self.active.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let result = self
+            .manual
+            .program(&mut ManualRaw { native: self }, enabled)
+            .map_err(|_| Error::Access);
+        if result.is_err() {
+            self.manual.fail();
+        }
+        result
+    }
+    pub(super) fn ar9565_manual_stop_mci(
+        &self,
+        link: &mut super::ar9003::btcoex::MciLink,
+    ) -> Result<(), Error> {
+        if self.device.id.device != 0x0036 || self.active.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let expected = self.manual.mci_facts().ok_or(Error::State)?;
+        let mut io = ManualRaw { native: self };
+        let result = self.manual.current(false, || {
+            link.stop_for_manual(&mut io, expected)
+                .map_err(|_| Error::Access)
+        });
+        if result.is_err() {
+            link.retire_manual_producers();
+            self.manual.fail();
+        }
+        result
+    }
+    pub(super) fn ar9565_manual_validate_mci(
+        &self,
+        link: &super::ar9003::btcoex::MciLink,
+    ) -> Result<(), Error> {
+        if self.device.id.device != 0x0036 || self.active.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let expected = self.manual.mci_facts().ok_or(Error::State)?;
+        if link.manual_facts().map_err(|_| Error::State)? != expected {
+            return Err(Error::State);
+        }
+        let mut io = ManualRaw { native: self };
+        self.manual.current(false, || {
+            if link.manually_retired() {
+                super::ar9003::antenna::manual::check_mci_off(&mut io)
+            } else {
+                expected.validate_live(&mut io)
+            }
+            .map_err(|_| Error::Access)
+        })
+    }
+    pub(super) fn ar9003_manual_start(&self) -> Result<(), Error> {
+        self.antenna
+            .lock()
+            .as_ref()
+            .ok_or(Error::State)?
+            .check_manual_start(self)
+    }
+    pub(super) fn ar9003_manual_rebase(&self, enabled: bool) -> Result<(), Error> {
+        self.antenna
+            .lock()
+            .as_ref()
+            .ok_or(Error::State)?
+            .rebase_manual(self, enabled)
     }
     pub(super) fn ar9300_reset_tail(&self, led: u32) -> Result<(), Error> {
         let Calibrated::Ar9300 { periodic, .. } = &self.calibrated else {
@@ -772,7 +939,9 @@ impl Native {
         true
     }
     fn invoke_cfg<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
-        identity::invoke(&self.cap, operation).map_err(|_| Error::Access)
+        self.manual.current(true, || {
+            identity::invoke(&self.cap, operation).map_err(|_| Error::Access)
+        })
     }
 }
 fn quarantine(msi: &Msi) {
@@ -820,6 +989,9 @@ impl Native {
         }
     }
     fn invoke<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        self.manual.current(true, || self.raw_invoke(operation))
+    }
+    fn raw_invoke<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         identity::invoke(&self.cap, operation).map_err(|_| Error::Access)?
     }
     fn physical_readback(&self, active: bool, periodic: bool) -> Result<(), Error> {
@@ -855,7 +1027,15 @@ impl Native {
             {
                 return Err(Error::Descriptor);
             }
-            for (register, value) in powers.registers() {
+            let mci_words = self
+                .mci_power
+                .as_ref()
+                .map(|power| power.lock().words())
+                .transpose()?;
+            let expected = mci_words
+                .as_ref()
+                .map_or_else(|| powers.registers(), |words| words.as_slice());
+            for (register, value) in expected {
                 if read(*register)? != *value {
                     return Err(Error::Descriptor);
                 }
@@ -1016,6 +1196,63 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn coex_access<T>(
+        &self,
+        active: bool,
+        action: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let Calibrated::Ar9300 { grant, .. } = &self.calibrated else {
+            return Err(Error::State);
+        };
+        grant
+            .invoke(|| Ok(self.access(active, action)))
+            .map_err(|_| Error::Access)?
+    }
+    fn ps_request(&self) -> Option<super::ps::Request> {
+        self.ps_ar9003
+            .lock()
+            .as_ref()
+            .map(|base| base.request())
+            .or_else(|| self.ht_grant().map(|base| super::ps::request(&base)))
+    }
+    fn mci_network_sleep(&self) -> Result<Option<super::ar9003::ps::NetworkSleep>, Error> {
+        if !self.ps_sleeping.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if !self.ps_bound.load(Ordering::Acquire) || self.ps_failed.load(Ordering::Acquire) {
+            return Err(Error::Access);
+        }
+        let source = self.ps.lock().clone().ok_or(Error::Access)?;
+        if source.ar9003_wa().is_none() {
+            return Ok(None);
+        }
+        let raw = PowerRaw {
+            native: self,
+            source: &source,
+        };
+        super::ar9003::ps::NetworkSleep::observe(source.clone(), &raw).map(Some)
+    }
+    fn mci_concurrent(&self, enabled: bool) -> Result<bool, Error> {
+        self.mci_power_transition(enabled)
+    }
+    fn ar9003_antenna(&self) -> Option<super::ar9003::antenna::Binding> {
+        self.antenna.lock().clone()
+    }
+    fn manual_scope(&self) -> Option<alloc::sync::Arc<super::ar9003::antenna::manual::Latch>> {
+        Some(self.manual.clone())
+    }
+    fn ar9003_ani_bound(&self) -> bool {
+        self.manual.ani_bound()
+    }
+    fn ar9003_ani_service(&self, eligible: bool) -> Result<(), Error> {
+        self.ar9003_ani_service(eligible)
+    }
+    fn ar9003_ani_beacon(&self, rssi: i8) {
+        self.ar9003_ani_beacon(rssi);
+    }
+    fn ar9003_ani_epoch(&self) {
+        self.ar9003_ani_epoch();
+    }
     fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
         self.periodic_source()
     }
@@ -1055,10 +1292,17 @@ impl Port for Native {
         }
     }
     fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        if self.manual.ani_bound() {
+            return None;
+        }
         if let Some(source) = self.ps.lock().clone() {
             return Some(source);
         }
-        let source = super::ps::Source::Registered.load(self.ht_grant()?).ok()?;
+        let base = self.ps_ar9003.lock().clone();
+        let source = match base {
+            Some(base) => super::ps::Source::Registered.load_ar9003(base).ok()?,
+            None => super::ps::Source::Registered.load(self.ht_grant()?).ok()?,
+        };
         let mut retained = self.ps.lock();
         Some(retained.get_or_insert(source).clone())
     }
@@ -1072,6 +1316,9 @@ impl Port for Native {
         self.access(self.active.load(Ordering::Acquire), || Ok(true))
     }
     fn bind_ps(&self, source: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
+        if self.manual.ani_bound() {
+            return Err(Error::State);
+        }
         if self.has_periodic() {
             return Err(Error::State);
         }
@@ -1103,7 +1350,10 @@ impl Port for Native {
                 // Mark an ambiguous attempt before any clock mutation. Ordinary
                 // I/O can resume only after the full actual sleep proof succeeds.
                 self.ps_failed.store(true, Ordering::Release);
-                super::ps::hardware::network_sleep(&raw)?;
+                match source.ar9003_wa() {
+                    Some(wa) => super::ar9003::ps::hardware::network_sleep(&raw, wa)?,
+                    None => super::ps::hardware::network_sleep(&raw)?,
+                }
                 self.ps_sleeping.store(true, Ordering::Release);
                 self.ps_failed.store(false, Ordering::Release);
                 Ok(())
@@ -1312,7 +1562,11 @@ impl Port for Native {
                         source,
                     };
                     if self.ps_sleeping.load(Ordering::Acquire) {
-                        if let Err(error) = super::ps::hardware::awake(&raw) {
+                        let wake = match source.ar9003_wa() {
+                            Some(wa) => super::ar9003::ps::hardware::awake(&raw, wa),
+                            None => super::ps::hardware::awake(&raw),
+                        };
+                        if let Err(error) = wake {
                             self.ps_failed.store(true, Ordering::Release);
                             return Err(error);
                         }
@@ -1328,6 +1582,16 @@ impl Port for Native {
                 }
                 let action = || {
                     self.physical_readback(active, periodic.is_some())?;
+                    if let Some(expected) = *self.ani_expected.lock() {
+                        expected.readback(&ar9003_ani::Unchecked { native: self })?;
+                    }
+                    if self.manual.bound() {
+                        self.manual.readback(|register| {
+                            self.extent(register)?;
+                            // SAFETY: same current N48D/N48A/PCI scope and dword extent.
+                            Ok(unsafe { self.bar.read32(register) })
+                        })?;
+                    }
                     if let Some((_, live)) = &periodic {
                         live.readback(&live_calibration::Raw { native: self })?;
                     }
@@ -1460,13 +1724,53 @@ impl Port for Native {
     }
 }
 
+/// Private parked manual transition, before its coex-off receipt exists.
+/// It bypasses only that new receipt check, retaining actual N48D/N48A,
+/// PCI, power/PHY and configured RFkill checks around every scalar.
+struct ManualRaw<'a> {
+    native: &'a Native,
+}
+impl ManualRaw<'_> {
+    fn current<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        self.native.manual.current(false, || {
+            self.native.raw_invoke(|| {
+                self.native.physical_readback(false, false)?;
+                action()
+            })
+        })
+    }
+}
+impl super::identity::RegisterIo for ManualRaw<'_> {
+    fn authorized(&self) -> bool {
+        self.current(|| Ok(())).is_ok()
+    }
+    fn read32(&mut self, register: u64) -> u32 {
+        self.current(|| {
+            self.native.extent(register)?;
+            // SAFETY: exact retained source/PCI/PHY/RFkill invocation and dword extent.
+            Ok(unsafe { self.native.bar.read32(register) })
+        })
+        .unwrap_or(u32::MAX)
+    }
+    fn write32(&mut self, register: u64, value: u32) {
+        let _ = self.current(|| {
+            self.native.extent(register)?;
+            // SAFETY: as above; this adapter is private to the fixed source program.
+            unsafe {
+                self.native.bar.write32(register, value);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Raw current-cap power operations; never recursively call Port::read.
 struct PowerRaw<'a> {
     native: &'a Native,
     source: &'a super::ps::Grant,
 }
-impl super::ps::hardware::Raw for PowerRaw<'_> {
-    fn read(&self, register: u64) -> Result<u32, Error> {
+impl PowerRaw<'_> {
+    fn current<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         self.source.invoke(|| {
             self.native.invoke(|| {
                 let command = self.native.command()?;
@@ -1475,35 +1779,55 @@ impl super::ps::hardware::Raw for PowerRaw<'_> {
                 {
                     return Err(Error::Access);
                 }
-                self.native.extent(register)?;
-                // SAFETY: actual retained sole BAR, complete dword extent and
-                // fresh source/PCI invocation; raw RTC access must precede AWAKE.
-                let value = unsafe { self.native.bar.read32(register) };
-                if value == u32::MAX {
-                    Err(Error::Access)
-                } else {
-                    Ok(value)
+                if let Calibrated::Ar9300 {
+                    rf_kill: Some(kill),
+                    ..
+                } = &self.native.calibrated
+                {
+                    // The original EEPROM decoded this exact GPIO/polarity.
+                    // Check it before raw clock/PM/MCI effects: ordinary
+                    // physical_readback runs only after a complete wake.
+                    self.native.extent(0x404c)?;
+                    // SAFETY: complete original GPIO dword in the same
+                    // current S/N46A/PCI invocation, before any wake write.
+                    let value = unsafe { self.native.bar.read32(0x404c) };
+                    if matches!(value, u32::MAX | 0xdead_beef)
+                        || (value & (1 << kill.gpio) != 0) == kill.polarity
+                    {
+                        // Releasing the switch cannot revive an ambiguous
+                        // sleep/wake owner or publish awake/DMA retirement.
+                        self.native.ps_failed.store(true, Ordering::Release);
+                        return Err(Error::Access);
+                    }
                 }
+                operation()
             })
         })
     }
+}
+impl super::ps::hardware::Raw for PowerRaw<'_> {
+    fn read(&self, register: u64) -> Result<u32, Error> {
+        self.current(|| {
+            self.native.extent(register)?;
+            // SAFETY: actual retained sole BAR, complete dword extent and
+            // fresh source/PCI/RFkill proof; RTC access must precede AWAKE.
+            let value = unsafe { self.native.bar.read32(register) };
+            if value == u32::MAX {
+                Err(Error::Access)
+            } else {
+                Ok(value)
+            }
+        })
+    }
     fn write(&self, register: u64, value: u32) -> Result<(), Error> {
-        self.source.invoke(|| {
-            self.native.invoke(|| {
-                let command = self.native.command()?;
-                if (command & narf_bus::pci::cmd::BUS_MASTER != 0)
-                    != self.native.active.load(Ordering::Acquire)
-                {
-                    return Err(Error::Access);
-                }
-                self.native.extent(register)?;
-                // SAFETY: same current sole PCI/source invocation and full BAR
-                // extent, serialized by the retained packet/radio owner.
-                unsafe {
-                    self.native.bar.write32(register, value);
-                }
-                Ok(())
-            })
+        self.current(|| {
+            self.native.extent(register)?;
+            // SAFETY: same current sole PCI/source/RFkill proof and full BAR
+            // extent, serialized by the retained packet/radio owner.
+            unsafe {
+                self.native.bar.write32(register, value);
+            }
+            Ok(())
         })
     }
     fn delay(&self, us: u64) {
@@ -1530,3 +1854,7 @@ impl super::ps::hardware::Raw for PowerRaw<'_> {
         }
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "packet_native/ps_tests.rs"]
+mod ps_tests;

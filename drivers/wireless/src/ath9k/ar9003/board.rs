@@ -10,12 +10,11 @@
 //! it (`AR_SREV_9300` is true for both); the AR9462/AR9565 take the
 //! `AR_CH0_TOP` / `AR_SWITCH_TABLE_COM_AR9462` / SPDT / PMU1 arms, and
 //! the AR9485 the `AR_CH0_TOP2` / antenna-diversity / PMU1+PMU2 arms.
-//! Branches that need a board value no in-tree source supplies —
-//! `bt_ant_diversity` and the `ath_hw_config` fields (`xlna_gpio`,
-//! `ant_ctrl_comm2g_switch_enable`, `xatten_margin_cfg`,
-//! `alt_mingainidx`) — are NOT implemented here: the unconditional base
-//! write is ported, the board-conditional delta is left for the
-//! board-config follow-up (see the PR body). No 5 GHz per-chip refusal
+//! Canonical PCI subsystem inputs select the source CUS198/CUS230 xLNA,
+//! xatten-margin and alt-mingain branches. GPIO9 is the source fallback
+//! for AR9485 raw RX-gain index0. The retained antenna owner composes the
+//! AR9485 scanner and AR9565 default tracking; manual BT sharing stays
+//! separately gated. No 5 GHz per-chip refusal
 //! is added: that is the open §5 design question (#1382), not a lane
 //! decision.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
@@ -27,6 +26,9 @@ use super::{
     rmw, Chip,
 };
 use crate::ath9k::identity::{BringUpError, RegisterIo};
+
+mod config;
+pub(in crate::ath9k) use config::Config;
 
 const AR_PHY_XPA_TIMING_CTL: u64 = 0xa264;
 const AR_CH0_TOP: u64 = 0x16288;
@@ -139,11 +141,9 @@ fn xpa_bias_level_apply(
     }
 }
 
-/// `ar9003_hw_ant_ctrl_apply`. The AR9485 xLNA-GPIO branch
-/// (`rx_gain_idx == 0`, `ah->config.xlna_gpio`) and the AR9485
-/// `bt_ant_diversity` mask of `antCtrlCommon2` need board config with no
-/// in-tree source and are left for the board-config follow-up; the
-/// unconditional switch-table writes below are Linux's for every chip.
+/// `ar9003_hw_ant_ctrl_apply`: source GPIO9 fallback and canonical
+/// PCOEM pin, followed by the chip's EEPROM antenna switch tables.
+/// The independently requested BT-antenna sharing gate stays closed.
 fn ant_ctrl_apply(
     io: &mut impl RegisterIo,
     image: &Image,
@@ -151,7 +151,18 @@ fn ant_ctrl_apply(
     chip: Chip,
     rx_chainmask: u8,
     tx_chainmask: u8,
+    board_config: Config,
 ) -> Result<(), BringUpError> {
+    if chip == Chip::Ar9485 && image[field::TXRX_GAIN] & 0xf == 0 {
+        // ar9003_hw_ant_ctrl_apply: a zero configured pin selects the
+        // source fallback AR9300_EXT_LNA_CTL_GPIO_AR9485 (GPIO9).
+        let gpio = if board_config.xlna_gpio == 0 {
+            9
+        } else {
+            u32::from(board_config.xlna_gpio)
+        };
+        super::mci::gpio_request_out(io, gpio, 1)?; // PCIE_ATTENTION_LED.
+    }
     let value = u32_at(image, m + modal::ANT_CTRL_COMMON);
     // `AR_SWITCH_TABLE_COM_AR9462_ALL` 0xffffff for the AR9462/AR9565,
     // `AR_SWITCH_TABLE_COM_ALL` 0xffff for the rest.
@@ -187,26 +198,40 @@ fn ant_ctrl_apply(
     // `EEP_ANT_DIV_CTL1` is the EEPROM `ant_div_control` byte, except the
     // AR9565, which uses `AR9300_EEP_ANTDIV_CONTROL_DEFAULT_VALUE`. The
     // `bt_ant_diversity` adjustments (AR9485 `AR_ANT_DIV_ENABLE`, the
-    // AR9565 RX-protect / force-on arms) need board config and are left
-    // for the board-config follow-up.
+    // AR9565 RX-protect / force-on arms) require a separate manual
+    // sharing request and coexistence policy. PCI quirk inputs alone
+    // do not open that gate.
     if matches!(chip, Chip::Ar9485 | Chip::Ar9565) {
         let value = if chip == Chip::Ar9565 {
             ANT_DIV_CONTROL_DEFAULT
         } else {
             u32::from(image[field::EXT1 + field::EXT1_ANT_DIV_CONTROL])
         };
-        rmw(io, AR_PHY_MC_GAIN_CTRL, 0x7e00_0000, (value & 0x3f) << 25)?;
-        rmw(
-            io,
-            AR_PHY_MC_GAIN_CTRL,
-            0x0100_0000,
-            ((value >> 6) & 0x1) << 24,
-        )?;
+        if chip == Chip::Ar9565 {
+            // ar9003_hw_ant_ctrl_apply, common->bt_ant_diversity=false:
+            // retain the source intermediate RX-protect clear, BT force-off
+            // and final MC word order. PCI capability is no manual request.
+            let before = io.read32(AR_PHY_MC_GAIN_CTRL);
+            let regval =
+                ((before & !0x7f00_0000) | ((value & 0x3f) << 25) | (((value >> 6) & 1) << 24))
+                    & !0x0180_0000;
+            rmw(io, AR_PHY_MC_GAIN_CTRL, 0x0080_0000, 0)?;
+            rmw(io, 0x1a64, 0x8000, 0)?; // AR_BTCOEX_WL_LNADIV_FORCE_ON.
+            io.write32(AR_PHY_MC_GAIN_CTRL, regval);
+        } else {
+            rmw(io, AR_PHY_MC_GAIN_CTRL, 0x7e00_0000, (value & 0x3f) << 25)?;
+            rmw(
+                io,
+                AR_PHY_MC_GAIN_CTRL,
+                0x0100_0000,
+                ((value >> 6) & 0x1) << 24,
+            )?;
+        }
         rmw(io, AR_PHY_CCK_DETECT, 0x2000, ((value >> 7) & 0x1) << 13)?;
         // `hw.c::ath9k_hw_fill_cap_info`: LNA combining when
         // `(ant_div_ctl1 >> 6) == 0x3` — main LNA1, alt LNA2
         // (`phy.h::ATH_ANT_DIV_COMB_LNA1` 2, `_LNA2` 1).
-        if (value >> 6) == 0x3 {
+        if (value >> 6) == 0x3 && !board_config.suppress_9565_combining() {
             rmw(io, AR_PHY_MC_GAIN_CTRL, 0x7e00_0000, (2 << 27) | (1 << 25))?;
         }
     }
@@ -291,9 +316,8 @@ fn atten(image: &Image, frequency: u16, chain: usize, margin: bool) -> u32 {
     u32::from(value as u16)
 }
 
-/// `ar9003_hw_atten_apply` (the `alt_mingainidx` write and the AR9485
-/// `rx_gain_idx == 0 && xatten_margin_cfg` margin-5 override need board
-/// config / the gain index and are left for the board-config follow-up).
+/// `ar9003_hw_atten_apply`, including canonical CUS198/CUS230 margin5
+/// and the source extra chain0 margin RMW for `alt_mingainidx`.
 fn atten_apply(
     io: &mut impl RegisterIo,
     image: &Image,
@@ -301,6 +325,7 @@ fn atten_apply(
     chip: Chip,
     rx_chainmask: u8,
     tx_chainmask: u8,
+    board_config: Config,
 ) -> Result<(), BringUpError> {
     // `AR_SREV_9462 && rxchainmask == 0x2`: chain 1's attenuation into
     // `AR_PHY_EXT_ATTEN_CTL_0`.
@@ -323,13 +348,19 @@ fn atten_apply(
     for (chain, register) in EXT_ATTEN_CTL.into_iter().enumerate() {
         if tx_chainmask & (1 << chain) != 0 {
             set_field(io, register, 0x3f, 0, atten(image, frequency, chain, false))?;
-            set_field(
-                io,
-                register,
-                0x1f000,
-                12,
-                atten(image, frequency, chain, true),
-            )?;
+            let margin = if chip == Chip::Ar9485
+                && image[field::TXRX_GAIN] & 0xf == 0
+                && board_config.xatten_margin
+            {
+                5
+            } else {
+                atten(image, frequency, chain, true)
+            };
+            if board_config.alt_mingainidx {
+                // The source flag adds this RMW; it selects no new gain table.
+                set_field(io, EXT_ATTEN_CTL[0], 0x1f000, 12, margin)?;
+            }
+            set_field(io, register, 0x1f000, 12, margin)?;
         }
     }
     Ok(())
@@ -558,14 +589,44 @@ pub(in crate::ath9k) fn set_board_values(
     rx_chainmask: u8,
     tx_chainmask: u8,
 ) -> Result<(), BringUpError> {
+    set_board_values_configured(
+        io,
+        chip,
+        image,
+        frequency,
+        rx_chainmask,
+        tx_chainmask,
+        Config::default(),
+    )
+}
+
+/// Same source board program with canonical PCI-derived PCOEM inputs.
+pub(in crate::ath9k) fn set_board_values_configured(
+    io: &mut impl RegisterIo,
+    chip: Chip,
+    image: &Image,
+    frequency: u16,
+    rx_chainmask: u8,
+    tx_chainmask: u8,
+    board_config: Config,
+) -> Result<(), BringUpError> {
+    board_config.check_chip(chip)?;
     let two = frequency < 4000;
     let m = modal_base(!two);
     xpa_timing_control_apply(io, image, m, two, chip)?;
     xpa_bias_level_apply(io, image, m, chip)?;
-    ant_ctrl_apply(io, image, m, chip, rx_chainmask, tx_chainmask)?;
+    ant_ctrl_apply(io, image, m, chip, rx_chainmask, tx_chainmask, board_config)?;
     drive_strength_apply(io, image)?;
     xlna_bias_strength_apply(io, image, m, chip)?;
-    atten_apply(io, image, frequency, chip, rx_chainmask, tx_chainmask)?;
+    atten_apply(
+        io,
+        image,
+        frequency,
+        chip,
+        rx_chainmask,
+        tx_chainmask,
+        board_config,
+    )?;
     quick_drop_apply(io, image, frequency, chip)?;
     internal_regulator_apply(io, image, chip)?;
     apply_tuning_caps(io, image, chip)?;

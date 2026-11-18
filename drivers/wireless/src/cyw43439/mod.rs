@@ -43,7 +43,7 @@
 //!   number / firmware-name constants, SDIO function-model
 //!   constants.
 //! - **Stage 2 (landed)** — transport-codec layer:
-//!   - [`gspi`] — 32-bit gSPI command-word codec (datasheet §6.4).
+//!   - [`gspi`] — 32-bit gSPI command-word codec (datasheet §4.2).
 //!   - [`sdio`] — CMD52 / CMD53 argument-word codec + F0/F1
 //!     register addresses (SDIO Simplified Spec + datasheet §6.5).
 //!   - [`backplane`] — F1 window paging codec (datasheet §6.5).

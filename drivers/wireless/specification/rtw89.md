@@ -3,12 +3,16 @@
 > Status: Initial RTL8852B retained cold/firmware/full-radio/native-packet
 > station path implemented; Open/WPA2, kernel DHCP and exact IP have composed
 > software models. Exact signed deployment assets and physical acceptance
-> remain required. Other AX/BE profiles retain diagnostic/prerequisite support.
+> remain required. Other AX profiles retain diagnostic/prerequisite support. RTL8922A has a
+> retained packet-closed FLR/power/FWDL/SCC-TRX path plus separately measured
+> partial native RF/DM/channel/init-late composition. Separate N22W measurement
+> can admit complete DM, an owned MAC1 power window and explicit WLAN-only
+> channel RFK. Ordinary radio/station gates remain closed; validation is pending.
 
 ## 1. Purpose & scope
 
-Owns RTL8852A/B/C, RTL8851B and planned RTL8922A PCIe support. Current live
-identity code implements AX DDV EFUSE; BE has a different read/block layout.
+Owns RTL8852A/B/C, RTL8851B and RTL8922A PCIe support. BE retains its
+separate checked DDV/block EFUSE, reset, power, firmware and DMA ownership.
 
 ## 2. Assumptions
 
@@ -18,12 +22,15 @@ TX-A fixed1Mbps, RX-AB, an AP advertising basic1Mbps, and awake polling with
 interrupts disabled. A claim is bounded to512 packet identities per queue;
 terminal close/failure/exhaustion requires a fresh independently reset lifecycle.
 BAR2 must cover every actual MAC/PHY and nonsecure indirect-table access.
-Other AX/BE profiles retain their parked diagnostic power/identity path.
+Other AX profiles retain their parked diagnostic power/identity path. The
+closed BE path requires a completed same-function PCIe FLR and keeps MAC0
+packet gates closed and all original DMA ownership retained. MAC1 remains
+off except for the separately qualified synchronous N22W power window below.
 
 ## 3. Public interface
 
-For the retained-bootstrap IDs (`rtw89::bootstrap_did`: `10ec:b852`/`10ec:b85b`,
-`10ec:c852` and `10ec:b851`), `pci::probe` reserves its exact BDF before parking
+For the retained-bootstrap IDs (`rtw89::bootstrap_did`: `10ec:8852`/`10ec:a85a`,
+`10ec:b852`/`10ec:b85b`, `10ec:c852` and `10ec:b851`), `pci::probe` reserves its exact BDF before parking
 and retains the actual reset owner before its first await. Generic binding
 requires an advertised, completed FLR and its consumed temporal fence. A
 repeat same-function probe performs no config access, including during reset
@@ -33,7 +40,329 @@ posted-traffic drainage and no DMA ownership since, and call before generic
 binding. Static board facts and BME-off cannot satisfy that temporal contract.
 Neither path can replace an existing reserved owner.
 `pci::register_pci_driver` registers `bootstrap::remove` for the same ID set;
-the A and 8922A IDs stay on the parked diagnostic probe.
+the A IDs select the retained `prepare_radio_a` source owner. RTL8922A has the separate
+closed consumer below; its reset support does not expand bootstrap_did.
+
+`bootstrap_8922a::probe` reserves each exact `10ec:8922`/`10ec:892b` BDF
+before hardware access in a bounded lifetime table. The original capability,
+ECAM/function identity and actual reset owner survive failure, cancellation,
+detach and reprobe. The bus broker's fresh capability on an identical
+BDF/DeviceId/ECAM repeat is observational and never replaces the original
+authority slot; changed ECAM cannot reconstruct an attempt. Unsupported FLR or IOMMU
+reset handling refuses the path. Removal sets a retained cancellation fact;
+subsequent native/config operations check it and current capability authority.
+The removed owner and uncertain DMA remain quarantined. No net/station or IRQ
+registration follows from binding this closed supervisor.
+
+Its real FLR Fence precedes the checked native cold program. Entry observes
+BB0/BB1 reset closure and WCPU hold, and closes both complete common CMAC power
+tuples before source reset → complete pwr_on head → closed power tail. MAC0
+requires all five AFE enables, FEN and isolation readbacks before its bank is
+read; MAC1 retains all five AFE bits clear, FEN clear and isolation set. MAC0
+TXEN/RXEN are closed/read back before the first BBMCU0 hook. The ordinary
+source power tail and mac_func_en remain separate helpers and cannot reopen
+these gates on the native route. EFUSE uses source byte/word/dword widths,
+including the aligned16-bit autoload register at0x000a. Erased EFUSE data is
+valid all-ones data; failed control/secure/CV reads are propagated. The owner
+retains the exact RF/HCI logical maps, factory identity and parsed packed TSSI
+and gain-offset fields. Factory thermal is a stored EFUSE fact, not a live
+calibration measurement.
+The closed owner also observes actual XTAL ACV/AID and common-register CID,
+in core.c's ACV → CID → AID-low → AID-high order. Native XTAL observation is
+delayed until checked common power; neither a register default nor a supplied
+board ID is substituted. A valid ECV replaces only CV before subsequent EFUSE
+power-cut sequencing and firmware/table selection; erased ECV keeps the raw
+power-on cut, while access failure is terminal. The signed NORMAL container's
+five radio tables are preflighted before CH12 publication using its observed
+AID: aid0 is wildcard, other AIDs must match, and first match wins. The actual
+AID selector is bound separately from historical legacy table identities.
+The892b PCI match selects the source8922AE-VS variant: selected firmware older
+than0.35.54.0 is refused before CH12/BME, and its later capability receipt
+retains the no-MCS12/13 limit. The8922 match keeps the ordinary A variant.
+
+The internal HCI-enable → BBMCU0 sequence, DLFW DLE/HFC carve, IO recovery and
+PCI settings use fallible ports with per-access current authority, exact width,
+extent, register surface and first-error/cancellation refusal. Native preinit
+keeps all TX/WPDMA stops asserted through DLE/HFC and owned ring publication;
+the source ordinary TX-channel unstop is excluded. All13 TX rings, two RX rings
+and their256×2048-byte buffers per RX channel move into CheckedPrepared before
+any NUM/base/index/doorbell write. No Rtw89Device field retains a droppable DMA
+alias. Programmed NUM/base/index and positive WCPU/global/all-channel stop and
+idle receipts gate configuration. The source BDRAM request/clear poll is kept;
+no short assertion pulse, default-clear bit or ring reprogramming retires a
+mapping. Every legacy, pending and consumed bootstrap buffer stays retained.
+Only the private permanent original-controller held-stop/idle terminal receipt
+can release the maps; that operation consumes the native port and disables
+future production. Drop never manufactures a stop receipt.
+
+Current PCI command readback and completed DLE/HFC/PCI/ring receipts precede
+BME activation. Only bounded CH12 plus the source global DMA state is enabled;
+WPDMA and all ordinary TX channels remain stopped. The same original owner
+retains signed registry NORMAL and BBMCU0 snapshots and fuse-selected plans.
+A single fallible download attempt positively observes WCPU-off/HOLD/on before
+clearing old boot/path/status fields, reads the clear back, verifies fresh
+FWDL-enable fields, then observes CPU-off/hold-release/on and the source fresh
+ROM/path/suit/FreeRTOS handshakes. Stale loader-ready bits cannot satisfy the
+attempt. CH12 RP/index geometry and the original16-bit doorbell readback govern
+credit; uncertain submissions stay owned and replay is refused.
+
+The post-FW SystemConfigured stage closes/verifies MAC0 packets before any
+BB release or full DMAC_BB_SYS write. All powered/off-domain prerequisites
+remain explicit at every boundary. The SCC/TRX continuation first consumes
+every pending FWDL descriptor through its actual RP, then stops HAXI globally
+and observes TX/RX/IO idle without freeing allocations. It configures the source
+normal PCIe SCC DLE quotas, preload/MPDU/CSI reservations, HFC c0 precost and
+actual public-page accounting, STA scheduler, MPDU/security/MLO, MAC0 CAM/RX
+filters/scheduler/protocol/DMA, internal IMR tables and host release reports.
+DBCC/MAC1 and ordinary channel enables remain closed. Only CH12/global DMA is
+restored after ConfiguredClosed. These stages publish no calibrated channel,
+ordinary RX or station readiness. Legacy direct pci::bring_up refuses BE
+before hardware because exclusivity alone supplies no temporal fence.
+The checked owner then permits a bounded firmware-only RXQ poll on that same
+actual closed TRX receipt. The complete DMA snapshot, BE segment assembly,
+header clearing and recycling run under a current capability invocation;
+register effects retain their own current checks. RX RP/host-WP geometry,
+device-to-CPU synchronization and the16-bit doorbell readback precede return
+of any C2H. A failed access/readback terminalizes the owner while retaining
+its advanced cursor and every map. Ordinary Wifi and PPDU events are dropped.
+The initial bootstrap poll retains actual C2H messages as data; it has issued
+no RFK offload and cannot interpret them as calibration completions.
+The original owner also performs BE GET_FEATURE part0 and, when the actual
+NORMAL version is at least0.35.51.0, part1. The separate BE mailbox retains
+the source0x7140/0x7150 data blocks, byte triggers, UDM1 counters and EFUSE
+power-state conversion. It refuses inherited replies, observes the submitted
+part body before trigger, and requires new response/full-length/function and
+command-consumed receipts. Failure leaves the mailbox terminal; a failed
+access never causes a later cleanup write. Actual NSS/antenna/protocol/QAM
+and the PCI variant are retained and bound; source-declared chip defaults for
+zero capability fields do not mint a physical-board qualification.
+The retained CH12 control owner now frames the normal BE descriptor/header
+with source sequence0 after fresh FWDL and no AX forced-ACK quirk. It keeps
+descriptor-memory effects within a current capability invocation, retains all
+referenced allocations, refuses sequence reuse and waits for actual RP
+consumption. An RFK operation has exactly one outstanding kind/command and
+accepts only one fresh RFK report; unsolicited or duplicate reports,
+access failure and timeout terminalize the control owner. RFK's wire report
+contains no command tag: the source single-outstanding firmware protocol,
+fresh image/queue ownership and refusal of overlapping/replayed attempts are
+required. Transport consumption never becomes a firmware execution receipt.
+Commands whose source explicitly requests DONE_ACK use a distinct retained
+ticket: the exact category/class/function/sequence tuple, DONE rather than
+REC, zero firmware return and actual RP consumption must all succeed. Wrong,
+duplicate, stale or unrequested ACKs, cancellation and timeout terminalize the
+owner without releasing DMA. RFK commands preserve their source no-ACK flags
+and distinct single-report protocol. Source MACID-pause has a separate exact
+REC-only ticket plus RP consumption; it proves receipt and never pause
+application or command execution. Default DMAC v2 requests no ACK. The concrete
+BE callers below borrow separate measured N22P/N22W/N22O scopes; ordinary
+packet admission stays closed.
+BE scheduler pause/resume uses source mac_be.c v2 direct32-bit0x10398 access,
+preserving the original18-bit scheduler enables and current reserved bits.
+The retained scheduler owns its saved value, requires an exact resume token
+and fails terminally on an uncertain stop/restore. It cannot substitute the
+AX16-bit firmware-mailbox scheduler or enable closed CMAC packet gates.
+
+The BE radio prerequisites now retain the phy_be.c gain layout (12 bands,
+two BW classes, packed path/BW nibble, dense subchannels and direct cfg_type15
+writes), source per-channel LNA/TIA/OP1dB/RPL fields and actual EFUSE normal-RX
+gain fields. BB/NCTL use the BE CR base0x20000 and generation-specific NCTL
+preinit/check; RF-v2 has its own HWSI/direct owner and AX RF dispatch refuses
+BE. The complete optional BB gain program preserves source ordering around
+band selection. Their generic types alone supply no native RF grant.
+`phy_operating_be::Operating` now issues a separately typed cold SCC DM
+prerequisite program: actual source BB-sethw/MLO/AFE, CCX/IFS, PHYSTS, BE
+DIG/CFO, MACID/TPU/force/FTM setup, CAV EDCCA, channel info and actual XTAL
+PLL read/modify/write. It never reuses AX's base, PAGC fields or initial CCK
+threshold (BE ch1/20MHz is-126, AX is-128). Source support_noise=false skips
+NHM. N22P's success state is PartialMac1Off: the source helper's two
+unconditional unused MAC1 UL-power writes are explicitly omitted, since the
+native profile keeps MAC1 off/isolated and mac_be.c itself refuses SCC
+CMAC1 power-CR access. No bank-zero sample supplies a replacement receipt,
+and this partial state cannot qualify the complete native RF/station program.
+The separate N22W continuation issues the complete pair through the owned
+power window below and earns CompleteMac1Restored, never packet readiness.
+Actual RF-sensor observations and the source's disabled-profile thermal
+fallback are distinct values; factory TSSI PG thermal is a separate fact.
+The separate `be_path::Paths` prerequisite uses the actual firmware-reported
+antenna paths and the full source scheduler/PPDU/DFS/TSSI/ADC/BB-reset bracket
+around TMAC paths and HT/VHT/HE/EHT NSS limits. The source PHY1 loop repeats
+PHY0 BB writes in non-DBCC mode; these duplicates remain in order, while its
+TX MAC table returns early before any MAC1 bank access. Its Programmed state
+is distinct from calibration and ordinary RX/station admission.
+Actual selected NORMAL-suit version now chooses source PRE-notify V0/V1/V2,
+MCC-notify V0/V1, IQK-v0/current and RXDCK-v0/current. The A chip never assumes
+PRE-v3 or MCC-v2. The SCC context owner records and applies the source
+coefficient/MDPD/RF table reload before channel RFK; failure or a dropped
+pending reload leaves it Busy. PRE-v0 obtains live coefficient/RR_CFGCH
+observations, while MCC uses its separate class/function and has no report
+wait. The cold init-late owner separately runs source PRE/MCC → DACK58ms →
+RXDCK128ms. The retained partial native owner supplies actual current
+H2C/report composition under the new separate measured permission.
+Historical N22A v1 identity remains unchanged and binds only its historical
+subset recipe. It cannot qualify the new full native RF/channel/station path.
+
+`native_radio_be::Radio` is now retained in the original BE supervisor before
+its first asynchronous effect. Its concrete port uses the original
+`CheckedPrepared` CH12/RX/scheduler owner directly; it never recursively enters
+an `Rtw89Device` or adopts a replacement broker capability. Every actual
+MMIO, RF-v2/XTAL subtransaction, descriptor-memory publication, firmware
+report consumption and scheduler effect is enclosed by both current signed
+N22P/N22W and original Bus capability invocation. Common power receipts precede
+MAC0 bank access; every effect verifies MAC0 packets closed, MAC1 fully off
+and BB1 held, WPDMA/ordinary TX stopped, and source CH12/global DMA state.
+The N22W window alone replaces the off tuple with each exact owned transition
+tuple; no general MAC1 register surface or bypass is added.
+Gone/access/cancellation faults permanently latch the port; dropped/failed
+radio work leaves its one-shot owner Busy and keeps all DMA retained.
+Qualified send/report/scheduler entry points borrow that same original typed
+N22P/N22W grant on the checked native transport. Each scalar poll independently invokes
+it during synchronous waits. The internal fallible `Regs::dma_memory` hook
+also encloses each descriptor write, payload/header sync and RX snapshot/
+header clear in fresh signed and Bus invocations, with a current check after
+the memory effect. A revocation during an already-outstanding RFK report wait
+therefore cannot publish a later report, RX credit or doorbell. Existing cold
+transport callers retain their separate API and original DMA ownership.
+
+The distinct NARF-local N22P-v1 file is
+`rtw89/rtw8922a-partial-cal-v1-<mac>.bin`. Its96-byte format has the same
+channel1/20MHz, peak-conducted-power plus antenna/current-host-rule envelope
+as the existing calibration records, with magic `N22P`; an `N22A` record
+cannot decode as `N22P` or vice versa. Its identity binds actual raw RF/HCI/
+PHYcap, MAC, corrected CV/ACV/CID/AID, exact PCI IDs and thermal quirk,
+actual retained GET_FEATURE/firmware-version facts, observed-AID-selected
+signed container/table bytes and length-delimited source filenames/contents.
+This conservative source snapshot includes the concrete port and every
+program/codec it consumes; even a comment change needs a fresh measurement.
+The signed scope explicitly permits the exact partial calibration tones and
+transitions and names the MAC1 UL-power omission, disabled DAG/SAR profile
+and missing BTC/full-readiness gates. It exposes no full Calibration or
+station/response grant. Absent/current-policy-incompatible/revoked measurement
+refuses before radio effects; no checked-in firmware or measurement is added.
+
+The concrete order is BB/gain direct words → source complete SCC
+`bb_postinit`25 fields → RF A/B and direct-only firmware pages → partial DM
+with actual thermal/CFO/PLL inputs → BE NCTL → source RFK software-zero
+initialization → zero OFDM/CCK power references → factory PA/pad trims →
+GET_FEATURE-selected source Tx/Rx paths. It then explicitly programs source
+channel1 MAC/BB/gain/RF and WW/no-DAG/no-SAR power inside the retained reset/
+scheduler bracket, performs source SCC RFK context reload and runs init-late
+PRE/MCC/DACK/RXDCK over the real retained command/report stream. No table
+default is assumed to prove an operating channel. The native init-late run
+keeps ordinary HCI/rings/RUNNING/BT-radio-on gates closed; this divergence is
+part of the measured N22P scope. Its only completed native state is
+PartialMac1Off, with a programmed channel and separately retained init-late
+reports; these do not supply full channel RFK or station readiness.
+
+Thermal protection is derived from Linux's literal PCI match
+10ec:8922/10ec:a891 (threshold0xb4); the DELL custid is output metadata, not
+a DMI prerequisite. That profile performs actual RF0x42 trigger1/0/1,
+200us delay/read and signed actual PHYcap trim/clamp. Other admitted source
+debug-disabled profiles retain a typed disabled fallback, never a live
+sample or factory PG substitution. Coexistence-dependent switch-band and
+channel-RFK callbacks explicitly refuse on N22P; AX/A callbacks and default
+no-op notifications cannot replace the separately owned N22W producer.
+
+The distinct96-byte `N22W` v1 record lives at
+`rtw89/rtw8922a-wlan-cal-v1-<mac>.bin`. Its identity binds all actual N22P
+facts, selected assets/NORMAL/GET_FEATURE and exact source contents, plus the
+complete MAC1-window, WLAN-only arbitration and channel-RFK program. Its
+measured conducted peak plus antenna/current host ceiling must cover the
+entire enabled calibration/arbitration state and transitions, including all
+tones and firmware offloads. N22A/N22P/N22W magics and identities never cross.
+Selection occurs once before radio effects: an absent N22W keeps only the
+separately qualified partial program. A malformed, revoked or policy-invalid
+N22W refuses; no missing record or retained Busy/partial owner can be upgraded.
+
+`be_mac1::Window` uses the source common AFE → isolation release → FEN power
+sequence. Current original PCI and N22W checks surround every transition and
+readback. Positive complete common tuples precede any C1-bank access; C1
+packet bits are closed/read back, the exact source UL target/threshold words
+are written/read back, then FEN → isolation → AFE closure is verified. The
+whole window is synchronous, so executor cancellation cannot strand a power
+transition between polls. Source/cancellation failure attempts only those
+restrictive common closure operations under current original PCI; revoked PCI
+leaves FailedUnknown and retained ownership. Neither closure nor bank values
+create a reset, DMA reclamation, ordinary packet or future retry receipt.
+
+`be_coex::Owner` produces explicit source `BTC_MODE_WL`/WONLY policy under
+N22W. This is a static closed calibration profile: it supplies no BT-enabled,
+BT-disabled, BT-version, telemetry or generic concurrent BT-policy claims.
+Actual RFE/CV/ACV and GET_FEATURE NSS select the source antenna map, RF LUT
+and NORMAL-version-selected init7/11, CTRL7/9, slots7 and TDMA7/8 layouts.
+WLAN scoreboard flags are retained host state; only firmware-owned register
+bits are preserved. Source WL-high/BT-low grants, MAC0 PLT, force-power disable
+and acknowledged OFF policy precede RFK. Switch-band and RFK START/STOP update
+the real scoreboard/WONLY owner. After actual init-late DACK/RXDCK, the source
+first-band TSSI SCAN and PRE/MCC/TXGAPK/IQK/TSSI/DPK/RXDCK sequence uses the
+same retained CH12/report stream, actual efuse DE and selected TXPWR_TRK rows.
+Source8922A has no TSSI-trim parser; only those source-unproduced trim fields
+are zero. Success earns ClosedWlanCalibrated with MAC1 off and all ordinary
+HCI/IRQ/rings/RUNNING/packet/response/station/AP/EHT gates still closed.
+
+Final ordinary packet/response qualification and retained RX/station
+composition remain required; generic concurrent BT policy needs its actual
+producer inputs. Native/source literal, ACK/report, power-domain closure,
+revocation and cancellation cases are authored. No new deployment measurement
+or firmware is checked in; execution and physical acceptance remain pending.
+
+The distinct ordinary packet/response envelope is `N22O` v1 at
+`rtw89/rtw8922a-packet-cal-v1-<mac>.bin`, using the common96-byte current
+channel1/20MHz power/antenna envelope. It binds the entire enabled radio,
+calibration, WONLY, native packet and autonomous-response state/transitions,
+plus exact selected assets/facts and packet/MLME source bytes. N22P/N22W
+cannot decode as N22O or grant packet authority. The original supervisor
+retains a one-shot packet Program before lookup; missing measurement remains
+MissingMeasurement and cannot upgrade on a repeat probe/call.
+The actual post-TRX RESP1/RRSR0/RRSR1 words are observed under current original
+N22W/PCI before N22O lookup, retained as historical metadata and bound into its
+identity. Fixed payload rate is never a replacement for this preserved
+autonomous-response state. Current native scopes recheck the exact words,
+WONLY GNT/PLT/scoreboard and complete closed power/DMA tuple.
+
+After the exact original Radio has complete current DM/MAC1-off/WONLY and
+actual late/channel-RFK receipts, `native_packet_be` independently invokes
+the N22W and fresh N22O scopes for inactive preflight. Its concrete adapter
+checks every original TX/RX NUM/base and stopped data index, preserving
+CH12 and the existing RXQ/RPQ cursors. It refuses all register writes, peer
+operations and packet start; success means Inactive and earns no Station,
+packet or ordinary HCI publication. No new rings or reset/reclaim receipts
+are created.
+
+`be_mlme::Controller` then executes actual source port0/no-link setup through
+`native_packet_be_mlme` on the same checked CH12 owner. Both V1 BA-user table
+commands carry their exact band0/band1 tags and successful DONE receipts;
+neither grants MAC1 host access or proves off-domain internals. Source BE
+crypto-off clears data/management decrypt and pre-enqueue enable fields while
+preserving clocks; final PPDU/PHY-report and halfword RTS setup are explicit.
+The port program preserves byte/halfword widths, including1040e within the
+overlapping beacon word, and the actual20us delay. Unexpected already-active
+cold port refuses without adopting an old BSS or fabricating a TSF-reset
+receipt. Version-selected CAM uses v0 before NORMAL0.35.84.0 and v1 thereafter.
+REC-only MACID-pause, DONE role/join/CAM/G7 CMAC and no-ACK DMAC preserve their
+source contracts; AX indirect-table initialization is skipped as source BE
+does. Source acceptance is distinct from execution for REC/no-ACK commands.
+Each actual register, descriptor/RX-memory/control poll and resumed callback
+invokes both the retained original Radio/N22W scope and the separate N22O/PCI
+scope. A prior no-op/current metadata check cannot authorize a later effect.
+The selected-source digest includes the actual native child dispatch, without
+claiming a whole-executable digest. Success remains MlmeConfiguredClosed;
+ordinary HCI/packet/response and public Station publication remain closed.
+
+`checked_fwdl_8922a::packet` retains the bounded BE transport inside that
+same checked DMA owner: original data0/MGMT8 rings, one MPDU in flight,
+512 non-repeated identities per queue, full descriptor/header/body retention
+before the first TXBD memory publication, source-v2 fixed1Mbps body/info/WP
+and36-bit v1 address entries. RTL8922A selects `fill_txdesc_v2`, whose QSEL
+is[22:17] and MACID[31:24]; the later v3 `_V1` layout is not an alias. Actual
+BD RP and a distinct exact4-byte BE RPQ tuple are both required; firmware
+TX_DONE status is never substituted for external overair/AP acceptance.
+Even completed allocations remain retained by this bounded owner. Its source
+NAPI-order RPQ/RXQ walk uses the actual BE descriptors, FS/LS assembly and
+eq-is-full cursors with current checks around memory/credit/return. Duplicate,
+stale, conflicting or wrong-tuple releases fail terminally. The unsafe active
+port additionally requires concrete BE VIF/role/CAM/CCTL/join/rate/crypto-off
+and publication receipts; the production preflight adapter cannot supply it.
+That active native MLME/HCI/station composition remains source work here.
 
 `Bootstrap` retains the same `Startup` inside `Arc<Lifecycle>` before discovery.
 `Startup::discover` earns the actual factory identity with BME off. One named
@@ -72,11 +401,9 @@ requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
 DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
 BME requires the composed owned cold/firmware-download and packet/ring/reset owners.
-The one such owner today is the RTL8922A boot: `Rtw89Device::boot_8922a` sets
-`BUS_MASTER` through `rtw88::pci_park::master` (readback must show BME +
-MEM + INTx-off; Linux `rtw89_pci_claim_device` -> `pci_set_master`) before
-its ring programming and CH12 firmware download, and `bring_up_registers`
-re-parks the function (`pci_park::park`) when that boot fails.
+The separate retained RTL8922A supervisor enables BME only after the checked
+owned-ring and preinit receipts above. Its retired diagnostic Rtw89Device boot
+is not a producer of the current native route.
 The complete diagnostic mapping/power/identity operation runs within actual
 capability invocation. It retains unpublished storage, with no ring base/index
 publication, enabled MSI-X delivery, RX pump or network-interface registration.
@@ -102,7 +429,7 @@ preserve that minimum. After quarantine it bounds config readiness to 60s,
 requires the same identity/capability layout, self-cleared FLR and decoding/BME
 off, masks interrupts again, restores/readbacks original BARs with decoding off,
 and leaves BME/IRQ disabled. Unsupported IOMMU reset handling is not simulated.
-Only successful completion creates a private non-Clone `Fence`. Its sole
+Only successful completion creates a private non-Clone `Fence`. The AX
 consumer, `Startup::claim_reset`, rechecks exact binding, current authority,
 parked controls and restored BARs before transferring into the actual cold
 owner. The original function reservation remains retained throughout the
@@ -125,8 +452,8 @@ and `rtw8851b_fw` basenames, preferring supported format suffixes before the
 unversioned fallback. Only a missing file permits filename fallback; invalid
 images or missing/revoked authority abort. 8852B/8851B prefer the NORMAL_CE
 image, then NORMAL. MFW selection bounds every entry before choosing the
-nearest non-manufacturing cut at or below the physical revision. BE is rejected
-before file access. The native registry adapter copies bytes inside the actual
+nearest non-manufacturing cut at or below the physical revision. BE selects
+NORMAL and its BBMCU0 image through separate checked suits. The native registry adapter copies bytes inside the actual
 firmware capability invocation.
 
 `fwdl::parse_auto` accepts AX header versions0/1 only: base sizes32/48 and
@@ -4497,7 +4824,7 @@ settings are now driven end to end (`rx_packet::ppdu_class` + IE01 EVM,
 `Protocol51::init` diversity row); the row's remainder is the
 chip-specific firmware/RF/power/station ownership still open above.
 
-### RTL8852A retained runtime (partial; Qualification wired, no RF program owner yet)
+### RTL8852A retained runtime (full source TSSI/PMAC and native channel RFK linked)
 
 Chip row `rtl8852a`. The A BB/RF tables and the RFK flow on top of them
 landed in #2054 (`radio_tables_a.rs`, `rtw8852a_rfk_init`: RCK, DACK,
@@ -4553,13 +4880,232 @@ binding is measured against the N5AF companion and the A grant
 (`fragment_part_current` compares the grant by identity). The
 packet-layer fragment gates are lifted for A only
 (`packet_core::submit_inner`, `packet_format::transmit_profile_inner`,
-`tx_transport::prepare_header_fragment`); C and RTL8851B stay refused,
-and the Native-level gate (`fragment_binding` +
-`fragments_allowed`) remains the actual authorization. No production
-path installs an `OrdinaryGrant::A` yet: the A RF program owner
-(`preflight_radio_a` / `prepare_radio_a`) does not exist, and installing
-the grant without the owner having run the recipe would admit ordinary
-TX without the measured RF program. The Native-level A `radio_access`
+`tx_transport::prepare_header_fragment`); C and RTL8851B stay refused.
+The explicit fragment encoder precedes ordinary A dispatch while
+retaining the actual A/B chip identity. Ordinary emitters continue refusing
+fragmented frames. Literal AX-v0 descriptor vectors cover both band floors
+and first/final data and management fragments.
+The Native-level gate (`fragment_binding` +
+`fragments_allowed`) remains the actual authorization. The A RF program
+owner (`preflight_radio_a` / `prepare_radio_a`, through startup/bootstrap)
+installs `OrdinaryGrant::A` only after the complete initial source channel
+RFK and strict fresh pre-TX receipts below. PCI IDs8852/a85a now enter that
+retained bootstrap directly, including the actual FLR/cold-attach and remove
+owner fences; generic probe cannot select the old diagnostic attach instead.
+Station feature queries (WMM/QoS/firmware-RA/HT/HE/A-MPDU), admitted20MHz and
+wide profiles and regulatory policy now dispatch through the exact retained
+A grant. Original Bus validity and A record identity are checked again;
+A-MSDU stays unavailable because no signed A aggregation companion exists.
+Startup now retains the actual selected A firmware assets and Native routes
+RX to `Rx::prepare_for`'s existing A geometry/LTR path. Its new MAC owner
+uses the actual A `wde_size0`/`ple_size0`/`wde_qt0`/`ple_qt4,5` SCC:
+4095 WDE pages,1520 PLE pages at boundary32, twelve HFC channels with
+128/1896 ACH quotas and32/128 management/high minima, groups1896/1896
+and public3792. Generic AX system/STA/MPDU/security/CMAC subprograms are
+shared only where the primary sources are identical; A's generic
+enable_bb_rf uses SYS_FUNC_EN3, WLRF_CTRL8282 and PHYREG_SET8 with no
+B XTAL writes. A SIFS is0x15, RX capped length23, actual-CBV (cut1)
+clears DLK CCA timeout and sets RCR bit12, and the A protocol interrupt
+mask preserves source-reserved bits. Entry observes actual MAC1 functions
+and clocks off. CMAC0 TX, all packet DMA and host IRQs stay closed.
+
+`Native::preflight_mac_a` loads a distinct signed96-byte `N5AM` v1
+(`rtw89/rtw8852a-mac-v1-<mac>.bin`) before the MAC Attempt/effects;
+`prepare_mac_a` rebinds it to the original factory and selected assets.
+Bytes0..54 use the calibration-family header/identity/MAC layout with
+magicN5AM/version1/length96; bytes54..96 are zero. Its identity binds the
+exact MAC recipe, actual A logical/PHY-cap/fuse facts and corrected cut,
+PCI/subsystem IDs, selected container and observed-FLR lifecycle. Each
+actual MAC access executes inside this original signed capability and
+the original NativeIo Bus invocation, with current checks across waits.
+The same retained scope covers subsequent A `Rx::prepare_for(64)` register/
+descriptor-base publication, A's unconditional LTR software trigger, and
+the actual GET_FEATURE register mailbox. LTR configuration uses the
+bounded original PCIe capability/version/DEVCTL2 observations through
+current signed and Bus invocations. This A adapter requires real ECAM;
+it refuses absent mappings instead of inventing config or using an
+unscoped DBI fallback. RX storage is retained before publication and
+through cancellation; normal packet TX and host IRQs remain closed.
+The grant remains retained across failure/drop. Historical N5AB v1 is
+unchanged and cannot authorize these newly routed MAC effects. Full
+N5AB v2/N5AC also bind that exact MAC identity and recipe; dependent
+fragment records consequently require fresh measurements.
+Absent MAC authority leaves the original Running firmware owner untouched
+and its A bootstrap waits for assets; a failure/drop after the attempt
+starts terminalizes it, so that wait cannot replay a failed MAC owner.
+
+For programmed A secure fuses, startup loads the separately signed96-byte
+`N5AS` v1 (`rtw89/rtw8852a-secure-v1-<mac>.bin`) under the same exact
+factory/fuse/assets/lifecycle identity before any firmware attempt. It
+uses that header/identity/MAC layout, byte54 blacklist version, byte55
+zero, bytes56..88 actual blacklist bitmap and bytes88..96 zero. The
+authenticated board snapshot constructs the immutable `DownloadPlan`
+inside its actual invocation; existing hardware MSS signature selection,
+section bounds, blacklist-version and deny-bit checks still apply. This
+is the existing owned firmware/policy snapshot contract, with retained
+evidence and entry/return checks, not a claim of live secure-policy
+revocation around each firmware MMIO. Missing/unsigned/mismatched policy
+refuses before effects; `Blacklist::upstream(A)` remains None. Erased
+secure fuses do not demand or invent a policy. Restrictive A shutdown
+reobserves its exact synchronous disable_bb_rf/PMAC masks under original
+PCI independently of failed RF/MAC qualifications; it supplies no reset,
+RF-idle or DMA-reclaim proof. New MAC/config/grant/secure-policy cases
+are authored and unrun pending final coordinated validation.
+
+The additional A DM-init chunk now executes source CCX/IFS initialization
+and NHM enable/power-method setup before PHYSTS/DIG. On actual corrected
+cuts0/1 it reads IB peak/backoff and all four gain arrays from their A
+BB fields, sign-extends the gain nibble with source bases/steps and
+programs paired max LNA6/TIA1/RXB31 reset fields; later cuts skip those
+IGI reads/writes and retain their source CCKPD behavior. A CFO init now
+uses actual `xtal_info` direct register0280 SC_XO23:17/SC_XI16:10,
+instead of B/C's XTAL-SI5/4. The original boxed DM state and observed
+gains move from Operating to the retained Radio and survive retune.
+The exact recipes are hashed into fresh full N5AB v2/N5AC, selected
+before effects; Native's A operating/RFK adapters explicitly refuse
+old cold-N5AB-v1-only authority. A native refusal regression and
+source gain/direct-XTAL/environment cases are authored and unrun.
+
+Width-aware A DIG/gain projection exists as a source helper, but
+periodic station DIG/NHM/gain-code tracking still lacks A's
+native adapter: A tracking ports/profile/layout explicitly return
+Unsupported and the RF-tracking accessor does no work without its
+measured A continuation. NHM trigger/result belongs to scan-channel
+notifications (mac.c5350/5381), not periodic IFS background work;
+native scan notification/history composition remains open. AP role/control,
+A aggregation and sleep/tracking companion owners remain open.
+The native A owner now programs MAC0/PHY0 non-DBCC channel control after
+its initial RF setup and trims. `channel_a` follows the A source help
+window, MAC/BB/RF18 A/B channel and bandwidth programs, SCO/CCK/spur/reset
+legs, then the exact per-channel power prefix and help exit. Channel power
+uses `Plan::visit_a_channel` (byrate, offset, limit and RU); the separate
+DM-init reference tail is not replayed. Geometry is matched to the plan
+before I/O; every access retains admission and masked readback. A failure
+or dropped attempt leaves the owner non-Ready and does not resume an
+incomplete help window. Six native regressions cover literal programs,
+plan/width refusal, access/readback/cancellation, actual qualification and
+WLAN-only coexistence grants/revocation. The current A WLAN-only grant
+program is band-independent and never dispatches the C grant algorithm.
+All six channel cases pass in the coordinated x86_64 Wi-Fi run. This is
+software evidence for Programmed state, without RF/station acceptance.
+
+The new channel boundary is domain-bound into the N5AB v2/N5AC identity;
+old full-radio records cannot silently authorize it. N5AB v1 cold
+calibration is unchanged. Channel programming alone still yields only
+`Programmed`; it cannot publish `Radio::channel()` or `Native.channel`.
+The separately measured complete RFK continuation below must finish first.
+
+The retained A owner now also derives the source FEM flags from that same
+actual factory RFE (`rtw8852a.c::rtw8852a_fem_setup`):11/12/17/18/51/53
+have EPA and ELNA on2G and fall through to5G;9/10/15/16 have only5G;
+other non-erased RFE values have neither. These are flags per band, not
+per RF path, and erased255 or another chip cannot supply them.
+After the programmed channel's help exit, a separately measured bounded
+observation runs the non-TSSI branch of `rtw8852a_get_thermal`: on each
+actual A RF path, RF42 BIT19 trigger1/0/1,200us, then RF42 bits6:1.
+The original direct apertures are0x1c108/0x1d108; no B RF-base substitution
+or factory-thermal fallback is used. Source `DECLARE_EWMA(thermal,4,4)`
+history and `last_thermal_max` are retained; zero samples leave the mean
+unchanged, including an unavailable zero mean before the first observation.
+This is an explicit post-channel observation, separate from Linux's initial
+DM thermal-update position. At this point the fresh A owner has not enabled
+TSSI, so it uses the actual RF sensor rather than presuming the later BB
+thermal source is active. The cold-observation channel method refuses reuse
+after TSSI enable; no RF-sensor sample is substituted for a live TSSI reading.
+`Startup::retune_channel` and `retune_wide` select the original retained
+A owner for pre-station source retunes. Once the packet runtime is started,
+actual changes refuse before effects: an RXQ/RPQ epoch/quarantine handoff
+must be composed before live station scan/CSA retunes can open. A same-profile
+observation may return its unchanged valid epoch. Before withdrawing the
+ordinary grant and old channel epoch on the pre-station path, Native polls
+the real CH12 completion owner, requires empty command queues and software RX
+backlog, a ready packet core, matching actual peer/link state, and source
+CPWM/MACID-awake observations inside the original grant and Bus invocation.
+The target's exact loaded N5AC, actual selected firmware/power/tracking and
+factory calibration must match before any target emission. The new target
+grant is selected before the first RF access and remains current on accesses
+and after waits. Retune reads live TSSI thermal from source BB1c10/3c10
+bits29:24, retaining the existing EWMA/zero history, executes the A channel
+help/power sequence and band-change TSSI scan, then full channel RFK using
+the same TSSI/DPK owners. No B Radio, power, coexistence or calibration state
+is borrowed. Only complete fresh RFK/pre-TX receipts publish a new epoch;
+failure/drop retains the uncertain help/PMAC/scheduler state for the outer
+A terminal closure and cannot reconstruct or replay an owner. Same-profile
+requests check the actual original publication and return its existing epoch
+without hardware effects. Unexecuted native cases cover in-band and5GHz/80
+retune, retained thermal history, dropped help-window ownership, exact A
+optional-program dispatch and original grant/Bus revocation.
+Every trigger/read still passes the retained current signed A and cold
+calibration invocations plus the original Bus invocation. A failure or
+dropped delay retains Busy and existing history, publishes no fresh complete
+two-path observation and cannot retry with a replacement owner. The
+observation recipe is separately hashed into N5AB v2/N5AC, requiring fresh
+full-program identities; historical cold N5AB v1 is unchanged. New source,
+actual-Native aperture/grant, failure and cancellation cases are authored
+and remain unrun pending the final coordinated validation.
+`radio_a::Radio::complete_channel` now feeds those actual nonzero EWMA and
+factory FEM facts to `rfk::a_channel::Channel`. Factory thermal remains only
+the source EFUSE tmeter-table input. Pure preflight requires the actual
+selected A TXPWR_TRK element: fw.c requires bitmap0xfff0 for2G/5G; optional
+6G rows consume their actual bytes when present. An absent element, missing
+required row or malformed extent refuses before the native RF program.
+A no longer inherits C's mandatory6G bitmap.
+
+`a_tssi::tail::Inputs::from_assets` issues the exact source queries through
+`radio_power_c::Rules`: current-BW MCS/1TX/nonBF at the lowest occupied20MHz
+channel for `_tssi_high_power`, and OFDM/20MHz/1TX/nonBF at that channel for
+`_tssi_pre_tx`. The retained WW/no-DAG/no-SAR state uses the same actual
+source reader as the programmed power plan. The high-power test is the source
+`power*100/4 > 1800` on2G; otherwise the literal tracking table runs and
+extra offsets/check flags clear. Pre-TX uses A's MAC factor1 and the exact
+`(power*100)>>1 > 1800 ? 68 : power*2` BB setting, including signed values.
+These limits and the actual69-entry A HT20-MCS7 PLCP table are bound into a
+new full-program identity; old N5AB v2/N5AC and dependent N5AF artifacts
+cannot silently authorize these new emissions. Cold N5AB v1 remains unchanged.
+
+The full source tail preserves A's own helpers and order: DPK coexistence
+START, retained scheduler pause/RF RX-idle, actual16-bit TX counter, full PLCP
+writes, duplicate PHY0/PHY1 MAC_SEL writes onto PHY0 in non-DBCC mode,
+AB path3/NSS4 and source path-B TX-power reset1/3, BB power, PMAC grant/CCA/
+reset and20-count/5000-period start, actual15ms wait, then the source's
+replayed PLCP/path/power/stop. It retains both counter readings and the source
+subtraction result; it never pretends the configured20 count was observed.
+The source's conditional/six-read default-TXAGC offsets remain optional actual
+observations, with retained prior values distinguished from fresh samples.
+TMAC restore, scheduler resume and DPK coexistence STOP finish the tail.
+Both30ms Bluetooth-preserve intervals conservatively wait the full duration;
+this does not claim a Bluetooth link or an A2DP receipt. The source connection
+RFK notification itself changes software state only.
+
+The native sequence is actual channel/power -> live RF thermal -> RXDCK ->
+IQK -> complete TSSI prefix/high-power/pre-TX -> DPK. `ChannelInputs::tail`
+is optional for diagnostic source composition: `None` returns only
+`Outcome::PartialTssi`, with no calibrated channel or tracking permission;
+`Some` reaches `Calibrated` only after its actual complete tail and DPK.
+`Radio::complete_channel` further refuses unknown/zero thermal averages,
+unchanged TX counter, absent/zero fresh default-TXAGC observations or failed
+non-EPA DPK paths. Actual factory EPA permits only the source DPK bypass.
+Only this positive retained full receipt can publish the native operating
+channel and install the existing A ordinary grant. The existing station
+sequence still requires actual command ACKs, including CMAC `NTX_PATH_EN=RF_A`
+and zero maps (`fw.c::__rtw89_fw_h2c_set_tx_path`, A UD layout), before
+packet/role publication; PMAC's AB BB fields are not an ordinary TX-A receipt.
+
+Cancellation or failure keeps the original radio non-Ready and all uncertain
+DMA retained. `Native::fail` now has an A-specific restrictive PMAC/TMAC
+closure followed by A's exact `rtw89_mac_disable_bb_rf` order: clear SYS_FUNC_EN
+BB reset bits, WLRF_CTRL bits15/9/7/1, then PHYREG_SET ALL_CYCLE. Each actual
+access uses the original current Bus invocation even if the RF qualification
+was revoked. A revoked Bus forbids those writes; no successful helper, BME-off,
+clock clear or idle read creates a reset/reclaim/physical-RF-stop receipt.
+B/C/51/BE closure recipes are unchanged. New native Rust cases cover full A
+source-tail programs/receipts on2G and5G, positive composed radio completion,
+sparse supported-band tracking rows, PMAC failure/drop, and original Native
+restrictive closure after RF grant revocation with retained command DMA.
+All new cases remain unrun until the final coordinated validation. Exact
+signed measurements/assets and physical RF/firmware/interoperability acceptance
+remain required; this source continuation is not a hardware-acceptance claim.
+The Native-level A `radio_access`
 test (`smoke_rtw89_native_a_radio_access_requires_factory_phycap_and_polling_rx`)
 drives RX to Polling via `Rx::prepare_for` on a local `pcie::Interface`
 model and requires the factory A PHY-cap window; the end-to-end A
@@ -4747,7 +5293,7 @@ or physical hardware acceptance.
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Initial B power/PCIe initialization | Retained actual cold/firmware/MAC/RX/full-radio/ordinary BE/MGMT startup and probe integration implemented; selective source PCI setup is bounded to this awake polled profile |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; initial B packet/RF startup is implemented; A/51 secure-policy loading remains outside the initial profile |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; initial B packet/RF startup is implemented; A secure-fuse policy is now handed to startup through signed N5AS; 51 uses the exact source NULL blacklist policy; new native/physical validation remains pending |
 | Initial B reset, rings and ownership | Actual temporal FLR or explicit trusted platform reset contract; retained BDRAM/CH12/RX/RPQ plus fresh BE/MGMT rings and terminal storage ownership implemented. AX v0 MSI delivery and proven DMA reclamation implemented; recovery remains separate |
 | Initial B native TX and bounded completion | Exact source TXWD/BD/WP/address-info and joint TXBD/RPQ retirement are activated by the same retained station owner;512 nonreused identities per queue |
 | RPQ release handling, RX assembly/validation and frame delivery | B retained native RXQ/RPQ publication/polling, checked segmented RX/FCS, RPQ records and bounded C2H/ACK decoding implemented; same-owner packet completion dispatch, raw station frame delivery and kernel DHCP/IP are implemented |
@@ -4839,7 +5385,7 @@ triage above remains separate from implementation.
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have 6GHz applicability. RTL8852C: implemented ("C 6GHz power, records and station"): 6GHz TX power program (regd.c policy, `reg_6ghz_power`, TPE), signed 6GHz `N5CC` records with per-power-type client admission, native staging/retune with band-qualified channel identity, the HE20 station 6GHz scan (PSC/RNR planning, active only on active records), SAE-H2E join through `admit_with_rule` + `JoinPlan::prepare_6ghz`, HE 6GHz Band Capabilities, AP TPE into the plan, HE-only RA and 6GHz band advertisement of admitted primaries only. Native/physical validation pending; HE20 only, 6GHz CSA disconnects, post-association TPE changes not re-applied. RTL8922A 6GHz admission is implemented at the station owner (`station_8922a`: TPE rearranged to the full operating width + power program at 20/40/80/160 MHz — legacy HE20 20 MHz only; register-level `rtw8922a_set_txpwr` program delivered in `radio_power_be::Plan`, applied by `Prepared8922a::set_txpwr`, first live caller `Prepared8922a::set_channel`). The retained B profile is 2.4GHz-only in software. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
-| `rtl8852a` | Step 1 done: NHM noise monitoring (`nhm.rs`, fixture-tested — 8852A-only threshold/report tables, 11k thresholds with the WA override, weighted-average noise, trigger/set/get-result model, `support_noise` true) and the authenticated board secure-policy load path (`Blacklist::board_8852a`; upstream 8852A policy is NULL but NARF takes no 8851B-style signature-only fallback for A). Step 2 done: the station owner — `station_control::Controller::new` admits A on B's codec (same CCTLINFO_UD, `bacam_num` 2 / BACAM_V0, `addrcam_ver` 0; `rtw8852a.c:2434..2437,2472` @ 05441d6), `startup_station::station_allowed` admits A, the A station window (`a_phy_window` 0x1d3fc from `rf_base_addr` {0xc000, 0xd000}, `a_station_window`) gates the preflight, RX DMA takes the AX geometry plus the A-only LTR software trigger (`rx_dma.rs`), TX transport admits A QoS/+HTC/host-CCMP with the 36-bit DAC mask, and packet composition runs through `transmit_a` (AX v0 body) with ordinary-station-only rings — all fixture-tested, including a byte-identical A-vs-B H2C/register stream. Step 3 done (Refs #1879): A RF bases (`rf_access::Rf::for_chip`, `rf_base_addr` {0xc000, 0xd000}, `Native` wires it), A PHY-cap (`Factory::a_phycap`, `phycap_addr` 0x580/size 128) with the A calibration decode (`factory_a.rs`: TSSI/thermal/PA-bias trims per rtw8852a.{c,h}) and the A PHY window (`a_phy_window`, last direct RF dword 0x1d3fc) gating `command_native::radio_access` for A, A-domain radio program identities (`radio_policy_a.rs`: WMM/QoS/RA/HT/HE/A-MPDU over the v0 TXWD path), and `packet_core` A admission (ordinary station rings on the AX address set, A-MPDU, A-MSDU to A's 3500-byte `max_amsdu_limit`, AP role with CH9). Step 4 done (Refs #1902): the BB/RF tables (`rtw8852a_table.c`, 51,012 lines) and the RFK flow on top of them landed in #2054, and this PR wires the A `Qualification`/`OrdinaryGrant::A` in `command_native` (`qualification_a`, `ChipProgram::A`, `calibration_access` / `station_tx_current` A arms), the A fragment companion (N5AF, end-to-end A fragment submit test) and a Native-level A `radio_access` test (RX at Polling via `Rx::prepare_for`). Step 5 done (Closes #2074): the A RF program owner — `radio_init::from_factory_a` / `Inputs::A` / `power_units_a` (3 MAC writes, COEXT_CTRL 0x01ebf004) / `reset_a` (B's reset minus the B-only 0x11200/0x13200 HW-SI writes) / `nctl_a` (NCTL_PREINIT[..4], no post table) / `controls_a` (rtw8852a_bb_sethw), `radio_a::Radio` (bb_sethw + DM sub-inits + NCTL, then rtw8852a_rfk_init + set_txpwr_ctrl + power trim; no bb_cfg_txrx_path, no channel program yet), `coex_native::Coex::prepare_a` (A WLAN-only BTC init + OFF policy) and the `command_native` A dispatch (`preflight_radio_a` / `prepare_radio_a` installing `OrdinaryGrant::A`, wired through `startup::prepare_radio_a` + `bootstrap::advance`) — all fixture-tested at init/coex/owner level. Still absent: the A `set_channel` / `rfk_channel` owner (follows #2098, channel RFK IQK/DPK/TSSI), so no channel is programmed yet and native A station operation still cannot be advertised. |
+| `rtl8852a` | A BB/RF/NCTL, WLAN-only coexistence, MAC0/PHY0 non-DBCC20/40/80 channel/power, actual FEM/live thermal, complete source TSSI high_power/pre_tx and native RXDCK/IQK/TSSI/DPK now compose under fresh exact A qualifications. DIDs8852/a85a route to the retained original FLR/startup; exact A SCC/MAC plus owned polling RX/LTR/GET_FEATURE use new per-access signed N5AM authority, and programmed secure fuses obtain the authenticated N5AS board blacklist snapshot before firmware effects. N5ABv1 stays unchanged; full N5ABv2/N5AC and fragment identities require fresh measurements. Native channel publication and pre-station retained RF retune require complete actual RFK and strict fresh PMAC counter/default-offset receipts, preserve history/scheduler ownership and close uncertain engines independently on failure/drop. Live station retune refuses before effects pending actual RXQ/RPQ epoch/quarantine composition. Feature/current-channel/regulatory dispatch uses A records; station/AX-v0/A-MPDU/fragment components exist. Remaining source composition: native periodic A DIG/NHM/gain tracking, AP role/protocol owner, signed A-MSDU/sleep/RF-tracking companion owners and complete chip acceptance. New software cases are authored and unrun; exact signed deployment measurements and physical RF/packet acceptance remain pending. |
 | `rtl8851b` | Source identifies the 1TX/1RX dual-band chip. The exact secure policy is now pinned (Linux NULL `fw_blacklist`: no host chip list, content bounds still enforced, MSS signature still required) and the one-path antenna-diversity owner exists (`antdiv_51`, composed into `radio_51::prepare_controls` with retained state: `rfe_gpio` incl. the `<= 50` GPIO bound, `reg_init`/`set_ant` programs, EWMA stats + training/decision/track state machine). The state machine is hooked into the PHYSTS path (`startup_station.rs` `packet_poll` -> `radio_51::parse_ppdu`, phy.c `rtw89_phy_antdiv_parse`) and periodic work (`radio_51::track` -> `antdiv_tick`, phy.c `rtw89_phy_antdiv_track`), and `pci::probe` routes `10ec:b851` to the retained bootstrap (`radio_51` station runtime). Remaining: signed N51 records/provisioning and native/physical acceptance. |
 | `rtl8852c` | The advertised AX-v1/three-band hardware description is not a native station profile. C needs the exact generation-specific PCI/descriptor transport plus firmware/security, RF/calibration/power and station composition; the current retained Controller/N52B profile is B-only. |
-| `rtl8922a` | BE EFUSE (DDV physical dump, 3-byte-header logical parse, per-block driver, PHY-cap window, secure/ECV/thermal-K readers, BAR MAC), chip container, BE TXD body v2 encode, BE RXD short v2 parse, v2 interrupt mask/enable/disable/recognize, and BE RA H2C v1 builder are implemented (`chip_8922a.rs`, `efuse_be.rs`, `txrx_be.rs`, `irq_be.rs`, `ra_v1.rs`, fixture-tested). Runtime step 1 is also implemented: BE PCI DMA control sequence (`dma_be`: WPDMA/TRXDMA/TXDMA channel + FW channel, index clear, mode-op, BDRAM reset, MIT, post-init tail, DMA-all), BACAM_V1 H2C encoding + slot map with Linux eviction rule (`bacam_v1`), G7 default CMAC table (`cctl_g7`). Steps 2–7 are also implemented, fixture-tested: station owner + admission (`station_8922a.rs`, step 2), TX-power profile + CCTL update builders + RA mask (`txpower_8922a.rs` TSSI/gain-offset parse, `cctl_g7` ampdu/txtime/punctured, `ra_mask`, step 3), BE DMA ring programming + transport (`dma_8922a.rs`, `tx_8922a.rs`, step 4), Prepared wiring + probe admission (`prepared_8922a.rs`, `pci.rs` bring-up, step 5), interrupt config/mask + v2 classification + MSI binding (`irq_be.rs` `IsrsBe::events`, `BindingBe`, step 6), and the C2H completion path (`completion_8922a.rs`: NAPI-order RPQ then RXQ drain, C2H envelope parse + route, H2C-ack surfacing, TX receipts freeing retained DMA buffers, step 7). Still absent: the complete firmware/RF/power/station profile (BB/RF tables — NULL in Linux, loaded from firmware — thermal/TSSI tracking (#1944: no BE TSSI tables exist upstream; upstream `rtw8922a_rfk_track` is an empty stub), calibration, firmware-security wiring; the TX-power program including by-rate tables and regulatory limits is delivered in `radio_power_be::Plan`, applied by `Prepared8922a::set_txpwr`), MLO multi-link, legacy-mode admission, the MAC/PHY/BTC C2H handlers, BA reorder, A-MSDU deaggregation, RX fragment reassembly, and 8922A admission into `station_control`. Done 2026-11-08 (#1867 lane): FWCMD header framing for H2C bodies (`fwcmd_8922a.rs`) with H2C-ack → retained-buffer matching in the completion path, the TXWD_INFO v2 fill (`txrx_be::fill_txwd_info_v2`, `tx_8922a::build_header_with_info` / `Prepared8922a::prepare_data_with_info`), the full `pwr_on_func` tail / `mac_pre_init` owner (`mac_pre_init_8922a.rs`, run from `pci::bring_up`), and `cid` retention (`HalChipVer`, recorded on the owner). 6GHz admission is also implemented (station_8922a: TPE rearranged to the full operating width + power program at 20/40/80/160 MHz — legacy HE20 20 MHz only; register-level `rtw8922a_set_txpwr` program delivered in `radio_power_be::Plan`, applied by `Prepared8922a::set_txpwr`). The set_channel owner is implemented (`channel_be.rs` + `Prepared8922a::set_channel`, driven from `Rtw89Device::set_channel_8922a`: `rtw8922a_set_channel_mac` program + `set_txpwr` live call + band-change record; BB/RF programs, help bracket, BTC switch-band and the async channel RFK remain open). The AX-path 8922A refusals are verified already-delivered (see `tx_transport`, `packet_format`, `packet_core`, `factory`, `fifo`, `bdram`, `download_dma`, `irq::Mask::config`, `station_control::Controller::new`). Of the 8922A dispatch gates, two are now routed: `command_queue.rs` `descriptor` takes the BE 24-byte short-v2 FWCMD descriptor (`fwcmd_8922a::fwcmd_txdesc`) and `efuse.rs` `read_mac_with` takes the BE PCIe BAR MAC (`efuse_be::read_mac_pcie`). Six still deliberately refuse the chip — their AX register sequences have BE parallels already wired through probe (`prepared_8922a` / `BeFactory` / `irq_be::MaskBe` / `dma_be` / `fwdl_be`): `bdram.rs`, `download_dma.rs`, `factory.rs`, `fifo.rs`, `irq.rs` `Mask::config`, `station_control.rs` `Controller::new` (whose `&Factory` input cannot carry 8922A). Native EHT/320MHz cannot be enabled by shared IE encoders before that owner exists. |
+| `rtl8922a` | Retained native FLR → checked packet-closed power/factory → owned DLFW DMA/DLE/HFC/PCI/BME → fresh signed NORMAL+BBMCU0 → closed sys_init/SCC-TRX → actual GET_FEATURE → separately measured N22P partial native radio composition implemented (§3). Actual original factory/maps, corrected chip/AID-selected signed assets, RF-v2/XTAL, complete BB postinit/gain/NCTL, partial DM, source Tx/Rx paths/channel/power/context and init-late PRE/DACK/RXDCK use retained original authority/CH12/C2H/scheduler ownership. All legacy/pending/prefetched DMA remains retained across uncertainty. PartialMac1Off explicitly omits inaccessible unused-MAC1 UL-power writes; BE BTC-dependent channel RFK refuses. Ordinary RX/station/AP/EHT stays closed pending complete DM domain/coexistence/full-channel-RFK, measured packet/response permission and final packet/MLME composition. Existing station/TPE/power/TXWD_INFO/IRQ/MLO component owners remain available. Historical N22A-v1 is unchanged and cannot admit N22P. New software validation, exact signed deployment measurement and physical acceptance remain pending; AArch64 is outside this task. |

@@ -1,3 +1,5 @@
+#[path = "command_native_channel_a_tests.rs"]
+mod channel_a_tests;
 #[path = "command_native_fragment_tests.rs"]
 mod fragment_tests;
 #[path = "command_native_rf_tracking_tests.rs"]
@@ -103,6 +105,7 @@ impl Fixture {
             ordinary: None,
             full_qualification: None,
             qualification_a: None,
+            mac_a: None,
             qualification_c: None,
             qualification_51: None,
             operating: Some(super::super::phy_operating::Operating::default()),

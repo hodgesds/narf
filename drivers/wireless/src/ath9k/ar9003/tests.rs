@@ -5,6 +5,13 @@ use super::*;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+// INI constants can be emitted separately in different codegen units.
+// Their addresses are not an identity contract; preserve the independent
+// source-derived digests below and compare the actual register/value rows.
+fn rows_equal<const C: usize>(actual: &[[u32; C]], expected: &[[u32; C]]) -> bool {
+    actual == expected
+}
+
 const SREV_9300_22: u32 = 0x001c_03ff;
 const MAC: [u8; 6] = [0x00, 0x03, 0x7f, 0x12, 0x34, 0x56];
 
@@ -688,7 +695,7 @@ fn smoke_ath9k_ar9580_revision_split_and_ini_selection() -> TestResult {
         }
         (h, rows.len())
     };
-    let ar9580 = |t: &[[u32; 5]], u: &[[u32; 5]]| core::ptr::eq(t, u);
+    let ar9580 = |t: &[[u32; 5]], u: &[[u32; 5]]| rows_equal(t, u);
     if all != (0xa7d3_dd7b_e1f6_d1d7, 886)
         || default.tx_gain_kind != TxGain::LowestObDb
         || default.rx_gain_kind != RxGain::Common
@@ -697,11 +704,11 @@ fn smoke_ath9k_ar9580_revision_split_and_ini_selection() -> TestResult {
         || default.fast_clock.len() != 9
         || default.cck_fir_japan_2484.len() != 3
         || default.dfs.len() != 5
-        || !core::ptr::eq(
+        || !rows_equal(
             default.radio_core,
             super::initvals_ar9580::AR9580_1P0_RADIO_CORE,
         )
-        || !core::ptr::eq(default.soc_pre, super::initvals::AR9300_2P2_SOC_PREAMBLE)
+        || !rows_equal(default.soc_pre, super::initvals::AR9300_2P2_SOC_PREAMBLE)
         || !ar9580(default.mac_post, super::initvals::AR9300_2P2_MAC_POSTAMBLE)
     {
         return TestResult::Fail("AR9580 1p0 default INI selection differs from Linux");
@@ -930,7 +937,7 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
     if oracle(&default20) != (0x6b83_5b40_4777_8dd5, 755)
         || default20.tx_gain_kind != TxGain::LowestObDb
         || default20.rx_gain_kind != RxGain::Common
-        || !core::ptr::eq(
+        || !rows_equal(
             default20.radio_post_sys2ant,
             t::AR9462_2P0_RADIO_POSTAMBLE_SYS2ANT,
         )
@@ -963,9 +970,9 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
         if tables.pcie_serdes.len() != awake
             || tables.pcie_serdes_low_power.len() != low
             || (awake > 0
-                && !core::ptr::eq(tables.pcie_serdes, t::AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1))
+                && !rows_equal(tables.pcie_serdes, t::AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1))
             || (low > 0
-                && !core::ptr::eq(
+                && !rows_equal(
                     tables.pcie_serdes_low_power,
                     t::AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1,
                 ))
@@ -977,10 +984,10 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default21) != (0xf5f2_6f37_ac39_d73d, 755)
-        || !core::ptr::eq(default21.mac_core, t::AR9462_2P1_MAC_CORE)
-        || !core::ptr::eq(default21.bb_post, t::AR9462_2P1_BASEBAND_POSTAMBLE)
-        || !core::ptr::eq(default21.soc_pre, t::AR9462_2P1_SOC_PREAMBLE)
-        || !core::ptr::eq(
+        || !rows_equal(default21.mac_core, t::AR9462_2P1_MAC_CORE)
+        || !rows_equal(default21.bb_post, t::AR9462_2P1_BASEBAND_POSTAMBLE)
+        || !rows_equal(default21.soc_pre, t::AR9462_2P1_SOC_PREAMBLE)
+        || !rows_equal(
             default21.radio_post_sys2ant,
             t::AR9462_2P1_RADIO_POSTAMBLE_SYS2ANT,
         )
@@ -1161,18 +1168,18 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
             if want.is_empty() {
                 got.is_empty()
             } else {
-                core::ptr::eq(got, want)
+                rows_equal(got, want)
             }
         };
         let same5 = |got: &[[u32; 5]], want: &[[u32; 5]]| {
             if want.is_empty() {
                 got.is_empty()
             } else {
-                core::ptr::eq(got, want)
+                rows_equal(got, want)
             }
         };
         if tables.tx_gain_kind != tx
-            || !core::ptr::eq(tables.tx_gain, table)
+            || !rows_equal(tables.tx_gain, table)
             || tables.rx_gain_kind != rx
             || fnv(&[], &[tables.tx_gain]) != tx_hash
             || fnv(&[tables.rx_gain], &[]) != rx_hash
@@ -1307,7 +1314,7 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
     if oracle(&default10) != (0xacd9_a70b_8756_3d5a, 711)
         || default10.tx_gain_kind != TxGain::LowObDb
         || default10.rx_gain_kind != RxGain::Common
-        || !core::ptr::eq(default10.radio_post, t::AR9565_1P0_RADIO_POSTAMBLE)
+        || !rows_equal(default10.radio_post, t::AR9565_1P0_RADIO_POSTAMBLE)
         || !default10.radio_post_sys2ant.is_empty()
         || !default10.rxgain_bb_core.is_empty()
         || !default10.rxgain_bb_postamble.is_empty()
@@ -1337,9 +1344,9 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
         if tables.pcie_serdes.len() != awake
             || tables.pcie_serdes_low_power.len() != low
             || (awake > 0
-                && !core::ptr::eq(tables.pcie_serdes, t::AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1))
+                && !rows_equal(tables.pcie_serdes, t::AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1))
             || (low > 0
-                && !core::ptr::eq(
+                && !rows_equal(
                     tables.pcie_serdes_low_power,
                     t::AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
                 ))
@@ -1351,10 +1358,10 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default11) != (0x550e_5802_200a_6506, 711)
-        || !core::ptr::eq(default11.radio_post, t::AR9565_1P1_RADIO_POSTAMBLE)
-        || !core::ptr::eq(default11.mac_core, t::AR9565_1P0_MAC_CORE)
-        || !core::ptr::eq(default11.bb_post, t::AR9565_1P0_BASEBAND_POSTAMBLE)
-        || !core::ptr::eq(default11.soc_pre, t::AR9565_1P0_SOC_PREAMBLE)
+        || !rows_equal(default11.radio_post, t::AR9565_1P1_RADIO_POSTAMBLE)
+        || !rows_equal(default11.mac_core, t::AR9565_1P0_MAC_CORE)
+        || !rows_equal(default11.bb_post, t::AR9565_1P0_BASEBAND_POSTAMBLE)
+        || !rows_equal(default11.soc_pre, t::AR9565_1P0_SOC_PREAMBLE)
     {
         return TestResult::Fail("AR9565 1p1 default INI selection differs from Linux");
     }
@@ -1451,7 +1458,7 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
             return TestResult::Fail("identity refused");
         };
         if tables.tx_gain_kind != tx
-            || !core::ptr::eq(tables.tx_gain, table)
+            || !rows_equal(tables.tx_gain, table)
             || tables.rx_gain_kind != rx
             || fnv(&[], &[tables.tx_gain]) != tx_hash
             || fnv(&[tables.rx_gain], &[]) != rx_hash
@@ -1599,9 +1606,9 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
     if oracle(&default) != (0x80b4_c5ff_64c6_1020, 648)
         || default.tx_gain_kind != TxGain::LowestObDb
         || default.rx_gain_kind != RxGain::Common
-        || !core::ptr::eq(default.mac_post, t::AR9485_1_1_MAC_POSTAMBLE)
-        || !core::ptr::eq(default.bb_pre, t::AR9485_1_1)
-        || !core::ptr::eq(default.radio_post_allmodes, t::AR9485_1_1_RADIO_POSTAMBLE)
+        || !rows_equal(default.mac_post, t::AR9485_1_1_MAC_POSTAMBLE)
+        || !rows_equal(default.bb_pre, t::AR9485_1_1)
+        || !rows_equal(default.radio_post_allmodes, t::AR9485_1_1_RADIO_POSTAMBLE)
         || !default.radio_post.is_empty()
         || !default.soc_post.is_empty()
         || default.pcie_serdes.len() != 3
@@ -1628,8 +1635,8 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
         let Some(tables) = tables_for(0x00, &rev11, serdes::PllPwrsave::from_bits(bits)) else {
             return TestResult::Fail("identity refused");
         };
-        if !core::ptr::eq(tables.pcie_serdes, table)
-            || !core::ptr::eq(tables.pcie_serdes_low_power, table)
+        if !rows_equal(tables.pcie_serdes, table)
+            || !rows_equal(tables.pcie_serdes_low_power, table)
             || tables.pcie_serdes.first().map(|r| r[1]) != Some(first)
         {
             return TestResult::Fail("AR9485 SerDes selection differs from Linux");
@@ -1640,7 +1647,7 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default12) != (0x80b4_c5ff_64c6_1020, 648)
-        || !core::ptr::eq(default12.mac_core, t::AR9485_1_1_MAC_CORE)
+        || !rows_equal(default12.mac_core, t::AR9485_1_1_MAC_CORE)
     {
         return TestResult::Fail("AR9485 later macRev INI selection differs from Linux");
     }
@@ -1761,7 +1768,7 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
             return TestResult::Fail("identity refused");
         };
         if tables.tx_gain_kind != tx
-            || !core::ptr::eq(tables.tx_gain, table)
+            || !rows_equal(tables.tx_gain, table)
             || tables.rx_gain_kind != rx
             || fnv(&[], &[tables.tx_gain]) != tx_hash
             || fnv(&[tables.rx_gain], &[]) != rx_hash

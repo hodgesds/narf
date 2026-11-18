@@ -5129,6 +5129,14 @@ Checksum-PARTIAL is completed in software before group encryption. Counters
 reserve before publication and include consumed unsent PN/IPN; same-key
 reinstall preserves/raises the existing floor and deletion erases the key
 without allowing retired material to restart its nonce space.
+The private host-group enqueue path borrows that actual mutable Session,
+requires pointer identity with the hardware's original AP owner and its
+exact MCAST/TID0 queue, and protects/posts inside the current source
+invocation. Ordinary raw-protected enqueue remains refused. A different
+current owner allocation or foreign queue cannot consume a GTK PN.
+Gen2 netdev enqueue retains the admitted `TxMeta` on the actual Frame so
+software checksum completion still precedes host GTK encryption; the
+native on-air decrypt/checksum regression verifies that handoff.
 
 In actual GO9, `supports_ap_key_sequence` and `key_sequence_ap_async` implement
 the shared original-authority GET_KEY path for installed host GTK/IGTK.

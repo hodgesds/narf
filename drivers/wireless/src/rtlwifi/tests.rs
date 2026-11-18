@@ -867,6 +867,7 @@ fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
     let device = super::pci::RtlwifiDevice {
         name: "rtlwifi-unready-fixture",
         native: None,
+        ae: None,
         firmware: None,
         prepared: None,
         factory: None,

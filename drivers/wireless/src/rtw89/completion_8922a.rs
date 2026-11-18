@@ -130,6 +130,49 @@ const RXD_LEN_LONG: usize = 40;
 /// One RPQ record: Linux's original 4-byte format
 /// (`rtw8922ae.c:39`, `.rpp_fmt_size = sizeof(struct rtw89_pci_rpp_fmt)`).
 const RPP_SIZE: usize = 4;
+
+/// RTL8922A selects pci_parse_rpp and sizeof(rpp_fmt)=4, independently
+/// of the later BE chips' eight-byte v1 format. Shared queue state is not
+/// an AX wire-codec authority.
+pub(super) fn parse_rpq_record(bytes: &[u8]) -> Result<super::tx_transport::Report, Error> {
+    let word = u32::from_le_bytes(bytes.try_into().map_err(|_| Error::Extent)?);
+    let qsel = ((word >> 8) & 0x1f) as u8;
+    let status = ((word >> 13) & 7) as u8;
+    if word & (1 << 31) != 0 || status > 3 {
+        return Err(Error::Descriptor);
+    }
+    Ok(super::tx_transport::Report {
+        sequence: ((word >> 16) & 0x7fff) as u16,
+        channel: super::tx_8922a::channel_for_qsel(qsel).map_err(|_| Error::Descriptor)?,
+        mac_id: word as u8,
+        qsel,
+        status,
+    })
+}
+
+/// Source FS/LS RPQ extent after BE query_rxdesc_v2. Never interprets the
+/// write-size padding beyond the actual RXBD-info extent as another buffer.
+pub(super) fn rpq_records(bytes: &[u8]) -> Result<&[u8], Error> {
+    let info = rxbd_info(bytes)?;
+    if !info.fs || !info.ls {
+        return Err(Error::Segment);
+    }
+    let bytes = &bytes[..info.size];
+    let rxd = decode_rxd_be(bytes.get(4..).ok_or(Error::Extent)?).ok_or(Error::Descriptor)?;
+    let dw0 = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| Error::Extent)?);
+    let rxd_len = if dw0 & RXD_D0_LONG != 0 {
+        RXD_LEN_LONG
+    } else {
+        RXD_LEN_SHORT
+    };
+    let offset = 4
+        + usize::from(rxd.shift) * 2
+        + usize::from(rxd.drv_info_sz) * 8
+        + usize::from(rxd.phy_rpt_sz) * 8
+        + usize::from(rxd.hdr_cnv_sz) * 16
+        + rxd_len;
+    bytes.get(offset..).ok_or(Error::Extent)
+}
 /// PHY-report length that carries the RSSI dword
 /// (`core.c` `rtw89_core_query_rxdesc_v2`: 8 bytes).
 const PHY_RPT_RSSI_LEN: usize = 8;

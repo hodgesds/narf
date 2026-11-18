@@ -161,7 +161,11 @@ pub(super) fn fill_addr_info_v1(
     total_len: usize,
     dma: u64,
 ) -> Result<usize, Error> {
-    if dma > FRAME_DMA_MASK {
+    if total_len == 0
+        || dma
+            .checked_add(total_len as u64 - 1)
+            .is_none_or(|end| end > FRAME_DMA_MASK)
+    {
         return Err(Error::BadDma);
     }
     let entries = total_len.div_ceil(ADDR_INFO_MAX_LEN);
@@ -433,12 +437,8 @@ impl DataTx {
         &mut self,
         bytes: &[u8],
     ) -> Result<Option<Completion<Retained>>, Error> {
-        let report = tx_transport::parse_report(bytes).map_err(|error| match error {
-            tx_transport::Error::BadFrame => Error::BadFrame,
-            tx_transport::Error::StaleReport => Error::StaleReport,
-            tx_transport::Error::BadQueue => Error::BadQsel,
-            _ => Error::BadFrame, // parse_report only yields these three.
-        })?;
+        let report =
+            super::completion_8922a::parse_rpq_record(bytes).map_err(|_| Error::StaleReport)?;
         let queue = self
             .queues
             .get_mut(report.channel as usize)

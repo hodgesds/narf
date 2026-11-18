@@ -381,9 +381,12 @@ pub(super) fn transmit_51(
         fragments: false,
     })
 }
-/// New full native fragment emitter always fixes CCK1/no aggregation and host
-/// sequence mode, including management. Original SW_SN/fragno stays on air.
+/// Explicit RTL8852A/B AX v0 fragment emitter: fixed band floor, no aggregation
+/// and host sequence mode, including management. Original SW_SN/fragno stays
+/// on air; ordinary A/B emitters continue refusing fragmented frames.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn transmit_fragment(
+    chip: ChipId,
     frame: &[u8],
     own: [u8; 6],
     mac_id: u8,
@@ -392,12 +395,14 @@ pub(super) fn transmit_fragment(
     report: bool,
     rate: u8,
 ) -> Result<(Vec<u8>, Queue), Error> {
+    // The two admitted AX v0 profiles share the source body and address-info
+    // layout; keep the actual chip through the transport proof.
     // Fixed band floor only: CCK1 (2.4GHz) or OFDM6 (5GHz).
-    if !matches!(rate, 0 | OFDM6) {
+    if !matches!(chip, ChipId::Rtl8852A | ChipId::Rtl8852B) || !matches!(rate, 0 | OFDM6) {
         return Err(Error::Metadata);
     }
     transmit_profile_inner(Tx {
-        chip: ChipId::Rtl8852B,
+        chip,
         frame,
         own,
         mac_id,

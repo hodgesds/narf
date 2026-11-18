@@ -301,6 +301,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
     pub(super) fn publication(&self) -> Arc<IrqSafeSpinLock<()>> {
         self.publication.clone()
     }
+    pub(super) fn manual_scope(&self) -> Option<Arc<super::ar9003::antenna::manual::Latch>> {
+        self.packet.manual_scope()
+    }
     /// Capture an owned transition before releasing this generation's lock.
     pub(super) fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
         self.environment.retune(frequency)
@@ -474,7 +477,15 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         if self.terminal() {
             return Err(Error::State);
         }
-        self.packet.check_bt().map_err(Error::Transport)
+        self.packet.check_bt().map_err(Error::Transport)?;
+        self.restore_ps_inner()
+    }
+    /// A relative worker wakeup only; the packet owner retains MMIO.
+    pub(super) fn coex_wait_us(&self) -> Option<u64> {
+        if self.terminal() || self.service_held() {
+            return None;
+        }
+        self.packet.coex_wait_us()
     }
     /// Stop (if still running) and report whether the packet owner proved
     /// DMA quiescence and released its storage.
@@ -511,7 +522,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         self.ready() && self.tx_ba.as_ref().is_some_and(super::tx_ba::Owner::paired)
     }
     pub(super) fn ps_request(&self) -> Option<super::ps::Request> {
-        self.packet.ht_grant().map(|base| super::ps::request(&base))
+        self.packet.ps_request()
     }
     pub(super) fn periodic_request(&self) -> Option<super::periodic::Request> {
         self.packet
@@ -721,6 +732,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         }
         // A drained (never completed) submission does not train rate control.
         self.pending = None;
+        if let Some(ps) = self.ps.as_mut() {
+            ps.resync();
+        }
         Ok(kind)
     }
     /// `ath_complete_reset`'s station half after the engine restarted:
@@ -1098,7 +1112,8 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             // Interrupt bottom half brackets one service pass: causes are
             // read and IER killed first, then resumed after RX/TX work.
             self.packet
-                .periodic_service(false)
+                .sleep_service()
+                .and_then(|_| self.packet.periodic_service(false))
                 .map_err(Error::from)
                 .and_then(|_| {
                     self.ps
@@ -1752,7 +1767,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             && self.incoming.is_empty()
             && self.receive_open()
             && self.ps_controls.is_empty()
-            && self.tx_ba_checked
+            && (self.ht.is_none() || self.tx_ba_checked)
             && self.pending.is_none()
             && self.pair_pending.is_none()
             && self.delivered_ps.is_none()
@@ -2274,6 +2289,14 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
 /// with one). The owner runs `ath9k_hw_reset` on [`Self::reset_port`]
 /// between the two halves while it holds this station.
 impl<P: Port, E: Environment> Radio<P, E, Dispatch<P>> {
+    pub(super) fn pause_for_manual(&mut self) -> Result<(), Error> {
+        if self.reset_wanted.is_some() || !self.reset_admissible() {
+            return Err(Error::State);
+        }
+        self.retire_receive()?;
+        self.reset_wanted = Some(ResetType::Calibration);
+        self.pause_for_reset().map(|_| ())
+    }
     /// `ath_prepare_reset`: the station half ([`Self::begin_reset`]) then
     /// the EDMA engine stop that keeps every ring and buffer. A failure
     /// closes the generation (the owner then retires it).
@@ -2300,6 +2323,7 @@ impl<P: Port, E: Environment> Radio<P, E, Dispatch<P>> {
         let bssid = self.peer()?;
         (!self.service_held()
             && self.phase == Phase::Open
+            && !self.ps_bound
             && self.reset_admissible()
             && self.pending.is_none()
             && matches!(self.packet, Dispatch::Ar9003(_)))

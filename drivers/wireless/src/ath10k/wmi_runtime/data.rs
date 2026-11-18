@@ -4,6 +4,7 @@
 use super::hw_keys;
 use super::*;
 use crate::ath10k::regulatory::Permission;
+use alloc::boxed::Box;
 use narf_wireless::packet_key::AmsduAdmission;
 use narf_wireless::station_security::{KeyInstall, MgmtRx, RawFrame, Rx, Security};
 const RECEIVED_FRAMES: usize = 256;
@@ -52,7 +53,7 @@ impl RawFrame for Native {
 }
 #[derive(Debug)]
 pub(super) struct State {
-    security: Option<Security>,
+    security: Option<Box<Security>>,
     /// Every outstanding native HTT ID, keyed by MSDU ID (heap-owned).
     pending: Pipeline,
     incoming: VecDeque<Incoming>,
@@ -128,7 +129,10 @@ impl State {
     pub(super) fn protection_allowed(&self) -> bool {
         self.open()
             && !self.pending.reply_in_flight()
-            && self.security.as_ref().is_none_or(|s| !s.handshake_active())
+            && self
+                .security
+                .as_deref()
+                .is_none_or(|s| !s.handshake_active())
     }
     pub(super) fn roc_quiescent(&self) -> bool {
         self.protection_allowed() && self.pending.is_empty() && self.management.is_none()
@@ -169,7 +173,7 @@ impl State {
         // Do not release or pretend to complete the outstanding native ID.
     }
     fn open(&self) -> bool {
-        !self.failed && self.authorized && self.security.as_ref().is_none_or(Security::port_open)
+        !self.failed && self.authorized && self.security.as_deref().is_none_or(Security::port_open)
     }
     fn now(&self) -> u64 {
         #[cfg(any(test, feature = "kernel-test"))]
@@ -201,7 +205,10 @@ impl State {
             return Ok(());
         };
         let data_admitted = self.open();
-        let hardware = self.security.as_ref().is_some_and(Security::hardware_keys);
+        let hardware = self
+            .security
+            .as_deref()
+            .is_some_and(Security::hardware_keys);
         match raw_frame(
             frame,
             status,
@@ -338,7 +345,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .data
             .as_mut()
             .filter(|d| !d.failed)
-            .and_then(|d| d.security.as_mut())
+            .and_then(|d| d.security.as_deref_mut())
             .filter(|s| s.pmf() && s.port_open())
         else {
             return Ok(None);
@@ -371,7 +378,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Ok(false);
             }
             data.key_in_flight = None;
-            if let Some(security) = data.security.as_mut() {
+            if let Some(security) = data.security.as_deref_mut() {
                 security.key_install_failed(flight.token);
             }
         }
@@ -619,6 +626,59 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.start_data_with_nonce_checked(domain, pmk, nonce, &|| Ok(()))
             .await
     }
+    /// Construct the retained key owner in a separate synchronous frame and
+    /// return only its heap pointer. Keeping Security inline in State made
+    /// startup's async poll hold constructor and State-move temporaries at
+    /// once; an async inline boundary alone cannot prevent that with LTO.
+    #[inline(never)]
+    fn prepare_data_security(
+        &self,
+        associated: StationAssociated,
+        own: [u8; 6],
+        cached: &ScanBss,
+        pmk: Option<&[u8; 32]>,
+    ) -> Result<Option<Box<Security>>, Error> {
+        if !associated.protected {
+            return Ok(None);
+        }
+        let security = {
+            // The station RSNE/RSNXE are the association's own (plan
+            // `rsn_body`, SAE `station_rsnxe`): WPA2, WPA2-PMF or SAE.
+            let rsn = self
+                .station
+                .peer
+                .as_ref()
+                .and_then(|p| p.rsn.as_deref())
+                .ok_or(Error::Unsupported)?;
+            let ap_rsne = element(&cached.information_elements, 48)?.ok_or(Error::Unsupported)?;
+            let ap_rsnxe = element(&cached.information_elements, 244)?;
+            match (&rsn.sae_pmk, pmk) {
+                (Some(sae), None) => Security::new_sae(
+                    own,
+                    associated.bssid,
+                    sae,
+                    &rsn.rsne,
+                    rsn.rsnxe.as_deref(),
+                    ap_rsne,
+                    ap_rsnxe,
+                    2,
+                ),
+                (None, Some(pmk)) => {
+                    Security::new(own, associated.bssid, pmk, &rsn.rsne, ap_rsne, ap_rsnxe, 2)
+                }
+                _ => return Err(Error::Unsupported),
+            }
+            .and_then(|security| {
+                if self.hardware_keys {
+                    security.with_hardware_keys()
+                } else {
+                    Ok(security)
+                }
+            })
+            .map_err(security_error)?
+        };
+        Ok(Some(Box::new(security)))
+    }
     pub(in crate::ath10k) async fn start_data_with_nonce_checked(
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -658,46 +718,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .iter()
             .find(|b| b.bssid == associated.bssid && b.frequency == associated.frequency)
             .ok_or(Error::Failed)?;
-        let security = if associated.protected {
-            // The station RSNE/RSNXE are the association's own (plan
-            // `rsn_body`, SAE `station_rsnxe`): WPA2, WPA2-PMF or SAE.
-            let rsn = self
-                .station
-                .peer
-                .as_ref()
-                .and_then(|p| p.rsn.as_deref())
-                .ok_or(Error::Unsupported)?;
-            let ap_rsne = element(&cached.information_elements, 48)?.ok_or(Error::Unsupported)?;
-            let ap_rsnxe = element(&cached.information_elements, 244)?;
-            Some(
-                match (&rsn.sae_pmk, pmk) {
-                    (Some(sae), None) => Security::new_sae(
-                        own,
-                        associated.bssid,
-                        sae,
-                        &rsn.rsne,
-                        rsn.rsnxe.as_deref(),
-                        ap_rsne,
-                        ap_rsnxe,
-                        2,
-                    ),
-                    (None, Some(pmk)) => {
-                        Security::new(own, associated.bssid, pmk, &rsn.rsne, ap_rsne, ap_rsnxe, 2)
-                    }
-                    _ => return Err(Error::Unsupported),
-                }
-                .and_then(|security| {
-                    if self.hardware_keys {
-                        security.with_hardware_keys()
-                    } else {
-                        Ok(security)
-                    }
-                })
-                .map_err(security_error)?,
-            )
-        } else {
-            None
-        };
+        let security = self.prepare_data_security(associated, own, cached, pmk)?;
         self.failed = true;
         // Events a sibling slot parked for this one (its own early EAPOL or
         // PEER_MAP polled while the sibling owned the radio) precede the
@@ -860,7 +881,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let own = self.station_own()?;
         let vdev = self.station_vdev();
         let data = self.station.data.as_mut().ok_or(Error::Failed)?;
-        if !data.pending.data_admissible() || data.security.as_ref().is_some_and(|s| !s.port_open())
+        if !data.pending.data_admissible()
+            || data.security.as_deref().is_some_and(|s| !s.port_open())
         {
             return Err(Error::Htt(htt::Error::Busy));
         }
@@ -1393,7 +1415,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 let current = management.status & !0x40 == 0
                     && wire::channel_to_frequency(management.channel)
                         == Some(peer.permission.frequency);
-                if let Some(security) = data.security.as_mut().filter(|s| s.pmf()) {
+                if let Some(security) = data.security.as_deref_mut().filter(|s| s.pmf()) {
                     // mac80211 ieee80211_drop_unencrypted_mgmt: robust
                     // frames from the AP pass only CCMP (unicast) or BIP
                     // (group) admission once keys are in.
@@ -1447,7 +1469,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             htt::Event::Message(bytes)
                 if bytes.first() == Some(&hw_keys::SECURITY_INDICATION)
-                    && data.security.as_ref().is_some_and(Security::hardware_keys) =>
+                    && data
+                        .security
+                        .as_deref()
+                        .is_some_and(Security::hardware_keys) =>
             {
                 // htt_rx.c HTT_T2H_MSG_TYPE_SEC_IND completes
                 // install_key_done. Only the outstanding install's own
@@ -1459,7 +1484,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     if peer.owns(id) && unicast == flight.pairwise {
                         data.key_in_flight = None;
                         data.security
-                            .as_mut()
+                            .as_deref_mut()
                             .ok_or(Error::Failed)?
                             .key_installed(flight.token);
                     }
@@ -1528,7 +1553,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     // boundary. Firmware BA agreements persist across rekey,
                     // but no retained PPDU PHY proof crosses this boundary.
                     data.rx_ba.discard_ppdu();
-                    let security = data.security.as_mut().ok_or(Error::Failed)?;
+                    let security = data.security.as_deref_mut().ok_or(Error::Failed)?;
                     if data.native_wifi {
                         security.reply_delivered_device(length)
                     } else {
@@ -1538,7 +1563,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     // mac80211 set_key after the committing reply (PTK
                     // before GTK); programmed from the async data step.
                     data.keys.extend(security.take_key_installs());
-                    if data.security.as_ref().is_some_and(Security::port_open) {
+                    if data.security.as_deref().is_some_and(Security::port_open) {
                         data.authorized = true;
                     }
                 }
@@ -1553,7 +1578,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             && !data.pending.reply_in_flight()
             && data
                 .security
-                .as_ref()
+                .as_deref()
                 .and_then(Security::pending_frame)
                 .is_none()
         {
@@ -1640,7 +1665,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Key-reply fence: the reply waits for every earlier data ID.
         let reply = if data.pending.reply_admissible() {
             data.security
-                .as_ref()
+                .as_deref()
                 .and_then(|security| {
                     if data.native_wifi {
                         security.pending_frame_device()

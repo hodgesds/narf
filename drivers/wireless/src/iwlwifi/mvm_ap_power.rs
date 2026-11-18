@@ -1,7 +1,7 @@
 //! Tag7 AP qualification: a planned ceiling is not an installed receipt.
 //! Only the native two-command transaction marks this power owner ready.
 use super::power;
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;
 
@@ -80,7 +80,9 @@ impl Fence {
 }
 pub(in crate::iwlwifi) struct Plan {
     pub(super) fence: Arc<Fence>,
-    prepared: power::Prepared,
+    // Keep the original MLME-capable power owner in its allocation through
+    // planning, native acknowledgement and the final session qualification.
+    prepared: Box<power::Prepared>,
 }
 impl Plan {
     pub(super) fn new(
@@ -114,7 +116,7 @@ impl Plan {
         } else {
             power::Emission::ApLegacy
         };
-        let prepared = power::parse_for(source, binding, own, channel, emission)?;
+        let prepared = power::parse_retained(source, binding, own, channel, emission)?;
         let planned = prepared.host_ceiling(domain)?;
         let (cap, maximum, gain) = prepared.ap_source();
         let fence = Arc::new(Fence {
@@ -132,7 +134,7 @@ impl Plan {
     pub(in crate::iwlwifi) async fn apply(
         self,
         hw: &mut super::super::runtime::Hardware,
-    ) -> Result<power::Prepared, &'static str> {
+    ) -> Result<Box<power::Prepared>, &'static str> {
         let (chains, link) = self.prepared.ap_commands(self.fence.planned);
         for body in [chains, link] {
             let response = hw.command(1, 0x9f, &body).await?;

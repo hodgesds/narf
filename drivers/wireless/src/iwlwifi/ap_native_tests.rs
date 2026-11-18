@@ -8,6 +8,33 @@ mod go;
 use narf_capabilities::{Cap, Invoke};
 use narf_net::netlink_generic::DeferredReplySink;
 use narf_wireless::ap_control::ApControlAuthority;
+
+/// The P2P smokes own one private deferred-nl80211 executor graph. Other
+/// fake devices may leave workers retaining their scripted DMA owner;
+/// those workers must not be polled by this separate native conversation.
+/// Declared before each fixture so its exit reset follows fixture retirement.
+struct ExecutorFixture;
+impl ExecutorFixture {
+    fn new() -> Self {
+        narf_scheduler::__reset_queues_for_test();
+        Self
+    }
+}
+impl Drop for ExecutorFixture {
+    fn drop(&mut self) {
+        narf_scheduler::__reset_queues_for_test();
+    }
+}
+
+/// These RAM-backed native owners have no IRQ. Advance their actual1ms
+/// Activity timer between unfinished executor rounds; polling a ready queue
+/// repeatedly cannot manufacture a native TX completion or advance time.
+fn management_wait_tick() {
+    narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+        2_000_000,
+    )));
+}
+
 const PEER: [u8; 6] = [2, 0x73, 2, 3, 4, 5];
 const TK: [u8; 16] = [0x31; 16];
 const GTK: [u8; 16] = [0x32; 16];

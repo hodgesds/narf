@@ -6,6 +6,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Exact-width word writes use [`Io::write16`]; an adapter keeping its
 /// refusing default cannot complete the back-door sequence.
 pub(super) trait Port: Io {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Profile {
+    Rtl8188ee,
+    Rtl8723be,
+    Rtl8192de,
+    Rtl8723ae,
+}
+#[path = "rtl8723ae/aspm.rs"]
+mod ae;
+#[path = "aspm_chip.rs"]
+mod chip;
 pub(super) const CONTROL_MASK: u16 = 3 | (1 << 8);
 /// Follow only an actual enabled parent policy and endpoint capabilities.
 /// Common-clock configuration and the shared bridge are not modified here.
@@ -70,6 +81,13 @@ pub(super) trait PolicyPort: Port {
 /// Shared physical sequence; the native adapter alone supplies actual
 /// configuration/parent authority. No endpoint entry precedes real DBI proof.
 pub(super) async fn configure(io: &impl PolicyPort, enabled: bool) -> Result<(), Error> {
+    configure_for(io, Profile::Rtl8188ee, enabled).await
+}
+pub(super) async fn configure_for(
+    io: &impl PolicyPort,
+    profile: Profile,
+    enabled: bool,
+) -> Result<(), Error> {
     let Some(desired) = io.desired(enabled)? else {
         return Ok(());
     };
@@ -78,7 +96,12 @@ pub(super) async fn configure(io: &impl PolicyPort, enabled: bool) -> Result<(),
     }
     if !io.prepared().load(Ordering::Acquire) {
         io.control(0)?;
-        prepare(io).await?;
+        match profile {
+            Profile::Rtl8188ee => prepare(io).await?,
+            Profile::Rtl8723be => chip::prepare_be(io).await?,
+            Profile::Rtl8192de => chip::prepare_de(io).await?,
+            Profile::Rtl8723ae => ae::prepare(io).await?,
+        }
         io.prepared().store(true, Ordering::Release);
     }
     let current = io.desired(enabled)?.ok_or(Error::Unsupported)?;

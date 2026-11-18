@@ -125,7 +125,10 @@ pub unsafe fn attach_cold(
 
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    // RTL8852BE (b852/b85b), RTL8852CE (c852, rtw8852ce.c
+    if device.id.vendor == 0x10ec && matches!(device.id.device, 0x8922 | 0x892b) {
+        return super::bootstrap_8922a::probe(device, cap);
+    }
+    // RTL8852AE (8852/a85a), RTL8852BE (b852/b85b), RTL8852CE (c852, rtw8852ce.c
     // `rtw89_8852ce_id_table`) and RTL8851BE (b851, rtw8851be.c
     // `rtw89_8851be_id_table`) run the retained reset/firmware/radio/
     // station bootstrap; C and 8851B station admission need their signed
@@ -176,6 +179,12 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw89Device, ProbeError> {
+    // The legacy direct API carries exclusivity only. BE additionally requires
+    // the retained real temporal reset and checked closed DMA/FWDL owner;
+    // BME parking and a source power tail cannot supply that proof.
+    if matches!(device.id.device, 0x8922 | 0x892b) {
+        return Err(ProbeError::PciAccess);
+    }
     crate::rtw88::pci_park::invoke(cap, || {
         // SAFETY: caller's exclusive function/BAR contract; complete diagnostic
         // accesses stay inside the real capability operation.
@@ -1321,6 +1330,8 @@ pub fn register_pci_driver() {
         });
         if super::bootstrap_did(did) {
             narf_bus::register_pci_remove(name_for(did), super::bootstrap::remove);
+        } else if matches!(did, 0x8922 | 0x892b) {
+            narf_bus::register_pci_remove(name_for(did), super::bootstrap_8922a::remove);
         }
     }
 }

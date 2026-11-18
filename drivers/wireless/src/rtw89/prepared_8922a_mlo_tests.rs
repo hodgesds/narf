@@ -692,20 +692,25 @@ fn smoke_rtw89_prepared_8922a_mlo_link_refusals() -> TestResult {
     }
     // Port mismatch: a second VIF (port 1) cannot serve the
     // port-0 MLD's transitions.
-    if owner
-        .add_vif(
+    let second_vif = match owner.add_vif(
+        [0x02, 0x11, 0x22, 0x33, 0x44, 0x57],
+        VifRole::Station,
+        [
             [0x02, 0x11, 0x22, 0x33, 0x44, 0x57],
-            VifRole::Station,
-            [
-                [0x02, 0x11, 0x22, 0x33, 0x44, 0x57],
-                [0x02, 0x11, 0x22, 0x33, 0x44, 0x58],
-            ],
-        )
-        .is_err()
-    {
-        return TestResult::Fail("second add_vif failed");
+            [0x02, 0x11, 0x22, 0x33, 0x44, 0x58],
+        ],
+    ) {
+        Ok(vif) => vif,
+        Err(_) => return TestResult::Fail("second add_vif failed"),
+    };
+    // add_vif returns its allocated main MACID, not its port number;
+    // the intervening MLD already owns MACIDs1/17.
+    if owner.vif(second_vif).map(|vif| vif.port) != Some(1) {
+        return TestResult::Fail("second VIF does not own port1");
     }
-    if owner.mld_link_frames(base, 0, 1, LinkTransition::Assoc, &opts) != Err(Error::PortMismatch) {
+    if owner.mld_link_frames(base, 0, second_vif, LinkTransition::Assoc, &opts)
+        != Err(Error::PortMismatch)
+    {
         return TestResult::Fail("port-mismatched MLD assoc accepted");
     }
     // The MLD's link MACIDs are not single-link stations.

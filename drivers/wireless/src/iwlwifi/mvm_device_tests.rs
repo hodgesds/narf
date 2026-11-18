@@ -164,6 +164,7 @@ fn ht_ies() -> Vec<u8> {
 struct Actor {
     client: bool,
     client_mac: u8,
+    client_prefix_sync: u32,
     client_public: Vec<Vec<u8>>,
     hold_client_public: bool,
     native_ap: Option<Box<ap_tests::Model>>,
@@ -238,10 +239,15 @@ struct Actor {
 unsafe impl Send for Actor {}
 impl Actor {
     fn inject(&mut self, command: u8, group: u8, sequence: u16, body: &[u8]) {
-        if command == 0xc1 && group == 0 && body.len() >= 48 && self.channel != 1 {
+        if command == 0xc1 && group == 0 && body.len() >= 48 && (self.channel != 1 || self.client) {
             // The API77 MPDU descriptor channel (energy offset + 2).
             let mut body = body.to_vec();
             body[34] = self.channel;
+            if self.client {
+                // fw/api/rs.h rates-v2: legacy OFDM format 1, index 0 = 6 Mbps.
+                // This peer advertises OFDM only; CCK 1 Mbps is not its RX rate.
+                body[28..32].copy_from_slice(&0x100u32.to_le_bytes());
+            }
             return self.firmware.inject(command, group, sequence, &body);
         }
         self.firmware.inject(command, group, sequence, body)
@@ -442,6 +448,30 @@ impl Actor {
                 return Ok(());
             }
             if self.multi_receive && self.receive_command(g, c, s, b)? {
+                return Ok(());
+            }
+            if self.client && !self.data_added && (g, c) == (5, 2) {
+                // Runtime's old-MAC receive prefix and the later RSNA key
+                // receiver have separate cookie owners. Both begin at1.
+                // This prefix belongs strictly between MAC5 REMOVE and MAC7
+                // ADD, before a DATA queue or SecurityModel transaction.
+                let cookie = self
+                    .client_prefix_sync
+                    .checked_add(1)
+                    .ok_or("CLIENT startup RX cookie overflow")?;
+                let mut expected = [0u8; 20];
+                expected[4] = 1;
+                expected[8] = 8;
+                expected[14] = 1;
+                expected[16..20].copy_from_slice(&cookie.to_le_bytes());
+                if self.client_mac != 1 || !self.security.events.is_empty() || b != expected {
+                    return Err("CLIENT original pre-MAC7 RX prefix bytes/order");
+                }
+                self.client_prefix_sync = cookie;
+                let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
+                marker.extend_from_slice(&cookie.to_le_bytes());
+                self.inject(0xff, 5, 0x8000, &marker);
+                self.reply(c, g, s, vec![]);
                 return Ok(());
             }
             if self.ba && g == 5 && c == 2 && b.get(12) == Some(&1) {
@@ -1401,9 +1431,13 @@ impl Harness {
         } else {
             ap(protected)?
         };
+        if emission == 10 {
+            security.use_legacy_ofdm_rx();
+        }
         let mut actor = Actor {
             client: emission == 10,
             client_mac: 0,
+            client_prefix_sync: 0,
             client_public: Vec::new(),
             hold_client_public: false,
             native_ap: matches!(emission, 7 | 9).then(|| Box::new(ap_tests::Model::new())),

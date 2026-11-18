@@ -24,6 +24,9 @@ struct Model {
     now: u64,
     stuck: Option<u32>,
     lok_fail: bool,
+    stall_pre_tx: bool,
+    fail_pre_tx: bool,
+    denied: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -34,6 +37,9 @@ impl Model {
             now: 0,
             stuck: None,
             lok_fail: false,
+            stall_pre_tx: false,
+            fail_pre_tx: false,
+            denied: false,
         }
     }
     fn word(&self, address: u32) -> u32 {
@@ -96,6 +102,19 @@ impl Io for Model {
     }
     async fn delay_us(&mut self, us: u64) {
         self.now += us;
+        // Independent source actor: the real A PMAC start/period/count
+        // produces observations only during its actual15ms enabled window.
+        if us == 15_000 && self.word(0x09c4) & 0x10 != 0 {
+            if self.stall_pre_tx {
+                core::future::pending::<()>().await;
+            }
+            if self.fail_pre_tx {
+                self.denied = true;
+            }
+            self.words[0x11a40 / 4] = self.word(0x1a40).wrapping_add(3);
+            self.words[0x11c60 / 4] = 0x1200_0000;
+            self.words[0x13c60 / 4] = 0x3400_0000;
+        }
     }
     async fn read_ecv(&mut self) -> Result<Option<u8>, power::Error> {
         Err(power::Error::Unsupported)
@@ -103,7 +122,11 @@ impl Io for Model {
 }
 impl Interface for Model {
     fn admit(&mut self) -> Result<(), Error> {
-        Ok(())
+        if self.denied {
+            Err(power::Error::Access.into())
+        } else {
+            Ok(())
+        }
     }
     async fn rf_read(&mut self, path: u8, address: u32, mask: u32) -> Result<u32, Error> {
         let mut value = self.rf[usize::from(path)][(address & 0xff) as usize];
@@ -180,7 +203,7 @@ fn calibration_fixture() -> Calibration {
 }
 
 /// rtw8852a.c `rtw8852a_rfk_channel(PHY_0)` on channel 1 / 20MHz:
-/// RX DCK, IQK, TSSI, DPK end to end, with the Kind brackets in
+/// RX DCK, IQK, partial TSSI and DPK, with the Kind brackets in
 /// Linux order and the per-owner results retained.
 fn smoke_rtw89_a_channel_rfk_iqk_dpk_tssi_follow_rtw8852a() -> TestResult {
     let mut io = Model::new();
@@ -198,14 +221,16 @@ fn smoke_rtw89_a_channel_rfk_iqk_dpk_tssi_follow_rtw8852a() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
-    }) != Some(Ok(()))
-        || channel.state() != State::Calibrated
-        || channel.calibrated() != Some(Profile::INITIAL)
+    }) != Some(Ok(Outcome::PartialTssi))
+        || channel.state() != State::PartialTssi
+        || channel.calibrated().is_some()
+        || channel.partial_programmed() != Some(Profile::INITIAL)
         || channel.tssi_mode() != [true, true]
     {
-        return TestResult::Fail("RTL8852A channel RFK did not complete on a ready model");
+        return TestResult::Fail("RTL8852A partial RFK did not program on a ready model");
     }
     // IQK: wideband TX group-select on both paths, narrowband RX on
     // 2G (nb_rxcfir is the debug RXIQC read OR 0x2), no LOK failure.
@@ -324,12 +349,13 @@ fn smoke_rtw89_a_channel_rfk_5ghz_80mhz_follow_rtw8852a() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
-    }) != Some(Ok(()))
-        || channel.state() != State::Calibrated
+    }) != Some(Ok(Outcome::PartialTssi))
+        || channel.state() != State::PartialTssi
     {
-        return TestResult::Fail("RTL8852A channel RFK did not complete on 5GHz 80MHz");
+        return TestResult::Fail("RTL8852A partial RFK did not program on 5GHz 80MHz");
     }
     let Some(iqk) = channel.iqk().results() else {
         return TestResult::Fail("RTL8852A 5GHz channel RFK published no IQK results");
@@ -386,6 +412,7 @@ fn smoke_rtw89_a_channel_rfk_stuck_done_fails_closed() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
     });
@@ -400,6 +427,7 @@ fn smoke_rtw89_a_channel_rfk_stuck_done_fails_closed() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
     });
@@ -435,12 +463,13 @@ fn smoke_rtw89_a_channel_rfk_dpk_bypass_epa_2g() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [true, false],
+                tail: None,
             },
         )
-    }) != Some(Ok(()))
-        || channel.state() != State::Calibrated
+    }) != Some(Ok(Outcome::PartialTssi))
+        || channel.state() != State::PartialTssi
     {
-        return TestResult::Fail("RTL8852A channel RFK did not complete with EPA on 2G");
+        return TestResult::Fail("RTL8852A partial RFK did not program with EPA on 2G");
     }
     let Some(dpk) = channel.dpk().results() else {
         return TestResult::Fail("RTL8852A bypassed DPK published no results");
@@ -475,7 +504,7 @@ fn smoke_rtw89_a_channel_rfk_tssi_scan_and_track() -> TestResult {
         != Some(Ok(false))
         || !io.trace.is_empty()
     {
-        return TestResult::Fail("RTL8852A TSSI scan ran before calibration");
+        return TestResult::Fail("RTL8852A TSSI scan ran before programming");
     }
     // SAFETY: private inert register/RF model; no hardware or DMA.
     if ready(unsafe {
@@ -488,11 +517,12 @@ fn smoke_rtw89_a_channel_rfk_tssi_scan_and_track() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
-    }) != Some(Ok(()))
+    }) != Some(Ok(Outcome::PartialTssi))
     {
-        return TestResult::Fail("RTL8852A channel RFK did not complete for the scan test");
+        return TestResult::Fail("RTL8852A partial RFK did not program for the scan test");
     }
     io.trace.clear();
     // SAFETY: private inert register/RF model; no hardware or DMA.
@@ -500,13 +530,18 @@ fn smoke_rtw89_a_channel_rfk_tssi_scan_and_track() -> TestResult {
         != Some(Ok(true))
         || channel.tssi().results().map(|r| r.base_thermal) != Some([0x21, 0x21])
     {
-        return TestResult::Fail("RTL8852A TSSI scan did not run after calibration");
+        return TestResult::Fail("RTL8852A TSSI scan did not run after partial programming");
     }
-    // SAFETY: private inert register/RF model; no hardware or DMA.
-    if ready(unsafe { channel.track(&mut io, [0x22, 0x22]) }) != Some(Ok(()))
+    let before = io.trace.clone();
+    // SAFETY: private inert partial model; full tracking must refuse before
+    // even DPK I/O, because high_power/pre_tx have never completed.
+    if ready(unsafe { channel.track(&mut io, [0x22, 0x22]) }) != Some(Err(Error::Terminal))
+        || io.trace != before
+        || channel.calibrated().is_some()
+        || channel.state() != State::PartialTssi
         || channel.tssi().results().map(|r| r.extra_ofst) != Some([0, 0])
     {
-        return TestResult::Fail("RTL8852A TSSI track wrote offsets before high_power");
+        return TestResult::Fail("RTL8852A partial TSSI minted calibration/tracking");
     }
     TestResult::Pass
 }
@@ -533,6 +568,7 @@ fn smoke_rtw89_a_channel_rfk_lok_failure_refuses() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
     }) != Some(Err(Error::Terminal))
@@ -570,6 +606,7 @@ fn smoke_rtw89_a_channel_rfk_6ghz_refused() -> TestResult {
                 cut: 0,
                 thermal: [0x20, 0x20],
                 epa: [false, false],
+                tail: None,
             },
         )
     }) != Some(Err(Error::Policy))
@@ -582,4 +619,181 @@ fn smoke_rtw89_a_channel_rfk_6ghz_refused() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_a_channel_rfk_6ghz_refused
+);
+
+fn smoke_rtw8852a_full_tssi_tail_retains_source_pmac_receipts_and_full_rfk() -> TestResult {
+    for (profile, mcs, ofdm, expected_power, tracking_enabled) in [
+        (Profile::INITIAL, 60, 36, 72, false),
+        (Profile::INITIAL, 80, 37, 68, true),
+        (
+            Profile::new_wide(Band::Ghz5, 36, Width::Mhz80).unwrap(),
+            80,
+            -6,
+            -12,
+            false,
+        ),
+    ] {
+        let mut io = Model::new();
+        io.words[0x11a40 / 4] = 7;
+        let mut channel = Channel::default();
+        let calibration = calibration_fixture();
+        let tracking = tracking_fixture();
+        // SAFETY: private inert source actor supplies literal PMAC counter
+        // and TXAGC observations; no physical RF or native grant is created.
+        let outcome = ready(unsafe {
+            channel.rfk_channel(
+                &mut io,
+                profile,
+                &ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    cut: 0,
+                    thermal: [32, 33],
+                    epa: [false, false],
+                    tail: Some(tail::Inputs::fixture(profile, mcs, ofdm)),
+                },
+            )
+        });
+        let Some(receipt) = channel.tssi().complete() else {
+            return TestResult::Fail("full A tail receipt absent");
+        };
+        if outcome != Some(Ok(Outcome::Calibrated))
+            || channel.calibrated() != Some(profile)
+            || receipt.before != 7
+            || receipt.after != 10
+            || receipt.count != 3
+            || receipt.power != expected_power
+            || receipt.default_txagc != [Some(0x12), Some(0x34)]
+            || channel.tssi().results().map(|r| r.tracking_check) != Some([tracking_enabled; 2])
+            || io.word(0x09c4) & 0x10 != 0
+            || io.word(0x0980) & 0x10001 != 0
+            || io.word(0x09a4) & 0x1041c != 0
+            || io.word(0x09c8) != 20
+            || (io.word(0x09c4) >> 8) != 5000
+            || !io.trace.contains(&(4, 0x14530, 0x4e1f3e81))
+            || !io
+                .trace
+                .iter()
+                .any(|t| t.0 == 4 && t.1 == 0x178dc && t.2 & 0xc0000000 == 0x40000000)
+            || !io
+                .trace
+                .iter()
+                .any(|t| t.0 == 4 && t.1 == 0x178dc && t.2 & 0xc0000000 == 0xc0000000)
+        {
+            return TestResult::Fail("A full source pre-TX power/path/pulse/receipt differs");
+        }
+        // The source writes MAC_SEL for PHY0 and PHY1 onto PHY0 in SCC.
+        let duplicate = io
+            .trace
+            .windows(2)
+            .any(|w| w[0].0 == 4 && w[0].1 == 0x109a4 && w[0] == w[1] && w[0].2 & 0x1c == 0x1c);
+        if !duplicate {
+            return TestResult::Fail("A non-DBCC PHY1 duplicate MAC_SEL write elided");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_full_tssi_tail_retains_source_pmac_receipts_and_full_rfk
+);
+
+fn smoke_rtw8852a_full_tssi_tail_failure_or_drop_cannot_publish_calibration() -> TestResult {
+    for cancelled in [false, true] {
+        let mut io = Model::new();
+        io.stall_pre_tx = cancelled;
+        io.fail_pre_tx = !cancelled;
+        let mut channel = Channel::default();
+        let calibration = calibration_fixture();
+        let tracking = tracking_fixture();
+        // SAFETY: source-only model; cancellation/error occurs inside actual
+        // production15ms wait, with PMAC still owned by the retained channel.
+        let outcome = ready(unsafe {
+            channel.rfk_channel(
+                &mut io,
+                Profile::INITIAL,
+                &ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    cut: 0,
+                    thermal: [32, 33],
+                    epa: [false, false],
+                    tail: Some(tail::Inputs::fixture(Profile::INITIAL, 60, 36)),
+                },
+            )
+        });
+        if outcome
+            != if cancelled {
+                None
+            } else {
+                Some(Err(Error::Register(power::Error::Access)))
+            }
+            || channel.state() != State::Busy
+            || channel.calibrated().is_some()
+            || channel.tssi().complete().is_some()
+            || channel.tssi().results().is_some()
+            || io.word(0x09c4) & 0x10 == 0
+        {
+            return TestResult::Fail("uncertain A autonomous PMAC fabricated full completion");
+        }
+        let before = io.trace.clone();
+        // SAFETY: same retained Busy owner must refuse retry before effects.
+        if ready(unsafe {
+            channel.rfk_channel(
+                &mut io,
+                Profile::INITIAL,
+                &ChannelInputs {
+                    calibration: &calibration,
+                    tracking: &tracking,
+                    cut: 0,
+                    thermal: [32, 33],
+                    epa: [false, false],
+                    tail: Some(tail::Inputs::fixture(Profile::INITIAL, 60, 36)),
+                },
+            )
+        }) != Some(Err(Error::Terminal))
+            || io.trace != before
+        {
+            return TestResult::Fail("A cancelled full channel owner revived");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_full_tssi_tail_failure_or_drop_cannot_publish_calibration
+);
+
+fn smoke_rtw8852a_tracking_requires_only_actual_supported_band_rows() -> TestResult {
+    // Firmware bitmap0xfff0: four5G types*three rows + eight2G types.
+    let mut bytes = vec![0; 608];
+    bytes[..4].copy_from_slice(&0xfff0u32.to_le_bytes());
+    let mut offset = 8;
+    for kind in 4..16u8 {
+        let count = if kind < 8 { 3 } else { 1 };
+        for _ in 0..count {
+            bytes[offset..offset + 30].fill(kind);
+            offset += 30;
+        }
+    }
+    let Ok(track) = Tracking::parse(&bytes) else {
+        return TestResult::Fail("A parser demanded unsupported6G rows");
+    };
+    if track.rows(0, 0) != (&[11; 30], &[10; 30])
+        || track.rows(0, 1) != (&[9; 30], &[8; 30])
+        || track.rows(4, 0) != (&[7; 30], &[6; 30])
+        || track.rows(4, 1) != (&[5; 30], &[4; 30])
+        || Tracking::parse(&bytes[..607]).is_ok()
+    {
+        return TestResult::Fail("A supported-band source row selection/truncation differs");
+    }
+    bytes[1] &= !0x10; // mandatory source2G CCK row12, even though OFDM uses10/11.
+    if Tracking::parse(&bytes).is_ok() {
+        return TestResult::Fail("A accepted missing mandatory source tracking row");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_tracking_requires_only_actual_supported_band_rows
 );

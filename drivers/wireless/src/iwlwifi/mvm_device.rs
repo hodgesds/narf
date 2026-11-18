@@ -990,8 +990,8 @@ impl Device {
                 )?;
                 owner.restrict_offer(&(self.environment.policy)()?);
                 let (source, binding) = (self.environment.power)(owner)?;
-                owner
-                    .station_join(
+                crate::future_heap::build(|| {
+                    owner.station_join(
                         request.bssid,
                         &request.ssid,
                         request.channel,
@@ -1003,16 +1003,18 @@ impl Device {
                         || (self.environment.policy)(),
                         || (self.environment.nonce)(),
                     )
-                    .await?;
+                })
+                .await?;
                 Ok(Outcome::Joined(request.bssid))
             }
             Operation::Maintain => {
-                owner
-                    .station_security(
+                crate::future_heap::build(|| {
+                    owner.station_security(
                         || (self.environment.nonce)(),
                         || (self.environment.policy)(),
                     )
-                    .await?;
+                })
+                .await?;
                 Ok(Outcome::Done)
             }
             Operation::Transmit => {
@@ -1339,6 +1341,10 @@ impl Device {
             let memory = super::runtime::dma_alloc(bytes.len())?;
             let mut frame = Frame::new(memory, bytes.len() as u32);
             frame.payload_mut().copy_from_slice(bytes);
+            frame.set_tx_meta(narf_net::TxMeta {
+                more: false,
+                ..meta
+            });
             let _publication = self.admission.lock();
             authority.invoke(&(self.environment.policy)()?, || {
                 if self.terminal.load(Ordering::Acquire)

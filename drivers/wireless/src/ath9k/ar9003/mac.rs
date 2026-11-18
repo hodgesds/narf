@@ -143,6 +143,21 @@ pub(in crate::ath9k) fn prepare(
     local: [u8; 6],
     five_ghz: bool,
 ) -> Result<Option<RfKill>, Error> {
+    prepare_with_antenna(io, identity, image, local, five_ghz, None)
+}
+/// The sole owner captured `saved` before chip reset. It never denotes a
+/// logical scanner sample; Linux restores the actual hardware antenna.
+pub(in crate::ath9k) fn prepare_with_antenna(
+    io: &impl Port,
+    identity: &Identity,
+    image: &[u8],
+    local: [u8; 6],
+    five_ghz: bool,
+    saved: Option<u32>,
+) -> Result<Option<RfKill>, Error> {
+    if saved.is_some_and(|antenna| antenna > 7) {
+        return Err(Error::Packet);
+    }
     if local[0] & 1 != 0 || local == [0; 6] || identity.mac != local {
         return Err(Error::Packet);
     }
@@ -171,7 +186,10 @@ pub(in crate::ath9k) fn prepare(
     )?;
     write(io, 0x80e0, u32::MAX)?;
     write(io, 0x80e4, 0xffff)?;
-    let antenna = io.read(0x8058)?;
+    let antenna = match saved {
+        Some(saved) => saved,
+        None => io.read(0x8058)?,
+    };
     write(io, 0x8058, if antenna == 0 { 1 } else { antenna })?;
     let slot = if five_ghz { 9 } else { 20 };
     shared::peer_clocked(io, None, slot, clock(five_ghz))?;

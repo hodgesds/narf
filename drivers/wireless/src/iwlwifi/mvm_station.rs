@@ -1,6 +1,6 @@
 //! Composed legacy station lifecycle for the native API77 interface.
 use super::{Owner, Phase};
-use crate::firmware_asset::Asset;
+use crate::{firmware_asset::Asset, future_heap};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicBool;
 use narf_wireless::{
@@ -160,6 +160,24 @@ impl Owner {
         self.restart_hardware(mac).await?;
         // DMA stop is acknowledged: retire installed keys into PN history.
         self.retire_security_after_reset()?;
+        self.reset_after_hardware_restart()?;
+        self.configure(mac).await?;
+        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
+        if nvm.channels != original.channels
+            || nvm.tx_chains != original.tx_chains
+            || nvm.rx_chains != original.rx_chains
+            || nvm.phy != original.phy
+            || nvm.he != original.he
+        {
+            return Err("MVM recovery changed NVM identity");
+        }
+        Ok(())
+    }
+
+    // Power embeds the large inline MLME context. Its fresh construction is
+    // synchronous and must not share the recovery poll's transport temporaries.
+    #[inline(never)]
+    fn reset_after_hardware_restart(&mut self) -> Result<(), &'static str> {
         let parsed = super::super::parse_ucode(&self.firmware)
             .map_err(|_| "invalid retained MVM firmware")?;
         // Every per-association owner named firmware objects or DMA of the
@@ -173,16 +191,6 @@ impl Owner {
         self.mac = None;
         self.nvm = None;
         self.phase = Phase::Starting;
-        self.configure(mac).await?;
-        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
-        if nvm.channels != original.channels
-            || nvm.tx_chains != original.tx_chains
-            || nvm.rx_chains != original.rx_chains
-            || nvm.phy != original.phy
-            || nvm.he != original.he
-        {
-            return Err("MVM recovery changed NVM identity");
-        }
         Ok(())
     }
 
@@ -197,15 +205,12 @@ impl Owner {
         }
         self.power.phy.ba.clear_packets();
         self.phase = Phase::Failed;
-        #[cfg(any(test, feature = "kernel-test"))]
-        let model = super::super::runtime::model::is_model(&self.hardware);
-        #[cfg(not(any(test, feature = "kernel-test")))]
-        let model = false;
-        if model {
-            self.hardware.fail();
-        } else {
-            self.hardware.stop_for_suspend().await?;
-        }
+        // The explicit RAM backend also uses the transport's retained stop
+        // boundary. Marking it failed alone leaves P2P/session ownership
+        // live and cannot stand in for terminal DMA retirement. The common
+        // path invokes current device authority and retires native ownership
+        // only after its backend's stop/BME-off proof succeeds.
+        self.hardware.stop_for_suspend().await?;
         // DMA stop is acknowledged: no installed key can be used again.
         self.retire_security_after_reset()
     }
@@ -412,53 +417,69 @@ impl Owner {
             signer: source.signer,
             digest: source.digest,
         };
-        super::power::parse_for(
-            probe,
-            binding,
-            self.mac.unwrap(),
-            channel,
-            self.power.phy.emission(),
-        )?
-        .with_span(self.power.phy.span())
-        .with_client(self.hardware.p2p_client_native())?
-        .host_ceiling(&policy()?)?;
+        {
+            let mut prepared = super::power::parse_retained(
+                probe,
+                binding,
+                self.mac.unwrap(),
+                channel,
+                self.power.phy.emission(),
+            )?;
+            prepared.bind_span(self.power.phy.span());
+            prepared.bind_client(self.hardware.p2p_client_native())?;
+            prepared.host_ceiling(&policy()?)?;
+        }
         if self.hardware.p2p_client_native().is_some() {
             let epoch = self.hardware.close_receive_epoch()?;
-            self.hardware.prepare_p2p_client().await?;
+            future_heap::build(|| self.hardware.prepare_p2p_client()).await?;
             self.hardware.commit_receive_epoch(epoch)?;
         }
-        self.prepare_channel_in_domain(channel, &policy()?).await?;
-        self.prepare_peer_in_domain(bssid, &policy()?).await?;
-        self.prepare_management_queue().await?;
-        self.prepare_power_using(source, binding, &mut policy)
-            .await?;
+        // Each original child future retains its own source/receipt and
+        // cancellation rules. Keep those large state machines out of this
+        // orchestration poll rather than storing all variants inline.
+        {
+            let domain = policy()?;
+            future_heap::build(|| self.prepare_channel_in_domain(channel, &domain)).await?;
+        }
+        {
+            let domain = policy()?;
+            future_heap::build(|| self.prepare_peer_in_domain(bssid, &domain)).await?;
+        }
+        future_heap::build(|| self.prepare_management_queue()).await?;
+        future_heap::build(|| self.prepare_power_using(source, binding, &mut policy)).await?;
         self.power.prepared.as_mut().unwrap().stop = Some(stop);
-        self.activate_link_using(&mut policy).await?;
+        future_heap::build(|| self.activate_link_using(&mut policy)).await?;
         let authenticated = match &credential {
             Credential::Sae(password) => {
                 let ssid_owned = ssid.to_vec();
-                self.authenticate_sae_using(
-                    ssid,
-                    elements,
-                    narf_wireless::association::SaePwe::Both,
-                    |join, own, peer| {
-                        super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
-                    },
-                    &mut policy,
-                )
+                future_heap::build(|| {
+                    self.authenticate_sae_using(
+                        ssid,
+                        elements,
+                        narf_wireless::association::SaePwe::Both,
+                        |join, own, peer| {
+                            super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
+                        },
+                        &mut policy,
+                    )
+                })
                 .await?
             }
-            _ => self.authenticate_open_using(&mut policy).await?,
+            _ => future_heap::build(|| self.authenticate_open_using(&mut policy)).await?,
         };
         if authenticated.status != 0 {
             return Err("MVM AP refused authentication");
         }
-        self.associate_elements_using(ssid, mode, elements, &mut policy)
+        future_heap::build(|| self.associate_elements_using(ssid, mode, elements, &mut policy))
             .await?;
-        self.prepare_data_using(&mut policy).await?;
+        future_heap::build(|| self.prepare_data_using(&mut policy)).await?;
         match credential {
-            Credential::Psk(pmk) => self.secure_using(*pmk, &mut nonce, &mut policy).await?,
-            Credential::Sae(_) => self.secure_sae_using(&mut nonce, &mut policy).await?,
+            Credential::Psk(pmk) => {
+                future_heap::build(|| self.secure_using(*pmk, &mut nonce, &mut policy)).await?
+            }
+            Credential::Sae(_) => {
+                future_heap::build(|| self.secure_sae_using(&mut nonce, &mut policy)).await?
+            }
             Credential::Open => {}
         }
         if !self.data_port_using(&mut policy) {

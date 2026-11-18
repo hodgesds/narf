@@ -8,6 +8,12 @@ impl
     > for NativeEnvironment
 {
     async fn power_down(&self) -> Result<(), Error> {
+        // NASR profile1 has no AE card-disable/reset/reclaim producer.
+        // Never reach an 88EE fallback or replace its original cold owner.
+        if self.firmware().device_id() == super::super::regs::RTL_DEV_8723AE {
+            return Err(Error::State);
+        }
+
         use super::super::{firmware_transport::Stage, prepare};
         match self.power_state.load(Ordering::Acquire) {
             1 => return Ok(()),
@@ -52,10 +58,9 @@ impl
         };
         disabled.map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
-        if rtl8821ae || rtl8192ee || rtl8192ce || rtl8723be || rtl8192de {
-            // ASPM is not composed for 8821AE/8192EE/8192CE/8723BE/8192DE
-            // (`prepare_bus_power`; 8192EE / 8192CE `enable_aspm` is not
-            // issued): the probe's ASPM-disabled link state is kept.
+        if rtl8821ae || rtl8192ee || rtl8192ce {
+            // These profiles do not have native internal ASPM preparation;
+            // preserve their disabled endpoint policy.
             return Ok(());
         }
         // Card-disable proof is complete. Optional idle-link optimization

@@ -54,11 +54,14 @@ pub struct Startup {
     phase: Phase,
     cold: Option<Cold<Owned>>,
     native: Option<Native>,
-    firmware: Option<Firmware<Native>>,
+    // Retain the original transport and selected plan without moving their
+    // combined state through the startup control future's polling frame.
+    firmware: Option<alloc::boxed::Box<Firmware<Native>>>,
     identity: Option<Identity>,
     mac: super::mac_runtime::Mac,
     radio: super::radio_init::Init,
     assets: Option<super::radio_assets::Assets>,
+    a_secure_policy: Option<alloc::boxed::Box<super::mac_a_policy::SecurePolicy>>,
     coex: super::coex_native::Coex,
     rfk: super::rfk::Rfk,
     full_radio: super::radio_full::Radio,
@@ -149,6 +152,7 @@ impl Startup {
             mac: super::mac_runtime::Mac::default(),
             radio: super::radio_init::Init::default(),
             assets: None,
+            a_secure_policy: None,
             coex: super::coex_native::Coex::default(),
             rfk: super::rfk::Rfk::default(),
             full_radio: super::radio_full::Radio::default(),
@@ -479,6 +483,14 @@ impl Startup {
         }
         if self
             .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852A)
+        {
+            let profile = super::operating_channel::Profile::from_primary(primary)
+                .ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_a(profile, linked).await;
+        }
+        if self
+            .identity
             .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
         {
             // RTL8852C: the 20MHz profile of `primary` (2.4GHz 1..=13 or a
@@ -543,6 +555,12 @@ impl Startup {
         profile: super::operating_channel::Profile,
         linked: bool,
     ) -> Result<u32, power::Error> {
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852A)
+        {
+            return self.retune_channel_a(profile, linked).await;
+        }
         if self
             .identity
             .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
@@ -789,6 +807,26 @@ impl Startup {
         if self.phase != Phase::Running {
             return Err(Error::Terminal);
         }
+        if let Some(policy) = self.a_secure_policy.as_ref() {
+            policy.current().map_err(Error::Register)?;
+        }
+        // A's newly routed MAC sequence has its own fresh measured authority.
+        // Missing/invalid assets or N5AM refuse before the terminal attempt.
+        let staged_a = if self
+            .identity
+            .is_some_and(|id| id.chip() == super::mac::ChipId::Rtl8852A)
+        {
+            Some(
+                self.firmware
+                    .as_ref()
+                    .ok_or(Error::Terminal)?
+                    .transport()
+                    .preflight_mac_a(self.assets.as_ref().ok_or(Error::Terminal)?)
+                    .map_err(Error::Mac)?,
+            )
+        } else {
+            None
+        };
         self.phase = Phase::MacPreparation;
         let mut attempt = Attempt::new(self);
         let result = async {
@@ -800,10 +838,21 @@ impl Startup {
             // Drop/failure closes command DMA, retains mappings and forbids
             // any IRQ/reset/packet/radio producer through this private owner.
             unsafe {
-                firmware
-                    .transport_mut()
-                    .prepare_mac(&mut attempt.owner.mac)
-                    .await
+                if let Some(grant) = staged_a {
+                    firmware
+                        .transport_mut()
+                        .prepare_mac_a(
+                            &mut attempt.owner.mac,
+                            attempt.owner.assets.as_ref().ok_or(Error::Terminal)?,
+                            grant,
+                        )
+                        .await
+                } else {
+                    firmware
+                        .transport_mut()
+                        .prepare_mac(&mut attempt.owner.mac)
+                        .await
+                }
             }
             .map_err(Error::Mac)?;
             attempt.owner.phase = Phase::MacPrepared;
@@ -863,11 +912,12 @@ impl Startup {
         // `fw_blacklist` policy (signature selection only; secure.rs).
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
-        // radio_assets admits the RTL8852B, RTL8852C and RTL8851B element
-        // layouts.
+        // Exact selected AX element layouts; A is retained for its own
+        // tables/power/tracking owner, never reconstructed from B assets.
         let assets = if matches!(
             identity.chip(),
-            super::mac::ChipId::Rtl8852B
+            super::mac::ChipId::Rtl8852A
+                | super::mac::ChipId::Rtl8852B
                 | super::mac::ChipId::Rtl8852C
                 | super::mac::ChipId::Rtl8851B
         ) {
@@ -875,16 +925,44 @@ impl Startup {
         } else {
             None
         };
-        let plan = DownloadPlan::new(
-            image,
-            identity.fuses(),
-            Blacklist::upstream(identity.chip()),
-        )
-        .map_err(Error::Plan)?;
+        let (plan, secure_a) =
+            if identity.chip() == super::mac::ChipId::Rtl8852A && identity.fuses().enabled() {
+                let policy = self
+                    .native
+                    .as_ref()
+                    .ok_or(Error::Terminal)?
+                    .secure_policy_a(assets.as_ref().ok_or(Error::Terminal)?)
+                    .map_err(Error::Register)?;
+                // The authenticated board snapshot constructs the immutable plan
+                // inside its real invocation, before any firmware register/DMA effect.
+                let plan = policy
+                    .plan(image, identity.fuses())
+                    .map_err(Error::Register)?
+                    .map_err(Error::Plan)?;
+                (plan, Some(alloc::boxed::Box::new(policy)))
+            } else {
+                (
+                    DownloadPlan::new(
+                        image,
+                        identity.fuses(),
+                        Blacklist::upstream(identity.chip()),
+                    )
+                    .map_err(Error::Plan)?,
+                    None,
+                )
+            };
         self.phase = Phase::CommandPreparation;
         self.assets = assets;
+        self.a_secure_policy = secure_a;
         let mut attempt = Attempt::new(self);
         let result = attempt.owner.start_plan(ber, plan).await;
+        let result = result.and_then(|()| {
+            attempt
+                .owner
+                .a_secure_policy
+                .as_ref()
+                .map_or(Ok(()), |policy| policy.current().map_err(Error::Register))
+        });
         attempt.committed = result.is_ok();
         result
     }
@@ -898,7 +976,7 @@ impl Startup {
         unsafe { native.configure() }.map_err(Error::Command)?;
         native.enable_download().map_err(Error::Command)?;
         let native = self.native.take().ok_or(Error::Terminal)?;
-        self.firmware = Some(Firmware::new(native, plan).map_err(Error::Boot)?);
+        self.firmware = Some(retain_firmware(native, plan)?);
         self.phase = Phase::Firmware;
         self.firmware
             .as_mut()
@@ -919,11 +997,25 @@ impl Startup {
         }
     }
 }
+// Construct the final retained owner in a separate frame: Firmware combines
+// the large Native transport and DownloadPlan, and returning it by value to
+// start_plan duplicates both in its enclosing future's stack frame.
+#[inline(never)]
+fn retain_firmware(
+    native: Native,
+    plan: DownloadPlan,
+) -> Result<alloc::boxed::Box<Firmware<Native>>, Error> {
+    Ok(alloc::boxed::Box::new(
+        Firmware::new(native, plan).map_err(Error::Boot)?,
+    ))
+}
 impl Drop for Startup {
     fn drop(&mut self) {
         self.fail();
     }
 }
+#[path = "startup_a.rs"]
+mod a;
 #[path = "startup_ap.rs"]
 mod ap;
 #[path = "startup_lps.rs"]

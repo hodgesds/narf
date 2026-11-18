@@ -76,9 +76,10 @@ impl Owner {
                 ))?;
             // Actual inactive MAC/link/DQA/awake setup, without SCAN_REQ.
             // It creates exactly the idle objects common AP preparation removes.
-            self.prepare_scan().await?;
+            crate::future_heap::build(|| self.prepare_scan()).await?;
             let (mcc, ibss) = if let Some((version, query)) = self.mcc_request()? {
-                let reply = self.hardware.command(1, 0xc8, &query).await?;
+                let reply =
+                    crate::future_heap::build(|| self.hardware.command(1, 0xc8, &query)).await?;
                 (
                     super::super::mld_regulatory::Mcc::parse_mvm(version, &reply.payload)?,
                     false,
@@ -132,17 +133,19 @@ impl Owner {
                 .install_rf_policy(super::super::mld_policy::Authority::Station(
                     policy.bind(program.clone())?,
                 ))?;
-            super::super::ap_session::Session::prepare_native(
-                &mut self.hardware,
-                plan,
-                settings,
-                own,
-                chains,
-                proof,
-                history,
-                program,
-                Some(power),
-            )
+            crate::future_heap::build(|| {
+                super::super::ap_session::Session::prepare_native(
+                    &mut self.hardware,
+                    plan,
+                    settings,
+                    own,
+                    chains,
+                    proof,
+                    history,
+                    program,
+                    Some(power),
+                )
+            })
             .await
         }
         .await;

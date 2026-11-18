@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Distinct measured AR9285 NETWORK_SLEEP program. No signed measurements
-//! are supplied. Legacy programs remain awake without this exact source.
+//! Distinct measured station NETWORK_SLEEP programs: AR9285 N85S and
+//! AR9462 N46S have disjoint exact native bases. No signed measurements
+//! are supplied. Other programs remain awake without their exact source.
 use super::{
     ht,
     packet::{Error, Port},
@@ -62,11 +63,41 @@ pub(super) fn request(base: &ht::Grant) -> Request {
     }
 }
 pub(super) struct Grant {
-    base: Arc<ht::Grant>,
+    base: Base,
     cap: Cap<FirmwareBlob, Read>,
     antenna: i16,
     peak: i16,
     ceiling: i16,
+}
+enum Base {
+    Ar9285(Arc<ht::Grant>),
+    Ar9462(Arc<super::ar9003::ps::Base>),
+}
+impl Base {
+    fn limits(&self) -> (i16, i16) {
+        match self {
+            Self::Ar9285(base) => base.ba_limit(),
+            Self::Ar9462(base) => base.limits(),
+        }
+    }
+    fn span(&self) -> (u32, u32) {
+        match self {
+            Self::Ar9285(base) => base.span(),
+            Self::Ar9462(base) => base.span(),
+        }
+    }
+    fn invoke<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        match self {
+            Self::Ar9285(base) => base.invoke(action),
+            Self::Ar9462(base) => base.invoke(action),
+        }
+    }
+    fn readback(&self, port: &impl Port) -> Result<(), Error> {
+        match self {
+            Self::Ar9285(base) => base.readback(port),
+            Self::Ar9462(base) => base.readback(port),
+        }
+    }
 }
 pub(super) enum Source {
     Registered,
@@ -78,6 +109,37 @@ pub(super) enum Source {
     },
 }
 impl Source {
+    pub(super) fn load_ar9003(
+        self,
+        base: Arc<super::ar9003::ps::Base>,
+    ) -> Result<Arc<Grant>, Error> {
+        struct Decode(Arc<super::ar9003::ps::Base>);
+        impl CapOp<FirmwareBlob, Read> for Decode {
+            type Output = Result<Grant, Error>;
+            fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    let view = narf_firmware::view_of(cap).map_err(|_| Error::Access)?;
+                    Grant::decode_ar9003(view.bytes, view.signer, *cap, self.0)
+                })())
+            }
+        }
+        let grant = match self {
+            Self::Registered => {
+                let loader = narf_firmware::trusted_loader_authority()
+                    .and_then(|c| c.derive::<Read>().ok())
+                    .ok_or(Error::Access)?;
+                let cap = narf_firmware::open(&base.request().filename, &loader)
+                    .map_err(|_| Error::Access)?;
+                cap.invoke(Decode(base)).map_err(|_| Error::Access)??
+            }
+            #[cfg(feature = "kernel-test")]
+            Self::Verified { bytes, signer, cap } => {
+                Grant::decode_ar9003(&bytes, signer, cap, base)?
+            }
+        };
+        grant.check()?;
+        Ok(Arc::new(grant))
+    }
     pub(super) fn load(self, base: Arc<ht::Grant>) -> Result<Arc<Grant>, Error> {
         struct Decode(Arc<ht::Grant>);
         impl CapOp<FirmwareBlob, Read> for Decode {
@@ -106,6 +168,45 @@ impl Source {
     }
 }
 impl Grant {
+    fn decode_ar9003(
+        bytes: &[u8],
+        signer: Option<[u8; 32]>,
+        cap: Cap<FirmwareBlob, Read>,
+        base: Arc<super::ar9003::ps::Base>,
+    ) -> Result<Self, Error> {
+        cap.invoke(NoopOp).map_err(|_| Error::Access)?;
+        let request = base.request();
+        if signer.is_none()
+            || bytes.len() != 128
+            || bytes[..8] != [b'N', b'4', b'6', b'S', 1, 0, 128, 0]
+            || bytes[8..12] != 128u32.to_le_bytes()
+            || bytes[12..16] != [0x8c, 0x16, 0x34, 0]
+            || bytes[16..48] != request.identity
+            || bytes[48..54] != request.mac
+            || bytes[54..58] != base.body()
+            || bytes[64..80] != [1, 0, 0, 4, 255, 8, 0xd0, 7, 0, 4, 1, 1, 0, 0, 0, 0]
+            || bytes[80..112] != base.digest()
+            || bytes[112..] != [0; 16]
+        {
+            return Err(Error::Packet);
+        }
+        let signed = |at| i16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let grant = Self {
+            base: Base::Ar9462(base),
+            cap,
+            antenna: signed(58),
+            peak: signed(60),
+            ceiling: signed(62),
+        };
+        if !(0..=128).contains(&grant.antenna)
+            || grant.antenna < grant.base.limits().0
+            || !(-512..=256).contains(&grant.peak)
+            || !(-512..=256).contains(&grant.ceiling)
+        {
+            return Err(Error::Packet);
+        }
+        Ok(grant)
+    }
     fn decode(
         bytes: &[u8],
         signer: Option<[u8; 32]>,
@@ -148,14 +249,14 @@ impl Grant {
         }
         let signed = |at| i16::from_le_bytes([bytes[at], bytes[at + 1]]);
         let grant = Self {
-            base,
+            base: Base::Ar9285(base),
             cap,
             antenna: signed(58),
             peak: signed(60),
             ceiling: signed(62),
         };
         if !(0..=128).contains(&grant.antenna)
-            || grant.antenna < grant.base.ba_limit().0
+            || grant.antenna < grant.base.limits().0
             || !(-512..=256).contains(&grant.peak)
             || !(-512..=256).contains(&grant.ceiling)
         {
@@ -172,7 +273,7 @@ impl Grant {
             type Output = Result<T, Error>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
-                    let (_, base) = self.0.base.ba_limit();
+                    let (_, base) = self.0.base.limits();
                     let mut limit = base.min(self.0.ceiling);
                     let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
                     for rule in &domain.rules {
@@ -201,6 +302,12 @@ impl Grant {
     pub(super) fn readback(&self, io: &impl Port) -> Result<(), Error> {
         self.check()?;
         self.base.readback(io)
+    }
+    pub(super) fn ar9003_wa(&self) -> Option<u32> {
+        match &self.base {
+            Base::Ar9462(base) => Some(base.wa()),
+            Base::Ar9285(_) => None,
+        }
     }
 }
 

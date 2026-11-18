@@ -111,7 +111,9 @@ impl Model {
             }
             if a == R_AX_PUB_PAGE_INFO2 {
                 // rtw8851b_hfc_pubcfg_pcie pub max 448; B 446.
-                let public = if self.chip == ChipId::Rtl8851B {
+                let public = if self.chip == ChipId::Rtl8852A {
+                    3792
+                } else if self.chip == ChipId::Rtl8851B {
                     448
                 } else {
                     446
@@ -167,6 +169,11 @@ impl Model {
             m.store(0x1010, 4, 0xbff00);
             m.store(0x1000, 4, 1 << 7);
             m.store(0x7880, 4, 1);
+        }
+        if chip == ChipId::Rtl8852A {
+            m.store(0x1010, 4, 0xbff00);
+            m.store(0xe000, 4, 0);
+            m.store(0xe004, 4, 0);
         }
         let mut factory = Factory::default();
         assert_eq!(ready(factory.read(&mut m)), Some(Ok(())));
@@ -233,7 +240,11 @@ impl Source for Model {
                     cursor += 4;
                 }
             }
-            (0x580, 128) if matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8851B) => (),
+            (0x580, 128)
+                if matches!(
+                    self.chip,
+                    ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8851B
+                ) => {}
             (0x590, 0x60) if self.chip == ChipId::Rtl8852C => (),
             _ => return Err(Error::Access),
         }
@@ -247,6 +258,94 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
         Poll::Pending => None,
     }
 }
+
+fn smoke_rtw8852a_post_wcpu_mac_uses_exact_full_scc_and_cut_quirks() -> TestResult {
+    for (seed, cut) in [(0, 0), (0xa5, 1), (0x5a, 2)] {
+        let (mut io, factory) = Model::setup_chip(seed, cut, ChipId::Rtl8852A);
+        let mut mac = Mac::default();
+        // SAFETY: exclusively owned inert A factory/register source, no DMA.
+        if ready(unsafe { mac.prepare(&mut io, &factory) }) != Some(Ok(()))
+            || mac.state() != State::Ready
+            || io.raw(R_AX_WDE_PKTBUF_CFG, 4) & B_AX_WDE_FREE_PAGE_NUM_MASK != 4095 << 16
+            || io.raw(R_AX_PLE_PKTBUF_CFG, 4) & B_AX_PLE_FREE_PAGE_NUM_MASK != 1520 << 16
+            || io.raw(R_AX_PLE_PKTBUF_CFG, 4) & B_AX_PLE_START_BOUND_MASK != 32 << 8
+            || io.raw(R_AX_PUB_PAGE_CTRL1, 4) != 0x0768_0768
+            || io.raw(R_AX_PUB_PAGE_CTRL2, 4) != 3792
+            || io.raw(R_AX_RX_FLTR_OPT, 4) & B_AX_RX_MPDU_MAX_LEN_MASK
+                != field(B_AX_RX_MPDU_MAX_LEN_MASK, 23)
+            || io.raw(R_AX_TRXPTCL_RESP_0, 4) & B_AX_WMAC_SPEC_SIFS_OFDM_MASK
+                != field(B_AX_WMAC_SPEC_SIFS_OFDM_MASK, 0x15)
+            || io.raw(R_AX_WLRF_CTRL, 4) != u32::from_le_bytes([seed; 4]) | 0x8282
+            || io.raw(R_AX_PHYREG_SET, 1) != u32::from(seed | 8)
+            || io.raw(R_AX_CMAC_FUNC_EN, 4) & B_AX_CMAC_TXEN != 0
+            || io.raw(0x1010, 4) != 0xbff00
+            || io.raw(0x1000, 4) & (1 << 13) != 0
+            || io.raw(0x8380, 4) & 2 != 0
+            || io
+                .trace
+                .iter()
+                .any(|&(_, a, _)| a == R_AX_WLAN_XTAL_SI_CTRL)
+        {
+            return TestResult::Fail(
+                "A full SCC/enable/source quirks borrowed B/C or opened packet gates",
+            );
+        }
+        for channel in 0..12u32 {
+            let minimum = if channel == 8 || channel == 10 {
+                32
+            } else {
+                128
+            };
+            let group = if (4..8).contains(&channel) || channel >= 10 {
+                0x8000_0000
+            } else {
+                0
+            };
+            if io.raw(R_AX_ACH0_PAGE_CTRL + 4 * channel, 4) != minimum | 0x0768_0000 | group {
+                return TestResult::Fail("A HFC full12 source channels/groups differ");
+            }
+        }
+        let cca = (io.raw(R_AX_DLK_PROTECT_CTL, 2) & B_AX_RX_DLK_CCA_TIME_MASK)
+            >> B_AX_RX_DLK_CCA_TIME_MASK.trailing_zeros();
+        if cca != if cut == 1 { 0 } else { 32 }
+            || (cut == 1 && io.raw(R_AX_RCR, 2) & (1 << 12) == 0)
+        {
+            return TestResult::Fail("A CBV RX patch ignored actual source cut");
+        }
+    }
+    let (mut io, factory) = Model::setup_chip(0, 1, ChipId::Rtl8852A);
+    io.store(0xe000, 4, B_AX_CMAC_EN);
+    let mut mac = Mac::default();
+    // SAFETY: inert preflight mismatch must refuse before enabling either BB/MAC.
+    if ready(unsafe { mac.prepare(&mut io, &factory) }) != Some(Err(Error::Access))
+        || !io.trace.is_empty()
+    {
+        return TestResult::Fail("A SCC accepted live MAC1");
+    }
+    let (mut io, factory) = Model::setup_chip(0, 1, ChipId::Rtl8852A);
+    io.pending = Some(0);
+    let mut mac = Mac::default();
+    // SAFETY: drop actual source MAC future at its first wait.
+    if ready(unsafe { mac.prepare(&mut io, &factory) }).is_some() || mac.state() != State::Preparing
+    {
+        return TestResult::Fail("A MAC cancellation ownership");
+    }
+    let before = io.operations;
+    // SAFETY: the same sole inert register/factory model outlives this
+    // replay; the retained Preparing state rejects before any access. The
+    // dropped first future supplies no replacement MAC/DMA ownership.
+    if ready(unsafe { mac.prepare(&mut io, &factory) }) != Some(Err(Error::Terminal))
+        || io.operations != before
+    {
+        return TestResult::Fail("A MAC replayed uncertain original owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_post_wcpu_mac_uses_exact_full_scc_and_cut_quirks
+);
+
 fn smoke_rtw89_b_post_wcpu_mac_matches_frozen_references() -> TestResult {
     for case in CASES {
         let (mut io, factory) = Model::setup(case.seed, case.cut);

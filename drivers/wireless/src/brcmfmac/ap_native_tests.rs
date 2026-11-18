@@ -8,11 +8,11 @@ use narf_capabilities::{Cap, Invoke};
 use narf_wireless::{ap_control::ApControlAuthority, WirelessNetIface};
 
 // Native flow retirement and watchdog settling really wait on the clock.
-// No IrqSafeSpinLock survives this bridge; all driver waits are bounded and
-// IRQ-driven/self-waking. Immediate-poll station helper is intentionally not
-// used as invented completion credit for these AP lifetime operations.
+// The RAM ring model supplies no IRQ, and the BSP test timer may be parked.
+// Spin through the actual bounded delays and receipts; a Pending future is
+// never replaced with an invented AP lifetime completion.
 fn ready<F: Future>(future: F) -> Result<F::Output, &'static str> {
-    Ok(narf_scheduler::block_on(future))
+    Ok(narf_scheduler::block_on_spin(future))
 }
 
 struct Callback(
@@ -208,6 +208,13 @@ impl Bound {
         .admin;
         let iface: Arc<dyn WirelessNetIface> = device.clone();
         narf_wireless::registry::register(iface.clone());
+        // Production attachment binds this exact receiver's ndo open/stop
+        // target before administrative UP. Exercise the same AP DOWN
+        // carrier retirement when a Program setup callback retires it.
+        let receiver = narf_net::iface::lookup(&name).ok_or("AP original open/stop receiver")?;
+        if !narf_net::iface::set_open_stop_target(&receiver, device.monitor_target()) {
+            return Err("AP original open/stop target");
+        }
         narf_net::iface::set_link_state(&name, true);
         Ok(Self {
             device,

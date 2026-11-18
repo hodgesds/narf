@@ -24,6 +24,10 @@ use narf_wireless::{
     WirelessNetIface,
 };
 use zeroize::Zeroizing;
+#[path = "rtl8723ae/native_activation.rs"]
+mod ae_activation;
+#[path = "rtl8723be/tracking_native.rs"]
+mod be_thermal;
 #[path = "channel_runtime.rs"]
 mod channel_runtime;
 #[path = "endpoint_routes.rs"]
@@ -45,6 +49,8 @@ struct EndpointState {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    /// Receipt belongs to this one retained pending frame, never a packet class.
+    special_notified: bool,
     epoch: u64,
 }
 struct Received {
@@ -55,6 +61,7 @@ struct Received {
 impl EndpointState {
     fn clear(&mut self) {
         self.pending = None;
+        self.special_notified = false;
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -75,8 +82,12 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     bssid: AtomicU64,
     ht: AtomicBool,
     ht40: AtomicBool,
+    ae_ht20: AtomicBool,
     /// RTL8821AE per-band host capability (`rtl8821ae::vht::HOST_*`).
     rtl8821ae_caps: AtomicU8,
+    /// Exact installed N21C channel, or zero for the ordinary NAPC profile.
+    /// This display/control preflight cache grants no RF authority.
+    coex_channel: AtomicU8,
     /// RTL8192EE `rtl8192ee::ht::host_capabilities` bits (0 otherwise).
     rtl8192ee_caps: AtomicU8,
     /// RTL8192CE / 8188CE `rtl8192ce::ht::host_capabilities` bits (0
@@ -90,12 +101,6 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
-    /// Latest special frame (`rtl_is_special_data`) awaiting its
-    /// `btc_special_packet_notify`, recorded by `enqueue` and flushed by
-    /// the worker loop before the frame is drained. A second special frame
-    /// before the flush replaces the first; the notify carries the latest
-    /// class.
-    special_pending: IrqSafeSpinLock<Option<super::btcoex::btc::Packet>>,
     lifecycle: lifecycle::Lifecycle,
     work: Mutex<Option<supervisor::Work>>,
     scan_request: Mutex<()>,
@@ -249,7 +254,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
         self.ht40.store(false, Ordering::Release);
+        self.ae_ht20.store(false, Ordering::Release);
         self.rtl8821ae_caps.store(0, Ordering::Release);
+        self.coex_channel.store(0, Ordering::Release);
         self.rtl8192ee_caps.store(0, Ordering::Release);
         self.rtl8192ce_caps.store(0, Ordering::Release);
         self.rtl8192de_caps.store(0, Ordering::Release);
@@ -276,6 +283,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 rx,
                 tx,
                 pending: None,
+                special_notified: false,
                 epoch: 0,
             }),
             factory,
@@ -288,7 +296,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             bssid: AtomicU64::new(0),
             ht: AtomicBool::new(false),
             ht40: AtomicBool::new(false),
+            ae_ht20: AtomicBool::new(false),
             rtl8821ae_caps: AtomicU8::new(0),
+            coex_channel: AtomicU8::new(0),
             rtl8192ee_caps: AtomicU8::new(0),
             rtl8192ce_caps: AtomicU8::new(0),
             rtl8192de_caps: AtomicU8::new(0),
@@ -297,7 +307,6 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
-            special_pending: IrqSafeSpinLock::new(None),
             lifecycle: lifecycle::Lifecycle::with_channel(initial_channel),
             work: Mutex::new(None),
             scan_request: Mutex::new(()),
@@ -331,18 +340,23 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(Error::State);
         }
-        if owner.chip() == super::prepare::Chip::Rtl8821ae {
+        if owner.chip() == super::prepare::Chip::Rtl8723ae {
+            owner.rtl8723ae_ready(
+                &self.factory,
+                self.lifecycle.channel.load(Ordering::Acquire),
+                &self.environment.domain()?,
+            )?;
+        } else if owner.chip() == super::prepare::Chip::Rtl8821ae {
             if matches!(
                 owner.phase(),
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8821ae(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8821ae(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192ee {
@@ -351,12 +365,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192ee(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192ee(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192ce {
@@ -365,12 +378,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192ce(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192ce(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8723be {
@@ -379,12 +391,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8723be(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8723be(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if owner.chip() == super::prepare::Chip::Rtl8192de {
@@ -393,12 +404,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
             ) && !owner.station_calibration_present()
             {
-                super::prepare_native::admit_rtl8192de(
-                    owner,
-                    &self.factory,
-                    &self.environment.domain()?,
-                    self.lifecycle.channel.load(Ordering::Acquire),
-                )
+                let domain = self.environment.domain()?;
+                let channel = self.lifecycle.channel.load(Ordering::Acquire);
+                crate::future_heap::build(|| {
+                    super::prepare_native::admit_rtl8192de(owner, &self.factory, &domain, channel)
+                })
                 .await?;
             }
         } else if matches!(
@@ -432,7 +442,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         if owner.station_phase() == station::Phase::Dormant && owner.phase() == Phase::MacConfigured
         {
-            if let Err(error) = owner.prepare_station_bus_power(&self.environment).await {
+            if let Err(error) =
+                crate::future_heap::build(|| owner.prepare_station_bus_power(&self.environment))
+                    .await
+            {
                 self.close();
                 return Err(error);
             }
@@ -449,6 +462,19 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 }
                 return Err(e);
             }
+            // Starting the original station can install its separately
+            // qualified N21C20MHz base. Publish capabilities only after that
+            // continuation succeeds, so old NAPC width/VHT bits cannot escape.
+            crate::future_heap::build(|| owner.start_station_service(&self.environment)).await?;
+            self.ae_ht20.store(owner.rtl8723ae_ht(), Ordering::Release);
+            self.coex_channel.store(
+                if owner.station_full_coex() {
+                    owner.station_grant().ok_or(Error::State)?.channel()
+                } else {
+                    0
+                },
+                Ordering::Release,
+            );
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
             self.ht40
@@ -473,7 +499,6 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 owner.station_rtl8723be_host_caps(&self.environment),
                 Ordering::Release,
             );
-            owner.start_station_service(&self.environment).await?;
         }
         if owner.station_phase() == station::Phase::Failed {
             return Err(Error::State);
@@ -526,12 +551,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             signal.raise();
         }
         match result {
-            Ok(Some(result)) => {
-                if result.is_ok() {
-                    self.note_special(bytes);
-                }
-                result
-            }
+            Ok(Some(result)) => result,
             Ok(None) => Err(()),
             Err(_) => {
                 self.abort_generation(generation);
@@ -539,42 +559,67 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }
         }
     }
-    /// Record a special frame (`rtl_is_special_data`) for the worker
-    /// loop's `btc_special_packet_notify`: the async notify must run before
-    /// the frame is transmitted, and `enqueue` is the last synchronous
-    /// point that sees the frame before the worker loop drains it. Only the
-    /// RTL8723BE owner consumes the record.
-    fn note_special(&self, bytes: &[u8]) {
-        // No chip gate here: `enqueue` is synchronous and the chip is only
-        // known through the prepared owner; the flush below is chip-gated,
-        // so on any other chip the record simply sits unconsumed.
-        if let Some(pkt) = special_class(bytes) {
-            *self.special_pending.lock() = Some(pkt);
-        }
-    }
-    /// `btc_special_packet_notify` (`base.c::setup_special_tx`) for a
-    /// special frame recorded by `enqueue`: runs before the worker loop's
-    /// `drain()` transmits it, so the coexistence algorithm yields the
-    /// antenna first. The record stays pending while the owner is not
-    /// ready to transmit; a frame already sent by a stack-driven drain is
-    /// notified after the fact (best effort). Any other chip, or no record,
-    /// is a no-op.
-    async fn be8723_flush_special(&self) -> Result<(), Error> {
-        let Some(pkt) = *self.special_pending.lock() else {
-            return Ok(());
-        };
+    /// Async preflight for the exact retained handshake reply and then the
+    /// exact queued Ethernet frame. Prepared -> endpoint lock order matches
+    /// synchronous progress; both are async-safe Mutex guards. No later stack
+    /// drain can move this frame while coexistence waits on its H2C receipt.
+    async fn coex_flush_special(&self) -> Result<(), Error> {
         let mut storage = self.prepared.lock().await;
         let Some(owner) = storage.as_mut() else {
             return Ok(());
         };
-        if owner.chip() != super::prepare::Chip::Rtl8723be || !owner.transmit_ready() {
+        if owner.chip() != super::prepare::Chip::Rtl8723be && !owner.station_full_coex() {
             return Ok(());
         }
-        *self.special_pending.lock() = None;
+        if owner.phase() != super::prepare::Phase::Running {
+            return Ok(());
+        }
+        if self.admission.closed.load(Ordering::Acquire)
+            || self.lifecycle.rebuilding.load(Ordering::Acquire)
+            || self.lifecycle.suspended.load(Ordering::Acquire)
+            || self.lifecycle.inactive.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         owner
-            .be8723_special_packet_notify(pkt)
+            .station_coex_service(&self.environment)
             .await
-            .map_err(|_| Error::State)
+            .map_err(|_| Error::State)?;
+        if !owner.transmit_ready() {
+            return Ok(());
+        }
+        owner
+            .flush_station_eapol(&self.environment)
+            .await
+            .map_err(|_| Error::State)?;
+        let mut state = self.state.lock().await;
+        if state.special_notified {
+            return Ok(());
+        }
+        let Some(packet) = state
+            .pending
+            .as_ref()
+            .and_then(|frame| special_class(frame.payload()))
+        else {
+            return Ok(());
+        };
+        let generation = self.lifecycle.generation();
+        owner
+            .station_special_packet(packet, &self.environment)
+            .await
+            .map_err(|_| Error::State)?;
+        if self.admission.closed.load(Ordering::Acquire)
+            || self.lifecycle.generation() != generation
+            || self.lifecycle.suspended.load(Ordering::Acquire)
+            || self.lifecycle.inactive.load(Ordering::Acquire)
+        {
+            state.clear();
+            owner.abort_station();
+            return Err(Error::State);
+        }
+        owner.station_publication(&self.environment, || Ok(()))?;
+        state.special_notified = true;
+        Ok(())
     }
     fn progress(&self) -> Vec<Received> {
         if self.lifecycle.rebuilding.load(Ordering::Acquire)
@@ -637,6 +682,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                         break;
                     };
                     if admitted(frame.payload(), self.factory.mac) && offloads(frame.tx_meta()) {
+                        state.special_notified = false;
                         state.pending = Some(frame);
                         break;
                     }
@@ -645,12 +691,21 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let mut sent = 0;
             if owner.station_transmit_ready() && !self.admission.closed.load(Ordering::Acquire) {
                 if let Some(frame) = state.pending.take() {
-                    if owner.leisure() && special(frame.payload()) {
+                    if (owner.chip() == super::prepare::Chip::Rtl8723be
+                        || owner.station_full_coex())
+                        && special(frame.payload())
+                        && !state.special_notified
+                    {
+                        // The worker must complete the exact frame's async
+                        // coexistence preflight before any descriptor emission.
+                        state.pending = Some(frame);
+                    } else if owner.leisure() && special(frame.payload()) {
                         // rtl_is_special_data: wake before EAPOL/ARP/DHCP.
                         state.pending = Some(frame);
                         self.request_leave();
                     } else {
                         owner.send_station_ethernet(frame.payload(), &self.environment)?;
+                        state.special_notified = false;
                         sent = 1;
                     }
                 }
@@ -721,6 +776,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let Some(owner) = storage.as_mut() else {
             return;
         };
+        if owner.chip() == super::prepare::Chip::Rtl8723ae {
+            return;
+        }
         if self.admission.closed.load(Ordering::Acquire) {
             // disconnect_station_peer leaves PS itself before the report.
             return;
@@ -743,7 +801,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         };
         let linked = owner.phase() == Phase::Running && owner.station_linked();
         if owner.leisure() && (leave || !enabled || !linked) {
-            let _ = owner.leave_leisure().await;
+            if !self.be_tracked_lps(owner, false).await {
+                let _ = owner.leave_leisure().await;
+            }
             return;
         }
         let Some((rx, tx)) = sample else {
@@ -762,10 +822,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             return;
         }
         if busy(rx, tx) {
-            if owner.leisure() {
+            if owner.leisure() && !self.be_tracked_lps(owner, false).await {
                 let _ = owner.leave_leisure().await;
             }
-        } else if periods >= 5 && !owner.leisure() && owner.transmit_ready() {
+        } else if periods >= 5
+            && !owner.leisure()
+            && owner.transmit_ready()
+            && !self.be_tracked_lps(owner, true).await
+        {
             let _ = owner.enter_leisure().await;
         }
     }
@@ -783,7 +847,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             return;
         }
         let linked = owner.phase() == Phase::Running && owner.station_linked();
-        if leave || !enabled || !linked {
+        if (leave || !enabled || !linked) && !self.be_tracked_lps(owner, false).await {
             let _ = owner.leave_leisure().await;
         }
     }
@@ -853,6 +917,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let Some(owner) = storage.as_mut() else {
             return;
         };
+        if owner.chip() == super::prepare::Chip::Rtl8723be {
+            return;
+        }
         if self.admission.closed.load(Ordering::Acquire) {
             return;
         }
@@ -887,6 +954,17 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             .as_ref()
             .ok_or(Error::State)?
             .station_antenna_request(firmware, &self.environment)
+    }
+    /// Historical original-owner metadata, including an absent signed N21C
+    /// asset. No source recheck, inquiry or qualification attempt is made.
+    pub(crate) fn rtl8821ae_coexistence_request(
+        &self,
+    ) -> Result<Option<super::rtl8821ae::coex_program::Request>, Error> {
+        let storage = self.prepared.try_lock().ok_or(Error::Busy)?;
+        Ok(storage
+            .as_ref()
+            .ok_or(Error::State)?
+            .rtl8821ae_coex_request())
     }
     pub(crate) fn thermal_tracking_request(
         &self,
@@ -1256,6 +1334,12 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 band,
             );
         }
+        if band == 2400 && band_listed && self.ae_ht20.load(Ordering::Acquire) {
+            return Some(narf_wireless::iface::PhyCapabilities {
+                ht: super::rtl8723ae::ht::capability().capability_body(),
+                vht: None,
+            });
+        }
         (band_listed && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
                 ht: if self.ht40.load(Ordering::Acquire) {
@@ -1358,6 +1442,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.state.lock().await.clear();
         self.close();
         let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
+        if let Err(reason) = self.be_restore_for_lifecycle(owner).await {
+            owner.abort_station();
+            return Err(error(reason));
+        }
         let result = owner.disconnect_station().await.map_err(error);
         // Safe rejoin: a completed disassociation leaves a Passive station
         // on the same live owner. Reopen admission under the owner and
@@ -1376,6 +1464,18 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let _publication = self.admission.publication.lock();
             self.admission.abort.store(false, Ordering::Release);
             self.admission.closed.store(false, Ordering::Release);
+            self.ae_ht20.store(owner.rtl8723ae_ht(), Ordering::Release);
+            self.coex_channel.store(
+                if owner.station_full_coex() {
+                    // Missing power state must never widen this fixed profile.
+                    owner
+                        .station_grant()
+                        .map_or(u8::MAX, |grant| grant.channel())
+                } else {
+                    0
+                },
+                Ordering::Release,
+            );
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
             self.ht40
@@ -1407,6 +1507,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
         let channel = u8::try_from(config.channel).map_err(|_| WirelessError::NotSupported)?;
         if config.tx_power_dbm.is_some() || !super::rtl8821ae::envelope::station_channel(channel) {
+            return Err(WirelessError::NotSupported);
+        }
+        let fixed = self.coex_channel.load(Ordering::Acquire);
+        if fixed != 0 && channel != fixed {
             return Err(WirelessError::NotSupported);
         }
         if channel == self.lifecycle.channel.load(Ordering::Acquire)
@@ -1447,6 +1551,74 @@ pub(super) mod publication_test {
         pin::pin,
         task::{Context, Waker},
     };
+
+    /// RAM-native fixture registration only. Run the unmodified ready/start
+    /// path and read the public cached PHY metadata after initial N21C bind.
+    pub(in crate::rtlwifi) async fn ready_8821_capabilities<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<I, M, E>,
+    ) -> Result<narf_wireless::iface::PhyCapabilities, &'static str> {
+        device.published.store(true, Ordering::Release);
+        {
+            let mut storage = device.prepared.lock().await;
+            let owner = storage.as_mut().ok_or("8821 ready fixture owner")?;
+            device
+                .ready(owner)
+                .await
+                .map_err(|_| "8821 actual Native ready")?;
+        }
+        if !device.get_wireless_info().hw_caps.ht_supported {
+            return Err("8821 Native ready lost public HT metadata");
+        }
+        device
+            .phy_capabilities(2400)
+            .ok_or("8821 Native ready lacks public PHY metadata")
+    }
+
+    /// Pause the real scan after Scan(true), before scan_one obtains its
+    /// control mutex and constructs its narrower per-channel guard.
+    pub(in crate::rtlwifi) async fn cancel_8821_scan_waiting_for_control<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<I, M, E>,
+        request: ScanRequest,
+    ) -> Result<(), &'static str> {
+        let _control = device.lifecycle.control.lock().await;
+        {
+            let mut future = pin!(device.scan(request));
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return Err("8821 scan did not await its held control mutex");
+            }
+            let storage = device.prepared.try_lock().ok_or("8821 paused scan owner")?;
+            if !storage
+                .as_ref()
+                .is_some_and(Prepared::station_8821_scanning)
+            {
+                return Err("8821 cancelled scan never completed actual Scan(true)");
+            }
+        }
+        let storage = device
+            .prepared
+            .try_lock()
+            .ok_or("8821 cancelled scan owner")?;
+        if !device.admission.closed.load(Ordering::Acquire)
+            || !storage
+                .as_ref()
+                .is_some_and(|owner| owner.station_phase() == station::Phase::Failed)
+        {
+            return Err("8821 scan cancellation left its exact station generation live");
+        }
+        Ok(())
+    }
 
     pub(in crate::rtlwifi) fn copied_then_revoke<
         I: Port<Buffer = M> + 'static,
@@ -1649,23 +1821,19 @@ impl NativeEnvironment {
     }
 }
 impl Environment for NativeEnvironment {
+    fn pcie_aspm(&self) -> bool {
+        PCIE_ASPM.load(Ordering::Acquire)
+    }
     async fn prepare_bus_power(&self) -> Result<(), Error> {
         let device = self.firmware().device_id();
         if matches!(
             device,
-            super::regs::RTL_DEV_8821AE
-                | super::regs::RTL_DEV_8192EE
-                | super::regs::RTL_DEV_8723BE
-                | super::regs::RTL_DEV_8192DE
+            super::regs::RTL_DEV_8821AE | super::regs::RTL_DEV_8192EE | super::regs::RTL_DEV_8723AE
         ) || super::rtl8192ce::is_8192ce(device)
         {
-            // `_rtl8821ae_enable_aspm_back_door` / ASPM, the 8192EE /
-            // 8192CE `enable_aspm`, the 8723BE
-            // `_rtl8723be_enable_aspm_back_door` / `enable_aspm` and the
-            // 8192DE `enable_aspm` are not composed for these profiles:
-            // probe's ASPM-disabled link state is kept (the 8192DE back
-            // door is written with `const_support_pciaspm` 0 by
-            // `configure_rtl8192de`).
+            // Only 8188EE/8723BE/8192DE have a source-matched native
+            // internal preparation producer. AE remains parked and other
+            // admitted profiles retain their disabled endpoint policy.
             return Ok(());
         }
         self.firmware()
@@ -1677,6 +1845,15 @@ impl Environment for NativeEnvironment {
     }
 
     fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
+        if self.firmware().device_id() == super::regs::RTL_DEV_8723AE {
+            let device = self.device.lock().upgrade().ok_or(Error::State)?;
+            let storage = device.prepared.try_lock().ok_or(Error::Busy)?;
+            let owner = storage.as_ref().ok_or(Error::State)?;
+            return owner
+                .rtl8723ae_ready(factory, channel, &self.domain()?)
+                .map_err(Error::Radio);
+        }
+
         if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
             // Retuning rebuilds through the 8821AE card-disable/enable flow
             // (`rebuild_native`); admission is the `NAPC` 20 MHz permission
@@ -1847,6 +2024,18 @@ impl Environment for NativeEnvironment {
             firmware: self.firmware().identity().ok_or(Error::State)?,
         })
         .map_err(Error::Radio)
+    }
+    fn rtl8723be_tracking(
+        &self,
+        base: Arc<super::rtl8723be::envelope::Calibration>,
+        facts: super::rtl8723be::tracking::Facts,
+    ) -> Result<Option<Arc<super::rtl8723be::tracking::Grant>>, Error> {
+        let owner = self.firmware();
+        if owner.device_id() != super::regs::RTL_DEV_8723BE {
+            return Err(Error::Profile);
+        }
+        let identity = owner.identity().ok_or(Error::State)?;
+        super::rtl8723be::tracking::Grant::registered(base, identity, facts).map_err(Error::Radio)
     }
     fn tracking(
         &self,
@@ -2067,9 +2256,10 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
                     .saturating_sub(device.lifecycle.activity_ms.load(Ordering::Acquire))
                     >= WATCHDOG_MS
                 && device.prepared.try_lock().is_some_and(|owner| {
-                    owner
-                        .as_ref()
-                        .is_some_and(|owner| owner.station_phase() == station::Phase::Passive)
+                    owner.as_ref().is_some_and(|owner| {
+                        owner.chip() != super::prepare::Chip::Rtl8723ae
+                            && owner.station_phase() == station::Phase::Passive
+                    })
                 })
             {
                 let _ = device.schedule(supervisor::Operation::Idle);
@@ -2077,12 +2267,9 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
-            // A special frame recorded by `enqueue` is notified to the
-            // coexistence owner before the drain below transmits it
-            // (`base.c::setup_special_tx` ordering). Best effort: a failed
-            // notify leaves the owner for the next pass to abort, it must
-            // not stall the worker loop.
-            let _ = device.be8723_flush_special().await;
+            // Owned pending frames remain parked across this async preflight.
+            // Failure/cancellation closes the station before drain can emit.
+            let _ = device.coex_flush_special().await;
             device.drain();
             // The periodic steps run from the watchdog work; only a
             // data-path LPS leave is served here, without waiting for it.

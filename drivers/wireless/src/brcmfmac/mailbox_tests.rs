@@ -18,6 +18,15 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 
+fn drive_timed_model<F: Future>(future: F) -> F::Output {
+    // The kernel-test harness runs before the BSP timer pump starts.
+    // AP timers may already have installed the global hrtimer programmer,
+    // so SleepUntil need not self-wake despite having no BSP timer IRQ.
+    // The spin bridge pumps due hrtimers against the real monotonic clock;
+    // these register-model tests retain their actual timeout/reset delays.
+    narf_scheduler::block_on_spin(future)
+}
+
 fn mask(s: &State) -> u32 {
     *s.registers.get(&(PCIE + 0x4c)).unwrap_or(&0)
 }
@@ -251,7 +260,7 @@ fn smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma() -> TestResult {
     };
     // Firmware never answers D3_INFORM: Linux times out after 2 s and
     // returns the bus to UP.
-    if narf_scheduler::block_on(owner.quiesce()) != Err(runtime::Error::Timeout)
+    if drive_timed_model(owner.quiesce()) != Err(runtime::Error::Timeout)
         || owner.is_down()
         || owner.is_reclaimable()
         || owner.is_failed()
@@ -393,7 +402,7 @@ fn smoke_brcmf_system_suspend_timeout_unwinds_usable() -> TestResult {
     let Some((mut adapter, s)) = adapter(false) else {
         return TestResult::Fail("msgbuf adapter setup failed");
     };
-    if narf_scheduler::block_on(adapter.suspend_transport())
+    if drive_timed_model(adapter.suspend_transport())
         != Err(crate::cyw43439::runtime::Error::Timeout)
         || adapter.poll().is_err()
         || mask(&s.lock()) != MB_INT_D2H_DB | MB_INT_FN0
@@ -436,7 +445,7 @@ fn smoke_brcmf_dead_firmware_stop_resets_and_reclaims() -> TestResult {
     if ready(owner.quiesce()) != Some(Err(runtime::Error::Failed)) {
         return TestResult::Fail("halted firmware entered the D3 handshake");
     }
-    let proof = match narf_scheduler::block_on(owner.stop_dead()) {
+    let proof = match drive_timed_model(owner.stop_dead()) {
         Ok(proof) => proof,
         Err(_) => return TestResult::Fail("dead-firmware stop failed"),
     };

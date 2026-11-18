@@ -265,6 +265,10 @@ impl<B: Backend> Session<B> {
             )
             .map_err(|_| Error::Bounds)?;
         let epoch = self.receive_epoch;
+        // Install the new copy-time stamp while the capture is still closed.
+        // Both the real RX owner and the model refuse opening a stamp they
+        // have not observed; close(0) above remains the allocation-failure fence.
+        self.backend.close_receive_capture(epoch);
         let home = self.home_receive_current().unwrap_or(false)
             && self.backend.open_receive_capture(epoch).is_ok();
         if let Some(owner) = self.ap_owner.as_mut() {

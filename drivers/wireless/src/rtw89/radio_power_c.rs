@@ -847,6 +847,16 @@ impl Plan {
         &self,
         mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.visit_a_channel(&mut emit)?;
+        super::radio_power::reference(&mut emit)
+    }
+    /// The exact `rtw8852a_set_txpwr` prefix for __rtw89_set_channel:
+    /// byrate, offset, limit and RU, without reapplying DM init's
+    /// separate `rtw8852a_set_txpwr_ctrl`/reference tail.
+    pub(super) fn visit_a_channel(
+        &self,
+        mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let pack = |b: &[i8]| u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]);
         for (i, w) in self.byrate.chunks_exact(4).enumerate() {
             emit(R_AX_PWR_BY_RATE + 4 * i as u32, u32::MAX, pack(w))?;
@@ -874,7 +884,7 @@ impl Plan {
                 )?;
             }
         }
-        super::radio_power::reference(&mut emit)
+        Ok(())
     }
     fn build(
         elements: &[Element],

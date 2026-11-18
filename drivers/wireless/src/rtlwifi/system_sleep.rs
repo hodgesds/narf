@@ -114,9 +114,8 @@ where
             return Ok(());
         }
         owner
-            .be8723_ips_notify(rf_off)
+            .be_tracking_notify(station::BeTrackingNotice::Ips(rf_off), &self.environment)
             .await
-            .map_err(|_| Error::State)
     }
 
     /// `btc_ips_notify(ERFON)` (`ps.c::rtl_ips_nic_on`) on the live
@@ -203,6 +202,12 @@ where
             next?
         };
         if let Some(owner) = storage.as_mut() {
+            if owner.be_tracking_bound() {
+                if let Err(reason) = self.be_restore_for_lifecycle(owner).await {
+                    owner.abort_station();
+                    return Err(reason);
+                }
+            }
             // `btc_ips_notify(ERFOFF)` (`ps.c::_rtl_ps_inactive_ps`): before
             // the NIC goes off. Best effort: the owner is retired either
             // way, and a non-running owner has nothing to notify.
