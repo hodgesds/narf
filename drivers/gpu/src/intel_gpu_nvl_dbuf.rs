@@ -9,12 +9,12 @@
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::intel_gpu_modeset::Mode;
 use crate::intel_gpu_pipes::Pipe;
 use crate::intel_gpu_xelpg_cdclk::{self as cdclk, Rung};
-use crate::intel_gpu_xelpg_dbuf::{self as dbuf, Dbuf, PipeInput, PlaneInput, PIPES, PLANES};
+use crate::intel_gpu_xelpg_dbuf::{self as dbuf, PipeInput, PlaneInput, PIPES, PLANES};
 use crate::intel_gpu_xelpg_resources::ResourceError;
 use crate::intel_gpu_xelpg_wm::{self as wm, Latency, Surface, Tiling, Timing};
 
@@ -88,7 +88,10 @@ impl NovaScanout {
 
 #[derive(Debug)]
 pub(crate) struct NovaDbufPlan {
-    dbuf: Dbuf,
+    active_pipes: u8,
+    enabled_slices: u8,
+    joined: bool,
+    mbus_fields: u32,
     /// First display-35 clock rung meeting the supplied floor and scanout demand.
     pub(crate) clock: Rung,
     /// All plane and cursor WM/DDB images in pipe order, skipping fused pipes.
@@ -115,7 +118,9 @@ impl NovaDbufPlan {
         }
         let latency = Latency::adjust_display35(raw_latency, sagv_block_us);
         let active = scanouts.iter().flatten().count() as u32;
-        let mut inputs = [None; PIPES];
+        // The per-pipe watermarks and the resulting DDB allocations coexist
+        // during allocation. Keep the four-pipe scratch array off the kernel stack.
+        let mut inputs = Box::new([None; PIPES]);
         let mut floor = min_cdclk_khz;
         for (pipe, scanout) in scanouts.iter().enumerate() {
             let Some(scanout) = scanout else { continue };
@@ -141,38 +146,37 @@ impl NovaDbufPlan {
             }
         }
         Ok(Self {
-            dbuf,
+            active_pipes: dbuf.active_pipes,
+            enabled_slices: dbuf.enabled_slices,
+            joined: dbuf.joined,
+            mbus_fields: cdclk::nova_lake_mbus_ctl(dbuf.mbus_ctl(), clock),
             clock,
             plane_registers,
         })
     }
 
     pub(crate) fn mbus_ctl(&self, old: u32) -> u32 {
-        let joined = (old & !dbuf::MBUS_CTL_MASK) | self.dbuf.mbus_ctl();
-        cdclk::nova_lake_mbus_ctl(joined, self.clock)
+        (old & !(dbuf::MBUS_CTL_MASK | cdclk::NOVA_LAKE_MBUS_THROTTLE_MASK)) | self.mbus_fields
     }
 
     pub(crate) fn dbuf_ctl(&self, slice: usize, old: u32) -> Option<u32> {
         if slice >= dbuf::SLICES {
             return None;
         }
-        let request = if self.dbuf.enabled_slices & (1 << slice) != 0 {
+        let request = if self.enabled_slices & (1 << slice) != 0 {
             dbuf::DBUF_POWER_REQUEST
         } else {
             0
         };
         Some(
-            cdclk::nova_lake_dbuf_ctl(
-                old & !dbuf::DBUF_POWER_REQUEST,
-                self.clock,
-                self.dbuf.joined,
-            ) | request,
+            cdclk::nova_lake_dbuf_ctl(old & !dbuf::DBUF_POWER_REQUEST, self.clock, self.joined)
+                | request,
         )
     }
 
     pub(crate) fn dbox(&self, pipe: Pipe) -> Option<u32> {
-        (self.dbuf.active_pipes & (1 << pipe as u8) != 0)
-            .then(|| crate::intel_gpu_xe2lpd::dbox(self.dbuf.joined))
+        (self.active_pipes & (1 << pipe as u8) != 0)
+            .then(|| crate::intel_gpu_xe2lpd::dbox(self.joined))
     }
 }
 
