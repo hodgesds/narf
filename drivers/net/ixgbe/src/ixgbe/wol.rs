@@ -214,16 +214,21 @@ pub const WOL_CAP_PORT0_1: u16 = 0x4; // WoL supported on ports 0 & 1
 pub const WOL_CAP_PORT0: u16 = 0x8; // WoL supported on port 0
 pub const WOL_CAP_MASK: u16 = 0xC;
 
+/// EEPROM word holding the DEVICE_CAPS bits (ixgbe_main.c:11913
+/// reads this offset at probe). Only the 0xC mask matters here.
+pub const EEPROM_DEVICE_CAPS_WORD: u16 = 0x2c;
+
 /// Board capability record gating WoL on X540-and-newer parts.
 ///
 /// Linux determines X540+ WoL from the EEPROM DEVICE_CAPS word, not
 /// from the device ID (ixgbe_main.c `ixgbe_wol_supported`, X540+ arm):
 /// the board (via its EEPROM image) opts in, and the driver never
-/// arms blindly. NARF has an EERD reader but no DEVICE_CAPS consumer
-/// yet, so the record is supplied explicitly by the board/platform
-/// layer through `Ixgbe::set_wol_board_cap`; the default record opts
-/// nothing in. A future lane can populate it from EEPROM word 0x2c
-/// via the existing EERD helper instead of board configuration.
+/// arms blindly. Probe populates the record from EEPROM word 0x2c
+/// via the EERD helper (`WolBoardCap::from_device_caps`); the
+/// board/platform layer may still override it through
+/// `Ixgbe::set_wol_board_cap`. The default record opts nothing in,
+/// and a failed 0x2c read leaves the default — populating the record
+/// arms nothing by itself.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WolBoardCap {
     /// Raw DEVICE_CAPS word bits (only the 0xC mask is consulted).
@@ -234,6 +239,16 @@ pub struct WolBoardCap {
 }
 
 impl WolBoardCap {
+    /// Build the record from a raw EEPROM DEVICE_CAPS word read at
+    /// probe, for the given PCI function number. The word is stored
+    /// verbatim; only the 0xC mask is consulted by [`Self::allows`].
+    pub const fn from_device_caps(word: u16, func: u8) -> Self {
+        Self {
+            cap_bits: word,
+            func,
+        }
+    }
+
     /// The Linux-literal X540+ rule (ixgbe_main.c `ixgbe_wol_supported`):
     /// masked cap 0x4 permits any function; masked cap 0x8 permits
     /// function 0 only; anything else — including 0xC, both bits set,
