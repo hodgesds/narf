@@ -216,7 +216,9 @@ impl GtPlatform {
             let family = match entry.asic {
                 "tigerlake" => Some(Gen12Platform::TigerLake),
                 "rocketlake" => Some(Gen12Platform::RocketLake),
-                "alderlake-p" | "alderlake-m" | "raptorlake-p" => Some(Gen12Platform::AlderLakeP),
+                "alderlake-p" | "alderlake-m" | "raptorlake-p" | "raptorlake-u" => {
+                    Some(Gen12Platform::AlderLakeP)
+                }
                 "alderlake-s" | "raptorlake-s" => Some(Gen12Platform::AlderLakeS),
                 "alderlake-n" => Some(Gen12Platform::AlderLakeN),
                 _ => None,

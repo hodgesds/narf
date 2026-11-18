@@ -2018,7 +2018,10 @@ and includes every currently qualified TGL/ADL variant from Linux
 `include/drm/intel/pciids.h`, including TGL 9A59/9AC0/9AC9/9AD9/9AF8 and
 ADL 46A2/46B2/46C2, plus the six exact RKL IDs
 4C80/4C8A/4C8B/4C8C/4C90/4C9A, WCL FD80/FD81 and NVL-S
-D740/D741/D742/D743/D744/D745. Every row must resolve to a qualified `guc()` profile in
+D740/D741/D742/D743/D744/D745. `ChipInfo::asic` reports Alder Lake-P
+for 46B0–46B3 and Raptor Lake-U for A721/A7A1/A7A9/A7AC/A7AD.
+Both mobile Raptor Lake variants select the Alder Lake-P display and GT
+profiles. Every row must resolve to a qualified `guc()` profile in
 the native census fixture. Initial probe first parks decode/mastering, returns
 the function to D0 and restores BARs lost across D3hot; only the selected
 generation path then enables memory and DMA. `guc()` selects the exact TGL,

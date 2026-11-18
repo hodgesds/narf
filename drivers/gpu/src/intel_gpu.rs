@@ -85,7 +85,7 @@ pub const RKL_4C8C: u16 = 0x4C8C;
 pub const RKL_4C90: u16 = 0x4C90;
 pub const RKL_4C9A: u16 = 0x4C9A;
 
-// Alder Lake-P / Raptor Lake-P (Gen12, mobile).
+// Alder Lake-P (Gen12, mobile).
 pub const ADL_P_4626: u16 = 0x4626;
 pub const ADL_P_4628: u16 = 0x4628;
 pub const ADL_P_462A: u16 = 0x462A;
@@ -102,10 +102,10 @@ pub const ADL_P_46AA: u16 = 0x46AA;
 pub const ADL_P_46B6: u16 = 0x46B6;
 pub const ADL_P_46B8: u16 = 0x46B8;
 pub const ADL_P_46BA: u16 = 0x46BA;
-pub const RPL_P_46B0: u16 = 0x46B0;
-pub const RPL_P_46B1: u16 = 0x46B1;
-pub const RPL_P_46B2: u16 = 0x46B2;
-pub const RPL_P_46B3: u16 = 0x46B3;
+pub const ADL_P_46B0: u16 = 0x46B0;
+pub const ADL_P_46B1: u16 = 0x46B1;
+pub const ADL_P_46B2: u16 = 0x46B2;
+pub const ADL_P_46B3: u16 = 0x46B3;
 // Alder Lake-M (Gen12, mobile).
 pub const ADL_M_46C0: u16 = 0x46C0;
 pub const ADL_M_46C1: u16 = 0x46C1;
@@ -137,15 +137,26 @@ pub const RPL_S_A78A: u16 = 0xA78A;
 pub const RPL_S_A78B: u16 = 0xA78B;
 // Raptor Lake-P / -U (Gen12, mobile).
 pub const RPL_P_A720: u16 = 0xA720;
-pub const RPL_P_A721: u16 = 0xA721;
+pub const RPL_U_A721: u16 = 0xA721;
 pub const RPL_P_A7A0: u16 = 0xA7A0;
-pub const RPL_P_A7A1: u16 = 0xA7A1;
+pub const RPL_U_A7A1: u16 = 0xA7A1;
 pub const RPL_P_A7A8: u16 = 0xA7A8;
-pub const RPL_P_A7A9: u16 = 0xA7A9;
+pub const RPL_U_A7A9: u16 = 0xA7A9;
 pub const RPL_P_A7AA: u16 = 0xA7AA;
 pub const RPL_P_A7AB: u16 = 0xA7AB;
-pub const RPL_P_A7AC: u16 = 0xA7AC;
-pub const RPL_P_A7AD: u16 = 0xA7AD;
+pub const RPL_U_A7AC: u16 = 0xA7AC;
+pub const RPL_U_A7AD: u16 = 0xA7AD;
+
+// Compatibility for users of the original PCI constant names.
+pub use self::ADL_P_46B0 as RPL_P_46B0;
+pub use self::ADL_P_46B1 as RPL_P_46B1;
+pub use self::ADL_P_46B2 as RPL_P_46B2;
+pub use self::ADL_P_46B3 as RPL_P_46B3;
+pub use self::RPL_U_A721 as RPL_P_A721;
+pub use self::RPL_U_A7A1 as RPL_P_A7A1;
+pub use self::RPL_U_A7A9 as RPL_P_A7A9;
+pub use self::RPL_U_A7AC as RPL_P_A7AC;
+pub use self::RPL_U_A7AD as RPL_P_A7AD;
 
 // Meteor Lake (Xe-LPG, mobile).
 pub const MTL_7D40: u16 = 0x7D40;
@@ -539,30 +550,30 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         generation: Generation::AlderLake,
         asic: "alderlake-p",
     },
-    // Raptor Lake-P (IDs the tree has always classified here).
+    // Keep the registered bus names for these Alder Lake-P devices.
     DeviceEntry {
         name: "intel-gpu-rpl-46B0",
-        did: RPL_P_46B0,
+        did: ADL_P_46B0,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "alderlake-p",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-46B1",
-        did: RPL_P_46B1,
+        did: ADL_P_46B1,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "alderlake-p",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-46B2",
-        did: RPL_P_46B2,
+        did: ADL_P_46B2,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "alderlake-p",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-46B3",
-        did: RPL_P_46B3,
+        did: ADL_P_46B3,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "alderlake-p",
     },
     // Alder Lake-M.
     DeviceEntry {
@@ -727,9 +738,9 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A721",
-        did: RPL_P_A721,
+        did: RPL_U_A721,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "raptorlake-u",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7A0",
@@ -739,9 +750,9 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7A1",
-        did: RPL_P_A7A1,
+        did: RPL_U_A7A1,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "raptorlake-u",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7A8",
@@ -751,9 +762,9 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7A9",
-        did: RPL_P_A7A9,
+        did: RPL_U_A7A9,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "raptorlake-u",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7AA",
@@ -769,15 +780,15 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7AC",
-        did: RPL_P_A7AC,
+        did: RPL_U_A7AC,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "raptorlake-u",
     },
     DeviceEntry {
         name: "intel-gpu-rpl-A7AD",
-        did: RPL_P_A7AD,
+        did: RPL_U_A7AD,
         generation: Generation::AlderLake,
-        asic: "raptorlake-p",
+        asic: "raptorlake-u",
     },
     // Meteor Lake (Xe-LPG) — identify + announce only in this lane.
     DeviceEntry {
@@ -3695,10 +3706,10 @@ pub mod tests {
             (0x46B6, "alderlake-p"),
             (0x46B8, "alderlake-p"),
             (0x46BA, "alderlake-p"),
-            (0x46B0, "raptorlake-p"),
-            (0x46B1, "raptorlake-p"),
-            (0x46B2, "raptorlake-p"),
-            (0x46B3, "raptorlake-p"),
+            (0x46B0, "alderlake-p"),
+            (0x46B1, "alderlake-p"),
+            (0x46B2, "alderlake-p"),
+            (0x46B3, "alderlake-p"),
             (0x46C0, "alderlake-m"),
             (0x46C1, "alderlake-m"),
             (0x46C2, "alderlake-m"),
@@ -3725,15 +3736,15 @@ pub mod tests {
             (0xA78A, "raptorlake-s"),
             (0xA78B, "raptorlake-s"),
             (0xA720, "raptorlake-p"),
-            (0xA721, "raptorlake-p"),
+            (0xA721, "raptorlake-u"),
             (0xA7A0, "raptorlake-p"),
-            (0xA7A1, "raptorlake-p"),
+            (0xA7A1, "raptorlake-u"),
             (0xA7A8, "raptorlake-p"),
-            (0xA7A9, "raptorlake-p"),
+            (0xA7A9, "raptorlake-u"),
             (0xA7AA, "raptorlake-p"),
             (0xA7AB, "raptorlake-p"),
-            (0xA7AC, "raptorlake-p"),
-            (0xA7AD, "raptorlake-p"),
+            (0xA7AC, "raptorlake-u"),
+            (0xA7AD, "raptorlake-u"),
             (0x7D40, "meteorlake"),
             (0x7D45, "meteorlake"),
             (0x7D55, "meteorlake"),
@@ -3777,6 +3788,14 @@ pub mod tests {
                 return TestResult::Fail("census DID classifies to the wrong ASIC");
             }
             let platform = crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, *did);
+            if matches!(
+                *asic,
+                "alderlake-p" | "alderlake-m" | "raptorlake-p" | "raptorlake-u"
+            ) && crate::intel_gpu_modeset::gen12_family_for_chip(info)
+                != Some(crate::intel_gpu_gt::Gen12Platform::AlderLakeP)
+            {
+                return TestResult::Fail("mobile ADL/RPL must use the ADL-P display profile");
+            }
             if platform
                 .and_then(crate::intel_gpu_gt::GtPlatform::guc)
                 .is_none()

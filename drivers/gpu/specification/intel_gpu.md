@@ -290,8 +290,9 @@ rules apply.
 | lunarlake (Xe2-LPG; display 20 opt-in) | 6420, 64A0, 64B0 |
 | tigerlake (Gen12) | 9A40, 9A49, 9A59, 9A60, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8 |
 | rocketlake (Gen12 GT; display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
-| alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A2, 46A3, 46A6, 46A8, 46AA, 46B6, 46B8, 46BA |
-| raptorlake-p (Gen12) | 46B0, 46B1, 46B2, 46B3, A720, A721, A7A0, A7A1, A7A8, A7A9, A7AA, A7AB, A7AC, A7AD |
+| alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A2, 46A3, 46A6, 46A8, 46AA, 46B0, 46B1, 46B2, 46B3, 46B6, 46B8, 46BA |
+| raptorlake-p (Gen12) | A720, A7A0, A7A8, A7AA, A7AB |
+| raptorlake-u (Gen12) | A721, A7A1, A7A9, A7AC, A7AD |
 | alderlake-m (Gen12) | 46C0, 46C1, 46C2, 46C3 |
 | alderlake-n (Gen12) | 46D0, 46D1, 46D2, 46D3, 46D4 |
 | alderlake-s (Gen12) | 4680, 4682, 4688, 468A, 468B, 4690, 4692, 4693 |
@@ -302,10 +303,10 @@ rules apply.
 | wildcatlake (Xe3-LPG; display 30.02 gated) | FD80, FD81 |
 | novalake-s (Xe3-LPG; display 35.00 gated) | D740, D741, D742, D743, D744, D745 |
 
-Note: pci.ids labels 46B0/46B1/46B3 as AlderLake-P silicon; the
-driver has always classified them `raptorlake-p` and the census
-pins that existing behaviour (re-classification is out of scope
-for lane 1).
+Linux `INTEL_ADLP_IDS` includes 46B0–46B3. The historical
+`intel-gpu-rpl-46B*` registration names for these four devices remain
+available for bus consumers. Raptor Lake-P and Raptor Lake-U have distinct
+ASIC names and both use the Alder Lake-P GT and display profiles.
 
 Rocket Lake is not a Tiger Lake device-ID alias. Linux
 `include/drm/intel/pciids.h` supplies the exact six-ID census;
