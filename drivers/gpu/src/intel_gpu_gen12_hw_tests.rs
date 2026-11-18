@@ -177,7 +177,7 @@ fn execute_user(w: &Window, base: u32) {
     let ring_base = image.borrow()[1024 + 9];
     let ring = d.memory[&ring_base].borrow().clone();
     let stamp = ring[7];
-    execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
+    execute_ppgtt_probe(&d, &image.borrow(), &ring, stamp, base, false);
     let tail = image.borrow()[1024 + 7];
     image.borrow_mut()[0x800 / 4] = stamp;
     image.borrow_mut()[1024 + 5] = tail;

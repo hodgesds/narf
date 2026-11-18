@@ -1,6 +1,7 @@
 //! Independent native device side of the documented Xe-HPG CCS transfer.
 //! Decodes instructions fetched through real production PPGTT pages; metadata
 //! lives in a model-only VRAM sideband so a CPU data clear cannot pass this test.
+use crate::intel_gpu_gt::GtPlatform;
 use alloc::vec::Vec;
 use core::ops::Range;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -75,47 +76,67 @@ pub(crate) fn fixture_metadata(dpa: u64, bytes: &[u8]) {
     model.metadata[start..start + bytes.len()].copy_from_slice(bytes);
 }
 
-fn leaf(root: u64, va: u64) -> (u64, u64) {
-    let mut table = root & 0x0000_3fff_ffff_f000;
-    for shift in [39, 30, 21, 12] {
-        let pointer = narf_memory::PhysAddr::new(table).kernel_ptr::<u64>();
-        // SAFETY: called only while the native scheduler retains the real
-        // immutable production page-table allocation for this request.
-        let entry =
-            unsafe { core::ptr::read_volatile(pointer.add(((va >> shift) & 511) as usize)) };
-        assert_ne!(entry & 1, 0);
-        let physical = entry & 0x0000_3fff_ffff_f000;
-        if shift == 12 {
-            return (physical | (va & 4095), entry);
-        }
-        assert_ne!(physical, 0);
-        assert_eq!(entry & !(0x0000_3fff_ffff_f000 | 0x18), 3, "ordinary table");
-        table = physical;
-    }
-    unreachable!()
-}
-fn pointer(root: u64, va: u64, writable: bool) -> *mut u8 {
-    let (physical, entry) = leaf(root, va);
-    let pat = if root & 0x18 == 0x10 { 0x10 } else { 0 };
-    let device = entry & 0x800 != 0;
-    let page64 = device && pat == 0;
-    assert_eq!(
-        entry & !0x0000_3fff_ffff_f000,
-        1 | (u64::from(writable) * 2)
-            | pat
-            | (u64::from(device) * 0x800)
-            | (u64::from(page64) * 0x100),
-        "copy leaf permission/cache policy"
-    );
-    if device {
-        fixture_pointer(physical).expect("DM leaf outside model windows") as *mut u8
+// Linux xe_pci.c gives Battlemage a level-4 root even with 48-bit VAs.
+pub(crate) fn fixture_page_shifts(platform: Option<GtPlatform>) -> &'static [u8] {
+    if platform.is_some_and(GtPlatform::is_xe2) {
+        &[48, 39, 30, 21, 12]
     } else {
-        narf_memory::PhysAddr::new(physical).kernel_mut_ptr::<u8>()
+        &[39, 30, 21, 12]
     }
 }
 
-pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
-    let (code, flags) = leaf(root, batch_va);
+struct ModelTables {
+    root: u64,
+    shifts: &'static [u8],
+}
+
+impl ModelTables {
+    fn leaf(&self, va: u64) -> (u64, u64) {
+        let mut table = self.root & 0x0000_3fff_ffff_f000;
+        for &shift in self.shifts {
+            let pointer = narf_memory::PhysAddr::new(table).kernel_ptr::<u64>();
+            // SAFETY: called only while the native scheduler retains the real
+            // immutable production page-table allocation for this request.
+            let entry =
+                unsafe { core::ptr::read_volatile(pointer.add(((va >> shift) & 511) as usize)) };
+            assert_ne!(entry & 1, 0);
+            let physical = entry & 0x0000_3fff_ffff_f000;
+            if shift == 12 {
+                return (physical | (va & 4095), entry);
+            }
+            assert_ne!(physical, 0);
+            assert_eq!(entry & !(0x0000_3fff_ffff_f000 | 0x18), 3, "ordinary table");
+            table = physical;
+        }
+        unreachable!()
+    }
+    fn pointer(&self, va: u64, writable: bool) -> *mut u8 {
+        let (physical, entry) = self.leaf(va);
+        let pat = if self.root & 0x18 == 0x10 { 0x10 } else { 0 };
+        let device = entry & 0x800 != 0;
+        let page64 = device && pat == 0;
+        assert_eq!(
+            entry & !0x0000_3fff_ffff_f000,
+            1 | (u64::from(writable) * 2)
+                | pat
+                | (u64::from(device) * 0x800)
+                | (u64::from(page64) * 0x100),
+            "copy leaf permission/cache policy"
+        );
+        if device {
+            fixture_pointer(physical).expect("DM leaf outside model windows") as *mut u8
+        } else {
+            narf_memory::PhysAddr::new(physical).kernel_mut_ptr::<u8>()
+        }
+    }
+}
+
+pub(crate) fn execute_fixture(platform: Option<GtPlatform>, root: u64, batch_va: u64) -> bool {
+    let tables = ModelTables {
+        root,
+        shifts: fixture_page_shifts(platform),
+    };
+    let (code, flags) = tables.leaf(batch_va);
     let pointer = narf_memory::PhysAddr::new(code).kernel_ptr::<u32>();
     // SAFETY: trusted copy/clear factories retain this complete 4 KiB BO.
     let words = unsafe { core::slice::from_raw_parts(pointer, 1024) };
@@ -157,11 +178,11 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
             if let Some(model) = MODEL.lock().as_mut() {
                 model
                     .copies
-                    .push((leaf(root, source).0, leaf(root, target).0, bytes));
+                    .push((tables.leaf(source).0, tables.leaf(target).0, bytes));
             }
             for page in (0..bytes).step_by(4096) {
-                let source = self::pointer(root, source + page, false);
-                let target = self::pointer(root, target + page, true);
+                let source = tables.pointer(source + page, false);
+                let target = tables.pointer(target + page, true);
                 // SAFETY: independent walks resolve retained RO source and
                 // RW destination pages; admitted ranges cannot overlap.
                 unsafe { core::ptr::copy_nonoverlapping(source, target, 4096) };
@@ -190,7 +211,7 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
             assert_eq!(target & 65535, 0);
         }
         if !src_direct {
-            let source_dpa = leaf(root, source).0;
+            let source_dpa = tables.leaf(source).0;
             assert_eq!(source_dpa & 65535, 0);
             if dst_direct {
                 let mut saved = alloc::vec![0u8; metadata_bytes as usize];
@@ -209,33 +230,29 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
                 for (i, byte) in saved.into_iter().enumerate() {
                     // SAFETY: independently verified writable direct sysmem CCS buffer.
                     unsafe {
-                        core::ptr::write_volatile(
-                            self::pointer(root, target + i as u64, true),
-                            byte,
-                        )
+                        core::ptr::write_volatile(tables.pointer(target + i as u64, true), byte)
                     };
                 }
                 offset += 5;
                 continue;
             }
         }
-        let source_dpa = (!src_direct).then(|| leaf(root, source).0);
+        let source_dpa = (!src_direct).then(|| tables.leaf(source).0);
         let mut restored = if src_direct {
             let mut bytes = alloc::vec![0u8; metadata_bytes as usize];
             for (i, slot) in bytes.iter_mut().enumerate() {
                 // SAFETY: independently verified retained RO direct sysmem source.
-                *slot = unsafe {
-                    core::ptr::read_volatile(self::pointer(root, source + i as u64, false))
-                };
+                *slot =
+                    unsafe { core::ptr::read_volatile(tables.pointer(source + i as u64, false)) };
             }
             Some(bytes)
         } else {
             None
         };
-        let (dpa, _) = leaf(root, target);
+        let (dpa, _) = tables.leaf(target);
         for chunk in (0..data_bytes).step_by(65536) {
             for page in 0..16 {
-                let (physical, entry) = leaf(root, target + chunk + page * 4096);
+                let (physical, entry) = tables.leaf(target + chunk + page * 4096);
                 assert_eq!(physical, dpa + chunk + page * 4096);
                 assert_eq!(entry & !0x0000_3fff_ffff_f000, 0x903, "DM|PS64|RW|PRESENT");
             }

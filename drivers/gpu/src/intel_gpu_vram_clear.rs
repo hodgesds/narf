@@ -12,7 +12,7 @@ mod model;
 #[cfg(feature = "kernel-test")]
 pub(crate) use model::{
     execute_fixture, fixture_add_window, fixture_copies, fixture_finish, fixture_metadata,
-    fixture_pointer, fixture_seed, fixture_state,
+    fixture_page_shifts, fixture_pointer, fixture_seed, fixture_state,
 };
 
 const CODE: u64 = 0x1234_0000_0000;

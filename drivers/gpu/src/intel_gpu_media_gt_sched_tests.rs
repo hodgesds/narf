@@ -121,6 +121,7 @@ pub(super) fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
     };
     assert!(d.synced.contains(&ring_base));
     let ring = d.memory[&ring_base].borrow().clone();
+    let platform = d.profile;
     drop(d);
     let mut words = &ring[..tail as usize / 4];
     if words[0] == 0x12480002 {
@@ -166,7 +167,7 @@ pub(super) fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
             ]
         );
         if hw.drop_store != Some(engine) {
-            execute_copy_ppgtt(root, &normalized[7..], false);
+            execute_copy_ppgtt(root, &normalized[7..], platform);
         }
         hw.ppgtt.push(engine);
     }
