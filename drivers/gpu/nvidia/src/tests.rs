@@ -6140,3 +6140,62 @@ fn smoke_c57d_write_inst_mem() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_write_inst_mem);
+
+// ────────────────────────────────────────────────────────────────
+// NvDisplay C57E window-channel surface scanout (Turing)
+// ────────────────────────────────────────────────────────────────
+
+use crate::dispc57e::{
+    offset_units, params, plane_method, size_wh, storage, C57E_SET_CONTEXT_DMA_ISO,
+    C57E_SET_OFFSET, FORMAT_A8R8G8B8, MEMORY_LAYOUT_PITCH,
+};
+
+fn smoke_c57e_surface_encoders() -> TestResult {
+    // SET_SIZE = width | height<<16.
+    if size_wh(1920, 1080) != (1920 | (1080u32 << 16)) {
+        return TestResult::Fail("size_wh wrong");
+    }
+    // STORAGE: pitch layout at bit 4, block height at 3:0.
+    if storage(MEMORY_LAYOUT_PITCH, 0) != (1 << 4) {
+        return TestResult::Fail("pitch storage wrong");
+    }
+    if storage(0, 4) != 4 {
+        return TestResult::Fail("block-linear block height wrong");
+    }
+    // PARAMS: XRGB8888 format in bits[7:0].
+    if params(FORMAT_A8R8G8B8) != 0xcf {
+        return TestResult::Fail("format wrong");
+    }
+    // OFFSET is byte offset >> 8 (256-byte units).
+    if offset_units(0x1_0000) != 0x100 || offset_units(0xFF) != 0 {
+        return TestResult::Fail("offset units wrong");
+    }
+    // Per-plane method stride is 4 bytes.
+    if plane_method(C57E_SET_CONTEXT_DMA_ISO, 0) != 0x240
+        || plane_method(C57E_SET_OFFSET, 1) != 0x264
+    {
+        return TestResult::Fail("plane method addressing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57e", smoke_c57e_surface_encoders);
+
+fn smoke_c57e_stage_surface() -> TestResult {
+    // The staging emits a sequence of methods into a pushbuffer; verify
+    // it builds without overflow and encodes the first method.
+    use crate::dispc57e::{stage_surface, stage_update};
+    let mut buf = alloc::vec![0u8; 256];
+    let mut pb = crate::pb::PbBuilder::new(&mut buf);
+    if stage_surface(&mut pb, 0xcafe, 0x2_0000, 1920, 1080).is_err() {
+        return TestResult::Fail("stage_surface must fit the pushbuffer");
+    }
+    if stage_update(&mut pb).is_err() {
+        return TestResult::Fail("stage_update must fit");
+    }
+    // Something was written (header + data words).
+    if pb.is_empty() {
+        return TestResult::Fail("staging must emit pushbuffer words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57e", smoke_c57e_stage_surface);
