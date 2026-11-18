@@ -6061,3 +6061,82 @@ fn smoke_gsp_static_info_parse() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_static", smoke_gsp_static_info_parse);
+
+// ────────────────────────────────────────────────────────────────
+// NvDisplay C57D method layer (Turing modeset) + WRITE_INST_MEM
+// ────────────────────────────────────────────────────────────────
+
+use crate::dispc57d::{
+    head_method as c57d_head_method, output_resource, pixel_clock_hz, raster_blank_end,
+    raster_blank_start, raster_size, raster_sync_end, window_method, C57D_HEAD_SET_RASTER_SIZE,
+    C57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS, PIXEL_DEPTH_BPP_24_444,
+};
+use crate::gsp_chan::{write_inst_mem_params, write_inst_mem_rpc, NV_MEMORY_WRITECOMBINED};
+
+fn mode_1080p60() -> crate::disp::Mode {
+    crate::disp::Mode {
+        clock_khz: 148_500,
+        h_display: 1920,
+        h_sync_start: 2008,
+        h_sync_end: 2052,
+        h_total: 2200,
+        v_display: 1080,
+        v_sync_start: 1084,
+        v_sync_end: 1089,
+        v_total: 1125,
+        flags: crate::disp::ModeFlags::default(),
+    }
+}
+
+fn smoke_c57d_method_addressing() -> TestResult {
+    if c57d_head_method(C57D_HEAD_SET_RASTER_SIZE, 1) != 0x2464 {
+        return TestResult::Fail("head method addressing wrong");
+    }
+    if window_method(C57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS, 2) != 0x1004 + 2 * 0x80 {
+        return TestResult::Fail("window method addressing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_method_addressing);
+
+fn smoke_c57d_raster_encoders() -> TestResult {
+    let m = mode_1080p60();
+    if raster_size(&m) != (2200 | (1125u32 << 16)) {
+        return TestResult::Fail("raster_size wrong");
+    }
+    if raster_sync_end(&m) != (43 | (4u32 << 16)) {
+        return TestResult::Fail("raster_sync_end wrong");
+    }
+    if raster_blank_end(&m) != (191 | (40u32 << 16)) {
+        return TestResult::Fail("raster_blank_end wrong");
+    }
+    if raster_blank_start(&m) != (2111 | (1120u32 << 16)) {
+        return TestResult::Fail("raster_blank_start wrong");
+    }
+    if pixel_clock_hz(&m) != 148_500_000 {
+        return TestResult::Fail("pixel clock Hz wrong");
+    }
+    if output_resource(PIXEL_DEPTH_BPP_24_444) != (4 << 4) {
+        return TestResult::Fail("output resource pixel depth wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_raster_encoders);
+
+fn smoke_c57d_write_inst_mem() -> TestResult {
+    let p = write_inst_mem_params(0x1_0000_0000, 0x1_0000, ADDR_FBMEM, NV_MEMORY_WRITECOMBINED);
+    let rd64 = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    if rd64(0) != 0x1_0000_0000 || rd64(8) != 0x1_0000 {
+        return TestResult::Fail("inst-mem phys/size mis-packed");
+    }
+    if rd32(16) != ADDR_FBMEM || rd32(20) != NV_MEMORY_WRITECOMBINED {
+        return TestResult::Fail("inst-mem addr-space/cache-attr wrong");
+    }
+    let rpc = write_inst_mem_rpc(0xc1d0_0000, 0x5d1d_0000, 0x1000, 0x1_0000);
+    if u32::from_le_bytes(rpc[4..8].try_into().unwrap()) != 0x5d1d_0000 {
+        return TestResult::Fail("WRITE_INST_MEM must target the internal subdevice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/dispc57d", smoke_c57d_write_inst_mem);

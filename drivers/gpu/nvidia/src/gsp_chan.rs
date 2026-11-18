@@ -127,3 +127,38 @@ pub fn alloc_channel_rpc(h_client: u32, hclass: u32, inst: u16) -> alloc::vec::V
         &channeldma_alloc_params(inst as u32),
     )
 }
+
+// ── Display instance memory (RAMIN) ──────────────────────────────
+
+/// `NV_MEMORY_WRITECOMBINED` CPU cache attribute.
+pub const NV_MEMORY_WRITECOMBINED: u32 = 2;
+
+/// `NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS` (24 bytes):
+/// instMemPhysAddr, instMemSize, instMemAddrSpace, instMemCpuCacheAttr.
+/// The display engine's instance memory is a VRAM gpuobj handed to GSP
+/// before any channel is allocated.
+pub fn write_inst_mem_params(phys: u64, size: u64, addr_space: u32, cache_attr: u32) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[0..8].copy_from_slice(&phys.to_le_bytes());
+    b[8..16].copy_from_slice(&size.to_le_bytes());
+    b[16..20].copy_from_slice(&addr_space.to_le_bytes());
+    b[20..24].copy_from_slice(&cache_attr.to_le_bytes());
+    b
+}
+
+/// Build the `WRITE_INST_MEM` `GSP_RM_CONTROL` payload, targeting the
+/// internal subdevice. `phys`/`size` describe the VRAM RAMIN gpuobj.
+pub fn write_inst_mem_rpc(
+    h_client: u32,
+    h_internal_subdevice: u32,
+    phys: u64,
+    size: u64,
+) -> alloc::vec::Vec<u8> {
+    let params = write_inst_mem_params(phys, size, ADDR_FBMEM, NV_MEMORY_WRITECOMBINED);
+    build_rm_control(
+        h_client,
+        h_internal_subdevice,
+        CMD_INTERNAL_DISPLAY_WRITE_INST_MEM,
+        &params,
+    )
+}

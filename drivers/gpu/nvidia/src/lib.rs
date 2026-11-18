@@ -38,6 +38,7 @@ pub mod bar;
 pub mod ce;
 pub mod chip;
 pub mod disp;
+pub mod dispc57d;
 pub mod dp;
 pub mod edid_aux;
 pub mod falcon;
