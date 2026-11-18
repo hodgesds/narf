@@ -3367,7 +3367,10 @@ fn smoke_bt_connect_refused_failed() -> TestResult {
     ) {
         return TestResult::Fail("failed connect should be ENETUNREACH");
     }
-    // Undiscovered BR/EDR peer: same mapping.
+    // Undiscovered BR/EDR peer: same mapping. The scripted peer
+    // must carry addr type 0 (BR/EDR) to match the connect below;
+    // phases 1-2 used type 1 (LE).
+    peer[0] = 0;
     fake_bt_script_connect(
         0,
         peer,
