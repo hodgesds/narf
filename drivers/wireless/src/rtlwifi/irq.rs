@@ -102,7 +102,13 @@ pub unsafe fn disable_interrupts(mmio: &MmioRegion) {
 /// mask at `0x120` / `0x128` (`rtl92ce_disable_interrupt`,
 /// `rtl92d_disable_interrupt`), the others at the 88EE `0xb0` / `0xb8`.
 pub const fn imr_pair(did: u16) -> (u64, u64) {
-    if super::rtl8192ce::is_8192ce(did) {
+    if did == super::regs::RTL_DEV_8723AE {
+        // Actual hw.c literals; reg.h's HIMR macros are unused by this path.
+        (
+            super::rtl8723ae::irq::MASK0 as u64,
+            super::rtl8723ae::irq::MASK1 as u64,
+        )
+    } else if super::rtl8192ce::is_8192ce(did) {
         (
             super::rtl8192ce::mac::REG_HIMR as u64,
             super::rtl8192ce::mac::REG_HIMRE as u64,

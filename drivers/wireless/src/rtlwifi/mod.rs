@@ -17,28 +17,25 @@
 //! RTL8822BE (0xB822) is not in this family: it belongs to `rtw88`
 //! (`specification/rtlwifi.md` §1) and must never be matched here.
 //!
-//! ## Scope (this commit)
+//! ## Retained native ownership
 //!
 //! 1. PCI device-ID table — all 8 IDs registered with `narf-bus`.
 //! 2. BAR2 control mapping and verifiably parked PCI bus mastering.
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner,
-//!    and the RTL8821AE 2.4 GHz legacy station profile (no BT coexistence).
-//!    Other silicon profiles remain diagnostic.
+//! 6. Per-chip authenticated firmware, linked-ring/LLT and calibrated station
+//!    continuations; exact profiles and prerequisites live in the family spec.
+//! 7. Separate RTL8723AE NASR station, RTL8723BE NBTH thermal and RTL8821AE
+//!    N21C coexistence programs retain their original radio/firmware owners.
 //!
-//! ## Deferred
+//! ## Admission
 //!
-//! - Complete power/reset flows for silicon beyond RTL8188EE.
-//! - Firmware transport for the remaining legacy parts.
-//! - Active DMA, complete MAC/BB/RF/calibration and station packet runtime.
-//! - MSI / INTx IRQ routing.
-//! - Bluetooth co-existence (8723AE/BE).
-//!
-//! Until those firmware-backed paths exist, the registered diagnostic
-//! interface remains down: scan, association, and configuration return
-//! `WirelessError::NotSupported` rather than claiming a usable WLAN.
+//! Probe alone grants no station or RF authority. Actual signed qualification,
+//! current host policy and original PCI/firmware sources enclose native effects
+//! and publication. Missing optional coexistence/tracking inputs preserve their
+//! documented closed/coarse baseline. Broader profiles and physical acceptance
+//! remain pending; a restrictive park does not prove DMA idle or RF reset.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -73,6 +70,8 @@ pub use ht::Request as Ht40Request;
 mod antenna;
 pub use antenna::Request as AntennaDiversityRequest;
 mod tracking;
+pub use rtl8723be::tracking::Request as Rtl8723beThermalTrackingRequest;
+pub use rtl8821ae::coex_program::Request as Rtl8821aeCoexistenceRequest;
 pub use tracking::Request as ThermalTrackingRequest;
 mod protection;
 pub use protection::Request as ProtectionRequest;
@@ -119,3 +118,6 @@ mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
+
+// Source-identical base.c arithmetic; each chip owns its observations.
+pub(crate) mod watchdog_traffic;

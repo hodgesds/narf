@@ -286,7 +286,7 @@ pub struct Owner {
     /// `hw_coexist_all_off` wrapper flag (see the module caveat).
     pub hw_all_off: bool,
     /// Next H2C box number (`rtlhal->last_hmeboxnum` rotation).
-    h2c_next: u8,
+    pub(in crate::rtlwifi) mailbox: super::h2c::Mailbox,
 }
 
 /// H2C fill failure (mirrors `rtl8723be/h2c.rs` error shape).
@@ -296,7 +296,7 @@ pub enum Error {
     CommandTimeout,
     /// Register access failed.
     Access,
-    /// Payload empty or longer than 7 bytes.
+    /// Payload empty or longer than 5 bytes, or mailbox already terminal.
     State,
 }
 
@@ -370,7 +370,7 @@ impl Owner {
             fw_all_off: false,
             sw_all_off: false,
             hw_all_off: false,
-            h2c_next: 0,
+            mailbox: super::h2c::Mailbox::new(),
         }
     }
 
@@ -609,61 +609,25 @@ impl Owner {
         next
     }
 
-    /// Fill one H2C command through the box rotation, mirroring
-    /// `rtl8723be_fill_h2c_cmd` (`HMETFR` free-box poll, box + extension
-    /// split at 3 payload bytes). Payloads longer than 7 bytes or empty
-    /// are refused, as in the BE mailbox.
+    /// Actual AE mailbox shared with station commands. Readiness requires
+    /// BOTH HMETFR and MCUTST; every delayed retry also reads0x1bf. A partial
+    /// write, timeout or cancellation poisons the same retained rotation.
     pub(crate) async fn h2c_fill<I: Io>(
         &mut self,
         io: &I,
         id: u8,
         payload: &[u8],
     ) -> Result<(), Error> {
-        // `_rtl8723e_fill_h2c_command` handles 1..=5 command bytes.
-        if payload.is_empty() || payload.len() > 5 {
-            return Err(Error::State);
-        }
-        let boxnum = self.h2c_next;
-        let mut read = false;
-        for check in 0..HMETFR_CHECKS {
-            if check != 0 {
-                io.delay_us(10).await;
-            }
-            let hmetfr = io.read8(REG_HMETFR)?;
-            if hmetfr == 0xff {
-                return Err(Error::Access);
-            }
-            if (hmetfr >> boxnum) & 1 == 0 {
-                read = true;
-                break;
-            }
-        }
-        if !read {
-            return Err(Error::CommandTimeout);
-        }
-        let base = REG_HMEBOX_0 + u16::from(boxnum) * 4;
-        // `rtl8723ae/fw.c::_rtl8723e_fill_h2c_command`: up to three bytes
-        // go in the box with BIT(7) clear; four or five bytes set BIT(7),
-        // put the first two in the two-byte extension register (written
-        // first) and the rest in the box.
-        let mut content = [0u8; 4];
-        content[0] = id;
-        if payload.len() > 3 {
-            content[0] |= 1 << 7;
-            let ext_base = REG_HMEBOX_EXT_0 + u16::from(boxnum) * 2;
-            for (i, b) in payload[..2].iter().enumerate() {
-                io.write8(ext_base + i as u16, *b)?;
-            }
-            content[1..1 + payload.len() - 2].copy_from_slice(&payload[2..]);
-        } else {
-            content[0] &= !(1 << 7);
-            content[1..1 + payload.len()].copy_from_slice(payload);
-        }
-        for (i, b) in content.iter().enumerate() {
-            io.write8(base + i as u16, *b)?;
-        }
-        self.h2c_next = (boxnum + 1) & 3;
-        Ok(())
+        self.mailbox
+            .fill(io, id, payload)
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                crate::rtlwifi::prepare::Error::PacketTimeout => Error::CommandTimeout,
+                crate::rtlwifi::prepare::Error::State
+                | crate::rtlwifi::prepare::Error::Descriptor => Error::State,
+                _ => Error::Access,
+            })
     }
 
     /// `rtl8723e_dm_bt_balance`: H2C `0x0c` with `[ms0, ms1, on]`; turning

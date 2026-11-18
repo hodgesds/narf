@@ -95,9 +95,32 @@ unsafe impl Memory for Coherent {
 pub(super) type NativePrepared = Prepared<PacketIo<PciIo>, Coherent>;
 
 impl super::prepare::packet::Port for PacketIo<PciIo> {
-    fn publication(&self) -> Result<super::prepare::packet::Publication, Error> {
-        self.with_io(|io| Ok(io.publication()))
+    async fn prepare_rtl8723ae_aspm(&self, enabled: bool) -> Result<(), Error> {
+        self.require_ae_aspm_profile().map_err(Error::Access)?;
+        super::aspm::configure_for(self, super::aspm::Profile::Rtl8723ae, enabled)
+            .await
             .map_err(Error::Access)
+    }
+    fn bind_rtl8821ae_coex(
+        &self,
+        base: Arc<super::rtl8821ae::envelope::Calibration>,
+        factory: &super::efuse::Factory,
+        permission: super::rtl8821ae::envelope::Permission,
+        bt: super::rtl8821ae::coex_program::BtIdentity,
+    ) -> Result<Option<Arc<super::rtl8821ae::coex_program::Program>>, Error> {
+        self.bind_8821_program(base, factory, permission, bt)
+    }
+    fn rtl8821ae_coex_request(&self) -> Option<super::rtl8821ae::coex_program::Request> {
+        self.request_8821_program()
+    }
+    fn terminal_park(&self) -> Option<super::prepare::packet::TerminalPark> {
+        self.terminal_8821()
+    }
+    fn publication(&self) -> Result<super::prepare::packet::Publication, Error> {
+        let original = self
+            .with_io(|io| Ok(io.publication()))
+            .map_err(Error::Access)?;
+        Ok(self.guard_8821_publication(original))
     }
     type Buffer = Coherent;
     fn authority<T>(
@@ -111,12 +134,27 @@ impl super::prepare::packet::Port for PacketIo<PciIo> {
         Ok(Coherent(self.with_io(|io| io.allocate_dma(bytes))?))
     }
     fn master(&self, enabled: bool) -> Result<(), Error> {
-        self.with_io(|io| io.packet_master(enabled))?;
+        self.with_effect_io(|io| io.packet_master(enabled))?;
         Ok(())
     }
     fn kick(&self, queue_bit: u16) -> Result<(), Error> {
-        self.with_io(|io| io.packet_kick(queue_bit))?;
+        self.with_effect_io(|io| io.packet_kick(queue_bit))?;
         Ok(())
+    }
+}
+
+impl super::aspm::Port for PacketIo<PciIo> {}
+impl super::aspm::PolicyPort for PacketIo<PciIo> {
+    fn desired(&self, enabled: bool) -> Result<Option<u16>, super::firmware_transport::Error> {
+        self.require_ae_aspm_profile()?;
+        self.with_effect_io(|io| super::aspm::PolicyPort::desired(io, enabled))
+    }
+    fn control(&self, desired: u16) -> Result<(), super::firmware_transport::Error> {
+        self.require_ae_aspm_profile()?;
+        self.with_effect_io(|io| super::aspm::PolicyPort::control(io, desired))
+    }
+    fn prepared(&self) -> &core::sync::atomic::AtomicBool {
+        self.original_aspm_receipt()
     }
 }
 
@@ -649,6 +687,19 @@ pub(super) async fn initialize_registered_on_channel(
     factory: Arc<super::efuse::Factory>,
     channel: u8,
 ) -> Result<(), Error> {
+    if firmware.device_id() == super::regs::RTL_DEV_8723AE {
+        // A readiness query only. The registered AE capsule alone can move
+        // its original cold port through NAQR/NASR/rings/MAC. Never replay
+        // cold/firmware/table setup or consume a generic packet claim here.
+        if firmware.status().stage != super::firmware_transport::Stage::Ready {
+            return Err(Error::State);
+        }
+        let storage = retained.lock().await;
+        let owner = storage.as_ref().ok_or(Error::State)?;
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+        return owner.rtl8723ae_ready(&factory, channel, &domain);
+    }
     // RTL8821AE and RTL8192DE are dual-band (their own gates admit the
     // 5 GHz plan, 92DE per function bandset); every other profile stays on
     // 2.4 GHz channels 1-11.
@@ -714,4 +765,29 @@ pub(super) async fn initialize_registered_on_channel(
     prepared
         .stage_station_calibration(calibration, &domain)
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))
+}
+
+/// Original AE port only: the registered cold capsule consumed the generic
+/// claim and installed NASR before this entry. No firmware or LLT replay.
+pub(super) fn allocate_ae_port(
+    port: PacketIo<PciIo>,
+    depth: usize,
+) -> Result<NativePrepared, Error> {
+    if !(4..=256).contains(&depth) || !depth.is_power_of_two() {
+        return Err(Error::Geometry);
+    }
+    let mut blocks = alloc::vec::Vec::new();
+    blocks
+        .try_reserve_exact(depth + 8)
+        .map_err(|_| Error::Memory)?;
+    for bytes in core::iter::repeat_n(depth * 64, 7)
+        .chain(core::iter::once(depth * 32))
+        .chain(core::iter::repeat_n(super::prepare::RX_BUFFER, depth))
+    {
+        blocks.push(Coherent(port.with_io(|io| io.allocate_dma(bytes))?));
+    }
+    let mut blocks = blocks.into_iter();
+    Prepared::allocate_for(super::prepare::Chip::Rtl8723ae, port, depth, |_| {
+        blocks.next().ok_or(Error::Memory)
+    })
 }

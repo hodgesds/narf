@@ -208,6 +208,8 @@ struct Curve {
 
 /// Signed per-board calibration for one 8723BE board.
 pub struct Calibration {
+    /// Exact signed NAPC bytes; optional continuations bind this original record.
+    digest: [u8; 32],
     identity: [u8; 32],
     antenna: i16,
     qualified: i16,
@@ -287,6 +289,13 @@ fn signed(bytes: &[u8], at: usize) -> i16 {
 }
 
 impl Calibration {
+    pub(crate) fn measurement_digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub(crate) fn antenna_qdbi(&self) -> i16 {
+        self.antenna
+    }
+
     /// Load the board's signed envelope from the trusted registry: v2
     /// first, v1 on `NotFound` — mirroring `rtl8821ae::envelope`.
     pub fn load_registered(factory: &crate::rtlwifi::efuse::Factory) -> Result<Self, Error> {
@@ -400,7 +409,10 @@ impl Calibration {
             }
             curves.push(Curve { op, output });
         }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(bytes);
         Ok(Self {
+            digest: hash.finalize(),
             identity,
             antenna,
             qualified,
@@ -594,4 +606,14 @@ fn span_ceiling(
         }
     }
     limit.ok_or(Error::Policy)
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+impl Calibration {
+    /// Only a RAM fixture: attaches a real revocable cap to exercise exactly
+    /// the production with_current closure; it supplies no measured RF authority.
+    pub(crate) fn with_fixture_source(mut self, cap: Cap<FirmwareBlob, Read>) -> Self {
+        self.authority = Some(cap);
+        self
+    }
 }

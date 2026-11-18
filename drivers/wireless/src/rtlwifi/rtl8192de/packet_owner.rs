@@ -24,8 +24,9 @@
 //!   mask leaves USE_RATE / DISFB clear (`dm.useramask` is set by
 //!   `rtl92de_init_sw_vars`), RATE_ID from `mac->mode`
 //!   (`_rtl_txrate_selectmode`: GB 4 / B 6, MC 7 without a link), MACID 0;
-//!   EAPOL and (QoS) Null DATA request a TX report (`SPE_RPT`, `SW_DEFINE =
-//!   (sn & 0x3f) << 2`). `ppsc->fwctrl_lps` is false (`rtl92de_mod_params`),
+//!   DE's source never writes SPE_RPT / SW_DEFINE, including for EAPOL
+//!   and Null DATA, and has no TX-report arrival route. The host receipt
+//!   is not an on-air ACK. `ppsc->fwctrl_lps` is false (`rtl92de_mod_params`),
 //!   so no frame takes the LPS hardware-sequence rule. Every rate the
 //!   descriptor can put on air must be admitted by the `N92D` permission.
 //!   HT is admitted on an HT profile: MCS0-7 (1T1R) / MCS0-15 (2T2R),
@@ -116,8 +117,6 @@ pub(in super::super) struct State {
     pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
     /// `bss_conf->use_short_preamble` / `use_short_slot` as programmed.
     pub(in super::super) erp_timing: Option<(bool, bool)>,
-    /// `rtlpriv->tx_report.sn`.
-    report_sn: u16,
     /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` shadow, shared by
     /// `HW_VAR_SHORTGI_DENSITY` and `HW_VAR_AMPDU_MIN_SPACE`).
     pub(in super::super) min_space_cfg: u8,
@@ -139,7 +138,6 @@ impl State {
             receive_config: None,
             link: None,
             erp_timing: None,
-            report_sn: 0,
             min_space_cfg: 0,
             tx_unicast_bytes: 0,
             rx_unicast_bytes: 0,
@@ -346,10 +344,6 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             &frame[4..10]
         };
         let multicast = destination[0] & 1 != 0;
-        let sw_define = super::ae::wants_report(frame).then(|| {
-            self.packet.de92.report_sn = self.packet.de92.report_sn.wrapping_add(1);
-            (self.packet.de92.report_sn & 0x3f) << 2
-        });
         let (rts_enable, cts_enable) = match protection {
             super::super::super::protection::Mode::None => (false, false),
             super::super::super::protection::Mode::RtsCts => (true, false),
@@ -388,8 +382,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             dual_mac_dual_phy: facts.mode == MacPhyMode::DualMacDualPhy,
             fwctrl_lps: false,
             rdg_en: false,
-            spe_rpt: sw_define.is_some(),
-            sw_define: sw_define.unwrap_or(0),
+            spe_rpt: false,
+            sw_define: 0,
         });
         let mut prefix = [0u32; 10];
         prefix.copy_from_slice(&descriptor.dw[..10]);

@@ -13,7 +13,9 @@
 //! Exact Linux-derived pieces the retained RTL8821AE owner is built from.
 //! Probe retains `0x8821` and native provisioning composes them into the
 //! 2.4 GHz legacy station owner (`prepare_native::prepare_rtl8821ae`,
-//! `packet_ae.rs`); boards with the BT function strapped on are refused:
+//! `packet_ae.rs`). BT-strapped boards retain a coarse LPS owner; optional
+//! full coexistence additionally requires the observed BT patch/build and
+//! a fresh N21C program at the exact20MHz operating point:
 //!
 //! - [`pwrseq`] — PCI rows of every `rtl8821A_*_flow` (`pwrseq.{c,h}`).
 //! - [`tables`] / [`headerfile`] — MAC/BB/AGC/RF-A/power-by-rate arrays and
@@ -47,9 +49,15 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod btc;
 pub mod c2h;
 pub mod channel;
 pub mod coex;
+pub(crate) mod coex_dispatch;
+pub(crate) mod coex_inbox;
+pub mod coex_program;
+pub(crate) mod coex_runtime;
+mod coex_source;
 pub mod envelope;
 pub mod fw;
 pub mod h2c;
@@ -58,6 +66,7 @@ pub mod ht;
 pub mod iqk;
 pub mod llt;
 pub mod mac;
+pub(crate) mod park;
 pub mod phy;
 pub mod power_limit;
 pub mod pwrseq;

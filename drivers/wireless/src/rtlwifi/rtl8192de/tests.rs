@@ -4229,9 +4229,10 @@ fn de_tx_owner() -> Option<packet::Owner> {
     ))
 }
 
-/// TX-report frames (EAPOL / nullfunc): `SPE_RPT` (dword 2 bit 19)
-/// plus the `SW_DEFINE` sequence `(++sn & 0x3f) << 2`; ordinary data
-/// carries neither. `sectype`: none 0, WEP/TKIP 1, CCMP 3.
+/// rtl8192de/trx.c:44..229 never calls rtl_set_tx_report: ordinary,
+/// EAPOL and Null frames retain cleared SPE_RPT / SW_DEFINE fields.
+/// Compatibility report inputs must not invent a DE firmware request.
+/// `sectype`: none 0, WEP/TKIP 1, CCMP 3.
 fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
     use packet::*;
     let Some(mut owner) = de_tx_owner() else {
@@ -4263,7 +4264,7 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
     {
         return TestResult::Fail("8192DE TX report ordinary data");
     }
-    // EAPOL: report with sn 4, then 8.
+    // EAPOL classifications do not add a request or software sequence.
     let mut slot = trx::TxDesc::default();
     if owner
         .fill_tx_slot(
@@ -4274,8 +4275,8 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[2] & (1 << 19) == 0
-        || slot.dw[6] & 0xfff != 4
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report EAPOL first");
     }
@@ -4289,11 +4290,12 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[6] & 0xfff != 8
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report EAPOL second");
     }
-    // Nullfunc: report with sn 12.
+    // A Null-PM frame likewise cannot solicit the newer chips' report.
     let mut slot = trx::TxDesc::default();
     if owner
         .fill_tx_slot(
@@ -4304,8 +4306,8 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             },
         )
         .is_err()
-        || slot.dw[2] & (1 << 19) == 0
-        || slot.dw[6] & 0xfff != 12
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
     {
         return TestResult::Fail("8192DE TX report nullfunc");
     }
@@ -4325,11 +4327,24 @@ fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
             return TestResult::Fail("8192DE TX sectype");
         }
     }
-    // The report helpers agree with the descriptor bits.
+    // Direct callers cannot bypass the source rule through old public
+    // inputs. Those inputs remain inert for API compatibility.
+    let direct = trx::TxDesc::fill(&trx::TxParams {
+        spe_rpt: true,
+        sw_define: 0x0fff,
+        ..trx::TxParams::default()
+    });
+    if direct.dw[2] & (1 << 19) != 0 || direct.dw[6] & 0x0fff != 0 {
+        return TestResult::Fail("8192DE compatibility inputs invented a report request");
+    }
+    // Common classification/sequence helpers remain software metadata;
+    // actual descriptor fills above never advanced the sequence.
     if !wants_tx_report(true, false)
         || !wants_tx_report(false, true)
         || wants_tx_report(false, false)
         || ETH_P_PAE != 0x888e
+        || owner.next_report_sn() != 4
+        || owner.next_report_sn() != 8
     {
         return TestResult::Fail("8192DE TX report predicate");
     }

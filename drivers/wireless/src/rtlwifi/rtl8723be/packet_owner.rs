@@ -80,6 +80,7 @@ pub(in super::super) struct State {
     pub(in super::super) dm: Option<dm::Dm>,
     pub(in super::super) cfo: dm::Cfo,
     pub(in super::super) edca: dm::edca::Edca,
+    pub(in super::super) tracking: Option<super::super::super::rtl8723be::tracking::State>,
     bssid: [u8; 6],
     /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
     pub(in super::super) min_space_cfg: u8,
@@ -107,6 +108,7 @@ impl State {
             dm: None,
             cfo: dm::Cfo::default(),
             edca: dm::edca::Edca::default(),
+            tracking: None,
             bssid: [0; 6],
             min_space_cfg: 0,
             erp_timing: None,
@@ -951,13 +953,23 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// coexistence owner (with the queued C2H first, as `c2hcmd_wq` runs
     /// ahead of it; the coexistence step also runs in leisure PS, the DM
     /// steps do not). EDCA turbo runs after RA refresh and before ATC;
-    /// TX-power tracking is not composed (`dm.rs` module note). Returns
-    /// whether a mask was sent.
+    /// This unqualified entry is only for owners without NBTH tracking.
+    /// `rtl8723be_dm_watchdog_qualified` inserts the separately qualified
+    /// thermal slot after ATC and before dynamic TX power. Returns whether
+    /// a mask was sent.
     pub(super) async fn be8723_dm_watchdog(
         &mut self,
         undec_sm_pwdb: i64,
         now_ms: u64,
     ) -> Result<bool, Error> {
+        if self.packet.be8723.tracking.is_some() {
+            return Err(Error::State);
+        }
+        let refreshed = self.be8723_dm_watchdog_head(undec_sm_pwdb).await?;
+        self.be8723_dm_watchdog_tail(undec_sm_pwdb, now_ms).await?;
+        Ok(refreshed)
+    }
+    async fn be8723_dm_watchdog_head(&mut self, undec_sm_pwdb: i64) -> Result<bool, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -1018,8 +1030,20 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .is_some_and(|coex| coex.btc.is_bt_disabled());
                 dm::atc_switch_unlinked(&self.io, dm, bt_disabled)?;
             }
-            dm::dynamic_txpower();
             self.phase = Phase::Running;
+        }
+        Ok(refreshed)
+    }
+    async fn be8723_dm_watchdog_tail(
+        &mut self,
+        undec_sm_pwdb: i64,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if !self.packet.leisure {
+            dm::dynamic_txpower();
         }
         self.phase = Phase::Failed;
         let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
@@ -1029,7 +1053,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         coex.watchdog(&self.io, &mut self.packet.be8723.c2h, now_ms)
             .await?;
         self.phase = Phase::Running;
-        Ok(refreshed)
+        Ok(())
     }
 
     /// `rtl_lps_set_psmode(EAUTOPS)` through the coexistence owner (the
@@ -1144,4 +1168,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_owner_tests.rs"]
-mod tests;
+pub(crate) mod tests;
+
+#[path = "tracking_packet.rs"]
+mod thermal;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) use thermal::tests::{shared_station_fixture, StationFixture};

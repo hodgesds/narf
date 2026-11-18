@@ -85,6 +85,9 @@ const RX_BASE: u16 = super::rtl8188ee::REG_RX_DESA;
 /// dword 6; they differ in the next-descriptor dword and the LLT layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chip {
+    /// Original RTL8723AE cold LLT/PG is retained across firmware; only the
+    /// separate registered NASR owner can prepare this linked-ring profile.
+    Rtl8723ae,
     Rtl8188ee,
     Rtl8821ae,
     /// New-TRX-flow buffer-descriptor profile (`rtl8192ee/packet_owner.rs`):
@@ -107,6 +110,7 @@ pub enum Chip {
 impl Chip {
     pub const fn from_device(did: u16) -> Option<Self> {
         match did {
+            super::regs::RTL_DEV_8723AE => Some(Self::Rtl8723ae),
             super::regs::RTL_DEV_8188EE => Some(Self::Rtl8188ee),
             super::regs::RTL_DEV_8821AE => Some(Self::Rtl8821ae),
             super::regs::RTL_DEV_8192EE => Some(Self::Rtl8192ee),
@@ -121,6 +125,7 @@ impl Chip {
     /// `None` for the RTL8192EE buffer-descriptor rings, which have none.
     pub const fn next_desc_offset(self) -> Option<usize> {
         match self {
+            Self::Rtl8723ae => Some(40),
             Self::Rtl8188ee => Some(40),
             Self::Rtl8821ae => Some(48),
             // TX_DESC_NEXT_DESC_OFFSET.
@@ -207,6 +212,7 @@ pub struct Prepared<I: Io, M: Memory> {
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
+    ae8723: Option<alloc::boxed::Box<super::rtl8723ae::station_owner::State>>,
 }
 impl<I: Io, M: Memory> core::fmt::Debug for Prepared<I, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -321,6 +327,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
+            ae8723: None,
         }
     }
     pub fn phase(&self) -> Phase {
@@ -490,7 +497,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         // The owner reflects the current strap: BT-strapped boards get a
         // coexistence owner, WLAN-only boards get none.
         self.rtl8821ae_coex = if strap & RTL8821AE_BT_FUNCTION != 0 {
-            Some(alloc::boxed::Box::new(super::rtl8821ae::coex::Owner::bind()))
+            Some(alloc::boxed::Box::new(
+                super::rtl8821ae::coex::Owner::bind_factory(factory),
+            ))
         } else {
             None
         };
@@ -543,6 +552,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         result
     }
     async fn prepare_inner(&mut self) -> Result<(), Error> {
+        if self.chip == Chip::Rtl8723ae {
+            return self.prepare_rtl8723ae_rings().await;
+        }
         if self.chip == Chip::Rtl8192ee {
             return self.ee92_prepare().await;
         }
@@ -699,6 +711,18 @@ impl<I: Io, M: Memory> Prepared<I, M> {
 }
 impl<I: Io, M: Memory> Drop for Prepared<I, M> {
     fn drop(&mut self) {
+        if self
+            .packet
+            .be8723
+            .tracking
+            .as_ref()
+            .is_some_and(|state| state.uncertain)
+        {
+            // DMA idle is not a terminal LCK/IQK/RF-reset receipt. Preserve
+            // the original/joint sources and immutable backups even when a
+            // later DMA-only proof cleared published before full card reset.
+            core::mem::forget(self.packet.be8723.tracking.take());
+        }
         if self.published {
             // Clearing BME/revoking authority alone is not a prefetch fence.
             // A future reset/quiescence owner must prove reclamation first.
@@ -710,6 +734,8 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
     }
 }
 
+#[path = "rtl8723ae/ring_owner.rs"]
+mod ae8723_rings;
 #[path = "rtl8723be/radio_owner.rs"]
 mod be8723_radio;
 #[path = "rtl8192ce/radio_owner.rs"]

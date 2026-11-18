@@ -23,9 +23,9 @@
 //! dynamic TX power (empty in Linux). This profile composes the common
 //! info, false-alarm statistics, RSSI monitor, DIG, dynamic EDCCA, CCK PD
 //! and RA mask refresh steps, EDCA turbo, both ATC branches and
-//! the (empty) dynamic-TX-power step. Not composed, with the reason in the
-//! step's note: TX-power tracking (no swing tables or calibrated tracking
-//! owner composed with the RF register helper). The retained watchdog only invokes
+//! the (empty) dynamic-TX-power step. Explicit NBTH-qualified tracking now
+//! occupies the source thermal slot through tracking_packet.rs, with its own
+//! BBSWING/LCK/IQK program; ordinary NAPC never enables it. The retained watchdog only invokes
 //! these steps when linked (the `station.rs` gate, as for RTL8192CE), so
 //! the unlinked branches run in fixtures, not in production.
 

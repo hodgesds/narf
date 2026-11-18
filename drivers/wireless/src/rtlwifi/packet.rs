@@ -19,10 +19,71 @@ pub trait Port: Io {
     fn allocate_packet(&self, bytes: usize) -> Result<Self::Buffer, Error>;
     fn master(&self, enabled: bool) -> Result<(), Error>;
     fn kick(&self, queue_bit: u16) -> Result<(), Error>;
+    /// Separately admitted NASR3 AE endpoint policy. Unsupported adapters
+    /// refuse; neither NASR1 nor NASR2 invokes this operation.
+    fn prepare_rtl8723ae_aspm(
+        &self,
+        _enabled: bool,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        core::future::ready(Err(Error::State))
+    }
+    /// Optional fresh qualification for this original RTL8821AE owner.
+    /// The native implementation obtains the selected image identity from
+    /// the retained CPU owner and latches the program before any RF effect.
+    /// Generic/model ports cannot gain it merely from an antenna count.
+    fn bind_rtl8821ae_coex(
+        &self,
+        _base: alloc::sync::Arc<super::super::rtl8821ae::envelope::Calibration>,
+        _factory: &super::super::efuse::Factory,
+        _permission: super::super::rtl8821ae::envelope::Permission,
+        _bt: super::super::rtl8821ae::coex_program::BtIdentity,
+    ) -> Result<Option<alloc::sync::Arc<super::super::rtl8821ae::coex_program::Program>>, Error>
+    {
+        Ok(None)
+    }
+    /// Historical metadata from this original owner's single inquiry, if
+    /// one completed. Reading it cannot retry or admit qualification.
+    fn rtl8821ae_coex_request(&self) -> Option<super::super::rtl8821ae::coex_program::Request> {
+        None
+    }
+    /// Optional restrictive callback retaining the original native owner.
+    /// None grants no stop/cleanup receipt.
+    fn terminal_park(&self) -> Option<TerminalPark> {
+        None
+    }
     fn publication(&self) -> Result<Publication, Error> {
         Err(Error::State)
     }
 }
+
+impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    pub(crate) fn rtl8821ae_coex_request(
+        &self,
+    ) -> Option<super::super::rtl8821ae::coex_program::Request> {
+        self.io.rtl8821ae_coex_request()
+    }
+}
+/// Owned restrictive park only; never a reset, RF restore or DMA-idle receipt.
+#[derive(Clone)]
+pub struct TerminalPark(alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>);
+impl core::fmt::Debug for TerminalPark {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RtlwifiTerminalPark")
+    }
+}
+impl TerminalPark {
+    pub(crate) fn new(
+        callback: alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>,
+    ) -> Self {
+        Self(callback)
+    }
+    pub fn park(&self) -> Result<(), Error> {
+        (self.0)()
+    }
+}
+type PublicationGuard =
+    dyn Fn(&mut dyn FnMut() -> Result<(), Error>) -> Result<(), Error> + Send + Sync;
+
 /// Owned current PCI invocation, without a borrowed native owner or lock.
 #[derive(Clone)]
 pub struct Publication(PublicationSource);
@@ -33,6 +94,7 @@ impl core::fmt::Debug for Publication {
 }
 #[derive(Clone)]
 enum PublicationSource {
+    Guarded(alloc::sync::Arc<PublicationGuard>),
     Native(
         narf_bus::BusDevice,
         narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
@@ -41,6 +103,10 @@ enum PublicationSource {
     Model(alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>),
 }
 impl Publication {
+    pub(crate) fn guarded(guard: alloc::sync::Arc<PublicationGuard>) -> Self {
+        Self(PublicationSource::Guarded(guard))
+    }
+
     pub(crate) fn native(
         device: narf_bus::BusDevice,
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
@@ -58,6 +124,15 @@ impl Publication {
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         match &self.0 {
+            PublicationSource::Guarded(guard) => {
+                let mut operation = Some(operation);
+                let mut result = None;
+                guard(&mut || {
+                    result = Some(operation.take().ok_or(Error::State)?());
+                    Ok(())
+                })?;
+                result.ok_or(Error::State)?
+            }
             PublicationSource::Native(device, cap) => crate::rtw88::pci_park::invoke(cap, || {
                 let cmd = narf_bus::pci::read_command(cap, device)
                     .map_err(|_| Error::Access(super::AccessError::Access))?;
@@ -114,6 +189,8 @@ pub(super) struct State<M: Memory> {
     // Keep chip-specific DM/statistics out of every generic Prepared
     // move, including the cold removal/rebuild future's kernel frame.
     pub(super) be8723: Box<be8723::State>,
+    /// Exact AE original calibration coex owner and shared H2C mailbox.
+    pub(super) ae8723: ae8723::State,
     /// RTL8192DE chip facts, mailbox, beacon-control/RCR caches and RA link
     /// (`rtl8192de/packet_owner.rs`).
     pub(super) de92: de92::State,
@@ -149,6 +226,7 @@ impl<M: Memory> State<M> {
             ee92: ee92::State::new(),
             ce92: ce92::State::new(),
             be8723: Box::new(be8723::State::new()),
+            ae8723: ae8723::State::new(),
             de92: de92::State::new(),
             rate_mask: None,
             retired: Vec::new(),
@@ -157,6 +235,13 @@ impl<M: Memory> State<M> {
     pub(super) fn retain(&mut self) {
         // Published descriptors may still name the current TX allocation.
         // BME clear alone never permits releasing it at a terminal stop.
+        // The SAME AE coex Box moved out of original calibration scratch.
+        // Its partial RF origins/mailbox must outlive uncertain published
+        // DMA even if an enclosing non-native wrapper is accidentally lost.
+        core::mem::forget(self.ae8723.coex.take());
+        // NBTH retains original firmware/joint caps and immutable RF/IQK/BB
+        // backups until actual card/DMA terminal proof, not BME alone.
+        core::mem::forget(self.be8723.tracking.take());
         core::mem::forget(self.pending.take());
         core::mem::forget(self.reserved.take());
         core::mem::forget(core::mem::take(&mut self.retired));
@@ -302,6 +387,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             && !self.packet.ae.mailbox.failed
             && !self.packet.ee92.mailbox.failed
             && !self.packet.ce92.mailbox.failed
+            && (!self.rtl8723ae()
+                || self
+                    .packet
+                    .ae8723
+                    .coex
+                    .as_ref()
+                    .is_some_and(|owner| !owner.mailbox.failed))
     }
     fn rtl8821ae(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae
@@ -311,6 +403,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
     fn rtl8192ce(&self) -> bool {
         self.chip == super::Chip::Rtl8192ce
+    }
+    fn rtl8723ae(&self) -> bool {
+        self.chip == super::Chip::Rtl8723ae
     }
     fn rtl8723be(&self) -> bool {
         self.chip == super::Chip::Rtl8723be
@@ -327,6 +422,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_awake_station();
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_awake_station();
         }
         if self.rtl8723be() {
             return self.be8723_awake_station();
@@ -357,6 +455,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_prepare_peer(peer, rates, basic, capability);
         }
         if self.rtl8723be() {
             return self.be8723_prepare_peer(peer, rates, basic, capability);
@@ -399,6 +500,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8723ae() {
+            return self
+                .ae8723_complete_peer(peer, aid, admission, policy)
+                .await;
         }
         if self.rtl8723be() {
             return self
@@ -564,6 +670,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             || self.rtl8192ee()
             || self.rtl8192ce()
             || self.rtl8723be()
+            || self.rtl8723ae()
             || self.rtl8192de()
             || !self.transmit_ready()
             || self.packet.leisure
@@ -639,6 +746,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.ce92_install_rate_mask(peer, bw40, level, admitted)
             .await?;
         self.packet.rate_mask = self.packet.ce92.link.map(|(_, _, index)| index);
+        Ok(())
+    }
+    /// AE firmware RA; its selected NASR1/2 grant bounds every fallback.
+    pub(crate) async fn install_rtl8723ae_rate_mask(
+        &mut self,
+        peer: super::super::rtl8723ae::h2c::Peer,
+        level: u8,
+    ) -> Result<(), Error> {
+        if !self.rtl8723ae() {
+            return Err(Error::State);
+        }
+        let admitted = self
+            .ae8723
+            .as_ref()
+            .ok_or(Error::State)?
+            .grant
+            .permission()
+            .admitted_rates() as u32;
+        self.ae8723_install_rate_mask(peer, false, level, admitted)
+            .await?;
+        self.packet.rate_mask = self.packet.ae8723.link.map(|(_, _, index)| index);
         Ok(())
     }
     /// 8723BE `rtl8723be_update_hal_rate_mask` (`H2C_8723B_RA_MASK`) for
@@ -771,6 +899,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_enter_leisure().await;
         }
+        if self.rtl8723ae() {
+            return self.ae8723_enter_leisure().await;
+        }
         if self.rtl8723be() {
             return self.be8723_enter_leisure().await;
         }
@@ -797,6 +928,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_leave_leisure().await;
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_leave_leisure().await;
         }
         if self.rtl8723be() {
             return self.be8723_leave_leisure().await;
@@ -832,6 +966,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .retired
             .try_reserve(1)
             .map_err(|_| Error::Memory)?;
+        let mut terminal = self
+            .rtl8821ae_full_coex()
+            .then(|| ae::CoexAttempt::new(&self.io));
+        if self.rtl8821ae_full_coex() {
+            self.ae_coex_leave_peer().await?;
+        }
         self.phase = Phase::Failed;
         if self.rtl8821ae() {
             self.ae_disconnected().await?;
@@ -839,6 +979,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.ee92_disconnected().await?;
         } else if self.rtl8192ce() {
             self.ce92_disconnected().await?;
+        } else if self.rtl8723ae() {
+            self.ae8723_disconnected().await?;
         } else if self.rtl8723be() {
             self.be8723_disconnected().await?;
         } else if self.rtl8192de() {
@@ -858,6 +1000,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.packet.retired.push(reserved);
         }
         self.phase = Phase::Running;
+        if let Some(terminal) = &mut terminal {
+            terminal.complete();
+        }
         Ok(())
     }
     /// A running owner whose last frame has its host receipt may leave the
@@ -900,17 +1045,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {
             return Err(Error::State);
         }
+        // Normal notifications precede cleanup's terminal phase. A failed
+        // controller is never revived to replay its RF/LPS program.
+        let coex = if self.phase == Phase::Running && self.rtl8821ae_full_coex() {
+            self.ae_coex_before_disconnect().await
+        } else {
+            Ok(())
+        };
         self.phase = Phase::Failed;
         if self.rtl8821ae()
             || self.rtl8192ee()
             || self.rtl8192ce()
             || self.rtl8723be()
+            || self.rtl8723ae()
             || self.rtl8192de()
         {
             let report = if self.rtl8821ae() {
                 self.ae_disconnected().await
             } else if self.rtl8192ee() {
                 self.ee92_disconnected().await
+            } else if self.rtl8723ae() {
+                self.ae8723_disconnected().await
             } else if self.rtl8723be() {
                 self.be8723_disconnected().await
             } else if self.rtl8192de() {
@@ -922,7 +1077,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             if stopped.is_ok() {
                 let _ = self.quiesce().await;
             }
-            return report.and(stopped);
+            return coex.and(report).and(stopped);
         }
         // mac80211 disassociation leaves PS before the join report clears.
         let awake = if core::mem::take(&mut self.packet.leisure) {
@@ -951,6 +1106,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !self.published {
             return true;
         }
+        if self.phase == Phase::Running && self.rtl8821ae_full_coex() {
+            // Always attempt the independent restrictive gates after an
+            // error. Only real quiescence below permits DMA reclamation.
+            let _ = self
+                .ae_coex_notify(super::super::rtl8821ae::coex_runtime::Notify::Halt)
+                .await;
+        }
         if self.phase != Phase::Stopped && self.stop_packets().is_err() {
             return false;
         }
@@ -977,6 +1139,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_quiesce().await;
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_quiesce().await;
         }
         if self.rtl8723be() {
             return self.be8723_quiesce().await;
@@ -1036,6 +1201,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_start_packets();
         }
+        if self.rtl8723ae() {
+            return self.ae8723_start_packets();
+        }
         if self.rtl8723be() {
             return self.be8723_start_packets();
         }
@@ -1094,6 +1262,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_enable_interrupts();
         }
+        if self.rtl8723ae() {
+            return self.ae8723_enable_interrupts();
+        }
         if self.rtl8723be() {
             return self.be8723_enable_interrupts();
         }
@@ -1122,6 +1293,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl88ee_disable_interrupt` (HIMR/HIMRE = IMR_DISABLED). Used
     /// when the bound vector is withdrawn while the owner keeps polling.
     pub(crate) fn disable_interrupts(&mut self) -> Result<(), Error> {
+        if self.rtl8723ae() {
+            return self.ae8723_disable_interrupts();
+        }
         if self.rtl8192ce() {
             return self.ce92_disable_interrupts();
         }
@@ -1153,6 +1327,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_recognize_interrupts();
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_recognize_interrupts();
         }
         if self.rtl8723be() {
             return self.be8723_recognize_interrupts();
@@ -1248,6 +1425,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
+        if self.rtl8723ae() {
+            return self.ae8723_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.rtl8723be() {
             return self.be8723_submit(frame, rate, aggregate, adaptive, short_gi);
@@ -1479,6 +1659,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_receive_step();
         }
+        if self.rtl8723ae() {
+            return self.ae8723_receive_step();
+        }
         if self.rtl8723be() {
             return self.be8723_receive_step();
         }
@@ -1642,8 +1825,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // its TX polling doorbell). RTL8192DE: the same 0x120/0x128 IMRs
         // (`rtl8192d/reg.h` `REG_HIMR` / `REG_HIMRE`) with the
         // `REG_PCIE_CTRL_REG + 1` DMA stop `rtl92de_card_disable` uses.
-        let ce = self.rtl8192ce();
-        let (himr, himre) = if ce || self.rtl8192de() {
+        let ce = self.rtl8192ce() || self.rtl8723ae();
+        let (himr, himre) = if self.rtl8723ae() {
+            (0x3a8, 0x3ac)
+        } else if ce || self.rtl8192de() {
             (0x120, 0x128)
         } else {
             (0xb0, 0xb8)
@@ -1692,6 +1877,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 
 #[path = "packet_ae.rs"]
 pub(crate) mod ae;
+#[path = "rtl8723ae/packet_owner.rs"]
+pub(crate) mod ae8723;
 #[path = "rtl8723be/packet_owner.rs"]
 pub(crate) mod be8723;
 #[path = "rtl8192ce/packet_owner.rs"]

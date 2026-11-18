@@ -2,16 +2,10 @@
 //! 8821AE (combo Wi-Fi + BT silicon).
 //!
 //! The combo chips share their RF front-end between Wi-Fi and BT.
-//! Coexistence is implemented as a state-machine that pushes one of
-//! a small set of "BT-TDMA" patterns into the chip via an H2C command;
-//! the chip's MCU then time-slices the antenna.
-//!
-//! NARF carries the *decision matrix* (Wi-Fi state × BT state →
-//! TDMA-pattern selector) plus the H2C encoding.  The actual table of
-//! TDMA slot bytes is per-chip and lives in Linux's
-//! `btcoexist/halbtc8723b2ant.c` (etc.) — for bring-up we emit the
-//! "BT-only" / "Wi-Fi-only" extremes and the "shared antenna 50/50"
-//! middle pattern.
+//! Full RTL8723B and RTL8821A algorithms retain chip-specific tables and
+//! notification histories in their own modules. The small decision matrix
+//! and coarse H2C patterns below remain the initial bring-up policy. Native
+//! owners determine which program is measured and admitted for their board.
 //!
 //! ## Linux reference (GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -25,6 +19,8 @@
 
 pub mod b8723b1ant;
 pub mod b8723b2ant;
+pub mod b8821a1ant;
+pub mod b8821a2ant;
 pub mod btc;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

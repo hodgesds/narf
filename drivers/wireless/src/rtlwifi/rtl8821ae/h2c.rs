@@ -13,12 +13,10 @@
 //! `int_clear`, `rtl8821ae_clear_interrupt` and
 //! `rtl8821ae_interrupt_recognized`; `rtl8821ae/sw.c` masks.
 //!
-//! BT coexistence: Linux 8821AE always reports `get_btc_status() == true`,
-//! but `btc_is_bt_ctrl_lps` stays false until a coex algorithm takes LPS
-//! control, which only happens on boards with BT (`REG_MULTI_FUNC_CTRL[18]`,
-//! `_rtl8821ae_read_bt_coexist_info_from_hwpg`). Coexistence is not
-//! implemented; the commands here are the `bt_ctrl_lps == false` forms and a
-//! board with the BT function is not admitted by the owner.
+//! The native non-coexistence wrappers retain their original payloads.
+//! [`pwrmode_bt`] and [`fwlps_enter_bt`] / [`fwlps_leave_bt`] carry the
+//! separate RTL8821AE BT-controlled form; callers must hold the current
+//! jointly measured station/coexistence program before using it.
 //!
 //! Differences from Linux: a full HMETFR wait or a `REG_CR == 0xEA`
 //! (powered-off MAC) box is reported as an error instead of silently
@@ -132,6 +130,8 @@ pub fn media_status(connected: bool) -> [u8; 3] {
 pub enum PsMode {
     /// `FW_PS_ACTIVE_MODE` (0).
     Active,
+    /// `FW_PS_MIN_MODE` (1), selected when coexistence forces LPS on.
+    Min,
     /// `FW_PS_MAX_MODE` (2): `sw.c` sets `reg_fwctrl_lps = 2`.
     Max,
 }
@@ -139,13 +139,46 @@ pub enum PsMode {
 /// `rtl8821ae_set_fw_pwrmode_cmd` payload for a non-P2P station without BT
 /// LPS control.
 pub fn pwrmode(mode: PsMode) -> [u8; 7] {
-    let (mode_byte, rlbm, awake, state) = match mode {
+    pwrmode_bt(mode, None)
+}
+
+/// The actual `btc_is_bt_ctrl_lps` / `btc_get_{lps,rpwm}_val` facts read by
+/// `rtl8821ae_set_fw_pwrmode_cmd`. A value is not permission to issue H2C.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtLps {
+    pub lps_on: bool,
+    pub lps_val: u8,
+    pub rpwm_val: u8,
+}
+
+/// `rtl8821ae_set_fw_pwrmode_cmd`, INFRA non-P2P, including BT control.
+/// Unlike 8723BE, the unforced SMART_PS is always 1 on this chip.
+pub fn pwrmode_bt(mut mode: PsMode, bt: Option<BtLps>) -> [u8; 7] {
+    if let Some(bt) = bt {
+        mode = if bt.lps_on {
+            PsMode::Min
+        } else {
+            PsMode::Active
+        };
+    }
+    let (mode_byte, rlbm, awake, mut state) = match mode {
         // FW_PS_ACTIVE_MODE falls to the switch default (rlbm 2, interval 4).
         PsMode::Active => (0, 2, 4, FW_PWR_STATE_ACTIVE),
+        PsMode::Min => (1, 0, 2, FW_PWR_STATE_RF_OFF),
         PsMode::Max => (1, 1, 2, FW_PWR_STATE_RF_OFF),
     };
-    // SMART_PS = 1 (bt_ctrl_lps false, not P2P); ALL_QUEUE_UAPSD 0; byte5 0x40.
-    [mode_byte, rlbm | (1 << 4), awake, 0, state, 0x40, 0]
+    let byte5 = if mode != PsMode::Active {
+        if let Some(bt) = bt {
+            state = bt.rpwm_val;
+            bt.lps_val
+        } else {
+            0x40
+        }
+    } else {
+        0x40
+    };
+    let smart_ps = if bt.is_some() { 0 } else { 1 << 4 };
+    [mode_byte, rlbm | smart_ps, awake, 0, state, byte5, 0]
 }
 
 /// `rtl8821ae_set_fw_rsvdpagepkt` location command (`H2C_8821AE_RSVDPAGE`,
@@ -171,19 +204,38 @@ pub async fn set_rpwm(io: &impl Io, value: u8) -> Result<(), Error> {
 /// `_rtl8821ae_fwlps_leave` (`low_power_enable` false): RPWM all-on, then
 /// `SETPWRMODE(ACTIVE)`.
 pub async fn fwlps_leave(io: &impl Io, mailbox: &mut Mailbox) -> Result<(), Error> {
-    set_rpwm(io, FW_PS_STATE_ALL_ON).await?;
-    mailbox
-        .fill(io, H2C_SETPWRMODE, &pwrmode(PsMode::Active))
-        .await
+    fwlps_leave_bt(io, mailbox, None).await.map(|_| ())
 }
 
 /// `_rtl8821ae_fwlps_enter` (`low_power_enable` false): `SETPWRMODE(MAX)`,
 /// then RPWM RF-off.
 pub async fn fwlps_enter(io: &impl Io, mailbox: &mut Mailbox) -> Result<(), Error> {
-    mailbox
-        .fill(io, H2C_SETPWRMODE, &pwrmode(PsMode::Max))
-        .await?;
-    set_rpwm(io, FW_PS_STATE_RF_OFF).await
+    fwlps_enter_bt(io, mailbox, None).await.map(|_| ())
+}
+
+/// `_rtl8821ae_fwlps_leave`, low_power_enable false, with the same mailbox
+/// rotation used by every other sender. Return the actual command to record.
+pub async fn fwlps_leave_bt(
+    io: &impl Io,
+    mailbox: &mut Mailbox,
+    bt: Option<BtLps>,
+) -> Result<[u8; 7], Error> {
+    set_rpwm(io, FW_PS_STATE_ALL_ON).await?;
+    let cmd = pwrmode_bt(PsMode::Active, bt);
+    mailbox.fill(io, H2C_SETPWRMODE, &cmd).await?;
+    Ok(cmd)
+}
+
+/// `_rtl8821ae_fwlps_enter`, low_power_enable false, with BT control.
+pub async fn fwlps_enter_bt(
+    io: &impl Io,
+    mailbox: &mut Mailbox,
+    bt: Option<BtLps>,
+) -> Result<[u8; 7], Error> {
+    let cmd = pwrmode_bt(PsMode::Max, bt);
+    mailbox.fill(io, H2C_SETPWRMODE, &cmd).await?;
+    set_rpwm(io, FW_PS_STATE_RF_OFF).await?;
+    Ok(cmd)
 }
 
 /// `sta_entry->wireless_mode` for the station (`core.c::rtl_op_sta_add` /

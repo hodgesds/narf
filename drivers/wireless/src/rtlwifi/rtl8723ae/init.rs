@@ -27,12 +27,23 @@ pub struct Tables {
     pub receive_config: u32,
 }
 
+/// Historical source inputs recorded by the original native cold owner.
+/// No defaults: absence or incomplete source transitions produce no receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct History {
+    pub version: Version,
+    pub ephy_retries: u16,
+    pub mac_func_enabled: bool,
+}
+
 /// Records terminal ownership before the first register operation.
 /// Failure or cancellation cannot retry a partially programmed device.
 #[derive(Debug)]
 pub struct Owner {
     phase: Phase,
     tables: Option<Tables>,
+    mac_history: Option<(u16, bool)>,
+    version_used: Option<Version>,
 }
 
 impl Default for Owner {
@@ -46,6 +57,8 @@ impl Owner {
         Self {
             phase: Phase::New,
             tables: None,
+            mac_history: None,
+            version_used: None,
         }
     }
     pub const fn phase(&self) -> Phase {
@@ -53,6 +66,18 @@ impl Owner {
     }
     pub fn tables(&self) -> Option<&Tables> {
         self.tables.as_ref()
+    }
+
+    pub fn history(&self) -> Option<History> {
+        if self.phase != Phase::TablesReady || self.tables.is_none() {
+            return None;
+        }
+        let (ephy_retries, mac_func_enabled) = self.mac_history?;
+        Some(History {
+            version: self.version_used?,
+            ephy_retries,
+            mac_func_enabled,
+        })
     }
 
     /// `ephy_retries` is the successful `power::post_flow` loop count
@@ -71,6 +96,7 @@ impl Owner {
         if !(1..100).contains(&ephy_retries) {
             return Err(Error::State);
         }
+        self.mac_history = Some((ephy_retries, mac_func_enabled));
         if !mac_func_enabled {
             super::llt::init(io)?;
         }
@@ -92,6 +118,7 @@ impl Owner {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        self.version_used = Some(version);
         super::fw::download(io, payload).await?;
         phy::mac_config(io)?;
         let receive_config = mac::trim_receive_config(io)?;

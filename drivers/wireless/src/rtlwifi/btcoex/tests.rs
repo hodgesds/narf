@@ -20,6 +20,8 @@ pub(crate) struct FakeHal {
     pub ampdu: Vec<AmpduCfg>,
     pub now: u64,
     pub delays: u32,
+    pub deny_write: Option<u16>,
+    pub deny_h2c: Option<u8>,
 }
 
 impl FakeHal {
@@ -51,14 +53,23 @@ impl Hal for FakeHal {
         Ok(self.get(reg, 4))
     }
     fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
+        if self.deny_write == Some(reg) {
+            return Err(Error::State);
+        }
         self.put(reg, value.into(), 1);
         Ok(())
     }
     fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error> {
+        if self.deny_write == Some(reg) {
+            return Err(Error::State);
+        }
         self.put(reg, value.into(), 2);
         Ok(())
     }
     fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
+        if self.deny_write == Some(reg) {
+            return Err(Error::State);
+        }
         self.put(reg, value, 4);
         Ok(())
     }
@@ -70,6 +81,9 @@ impl Hal for FakeHal {
         Ok(0)
     }
     async fn fill_h2c(&mut self, id: u8, cmd: &[u8]) -> Result<(), Error> {
+        if self.deny_h2c == Some(id) {
+            return Err(Error::State);
+        }
         self.h2c.push((id, cmd.to_vec()));
         Ok(())
     }

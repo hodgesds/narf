@@ -7,7 +7,10 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_firmware::FirmwareError;
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use narf_lib::{
+    mutex::Mutex,
+    sync::{IrqSafeSpinLock, OnceLock},
+};
 
 const HEADER: usize = 32;
 const PAGE: usize = 4096;
@@ -119,8 +122,19 @@ pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
 }
 #[async_trait::async_trait]
 pub trait Io: Send + Sync {
+    /// Restrict only this original8821 PCI function. Defaults are NOT a
+    /// park/stop receipt; unsupported backends retain all resources.
+    fn restrict_8821_packets(&self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
     fn read8(&self, reg: u16) -> Result<u8, Error>;
     fn read32(&self, reg: u16) -> Result<u32, Error>;
+    /// Exact-width source EFUSE/SYS word access. Unsupported adapters
+    /// refuse instead of widening to an unaligned dword or splitting bytes.
+    fn read16(&self, _reg: u16) -> Result<u16, Error> {
+        Err(Error::Access)
+    }
     fn write8(&self, reg: u16, value: u8) -> Result<(), Error>;
     fn write32(&self, reg: u16, value: u32) -> Result<(), Error>;
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error>;
@@ -148,11 +162,92 @@ pub struct Owner<I: Io> {
     identity: IrqSafeSpinLock<Option<Identity>>,
     // Allocated only for AE and retained across all firmware/table awaits.
     ae_cold: Mutex<Option<Box<super::rtl8723ae::init::Owner>>>,
+    ae_access: OnceLock<Arc<dyn AeAccess>>,
+    ae_retired: AtomicBool,
+}
+/// The AE continuation stays closed until the original registered capsule
+/// installs its separately signed station program. The closure is the actual
+/// access, not an unguarded future or a caller-provided admission boolean.
+pub(in crate::rtlwifi) trait AeAccess: Send + Sync {
+    /// Immutable selected profile metadata. This is no current effect
+    /// grant; invoke_effect still encloses each actual ASPM operation.
+    fn aspm_profile(&self) -> bool {
+        false
+    }
+    fn invoke(&self, operation: &mut dyn FnMut() -> Result<(), Error>) -> Result<(), Error>;
+    /// Actual synchronous scalar/control effect. AE serializes this narrow
+    /// boundary with terminal park; outer poll/descriptor scopes stay reentrant.
+    fn invoke_effect(&self, operation: &mut dyn FnMut() -> Result<(), Error>) -> Result<(), Error>;
+}
+/// Earlier AE cold work must also stop on detach/source loss. The original
+/// cold Box remains in Owner; this facade encloses the ACTUAL access/poll.
+struct AeColdIo<'a, I: Io> {
+    owner: &'a Owner<I>,
+    image: Option<Identity>,
+}
+impl<I: Io> AeColdIo<'_, I> {
+    fn access<T>(&self, operation: impl FnOnce(&I) -> Result<T, Error>) -> Result<T, Error> {
+        let current = || {
+            if self.owner.ae_retired.load(Ordering::Acquire) {
+                return Err(Error::Gate);
+            }
+            operation(&self.owner.io)
+        };
+        if self.owner.ae_retired.load(Ordering::Acquire) {
+            return Err(Error::Gate);
+        }
+        match self.image {
+            Some(image) => image
+                .invoke(|| current().map_err(super::prepare::Error::Access))
+                .map_err(|error| match error {
+                    super::prepare::Error::Access(error) => error,
+                    _ => Error::Gate,
+                }),
+            None => current(), // Read-only version selection before an image exists.
+        }
+    }
+    fn poll<F: core::future::Future + ?Sized>(
+        &self,
+        future: core::pin::Pin<&mut F>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Result<core::task::Poll<F::Output>, Error> {
+        self.access(|_| Ok(future.poll(cx)))
+    }
+}
+#[async_trait::async_trait]
+impl<I: Io> Io for AeColdIo<'_, I> {
+    fn read8(&self, r: u16) -> Result<u8, Error> {
+        self.access(|io| io.read8(r))
+    }
+    fn read16(&self, r: u16) -> Result<u16, Error> {
+        self.access(|io| io.read16(r))
+    }
+    fn read32(&self, r: u16) -> Result<u32, Error> {
+        self.access(|io| io.read32(r))
+    }
+    fn write8(&self, r: u16, v: u8) -> Result<(), Error> {
+        self.access(|io| io.write8(r, v))
+    }
+    fn write16(&self, r: u16, v: u16) -> Result<(), Error> {
+        self.access(|io| io.write16(r, v))
+    }
+    fn write32(&self, r: u16, v: u32) -> Result<(), Error> {
+        self.access(|io| io.write32(r, v))
+    }
+    fn write_bytes(&self, r: u16, v: &[u8]) -> Result<(), Error> {
+        self.access(|io| io.write_bytes(r, v))
+    }
+    async fn delay_us(&self, us: u64) {
+        self.owner.io.delay_us(us).await;
+    }
 }
 /// Exact image of the successful retained CPU owner; not an upload receipt.
 #[derive(Clone, Copy)]
 pub(crate) struct Identity {
     pub(super) digest: [u8; 32],
+    /// Actual selected/validated header bytes, not a filename or caller's
+    /// guessed chip version. Short inert fixtures carry no header facts.
+    pub(super) version: Option<(u16, u8)>,
     source: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
 }
 impl Identity {
@@ -166,6 +261,9 @@ impl Identity {
         h.update(bytes);
         Self {
             digest: h.finalize(),
+            version: bytes
+                .get(4..7)
+                .map(|v| (u16::from_le_bytes([v[0], v[1]]), v[2])),
             source,
         }
     }
@@ -173,6 +271,13 @@ impl Identity {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn fixture(bytes: &[u8]) -> Self {
         Self::from_bytes(bytes, None)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fixture_with_source(
+        bytes: &[u8],
+        source: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    ) -> Self {
+        Self::from_bytes(bytes, Some(source))
     }
     pub(super) fn invoke<T>(
         &self,
@@ -226,7 +331,72 @@ impl<I: Io> core::fmt::Debug for Owner<I> {
 /// Exclusive native continuation of the exact successful firmware owner.
 /// No Clone and no public constructor: a second owner cannot overwrite the
 /// ring bases or LLT while the first retains published device DMA.
-pub(super) struct PacketIo<I: Io>(Arc<Owner<I>>);
+pub(super) struct PacketIo<I: Io>(Arc<Owner<I>>, Arc<PacketState>);
+impl<I: Io> PacketIo<I> {
+    pub(super) fn require_ae_aspm_profile(&self) -> Result<(), Error> {
+        if self.0.did != super::regs::RTL_DEV_8723AE
+            || !self
+                .0
+                .ae_access
+                .get()
+                .is_some_and(|access| access.aspm_profile())
+        {
+            return Err(Error::Gate);
+        }
+        self.with_effect_io(|_| Ok(()))
+    }
+}
+impl PacketIo<super::firmware_native::PciIo> {
+    /// Shared receipt metadata only; configuration effects still use the
+    /// current original source/PCI invocation through with_effect_io.
+    pub(super) fn original_aspm_receipt(&self) -> &AtomicBool {
+        super::aspm::PolicyPort::prepared(self.0.native())
+    }
+}
+struct PacketState {
+    program: OnceLock<Arc<super::rtl8821ae::coex_program::Program>>,
+    // Historical metadata from the original owner's single actual inquiry.
+    // Its presence consumes qualification even when no signed asset exists.
+    request: OnceLock<super::rtl8821ae::coex_program::Request>,
+    scalar: narf_lib::sync::IrqSafeSpinLock<()>,
+    retired: AtomicBool,
+}
+impl PacketState {
+    fn new() -> Self {
+        Self {
+            program: OnceLock::new(),
+            request: OnceLock::new(),
+            scalar: narf_lib::sync::IrqSafeSpinLock::new(()),
+            retired: AtomicBool::new(false),
+        }
+    }
+    // No scalar lock here: outer polls, descriptor scopes and their scalar
+    // children must remain reentrant. Only with_effect_io takes that gate.
+    fn current<I: Io, T>(
+        &self,
+        owner: &Owner<I>,
+        operation: impl FnOnce(&I) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.retired.load(Ordering::Acquire) || owner.status().stage != Stage::Ready {
+            return Err(Error::Gate);
+        }
+        let image = owner.identity().ok_or(Error::Gate)?;
+        let effect = || operation(&owner.io).map_err(super::prepare::Error::Access);
+        image
+            .invoke(|| {
+                if let Some(program) = self.program.get() {
+                    program.invoke(effect)
+                } else {
+                    effect()
+                }
+            })
+            .map_err(|e| match e {
+                super::prepare::Error::Access(e) => e,
+                _ => Error::Gate,
+            })
+    }
+}
+
 impl<I: Io> core::fmt::Debug for PacketIo<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Rtl8188eePacketIo")
@@ -235,6 +405,100 @@ impl<I: Io> core::fmt::Debug for PacketIo<I> {
     }
 }
 impl<I: Io> PacketIo<I> {
+    pub(super) fn bind_8821_program(
+        &self,
+        base: Arc<super::rtl8821ae::envelope::Calibration>,
+        factory: &super::efuse::Factory,
+        permission: super::rtl8821ae::envelope::Permission,
+        bt: super::rtl8821ae::coex_program::BtIdentity,
+    ) -> Result<Option<Arc<super::rtl8821ae::coex_program::Program>>, super::prepare::Error> {
+        self.bind_8821_program_using(&base, factory, permission, bt, |image| {
+            super::rtl8821ae::coex_program::Program::registered(
+                base.clone(),
+                image,
+                factory,
+                permission,
+                bt,
+            )
+        })
+    }
+    fn bind_8821_program_using(
+        &self,
+        base: &super::rtl8821ae::envelope::Calibration,
+        factory: &super::efuse::Factory,
+        permission: super::rtl8821ae::envelope::Permission,
+        bt: super::rtl8821ae::coex_program::BtIdentity,
+        load: impl FnOnce(
+            Identity,
+        ) -> Result<
+            Option<Arc<super::rtl8821ae::coex_program::Program>>,
+            super::prepare::Error,
+        >,
+    ) -> Result<Option<Arc<super::rtl8821ae::coex_program::Program>>, super::prepare::Error> {
+        if self.0.did != super::regs::RTL_DEV_8821AE
+            || self.0.status().stage != Stage::Ready
+            || self.1.program.get().is_some()
+            || self.1.request.get().is_some()
+            || self.1.retired.load(Ordering::Acquire)
+        {
+            return Err(super::prepare::Error::State);
+        }
+        let image = self.0.identity().ok_or(super::prepare::Error::State)?;
+        base.with_current(|| {
+            image.invoke(|| {
+                if self.1.retired.load(Ordering::Acquire) {
+                    return Err(super::prepare::Error::State);
+                }
+                let request =
+                    super::rtl8821ae::coex_program::request(base, image, factory, permission, bt)?;
+                // Latch before the lookup, including NotFound and load errors.
+                // A second binding must rebuild the original native owner.
+                self.1
+                    .request
+                    .set(request)
+                    .map_err(|_| super::prepare::Error::State)
+            })
+        })?;
+        let program = load(image)?;
+        if self.1.retired.load(Ordering::Acquire) {
+            return Err(super::prepare::Error::State);
+        }
+        if let Some(program) = &program {
+            self.1
+                .program
+                .set(program.clone())
+                .map_err(|_| super::prepare::Error::State)?;
+        }
+        Ok(program)
+    }
+    /// Prior observed provisioning metadata only. Cloning it performs no
+    /// I/O, current-source validation, asset lookup or grant installation.
+    pub(super) fn request_8821_program(&self) -> Option<super::rtl8821ae::coex_program::Request> {
+        self.1.request.get().cloned()
+    }
+    pub(super) fn with_effect_io<T>(
+        &self,
+        operation: impl FnOnce(&I) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.0.did != super::regs::RTL_DEV_8723AE {
+            if self.0.did == super::regs::RTL_DEV_8821AE {
+                let _scalar = self.1.scalar.lock();
+                return self.1.current(&self.0, operation);
+            }
+            return self.1.current(&self.0, operation);
+        }
+        if self.0.status().stage != Stage::Ready {
+            return Err(Error::Gate);
+        }
+        let access = self.0.ae_access.get().ok_or(Error::Gate)?;
+        let mut operation = Some(operation);
+        let mut result = None;
+        access.invoke_effect(&mut || {
+            result = Some(operation.take().ok_or(Error::Gate)?(&self.0.io)?);
+            Ok(())
+        })?;
+        result.ok_or(Error::Gate)
+    }
     pub(super) fn with_io<T>(
         &self,
         operation: impl FnOnce(&I) -> Result<T, Error>,
@@ -242,28 +506,86 @@ impl<I: Io> PacketIo<I> {
         if self.0.status().stage != Stage::Ready {
             return Err(Error::Gate);
         }
-        operation(&self.0.io)
+        if self.0.did == super::regs::RTL_DEV_8723AE {
+            let access = self.0.ae_access.get().ok_or(Error::Gate)?;
+            let mut operation = Some(operation);
+            let mut result = None;
+            access.invoke(&mut || {
+                result = Some(operation.take().ok_or(Error::Gate)?(&self.0.io)?);
+                Ok(())
+            })?;
+            return result.ok_or(Error::Gate);
+        }
+        self.1.current(&self.0, operation)
+    }
+    pub(super) fn terminal_8821(&self) -> Option<super::prepare::packet::TerminalPark>
+    where
+        I: 'static,
+    {
+        if self.0.did != super::regs::RTL_DEV_8821AE {
+            return None;
+        }
+        let owner = self.0.clone();
+        let state = self.1.clone();
+        Some(super::prepare::packet::TerminalPark::new(Arc::new(
+            move || {
+                // The store precedes the SAME scalar gate. A scalar admitted
+                // earlier completes before restrictive park; later scalars refuse.
+                state.retired.store(true, Ordering::Release);
+                let _scalar = state.scalar.lock();
+                owner
+                    .io
+                    .restrict_8821_packets()
+                    .map_err(super::prepare::Error::Access)
+            },
+        )))
+    }
+    pub(super) fn guard_8821_publication(
+        &self,
+        original: super::prepare::packet::Publication,
+    ) -> super::prepare::packet::Publication
+    where
+        I: 'static,
+    {
+        if self.0.did != super::regs::RTL_DEV_8821AE {
+            return original;
+        }
+        let owner = self.0.clone();
+        let state = self.1.clone();
+        super::prepare::packet::Publication::guarded(Arc::new(move |operation| {
+            let mut result = None;
+            state
+                .current(&owner, |_| {
+                    result = Some(original.invoke(operation));
+                    Ok(())
+                })
+                .map_err(super::prepare::Error::Access)?;
+            result.ok_or(super::prepare::Error::State)?
+        }))
     }
 }
 #[async_trait::async_trait]
 impl<I: Io> Io for PacketIo<I> {
     fn read8(&self, reg: u16) -> Result<u8, Error> {
-        self.with_io(|io| io.read8(reg))
+        self.with_effect_io(|io| io.read8(reg))
     }
     fn read32(&self, reg: u16) -> Result<u32, Error> {
-        self.with_io(|io| io.read32(reg))
+        self.with_effect_io(|io| io.read32(reg))
+    }
+    fn read16(&self, reg: u16) -> Result<u16, Error> {
+        self.with_effect_io(|io| io.read16(reg))
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), Error> {
-        self.with_io(|io| io.write8(reg, value))
+        self.with_effect_io(|io| io.write8(reg, value))
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), Error> {
-        self.with_io(|io| io.write32(reg, value))
+        self.with_effect_io(|io| io.write32(reg, value))
     }
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error> {
-        self.with_io(|io| io.write_bytes(reg, bytes))
+        self.with_effect_io(|io| io.write_bytes(reg, bytes))
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
-        self.with_io(|io| io.write16(reg, value))
+        self.with_effect_io(|io| io.write16(reg, value))
     }
     async fn delay_us(&self, micros: u64) {
         self.0.io.delay_us(micros).await;
@@ -294,6 +616,8 @@ impl<I: Io> Owner<I> {
             }),
             identity: IrqSafeSpinLock::new(None),
             ae_cold: Mutex::new(None),
+            ae_access: OnceLock::new(),
+            ae_retired: AtomicBool::new(false),
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -303,6 +627,16 @@ impl<I: Io> Owner<I> {
             .await
             .as_ref()
             .map(|owner| owner.phase())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) async fn ae_fixture_lock(
+        &self,
+    ) -> narf_lib::mutex::MutexGuard<'_, Option<Box<super::rtl8723ae::init::Owner>>> {
+        self.ae_cold.lock().await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn ae_fixture_fail(&self) {
+        self.set(Stage::Failed, Some(Error::Cancelled));
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
@@ -316,6 +650,29 @@ impl<I: Io> Owner<I> {
     pub(super) fn native(&self) -> &I {
         &self.io
     }
+    pub(in crate::rtlwifi) fn retire_ae(&self) {
+        if self.did == super::regs::RTL_DEV_8723AE {
+            self.ae_retired.store(true, Ordering::Release);
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtlwifi) fn ae_fixture_source(&self) -> Option<Identity> {
+        *self.identity.lock()
+    }
+    pub(in crate::rtlwifi) fn install_ae_access(
+        &self,
+        access: Arc<dyn AeAccess>,
+    ) -> Result<(), Error> {
+        if self.did != super::regs::RTL_DEV_8723AE
+            || self.status().stage != Stage::Ready
+            || !self.native_claimed.load(Ordering::Acquire)
+        {
+            return Err(Error::Gate);
+        }
+        self.ae_access
+            .set(access)
+            .map_err(|_| Error::AlreadyStarted)
+    }
     pub(crate) fn identity(&self) -> Option<Identity> {
         if self.status().stage != Stage::Ready {
             return None;
@@ -325,18 +682,96 @@ impl<I: Io> Owner<I> {
     /// Claim at most one LLT/descriptor continuation after successful boot.
     /// Failed allocation, cancellation, or Drop never reopens this claim.
     pub(super) fn claim_packet_io(self: &Arc<Self>) -> Result<PacketIo<I>, Error> {
+        // AE already retains source LLT/MAC/table state. A generic ring
+        // continuation cannot discard/replay that original cold Box.
+        if self.did == super::regs::RTL_DEV_8723AE {
+            return Err(Error::Unsupported);
+        }
         if self.status().stage != Stage::Ready {
             return Err(Error::Gate);
         }
         self.native_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::AlreadyStarted)?;
-        Ok(PacketIo(self.clone()))
+        Ok(PacketIo(self.clone(), Arc::new(PacketState::new())))
+    }
+    pub(in crate::rtlwifi) async fn claim_ae_cold(
+        self: &Arc<Self>,
+        target: &Arc<super::rtl8723ae::retained::Retained<I>>,
+    ) -> Result<super::rtl8723ae::cold_storage::Bound, Error>
+    where
+        I: super::rtl8723ae::retained::Backend,
+    {
+        use super::rtl8723ae::{cold_storage::Storage, retained::Phase};
+        if self.did != super::regs::RTL_DEV_8723AE
+            || self.status().stage != Stage::Ready
+            || !target.registered_for(self)
+        {
+            return Err(Error::Gate);
+        }
+        self.identity()
+            .ok_or(Error::Gate)?
+            .invoke(|| Ok(()))
+            .map_err(|_| Error::Gate)?;
+        self.native_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::AlreadyStarted)?;
+        target.claim_intent();
+        // Fixed order: registered destination regular Mutex, then cold Mutex.
+        let mut state = target.state.lock().await;
+        let mut cold = self.ae_cold.lock().await;
+        if self.status().stage != Stage::Ready
+            || !target.registered_for(self)
+            || state.phase != Phase::Allocated
+            || !target.cold.empty()
+        {
+            state.phase = Phase::ResetOnly;
+            return Err(Error::Gate);
+        }
+        let identity = self.identity().ok_or(Error::Gate)?;
+        let pci = self.io.identity()?;
+        if pci.address() != self.io.address() {
+            state.phase = Phase::ResetOnly;
+            return Err(Error::Gate);
+        }
+        identity
+            .invoke(|| {
+                if self.status().stage != Stage::Ready
+                    || !target.registered_for(self)
+                    || self
+                        .identity()
+                        .is_none_or(|now| now.digest != identity.digest)
+                    || !cold.as_deref().is_some_and(Storage::accepts)
+                {
+                    state.phase = Phase::ResetOnly;
+                    return Err(super::prepare::Error::State);
+                }
+                let original = cold.take().unwrap();
+                match target.cold.install(original, pci) {
+                    Ok(()) => {
+                        state.port = Some(PacketIo(self.clone(), Arc::new(PacketState::new())));
+                        state.identity = Some(identity);
+                        state.phase = Phase::ColdOwned;
+                        Ok(())
+                    }
+                    Err(original) => {
+                        *cold = Some(original);
+                        state.phase = Phase::ResetOnly;
+                        Err(super::prepare::Error::State)
+                    }
+                }
+            })
+            .map_err(|_| Error::Gate)?;
+        // Original Box + PacketIo were stored before either mutex can drop.
+        target.cold.bound().map_err(|_| Error::Gate)
     }
     fn set(&self, stage: Stage, error: Option<Error>) {
         *self.status.lock() = Status { stage, error };
     }
     fn begin(&self) -> Result<Attempt<'_, I>, Error> {
+        if self.did == super::regs::RTL_DEV_8723AE && self.ae_retired.load(Ordering::Acquire) {
+            return Err(Error::Gate);
+        }
         self.started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::AlreadyStarted)?;
@@ -416,7 +851,11 @@ impl<I: Io> Owner<I> {
         use super::rtl8723ae::version::{
             Version, BT_FUNC, REG_GPIO_OUTSTS, REG_MULTI_FUNC_CTRL, REG_SYS_CFG, TRP_VAUX_EN,
         };
-        let sys_cfg = self.io.read32(REG_SYS_CFG)?;
+        let io = AeColdIo {
+            owner: self,
+            image: None,
+        };
+        let sys_cfg = io.read32(REG_SYS_CFG)?;
         if sys_cfg == u32::MAX {
             return Err(Error::Gone);
         }
@@ -425,11 +864,11 @@ impl<I: Io> Owner<I> {
         if sys_cfg & TRP_VAUX_EN != 0 || sys_cfg & BT_FUNC == 0 {
             return Err(Error::Unsupported);
         }
-        let gpio = self.io.read32(REG_GPIO_OUTSTS)?;
+        let gpio = io.read32(REG_GPIO_OUTSTS)?;
         if gpio == u32::MAX {
             return Err(Error::Gone);
         }
-        let multi = self.io.read32(REG_MULTI_FUNC_CTRL)?;
+        let multi = io.read32(REG_MULTI_FUNC_CTRL)?;
         if multi == u32::MAX {
             return Err(Error::Gone);
         }
@@ -816,18 +1255,23 @@ impl<I: Io> Owner<I> {
     async fn run_8723ae(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
         // Worst source firmware poll is about 5.1 s; the additional RF
         // table's four 50 ms delays and BB/LSSI settles fit the 6 s bound.
-        narf_time::timeout(narf_time::Deadline::after_ms(6_000), async {
+        let image = (*self.identity.lock()).ok_or(Error::Gate)?;
+        let io = AeColdIo {
+            owner: self,
+            image: Some(image),
+        };
+        let work = async {
             use super::rtl8723ae::{adapter, init, power};
             let cold_error = |error| match error {
                 super::prepare::Error::Access(error) => error,
                 _ => Error::Gate,
             };
             self.set(Stage::Preparing, None);
-            if self.io.read32(MCU)? == u32::MAX {
+            if io.read32(MCU)? == u32::MAX {
                 return Err(Error::Gone);
             }
             let version = self.rtl8723ae_version()?;
-            let mode = self.io.read8(adapter::REG_9346CR)?;
+            let mode = io.read8(adapter::REG_9346CR)?;
             if mode & (adapter::CR9346_AUTOLOAD_OK | adapter::CR9346_EEPROM)
                 != adapter::CR9346_AUTOLOAD_OK
             {
@@ -840,21 +1284,29 @@ impl<I: Io> Owner<I> {
             // Card-enable and ePHY setup do not write CR. Preserve the
             // source's pre-power `CR == 0xff` LLT-skip observation before
             // parking the gates below.
-            let control = self.read8(0x100).await?;
-            let retries = power::post_flow_with_retries(&self.io).await?;
-            self.io.write8(0x100, control & !0xcf)?;
-            if self.read8(0x100).await? & 0xcf != 0 {
+            let control = io.read8(0x100)?;
+            let retries = power::post_flow_with_retries(&io).await?;
+            io.write8(0x100, control & !0xcf)?;
+            if io.read8(0x100)? & 0xcf != 0 {
                 return Err(Error::Gate);
             }
-            cold.prepare_mac(&self.io, retries, control == 0xff)
+            cold.prepare_mac(&io, retries, control == 0xff)
                 .await
                 .map_err(cold_error)?;
             self.set(Stage::Downloading, None);
-            cold.download_and_configure(&self.io, version, payload)
+            cold.download_and_configure(&io, version, payload)
                 .await
                 .map_err(cold_error)?;
             Ok(info)
-        })
+        };
+        let mut work = core::pin::pin!(work);
+        narf_time::timeout(
+            narf_time::Deadline::after_ms(6_000),
+            core::future::poll_fn(|cx| match io.poll(work.as_mut(), cx) {
+                Ok(poll) => poll,
+                Err(error) => core::task::Poll::Ready(Err(error)),
+            }),
+        )
         .await
         .unwrap_or(Err(Error::Deadline))
     }
@@ -862,3 +1314,7 @@ impl<I: Io> Owner<I> {
 #[cfg(feature = "kernel-test")]
 #[path = "firmware_transport_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "firmware_transport_terminal_tests.rs"]
+mod terminal_tests;

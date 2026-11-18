@@ -50,6 +50,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<(), Error> {
+        if self.chip == super::super::super::prepare::Chip::Rtl8723be {
+            return self.be_tracking_restore(environment).await;
+        }
         let Some(state) = &self.station.tracking else {
             return Ok(());
         };

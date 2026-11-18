@@ -52,6 +52,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         environment: &impl Environment,
     ) -> Result<Option<super::super::super::rtl8821ae::envelope::Permission>, Error> {
         use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        if self.rtl8821ae_full_coex() {
+            return Ok(None);
+        }
         let Some(base) = self
             .station
             .calibration
@@ -127,6 +130,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Error,
     > {
         use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        if self.rtl8821ae_full_coex() {
+            return Ok(None);
+        }
         let Some(base) = self
             .station
             .calibration
@@ -307,6 +313,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let permission = base
             .permission_for(&environment.domain()?, op)
             .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if self
+            .rtl8821ae_coex
+            .as_ref()
+            .and_then(|coex| coex.program.as_ref())
+            .is_some_and(|program| program.permission() != permission)
+        {
+            return Err(Error::Profile);
+        }
         if width.is_some() && !super::super::super::rtl8821ae::ht::admitted(&permission)
             || eighty && !super::super::super::rtl8821ae::vht::admitted(&permission)
         {
@@ -781,6 +795,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             },
             Some(_) => return Err(Error::Profile),
         };
+        // A restored original BB image still retains NBTH. Do not cross
+        // to an unbound width or silently replace its source by plain NAPC.
+        self.be_tracking_allows_op(op, environment)?;
         if current.operating() == op && self.packet.width == width {
             return Ok(());
         }

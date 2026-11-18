@@ -1668,8 +1668,9 @@ and WoWLAN paths are described below.
   control on boards with the BT function (`REG_MULTI_FUNC_CTRL[18]`);
   BT-strapped boards are admitted with the pass-1 coexistence owner
   (`rtl8821ae/coex.rs`: bound `btc_coexist` facts, the TDMA decision
-  matrix, and the LPS gate — BT-state notify and the per-traffic-class
-  8821A algorithm tables are outstanding).
+  matrix and the LPS gate). The source-specific one/two-antenna ports and
+  separate full-program qualification are described below; their new
+  native integration and final validation are still in progress.
   Interrupts: `enable_interrupt` with `int_clear` (HISR/HISRE/HSISR
   write-back, then HIMR/HIMRE/HSIMR; no `REG_C2HEVT_CLEAR` write on this
   chip), `disable_interrupt`, `service_interrupt` (disable → recognize W1C
@@ -3329,18 +3330,19 @@ the coexistence owner runs every composed call site.
     `admit_rtl8723be`; `allow_channel` re-derives the `NAPC` permission;
     retune/removal rebuild through `power_runtime::disable_rtl8723be` +
     `enable_rtl8723be` (`_rtl8723be_init_mac` prefix + enable flow); ASPM
-    stays off. `pci.rs::bring_up` retains `0xb723` when the BAR covers the
+    follows the source internal preparation and current parent policy below.
+    `pci.rs::bring_up` retains `0xb723` when the BAR covers the
     8723BE MMIO, `_rtl8723be_read_chip_version` qualifies, the map is
     provisioned with the factory MAC and the path-A TX power decodes.
-  - Not composed (follow-ups): ASPM (PCIe programme #1849, not wifi).
-    Composed: HT/40 MHz on this profile (`rtl8723be_update_hal_rate_mask`
+  - ASPM is newly composed below (validation deferred), using the existing
+    PCIe parent-policy API without changing the bridge. Composed: HT/40 MHz on this profile (`rtl8723be_update_hal_rate_mask`
     N rows via `ht.rs`, `rtl8723be_wide` / `retune_rtl8723be`; the
     host-API capability publication is composed too
     (`rtl8723be::ht::host_capabilities`, `station_rtl8723be_host_caps`,
     `rtl8723be_caps` — nl80211 publishes the composed HT20/40 body), the `btc_scan_notify` / `connect` /
-    `special_packet` / IPS call sites from the shared station (handshake
-    EAPOL replies produced inside the sync TX path are not covered — no
-    async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond
+    `special_packet` / IPS call sites from the shared station (the retained
+    handshake-EAPOL preflight continuation below is newly linked, with
+    validation deferred), `rtl8723be_dm_watchdog` steps beyond
     the RA refresh including EDCA turbo, except
     TX-power tracking (see `dm.rs`), short-preamble TX, TX-report
     matching for the station. Tests
@@ -3365,8 +3367,54 @@ cap limits and the strict (-80,80) kHz ATC window. The unlinked helper
 retains the initial factory cap separately so an adjustment cannot become
 the new restore value. Native tests cover wire offsets/BSSID selection,
 signed extremes, stale samples, hysteresis, clamps and RX-to-watchdog
-composition. Calibrated TX-power tracking, handshake-EAPOL
-coexistence before synchronous TX and PCIe ASPM remain open.
+composition. Calibrated TX-power tracking remains open; the source-specific
+ASPM continuation below is newly linked and awaits final validation.
+
+**RTL8723BE/RTL8192DE ASPM continuation (validation deferred).**
+The actual retained PCI function selects its exact internal program. BE
+performs bounded source MDIO read/write/readback for compatibility words
+1=0x0663,4=0x7544,6=0xb880,7=0x4000,8=0x9003,9=0x0d03,
+10=0x4037,11=0x0070, then byte-enable DBI updates 0x70f|=0xb8
+(L0s and source L1 latency 7) and 0x719|=0x18 (L1/CLKREQ). DE uses
+the source support=1 DBI bytes 0x70f=0x93 and 0x719=0x1b; its cold
+support=0 setup remains closed until this preparation succeeds. Both
+require actual command completion/readbacks; no EE register recipe is
+aliased to either chip. A source timeout, ignored write or lost authority
+cannot mark internal preparation complete or enable endpoint ASPM.
+
+The existing native PCIe adapter invokes the current original PCI capability
+around every config/MMIO operation. It limits endpoint L0s/L1 to current
+endpoint capabilities intersected with the actually enabled upstream policy,
+sets CLKREQ only with actual endpoint support, preserves other Link Control
+bits and rereads parent policy after waits. Unknown/disabled parents leave
+ASPM off; no shared-bridge/common-clock writes are introduced. Card-disable
+may retain the original proven idle link policy; a rebuilt control owner
+has no old preparation receipt and repeats its own chip program before
+station readiness. AE and the other uncomposed profiles remain disabled.
+Native BE/DE cases are authored for exact MDIO/DBI images/byte enables,
+timeout/ignored-write/source-loss/cancellation refusal and current parent
+withdrawal. Test execution remains deferred until final validation.
+
+**Retained special-packet preflight continuation (validation deferred).**
+The shared synchronous station queue retains each RTL8723BE EAPOL reply as
+owned bytes with a bounded deadline, before allocating a TX identifier or
+publishing a descriptor. The initial join loop and post-association worker
+run the actual async coexistence special-packet notification and LPS leave
+inside the current calibrated station grant. A cancellation guard closes
+the generation. Actual RX queued during the H2C wait is drained before the
+reply is submitted; deauthentication or revoked policy prevents emission.
+The ordinary native descriptor retirement still owns reply delivery and
+controlled-port opening. There is no executor-reentrant `block_on` bridge.
+
+Queued Ethernet EAPOL/ARP/DHCP likewise stays in its exact endpoint pending
+Frame until that frame's notification completes. A per-frame receipt
+replaces the former overwritten latest-class record and best-effort flush;
+synchronous stack drains cannot bypass notification. Lifecycle and current
+station publication are rechecked after the await, and the receipt is
+consumed with that one frame. Native cases are written for the real LPS
+H2C before descriptor kick, dropped mailbox waiter and source loss during
+the wait. All execution is deferred until final validation; this is not
+part of the preceding 4404-pass checkpoint or physical acceptance.
 
 **EDCA turbo continuation.** `dm::edca` ports
 `rtl8723be_dm_check_edca_turbo`, `rtl8723_dm_init_edca_turbo` and
@@ -3406,7 +3454,89 @@ cover literal Cisco/default values, strict direction boundaries and wraparound,
 vendor bounds/window/precedence, actual RX/TX accounting, LPS suppression
 and failed-access handling. Silicon validation remains pending.
 
-### RTL8723AE retained runtime (native cold setup; station admission open)
+#### Separately qualified BE BBSWING thermal continuation (validation pending)
+
+`Rtl8723beThermalTrackingRequest` and
+`RtlwifiDevice::rtl8723be_thermal_tracking_request()` describe the current
+original BE radio/BB/IQK/thermal program. Metadata grants no RF authority.
+`enable_rtl8723be_thermal_tracking()` explicitly loads a separately signed
+NBTH record through the original native firmware Identity. Missing optional
+input returns false and leaves ordinary NAPC unchanged; a present invalid,
+unsigned, mismatched or revoked record refuses. EE NETH and old NAPC formats
+are not upgraded or aliased. `restore_rtl8723be_thermal_tracking()` deliberately
+restores original BB/IQK under the OLD current joint source and keeps that
+source installed afterward. A different operating point or measurement
+requires a full retained hardware rebuild, not a baseline restore/downgrade.
+
+NBTH1 has a320-byte header and107840-byte total length. It binds original
+factory/NAPC/firmware/radio/by-rate/IQK identity, exact primary/width/center/
+offset,20 original TXAGC indices, original CCK8 bytes/nine BB words/IQK
+matrix, original nonerased factory thermal1..63, antenna and ceiling. Its
+64 raw-thermal rows contain4 CCK rates x34 signed-i16 bounds and16 OFDM/MCS
+rates x44 bounds:33/43 actual physical table choices plus an original/
+calibration/transition/failure column. Each measured conducted bound covers
+all simultaneous selections, valid IQK coefficients, actual antenna/BT/supply
+states and the original firmware rates/retry/response/protection/HT/SGI/BA
+programs. Every cell must be known and fit both the original current
+Permission and new ceiling after antenna gain. No table/index-derived power,
+interpolation or unobserved-temperature permission is inferred. Physical
+measurements and hardware acceptance remain external; no measured asset or
+firmware binary is supplied in-tree.
+
+The BE source program is BBSWING: default CCK20/OFDM30, alternating2s RF42
+trigger/read, nonzero average4, BE asymmetric30-entry deltas and its exact
+signed8/unsigned8 copy-before-clamp order. Measurements cover all33 CCK/43
+OFDM physical selections, including negative-wrap choices. Actual effect
+order is LCK -> CCK/OFDM BBSWING -> IQK, with the source's unconditional
+tracking IQK independent of antenna count. Expected RF18 must match retained
+actual Radio.chnlval before calibration, then that exact admitted RF18 is
+restored/read back before MAC reopens. Original full IQK report, original
+matrix/nine backups and original BB baseline remain immutable in the grant;
+later successful reports update only the live radio/history.
+
+`station_power::Base::Rtl8723beTracking` retains NBTH for all captured packet/
+stack publications and every resumed station operation. Its normal BE accessor
+returns the same original NAPC Arc; regrant uses the joint current Permission;
+actual operations run under NBTH -> original NAPC -> original firmware ->
+current original PCI. `station_tracking`, `tracking_native` and the actual
+Environment callback compose installation into the retained native owner.
+Explicit enable takes native control/Prepared ownership, closes/advances the
+native publication generation, drains old leases, retires the old station
+receive/publication epoch and clears queued old output before installing the
+joint Base/State. Prepared stays exclusively held through reopening and
+installation. Cancellation/failure stays terminal; no frame can observe a
+partial base replacement. Restore retains the joint cap, including after the
+physical BB bytes match their original values.
+
+The qualified BE watchdog keeps tracking in its exact source slot between ATC
+and dynamic-TX/coex work; it is not an extra EE gain callback. Scan/connect/
+IPS/LPS notifications carry the same joint source when installed. Deliberate
+normal lifecycle restoration precedes peer/width changes, LPS, disassociation,
+rebuild and sleep under current old authority. A private native lifecycle view
+allows that serialized restoration after packet admission closes while checking
+actual native generation/removal and all original/joint/host/PCI sources; it
+is not a caller boolean or rollback after source loss. A successful bound LPS
+owner first executes its actual source wake under that same joint lifecycle
+view, then checks idle, retires publications and restores BB/IQK. Cancellation,
+removal or source loss during wake stays terminal; no plain-NAPC downgrade
+authorizes restoration. Different widths refuse
+before RF/MLME/coex effects while bound. Uncertain/error owners never silently
+resume, reset their expected history or discard their original backups; new
+State is marked Failed/uncertain before awaited RF effects. Published DMA and
+its joint cap/backups are retained on uncertain Drop. An uncertain NBTH State
+is also pinned independently when a DMA-idle receipt cleared `published`:
+that receipt is not terminal LCK/IQK completion or a physical RF/card reset.
+BME alone supplies neither reclaim nor calibration completion proof.
+
+Seven source/native RF cases and five shared/native lifecycle cases are
+authored but unexecuted. The latter exercise old publication retirement,
+optional absence, fixed-op/current-cap refusal, joint retention after actual
+BB restore and the native enable waiting on a real old publication lease.
+Their original radio/peer metadata bypasses over-air/physical boot proof and
+uses synthetic qualification curves. No test or test-feature build has run
+for this wave.
+
+### RTL8723AE retained native legacy20 station (validation pending)
 
 `rtl8723ae/` + `rtl8723ae.rs` port Linux `rtl8723ae` and the `rtl8723com`
 pieces it uses (PCI `0x8723`, 1T1R 2.4 GHz HT with Bluetooth; the
@@ -3416,8 +3546,15 @@ the chip under qualification — `_rtl8723e_read_chip_version` qualifies
 (no `TRP_VAUX_EN` test chip, `BT_FUNC` set), the EFUSE map is
 provisioned (`REG_9346CR` EFUSE boot + autoload, `0x8129`) and its MAC
 is the factory identity — and retains the firmware owner, which runs
-`run_8723ae`. Station admission (`prepare_rtl8723ae`,
-`Chip::Rtl8723ae`, packet path) is still open.
+`run_8723ae`. `pci::prepare_rtl8723ae_at(address, operating)` composes
+actual retained cold/factory ownership with separately qualified calibration
+and power/channel preparation while packet DMA/MAC stay closed. The AE
+branch of `provision_at` is stage-aware: completed preparation is never
+replayed while waiting for a separate signed station record. The same
+native interface, factory, firmware and retained ring slot are allocated at
+probe and kept on the original name/wiphy. Native station admission requires
+the original completed calibration, separate NASR station grant and final
+MAC/coexistence activation receipt; firmware/ring readiness alone grants none.
 
 - `version` — `_rtl8723e_read_chip_version`: `NORMAL_CHIP | CHIP_8723`,
   `CHIP_VENDOR_UMC` from `REG_SYS_CFG[19]` with the `CHIP_VER_RTL_MASK` cut
@@ -3482,26 +3619,157 @@ is the factory identity — and retains the firmware owner, which runs
 - `init`, `llt`, `mac`, `phy`, `tables` — source cold initialization and
   AE-specific MAC/PHY/AGC/RF/PG tables, cached original BB/RF values,
   channel/bandwidth and LCK programs. The firmware owner reaches
-  `TablesReady`; factory MAC, coexistence tail, IQK and calibrated power
-  remain the future radio owner's work. Six new native smokes include the
+  `TablesReady` and records the actual qualified Version, warm-MAC choice
+  and ePHY retry count. The native specialization transfers its exact
+  original boxed owner and PG store to the registered AE capsule; it never
+  clones PG or replays LLT/MAC/table initialization. Six new native smokes include the
   actual `FirmwareOwner::initialize` path, pre/post-download register
   ordering, warm LLT retention, eligibility refusal before writes, late
   failure and cancellation. These fixtures are not physical receipts.
   The six cold-start and four preparation cases below pass in the
   coordinated x86_64 Wi-Fi run; aarch64 is skipped at the user's request.
-- `iqk`, `txpower` — separate preparation APIs, not native startup or
-  station callers. IQK preserves 1T1R trials/candidate selection, matrix
+- `iqk`, `txpower` — source preparation APIs now composed by the native
+  retained supervisor after independent signed recipe qualification. IQK preserves 1T1R trials/candidate selection, matrix
   writes and ten-register recovery. `Complete` records source completion;
   candidate `0xff` or zero TX results admit no calibrated radio. The
   RF6052 plan decodes AE EFUSE offsets and PG groups, including BT1/BT2
   word subtraction and per-byte clamps. Observed bytes are not replaced
   by guessed factory defaults. Plans/raw indices carry no signed or
   regulatory authority. Four native regressions cover source vectors,
-  register programs and terminal failure/cancellation. Native composition
-  still needs measured PA-bias byte `0x1fa`, a factory-bound radio handoff,
-  factory-capped signed grants and current-capability invocation. NAPC
-  curves need not be monotonic: lowering a selected index alone is not a
-  proof that the lower entry meets the signed ceiling.
+  register programs and terminal failure/cancellation. The native path
+  acquires physical PA-bias byte `0x1fa`, retains original cold history,
+  searches signed curves independently inside each factory cap, and
+  invokes current source/PCI capabilities for every actual access/poll.
+  NAPC curves need not be monotonic: the search does not clamp a previously
+  chosen index or infer safety of unmeasured lower entries.
+- `retained`, `cold_storage`, `checked` — the real PCI binding allocates
+  the AE capsule before commit. Commit accepts only the original firmware
+  Arc and bus address; the specialized one-shot claim rechecks firmware,
+  current source and destination after both regular mutex waits. Generic
+  `claim_packet_io` rejects AE without consuming that specialized claim.
+  The exact Box, PG/backend/factory and any operation remain owned through
+  cancellation, error, removal and unexpected last-owner drop. Detach
+  retires admission and reserves the exact function in `Bindings` forever;
+  `reclaimed` cannot clear an AE quarantine. `finish_removal` stores the
+  entire original controller in a preallocated quarantine cell. There is
+  no reset/reclamation receipt or retry after uncertain hardware work.
+- `factory` — native read-only bank-0 EFUSE observations use real fallible
+  8/16/32-bit accessors, including word SYS_FUNC_EN/SYS_CLKR power gates.
+  The logical map uses DWORD ready polling (initial + at most10000 repeats
+  and50us settling); physical0x1fa uses BYTE ready polling (initial + at
+  most1000 repeats). A native100ms ceiling can refuse earlier. Ready
+  DATA0xff is a successful observation, distinguished from timeout or
+  all-ones status. All SYS_CFG/GPIO_OUTSTS/MULTI_FUNC observations reject
+  all ones; autoload, full retained logical-map/MAC equality and conservative
+  raw required-power-byte qualification are mandatory. Factory and post-LCK
+  PA owners retain cleanup receipts even on Err. ACCESS0/write/readback
+  always requires current original PCI authority; loss after gate-on
+  quarantines the gate instead of bypassing revocation through raw MMIO.
+- `radio_policy` — old NAPC v1/v2 wire format/reserved bytes are unchanged.
+  A new signed256-byte `NAQR` v1 preparation companion binds the exact
+  NAPC digest, retained firmware digest, source recipe/table digest,
+  original Version/warm/retry/PG/RF18 history, actual PCI subsystem IDs,
+  observed factory/BT facts, independent physical PA byte and requested
+  operating geometry. Its measured calibration/transition peak plus
+  antenna gain must fit both cold1/20MHz and target host-policy spans.
+  Every selected TXAGC index is measured and searched independently within
+  its actual source factory cap. The source's forced CCK11M index0 needs
+  its own safe measurement. No monotonicity, interpolation, invented curves,
+  or factory defaults are used. Old logical-map-only NAPC qualification
+  authorizes none of the new physical-fuse or calibration program facts.
+  `RtlwifiDevice::rtl8723ae_preparation_request` returns the separate asset
+  name/binding after actual cold/factory acquisition; it runs no IQK/LCK.
+  `rtl8723ae_preparation_status` is historical progress, never station-ready.
+- `supervision` — native preparation loads real signed assets and retains
+  the complete context/future before first poll. Current firmware, NAPC,
+  NAQR, fixed current regulatory-domain identity, exact factory-capped grant
+  and original PCI enclose each resumed poll and each individual access.
+  Stages verify measured cold RF18/20MHz state, write/read back factory MAC,
+  switch main RF path, run source IQK, run source LCK, reread physical PA
+  with exact equality, apply source PA effects, program/read back independent
+  power words and channel/bandwidth, then verify parked gates. ASPM remains
+  disabled; the source8723A BT hardware-init dispatch and thermal-tracking
+  hook are no-ops. A caller Drop requests cancellation: an already-started
+  stage drains under current authority and no subsequent stage starts.
+  Authority/registration loss stops polling and retains pending resources;
+  Ready(Err) explicitly grants no recovery of helper-local backups already
+  destroyed by unwinding. Every uncertain result is reset-only quarantine.
+  Source completion is neither an RF-stop fence nor packet/ACK/retry/coex
+  authority. These new native ownership/factory/policy regressions are
+  written; all execution is deferred to the final coordinated validation.
+- Early firmware/cold execution now uses an AE-only checked IO/poll facade:
+  each actual access and resumed poll invokes the retained firmware source,
+  and detach atomically retires the original firmware owner as well as the
+  later factory/radio capsule. A pending cold coroutine cannot continue
+  through raw PciIo after retirement or image-capability revocation. Its
+  partial original Box stays terminal and retained. Other chips' firmware
+  algorithms and the original AE effect ordering are unchanged.
+- `station_policy`, `station_owner`, `ring_owner` — a separate640-byte
+  signed `NASR` v1 record binds the exact successful retained preparation
+  context (including actual IQK result/restore image, acknowledged post-LCK
+  physical PA observation, original cold/PG/PCI history, NAPC/NAQR/firmware
+  digests) and a distinct station/coexistence recipe. The256-byte header
+  carries exact binding/identity/source/recipe digests, legacy20 geometry,
+  factory MAC, antenna/qualified/transition bounds and profile1/rate mask;
+  bytes232..256 remain zero. Three64-entry `i16` curves follow. They are
+  independently measured worst-case station/firmware/coexistence curves;
+  old NAPC's Normal curves do not acquire this meaning. Signed unmeasured
+  entries remain `i16::MAX`; factory-cap selection searches each curve
+  independently, including the forced CCK11M index0. Profile1 excludes
+  HT/A-MPDU/SGI, LPS/IPS, ASPM and reset/reclamation authority.
+  The NASR recipe additionally incorporates a cached SHA-256 over an explicit
+  compile-time `include_bytes` set of actual AE native MAC/TRX/H2C/coex/RF/
+  rate/reserved/park/admission helpers, source tables and the shared RF/
+  traffic helpers actually used. File count, each name length/name and each
+  source length/body are framed independently. Any included source edit,
+  including a nonfunctional edit, conservatively invalidates old NASR. This
+  identifies selected source inputs; it does not sign an executable, bind a
+  compiler/dependency graph or supply physical/calibration evidence. Old
+  NAPC/NAQR wire formats retain their meanings and are unchanged.
+
+  `RtlwifiDevice::rtl8723ae_station_request` requires actual completed native
+  preparation. `pci::prepare_rtl8723ae_station_transport_at` loads NASR,
+  checks the exact original Work/Binding pointer after its mutex wait,
+  consumes its one-shot station intent, and transfers the original PacketIo
+  into the preallocated retained native ring slot. Generic AE packet claim
+  remains rejected. NASR and all preparation sources enclose every actual
+  access and resumed poll under the original current policy source; private
+  fixture databases never fall back to global policy.
+  The actual linked-ring continuation allocates DMA32 TX/RX/buffer pages,
+  retains the complete owner before the first BAR base write, verifies
+  actual calibrated channel/20MHz, factory MAC/RCR and source BCN state,
+  programs/readbacks independent joint TXAGC words, and publishes exact
+  linked TX bases0x308..0x338 and RX base0x340. It skips LLT/table/firmware
+  replay and never opens BME, CR packet gates or IRQs. Inactive transport
+  completion still has no `station_grant`.
+  `pci::activate_rtl8723ae_station_at` then takes the native lifecycle and
+  retained Prepared locks, moves the SAME original coex Box/mailbox out of
+  the successful preparation context without an intervening suspension,
+  captures actual RF origins via `mech_init`, configures source AE MAC state,
+  and stages the exact same NASR Arc as the typed station power base.
+  An independent shared live-admission flag stays false throughout this
+  hardware prefix. Only the retained owner can commit it under current
+  NASR/preparation/host-policy/registration and native publication fences.
+  Dropping activation, including a mutex wait after helper completion,
+  invokes its terminal restrictive park; a locally completed helper cannot
+  publish station authority by itself. The generic initialization path is
+  an exact existing-AE readiness query, never a cold/firmware/claim fallback.
+- `irq`, `h2c`, `trx` — AE runtime source primitives are distinct from CE/BE.
+  Actual `hw.c` IRQ enable/disable masks are literal0x3a8/0x3ac; recognition
+  reads/masks/W1C0x3a0 only. The unused `reg.h` HIMR macros do not authorize
+  another bank. Probe's shared IMR dispatch now selects this pair for AE.
+  Station/coex share one retained AE H2C mailbox: BOTH HMETFR and MCUTST
+  must be ready, initial + at most99 delayed10us rechecks also read0x1bf,
+  extensions precede box bytes, and error/cancel poisons the rotation.
+  New actual TX/RX descriptor codecs preserve AE's DW3 BIT31 hardware
+  sequence helper; the CE-only DW4 BIT7 write is absent. RXPKT_LEN is
+  independent of the driver-info/shift buffer offset (and includes FCS).
+  AE's generic btc special-packet dispatch has no8723A hardware branch;
+  it must not inherit BE's typed EAPOL H2C state machine. Actual legacy
+  AE `rtl_8723e_bt_wifi_media_status_notify` H2C0x19 remains an exported
+  source helper without a native caller (the current Linux tree configures
+  the callback but has no caller). The native C2H/watchdog path below uses
+  the actual legacy source mechanism, without inventing that call site.
 - `c2h` — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`,
   `hal_btc.c:1690`): header byte at `REG_C2HEVT_MSG_NORMAL` (`0x01A0`,
   id low nibble / len high nibble, sequence at `0x01A1`, body from
@@ -3513,12 +3781,11 @@ is the factory identity — and retains the firmware owner, which runs
   consumed without effect; `C2H_V0_BT_INFO` (12) parses via
   `rtl8723e_dm_bt_parse_bt_info` (original byte 0, retry byte 1 when the
   body is at least 2 bytes, inquiry page bit 2, connection bit 0) and
-  returns the four fields as `BtInfo` for the coexistence owner
-  (`coex::Owner::ingest` + `periodical`, fed by the packet owner's
-  `service_c2h`). `packet::Owner::service_c2h` schedules `c2h::drain`
-  when `irq::IsrStatus::c2h_pending` is set, mirroring the `pci.c`
-  fwevt gate, which is 8723AE-only (fixture-tested; no live IRQ caller
-  yet — the station owner that would service it is still open). Tests
+  returns the four fields to the SAME native coex owner's `ingest`.
+  The actual native packet path drives this MMIO drain from the real AE
+  C2H status in IRQ and polled operation; no event is treated as a TX ACK.
+  Generic btc_periodical has no8723A hardware dispatch, so the old coarse
+  matrix is not applied as an RF program. Tests
   `smoke_rtl8723ae_c2h_mailbox_close_protocol`,
   `smoke_rtl8723ae_c2h_mailbox_bt_info` (written, unexecuted).
 - `coex` — the 8723AE Bluetooth-coexistence owner, pass 1 (#1458): board
@@ -3547,17 +3814,238 @@ is the factory identity — and retains the firmware owner, which runs
   `smoke_rtl8723ae_dm_all_off_sequences` (written, unexecuted). The
   1-ant path is a Linux stub, ported as a no-op. The coex owner binds
   from the adapter facts probe derives (`Adapter::bt`, as the admission
-  smoke test does); its live feed still runs through the packet owner,
-  whose station admission is still open.
+  smoke test does). Native activation transfers that original owner before
+  `mech_init`; partial RF origins/mailbox/history remain inside the retained
+  Prepared on every failure. The 2s source watchdog uses actual bound-peer
+  smoothed PWDB, real PHIMR BK/BE/VI/VO DOK causes (bits5..2), good unicast
+  DATA RX and shared source `base.c` four-period averages. The source's
+  TX-heavy `tx_busy_traffic=false` quirk is preserved. No doorbell or DD
+  is counted as an on-air ACK, and no synthetic RSSI sample is supplied.
 - `envelope` — signed per-board NAPC power envelopes, 2.4 GHz only
   (#1458): `Calibration::permission_for` mints the `Permission` the
   packet owner transmits under (v1/v2 rows, CCK/OFDM/HT 1SS curves,
   no BB swing, no factory per-rate TXAGC cap).
-- `packet` — the AE packet owner (#1458): 92CE-style TX descriptor
-  fill, RX descriptor query, firmware + envelope admission gates
-  (`Owner::admit`, `admit_tx`) and the mailbox service entry
-  (`service_c2h`). Probe admits the chip (#2087); the packet owner
-  itself is not yet admitted — station admission is still open.
+- `packet_owner`, `station_native`, `ps`, `station`, `reserved` — the
+  actual native NASR legacy20 branch is distinct from the earlier diagnostic
+  `packet::Owner`. It uses own AE descriptor and HW-sequence fields, linked
+  DMA publication/host retirement, software CCMP, exact FCS/driver-info
+  separation, source BSSID/MSR/RCR/beacon caches, RRSR/SIFS/ERP/fixed EDCA,
+  shared H2C rotation, own B/G RA masks and source AE RA hysteresis (LOW
+  high threshold60; missing bound-peer beacons reduce the state).
+  The768-byte reserved-page packet is ported source text, hashed in the
+  NASR recipe and patched with actual MAC/peer/AID. Linux publishes its
+  command OWN and doorbell before RSVD/JOIN H2C; AE has no BCN_VALID
+  receipt, so the exact body stays retained rather than inventing an ACK.
+  Open/WPA2 MLME/data use the common retained station security/key/PN/RX
+  publication rules with this own typed NASR Base/Grant and actual AE GPIO
+  polarity; the unrelated EE0x6c bit31 predicate is never used for AE.
+- `park`, `park_native`, retained registration/removal — cancellation or
+  source loss retires AE emission authority before cleanup. Only current
+  original PCI identity may attempt restrictive IRQ3a8/3ac masks, TXPAUSE,
+  CR DMA/MAC closure, BME clear and MSI withdrawal. Every scalar access is
+  inside the original PCI invocation; MMIO failure does not skip independent
+  BME/MSI attempts. A failed/revoked access is quarantined, never bypassed.
+  Actual scalar I/O and native master/kick additionally share a synchronous
+  effect gate with terminal park. Retirement is stored before the park takes
+  that gate: earlier admitted scalar enables finish before the closing
+  commands, later ones recheck retirement inside it and refuse. Outer
+  descriptor/poll/current-source scopes remain reentrant and never hold this
+  gate across an await. Errors release it before attempting cleanup.
+  These readbacks prove no reset or DMA-idle/reclamation: the original cold
+  Box/PG, backend, factory/physical fuse observations, IQK/PA state, coex
+  origins/mailbox, Native facade and all published DMA remain retained on
+  error/drop/detach. The address cannot be rebound. Profile1 excludes native
+  LPS/IPS and generic power-down/rebuild, so neither an 88EE fallback nor
+  host Null DD can supply missing reset/RF-sleep/ACK authority.
+
+The new native composition and authored regressions await final test execution.
+No physical-board calibration/measurement record, Wi-Fi firmware or BT binary
+is fabricated or committed. Actual signed NAPC/NAQR/NASR inputs and physical
+RF/firmware interoperability acceptance remain external prerequisites. HT,
+aggregation/SGI, LPS/IPS, ASPM, reset/recovery, retuning and reclaim need their
+own source/lifecycle/qualified programs; the legacy20 profile does not claim
+those features.
+
+#### Separately qualified AE HT20 profile (implementation)
+
+After the optional NASR3 inquiry below, the original station attempt selects
+NASR2 before any station effect, with NASR1 fallback only on NotFound. A present
+bad, unsigned, mismatched or revoked NASR2 is terminal. Selection never
+replaces a live legacy program. The additional public
+`rtl8723ae_ht20_station_request()` getter derives its filename and binding
+from the same successful retained calibration; metadata is not an HT grant.
+
+NASR2 retains the640-byte geometry but requires header version2, profile2
+at226 and admitted mask0xfffff at228, a distinct recipe digest and the name
+`rtlwifi/rtl8723ae-station-v2-<mac>-p<N>.bin`. The three curves independently
+measure all enabled HT20/SGI20/MCS0-7/legacy/QoS/CCMP/firmware retry/response,
+recipient BA and retained coexistence states and transitions. The measured
+peak includes each enabled state, including hardware responses; its antenna/
+ceiling/current-policy/factory-cap checks remain mandatory. NASR1's wire
+layout and legacy meaning remain unchanged; its active mask is now explicitly
+0xfff while its unused programmed HT gain indices remain unchanged. No
+unmeasured lower index or old legacy curve acquires HT meaning.
+
+The actual native continuation advertises only one-stream HT20/SGI20 with
+3839-byte A-MSDU receive bounds, sets source HT SIFS0x1010 and AE aggregation
+timing, and installs its source N24 mask from the real peer MCS/GI facts.
+The normal source0x41/a8/72/b9 aggregation-length row applies: the retained
+factory type is RTL8723A, so the source CSR_BC4 alternative is unreachable.
+Received MCS/A-MPDU/long frames require negotiated `packet.ht`. Bounded exact
+20-byte compressed BARs reach the shared software recipient BA owner without
+indexing a nonexistent byte22; ordinary MAC frames keep their24-byte minimum.
+AE supplies no receive GI metadata. The retained old AE coexistence owner
+receives actual negotiated legacy/HT20 state; it borrows no BE mechanism.
+
+TX remains single-MPDU, using actual AE descriptors and the same current
+joint source. Shared `aggregate` and DD-triggered sender-BA callbacks are
+disabled for AE; host completion is no on-air ACK. RX BA64/reorder and
+A-MSDU use the existing peer/key/PN-aware software owners. Wider points,
+TX aggregation, native PS/ASPM, retune/reset/reclaim and physical acceptance
+remain unfinished. Four authored NASR2 regressions cover old-record refusal,
+active/programmed-rate separation, actual original-ring RX bounds/BAR parsing,
+single-MPDU SGI descriptors, the original shared mailbox's N24 RSSI masks and
+capability revocation before effects. They remain unrun until final validation.
+
+#### Separately qualified AE HT20/ASPM profile (implementation)
+
+NASR3 is a separate complete-program measurement at
+`rtlwifi/rtl8723ae-station-v3-<mac>-p<N>.bin`, using the same640-byte shape
+with version/profile3, mask0xfffff and a distinct binding/recipe. It measures
+the complete HT20 station, retained firmware/coexistence, retries and automatic
+responses across disabled and enabled link states and transitions. NASR1/2
+do not supply those bounds. The original single station attempt tries3,2,1
+in that order; only NotFound permits the next profile. Present invalid,
+unsigned, revoked or mismatched records refuse, and no live owner upgrades.
+`rtl8723ae_ht20_aspm_station_request()` returns metadata from the same actual
+completed calibration, without changing link state.
+
+Before opening packets, only NASR3 invokes the new refusing-by-default
+`packet::Port::prepare_rtl8723ae_aspm` operation. The native PacketIo checks
+the immutable selected profile and each actual access/configuration operation
+invokes the same original NASR/NAQR/NAPC/firmware/PCI sources. AE uses its own
+`hw.c853..870` source byte program: `34b=93`, `350=870c`, `352=1`, then
+`349=1b`, `350=2718`, `352=1`. Default `const_support_pciaspm=1` establishes
+source `support_backdoor=true`. It borrows no other chip's MDIO/full-dword
+sequence. Bounded DBI completion and byte-lane readbacks precede the original
+endpoint receipt. Actual endpoint capabilities and current enabled parent
+policy bound L0s/L1/CLKREQ; the shared bridge/common-clock fields are unchanged.
+Policy is re-read around the100us wait and before each endpoint commit.
+Disabled policy performs no internal preparation or link enable.
+
+Cancellation, ignored writes, timeout and source loss leave preparation failed
+with the original owner retained; restrictive park still provides no DMA-idle,
+RF-stop/reset or reclaim proof. ASPM does not admit IPS/LPS or sender BA.
+Four additional authored cases cover the exact source byte program, changed
+parent policy, incomplete/revoked/cancelled preparation and actual original
+PacketIo profile gating, plus actual native RAM-ECAM/BAR terminal withdrawal
+even after a MAC readback failure. Terminal park attempts endpoint ASPM/CLKREQ
+withdrawal independently under current original PCI, serialized with old scalar
+effects. Denied cleanup retains uncertainty and all original owners. All cases
+remain unrun. The selected-source identity also
+includes the shared station/packet/interface/current-access and native ASPM
+dispatch bodies, conservatively invalidating older records after those edits.
+
+### RTL8821AE source coexistence continuation (validation pending)
+
+The two source algorithms are now distinct Rust programs:
+`btcoex/b8821a1ant.rs` (20130816/0x41) and `b8821a2ant.rs`
+(20130618/0x5050). They preserve their own TDMA/PTA tables, antenna registers,
+RF/AGC/DAC operations, RSSI/adaptive histories and notify ordering. The source
+two-antenna boolean BT-power cache, reversed first-adjust/report behavior,
+direct PAN+HID table and firmware-specific GNT_BT path are retained. They do
+not borrow RTL8723B hardware recipes. Both primary files are GPL-2.0-only;
+the local Linux tree identifies itself as 7.3-rc4, and the source C/header
+SHA-256s are recorded in the ports and the qualification recipe.
+
+The original MAC continuation now binds antenna count from actual factory
+EFUSE 0xc3 bit 0 (1 selects one antenna, 0 selects two), independently of the
+Wi-Fi 1T1R stream count. The retained native adapter uses RTL8821AE path-A
+RF serial access, byte-wise mailbox/extension writes and the chip's actual
+BT-controlled power-mode/RPWM commands. Every sender shares its original
+mailbox rotation. Controller histories and original RF backups remain owned
+through awaits; partial/cancelled operations are terminal rather than replayed.
+
+RX support now retains the complete bounded C2H header plus 16-byte command,
+rejects oversized BT bodies rather than accepting a truncated prefix, and
+uses the same actual original-ring parser/rearm program during MP waits.
+Unrelated reports are deferred on a separate queue; ordinary frames retain
+their bytes and PHY facts for later security/PN processing. Per-round drain
+budgets prevent continuous arrivals from suppressing the timeout. Actual
+data-queue TXDOK causes and good unicast DATA RX feed the source four-period
+traffic history; neither a doorbell nor DD is counted as an on-air ACK.
+
+Full native activation additionally requires a nonzero BT patch/build
+observation from the original RX stream and a separately signed N21C v1
+record. A missing observation/record keeps the original coarse policy.
+The record binds the exact factory, raw antenna byte, selected Wi-Fi firmware,
+actual BT patch/build numbers, exact signed NAPC bytes, complete admitted-rate/
+TXAGC/swing permission and both source recipes. Its independently measured
+conducted peak covers every enabled algorithm state, admitted rate and
+transition at that exact 20 MHz point; normal NAPC measurements do not supply
+that peak. Wider channels and coexistence WoW/replay require further
+qualification. No measured record or firmware blob is committed.
+
+N21C is exactly 256 bytes, little endian: magic at 0; version 1/header 256
+at 4; total 256 at 8; PCI 10ec:8821 at 12; binding/factory/NAPC/firmware/
+recipe/permission digests at 16/48/80/112/144/176; MAC at 208; raw C3 and
+source antenna count at 214/215; band/primary/20/offset0 at 216; observed
+BT patch u16/build at 220/222; complete-program measurement flag 1 at 223;
+signed quarter-dBm antenna gain/qualification ceiling/conducted peak at
+224/226/228; 26 zero bytes at 230. The name is
+`rtlwifi/rtl8821ae-coex-v1-p<primary>-<mac>.bin`. The permission digest covers
+the exact admitted rates, all 48 gain indices, swing and policy ceiling.
+Actual effects nest N21C, original NAPC, selected firmware and original PCI
+invocations. A separate station power-base variant also retains that source
+through stack publication; a prior Noop validity check cannot grant later I/O.
+
+The first native station start performs one read-only BT-version inquiry
+through the original retained RX ring and H2C rotation. A complete actual
+version/build and signed N21C are required before algorithm initialization.
+The full controller and qualification are retained before any awaited RF
+effect. Missing optional input keeps the coarse policy and consumes the
+original owner's inquiry; it cannot be upgraded on an open station. The
+public `rtl8821ae_coexistence_request()` getter clones the retained historical
+filename/binding even when asset lookup returned NotFound. It sends no query,
+installs no grant and supplies no current RF authority.
+
+Actual scan start/finish, connect/media, C2H, EAPOL and each queued special
+packet, LPS, two-second watchdog and healthy halt now drive that same owner.
+Special frames cannot acquire a TX id or descriptor before their own async
+preflight, and current C2H is serviced before readiness is tested. Actual
+completed scan-cache counts and observed legacy/HT mode feed source decisions;
+the source four-period traffic history retains its `tx_busy=false` behavior.
+Chip RA/IQK work precedes coexistence periodical work, including coex work
+when firmware LPS suppresses chip DM. The source aggregation-size setting caps
+future ADDBA windows; its logged-only `reject_agg` is not invented as RX policy.
+
+N21C is retained in the station power base and original PacketIo. Both scalar
+effects and captured publication callbacks invoke its actual source alongside
+NAPC, selected image and original PCI. Its recipe additionally includes a
+cached name/length-framed digest of the linked source helpers; source edits
+conservatively require fresh measurements without claiming an executable or
+compiler attestation. A complete contradictory BT version/build poisons the
+program inside original RX authority before descriptor rearm; truncated reports
+cannot substitute for that observation. Ordinary MAC frames need at least24
+bytes after FCS removal, including when encountered during an MP wait.
+
+Every full-owner awaited operation has cancellation/failure guards. Logical
+admission closes before its retained restrictive park serializes with scalar
+effects. IRQ masks, TX pause, DMA/MAC gates, PCI mastering and MSI are fenced
+independently against the actual original PCI function; stale authority grants
+no fallback access. Park is neither RF restoration nor DMA-idle/reset proof,
+so uncertain owners remain pinned. Healthy disconnect issues source halt
+before terminal state rather than reviving a failed controller for cleanup.
+Different operating points, wider HT/VHT and WoW replay refuse while the joint
+program is installed. Public cached capabilities are captured after joint
+installation and advertise only HT20 on that point's actual band. The channel
+list and default scan stay on that exact point; incompatible explicit scan,
+join and channel requests refuse before scan notification or retune. An outer
+scan guard retains original ownership through waits between notifications and
+channel controls. Reusable disassociation leaves LPS and notifies media loss
+without issuing the source's permanent Halt. Source/native regression cases are authored, with all
+test execution deferred to final validation. Physical BT/Wi-Fi concurrency,
+fresh measurements and broader native profiles remain open.
 
 ### RTL8192DE retained runtime (2.4 GHz legacy station admitted)
 
@@ -3611,8 +4099,7 @@ is the factory identity — and retains the firmware owner, which runs
   comes from the retained `PciIo`), the `rtl92de_hw_init`
   orchestrator (`init::configure`: power-on, MAC, BB/RF tail, TX-power
   level, dual-MAC RF-ready poll), AMPDU density / RDG / HTC-LPS hwseq
-  / sectype / TX-report (`SPE_RPT` + `SW_DEFINE` sequence) /
-  rate-id / MAC-id in the packet owner and descriptors, the H2C
+  / sectype / rate-id / MAC-id in the packet owner and descriptors, the H2C
   rate-mask send (`update_hal_rate_mask`, admitted-gated) and the
   RPWM LPS enter/leave (`0x02` / `0x0c`), and card disable /
   power-off (`check_poweroff`, `poweroff_adapter`, `card_disable`).
@@ -3640,11 +4127,20 @@ is the factory identity — and retains the firmware owner, which runs
   `native_channel` over the PROM mode and PCI function, and
   `initialize_registered_on_channel` dispatches 92DE before the 2.4 GHz
   1–11 gate. Test `smoke_rtl8192de_hw_init` (extended; written,
-  unexecuted). TX-report arrival matching is inapplicable on 92D, not
-  open: Linux gives 92D no C2H arrival route (`rtl92de_rx_query_desc`
-  never sets `packet_report_type`; the `IMR_C2HCMD` dispatch in
-  `pci.c` is gated to RTL8723AE), so a requested report only resolves
-  through the 3 s timeout, as here.
+  unexecuted). The Linux7.3-rc4 source audit found that
+  `rtl8192de/trx.c:44..229` never calls `rtl_set_tx_report` or writes
+  SPE_RPT/SW_DEFINE, including for EAPOL/Null frames. Both NARF DE
+  descriptor paths now preserve those source-cleared fields and never
+  advance a hardware-report sequence. Existing public report inputs,
+  classification and sequence helpers remain inert software metadata
+  for compatibility, with no request or ACK authority. DE also has no
+  C2H arrival route: `sw.c:209` selects
+  `rtl8192d/trx_common.c:384..431`, which never sets
+  `packet_report_type`, and `pci.c:979..987` schedules mailbox C2H work
+  only for RTL8723AE. DE's `IMR_C2HCMD` mask and common report macros
+  cannot supply the missing firmware protocol. A 3-second key-disable
+  wait timeout is unrelated to an on-air ACK; Null queue timeout
+  cleanup (`base.c:1939..1955`) explicitly reports failure.
 - Station composition (`rtl8192de/packet_owner.rs`, mounted as
   `prepare::packet::de92`; written, build-gated, unexecuted): the 92DE
   packet branch of the shared retained owner — `_rtl92de_init_mac` DESA
@@ -3691,8 +4187,9 @@ is the factory identity — and retains the firmware owner, which runs
   92DE (offer, admission, TX/RX, `BSS_CHANGED_HT` timing), DIG /
   dynamic TX power / EDCA turbo watchdog steps, software-LPS
   decisions (enter-core gate, beacon TIM decision, sleep interval),
-  RX RSSI from the PHY status (`rx_pwdb_all`). Not composed: ASPM,
-  and the software-LPS RF sleep/awake execution
+  RX RSSI from the PHY status (`rx_pwdb_all`). Source-specific DBI ASPM
+  is composed with the original endpoint/parent policy, pending native
+  acceptance. Not composed: the software-LPS RF sleep/awake execution
   (`rtl_ps_set_rf_state` has no NARF primitive).
 
   Native software LPS also needs the stack's actual requested PS state
@@ -3707,6 +4204,23 @@ is the factory identity — and retains the firmware owner, which runs
   sequences, including five RF0 retries and the awake fallback. They
   must preserve current qualification at every effect; an unconfirmed
   restore cannot publish awake readiness or DMA retirement.
+
+  The missing Null-PM on-air ACK is a source blocker before those RF
+  operations can safely join the native PS lifecycle.
+  `mac80211/mlme.c:3948..3966` sends the Null-PM frame then requires
+  `NULLFUNC_ACKED` before setting `CONF_PS`;
+  `mac80211/status.c:1120..1129` sets that flag only from TX_STAT_ACK.
+  In contrast, `rtlwifi/pci.c:511..549` queues a retired Null frame
+  for the report handler instead of marking it ACKed, and the DE
+  paths above provide no report arrival. The current native packet queue
+  also rejects PM=1 before descriptor publication; no explicit requested
+  PS state or Null-PM sender is admitted. DD, DOK, the 5 ms delay,
+  an elapsed report timeout or a new caller-supplied ACK flag cannot
+  establish AP buffering agreement. Native software sleep remains
+  disabled. Corrected descriptor expectations and an actual retained
+  EAPOL/ordinary-Null ring case are authored but unexecuted; the native
+  case refuses PM=1, then retires DD while requiring no report bits or
+  RF sleep effects.
 
 ## 4. Invariants
 
@@ -3852,6 +4366,23 @@ above. Other chip-specific power paths retain their remaining rows.
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,
 `rtl8192d/hw_common.c` dual-MAC selection, and per-chip firmware/HW code.
 
+**Software-LPS ACK prerequisite (2026-11-17 source audit).** Native
+software sleep must stay closed until an actual on-air Null-PM ACK producer
+exists. Linux 7.3-rc4 `base.c` advertises both REPORTS_TX_ACK_STATUS and
+PS_NULLFUNC_STACK, and mac80211 `dynamic_ps_enable_work` waits for
+NULLFUNC_ACKED before CONF_PS. PCI Null descriptor retirement instead
+queues `rtl_tx_ackqueue`; `base.c` timeout cleanup reports false. The real
+report handler can report success, but DE has no source arrival path:
+PCI C2HCMD scheduling is AE-only, DE RX does not assign a C2H report type,
+and its descriptor path has no TX-report producer. Host DD retirement
+therefore cannot authorize AP-buffering agreement or RF sleep. This is a
+specific source/firmware receipt gap, independently reviewed during the
+continuation, not a missing generic timer or a permitted DD-to-ACK alias.
+The source RF sleep/awake program, explicit PS request, Null-PM delivery,
+DTIM/wake workers and lifecycle handling remain uncomposed; they cannot
+close the feature while that ACK prerequisite is absent. ASPM is composed
+separately above and grants no PS or AP acknowledgement.
+
 ### Current remaining feature blockers (2026-10-30)
 
 These named rows retain the source/profile limits described above. Chip-specific
@@ -3859,7 +4390,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE: the per-chip coexistence owners are delivered (8723AE pass-1 owner + 1-/2-ant mechanism trees, #1458/#1470; 8723BE owner with 1-/2-antenna dispatch and every `rtl_btc_ops` call site, #1351); probe admission landed for both chips (#2087 for 8723AE) and the 8723AE coex RF halves are delivered through the rtl8723com LSSI writer (7259422b6; the `rf.rs` RF-write API is not the path — 12-bit packing cannot carry the 20-bit coex values). Remaining: the 8821AE per-chip algorithm (future work) |
+| `bt_coexistence` | RTL8723AE/BE and RTL8821AE source owners and native call sites are linked. AE uses its original retained coex/mailbox under separate NASR legacy20 qualification; BE retains its one-/two-antenna owner; 8821AE has distinct source one-/two-antenna programs, original RX/H2C ownership and optional fresh N21C20MHz qualification. Missing records retain closed/coarse admission. New native validation, actual measured assets, physical concurrency and broader qualified profiles remain pending. |
 | `dynamic_antenna_selection` | Native factory type1/2 hardware diversity and SMART type4, actual PHY mux/descriptor/training/restore and separate signed NEAN per-selector/thermal full-program qualification are implemented above, pending release compilation/native acceptance. Original static records remain unchanged; board measurements and physical mapping/RF acceptance remain external |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; RTL8192DE 5 GHz channel operation delivered (#2026 prepare-layer admission; #2089 interface allow_channel + cold bring-up default channel 36). Still blocked on the rtl8821ae chip runtime (RTL8188EE is 2.4GHz-only) |
 | `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |

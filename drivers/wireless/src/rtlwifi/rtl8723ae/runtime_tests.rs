@@ -12,6 +12,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     R8(u16),
+    R16(u16),
+    Master(bool),
     R32(u16),
     W(u8, u16, u32),
     Delay(u64),
@@ -650,3 +652,48 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723ae",
     smoke_rtl8723ae_native_cold_firmware_order_and_refusals
 );
+
+#[path = "retained_tests.rs"]
+mod retained_tests;
+
+fn smoke_ae_native_gpio_polarity_off_and_lost_observations() -> TestResult {
+    for high in [false, true] {
+        let version = version::Version::from_registers(
+            version::BT_FUNC,
+            || 0,
+            || if high { version::WL_HWPDN_SL } else { 0 },
+        )
+        .unwrap();
+        for (pins, want) in [(0, high), (2, !high)] {
+            let port = Port::new();
+            port.set8(0x62, 0x0e);
+            port.set8(0x60, pins);
+            port.set8(0x6f, 0x80); // Unrelated EE predicate cannot authorize AE.
+            kt_assert_eq!(radio_switch::on(&port, version).is_ok(), want);
+            kt_assert_eq!(port.writes(), vec![(1, 0x62, 0x0c)]);
+            kt_assert!(!port
+                .0
+                .lock()
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::R32(0x6c))));
+        }
+        let direction = Port::new();
+        direction.set8(0x62, 0xff);
+        kt_assert_eq!(
+            radio_switch::on(&direction, version),
+            Err(Error::Access(AccessError::Gone))
+        );
+        kt_assert!(direction.writes().is_empty());
+        let pins = Port::new();
+        pins.set8(0x62, 2);
+        pins.set8(0x60, 0xff);
+        kt_assert_eq!(
+            radio_switch::on(&pins, version),
+            Err(Error::Access(AccessError::Gone))
+        );
+        kt_assert_eq!(pins.writes(), vec![(1, 0x62, 0)]);
+    }
+    TestResult::Pass
+}
+kernel_test_in! {"drivers/wireless/rtlwifi/rtl8723ae",smoke_ae_native_gpio_polarity_off_and_lost_observations}

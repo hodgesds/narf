@@ -12,12 +12,15 @@ pub(super) enum Admission {
 enum Slot {
     Probing(BusAddr),
     Bound(RtlwifiDevice),
-    Quarantined(BusAddr),
+    Quarantined(
+        BusAddr,
+        Option<alloc::sync::Arc<super::super::rtl8723ae::retained::Retained>>,
+    ),
 }
 impl Slot {
     fn address(&self) -> BusAddr {
         match self {
-            Self::Probing(a) | Self::Quarantined(a) => *a,
+            Self::Probing(a) | Self::Quarantined(a, _) => *a,
             Self::Bound(d) => d.bus_addr,
         }
     }
@@ -53,6 +56,21 @@ impl Bindings {
         if !matches!(slot, Slot::Probing(_)) {
             return false;
         }
+        if let Some(ae) = &device.ae {
+            let Some(firmware) = &device.firmware else {
+                return false;
+            };
+            if device
+                .native
+                .as_ref()
+                .is_none_or(|native| !ae.same_native(native))
+            {
+                return false;
+            }
+            if !ae.commit(device.bus_addr, firmware) {
+                return false;
+            }
+        }
         *slot = Slot::Bound(device);
         true
     }
@@ -68,19 +86,26 @@ impl Bindings {
         if !matches!(slot, Slot::Bound(_)) {
             return None;
         }
-        match core::mem::replace(slot, Slot::Quarantined(address)) {
+        let ae = match &*slot {
+            Slot::Bound(device) => device.ae.clone(),
+            _ => None,
+        };
+        if let Some(ae) = &ae {
+            ae.retire();
+        }
+        match core::mem::replace(slot, Slot::Quarantined(address, ae)) {
             Slot::Bound(device) => Some(device),
             _ => unreachable!(),
         }
     }
     pub(super) fn reclaimed(&mut self, address: BusAddr) {
         self.slots
-            .retain(|slot| !matches!(slot, Slot::Quarantined(a) if *a == address));
+            .retain(|slot| !matches!(slot, Slot::Quarantined(a, None) if *a == address));
     }
     pub(super) fn quarantined(&self, address: BusAddr) -> bool {
         self.slots
             .iter()
-            .any(|slot| matches!(slot, Slot::Quarantined(a) if *a == address))
+            .any(|slot| matches!(slot, Slot::Quarantined(a, _) if *a == address))
     }
     pub(super) fn first(&self) -> Option<&RtlwifiDevice> {
         self.slots.iter().find_map(|slot| match slot {

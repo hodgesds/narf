@@ -96,6 +96,17 @@ where
         let retired = {
             let mut storage = self.prepared.lock().await;
             if let Some(old) = storage.as_mut() {
+                if old.be_tracking_bound()
+                    && matches!(
+                        old.station_phase(),
+                        station::Phase::Open | station::Phase::Passive | station::Phase::Dormant
+                    )
+                {
+                    if let Err(reason) = self.be_restore_for_lifecycle(old).await {
+                        old.abort_station();
+                        return Err(reason);
+                    }
+                }
                 old.abort_station();
                 self.withdraw_interrupts(old);
                 if !old.retire().await {

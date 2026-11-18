@@ -10,6 +10,23 @@
 //! workqueues have no NARF counterpart — so a `SleepDue` decision
 //! only records the sw-LPS state, it does not sleep the radio.
 //!
+//! Native sleep also lacks a source-defined on-air Null-PM ACK producer.
+//! Linux 7.3-rc4 rtl8192de/trx.c:44..229 never invokes rtl_set_tx_report
+//! or writes SPE_RPT / SW_DEFINE. The actual RX parser is
+//! rtl8192d/trx_common.c:384..431 (sw.c:209), which never assigns
+//! packet_report_type; pci.c:979..987 schedules mailbox C2H work only
+//! for RTL8723AE. Merely enabling IMR_C2HCMD (DE sw.c:121) supplies no
+//! event parser. Null host retirement instead queues rtl_tx_ackqueue
+//! (pci.c:511..549), whose timeout reports failure (base.c:1939..1955).
+//! mac80211/mlme.c:3948..3966 requires NULLFUNC_ACKED before CONF_PS;
+//! status.c:1120..1129 sets it only from a real TX_STAT_ACK receipt.
+//! Neither DD, a timer, the common software sequence helper nor
+//! rtl_check_tx_report_acked's unrelated key-disable timeout proves AP
+//! buffering agreement. No RF sleep/awake execution is authorized here
+//! until an actual DE firmware/descriptor receipt protocol is sourced.
+//! The retained native packet queue also rejects PM=1 frames; this
+//! decision-only module cannot change that gate or the requested PS state.
+//!
 //! TIM element layout (IEEE 802.11 §9.4.2.5; the low-order bit of
 //! the first partial-bitmap octet is AID `bitmap_control.offset ×
 //! 16`, bits LSB-first, octet `N/8`, bit `N mod 8`): element ID 5,

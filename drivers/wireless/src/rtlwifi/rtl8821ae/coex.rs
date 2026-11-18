@@ -1,27 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8821AE Bluetooth-coexistence owner (pass 1).
+//! RTL8821AE retained Bluetooth-coexistence owner.
 //!
-//! Linux `rtl8821ae/btc.c::rtl8821ae_btc_init` wraps the same coexist
-//! core as the 8723B algorithms; the full-algorithm form in NARF is the
-//! 8723BE owner (`rtl8723be/coex.rs`), which is the TSV `bt_coexistence`
-//! row's scope and is deliberately untouched here. This module is the
-//! 8821AE pass-1 form: admission of BT-strapped boards, the LPS gate,
-//! and the TDMA decision matrix (`btcoex::pattern_for`). A
-//! per-traffic-class 8821A algorithm (a `halbtc8821a1ant`/`2ant`
-//! equivalent with its own TDMA tables) does not exist in-tree and is
-//! future work; the matrix's three coarse patterns (Wi-Fi-only,
-//! BT-only, shared 50/50) are the bring-up policy `btcoex.rs` already
-//! carries for combo silicon.
+//! The original coarse matrix/LPS policy remains available without N21C.
+//! Full source one/two-antenna algorithms live in btcoex/b8821a{1,2}ant;
+//! native activation additionally needs a complete actual BT patch/build
+//! observation and the separately measured current coex_program::Program.
+//! Both modes keep the original board/controller/mailbox histories.
 //!
 //! Board facts, all grounded (see `Owner::bind`):
 //! - `bt_exist` from the `REG_MULTI_FUNC_CTRL` BIT(18) strap
 //!   (`prepare::RTL8821AE_BT_FUNCTION`), read in
 //!   `configure_rtl8821ae_mac`; the owner is only constructed for
 //!   strapped boards.
-//! - Single antenna: the 8821AE station is 1T1R (rtlwifi.md's 8821AE
-//!   rate-mask section describes a "2.4 GHz B/G/N 1T1R station"), so
-//!   `ant_num` is 1 and the antenna sits at the main port (the same
-//!   default `BtCoexist::bind` applies to `btdm_ant_pos`).
+//! - Antenna algorithm: actual factory EFUSE0xc3 BIT0 selects ANT_X1(1)
+//!   or ANT_X2(0), as `_rtl8821ae_read_bt_coexist_info_from_hwpg` does.
+//!   Wi-Fi RF stream count does not establish the shared BT antenna count.
+//!   `BtCoexist::bind` applies the source's default main/aux position.
 //! - `package_type` 0: "RTL8821AE never sets `package_type`"
 //!   (`rtl8821ae/headerfile.rs`), so the bind's non-TFBGA branch
 //!   applies.
@@ -41,6 +35,7 @@
 
 use crate::rtlwifi::btcoex::btc::{BtCoexist, ChipInterface, ChipType, HwPg};
 use crate::rtlwifi::btcoex::{pattern_for, BtState, TdmaPattern, WifiState};
+use alloc::sync::Arc;
 
 /// The 8821AE coexistence owner: bound `btc_coexist` state plus the
 /// current Wi-Fi/BT states the decision matrix reads.
@@ -50,16 +45,20 @@ pub struct Owner {
     pub btc: BtCoexist,
     wifi: WifiState,
     bt: BtState,
+    pub(in crate::rtlwifi) factory: Option<Arc<crate::rtlwifi::efuse::Factory>>,
+    pub(in crate::rtlwifi) full: Option<super::coex_dispatch::Dispatch>,
+    pub(in crate::rtlwifi) program: Option<Arc<super::coex_program::Program>>,
+    pub(in crate::rtlwifi) probed: bool,
 }
 
 impl Owner {
     /// Bind the owner for a BT-strapped 8821AE board (board facts per
     /// the module documentation).
-    pub fn bind() -> Self {
+    pub fn bind(antenna_setting: u8) -> Self {
         Self {
             btc: BtCoexist::bind(HwPg {
                 bt_exist: true,
-                ant_num: 1,
+                ant_num: if antenna_setting & 1 != 0 { 1 } else { 2 },
                 single_ant_path: 0,
                 chip_type: ChipType::Rtl8821,
                 package_type: 0,
@@ -68,7 +67,20 @@ impl Owner {
             }),
             wifi: WifiState::Idle,
             bt: BtState::Idle,
+            factory: None,
+            full: None,
+            program: None,
+            probed: false,
         }
+    }
+
+    /// The already identity-checked factory snapshot from the retained MAC
+    /// continuation, including the raw antenna byte. This is metadata, not
+    /// a new independent controller, permission or replacement authority.
+    pub(crate) fn bind_factory(factory: &crate::rtlwifi::efuse::Factory) -> Self {
+        let mut owner = Self::bind(factory.logical[0xc3]);
+        owner.factory = Some(Arc::new(factory.clone()));
+        owner
     }
 
     /// Current TDMA pattern from the decision matrix.

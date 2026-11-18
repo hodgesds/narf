@@ -220,6 +220,9 @@ struct Curve {
 
 pub struct Calibration {
     identity: [u8; 32],
+    /// Exact signed NAPC bytes; normal-power measurements are never silently
+    /// upgraded into qualification for a different RF/coexistence program.
+    digest: [u8; 32],
     power: FactoryPower,
     swing: u32,
     swing_5g: u32,
@@ -317,6 +320,23 @@ fn tx_swing(logical: &[u8], at: usize) -> Result<u32, Error> {
 }
 
 impl Calibration {
+    /// Attach a real revocable source to inert verified-metadata fixtures.
+    /// This helper cannot construct native PCI or measured RF authority.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn with_fixture_source(mut self, cap: Cap<FirmwareBlob, Read>) -> Self {
+        self.authority = Some(cap);
+        self
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub(crate) fn antenna_qdb(&self) -> i16 {
+        self.antenna
+    }
+    pub(crate) fn qualified_qdbm(&self) -> i16 {
+        self.qualified
+    }
     fn current(&self) -> Result<(), Error> {
         if let Some(cap) = &self.authority {
             return cap.invoke(NoopOp).map_err(|_| Error::Authority);
@@ -465,8 +485,11 @@ impl Calibration {
             }
             curves.push(Curve { op, output });
         }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(bytes);
         Ok(Self {
             identity,
+            digest: hash.finalize(),
             power,
             swing,
             swing_5g,

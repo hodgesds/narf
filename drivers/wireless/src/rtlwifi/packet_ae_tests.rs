@@ -1,5 +1,8 @@
 //! RTL8821AE native packet/station owner over a register-file and DMA model.
 //! Written; not yet executed (no QEMU in this lane).
+#[path = "rtl8821ae/coex_native_tests.rs"]
+mod coex_native;
+
 use super::super::super::super::{
     channel_power::tests::domain,
     efuse::Factory,
@@ -116,6 +119,13 @@ impl AePort {
 impl Io for AePort {
     fn read8(&self, reg: u16) -> Result<u8, AccessError> {
         Ok(self.reg8(reg))
+    }
+    fn read16(&self, reg: u16) -> Result<u16, AccessError> {
+        let model = self.0.lock();
+        let at = usize::from(reg);
+        Ok(u16::from_le_bytes(
+            model.regs[at..at + 2].try_into().unwrap(),
+        ))
     }
     fn read32(&self, reg: u16) -> Result<u32, AccessError> {
         Ok(self.reg32(reg))
@@ -480,7 +490,7 @@ fn smoke_rtl8821ae_coex_bt_only_holds_lps_off() -> TestResult {
     // BT-strapped owner with BT streaming: enter is a held-off no-op —
     // Ok, but `leisure` stays false and the phase stays Running.
     owner.rtl8821ae_coex = Some(Box::new(
-        super::super::super::super::rtl8821ae::coex::Owner::bind(),
+        super::super::super::super::rtl8821ae::coex::Owner::bind(1),
     ));
     owner
         .rtl8821ae_coex
@@ -531,6 +541,45 @@ fn retire(owner: &mut Prepared<AePort, Block>, queue: usize, slot: usize) -> Opt
     owner.tx[queue].write32(slot * 64, dw0 & !OWN).unwrap();
     owner.poll_delivery().ok().flatten().map(|d| d.id)
 }
+
+/// RX packet length includes FCS. A runt cannot become a short header
+/// indexed as a complete MPDU after the four FCS bytes are removed.
+fn smoke_rtl8821ae_runt_after_fcs_does_not_escape_or_panic() -> TestResult {
+    let Some((mut owner, _)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start");
+    }
+    for length in 24..28 {
+        let mut bytes = vec![0; length];
+        bytes[0] = 0x80;
+        match rx_buffer(&mut owner, &bytes, length as u32, 0, 0) {
+            Ok(step) if step.consumed && step.packet.is_none() => {}
+            _ => {
+                return TestResult::Fail(
+                    "runt must be consumed without indexing/delivering a short header",
+                )
+            }
+        }
+    }
+    let mut bytes = [0; 28];
+    bytes[0] = 0x80;
+    match rx_buffer(&mut owner, &bytes, 28, 0, 0) {
+        Ok(step)
+            if step.consumed
+                && step
+                    .packet
+                    .as_ref()
+                    .is_some_and(|packet| packet.bytes.len() == 24) => {}
+        _ => return TestResult::Fail("complete MAC header plus FCS must remain accepted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_runt_after_fcs_does_not_escape_or_panic
+);
 
 fn smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation() -> TestResult {
     let Some((mut owner, port)) = owner() else {
@@ -644,4 +693,141 @@ fn smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation() -> Test
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation
+);
+
+/// The MP source consumes the original DMA ring using the ordinary RX
+/// parser/rearm function. DATA and unrelated reports survive the wait.
+fn smoke_rtl8821ae_real_rx_mp_pump_retains_data_and_report_order() -> TestResult {
+    use super::super::super::super::rtl8821ae::{
+        btc::{BtMpSource, RxBtMp},
+        c2h,
+    };
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start");
+    }
+    owner.packet.ae.coex_rx = Some(Box::new(super::CoexRx::default()));
+    owner.packet.ae.coex_rx.as_mut().unwrap().capture = true;
+    let mut beacon = [0; 28];
+    beacon[0] = 0x80;
+    let tx = [c2h::C2H_TX_REPORT, 0, 0, 0, 2, 0, 0, 0, 4];
+    let info = [c2h::C2H_BT_INFO, 0, 0, 7, 0, 0, 0];
+    let mp = [c2h::C2H_BT_MP, 0, 1, 0, 0xe0, 0x34, 0x12, 7];
+    for (slot, bytes) in [&beacon[..], &tx[..], &info[..], &mp[..]]
+        .into_iter()
+        .enumerate()
+    {
+        owner.buffers[slot].write_bytes(0, bytes).unwrap();
+        let ring = owner.receive.as_mut().unwrap();
+        ring.write32(
+            slot * 32,
+            bytes.len() as u32 | if slot == 3 { 1 << 30 } else { 0 },
+        )
+        .unwrap();
+        ring.write32(slot * 32 + 8, if slot == 0 { 0 } else { 1 << 28 })
+            .unwrap();
+    }
+    let got = {
+        let rx = owner.packet.ae.coex_rx.as_mut().unwrap();
+        let mut pump = super::RxPump {
+            io: &owner.io,
+            ring: owner.receive.as_mut().unwrap(),
+            buffers: &mut owner.buffers,
+            next: &mut owner.packet.receive,
+            depth: owner.depth,
+            remaining: 0,
+            policy: super::RxPolicy {
+                channel: 1,
+                ht: false,
+                forty: false,
+                eighty: false,
+                vht: false,
+            },
+            inbox: &mut rx.inbox,
+            deferred: &mut rx.deferred,
+            traffic: &mut rx.traffic,
+            program: None,
+            observed_bt: None,
+        };
+        run(RxBtMp {
+            io: &port,
+            source: &mut pump,
+        }
+        .next_bt_mp(0))
+    };
+    if !matches!(got, Ok(Some(report)) if report.body() == &mp[2..]) || owner.packet.receive != 0 {
+        return TestResult::Fail("MP reply from original ring / wrap");
+    }
+    for slot in 0..4 {
+        if owner.receive.as_ref().unwrap().read32(slot * 32).unwrap() & OWN == 0 {
+            return TestResult::Fail("original RX slot not rearmed");
+        }
+    }
+    let rx = owner.packet.ae.coex_rx.as_mut().unwrap();
+    for expected in [&tx[..], &info[..]] {
+        if !matches!(rx.inbox.pop(), Some((n, bytes)) if &bytes[..n] == expected) {
+            return TestResult::Fail("non-MP reports lost/reordered/repeated");
+        }
+    }
+    if rx.inbox.len() != 0 || rx.deferred.len() != 1 {
+        return TestResult::Fail("finite report/data queues");
+    }
+    match owner.poll_receive_step() {
+        Ok(step)
+            if step.consumed
+                && step
+                    .packet
+                    .as_ref()
+                    .is_some_and(|packet| packet.bytes == beacon[..24] && packet.channel == 1) => {}
+        _ => {
+            return TestResult::Fail(
+                "ordinary DATA/management bytes must survive for security processing",
+            )
+        }
+    }
+    match owner.poll_receive_step() {
+        Ok(step) if !step.consumed && step.packet.is_none() => {}
+        _ => return TestResult::Fail("deferred frame delivered twice"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_real_rx_mp_pump_retains_data_and_report_order
+);
+
+fn smoke_rtl8821ae_complete_bt_c2h_and_oversize_refusal() -> TestResult {
+    use super::super::super::super::rtl8821ae::{btc::C2H_MAX, c2h};
+    let Some((mut owner, _)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start");
+    }
+    owner.packet.ae.coex_rx = Some(Box::new(super::CoexRx::default()));
+    owner.packet.ae.coex_rx.as_mut().unwrap().capture = true;
+    let mut packet = [0x5a; C2H_MAX];
+    packet[0] = c2h::C2H_BT_MP;
+    packet[1] = 7;
+    packet[C2H_MAX - 1] = 0xa7;
+    if !matches!(rx_buffer(&mut owner, &packet, C2H_MAX as u32, 1 << 28, 0), Ok(step) if step.consumed && step.packet.is_none())
+        || !matches!(owner.packet.ae.coex_rx.as_mut().unwrap().inbox.pop(), Some((n, bytes)) if n == C2H_MAX && bytes == packet)
+    {
+        return TestResult::Fail("two-byte header plus full 16-byte BT body");
+    }
+    let oversized = [c2h::C2H_BT_MP; C2H_MAX + 1];
+    if !matches!(
+        rx_buffer(&mut owner, &oversized, oversized.len() as u32, 1 << 28, 0),
+        Err(Error::Descriptor)
+    ) || owner.phase != Phase::Failed
+    {
+        return TestResult::Fail("oversized BT report accepted as valid truncated prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_complete_bt_c2h_and_oversize_refusal
 );

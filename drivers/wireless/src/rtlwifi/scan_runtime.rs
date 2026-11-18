@@ -4,6 +4,57 @@
 use super::*;
 const MAX_BSS: usize = 32;
 const CACHE_MS: u64 = 10_000;
+
+/// One scan may replace the physical owner at each channel. Cancellation
+/// closes only the last exact full-coexistence owner this scan captured.
+struct CoexScanAttempt<
+    'a,
+    I: Port<Buffer = M> + 'static,
+    M: Memory + 'static,
+    E: Environment + 'static,
+> {
+    device: &'a Device<I, M, E>,
+    owner: Option<Arc<AtomicBool>>,
+    park: Option<super::super::prepare::packet::TerminalPark>,
+    generation: u64,
+    armed: bool,
+}
+impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static>
+    CoexScanAttempt<'_, I, M, E>
+{
+    fn capture(&mut self, owner: &Prepared<I, M>) {
+        if owner.station_full_coex() {
+            self.owner = Some(owner.station_cancellation());
+            self.park = owner.ae_coex_terminal_park();
+            self.generation = self.device.lifecycle.generation();
+            self.armed = true;
+        }
+    }
+}
+impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Drop
+    for CoexScanAttempt<'_, I, M, E>
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(owner) = &self.owner {
+            owner.store(true, Ordering::Release);
+        }
+        // Generation advancement uses this same gate. A stale callback
+        // must never park physical PCI after a new owner has been admitted.
+        let publication = self.device.admission.publication.lock();
+        if self.device.lifecycle.generation() == self.generation {
+            self.device.admission.abort.store(true, Ordering::Release);
+            self.device.admission.closed.store(true, Ordering::Release);
+            if let Some(park) = &self.park {
+                let _ = park.park();
+            }
+            self.device.commit_close(publication);
+        }
+    }
+}
+
 pub(super) struct Observation {
     pub(super) candidate: station::Candidate,
     seen: u64,
@@ -48,17 +99,24 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     /// 5 GHz channel; DFS/NO_IR rules refuse the `NAPC` permission, so such
     /// channels are neither listed nor scanned).
     pub(super) fn available_channels(&self) -> Vec<u32> {
+        let coex_channel = self.coex_channel.load(Ordering::Acquire);
         (1..=11)
             .chain(crate::rtlwifi::rtl8821ae::envelope::CHANNELS_5G)
             .filter(|&channel| {
-                self.environment
-                    .allow_channel(&self.factory, channel)
-                    .is_ok()
+                (coex_channel == 0 || channel == coex_channel)
+                    && self
+                        .environment
+                        .allow_channel(&self.factory, channel)
+                        .is_ok()
             })
             .map(u32::from)
             .collect()
     }
     async fn select_scan_channel(&self, channel: u8) -> Result<(), WirelessError> {
+        let coex_channel = self.coex_channel.load(Ordering::Acquire);
+        if coex_channel != 0 && channel != coex_channel {
+            return Err(WirelessError::NotSupported);
+        }
         self.lifecycle
             .activity_ms
             .store(self.environment.now_ms(), Ordering::Release);
@@ -77,12 +135,35 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         Ok(())
     }
+    async fn select_coex_scan_channel(
+        &self,
+        channel: u8,
+        attempt: &mut CoexScanAttempt<'_, I, M, E>,
+    ) -> Result<(), WirelessError> {
+        self.select_scan_channel(channel).await?;
+        if !attempt.armed {
+            return Ok(());
+        }
+        // A completed driver-owned transition has released its owner lock.
+        // Capture before the next await, including the wait for control.
+        let storage = self.prepared.try_lock().ok_or(WirelessError::Busy)?;
+        if self.lifecycle.rebuilding.load(Ordering::Acquire)
+            || self.lifecycle.channel.load(Ordering::Acquire) != channel
+        {
+            return Err(WirelessError::Busy);
+        }
+        if let Some(owner) = storage.as_ref() {
+            attempt.capture(owner);
+        }
+        Ok(())
+    }
     pub(super) async fn scan_channels(
         &self,
         request: ScanRequest,
     ) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
         let mut channels = requested_channels(&request)?;
+        let explicit = !channels.is_empty();
         if channels.is_empty() {
             channels = self
                 .available_channels()
@@ -93,6 +174,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if channels.is_empty() {
             return Err(WirelessError::NotSupported);
         }
+        let coex_channel = self.coex_channel.load(Ordering::Acquire);
+        if coex_channel != 0 && channels.iter().any(|&channel| channel != coex_channel) {
+            return Err(WirelessError::NotSupported);
+        }
         // Reject the entire explicit plan before the first retune or probe.
         for &channel in &channels {
             self.environment
@@ -100,18 +185,49 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map_err(error)?;
         }
         let _scan = self.scan_request.lock().await;
+        let mut attempt = CoexScanAttempt {
+            device: self,
+            owner: None,
+            park: None,
+            generation: self.lifecycle.generation(),
+            armed: false,
+        };
+        // Initial ready may discover the first full N21C program. Resolve
+        // its fixed operating point before declaring scan-start, so the
+        // default NAPC channel list cannot trigger an unqualified retune.
+        {
+            let mut storage = self.prepared.lock().await;
+            if let Some(owner) = storage
+                .as_mut()
+                .filter(|owner| owner.chip() == super::super::prepare::Chip::Rtl8821ae)
+            {
+                self.ready(owner).await.map_err(error)?;
+            }
+        }
+        let coex_channel = self.coex_channel.load(Ordering::Acquire);
+        if coex_channel != 0 {
+            if explicit && channels.iter().any(|&channel| channel != coex_channel) {
+                return Err(WirelessError::NotSupported);
+            }
+            channels.retain(|&channel| channel == coex_channel);
+        }
         self.scan_cache.lock().clear();
         // `btc_scan_notify(1)` (`core.c::rtl_op_sw_scan_start`): the scan
         // runs on the live owner, so the coexistence algorithm can yield
         // the antenna. The (0) notify runs at the successful end below; a
         // failed scan aborts and closes the owner, leaving no live coex
         // owner to notify.
-        self.be8723_scan_notify(true).await.map_err(error)?;
+        self.coex_scan_notify(true, &mut attempt)
+            .await
+            .map_err(error)?;
         let home = self.lifecycle.channel.load(Ordering::Acquire);
         let multiple = channels.len() > 1;
         let mut observations: Vec<Observation> = Vec::new();
         for channel in channels {
-            for candidate in self.scan_one(&request, channel, dwell).await? {
+            for candidate in self
+                .scan_one(&request, channel, dwell, &mut attempt)
+                .await?
+            {
                 let entry = Observation {
                     candidate,
                     seen: self.environment.now_ms(),
@@ -132,40 +248,74 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         // A scan over several channels restores its original operating
         // channel. No old cache is injected into the fresh station owner.
         if multiple {
-            self.select_scan_channel(home).await?;
+            self.select_coex_scan_channel(home, &mut attempt).await?;
         }
         let now = self.environment.now_ms();
         observations.retain(|entry| entry.current(now));
         let result = observations.iter().map(Observation::info).collect();
         *self.scan_cache.lock() = observations;
-        self.be8723_scan_notify(false).await.map_err(error)?;
+        self.coex_scan_notify(false, &mut attempt)
+            .await
+            .map_err(error)?;
+        attempt.armed = false;
         Ok(result)
     }
     /// `btc_scan_notify` for the RTL8723BE owner, if one is live
     /// (`ready()` is the scan's own admission step, already run per channel
     /// by `scan_one`; running it here too is a no-op on a live owner). Any
     /// other chip, or no owner, is a no-op.
-    async fn be8723_scan_notify(&self, start: bool) -> Result<(), Error> {
+    async fn coex_scan_notify(
+        &self,
+        start: bool,
+        attempt: &mut CoexScanAttempt<'_, I, M, E>,
+    ) -> Result<(), Error> {
         let mut storage = self.prepared.lock().await;
         let Some(owner) = storage.as_mut() else {
             return Ok(());
         };
-        if owner.chip() != super::super::prepare::Chip::Rtl8723be {
+        if !matches!(
+            owner.chip(),
+            super::super::prepare::Chip::Rtl8723be | super::super::prepare::Chip::Rtl8821ae
+        ) {
             return Ok(());
         }
         self.ready(owner).await?;
-        owner
-            .be8723_scan_notify(start)
-            .await
-            .map_err(|_| Error::State)
+        if owner.station_full_coex() {
+            attempt.capture(owner);
+            if !start {
+                let now = self.environment.now_ms();
+                let count = {
+                    self.scan_cache
+                        .lock()
+                        .iter()
+                        .filter(|entry| entry.current(now))
+                        .count()
+                        .min(255) as u8
+                };
+                owner.station_8821_scan_count(count)?;
+            }
+            owner
+                .station_8821_notify(
+                    super::super::rtl8821ae::coex_runtime::Notify::Scan(start),
+                    &self.environment,
+                )
+                .await
+        } else if owner.chip() == super::super::prepare::Chip::Rtl8723be {
+            owner
+                .be_tracking_notify(station::BeTrackingNotice::Scan(start), &self.environment)
+                .await
+        } else {
+            Ok(())
+        }
     }
     async fn scan_one(
         &self,
         request: &ScanRequest,
         channel: u8,
         dwell: u64,
+        scan: &mut CoexScanAttempt<'_, I, M, E>,
     ) -> Result<Vec<station::Candidate>, WirelessError> {
-        self.select_scan_channel(channel).await?;
+        self.select_coex_scan_channel(channel, scan).await?;
         let _control = self.lifecycle.control.lock().await;
         if self.lifecycle.channel.load(Ordering::Acquire) != channel {
             return Err(WirelessError::Busy);
@@ -182,6 +332,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 WirelessError::Busy
             })?;
         self.ready(owner).await.map_err(error)?;
+        scan.capture(owner);
         if owner.station_phase() != station::Phase::Passive {
             return Err(WirelessError::Busy);
         }
@@ -192,6 +343,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             armed: true,
         };
         let result = async {
+            if owner.station_full_coex() && !owner.station_8821_scanning() {
+                owner
+                    .station_8821_notify(
+                        super::super::rtl8821ae::coex_runtime::Notify::Scan(true),
+                        &self.environment,
+                    )
+                    .await?;
+            }
             if request.active {
                 if request.ssids.is_empty() {
                     owner.probe_station(&[], &self.environment).await?;
@@ -202,6 +361,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }
             let deadline = self.environment.now_ms().saturating_add(dwell);
             loop {
+                owner.station_coex_service(&self.environment).await?;
                 owner.progress_station(&self.environment)?;
                 if self.environment.now_ms() >= deadline {
                     break;
@@ -271,6 +431,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         request: &AssociateRequest,
     ) -> Result<(), WirelessError> {
         let channel = u8::try_from(request.channel).map_err(|_| WirelessError::NotSupported)?;
+        let coex_channel = self.coex_channel.load(Ordering::Acquire);
+        if coex_channel != 0 && channel != coex_channel {
+            return Err(WirelessError::NotSupported);
+        }
         if crate::rtlwifi::rtl8821ae::envelope::station_frequency_mhz(channel)
             != Some(request.frequency_mhz)
             || request.ssid.len() > 32

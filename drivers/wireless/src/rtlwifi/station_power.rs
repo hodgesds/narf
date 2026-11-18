@@ -23,10 +23,13 @@ use alloc::sync::Arc;
 pub(crate) enum Base {
     Rtl8188ee(Arc<channel_power::Calibration>),
     Rtl8821ae(Arc<envelope::Calibration>),
+    Rtl8821aeCoex(Arc<super::rtl8821ae::coex_program::Program>),
     Rtl8192ee(Arc<ee92::Calibration>),
     Rtl8192ce(Arc<ce92::Calibration>),
     Rtl8192de(Arc<de92::Calibration>),
     Rtl8723be(Arc<be8723::Calibration>),
+    Rtl8723beTracking(Arc<super::rtl8723be::tracking::Grant>),
+    Rtl8723ae(Arc<super::rtl8723ae::station_policy::Program>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +40,7 @@ pub(crate) enum Grant {
     Rtl8192ce(ce92::Permission),
     Rtl8192de(de92::Permission),
     Rtl8723be(be8723::Permission),
+    Rtl8723ae(super::rtl8723ae::station_policy::Grant),
 }
 
 impl Grant {
@@ -48,6 +52,7 @@ impl Grant {
             Self::Rtl8192ce(p) => p.channel(),
             Self::Rtl8192de(p) => p.channel(),
             Self::Rtl8723be(p) => p.channel(),
+            Self::Rtl8723ae(p) => p.channel(),
         }
     }
     /// The 88EE permission the 88EE-only grants are checked against.
@@ -58,7 +63,8 @@ impl Grant {
             | Self::Rtl8192ee(_)
             | Self::Rtl8192ce(_)
             | Self::Rtl8192de(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
 }
@@ -70,21 +76,27 @@ impl Base {
         match self {
             Self::Rtl8188ee(base) => Some(base),
             Self::Rtl8821ae(_)
+            | Self::Rtl8821aeCoex(_)
             | Self::Rtl8192ee(_)
             | Self::Rtl8192ce(_)
             | Self::Rtl8192de(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723beTracking(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
     /// The 8821AE `NAPC` calibration.
     pub(crate) fn rtl8821ae(&self) -> Option<&Arc<envelope::Calibration>> {
         match self {
             Self::Rtl8821ae(base) => Some(base),
+            Self::Rtl8821aeCoex(program) => Some(program.base()),
             Self::Rtl8188ee(_)
             | Self::Rtl8192ee(_)
             | Self::Rtl8192ce(_)
             | Self::Rtl8192de(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723beTracking(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
     /// The 8192EE `N92E` calibration.
@@ -93,9 +105,12 @@ impl Base {
             Self::Rtl8192ee(base) => Some(base),
             Self::Rtl8188ee(_)
             | Self::Rtl8821ae(_)
+            | Self::Rtl8821aeCoex(_)
             | Self::Rtl8192ce(_)
             | Self::Rtl8192de(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723beTracking(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
     /// The 8192CE / 8188CE `N92C` calibration.
@@ -104,9 +119,12 @@ impl Base {
             Self::Rtl8192ce(base) => Some(base),
             Self::Rtl8188ee(_)
             | Self::Rtl8821ae(_)
+            | Self::Rtl8821aeCoex(_)
             | Self::Rtl8192ee(_)
             | Self::Rtl8192de(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723beTracking(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
     /// The 8192DE `N92D` calibration.
@@ -115,15 +133,25 @@ impl Base {
             Self::Rtl8192de(base) => Some(base),
             Self::Rtl8188ee(_)
             | Self::Rtl8821ae(_)
+            | Self::Rtl8821aeCoex(_)
             | Self::Rtl8192ee(_)
             | Self::Rtl8192ce(_)
-            | Self::Rtl8723be(_) => None,
+            | Self::Rtl8723be(_)
+            | Self::Rtl8723beTracking(_)
+            | Self::Rtl8723ae(_) => None,
         }
     }
     /// The 8723BE `NAPC` calibration.
     pub(crate) fn rtl8723be(&self) -> Option<&Arc<be8723::Calibration>> {
         match self {
             Self::Rtl8723be(base) => Some(base),
+            Self::Rtl8723beTracking(grant) => Some(grant.base()),
+            _ => None,
+        }
+    }
+    pub(crate) fn rtl8723be_tracking(&self) -> Option<&Arc<super::rtl8723be::tracking::Grant>> {
+        match self {
+            Self::Rtl8723beTracking(grant) => Some(grant),
             _ => None,
         }
     }
@@ -139,6 +167,18 @@ impl Base {
             (Self::Rtl8188ee(base), _) => base
                 .permission(domain, current.channel())
                 .map(Grant::Rtl8188ee),
+            (Self::Rtl8821aeCoex(program), Grant::Rtl8821ae(p)) if p == program.permission() => {
+                program
+                    .base()
+                    .permission_for(domain, p.operating())
+                    .and_then(|current| {
+                        if current == p {
+                            Ok(Grant::Rtl8821ae(current))
+                        } else {
+                            Err(channel_power::Error::Policy)
+                        }
+                    })
+            }
             (Self::Rtl8821ae(base), Grant::Rtl8821ae(p)) => base
                 .permission_for(domain, p.operating())
                 .map(Grant::Rtl8821ae),
@@ -151,15 +191,28 @@ impl Base {
             (Self::Rtl8192de(base), Grant::Rtl8192de(p)) => base
                 .permission_for(domain, p.operating())
                 .map(Grant::Rtl8192de),
+            (Self::Rtl8723ae(base), Grant::Rtl8723ae(_)) => base
+                .grant_for(domain)
+                .map(Grant::Rtl8723ae)
+                .map_err(|error| match error {
+                    prepare::Error::Power(error) => error,
+                    _ => channel_power::Error::Authority,
+                }),
+            (Self::Rtl8723beTracking(grant), Grant::Rtl8723be(p)) => grant
+                .permission_for(domain, p.operating())
+                .map(Grant::Rtl8723be),
             (Self::Rtl8723be(base), Grant::Rtl8723be(p)) => base
                 .permission_for(domain, p.operating())
                 .map(Grant::Rtl8723be),
             (
                 Self::Rtl8821ae(_)
+                | Self::Rtl8821aeCoex(_)
                 | Self::Rtl8192ee(_)
                 | Self::Rtl8192ce(_)
                 | Self::Rtl8192de(_)
-                | Self::Rtl8723be(_),
+                | Self::Rtl8723be(_)
+                | Self::Rtl8723beTracking(_)
+                | Self::Rtl8723ae(_),
                 _,
             ) => Err(channel_power::Error::Identity),
         }
@@ -171,10 +224,13 @@ impl Base {
         match self {
             Self::Rtl8188ee(base) => base.with_current(operation),
             Self::Rtl8821ae(base) => base.with_current(operation),
+            Self::Rtl8821aeCoex(program) => program.invoke(operation),
             Self::Rtl8192ee(base) => base.with_current(operation),
             Self::Rtl8192ce(base) => base.with_current(operation),
             Self::Rtl8192de(base) => base.with_current(operation),
             Self::Rtl8723be(base) => base.with_current(operation),
+            Self::Rtl8723beTracking(grant) => grant.with_current(operation),
+            Self::Rtl8723ae(base) => base.with_current(operation),
         }
     }
 }
@@ -338,6 +394,70 @@ pub(crate) async fn wait_rtl8723be<F: core::future::Future<Output = Result<(), p
         match base.with_current(operation) {
             Ok(core::task::Poll::Ready(result)) => core::task::Poll::Ready(result),
             Ok(core::task::Poll::Pending) => core::task::Poll::Pending,
+            Err(error) => core::task::Poll::Ready(Err(error)),
+        }
+    })
+    .await
+}
+
+/// AE retains its original NAQR completion and separate NASR station program.
+/// Its actual current selected policy and the station's host policy must both
+/// derive the exact programmed grant before each resumed poll.
+pub(crate) async fn wait_rtl8723ae<F: core::future::Future<Output = Result<(), prepare::Error>>>(
+    base: Arc<super::rtl8723ae::station_policy::Program>,
+    grant: super::rtl8723ae::station_policy::Grant,
+    environment: &impl prepare::station::Environment,
+    future: F,
+) -> Result<(), prepare::Error> {
+    let mut future = core::pin::pin!(future);
+    base.wait(
+        grant,
+        core::future::poll_fn(|cx| {
+            let result = (|| {
+                let domain = environment
+                    .domain()
+                    .map_err(|_| prepare::Error::Power(channel_power::Error::Policy))?;
+                if base.grant_for(&domain)? != grant {
+                    return Err(prepare::Error::State);
+                }
+                Ok(future.as_mut().poll(cx))
+            })();
+            match result {
+                Ok(poll) => poll,
+                Err(error) => core::task::Poll::Ready(Err(error)),
+            }
+        }),
+    )
+    .await
+}
+
+/// Full BE NBTH authority accompanies every resumed station poll, not only
+/// the thermal callback. The original permission must remain exact/current.
+pub(crate) async fn wait_rtl8723be_tracking<
+    F: core::future::Future<Output = Result<(), prepare::Error>>,
+>(
+    grant: Arc<super::rtl8723be::tracking::Grant>,
+    permission: be8723::Permission,
+    environment: &impl prepare::station::Environment,
+    future: F,
+) -> Result<(), prepare::Error> {
+    let mut future = core::pin::pin!(future);
+    core::future::poll_fn(|cx| {
+        let result = grant.with_current(|| {
+            let domain = environment
+                .domain()
+                .map_err(|_| prepare::Error::Power(channel_power::Error::Policy))?;
+            if grant
+                .permission_for(&domain, permission.operating())
+                .map_err(prepare::Error::Power)?
+                != permission
+            {
+                return Err(prepare::Error::State);
+            }
+            Ok(future.as_mut().poll(cx))
+        });
+        match result {
+            Ok(poll) => poll,
             Err(error) => core::task::Poll::Ready(Err(error)),
         }
     })

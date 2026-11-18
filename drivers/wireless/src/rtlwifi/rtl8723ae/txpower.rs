@@ -245,6 +245,64 @@ impl Plan {
         }
         out
     }
+
+    /// Exact independently selected per-rate words, not a recomputed base.
+    /// Caller must retain the separate measured/factory qualification.
+    /// Auxiliary source effects remain preparation writes only; they are
+    /// not transmitting rates of the20-rate path-A grant.
+    pub(super) fn bounded(&self, selected: [u8; 20]) -> Result<Self, Error> {
+        let source = self.indices()[0];
+        if selected[3] != 0
+            || selected
+                .iter()
+                .enumerate()
+                .any(|(r, g)| *g > 63 || *g > source[r])
+        {
+            return Err(Error::State);
+        }
+        let mut result = self.clone();
+        result.cck[0] = u32::from_le_bytes([selected[0], selected[1], selected[2], 0]);
+        for (word, rates) in result.ofdm[..4]
+            .iter_mut()
+            .zip(selected[4..].chunks_exact(4))
+        {
+            word[0] = u32::from_le_bytes(rates.try_into().map_err(|_| Error::State)?);
+        }
+        Ok(result)
+    }
+
+    /// Native preparation readback restriction. Checks independent full TXAGC
+    /// words and the actual source MCS7-derived tails; no read grants emission.
+    pub(in crate::rtlwifi) fn verify(&self, io: &impl Io) -> Result<(), Error> {
+        let cck_a = (io.read32(0xe08)? >> 8) & 0xff;
+        let shared = io.read32(0x86c)?;
+        let cck_b = io.read32(0x838)?;
+        if cck_a != self.cck[0] & 0xff
+            || (shared >> 8) != (self.cck[0] >> 8) & 0x00ff_ffff
+            || shared & 0xff != self.cck[1] >> 24
+            || cck_b >> 8 != self.cck[1] & 0x00ff_ffff
+        {
+            return Err(Error::Readback);
+        }
+        for (index, row) in self.ofdm.iter().enumerate() {
+            for (rf, word) in row.iter().enumerate() {
+                if io.read32(if rf == 0 { REG_A[index] } else { REG_B[index] })? != *word {
+                    return Err(Error::Readback);
+                }
+                if index == 3 {
+                    let base = if rf == 0 { 0xc90 } else { 0xc98 };
+                    let mut value = word.to_le_bytes()[3];
+                    for offset in 0..3 {
+                        value = value.saturating_sub(6);
+                        if io.read8(base + offset)? != value {
+                            return Err(Error::Readback);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

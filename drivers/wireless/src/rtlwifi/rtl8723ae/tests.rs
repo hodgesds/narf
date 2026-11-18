@@ -1136,7 +1136,7 @@ fn smoke_rtl8723ae_packet_admission_and_desc() -> TestResult {
         || rx.drv_info_bytes != 16
         || rx.shift != 1
         || rx.payload_offset() != 17
-        || rx.payload_len() != 183
+        || rx.payload_len() != 200
         || !rx.paggr
         || !rx.first_ampdu
         || rx.rate != 12

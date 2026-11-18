@@ -19,7 +19,7 @@ use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     address: u64,
     bytes: Arc<IrqSafeSpinLock<Vec<u8>>>,
 }
@@ -65,19 +65,23 @@ struct Model {
     writes: Vec<(u8, u16, u32)>,
     kicks: Vec<u16>,
     master: bool,
+    events: Vec<(bool, u16)>,
+    yield_delay: bool,
     next: u64,
     deny: bool,
     fail_write32: Option<u16>,
 }
 #[derive(Clone)]
-struct BePort(Arc<IrqSafeSpinLock<Model>>);
+pub(crate) struct BePort(Arc<IrqSafeSpinLock<Model>>);
 impl BePort {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(IrqSafeSpinLock::new(Model {
             regs: vec![0; 0x1000],
             writes: Vec::new(),
             kicks: Vec::new(),
             master: false,
+            events: Vec::new(),
+            yield_delay: false,
             next: 0x10_0000,
             deny: false,
             fail_write32: None,
@@ -141,6 +145,7 @@ impl Io for BePort {
             _ => value,
         };
         m.writes.push((1, reg, value.into()));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
@@ -151,6 +156,7 @@ impl Io for BePort {
         let r = usize::from(reg);
         m.regs[r..r + 2].copy_from_slice(&value.to_le_bytes());
         m.writes.push((2, reg, value.into()));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
@@ -161,12 +167,27 @@ impl Io for BePort {
         let r = usize::from(reg);
         m.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
         m.writes.push((4, reg, value));
+        m.events.push((false, reg));
         Ok(())
     }
     fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), AccessError> {
         Err(AccessError::Access)
     }
-    async fn delay_us(&self, _micros: u64) {}
+    async fn delay_us(&self, _micros: u64) {
+        let yield_delay = self.0.lock().yield_delay;
+        if yield_delay {
+            let mut first = true;
+            core::future::poll_fn(|cx| {
+                if core::mem::take(&mut first) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+        }
+    }
 }
 impl Port for BePort {
     type Buffer = Block;
@@ -188,7 +209,9 @@ impl Port for BePort {
         Ok(())
     }
     fn kick(&self, queue_bit: u16) -> Result<(), Error> {
-        self.0.lock().kicks.push(queue_bit);
+        let mut model = self.0.lock();
+        model.kicks.push(queue_bit);
+        model.events.push((true, queue_bit));
         Ok(())
     }
 }
@@ -291,6 +314,32 @@ fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
 
 fn owner40() -> Option<(Prepared<BePort, Block>, BePort)> {
     owner_with(true)
+}
+
+pub(crate) fn station_fixture() -> Option<(Prepared<BePort, Block>, BePort)> {
+    let (mut owner, port) = owner()?;
+    let factory = be::be_factory();
+    let fixture = be::be_napc_fixture(1, 0, 80, &[(6, 20, 0, be::be_rising)]);
+    let cal = envelope::Calibration::from_verified(&fixture, Some([0xab; 32]), &factory).ok()?;
+    owner
+        .stage_rtl8723be_calibration(cal, &be::be_us_domain())
+        .ok()?;
+    owner.start_packets().ok()?;
+    run(owner.prepare_station_peer(PEER, 0xfff, 0x15, 0x421)).ok()?;
+    Some((owner, port))
+}
+impl BePort {
+    pub(crate) fn special_events(&self) -> Vec<(bool, u16)> {
+        self.0.lock().events.clone()
+    }
+    pub(crate) fn stall_special(&self) {
+        let mut model = self.0.lock();
+        model.regs[0x1cc] = 0xff;
+        model.yield_delay = true;
+    }
+    pub(crate) fn deny_special(&self) {
+        self.0.lock().deny = true;
+    }
 }
 
 #[path = "packet_owner_tests/edca.rs"]
@@ -397,6 +446,70 @@ fn smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx() -> TestResult
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx
+);
+
+/// Use the production queue, rather than a fake with already separate
+/// arrivals/deferred storage: a non-MP report cannot re-enter its own wait.
+fn smoke_rtl8723be_real_c2h_queue_mp_deferral_and_timeout() -> TestResult {
+    use super::super::super::super::rtl8723be::{
+        btc::{BtMpSource, C2hSource, RxBtMp, C2H_MAX},
+        c2h,
+        packet::C2hQueue,
+    };
+    let Some((_, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    let info = [c2h::C2H_BT_INFO, 0, 0, 7, 0, 0, 0];
+    let report = [c2h::C2H_TX_REPORT, 0, 0, 0, 2, 0, 0, 0, 4];
+    let mp = [c2h::C2H_BT_MP, 0, 1, 0, 0xe0, 0x34, 0x12, 7];
+    let mut queue = C2hQueue::default();
+    queue.push(&info);
+    queue.push(&report);
+    let mut bytes = [0; C2H_MAX];
+    for expected in [&info[..], &report[..]] {
+        if queue.poll_c2h(&mut bytes) != Ok(Some(expected.len()))
+            || &bytes[..expected.len()] != expected
+        {
+            return TestResult::Fail("fresh arrival order");
+        }
+        if queue.defer_c2h(expected).is_err() {
+            return TestResult::Fail("defer");
+        }
+    }
+    if queue.poll_c2h(&mut bytes) != Ok(None) || queue.len() != 2 {
+        return TestResult::Fail("deferred packet re-enters the same MP wait");
+    }
+    if run(RxBtMp {
+        io: &port,
+        source: &mut queue,
+    }
+    .next_bt_mp(1))
+        != Ok(None)
+    {
+        return TestResult::Fail("real queue MP timeout");
+    }
+    queue.push(&mp);
+    let got = run(RxBtMp {
+        io: &port,
+        source: &mut queue,
+    }
+    .next_bt_mp(1));
+    if !matches!(got, Ok(Some(value)) if value.body() == &mp[2..]) {
+        return TestResult::Fail("fresh MP bypasses deferred non-MP work");
+    }
+    for expected in [&info[..], &report[..]] {
+        if !matches!(queue.pop(), Some((n, bytes)) if &bytes[..n] == expected) {
+            return TestResult::Fail("deferred reports delivered exactly once in order");
+        }
+    }
+    if !queue.is_empty() {
+        return TestResult::Fail("duplicate report");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_real_c2h_queue_mp_deferral_and_timeout
 );
 
 /// Authentication-time registers, the association `JOINBSSRPT`

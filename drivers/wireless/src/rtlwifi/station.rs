@@ -49,8 +49,20 @@ pub(crate) enum Phase {
     Stopped,
     Failed,
 }
+#[path = "rtl8723ae/station_native.rs"]
+mod ae8723;
 #[path = "antenna_runtime.rs"]
 mod antenna_runtime;
+#[path = "rtl8723be/station_tracking.rs"]
+mod be_tracking;
+pub(crate) use be_tracking::Notice as BeTrackingNotice;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) use be_tracking::{
+    fixture_publication as be_tracking_fixture_publication,
+    shared_native_fixture as be_tracking_native_fixture,
+};
+#[path = "coex_8821_runtime.rs"]
+mod coex_8821_runtime;
 #[path = "ht_width.rs"]
 mod ht_width;
 #[path = "tracking_runtime.rs"]
@@ -58,6 +70,9 @@ mod tracking_runtime;
 pub(crate) type TransitionFuture =
     core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub(crate) trait Environment: Send + Sync {
+    fn pcie_aspm(&self) -> bool {
+        false
+    }
     fn prepare_bus_power(&self) -> impl Future<Output = Result<(), Error>> + Send {
         core::future::ready(Ok(()))
     }
@@ -110,6 +125,15 @@ pub(crate) trait Environment: Send + Sync {
         _base: Arc<super::super::channel_power::Calibration>,
         _ht: Option<Arc<super::super::ht::Grant>>,
     ) -> Result<Option<Arc<super::super::protection::Grant>>, Error> {
+        Ok(None)
+    }
+    /// Optional BE-only full BBSWING/calibration continuation. The native
+    /// implementation selects the ACTUAL original retained firmware Identity.
+    fn rtl8723be_tracking(
+        &self,
+        _base: Arc<super::super::rtl8723be::envelope::Calibration>,
+        _facts: super::super::rtl8723be::tracking::Facts,
+    ) -> Result<Option<Arc<super::super::rtl8723be::tracking::Grant>>, Error> {
         Ok(None)
     }
     fn tracking(
@@ -246,6 +270,12 @@ struct Pending {
     bytes: Vec<u8>,
     deadline: u64,
 }
+/// Owned EAPOL reply awaiting the async coexistence preflight. This is not a
+/// submitted descriptor and carries no fabricated TX/completion identifier.
+struct DeferredEapol {
+    bytes: Vec<u8>,
+    deadline: u64,
+}
 struct Captured {
     frame: Mpdu,
     admitted: bool,
@@ -342,6 +372,15 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
         {
             super::super::station_power::wait_rtl8821ae(base, permission, environment, future).await
         }
+        (Base::Rtl8821aeCoex(program), Grant::Rtl8821ae(permission))
+            if ht.is_none()
+                && protection.is_none()
+                && tracking.is_none()
+                && antenna.is_none()
+                && program.permission() == permission =>
+        {
+            program.wait(future).await
+        }
         (Base::Rtl8192ee(base), Grant::Rtl8192ee(permission))
             if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
         {
@@ -356,6 +395,22 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
             if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
         {
             super::super::station_power::wait_rtl8192de(base, permission, environment, future).await
+        }
+        (Base::Rtl8723ae(base), Grant::Rtl8723ae(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8723ae(base, permission, environment, future).await
+        }
+        (Base::Rtl8723beTracking(base), Grant::Rtl8723be(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8723be_tracking(
+                base,
+                permission,
+                environment,
+                future,
+            )
+            .await
         }
         (Base::Rtl8723be(base), Grant::Rtl8723be(permission))
             if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
@@ -460,6 +515,7 @@ pub(super) struct State {
     pmk: Option<Zeroizing<[u8; 32]>>,
     security: Option<Security>,
     pending: Option<Pending>,
+    deferred_eapol: Option<DeferredEapol>,
     incoming: VecDeque<Captured>,
     received: VecDeque<Vec<u8>>,
     aid: Option<u16>,
@@ -491,6 +547,8 @@ pub(super) struct State {
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Recipient BA sessions by TID (mac80211 `tid_ampdu_rx`).
     rx_ba: [Option<RxBa>; 8],
+    /// `hw->max_rx_aggregation_subframes`, changed by rtl_rx_ampdu_apply.
+    coex_rx_window: u16,
     /// mac80211 `ampdu_mlme.unexpected_agg`: one DELBA per TID.
     unexpected_ba: u16,
     /// Originator BA sessions by TID with mac80211 retry bookkeeping.
@@ -522,6 +580,7 @@ impl State {
             pmk: None,
             security: None,
             pending: None,
+            deferred_eapol: None,
             incoming: VecDeque::new(),
             received: VecDeque::new(),
             aid: None,
@@ -549,6 +608,7 @@ impl State {
             epoch: Arc::new(AtomicU64::new(1)),
             retire: None,
             rx_ba: Default::default(),
+            coex_rx_window: BA_MAX_WINDOW,
             unexpected_ba: 0,
             tx_ba: [None; 8],
             tx_token: 0,
@@ -590,6 +650,7 @@ impl State {
         self.pmk = None;
         self.security = None;
         self.pending = None;
+        self.deferred_eapol = None;
         self.incoming.clear();
         self.received.clear();
         self.aid = None;
@@ -797,9 +858,13 @@ impl State {
         if policy != 1 || buf > BA_MAX_WINDOW {
             return (STATUS_INVALID_QOS, tid, buf);
         }
+        if self.coex_rx_window == 0 {
+            return (STATUS_DECLINED, tid, buf);
+        }
         if buf == 0 {
             buf = BA_MAX_WINDOW;
         }
+        buf = buf.min(self.coex_rx_window);
         let slot = &mut self.rx_ba[usize::from(tid)];
         if let Some(session) = slot {
             if session.token == token {
@@ -877,6 +942,7 @@ impl State {
             && self.native_associated
             && self.admitted
             && self.delivered_reply.is_none()
+            && self.deferred_eapol.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
             && !self.failed.load(Ordering::Acquire)
     }
@@ -1043,6 +1109,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         !self.station.wide_profiles.is_empty()
     }
     pub(crate) fn station_ht_capability(&self) -> Option<[u8; 26]> {
+        if self.rtl8723ae_ht() {
+            return Some(super::super::rtl8723ae::ht::capability().capability_body());
+        }
         self.station.ht.as_ref()?;
         Some(if self.station.wide_profiles.is_empty() {
             association::phy::LocalHt::siso20(false, false).capability_body()
@@ -1090,7 +1159,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     pub(crate) fn native_protection(&self) -> bool {
         matches!(
             self.chip,
-            super::Chip::Rtl8821ae
+            super::Chip::Rtl8723ae
+                | super::Chip::Rtl8821ae
                 | super::Chip::Rtl8192ee
                 | super::Chip::Rtl8192ce
                 | super::Chip::Rtl8723be
@@ -1130,6 +1200,15 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             && self
                 .rtl8723be_power
                 .is_some_and(|p| super::super::rtl8723be::ht::admitted(&p))
+    }
+    pub(crate) fn rtl8723ae_ht(&self) -> bool {
+        self.chip == super::Chip::Rtl8723ae
+            && self.ae8723.as_ref().is_some_and(|state| {
+                state.program.ht20()
+                    && state.grant.permission().admitted_rates()
+                        & super::super::rtl8723ae::ht::MCS0_7
+                        == super::super::rtl8723ae::ht::MCS0_7
+            })
     }
     /// RTL8723BE local HT20 PHY for beacon observation and scanning
     /// (`rtl8723be::ht::local`, RF_1T1R).
@@ -1243,7 +1322,20 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             return 0;
         };
         environment.domain().map_or(0, |domain| {
-            super::super::rtl8821ae::vht::host_capabilities(base, &domain)
+            let caps = super::super::rtl8821ae::vht::host_capabilities(base, &domain);
+            if self.rtl8821ae_full_coex() {
+                caps & match self.rtl8821ae_power.map(|p| p.operating().band) {
+                    Some(super::super::rtl8821ae::envelope::Band::B2g) => {
+                        super::super::rtl8821ae::vht::HOST_HT_2G
+                    }
+                    Some(super::super::rtl8821ae::envelope::Band::B5g) => {
+                        super::super::rtl8821ae::vht::HOST_HT_5G
+                    }
+                    None => 0,
+                }
+            } else {
+                caps
+            }
         })
     }
     /// RTL8192EE: the host-API capability bits
@@ -1366,6 +1458,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     /// The programmed channel grant of this owner's chip profile.
     pub(crate) fn station_grant(&self) -> Option<super::super::station_power::Grant> {
         match self.chip {
+            super::Chip::Rtl8723ae => self
+                .ae8723
+                .as_ref()
+                .filter(|state| state.mac_ready && state.live.load(Ordering::Acquire))
+                .map(|state| super::super::station_power::Grant::Rtl8723ae(state.grant)),
             super::Chip::Rtl8188ee => self
                 .permission
                 .map(super::super::station_power::Grant::Rtl8188ee),
@@ -1505,6 +1602,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 // rtl92ce_set_qos ignores the AP's rows (fixed BK/VI/VO).
                 return super::super::rtl8192ce::station::set_qos_all(&self.io);
             }
+            if self.chip == super::Chip::Rtl8723ae {
+                return super::super::rtl8723ae::station::set_qos_all(&self.io);
+            }
             if self.chip == super::Chip::Rtl8723be {
                 // rtl8723be_set_qos ignores the AP's rows (fixed BK/VI/VO).
                 return super::super::rtl8723be::station::set_qos_all(&self.io);
@@ -1572,10 +1672,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         candidate: &Candidate,
         environment: &impl Environment,
     ) -> Result<(), Error> {
+        let ae8723 = self.chip == super::Chip::Rtl8723ae;
         let ce = self.chip == super::Chip::Rtl8192ce;
         let be = self.chip == super::Chip::Rtl8723be;
         let de = self.chip == super::Chip::Rtl8192de;
-        let current = if de {
+        let current = if ae8723 {
+            self.packet.ae8723.erp_timing
+        } else if de {
             self.packet.de92.erp_timing
         } else if be {
             self.packet.be8723.erp_timing
@@ -1592,7 +1695,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if new == old {
             return Ok(());
         }
-        if de {
+        if ae8723 {
+            self.station_publication(environment, || {
+                super::super::rtl8723ae::station::erp_changed(&self.io, old, new, 0)
+                    .map_err(|_| RadioError::State)
+            })?;
+            self.packet.ae8723.erp_timing = Some(new);
+        } else if de {
             // RTL8192DE: `HW_VAR_ACK_PREAMBLE` at `REG_RRSR + 2` with the
             // programmed `cur_40_prime_sc`, `HW_VAR_SLOT_TIME`.
             let prime_sc = self.rtl8192de_prime_sc();
@@ -1719,7 +1828,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Hardware::Failed;
-        environment.prepare_bus_power().await?;
+        if self.chip == super::Chip::Rtl8723ae {
+            let state = self.ae8723.as_ref().ok_or(Error::State)?;
+            if state.program.aspm() {
+                let program = state.program.clone();
+                let grant = state.grant;
+                program
+                    .wait(
+                        grant,
+                        self.io.prepare_rtl8723ae_aspm(environment.pcie_aspm()),
+                    )
+                    .await?;
+            }
+        } else {
+            environment.prepare_bus_power().await?;
+        }
         self.phase = Hardware::MacConfigured;
         Ok(())
     }
@@ -1779,7 +1902,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         config: &narf_wireless::WowlanConfig,
         image: &[u8],
     ) -> Result<(), Error> {
-        if self.chip != super::Chip::Rtl8821ae || self.station_phase() != Phase::Open {
+        if self.chip != super::Chip::Rtl8821ae
+            || self.station_phase() != Phase::Open
+            || self.rtl8821ae_full_coex()
+        {
             return Err(Error::State);
         }
         let bssid = self
@@ -1811,6 +1937,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
     pub(crate) fn abort_station(&mut self) {
         self.station.fail();
+        if self.rtl8821ae_full_coex() {
+            self.phase = Hardware::Failed;
+            if let Some(park) = self.io.terminal_park() {
+                let _ = park.park();
+            }
+            return;
+        }
         if self.phase != Hardware::Stopped {
             let _ = self.stop_packets();
         }
@@ -1869,6 +2002,29 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             } else {
                 publish()?;
             }
+            if self.chip == super::Chip::Rtl8821ae {
+                let envelope = base.rtl8821ae().ok_or(Error::Profile)?.clone();
+                let grant = self.station_grant().ok_or(Error::State)?;
+                let mut program = None;
+                power_wait(
+                    base.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    grant,
+                    environment,
+                    async {
+                        program = self.ae_prepare_coex(envelope).await?;
+                        Ok(())
+                    },
+                )
+                .await?;
+                if let Some(program) = program {
+                    self.station.calibration =
+                        Some(super::super::station_power::Base::Rtl8821aeCoex(program));
+                }
+            }
             let now = environment.now_ms();
             self.station.last_now = now;
             self.station.last_peer = now;
@@ -1913,6 +2069,140 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
     fn queue_station(
         &mut self,
+        bytes: Vec<u8>,
+        kind: Kind,
+        now: u64,
+        sequence: bool,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        if self.station.deferred_eapol.is_some() {
+            return Err(Error::Busy);
+        }
+        if (self.chip == super::Chip::Rtl8723be || self.rtl8821ae_full_coex())
+            && matches!(kind, Kind::Eapol)
+        {
+            if sequence || self.station.pending.is_some() || !self.transmit_ready() {
+                return Err(Error::Busy);
+            }
+            self.check_station_policy(environment)?;
+            if self.rtl8821ae_full_coex() {
+                self.station_8821_eapol(now)?;
+            } else {
+                self.rtl8723be_coex
+                    .as_deref_mut()
+                    .ok_or(Error::State)?
+                    .eapol(now);
+            }
+            self.station.deferred_eapol = Some(DeferredEapol {
+                bytes,
+                deadline: now.saturating_add(1000),
+            });
+            return Ok(());
+        }
+        self.queue_station_now(bytes, kind, now, sequence, environment)
+    }
+
+    /// Source setup_special_tx -> btc_special_packet_notify -> rtl_lps_leave.
+    /// Each await is inside the current station power grant; cancellation closes
+    /// this station generation even if the H2C helper has not emitted yet.
+    pub(crate) async fn station_special_packet(
+        &mut self,
+        packet: super::super::btcoex::btc::Packet,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        if self.chip != super::Chip::Rtl8723be && !self.rtl8821ae_full_coex() {
+            return Ok(());
+        }
+        let mut terminal = super::packet::ae::CoexAttempt::new(&self.io);
+        let mut attempt = Attempt {
+            failed: self.station.failed.clone(),
+            armed: true,
+        };
+        if self.rtl8821ae_full_coex() && packet == super::super::btcoex::btc::Packet::Eapol {
+            self.station_8821_eapol(environment.now_ms())?;
+        }
+        let result = power_wait(
+            self.station
+                .calibration
+                .as_ref()
+                .ok_or(Error::Profile)?
+                .clone(),
+            self.station.ht.clone(),
+            self.station.protection.clone(),
+            self.station.tracking.as_ref().map(|s| s.grant.clone()),
+            self.station.antenna.as_ref().map(|s| s.grant.clone()),
+            self.station_grant().ok_or(Error::State)?,
+            environment,
+            async {
+                if self.rtl8821ae_full_coex() {
+                    self.ae_coex_special(packet).await
+                } else {
+                    self.be8723_special_packet_notify(packet).await
+                }
+            },
+        )
+        .await
+        .map_err(Error::Radio);
+        attempt.armed = false;
+        if result.is_err() {
+            self.abort_station();
+        }
+        if result.is_ok() {
+            terminal.complete();
+        }
+        result
+    }
+
+    pub(crate) async fn flush_station_eapol(
+        &mut self,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let Some(deadline) = self
+            .station
+            .deferred_eapol
+            .as_ref()
+            .map(|reply| reply.deadline)
+        else {
+            return Ok(());
+        };
+        let mut attempt = Attempt {
+            failed: self.station.failed.clone(),
+            armed: true,
+        };
+        let result = async {
+            if environment.now_ms() >= deadline {
+                return Err(Error::Timeout);
+            }
+            self.station_special_packet(super::super::btcoex::btc::Packet::Eapol, environment)
+                .await?;
+            if environment.now_ms() >= deadline {
+                return Err(Error::Timeout);
+            }
+            // Retain the deferred marker while draining: it blocks a second
+            // EAPOL/security transition, while deauth/revoke still closes this
+            // generation. Never publish past RX queued during the H2C wait.
+            if !self.progress_station_inner(environment)? {
+                return Ok(());
+            }
+            let reply = self.station.deferred_eapol.take().ok_or(Error::State)?;
+            self.queue_station_now(
+                reply.bytes,
+                Kind::Eapol,
+                environment.now_ms(),
+                false,
+                environment,
+            )
+        }
+        .await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.abort_station();
+        }
+        result
+    }
+
+    fn queue_station_now(
+        &mut self,
         mut bytes: Vec<u8>,
         kind: Kind,
         now: u64,
@@ -1922,7 +2212,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.station.pending.is_some() || !self.transmit_ready() {
             return Err(Error::Busy);
         }
-        super::super::station_control::radio_on(&self.io)?;
+        self.native_station_radio_on()?;
         if sequence {
             bytes[22..24].copy_from_slice(&(self.station.sequence << 4).to_le_bytes());
             self.station.sequence = (self.station.sequence + 1) & 4095;
@@ -1964,7 +2254,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::Profile)?
             .clone();
         let ht = self.station.ht.clone();
-        let aggregate = if matches!(kind, Kind::Data) {
+        let aggregate = if matches!(kind, Kind::Data) && self.chip != super::Chip::Rtl8723ae {
             self.station.aggregate(&bytes, now)
         } else {
             None
@@ -2035,6 +2325,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.chip,
             super::Chip::Rtl8192ee
                 | super::Chip::Rtl8192ce
+                | super::Chip::Rtl8723ae
                 | super::Chip::Rtl8723be
                 | super::Chip::Rtl8192de
         );
@@ -2151,6 +2442,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             environment,
         )?;
         loop {
+            self.station_coex_service(environment).await?;
             self.progress_station(environment)?;
             if self.station.pending.is_none() {
                 return Ok(());
@@ -2189,10 +2481,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             || self.rtl8192ee_ht()
             || self.rtl8192de_ht()
             || self.rtl8192ce_ht()
+            || self.rtl8723ae_ht()
             || self.rtl8723be_ht())
             && has_wmm
         {
-            let phy = if self.chip == super::Chip::Rtl8192ce {
+            let phy = if self.chip == super::Chip::Rtl8723ae {
+                super::super::rtl8723ae::ht::local()
+            } else if self.chip == super::Chip::Rtl8192ce {
                 let wide = self.rtl8192ce_wide(&candidate, environment)?;
                 let two = self.rtl8192ce_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
                 let rf = self.rtl8192ce_power.ok_or(Error::State)?.rf_type();
@@ -2247,6 +2542,26 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !legacy_rates_fit(rates, basic, self.rtl8821ae_five_ghz()) || basic & !0x15f != 0 {
             return Err(Error::Profile);
         }
+        if self.be_tracking_bound() {
+            let offered = plan.offered_phy();
+            let width = offered
+                .map(|p| Self::rtl8821ae_offered_width(p.width(), p.ht().operation()))
+                .transpose()?
+                .flatten();
+            let channel = self.rtl8723be_power.ok_or(Error::State)?.channel();
+            let op = match width {
+                None => super::super::rtl8723be::envelope::Operating::twenty(channel),
+                Some(g) => super::super::rtl8723be::envelope::Operating {
+                    channel,
+                    width: if g.prime() == 1 {
+                        super::super::rtl8723be::envelope::Width::W40Above
+                    } else {
+                        super::super::rtl8723be::envelope::Width::W40Below
+                    },
+                },
+            };
+            self.be_tracking_allows_op(op, environment)?;
+        }
         self.station.phase = Phase::Joining;
         self.station.candidate = Some(candidate);
         self.station.plan = Some(plan);
@@ -2258,7 +2573,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // `be8723_complete_peer` on the success path; a failed association
         // aborts the owner, leaving no live coex owner to notify).
         if self.chip == super::Chip::Rtl8723be {
-            self.be8723_connect_notify(true).await?;
+            self.be_tracking_notify(BeTrackingNotice::Connect(true), environment)
+                .await?;
+        }
+        if self.rtl8821ae_full_coex() {
+            self.ae_coex_notify(super::super::rtl8821ae::coex_runtime::Notify::Connect(true))
+                .await?;
         }
         let mut attempt = Attempt {
             failed: self.station.failed.clone(),
@@ -2346,6 +2666,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.station.deadline = now.saturating_add(5000);
             self.station.last_peer = now;
             loop {
+                self.station_coex_service(environment).await?;
+                self.flush_station_eapol(environment).await?;
                 let idle = self.progress_station_inner(environment)?;
                 if self.station.phase == Phase::Configuring {
                     self.check_station_policy(environment)?;
@@ -2379,6 +2701,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.chip,
                         super::Chip::Rtl8192ee
                             | super::Chip::Rtl8192ce
+                            | super::Chip::Rtl8723ae
                             | super::Chip::Rtl8723be
                             | super::Chip::Rtl8192de
                     ) {
@@ -2427,6 +2750,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 self.rtl8192ce_prime_sc(),
                             );
                         }
+                        if self.chip == super::Chip::Rtl8723ae {
+                            return super::super::rtl8723ae::station::configure_rates(
+                                &self.io,
+                                rates,
+                                basic,
+                                self.station.capability,
+                                erp92,
+                                self.station.ht_profile.is_some(),
+                                0,
+                            );
+                        }
                         if self.chip == super::Chip::Rtl8723be {
                             return super::super::rtl8723be::station::configure_rates(
                                 &self.io,
@@ -2468,6 +2802,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.packet.ee92.erp_timing = Some(timing);
                     } else if self.chip == super::Chip::Rtl8192ce {
                         self.packet.ce92.erp_timing = Some(timing);
+                    } else if self.chip == super::Chip::Rtl8723ae {
+                        self.packet.ae8723.erp_timing = Some(timing);
                     } else if self.chip == super::Chip::Rtl8723be {
                         self.packet.be8723.erp_timing = Some(timing);
                     } else if self.chip == super::Chip::Rtl8192de {
@@ -2508,6 +2844,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                     ),
                                 )
                             });
+                        } else if self.chip == super::Chip::Rtl8723ae {
+                            if !self.rtl8723ae_ht() {
+                                return Err(Error::Profile);
+                            }
+                            let mut min_space = self.packet.ae8723.min_space_cfg;
+                            self.station_publication(environment, || {
+                                super::super::rtl8723ae::ht::timing(
+                                    &self.io,
+                                    &mut min_space,
+                                    profile.peer_ampdu_factor(),
+                                    profile.peer_mpdu_density(),
+                                )
+                            })?;
+                            self.packet.ae8723.min_space_cfg = min_space;
+                            self.check_station_policy(environment)?;
+                            self.packet.ht = true;
                         } else if self.chip == super::Chip::Rtl8192ee {
                             // `rtl_op_bss_info_changed(BSS_CHANGED_HT)`:
                             // only `HW_VAR_AMPDU_FACTOR` has an 8192EE case;
@@ -2598,6 +2950,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             super::Chip::Rtl8821ae
                                 | super::Chip::Rtl8192ee
                                 | super::Chip::Rtl8192ce
+                                | super::Chip::Rtl8723ae
                                 | super::Chip::Rtl8192de
                                 | super::Chip::Rtl8723be
                         )
@@ -2758,12 +3111,23 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.check_station_policy(environment)?;
-        super::super::station_control::radio_on(&self.io)?;
+        self.native_station_radio_on()?;
+        if self.chip == super::Chip::Rtl8723ae {
+            self.ae8723_service_c2h()?;
+        }
         let now = environment.now_ms();
         if now < self.station.last_now {
             return Err(Error::State);
         }
         self.station.last_now = now;
+        if self
+            .station
+            .deferred_eapol
+            .as_ref()
+            .is_some_and(|reply| now >= reply.deadline)
+        {
+            return Err(Error::Timeout);
+        }
         if self.station.phase != Phase::Passive
             && self.station.phase != Phase::Open
             && now >= self.station.deadline
@@ -2802,7 +3166,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.station.delivered_reply = Some(pending);
                 } else if matches!(pending.kind, Kind::Data) {
                     let own = self.local().ok_or(Error::State)?;
-                    self.station.tx_status(&pending.bytes, now, own)?;
+                    if self.chip != super::Chip::Rtl8723ae {
+                        self.station.tx_status(&pending.bytes, now, own)?;
+                    }
                 }
             }
         }
@@ -2860,6 +3226,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.rtl8192de_local_ht20()
             } else if self.rtl8723be_ht() {
                 self.rtl8723be_local_ht20()
+            } else if self.rtl8723ae_ht() {
+                Some(super::super::rtl8723ae::ht::local())
             } else {
                 None
             };
@@ -2876,6 +3244,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.chip,
                         super::Chip::Rtl8192ee
                             | super::Chip::Rtl8192ce
+                            | super::Chip::Rtl8723ae
                             | super::Chip::Rtl8723be
                             | super::Chip::Rtl8192de
                     ) {
@@ -3082,7 +3451,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
             }
         }
-        while self.station.pending.is_none() && self.station.delivered_reply.is_none() {
+        while self.station.pending.is_none()
+            && self.station.delivered_reply.is_none()
+            && self.station.deferred_eapol.is_none()
+        {
             let Some(Captured {
                 frame,
                 mut admitted,
@@ -3261,6 +3633,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
         }
         if self.station.pending.is_none()
+            && self.station.deferred_eapol.is_none()
             && self.station.delivered_reply.is_none()
             && self.station.receive_open()
         {
@@ -3299,6 +3672,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.chip == super::Chip::Rtl8192ce {
             return self
                 .install_rtl8192ce_station_rate_mask(rates, level, environment)
+                .await;
+        }
+        if self.chip == super::Chip::Rtl8723ae {
+            return self
+                .install_rtl8723ae_station_rate_mask(rates, level, environment)
                 .await;
         }
         if self.chip == super::Chip::Rtl8723be {
@@ -3684,7 +4062,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let refreshed = &mut sent;
         let owner = &mut *self;
         power_wait(base, None, None, None, None, grant, environment, async {
-            *refreshed = owner.rtl8723be_dm_watchdog(pwdb, now).await?;
+            *refreshed = if owner.be_tracking_bound() {
+                owner
+                    .rtl8723be_dm_watchdog_qualified(pwdb, now, environment)
+                    .await?
+            } else {
+                owner.rtl8723be_dm_watchdog(pwdb, now).await?
+            };
             Ok(())
         })
         .await?;
@@ -3776,6 +4160,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Ok(false);
         }
         if self.leisure() {
+            self.station_8821_watchdog(environment).await?;
             return Ok(false);
         }
         let linked = self.station_linked();
@@ -3809,6 +4194,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .await?;
         }
         if !self.station.iqk.tick(linked) {
+            self.station_8821_watchdog(environment).await?;
             return Ok(sent);
         }
         self.check_station_policy(environment)?;
@@ -3831,6 +4217,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         )
         .await?;
         self.check_station_policy(environment)?;
+        self.station_8821_watchdog(environment).await?;
         Ok(sent)
     }
     /// `rtl88e_dm_watchdog` → `rtl88e_dm_refresh_rate_adaptive_mask`: every
@@ -3841,6 +4228,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<bool, Error> {
+        if self.chip == super::Chip::Rtl8723ae {
+            let result = self.rtl8723ae_watchdog(environment).await;
+            if result.is_err() {
+                self.abort_station();
+            }
+            return result;
+        }
         if self.chip == super::Chip::Rtl8192ee {
             let result = self.rtl8192ee_watchdog(environment).await;
             if result.is_err() {
@@ -3870,10 +4264,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return result;
         }
         if self.chip == super::Chip::Rtl8821ae {
+            // Chip RA/init-rate/IQK runs before coex periodical. Keep the
+            // original terminal fence armed across that entire prefix too:
+            // an IQK wait can be cancelled before the coex helper is entered.
+            let full = self.rtl8821ae_full_coex();
+            let mut terminal = full.then(|| super::packet::ae::CoexAttempt::new(&self.io));
+            let mut attempt = Attempt {
+                failed: self.station.failed.clone(),
+                armed: full,
+            };
             let result = self.rtl8821ae_watchdog(environment).await;
             if result.is_err() {
                 self.abort_station();
+            } else if let Some(terminal) = &mut terminal {
+                terminal.complete();
             }
+            attempt.armed = false;
             return result;
         }
         // Each watchdog pass re-proves the fallback grant (revocation
@@ -3920,6 +4326,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) fn station_transmit_ready(&self) -> bool {
         self.station_peer().is_some()
             && self.station.pending.is_none()
+            && self.station.deferred_eapol.is_none()
             && self.station.delivered_reply.is_none()
             && self.station.controls.is_empty()
             && self.transmit_ready()
@@ -4032,3 +4439,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         result
     }
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "station_special_tests.rs"]
+mod special_tests;
