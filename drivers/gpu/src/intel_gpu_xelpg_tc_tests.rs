@@ -440,13 +440,13 @@ kernel_test_in!(
 fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
     struct LtAux {
         phy: FakePhy,
-        stuck: bool,
+        stuck_status: Option<bool>,
     }
     impl LtAux {
-        fn new(stuck: bool) -> Self {
+        fn new(stuck_status: Option<bool>) -> Self {
             Self {
                 phy: FakePhy::new(XeLpgPort::Tc1),
-                stuck,
+                stuck_status,
             }
         }
     }
@@ -456,10 +456,13 @@ fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
         }
         fn read32(&self, off: u64) -> u32 {
             let value = self.phy.read32(off);
-            if off != XeLpgPort::Tc1.aux_ctl() || self.stuck {
+            if off != XeLpgPort::Tc1.aux_ctl() {
                 return value;
             }
-            if value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0 {
+            if self
+                .stuck_status
+                .unwrap_or(value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0)
+            {
                 value | XELPDP_AUX_CH_CTL_POWER_STATUS
             } else {
                 value & !XELPDP_AUX_CH_CTL_POWER_STATUS
@@ -470,7 +473,7 @@ fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
         }
     }
 
-    let io = LtAux::new(false);
+    let io = LtAux::new(None);
     if aux_power_enable(&io, XeLpgPort::Tc1).is_err()
         || aux_power_requested(&io, XeLpgPort::Tc1) != Ok(true)
         || aux_power_disable(&io, XeLpgPort::Tc1).is_err()
@@ -478,13 +481,25 @@ fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
     {
         return TestResult::Fail("LT AUX status handshake must complete both transitions");
     }
-    if io.phy.writes_to(XeLpgPort::Tc1.aux_ctl()) != [XELPDP_AUX_CH_CTL_POWER_REQUEST, 0] {
-        return TestResult::Fail("LT AUX owner must write only request then release");
+    // The disable read-modify-write clears REQUEST while STATUS still reads high.
+    if io.phy.writes_to(XeLpgPort::Tc1.aux_ctl())
+        != [
+            XELPDP_AUX_CH_CTL_POWER_REQUEST,
+            XELPDP_AUX_CH_CTL_POWER_STATUS,
+        ]
+    {
+        return TestResult::Fail("LT AUX power writes must preserve the observed status");
     }
 
-    let stuck = LtAux::new(true);
-    if aux_power_enable(&stuck, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout) {
+    let stuck_off = LtAux::new(Some(false));
+    if aux_power_enable(&stuck_off, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout) {
         return TestResult::Fail("LT AUX power-up without status must time out");
+    }
+    let stuck_on = LtAux::new(Some(true));
+    if aux_power_enable(&stuck_on, XeLpgPort::Tc1).is_err()
+        || aux_power_disable(&stuck_on, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout)
+    {
+        return TestResult::Fail("LT AUX power-down with status still set must time out");
     }
     TestResult::Pass
 }

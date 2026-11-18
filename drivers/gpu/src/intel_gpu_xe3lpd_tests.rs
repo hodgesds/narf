@@ -878,13 +878,19 @@ fn smoke_xe3lpd_bandwidth_sa_info_limit() -> TestResult {
         Some(768)
     );
     assert_eq!(qgv_peak_bw_ip(DisplayIp::Xe3Lpd, &qgv, 50_000, 1), None);
-    // xe3lpd_3002_sa_info clamps programmed bandwidth to 22 GB/s.
+    // The 1600 MHz point offers 20339 MB/s after derating, so Linux's
+    // least-headroom rule selects its 25600 MB/s peak at a 20 GB/s load.
     assert_eq!(
         qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 20_000, 1),
+        Some(256)
+    );
+    // The faster point reaches the xe3lpd_3002_sa_info 22 GB/s ceiling.
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 22_000, 1),
         Some(768)
     );
     assert_eq!(
-        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 30_000, 1),
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 22_001, 1),
         None
     );
     assert_eq!(
