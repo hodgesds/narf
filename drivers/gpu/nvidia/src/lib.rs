@@ -61,6 +61,7 @@ pub mod gsp_ring;
 pub mod gsp_rm;
 pub mod gsp_rm_api;
 pub mod gsp_seq;
+pub mod gsp_static;
 pub mod hdcp;
 pub mod hpd;
 pub mod irq;

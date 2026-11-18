@@ -5997,3 +5997,67 @@ fn smoke_gsp_chan_alloc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp_chan", smoke_gsp_chan_alloc);
+
+// ────────────────────────────────────────────────────────────────
+// GET_GSP_STATIC_INFO parse
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp_static::{parse_static_info, FbRegion, GSP_STATIC_INFO_SIZE};
+
+fn smoke_gsp_static_info_parse() -> TestResult {
+    let mut p = alloc::vec![0u8; GSP_STATIC_INFO_SIZE];
+    let p64 = |p: &mut [u8], o: usize, v: u64| p[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let p32 = |p: &mut [u8], o: usize, v: u32| p[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    // numFBRegions @840 = 2; two regions at 848 + n*48.
+    p32(&mut p, 840, 2);
+    // region 0: usable (base/limit, reserved 0, compressed+iso).
+    p64(&mut p, 848, 0x1_0000_0000);
+    p64(&mut p, 848 + 8, 0x1_FFFF_FFFF);
+    p[848 + 28] = 1; // supportCompressed
+    p[848 + 29] = 1; // supportISO
+                     // region 1: protected (not usable).
+    p64(&mut p, 848 + 48, 0x2_0000_0000);
+    p64(&mut p, 848 + 48 + 8, 0x2_0000_FFFF);
+    p[848 + 48 + 30] = 1; // bProtected
+                          // fb_length @1752, bar PDEs @2088/2096.
+    p64(&mut p, 1752, 0x2_0000_0000);
+    p64(&mut p, 2088, 0x1111_0000);
+    p64(&mut p, 2096, 0x2222_0000);
+    // internal handles @2152/2156/2160.
+    p32(&mut p, 2152, 0xc1d0_0042);
+    p32(&mut p, 2156, 0xde1d_0000);
+    p32(&mut p, 2160, 0x5d1d_0000);
+
+    let si = match parse_static_info(&p) {
+        Some(s) => s,
+        None => return TestResult::Fail("full-size payload must parse"),
+    };
+    if si.internal_client != 0xc1d0_0042
+        || si.internal_device != 0xde1d_0000
+        || si.internal_subdevice != 0x5d1d_0000
+    {
+        return TestResult::Fail("internal handles mis-read (offset drift)");
+    }
+    if si.bar1_pde_base != 0x1111_0000 || si.bar2_pde_base != 0x2222_0000 {
+        return TestResult::Fail("BAR PDE bases mis-read");
+    }
+    if si.fb_length != 0x2_0000_0000 {
+        return TestResult::Fail("fb_length mis-read");
+    }
+    if si.fb_regions.len() != 2 {
+        return TestResult::Fail("must read both FB regions");
+    }
+    let r0: &FbRegion = &si.fb_regions[0];
+    if r0.base != 0x1_0000_0000 || r0.size() != 0x1_0000_0000 || !r0.is_usable() {
+        return TestResult::Fail("region 0 fields / usability wrong");
+    }
+    if si.fb_regions[1].is_usable() {
+        return TestResult::Fail("protected region must not be usable");
+    }
+    // Short payload is rejected.
+    if parse_static_info(&p[..GSP_STATIC_INFO_SIZE - 1]).is_some() {
+        return TestResult::Fail("a short payload must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp_static", smoke_gsp_static_info_parse);
