@@ -53,7 +53,8 @@ PCI matches come from the built-in driver's tables, including its gated
 IDs. Its probe currently returns `-ENODEV` and permits the resident
 driver to bind. Modesetting, USB-C DP and GuC submission run in the
 resident driver. Failed module init and module unload withdraw only the
-loadable driver's registrations.
+loadable driver's registrations. The resident driver's class probe declines
+unknown and gated device IDs before PCI power, command-register or BAR access.
 
 The crate's vendor driver sets are cargo features: `amdgpu` and
 `intel`, both in `default`, so a default build compiles and

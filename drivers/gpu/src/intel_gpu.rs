@@ -588,17 +588,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
+    let Some(platform) =
+        crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+    else {
+        log_probe(
+            "unsupported Intel ASIC — device id not in the driver table",
+            &device,
+        );
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    };
     // Normalize every admitted Intel graphics function before any route
     // probe maps or reads BAR0. Firmware may hand an integrated or discrete
     // GPU to us in D3hot, where the transition back to D0 can clear BARs.
     // `prepare_memory_probe` restores those BARs while leaving memory decode
     // and bus mastering parked; the selected path below enables only what it
-    // owns. Unknown Intel display functions skip this preflight and are
-    // announced by the class-match fallback below.
-    if crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device).is_some() {
-        narf_bus::pci::prepare_memory_probe(&cap, &device)
-            .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    }
+    // owns.
+    narf_bus::pci::prepare_memory_probe(&cap, &device)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // A Lunar Lake function whose display-20 route is admitted (requested,
     // GMD 20.00, Pipe A fused in and lit by firmware) takes the integrated
     // display path below and never the headless profile's driver FLR;
@@ -609,10 +615,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // `narf.intel.wcl_display=1`) likewise takes the integrated display path
     // and never the headless driver FLR. Without its option it reads nothing.
     let ptl_display = !lnl_display && crate::intel_gpu_xe3lpd::probe_route(&device, &cap);
-    if !lnl_display
-        && !ptl_display
-        && crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-            .is_some_and(|p| p.is_discrete() || p.is_headless_integrated())
+    if !lnl_display && !ptl_display && (platform.is_discrete() || platform.is_headless_integrated())
     {
         return crate::intel_gpu_gt_runtime::probe_discrete(device, cap);
     }
@@ -630,15 +633,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: caller-authority.
     let mut dev = match unsafe { IntelGpu::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(IntelGpuError::UnknownAsic) => {
-            // Announced, not silent: an Intel DID outside the
-            // table is a coverage gap, not broken silicon.
-            log_probe(
-                "unsupported Intel ASIC — device id not in the driver table",
-                &device,
-            );
-            return Err(narf_bus::ProbeError::NotForThisDriver);
-        }
         Err(e) => {
             use core::fmt::Write as _;
             let _ = writeln!(
@@ -2959,6 +2953,47 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_unknown_ids_do_not_classify);
+
+    #[cfg(feature = "kernel-test")]
+    fn smoke_unqualified_class_probe_preserves_pci_command() -> TestResult {
+        use narf_bus::{BusAddr, BusKind, DeviceId, PcieAddr, ProbeError};
+        let addr = PcieAddr::new(0x7f35, 0, 2, 0);
+        let cfg_phys = narf_memory::PhysAddr::new(0x7f35_0000);
+        let mut config = alloc::vec![0u32; 1024];
+        // SAFETY: the scoped ECAM window points at this test's aligned
+        // RAM and is removed before the backing vector drops.
+        let _window = unsafe {
+            narf_bus::ecam::__test_windows(&[(cfg_phys, config.as_mut_ptr().cast(), 4096)])
+        };
+        config[1] = 1; // firmware left I/O-space decoding enabled
+        for did in [0x46b4, CRI_674C] {
+            let device = BusDevice {
+                addr: BusAddr::Pcie(addr),
+                kind: BusKind::Pcie { addr, cfg_phys },
+                id: DeviceId {
+                    vendor: INTEL_VENDOR,
+                    device: did,
+                    class: 0x030000,
+                    subsystem_vendor: 0,
+                    subsystem_id: 0,
+                },
+            };
+            let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+            let result = probe(device, cap);
+            cap.revoke();
+            if !matches!(result, Err(ProbeError::NotForThisDriver)) || config[1] != 1 {
+                return TestResult::Fail(
+                    "unqualified Intel class probe claimed or reconfigured a device",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    #[cfg(feature = "kernel-test")]
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_unqualified_class_probe_preserves_pci_command
+    );
 
     fn smoke_crescent_island_identity_is_exact_and_fail_closed() -> TestResult {
         if !source_known_unqualified(CRI_674C)
