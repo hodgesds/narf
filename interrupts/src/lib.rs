@@ -29,6 +29,7 @@ mod gic_dt_tests;
 mod gic_spi_tests;
 #[path = "its_tests.rs"]
 mod its_tests;
+mod lapic_oneshot_tests;
 mod tests;
 
 pub use dispatch::{

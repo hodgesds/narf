@@ -22,13 +22,29 @@ handling (drivers do that after the dispatch).
 
 ## 3. Public interface
 
-The x86 TSC-deadline clockevent implements local tickless idle through
+Every x86 CPU's LAPIC timer is its own one-shot clockevent (Linux
+`setup_APIC_timer`): TSC-deadline when CPUID.01H:ECX[24] is set
+(`lapic_next_deadline`), otherwise the LVT one-shot mode loading `TMICT`
+(`lapic_next_event`, divide 16). The TMICT rate is measured once on the boot
+CPU in `init_bsp`, before any AP starts, against the TSC
+(`calibrate_APIC_clock`; `apic::lapic_timer_scale()` returns the
+`narf_lib::clockevent_scale::ClockEventScale`), and shared by every CPU.
+Conversion clamps to Linux's LAPIC range (`0xF..=0x7FFF_FFFF` ticks) and is
+biased so the timer never fires before the requested deadline; the armed time
+recorded for re-arm decisions is the latest the countdown can expire, so a
+re-arm never cancels an imminent interrupt. `apic::start_timer(vector,
+initial_count)` starts the TMICT one-shot with a software tick every
+`initial_count` divide-16 ticks; only a timer that failed calibration falls back
+to the hardware periodic InitialCount mode. `apic::local_timer_mode(cpu)`
+reports `Stopped | Periodic | TscDeadline | Oneshot`.
+
+Both one-shot modes implement local tickless idle through
 `ClockEvent::set_idle_tick`. Periodic, hrtimer and scheduler budget deadlines
 are tracked independently; an earlier hrtimer IRQ cannot discard a later budget
-expiry/replenishment. With no pending deadline, IA32_TSC_DEADLINE is disarmed
-with zero. Restarting execution restores a future periodic deadline. The
-InitialCount backend retains its periodic tick and runs the low-resolution
-`hrtimer_run_queues` from it. Every CPU's clockevent carries its own hrtimer
+expiry/replenishment. With no pending deadline, IA32_TSC_DEADLINE (or TMICT) is
+disarmed with zero. Restarting execution restores a future periodic deadline.
+The uncalibrated InitialCount fallback retains its periodic tick and runs the
+low-resolution `hrtimer_run_queues` from it. Every CPU's clockevent carries its own hrtimer
 base's next event (`time/` §3.2.1): the timer interrupt calls
 `narf_time::hrtimer::hrtimer_interrupt()`, and `arm_hrtimer_event` is the
 `tick_program_event` behind the base's arm callback. The reschedule IPI
@@ -36,7 +52,13 @@ base's next event (`time/` §3.2.1): the timer interrupt calls
 `hrtimer::retrigger_next_event`, which re-programs the local clockevent when a
 remote CPU queued an earlier timer on this CPU's base. The HPET fallback pump
 expires every CPU's base (`hrtimer_run_all_bases`) and is armed for the
-earliest event of any base. The aarch64 generic timer runs
+earliest event of any base. It is the tick-broadcast device and is armed only
+when `timer_pump::update_broadcast()` (run by `timer_pump::init` after
+`clockevent::select_primary`) finds that some CPU cannot rely on its own LAPIC:
+no one-shot LAPIC primary, or no ARAT (the LAPIC timer stops in deep C-states,
+Linux `CLOCK_EVT_FEAT_C3STOP`). ARAT follows CPUID.06H:EAX[2] plus Linux's
+vendor rule (AMD family 12h+, every Hygon part). With a one-shot ARAT LAPIC,
+`uses_hpet_fallback()` is false and HPET takes no interrupts. The aarch64 generic timer runs
 `hrtimer_interrupt` each tick and re-arms for `min(period, next event)`. Local
 timer transitions serialize against their ISR with IRQ masking and restore the
 caller's original IRQ state.
@@ -92,6 +114,14 @@ pub fn interrupted_user_state() -> Option<InterruptedUserState>;
 
 #[cfg(target_arch = "x86_64")]
 pub fn uses_hpet_fallback() -> bool; // x86_64::timer_pump diagnostic
+#[cfg(target_arch = "x86_64")]
+pub fn update_broadcast() -> bool; // x86_64::timer_pump; re-evaluate after the primary changes
+#[cfg(target_arch = "x86_64")]
+pub fn apic::lapic_timer_scale() -> Option<&'static ClockEventScale>;
+#[cfg(target_arch = "x86_64")]
+pub fn apic::local_timer_mode(cpu: usize) -> apic::LocalTimerMode;
+#[cfg(target_arch = "x86_64")]
+pub fn apic::local_oneshot_active() -> bool; // this CPU: TSC-deadline or TMICT
 
 pub fn install_tlb_shootdown_bridge();
 
@@ -372,12 +402,13 @@ way before it offers a wake-capable sleep state.
 ### x86_64
 - Controllers: x2APIC for local, I/O APIC legacy path for devices that
   predate MSI/MSI-X. Prefer MSI-X where the device supports it.
-- Timer-wheel deadlines use the successfully probed reliable LAPIC
-  TSC-deadline clockevent exclusively. The HPET comparator path remains
-  armed as a fallback only when that reliable primary is unavailable; the two
-  sources do not intentionally deliver the same deadline.
+- Timer-wheel deadlines use the successfully probed one-shot LAPIC
+  clockevent (TSC-deadline, or TMICT one-shot without TSC-deadline)
+  exclusively. The HPET comparator path remains armed as the broadcast only
+  when that primary is unavailable or its timer stops in idle (no ARAT); the
+  two sources do not intentionally deliver the same deadline.
 - The timer wheel is global, but exactly one logical CPU owns its LAPIC
-  TSC-deadline clockevent at a time. Publishing a new earliest deadline
+  one-shot clockevent at a time. Publishing a new earliest deadline
   transfers ownership to the publishing CPU. A previous owner's already-armed
   one-shot may fire once, but it must not mirror or re-arm the global minimum;
   this keeps wheel delivery O(1) rather than O(online CPUs). On expiry, the
