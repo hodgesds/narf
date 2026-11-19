@@ -1,0 +1,26 @@
+# WWAN subsystem core: WwanPort + registry, MBIM/QMI codecs, MBIM session,
+# raw-IP bearer, IOSM id table. Split out of `narf-drivers-wwan` (now the
+# facade) so the CDC-MBIM USB binding can be a dual-build crate on top of it.
+# Always built-in.
+
+[package]
+name         = "narf-drivers-wwan-core"
+description  = "WWAN subsystem core: port registry, MBIM/QMI codecs, MBIM session, raw-IP bearer."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wwan_core"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../../lib" }
+narf-scheduler    = { path = "../../../scheduler" }
+narf-net          = { path = "../../../net" }
+narf-drivers-usb  = { path = "../../usb" }
+
+[lints]
+workspace = true

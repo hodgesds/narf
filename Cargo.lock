@@ -2828,8 +2828,32 @@ version = "0.0.0"
 dependencies = [
  "narf-console",
  "narf-drivers-usb",
+ "narf-drivers-wwan-cdc-mbim",
+ "narf-drivers-wwan-core",
  "narf-init",
  "narf-kernel-test",
+ "narf-lib",
+ "narf-net",
+ "narf-scheduler",
+]
+
+[[package]]
+name = "narf-drivers-wwan-cdc-mbim"
+version = "0.0.0"
+dependencies = [
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers-usb",
+ "narf-drivers-wwan-core",
+ "narf-lib",
+ "narf-scheduler",
+]
+
+[[package]]
+name = "narf-drivers-wwan-core"
+version = "0.0.0"
+dependencies = [
+ "narf-drivers-usb",
  "narf-lib",
  "narf-net",
  "narf-scheduler",
