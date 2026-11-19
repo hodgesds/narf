@@ -44,7 +44,8 @@
 //! `power` — the park flags are the contract; the drivers that own
 //! each cause do their own hardware work around them.
 //!
-//! PCIe controllers (`btintel_pcie`) are covered since #1576:
+//! PCIe controllers (`btintel_pcie`, in
+//! `narf-drivers-bluetooth-btintel-pcie`) are covered since #1576:
 //! their transport enters the registry through `bring_up_all`
 //! (which runs after the firmware download), and
 //! `btintel_pcie::BtIntelPciePm` drives `suspend_controller` /

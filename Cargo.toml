@@ -120,6 +120,7 @@ members = [
     "fb",
     "audio",
     "bluetooth",
+    "drivers/bluetooth/btintel-pcie",
     "edid",
     "efi",
     "hid",

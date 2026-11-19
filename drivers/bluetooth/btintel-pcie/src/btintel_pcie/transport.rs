@@ -29,8 +29,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::hci::{Command, Event};
-use crate::transport::{HciTransport, TransportError};
+use narf_bluetooth::hci::{Command, Event};
+use narf_bluetooth::transport::{HciTransport, TransportError};
 
 use super::rings::{HCI_ACL_PKT, HCI_CMD_PKT, HCI_EVT_PKT, HCI_ISO_PKT, HCI_SCO_PKT};
 use super::{BtIntelPcie, BtPcieError};

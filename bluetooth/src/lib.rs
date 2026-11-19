@@ -29,6 +29,11 @@
 //! - [`classic`] — classic BR/EDR command builders (Inquiry,
 //!   Create_Connection, SSP IO-capability exchange, SCO setup).
 //! - [`cmd_queue`] — HCI command queue with credit-flow tracking.
+//!
+//! Controller drivers live outside this crate and plug into the
+//! [`transport`] / [`controller`] / [`pm`] registries: btusb in
+//! `narf-drivers-usb`, the Intel PCIe controller in
+//! `narf-drivers-bluetooth-btintel-pcie` (dual-build, built-in or `.ko`).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -40,10 +45,6 @@ pub mod att;
 pub mod avdtp;
 pub mod avrcp;
 pub mod bond_store;
-/// Intel PCIe-attached Bluetooth controllers (Lunar Lake onward).
-/// Needs the PCIe bus, so x86_64 only for now.
-#[cfg(target_arch = "x86_64")]
-pub mod btintel_pcie;
 pub mod btusb_quirks;
 pub mod classic;
 pub mod cmd_queue;
@@ -110,22 +111,6 @@ pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
     Cap::<Bluetooth, Grant>::bootstrap()
 }
 
-/// Register the controller-firmware download.
-///
-/// Kept out of [`register_initcalls`] on purpose: it must run after
-/// the firmware registry has been populated, and `Stage::Late`
-/// initcalls run in registration order. `bare_main` calls this after
-/// `narf_firmware::register_initcalls()`, which is what puts it after
-/// the initramfs and rootfs firmware scans.
-#[cfg(target_arch = "x86_64")]
-pub fn register_firmware_initcalls() {
-    use narf_init::{InitResult, Stage};
-    narf_init::register(Stage::Late, "btintel-pcie-firmware", || {
-        btintel_pcie::load_firmware();
-        InitResult::Ok
-    });
-}
-
 /// Stage::Late initcall registration. Stage 0 just registers a
 /// per-stage placeholder so the boot summary records that the
 /// Bluetooth subsystem is wired in; the actual USB transport bind
@@ -138,11 +123,6 @@ pub fn register_firmware_initcalls() {
 /// their pump from `pump::notify_controller_ready`.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
-    #[cfg(target_arch = "x86_64")]
-    narf_init::register(Stage::Subsys, "btintel-pcie", || {
-        btintel_pcie::register_pci_driver();
-        InitResult::Ok
-    });
     // Stage: opt-in H5 boot bind (`bt-h5=<uart-name>`, issue #1580
     // items 1–2). Runs before `bluetooth-bringup` (registered later
     // by bare_main) so the bound transport is in the registry when

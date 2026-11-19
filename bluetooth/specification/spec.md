@@ -178,6 +178,15 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 
 ## Public interface
 
+Controller drivers are not part of this crate. They plug into the
+public `transport` / `controller` / `pm` registries from their own
+crates: btusb from `narf-drivers-usb`, and the Intel PCIe controller
+from `narf-drivers-bluetooth-btintel-pcie` (dual-build: built-in, or a
+registration-only loadable `.ko`). That crate owns the `btintel-pcie`
+Stage::Subsys and `btintel-pcie-firmware` Stage::Late initcalls, which
+`frame` registers; `narf-bluetooth` no longer exports
+`register_firmware_initcalls` or a `btintel_pcie` module.
+
 `btusb_quirks::identify` includes the MT7922 USB alias `0e8d:0616`.
 Selecting the MediaTek family requires USB setup to verify runtime chip/ROM
 identity and complete firmware/protocol enable before generic HCI commands.

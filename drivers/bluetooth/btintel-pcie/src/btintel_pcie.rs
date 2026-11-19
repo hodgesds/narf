@@ -24,7 +24,7 @@
 //!
 //! Every Intel Bluetooth controller before Lunar Lake hung off the
 //! internal USB hub, and NARF reaches those through
-//! [`crate::usb_transport`]. From Lunar Lake on, the controller is a
+//! [`narf_bluetooth::usb_transport`]. From Lunar Lake on, the controller is a
 //! **PCIe function of its own**, and the host talks to it over DMA
 //! descriptor rings — TFD/TXQ outbound, FRBD/URBD/RXQ inbound — with
 //! a 4-byte packet-type prefix instead of the 1-byte BT SIG HCI type.
@@ -69,7 +69,7 @@
 //! Once operational firmware is running, `load_firmware` registers
 //! the transport and the device-PM ops (`BtIntelPciePm`,
 //! `btintel-pcie`). Suspend parks the HCI pump via
-//! `crate::pm::suspend_controller` — the HCI index is resolved
+//! `narf_bluetooth::pm::suspend_controller` — the HCI index is resolved
 //! lazily by transport identity, because the index only exists once
 //! `bring_up_all` has run the mandatory HCI bring-up over the
 //! transport — and writes `POWER_STATE_D3_HOT` to `IPC_SLEEP_CTL`,
@@ -85,7 +85,7 @@
 //! from task context, re-runs `enable_bt` + `fw::setup`, and
 //! unparks the pump.
 //!
-//! No [`crate::transport::HciTransport`] is registered yet. The HCI
+//! No [`narf_bluetooth::transport::HciTransport`] is registered yet. The HCI
 //! core's bring-up sequence assumes a controller running operational
 //! firmware, and pointing it at a bootloader would have it time out
 //! on the first `Read Local Version` rather than report anything
@@ -819,14 +819,14 @@ pub(crate) fn firmware_lost() -> bool {
 #[derive(Debug)]
 pub(crate) struct BtIntelPciePm {
     regs: alloc::sync::Arc<dyn PciePowerRegs>,
-    transport: alloc::sync::Arc<dyn crate::transport::HciTransport>,
+    transport: alloc::sync::Arc<dyn narf_bluetooth::transport::HciTransport>,
 }
 
 impl BtIntelPciePm {
     /// Build the ops for a controller whose firmware is running.
     pub(crate) fn new(
         regs: alloc::sync::Arc<dyn PciePowerRegs>,
-        transport: alloc::sync::Arc<dyn crate::transport::HciTransport>,
+        transport: alloc::sync::Arc<dyn narf_bluetooth::transport::HciTransport>,
     ) -> Self {
         Self { regs, transport }
     }
@@ -841,15 +841,15 @@ impl narf_power::device_pm::DevicePmOps for BtIntelPciePm {
         // handshake to ack: park the pump and report success so a
         // dead controller cannot veto every later suspend.
         if firmware_lost() {
-            if let Some(index) = crate::controller::index_of_transport(&self.transport) {
-                crate::pm::suspend_controller(index);
+            if let Some(index) = narf_bluetooth::controller::index_of_transport(&self.transport) {
+                narf_bluetooth::pm::suspend_controller(index);
             }
             return Ok(());
         }
         // Park first: the pump must not issue HCI into a device
         // that is about to sleep.
-        if let Some(index) = crate::controller::index_of_transport(&self.transport) {
-            crate::pm::suspend_controller(index);
+        if let Some(index) = narf_bluetooth::controller::index_of_transport(&self.transport) {
+            narf_bluetooth::pm::suspend_controller(index);
         } else {
             let _ = writeln!(
                 narf_console::Writer,
@@ -906,8 +906,8 @@ impl narf_power::device_pm::DevicePmOps for BtIntelPciePm {
         // Re-arm before unparking: the pump must not transmit
         // before the device has RX buffers again.
         self.regs.rearm_rx();
-        if let Some(index) = crate::controller::index_of_transport(&self.transport) {
-            crate::pm::resume_controller(index);
+        if let Some(index) = narf_bluetooth::controller::index_of_transport(&self.transport) {
+            narf_bluetooth::pm::resume_controller(index);
         }
         Ok(())
     }
@@ -1034,14 +1034,14 @@ pub(crate) fn maybe_reload_firmware() -> ReloadOutcome {
 /// power cut (same `Arc`, already registered) and keeps its HCI
 /// index — `register_ready_transport` must NOT be re-run.
 pub(crate) fn maybe_reload_firmware_with(
-    transport: &alloc::sync::Arc<dyn crate::transport::HciTransport>,
+    transport: &alloc::sync::Arc<dyn narf_bluetooth::transport::HciTransport>,
     reloader: &dyn PcieFwReload,
 ) -> ReloadOutcome {
     use core::fmt::Write as _;
     if !firmware_lost() {
         return ReloadOutcome::NotNeeded;
     }
-    let Some(index) = crate::controller::index_of_transport(transport) else {
+    let Some(index) = narf_bluetooth::controller::index_of_transport(transport) else {
         let _ = writeln!(
             narf_console::Writer,
             "  btintel-pcie: firmware lost but no HCI index; reload deferred",
@@ -1076,7 +1076,7 @@ pub(crate) fn maybe_reload_firmware_with(
         }
     }
     FIRMWARE_LOST.store(false, Ordering::Release);
-    crate::pm::resume_controller(index);
+    narf_bluetooth::pm::resume_controller(index);
     let _ = writeln!(
         narf_console::Writer,
         "  btintel-pcie: firmware reloaded after power cut; controller serving again",
@@ -1125,8 +1125,9 @@ static CONTROLLER: IrqSafeSpinLock<Option<alloc::sync::Arc<BtIntelPcie>>> =
 /// Set in `register_transport` next to the device-PM ops; the
 /// transport survives a power cut (same `Arc`), so the reload
 /// unparks the pump through it instead of re-registering.
-static TRANSPORT: IrqSafeSpinLock<Option<alloc::sync::Arc<dyn crate::transport::HciTransport>>> =
-    IrqSafeSpinLock::new(None);
+static TRANSPORT: IrqSafeSpinLock<
+    Option<alloc::sync::Arc<dyn narf_bluetooth::transport::HciTransport>>,
+> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1282,9 +1283,9 @@ fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
         return;
     }
 
-    let t: alloc::sync::Arc<dyn crate::transport::HciTransport> =
+    let t: alloc::sync::Arc<dyn narf_bluetooth::transport::HciTransport> =
         alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
-    crate::transport::register(t.clone());
+    narf_bluetooth::transport::register(t.clone());
     // Keep the transport for the post-resume reload (#1660): the
     // reload resolves the HCI index through it to unpark the pump.
     *TRANSPORT.lock() = Some(t.clone());
@@ -1296,7 +1297,7 @@ fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
     let _ = writeln!(
         narf_console::Writer,
         "  btintel-pcie: HCI transport registered ({} total)",
-        crate::transport::transport_count(),
+        narf_bluetooth::transport::transport_count(),
     );
 }
 

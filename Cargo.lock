@@ -1228,6 +1228,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-bluetooth-btintel-pcie"
+version = "0.0.0"
+dependencies = [
+ "narf-bluetooth",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-efi",
+ "narf-firmware",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-crypto"
 version = "0.0.0"
 dependencies = [
@@ -2900,6 +2921,7 @@ dependencies = [
  "narf-crypto",
  "narf-drivers",
  "narf-drivers-backlight",
+ "narf-drivers-bluetooth-btintel-pcie",
  "narf-drivers-crypto",
  "narf-drivers-fingerprint",
  "narf-drivers-fs-9p",
