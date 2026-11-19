@@ -238,6 +238,16 @@ enum Cmd {
     /// multi-page reads, a read-modify-write and a write driven entirely by
     /// module text.
     NvmeModuleBlockSmoke(BuildArgs),
+    /// USB + block datapath C-ABI proof over QEMU's `usb-storage` (a
+    /// Bulk-Only Transport stick). Builds and ABI-stamps usb-storage.ko,
+    /// autoloads it with the built-in MSC binder stepped aside
+    /// (`narf-drivers-usb/msc-module-only`), and serves a purpose-built
+    /// 32 KiB image. The guest shell writes a token into sector 0 of the
+    /// module's `/dev/usb-msc0` and reads the stick back (a host-only marker
+    /// must come back); after QEMU exits the image file must hold the token
+    /// with every other byte unchanged. Proves SCSI over module-submitted
+    /// bulk transfers feeding a module-backed disk.
+    UsbStorageModuleBlockSmoke(BuildArgs),
     /// The same live TCP/UDP/DNS smoke over the built-in igb driver bound to
     /// QEMU's `-device igb` (82576, 0x10C9). Boots LegacyOnly with the static
     /// IPv4 late initcall so igb is the sole NIC and owns the SLIRP lease,
@@ -1976,6 +1986,17 @@ impl Arch {
                             format!("socket,id=usbser0,path={sock},server=off"),
                             "-device".into(),
                             "usb-serial,bus=xhci0.0,chardev=usbser0,always-plugged=on".into(),
+                        ]);
+                    }
+                    // `XTASK_QEMU_USB_STORAGE_IMG=<file>`: a Bulk-Only
+                    // Transport stick (`usb-storage`) serving that raw image.
+                    // Used by `usb-storage-module-block-smoke`; absent otherwise.
+                    if let Ok(img) = std::env::var("XTASK_QEMU_USB_STORAGE_IMG") {
+                        args.extend_from_slice(&[
+                            "-drive".into(),
+                            format!("if=none,id=usbstick0,format=raw,file={img}"),
+                            "-device".into(),
+                            "usb-storage,bus=xhci0.0,drive=usbstick0".into(),
                         ]);
                     }
                     if gpu_backend != GpuBackend::Virgl {
@@ -8653,32 +8674,110 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
+/// What one module block smoke boots and expects.
+struct ModuleBlockSmoke {
+    name: &'static str,
+    /// Module crate and its initramfs path.
+    package: &'static str,
+    ko_path: &'static str,
+    /// Kernel feature that steps the built-in claimant aside.
+    module_only: &'static str,
+    /// Env var `qemu_args` reads to attach the served image.
+    image_env: &'static str,
+    /// The module's disk node and the log lines a passing boot prints.
+    node: &'static str,
+    required: &'static [(&'static str, &'static str)],
+    /// Seconds the guest waits before touching the disk (device attach).
+    settle_secs: u32,
+    token: &'static str,
+}
+
 /// `cargo xtask nvme-module-block-smoke` — see [`Cmd::NvmeModuleBlockSmoke`].
 fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    module_block_smoke(
+        args,
+        &ModuleBlockSmoke {
+            name: "nvme-module-block-smoke",
+            package: "narf-drivers-nvme",
+            ko_path: "lib/modules/nvme.ko",
+            module_only: "narf-drivers-nvme/nvme-module-only",
+            image_env: "NARF_NVME_IMG",
+            node: "/dev/nvme0n1",
+            required: &[
+                (
+                    "modules: autoloaded nvme from lib/modules/nvme.ko",
+                    "nvme.ko was not autoloaded from the initramfs",
+                ),
+                (
+                    "nvme(.ko): polled controller live, registered nvme0n1",
+                    "the module did not bring the controller up and register nvme0n1",
+                ),
+            ],
+            settle_secs: 0,
+            token: "NARF-NVME-WRITE",
+        },
+    )
+}
+
+/// `cargo xtask usb-storage-module-block-smoke` — see
+/// [`Cmd::UsbStorageModuleBlockSmoke`].
+fn usb_storage_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    module_block_smoke(
+        args,
+        &ModuleBlockSmoke {
+            name: "usb-storage-module-block-smoke",
+            package: "narf-drivers-usb-storage",
+            ko_path: "lib/modules/usb-storage.ko",
+            module_only: "narf-drivers-usb/msc-module-only",
+            image_env: "XTASK_QEMU_USB_STORAGE_IMG",
+            node: "/dev/usb-msc0",
+            required: &[
+                (
+                    "modules: autoloaded usb_storage from lib/modules/usb-storage.ko",
+                    "usb-storage.ko was not autoloaded from the initramfs",
+                ),
+                (
+                    "usb-storage(.ko): BOT device live, registered usb-msc0",
+                    "the module did not bring the stick up and register usb-msc0",
+                ),
+            ],
+            // The USB supervisor attaches the stick after the shell is up.
+            settle_secs: 4,
+            token: "NARF-USB-WRITE",
+        },
+    )
+}
+
+/// Boot with a module driving the only claimant of a disk. The guest writes
+/// a token into sector 0 (a partial-sector read-modify-write) and reads the
+/// whole disk back: the token and a host-only marker in sector 1 must come
+/// back. After QEMU exits the image must hold the token at byte 0 with
+/// every other byte unchanged.
+fn module_block_smoke(args: &BuildArgs, smoke: &ModuleBlockSmoke) -> Result<()> {
     /// Sector 1 of the served image starts with this. Only the host writes
     /// it, so seeing it on the console proves a read through the module.
-    const MARK: &[u8] = b"HOST-NVME-MARK\n";
-    /// The guest writes this (with `echo`'s newline) at byte 0.
-    const TOKEN: &[u8] = b"NARF-NVME-WRITE\n";
+    const MARK: &[u8] = b"HOST-DISK-MARK\n";
     const IMAGE_LEN: usize = 32 * 1024;
+    let name = smoke.name;
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask nvme-module-block-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!("xtask {name}: only x86_64 is wired (boot-init is x86_64-only)");
     }
     let root = workspace_root()?;
     let mut build = args.clone();
     ensure_feature(&mut build.features, "boot-init");
     ensure_feature(&mut build.features, "firmware-allow-unsigned");
     ensure_feature(&mut build.features, "module-allow-unsigned");
-    ensure_feature(&mut build.features, "narf-drivers-nvme/nvme-module-only");
+    ensure_feature(&mut build.features, smoke.module_only);
 
     let abi = kernel_abi_hash_from_source(&root)?;
-    let module = build_module_fixture_with_abi("narf-drivers-nvme", build.arch, &root, Some(abi))?;
-    let cpio = encode_cpio_newc(&[("lib/modules/nvme.ko", module.as_slice())]);
-    let initrd = root
-        .join("target")
-        .join("nvme-module-block-smoke-initramfs.cpio");
+    let module = build_module_fixture_with_abi(smoke.package, build.arch, &root, Some(abi))?;
+    let cpio = encode_cpio_newc(&[(smoke.ko_path, module.as_slice())]);
+    let initrd = root.join("target").join(format!("{name}-initramfs.cpio"));
     std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
-    println!("xtask nvme-module-block-smoke: staged ABI 0x{abi:08x} nvme.ko for autoload");
+    println!(
+        "xtask {name}: staged ABI 0x{abi:08x} {} for autoload",
+        smoke.ko_path
+    );
 
     // Printable filler (64-byte lines) so `cat` of the whole disk stays a
     // readable transcript; the marker opens sector 1.
@@ -8690,14 +8789,14 @@ fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     }
     image[512..512 + MARK.len()].copy_from_slice(MARK);
     let before = image.clone();
-    let disk = root.join("target").join("nvme-module-block-smoke.img");
+    let disk = root.join("target").join(format!("{name}.img"));
     std::fs::write(&disk, &image).with_context(|| format!("writing {}", disk.display()))?;
-    std::env::set_var("NARF_NVME_IMG", &disk);
+    std::env::set_var(smoke.image_env, &disk);
     {
         let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
-        let extra = "no_redis modules_load=lib/modules/nvme.ko";
+        let extra = format!("no_redis modules_load={}", smoke.ko_path);
         let combined = if existing.is_empty() {
-            extra.to_string()
+            extra
         } else {
             format!("{existing} {extra}")
         };
@@ -8712,50 +8811,50 @@ fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
 
     // Write first, then read the whole disk: the read must return the token
     // (read-after-write through the module) and, after it, the host marker.
-    let typed = "echo NARF-NVME-WRITE > /dev/nvme0n1; sleep 1; cat /dev/nvme0n1";
+    let settle = if smoke.settle_secs == 0 {
+        String::new()
+    } else {
+        format!("sleep {}; ", smoke.settle_secs)
+    };
+    let typed = format!(
+        "{settle}echo {} > {node}; sleep 1; cat {node}",
+        smoke.token,
+        node = smoke.node
+    );
     let transcript = run_interactive_boot(
         &kernel,
         Some(&initrd),
         &build,
-        typed,
+        &typed,
         std::str::from_utf8(MARK.trim_ascii_end()).expect("ASCII"),
     )?;
 
-    let required: [(&str, &str); 2] = [
-        (
-            "modules: autoloaded nvme from lib/modules/nvme.ko",
-            "nvme.ko was not autoloaded from the initramfs",
-        ),
-        (
-            "nvme(.ko): polled controller live, registered nvme0n1",
-            "the module did not bring the controller up and register nvme0n1",
-        ),
-    ];
-    for (needle, why) in required {
+    for (needle, why) in smoke.required {
         if !transcript.contains(needle) {
-            bail!("xtask nvme-module-block-smoke: {why} (missing `{needle}`)");
+            bail!("xtask {name}: {why} (missing `{needle}`)");
         }
     }
     // Once in the typed command line, once from `cat` of sector 0.
-    let token = std::str::from_utf8(TOKEN.trim_ascii_end()).expect("ASCII");
-    if transcript.matches(token).count() < 2 {
-        bail!(
-            "xtask nvme-module-block-smoke: reading the disk back did not return the guest's write"
-        );
+    if transcript.matches(smoke.token).count() < 2 {
+        bail!("xtask {name}: reading the disk back did not return the guest's write");
     }
 
+    let written = format!("{}\n", smoke.token);
     let after = std::fs::read(&disk).with_context(|| format!("reading {}", disk.display()))?;
-    if after.len() != IMAGE_LEN || !after.starts_with(TOKEN) {
-        bail!("xtask nvme-module-block-smoke: the guest's write did not reach the image at byte 0");
+    if after.len() != IMAGE_LEN || !after.starts_with(written.as_bytes()) {
+        bail!("xtask {name}: the guest's write did not reach the image at byte 0");
     }
-    if after[TOKEN.len()..] != before[TOKEN.len()..] {
+    if after[written.len()..] != before[written.len()..] {
         bail!(
-            "xtask nvme-module-block-smoke: the write disturbed bytes past the token \
+            "xtask {name}: the write disturbed bytes past the token \
              (the partial-sector read-modify-write lost data)"
         );
     }
+    let _ = std::fs::remove_file(&disk);
+    let _ = std::fs::remove_file(&initrd);
     println!(
-        "xtask nvme-module-block-smoke: PASS — reads, a partial-sector write and read-back through nvme.ko"
+        "xtask {name}: PASS — reads, a partial-sector write and read-back through {}",
+        smoke.ko_path
     );
     Ok(())
 }
@@ -15864,6 +15963,7 @@ fn main() -> Result<()> {
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::FtdiModuleSerialSmoke(args) => ftdi_module_serial_smoke_cmd(&args),
         Cmd::NvmeModuleBlockSmoke(args) => nvme_module_block_smoke_cmd(&args),
+        Cmd::UsbStorageModuleBlockSmoke(args) => usb_storage_module_block_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
         Cmd::NetPeer(args) => net_robust::net_peer_main(&args.sock, args.mask, args.long),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),

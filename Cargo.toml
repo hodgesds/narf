@@ -163,6 +163,7 @@ members = [
     "drivers/wwan/core",
     "drivers/wwan/cdc-mbim",
     "drivers/usb/ftdi",
+    "drivers/usb/storage",
     "drivers/sdio",
     "drivers/sound",
     "drivers/tpm",

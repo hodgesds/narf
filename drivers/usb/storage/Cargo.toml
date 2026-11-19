@@ -1,0 +1,36 @@
+# USB mass-storage (Bulk-Only Transport) driver — dual-build.
+#
+#   * `builtin` (default): the BOT/SCSI wire codec only (`codec`). The
+#     built-in binder stays in `narf-drivers-usb::msc` (multi-LUN, UAS
+#     fallback, error recovery); its encoders are checked byte-for-byte
+#     against this codec so both builds put the same commands on the wire.
+#   * `module`: `cargo xtask build-module --package narf-drivers-usb-storage
+#     --no-default-features --features module`. A working loadable driver:
+#     it matches BOT interfaces (08/06/50) through `narf_register_usb_driver`,
+#     drives the stick through the `narf_usb_*` exports, and publishes it as
+#     a module-backed disk through `narf_blk_*`.
+
+[package]
+name         = "narf-drivers-usb-storage"
+description  = "USB mass-storage (BOT) driver — shared codec built in, or a working loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_usb_storage"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+# The codec has no kernel dependencies, so neither build pulls any.
+builtin = []
+module = []
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+
+[lints]
+workspace = true

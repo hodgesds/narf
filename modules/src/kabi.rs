@@ -313,7 +313,7 @@ kernel_abi! {
     /// subclass, bit 3 interface protocol; unselected fields are ignored.
     /// `probe` is a `ModuleProbeFn` called through the module call gate, in
     /// task context, for a device no built-in driver claimed; its `dev_token`
-    /// is an opaque USB device token (no USB datapath export accepts it yet)
+    /// is an opaque USB device token, accepted by the `narf_usb_*` exports,
     /// and a 0 return claims the device. Returns 0, `-EINVAL` for a bad
     /// name, null probe, no/unknown flags or a vendor match on VID 0,
     /// `-ENODEV` when the kernel has no USB stack, `-EBUSY` when another
@@ -974,6 +974,20 @@ kernel_abi! {
         narf_bus::module_usb::cancel(crate::symbols::current_execution_id().0, dev, urb)
     }
 
+    /// Wait up to `timeout_ns` (at most 1 s) for a bulk or interrupt request
+    /// submitted without a completion callback, polling it inline: the wait
+    /// never depends on another task running, so synchronous paths (a block
+    /// request callback) can use it. 0 once terminal (collect it with
+    /// `narf_usb_poll`), `-ETIMEDOUT`, `-EINVAL` for an unknown request or
+    /// one with a callback, `-EOPNOTSUPP` for control/configure requests.
+    ///
+    /// # Safety
+    /// `dev`/`urb` are this module's own token and request id.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_wait(dev: u64, urb: u64, timeout_ns: u64) -> i32 {
+        narf_bus::module_usb::wait(crate::symbols::current_execution_id().0, dev, urb, timeout_ns)
+    }
+
     /// Publish a `/dev/ttyUSB<N>` node backed by this device and store its
     /// port number through `out_port`. `family` names the chip for sysfs
     /// (0 ch341, 1 ftdi_sio, 2 pl2303, 3 cp210x). `kick` (0 or an `extern
@@ -1098,7 +1112,8 @@ kernel_abi! {
     ) -> i32 {
         let Some(end) = req_off.checked_add(len) else { return -22; };
         let owner = crate::symbols::current_execution_id().0;
-        crate::module_block::copy(owner, dev, request, dma, dma_off, req_off..end, false)
+        let side = crate::module_block::Endpoint::Dma { handle: dma, offset: dma_off };
+        crate::module_block::copy(owner, dev, request, side, req_off..end, false)
     }
 
     /// Copy `len` bytes from offset `dma_off` of DMA buffer `dma` into a
@@ -1114,7 +1129,38 @@ kernel_abi! {
     ) -> i32 {
         let Some(end) = req_off.checked_add(len) else { return -22; };
         let owner = crate::symbols::current_execution_id().0;
-        crate::module_block::copy(owner, dev, request, dma, dma_off, req_off..end, true)
+        let side = crate::module_block::Endpoint::Dma { handle: dma, offset: dma_off };
+        crate::module_block::copy(owner, dev, request, side, req_off..end, true)
+    }
+
+    /// Copy `len` bytes of module memory at `src` into a running read
+    /// request, starting `req_off` bytes into it: for drivers without bus
+    /// DMA buffers (USB). Valid only inside that request's callback.
+    ///
+    /// # Safety
+    /// `src` names `len` readable bytes of module memory.
+    requires narf_capabilities::CapKind::BlockDevice;
+    fn narf_blk_fill(dev: u64, request: u64, req_off: usize, src: *const u8, len: usize) -> i32 {
+        if src.is_null() { return -22; }
+        let Some(end) = req_off.checked_add(len) else { return -22; };
+        let owner = crate::symbols::current_execution_id().0;
+        let side = crate::module_block::Endpoint::Module(src as usize);
+        crate::module_block::copy(owner, dev, request, side, req_off..end, true)
+    }
+
+    /// Copy `len` bytes of a running write request, starting `req_off` bytes
+    /// into it, to module memory at `dst`. Valid only inside that request's
+    /// callback.
+    ///
+    /// # Safety
+    /// `dst` names `len` writable bytes of module memory.
+    requires narf_capabilities::CapKind::BlockDevice;
+    fn narf_blk_fetch(dev: u64, request: u64, req_off: usize, dst: *mut u8, len: usize) -> i32 {
+        if dst.is_null() { return -22; }
+        let Some(end) = req_off.checked_add(len) else { return -22; };
+        let owner = crate::symbols::current_execution_id().0;
+        let side = crate::module_block::Endpoint::Module(dst as usize);
+        crate::module_block::copy(owner, dev, request, side, req_off..end, false)
     }
 }
 
@@ -1464,6 +1510,8 @@ fn smoke_kabi_usb_datapath_validates_arguments() -> TestResult {
     let rejected = unsafe {
         narf_usb_poll(UNKNOWN, 1, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut()) == -22
             && narf_usb_poll(UNKNOWN, 1, core::ptr::null_mut(), 8, &mut n) == -22
+            && narf_usb_wait(UNKNOWN, 1, 0) == -22
+            && narf_usb_wait(UNKNOWN, 1, 2_000_000_000) == -22
             && narf_usb_config_descriptor(UNKNOWN, buf.as_mut_ptr(), 1 << 20, &mut n) == -22
             && narf_usb_control(UNKNOWN, core::ptr::null(), core::ptr::null(), 0, 0, 0, &mut urb) == -22
             && narf_usb_control(UNKNOWN, setup.as_ptr(), core::ptr::null(), 4, 0, 0, &mut urb) == -22
@@ -1498,6 +1546,7 @@ fn smoke_kabi_usb_datapath_validates_arguments() -> TestResult {
             narf_usb_configure(UNKNOWN, eps.as_ptr(), 1, 0, 0, &mut urb),
             narf_usb_poll(UNKNOWN, 1, buf.as_mut_ptr(), buf.len(), &mut n),
             narf_usb_cancel(UNKNOWN, 1),
+            narf_usb_wait(UNKNOWN, 1, 1_000_000),
             narf_usb_serial_register(UNKNOWN, 1, 0, 0, &mut port),
         ]
     };
@@ -1531,6 +1580,10 @@ fn smoke_kabi_block_datapath_validates_arguments() -> TestResult {
             && narf_blk_copy_in(UNKNOWN, 1, 1, 0, usize::MAX, 2) == -22
             && narf_blk_copy_out(UNKNOWN, 1, 1, 0, 0, 512) == -22
             && narf_blk_copy_in(UNKNOWN, 1, 1, 0, 0, 512) == -22
+            && narf_blk_fill(UNKNOWN, 1, 0, core::ptr::null(), 512) == -22
+            && narf_blk_fetch(UNKNOWN, 1, 0, core::ptr::null_mut(), 512) == -22
+            && narf_blk_fill(UNKNOWN, 1, usize::MAX, geometry.as_ptr().cast(), 2) == -22
+            && narf_blk_fetch(UNKNOWN, 1, 0, [0u8; 8].as_mut_ptr(), 8) == -22
     };
     if !rejected {
         return TestResult::Fail("a block datapath export accepted a malformed argument");

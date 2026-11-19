@@ -2592,6 +2592,7 @@ dependencies = [
  "narf-drivers-leds",
  "narf-drivers-sound",
  "narf-drivers-usb-ftdi",
+ "narf-drivers-usb-storage",
  "narf-drivers-video",
  "narf-filesystem",
  "narf-firmware",
@@ -2612,6 +2613,13 @@ dependencies = [
 
 [[package]]
 name = "narf-drivers-usb-ftdi"
+version = "0.0.0"
+dependencies = [
+ "narf-driver-macros",
+]
+
+[[package]]
+name = "narf-drivers-usb-storage"
 version = "0.0.0"
 dependencies = [
  "narf-driver-macros",

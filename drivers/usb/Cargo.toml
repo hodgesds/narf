@@ -42,6 +42,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-ctap2        = { path = "../../ctap2" }
 narf-crypto       = { path = "../../crypto" }
 narf-drivers-usb-ftdi = { path = "ftdi" }
+narf-drivers-usb-storage = { path = "storage" }
 
 [features]
 kernel-test = ["narf-ctap2/kernel-test"]
@@ -50,6 +51,10 @@ kernel-test = ["narf-ctap2/kernel-test"]
 # the device falls through to the module's `narf_register_usb_driver` match.
 # Used by `cargo xtask ftdi-module-serial-smoke`; off in every normal build.
 ftdi-module-only = []
+# Leave USB mass storage (BOT, 08/06/50) to `usb-storage.ko`: the built-in
+# binder skips it and does not register its class entry, so the stick falls
+# through to module matches. Used by `cargo xtask usb-storage-module-block-smoke`.
+msc-module-only = []
 
 [lints]
 workspace = true

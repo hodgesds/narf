@@ -402,9 +402,10 @@ narf_usb_cancel(dev, urb) -> i32
 narf_usb_serial_register(dev, family, kick, cookie, out_port) -> i32
 narf_usb_serial_tx(dev, port, buf, len, out_len) -> i32
 narf_usb_serial_rx(dev, port, data, len) -> i32
+narf_usb_wait(dev, urb, timeout_ns) -> i32
 ```
 
-All nine require `BusDevice`. Their path is `kabi.rs` → `narf_bus::module_usb`
+All ten require `BusDevice`. Their path is `kabi.rs` → `narf_bus::module_usb`
 (shape checks; bus sits below the USB stack) → the USB stack's permanent
 `Datapath` hooks (`drivers/usb/src/module_datapath.rs`).
 
@@ -443,6 +444,17 @@ All nine require `BusDevice`. Their path is `kabi.rs` → `narf_bus::module_usb`
   module's kick callback; the module drains them to bulk-OUT and delivers
   bulk-IN payloads to readers. HCI and WWAN sinks (for `btusb.ko` and
   `cdc_mbim.ko`) are the next extensions; they are not part of this slice.
+  A storage module instead publishes a disk through the
+  [block datapath](#block-datapath).
+- **Synchronous waits for synchronous callers.** A block request callback
+  must finish its request before returning, and it may run inside an
+  executor poll, so it cannot wait for the per-context pump task.
+  `narf_usb_wait` polls one bulk or interrupt request inline (the xHCI
+  bulk poll drains the event ring itself, as the built-in MSC driver's
+  `block_on_spin` bridge relies on) and needs no other task to run. It
+  only accepts requests submitted without a completion callback, so it
+  never swallows one or re-enters the module, and it refuses control and
+  configure requests (`-EOPNOTSUPP`), which complete in kernel tasks.
 
 Proof: `ftdi-module-serial-smoke` boots with QEMU's `usb-serial` (FTDI
 FT232BM) wired to a host socket, the built-in FTDI binder stepped aside
@@ -470,9 +482,11 @@ was nowhere to deliver sectors. The block sink is that place:
 narf_blk_register(dev, name, name_len, geometry[4], request, cookie) -> i32
 narf_blk_copy_in(dev, request, dma, dma_off, req_off, len) -> i32
 narf_blk_copy_out(dev, request, dma, dma_off, req_off, len) -> i32
+narf_blk_fill(dev, request, req_off, src, len) -> i32
+narf_blk_fetch(dev, request, req_off, dst, len) -> i32
 ```
 
-All three require `BlockDevice`. They are implemented in the modules crate
+All five require `BlockDevice`. They are implemented in the modules crate
 (`modules/src/module_block.rs`), which owns the module call gate and can
 reach both the bus DMA table and the block registry.
 
@@ -480,7 +494,8 @@ reach both the bus DMA table and the block registry.
   at most 31 bytes, unused) and geometry (`[block size 512..=4096, capacity,
   max blocks <= 1 MiB of data, flags]`; bit 0 volatile write cache, bit 1
   read-only), checks that the caller holds a live probe context for `dev`
-  (`narf_bus::module_device_live`), and registers an ordinary
+  (`narf_bus::module_device_live` for PCI, `module_usb::context_live` for
+  USB), and registers an ordinary
   `BlockDeviceSync`. `/dev/<name>`, the disk-write policy, partition
   scanning and filesystems treat it like any built-in disk.
 - **Synchronous requests, like the built-in polled drivers.** `read`,
@@ -491,17 +506,23 @@ reach both the bus DMA table and the block registry.
   A module that registers a disk from its probe and is then read during
   that registration (disk policy) is already in its own context; that
   nested request skips the gate and still takes the per-disk slot.
-- **Kernel-side copies, no shared pointers.** The module never sees the
-  caller's buffer and the kernel never dereferences module memory. Inside a
-  request the module asks the kernel to copy between the request and one of
-  its own DMA buffers (`narf_bus::module_dma_read`/`write`). A copy is
+- **Kernel-side copies; the module never sees the caller's buffer.**
+  Inside a request the module asks the kernel to copy between the request
+  and either one of its own DMA buffers (`narf_blk_copy_in`/`copy_out`, via
+  `narf_bus::module_dma_read`/`write`: PCI drivers) or module memory it
+  names (`narf_blk_fetch`/`fill`: USB drivers, whose transfers already copy
+  through module memory and who own no bus DMA buffers). A copy is
   checked against the request's owner, token, direction and length, and a
   second concurrent copy of the same request is `-EBUSY`. Request ids are
   never reused, so a copy after the callback returned is `-EINVAL`.
-- **Unload.** `delete_module` (and a failed init) calls `retire_owner`
-  before the bus context goes: new requests fail `DeviceRemoved`, a running
-  one is waited out (5 s bound), and every disk is unregistered, all before
-  module text is unmapped.
+- **Unload and removal.** `delete_module` (and a failed init) calls
+  `retire_owner` before the bus context goes: new requests fail
+  `DeviceRemoved`, a running one is waited out (5 s bound), and every disk
+  is unregistered, all before module text is unmapped. The bus also reports
+  every retired PCI or USB device context
+  (`narf_bus::module_context_retired`: unplug, reprobe, declined probe), and
+  the disks registered for that one device are retired the same way, so an
+  unplugged stick's disk disappears instead of failing in place.
 
 The reference driver is deliberately small: one admin and one I/O queue,
 polled with `narf_dma_wait8`, namespace 1 only, a 64 KiB data buffer with a
@@ -518,3 +539,12 @@ exits, the host image must hold the token at byte 0 with every other byte
 unchanged. In-kernel smokes (`modules/block`, `modules/kabi`) cover name
 and geometry validation, limits, request splitting, errno mapping, read-only
 and flush flags, copy checks and retirement.
+
+`usb-storage.ko` (`drivers/usb/storage`) is the USB consumer. Its probe and
+the configure / `SET_CONFIGURATION` steps run from completions; the SCSI
+bring-up (TEST UNIT READY, INQUIRY, READ CAPACITY(10)) and every block
+request then run synchronously as CBW → data → CSW over callback-less bulk
+requests waited with `narf_usb_wait`, at most 4 KiB per command (one
+transfer). `narf-drivers-usb/msc-module-only` steps the built-in binder
+aside. `usb-storage-module-block-smoke` proves it with the same
+write/read-back/image check as the NVMe smoke, over QEMU's `usb-storage`.

@@ -744,6 +744,16 @@ also consult upstream Linux GPL sources.
     `serial_tx` drains that ring (nothing while `TCXONC` stopped it) and
     `serial_rx` feeds readers. Termios ioctls on a module node update its
     cached state only (`port::binding_for_tty` has no built-in binding).
+- Feature `msc-module-only`: the attach cascade skips the built-in MSC
+  binder and its class-registry entry is not registered, so BOT sticks
+  (08/06/50) reach a loadable `usb-storage` module's match
+  (`narf-drivers-usb-storage`). That crate's const BOT/SCSI codec is checked
+  byte-for-byte against `msc`'s encoders (`drivers/usb/msc` smoke), and
+  `msc` takes its interface triple and CBW/CSW signatures from it.
+- Module datapath `wait` polls one callback-less bulk/interrupt request
+  inline (the same per-request poll the pump uses), so a synchronous module
+  path (a block request callback) never waits on the pump task. Retiring a
+  context reports it through `narf_bus::module_context_retired` first.
 - Feature `ftdi-module-only`: the serial cascade skips the FTDI family so
   FTDI parts reach a loadable `ftdi_sio` module's match
   (`narf-drivers-usb-ftdi`). The FTDI wire codec (`serial::ftdi`'s request

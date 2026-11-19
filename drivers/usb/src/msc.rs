@@ -84,14 +84,14 @@ const MSC_DMA_PAGE_BYTES: u32 = 4096;
 // transparent command set + Bulk-Only Transport (§4.0 of the BOT
 // spec; §3.1 of the parent MSC spec). These show up in the
 // Interface Descriptor's bInterfaceClass / SubClass / Protocol.
-pub const MSC_INTERFACE_CLASS: u8 = 0x08;
-pub const MSC_INTERFACE_SUBCLASS: u8 = 0x06; // SCSI Transparent
-pub const MSC_INTERFACE_PROTOCOL: u8 = 0x50; // Bulk-Only Transport
+pub const MSC_INTERFACE_CLASS: u8 = narf_drivers_usb_storage::codec::INTERFACE_CLASS;
+pub const MSC_INTERFACE_SUBCLASS: u8 = narf_drivers_usb_storage::codec::INTERFACE_SUBCLASS; // SCSI Transparent
+pub const MSC_INTERFACE_PROTOCOL: u8 = narf_drivers_usb_storage::codec::INTERFACE_PROTOCOL; // Bulk-Only Transport
 
 /// CBW signature (§5.1 Table 5.1) — `b'USBC'` little-endian.
-pub const CBW_SIGNATURE: u32 = 0x4342_5355;
+pub const CBW_SIGNATURE: u32 = narf_drivers_usb_storage::codec::CBW_SIGNATURE;
 /// CSW signature (§5.2 Table 5.2) — `b'USBS'` little-endian.
-pub const CSW_SIGNATURE: u32 = 0x5342_5355;
+pub const CSW_SIGNATURE: u32 = narf_drivers_usb_storage::codec::CSW_SIGNATURE;
 
 /// CBW direction bit (bmCBWFlags bit 7): 1 = data IN (device to host).
 const CBW_FLAG_IN: u8 = 0x80;
@@ -2430,4 +2430,58 @@ mod block_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/msc", smoke_msc_fua_preflights_whole_request);
+}
+
+/// The built-in binder and `usb-storage.ko` must put identical bytes on the
+/// wire: the module builds its commands with the shared const codec
+/// (`narf-drivers-usb-storage::codec`), this binder with the encoders above.
+#[cfg(feature = "kernel-test")]
+mod codec_parity_tests {
+    use narf_drivers_usb_storage::codec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_msc_shared_codec_matches_builtin() -> TestResult {
+        let read = codec::read10(0x0102_0304, 0x0506);
+        let write = codec::write10(0xA0B0_C0D0, 8);
+        let sync = codec::synchronize_cache10();
+        let cdbs = read.bytes()[..10] == super::encode_read10(0x0102_0304, 0x0506)
+            && write.bytes()[..10] == super::encode_write10(0xA0B0_C0D0, 8)
+            && sync.bytes()[..10] == super::encode_synchronize_cache10()
+            && read.bytes()[10..].iter().all(|&b| b == 0)
+            && read.len() == 10;
+        if !cdbs {
+            return TestResult::Fail("shared READ/WRITE/SYNC CACHE(10) bytes differ from msc's");
+        }
+        let wrapped = codec::cbw(0xDEAD_BEEF, 4096, true, 0, &read)
+            == super::encode_cbw(0xDEAD_BEEF, 4096, true, 0, &read.bytes()[..10])
+            && codec::cbw(7, 512, false, 2, &write)
+                == super::encode_cbw(7, 512, false, 2, &write.bytes()[..10])
+            && codec::cbw(9, 0, false, 0, &codec::test_unit_ready())
+                == super::encode_cbw(9, 0, false, 0, &[0u8; 6]);
+        if !wrapped {
+            return TestResult::Fail("shared CBW bytes differ from msc's encode_cbw");
+        }
+        let mut csw = [0u8; codec::CSW_LEN];
+        csw[..4].copy_from_slice(&codec::CSW_SIGNATURE.to_le_bytes());
+        csw[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        csw[8..12].copy_from_slice(&16u32.to_le_bytes());
+        csw[12] = codec::CSW_FAILED;
+        let ours = codec::decode_csw(&csw);
+        let theirs = super::decode_csw(&csw);
+        let csw_ok = matches!(
+            (ours, theirs),
+            (Some(a), Some(b)) if a.tag == b.tag && a.residue == b.residue && a.status == b.status
+        );
+        let capacity = [0, 0, 0x10, 0, 0, 0, 2, 0];
+        let (last, block) = codec::decode_read_capacity10(&capacity);
+        let cap_ok = super::decode_read_capacity10(&capacity) == Some((block, last))
+            && (last, block) == (0x1000, 512);
+        let mut bad = csw;
+        bad[0] ^= 0xFF;
+        if !csw_ok || codec::decode_csw(&bad).is_some() || !cap_ok {
+            return TestResult::Fail("shared CSW / READ CAPACITY decoding differs from msc's");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/msc", smoke_msc_shared_codec_matches_builtin);
 }

@@ -465,7 +465,8 @@ so this crate needs no module-specific code: the disk-write policy guard,
 - Module errnos map to `BlockIoError`: `-ENODEV` → `DeviceRemoved`,
   `-EROFS` → `ReadOnly`, anything else → `DriverError`.
 - Unload unregisters the disk (`unregister_block_device`) before module
-  text is unmapped; a holder of the old `Arc` then sees `DeviceRemoved`.
+  text is unmapped, and so does retirement of the device's PCI or USB
+  context (unplug); a holder of the old `Arc` then sees `DeviceRemoved`.
 
 ## 4. Invariants & safety properties
 
