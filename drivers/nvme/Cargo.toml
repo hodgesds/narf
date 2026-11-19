@@ -24,6 +24,11 @@ builtin = [
     "dep:narf-filesystem", "dep:narf-console",
 ]
 module = []
+# Built-in build that leaves PCI NVMe to `nvme.ko`: the crate still builds
+# built-in, but its PCI matches are not registered, so a module loaded before
+# PCI probing binds the controller. Used by `cargo xtask
+# nvme-module-block-smoke`.
+nvme-module-only = ["builtin"]
 
 [dependencies]
 narf-driver-macros = { path = "../../driver-macros" }

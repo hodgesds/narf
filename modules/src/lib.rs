@@ -46,6 +46,7 @@ pub mod kabi;
 pub mod lifecycle;
 pub mod loader;
 pub mod manifest;
+pub mod module_block;
 pub mod params;
 pub mod plt;
 pub mod proc_modules;

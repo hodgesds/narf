@@ -200,6 +200,9 @@ So the surface is small and grows deliberately. Today:
 | `narf_usb_serial_register` | `(u64, u32, usize, u64, *mut u32) -> i32` | publish `/dev/ttyUSB<N>` backed by the device; kick callback on writes |
 | `narf_usb_serial_tx` | `(u64, u32, *mut u8, usize, *mut usize) -> i32` | take bytes writers queued on the node |
 | `narf_usb_serial_rx` | `(u64, u32, *const u8, usize) -> i32` | deliver received bytes to readers; returns bytes accepted |
+| `narf_blk_register` | `(u64, *const u8, usize, *const u64, usize, u64) -> i32` | publish a disk: name, geometry `[block size, capacity, max blocks, flags]`, request callback, cookie |
+| `narf_blk_copy_in` | `(u64, u64, u64, u64, usize, usize) -> i32` | inside a write request: copy request bytes into one of the module's DMA buffers |
+| `narf_blk_copy_out` | `(u64, u64, u64, u64, usize, usize) -> i32` | inside a read request: copy DMA buffer bytes into the request |
 
 Declare them as you would any foreign function:
 
@@ -221,7 +224,16 @@ three. The USB datapath exports (`narf_usb_*`) require `BusDevice`. Their
 `dev` is the token a USB probe received; every request is submitted, then
 optionally reported through a completion callback (task context, the
 module's domain) and collected with `narf_usb_poll`. `drivers/usb/ftdi` is the
-worked example: a USB-serial driver built entirely from completions. The retained per-device cap is still checked on every invocation; the
+worked example: a USB-serial driver built entirely from completions. The block
+exports (`narf_blk_*`) require `BlockDevice`. A registered disk joins the
+block registry (`/dev/<name>`, partitions, filesystems). Each request runs
+synchronously: the kernel calls the module's
+`extern "C" fn(cookie, request, op, lba, count) -> i32` (op 0 read, 1 write,
+2 flush) in the module's domain, one request per disk at a time, split to the
+module's `max blocks`. The module moves data only with `narf_blk_copy_in` /
+`narf_blk_copy_out`, which copy between the request and its own DMA buffers,
+so neither side hands the other a pointer. `drivers/nvme` (`module_probe.rs`)
+is the worked example: a polled NVMe host. The retained per-device cap is still checked on every invocation; the
 manifest declaration only controls whether the imports can link.
 
 IRQ callbacks never run in hard-IRQ context. The FRAME handler accounts and

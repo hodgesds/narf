@@ -958,6 +958,20 @@ pub fn module_pci_prepare_probe(owner: u64, token: u64) -> i32 {
     }
 }
 
+/// Whether `owner` holds a probe context for `token` whose device cap still
+/// validates. Subsystem sinks that live outside the bus (the module block
+/// sink in `narf-modules`) gate registration on it.
+pub fn module_device_live(owner: u64, token: u64) -> bool {
+    let cap = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(ctx) => ctx.cap,
+            None => return false,
+        }
+    };
+    cap.invoke(DeviceOp(|| ())).is_ok()
+}
+
 /// Enable PCI command bits through the module's current device authority.
 pub fn module_pci_enable(owner: u64, token: u64, bits: u16) -> i32 {
     let mut g = DEVICE_CTXS.lock();

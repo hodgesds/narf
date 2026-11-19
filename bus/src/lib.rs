@@ -77,11 +77,11 @@ pub use bar::{
 };
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use driver_match::{
-    bound_count as bound_pci_devices, detach as detach_pci_device, module_bar_map, module_dma_addr,
-    module_dma_alloc, module_dma_free, module_dma_read, module_dma_wait8, module_dma_write,
-    module_irq_set_handler, module_mmio_read32, module_mmio_wait32, module_mmio_write32,
-    module_msix_claim, module_msix_enable, module_netif_register,
-    module_netif_register_with_context, module_netif_rx, module_pci_enable,
+    bound_count as bound_pci_devices, detach as detach_pci_device, module_bar_map,
+    module_device_live, module_dma_addr, module_dma_alloc, module_dma_free, module_dma_read,
+    module_dma_wait8, module_dma_write, module_irq_set_handler, module_mmio_read32,
+    module_mmio_wait32, module_mmio_write32, module_msix_claim, module_msix_enable,
+    module_netif_register, module_netif_register_with_context, module_netif_rx, module_pci_enable,
     module_pci_prepare_probe, module_spawn_poller, probe_all as probe_all_pci,
     register as register_pci_driver, register_module_pci_driver,
     register_remove as register_pci_remove, registered as registered_pci_drivers,

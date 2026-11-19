@@ -1040,6 +1040,82 @@ kernel_abi! {
             Err(e) => e,
         }
     }
+
+    /// Register a module-backed disk `name` (lowercase ASCII, digits, `_`,
+    /// `-`; at most 31 bytes) for the device behind `dev`. `geometry` names
+    /// four `u64`s: bytes per block (512..=4096, a power of two), capacity
+    /// in blocks, the largest request in blocks (at most 1 MiB of data), and
+    /// flags (bit 0 volatile write cache, bit 1 read-only). `request` is an
+    /// `extern "C" fn(cookie: u64, request: u64, op: u32, lba: u64,
+    /// count: u32) -> i32`: op 0 read, 1 write, 2 flush. It runs in the
+    /// module's domain, finishes the whole request before returning, and
+    /// moves data only with `narf_blk_copy_in`/`narf_blk_copy_out`.
+    /// `-EEXIST` if the name is taken.
+    ///
+    /// # Safety
+    /// `name` names `name_len` readable bytes and `geometry` four readable,
+    /// aligned `u64`s. `request` stays valid until the module is unloaded.
+    requires narf_capabilities::CapKind::BlockDevice;
+    fn narf_blk_register(
+        dev: u64, name: *const u8, name_len: usize,
+        geometry: *const u64, request: usize, cookie: u64,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || name_len > crate::module_block::MAX_NAME
+            || geometry.is_null() || request == 0 || geometry.align_offset(8) != 0 {
+            return -22;
+        }
+        // SAFETY: non-null, bounded readable module storage; copied here.
+        let name = unsafe { core::slice::from_raw_parts(name, name_len) };
+        // SAFETY: the module promises four readable, aligned `u64`s.
+        let g = unsafe { core::slice::from_raw_parts(geometry, 4) };
+        let (Ok(lba_size), Ok(max_blocks), Ok(flags)) =
+            (u32::try_from(g[0]), u32::try_from(g[2]), u32::try_from(g[3]))
+        else {
+            return -22;
+        };
+        // SAFETY: the address has the documented C signature, and the disk is
+        // retired before the module's text is unmapped.
+        let request = unsafe {
+            core::mem::transmute::<usize, crate::module_block::RequestFn>(request)
+        };
+        let spec = crate::module_block::DiskSpec {
+            lba_size, capacity: g[1], max_blocks, flags, request, cookie,
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::module_block::register(owner, dev, name, spec)
+    }
+
+    /// Copy `len` bytes of a running write request, starting `req_off` bytes
+    /// into it, to offset `dma_off` of DMA buffer `dma`. Valid only inside
+    /// that request's callback.
+    ///
+    /// # Safety
+    /// `dev`/`dma` are this module's handles; nothing is dereferenced in
+    /// module memory.
+    requires narf_capabilities::CapKind::BlockDevice;
+    fn narf_blk_copy_in(
+        dev: u64, request: u64, dma: u64, dma_off: u64, req_off: usize, len: usize,
+    ) -> i32 {
+        let Some(end) = req_off.checked_add(len) else { return -22; };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::module_block::copy(owner, dev, request, dma, dma_off, req_off..end, false)
+    }
+
+    /// Copy `len` bytes from offset `dma_off` of DMA buffer `dma` into a
+    /// running read request, starting `req_off` bytes into it. Valid only
+    /// inside that request's callback.
+    ///
+    /// # Safety
+    /// `dev`/`dma` are this module's handles; nothing is dereferenced in
+    /// module memory.
+    requires narf_capabilities::CapKind::BlockDevice;
+    fn narf_blk_copy_out(
+        dev: u64, request: u64, dma: u64, dma_off: u64, req_off: usize, len: usize,
+    ) -> i32 {
+        let Some(end) = req_off.checked_add(len) else { return -22; };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::module_block::copy(owner, dev, request, dma, dma_off, req_off..end, true)
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -1431,3 +1507,46 @@ fn smoke_kabi_usb_datapath_validates_arguments() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_usb_datapath_validates_arguments);
+
+/// The block exports reject malformed arguments, refuse a device the caller
+/// holds no probe context for (`-ENODEV`, so no disk is published), and
+/// refuse a copy outside a running request.
+fn smoke_kabi_block_datapath_validates_arguments() -> TestResult {
+    extern "C" fn request(_: u64, _: u64, _: u32, _: u64, _: u32) -> i32 {
+        0
+    }
+    const UNKNOWN: u64 = 0xB10C_FEFE;
+    let name = b"mblkkabi0";
+    let geometry = [512u64, 64, 8, 0];
+    let cb = request as usize;
+    // SAFETY: every pointer is null (to prove rejection) or names live,
+    // correctly sized local storage; the callback is a valid C fn.
+    let rejected = unsafe {
+        narf_blk_register(UNKNOWN, core::ptr::null(), 4, geometry.as_ptr(), cb, 0) == -22
+            && narf_blk_register(UNKNOWN, name.as_ptr(), 0, geometry.as_ptr(), cb, 0) == -22
+            && narf_blk_register(UNKNOWN, name.as_ptr(), 64, geometry.as_ptr(), cb, 0) == -22
+            && narf_blk_register(UNKNOWN, name.as_ptr(), name.len(), core::ptr::null(), cb, 0)
+                == -22
+            && narf_blk_register(UNKNOWN, name.as_ptr(), name.len(), geometry.as_ptr(), 0, 0) == -22
+            && narf_blk_copy_in(UNKNOWN, 1, 1, 0, usize::MAX, 2) == -22
+            && narf_blk_copy_out(UNKNOWN, 1, 1, 0, 0, 512) == -22
+            && narf_blk_copy_in(UNKNOWN, 1, 1, 0, 0, 512) == -22
+    };
+    if !rejected {
+        return TestResult::Fail("a block datapath export accepted a malformed argument");
+    }
+    // SAFETY: as above; all arguments are well formed.
+    let unknown =
+        unsafe { narf_blk_register(UNKNOWN, name.as_ptr(), name.len(), geometry.as_ptr(), cb, 0) };
+    let published = narf_block::block_devices()
+        .iter()
+        .any(|d| d.name == "mblkkabi0");
+    if unknown != -19 || published {
+        return TestResult::Fail("narf_blk_register published a disk with no probe context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_block_datapath_validates_arguments
+);

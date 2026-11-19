@@ -72,6 +72,7 @@ pub fn sys_init_module_with_params(
     let invoke = unsafe { loader::invoke_init(&module) };
     if let Err(e) = invoke {
         drop_dependency_refs(&module);
+        crate::module_block::retire_owner(module.id.0);
         narf_bus::unregister_module_pci_drivers(module.id.0);
         narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
         let _removed = crate::symbols::unregister_exports_of(module.id);
@@ -151,7 +152,9 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
 
     // Module exit has had its chance to quiesce the device. Remove bus
     // callbacks and cap-bearing datapath contexts before the module's text is
-    // made unreachable or unmapped.
+    // made unreachable or unmapped. Module disks go first: a running request
+    // copies through the bus context's DMA buffers.
+    crate::module_block::retire_owner(module.id.0);
     narf_bus::unregister_module_pci_drivers(module.id.0);
     narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
 
