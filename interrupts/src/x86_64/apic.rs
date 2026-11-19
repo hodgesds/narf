@@ -977,6 +977,98 @@ pub fn mmio_remapped() -> bool {
     LAPIC_VA.load(core::sync::atomic::Ordering::Acquire) != 0
 }
 
+/// Program this CPU's fixed-delivery performance-counter interrupt.
+/// Returns false if xAPIC has no permanent device mapping yet. In particular,
+/// never dereference IA32_APIC_BASE's physical address from a process CR3.
+///
+/// # Safety
+/// CPL=0, APIC bring-up is complete, and the caller owns this CPU's LVT-PC.
+pub unsafe fn program_current_lvt_pc(vector: u8, masked: bool) -> bool {
+    if x2apic_active() {
+        const APIC_LVT_PC_MSR: u32 = 0x834;
+        let value = u64::from(vector) | if masked { LVT_MASKED } else { 0 };
+        // SAFETY: bring-up confirmed x2APIC, so this CPU has the LVT-PC MSR.
+        unsafe { wrmsr(APIC_LVT_PC_MSR, value) };
+        true
+    } else {
+        let mapped_base = LAPIC_VA.load(Ordering::Acquire);
+        // SAFETY: remap_mmio publishes a permanent, device-typed mapping;
+        // zero is rejected before dereferencing any register.
+        unsafe { program_xapic_lvt_pc(mapped_base, vector, masked) }
+    }
+}
+
+unsafe fn program_xapic_lvt_pc(mapped_base: usize, vector: u8, masked: bool) -> bool {
+    if mapped_base == 0 {
+        return false;
+    }
+    // SAFETY: the caller supplies the mapped register page, not its physical
+    // address. The architecture helper performs an aligned volatile write.
+    unsafe { narf_arch::x86_64::pmi::program_lvt_pc(mapped_base, vector, false, masked) };
+    true
+}
+
+fn smoke_pmi_mapped_register_access() -> narf_kernel_test::TestResult {
+    let mut registers = [0xa5a5_a5a5u32; 256];
+    let base = registers.as_mut_ptr() as usize;
+    // SAFETY: zero is explicitly rejected; the array emulates a writable
+    // register page and covers the aligned LVT-PC register at offset 0x340.
+    unsafe {
+        if program_xapic_lvt_pc(0, 0xee, false)
+            || !program_xapic_lvt_pc(base, 0xee, true)
+            || registers[0x340 / 4] != (0xee | LVT_MASKED as u32)
+            || !program_xapic_lvt_pc(base, 0xef, false)
+            || registers[0x340 / 4] != 0xef
+        {
+            return narf_kernel_test::TestResult::Fail("PMI did not use its supplied mapping");
+        }
+    }
+    if registers
+        .iter()
+        .enumerate()
+        .any(|(i, &v)| i != 0x340 / 4 && v != 0xa5a5_a5a5)
+    {
+        return narf_kernel_test::TestResult::Fail("PMI changed a different APIC register");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("interrupts/pmi", smoke_pmi_mapped_register_access);
+
+fn smoke_pmi_current_lvt_route() -> narf_kernel_test::TestResult {
+    narf_lib::sync::without_interrupts(|| {
+        let x2 = x2apic_active();
+        if !x2 && !mmio_remapped() {
+            return narf_kernel_test::TestResult::Fail("xAPIC has no permanent mapping");
+        }
+        // SAFETY: boot initialized this CPU's APIC. Keep IRQs masked and save
+        // and restore the exact prior LVT value; the test route stays masked.
+        let (ok, observed) = unsafe {
+            let old = if x2 {
+                rdmsr(0x834) as u32
+            } else {
+                core::ptr::read_volatile(lapic_reg(0x340))
+            };
+            let ok = program_current_lvt_pc(0xee, true);
+            let value = if x2 {
+                rdmsr(0x834) as u32
+            } else {
+                core::ptr::read_volatile(lapic_reg(0x340))
+            };
+            if x2 {
+                wrmsr(0x834, u64::from(old));
+            } else {
+                core::ptr::write_volatile(lapic_reg(0x340), old);
+            }
+            (ok, value)
+        };
+        if !ok || observed & (LVT_MASKED as u32 | 0x7ff) != LVT_MASKED as u32 | 0xee {
+            return narf_kernel_test::TestResult::Fail("PMI current-CPU route did not round-trip");
+        }
+        narf_kernel_test::TestResult::Pass
+    })
+}
+narf_kernel_test::kernel_test_in!("interrupts/pmi", smoke_pmi_current_lvt_route);
+
 /// Send an INIT IPI (assert) to the target APIC.
 ///
 /// Routes through x2APIC ICR (MSR 0x830) when `X2APIC_ACTIVE`, or

@@ -101,6 +101,8 @@ pub const PERF_ATTR_FLAG_PRECISE_IP_MASK: u64 = 3 << 15;
 pub const PERF_ATTR_FLAG_MMAP_DATA: u64 = 1 << 17;
 pub const PERF_ATTR_FLAG_SAMPLE_ID_ALL: u64 = 1 << 18;
 pub const PERF_ATTR_FLAG_EXCLUDE_GUEST: u64 = 1 << 20;
+pub const PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL: u64 = 1 << 21;
+pub const PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER: u64 = 1 << 22;
 pub const PERF_ATTR_FLAG_MMAP2: u64 = 1 << 23;
 pub const PERF_ATTR_FLAG_COMM_EXEC: u64 = 1 << 24;
 pub const PERF_ATTR_FLAG_KSYMBOL: u64 = 1 << 29;
@@ -138,6 +140,10 @@ pub const PERF_RECORD_MISC_USER: u16 = 2;
 pub const PERF_RECORD_MISC_MMAP_DATA: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_EXACT_IP: u16 = 1 << 14;
+
+pub const PERF_SAMPLE_REGS_ABI_NONE: u64 = 0;
+pub const PERF_SAMPLE_REGS_ABI_32: u64 = 1;
+pub const PERF_SAMPLE_REGS_ABI_64: u64 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]

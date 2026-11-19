@@ -63,7 +63,7 @@ fn clock_expired(timer: &HrTimer) -> HrtimerRestart {
         }
     {
         capture_clock_sample(cpu, clock.event_id, period, clock.stack_bytes);
-        queue_sample_drain();
+        queue_sample_drain(cpu);
     }
     timer.forward(narf_time::monotonic_ns(), period);
     if clock.active.load(Ordering::Acquire) {
@@ -85,11 +85,7 @@ pub(super) struct SoftwareClock {
 impl SoftwareClock {
     pub(super) fn new(id: u64, target: u64, attr: &PerfEventAttr) -> Self {
         let period = period(attr);
-        let stack_bytes = if attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
-            PERF_MAX_USER_STACK_SAMPLE
-        } else {
-            attr.sample_stack_user as usize
-        };
+        let stack_bytes = user_stack_capture_bytes(attr);
         let mut timers = Vec::with_capacity(SAMPLE_CPU_SLOTS);
         for cpu in 0..SAMPLE_CPU_SLOTS {
             // Named-CPU starts require an existing base. Prepare it here,

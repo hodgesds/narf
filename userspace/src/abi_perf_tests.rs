@@ -930,11 +930,14 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 104
             || u64::from_ne_bytes(record[8..16].try_into().unwrap()) != 0x1234_5678
             || u64::from_ne_bytes(record[32..40].try_into().unwrap()) != 0 // ADDR
-            || u64::from_ne_bytes(record[40..48].try_into().unwrap()) != 0
-            || u64::from_ne_bytes(record[48..56].try_into().unwrap()) != 0
-            || u64::from_ne_bytes(record[56..64].try_into().unwrap()) != 1
-            || u64::from_ne_bytes(record[64..72].try_into().unwrap()) != 0x1234_5678
-            || u64::from_ne_bytes(record[88..96].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[40..48].try_into().unwrap()) == 0 // ID
+            || u64::from_ne_bytes(record[48..56].try_into().unwrap())
+                != narf_lib::percpu::current_cpu() as u64 // CPU + reserved
+            || u64::from_ne_bytes(record[56..64].try_into().unwrap()) != 0 // PERIOD
+            || u64::from_ne_bytes(record[64..72].try_into().unwrap()) != 0 // READ value
+            || u64::from_ne_bytes(record[72..80].try_into().unwrap()) != 0 // READ lost
+            || u64::from_ne_bytes(record[80..88].try_into().unwrap()) != 1 // CALLCHAIN nr
+            || u64::from_ne_bytes(record[88..96].try_into().unwrap()) != 0x1234_5678
             || u64::from_ne_bytes(record[96..104].try_into().unwrap()) != 0
         {
             return Err("PERF_RECORD_SAMPLE wire layout is invalid");
@@ -1332,6 +1335,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("tracepoint enable failed");
         }
         narf_tracing::emit_event(0x5a17, &[0xaa, 0xbb, 0xcc]);
+        #[cfg(feature = "kernel-test")]
+        if !crate::perf_event::sample_drain_pending_for_test() {
+            return Err("tracepoint did not schedule its deferred consumer");
+        }
         crate::perf_event::drain_irq_samples();
         // SAFETY: trace_ops owns the metadata and data frames.
         let trace_head = unsafe {

@@ -15,6 +15,7 @@ mod software_clock;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_BUILD_ID, PERF_ATTR_FLAG_COMM,
     PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC,
+    PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL, PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER,
     PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
     PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_EXCLUSIVE, PERF_ATTR_FLAG_FREQ,
     PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
@@ -30,10 +31,11 @@ use narf_linux_perf_uapi::{
     PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN,
     PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC,
     PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
-    PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER,
-    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE,
-    PERF_TYPE_RAW, PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
+    PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_ABI_64,
+    PERF_SAMPLE_REGS_ABI_NONE, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION,
+    PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE, PERF_TYPE_RAW,
+    PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -45,6 +47,10 @@ use narf_linux_perf_uapi::{
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static SAMPLE_DRAIN_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 static SAMPLE_DRAIN_READY: narf_lib::readiness::Readiness = narf_lib::readiness::Readiness::new(0);
+// A producer publishes its slot before setting its CPU bit. Swapping the mask
+// before draining preserves publications that race the consumer for another
+// pass, without walking every CPU's empty queues on every syscall.
+static SAMPLE_DRAIN_CPUS: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_sample_drain_task() {
     if !SAMPLE_DRAIN_TASK_STARTED.swap(true, Ordering::AcqRel) {
@@ -61,7 +67,8 @@ fn ensure_sample_drain_task() {
     }
 }
 
-fn queue_sample_drain() {
+fn queue_sample_drain(cpu: usize) {
+    SAMPLE_DRAIN_CPUS.fetch_or(1u64 << cpu, Ordering::Release);
     // One IRQ-safe scheduler waker, retained in this cell. Unlike the legacy
     // global I/O wake hook this neither allocates nor scans/drops I/O wakers.
     SAMPLE_DRAIN_READY.set_event(1, 0, 1);
@@ -69,8 +76,8 @@ fn queue_sample_drain() {
 
 /// Lock-free count of live perf events (the refcount that gates
 /// `narf_lib::perf::enabled()`). Read by the stall-watchdog to tell whether a
-/// perf test leaked an event, leaving the per-syscall `drain_irq_samples` scan
-/// permanently armed. Never takes the registry lock — the watchdog may run
+/// perf test leaked an event, leaving the perf hooks enabled. Never takes
+/// the registry lock — the watchdog may run
 /// while a wedged CPU holds it.
 pub fn dbg_active_perf_events() -> usize {
     ACTIVE_PERF_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
@@ -198,6 +205,32 @@ fn remaining_sample_period(loaded: u64, consumed: u64) -> u64 {
     loaded.saturating_sub(consumed).max(1)
 }
 
+/// Translate the IRQ snapshot into Linux's perf register numbering at the
+/// wire boundary. x86 trap capture packs R8..R15 immediately after SS; Linux
+/// leaves four holes for DS/ES/FS/GS before those registers (indices 16..23).
+fn sampled_user_register(
+    state: &narf_interrupts::InterruptedUserState,
+    index: usize,
+) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    let index = match index {
+        0..=11 => index,
+        16..=23 => index - 4,
+        _ => return None,
+    };
+    state.regs.get(index).copied()
+}
+
+fn user_stack_capture_bytes(attr: &PerfEventAttr) -> usize {
+    if attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0
+        && attr.flags & PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER == 0
+    {
+        PERF_MAX_USER_STACK_SAMPLE
+    } else {
+        attr.sample_stack_user as usize
+    }
+}
+
 fn unwind_user_callchain(
     ip: u64,
     state: Option<&narf_interrupts::InterruptedUserState>,
@@ -254,14 +287,7 @@ pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool 
 }
 
 fn publish_active_sample(cpu: usize, slot: usize, event: &PerfEventFile) {
-    let stack_bytes = if event.attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
-        event
-            .attr
-            .sample_stack_user
-            .max(PERF_MAX_USER_STACK_SAMPLE as u32)
-    } else {
-        event.attr.sample_stack_user
-    };
+    let stack_bytes = user_stack_capture_bytes(&event.attr) as u32;
     ACTIVE_SAMPLE_STACK_BYTES[cpu][slot].store(stack_bytes, Ordering::Relaxed);
     ACTIVE_SAMPLE_IDS[cpu][slot].store(event.id, Ordering::Release);
 }
@@ -350,8 +376,13 @@ fn execute_pmu_command(command: RemotePmuCommand) -> RemotePmuReply {
         RemotePmuCommand::RoutePmi(vector) => {
             // SAFETY: APIC bring-up is complete and this writes only this
             // CPU's LVT-PC entry.
-            unsafe { narf_arch::x86_64::pmi::program_current_lvt_pc(vector, false) };
-            RemotePmuReply::Result(Ok(()))
+            let routed =
+                unsafe { narf_interrupts::x86_64::apic::program_current_lvt_pc(vector, false) };
+            RemotePmuReply::Result(if routed {
+                Ok(())
+            } else {
+                Err(ArchPmuError::NoPmu)
+            })
         }
         RemotePmuCommand::Release(counter) => {
             // SAFETY: the synchronous mailbox executes on `counter.cpu` and
@@ -394,7 +425,11 @@ fn remote_pmu_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
 
 #[cfg(target_arch = "x86_64")]
 fn ensure_remote_pmu_vector() -> Result<u8, narf_arch::x86_64::pmu::PmuError> {
-    if !narf_interrupts::x86_64::apic::x2apic_active() {
+    // Fixed IPIs support both APIC modes. A native xAPIC host must not lose
+    // system-wide PMU events merely because the destination is another CPU.
+    if !narf_interrupts::x86_64::apic::x2apic_active()
+        && !narf_interrupts::x86_64::apic::mmio_remapped()
+    {
         return Err(narf_arch::x86_64::pmu::PmuError::NoPmu);
     }
     let mut slot = REMOTE_PMU_VECTOR.lock();
@@ -465,6 +500,37 @@ fn allocate_pmu_on(
         _ => unreachable!("allocate PMU command returned the wrong reply"),
     }
 }
+
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+fn smoke_perf_remote_pmu_transport() -> narf_kernel_test::TestResult {
+    use narf_arch::x86_64::pmu::{PmuError, PmuEvent};
+    use narf_kernel_test::TestResult;
+    let current = narf_lib::percpu::current_cpu();
+    let Some(cpu) = (0..narf_lib::percpu::MAX_CPUS)
+        .find(|&cpu| cpu != current && narf_lib::smp::is_online(cpu as u32))
+    else {
+        return TestResult::Skip("requires a second online CPU");
+    };
+    // Even an emulator without a PMU must deliver the IPI and return the
+    // destination's NoPmu reply, rather than rejecting xAPIC in the caller.
+    match remote_pmu_call(
+        cpu,
+        RemotePmuCommand::Allocate(PmuEvent::Cycles, true, true),
+    ) {
+        Ok(RemotePmuReply::Counter(Ok(counter))) => {
+            let correct_cpu = counter.cpu as usize == cpu;
+            release_pmu_on(counter);
+            if !correct_cpu {
+                return TestResult::Fail("remote counter allocated on the calling CPU");
+            }
+        }
+        Ok(RemotePmuReply::Counter(Err(PmuError::NoPmu))) => {}
+        _ => return TestResult::Fail("remote PMU command did not reach its destination"),
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+narf_kernel_test::kernel_test_in!("syscall_abi/perf", smoke_perf_remote_pmu_transport);
 
 #[cfg(target_arch = "x86_64")]
 fn read_pmu_on(counter: narf_arch::x86_64::pmu::PmuCounter) -> u64 {
@@ -868,6 +934,8 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_INHERIT
     | PERF_ATTR_FLAG_EXCLUDE_USER
     | PERF_ATTR_FLAG_EXCLUDE_KERNEL
+    | PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL
+    | PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER
     | PERF_ATTR_FLAG_REMOVE_ON_EXEC
     | PERF_ATTR_FLAG_SIGTRAP
     // NARF does not execute nested guests and currently has no BPF VM or
@@ -998,8 +1066,8 @@ struct PerfEventFile {
     /// Consulted in the tracepoint *drain*, not in the sample producer. The
     /// producers (`capture_pending_sample`, `capture_trace`) run in PMI and IRQ
     /// context and only stage into lock-free per-CPU rings; `drain_irq_samples`
-    /// runs from the syscall-return path, which is where a BPF program can be
-    /// run without inheriting NMI-safety constraints (spec §6.1).
+    /// runs in the dedicated consumer, where a BPF program can execute
+    /// without inheriting NMI-safety constraints (spec §6.1).
     bpf_prog: IrqSafeSpinLock<Option<Arc<narf_bpf::prog::BpfProg>>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
     // A member keeps its leader's open-file description alive. The leader
@@ -1888,21 +1956,6 @@ impl PerfEventFile {
             // Counting PMUs do not report a sampled data address.
             push_u64(&mut payload, 0);
         }
-        if sample_type & PERF_SAMPLE_READ != 0 {
-            self.append_sample_read(&mut payload);
-        }
-        if sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
-            let max_stack = if self.attr.sample_max_stack == 0 {
-                127
-            } else {
-                usize::from(self.attr.sample_max_stack)
-            };
-            let callchain = unwind_user_callchain(ip, user_state, user_stack, max_stack);
-            push_u64(&mut payload, callchain.len() as u64);
-            for address in callchain {
-                push_u64(&mut payload, address);
-            }
-        }
         if sample_type & PERF_SAMPLE_ID != 0 {
             push_u64(&mut payload, self.id);
         }
@@ -1919,6 +1972,33 @@ impl PerfEventFile {
                 self.last_sample_period.load(Ordering::Acquire),
             );
         }
+        // Linux's record order is not sample-bit order: ID/STREAM_ID/CPU/
+        // PERIOD precede READ and CALLCHAIN. Otherwise perf interprets a
+        // sample period as the callchain length and rejects the record.
+        if sample_type & PERF_SAMPLE_READ != 0 {
+            self.append_sample_read(&mut payload);
+        }
+        if sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+            let max_stack = if self.attr.sample_max_stack == 0 {
+                127
+            } else {
+                usize::from(self.attr.sample_max_stack)
+            };
+            let exclusion = if user_state.is_some() {
+                PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER
+            } else {
+                PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL
+            };
+            let callchain = if self.attr.flags & exclusion != 0 {
+                Vec::new()
+            } else {
+                unwind_user_callchain(ip, user_state, user_stack, max_stack)
+            };
+            push_u64(&mut payload, callchain.len() as u64);
+            for address in callchain {
+                push_u64(&mut payload, address);
+            }
+        }
         if sample_type & PERF_SAMPLE_RAW != 0 {
             push_u32(&mut payload, raw.len() as u32);
             payload.extend_from_slice(raw);
@@ -1927,26 +2007,36 @@ impl PerfEventFile {
             }
         }
         if sample_type & PERF_SAMPLE_REGS_USER != 0 {
-            let Some(state) = user_state else {
-                return false;
-            };
-            push_u64(&mut payload, state.abi);
-            for index in 0..64 {
-                if self.attr.sample_regs_user & (1 << index) != 0 {
-                    let Some(value) = state.regs.get(index) else {
-                        return false;
-                    };
-                    push_u64(&mut payload, *value);
+            if let Some(state) = user_state {
+                // Native userspace is 64-bit. The trap's internal marker is
+                // not Linux's wire enum: ABI_64 is 2, whereas 1 means ABI_32.
+                push_u64(&mut payload, PERF_SAMPLE_REGS_ABI_64);
+                for index in 0..64 {
+                    if self.attr.sample_regs_user & (1 << index) != 0 {
+                        let Some(value) = sampled_user_register(state, index) else {
+                            return false;
+                        };
+                        push_u64(&mut payload, value);
+                    }
                 }
+            } else {
+                // A kernel-context IRQ may have no captured user register
+                // image. Preserve the sample with the Linux NONE tag.
+                push_u64(&mut payload, PERF_SAMPLE_REGS_ABI_NONE);
             }
         }
         if sample_type & PERF_SAMPLE_STACK_USER != 0 {
+            let user_stack =
+                &user_stack[..user_stack.len().min(self.attr.sample_stack_user as usize)];
             push_u64(&mut payload, user_stack.len() as u64);
             payload.extend_from_slice(user_stack);
             while payload.len() & 7 != 0 {
                 payload.push(0);
             }
-            push_u64(&mut payload, user_stack.len() as u64);
+            // Linux omits dyn_size entirely when size is zero.
+            if !user_stack.is_empty() {
+                push_u64(&mut payload, user_stack.len() as u64);
+            }
         }
         if sample_type & PERF_SAMPLE_WEIGHT != 0 {
             push_u64(&mut payload, 0);
@@ -2674,9 +2764,13 @@ fn record_event_loss(cpu: usize, event_id: u64) {
 }
 
 fn capture_trace(type_id: u64, bytes: &[u8]) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
     if bytes.len() > PENDING_TRACE_BYTES {
         record_trace_loss(cpu, type_id);
+        queue_sample_drain(cpu);
         return;
     }
     let start = PENDING_TRACE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
@@ -2709,9 +2803,11 @@ fn capture_trace(type_id: u64, bytes: &[u8]) {
             .store(narf_time::monotonic_ns(), Ordering::Relaxed);
         pending.len.store(bytes.len() as u32, Ordering::Relaxed);
         pending.state.store(2, Ordering::Release);
+        queue_sample_drain(cpu);
         return;
     }
     record_trace_loss(cpu, type_id);
+    queue_sample_drain(cpu);
 }
 
 fn record_trace_loss(cpu: usize, type_id: u64) {
@@ -2880,9 +2976,9 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
     }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
     let _ = capture_pending_sample(cpu, counters);
-    // Wake a parked poll/epoll task so its syscall re-enters normal context
-    // and drains this allocation-free IRQ snapshot into the mmap ring.
-    queue_sample_drain();
+    // Record encoding runs in the dedicated consumer, not the interrupted
+    // task or an unrelated process's next syscall.
+    queue_sample_drain(cpu);
     narf_interrupts::IrqStatus::Handled
 }
 
@@ -2903,7 +2999,7 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
     }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
     let _ = capture_pending_sample(cpu, counters);
-    queue_sample_drain();
+    queue_sample_drain(cpu);
     narf_interrupts::IrqStatus::Handled
 }
 
@@ -2925,11 +3021,17 @@ fn ensure_pmi_route_on(cpu: usize) -> Result<(), ()> {
     };
     drop(slot);
     let cpu_bit = 1u64.checked_shl(cpu as u32).ok_or(())?;
-    if PMI_ROUTED_CPUS.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit != 0 {
+    if PMI_ROUTED_CPUS.load(Ordering::Acquire) & cpu_bit != 0 {
         return Ok(());
     }
     match remote_pmu_call(cpu, RemotePmuCommand::RoutePmi(vector)).map_err(|_| ())? {
-        RemotePmuReply::Result(result) => result.map_err(|_| ()),
+        RemotePmuReply::Result(result) => {
+            result.map_err(|_| ())?;
+            // A missing MMIO mapping must remain retryable. Concurrent first
+            // callers program the same vector before publishing success.
+            PMI_ROUTED_CPUS.fetch_or(cpu_bit, Ordering::Release);
+            Ok(())
+        }
         _ => unreachable!("route-PMI command returned the wrong reply"),
     }
 }
@@ -2942,37 +3044,45 @@ fn ensure_pmi_route() -> Result<(), ()> {
     Ok(())
 }
 
-/// Drain allocation-free PMI snapshots into userspace mmap rings from normal
-/// syscall context. The IRQ handler captures IP/task/time and rearms hardware;
-/// record encoding and readiness wakeups happen here where allocation is safe.
-// Keep the overwhelmingly common inactive gate in the syscall caller while
-// leaving the sizeable sampling path out of line.
-#[inline]
+/// Drain published snapshots from the dedicated task (or explicit test driver).
+/// Event references outlive the registry guard: sample encoding, poll wakeups,
+/// refresh expiry and final-reference cleanup must not run under that lock.
+fn sample_events_snapshot() -> Vec<Arc<PerfEventFile>> {
+    PERF_EVENT_REGISTRY
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect()
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn sample_registry_unlocked_for_test() -> bool {
+    PERF_EVENT_REGISTRY.try_lock().is_some()
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn sample_drain_pending_for_test() -> bool {
+    SAMPLE_DRAIN_CPUS.load(Ordering::Acquire) != 0
+}
+
 pub(crate) fn drain_irq_samples() {
-    // Fast path: with no perf event attached anywhere, no producer can stage a
-    // sample, so the per-CPU pending rings are all empty. Skip before touching
-    // the registry lock or scanning MAX_CPUS * ring-depth slots — this runs on
-    // every syscall dispatch, so an unconditional scan taxes the whole system
-    // (and monopolizes the CPU) even when nobody is profiling. `enabled()` is a
-    // single read-mostly load flipped only on the first attach / last detach.
-    // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
-    // can desync from the count (a stall-watchdog probe caught active_events=0
-    // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
-    // dispatch / task switch for the rest of the run — monopolizing the CPU (a
-    // scheduler stall once the preemption backstop is gone; task #32). The
-    // refcount is the source of truth: 0 live events means nothing to do.
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    drain_irq_samples_active();
+    let cpus = SAMPLE_DRAIN_CPUS.swap(0, Ordering::AcqRel);
+    if cpus != 0 {
+        drain_irq_samples_active(cpus);
+    }
 }
 
 #[inline(never)]
-fn drain_irq_samples_active() {
+fn drain_irq_samples_active(cpus: u64) {
     let mut notify = false;
     {
-        let registry = PERF_EVENT_REGISTRY.lock();
-        for buckets in &PENDING_LOSSES {
+        for (cpu, buckets) in PENDING_LOSSES.iter().enumerate() {
+            if cpus & (1u64 << cpu) == 0 {
+                continue;
+            }
             for bucket in buckets {
                 if bucket
                     .state
@@ -2984,10 +3094,8 @@ fn drain_irq_samples_active() {
                 let event_id = bucket.event_id.load(Ordering::Relaxed);
                 let lost = bucket.count.swap(0, Ordering::Relaxed);
                 if lost != 0 {
-                    for weak in registry.iter() {
-                        let Some(event) = weak.upgrade() else {
-                            continue;
-                        };
+                    let events = sample_events_snapshot();
+                    for event in &events {
                         if event.id == event_id {
                             event.sample_lost.fetch_add(lost, Ordering::Relaxed);
                             break;
@@ -3000,6 +3108,9 @@ fn drain_irq_samples_active() {
         }
     }
     for (source_cpu, pending_ring) in PENDING_SAMPLES.iter().enumerate() {
+        if cpus & (1u64 << source_cpu) == 0 {
+            continue;
+        }
         for pending in pending_ring {
             if pending
                 .state
@@ -3029,11 +3140,8 @@ fn drain_irq_samples_active() {
             // SAFETY: this consumer exclusively owns the acquired state-1 slot.
             let user_stack = unsafe { pending.user_stack.slice(stack_size) };
             {
-                let registry = PERF_EVENT_REGISTRY.lock();
-                for weak in registry.iter() {
-                    let Some(event) = weak.upgrade() else {
-                        continue;
-                    };
+                let events = sample_events_snapshot();
+                for event in &events {
                     let matched_counter = (0..8).find(|&idx| {
                         counters & (1 << idx) != 0
                             && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
@@ -3058,7 +3166,7 @@ fn drain_irq_samples_active() {
                             user_stack,
                             &[],
                         );
-                        deliver_sigtrap(&event, task);
+                        deliver_sigtrap(event, task);
                         if event.software_clock.is_none() {
                             event.adjust_frequency_period(now, period);
                         }
@@ -3069,7 +3177,10 @@ fn drain_irq_samples_active() {
             pending.state.store(0, Ordering::Release);
         }
     }
-    for buckets in &PENDING_TRACE_LOSSES {
+    for (cpu, buckets) in PENDING_TRACE_LOSSES.iter().enumerate() {
+        if cpus & (1u64 << cpu) == 0 {
+            continue;
+        }
         for bucket in buckets {
             if bucket
                 .state
@@ -3080,12 +3191,10 @@ fn drain_irq_samples_active() {
             }
             let type_id = bucket.event_id.load(Ordering::Relaxed);
             let lost = bucket.count.swap(0, Ordering::Relaxed);
-            let registry = PERF_EVENT_REGISTRY.lock();
-            for weak in registry.iter() {
-                if let Some(event) = weak.upgrade() {
-                    if event.attr.type_ == PERF_TYPE_TRACEPOINT && event.attr.config == type_id {
-                        event.sample_lost.fetch_add(lost, Ordering::Relaxed);
-                    }
+            let events = sample_events_snapshot();
+            for event in &events {
+                if event.attr.type_ == PERF_TYPE_TRACEPOINT && event.attr.config == type_id {
+                    event.sample_lost.fetch_add(lost, Ordering::Relaxed);
                 }
             }
             bucket.event_id.store(0, Ordering::Relaxed);
@@ -3093,6 +3202,9 @@ fn drain_irq_samples_active() {
         }
     }
     for (source_cpu, pending_ring) in PENDING_TRACES.iter().enumerate() {
+        if cpus & (1u64 << source_cpu) == 0 {
+            continue;
+        }
         for pending in pending_ring {
             if pending
                 .state
@@ -3109,11 +3221,8 @@ fn drain_irq_samples_active() {
             // SAFETY: this consumer owns the acquired state-1 slot.
             let raw =
                 unsafe { core::slice::from_raw_parts(pending.bytes.0.as_ptr().cast::<u8>(), len) };
-            let registry = PERF_EVENT_REGISTRY.lock();
-            for weak in registry.iter() {
-                let Some(event) = weak.upgrade() else {
-                    continue;
-                };
+            let events = sample_events_snapshot();
+            for event in &events {
                 if event.attr.type_ != PERF_TYPE_TRACEPOINT
                     || event.attr.config != type_id
                     || !event.enabled.load(Ordering::Acquire)
@@ -3129,7 +3238,7 @@ fn drain_irq_samples_active() {
                 //
                 // Here rather than in the producer: `capture_trace` runs in IRQ
                 // context and only stages into a lock-free per-CPU ring, while
-                // this drain runs from the syscall-return path. Running the
+                // this drain runs in the dedicated consumer task. Running the
                 // program here is what keeps NMI-safety out of the picture
                 // entirely (spec §6.1) — and the `raw` slice is already exactly
                 // the tracepoint argument blob a program expects as its context.
@@ -3166,7 +3275,6 @@ fn drain_irq_samples_active() {
                 notify |= event.sample_record(ip, task, now, source_cpu, None, &[], raw);
                 notify |= event.consume_refresh();
             }
-            drop(registry);
             pending.state.store(0, Ordering::Release);
         }
     }
@@ -4129,7 +4237,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         return;
     }
     #[cfg(target_arch = "x86_64")]
-    let supported_user_regs = (1u64 << 20) - 1;
+    let supported_user_regs = 0x00ff_0fffu64;
     #[cfg(target_arch = "aarch64")]
     let supported_user_regs = (1u64 << 34) - 1;
     if attr.sample_type & PERF_SAMPLE_REGS_USER != 0
@@ -4706,14 +4814,13 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     }
 }
 
-/// The syscall-return drain must be a no-op when NO perf event is registered —
+/// The drain must be a no-op when NO perf event is registered —
 /// EVEN IF the global `perf::enabled()` software-counter bit is on. The
 /// stall-watchdog turns `enabled()` on for its `syscalls` forward-progress
 /// counter and never balances it, so `drain_irq_samples` gates on the
 /// ACTIVE_PERF_EVENTS refcount (the source of truth for "are there sample
-/// events"), NOT that bool. A stale-true bool must not drag the per-syscall
-/// scan of MAX_CPUS * depth slots along and monopolize the CPU (which stalled
-/// the scheduler once the preemption backstop was gone; task #32). Proves a
+/// events"), NOT that bool. The earlier syscall-driven consumer used that
+/// stale bool and scanned every queue even with no event attached. Proves a
 /// staged slot is left UNTOUCHED whenever the refcount is 0, either bool state.
 fn smoke_perf_drain_skips_without_active_events() -> narf_kernel_test::TestResult {
     // The refcount is the gate; this test is only meaningful with it at 0.
