@@ -584,20 +584,47 @@ fn load_and_start() -> Result<(), LoadError> {
     // Validated as reclaimable before EBS; no diagnostics are possible here,
     // which is exactly why that check happens while console output still
     // works.
+    // [hang147] diagnostic: zero the .bss tail in bounded chunks with
+    // a marker before the first chunk and after it, so a fault inside
+    // the zeroing is bracketed to "before the first chunk" vs "after
+    // it" instead of the whole multi-MiB range. The chunking changes
+    // nothing observable — the same bytes end up zero.
+    const BSS_ZERO_CHUNK: u64 = 0x10000; // 64 KiB
+    let mut first_chunk = true;
     for segment in elf.segments() {
         let zero_len = segment.memory_size - segment.file_size;
         if zero_len == 0 {
             continue;
         }
-        // SAFETY: p_filesz <= p_memsz; the range lies inside the validated
-        // load span, and after ExitBootServices the loader owns all of it.
-        unsafe {
-            ptr::write_bytes(
-                (segment.physical + segment.file_size) as *mut u8,
-                0,
-                zero_len as usize,
-            )
-        };
+        let start = segment.physical + segment.file_size;
+        let end = segment.physical + segment.memory_size;
+        uart_marker(
+            uart,
+            format_args!(
+                "NARF UEFI loader: [hang147] stage: bss-zero-start {:#x}-{:#x}\n",
+                start, end
+            ),
+        );
+        let mut offset: u64 = 0;
+        while offset < zero_len {
+            let chunk = (zero_len - offset).min(BSS_ZERO_CHUNK);
+            // SAFETY: p_filesz <= p_memsz; the range lies inside the validated
+            // load span, and after ExitBootServices the loader owns all of it.
+            unsafe {
+                ptr::write_bytes((start + offset) as *mut u8, 0, chunk as usize);
+            }
+            offset += chunk;
+            if first_chunk {
+                first_chunk = false;
+                uart_marker(
+                    uart,
+                    format_args!(
+                        "NARF UEFI loader: [hang147] stage: bss-zero-first-chunk {:#x}\n",
+                        start + offset
+                    ),
+                );
+            }
+        }
     }
     let bss_zeroed: u64 = elf
         .segments()
@@ -1677,11 +1704,16 @@ mod tests {
         );
     }
 
+    /// One flat DTB node for the test helper: a name with its
+    /// (property name, value) pairs. Named so the `build_dtb`
+    /// signature stays below clippy's `type_complexity` threshold.
+    type DtbNode<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
+
     /// Build a minimal DTB: root with `#address-cells` /
     /// `#size-cells` 2/2 (like QEMU's `virt` tree) plus flat child
     /// nodes, each a name with (prop-name, value) pairs. Mirrors
     /// `firmware/fdt`'s `build_blob` test helper.
-    fn build_dtb(nodes: &[(&str, &[(&str, &[u8])])]) -> Vec<u8> {
+    fn build_dtb(nodes: &[DtbNode<'_>]) -> Vec<u8> {
         let mut strings: Vec<u8> = Vec::new();
         let intern = |strings: &mut Vec<u8>, name: &str| -> u32 {
             let target = name.as_bytes();
@@ -1716,7 +1748,7 @@ mod tests {
             s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
             s.extend_from_slice(node_name.as_bytes());
             s.push(0);
-            while s.len() % 4 != 0 {
+            while !s.len().is_multiple_of(4) {
                 s.push(0);
             }
             for (pname, pval) in *props {
@@ -1725,7 +1757,7 @@ mod tests {
                 s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
                 s.extend_from_slice(&off.to_be_bytes());
                 s.extend_from_slice(pval);
-                while s.len() % 4 != 0 {
+                while !s.len().is_multiple_of(4) {
                     s.push(0);
                 }
             }
