@@ -280,6 +280,31 @@ then invokes wakers after unlocking, outside hard-IRQ context. A callback may
 enqueue another waker; its new presence publication survives for the next pass.
 The scheduler drains at executor and completed own-stack user-return boundaries.
 
+### 3.9 Clockevent delta conversion (`clockevent_scale`)
+
+```rust
+pub struct ClockEventScale; // Copy
+impl ClockEventScale {
+    pub const fn from_measurement(units: u64, ticks: u64, units_err: u64,
+                                  min_ticks: u64, max_ticks: u64) -> Option<Self>;
+    pub const fn program(&self, delta: u64) -> Programmed;
+    pub const fn ticks_to_units(&self, ticks: u64) -> u64;
+    pub const fn min_delta(&self) -> u64;
+    pub const fn max_delta(&self) -> u64;
+}
+pub struct Programmed { pub ticks: u64, pub latest: u64 }
+```
+
+Linux `clockevents_config` + `clockevents_program_event` for a one-shot device
+calibrated against a reference counter (x86: LAPIC TMICT ticks against TSC
+cycles). `from_measurement` keeps the calibration's uncertainty (`units_err`
+reference units, one tick per end): `program` clamps the delta to
+`[min_delta, max_delta]` and converts with the fastest admissible device rate,
+so the device never fires before the delta; `Programmed::latest` uses the
+slowest, so recording `now + latest` as the armed time never treats a still
+counting device as expired. Pure 32.32 fixed point with 128-bit products;
+host-tested.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a
