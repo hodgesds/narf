@@ -23,7 +23,7 @@ fn word(packet: &[u8], offset: usize) -> Option<u32> {
 pub(super) fn decode(packet: &[u8], nss: u8) -> Option<Raw<'_>> {
     let r0 = word(packet, 0)?;
     let length = (r0 & 0xffff) as usize;
-    if !(r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1)
+    if crate::mt7921::txrx::rx_packet(r0) != crate::mt7921::txrx::RxPacket::Normal
         || length < 24
         || length > packet.len()
     {

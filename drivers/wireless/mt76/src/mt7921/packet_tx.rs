@@ -351,13 +351,16 @@ pub(super) struct Completion {
 }
 
 /// Validate the whole variable-length release event before changing ownership.
+/// The event is a `PKT_TYPE_TXRX_NOTIFY` packet (`mt7921_mac_tx_free`):
+/// `struct mt76_connac_tx_free` then one `tx_info` dword per entry.
 pub(super) fn releases(bytes: &[u8]) -> Result<Vec<Completion>, Error> {
+    use crate::mt7921::txrx::{rx_packet, RxPacket};
     if bytes.len() < 8 {
         return Err(Error::MalformedEvent);
     }
     let header = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let len = (header & 0xffff) as usize;
-    if header >> 27 != 0 || len < 8 || len > bytes.len() || len > 4096 {
+    if rx_packet(header) != RxPacket::TxFree || len < 8 || len > bytes.len() || len > 4096 {
         return Err(Error::MalformedEvent);
     }
     let count = ((header >> 16) & 0x3ff) as usize;

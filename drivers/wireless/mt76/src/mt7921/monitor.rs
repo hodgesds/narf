@@ -401,7 +401,10 @@ fn decode(packet: &[u8], nss: u8) -> Option<(narf_wireless::monitor::Metadata, &
     };
     let r0 = word(0)?;
     let len = (r0 & 0xffff) as usize;
-    if !(r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1) || len < 24 || len > packet.len() {
+    if crate::mt7921::txrx::rx_packet(r0) != crate::mt7921::txrx::RxPacket::Normal
+        || len < 24
+        || len > packet.len()
+    {
         return None;
     }
     let packet = &packet[..len];

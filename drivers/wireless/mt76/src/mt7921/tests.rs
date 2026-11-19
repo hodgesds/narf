@@ -436,7 +436,7 @@ fn smoke_mt7921_rxd_decode_roundtrip() -> TestResult {
     // FCS error round-trip.
     let bad = RxdInfo {
         frame_len: 64,
-        pkt_type: 0,
+        pkt_type: RXD0_PKT_TYPE_NORMAL as u8,
         wlan_idx: 0,
         fcs_err: true,
         icv_err: false,

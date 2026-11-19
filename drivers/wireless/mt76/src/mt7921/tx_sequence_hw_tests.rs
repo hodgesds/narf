@@ -2,7 +2,7 @@
 use super::*;
 fn txs(pid: u8, tid: u8, sequence: u16) -> Vec<u8> {
     let words = [
-        1u32 << 27 | 40,
+        40u32, // RXD0: length 40, PKT_TYPE_TXS (0) in bits 31:27
         0,
         u32::from(tid) << 26 | 1 << 15,
         u32::from(sequence) << 20,

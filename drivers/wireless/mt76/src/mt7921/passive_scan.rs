@@ -159,7 +159,7 @@ pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
 pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
-    let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
+    let normal = crate::mt7921::txrx::rx_packet(r0) == crate::mt7921::txrx::RxPacket::Normal;
     if !normal || len < 24 || len > packet.len() {
         return None;
     }

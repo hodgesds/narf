@@ -385,14 +385,21 @@ struct Report {
     bw: u8,
 }
 fn reports(bytes: &[u8]) -> Result<Vec<Report>, Error> {
-    if bytes.len() < 40 {
+    if bytes.len() < 8 {
         return Err(Error::MalformedEvent);
     }
     let header = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let len = (header & 0xffff) as usize;
-    if header >> 27 != 1 || len < 40 || len > bytes.len() || len > 4096 || (len - 8) % 32 != 0 {
+    // A `PKT_TYPE_TXS` packet (`mt7921_queue_rx_skb` → `mt7921_mac_add_txs`).
+    if crate::mt7921::txrx::rx_packet(header) != crate::mt7921::txrx::RxPacket::TxStatus
+        || len < 8
+        || len > bytes.len()
+        || len > 4096
+    {
         return Err(Error::MalformedEvent);
     }
+    // `for (rxd += 2; rxd + 8 <= end; rxd += 8)`: every complete 8-dword
+    // record after the 2-dword header. A trailing partial record is none.
     let mut reports = Vec::with_capacity((len - 8) / 32);
     for data in bytes[8..len].chunks_exact(32) {
         let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -403,7 +410,10 @@ fn reports(bytes: &[u8]) -> Result<Vec<Report>, Error> {
             wcid: ((word(8) >> 16) & 0x3ff) as u16,
             format: ((r0 >> 23) & 3) as u8,
             ampdu: r0 & (1 << 25) != 0,
-            failed: r0 & (0x5f << 16) != 0,
+            // `mt76_connac2_mac_add_txs_skb`: ACKed unless a bit of
+            // MT_TXS0_ACK_ERROR_MASK (ACK/RTS/queue timeout, bits 18:16)
+            // is set. BIP_ERROR, TXOP_TIMEOUT and BA_ERROR are not ACK errors.
+            failed: r0 & (7 << 16) != 0,
             sequence: (word(4) >> 20) as u16,
             tx_rate: (r0 & 0x3fff) as u16,
             bw: ((r0 >> 29) & 3) as u8,

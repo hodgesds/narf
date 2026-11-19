@@ -436,7 +436,8 @@ fn management_frame() -> [u8; 30] {
 fn release_event(token: u16, status: u8, pair: bool) -> Vec<u8> {
     let mut packet = vec![0u8; if pair { 16 } else { 12 }];
     let len = packet.len();
-    packet[..4].copy_from_slice(&((1u32 << 16) | len as u32).to_le_bytes());
+    // RXD0: PKT_TYPE_TXRX_NOTIFY (6), MSDU_CNT 1, byte count.
+    packet[..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | len as u32).to_le_bytes());
     let mut offset = 8;
     if pair {
         packet[offset..offset + 4].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
@@ -677,9 +678,11 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
         let bytes = unsafe { core::slice::from_raw_parts(ring.buffers[0].cpu_ptr::<u8>(), 82) };
         // Literal Linux CONNAC2 fields: BE LMAC queue 1, EtherType/802.3,
         // TID 0, QoS DATA subtype in TXD2/TXD7, normal retry, PTK bit only.
+        // TXD5 carries MT_PACKET_ID_NO_SKB: the AP receiver ACKs the frame
+        // and no HOST status is requested (`mt76_tx_status_skb_add`).
         if bytes[..12] != [50, 0, 0, 2, 1, 128, 0, 128, 40, 0, 0, 0]
             || bytes[12..16] != [if protected { 2 } else { 0 }, 120, 0, 16]
-            || bytes[16..28] != [0; 12]
+            || bytes[16..28] != [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
             || bytes[28..36] != [0, 0, 40, 0, 1, 128, 0, 0]
             || bytes[44..46] != [18, 128]
             || bytes[64..] != frame
@@ -730,7 +733,8 @@ fn mcu_tx_release_batch_is_atomic_and_preserves_failure_status() -> TestResult {
     tokens.begin(1).unwrap();
     tokens.dma_done().unwrap();
     let mut packet = release_event(1, 0, true);
-    packet[..4].copy_from_slice(&((2u32 << 16) | 16).to_le_bytes()); // declares a missing second MSDU
+    // TXRX_NOTIFY declaring a missing second MSDU.
+    packet[..4].copy_from_slice(&((6u32 << 27) | (2 << 16) | 16).to_le_bytes());
     if packet_tx::releases(&packet) != Err(Error::MalformedEvent) || tokens.finish().is_some() {
         return TestResult::Fail("truncated TX release mutated owner");
     }
@@ -773,6 +777,209 @@ fn mcu_tx_release_batch_is_atomic_and_preserves_failure_status() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_tx_release_batch_is_atomic_and_preserves_failure_status
+);
+
+/// Linux `enum rx_pkt_type` (`mt76_connac.h`) as `mt7921_queue_rx_skb`
+/// dispatches it, from literal RXD0 words.
+fn mt76_rx_packet_types_follow_linux_rx_pkt_type() -> TestResult {
+    use crate::mt7921::txrx::{rx_packet, RxPacket};
+    for (rxd0, expected) in [
+        (0x0000_0028u32, RxPacket::TxStatus), // PKT_TYPE_TXS
+        (0x0800_0028, RxPacket::Other),       // PKT_TYPE_TXRXV
+        (0x1000_0040, RxPacket::Normal),      // PKT_TYPE_NORMAL
+        (0x1800_0040, RxPacket::Other),       // PKT_TYPE_RX_DUP_RFB
+        (0x3001_0010, RxPacket::TxFree),      // PKT_TYPE_TXRX_NOTIFY
+        (0x3800_0024, RxPacket::Event),       // PKT_TYPE_RX_EVENT
+        (0x3802_0024, RxPacket::Event),       // PKT_TYPE_RX_EVENT, PKT_FLAG 2
+        (0x3801_0040, RxPacket::Normal),      // PKT_FLAG 1: PKT_TYPE_NORMAL_MCU
+        (0x4000_0040, RxPacket::Normal),      // PKT_TYPE_NORMAL_MCU
+        (0x6000_0010, RxPacket::Other),       // PKT_TYPE_RX_FW_MONITOR
+        (0xc000_0010, RxPacket::Other),       // PKT_TYPE_TXRX_NOTIFY_V0
+    ] {
+        if rx_packet(rxd0) != expected {
+            return TestResult::Fail("RXD0 PKT_TYPE dispatch differs from mt7921_queue_rx_skb");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mt76_rx_packet_types_follow_linux_rx_pkt_type
+);
+
+/// A literal firmware TX-free notification (`mt7921_mac_tx_free`): RXD0
+/// 0x30010010 is PKT_TYPE_TXRX_NOTIFY, MSDU_CNT 1, 16 bytes; then the
+/// `txd` dword, a WCID-1 pair entry and token 1's MSDU entry (status 0,
+/// one transmit count).
+const TXRX_NOTIFY_TOKEN_1: [u32; 4] = [0x3001_0010, 0, 0x8000_4000, 0x0001_0001];
+/// A literal PKT_TYPE_TXS packet (`mt7921_mac_add_txs`): RXD0 0x00000028,
+/// one 8-dword MPDU-format record, acked, WCID 1, PID 1 (NO_SKB).
+const TXS_WCID_1_PID_1: [u32; 10] = [0x28, 0, 1 << 15, 0, 1 << 16, 1 << 24, 0, 0, 0, 0];
+/// A PKT_TYPE_TXRXV packet whose length is no TXS record multiple.
+const TXRXV: [u32; 6] = [0x0800_0018, 0, 0xdead_beef, 0x0001_0001, 0, 0];
+
+fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// The native join's management wait (`transmit_management`: submit, then
+/// `wait(TIMEOUT_MS, management_complete)`) ends on the firmware's
+/// PKT_TYPE_TXRX_NOTIFY release. A TXS (type 0) and a TXRXV (type 1) on the
+/// other rings are not releases: before the fix the TXRX_NOTIFY was dropped
+/// and the TXS parsed as a release, and the auth wait timed out.
+fn mt76_native_txrx_notify_completes_management_wait_and_txs_is_no_release() -> TestResult {
+    use core::future::Future;
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("TXRX_NOTIFY fixture allocation"),
+    };
+    hw.owner.published = true;
+    if Backend::submit_management(
+        &mut hw,
+        crate::mt7921::vif_slots::Vif::HOME,
+        &management_frame(),
+        1,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("management frame publication");
+    }
+    // WFDMA consumed the descriptor (the native boot's `dma=Ok` DIDX).
+    hw.owner
+        .storage
+        .as_ref()
+        .unwrap()
+        .data
+        .set_word(0, 1, (64 << 16) | LAST | DONE);
+    words[(TX_DATA + 12) as usize / 4] = 1;
+    inject_rx(&mut words, &hw, 0, &words_to_bytes(&TXS_WCID_1_PID_1));
+    inject_rx(&mut words, &hw, 2, &words_to_bytes(&TXRXV));
+    if hw.management_complete() != Ok(None) {
+        return TestResult::Fail("TXS or TXRXV released the management token");
+    }
+    let storage = hw.owner.storage.as_ref().unwrap();
+    if storage.rx[0].index != 1 || storage.rx[2].index != 1 || !storage.pending_data.is_empty() {
+        return TestResult::Fail("TXS/TXRXV not consumed by the router, or queued as frames");
+    }
+    // The firmware's release arrives on the post-download MCU ring.
+    inject_rx(&mut words, &hw, 1, &words_to_bytes(&TXRX_NOTIFY_TOKEN_1));
+    let mut session = super::super::Session::new_boxed(hw, super::super::tests::firmware(32));
+    let result = {
+        let mut wait = core::pin::pin!(session.wait(super::super::TIMEOUT_MS, |backend| {
+            backend.management_complete()
+        }));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        let mut result = None;
+        for _ in 0..16 {
+            if let core::task::Poll::Ready(value) = wait.as_mut().poll(&mut cx) {
+                result = Some(value);
+                break;
+            }
+        }
+        result
+    };
+    session.backend.owner.published = false; // the model has no DMA engine
+    if result
+        != Some(Ok(packet_tx::Completion {
+            token: 1,
+            status: 0,
+        }))
+    {
+        return TestResult::Fail("TXRX_NOTIFY did not complete the management wait");
+    }
+    if session.backend.owner.storage.as_ref().unwrap().rx[1].index != 1 {
+        return TestResult::Fail("TXRX_NOTIFY left on the MCU ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mt76_native_txrx_notify_completes_management_wait_and_txs_is_no_release
+);
+
+/// A PKT_TYPE_TXS (0) packet reaches the TXS parser and becomes the home
+/// station's sampled TX rate; the same record as PKT_TYPE_TXRXV (1) is
+/// ignored, as Linux frees it.
+fn mt76_native_txs_type_zero_reaches_status_parser() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("TXS fixture allocation"),
+    };
+    hw.owner.storage.as_mut().unwrap().tx_sequence = crate::mt7921::tx_sequence::Owner::new();
+    hw.owner.published = true;
+    // The home station's first data frame requests a HOST TXS on PID 3.
+    if hw
+        .submit_data_txd(
+            crate::mt7921::vif_slots::Link::HOME,
+            &tx_pipeline_hw_tests::ethernet(0x52),
+            true,
+            true,
+            true,
+            false,
+            0,
+        )
+        .is_err()
+    {
+        return TestResult::Fail("sampled home data frame");
+    }
+    hw.owner
+        .storage
+        .as_ref()
+        .unwrap()
+        .data
+        .set_word(0, 1, (64 << 16) | LAST | DONE);
+    words[(TX_DATA + 12) as usize / 4] = 1;
+    inject_rx(&mut words, &hw, 1, &words_to_bytes(&TXRX_NOTIFY_TOKEN_1));
+    if hw.management_complete()
+        != Ok(Some(packet_tx::Completion {
+            token: 1,
+            status: 0,
+        }))
+    {
+        return TestResult::Fail("sampled frame did not retire on TXRX_NOTIFY");
+    }
+    // PID 3, WCID 1, VHT MCS 7 NSS 2 at 80 MHz. BA_ERROR, TXOP_TIMEOUT and
+    // BIP_ERROR are outside MT_TXS0_ACK_ERROR_MASK: still an ACK.
+    let rate = 7u32 | 4 << 6 | 1 << 10;
+    let mut record = [
+        0x28u32,
+        0,
+        rate | 2 << 29 | 1 << 22 | 1 << 20 | 1 << 19 | 1 << 15,
+        0,
+        1 << 16,
+        3 << 24,
+        0,
+        0,
+        0,
+        0,
+    ];
+    record[0] |= 1 << 27; // PKT_TYPE_TXRXV
+    inject_rx(&mut words, &hw, 0, &words_to_bytes(&record));
+    if hw.route_rx(None) != Ok(None) || Backend::tx_rate_report(&hw).is_some() {
+        return TestResult::Fail("TXRXV was parsed as a TX status");
+    }
+    record[0] &= !(0x1f << 27); // PKT_TYPE_TXS
+    inject_rx(&mut words, &hw, 0, &words_to_bytes(&record));
+    if hw.route_rx(None) != Ok(None) {
+        return TestResult::Fail("TXS receipt");
+    }
+    hw.owner.published = false;
+    match Backend::tx_rate_report(&hw) {
+        Some(report)
+            if report.wcid == 1
+                && u32::from(report.tx_rate) == rate
+                && report.bw == 2
+                && report.failures == 0 =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("PKT_TYPE_TXS did not reach the TXS parser"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mt76_native_txs_type_zero_reaches_status_parser
 );
 fn mcu_packet_router_separates_forwarded_management_from_command_replies() -> TestResult {
     let (mut words, mut hw) = match rig() {

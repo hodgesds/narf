@@ -146,10 +146,11 @@ pub(super) fn ethernet(value: u8) -> Vec<u8> {
 pub(super) fn free(records: &[(u16, u8)]) -> Vec<u8> {
     // mt76_connac_tx_free: byte count:u16,ctrl low10 MSDU count,txd:u32;
     // MT_TX_FREE_PAIR/WLAN_ID, then native token/status/retry-count entries.
+    // ctrl bits 15:11 are RXD0 PKT_TYPE: PKT_TYPE_TXRX_NOTIFY (6).
     let len = 12 + records.len() * 4;
     let mut bytes = vec![0; len];
     bytes[..2].copy_from_slice(&(len as u16).to_le_bytes());
-    bytes[2..4].copy_from_slice(&(records.len() as u16).to_le_bytes());
+    bytes[2..4].copy_from_slice(&(6 << 11 | records.len() as u16).to_le_bytes());
     bytes[8..12].copy_from_slice(&0x8000_4000u32.to_le_bytes());
     for (n, (token, status)) in records.iter().enumerate() {
         bytes[12 + n * 4..16 + n * 4].copy_from_slice(
