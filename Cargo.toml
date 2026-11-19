@@ -60,6 +60,7 @@ members = [
     "power",
     "scmi",
     "observability",
+    "observability/kallsyms",
     "userspace",
     "user-runtime",
     "drivers/nvme",
