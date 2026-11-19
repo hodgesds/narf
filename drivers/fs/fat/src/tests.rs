@@ -1559,6 +1559,8 @@ kernel_test_in!(
 /// Test-only; never used outside this module.
 struct DeferredDmaDevice {
     storage: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    flushes: core::sync::atomic::AtomicUsize,
+    fail_flush: core::sync::atomic::AtomicBool,
     logical_block_size: u32,
     capacity_blocks: u64,
 }
@@ -1572,6 +1574,8 @@ impl DeferredDmaDevice {
         let capacity_blocks = (image.len() / lbs as usize) as u64;
         alloc::sync::Arc::new(Self {
             storage: narf_lib::sync::IrqSafeSpinLock::new(image),
+            flushes: core::sync::atomic::AtomicUsize::new(0),
+            fail_flush: core::sync::atomic::AtomicBool::new(false),
             logical_block_size: lbs,
             capacity_blocks,
         })
@@ -1661,6 +1665,15 @@ impl narf_block::BlockDevice for DeferredDmaDevice {
         }
     }
     async fn flush(&self) {}
+    async fn flush_result(&self) -> Result<(), narf_block::BlockError> {
+        use core::sync::atomic::Ordering;
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        if self.fail_flush.load(Ordering::Relaxed) {
+            Err(narf_block::BlockError::IOError)
+        } else {
+            Ok(())
+        }
+    }
     async fn discard(&self, _range: narf_block::LbaRange) {}
     async fn cancel(&self, _tag: u64) -> narf_block::CancelResult {
         narf_block::CancelResult::NotFound
@@ -1787,6 +1800,47 @@ fn mount_deferred_volume_with_file() -> Option<DeferredFileFixture> {
     let file = drive(root.lookup_async("NARF.TXT"))?.ok()?;
     Some((device, volume, file))
 }
+
+fn smoke_fat_sync_flushes_and_propagates_errors() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::{FsError, FsInstance};
+    let Some((device, volume, file)) = mount_deferred_volume_with_file() else {
+        return TestResult::Fail("mount failed");
+    };
+    let root = volume.root();
+    for failing in [false, true] {
+        device.fail_flush.store(failing, Ordering::Relaxed);
+        let before = device.flushes.load(Ordering::Relaxed);
+        let results = [
+            drive(file.fsync(false)),
+            drive(file.fsync(true)),
+            drive(file.syncfs()),
+            drive(root.fsync(false)),
+            drive(root.syncfs()),
+        ];
+        for result in results {
+            let correct = if failing {
+                matches!(
+                    result,
+                    Some(Err(FsError::Io(narf_block::BlockError::IOError)))
+                )
+            } else {
+                matches!(result, Some(Ok(())))
+            };
+            if !correct {
+                return TestResult::Fail("FAT sync must preserve device flush errors");
+            }
+        }
+        if device.flushes.load(Ordering::Relaxed) != before + 5 {
+            return TestResult::Fail("FAT file/directory sync skipped device flush");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_sync_flushes_and_propagates_errors
+);
 
 /// Two concurrent partial-sector writes to different offsets of
 /// one sector must both survive: each patch lands in its own slice

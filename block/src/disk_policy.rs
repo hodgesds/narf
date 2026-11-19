@@ -12,7 +12,7 @@
 //! | `all`       | every device (the default; what QEMU test boots rely on)    |
 //! | `boot-only` | only the disk positively identified as the boot medium      |
 //! | `root-ro`   | nothing; the designated root may be mounted read-only       |
-//! | `root-rw`   | only the designated root *partition* (one btrfs filesystem) |
+//! | `root-rw`   | designated btrfs root and its verified EFI partition        |
 //!
 //! `boot-only`:
 //! - The guard rejects every [`BlockDeviceSync::write`] with
@@ -32,9 +32,10 @@
 //!   (a cloned disk or a multi-device btrfs carries the same UUID: refused),
 //!   refuses an ESP / vfat partition, and under `root-rw` requires btrfs (the
 //!   one writer with a mount-time write-safety gate). It can succeed once.
-//! - Under `root-rw` exactly the designated partition's guard — identified by
+//! - Under `root-rw` the designated partition's guard — identified by
 //!   its never-reused [`DevId`], never by name — passes writes. The whole
-//!   disk device, its ESP, and every other disk stay read-only.
+//!   disk device and every other disk stay read-only. The root's unique,
+//!   verified GPT ESP is also writable; see `block/specification/spec.md` §3.5.
 //! - Under `root-ro` no guard ever passes a write; the distro path's tmpfs
 //!   overlay provides the writable view.
 //! - The designation is revoked for the rest of the boot (every write refused
@@ -42,7 +43,7 @@
 //!   replaced, or another device carrying the same filesystem UUID appears.
 //! - [`automount_allowed`] admits only the root candidate (before
 //!   designation), the designated root, and vfat partitions on the root's
-//!   physical disk (its ESP, which the guard keeps read-only).
+//!   physical disk (including the ESP).
 //!
 //! An unrecognised (or repeated) value fails closed to `boot-only`. The
 //! resolved policy is printed as a framed console banner either way, and a
@@ -65,6 +66,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::partition::{format_uuid_bytes, parse_uuid};
 use crate::registry::{BlockDeviceSync, BlockIoError, RegisteredBlockDevice};
 
+mod esp;
+
 /// Kernel argument selecting the policy.
 pub const ARG: &str = "narf.disks";
 
@@ -79,7 +82,8 @@ pub enum DiskPolicy {
     /// Nothing is writable. The partition named by `root=UUID=` may be
     /// mounted read-only once designated ([`designate_root`]).
     RootRo,
-    /// Only the designated root partition (`root=UUID=`, btrfs) is writable.
+    /// The designated root (`root=UUID=`, btrfs) and its verified ESP
+    /// may be written.
     RootRw,
 }
 
@@ -240,7 +244,7 @@ pub fn banner_with_root(policy: DiskPolicy, explicit: bool, root: Option<&str>) 
         ),
         (DiskPolicy::RootRw, _) => alloc::format!(
             "disks: POLICY narf.disks=root-rw: ONLY the partition whose filesystem UUID matches root={root} \
-             will be WRITABLE; every other disk and partition (its ESP included) is read-only"
+             and its verified EFI partition will be WRITABLE; every other disk and partition is read-only"
         ),
     }
 }
@@ -441,8 +445,8 @@ pub enum PolicyError {
     /// More than one registered device carries the UUID (cloned disk,
     /// multi-device btrfs).
     Ambiguous,
-    /// The device is an EFI System Partition or a vfat filesystem, which stay
-    /// read-only in every root policy.
+    /// The root candidate is an ESP or vfat filesystem. An ESP can only be
+    /// authorized separately, after a btrfs root has been designated.
     EfiOrVfat,
     /// `root-rw` requires btrfs, the writer with a write-safety gate.
     NotBtrfs,
@@ -505,6 +509,7 @@ pub fn __set_root_arg_for_test(value: Option<Option<&str>>) {
 /// Test-only: forget the designation and any revocation.
 #[doc(hidden)]
 pub fn __reset_root_for_test() {
+    esp::reset_for_test();
     *DESIGNATED.lock() = None;
     DESIGNATED_DEV.store(0, Ordering::Release);
     DESIGNATED_DISK.store(0, Ordering::Release);
@@ -658,8 +663,8 @@ fn designate_root_inner(
     };
     framed(&match policy {
         DiskPolicy::RootRw => alloc::format!(
-            "disks: WRITABLE: {} ({identity_kind} UUID {uuid}) is the ONLY writable device \
-             (narf.disks=root-rw); every other disk and partition is read-only",
+            "disks: WRITABLE ROOT: {} ({identity_kind} UUID {uuid}, narf.disks=root-rw); \
+             its EFI partition is verified separately; other partitions remain protected",
             entry.name
         ),
         _ => alloc::format!(
@@ -668,6 +673,7 @@ fn designate_root_inner(
             entry.name
         ),
     });
+    esp::designate(entry);
     Ok(())
 }
 
@@ -675,6 +681,7 @@ fn designate_root_inner(
 /// entry it replaced under the same name). Revokes the designation when the
 /// designated device was replaced or another device carries its UUID.
 pub(crate) fn note_registered(entry: &RegisteredBlockDevice, replaced: Option<DevId>) {
+    esp::note_registered(entry, replaced);
     if let Some(old) = replaced {
         forget_log_stick(old);
     }
@@ -693,6 +700,7 @@ pub(crate) fn note_registered(entry: &RegisteredBlockDevice, replaced: Option<De
 
 /// Registry hook: the device `dev` was unregistered.
 pub(crate) fn note_unregistered(dev: DevId) {
+    esp::note_unregistered(dev);
     forget_log_stick(dev);
     if dev != 0 && DESIGNATED_DEV.load(Ordering::Acquire) == dev {
         revoke("the designated root device was removed");
@@ -713,7 +721,7 @@ fn forget_log_stick(dev: DevId) {
 }
 
 /// True when `root-rw` is active and a root is designated (and not
-/// revoked): exactly one partition is writable.
+/// revoked). Its verified ESP may also be writable.
 pub fn root_writable() -> bool {
     policy() == DiskPolicy::RootRw
         && !REVOKED.load(Ordering::Acquire)
@@ -740,7 +748,8 @@ fn entry_named(name: &str) -> Option<RegisteredBlockDevice> {
 /// Under the root policies: before designation only a partition whose
 /// filesystem UUID equals `root=UUID=` (the candidate root mounting will
 /// designate); afterwards the designated root, plus vfat partitions on the
-/// same physical disk (its ESP), which the guard keeps read-only.
+/// same physical disk (including its ESP). Only the verified ESP may be
+/// written, and only under `root-rw`.
 pub fn automount_allowed(device_name: &str) -> bool {
     match policy() {
         DiskPolicy::All => true,
@@ -785,6 +794,7 @@ pub fn write_allowed(device_name: &str) -> bool {
         }
         DiskPolicy::RootRw => entry_named(device_name).is_some_and(|e| {
             dev_writable(e.dev_id)
+                || esp::writable(e.dev_id)
                 || e.write_parent.is_some_and(dev_writable)
                 || log_stick_writable(e.dev_id)
         }),
@@ -863,7 +873,10 @@ fn permits_write(disk: DiskId, dev: DevId, write_parent: Option<DevId>) -> bool 
         DiskPolicy::BootOnly => disk_trusted(disk),
         DiskPolicy::RootRo => log_stick_writable(dev),
         DiskPolicy::RootRw => {
-            dev_writable(dev) || write_parent.is_some_and(dev_writable) || log_stick_writable(dev)
+            dev_writable(dev)
+                || esp::writable(dev)
+                || write_parent.is_some_and(dev_writable)
+                || log_stick_writable(dev)
         }
     }
 }

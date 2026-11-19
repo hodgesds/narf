@@ -1980,7 +1980,9 @@ nothing they return `RootMountError::BootOnly`. An explicit `root=` naming
 another disk is refused the same way. Under `narf.disks=root-ro|root-rw` they
 consider only the `root=UUID=` candidate, then the designated root
 (`disk_policy::designate_root`, called before the filesystem is built) and
-vfat partitions on its disk; vfat volumes report `always_read_only` there.
+vfat partitions on its disk. FAT reports the block guard's read-only state:
+the verified root-disk ESP is writable under `root-rw`; other FAT volumes
+and all ESPs under `root-ro` stay read-only (block §3.5).
 
 `root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
 both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed

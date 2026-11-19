@@ -781,6 +781,13 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         Ok(())
     }
 
+    /// Writes (including FSInfo updates) complete through FUA sector I/O.
+    /// Explicit sync additionally drains the device cache and reports errors.
+    pub async fn sync(&self) -> Result<(), FsError> {
+        let _io = self.io.lock().await;
+        self.device.flush_result().await.map_err(FsError::Io)
+    }
+
     pub async fn flush_fsinfo(&self) -> Result<(), FsError> {
         let lba = if let Some(ref ext) = self.fat32_ext {
             ext.fs_info as u64
@@ -811,9 +818,9 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
-    /// Under `narf.disks=root-ro|root-rw` every vfat filesystem (the ESP
-    /// included) stays read-only for the whole boot: report it, so the VFS
-    /// refuses writes with EROFS and mountinfo says `ro`. (Under `boot-only`
+    /// Root policies keep FAT read-only except the root disk's verified ESP
+    /// under `root-rw`. ESP designation precedes mounting. Report the state so
+    /// the VFS refuses protected writes with EROFS. (Under `boot-only`
     /// the boot medium becomes writable once identified, so the mount-time
     /// answer would go stale; the block layer guard covers that case.)
     fn always_read_only(&self) -> bool {

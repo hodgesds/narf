@@ -962,6 +962,14 @@ impl<B: BlockDevice + 'static> FatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync())
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync())
+    }
+
     fn ino(&self) -> u64 {
         self.inode_number()
     }
@@ -1207,6 +1215,14 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync())
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync())
+    }
+
     fn ino(&self) -> u64 {
         self.inode_number()
     }

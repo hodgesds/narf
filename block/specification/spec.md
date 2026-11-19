@@ -351,9 +351,10 @@ Under `RootRo` / `RootRw` nothing is writable until root mounting calls
 against the command line (exactly one `root=`), the partition metadata and the
 device's own superblock; refuses whole disks, ESP / vfat partitions, a UUID
 carried by more than one registered device, and (under `RootRw`) anything but
-btrfs. Under `RootRw` exactly the guard whose `DevId` was designated passes
-writes; under `RootRo` none does. The designation is revoked for the rest of
-the boot if that entry is unregistered or replaced or another device carrying
+btrfs. Under `RootRw` the guard whose `DevId` was designated passes writes,
+as does its verified ESP (below); under `RootRo` neither does. The root
+designation is revoked for the rest of the boot if that entry is unregistered
+or replaced or another device carrying
 the UUID registers. `automount_allowed` admits only the `root=UUID=` candidate
 (before designation), the designated root, and vfat partitions on its disk.
 Both modes print a framed banner at policy resolution and at designation
@@ -362,6 +363,25 @@ naming the writable device and UUID. Under both modes `trust_boot_medium`
 mass-storage entry writable, never one on the root's disk; it is forgotten
 when that entry goes away. The boot log probes only after
 `mark_root_mount_settled`.
+
+**Native ESP updates:** `narf.disks=root-rw` also makes the root disk's
+verified EFI partition writable by default; no additional argument is
+required. After successful root designation, before ESP mounting, the
+registry must contain exactly one GPT EFI System Partition on the root's
+physical `DiskId`, with the same reported hardware identity. It must contain
+FAT and a nonzero 128-bit PARTUUID unique across the registry (a FAT volume
+serial is not a PARTUUID). Missing, malformed, ambiguous or non-ESP candidates
+grant nothing; root mounting can still succeed. `root-ro` keeps ESPs read-only.
+
+Only that ESP's never-reused `DevId` passes the synchronous and asynchronous
+write gates. Its parent disk, sibling partitions, and stacked views do not
+inherit permission. Removing/replacing the ESP or registering a duplicate
+PARTUUID or a second ESP on the root disk permanently revokes this grant;
+revoking the root also disables ESP writes. An ESP-only revocation leaves
+the root usable. Registry state is
+rechecked after publication to cover registration/removal during selection.
+The grant is announced with the ESP's registry name and PARTUUID. It permits
+FAT filesystem writes, not EFI runtime-variable/NVRAM access.
 
 ### 3.6 Encrypted-device stacking
 
