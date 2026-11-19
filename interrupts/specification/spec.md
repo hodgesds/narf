@@ -189,6 +189,10 @@ pub fn vector::alloc() -> Result<u8, VectorError>;
 pub fn vector::alloc_block(n: u8) -> Result<u8, VectorError>;
 pub fn vector::alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError>;
 pub fn vector::free(vector: u8) -> Result<(), VectorError>;
+
+// Per-vector waker diagnostics (dispatch-slot introspection for tests).
+pub fn dispatch::wakers_len(vector: u8) -> usize;
+pub fn dispatch::waker_identities(vector: u8, out: &mut [(usize, usize)]) -> usize; // (data, vtable) per queued waker
 ```
 
 SPI contract (aarch64). `configure_spi` disables the INTID, clears its

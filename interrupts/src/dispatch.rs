@@ -763,6 +763,25 @@ pub fn wakers_len(vector: u8) -> usize {
     SLOTS[vector as usize].wakers.lock().len()
 }
 
+/// Diagnostic: identity of each waker queued for `vector`, as
+/// (`Waker::data` pointer, vtable pointer) pairs, up to `out.len()`
+/// entries. Returns the number of pairs written. Exposed for the
+/// `set_waker` dedup regression test (#2248): entries that all share
+/// one identity mean repeated polls of a single waiter (the dedup
+/// is not firing); entries with distinct identities mean distinct
+/// waiters share the vector (a foreign waiter is parked on it).
+/// The caller sizes `out` to the sample it needs — the exact length
+/// still comes from [`wakers_len`].
+#[inline]
+pub fn waker_identities(vector: u8, out: &mut [(usize, usize)]) -> usize {
+    let g = SLOTS[vector as usize].wakers.lock();
+    let n = g.len().min(out.len());
+    for (i, w) in g.iter().take(n).enumerate() {
+        out[i] = (w.data() as usize, w.vtable() as *const _ as usize);
+    }
+    n
+}
+
 // ── NMI dispatch ────────────────────────────────────────────────────
 //
 // NMIs (x86 vector 2; aarch64 has no direct equivalent) bypass the

@@ -7986,6 +7986,23 @@ kernel_test!(smoke_irq_multi_waker_both_resolve);
 /// re-poll rate, the un-deduped list grew per poll, eventually
 /// exhausting the allocator. QEMU's high virtual-IRQ rate masked
 /// the issue.
+///
+/// Diagnostic oracle (#2248): this test regressed on tip
+/// (fails in run 44452608899, passed 2026-11-17) for a cause not
+/// yet pinned, so it samples the slot before its first poll, after
+/// it, and at the end, with the queued wakers' data/vtable
+/// identity. How to read the `[irq-dedup-oracle]` lines:
+/// `len_before >= 1` means a foreign waiter was already parked on
+/// the vector before this test ran; `len_after_first == 2` with two
+/// distinct identities means the foreign waiter was there after a
+/// single poll; a final `len > 1` with ONE distinct identity means
+/// repeated polls of this one waiter accumulated (the dedup is not
+/// firing); a final `len > 1` with two distinct identities after a
+/// clean first poll means a foreign waiter parked mid-test.
+/// The samples are logged, not returned: `TestResult::Fail` takes
+/// `&'static str`, so dynamic values cannot ride in the message.
+/// `fires` brackets the test: a fire mid-test swaps the list out
+/// (`on_irq` takes it), which would mask growth.
 #[cfg(target_arch = "x86_64")]
 fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
     use core::future::Future;
@@ -7996,6 +8013,21 @@ fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
     const VECTOR: u8 = 90;
     static POLLS: AtomicU32 = AtomicU32::new(0);
     POLLS.store(0, Ordering::Release);
+
+    // Count distinct data pointers / vtables in an identity sample.
+    fn distinct(ids: &[(usize, usize)]) -> (usize, usize) {
+        let mut data = 0;
+        let mut vtable = 0;
+        for (i, (d, v)) in ids.iter().enumerate() {
+            if !ids[..i].iter().any(|(od, _)| od == d) {
+                data += 1;
+            }
+            if !ids[..i].iter().any(|(_, ov)| ov == v) {
+                vtable += 1;
+            }
+        }
+        (data, vtable)
+    }
 
     // A future that polls wait_for_irq repeatedly via re-poll
     // without the IRQ ever firing. Counts the number of set_waker
@@ -8021,13 +8053,38 @@ fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
         }
     }
 
+    let fires_before = narf_interrupts::dispatch::fire_count(VECTOR);
+    let mut ids_before = [(0usize, 0usize); 8];
+    let n_before = narf_interrupts::dispatch::waker_identities(VECTOR, &mut ids_before);
+    let len_before = narf_interrupts::dispatch::wakers_len(VECTOR);
+    let (data_before, vtable_before) = distinct(&ids_before[..n_before]);
+    let _ = writeln!(
+        Writer,
+        "  [irq-dedup-oracle] vec {} before: len={} fires={} distinct_data={} distinct_vtable={} ids={:?}",
+        VECTOR, len_before, fires_before, data_before, vtable_before, &ids_before[..n_before]
+    );
+
     let task = PollMany {
         remaining: 64,
         inner: narf_interrupts::wait::wait_for_irq(VECTOR),
     };
     narf_scheduler::spawn_stackful(task);
+    let mut sampled_first = false;
     for _ in 0..256 {
         narf_scheduler::poll_one_round();
+        if !sampled_first && POLLS.load(Ordering::Acquire) >= 1 {
+            sampled_first = true;
+            let len_after_first = narf_interrupts::dispatch::wakers_len(VECTOR);
+            let mut ids_after_first = [(0usize, 0usize); 8];
+            let n_after_first =
+                narf_interrupts::dispatch::waker_identities(VECTOR, &mut ids_after_first);
+            let (data_first, vtable_first) = distinct(&ids_after_first[..n_after_first]);
+            let _ = writeln!(
+                Writer,
+                "  [irq-dedup-oracle] vec {} after-first-poll: len={} distinct_data={} distinct_vtable={} ids={:?}",
+                VECTOR, len_after_first, data_first, vtable_first, &ids_after_first[..n_after_first]
+            );
+        }
         if POLLS.load(Ordering::Acquire) >= 64 {
             break;
         }
@@ -8035,9 +8092,28 @@ fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
     // The wakers list for VECTOR should hold at most ONE entry
     // for this future's waker — the dedup keeps repeated polls
     // from accumulating.
+    let polls = POLLS.load(Ordering::Acquire);
     let len = narf_interrupts::dispatch::wakers_len(VECTOR);
+    let mut ids_final = [(0usize, 0usize); 8];
+    let n_final = narf_interrupts::dispatch::waker_identities(VECTOR, &mut ids_final);
+    let (data_final, vtable_final) = distinct(&ids_final[..n_final]);
+    let fires_after = narf_interrupts::dispatch::fire_count(VECTOR);
+    let _ = writeln!(
+        Writer,
+        "  [irq-dedup-oracle] vec {} final: len={} polls={} fires={}->{} distinct_data={} distinct_vtable={} ids={:?}",
+        VECTOR,
+        len,
+        polls,
+        fires_before,
+        fires_after,
+        data_final,
+        vtable_final,
+        &ids_final[..n_final]
+    );
     if len > 1 {
-        return TestResult::Fail("set_waker didn't dedupe — wakers list grew unbounded");
+        return TestResult::Fail(
+            "set_waker didn't dedupe — wakers list grew unbounded (see [irq-dedup-oracle] lines above)",
+        );
     }
     // Cleanup: clear every registered waker so subsequent tests
     // start clean. The future is still alive in the scheduler
