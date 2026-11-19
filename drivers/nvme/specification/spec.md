@@ -357,6 +357,17 @@ multipath / fabrics (defer).
   are allowed only under `narf.disks=all` or when every namespace of that
   controller is the identified boot medium. Device PM registers `nvme<C>`
   per instance (`DevicePmOps`).
+- Loadable module (`--no-default-features --features module`,
+  `src/module_probe.rs`): a polled NVMe host written only against KSYMTAB
+  exports. It matches QEMU's `1b36:0010`, resets the controller, builds one
+  admin and one I/O queue pair (depth 16, no interrupts; completions waited
+  with `narf_dma_wait8`), identifies namespace 1, and registers the first
+  free `nvme<N>n1` with `narf_blk_register` (block datapath ABI). Data moves
+  through a 64 KiB module DMA buffer with a fixed PRP list, bounded by MDTS;
+  the identify VWC bit sets the disk's volatile-cache flag (flush issues NVM
+  Flush). Feature `nvme-module-only` keeps the built-in crate but withdraws
+  its PCI matches, so a module loaded before PCI probing binds the
+  controller (`cargo xtask nvme-module-block-smoke`).
 
 ## 4. Invariants & safety properties
 

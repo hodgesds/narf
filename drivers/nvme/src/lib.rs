@@ -3,9 +3,10 @@
 //! Single-driver crate: the whole crate is dual-build (built-in rlib or a
 //! loadable `.ko`). The driver body lives in [`imp`] and compiles only for the
 //! built-in build (re-exported here so `narf_drivers_nvme::…` is unchanged for
-//! callers); the `module` build registers through the `narf_register_pci_driver`
-//! KSYMTAB export (registration-only, `-ENOSYS` probe, until the device
-//! datapath ABI lands). See `narf-drivers-net-e1000` for the pattern.
+//! callers). The `module` build ([`module_probe`]) is a small polled NVMe host
+//! written only against KSYMTAB exports: it drives the controller through the
+//! PCI/MMIO/DMA exports and publishes namespace 1 through `narf_blk_register`.
+//! See `narf-drivers-net-e1000` for the dual-build pattern.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -32,6 +33,7 @@ narf_driver! {
         author: "narf",
         description: "NVMe host controller",
         target_domain: "block",
+        required_caps: "DmaBuffer:Write,BusDevice:Write,BlockDevice:Write",
     },
     register: do_register,
 }
@@ -50,6 +52,7 @@ fn do_register() {
 #[cfg(feature = "builtin")]
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    #[cfg(not(feature = "nvme-module-only"))]
     narf_init::register(Stage::Subsys, "nvme", || {
         register();
         InitResult::Ok
