@@ -32,6 +32,134 @@ const ASSOC_TIMEOUT_SHORT_MS: u64 = 100;
 /// `jiffies_to_msecs(HZ)`.
 const JOIN_ROC_MS: u32 = 1_000;
 
+/// `WLAN_REASON_DEAUTH_LEAVING`: this station leaves the BSS.
+pub(super) const WLAN_REASON_DEAUTH_LEAVING: u16 = 3;
+/// No association comeback time was offered (`mlme_exchange`).
+const NO_COMEBACK: u64 = u64::MAX;
+/// `WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY`.
+const WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY: u8 = 30;
+
+/// mac80211's info line for a link that ends without an operator request:
+/// `deauthenticated from %pM (Reason: %u=%s)`, `disassociated from ...`, or
+/// a local decision such as `AP %pM changed caps/bw ... - disconnect`.
+#[cold]
+#[inline(never)]
+fn note_link_loss(peer: [u8; 6], why: &str, reason: u16, from_ap: bool) {
+    use core::fmt::Write;
+    let by = if from_ap { "by AP" } else { "locally" };
+    let _ = writeln!(
+        narf_console::Writer,
+        "mt76: AP {} {why} - disconnect (Reason: {reason}, {by})",
+        Mac(peer)
+    );
+}
+
+/// `%pM`.
+pub(super) struct Mac(pub(super) [u8; 6]);
+impl core::fmt::Display for Mac {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let m = self.0;
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        )
+    }
+}
+
+/// mac80211 `ieee80211_rx_mgmt_assoc_resp`: `frame` is this join's
+/// (Re)Association Response rejecting it temporarily
+/// (`WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY`) with a Timeout Interval
+/// element of type `WLAN_TIMEOUT_ASSOC_COMEBACK`: the comeback time in TUs.
+/// An AP with PMF answers so while its SA Query still checks the station's
+/// previous association.
+pub(super) fn association_comeback(
+    frame: &[u8],
+    own: [u8; 6],
+    bssid: [u8; 6],
+    reassociation: bool,
+) -> Option<u32> {
+    let subtype = if reassociation { 0x30 } else { 0x10 };
+    if frame.len() < 30
+        || frame[0] != subtype
+        || frame[1] & 0xc7 != 0
+        || frame[22] & 15 != 0
+        || frame[4..10] != own
+        || frame[10..16] != bssid
+        || frame[16..22] != bssid
+        || u16::from_le_bytes([frame[26], frame[27]])
+            != u16::from(WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY)
+    {
+        return None;
+    }
+    let mut ies = &frame[30..];
+    while ies.len() >= 2 {
+        let len = usize::from(ies[1]);
+        let body = ies.get(2..2 + len)?;
+        // WLAN_EID_TIMEOUT_INTERVAL, `sizeof(struct ieee80211_timeout_interval_ie)`.
+        if ies[0] == 56 && len == 5 && body[0] == 3 {
+            return Some(u32::from_le_bytes([body[1], body[2], body[3], body[4]]));
+        }
+        ies = &ies[2 + len..];
+    }
+    None
+}
+
+/// A failed join's facts for its in-place undo (`leave_failed_join`).
+#[derive(Clone, Copy, Debug)]
+struct FailedJoin {
+    info: super::RadioInfo,
+    /// The AP accepted the association (the join failed in its RSNA).
+    associated: bool,
+    /// The negotiated HE profile: its BSS HE record is cleared too.
+    he: Option<crate::mt7921::he::Profile>,
+    permission: Option<crate::mt7921::association::TxPermission>,
+    error: Error,
+}
+
+/// Whether a failed join is undone in place rather than by firmware
+/// recovery. A refusal (status code, unacknowledged frame), an unanswered
+/// exchange or a bad frame from the AP leaves the firmware working; Linux
+/// resets only when the MCU itself stops answering (`mt792x_reset` from
+/// `mt7921_mcu_parse_response`), which the undo's own commands then show.
+/// A gone, revoked or unprogrammable device cannot be undone in place, nor
+/// a host without the entropy every handshake needs.
+fn join_failure_leaves_cleanly(error: Error) -> bool {
+    !matches!(
+        error,
+        Error::DeviceGone
+            | Error::EntropyUnavailable
+            | Error::Authority
+            | Error::Register
+            | Error::Ring
+            | Error::Allocation
+            | Error::DmaAddress
+            | Error::InvalidIdentity
+            | Error::Cancelled
+    )
+}
+
+/// `%pM rejected association temporarily; comeback duration %u TU (%u ms)`.
+#[cold]
+#[inline(never)]
+fn note_comeback(bssid: [u8; 6], tu: u32) {
+    use core::fmt::Write;
+    let ms = u64::from(tu) * 1024 / 1000;
+    let _ = writeln!(
+        narf_console::Writer,
+        "mt76: {} rejected association temporarily; comeback duration {tu} TU ({ms} ms)",
+        Mac(bssid)
+    );
+}
+
+/// mac80211's `authenticate with %pM` / `associate with %pM` info lines.
+#[cold]
+#[inline(never)]
+pub(super) fn note_join_step(step: &str, bssid: [u8; 6]) {
+    use core::fmt::Write;
+    let _ = writeln!(narf_console::Writer, "mt76: {step} {}", Mac(bssid));
+}
+
 /// mac80211's per-try line (`send auth to %pM (try %d/%d)`), here only for a
 /// try that is retried or the last one that failed.
 #[cold]
@@ -796,6 +924,41 @@ impl<B: Backend> Session<B> {
     pub(super) fn keys_pending(&self) -> bool {
         self.owner_keys_pending(&self.station, &self.state)
     }
+
+    /// The earliest time the associated home station needs a service pass
+    /// with no device interrupt and no host request: the work mac80211 and
+    /// mt76 run from timers (the RX reorder and BA session timers, the
+    /// announced channel switch time, the TX completion watchdog). `Some(0)`
+    /// when work is already queued; `None` when nothing is timed, so an
+    /// idle link is serviced only on interrupts.
+    pub(super) fn service_deadline(&self) -> Option<u64> {
+        if !matches!(self.state, State::Associated { .. }) {
+            return None;
+        }
+        let station = &self.station;
+        if station.peer_lost
+            || self.keys_pending()
+            || !station.control_pending.is_empty()
+            || !station.received_msdu.is_empty()
+            || !station.tx_fragments.is_empty()
+            || station.wmm_pending.is_some()
+            || station.bw_change.is_some()
+            || station.ps_wanted != station.ps_applied
+        {
+            return Some(0);
+        }
+        [
+            station.rx_ba.next_deadline(),
+            station.tx_ba.next_deadline(),
+            station.csa.map(|(_, at)| at),
+            self.data_pending
+                .oldest_for(station.link)
+                .map(|started| started.saturating_add(TIMEOUT_MS * 1_000_000)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
     /// Key/WMM/BA control work of one station owner (the current one, or
     /// the swapped-out group owner for `group_keys_pending`).
     pub(super) fn owner_keys_pending(&self, station: &super::StationLink, state: &State) -> bool {
@@ -1165,11 +1328,12 @@ impl<B: Backend> Session<B> {
                         && f.get(36..).is_some_and(|ies| !profile.matches(ies))
                         || f[0] == 0xd0 && (f[24..26] == [21, 2] || f[24..26] == [7, 0]))
                 {
-                    self.station.peer_lost = true;
-                    self.station.rx_ba.fence();
-                    self.station.tx_ba.fence();
-                    self.clear_aggregate_receive();
-                    return Err(Error::DeviceGone);
+                    let why = if f[0] == 0xd0 {
+                        "changed its operating mode (action frame) in a way we can't support"
+                    } else {
+                        "changed caps/bw in a way we can't support"
+                    };
+                    return Err(self.lose_peer(peer, WLAN_REASON_DEAUTH_LEAVING, false, why));
                 }
             }
             if let Some(ap) = self.station.ap_phy {
@@ -1220,11 +1384,12 @@ impl<B: Backend> Session<B> {
                             }
                         }
                         crate::mt7921::csa::BeaconPhy::Changed => {
-                            self.station.peer_lost = true;
-                            self.station.rx_ba.fence();
-                            self.station.tx_ba.fence();
-                            self.clear_aggregate_receive();
-                            return Err(Error::DeviceGone);
+                            return Err(self.lose_peer(
+                                peer,
+                                WLAN_REASON_DEAUTH_LEAVING,
+                                false,
+                                "changed caps/bw in a way we can't support",
+                            ));
                         }
                     }
                 }
@@ -1264,11 +1429,12 @@ impl<B: Backend> Session<B> {
                             .is_ok_and(|current| current.same_static(profile))
                     })
                 {
-                    self.station.peer_lost = true;
-                    self.station.rx_ba.fence();
-                    self.station.tx_ba.fence();
-                    self.clear_aggregate_receive();
-                    return Err(Error::DeviceGone);
+                    return Err(self.lose_peer(
+                        peer,
+                        WLAN_REASON_DEAUTH_LEAVING,
+                        false,
+                        "changed HT caps/operation in a way we can't support",
+                    ));
                 }
             }
             // The AP announces it is leaving this channel (Channel Switch
@@ -1325,12 +1491,13 @@ impl<B: Backend> Session<B> {
                         _ => {
                             // Missing/malformed parameters or changed rows with
                             // an unchanged change counter cannot authorize TX.
-                            self.station.peer_lost = true;
                             self.station.wmm_pending = None;
-                            self.station.rx_ba.fence();
-                            self.station.tx_ba.fence();
-                            self.clear_aggregate_receive();
-                            return Err(Error::DeviceGone);
+                            return Err(self.lose_peer(
+                                peer,
+                                WLAN_REASON_DEAUTH_LEAVING,
+                                false,
+                                "sent WMM parameters we can't use",
+                            ));
                         }
                     }
                 }
@@ -1344,11 +1511,14 @@ impl<B: Backend> Session<B> {
                 && header[16..22] == peer
                 && frame.get(24..26).is_some_and(|reason| reason != [0, 0])
             {
-                self.station.peer_lost = true;
-                self.station.rx_ba.fence();
-                self.station.tx_ba.fence();
-                self.clear_aggregate_receive();
-                return Err(Error::DeviceGone);
+                // mac80211 `ieee80211_rx_mgmt_deauth` / `_disassoc`.
+                let reason = u16::from_le_bytes([frame[24], frame[25]]);
+                let why = if header[0] == 0xc0 {
+                    "deauthenticated us"
+                } else {
+                    "disassociated us"
+                };
+                return Err(self.lose_peer(peer, reason, true, why));
             }
             if header[10..16] != peer
                 || header[4..10] != own && header[4] & 1 == 0
@@ -1855,6 +2025,7 @@ impl<B: Backend> Session<B> {
         if self.station.peer_lost || !matches!(self.state, State::Associated { .. }) {
             return Err(Error::DeviceGone);
         }
+        self.adopt_identical_policy();
         let epoch = self.receive_epoch;
         let ready = !self.p2p_rf_busy() && !self.station.csa_block_tx && self.poll_data_tx()?;
         let transmitted = if let Some(frame) = tx.filter(|_| ready) {
@@ -1899,6 +2070,13 @@ impl<B: Backend> Session<B> {
     /// the try waits `reply_ms` for `reply`, then retries. A reply that
     /// `reply` refuses, a missing TX status (the token stays owned until its
     /// native release) and any other failure end the exchange.
+    ///
+    /// A (Re)Association Response rejecting the request temporarily with an
+    /// association comeback time (`reply` stores it in `comeback` and
+    /// refuses with status 30) is not a failure: as
+    /// `ieee80211_rx_mgmt_assoc_resp` does, the join grant is completed
+    /// (`drv_mgd_complete_tx`) and the next try (`ieee80211_do_assoc`, which
+    /// counts it) follows after the comeback time.
     #[allow(clippy::too_many_arguments)]
     async fn mlme_exchange<T>(
         &mut self,
@@ -1908,6 +2086,7 @@ impl<B: Backend> Session<B> {
         frame: &[u8],
         reply_ms: u64,
         steps: [&'static str; 3],
+        comeback: Option<&core::sync::atomic::AtomicU64>,
         mut reply: impl FnMut(&mut B, &[u8]) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
         let peer = u16::from(self.station.link.peer());
@@ -1921,6 +2100,31 @@ impl<B: Backend> Session<B> {
                     self.associate_step = steps[2];
                     match self.wait_station_rx(reply_ms, &mut reply).await {
                         Err(Error::Timeout) => "no reply",
+                        Err(Error::Rejected(WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY))
+                            if comeback.is_some_and(|tu| {
+                                tu.load(core::sync::atomic::Ordering::Acquire) != NO_COMEBACK
+                            }) =>
+                        {
+                            let tu = comeback.map_or(0, |tu| {
+                                tu.swap(NO_COMEBACK, core::sync::atomic::Ordering::AcqRel)
+                            });
+                            self.abort_join_roc(join_roc).await?;
+                            if attempt < MLME_MAX_TRIES {
+                                // TU = 1024 us (`tu * 1024 / 1000` ms).
+                                let ms = tu.saturating_mul(1024) / 1000;
+                                match self
+                                    .wait_station_rx(ms, |_, _| {
+                                        Ok(None::<core::convert::Infallible>)
+                                    })
+                                    .await
+                                {
+                                    Err(Error::Timeout) => {}
+                                    Err(error) => return Err(error),
+                                    Ok(never) => match never {},
+                                }
+                            }
+                            "rejected temporarily"
+                        }
                         result => return result,
                     }
                 }
@@ -2002,6 +2206,7 @@ impl<B: Backend> Session<B> {
                     &frame,
                     AUTH_TIMEOUT_SAE_MS,
                     ["auth-roc", "auth-sae-tx", "auth-sae-rx"],
+                    None,
                     |_, packet| {
                         if let Some(reply) = rx_on_channel(packet, rx_channel) {
                             if let Some(step) = plan
@@ -2045,6 +2250,7 @@ impl<B: Backend> Session<B> {
             frame,
             AUTH_TIMEOUT_SHORT_MS,
             steps,
+            None,
             |_, packet| {
                 if let Some(frame) = rx_on_channel(packet, rx_channel) {
                     if let Some(assoc) = plan
@@ -2328,6 +2534,7 @@ impl<B: Backend> Session<B> {
 
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
+            note_join_step("authenticate with", bss.bssid);
             let aid = loop {
                 let _ = self.abort_join_roc(&mut join_roc).await;
                 let attempt = async {
@@ -2413,7 +2620,10 @@ impl<B: Backend> Session<B> {
                         None => assoc_req,
                     };
                     self.stage(Stage::Associate);
+                    note_join_step("associate with", bss.bssid);
                     // 6. Wait for Association Response (`ieee80211_do_assoc`):
+                    let comeback = core::sync::atomic::AtomicU64::new(NO_COMEBACK);
+                    let reassociation = reassociate_from.is_some();
                     self.mlme_exchange(
                         &mut join_roc,
                         frequency_mhz,
@@ -2421,8 +2631,21 @@ impl<B: Backend> Session<B> {
                         &assoc_req,
                         ASSOC_TIMEOUT_SHORT_MS,
                         ["assoc-roc", "assoc-tx", "assoc-rx"],
+                        Some(&comeback),
                         |_, packet| {
                             if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                                if let Some(tu) =
+                                    association_comeback(frame, own, bss.bssid, reassociation)
+                                {
+                                    note_comeback(bss.bssid, tu);
+                                    comeback.store(
+                                        u64::from(tu),
+                                        core::sync::atomic::Ordering::Release,
+                                    );
+                                    return Err(Error::Rejected(
+                                        WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY,
+                                    ));
+                                }
                                 if let Some(aid) = plan.association_response(frame).map_err(
                                     |error| match error {
                                         // The status itself only selects the
@@ -2712,8 +2935,10 @@ impl<B: Backend> Session<B> {
 
         match result {
             Ok(aid) => {
+                note_join_step("associated with", bss.bssid);
                 self.boot_started = None;
                 self.station.peer_lost = false;
+                self.station.loss = None;
                 // A report from before this association is not its own.
                 self.station.link_stats = crate::mt7921::link_stats::LinkStats::starting_after(
                     self.backend.tx_rate_report().map(|report| report.sequence),
@@ -2751,10 +2976,29 @@ impl<B: Backend> Session<B> {
                 if cached.is_some() {
                     self.pmksa.remove(bss.bssid);
                 }
+                let _ = self.abort_join_roc(&mut join_roc).await;
+                let stage = match self.state {
+                    State::Running(stage) | State::Failed { stage, .. } => stage,
+                    _ => Stage::Associate,
+                };
+                // A refused or unanswered join on a working firmware is no
+                // firmware failure: it is undone in place and the radio
+                // stays usable (no recovery), as mac80211 and mt7921 do.
+                let left = if join_failure_leaves_cleanly(error) {
+                    let join = FailedJoin {
+                        info,
+                        associated: stage == Stage::EapolHandshake,
+                        he: plan.he(),
+                        permission: self.station.permission,
+                        error,
+                    };
+                    self.leave_failed_join(bss, join).await.is_ok()
+                } else {
+                    false
+                };
                 self.station.security = None;
                 self.station.wmm = None;
                 self.station.wmm_pending = None;
-                let _ = self.abort_join_roc(&mut join_roc).await;
                 self.station.permission = None;
                 self.station.ht20_rx = None;
                 self.station.ht20_profile = None;
@@ -2762,14 +3006,116 @@ impl<B: Backend> Session<B> {
                 self.station.he_profile = None;
                 self.station.ap_phy = None;
                 plan.cancel();
-                let stage = match self.state {
-                    State::Running(stage) | State::Failed { stage, .. } => stage,
-                    _ => Stage::Associate,
-                };
-                self.state = State::Failed { stage, error };
+                if left {
+                    self.station.bss = None;
+                    self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
+                    self.station.peer_lost = false;
+                    self.station.loss = None;
+                    self.state = State::ScanReady(info);
+                } else {
+                    self.state = State::Failed { stage, error };
+                }
                 Err(error)
             }
         }
+    }
+
+    /// Undo a failed join (`FailedJoin`) on firmware that still answers:
+    /// mac80211 `ieee80211_destroy_assoc_data` (or, for a join the AP had
+    /// accepted, the Deauthentication wpa_supplicant sends after a failed
+    /// 4-way handshake), then what mt7921 does for the removed station
+    /// (`mt7921_mac_sta_remove`, `mt76_connac_mcu_uni_add_bss(enable =
+    /// false)`, `mt7921_mcu_set_tx` back to the legacy EDCA, and the 6 GHz
+    /// power type unset). Any failure here leaves the owner Failed, and so
+    /// for recovery, exactly as an unanswered teardown always did.
+    async fn leave_failed_join(&mut self, bss: &ScanBss, join: FailedJoin) -> Result<(), Error> {
+        let link = self.station.link;
+        let peer = bss.bssid;
+        let keys = self
+            .station
+            .security
+            .as_ref()
+            .is_some_and(|security| security.ptk_installed);
+        let protect = self
+            .station
+            .security
+            .as_ref()
+            .is_some_and(StationSecurity::protects_management);
+        self.close_own_receive_capture();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        while !self.data_pending.is_empty() {
+            let completion = self
+                .wait(TIMEOUT_MS, |backend| backend.management_complete())
+                .await?;
+            let _ = self.retire_data(completion);
+        }
+        self.retire_transmit_ba(false).await?;
+        self.retire_receive_ba(peer).await?;
+        if join.associated {
+            // WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT for an unanswered handshake.
+            let reason: u16 = if join.error == Error::Timeout { 15 } else { 1 };
+            let mut deauth = vec![0u8; 26];
+            deauth[0] = 0xc0;
+            deauth[1] = if protect { 0x40 } else { 0 };
+            deauth[4..10].copy_from_slice(&peer);
+            deauth[10..16].copy_from_slice(&join.info.capabilities.mac);
+            deauth[16..22].copy_from_slice(&peer);
+            deauth[24..26].copy_from_slice(&reason.to_le_bytes());
+            if join
+                .permission
+                .is_some_and(|permission| self.backend.check_tx_permission(permission).is_ok())
+            {
+                match self
+                    .transmit_management(&deauth, u16::from(link.peer()))
+                    .await
+                {
+                    Ok(_) | Err(Error::Rejected(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if keys {
+            for wcid in [link.peer(), link.bmc()] {
+                let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
+                    .map_err(|_| Error::Bounds)?;
+                self.exchange(Command::Unified { id: 3 }, &record).await?;
+            }
+        }
+        for record in [
+            disconnect_record_on(link, peer),
+            crate::mt7921::association::group_disconnect_record_on(link),
+        ] {
+            self.exchange(Command::Unified { id: 3 }, &record).await?;
+        }
+        let mut record = crate::mt7921::association::bss_record_qos_on(link, bss, false, false)
+            .map_err(|_| Error::Bounds)?;
+        crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
+        self.exchange(Command::Unified { id: 2 }, &record).await?;
+        if let Some(he) = join.he {
+            self.exchange(
+                Command::Unified { id: 2 },
+                &crate::mt7921::vif_slots::on_bss(link.vif(), he.bss(false)),
+            )
+            .await?;
+        }
+        self.notify(
+            Command::Ce {
+                id: 0x1d,
+                query: false,
+            },
+            &crate::mt7921::association::wmm::on_vif(
+                link.vif(),
+                crate::mt7921::association::wmm::legacy_edca(),
+            ),
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        if join.permission.is_some_and(|p| p.six.is_some()) {
+            self.program_6ghz_power_type(join.info, crate::mt7921::six_ghz::MT_AP_UNSET)
+                .await?;
+        }
+        self.backend.check()
     }
 
     pub(super) async fn disassociate_station(&mut self) -> Result<(), Error> {
@@ -2812,7 +3158,10 @@ impl<B: Backend> Session<B> {
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
         self.station.tx_credit.clear();
-        let peer_lost = self.station.peer_lost;
+        // Only a link the AP itself ended goes without the closing
+        // Deauthentication; a local decision sends it as mac80211's
+        // `ieee80211_set_disassoc(..., tx = true)` does.
+        let peer_lost = self.station.peer_lost && self.station.loss.is_none_or(|loss| loss.from_ap);
         self.stage(Stage::StaRecord);
         let result = async {
             // Drain the device FIFO; the other owner's entries are
@@ -2833,15 +3182,20 @@ impl<B: Backend> Session<B> {
                 deauth[10..16].copy_from_slice(&info.capabilities.mac);
                 deauth[16..22].copy_from_slice(&peer);
                 deauth[24..26].copy_from_slice(&3u16.to_le_bytes());
-                self.backend
-                    .check_tx_permission(closing_permission.ok_or(Error::Authority)?)?;
-                match self
-                    .transmit_management(&deauth, u16::from(self.station.link.peer()))
-                    .await
-                {
-                    Ok(_) | Err(Error::Rejected(_)) => {}
-                    Err(error) => return Err(error),
+                // A leave the policy no longer permits to transmit on (a
+                // regulatory change) goes without its Deauthentication.
+                let permitted = closing_permission
+                    .is_some_and(|permission| self.backend.check_tx_permission(permission).is_ok());
+                if permitted {
+                    match self
+                        .transmit_management(&deauth, u16::from(self.station.link.peer()))
+                        .await
+                    {
+                        Ok(_) | Err(Error::Rejected(_)) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
+                self.backend.check()?;
             }
             // Retire keys before removing the station WCIDs. No cleanup ACK
             // is optional: uncertainty cannot become a reusable ready radio.
@@ -2914,6 +3268,7 @@ impl<B: Backend> Session<B> {
         self.station.bss = None;
         self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.station.peer_lost = false;
+        self.station.loss = None;
         self.state = State::ScanReady(info);
         Ok(())
     }
@@ -3106,6 +3461,14 @@ impl<B: Backend> Session<B> {
         .await;
         self.boot_started = None;
         if let Err(error) = result {
+            if self.station.peer_lost {
+                // A decided leave (`ieee80211_sta_connection_lost`), not a
+                // firmware failure: the association stays published for
+                // the teardown that sends its Deauthentication and reports
+                // the disconnect. No recovery follows a healthy firmware.
+                self.state = restore;
+                return Err(Error::DeviceGone);
+            }
             self.station.security = None;
             self.station.wmm = None;
             self.station.wmm_pending = None;
@@ -3239,12 +3602,40 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// End the link: the AP moved somewhere this station cannot follow.
+    /// End the link: the AP moved somewhere this station cannot follow
+    /// (`ieee80211_sta_connection_lost(sdata, WLAN_REASON_DEAUTH_LEAVING)`).
     fn leave_ap(&mut self) -> Error {
+        let peer = self.station.bss.as_ref().map_or([0; 6], |bss| bss.bssid);
+        let _ = self.lose_peer(
+            peer,
+            WLAN_REASON_DEAUTH_LEAVING,
+            false,
+            "moved to a channel we can't follow",
+        );
+        Error::Authority
+    }
+
+    /// The associated link ends without an operator request: the AP's
+    /// Deauthentication / Disassociation (`from_ap`), or this station's own
+    /// `ieee80211_set_disassoc` decision. Records the reason the disconnect
+    /// report carries, logs it as mac80211 does, and fences BA/RX state.
+    /// A local decision still sends its Deauthentication from
+    /// `disassociate_station` (`ieee80211_set_disassoc(..., tx = true)`),
+    /// so an AP with PMF does not keep the stale association.
+    pub(super) fn lose_peer(
+        &mut self,
+        peer: [u8; 6],
+        reason: u16,
+        from_ap: bool,
+        why: &str,
+    ) -> Error {
+        note_link_loss(peer, why, reason, from_ap);
         self.station.peer_lost = true;
+        self.station.loss = Some(super::LinkLoss { reason, from_ap });
         self.station.rx_ba.fence();
         self.station.tx_ba.fence();
-        Error::Authority
+        self.clear_aggregate_receive();
+        Error::DeviceGone
     }
 
     /// Move the association to the AP's channel `ap`: the station uses it
@@ -3352,6 +3743,22 @@ impl<B: Backend> Session<B> {
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
     /// The installed regulatory policy is no longer the one this station's
     /// grant and firmware limits were programmed from.
+    /// cfg80211 runs the regulatory notifier only when the rules change: a
+    /// reinstall of identical rules is adopted as the applied policy, so
+    /// [`Self::policy_changed`] compares it by identity, not by value, on
+    /// every later pass.
+    fn adopt_identical_policy(&mut self) {
+        let Some(applied) = self.station.applied_policy.as_ref() else {
+            return;
+        };
+        let Ok(now) = self.backend.regulatory_domain() else {
+            return;
+        };
+        if !alloc::sync::Arc::ptr_eq(applied, &now) && **applied == *now {
+            self.station.applied_policy = Some(now);
+        }
+    }
+
     pub(super) fn policy_changed(&self, station: &super::StationLink) -> bool {
         // Compared by value: reinstalling identical rules is no change.
         station.applied_policy.as_ref().is_some_and(|applied| {
@@ -3383,9 +3790,12 @@ impl<B: Backend> Session<B> {
         )
         .filter(|new| new.same_operation(old));
         let Some(new) = new else {
-            self.station.peer_lost = true;
-            self.station.rx_ba.fence();
-            self.station.tx_ba.fence();
+            let _ = self.lose_peer(
+                bss.bssid,
+                WLAN_REASON_DEAUTH_LEAVING,
+                false,
+                "is no longer permitted by the regulatory policy",
+            );
             return Err(Error::Authority);
         };
         let band = new.band().ok_or(Error::Bounds)?;

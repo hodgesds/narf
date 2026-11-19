@@ -89,6 +89,8 @@ pub struct Mt76Iface {
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     tx_cons: IrqSafeSpinLock<Option<Consumer<Frame, TX_RING_N>>>,
     associated_bssid: IrqSafeSpinLock<Option<[u8; 6]>>,
+    /// The operating channel's centre frequency of that association.
+    associated_frequency: AtomicU32,
     /// The station link's statistics from the latest packet step, for
     /// NL80211_CMD_GET_STATION (`station_info`); cleared with the link.
     link_stats: IrqSafeSpinLock<Option<crate::mt7921::link_stats::LinkStats>>,
@@ -98,6 +100,9 @@ pub struct Mt76Iface {
     pending_tx: IrqSafeSpinLock<Option<Frame>>,
     control: narf_lib::mutex::Mutex<()>,
     teardown_needed: AtomicBool,
+    /// A packet step moved frames since the worker last looked: it runs
+    /// again at once (NAPI repolls while its budget is used up).
+    serviced: AtomicBool,
     recovery_attempts: AtomicU32,
     recovery_after_ns: AtomicU64,
     receive_epoch: AtomicU64,
@@ -144,11 +149,13 @@ impl Mt76Iface {
             rx_prod: IrqSafeSpinLock::new(None),
             tx_cons: IrqSafeSpinLock::new(None),
             associated_bssid: IrqSafeSpinLock::new(None),
+            associated_frequency: AtomicU32::new(0),
             link_stats: IrqSafeSpinLock::new(None),
             cqm: IrqSafeSpinLock::new(Cqm::default()),
             pending_tx: IrqSafeSpinLock::new(None),
             control: narf_lib::mutex::Mutex::new(()),
             teardown_needed: AtomicBool::new(false),
+            serviced: AtomicBool::new(false),
             recovery_attempts: AtomicU32::new(0),
             recovery_after_ns: AtomicU64::new(0),
             receive_epoch: AtomicU64::new(0),
@@ -336,7 +343,10 @@ impl Mt76Iface {
                 self.refresh_receive_epoch()?;
                 match service_boot_keys().await {
                     Ok(()) | Err(Error::Busy) => {}
-                    Err(_) => {
+                    Err(error) => {
+                        if error != Error::DeviceGone {
+                            note_failure("key/control service", &error);
+                        }
                         self.lose_link();
                         return Err(WirelessError::HardwareError);
                     }
@@ -345,6 +355,64 @@ impl Mt76Iface {
             }
         }
         Ok(())
+    }
+
+    /// One service-worker pass, then the wait until the next one.
+    ///
+    /// Linux mt7921e does no periodic device work on an idle link:
+    /// `mt792x_irq_handler` -> `mt792x_irq_tasklet` -> NAPI services the
+    /// rings when the device interrupts, and timed work (RX reorder and BA
+    /// session timers, the channel-switch time) runs from timers. The pass
+    /// is the tasklet + NAPI poll: the device sources are masked and
+    /// acknowledged, the rings and host queues serviced, the sources
+    /// unmasked (`interrupts_end`). A pass that moved frames repolls at
+    /// once. Otherwise the worker sleeps until an interrupt or a host kick
+    /// (`irq::kick`) raises the line, or until the station's next timed
+    /// work, at most `MT792x_WATCHDOG_TIME`. A polled owner (no MSI vector,
+    /// or a role still sampled by polling) keeps the 1 ms pass period.
+    pub(crate) async fn service_pass(&self) {
+        use crate::mt7921::firmware_transport::{boot_interrupts_begin, boot_interrupts_end};
+        use crate::mt7921::irq::LINE;
+        let seen = LINE.raised();
+        let owned = boot_interrupts_begin().is_ok();
+        let _ = self.poll_data().await;
+        let owned = owned && boot_interrupts_end().is_ok();
+        if self.serviced.swap(false, Ordering::AcqRel) {
+            narf_scheduler::yield_now().await;
+            return;
+        }
+        let period = self.idle_period_ns(owned);
+        let _ = narf_time::timeout(narf_time::Deadline::after_ns(period), LINE.wait(seen)).await;
+    }
+
+    /// How long the worker may sleep after a pass that moved no frames.
+    fn idle_period_ns(&self, owned: bool) -> u64 {
+        let interrupts = owned && crate::mt7921::irq::LINE.bound() && !self.polled_role();
+        let deadline = if interrupts {
+            crate::mt7921::firmware_transport::boot_service_deadline().map_err(|_| ())
+        } else {
+            Err(())
+        };
+        idle_period(interrupts, deadline, narf_time::wall::monotonic_ns())
+    }
+
+    /// Roles and transitions whose timers the owner still samples on each
+    /// pass rather than scheduling: AP, P2P device/group/GO, monitor and
+    /// scheduled scan, and a teardown or recovery in progress.
+    fn polled_role(&self) -> bool {
+        self.ap_owned.load(Ordering::Acquire)
+            || self.ap_role()
+            || self.current_iftype() == 6
+            || self.teardown_needed.load(Ordering::Acquire)
+            || self.sched_scan_running()
+            || self
+                .p2p_device
+                .lock()
+                .as_ref()
+                .is_some_and(|child| child.running())
+            || self.p2p_group.lock().is_some()
+            || self.p2p_go.lock().is_some()
+            || radio_needs_recovery()
     }
 
     /// The synchronous path never waits on a future or another executor task.
@@ -376,7 +444,10 @@ impl Mt76Iface {
         let step = match result {
             Ok(step) => step,
             Err(crate::mt7921::firmware_transport::Error::Busy) => return Ok(false),
-            Err(_) => {
+            Err(error) => {
+                if error != crate::mt7921::firmware_transport::Error::DeviceGone {
+                    note_failure("packet service", &error);
+                }
                 self.lose_link();
                 return Err(WirelessError::HardwareError);
             }
@@ -390,6 +461,9 @@ impl Mt76Iface {
             }
         }
         let progress = step.transmitted || !step.received.is_empty();
+        if progress {
+            self.serviced.store(true, Ordering::Release);
+        }
         deliver_received_batch(
             step,
             |epoch| self.receive_current(epoch),
@@ -497,14 +571,28 @@ impl Mt76Iface {
         *self.rx_prod.lock() = None;
     }
 
+    /// The link ended without an operator request: `__cfg80211_disconnected`
+    /// with the reason and origin mac80211 reported. A peer loss carries the
+    /// AP's own Deauthentication / Disassociation reason (`from_ap`) or the
+    /// station's local decision; a firmware or transport failure is
+    /// mac80211's `ieee80211_sta_connection_lost(WLAN_REASON_UNSPECIFIED)`.
+    /// The firmware teardown follows in `finish_teardown`.
     fn lose_link(&self) {
         let connected = self.station_role() && self.link_up();
+        let bssid = *self.associated_bssid.lock();
+        let loss = connected
+            .then(crate::mt7921::firmware_transport::boot_link_loss)
+            .flatten();
         if connected {
             self.teardown_needed.store(true, Ordering::Release);
         }
         self.clear_link();
         if connected {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            let (reason, from_ap) = loss.map_or((1, false), |loss| (loss.reason, loss.from_ap));
+            if loss.is_none() {
+                note_connection_lost(&self.name, bssid.unwrap_or([0; 6]));
+            }
+            narf_wireless::nl80211::notify_disconnect(&self.name, reason, from_ap);
         }
     }
 
@@ -729,7 +817,11 @@ impl Mt76Iface {
             .as_mut()
             .ok_or(())?
             .try_send(Frame::new(buffer, bytes.len() as u32))
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        // `ieee80211_tx` -> `mt76_tx` -> `mt76_worker_schedule`: the queued
+        // frame is serviced now, not on the next timer.
+        crate::mt7921::irq::kick();
+        Ok(())
     }
 }
 
@@ -794,6 +886,24 @@ static FAILURE_NOTES: AtomicU32 = AtomicU32::new(24);
 /// firmware/transport error into a handful of classes, so without this line
 /// a hardware boot cannot tell a regulatory refusal from an MCU timeout.
 /// Operator-driven and bounded for the boot.
+/// mac80211 `Connection to AP %pM lost`: the link ended on a firmware or
+/// transport failure rather than an AP frame or a local decision.
+#[cold]
+#[inline(never)]
+fn note_connection_lost(name: &str, bssid: [u8; 6]) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "mt76: {name}: connection to AP {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} lost",
+        bssid[0],
+        bssid[1],
+        bssid[2],
+        bssid[3],
+        bssid[4],
+        bssid[5]
+    );
+}
+
 fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
     if FAILURE_NOTES
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
@@ -869,6 +979,27 @@ fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
         && bytes[6..12] == local
         && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
         && bytes[12..14] != [0x88, 0x8e]
+}
+
+/// `MT792x_WATCHDOG_TIME` (HZ / 4), the `mt792x_mac_work` period: the
+/// longest an interrupt-driven owner sleeps with nothing timed.
+const WATCHDOG_NS: u64 = 250_000_000;
+/// The pass period of a polled owner (no MSI vector, or a role whose
+/// timers this owner still samples) and the retry period while another
+/// operation holds the transport.
+const POLL_NS: u64 = 1_000_000;
+
+/// The worker's sleep after an idle pass: an interrupt-driven owner sleeps
+/// until its next timed work (`deadline`, monotonic ns), at least one poll
+/// period and at most `MT792x_WATCHDOG_TIME`; a polled owner, or one whose
+/// transport another operation held, polls.
+fn idle_period(interrupts: bool, deadline: Result<Option<u64>, ()>, now: u64) -> u64 {
+    match deadline {
+        _ if !interrupts => POLL_NS,
+        Ok(Some(at)) => at.saturating_sub(now).clamp(POLL_NS, WATCHDOG_NS),
+        Ok(None) => WATCHDOG_NS,
+        Err(()) => POLL_NS,
+    }
 }
 
 fn radio_needs_recovery() -> bool {
@@ -1397,6 +1528,8 @@ impl WirelessNetIface for Mt76Iface {
             *self.tx_cons.lock() = Some(tx_cons);
             *self.rx_prod.lock() = Some(rx_prod);
             *self.associated_bssid.lock() = Some(req.bssid);
+            self.associated_frequency
+                .store(req.frequency_mhz, Ordering::Release);
             publish_link(&self.name, true);
             Ok(())
         }
@@ -1467,6 +1600,8 @@ impl WirelessNetIface for Mt76Iface {
         match result {
             Ok(_) => {
                 *self.associated_bssid.lock() = Some(req.bssid);
+                self.associated_frequency
+                    .store(req.frequency_mhz, Ordering::Release);
                 *self.link_stats.lock() = None;
                 self.cqm.lock().restart();
                 Ok(())
@@ -1500,6 +1635,7 @@ impl WirelessNetIface for Mt76Iface {
             (None, None) => return Err(22), // EINVAL
         };
         BOOT_PMKSA_REQUESTS.lock().push(request);
+        crate::mt7921::irq::kick();
         Ok(())
     }
     fn flush_pmksa(&self) -> Result<(), i32> {
@@ -1514,6 +1650,29 @@ impl WirelessNetIface for Mt76Iface {
     /// Beacon signal, for one threshold or a cfg80211 threshold list.
     fn supports_cqm_rssi(&self) -> bool {
         true
+    }
+
+    /// mac80211 `ieee80211_dump_survey` -> `mt76_get_survey`: the channel
+    /// in use while associated. This owner samples no MIB channel times
+    /// (`mt792x_mac_work`'s survey update is not run on an idle link) and
+    /// measures no noise floor, so the record carries neither.
+    fn supports_survey(&self) -> bool {
+        self.station_role()
+    }
+    fn survey_info(&self) -> Vec<narf_wireless::SurveyInfo> {
+        let frequency_mhz = self.associated_frequency.load(Ordering::Acquire);
+        if !self.station_role() || !self.link_up() || frequency_mhz == 0 {
+            return Vec::new();
+        }
+        alloc::vec![narf_wireless::SurveyInfo {
+            frequency_mhz,
+            noise_dbm: None,
+            in_use: true,
+            time_ms: None,
+            time_busy_ms: None,
+            time_rx_ms: None,
+            time_tx_ms: None,
+        }]
     }
     fn supports_cqm_rssi_list(&self) -> bool {
         true
@@ -1534,6 +1693,7 @@ impl WirelessNetIface for Mt76Iface {
     /// on its next packet step, and to every later association.
     fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
         crate::mt7921::firmware_transport::BOOT_POWER_SAVE.store(enabled, Ordering::Relaxed);
+        crate::mt7921::irq::kick();
         Ok(())
     }
 
@@ -1900,8 +2060,7 @@ pub(crate) fn register_scan_iface_profile(
         // Removal withdraws ACTIVE; a removed generation's worker never
         // touches a reprobed radio.
         while is_active(&worker) {
-            let _ = worker.poll_data().await;
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            worker.service_pass().await;
         }
     });
     Ok(iface)
@@ -2096,6 +2255,36 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_physical_carrier_preserves_admin_and_never_calls_hook_under_driver_lock
+    );
+
+    /// mt7921e on an idle link: no pass until an interrupt, a host kick or
+    /// timed work, and never longer than `MT792x_WATCHDOG_TIME`; queued or
+    /// overdue work waits one poll period, not a busy loop. A polled owner
+    /// (no MSI) or a held transport keeps the 1 ms period.
+    fn mt76_worker_sleeps_until_interrupt_or_timed_work() -> TestResult {
+        let now = 10_000_000_000;
+        let cases = [
+            (true, Ok(None), WATCHDOG_NS),
+            (true, Ok(Some(now + 40_000_000)), 40_000_000),
+            (true, Ok(Some(now + 3_000_000_000)), WATCHDOG_NS),
+            (true, Ok(Some(0)), POLL_NS),
+            (true, Ok(Some(now + 10)), POLL_NS),
+            (true, Err(()), POLL_NS),
+            (false, Ok(None), POLL_NS),
+        ];
+        for (interrupts, deadline, expected) in cases {
+            if idle_period(interrupts, deadline, now) != expected {
+                return TestResult::Fail("worker sleep differs from the interrupt-driven plan");
+            }
+        }
+        if WATCHDOG_NS != 250_000_000 {
+            return TestResult::Fail("watchdog period is not MT792x_WATCHDOG_TIME (HZ / 4)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/irq",
+        mt76_worker_sleeps_until_interrupt_or_timed_work
     );
     fn radio() -> RadioInfo {
         RadioInfo {
@@ -2313,6 +2502,29 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin
+    );
+    /// `mt76_get_survey` for wpa_supplicant's `signal_poll`: the channel in
+    /// use while associated, nothing while the station is idle.
+    fn mt76_survey_reports_the_channel_in_use() -> TestResult {
+        let iface = Mt76Iface::new(String::from("mt76-survey"), radio()).unwrap();
+        if !iface.supports_survey() || !iface.survey_info().is_empty() {
+            return TestResult::Fail("an idle station reported a channel in use");
+        }
+        *iface.associated_bssid.lock() = Some([2, 1, 2, 3, 4, 5]);
+        iface.associated_frequency.store(5805, Ordering::Release);
+        let survey = iface.survey_info();
+        if survey.len() != 1
+            || survey[0].frequency_mhz != 5805
+            || !survey[0].in_use
+            || survey[0].noise_dbm.is_some()
+        {
+            return TestResult::Fail("the associated channel was not reported in use");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_survey_reports_the_channel_in_use
     );
     fn mt76_wow_capability_busy_reporting_does_not_cache_authority() -> TestResult {
         use crate::mt7921::firmware_transport::Error;

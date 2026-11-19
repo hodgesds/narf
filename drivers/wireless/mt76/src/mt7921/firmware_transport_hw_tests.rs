@@ -91,6 +91,7 @@ fn rig_with(
             hw_amsdu: false,
             sequence_reset: SequenceReset::None,
             wake: wake::Wake::default(),
+            irq: None,
         },
     ))
 }
@@ -1034,6 +1035,8 @@ fn mcu_packet_router_separates_forwarded_management_from_command_replies() -> Te
     }
     let mut reply = vec![0u8; 36];
     reply[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    reply[28] = 1; // generic reply
+    reply[29] = 1; // to command sequence 1
     inject_rx(&mut words, &hw, 2, &reply);
     if hw.receive_data() != Ok(None) || hw.receive() != Ok(Some(reply)) {
         return TestResult::Fail("MCU response on data ring was dropped");
@@ -1141,16 +1144,19 @@ fn mcu_receive_router_bounds_both_queues_without_dropping_command_replies() -> T
     }
     // Clear the data backlog before exercising event routing on data ring 2.
     hw.owner.storage.as_mut().unwrap().pending_data.clear();
+    // A command reply (generic event, nonzero sequence) waits for its
+    // command; an unread unsolicited event does not (see the next test).
+    let mut reply = [0u8; 36];
+    reply[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    reply[28] = 1;
+    reply[29] = 1;
     for _ in 0..32 {
-        let mut packet = [0u8; 36];
-        packet[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
-        inject_rx(&mut words, &hw, 2, &packet);
+        inject_rx(&mut words, &hw, 2, &reply);
         if hw.receive_data() != Ok(None) {
             return TestResult::Fail("MCU reply reached packet receiver");
         }
     }
-    let mut packet = [0u8; 36];
-    packet[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    let packet = reply;
     inject_rx(&mut words, &hw, 2, &packet);
     if hw.receive_data() != Err(Error::EventOverflow)
         || hw.owner.storage.as_ref().unwrap().pending_events.len() != 32
@@ -1162,6 +1168,62 @@ fn mcu_receive_router_bounds_both_queues_without_dropping_command_replies() -> T
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_receive_router_bounds_both_queues_without_dropping_command_replies
+);
+
+/// Linux `mt7921_mcu_rx_event` handles an unsolicited event at RX time and
+/// frees it. With packet service running and no command waiting (an idle
+/// associated link), LP_INFO, DBG_MSG, RSSI_NOTIFY, TX_DONE, the rate report
+/// and sequence-0 generic events are dropped, however many arrive; they
+/// never exhaust the 32-entry queue that replies and SCAN_DONE wait in.
+fn mcu_unread_unsolicited_events_never_fill_the_event_queue() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    let unsolicited = |eid: u8, option: u8, ext_eid: u8| {
+        let mut packet = [0u8; 36];
+        packet[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+        packet[28] = eid;
+        packet[30] = option;
+        packet[32] = ext_eid;
+        packet
+    };
+    let kinds = [
+        unsolicited(0x07, 0, 0),    // LP_INFO
+        unsolicited(0x27, 0, 0),    // DBG_MSG
+        unsolicited(0x96, 0, 0),    // RSSI_NOTIFY
+        unsolicited(0x0f, 0, 0),    // TX_DONE
+        unsolicited(0xed, 0, 0x87), // ext RATE_REPORT
+        unsolicited(0x13, 0, 0),    // BSS_BEACON_LOSS without beacon filter
+        unsolicited(0x01, 0, 0),    // sequence-0 generic event
+        unsolicited(0x30, 4, 0),    // other unified unsolicited event
+    ];
+    for _ in 0..40 {
+        for packet in &kinds {
+            inject_rx(&mut words, &hw, 2, packet);
+            if hw.receive_data() != Ok(None) {
+                return TestResult::Fail("an unsolicited event failed or reached packet RX");
+            }
+        }
+        if !hw.owner.storage.as_ref().unwrap().pending_events.is_empty() {
+            return TestResult::Fail("an unread unsolicited event was queued");
+        }
+    }
+    // SCAN_DONE and the unified ROC grant are read later by their owner.
+    for packet in [unsolicited(0x0d, 0, 0), unsolicited(0x27, 4, 0)] {
+        inject_rx(&mut words, &hw, 2, &packet);
+        if hw.receive_data() != Ok(None) {
+            return TestResult::Fail("a kept event reached packet RX");
+        }
+    }
+    if hw.owner.storage.as_ref().unwrap().pending_events.len() != 2 {
+        return TestResult::Fail("SCAN_DONE / ROC grant was not kept for its owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_unread_unsolicited_events_never_fill_the_event_queue
 );
 
 fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestResult {
@@ -1297,4 +1359,55 @@ fn mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata() -> TestRe
 kernel_test_in!(
     "drivers/wireless/mt7921/tx_ba",
     mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata
+);
+
+/// Linux `mt7921_pci_probe` / `mt792x_dma_enable` sources, then one
+/// `mt792x_irq_handler` + `mt792x_irq_tasklet` pass: mask, read the enabled
+/// pending sources, acknowledge them (and `MT_MCU_CMD`), and NAPI's unmask.
+fn mcu_interrupt_pass_masks_acknowledges_and_unmasks_like_the_tasklet() -> TestResult {
+    use crate::mt7921::irq::{HOST_INT_MASK, MT_INT_MCU_CMD, MT_INT_RX_DONE_ALL};
+    let (mut words, hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    let word = |addr: u32| addr as usize / 4;
+    words[word(MT_MCU2HOST_SW_INT_ENA)] = 0x100;
+    if hw.program_host_interrupts().is_err()
+        || words[word(MT_PCIE_MAC_INT_ENABLE)] != 0xff
+        || words[word(MT_WFDMA0_HOST_INT_ENA)] != HOST_INT_MASK
+        || words[word(MT_MCU2HOST_SW_INT_ENA)] != 0x100 | MT_MCU_CMD_WAKE_RX_PCIE
+    {
+        return TestResult::Fail("interrupt sources differ from mt7921e's");
+    }
+    // RX data and the MCU software interrupt pend, with a source mt7921e
+    // never enables (bit 31): only the enabled ones are acknowledged.
+    let pending = (1 << 2) | MT_INT_MCU_CMD | (1 << 31);
+    words[word(MT_WFDMA0_HOST_INT_STA)] = pending;
+    words[word(MT_MCU_CMD)] = MT_MCU_CMD_WAKE_RX_PCIE;
+    match hw.acknowledge_interrupts() {
+        Ok(status) if status == pending & HOST_INT_MASK => {}
+        _ => return TestResult::Fail("pass did not report the enabled pending sources"),
+    }
+    if words[word(MT_WFDMA0_HOST_INT_ENA)] != 0
+        || words[word(MT_WFDMA0_HOST_INT_STA)] != pending & HOST_INT_MASK
+        || words[word(MT_MCU_CMD)] != MT_MCU_CMD_WAKE_RX_PCIE
+    {
+        return TestResult::Fail("pass did not mask, then write-1-clear STA and MCU_CMD");
+    }
+    if HOST_INT_MASK & MT_INT_RX_DONE_ALL != MT_INT_RX_DONE_ALL || HOST_INT_MASK != 0x2847_fff5 {
+        return TestResult::Fail("mask differs from MT_INT_TX_DONE_ALL | RX_DONE_ALL | MCU_CMD");
+    }
+    // No vector bound: the polled owner never touches the sources.
+    words[word(MT_WFDMA0_HOST_INT_ENA)] = 0x1234;
+    if hw.interrupts_begin() != Ok(0)
+        || hw.interrupts_end().is_err()
+        || words[word(MT_WFDMA0_HOST_INT_ENA)] != 0x1234
+    {
+        return TestResult::Fail("a polled owner changed the interrupt sources");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_interrupt_pass_masks_acknowledges_and_unmasks_like_the_tasklet
 );

@@ -169,3 +169,98 @@ kernel_test_in!(
     "drivers/wireless/mt7921/join/retry",
     mt76_join_gives_up_after_the_mac80211_try_limits
 );
+
+/// Whether `session` sent the firmware command carrying `record`.
+fn commanded(session: &Session<Model>, from: usize, record: &[u8]) -> bool {
+    session.backend.frames[from..]
+        .iter()
+        .any(|(_, frame)| frame.windows(record.len()).any(|window| window == record))
+}
+
+/// `ieee80211_rx_mgmt_assoc_resp`: WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY
+/// with an association comeback Timeout Interval element is not a failure.
+/// The station waits the comeback time (200 TU = 204 ms) and sends the
+/// identical request again (`ieee80211_do_assoc`), which the AP accepts.
+fn comeback_then_join() -> Result<(), &'static str> {
+    let (mut session, bss) = super::wmm_tests::prepared(true, false);
+    session.backend.assoc_refusals.push_back((30, Some(200)));
+    let start = session.backend.frames.len();
+    let began = session.backend.ticks.get();
+    if open_join(&mut session, &bss).is_err() {
+        return Err("join did not survive a temporary rejection with a comeback time");
+    }
+    let requests = sent(&session, start, association);
+    if requests.len() != 2 || requests[0] != requests[1] {
+        return Err("the association was not re-sent once, unchanged, after the comeback");
+    }
+    if session.backend.ticks.get().saturating_sub(began) < 204_000_000 {
+        return Err("the association was re-sent before the comeback time");
+    }
+    if !matches!(session.state, State::Associated { .. }) {
+        return Err("the station is not associated after the comeback");
+    }
+    Ok(())
+}
+fn mt76_assoc_comeback_waits_and_retries_the_association() -> TestResult {
+    comeback_then_join().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join/retry",
+    mt76_assoc_comeback_waits_and_retries_the_association
+);
+
+/// A refused association (`%pM denied association (code=%d)`; status 30
+/// without a comeback time, or any other status), and a comeback on every
+/// try (`association with %pM timed out` after IEEE80211_ASSOC_MAX_TRIES),
+/// end the join on a working firmware. mac80211 destroys the association
+/// data and mt7921 removes the station and disables the BSS; the radio
+/// stays ready (no firmware recovery) and no Deauthentication is sent.
+/// The AP's refusals (status, comeback TUs), the join's error, the tries.
+type Refusal = (&'static [(u16, Option<u32>)], Error, usize);
+fn refusal_leaves_radio_ready() -> Result<(), &'static str> {
+    let cases: [Refusal; 3] = [
+        (&[(30, None)], Error::Rejected(30), 1),
+        (&[(17, None)], Error::Rejected(17), 1),
+        (&[(30, Some(10)); 3], Error::Timeout, MAX_TRIES),
+    ];
+    for (refusals, expected, tries) in cases {
+        let (mut session, bss) = super::wmm_tests::prepared(true, false);
+        session
+            .backend
+            .assoc_refusals
+            .extend(refusals.iter().copied());
+        let start = session.backend.frames.len();
+        if open_join(&mut session, &bss) != Err(expected) {
+            return Err("a refused association did not fail the join with its status");
+        }
+        if sent(&session, start, association).len() != tries {
+            return Err("a refused association was retried like a lost one");
+        }
+        if !matches!(session.state, State::ScanReady(_)) {
+            return Err("a refused association left the radio for firmware recovery");
+        }
+        let link = crate::mt7921::vif_slots::Link::HOME;
+        if !commanded(
+            &session,
+            start,
+            &crate::mt7921::association::disconnect_record_on(link, bss.bssid),
+        ) || !commanded(
+            &session,
+            start,
+            &crate::mt7921::association::group_disconnect_record_on(link),
+        ) {
+            return Err("the refused join's station records were not removed");
+        }
+        if !sent(&session, start, |frame| frame.first() == Some(&0xc0)).is_empty() {
+            return Err("a never-associated station sent a Deauthentication");
+        }
+    }
+    Ok(())
+}
+fn mt76_refused_association_is_undone_without_recovery() -> TestResult {
+    refusal_leaves_radio_ready().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join/retry",
+    mt76_refused_association_is_undone_without_recovery
+);
