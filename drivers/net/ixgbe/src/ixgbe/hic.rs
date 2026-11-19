@@ -45,13 +45,15 @@
 //! Timing: Linux sleeps between semaphore retries (5–10 ms)
 //! and after a successful claim (5–6 ms). This module waits
 //! with `responsive_spin_until` (which ticks the sleep pumps,
-//! per the repo rule against hand-rolled MMIO spin loops)
-//! instead of sleeping: the inter-retry wait polls the
-//! resource bits so it returns early when the holder
-//! releases, and the post-claim sleep is skipped — the
-//! register write itself is the handoff. The retry budgets
-//! (200 acquire iterations, 200 ms semaphore phases) are
-//! Linux's.
+//! per the repo rule against hand-rolled MMIO spin loops):
+//! the inter-retry wait is a bounded sleep that never reads
+//! SWFW_SYNC — a read of that register test-and-sets REGSMP
+//! (bit 31) and would claim the semaphore the wait is trying
+//! to let go, so polling it here can never return early and
+//! instead breaks the next retry (see #2265). The post-claim
+//! sleep is skipped — the register write itself is the
+//! handoff. The retry budgets (200 acquire iterations,
+//! 200 ms semaphore phases) are Linux's.
 
 use super::queues::RegBank;
 
@@ -159,8 +161,11 @@ pub const SWFW_SEM_TIMEOUT_MS: u64 = 200;
 /// `ixgbe_acquire_swfw_sync_X540`, 200 iterations).
 pub const SWFW_ACQUIRE_RETRIES: u32 = 200;
 /// Inter-retry wait inside the SWFW acquire (Linux sleeps
-/// 5–10 ms; this module polls the resource bits for up to
-/// 10 ms and returns early when they clear).
+/// 5–10 ms; this module sleeps the full 10 ms). It must
+/// never read SWFW_SYNC: a read test-and-sets REGSMP
+/// (bit 31) and claims the semaphore, so polling the
+/// resource bits here breaks the next retry instead of
+/// returning early (#2265).
 pub const SWFW_RETRY_WAIT_MS: u64 = 10;
 
 /// HIC command return status: success (X550 Table 11-48 /
@@ -443,12 +448,12 @@ pub fn acquire_swfw_sync<B: RegBank>(
             return Ok(());
         }
         release_swfw_sync_semaphore(bank, swsm, swfw_sync);
-        // Wait for the holder to release (up to 10 ms),
-        // returning early when the bits clear.
-        let _ = narf_scheduler::responsive_spin_until(
-            || bank.read32(swfw_sync) & wanted == 0,
-            narf_time::Deadline::after_ms(SWFW_RETRY_WAIT_MS),
-        );
+        // Sleep like Linux (`usleep_range(5000, 10000)`).
+        // Never read SWFW_SYNC here: a read test-and-sets
+        // REGSMP and claims the semaphore, so the next
+        // retry's semaphore phase would time out and the
+        // expiry tail would never run (#2265).
+        wait_ms(SWFW_RETRY_WAIT_MS);
     }
     // Expired: assume FW/HW malfunction and claim the SW
     // bits anyway — unless another SW holds them, in which
