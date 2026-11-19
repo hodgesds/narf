@@ -41,6 +41,13 @@ earliest event of any base. The aarch64 generic timer runs
 timer transitions serialize against their ISR with IRQ masking and restore the
 caller's original IRQ state.
 
+HPET comparator 0 prefers FSB-MSI delivery to the boot CPU's mapped APIC ID;
+it claims an IOAPIC GSI only when the comparator lacks FSB capability. Both
+routes use checked one-shot programming and bounded minimum-delta retries.
+The installed handler is named `hpet-timer` in `/proc/interrupts`, and boot logs
+identify the selected route and vector. Failed IOAPIC routing removes the
+handler before releasing its vector.
+
 CPU masks handed to `apic::send_fixed_ipi` (reschedule, TLB shootdown,
 membarrier) and the panic-stop / stall NMIs name **logical** CPUs; each
 target is resolved to its APIC ID through `narf_acpi::apic_id_of_cpu`
@@ -366,7 +373,7 @@ way before it offers a wake-capable sleep state.
 - Controllers: x2APIC for local, I/O APIC legacy path for devices that
   predate MSI/MSI-X. Prefer MSI-X where the device supports it.
 - Timer-wheel deadlines use the successfully probed reliable LAPIC
-  TSC-deadline clockevent exclusively. The HPET comparator/IOAPIC path remains
+  TSC-deadline clockevent exclusively. The HPET comparator path remains
   armed as a fallback only when that reliable primary is unavailable; the two
   sources do not intentionally deliver the same deadline.
 - The timer wheel is global, but exactly one logical CPU owns its LAPIC

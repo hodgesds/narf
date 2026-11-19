@@ -4,7 +4,8 @@
 //! clockevent (`tick_program_event`). Reliable LAPIC TSC-deadline is the
 //! primary path; HPET comparator 0 remains the fallback when the
 //! selected LAPIC is not a reliable one-shot source. At boot the
-//! fallback allocates one IDT vector + one IOAPIC redirection. This
+//! fallback allocates one IDT vector and prefers FSB-MSI delivery; older
+//! HPETs use an IOAPIC redirection. This
 //! is the contrast with
 //! [`crate::x86_64::hpet_oneshot`], which leaks a fresh vector on
 //! every arm and is fine for one-shot calibration use but would
@@ -65,6 +66,8 @@ struct PumpState {
     gsi: AtomicU8,
     /// LAPIC id we route to (always BSP for this pass).
     dest_apic: AtomicU8,
+    /// Comparator 0 delivers an MSI instead of driving a GSI.
+    fsb: AtomicBool,
 }
 
 static STATE: PumpState = PumpState {
@@ -72,6 +75,7 @@ static STATE: PumpState = PumpState {
     vector: AtomicU8::new(0),
     gsi: AtomicU8::new(0),
     dest_apic: AtomicU8::new(0),
+    fsb: AtomicBool::new(false),
 };
 
 /// Whether wheel arms also need the HPET fallback. A working TSC-deadline
@@ -158,6 +162,9 @@ fn wheel_arm(deadline_cycles: u64) {
 
 fn arm_hpet(deadline_cycles: u64) {
     let gsi = STATE.gsi.load(Ordering::Relaxed);
+    let fsb = STATE.fsb.load(Ordering::Relaxed);
+    let msi_addr = 0xFEE0_0000 | (u32::from(STATE.dest_apic.load(Ordering::Relaxed)) << 12);
+    let msi_data = u32::from(STATE.vector.load(Ordering::Relaxed));
     let mut target = deadline_cycles_to_hpet_target(deadline_cycles);
     // Linux `clockevents_program_event` → `clockevents_program_min_delta`:
     // when the device reports -ETIME (the counter reached the comparator
@@ -168,10 +175,16 @@ fn arm_hpet(deadline_cycles: u64) {
     // broadcast silent until some later arm.
     let mut delta = narf_time::hpet::MIN_PROG_TICKS;
     for _ in 0..10 {
-        // SAFETY: HPET window initialised at boot (init() checked); GSI is
-        // the one we registered against the IOAPIC; comparator 0 is the one
-        // we routed.
-        match unsafe { narf_time::hpet::arm_oneshot_checked(0, gsi, target) } {
+        // SAFETY: init owns comparator 0 and installed this vector's handler
+        // before publishing either the FSB-MSI or IOAPIC route.
+        let armed = unsafe {
+            if fsb {
+                narf_time::hpet::arm_oneshot_msi_checked(0, msi_addr, msi_data, target)
+            } else {
+                narf_time::hpet::arm_oneshot_checked(0, gsi, target)
+            }
+        };
+        match armed {
             Err(narf_time::hpet::ArmError::Expired) => {
                 target = narf_time::hpet::read_counter().wrapping_add(delta);
                 delta = delta.saturating_mul(2);
@@ -239,18 +252,23 @@ pub fn init() -> Result<(), TimerPumpInitError> {
         _ => return Err(bail(TimerPumpInitError::NoLocalApic)),
     };
 
+    let fsb = narf_time::hpet::comparator_supports_fsb(0);
     let route_cap = narf_time::hpet::timer_route_cap(0);
-    let gsi = match pick_gsi(route_cap, 16) {
-        Some(g) => g,
-        None => {
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "  timer_pump: HPET timer 0 route_cap = {:#010x} \
+    let gsi = if fsb {
+        0 // unused: MSI must not claim or alter an IOAPIC route
+    } else {
+        match pick_gsi(route_cap, 16) {
+            Some(g) => g,
+            None => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  timer_pump: HPET timer 0 route_cap = {:#010x} \
                  (no usable GSI found)",
-                route_cap,
-            );
-            return Err(bail(TimerPumpInitError::NoSafeGsi));
+                    route_cap,
+                );
+                return Err(bail(TimerPumpInitError::NoSafeGsi));
+            }
         }
     };
 
@@ -258,25 +276,38 @@ pub fn init() -> Result<(), TimerPumpInitError> {
         Ok(v) => v,
         Err(_) => return Err(bail(TimerPumpInitError::NoVector)),
     };
-    crate::install_handler(vector, pump_irq);
+    // A calibration user may have programmed comparator 0 since HPET takeover.
+    // Quiesce it before publishing a new route and enabling delivery.
+    // SAFETY: boot owns comparator 0; no timer-pump arm callback exists yet.
+    unsafe {
+        let _ = narf_time::hpet::disarm(0);
+    }
+    crate::install_handler_named(vector, "hpet-timer", 0, |_| {
+        pump_irq();
+        crate::IrqStatus::Handled
+    });
 
-    // SAFETY: vector freshly allocated, handler installed above.
-    let routed = unsafe {
-        ioapic::route_gsi_to_vector(
-            gsi as u32,
-            vector,
-            dest_apic,
-            ioapic::POLARITY_HIGH | ioapic::TRIGGER_LEVEL,
-        )
-    };
-    if !routed {
-        let _ = crate::vector::free(vector);
-        return Err(bail(TimerPumpInitError::IoapicRoutingFailed));
+    if !fsb {
+        // SAFETY: vector freshly allocated, handler installed above.
+        let routed = unsafe {
+            ioapic::route_gsi_to_vector(
+                gsi as u32,
+                vector,
+                dest_apic,
+                ioapic::POLARITY_HIGH | ioapic::TRIGGER_LEVEL,
+            )
+        };
+        if !routed {
+            crate::dispatch::remove_handler(vector, "hpet-timer", 0);
+            let _ = crate::vector::free(vector);
+            return Err(bail(TimerPumpInitError::IoapicRoutingFailed));
+        }
     }
 
     STATE.vector.store(vector, Ordering::Release);
     STATE.gsi.store(gsi, Ordering::Release);
     STATE.dest_apic.store(dest_apic, Ordering::Release);
+    STATE.fsb.store(fsb, Ordering::Release);
 
     // Linux-style single clockevent ownership: once the boot probe selected a
     // reliable LAPIC one-shot, it alone drives wheel deadlines. Retain HPET for
@@ -289,6 +320,15 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     let oneshot_lapic = narf_time::clockevent::primary()
         .is_some_and(|dev| dev.name() == "lapic" && dev.can_stop_idle_tick());
     USE_HPET_FALLBACK.store(!oneshot_lapic, Ordering::Release);
+
+    if !oneshot_lapic {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  timer_pump: HPET comparator 0 via {} vector {vector} apic {dest_apic}",
+            if fsb { "MSI" } else { "IOAPIC" },
+        );
+    }
 
     // Install the wheel callback last — it's the gate that lets
     // future `register` calls actually program HPET. Anything
