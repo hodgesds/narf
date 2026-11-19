@@ -77,7 +77,13 @@ trait default `trim` errors, `submit` with `BlockOp::Trim` forwards to
 `trim` and surfaces that error, and the fire-and-forget `discard()`
 forwards only on trim-capable devices. A device must never advertise
 Discard for a no-op trim: filesystems would record blocks as freed
-while the device still holds them.
+while the device still holds them. Wrappers forward `supports_trim`
+with `trim`: `PartitionBlockDevice` offsets the range to the parent,
+`EncryptedBlockDevice` translates it by the data offset (trim carries
+no data, so there is nothing to encrypt), and `PolicyGuard` gates both
+on the write policy — a read-only guard neither advertises Discard nor
+forwards a trim, matching the queued path, which refuses
+`BlockOp::Trim` via `op_writes`.
 
 ### 3.2 Request / completion
 

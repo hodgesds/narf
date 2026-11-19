@@ -994,6 +994,28 @@ impl BlockDeviceSync for PolicyGuard {
         }
         self.refuse(lba, n_blocks)
     }
+    /// Discard is advertised only while the policy permits writes:
+    /// a trim deallocates media contents, so a read-only guard must
+    /// not offer it — the queued path already refuses `BlockOp::Trim`
+    /// via `op_writes`, and the sync path must match.
+    fn supports_trim(&self) -> bool {
+        self.inner.supports_trim() && self.permits_write()
+    }
+    /// Trim changes media contents (deallocation), so it is refused
+    /// exactly like a write when the policy denies writes — unlike
+    /// `flush`, which carries no data and is forwarded regardless.
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), BlockIoError> {
+        if self.permits_write() {
+            return self.inner.trim(lba, n_blocks);
+        }
+        refuse_write(
+            self.name,
+            &self.warned,
+            lba,
+            u32::try_from(n_blocks).unwrap_or(u32::MAX),
+        );
+        Err(BlockIoError::ReadOnly)
+    }
     /// The inner device's queue behind the same write gate.
     fn queue(&self) -> Option<Arc<dyn crate::BlockQueue>> {
         let inner = self.inner.queue()?;

@@ -568,6 +568,32 @@ impl BlockDeviceSync for EncryptedBlockDevice {
     fn has_real_flush(&self) -> bool {
         self.inner.has_real_flush()
     }
+    fn supports_trim(&self) -> bool {
+        self.inner.supports_trim()
+    }
+    /// Trim carries no data, so there is nothing to encrypt: the
+    /// range is translated to inner LBAs exactly as `read`/`write`
+    /// translate theirs and forwarded to the inner device's
+    /// deallocation command (dm-crypt `allow_discards` semantics —
+    /// the underlying device frees the sectors; reads afterwards
+    /// are device-defined, as the trait documents). No FUA-style
+    /// treatment: trim makes no durability claim about written
+    /// data, so `capabilities().fua` stays `false` here regardless.
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), BlockIoError> {
+        let end = lba.checked_add(n_blocks).ok_or(BlockIoError::OutOfRange)?;
+        if end > self.capacity() {
+            return Err(BlockIoError::OutOfRange);
+        }
+        let scale = u64::from(self.lba_size()) / u64::from(self.inner.lba_size());
+        let inner_lba = lba
+            .checked_mul(scale)
+            .and_then(|offset| self.data_offset_lbas.checked_add(offset))
+            .ok_or(BlockIoError::OutOfRange)?;
+        let inner_blocks = n_blocks
+            .checked_mul(scale)
+            .ok_or(BlockIoError::OutOfRange)?;
+        self.inner.trim(inner_lba, inner_blocks)
+    }
     fn capabilities(&self) -> crate::registry::BlockCaps {
         // FUA is emulated here (the default `write_fua`).
         crate::registry::BlockCaps {
