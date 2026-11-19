@@ -11,7 +11,7 @@ const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
 const PASSWORD: &[u8] = b"narf-sae-password";
 const IGTK: [u8; 16] = [0x3c; 16];
 
-fn sae_ap(pwe: ApSaePwe) -> FakeAp {
+pub(super) fn sae_ap(pwe: ApSaePwe) -> FakeAp {
     FakeAp::wpa3_sae(
         super::wmm_tests::NETWORK,
         b"narf",
@@ -60,7 +60,11 @@ pub(super) fn prepared(ap: FakeAp) -> (Box<Session<Model>>, ScanBss) {
     (session, bss)
 }
 
-fn join(session: &mut Session<Model>, bss: &ScanBss, security: Security) -> Result<u16, Error> {
+pub(super) fn join(
+    session: &mut Session<Model>,
+    bss: &ScanBss,
+    security: Security,
+) -> Result<u16, Error> {
     run(Box::pin(session.associate_station(
         bss,
         b"narf",
@@ -70,7 +74,7 @@ fn join(session: &mut Session<Model>, bss: &ScanBss, security: Security) -> Resu
     )))
 }
 
-fn sae() -> Security {
+pub(super) fn sae() -> Security {
     Security::Wpa3Sae {
         password: SaePassword::new(PASSWORD).unwrap(),
     }

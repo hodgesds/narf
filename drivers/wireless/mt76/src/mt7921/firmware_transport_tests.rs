@@ -49,6 +49,8 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "join_retry_tests.rs"]
+mod join_retry_tests;
 #[path = "key_replace_tests.rs"]
 mod key_replace_tests;
 #[path = "monitor_tests.rs"]
@@ -302,6 +304,17 @@ struct Model {
     sequence: crate::mt7921::tx_sequence::Owner,
     tx_status: VecDeque<Vec<u8>>,
     data_headers: Vec<[u8; 64]>,
+    /// The next N station management frames are lost on air: the fixture
+    /// AP never sees them and their TX status reports no ACK (status 1).
+    unacked_management: usize,
+    /// Restricts `unacked_management` to frames whose first byte (frame
+    /// control) is this; others are delivered.
+    unacked_kind: Option<u8>,
+    /// The next N fixture-AP replies are lost on air after the AP took
+    /// (and ACKed) the frame they answer.
+    lost_replies: usize,
+    /// TX statuses for submitted-but-unacknowledged management frames.
+    unacked_status: VecDeque<u8>,
 }
 #[path = "associated_scan_tests.rs"]
 mod associated_scan_tests;
@@ -445,6 +458,10 @@ impl Model {
             sequence: crate::mt7921::tx_sequence::Owner::new(),
             tx_status: VecDeque::new(),
             data_headers: Vec::new(),
+            unacked_management: 0,
+            unacked_kind: None,
+            lost_replies: 0,
+            unacked_status: VecDeque::new(),
         }
     }
 }
@@ -1046,6 +1063,15 @@ impl Backend for Model {
         self.tx_vifs.push(vif.index());
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
+        if self.unacked_management > 0
+            && self
+                .unacked_kind
+                .is_none_or(|kind| frame.first() == Some(&kind))
+        {
+            self.unacked_management -= 1;
+            self.unacked_status.push_back(1);
+            return Ok(());
+        }
         if frame.first() == Some(&0xc0) {
             if let Some(ap) = &self.access_point {
                 // The shared AP speaks auth/association/EAPOL through its
@@ -1184,6 +1210,10 @@ impl Backend for Model {
         if let Some(ap) = &mut self.access_point {
             let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
             for mut reply in replies {
+                if self.lost_replies > 0 {
+                    self.lost_replies -= 1;
+                    continue;
+                }
                 if reply.first() == Some(&0x10) {
                     if let Some(parameters) = &self.wmm_reply {
                         reply.extend_from_slice(parameters);
@@ -1545,7 +1575,10 @@ impl Backend for Model {
         }
         let completion = crate::mt7921::packet_tx::Completion {
             token: 1,
-            status: self.completion_status,
+            status: self
+                .unacked_status
+                .pop_front()
+                .unwrap_or(self.completion_status),
         };
         self.sequence.terminal(completion);
         Ok(Some(completion))

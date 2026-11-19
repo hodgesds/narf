@@ -16,6 +16,39 @@ use zeroize::{Zeroize, Zeroizing};
 #[path = "wowlan_security.rs"]
 mod wowlan;
 
+// net/mac80211/mlme.c MLME retry policy (mt76 sets REPORTS_TX_ACK_STATUS).
+/// `IEEE80211_AUTH_MAX_TRIES` and `IEEE80211_ASSOC_MAX_TRIES`.
+pub(super) const MLME_MAX_TRIES: u8 = 3;
+/// `IEEE80211_AUTH_TIMEOUT_SHORT` (HZ / 10): the wait for a reply to an
+/// ACKed Open System (or PMKSA-caching) Authentication.
+const AUTH_TIMEOUT_SHORT_MS: u64 = 100;
+/// `IEEE80211_AUTH_TIMEOUT_SAE` (2 * HZ): the wait for a reply to an ACKed
+/// SAE Commit or Confirm, and the SAE `drv_mgd_prepare_tx` duration.
+const AUTH_TIMEOUT_SAE_MS: u64 = 2_000;
+/// `IEEE80211_ASSOC_TIMEOUT_SHORT` (HZ / 10): the wait for a reply to an
+/// ACKed (Re)Association Request.
+const ASSOC_TIMEOUT_SHORT_MS: u64 = 100;
+/// `mt7921_mgd_prepare_tx` grant when mac80211 names no duration:
+/// `jiffies_to_msecs(HZ)`.
+const JOIN_ROC_MS: u32 = 1_000;
+
+/// mac80211's per-try line (`send auth to %pM (try %d/%d)`), here only for a
+/// try that is retried or the last one that failed.
+#[cold]
+#[inline(never)]
+fn note_mlme_try(step: &str, attempt: u8, why: &str) {
+    use core::fmt::Write;
+    let next = if attempt < MLME_MAX_TRIES {
+        "retrying"
+    } else {
+        "giving up"
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "mt76: {step} try {attempt}/{MLME_MAX_TRIES}: {why}; {next}"
+    );
+}
+
 /// Association-owned RSNA state. Key bytes are never included in driver
 /// diagnostics. Keeping the same supplicant across RX permits PTK/GTK rekeys
 /// and preserves its key-reinstallation and EAPOL replay checks.
@@ -1858,12 +1891,68 @@ impl<B: Backend> Session<B> {
         })
     }
 
+    /// One mac80211 MLME frame exchange (`ieee80211_auth` /
+    /// `ieee80211_do_assoc` driven by `ieee80211_sta_work`): up to
+    /// `MLME_MAX_TRIES` sends of the same `frame`. Every try first renews
+    /// the join grant (`drv_mgd_prepare_tx`). A TX status without ACK
+    /// retries at once (`auth_data->timeout = jiffies - 1`); after an ACK
+    /// the try waits `reply_ms` for `reply`, then retries. A reply that
+    /// `reply` refuses, a missing TX status (the token stays owned until its
+    /// native release) and any other failure end the exchange.
+    #[allow(clippy::too_many_arguments)]
+    async fn mlme_exchange<T>(
+        &mut self,
+        join_roc: &mut Option<super::p2p::JoinRoc>,
+        frequency_mhz: u32,
+        roc_ms: u32,
+        frame: &[u8],
+        reply_ms: u64,
+        steps: [&'static str; 3],
+        mut reply: impl FnMut(&mut B, &[u8]) -> Result<Option<T>, Error>,
+    ) -> Result<T, Error> {
+        let peer = u16::from(self.station.link.peer());
+        for attempt in 1..=MLME_MAX_TRIES {
+            self.associate_step = steps[0];
+            self.prepare_join_tx(join_roc, frequency_mhz, roc_ms)
+                .await?;
+            self.associate_step = steps[1];
+            let why = match self.send_management(frame, peer).await {
+                Ok(_) => {
+                    self.associate_step = steps[2];
+                    match self.wait_station_rx(reply_ms, &mut reply).await {
+                        Err(Error::Timeout) => "no reply",
+                        result => return result,
+                    }
+                }
+                Err(Error::Rejected(_)) => "not acknowledged",
+                Err(error) => return Err(error),
+            };
+            // The operation's 30 s budget also ends a try with Timeout;
+            // it is never retried.
+            if self
+                .boot_started
+                .is_some_and(|began| self.backend.now_ns().saturating_sub(began) >= 30_000_000_000)
+            {
+                return Err(Error::Timeout);
+            }
+            note_mlme_try(steps[1], attempt, why);
+        }
+        Err(Error::Timeout)
+    }
+
     /// WPA3-SAE Authentication (Linux leaves it to wpa_supplicant
     /// `sme_sae_auth` over mac80211 `ieee80211_rx_mgmt_auth`, algorithm 3):
     /// a Commit from the device CSPRNG, bounded anti-clogging retries,
     /// Confirm, then the association request carrying the SAE PMKID. The
     /// session (password element, scalars, PMK) stays boxed and is dropped
     /// here; only the PMK leaves, zeroized on drop.
+    ///
+    /// Each Commit or Confirm is one `NL80211_CMD_AUTHENTICATE` for
+    /// mac80211: its own `mlme_exchange` (fresh tries, a 2 s SAE join grant
+    /// and reply wait). A retry re-sends the identical frame, as
+    /// `ieee80211_auth` re-sends `auth_data->data`: the Commit keeps its
+    /// scalar and element, the Confirm its send-confirm counter.
+    #[allow(clippy::too_many_arguments)]
     async fn authenticate_sae(
         &mut self,
         plan: &mut JoinPlan,
@@ -1872,6 +1961,8 @@ impl<B: Backend> Session<B> {
         own: [u8; 6],
         password: crate::mt7921::association::SaePassword,
         rx_channel: u8,
+        join_roc: &mut Option<super::p2p::JoinRoc>,
+        frequency_mhz: u32,
     ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), Error> {
         use narf_wireless::sae::{SaeError, SaeSession};
         let join = plan.sae().ok_or(Error::MalformedEvent)?;
@@ -1903,22 +1994,26 @@ impl<B: Backend> Session<B> {
         // Commit, at most the shared plan's MAX_ANTI_CLOGGING (3) token
         // retries, then Confirm; the plan fails any further token request.
         for _ in 0..5 {
-            self.associate_step = "auth-sae-tx";
-            self.send_management(&frame, u16::from(self.station.link.peer()))
-                .await?;
-            self.associate_step = "auth-sae-rx";
             let step = self
-                .wait_station_rx(3_000, |_, packet| {
-                    if let Some(reply) = rx_on_channel(packet, rx_channel) {
-                        if let Some(step) = plan
-                            .sae_authentication_response(reply, &mut session)
-                            .map_err(|_| Error::MalformedEvent)?
-                        {
-                            return Ok(Some(step));
+                .mlme_exchange(
+                    join_roc,
+                    frequency_mhz,
+                    AUTH_TIMEOUT_SAE_MS as u32,
+                    &frame,
+                    AUTH_TIMEOUT_SAE_MS,
+                    ["auth-roc", "auth-sae-tx", "auth-sae-rx"],
+                    |_, packet| {
+                        if let Some(reply) = rx_on_channel(packet, rx_channel) {
+                            if let Some(step) = plan
+                                .sae_authentication_response(reply, &mut session)
+                                .map_err(|_| Error::MalformedEvent)?
+                            {
+                                return Ok(Some(step));
+                            }
                         }
-                    }
-                    Ok(None)
-                })
+                        Ok(None)
+                    },
+                )
                 .await?;
             match step {
                 crate::mt7921::association::SaeOutcome::Transmit(next) => frame = next,
@@ -1931,25 +2026,37 @@ impl<B: Backend> Session<B> {
         Err(Error::MalformedEvent)
     }
 
-    /// Wait for the AP's Open System Authentication response and return
-    /// the association request it releases.
-    async fn open_authentication_response(
+    /// Open System Authentication (`frame`, also the PMKSA-caching request)
+    /// through `mlme_exchange`; returns the association request the AP's
+    /// response releases.
+    async fn open_authentication(
         &mut self,
         plan: &mut JoinPlan,
+        frame: &[u8],
         rx_channel: u8,
+        join_roc: &mut Option<super::p2p::JoinRoc>,
+        frequency_mhz: u32,
+        steps: [&'static str; 3],
     ) -> Result<Vec<u8>, Error> {
-        self.associate_step = "auth-open-rx";
-        self.wait_station_rx(3_000, |_, packet| {
-            if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                if let Some(assoc) = plan
-                    .authentication_response(frame)
-                    .map_err(|_| Error::MalformedEvent)?
-                {
-                    return Ok(Some(assoc.to_vec()));
+        self.mlme_exchange(
+            join_roc,
+            frequency_mhz,
+            JOIN_ROC_MS,
+            frame,
+            AUTH_TIMEOUT_SHORT_MS,
+            steps,
+            |_, packet| {
+                if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                    if let Some(assoc) = plan
+                        .authentication_response(frame)
+                        .map_err(|_| Error::MalformedEvent)?
+                    {
+                        return Ok(Some(assoc.to_vec()));
+                    }
                 }
-            }
-            Ok(None)
-        })
+                Ok(None)
+            },
+        )
         .await
     }
 
@@ -2078,7 +2185,7 @@ impl<B: Backend> Session<B> {
         let mut new_pmksa: Option<([u8; 16], Zeroizing<[u8; 32]>)> = None;
         // Roaming: this join is a reassociation away from that AP.
         let reassociate_from = self.station.reassociate_from.take();
-        let mut join_roc: Option<crate::mt7921::p2p_wire::Request> = None;
+        let mut join_roc: Option<super::p2p::JoinRoc> = None;
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -2224,9 +2331,8 @@ impl<B: Backend> Session<B> {
             let aid = loop {
                 let _ = self.abort_join_roc(&mut join_roc).await;
                 let attempt = async {
-                    self.associate_step = "auth-roc";
-                    self.acquire_join_roc(&mut join_roc, frequency_mhz, 2_000)
-                        .await?;
+                    // Each try's `drv_mgd_prepare_tx` renews the join grant
+                    // inside `mlme_exchange`.
                     let auth_result: Result<_, Error> = async {
                         let assoc_req = match (security, cached.as_ref()) {
                             // PMKSA caching: Open System authentication and the
@@ -2236,15 +2342,15 @@ impl<B: Backend> Session<B> {
                                     .start_pmksa_authentication(*pmkid)
                                     .map_err(|_| Error::Busy)?
                                     .to_vec();
-                                self.associate_step = "auth-pmksa-tx";
-                                self.send_management(
-                                    &auth_req,
-                                    u16::from(self.station.link.peer()),
-                                )
-                                .await?;
-                                self.associate_step = "auth-pmksa-rx";
                                 let request = self
-                                    .open_authentication_response(&mut plan, rx_channel)
+                                    .open_authentication(
+                                        &mut plan,
+                                        &auth_req,
+                                        rx_channel,
+                                        &mut join_roc,
+                                        frequency_mhz,
+                                        ["auth-roc", "auth-pmksa-tx", "auth-pmksa-rx"],
+                                    )
                                     .await?;
                                 sae_pmk = Some(Zeroizing::new(**pmk));
                                 request
@@ -2252,7 +2358,14 @@ impl<B: Backend> Session<B> {
                             (Security::Wpa3Sae { password }, None) => {
                                 let (request, pmk) = self
                                     .authenticate_sae(
-                                        &mut plan, bss, ssid, own, password, rx_channel,
+                                        &mut plan,
+                                        bss,
+                                        ssid,
+                                        own,
+                                        password,
+                                        rx_channel,
+                                        &mut join_roc,
+                                        frequency_mhz,
                                     )
                                     .await?;
                                 new_pmksa = plan
@@ -2263,19 +2376,26 @@ impl<B: Backend> Session<B> {
                                 request
                             }
                             _ => {
-                                let auth_req =
-                                    plan.start_authentication().map_err(|_| Error::Busy)?;
-                                self.associate_step = "auth-open-tx";
-                                self.send_management(auth_req, u16::from(self.station.link.peer()))
-                                    .await?;
+                                let auth_req = plan
+                                    .start_authentication()
+                                    .map_err(|_| Error::Busy)?
+                                    .to_vec();
                                 // 4. Wait for Authentication Response:
-                                self.open_authentication_response(&mut plan, rx_channel)
-                                    .await?
+                                self.open_authentication(
+                                    &mut plan,
+                                    &auth_req,
+                                    rx_channel,
+                                    &mut join_roc,
+                                    frequency_mhz,
+                                    ["auth-roc", "auth-open-tx", "auth-open-rx"],
+                                )
+                                .await?
                             }
                         };
                         Ok(assoc_req)
                     }
                     .await;
+                    // `ieee80211_rx_mgmt_auth` -> `drv_mgd_complete_tx`.
                     let abort = self.abort_join_roc(&mut join_roc).await;
                     let assoc_req = auth_result?;
                     abort?;
@@ -2293,33 +2413,32 @@ impl<B: Backend> Session<B> {
                         None => assoc_req,
                     };
                     self.stage(Stage::Associate);
-                    self.associate_step = "assoc-roc";
-                    self.acquire_join_roc(&mut join_roc, frequency_mhz, 2_000)
-                        .await?;
-                    self.associate_step = "assoc-tx";
-                    self.send_management(&assoc_req, u16::from(self.station.link.peer()))
-                        .await?;
-
-                    // 6. Wait for Association Response:
-                    self.associate_step = "assoc-rx";
-                    self.wait_station_rx(3_000, |_, packet| {
-                        if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                            if let Some(aid) =
-                                plan.association_response(frame)
-                                    .map_err(|error| match error {
+                    // 6. Wait for Association Response (`ieee80211_do_assoc`):
+                    self.mlme_exchange(
+                        &mut join_roc,
+                        frequency_mhz,
+                        JOIN_ROC_MS,
+                        &assoc_req,
+                        ASSOC_TIMEOUT_SHORT_MS,
+                        ["assoc-roc", "assoc-tx", "assoc-rx"],
+                        |_, packet| {
+                            if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                                if let Some(aid) = plan.association_response(frame).map_err(
+                                    |error| match error {
                                         // The status itself only selects the
                                         // PMKSA fallback below.
                                         narf_wireless::association::Error::Rejected(status) => {
                                             Error::Rejected(u8::try_from(status).unwrap_or(u8::MAX))
                                         }
                                         _ => Error::MalformedEvent,
-                                    })?
-                            {
-                                return Ok(Some(aid));
+                                    },
+                                )? {
+                                    return Ok(Some(aid));
+                                }
                             }
-                        }
-                        Ok(None)
-                    })
+                            Ok(None)
+                        },
+                    )
                     .await
                 }
                 .await;

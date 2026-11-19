@@ -44,6 +44,26 @@ fn dma_barrier() {
 
 const DEPTH: usize = packet_tx::RING_SLOTS;
 
+/// Native reports dropped as unusable (`mt7921_queue_rx_skb` frees them).
+static DROPPED_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// One line for the 1st, 2nd, 4th, 8th, ... dropped report: visible like
+/// Linux's WARN_ON_ONCE without flooding the console.
+#[cold]
+#[inline(never)]
+fn dropped_report(kind: &str, rxd0: u32, error: Error) {
+    use core::fmt::Write;
+    let count = DROPPED_REPORTS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if count.is_power_of_two() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: dropped unusable {kind} report rxd0={rxd0:#010x} ({error:?}); {count} dropped"
+        );
+    }
+}
+
 #[cold]
 fn register_access_error(operation: &str, addr: u32, error: registers::Error) -> Error {
     use core::fmt::Write;
@@ -390,12 +410,23 @@ impl Hardware {
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
         // Linux `mt7921_queue_rx_skb` (`mt7921_rx_check` on the DMA path).
         match rx_packet(rxd) {
-            RxPacket::TxFree => {
-                // `mt7921_mac_tx_free`: the firmware's token releases.
-                storage
-                    .tokens
-                    .firmware_done(&packet_tx::releases(&bytes)?)?;
-            }
+            // `mt7921_mac_tx_free`: the firmware's token releases. Linux
+            // drops a release it cannot walk (WARN_ON_ONCE). One that may
+            // concern an owned token instead fails closed ("a malformed
+            // native completion closes host security/grant/producer state").
+            RxPacket::TxFree => match packet_tx::releases(&bytes) {
+                Ok(records) => storage.tokens.firmware_done(&records)?,
+                Err(error) if storage.tokens.is_empty() => {
+                    dropped_report("TX-free", rxd, error);
+                }
+                Err(error) => return Err(error),
+            },
+            // `mt7921_mac_add_txs`. Every routed length decodes (complete
+            // records only), so `receive` refuses a report only when it
+            // conflicts with a published sample's PID: that owner's
+            // ambiguous receipt, which quarantines it ("Ambiguous/malformed
+            // or missing receipts quarantine the owner until verified
+            // reset"). Reports no owner waits for are ignored there.
             RxPacket::TxStatus => storage.tx_sequence.receive(&bytes)?,
             RxPacket::Normal => {
                 storage.p2p_capture.copy(&bytes, now);
