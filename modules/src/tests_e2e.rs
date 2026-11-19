@@ -920,17 +920,9 @@ fn e2e_driver_module_drives_device() -> TestResult {
     narf_bus::driver_match::__reset_for_test();
 
     // Stamp the live ABI over xtask's zero placeholder, as the loader expects.
-    let mut image = staged.to_vec();
-    const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
-    let Some(value_at) = image
-        .windows(PLACEHOLDER.len())
-        .position(|window| window == PLACEHOLDER)
-        .map(|start| start + b"kernel_abi=0x".len())
-    else {
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
         return TestResult::Fail("driver module has no ABI placeholder");
     };
-    let stamped = format!("{abi:08x}");
-    image[value_at..value_at + 8].copy_from_slice(stamped.as_bytes());
 
     // The module advertises `target_domain=net` (DRIVER_0), but the holder of
     // module-load authority places this instance in DRIVER_2. A built-in
@@ -1178,6 +1170,138 @@ fn e2e_driver_module_drives_device() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/e2e", e2e_driver_module_drives_device);
+
+fn stamp_fixture_abi(staged: &[u8], abi: u32) -> Option<Vec<u8>> {
+    const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
+    let start = staged
+        .windows(PLACEHOLDER.len())
+        .position(|w| w == PLACEHOLDER)?
+        + b"kernel_abi=0x".len();
+    let mut image = staged.to_vec();
+    image[start..start + 8].copy_from_slice(format!("{abi:08x}").as_bytes());
+    Some(image)
+}
+
+fn e2e_intel_gpu_module_registration() -> TestResult {
+    use narf_bus::driver_match::{
+        __module_device_context_count_for_test, __module_thunk_for_test, count, registered,
+    };
+    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr, ProbeError};
+    use narf_capabilities::{Cap, Write};
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/intel_gpu.ko")
+    else {
+        return TestResult::Fail("Intel GPU module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("Intel GPU module has no ABI placeholder");
+    };
+    let before = count();
+    // Exercise a late registration conflict. Failed init must withdraw its
+    // earlier rows, leave the other owner in place, and permit a clean retry.
+    const OWNER: u64 = u64::MAX - 1;
+    extern "C" fn decline(_: u64, _: u64) -> i32 {
+        -19
+    }
+    // SAFETY: the static C callback remains valid until the test removes it.
+    if unsafe {
+        narf_bus::register_module_pci_driver(
+            OWNER,
+            "intel-gpu-fixture",
+            0x8086,
+            0xd74b,
+            decline as usize,
+        )
+    } != 0
+    {
+        return TestResult::Fail("could not install conflicting Nova Lake PCI match");
+    }
+    let conflict = sys_init_module(&image);
+    let rolled_back = matches!(
+        conflict,
+        Err(ModuleSyscallError::InitFailed(
+            crate::lifecycle::LifecycleError::InitFailed(-16)
+        ))
+    ) && count() == before + 1
+        && __module_thunk_for_test(0x8086, 0xd74b).is_some();
+    narf_bus::unregister_module_pci_drivers(OWNER);
+    if !rolled_back {
+        let _ = sys_delete_module("intel_gpu");
+        return TestResult::Fail("failed Intel module init did not roll back on EBUSY");
+    }
+
+    let Ok(module) = sys_init_module(&image) else {
+        return TestResult::Fail(
+            "could not load the Intel GPU module after resolving the conflict",
+        );
+    };
+    let representatives = [
+        0x9a49, 0x4c80, 0x46b3, 0x7d55, 0x7d41, 0x6420, 0xb080, 0xfd80, 0xd740, 0x4905, 0x56a0,
+        0xe202, 0x56c0, 0x674c, 0x6750, 0xd750, 0xd75f, 0xb0a1, 0xd74a, 0xd74b,
+    ];
+    let matches_installed = module.name() == "intel_gpu"
+        && module.domain == narf_lib::id::DomainId::DRIVER_2
+        && count() == before + 168
+        && representatives
+            .iter()
+            .all(|&id| __module_thunk_for_test(0x8086, id).is_some())
+        && [0xb0a2, 0xd746, 0xd74c, 0xd758, 0x6751, 0xffff]
+            .iter()
+            .all(|&id| __module_thunk_for_test(0x8086, id).is_none());
+    // Exercise the real module callback via the bus trampoline. A declined
+    // Meteor Lake probe must let arbitration continue with a fresh cap.
+    let addr = PcieAddr::new(0x7f34, 0, 2, 0);
+    let device = BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor: 0x8086,
+            device: 0x7d55,
+            class: 0x030000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            // The registration probe declines from its device token alone.
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    let declined = registered()
+        .iter()
+        .find(|m| m.name == "intel-gpu-module" && m.kind.matches(&device))
+        .is_some_and(|m| {
+            let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+            matches!((m.probe)(device, cap), Err(ProbeError::NotForThisDriver))
+                && cap.check_live().is_err()
+                && __module_device_context_count_for_test(module.id.0) == 0
+        });
+    drop(module);
+    if sys_delete_module("intel_gpu").is_err() {
+        return TestResult::Fail("could not unload the Intel GPU module");
+    }
+    if !matches_installed || !declined {
+        return TestResult::Fail(
+            "Intel module registration, graphics domain or probe fallback mismatch",
+        );
+    }
+    if count() != before
+        || representatives
+            .iter()
+            .any(|&id| __module_thunk_for_test(0x8086, id).is_some())
+    {
+        return TestResult::Fail("Intel module unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/intel-gpu", e2e_intel_gpu_module_registration);
 
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.

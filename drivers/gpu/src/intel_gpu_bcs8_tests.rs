@@ -36,7 +36,7 @@ fn smoke_bcs8_discovery_ads_private_probe_and_retirement() -> TestResult {
             // Logical [0,1] -> hardware [0,8]; other mappings remain invalid.
             assert_eq!(ads[(0x123c + 96) / 4], 0x20200800);
             assert_eq!(ads[(0x123c + 524) / 4], 0x101);
-            assert_eq!(ads[0x340 / 4 + 1], 18);
+            assert_eq!(ads[0x340 / 4 + 1], 19);
             assert_ne!(ads[0x300 / 4], ads[0x340 / 4]);
             let saves = ads_registers(&w, Engine::Bcs8);
             assert_eq!(saves[&0x3ee29c].1, 0);

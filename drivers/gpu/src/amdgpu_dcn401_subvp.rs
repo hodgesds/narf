@@ -62,9 +62,8 @@ pub fn admit_subvp(
     expand_subvp(soc, uclk, mode, mall_bytes, &main, &p)
 }
 
-/// `admit_subvp`'s phantom expansion, out of line: its 8 KiB of state is
-/// then not under the normal admission and mode support `admit_subvp` runs
-/// first, which the deadline bound reaches from a display's scanout start.
+/// Keep phantom expansion out of the normal admission stack frame reached
+/// from scanout start.
 #[inline(never)]
 fn expand_subvp(
     soc: &Soc,
@@ -196,9 +195,13 @@ fn expand_subvp(
             ..ctx_at(&table, uclk, lat)
         };
         let mut plans = program(soc, &[*mode, phantom_mode], &shapes, &p, &ctx, &ov, None)?;
-        let mut phantom = plans.pop().ok_or(Error::Invalid)?;
-        let mut main = plans.pop().ok_or(Error::Invalid)?;
-        for (plan, is_phantom) in [(&mut main, false), (&mut phantom, true)] {
+        let mut phantom = alloc::boxed::Box::new(Phantom {
+            plan: plans.pop().ok_or(Error::Invalid)?,
+            mall_bytes: bytes,
+            mall_ways: ways as u8,
+        });
+        let main = plans.first_mut().ok_or(Error::Invalid)?;
+        for (plan, is_phantom) in [(&mut *main, false), (&mut phantom.plan, true)] {
             plan.stream = u8::from(is_phantom);
             plan.streams = [None; MAX_STREAMS - 1];
             plan.pstate = Some(PlanPstate {
@@ -213,7 +216,7 @@ fn expand_subvp(
             });
         }
         // Phantom readmission reconstructs from the main mode retained here.
-        phantom.streams[0] = Some(*mode);
+        phantom.plan.streams[0] = Some(*mode);
         let usable = main
             .planes
             .iter()
@@ -231,7 +234,7 @@ fn expand_subvp(
             prefetch_to_mall: m.subvp_prefetch_to_mall as u8 as u16,
         });
         return Ok(Some(Supported {
-            plans: alloc::vec![main],
+            plans,
             methods: [Method::FwSvp, Method::Na, Method::Na, Method::Na],
             level: lat as u8,
             active,
@@ -239,11 +242,7 @@ fn expand_subvp(
             fclk_pstate: true,
             fams2_required: true,
             fams2_streams: alloc::boxed::Box::new(fams),
-            phantom: Some(alloc::boxed::Box::new(Phantom {
-                plan: phantom,
-                mall_bytes: bytes,
-                mall_ways: ways as u8,
-            })),
+            phantom: Some(phantom),
         }));
     }
     Ok(None)

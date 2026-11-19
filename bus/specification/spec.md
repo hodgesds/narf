@@ -379,6 +379,9 @@ Stage-5 work; `dispatch_event` is the seam they will feed.
 Separately compiled modules cross the bus boundary through C-ABI callbacks
 and opaque integers; `BusDevice`, `MmioRegion`, `DmaBuffer`, and their typed
 capabilities remain kernel-owned Rust objects.
+Returning `-ENODEV` from a module PCI probe releases its device context
+and tries the next matching driver. Other failures terminate that device's
+probe sequence.
 
 ```rust
 pub type ModuleProbeFn = extern "C" fn(dev_token: u64, reserved: u64) -> i32;

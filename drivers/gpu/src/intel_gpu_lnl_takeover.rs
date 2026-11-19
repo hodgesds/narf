@@ -11,6 +11,7 @@
 //! receipt comes from [`Receipt::admit_display`], which preserves the lit
 //! panel and leaves the GT-only reset to `HardwareInit` (see there).
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_xe2lpd::{DisplayIdentity, DisplayIdentityProfile};
 use core::task::Poll;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -147,19 +148,11 @@ impl Receipt {
         mmio: &impl MmioWindow,
         current: impl FnOnce() -> bool,
     ) -> Result<Self, Error> {
-        Self::admit_route(
-            device,
-            bar,
-            mmio,
-            current,
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
-        )
+        Self::admit_route(device, bar, mmio, current, &[DisplayIdentity::Xe2Lpd])
     }
 
-    /// [`Self::admit_display`] for the opted-in Panther Lake display-30
-    /// function: the same read-only proofs against display 30.00, whose
-    /// `xe2_lpd_display` inventory (four pipes, five universal planes, three
-    /// DSBs per pipe, FBC A–D, the pipe-DMC flip queues) is display 20's.
+    /// Preserve the owned panel while starting the GT on Panther Lake
+    /// (display 30.00) or Wildcat Lake (30.02, pipes and FBC A–C).
     pub(crate) fn admit_display_ptl(
         device: narf_bus::BusDevice,
         bar: narf_bus::bar::MmioRegion,
@@ -171,31 +164,23 @@ impl Receipt {
             bar,
             mmio,
             current,
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+            &[DisplayIdentity::Xe3Lpd, DisplayIdentity::WildcatLake],
         )
     }
 
-    /// The display-preserving admission of `ip`'s route: Lunar Lake with
-    /// display 20.00, or Panther Lake with display 30.00.
     fn admit_route(
         device: narf_bus::BusDevice,
         bar: narf_bus::bar::MmioRegion,
         mmio: &impl MmioWindow,
         current: impl FnOnce() -> bool,
-        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+        supported: &[DisplayIdentity],
     ) -> Result<Self, Error> {
-        use crate::intel_gpu_xe2lpd::DisplayIp;
         if !current() {
             return Err(Error::Unavailable);
         }
-        if device.id.vendor != 0x8086
+        let expected = expected_display(device.id.vendor, device.id.device)?;
+        if !supported.contains(&expected)
             || !matches!(device.addr, narf_bus::BusAddr::Pcie(_))
-            || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-                .is_some_and(|p| match ip {
-                    DisplayIp::Xe2Lpd => p.is_lnl(),
-                    DisplayIp::Xe3Lpd => p.has_ptl_display_route(),
-                    DisplayIp::Xelpdp | DisplayIp::WildcatLake => false,
-                })
             || bar.phys.raw() == 0
             || bar.phys.raw() & 4095 != 0
             || bar.len < 16 * 1024 * 1024
@@ -210,7 +195,7 @@ impl Receipt {
         }
         let gmd = read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?;
         if gmd != read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?
-            || DisplayIp::decode_all(gmd) != Ok(ip)
+            || DisplayIdentity::decode(gmd) != Ok(expected)
         {
             return Err(Error::Unsupported);
         }
@@ -223,7 +208,7 @@ impl Receipt {
         if read(mmio, 0x70008)? & 0xc0000000 != 0xc0000000 {
             return Err(Error::State);
         }
-        display_producers_idle(mmio)?;
+        display_producers_idle(mmio, expected.profile())?;
         if read(mmio, GU_DEBUG)? & DRIVERFLR != 0 {
             mmio.write32(GU_DEBUG, DRIVERFLR);
             if read(mmio, GU_DEBUG)? & DRIVERFLR != 0 {
@@ -253,12 +238,16 @@ fn display_owned_current(m: &impl MmioWindow, display: Option<u32>) -> bool {
         })
 }
 
-/// Display 20.00 (`xe2_lpd_display`) inventory: four pipes, the primary and
-/// four sprites per pipe (`num_sprites` is 4 on display >= 13), three DSBs
-/// per pipe and FBC A–D. Only Pipe A's primary (the route's surface) may
-/// fetch. Every access is a read.
-fn display_producers_idle(m: &impl MmioWindow) -> Result<(), Error> {
+/// Each implemented pipe has five universal planes and three DSBs. Only
+/// Pipe A's primary may fetch. Linux's `wcl_display` omits Pipe D and FBC D.
+fn display_producers_idle(
+    m: &impl MmioWindow,
+    profile: DisplayIdentityProfile,
+) -> Result<(), Error> {
     for pipe in 0..4u64 {
+        if profile.pipe_mask & (1 << pipe) == 0 {
+            continue;
+        }
         let base = 0x70000 + pipe * 0x1000;
         // TRANSCONF(B–D): enable | state.
         if pipe != 0 && read(m, base + 0x8)? & 0xc0000000 != 0 {
@@ -288,14 +277,14 @@ fn display_producers_idle(m: &impl MmioWindow) -> Result<(), Error> {
             return Err(Error::Busy);
         }
     }
-    // ILK_DPFC_CONTROL(FBC A–D): DPFC_CTL_EN.
+    // ILK_DPFC_CONTROL: DPFC_CTL_EN.
     for fbc in 0..4u64 {
-        if read(m, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
+        if profile.fbc_mask & (1 << fbc) != 0 && read(m, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
             return Err(Error::Busy);
         }
     }
-    // MTL_PIPEDMC_CONTROL: PIPEDMC_ENABLE_MTL(B–D).
-    if read(m, 0x45250)? & 0x1110 != 0 {
+    // Pipe A's DMC may continue servicing the lit panel.
+    if read(m, 0x45250)? & (profile.pipedmc_enable_mask() & !1) != 0 {
         return Err(Error::Busy);
     }
     Ok(())
@@ -625,30 +614,30 @@ impl MediaQuiesce {
     }
 }
 
+/// The display identity paired with the exact PCI function in
+/// intel_display_device.c::gmdid_display_map and xe_pci.c.
+fn expected_display(vendor: u16, device: u16) -> Result<DisplayIdentity, Error> {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt::GtPlatform;
+    match GtPlatform::from_pci(vendor, device) {
+        Some(GtPlatform::Integrated(Generation::LunarLake)) => Ok(DisplayIdentity::Xe2Lpd),
+        Some(GtPlatform::Integrated(Generation::PantherLake)) => Ok(DisplayIdentity::Xe3Lpd),
+        Some(GtPlatform::WildcatLake) => Ok(DisplayIdentity::WildcatLake),
+        Some(GtPlatform::NovaLakeS) => Ok(DisplayIdentity::NovaLakeS),
+        Some(GtPlatform::Battlemage) => Ok(DisplayIdentity::Xe2Hpd),
+        _ => Err(Error::Unsupported),
+    }
+}
+
 /// Secondary guards in a *fresh completed full-display-reset incarnation*.
 /// Retirement of inherited MainDMC/DSB producers comes from driver FLR's
 /// documented whole-display reset; a powered-off read is never interpreted
 /// as a disabled plane. This profile never initializes display or DMC.
 fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Error> {
-    use crate::intel_gpu_xe2lpd::DisplayIdentity;
     if read(m, 0x10100c)? & (1 << 9) == 0 {
         return Ok(None);
     }
-    let platform =
-        crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, device).ok_or(Error::Unsupported)?;
-    let expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
-        DisplayIdentity::NovaLakeS
-    } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
-        DisplayIdentity::WildcatLake
-    } else if platform.is_ptl() {
-        DisplayIdentity::Xe3Lpd
-    } else if platform.is_lnl() {
-        DisplayIdentity::Xe2Lpd
-    } else if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-        DisplayIdentity::Xe2Hpd
-    } else {
-        return Err(Error::Unsupported);
-    };
+    let expected = expected_display(0x8086, device)?;
     let a = read(m, 0x510a0)?;
     if a != read(m, 0x510a0)? || DisplayIdentity::decode(a) != Ok(expected) {
         return Err(Error::Unsupported);
@@ -1047,7 +1036,7 @@ mod tests {
             crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
         for id in [
             0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-            0xb0b0,
+            0xb0a1, 0xb0b0,
         ] {
             assert_eq!(
                 crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
@@ -1293,7 +1282,9 @@ mod tests {
     );
     fn smoke_nvls_distinct_firmware_media_and_display_identity() -> TestResult {
         let platform = crate::intel_gpu_gt::GtPlatform::NovaLakeS;
-        for id in [0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745] {
+        for id in [
+            0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745, 0xd74a, 0xd74b,
+        ] {
             assert_eq!(
                 crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
                 Some(platform)

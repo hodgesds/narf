@@ -2097,12 +2097,10 @@ mod tests {
     }
     fn stage(window: Window, arena: Arena, platform: GtPlatform) -> GuCBoot<Window, Arena> {
         window.0.borrow_mut().profile = Some(platform);
-        window
-            .0
-            .borrow_mut()
-            .regs
-            .entry(0xd8c)
-            .or_insert(if platform.is_ptl() {
+        window.0.borrow_mut().regs.entry(0xd8c).or_insert(
+            if matches!(platform, GtPlatform::WildcatLake | GtPlatform::NovaLakeS) {
+                (30 << 22) | (3 << 14)
+            } else if platform.is_ptl() {
                 30 << 22
             } else if platform.is_lnl() {
                 (20 << 22) | (4 << 14)
@@ -2110,7 +2108,8 @@ mod tests {
                 (20 << 22) | (1 << 14)
             } else {
                 (12 << 22) | (70 << 14)
-            });
+            },
+        );
         let device_id = match platform {
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake) => 0x4c80,
@@ -2121,15 +2120,21 @@ mod tests {
             GtPlatform::ArcticSoundM => 0x56c0,
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
+            GtPlatform::NovaLakeS => 0xd740,
+            GtPlatform::WildcatLake => 0xfd80,
             _ if platform.is_ptl() => 0xb080,
             _ if platform.is_lnl() => 0x6420,
             _ => 0x7d55,
         };
+        let mut css = image();
+        if platform == GtPlatform::NovaLakeS {
+            crate::intel_gpu_uapi::put32(&mut css, 64, 0x0046_3704); // NVL GuC 70.55.4
+        }
         GuCBoot::stage_image(
             window,
             arena,
             platform,
-            CssImage::parse(&image(), 70).unwrap(),
+            CssImage::parse(&css, 70).unwrap(),
             BootConfig {
                 device_id,
                 revision: 3,

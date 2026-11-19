@@ -357,7 +357,7 @@ impl MstLink {
     /// the manager: MSTM_CAP check, MSTM_CTRL write, payload
     /// table reset). `caps` / `raw_caps` are the sink's DPCD
     /// receiver capabilities as the SST probe reads them
-    /// (`dp_link_training::read_caps` + the raw 16 bytes).
+    /// (the selected raw snapshot and its decoded fields).
     pub fn connect<M: MmioWindow + ?Sized, A: crate::dp_mst_mgr::MstAux<Error = AuxError>>(
         &mut self,
         mmio: &M,
@@ -876,7 +876,6 @@ pub mod tests {
     extern crate alloc;
 
     use super::*;
-    use crate::dp_aux::AuxChannel as _;
     use crate::intel_gpu_aux::{
         AUX_CTL_DONE, AUX_CTL_MSGSIZE_MASK, AUX_CTL_MSGSIZE_SHIFT, AUX_CTL_SEND_BUSY,
         DDI_AUX_CTL_OFFSET, DDI_AUX_DATA_OFFSET,
@@ -1895,14 +1894,9 @@ pub mod tests {
         /// then the manager start over the MST adapter.
         fn connect(&mut self) -> Result<(), MstError> {
             let mut plain = IntelAux::new(&self.mmio, Ddi::B);
-            let caps = crate::dp_link_training::read_caps(&mut plain).map_err(|e| {
-                MstError::Aux(match e {
-                    crate::dp_link_training::LinkError::AuxFailure(a) => a,
-                    _ => AuxError::UnknownStatus,
-                })
-            })?;
-            let mut raw = [0u8; 16];
-            plain.dpcd_read(0, &mut raw).map_err(MstError::Aux)?;
+            let raw =
+                crate::dp_link_training::read_receiver_caps(&mut plain).map_err(MstError::Aux)?;
+            let caps = DpcdCaps::decode(&raw);
             let mut aux = test_aux(&self.mmio);
             self.link.connect(&self.mmio, &mut aux, caps, &raw)
         }

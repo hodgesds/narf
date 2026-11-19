@@ -70,6 +70,7 @@ pub(super) fn beside_external(
         (0x71008, 3 << 30),
         (0x71180, 0x8400_0000),
         (0x7119c, EXT_SURFACE),
+        (0x711ac, EXT_SURFACE),
     ] {
         platform.set(r, v);
     }
@@ -79,6 +80,91 @@ pub(super) fn beside_external(
     }));
     (timing, state)
 }
+
+/// The integrated KMS takeover can claim its GEM arena while an external
+/// primary already scans a separately reserved surface. Compare the layout
+/// against both the programmed and latched surface on the same pipe.
+fn smoke_kms_panel_takeover_checks_live_external_primary() -> TestResult {
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+
+    for (ip, generation, gmd) in [
+        (DisplayIp::Xe2Lpd, Generation::LunarLake, 20 << 22),
+        (DisplayIp::Xe3Lpd, Generation::PantherLake, 30 << 22),
+        (
+            DisplayIp::WildcatLake,
+            Generation::PantherLake,
+            (30 << 22) | (2 << 14),
+        ),
+    ] {
+        let platform = MockPlatform::new().with_display_ip(ip);
+        platform.set(0x510a0, gmd);
+        platform.set(0x480c, 0x3c);
+        let timing = platform.dsb_timing();
+        let mut request =
+            crate::intel_gpu_display_resources::request(&mode_of(timing), Tiling::Linear, 307_200);
+        request.pipes[1] = Some(external());
+        let layout = Layout {
+            state: res::compute_ip(ip, &request, &Latency::read(&platform).unwrap())
+                .unwrap()
+                .into(),
+            surfaces: [None, Some(EXT_SURFACE), None, None],
+        };
+        platform.set(0x71008, 3 << 30);
+        platform.set(0x71180, 0x8400_0000);
+        platform.set(0x7119c, EXT_SURFACE);
+        platform.set(0x711ac, EXT_SURFACE);
+        let check = |ip| fetchers_with_cursor(&platform, generation, ip, false, false);
+        publish_layout_for_test(Some(layout.clone()));
+        if ip == DisplayIp::WildcatLake {
+            // Reading Pipe D on Wildcat would encounter an absent register.
+            platform.set(0x73080, u32::MAX);
+        }
+        assert_eq!(check(Some(ip)), Ok(()));
+        let device = Device::new(platform.clone(), generation, 0x100_0000, console());
+        {
+            let mut guard = complete(device.session()).unwrap();
+            let before = platform.all_writes().len();
+            complete(guard.present(object(true).unwrap(), geometry())).unwrap();
+            assert_ne!(platform.read32(LIVE), CONSOLE);
+            complete(guard.restore_console()).unwrap();
+            assert_eq!(platform.read32(LIVE), CONSOLE);
+            assert_eq!(platform.read32(0x711ac), EXT_SURFACE);
+            assert!(platform.all_writes()[before..]
+                .iter()
+                .all(|(reg, _)| !(0x71000..0x72000).contains(reg)));
+        }
+        assert_eq!(check(Some(DisplayIp::Xelpdp)), Err(FsError::Unsupported));
+        assert_eq!(check(None), Err(FsError::Unsupported));
+        for reg in [0x7119c, 0x711ac] {
+            platform.set(reg, EXT_SURFACE + 4096);
+            assert_eq!(check(Some(ip)), Err(FsError::Unsupported));
+            platform.set(reg, u32::MAX);
+            assert_eq!(check(Some(ip)), Err(FsError::NoDevice));
+            platform.set(reg, EXT_SURFACE);
+        }
+        platform.set(0x71280, 1 << 31);
+        assert_eq!(check(Some(ip)), Err(FsError::Unsupported));
+        platform.set(0x71280, 0);
+        reset_published_layout();
+        assert_eq!(check(Some(ip)), Err(FsError::Unsupported));
+
+        // A published address inside the panel's own arena is never safe.
+        let conflict = GEM_SCANOUT_GTT_START as u32;
+        publish_layout_for_test(Some(Layout {
+            surfaces: [None, Some(conflict), None, None],
+            ..layout
+        }));
+        platform.set(0x7119c, conflict);
+        platform.set(0x711ac, conflict);
+        assert_eq!(check(Some(ip)), Err(FsError::Unsupported));
+        reset_published_layout();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_panel_takeover_checks_live_external_primary
+);
 
 /// A register the panel's KMS services must never write while the external
 /// is lit: Pipes and transcoders B–D, and the global display resources the
@@ -256,6 +342,7 @@ fn add_external(platform: &MockPlatform, single: &res::State, multi: &res::State
         (0x71008, 3 << 30),
         (0x71180, 0x8400_0000),
         (0x7119c, EXT_SURFACE),
+        (0x711ac, EXT_SURFACE),
     ] {
         platform.set(r, v);
     }
@@ -270,6 +357,55 @@ fn remove_external(platform: &MockPlatform, multi: &res::State, single: &res::St
     crate::intel_gpu_xelpg_live::commit_live(platform, multi, single, 1).unwrap();
     reset_published_layout();
 }
+
+fn smoke_kms_external_teardown_waits_for_cancelled_panel_flip() -> TestResult {
+    let platform = MockPlatform::new();
+    let (timing, multi) = beside_external(&platform);
+    let (single, _) = layouts(&platform, timing);
+    let device = platform.meteor();
+    let mut session = complete(device.session()).unwrap();
+    let mut flip = Box::pin(session.present(object(true).unwrap(), geometry()));
+    assert!(once(flip.as_mut()).is_pending());
+    let target = platform.read32(SURF);
+    assert_ne!(target, CONSOLE);
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    drop(flip);
+    drop(session);
+    let legacy = device.legacy_drain().unwrap();
+
+    // The route check itself belongs under the mutex. An in-flight pass
+    // can change its published presence before the panel owner is free.
+    let sampled = core::cell::Cell::new(false);
+    let mut retirement = Box::pin(device.external_retirement(|| {
+        sampled.set(true);
+        false
+    }));
+    assert!(once(retirement.as_mut()).is_pending());
+    assert!(!sampled.get());
+    drop(legacy);
+    assert!(device.external_pass().is_err());
+    assert!(once(retirement.as_mut()).is_pending());
+    assert!(sampled.get());
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    assert_eq!(platform.read32(0x71008), 3 << 30);
+
+    let pass = complete(retirement).unwrap();
+    assert_eq!(platform.read32(LIVE), target);
+    assert!(device.state.try_lock().is_none());
+    platform.step_on_read(Some(FRAME));
+    remove_external(&platform, &multi, &single);
+    drop(pass);
+    platform.step_on_read(None);
+    complete(device.quiesce()).unwrap();
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    assert_eq!(platform.mapping_count(), 0);
+    assert!(device.external_pass().is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_external_teardown_waits_for_cancelled_panel_flip
+);
 
 /// The first and last write of the repartition in `writes`.
 fn repartition_span(writes: &[(u64, u32)]) -> (usize, usize) {

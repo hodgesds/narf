@@ -30,7 +30,11 @@ fn expected_saves(
         entries.insert(base + offset, 0);
     }
     if platform.is_xe2() {
-        entries.extend([(base + 0x50, 1), (base + 0xd4, 1)]);
+        entries.insert(base + 0xd4, 1);
+        entries.insert(base + 0x23c, 0);
+        if !matches!(platform, GtPlatform::WildcatLake | GtPlatform::NovaLakeS) {
+            entries.insert(base + 0x50, 1);
+        }
     }
     if engine != Engine::Rcs0 {
         return entries;
@@ -238,7 +242,7 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
     .to_vec();
     for device in [
         0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-        0xb0b0,
+        0xb0a1, 0xb0b0,
     ] {
         for (release, step) in [(0, 0), (0, 4), (1, 0)] {
             cases.push((
@@ -335,6 +339,13 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
             }
             assert!(registered.contains_key(&u32::from(id)) && fence.result().is_none());
             let expected = expected_saves(platform, device, release, step, engine);
+            if platform.is_xe2() {
+                // A live value with upper bits proves a full-width GuC
+                // capture and restore even if the boot delay was zero.
+                w.0.borrow_mut()
+                    .regs
+                    .insert(u64::from(engine.base() + 0x23c), 0x4420_000e);
+            }
             firmware_reset(&w, engine, &expected);
             let writes = w.0.borrow().writes.len();
             event(&ct_memory(&w), 0x1008, &[u32::from(id)]);

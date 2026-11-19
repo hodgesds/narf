@@ -1,0 +1,20 @@
+[package]
+name = "narf-drivers-gpu-intel"
+description = "Intel GPU built-in and loadable PCI registration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["builtin"]
+builtin = ["dep:narf-drivers-gpu"]
+module = []
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+narf-drivers-gpu = { path = "..", optional = true, default-features = false, features = ["intel"] }
+
+[lints]
+workspace = true

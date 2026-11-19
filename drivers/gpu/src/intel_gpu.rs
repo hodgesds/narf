@@ -55,201 +55,14 @@ use crate::intel_gpu_regions::{self, Region, RegionGeneration, RegionKind};
 
 // ── Vendor + device ids ───────────────────────────────────────────
 
-/// Intel Corporation (PCI Special Interest Group ID).
-pub const INTEL_VENDOR: u16 = 0x8086;
+#[path = "intel_gpu_pci_ids.rs"]
+mod ids;
+pub use ids::*;
 
 /// PCI class triple for a VGA-compatible display controller. The
 /// class-match backstop catches all VGA cards; `probe` filters by
 /// vendor so non-Intel cards fall through to their own drivers.
 const PCI_CLASS_DISPLAY: u8 = 0x03;
-
-// Tiger Lake (Gen12 Xe-LP) — public `pci.ids` Intel rows.
-pub const TGL_9A40: u16 = 0x9A40;
-pub const TGL_U_GT2_9A49: u16 = 0x9A49;
-pub const TGL_U_GT2_9A59: u16 = 0x9A59;
-pub const TGL_H_GT1_9A60: u16 = 0x9A60;
-pub const TGL_H_GT2_9A68: u16 = 0x9A68;
-pub const TGL_H_GT2_9A70: u16 = 0x9A70;
-pub const TGL_GT2_9A78: u16 = 0x9A78;
-pub const TGL_GT2_9AC0: u16 = 0x9AC0;
-pub const TGL_GT2_9AC9: u16 = 0x9AC9;
-pub const TGL_GT2_9AD9: u16 = 0x9AD9;
-pub const TGL_GT2_9AF8: u16 = 0x9AF8;
-
-// Rocket Lake (Gen12 Xe-LP, desktop). The GT shares the TGL GuC profile;
-// display clocks/ports are a distinct source family and remain gated.
-pub const RKL_4C80: u16 = 0x4C80;
-pub const RKL_4C8A: u16 = 0x4C8A;
-pub const RKL_4C8B: u16 = 0x4C8B;
-pub const RKL_4C8C: u16 = 0x4C8C;
-pub const RKL_4C90: u16 = 0x4C90;
-pub const RKL_4C9A: u16 = 0x4C9A;
-
-// Alder Lake-P (Gen12, mobile).
-pub const ADL_P_4626: u16 = 0x4626;
-pub const ADL_P_4628: u16 = 0x4628;
-pub const ADL_P_462A: u16 = 0x462A;
-pub const ADL_P_4636: u16 = 0x4636;
-pub const ADL_P_4638: u16 = 0x4638;
-pub const ADL_P_463A: u16 = 0x463A;
-pub const ADL_P_46A0: u16 = 0x46A0;
-pub const ADL_P_46A1: u16 = 0x46A1;
-pub const ADL_P_46A2: u16 = 0x46A2;
-pub const ADL_P_46A3: u16 = 0x46A3;
-pub const ADL_P_46A6: u16 = 0x46A6;
-pub const ADL_P_46A8: u16 = 0x46A8;
-pub const ADL_P_46AA: u16 = 0x46AA;
-pub const ADL_P_46B6: u16 = 0x46B6;
-pub const ADL_P_46B8: u16 = 0x46B8;
-pub const ADL_P_46BA: u16 = 0x46BA;
-pub const ADL_P_46B0: u16 = 0x46B0;
-pub const ADL_P_46B1: u16 = 0x46B1;
-pub const ADL_P_46B2: u16 = 0x46B2;
-pub const ADL_P_46B3: u16 = 0x46B3;
-// Alder Lake-M (Gen12, mobile).
-pub const ADL_M_46C0: u16 = 0x46C0;
-pub const ADL_M_46C1: u16 = 0x46C1;
-pub const ADL_M_46C2: u16 = 0x46C2;
-pub const ADL_M_46C3: u16 = 0x46C3;
-// Alder Lake-N (Gen12, low-power mobile/desktop).
-pub const ADL_N_46D0: u16 = 0x46D0;
-pub const ADL_N_46D1: u16 = 0x46D1;
-pub const ADL_N_46D2: u16 = 0x46D2;
-pub const ADL_N_46D3: u16 = 0x46D3;
-pub const ADL_N_46D4: u16 = 0x46D4;
-
-// Alder Lake-S / Raptor Lake-S (Gen12, desktop).
-pub const ADL_S_4680: u16 = 0x4680;
-pub const ADL_S_4682: u16 = 0x4682;
-pub const ADL_S_4688: u16 = 0x4688;
-pub const ADL_S_468A: u16 = 0x468A;
-pub const ADL_S_468B: u16 = 0x468B;
-pub const ADL_S_4690: u16 = 0x4690;
-pub const ADL_S_4692: u16 = 0x4692;
-pub const ADL_S_4693: u16 = 0x4693;
-pub const RPL_S_A780: u16 = 0xA780;
-pub const RPL_S_A781: u16 = 0xA781;
-pub const RPL_S_A782: u16 = 0xA782;
-pub const RPL_S_A783: u16 = 0xA783;
-pub const RPL_S_A788: u16 = 0xA788;
-pub const RPL_S_A789: u16 = 0xA789;
-pub const RPL_S_A78A: u16 = 0xA78A;
-pub const RPL_S_A78B: u16 = 0xA78B;
-// Raptor Lake-P / -U (Gen12, mobile).
-pub const RPL_P_A720: u16 = 0xA720;
-pub const RPL_U_A721: u16 = 0xA721;
-pub const RPL_P_A7A0: u16 = 0xA7A0;
-pub const RPL_U_A7A1: u16 = 0xA7A1;
-pub const RPL_P_A7A8: u16 = 0xA7A8;
-pub const RPL_U_A7A9: u16 = 0xA7A9;
-pub const RPL_P_A7AA: u16 = 0xA7AA;
-pub const RPL_P_A7AB: u16 = 0xA7AB;
-pub const RPL_U_A7AC: u16 = 0xA7AC;
-pub const RPL_U_A7AD: u16 = 0xA7AD;
-
-// Compatibility for users of the original PCI constant names.
-pub use self::ADL_P_46B0 as RPL_P_46B0;
-pub use self::ADL_P_46B1 as RPL_P_46B1;
-pub use self::ADL_P_46B2 as RPL_P_46B2;
-pub use self::ADL_P_46B3 as RPL_P_46B3;
-pub use self::RPL_U_A721 as RPL_P_A721;
-pub use self::RPL_U_A7A1 as RPL_P_A7A1;
-pub use self::RPL_U_A7A9 as RPL_P_A7A9;
-pub use self::RPL_U_A7AC as RPL_P_A7AC;
-pub use self::RPL_U_A7AD as RPL_P_A7AD;
-
-// Meteor Lake (Xe-LPG, mobile).
-pub const MTL_7D40: u16 = 0x7D40;
-pub const MTL_7D45: u16 = 0x7D45;
-pub const MTL_7D55: u16 = 0x7D55;
-pub const MTL_7D60: u16 = 0x7D60;
-pub const MTL_7DD5: u16 = 0x7DD5;
-
-// Arrow Lake (Xe-LPG silicon under a new product name — see the
-// DEVICE_TABLE note). Linux `include/drm/intel/pciids.h`
-// INTEL_ARL_*_IDS: H = 7D51/7DD1, U = 7D41, S = 7D67/B640.
-// pci.ids lists the same five as Arrow Lake (it labels B640
-// Arrow Lake-H; i915 files B640 under its ARL-S macro — the
-// segment letter differs between the two sources, the Arrow
-// Lake attribution and the MTL binding agree).
-pub const ARL_7D41: u16 = 0x7D41;
-pub const ARL_7D51: u16 = 0x7D51;
-pub const ARL_7D67: u16 = 0x7D67;
-pub const ARL_7DD1: u16 = 0x7DD1;
-pub const ARL_B640: u16 = 0xB640;
-
-// Panther Lake (Xe3-LPG / "Xe3", Core Ultra Series 3 mobile).
-pub const PTL_B080: u16 = 0xB080;
-pub const PTL_B081: u16 = 0xB081;
-pub const PTL_B082: u16 = 0xB082;
-pub const PTL_B083: u16 = 0xB083;
-pub const PTL_B084: u16 = 0xB084;
-pub const PTL_B085: u16 = 0xB085;
-pub const PTL_B086: u16 = 0xB086;
-pub const PTL_B087: u16 = 0xB087;
-pub const PTL_B08F: u16 = 0xB08F;
-pub const PTL_B090: u16 = 0xB090;
-/// Panther Lake-H — the SKU on the Minisforum MS-03 (Core Ultra 5 336H).
-pub const PTL_B0A0: u16 = 0xB0A0;
-pub const PTL_B0B0: u16 = 0xB0B0;
-
-// Wildcat Lake (Xe3-LPG). Linux binds both IDs to the Panther Lake GT
-// descriptor; display 30.02 remains separately gated in intel_gpu_xe3lpd.
-pub const WCL_FD80: u16 = 0xFD80;
-pub const WCL_FD81: u16 = 0xFD81;
-
-// Nova Lake-S. Linux gives this family a distinct descriptor and GuC image;
-// display 35.00 remains on the headless route until its modeset is qualified.
-pub const NVLS_D740: u16 = 0xD740;
-pub const NVLS_D741: u16 = 0xD741;
-pub const NVLS_D742: u16 = 0xD742;
-pub const NVLS_D743: u16 = 0xD743;
-pub const NVLS_D744: u16 = 0xD744;
-pub const NVLS_D745: u16 = 0xD745;
-
-// Crescent Island is source-known but execution remains gated: the current
-// Linux xe firmware manifest has no CRESCENTISLAND GuC entry.
-pub const CRI_674C: u16 = 0x674C;
-pub(crate) const CRI_IDS: &[u16] = &[CRI_674C];
-
-// Arctic Sound-M. Linux `INTEL_ATS_M_IDS`: M150 = 56C0/56C2, M75 = 56C1.
-// These use the DG2 platform machinery but are display-less, SR-IOV-capable
-// accelerator profiles. NARF binds only a PF with VF Enable and NumVFs zero.
-pub const ATSM_56C0: u16 = 0x56C0;
-pub const ATSM_56C1: u16 = 0x56C1;
-pub const ATSM_56C2: u16 = 0x56C2;
-pub(crate) const ATSM_IDS: &[u16] = &[ATSM_56C0, ATSM_56C1, ATSM_56C2];
-
-// ── Generation classifier ────────────────────────────────────────
-
-/// Gen12 sub-architecture identifier. Tiger Lake / Alder Lake /
-/// Raptor Lake all share the Xe-LP register surface; Meteor Lake
-/// uses Xe-LPG (different DDI / DPLL programming).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Generation {
-    /// Tiger Lake — Gen12 Xe-LP. Conservative reference target.
-    TigerLake,
-    /// Rocket Lake — Gen12 Xe-LP GT with a distinct display-12 clock/port
-    /// topology. GT execution is admitted; display programming is gated.
-    RocketLake,
-    /// Alder Lake / Raptor Lake — Gen12 Xe-LP carry-forward.
-    AlderLake,
-    /// Meteor Lake — Xe-LPG (re-architected DDI + display power).
-    /// Arrow Lake classifies here too: its GT is Xe-LPG and its
-    /// display is Xe-LPD, and both Linux drivers bind the ARL IDs
-    /// to the Meteor Lake device info / display descriptor
-    /// (i915 `INTEL_ARL_IDS(..., &mtl_info)`, xe `&mtl_desc`),
-    /// distinguishing Arrow Lake only as a subplatform. The
-    /// table follows the silicon, as it already does for Raptor
-    /// Lake under `AlderLake`; `asic` carries the product name.
-    MeteorLake,
-    /// Lunar Lake — Xe2-LPG graphics only; display remains unadmitted.
-    LunarLake,
-    /// Panther Lake / Wildcat Lake — Xe3-LPG. Display is Xe3_LPD: the DDI block
-    /// moved again relative to Xe-LPG and the C10/C20 PHYs replace
-    /// the combo-PHY + DPLL pair Gen12 used.
-    PantherLake,
-}
 
 impl Generation {
     /// Map the sub-architecture to the BAR0 region-enumeration
@@ -310,680 +123,14 @@ pub struct ChipInfo {
     pub asic: &'static str,
 }
 
-/// One row of the canonical Intel device table. PCI registration
-/// and `chip_info_for_pci_id` both derive from this single list,
-/// so the two can no longer drift apart (before lane 1 they were
-/// a hand-duplicated classifier match + a 36-entry registration
-/// list with zero fixtures pinning either).
-#[derive(Copy, Clone, Debug)]
-pub struct DeviceEntry {
-    /// PCI registration name (`narf_bus::PciMatch::name`).
-    pub name: &'static str,
-    pub did: u16,
-    pub generation: Generation,
-    pub asic: &'static str,
-}
-
-/// The canonical integrated device table. Contents are pinned against
-/// spec §5 by the census fixture in this module's tests. Current families
-/// are transcribed from Linux `include/drm/intel/pciids.h`; the six retained
-/// public-`pci.ids` ADL-P rows are called out in the spec. Every row requires
-/// an already-qualified matching generation profile.
-pub const DEVICE_TABLE: &[DeviceEntry] = &[
-    // MIT Linux include/drm/intel/pciids.h: INTEL_LNL_IDS (exactly three).
-    DeviceEntry {
-        name: "intel-gpu-lnl-6420",
-        did: 0x6420,
-        generation: Generation::LunarLake,
-        asic: "lunarlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-lnl-64A0",
-        did: 0x64a0,
-        generation: Generation::LunarLake,
-        asic: "lunarlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-lnl-64B0",
-        did: 0x64b0,
-        generation: Generation::LunarLake,
-        asic: "lunarlake",
-    },
-    // Tiger Lake (Gen12 Xe-LP).
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A40",
-        did: TGL_9A40,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A49",
-        did: TGL_U_GT2_9A49,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A59",
-        did: TGL_U_GT2_9A59,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A60",
-        did: TGL_H_GT1_9A60,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A68",
-        did: TGL_H_GT2_9A68,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A70",
-        did: TGL_H_GT2_9A70,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A78",
-        did: TGL_GT2_9A78,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9AC0",
-        did: TGL_GT2_9AC0,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9AC9",
-        did: TGL_GT2_9AC9,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9AD9",
-        did: TGL_GT2_9AD9,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9AF8",
-        did: TGL_GT2_9AF8,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    // Rocket Lake (Gen12 Xe-LP GT; display remains separately gated).
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C80",
-        did: RKL_4C80,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C8A",
-        did: RKL_4C8A,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C8B",
-        did: RKL_4C8B,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C8C",
-        did: RKL_4C8C,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C90",
-        did: RKL_4C90,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rkl-4C9A",
-        did: RKL_4C9A,
-        generation: Generation::RocketLake,
-        asic: "rocketlake",
-    },
-    // Alder Lake-P.
-    DeviceEntry {
-        name: "intel-gpu-adl-4626",
-        did: ADL_P_4626,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4628",
-        did: ADL_P_4628,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-462A",
-        did: ADL_P_462A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4636",
-        did: ADL_P_4636,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4638",
-        did: ADL_P_4638,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-463A",
-        did: ADL_P_463A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A0",
-        did: ADL_P_46A0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A1",
-        did: ADL_P_46A1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A2",
-        did: ADL_P_46A2,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A3",
-        did: ADL_P_46A3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A6",
-        did: ADL_P_46A6,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A8",
-        did: ADL_P_46A8,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46AA",
-        did: ADL_P_46AA,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46B6",
-        did: ADL_P_46B6,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46B8",
-        did: ADL_P_46B8,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46BA",
-        did: ADL_P_46BA,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    // Keep the registered bus names for these Alder Lake-P devices.
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B0",
-        did: ADL_P_46B0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B1",
-        did: ADL_P_46B1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B2",
-        did: ADL_P_46B2,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B3",
-        did: ADL_P_46B3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    // Alder Lake-M.
-    DeviceEntry {
-        name: "intel-gpu-adl-46C0",
-        did: ADL_M_46C0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46C1",
-        did: ADL_M_46C1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46C2",
-        did: ADL_M_46C2,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46C3",
-        did: ADL_M_46C3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    // Alder Lake-N.
-    DeviceEntry {
-        name: "intel-gpu-adl-46D0",
-        did: ADL_N_46D0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D1",
-        did: ADL_N_46D1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D2",
-        did: ADL_N_46D2,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D3",
-        did: ADL_N_46D3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D4",
-        did: ADL_N_46D4,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    // Alder Lake-S.
-    DeviceEntry {
-        name: "intel-gpu-adl-4680",
-        did: ADL_S_4680,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4682",
-        did: ADL_S_4682,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4688",
-        did: ADL_S_4688,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-468A",
-        did: ADL_S_468A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-468B",
-        did: ADL_S_468B,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4690",
-        did: ADL_S_4690,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4692",
-        did: ADL_S_4692,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4693",
-        did: ADL_S_4693,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    // Raptor Lake-S.
-    DeviceEntry {
-        name: "intel-gpu-rpl-A780",
-        did: RPL_S_A780,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A781",
-        did: RPL_S_A781,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A782",
-        did: RPL_S_A782,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A783",
-        did: RPL_S_A783,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A788",
-        did: RPL_S_A788,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A789",
-        did: RPL_S_A789,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A78A",
-        did: RPL_S_A78A,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A78B",
-        did: RPL_S_A78B,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    // Raptor Lake-P / -U.
-    DeviceEntry {
-        name: "intel-gpu-rpl-A720",
-        did: RPL_P_A720,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A721",
-        did: RPL_U_A721,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-u",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A0",
-        did: RPL_P_A7A0,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A1",
-        did: RPL_U_A7A1,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-u",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A8",
-        did: RPL_P_A7A8,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A9",
-        did: RPL_U_A7A9,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-u",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AA",
-        did: RPL_P_A7AA,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AB",
-        did: RPL_P_A7AB,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AC",
-        did: RPL_U_A7AC,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-u",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AD",
-        did: RPL_U_A7AD,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-u",
-    },
-    // Meteor Lake (Xe-LPG) — identify + announce only in this lane.
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D40",
-        did: MTL_7D40,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D45",
-        did: MTL_7D45,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D55",
-        did: MTL_7D55,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D60",
-        did: MTL_7D60,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7DD5",
-        did: MTL_7DD5,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    // Arrow Lake (Xe-LPG) — classified Generation::MeteorLake
-    // (the silicon and both Linux drivers' binding), announced
-    // under its own name. Display disposition is exactly the
-    // Meteor Lake rows' above (Xe-LPG display, #1016).
-    DeviceEntry {
-        name: "intel-gpu-arl-7D41",
-        did: ARL_7D41,
-        generation: Generation::MeteorLake,
-        asic: "arrowlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-arl-7D51",
-        did: ARL_7D51,
-        generation: Generation::MeteorLake,
-        asic: "arrowlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-arl-7D67",
-        did: ARL_7D67,
-        generation: Generation::MeteorLake,
-        asic: "arrowlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-arl-7DD1",
-        did: ARL_7DD1,
-        generation: Generation::MeteorLake,
-        asic: "arrowlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-arl-B640",
-        did: ARL_B640,
-        generation: Generation::MeteorLake,
-        asic: "arrowlake",
-    },
-    // Panther Lake (Xe3-LPG) — identify + announce only in this lane.
-    DeviceEntry {
-        name: "intel-gpu-ptl-B080",
-        did: PTL_B080,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B081",
-        did: PTL_B081,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B082",
-        did: PTL_B082,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B083",
-        did: PTL_B083,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B084",
-        did: PTL_B084,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B085",
-        did: PTL_B085,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B086",
-        did: PTL_B086,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B087",
-        did: PTL_B087,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B08F",
-        did: PTL_B08F,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B090",
-        did: PTL_B090,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B0A0",
-        did: PTL_B0A0,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B0B0",
-        did: PTL_B0B0,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    // Wildcat Lake uses Linux's ptl_desc GT profile. Its distinct display
-    // 30.02 path remains a typed refusal.
-    DeviceEntry {
-        name: "intel-gpu-wcl-FD80",
-        did: WCL_FD80,
-        generation: Generation::PantherLake,
-        asic: "wildcatlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-wcl-FD81",
-        did: WCL_FD81,
-        generation: Generation::PantherLake,
-        asic: "wildcatlake",
-    },
-    // Nova Lake-S retains the broad post-Xe2 display-generation gate here;
-    // GtPlatform carries its distinct GT, firmware and live-GMD identity.
-    DeviceEntry {
-        name: "intel-gpu-nvls-D740",
-        did: NVLS_D740,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-nvls-D741",
-        did: NVLS_D741,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-nvls-D742",
-        did: NVLS_D742,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-nvls-D743",
-        did: NVLS_D743,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-nvls-D744",
-        did: NVLS_D744,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-nvls-D745",
-        did: NVLS_D745,
-        generation: Generation::PantherLake,
-        asic: "novalake-s",
-    },
-];
-
-pub(crate) fn source_known_unqualified(did: u16) -> bool {
-    CRI_IDS.contains(&did)
+fn unqualified_probe_message(did: u16) -> Option<&'static str> {
+    if CRI_IDS.contains(&did) {
+        Some("recognized Crescent Island — GuC firmware profile absent; execution gated")
+    } else if NVLP_IDS.contains(&did) {
+        Some("recognized Nova Lake-P — GuC firmware profile absent; execution gated")
+    } else {
+        None
+    }
 }
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
@@ -1440,24 +587,57 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    if source_known_unqualified(device.id.device) {
+    if let Some(note) = unqualified_probe_message(device.id.device) {
+        log_probe(note, &device);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    let Some(platform) =
+        crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+    else {
         log_probe(
-            "recognized Crescent Island — GuC firmware profile absent; execution gated",
+            "unsupported Intel ASIC — device id not in the driver table",
             &device,
         );
         return Err(narf_bus::ProbeError::NotForThisDriver);
+    };
+    // Nova's explicit firmware-observation route terminates here even if
+    // the live plane cannot be reconstructed. PCI parking and the headless
+    // GT's driver FLR would destroy state this option exists to observe.
+    if let Some(result) = crate::intel_gpu_lt_phy::probe_firmware_primary(platform, &device, &cap) {
+        use core::fmt::Write as _;
+        match result {
+            Ok(primary) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} firmware Pipe A {}x{} {:?}, pitch {} bytes, GGTT {:#x}",
+                    device.id.vendor,
+                    device.id.device,
+                    primary.geometry.width,
+                    primary.geometry.height,
+                    primary.format,
+                    primary.geometry.pitch,
+                    primary.gtt_offset,
+                );
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} firmware Pipe A readout refused ({reason:?})",
+                    device.id.vendor,
+                    device.id.device,
+                );
+            }
+        }
+        return Ok(());
     }
     // Normalize every admitted Intel graphics function before any route
     // probe maps or reads BAR0. Firmware may hand an integrated or discrete
     // GPU to us in D3hot, where the transition back to D0 can clear BARs.
     // `prepare_memory_probe` restores those BARs while leaving memory decode
     // and bus mastering parked; the selected path below enables only what it
-    // owns. Unknown Intel display functions skip this preflight and are
-    // announced by the class-match fallback below.
-    if crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device).is_some() {
-        narf_bus::pci::prepare_memory_probe(&cap, &device)
-            .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    }
+    // owns.
+    narf_bus::pci::prepare_memory_probe(&cap, &device)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // A Lunar Lake function whose display-20 route is admitted (requested,
     // GMD 20.00, Pipe A fused in and lit by firmware) takes the integrated
     // display path below and never the headless profile's driver FLR;
@@ -1468,10 +648,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // `narf.intel.wcl_display=1`) likewise takes the integrated display path
     // and never the headless driver FLR. Without its option it reads nothing.
     let ptl_display = !lnl_display && crate::intel_gpu_xe3lpd::probe_route(&device, &cap);
-    if !lnl_display
-        && !ptl_display
-        && crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-            .is_some_and(|p| p.is_discrete() || p.is_headless_integrated())
+    if !lnl_display && !ptl_display && (platform.is_discrete() || platform.is_headless_integrated())
     {
         return crate::intel_gpu_gt_runtime::probe_discrete(device, cap);
     }
@@ -1489,15 +666,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: caller-authority.
     let mut dev = match unsafe { IntelGpu::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(IntelGpuError::UnknownAsic) => {
-            // Announced, not silent: an Intel DID outside the
-            // table is a coverage gap, not broken silicon.
-            log_probe(
-                "unsupported Intel ASIC — device id not in the driver table",
-                &device,
-            );
-            return Err(narf_bus::ProbeError::NotForThisDriver);
-        }
         Err(e) => {
             use core::fmt::Write as _;
             let _ = writeln!(
@@ -2144,30 +1312,12 @@ pub(crate) fn relight_display_locked(
 /// Register one exact-match PCI driver per row of the canonical
 /// device table, plus the class-match backstop.
 pub fn register_pci_driver() {
-    for (name, ids) in [
-        ("intel-gpu-dg1", crate::intel_gpu_gt::DG1_IDS),
-        ("intel-gpu-dg2", crate::intel_gpu_gt::DG2_IDS),
-        ("intel-gpu-bmg", crate::intel_gpu_gt::BMG_IDS),
-        ("intel-gpu-atsm", ATSM_IDS),
-        ("intel-gpu-cri-gated", CRI_IDS),
-    ] {
-        for &device in ids {
-            narf_bus::register_pci_driver(narf_bus::PciMatch {
-                name,
-                kind: narf_bus::MatchKind::VendorDevice {
-                    vendor: INTEL_VENDOR,
-                    device,
-                },
-                probe,
-            });
-        }
-    }
-    for entry in DEVICE_TABLE.iter() {
+    for (name, device) in ids::pci_matches() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
-            name: entry.name,
+            name,
             kind: narf_bus::MatchKind::VendorDevice {
                 vendor: INTEL_VENDOR,
-                device: entry.did,
+                device,
             },
             probe,
         });
@@ -2849,7 +1999,7 @@ fn step_external_sst_inner(bar: &MmioRegion, stop: bool) -> Result<bool, narf_fi
 fn step_external_sst(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesystem::FsError> {
     // Preserve idle/older-platform recovery: an absent external owner must
     // not set KMS.blocked when Device::recover legitimately has no work.
-    if external_routes_stopped(bar) {
+    if legacy_external_routes_stopped(bar) {
         return Ok(true);
     }
     let display = crate::intel_gpu_kms::display_for_bar(bar);
@@ -2909,6 +2059,11 @@ fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {
             .is_some_and(|state| state.bar == bar.phys.raw())
 }
 pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
+    legacy_external_routes_stopped(bar) && crate::intel_gpu_xelpg_external::routes_stopped()
+}
+// The MTL-family route has its own panel-serialized retirement. A live route
+// there must not close KMS admission through the unrelated legacy SST drain.
+fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
     if !crate::intel_gpu_dp_bridge::sessions_stopped(bar.phys.raw()) {
         return false;
     }
@@ -2917,7 +2072,6 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
             .lock()
             .as_ref()
             .is_none_or(|state| state.bar != bar.phys.raw() || state.stopped())
-        && crate::intel_gpu_xelpg_external::routes_stopped()
 }
 
 // ── Meteor Lake external SST (`intel_gpu_xelpg_external`) ───────
@@ -3291,34 +2445,26 @@ pub(crate) fn mtl_runtime_pass<M: crate::intel_gpu_kms::Platform>(
 /// Suspend/GT-reset retirement of the MTL route and its hotplug sources,
 /// then withdrawal of its publication once nothing is live. `Busy` when a
 /// route stays retained (quarantined or a service pass in progress).
-pub(crate) fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
-    // Stopping a live route repartitions Pipe A's resources: bracket it
-    // with the panel's KMS owner exactly as a hotplug pass does (FBC and PSR
-    // leave Pipe A first). A busy owner leaves the teardown unbracketed; the
-    // live transaction then refuses an active FBC and the retirement
-    // reports Busy, to be retried. After a GT reset the owner's own
-    // loss-tolerant recovery disables FBC and PSR instead.
-    let display = crate::intel_gpu_kms::display_for_bar(bar);
-    let mut pass = if crate::intel_gpu_xelpg_external::routes_stopped() {
-        None
-    } else {
-        display
-            .as_ref()
-            .filter(|display| !display.reset_lost())
-            .and_then(|display| display.external_pass().ok())
+pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    let Some(gpu) = with_display_info(|gpu| *gpu).filter(|gpu| {
+        gpu.gtt_mmadr.phys == bar.phys
+            && crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation)
+    }) else {
+        return Ok(());
     };
-    if let Some(pass) = pass.as_mut() {
-        pass.pre_update();
-    }
-    let done = with_display_info(|gpu| {
-        if gpu.gtt_mmadr.phys != bar.phys {
-            return true;
-        }
-        let window = gpu.mode_window();
-        crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
-    })
-    .unwrap_or(true);
-    drop(pass);
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let _pass = match display.as_ref() {
+        Some(display) => Some(
+            display
+                .external_retirement(crate::intel_gpu_xelpg_external::routes_stopped)
+                .await?,
+        ),
+        None => None,
+    };
+    let done = crate::intel_gpu_xelpg_external::teardown_mtl_external(
+        &gpu.mode_window(),
+        gpu.chip.generation,
+    );
     if !crate::intel_gpu_xelpg_external::route_live() {
         let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
         if serial != 0 {
@@ -3411,9 +2557,8 @@ fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
         // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
         // less is an SST device and not this path's business.
         let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
-        let caps = crate::dp_link_training::read_caps(&mut aux).ok()?;
-        let mut raw_caps = [0u8; 16];
-        aux.dpcd_read(0, &mut raw_caps).ok()?;
+        let raw_caps = crate::dp_link_training::read_receiver_caps(&mut aux).ok()?;
+        let caps = crate::dp_link_training::DpcdCaps::decode(&raw_caps);
         let mut mstm_cap = [0u8; 1];
         aux.dpcd_read(crate::dp_mst_mgr::MSTM_CAP, &mut mstm_cap)
             .ok()?;
@@ -3766,6 +2911,7 @@ pub mod tests {
             (0xB08F, "pantherlake"),
             (0xB090, "pantherlake"),
             (0xB0A0, "pantherlake"),
+            (0xB0A1, "pantherlake"),
             (0xB0B0, "pantherlake"),
             (0xFD80, "wildcatlake"),
             (0xFD81, "wildcatlake"),
@@ -3775,6 +2921,8 @@ pub mod tests {
             (0xD743, "novalake-s"),
             (0xD744, "novalake-s"),
             (0xD745, "novalake-s"),
+            (0xD74A, "novalake-s"),
+            (0xD74B, "novalake-s"),
         ];
         if DEVICE_TABLE.len() != EXPECTED.len() {
             return TestResult::Fail("device table size drifted from the spec §5 census");
@@ -3838,14 +2986,78 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_unknown_ids_do_not_classify);
 
-    fn smoke_crescent_island_identity_is_exact_and_fail_closed() -> TestResult {
-        if !source_known_unqualified(CRI_674C)
-            || source_known_unqualified(0x674b)
-            || source_known_unqualified(0x674d)
-            || chip_info_for_pci_id(INTEL_VENDOR, CRI_674C).is_some()
-            || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, CRI_674C).is_some()
+    #[cfg(feature = "kernel-test")]
+    fn smoke_unqualified_class_probe_preserves_pci_command() -> TestResult {
+        use narf_bus::{BusAddr, BusKind, DeviceId, PcieAddr, ProbeError};
+        let addr = PcieAddr::new(0x7f35, 0, 2, 0);
+        let cfg_phys = narf_memory::PhysAddr::new(0x7f35_0000);
+        let mut config = alloc::vec![0u32; 1024];
+        // SAFETY: the scoped ECAM window points at this test's aligned
+        // RAM and is removed before the backing vector drops.
+        let _window = unsafe {
+            narf_bus::ecam::__test_windows(&[(cfg_phys, config.as_mut_ptr().cast(), 4096)])
+        };
+        config[1] = 1; // firmware left I/O-space decoding enabled
+        for did in [0x46b4, 0xd746, 0xd74c, 0xd758, 0xb0a2]
+            .into_iter()
+            .chain(CRI_IDS.iter().chain(NVLP_IDS).copied())
         {
-            return TestResult::Fail("Crescent Island fail-closed identity boundary");
+            let device = BusDevice {
+                addr: BusAddr::Pcie(addr),
+                kind: BusKind::Pcie { addr, cfg_phys },
+                id: DeviceId {
+                    vendor: INTEL_VENDOR,
+                    device: did,
+                    class: 0x030000,
+                    subsystem_vendor: 0,
+                    subsystem_id: 0,
+                },
+            };
+            let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+            let result = probe(device, cap);
+            cap.revoke();
+            if !matches!(result, Err(ProbeError::NotForThisDriver)) || config[1] != 1 {
+                return TestResult::Fail(
+                    "unqualified Intel class probe claimed or reconfigured a device",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    #[cfg(feature = "kernel-test")]
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_unqualified_class_probe_preserves_pci_command
+    );
+
+    fn smoke_crescent_island_identity_is_exact_and_fail_closed() -> TestResult {
+        for (ids, family) in [
+            (
+                &[0x674c, 0x674d, 0x674e, 0x674f, 0x6750][..],
+                "Crescent Island",
+            ),
+            (
+                &[
+                    0xd750, 0xd751, 0xd752, 0xd753, 0xd754, 0xd755, 0xd756, 0xd757, 0xd75f,
+                ][..],
+                "Nova Lake-P",
+            ),
+        ] {
+            for &did in ids {
+                if !unqualified_probe_message(did).is_some_and(|message| message.contains(family))
+                    || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
+                    || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did).is_some()
+                {
+                    return TestResult::Fail("unqualified PCI family entered an active profile");
+                }
+            }
+        }
+        for did in [0x674b, 0x6751, 0xd74f, 0xd758, 0xd75e, 0xd760] {
+            if unqualified_probe_message(did).is_some() {
+                return TestResult::Fail(
+                    "neighboring PCI ID classified as Crescent Island or Nova Lake-P",
+                );
+            }
         }
         TestResult::Pass
     }
@@ -3856,7 +3068,7 @@ pub mod tests {
 
     fn smoke_arctic_sound_m_identity_is_exact_and_pf_only() -> TestResult {
         for did in [ATSM_56C0, ATSM_56C1, ATSM_56C2] {
-            if source_known_unqualified(did)
+            if unqualified_probe_message(did).is_some()
                 || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
                 || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
                     != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
@@ -3865,7 +3077,7 @@ pub mod tests {
             }
         }
         for did in [0x56bfu16, 0x56c3] {
-            if source_known_unqualified(did)
+            if unqualified_probe_message(did).is_some()
                 || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
                     == Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
             {

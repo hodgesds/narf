@@ -456,6 +456,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         trained,
         pipe,
         reservation: None,
+        awaiting_fec_stop: false,
         state: RouteState::Stopped,
     };
     let result = (|| {
@@ -583,7 +584,8 @@ mod tests {
                 "MST needs independent pipes/surfaces, bounded pin-D width and pipe VCPI",
             );
         }
-        if io.read32(0x61540) & (1 << 27) == 0
+        if io.read32(0x61540) & ((1 << 27) | (1 << 18)) != 1 << 27
+            || io.sink.borrow().training_writes_to(0x101) != [2]
             || io.read32(0x62540) & (1 << 31) != 0
             || io.read32(0x62400) & (3 << 10) != 1 << 10
         {

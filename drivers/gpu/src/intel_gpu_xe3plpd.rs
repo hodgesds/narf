@@ -1,4 +1,4 @@
-//! Disconnected Display 35 (Xe3P_LPD) plane, transcoder and underrun dialect.
+//! Display 35 (Xe3P_LPD) firmware primary readout and programming dialect.
 //!
 //! Pinned source: local Linux 7.0-rc7
 //! `i915/display/{intel_display.c,intel_plane.c,skl_universal_plane.c,
@@ -9,12 +9,102 @@
 //! behavior: no `TRANS_VSYNCSHIFT` write or transcoder interlace field,
 //! linear horizontal reflection is allowed while Tile4 reflection is not,
 //! semiplanar YUV restores vertical 2x subsampling, and the four Display-35
-//! underrun latches have exact decode/write-one-to-clear images. They form no
-//! MMIO transaction and grant no Nova Lake programming authority.
+//! underrun latches have exact decode/write-one-to-clear images.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use crate::{intel_gpu_pipes::Pipe, intel_gpu_xelpg_wm::Tiling};
+
+/// Firmware's origin-aligned, opaque linear primary, observed before GT reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FirmwarePrimary {
+    pub(crate) format: crate::drm::card::PixelFormat,
+    pub(crate) geometry: crate::intel_gpu_scanout::Geometry,
+    pub(crate) gtt_offset: u32,
+}
+
+/// Read one Pipe A plane state under the caller's live display-35 route proof.
+/// Linux 7.0-rc7 and 7.4-rc1: skl_get_initial_plane_config,
+/// skl_plane_stride_mult, intel_get_pipe_src_size and skl_universal_plane_regs.h.
+pub(crate) fn read_firmware_primary(
+    io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized),
+) -> Result<FirmwarePrimary, crate::intel_gpu_lt_phy::RouteRefusal> {
+    use crate::intel_gpu_lt_phy::RouteRefusal;
+    use crate::intel_gpu_pipes as pipes;
+    let read = |off| {
+        if !io.display_access_ok() {
+            return Err(RouteRefusal::Ip(crate::intel_gpu_xe2lpd::IpError::NoDevice));
+        }
+        let value = io.read32(off);
+        if value == u32::MAX || !io.display_access_ok() {
+            Err(RouteRefusal::Ip(crate::intel_gpu_xe2lpd::IpError::NoDevice))
+        } else {
+            Ok(value)
+        }
+    };
+    let pipe = Pipe::A.trans_base();
+    let plane = Pipe::A.base() + pipes::PLANE_PRIMARY_OFFSET;
+    // intel_ddi_get_encoder_pipes requires the port buffer as well as the
+    // transcoder assignment. An armed SST transcoder alone can be stale.
+    let port = crate::intel_gpu_xelpg::XeLpgPort::A;
+    let ddi = read(pipe + pipes::TRANS_DDI_FUNC_CTL_OFFSET)?;
+    if ddi & (0xff00_0000 | (1 << 15)) != 0x8a00_0000
+        || read(port.ddi_buf_ctl())? & crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE == 0
+    {
+        return Err(RouteRefusal::PanelRoute);
+    }
+    // skl_get_initial_plane_config excludes joined CRTCs. Check Pipe A's
+    // ICL_PIPE_DSS_CTL1 big/ultra and uncompressed joiner enables.
+    if read(0x78000)? & ((1 << 29) | (1 << 23) | (3 << 20)) != 0 {
+        return Err(RouteRefusal::PanelRoute);
+    }
+    let ctl = read(plane + pipes::PLANE_CTL_OFFSET)?;
+    if ctl & pipes::PLANE_CTL_ENABLE == 0 {
+        return Err(RouteRefusal::PrimaryDark);
+    }
+    // PLANE_CTL: check ICL format, render/media decompression, tiling,
+    // async flip, reflection and rotation. Alpha lives in PLANE_COLOR_CTL.
+    let fetch_mask = (31 << 23) | (1 << 15) | (7 << 10) | (3 << 8) | (1 << 4) | 3;
+    if ctl & fetch_mask != pipes::PixelFormat::Argb8888.encode_for_plane_ctl()
+        || read(plane + 0x4c)? & (3 << 4) != 0
+        || read(plane + pipes::PLANE_OFFSET_OFFSET)? != 0
+        || read(plane + pipes::PLANE_POS_OFFSET)? != 0
+    {
+        return Err(RouteRefusal::PrimaryLayout);
+    }
+    let size = read(plane + pipes::PLANE_SIZE_OFFSET)?;
+    let src = read(pipe + pipes::PIPE_SRCSZ_OFFSET)?;
+    let width = (size & 0xffff) + 1;
+    let height = (size >> 16) + 1;
+    let pitch = (read(plane + pipes::PLANE_STRIDE_OFFSET)? & 0xfff) * 64;
+    let surface = read(plane + pipes::PLANE_SURF_OFFSET)?;
+    // The armed SURF and latched SURFLIVE must name the same GGTT page.
+    // Reject protected and asynchronous updates. GGTT offset zero is valid.
+    if surface & 0xfff != 0 || read(plane + 0x2c)? != surface {
+        return Err(RouteRefusal::PrimarySurface);
+    }
+    if width > 16_384
+        || height > 16_384
+        || size.rotate_left(16) != src
+        || pitch < width * 4
+        || u64::from(surface) + u64::from(height) * u64::from(pitch) > 1 << 32
+    {
+        return Err(RouteRefusal::PrimaryLayout);
+    }
+    Ok(FirmwarePrimary {
+        format: if ctl & (1 << 20) == 0 {
+            crate::drm::card::PixelFormat::Xrgb8888
+        } else {
+            crate::drm::card::PixelFormat::Xbgr8888
+        },
+        geometry: crate::intel_gpu_scanout::Geometry {
+            width,
+            height,
+            pitch,
+        },
+        gtt_offset: surface,
+    })
+}
 
 const TRANSCONF_ENABLE: u32 = 1 << 31;
 /// `MTL_MEM_SS_INFO_GLOBAL`.

@@ -387,6 +387,34 @@ struct Display30 {
 }
 
 impl Physical {
+    fn integrated_display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        if self.discrete_display.is_some() {
+            return None;
+        }
+        if self.generation == Generation::PantherLake {
+            return self.display_ip();
+        }
+        crate::intel_gpu_xe2lpd::DisplayIp::for_generation(self.generation)
+    }
+
+    fn check_fetchers(&self, owned_dsb: bool, owned_cursor: bool) -> Result<(), FsError> {
+        // The external pipe layout belongs to the single integrated display
+        // controller. Verify the function and BAR before consulting it.
+        if self.discrete_display.is_none()
+            && crate::intel_gpu::with_controller(|gpu| (gpu.function_addr(), gpu.gtt_mmadr.phys))
+                != Some((self.device.addr, self.bar.phys))
+        {
+            return Err(FsError::NoDevice);
+        }
+        fetchers_with_cursor(
+            self,
+            self.generation,
+            self.integrated_display_ip(),
+            owned_dsb,
+            owned_cursor,
+        )
+    }
+
     fn read64(&self, offset: u64) -> u64 {
         u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
     }
@@ -750,17 +778,8 @@ impl Platform for Physical {
         if !self.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(
-            self,
-            self.generation,
-            self.display_ip(),
-            false,
-            owned_cursor,
-        )?;
+        self.check_fetchers(false, owned_cursor)?;
         if self.discrete_display.is_none() {
-            if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
-                return Err(FsError::NoDevice);
-            }
             if self.gen12_family().is_some() && !self.internal_primary_claimed() {
                 return Err(FsError::NoDevice);
             }
@@ -778,17 +797,8 @@ impl Platform for Physical {
         if !self.console_access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(
-            self,
-            self.generation,
-            self.display_ip(),
-            false,
-            owned_cursor,
-        )?;
+        self.check_fetchers(false, owned_cursor)?;
         if self.discrete_display.is_none() {
-            if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
-                return Err(FsError::NoDevice);
-            }
             return crate::intel_gpu_edp::kms_inhibit_psr(self)
                 .map_err(|_| crate::intel_gpu_user::io_error());
         }
@@ -839,17 +849,8 @@ impl Platform for Physical {
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(
-            &fresh,
-            fresh.generation,
-            fresh.display_ip(),
-            owned_dsb,
-            owned_cursor,
-        )?;
+        fresh.check_fetchers(owned_dsb, owned_cursor)?;
         if fresh.discrete_display.is_none() {
-            if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(fresh.bar.phys) {
-                return Err(FsError::NoDevice);
-            }
             crate::intel_gpu_edp::kms_inhibit_psr(&fresh)
                 .map_err(|_| crate::intel_gpu_user::io_error())?;
         }
@@ -1108,7 +1109,14 @@ fn fetchers_idle(
     generation: Generation,
     owned_dsb: bool,
 ) -> Result<(), FsError> {
-    fetchers_with_cursor(mmio, generation, None, owned_dsb, false)
+    // This generation-only fixture has no opted-in Display-30 identity.
+    let ip = match generation {
+        Generation::MeteorLake | Generation::LunarLake => {
+            crate::intel_gpu_xe2lpd::DisplayIp::for_generation(generation)
+        }
+        _ => None,
+    };
+    fetchers_with_cursor(mmio, generation, ip, owned_dsb, false)
 }
 fn fetchers_with_cursor(
     mmio: &impl MmioWindow,
@@ -1149,15 +1157,12 @@ fn fetchers_with_cursor(
             _ => 7,
         }
     };
-    // Display 14: a Pipe B–D primary the MTL external route lit through the
-    // Pipe B–D owner scans its own allocation, outside this owner's GEM
-    // arena; it is neither this owner's fetcher nor one it could retire.
-    // Only that exact surface on that pipe's primary is admitted.
-    let external = if generation == Generation::MeteorLake {
-        crate::intel_gpu_xelpg_pipes::published_layout().map_or([None; 4], |l| l.surfaces)
-    } else {
-        [None; 4]
-    };
+    // A lit external primary may keep fetching its own surface while the
+    // panel acquires its disjoint GEM arena. The KMS mutex serializes
+    // external layout publication and this inventory.
+    let external = display_ip.and_then(|ip| {
+        crate::intel_gpu_xelpg_pipes::published_layout().filter(|l| l.state.ip == ip)
+    });
     let pipe_count = display_ip.map_or(4, crate::intel_gpu_xe2lpd::DisplayIp::pipe_count);
     for pipe in 0..pipe_count as u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
@@ -1187,17 +1192,20 @@ fn fetchers_with_cursor(
                 return Err(FsError::NoDevice);
             }
             if ctl & (1 << 31) != 0 {
+                let layout = external.as_ref().ok_or(FsError::Unsupported)?;
+                if plane != 1 || layout.state.requests[pipe as usize].is_none() {
+                    return Err(FsError::Unsupported);
+                }
+                let owned = layout.surfaces[pipe as usize].ok_or(FsError::Unsupported)?;
                 let surface = mmio.read32(0x7019c + pipe * 0x1000);
-                let routed = plane == 1
-                    && external[pipe as usize].is_some_and(|owned| {
-                        owned == surface
-                            && !(GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END)
-                                .contains(&u64::from(owned))
-                    });
-                if surface == u32::MAX {
+                let live = mmio.read32(0x701ac + pipe * 0x1000);
+                if surface == u32::MAX || live == u32::MAX {
                     return Err(FsError::NoDevice);
                 }
-                if !routed {
+                if surface != owned
+                    || live != owned
+                    || (GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(owned))
+                {
                     return Err(FsError::Unsupported);
                 }
             }
@@ -1284,15 +1292,7 @@ impl Display {
     /// installed. Wildcat Lake must remain 30.02 instead of being rebuilt
     /// from its broad Panther Lake graphics generation.
     pub(crate) fn integrated_display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
-        if self.platform.discrete_display.is_some() {
-            return None;
-        }
-        match self.generation {
-            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
-                Some(resource_ip(&self.platform, self.generation))
-            }
-            _ => None,
-        }
+        self.platform.integrated_display_ip()
     }
 
     /// Admission epoch is published by the GT owner after reset recovery;
@@ -1677,23 +1677,18 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
         lost.store(true, Ordering::Release);
     }
 }
-/// Retire an owned Meteor Lake external route, its hotplug sources and its
-/// publication for this BAR (`intel_gpu::retire_mtl_external`). Other
-/// generations return before any register access.
-fn retire_mtl_external(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
-    crate::intel_gpu::retire_mtl_external(bar)
-}
-
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     // Display-14 suspend: DC states exited and held off for the whole
     // preparation; the DMC program is disabled only once it succeeded.
     crate::intel_gpu_dc_states::suspend_begin_for_bar(bar).map_err(|_| FsError::Busy)?;
     let result = async {
         crate::intel_gpu::retire_external_sst(bar).await?;
-        retire_mtl_external(bar)?;
         if let Some(display) = display_for_bar(bar) {
             display.quiesce().await?;
         }
+        // The restored panel has closed admission to both users and hotplug
+        // before the last external route is retired for suspend.
+        crate::intel_gpu::retire_mtl_external(bar).await?;
         if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
             // A failed system-PM prepare hook is not resumed by the coordinator.
             // Attempt a fully verified replay while the original video is live;
@@ -1710,7 +1705,7 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
 
 pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     crate::intel_gpu::retire_external_sst(bar).await?;
-    retire_mtl_external(bar)?;
+    crate::intel_gpu::retire_mtl_external(bar).await?;
     if let Some(display) = display_for_bar(bar) {
         display.recover().await?;
     }
@@ -2207,6 +2202,9 @@ impl<M: Platform> Device<M> {
     /// next call; the repartition preserves every register it verifies.
     pub(crate) fn external_pass(&self) -> Result<ExternalPass<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
+        if state.blocked || state.failed || self.platform.reset_lost() {
+            return Err(FsError::Busy);
+        }
         let _power = self.platform.display_power()?;
         let mut guard = Guard {
             device: self,
@@ -2230,6 +2228,44 @@ impl<M: Platform> Device<M> {
             guard,
             bracket: None,
         })
+    }
+
+    /// Suspend and reset recovery run outside the GT mutex. Keep the panel
+    /// owner through external stop/repartition, including when the hotplug
+    /// actor has only just finished bringing a route up.
+    pub(crate) async fn external_retirement(
+        &self,
+        routes_stopped: impl FnOnce() -> bool,
+    ) -> Result<ExternalPass<'_, M>, FsError> {
+        let state = self.state.lock().await;
+        let _power = self.platform.display_power()?;
+        let mut pass = ExternalPass {
+            guard: Guard {
+                device: self,
+                state,
+                _power,
+                _rpm: None,
+            },
+            bracket: None,
+        };
+        // On GT loss the display recovery owner handles its retained
+        // fetchers with a fresh MMIO view. The old panel proofs are stale.
+        if routes_stopped() || self.platform.reset_lost() {
+            return Ok(pass);
+        }
+        if pass.guard.state.failed {
+            return Err(FsError::NoDevice);
+        }
+        let state = &pass.guard.state;
+        if state.joint.is_some()
+            || state.dsb.as_ref().is_some_and(|dsb| dsb.armed())
+            || state.color.as_ref().is_some_and(|color| color.pending())
+        {
+            pass.guard.finish_color().await?;
+        }
+        pass.guard.finish_pending().await?;
+        pass.pre_update();
+        Ok(pass)
     }
 }
 
@@ -2424,7 +2460,10 @@ impl<M: Platform> Guard<'_, M> {
     /// Recheck before publishing a hardware transaction. The synchronous GT
     /// loss path can poison a busy session without acquiring this mutex.
     pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
-        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+        // Session admission checks `blocked` under this same mutex. A PM
+        // guard must still be able to finish an already armed frame after
+        // the legacy drain closed admission.
+        if self.state.failed || self.device.platform.reset_lost() {
             return Err(FsError::NoDevice);
         }
         // A dark panel has no console scanout to prove: its retained owners

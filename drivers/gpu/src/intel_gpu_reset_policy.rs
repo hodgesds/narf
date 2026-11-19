@@ -142,10 +142,16 @@ impl ResetPolicy {
             add(base + 0x4d0 + slot * 4, 0);
         }
         if self.platform.is_xe2() {
-            // Wa16021639441 + Priority_Mem_Read, and Wa16023105232,
-            // use ENGINE_BASE for each physical RCS/CCS/COPY instance.
+            // Priority_Mem_Read and, where applicable, Wa16021639441.
             add(base + 0xd4, 1);
+        }
+        if crate::intel_gpu_gt_registers::disable_rc_sema_idle_msg(self.graphics) {
             add(base + 0x50, 1);
+        }
+        // xe_guc_ads.c adds this unmasked register for the separate OOB
+        // workaround even if the firmware already programmed a valid delay.
+        if crate::intel_gpu_gt_registers::adjust_ring_idle_delay(self.graphics) {
+            add(base + crate::intel_gpu_gt_registers::RING_IDLEDLY, 0);
         }
         // RCS0 is the first render/compute engine and therefore owns all
         // shared engine-reset-domain state. Never duplicate it on each CCS.

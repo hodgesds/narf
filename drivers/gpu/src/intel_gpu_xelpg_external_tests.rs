@@ -28,10 +28,12 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 #[derive(Debug)]
 pub struct Sink {
     caps: [u8; 16],
+    extended_caps: Option<[u8; 15]>,
     edid: Vec<u8>,
     i2c_ptr: usize,
     lanes_set: u8,
     pattern: u8,
+    training_writes: Vec<(u32, u8)>,
     cr_locked: bool,
     eq_locked: bool,
     polls: u32,
@@ -48,6 +50,8 @@ pub struct Sink {
     pub fec_config: u8,
     pub dsc_enable: u8,
     pub fec_status: u8,
+    /// Inject NACKs on DP_FEC_STATUS reads while the link is trained.
+    fec_status_nacks: u8,
     /// Native writes to the DSC/FEC registers, in order.
     pub dsc_log: Vec<(u32, u8)>,
 }
@@ -60,10 +64,12 @@ impl Sink {
         caps[2] = 4 | 0x40 | 0x80;
         Self {
             caps,
+            extended_caps: None,
             edid,
             i2c_ptr: 0,
             lanes_set: 0,
             pattern: 0,
+            training_writes: Vec::new(),
             cr_locked: false,
             eq_locked: false,
             polls: 0,
@@ -76,12 +82,19 @@ impl Sink {
             fec_config: 0,
             dsc_enable: 0,
             fec_status: 0,
+            fec_status_nacks: 0,
             dsc_log: Vec::new(),
         }
     }
     pub fn drop_lock(&mut self) {
         self.cr_locked = false;
         self.eq_locked = false;
+    }
+    pub(super) fn training_writes_to(&self, reg: u32) -> Vec<u8> {
+        self.training_writes
+            .iter()
+            .filter_map(|&(r, v)| (r == reg).then_some(v))
+            .collect()
     }
     fn lanes_ok(&self) -> bool {
         self.max_good_lanes == 0 || self.lanes_set <= self.max_good_lanes
@@ -115,15 +128,7 @@ impl Sink {
             0x090 => self.fec_cap,
             0x120 => self.fec_config,
             0x160 => self.dsc_enable,
-            // The decoder reports FEC once the source sends it (ready, and
-            // the link trained).
-            0x280 => {
-                if self.fec_config & 1 != 0 && self.eq_locked {
-                    self.fec_status | 1
-                } else {
-                    self.fec_status
-                }
-            }
+            0x280 => self.fec_status,
             _ => 0,
         }
     }
@@ -134,10 +139,12 @@ impl Sink {
                 self.polls = 0;
             }
             0x101 => {
+                self.training_writes.push((addr, value));
                 self.lanes_set = value & 0x1F;
                 self.drop_lock();
             }
             0x102 => {
+                self.training_writes.push((addr, value));
                 self.pattern = value & 0x7;
                 self.polls = 0;
             }
@@ -165,6 +172,10 @@ impl Sink {
         }
         let cmd = wire[0] >> 4;
         let addr = (((wire[0] & 0xF) as u32) << 16) | ((wire[1] as u32) << 8) | wire[2] as u32;
+        if cmd == 0x9 && addr == dsc::DP_FEC_STATUS && self.fec_status_nacks != 0 {
+            self.fec_status_nacks -= 1;
+            return alloc::vec![0x10];
+        }
         if cmd & 0x8 == 0 && addr != 0x50 {
             return alloc::vec![0x40];
         }
@@ -172,6 +183,14 @@ impl Sink {
             return alloc::vec![0x00];
         }
         let len = wire[3] as usize + 1;
+        if cmd == 0x9 && addr == 0x2200 {
+            if let Some(extended) = self.extended_caps.filter(|caps| len == caps.len()) {
+                let mut reply = alloc::vec![0x00];
+                reply.extend_from_slice(&extended);
+                return reply;
+            }
+            return alloc::vec![0x10];
+        }
         match cmd {
             0x8 => {
                 for i in 0..len {
@@ -317,6 +336,12 @@ pub struct ExtFake {
     /// No TRANSCONF ever acknowledges a disable.
     pub pipeconf_stuck: Cell<bool>,
     pub act_stuck: Cell<bool>,
+    /// Number of FEC rising edges the source will fail to acknowledge.
+    fec_missed_enables: Cell<u8>,
+    /// Override Pipe B's transport status after FEC has been disabled.
+    fec_stop_status: Cell<Option<u32>>,
+    /// Drop Pipe B's live FEC indication on enabling this register.
+    fec_drop_on_enable: Cell<Option<u64>>,
     frames: [Cell<u32>; 4],
     /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
     /// primary `PLANE_SURF` write: (register, enabled).
@@ -367,6 +392,9 @@ impl ExtFake {
             confs: Default::default(),
             pipeconf_stuck: Cell::new(false),
             act_stuck: Cell::new(false),
+            fec_missed_enables: Cell::new(0),
+            fec_stop_status: Cell::new(None),
+            fec_drop_on_enable: Cell::new(None),
             frames: Default::default(),
             irq_log: RefCell::new(Vec::new()),
             sink: RefCell::new(sink),
@@ -482,7 +510,9 @@ impl ExtFake {
             };
             let correct = (0..4).any(|pipe| {
                 let source = self.phy.read32(0x60540 + pipe * 0x1000);
-                source & (1 << 31) != 0 && (source >> 8) & 7 == expected
+                source & (1 << 31) != 0
+                    && (source >> 8) & 7 == expected
+                    && (source & (1 << 7) != 0) == (wire[4] & (1 << 5) != 0)
             });
             if !correct {
                 self.aux_done
@@ -513,6 +543,13 @@ impl MmioWindow for ExtFake {
             return self.phy.read32(off) & !crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_RUN_BUSY;
         }
         if (0..4).any(|p| off == 0x60544 + p * 0x1000) {
+            if off == DP_TP_CTL_B + 4
+                && self.phy.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE == 0
+            {
+                if let Some(status) = self.fec_stop_status.get() {
+                    return status;
+                }
+            }
             let mut value = self.phy.read32(off);
             if self.phy.read32(off - 4) & (7 << 8) == 2 << 8 {
                 value |= 1 << 25;
@@ -628,6 +665,32 @@ impl MmioWindow for ExtFake {
             return;
         }
         self.writes.borrow_mut().push((off, value));
+        if self.fec_drop_on_enable.get() == Some(off) && value & ENABLE != 0 {
+            let status = DP_TP_CTL_B + 4;
+            self.phy.write32(
+                status,
+                self.phy.read32(status) & !dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            );
+        }
+        if (0..4).any(|p| off == 0x60540 + p * 0x1000)
+            && (self.phy.read32(off) ^ value) & dsc::DP_TP_CTL_FEC_ENABLE != 0
+        {
+            let mut status = self.phy.read32(off + 4) & !dsc::DP_TP_STATUS_FEC_ENABLE_LIVE;
+            if value & dsc::DP_TP_CTL_FEC_ENABLE != 0 {
+                if self.fec_missed_enables.get() == 0 {
+                    status |= dsc::DP_TP_STATUS_FEC_ENABLE_LIVE;
+                    let mut sink = self.sink.borrow_mut();
+                    if sink.eq_locked && sink.fec_config & 1 != 0 {
+                        // DP_FEC_DECODE_EN_DETECTED is latched until W1C.
+                        sink.fec_status |= 1;
+                    }
+                } else {
+                    self.fec_missed_enables
+                        .set(self.fec_missed_enables.get() - 1);
+                }
+            }
+            self.phy.write32(off + 4, status);
+        }
         if (0..4).any(|p| off == 0x60400 + p * 0x1000)
             && (self.phy.read32(off) ^ value) & (1 << 8) != 0
             && !self.act_stuck.get()
@@ -1195,6 +1258,148 @@ kernel_test_in!(
     smoke_mtl_external_lane_fallback_retries_at_trained_width
 );
 
+fn smoke_xe3_usb_c_uses_receiver_training_patterns() -> TestResult {
+    for (ip, revision, lane_cap, spread_cap, expected_rate, expected_patterns) in [
+        // The extended block supplies TPS4. CR fails at four lanes, then
+        // succeeds at two; the final modeset retries that trained width.
+        (
+            DisplayIp::Xe3Lpd,
+            0x14,
+            4,
+            0x80,
+            TrainRate::Rbr,
+            &[0x21, 0, 0x21, 7, 0, 0x21, 7, 0][..],
+        ),
+        // The TPS4 bit is reserved before DPCD 1.4.
+        (
+            DisplayIp::WildcatLake,
+            0x13,
+            0xc1,
+            0x80,
+            TrainRate::Hbr2,
+            &[0x21, 0x23, 0][..],
+        ),
+        // Some HBR2 receivers do not advertise TPS3.
+        (
+            DisplayIp::WildcatLake,
+            0x14,
+            1,
+            0,
+            TrainRate::Hbr2,
+            &[0x21, 0x22, 0][..],
+        ),
+    ] {
+        let fallback = expected_rate == TrainRate::Rbr;
+        let edid = if fallback { edid_1024() } else { edid_1080() };
+        let mut sink = Sink::new(0x14, edid);
+        let mut caps = [0; 15];
+        caps[..4].copy_from_slice(&[revision, 0x14, lane_cap, spread_cap]);
+        if fallback {
+            sink.caps[2] = 0x84;
+            sink.caps[14] = 0x80;
+            sink.extended_caps = Some(caps);
+            sink.max_good_lanes = 2;
+        } else {
+            sink.caps[..15].copy_from_slice(&caps);
+        }
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        let Some(panel) = io.light_panel_ip(ip) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        let mut service = MtlExternalService::new();
+        service.set_profile(ExternalDisplayProfile::for_ip(ip));
+        service.set_display(MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        });
+        let result = service.handle(
+            &io,
+            tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt)),
+            &mut fb_for,
+        );
+        if !matches!(result, ServiceOutcome::Activated { pipe: Pipe::B, .. }) {
+            return TestResult::Fail("the USB-C receiver must train and reach scanout");
+        }
+        let Some(MtlRoute::Dp(route)) = service.route() else {
+            return TestResult::Fail("the service must own the trained DP route");
+        };
+        assert_eq!(route.trained.rate, expected_rate);
+        assert_eq!(
+            io.sink.borrow().training_writes_to(0x102),
+            expected_patterns
+        );
+        let expected_lanes = match (fallback, lane_cap & 0x80 != 0) {
+            (true, _) => &[4, 2, 2][..],
+            (false, true) => &[0x81],
+            (false, false) => &[1],
+        };
+        assert_eq!(io.sink.borrow().training_writes_to(0x101), expected_lanes);
+        let enhanced = lane_cap & 0x80 != 0;
+        assert!(io
+            .writes_to(DP_TP_CTL_B)
+            .iter()
+            .filter(|v| **v & ENABLE != 0)
+            .all(|v| (v & (1 << 18) != 0) == enhanced));
+        assert!(service.teardown(&io));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_usb_c_uses_receiver_training_patterns
+);
+
+fn smoke_xe3_usb_c_receiver_training_poll_intervals() -> TestResult {
+    use crate::intel_gpu_modeset::training::{Change, State, TrainingAux};
+    for (rev, interval, width, expected) in [
+        (0x12, 0x80, 2, &[100, 400][..]),
+        (0x12, 0x82, 2, &[8_000, 8_000][..]),
+        // Above the specified interval range Linux still waits the reported duration.
+        (0x12, 0x85, 2, &[20_000, 20_000][..]),
+        // Five CR polls at four lanes fail. The two-lane retry needs one CR
+        // and one EQ poll, with the DP 1.4 fixed CR delay on both attempts.
+        (0x14, 0x82, 4, &[100, 100, 100, 100, 100, 100, 8_000][..]),
+    ] {
+        let mut sink = Sink::new(0x06, edid_1024());
+        sink.caps[0] = rev;
+        sink.caps[14] = 0x80;
+        let mut extended = [0; 15];
+        extended.copy_from_slice(&sink.caps[..15]);
+        extended[14] = interval;
+        sink.extended_caps = Some(extended);
+        sink.max_good_lanes = 2;
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        let mut aux = IntelAux::xelpdp(&io, io.port.aux_base(), false);
+        aux_power_enable(&io, io.port).unwrap();
+        let caps = crate::dp_link_training::read_caps(&mut aux).unwrap();
+        let receiver = ReceiverTraining::for_receiver(&caps, 0, false);
+        let mut aux = TrainingAux::new(
+            aux,
+            State::new(crate::intel_gpu_pll::LinkRate::DpRbr, width),
+            |state: &State, change| {
+                if change == Change::Pattern {
+                    io.phy.write32(DP_TP_CTL_B, ENABLE | state.pattern_bits()?);
+                }
+                Ok(())
+            },
+        );
+        let delays = RefCell::new(Vec::new());
+        let result =
+            train_link_with_receiver(&mut aux, TrainRate::Rbr, width, Some(receiver), |us| {
+                delays.borrow_mut().push(us)
+            })
+            .unwrap();
+        assert_eq!(result.lanes, 2);
+        assert_eq!(delays.borrow().as_slice(), expected);
+        aux_power_disable(&io, io.port).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_usb_c_receiver_training_poll_intervals
+);
+
 fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     if probe_sink(&NoAccess, Generation::TigerLake, XeLpgPort::Tc1, false).err()
         != Some(ExternalError::UnsupportedGeneration)
@@ -1312,6 +1517,69 @@ fn smoke_mtl_external_probe_failures_roll_back_type_c() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_probe_failures_roll_back_type_c
+);
+
+fn smoke_tc_dp_extended_receiver_caps() -> TestResult {
+    // Linux selects the entire extension at equal or newer revision, even
+    // when the base revision predates DP 1.3. SSC uses the same snapshot.
+    for (base_rev, ext_rev, use_extended) in
+        [(0x12, 0x14, true), (0x14, 0x14, true), (0x14, 0x13, false)]
+    {
+        let mut sink = Sink::new(0x14, edid_1024());
+        sink.caps[0] = base_rev;
+        sink.caps[14] = 0x82;
+        let mut extended = [0; 15];
+        extended[..4].copy_from_slice(&[ext_rev, 0x0a, 0x82, 1]);
+        extended[7] = 0x40;
+        extended[14] = 1;
+        sink.extended_caps = Some(extended);
+        let io = ExtFake::new(XeLpgPort::Tc1, sink);
+        let Ok(probe) = probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("USB-C sink with extended capabilities should probe");
+        };
+        let expected = if use_extended {
+            (ext_rev, TrainRate::Hbr, 2, 4_000)
+        } else {
+            (base_rev, TrainRate::Hbr2, 4, 8_000)
+        };
+        let caps = probe.caps;
+        assert_eq!(
+            (
+                caps.dpcd_rev,
+                caps.max_rate,
+                caps.max_lanes,
+                caps.aux_rd_interval_us()
+            ),
+            expected
+        );
+        assert_eq!(probe.negotiated.lanes, caps.max_lanes);
+        assert_eq!(probe.ssc, use_extended);
+        assert_eq!(caps.msa_timing_par_ignored, use_extended);
+    }
+
+    for (rev, error) in [
+        (0x14, crate::dp_aux::AuxError::Nacked),
+        (0, crate::dp_aux::AuxError::InvalidDpcdRevision),
+    ] {
+        let mut sink = Sink::new(0x14, edid_1024());
+        sink.caps[0] = rev;
+        sink.caps[14] = 0x80;
+        let io = ExtFake::new(XeLpgPort::Tc1, sink);
+        assert_eq!(
+            probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false).err(),
+            Some(ExternalError::Link(LinkError::AuxFailure(error)))
+        );
+        assert_eq!(
+            io.read32(XeLpgPort::Tc1.buf_ctl1()) & (TC_PHY_OWNERSHIP | TCSS_POWER_REQUEST),
+            0
+        );
+        assert!(!io.aux_power.get());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_tc_dp_extended_receiver_caps
 );
 
 fn smoke_mtl_external_unplug_mid_activation_and_failed_stop() -> TestResult {
@@ -2848,16 +3116,26 @@ fn dsc_monitor(fec: bool) -> Sink {
     sink
 }
 
+// One HBR lane cannot carry 1080p60 even at 6 bpc, forcing DSC with FEC.
+fn compressed_tc(nacks: u8) -> ExtFake {
+    let mut sink = dsc_monitor(true);
+    sink.edid = edid_1080();
+    sink.caps[1] = 0x0a;
+    sink.fec_status_nacks = nacks;
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    io
+}
+
 fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
     use crate::intel_gpu_xelpg_dsc::{
         decide_dp, DpDscSink, DscDpcd, DscSink, LinkDecision, LinkLimits, DP_TP_CTL_FEC_ENABLE,
-        DP_TP_STATUS_FEC_ENABLE_LIVE, PIPE_BPP,
+        PIPE_BPP,
     };
     // 594 MHz needs 1782000 kBps at 24 bpp and 1336500 at 18; one HBR3
     // lane carries 810000. Linux compresses with FEC: 169/16 bpp, two
     // slices on two engines, HBR3 x1.
     let io = ExtFake::new(XeLpgPort::B, dsc_monitor(true));
-    io.phy.write32(0x6_1544, DP_TP_STATUS_FEC_ENABLE_LIVE);
     let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("the DSC monitor must probe"),
@@ -2973,6 +3251,237 @@ fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_dsc_with_fec_lights_and_stops
+);
+
+fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
+    for (ip, missed, nacks, expected_enables) in [
+        (DisplayIp::Xe2Lpd, 1, 0, 1),
+        (DisplayIp::Xe3Lpd, 1, 0, 2),
+        (DisplayIp::WildcatLake, 0, 1, 2),
+        (DisplayIp::WildcatLake, 0, 4, 4),
+    ] {
+        let io = compressed_tc(nacks);
+        io.fec_missed_enables.set(missed);
+        let Some(panel) = io.light_panel_ip(ip) else {
+            return TestResult::Fail("could not light the panel for the FEC fixture");
+        };
+        let probe =
+            match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), io.port, false)
+                .and_then(|link| probe_sink_link(&io, link))
+            {
+                Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
+                _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
+            };
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let result = activate(&io, probe, fb, &display);
+        if io
+            .sink
+            .borrow()
+            .dsc_log
+            .iter()
+            .filter(|&&(addr, value)| addr == 0x280 && value == 3)
+            .count()
+            != 1
+        {
+            return TestResult::Fail(
+                "clear the sink's FEC detected flags once when setting FEC_READY",
+            );
+        }
+        let pps = io.first_write(|off, _| off == 0x6_1350);
+        let mut enabled = false;
+        let mut rising = 0;
+        // A successful handshake precedes the first PPS. On a failure all
+        // attempts precede rollback, which only clears FEC.
+        for &(off, value) in io.writes.borrow().iter().take(pps.unwrap_or(usize::MAX)) {
+            if off == DP_TP_CTL_B {
+                let next = value & dsc::DP_TP_CTL_FEC_ENABLE != 0;
+                rising += usize::from(next && !enabled);
+                enabled = next;
+            }
+        }
+        if rising != expected_enables {
+            return TestResult::Fail("wrong number of FEC enables before the first PPS");
+        }
+        if nacks == 4 {
+            let Err(ActivateError::Failed(route, ExternalError::FecNotReady)) = result else {
+                return TestResult::Fail("the fourth failed FEC handshake must roll back");
+            };
+            if pps.is_some()
+                || io
+                    .first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0)
+                    .is_some()
+                || route.state() != RouteState::Stopped
+                || route.reserved()
+                || io.sink.borrow().fec_config != 0
+                || io.sink.borrow().dsc_enable != 0
+                || route.release(&io).is_err()
+            {
+                return TestResult::Fail("failed FEC must leave the compressed stream stopped");
+            }
+        } else {
+            let Ok(mut route) = result else {
+                return TestResult::Fail(
+                    "the compressed route must activate after its FEC sequence",
+                );
+            };
+            if pps.is_none() || !enabled || route.stop(&io).is_err() || route.release(&io).is_err()
+            {
+                return TestResult::Fail("the compressed route must send PPS and stop cleanly");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_confirms_fec_before_pps
+);
+
+fn fec_service(io: &ExtFake, ip: DisplayIp, dmc: &'static DmcEvents) -> Option<MtlExternalService> {
+    let mut service = MtlExternalService::new();
+    service.set_profile(ExternalDisplayProfile::for_ip(ip));
+    service.set_display(beside(io.light_panel_ip(ip)?, dmc));
+    Some(service)
+}
+
+fn tc2_event(kind: MtlHpdKind) -> MtlHpdEvent {
+    MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind,
+    }
+}
+
+fn smoke_xe3_external_dsc_requires_live_fec_through_scanout() -> TestResult {
+    for (ip, drop_on) in [
+        (DisplayIp::Xe3Lpd, PIPECONF_B),
+        (DisplayIp::WildcatLake, PLANE_CTL_1_B),
+    ] {
+        let io = compressed_tc(0);
+        let dmc = DmcEvents::leak();
+        let Some(mut service) = fec_service(&io, ip, dmc) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        io.fec_drop_on_enable.set(Some(drop_on));
+        let result = service.handle(
+            &io,
+            tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt)),
+            &mut fb_for,
+        );
+        if !matches!(
+            result,
+            ServiceOutcome::Refused {
+                error: RouteError::Dp(ExternalError::FecNotReady),
+                ..
+            }
+        ) || service.route().is_some()
+            || io.writes_to(0x6_1350).is_empty()
+            || io
+                .first_write(|r, v| r == PIPECONF_B && v & ENABLE != 0)
+                .is_none()
+            || io
+                .first_write(|r, v| r == PLANE_CTL_1_B && v & ENABLE != 0)
+                .is_some()
+                != (drop_on == PLANE_CTL_1_B)
+            || io.read32(TRANS_CLK_SEL_B) != 0
+            || io.aux_power.get()
+            || dmc.events() != [(1, true), (1, false)]
+            || !panel_never_blanked(&io)
+        {
+            return TestResult::Fail(
+                "lost source FEC must withdraw the compressed stream before publication",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_requires_live_fec_through_scanout
+);
+
+fn smoke_xe3_external_dsc_retains_clock_until_fec_stops() -> TestResult {
+    for (ip, stop_status, error, rollback) in [
+        (
+            DisplayIp::Xe3Lpd,
+            dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            ExternalError::FecStopTimeout,
+            false,
+        ),
+        (
+            DisplayIp::WildcatLake,
+            u32::MAX,
+            ExternalError::AccessLost,
+            false,
+        ),
+        (
+            DisplayIp::WildcatLake,
+            dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            ExternalError::FecStopTimeout,
+            true,
+        ),
+    ] {
+        let io = compressed_tc(u8::from(rollback));
+        let dmc = DmcEvents::leak();
+        let Some(mut service) = fec_service(&io, ip, dmc) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        if rollback {
+            io.fec_stop_status.set(Some(stop_status));
+        }
+        let connect = tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt));
+        let disconnect = tc2_event(MtlHpdKind::Disconnected);
+        let mut outcome = service.handle(&io, connect, &mut fb_for);
+        if !rollback {
+            if !matches!(outcome, ServiceOutcome::Activated { pipe: Pipe::B, .. }) {
+                return TestResult::Fail("the compressed route must light before the forced stop");
+            }
+            io.fec_stop_status.set(Some(stop_status));
+            outcome = service.handle(&io, disconnect, &mut fb_for);
+        }
+        if !matches!(outcome, ServiceOutcome::Retained { error: RouteError::Dp(e), .. } if e == error)
+            || !matches!(service.route(), Some(MtlRoute::Dp(r)) if r.state() == RouteState::Quarantined && r.reserved())
+            || io.read32(DP_TP_CTL_B) & (DP_TP_CTL_ENABLE | dsc::DP_TP_CTL_FEC_ENABLE) != 0
+            || io.read32(TRANS_CLK_SEL_B) == 0
+            || io.read32(io.port.buf_ctl1()) & TC_PHY_OWNERSHIP == 0
+            || !io.aux_power.get()
+            || dmc.events() != [(1, true)]
+        {
+            return TestResult::Fail(
+                "an unproven FEC stop must retain the pipe, clock, Type-C and AUX",
+            );
+        }
+        io.writes.borrow_mut().clear();
+        if !matches!(service.handle(&io, disconnect, &mut fb_for), ServiceOutcome::Retained { error: RouteError::Dp(e), .. } if e == error)
+            || !io.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("a retry while FEC is unproven may only sample source status");
+        }
+        io.fec_stop_status.set(None);
+        io.sink.borrow_mut().nack_all = true; // A detached sink cannot acknowledge AUX.
+        if !matches!(
+            service.handle(&io, disconnect, &mut fb_for),
+            ServiceOutcome::Withdrawn { .. }
+        ) || service.route().is_some()
+            || io.read32(TRANS_CLK_SEL_B) != 0
+            || io.read32(io.port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+            || io.aux_power.get()
+            || dmc.events() != [(1, true), (1, false)]
+            || !panel_never_blanked(&io)
+        {
+            return TestResult::Fail(
+                "after source FEC stops the same reservation must release on unplug",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_retains_clock_until_fec_stops
 );
 
 fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {

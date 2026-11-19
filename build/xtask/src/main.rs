@@ -5418,8 +5418,8 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
     // aarch64 needs it while generating the device tree, which has to declare
     // where the blob lands.
     //
-    // Best-effort throughout. A failure here leaves the guest without the file
-    // and its smokes skip, exactly as on an image built without it.
+    // A fixture build error is reported here. The Intel loader smoke also
+    // fails if selected without its fixture in the staged initramfs.
     if args.features.contains("kernel-test") {
         let build_fixture = |compress| {
             let ko_args = BuildModuleArgs {
@@ -5455,6 +5455,10 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             }
             Ok(_) => {}
             Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
+        }
+        match build_module_fixture("narf-drivers-gpu-intel", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/intel_gpu.ko".into(), bytes)),
+            Err(e) => println!("xtask: Intel GPU driver module unavailable ({e})"),
         }
     }
 

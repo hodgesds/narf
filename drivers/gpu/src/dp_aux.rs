@@ -84,6 +84,8 @@ pub enum AuxError {
     Nacked,
     /// Sink wants the source to back off and retry.
     Deferred,
+    /// The receiver returned a zero DPCD revision during capability discovery.
+    InvalidDpcdRevision,
 }
 
 /// One pending AUX transaction. `data` is the write payload for
@@ -219,6 +221,12 @@ pub trait AuxChannel {
         // Reply buffer = 1 status + n data bytes.
         let mut reply = [0u8; 17];
         let resp = self.transact(&req, &mut reply[..1 + n])?;
+        match resp.status {
+            AuxStatus::Ack if resp.data.len() == n => {}
+            AuxStatus::Ack => return Err(AuxError::ShortReply),
+            AuxStatus::Nack | AuxStatus::I2cNack => return Err(AuxError::Nacked),
+            AuxStatus::Defer | AuxStatus::I2cDefer => return Err(AuxError::Deferred),
+        }
         buf.copy_from_slice(resp.data);
         Ok(())
     }

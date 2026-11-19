@@ -1884,9 +1884,10 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
             ); //2MiB minus source reserve
             let ads = d.memory[&0x20001000].borrow();
             assert_eq!(
-                &ads[0x3000 / 4..0x3000 / 4 + 6],
-                &[0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                &ads[0x3000 / 4..0x3000 / 4 + 7],
+                &[0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000]
             );
+            assert_eq!(ads[0x11ac / 4], 28);
             assert_eq!(d.regs[&0xe48c] & 0x200, 0x200);
             assert_eq!(d.regs[&0xe4c4] & 0x1840, 0x840);
             assert_eq!(d.regs[&0x24d0], 0x23fc);
@@ -1897,7 +1898,7 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
         for engine in gt.engines().unwrap().iter() {
             assert_eq!(
                 ads_registers(&w, engine).len(),
-                if engine == Engine::Rcs0 { 28 } else { 18 }
+                if engine == Engine::Rcs0 { 29 } else { 19 }
             );
         }
 
@@ -1962,31 +1963,48 @@ kernel_test_in!(
     smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion
 );
 
-fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -> TestResult {
+fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -> TestResult {
     use crate::intel_gpu_engine::Engine;
-    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
     for device in [
         0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-        0xb0b0,
+        0xb0a1, 0xb0b0, 0xfd80, 0xfd81, 0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745, 0xd74a,
+        0xd74b,
     ] {
-        for (release, step) in [(0u32, 0u32), (0, 4), (1, 0)] {
+        let (platform, versions) = match device {
+            0xfd80 | 0xfd81 => (GtPlatform::WildcatLake, [(3, 0), (4, 0), (5, 0)]),
+            0xd740..=0xd745 | 0xd74a | 0xd74b => (GtPlatform::NovaLakeS, [(3, 0), (4, 0), (5, 0)]),
+            _ => (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+                [(0, 0), (0, 4), (1, 0)],
+            ),
+        };
+        for (release, step) in versions {
             let (w, arena, mut gt) = hardware_model_with_identity(platform, 0xdfc, 1, Some(device));
             {
                 let mut d = w.0.borrow_mut();
+                *d.regs.get_mut(&0x380d8c).unwrap() |= step;
                 d.regs.extend([
                     (0xd8c, 30 << 22 | release << 14 | step),
+                    (0x6210, 0xa4000001),
+                    (0x7300, 0x0400),
+                    (0xd00, 0x1e), // 25 MHz crystal, 640 ns per idle-delay tick
                     (0x913c, 0),
                     (0x9150, 0),
                     (0x9154, 0x80000000),
                     (0x9144, 0),
                     (0x9148, 0x80000000),
                     (0x914c, 0),
-                    (0x380d8c, 30 << 22 | step),
                     // XE2_NODE_ENABLE_MASK nodes 0-1 over the harness's
                     // MEML3 nibble; MIRROR_L3BANK_ENABLE without bank 1.
                     (0x9118, 0x0003_0001),
                     (0x9130, 0xfd),
                 ]);
+                for base in [
+                    0x2000, 0x22000, 0x3ee000, 0x1a000, 0x1c000, 0x1e000, 0x26000,
+                ] {
+                    d.regs
+                        .extend([(base + 0x23c, 0xc020_0020), (base + 0x54, 20)]);
+                }
             }
             hardware_discovery(&mut gt, &w, 0xdfc);
             hardware_scheduling_reload_mode(&mut gt, &w, 4);
@@ -2041,10 +2059,13 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 ); //2MiB minus source reserve
                 let ads = d.memory[&0x20001000].borrow();
                 let expected_klvs: &[u32] = if release == 0 && step < 4 {
-                    &[0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                    &[
+                        0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000,
+                    ]
                 } else {
-                    &[0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                    &[0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000]
                 };
+                assert_eq!(ads[0x11ac / 4] as usize, expected_klvs.len() * 4);
                 assert_eq!(
                     &ads[0x3000 / 4..0x3000 / 4 + expected_klvs.len()],
                     expected_klvs
@@ -2074,23 +2095,45 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     (0x6210, 0x62a8, 0x1000dafc, 0x1000db01, 0xdb1c)
                 );
                 assert_eq!(d.regs[&0x20d4] & 0xc080, 0x80);
+                assert_eq!(
+                    d.regs[&0x7300], 0x1420,
+                    "render context windower filtering and SBE workaround"
+                );
+                assert_eq!(
+                    d.regs[&0x6210],
+                    if release == 0 && step < 4 {
+                        0xa4018011
+                    } else {
+                        0xa4000011
+                    },
+                    "FF_MODE after executing the golden render context"
+                );
                 assert!(!d.regs.contains_key(&0xb154)); // no LNL-only RW flush tuning
                 for reg in [0x220c4, 0x3ee0c4, 0x1a0c4, 0x1c0c4, 0x1e0c4, 0x260c4] {
                     assert_eq!(d.regs[&reg], 0x306);
                 }
             }
             for engine in gt.engines().unwrap().iter() {
+                let ring_psmi = engine.base() + 0x50;
+                let saves = ads_registers(&w, engine);
                 assert_eq!(
-                    ads_registers(&w, engine).len(),
-                    if engine == Engine::Rcs0 {
+                    w.0.borrow().writes.contains(&(u64::from(ring_psmi), 0x1000_1000)),
+                    release <= 1
+                );
+                assert_eq!(saves.contains_key(&ring_psmi), release <= 1);
+                assert_eq!(w.read32(u64::from(engine.base() + 0x23c)), 0x4020_0013);
+                assert_eq!(saves[&(engine.base() + 0x23c)].1, 0);
+                assert_eq!(
+                    saves.len(),
+                    (if engine == Engine::Rcs0 {
                         if release == 0 && step < 4 {
-                            27
+                            28
                         } else {
-                            25
+                            26
                         }
                     } else {
-                        18
-                    }
+                        19
+                    }) - usize::from(release > 1)
                 );
             }
 
@@ -2181,7 +2224,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     Ok(0)
                 );
             }
-            // LNL exposes only programmed noncompressed coherent policies.
+            // These integrated GTs expose the programmed coherent PAT entries.
             for pat in [0, 3, 6, 8, 15, 16, 31] {
                 assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
             }
@@ -2197,7 +2240,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe",
-    smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
+    smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
 );
 
 /// Negative publication: without `narf.intel.media_gt=1` (or before its

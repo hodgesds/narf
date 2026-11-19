@@ -69,6 +69,7 @@ pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
 pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
 pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
 pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
+pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
 pub const R_AARCH64_JUMP26: u32 = 282;
 pub const R_AARCH64_CALL26: u32 = 283;
 
@@ -263,10 +264,19 @@ pub fn apply_aarch64(
             let new = (cur & !(0x60000000 | 0x00FFFFE0)) | immlo | immhi;
             write_u32(dest, loc, new)
         }
-        R_AARCH64_ADD_ABS_LO12_NC => {
-            // 12-bit low slot of an ADD-imm or LDR-imm.
-            // Linux ref: `arch/arm64/kernel/module.c:381`.
-            let imm = (val & 0xFFF) as u32;
+        R_AARCH64_ADD_ABS_LO12_NC
+        | R_AARCH64_LDST32_ABS_LO12_NC
+        | R_AARCH64_LDST64_ABS_LO12_NC
+        | R_AARCH64_LDST128_ABS_LO12_NC => {
+            // Linux apply_relocate_add encodes the low page offset in
+            // units of the access width. _NC discards low alignment bits.
+            let shift = match ty {
+                R_AARCH64_ADD_ABS_LO12_NC => 0,
+                R_AARCH64_LDST32_ABS_LO12_NC => 2,
+                R_AARCH64_LDST64_ABS_LO12_NC => 3,
+                _ => 4,
+            };
+            let imm = ((val & 0xFFF) >> shift) as u32;
             let cur = read_u32_in(dest, loc)?;
             // Imm12 field is bits 10..21.
             let new = (cur & !(0xFFF << 10)) | (imm << 10);
@@ -310,23 +320,6 @@ pub fn apply_aarch64(
             let cur = read_u32_in(dest, loc)?;
             // imm16 occupies bits 20:5 of MOVZ/MOVK.
             let new = (cur & !(0xFFFF << 5)) | (imm << 5);
-            write_u32(dest, loc, new)
-        }
-        R_AARCH64_LDST32_ABS_LO12_NC => {
-            // 12-bit low slot, scaled by 4 for LDR/STR (32-bit).
-            // LLVM emits this for accesses to AtomicU32-backed module
-            // globals; the e1000 module is the first real fixture to carry
-            // the form. `_NC` deliberately discards the low alignment bits.
-            let imm = ((val & 0xFFF) >> 2) as u32;
-            let cur = read_u32_in(dest, loc)?;
-            let new = (cur & !(0xFFF << 10)) | (imm << 10);
-            write_u32(dest, loc, new)
-        }
-        R_AARCH64_LDST64_ABS_LO12_NC => {
-            // 12-bit low slot, scaled by 8 for LDR/STR (64-bit).
-            let imm = ((val & 0xFFF) >> 3) as u32;
-            let cur = read_u32_in(dest, loc)?;
-            let new = (cur & !(0xFFF << 10)) | (imm << 10);
             write_u32(dest, loc, new)
         }
         other => Err(RelocError::UnsupportedType(other)),

@@ -192,7 +192,9 @@ impl ContextSeed {
             _ if self.platform.is_xe3_lpg() => {
                 let mut entries = vec![
                     (0x6208, 0x00200020),
-                    (0x7300, 0x10001000),
+                    // xe_tuning.c Windower HW Filtering and Wa_22021007897
+                    // share the masked XEHP_COMMON_SLICE_CHICKEN4 register.
+                    (0x7300, 0x10201020),
                     (0x731c, 0x20002000),
                 ];
                 if self.graphics == 3000 && self.step < 4 {
@@ -241,14 +243,23 @@ impl ContextSeed {
         for (reg, value) in masked {
             words.extend_from_slice(&[reg, value]);
         }
-        if self.platform.is_lnl()
-            || (self.platform.is_xe3_lpg() && self.graphics == 3000 && self.step < 4)
-        {
+        if self.platform.is_xe3_lpg() {
+            // Linux 7.3-rc4 xe_wa.c Wa_14026781792: disable TE patch control
+            // in the golden render context. FF_MODE also carries the two mesh
+            // autostrip disables on 30.00 A-stepping. Write the merged mask
+            // from a live DSS so the other FF_MODE fields survive capture.
+            let bits = if self.graphics == 3000 && self.step < 4 {
+                0x18010
+            } else {
+                0x10
+            };
+            rmw(&mut words, 0x6210, bits, bits, self.dss);
+        } else if self.platform.is_lnl() {
             rmw(&mut words, 0x6210, 0x18000, 0x18000, self.dss);
         } else if self.graphics == 2001 {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
-        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_xe3_lpg() {
+        } else if self.platform != GtPlatform::Battlemage {
             if self.platform.is_dg2() {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
@@ -695,18 +706,18 @@ pub(crate) mod tests {
             assert_eq!((wire[29 + 63], wire[29 + 95]), (1, 1));
             let seed = ContextSeed::read(&w, platform, &topology, &config).unwrap();
             assert_eq!((seed.per_group, seed.dss), (8, 0x43870000)); // union's first live DSS63 =>7/7
-            let mut regs = BTreeMap::from([(0x6210, 0xa4000001), (0x731c, 1)]);
+            let mut regs = BTreeMap::from([(0x6210, 0xa4000001), (0x7300, 0x400), (0x731c, 1)]);
             let words = seed.commands();
             let (svg, used) = execute(&words, &mut regs);
             assert!(svg.is_empty()); // Wa14019789679 ends at graphics20.04
             assert_eq!(used, words.len());
             assert_eq!(
                 (regs[&0x6208], regs[&0x7300], regs[&0x731c]),
-                (0x20, 0x1000, 0x2001)
+                (0x20, 0x1420, 0x2001)
             );
             assert_eq!(regs[&0x2580], 2); // source WMTP-disabled fuse
             let early = release == 0 && step < 4;
-            assert_eq!(regs[&0x6210], if early { 0xa4018001 } else { 0xa4000001 });
+            assert_eq!(regs[&0x6210], if early { 0xa4018011 } else { 0xa4000011 });
             assert_eq!(
                 regs.get(&0x6204).copied().unwrap_or(0),
                 if early { 0x40 } else { 0 }

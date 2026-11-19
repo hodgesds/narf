@@ -1133,6 +1133,7 @@ fn smoke_xelpg_dsc_sink_caps_decompression_and_fec_ready() -> TestResult {
     }
     // eDP 1.3: no rate table or DSC read (intel_edp_get_dsc_sink_cap).
     let mut old = Sink::new();
+    old.dpcd[0] = 0x12;
     old.dpcd[0x700] = 0x02;
     old.dpcd[0x60] = 0x01;
     match EdpCaps::read(&mut old) {

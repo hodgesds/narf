@@ -168,7 +168,10 @@ state by this token; module identity or PCI vendor/device IDs alone cannot
 select a device instance.
 
 An in-tree dual-build driver declares one static registration path for the
-kernel image and one C-ABI registration path for a `.ko`. Built-in code and
+kernel image and one C-ABI registration path for a `.ko`. A driver with
+multiple PCI matches can use `register: path => i32` in `narf_driver!`.
+The first registration error reaches the loader, which removes all matches
+installed by that module before its init failed. Built-in code and
 resource placement remain compile-time choices (e1000 assigns coherent rings
 to `DomainId::DRIVER_0`); no loader parameter can change them. For a runtime-loaded module,
 `target_domain=` is an author hint and the holder of `CAP_SYS_MODULE` may pass

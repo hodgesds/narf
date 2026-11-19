@@ -299,9 +299,9 @@ rules apply.
 | raptorlake-s (Gen12) | A780, A781, A782, A783, A788, A789, A78A, A78B |
 | meteorlake (Xe-LPG) | 7D40, 7D45, 7D55, 7D60, 7DD5 |
 | arrowlake (Xe-LPG) | 7D41, 7D51, 7D67, 7DD1, B640 |
-| pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0B0 |
+| pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0A1, B0B0 |
 | wildcatlake (Xe3-LPG; display 30.02 gated) | FD80, FD81 |
-| novalake-s (Xe3-LPG; display 35.00 gated) | D740, D741, D742, D743, D744, D745 |
+| novalake-s (Xe3-LPG; display 35.00 gated) | D740, D741, D742, D743, D744, D745, D74A, D74B |
 
 Linux `INTEL_ADLP_IDS` includes 46B0–46B3. The historical
 `intel-gpu-rpl-46B*` registration names for these four devices remain
@@ -390,11 +390,12 @@ The disconnected CDCLK model pins all 31 `xe3p_lpd_cdclk_table` rungs from
 151.2 through 787.2 MHz, including the ratio-21 squash waveforms, the 19.2 MHz
 crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. It
 requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
-production route supplies those preconditions. A strict
-`narf.intel.nvl_display=1` read-only route decision requires exact Nova Lake-S,
-GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants
-no programming authority: display 35.00 remains operationally gated pending
-Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
+production route supplies those preconditions. On Nova Lake-S,
+`narf.intel.nvl_display=1` reports the firmware primary at PCI probe and skips
+the headless GT reset for that boot, including when readout fails. For an
+enabled SST output on port A it checks two live scanout snapshots and reports
+the format, dimensions, byte pitch and GGTT offset. Firmware keeps the panel.
+WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
 owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
 port B/Pipes B-D, and DP-alt on LT TC1/TC2/Pipes B-D. Each plan retains the
@@ -515,7 +516,8 @@ the display >= 20 flip-queue/interrupt brackets; a broad generation cannot
 select either container. Nova's parser has the same Pipe C/D rule but remains
 disconnected from the production DC service.
 
-Nova Lake-S IDs D740-D745 are exact `INTEL_NVLS_IDS`. Linux gives them a
+The Nova Lake-S census includes the exact `INTEL_NVLS_IDS` from Linux 7.4-rc1
+and retains D744 from Linux 7.0-rc7. Linux gives them a
 distinct integrated descriptor (DMA46, flat CCS, 48-bit VA, root4), the Xe2
 MOCS table and display/media 35.00. Firmware packages supply
 `xe/nvl_guc_70.bin`. If that name is absent, the loader tries
@@ -526,8 +528,12 @@ headless route. It never enters the display-30 route; its distinct read-only
 display option proves 35.00 without selecting the disconnected LT transport.
 Programming remains gated until its clock/PHY/modeset policy is qualified.
 
-Crescent Island ID 674C is exact `INTEL_CRI_IDS` and uses an exact PCI-device
-registration because Linux does not classify it as VGA. Linux describes its
+Nova Lake-P IDs D750 through D757 and D75F use their own Xe descriptor.
+The driver registers these nine IDs and reports the product before PCI
+setup. Linux 7.4-rc1 has no NVL-P GuC firmware entry.
+
+Crescent Island IDs 674C through 6750 use exact PCI-device registration
+from Linux 7.4-rc1 `INTEL_CRI_IDS`. Linux describes its
 discrete DMA52, VA57, root4, non-flat-CCS Xe3p_XPC profile, but the current
 `xe_uc_fw.c` manifest has no `CRESCENTISLAND` GuC entry. NARF therefore
 announces the exact identity and refuses before D-state, BAR, command or MMIO

@@ -54,7 +54,7 @@ amdgpu = []
 intel = []
 # Tests cover the DRM sysfs class bridge, so the
 # kernel-test build must compile those paths.
-kernel-test = []
+kernel-test = ["narf-bus/kernel-test"]
 
 [lints]
 workspace = true

@@ -111,14 +111,18 @@
 //! `DP_FEC_CONFIGURATION` before training, `DP_TP_CTL` FEC enable and the
 //! PPS SDP after the normal pattern; then `hsw_crtc_enable`'s
 //! `intel_dsc_enable` on the route's pipe, the compressed M/N, and after the
-//! transcoder enable `intel_ddi_wait_for_fec_status` (best effort, as Linux
-//! only logs it). The stop reverses it: sink decompression off before the
-//! transcoder, `intel_dsc_disable` and the PPS SDP enable after the function
+//! transcoder enable `intel_ddi_wait_for_fec_status`. The stop reverses it:
+//! sink decompression off before the transcoder, `intel_dsc_disable` and
+//! the PPS SDP enable after the function
 //! deselect, FEC off after `DP_TP_CTL`, then the sink's FEC ready. The
 //! Pipes owner already sets display 14's `DP_FEC_BS_JITTER_WA`. The shared
 //! training loop programs each source pattern and drive level before its
 //! matching sink write. A rate/width fallback stops the buffer before
 //! retuning the owned PHY or fabric clock and restarting CR/EQ.
+//! Display 30 confirms both source FEC live and sink decode before the PPS.
+//! Up to three disable/enable retries precede rollback of a failed handshake.
+//! Its source must still report FEC live after the transcoder is enabled and
+//! must acknowledge FEC off before the port clock or reservation is released.
 //!
 //! Sources (Linux b90c984d): `intel_ddi.c` (`mtl_ddi_pre_enable_dp`,
 //! `mtl_ddi_prepare_link_retrain`, `intel_ddi_init_dp_buf_reg`,
@@ -138,8 +142,8 @@ pub use mst::{MstFailure, MtlMstRoute};
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{
-    negotiate, stream_demand_kbps, train_link, DpcdCaps, LinkError, LinkRate as TrainRate,
-    NegotiatedLink, SourceCaps, TrainedLink,
+    negotiate, stream_demand_kbps, train_link_with_receiver, DpcdCaps, LinkError,
+    LinkRate as TrainRate, NegotiatedLink, ReceiverTraining, SourceCaps, TrainedLink,
 };
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
@@ -235,10 +239,6 @@ impl ExternalDisplayProfile {
         }
     }
 }
-
-/// DPCD receiver-capability bytes read at probe (0x000..0x00F, the span
-/// `read_caps` decodes; `DP_MAX_DOWNSPREAD` is byte 3).
-const DPCD_RECEIVER_CAP_BYTES: usize = 16;
 
 /// Largest EDID retained (base + three extensions).
 pub const EDID_CAPACITY: usize = 512;
@@ -351,6 +351,10 @@ pub enum ExternalError {
     PortBusy,
     /// A fallback retry trained at yet another configuration.
     TrainingMismatch,
+    /// Display 30 could not confirm FEC for a compressed output.
+    FecNotReady,
+    /// Display 30 did not acknowledge disabling the source FEC encoder.
+    FecStopTimeout,
     /// Programming or observation failed.
     Modeset(ModesetError),
     /// Register authority was lost.
@@ -837,9 +841,7 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
         port.aux_base(),
         tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt),
     );
-    // `read_caps`'s DPCD read, keeping the raw bytes for DP_MAX_DOWNSPREAD.
-    let mut raw = [0u8; DPCD_RECEIVER_CAP_BYTES];
-    aux.dpcd_read(0, &mut raw)
+    let raw = crate::dp_link_training::read_receiver_caps(&mut aux)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
     Ok(LinkProbe {
         display_ip,
@@ -1045,6 +1047,9 @@ pub struct MtlExternalRoute {
     pipe: Pipe,
     /// The pipe's reservation until its post-plane release is proven.
     reservation: Option<RoutePipe>,
+    /// Plane, transcoder and port are disabled. Only the source FEC-off
+    /// acknowledgement is pending before clock teardown can resume.
+    awaiting_fec_stop: bool,
 }
 
 /// Why [`activate`] did not produce a live route.
@@ -1202,17 +1207,20 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
         state: RouteState::Stopped,
         pipe: choice.pipe,
         reservation: None,
+        awaiting_fec_stop: false,
     };
     match program(io, &mut route, choice, &ext, display.pipe_dmc, payload) {
         Ok(()) => {
             route.state = RouteState::Live;
             Ok(route)
         }
-        Err(e) => {
-            route.state = match stop_local(io, &mut route) {
-                Ok(()) => RouteState::Stopped,
-                Err(_) => RouteState::Quarantined,
-            };
+        Err(mut e) => {
+            if let Err(stop_error) = stop_local(io, &mut route) {
+                route.state = RouteState::Quarantined;
+                if route.awaiting_fec_stop {
+                    e = stop_error;
+                }
+            }
             Err(ActivateError::Failed(route, e))
         }
     }
@@ -1256,7 +1264,8 @@ fn program<M: MmioWindow + ?Sized>(
         // keeps the reserved port clock: a carried fallback only drops
         // lanes at that rate (see activate), so this is exact, and a lower
         // rate would be the documented over-request, never an under-one.
-        stop_port(io, route)?;
+        disable_port(io, route)?;
+        finish_port_stop(io, route)?;
         let retry = enable_port(io, route, trained.rate, trained.lanes)?;
         if retry.rate != trained.rate || retry.lanes != trained.lanes {
             return Err(ExternalError::TrainingMismatch);
@@ -1312,7 +1321,12 @@ fn enable_port<M: MmioWindow + ?Sized>(
     }
     // mtl_ddi_prepare_link_retrain: 6.d DP_TP_CTL TPS1 (SST), 6.f D2D,
     // 6.g levels, 6.h PORT_BUF_CTL1, 6.i DDI_CTL_DE + buffer active.
-    let enhanced = if route.probe.caps.enhanced_framing {
+    let receiver = ReceiverTraining::for_receiver(
+        &route.probe.caps,
+        route.probe.max_downspread,
+        route.probe.mst.is_some(),
+    );
+    let enhanced = if receiver.enhanced_framing {
         DP_TP_CTL_ENHANCED_FRAME
     } else {
         0
@@ -1359,7 +1373,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
             })
         },
     );
-    let result = train_link(&mut aux, rate, lanes, |us| {
+    let result = train_link_with_receiver(&mut aux, rate, lanes, Some(receiver), |us| {
         let _ = narf_scheduler::responsive_spin_until(
             || false,
             narf_time::Deadline::after_ns(us as u64 * 1_000),
@@ -1523,6 +1537,41 @@ fn program_mn<M: MmioWindow + ?Sized>(
     write(io, base + PIPE_LINK_N1_OFFSET, ln)
 }
 
+fn sink_fec_detected<M: MmioWindow + ?Sized>(io: &M, probe: &MtlSinkProbe) -> bool {
+    let mut aux = IntelAux::xelpdp(io, probe.port.aux_base(), probe.tbt());
+    dsc::wait_fec_detected(&mut aux, |us| {
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ns(u64::from(us) * 1_000),
+        );
+    })
+}
+
+/// Display 30's intel_ddi_enable_fec retries the source enable only after
+/// observing it off. Some MST hubs never report decode-disabled over AUX.
+fn enable_stream_fec<M: MmioWindow + ?Sized>(
+    io: &M,
+    trans: Transcoder,
+    probe: &MtlSinkProbe,
+) -> Result<(), ExternalError> {
+    let lost = |_| ExternalError::AccessLost;
+    for attempt in 0..=3 {
+        if attempt > 0 {
+            dsc::disable_fec(io, trans).map_err(lost)?;
+            if !dsc::poll_fec_live(io, trans, false).map_err(lost)? {
+                continue;
+            }
+        }
+        dsc::enable_fec(io, trans).map_err(lost)?;
+        if !probe.display_ip.is_display30()
+            || (dsc::poll_fec_live(io, trans, true).map_err(lost)? && sink_fec_detected(io, probe))
+        {
+            return Ok(());
+        }
+    }
+    Err(ExternalError::FecNotReady)
+}
+
 /// The rest of `mtl_ddi_pre_enable_dp` (trained levels, 6.n DP_TP_CTL
 /// normal), `hsw_crtc_enable` (M/N, source size, timings, RGB bypass),
 /// `intel_ddi_enable` (`TRANS_DDI_FUNC_CTL` enable, transcoder enable) and
@@ -1595,7 +1644,7 @@ fn finish<M: MmioWindow + ?Sized>(
         // intel_ddi_enable_fec, then intel_dsc_dp_pps_write; then
         // hsw_crtc_enable's intel_dsc_enable on the route's pipe.
         if plan.fec {
-            dsc::enable_fec(io, trans).map_err(lost)?;
+            enable_stream_fec(io, trans, &route.probe)?;
         }
         dsc::write_pps_sdp(io, trans, plan).map_err(lost)?;
         dsc::enable_engines(io, pipe, plan).map_err(lost)?;
@@ -1628,16 +1677,14 @@ fn finish<M: MmioWindow + ?Sized>(
     rp.pipes.enable_fixed_tg(io, pipe)?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
-    // intel_ddi_wait_for_fec_status(true): Linux only logs a timeout.
+    // intel_ddi_wait_for_fec_status(true). Display 30 requires its source
+    // to stay live through transcoder enable before arming the primary.
     if plan.is_some_and(|p| p.fec) {
-        let _ = dsc::wait_fec_live(io, trans, true);
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
-        let _ = dsc::wait_fec_detected(&mut aux, |us| {
-            let _ = narf_scheduler::responsive_spin_until(
-                || false,
-                narf_time::Deadline::after_ns(u64::from(us) * 1_000),
-            );
-        });
+        if dsc::poll_fec_live(io, trans, true).map_err(lost)? {
+            let _ = sink_fec_detected(io, &route.probe);
+        } else if route.probe.display_ip.is_display30() {
+            return Err(ExternalError::FecNotReady);
+        }
     }
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)
@@ -1694,13 +1741,18 @@ fn observe_live<M: MmioWindow + ?Sized>(
             ModesetError::PipelineEnableUnavailable,
         ));
     }
+    if route.probe.display_ip.is_display30()
+        && route.probe.dsc.is_some_and(|plan| plan.fec)
+        && read(io, dp_tp_ctl(trans) + 4)? & dsc::DP_TP_STATUS_FEC_ENABLE_LIVE == 0
+    {
+        return Err(ExternalError::FecNotReady);
+    }
     Ok(())
 }
 
 /// The port side of `intel_ddi_post_disable_dp`, with the transcoder off:
-/// function deselect, sink D3, `intel_ddi_buf_disable`, `TRANS_CLK_SEL`
-/// off, `intel_cx0pll_disable` and TBT IO deselect, each observed.
-fn stop_port<M: MmioWindow + ?Sized>(
+/// function deselect, sink D3, `intel_ddi_buf_disable` and FEC disable.
+fn disable_port<M: MmioWindow + ?Sized>(
     io: &M,
     route: &MtlExternalRoute,
 ) -> Result<(), ExternalError> {
@@ -1743,11 +1795,31 @@ fn stop_port<M: MmioWindow + ?Sized>(
     disable_d2d(io, route.probe.display_ip, port).map_err(|_| stop_failed)?;
     let tp = read(io, dp_tp_ctl(trans))?;
     write(io, dp_tp_ctl(trans), tp & !DP_TP_CTL_ENABLE)?;
-    // intel_ddi_disable_fec and intel_ddi_wait_for_fec_status(false) (a
-    // logged timeout in Linux), then intel_dp_sink_set_fec_ready(false).
     if fec {
         dsc::disable_fec(io, trans).map_err(|_| ExternalError::AccessLost)?;
-        let _ = dsc::wait_fec_live(io, trans, false);
+    }
+    Ok(())
+}
+
+/// Wait for FEC off while the port's clock is still available, then
+/// deselect the transcoder clock, disable the PLL and deselect TBT IO.
+fn finish_port_stop<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlExternalRoute,
+) -> Result<(), ExternalError> {
+    let port = route.probe.port;
+    let trans = route_pipe(route)?.transcoder();
+    let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
+    if route.probe.dsc.is_some_and(|p| p.fec) {
+        if route.probe.display_ip.is_display30() {
+            route.awaiting_fec_stop = true;
+            if !dsc::poll_fec_live(io, trans, false).map_err(|_| ExternalError::AccessLost)? {
+                return Err(ExternalError::FecStopTimeout);
+            }
+            route.awaiting_fec_stop = false;
+        } else {
+            let _ = dsc::wait_fec_live(io, trans, false);
+        }
         let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = dsc::set_sink_fec_ready(&mut aux, false);
     }
@@ -1775,7 +1847,7 @@ fn stop_port<M: MmioWindow + ?Sized>(
 }
 
 /// Local stop in `hsw_crtc_disable` / `intel_ddi_post_disable_dp` order:
-/// primary off, transcoder off, the port side ([`stop_port`]), then the
+/// primary off, transcoder off, the port side, then the
 /// pipe DMC disable and the post-plane repartition without the pipe. Every
 /// step is observed; any failure leaves the remaining state (and the
 /// pipe's reservation) for quarantine. A route that failed before its
@@ -1788,23 +1860,22 @@ fn stop_local<M: MmioWindow + ?Sized>(
     let Some(rp) = route.reservation.as_mut() else {
         return Ok(());
     };
-    let pipe = rp.pipe;
-    rp.pipes.disable_primary(io, pipe)?;
-    // intel_ddi_disable_dp: the sink's decompression off before the
-    // transcoder (best effort, as in Linux).
-    if route.probe.dsc.is_some() {
-        let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
-        let _ = dsc::set_sink_decompression(&mut aux, false);
+    if !route.awaiting_fec_stop {
+        let pipe = rp.pipe;
+        rp.pipes.disable_primary(io, pipe)?;
+        // intel_ddi_disable_dp: the sink's decompression off before the
+        // transcoder (best effort, as in Linux).
+        if route.probe.dsc.is_some() {
+            let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+            let _ = dsc::set_sink_decompression(&mut aux, false);
+        }
+        rp.pipes.disable(io, pipe).map_err(|e| match e {
+            PipeEnableError::Timeout => stop_failed,
+            e => e.into(),
+        })?;
+        disable_port(io, route)?;
     }
-    let rp = route
-        .reservation
-        .as_mut()
-        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
-    rp.pipes.disable(io, pipe).map_err(|e| match e {
-        PipeEnableError::Timeout => stop_failed,
-        e => e.into(),
-    })?;
-    stop_port(io, route)?;
+    finish_port_stop(io, route)?;
     let rp = route
         .reservation
         .as_mut()
@@ -1837,12 +1908,13 @@ impl MtlExternalRoute {
     }
 
     /// Locally stop the route. A stopped route stays stopped; a failed
-    /// stop quarantines it (resources retained, never released).
+    /// stop quarantines it. A pending display-30 FEC-off acknowledgement
+    /// can be sampled again with the same leases and clock still held.
     pub fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), ExternalError> {
         match self.state {
             RouteState::Stopped => Ok(()),
-            RouteState::Quarantined => Err(ExternalError::Quarantined),
-            RouteState::Live => match stop_local(io, self) {
+            RouteState::Quarantined if !self.awaiting_fec_stop => Err(ExternalError::Quarantined),
+            RouteState::Live | RouteState::Quarantined => match stop_local(io, self) {
                 Ok(()) => {
                     self.state = RouteState::Stopped;
                     Ok(())

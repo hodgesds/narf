@@ -241,6 +241,63 @@ kernel_test_in!(
     smoke_xe2lpd_gt_display_admission_reads_display_only_and_never_flrs
 );
 
+fn smoke_display30_gt_preserves_wildcat_panel_and_checks_only_implemented_pipes() -> TestResult {
+    let panther = 30 << 22;
+    let wildcat = (30 << 22) | (2 << 14);
+    let m = lit();
+    m.set(0x510a0, wildcat);
+    // WCL has no Pipe D, FBC D, or DMC D. Missing registers may read ~0.
+    for reg in [0x73008, 0x73080, 0x73180, 0x73d08, 0x5fc78, 0x432c8] {
+        m.set(reg, u32::MAX);
+    }
+    m.set(0x45250, 0x1001); // Only Pipe A's DMC exists in this set.
+    for id in [0xfd80, 0xfd81] {
+        let (device, bar) = identity(id);
+        let receipt = Receipt::admit_display_ptl(device, bar, &m, || true).unwrap();
+        assert!(receipt.display_preserving() && receipt.matches(device, bar, &m));
+        m.set(0x510a0, panther);
+        assert!(!receipt.matches(device, bar, &m));
+        assert_eq!(
+            Receipt::admit_display_ptl(device, bar, &m, || true).err(),
+            Some(Error::Unsupported),
+        );
+        m.set(0x510a0, wildcat);
+    }
+    let (device, bar) = identity(0xfd80);
+    // A real Pipe C fetcher or enabled C DMC still prevents GT takeover.
+    for (reg, value) in [(0x72580, 1 << 31), (0x43288, 1 << 31), (0x45250, 0x100)] {
+        let saved = m.read32(reg);
+        m.set(reg, value);
+        assert_eq!(
+            Receipt::admit_display_ptl(device, bar, &m, || true).err(),
+            Some(Error::Busy),
+        );
+        m.set(reg, saved);
+    }
+    let (device, bar) = identity(0xb080);
+    assert_eq!(
+        Receipt::admit_display_ptl(device, bar, &m, || true).err(),
+        Some(Error::Unsupported),
+    );
+    m.set(0x510a0, panther);
+    assert_eq!(
+        Receipt::admit_display_ptl(device, bar, &m, || true).err(),
+        Some(Error::Unavailable), // Panther Lake's Pipe D must be readable.
+    );
+    let (device, bar) = identity(0xd740);
+    m.set(0x510a0, 35 << 22);
+    assert_eq!(
+        Receipt::admit_display_ptl(device, bar, &m, || true).err(),
+        Some(Error::Unsupported),
+    );
+    assert!(m.writes().is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_gt",
+    smoke_display30_gt_preserves_wildcat_panel_and_checks_only_implemented_pipes
+);
+
 fn smoke_xe2lpd_gt_hardware_init_resets_gt_only() -> TestResult {
     use crate::intel_gpu_gt_hw::HardwareInit;
     let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
