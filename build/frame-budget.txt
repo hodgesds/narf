@@ -60,6 +60,5 @@
 8576 narf_userspace::sysvipc::sys_msgget
 8440 narf_drivers_gpu::amdgpu_vcn_navi48::av1_320_words::keyframe_message
 8360 narf_userspace::abi_test_support::with_memfs
-8344 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::subvp::expand_subvp
 8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
 8296 narf_memory::compress::lz4_encode
