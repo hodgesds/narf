@@ -1943,8 +1943,16 @@ impl FwFakeBank {
         } else {
             opcode
         };
-        resp[0] =
-            ((resp_opcode as u32) << 16) | (aci::ACI_FLAG_SI as u32) | (aci::ACI_FLAG_DD as u32);
+        // Real firmware returns the submitted descriptor
+        // with DD set — it never rebuilds the flags word
+        // (Linux `ixgbe_aci_send_cmd_execute` reads the
+        // response back verbatim). Preserve the request's
+        // BUF/LB/RD/SI flags; rebuilding from
+        // opcode|SI|DD dropped them (0x2001 instead of
+        // 0x3201 on a 560-byte get_phy_caps).
+        resp[0] = ((resp_opcode as u32) << 16)
+            | (aci::desc_flags(&req) as u32)
+            | (aci::ACI_FLAG_DD as u32);
         let retval = if self.mode == FwMode::AciBadRetval {
             0xE
         } else {
