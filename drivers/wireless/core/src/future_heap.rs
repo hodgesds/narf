@@ -11,14 +11,20 @@ use core::{
 /// cancellation guards in pinned heap storage. The separate construction
 /// frame prevents a parent's poll from reserving its child's full state.
 #[inline(never)]
-pub(crate) fn build<F: Future>(make: impl FnOnce() -> F) -> HeapFuture<F> {
+pub fn build<F: Future>(make: impl FnOnce() -> F) -> HeapFuture<F> {
     HeapFuture {
         inner: Box::pin(make()),
     }
 }
 
-pub(crate) struct HeapFuture<F> {
+pub struct HeapFuture<F> {
     inner: Pin<Box<F>>,
+}
+
+impl<F> core::fmt::Debug for HeapFuture<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HeapFuture").finish_non_exhaustive()
+    }
 }
 
 impl<F: Future> Future for HeapFuture<F> {

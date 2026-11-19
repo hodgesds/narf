@@ -1,0 +1,40 @@
+# Shared Realtek USB transport primitives.
+#
+# The generic USB bulk/control transport abstraction that both the rtl8xxxu
+# driver and rtw88's USB datapath are built on: the `Io`/`ControlIo` traits,
+# their `UsbIo`/`UsbControl` concrete USB-device wrappers, and the shared
+# `RTL8XXXU_USB_IDS` match table. Factored out of the rtl8xxxu driver so the
+# Realtek Wi-Fi family crate (rtw88/rtw89) can reuse the transport without
+# depending on another driver crate.
+#
+# Chip-specific machinery (the `Owner<I>` state engines, packet codecs,
+# per-chip init/radio/iqk) stays in rtl8xxxu; only the bus-generic primitives
+# live here. Plain rlib (like narf-drivers-wireless-core); dependents gate it
+# under their own `builtin` feature so a `.ko` build never pulls it in.
+
+[package]
+name         = "narf-drivers-wireless-rtl-usb"
+description  = "Shared Realtek USB transport primitives (Io/ControlIo traits, UsbIo/UsbControl, RTL8XXXU_USB_IDS)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_rtl_usb"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enables the `ControlIo::inert_source_fixture` test hook so dependents'
+# kernel tests compile.
+kernel-test = []
+
+[dependencies]
+narf-drivers-usb = { path = "../../usb" }
+narf-time        = { path = "../../../time" }
+async-trait      = "0.1"
+
+[lints]
+workspace = true

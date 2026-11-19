@@ -124,44 +124,8 @@ pub use crate::iwlwifi::mlme::{
 /// and RTL8822BU (0bda:b82c and the rest of
 /// `rtw8822bu.c::rtw_8822bu_id_table`) are bound by rtw88
 /// (`rtw88::usb_driver`), as in Linux; they are not listed here.
-pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] = {
-    use narf_drivers_usb::class_registry::UsbClassMatch;
-    use regs::*;
-    &[
-        // Primary Realtek-vendor IDs.
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID_ALT),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID_ALT),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8723BU_ID),
-        // RTL8710BU / RTL8188GU
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, 0xB711),
-        // RTL8188EU rosewill ffef
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, 0xFFEF),
-        // Rebranded — TP-Link
-        UsbClassMatch::vid_pid(0x2357, 0x0108),
-        UsbClassMatch::vid_pid(0x2357, 0x0109),
-        UsbClassMatch::vid_pid(0x2357, 0x010C),
-        UsbClassMatch::vid_pid(0x2357, 0x0111),
-        // Rebranded RTL8192EU (core.c dev_table `rtl8192eu_fops`).
-        UsbClassMatch::vid_pid(0x2357, 0x0107),
-        UsbClassMatch::vid_pid(0x2357, 0x0126),
-        UsbClassMatch::vid_pid(0x2019, 0xAB33),
-        UsbClassMatch::vid_pid(0x2001, 0x3312),
-        UsbClassMatch::vid_pid(0x2C4E, 0x0100),
-        UsbClassMatch::vid_pid(0x2C4E, 0x0104),
-        // Rebranded — D-Link
-        UsbClassMatch::vid_pid(0x2001, 0x3319),
-        UsbClassMatch::vid_pid(0x2001, 0x3311),
-        // Rebranded — Edimax
-        UsbClassMatch::vid_pid(0x7392, 0xB811),
-        UsbClassMatch::vid_pid(0x7392, 0xA611),
-        // Rebranded — ASUS
-        UsbClassMatch::vid_pid(0x0B05, 0x18F0),
-        // Rebranded — Abocom
-        UsbClassMatch::vid_pid(0x07B8, 0x8179),
-    ]
-};
+// `RTL8XXXU_USB_IDS` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
+pub use narf_drivers_wireless_rtl_usb::RTL8XXXU_USB_IDS;
 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores

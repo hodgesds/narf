@@ -10,7 +10,6 @@
 //! post-table MAC state and full LC/IQK. MAC TX/RX remain closed; neither
 //! firmware-ready nor radio-ready publishes a station or authorizes packets.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -156,62 +155,8 @@ pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]
     ))
 }
 
-/// All register and firmware writes use EP0 with request 0x05, value=address,
-/// index=0. The trait requires exact-count checking at the owner boundary.
-#[async_trait::async_trait]
-pub trait ControlIo: Send + Sync {
-    #[cfg(any(test, feature = "kernel-test"))]
-    fn inert_source_fixture(&self) -> bool {
-        false
-    }
-    fn identity(&self) -> Option<(u16, u16)> {
-        None
-    }
-    async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError>;
-    async fn write(&self, addr: u16, data: &[u8]) -> Result<usize, UsbError>;
-    async fn configuration(&self, _out: &mut [u8]) -> Result<usize, UsbError> {
-        Err(UsbError::NotConfigured)
-    }
-    async fn delay_us(&self, us: u64) {
-        narf_time::sleep_cycles(narf_time::ns_to_cycles(us.saturating_mul(1000))).await;
-    }
-}
-
-/// Production transport retains the enumerated USB handle for the entire
-/// attempt. The owner serializes its sequence; it never nests block_on in an
-/// executor poll or holds an IRQ-disabling lock across USB awaits.
-#[derive(Debug)]
-pub struct UsbControl {
-    device: Arc<USBDevice>,
-}
-
-impl UsbControl {
-    pub fn new(device: Arc<USBDevice>) -> Self {
-        Self { device }
-    }
-}
-
-#[async_trait::async_trait]
-impl ControlIo for UsbControl {
-    fn identity(&self) -> Option<(u16, u16)> {
-        Some((self.device.vendor_id(), self.device.product_id()))
-    }
-    async fn configuration(&self, out: &mut [u8]) -> Result<usize, UsbError> {
-        self.device.get_config_descriptor(0, out).await
-    }
-    async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError> {
-        self.device
-            .control_in(REALTEK_USB_READ, REALTEK_USB_CMD_REQ, addr, 0, out)
-            .await
-    }
-
-    async fn write(&self, addr: u16, data: &[u8]) -> Result<usize, UsbError> {
-        self.device
-            .control_out(REALTEK_USB_WRITE, REALTEK_USB_CMD_REQ, addr, 0, data)
-            .await
-    }
-}
-
+// `ControlIo`/`UsbControl` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
+pub use narf_drivers_wireless_rtl_usb::{ControlIo, UsbControl};
 /// A retained, one-shot initialization attempt. A failed or cancelled owner
 /// cannot replay register writes; recovery requires a fresh device lifecycle.
 pub struct Owner<I: ControlIo> {
@@ -983,7 +928,7 @@ impl Owner<UsbControl> {
     /// The packet adapter must use the identical retained USB generation and
     /// controller as EP0. Taking another caller-provided handle is forbidden.
     pub(super) fn usb_device(&self) -> Arc<USBDevice> {
-        self.io.device.clone()
+        self.io.device()
     }
 }
 

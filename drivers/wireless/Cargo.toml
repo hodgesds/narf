@@ -46,11 +46,20 @@ narf-drivers-platform = { path = "../platform" }
 # here; the same crate also builds to a loadable `.ko` via `cargo xtask
 # build-module`. See drivers/wireless/mt76/ and drivers/net/i40e/ (template).
 narf-drivers-wireless-mt76 = { path = "mt76", default-features = false, features = ["builtin"] }
+# Intel iwlwifi (promoted from the former src/iwlwifi/ module). Built-in here;
+# the same crate builds to a loadable `.ko` via `cargo xtask build-module`.
+narf-drivers-wireless-iwlwifi = { path = "iwlwifi", default-features = false, features = ["builtin"] }
+# Shared driver-agnostic helpers (firmware_asset, future_heap), re-exported
+# from the crate root for the still-inlined drivers.
+narf-drivers-wireless-core = { path = "core" }
+# Shared Realtek USB transport primitives (Io/ControlIo/UsbIo/UsbControl +
+# RTL8XXXU_USB_IDS), used by the inlined rtl8xxxu driver and the rtw family crate.
+narf-drivers-wireless-rtl-usb = { path = "rtl-usb" }
 async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test"]
+kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test"]
 
 [lints]
 workspace = true

@@ -1,0 +1,96 @@
+# Intel iwlwifi PCIe Wi-Fi (AX200/AX201/AX210/AX211/BE200) — dual-build.
+#
+# Promoted from the former `drivers/wireless/src/iwlwifi/` module into a proper
+# per-driver crate. Builds two ways from one source, selected by cargo feature,
+# exactly like `drivers/wireless/mt76/` and `drivers/net/i40e/` (the locked
+# dual-build template):
+#
+#   * `builtin` (default): an rlib dependency of the `narf-drivers-wireless`
+#     facade, registered from the kernel's Stage::Subsys initcall. The real
+#     driver (PCIe transport, firmware TLV/ladder, MLD station path) lives
+#     here, gated under `builtin`.
+#   * `module`: built to a relocatable `.ko` via
+#     `cargo xtask build-module --package narf-drivers-wireless-iwlwifi \
+#        --no-default-features --features module`. The kernel crates drop from
+#     the graph; the driver registers its PCI IDs through the
+#     `narf_register_pci_driver` KSYMTAB export (registration-only proof — the
+#     probe thunk returns -ENOSYS; the native datapath stays in the builtin
+#     host, matching the net `.ko`s).
+#
+# Unlike mt76, tests gate on a dedicated `kernel-test` feature (which implies
+# `builtin`) rather than on `builtin` itself, so the driver's ~160 test modules
+# stay out of a production built-in kernel.
+
+[package]
+name         = "narf-drivers-wireless-iwlwifi"
+description  = "Intel iwlwifi PCIe Wi-Fi (AX200/AX201/AX210/AX211/BE200) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_iwlwifi"
+path = "src/lib.rs"
+# rlib for the built-in facade dependency and the kernel link. The `.ko` build
+# overrides this to `staticlib` via `cargo xtask build-module`.
+
+[features]
+default = ["builtin"]
+# Built-in: pull the real kernel crates. The driver body only compiles here.
+builtin = [
+    "dep:narf-aml", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-console", "dep:narf-crypto", "dep:narf-drivers",
+    "dep:narf-drivers-wireless-core", "dep:narf-firmware",
+    "dep:narf-firmware-smbios", "dep:narf-interrupts", "dep:narf-io",
+    "dep:narf-ipc", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
+    "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
+    "dep:narf-wireless", "dep:zeroize",
+]
+# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
+# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+module = []
+# Kernel tests imply the built-in body and add the test-only harness/fixture
+# crates plus the cascades the driver's smokes need.
+kernel-test = [
+    "builtin",
+    "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
+    "narf-wireless/kernel-test", "narf-bus/kernel-test",
+    "narf-power/wake-test",
+]
+
+[dependencies]
+# Always present: the decl-macro crate (no object code of its own, safe to
+# link into the `.ko`) and async-trait (expands to plain code).
+narf-driver-macros = { path = "../../../driver-macros" }
+async-trait        = "0.1"
+
+# Real kernel crates — present for `builtin`, absent for `module`.
+narf-aml          = { path = "../../../aml", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-drivers-wireless-core = { path = "../core", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-firmware-smbios = { path = "../../../firmware/smbios", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+# Test-only: harness + Wi-Fi fixtures, pulled by `kernel-test`.
+narf-kernel-test   = { path = "../../../verification/kernel-test", optional = true }
+narf-wifi-fixtures = { path = "../../../verification/wifi-fixtures", optional = true }
+
+[lints]
+workspace = true

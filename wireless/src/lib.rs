@@ -31,6 +31,7 @@ pub mod rsn;
 pub mod sae;
 pub mod scan;
 pub mod station_security;
+pub mod txpower;
 pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
