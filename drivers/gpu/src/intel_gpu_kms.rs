@@ -1677,23 +1677,18 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
         lost.store(true, Ordering::Release);
     }
 }
-/// Retire an owned Meteor Lake external route, its hotplug sources and its
-/// publication for this BAR (`intel_gpu::retire_mtl_external`). Other
-/// generations return before any register access.
-fn retire_mtl_external(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
-    crate::intel_gpu::retire_mtl_external(bar)
-}
-
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     // Display-14 suspend: DC states exited and held off for the whole
     // preparation; the DMC program is disabled only once it succeeded.
     crate::intel_gpu_dc_states::suspend_begin_for_bar(bar).map_err(|_| FsError::Busy)?;
     let result = async {
         crate::intel_gpu::retire_external_sst(bar).await?;
-        retire_mtl_external(bar)?;
         if let Some(display) = display_for_bar(bar) {
             display.quiesce().await?;
         }
+        // The restored panel has closed admission to both users and hotplug
+        // before the last external route is retired for suspend.
+        crate::intel_gpu::retire_mtl_external(bar).await?;
         if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
             // A failed system-PM prepare hook is not resumed by the coordinator.
             // Attempt a fully verified replay while the original video is live;
@@ -1710,7 +1705,7 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
 
 pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     crate::intel_gpu::retire_external_sst(bar).await?;
-    retire_mtl_external(bar)?;
+    crate::intel_gpu::retire_mtl_external(bar).await?;
     if let Some(display) = display_for_bar(bar) {
         display.recover().await?;
     }
@@ -2207,6 +2202,9 @@ impl<M: Platform> Device<M> {
     /// next call; the repartition preserves every register it verifies.
     pub(crate) fn external_pass(&self) -> Result<ExternalPass<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
+        if state.blocked || state.failed || self.platform.reset_lost() {
+            return Err(FsError::Busy);
+        }
         let _power = self.platform.display_power()?;
         let mut guard = Guard {
             device: self,
@@ -2230,6 +2228,44 @@ impl<M: Platform> Device<M> {
             guard,
             bracket: None,
         })
+    }
+
+    /// Suspend and reset recovery run outside the GT mutex. Keep the panel
+    /// owner through external stop/repartition, including when the hotplug
+    /// actor has only just finished bringing a route up.
+    pub(crate) async fn external_retirement(
+        &self,
+        routes_stopped: impl FnOnce() -> bool,
+    ) -> Result<ExternalPass<'_, M>, FsError> {
+        let state = self.state.lock().await;
+        let _power = self.platform.display_power()?;
+        let mut pass = ExternalPass {
+            guard: Guard {
+                device: self,
+                state,
+                _power,
+                _rpm: None,
+            },
+            bracket: None,
+        };
+        // On GT loss the display recovery owner handles its retained
+        // fetchers with a fresh MMIO view. The old panel proofs are stale.
+        if routes_stopped() || self.platform.reset_lost() {
+            return Ok(pass);
+        }
+        if pass.guard.state.failed {
+            return Err(FsError::NoDevice);
+        }
+        let state = &pass.guard.state;
+        if state.joint.is_some()
+            || state.dsb.as_ref().is_some_and(|dsb| dsb.armed())
+            || state.color.as_ref().is_some_and(|color| color.pending())
+        {
+            pass.guard.finish_color().await?;
+        }
+        pass.guard.finish_pending().await?;
+        pass.pre_update();
+        Ok(pass)
     }
 }
 
@@ -2424,7 +2460,10 @@ impl<M: Platform> Guard<'_, M> {
     /// Recheck before publishing a hardware transaction. The synchronous GT
     /// loss path can poison a busy session without acquiring this mutex.
     pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
-        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+        // Session admission checks `blocked` under this same mutex. A PM
+        // guard must still be able to finish an already armed frame after
+        // the legacy drain closed admission.
+        if self.state.failed || self.device.platform.reset_lost() {
             return Err(FsError::NoDevice);
         }
         // A dark panel has no console scanout to prove: its retained owners

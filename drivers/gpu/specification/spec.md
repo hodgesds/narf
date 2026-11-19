@@ -4135,6 +4135,12 @@ while a primary flip is unlatched; an in-flight panel DSB is retired first);
 `ExternalPass::pre_update` deactivates FBC and exits PSR,
 `post_update` waits for a Pipe-A frame, re-proves the layout and only then
 re-activates FBC (PSR re-arms when the pass ends).
+Suspend restores the panel and closes hotplug admission before withdrawing
+the external route. External retirement holds the panel mutex from its route
+presence check through the stop and resource update. A healthy panel drains
+any retained primary or DSB update first, including one left by a cancelled
+client. After GT loss the display recovery owner retains the old buffers
+until it observes its fresh console latch.
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 

@@ -1966,7 +1966,7 @@ fn step_external_sst_inner(bar: &MmioRegion, stop: bool) -> Result<bool, narf_fi
 fn step_external_sst(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesystem::FsError> {
     // Preserve idle/older-platform recovery: an absent external owner must
     // not set KMS.blocked when Device::recover legitimately has no work.
-    if external_routes_stopped(bar) {
+    if legacy_external_routes_stopped(bar) {
         return Ok(true);
     }
     let display = crate::intel_gpu_kms::display_for_bar(bar);
@@ -2026,6 +2026,11 @@ fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {
             .is_some_and(|state| state.bar == bar.phys.raw())
 }
 pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
+    legacy_external_routes_stopped(bar) && crate::intel_gpu_xelpg_external::routes_stopped()
+}
+// The MTL-family route has its own panel-serialized retirement. A live route
+// there must not close KMS admission through the unrelated legacy SST drain.
+fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
     if !crate::intel_gpu_dp_bridge::sessions_stopped(bar.phys.raw()) {
         return false;
     }
@@ -2034,7 +2039,6 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
             .lock()
             .as_ref()
             .is_none_or(|state| state.bar != bar.phys.raw() || state.stopped())
-        && crate::intel_gpu_xelpg_external::routes_stopped()
 }
 
 // ── Meteor Lake external SST (`intel_gpu_xelpg_external`) ───────
@@ -2408,34 +2412,26 @@ pub(crate) fn mtl_runtime_pass<M: crate::intel_gpu_kms::Platform>(
 /// Suspend/GT-reset retirement of the MTL route and its hotplug sources,
 /// then withdrawal of its publication once nothing is live. `Busy` when a
 /// route stays retained (quarantined or a service pass in progress).
-pub(crate) fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
-    // Stopping a live route repartitions Pipe A's resources: bracket it
-    // with the panel's KMS owner exactly as a hotplug pass does (FBC and PSR
-    // leave Pipe A first). A busy owner leaves the teardown unbracketed; the
-    // live transaction then refuses an active FBC and the retirement
-    // reports Busy, to be retried. After a GT reset the owner's own
-    // loss-tolerant recovery disables FBC and PSR instead.
-    let display = crate::intel_gpu_kms::display_for_bar(bar);
-    let mut pass = if crate::intel_gpu_xelpg_external::routes_stopped() {
-        None
-    } else {
-        display
-            .as_ref()
-            .filter(|display| !display.reset_lost())
-            .and_then(|display| display.external_pass().ok())
+pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    let Some(gpu) = with_display_info(|gpu| *gpu).filter(|gpu| {
+        gpu.gtt_mmadr.phys == bar.phys
+            && crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation)
+    }) else {
+        return Ok(());
     };
-    if let Some(pass) = pass.as_mut() {
-        pass.pre_update();
-    }
-    let done = with_display_info(|gpu| {
-        if gpu.gtt_mmadr.phys != bar.phys {
-            return true;
-        }
-        let window = gpu.mode_window();
-        crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
-    })
-    .unwrap_or(true);
-    drop(pass);
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let _pass = match display.as_ref() {
+        Some(display) => Some(
+            display
+                .external_retirement(crate::intel_gpu_xelpg_external::routes_stopped)
+                .await?,
+        ),
+        None => None,
+    };
+    let done = crate::intel_gpu_xelpg_external::teardown_mtl_external(
+        &gpu.mode_window(),
+        gpu.chip.generation,
+    );
     if !crate::intel_gpu_xelpg_external::route_live() {
         let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
         if serial != 0 {

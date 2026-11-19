@@ -358,6 +358,55 @@ fn remove_external(platform: &MockPlatform, multi: &res::State, single: &res::St
     reset_published_layout();
 }
 
+fn smoke_kms_external_teardown_waits_for_cancelled_panel_flip() -> TestResult {
+    let platform = MockPlatform::new();
+    let (timing, multi) = beside_external(&platform);
+    let (single, _) = layouts(&platform, timing);
+    let device = platform.meteor();
+    let mut session = complete(device.session()).unwrap();
+    let mut flip = Box::pin(session.present(object(true).unwrap(), geometry()));
+    assert!(once(flip.as_mut()).is_pending());
+    let target = platform.read32(SURF);
+    assert_ne!(target, CONSOLE);
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    drop(flip);
+    drop(session);
+    let legacy = device.legacy_drain().unwrap();
+
+    // The route check itself belongs under the mutex. An in-flight pass
+    // can change its published presence before the panel owner is free.
+    let sampled = core::cell::Cell::new(false);
+    let mut retirement = Box::pin(device.external_retirement(|| {
+        sampled.set(true);
+        false
+    }));
+    assert!(once(retirement.as_mut()).is_pending());
+    assert!(!sampled.get());
+    drop(legacy);
+    assert!(device.external_pass().is_err());
+    assert!(once(retirement.as_mut()).is_pending());
+    assert!(sampled.get());
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    assert_eq!(platform.read32(0x71008), 3 << 30);
+
+    let pass = complete(retirement).unwrap();
+    assert_eq!(platform.read32(LIVE), target);
+    assert!(device.state.try_lock().is_none());
+    platform.step_on_read(Some(FRAME));
+    remove_external(&platform, &multi, &single);
+    drop(pass);
+    platform.step_on_read(None);
+    complete(device.quiesce()).unwrap();
+    assert_eq!(platform.read32(LIVE), CONSOLE);
+    assert_eq!(platform.mapping_count(), 0);
+    assert!(device.external_pass().is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_external_teardown_waits_for_cancelled_panel_flip
+);
+
 /// The first and last write of the repartition in `writes`.
 fn repartition_span(writes: &[(u64, u32)]) -> (usize, usize) {
     let touched = |r: u64| external_or_global(r) || (0x70140..0x70380).contains(&r);
