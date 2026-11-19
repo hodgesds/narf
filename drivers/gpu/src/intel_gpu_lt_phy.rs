@@ -6,8 +6,8 @@
 //! contains the source-qualified portion of Linux's `intel_lt_phy.c` contract:
 //! port/register selection, DP and eDP PLL images, VDR write-image
 //! construction, transmitter ownership/masking, DP signal-level tables and
-//! the disconnected MMIO transport. A strict, read-only display-35 route proof
-//! grants no programming authority; production remains disconnected.
+//! the disconnected MMIO transport. The PCI probe can read the inherited
+//! display-35 primary through the strict Nova Lake-S boot option.
 //!
 //! Pinned source: the local Linux tree's
 //! `drivers/gpu/drm/i915/display/{intel_lt_phy.c,intel_lt_phy_regs.h,
@@ -28,7 +28,7 @@ use crate::intel_gpu_xelpg::{
     POWER_STATE_READY_MASK, SSC_ENABLE_PLLA, SSC_ENABLE_PLLB, XE3_DDI_CLOCK_SELECT_MASK,
 };
 
-/// Destructive display option reserved for the exact Nova Lake-S route.
+/// Read the firmware primary before the exact Nova Lake-S GT probe.
 pub(crate) const OPT_IN: &str = "narf.intel.nvl_display";
 const PICA_PHY_CONFIG_CONTROL: u64 = 0x16_fe68;
 const EDP_ON_TYPEC: u32 = 1 << 31;
@@ -37,6 +37,118 @@ const TRANSCONF_A: u64 = 0x70_008;
 /// Strict option grammar shared by Intel's destructive route gates.
 pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
     crate::intel_gpu_gt::boot_opt_in(args, OPT_IN)
+}
+
+// xe_mmio_probe_early: the first 16 MiB of GTTMMADR belongs to the root
+// tile, with registers in its first 4 MiB. Mapping just the register block
+// avoids sizing writes to the live firmware BAR or mapping the GGTT.
+const ROOT_REGISTERS: u64 = 4 << 20;
+
+fn firmware_bar(low: u32, high: u32) -> Option<(u64, narf_bus::BarKind)> {
+    use narf_bus::BarKind::*;
+    let (base, kind) = match low & 15 {
+        0 => (
+            u64::from(low),
+            Mmio32 {
+                prefetchable: false,
+            },
+        ),
+        4 => (
+            (u64::from(high) << 32) | u64::from(low & !15),
+            Mmio64 {
+                prefetchable: false,
+            },
+        ),
+        _ => return None,
+    };
+    (base != 0 && base < 1 << 48 && base % (16 << 20) == 0).then_some((base, kind))
+}
+
+fn firmware_probe_route<T>(
+    platform: GtPlatform,
+    args: narf_boot::args::KernelCmdline<'_>,
+    observe: impl FnOnce() -> T,
+) -> Option<T> {
+    (platform == GtPlatform::NovaLakeS && requested(args)).then(observe)
+}
+
+/// Some (including a refusal) consumes the probe before PCI normalization,
+/// modesetting, DMA setup, or scheduling a headless full-device reset.
+pub(crate) fn probe_firmware_primary(
+    platform: GtPlatform,
+    device: &narf_bus::BusDevice,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Option<Result<crate::intel_gpu_xe3plpd::FirmwarePrimary, RouteRefusal>> {
+    use narf_bus::pci;
+    firmware_probe_route(platform, narf_boot::args(), || {
+        let no_device = RouteRefusal::Ip(IpError::NoDevice);
+        if !matches!(device.kind, narf_bus::BusKind::Pcie { addr, .. } if addr.bus == 0)
+            || narf_bus::vmd_domain::domain_for_device(device).is_some()
+        {
+            return Err(no_device);
+        }
+        let config = |off| pci::read_config32(cap, device, off).map_err(|_| no_device);
+        let bar_base = || {
+            if config(0)? != (u32::from(device.id.device) << 16 | 0x8086)
+                || config(8)? >> 8 != device.id.class
+                || device.id.class >> 16 != 3
+                || !matches!(
+                    pci::power_state(cap, device),
+                    Ok(Some(pci::PciPowerState::D0))
+                )
+                || !matches!(pci::read_command(cap, device), Ok(v) if v != u16::MAX && v & pci::cmd::MEM_SPACE != 0)
+            {
+                return Err(no_device);
+            }
+            firmware_bar(config(0x10)?, config(0x14)?).ok_or(no_device)
+        };
+        let bar = bar_base()?;
+        let (base, kind) = bar;
+        if (0..ROOT_REGISTERS)
+            .step_by(4096)
+            .any(|off| narf_memory::frame::is_system_ram(narf_memory::PhysAddr::new(base + off)))
+            || bar_base()? != bar
+        {
+            return Err(no_device);
+        }
+        // SAFETY: the probe owns this native PCI function. The stable assigned
+        // non-prefetchable BAR0 is decoded in D0; the source-defined root
+        // register block fits in its first 16 MiB. No PCI BAR is resized.
+        let mapping = unsafe {
+            narf_memory::ioremap::ioremap(
+                base,
+                ROOT_REGISTERS,
+                narf_memory::ioremap::MmioAttrs::Device,
+            )
+        }
+        .map_err(|_| no_device)?;
+        let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(base),
+                virt: mapping.va(),
+                len: ROOT_REGISTERS,
+                kind,
+            },
+            *cap,
+        );
+        // VF_CAP_REG is read-only; a VF or an inaccessible function cannot
+        // expose a host display snapshot. Recheck the firmware mapping after
+        // both register samples while the probe still owns the function.
+        let result = (|| {
+            if bar_base()? != bar || window.read32(0x1901f8) & 1 != 0 {
+                return Err(no_device);
+            }
+            let primary = display_route(platform, true, &window)?;
+            if bar_base()? != bar || window.read32(0x1901f8) & 1 != 0 {
+                return Err(no_device);
+            }
+            Ok(primary)
+        })();
+        // SAFETY: the owning PCI probe is the only user of this ephemeral
+        // window. The returned primary carries numbers, not a BAR alias.
+        unsafe { narf_memory::ioremap::iounmap(mapping) };
+        result
+    })
 }
 
 /// Why display 35.00 remains on the headless profile.
@@ -48,35 +160,62 @@ pub(crate) enum RouteRefusal {
     PipeAFused,
     EdpOnTypeC,
     PipeADark,
+    PanelRoute,
+    PrimaryDark,
+    PrimaryLayout,
+    PrimarySurface,
+    Changed,
 }
 
-/// Exact, read-only Nova Lake-S display-35 route proof. This does not build a
-/// [`crate::intel_gpu_xe2lpd::DisplayIp`] and therefore grants no modeset or
-/// LT-PHY programming authority.
+/// Snapshot the exact firmware primary before the headless GT lifecycle.
 pub(crate) fn display_route(
     platform: GtPlatform,
     requested: bool,
     io: &(impl MmioWindow + ?Sized),
-) -> Result<DisplayIdentity, RouteRefusal> {
+) -> Result<crate::intel_gpu_xe3plpd::FirmwarePrimary, RouteRefusal> {
     if platform != GtPlatform::NovaLakeS {
         return Err(RouteRefusal::UnsupportedPlatform);
     }
     if !requested {
         return Err(RouteRefusal::NotRequested);
     }
+    let sample = || {
+        qualify_lit_pipe_a(io)?;
+        crate::intel_gpu_xe3plpd::read_firmware_primary(io)
+    };
+    let primary = sample()?;
+    if sample()? != primary {
+        return Err(RouteRefusal::Changed);
+    }
+    Ok(primary)
+}
+
+fn qualify_lit_pipe_a(io: &(impl MmioWindow + ?Sized)) -> Result<(), RouteRefusal> {
     let identity = DisplayIdentity::read(io).map_err(RouteRefusal::Ip)?;
     if identity != DisplayIdentity::NovaLakeS {
         let (ver, rel) = identity.version();
         return Err(RouteRefusal::Ip(IpError::Unqualified { ver, rel }));
     }
     let dfsm = io.read32(SKL_DFSM);
-    let pica = io.read32(PICA_PHY_CONFIG_CONTROL);
-    let conf = io.read32(TRANSCONF_A);
-    if dfsm == u32::MAX || pica == u32::MAX || conf == u32::MAX || !io.display_access_ok() {
+    if dfsm == u32::MAX || !io.display_access_ok() {
         return Err(RouteRefusal::Ip(IpError::NoDevice));
     }
     if dfsm & DFSM_PIPE_A_DISABLE != 0 {
         return Err(RouteRefusal::PipeAFused);
+    }
+    // intel_display_power_map.c: PW1 and PW_A supply the Pipe A register
+    // domain. Observe both state bits without acquiring a power-well request.
+    let power = io.read32(0x45404);
+    if power == u32::MAX || !io.display_access_ok() {
+        return Err(RouteRefusal::Ip(IpError::NoDevice));
+    }
+    if power & 0x401 != 0x401 {
+        return Err(RouteRefusal::PipeADark);
+    }
+    let pica = io.read32(PICA_PHY_CONFIG_CONTROL);
+    let conf = io.read32(TRANSCONF_A);
+    if pica == u32::MAX || conf == u32::MAX || !io.display_access_ok() {
+        return Err(RouteRefusal::Ip(IpError::NoDevice));
     }
     if pica & EDP_ON_TYPEC != 0 {
         return Err(RouteRefusal::EdpOnTypeC);
@@ -84,7 +223,7 @@ pub(crate) fn display_route(
     if conf & (3 << 30) != 3 << 30 {
         return Err(RouteRefusal::PipeADark);
     }
-    Ok(identity)
+    Ok(())
 }
 
 pub(crate) const LANE0: u8 = 1;
@@ -1765,8 +1904,17 @@ mod tests {
         io.regs.borrow_mut().extend([
             (crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY, 35 << 22),
             (SKL_DFSM, 0),
+            (0x45404, 0x401),
             (PICA_PHY_CONFIG_CONTROL, 0),
             (TRANSCONF_A, 3 << 30),
+            (0x60400, 0x8a00_0000),
+            (0x64000, 1 << 31),
+            (0x70180, 0x8400_0000),
+            (0x70188, 128), // 8192-byte pitch, 512 bytes of padding
+            (0x70190, 1079 << 16 | 1919),
+            (0x6001c, 1919 << 16 | 1079),
+            (0x7019c, 0x0123_4000),
+            (0x701ac, 0x0123_4000),
         ]);
         io
     }
@@ -1776,10 +1924,14 @@ mod tests {
 
         let io = lit_nvl();
         let before = io.regs.borrow().clone();
+        let primary = display_route(GtPlatform::NovaLakeS, true, &io).unwrap();
+        assert_eq!(primary.format, crate::drm::card::PixelFormat::Xrgb8888);
         assert_eq!(
-            display_route(GtPlatform::NovaLakeS, true, &io),
-            Ok(DisplayIdentity::NovaLakeS)
+            (primary.geometry.width, primary.geometry.height),
+            (1920, 1080)
         );
+        assert_eq!(primary.geometry.pitch, 8192);
+        assert_eq!(primary.gtt_offset, 0x0123_4000);
         assert_eq!(*io.regs.borrow(), before);
         assert_eq!(
             display_route(
@@ -1808,6 +1960,23 @@ mod tests {
             ),
             (TRANSCONF_A, 0, RouteRefusal::PipeADark),
             (TRANSCONF_A, u32::MAX, RouteRefusal::Ip(IpError::NoDevice)),
+            (0x45404, 1, RouteRefusal::PipeADark),
+            (0x60400, 0x9200_0000, RouteRefusal::PanelRoute), // wrong port
+            (0x60400, 0x8b00_0000, RouteRefusal::PanelRoute), // MST
+            (0x64000, 0, RouteRefusal::PanelRoute),           // port buffer disabled
+            (0x78000, 1 << 29, RouteRefusal::PanelRoute),     // joined pipes
+            (0x70180, 0, RouteRefusal::PrimaryDark),
+            (0x70180, 0x8400_1400, RouteRefusal::PrimaryLayout), // Tile4
+            (0x70180, 0x8400_8000, RouteRefusal::PrimaryLayout), // CCS
+            (0x70180, 0x8400_0002, RouteRefusal::PrimaryLayout), // 180 degrees
+            (0x701cc, 0x20, RouteRefusal::PrimaryLayout),        // per-pixel alpha
+            (0x701a4, 1, RouteRefusal::PrimaryLayout),           // source offset
+            (0x7018c, 1, RouteRefusal::PrimaryLayout),           // destination offset
+            (0x70188, 119, RouteRefusal::PrimaryLayout),         // short stride
+            (0x6001c, 1900 << 16 | 1079, RouteRefusal::PrimaryLayout),
+            (0x7019c, 0x0123_4004, RouteRefusal::PrimarySurface), // protected
+            (0x701ac, 0x0400_0000, RouteRefusal::PrimarySurface), // flip pending
+            (0x701ac, u32::MAX, RouteRefusal::Ip(IpError::NoDevice)),
         ] {
             let io = lit_nvl();
             io.regs.borrow_mut().insert(reg, value);
@@ -1836,6 +2005,97 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_nvl_display_route_is_exact_and_read_only
+    );
+
+    fn smoke_nvl_firmware_observation_excludes_reset_and_torn_surfaces() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        use narf_bus::BarKind;
+        struct ReadOnly<'a> {
+            io: &'a FakeLtMmio,
+            stride_reads: Cell<u8>,
+        }
+        impl MmioWindow for ReadOnly<'_> {
+            fn read32(&self, reg: u64) -> u32 {
+                if reg == 0x70188 {
+                    let n = self.stride_reads.get();
+                    self.stride_reads.set(n + 1);
+                    return 128 + u32::from(n);
+                }
+                self.io.read32(reg)
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("firmware observation wrote MMIO");
+            }
+        }
+        let requested = KernelCmdline::new("narf.intel.nvl_display=1");
+        let io = lit_nvl();
+        io.regs
+            .borrow_mut()
+            .extend([(0x70180, 0x8410_0000), (0x7019c, 0), (0x701ac, 0)]);
+        let probe = |io: &FakeLtMmio| {
+            firmware_probe_route(GtPlatform::NovaLakeS, requested, || {
+                display_route(GtPlatform::NovaLakeS, true, io)
+            })
+        };
+        let primary = probe(&io).unwrap().unwrap();
+        assert_eq!(primary.format, crate::drm::card::PixelFormat::Xbgr8888);
+        assert_eq!(primary.gtt_offset, 0);
+        let io_readonly = ReadOnly {
+            io: &io,
+            stride_reads: Cell::new(0),
+        };
+        assert_eq!(
+            display_route(GtPlatform::NovaLakeS, true, &io_readonly),
+            Err(RouteRefusal::Changed)
+        );
+        io.regs
+            .borrow_mut()
+            .extend([(0x7019c, 0xfff0_0000), (0x701ac, 0xfff0_0000)]);
+        assert_eq!(probe(&io), Some(Err(RouteRefusal::PrimaryLayout))); // exceeds 4 GiB
+        for (platform, args) in [
+            (GtPlatform::NovaLakeS, KernelCmdline::new("")),
+            (GtPlatform::WildcatLake, requested),
+        ] {
+            assert_eq!(
+                firmware_probe_route(platform, args, || panic!("unexpected snapshot")),
+                None::<()>
+            );
+        }
+        assert_eq!(
+            firmware_bar(0xc0000000, 3),
+            Some((
+                0xc0000000,
+                BarKind::Mmio32 {
+                    prefetchable: false
+                }
+            ))
+        );
+        assert_eq!(
+            firmware_bar(0x80000004, 1),
+            Some((
+                0x180000000,
+                BarKind::Mmio64 {
+                    prefetchable: false
+                }
+            ))
+        );
+        for (lo, hi) in [
+            (0, 0),
+            (4, 0),
+            (0xc0000001, 0),
+            (0xc0000008, 0),
+            (0xc0000002, 0),
+            (0xc0001004, 0),
+            (0xc0000004, 0x10000),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert_eq!(firmware_bar(lo, hi), None);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_firmware_observation_excludes_reset_and_torn_surfaces
     );
 
     fn smoke_nvl_display35_cdclk_table_and_hooks() -> TestResult {

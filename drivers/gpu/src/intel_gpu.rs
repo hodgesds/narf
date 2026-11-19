@@ -600,6 +600,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         return Err(narf_bus::ProbeError::NotForThisDriver);
     };
+    // Nova's explicit firmware-observation route terminates here even if
+    // the live plane cannot be reconstructed. PCI parking and the headless
+    // GT's driver FLR would destroy state this option exists to observe.
+    if let Some(result) = crate::intel_gpu_lt_phy::probe_firmware_primary(platform, &device, &cap) {
+        use core::fmt::Write as _;
+        match result {
+            Ok(primary) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} firmware Pipe A {}x{} {:?}, pitch {} bytes, GGTT {:#x}",
+                    device.id.vendor,
+                    device.id.device,
+                    primary.geometry.width,
+                    primary.geometry.height,
+                    primary.format,
+                    primary.geometry.pitch,
+                    primary.gtt_offset,
+                );
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} firmware Pipe A readout refused ({reason:?})",
+                    device.id.vendor,
+                    device.id.device,
+                );
+            }
+        }
+        return Ok(());
+    }
     // Normalize every admitted Intel graphics function before any route
     // probe maps or reads BAR0. Firmware may hand an integrated or discrete
     // GPU to us in D3hot, where the transition back to D0 can clear BARs.

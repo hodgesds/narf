@@ -504,10 +504,16 @@ selection. The disconnected CDCLK model pins the complete 31-rung
 `xe3p_lpd_cdclk_table` (151.2–787.2 MHz), its ratio-21 squash waveforms,
 19.2 MHz crawl ladder, MDCLK source and zero-voltage-level hook, but requires
 DC-off and Type-C/D2D/AUX ownership from a future
-caller. Its strict `narf.intel.nvl_display=1` route proof is read-only and
-requires exact `GtPlatform::NovaLakeS`, GMD 35.00, an unfused and firmware-lit
-Pipe A, and a non-Type-C eDP panel; it constructs no operational `DisplayIp`
-and is not a production route.
+caller. On Nova Lake-S, `narf.intel.nvl_display=1` selects firmware display
+observation at PCI probe. The probe reports the inherited Pipe A primary
+or its refusal on the console and returns before PCI command changes or the
+headless GT reset. It requires a decoded native BAR0 in D0, a physical
+function, GMD 35.00, powered and unfused Pipe A and an enabled unjoined
+DP SST transcoder on combo port A. Two matching snapshots establish the
+origin-aligned linear XRGB8888 or XBGR8888 primary's dimensions, byte pitch
+and GGTT offset. The armed and live surface must agree, and the pitch must
+cover each row. Firmware keeps the display. With the option omitted, the
+existing headless GT probe runs.
 `intel_gpu_nvl_resources::NovaResourcePlan` is the pure, crate-private
 ownership contract for a future live route. It binds eDP A to Pipe A, combo-B
 DP/HDMI and TC1/TC2 USB-C DP-alt to Pipes B-D, retaining the same-index

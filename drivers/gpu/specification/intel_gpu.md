@@ -390,11 +390,12 @@ The disconnected CDCLK model pins all 31 `xe3p_lpd_cdclk_table` rungs from
 151.2 through 787.2 MHz, including the ratio-21 squash waveforms, the 19.2 MHz
 crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. It
 requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
-production route supplies those preconditions. A strict
-`narf.intel.nvl_display=1` read-only route decision requires exact Nova Lake-S,
-GMD 35.00, an unfused and firmware-lit Pipe A and eDP outside Type-C. It grants
-no programming authority: display 35.00 remains operationally gated pending
-Nova Lake display/output ownership. WCL stays on the separate C10/C20 route.
+production route supplies those preconditions. On Nova Lake-S,
+`narf.intel.nvl_display=1` reports the firmware primary at PCI probe and skips
+the headless GT reset for that boot, including when readout fails. For an
+enabled SST output on port A it checks two live scanout snapshots and reports
+the format, dimensions, byte pitch and GGTT offset. Firmware keeps the panel.
+WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
 owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
 port B/Pipes B-D, and DP-alt on LT TC1/TC2/Pipes B-D. Each plan retains the
