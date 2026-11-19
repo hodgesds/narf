@@ -157,6 +157,7 @@ mod abi_futex_tests;
 mod abi_inode_identity_tests;
 mod abi_ioerrno_tests;
 mod abi_ipc_tests;
+mod abi_kallsyms_tests;
 mod abi_lookup_error_tests;
 mod abi_mem2_tests;
 mod abi_mem_tests;

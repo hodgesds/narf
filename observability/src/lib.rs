@@ -38,6 +38,7 @@
 extern crate alloc;
 
 pub mod gdb;
+pub mod kallsyms;
 pub mod peek;
 
 mod tests;

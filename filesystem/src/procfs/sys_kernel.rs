@@ -583,12 +583,56 @@ fn read_dmesg_restrict() -> String {
     String::from("1\n")
 }
 
-// kernel/kptr_restrict: "2" — always hide kernel pointers.
-// NARF full restriction by default; writable for completeness but
-// we never loosen below 1 (in a real build the cap system enforces
-// this separately; here we just clamp).
+/// `kernel.kptr_restrict` (`lib/vsprintf.c::kptr_restrict`), consumed by
+/// [`super::kallsyms::kallsyms_show_value`]:
+///
+/// * `0` — kernel addresses are shown to readers perf would trust
+///   (`perf_event_paranoid <= 1`) and to `CAP_SYSLOG` holders;
+/// * `1` — only to `CAP_SYSLOG` holders;
+/// * `2` — to nobody: every address reads as zero.
+///
+/// The default is 2, not Linux's compiled-in 0. NARF's stated posture is that
+/// kernel layout is exposed only on request (`dmesg_restrict` is 1, the boot
+/// log carries no KASLR offset), so revealing addresses is an administrator's
+/// explicit `sysctl kernel.kptr_restrict=1` (or 0), not something a fresh
+/// boot does on its own.
+pub(crate) static KPTR_RESTRICT: AtomicU32 = AtomicU32::new(KPTR_RESTRICT_DEFAULT);
+
+/// Boot value of [`KPTR_RESTRICT`].
+pub(crate) const KPTR_RESTRICT_DEFAULT: u32 = 2;
+
+/// `CAP_SYS_ADMIN` (`include/uapi/linux/capability.h`).
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// The live `kernel.kptr_restrict`.
+pub fn kptr_restrict() -> u32 {
+    KPTR_RESTRICT.load(Ordering::Acquire)
+}
+
+/// The live `kernel.perf_event_paranoid`.
+pub fn perf_event_paranoid() -> i32 {
+    PERF_EVENT_PARANOID.load(Ordering::Acquire)
+}
+
 fn read_kptr_restrict() -> String {
-    String::from("2\n")
+    format!("{}\n", kptr_restrict())
+}
+
+/// `proc_dointvec_minmax_sysadmin` with `extra1 = SYSCTL_ZERO`,
+/// `extra2 = SYSCTL_TWO` (`kernel/printk/sysctl.c`): a write needs
+/// `CAP_SYS_ADMIN` on top of the file's 0644 mode — the mode alone would let
+/// any root-uid process that dropped its capabilities re-expose kernel
+/// addresses — and a value outside 0..=2 is `EINVAL`.
+fn write_kptr_restrict(v: &str) -> Result<(), FsError> {
+    if !crate::caller_capable(CAP_SYS_ADMIN) {
+        return Err(FsError::OperationNotPermitted);
+    }
+    let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
+    if n > 2 {
+        return Err(FsError::InvalidData);
+    }
+    KPTR_RESTRICT.store(n, Ordering::Release);
+    Ok(())
 }
 
 fn read_perf_event_paranoid() -> String {
@@ -961,11 +1005,12 @@ pub fn register_all() {
         write: None,
         perms: 0o444,
     });
+    // `kernel/printk/sysctl.c`: 0644 `proc_dointvec_minmax_sysadmin`.
     register_sysctl(SysctlEntry {
         path: "kernel/kptr_restrict",
         read: read_kptr_restrict,
-        write: None,
-        perms: 0o444,
+        write: Some(write_kptr_restrict),
+        perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "kernel/perf_event_paranoid",
@@ -1193,17 +1238,74 @@ kernel_test_in!(
     smoke_kernel_random_uuid_format
 );
 
-/// kptr_restrict = "2".
-fn smoke_kernel_kptr_restrict_is_two() -> TestResult {
+/// kptr_restrict boots at "2" (addresses hidden from everyone) and the file
+/// reports the live value.
+fn smoke_kernel_kptr_restrict_default_is_two() -> TestResult {
     register_all();
+    if KPTR_RESTRICT_DEFAULT != 2 || kptr_restrict() != KPTR_RESTRICT_DEFAULT {
+        return TestResult::Fail("kptr_restrict did not boot at 2");
+    }
     match read_sys("kernel/kptr_restrict") {
-        Some(s) if s.trim() == "2" => TestResult::Pass,
-        _ => TestResult::Fail("kptr_restrict is not 2"),
+        Some(s) if s == "2\n" => TestResult::Pass,
+        _ => TestResult::Fail("kptr_restrict file does not read 2"),
     }
 }
 kernel_test_in!(
     "filesystem/procfs/sys_kernel",
-    smoke_kernel_kptr_restrict_is_two
+    smoke_kernel_kptr_restrict_default_is_two
+);
+
+/// kptr_restrict is a real sysctl: 0644, CAP_SYS_ADMIN writes 0..=2 and the
+/// file reads them back, 3 and junk are EINVAL, and a writer without
+/// CAP_SYS_ADMIN gets EPERM and changes nothing
+/// (`proc_dointvec_minmax_sysadmin`).
+fn smoke_kernel_kptr_restrict_write_is_sysadmin_and_ranged() -> TestResult {
+    register_all();
+    let Some(f) = lookup_sys("kernel/kptr_restrict") else {
+        return TestResult::Fail("kptr_restrict not found");
+    };
+    if f.perms() != 0o644 || !f.writable() {
+        return TestResult::Fail("kptr_restrict is not a 0644 writable key");
+    }
+    struct Restore(Option<fn(u32) -> bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::__test_swap_caller_capable_hook(self.0);
+            KPTR_RESTRICT.store(KPTR_RESTRICT_DEFAULT, Ordering::Release);
+        }
+    }
+    let _restore = Restore(crate::__test_swap_caller_capable_hook(Some(|cap| {
+        cap == CAP_SYS_ADMIN
+    })));
+    for v in [0u32, 1, 2] {
+        if f.write(alloc::format!("{v}\n").as_bytes()).is_err() {
+            return TestResult::Fail("CAP_SYS_ADMIN write of 0..=2 rejected");
+        }
+        if read_sys("kernel/kptr_restrict") != Some(alloc::format!("{v}\n")) {
+            return TestResult::Fail("kptr_restrict does not read back the written value");
+        }
+    }
+    for bad in [&b"3\n"[..], b"-1\n", b"x\n"] {
+        if !matches!(f.write(bad), Err(FsError::InvalidData)) {
+            return TestResult::Fail("out-of-range kptr_restrict not EINVAL");
+        }
+    }
+    if kptr_restrict() != 2 {
+        return TestResult::Fail("a rejected write changed kptr_restrict");
+    }
+    // Without CAP_SYS_ADMIN — whatever else the caller holds — EPERM.
+    crate::__test_swap_caller_capable_hook(Some(|cap| cap != CAP_SYS_ADMIN));
+    if !matches!(f.write(b"0\n"), Err(FsError::OperationNotPermitted)) {
+        return TestResult::Fail("write without CAP_SYS_ADMIN not EPERM");
+    }
+    if kptr_restrict() != 2 {
+        return TestResult::Fail("an unprivileged write changed kptr_restrict");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_kptr_restrict_write_is_sysadmin_and_ranged
 );
 
 /// modprobe returns "\n" (empty stub).

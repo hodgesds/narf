@@ -31,6 +31,7 @@ narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-efi          = { path = "../efi" }
 narf-rcu          = { path = "../rcu" }
+narf-observability = { path = "../observability" }
 
 [features]
 # Linux-shaped mount/bind-mount/overlayfs plumbing.  Stub for Waves 63-67.
