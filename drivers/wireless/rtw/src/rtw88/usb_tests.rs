@@ -2,13 +2,13 @@
 //! RTL8821CU USB transport (Linux rtw88/usb.c) register-model and framing
 //! cases. Inert software models only: no USB device is touched.
 use super::usb::{self, Endpoints, Registers, Speed, QSEL_BEACON, QSEL_H2C, QSEL_MGMT, TX_DESC};
-use crate::rtl8xxxu::firmware_transport::ControlIo;
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
 use narf_drivers_usb::device::UsbError;
+use narf_drivers_wireless_rtl_usb::ControlIo;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -414,7 +414,7 @@ fn smoke_rtw88_usb_driver_id_table_and_endpoint_contexts() -> TestResult {
     {
         return TestResult::Fail("rtw8821cu id table differs from rtw_8821cu_id_table");
     }
-    if crate::rtl8xxxu::RTL8XXXU_USB_IDS
+    if narf_drivers_wireless_rtl_usb::RTL8XXXU_USB_IDS
         .iter()
         .any(|m| usb::is_rtl8821cu(m.vendor_id, m.product_id))
     {
@@ -518,7 +518,7 @@ fn smoke_rtw88_usb_8822bu_id_table_host_and_fifo() -> TestResult {
     {
         return TestResult::Fail("8821CU/8822BU tables overlap or chip map wrong");
     }
-    if crate::rtl8xxxu::RTL8XXXU_USB_IDS
+    if narf_drivers_wireless_rtl_usb::RTL8XXXU_USB_IDS
         .iter()
         .any(|m| usb::is_rtl8822bu(m.vendor_id, m.product_id))
     {

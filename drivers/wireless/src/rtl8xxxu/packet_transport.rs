@@ -9,8 +9,8 @@ use super::{
     device_init::Endpoints,
     packet_codec::{self, Kind, Record, MAX_TRANSFER},
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use narf_drivers_usb::device::{BulkToken, USBDevice, UsbError};
+use alloc::{boxed::Box, vec::Vec};
+use narf_drivers_usb::device::UsbError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -41,65 +41,8 @@ pub struct Recovery {
     /// without a USB delivery receipt.
     pub transmit_lost: bool,
 }
-/// No caller/DMA alias survives a begin call: native USB stages TX bytes and
-/// retains RX storage itself. Only an exact terminal receipt may copy/reuse.
-#[async_trait::async_trait]
-pub trait Io: Send + Sync {
-    type Receipt: Send + Sync;
-    fn begin_receive(&self, dci: u8, length: usize) -> Result<Self::Receipt, UsbError>;
-    fn poll_receive(
-        &self,
-        receipt: &Self::Receipt,
-        bytes: &mut [u8],
-    ) -> Result<Option<usize>, UsbError>;
-    fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<Self::Receipt, UsbError>;
-    fn poll_send(&self, receipt: &Self::Receipt) -> Result<Option<usize>, UsbError>;
-    async fn stop(&self, receipt: &Self::Receipt) -> Result<(), UsbError>;
-    /// Host Reset Endpoint + Set TR Dequeue, then device
-    /// CLEAR_FEATURE(ENDPOINT_HALT) for `endpoint` (descriptor address).
-    /// Any retained receipt on that pipe becomes stale.
-    async fn clear_halt(&self, _endpoint: u8) -> Result<(), UsbError> {
-        Err(UsbError::NotConfigured)
-    }
-}
-#[derive(Clone)]
-pub struct UsbIo(Arc<USBDevice>);
-impl core::fmt::Debug for UsbIo {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtl8188euUsbIo").finish_non_exhaustive()
-    }
-}
-impl UsbIo {
-    pub fn new(device: Arc<USBDevice>) -> Self {
-        Self(device)
-    }
-}
-#[async_trait::async_trait]
-impl Io for UsbIo {
-    type Receipt = BulkToken;
-    fn begin_receive(&self, dci: u8, length: usize) -> Result<BulkToken, UsbError> {
-        self.0.begin_bulk_in(dci, length)
-    }
-    fn poll_receive(
-        &self,
-        receipt: &BulkToken,
-        bytes: &mut [u8],
-    ) -> Result<Option<usize>, UsbError> {
-        self.0.poll_bulk_in(receipt, bytes)
-    }
-    fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<BulkToken, UsbError> {
-        self.0.begin_bulk_out(dci, bytes)
-    }
-    fn poll_send(&self, receipt: &BulkToken) -> Result<Option<usize>, UsbError> {
-        self.0.poll_bulk_out(receipt)
-    }
-    async fn stop(&self, receipt: &BulkToken) -> Result<(), UsbError> {
-        self.0.stop_bulk(receipt).await
-    }
-    async fn clear_halt(&self, endpoint: u8) -> Result<(), UsbError> {
-        self.0.clear_endpoint_halt(endpoint).await
-    }
-}
+// `Io`/`UsbIo` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
+pub use narf_drivers_wireless_rtl_usb::{Io, UsbIo};
 struct Transmit<R> {
     receipt: R,
     bytes: usize,

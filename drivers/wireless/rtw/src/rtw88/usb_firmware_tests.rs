@@ -8,13 +8,13 @@ use super::{
     usb::{Endpoints, Speed, QSEL_BEACON, QSEL_H2C, TX_DESC},
     usb_firmware::Backend,
 };
-use crate::rtl8xxxu::{firmware_transport::ControlIo, packet_transport::Io as Bulk};
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
 use narf_drivers_usb::device::UsbError;
+use narf_drivers_wireless_rtl_usb::{ControlIo, Io as Bulk};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 

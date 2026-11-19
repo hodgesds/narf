@@ -326,7 +326,7 @@ fn read_trims(io: &mut impl EfuseIo, chip: Geometry) -> Result<[u8; 19], EfuseEr
 
 /// Decode one-/two-byte headers, sparse word enables, and later word
 /// overrides. Protected physical bytes must be excluded by the caller.
-pub(crate) fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
+pub fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
     logical.fill(0xff);
     let mut cursor = 0;
     while cursor < physical.len() {

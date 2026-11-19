@@ -8,9 +8,9 @@ use super::{
     usb::{self, Endpoints, MAX_RECVBUF, QSEL_MGMT, TX_DESC},
     usb_packet::{transmit_packet, Owner},
 };
-use crate::rtl8xxxu::packet_transport::Io;
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use narf_drivers_usb::device::UsbError;
+use narf_drivers_wireless_rtl_usb::Io;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 

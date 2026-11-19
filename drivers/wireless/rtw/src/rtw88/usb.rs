@@ -19,9 +19,9 @@
 //! transport" for the remaining admission blockers.
 
 use super::power::Command;
-use crate::rtl8xxxu::firmware_transport::ControlIo;
 use alloc::vec::Vec;
 use narf_drivers_usb::device::UsbError;
+use narf_drivers_wireless_rtl_usb::ControlIo;
 
 /// `usb.h`: `RTW_USB_CMD_READ` / `RTW_USB_CMD_WRITE` / `RTW_USB_CMD_REQ`.
 pub(super) const CMD_READ: u8 = 0xc0;

@@ -2,22 +2,20 @@
 
 extern crate alloc;
 
-mod future_heap;
+// Shared, driver-agnostic helpers promoted to `narf-drivers-wireless-core`.
+// Re-exported at the crate root so the still-inlined drivers' existing
+// `crate::firmware_asset` / `crate::future_heap` references keep resolving.
+pub use narf_drivers_wireless_core::{firmware_asset, future_heap, watchdog_work};
 
 pub mod ath10k;
 pub mod ath11k;
 pub mod ath9k;
 pub mod brcmfmac;
 pub mod cyw43439;
-mod firmware_asset;
-pub mod iwlwifi;
 mod qualcomm_pci;
 mod qualcomm_regulatory;
 pub mod rtl8xxxu;
 pub mod rtlwifi;
-pub mod rtw88;
-pub mod rtw89;
-mod watchdog_work;
 
 // MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920). Promoted out of the
 // former `src/mt7921/` module into the standalone dual-build crate
@@ -26,8 +24,26 @@ mod watchdog_work;
 // former dead MT7615 `mt76.rs` stub was deleted.
 pub use narf_drivers_wireless_mt76 as mt76;
 
+// Intel iwlwifi PCIe Wi-Fi. Promoted out of the former `src/iwlwifi/` module
+// into the standalone dual-build crate `narf-drivers-wireless-iwlwifi` (see
+// drivers/wireless/iwlwifi/). Its inner driver module is re-exported here as
+// `iwlwifi` so existing `crate::iwlwifi::{mlme,wpa,rekey,mac_ctx,…}` and
+// `iwlwifi::register()` references keep resolving.
+pub use narf_drivers_wireless_iwlwifi::iwlwifi;
+
+// Realtek RTW88/RTW89 PCIe Wi-Fi. Promoted out of the former
+// `src/{rtw88,rtw89}/` modules into the standalone dual-build family crate
+// `narf-drivers-wireless-rtw` (see drivers/wireless/rtw/). Inner driver
+// modules re-exported here as `rtw88`/`rtw89` so existing
+// `crate::rtw88::{pci_park,efuse,regs,…}` / `crate::rtw89::{…}` and
+// `rtw88::register()` / `rtw89::register()` references keep resolving.
+pub use narf_drivers_wireless_rtw::{rtw88, rtw89};
+
 #[cfg(feature = "kernel-test")]
 mod e2e_tests;
+
+#[cfg(feature = "kernel-test")]
+mod firmware_asset_tests;
 
 use narf_init::{InitResult, Stage};
 

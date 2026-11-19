@@ -1,0 +1,43 @@
+# Shared surface for NARF Wi-Fi drivers.
+#
+# The driver-agnostic helpers factored out of the `narf-drivers-wireless`
+# facade so per-driver crates (iwlwifi, …) can depend on THIS rather than on
+# the facade that aggregates them — same role `narf-drivers-net-core` plays for
+# the NIC drivers, avoiding a dependency cycle with the facade.
+#
+#   * `firmware_asset` — capability-gated owned-copy firmware loading.
+#   * `future_heap`    — heap-retained infrequent driver control futures.
+#
+# Unlike a driver crate this is never built to a `.ko`; it is a plain rlib
+# dependency. The `kernel-test` feature exposes the `firmware_asset::tests`
+# fixture (`install`) that several drivers' smoke tests reuse.
+
+[package]
+name         = "narf-drivers-wireless-core"
+description  = "Shared helpers for NARF Wi-Fi drivers (firmware_asset, future_heap)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Expose the `firmware_asset::tests::install` fixture + register the
+# module's own smoke tests. Pulls the crypto/test-harness crates only then.
+kernel-test = ["dep:narf-crypto", "dep:narf-kernel-test"]
+
+[dependencies]
+narf-capabilities = { path = "../../../capabilities" }
+narf-firmware     = { path = "../../../firmware" }
+narf-scheduler    = { path = "../../../scheduler" }
+narf-time         = { path = "../../../time" }
+narf-crypto       = { path = "../../../crypto", optional = true }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

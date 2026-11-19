@@ -7,7 +7,7 @@ use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError, FirmwareRegistry};
 
 #[derive(Debug)]
-pub(crate) struct Asset {
+pub struct Asset {
     pub bytes: Vec<u8>,
     pub cap: Cap<FirmwareBlob, Read>,
     pub signer: Option<[u8; 32]>,
@@ -55,7 +55,7 @@ impl CapOp<FirmwareBlob, Read> for Copy<'_> {
         })())
     }
 }
-pub(crate) fn load(
+pub fn load(
     authority: &Cap<FirmwareRegistry, Read>,
     name: &str,
     maximum: usize,
@@ -66,7 +66,7 @@ pub(crate) fn load(
         .map_err(|_| FirmwareError::AuthorityRevoked)??;
     copy(&cap, name, maximum, signer)
 }
-fn copy(
+pub fn copy(
     cap: &Cap<FirmwareBlob, Read>,
     name: &str,
     maximum: usize,
@@ -81,10 +81,9 @@ fn copy(
 }
 
 #[cfg(feature = "kernel-test")]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-    pub(crate) fn install(
+    pub fn install(
         authority: &Cap<FirmwareRegistry, narf_capabilities::Write>,
         name: &'static str,
         payload: &[u8],
@@ -128,46 +127,4 @@ pub(crate) mod tests {
             })
             .map_err(|_| FirmwareError::AuthorityRevoked)?
     }
-    fn smoke_wireless_asset_real_registry_epochs_owned_copy_and_bounds() -> TestResult {
-        let (_, read) = crate::brcmfmac::provision::tests::registry().unwrap();
-        let name = "narf-test/brcm/fw";
-        let asset = load(&read, name, 8, true).unwrap();
-        if asset.bytes != [0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6]
-            || !asset.current()
-            || asset.signer.is_none()
-            || !matches!(load(&read, name, 7, true), Err(FirmwareError::BadFormat))
-            || !matches!(
-                copy(&asset.cap, "narf-test/brcm/nv", 8, true),
-                Err(FirmwareError::BadFormat)
-            )
-        {
-            return TestResult::Fail(
-                "current owned asset copy ignored exact identity, signer or extent",
-            );
-        }
-        asset.cap.revoke();
-        if asset.current()
-            || !matches!(
-                copy(&asset.cap, name, 8, true),
-                Err(FirmwareError::AuthorityRevoked)
-            )
-            || asset.bytes != [0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6]
-        {
-            return TestResult::Fail(
-                "revoked source cap remained usable or invalidated owned copy",
-            );
-        }
-        read.revoke();
-        if !matches!(
-            load(&read, name, 8, true),
-            Err(FirmwareError::AuthorityRevoked)
-        ) {
-            return TestResult::Fail("revoked registry authority opened firmware asset");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/wireless/firmware_asset",
-        smoke_wireless_asset_real_registry_epochs_owned_copy_and_bounds
-    );
 }

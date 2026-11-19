@@ -23,7 +23,7 @@ use narf_scheduler::workqueue::{
 };
 
 /// A device whose watchdog step runs from [`WatchdogWork`].
-pub(crate) trait Watchdog: Send + Sync + 'static {
+pub trait Watchdog: Send + Sync + 'static {
     /// The device has been withdrawn: the work stops re-queueing.
     fn watchdog_stopped(&self) -> bool;
     /// One watchdog period's step. The future owns the device for its run.
@@ -42,7 +42,7 @@ struct WatchdogWork<D: Watchdog> {
 
 /// Queue `device`'s watchdog every `period_ms`, the first run one period
 /// from now. The work lives until a run finds the device stopped.
-pub(crate) fn start<D: Watchdog>(device: &Arc<D>, period_ms: u64) {
+pub fn start<D: Watchdog>(device: &Arc<D>, period_ms: u64) {
     start_jiffies(
         device,
         narf_time::timer::ns_to_jiffies(period_ms.saturating_mul(1_000_000)),
@@ -50,7 +50,7 @@ pub(crate) fn start<D: Watchdog>(device: &Arc<D>, period_ms: u64) {
 }
 
 /// [`start`] with the period in jiffies (tests use a short one).
-pub(crate) fn start_jiffies<D: Watchdog>(device: &Arc<D>, period: u64) {
+pub fn start_jiffies<D: Watchdog>(device: &Arc<D>, period: u64) {
     let work = Box::leak(Box::new(WatchdogWork {
         dw: DelayedWork::new(WorkFn::Async(run::<D>), false),
         device: Arc::downgrade(device),
