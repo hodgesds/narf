@@ -203,6 +203,9 @@ So the surface is small and grows deliberately. Today:
 | `narf_blk_register` | `(u64, *const u8, usize, *const u64, usize, u64) -> i32` | publish a disk: name, geometry `[block size, capacity, max blocks, flags]`, request callback, cookie |
 | `narf_blk_copy_in` | `(u64, u64, u64, u64, usize, usize) -> i32` | inside a write request: copy request bytes into one of the module's DMA buffers |
 | `narf_blk_copy_out` | `(u64, u64, u64, u64, usize, usize) -> i32` | inside a read request: copy DMA buffer bytes into the request |
+| `narf_blk_fill` | `(u64, u64, usize, *const u8, usize) -> i32` | inside a read request: copy module memory into the request (USB drivers) |
+| `narf_blk_fetch` | `(u64, u64, usize, *mut u8, usize) -> i32` | inside a write request: copy request bytes into module memory (USB drivers) |
+| `narf_usb_wait` | `(u64, u64, u64) -> i32` | wait up to 1 s for a callback-less bulk/interrupt request, polling it inline |
 
 Declare them as you would any foreign function:
 
@@ -231,9 +234,13 @@ synchronously: the kernel calls the module's
 `extern "C" fn(cookie, request, op, lba, count) -> i32` (op 0 read, 1 write,
 2 flush) in the module's domain, one request per disk at a time, split to the
 module's `max blocks`. The module moves data only with `narf_blk_copy_in` /
-`narf_blk_copy_out`, which copy between the request and its own DMA buffers,
-so neither side hands the other a pointer. `drivers/nvme` (`module_probe.rs`)
-is the worked example: a polled NVMe host. The retained per-device cap is still checked on every invocation; the
+`narf_blk_copy_out` (to and from its own DMA buffers: PCI drivers) or
+`narf_blk_fill` / `narf_blk_fetch` (to and from module memory: USB drivers).
+The module never sees the caller's buffer. `drivers/nvme` (`module_probe.rs`)
+is the PCI worked example, a polled NVMe host; `drivers/usb/storage` is the
+USB one, BOT over bulk requests waited with `narf_usb_wait` (callback-less
+requests only; it polls the transfer inline, so a synchronous request
+callback never depends on another task running). The retained per-device cap is still checked on every invocation; the
 manifest declaration only controls whether the imports can link.
 
 IRQ callbacks never run in hard-IRQ context. The FRAME handler accounts and

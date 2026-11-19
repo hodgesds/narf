@@ -208,6 +208,11 @@ pub struct Datapath {
         fn(owner: u64, token: u64, family: u32, kick: Completion) -> Result<u32, i32>,
     pub serial_tx: fn(owner: u64, token: u64, port: u32, out: &mut [u8]) -> Result<usize, i32>,
     pub serial_rx: fn(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize, i32>,
+    /// Poll one callback-less bulk/interrupt request inline until it is
+    /// terminal (0, then collect it with `poll`) or `timeout_ns` passes.
+    pub wait: fn(owner: u64, token: u64, urb: u64, timeout_ns: u64) -> i32,
+    /// Whether `owner` holds a live context for `token`.
+    pub context_live: fn(owner: u64, token: u64) -> bool,
 }
 
 static DATAPATH: AtomicUsize = AtomicUsize::new(0);
@@ -317,6 +322,28 @@ pub fn serial_rx(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize
         return Err(-22);
     }
     (datapath()?.serial_rx)(owner, token, port, data)
+}
+
+/// Wait for one request submitted without a completion callback by
+/// polling it inline, so the wait never depends on another task being
+/// scheduled. 0 once it is terminal (collect it with [`poll`]); `-ETIMEDOUT`;
+/// `-EINVAL` for an unknown request, one with a callback, or a timeout
+/// outside 1 ns..=1 s; `-EOPNOTSUPP` for control/configure requests, which
+/// complete in kernel tasks and are collected through their callback.
+pub fn wait(owner: u64, token: u64, urb: u64, timeout_ns: u64) -> i32 {
+    if timeout_ns == 0 || timeout_ns > 1_000_000_000 {
+        return -22;
+    }
+    match datapath() {
+        Ok(d) => (d.wait)(owner, token, urb, timeout_ns),
+        Err(e) => e,
+    }
+}
+
+/// Whether `owner` holds a live USB context for `token`. Subsystem sinks
+/// outside the USB stack (module block disks) gate registration on it.
+pub fn context_live(owner: u64, token: u64) -> bool {
+    datapath().is_ok_and(|d| (d.context_live)(owner, token))
 }
 
 /// Run a module completion/kick callback through the module callback gate

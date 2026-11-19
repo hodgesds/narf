@@ -223,6 +223,7 @@ fn install_bus_call_gate() {
     narf_bus::set_module_probe_call_gate(module_pci_probe_call_gate);
     narf_bus::set_module_callback_call_gate(module_callback_call_gate);
     narf_bus::set_module_tx_call_gate(module_tx_call_gate);
+    narf_bus::set_module_context_retired_hook(module_block::retire_token);
 }
 
 /// Per-name registry of loaded modules. Acts as the single source

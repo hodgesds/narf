@@ -459,6 +459,12 @@ pub fn module_netif_rx(
 /// validates. Sinks outside the bus (the module block sink in
 /// `narf-modules`) gate registration on it.
 pub fn module_device_live(owner: u64, dev: u64) -> bool;
+/// Told `(owner, token)` whenever a module's PCI or USB device context is
+/// retired (unplug, reprobe, declined probe, unload), outside every
+/// context lock, before the context's DMA buffers or transfers go away.
+pub type ModuleContextRetiredHook = fn(owner: u64, token: u64);
+pub fn set_module_context_retired_hook(hook: ModuleContextRetiredHook);
+pub fn module_context_retired(owner: u64, token: u64);
 ```
 
 The module subsystem installs all three call gates. They resolve `owner` to the
@@ -618,6 +624,7 @@ pub mod module_usb {
     pub struct Datapath {                         // all fields are fn pointers
         pub config_descriptor, pub configure, pub control, pub transfer,
         pub poll, pub cancel, pub serial_register, pub serial_tx, pub serial_rx,
+        pub wait, pub context_live,
     }
     pub fn register_datapath(d: &'static Datapath) -> Result<(), i32>; // other = -EBUSY
     pub fn config_descriptor(owner: u64, token: u64, out: &mut [u8]) -> (i32, usize);
@@ -630,6 +637,10 @@ pub mod module_usb {
     pub fn serial_register(owner: u64, token: u64, family: u32, kick: Completion) -> Result<u32, i32>;
     pub fn serial_tx(owner: u64, token: u64, port: u32, out: &mut [u8]) -> Result<usize, i32>;
     pub fn serial_rx(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize, i32>;
+    /// Poll one callback-less bulk/interrupt request inline until terminal
+    /// (0; collect with `poll`) or `timeout_ns` (1 ns..=1 s) passes.
+    pub fn wait(owner: u64, token: u64, urb: u64, timeout_ns: u64) -> i32;
+    pub fn context_live(owner: u64, token: u64) -> bool;
     pub fn call_module_usb_callback(owner: u64, cb: ModuleCallbackFn, cookie: u64) -> i32;
 }
 ```

@@ -15,12 +15,17 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::{
-    copy, register_unchecked, retire_owner, DiskSpec, ModuleDisk, DISKS, FLAG_READ_ONLY,
+    copy, register_unchecked, retire_owner, DiskSpec, Endpoint, ModuleDisk, DISKS, FLAG_READ_ONLY,
     FLAG_VOLATILE_CACHE, OP_FLUSH, OP_READ, OP_WRITE,
 };
 
 const OWNER: u64 = crate::symbols::KERNEL_MODULE_ID.0;
 const TOKEN: u64 = 0xB10C_0000_0000_0001;
+/// A DMA handle no bus context owns.
+const DMA: Endpoint = Endpoint::Dma {
+    handle: 1,
+    offset: 0,
+};
 
 /// `(cookie, op, lba, count)` of every request the fake callback saw.
 static CALLS: IrqSafeSpinLock<Vec<(u64, u32, u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
@@ -45,15 +50,15 @@ extern "C" fn copying_request(_: u64, request: u64, op: u32, _: u64, count: u32)
     let read = op == OP_READ;
     let mut results = COPIES.lock();
     // The wrong owner, the wrong token, and a request that is not running.
-    results.push(copy(OWNER + 1, TOKEN, request, 1, 0, 0..len, read));
-    results.push(copy(OWNER, TOKEN + 1, request, 1, 0, 0..len, read));
-    results.push(copy(OWNER, TOKEN, request + 1000, 1, 0, 0..len, read));
+    results.push(copy(OWNER + 1, TOKEN, request, DMA, 0..len, read));
+    results.push(copy(OWNER, TOKEN + 1, request, DMA, 0..len, read));
+    results.push(copy(OWNER, TOKEN, request + 1000, DMA, 0..len, read));
     // The wrong direction, an empty range, and a range past the buffer.
-    results.push(copy(OWNER, TOKEN, request, 1, 0, 0..len, !read));
-    results.push(copy(OWNER, TOKEN, request, 1, 0, 8..8, read));
-    results.push(copy(OWNER, TOKEN, request, 1, 0, 0..len + 1, read));
+    results.push(copy(OWNER, TOKEN, request, DMA, 0..len, !read));
+    results.push(copy(OWNER, TOKEN, request, DMA, 8..8, read));
+    results.push(copy(OWNER, TOKEN, request, DMA, 0..len + 1, read));
     // Well formed: reaches the DMA lookup, which has no context.
-    results.push(copy(OWNER, TOKEN, request, 1, 0, 0..len, read));
+    results.push(copy(OWNER, TOKEN, request, DMA, 0..len, read));
     LAST_REQUEST.store(request, Ordering::Relaxed);
     0
 }
@@ -275,7 +280,7 @@ fn smoke_module_block_copy_checks_request() -> TestResult {
     let write = disk.write(0, 2, &buf);
     let during_write = COPIES.lock().clone();
     let finished = LAST_REQUEST.load(Ordering::Relaxed);
-    let stale = copy(OWNER, TOKEN, finished, 1, 0, 0..512, false);
+    let stale = copy(OWNER, TOKEN, finished, DMA, 0..512, false);
     reset();
     if read.is_err() || write.is_err() {
         return TestResult::Fail("the copying request callback failed");
@@ -293,3 +298,100 @@ fn smoke_module_block_copy_checks_request() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/block", smoke_module_block_copy_checks_request);
+
+/// Bytes the module-memory callback serves for reads.
+static PATTERN: [u8; 1024] = {
+    let mut p = [0u8; 1024];
+    let mut i = 0;
+    while i < p.len() {
+        p[i] = (i as u8).wrapping_mul(7) ^ 0x5A;
+        i += 1;
+    }
+    p
+};
+/// Where the module-memory callback lands writes.
+static SINK: IrqSafeSpinLock<[u8; 1024]> = IrqSafeSpinLock::new([0; 1024]);
+
+/// A USB-style driver: reads are filled from module memory, writes are
+/// fetched into module memory.
+extern "C" fn module_memory_request(_: u64, request: u64, op: u32, _: u64, count: u32) -> i32 {
+    let len = count as usize * 512;
+    if op == OP_READ {
+        let side = Endpoint::Module(PATTERN.as_ptr() as usize);
+        copy(OWNER, TOKEN, request, side, 0..len, true)
+    } else {
+        let mut sink = SINK.lock();
+        let side = Endpoint::Module(sink.as_mut_ptr() as usize);
+        copy(OWNER, TOKEN, request, side, 0..len, false)
+    }
+}
+
+fn smoke_module_block_module_memory_copy() -> TestResult {
+    reset();
+    let spec = DiskSpec {
+        request: module_memory_request,
+        ..spec(64, 2, 0)
+    };
+    if register_unchecked(OWNER, TOKEN, b"mblkm0", spec) != 0 {
+        reset();
+        return TestResult::Fail("could not register the test disk");
+    }
+    let Some(disk) = disk_named("mblkm0") else {
+        reset();
+        return TestResult::Fail("registered disk not found");
+    };
+    // Four blocks over a two-block maximum: two requests, each copying the
+    // same 1 KiB pattern, so both halves must match it.
+    let mut buf = [0u8; 2048];
+    let read = disk.read(0, 4, &mut buf);
+    let data: alloc::vec::Vec<u8> = (0..2048u32)
+        .map(|i| ((i % 1024) as u8).wrapping_mul(7) ^ 0x5A)
+        .collect();
+    let mut written = [0u8; 1024];
+    for (i, b) in written.iter_mut().enumerate() {
+        *b = !(i as u8);
+    }
+    *SINK.lock() = [0; 1024];
+    let write = disk.write(0, 2, &written);
+    let landed = *SINK.lock() == written;
+    reset();
+    if read.is_err() || buf.as_slice() != data.as_slice() {
+        return TestResult::Fail("a read did not return the module-memory bytes");
+    }
+    if write.is_err() || !landed {
+        return TestResult::Fail("a write did not land in module memory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/block", smoke_module_block_module_memory_copy);
+
+fn smoke_module_block_retire_token_is_per_device() -> TestResult {
+    reset();
+    let a = register_unchecked(OWNER, TOKEN, b"mblkr0", spec(64, 8, 0));
+    let b = register_unchecked(OWNER, TOKEN + 1, b"mblkr1", spec(64, 8, 0));
+    if a != 0 || b != 0 {
+        reset();
+        return TestResult::Fail("could not register the test disks");
+    }
+    // The bus reports a retired context through the hook the module
+    // subsystem installs at boot (installed again here; it is idempotent).
+    narf_bus::set_module_context_retired_hook(super::retire_token);
+    narf_bus::module_context_retired(OWNER, TOKEN);
+    let first_gone = disk_named("mblkr0").is_none()
+        && !narf_block::block_devices()
+            .iter()
+            .any(|d| d.name == "mblkr0");
+    let second_kept = disk_named("mblkr1").is_some();
+    reset();
+    if !first_gone {
+        return TestResult::Fail("a retired device context left its disk registered");
+    }
+    if !second_kept {
+        return TestResult::Fail("retiring one device context removed another device's disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/block",
+    smoke_module_block_retire_token_is_per_device
+);

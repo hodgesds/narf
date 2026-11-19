@@ -225,6 +225,9 @@ pub(crate) fn retire_owner(owner: u64) {
 /// here: pending requests are simply dropped, and a posted bulk TD is
 /// stopped by a kernel task that never calls module text.
 fn teardown(ctx: Context) {
+    // Sinks outside the USB stack (a module's block disk) go first: a
+    // request still running waits on this context's transfers.
+    narf_bus::module_context_retired(ctx.owner, ctx.token);
     if let Some(index) = ctx.serial {
         PORTS
             .lock()
@@ -508,6 +511,59 @@ fn finish(owner: u64, token: u64, id: u64, status: i32, actual: usize, data: Vec
     fire(owner, done);
 }
 
+/// Poll one pending bulk/interrupt request once. `Some((status, actual,
+/// data))` once it is terminal. Futures and stopping receipts are driven
+/// elsewhere and report `None` here.
+fn poll_pending(device: &USBDevice, pending: &Pending) -> Option<(i32, usize, Vec<u8>)> {
+    match pending {
+        Pending::Bulk {
+            receipt,
+            is_in,
+            len,
+        } => {
+            if *is_in {
+                let mut buf = vec![0u8; *len];
+                match device.poll_bulk_in(receipt, &mut buf) {
+                    Ok(Some(n)) => {
+                        buf.truncate(n);
+                        Some((0, n, buf))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((errno(e), 0, Vec::new())),
+                }
+            } else {
+                match device.poll_bulk_out(receipt) {
+                    Ok(Some(n)) => Some((0, n, Vec::new())),
+                    Ok(None) => None,
+                    Err(e) => Some((errno(e), 0, Vec::new())),
+                }
+            }
+        }
+        Pending::InterruptIn { dci, len } => {
+            let mut buf = vec![0u8; *len];
+            match device.poll_interrupt_in(*dci, &mut buf) {
+                Ok(Some(n)) => {
+                    buf.truncate(n.min(*len));
+                    Some((0, n, buf))
+                }
+                Ok(None) => None,
+                Err(e) => Some((errno(e), 0, Vec::new())),
+            }
+        }
+        Pending::InterruptOut { dci, len } => {
+            match device
+                .controller()
+                .poll_interrupt_out(device.slot_id(), *dci, *len as u32)
+            {
+                Ok(Some(n)) => Some((0, n, Vec::new())),
+                Ok(None) => None,
+                Err(e) => Some((errno(UsbError::from_xhci(e)), 0, Vec::new())),
+            }
+        }
+        Pending::Future | Pending::Stopping => None,
+    }
+}
+
 /// Poll one context's bulk/interrupt requests once. Returns the completions
 /// to fire and whether anything is still pending.
 fn pump_once(owner: u64, token: u64) -> Option<(Vec<Completion>, bool)> {
@@ -520,52 +576,9 @@ fn pump_once(owner: u64, token: u64) -> Option<(Vec<Completion>, bool)> {
         let State::Pending(pending) = &urb.state else {
             continue;
         };
-        let result: Option<(i32, usize, Vec<u8>)> = match pending {
-            Pending::Bulk {
-                receipt,
-                is_in,
-                len,
-            } => {
-                if *is_in {
-                    let mut buf = vec![0u8; *len];
-                    match device.poll_bulk_in(receipt, &mut buf) {
-                        Ok(Some(n)) => {
-                            buf.truncate(n);
-                            Some((0, n, buf))
-                        }
-                        Ok(None) => None,
-                        Err(e) => Some((errno(e), 0, Vec::new())),
-                    }
-                } else {
-                    match device.poll_bulk_out(receipt) {
-                        Ok(Some(n)) => Some((0, n, Vec::new())),
-                        Ok(None) => None,
-                        Err(e) => Some((errno(e), 0, Vec::new())),
-                    }
-                }
-            }
-            Pending::InterruptIn { dci, len } => {
-                let mut buf = vec![0u8; *len];
-                match device.poll_interrupt_in(*dci, &mut buf) {
-                    Ok(Some(n)) => {
-                        buf.truncate(n.min(*len));
-                        Some((0, n, buf))
-                    }
-                    Ok(None) => None,
-                    Err(e) => Some((errno(e), 0, Vec::new())),
-                }
-            }
-            Pending::InterruptOut { dci, len } => {
-                match device
-                    .controller()
-                    .poll_interrupt_out(device.slot_id(), *dci, *len as u32)
-                {
-                    Ok(Some(n)) => Some((0, n, Vec::new())),
-                    Ok(None) => None,
-                    Err(e) => Some((errno(UsbError::from_xhci(e)), 0, Vec::new())),
-                }
-            }
+        let result = match pending {
             Pending::Future | Pending::Stopping => continue,
+            pending => poll_pending(&device, pending),
         };
         match result {
             Some((status, actual, data)) => {
@@ -775,6 +788,79 @@ pub(crate) fn serial_kick(index: usize) {
     }
 }
 
+/// One step of [`wait`]: `Some(rc)` once the request is terminal (0) or
+/// can no longer be waited on, `None` while it is pending.
+fn wait_step(owner: u64, token: u64, id: u64) -> Option<i32> {
+    let mut contexts = CONTEXTS.lock();
+    let ctx = match find(&mut contexts, owner, token) {
+        Ok(ctx) => ctx,
+        Err(e) => return Some(e),
+    };
+    let device = Arc::clone(&ctx.device);
+    let Some(urb) = ctx.urbs.iter_mut().find(|u| u.id == id) else {
+        return Some(EINVAL);
+    };
+    let State::Pending(pending) = &urb.state else {
+        return Some(0);
+    };
+    let (status, actual, data) = poll_pending(&device, pending)?;
+    urb.state = State::Done {
+        status,
+        actual,
+        data,
+    };
+    Some(0)
+}
+
+fn wait(owner: u64, token: u64, id: u64, timeout_ns: u64) -> i32 {
+    {
+        let mut contexts = CONTEXTS.lock();
+        let ctx = match find(&mut contexts, owner, token) {
+            Ok(ctx) => ctx,
+            Err(e) => return e,
+        };
+        let Some(urb) = ctx.urbs.iter().find(|u| u.id == id) else {
+            return EINVAL;
+        };
+        // A request with a callback is reported through it; waiting here
+        // would swallow that or re-enter the module.
+        if urb.done.callback.is_some() {
+            return EINVAL;
+        }
+        match urb.state {
+            State::Done { .. } => return 0,
+            // Control/configure futures and bulk stops run in kernel tasks;
+            // an inline wait cannot drive them.
+            State::Pending(Pending::Future) => return EOPNOTSUPP,
+            State::Pending(Pending::Stopping) => return EBUSY,
+            State::Pending(_) => {}
+        }
+    }
+    let mut rc = ETIMEDOUT;
+    let finished = narf_scheduler::responsive_spin_until(
+        || match wait_step(owner, token, id) {
+            Some(result) => {
+                rc = result;
+                true
+            }
+            None => false,
+        },
+        narf_time::Deadline::after_ns(timeout_ns),
+    );
+    if finished {
+        rc
+    } else {
+        ETIMEDOUT
+    }
+}
+
+fn context_live(owner: u64, token: u64) -> bool {
+    CONTEXTS
+        .lock()
+        .iter()
+        .any(|c| c.owner == owner && c.token == token)
+}
+
 static DATAPATH: Datapath = Datapath {
     config_descriptor,
     configure,
@@ -785,6 +871,8 @@ static DATAPATH: Datapath = Datapath {
     serial_register,
     serial_tx,
     serial_rx,
+    wait,
+    context_live,
 };
 
 /// Install the datapath hooks behind the `narf_usb_*` exports. Idempotent;

@@ -9,14 +9,16 @@
 //! (`NvmeBlockSync`, `AhciBlockSync`): [`BlockDeviceSync::read`] or `write`
 //! calls the module's request callback through the module call gate (its
 //! load-time domain, pinned `Live`) and returns once the callback does. The
-//! module moves sector data with [`copy`], which copies between the caller's
-//! buffer and one of the module's own DMA buffers. No kernel pointer is
-//! handed to module text, and module memory is never a copy endpoint.
+//! module moves sector data with [`copy`], between the caller's buffer and
+//! either one of its own DMA buffers (PCI drivers) or module memory it hands
+//! the export (USB drivers, whose transfers already copy through module
+//! memory). No kernel pointer is ever handed to module text.
 //!
 //! One request per disk is in flight at a time, and a request larger than
 //! the module's `max_blocks` is split here. On unload, [`retire_owner`]
 //! fails new requests, waits out the running one, and unregisters every
-//! disk before the bus context and module text go away.
+//! disk before the bus context and module text go away; [`retire_token`]
+//! does the same for one device when the bus retires its context.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -133,9 +135,12 @@ pub struct DiskSpec {
     pub cookie: u64,
 }
 
-/// Register a module-backed disk for the device behind `token`.
+/// Register a module-backed disk for the device behind `token`: a PCI
+/// probe context or a USB one.
 pub fn register(owner: u64, token: u64, name: &[u8], spec: DiskSpec) -> i32 {
-    if !narf_bus::module_device_live(owner, token) {
+    if !narf_bus::module_device_live(owner, token)
+        && !narf_bus::module_usb::context_live(owner, token)
+    {
         return ENODEV;
     }
     register_unchecked(owner, token, name, spec)
@@ -195,16 +200,26 @@ pub(crate) fn register_unchecked(owner: u64, token: u64, name: &[u8], spec: Disk
     0
 }
 
-/// Copy one range of the running request. `to_request` = a read (DMA buffer
-/// to the caller's buffer); otherwise a write (caller's buffer to DMA).
-/// Only the module that owns the request, for the device it registered the
-/// disk on, may copy, and only while the request callback runs.
+/// The module side of one copy.
+#[derive(Clone, Copy, Debug)]
+pub enum Endpoint {
+    /// One of the module's bus DMA buffers, at a byte offset.
+    Dma { handle: u64, offset: u64 },
+    /// Module memory the export was handed; `len` bytes long, readable for
+    /// a read request and writable for a write request.
+    Module(usize),
+}
+
+/// Copy one range of the running request. `to_request` = a read (module
+/// side to the caller's buffer); otherwise a write (caller's buffer to the
+/// module side). Only the module that owns the request, for the device it
+/// registered the disk on, may copy, and only while the request callback
+/// runs.
 pub fn copy(
     owner: u64,
     token: u64,
     request: u64,
-    dma: u64,
-    dma_off: u64,
+    endpoint: Endpoint,
     range: core::ops::Range<usize>,
     to_request: bool,
 ) -> i32 {
@@ -232,11 +247,31 @@ pub fn copy(
         // callback for as long as the entry exists, and `copying` excludes
         // a second concurrent copy, so this is the only access.
         let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-        narf_bus::module_dma_write(owner, token, dma, dma_off, src)
+        match endpoint {
+            Endpoint::Dma { handle, offset } => {
+                narf_bus::module_dma_write(owner, token, handle, offset, src)
+            }
+            Endpoint::Module(dst) => {
+                // SAFETY: the export's caller promises `len` writable bytes
+                // of module memory at `dst`, disjoint from kernel buffers.
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, len) };
+                0
+            }
+        }
     } else {
         // SAFETY: as above; a read request's buffer is the caller's `&mut`.
         let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-        narf_bus::module_dma_read(owner, token, dma, dma_off, dst)
+        match endpoint {
+            Endpoint::Dma { handle, offset } => {
+                narf_bus::module_dma_read(owner, token, handle, offset, dst)
+            }
+            Endpoint::Module(src) => {
+                // SAFETY: the export's caller promises `len` readable bytes of
+                // module memory at `src`.
+                unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), len) };
+                0
+            }
+        }
     };
     if let Some(entry) = ACTIVE.lock().iter_mut().find(|a| a.id == request) {
         entry.copying = false;
@@ -247,11 +282,21 @@ pub fn copy(
 /// Fail new requests on every disk `owner` registered, wait out a running
 /// one, and unregister them. Called on unload before the bus context goes.
 pub fn retire_owner(owner: u64) {
+    retire_where(|d| d.owner == owner, "unload");
+}
+
+/// Retire the disks registered for one device context: the bus reports
+/// every retired PCI or USB context here (unplug, reprobe, declined probe).
+pub fn retire_token(owner: u64, token: u64) {
+    retire_where(|d| d.owner == owner && d.token == token, "device removal");
+}
+
+fn retire_where(matches: impl Fn(&Disk) -> bool, why: &str) {
     let retired: Vec<Arc<Disk>> = {
         let mut disks = DISKS.lock();
         let mut retired = Vec::new();
         disks.retain(|d| {
-            if d.owner == owner {
+            if matches(d) {
                 retired.push(Arc::clone(d));
                 false
             } else {
@@ -272,7 +317,7 @@ pub fn retire_owner(owner: u64) {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "  modules: {} still has a block request running at unload",
+                "  modules: {} still has a block request running at {why}",
                 disk.name
             );
         }

@@ -582,6 +582,31 @@ pub(crate) fn call_module_probe(
     gate(owner, thunk, dev_token, reserved)
 }
 
+/// Told `(owner, token)` whenever a module's device context, PCI or USB,
+/// is retired: unplug, reprobe, declined probe or unload. Sinks living
+/// outside the bus (module block disks in `narf-modules`) withdraw what
+/// they published for that device. Runs outside every context lock.
+pub type ModuleContextRetiredHook = fn(owner: u64, token: u64);
+
+static MODULE_CONTEXT_RETIRED_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the module-context retirement hook (the module subsystem does).
+pub fn set_module_context_retired_hook(hook: ModuleContextRetiredHook) {
+    MODULE_CONTEXT_RETIRED_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Report a retired module device context to the installed hook, if any.
+pub fn module_context_retired(owner: u64, token: u64) {
+    let hook = MODULE_CONTEXT_RETIRED_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_module_context_retired_hook` stores here, and it
+        // stores a `ModuleContextRetiredHook` address.
+        let hook: ModuleContextRetiredHook = unsafe { core::mem::transmute(hook) };
+        hook(owner, token);
+    }
+}
+
 pub(crate) fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
     let gate = MODULE_CALLBACK_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
     if gate == 0 {
@@ -802,6 +827,9 @@ fn remove_device_ctx(token: u64) {
 }
 
 fn teardown_device_ctx(mut ctx: DeviceCtx) {
+    // Sinks outside the bus (module disks) go first: a request still
+    // running copies through this context's DMA buffers.
+    module_context_retired(ctx.owner, ctx.token);
     // A wireless host retains its native futures/DMA independently of module
     // text. Withdraw it while the original probe authority is still current.
     crate::module_wireless::retire_device(ctx.owner, ctx.token);
