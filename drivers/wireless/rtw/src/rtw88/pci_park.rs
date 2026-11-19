@@ -82,7 +82,7 @@ pub(crate) fn master(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Resu
 
 /// Keep the actual mapping/register operation inside the epoch-checked
 /// capability invocation. A separate prior authority check is insufficient.
-pub(crate) fn invoke<T>(
+pub fn invoke<T>(
     cap: &Cap<BusDeviceCap, Write>,
     operation: impl FnOnce() -> T,
 ) -> Result<T, CapError> {
@@ -119,7 +119,7 @@ pub(super) fn map_with<T>(
     Ok(region)
 }
 
-pub(crate) fn map_bar_control(
+pub fn map_bar_control(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     index: u8,

@@ -86,6 +86,7 @@ members = [
     "drivers/wireless/iwlwifi",
     "drivers/wireless/mt76",
     "drivers/wireless/rtl-usb",
+    "drivers/wireless/rtw",
     "drivers/i2c",
     "drivers/gpio",
     "drivers/i3c",

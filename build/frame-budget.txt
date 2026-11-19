@@ -10,9 +10,9 @@
 28248 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
 26728 <narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard as core::ops::drop::Drop>::drop
 26376 <narf_drivers_wireless::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
-25688 narf_drivers_wireless::rtw89::bootstrap::Bootstrap::generation::{{closure}}
-23976 narf_drivers_wireless::rtw89::efuse_be::read_factory
-23960 narf_drivers_wireless::rtw89::efuse_be::BeFactory::read
+25688 narf_drivers_wireless_rtw::rtw89::bootstrap::Bootstrap::generation::{{closure}}
+23976 narf_drivers_wireless_rtw::rtw89::efuse_be::read_factory
+23960 narf_drivers_wireless_rtw::rtw89::efuse_be::BeFactory::read
 23176 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
 21960 narf_drivers_wireless::ath11k::pci::probe
 21720 narf_drivers_wireless::ath10k::pci::probe
@@ -21,7 +21,7 @@
 21240 narf_drivers_wireless::ath10k::pci::restart_parked
 21192 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::station::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::Owner>::station_join::{{closure}}
 20728 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::check
-20064 narf_drivers_wireless::rtw89::bootstrap::attach_cold
+20064 narf_drivers_wireless_rtw::rtw89::bootstrap::attach_cold
 19848 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::composition
 19240 narf_fb::amdgpu_boot::bring_up_navi48
 19168 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::run
@@ -63,3 +63,8 @@
 8344 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::subvp::expand_subvp
 8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
 8296 narf_memory::compress::lz4_encode
+29672 narf_drivers_wireless::rtl8xxxu::interface::interface_power::<impl narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E>>::request_admin::{{closure}}
+27880 narf_drivers_wireless::ath11k::core::pci_start::{{closure}}
+13296 narf_drivers_wireless::ath11k::iface::register_ahb
+13144 narf_drivers_wireless::ath11k::iface::register_pci_netdev
+8824 narf_drivers_wireless::ath11k::pci::mhi_task::{{closure}}

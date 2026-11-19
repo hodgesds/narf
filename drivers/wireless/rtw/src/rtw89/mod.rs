@@ -45,8 +45,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 mod antdiv_51;
 mod ap_control;
 mod ap_crypto;

@@ -2597,6 +2597,7 @@ dependencies = [
  "narf-drivers-wireless-iwlwifi",
  "narf-drivers-wireless-mt76",
  "narf-drivers-wireless-rtl-usb",
+ "narf-drivers-wireless-rtw",
  "narf-firmware",
  "narf-firmware-fdt",
  "narf-firmware-smbios",
@@ -2624,6 +2625,8 @@ dependencies = [
  "narf-crypto",
  "narf-firmware",
  "narf-kernel-test",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -2694,6 +2697,37 @@ dependencies = [
  "async-trait",
  "narf-drivers-usb",
  "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-wireless-rtw"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-crypto",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-usb",
+ "narf-drivers-wireless-core",
+ "narf-drivers-wireless-rtl-usb",
+ "narf-firmware",
+ "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+ "narf-wifi-fixtures",
+ "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]

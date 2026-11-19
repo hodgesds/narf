@@ -28,8 +28,8 @@ use super::{
     packet_format as format,
     usb::{self, Endpoints, EP_MAX, MAX_RECVBUF, QSEL_HIGH},
 };
-use crate::rtl8xxxu::packet_transport::Io;
 use alloc::{collections::VecDeque, vec::Vec};
+use narf_drivers_wireless_rtl_usb::Io;
 
 /// Frames queued on all bulk-OUT pipes together (Linux bounds the queues by
 /// mac80211 flow control; this owner refuses with `Busy` instead).

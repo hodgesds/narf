@@ -39,8 +39,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 mod band5;
 mod bf;
 mod calibration8821c;
@@ -184,7 +182,7 @@ pub use station_power8821c::Request as C21StationRequest;
 pub use station_profile::Request as C22LegacyWmmRequest;
 pub use station_profile::Request as C21LegacyWmmRequest;
 pub mod pci;
-pub(crate) mod pci_park;
+pub mod pci_park;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod pci_park_tests;

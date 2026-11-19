@@ -44,9 +44,10 @@ use super::{
     system_pm_worker::{self, Control, Phase},
     usb_driver::{self, Generation, Origin},
 };
-use crate::{future_heap, rtl8xxxu::firmware_transport::UsbControl};
+use crate::future_heap;
 use alloc::{boxed::Box, sync::Arc};
 use narf_drivers_usb::device::USBDevice;
+use narf_drivers_wireless_rtl_usb::UsbControl;
 use narf_power::device_pm::DevicePmError;
 use narf_time::Deadline;
 use narf_wireless::AssociateRequest;

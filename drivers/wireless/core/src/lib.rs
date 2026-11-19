@@ -16,3 +16,4 @@ extern crate alloc;
 
 pub mod firmware_asset;
 pub mod future_heap;
+pub mod watchdog_work;

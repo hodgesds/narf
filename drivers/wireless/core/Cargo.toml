@@ -34,6 +34,8 @@ kernel-test = ["dep:narf-crypto", "dep:narf-kernel-test"]
 [dependencies]
 narf-capabilities = { path = "../../../capabilities" }
 narf-firmware     = { path = "../../../firmware" }
+narf-scheduler    = { path = "../../../scheduler" }
+narf-time         = { path = "../../../time" }
 narf-crypto       = { path = "../../../crypto", optional = true }
 narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
 

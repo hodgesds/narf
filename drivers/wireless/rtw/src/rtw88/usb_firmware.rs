@@ -35,9 +35,9 @@ use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
 use super::usb_packet;
-use crate::rtl8xxxu::firmware_transport::ControlIo;
-use crate::rtl8xxxu::packet_transport::Io as Bulk;
 use alloc::{boxed::Box, collections::VecDeque};
+use narf_drivers_wireless_rtl_usb::ControlIo;
+use narf_drivers_wireless_rtl_usb::Io as Bulk;
 
 /// `check_hw_ready` (1000 x 10 us) for BCN_VALID_V1.
 const BEACON_POLLS: u32 = 1000;

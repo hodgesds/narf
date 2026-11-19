@@ -10,7 +10,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 mod firmware_metadata {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../verification/data/wifi-firmware/realtek/metadata.rs"
+        "/../../../verification/data/wifi-firmware/realtek/metadata.rs"
     ));
 }
 include!("firmware/rtl8821c_metadata.rs");

@@ -42,13 +42,13 @@ use super::{
     usb::{self, Endpoints, Speed},
     usb_firmware,
 };
-use crate::rtl8xxxu::{firmware_transport::UsbControl, packet_transport::UsbIo};
 use alloc::{sync::Arc, vec::Vec};
 use narf_drivers_usb::{
     class_registry::{UsbClassMatch, UsbProbeError},
     device::USBDevice,
     xhci::EndpointConfig,
 };
+use narf_drivers_wireless_rtl_usb::{UsbControl, UsbIo};
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub(super) type Backend = usb_firmware::Backend<UsbControl, UsbIo>;
@@ -348,8 +348,8 @@ async fn interface_init(device: &USBDevice) -> Result<Endpoints, Error> {
 /// `rtw_chip_efuse_enable` up to the factory map: `rtw_mac_power_on`,
 /// REG_C2HEVT = C2H_HW_FEATURE_REPORT, then the physical EFUSE dump.
 pub(super) async fn power_and_factory<
-    C: crate::rtl8xxxu::firmware_transport::ControlIo,
-    P: crate::rtl8xxxu::packet_transport::Io + Clone,
+    C: narf_drivers_wireless_rtl_usb::ControlIo,
+    P: narf_drivers_wireless_rtl_usb::Io + Clone,
 >(
     backend: &mut usb_firmware::Backend<C, P>,
 ) -> Result<Factory8821c, Error> {
@@ -360,8 +360,8 @@ pub(super) async fn power_and_factory<
 }
 /// [`power_and_factory`] for the claimed chip `did`.
 pub(super) async fn power_and_factory_for<
-    C: crate::rtl8xxxu::firmware_transport::ControlIo,
-    P: crate::rtl8xxxu::packet_transport::Io + Clone,
+    C: narf_drivers_wireless_rtl_usb::ControlIo,
+    P: narf_drivers_wireless_rtl_usb::Io + Clone,
 >(
     backend: &mut usb_firmware::Backend<C, P>,
     did: u16,
@@ -386,8 +386,8 @@ fn factory_error(error: efuse::EfuseError) -> Error {
     }
 }
 async fn power_on<
-    C: crate::rtl8xxxu::firmware_transport::ControlIo,
-    P: crate::rtl8xxxu::packet_transport::Io + Clone,
+    C: narf_drivers_wireless_rtl_usb::ControlIo,
+    P: narf_drivers_wireless_rtl_usb::Io + Clone,
 >(
     backend: &mut usb_firmware::Backend<C, P>,
 ) -> Result<(), Error> {

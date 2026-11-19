@@ -193,4 +193,3 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         UsbClassMatch::vid_pid(0x07B8, 0x8179),
     ]
 };
-
