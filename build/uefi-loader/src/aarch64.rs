@@ -7,7 +7,7 @@ use core::{ptr, slice};
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     cstr16, entry, guid,
-    mem::memory_map::MemoryMap,
+    mem::memory_map::{MemoryDescriptor, MemoryMap},
     prelude::Status,
     proto::media::file::{File, FileAttribute, FileMode, RegularFile},
     system,
@@ -529,12 +529,14 @@ fn load_and_start() -> Result<(), LoadError> {
     // The post-EBS markers bypass boot services entirely (direct PL011
     // writes), but only when a PL011 was positively identified before
     // ExitBootServices — see `pl011_available`.
-    let uart = pl011_available(&map);
+    let probe = pl011_available(&map);
+    let uart = probe.is_available();
     if !uart {
         uefi::println!(
             "NARF UEFI loader: [hang147] note: no PL011 at {:#x}, post-EBS stage markers disabled",
             PL011_BASE
         );
+        probe.print_why();
     }
 
     drop(kernel);
@@ -1151,32 +1153,125 @@ fn copy_segment_piece(
     )
 }
 
+/// Outcome of the PL011 probe, with the failure reason attached. The
+/// verdict logic is the guard's: the map must list the address as MMIO
+/// and the ID block must read as a PL011. The reason is carried so the
+/// [hang147] diagnostic can report *why* the post-EBS markers were
+/// disabled from runtime evidence — the log on sighting #150 recorded
+/// no reason. Prints only; the verdict is unchanged.
+#[derive(Debug)]
+enum Pl011Probe {
+    /// Both halves passed; post-EBS markers may write to the UART.
+    Available,
+    /// No memory-map MMIO entry covers the UART address. `before` and
+    /// `after` are the nearest map entries bracketing the address
+    /// (nearest first in each direction), so the log shows what the
+    /// map actually contains there.
+    NoMmioEntry {
+        before: [Option<MemoryDescriptor>; 2],
+        after: [Option<MemoryDescriptor>; 2],
+    },
+    /// The ID block did not read as a PL011; the six raw bytes read,
+    /// in register order (periph ID0/ID1, cell ID0–ID3).
+    IdMismatch { id: [u8; 6] },
+}
+
+impl Pl011Probe {
+    const fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// Print why the probe failed, pre-EBS only. No-op when available.
+    /// Called next to the "no PL011" note so the log names the failing
+    /// half from runtime evidence.
+    fn print_why(&self) {
+        match self {
+            Self::Available => {}
+            Self::NoMmioEntry { before, after } => {
+                uefi::println!(
+                    "NARF UEFI loader: [hang147] why: no MMIO map entry covers {:#x}",
+                    PL011_BASE
+                );
+                // Ascending address order: second-nearest below, nearest
+                // below, nearest above, second-nearest above.
+                for slot in [before[1], before[0], after[0], after[1]] {
+                    if let Some(entry) = slot {
+                        let end = entry
+                            .phys_start
+                            .saturating_add(entry.page_count.saturating_mul(PAGE_SIZE));
+                        uefi::println!(
+                            "NARF UEFI loader: [hang147] why: nearest map {:?} {:#x}-{:#x}",
+                            entry.ty,
+                            entry.phys_start,
+                            end
+                        );
+                    }
+                }
+            }
+            Self::IdMismatch { id } => {
+                uefi::println!(
+                    "NARF UEFI loader: [hang147] why: PL011 ID block mismatch {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                    id[0], id[1], id[2], id[3], id[4], id[5]
+                );
+            }
+        }
+    }
+}
+
 /// Is there a real PL011 at the QEMU `virt` UART address? Both halves are
 /// checked while boot services are live: the memory map must list the
 /// address as MMIO, and the PrimeCell ID block must read as a PL011. The
 /// result is carried into the post-EBS stages, where no firmware service
 /// can answer the question anymore — and where a wrong guess would write
 /// marker bytes into an unrelated device's registers.
-fn pl011_available(map: &impl MemoryMap) -> bool {
-    let mmio = map.entries().any(|d| {
+fn pl011_available(map: &impl MemoryMap) -> Pl011Probe {
+    // Nearest entries bracketing PL011_BASE, for the [hang147]
+    // diagnostic. Tracked by comparison, not iteration order: the map
+    // is sorted in practice but the trait does not promise it.
+    let mut before: [Option<MemoryDescriptor>; 2] = [None; 2];
+    let mut after: [Option<MemoryDescriptor>; 2] = [None; 2];
+    let mut mmio = false;
+    for d in map.entries().copied() {
         let end = d
             .phys_start
             .saturating_add(d.page_count.saturating_mul(PAGE_SIZE));
-        d.ty == MemoryType::MMIO && d.phys_start <= PL011_BASE && PL011_BASE < end
-    });
+        if d.ty == MemoryType::MMIO && d.phys_start <= PL011_BASE && PL011_BASE < end {
+            mmio = true;
+        }
+        if d.phys_start <= PL011_BASE {
+            if before[0].is_none_or(|b| d.phys_start >= b.phys_start) {
+                before[1] = before[0];
+                before[0] = Some(d);
+            } else if before[1].is_none_or(|b| d.phys_start >= b.phys_start) {
+                before[1] = Some(d);
+            }
+        } else if after[0].is_none_or(|a| d.phys_start <= a.phys_start) {
+            after[1] = after[0];
+            after[0] = Some(d);
+        } else if after[1].is_none_or(|a| d.phys_start <= a.phys_start) {
+            after[1] = Some(d);
+        }
+    }
     if !mmio {
-        return false;
+        return Pl011Probe::NoMmioEntry { before, after };
     }
     // SAFETY: the memory map lists this range as MMIO, and the ID
     // registers are read-only by the PrimeCell specification.
     let id =
         |offset: u64| unsafe { ptr::read_volatile((PL011_BASE + offset) as *const u32) & 0xff };
-    id(PL011_PERIPH_ID0_OFFSET) == 0x11
-        && id(PL011_PERIPH_ID1_OFFSET) == 0x10
-        && id(PL011_CELL_ID0_OFFSET) == 0x0d
-        && id(PL011_CELL_ID1_OFFSET) == 0xf0
-        && id(PL011_CELL_ID2_OFFSET) == 0x05
-        && id(PL011_CELL_ID3_OFFSET) == 0xb1
+    let bytes = [
+        id(PL011_PERIPH_ID0_OFFSET) as u8,
+        id(PL011_PERIPH_ID1_OFFSET) as u8,
+        id(PL011_CELL_ID0_OFFSET) as u8,
+        id(PL011_CELL_ID1_OFFSET) as u8,
+        id(PL011_CELL_ID2_OFFSET) as u8,
+        id(PL011_CELL_ID3_OFFSET) as u8,
+    ];
+    if bytes == [0x11, 0x10, 0x0d, 0xf0, 0x05, 0xb1] {
+        Pl011Probe::Available
+    } else {
+        Pl011Probe::IdMismatch { id: bytes }
+    }
 }
 
 /// Write one byte straight to the PL011 data register, waiting for TX
@@ -1245,6 +1340,7 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+    use uefi::mem::memory_map::{MemoryAttribute, MemoryMapMeta, MemoryMapRef};
 
     fn valid_elf() -> Vec<u8> {
         let mut bytes = vec![0u8; ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE + 4];
@@ -1570,5 +1666,61 @@ mod tests {
             find_dtb_relocation(entries.iter().copied(), 0x1000, 0x4008_0000, 0x49c4_5000),
             Some(0x49c4_5000)
         );
+    }
+
+    fn map_descriptor(ty: MemoryType, start: u64, pages: u64) -> MemoryDescriptor {
+        MemoryDescriptor {
+            ty,
+            phys_start: start,
+            virt_start: 0,
+            page_count: pages,
+            att: MemoryAttribute::empty(),
+        }
+    }
+
+    fn map_ref(descriptors: &[MemoryDescriptor]) -> MemoryMapRef<'_> {
+        // SAFETY: the descriptor slice is a valid, 8-byte-aligned byte
+        // buffer of exactly `desc_size`-sized entries.
+        let bytes = unsafe {
+            slice::from_raw_parts(
+                descriptors.as_ptr() as *const u8,
+                descriptors.len() * core::mem::size_of::<MemoryDescriptor>(),
+            )
+        };
+        MemoryMapRef::new(
+            bytes,
+            MemoryMapMeta {
+                map_size: bytes.len(),
+                desc_size: core::mem::size_of::<MemoryDescriptor>(),
+                map_key: Default::default(),
+                desc_version: MemoryDescriptor::VERSION,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pl011_probe_reports_missing_mmio_entry_with_nearest_entries() {
+        // The observed AAVMF shape: NOR flash and the PCI window bracket
+        // the UART address, and no MMIO entry covers it. The probe must
+        // say so and name the bracketing entries — in address order even
+        // when the map is unsorted. The ID half never runs here (no
+        // volatile read of the hardware address on the host).
+        let descriptors = [
+            map_descriptor(MemoryType::CONVENTIONAL, 0x4000_0000, 0x8000),
+            map_descriptor(MemoryType::MMIO, 0x1000_0000, 0x1000),
+            map_descriptor(MemoryType::MMIO, 0x0000_0000, 0x4000),
+            map_descriptor(MemoryType::CONVENTIONAL, 0x4402_0000, 0x1000),
+        ];
+        let map = map_ref(&descriptors);
+        let probe = pl011_available(&map);
+        let (before, after) = match probe {
+            Pl011Probe::NoMmioEntry { before, after } => (before, after),
+            _ => panic!("expected NoMmioEntry, got {probe:?}"),
+        };
+        assert_eq!(before[0].map(|d| d.phys_start), Some(0x0000_0000));
+        assert!(before[1].is_none());
+        assert_eq!(after[0].map(|d| d.phys_start), Some(0x1000_0000));
+        assert_eq!(after[1].map(|d| d.phys_start), Some(0x4000_0000));
     }
 }
