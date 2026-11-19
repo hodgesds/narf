@@ -2011,11 +2011,23 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         let mut out = options.render();
         let id = self.mounted_subvol_id();
         out.push_str(&alloc::format!(",subvolid={id}"));
-        if let Some(crate::volume::Subvol::Name(path)) = &options.subvol {
-            out.push_str(&alloc::format!(",subvol=/{path}"));
-        } else if id == crate::format::FS_TREE_OBJECTID {
-            out.push_str(",subvol=/");
+        // `btrfs_show_options`: `subvol=` is the mounted subvolume's path,
+        // however the mount selected it.
+        if let Some(path) = self.mounted_subvol_path() {
+            out.push_str(&alloc::format!(",subvol={path}"));
         }
         out
+    }
+
+    /// `btrfs_show_devname`: the filesystem's device.
+    fn show_devname(&self) -> Option<alloc::string::String> {
+        self.device_name()
+    }
+
+    /// The mount's root is the subvolume's root directory, which mountinfo
+    /// names by the subvolume's path (`/@`).
+    fn show_root(&self) -> alloc::string::String {
+        self.mounted_subvol_path()
+            .unwrap_or_else(|| alloc::string::String::from("/"))
     }
 }

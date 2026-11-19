@@ -256,6 +256,13 @@ that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
 launcher.
 
+A task root is stored as a directory's canonical host path (no trailing `/`
+except `/` itself, no empty or dot components), and a task's `/` joins to
+that root exactly. `chroot("/")` or `chroot(".")` naming the current root
+therefore leaves the root unchanged, as on Linux — pacman runs every hook
+with `chroot("/")` inside PID 1's root, and `ldconfig -r .` adds its own
+`chroot(".")`.
+
 `narf_user_runtime::execve` does not return on success and returns the kernel's
 positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,
@@ -1565,6 +1572,16 @@ aliases), it reopens descriptor `N`; path-backed descriptors restart normal
 open permission and flag handling, while anonymous descriptors retain a live
 reference to their object. `O_NOFOLLOW` preserves the final devtmpfs link and
 `RESOLVE_NO_MAGICLINKS` rejects the proc-fd jump with `ELOOP`.
+A followed proc-fd link lands on the descriptor's file for the path `stat`
+family and `access(2)` too (`stat("/dev/stdin")` with standard input a pipe
+describes the pipe), and a proc-fd link that is NOT the last component is
+jumped by every path syscall: `resolve_cwd_path` and friends rewrite
+`/proc/{self,thread-self,<pid>}/fd/N/<rest>` to `<the file's path>/<rest>`
+(`..` in `<rest>` climbs from that file's real directory), so Bun's
+`openat("/proc/self/fd/N/name", O_CREAT|O_EXCL)`, `rename` and `statx`
+through the link reach the directory `N` names. A descriptor with no name
+(a pipe, a socket, a removed directory) is left as written and the walk's
+errno is Linux's (ENOTDIR for a non-directory, ENOENT under a dead one).
 `/proc/{self,thread-self,<pid>}/{root,cwd,exe}` are magic links whose target
 is an ordinary pathname. Following one — through `open(2)` or a path `stat`
 — restarts the walk at that pathname, so `open("/proc/<pid>/root",

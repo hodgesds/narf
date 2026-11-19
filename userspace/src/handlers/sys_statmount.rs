@@ -223,12 +223,13 @@ fn mnt_id_req_from_user(req: u64, by_fd: bool) -> Result<(u32, u64, u64, u64), i
 }
 
 /// `(unique_id, unique_parent_id, old_id, path, fstype, mnt_opts, sb_opts,
-/// super_flags)`.
-/// `(unique_id, unique_parent_id, old_id, path, fstype, mnt_opts, sb_opts)`.
+/// super_flags, source, root)`.
 type VisibleMount = (
     u64,
     u64,
     u64,
+    alloc::string::String,
+    alloc::string::String,
     alloc::string::String,
     alloc::string::String,
     alloc::string::String,
@@ -241,7 +242,7 @@ fn visible_mounts() -> alloc::vec::Vec<VisibleMount> {
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
     rows.into_iter()
-        .map(|(id, parent, path, fstype, mnt_opts, sb_opts, super_flags)| {
+        .map(|(id, parent, path, fstype, mnt_opts, sb_opts, super_flags, source, root)| {
             // `struct statmount`: "mnt_parent_id — Unique ID of parent (for
             // root == mnt_id)". Linux's root mount has `mnt_parent` pointing
             // at itself, so `do_statmount` reports its own id.
@@ -261,6 +262,8 @@ fn visible_mounts() -> alloc::vec::Vec<VisibleMount> {
                 mnt_opts,
                 sb_opts,
                 super_flags,
+                source,
+                root,
             )
         })
         .collect()
@@ -406,6 +409,7 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     };
     let (unique, parent_unique, old_id, path, fstype, mnt_opts, sb_opts, super_flags) =
         (m.0, m.1, m.2, &m.3, &m.4, &m.5, &m.6, &m.7);
+    let (source, root) = (&m.8, &m.9);
 
     // Build the string area first: each `[str]` field is a u32 OFFSET into
     // it, so the offsets are only knowable once the area exists.
@@ -496,11 +500,12 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         got |= STATMOUNT_SUPPORTED_MASK;
         sm.supported_mask = STATMOUNT_SUPPORTED;
     }
-    // `mnt_root` is the mount's root WITHIN its filesystem. NARF mounts
-    // whole filesystems, so that is always "/".
+    // `mnt_root` is the mount's root WITHIN its filesystem
+    // (`statmount_mnt_root` -> `show_path`): `/` for a whole filesystem, the
+    // subvolume's path for a btrfs subvolume mount — mountinfo's field 4.
     if mask & STATMOUNT_MNT_ROOT != 0 {
         got |= STATMOUNT_MNT_ROOT;
-        sm.mnt_root = push("/", &mut strs);
+        sm.mnt_root = push(root, &mut strs);
     }
     if mask & STATMOUNT_MNT_POINT != 0 {
         got |= STATMOUNT_MNT_POINT;
@@ -519,7 +524,9 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     }
     if mask & STATMOUNT_SB_SOURCE != 0 {
         got |= STATMOUNT_SB_SOURCE;
-        sm.sb_source = push(fstype, &mut strs);
+        // `statmount_sb_source`: `show_devname`, else `mnt_devname` — the
+        // source field of mountinfo.
+        sm.sb_source = push(source, &mut strs);
     }
     sm.mask = got;
 

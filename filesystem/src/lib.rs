@@ -2983,6 +2983,26 @@ pub trait FsInstance: Send + Sync + 'static {
         String::new()
     }
 
+    /// The mount source this filesystem names itself by, as Linux's
+    /// `super_operations::show_devname` prints it in the first field of
+    /// `/proc/mounts` and the source field of `/proc/<pid>/mountinfo` —
+    /// btrfs's `btrfs_show_devname` prints its device, whatever string the
+    /// mount was made with. `None` (the default, and every filesystem
+    /// without the operation) prints the mount's own source string
+    /// (`mnt_devname`).
+    fn show_devname(&self) -> Option<String> {
+        None
+    }
+
+    /// The path of this mount's root inside the filesystem, which
+    /// `/proc/<pid>/mountinfo` prints as its fourth field
+    /// (`show_mountinfo` -> `show_path(m, mnt->mnt_root)`): `/` for a
+    /// filesystem mounted at its own root, the subvolume's path (`/@`) for a
+    /// btrfs subvolume mount, the bound directory for a bind mount.
+    fn show_root(&self) -> String {
+        String::from("/")
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -3741,6 +3761,12 @@ pub struct Mount {
     /// one of them propagates to all the others (`MS_SHARED`). Atomic because
     /// `mount --make-shared`/`--make-private` flip it on a live mount.
     group_id: core::sync::atomic::AtomicU64,
+    /// The source string the mount was made with — Linux's `mnt_devname`
+    /// (`fc->source`, `"none"` for a `mount(2)` with no source), copied to
+    /// a bind mount and to a namespace's copy of the mount. `None` for a
+    /// mount the kernel made without one, which reports its filesystem's
+    /// name. A filesystem with `show_devname` reports that instead.
+    devname: Option<Arc<str>>,
 }
 
 /// Every `MNT_*` bit that has ever been set on any mount, OR-ed together.
@@ -4005,6 +4031,16 @@ impl Mount {
         self.group_id
             .store(gid, core::sync::atomic::Ordering::Release);
     }
+
+    /// The source field `/proc/mounts` and `/proc/<pid>/mountinfo` print
+    /// for this mount: `sb->s_op->show_devname` when the filesystem has one,
+    /// else `mnt_devname` (`show_vfsmnt`, `show_mountinfo`).
+    pub fn source(&self) -> String {
+        self.fs
+            .show_devname()
+            .or_else(|| self.devname.as_deref().map(String::from))
+            .unwrap_or_else(|| String::from(self.fs.name()))
+    }
 }
 
 impl fmt::Debug for Mount {
@@ -4017,12 +4053,15 @@ impl fmt::Debug for Mount {
 }
 
 /// One `/proc/<pid>/mountinfo` row: `(id, parent, path, fstype, mount
-/// options, super options)`.
+/// options, show options, super flags, source, root)`.
 ///
-/// The two option fields are the two halves Linux keeps apart and prints
-/// in different columns: `mount options` is this ATTACHMENT's `MNT_*` set
-/// (`rw`/`ro` plus `nosuid`/`nodev`/`noexec`), while `super options` is
-/// the filesystem's own `show_options` string, already `,`-prefixed.
+/// The option fields are the halves Linux keeps apart and prints in
+/// different columns: `mount options` is this ATTACHMENT's `MNT_*` set
+/// (`rw`/`ro` plus `nosuid`/`nodev`/`noexec`), while `show options` is the
+/// filesystem's own `show_options` string, already `,`-prefixed, and
+/// `super flags` the superblock's `rw`/`ro` + `show_sb_opts`. `source` is
+/// [`Mount::source`]; `root` is the mount root's path inside its
+/// filesystem ([`FsInstance::show_root`]).
 /// `struct cachestat` (`include/uapi/linux/mman.h`) — what `cachestat(2)`
 /// reports for a range of a file.
 ///
@@ -4044,7 +4083,17 @@ pub struct CacheStat {
     pub nr_recently_evicted: u64,
 }
 
-pub type MountInfoRow = (u64, u64, String, String, String, String, String);
+pub type MountInfoRow = (
+    u64,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
     mounts
@@ -4083,6 +4132,8 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
                 mnt_flags::render(mount.flags()),
                 mount.fs.show_options(),
                 sb_flags::render(sb_flags::of(&mount.fs)),
+                mount.source(),
+                mount.fs.show_root(),
             )
         })
         .collect()
@@ -4149,6 +4200,7 @@ struct MountLookup {
     fs: Weak<dyn FsInstance>,
     root: Weak<Dentry>,
     id: u64,
+    devname: Option<Arc<str>>,
 }
 
 struct MountLookupTable {
@@ -4160,6 +4212,8 @@ struct MountResolution {
     root: Arc<Dentry>,
     rel_start: usize,
     id: u64,
+    /// The covering mount's `mnt_devname`, which a bind of it inherits.
+    devname: Option<Arc<str>>,
 }
 
 impl MountLookupTable {
@@ -4172,6 +4226,7 @@ impl MountLookupTable {
                     fs: Arc::downgrade(&mount.fs),
                     root: Arc::downgrade(&mount.root),
                     id: mount.id,
+                    devname: mount.devname.clone(),
                 })
                 .collect(),
         }
@@ -4216,6 +4271,7 @@ fn single_mount_lookup_resolution(mounts: &[MountLookup], abs: &str) -> Option<M
         root: mount.root.upgrade()?,
         rel_start,
         id: mount.id,
+        devname: mount.devname.clone(),
     })
 }
 
@@ -4771,6 +4827,8 @@ impl MountNamespace {
                 // are mount namespaces in the same user namespace, so the peer
                 // path is the one that matters here.
                 group_id: core::sync::atomic::AtomicU64::new(m.group_id()),
+                // `clone_mnt`: `mnt->mnt_devname = old->mnt_devname`.
+                devname: m.devname.clone(),
             })
             .collect();
         let id = alloc_mount_ns_id();
@@ -4995,15 +5053,24 @@ impl MountNamespace {
             .map(|mount| mount.fs)
     }
 
+    /// The `mnt_devname` of the visible mount covering `abs` — what a clone
+    /// of it (`open_tree(OPEN_TREE_CLONE)`) carries.
+    pub fn mount_devname_at(&self, abs: &str) -> Option<String> {
+        self.store().mount_devname_at(abs)
+    }
+
     /// Clone the visible directory subtree rooted at `abs`.
     pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
         let mount = self.store().lookup_covering_mount(abs)?;
-        let root = resolve_directory_cached(mount.root, &abs[mount.rel_start..])?;
+        let rel = &abs[mount.rel_start..];
+        let root_path = join_root_path(&mount.fs.show_root(), rel);
+        let root = resolve_directory_cached(mount.root, rel)?;
         Some(Arc::new(BindMount {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
             source: mount.fs.clone(),
+            root_path,
         }) as Arc<dyn FsInstance>)
     }
 
@@ -5130,6 +5197,19 @@ impl MountNamespace {
         fs: Arc<dyn FsInstance>,
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.mount_arc_with_source(authority, path, fs, flags, None)
+    }
+
+    /// [`Self::mount_arc_with_flags`] recording the source string the mount
+    /// was made with (`mnt_devname`; see [`VfsRegistry::mount_arc_with_source`]).
+    pub fn mount_arc_with_source(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+        devname: Option<&str>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let flags = if fs.always_read_only() {
             flags | mnt_flags::READONLY
@@ -5152,6 +5232,7 @@ impl MountNamespace {
             // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
             // already-shared parent is handled by the attach path, not here.
             group_id: core::sync::atomic::AtomicU64::new(0),
+            devname: devname.map(Arc::from),
         });
         store.publish_lookup_locked(&mounts);
         note_mnt_flags(flags);
@@ -5179,7 +5260,7 @@ impl MountNamespace {
         // A directory source binds as a subtree; a FILE source binds as a
         // single file (mount --bind of a file).
         let bind = build_bind_fs(&source_mount.fs, source_mount.root, &rel)?;
-        self.mount_arc(authority, target, bind)
+        self.mount_arc_with_source(authority, target, bind, 0, source_mount.devname.as_deref())
     }
 
     /// Detach the topmost mount at `path` from this private namespace.
@@ -5318,6 +5399,8 @@ struct BindMount {
     /// (`systemd-remount-fs` remounts the installed root through the
     /// `/mnt` bind PID 1 is rooted at).
     source: Arc<dyn FsInstance>,
+    /// The bound directory's path inside the filesystem — mountinfo's root.
+    root_path: String,
 }
 
 impl fmt::Debug for BindMount {
@@ -5349,6 +5432,13 @@ impl FsInstance for BindMount {
     }
     fn show_options(&self) -> String {
         self.source.show_options()
+    }
+    /// One superblock: a bind reports the source filesystem's device.
+    fn show_devname(&self) -> Option<String> {
+        self.source.show_devname()
+    }
+    fn show_root(&self) -> String {
+        self.root_path.clone()
     }
 }
 
@@ -5382,6 +5472,10 @@ struct FileMount {
     // as pathname AF_UNIX, which must recognise the source and target as the
     // same socket node.
     backing_identity: usize,
+    /// The source filesystem's `show_devname`, captured at bind time.
+    devname: Option<String>,
+    /// The bound file's path inside its filesystem — mountinfo's root.
+    root_path: String,
 }
 
 impl fmt::Debug for FileMount {
@@ -5405,6 +5499,25 @@ impl FsInstance for FileMount {
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
     }
+    fn show_devname(&self) -> Option<String> {
+        self.devname.clone()
+    }
+    fn show_root(&self) -> String {
+        self.root_path.clone()
+    }
+}
+
+/// `root` (an absolute path inside a filesystem) joined with the relative
+/// path `rel` below it.
+fn join_root_path(root: &str, rel: &str) -> String {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        return String::from(root);
+    }
+    let mut out = String::from(root.trim_end_matches('/'));
+    out.push('/');
+    out.push_str(rel);
+    out
 }
 
 /// Build the `FsInstance` for binding the node at relative path `rel` within
@@ -5421,6 +5534,7 @@ fn build_bind_fs(
     rel: &str,
 ) -> Result<Arc<dyn FsInstance>, FsError> {
     let fs_name = String::from(source_fs.name());
+    let root_path = join_root_path(&source_fs.show_root(), rel);
     let comps: alloc::vec::Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let source_root_dir = source_root.directory().ok_or(FsError::NotFound)?;
     if comps.is_empty() {
@@ -5430,6 +5544,7 @@ fn build_bind_fs(
             fs_name,
             backing_identity: source_fs.backing_identity(),
             source: source_fs.clone(),
+            root_path,
         }));
     }
     let mut dir = source_root_dir;
@@ -5452,6 +5567,7 @@ fn build_bind_fs(
                             fs_name,
                             backing_identity: source_fs.backing_identity(),
                             source: source_fs.clone(),
+                            root_path,
                         }));
                     }
                     Err(FsError::NotFound) => {}
@@ -5462,6 +5578,8 @@ fn build_bind_fs(
                 file: node,
                 fs_name,
                 backing_identity: source_fs.backing_identity(),
+                devname: source_fs.show_devname(),
+                root_path,
             }));
         }
         Err(FsError::NotFound) => {}
@@ -5474,6 +5592,7 @@ fn build_bind_fs(
         fs_name,
         backing_identity: source_fs.backing_identity(),
         source: source_fs.clone(),
+        root_path,
     }))
 }
 
@@ -5515,6 +5634,7 @@ impl VfsRegistry {
                     root,
                     rel_start,
                     id: mount.id,
+                    devname: mount.devname.clone(),
                 });
             }
         }
@@ -5610,6 +5730,7 @@ impl VfsRegistry {
             // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
             // already-shared parent is handled by the attach path, not here.
             group_id: core::sync::atomic::AtomicU64::new(0),
+            devname: None,
         });
         self.publish_lookup_locked(&q);
         note_mnt_flags(flags);
@@ -5641,6 +5762,23 @@ impl VfsRegistry {
         fs: Arc<dyn FsInstance>,
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.mount_arc_with_source(authority, path, fs, flags, None)
+    }
+
+    /// [`Self::mount_arc_with_flags`] recording the source string the mount
+    /// was made with: Linux's `mnt_devname` (`vfs_create_mount`:
+    /// `mnt->mnt_devname = fc->source ?: "none"`), which `/proc/mounts` and
+    /// `/proc/<pid>/mountinfo` print for a filesystem without
+    /// `show_devname`. `None` is a mount the kernel made with no source
+    /// string, which reports the filesystem's name.
+    pub fn mount_arc_with_source(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+        devname: Option<&str>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let flags = if fs.always_read_only() {
             flags | mnt_flags::READONLY
@@ -5662,6 +5800,7 @@ impl VfsRegistry {
             // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
             // already-shared parent is handled by the attach path, not here.
             group_id: core::sync::atomic::AtomicU64::new(0),
+            devname: devname.map(Arc::from),
         });
         self.publish_lookup_locked(&q);
         note_mnt_flags(flags);
@@ -5697,7 +5836,7 @@ impl VfsRegistry {
         // A directory source binds as a subtree; a FILE source binds as a
         // single file (mount --bind of a file).
         let bind = build_bind_fs(&source_mount.fs, source_mount.root, &rel)?;
-        self.mount_arc(authority, target, bind)
+        self.mount_arc_with_source(authority, target, bind, 0, source_mount.devname.as_deref())
     }
 
     /// Mount a writable overlay at `path`: the directory currently visible at
@@ -5991,15 +6130,26 @@ impl VfsRegistry {
         self.lookup_covering_mount(abs).map(|mount| mount.fs)
     }
 
+    /// The `mnt_devname` of the mount covering `abs` — what a clone of it
+    /// (`open_tree(OPEN_TREE_CLONE)`, `clone_mnt`) carries. `None` for a
+    /// mount made with no source string.
+    pub fn mount_devname_at(&self, abs: &str) -> Option<String> {
+        self.lookup_covering_mount(abs)
+            .and_then(|mount| mount.devname.as_deref().map(String::from))
+    }
+
     /// Clone the directory subtree rooted at `abs` as a detached filesystem.
     pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
         let mount = self.lookup_covering_mount(abs)?;
-        let root = resolve_directory_cached(mount.root, &abs[mount.rel_start..])?;
+        let rel = &abs[mount.rel_start..];
+        let root_path = join_root_path(&mount.fs.show_root(), rel);
+        let root = resolve_directory_cached(mount.root, rel)?;
         Some(Arc::new(BindMount {
             root,
             fs_name: String::from(mount.fs.name()),
             backing_identity: mount.fs.backing_identity(),
             source: mount.fs.clone(),
+            root_path,
         }) as Arc<dyn FsInstance>)
     }
 

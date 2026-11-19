@@ -1255,12 +1255,28 @@ independently of optional container namespaces: service managers use
 `CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
 they remount them read-only.
 `/proc/mounts` and `/proc/<pid>/mounts` render `show_vfsmnt` rows from the
-same per-task view (the namespace hook's seven tab-separated fields, else
+same per-task view (the namespace hook's nine tab-separated fields — id,
+parent, path, fstype, mount options, `show_options`, super flags, source,
+root; rows may stop after the fstype or the super flags — else
 `list_mountinfo`): options are `rw`/`ro` (mount or superblock read-only), then
-the superblock options, then the mount options, then `show_options`. Device
-and fstype are octal-escaped with `mangle()`'s set (`" \t\n\\#"`) and mount
-points with `seq_path_root`'s (`" \t\n\\"`), in both those files and
-`mountinfo`. The mountinfo hook is global state; `MountinfoHookGuard::install`
+the superblock options, then the mount options, then `show_options`. The
+device field (and mountinfo's source field, and statmount's `sb_source`) is
+`Mount::source()`: `FsInstance::show_devname()` when the filesystem has one
+(btrfs prints its device, `btrfs_show_devname`), else the mount's
+`mnt_devname` — the source string `mount(2)` (`"none"` for a NULL source) or
+`fsconfig("source")` gave it, the device the kernel mounted the root or ESP
+from, copied to binds, `open_tree` clones and namespace copies — else, for a
+mount the kernel made without one, the fstype. Mountinfo's fourth field (and
+statmount's `mnt_root`) is `FsInstance::show_root()`, the mount root's path
+inside its filesystem: `/`, a btrfs subvolume's path from the top level
+(`/@`), or a bind's source directory. `list_mountinfo` rows are
+`(id, parent, path, fstype, mount options, show_options, super flags, source,
+root)`. `VfsRegistry::mount_arc_with_source` /
+`MountNamespace::mount_arc_with_source` attach with a `mnt_devname`
+(`mount_arc_with_flags` attaches with none), and `mount_devname_at` reads the
+covering mount's. Device and fstype are octal-escaped with `mangle()`'s set
+(`" \t\n\\#"`) and mount points and roots with `seq_path_root`'s
+(`" \t\n\\"`), in both those files and `mountinfo`. The mountinfo hook is global state; `MountinfoHookGuard::install`
 installs one for a scope and restores the previous hook on drop.
 An already-open `/proc/<pid>/mountinfo` file reports a `POLLPRI` edge after an
 attach, detach, or move in that task's visible mount namespace; unrelated
@@ -1329,8 +1345,15 @@ pub trait FsInstance: Send + Sync {
     fn backing_identity(&self) -> usize;
     async fn statfs(&self) -> Result<FsStat, FsError>;
     fn reconfigure(&self, options: &str) -> Result<(), FsError>;
+    fn show_options(&self) -> String;          // default: ""
+    fn show_devname(&self) -> Option<String>;  // default: None (mnt_devname)
+    fn show_root(&self) -> String;             // default: "/"
 }
 ```
+
+`show_devname` and `show_root` are read under the mount-table lock while
+`/proc/<pid>/mountinfo` is rendered, so they answer from state the filesystem
+recorded at mount (no I/O, no sleeping lock).
 
 Filesystems run in their own PKS/MTE domain (Stage 4) and communicate
 with `filesystem/` core via Narf-Ring.

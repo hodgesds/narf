@@ -371,15 +371,22 @@ fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::stri
     if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
         return normalize_abs(host);
     }
-    let normalized = if is_normalized_abs(&path) {
+    let normalized = if is_normalized_abs(&path) && !path.contains("/fd/") {
         path
     } else {
-        resolve_cwd_path_user(task, &path)
+        match normalize_user_walk(task, &cwd_joined(task, &path)) {
+            WalkedPath::User(normalized) => normalized,
+            WalkedPath::Host(host) => return host,
+        }
     };
     let prefix = match root_dir_prefix(task) {
         Some(prefix) if prefix != "/" => prefix,
         _ => return normalized,
     };
+    // The task's `/` is its root itself (see `apply_chroot`).
+    if normalized == "/" {
+        return prefix;
+    }
     let mut rooted = alloc::string::String::with_capacity(prefix.len() + normalized.len());
     rooted.push_str(&prefix);
     rooted.push_str(&normalized);
@@ -468,12 +475,12 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
         return normalize_abs(host);
     }
-    let normalized = resolve_cwd_path_user(task, path);
-    // Re-root under the task's chroot (if any) so a chrooted process —
-    // e.g. a container — resolves paths against the chrooted rootfs, not
-    // the host root. No-op for tasks without a chroot.
-    {
-        apply_chroot(&normalized)
+    match normalize_user_walk(task, &cwd_joined(task, path)) {
+        // Re-root under the task's chroot (if any) so a chrooted process —
+        // e.g. a container — resolves paths against the chrooted rootfs, not
+        // the host root. No-op for tasks without a chroot.
+        WalkedPath::User(normalized) => apply_chroot(&normalized),
+        WalkedPath::Host(host) => host,
     }
 }
 
@@ -1063,15 +1070,113 @@ fn path_is_within(path: &str, root: &str) -> bool {
 /// "/mnt/mnt/proc/stat" → busybox top's "can't open 'stat'"), and
 /// getcwd leaked the host-side prefix into the container.
 pub(crate) fn resolve_cwd_path_user(task: u64, path: &str) -> alloc::string::String {
+    let joined = cwd_joined(task, path);
+    match normalize_user_walk(task, &joined) {
+        WalkedPath::User(path) => path,
+        // A caller-view path cannot name a file outside the caller's root;
+        // the host-producing resolvers below carry that jump.
+        WalkedPath::Host(_) => normalize_abs(&joined),
+    }
+}
+
+/// `path` made absolute against `task`'s cwd, not yet normalised.
+fn cwd_joined(task: u64, path: &str) -> alloc::borrow::Cow<'_, str> {
     if path.starts_with('/') {
-        normalize_abs(path)
+        alloc::borrow::Cow::Borrowed(path)
     } else {
         let mut joined = cwd_of(task);
         if !joined.ends_with('/') {
             joined.push('/');
         }
         joined.push_str(path);
-        normalize_abs(&joined)
+        alloc::borrow::Cow::Owned(joined)
+    }
+}
+
+/// An absolute pathname after [`normalize_user_walk`].
+enum WalkedPath {
+    /// In the caller's view, before its chroot prefix.
+    User(alloc::string::String),
+    /// Host-absolute: a proc-fd magic link jumped to a file outside the
+    /// caller's root (a descriptor opened before a later chroot).
+    Host(alloc::string::String),
+}
+
+/// [`normalize_abs`], plus `nd_jump_link` for each proc-fd magic link the
+/// walk goes ON from.
+///
+/// `link_path_walk` follows every non-final symlink, and following
+/// `/proc/self/fd/N` (or `thread-self`, or `<pid>`) installs the open file's
+/// own path, from which the remaining components are walked — `..`
+/// included, which climbs out of that file's real directory. Bun reaches
+/// every name this way: it opens a directory `O_PATH` and then creates,
+/// stats and renames `/proc/self/fd/N/<name>` (Claude Code's every file
+/// write). Left in place, the name went to procfs, which has no `N/<name>`,
+/// and every write failed ENOENT.
+///
+/// Only a descriptor that still has its name is jumped through here. One
+/// with none (a pipe, a socket, a removed directory) is left as written: the
+/// walk into procfs then fails, and its errno is classified as Linux's walk
+/// would answer (`path_lookup_errno` stats the link, which lands on the
+/// object: ENOTDIR for a non-directory, ENOENT under a dead directory).
+/// A final magic link is left to the syscall, which decides whether to
+/// follow it (O_NOFOLLOW, AT_SYMLINK_NOFOLLOW, lstat).
+fn normalize_user_walk(task: u64, joined: &str) -> WalkedPath {
+    // The common path has no fd link to jump; keep it allocation-light.
+    if !joined.contains("/fd/") {
+        return WalkedPath::User(normalize_abs(joined));
+    }
+    let components: alloc::vec::Vec<&str> = joined.split('/').collect();
+    let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut host = false;
+    let mut jumps = 0usize;
+    for (index, component) in components.iter().enumerate() {
+        match *component {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+                continue;
+            }
+            name => out.push(alloc::string::String::from(name)),
+        }
+        let walked_on = components[index + 1..].iter().any(|next| !next.is_empty());
+        if !walked_on
+            || jumps >= SYMLOOP_MAX
+            || out.len() < 2
+            || out[out.len() - 2] != "fd"
+        {
+            continue;
+        }
+        let prefix = alloc::format!("/{}", out.join("/"));
+        let visible = if host {
+            match visible_path_of(task, &prefix) {
+                Some(visible) => alloc::string::String::from(visible),
+                None => continue,
+            }
+        } else {
+            prefix
+        };
+        let Some(ProcFdLanding::Path(target)) = proc_fd_landing(task, &visible) else {
+            continue;
+        };
+        jumps += 1;
+        let view = visible_path_of(task, &target).map(alloc::string::String::from);
+        let (view, in_host) = match view {
+            Some(view) => (view, false),
+            None => (target, true),
+        };
+        host = in_host;
+        out = view
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+    }
+    let path = alloc::format!("/{}", out.join("/"));
+    if host {
+        WalkedPath::Host(path)
+    } else {
+        WalkedPath::User(path)
     }
 }
 
@@ -1462,22 +1567,71 @@ fn path_lookup_errno(path: &str, first: Option<narf_filesystem::FsError>) -> i64
 /// path. `None` for anything else (the ordinary walk then applies), including
 /// a closed fd or a pathless one (memfd, socket, anon inode).
 fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::String> {
-    let (owner, fd) = if let Some(n) = user_path
-        .strip_prefix("/proc/self/fd/")
-        .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"))
-    {
-        (task, n.parse::<u32>().ok()?)
-    } else {
-        let n = parse_proc_self_fd(user_path)?;
-        let pid = user_path
-            .strip_prefix("/proc/")?
-            .split_once('/')?
-            .0
-            .parse::<u64>()
-            .ok()?;
-        (proc_pid_to_tid(pid), n)
-    };
+    let (owner, fd) = proc_fd_link_owner(task, user_path)?;
     fd_path_for_task(owner, fd).filter(|p| p.starts_with('/'))
+}
+
+/// The descriptor a `/proc/self/fd/N`, `/proc/thread-self/fd/N` or
+/// `/proc/<pid>/fd/N` link (caller view) refers to: `(owning task, N)`.
+/// `self` and `thread-self` are the caller, whose thread shares the
+/// process's table; a pid is resolved in the caller's pid namespace.
+fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
+    let n = parse_proc_self_fd(user_path)?;
+    if user_path.starts_with("/proc/self/fd/")
+        || user_path.starts_with("/proc/thread-self/fd/")
+    {
+        return Some((task, n));
+    }
+    let pid = user_path
+        .strip_prefix("/proc/")?
+        .split_once('/')?
+        .0
+        .parse::<u64>()
+        .ok()?;
+    Some((proc_pid_to_tid(pid), n))
+}
+
+/// Where FOLLOWING a proc-fd magic link lands. `proc_fd_link` hands
+/// `nd_jump_link` the open file's own `f_path`: the walk goes on from the
+/// file itself, never from the link's readlink text, which for a file with
+/// no name (`pipe:[ino]`) names nothing.
+pub(crate) enum ProcFdLanding {
+    /// The open file still has its name: the host path of it.
+    Path(alloc::string::String),
+    /// The open file has no name a walk could take — a pipe, socket,
+    /// anonymous inode or memfd, or a file whose name was removed: the
+    /// object itself.
+    Object(alloc::sync::Arc<dyn narf_filesystem::FileOps>),
+}
+
+/// `user_path` (caller view, absolute, normalised) followed as a proc-fd
+/// magic link. `None` when it is not one, and when it names no open
+/// descriptor — that is a missing entry of the fd directory, which the
+/// ordinary walk reports as ENOENT just as Linux's lookup does.
+pub(crate) fn proc_fd_landing(task: u64, user_path: &str) -> Option<ProcFdLanding> {
+    let (owner, n) = proc_fd_link_owner(task, user_path)?;
+    let (ops, name) = crate::fd::with_table(owner, |table| {
+        Some((
+            table.get(n)?.ops.clone(),
+            table.description(n).and_then(|description| description.name()),
+        ))
+    })
+    .flatten()?;
+    if internal_file_path(&*ops).is_some() {
+        return Some(ProcFdLanding::Object(ops));
+    }
+    Some(match name {
+        Some(name) if !name.deleted => {
+            ProcFdLanding::Path(alloc::string::String::from(&*name.path))
+        }
+        _ => ProcFdLanding::Object(ops),
+    })
+}
+
+/// The stat tuple of an object a walk landed on rather than looked up.
+fn path_stat_of(ops: &dyn narf_filesystem::FileOps) -> PathStat {
+    let (uid, gid) = ops.owners();
+    (ops.stat(), ops.ino(), ops.rdev(), uid, gid, ops.inode_attrs())
 }
 
 /// Where a FOLLOWED `/proc/{self,thread-self,<pid>}/fd/N` lands for a
@@ -1800,6 +1954,26 @@ fn stat_ino_path_dir_aware_depth(
     depth: u8,
 ) -> Result<PathStat, narf_filesystem::FsError> {
     const MAX_STAT_RETRY: u8 = 2;
+    // A FOLLOWED proc-fd magic link lands on the descriptor's own file and
+    // stops there (`proc_fd_link` -> `nd_jump_link`): describe that file, by
+    // its name when it has one (without following it further — an
+    // O_PATH|O_NOFOLLOW descriptor on a symlink describes the symlink), and
+    // as the object itself when it has none. Walking the link instead
+    // followed its readlink text, which for a pipe is `pipe:[ino]`: `stat`
+    // of `/proc/self/fd/0`, of `/dev/fd/0` and of `/dev/stdin` with standard
+    // input a pipe was ENOENT, which is what `install -Dm644 /dev/stdin
+    // /boot/vmlinuz-linux` (mkinitcpio's install hook) died on.
+    if follow_final && depth < MAX_STAT_RETRY {
+        let task = current_task_id();
+        let landing =
+            visible_path_of(task, path).and_then(|visible| proc_fd_landing(task, visible));
+        if let Some(landing) = landing {
+            return match landing {
+                ProcFdLanding::Path(host) => stat_ino_path_dir_aware_depth(&host, false, depth + 1),
+                ProcFdLanding::Object(ops) => Ok(path_stat_of(&*ops)),
+            };
+        }
+    }
     // The first walk's error, if it failed.
     let mut first: Option<narf_filesystem::FsError> = None;
     let file = current_resolve_absolute(path, |fs, root, rel| {
@@ -1953,30 +2127,10 @@ fn stat_ino_path_dir_aware_depth(
                 // The expansion deliberately stops AT a proc-fd magic link
                 // rather than following its readlink text, because that text
                 // describes the object and for an anonymous descriptor names
-                // nothing. `open` performs the jump itself; a path `stat` has
-                // to do the same here, or a path that opens fine cannot be
-                // described — `/dev/fd/0` is a devtmpfs symlink into procfs,
-                // so `[ -e /dev/fd/0 ]` expanded to `/proc/self/fd/0` and then
-                // had nothing left to walk.
-                //
-                // `nd_jump_link` stops at the descriptor's own file, so the
-                // target is described directly and the walk does not continue
-                // into it (`follow_final` false) — the same shape the statx
-                // handler already uses for a literal `/proc/<pid>/fd/N`.
-                if follow_final {
-                    let task = current_task_id();
-                    if let Some(fd) = parse_proc_fd_magic_path(task, &expanded) {
-                        if let Some(target) =
-                            fd_path_for_task(task, fd).filter(|p| p.starts_with('/'))
-                        {
-                            return retried(stat_ino_path_dir_aware_depth(
-                                &apply_chroot(&target),
-                                false,
-                                depth + 1,
-                            ));
-                        }
-                    }
-                }
+                // nothing. `/dev/fd/0` is a devtmpfs symlink into procfs, so
+                // `[ -e /dev/fd/0 ]` expands to `/proc/self/fd/0`; the retry
+                // lands on the descriptor's file (see the top of this
+                // function), as `open` does.
                 return retried(stat_ino_path_dir_aware_depth(
                     &expanded,
                     follow_final,
@@ -4400,6 +4554,15 @@ pub(crate) fn current_fs_arc_at(
     }
 }
 
+/// [`current_fs_arc_at`]'s mount's `mnt_devname`.
+pub(crate) fn current_mount_devname_at(path: &str) -> Option<alloc::string::String> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_devname_at(path)
+    } else {
+        narf_filesystem::registry().mount_devname_at(path)
+    }
+}
+
 pub(crate) fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
     current_mount_namespace()
         .map(|ns| ns.list())
@@ -4503,10 +4666,26 @@ pub(crate) fn current_mount_arc_with_flags(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    current_mount_arc_with_source(authority, path, fs, flags, None)
+}
+
+/// [`current_mount_arc_with_flags`] recording the source string the mount
+/// was made with (`mnt_devname`): `mount(2)`'s `source` (`"none"` for a NULL
+/// one), or the new mount API's `fsconfig("source")`.
+pub(crate) fn current_mount_arc_with_source(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    flags: u64,
+    devname: Option<&str>,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.mount_arc_with_flags(authority, path, fs, flags)
+        ns.mount_arc_with_source(authority, path, fs, flags, devname)
     } else {
-        narf_filesystem::registry().mount_arc_with_flags(authority, path, fs, flags)
+        narf_filesystem::registry().mount_arc_with_source(authority, path, fs, flags, devname)
     };
     // Mount propagation: a filesystem mount attached under a shared mount is
     // mirrored into every peer namespace (Linux `propagate_mnt`). No-op unless
@@ -4991,7 +5170,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts, super_flags) in rows {
+    for (id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -5003,14 +5182,15 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        // The last three fields are the option halves: this attachment's
-        // MNT_* flags, then the filesystem's `show_options` text, then the
-        // superblock's `rw`/`ro` + `show_sb_opts`. procfs renders the first
-        // before mountinfo's `-` and the other two after it.
+        // Then the option halves: this attachment's MNT_* flags, the
+        // filesystem's `show_options` text, and the superblock's `rw`/`ro` +
+        // `show_sb_opts` (procfs renders the first before mountinfo's `-`
+        // and the other two after it); then the source (`show_devname`, else
+        // `mnt_devname`) and the mount root's path inside its filesystem.
         let _ = writeln!(
             s,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            id, parent, visible, name, mnt_opts, sb_opts, super_flags
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root
         );
     }
     Some(s)
@@ -5294,6 +5474,10 @@ fn set_root_dir(task: u64, root: alloc::string::String) {
 }
 
 fn set_root_dir_key(key: u64, root: alloc::string::String) {
+    // A root is a directory's host path: no trailing `/` (but `/` itself),
+    // no empty or dot components — the form every join and prefix test
+    // below assumes. `chroot("/")` inside a root names that root.
+    let root = normalize_abs(&root);
     let mut shard = ROOT_DIR_TABLE[task_map_shard(key)].map.lock();
     let roots = shard.get_or_insert_with(BTreeMap::new);
     if !roots.contains_key(&key) {
@@ -5363,6 +5547,14 @@ pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     };
     if !path.starts_with('/') {
         return alloc::string::String::from(path);
+    }
+    // The task's `/` is its root directory itself. Joining gave `<root>/`,
+    // and `chroot("/")` — pacman's `_alpm_run_chroot` inside PID 1's root,
+    // then `ldconfig -r .`'s `chroot(".")` — stored that as the new root, so
+    // every later path became `<root>//etc/...`: `chmod` took the empty
+    // component literally and failed ENOENT on a file `open` had just made.
+    if path == "/" && prefix != "/" {
+        return prefix;
     }
     // Compose prefix + path; prefix has no trailing `/` (except when
     // it equals `/`), path starts with `/`.

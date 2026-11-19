@@ -853,6 +853,9 @@ struct ViewState {
     fs_tree_id: u64,
     /// Cached root-directory inode (objectid 256), for the sync `root()` path.
     root_inode: Option<InodeItem>,
+    /// The selected subvolume's path from the top level (`/@`), resolved when
+    /// it was selected; `None` for the top level itself.
+    subvol_path: Option<String>,
 }
 
 /// A mounted btrfs filesystem as one mount sees it: a subvolume root over the
@@ -1115,6 +1118,24 @@ impl<B: BlockDevice> VolCore<B> {
     /// The filesystem UUID this instance serves.
     pub fn fsid(&self) -> [u8; 16] {
         self.state.lock().superblock.fsid
+    }
+
+    /// The device `/proc/mounts` and `/proc/<pid>/mountinfo` name this
+    /// filesystem by (`btrfs_show_devname`), whichever device or subvolume a
+    /// mount of it was asked for.
+    pub fn device_name(&self) -> Option<String> {
+        self.device_name.lock().clone()
+    }
+
+    /// Record the device the filesystem was opened from. The first one
+    /// stays: Linux sets `latest_dev` when the devices are opened, and a
+    /// later mount through another member of the same filesystem is a view of
+    /// the open one.
+    pub fn note_device_name(&self, name: &str) {
+        let mut slot = self.device_name.lock();
+        if slot.is_none() {
+            *slot = Some(String::from(name));
+        }
     }
 
     /// Whether `devid` is one of this instance's assembled members.
@@ -1549,6 +1570,11 @@ pub struct VolCore<B: BlockDevice> {
     /// The drop-time commit has been started once; a failed one is not
     /// retried by every internal view that drops after it.
     drop_commit_tried: core::sync::atomic::AtomicBool,
+    /// The device the filesystem was opened from, as `/proc/mounts` names
+    /// it — Linux's `fs_devices->latest_dev->name`, which
+    /// `btrfs_show_devname` prints. `None` for a device the block registry
+    /// does not know (a test's RAM disk).
+    device_name: IrqSafeSpinLock<Option<String>>,
 }
 
 /// Whether a core still holds work no superblock on disk describes: a batch
@@ -1842,6 +1868,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Objectid of the mounted subvolume (`5` = the top-level FS tree).
     pub fn mounted_subvol_id(&self) -> u64 {
         self.view.lock().fs_tree_id
+    }
+
+    /// The mounted subvolume's path from the top level, `/` for the top
+    /// level: the root `/proc/<pid>/mountinfo` reports for this mount and
+    /// the `subvol=` it shows. `None` for a subvolume whose path its backrefs
+    /// could not give when it was selected.
+    pub fn mounted_subvol_path(&self) -> Option<String> {
+        let view = self.view.lock();
+        if view.fs_tree_id == format::FS_TREE_OBJECTID {
+            return Some(String::from("/"));
+        }
+        view.subvol_path.clone()
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -3017,7 +3055,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // checks (`btree::verify_child`). Retry from the new root, as the
         // VFS read paths do; a failure against an unchanged root is real.
         let mut attempt = 0;
-        let (subvol_id, subvol_root, subvol_level, subvol_flags, root_inode) = loop {
+        let (subvol_id, subvol_root, subvol_level, subvol_flags, root_inode, path) = loop {
             let (root_tree, _) = self.root_tree_root();
             let resolved = async {
                 let (id, root, level, flags) = match sel {
@@ -3031,7 +3069,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 let inode = self
                     .load_inode_in(root, format::FIRST_FREE_OBJECTID)
                     .await?;
-                Ok::<_, FsError>((id, root, level, flags, inode))
+                // `mount_subvol` names the mount by the subvolume's own path,
+                // whatever selected it (`subvolid=`, the default subvolume, or
+                // a `subvol=` spelled with extra slashes). A filesystem whose
+                // backrefs cannot be walked keeps the spelling it was given.
+                let path = match self.subvol_path_of(root_tree, id).await {
+                    Ok(path) => Some(path),
+                    Err(_) => match sel {
+                        Subvol::Name(path) => Some(alloc::format!("/{}", path.trim_matches('/'))),
+                        Subvol::Id(_) => None,
+                    },
+                };
+                Ok::<_, FsError>((id, root, level, flags, inode, path))
             }
             .await;
             match resolved {
@@ -3044,8 +3093,59 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
         };
         self.select_subvol(subvol_id, subvol_root, subvol_level, subvol_flags);
-        self.view.lock().root_inode = Some(root_inode);
+        {
+            let mut view = self.view.lock();
+            view.root_inode = Some(root_inode);
+            view.subvol_path = path.filter(|path| path != "/");
+        }
         Ok(())
+    }
+
+    /// `btrfs_get_subvol_name_from_objectid`: the path of subvolume `id`
+    /// from the top-level subvolume (`/` for the top level). Walks the
+    /// subvolume's `ROOT_BACKREF` to its parent subvolume and the directory
+    /// it sits in, then that directory's `INODE_REF`s up to the parent's root
+    /// directory, and repeats until the top level.
+    async fn subvol_path_of(&self, root_tree: u64, mut id: u64) -> Result<String, FsError> {
+        // Names, innermost first.
+        let mut names: Vec<String> = Vec::new();
+        // A tree of trees is bounded by the subvolume count; a loop in the
+        // backrefs is corruption.
+        let mut budget = 1usize << 16;
+        let mut step = || -> Result<(), FsError> {
+            budget = budget.checked_sub(1).ok_or(FsError::InvalidData)?;
+            Ok(())
+        };
+        while id != format::FS_TREE_OBJECTID {
+            step()?;
+            // `btrfs_search_backwards(root, (id, ROOT_BACKREF, -1))`.
+            let refs =
+                crate::btree::collect_for(self, root_tree, id, format::ROOT_BACKREF_KEY).await?;
+            let (key, body) = refs.last().ok_or(FsError::NotFound)?;
+            let parent = key.offset;
+            // `struct btrfs_root_ref { dirid, sequence, name_len }` + name.
+            let mut dirid = format::le64(body, 0)?;
+            let len = usize::from(format::le16(body, 16)?);
+            let name = body.get(18..18 + len).ok_or(FsError::InvalidData)?;
+            names.push(String::from_utf8_lossy(name).into_owned());
+            let (parent_root, _, _) =
+                crate::roots::find_root_with_flags(self, root_tree, parent).await?;
+            while dirid != format::FIRST_FREE_OBJECTID {
+                step()?;
+                let refs =
+                    crate::btree::collect_for(self, parent_root, dirid, format::INODE_REF_KEY)
+                        .await?;
+                let (key, body) = refs.last().ok_or(FsError::NotFound)?;
+                // `struct btrfs_inode_ref { index, name_len }` + name.
+                let len = usize::from(format::le16(body, 8)?);
+                let name = body.get(10..10 + len).ok_or(FsError::InvalidData)?;
+                names.push(String::from_utf8_lossy(name).into_owned());
+                dirid = key.offset;
+            }
+            id = parent;
+        }
+        names.reverse();
+        Ok(alloc::format!("/{}", names.join("/")))
     }
 
     /// Resolve a `subvol=PATH` from the top-level FS_TREE. Ordinary directory
@@ -3377,6 +3477,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             bytes_used_summed: core::sync::atomic::AtomicBool::new(false),
             last_view_dropped: commit_on_last_drop::<B>,
             drop_commit_tried: core::sync::atomic::AtomicBool::new(false),
+            device_name: IrqSafeSpinLock::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -3405,6 +3506,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             view: IrqSafeSpinLock::new(ViewState {
                 fs_tree_id: 0,
                 root_inode: None,
+                subvol_path: None,
             }),
             view_read_only: core::sync::atomic::AtomicBool::new(read_only),
             mount_options: IrqSafeSpinLock::new(crate::mount_opts::MountOptions::default()),
