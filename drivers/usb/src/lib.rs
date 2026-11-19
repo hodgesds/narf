@@ -169,6 +169,9 @@ pub fn register_initcalls() {
     // this registration exists so the registry's unbind dispatch
     // (detach path) can reach msc::detach_msc.
     narf_init::register(Stage::Subsys, "usb-msc", || {
+        // The registry entry only routes unbinds to the built-in MSC
+        // binder; with `msc-module-only` the stick belongs to a module.
+        #[cfg(not(feature = "msc-module-only"))]
         msc::register_initcalls();
         InitResult::Ok
     });
