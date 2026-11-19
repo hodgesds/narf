@@ -56,7 +56,8 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
             // SAFETY: fixed-size local destination; guarded, range-checked
             // user read. Arbitrary frame contents grant no kernel authority.
             unsafe { copy_from_user(&mut mask, address) }
-                .map(|_| Some(u64::from_ne_bytes(mask))).map_err(|_| ())
+                .map(|_| Some(u64::from_ne_bytes(mask)))
+                .map_err(|_| ())
         })
     } else {
         // NARF's compact non-restorer ABI keeps the kernel-side mask record.
@@ -94,7 +95,16 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
         // a full fatal-fault diagnostic and then terminates, which bounds it;
         // a task that *has* a SIGSEGV handler survives, so printing here would
         // hand userspace an unbounded console-spam loop.
-        let killed = sync_signal_hook().is_some_and(|hook| hook(ctx, 13, SyncFaultInfo { addr: 0, bus: false }));
+        let killed = sync_signal_hook().is_some_and(|hook| {
+            hook(
+                ctx,
+                13,
+                SyncFaultInfo {
+                    addr: 0,
+                    bus: false,
+                },
+            )
+        });
         if !killed {
             // No signal machinery wired at all. Linux's badframe arm literally
             // reads `return 0`, so that is the answer left standing.
@@ -128,11 +138,19 @@ fn smoke_rt_sigreturn_restores_edited_user_mask() -> narf_kernel_test::TestResul
         restored: bool,
     }
     impl TrapContext for ReturnContext {
-        fn args(&self) -> &SyscallArgs { &self.args }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
         fn set_return(&mut self, _: SyscallReturn) {}
-        fn user_rsp(&self) -> u64 { self.rsp }
-        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
-        fn rip(&self) -> u64 { 0 }
+        fn user_rsp(&self) -> u64 {
+            self.rsp
+        }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
         fn set_rip(&mut self, _: u64) {}
         fn perform_sigreturn(&mut self, _: u64, _: bool) -> bool {
             self.restored = true;
@@ -152,9 +170,101 @@ fn smoke_rt_sigreturn_restores_edited_user_mask() -> narf_kernel_test::TestResul
     let restored = signal_mask_of(task);
     set_signal_mask_for_task(task, old);
     if !ctx.restored || restored != edited & !UNBLOCKABLE_MASK {
-        return TestResult::Fail("rt_sigreturn ignored edited uc_sigmask or restored unblockable bits");
+        return TestResult::Fail(
+            "rt_sigreturn ignored edited uc_sigmask or restored unblockable bits",
+        );
     }
     TestResult::Pass
 }
 #[cfg(feature = "kernel-test")]
-narf_kernel_test::kernel_test_in!("userspace/signals", smoke_rt_sigreturn_restores_edited_user_mask);
+narf_kernel_test::kernel_test_in!(
+    "userspace/signals",
+    smoke_rt_sigreturn_restores_edited_user_mask
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_sync_fault_disposition_and_mask() -> narf_kernel_test::TestResult {
+    crate::abi_test_support::with_setup(|| {
+        struct FaultContext {
+            args: SyscallArgs,
+            delivered: bool,
+            restored: bool,
+        }
+        impl TrapContext for FaultContext {
+            fn args(&self) -> &SyscallArgs {
+                &self.args
+            }
+            fn set_return(&mut self, _: SyscallReturn) {}
+            fn user_rsp(&self) -> u64 {
+                0x700000
+            }
+            fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+                false
+            }
+            fn rip(&self) -> u64 {
+                0x400100
+            }
+            fn set_rip(&mut self, _: u64) {}
+            fn returning_to_user(&self) -> bool {
+                true
+            }
+            fn deliver_signal(&mut self, params: &crate::syscall::SigDeliveryParams) -> bool {
+                self.delivered = params.signum == SIGSEGV;
+                true
+            }
+            fn perform_sigreturn(&mut self, _: u64, _: bool) -> bool {
+                self.restored = true;
+                true
+            }
+        }
+        let task = current_task_id();
+        let before = sig_bit(10);
+        for flags in [0, SA_NODEFER, SA_RESETHAND, SA_RESETHAND | SA_NODEFER] {
+            let _ = set_signal_mask_for_task(task, before);
+            let mut ctx = FaultContext {
+                args: SyscallArgs {
+                    arg0: SIGSEGV as u64,
+                    arg1: 0x400000,
+                    arg3: flags as u64,
+                    ..SyscallArgs::default()
+                },
+                delivered: false,
+                restored: false,
+            };
+            sys_sigaction(&mut ctx);
+            if !default_sync_signal_delivery(
+                &mut ctx,
+                14,
+                SyncFaultInfo {
+                    addr: 0,
+                    bus: false,
+                },
+            ) || !ctx.delivered
+            {
+                return Err("synchronous SIGSEGV handler not delivered");
+            }
+            let reset = sigaction_lookup_full(task, SIGSEGV as usize).is_none();
+            if reset != (flags & SA_RESETHAND != 0) {
+                return Err("synchronous fault ignored SA_RESETHAND");
+            }
+            let expected = before
+                | if flags & SA_NODEFER == 0 {
+                    sig_bit(SIGSEGV)
+                } else {
+                    0
+                };
+            if signal_mask_of(task) != expected {
+                return Err("synchronous fault applied wrong auto-block mask");
+            }
+            // Compact non-restorer frames restore the recorded kernel mask.
+            ctx.args.arg0 = 0x600000;
+            sys_sigreturn(&mut ctx);
+            if !ctx.restored || signal_mask_of(task) != before {
+                return Err("synchronous sigreturn did not restore interrupted mask");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/signals", smoke_sync_fault_disposition_and_mask);
