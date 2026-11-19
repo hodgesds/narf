@@ -236,10 +236,6 @@ impl ExternalDisplayProfile {
     }
 }
 
-/// DPCD receiver-capability bytes read at probe (0x000..0x00F, the span
-/// `read_caps` decodes; `DP_MAX_DOWNSPREAD` is byte 3).
-const DPCD_RECEIVER_CAP_BYTES: usize = 16;
-
 /// Largest EDID retained (base + three extensions).
 pub const EDID_CAPACITY: usize = 512;
 
@@ -837,9 +833,7 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
         port.aux_base(),
         tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt),
     );
-    // `read_caps`'s DPCD read, keeping the raw bytes for DP_MAX_DOWNSPREAD.
-    let mut raw = [0u8; DPCD_RECEIVER_CAP_BYTES];
-    aux.dpcd_read(0, &mut raw)
+    let raw = crate::dp_link_training::read_receiver_caps(&mut aux)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
     Ok(LinkProbe {
         display_ip,

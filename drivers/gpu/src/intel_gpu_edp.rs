@@ -570,7 +570,6 @@ const SET_POWER_D0: u8 = 0x1;
 /// `DP_MAX_LANE_COUNT` — TPS3 support lives in bit 6; the probe
 /// wiring reads it to pick the PSR1 training-pattern select.
 pub const DPCD_MAX_LANE_COUNT: u32 = 0x002;
-const TPS3_SUPPORTED: u8 = 1 << 6;
 
 /// PSR setup times by `DP_PSR_CAPS[3:1]` code (µs). Code 7 is
 /// reserved by the spec — a panel that reports it is lying about
@@ -1412,9 +1411,10 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
             return;
         }
     };
-    let mut lane_count = [0u8; 1];
-    let tps3 = sink_read(&mut aux, DPCD_MAX_LANE_COUNT, &mut lane_count).is_ok()
-        && (lane_count[0] & TPS3_SUPPORTED) != 0;
+    let Ok(receiver) = crate::dp_link_training::read_caps(&mut aux) else {
+        return;
+    };
+    let tps3 = receiver.tps3_supported;
     let layout = PsrLayout::from_generation(gpu.chip.generation);
     match psr_enable(&window, &mut aux, &caps, layout, mode, tps3) {
         Ok(active) => {

@@ -28,6 +28,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 #[derive(Debug)]
 pub struct Sink {
     caps: [u8; 16],
+    extended_caps: Option<[u8; 15]>,
     edid: Vec<u8>,
     i2c_ptr: usize,
     lanes_set: u8,
@@ -60,6 +61,7 @@ impl Sink {
         caps[2] = 4 | 0x40 | 0x80;
         Self {
             caps,
+            extended_caps: None,
             edid,
             i2c_ptr: 0,
             lanes_set: 0,
@@ -172,6 +174,14 @@ impl Sink {
             return alloc::vec![0x00];
         }
         let len = wire[3] as usize + 1;
+        if cmd == 0x9 && addr == 0x2200 {
+            if let Some(extended) = self.extended_caps.filter(|caps| len == caps.len()) {
+                let mut reply = alloc::vec![0x00];
+                reply.extend_from_slice(&extended);
+                return reply;
+            }
+            return alloc::vec![0x10];
+        }
         match cmd {
             0x8 => {
                 for i in 0..len {
@@ -1312,6 +1322,69 @@ fn smoke_mtl_external_probe_failures_roll_back_type_c() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_probe_failures_roll_back_type_c
+);
+
+fn smoke_tc_dp_extended_receiver_caps() -> TestResult {
+    // Linux selects the entire extension at equal or newer revision, even
+    // when the base revision predates DP 1.3. SSC uses the same snapshot.
+    for (base_rev, ext_rev, use_extended) in
+        [(0x12, 0x14, true), (0x14, 0x14, true), (0x14, 0x13, false)]
+    {
+        let mut sink = Sink::new(0x14, edid_1024());
+        sink.caps[0] = base_rev;
+        sink.caps[14] = 0x82;
+        let mut extended = [0; 15];
+        extended[..4].copy_from_slice(&[ext_rev, 0x0a, 0x82, 1]);
+        extended[7] = 0x40;
+        extended[14] = 1;
+        sink.extended_caps = Some(extended);
+        let io = ExtFake::new(XeLpgPort::Tc1, sink);
+        let Ok(probe) = probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("USB-C sink with extended capabilities should probe");
+        };
+        let expected = if use_extended {
+            (ext_rev, TrainRate::Hbr, 2, 4_000)
+        } else {
+            (base_rev, TrainRate::Hbr2, 4, 8_000)
+        };
+        let caps = probe.caps;
+        assert_eq!(
+            (
+                caps.dpcd_rev,
+                caps.max_rate,
+                caps.max_lanes,
+                caps.aux_rd_interval_us()
+            ),
+            expected
+        );
+        assert_eq!(probe.negotiated.lanes, caps.max_lanes);
+        assert_eq!(probe.ssc, use_extended);
+        assert_eq!(caps.msa_timing_par_ignored, use_extended);
+    }
+
+    for (rev, error) in [
+        (0x14, crate::dp_aux::AuxError::Nacked),
+        (0, crate::dp_aux::AuxError::InvalidDpcdRevision),
+    ] {
+        let mut sink = Sink::new(0x14, edid_1024());
+        sink.caps[0] = rev;
+        sink.caps[14] = 0x80;
+        let io = ExtFake::new(XeLpgPort::Tc1, sink);
+        assert_eq!(
+            probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false).err(),
+            Some(ExternalError::Link(LinkError::AuxFailure(error)))
+        );
+        assert_eq!(
+            io.read32(XeLpgPort::Tc1.buf_ctl1()) & (TC_PHY_OWNERSHIP | TCSS_POWER_REQUEST),
+            0
+        );
+        assert!(!io.aux_power.get());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_tc_dp_extended_receiver_caps
 );
 
 fn smoke_mtl_external_unplug_mid_activation_and_failed_stop() -> TestResult {

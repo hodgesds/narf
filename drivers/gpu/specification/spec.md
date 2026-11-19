@@ -360,6 +360,17 @@ producer exclusion and a full retained async modeset owner remain unresolved.
 
 ### Meteor/Arrow Lake display DSC, pipe bpp and panel fitter
 
+Intel DP and eDP discovery select receiver capabilities using Linux's
+`drm_dp_read_dpcd_caps` revision rule. Bit 7 at DPCD 0x00e requests
+the 15-byte block at 0x2200, including when the base revision is below
+DP 1.3. An equal or newer extension supplies all 15 receiver bytes.
+An older extension leaves the base capabilities in effect. The base
+adapter capability at 0x00f is retained separately in the 16-byte
+snapshot. A zero base revision returns `AuxError::InvalidDpcdRevision`.
+Errors reading the advertised extension propagate to the probe. SST
+link negotiation, MST discovery and the Type-C spread-spectrum decision
+use the selected block.
+
 `drm_dsc` (ungated) holds DRM's VESA DSC helpers: `Pps` (drm_dsc_config),
 `compute_rc_parameters`, `pack_pps`, `set_rc_buf_thresh` and
 `dp_pps_header`; `amdgpu_dsc` re-exports `Pps` and `pack_pps`.

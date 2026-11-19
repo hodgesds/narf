@@ -505,8 +505,7 @@ impl Sink {
     /// capability and PSR capability reads are required; the others fall
     /// back to the values Linux keeps when they fail.
     pub fn read<A: AuxChannel + ?Sized>(aux: &mut A) -> Result<Sink, Refusal> {
-        let mut receiver = [0u8; 3];
-        read(aux, DP_DPCD_REV, &mut receiver).map_err(Refusal::Aux)?;
+        let receiver = crate::dp_link_training::read_receiver_caps(aux).map_err(Refusal::Aux)?;
         let mut psr = [0u8; 2];
         read(aux, DP_PSR_SUPPORT, &mut psr).map_err(Refusal::Aux)?;
         let mut edp = [0u8; 5];

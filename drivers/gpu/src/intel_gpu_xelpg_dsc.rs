@@ -738,8 +738,7 @@ impl EdpCaps {
     /// the link-rate table and the DSC capabilities (`intel_edp_init_dpcd`,
     /// `intel_edp_set_sink_rates`, `intel_edp_get_dsc_sink_cap`).
     pub fn read<A: AuxChannel>(aux: &mut A) -> Result<Self, AuxError> {
-        let mut receiver = [0u8; 16];
-        aux.dpcd_read(0, &mut receiver)?;
+        let receiver = crate::dp_link_training::read_receiver_caps(aux)?;
         let mut rev = [0u8; 1];
         aux.dpcd_read(DP_EDP_DPCD_REV, &mut rev)?;
         let mut link_rates = [0u16; 8];

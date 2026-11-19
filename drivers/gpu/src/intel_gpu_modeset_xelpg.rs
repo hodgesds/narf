@@ -1609,8 +1609,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         crate::intel_gpu_xelpg_dsc::disable_pps_sdp(self.mmio, Transcoder::A).map_err(|_| stop)?;
         {
             let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
-            let mut rev = [0u8];
-            if aux.dpcd_read(0x000, &mut rev).is_ok() && rev[0] >= 0x11 {
+            if crate::dp_link_training::read_caps(&mut aux).is_ok_and(|caps| caps.dpcd_rev >= 0x11)
+            {
                 let _ =
                     aux.dpcd_write(crate::intel_gpu_xelpg_dsc::DP_SET_POWER, &[DP_SET_POWER_D3]);
             }

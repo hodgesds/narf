@@ -3411,9 +3411,8 @@ fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
         // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
         // less is an SST device and not this path's business.
         let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
-        let caps = crate::dp_link_training::read_caps(&mut aux).ok()?;
-        let mut raw_caps = [0u8; 16];
-        aux.dpcd_read(0, &mut raw_caps).ok()?;
+        let raw_caps = crate::dp_link_training::read_receiver_caps(&mut aux).ok()?;
+        let caps = crate::dp_link_training::DpcdCaps::decode(&raw_caps);
         let mut mstm_cap = [0u8; 1];
         aux.dpcd_read(crate::dp_mst_mgr::MSTM_CAP, &mut mstm_cap)
             .ok()?;

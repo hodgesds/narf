@@ -841,6 +841,10 @@ const DPCD_MAX_LANE_COUNT: u32 = 0x0_0002;
 pub const DPCD_MSA_TIMING_PAR_IGNORED: u8 = 1 << 6;
 const DP_DOWN_STREAM_PORT_COUNT: usize = 0x007;
 const DPCD_TRAINING_AUX_RD_INTERVAL: u32 = 0x0_000E;
+const DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT: u8 = 1 << 7;
+const DP_DP13_DPCD_REV: u32 = 0x2200;
+/// Linux DP_RECEIVER_CAP_SIZE covers DPCD 0x000 through 0x00e.
+const DP_RECEIVER_CAP_SIZE: usize = 15;
 
 /// Size of the receiver-capability field read in one burst.
 const DPCD_CAPS_LEN: usize = 16;
@@ -920,7 +924,7 @@ impl DpcdCaps {
             max_rate: LinkRate::from_dpcd_byte(raw[(DPCD_MAX_LINK_RATE - DPCD_DPCD_REV) as usize])
                 .unwrap_or(LinkRate::Rbr),
             max_lanes: lanes,
-            tps3_supported: lane_byte & 0x40 != 0,
+            tps3_supported: raw[0] >= 0x12 && lane_byte & 0x40 != 0,
             enhanced_framing: lane_byte & 0x80 != 0,
             msa_timing_par_ignored: sink_ignores_msa_timing(raw),
             training_aux_rd_interval: raw[(DPCD_TRAINING_AUX_RD_INTERVAL - DPCD_DPCD_REV) as usize],
@@ -932,7 +936,7 @@ impl DpcdCaps {
     /// 2-146): 0 → 100 µs; 1–4 → 4/8/12/16 ms; reserved values
     /// fall back to the 100 µs floor.
     pub fn aux_rd_interval_us(&self) -> u32 {
-        match self.training_aux_rd_interval {
+        match self.training_aux_rd_interval & !DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT {
             0 => 100,
             1 => 4_000,
             2 => 8_000,
@@ -943,12 +947,29 @@ impl DpcdCaps {
     }
 }
 
-/// Read the sink's receiver-capability field in one 16-byte
-/// burst read at DPCD 0x0000.
+/// Read the effective receiver capabilities as in `drm_dp_read_dpcd_caps`.
+/// NARF's 16-byte snapshot also includes the base DP_ADAPTER_CAP at 0x00f.
+pub(crate) fn read_receiver_caps<A: AuxChannel + ?Sized>(
+    aux: &mut A,
+) -> Result<[u8; DPCD_CAPS_LEN], AuxError> {
+    let mut base = [0; DPCD_CAPS_LEN];
+    aux.dpcd_read(DPCD_DPCD_REV, &mut base)?;
+    if base[0] == 0 {
+        return Err(AuxError::InvalidDpcdRevision);
+    }
+    if base[DPCD_TRAINING_AUX_RD_INTERVAL as usize] & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT != 0 {
+        let mut extended = [0; DP_RECEIVER_CAP_SIZE];
+        aux.dpcd_read(DP_DP13_DPCD_REV, &mut extended)?;
+        if extended[0] >= base[0] {
+            base[..DP_RECEIVER_CAP_SIZE].copy_from_slice(&extended);
+        }
+    }
+    Ok(base)
+}
+
+/// Decode the selected receiver capability block for link negotiation.
 pub fn read_caps<A: AuxChannel>(aux: &mut A) -> Result<DpcdCaps, LinkError> {
-    let mut raw = [0u8; DPCD_CAPS_LEN];
-    aux.dpcd_read(DPCD_DPCD_REV, &mut raw)?;
-    Ok(DpcdCaps::decode(&raw))
+    Ok(DpcdCaps::decode(&read_receiver_caps(aux)?))
 }
 
 /// What the *source* (this driver / PHY) can drive. The Intel

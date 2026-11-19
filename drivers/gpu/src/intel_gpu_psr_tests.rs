@@ -160,6 +160,14 @@ fn smoke_psr_sink_caps_decode_and_refusals() -> TestResult {
     assert_eq!(sink.psr_support(), Ok(()));
     assert!(aux.writes.is_empty(), "capability reads wrote the sink");
 
+    // An advertised extension can clear TPS3 even at the same revision.
+    aux.dpcd.insert(0xe, 0x80);
+    aux.dpcd.insert(0x2200, 0x14);
+    aux.dpcd.insert(0x2202, 0x82);
+    assert!(!Sink::read(&mut aux).unwrap().tps3());
+    aux.nack.push(0x2200);
+    assert_eq!(Sink::read(&mut aux), Err(Refusal::Aux(AuxError::Nacked)));
+
     // Unreadable sync latency: Linux assumes the worst, 8 frames.
     let mut aux = psr1_sink();
     aux.nack.push(0x2009);
