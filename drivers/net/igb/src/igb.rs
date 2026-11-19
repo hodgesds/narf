@@ -6508,7 +6508,11 @@ mod tests {
         if bank.value(super::REG_WUC) != 0 || bank.value(super::REG_WUFC) != 0 {
             return TestResult::Fail("igb unarmed suspend left WoL filters armed");
         }
-        if bank.value(super::REG_MDIC) != FakeBank::mdic_cmd(super::PHY_BMCR_PWRDOWN) {
+        // FakeBank models synchronous MDIC completion: write32 ORs MDIC_READY
+        // into the stored word, so expect the completed-transaction word.
+        if bank.value(super::REG_MDIC)
+            != FakeBank::mdic_cmd(super::PHY_BMCR_PWRDOWN) | super::MDIC_READY
+        {
             return TestResult::Fail("igb unarmed suspend did not power the PHY down");
         }
         TestResult::Pass
@@ -6570,7 +6574,9 @@ mod tests {
             return TestResult::Fail("igb resume did not clear wake status");
         }
         let anrestart = super::PHY_BMCR_ANENABLE | super::PHY_BMCR_ANRESTART;
-        if bank.value(super::REG_MDIC) != FakeBank::mdic_cmd(anrestart) {
+        // As above: the stored word carries MDIC_READY from synchronous
+        // completion, so expect the completed-transaction word.
+        if bank.value(super::REG_MDIC) != FakeBank::mdic_cmd(anrestart) | super::MDIC_READY {
             return TestResult::Fail("igb resume did not re-kick the PHY (AN restart)");
         }
         if bank.value(super::REG_RCTL) & super::RCTL_EN == 0
