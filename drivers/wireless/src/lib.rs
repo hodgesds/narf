@@ -12,8 +12,11 @@ pub mod ath11k;
 pub mod ath9k;
 pub mod brcmfmac;
 pub mod cyw43439;
-mod qualcomm_pci;
-mod qualcomm_regulatory;
+// Shared Atheros/Qualcomm code promoted to `narf-drivers-wireless-ath-core`.
+// Re-exported at the crate root so the still-inlined ath9k/ath10k/ath11k
+// drivers' `crate::qualcomm_pci` / `crate::qualcomm_regulatory` references
+// keep resolving.
+pub use narf_drivers_wireless_ath_core::{qualcomm_pci, qualcomm_regulatory};
 pub mod rtl8xxxu;
 pub mod rtlwifi;
 

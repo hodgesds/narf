@@ -1,0 +1,42 @@
+# Shared Atheros/Qualcomm Wi-Fi code.
+#
+# The driver-agnostic half of the ath family, factored out of the
+# `narf-drivers-wireless` facade so per-driver crates (ath10k first; ath9k/
+# ath11k later) can depend on THIS rather than on the facade or on each other.
+# Same role `narf-drivers-net-core` / `narf-drivers-wireless-core` play.
+#
+#   * `qualcomm_pci`         — the QCA PCI window/park invoke helpers.
+#   * `qualcomm_regulatory`  — the shared QCA regulatory table.
+#   * `eth`                  — 802.1d QoS classification from an Ethernet frame.
+#   * `board`                — SMBIOS board-data-file (BDF) identification.
+#   * `wmi_nlo`              — WMI network-list-offload (WoW NET_DETECT) types.
+#
+# Plain rlib (not dual-build); per-driver crates gate it under their `builtin`
+# feature so a `.ko` build never pulls it in.
+
+[package]
+name         = "narf-drivers-wireless-ath-core"
+description  = "Shared Atheros/Qualcomm Wi-Fi code (qualcomm_pci, qualcomm_regulatory, eth QoS, board SMBIOS, WMI NLO types)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_ath_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+kernel-test = ["dep:narf-kernel-test"]
+
+[dependencies]
+narf-bus             = { path = "../../../bus" }
+narf-capabilities    = { path = "../../../capabilities" }
+narf-firmware-smbios = { path = "../../../firmware/smbios" }
+narf-wireless        = { path = "../../../wireless" }
+narf-kernel-test     = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

@@ -2711,6 +2711,7 @@ dependencies = [
  "narf-drivers-sdio",
  "narf-drivers-spi",
  "narf-drivers-usb",
+ "narf-drivers-wireless-ath-core",
  "narf-drivers-wireless-core",
  "narf-drivers-wireless-iwlwifi",
  "narf-drivers-wireless-mt76",
@@ -2733,6 +2734,17 @@ dependencies = [
  "narf-wifi-fixtures",
  "narf-wireless",
  "zeroize",
+]
+
+[[package]]
+name = "narf-drivers-wireless-ath-core"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-firmware-smbios",
+ "narf-kernel-test",
+ "narf-wireless",
 ]
 
 [[package]]
