@@ -185,6 +185,13 @@ pub struct UacCardState {
     /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
     /// 0 from [`Self::from_bind`]; the binder sets it before publishing.
     pub controller: AtomicU8,
+    /// Test-only control-transfer transport, installed by kernel
+    /// tests through [`Self::__set_control_transport_for_test`].
+    /// `None` in production: control transfers go to the xHCI
+    /// controller. When set, `control_out` / `control_in` delegate
+    /// to it instead, so a fixture card can complete Feature Unit
+    /// writes with no controller present.
+    control_transport: IrqSafeSpinLock<Option<Arc<dyn ControlTransport>>>,
 }
 
 impl UacCardState {
@@ -244,7 +251,17 @@ impl UacCardState {
             card_index: IrqSafeSpinLock::new(None),
             detached: AtomicBool::new(false),
             controller: AtomicU8::new(0),
+            control_transport: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// Install a fake control-transfer transport for kernel tests
+    /// (see [`ControlTransport`]). Production code never calls this:
+    /// with no transport installed, control transfers go to the xHCI
+    /// controller as before.
+    #[doc(hidden)]
+    pub fn __set_control_transport_for_test(&self, transport: Arc<dyn ControlTransport>) {
+        *self.control_transport.lock() = Some(transport);
     }
 
     pub fn stream(&self, capture: bool) -> Option<&Arc<StreamState>> {
@@ -286,6 +303,13 @@ impl UacCardState {
         index: u16,
         data: &[u8],
     ) -> Result<(), SoundError> {
+        // Fixture transport first: the test-installed sink answers
+        // without a controller (the lock is dropped before the call,
+        // so no lock is held across the foreign transport).
+        let transport = self.control_transport.lock().clone();
+        if let Some(t) = transport {
+            return t.control_out(rt, req, value, index, data);
+        }
         let ctrl = self.xhci().ok_or(SoundError::NoSuchCard)?;
         let slot = self.slot_id;
         narf_scheduler::block_on(async move {
@@ -303,6 +327,10 @@ impl UacCardState {
         index: u16,
         out: &mut [u8],
     ) -> Result<usize, SoundError> {
+        let transport = self.control_transport.lock().clone();
+        if let Some(t) = transport {
+            return t.control_in(rt, req, value, index, out);
+        }
         let ctrl = self.xhci().ok_or(SoundError::NoSuchCard)?;
         let slot = self.slot_id;
         narf_scheduler::block_on(
@@ -581,6 +609,35 @@ impl PumpShared {
 pub trait IsoTransfer: Send + Sync + core::fmt::Debug {
     fn isoch_out(&self, data: &[u8]) -> Result<usize, SoundError>;
     fn isoch_in(&self, out: &mut [u8]) -> Result<usize, SoundError>;
+}
+
+/// Control-transfer transport for the card's SET_CUR / GET_CUR
+/// path (Feature Unit mute/volume, clock programming, interface
+/// selection).
+///
+/// Production transport is the xHCI `control_out` / `control_in`
+/// pair on [`UacCardState`]; kernel tests install a fake through
+/// [`UacCardState::__set_control_transport_for_test`] so a fixture
+/// card can complete control writes with no controller present —
+/// the same fixture seam as [`IsoTransfer`] / `UacStream::with_iso`
+/// for the isochronous path.
+pub trait ControlTransport: Send + Sync + core::fmt::Debug {
+    fn control_out(
+        &self,
+        rt: u8,
+        req: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+    ) -> Result<(), SoundError>;
+    fn control_in(
+        &self,
+        rt: u8,
+        req: u8,
+        value: u16,
+        index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, SoundError>;
 }
 
 /// Production transport: bridges to the xHCI via `block_on`,
@@ -891,6 +948,14 @@ impl PcmDevice for UsbAudioCard {
                 self.0
                     .fu_set_cur(fu, FU_CS_MUTE, &crate::uac::encode_mute(muted))?;
                 fu.muted.store(muted, Ordering::SeqCst);
+                // The UAC mute is the mute bit itself (`encode_mute`
+                // writes 1 = muted), so `Boolean(true)` means muted —
+                // the opposite polarity from the ALSA Master Playback
+                // Switch, where `true` means unmute. Report the
+                // successful write into the LED trigger engine, as
+                // the mixer path does (`mixer::set`); a failed
+                // SET_CUR above leaves the trigger untouched.
+                narf_drivers_leds::triggers::set_audio_muted(muted);
                 Ok(())
             }
             _ => Err(SoundError::NoSuchControl),

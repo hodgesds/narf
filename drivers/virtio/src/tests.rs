@@ -2537,6 +2537,142 @@ kernel_test_in!(
     smoke_virtio_snd_pci_controls_surface
 );
 
+// ── #2226: virtio-snd mute-write polarity ─────────────────────────
+//
+// The card's `set_control` needs a live virtqueue, which no fixture
+// can drive, so the polarity decision it reports through is pinned
+// here directly: a successful MasterMute write of `Boolean(true)`
+// must report muted, `Boolean(false)` must clear it, and any other
+// kind — or a non-boolean value — must leave the trigger alone.
+// The one polarity that can be gotten wrong is the ALSA switch
+// inversion (`true` = unmute there); the virtio-snd mute element
+// carries the mute bit itself (`true` = muted).
+fn smoke_virtio_snd_mute_write_reports_trigger() -> TestResult {
+    use crate::snd_pci::report_mute_write;
+    use narf_drivers_leds::triggers as led_triggers;
+    use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+
+    led_triggers::__reset_for_test();
+    let mute = ControlId {
+        index: 0,
+        kind: ControlKind::MasterMute,
+    };
+    let volume = ControlId {
+        index: 1,
+        kind: ControlKind::MasterVolume,
+    };
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("audio-mute trigger must start unmuted");
+    }
+    // Mute → reported muted.
+    report_mute_write(mute, ControlValue::boolean(true));
+    if !led_triggers::audio_muted() {
+        return TestResult::Fail("mute write must report audio muted");
+    }
+    // Unmute → cleared.
+    report_mute_write(mute, ControlValue::boolean(false));
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("unmute write must clear audio muted");
+    }
+    // A volume write must not touch the mute state.
+    report_mute_write(volume, ControlValue::integer(10, 10));
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("volume write must not change audio muted");
+    }
+    // A non-boolean value on the mute control must not report either.
+    report_mute_write(mute, ControlValue::integer(1, 1));
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("non-boolean mute write must not report audio muted");
+    }
+    led_triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    smoke_virtio_snd_mute_write_reports_trigger
+);
+
+/// Live MasterMute feed against the QEMU virtio-snd device: a mute
+/// write on the card's MasterMute control must report muted into the
+/// trigger, and an unmute must clear it, with the device's own value
+/// restored afterwards. Skips when the device offers no MasterMute
+/// control — QEMU's virtio-snd implements no control elements at
+/// all, so this is a Skip there and runs only on a CTL-capable
+/// device; the polarity fixture above is the coverage that runs in
+/// CI.
+fn smoke_virtio_snd_pci_master_mute_drives_audio_trigger() -> TestResult {
+    use crate::snd_pci;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    use narf_drivers_leds::triggers as led_triggers;
+    use narf_drivers_sound::mixer::{ControlKind, ControlValue};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !devices().iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    }) {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
+    snd_pci::__reset_for_test();
+    __reset_for_test();
+    snd_pci::register_pci_driver();
+    if probe_all_pci(&bootstrap_registry_authority()).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let Some(card) = snd_pci::__card_index_for_test() else {
+        return TestResult::Fail("virtio-snd card not registered");
+    };
+    let Ok(mixer) = narf_drivers_sound::mixer(card) else {
+        return TestResult::Fail("mixer(card)");
+    };
+    let Some(mute) = mixer
+        .list_controls()
+        .iter()
+        .find(|id| id.kind == ControlKind::MasterMute)
+        .copied()
+    else {
+        return TestResult::Skip("device offers no MasterMute control");
+    };
+    let initial = match mixer.get_control_value(mute) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("MasterMute did not read"),
+    };
+    led_triggers::__reset_for_test();
+    // Mute → trigger reports muted.
+    if mixer
+        .set_control_value(mute, ControlValue::boolean(true))
+        .is_err()
+    {
+        return TestResult::Fail("mute write failed");
+    }
+    if !led_triggers::audio_muted() {
+        return TestResult::Fail("muting virtio-snd must report audio muted");
+    }
+    // Unmute → trigger clears.
+    if mixer
+        .set_control_value(mute, ControlValue::boolean(false))
+        .is_err()
+    {
+        return TestResult::Fail("unmute write failed");
+    }
+    if led_triggers::audio_muted() {
+        return TestResult::Fail("unmuting virtio-snd must clear audio muted");
+    }
+    // Restore the device's own value.
+    if mixer.set_control_value(mute, initial).is_err() {
+        return TestResult::Fail("restoring the initial mute value failed");
+    }
+    led_triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    smoke_virtio_snd_pci_master_mute_drives_audio_trigger
+);
+
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use crate::balloon_pci;
     use narf_bus::driver_match::__reset_for_test;
