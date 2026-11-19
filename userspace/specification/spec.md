@@ -25,6 +25,12 @@ applications above NARF.
 
 ## 3. Public interface
 
+`proc_thread_list` enumerates the maintained thread-group membership index,
+then validates each member against the task registry outside the index lock.
+It includes registered zombies until reap, rejects stale or moved members,
+and translates scheduler task IDs to namespace-visible Linux thread IDs.
+Listing one process's threads does not snapshot unrelated tasks.
+
 The `native-ring` Cargo feature is off by default. Enabling it registers
 `Bootstrap` (0x4001) and `RingKick` (0x4003), compiles native session/dispatcher
 support, and forwards the feature to `narf-abi` and `narf-scheduler`.
