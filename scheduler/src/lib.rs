@@ -8226,6 +8226,23 @@ pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool
 /// Upper bound on [`dbg_ready_slots`] output — see its note on trap context.
 pub const DBG_READY_SLOTS_MAX: usize = 24;
 
+/// Lockup-watchdog sample for one CPU: `(scheduling_points, halted)`.
+///
+/// `scheduling_points` is the owner-written count [`note_sched_pass`]
+/// maintains (a dispatch round started, a polled task returned, a direct
+/// handoff); `halted` is the CPU's published `CPU_HALTED` flag. The soft
+/// lockup detector's "this CPU scheduled" proof, which Linux gets from its
+/// per-CPU stopper thread. Two loads; never blocks.
+pub fn dbg_cpu_sched_passes(cpu: usize) -> (u64, bool) {
+    match (SCHEDULER_TELEMETRY.get(cpu), CPU_HALTED.get(cpu)) {
+        (Some(telemetry), Some(halted)) => (
+            telemetry.sched_passes.load(Ordering::Relaxed),
+            halted.load(Ordering::SeqCst),
+        ),
+        _ => (0, false),
+    }
+}
+
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return (0, 0, false, false);

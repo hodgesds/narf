@@ -677,8 +677,21 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
         }
         None => caller as *const _ as usize,
     };
-    uc.park_site
-        .store(site, core::sync::atomic::Ordering::Relaxed);
+    // A synchronous kernel wait: only the future's completion ends it, never
+    // a signal — Linux's TASK_UNINTERRUPTIBLE (see `PARK_SITE_UNINTERRUPTIBLE`).
+    // Counting it gives the hung-task detector its switch count; this task
+    // is the only writer, so a plain load + store is enough.
+    let parks = uc
+        .uninterruptible_parks
+        .load(core::sync::atomic::Ordering::Relaxed);
+    uc.uninterruptible_parks.store(
+        parks.wrapping_add(1),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    uc.park_site.store(
+        site | PARK_SITE_UNINTERRUPTIBLE,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     uc.parked_in_syscall
         .store(true, core::sync::atomic::Ordering::Release);
     // SAFETY: a current stackful task and its executor context were verified
@@ -701,13 +714,24 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
 /// `Location` is word-aligned, so the bit is free.
 const PARK_SITE_LOCK: usize = 1;
 
+/// `UserTaskCtx::park_site` bit 1: the park is uninterruptible — a
+/// synchronous kernel wait (`park_pending_future`: filesystem I/O, a
+/// kernel lock) that only the awaited future's completion ends. Every other
+/// park (`own_stack_park_until`, the wait4/waitid loop) registers the
+/// task's signal waker and is interruptible. This is NARF's
+/// TASK_UNINTERRUPTIBLE, which the hung-task detector watches.
+pub const PARK_SITE_UNINTERRUPTIBLE: usize = 2;
+
+/// Flag bits of a `park_site` value; the rest is a `&'static Location`.
+const PARK_SITE_FLAGS: usize = PARK_SITE_LOCK | PARK_SITE_UNINTERRUPTIBLE;
+
 fn location_text(addr: usize) -> Option<alloc::string::String> {
     if addr == 0 {
         return None;
     }
     // SAFETY: only `&'static Location` addresses are stored in these fields
-    // (bit 0 masked off here).
-    let site = unsafe { &*((addr & !PARK_SITE_LOCK) as *const core::panic::Location<'static>) };
+    // (the flag bits masked off here).
+    let site = unsafe { &*((addr & !PARK_SITE_FLAGS) as *const core::panic::Location<'static>) };
     Some(alloc::format!("{}:{}", site.file(), site.line()))
 }
 

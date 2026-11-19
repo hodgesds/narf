@@ -126,6 +126,12 @@ pub struct Task {
     /// per-task reason. (Reading the executor's own preemption flag would
     /// consume it and break its QSBR decision.)
     parked_this_slice: AtomicU32,
+    /// Hung-task detector bookkeeping (Linux `last_switch_count` /
+    /// `last_switch_time`): the uninterruptible-park count the detector
+    /// last saw, and when it first saw it. Written only by
+    /// [`check_hung_tasks`].
+    hung_last_switch_count: AtomicU64,
+    hung_last_switch_ns: AtomicU64,
     /// Number of process children created by this task. Fork placement uses
     /// the per-parent sequence so a child's own helper forks cannot consume
     /// another parent's CPU rotation.
@@ -248,6 +254,8 @@ impl Task {
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             parked_this_slice: AtomicU32::new(0),
+            hung_last_switch_count: AtomicU64::new(0),
+            hung_last_switch_ns: AtomicU64::new(0),
             fork_sequence: AtomicU64::new(0),
             fork_base_cpu: AtomicU32::new(u32::MAX),
             rlimits: limits,
@@ -1074,12 +1082,11 @@ pub fn dbg_proc_roster() {
 /// `unix-latency-trace`: print a one-line park report for every task
 /// currently parked in a syscall.
 ///
-/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
-/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
-/// the boot (an early RCU stall trips it around t+25 s), so on a real
-/// desktop run the census never fires. This one is called from ahead of
-/// that gate and repeats, which is what a process that freezes MINUTES
-/// into the session requires.
+/// The stall watchdog's own reports list only tasks that are NOT in a
+/// healthy interruptible park, and only when a detector fires; this census
+/// lists every parked task and repeats, which is what attributing a
+/// process that freezes MINUTES into the session (with nothing stalled)
+/// requires.
 ///
 /// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
 /// healthy parked poller re-executes its syscall on a 1 ms deadline, so
@@ -1204,58 +1211,185 @@ pub fn dbg_park_census(tag: &str) {
     }
 }
 
-/// Diagnostic snapshot for the stall watchdog: one entry per registered
-/// task — `(tid, pid, state, sleep_deadline_ns, futex_uaddr,
-/// futex_namespace, futex_park_gen, futex_val, net_io_wait,
-/// wait_child_pending, flock_key, parked_in_syscall)`. Clones the Arcs out
-/// under the lock, reads the
-/// atomics lock-free after.
-#[allow(clippy::type_complexity)]
-pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
-    u64,
-    u64,
-    u32,
-    u64,
-    u64,
-    u64,
-    u64,
-    u32,
-    bool,
-    bool,
-    usize,
-    bool,
+/// One task's park state, for the stall watchdog's dump
+/// ([`dbg_park_snapshot`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ParkSnapshot {
+    pub tid: u64,
+    pub pid: u64,
+    pub state: u32,
+    pub deadline: u64,
+    pub futex: u64,
+    pub futex_ns: u64,
+    pub futex_gen: u64,
+    pub futex_val: u32,
+    pub netio: bool,
+    pub waitchild: bool,
+    pub flock: usize,
+    pub parked: bool,
     // Park-path discriminators — which interruptible wait the task is in, so a
     // parked task that is in NONE of the wakeable waits (all zero/false) but
     // still has `parked=true` + a pending signal is the waker-less strand.
-    u64,  // sigwait_set (sigtimedwait/sigwaitinfo park; 0 = not)
-    bool, // console_read_pending (fd-0 blocking read park)
-    u64,  // epoll_wait_fd (biased +1; 0 = not in epoll_wait)
-    bool, // has_signal_waker — can wake_signal actually rouse it?
-)> {
+    /// `sigtimedwait`/`sigwaitinfo` set (0 = not in one).
+    pub sigwait: u64,
+    /// Blocking fd-0 read park.
+    pub console_read: bool,
+    /// `epoll_wait` fd, biased +1 (0 = not in `epoll_wait`).
+    pub epoll_fd: u64,
+    /// Whether `wake_signal` can rouse it.
+    pub has_sigwaker: bool,
+    /// Parked in an uninterruptible wait (see [`check_hung_tasks`]).
+    pub uninterruptible: bool,
+}
+
+/// Diagnostic snapshot for the stall watchdog: one entry per registered
+/// task. Clones the Arcs out under the registry lock, reads the atomics
+/// lock-free after.
+pub fn dbg_park_snapshot() -> alloc::vec::Vec<ParkSnapshot> {
     let tasks = task_registry_snapshot();
     tasks
         .iter()
-        .map(|t| {
-            (
-                t.tid,
-                t.pid.load(Ordering::Relaxed),
-                t.state.load(Ordering::Relaxed),
-                t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
-                t.uctx.futex_uaddr.load(Ordering::Relaxed),
-                t.uctx.futex_namespace.load(Ordering::Relaxed),
-                t.uctx.futex_park_gen.load(Ordering::Relaxed),
-                t.uctx.futex_val.load(Ordering::Relaxed),
-                t.uctx.net_io_wait.load(Ordering::Relaxed),
-                t.uctx.wait_child_pending.load(Ordering::Relaxed),
-                t.uctx.flock_key.load(Ordering::Relaxed),
-                t.uctx.parked_in_syscall.load(Ordering::Relaxed),
-                t.uctx.sigwait_set.load(Ordering::Relaxed),
-                t.uctx.console_read_pending.load(Ordering::Relaxed),
-                t.uctx.epoll_wait_fd.load(Ordering::Relaxed),
-                crate::handlers::dbg_has_signal_waker(t.tid),
-            )
+        .map(|t| ParkSnapshot {
+            tid: t.tid,
+            pid: t.pid.load(Ordering::Relaxed),
+            state: t.state.load(Ordering::Relaxed),
+            deadline: t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
+            futex: t.uctx.futex_uaddr.load(Ordering::Relaxed),
+            futex_ns: t.uctx.futex_namespace.load(Ordering::Relaxed),
+            futex_gen: t.uctx.futex_park_gen.load(Ordering::Relaxed),
+            futex_val: t.uctx.futex_val.load(Ordering::Relaxed),
+            netio: t.uctx.net_io_wait.load(Ordering::Relaxed),
+            waitchild: t.uctx.wait_child_pending.load(Ordering::Relaxed),
+            flock: t.uctx.flock_key.load(Ordering::Relaxed),
+            parked: t.uctx.parked_in_syscall.load(Ordering::Relaxed),
+            sigwait: t.uctx.sigwait_set.load(Ordering::Relaxed),
+            console_read: t.uctx.console_read_pending.load(Ordering::Relaxed),
+            epoll_fd: t.uctx.epoll_wait_fd.load(Ordering::Relaxed),
+            has_sigwaker: crate::handlers::dbg_has_signal_waker(t.tid),
+            uninterruptible: in_uninterruptible_park(t),
         })
         .collect()
+}
+
+// ── hung-task detector (Linux `kernel/hung_task.c`) ─────────────────
+
+/// `CONFIG_DEFAULT_HUNG_TASK_TIMEOUT`, seconds.
+pub const HUNG_TASK_TIMEOUT_SECS: u64 = 120;
+
+/// `sysctl_hung_task_warnings` default: reports per boot.
+pub const HUNG_TASK_WARNINGS: u64 = 10;
+
+/// Whether `t` is parked in an uninterruptible wait — NARF's
+/// TASK_UNINTERRUPTIBLE.
+///
+/// NARF has no per-task sleep state; the park entry point decides it:
+///
+/// | Park                                        | Linux state           |
+/// |---------------------------------------------|-----------------------|
+/// | `park_pending_future` — a synchronous kernel wait: filesystem I/O, a kernel `Mutex`, a btrfs gate | `D` (uninterruptible) |
+/// | `own_stack_park_until` — nanosleep/pause, futex, poll/ppoll/select, epoll_wait, socket/pipe/tty I/O (`net_io_wait`, `console_read_pending`), sigtimedwait, flock/F_SETLKW, SysV sem/msg, fifo open | `S` (interruptible)   |
+/// | `own_stack_wait_child` — wait4/waitid       | `S` (interruptible)   |
+/// | job-control stop / ptrace stop               | `T` / `t`             |
+///
+/// The interruptible parks all register the task's signal waker and end on
+/// a deliverable signal; a synchronous kernel wait ends only when its
+/// future completes. Some of those futures also give up on SIGKILL
+/// (`narf_filesystem::killable`), which Linux would call TASK_KILLABLE and
+/// skip. NARF counts them as uninterruptible anyway: the kill arm is inside
+/// the awaited future, not a task state, and it wraps waits Linux performs
+/// uninterruptibly — btrfs bio completion among them — so skipping them
+/// would hide the I/O stalls this detector exists to report.
+fn in_uninterruptible_park(t: &Task) -> bool {
+    t.state.load(Ordering::Acquire) != TASK_ZOMBIE
+        && t.uctx.parked_in_syscall.load(Ordering::Acquire)
+        && t.uctx.park_site.load(Ordering::Relaxed) & crate::handlers::PARK_SITE_UNINTERRUPTIBLE
+            != 0
+}
+
+/// Linux `task_is_hung`: `Some(blocked_ns)` when `t` is in an
+/// uninterruptible wait it entered at least `timeout_ns` ago, judged by its
+/// uninterruptible-park count not having moved since this detector first
+/// saw it (a task woken and parked again counts as a new wait).
+fn task_is_hung(t: &Task, now_ns: u64, timeout_ns: u64) -> Option<u64> {
+    if !in_uninterruptible_park(t) {
+        return None;
+    }
+    let switches = t.uctx.uninterruptible_parks.load(Ordering::Relaxed);
+    if switches == 0 {
+        return None;
+    }
+    if switches != t.hung_last_switch_count.load(Ordering::Relaxed) {
+        t.hung_last_switch_count.store(switches, Ordering::Relaxed);
+        t.hung_last_switch_ns.store(now_ns, Ordering::Relaxed);
+        return None;
+    }
+    let blocked = now_ns.saturating_sub(t.hung_last_switch_ns.load(Ordering::Relaxed));
+    (blocked >= timeout_ns).then_some(blocked)
+}
+
+/// Linux `check_hung_uninterruptible_tasks`: report every user task that
+/// has sat in one uninterruptible wait for `timeout_ns` (0 disables), while
+/// `warnings` lasts (`sysctl_hung_task_warnings`; `u64::MAX` is unlimited).
+/// Returns how many tasks were hung this round, reported or not.
+///
+/// The report names what Linux's does — the task, how long, and where it
+/// waits (the park site `/proc/<pid>/stack` shows; for a lock, the lock's
+/// `lock()` call site and the waiter it holds) — in place of a stack trace.
+///
+/// Runs from the stall watchdog's timer tick: the registry snapshot and the
+/// site strings allocate, as the watchdog's other task scans do, and the
+/// task name is read without waiting for its lock.
+pub fn check_hung_tasks(now_ns: u64, timeout_ns: u64, warnings: &AtomicU64) -> usize {
+    use core::fmt::Write as _;
+    if timeout_ns == 0 {
+        return 0;
+    }
+    let mut hung = 0;
+    for t in task_registry_snapshot() {
+        let Some(blocked_ns) = task_is_hung(&t, now_ns, timeout_ns) else {
+            continue;
+        };
+        hung += 1;
+        let left = warnings.load(Ordering::Relaxed);
+        if left == 0 {
+            continue;
+        }
+        if left != u64::MAX {
+            warnings.store(left - 1, Ordering::Relaxed);
+        }
+        let mut comm = [0u8; 16];
+        let n = crate::handlers::proc_comm_of_task_into(t.tid, &mut comm);
+        let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+        let pid = t.pid.load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "INFO: task {comm}:{pid} blocked for more than {} seconds.",
+            blocked_ns / 1_000_000_000
+        );
+        let syscall = t.uctx.in_syscall.load(Ordering::Relaxed);
+        let (kind, site) = match crate::handlers::parked_wait_site(t.tid) {
+            Some(lock) => ("lock", Some(lock)),
+            None => ("site", crate::handlers::parked_park_site(t.tid)),
+        };
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "      tid={} state=D syscall={} {kind}={}",
+            t.tid,
+            syscall.wrapping_sub(1) as i32,
+            site.as_deref().unwrap_or("?")
+        );
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "\"sysctl.kernel.hung_task_timeout_secs=0\" on the kernel command line disables this message."
+        );
+        if left == 1 {
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings"
+            );
+        }
+    }
+    hung
 }
 
 /// Parked tasks whose epoll set already reports a ready descriptor —
