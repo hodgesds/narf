@@ -976,6 +976,9 @@ impl BlockDeviceSync for PolicyGuard {
     fn flush(&self) -> Result<(), BlockIoError> {
         self.inner.flush()
     }
+    fn has_real_flush(&self) -> bool {
+        self.inner.has_real_flush()
+    }
     fn capabilities(&self) -> crate::registry::BlockCaps {
         self.inner.capabilities()
     }

@@ -2668,6 +2668,9 @@ impl crate::BlockDeviceSync for FlushProbe {
             Ok(())
         }
     }
+    fn has_real_flush(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> crate::BlockCaps {
         crate::BlockCaps {
             volatile_cache: true,
@@ -2768,6 +2771,146 @@ fn smoke_block_flush_and_fua_forwarding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("block/flush", smoke_block_flush_and_fua_forwarding);
+
+/// The #841 flush-advertisement guard: `SyncBlock` advertises
+/// `BlockFeature::Flush` / `Fua` exactly when the wrapped device
+/// can honestly deliver them. A volatile-cache device riding the
+/// default no-op flush advertises neither — a future driver that
+/// adds a volatile cache but forgets the `has_real_flush` override
+/// fails closed instead of silently claiming a durability it never
+/// provides. Write-through devices advertise both (write + the
+/// no-op flush is durable there), a native-FUA device advertises
+/// Fua without Flush, and partitions forward the advertisement of
+/// their parent.
+fn smoke_sync_block_flush_advertisement() -> TestResult {
+    use crate::partition::PartitionBlockDevice;
+    use alloc::sync::Arc;
+
+    /// Volatile cache, native FUA, default (no-op) flush: Fua is
+    /// honest (the FUA write itself is durable), Flush is not.
+    struct VolatileNativeFua;
+    impl crate::BlockDeviceSync for VolatileNativeFua {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, _l: u64, _n: u16, _o: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _l: u64, _n: u16, _d: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write_fua(&self, _l: u64, _n: u16, _d: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn capabilities(&self) -> crate::BlockCaps {
+            crate::BlockCaps {
+                volatile_cache: true,
+                fua: true,
+            }
+        }
+    }
+
+    /// Volatile cache, neither a real flush nor native FUA: the lie
+    /// case — it must advertise neither Flush nor Fua.
+    struct VolatileNoFlush;
+    impl crate::BlockDeviceSync for VolatileNoFlush {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, _l: u64, _n: u16, _o: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _l: u64, _n: u16, _d: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn capabilities(&self) -> crate::BlockCaps {
+            crate::BlockCaps {
+                volatile_cache: true,
+                fua: false,
+            }
+        }
+    }
+
+    /// Write-through device on the trait defaults: Flush and Fua
+    /// are honest (write + the no-op flush is durable).
+    struct WriteThrough;
+    impl crate::BlockDeviceSync for WriteThrough {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            64
+        }
+        fn read(&self, _l: u64, _n: u16, _o: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _l: u64, _n: u16, _d: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+    }
+
+    fn advertised(dev: &Arc<dyn crate::BlockDeviceSync>, f: crate::BlockFeature) -> bool {
+        let bridge = crate::SyncBlock::new(dev.clone());
+        crate::BlockDevice::supports(&*bridge, f)
+    }
+
+    // A volatile-cache device with a real flush (FlushProbe)
+    // advertises both.
+    let real: Arc<dyn crate::BlockDeviceSync> = FlushProbe::new(false);
+    if !advertised(&real, crate::BlockFeature::Flush)
+        || !advertised(&real, crate::BlockFeature::Fua)
+    {
+        return TestResult::Fail(
+            "volatile-cache device with a real flush must advertise Flush + Fua",
+        );
+    }
+    // The lie case advertises neither.
+    let lying: Arc<dyn crate::BlockDeviceSync> = Arc::new(VolatileNoFlush);
+    if advertised(&lying, crate::BlockFeature::Flush)
+        || advertised(&lying, crate::BlockFeature::Fua)
+    {
+        return TestResult::Fail(
+            "volatile-cache device on the default flush must advertise neither Flush nor Fua",
+        );
+    }
+    // Native FUA without a real flush: Fua only.
+    let native_fua: Arc<dyn crate::BlockDeviceSync> = Arc::new(VolatileNativeFua);
+    if advertised(&native_fua, crate::BlockFeature::Flush)
+        || !advertised(&native_fua, crate::BlockFeature::Fua)
+    {
+        return TestResult::Fail("native-FUA device without a real flush must advertise Fua only");
+    }
+    // Write-through on the defaults: both, and WriteZeroes everywhere.
+    let wt: Arc<dyn crate::BlockDeviceSync> = Arc::new(WriteThrough);
+    if !advertised(&wt, crate::BlockFeature::Flush)
+        || !advertised(&wt, crate::BlockFeature::Fua)
+        || !advertised(&wt, crate::BlockFeature::WriteZeroes)
+        || !advertised(&lying, crate::BlockFeature::WriteZeroes)
+    {
+        return TestResult::Fail("write-through device must advertise Flush + Fua + WriteZeroes");
+    }
+    // Partitions forward the advertisement of their parent, both ways.
+    let part_lying: Arc<dyn crate::BlockDeviceSync> =
+        Arc::new(PartitionBlockDevice::new(lying, 0, 64));
+    if advertised(&part_lying, crate::BlockFeature::Flush) {
+        return TestResult::Fail("partition must not advertise Flush its parent cannot deliver");
+    }
+    let part_real: Arc<dyn crate::BlockDeviceSync> =
+        Arc::new(PartitionBlockDevice::new(real, 0, 64));
+    if !advertised(&part_real, crate::BlockFeature::Flush)
+        || !advertised(&part_real, crate::BlockFeature::Fua)
+    {
+        return TestResult::Fail("partition must forward its parent's Flush + Fua");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/flush", smoke_sync_block_flush_advertisement);
 
 /// The #841 discard contract for the sync adapter: `SyncBlock`
 /// advertises `BlockFeature::Discard` exactly when the wrapped

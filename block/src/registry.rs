@@ -82,8 +82,29 @@ pub trait BlockDeviceSync: Send + Sync {
     /// the device has reported the flush complete. The default is for
     /// write-through devices, where a completed write is already durable.
     /// Wrappers must forward it.
+    ///
+    /// #841 invariant: [`Self::flush`] must never silently report
+    /// success while a volatile cache is undrained. A device that
+    /// reports [`Self::capabilities`] with `volatile_cache == true`
+    /// MUST override this with a real drain (and override
+    /// [`Self::has_real_flush`] to `true`); a device whose flush is
+    /// this default no-op must report `volatile_cache == false`.
     fn flush(&self) -> Result<(), BlockIoError> {
         Ok(())
+    }
+    /// Whether [`Self::flush`] issues a real cache drain, as opposed
+    /// to the trait-default no-op. The default is `false`: a device
+    /// overrides this to `true` exactly when its `flush` override
+    /// drains the device's volatile write cache (or errors when it
+    /// cannot). [`SyncBlock::supports`] computes the `Flush` /
+    /// `Fua` advertisement from this together with
+    /// [`Self::capabilities`], so a future driver that adds a
+    /// volatile cache but forgets the override fails closed — the
+    /// feature is not advertised — instead of silently claiming a
+    /// durability it never provides (#841). Wrappers must forward
+    /// it, as they do `flush` and `capabilities`.
+    fn has_real_flush(&self) -> bool {
+        false
     }
     /// Write-cache capabilities (Linux `blk_queue_write_cache(q, wc, fua)`).
     /// The default describes a write-through device without native FUA.
@@ -696,14 +717,29 @@ impl BlockDevice for SyncBlock {
     }
     fn supports(&self, f: BlockFeature) -> bool {
         match f {
-            // Flush + WriteZeroes are honest on every sync device:
-            // flush forwards to the device (a real cache drain where
-            // the device implements it, a no-op on write-through
-            // devices) and WriteZeroes is emulated below by writing
-            // zeroes, so claiming both cannot mislead the FS layer.
-            // Fua likewise: native where the device implements it,
-            // emulated as write + flush otherwise.
-            BlockFeature::Flush | BlockFeature::Fua | BlockFeature::WriteZeroes => true,
+            // Flush is honest exactly when the device has no volatile
+            // cache to drain, or its flush really drains one
+            // (`has_real_flush`). The old blanket `true` advertised
+            // Flush for a volatile-cache device riding the default
+            // no-op flush — a durability the device never provided
+            // (#841). A device that forgets the `has_real_flush`
+            // override fails closed here: not advertised.
+            BlockFeature::Flush => {
+                let caps = self.0.capabilities();
+                !caps.volatile_cache || self.0.has_real_flush()
+            }
+            // Fua is native where the device says so (`caps.fua`),
+            // emulated as write + flush otherwise — which is sound
+            // exactly when Flush is sound for this device (same
+            // gate as above).
+            BlockFeature::Fua => {
+                let caps = self.0.capabilities();
+                caps.fua || !caps.volatile_cache || self.0.has_real_flush()
+            }
+            // WriteZeroes is emulated below by writing zeroes, so
+            // its durability is exactly the device's write
+            // durability — no separate cache claim is made.
+            BlockFeature::WriteZeroes => true,
             // Discard is claimed only when the device really issues
             // its deallocation command — a no-op "Discard" would tell
             // filesystems blocks were freed when they were not (#841).

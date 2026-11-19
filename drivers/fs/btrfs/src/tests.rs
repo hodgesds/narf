@@ -12674,6 +12674,9 @@ impl narf_block::BlockDeviceSync for RecordingDevice {
         self.log.lock().push(DevOp::Flush);
         Ok(())
     }
+    fn has_real_flush(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> narf_block::BlockCaps {
         narf_block::BlockCaps {
             volatile_cache: true,
