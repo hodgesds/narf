@@ -2038,7 +2038,7 @@ mod tests {
             || rah_addr(0) != 0x05404
             || ral_addr(15) != 0x05478
             || ral_addr(16) != 0x054E0
-            || rah_addr(31) != 0x055DC
+            || rah_addr(31) != 0x0555C
         {
             return TestResult::Fail("igb RAL/RAH split (16-entry) drift");
         }
@@ -2266,7 +2266,13 @@ mod tests {
         if vt.vlvf.entries[31] != 0 {
             return TestResult::Fail("igb set_vf_vlan remove leaves a PF-only VLVF entry");
         }
-        if prog.n_writes != 1 || prog.writes[0] != RegWrite::new(vlvf_addr(31), 0) {
+        // Two VLVF writes, matching Linux: the VF remove step writes
+        // the entry with the VF pool bit cleared (PF pool bit kept),
+        // then `update_pf_vlvf` clears the entry outright.
+        if prog.n_writes != 2
+            || prog.writes[0] != RegWrite::new(vlvf_addr(31), 0x800040C8)
+            || prog.writes[1] != RegWrite::new(vlvf_addr(31), 0)
+        {
             return TestResult::Fail("igb set_vf_vlan remove update_pf_vlvf write drift");
         }
         TestResult::Pass
@@ -2483,7 +2489,7 @@ mod tests {
         }
         vt.set_vf_trust(0, true).unwrap();
         let out = vt
-            .dispatch(0, &[VF_SET_MAC_ADDR, 0x0000_0303, 0x0000_0100], &filter)
+            .dispatch(0, &[VF_SET_MAC_ADDR, 0x0000_0202, 0x0000_0100], &filter)
             .unwrap();
         if out.reply[0] != VF_SET_MAC_ADDR | VT_MSGTYPE_CTS | VT_MSGTYPE_ACK {
             return TestResult::Fail("igb trusted VF cannot override PF-set MAC");
