@@ -61,16 +61,19 @@ pub struct Features {
     pub x2apic: bool,        // leaf 1 ECX:21
     pub apic: bool,          // leaf 1 EDX:9
     pub tsc_deadline: bool,  // leaf 1 ECX:24 — LAPIC TSC-deadline mode
-    /// Always Running APIC Timer: leaf 0x06 EAX:2.
+    /// Always Running APIC Timer: leaf 0x06 EAX:2, or implied by the
+    /// vendor/family as Linux does it.
     ///
-    /// Intel-only feature (AMD doesn't populate CPUID 0x06 — the
-    /// "Thermal and Power Management" leaf is Intel-architected).
     /// When set, the LAPIC timer does NOT stop in C3 or deeper
     /// C-states. Linux uses this to (a) clear the C3STOP feature
     /// from the LAPIC clockevent and (b) bump its rating above
     /// HPET so the per-CPU LAPIC timer is preferred over the
-    /// global HPET as the primary clockevent on Intel ≥ Nehalem.
-    /// See `setup_APIC_timer` in `arch/x86/kernel/apic/apic.c`.
+    /// global HPET as the primary clockevent (`setup_APIC_timer` in
+    /// `arch/x86/kernel/apic/apic.c`); with it no CPU needs the HPET
+    /// tick broadcast. AMD documents the same CPUID bit, and Linux also
+    /// forces it for AMD family 12h and later (`init_amd`) and for every
+    /// Hygon part (`init_hygon`), whose APIC timer keeps running in deep
+    /// C-states whether or not firmware reports the bit.
     pub arat: bool,
     /// Hybrid topology indicator: leaf 7 sub 0 EDX:15.
     ///
@@ -98,7 +101,7 @@ impl Features {
 
         // Leaf 1: ECX:21 = x2APIC, ECX:30 = RDRAND, EDX:9 = APIC.
         // SAFETY: CPUID at CPL=0 is always defined.
-        let (_, _, ecx1, edx1) = unsafe { cpuid(0x0000_0001, 0) };
+        let (eax1, _, ecx1, edx1) = unsafe { cpuid(0x0000_0001, 0) };
         f.rdrand = ecx1 & (1 << 30) != 0;
         f.x2apic = ecx1 & (1 << 21) != 0;
         f.apic = edx1 & (1 << 9) != 0;
@@ -125,20 +128,37 @@ impl Features {
         let (_, _, _, edx_adv) = unsafe { cpuid(0x8000_0007, 0) };
         f.invariant_tsc = edx_adv & (1 << 8) != 0;
 
-        // Leaf 0x06 EAX:2 = ARAT (Always Running APIC Timer). Only
-        // populated on Intel — AMD parts return 0 for the whole
-        // "Thermal and Power Management" leaf. CPUID max guard
-        // ensures we don't read past the implemented range.
+        // Leaf 0x06 EAX:2 = ARAT (Always Running APIC Timer). CPUID max
+        // guard ensures we don't read past the implemented range.
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
-        let (max, _, _, _) = unsafe { cpuid(0, 0) };
+        let (max, ebx0, ecx0, edx0) = unsafe { cpuid(0, 0) };
         if max >= 6 {
             // SAFETY: the operation upholds its documented invariant (see surrounding context).
             let (eax6, _, _, _) = unsafe { cpuid(0x0000_0006, 0) };
             f.arat = eax6 & (1 << 2) != 0;
         }
+        f.arat |= arat_implied_by_vendor([ebx0, edx0, ecx0], eax1);
 
         f
     }
+}
+
+/// Linux `init_amd` / `init_hygon`: AMD family 12h and later, and every
+/// Hygon part, keep the APIC timer running in deep C-states. `vendor` is
+/// CPUID(0) EBX, EDX, ECX; `signature` is CPUID(1) EAX.
+pub const fn arat_implied_by_vendor(vendor: [u32; 3], signature: u32) -> bool {
+    // "AuthenticAMD" / "HygonGenuine" as EBX, EDX, ECX little-endian words.
+    const AMD: [u32; 3] = [0x6874_7541, 0x6974_6E65, 0x444D_4163];
+    const HYGON: [u32; 3] = [0x6F67_7948, 0x6E65_476E, 0x656E_6975];
+    let base_family = (signature >> 8) & 0xF;
+    let family = if base_family == 0xF {
+        base_family + ((signature >> 20) & 0xFF)
+    } else {
+        base_family
+    };
+    let amd = vendor[0] == AMD[0] && vendor[1] == AMD[1] && vendor[2] == AMD[2];
+    let hygon = vendor[0] == HYGON[0] && vendor[1] == HYGON[1] && vendor[2] == HYGON[2];
+    (amd && family > 0x11) || hygon
 }
 
 /// Read this CPU's hybrid `core_type` byte from CPUID leaf 0x1A
