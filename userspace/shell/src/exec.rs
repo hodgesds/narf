@@ -168,9 +168,30 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
     // produces `echo: exec failed`. Routing through the existing
     // legacy dispatcher gives the same code path the in-kernel
     // `smoke_echo_hello_world_end_to_end` proves.
-    if name == b"echo" {
+    //
+    // `sleep` joins it for the same reason: there is no `/bin/sleep` in
+    // the default image, so `a; sleep 1; b` used to print
+    // `sleep: exec failed` and not wait.
+    if name == b"echo" || name == b"sleep" {
+        if sc.redir_count == 0 {
+            // SAFETY: Valid memory or trusted environment
+            return unsafe { dispatch_builtin_inproc(fd, sc) };
+        }
+        // Honour `echo x > file`: point stdio at the redirect targets,
+        // have the built-in write to fd 1, then restore. Without this the
+        // redirect was dropped and the text went to the console.
         // SAFETY: Valid memory or trusted environment
-        return unsafe { dispatch_builtin_inproc(fd, sc) };
+        let saved = unsafe { save_stdio() };
+        // SAFETY: Valid memory or trusted environment
+        let rc = if unsafe { apply_redirs(fd, sc) } {
+            // SAFETY: Valid memory or trusted environment
+            unsafe { dispatch_builtin_inproc(1, sc) }
+        } else {
+            1
+        };
+        // SAFETY: Valid memory or trusted environment
+        unsafe { restore_stdio(saved) };
+        return rc;
     }
 
     // ── Fork + exec path ────────────────────────────────────────────────
