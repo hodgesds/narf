@@ -24,10 +24,9 @@ to it.
   `io/src/iommu.rs`).
 - Hot-unplug / surprise-removal of a module-driven device.
 - Non-PCI buses (I²C/SPI/platform) — separate per-bus registration exports,
-  out of scope here. USB has its registration export
-  (`narf_register_usb_driver`, through `narf_bus::module_usb`); a USB
-  datapath (control/bulk/interrupt transfers on the probe token) is not
-  designed yet.
+  out of scope here. USB has both halves: registration
+  (`narf_register_usb_driver`) and the transfer datapath below
+  ([USB transfer datapath](#usb-transfer-datapath)).
 
 ## The core constraint
 
@@ -381,3 +380,77 @@ Source fixtures for owner/device/version isolation, short-buffer retention,
 late cap revocation, teardown ordering, native-future cancellation and wire
 bounds are implemented. Their execution and dual module builds remain pending
 in the final coordinated validation pass; no RF acceptance is implied.
+
+## USB transfer datapath
+
+Status: **implemented; `ftdi.ko` (`drivers/usb/ftdi`) is the reference
+consumer**, proven by `cargo xtask ftdi-module-serial-smoke`.
+
+A USB module probe runs inside the async attach cascade, and module text
+cannot produce or await a `Future`, so a blocking "do a transfer" export is
+impossible. The USB exports therefore follow Linux's URB model on top of the
+handle-table pattern above:
+
+```text
+narf_usb_config_descriptor(dev, buf, len, out_len) -> i32
+narf_usb_configure(dev, endpoints, count, callback, cookie, out_urb) -> i32
+narf_usb_control(dev, setup[8], data, len, callback, cookie, out_urb) -> i32
+narf_usb_submit(dev, endpoint, data, len, callback, cookie, out_urb) -> i32
+narf_usb_poll(dev, urb, buf, len, out_len) -> i32
+narf_usb_cancel(dev, urb) -> i32
+narf_usb_serial_register(dev, family, kick, cookie, out_port) -> i32
+narf_usb_serial_tx(dev, port, buf, len, out_len) -> i32
+narf_usb_serial_rx(dev, port, data, len) -> i32
+```
+
+All nine require `BusDevice`. Their path is `kabi.rs` → `narf_bus::module_usb`
+(shape checks; bus sits below the USB stack) → the USB stack's permanent
+`Datapath` hooks (`drivers/usb/src/module_datapath.rs`).
+
+- **Context, not capability.** USB devices carry no `Cap` object today
+  (built-in class drivers hold an `Arc<USBDevice>`). The equivalent
+  authority is the context the class registry mints for exactly one
+  `(module, token)` immediately before that module's probe. Every export
+  resolves the caller's identity from the module call gate together with
+  the token, so a module reaches only devices it was probed for, and only
+  until a declined probe, an unplug or its unload retires the context.
+  Transfers additionally carry the xHCI slot generation, so a reused slot
+  is stale.
+- **Copy mode, kernel buffers.** OUT payloads are copied at submit and IN
+  payloads at poll; transfer buffers are the xHCI endpoint pages. Module
+  memory is never a DMA target, so the unload question from
+  [DMA safety](#dma-safety-the-load-bearing-decision) does not arise.
+- **Kernel-owned futures, module completions.** Control and configure
+  requests run in in-tree tasks; bulk and interrupt receipts are polled by
+  a per-context pump task while any are pending. A terminal request fires
+  the module's optional `extern "C" fn(u64) -> i32` completion through the
+  module callback gate, outside every lock, and the module collects it
+  with `narf_usb_poll` (`-EAGAIN` pending; `-ENOBUFS` retains it; otherwise
+  consumed, with a Linux URB status).
+- **Attributes from the descriptor.** `narf_usb_configure` names endpoints
+  by address; type, packet size and interval come from the configuration
+  descriptor the device was matched with, so a module cannot program an
+  endpoint the device does not describe. `SET_ADDRESS` is refused on EP0.
+  Isochronous transfers are not offered.
+- **Cancellation is a request.** A bulk TD is stopped in a kernel task and
+  completes `-ECANCELED` (an OUT may already have reached the device); an
+  interrupt-IN wait completes `-ECANCELED` with its kernel-page TRB left
+  armed; control, configure and interrupt-OUT run to completion (`-EBUSY`).
+- **A subsystem sink.** Like `narf_netif_*` for e1000, a USB driver needs a
+  place to deliver data. `narf_usb_serial_*` publishes a module-backed
+  `/dev/ttyUSB<N>`: writers' bytes queue in the node's TX ring and run the
+  module's kick callback; the module drains them to bulk-OUT and delivers
+  bulk-IN payloads to readers. HCI and WWAN sinks (for `btusb.ko` and
+  `cdc_mbim.ko`) are the next extensions; they are not part of this slice.
+
+Proof: `ftdi-module-serial-smoke` boots with QEMU's `usb-serial` (FTDI
+FT232BM) wired to a host socket, the built-in FTDI binder stepped aside
+(`narf-drivers-usb/ftdi-module-only`), and `ftdi.ko` autoloaded. The module
+reads the device descriptor (control IN), configures its endpoints, runs
+the FTDI bring-up (control OUT), and publishes `/dev/ttyUSB0`. The guest
+shell's `echo` reaches the host socket through module-submitted bulk-OUT,
+and the host's reply reaches the shell's `cat` through module-submitted
+bulk-IN. In-kernel smokes (`drivers/usb/module-datapath`,
+`modules/kabi`) cover argument validation, owner isolation, the serial
+bridge, retirement and a real control request against the kernel-test
+VM's QEMU keyboard.

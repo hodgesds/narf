@@ -13,7 +13,7 @@
 #     narf-drivers-bluetooth-btusb --no-default-features --features module`.
 #     Registration-only: registers the Bluetooth interface match (0xE0/0x01/
 #     0x01) through `narf_register_usb_driver`; the probe returns -ENOSYS until
-#     a USB transfer datapath is exported to modules.
+#     an HCI-transport module export exists (USB transfers are exported).
 #
 # Tests gate on a dedicated `kernel-test` feature implying `builtin`.
 

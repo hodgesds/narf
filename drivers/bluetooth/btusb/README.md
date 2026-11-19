@@ -11,8 +11,9 @@ binder, wake watch), installed by `register_initcalls`.
 
 Dual-build: the built-in build compiles the real driver; the `.ko` build
 registers the Bluetooth interface match through the `narf_register_usb_driver`
-KSYMTAB export and is registration-only until a USB transfer datapath is
-exported to modules.
+KSYMTAB export and is registration-only: the USB transfer datapath exists
+(`narf_usb_*`), but no HCI-transport export lets a module hand the host
+stack its events and ACL data yet.
 
 ```
 cargo xtask build-module --package narf-drivers-bluetooth-btusb \

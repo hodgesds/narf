@@ -9,8 +9,8 @@
 //! [`register_initcalls`].
 //!
 //! The `module` build registers the Bluetooth interface match through the
-//! `narf_register_usb_driver` KSYMTAB export (registration-only until a USB
-//! transfer datapath is exported). Without the built-in binder the attach
+//! `narf_register_usb_driver` KSYMTAB export (registration-only until an
+//! HCI-transport export joins the USB transfer datapath). Without the built-in binder the attach
 //! cascade offers Bluetooth devices to the class registry, which is where the
 //! `.ko`'s match sees them.
 
@@ -134,7 +134,8 @@ mod module_probe {
     }
 
     extern "C" fn probe_c(_dev_token: u64, _reserved: u64) -> i32 {
-        // -ENOSYS: no USB transfer datapath is exported to modules yet.
+        // -ENOSYS: transfers are exported (`narf_usb_*`), but there is no
+        // HCI-transport sink to hand the host stack events and ACL data.
         -38
     }
 

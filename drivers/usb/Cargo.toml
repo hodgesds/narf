@@ -41,9 +41,15 @@ narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-ctap2        = { path = "../../ctap2" }
 narf-crypto       = { path = "../../crypto" }
+narf-drivers-usb-ftdi = { path = "ftdi" }
 
 [features]
 kernel-test = ["narf-ctap2/kernel-test"]
+# Leave FTDI parts to a loadable `ftdi_sio` module (`narf-drivers-usb-ftdi`,
+# `--features module`): the built-in serial cascade skips the FTDI family, so
+# the device falls through to the module's `narf_register_usb_driver` match.
+# Used by `cargo xtask ftdi-module-serial-smoke`; off in every normal build.
+ftdi-module-only = []
 
 [lints]
 workspace = true

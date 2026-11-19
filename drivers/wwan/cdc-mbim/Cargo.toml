@@ -7,7 +7,7 @@
 #   * `module`: `cargo xtask build-module --package narf-drivers-wwan-cdc-mbim
 #     --no-default-features --features module`. Registration-only: registers
 #     the CDC-MBIM interface match through `narf_register_usb_driver`; the
-#     probe returns -ENOSYS until a USB transfer datapath is exported.
+#     probe returns -ENOSYS until a WWAN-port / netdev module export exists.
 
 [package]
 name         = "narf-drivers-wwan-cdc-mbim"

@@ -1368,7 +1368,12 @@ async fn dispatch_after_address(
         // publishes /dev/ttyUSB<N>. Placed after the class-based
         // probes (a CDC-ACM device with a serial VID must still
         // bind as ACM above) and before the WBDI sniff.
-        if crate::serial::identify(dev_vid, dev_pid).is_some()
+        // `ftdi-module-only` hands FTDI parts to a loadable driver: they
+        // fall through to the class registry's module matches below.
+        let leave_to_module = cfg!(feature = "ftdi-module-only")
+            && crate::serial::identify(dev_vid, dev_pid) == Some(crate::serial::ChipFamily::Ftdi);
+        if !leave_to_module
+            && crate::serial::identify(dev_vid, dev_pid).is_some()
             && crate::serial::port::try_bind_serial_already_addressed(
                 xhci_dev,
                 slot_id,

@@ -744,6 +744,11 @@ also consult upstream Linux GPL sources.
     `serial_tx` drains that ring (nothing while `TCXONC` stopped it) and
     `serial_rx` feeds readers. Termios ioctls on a module node update its
     cached state only (`port::binding_for_tty` has no built-in binding).
+- Feature `ftdi-module-only`: the serial cascade skips the FTDI family so
+  FTDI parts reach a loadable `ftdi_sio` module's match
+  (`narf-drivers-usb-ftdi`). The FTDI wire codec (`serial::ftdi`'s request
+  codes, divisors, modem-control encoding) is re-exported from that crate,
+  so both builds program identical values.
 - Disconnect lifecycle: the supervisor polls connection state each cycle.
   A claimed root port (or bound hub downstream port) that leaves the
   connected set is detached via `attach::detach_slot`: class bindings are
