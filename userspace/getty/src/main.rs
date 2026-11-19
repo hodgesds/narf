@@ -135,6 +135,27 @@ unsafe fn check_credentials(user: &[u8], pass: &[u8]) -> bool {
     login_core::authenticate(&buf[..total], user, pass)
 }
 
+/// Check if `/proc/cmdline` contains `autologin` or `narf.autologin`.
+unsafe fn should_autologin() -> bool {
+    let fd = unsafe { libc::posix_open(b"/proc/cmdline\0".as_ptr() as *const i8, 0, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let n = unsafe { libc::posix_read(fd, buf.as_mut_ptr() as *mut _, buf.len() - 1) };
+    unsafe { libc::posix_close(fd) };
+    if n <= 0 {
+        return false;
+    }
+    let bytes = &buf[..(n as usize)];
+    for word in bytes.split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r') {
+        if word == b"autologin" || word == b"narf.autologin" {
+            return true;
+        }
+    }
+    false
+}
+
 #[no_mangle]
 // Fixed entry signature; argv/envp are unused (we synthesize the shell's).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -153,29 +174,31 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let pgid: i32 = libc::getpid();
         narf_user_runtime::syscall3_raw(SYS_IOCTL, 0, TIOCSPGRP, &pgid as *const i32 as u64);
 
-        // 4. Authenticate.
-        let mut user = [0u8; 64];
-        loop {
-            write_console(b"\nNARF login: ");
-            let ulen = read_line(&mut user);
-            if ulen == 0 {
-                continue; // empty username — re-prompt
-            }
+        // 4. Authenticate unless autologin is requested on kernel cmdline.
+        if !should_autologin() {
+            let mut user = [0u8; 64];
+            loop {
+                write_console(b"\nNARF login: ");
+                let ulen = read_line(&mut user);
+                if ulen == 0 {
+                    continue; // empty username — re-prompt
+                }
 
-            write_console(b"Password: ");
-            set_echo(false);
-            let mut pass = [0u8; 64];
-            let plen = read_line(&mut pass);
-            set_echo(true);
-            write_console(b"\n"); // the (un-echoed) newline
+                write_console(b"Password: ");
+                set_echo(false);
+                let mut pass = [0u8; 64];
+                let plen = read_line(&mut pass);
+                set_echo(true);
+                write_console(b"\n"); // the (un-echoed) newline
 
-            if check_credentials(&user[..ulen], &pass[..plen]) {
-                break;
+                if check_credentials(&user[..ulen], &pass[..plen]) {
+                    break;
+                }
+                // Wrong credentials: a brief delay (anti-brute-force, like real
+                // login) then re-prompt.
+                write_console(b"Login incorrect\n");
+                libc::usleep(1_000_000);
             }
-            // Wrong credentials: a brief delay (anti-brute-force, like real
-            // login) then re-prompt.
-            write_console(b"Login incorrect\n");
-            libc::usleep(1_000_000);
         }
 
         write_console(b"\nWelcome to NARF.\n\n");

@@ -17,12 +17,7 @@ pub const MIN_REFRESH_RANGE_HZ: u32 = 10;
 /// dcn401_resource.c `dc->caps.max_v_total`: the 15-bit OTG field.
 pub const MAX_V_TOTAL: u32 = (1 << 15) - 1;
 
-/// drm_display_info.monitor_range: the EDID's vertical rate limits in Hz.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MonitorRange {
-    pub min_vfreq: u16,
-    pub max_vfreq: u16,
-}
+pub use crate::dp_edid::{displayid_range, monitor_range, MonitorRange};
 
 /// Firmware-parsed AMD vendor data from the HDMI sink's CTA block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,113 +61,7 @@ pub(crate) fn hdmi_amd_vsdb_cea(edid: &[u8]) -> Option<&[u8]> {
         .then_some(cta)
 }
 
-/// amdgpu_dm's DisplayID dynamic-video-timing-range fallback. Linux
-/// searches the first declared DisplayID extension; use only bounds that
-/// fit inside that actual block and accept revision0/1, length9 as it does.
-pub fn displayid_range(edid: &[u8]) -> Option<MonitorRange> {
-    let base = edid.get(..128)?;
-    let ext = edid
-        .chunks_exact(128)
-        .skip(1)
-        .take(usize::from(base[126]))
-        .find(|b| b[0] == 0x70)?;
-    for j in 0..115 {
-        if ext[j] == 0x25 && ext[j + 1] & 0xfe == 0 && ext[j + 2] == 9 {
-            let min = u16::from(ext[j + 9]);
-            let max = u16::from(ext[j + 10])
-                | if ext[j + 1] & 7 != 0 {
-                    u16::from(ext[j + 11] & 3) << 8
-                } else {
-                    0
-                };
-            if min != 0 && max != 0 {
-                return Some(MonitorRange {
-                    min_vfreq: min,
-                    max_vfreq: max,
-                });
-            }
-        }
-    }
-    None
-}
-
-/// The display descriptor tag of a Monitor Range Limits descriptor.
-const RANGE_DESCRIPTOR: u8 = 0xfd;
-/// DRM_EDID_RANGE_LIMITS_ONLY_FLAG: the only variant promising every timing
-/// inside the range, so the only one usable for VRR.
-const RANGE_LIMITS_ONLY: u8 = 0x01;
-/// DRM_EDID_RANGE_OFFSET_{MIN,MAX}_VFREQ (EDID 1.4): add 255 Hz.
-const OFFSET_MIN_VFREQ: u8 = 1 << 0;
-const OFFSET_MAX_VFREQ: u8 = 1 << 1;
-/// DRM_EDID_FEATURE_CONTINUOUS_FREQ.
-const CONTINUOUS_FREQ: u8 = 1 << 0;
-
-/// drm_get_monitor_range over a whole EDID (base block then extensions):
-/// EDID 1.4 with continuous frequency, every 18-byte detailed block (the base
-/// block's four, a CTA-861 extension's DTD area, a VTB extension's), the
-/// last matching "range limits only" descriptor winning, with the 1.4 +255
-/// offsets. None when no descriptor qualifies (Linux's 0..0).
-pub fn monitor_range(edid: &[u8]) -> Option<MonitorRange> {
-    let base = edid.get(..128)?;
-    let revision = base[0x13];
-    if revision < 4 || base[0x18] & CONTINUOUS_FREQ == 0 {
-        return None;
-    }
-    let mut range = None;
-    let mut visit = |d: &[u8]| {
-        // is_display_descriptor: pixel clock 0, pad1 0, the tag.
-        if d.len() < 18 || d[0] != 0 || d[1] != 0 || d[2] != 0 || d[3] != RANGE_DESCRIPTOR {
-            return;
-        }
-        if d[10] != RANGE_LIMITS_ONLY {
-            return;
-        }
-        let mut r = MonitorRange {
-            min_vfreq: u16::from(d[5]),
-            max_vfreq: u16::from(d[6]),
-        };
-        // revision >= 4 already holds.
-        if d[4] & OFFSET_MIN_VFREQ != 0 {
-            r.min_vfreq += 255;
-        }
-        if d[4] & OFFSET_MAX_VFREQ != 0 {
-            r.max_vfreq += 255;
-        }
-        range = Some(r);
-    };
-    for i in 0..4 {
-        let at = 54 + 18 * i;
-        visit(&base[at..at + 18]);
-    }
-    // drm_edid_block_count: the declared extensions, limited by the size.
-    let blocks = (usize::from(base[0x7e]) + 1).min(edid.len() / 128);
-    for ext in edid.chunks_exact(128).take(blocks).skip(1) {
-        match ext[0] {
-            // cea_for_each_detailed_block
-            0x02 => {
-                let d = usize::from(ext[2]);
-                if !(4..=127).contains(&d) {
-                    continue;
-                }
-                for i in 0..(127 - d) / 18 {
-                    visit(&ext[d + 18 * i..d + 18 * i + 18]);
-                }
-            }
-            // vtb_for_each_detailed_block
-            0x10 if ext[1] == 1 => {
-                for i in 0..usize::from(ext[2]).min(6) {
-                    visit(&ext[5 + 18 * i..5 + 18 * i + 18]);
-                }
-            }
-            _ => {}
-        }
-    }
-    range
-}
-
-/// DP_DOWN_STREAM_PORT_COUNT (DPCD 0x007) MSA_TIMING_PAR_IGNORED: the sink
-/// can run without the MSA's timing (dpcd_caps.allow_invalid_MSA_timing_param).
-pub const DPCD_MSA_TIMING_PAR_IGNORED: u8 = 1 << 6;
+pub use crate::dp_link_training::DPCD_MSA_TIMING_PAR_IGNORED;
 /// DP_DOWNSPREAD_CTRL (DPCD 0x107) and its IGNORE_MSA_TIMING_PARAM bit.
 pub const DPCD_DOWNSPREAD_CTRL: u32 = 0x107;
 pub const DPCD_IGNORE_MSA_TIMING_PARAM: u8 = 1 << 7;
@@ -198,12 +87,10 @@ impl VrrRange {
 /// DPCD allows invalid MSA timing and the range is more than 10 Hz wide.
 /// DisplayID dynamic range supplies missing monitor-range bounds.
 pub fn dp_sst_caps(edid: &[u8], dpcd: &[u8; 16]) -> Option<VrrRange> {
-    if dpcd[7] & DPCD_MSA_TIMING_PAR_IGNORED == 0 {
+    if !crate::dp_link_training::sink_ignores_msa_timing(dpcd) {
         return None;
     }
-    let r = monitor_range(edid)
-        .filter(|r| r.min_vfreq != 0 && r.max_vfreq != 0)
-        .or_else(|| displayid_range(edid))?;
+    let r = crate::dp_edid::adaptive_sync_range(edid)?;
     // `max_vfreq - min_vfreq > 10` in Linux's int arithmetic.
     (i32::from(r.max_vfreq) - i32::from(r.min_vfreq) > 10).then_some(VrrRange {
         min_hz: r.min_vfreq,

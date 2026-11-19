@@ -131,7 +131,7 @@ pub enum DisplayVrrIp {
 impl DisplayVrrIp {
     pub const fn from_generation(gen: Generation) -> Self {
         match gen {
-            Generation::TigerLake => Self::Gen12,
+            Generation::TigerLake | Generation::RocketLake => Self::Gen12,
             Generation::AlderLake => Self::Display13,
             Generation::MeteorLake => Self::Display14,
             Generation::LunarLake => Self::Display20,
@@ -143,7 +143,9 @@ impl DisplayVrrIp {
     /// path knows the family, not the `Generation`).
     pub const fn from_gen12_platform(family: crate::intel_gpu_gt::Gen12Platform) -> Self {
         match family {
-            crate::intel_gpu_gt::Gen12Platform::TigerLake => Self::Gen12,
+            crate::intel_gpu_gt::Gen12Platform::TigerLake
+            | crate::intel_gpu_gt::Gen12Platform::Dg1
+            | crate::intel_gpu_gt::Gen12Platform::RocketLake => Self::Gen12,
             crate::intel_gpu_gt::Gen12Platform::AlderLakeP
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeS
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => Self::Display13,
@@ -227,16 +229,14 @@ impl VrrRange {
 
     /// Parse VRR range from an EDID byte slice (monitor range descriptor or DisplayID).
     pub fn from_edid(edid: &[u8]) -> Option<Self> {
-        let r = crate::amdgpu_freesync::monitor_range(edid)
-            .filter(|r| r.min_vfreq != 0 && r.max_vfreq != 0)
-            .or_else(|| crate::amdgpu_freesync::displayid_range(edid))?;
+        let r = crate::dp_edid::adaptive_sync_range(edid)?;
         Self::new(r.min_vfreq, r.max_vfreq)
     }
 
     /// Parse VRR range from an EDID and optional DPCD block.
     pub fn from_edid_and_dpcd(edid: &[u8], dpcd: Option<&[u8; 16]>) -> Option<Self> {
         if let Some(dpcd) = dpcd {
-            if dpcd[7] & crate::amdgpu_freesync::DPCD_MSA_TIMING_PAR_IGNORED == 0 {
+            if !crate::dp_link_training::sink_ignores_msa_timing(dpcd) {
                 return None;
             }
         }

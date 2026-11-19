@@ -131,6 +131,7 @@ fn smoke_slpc_fused_bounds_and_acknowledged_controls() -> TestResult {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
             0xdfc,
         ),
+        (GtPlatform::ArcticSoundM, 0x130044),
         (GtPlatform::Alchemist, 0x130044),
         (GtPlatform::Battlemage, 0xdfc),
     ] {

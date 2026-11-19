@@ -29,6 +29,7 @@ narf-init         = { path = "../init" }
 narf-filesystem   = { path = "../filesystem" }
 narf-initramfs    = { path = "../initramfs" }
 narf-scheduler    = { path = "../scheduler" }
+narf-console      = { path = "../console" }
 
 [lints]
 workspace = true

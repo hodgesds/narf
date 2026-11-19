@@ -202,7 +202,7 @@ impl MtlMstRoute {
                 // Local admission leaves all already-running streams alone.
                 continue;
             }
-            let pipe = match free_pipe(io) {
+            let pipe = match free_pipe(io, ExternalDisplayProfile::for_ip(self.link.display_ip)) {
                 Ok(pipe) => pipe,
                 Err(ExternalError::NoFreePipe) => break,
                 Err(error) => return Err(error),
@@ -215,6 +215,7 @@ impl MtlMstRoute {
                 .first()
                 .map_or(pipe.transcoder(), |s| s.route.pipe.transcoder());
             let mut probe = MtlSinkProbe {
+                display_ip: self.link.display_ip,
                 mst: Some(MstStreamConfig {
                     master,
                     slots: slots as u8,
@@ -227,7 +228,7 @@ impl MtlMstRoute {
                 negotiated,
                 max_downspread: self.link.raw[DP_MAX_DOWNSPREAD],
                 ssc: false,
-                edid: [0; EDID_CAPACITY],
+                edid: Box::new([0; EDID_CAPACITY]),
                 edid_len: 128,
                 dsc: None,
                 pipe_bpp: 24,
@@ -424,7 +425,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     pipes: Pipes,
     payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    let pipe = match free_pipe(io) {
+    let pipe = match free_pipe(io, ExternalDisplayProfile::for_ip(probe.display_ip)) {
         Ok(pipe) => pipe,
         Err(error) => return Err(ActivateError::Refused(probe, error)),
     };

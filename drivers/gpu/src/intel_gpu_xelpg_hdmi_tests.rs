@@ -267,7 +267,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         sink: SinkScdc::default(),
         link: TmdsLink::default(),
         ddc: PinPair::Pin2Bxt,
-        edid: [0; crate::intel_gpu_hdmi::EDID_CAPACITY],
+        edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
 }
@@ -374,6 +374,18 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             Generation::TigerLake,
             XeLpgPort::B,
             false,
+            HdmiError::Route(ExternalError::UnsupportedGeneration),
+        ),
+        (
+            Generation::LunarLake,
+            XeLpgPort::Tc1,
+            true,
+            HdmiError::Route(ExternalError::UnsupportedGeneration),
+        ),
+        (
+            Generation::PantherLake,
+            XeLpgPort::Tc1,
+            true,
             HdmiError::Route(ExternalError::UnsupportedGeneration),
         ),
         (

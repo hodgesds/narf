@@ -254,6 +254,27 @@ impl UserBackend for Mailbox {
     }
 }
 impl Mailbox {
+    /// Poll the fixture ioctl after its dependency is released. Bound retries
+    /// of the 100 µs fence timer independently of time spent building a batch
+    /// or waiting for the host to schedule the guest.
+    fn poll_until_queued<F: Future>(&self, mut call: core::pin::Pin<&mut F>) {
+        if !self.pending.lock().is_empty() {
+            return;
+        }
+        for _ in 0..100 {
+            assert!(call
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            if !self.pending.lock().is_empty() {
+                return;
+            }
+            narf_scheduler::block_on_spin(narf_time::SleepUntil::new(
+                narf_time::Deadline::after_us(100).as_instant(),
+            ));
+        }
+        panic!("GPU submission did not reach the fixture mailbox");
+    }
     fn accept<M: MmioWindow, A: BootAllocator>(
         &self,
         gt: &mut GuCGt<M, A>,

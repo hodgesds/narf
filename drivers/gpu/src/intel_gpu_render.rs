@@ -132,7 +132,9 @@ pub enum SubmissionProfile {
 impl SubmissionProfile {
     pub const fn for_generation(generation: Generation) -> Self {
         match generation {
-            Generation::TigerLake | Generation::AlderLake => Self::Gen12GuC,
+            Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                Self::Gen12GuC
+            }
             Generation::MeteorLake => Self::XeLpgGuC,
             Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
@@ -1128,8 +1130,7 @@ impl RenderFile {
             namespaces.initialize();
             namespaces.select(wire.context_id(), wire.ring(), info)?
         };
-        let dr4_fixed_up = wire.dr4_fixed_up();
-        let mut request = wire.resolve(&self.gem)?;
+        let mut request = wire.resolve_ioctl(&self.gem, cmd, user, arg)?;
         // Linux eb_oa_config: the request must not be preempted when the
         // execbuffer carries the ext_perf extension on a context pinned by
         // a HOLD_PREEMPTION OA stream. Either half alone does not hold
@@ -1146,10 +1147,6 @@ impl RenderFile {
         request.validate_for_gt(info.platform)?;
         if request.has_async() && !info.object_async_ready() {
             return Err(FsError::NoDevice);
-        }
-        if dr4_fixed_up && cmd == abi::GEM_EXECBUFFER2_WR {
-            // Write back fixed-up DR4 (0) on writeable execbuffer2 ioctl.
-            let _ = user.write(arg + 24, &0u32.to_ne_bytes());
         }
         let output = sync.output;
         let input_word = sync.input_word;
@@ -1473,7 +1470,7 @@ impl RenderFile {
             _ => return Err(FsError::InvalidData),
         }
         let topology = observed_topology(info)?;
-        if info.platform.is_ptl() {
+        if info.platform.is_xe3_lpg() {
             return Err(FsError::NoDevice);
         }
         let eus = match topology.eu_type() {
@@ -1632,6 +1629,12 @@ impl RenderFile {
                     put32(&mut request, 4, object.busy());
                     return user.write(arg, &request);
                 }
+                if matches!(cmd, abi::GEM_SET_DOMAIN | abi::GEM_SW_FINISH)
+                    && write
+                    && object.is_read_only()
+                {
+                    return Err(FsError::InvalidData);
+                }
                 if object.idle(write) {
                     Ok(())
                 } else if cmd == abi::GEM_WAIT && u64_at(&request, 8) == 0 {
@@ -1734,6 +1737,7 @@ impl RenderFile {
                 let low_latency_admitted = matches!(
                     info.platform,
                     GtPlatform::Gen12(_)
+                        | GtPlatform::ArcticSoundM
                         | GtPlatform::Alchemist
                         | GtPlatform::Integrated(Generation::MeteorLake)
                 ) && crate::intel_gpu_xe::low_latency_supported(info);
@@ -1799,12 +1803,11 @@ impl RenderFile {
             abi::QUERY => query(info, arg, user),
             abi::GEM_THROTTLE => Ok(()),
             abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR => {
-                let request = crate::intel_gpu_exec::ExecRequest::read(user, arg, &self.gem)?;
-                let mut namespaces = self.namespaces.lock();
-                namespaces.initialize();
-                if !namespaces.contexts.contains_key(&request.context_id) {
-                    return Err(FsError::NotFound);
-                }
+                let wire = crate::intel_gpu_exec::ExecWire::read(user, arg, false)?;
+                self.namespaces
+                    .lock()
+                    .select(wire.context_id(), wire.ring(), info)?;
+                wire.resolve_ioctl(&self.gem, cmd, user, arg)?;
                 if info.submission_ready() {
                     Err(FsError::WouldBlock)
                 } else {
@@ -2070,6 +2073,7 @@ fn create_extensions(
             if matches!(
                 info.platform,
                 GtPlatform::Gen12(_)
+                    | GtPlatform::ArcticSoundM
                     | GtPlatform::Alchemist
                     | GtPlatform::Integrated(Generation::TigerLake | Generation::AlderLake)
             ) {
@@ -3624,7 +3628,9 @@ pub(crate) mod tests {
         check(|| {
             for entry in crate::intel_gpu::DEVICE_TABLE {
                 let expected = match entry.generation {
-                    Generation::TigerLake | Generation::AlderLake => SubmissionProfile::Gen12GuC,
+                    Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                        SubmissionProfile::Gen12GuC
+                    }
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
                     Generation::LunarLake | Generation::PantherLake => {
                         SubmissionProfile::Unsupported
@@ -4004,15 +4010,15 @@ pub(crate) mod tests {
                 return Err("read_only flag not set on object");
             }
 
-            // Writing to read-only object via pwrite fails with PermissionDenied
+            // i915_gem_userptr_pwrite and the read-only object check return EINVAL.
             let mut pwrite_req = [0; 32];
             put32(&mut pwrite_req, 0, ro_handle);
             put64(&mut pwrite_req, 8, 0);
             put64(&mut pwrite_req, 16, 16);
             put64(&mut pwrite_req, 24, 1024);
             user.store(64, &pwrite_req);
-            if invoke(&file, &user, abi::GEM_PWRITE) != Err(FsError::PermissionDenied) {
-                return Err("pwrite on read-only userptr accepted");
+            if invoke(&file, &user, abi::GEM_PWRITE) != Err(FsError::InvalidData) {
+                return Err("PWRITE on a read-only userptr must return EINVAL");
             }
 
             // Setting write domain on read-only object fails with InvalidData
@@ -4117,7 +4123,8 @@ pub(crate) mod tests {
             let handle = file.gem.create(4096, |_, _| Ok(())).map_err(|_| "alloc")?;
 
             // 1. Verify that context validation precedes object resolution.
-            // Pass an unknown context ID (0x9999) along with a non-existent GEM handle (0xbeef).
+            // An unknown context returns ENOENT. The invalid object flags
+            // would return EINVAL if object resolution ran first.
             let mut request = [0; 64];
             put64(&mut request, 0, 256); // objects ptr
             put32(&mut request, 8, 1); // count = 1
@@ -4129,7 +4136,7 @@ pub(crate) mod tests {
             let mut obj = [0; 56];
             put32(&mut obj, 0, 0xbeef); // non-existent GEM handle
             put64(&mut obj, 24, 0x20_0000);
-            put64(&mut obj, 32, abi::OBJECT_PINNED | abi::OBJECT_SUPPORTS_48B);
+            put64(&mut obj, 32, u64::MAX);
 
             user.store(64, &request);
             user.store(256, &obj);
@@ -4144,16 +4151,38 @@ pub(crate) mod tests {
             put64(&mut request, 48, 0); // valid default context 0
             put32(&mut request, 24, u32::MAX); // DR4 = 0xffffffff
             put32(&mut obj, 0, handle); // valid handle
+            put64(&mut obj, 32, abi::OBJECT_PINNED | abi::OBJECT_SUPPORTS_48B);
             user.store(64, &request);
             user.store(256, &obj);
 
-            let res = invoke(&file, &user, abi::GEM_EXECBUFFER2_WR);
-            let written_dr4 = u32_at(&user.load(64, 64), 24);
-            if written_dr4 != 0 {
-                return Err("DR4 fixup was not written back");
-            }
-            if res != Err(FsError::NotImplemented) {
-                return Err("unexpected execution result");
+            let info = info(Generation::MeteorLake);
+            for userspace in [false, true] {
+                let submit = |cmd| {
+                    if userspace {
+                        narf_scheduler::block_on_spin(alloc::boxed::Box::pin(
+                            file.dispatch_user(&info, cmd, 64, &user),
+                        ))
+                        .expect("Intel command")
+                    } else {
+                        invoke(&file, &user, cmd)
+                    }
+                };
+                user.store(64, &request);
+                user.fault_write_at(Some(64 + 24));
+                if submit(abi::GEM_EXECBUFFER2) != Err(FsError::NotImplemented)
+                    || u32_at(&user.load(64, 64), 24) != u32::MAX
+                {
+                    return Err("write-only execbuffer must leave DR4 alone");
+                }
+                if submit(abi::GEM_EXECBUFFER2_WR) != Err(FsError::BadAddress) {
+                    return Err("DR4 copyout fault must return EFAULT");
+                }
+                user.fault_write_at(None);
+                if submit(abi::GEM_EXECBUFFER2_WR) != Err(FsError::NotImplemented)
+                    || u32_at(&user.load(64, 64), 24) != 0
+                {
+                    return Err("read/write execbuffer must report the normalized DR4");
+                }
             }
 
             Ok(())

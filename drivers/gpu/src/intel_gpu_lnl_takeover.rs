@@ -193,8 +193,8 @@ impl Receipt {
             || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
                 .is_some_and(|p| match ip {
                     DisplayIp::Xe2Lpd => p.is_lnl(),
-                    DisplayIp::Xe3Lpd => p.is_ptl(),
-                    DisplayIp::Xelpdp => false,
+                    DisplayIp::Xe3Lpd => p.has_ptl_display_route(),
+                    DisplayIp::Xelpdp | DisplayIp::WildcatLake => false,
                 })
             || bar.phys.raw() == 0
             || bar.phys.raw() & 4095 != 0
@@ -468,7 +468,7 @@ impl MediaProof {
         // Wa22019338487: media20.00 all steps; media30.00 A0 only.
         // The immutable GMD was captured under the retained media wake.
         let version = (self.gmd >> 22) * 100 + ((self.gmd >> 14) & 255);
-        if version == 1301 || version == 3000 && self.gmd & 63 >= 4 {
+        if matches!(version, 1301 | 3002 | 3500 | 3503) || version == 3000 && self.gmd & 63 >= 4 {
             return Ok(());
         }
         let next = count.get() + 1;
@@ -493,7 +493,15 @@ pub(crate) struct MediaQuiesce {
 impl MediaQuiesce {
     pub(crate) fn for_platform(platform: crate::intel_gpu_gt::GtPlatform) -> Self {
         let mut state = Self::new();
-        state.expected = if platform.is_ptl() { 3000 } else { 2000 };
+        state.expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
+            3500
+        } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+            3002
+        } else if platform.is_ptl() {
+            3000
+        } else {
+            2000
+        };
         state
     }
     pub(crate) fn for_bmg() -> Self {
@@ -622,34 +630,41 @@ impl MediaQuiesce {
 /// documented whole-display reset; a powered-off read is never interpreted
 /// as a disabled plane. This profile never initializes display or DMC.
 fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Error> {
+    use crate::intel_gpu_xe2lpd::DisplayIdentity;
     if read(m, 0x10100c)? & (1 << 9) == 0 {
         return Ok(None);
     }
     let platform =
         crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, device).ok_or(Error::Unsupported)?;
-    let expected = if platform.is_ptl() {
-        3000
+    let expected = if platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS {
+        DisplayIdentity::NovaLakeS
+    } else if platform == crate::intel_gpu_gt::GtPlatform::WildcatLake {
+        DisplayIdentity::WildcatLake
+    } else if platform.is_ptl() {
+        DisplayIdentity::Xe3Lpd
     } else if platform.is_lnl() {
-        2000
+        DisplayIdentity::Xe2Lpd
     } else if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-        1401
+        DisplayIdentity::Xe2Hpd
     } else {
         return Err(Error::Unsupported);
     };
     let a = read(m, 0x510a0)?;
-    if a != read(m, 0x510a0)? || (a >> 22) * 100 + ((a >> 14) & 255) != expected {
+    if a != read(m, 0x510a0)? || DisplayIdentity::decode(a) != Ok(expected) {
         return Err(Error::Unsupported);
     }
+    let profile = expected.profile();
     // Secondary refusal probes only: distribution or gated zeroes are not an
     // inactive proof. Inherited producer retirement comes from completed FLR.
     if read(m, 0x42000)? & 0x0c000000 != 0x0c000000 {
         return Err(Error::Unavailable);
     }
-    if read(m, 0x45504)? != 0 || read(m, 0x45250)? & 0x1111 != 0 {
+    if read(m, 0x45504)? != 0 || read(m, 0x45250)? & profile.pipedmc_enable_mask() != 0 {
         return Err(Error::Busy);
     }
-    let mask = (3 << 2) | (3 << 10) | (3 << 12) | (3 << 14) | (3 << 16);
-    // PW2 and pipe A-D wells must remain off, including other agents' refs.
+    let mask = profile.pipe_power_well_mask();
+    // PW2 and every real pipe well must remain off, including other agents'
+    // refs. WCL has A-C; the other admitted identities have A-D.
     // Display30.00 changes PGB's parent toPG1 (power_map.c:1596ff),
     // but keeps these exact request/state indices. No well is enabled here.
     for reg in [0x45400, 0x45404, 0x45408, 0x4540c] {
@@ -660,13 +675,8 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
     if read(m, 0x70008)? & 0xc0000000 != 0 {
         return Err(Error::Busy);
     }
-    let fbc_count = if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-        2
-    } else {
-        4
-    };
-    for id in 0..fbc_count {
-        if read(m, 0x43208 + id * 0x40)? & 0x80000000 != 0 {
+    for id in 0..4u64 {
+        if profile.fbc_mask & (1 << id) != 0 && read(m, 0x43208 + id * 0x40)? & 0x80000000 != 0 {
             return Err(Error::Busy);
         }
     }
@@ -815,7 +825,10 @@ mod tests {
         assert!(crate::intel_gpu::Generation::LunarLake
             .region_generation()
             .is_none());
-        assert!(crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80).is_none());
+        assert_eq!(
+            crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
+            Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)
+        );
         let (device, bar) = identity();
         for (reg, value) in [(0x10100c, 0x80000000), (0x1901f8, 1)] {
             let m = Registers::new();
@@ -1060,7 +1073,10 @@ mod tests {
         assert!(crate::intel_gpu::Generation::PantherLake
             .region_generation()
             .is_none());
-        assert!(crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80).is_none());
+        assert_eq!(
+            crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
+            Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)
+        );
         let (mut device, bar) = identity();
         device.id.device = 0xb080;
         for (reg, value) in [(0x10100c, 0x80000000), (0x1901f8, 1)] {
@@ -1199,5 +1215,146 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_ptl_driver_flr_profiles_media_steps_and_first_pte_refusal
+    );
+    fn smoke_wcl_distinct_graphics_media_and_display_identity() -> TestResult {
+        let platform = crate::intel_gpu_gt::GtPlatform::WildcatLake;
+        for id in [0xfd80, 0xfd81] {
+            assert_eq!(
+                crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
+                Some(platform)
+            );
+        }
+        assert_eq!(media_version(3002), 30 << 22 | 2 << 14);
+
+        let m = Registers::new();
+        m.set(0x380d8c, media_version(3002));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert_eq!(media.expected, 3002);
+        assert!(media.poll(&m, 0).is_pending());
+        m.set(0x380dfc, 1);
+        assert!(media.poll(&m, 1).is_pending());
+        m.set(0x38941c, 0);
+        m.set(0x38c000, 1);
+        assert!(media.poll(&m, 2).is_pending());
+        m.set(0x38941c, 0);
+        let Poll::Ready(Ok(proof)) = media.poll(&m, 3) else {
+            panic!("WCL media 30.02 proof")
+        };
+        let count = Cell::new(0);
+        for _ in 0..126 {
+            proof.after_pte(&m, &count).unwrap();
+        }
+        assert_eq!(count.get(), 0);
+        assert!(m
+            .writes
+            .borrow()
+            .iter()
+            .all(|(register, _)| *register != 0x380d8c));
+
+        let wrong = Registers::new();
+        wrong.set(0x380d8c, media_version(3000));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert!(media.poll(&wrong, 0).is_pending());
+        wrong.set(0x380dfc, 1);
+        assert!(matches!(
+            media.poll(&wrong, 1),
+            Poll::Ready(Err(Error::Unsupported))
+        ));
+
+        let display = Registers::new();
+        display.set(0x10100c, 1 << 9);
+        display.set(0x510a0, media_version(3002));
+        display.set(0x42000, 0x0c000000);
+        assert_eq!(
+            post_flr_display(&display, 0xfd80),
+            Ok(Some(media_version(3002)))
+        );
+        // WCL has no Pipe-D DMC or power well. Reserved/nonexistent D bits
+        // are not part of its proof.
+        display.set(0x45250, 0x1000);
+        for register in [0x45400, 0x45404, 0x45408, 0x4540c] {
+            display.set(register, 3 << 16);
+        }
+        display.set(0x43208 + 3 * 0x40, 1 << 31);
+        assert_eq!(
+            post_flr_display(&display, 0xfd80),
+            Ok(Some(media_version(3002)))
+        );
+        display.set(0x510a0, media_version(3000));
+        assert_eq!(post_flr_display(&display, 0xfd80), Err(Error::Unsupported));
+        TestResult::Pass
+    }
+    const fn media_version(version: u32) -> u32 {
+        (version / 100) << 22 | (version % 100) << 14
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_wcl_distinct_graphics_media_and_display_identity
+    );
+    fn smoke_nvls_distinct_firmware_media_and_display_identity() -> TestResult {
+        let platform = crate::intel_gpu_gt::GtPlatform::NovaLakeS;
+        for id in [0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745] {
+            assert_eq!(
+                crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
+                Some(platform)
+            );
+        }
+        let profile = platform.guc().unwrap();
+        assert_eq!(
+            (profile.firmware, profile.minimum_version),
+            ("xe/nvl_guc_70.bin", (70, 55, 4))
+        );
+
+        let m = Registers::new();
+        m.set(0x380d8c, media_version(3500));
+        let mut media = MediaQuiesce::for_platform(platform);
+        assert_eq!(media.expected, 3500);
+        assert!(media.poll(&m, 0).is_pending());
+        m.set(0x380dfc, 1);
+        assert!(media.poll(&m, 1).is_pending());
+        m.set(0x38941c, 0);
+        m.set(0x38c000, 1);
+        assert!(media.poll(&m, 2).is_pending());
+        m.set(0x38941c, 0);
+        let Poll::Ready(Ok(proof)) = media.poll(&m, 3) else {
+            panic!("NVL-S media 35.00 proof")
+        };
+        let count = Cell::new(0);
+        for _ in 0..126 {
+            proof.after_pte(&m, &count).unwrap();
+        }
+        assert_eq!(count.get(), 0);
+        assert!(m
+            .writes
+            .borrow()
+            .iter()
+            .all(|(register, _)| *register != 0x380d8c));
+
+        let display = Registers::new();
+        display.set(0x10100c, 1 << 9);
+        display.set(0x510a0, media_version(3500));
+        display.set(0x42000, 0x0c000000);
+        assert_eq!(
+            post_flr_display(&display, 0xd740),
+            Ok(Some(media_version(3500)))
+        );
+        // NVL-S maps the four-pipe xe2_lpd_display descriptor, so the same
+        // Pipe-D state is live and must fail closed.
+        display.set(0x45250, 0x1000);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x45250, 0);
+        display.set(0x45400, 3 << 16);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x45400, 0);
+        display.set(0x43208 + 3 * 0x40, 1 << 31);
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Busy));
+        display.set(0x43208 + 3 * 0x40, 0);
+        display.set(0x510a0, media_version(3002));
+        assert_eq!(post_flr_display(&display, 0xd740), Err(Error::Unsupported));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_nvls_distinct_firmware_media_and_display_identity
     );
 }

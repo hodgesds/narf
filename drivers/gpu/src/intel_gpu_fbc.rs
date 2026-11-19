@@ -1,6 +1,6 @@
-//! Display-14 framebuffer compression (FBC A) for the fixed Pipe-A
-//! primary, enabled only while that plane scans out a KMS-owned GEM
-//! framebuffer.
+//! Framebuffer compression (FBC). The live owner covers FBC A on the fixed
+//! Pipe-A primary and is enabled only while that plane scans out a KMS-owned
+//! GEM framebuffer.
 //!
 //! Pinned source: Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! `i915/display/intel_fbc.c`, `intel_fbc_regs.h`,
@@ -36,6 +36,14 @@
 //! `skl_fbc_min_cfb_stride` with Wa_16011863758's +64), height capped at
 //! 2560, limit from `find_compression_limit` (twice the size first, then
 //! 1:1, 1:2, 1:4), placed below 2^28 in DSM.
+//!
+//! Display 35 planning is deliberately disconnected from that live owner.
+//! Linux 7.0-rc7's `xe3p_lpd_fbc_pixel_format_is_valid` adds four 64-bit
+//! integer formats and ARGB/ABGR FP16; only the two FP16 formats require the
+//! 1.0 pixel normalizer on HDR planes 1--3. Its 2 MiB FBC system-cache image
+//! uses 4 KiB start units and 64 KiB range units. Wa_14025769978 keeps the
+//! cache-read-enable bit clear. The pure helpers below form register images
+//! but perform no MMIO and grant no Display-35 programming authority.
 //!
 //! This driver never enables FBC on the console or boot framebuffer, and
 //! never touches an FBC it did not activate: an inherited enable remains
@@ -77,26 +85,114 @@ pub const MAX_CFB_HEIGHT: u32 = 2560;
 pub const MAX_PLANE: (u32, u32) = (5120, 4096);
 /// `intel_fbc_max_surface_size`, display >= 11.
 pub const MAX_SURFACE: (u32, u32) = (8192, 4096);
+/// `XE3P_LPD_FBC_SYS_CACHE_USAGE_CFG`.
+pub const XE3P_LPD_FBC_SYS_CACHE_USAGE_CFG: u64 = 0x1344E0;
+/// `FBC_SYS_CACHE_READ_ENABLE` (kept clear on Display 35 by Wa_14025769978).
+pub const FBC_SYS_CACHE_READ_ENABLE: u32 = 1;
+/// Display 35's `fbc_sys_cache_limit`, expressed in 64 KiB units.
+pub const DISPLAY35_FBC_SYS_CACHEABLE_RANGE: u32 = (2 * 1024 * 1024) / (64 * 1024);
+/// `PLANE_PIXEL_NORMALIZE(PIPE_A, PLANE_1)`.
+pub const PLANE_PIXEL_NORMALIZE_1_A: u64 = 0x701A8;
+/// `PLANE_PIXEL_NORMALIZE_ENABLE`.
+pub const PLANE_PIXEL_NORMALIZE_ENABLE: u32 = 1 << 31;
+/// FP16 normalization factor 1.0.
+pub const PLANE_PIXEL_NORMALIZE_FACTOR_1_0: u32 = 0x3C00;
 
 /// Plane pixel formats as FBC classifies them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Xrgb8888,
     Xbgr8888,
+    Argb8888,
+    Abgr8888,
     Rgb565,
+    Xrgb16161616,
+    Xbgr16161616,
+    Argb16161616,
+    Abgr16161616,
+    Argb16161616f,
+    Abgr16161616f,
     /// Anything else (XR30 included): `g4x_fbc_pixel_format_is_valid`
     /// refuses it.
     Other,
 }
 
 impl Format {
-    fn cpp(self) -> u32 {
-        if self == Format::Rgb565 {
-            2
-        } else {
-            4
+    const fn cpp(self) -> u32 {
+        match self {
+            Self::Rgb565 => 2,
+            Self::Xrgb16161616
+            | Self::Xbgr16161616
+            | Self::Argb16161616
+            | Self::Abgr16161616
+            | Self::Argb16161616f
+            | Self::Abgr16161616f => 8,
+            _ => 4,
         }
     }
+
+    const fn valid_display14(self) -> bool {
+        matches!(self, Self::Xrgb8888 | Self::Xbgr8888 | Self::Rgb565)
+    }
+
+    const fn valid_display20(self) -> bool {
+        matches!(
+            self,
+            Self::Xrgb8888 | Self::Xbgr8888 | Self::Argb8888 | Self::Abgr8888 | Self::Rgb565
+        )
+    }
+
+    const fn valid_display35(self) -> bool {
+        self.valid_display20()
+            || matches!(
+                self,
+                Self::Xrgb16161616
+                    | Self::Xbgr16161616
+                    | Self::Argb16161616
+                    | Self::Abgr16161616
+                    | Self::Argb16161616f
+                    | Self::Abgr16161616f
+            )
+    }
+
+    /// Whether Display 35 FBC needs `PLANE_PIXEL_NORMALIZE` for this format.
+    pub const fn needs_pixel_normalizer(self) -> bool {
+        matches!(self, Self::Argb16161616f | Self::Abgr16161616f)
+    }
+}
+
+/// `PLANE_PIXEL_NORMALIZE(pipe, plane)` for Display 35's HDR planes 1--3.
+/// `pipe` and `plane` use Linux's zero-based `PIPE_A` and `PLANE_1` IDs.
+pub const fn pixel_normalizer_register(pipe: u8, plane: u8) -> Option<u64> {
+    if pipe < 4 && plane < 3 {
+        Some(PLANE_PIXEL_NORMALIZE_1_A + pipe as u64 * 0x1000 + plane as u64 * 0x100)
+    } else {
+        None
+    }
+}
+
+/// Display 35's normalizer image. Non-FP16 formats disable the register.
+pub const fn pixel_normalizer_value(format: Format) -> u32 {
+    if format.needs_pixel_normalizer() {
+        PLANE_PIXEL_NORMALIZE_ENABLE | PLANE_PIXEL_NORMALIZE_FACTOR_1_0
+    } else {
+        0
+    }
+}
+
+/// Display 35's `XE3P_LPD_FBC_SYS_CACHE_USAGE_CFG` image for a compressed
+/// framebuffer offset within stolen memory. Invalid alignment or a start base
+/// wider than the hardware's 16-bit 4 KiB field is refused. The read-enable
+/// bit stays clear for Wa_14025769978.
+pub const fn display35_fbc_sys_cache_config(stolen_offset_bytes: u64) -> Option<u32> {
+    if stolen_offset_bytes & 0xFFF != 0 {
+        return None;
+    }
+    let start_base = stolen_offset_bytes >> 12;
+    if start_base > u16::MAX as u64 {
+        return None;
+    }
+    Some((start_base as u32) << 16 | DISPLAY35_FBC_SYS_CACHEABLE_RANGE << 4 | 3 << 2)
 }
 
 /// The plane facts eligibility depends on.
@@ -146,6 +242,16 @@ pub fn check_plane(plane: &Plane) -> Result<(), Refusal> {
 /// `Wa_14016291713` against PSR1) or display >= 20 (`display20 == true`,
 /// allows PSR1 alongside FBC while still refusing selective update).
 pub fn check_plane_for(plane: &Plane, display20: bool) -> Result<(), Refusal> {
+    check_plane_version(plane, if display20 { 20 } else { 14 })
+}
+
+/// `intel_fbc_check_plane`'s Display-35 format/eligibility portion. This is a
+/// pure admission helper and is not connected to the live FBC owner.
+pub fn check_plane_display35(plane: &Plane) -> Result<(), Refusal> {
+    check_plane_version(plane, 35)
+}
+
+fn check_plane_version(plane: &Plane, display_version: u8) -> Result<(), Refusal> {
     if !plane.kms_owned {
         return Err(Refusal::NotKmsOwned);
     }
@@ -155,10 +261,17 @@ pub fn check_plane_for(plane: &Plane, display20: bool) -> Result<(), Refusal> {
     if plane.selective_update {
         return Err(Refusal::SelectiveUpdate);
     }
-    if !display20 && plane.psr1 {
+    if display_version < 20 && plane.psr1 {
         return Err(Refusal::Psr1);
     }
-    if plane.format == Format::Other {
+    let valid_format = if display_version >= 35 {
+        plane.format.valid_display35()
+    } else if display_version >= 20 {
+        plane.format.valid_display20()
+    } else {
+        plane.format.valid_display14()
+    };
+    if !valid_format {
         return Err(Refusal::Format);
     }
     if plane.format == Format::Rgb565 && plane.rotated_90 {

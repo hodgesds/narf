@@ -146,7 +146,7 @@ fn smoke_xe2lpd_kms_fetcher_inventory_and_refused_services() -> TestResult {
             let platform = MockPlatform::new();
             platform.set(register, 0x8000_0001);
             assert_eq!(
-                fetchers_with_cursor(&platform, generation, false, false).is_ok(),
+                fetchers_with_cursor(&platform, generation, None, false, false).is_ok(),
                 admitted,
                 "{register:#x} {generation:?}"
             );
@@ -774,21 +774,21 @@ fn smoke_xe2lpd_kms_tile4_panning_through_owned_dpt() -> TestResult {
 
     let platform = MockPlatform::new();
     let timing = display20_resources(&platform);
+    platform.set(0x70188, pan_geo.pitch / 64);
     crate::intel_gpu_kms::tile4_profile(&platform, pan_geo, timing).unwrap();
-    let device = lunar(&platform);
-    let gem = crate::intel_gpu_gem::GemState::new();
-    let handle = gem
-        .create_placed(
-            32768,
-            None,
-            crate::intel_gpu_gem::Placement::SystemWc,
-            |_, _| Ok(()),
-        )
-        .unwrap();
-    let fb = gem.object(handle).unwrap();
-    let _ = gem.close(handle);
+    let device = Device::new(
+        platform.clone(),
+        Generation::LunarLake,
+        0x100_0000,
+        ActiveScanout {
+            stride_bytes: pan_geo.pitch,
+            ..console()
+        },
+    );
+    // The panned window covers tile rows 1 and 2 of a four-column surface.
+    let fb = object_sized(true, 12 * 4096).unwrap();
     let frames: Vec<u64> = fb.pages().collect();
-    assert_eq!(frames.len(), 8);
+    assert_eq!(frames.len(), 12);
     let view = View {
         origin,
         layout: Layout::Tile4,
@@ -813,11 +813,17 @@ fn smoke_xe2lpd_kms_tile4_panning_through_owned_dpt() -> TestResult {
                 .read_volatile()
         }
     };
-    // Row 0 of DPT maps source tile row 1 cols 1..=3 (pages 5, 6, 7); cols 3..8 stay zero.
-    assert_eq!(entry(0), frames[5] | 1 | (3 << 52));
-    assert_eq!(entry(1), frames[6] | 1 | (3 << 52));
-    assert_eq!(entry(2), frames[7] | 1 | (3 << 52));
-    assert_eq!(entry(3), 0);
+    for (row, first_page) in [(0, 5), (8, 9)] {
+        for col in 0..3 {
+            assert_eq!(
+                entry(row + col as u64),
+                frames[first_page + col] | 1 | (3 << 52)
+            );
+        }
+        for padding in 3..8 {
+            assert_eq!(entry(row + padding), 0);
+        }
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -841,11 +847,12 @@ fn smoke_xe2lpd_kms_fbc_display20_deltas_and_psr1_coexistence() -> TestResult {
 
     assert!(super::psr::psr(&device).is_some());
     assert_ne!(platform.read32(super::psr::PSR_CTL) & (1 << 31), 0);
-    // Display-20 FBC is enabled alongside PSR1:
-    assert_eq!(platform.read32(0x43200), 0x100_0000); // DPFC_CB_BASE
-    assert_ne!(platform.read32(0x43208) & (1 << 31), 0); // DPFC_CONTROL
-    assert_ne!(platform.read32(0x60114) & (1 << 3), 0); // Wa_18038517565
-                                                        // Wa_22014263786 (DPFC_CHICKEN bit 13) is skipped on display >= 20:
+    // DPFC_CB_BASE and DPFC_CONTROL show FBC enabled alongside PSR1.
+    assert_eq!(platform.read32(0x43200), 0x100_0000);
+    assert_ne!(platform.read32(0x43208) & (1 << 31), 0);
+    // Wa_18038517565 sets MTL_DPFC_GATING_DIS in MTL_PIPE_CLKGATE_DIS2(A).
+    assert_ne!(platform.read32(0x60114) & (1 << 6), 0);
+    // Wa_22014263786 (DPFC_CHICKEN bit 13) is skipped on display >= 20.
     assert_eq!(platform.read32(0x43224) & (1 << 13), 0);
     TestResult::Pass
 }

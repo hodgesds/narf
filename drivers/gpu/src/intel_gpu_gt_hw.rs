@@ -28,8 +28,9 @@ impl AuthorizedWindow {
             headless: None,
         }
     }
-    /// Exact source-profile constructor. It performs only the Linux bootstrap
-    /// four-zero root writes + VF_CAP probe before recording PF permission.
+    /// Exact PF/profile constructor. Integrated Xe2/Xe3 performs the Linux
+    /// bootstrap four-zero root writes before VF_CAP; source SR-IOV families
+    /// need only VF_CAP when they do not use that workaround.
     /// Every raw access independently invokes current capability and validates
     /// current PCI identity/BAR/command/D0 and inherited-VF exclusion.
     pub(crate) fn for_device(
@@ -37,9 +38,10 @@ impl AuthorizedWindow {
         cap: Cap<narf_bus::BusDeviceCap, Write>,
         device: narf_bus::BusDevice,
     ) -> Self {
-        if !GtPlatform::from_pci(device.id.vendor, device.id.device)
-            .is_some_and(|p| p.is_headless_integrated())
-        {
+        let Some(platform) = GtPlatform::from_pci(device.id.vendor, device.id.device) else {
+            return Self::new(bar, cap);
+        };
+        if !platform.is_headless_integrated() && !platform.has_sriov() {
             return Self::new(bar, cap);
         }
         let this = Self {
@@ -49,7 +51,7 @@ impl AuthorizedWindow {
                 device,
                 pf: core::sync::atomic::AtomicBool::new(false),
                 local: None,
-                flush: true,
+                flush: platform.is_headless_integrated(),
             })),
         };
         let _ = this.read32(0x1901f8);
@@ -306,17 +308,18 @@ impl HeadlessAccess {
         if u64::from(high) << 32 | u64::from(low & !15) != bar.phys.raw() {
             return false;
         }
-        if !self.flush {
-            if crate::intel_gpu_gt::GtPlatform::from_pci(
-                self.device.id.vendor,
-                self.device.id.device,
-            ) != Some(crate::intel_gpu_gt::GtPlatform::Battlemage)
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(self.device.id.vendor, self.device.id.device);
+        if self.flush {
+            if !platform.is_some_and(|platform| platform.is_headless_integrated())
+                || self.local.is_some()
             {
                 return false;
             }
-            let Some(local) = self.local else {
+        } else if let Some(local) = self.local {
+            if platform != Some(crate::intel_gpu_gt::GtPlatform::Battlemage) {
                 return false;
-            };
+            }
             let Some(low) = read(0x18) else {
                 return false;
             };
@@ -331,6 +334,8 @@ impl HeadlessAccess {
             {
                 return false;
             }
+        } else if !platform.is_some_and(crate::intel_gpu_gt::GtPlatform::has_sriov) {
+            return false;
         }
         no_inherited_vfs(read)
     }
@@ -678,7 +683,10 @@ impl HardwareInit {
             self.quiesce = 3;
         }
         if self.platform.is_gen12() {
-            crate::intel_gpu_gt::gen12::cache(mmio)?;
+            let GtPlatform::Gen12(family) = self.platform else {
+                unreachable!("is_gen12 accepted a non-Gen12 platform")
+            };
+            crate::intel_gpu_gt::gen12::cache(mmio, family)?;
             self.ready = true;
             let mask = mmio.read32(0x1900e8);
             if mask == u32::MAX {
@@ -691,7 +699,10 @@ impl HardwareInit {
                 media: None,
             }));
         }
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !matches!(
+            self.platform,
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist
+        );
         if modern {
             let sem = mmio.read32(0xfd0);
             if sem == u32::MAX {
@@ -735,7 +746,7 @@ impl HardwareInit {
                 }
                 3
             }
-            GtPlatform::Alchemist => {
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 mmio.write32(0x4800, 3); // Xe-LP PAT0: WB, coherent
                 let l3 = [0x90, 0xd0, 0x50, 0xb0];
                 for i in 0..32 {
@@ -745,7 +756,10 @@ impl HardwareInit {
                 }
                 0
             }
-            GtPlatform::Battlemage | GtPlatform::Integrated(_) => {
+            GtPlatform::Battlemage
+            | GtPlatform::WildcatLake
+            | GtPlatform::NovaLakeS
+            | GtPlatform::Integrated(_) => {
                 mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
                 if self.platform.is_headless_integrated() {
                     mmio.write32(0x480c, 0x3c);
@@ -1049,6 +1063,38 @@ mod read_order_tests {
             assert_eq!(ops.len(), if valid { 5 } else { 0 });
             assert_eq!(pf.load(Ordering::Acquire), valid);
         }
+        // Source SR-IOV families without the integrated four-zero workaround
+        // bootstrap through VF_CAP only; each later access is one operation.
+        let pf = AtomicBool::new(false);
+        let mut ops = Vec::new();
+        assert_eq!(
+            profile_read_ordered(0xc000, Some(&pf), false, |r, w, _| {
+                ops.push((r, w));
+                Some(0)
+            }),
+            u32::MAX
+        );
+        assert!(ops.is_empty());
+        assert_eq!(
+            profile_read_ordered(VF_CAP, Some(&pf), false, |r, w, bootstrap| {
+                assert!(bootstrap);
+                ops.push((r, w));
+                Some(0)
+            }),
+            0
+        );
+        assert_eq!(ops, [(VF_CAP, None)]);
+        assert!(pf.load(Ordering::Acquire));
+        ops.clear();
+        assert_eq!(
+            profile_read_ordered(0xc000, Some(&pf), false, |r, w, bootstrap| {
+                assert!(!bootstrap);
+                ops.push((r, w));
+                Some(7)
+            }),
+            7
+        );
+        assert_eq!(ops, [(0xc000, None)]);
         TestResult::Pass
     }
     kernel_test_in!(

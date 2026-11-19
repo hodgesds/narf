@@ -239,7 +239,7 @@ pub(crate) enum Profile {
 impl Profile {
     pub(crate) fn of(platform: GtPlatform, graphics: u16) -> Option<Self> {
         match platform {
-            GtPlatform::Alchemist if graphics == 1255 => Some(Self::Dg2),
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist if graphics == 1255 => Some(Self::Dg2),
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake)
                 if matches!(graphics, 1270 | 1271 | 1274) =>
             {
@@ -744,6 +744,14 @@ impl Config {
 struct Registry {
     configs: BTreeMap<u32, Arc<Config>>,
     regs: usize,
+}
+impl Registry {
+    fn remove(&mut self, card: u32, id: u32) -> Result<(), FsError> {
+        let config = self.configs.remove(&id).ok_or(FsError::NotFound)?;
+        metrics_remove(card, &config.uuid);
+        self.regs -= config.regs.len();
+        Ok(())
+    }
 }
 /// xe_oa::metrics_idr, one per card for the device lifetime.
 static REGISTRY: [IrqSafeSpinLock<Registry>; 64] = [const {
@@ -1674,11 +1682,9 @@ pub(crate) fn remove_config(
     let mut word = [0u8; 8];
     user.read(param, &mut word)?;
     let id = u32::try_from(u64::from_le_bytes(word)).map_err(|_| FsError::NotFound)?;
-    let mut registry = REGISTRY[device.card as usize].lock();
-    let config = registry.configs.remove(&id).ok_or(FsError::NotFound)?;
-    // sysfs_remove_group before idr_remove, under metrics_lock.
-    metrics_remove(device.card, &config.uuid);
-    registry.regs -= config.regs.len();
+    REGISTRY[device.card as usize]
+        .lock()
+        .remove(device.card, id)?;
     Ok(0)
 }
 

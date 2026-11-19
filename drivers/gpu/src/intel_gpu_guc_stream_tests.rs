@@ -530,9 +530,23 @@ fn smoke_guc_stream_v2_firmware_counter_wrap_lower_bound_and_ring_images() -> Te
     );
     assert_eq!(dword(&b.bytes, 76), 8);
     assert!(!supported(identity().platform, (71, 0, 0)));
+    for (platform, version) in [
+        (
+            crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
+            (70, 53, 0),
+        ),
+        (
+            crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+            (70, 54, 0),
+        ),
+        (crate::intel_gpu_gt::GtPlatform::WildcatLake, (70, 54, 0)),
+        (crate::intel_gpu_gt::GtPlatform::NovaLakeS, (70, 55, 4)),
+    ] {
+        assert!(supported(platform, version));
+    }
     assert!(!supported(
-        crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
-        (70, 54, 1)
+        crate::intel_gpu_gt::GtPlatform::NovaLakeS,
+        (70, 55, 3)
     ));
     TestResult::Pass
 }

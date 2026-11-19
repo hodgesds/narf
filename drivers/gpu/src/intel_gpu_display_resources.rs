@@ -99,9 +99,9 @@ fn idle_ip(io: &(impl MmioWindow + ?Sized), ip: DisplayIp) -> Result<(), FsError
         _ => FsError::NoDevice,
     })
 }
-/// The display IP this owner programs: 14.00, 20.00 or 30.00 (`None` for
-/// every other GMD, which keeps the inherited layout). Display 30 is only
-/// reached through the opted-in Panther Lake route.
+/// The display IP this owner programs: 14.00, 20.00, 30.00 or 30.02 (`None`
+/// for every other GMD, which keeps the inherited layout). Display 30 is only
+/// reached through the exact opted-in Panther or Wildcat Lake route.
 fn display_ip(io: &(impl MmioWindow + ?Sized)) -> Result<Option<DisplayIp>, FsError> {
     let gmd = read(io, 0x510a0)?;
     Ok(DisplayIp::decode_all(gmd).ok())
@@ -191,7 +191,7 @@ impl Profile {
             .max(alloc.cursor_wm.levels[0].lines);
         let wm_level_disabled = match state.ip {
             // The VRR guardband is display 30's vblank prefill budget.
-            DisplayIp::Xe3Lpd => wm::wm_level_disabled_dsc_ip(
+            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => wm::wm_level_disabled_dsc_ip(
                 state.ip,
                 wm::Timing {
                     vblank_start: u32::from(state.vblank_start[0].unwrap_or(mode.v_active)),
@@ -257,7 +257,7 @@ impl Profile {
         // Display 30 always scans out through the VRR timing generator:
         // the vblank prefill budget is its guardband.
         let mut vblank_start = [None; res::PIPES];
-        if ip == DisplayIp::Xe3Lpd {
+        if ip.is_display30() {
             let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
                 .map_err(|_| FsError::Unsupported)?;
             vblank_start[0] = Some(mode.v_total - guardband);
@@ -394,6 +394,20 @@ impl Profile {
         Self::check_cdclk(io, profile.ip, mode)?;
         Ok(profile)
     }
+
+    /// [`Self::capture`] while requiring the caller's admitted display IP.
+    pub(crate) fn capture_ip(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        ip: DisplayIp,
+    ) -> Result<Self, FsError> {
+        let profile = Self::capture(io, mode)?;
+        if profile.ip == ip {
+            Ok(profile)
+        } else {
+            Err(FsError::Unsupported)
+        }
+    }
     /// The running CDCLK covers `mode` and the acknowledged PM demand covers
     /// the clock: `ip`'s ceiling (691.2 MHz on display 30) and voltage level
     /// (`xe3lpd_calc_voltage_level` is 0); both PM demand layouts keep the
@@ -435,22 +449,21 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
         dsc: Option<DscTerm>,
-    ) -> Result<(Self, Option<Box<Layout>>, DisplayIp), FsError> {
+    ) -> Result<(Self, Option<Layout>, DisplayIp), FsError> {
         let ip = display_ip(io)?.ok_or(FsError::Unsupported)?;
         match Self::capture_single(io, ip, mode, dsc) {
             Ok(profile) => return Ok((profile, None, ip)),
             Err(FsError::Unsupported) => {}
             Err(error) => return Err(error),
         }
-        // Only the display-14 Pipe B–D owner publishes multi-pipe layouts.
-        if ip != DisplayIp::Xelpdp {
-            return Err(FsError::Unsupported);
-        }
         let layout =
             crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
+        if layout.state.ip != ip {
+            return Err(FsError::Unsupported);
+        }
         Ok((
             Self::capture_multi(io, mode, &layout, dsc)?,
-            Some(Box::new(layout)),
+            Some(layout),
             ip,
         ))
     }
@@ -502,7 +515,7 @@ impl Profile {
         {
             return Err(FsError::Unsupported);
         }
-        for pipe in 0..res::PIPES {
+        for pipe in 0..state.ip.pipe_count() {
             if state.dbuf.active_pipes & (1 << pipe) != 0
                 && read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(pipe))? != state.dbox(pipe)
             {
@@ -529,7 +542,7 @@ impl Profile {
     ) -> Result<Self, FsError> {
         // An enabled blank foreign pipe still consumes global display
         // resources, even when none of its fetchers is enabled.
-        for pipe in 1..4 {
+        for pipe in 1..ip.pipe_count() as u64 {
             if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
                 return Err(FsError::Unsupported);
             }
@@ -565,7 +578,7 @@ impl Profile {
         let latency = Latency::read(io)?;
         let state = Self::multi_state(mode, Tiling::Linear, layout, &latency, dsc)?;
         let profile = Self::share(mode, &latency, &state, dsc)?;
-        for pipe in 1..res::PIPES {
+        for pipe in 1..state.ip.pipe_count() {
             if state.requests[pipe].is_none()
                 && read(io, 0x70008 + pipe as u64 * 0x1000)? & 0xc0000000 != 0
             {
@@ -581,7 +594,7 @@ impl Profile {
             mbus & !(7 << 26) == base
                 && (select == 7 || state.dbuf.active_pipes & (1 << select) != 0)
         })?;
-        for pipe in 0..res::PIPES {
+        for pipe in 0..state.ip.pipe_count() {
             let active = state.dbuf.active_pipes & (1 << pipe) != 0;
             let alloc = &state.dbuf.pipes[pipe];
             for plane in 0..res::PLANES {
@@ -625,7 +638,7 @@ impl Profile {
             _ => return Err(FsError::Unsupported),
         };
         if let Some(tiling) = tiling {
-            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_deref(), dsc)?;
+            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_ref(), dsc)?;
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
@@ -640,7 +653,7 @@ fn primary_registers(ip: DisplayIp, wm: PlaneWm) -> Result<alloc::vec::Vec<(u64,
     let mut image = res::plane_wm_image_ip(ip, 0, 0, &wm)
         .ok_or(FsError::Unsupported)?
         .to_vec();
-    if ip == DisplayIp::Xe3Lpd {
+    if ip.is_display30() {
         image.push((
             res::plane_min_buf_cfg(0, 0),
             res::min_ddb_value(&wm).ok_or(FsError::Unsupported)?,
@@ -770,7 +783,7 @@ impl Primary {
             return Err(FsError::Unsupported);
         }
         let tile4 =
-            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_deref(), dsc)?;
+            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
         Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.

@@ -11,19 +11,20 @@
 //! 30.02 to `wcl_display` (Wildcat Lake: pipes A–C, ports A/B/TC1/TC2).
 //! `INTEL_PTL_IDS` and `INTEL_WCL_IDS` both bind `ptl_desc`, which carries
 //! no display info, so the IP is known only from `GMD_ID_DISPLAY`.
-//! [`DisplayIp::decode_all`] admits 30.00 only; 30.02 stays a typed refusal
-//! (the WCL PCI IDs are not in the driver table, and its PHY map, DMC
-//! container, CDCLK ceiling and bandwidth parameters differ). For display
+//! [`DisplayIp::decode_all`] admits both exact identities. The route matches
+//! 30.00 only to Panther Lake and 30.02 only to Wildcat Lake, so a broad
+//! generation cannot exchange their four- and three-pipe profiles. For display
 //! \>= 30 `__intel_display_device_info_runtime_init` also reads
 //! `PICA_PHY_CONFIG_CONTROL.EDP_ON_TYPEC` (`edp_typec_support`).
 //!
 //! ## Route
 //!
-//! Panther Lake's existing profile is the headless main GT
+//! Panther and Wildcat Lake's existing profiles are the headless main GT
 //! ([`crate::intel_gpu_lnl_takeover`]), whose driver FLR would reset the
-//! panel. The display route (`narf.intel.ptl_display=1`, the strict Intel
-//! opt-in grammar) never runs it: it adopts the firmware-lit Pipe A on
-//! DDI A, exactly like the Lunar Lake route. The decision reads
+//! panel. The display routes (`narf.intel.ptl_display=1` and the distinct
+//! `narf.intel.wcl_display=1`, using the strict Intel opt-in grammar) never
+//! run it: they adopt the firmware-lit Pipe A on DDI A, exactly like the
+//! Lunar Lake route. The decision reads
 //! `GMD_ID_DISPLAY` (twice), `SKL_DFSM`, `PICA_PHY_CONFIG_CONTROL` and
 //! `TRANSCONF_A`, and nothing without the option. eDP on a Type-C port
 //! (`EDP_ON_TYPEC`) is refused: that panel is driven by a C20 PHY with
@@ -76,14 +77,19 @@
 //!
 //! Supported on display 30: opted-in eDP takeover, linear, X-tiled and
 //! Tile4 primary flips through DPT, the 64x64 cursor, CTM and double-buffered
-//! LUTs, DSB transactions, and the Xe `SCANOUT` create flag.
-//! Refused on display 30: eDP on Type-C, the C20 tables, every external
-//! output, PSR and panel replay, FBC (and its dirty rectangles), compressed
-//! primaries, DC states, system suspend and relight, and Wildcat Lake (30.02).
+//! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and TC1–TC4 USB-C
+//! DP 1.4 beside the panel through the fixed-refresh VRR timing generator.
+//! Refused on display 30: eDP on Type-C and its untranscribed intermediate
+//! C20 tables, combo DDI B, HDMI, PSR and panel replay, FBC (and its dirty
+//! rectangles), compressed primaries, DC states, system suspend and relight.
+//! Wildcat Lake additionally retains only Pipes A-C and ports A/B/TC1/TC2;
+//! its distinct production option carries the proved 30.02 identity through
+//! KMS, hotplug, resource capture and recovery.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_xe2lpd::{DisplayIp, IpError, DFSM_PIPE_A_DISABLE, SKL_DFSM};
 use crate::intel_gpu_xelpg::{PhyKind, XeLpgPort};
@@ -94,11 +100,33 @@ use crate::intel_gpu_xelpg_wm::Latency;
 
 /// The boot option requesting the Panther Lake display route.
 pub(crate) const OPT_IN: &str = "narf.intel.ptl_display";
+/// The distinct boot option requesting the Wildcat Lake display route.
+pub(crate) const WCL_OPT_IN: &str = "narf.intel.wcl_display";
 
 /// `narf.intel.ptl_display=1`, with the strict grammar every Intel
 /// destructive opt-in uses ([`crate::intel_gpu_gt::boot_opt_in`]).
 pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
     crate::intel_gpu_gt::boot_opt_in(args, OPT_IN)
+}
+
+/// `narf.intel.wcl_display=1`, kept separate so Panther Lake's broad
+/// generation identity cannot opt a Wildcat Lake function into display.
+pub(crate) fn wcl_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, WCL_OPT_IN)
+}
+
+/// Select only the exact platform's destructive display option. Keeping this
+/// decision typed prevents either Panther or Wildcat Lake from inheriting the
+/// other's request through their shared graphics generation.
+pub(crate) fn platform_requested(
+    platform: GtPlatform,
+    args: narf_boot::args::KernelCmdline<'_>,
+) -> bool {
+    match platform {
+        GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => requested(args),
+        GtPlatform::WildcatLake => wcl_requested(args),
+        _ => false,
+    }
 }
 
 /// `PICA_PHY_CONFIG_CONTROL` and `EDP_ON_TYPEC` (`intel_cx0_phy_regs.h`).
@@ -107,15 +135,15 @@ pub(crate) const EDP_ON_TYPEC: u32 = 1 << 31;
 /// `TRANSCONF(A)`.
 const TRANSCONF_A: u64 = 0x70008;
 
-/// Why a Panther Lake function keeps its headless profile.
+/// Why a display-30 function keeps its headless profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RouteRefusal {
-    /// Not a Panther Lake function.
-    NotPantherLake,
-    /// `narf.intel.ptl_display=1` was not given.
+    /// Neither the exact Panther Lake nor Wildcat Lake platform.
+    UnsupportedPlatform,
+    /// The exact platform's display option was not given.
     NotRequested,
-    /// The display IP is not 30.00 (absent, Wildcat Lake's 30.02, foreign
-    /// or unreadable).
+    /// The display IP does not match the exact platform, or is absent,
+    /// foreign or unreadable.
     Ip(IpError),
     /// `SKL_DFSM` fuses Pipe A off.
     PipeAFused,
@@ -126,25 +154,30 @@ pub(crate) enum RouteRefusal {
     PipeADark,
 }
 
-/// Decide the display route for one Panther Lake function. Read-only: no
-/// register is written, so every refusal leaves the function exactly as the
-/// headless profile expects to find it.
+/// Decide the display route for one Panther or Wildcat Lake function.
+/// Read-only: no register is written, so every refusal leaves the function
+/// exactly as the headless profile expects to find it.
 pub(crate) fn display_route(
-    generation: crate::intel_gpu::Generation,
+    platform: GtPlatform,
     requested: bool,
     io: &(impl MmioWindow + ?Sized),
 ) -> Result<DisplayIp, RouteRefusal> {
-    if generation != crate::intel_gpu::Generation::PantherLake {
-        return Err(RouteRefusal::NotPantherLake);
-    }
+    let expected = match platform {
+        GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => DisplayIp::Xe3Lpd,
+        GtPlatform::WildcatLake => DisplayIp::WildcatLake,
+        _ => return Err(RouteRefusal::UnsupportedPlatform),
+    };
     if !requested {
         return Err(RouteRefusal::NotRequested);
     }
     let ip = DisplayIp::read_all(io).map_err(RouteRefusal::Ip)?;
-    if ip != DisplayIp::Xe3Lpd {
+    if ip != expected {
         return Err(RouteRefusal::Ip(IpError::Unqualified {
             ver: ip.ver(),
-            rel: 0,
+            rel: match ip {
+                DisplayIp::WildcatLake => 2,
+                _ => 0,
+            },
         }));
     }
     let dfsm = io.read32(SKL_DFSM);
@@ -165,25 +198,28 @@ pub(crate) fn display_route(
     Ok(ip)
 }
 
-/// The probe's route decision for one Panther Lake function: `true` only
-/// when [`display_route`] admits the display. Without the option no
-/// register is touched (and BAR0 is not even mapped), so the headless
-/// profile's probe runs exactly as before.
+/// The probe's route decision for one Panther or Wildcat Lake function:
+/// `true` only when [`display_route`] admits the exact display. Without that
+/// platform's option no register is touched (and BAR0 is not even mapped),
+/// so the headless profile's probe runs exactly as before.
 pub(crate) fn probe_route(
     device: &narf_bus::BusDevice,
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> bool {
-    let ptl = crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-        .is_some_and(|p| p.is_ptl());
-    if !ptl || !requested(narf_boot::args()) {
+    let Some(
+        platform @ (GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake)
+        | GtPlatform::WildcatLake),
+    ) = GtPlatform::from_pci(device.id.vendor, device.id.device)
+    else {
+        return false;
+    };
+    if !platform_requested(platform, narf_boot::args()) {
         return false;
     }
     if narf_bus::pci::set_command(
         cap,
         device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
+        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .is_err()
     {
@@ -194,16 +230,13 @@ pub(crate) fn probe_route(
     let Ok(bar) = (unsafe { narf_bus::bar::map_bar(device, 0) }) else {
         return false;
     };
-    let route = display_route(
-        crate::intel_gpu::Generation::PantherLake,
-        true,
-        &crate::intel_gpu_edp::BarWindow(&bar),
-    );
+    let route = display_route(platform, true, &crate::intel_gpu_edp::BarWindow(&bar));
     {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "intel-gpu: Panther Lake display route (PCI {:04x}:{:04x}): {:?}",
+            "intel-gpu: display-30 route {:?} (PCI {:04x}:{:04x}): {:?}",
+            platform,
             device.id.vendor,
             device.id.device,
             route,
@@ -313,20 +346,23 @@ impl<M: MmioWindow + ?Sized> MmioWindow for View<'_, M> {
 // ── Owned modeset ────────────────────────────────────────────────
 
 /// The display-30 owned Pipe-A modeset, through the display-14 orchestrator
-/// dispatched on Xe3_LPD. `mmio` must be a [`View`]. Refused read-only
-/// unless the hardware reports display 30.00: the generation never selects
-/// it ([`crate::intel_gpu_modeset::modeset_display`] keeps refusing
-/// Panther Lake).
+/// dispatched on the exact display IP. `mmio` must be a [`View`]. Refused
+/// read-only unless the hardware reports 30.00 or 30.02: the generation
+/// never selects it ([`crate::intel_gpu_modeset::modeset_display`] keeps
+/// refusing Panther Lake).
 pub(crate) fn modeset<M: MmioWindow + ?Sized>(
     mmio: &M,
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
-    if !mmio.cx0_xe3() || DisplayIp::read_all(mmio) != Ok(DisplayIp::Xe3Lpd) {
+    if !mmio.cx0_xe3() {
         return Err(ModesetError::UnsupportedGeneration);
     }
-    let mut ms = crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(mmio, XeLpgPort::A)
-        .with_display_ip(DisplayIp::Xe3Lpd);
+    let Ok(ip @ (DisplayIp::Xe3Lpd | DisplayIp::WildcatLake)) = DisplayIp::read_all(mmio) else {
+        return Err(ModesetError::UnsupportedGeneration);
+    };
+    let mut ms =
+        crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(mmio, XeLpgPort::A).with_display_ip(ip);
     match mode {
         Some(mode) => ms.modeset_fixed(fb, mode),
         None => ms.modeset(fb, None),
@@ -423,7 +459,7 @@ pub(crate) const fn parent(ip: DisplayIp, well: Well) -> Option<Well> {
     match (ip, well) {
         (_, Well::Pw1) => None,
         (_, Well::Pw2 | Well::PwA) => Some(Well::Pw1),
-        (DisplayIp::Xe3Lpd, Well::PwB) => Some(Well::Pw1),
+        (DisplayIp::Xe3Lpd | DisplayIp::WildcatLake, Well::PwB) => Some(Well::Pw1),
         (DisplayIp::Xelpdp | DisplayIp::Xe2Lpd, Well::PwB) => Some(Well::Pw2),
         (_, Well::PwC | Well::PwD) => Some(Well::Pw2),
     }
@@ -454,7 +490,7 @@ pub(crate) enum Domain {
 /// `AUDIO_MMIO`, `AUDIO_PLAYBACK`) on display 30.
 pub(crate) const fn dc_off_domains(ip: DisplayIp) -> &'static [Domain] {
     match ip {
-        DisplayIp::Xe3Lpd => &[
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => &[
             Domain::PipeC,
             Domain::PipeD,
             Domain::TranscoderC,
@@ -519,12 +555,16 @@ pub(crate) const CDCLK_TABLE: [Rung; 29] = [
 
 /// `intel_update_max_cdclk`, display 30.00.
 pub(crate) const MAX_CDCLK_KHZ: u32 = 691_200;
+/// `intel_update_max_cdclk`, display 30.02 (Wildcat Lake).
+pub(crate) const WCL_MAX_CDCLK_KHZ: u32 = 480_000;
 
 // ── Bandwidth ────────────────────────────────────────────────────
 
 /// `xe3lpd_sa_info.deprogbwlimit` (GB/s); deburst 32, displayrtids 256 and
 /// derating 10 equal `mtl_sa_info`.
 pub(crate) const DEPROGBWLIMIT_GBPS: i64 = 65;
+/// `xe3lpd_3002_sa_info.deprogbwlimit` (GB/s) on Wildcat Lake.
+pub(crate) const WCL_DEPROGBWLIMIT_GBPS: i64 = 22;
 
 // ── PHY ──────────────────────────────────────────────────────────
 
@@ -548,15 +588,7 @@ pub(crate) const fn power_control_disable_val(kind: PhyKind, edp: bool) -> u32 {
 
 // ── VRR timing generator ─────────────────────────────────────────
 
-/// Transcoder-A registers of `intel_vrr_regs.h` and `intel_display_regs.h`.
-pub(crate) const TRANS_VRR_CTL_A: u64 = 0x60420;
-pub(crate) const TRANS_VRR_VMAX_A: u64 = 0x60424;
-pub(crate) const TRANS_VRR_STATUS_A: u64 = 0x6042c;
-pub(crate) const TRANS_VRR_VMIN_A: u64 = 0x60434;
-pub(crate) const TRANS_VRR_FLIPLINE_A: u64 = 0x60438;
-pub(crate) const TRANS_VRR_VSYNC_A: u64 = 0x60078;
-pub(crate) const TRANS_PUSH_A: u64 = 0x60a70;
-pub(crate) const EMP_AS_SDP_TL_A: u64 = 0x60204;
+/// Transcoder-A registers that are not expressed by the generic VRR offsets.
 pub(crate) const TRANS_SET_CONTEXT_LATENCY_A: u64 = 0x6007c;
 pub(crate) const DP_MIN_HBLANK_CTL_A: u64 = 0x600ac;
 pub(crate) const VRR_CTL_VRR_ENABLE: u32 = 1 << 31;
@@ -693,23 +725,38 @@ pub(crate) fn vrr_guardband_for(
     vrr_guardband(mode, latency, dsc.is_some(), num_scalers(io)?).ok_or(IpError::NoDevice)
 }
 
-/// `intel_vrr_transcoder_disable` → `intel_vrr_tg_disable` for the old
-/// state read back (`intel_vrr_get_config`: VRR is possible when
-/// `VRR_CTL_FLIP_LINE_EN` is set): `TRANS_VRR_CTL` keeps only the flip
-/// line enable and the old guardband, `VRR_STATUS_VRR_EN_LIVE` clears
-/// within 1 s, then `TRANS_PUSH` is cleared.
-pub(crate) fn tg_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
-    let ctl = read(io, TRANS_VRR_CTL_A)?;
+/// `intel_vrr_transcoder_disable` → `intel_vrr_tg_disable` for `trans`'s
+/// old state read back (`intel_vrr_get_config`: VRR is possible when
+/// `VRR_CTL_FLIP_LINE_EN` is set): `TRANS_VRR_CTL` keeps only the flip-line
+/// enable and old guardband, `VRR_STATUS_VRR_EN_LIVE` clears within 1 s,
+/// then `TRANS_PUSH` is cleared.
+pub(crate) fn tg_disable_for(
+    io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
+) -> Result<(), IpError> {
+    let base = trans.base();
+    let ctl = read(io, base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET)?;
     if ctl & VRR_CTL_FLIP_LINE_EN == 0 {
         return Ok(());
     }
     io.write32(
-        TRANS_VRR_CTL_A,
+        base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET,
         VRR_CTL_FLIP_LINE_EN | (ctl & VRR_CTL_GUARDBAND_MASK),
     );
-    wait(io, TRANS_VRR_STATUS_A, VRR_STATUS_VRR_EN_LIVE, 0, 1_000_000)?;
-    io.write32(TRANS_PUSH_A, 0);
+    wait(
+        io,
+        base + crate::intel_gpu_vrr::TRANS_VRR_STATUS_OFFSET,
+        VRR_STATUS_VRR_EN_LIVE,
+        0,
+        1_000_000,
+    )?;
+    io.write32(base + crate::intel_gpu_vrr::TRANS_PUSH_OFFSET, 0);
     Ok(())
+}
+
+/// [`tg_disable_for`] on the owned Pipe-A panel.
+pub(crate) fn tg_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), IpError> {
+    tg_disable_for(io, crate::intel_gpu_vrr::VrrTranscoder::A)
 }
 
 /// `TRANS_VTOTAL` on display 30: `intel_vrr_always_use_vrr_tg` makes
@@ -719,31 +766,45 @@ pub(crate) const fn trans_vtotal(mode: &Mode) -> u32 {
     (mode.v_active as u32).saturating_sub(1) & 0xffff
 }
 
-/// `intel_vrr_set_transcoder_timings` for Pipe A at fixed refresh
+/// `intel_vrr_set_transcoder_timings` for `trans` at fixed refresh
 /// (`intel_vrr_compute_fixed_rr_timings`): `intel_vrr_set_fixed_rr_timings`
 /// writes VMIN/VMAX/FLIPLINE = vtotal - 1 (no display < 13 offsets), then
 /// `TRANS_VRR_VSYNC` (`HAS_AS_SDP`: `vtotal - vsync_end` / `vtotal -
 /// vsync_start`) and `EMP_AS_SDP_TL` (display >= 20: the adaptive-sync
 /// transmission line at `vtotal - vsync_start`). `TRANS_VRR_CTL` is left to
 /// the enable: the timing generator is always used.
-pub(crate) fn program_vrr_timings(
+pub(crate) fn program_vrr_timings_for(
     io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
     mode: &Mode,
 ) -> Result<(), IpError> {
+    let base = trans.base();
     let vtotal = u32::from(mode.v_total);
     if mode.v_sync_end > mode.v_total || mode.v_sync_start > mode.v_sync_end || vtotal == 0 {
         return Err(IpError::NoDevice);
     }
     let vsync_start = vtotal - u32::from(mode.v_sync_start);
     let vsync_end = vtotal - u32::from(mode.v_sync_end);
-    io.write32(TRANS_VRR_VMIN_A, vtotal - 1);
-    io.write32(TRANS_VRR_VMAX_A, vtotal - 1);
-    io.write32(TRANS_VRR_FLIPLINE_A, vtotal - 1);
     io.write32(
-        TRANS_VRR_VSYNC_A,
+        base + crate::intel_gpu_vrr::TRANS_VRR_VMIN_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_VMAX_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_FLIPLINE_OFFSET,
+        vtotal - 1,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_VSYNC_OFFSET,
         ((vsync_end & 0x1fff) << 16) | (vsync_start & 0x1fff),
     );
-    io.write32(EMP_AS_SDP_TL_A, vsync_start & 0x1fff);
+    io.write32(
+        base + crate::intel_gpu_vrr::EMP_AS_SDP_TL_OFFSET,
+        vsync_start & 0x1fff,
+    );
     if io.display_access_ok() {
         Ok(())
     } else {
@@ -751,13 +812,29 @@ pub(crate) fn program_vrr_timings(
     }
 }
 
+/// [`program_vrr_timings_for`] on the owned Pipe-A panel.
+pub(crate) fn program_vrr_timings(
+    io: &(impl MmioWindow + ?Sized),
+    mode: &Mode,
+) -> Result<(), IpError> {
+    program_vrr_timings_for(io, crate::intel_gpu_vrr::VrrTranscoder::A, mode)
+}
+
 /// `intel_vrr_transcoder_enable` → `intel_vrr_tg_enable` (no CMRR):
 /// `TRANS_PUSH` = `TRANS_PUSH_EN`, then `TRANS_VRR_CTL` = enable, flip line
 /// enable and the guardband (`trans_vrr_ctl`, display >= 14).
-pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Result<(), IpError> {
-    io.write32(TRANS_PUSH_A, TRANS_PUSH_EN);
+pub(crate) fn tg_enable_for(
+    io: &(impl MmioWindow + ?Sized),
+    trans: crate::intel_gpu_vrr::VrrTranscoder,
+    guardband: u16,
+) -> Result<(), IpError> {
+    let base = trans.base();
     io.write32(
-        TRANS_VRR_CTL_A,
+        base + crate::intel_gpu_vrr::TRANS_PUSH_OFFSET,
+        TRANS_PUSH_EN,
+    );
+    io.write32(
+        base + crate::intel_gpu_vrr::TRANS_VRR_CTL_OFFSET,
         VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN | u32::from(guardband),
     );
     if io.display_access_ok() {
@@ -765,6 +842,11 @@ pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Resu
     } else {
         Err(IpError::NoDevice)
     }
+}
+
+/// [`tg_enable_for`] on the owned Pipe-A panel.
+pub(crate) fn tg_enable(io: &(impl MmioWindow + ?Sized), guardband: u16) -> Result<(), IpError> {
+    tg_enable_for(io, crate::intel_gpu_vrr::VrrTranscoder::A, guardband)
 }
 
 fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, IpError> {

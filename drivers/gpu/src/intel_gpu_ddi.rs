@@ -47,6 +47,8 @@ pub enum Ddi {
     G = 6,
     /// DDI H / TC5.
     H = 7,
+    /// DDI I / TC6 (Tiger Lake only among the qualified Gen12 families).
+    I = 8,
 }
 
 impl Ddi {
@@ -206,6 +208,7 @@ impl TryFrom<u8> for Ddi {
             5 => Ddi::F,
             6 => Ddi::G,
             7 => Ddi::H,
+            8 => Ddi::I,
             _ => return Err(()),
         })
     }
@@ -222,6 +225,9 @@ pub mod tests {
         }
         if Ddi::B.base() != 0x64100 {
             return TestResult::Fail("DDI B base wrong");
+        }
+        if Ddi::I.base() != 0x64800 || Ddi::try_from(8) != Ok(Ddi::I) {
+            return TestResult::Fail("DDI I / TC6 identity wrong");
         }
         TestResult::Pass
     }

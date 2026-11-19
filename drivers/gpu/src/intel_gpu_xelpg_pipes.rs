@@ -1,4 +1,4 @@
-//! Display-14.00 Pipe B–D owner for the external outputs.
+//! Display-14/20/30 Pipe B–D owner for the external outputs.
 //!
 //! The owned Pipe-A panel is adopted, never stopped or replaned; this
 //! owner adds and removes Pipes B–D around it. Its caller is the MTL
@@ -22,7 +22,7 @@
 //!    `intel_vrr_set_transcoder_timings`, `TRANS_MULT`,
 //!    `hsw_set_frame_start_delay`, `hsw_set_transconf`),
 //!    `intel_color_modeset` (the owned RGB bypass), `hsw_set_linetime_wm`,
-//!    `icl_set_pipe_chicken` and the display-14 no-DPT plane chicken
+//!    `icl_set_pipe_chicken` and, on display 14 only, the no-DPT plane chicken
 //!    (`intel_pre_update_crtc` → `intel_dpt_configure`), pipe off.
 //! 4. The caller enables `TRANS_DDI_FUNC_CTL`; [`Pipes::enable`] is
 //!    `intel_enable_transcoder` (`TRANSCONF` with its STATE ack).
@@ -49,11 +49,12 @@ use crate::intel_gpu_pipes::{
     TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET,
     TRANS_VTOTAL_OFFSET,
 };
+use crate::intel_gpu_xe2lpd::DisplayIp;
 use crate::intel_gpu_xelpg_resources::{
     self as res, checked, read, PipeRequest, PlaneRequest, ResourceError, State, PLANES,
 };
 use crate::intel_gpu_xelpg_wm::Tiling;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 /// `PIPE_FRMCOUNT_G4X` relative to the pipe block.
 const FRMCOUNT_OFFSET: u64 = 0x40;
@@ -77,6 +78,7 @@ const PIPE_CHICKEN_OFFSET: u64 = 0x38;
 /// (Display WA #1153), `PIXEL_ROUNDING_TRUNC_FB_PASSTHRU` (Display WA
 /// #1605353570) and `UNDERRUN_RECOVERY_DISABLE_ADLP` (display 13..29).
 pub(crate) const PIPE_CHICKEN_BITS: u32 = (1 << 30) | (1 << 15) | (1 << 7);
+const UNDERRUN_RECOVERY_DISABLE_ADLP: u32 = 1 << 30;
 /// Transcoder-block offsets: `TRANS_VSYNCSHIFT`, `TRANS_MULT`,
 /// `TRANS_SET_CONTEXT_LATENCY`, `TRANS_VRR_CTL` and the display-14
 /// `CHICKEN_TRANS` (`_MTL_CHICKEN_TRANS_A` 0x604e0).
@@ -84,14 +86,12 @@ const TRANS_VSYNCSHIFT_OFFSET: u64 = 0x28;
 const TRANS_MULT_OFFSET: u64 = 0x2c;
 const TRANS_SET_CONTEXT_LATENCY_OFFSET: u64 = 0x7c;
 const TRANS_VRR_CTL_OFFSET: u64 = 0x420;
+/// `DP_MIN_HBLANK_CTL(cpu_transcoder)` on display 30.
+const DP_MIN_HBLANK_CTL_OFFSET: u64 = 0x0ac;
 const CHICKEN_TRANS_OFFSET: u64 = 0x4e0;
 /// `HSW_FRAME_START_DELAY_MASK`; `framestart_delay` is 1, so the field
 /// (`framestart_delay - 1`) is 0.
 const FRAME_START_DELAY_MASK: u32 = 3 << 27;
-/// `CHICKEN_TRANS` `DP_FEC_BS_JITTER_WA` and `DP_DSC_INSERT_SF_AT_EOL_WA`.
-const DP_FEC_BS_JITTER_WA: u32 = 1 << 15;
-const DP_DSC_INSERT_SF_AT_EOL_WA: u32 = 1 << 4;
-
 /// `WM_LINETIME(pipe)`.
 pub(crate) const fn wm_linetime(pipe: Pipe) -> u64 {
     0x45270 + pipe as u64 * 4
@@ -239,13 +239,13 @@ fn wait_conf(io: &(impl MmioWindow + ?Sized), pipe: Pipe, on: bool) -> Result<()
 /// Pipe B–D is reserved; absent means the owned single-pipe layout (or
 /// nothing) is programmed. It is a description, never a proof: every
 /// reader still verifies the hardware against it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     /// The programmed state. Pipe A's primary watermarks are those of the
     /// tiling it scanned out when the owner last transitioned; its cursor
     /// watermarks, every DDB entry and the globals are the linear-baseline
     /// computation, as the KMS owner programs them.
-    pub(crate) state: State,
+    pub(crate) state: Arc<State>,
     /// The GGTT scanout surface of each reserved Pipe B–D primary.
     pub(crate) surfaces: [Option<u32>; 4],
 }
@@ -256,20 +256,27 @@ static LAYOUT: narf_lib::sync::IrqSafeSpinLock<Option<Layout>> =
 
 /// The layout the Pipe B–D owner last programmed (see [`Layout`]).
 pub(crate) fn published_layout() -> Option<Layout> {
-    *LAYOUT.lock()
+    LAYOUT.lock().clone()
+}
+
+fn publish_layout(layout: Option<Layout>) {
+    // The last reader can release the previous DBUF allocation here.
+    // Drop the displaced snapshot after the publication lock is released.
+    let previous = core::mem::replace(&mut *LAYOUT.lock(), layout);
+    drop(previous);
 }
 
 /// Fixtures start from the single-pipe description.
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn reset_published_layout() {
-    *LAYOUT.lock() = None;
+    publish_layout(None);
 }
 
 /// Publish `layout` as programmed (fixtures that program a multi-pipe
 /// register image directly).
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn publish_layout_for_test(layout: Option<Layout>) {
-    *LAYOUT.lock() = layout;
+    publish_layout(layout);
 }
 
 /// The owner's Pipe-A primary tiling read from `PLANE_CTL` (the KMS owner
@@ -290,35 +297,63 @@ fn panel_tiling(io: &(impl MmioWindow + ?Sized)) -> Result<Tiling, PipeEnableErr
 pub(crate) struct Pipes {
     // Keep route, choice and cloned-owner values small while nested planners
     // use their scratch space on the 64 KiB ARM bootstrap stack.
-    state: Option<Box<State>>,
+    state: Option<Arc<State>>,
+    ip: DisplayIp,
+    /// Adjusted vblank start used by display-30 watermark admission. It is
+    /// `vtotal - fixed-refresh VRR-TG guardband` for each owned pipe.
+    vblank_start: [Option<u16>; 4],
     lit: u8,
-    reserved: [Option<ExternalPipe>; 4],
+    reserved: Box<[Option<ExternalPipe>; 4]>,
 }
 
 impl Pipes {
     /// Adopt an already programmed state with the `lit` pipes on. `None`
     /// means nothing is programmed that a lit pipe depends on (every pipe
     /// off): the next reservation is the all-off commit.
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn adopt(state: Option<State>, lit: u8) -> Self {
+        Self::adopt_ip(DisplayIp::Xelpdp, state, lit)
+    }
+
+    /// [`Self::adopt`] for an admitted display IP. A supplied state must
+    /// have been computed for the same register layout.
+    pub(crate) fn adopt_ip(ip: DisplayIp, state: Option<State>, lit: u8) -> Self {
+        debug_assert!(state.as_ref().is_none_or(|state| state.ip == ip));
+        let vblank_start = state.as_ref().map_or([None; 4], |state| state.vblank_start);
         Self {
-            state: state.map(Box::new),
+            state: state.map(Arc::new),
+            ip,
+            vblank_start,
             lit,
-            reserved: [None; 4],
+            reserved: Box::new([None; 4]),
         }
     }
 
     /// Adopt the state of the owned Pipe-A modeset for `mode`, proving it
     /// is what the hardware holds. The primary's tiling is the one Pipe A
     /// scans out (the KMS owner may have flipped to X or Tile4).
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn adopt_panel(
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
     ) -> Result<Self, PipeEnableError> {
-        crate::intel_gpu_display_resources::Profile::capture(io, mode)
+        Self::adopt_panel_ip(io, mode, DisplayIp::Xelpdp)
+    }
+
+    /// [`Self::adopt_panel`] for `ip`'s resource and plane-chicken rules.
+    pub(crate) fn adopt_panel_ip(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        ip: DisplayIp,
+    ) -> Result<Self, PipeEnableError> {
+        crate::intel_gpu_display_resources::Profile::capture_ip(io, mode, ip)
             .map_err(|_| PipeEnableError::Resource(ResourceError::Diverged))?;
         // Only the owned single-pipe layout is adopted: one external route
         // runs at a time, so a lit Pipe B–D here is not this owner's.
-        for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        for pipe in [Pipe::B, Pipe::C, Pipe::D]
+            .into_iter()
+            .take(ip.pipe_count() - 1)
+        {
             if read(io, pipe.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
                 return Err(PipeEnableError::Resource(ResourceError::Diverged));
             }
@@ -327,13 +362,23 @@ impl Pipes {
         // A compressing panel keeps its VDSC term (read back from Pipe A).
         let dsc = crate::intel_gpu_display_resources::pipe_a_dsc(io, mode)
             .map_err(|_| PipeEnableError::Resource(ResourceError::NoDevice))?;
+        let mut vblank_start = [None; 4];
+        if ip.is_display30() {
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
+                .map_err(|_| PipeEnableError::NoDevice)?;
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+                .map_err(|_| PipeEnableError::Unsupported)?;
+            vblank_start[0] = Some(mode.v_total - guardband);
+        }
         let state = Self::compute(
+            ip,
             io,
             &crate::intel_gpu_display_resources::request_dsc(mode, tiling, 0, dsc),
+            vblank_start,
         )?;
         let lit = read(io, Pipe::A.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE)
             == PIPECONF_ENABLE | PIPECONF_STATE;
-        Ok(Self::adopt(Some(state), u8::from(lit)))
+        Ok(Self::adopt_ip(ip, Some(state), u8::from(lit)))
     }
 
     /// Publish what this owner holds programmed for the Pipe-A KMS proofs:
@@ -341,12 +386,12 @@ impl Pipes {
     fn publish(&self) {
         let layout = self
             .state
-            .as_deref()
+            .as_ref()
             .filter(|s| s.requests[1..].iter().any(Option::is_some));
-        *LAYOUT.lock() = layout.map(|state| Layout {
-            state: *state,
+        publish_layout(layout.map(|state| Layout {
+            state: Arc::clone(state),
             surfaces: core::array::from_fn(|p| self.reserved[p].map(|ext| ext.surface)),
-        });
+        }));
     }
 
     /// Pipe A belongs to the panel's KMS owner, which turns it off and on
@@ -382,7 +427,7 @@ impl Pipes {
         let tiling = panel_tiling(io)?;
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
-        self.state = Some(Box::new((*state).retile(0, tiling, &latency)?));
+        self.state = Some(Arc::new(state.retile(0, tiling, &latency)?));
         Ok(())
     }
 
@@ -399,7 +444,7 @@ impl Pipes {
     ) -> Result<(), PipeEnableError> {
         // Allocate before programming; an uncertain transaction keeps the old
         // snapshot, and successful ownership transfer needs no later allocation.
-        let new = Box::new(new);
+        let new = Arc::new(new);
         match (&self.state, self.lit) {
             (Some(old), lit) if lit != 0 => {
                 crate::intel_gpu_xelpg_live::commit_live(io, old, &new, lit)?
@@ -423,8 +468,10 @@ impl Pipes {
     /// the linear baseline of its primary (the owned modeset's layout),
     /// then that primary retiled to the tiling it actually scans out.
     fn compute(
+        ip: DisplayIp,
         io: &(impl MmioWindow + ?Sized),
         request: &res::Request,
+        vblank_start: [Option<u16>; 4],
     ) -> Result<State, PipeEnableError> {
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
@@ -436,10 +483,10 @@ impl Pipes {
         if let Some(plane) = primary {
             plane.tiling = Tiling::Linear;
         }
-        let state = res::compute(&baseline, &latency)?;
+        let state = res::compute_ip_vblank(ip, &baseline, &latency, vblank_start)?;
         match tiling {
+            Some(Tiling::Linear) | None => Ok(state),
             Some(tiling) => Ok(state.retile(0, tiling, &latency)?),
-            None => Ok(state),
         }
     }
 
@@ -448,9 +495,10 @@ impl Pipes {
         &self,
         io: &(impl MmioWindow + ?Sized),
         ext: &ExternalPipe,
-    ) -> Result<State, PipeEnableError> {
+    ) -> Result<(State, [Option<u16>; 4]), PipeEnableError> {
         let p = ext.pipe as usize;
-        if ext.pipe == Pipe::A
+        if p >= self.ip.pipe_count()
+            || ext.pipe == Pipe::A
             || ext.surface & 0xfff != 0
             || ext.stride_bytes % 64 != 0
             || u32::from(ext.mode.h_active) * 4 > ext.stride_bytes
@@ -471,12 +519,23 @@ impl Pipes {
         }
         // The transaction's hardware precondition: the lit pipes are lit
         // and every other pipe, plane, cursor, DSB and FBC is idle.
-        if fresh.lit != 0 {
-            crate::intel_gpu_xelpg_live::check_pipes(io, fresh.lit)?;
-        } else {
-            res::require_idle(io)?;
+        crate::intel_gpu_xelpg_live::check_pipes(io, fresh.ip, fresh.lit)?;
+        let mut vblank_start = fresh.vblank_start;
+        if fresh.ip.is_display30() {
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(io)
+                .map_err(|_| PipeEnableError::NoDevice)?;
+            let guardband =
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(io, &ext.mode, ext.dsc, &latency)
+                    .map_err(|_| PipeEnableError::Unsupported)?;
+            vblank_start[p] = Some(ext.mode.v_total - guardband);
         }
-        Self::compute(io, &fresh.request_with(|r| r.pipes[p] = Some(request(ext))))
+        Self::compute(
+            fresh.ip,
+            io,
+            &fresh.request_with(|r| r.pipes[p] = Some(request(ext))),
+            vblank_start,
+        )
+        .map(|state| (state, vblank_start))
     }
 
     /// Step 0: admission. Every refusal [`Self::reserve`] can make from the
@@ -499,10 +558,11 @@ impl Pipes {
         ext: &ExternalPipe,
         dmc: &dyn PipeDmc,
     ) -> Result<(), PipeEnableError> {
-        let new = self.check(io, ext)?;
+        let (new, vblank_start) = self.check(io, ext)?;
         self.sync_panel(io)?;
         self.refresh_panel(io)?;
         self.transition(io, new)?;
+        self.vblank_start = vblank_start;
         let p = ext.pipe as usize;
         self.reserved[p] = Some(*ext);
         self.publish();
@@ -559,16 +619,26 @@ impl Pipes {
             crate::intel_gpu_vrr::set_context_latency_for_crtc(pipe as u32 + 1),
         )?;
         checked(io, base + TRANS_VSYNCSHIFT_OFFSET, 0)?;
+        let vtotal = if self.ip.is_display30() {
+            crate::intel_gpu_xe3lpd::trans_vtotal(&ext.mode)
+        } else {
+            trans.vtotal
+        };
         for (off, v) in [
             (TRANS_HTOTAL_OFFSET, trans.htotal),
             (TRANS_HBLANK_OFFSET, trans.hblank),
             (TRANS_HSYNC_OFFSET, trans.hsync),
-            (TRANS_VTOTAL_OFFSET, trans.vtotal),
+            (TRANS_VTOTAL_OFFSET, vtotal),
             // Display 13+ clears VBLANK_START (intel_set_transcoder_timings).
             (TRANS_VBLANK_OFFSET, trans.vblank_display13()),
             (TRANS_VSYNC_OFFSET, trans.vsync),
         ] {
             checked(io, base + off, v)?;
+        }
+        if self.ip.is_display30() {
+            // intel_dp_compute_min_hblank is zero for this qualified 8b/10b
+            // SST route. Display 30 requires the register on every pipe.
+            checked(io, base + DP_MIN_HBLANK_CTL_OFFSET, 0)?;
         }
         checked(io, base + TRANS_VRR_CTL_OFFSET, 0)?;
         checked(io, base + TRANS_MULT_OFFSET, 0)?;
@@ -587,19 +657,56 @@ impl Pipes {
         })?;
         checked(io, wm_linetime(pipe), linetime)?;
         let chicken = read(io, pipe.base() + PIPE_CHICKEN_OFFSET)?;
+        let pipe_chicken = if self.ip.is_display30() {
+            PIPE_CHICKEN_BITS & !UNDERRUN_RECOVERY_DISABLE_ADLP
+        } else {
+            PIPE_CHICKEN_BITS
+        };
         checked(
             io,
             pipe.base() + PIPE_CHICKEN_OFFSET,
-            chicken | PIPE_CHICKEN_BITS,
+            chicken | pipe_chicken,
         )?;
-        // intel_dpt_configure (display 14) for every universal plane: this
-        // driver scans out of the GGTT, never through a DPT.
-        for plane in 0..PLANES as u64 {
-            let r = pipe.base() + PLANE_PRIMARY_OFFSET + plane * 0x100 + PLANE_CHICKEN_OFFSET;
-            let v = read(io, r)?;
-            checked(io, r, v | PLANE_CHICKEN_DISABLE_DPT)?;
+        // intel_dpt_configure: only display 14 has the no-DPT chicken.
+        if self.ip.has_no_dpt_chicken() {
+            for plane in 0..PLANES as u64 {
+                let r = pipe.base() + PLANE_PRIMARY_OFFSET + plane * 0x100 + PLANE_CHICKEN_OFFSET;
+                let v = read(io, r)?;
+                checked(io, r, v | PLANE_CHICKEN_DISABLE_DPT)?;
+            }
         }
         Ok(())
+    }
+
+    /// Display 30's `intel_vrr_transcoder_enable`: after the caller enables
+    /// `TRANS_DDI_FUNC_CTL` and before [`Self::enable`] turns on the
+    /// transcoder, program fixed-refresh VRR timings and start the mandatory
+    /// timing generator. Earlier IPs are a no-op.
+    pub(crate) fn enable_fixed_tg(
+        &self,
+        io: &(impl MmioWindow + ?Sized),
+        pipe: Pipe,
+    ) -> Result<(), PipeEnableError> {
+        let ext = self.reserved(pipe)?;
+        if !self.ip.is_display30() {
+            return Ok(());
+        }
+        let vblank_start = self.vblank_start[pipe as usize].ok_or(PipeEnableError::Unsupported)?;
+        let guardband = ext
+            .mode
+            .v_total
+            .checked_sub(vblank_start)
+            .ok_or(PipeEnableError::Unsupported)?;
+        let trans = match pipe {
+            Pipe::A => return Err(PipeEnableError::Unsupported),
+            Pipe::B => crate::intel_gpu_vrr::VrrTranscoder::B,
+            Pipe::C => crate::intel_gpu_vrr::VrrTranscoder::C,
+            Pipe::D => crate::intel_gpu_vrr::VrrTranscoder::D,
+        };
+        crate::intel_gpu_xe3lpd::program_vrr_timings_for(io, trans, &ext.mode)
+            .map_err(|_| PipeEnableError::NoDevice)?;
+        crate::intel_gpu_xe3lpd::tg_enable_for(io, trans, guardband)
+            .map_err(|_| PipeEnableError::NoDevice)
     }
 
     /// Step 4: `intel_enable_transcoder` (with its display-14
@@ -616,15 +723,12 @@ impl Pipes {
         if self.lit & bit != 0 {
             return Err(PipeEnableError::Busy);
         }
-        // intel_enable_transcoder, display 14: CHICKEN_TRANS clears
-        // DP_DSC_INSERT_SF_AT_EOL_WA and sets DP_FEC_BS_JITTER_WA first.
+        // intel_enable_transcoder: all three IPs clear the DSC insertion
+        // workaround; only display 14 sets the FEC jitter workaround.
         let chicken = pipe.transcoder().base() + CHICKEN_TRANS_OFFSET;
         let v = read(io, chicken)?;
-        checked(
-            io,
-            chicken,
-            (v & !DP_DSC_INSERT_SF_AT_EOL_WA) | DP_FEC_BS_JITTER_WA,
-        )?;
+        let (clear, set) = self.ip.chicken_trans();
+        checked(io, chicken, (v & !clear) | set)?;
         let conf = pipe.base() + PIPECONF_OFFSET;
         let old = read(io, conf)?;
         io.write32(conf, (old & !PIPECONF_STATE) | PIPECONF_ENABLE);
@@ -696,7 +800,8 @@ impl Pipes {
         Ok(())
     }
 
-    /// Step 6b: `intel_disable_transcoder` with its STATE ack.
+    /// Step 6b: `intel_disable_transcoder` with its STATE ack, followed on
+    /// display 30 by `intel_vrr_transcoder_disable` for the mandatory TG.
     pub(crate) fn disable(
         &mut self,
         io: &(impl MmioWindow + ?Sized),
@@ -707,6 +812,16 @@ impl Pipes {
         let old = read(io, conf)?;
         io.write32(conf, old & !(PIPECONF_ENABLE | PIPECONF_STATE));
         wait_conf(io, pipe, false)?;
+        if self.ip.is_display30() {
+            let trans = match pipe {
+                Pipe::A => return Err(PipeEnableError::Unsupported),
+                Pipe::B => crate::intel_gpu_vrr::VrrTranscoder::B,
+                Pipe::C => crate::intel_gpu_vrr::VrrTranscoder::C,
+                Pipe::D => crate::intel_gpu_vrr::VrrTranscoder::D,
+            };
+            crate::intel_gpu_xe3lpd::tg_disable_for(io, trans)
+                .map_err(|_| PipeEnableError::Timeout)?;
+        }
         self.lit &= !(1 << pipe as usize);
         Ok(())
     }
@@ -734,6 +849,8 @@ impl Pipes {
         self.refresh_panel(io)?;
         dmc.disable_pipe(p as u32);
         let request = self.request_with(|r| r.pipes[p] = None);
+        let mut vblank_start = self.vblank_start;
+        vblank_start[p] = None;
         if request.pipes.iter().all(Option::is_none) {
             // Every pipe is off: the post-plane steps of that commit lower
             // DBUF, CDCLK and PM demand to the all-off minimum. Best effort:
@@ -741,12 +858,14 @@ impl Pipes {
             // see settle_all_off) and the next reservation is the all-off
             // commit either way.
             self.state = None;
+            self.vblank_start = vblank_start;
             if let Ok(latency) = crate::intel_gpu_xelpg_wm::Latency::read(io) {
-                let _ = res::settle_all_off(io, &latency);
+                let _ = res::settle_all_off_ip(io, self.ip, &latency);
             }
         } else {
-            let new = Self::compute(io, &request)?;
+            let new = Self::compute(self.ip, io, &request, vblank_start)?;
             self.transition(io, new)?;
+            self.vblank_start = vblank_start;
         }
         self.reserved[p] = None;
         self.publish();

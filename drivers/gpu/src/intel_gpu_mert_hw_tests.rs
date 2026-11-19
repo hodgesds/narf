@@ -171,6 +171,7 @@ impl Rig {
         before_stage: impl FnOnce(&Io, &Arena),
     ) -> Self {
         let (inner, arena) = model();
+        inner.0.borrow_mut().profile = Some(GtPlatform::Battlemage);
         inner.0.borrow_mut().regs.extend([
             (0xdfc, 0),
             (0xa188, 2),

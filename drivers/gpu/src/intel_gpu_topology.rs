@@ -40,10 +40,12 @@ impl L3Rule {
     pub(crate) const fn for_platform(platform: GtPlatform) -> Option<Self> {
         Some(match platform {
             GtPlatform::Gen12(_) => Self::XeLp,
-            GtPlatform::Alchemist => Self::Dg2,
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => Self::Dg2,
             GtPlatform::Integrated(Generation::MeteorLake) => Self::XeLpg,
             GtPlatform::Battlemage | GtPlatform::Integrated(Generation::LunarLake) => Self::Xe2,
-            GtPlatform::Integrated(Generation::PantherLake) => Self::Xe3,
+            GtPlatform::NovaLakeS
+            | GtPlatform::WildcatLake
+            | GtPlatform::Integrated(Generation::PantherLake) => Self::Xe3,
             GtPlatform::Integrated(_) => return None,
         })
     }
@@ -606,7 +608,7 @@ impl GtTopology {
             } else {
                 u128::from(mmio.read32(0x9144))
             };
-            if platform.is_ptl() {
+            if platform.is_xe3_lpg() {
                 geometry |= u128::from(mmio.read32(0x9150)) << 32;
                 geometry |= u128::from(mmio.read32(0x9154)) << 64;
                 compute |= u128::from(mmio.read32(0x9148)) << 32;
@@ -714,7 +716,7 @@ impl GtTopology {
         // The XeHP single software slice uses the full32-bit DSS register.
         let (dss_count, subslice_stride) = if self.platform.is_gen12() {
             (6usize, 1usize)
-        } else if self.platform.is_ptl() {
+        } else if self.platform.is_xe3_lpg() {
             (96, 12)
         } else {
             (32, 4)

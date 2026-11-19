@@ -155,6 +155,82 @@ kernel_test_in!(
     smoke_fbc_display14_eligibility_and_console_refusal
 );
 
+fn smoke_fbc_display35_formats_normalizer_and_system_cache() -> TestResult {
+    let lnl_formats = [
+        Format::Xrgb8888,
+        Format::Xbgr8888,
+        Format::Argb8888,
+        Format::Abgr8888,
+        Format::Rgb565,
+    ];
+    let xe3p_formats = [
+        Format::Xrgb16161616,
+        Format::Xbgr16161616,
+        Format::Argb16161616,
+        Format::Abgr16161616,
+        Format::Argb16161616f,
+        Format::Abgr16161616f,
+    ];
+    for format in lnl_formats {
+        if check_plane_for(&Plane { format, ..plane() }, true) != Ok(())
+            || check_plane_display35(&Plane { format, ..plane() }) != Ok(())
+        {
+            return TestResult::Fail("display 20/35 must accept the Lunar format set");
+        }
+    }
+    if check_plane(&Plane {
+        format: Format::Argb8888,
+        ..plane()
+    }) != Err(Refusal::Format)
+    {
+        return TestResult::Fail("display 14 must not inherit display-20 alpha formats");
+    }
+    for format in xe3p_formats {
+        if check_plane_for(&Plane { format, ..plane() }, true) != Err(Refusal::Format)
+            || check_plane_display35(&Plane { format, ..plane() }) != Ok(())
+        {
+            return TestResult::Fail("only display 35 may accept the Xe3P format additions");
+        }
+    }
+    if check_plane_display35(&Plane {
+        format: Format::Other,
+        ..plane()
+    }) != Err(Refusal::Format)
+        || cfb_stride(Format::Argb16161616f, 1920, 1920 * 8) < 1920 * 8
+    {
+        return TestResult::Fail("Display 35 must refuse unknown formats and retain 8-byte cpp");
+    }
+
+    let normalize = PLANE_PIXEL_NORMALIZE_ENABLE | PLANE_PIXEL_NORMALIZE_FACTOR_1_0;
+    if pixel_normalizer_value(Format::Argb16161616f) != normalize
+        || pixel_normalizer_value(Format::Abgr16161616f) != normalize
+        || pixel_normalizer_value(Format::Argb16161616) != 0
+        || pixel_normalizer_value(Format::Xrgb8888) != 0
+        || pixel_normalizer_register(0, 0) != Some(0x701A8)
+        || pixel_normalizer_register(0, 2) != Some(0x703A8)
+        || pixel_normalizer_register(3, 2) != Some(0x733A8)
+        || pixel_normalizer_register(4, 0).is_some()
+        || pixel_normalizer_register(0, 3).is_some()
+    {
+        return TestResult::Fail("Display-35 FBC pixel-normalizer image diverges");
+    }
+
+    let config = display35_fbc_sys_cache_config(0x0ABC_D000);
+    if XE3P_LPD_FBC_SYS_CACHE_USAGE_CFG != 0x1344E0
+        || config != Some(0xABCD_020C)
+        || config.is_some_and(|value| value & FBC_SYS_CACHE_READ_ENABLE != 0)
+        || display35_fbc_sys_cache_config(0x0ABC_D001).is_some()
+        || display35_fbc_sys_cache_config(0x1000_0000).is_some()
+    {
+        return TestResult::Fail("Display-35 FBC system-cache image or bounds diverge");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_fbc",
+    smoke_fbc_display35_formats_normalizer_and_system_cache
+);
+
 fn smoke_fbc_cfb_geometry_and_compression_limit() -> TestResult {
     // 2880 x 4 = 11520: ALIGN(11520, 512) = 11776; the minimum is
     // ALIGN(11520 + 64, 512) = 11776. Override: 11776 * 4 / 64 = 736.

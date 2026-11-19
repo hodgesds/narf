@@ -131,11 +131,14 @@ pub(crate) fn bw_info(q: &Qgv) -> Option<[Group; GROUPS]> {
 }
 
 /// `intel_bw_init_hw`'s `sa_info` for `ip`: display 30.00 takes
-/// `xe3lpd_sa_info`, whose only difference from `mtl_sa_info` is
-/// `deprogbwlimit` (65 GB/s instead of 38).
+/// `xe3lpd_sa_info` (65 GB/s) and display 30.02 takes
+/// `xe3lpd_3002_sa_info` (22 GB/s), against `mtl_sa_info`'s 38 GB/s.
 const fn deprogbwlimit_gbps(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> i64 {
     match ip {
         crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS,
+        crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => {
+            crate::intel_gpu_xe3lpd::WCL_DEPROGBWLIMIT_GBPS
+        }
         _ => DEPROGBWLIMIT_GBPS,
     }
 }
@@ -210,6 +213,7 @@ pub(crate) fn max_bw_index(
 /// `mtl_find_qgv_points` with SAGV allowed: the QGV peak bandwidth in
 /// 100 MB/s units of the point with the least derated headroom that still
 /// carries `data_rate_mbps`; `None` when no point does.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn qgv_peak_bw(q: &Qgv, data_rate_mbps: u32, num_planes: u32) -> Option<u16> {
     qgv_peak_bw_ip(
         crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,

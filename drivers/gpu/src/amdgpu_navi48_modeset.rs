@@ -5095,7 +5095,7 @@ impl ColdBoot {
             // The last display left: dc_commit_streams with no stream,
             // whose optimize_bandwidth tells PMFW no display is left and
             // lowers UCLK and FCLK with switching allowed.
-            self.release_display_bandwidth().await?;
+            crate::out_of_line::boxed!(self.release_display_bandwidth()).await?;
             return Ok(Vec::new());
         }
         // Already switching under this configuration's P-state plans.
@@ -5119,7 +5119,7 @@ impl ColdBoot {
             return Ok(Vec::new());
         }
         let Some(s) = self.running_pstate(&running, drr)? else {
-            self.pin_display_uclk().await?;
+            crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
             return Ok(Vec::new());
         };
         let mut configs = [None; 4];
@@ -5178,25 +5178,33 @@ impl ColdBoot {
             uclk_pstate: false,
             ..bandwidth
         };
-        self.pin_display_uclk().await?;
+        crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
         self.update_live_display_bandwidth(prepare, false).await?;
         let old: Vec<_> = running.iter().map(|m| m.plan).collect();
         for k in det_update_order(&old, &plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
-            unsafe { self.update_live_display_plan(running[k].pipe, &plans[k], true) }.await?;
+            crate::out_of_line::boxed!(unsafe {
+                self.update_live_display_plan(running[k].pipe, &plans[k], true)
+            })
+            .await?;
         }
-        self.disable_display_fams2().await?;
+        crate::out_of_line::boxed!(self.disable_display_fams2()).await?;
         // Exact watermarks precede the acknowledged firmware configuration
         // and clock relaxation. Hardware-only methods leave FAMS2 disabled.
         for (m, plan) in running.iter_mut().zip(&plans) {
-            // SAFETY: the caller's obligations; the scanout stays live.
-            let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
-            m.plan = d.plan;
-            m.scanout.plan = d.plan;
+            crate::out_of_line::boxed!(async {
+                // SAFETY: the caller owns the display and its scanout stays live.
+                let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
+                m.plan = d.plan;
+                m.scanout.plan = d.plan;
+                Ok::<(), otg::Error>(())
+            })
+            .await?;
             self.modesets.retain(m.clone());
         }
         if let Some(phantom) = &s.phantom {
-            let hw = self.stage_display_subvp(running[0].pipe, phantom).await?;
+            let hw = crate::out_of_line::boxed!(self.stage_display_subvp(running[0].pipe, phantom))
+                .await?;
             configs[0].as_mut().ok_or(otg::Error::Invalid)?.phantom = Some(hw);
         }
         if s.fams2_required {

@@ -437,7 +437,78 @@ kernel_test_in!(
     smoke_mtl_tc_aux_power_well_request_and_busy_refusal
 );
 
-fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
+fn smoke_nvl_lt_aux_power_waits_for_status() -> TestResult {
+    struct LtAux {
+        phy: FakePhy,
+        stuck_status: Option<bool>,
+    }
+    impl LtAux {
+        fn new(stuck_status: Option<bool>) -> Self {
+            Self {
+                phy: FakePhy::new(XeLpgPort::Tc1),
+                stuck_status,
+            }
+        }
+    }
+    impl MmioWindow for LtAux {
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            let value = self.phy.read32(off);
+            if off != XeLpgPort::Tc1.aux_ctl() {
+                return value;
+            }
+            if self
+                .stuck_status
+                .unwrap_or(value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0)
+            {
+                value | XELPDP_AUX_CH_CTL_POWER_STATUS
+            } else {
+                value & !XELPDP_AUX_CH_CTL_POWER_STATUS
+            }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.phy.write32(off, value);
+        }
+    }
+
+    let io = LtAux::new(None);
+    if aux_power_enable(&io, XeLpgPort::Tc1).is_err()
+        || aux_power_requested(&io, XeLpgPort::Tc1) != Ok(true)
+        || aux_power_disable(&io, XeLpgPort::Tc1).is_err()
+        || aux_power_requested(&io, XeLpgPort::Tc1) != Ok(false)
+    {
+        return TestResult::Fail("LT AUX status handshake must complete both transitions");
+    }
+    // The disable read-modify-write clears REQUEST while STATUS still reads high.
+    if io.phy.writes_to(XeLpgPort::Tc1.aux_ctl())
+        != [
+            XELPDP_AUX_CH_CTL_POWER_REQUEST,
+            XELPDP_AUX_CH_CTL_POWER_STATUS,
+        ]
+    {
+        return TestResult::Fail("LT AUX power writes must preserve the observed status");
+    }
+
+    let stuck_off = LtAux::new(Some(false));
+    if aux_power_enable(&stuck_off, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout) {
+        return TestResult::Fail("LT AUX power-up without status must time out");
+    }
+    let stuck_on = LtAux::new(Some(true));
+    if aux_power_enable(&stuck_on, XeLpgPort::Tc1).is_err()
+        || aux_power_disable(&stuck_on, XeLpgPort::Tc1) != Err(TcError::AuxPowerTimeout)
+    {
+        return TestResult::Fail("LT AUX power-down with status still set must time out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_tc",
+    smoke_nvl_lt_aux_power_waits_for_status
+);
+
+fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
     use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL};
 
     struct Display20Tc {
@@ -469,7 +540,9 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
             }
             if off == tcss_ddi_status(self.inner.tc()) {
                 let base = self.inner.read32(off);
-                return base | ((u32::from(self.tcss_pin.get()) & 0xF) << 20);
+                return base
+                    | ((u32::from(self.tcss_pin.get()) & 0xF)
+                        << TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT);
             }
             self.inner.read32(off)
         }
@@ -481,15 +554,51 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
         }
     }
 
+    struct MailboxBusy(Display20Tc);
+    impl MmioWindow for MailboxBusy {
+        fn display_access_ok(&self) -> bool {
+            self.0.display_access_ok()
+        }
+        fn cx0_xe3(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            if off == TCSS_DISP_MAILBOX_IN_CMD {
+                TCSS_DISP_MAILBOX_RUN_BUSY
+            } else {
+                self.0.read32(off)
+            }
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value);
+        }
+    }
+
+    struct NovaTc(Display20Tc);
+    impl MmioWindow for NovaTc {
+        fn display_access_ok(&self) -> bool {
+            self.0.display_access_ok()
+        }
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, off: u64) -> u32 {
+            self.0.read32(off)
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value);
+        }
+    }
+
     let io = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D);
     // Keep PORT_TX_DFLEXPA1 distinct so only TCSS_DDI_STATUS supplies PIN_ASSIGNMENT_D.
     io.inner.pin.set(PIN_ASSIGNMENT_C);
     io.inner.pica_isr.set(pica_dp_alt_hotplug(0));
-    let conn = match connect_for(&io, XeLpgPort::Tc1, false, 2, true) {
+    let conn = match connect_for(&io, XeLpgPort::Tc1, false, 2, TcDisplayProfile::Xe2Lpd) {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("Display 20 TC DP-alt connect_for must succeed"),
     };
-    if !conn.display20
+    if conn.profile != TcDisplayProfile::Xe2Lpd
         || conn.pin_assignment != PIN_ASSIGNMENT_D
         || conn.max_lanes != 2
         || io.pica_req.get() & PICA_POWER_REQUEST == 0
@@ -500,7 +609,7 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
         return TestResult::Fail("Display 20 TC disconnect must drop PICA_PW_CTL");
     }
     // Rollback on insufficient lanes must also drop PICA_PW_CTL.
-    if connect_for(&io, XeLpgPort::Tc1, false, 4, true)
+    if connect_for(&io, XeLpgPort::Tc1, false, 4, TcDisplayProfile::Xe2Lpd)
         != Err(TcError::InsufficientLanes {
             max: 2,
             required: 4,
@@ -509,9 +618,52 @@ fn smoke_display20_tc_pica_and_tcss_pin_assignment() -> TestResult {
     {
         return TestResult::Fail("Display 20 TC failure rollback must drop PICA_PW_CTL");
     }
+
+    let busy = MailboxBusy(Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_D));
+    busy.0.inner.pica_isr.set(pica_dp_alt_hotplug(0));
+    if connect_for(&busy, XeLpgPort::Tc1, false, 2, TcDisplayProfile::Xe3Lpd)
+        != Err(TcError::TcssMailboxTimeout)
+        || busy.0.pica_req.get() & PICA_POWER_REQUEST != 0
+        || !busy.0.inner.buf_writes().is_empty()
+    {
+        return TestResult::Fail("Display 30 busy mailbox must refuse before TCSS request");
+    }
+
+    let nova = NovaTc(Display20Tc::new(XeLpgPort::Tc2, PIN_ASSIGNMENT_C));
+    nova.0.inner.pica_isr.set(pica_dp_alt_hotplug(1));
+    let nova_conn = match connect_for(&nova, XeLpgPort::Tc2, false, 4, TcDisplayProfile::NovaLakeS)
+    {
+        Ok(conn) => conn,
+        Err(_) => return TestResult::Fail("Nova TC2 must use the exact LT/PICA profile"),
+    };
+    if nova_conn.profile != TcDisplayProfile::NovaLakeS
+        || nova.0.pica_req.get() & PICA_POWER_REQUEST == 0
+        || !nova
+            .0
+            .inner
+            .phy
+            .writes_to(TCSS_DISP_MAILBOX_IN_CMD)
+            .is_empty()
+        || disconnect(&nova, &nova_conn).is_err()
+    {
+        return TestResult::Fail("Nova TC must retain PICA without Display-30 mailbox writes");
+    }
+
+    let crossed = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_C);
+    if connect_for(
+        &crossed,
+        XeLpgPort::Tc1,
+        false,
+        1,
+        TcDisplayProfile::NovaLakeS,
+    ) != Err(TcError::ProfileMismatch)
+        || crossed.pica_req.get() != 0
+    {
+        return TestResult::Fail("Nova profile must refuse a non-LT MMIO view before writes");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_tc",
-    smoke_display20_tc_pica_and_tcss_pin_assignment
+    smoke_display20_tc_pica_pin_and_display30_mailbox
 );

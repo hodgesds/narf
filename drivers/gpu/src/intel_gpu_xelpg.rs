@@ -598,7 +598,7 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         Self {
             mmio,
             port,
-            settle_reset: !mmio.cx0_xe3(),
+            settle_reset: !(mmio.cx0_xe3() || mmio.has_lt_phy()),
             lanes: PhyLaneConfig::NATIVE,
         }
     }

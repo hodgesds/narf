@@ -425,15 +425,19 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
         }
     });
     if matches!(result, TestResult::Pass) {
-        narf_scheduler::block_on(async {
+        // Use block_on_spin here because a quiet keyboard emits no IRQs and
+        // kernel-test runs on BSP with LAPIC timer masked and timer_pump off,
+        // while APs install arm_hrtimer_event globally; halting block_on on
+        // sleep_cycles alone would sleep with no BSP timer IRQ to wake it.
+        narf_scheduler::block_on_spin(async {
             let deadline = narf_time::Deadline::after_ms(200);
             while !deadline.expired() {
                 if hid::pump_all(&c) > 0 {
                     break;
                 }
                 // No class/controller guard survives this self-driven wait.
-                // block_on drives sleep_pumps after direct HID pumping has
-                // returned, so other devices progress without recursive locks.
+                // block_on_spin drives sleep_pumps and hrtimer softirq after
+                // direct HID pumping has returned.
                 narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
             }
         });

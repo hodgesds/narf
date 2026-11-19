@@ -27,7 +27,8 @@
 //!   every MTL AUX well (A, B, TC1–TC4) is the
 //!   `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` bit; without an LT PHY the status
 //!   bit is not a completion signal and the source waits a fixed 600 µs
-//!   after the request (10 µs after release).
+//!   after the request (10 µs after release). Exact Nova/LT windows instead
+//!   wait up to 2 ms for `POWER_STATUS` set and 1 ms for it to clear.
 //!
 //! ## Qualified profile and refusals
 //!
@@ -39,10 +40,15 @@
 //! - The TC-cold block itself (`POWER_DOMAIN_TC_COLD_OFF`) maps to no
 //!   Xe-LPDP power well; the TCSS power request below is the hardware
 //!   side of the block.
+//! - [`TcDisplayProfile`] retains exact Display 14/20/30.00/30.02/35.00
+//!   policy. The MMIO view must agree with its Display-30 and LT-PHY facts
+//!   before any Type-C register access.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use crate::intel_gpu_aux::{MmioWindow, AUX_CTL_SEND_BUSY, XELPDP_AUX_CH_CTL_POWER_REQUEST};
+use crate::intel_gpu_aux::{
+    MmioWindow, AUX_CTL_SEND_BUSY, XELPDP_AUX_CH_CTL_POWER_REQUEST, XELPDP_AUX_CH_CTL_POWER_STATUS,
+};
 use crate::intel_gpu_xelpg::{XeLpgPort, TCSS_POWER_REQUEST, TCSS_POWER_STATE, TC_PHY_OWNERSHIP};
 use crate::intel_gpu_xelpg_hpd::{
     pica_dp_alt_hotplug, pica_tbt_hotplug, sde_tc_hotplug, PICA_ISR, SDE_ISR,
@@ -54,8 +60,8 @@ pub const fn tcss_ddi_status(tc: u8) -> u64 {
 }
 /// `TCSS_DDI_STATUS_READY`.
 pub const TCSS_DDI_STATUS_READY: u32 = 1 << 2;
-/// `TCSS_DDI_STATUS_PIN_ASSIGNMENT_MASK` (`GENMASK(23, 20)` on Display >= 20).
-pub const TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT: u32 = 20;
+/// `TCSS_DDI_STATUS_PIN_ASSIGNMENT_MASK` (`GENMASK(28, 25)` on Display >= 20).
+pub const TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT: u32 = 25;
 /// `_FIA(fia)` for the modular-FIA instance housing `tc`
 /// (`tc_phy_load_fia_params(tc, true)`: FIA = tc / 2).
 pub const fn fia_base(tc: u8) -> u64 {
@@ -87,6 +93,12 @@ pub const PIN_ASSIGNMENT_E: u8 = 5;
 const PHY_READY_TIMEOUT_NS: u64 = 500_000_000;
 /// `xelpdp_tc_phy_wait_for_tcss_power`: 5 ms.
 const TCSS_POWER_TIMEOUT_NS: u64 = 5_000_000;
+/// Wa_14020908590 mailbox idle/completion timeout: 10 ms.
+const TCSS_MAILBOX_TIMEOUT_NS: u64 = 10_000_000;
+/// `TCSS_DISP_MAILBOX_IN_CMD` and `TCSS_DISP_MAILBOX_IN_DATA`.
+pub(crate) const TCSS_DISP_MAILBOX_IN_CMD: u64 = 0x16_1300;
+pub(crate) const TCSS_DISP_MAILBOX_IN_DATA: u64 = 0x16_1304;
+pub(crate) const TCSS_DISP_MAILBOX_RUN_BUSY: u32 = 1 << 31;
 /// `xelpdp_aux_power_well_enable`: fixed 600 µs after the request.
 const AUX_POWER_UP_NS: u64 = 600_000;
 /// `xelpdp_aux_power_well_disable`: 10 µs after the release.
@@ -137,6 +149,10 @@ pub enum TcError {
     PhyNotReady,
     /// TCSS power did not reach the requested state in 5 ms.
     TcssPowerTimeout,
+    /// Display-30 Wa_14020908590's TCSS mailbox remained busy.
+    TcssMailboxTimeout,
+    /// The caller's display profile does not match the exact MMIO view.
+    ProfileMismatch,
     /// The DP-alt live status dropped during connect.
     SuddenDisconnect,
     /// The pin assignment carries fewer lanes than required.
@@ -148,6 +164,45 @@ pub enum TcError {
     },
     /// A foreign AUX transaction is in flight on this port.
     AuxBusy,
+    /// An LT-PHY AUX power-status transition missed its source timeout.
+    AuxPowerTimeout,
+    /// The Nova DP-alt path found an existing PICA or TCSS owner.
+    PortBusy,
+    /// The port does not report live native DP alternate mode.
+    DpAltUnavailable,
+}
+
+/// Exact display-family policy for the shared Xe-LPDP Type-C owner.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TcDisplayProfile {
+    /// Display 14.00: no PICA well, FIA pin assignment, no mailbox WA.
+    XeLpdp,
+    /// Display 20.00: PICA well and TCSS pin assignment.
+    Xe2Lpd,
+    /// Display 30.00: Display-20 rules plus Wa_14020908590.
+    Xe3Lpd,
+    /// Display 30.02: exact WCL identity with the same mailbox WA.
+    WildcatLake,
+    /// Display 35.00: PICA/TCSS rules, LT PHY, no Display-30 mailbox WA.
+    NovaLakeS,
+}
+
+impl TcDisplayProfile {
+    const fn uses_pica(self) -> bool {
+        !matches!(self, Self::XeLpdp)
+    }
+
+    const fn mailbox_wa(self) -> bool {
+        matches!(self, Self::Xe3Lpd | Self::WildcatLake)
+    }
+
+    fn validate<M: MmioWindow + ?Sized>(self, io: &M) -> Result<(), TcError> {
+        if io.cx0_xe3() != self.mailbox_wa() || io.has_lt_phy() != matches!(self, Self::NovaLakeS) {
+            Err(TcError::ProfileMismatch)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A connected (display-owned) Type-C PHY.
@@ -165,8 +220,8 @@ pub struct TcConnection {
     pub pin_assignment: u8,
     /// Maximum DP lanes this connection provides.
     pub max_lanes: u8,
-    /// Display >= 20 (`LunarLake` / `PantherLake`) PICA + TCSS pin-assignment path.
-    pub display20: bool,
+    /// Exact display-family policy retained through disconnect.
+    pub profile: TcDisplayProfile,
 }
 
 fn read_checked<M: MmioWindow + ?Sized>(io: &M, off: u64) -> Result<u32, TcError> {
@@ -274,15 +329,14 @@ pub fn pin_assignment<M: MmioWindow + ?Sized>(io: &M, tc: u8) -> Result<u8, TcEr
     Ok(((value >> pin_assignment_shift(tc)) & 0xF) as u8)
 }
 
-/// `get_pin_assignment` for `display20`: Display >= 20 (`Xe2_LPD` / `Xe3_LPD`)
-/// reads the pin assignment from `TCSS_DDI_STATUS(tc)` bits 23:20 rather
-/// than FIA `PORT_TX_DFLEXPA1`.
+/// `get_pin_assignment`: Display >= 20 profiles read the pin assignment from
+/// `TCSS_DDI_STATUS(tc)` bits 28:25 rather than FIA `PORT_TX_DFLEXPA1`.
 pub fn pin_assignment_for<M: MmioWindow + ?Sized>(
     io: &M,
     tc: u8,
-    display20: bool,
+    profile: TcDisplayProfile,
 ) -> Result<u8, TcError> {
-    if display20 {
+    if profile.uses_pica() {
         let value = read_checked(io, tcss_ddi_status(tc))?;
         Ok(((value >> TCSS_DDI_STATUS_PIN_ASSIGNMENT_SHIFT) & 0xF) as u8)
     } else {
@@ -361,13 +415,41 @@ const fn default_mode(legacy_port: bool) -> TcMode {
     }
 }
 
+/// Display-30 Wa_14020908590: serialize TCSS power-request changes through
+/// the display mailbox before touching `XELPDP_TCSS_POWER_REQUEST`.
+fn display30_tcss_power_request_wa<M: MmioWindow + ?Sized>(
+    io: &M,
+    enable: bool,
+) -> Result<(), TcError> {
+    let idle = poll_until(io, TCSS_MAILBOX_TIMEOUT_NS, || {
+        Ok(read_checked(io, TCSS_DISP_MAILBOX_IN_CMD)? & TCSS_DISP_MAILBOX_RUN_BUSY == 0)
+    })?;
+    if !idle {
+        return Err(TcError::TcssMailboxTimeout);
+    }
+    io.write32(TCSS_DISP_MAILBOX_IN_DATA, u32::from(enable));
+    compiler_fence(Ordering::SeqCst);
+    io.write32(TCSS_DISP_MAILBOX_IN_CMD, TCSS_DISP_MAILBOX_RUN_BUSY | 1);
+    compiler_fence(Ordering::SeqCst);
+    let complete = poll_until(io, TCSS_MAILBOX_TIMEOUT_NS, || {
+        Ok(read_checked(io, TCSS_DISP_MAILBOX_IN_CMD)? & TCSS_DISP_MAILBOX_RUN_BUSY == 0)
+    })?;
+    if complete {
+        Ok(())
+    } else {
+        Err(TcError::TcssMailboxTimeout)
+    }
+}
+
 fn set_tcss_power_request<M: MmioWindow + ?Sized>(
     io: &M,
     port: XeLpgPort,
     enable: bool,
+    profile: TcDisplayProfile,
 ) -> Result<(), TcError> {
-    // `__xelpdp_tc_phy_enable_tcss_power` (the display-30 mailbox WA does
-    // not apply to display 14).
+    if profile.mailbox_wa() {
+        display30_tcss_power_request_wa(io, enable)?;
+    }
     if enable {
         rmw(io, port.buf_ctl1(), 0, TCSS_POWER_REQUEST)
     } else {
@@ -392,8 +474,9 @@ fn enable_tcss_power<M: MmioWindow + ?Sized>(
     tc: u8,
     enable: bool,
     mode: TcMode,
+    profile: TcDisplayProfile,
 ) -> Result<(), TcError> {
-    set_tcss_power_request(io, port, enable)?;
+    set_tcss_power_request(io, port, enable, profile)?;
     let failure = if enable && !poll_until(io, PHY_READY_TIMEOUT_NS, || phy_is_ready(io, tc))? {
         TcError::PhyNotReady
     } else if !wait_tcss_power(io, port, enable)? {
@@ -406,7 +489,7 @@ fn enable_tcss_power<M: MmioWindow + ?Sized>(
     if mode == TcMode::Legacy || !enable {
         return Err(failure);
     }
-    set_tcss_power_request(io, port, false)?;
+    set_tcss_power_request(io, port, false, profile)?;
     let _ = wait_tcss_power(io, port, false)?;
     Err(failure)
 }
@@ -423,6 +506,122 @@ fn take_ownership<M: MmioWindow + ?Sized>(
     }
 }
 
+/// Exclusive, retryable Type-C handoff for the disconnected Nova owner.
+/// Record each request before waiting for its completion so a failed wait
+/// does not lose cleanup authority.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) enum NovaDpAltLease {
+    #[default]
+    Idle,
+    Pica,
+    Tcss,
+    Phy,
+}
+
+impl NovaDpAltLease {
+    pub(crate) fn acquire(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        port: XeLpgPort,
+        required_lanes: u8,
+    ) -> Result<TcConnection, TcError> {
+        use crate::intel_gpu_xe2lpd::{
+            pica_enable, PICA_POWER_REQUEST, PICA_POWER_STATUS, PICA_PW_CTL,
+        };
+
+        let profile = TcDisplayProfile::NovaLakeS;
+        profile.validate(io)?;
+        let tc = port
+            .tc_index()
+            .filter(|tc| *tc < 2)
+            .ok_or(TcError::NotTypeC)?;
+        if *self != Self::Idle
+            || read_checked(io, PICA_PW_CTL)? & (PICA_POWER_REQUEST | PICA_POWER_STATUS) != 0
+        {
+            return Err(TcError::PortBusy);
+        }
+        if TcMode::from_live_mask(live_status_mask(io, tc, false)?) != TcMode::DpAlt {
+            return Err(TcError::DpAltUnavailable);
+        }
+        *self = Self::Pica;
+        pica_enable(io).map_err(|_| TcError::TcssPowerTimeout)?;
+        if read_checked(io, port.buf_ctl1())?
+            & (TCSS_POWER_REQUEST | TCSS_POWER_STATE | TC_PHY_OWNERSHIP)
+            != 0
+        {
+            return Err(TcError::PortBusy);
+        }
+        *self = Self::Tcss;
+        set_tcss_power_request(io, port, true, profile)?;
+        if !poll_until(io, PHY_READY_TIMEOUT_NS, || phy_is_ready(io, tc))? {
+            return Err(TcError::PhyNotReady);
+        }
+        if !wait_tcss_power(io, port, true)? {
+            return Err(TcError::TcssPowerTimeout);
+        }
+        *self = Self::Phy;
+        take_ownership(io, port, true)?;
+        verify_connection(io, port, tc, false, TcMode::DpAlt, required_lanes, profile)
+    }
+
+    pub(crate) fn release(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        port: XeLpgPort,
+    ) -> Result<(), TcError> {
+        let profile = TcDisplayProfile::NovaLakeS;
+        profile.validate(io)?;
+        let tc = port.tc_index().ok_or(TcError::NotTypeC)?;
+        if *self == Self::Phy {
+            take_ownership(io, port, false)?;
+            *self = Self::Tcss;
+        }
+        if *self == Self::Tcss {
+            enable_tcss_power(io, port, tc, false, TcMode::DpAlt, profile)?;
+            *self = Self::Pica;
+        }
+        if *self == Self::Pica {
+            read_checked(io, crate::intel_gpu_xe2lpd::PICA_PW_CTL)?;
+            crate::intel_gpu_xe2lpd::pica_disable(io).map_err(|_| TcError::TcssPowerTimeout)?;
+            *self = Self::Idle;
+        }
+        Ok(())
+    }
+}
+
+fn verify_connection(
+    io: &(impl MmioWindow + ?Sized),
+    port: XeLpgPort,
+    tc: u8,
+    legacy_port: bool,
+    mode: TcMode,
+    required_lanes: u8,
+    profile: TcDisplayProfile,
+) -> Result<TcConnection, TcError> {
+    let pin_assignment = pin_assignment_for(io, tc, profile)?;
+    let max_lanes = max_lane_count(mode, pin_assignment);
+    if mode == TcMode::DpAlt {
+        if live_status_mask(io, tc, legacy_port)? & TcMode::DpAlt.bit() == 0 {
+            return Err(TcError::SuddenDisconnect);
+        }
+        if max_lanes < required_lanes {
+            return Err(TcError::InsufficientLanes {
+                max: max_lanes,
+                required: required_lanes,
+            });
+        }
+    }
+    Ok(TcConnection {
+        port,
+        tc,
+        mode,
+        legacy_port,
+        pin_assignment,
+        max_lanes,
+        profile,
+    })
+}
+
 /// `xelpdp_tc_phy_connect` for one target mode.
 fn connect_mode<M: MmioWindow + ?Sized>(
     io: &M,
@@ -431,7 +630,7 @@ fn connect_mode<M: MmioWindow + ?Sized>(
     legacy_port: bool,
     mode: TcMode,
     required_lanes: u8,
-    display20: bool,
+    profile: TcDisplayProfile,
 ) -> Result<TcConnection, TcError> {
     match mode {
         TcMode::TbtAlt => {
@@ -447,52 +646,28 @@ fn connect_mode<M: MmioWindow + ?Sized>(
                 legacy_port,
                 pin_assignment: PIN_ASSIGNMENT_NONE,
                 max_lanes: 4,
-                display20,
+                profile,
             });
         }
         TcMode::Disconnected => return Err(TcError::TunnelUnavailable),
         TcMode::DpAlt | TcMode::Legacy => {}
     }
-    if display20 {
+    if profile.uses_pica() {
         crate::intel_gpu_xe2lpd::pica_enable(io).map_err(|_| TcError::TcssPowerTimeout)?;
     }
-    if let Err(e) = enable_tcss_power(io, port, tc, true, mode) {
-        if display20 {
+    if let Err(e) = enable_tcss_power(io, port, tc, true, mode, profile) {
+        if profile.uses_pica() {
             let _ = crate::intel_gpu_xe2lpd::pica_disable(io);
         }
         return Err(e);
     }
     if let Err(e) = take_ownership(io, port, true) {
-        if display20 {
+        if profile.uses_pica() {
             let _ = crate::intel_gpu_xe2lpd::pica_disable(io);
         }
         return Err(e);
     }
-    let checked = (|| {
-        let pin = pin_assignment_for(io, tc, display20)?;
-        let max_lanes = max_lane_count(mode, pin);
-        // `tc_phy_verify_legacy_or_dp_alt_mode`.
-        if mode == TcMode::DpAlt {
-            if live_status_mask(io, tc, legacy_port)? & TcMode::DpAlt.bit() == 0 {
-                return Err(TcError::SuddenDisconnect);
-            }
-            if max_lanes < required_lanes {
-                return Err(TcError::InsufficientLanes {
-                    max: max_lanes,
-                    required: required_lanes,
-                });
-            }
-        }
-        Ok(TcConnection {
-            port,
-            tc,
-            mode,
-            legacy_port,
-            pin_assignment: pin,
-            max_lanes,
-            display20,
-        })
-    })();
+    let checked = verify_connection(io, port, tc, legacy_port, mode, required_lanes, profile);
     match checked {
         Ok(conn) => Ok(conn),
         Err(e) => {
@@ -500,7 +675,7 @@ fn connect_mode<M: MmioWindow + ?Sized>(
             // power state to drop (source does not clear the request here).
             take_ownership(io, port, false)?;
             let _ = wait_tcss_power(io, port, false)?;
-            if display20 {
+            if profile.uses_pica() {
                 let _ = crate::intel_gpu_xe2lpd::pica_disable(io);
             }
             Err(e)
@@ -518,18 +693,26 @@ pub fn connect<M: MmioWindow + ?Sized>(
     legacy_port: bool,
     required_lanes: u8,
 ) -> Result<TcConnection, TcError> {
-    connect_for(io, port, legacy_port, required_lanes, false)
+    connect_for(
+        io,
+        port,
+        legacy_port,
+        required_lanes,
+        TcDisplayProfile::XeLpdp,
+    )
 }
 
-/// [`connect`] parameterized by `display20` (Display >= 20 enables `PICA_PW_CTL`
-/// and reads pin assignment from `TCSS_DDI_STATUS`).
+/// [`connect`] parameterized by an exact display-family profile. Display >= 20
+/// profiles enable `PICA_PW_CTL` and read pin assignment from
+/// `TCSS_DDI_STATUS`; only Display 30 runs Wa_14020908590.
 pub fn connect_for<M: MmioWindow + ?Sized>(
     io: &M,
     port: XeLpgPort,
     legacy_port: bool,
     required_lanes: u8,
-    display20: bool,
+    profile: TcDisplayProfile,
 ) -> Result<TcConnection, TcError> {
+    profile.validate(io)?;
     let tc = port.tc_index().ok_or(TcError::NotTypeC)?;
     let mask = live_status_mask(io, tc, legacy_port)?;
     let legacy = fixup_legacy_flag(legacy_port, mask);
@@ -537,7 +720,7 @@ pub fn connect_for<M: MmioWindow + ?Sized>(
         TcMode::Disconnected => default_mode(legacy),
         mode => mode,
     };
-    match connect_mode(io, port, tc, legacy, target, required_lanes, display20) {
+    match connect_mode(io, port, tc, legacy, target, required_lanes, profile) {
         Ok(conn) => Ok(conn),
         Err(TcError::AccessLost) => Err(TcError::AccessLost),
         Err(e) if target != default_mode(legacy) && default_mode(legacy) == TcMode::Legacy => {
@@ -548,7 +731,7 @@ pub fn connect_for<M: MmioWindow + ?Sized>(
                 legacy,
                 TcMode::Legacy,
                 required_lanes,
-                display20,
+                profile,
             )
             .map_err(|_| e)
         }
@@ -558,7 +741,7 @@ pub fn connect_for<M: MmioWindow + ?Sized>(
 
 /// `xelpdp_tc_phy_disconnect` for a display-owned connection: release PHY
 /// ownership, then drop the TCSS power request and wait for it to settle.
-/// On Display >= 20 (`conn.display20`) also drops `PICA_PW_CTL`.
+/// Display >= 20 profiles also drop `PICA_PW_CTL`.
 pub fn disconnect<M: MmioWindow + ?Sized>(io: &M, conn: &TcConnection) -> Result<(), TcError> {
     if conn.mode == TcMode::TbtAlt {
         return if io.display_access_ok() {
@@ -568,8 +751,8 @@ pub fn disconnect<M: MmioWindow + ?Sized>(io: &M, conn: &TcConnection) -> Result
         };
     }
     take_ownership(io, conn.port, false)?;
-    enable_tcss_power(io, conn.port, conn.tc, false, conn.mode)?;
-    if conn.display20 {
+    enable_tcss_power(io, conn.port, conn.tc, false, conn.mode, conn.profile)?;
+    if conn.profile.uses_pica() {
         crate::intel_gpu_xe2lpd::pica_disable(io).map_err(|_| TcError::TcssPowerTimeout)?;
     }
     Ok(())
@@ -589,10 +772,11 @@ pub fn connection_intact<M: MmioWindow + ?Sized>(
         && tcss_power_enabled(io, conn.port)?)
 }
 
-/// `xelpdp_aux_power_well_enable` (no LT PHY): raise
-/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` and wait the fixed 600 µs. A
-/// foreign in-flight transaction (SEND_BUSY) is refused rather than
-/// re-triggered by the read-modify-write.
+/// `xelpdp_aux_power_well_enable`: raise
+/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST`. C10/C20 waits the fixed 600 µs;
+/// exact LT-PHY windows poll `POWER_STATUS` for up to 2 ms. A foreign
+/// in-flight transaction (SEND_BUSY) is refused rather than re-triggered by
+/// the read-modify-write.
 pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Result<(), TcError> {
     let cur = read_checked(io, port.aux_ctl())?;
     if cur & AUX_CTL_SEND_BUSY != 0 {
@@ -600,7 +784,16 @@ pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Resu
     }
     io.write32(port.aux_ctl(), cur | XELPDP_AUX_CH_CTL_POWER_REQUEST);
     compiler_fence(Ordering::SeqCst);
-    delay_ns(AUX_POWER_UP_NS);
+    if io.has_lt_phy() {
+        let ready = poll_until(io, 2_000_000, || {
+            Ok(read_checked(io, port.aux_ctl())? & XELPDP_AUX_CH_CTL_POWER_STATUS != 0)
+        })?;
+        if !ready {
+            return Err(TcError::AuxPowerTimeout);
+        }
+    } else {
+        delay_ns(AUX_POWER_UP_NS);
+    }
     if io.display_access_ok() {
         Ok(())
     } else {
@@ -608,8 +801,8 @@ pub fn aux_power_enable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Resu
     }
 }
 
-/// `xelpdp_aux_power_well_disable` (no LT PHY): drop the request, wait
-/// 10 µs.
+/// `xelpdp_aux_power_well_disable`: drop the request. C10/C20 waits 10 µs;
+/// exact LT-PHY windows poll `POWER_STATUS` clear for up to 1 ms.
 pub fn aux_power_disable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Result<(), TcError> {
     let cur = read_checked(io, port.aux_ctl())?;
     if cur & AUX_CTL_SEND_BUSY != 0 {
@@ -617,7 +810,16 @@ pub fn aux_power_disable<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Res
     }
     io.write32(port.aux_ctl(), cur & !XELPDP_AUX_CH_CTL_POWER_REQUEST);
     compiler_fence(Ordering::SeqCst);
-    delay_ns(AUX_POWER_DOWN_NS);
+    if io.has_lt_phy() {
+        let down = poll_until(io, 1_000_000, || {
+            Ok(read_checked(io, port.aux_ctl())? & XELPDP_AUX_CH_CTL_POWER_STATUS == 0)
+        })?;
+        if !down {
+            return Err(TcError::AuxPowerTimeout);
+        }
+    } else {
+        delay_ns(AUX_POWER_DOWN_NS);
+    }
     if io.display_access_ok() {
         Ok(())
     } else {

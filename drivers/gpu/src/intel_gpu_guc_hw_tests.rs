@@ -1,3 +1,5 @@
+use crate::intel_gpu_exec::vram_clear::fixture_page_shifts;
+
 mod huc_native {
     include!("intel_gpu_huc_hw_tests.rs");
 }
@@ -1792,7 +1794,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     };
                     assert_ne!(stamp, 0);
                     if image.borrow()[1024 + 0x33] != 0 {
-                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
+                        execute_ppgtt_probe(&d, &image.borrow(), &ring, stamp, base, false);
                     } else if tail != 32 {
                         // Hardware context-save for RING_CONTEXT_CONTROL, the
                         // image's first group address (`first`, engine base
@@ -2050,11 +2052,7 @@ fn execute_parallel_join(w: &Window, id: u32) {
     assert!(words[i + 3..].iter().all(|word| *word == 0));
     let mut page = root & 0x0000_3fff_ffff_f000;
     assert_eq!(address & 7, 0);
-    for &shift in if d.profile.is_some_and(GtPlatform::is_headless_integrated) {
-        &[48, 39, 30, 21, 12][..]
-    } else {
-        &[39, 30, 21, 12][..]
-    } {
+    for &shift in fixture_page_shifts(d.profile) {
         let table = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
         // SAFETY: real resident production PPGTT pages remain owned by the
         // group; this independent decoder never dereferences user pointers.
@@ -2378,11 +2376,7 @@ fn execute_copy(w: &Window, base: u32) {
                 0x02800100
             ]
         );
-        execute_copy_ppgtt(
-            root,
-            &words[7..],
-            d.profile.is_some_and(GtPlatform::is_headless_integrated),
-        );
+        execute_copy_ppgtt(root, &words[7..], d.profile);
     } else if tail != 32 {
         let seed_at = if gen12 {
             assert_eq!(
@@ -2477,14 +2471,10 @@ fn execute_copy(w: &Window, base: u32) {
 
 // Walk the production page tables for a copy job: an optional PPGTT batch
 // whose literal MI_STORE_DATA_IMM is executed, then an optional user fence.
-fn execute_copy_ppgtt(root: u64, words: &[u32], lnl: bool) {
+fn execute_copy_ppgtt(root: u64, words: &[u32], platform: Option<GtPlatform>) {
     let walk = |va: u64| -> u64 {
         let mut page = root & 0x0000_3fff_ffff_f000;
-        for &shift in if lnl {
-            &[48, 39, 30, 21, 12][..]
-        } else {
-            &[39, 30, 21, 12][..]
-        } {
+        for &shift in fixture_page_shifts(platform) {
             let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
             // SAFETY: the fixture's production tables stay resident until
             // terminal completion; this walk never dereferences user memory.
@@ -2507,7 +2497,9 @@ fn execute_copy_ppgtt(root: u64, words: &[u32], lnl: bool) {
     let mut i = 0;
     if words[0] == 0x18800101 {
         let batch = u64::from(words[1]) | u64::from(words[2]) << 32;
-        if lnl || !crate::intel_gpu_exec::vram_clear::execute_fixture(root, batch) {
+        if platform.is_some_and(GtPlatform::is_headless_integrated)
+            || !crate::intel_gpu_exec::vram_clear::execute_fixture(platform, root, batch)
+        {
             let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
             // SAFETY: translated page is an owned resident batch BO.
             let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
@@ -2535,7 +2527,7 @@ fn execute_copy_ppgtt(root: u64, words: &[u32], lnl: bool) {
 
 // Independent fixed-command device model. It follows the actual production
 // table pages, verifies their PAT/permissions, fetches the private batch via
-// four hardware-style reads and writes the translated destination page.
+// a hardware-style page walk and writes the translated destination page.
 /// Fixture LMEM: CPU physical address of device address zero. PPGTT leaves
 /// with XE_PPGTT_PTE_DM resolve through it, as the GPU reaches local memory.
 static FIXTURE_VRAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -2591,9 +2583,8 @@ fn execute_compute(w: &Window, base: u32) {
             .expect("compute GGTT post-sync immediate")[4]
     };
     if root != 0 {
-        let regs = d.regs.clone();
         execute_ppgtt_probe(
-            &regs,
+            &d,
             &image.borrow(),
             &ring[..tail as usize / 4],
             stamp,
@@ -2621,16 +2612,14 @@ fn execute_compute(w: &Window, base: u32) {
 }
 
 fn execute_ppgtt_probe(
-    regs: &BTreeMap<u64, u32>,
+    device: &Device,
     image: &[u32],
     ring: &[u32],
     id: u32,
     base: u32,
     compute: bool,
 ) {
-    let lnl = regs.get(&0xd8c).is_some_and(|g| {
-        (g >> 22 == 20 && (g >> 14) & 255 == 4) || (g >> 22 == 30 && (g >> 14) & 255 <= 1)
-    });
+    let regs = &device.regs;
     let pat = if regs.get(&0x480c) == Some(&2) {
         3
     } else if regs.get(&0x4808) == Some(&0xf) {
@@ -2650,13 +2639,9 @@ fn execute_ppgtt_probe(
     assert_eq!(root & 0xfff, 3 | table_pat << 3);
     let walk = |va: u64, writable: bool| -> u64 {
         let mut page = root & 0x0000_3fff_ffff_f000;
-        for &shift in if lnl {
-            &[48, 39, 30, 21, 12][..]
-        } else {
-            &[39, 30, 21, 12][..]
-        } {
+        for &shift in fixture_page_shifts(device.profile) {
             let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
-            // SAFETY: this fixture built and retains all four physical tables;
+            // SAFETY: this fixture built and retains all physical table pages;
             // the independent walk never uses an external/raw user pointer.
             let entry =
                 unsafe { core::ptr::read_volatile(address.add(((va >> shift) & 511) as usize)) };

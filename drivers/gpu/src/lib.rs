@@ -826,6 +826,8 @@ mod intel_gpu_hwmon;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_lt_phy;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_media_gt_sysfs;
@@ -839,6 +841,10 @@ pub mod intel_gpu_mst;
 pub mod intel_gpu_multipipe;
 #[cfg(feature = "intel")]
 mod intel_gpu_nonpriv;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_nvl_dbuf;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_nvl_resources;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_oa;
 #[cfg(feature = "intel")]
@@ -897,6 +903,8 @@ mod intel_gpu_xe;
 pub(crate) mod intel_gpu_xe2lpd;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xe3lpd;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xe3plpd;
 #[cfg(feature = "intel")]
 mod intel_gpu_xe_query;
 #[cfg(feature = "intel")]

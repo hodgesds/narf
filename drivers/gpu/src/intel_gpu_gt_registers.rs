@@ -104,7 +104,7 @@ mod tests {
         flat: bool,
         live: u32,
     ) -> (Window, RegisterInit) {
-        let modern = platform != GtPlatform::Alchemist;
+        let modern = !platform.is_gen12() && !platform.is_dg2();
         let first = live.trailing_zeros();
         let dss = 0x80000000
             | if modern {
@@ -151,12 +151,15 @@ mod tests {
     }
 
     fn smoke_global_register_dg2_subplatform_vectors() -> TestResult {
-        for (device, g10, g11) in [
-            (0x56a0, true, false),
-            (0x56a5, false, true),
-            (0x56a3, false, false),
+        for (platform, device, g10, g11) in [
+            (GtPlatform::Alchemist, 0x56a0, true, false),
+            (GtPlatform::Alchemist, 0x56a5, false, true),
+            (GtPlatform::Alchemist, 0x56a3, false, false),
+            (GtPlatform::ArcticSoundM, 0x56c0, true, false),
+            (GtPlatform::ArcticSoundM, 0x56c1, false, true),
+            (GtPlatform::ArcticSoundM, 0x56c2, true, false),
         ] {
-            let (w, init) = fixture(GtPlatform::Alchemist, device, 55, 0, false, 1 << 18);
+            let (w, init) = fixture(platform, device, 55, 0, false, 1 << 18);
             w.regs.borrow_mut().insert(0xe7cc, 0x12345678);
             assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
             let r = w.regs.borrow();
@@ -184,6 +187,21 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt_registers",
         smoke_global_register_dg2_subplatform_vectors
+    );
+
+    fn smoke_global_register_dg1_platform_workarounds_are_exact() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let (w, init) = fixture(platform, 0x4905, 10, 0, false, 1 << 5);
+        w.regs.borrow_mut().extend([(0x9528, 0), (0x94e4, 0)]);
+        assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
+        let regs = w.regs.borrow();
+        assert_eq!(regs[&0x9528], 1 << 9);
+        assert_eq!(regs[&0x94e4], 1 << 19);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_global_register_dg1_platform_workarounds_are_exact
     );
 
     fn smoke_global_register_dg2_vram_requires_stable_owned_layout() -> TestResult {
@@ -504,7 +522,7 @@ impl RegisterInit {
         let mut last = None;
         let mut discontiguous = false;
         let live = topology.geometry_dss() | topology.compute_dss();
-        for i in 0..if platform.is_ptl() { 96 } else { 32 } {
+        for i in 0..if platform.is_xe3_lpg() { 96 } else { 32 } {
             if live & (1u128 << i) == 0 {
                 continue;
             }
@@ -607,7 +625,7 @@ impl RegisterInit {
         {
             return Poll::Ready(Err(RegisterError::Identity));
         }
-        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && !self.platform.is_dg2();
         if modern {
             let semaphore = mmio.read32(0xfd0);
             if semaphore == u32::MAX {
@@ -645,7 +663,7 @@ impl RegisterInit {
         selector: u64,
         target: Target,
     ) -> Result<(), RegisterError> {
-        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && !self.platform.is_dg2();
         let (group, instance) = match target {
             Target::Direct | Target::Implicit => return Ok(()),
             Target::Dss => ((self.seed.dss >> 23) & 127, (self.seed.dss >> 16) & 127),
@@ -674,7 +692,7 @@ impl RegisterInit {
         mmio: &impl MmioWindow,
         selector: u64,
     ) -> Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError> {
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             // DG2 SF/SQIDI implicit ranges use instance two. GAM ranges
             // retain their separate hardware-default instance-one selector.
             mmio.write32(0xfd0, 0x02000000);
@@ -684,7 +702,7 @@ impl RegisterInit {
             }
         }
         let mut vram = None;
-        if self.platform == GtPlatform::Alchemist {
+        if self.platform.is_dg2() {
             // 0x4910 is in DG2's GAM implicit-steering range (xe_gt_mcr.c),
             // independent of the explicit MCR selector. Read all layout
             // words twice; an absent layout merely withholds VRAM while the
@@ -822,6 +840,10 @@ impl RegisterInit {
                 add(0x20ec, 2, 2, true, Direct);
                 add(0xe18c, 0x8001, 0x8001, true, Dss);
                 add(0x20e0, 0x4000, 0x4000, true, Direct);
+                if family == crate::intel_gpu_gt::Gen12Platform::Dg1 {
+                    add(0x9528, 1 << 9, 1 << 9, false, Dss); // 1409420604
+                    add(0x94e4, 1 << 19, 1 << 19, false, Direct); // 1408615072
+                }
                 if matches!(
                     family,
                     crate::intel_gpu_gt::Gen12Platform::TigerLake
@@ -830,12 +852,9 @@ impl RegisterInit {
                     add(0x2050, 0x1080, 0x1080, true, Direct);
                 }
             }
-            GtPlatform::Alchemist => {
+            GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
-                if matches!(
-                    self.device,
-                    0x56a0 | 0x56a1 | 0x56a2 | 0x56be | 0x56bf | 0x5690 | 0x5691 | 0x5692
-                ) {
+                if crate::intel_gpu_gt::is_dg2_g10(self.device) {
                     add(0x9434, 0x20000, 0x20000, false, Direct); // 22010523718 G10
                     add(0x9524, 0x10000000, 0x10000000, false, Dss); // 14011006942 G10
                 }
@@ -847,20 +866,7 @@ impl RegisterInit {
                 add(0xb188, 8, 8, false, L3); // blend-fill tuning
                 add(0x8724, 0x40000000, 0x40000000, false, Implicit); // 32B access tuning
                 add(0x20ec, 2, 2, true, Direct); // 18019627453
-                let g11 = matches!(
-                    self.device,
-                    0x56a5
-                        | 0x56a6
-                        | 0x56b0
-                        | 0x56b1
-                        | 0x56ba
-                        | 0x56bb
-                        | 0x56bc
-                        | 0x56bd
-                        | 0x5693
-                        | 0x5694
-                        | 0x5695
-                );
+                let g11 = crate::intel_gpu_gt::is_dg2_g11(self.device);
                 add(
                     0xe7cc,
                     if g11 { 0x048000f0 } else { 0x04800010 },
@@ -891,7 +897,9 @@ impl RegisterInit {
                     }); // Wa_14012342262 forbids readback
                 }
             }
-            _ if self.platform.is_ptl() => {
+            GtPlatform::NovaLakeS
+            | GtPlatform::WildcatLake
+            | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => {
                 // PTL GT lifetime (not hwe.reg_sr / ADS).
                 if self.seed.graphics == 3000 && self.seed.step < 4 {
                     add(0x9454, 0x10, 0x10, false, Direct);

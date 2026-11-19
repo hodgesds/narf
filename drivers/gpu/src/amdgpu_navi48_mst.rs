@@ -2577,7 +2577,7 @@ impl ColdBoot {
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
-            let scanout = self.start_display_scanout(pipe).await?;
+            let scanout = crate::out_of_line::boxed!(self.start_display_scanout(pipe)).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
             self.start_stream_audio(selection, false, encoders).await?;

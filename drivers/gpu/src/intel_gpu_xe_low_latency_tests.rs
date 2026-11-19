@@ -137,9 +137,8 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
     // PXP_TYPE errno. HANG_REPLAY_STATE (3) first vmemdup_user()s
     // xe_gt_lrc_hang_replay_size bytes, three pages for an Xe2 RCS image:
     // NULL and an image one byte short of the user range are -EFAULT, and a
-    // readable one reaches NARF's LINUX-GAP refusal (Linux would create the
-    // queue from it); smoke_xe_exec_queue_extensions_follow_linux_check_order
-    // pins the rest of the chain's order.
+    // readable image is accepted. The extension-order test covers the rest
+    // of the chain.
     for (property, value, error) in [
         (6, 0, FsError::InvalidData),
         (3, 0, FsError::BadAddress),
@@ -156,7 +155,7 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
             Err(error)
         );
     }
-    // A readable hang replay image successfully creates the queue:
+    // A readable hang replay image creates the first queue on this file.
     queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
     let mut ext = [0; 48];
     put32(&mut ext, 16, 3);
@@ -164,6 +163,7 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
     user.wire.store(8192, &ext);
     user.wire.store(64, &8192u64.to_le_bytes());
     assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE), Ok(0));
+    assert_eq!(u32_at(&user.wire.load(64, 48), 20), 1);
     assert_eq!(
         invoke(&file, &info, &user, 0x4028644e),
         Err(FsError::InvalidData)
@@ -219,7 +219,8 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
         .store(false, core::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         create_hint(&file, &info, &user, vm, 1, &[[0, 0, 0, 0]], 1),
-        Ok(1)
+        Ok(2),
+        "the failed copyout must leave the next queue ID available"
     );
     assert_eq!(arena.live_allocations(), before);
     assert_eq!(

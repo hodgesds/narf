@@ -103,8 +103,10 @@ impl EnginePolicy {
                 lnl_pre_b0: false,
                 media_gt: false,
             }),
-            GtPlatform::Alchemist
+            GtPlatform::ArcticSoundM
+            | GtPlatform::Alchemist
             | GtPlatform::Battlemage
+            | GtPlatform::NovaLakeS
             | GtPlatform::Integrated(
                 crate::intel_gpu::Generation::MeteorLake
                 | crate::intel_gpu::Generation::LunarLake
@@ -112,7 +114,7 @@ impl EnginePolicy {
             ) => Ok(Self {
                 engines,
                 gen12: false,
-                ptl: platform.is_ptl(),
+                ptl: platform.is_xe3_lpg(),
                 lnl_pre_b0: platform.is_lnl() && step < 4,
                 media_gt: false,
             }),
@@ -298,6 +300,7 @@ mod tests {
 
     fn smoke_nonpriv_literal_policy_and_inherited_slot_clear() -> TestResult {
         for platform in [
+            GtPlatform::ArcticSoundM,
             GtPlatform::Alchemist,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
             GtPlatform::Battlemage,

@@ -31,6 +31,18 @@
 //! wa_15010685871 (`pll_enable_wa_needed`) does not apply and
 //! Wa_13012396614 (`icl_cdclk_pll_disable`) selects CD2XCLK as the MDCLK
 //! source before the PLL is disabled.
+//! Display 30.02 (Wildcat Lake) uses the same table and programming
+//! functions but `intel_update_max_cdclk` caps admission at 480 MHz;
+//! Wa_13012396614 remains specific to display 30.00.
+//!
+//! Display 35.00 (Nova Lake-S / Xe3P_LPD) is kept outside operational
+//! [`DisplayIp`] dispatch, but its exact `xe3p_lpd_cdclk_table` is modeled
+//! here for the disconnected route: ratio 21 squashed rungs from 151.2 to
+//! 403.2 MHz, then crawl rungs through 787.2 MHz. Its disconnected MDCLK
+//! image uses the widened Xe3P MBUS and DBUF minimum-tracker fields; this is
+//! required because the lowest rung reaches a joined ratio of 12. Linux
+//! selects the same `xe3lpd_cdclk_funcs`; modeling these images grants no
+//! modeset authority.
 //!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
@@ -110,8 +122,230 @@ pub(crate) const TABLE: [Rung; 6] = [
     },
 ];
 
+/// Linux `xe3p_lpd_cdclk_table` for Nova Lake-S display 35.00.
+pub(crate) const NOVA_LAKE_TABLE: [Rung; 31] = [
+    Rung {
+        cdclk_khz: 151_200,
+        ratio: 21,
+        waveform: 0xa4a4,
+    },
+    Rung {
+        cdclk_khz: 176_400,
+        ratio: 21,
+        waveform: 0xaa54,
+    },
+    Rung {
+        cdclk_khz: 201_600,
+        ratio: 21,
+        waveform: 0xaaaa,
+    },
+    Rung {
+        cdclk_khz: 226_800,
+        ratio: 21,
+        waveform: 0xad5a,
+    },
+    Rung {
+        cdclk_khz: 252_000,
+        ratio: 21,
+        waveform: 0xb6b6,
+    },
+    Rung {
+        cdclk_khz: 277_200,
+        ratio: 21,
+        waveform: 0xdbb6,
+    },
+    Rung {
+        cdclk_khz: 302_400,
+        ratio: 21,
+        waveform: 0xeeee,
+    },
+    Rung {
+        cdclk_khz: 327_600,
+        ratio: 21,
+        waveform: 0xf7de,
+    },
+    Rung {
+        cdclk_khz: 352_800,
+        ratio: 21,
+        waveform: 0xfefe,
+    },
+    Rung {
+        cdclk_khz: 378_000,
+        ratio: 21,
+        waveform: 0xfffe,
+    },
+    Rung {
+        cdclk_khz: 403_200,
+        ratio: 21,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 422_400,
+        ratio: 22,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 441_600,
+        ratio: 23,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 460_800,
+        ratio: 24,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 480_000,
+        ratio: 25,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 499_200,
+        ratio: 26,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 518_400,
+        ratio: 27,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 537_600,
+        ratio: 28,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 556_800,
+        ratio: 29,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 576_000,
+        ratio: 30,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 595_200,
+        ratio: 31,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 614_400,
+        ratio: 32,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 633_600,
+        ratio: 33,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 652_800,
+        ratio: 34,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 672_000,
+        ratio: 35,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 691_200,
+        ratio: 36,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 710_400,
+        ratio: 37,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 729_600,
+        ratio: 38,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 748_800,
+        ratio: 39,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 768_000,
+        ratio: 40,
+        waveform: 0xffff,
+    },
+    Rung {
+        cdclk_khz: 787_200,
+        ratio: 41,
+        waveform: 0xffff,
+    },
+];
+
+pub(crate) const NOVA_LAKE_MAX_CDCLK_KHZ: u32 = 787_200;
+
+/// `XE3P_MBUS_TRANSLATION_THROTTLE_MIN_MASK` (display >= 35).
+pub(crate) const NOVA_LAKE_MBUS_THROTTLE_MASK: u32 = 0xf << 13;
+/// `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE_MASK` (display >= 35).
+pub(crate) const NOVA_LAKE_DBUF_MIN_TRACKER_MASK: u32 = 0x1f << 16;
+
+/// `bxt_calc_cdclk` over the disconnected display-35 table.
+pub(crate) fn calc_nova_lake_cdclk(min_khz: u32) -> Option<Rung> {
+    NOVA_LAKE_TABLE
+        .iter()
+        .copied()
+        .find(|rung| rung.cdclk_khz >= min_khz)
+}
+
+/// `bxt_cdclk_ctl` on display 35: like display 30, no CD2X pipe field and
+/// MDCLK sourced from the CDCLK PLL.
+#[cfg(any(test, doc, feature = "kernel-test"))]
+pub(crate) const fn nova_lake_ctl_value() -> u32 {
+    crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+}
+
+/// Display 35 selects `xe3lpd_cdclk_funcs`, whose voltage level is always 0.
+#[cfg(any(test, doc, feature = "kernel-test"))]
+pub(crate) const fn nova_lake_voltage_level(_cdclk_khz: u32) -> u8 {
+    0
+}
+
+/// `intel_mdclk_cdclk_ratio` for a disconnected display-35 rung: MDCLK is
+/// sourced from the CDCLK PLL, so the ratio is `DIV_ROUND_UP(vco, cdclk)`.
+pub(crate) fn nova_lake_mdclk_cdclk_ratio(rung: Rung) -> u32 {
+    (rung.ratio * REF_KHZ).div_ceil(rung.cdclk_khz)
+}
+
+/// `XE3P_MBUS_TRANSLATION_THROTTLE_MIN(ratio - 1)`.
+pub(crate) fn nova_lake_mbus_throttle(ratio: u32) -> u32 {
+    (ratio.saturating_sub(1) << 13) & NOVA_LAKE_MBUS_THROTTLE_MASK
+}
+
+/// `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE(ratio - 1)`, with the ratio doubled
+/// when the MBUS is joined.
+pub(crate) fn nova_lake_dbuf_min_tracker(ratio: u32, joined: bool) -> u32 {
+    let ratio = if joined { ratio * 2 } else { ratio };
+    (ratio.saturating_sub(1) << 16) & NOVA_LAKE_DBUF_MIN_TRACKER_MASK
+}
+
+/// Disconnected display-35 `MBUS_CTL` image over `old`. This models only the
+/// Xe3P throttle field and performs no MMIO.
+pub(crate) fn nova_lake_mbus_ctl(old: u32, rung: Rung) -> u32 {
+    let ratio = nova_lake_mdclk_cdclk_ratio(rung);
+    (old & !NOVA_LAKE_MBUS_THROTTLE_MASK) | nova_lake_mbus_throttle(ratio)
+}
+
+/// Disconnected display-35 `DBUF_CTL_S(slice)` image over `old`. As in the
+/// operational display-20 path, the read-only power-state bit is not written
+/// back; all fields outside the Xe3P minimum tracker are retained.
+pub(crate) fn nova_lake_dbuf_ctl(old: u32, rung: Rung, joined: bool) -> u32 {
+    let ratio = nova_lake_mdclk_cdclk_ratio(rung);
+    (old & !(NOVA_LAKE_DBUF_MIN_TRACKER_MASK | (1 << 30)))
+        | nova_lake_dbuf_min_tracker(ratio, joined)
+}
+
 /// `bxt_calc_cdclk`: the first rung at or above `min_khz`. Linux WARNs and
 /// clamps past the table; the owned transaction refuses instead.
+#[cfg(any(test, doc, feature = "kernel-test"))]
 pub(crate) fn calc_cdclk(min_khz: u32) -> Option<Rung> {
     TABLE.iter().copied().find(|r| r.cdclk_khz >= min_khz)
 }
@@ -121,12 +355,13 @@ fn rung(cdclk_khz: u32) -> Option<Rung> {
 }
 
 /// `intel_init_cdclk_hooks`' table for `ip`: `mtl_cdclk_table` on 14.00,
-/// `xe2lpd_cdclk_table` on display 20 (both `rplu_cdclk_funcs`).
+/// `xe2lpd_cdclk_table` on display 20 (both `rplu_cdclk_funcs`) and
+/// `xe3lpd_cdclk_table` on both display-30 releases.
 pub(crate) fn table(ip: DisplayIp) -> &'static [Rung] {
     match ip {
         DisplayIp::Xelpdp => &TABLE,
         DisplayIp::Xe2Lpd => &crate::intel_gpu_xe2lpd::CDCLK_TABLE,
-        DisplayIp::Xe3Lpd => &crate::intel_gpu_xe3lpd::CDCLK_TABLE,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => &crate::intel_gpu_xe3lpd::CDCLK_TABLE,
     }
 }
 
@@ -135,6 +370,7 @@ pub(crate) const fn max_cdclk_khz(ip: DisplayIp) -> u32 {
     match ip {
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => MAX_CDCLK_KHZ,
         DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::MAX_CDCLK_KHZ,
+        DisplayIp::WildcatLake => crate::intel_gpu_xe3lpd::WCL_MAX_CDCLK_KHZ,
     }
 }
 
@@ -144,7 +380,7 @@ pub(crate) const fn max_cdclk_khz(ip: DisplayIp) -> u32 {
 pub(crate) fn voltage_level_ip(ip: DisplayIp, cdclk_khz: u32) -> u8 {
     match ip {
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => voltage_level(cdclk_khz),
-        DisplayIp::Xe3Lpd => 0,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => 0,
     }
 }
 
@@ -161,7 +397,7 @@ pub(crate) fn calc_cdclk_ip(ip: DisplayIp, min_khz: u32) -> Option<Rung> {
 fn rung_ip(ip: DisplayIp, cdclk_khz: u32) -> Option<Rung> {
     match ip {
         DisplayIp::Xelpdp => rung(cdclk_khz),
-        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
             table(ip).iter().copied().find(|r| r.cdclk_khz == cdclk_khz)
         }
     }
@@ -205,7 +441,9 @@ pub(crate) fn ctl_value_ip(ip: DisplayIp, target: Rung) -> u32 {
     match ip {
         DisplayIp::Xelpdp => ctl_value(target),
         DisplayIp::Xe2Lpd => CD2X_PIPE_NONE | crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
-        DisplayIp::Xe3Lpd => crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
+        DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
+            crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+        }
     }
 }
 
@@ -255,6 +493,7 @@ fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, CdclkError> {
 }
 
 impl Current {
+    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, CdclkError> {
         Self::read_ip(io, DisplayIp::Xelpdp)
     }

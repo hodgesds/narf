@@ -111,8 +111,9 @@ impl ExecRequest {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
-            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
@@ -282,8 +283,24 @@ impl ExecWire {
         u64_at(&self.request, 40) as u32
     }
 
-    pub(crate) fn dr4_fixed_up(&self) -> bool {
-        u32_at(&self.request, 24) == u32::MAX
+    pub(crate) fn resolve_ioctl(
+        self,
+        gem: &GemState,
+        cmd: u32,
+        user: &dyn IoctlContext,
+        address: u64,
+    ) -> Result<ExecRequest, FsError> {
+        let report_dr4 = cmd == abi::GEM_EXECBUFFER2_WR && u32_at(&self.request, 24) == u32::MAX;
+        let request = self.resolve(gem);
+        // i915_gem_check_execbuffer normalizes UXA's DR4 sentinel. Only the
+        // read/write ioctl returns that field to the caller.
+        if report_dr4 {
+            user.write(
+                address.checked_add(24).ok_or(FsError::BadAddress)?,
+                &0u32.to_le_bytes(),
+            )?;
+        }
+        request
     }
 
     pub(crate) fn flags(&self) -> u64 {
@@ -620,8 +637,9 @@ impl ResidentBatch {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
-            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
+            _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
             _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
@@ -650,8 +668,7 @@ impl ResidentBatch {
                 }
                 if object.is_vram()
                     && object.vram_page_size() == 65536
-                    && (platform != GtPlatform::Alchemist
-                        || (m.va | m.offset | m.length) & 65535 != 0)
+                    && (!platform.is_dg2() || (m.va | m.offset | m.length) & 65535 != 0)
                 {
                     return Err(FsError::InvalidData);
                 }
@@ -1004,7 +1021,11 @@ impl PpgttProbeResult {
     /// Call after a successful terminal fence. Check the complete destination
     /// and unchanged code page, including all bytes outside the written word.
     pub fn verify(&self) -> Result<(), FsError> {
-        let mut bytes = [0; 4096];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(PAGE as usize)
+            .map_err(|_| FsError::OutOfMemory)?;
+        bytes.resize(PAGE as usize, 0);
         self.data.read(0, &mut bytes)?;
         for (i, byte) in bytes.iter().enumerate() {
             let expected = if (0x80..0x84).contains(&i) {

@@ -311,8 +311,8 @@ impl Ppgtt {
     }
 
     /// Root level uses the xe numbering: 3 = four levels, 4 = five levels.
-    /// LNL's xe_pci descriptor selects level 4 even with its 48-bit VA limit.
-    /// Existing constructors deliberately retain their four-level contract.
+    /// BMG/LNL/PTL/WCL/NVL-S xe_pci descriptors select level 4 even with their
+    /// 48-bit VA limits. Existing constructors retain their four-level contract.
     pub fn with_root_level<M: PtMemory>(
         mem: &mut M,
         format: PteFormat,

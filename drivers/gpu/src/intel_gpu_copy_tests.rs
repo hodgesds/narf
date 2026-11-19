@@ -35,6 +35,7 @@ fn request(source: &Arc<GemObject>, destination: &Arc<GemObject>, len: u64) -> C
 
 fn smoke_copy_jobs_real_system_ranges_chunking_and_reservations() -> TestResult {
     for (platform, ack) in [
+        (GtPlatform::ArcticSoundM, 0x130044),
         (GtPlatform::Alchemist, 0x130044),
         (GtPlatform::Battlemage, 0xdfc),
     ] {
@@ -150,6 +151,7 @@ fn smoke_copy_jobs_range_alias_cache_and_epoch_refusals() -> TestResult {
         Some(FsError::Unsupported)
     );
     for (platform, ack) in [
+        (GtPlatform::ArcticSoundM, 0x130044),
         (GtPlatform::Alchemist, 0x130044),
         (GtPlatform::Battlemage, 0xdfc),
     ] {
@@ -189,7 +191,7 @@ impl Local {
             (0x108104, 0),
             (
                 0x108100,
-                if platform == GtPlatform::Alchemist {
+                if platform.is_dg2() {
                     bytes + 4 * 1024 * 1024
                 } else {
                     bytes
@@ -213,7 +215,7 @@ impl Local {
         // SAFETY: the same GT-qualified, exclusive fixture BAR remains live
         // until all jobs/BOs have retired and finish() is called.
         let pool = unsafe {
-            if platform == GtPlatform::Alchemist {
+            if platform.is_dg2() {
                 Vram::new_dg2(bar, layout)
             } else {
                 Vram::new(bar, layout)
@@ -264,6 +266,7 @@ impl Local {
 
 fn smoke_copy_jobs_local_upload_copy_readback_and_ccs() -> TestResult {
     for (platform, ack) in [
+        (GtPlatform::ArcticSoundM, 0x130044),
         (GtPlatform::Alchemist, 0x130044),
         (GtPlatform::Battlemage, 0xdfc),
     ] {
@@ -289,7 +292,7 @@ fn smoke_copy_jobs_local_upload_copy_readback_and_ccs() -> TestResult {
             .unwrap();
         finish_copy(&mut gt, &w, &fence, 751);
         let auxiliary: Vec<_> = (0..256).map(|i| (i * 29) as u8).collect();
-        if platform == GtPlatform::Alchemist {
+        if platform.is_dg2() {
             // A previous GPU workload may populate auxiliary state. Local
             // copy must preserve it, rather than clear the destination CCS.
             crate::intel_gpu_exec::vram_clear::fixture_metadata(
@@ -309,7 +312,7 @@ fn smoke_copy_jobs_local_upload_copy_readback_and_ccs() -> TestResult {
         let mut actual = alloc::vec![0; 65536];
         second.read(0, &mut actual).unwrap();
         assert_eq!(actual, pattern);
-        if platform == GtPlatform::Alchemist {
+        if platform.is_dg2() {
             let before = arena.live_allocations();
             assert!(matches!(
                 gt.copy_objects(
@@ -360,7 +363,7 @@ fn smoke_copy_jobs_local_upload_copy_readback_and_ccs() -> TestResult {
         // SAFETY: independent exclusive storage models a foreign card pool;
         // no BO uses it and it is dropped before the frames are released.
         let foreign = unsafe {
-            if platform == GtPlatform::Alchemist {
+            if platform.is_dg2() {
                 Vram::new_dg2(bar, local.pool.layout)
             } else {
                 Vram::new(bar, local.pool.layout)

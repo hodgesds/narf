@@ -74,7 +74,7 @@ pub(super) fn beside_external(
         platform.set(r, v);
     }
     publish_layout_for_test(Some(Layout {
-        state,
+        state: state.clone().into(),
         surfaces: [None, Some(EXT_SURFACE), None, None],
     }));
     (timing, state)
@@ -249,7 +249,7 @@ fn layouts(
 fn add_external(platform: &MockPlatform, single: &res::State, multi: &res::State) {
     crate::intel_gpu_xelpg_live::commit_live(platform, single, multi, 1).unwrap();
     publish_layout_for_test(Some(Layout {
-        state: *multi,
+        state: multi.clone().into(),
         surfaces: [None, Some(EXT_SURFACE), None, None],
     }));
     for (r, v) in [
@@ -461,7 +461,7 @@ fn smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition() -> TestR
         assert_ne!(platform.read32(DSB0_CTRL) & ((1 << 31) | 1), 0);
         // The live transaction refuses an in-flight DSB.
         assert_eq!(
-            crate::intel_gpu_xelpg_live::check_pipes(&platform, 1),
+            crate::intel_gpu_xelpg_live::check_pipes(&platform, single.ip, 1),
             Err(res::ResourceError::Busy)
         );
         // The pass waits for the stream (its engine ticks on each control
@@ -470,7 +470,7 @@ fn smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition() -> TestR
         let mut pass = device.external_pass().unwrap();
         assert_eq!(platform.read32(DSB0_CTRL) & ((1 << 31) | 1), 0);
         assert_eq!(
-            crate::intel_gpu_xelpg_live::check_pipes(&platform, 1),
+            crate::intel_gpu_xelpg_live::check_pipes(&platform, single.ip, 1),
             Ok(())
         );
         platform.step_on_read(Some(FRAME));

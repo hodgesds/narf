@@ -24,8 +24,9 @@
 //! - The bridge `enter_dp_mode()` impl can return early if its own
 //!   Stage-2 work isn't done — the goal here is to land the call
 //!   path, not the full modeset.
-//! - On disconnect (cable yank / explicit DP exit) we eventually
-//!   want a `[notify_dp_exited]`; Stage-1 ships just the entry path.
+//! - On disconnect (cable yank / explicit DP exit),
+//!   [`notify_dp_exited`] retries retained-owner teardown before the
+//!   per-attach state is reset.
 //!
 //! ## Lane assignment per VESA DP Alt 2.0 §6
 //!
@@ -197,7 +198,7 @@ pub trait DpAltModeGpuBridge: Send + Sync + fmt::Debug {
 // ── Registry ───────────────────────────────────────────────────────
 
 /// Process-wide bridge slot. GPU drivers register a single impl from
-/// their Stage::Subsys initcall; the altmode-dp driver consults this
+/// their Stage::Late initcall; the altmode-dp driver consults this
 /// slot when a port reaches Active.
 ///
 /// Multiple GPUs on one machine: the registry holds a small vec so an

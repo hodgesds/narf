@@ -523,6 +523,10 @@ pub mod port {
 pub enum VbtPlatform {
     /// Tiger Lake (display 12, PCH_TGP).
     TigerLake,
+    /// Rocket Lake (display 12; combo PHY A-D map to A/B/TC1/TC2).
+    RocketLake,
+    /// DG1 (discrete display 12; RKL port map, DG1 PCH pin defaults).
+    Dg1,
     /// Alder Lake S / Raptor Lake S (display 12, PCH_ADP).
     AlderLakeS,
     /// Alder Lake P/N, Raptor Lake P/U (display 13, `alderlake_p`).
@@ -538,6 +542,8 @@ impl VbtPlatform {
         use crate::intel_gpu_gt::Gen12Platform;
         match family {
             Gen12Platform::TigerLake => VbtPlatform::TigerLake,
+            Gen12Platform::RocketLake => VbtPlatform::RocketLake,
+            Gen12Platform::Dg1 => VbtPlatform::Dg1,
             Gen12Platform::AlderLakeS => VbtPlatform::AlderLakeS,
             Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => VbtPlatform::AlderLakeP,
         }
@@ -546,7 +552,10 @@ impl VbtPlatform {
     /// `DISPLAY_VER`.
     pub const fn display_ver(self) -> u8 {
         match self {
-            VbtPlatform::TigerLake | VbtPlatform::AlderLakeS => 12,
+            VbtPlatform::TigerLake
+            | VbtPlatform::RocketLake
+            | VbtPlatform::Dg1
+            | VbtPlatform::AlderLakeS => 12,
             VbtPlatform::AlderLakeP => 13,
             VbtPlatform::MeteorLake => 14,
         }
@@ -561,6 +570,7 @@ impl VbtPlatform {
         const TC1_4: u16 = 0xF << port::TC1;
         match self {
             VbtPlatform::TigerLake => A | B | (0x3F << port::TC1),
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 => A | B | (0x3 << port::TC1),
             VbtPlatform::AlderLakeS => A | TC1_4,
             VbtPlatform::AlderLakeP | VbtPlatform::MeteorLake => A | B | TC1_4,
         }
@@ -596,6 +606,13 @@ impl VbtPlatform {
                 HDMIC | DPC => Some(port::TC2),
                 HDMID | DPD => Some(port::TC3),
                 HDMIE | DPE => Some(port::TC4),
+                _ => None,
+            },
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 => match dvo {
+                HDMIA | DPA => Some(port::A),
+                HDMIB | DPB => Some(port::B),
+                HDMIC | DPC => Some(port::TC1),
+                HDMID | DPD => Some(port::TC2),
                 _ => None,
             },
             VbtPlatform::TigerLake => match dvo {
@@ -649,6 +666,13 @@ impl VbtPlatform {
                 E => Some(6),
                 _ => None,
             },
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 => match code {
+                A => Some(0),
+                B => Some(1),
+                D => Some(2),
+                E => Some(3),
+                _ => None,
+            },
             VbtPlatform::TigerLake => match code {
                 A => Some(0),
                 B => Some(1),
@@ -686,6 +710,13 @@ impl VbtPlatform {
                 5 => 12,
                 _ => 0,
             },
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 => match code {
+                1 => 1,
+                2 => 2,
+                3 => 9,
+                4 => 10,
+                _ => 0,
+            },
             VbtPlatform::TigerLake => match code {
                 1 => 1,
                 2 => 2,
@@ -705,6 +736,7 @@ impl VbtPlatform {
     pub const fn gmbus_pin_table(self) -> GmbusPinTable {
         match self {
             VbtPlatform::MeteorLake => GmbusPinTable::Mtp,
+            VbtPlatform::Dg1 => GmbusPinTable::Dg1,
             _ => GmbusPinTable::Icp,
         }
     }
@@ -719,6 +751,7 @@ impl VbtPlatform {
                 5 + port - port::TC1
             }
             VbtPlatform::AlderLakeS if port >= port::TC1 => 1 + port - port::TC1,
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 if port >= port::TC1 => 2 + port - port::TC1,
             _ => port,
         }
     }
@@ -730,7 +763,7 @@ impl VbtPlatform {
         match self {
             VbtPlatform::AlderLakeP | VbtPlatform::MeteorLake => matches!(phy, 5..=8),
             VbtPlatform::TigerLake => matches!(phy, 3..=8),
-            VbtPlatform::AlderLakeS => false,
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 | VbtPlatform::AlderLakeS => false,
         }
     }
 
@@ -750,6 +783,11 @@ impl VbtPlatform {
                 }
             }
             VbtPlatform::MeteorLake => self.port_to_phy(port) + 1,
+            VbtPlatform::Dg1 => self.port_to_phy(port) + 1,
+            // RKL depends on the observed CMP/TGP PCH. This metadata-only
+            // profile has no PCH argument, so withhold a synthetic fallback;
+            // a parsed VBT pin remains available through `map_ddc_pin`.
+            VbtPlatform::RocketLake => 0,
             VbtPlatform::TigerLake | VbtPlatform::AlderLakeP => {
                 if self.port_is_tc(port) {
                     9 + port - port::TC1
@@ -762,7 +800,10 @@ impl VbtPlatform {
 
     /// `default_aux_ch`: `(enum aux_ch)port`.
     pub const fn default_aux_ch(self, port: u8) -> u8 {
-        port
+        match self {
+            VbtPlatform::RocketLake | VbtPlatform::Dg1 if port >= port::TC1 => 2 + port - port::TC1,
+            _ => port,
+        }
     }
 }
 
@@ -1736,10 +1777,11 @@ pub enum VbtInstall {
 }
 
 /// Probe-time discovery and installation (`intel_bios_init`'s place in
-/// probe): Meteor Lake gets [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`]
-/// (ports, legacy Type-C, DDC pins, SSC) or `NO_VBT`, and the Pipe-A eDP
-/// PSR facts ([`crate::intel_gpu_psr::VbtPsr`]); Gen12 gets its HDMI
-/// DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
+/// probe): Meteor, Lunar and Panther Lake get
+/// [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`] (ports,
+/// legacy Type-C, DDC pins, SSC) or `NO_VBT`; Meteor Lake also gets the
+/// Pipe-A eDP PSR facts ([`crate::intel_gpu_psr::VbtPsr`]); Gen12 gets its
+/// HDMI DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
 pub fn install_for_probe(
     generation: crate::intel_gpu::Generation,
     gen12: Option<crate::intel_gpu_gt::Gen12Platform>,
@@ -1748,7 +1790,7 @@ pub fn install_for_probe(
     use crate::intel_gpu::Generation;
     use crate::intel_gpu_xelpg_external::{install_mtl_port_policy, MtlPortPolicy};
     let applicable = match generation {
-        Generation::MeteorLake => true,
+        Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => true,
         Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
         _ => false,
     };
@@ -1789,10 +1831,13 @@ pub fn install_for_probe(
         );
     }
     let ok = match (generation, &found) {
-        (Generation::MeteorLake, Some((vbt, _))) => {
-            install_mtl_port_policy(MtlPortPolicy::from_vbt(vbt))
+        (
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake,
+            Some((vbt, _)),
+        ) => install_mtl_port_policy(MtlPortPolicy::from_vbt(vbt)),
+        (Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake, None) => {
+            install_mtl_port_policy(MtlPortPolicy::NO_VBT)
         }
-        (Generation::MeteorLake, None) => install_mtl_port_policy(MtlPortPolicy::NO_VBT),
         (_, Some((vbt, _))) => match gen12 {
             Some(family) => {
                 install_gen12_ddc(Gen12DdcOverrides::from_vbt(vbt, family));

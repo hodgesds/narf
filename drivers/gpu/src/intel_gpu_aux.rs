@@ -29,8 +29,7 @@
 //!    are little-endian dwords. `byte0..3` -> `data[0][31:0]`
 //!    with `byte0` in `[31:24]` and `byte3` in `[7:0]`.
 //! 2. Write `DDI_AUX_CTL` with the SEND bit, message-size field,
-//!    sync-pulse count (32), and the precharge timer + clock
-//!    divider for the target AUX bit-clock (~1 MHz).
+//!    normal sync length (32 pulses) and fast-wake sync length (18).
 //! 3. Poll SEND_BUSY for clear (transaction complete) or
 //!    `done`/`time-out-error`/`receive-error` flags.
 //! 4. Reply byte count is published in `MSGSIZE` field of
@@ -51,7 +50,8 @@ use core::sync::atomic::{compiler_fence, Ordering};
 // Every Intel AUX user, including independently retained backlight and KMS
 // PSR owners, shares this physical transport exclusion. Try-lock refuses a
 // concurrent/reentrant caller without spinning behind a polled transaction.
-static AUX_TRANSACTION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+// Keep the encoded request here across hardware retries.
+static AUX_TRANSACTION: narf_lib::mutex::Mutex<[u8; 20]> = narf_lib::mutex::Mutex::new([0; 20]);
 
 use crate::dp_aux::{
     decode_response, encode_request, AuxChannel, AuxError, AuxRequest, AuxResponse,
@@ -81,10 +81,10 @@ pub const AUX_CTL_SEND_BUSY: u32 = 1 << 31;
 pub const AUX_CTL_DONE: u32 = 1 << 30;
 /// `[29]` — Interrupt on Done. We poll, so leave clear.
 pub const AUX_CTL_INTERRUPT_ON_DONE: u32 = 1 << 29;
-/// `[27:26]` — Time-Out Timer Value. `00` = 400 µs, `01` = 600 µs,
-/// `10` = 800 µs, `11` = 1600 µs. We use 1600 µs (the most
-/// permissive) to tolerate slow eDP sinks.
-pub const AUX_CTL_TIMEOUT_1600US: u32 = 0b11 << 26;
+/// `[27:26]` selects the maximum hardware timeout, 4 ms on ICL and later.
+pub const AUX_CTL_TIMEOUT_MAX: u32 = 0b11 << 26;
+/// Historical name for the maximum timeout encoding (1.6 ms on SKL–GLK).
+pub const AUX_CTL_TIMEOUT_1600US: u32 = AUX_CTL_TIMEOUT_MAX;
 /// `[28]` — Time-Out Error. RW1C. Set on AUX time-out (no reply
 /// within the configured window).
 pub const AUX_CTL_TIMEOUT_ERROR: u32 = 1 << 28;
@@ -106,39 +106,20 @@ pub const AUX_CTL_RECEIVE_ERROR: u32 = 1 << 25;
 /// died in `read_caps`.
 pub const AUX_CTL_MSGSIZE_SHIFT: u32 = 20;
 pub const AUX_CTL_MSGSIZE_MASK: u32 = 0x1F << AUX_CTL_MSGSIZE_SHIFT;
-/// `[19:16]` — Pre-charge Time. PRM recommends 16 cycles for
-/// reliable signal integrity.
-pub const AUX_CTL_PRECHARGE_16: u32 = 0b1000 << 16;
-/// `[15:11]` — Sync Pulses count. PRM mandates 32 for DP/eDP and
-/// 18 for HDMI's DDC over AUX (we focus on DP here).
-pub const AUX_CTL_SYNC_PULSES_32: u32 = 32 << 16;
-// (NB: the PRM tables show overlap between PRECHARGE and SYNC
-// fields across platforms — see TGL §"DDI_AUX_CTL" for the
-// canonical layout. We pack both into the same dword; the
-// individual bit ranges don't overlap on Gen12.)
 
-/// AUX bit-clock divider, programming the target rate. AUX line
-/// is nominally 1 MHz on DP. The divider value is `(CD_CLK_HZ /
-/// 2_000_000) - 1` where `CD_CLK_HZ` is the core display clock
-/// (typically 38.4 MHz on TGL/ADL, giving a divider of `19 - 1 =
-/// 18`). For Stage 1 we hard-code `2222` — the i915 default for
-/// 24 MHz reference, which works for any chip that hasn't yet
-/// programmed CD_CLK above the boot default.
+// Raw constants exported by earlier drivers. None is a Gen12 timing field.
+#[deprecated(note = "pre-SKL field, reserved on Gen12")]
+pub const AUX_CTL_PRECHARGE_16: u32 = 0b1000 << 16;
+#[deprecated(note = "overlaps message size, use the SKL+ sync fields")]
+pub const AUX_CTL_SYNC_PULSES_32: u32 = 32 << 16;
+#[deprecated(note = "sets TBT_IO on Gen12, use the SKL+ sync fields")]
 pub const AUX_CTL_BITCLK_DIVIDER_DEFAULT: u32 = 2222;
 
-/// Control-word profile for one AUX transport.
-///
-/// `Gen12` is the historical TGL/ADL encoding this transport has always
-/// written (bit-for-bit unchanged). `XeLpdp` is the Meteor Lake source
-/// encoding, `intel_dp_aux.c::skl_get_aux_send_ctl` for display ver 14:
-/// SKL+ sync-pulse fields instead of the pre-SKL precharge/bit-clock
-/// fields, `TBT_IO` only for a Thunderbolt-alt route, and
-/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` preserved on every write ("Power
-/// request bit is already set during aux power well enable. Preserve the
-/// bit across aux transactions.").
+/// Control-word profile for one AUX transport. Both use SKL+ sync fields.
+/// Xe-LPDP also preserves the channel power request across transfers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AuxCtlProfile {
-    /// Historical Gen12 control word.
+    /// Gen12 native AUX on an eDP, DisplayPort or USB-C DP Alt Mode route.
     Gen12,
     /// Xe-LPDP (MTL) control word; `tbt_io` selects the TBT AUX IO.
     XeLpdp {
@@ -161,29 +142,24 @@ const fn aux_fw_sync_pulse_skl(count: u32) -> u32 {
 const fn aux_sync_pulse_skl(count: u32) -> u32 {
     (count - 1) & 0x1F
 }
-/// `intel_dp_aux_sync_len()`: precharge 16 + preamble 16.
-const XELPDP_AUX_SYNC_LEN: u32 = 32;
-/// `intel_dp_aux_fw_sync_len()` without the AUO-panel DPCD quirk:
-/// precharge 10 + preamble 8.
-const XELPDP_AUX_FW_SYNC_LEN: u32 = 18;
-
-/// Build the Xe-LPDP AUX control word for a `send_bytes` request.
-/// `DP_AUX_CH_CTL_INTERRUPT` (bit 29) is deliberately left clear: this
-/// transport polls completion and owns no AUX interrupt consumer.
-pub const fn xelpdp_aux_send_ctl(send_bytes: u32, tbt_io: bool) -> u32 {
-    let mut ctl = AUX_CTL_SEND_BUSY
+// skl_get_aux_send_ctl with the normal 16 + 16 sync pulses and the
+// default 10 + 8 fast-wake pulses. The polled driver leaves IRQs disabled.
+const fn native_aux_send_ctl(send_bytes: u32) -> u32 {
+    AUX_CTL_SEND_BUSY
         | AUX_CTL_DONE
         | AUX_CTL_TIMEOUT_ERROR
-        | AUX_CTL_TIMEOUT_1600US
+        | AUX_CTL_TIMEOUT_MAX
         | AUX_CTL_RECEIVE_ERROR
         | ((send_bytes << AUX_CTL_MSGSIZE_SHIFT) & AUX_CTL_MSGSIZE_MASK)
-        | aux_fw_sync_pulse_skl(XELPDP_AUX_FW_SYNC_LEN)
-        | aux_sync_pulse_skl(XELPDP_AUX_SYNC_LEN)
-        | XELPDP_AUX_CH_CTL_POWER_REQUEST;
-    if tbt_io {
-        ctl |= AUX_CTL_TBT_IO;
-    }
-    ctl
+        | aux_fw_sync_pulse_skl(18)
+        | aux_sync_pulse_skl(32)
+}
+
+/// Build the Xe-LPDP send word while keeping the channel power request asserted.
+pub const fn xelpdp_aux_send_ctl(send_bytes: u32, tbt_io: bool) -> u32 {
+    native_aux_send_ctl(send_bytes)
+        | XELPDP_AUX_CH_CTL_POWER_REQUEST
+        | if tbt_io { AUX_CTL_TBT_IO } else { 0 }
 }
 
 /// Maximum hardware-retry attempts on TIMEOUT / RECEIVE error.
@@ -244,6 +220,13 @@ pub trait MmioWindow {
     fn cx0_xe3(&self) -> bool {
         false
     }
+    /// Whether this exact source platform has Linux's LT PHY. This is a
+    /// platform fact, not a display-version test: current Linux defines
+    /// `HAS_LT_PHY(display)` as `platform.novalake`, while display-30
+    /// Panther/Wildcat Lake still use C10/C20.
+    fn has_lt_phy(&self) -> bool {
+        false
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;
@@ -273,7 +256,7 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     /// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` (bit 19, raised by
     /// `xelpdp_aux_power_well_enable`) is preserved on every write, as
     /// `intel_dp_aux.c::skl_get_aux_send_ctl` does for DISPLAY_VER >= 14.
-    /// Gen12 callers use [`IntelAux::new`], whose word is unchanged.
+    /// Gen12 callers use [`IntelAux::new`] for native AUX.
     pub fn with_base(mmio: &'a M, base: u64) -> Self {
         Self::xelpdp(mmio, base, false)
     }
@@ -351,8 +334,8 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     }
 
     /// Spin until SEND_BUSY clears or 5 ms has elapsed. Returns
-    /// the final DDI_AUX_CTL value. Timeout is 5x the longest
-    /// configured AUX timeout (1600 µs) to absorb slow sinks.
+    /// the final DDI_AUX_CTL value. The software deadline gives the
+    /// controller time to report its 4 ms hardware timeout.
     ///
     /// We can't use `narf_time::Deadline` here because it would
     /// allocate; instead spin on a bounded RDTSC budget. The
@@ -380,15 +363,8 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         ctl
     }
 
-    /// Single-attempt AUX transaction. Returns the raw reply
-    /// bytes (status nibble + payload) for the caller to decode
-    /// via `dp_aux::decode_response`.
-    fn xfer_once(
-        &self,
-        wire: &[u8],
-        expected_reply_payload: usize,
-        reply_buf: &mut [u8],
-    ) -> Result<usize, AuxError> {
+    /// Issue one request and return the byte count in the reply registers.
+    fn xfer_once(&self, wire: &[u8]) -> Result<usize, AuxError> {
         if wire.len() > 20 {
             return Err(AuxError::TooLong);
         }
@@ -409,14 +385,7 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
 
         // Compose the control register: send + msgsize + timing.
         let ctl = match self.profile {
-            AuxCtlProfile::Gen12 => {
-                let msgsize = ((wire.len() as u32) << AUX_CTL_MSGSIZE_SHIFT) & AUX_CTL_MSGSIZE_MASK;
-                AUX_CTL_SEND_BUSY
-                    | msgsize
-                    | AUX_CTL_TIMEOUT_1600US
-                    | AUX_CTL_PRECHARGE_16
-                    | AUX_CTL_BITCLK_DIVIDER_DEFAULT
-            }
+            AuxCtlProfile::Gen12 => native_aux_send_ctl(wire.len() as u32),
             AuxCtlProfile::XeLpdp { tbt_io } => xelpdp_aux_send_ctl(wire.len() as u32, tbt_io),
         };
         self.mmio.write32(self.aux_ctl_off(), ctl);
@@ -436,16 +405,14 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         }
 
         let reply_total = ((final_ctl & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT) as usize;
-        // Reply is 1 status byte + N payload bytes; sanity-check.
-        let expected_total = 1 + expected_reply_payload;
+        // One status byte and at most 16 payload bytes.
         if reply_total == 0 {
             return Err(AuxError::ShortReply);
         }
-        if reply_buf.len() < reply_total {
+        if reply_total > 17 {
             return Err(AuxError::TooLong);
         }
-        let _ = expected_total; // dp_aux's decode_response re-validates.
-        Ok(self.read_data(reply_total, reply_buf))
+        Ok(reply_total)
     }
 }
 
@@ -455,7 +422,7 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         req: &AuxRequest<'_>,
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
-        let _transaction = AUX_TRANSACTION.try_lock().ok_or(AuxError::Deferred)?;
+        let mut wire = AUX_TRANSACTION.try_lock().ok_or(AuxError::Deferred)?;
         let inherited = self.mmio.read32(self.aux_ctl_off());
         if inherited == u32::MAX {
             return Err(AuxError::ShortReply);
@@ -467,8 +434,7 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         }
         // Encode the request into the on-wire 3..20 byte frame (3 =
         // an I²C address-only request).
-        let mut wire = [0u8; 20];
-        let n = encode_request(req, &mut wire)?;
+        let n = encode_request(req, &mut wire[..])?;
 
         // Expected reply payload length: NATIVE/I2C reads return
         // `req.data.len()` bytes; writes return 0.
@@ -484,33 +450,18 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         // The dp_aux layer above handles DEFER-status retries —
         // those are not protocol errors, they're sink-level
         // backoff requests carried in the status nibble.
-        let mut attempt = 0;
-        // Defensive default; reassigned on each retry before it is read.
-        #[allow(unused_assignments)]
-        let mut last_err = AuxError::ShortReply;
-        let raw_len;
-        loop {
-            // Use a scratch reply buffer the size the spec allows
-            // for the worst case (1 status byte + 16 payload).
-            let mut raw = [0u8; 17];
-            match self.xfer_once(&wire[..n], expected_payload, &mut raw) {
-                Ok(got) => {
-                    if got > reply_buf.len() {
-                        return Err(AuxError::TooLong);
-                    }
-                    reply_buf[..got].copy_from_slice(&raw[..got]);
-                    raw_len = got;
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                    attempt += 1;
-                    if attempt >= HW_RETRIES {
-                        return Err(last_err);
-                    }
-                }
+        let mut attempt = 1;
+        let raw_len = loop {
+            match self.xfer_once(&wire[..n]) {
+                Ok(got) => break got,
+                Err(err) if attempt == HW_RETRIES => return Err(err),
+                Err(_) => attempt += 1,
             }
+        };
+        if reply_buf.len() < raw_len {
+            return Err(AuxError::TooLong);
         }
+        self.read_data(raw_len, reply_buf);
         // Hand the raw reply (status nibble in high half of byte 0,
         // then payload) to the dp_aux decoder. The decoder enforces
         // length + status invariants.
@@ -683,8 +634,8 @@ pub mod tests {
         if (sends[0] & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT != 5 {
             return TestResult::Fail("MSGSIZE must carry the wire length");
         }
-        if sends[0] & AUX_CTL_TIMEOUT_1600US != AUX_CTL_TIMEOUT_1600US {
-            return TestResult::Fail("CTL must select the 1600us timeout");
+        if sends[0] & AUX_CTL_TIMEOUT_MAX != AUX_CTL_TIMEOUT_MAX {
+            return TestResult::Fail("CTL must select the maximum timeout");
         }
         TestResult::Pass
     }
@@ -842,40 +793,63 @@ pub mod tests {
         smoke_aux_timeout_retries_exactly_three_times
     );
 
-    fn smoke_aux_xelpdp_profile_preserves_power_request_and_gen12_word() -> TestResult {
-        // Gen12 transports keep the historical control word exactly.
-        let gen12 = MockMmio::default();
-        gen12.set_read(ctl_off(), AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+    fn smoke_gen12_native_aux_send_word() -> TestResult {
+        let payload = [0; 16];
+        let mut reply = [0; 17];
+        for (ddi, ctl) in [
+            (Ddi::A, 0x64010),
+            (Ddi::B, 0x64110),
+            (Ddi::C, 0x64210),
+            (Ddi::D, 0x64310),
+            (Ddi::E, 0x64410),
+            (Ddi::F, 0x64510),
+            (Ddi::G, 0x64610),
+            (Ddi::H, 0x64710),
+            (Ddi::I, 0x64810),
+        ] {
+            for (cmd, len, send, recv) in [
+                (AuxCommand::I2cWrite, 0, 3, 1),
+                (AuxCommand::NativeRead, 16, 4, 17),
+                (AuxCommand::NativeWrite, 1, 5, 1),
+                (AuxCommand::NativeWrite, 16, 20, 1),
+            ] {
+                let mmio = MockMmio::default();
+                mmio.set_read(ctl, AUX_CTL_DONE | (recv << 20));
+                let req = AuxRequest {
+                    cmd,
+                    address: 0x50,
+                    data: &payload[..len],
+                };
+                let mut aux = IntelAux::new(&mmio, ddi);
+                if aux.transact(&req, &mut reply).is_err() {
+                    return TestResult::Fail("Gen12 native AUX transfer failed");
+                }
+                // i915 skl_get_aux_send_ctl, polled, native IO. Exact word
+                // also checks that neither TBT_IO nor POWER_REQUEST is set.
+                if mmio.writes_to(ctl) != [0x5200_0000, 0xde00_023f | (send << 20)] {
+                    return TestResult::Fail("Gen12 native AUX control register or timing");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_gen12_native_aux_send_word
+    );
+
+    fn smoke_aux_xelpdp_profile_preserves_power_request() -> TestResult {
         let req = AuxRequest {
             cmd: AuxCommand::NativeWrite,
             address: 0x600,
-            data: &[0x01],
+            data: &[1],
         };
         let mut reply = [0u8; 17];
-        let mut aux = IntelAux::new(&gen12, Ddi::A);
-        if aux.profile() != AuxCtlProfile::Gen12 || aux.transact(&req, &mut reply).is_err() {
-            return TestResult::Fail("Gen12 transport must keep its profile and succeed");
-        }
-        // Display-14 base transports (DDI A eDP, backlight owner) use the
-        // power-preserving Xe-LPDP word.
-        if IntelAux::with_base(&gen12, 0x6_4000).profile()
+        let mmio = MockMmio::default();
+        if IntelAux::with_base(&mmio, 0x6_4000).profile()
             != (AuxCtlProfile::XeLpdp { tbt_io: false })
         {
             return TestResult::Fail("display-14 base transport must preserve AUX power");
-        }
-        let gen12_writes = gen12.writes_to(ctl_off());
-        let historical = AUX_CTL_SEND_BUSY
-            | (5 << AUX_CTL_MSGSIZE_SHIFT)
-            | AUX_CTL_TIMEOUT_1600US
-            | AUX_CTL_PRECHARGE_16
-            | AUX_CTL_BITCLK_DIVIDER_DEFAULT;
-        if gen12_writes
-            != [
-                AUX_CTL_DONE | AUX_CTL_TIMEOUT_ERROR | AUX_CTL_RECEIVE_ERROR,
-                historical,
-            ]
-        {
-            return TestResult::Fail("Gen12 AUX control words changed");
         }
         // Xe-LPDP TC1 (0x16f210): every write keeps POWER_REQUEST, the
         // send word is skl_get_aux_send_ctl with fw-sync 18 / sync 32,
@@ -917,6 +891,6 @@ pub mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_aux",
-        smoke_aux_xelpdp_profile_preserves_power_request_and_gen12_word
+        smoke_aux_xelpdp_profile_preserves_power_request
     );
 }

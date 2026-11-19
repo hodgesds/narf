@@ -838,11 +838,16 @@ const DPCD_MAX_LANE_COUNT: u32 = 0x0_0002;
 /// ignores the MSA timing parameters, which is what lets the source
 /// vary the refresh rate (VESA Adaptive-Sync / Linux
 /// `drm_dp_sink_is_capable_without_timing_msa`).
-const DPCD_MSA_TIMING_PAR_IGNORED: u32 = 0x0_0007;
+pub const DPCD_MSA_TIMING_PAR_IGNORED: u8 = 1 << 6;
+const DP_DOWN_STREAM_PORT_COUNT: usize = 0x007;
 const DPCD_TRAINING_AUX_RD_INTERVAL: u32 = 0x0_000E;
 
 /// Size of the receiver-capability field read in one burst.
 const DPCD_CAPS_LEN: usize = 16;
+
+pub(crate) fn sink_ignores_msa_timing(raw: &[u8; DPCD_CAPS_LEN]) -> bool {
+    raw[DP_DOWN_STREAM_PORT_COUNT] & DPCD_MSA_TIMING_PAR_IGNORED != 0
+}
 
 impl LinkRate {
     /// Raw per-lane link rate in kbps (the symbol rate × 10 for
@@ -917,9 +922,7 @@ impl DpcdCaps {
             max_lanes: lanes,
             tps3_supported: lane_byte & 0x40 != 0,
             enhanced_framing: lane_byte & 0x80 != 0,
-            msa_timing_par_ignored: raw[(DPCD_MSA_TIMING_PAR_IGNORED - DPCD_DPCD_REV) as usize]
-                & crate::amdgpu_freesync::DPCD_MSA_TIMING_PAR_IGNORED
-                != 0,
+            msa_timing_par_ignored: sink_ignores_msa_timing(raw),
             training_aux_rd_interval: raw[(DPCD_TRAINING_AUX_RD_INTERVAL - DPCD_DPCD_REV) as usize],
         }
     }

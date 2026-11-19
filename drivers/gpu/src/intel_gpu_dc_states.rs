@@ -97,6 +97,14 @@
 //! Wa_15015404425 (four dummy writes before every read). The display-20 GT
 //! profile is D0-only, so the suspend half is not reached there.
 //!
+//! Display 30 (Panther/Wildcat Lake): KMS passes the exact retained
+//! `DisplayIp` plus the already-qualified Wa_15015404425 read-flush fact.
+//! Panther loads `xe3lpd_dmc.bin`; Wildcat loads the distinct
+//! `xe3lpd_3002_dmc.bin`. Both use the display >= 20 flip-queue/interrupt
+//! brackets, but unlike Lunar Lake restore Pipe C/D DMC MMIO before enable.
+//! A broad `Generation::PantherLake` without that exact identity installs no
+//! service. Display 35 remains disconnected.
+//!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
 //! DMC enabled that this driver did not enable, while an external route
@@ -115,19 +123,22 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dmc::{
-    disable_pipe, disable_program, enable_pipe, load_program, parse_dmc_firmware_xe2lpd,
+    disable_pipe, disable_program, enable_pipe, load_program, parse_dmc_firmware_wildcat_lake,
+    parse_dmc_firmware_xe2lpd, parse_dmc_firmware_xe3lpd, parse_dmc_firmware_xe3p_lpd,
     parse_dmc_firmware_xelpdp, pipedmc_enable_mtl, verify_loaded, verify_program, DmcError,
     DmcFirmware, DmcId, DmcPlatform, DmcVerifyError, DC_STATE_EN, DG1_DMC_DEBUG_DC5_COUNT,
     MTL_DMC_FIRMWARE, MTL_PIPEDMC_CONTROL,
 };
 
-/// Parse a retained container under `platform`'s rules: display 14
-/// (`mtl_dmc.bin`) or display 20 (`xe2lpd_dmc.bin`, 0x8000 ceiling).
-/// Stepping selection is wildcard on both.
+/// Parse a retained container under `platform`'s exact rules. Stepping
+/// selection is wildcard on every platform.
 fn parse_for(platform: DmcPlatform, blob: &[u8]) -> Result<DmcFirmware<'_>, DmcError> {
     match platform {
         DmcPlatform::Xe2Lpd => parse_dmc_firmware_xe2lpd(blob, b'*', b'*'),
-        _ => parse_dmc_firmware_xelpdp(blob, b'*', b'*'),
+        DmcPlatform::Xe3Lpd => parse_dmc_firmware_xe3lpd(blob, b'*', b'*'),
+        DmcPlatform::WildcatLake => parse_dmc_firmware_wildcat_lake(blob, b'*', b'*'),
+        DmcPlatform::Xe3pLpd => parse_dmc_firmware_xe3p_lpd(blob, b'*', b'*'),
+        DmcPlatform::Gen12 | DmcPlatform::Xelpdp => parse_dmc_firmware_xelpdp(blob, b'*', b'*'),
     }
 }
 
@@ -135,7 +146,10 @@ fn parse_for(platform: DmcPlatform, blob: &[u8]) -> Result<DmcFirmware<'_>, DmcE
 fn firmware_path(platform: DmcPlatform) -> &'static str {
     match platform {
         DmcPlatform::Xe2Lpd => crate::intel_gpu_xe2lpd::XE2LPD_DMC_FIRMWARE,
-        _ => MTL_DMC_FIRMWARE,
+        DmcPlatform::Xe3Lpd => crate::intel_gpu_xe3lpd::XE3LPD_DMC_FIRMWARE,
+        DmcPlatform::WildcatLake => "i915/xe3lpd_3002_dmc.bin",
+        DmcPlatform::Xe3pLpd => "i915/xe3p_lpd_dmc.bin",
+        DmcPlatform::Gen12 | DmcPlatform::Xelpdp => MTL_DMC_FIRMWARE,
     }
 }
 
@@ -1366,11 +1380,13 @@ async fn arm_task(service: Arc<DcService>) {
 }
 
 /// The service profile a KMS-owned generation installs: display 14 on
-/// Meteor/Arrow Lake, display 20 on Lunar Lake (whose KMS install has
-/// already verified `GMD_ID_DISPLAY` 20.00). `(container rules, allowed DC
-/// mask, Wa_15015404425 read flush)`; `None` installs nothing.
+/// Meteor/Arrow Lake, display 20 on Lunar Lake, or an exact display-30
+/// identity retained by the Panther/Wildcat Lake KMS install. `(container
+/// rules, allowed DC mask, Wa_15015404425 read flush)`; `None` installs
+/// nothing. Display 35 remains disconnected.
 pub(crate) fn service_profile(
     generation: crate::intel_gpu::Generation,
+    display30: Option<(crate::intel_gpu_xe2lpd::DisplayIp, bool)>,
 ) -> Option<(DmcPlatform, u32, bool)> {
     match generation {
         crate::intel_gpu::Generation::MeteorLake => {
@@ -1379,19 +1395,28 @@ pub(crate) fn service_profile(
         crate::intel_gpu::Generation::LunarLake => {
             Some((DmcPlatform::Xe2Lpd, XE2LPD_ALLOWED_DC_MASK, true))
         }
+        crate::intel_gpu::Generation::PantherLake => match display30 {
+            Some((crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd, flush)) => {
+                Some((DmcPlatform::Xe3Lpd, XE2LPD_ALLOWED_DC_MASK, flush))
+            }
+            Some((crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake, flush)) => {
+                Some((DmcPlatform::WildcatLake, XE2LPD_ALLOWED_DC_MASK, flush))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// KMS install for a display-14 or display-20 function: create the service
-/// and hold the Init reference (DC states exited) until the program is
-/// loaded.
+/// KMS install for a qualified display-14/20/30 function: create the service
+/// and hold the Init reference (DC states exited) until the program is loaded.
 pub(crate) fn install(
     generation: crate::intel_gpu::Generation,
+    display30: Option<(crate::intel_gpu_xe2lpd::DisplayIp, bool)>,
     bar: narf_bus::MmioRegion,
     cap: Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) {
-    let Some((platform, allowed, flush_reads)) = service_profile(generation) else {
+    let Some((platform, allowed, flush_reads)) = service_profile(generation, display30) else {
         return;
     };
     let mut slot = SERVICE.lock();

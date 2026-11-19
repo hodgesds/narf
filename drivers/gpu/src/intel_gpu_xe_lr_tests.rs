@@ -126,7 +126,7 @@ fn smoke_xe_lr_job_runs_past_watchdog_and_completes_or_cancels_on_destroy() -> T
             .windows(6)
             .find(|win| win[..4] == [0x7a000004, 0x01104080, base + 0x800, 0])
             .unwrap()[4];
-        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
+        execute_ppgtt_probe(&d, &image.borrow(), &ring, stamp, base, false);
         let mut image = image.borrow_mut();
         image[0x800 / 4] = stamp;
         image[1024 + 5] = tail;

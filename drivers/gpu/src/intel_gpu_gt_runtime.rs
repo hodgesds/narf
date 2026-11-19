@@ -250,7 +250,7 @@ pub(crate) fn ptl_profile(
     if !platform.is_headless_integrated() {
         return None;
     }
-    match (ptl_display, platform.is_ptl() && has_mode) {
+    match (ptl_display, platform.has_ptl_display_route() && has_mode) {
         (false, _) => Some(LnlProfile::Headless),
         (true, true) => Some(LnlProfile::DisplayPreserving),
         (true, false) => None,
@@ -1172,7 +1172,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             return None;
         }
         state.gt.as_ref()?;
-        let raw = if self.platform == GtPlatform::Alchemist || self.platform.is_gen12() {
+        let raw = if self.platform.is_dg2() || self.platform.is_gen12() {
             let rpstat = owner.pending.window.read32(0x1381b4);
             if rpstat == u32::MAX {
                 return None;
@@ -1715,7 +1715,7 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
         return Err(RuntimeError::Device);
     }
     if let Some(platform) = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
-        .filter(|platform| platform.is_discrete() && !p.smallbar)
+        .filter(|platform| platform.is_discrete() && platform.has_display() && !p.smallbar)
     {
         validate_discrete_display_idle(platform, mmio)?;
     }
@@ -1727,18 +1727,26 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
     Ok(revision)
 }
 
-/// Source display inventory only; no Arc display activation. Both currently
-/// admitted discrete profiles have display>=13 and four sprites per pipe.
-/// MIT intel_display_device.c:1788-1793, dg2_desc and bmg_desc.
+/// Source display inventory only; no display activation. DG1 has Display 12's
+/// six sprites plus the primary plane; DG2/BMG expose four sprites plus the
+/// primary. MIT intel_display_device.c:1788-1793 and the platform descriptors.
 fn validate_discrete_display_idle(
     platform: GtPlatform,
     mmio: &impl MmioWindow,
 ) -> Result<(), RuntimeError> {
-    if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+    if !platform.is_discrete() {
         return Err(RuntimeError::Device);
     }
+    if !platform.has_display() {
+        return Ok(());
+    }
+    let planes = if platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+        7
+    } else {
+        5
+    };
     for pipe in 0..4 {
-        for plane in 0..5 {
+        for plane in 0..planes {
             let ctl = mmio.read32(0x70180 + pipe * 0x1000 + plane * 0x100);
             if ctl == u32::MAX || ctl & (1 << 31) != 0 {
                 return Err(RuntimeError::Device);
@@ -1774,7 +1782,9 @@ fn pci_identity(
         if header == 0 {
             return Ok(revision as u8);
         }
-        if header as u16 == 0x10 && (off > 0xff4 || read(off + 8)? & 1 != 0) {
+        if header as u16 == 0x10
+            && (off > 0xfec || read(off + 8)? & 1 != 0 || read(off + 0x10)? & 0xffff != 0)
+        {
             return Err(RuntimeError::Device);
         }
         let next = (header >> 20) as u16;
@@ -2034,6 +2044,11 @@ impl Owner {
             .map_err(|_| RuntimeError::State)?;
             state.lnl_flr = None; // completed receipt was consumed by this fresh arena
             SharedArena::new(arena)
+        } else if platform.has_sriov() {
+            SharedArena::new(
+                GgttArena::for_sriov_pf_gt(p.bar, mmio.clone(), platform)
+                    .map_err(|_| RuntimeError::State)?,
+            )
         } else {
             SharedArena::new(GgttArena::for_gt(p.bar, p.cap, platform))
         };
@@ -3867,8 +3882,10 @@ pub(crate) fn probe_discrete(
         unsafe { card.install_lmem_bar(lmem) };
     }
     let display_window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-    let discrete_display =
-        crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform).ok();
+    let discrete_display = platform
+        .has_display()
+        .then(|| crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform))
+        .and_then(Result::ok);
     let discrete_console = discrete_display
         .and_then(|_| crate::intel_gpu_xe2lpd::discrete_pipe_a_scanout(&display_window));
     let assigned = if let Some(ip) = discrete_display {
@@ -4059,6 +4076,12 @@ mod tests {
             Err(RuntimeError::Device)
         );
         cfg.insert(0x208, 0);
+        cfg.insert(0x210, 1);
+        assert_eq!(
+            pci_identity(|off| Ok(*cfg.get(&off).unwrap_or(&0)), 0x8086, 0x7d55),
+            Err(RuntimeError::Device)
+        );
+        cfg.insert(0x210, 0);
         cfg.insert(0x180, 0x2001000f);
         assert_eq!(
             pci_identity(|off| Ok(*cfg.get(&off).unwrap_or(&0)), 0x8086, 0x7d55),
@@ -4113,11 +4136,15 @@ mod tests {
         struct Io {
             live: Option<u64>,
             unavailable: Option<u64>,
+            missing_high_planes: bool,
             absent: Cell<usize>,
         }
         impl MmioWindow for Io {
             fn read32(&self, r: u64) -> u32 {
-                if (0x70000..0x74000).contains(&r) && [0x680, 0x780].contains(&(r & 0xfff)) {
+                if self.missing_high_planes
+                    && (0x70000..0x74000).contains(&r)
+                    && [0x680, 0x780].contains(&(r & 0xfff))
+                {
                     self.absent.set(self.absent.get() + 1);
                     return u32::MAX;
                 }
@@ -4138,6 +4165,7 @@ mod tests {
             let io = Io {
                 live: None,
                 unavailable: None,
+                missing_high_planes: true,
                 absent: Cell::new(0),
             };
             assert_eq!(validate_discrete_display_idle(platform, &io), Ok(()));
@@ -4149,6 +4177,7 @@ mod tests {
                         let io = Io {
                             live: (!unavailable).then_some(r),
                             unavailable: unavailable.then_some(r),
+                            missing_high_planes: true,
                             absent: Cell::new(0),
                         };
                         assert_eq!(
@@ -4160,6 +4189,29 @@ mod tests {
                 }
             }
         }
+        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let io = Io {
+            live: None,
+            unavailable: None,
+            missing_high_planes: false,
+            absent: Cell::new(0),
+        };
+        assert_eq!(validate_discrete_display_idle(dg1, &io), Ok(()));
+        for pipe in 0..4 {
+            for plane in 0..7 {
+                let r = 0x70180 + pipe * 0x1000 + plane * 0x100;
+                let io = Io {
+                    live: Some(r),
+                    unavailable: None,
+                    missing_high_planes: false,
+                    absent: Cell::new(0),
+                };
+                assert_eq!(
+                    validate_discrete_display_idle(dg1, &io),
+                    Err(RuntimeError::Device)
+                );
+            }
+        }
         struct NoRead;
         impl MmioWindow for NoRead {
             fn read32(&self, _: u64) -> u32 {
@@ -4169,6 +4221,10 @@ mod tests {
                 panic!("non-discrete inventory wrote display registers")
             }
         }
+        assert_eq!(
+            validate_discrete_display_idle(GtPlatform::ArcticSoundM, &NoRead),
+            Ok(())
+        );
         for platform in [
             GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
             GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),

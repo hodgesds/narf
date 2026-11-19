@@ -110,19 +110,45 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 fn smoke_guc_log_exact_copy_header_and_profiles() -> TestResult {
+    let mut piece = alloc::vec![0; 4093];
     for (platform, tag) in [
+        (GtPlatform::ArcticSoundM, 1),
         (GtPlatform::Alchemist, 1),
         (
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
             2,
         ),
         (GtPlatform::Battlemage, 3),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
+            4,
+        ),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+            5,
+        ),
+        (GtPlatform::WildcatLake, 6),
+        (GtPlatform::NovaLakeS, 7),
     ] {
         let memory = Memory::new();
         let index = slot();
+        let mut identity = identity(platform);
+        if platform == GtPlatform::NovaLakeS {
+            // xe_uc_fw.c requires 70.55.4 for Nova Lake-S.
+            identity.firmware_version = (70, 55, 3);
+            assert_eq!(
+                CaptureBuffer::reserve_for_test(index)
+                    .unwrap()
+                    .capture(&memory, identity, || true)
+                    .unwrap_err(),
+                FsError::NoDevice
+            );
+            assert_eq!(memory.reads.load(Ordering::Relaxed), 0);
+            identity.firmware_version = (70, 55, 4);
+        }
         let snapshot = CaptureBuffer::reserve_for_test(index)
             .unwrap()
-            .capture(&memory, identity(platform), || true)
+            .capture(&memory, identity, || true)
             .unwrap();
         assert_eq!(memory.reads.load(Ordering::Relaxed), 0x115000 / 4 + 54);
         let mut header = [0; 112];
@@ -137,9 +163,10 @@ fn smoke_guc_log_exact_copy_header_and_profiles() -> TestResult {
         assert_eq!(qword(&header, 32), 42);
         assert_eq!(qword(&header, 40), 99);
         assert_eq!(qword(&header, 48), 123456);
+        let (major, minor, patch) = identity.firmware_version;
         assert_eq!(
             (dword(&header, 56), dword(&header, 60), dword(&header, 64)),
-            (70, 54, 1)
+            (u32::from(major), u32::from(minor), u32::from(patch))
         );
         assert_eq!(dword(&header, 68), 7);
         assert_eq!(dword(&header, 72), 0);
@@ -153,7 +180,6 @@ fn smoke_guc_log_exact_copy_header_and_profiles() -> TestResult {
         // Read the entire image in deliberately unaligned pieces, including
         // the header/payload seam. Expected body comes from independent data.
         let mut offset = 0;
-        let mut piece = [0; 4093];
         while offset < SNAPSHOT_BYTES {
             let n = snapshot.read(offset as u64, &mut piece);
             assert!(n > 0 && n <= piece.len());

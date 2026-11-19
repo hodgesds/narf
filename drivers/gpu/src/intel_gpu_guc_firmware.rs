@@ -28,13 +28,30 @@ pub struct GuCFirmware {
 }
 
 struct Open(GuCProfile);
+
+fn lookup_guc<T>(
+    profile: GuCProfile,
+    mut open: impl FnMut(&str) -> Result<T, narf_firmware::FirmwareError>,
+) -> Result<T, narf_firmware::FirmwareError> {
+    match open(profile.firmware) {
+        // Linux 7.0-rc7 xe_uc_fw.c uses mmp_ver for NOVALAKE_S. Newer
+        // firmware packages provide the major-version filename.
+        Err(narf_firmware::FirmwareError::NotFound)
+            if profile.platform == GtPlatform::NovaLakeS =>
+        {
+            open("xe/nvl_guc_70.55.4.bin")
+        }
+        result => result,
+    }
+}
+
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     type Output = Result<GuCFirmware, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(self.0.firmware, cap) {
+        let blob = match lookup_guc(self.0, |name| narf_firmware::open(name, cap)) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(FirmwareError::Registry(error))),
         };
@@ -86,6 +103,9 @@ impl GuCFirmware {
             Generation::TigerLake => {
                 GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
             }
+            Generation::RocketLake => {
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            }
             // ADL spans different firmware families; an ambiguous generation
             // cannot choose ADL-P versus ADL-S/N's asset. Use PCI identity.
             Generation::AlderLake => return Err(FirmwareError::Unsupported),
@@ -135,6 +155,39 @@ mod tests {
     use super::*;
     use crate::intel_gpu_uapi::put32;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_nova_guc_firmware_names() -> TestResult {
+        use narf_firmware::FirmwareError::{NotFound, SignatureInvalid};
+        let nova = GtPlatform::NovaLakeS.guc().unwrap();
+        for first in [Ok(1), Err(NotFound), Err(SignatureInvalid)] {
+            let mut calls = 0;
+            let found = lookup_guc(nova, |name| {
+                calls += 1;
+                if calls == 1 {
+                    assert_eq!(name, "xe/nvl_guc_70.bin");
+                    first
+                } else {
+                    assert_eq!(name, "xe/nvl_guc_70.55.4.bin");
+                    Ok(2)
+                }
+            });
+            if first == Err(NotFound) {
+                assert_eq!((found, calls), (Ok(2), 2));
+            } else {
+                assert_eq!((found, calls), (first, 1));
+            }
+        }
+        let missing = lookup_guc(GtPlatform::WildcatLake.guc().unwrap(), |name| {
+            assert_eq!(name, "xe/ptl_guc_70.bin");
+            Err::<(), _>(NotFound)
+        });
+        assert_eq!(missing, Err(NotFound));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_firmware",
+        smoke_nova_guc_firmware_names
+    );
 
     fn smoke_xelpg_firmware_authority_and_version() -> TestResult {
         let (write, read) = narf_firmware::bootstrap_authority();

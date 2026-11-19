@@ -56,7 +56,7 @@ impl ResetPolicy {
             || dss & 0x40000000 == 0
             || group > 15
             || instance
-                > if platform.is_gen12() || platform == GtPlatform::Alchemist {
+                > if platform.is_gen12() || platform.is_dg2() {
                     7
                 } else {
                     15
@@ -171,7 +171,7 @@ impl ResetPolicy {
                         add(0xb020 + index * 4, 0); // Wa1607983814.
                     }
                 }
-                GtPlatform::Alchemist => {
+                GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                     add(0x20ec, 1);
                     add(0xe7cc, mcr);
                     add(0xe7c8, mcr);
@@ -180,26 +180,15 @@ impl ResetPolicy {
                     add(0xe18c, mcr | 1);
                     add(0xe4f4, mcr | 1);
                     add(0xe5f0, mcr | 1);
-                    if matches!(
-                        self.device,
-                        0x56a5
-                            | 0x56a6
-                            | 0x56b0
-                            | 0x56b1
-                            | 0x56ba
-                            | 0x56bb
-                            | 0x56bc
-                            | 0x56bd
-                            | 0x5693
-                            | 0x5694
-                            | 0x5695
-                    ) {
+                    if crate::intel_gpu_gt::is_dg2_g11(self.device) {
                         // Wa14012342262 disables host read verification, not
                         // the source ADS save (xe_wa.c:419-427).
                         add(0xe420, mcr | 1);
                     }
                 }
-                _ if self.platform.is_ptl() => {
+                GtPlatform::NovaLakeS
+                | GtPlatform::WildcatLake
+                | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => {
                     for offset in [0xe194, 0xe4c4, 0xe4f0, 0xe5f4] {
                         add(offset, mcr | 1);
                     }

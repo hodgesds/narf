@@ -59,7 +59,7 @@ fn expected_saves(
             (0xe48c, 1),
             (0xe4f4, 1),
         ],
-        GtPlatform::Alchemist => &[
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => &[
             (0x20ec, 1),
             (0x83b4, 1),
             (0xe18c, 1),
@@ -69,7 +69,11 @@ fn expected_saves(
             (0xe7c8, 0),
             (0xe7cc, 0),
         ],
-        _ if platform.is_ptl() && release == 0 && step < 4 => &[
+        GtPlatform::NovaLakeS
+        | GtPlatform::WildcatLake
+        | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake)
+            if release == 0 && step < 4 =>
+        &[
             (0xe18c, 1),
             (0xe194, 1),
             (0xe48c, 1),
@@ -78,7 +82,9 @@ fn expected_saves(
             (0xe530, 0),
             (0xe5f4, 1),
         ],
-        _ if platform.is_ptl() => &[
+        GtPlatform::NovaLakeS
+        | GtPlatform::WildcatLake
+        | GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake) => &[
             (0xe194, 1),
             (0xe4c4, 1),
             (0xe4f0, 1),
@@ -128,7 +134,9 @@ fn expected_saves(
                 entries.insert(register, 0);
             }
         }
-        GtPlatform::Alchemist if device == 0x56a5 => {
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist
+            if crate::intel_gpu_gt::is_dg2_g11(device) =>
+        {
             entries.insert(0xe420, mcr | 1);
         }
         GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) if release <= 71 => {
@@ -216,6 +224,8 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
         (GtPlatform::Alchemist, 0x56a0, 55, 0),
         (GtPlatform::Alchemist, 0x56a5, 55, 0),
         (GtPlatform::Alchemist, 0x56a3, 55, 0),
+        (GtPlatform::ArcticSoundM, 0x56c0, 55, 0),
+        (GtPlatform::ArcticSoundM, 0x56c1, 55, 0),
         (lpg, 0x7d55, 70, 0),
         (lpg, 0x7d55, 71, 0),
         (lpg, 0x7d55, 74, 0),
@@ -273,7 +283,7 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
                     }) << 16,
                 );
             }
-            if !platform.is_gen12() && platform != GtPlatform::Alchemist {
+            if !platform.is_gen12() && !platform.is_dg2() {
                 d.regs.insert(
                     0xd8c,
                     if platform.is_ptl() {

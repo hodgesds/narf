@@ -112,7 +112,8 @@ fn smoke_hardware_vm_dump_retains_closed_user_bo_through_capture_and_full_reset(
             word(record, 40),
             word(record, 44)
         ),
-        (4, 4, 1, 1)
+        // Both adjacent pages share every parent on Battlemage's five-level walk.
+        (5, 5, 1, 1)
     );
     let range = &record[0x10180..];
     assert_eq!((word(range, 32), word(range, 44)), (32, 8192));

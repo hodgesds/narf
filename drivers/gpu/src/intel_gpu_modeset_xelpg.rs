@@ -772,7 +772,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // (intel_vrr_always_use_vrr_tg): its fixed-refresh guardband
         // (intel_vrr_compute_guardband) is known before the first
         // destructive write, and a mode it cannot describe is refused.
-        let guardband = if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+        let guardband = if self.ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             Some(
@@ -873,14 +873,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // block shared with Gen12 — the shared codecs build them),
         // then bdw_set_pipe_misc.
         self.program_transcoder(&mode);
-        if guardband.is_some() {
-            // hsw_configure_cpu_transcoder: intel_vrr_set_transcoder_timings
-            // follows intel_set_transcoder_timings.
-            crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
-                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
-        }
         // Non-Xe3 VRR timings for the mode this run commits (the Xe3
-        // branch above programs its always-on TG instead).
+        // enable sequence below programs its always-on TG instead).
         self.program_vrr_for_modeset(&mode)?;
         if let Some((src_w, src_h, ref scaler)) = scaler_plan {
             self.program_pipe_source(src_w, src_h);
@@ -1032,12 +1026,6 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             // enable on display 20 (no DP_FEC_BS_JITTER_WA there).
             self.chicken_trans()?;
         }
-        if let Some(guardband) = guardband {
-            // intel_ddi_enable_dp: intel_vrr_transcoder_enable between
-            // intel_ddi_enable_transcoder_func and intel_enable_transcoder.
-            crate::intel_gpu_xe3lpd::tg_enable(self.mmio, guardband)
-                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
-        }
         let frame = self.mmio.read32(0x70040);
         if frame == u32::MAX || !self.mmio.display_access_ok() {
             return Err(ModesetError::PipelineEnableUnavailable);
@@ -1045,6 +1033,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_ddi_enable: the transcoder function, then the transcoder.
         if cold.is_some() {
             self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
+        }
+        if let Some(guardband) = guardband {
+            // Display 30 follows Linux's intel_ddi_enable_dp ordering:
+            // the fixed VRR timing registers are unsafe before the DDI
+            // transcoder function is enabled, and its TG starts before
+            // intel_enable_transcoder sets TRANSCONF_ENABLE.
+            crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            crate::intel_gpu_xe3lpd::tg_enable(self.mmio, guardband)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
         }
         self.enable_transcoder()?;
         // VRR enable, after the transcoder is live (non-Xe3 only).
@@ -1721,7 +1719,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         }
         // intel_ddi_post_disable_hdmi_or_sst, display 30: the always-used
         // VRR timing generator stops after the transcoder.
-        if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+        if self.ip.is_display30() {
             crate::intel_gpu_xe3lpd::tg_disable(self.mmio)
                 .map_err(|_| ModesetError::PipelineStopUnavailable)?;
         }
@@ -1771,7 +1769,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             Err(_) => return,
         };
         let base = Transcoder::A.base();
-        let xe3 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd;
+        let xe3 = self.ip.is_display30();
         let xe2 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd;
         if xe3 || xe2 {
             // intel_set_transcoder_timings, display >= 13: the set-context
@@ -2011,7 +2009,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd => {
                 Some(crate::intel_gpu_vrr::DisplayVrrIp::Display20)
             }
-            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => None,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => None,
         }
     }
 
@@ -3794,9 +3793,7 @@ pub mod tests {
     /// through its PPS, with the PHY's idle and D2D state modelled.
     fn lit_panel(fake: &MtlFake, dmc: &DmcLog<'_>) -> Result<Mode, &'static str> {
         forget_panel_off();
-        fake.pps.set(true);
-        fake.phy.model_ddi_idle.set(true);
-        fake.phy.model_d2d.set(true);
+        fake.model_panel_power();
         let mode = Mode::VESA_1024X768_60;
         if XeLpgModeset::new(fake, XeLpgPort::A)
             .with_pipe_dmc(dmc)
@@ -4071,7 +4068,10 @@ pub mod tests {
     fn smoke_mtl_modeset_panel_fitting_scaler_and_pipe_source() -> TestResult {
         use crate::intel_gpu_xelpg_scaler::{Filter, ScalingMode, PS_SCALER_EN};
 
+        forget_panel_off();
         let fake = MtlFake::new(XeLpgPort::A);
+        fake.model_panel_power();
+        fake.phy.write32(PP_CONTROL, 1 | 4);
         // Native panel mode: 2880x1800 OLED
         let mode = oled_mode();
         oled_panel(&fake, 0x14, 2);
@@ -4118,9 +4118,9 @@ pub mod tests {
             return TestResult::Fail("SKL_PS_WIN_SZ must match panel window dimensions");
         }
 
-        // 5. PLANE_SIZE_1_A (0x70190) must receive (1919 << 16) | 1199
+        // PLANE_SIZE packs height in the upper half and width in the lower half.
         let plane_size = fake.writes_to(0x70190);
-        if plane_size.last() != Some(&((1919 << 16) | 1199)) {
+        if plane_size.last() != Some(&((1199 << 16) | 1919)) {
             return TestResult::Fail("PLANE_SIZE_1_A must receive source dimensions");
         }
 
@@ -4151,7 +4151,10 @@ pub mod tests {
         use crate::intel_gpu_xelpg_dsc::{dss_ctl1, JOINER_ENABLE};
         const SECONDARY_BIG_JOINER_ENABLE: u32 = 1 << 29;
 
+        forget_panel_off();
         let fake = MtlFake::new(XeLpgPort::A);
+        fake.model_panel_power();
+        fake.phy.write32(PP_CONTROL, 1 | 4);
         let mode = Mode::VESA_1024X768_60;
         let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_bigjoiner(PipeIdx::B);
         let res = ms.modeset_fixed(&test_fb(), &mode);

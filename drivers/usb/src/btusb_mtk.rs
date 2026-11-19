@@ -414,11 +414,24 @@ pub(crate) async fn read_identity(io: &impl MtkUsb, product: u16) -> Result<Stri
     let expected = u32::from(device_id(product).ok_or(MtkError::UnsupportedDevice)?);
     let chip = read_register(io, 0x70010200).await?;
     if chip != expected {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btusb-mtk: chip id {chip:#x} != expected {expected:#x}"
+        );
         return Err(MtkError::UnsupportedDevice);
     }
     let version = read_register(io, 0x80021004).await?;
     let flavor = read_register(io, 0x70010020).await?;
-    firmware_name(chip, version, flavor)
+    let name = firmware_name(chip, version, flavor)?;
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btusb-mtk: chip {chip:#x} ver {version:#x} flavor {flavor:#x} -> {name}"
+        );
+    }
+    Ok(name)
 }
 
 pub(crate) async fn download_and_enable(io: &impl MtkUsb, image: &[u8]) -> Result<(), MtkError> {
@@ -487,7 +500,23 @@ pub(crate) async fn setup_mediatek(
         interface,
     };
     let name = read_identity(&io, product_id).await?;
-    let cap = btusb::firmware_cap(&name).ok_or(MtkError::FirmwareUnavailable)?;
+    let cap = btusb::firmware_cap(&name)
+        .or_else(|| {
+            if product_id == 0x3604 || name.contains("7925") {
+                btusb::firmware_cap("mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btusb-mtk: firmware '{}' not found in registry",
+                name
+            );
+            MtkError::FirmwareUnavailable
+        })?;
     let view = narf_firmware::view_of(&cap).map_err(|_| MtkError::FirmwareUnavailable)?;
     download_and_enable(&io, view.bytes).await?;
     // WMT status/complete events may also be queued on the ordinary event

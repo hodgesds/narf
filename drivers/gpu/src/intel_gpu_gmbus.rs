@@ -95,6 +95,15 @@
 //! `HW_WAIT_PHASE`, which `classify` deliberately does not
 //! model (a new variant would break exhaustive matches in
 //! consumers of the codec).
+//!
+//! ## Xe3 GPIO bit-bash workaround (modeled, not connected)
+//!
+//! Linux 7.0-rc7 Wa_16025573575 applies to display 30.00, 30.02 and 35.00.
+//! A future GPIO fallback must set all four GPIO direction/value mask bits
+//! before the transfer, preserve them with the pull-up-disable bits in every
+//! line operation, and clear the masks afterward. The pure helpers below pin
+//! those images; [`GmbusBus`] remains hardware-GMBUS-only and does not invoke
+//! them.
 
 use core::convert::TryFrom;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -119,6 +128,66 @@ pub const GMBUS3: u64 = GMBUS_BASE + 0x0C;
 pub const GMBUS4: u64 = GMBUS_BASE + 0x10;
 /// 2-byte index for byte-indexed transfers.
 pub const GMBUS5: u64 = GMBUS_BASE + 0x20;
+
+/// GPIO bit-bash fields from `intel_gmbus_regs.h`.
+pub const GPIO_CLOCK_DIR_MASK: u32 = 1 << 0;
+pub const GPIO_CLOCK_DIR_OUT: u32 = 1 << 1;
+pub const GPIO_CLOCK_VAL_MASK: u32 = 1 << 2;
+pub const GPIO_CLOCK_PULLUP_DISABLE: u32 = 1 << 5;
+pub const GPIO_DATA_DIR_MASK: u32 = 1 << 8;
+pub const GPIO_DATA_DIR_OUT: u32 = 1 << 9;
+pub const GPIO_DATA_VAL_MASK: u32 = 1 << 10;
+pub const GPIO_DATA_PULLUP_DISABLE: u32 = 1 << 13;
+pub const GPIO_XE3_MASK_BITS: u32 =
+    GPIO_CLOCK_DIR_MASK | GPIO_CLOCK_VAL_MASK | GPIO_DATA_DIR_MASK | GPIO_DATA_VAL_MASK;
+pub const GPIO_PULLUP_DISABLE_BITS: u32 = GPIO_CLOCK_PULLUP_DISABLE | GPIO_DATA_PULLUP_DISABLE;
+
+/// `intel_display_needs_wa_16025573575`: exact GMD display identities.
+pub const fn wa_16025573575(display_version: u8, display_release: u8) -> bool {
+    matches!(
+        (display_version, display_release),
+        (30, 0) | (30, 2) | (35, 0)
+    )
+}
+
+/// `ptl_handle_mask_bits` before/after one GPIO transfer.
+pub const fn gpio_xe3_mask_image(current: u32, set: bool) -> u32 {
+    if set {
+        current | GPIO_XE3_MASK_BITS
+    } else {
+        current & !GPIO_XE3_MASK_BITS
+    }
+}
+
+/// `get_reserved`: pull-up-disable bits are always preserved on modern Intel;
+/// the four direction/value mask bits are additionally retained under the Xe3
+/// workaround.
+pub const fn gpio_reserved(current: u32, xe3_mask_wa: bool) -> u32 {
+    let preserve = if xe3_mask_wa {
+        GPIO_PULLUP_DISABLE_BITS | GPIO_XE3_MASK_BITS
+    } else {
+        GPIO_PULLUP_DISABLE_BITS
+    };
+    current & preserve
+}
+
+/// One `set_clock` image over a value returned by [`gpio_reserved`].
+pub const fn gpio_clock_image(reserved: u32, high: bool) -> u32 {
+    if high {
+        reserved | GPIO_CLOCK_DIR_MASK
+    } else {
+        reserved | GPIO_CLOCK_DIR_OUT | GPIO_CLOCK_DIR_MASK | GPIO_CLOCK_VAL_MASK
+    }
+}
+
+/// One `set_data` image over a value returned by [`gpio_reserved`].
+pub const fn gpio_data_image(reserved: u32, high: bool) -> u32 {
+    if high {
+        reserved | GPIO_DATA_DIR_MASK
+    } else {
+        reserved | GPIO_DATA_DIR_OUT | GPIO_DATA_DIR_MASK | GPIO_DATA_VAL_MASK
+    }
+}
 
 // ── GMBUS0 — pin pair + rate (TGL PRM Vol. 12 §"GMBUS0") ─────────
 
@@ -228,7 +297,9 @@ impl GmbusPinTable {
     pub const fn for_generation(generation: crate::intel_gpu::Generation) -> Self {
         use crate::intel_gpu::Generation;
         match generation {
-            Generation::TigerLake | Generation::AlderLake => GmbusPinTable::Icp,
+            Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
+                GmbusPinTable::Icp
+            }
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }
@@ -276,7 +347,7 @@ impl GmbusPinTable {
 pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
     match (family, ddi) {
         (_, Ddi::A) => Some(PinPair::Pin1Bxt),
-        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H) => None,
+        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H | Ddi::I) => None,
         (_, Ddi::B) => Some(PinPair::Pin2Bxt),
         (_, Ddi::C) => None,
         (_, Ddi::D) => Some(PinPair::Pin9Tc1),
@@ -285,6 +356,8 @@ pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
         (_, Ddi::G) => Some(PinPair::Pin12Tc4),
         (Gen12Platform::TigerLake, Ddi::H) => Some(PinPair::Pin13Tc5),
         (_, Ddi::H) => None,
+        (Gen12Platform::TigerLake, Ddi::I) => Some(PinPair::Pin14Tc6),
+        (_, Ddi::I) => None,
     }
 }
 
@@ -1236,6 +1309,44 @@ pub mod tests {
         smoke_gmbus_bit_map_matches_reference
     );
 
+    fn smoke_xe3_gpio_mask_workaround_images() -> TestResult {
+        for identity in [(30, 0), (30, 2), (35, 0)] {
+            if !wa_16025573575(identity.0, identity.1) {
+                return TestResult::Fail("Xe3 display identity lost Wa_16025573575");
+            }
+        }
+        for identity in [(20, 0), (30, 1), (35, 1), (14, 0)] {
+            if wa_16025573575(identity.0, identity.1) {
+                return TestResult::Fail("non-source identity inherited Wa_16025573575");
+            }
+        }
+        if GPIO_XE3_MASK_BITS != 0x505 || GPIO_PULLUP_DISABLE_BITS != 0x2020 {
+            return TestResult::Fail("GPIO mask/pull-up fields diverge from Linux");
+        }
+        let current = 0xffff_ffff;
+        let reserved = gpio_reserved(current, true);
+        if reserved != 0x2525
+            || gpio_reserved(current, false) != 0x2020
+            || gpio_xe3_mask_image(0x2020, true) != 0x2525
+            || gpio_xe3_mask_image(0x2525, false) != 0x2020
+        {
+            return TestResult::Fail("Xe3 GPIO mask pre/preserve/post image diverges");
+        }
+        if gpio_clock_image(reserved, true) != reserved
+            || gpio_clock_image(reserved, false)
+                != reserved | GPIO_CLOCK_DIR_OUT | GPIO_CLOCK_VAL_MASK
+            || gpio_data_image(reserved, true) != reserved
+            || gpio_data_image(reserved, false) != reserved | GPIO_DATA_DIR_OUT | GPIO_DATA_VAL_MASK
+        {
+            return TestResult::Fail("Xe3 GPIO line image failed to preserve all mask bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gmbus",
+        smoke_xe3_gpio_mask_workaround_images
+    );
+
     // ── Simulated GMBUS controller + DDC slaves ──────────────
     //
     // The fake models the *hardware side* of the PRM
@@ -2032,8 +2143,9 @@ pub mod tests {
             Ddi::F,
             Ddi::G,
             Ddi::H,
+            Ddi::I,
         ];
-        let rows: [(Gen12Platform, [Option<u32>; 8]); 4] = [
+        let rows: [(Gen12Platform, [Option<u32>; 9]); 4] = [
             (
                 TigerLake,
                 [
@@ -2045,6 +2157,7 @@ pub mod tests {
                     Some(11),
                     Some(12),
                     Some(13),
+                    Some(14),
                 ],
             ),
             (
@@ -2057,6 +2170,7 @@ pub mod tests {
                     Some(10),
                     Some(11),
                     Some(12),
+                    None,
                     None,
                 ],
             ),
@@ -2071,6 +2185,7 @@ pub mod tests {
                     Some(11),
                     Some(12),
                     None,
+                    None,
                 ],
             ),
             (
@@ -2083,6 +2198,7 @@ pub mod tests {
                     Some(10),
                     Some(11),
                     Some(12),
+                    None,
                     None,
                 ],
             ),

@@ -168,11 +168,16 @@ impl Owner {
         // the primary's live SURF happens to match a driver-owned buffer.
         let generation = match self.family {
             Gen12Platform::TigerLake => Generation::TigerLake,
+            Gen12Platform::RocketLake => Generation::RocketLake,
+            // DG1 display ownership is not admitted by this integrated
+            // console owner. Keep the source-shared display metadata from
+            // becoming an accidental modeset route.
+            Gen12Platform::Dg1 => return Err(FsError::Unsupported),
             Gen12Platform::AlderLakeS | Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => {
                 Generation::AlderLake
             }
         };
-        fetchers_with_cursor(io, generation, owned_dsb, owned_cursor)?;
+        fetchers_with_cursor(io, generation, None, owned_dsb, owned_cursor)?;
         for pipe in 1..4 {
             if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
                 return Err(FsError::NoDevice);

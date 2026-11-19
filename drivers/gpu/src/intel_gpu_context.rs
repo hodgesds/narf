@@ -95,7 +95,7 @@ impl ContextSeed {
         if per_group == 0 || per_group > 32 {
             return Err(ContextError::Hwconfig);
         }
-        if platform.is_ptl() {
+        if platform.is_xe3_lpg() {
             // Source says modern GuC must supply physical-layout maxima.
             // Refuse missing values and any live DSS whose exact selector
             // would overflow the source four-bit group/instance fields.
@@ -132,7 +132,7 @@ impl ContextSeed {
                 return Err(ContextError::Topology);
             }
             let slice = mslices.trailing_zeros();
-            if platform == GtPlatform::Alchemist {
+            if platform.is_dg2() {
                 let bank = slice * 8;
                 steering((bank >> 2) & 7, bank & 3)?
             } else {
@@ -156,10 +156,22 @@ impl ContextSeed {
     /// Direct privileged ring commands, only while priming owns RCS0.
     pub(crate) fn commands(self) -> Vec<u32> {
         if self.platform.is_gen12() {
-            // xe_wa.c lrc_was for graphics1200: no XeHP SVG or L3SQCREG5.
+            // xe_wa.c lrc_was for graphics1200/1210: no XeHP SVG or
+            // L3SQCREG5. DG1 adds two platform-specific masked bits.
+            let hiz = if self.platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+            {
+                0x60006000
+            } else {
+                0x20002000
+            };
+            let common3 =
+                if self.platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+                    0x12000200
+                } else {
+                    0x02000200
+                };
             let mut words = vec![
-                0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
-                0x02000200,
+                0, 0x11000007, 0x2580, 0x00060002, 0x7018, hiz, 0x7300, 0x00400040, 0x7304, common3,
             ];
             // Wa16011163337/1604555607: nonmasked FF_MODE2, preserve low16.
             rmw(&mut words, 0x6604, 0xffff0000, 0xe0040000, 0);
@@ -169,7 +181,7 @@ impl ContextSeed {
             return words;
         }
         let mut masked = match self.platform {
-            GtPlatform::Alchemist => vec![
+            _ if self.platform.is_dg2() => vec![
                 (0x6208, 0x00200020), // TBIMR tuning
                 (0x7004, 0x08000800), // 18019271663
                 (0x703c, 0x00200020), // 18018764978
@@ -177,7 +189,7 @@ impl ContextSeed {
                 (0x731c, 0x40004000), // 16013271637
                 (0x83a4, 0xffff4000), // 14014947963
             ],
-            _ if self.platform.is_ptl() => {
+            _ if self.platform.is_xe3_lpg() => {
                 let mut entries = vec![
                     (0x6208, 0x00200020),
                     (0x7300, 0x10001000),
@@ -230,14 +242,14 @@ impl ContextSeed {
             words.extend_from_slice(&[reg, value]);
         }
         if self.platform.is_lnl()
-            || (self.platform.is_ptl() && self.graphics == 3000 && self.step < 4)
+            || (self.platform.is_xe3_lpg() && self.graphics == 3000 && self.step < 4)
         {
             rmw(&mut words, 0x6210, 0x18000, 0x18000, self.dss);
         } else if self.graphics == 2001 {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
-        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_ptl() {
-            if self.platform == GtPlatform::Alchemist {
+        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_xe3_lpg() {
+            if self.platform.is_dg2() {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
             rmw(&mut words, 0xb158, 0x3ff, 0x7f, self.l3);
@@ -248,7 +260,11 @@ impl ContextSeed {
         ]);
         // Wa_14019789679 also covers Xe-LPG and Xe2. Omitted headers
         // otherwise let a later context inherit the previous context's state.
-        for &(subopcode, size) in if self.platform.is_ptl() { &[][..] } else { SVG } {
+        for &(subopcode, size) in if self.platform.is_xe3_lpg() {
+            &[][..]
+        } else {
+            SVG
+        } {
             let opcode = if self.graphics >= 2000 && subopcode == 0x100 {
                 0 // Xe2 replaces DRAWING_RECTANGLE with pipelined _FAST.
             } else {
@@ -458,6 +474,7 @@ pub(crate) mod tests {
 
     fn smoke_context_workaround_and_steering_vectors() -> TestResult {
         for platform in [
+            GtPlatform::ArcticSoundM,
             GtPlatform::Alchemist,
             GtPlatform::Battlemage,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
@@ -496,13 +513,13 @@ pub(crate) mod tests {
                 assert_eq!(regs[&0xb158], 0xa500007f);
                 assert_eq!(
                     seed.l3,
-                    if platform == GtPlatform::Alchemist {
+                    if platform.is_dg2() {
                         0x43000000
                     } else {
                         0x41820000
                     }
                 );
-                if platform == GtPlatform::Alchemist {
+                if platform.is_dg2() {
                     assert_eq!(regs[&0x6604], 0xa5041234);
                     assert_eq!(regs[&0x83a4], 0x4000);
                 }
@@ -587,6 +604,15 @@ pub(crate) mod tests {
         ] {
             assert_eq!(regs[&reg], value);
         }
+        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let dg1_topology = GtTopology::read(&w, dg1).unwrap();
+        let dg1_seed = ContextSeed::read(&w, dg1, &dg1_topology, None).unwrap();
+        assert_eq!(dg1_seed.graphics, 1210);
+        let mut dg1_regs = BTreeMap::from([(0x7018, 0), (0x7304, 0x1000)]);
+        let (svg, _) = execute(&dg1_seed.commands(), &mut dg1_regs);
+        assert!(svg.is_empty());
+        assert_eq!(dg1_regs[&0x7018], 0x6000);
+        assert_eq!(dg1_regs[&0x7304], 0x200);
         TestResult::Pass
     }
     kernel_test_in!(

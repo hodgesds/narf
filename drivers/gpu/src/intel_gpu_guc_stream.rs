@@ -1102,17 +1102,13 @@ pub(crate) fn take_requested(index: u32) -> Option<Arc<StreamSession>> {
     Some(root)
 }
 pub(crate) fn supported(platform: crate::intel_gpu_gt::GtPlatform, version: (u8, u8, u8)) -> bool {
-    // Only the existing pinned GuC70 profiles own this CT/log ABI. New
-    // firmware majors/platforms must obtain independent protocol qualification.
-    use crate::{intel_gpu::Generation, intel_gpu_gt::GtPlatform};
-    matches!(
-        platform,
-        GtPlatform::Gen12(_)
-            | GtPlatform::Alchemist
-            | GtPlatform::Battlemage
-            | GtPlatform::Integrated(Generation::MeteorLake)
-    ) && version.0 == 70
-        && platform.guc().is_some_and(|p| version >= p.minimum_version)
+    // xe_guc_log uses the common GuC70 flush/ACK action ABI without a device
+    // family allowlist. The typed firmware profile supplies the exact per-
+    // family minimum; a new firmware major still needs separate qualification.
+    version.0 == 70
+        && platform
+            .guc()
+            .is_some_and(|profile| version >= profile.minimum_version)
 }
 /// The actual card-lifetime worker registers cached queue service. A generic
 /// UserBackend with no physical flush owner must never advertise this stream.

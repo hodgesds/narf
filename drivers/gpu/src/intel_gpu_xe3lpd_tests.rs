@@ -8,6 +8,7 @@
 //! hardware acknowledgements.
 use super::*;
 use crate::intel_gpu::Generation;
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError, PixelFormat};
 use crate::intel_gpu_pmdemand::{Demand, Layout, Params};
 use crate::intel_gpu_xelpg_cdclk::{self as cdclk, Current, Step};
@@ -74,15 +75,16 @@ impl MmioWindow for Regs {
 
 // ── Identification and route ─────────────────────────────────────
 
-fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult {
+fn smoke_xe3lpd_gmd_decode_admits_display30_through_decode_all() -> TestResult {
     use crate::intel_gpu_xe2lpd::IpError;
     // gmdid_display_map: 30.00 is xe2_lpd_display (Panther Lake), 30.02
-    // wcl_display (Wildcat Lake, not in the device table).
+    // is the distinct wcl_display. Both require the exact display-30 route;
+    // the normal Meteor/Lunar decoder still refuses both.
     assert_eq!(DisplayIp::decode_all(30 << 22), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(DisplayIp::decode_all((30 << 22) | 5), Ok(DisplayIp::Xe3Lpd));
     assert_eq!(
         DisplayIp::decode_all((30 << 22) | (2 << 14)),
-        Err(IpError::Unqualified { ver: 30, rel: 2 })
+        Ok(DisplayIp::WildcatLake)
     );
     // The Meteor/Lunar Lake entries keep refusing 30.00.
     assert_eq!(
@@ -111,6 +113,12 @@ fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult 
     );
     let io = Regs::with(&[(0x510a0, u32::MAX)]);
     assert_eq!(DisplayIp::read_all(&io), Err(IpError::NoDevice));
+    let io = Regs::with(&[(0x510a0, (30 << 22) | (2 << 14))]);
+    assert_eq!(DisplayIp::read_all(&io), Ok(DisplayIp::WildcatLake));
+    assert_eq!(
+        DisplayIp::read(&io),
+        Err(IpError::Unqualified { ver: 30, rel: 2 })
+    );
     // Display-30 properties of xe2_lpd_display and the display >= 20
     // branches it shares.
     let ip = DisplayIp::Xe3Lpd;
@@ -129,11 +137,24 @@ fn smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all() -> TestResult 
         ip.d2d(crate::intel_gpu_xelpg::XeLpgPort::A),
         (0x64000, 1 << 29, 1 << 28)
     );
+    let wcl = DisplayIp::WildcatLake;
+    assert!(wcl.is_display30() && wcl.xe2_plus());
+    assert_eq!(
+        (wcl.ver(), wcl.pipe_count(), wcl.fbc_instances()),
+        (30, 3, 3)
+    );
+    assert_eq!(wcl.allowed_dc_mask(), (1 << 3) | 2);
+    assert_eq!(wcl.dmc_firmware(), ("i915/xe3lpd_3002_dmc.bin", 0x8000));
+    assert_eq!(wcl.chicken_trans(), (1 << 4, 0));
+    assert_eq!(
+        wcl.d2d(crate::intel_gpu_xelpg::XeLpgPort::A),
+        (0x64000, 1 << 29, 1 << 28)
+    );
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3lpd",
-    smoke_xe3lpd_gmd_decode_admits_30_00_only_through_decode_all
+    smoke_xe3lpd_gmd_decode_admits_display30_through_decode_all
 );
 
 fn lit_ptl() -> Regs {
@@ -147,25 +168,39 @@ fn lit_ptl() -> Regs {
 
 fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult {
     use crate::intel_gpu_xe2lpd::IpError;
+    let ptl = GtPlatform::Integrated(Generation::PantherLake);
     let io = lit_ptl();
-    assert_eq!(
-        display_route(Generation::PantherLake, true, &io),
-        Ok(DisplayIp::Xe3Lpd)
-    );
+    assert_eq!(display_route(ptl, true, &io), Ok(DisplayIp::Xe3Lpd));
     for other in [
-        Generation::LunarLake,
-        Generation::MeteorLake,
-        Generation::TigerLake,
+        GtPlatform::Integrated(Generation::LunarLake),
+        GtPlatform::Integrated(Generation::MeteorLake),
+        GtPlatform::Integrated(Generation::TigerLake),
+        GtPlatform::NovaLakeS,
     ] {
         assert_eq!(
             display_route(other, true, &io),
-            Err(RouteRefusal::NotPantherLake)
+            Err(RouteRefusal::UnsupportedPlatform)
         );
     }
+    let wcl = lit_ptl();
+    wcl.set(0x510a0, (30 << 22) | (2 << 14));
+    assert_eq!(
+        display_route(GtPlatform::WildcatLake, true, &wcl),
+        Ok(DisplayIp::WildcatLake)
+    );
+    assert_eq!(
+        display_route(ptl, true, &wcl),
+        Err(RouteRefusal::Ip(IpError::Unqualified { ver: 30, rel: 2 }))
+    );
+    assert_eq!(
+        display_route(GtPlatform::WildcatLake, true, &io),
+        Err(RouteRefusal::Ip(IpError::Unqualified { ver: 30, rel: 0 }))
+    );
+    assert!(wcl.writes.borrow().is_empty());
     // Without the option nothing is read.
     let io = lit_ptl();
     assert_eq!(
-        display_route(Generation::PantherLake, false, &io),
+        display_route(ptl, false, &io),
         Err(RouteRefusal::NotRequested)
     );
     assert_eq!(io.reads.get(), 0);
@@ -195,21 +230,14 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
     ] {
         let io = lit_ptl();
         io.set(r, v);
-        assert_eq!(
-            display_route(Generation::PantherLake, true, &io),
-            Err(refusal),
-            "{r:#x}={v:#x}"
-        );
+        assert_eq!(display_route(ptl, true, &io), Err(refusal), "{r:#x}={v:#x}");
         assert!(io.writes.borrow().is_empty(), "refusal wrote");
     }
     // A fused-out pipe B/C/D or other PICA config bits do not refuse.
     let io = lit_ptl();
     io.set(0x51000, 1 << 28);
     io.set(0x16fe68, 0x7fff_ffff);
-    assert_eq!(
-        display_route(Generation::PantherLake, true, &io),
-        Ok(DisplayIp::Xe3Lpd)
-    );
+    assert_eq!(display_route(ptl, true, &io), Ok(DisplayIp::Xe3Lpd));
     assert!(io.writes.borrow().is_empty());
     // The strict opt-in grammar; the Lunar Lake option does not request it.
     use narf_boot::args::KernelCmdline;
@@ -217,6 +245,33 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
     assert!(requested(KernelCmdline::new(
         "quiet narf.intel.ptl_display=1 root=/dev/sda"
     )));
+    assert!(wcl_requested(KernelCmdline::new(
+        "quiet narf.intel.wcl_display=1 root=/dev/sda"
+    )));
+    assert!(!requested(KernelCmdline::new("narf.intel.wcl_display=1")));
+    assert!(!wcl_requested(KernelCmdline::new(
+        "narf.intel.ptl_display=1"
+    )));
+    assert!(platform_requested(
+        ptl,
+        KernelCmdline::new("narf.intel.ptl_display=1")
+    ));
+    assert!(!platform_requested(
+        ptl,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
+    assert!(platform_requested(
+        GtPlatform::WildcatLake,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
+    assert!(!platform_requested(
+        GtPlatform::WildcatLake,
+        KernelCmdline::new("narf.intel.ptl_display=1")
+    ));
+    assert!(!platform_requested(
+        GtPlatform::NovaLakeS,
+        KernelCmdline::new("narf.intel.wcl_display=1")
+    ));
     for line in [
         "",
         "narf.intel.ptl_display",
@@ -227,6 +282,7 @@ fn smoke_xe3lpd_route_is_read_only_and_keeps_headless_otherwise() -> TestResult 
         "narf.intel.lnl_display=1",
     ] {
         assert!(!requested(KernelCmdline::new(line)), "{line}");
+        assert!(!wcl_requested(KernelCmdline::new(line)), "{line}");
     }
     TestResult::Pass
 }
@@ -343,6 +399,7 @@ fn smoke_xe3lpd_cdclk_table_ctl_voltage_and_ceiling() -> TestResult {
     );
     assert_eq!(cdclk::calc_cdclk_ip(DisplayIp::Xe3Lpd, 691_201), None);
     assert_eq!(cdclk::max_cdclk_khz(DisplayIp::Xe3Lpd), 691_200);
+    assert_eq!(cdclk::max_cdclk_khz(DisplayIp::WildcatLake), 480_000);
     assert_eq!(cdclk::max_cdclk_khz(DisplayIp::Xe2Lpd), 652_800);
     // bxt_cdclk_ctl, display >= 30: DIV_SEL_1, no CD2X pipe field, the
     // MDCLK source select. Display 20 keeps CD2X_PIPE_NONE.
@@ -359,6 +416,7 @@ fn smoke_xe3lpd_cdclk_table_ctl_voltage_and_ceiling() -> TestResult {
         assert_eq!(cdclk::voltage_level_ip(DisplayIp::Xe3Lpd, khz), 0);
     }
     assert_eq!(cdclk::voltage_level_ip(DisplayIp::Xe2Lpd, 652_800), 3);
+    assert_eq!(cdclk::voltage_level_ip(DisplayIp::WildcatLake, 480_000), 0);
     // bxt_get_cdclk + bxt_sanitize_cdclk on display 30: a CD2X pipe field
     // left by firmware is ignored, a decimal field is not.
     let io = Regs::with(&[
@@ -484,6 +542,51 @@ kernel_test_in!(
     smoke_xe3lpd_cdclk_plan_crawl_squash_and_wa_13012396614
 );
 
+fn smoke_xe3p_lpd_mdclk_uses_wide_mbus_and_dbuf_fields() -> TestResult {
+    use crate::intel_gpu_xelpg_cdclk::{
+        nova_lake_dbuf_ctl, nova_lake_dbuf_min_tracker, nova_lake_mbus_ctl,
+        nova_lake_mbus_throttle, nova_lake_mdclk_cdclk_ratio, NOVA_LAKE_DBUF_MIN_TRACKER_MASK,
+        NOVA_LAKE_MBUS_THROTTLE_MASK, NOVA_LAKE_TABLE,
+    };
+
+    assert_eq!(NOVA_LAKE_MBUS_THROTTLE_MASK, 0x0001_e000);
+    assert_eq!(NOVA_LAKE_DBUF_MIN_TRACKER_MASK, 0x001f_0000);
+    for (khz, ratio) in [
+        (151_200, 6),
+        (176_400, 5),
+        (201_600, 4),
+        (277_200, 3),
+        (403_200, 2),
+        (787_200, 2),
+    ] {
+        let rung = NOVA_LAKE_TABLE
+            .iter()
+            .copied()
+            .find(|rung| rung.cdclk_khz == khz)
+            .unwrap();
+        assert_eq!(nova_lake_mdclk_cdclk_ratio(rung), ratio, "{khz}");
+    }
+    assert!(NOVA_LAKE_TABLE
+        .iter()
+        .all(|rung| nova_lake_mdclk_cdclk_ratio(*rung) * 2 - 1 <= 0x1f));
+
+    let lowest = NOVA_LAKE_TABLE[0];
+    assert_eq!(nova_lake_mbus_throttle(6), 5 << 13);
+    assert_eq!(nova_lake_dbuf_min_tracker(6, false), 5 << 16);
+    assert_eq!(nova_lake_dbuf_min_tracker(6, true), 11 << 16);
+    assert_eq!(nova_lake_mbus_ctl(0xdc01_e001, lowest), 0xdc00_a001);
+    assert_eq!(nova_lake_dbuf_ctl(0xc0f8_0001, lowest, true), 0x80eb_0001);
+
+    // Display 20's three-bit field cannot represent Nova Lake's joined
+    // ratio 12. Keeping the images separate prevents silent truncation.
+    assert_eq!(crate::intel_gpu_xe2lpd::dbuf_min_tracker(6, true), 3 << 16);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3p_lpd_mdclk_uses_wide_mbus_and_dbuf_fields
+);
+
 // ── PM demand ────────────────────────────────────────────────────
 
 fn smoke_xe3lpd_pmdemand_xe3_layout() -> TestResult {
@@ -533,6 +636,7 @@ fn smoke_xe3lpd_pmdemand_xe3_layout() -> TestResult {
     let split = Params::decode(0xf0, 0);
     assert_eq!((split.active_pipes, split.active_dbufs), (3, 3));
     assert_eq!(Layout::for_ip(DisplayIp::Xe3Lpd), Layout::Xe3);
+    assert_eq!(Layout::for_ip(DisplayIp::WildcatLake), Layout::Xe3);
     assert_eq!(Layout::for_ip(DisplayIp::Xe2Lpd), Layout::PreXe3);
     TestResult::Pass
 }
@@ -702,6 +806,36 @@ fn smoke_xe3lpd_resources_auto_min_alloc_and_min_buf_cfg() -> TestResult {
         res::compute_ip(DisplayIp::Xe2Lpd, &request, &std_latency()),
         Err(res::ResourceError::CdclkUnsatisfiable)
     );
+    // Wildcat Lake retains display-30 watermark/PM rules but has a 480 MHz
+    // ceiling and no Pipe D in wcl_display. Its register image must never
+    // touch the absent Pipe-D watermark block.
+    let wcl = res::compute_ip_vblank(
+        DisplayIp::WildcatLake,
+        &panel_request(),
+        &std_latency(),
+        vblank,
+    )
+    .unwrap();
+    assert_eq!(wcl.cdclk.cdclk_khz, 153_600);
+    let off = res::all_off_pmdemand_ip(DisplayIp::WildcatLake, &std_latency(), rung(153_600));
+    assert_eq!((off.active_pipes, off.active_dbufs, off.scalers), (0, 0, 0));
+    assert!(wcl
+        .plane_registers()
+        .unwrap()
+        .iter()
+        .all(|(r, _)| !(0x73000..0x74000).contains(r)));
+    let mut too_fast = panel_request();
+    too_fast.min_cdclk_khz = 480_001;
+    assert_eq!(
+        res::compute_ip_vblank(DisplayIp::WildcatLake, &too_fast, &std_latency(), vblank),
+        Err(res::ResourceError::CdclkUnsatisfiable)
+    );
+    let mut pipe_d = panel_request();
+    pipe_d.pipes[3] = pipe_d.pipes[0];
+    assert_eq!(
+        res::compute_ip_vblank(DisplayIp::WildcatLake, &pipe_d, &std_latency(), vblank),
+        Err(res::ResourceError::Unsupported)
+    );
     TestResult::Pass
 }
 kernel_test_in!(
@@ -744,6 +878,21 @@ fn smoke_xe3lpd_bandwidth_sa_info_limit() -> TestResult {
         Some(768)
     );
     assert_eq!(qgv_peak_bw_ip(DisplayIp::Xe3Lpd, &qgv, 50_000, 1), None);
+    // The 1600 MHz point offers 20339 MB/s after derating, so Linux's
+    // least-headroom rule selects its 25600 MB/s peak at a 20 GB/s load.
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 20_000, 1),
+        Some(256)
+    );
+    // The faster point reaches the xe3lpd_3002_sa_info 22 GB/s ceiling.
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 22_000, 1),
+        Some(768)
+    );
+    assert_eq!(
+        qgv_peak_bw_ip(DisplayIp::WildcatLake, &qgv, 22_001, 1),
+        None
+    );
     assert_eq!(
         qgv_peak_bw_ip(DisplayIp::Xe2Lpd, &qgv, 30_000, 1),
         qgv_peak_bw(&qgv, 30_000, 1)
@@ -1207,12 +1356,32 @@ kernel_test_in!(
 );
 
 fn smoke_xe3lpd_entry_refuses_without_display30_read_only() -> TestResult {
-    for gmd in [14 << 22, 20 << 22, 0, (30 << 22) | (2 << 14)] {
+    for gmd in [14 << 22, 20 << 22, 0] {
         let io = Ptl::new();
         io.values.borrow_mut().insert(0x510a0, gmd);
         assert_eq!(io.run(), Err(ModesetError::UnsupportedGeneration));
         assert!(io.writes.borrow().is_empty(), "{gmd:#x}");
     }
+    // WCL uses the same display-30 Pipe-A sequence but retains its exact
+    // three-pipe resource profile and never accesses Pipe D.
+    let io = Ptl::new();
+    io.values
+        .borrow_mut()
+        .insert(0x510a0, (30 << 22) | (2 << 14));
+    assert_eq!(io.run(), Ok(Mode::VESA_1024X768_60));
+    assert!(io
+        .writes
+        .borrow()
+        .iter()
+        .all(|(r, _)| !(0x73000..0x74000).contains(r)));
+    assert_eq!(
+        crate::intel_gpu_display_resources::Profile::capture(
+            &View::new(&io, false),
+            &Mode::VESA_1024X768_60,
+        )
+        .map(|profile| profile.ip),
+        Ok(DisplayIp::WildcatLake)
+    );
     // The entry needs the display-30 view (the PICA dialect).
     let io = Ptl::new();
     assert_eq!(

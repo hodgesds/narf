@@ -12,7 +12,7 @@ mod model;
 #[cfg(feature = "kernel-test")]
 pub(crate) use model::{
     execute_fixture, fixture_add_window, fixture_copies, fixture_finish, fixture_metadata,
-    fixture_pointer, fixture_seed, fixture_state,
+    fixture_page_shifts, fixture_pointer, fixture_seed, fixture_state,
 };
 
 const CODE: u64 = 0x1234_0000_0000;
@@ -23,7 +23,13 @@ const CHUNK: u64 = 64 * 1024 * 1024;
 /// Build the trusted flat-CCS clear batch for a VRAM object. This performs
 /// the CCS-clear claim itself (`begin_ccs_clear`, ccs 1 -> 2): callers must
 /// not claim it first, or the second claim fails with `InvalidData`.
-pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch, FsError> {
+pub(crate) fn prepare_vram_clear(
+    platform: GtPlatform,
+    object: Arc<GemObject>,
+) -> Result<ResidentBatch, FsError> {
+    if !platform.is_dg2() {
+        return Err(FsError::Unsupported);
+    }
     object.begin_ccs_clear()?;
     let size = object.size();
     if size == 0 || size & 65535 != 0 || size > 256 * 1024 * 1024 {
@@ -38,7 +44,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
     for offset in (0..size).step_by(copy::COPY_CHUNK as usize) {
         copy::emit_data_copy(
             &mut words,
-            GtPlatform::Alchemist,
+            platform,
             ZERO,
             TARGET + offset,
             (size - offset).min(copy::COPY_CHUNK),
@@ -55,7 +61,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
         code.write(i as u64 * 4, &word.to_le_bytes())?;
     }
     ResidentBatch::from_vm(
-        GtPlatform::Alchemist,
+        platform,
         &[
             VmMapping {
                 dumpable: false,

@@ -201,7 +201,7 @@ impl Control {
     pub(crate) fn new(index: u32) -> Option<Arc<Self>> {
         let card = crate::drm_registry::card(index)?;
         if card.driver() != "intel-gpu"
-            || !GtPlatform::from_pci(card.vendor_id(), card.device_id())?.is_discrete()
+            || !GtPlatform::from_pci(card.vendor_id(), card.device_id())?.multiple_ccs()
         {
             return None;
         }

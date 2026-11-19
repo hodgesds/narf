@@ -139,6 +139,7 @@ fn register_test_virtio_card() -> u32 {
 /// A test Intel card: same shape as the virtio fixture, but driven by
 /// `IntelGpuCard` so the bridge resolves `driver_name(idx)` to
 /// "intel-gpu" and the Intel-only VRR modeset forcing applies.
+#[cfg(feature = "intel")]
 fn register_test_intel_card() -> u32 {
     let name = format!("card{}", crate::drm_registry::count());
     let card = Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
@@ -1072,6 +1073,7 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_properties);
 // VRR_ENABLED needs ALLOW_MODESET; the same commit on virtio needs
 // none (the test above). A same-value commit needs no modeset, and
 // TEST_ONLY validates without applying.
+#[cfg(feature = "intel")]
 fn smoke_drm_ioctl_vrr_intel_modeset() -> TestResult {
     let idx = register_test_intel_card();
     let Some(ms) = crate::drm_registry::mode_state(idx) else {
@@ -1131,6 +1133,7 @@ fn smoke_drm_ioctl_vrr_intel_modeset() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "intel")]
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_intel_modeset);
 
 // ── CRTC CTM / GAMMA_LUT and connector Colorspace / HDR_OUTPUT_METADATA ─

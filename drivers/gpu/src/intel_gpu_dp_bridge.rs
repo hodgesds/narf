@@ -6,7 +6,7 @@
 //! DDI). Per VESA DP Alt Mode v2.0 §6 and Tiger Lake / Alder Lake
 //! PRM Vol. 12 §"DDI Buffer", the source side does:
 //!
-//! 1. Map USB-C connector → DDI (TC1..TC5 → Ddi::D..H on Gen12).
+//! 1. Map USB-C connector → DDI (TC1..TC6 → Ddi::D..I on Gen12).
 //! 2. Bind a Pipe + Transcoder to that DDI.
 //! 3. Open an AUX channel — DPCD reads now flow over the USB-C aux
 //!    pins. EDID over I²C-over-AUX gives the sink's preferred mode.
@@ -18,17 +18,19 @@
 //!   adapter for the BAR0 `MmioRegion`, dispatch into AUX + Modeset.
 //! - A session retains its pipe, scanout and TC-cold/AUX/PHY ownership.
 //!   Detach stops the pipe, DDI transport and Dekel PLL before release;
-//!   uncertain stop retains the session and vetoes display power retirement.
-//! - Tiger Lake and Alder Lake-P use their own banked Dekel PLL, clock
+//!   uncertain stop retains the session, published image and backing, and
+//!   vetoes display power retirement. Successful modeset publication carries
+//!   a unique session serial, so stale detach cannot withdraw a newer output.
+//! - Tiger Lake and Alder Lake-P/N use their own banked Dekel PLL, clock
 //!   routing and TX presets. Negotiation respects the PD lane limit and
 //!   source training patterns/levels track the shared sink algorithm.
 //!
 //! ## USB-C connector → DDI mapping
 //!
-//! This bridge exposes TC1..TC5 as DDIs D..H and requires native TC
-//! numbering from its TCPM connector registration. Tiger Lake also has
-//! TC6, which the current Ddi enum does not expose; Alder Lake-P has
-//! four TC PHYs. A successful PD negotiation alone does not establish
+//! This bridge exposes TC1..TC6 as DDIs D..I and requires native TC
+//! numbering from its TCPM connector registration. Tiger Lake has all six;
+//! Alder Lake-P/N have four and their typed Dekel owner rejects TC5/TC6 before
+//! MMIO. A successful PD negotiation alone does not establish
 //! board wiring. Arbitrary firmware/UCSI connector numbering needs a
 //! board routing map before it can use this bridge.
 
@@ -59,9 +61,10 @@ struct BridgeSession {
     port: DklPort,
     bar: u64,
     pipe: Option<Pipe>,
+    publication_serial: u64,
 }
-static SESSIONS: narf_lib::mutex::Mutex<[Option<BridgeSession>; 8]> =
-    narf_lib::mutex::Mutex::new([None; 8]);
+static SESSIONS: narf_lib::mutex::Mutex<[Option<BridgeSession>; 9]> =
+    narf_lib::mutex::Mutex::new([None; 9]);
 
 /// System/display power transitions must not retire a function behind an
 /// attached or quarantined Type-C owner. A racing attach also vetoes.
@@ -72,12 +75,12 @@ pub(crate) fn sessions_stopped(bar: u64) -> bool {
 }
 
 /// Map a USB-C [`ConnectorId`] to the Gen12 Type-C DDI it's wired
-/// to. Returns `None` if the index is outside the documented TC1..5
+/// to. Returns `None` if the index is outside the documented TC1..6
 /// range exposed by this bridge. DklPort separately checks the family's
-/// physical TC count; TC6 needs an expanded Ddi representation.
+/// physical TC count.
 ///
 /// PRM Vol. 12 §"Display DDI Port Index":
-///   TC1 = Ddi::D, TC2 = Ddi::E, TC3 = Ddi::F, TC4 = Ddi::G, TC5 = Ddi::H.
+///   TC1 = Ddi::D through TC6 = Ddi::I.
 pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
     match connector.as_u32() {
         0 => Some(Ddi::D),
@@ -85,6 +88,7 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
         2 => Some(Ddi::F),
         3 => Some(Ddi::G),
         4 => Some(Ddi::H),
+        5 => Some(Ddi::I),
         _ => None,
     }
 }
@@ -210,6 +214,8 @@ impl IntelDpBridge {
         }
         let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)
             .ok_or(DpBridgeError::NoSuchConnector)?;
+        let publication_serial =
+            intel_gpu::next_external_scanout_serial().ok_or(DpBridgeError::NotReady)?;
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -237,10 +243,13 @@ impl IntelDpBridge {
                 port,
                 bar: gpu.gtt_mmadr.phys.raw(),
                 pipe: None,
+                publication_serial,
             });
         }
-        port.connect(&mmio, gpu.gtt_mmadr.phys.raw(), cfg.lanes)
+        let assigned_lanes = port
+            .acquire_dp_alt(&mmio, gpu.gtt_mmadr.phys.raw())
             .map_err(|_| DpBridgeError::NotReady)?;
+        let max_lanes = cfg.lanes.min(assigned_lanes);
 
         // Try an EDID readback over AUX. AUX may not yet be reachable
         // (DPRX side could still be waking up); a failure here isn't
@@ -307,7 +316,7 @@ impl IntelDpBridge {
         // machine, the pipe gets its DBUF share and the pipes
         // already live are reprogrammed to theirs.
         let mut modeset = Modeset::for_pipe(&mmio, ddi, pipe);
-        modeset.set_typec_width(cfg.lanes);
+        modeset.set_typec_width(max_lanes);
         let active = intel_gpu_multipipe::active_pipes();
         if active.len() >= 2 {
             if let Some((start, end)) = intel_gpu_multipipe::share_for(&active, pipe) {
@@ -322,7 +331,7 @@ impl IntelDpBridge {
                     .and_then(|caps| {
                         let source = crate::dp_link_training::SourceCaps {
                             max_rate: crate::dp_link_training::LinkRate::Hbr3,
-                            max_lanes: cfg.lanes,
+                            max_lanes,
                         };
                         let plan = crate::dp_link_training::negotiate(
                             &source,
@@ -394,6 +403,19 @@ impl IntelDpBridge {
                         crate::intel_gpu_vrr::msa_timing_par_ignore_wanted(1),
                     );
                 }
+                // The native pipe/surface witnesses above precede
+                // publication. The retained session serial makes a later
+                // detach exact even if another output supersedes this image.
+                intel_gpu::publish_external_scanout(
+                    narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base(),
+                        u32::from(mode.h_active),
+                        u32::from(mode.v_active),
+                        fb.stride_bytes,
+                        32,
+                    ),
+                    publication_serial,
+                );
                 Ok(())
             }
             Err(ModesetError::EdidUnavailable) => {
@@ -420,8 +442,8 @@ impl IntelDpBridge {
 
 /// Scanouts stay retained until the owning session proves a local stop.
 /// Failed stop never frees backing or recycles its pipe for another user.
-static BRIDGE_SCANOUTS: IrqSafeSpinLock<[Option<ContiguousScanout>; 8]> =
-    IrqSafeSpinLock::new([None; 8]);
+static BRIDGE_SCANOUTS: IrqSafeSpinLock<[Option<ContiguousScanout>; 9]> =
+    IrqSafeSpinLock::new([None; 9]);
 
 fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeError> {
     let mut sessions = SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?;
@@ -450,6 +472,10 @@ fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeEr
     if let Some(pipe) = session.pipe {
         intel_gpu_multipipe::release_pipe(pipe, ddi);
     }
+    // Stop is locally proven at this point. Withdraw before releasing the
+    // physical backing; a stale serial is a no-op and therefore cannot blank
+    // a newer internal, SST or Display-14 publication.
+    intel_gpu::withdraw_external_scanout(session.publication_serial);
     let allocation = BRIDGE_SCANOUTS.lock()[ddi as usize].take();
     if let Some(allocation) = allocation {
         crate::intel_gpu_gtt::free_contiguous_scanout(&allocation);
@@ -539,13 +565,14 @@ pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    fn smoke_connector_to_ddi_maps_tc1_through_tc5() -> TestResult {
+    fn smoke_connector_to_ddi_maps_tc1_through_tc6() -> TestResult {
         let wants = [
             (0, Ddi::D),
             (1, Ddi::E),
             (2, Ddi::F),
             (3, Ddi::G),
             (4, Ddi::H),
+            (5, Ddi::I),
         ];
         for (idx, want) in wants.iter().copied() {
             match super::connector_to_ddi(ConnectorId::from_index(idx)) {
@@ -560,12 +587,12 @@ pub mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp_bridge",
-        smoke_connector_to_ddi_maps_tc1_through_tc5
+        smoke_connector_to_ddi_maps_tc1_through_tc6
     );
 
     fn smoke_connector_to_ddi_unmaps_out_of_range() -> TestResult {
-        if super::connector_to_ddi(ConnectorId::from_index(5)).is_some() {
-            return TestResult::Fail("connector 5 should be unmapped");
+        if super::connector_to_ddi(ConnectorId::from_index(6)).is_some() {
+            return TestResult::Fail("connector 6 should be unmapped");
         }
         if super::connector_to_ddi(ConnectorId::from_index(100)).is_some() {
             return TestResult::Fail("connector 100 should be unmapped");

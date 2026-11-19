@@ -2613,7 +2613,7 @@ pub(crate) fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring:
             cursor += 2;
         }
     }
-    let extra: &[u32] = if platform == GtPlatform::Alchemist {
+    let extra: &[u32] = if platform.is_dg2() {
         &[0x1b0, 0x5a8, 0x5ac]
     } else {
         cursor += 2;

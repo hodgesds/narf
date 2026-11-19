@@ -145,7 +145,7 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> 
         _ if platform.is_xe2() => ((fuse4 >> 16) & 0xf) as u8,
         GtPlatform::Gen12(_) => 0,
         GtPlatform::Integrated(_) => 1,
-        GtPlatform::Alchemist => {
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
             // get_num_dss_regs: one geometry and one compute register, so
             // each quadrant is 8 DSS of the geometry|compute union.
             (0..4)
@@ -153,6 +153,8 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> 
                 .fold(0, |m, q| m | 1 << q)
         }
         GtPlatform::Battlemage => ((fuse4 >> 16) & 0xf) as u8,
+        GtPlatform::WildcatLake => ((fuse4 >> 16) & 0xf) as u8,
+        GtPlatform::NovaLakeS => ((fuse4 >> 16) & 0xf) as u8,
     }
 }
 
@@ -449,8 +451,10 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
         _ if platform.is_headless_integrated() => 3,
         GtPlatform::Gen12(_) => 3,
         GtPlatform::Integrated(_) => 9,
-        GtPlatform::Alchemist => 1,
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist => 1,
         GtPlatform::Battlemage => 3,
+        GtPlatform::WildcatLake => 3,
+        GtPlatform::NovaLakeS => 3,
     }
 }
 
@@ -460,7 +464,7 @@ pub(crate) fn copy_seed(engine: Engine, platform: GtPlatform) -> Vec<u32> {
     let uc = uncached_mocs(platform);
     let reg = engine.base() + 0x204;
     let mut words = if platform.is_gen12() {
-        gen12_nonrender_seed()
+        gen12_nonrender_seed(platform)
     } else {
         Vec::new()
     };
@@ -509,10 +513,19 @@ pub(crate) fn compute_seed(engine: Engine, platform: GtPlatform, disable_wmtp: b
 
 /// Source graphics1200 lrc_was shared by nonrender engines. Media has no
 /// BLIT_CCTL or render FF_MODE2/3D initialization.
-pub(crate) fn gen12_nonrender_seed() -> Vec<u32> {
+pub(crate) fn gen12_nonrender_seed(platform: GtPlatform) -> Vec<u32> {
+    let dg1 = platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
     alloc::vec![
-        0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
-        0x02000200
+        0,
+        0x11000007,
+        0x2580,
+        0x00060002,
+        0x7018,
+        if dg1 { 0x60006000 } else { 0x20002000 },
+        0x7300,
+        0x00400040,
+        0x7304,
+        if dg1 { 0x12000200 } else { 0x02000200 }
     ]
 }
 
@@ -561,7 +574,7 @@ pub(crate) fn media_ring_at(
 /// and no media 13.00 LRC rule exists), so the WA job is empty.
 pub(crate) fn media_seed(platform: GtPlatform) -> Vec<u32> {
     if platform.is_gen12() {
-        gen12_nonrender_seed()
+        gen12_nonrender_seed(platform)
     } else {
         Vec::new()
     }
@@ -1115,7 +1128,11 @@ pub(crate) mod tests {
             0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
             0x02000200,
         ];
-        assert_eq!(gen12_nonrender_seed(), generic);
+        assert_eq!(gen12_nonrender_seed(platform), generic);
+        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        let dg1_seed = gen12_nonrender_seed(dg1);
+        assert_eq!(dg1_seed[5], 0x60006000);
+        assert_eq!(dg1_seed[9], 0x12000200);
         let bcs = copy_seed(Engine::Bcs0, platform);
         assert_eq!(&bcs[..10], &generic);
         assert_eq!(&bcs[10..13], &[0x15080001, 0x22204, 0x600]);
