@@ -44,6 +44,22 @@ const EFI_DTB_TABLE_GUID: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aa
 const KERNEL_HASH_MARKER: [u8; 20] = *b"NARF_KERNEL_BLAKE2B=";
 const KERNEL_HASH_PLACEHOLDER: [u8; 64] = [0xa5; 64];
 const KERNEL_HASH_BUFFER_SIZE: usize = 4096;
+/// QEMU `virt` PL011 UART base. The smoke test's serial capture is this
+/// UART, and the firmware console writes through it, so direct MMIO writes
+/// here after ExitBootServices land in the same captured stream.
+const PL011_BASE: u64 = 0x0900_0000;
+const PL011_DR_OFFSET: u64 = 0x000;
+const PL011_FR_OFFSET: u64 = 0x018;
+const PL011_FR_TXFF: u32 = 1 << 5;
+/// PL011 peripheral-ID registers (read-only): part number 0x011 plus the
+/// ARM PrimeCell ID block. PID2/PID3 are revision-dependent and deliberately
+/// not checked.
+const PL011_PERIPH_ID0_OFFSET: u64 = 0xfe0;
+const PL011_PERIPH_ID1_OFFSET: u64 = 0xfe4;
+const PL011_CELL_ID0_OFFSET: u64 = 0xff0;
+const PL011_CELL_ID1_OFFSET: u64 = 0xff4;
+const PL011_CELL_ID2_OFFSET: u64 = 0xff8;
+const PL011_CELL_ID3_OFFSET: u64 = 0xffc;
 
 /// One memory-map entry overlapping the kernel's file-backed span.
 #[derive(Clone, Copy, Debug)]
@@ -481,6 +497,46 @@ fn load_and_start() -> Result<(), LoadError> {
         let _ = zero_len;
     }
 
+    // [hang147] diagnostic: this is the last stage that can print through
+    // the firmware console — `uefi::println!` is a no-op after
+    // ExitBootServices — so the marker and the post-EBS plan are recorded
+    // here.
+    uefi::println!(
+        "NARF UEFI loader: [hang147] stage: segments-copied load-span {:#x}-{:#x} file-backed-end {:#x} entry {:#x} dtb {:#x}",
+        page_start,
+        page_end,
+        elf.file_backed_end,
+        elf.entry,
+        dtb
+    );
+    for fill in &fills[..fill_count] {
+        uefi::println!(
+            "NARF UEFI loader: [hang147] plan: hole-fill dest {:#x} len {:#x}",
+            fill.dest,
+            fill.len
+        );
+    }
+    for segment in elf.segments() {
+        let zero_len = segment.memory_size - segment.file_size;
+        if zero_len != 0 {
+            uefi::println!(
+                "NARF UEFI loader: [hang147] plan: bss-zero {:#x}-{:#x}",
+                segment.physical + segment.file_size,
+                segment.physical + segment.memory_size
+            );
+        }
+    }
+    // The post-EBS markers bypass boot services entirely (direct PL011
+    // writes), but only when a PL011 was positively identified before
+    // ExitBootServices — see `pl011_available`.
+    let uart = pl011_available(&map);
+    if !uart {
+        uefi::println!(
+            "NARF UEFI loader: [hang147] note: no PL011 at {:#x}, post-EBS stage markers disabled",
+            PL011_BASE
+        );
+    }
+
     drop(kernel);
     drop(root);
     drop(protocol);
@@ -488,6 +544,13 @@ fn load_and_start() -> Result<(), LoadError> {
     // loaded pages and the firmware-owned DTB intentionally remain live.
     let memory_map = unsafe { boot::exit_boot_services(None) };
     core::mem::forget(memory_map);
+    uart_marker(
+        uart,
+        format_args!(
+            "NARF UEFI loader: [hang147] stage: exited-boot-services entry {:#x} dtb {:#x}\n",
+            elf.entry, dtb
+        ),
+    );
 
     // The staged hole bytes go in first: the staging buffers may sit inside
     // the .bss tail, so they are copied before the tail zeroing below wipes
@@ -500,6 +563,13 @@ fn load_and_start() -> Result<(), LoadError> {
             ptr::copy_nonoverlapping(fill.staging as *const u8, fill.dest as *mut u8, fill.len);
         }
     }
+    uart_marker(
+        uart,
+        format_args!(
+            "NARF UEFI loader: [hang147] stage: hole-fill-done fills {}\n",
+            fill_count
+        ),
+    );
 
     // Boot services are gone, so every BOOT_SERVICES_* range is now ordinary
     // free memory owned by us — including the .bss tail deliberately left
@@ -522,6 +592,18 @@ fn load_and_start() -> Result<(), LoadError> {
             )
         };
     }
+    let bss_zeroed: u64 = elf
+        .segments()
+        .iter()
+        .map(|segment| segment.memory_size - segment.file_size)
+        .sum();
+    uart_marker(
+        uart,
+        format_args!(
+            "NARF UEFI loader: [hang147] stage: bss-zero-done bytes {:#x}\n",
+            bss_zeroed
+        ),
+    );
 
     // The NARF aarch64 entry follows the Linux boot protocol: x0 is the
     // physical DTB address and execution begins at the ELF entry at EL1.
@@ -529,6 +611,13 @@ fn load_and_start() -> Result<(), LoadError> {
     // segment copied to its declared physical address.
     let kernel_entry: extern "C" fn(usize) -> ! =
         unsafe { core::mem::transmute(elf.entry as usize) };
+    uart_marker(
+        uart,
+        format_args!(
+            "NARF UEFI loader: [hang147] stage: jumping-to-kernel entry {:#x} dtb {:#x}\n",
+            elf.entry, dtb
+        ),
+    );
     kernel_entry(dtb)
 }
 
@@ -1060,6 +1149,85 @@ fn copy_segment_piece(
         segment.file_offset + (from - segment.physical),
         destination,
     )
+}
+
+/// Is there a real PL011 at the QEMU `virt` UART address? Both halves are
+/// checked while boot services are live: the memory map must list the
+/// address as MMIO, and the PrimeCell ID block must read as a PL011. The
+/// result is carried into the post-EBS stages, where no firmware service
+/// can answer the question anymore — and where a wrong guess would write
+/// marker bytes into an unrelated device's registers.
+fn pl011_available(map: &impl MemoryMap) -> bool {
+    let mmio = map.entries().any(|d| {
+        let end = d
+            .phys_start
+            .saturating_add(d.page_count.saturating_mul(PAGE_SIZE));
+        d.ty == MemoryType::MMIO && d.phys_start <= PL011_BASE && PL011_BASE < end
+    });
+    if !mmio {
+        return false;
+    }
+    // SAFETY: the memory map lists this range as MMIO, and the ID
+    // registers are read-only by the PrimeCell specification.
+    let id =
+        |offset: u64| unsafe { ptr::read_volatile((PL011_BASE + offset) as *const u32) & 0xff };
+    id(PL011_PERIPH_ID0_OFFSET) == 0x11
+        && id(PL011_PERIPH_ID1_OFFSET) == 0x10
+        && id(PL011_CELL_ID0_OFFSET) == 0x0d
+        && id(PL011_CELL_ID1_OFFSET) == 0xf0
+        && id(PL011_CELL_ID2_OFFSET) == 0x05
+        && id(PL011_CELL_ID3_OFFSET) == 0xb1
+}
+
+/// Write one byte straight to the PL011 data register, waiting for TX
+/// FIFO space first. Only called after ExitBootServices (see
+/// `uart_marker`); the firmware leaves the UART configured, and the
+/// smoke test captures this UART, so the bytes land in the same serial
+/// log the firmware console was writing to.
+unsafe fn uart_write_byte(byte: u8) {
+    // SAFETY: the caller verified with `pl011_available` before
+    // ExitBootServices that a PL011 lives at this address.
+    while ptr::read_volatile((PL011_BASE + PL011_FR_OFFSET) as *const u32) & PL011_FR_TXFF != 0 {
+        core::hint::spin_loop();
+    }
+    ptr::write_volatile((PL011_BASE + PL011_DR_OFFSET) as *mut u32, u32::from(byte));
+}
+
+/// Write `s` to the PL011, expanding `\n` to `\r\n` so the captured
+/// serial log stays readable.
+unsafe fn uart_write_str(s: &str) {
+    for &byte in s.as_bytes() {
+        if byte == b'\n' {
+            uart_write_byte(b'\r');
+        }
+        uart_write_byte(byte);
+    }
+}
+
+/// `core::fmt::Write` adapter over the direct PL011 writer, so post-EBS
+/// stage markers can format addresses the same way `uefi::println!` does.
+struct UartWriter;
+
+impl core::fmt::Write for UartWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // SAFETY: the caller verified the PL011 with `pl011_available`
+        // before ExitBootServices; see `uart_marker`.
+        unsafe { uart_write_str(s) };
+        Ok(())
+    }
+}
+
+/// Post-EBS stage marker. `uefi::println!` is a no-op once boot services
+/// are gone (uefi 0.39 `helpers::_print` returns early when
+/// `are_boot_services_active()` is false), so after ExitBootServices the
+/// marker goes straight to the PL011 instead — the only output channel
+/// left. When `uart` is false (no PL011 was found before EBS) the marker
+/// is silently skipped, so a machine without a QEMU `virt` UART boots
+/// exactly as before; the pre-EBS plan print is then the last record.
+fn uart_marker(uart: bool, args: core::fmt::Arguments) {
+    if uart {
+        let _ = core::fmt::write(&mut UartWriter, args);
+    }
 }
 
 const fn align_down(value: u64, alignment: u64) -> u64 {
