@@ -131,10 +131,12 @@ external-composition = []
 # counters + hardware PMU) every ~3000 timer ticks. Counters are always on;
 # this just enables the periodic serial dump. Off by default.
 perf-dump = []
-# stall-watchdog: arm the scheduler-stall watchdog. It emits a detailed
-# per-CPU/task dump and then panics when forward progress remains stalled.
-# Detects a global forward-progress stall (the intermittent SMP wedge) and
-# dumps per-CPU scheduler state once for classification. Off by default.
+# stall-watchdog: arm the stall watchdog — Linux's hung-task detector and
+# soft/hard-lockup detector, the RCU CPU-stall warning and the stranded-
+# wakeup probes, each followed by a bounded per-CPU/task dump. An idle
+# system reports nothing; nothing panics unless asked (softlockup_panic=,
+# hung_task_panic=, rcu_stall_panic). See `stall_wd` in
+# src/x86_64/trap.rs. Off by default.
 stall-watchdog = []
 # hrtick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice timer in the
 # scheduler for precise slice-exhaustion preemption. Forwarded to

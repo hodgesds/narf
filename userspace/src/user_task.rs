@@ -404,8 +404,17 @@ pub struct UserTaskCtx {
     /// What this task is parked on, for `/proc/<pid>/stack`: the address of
     /// a `&'static Location` (the lock's `lock()` call site with bit 0 set,
     /// or the kernel site that parked it with bit 0 clear), 0 when parked on
-    /// nothing nameable or not parked. Lock-free so a park pays one store.
+    /// nothing nameable or not parked. Bit 1 marks the park uninterruptible
+    /// (`crate::handlers::PARK_SITE_UNINTERRUPTIBLE`). Lock-free so a park
+    /// pays one store.
     pub park_site: core::sync::atomic::AtomicUsize,
+    /// Uninterruptible parks this task has entered: synchronous kernel
+    /// waits (filesystem I/O, a kernel lock) parked through
+    /// `park_pending_future`, which no signal ends. The hung-task
+    /// detector's switch count (Linux `nvcsw + nivcsw`): unchanged across
+    /// `hung_task_timeout_secs` while the task is still in such a park means
+    /// it was never woken. Written only by the task itself.
+    pub uninterruptible_parks: AtomicU64,
     /// The scheduling point (`cond_resched` caller) this task yielded at
     /// and is runnable from, as a `&'static Location` address; 0 otherwise.
     pub yield_site: core::sync::atomic::AtomicUsize,
@@ -980,6 +989,7 @@ impl UserTaskCtx {
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             in_syscall: core::sync::atomic::AtomicU32::new(0),
             park_site: core::sync::atomic::AtomicUsize::new(0),
+            uninterruptible_parks: AtomicU64::new(0),
             yield_site: core::sync::atomic::AtomicUsize::new(0),
             kernel_stack_top: AtomicU64::new(0),
             process: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
