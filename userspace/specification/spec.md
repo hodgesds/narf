@@ -724,13 +724,16 @@ references, revalidates both the directory and slot identity, and leaves its
 RCU read section before I/O or parking; the returned references own their
 lifetimes. `flock` obtains its operations and owner from one slot and retains
 that description through each acquisition attempt even if a shared-table peer
-closes the descriptor concurrently. Owned references are released before a
-retry parks, including the legacy nonlocal-yield path. Retired metadata contains
-only weak references, so grace periods do not postpone last-description close
-effects. Directory growth follows the table's geometric capacity; all RCU
-metadata allocations are fallible and allocation failure falls back to locked
-lookup. Close clears a slot without
-allocating, and metadata allocation runs outside read sections.
+closes the descriptor concurrently. A conflicting blocking `flock` waits
+interruptibly and retries even if the descriptor has `O_NONBLOCK`.
+`LOCK_NB` requests an immediate `EWOULDBLOCK`. Converting a shared lock to
+exclusive releases the previous lock before waiting. Owned references are
+released before a retry parks, including the legacy nonlocal-yield path.
+Retired metadata contains only weak references, so grace periods do not
+postpone last-description close effects. Directory growth follows the table's
+geometric capacity. All RCU metadata allocations are fallible, and allocation
+failure falls back to locked lookup. Close clears a slot without allocating,
+and metadata allocation runs outside read sections.
 IRQ table access permanently selects that locked fallback without invoking
 RCU. Whole-table replacement also invalidates the read view. `FdTable::get_mut`
 returns an `FdEntryMut` guard which publishes changed slot metadata on drop.

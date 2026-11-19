@@ -13,8 +13,7 @@
 // the lock; two independent open()s of one inode conflict; exec closes
 // O_CLOEXEC descriptors, dropping their references.
 //
-// Every lock uses LOCK_NB (setup locks never conflict on Linux) so a leak
-// is a named failure, not a hang.
+// The blocking case uses an alarm so a lost wake cannot hang the smoke.
 // Success token "flock-release-ok".
 #define _GNU_SOURCE
 #include <errno.h>
@@ -170,6 +169,59 @@ static int run_all(void) {
     return failed;
 }
 
+// OpenRC waits on another service's exclusive lock with a blocking LOCK_SH
+// on an O_NONBLOCK descriptor. Only the flock operation controls this wait.
+static int case_service_wait(void) {
+    int held = open(target, O_RDWR | O_CLOEXEC);
+    int ready[2];
+    if (held < 0 || flock(held, LOCK_EX) != 0 || pipe(ready) != 0)
+        return fail("service lock setup", errno);
+    pid_t child = fork();
+    if (child < 0)
+        return fail("fork service waiter", errno);
+    if (child == 0) {
+        close(ready[0]);
+        close(held);
+        int fd = open(target, O_RDONLY | O_NONBLOCK);
+        if (fd < 0 || flock(fd, LOCK_SH | LOCK_NB) == 0 || errno != EWOULDBLOCK)
+            _exit(fail("service waiter did not observe conflict", errno));
+        alarm(10);
+        if (write(ready[1], "w", 1) != 1 || flock(fd, LOCK_SH) != 0)
+            _exit(fail("blocking service lock", errno));
+        char state;
+        if (pread(fd, &state, 1, 0) != 1 || state != 's')
+            _exit(fail("waiter returned before service startup", 0));
+        _exit(0);
+    }
+    close(ready[1]);
+    char c;
+    int waiting = read(ready[0], &c, 1);
+    close(ready[0]);
+    usleep(150 * 1000);
+    int marked = pwrite(held, "s", 1, 0);
+    close(held);
+    int status;
+    if (waitpid(child, &status, 0) != child || waiting != 1 || marked != 1 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return fail("service waiter did not finish", 0);
+    return 0;
+}
+
+static int case_conversion(void) {
+    int a = open_dup(), b = open_dup();
+    if (a < 0 || b < 0 || flock(a, LOCK_SH) != 0 || flock(b, LOCK_SH) != 0)
+        return fail("shared locks for conversion", errno);
+    // Linux drops a's original shared lock even if conversion would block.
+    int conflict = flock(a, LOCK_EX | LOCK_NB);
+    int err = errno;
+    int converted = flock(b, LOCK_EX | LOCK_NB);
+    close(a);
+    close(b);
+    if (conflict == 0 || err != EWOULDBLOCK || converted != 0)
+        return fail("shared to exclusive conversion", err);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--sleep-ms") == 0) {
         usleep(atoi(argv[2]) * 1000);
@@ -198,6 +250,8 @@ int main(int argc, char **argv) {
     kind = "file";
     target = file;
     failed |= run_all();
+    failed |= case_service_wait();
+    failed |= case_conversion();
 
     unlink(file);
     rmdir(dir);
