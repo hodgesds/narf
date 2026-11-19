@@ -131,6 +131,13 @@ pub struct aarch64::UserFpState { /* 528 bytes, 16-byte aligned */ }
 pub unsafe fn aarch64::save_user_fp_state(state: *mut u8);
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::restore_user_fp_state(state: *const u8);
+/// x86 CPUID snapshot. `arat` (always-running APIC timer) is CPUID.06H:EAX[2]
+/// OR'd with Linux's vendor rule (`init_amd`: AMD family 12h+; `init_hygon`:
+/// every Hygon part); `interrupts::timer_pump` drops the HPET broadcast on it.
+#[cfg(target_arch = "x86_64")]
+pub struct x86_64::Features { pub tsc_deadline: bool, pub arat: bool, /* ... */ }
+#[cfg(target_arch = "x86_64")]
+pub const fn x86_64::cpuid::arat_implied_by_vendor(vendor: [u32; 3], signature: u32) -> bool;
 /// GIC CPU-interface intrinsics used by `interrupts::aarch64`. GICv3:
 /// `ICC_*_EL1` system registers (valid only when
 /// `Features::gicv3_sysreg`). GICv2: memory-mapped `GICC`, through the
