@@ -22,6 +22,19 @@ registered constructor with a block source and options, then attach its returned
 
 The driver implements the `FileSystem` trait from `narf-filesystem`.
 
+File and directory `fsync` (including `fdatasync`) and `syncfs` drain the
+underlying device through `BlockDevice::flush_result`, preserving any
+`BlockError` as `FsError::Io`. `FatVolume::sync` serializes that flush with
+sector I/O. Data, FAT, directory and FSInfo writes already complete with
+FUA; explicit sync is an additional error-reporting durability boundary.
+It does not turn a sequence of FAT metadata writes into a crash-atomic
+transaction. Same-directory rename currently requires an absent target.
+
+Under root disk policies, FAT reports the block guard's read-only state
+at mount time. The root disk's verified EFI partition mounts writable by
+default on a `root-rw` boot; `root-ro` keeps it read-only. The
+per-request block guard continues to enforce revocation after mounting.
+
 ### Persistent boot log (`bootlog`)
 
 `narf.bootlog=<token>` (8..=64 of `[A-Za-z0-9_-]`; absent or `off` =

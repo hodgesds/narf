@@ -2043,6 +2043,202 @@ fn rp_reset(policy: Option<crate::disk_policy::DiskPolicy>, root: Option<Option<
     crate::disk_policy::__set_root_arg_for_test(root);
 }
 
+const RP_ESP_UUID: &str = "90c2cdfe-6315-4ddd-9422-478b62b7f0fe";
+
+/// Replace a fixture's ESP registration with scanner-like GPT metadata.
+fn rp_esp(disk: &'static str, name: &'static str, bytes: RpBytes, guid: &str) {
+    rp_fat_partition(
+        disk,
+        name,
+        bytes,
+        guid,
+        crate::registry::GPT_EFI_SYSTEM_PARTITION_TYPE_GUID,
+    );
+}
+
+fn rp_fat_partition(
+    disk: &'static str,
+    name: &'static str,
+    bytes: RpBytes,
+    guid: &str,
+    type_guid: &str,
+) {
+    use alloc::sync::Arc;
+    let whole = Arc::new(VecBlock {
+        data: bytes,
+        lba_size: 512,
+    });
+    crate::register_partition_device(
+        name,
+        disk,
+        Arc::new(crate::partition::PartitionBlockDevice::new(
+            whole, RP_ESP.0, RP_ESP.1,
+        )),
+        Some(crate::registry::PartitionMetadata {
+            gpt_type_guid: type_guid.into(),
+            partlabel: "ESP".into(),
+            partuuid: guid.into(),
+            fs_uuid: "6D89-28C5".into(),
+        }),
+    );
+}
+
+fn smoke_block_disk_policy_esp_scoped_and_revoked() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    let names = [
+        "ep-diskp1",
+        "ep-diskp2",
+        "ep-diskp3",
+        "ep-disk",
+        "ep-otherp1",
+        "ep-otherp2",
+        "ep-other",
+    ];
+    let root = alloc::format!("UUID={RP_ROOT_UUID}");
+    // Exercise removal, same-name replacement, duplicate PARTUUID, and
+    // revocation of the root. Held handles must lose access in every case.
+    for cause in 0..5 {
+        rp_reset(Some(DiskPolicy::RootRw), Some(Some(&root)));
+        let bytes = rp_register_disk("ep-disk", "ep-diskp1", "ep-diskp2", RP_ROOT_UUID);
+        rp_esp("ep-disk", "ep-diskp1", bytes.clone(), RP_ESP_UUID);
+        rp_fat_partition(
+            "ep-disk",
+            "ep-diskp3",
+            bytes.clone(),
+            RP_OTHER_UUID,
+            "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        );
+        let other = rp_register_disk("ep-other", "ep-otherp1", "ep-otherp2", RP_OTHER_UUID);
+        let result = (|| {
+            if rp_writes("ep-diskp1") {
+                return Err("ESP writable before root designation");
+            }
+            disk_policy::designate_root("ep-diskp2", rp_uuid(RP_ROOT_UUID))
+                .map_err(|_| "root designation failed")?;
+            let held = crate::find_block_device("ep-diskp1").ok_or("missing ESP")?;
+            if held.is_read_only() || !rp_writes("ep-diskp1") || !rp_writes("ep-diskp2") {
+                return Err("verified ESP and root must be writable by default");
+            }
+            for protected in [
+                "ep-disk",
+                "ep-diskp3",
+                "ep-other",
+                "ep-otherp1",
+                "ep-otherp2",
+            ] {
+                if rp_writes(protected) {
+                    return Err("ESP permission escaped its partition");
+                }
+            }
+            match cause {
+                0 => crate::unregister_block_device("ep-diskp1"),
+                1 => rp_esp("ep-disk", "ep-diskp1", bytes.clone(), RP_ESP_UUID),
+                2 => rp_esp("ep-other", "ep-otherp1", other, RP_ESP_UUID),
+                3 => crate::unregister_block_device("ep-diskp2"),
+                _ => rp_esp("ep-disk", "ep-diskp3", bytes.clone(), RP_OTHER_UUID),
+            }
+            if !held.is_read_only() || held.write(1, 1, &[0; 512]).is_ok() || rp_writes("ep-diskp1")
+            {
+                return Err("revoked ESP handle still permits writes");
+            }
+            if cause == 0 {
+                rp_esp("ep-disk", "ep-diskp1", bytes, RP_ESP_UUID);
+                if rp_writes("ep-diskp1") {
+                    return Err("reinserted ESP regained permission");
+                }
+            }
+            if cause != 3 && !rp_writes("ep-diskp2") {
+                return Err("ESP-only revocation must leave root usable");
+            }
+            Ok(())
+        })();
+        let finished = rp_finish(&names, result);
+        if !matches!(finished, TestResult::Pass) {
+            return finished;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_esp_scoped_and_revoked
+);
+
+fn smoke_block_disk_policy_esp_refuses_unverified_candidates() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy};
+    let names = [
+        "er-diskp1",
+        "er-diskp2",
+        "er-diskp3",
+        "er-disk",
+        "er-otherp1",
+        "er-otherp2",
+        "er-other",
+    ];
+    let root = alloc::format!("UUID={RP_ROOT_UUID}");
+    // root-ro, duplicate GUID, only a foreign-disk ESP, bad filesystem,
+    // missing/malformed/zero PARTUUID, and multiple root-disk ESPs.
+    for refusal in 0..8 {
+        rp_reset(
+            Some(if refusal == 0 {
+                DiskPolicy::RootRo
+            } else {
+                DiskPolicy::RootRw
+            }),
+            Some(Some(&root)),
+        );
+        let bytes = rp_register_disk("er-disk", "er-diskp1", "er-diskp2", RP_ROOT_UUID);
+        rp_esp(
+            "er-disk",
+            "er-diskp1",
+            bytes.clone(),
+            match refusal {
+                4 => "",
+                5 => "6D89-28C5",
+                6 => "00000000-0000-0000-0000-000000000000",
+                _ => RP_ESP_UUID,
+            },
+        );
+        let other = rp_register_disk("er-other", "er-otherp1", "er-otherp2", RP_OTHER_UUID);
+        if refusal == 2 {
+            rp_fat_partition(
+                "er-disk",
+                "er-diskp1",
+                bytes.clone(),
+                RP_OTHER_UUID,
+                "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+            );
+        }
+        if refusal == 7 {
+            rp_esp("er-disk", "er-diskp3", bytes.clone(), RP_OTHER_UUID);
+        }
+        if refusal == 1 || refusal == 2 {
+            rp_esp("er-other", "er-otherp1", other, RP_ESP_UUID);
+        }
+        if refusal == 3 {
+            bytes.lock()[RP_ESP.0 as usize * 512..(RP_ESP.0 as usize + 1) * 512].fill(0);
+        }
+        let result = disk_policy::designate_root("er-diskp2", rp_uuid(RP_ROOT_UUID))
+            .map_err(|_| "ESP refusal must not prevent root designation")
+            .and_then(|()| {
+                if rp_writes("er-diskp1") || rp_writes("er-otherp1") {
+                    Err("unverified ESP writable")
+                } else {
+                    Ok(())
+                }
+            });
+        let finished = rp_finish(&names, result);
+        if !matches!(finished, TestResult::Pass) {
+            return finished;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/disk_policy",
+    smoke_block_disk_policy_esp_refuses_unverified_candidates
+);
+
 fn rp_writes(name: &str) -> bool {
     let Some(dev) = crate::registry::find_block_device(name) else {
         return false;
@@ -2090,10 +2286,11 @@ kernel_test_in!(
     smoke_block_disk_policy_parse_root_policies
 );
 
-/// The production shape: under root-rw, before designation nothing is
+/// With an ESP missing its GPT unique GUID: before designation nothing is
 /// writable and only the root=UUID= candidate may auto-mount; after it,
 /// exactly the root partition is writable — not its whole disk, not the ESP
-/// on the same disk (which may auto-mount, read-only), not another disk.
+/// on the same disk (which may auto-mount, read-only because it cannot be
+/// verified), not another disk. Verified ESP defaults are exercised above.
 fn smoke_block_disk_policy_root_rw_only_root_uuid_writable() -> TestResult {
     use crate::disk_policy::{self, DiskPolicy, PolicyError};
     let names = [

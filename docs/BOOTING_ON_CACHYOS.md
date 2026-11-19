@@ -356,17 +356,20 @@ device NARF does not have), then
   boot.
 - **Banners.** At policy resolution:
   `disks: POLICY narf.disks=root-rw: ONLY the partition whose filesystem UUID
-  matches root=UUID=... will be WRITABLE; every other disk and partition (its
-  ESP included) is read-only`. At designation:
-  `disks: WRITABLE: <dev> (btrfs UUID ...) is the ONLY writable device`.
+  matches root=UUID=... and its verified EFI partition will be WRITABLE;
+  every other disk and partition is read-only`. Designation prints
+  `disks: WRITABLE ROOT: <dev> ...` and, after verification,
+  `disks: WRITABLE ESP: <dev> (PARTUUID ...) ...`.
   Under `root-ro` the second banner says `designated READ-ONLY ... NOTHING is
   writable`.
-- **`root-rw` writes exactly one partition.** Only the designated root
-  partition's block-layer guard passes writes. Every other disk and
-  partition is refused, including the root partition's containing disk,
-  the ESP, other data disks, and the
-  `/dev/nvme<C>` passthrough nodes. vfat filesystems also report themselves
-  read-only to the VFS under both root policies, so they mount `ro`.
+- **`root-rw` writes the root and its verified ESP.** The root's physical
+  disk must contain exactly one GPT EFI System Partition, with FAT and a
+  nonzero PARTUUID unique across registered devices. That partition is
+  writable by default, with no extra kernel argument. Unverified or
+  ambiguous ESPs remain read-only. The whole-disk device, other partitions,
+  other data disks, and `/dev/nvme<C>` passthrough nodes remain protected.
+  `root-ro` keeps all ESPs read-only. Removal/replacement, duplicate identity,
+  or a second ESP on the root disk revokes ESP writes until reboot.
 - **The boot-log stick is the one exception, under both policies.** With
   `narf.bootlog=<token>`, the USB mass-storage FAT partition whose
   `/NARFLOG.ID` first line is the token becomes writable, and nothing else on
@@ -1113,7 +1116,8 @@ mounted writable unless the command line says `ro`.
     read-only, as for a write-protected disk on Linux. Under `root-rw` they
     are writable views of one shared btrfs instance.
   - `/boot/efi`: the ESP (`<ESP_UUID>`) is checked by `fsck.vfat` and
-    mounted read-only. NARF never writes it, under either policy.
+    mounted writable under `root-rw` when verified as above, and read-only
+    under `root-ro`.
   - `/tmp` is tmpfs.
 - **udev.** udev sees the NVMe partitions, their filesystem UUIDs, input and
   DRM devices. `/dev/btrfs-control` answers udev's btrfs readiness check, so
@@ -1278,8 +1282,9 @@ Power-off is clean in both modes. `systemctl poweroff` runs:
 GRUB's default entry is CachyOS, so a reboot without touching the menu goes
 back to Linux. After a `root-ro` boot nothing needs undoing. After a
 `root-rw` boot, a `btrfs subvolume snapshot` taken before is the rollback
-point. NARF writes nothing outside the root partition: not the ESP, the
-other data disks.
+point for the root filesystem. The verified ESP is also writable; preserve
+the previous EFI image when updating it, since a btrfs snapshot does not
+cover that FAT partition. Other data disks remain protected.
 
 ### QEMU rehearsal (no root needed, no host disk touched)
 

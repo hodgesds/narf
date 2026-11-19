@@ -129,6 +129,17 @@ below uses a separate directory so it can coexist with a package installation.
 
 ## Install on an existing ESP
 
+On an installed-root boot, `narf.disks=root-rw` makes the root disk's verified
+EFI partition writable by default. No additional ESP argument is needed.
+The block layer requires one GPT ESP on that disk, FAT, and a nonzero
+PARTUUID unique across registered devices. `root-ro` keeps the ESP read-only.
+This concerns files on the ESP; it does not enable EFI runtime-variable writes.
+
+FAT file and directory sync report device flush errors. FAT still requires
+an absent target for rename: an updater using `rename`/`os.replace` over an
+existing image must account for that restriction. A rename-away/publish
+sequence needs a durable backup and recovery path; it is not crash-atomic.
+
 For a laptop or desktop, select the framebuffer terminal as the preferred
 console (`console=tty0` last). The default command line prefers serial for
 the headless development workflow. Then copy the image into its own directory
@@ -224,9 +235,10 @@ entry require a later early-userspace design and are not available here.
 
 `narf.disks=root-ro` preserves all media and can supply the existing RAM-backed
 overlay to `systemd_pid1`. `root-rw` additionally requires btrfs inside the
-container and its existing write-safety gate; only the designated container
-partition and its decrypted view gain write permission. Other partitions and
-the whole-disk device remain read-only. Removing/replacing that registration
+container and its existing write-safety gate; the designated container
+partition, its decrypted view, and the verified root-disk ESP gain write
+permission. Other partitions and the whole-disk device remain read-only.
+Removing/replacing the container registration
 revokes retained decrypted handles. UUID selection is deliberately the outer
 container in these policies, so boot does not ask for credentials on every
 unrelated encrypted disk. NARF's existing LUKS algorithm/KDF/resource limits
