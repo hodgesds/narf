@@ -16,6 +16,7 @@ extern crate alloc;
 
 pub mod assert;
 pub mod bitmap;
+pub mod clockevent_scale;
 pub mod context;
 pub mod deferred_wake;
 pub mod directmap;
