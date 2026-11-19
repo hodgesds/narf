@@ -668,6 +668,11 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     };
     let _ = writeln!(buf, "\n*** KERNEL PANIC ***");
     let _ = writeln!(buf, "{info}");
+    // The KASLR offset, so the slid addresses below can be symbolised
+    // (`xtask kallsyms --print-slide`). Linux prints it from its panic
+    // notifier and nowhere else; the boot log deliberately does not carry
+    // it. Early in the report so the fixed-size buffer cannot cut it off.
+    let _ = writeln!(buf, "{}", narf_memory::kaslr::KernelOffset::current());
     // Best-effort RBP-chain walk. Rust kernels keep frame pointers
     // by default; each frame is `[saved_rbp, return_addr]`. Stop at
     // null / unaligned / outside [0xffff_8000_0000_0000, 0xffff_ffff_ffff_ffff]

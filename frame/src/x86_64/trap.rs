@@ -1983,6 +1983,13 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         frame.vector,
         vector_name(frame.vector)
     );
+    // The KASLR offset the boot log no longer carries, so the slid addresses
+    // below can be symbolised. Two atomic loads; fatal path only.
+    let _ = writeln!(
+        TrapWriter,
+        "  {}",
+        narf_memory::kaslr::KernelOffset::current()
+    );
     let _ = writeln!(TrapWriter, "  error:  {:#018x}", frame.error_code);
     if frame.vector == 14 {
         // #PF: CR2 holds the faulting linear address.

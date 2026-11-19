@@ -51,6 +51,55 @@ def load(run):
     return [ESC.sub("", line) for line in text.split("\n")]
 
 
+# The IDT is a static in the image, and QEMU's register dump prints its live
+# (slid) base, so the two give the slide for any run that has a dump.
+IDT_SYMBOL = "narf_frame::bare::x86_64::idt::IDT"
+
+
+def idt_link_address(elf):
+    out = subprocess.run(["nm", "-C", elf], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[2] == IDT_SYMBOL:
+            return int(parts[0], 16)
+    return None
+
+
+def slide_from_registers(registers, elf):
+    """The KASLR slide from an `info registers` dump: live IDT base minus the
+    IDT's link address. None when either is missing."""
+    m = re.search(r"IDT=\s*([0-9a-f]+)", registers)
+    link = idt_link_address(elf) if m and os.path.exists(elf) else None
+    if not m or link is None:
+        return None
+    return int(m.group(1), 16) - link
+
+
+def kaslr_slide(run, lines, elf):
+    """The run's KASLR slide.
+
+    The kernel prints it only in a panic or fatal-exception report
+    ("Kernel Offset: 0x..."), as Linux does; the boot log no longer carries
+    it. Without one, any QMP register dump the soak host saved in the run
+    directory recovers it from the IDT base. Older logs still have the boot
+    line ("kernel image slide 0x...").
+    """
+    for line in lines:
+        m = re.search(r"Kernel Offset: (0x[0-9a-f]+)", line) or re.search(
+            r"kernel image slide (0x[0-9a-f]+)", line
+        )
+        if m:
+            return int(m.group(1), 16)
+    for name in sorted(os.listdir(run)):
+        if name.startswith("registers-") and name.endswith(".txt"):
+            with open(os.path.join(run, name)) as f:
+                slide = slide_from_registers(f.read(), elf)
+            if slide is not None:
+                return slide
+    print("(no KASLR offset in the log or a register dump: addresses unslid)", file=sys.stderr)
+    return 0
+
+
 def kv(line):
     return dict(m.groups() for m in re.finditer(r"(\S+?)=(\S+)", line))
 
@@ -277,14 +326,8 @@ def episodes(lines, syms, run=None):
 def main():
     run = sys.argv[1]
     lines = load(run)
-    slide = 0
-    for line in lines:
-        m = re.search(r"kernel image slide (0x[0-9a-f]+)", line)
-        if m:
-            slide = int(m.group(1), 16)
-            break
     elf = os.path.join(run, "narf-frame")
-    syms = Symbols(elf, slide) if os.path.exists(elf) else None
+    syms = Symbols(elf, kaslr_slide(run, lines, elf)) if os.path.exists(elf) else None
     if "--stranded" in sys.argv:
         raw_stranding(lines)
         return

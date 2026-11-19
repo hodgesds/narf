@@ -128,6 +128,59 @@ pub fn kernel_virt_base() -> u64 {
     KERNEL_LINK_BASE + KERNEL_SLIDE.load(Ordering::Relaxed)
 }
 
+/// The KASLR offset as the fatal-path printers report it — Linux's
+/// `dump_kernel_offset` panic notifier (`arch/x86/kernel/setup.c`):
+///
+/// ```text
+/// Kernel Offset: 0x1ee00000 from 0xffffffff80000000 (relocation range: 0xffffffff80000000-0xffffffffbfffffff), physical delta 0x0
+/// ```
+///
+/// This is the ONLY place the slide is printed. Like Linux, the normal boot
+/// log never carries it: the slide is what KASLR keeps secret, and anyone
+/// who can read the log would otherwise have it. A panic or fatal exception
+/// is the exception because its report is useless without it — every raw
+/// address in the backtrace is slid — and the machine is going down.
+/// `xtask kallsyms --print-slide <offset>` turns it back into a symbol table.
+///
+/// `phys delta` is NARF's physical relocation (`IMAGE_PHYS_DELTA`), which
+/// Linux x86 does not report; the fatal printers dump physical addresses
+/// (CR3, PTEs) that need it.
+///
+/// Allocation- and lock-free: two atomic loads.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KernelOffset {
+    pub slide: u64,
+    pub phys_delta: u64,
+}
+
+impl KernelOffset {
+    /// The offset in force.
+    pub fn current() -> Self {
+        KernelOffset {
+            slide: KERNEL_SLIDE.load(Ordering::Relaxed),
+            phys_delta: IMAGE_PHYS_DELTA.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl core::fmt::Display for KernelOffset {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Kernel Offset: {:#x} from {:#x}",
+            self.slide, KERNEL_LINK_BASE
+        )?;
+        #[cfg(target_arch = "x86_64")]
+        write!(
+            f,
+            " (relocation range: {:#x}-{:#x})",
+            KERNEL_LINK_BASE,
+            KERNEL_LINK_BASE + KERNEL_IMAGE_SIZE - 1
+        )?;
+        write!(f, ", physical delta {:#x}", self.phys_delta)
+    }
+}
+
 /// Physical bounds of the loaded image: `[start, end)`.
 ///
 /// Reads a high-half word the linker populated, NOT the addresses of
@@ -411,6 +464,36 @@ mod kaslr_slide_tests {
         TestResult::Pass
     }
     kernel_test_in!("memory/kaslr", smoke_kaslr_slid_image_clears_module_window);
+
+    /// The fatal-path offset line has Linux's shape — tools match
+    /// `Kernel Offset: 0x<hex>` — and reports the offset actually in force.
+    fn smoke_kaslr_kernel_offset_line_is_linux_shaped() -> TestResult {
+        use core::fmt::Write as _;
+        let mut line = alloc::string::String::new();
+        let fixed = KernelOffset {
+            slide: 0x1ee0_0000,
+            phys_delta: 0x20_0000,
+        };
+        let _ = write!(line, "{fixed}");
+        let want = alloc::format!("Kernel Offset: 0x1ee00000 from {KERNEL_LINK_BASE:#x}");
+        if !line.starts_with(&want) || !line.ends_with(", physical delta 0x200000") {
+            return TestResult::Fail("Kernel Offset line is not Linux-shaped");
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !line.contains("(relocation range: 0xffffffff80000000-0xffffffffbfffffff)") {
+            return TestResult::Fail("x86_64 Kernel Offset line lacks the relocation range");
+        }
+        let now = KernelOffset::current();
+        if now.slide != KERNEL_SLIDE.load(Ordering::Relaxed) || now.phys_delta != image_phys_delta()
+        {
+            return TestResult::Fail("KernelOffset::current is not the offset in force");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/kaslr",
+        smoke_kaslr_kernel_offset_line_is_linux_shaped
+    );
 }
 
 /// Pull one 64-bit value of randomness using the best available source.
