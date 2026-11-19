@@ -295,7 +295,11 @@ The model mirrors Linux (`linux/drivers/base/firmware_loader/main.c`
 3. **Root partition** (mid-high priority, `BlobSource::Rootfs`).
    `firmware-scan-rootfs` at `Stage::Late`, registered AFTER
    `root-mount-auto`, walks `/lib/firmware/` on the mounted root
-   partition. `xtask image` stages everything NOT matched by
+   partition. It reads the final eight bytes of each candidate to check the
+   `NRFW` marker and metadata length before reserving space for the payload.
+   A candidate that fits is read to completion and goes through the usual
+   trailer and signature verification. An allocation failure skips that file.
+   `xtask image` stages everything NOT matched by
    `--initramfs-firmware` into `target/rootfs-firmware-staging/
    lib/firmware/`; `xtask disk-write-partitioned` copies that
    tree onto the NARF_ROOT ext4 partition. Rootfs entries shadow

@@ -14,6 +14,7 @@
 //! Linux convention where /lib/firmware/ takes precedence over
 //! the initramfs copy.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -81,6 +82,12 @@ static HOT_INSTALL: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new(
 // this latch; admitting an unsigned development blob cannot clear it.
 const REGULATORY_POLICY: &str = "wireless-regulatory.bin";
 static REGULATORY_POLICY_REJECTED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn note_rejection(name: &str) {
+    if name == REGULATORY_POLICY {
+        REGULATORY_POLICY_REJECTED.store(true, Ordering::Release);
+    }
+}
 
 /// Cap-binding routing table. Indexed by cap sequence number;
 /// kept in priority order matching the source tiers above. A
@@ -175,10 +182,11 @@ pub(crate) fn view_for<'a>(
 /// signature verification, allocate a DMA-coherent page, copy the
 /// payload in, register the entry.
 pub(crate) fn install_blob(
-    name: &'static str,
+    name: impl Into<Cow<'static, str>>,
     bytes: &[u8],
     source: BlobSource,
 ) -> Result<(), FirmwareError> {
+    let name = name.into();
     // 1. Decode + verify the trailer.
     let validated = signature::decode(bytes).and_then(|trailer| {
         signature::verify(&trailer)?;
@@ -187,9 +195,7 @@ pub(crate) fn install_blob(
     let trailer = match validated {
         Ok(trailer) => trailer,
         Err(error) => {
-            if name == REGULATORY_POLICY {
-                REGULATORY_POLICY_REJECTED.store(true, Ordering::Release);
-            }
+            note_rejection(&name);
             return Err(error);
         }
     };
@@ -216,6 +222,11 @@ pub(crate) fn install_blob(
         None
     } else {
         Some(trailer.signer)
+    };
+    // Only successfully staged rootfs entries need a permanent canonical name.
+    let name: &'static str = match name {
+        Cow::Borrowed(name) => name,
+        Cow::Owned(name) => alloc::boxed::Box::leak(name.into_boxed_str()),
     };
     let entry = Entry {
         name,
