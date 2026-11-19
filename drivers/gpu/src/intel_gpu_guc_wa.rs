@@ -4,6 +4,11 @@
 
 use crate::intel_gpu_gt::{GraphicsIp, GtPlatform};
 
+// xe_guc_ads.c::guc_waklv_init, Wa_14025515070. The GuC clears an idle
+// engine's CS_INDIRECT_RING_STATE when it registers a context. All admitted
+// Lunar Lake and Xe3 graphics firmware meets the 70.53 version gate.
+const CLEAR_IDLE_INDIRECT_RING_STATE: u32 = 0x900e_0000;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GuCWorkarounds {
     pub ip: GraphicsIp,
@@ -27,16 +32,39 @@ impl GuCWorkarounds {
                     &[0x90020000, 0x900b0000],
                 )
             }
-            _ if platform.is_ptl() && ip.version == 3000 && ip.step < 4 => {
-                (0, &[0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000])
-            }
-            _ if platform.is_ptl() => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
-            GtPlatform::WildcatLake => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
-            GtPlatform::NovaLakeS => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
+            _ if platform.is_ptl() && ip.version == 3000 && ip.step < 4 => (
+                0,
+                &[
+                    0x900a0000,
+                    0x90080001,
+                    0xc40,
+                    0x90090000,
+                    0x900b0000,
+                    CLEAR_IDLE_INDIRECT_RING_STATE,
+                ],
+            ),
+            GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake)
+            | GtPlatform::WildcatLake
+            | GtPlatform::NovaLakeS => (
+                0,
+                &[
+                    0x90080001,
+                    0xc40,
+                    0x90090000,
+                    0x900b0000,
+                    CLEAR_IDLE_INDIRECT_RING_STATE,
+                ],
+            ),
             _ if platform.is_lnl() => (
                 0,
                 &[
-                    0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000,
+                    0x90050000,
+                    0x90070000,
+                    0x90080001,
+                    0xc40,
+                    0x90090000,
+                    0x900b0000,
+                    CLEAR_IDLE_INDIRECT_RING_STATE,
                 ],
             ),
             GtPlatform::Integrated(_) => {

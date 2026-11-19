@@ -2330,6 +2330,14 @@ and in the GuC reset register list. Graphics 30.03–30.05 omits that
 register from both. Wildcat Lake uses the Xe3 non-privileged register
 policy when initializing its engines.
 
+Panther Lake, Wildcat Lake and Nova Lake-S prime each render context with
+hardware windower filtering enabled. The masked `XEHP_COMMON_SLICE_CHICKEN4`
+write enables both filtering and the SBE push-constant workaround while
+preserving other fields. On these GPUs and Lunar Lake, the graphics GuC ADS
+also requests that firmware clear an idle engine's indirect ring state when
+registering a context (Wa_14025515070, KLV 0x900e). These platforms require
+GuC firmware 70.53 or newer.
+
 For physical graphics engines on supported IPs from 20.01 through 30.05,
 the driver clears the preemption-inhibit bit in each engine's `RING_IDLEDLY`.
 It uses the crystal clock to round the 5 µs minimum up to a whole tick

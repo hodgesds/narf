@@ -1884,9 +1884,10 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
             ); //2MiB minus source reserve
             let ads = d.memory[&0x20001000].borrow();
             assert_eq!(
-                &ads[0x3000 / 4..0x3000 / 4 + 6],
-                &[0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                &ads[0x3000 / 4..0x3000 / 4 + 7],
+                &[0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000]
             );
+            assert_eq!(ads[0x11ac / 4], 28);
             assert_eq!(d.regs[&0xe48c] & 0x200, 0x200);
             assert_eq!(d.regs[&0xe4c4] & 0x1840, 0x840);
             assert_eq!(d.regs[&0x24d0], 0x23fc);
@@ -1985,6 +1986,7 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 d.regs.extend([
                     (0xd8c, 30 << 22 | release << 14 | step),
                     (0x6210, 0xa4000001),
+                    (0x7300, 0x0400),
                     (0xd00, 0x1e), // 25 MHz crystal, 640 ns per idle-delay tick
                     (0x913c, 0),
                     (0x9150, 0),
@@ -2057,10 +2059,13 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 ); //2MiB minus source reserve
                 let ads = d.memory[&0x20001000].borrow();
                 let expected_klvs: &[u32] = if release == 0 && step < 4 {
-                    &[0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                    &[
+                        0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000,
+                    ]
                 } else {
-                    &[0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                    &[0x90080001, 0xc40, 0x90090000, 0x900b0000, 0x900e0000]
                 };
+                assert_eq!(ads[0x11ac / 4] as usize, expected_klvs.len() * 4);
                 assert_eq!(
                     &ads[0x3000 / 4..0x3000 / 4 + expected_klvs.len()],
                     expected_klvs
@@ -2091,8 +2096,16 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 );
                 assert_eq!(d.regs[&0x20d4] & 0xc080, 0x80);
                 assert_eq!(
+                    d.regs[&0x7300], 0x1420,
+                    "render context windower filtering and SBE workaround"
+                );
+                assert_eq!(
                     d.regs[&0x6210],
-                    if release == 0 && step < 4 { 0xa4018011 } else { 0xa4000011 },
+                    if release == 0 && step < 4 {
+                        0xa4018011
+                    } else {
+                        0xa4000011
+                    },
                     "FF_MODE after executing the golden render context"
                 );
                 assert!(!d.regs.contains_key(&0xb154)); // no LNL-only RW flush tuning
