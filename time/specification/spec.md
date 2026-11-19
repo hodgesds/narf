@@ -149,8 +149,9 @@ pub fn next_deadline() -> Option<Instant>;
 | `hrtimer_forward`, `hrtimer_get_remaining`, `hrtimer_active` | `HrTimer::forward`, `hrtimer_get_remaining`, `HrTimer::is_active` |
 | `hrtimer_interrupt` (hard expiry, re-program) | `hrtimer_interrupt()` from each CPU's own timer interrupt; returns the next event for the arch code to program |
 | `HRTIMER_SOFTIRQ` (`_SOFT` bases) | `hrtimer_run_softirq()` from the executor loop (raised by the hard interrupt) |
-| `hrtimer_run_queues` (low-res tick) | `hrtimer_run_queues()` from periodic-only clockevents (LAPIC InitialCount) |
-| `tick_program_event` | the arch arm callback (`set_arm_callback`): LAPIC TSC-deadline, aarch64 `CNTP_TVAL` |
+| `hrtimer_run_queues` (low-res tick) | `hrtimer_run_queues()` from periodic-only clockevents (uncalibrated LAPIC InitialCount fallback) |
+| `tick_program_event` | the arch arm callback (`set_arm_callback`): LAPIC TSC-deadline or TMICT one-shot, aarch64 `CNTP_TVAL` |
+| `tick_device_uses_broadcast` / `CLOCK_EVT_FEAT_C3STOP` | x86 `timer_pump::update_broadcast()`: HPET broadcast only without a one-shot LAPIC primary or without ARAT |
 | `hrtimer_reprogram` / `retrigger_next_event` / `trigger_dyntick_cpu` | local earlier event: program at once; remote earlier event: publish under the remote base lock, then one reschedule IPI whose handler re-programs (`retrigger_next_event`) |
 | `tick_handle_periodic_broadcast` (global clockevent) | `hrtimer_run_all_bases()` from HPET / shared clockevent ticks |
 | `hrtimer_get_next_event` (nohz) | `next_event_cycles_local()` (lock-free, IRQ-safe) |
@@ -170,7 +171,8 @@ through alloc-free paths, and restart a periodic timer at its next expiry.
 ITIMER_VIRTUAL/PROF stay on the tick, as in Linux (`run_posix_cpu_timers`).
 
 Every CPU's local clockevent installs itself as the programmer when it
-starts (the x86 TSC-deadline LAPIC; the aarch64 generic timer). An executor
+starts (the x86 LAPIC in TSC-deadline or TMICT one-shot mode; the aarch64
+generic timer). An executor
 round (`poll_one_round`, the run loop) is the softirq context: it expires the
 CPU's due soft timers and any hard timer whose interrupt was not taken (a CPU
 that runs with interrupts masked — the kernel-test runner — gets no timer
@@ -390,12 +392,15 @@ single-shot drain, and PPS.
 - **Clocksource:** invariant TSC (`CPUID.80000007H:EDX[8]`) + `rdtscp`
   for ordering. Fallback: HPET, then PM timer.
 - **Clockevent:** TSC-deadline (`CPUID.01H:ECX[24]`); fallback to
-  LAPIC timer in one-shot mode.
-- Every CPU's LAPIC TSC-deadline one-shot carries `min(periodic tick,
+  LAPIC timer in one-shot (TMICT) mode, its rate calibrated once against the
+  TSC on the boot CPU (Linux `calibrate_APIC_clock`). AMD Zen 2/3/4 use the
+  one-shot mode.
+- Every CPU's LAPIC one-shot (either mode) carries `min(periodic tick,
   budget deadline, its own next hrtimer event)`. HPET is not armed for the
-  same events; it remains the fallback (programmed for the earliest event
-  of any base, expiring every base) when LAPIC selection fails or only the
-  unreliable legacy InitialCount mode is available.
+  same events; it remains the broadcast (programmed for the earliest event
+  of any base, expiring every base) when LAPIC selection fails, only the
+  uncalibrated InitialCount mode is available, or the LAPIC timer stops in
+  deep C-states (no ARAT).
 - **Boot calibration:** TSC ↔ PM timer or HPET cross-check to get
   frequency; CPUID leaf `0x15` on supported silicon.
 - **SMP sync:** TSC is architecturally synchronised across cores on

@@ -1,9 +1,12 @@
 //! x86 hrtimer clockevent pump.
 //!
 //! Bridges the per-CPU `narf_time::hrtimer` bases to the selected
-//! clockevent (`tick_program_event`). Reliable LAPIC TSC-deadline is the
-//! primary path; HPET comparator 0 remains the fallback when the
-//! selected LAPIC is not a reliable one-shot source. At boot the
+//! clockevent (`tick_program_event`). Each CPU's one-shot LAPIC timer
+//! (TSC-deadline, or TMICT one-shot where TSC-deadline is absent) is the
+//! primary path. HPET comparator 0 is the tick-broadcast device, armed only
+//! when some CPU cannot rely on its own LAPIC: no one-shot LAPIC was
+//! selected, or the LAPIC timer stops in deep C-states (no ARAT; Linux
+//! `CLOCK_EVT_FEAT_C3STOP` → `tick-broadcast`). At boot the
 //! fallback allocates one IDT vector and prefers FSB-MSI delivery; older
 //! HPETs use an IOAPIC redirection. This
 //! is the contrast with
@@ -78,12 +81,48 @@ static STATE: PumpState = PumpState {
     fsb: AtomicBool::new(false),
 };
 
-/// Whether wheel arms also need the HPET fallback. A working TSC-deadline
-/// clockevent already targets the same absolute deadline; programming HPET as
-/// well causes two interrupts and several intercepted MMIO accesses per
-/// deadline under KVM. Default to `true` until [`init`] has positively
-/// identified the reliable LAPIC primary.
+/// Whether wheel arms also need the HPET fallback. A working one-shot LAPIC
+/// clockevent already targets the same deadline on its own CPU; programming
+/// HPET as well routes every CPU's events to CPU0 (`hrtimer_run_all_bases`
+/// in [`pump_irq`]), costs a second interrupt plus IPIs per deadline, and
+/// several intercepted MMIO accesses under KVM. Default to `true` until
+/// [`update_broadcast`] has positively identified a LAPIC primary that
+/// needs no broadcast.
 static USE_HPET_FALLBACK: AtomicBool = AtomicBool::new(true);
+
+/// Linux tick-broadcast policy (`tick_device_uses_broadcast`): the HPET
+/// broadcast is needed unless every CPU runs a one-shot LAPIC clockevent
+/// whose timer keeps counting in idle. `oneshot_lapic` = the selected
+/// primary is the LAPIC in TSC-deadline or TMICT one-shot mode; `arat` = the
+/// LAPIC timer is always running (no `CLOCK_EVT_FEAT_C3STOP`). A periodic-
+/// only LAPIC cannot fire at an arbitrary deadline, and a non-ARAT LAPIC
+/// can stop in a deep C-state the idle governor may pick: both need HPET.
+pub(crate) const fn needs_hpet_broadcast(oneshot_lapic: bool, arat: bool) -> bool {
+    !(oneshot_lapic && arat)
+}
+
+/// Re-evaluate whether HPET must broadcast for the current primary
+/// clockevent (Linux re-runs `tick_device_uses_broadcast` from
+/// `tick_check_new_device` whenever a clock event device changes). Runs on
+/// the boot CPU after `clockevent::select_primary`; ARAT is a package-wide
+/// property, as in Linux's `boot_cpu_has` checks. Returns the new setting.
+/// Turning the broadcast off shuts comparator 0 down so a stale arm cannot
+/// fire (`clockevents_shutdown` of the broadcast device).
+pub fn update_broadcast() -> bool {
+    let oneshot_lapic = narf_time::clockevent::primary()
+        .is_some_and(|dev| dev.name() == "lapic" && dev.can_stop_idle_tick());
+    // SAFETY: CPUID is always legal at CPL=0.
+    let arat = unsafe { narf_arch::x86_64::Features::probe() }.arat;
+    let broadcast = needs_hpet_broadcast(oneshot_lapic, arat);
+    let was = USE_HPET_FALLBACK.swap(broadcast, Ordering::AcqRel);
+    if was && !broadcast && STATE.initialised.load(Ordering::Acquire) {
+        // SAFETY: init owns comparator 0; disarming only clears its enable.
+        unsafe {
+            let _ = narf_time::hpet::disarm(0);
+        }
+    }
+    broadcast
+}
 
 /// Pick a GSI in `mask`. Tries the high range first (>= `min_gsi`,
 /// typically 16, to stay out of legacy ISA territory), then falls
@@ -141,14 +180,15 @@ fn deadline_cycles_to_hpet_target(deadline_cycles: u64) -> u64 {
 /// Hrtimer clockevent programmer (`tick_program_event`) for THIS CPU's
 /// base. Called from an hrtimer enqueue or expiry with IRQs disabled.
 fn wheel_arm(deadline_cycles: u64) {
-    // Primary: this CPU's LAPIC TSC-deadline one-shot (reliable under KVM,
-    // where the HPET one-shot IRQ isn't promptly delivered). Unconditional —
-    // must run even before the HPET pump's STATE.initialised is set.
+    // Primary: this CPU's LAPIC one-shot (TSC-deadline or TMICT; reliable
+    // under KVM, where the HPET one-shot IRQ isn't promptly delivered).
+    // Unconditional — must run even before the HPET pump's STATE.initialised
+    // is set.
     crate::x86_64::apic::arm_hrtimer_event(deadline_cycles);
-    // Secondary: HPET one-shot only when the selected primary is not reliable
-    // TSC-deadline. The clockevent probe is the authority here: preserving an
-    // always-on HPET duplicate after LAPIC passed merely delivers the same
-    // deadline twice.
+    // Secondary: HPET broadcast only when [`update_broadcast`] found a CPU
+    // that cannot rely on its own LAPIC. Preserving an always-on HPET
+    // duplicate after a one-shot ARAT LAPIC passed merely delivers the same
+    // deadline twice, from CPU0.
     if !STATE.initialised.load(Ordering::Acquire) || !USE_HPET_FALLBACK.load(Ordering::Acquire) {
         return;
     }
@@ -309,25 +349,29 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     STATE.dest_apic.store(dest_apic, Ordering::Release);
     STATE.fsb.store(fsb, Ordering::Release);
 
-    // Linux-style single clockevent ownership: once the boot probe selected a
-    // reliable LAPIC one-shot, it alone drives wheel deadlines. Retain HPET for
-    // a failed LAPIC probe, an HPET primary, or the unreliable legacy LAPIC
-    // InitialCount mode.
-    // A periodic-only LAPIC (InitialCount mode, no TSC-deadline) ticks
-    // reliably but cannot fire at an arbitrary deadline: HPET is then the
-    // one-shot broadcast device for precise hrtimer events (Linux
-    // tick-broadcast with HPET).
-    let oneshot_lapic = narf_time::clockevent::primary()
-        .is_some_and(|dev| dev.name() == "lapic" && dev.can_stop_idle_tick());
-    USE_HPET_FALLBACK.store(!oneshot_lapic, Ordering::Release);
-
-    if !oneshot_lapic {
+    // Linux-style per-CPU clockevents: once the boot probe selected a one-shot
+    // LAPIC (TSC-deadline or TMICT) whose timer keeps running in idle (ARAT),
+    // every CPU programs its own events and HPET takes no interrupts. Retain
+    // the HPET broadcast for a failed LAPIC probe, an HPET primary, the
+    // uncalibrated periodic InitialCount mode (it cannot fire at an arbitrary
+    // deadline), or a LAPIC that stops in deep C-states (no ARAT).
+    let broadcast = update_broadcast();
+    {
         use core::fmt::Write as _;
-        let _ = writeln!(
-            narf_console::Writer,
-            "  timer_pump: HPET comparator 0 via {} vector {vector} apic {dest_apic}",
-            if fsb { "MSI" } else { "IOAPIC" },
-        );
+        if broadcast {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  timer_pump: HPET comparator 0 via {} vector {vector} apic {dest_apic} \
+                 broadcasts every CPU's events",
+                if fsb { "MSI" } else { "IOAPIC" },
+            );
+        } else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  timer_pump: per-CPU LAPIC {} clockevents (ARAT); HPET broadcast idle",
+                crate::x86_64::apic::local_timer_mode(narf_lib::percpu::current_cpu()).name(),
+            );
+        }
     }
 
     // Install the wheel callback last — it's the gate that lets
@@ -349,8 +393,10 @@ pub fn is_initialised() -> bool {
     STATE.initialised.load(Ordering::Acquire)
 }
 
-/// Diagnostic: `true` when wheel deadlines are duplicated onto HPET because
-/// no reliable LAPIC TSC-deadline primary was selected.
+/// Diagnostic: `true` when wheel deadlines are duplicated onto the HPET
+/// broadcast because no one-shot LAPIC primary was selected or the LAPIC
+/// timer stops in idle (no ARAT). `false` on ARAT CPUs whose LAPIC runs
+/// TSC-deadline or TMICT one-shot: every CPU then expires its own timers.
 pub fn uses_hpet_fallback() -> bool {
     USE_HPET_FALLBACK.load(Ordering::Acquire)
 }
