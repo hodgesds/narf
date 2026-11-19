@@ -5453,6 +5453,13 @@ impl narf_block::BlockDeviceSync for NvmeNamespaceBlock {
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         sync_flush(self.instance, Some(self.nsid))
     }
+    /// Real: `flush` issues the NVMe Flush opcode when the
+    /// controller has a volatile write cache, and is a sound
+    /// no-op otherwise because completed writes are already
+    /// durable then (#841).
+    fn has_real_flush(&self) -> bool {
+        true
+    }
     fn supports_trim(&self) -> bool {
         sync_supports_trim(self.instance, Some(self.nsid))
     }
@@ -5482,6 +5489,11 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
     }
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         sync_flush(0, None)
+    }
+    /// Real: same as `NvmeNamespaceBlock` — the Flush opcode when
+    /// the controller has a volatile write cache (#841).
+    fn has_real_flush(&self) -> bool {
+        true
     }
     fn supports_trim(&self) -> bool {
         sync_supports_trim(0, None)

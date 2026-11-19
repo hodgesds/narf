@@ -3994,6 +3994,19 @@ fn flush_ext_choice(f: &AtaFeatures) -> Option<bool> {
     }
 }
 
+/// Whether `AhciBlockSync::flush` must fail — rather than silently
+/// succeed — for a disk with these IDENTIFY features (#841).
+/// Pure function of the features so the kernel-test smoke can pin
+/// it without hardware: the only combination that must fail is a
+/// write cache reported enabled whose drain command does not exist
+/// — writes may sit in a volatile cache no command can drain, so
+/// success would claim a durability the device never provides. Every other combination is honest: a
+/// flush command drains the cache, and a cache-less disk has
+/// nothing to drain.
+pub fn flush_must_fail(f: &AtaFeatures) -> bool {
+    f.write_cache_enabled && flush_ext_choice(f).is_none()
+}
+
 /// Sync block-device adapter for the registry — ONE instance per
 /// published disk (#931), addressing its own controller + port.
 /// (Pre-#931 this was a unit struct that always routed to the
@@ -4141,11 +4154,17 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
     }
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         let disk = self.check_live()?;
-        // A device with no flush command has no flush to issue —
-        // `capabilities()` reports its cache state honestly, so Ok
-        // here cannot mislead a caller about the durability of a
-        // cache the device does not expose a drain for.
+        // A device with no flush command has no flush to issue — but
+        // only when its write cache is off: a cache reported enabled
+        // with no drain command would leave completed writes in a
+        // volatile cache no command can empty, so success here would
+        // claim a durability the device never provides. Fail loudly
+        // instead (#841); the `flush_must_fail` smoke pins the exact
+        // feature combination.
         let Some(ext) = flush_ext_choice(&disk.features) else {
+            if disk.features.write_cache_enabled {
+                return Err(narf_block::BlockIoError::DriverError);
+            }
             return Ok(());
         };
         let _gate = ReqGate::acquire(&self.ahci.req_gate);
@@ -4154,6 +4173,14 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         // function's contract is the same ownership.
         unsafe { self.ahci.flush_cache(self.port, ext) }
             .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+    /// Real exactly when the disk offers a FLUSH CACHE command to
+    /// drain with — `false` for a disk with no flush command, so a
+    /// cache-enabled-but-undrainable disk fails closed in
+    /// `SyncBlock::supports` instead of advertising Flush (#841).
+    fn has_real_flush(&self) -> bool {
+        self.disk()
+            .is_some_and(|d| flush_ext_choice(&d.features).is_some())
     }
     fn capabilities(&self) -> narf_block::BlockCaps {
         let features = self.disk().map(|d| d.features).unwrap_or_default();

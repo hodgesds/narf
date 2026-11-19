@@ -2143,6 +2143,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             Err(_) => Err(narf_block::BlockIoError::DriverError),
         }
     }
+    /// Real: `flush` always issues SYNCHRONIZE CACHE(10) (#841).
+    fn has_real_flush(&self) -> bool {
+        true
+    }
     /// Native FUA write: WRITE(10) with the FUA bit set, so the
     /// data is on the medium when the CSW completes — not the
     /// trait default's write + flush emulation. Same range and

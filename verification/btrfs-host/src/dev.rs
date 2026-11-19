@@ -231,6 +231,9 @@ impl BlockDeviceSync for RecDev {
         }
         Ok(())
     }
+    fn has_real_flush(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> BlockCaps {
         BlockCaps {
             volatile_cache: true,

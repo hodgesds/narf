@@ -462,6 +462,9 @@ impl BlockDeviceSync for PartitionBlockDevice {
     fn flush(&self) -> Result<(), BlockIoError> {
         self.parent.flush()
     }
+    fn has_real_flush(&self) -> bool {
+        self.parent.has_real_flush()
+    }
     fn supports_trim(&self) -> bool {
         self.parent.supports_trim()
     }

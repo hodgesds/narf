@@ -300,6 +300,22 @@ fn capabilities(&self) -> BlockCaps;                   // { volatile_cache, fua 
 `PartitionBlockDevice` and `EncryptedBlockDevice` forward all three; the guard
 forwards `flush` even while it refuses writes (a flush carries no data).
 
+The flush advertisement is computed, not blanket (#841): `SyncBlock`
+advertises `BlockFeature::Flush` exactly when the device has no volatile
+cache (`capabilities().volatile_cache == false`) or its `flush` really
+drains one (`BlockDeviceSync::has_real_flush() == true`); `Fua` when the
+device reports native FUA (`capabilities().fua`) or the same Flush gate
+holds (the default `write_fua` is write + flush). The invariant the
+trait pins: a device reporting `volatile_cache == true` must override
+`flush` with a real drain and `has_real_flush` to `true`; a device whose
+flush is the default no-op must report `volatile_cache == false`. A
+future driver that adds a volatile cache but forgets the override fails
+closed — the feature is not advertised — instead of silently claiming
+a durability it never provides. `WriteZeroes` stays unconditionally
+advertised: it is emulated by plain writes, so its durability is
+exactly the device's write durability. Wrappers forward
+`has_real_flush` with `flush` and `capabilities`.
+
 Every device entering the registry is wrapped in a
 `disk_policy::PolicyGuard`; `RegisteredBlockDevice::disk` is its physical-disk
 identity (`DiskId`, never reused), shared by a disk and the partitions the

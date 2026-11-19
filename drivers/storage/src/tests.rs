@@ -3071,8 +3071,8 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_dsm_trim_issues_real_fis);
 /// semantics, including the word-validity signatures.
 fn smoke_ahci_identify_features_and_dsm_encoding() -> TestResult {
     use crate::ahci::{
-        encode_dsm_range_block, identify_ata_features, identify_firmware, identify_model_string,
-        identify_serial,
+        encode_dsm_range_block, flush_must_fail, identify_ata_features, identify_firmware,
+        identify_model_string, identify_serial,
     };
     fn set_word(id: &mut [u8; 512], n: usize, v: u16) {
         id[2 * n..2 * n + 2].copy_from_slice(&v.to_le_bytes());
@@ -3143,6 +3143,31 @@ fn smoke_ahci_identify_features_and_dsm_encoding() -> TestResult {
     let many: alloc::vec::Vec<(u64, u16)> = (0..65).map(|i| (i as u64, 1)).collect();
     if encode_dsm_range_block(&many, &mut block) != 64 {
         return TestResult::Fail("one DSM block holds at most 64 ranges");
+    }
+
+    // #841 flush contract: the only feature combination where
+    // `flush()` must fail instead of silently succeeding is a write
+    // cache reported enabled with no FLUSH CACHE command to drain
+    // it. Every other combination is honest — a flush command
+    // drains the cache, and a cache-less disk has nothing to drain.
+    let mut wc_no_flush = [0u8; 512];
+    set_word(&mut wc_no_flush, 82, 1 << 5); // WC supported, no FLUSH CACHE
+    set_word(&mut wc_no_flush, 83, 0x4000 | (1 << 10)); // valid + LBA48, no FLUSH EXT
+    set_word(&mut wc_no_flush, 85, 1 << 5); // WC enabled
+    if !flush_must_fail(&identify_ata_features(&wc_no_flush)) {
+        return TestResult::Fail("write cache enabled with no flush command must fail flush");
+    }
+    let mut wc_flush = [0u8; 512];
+    set_word(&mut wc_flush, 82, (1 << 5) | (1 << 12)); // WC supported + FLUSH CACHE
+    set_word(&mut wc_flush, 83, 0x4000 | (1 << 10)); // valid + LBA48
+    set_word(&mut wc_flush, 85, 1 << 5); // WC enabled
+    if flush_must_fail(&identify_ata_features(&wc_flush)) {
+        return TestResult::Fail("write cache enabled with FLUSH CACHE must not fail flush");
+    }
+    let mut no_wc_no_flush = [0u8; 512];
+    set_word(&mut no_wc_no_flush, 83, 0x4000 | (1 << 10)); // valid + LBA48, nothing else
+    if flush_must_fail(&identify_ata_features(&no_wc_no_flush)) {
+        return TestResult::Fail("cache-less disk with no flush command must not fail flush");
     }
     TestResult::Pass
 }

@@ -565,6 +565,9 @@ impl BlockDeviceSync for EncryptedBlockDevice {
     fn flush(&self) -> Result<(), BlockIoError> {
         self.inner.flush()
     }
+    fn has_real_flush(&self) -> bool {
+        self.inner.has_real_flush()
+    }
     fn capabilities(&self) -> crate::registry::BlockCaps {
         // FUA is emulated here (the default `write_fua`).
         crate::registry::BlockCaps {

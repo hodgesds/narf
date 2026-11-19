@@ -706,6 +706,15 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         dev.flush_cache()
             .map_err(|_| narf_block::BlockIoError::DriverError)
     }
+    /// Real exactly when F_FLUSH was negotiated: then `flush`
+    /// issues T_FLUSH; without it the device has no
+    /// guest-drainable cache, `capabilities` reports write-through
+    /// and the no-op flush is honest (#841).
+    fn has_real_flush(&self) -> bool {
+        probed_device()
+            .map(|(_gate, dev)| dev.flush_supported())
+            .unwrap_or(false)
+    }
     /// `volatile_cache` tracks negotiation exactly: a device that
     /// offered F_FLUSH may cache writes, and `flush` drains it; a
     /// device that did not offer it has no guest-drainable cache,
