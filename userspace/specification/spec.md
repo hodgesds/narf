@@ -1172,6 +1172,11 @@ Restorer-based Linux frames contain that mask in `uc_sigmask`; `rt_sigreturn`
 reads it with guarded user access before register restoration and honors
 handler edits, always stripping SIGKILL/SIGSTOP. Compact non-restorer frames
 retain their recorded kernel mask.
+Successful synchronous CPU-fault delivery performs the same mask and disposition
+bookkeeping as queued signals and forced seccomp signals: `SA_NODEFER` suppresses
+auto-blocking, `SA_RESETHAND` resets the shared disposition before entering the
+handler, and sigreturn restores the interrupted mask. A returning one-shot fault
+handler therefore takes the default action if the faulting instruction retries.
 Queued-signal syscalls import the complete native kernel `siginfo` prefix before
 publishing pending state. `rt_sigqueueinfo` and `rt_tgsigqueueinfo` require a
 readable non-null info pointer and preserve Linux's `EFAULT`-before-argument

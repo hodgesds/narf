@@ -457,7 +457,109 @@ fn smoke_hpet_oneshot_fires_handler() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_fires_handler);
 
+// Comparator 0 belongs to the timer pump. Use comparator 2 when the periodic
+// HPET clockevent owns no comparator (LAPIC primary, or no primary yet).
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_msi_oneshot_fires_once() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_time::hpet;
+
+    const CHANNEL: u8 = 2;
+    if narf_time::clockevent::primary().is_some_and(|dev| dev.name() != "lapic") {
+        return TestResult::Skip("primary clockevent may own the spare HPET comparator");
+    }
+    if !hpet::comparator_supports_fsb(CHANNEL) {
+        return TestResult::Skip("no spare FSB-capable HPET comparator");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let Some(apic_id) = narf_acpi::apic_id_of_cpu(cpu).filter(|id| *id <= 255) else {
+        return TestResult::Skip("current LAPIC cannot receive a direct MSI");
+    };
+    let hz = hpet::frequency_hz();
+    if hz == 0 {
+        return TestResult::Fail("HPET has no clock frequency");
+    }
+    let Ok(vector) = crate::vector::alloc() else {
+        return TestResult::Fail("no vector for HPET MSI test");
+    };
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
+    FIRED.store(0, Ordering::Release);
+    crate::install_handler_named(vector, "hpet-msi-test", 0, |_| {
+        FIRED.fetch_add(1, Ordering::Release);
+        crate::IrqStatus::Handled
+    });
+    // Retain this test vector/handler for the boot, as hpet_oneshot does:
+    // a delayed MSI must never land on a vector recycled to a different owner.
+    narf_lib::sync::without_interrupts(|| {
+        let deadline = hpet::read_counter().wrapping_add((hz / 100).max(4096));
+        // SAFETY: the test harness owns unused comparator 2. Its handler and
+        // current CPU destination are installed before enabling delivery.
+        let armed = unsafe {
+            hpet::arm_oneshot_msi_checked(
+                CHANNEL,
+                0xfee0_0000 | (apic_id << 12),
+                u32::from(vector),
+                deadline,
+            )
+        };
+        if armed.is_err() {
+            // SAFETY: same exclusive comparator ownership.
+            unsafe {
+                let _ = hpet::disarm(CHANNEL);
+            }
+            return TestResult::Fail("HPET MSI deadline could not be programmed");
+        }
+        let start = narf_time::Instant::now();
+        // SAFETY: every delivery reaches the static handler above. Restore the
+        // masked state before cleanup; without_interrupts restores the caller.
+        unsafe { narf_arch::enable_interrupts() };
+        while FIRED.load(Ordering::Acquire) == 0
+            && narf_time::Instant::now().cycles_since(start) < narf_time::ns_to_cycles(250_000_000)
+        {
+            core::hint::spin_loop();
+        }
+        let quiet_start = narf_time::Instant::now();
+        while FIRED.load(Ordering::Acquire) == 1
+            && narf_time::Instant::now().cycles_since(quiet_start)
+                < narf_time::ns_to_cycles(20_000_000)
+        {
+            // Leave the comparator enabled: a one-shot must not re-fire.
+            core::hint::spin_loop();
+        }
+        // SAFETY: stop the test channel before inspecting the result.
+        unsafe {
+            narf_arch::disable_interrupts();
+            let _ = hpet::disarm(CHANNEL);
+        }
+        match FIRED.load(Ordering::Acquire) {
+            1 => TestResult::Pass,
+            0 => TestResult::Fail("HPET MSI did not reach the installed handler"),
+            _ => TestResult::Fail("HPET one-shot generated repeated interrupts"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/hpet", smoke_hpet_msi_oneshot_fires_once);
+
 // ── Timer-wheel pump (HPET-driven SleepUntil) ────────────────────
+
+// Kernel-test boots can run before bare_main selects a primary clockevent.
+// HPET and the LAPIC are already probed, so install the production fallback
+// here instead of silently skipping all timer-pump integration coverage.
+#[cfg(target_arch = "x86_64")]
+fn ensure_timer_pump_for_test() -> Result<(), TestResult> {
+    use crate::x86_64::timer_pump::{init, is_initialised, TimerPumpInitError};
+    if is_initialised() {
+        return Ok(());
+    }
+    match init() {
+        Ok(()) => Ok(()),
+        Err(TimerPumpInitError::HpetMissing | TimerPumpInitError::NoComparators) => {
+            Err(TestResult::Skip("HPET unavailable"))
+        }
+        Err(_) => Err(TestResult::Fail("timer pump could not initialize")),
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
@@ -473,8 +575,8 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::task::{Context, Poll};
 
-    if !timer_pump::is_initialised() {
-        return TestResult::Skip("timer_pump not initialised");
+    if let Err(result) = ensure_timer_pump_for_test() {
+        return result;
     }
 
     struct CW(AtomicUsize);
@@ -494,6 +596,8 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
     // ~5 ms in the future: comfortably > IOAPIC programming latency,
     // well under any reasonable test timeout.
     let cycles_5ms = narf_time::ns_to_cycles(5_000_000);
+    let vector = timer_pump::__vector_for_test();
+    let before = crate::fire_count(vector);
     let deadline = narf_time::Instant::now().plus_cycles(cycles_5ms);
     let mut s = narf_time::SleepUntil::new(deadline);
 
@@ -501,7 +605,7 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
         return TestResult::Fail("first poll should be Pending");
     }
 
-    // SAFETY: timer_pump is initialised; HPET will deliver via IOAPIC.
+    // SAFETY: timer_pump is initialised; HPET will deliver via MSI or IOAPIC.
     unsafe { narf_arch::enable_interrupts() };
 
     let start = narf_time::Instant::now();
@@ -511,10 +615,13 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
             woken = true;
             break;
         }
-        // This waker is not a scheduler task waker, so its sleeper expires
-        // on the _SOFT base, from the executor (NARF's HRTIMER_SOFTIRQ). The
-        // test stands in for the executor; the interrupt raises the softirq.
-        let _ = narf_time::hrtimer::hrtimer_run_softirq();
+        // Wait for real hardware delivery before running the soft expiry.
+        // Calling this unconditionally can expire the timer by polling and
+        // hide a broken HPET route. The test stands in for the executor only
+        // after the HPET interrupt has raised its softirq.
+        if crate::fire_count(vector) > before {
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+        }
         core::hint::spin_loop();
     }
     // SAFETY: re-disable IRQs before returning.
@@ -1824,9 +1931,9 @@ fn smoke_timer_pump_init_idempotent_after_first_success() -> TestResult {
     // If init() already succeeded earlier in the boot, a second
     // call must surface AlreadyInitialised — not silently re-program
     // the IOAPIC and waste a vector.
-    use crate::x86_64::timer_pump::{init, is_initialised, TimerPumpInitError};
-    if !is_initialised() {
-        return TestResult::Skip("timer pump not initialised in this flavour");
+    use crate::x86_64::timer_pump::{init, TimerPumpInitError};
+    if let Err(result) = ensure_timer_pump_for_test() {
+        return result;
     }
     match init() {
         Err(TimerPumpInitError::AlreadyInitialised) => TestResult::Pass,
@@ -1845,13 +1952,16 @@ fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
     // vector the dispatch path uses — the same value the BSP
     // wired into the IDT. Smoke test for "did init lose its
     // vector somewhere along the way".
-    use crate::x86_64::timer_pump::{__vector_for_test, is_initialised};
-    if !is_initialised() {
-        return TestResult::Skip("timer pump not up");
+    use crate::x86_64::timer_pump::__vector_for_test;
+    if let Err(result) = ensure_timer_pump_for_test() {
+        return result;
     }
     let v = __vector_for_test();
     if v == 0 {
         return TestResult::Fail("vector reported as 0 — likely uninitialised slot");
+    }
+    if !crate::installed_handler_names(v).contains(&"hpet-timer") {
+        return TestResult::Fail("timer pump vector has no named HPET handler");
     }
     TestResult::Pass
 }

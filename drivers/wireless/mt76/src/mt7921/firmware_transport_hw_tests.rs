@@ -476,7 +476,7 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
         0x8000200b,
         0x10007800,
         0,
-        0,
+        1,
         4,
         0x000b0000,
     ];
@@ -510,6 +510,57 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_management_tx_matches_linux_cut_through_header
+);
+fn mcu_tx_packet_id_distinguishes_ack_from_status_request() -> TestResult {
+    // Linux tx.c: NO_ACK=0, NO_SKB=1, reserved HOST status PIDs >=3.
+    // A registered global WCID has the same ACK contract as a peer.
+    for wcid in [0, 1, 19] {
+        for multicast in [false, true] {
+            let mut frame = management_frame();
+            frame[4] = if multicast { 0xff } else { 0x02 };
+            let mut header = packet_tx::management(
+                &frame,
+                0x12345040,
+                7,
+                wcid,
+                crate::mt7921::association::LegacyRate::ONE_MBPS,
+            )
+            .unwrap();
+            let pid = if multicast { 0 } else { 1 };
+            if header[20..24] != [pid, 0, 0, 0] || (header[12] & 1 != 0) != multicast {
+                return TestResult::Fail("unrequested management PID disagrees with ACK policy");
+            }
+            if !multicast
+                && (crate::mt7921::tx_sequence::request(&mut header, 3).is_err()
+                    || header[20..24] != [3, 4, 0, 0])
+            {
+                return TestResult::Fail("HOST status did not replace the unrequested PID");
+            }
+        }
+    }
+    // An Ethernet multicast destination is still transmitted to the AP's
+    // unicast RA; neither it nor a raw ToDS fragment is a no-ACK frame.
+    let mut ethernet = [0xff; 14];
+    ethernet[12..14].copy_from_slice(&[8, 0]);
+    for qos in [false, true] {
+        let header = packet_tx::ethernet_qos(&ethernet, 0x1000, 1, 1, true, qos).unwrap();
+        if header[20..24] != [1, 0, 0, 0] || header[12] & 1 != 0 {
+            return TestResult::Fail("station multicast MSDU lost the AP's ACK policy");
+        }
+        let mut fragment = [0; 32];
+        fragment[0] = if qos { 0x88 } else { 0x08 };
+        fragment[1] = 0x05; // ToDS + MoreFrags, first fragment.
+        fragment[4] = 0x02;
+        let header = packet_tx::fragment(&fragment, 0x1000, 1, 1).unwrap();
+        if header[20..24] != [1, 0, 0, 0] || header[12] & 1 != 0 {
+            return TestResult::Fail("raw fragment PID disagrees with unicast ACK policy");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mcu_tx_packet_id_distinguishes_ack_from_status_request
 );
 fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() -> TestResult {
     for dma_first in [false, true] {
@@ -976,7 +1027,7 @@ fn mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata() -> TestRe
         )
         .unwrap();
         if header[4..8] != (0x8002_6001u32 | u32::from(tid) << 20).to_le_bytes()
-            || header[20..24] != [0, 0x40, 0, 0]
+            || header[20..24] != [1, 0x40, 0, 0]
             || header[12..16] != (1u32 << 28 | 15 << 11).to_le_bytes()
         {
             return TestResult::Fail("ADDBA management TXD omitted target TID/ADD_BA or changed native sequence ownership");
@@ -990,7 +1041,7 @@ fn mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata() -> TestRe
             crate::mt7921::association::LegacyRate::ONE_MBPS,
         )
         .unwrap();
-        if response[20..24] != [0; 4] || response[4..8] != 0x8002_6001u32.to_le_bytes() {
+        if response[20..24] != [1, 0, 0, 0] || response[4..8] != 0x8002_6001u32.to_le_bytes() {
             return TestResult::Fail("ADDBA response inherited originator-only native metadata");
         }
     }

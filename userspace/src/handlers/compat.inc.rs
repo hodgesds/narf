@@ -6891,8 +6891,8 @@ const UNBLOCKABLE_MASK: u64 = (1 << 8) | (1 << 18);
 ///     `cs`/`ss` selector fields → control transfer to a corrupt address
 ///     (#UD/#GP). Mirrors deliver_signal's `want_siginfo || force_rt` exactly.
 ///   - `saved_mask`: the pre-handler signal mask to restore on return (POSIX),
-///     undoing the delivery's auto-block. `None` for a sync-fault handler (it
-///     doesn't auto-block); the async path fills it after building the frame.
+///     undoing the delivery's auto-block. Every successful delivery fills it
+///     after building the frame, including synchronous CPU faults.
 ///   - `interrupted_rsp`: stack pointer before the frame was installed. A
 ///     later delivery at or above this address proves a downward-growing
 ///     regular-stack frame was abandoned by `siglongjmp` instead of returned.
@@ -6933,7 +6933,7 @@ fn with_current_sigreturn_stack<R>(
 }
 
 /// Push a fresh record for a signal delivery. `saved_mask` starts `None`; the
-/// async path fills it via `set_sigreturn_saved_mask` after the frame is built.
+/// delivery path fills it via `set_sigreturn_saved_mask` after the frame is built.
 fn push_sigreturn_record(
     task: u64,
     use_rsp: bool,
@@ -12746,6 +12746,14 @@ fn default_signal_delivery_restricted_active(
         interrupted_rsp,
         params.altstack_sp != 0,
     );
+    finish_signal_delivery(task, signum, action.flags);
+    true
+}
+
+/// Common post-frame bookkeeping for queued signals, CPU faults and seccomp.
+/// In particular rustc installs a returning SA_RESETHAND fault handler: leaving
+/// it installed retries the same failing instruction and prints forever.
+fn finish_signal_delivery(task: u64, signum: u32, flags: u32) {
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
     // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
     // restored value is the mask in effect when the handler was entered.
@@ -12758,7 +12766,7 @@ fn default_signal_delivery_restricted_active(
     }
     // SA_NODEFER: skip the auto-block. Default: add the delivered
     // signal to the mask so the handler runs without re-entrancy.
-    if (action.flags & SA_NODEFER) == 0 {
+    if (flags & SA_NODEFER) == 0 {
         let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= sig_bit(signum));
         // The handler now blocks `signum`: another pending shared instance
         // belongs to a sibling that does not (`signal_setup_done` ->
@@ -12768,12 +12776,11 @@ fn default_signal_delivery_restricted_active(
     // SA_RESETHAND: one-shot — clear the handler so the next
     // occurrence falls through to the default action. Cleared in the
     // (possibly shared) live sighand, per Linux thread-group semantics.
-    if (action.flags & SA_RESETHAND) != 0 {
+    if (flags & SA_RESETHAND) != 0 {
         if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
             h.lock()[signum as usize] = None;
         }
     }
-    true
 }
 
 /// Linux force_sigsegv: a failed SIGSEGV frame is fatal; an ignored or
@@ -12917,7 +12924,7 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 /// SA_RESTART is intentionally a no-op on this path: a CPU
 /// exception is not a syscall trap (`restartable_syscall =
 /// false`), so the arch never rewinds RIP. SA_ONSTACK and
-/// SA_SIGINFO are honoured the same way as the async path.
+/// SA_SIGINFO, SA_NODEFER and SA_RESETHAND are honoured as on the async path.
 ///
 /// For SA_SIGINFO synchronous signals, the arch stamps an
 /// architecture-specific `si_code` and the faulting address into
@@ -13294,6 +13301,7 @@ pub fn default_sync_signal_delivery(
             interrupted_rsp,
             params.altstack_sp != 0,
         );
+        finish_signal_delivery(task, signum, action.flags);
         return true;
     }
     // The handler's signal frame couldn't be placed — `deliver_signal` only
@@ -13467,19 +13475,7 @@ pub(crate) fn force_sigsys_seccomp(
         interrupted_rsp,
         params.altstack_sp != 0,
     );
-    {
-        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| signal_mask_of(task));
-        set_sigreturn_saved_mask(task, cur);
-    }
-    if (action.flags & SA_NODEFER) == 0 {
-        let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= bit);
-        note_mask_change(task, 0, bit);
-    }
-    if (action.flags & SA_RESETHAND) != 0 {
-        if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
-            h.lock()[SIGSYS as usize] = None;
-        }
-    }
+    finish_signal_delivery(task, SIGSYS, action.flags);
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────

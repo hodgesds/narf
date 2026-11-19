@@ -90,6 +90,16 @@ counter without publishing the singleton, changing the physical-base override
 or programming comparators. Both this path and singleton calibration bound
 counter reads and return unavailable for a stopped counter or invalid ratio.
 
+`hpet::init` takes exclusive boot ownership: it disables inherited comparator
+interrupts and legacy replacement routing, acknowledges all channel latches,
+and enables the main counter without resetting its value. Calibration alone
+does not perform this takeover. `arm_oneshot_msi_checked(n, address, data,
+deadline_ticks)` programs an FSB-capable comparator for edge MSI delivery to an
+already-installed LAPIC handler. It shares the IOAPIC one-shot minimum-distance
+and wrap checks (`Expired` requires a later retry), and rejects unsupported
+comparators before modifying registers. Comparator ownership and the MSI
+destination remain the unsafe caller's responsibility.
+
 ### 3.2 Timers
 
 ```rust

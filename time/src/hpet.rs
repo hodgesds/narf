@@ -76,6 +76,10 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_arch = "x86_64")]
+#[path = "hpet_tests.rs"]
+mod tests;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -100,6 +104,7 @@ const TIMER_REG_COMPARATOR: u64 = 0x08;
 const TIMER_REG_FSB_ROUTE: u64 = 0x10;
 
 const GEN_CONF_ENABLE_CNF: u64 = 1 << 0;
+const GEN_CONF_LEGACY_CNF: u64 = 1 << 1;
 
 // Per-timer Tn_CONFIG_AND_CAP bits (§2.3.5).
 const TN_INT_TYPE_CNF: u64 = 1 << 1;
@@ -155,6 +160,12 @@ pub struct Hpet {
     caps: HpetCaps,
 }
 
+#[derive(Copy, Clone)]
+enum OneShotRoute {
+    Ioapic(u8),
+    Msi { address: u32, data: u32 },
+}
+
 impl Hpet {
     /// Probe HPET at `base_phys`. Reads the capabilities word + the
     /// counter clock period; returns `NotPresent` if the
@@ -198,6 +209,39 @@ impl Hpet {
         // SAFETY: same.
         unsafe {
             write_u64(self.base_phys + REG_GEN_CONF, g | GEN_CONF_ENABLE_CNF);
+        }
+    }
+
+    /// Take ownership before installing any NARF timer routes. Firmware may
+    /// have left another channel asserting the same GSI, or legacy replacement
+    /// routing enabled. Acknowledging only our comparator cannot stop that IRQ.
+    /// Linux `hpet_enable` sanitizes all channels before starting the counter.
+    /// Keep the main counter value intact for callers that calibrated with it.
+    ///
+    /// # Safety
+    /// Exclusive boot-time ownership of the entire mapped HPET; no live NARF
+    /// clockevents or other users may depend on its comparator configuration.
+    unsafe fn take_over(&self) {
+        // SAFETY: caller owns the mapped register window and all channels.
+        unsafe {
+            let cfg = read_u64(self.base_phys + REG_GEN_CONF);
+            write_u64(
+                self.base_phys + REG_GEN_CONF,
+                cfg & !(GEN_CONF_ENABLE_CNF | GEN_CONF_LEGACY_CNF),
+            );
+            for n in 0..self.caps.num_comparators {
+                let reg = self.timer_block(n) + TIMER_REG_CONFIG;
+                let cfg = read_u64(reg);
+                write_u64(
+                    reg,
+                    cfg & !(TN_INT_ENB_CNF | TN_INT_TYPE_CNF | TN_FSB_EN_CNF),
+                );
+            }
+            write_u64(
+                self.base_phys + REG_INT_STS,
+                (1u64 << self.caps.num_comparators) - 1,
+            );
+            self.enable();
         }
     }
 
@@ -313,6 +357,42 @@ impl Hpet {
     /// of this call. Callers must arrange IDT vector + IOAPIC
     /// programming so that the GSI lands at a real handler.
     pub unsafe fn arm_oneshot_comparator(&self, n: u8, gsi: u8, deadline: u64) {
+        // SAFETY: caller owns this live comparator and its IOAPIC route.
+        unsafe { self.program_oneshot(n, deadline, OneShotRoute::Ioapic(gsi)) };
+    }
+
+    /// Program an FSB-MSI one-shot and reject deadlines too close to the
+    /// current counter. MSI delivers an edge directly to the LAPIC, without
+    /// claiming a potentially shared IOAPIC GSI.
+    ///
+    /// # Safety
+    /// Exclusive access to this mapped HPET and comparator. `msi_addr` and
+    /// `msi_data` must target an installed handler on a live LAPIC.
+    pub unsafe fn arm_oneshot_msi_checked(
+        &self,
+        n: u8,
+        msi_addr: u32,
+        msi_data: u32,
+        deadline: u64,
+    ) -> Result<(), ArmError> {
+        if !self.supports_fsb(n) {
+            return Err(ArmError::BadComparator);
+        }
+        // SAFETY: capability/index checked; caller owns comparator and route.
+        unsafe {
+            self.program_oneshot(
+                n,
+                deadline,
+                OneShotRoute::Msi {
+                    address: msi_addr,
+                    data: msi_data,
+                },
+            );
+            self.check_oneshot_deadline(n, deadline)
+        }
+    }
+
+    unsafe fn program_oneshot(&self, n: u8, deadline: u64, route: OneShotRoute) {
         let block = self.timer_block(n);
         // SAFETY: caller-asserted live window + valid index.
         let mut cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
@@ -322,10 +402,15 @@ impl Hpet {
             | TN_TYPE_CNF_PERIODIC
             | TN_VAL_SET_CNF
             | TN_FSB_EN_CNF
+            | TN_INT_TYPE_CNF
             | TN_INT_ROUTE_CNF_MASK);
-        // Step 2/3: level-triggered (so a stale latch is observable
-        // + clearable rather than silently lost on edge).
-        cfg |= TN_INT_TYPE_CNF;
+        match route {
+            OneShotRoute::Ioapic(gsi) => {
+                cfg |= TN_INT_TYPE_CNF;
+                cfg |= ((gsi as u64) << TN_INT_ROUTE_CNF_SHIFT) & TN_INT_ROUTE_CNF_MASK;
+            }
+            OneShotRoute::Msi { .. } => cfg |= TN_FSB_EN_CNF,
+        }
         // Step 2 cont.: on 32-bit timers, force 32-bit mode so the
         // upper bits of the 64-bit comparator register aren't
         // consulted — the spec leaves them undefined on
@@ -333,10 +418,18 @@ impl Hpet {
         if cfg & TN_SIZE_CAP == 0 {
             cfg |= TN_32MODE_CNF;
         }
-        // Step 4: route bits.
-        cfg |= ((gsi as u64) << TN_INT_ROUTE_CNF_SHIFT) & TN_INT_ROUTE_CNF_MASK;
         // SAFETY: same.
         unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+
+        if let OneShotRoute::Msi { address, data } = route {
+            // Linux hpet_msi_write: low dword is data, high is address.
+            // Separate 32-bit writes work on HPETs without 64-bit route writes.
+            // SAFETY: caller owns this comparator; delivery is disabled above.
+            unsafe {
+                core::ptr::write_volatile((block + TIMER_REG_FSB_ROUTE) as *mut u32, data);
+                core::ptr::write_volatile((block + TIMER_REG_FSB_ROUTE + 4) as *mut u32, address);
+            }
+        }
 
         // Step 5: program the deadline. Mask to 32 bits in 32-bit
         // mode to avoid setting an unreachable comparator.
@@ -360,6 +453,18 @@ impl Hpet {
         cfg |= TN_INT_ENB_CNF;
         // SAFETY: same.
         unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+    }
+
+    unsafe fn check_oneshot_deadline(&self, n: u8, deadline: u64) -> Result<(), ArmError> {
+        // SAFETY: caller retains exclusive access to the live comparator.
+        let now = unsafe { self.read_counter() };
+        // SAFETY: same; n was checked before programming.
+        let narrow = unsafe { self.read_timer_config(n) } & TN_32MODE_CNF != 0;
+        if oneshot_expired(deadline, now, narrow) {
+            Err(ArmError::Expired)
+        } else {
+            Ok(())
+        }
     }
 
     /// Arm comparator `n` in PERIODIC mode firing every
@@ -619,7 +724,8 @@ pub fn base_phys_for_ioremap() -> u64 {
     }
 }
 
-/// Probe + enable HPET. Returns `Ok` on x86_64 with a working
+/// Probe + take ownership of HPET, disabling inherited interrupt sources and
+/// legacy replacement routing before enabling its counter. Returns `Ok` on x86_64 with a working
 /// HPET, `Err(NotPresent)` everywhere else (aarch64) or when the
 /// HPET window is inert.
 ///
@@ -637,7 +743,7 @@ pub unsafe fn init() -> Result<(), HpetError> {
     let dev = unsafe { Hpet::probe(base) }?;
     // SAFETY: caller asserted single-threaded.
     unsafe {
-        dev.enable();
+        dev.take_over();
     }
     *HPET.lock() = Some(dev);
     Ok(())
@@ -773,13 +879,25 @@ pub unsafe fn arm_oneshot_checked(n: u8, gsi: u8, deadline: u64) -> Result<(), A
     // validated against the route-cap mask.
     unsafe { h.arm_oneshot_comparator(n, gsi, deadline) };
     // SAFETY: as above.
-    let now = unsafe { h.read_counter() };
-    // SAFETY: as above.
-    let narrow = unsafe { read_u64(h.timer_block(n) + TIMER_REG_CONFIG) } & TN_32MODE_CNF != 0;
-    if oneshot_expired(deadline, now, narrow) {
-        return Err(ArmError::Expired);
-    }
-    Ok(())
+    unsafe { h.check_oneshot_deadline(n, deadline) }
+}
+
+/// Arm a one-shot through FSB-MSI, with the same minimum-deadline check as
+/// [`arm_oneshot_checked`]. Unsupported comparators return `BadComparator`.
+///
+/// # Safety
+/// Caller owns comparator `n` and installed the LAPIC handler addressed by
+/// `msi_addr` / `msi_data`. The singleton serializes register programming.
+pub unsafe fn arm_oneshot_msi_checked(
+    n: u8,
+    msi_addr: u32,
+    msi_data: u32,
+    deadline: u64,
+) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    // SAFETY: caller owns route/comparator; singleton lock owns the registers.
+    unsafe { h.arm_oneshot_msi_checked(n, msi_addr, msi_data, deadline) }
 }
 
 /// Whether a one-shot comparator at `deadline` counts as missed with the main
