@@ -238,6 +238,11 @@ branch exposed to a long-branch relocation. The arena is sized from a
 per-relocation over-count and folded by target at emit time, as Linux's
 `count_plts` does.
 
+For module-local data addressed with ADRP, the loader also relocates the
+following ADD or 32-, 64- or 128-bit load/store. It encodes the low 12 bits
+of the symbol plus addend in units of the access width. The Intel GPU
+module's PCI registration code uses the 128-bit form.
+
 ADRP reaches ±4 GiB, so with the window 1 GiB out no second-order
 veneer is needed. If the window ever moves further, Linux's
 `module_emit_veneer_for_adrp` is the piece to add.

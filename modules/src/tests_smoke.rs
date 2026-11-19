@@ -908,29 +908,31 @@ fn smoke_aarch64_call26_encoding() -> TestResult {
 }
 kernel_test_in!("modules/reloc", smoke_aarch64_call26_encoding);
 
-fn smoke_aarch64_ldst32_abs_lo12_encoding() -> TestResult {
-    use crate::elf::reloc::R_AARCH64_LDST32_ABS_LO12_NC;
-
-    // Preserve the opcode/register fields while replacing imm12 (bits
-    // 21:10) with the page offset scaled by a 32-bit access width.
-    let original = 0xB940_0021u32 | (0xFFF << 10);
-    let mut buf = original.to_le_bytes();
-    let value = 0xFFFF_0000_1234_0ABCu64;
-    if apply_aarch64(&mut buf, 0, 0, value, 0, R_AARCH64_LDST32_ABS_LO12_NC).is_err() {
-        return TestResult::Fail("LDST32_ABS_LO12_NC relocation was rejected");
-    }
-
-    let relocated = u32::from_le_bytes(buf);
-    let expected_imm = ((value & 0xFFF) >> 2) as u32;
-    if ((relocated >> 10) & 0xFFF) != expected_imm {
-        return TestResult::Fail("LDST32_ABS_LO12_NC immediate was encoded incorrectly");
-    }
-    if (relocated & !(0xFFF << 10)) != (original & !(0xFFF << 10)) {
-        return TestResult::Fail("LDST32_ABS_LO12_NC changed non-immediate bits");
+fn smoke_aarch64_scaled_lo12_encoding() -> TestResult {
+    use crate::elf::reloc::{
+        R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_LDST32_ABS_LO12_NC,
+        R_AARCH64_LDST64_ABS_LO12_NC,
+    };
+    // S + A crosses a page and ends in 0xabc. Use nonzero initial imm12
+    // bits to verify the relocation replaces the entire field.
+    for (ty, instruction, immediate) in [
+        (R_AARCH64_ADD_ABS_LO12_NC, 0x9100_0021u32, 0xabc),
+        (R_AARCH64_LDST32_ABS_LO12_NC, 0xb940_0021, 0x2af),
+        (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0021, 0x157),
+        (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0021, 0xab),
+    ] {
+        let mut buf = (instruction | (0xfff << 10)).to_le_bytes();
+        if apply_aarch64(&mut buf, 0, 0, 0xffff_0000_1234_0ffc, 0xac0, ty).is_err()
+            || u32::from_le_bytes(buf) != (instruction | (immediate << 10))
+        {
+            return TestResult::Fail(
+                "AArch64 low-12 relocation changed the opcode or encoded the wrong offset",
+            );
+        }
     }
     TestResult::Pass
 }
-kernel_test_in!("modules/reloc", smoke_aarch64_ldst32_abs_lo12_encoding);
+kernel_test_in!("modules/reloc", smoke_aarch64_scaled_lo12_encoding);
 
 fn smoke_cap_typed_export_blocks_missing_cap() -> TestResult {
     crate::symbols::__reset_for_test();
