@@ -9,7 +9,7 @@ use narf_capabilities::{Cap, Write};
 use narf_interrupts::{dispatch, vector};
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum Kind {
+pub enum Kind {
     Hda,
     Acp,
     /// ACP 3.x (Renoir): same service semantics as `Acp`, but the
@@ -17,7 +17,7 @@ pub(crate) enum Kind {
     Acp3x,
 }
 #[derive(Debug)]
-pub(crate) struct State {
+pub struct State {
     pub mmio: MmioRegion,
     pub kind: Kind,
     pub pending: AtomicU32,
@@ -95,7 +95,7 @@ fn handler(cookie: u64) -> dispatch::IrqStatus {
     }
 }
 
-pub(crate) struct Route {
+pub struct Route {
     pub vector: u8,
     owns_vector: bool,
     state: Arc<State>,

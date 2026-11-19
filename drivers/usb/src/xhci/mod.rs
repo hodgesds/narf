@@ -4232,7 +4232,7 @@ impl Xhci {
     }
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
-    pub(crate) async fn control_in_generation(
+    pub async fn control_in_generation(
         &self,
         slot_id: u8,
         generation: u64,
@@ -4424,7 +4424,7 @@ impl Xhci {
     }
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
-    pub(crate) async fn control_out_generation(
+    pub async fn control_out_generation(
         &self,
         slot_id: u8,
         generation: u64,

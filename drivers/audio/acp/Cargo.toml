@@ -1,0 +1,62 @@
+# AMD Audio Co-Processor (ACP 3.x / 6.3 PDM DMIC capture, ACP 6.3 SoundWire
+# manager + RT711/RT1316 codecs) — dual-build.
+#
+# Promoted out of `narf-audio`, which stays the PCM subsystem and re-exports
+# this crate's modules.
+#
+#   * `builtin` (default): rlib dependency of the `narf-audio` facade,
+#     registered from its Stage::Subsys `acp6-pci` / `acp63-sdw-pci`
+#     initcalls.
+#   * `module`: `cargo xtask build-module --package narf-drivers-audio-acp
+#     --no-default-features --features module`. Registration-only: the probe
+#     thunk returns -ENOSYS; it registers the ACP PCI id through
+#     `narf_register_pci_driver`.
+#
+# Tests gate on a dedicated `kernel-test` feature implying `builtin`.
+
+[package]
+name         = "narf-drivers-audio-acp"
+description  = "AMD Audio Co-Processor (ACP 3.x / 6.3 PDM + SoundWire) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_audio_acp"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-drivers-audio-core", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-drivers", "dep:narf-drivers-sound", "dep:narf-firmware",
+    "dep:narf-io", "dep:narf-lib", "dep:narf-power", "dep:narf-scheduler",
+    "dep:narf-time",
+]
+module = []
+kernel-test = [
+    "builtin", "dep:narf-kernel-test",
+    "narf-drivers-audio-core/kernel-test", "narf-drivers-sound/kernel-test",
+]
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+
+narf-drivers-audio-core = { path = "../core", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-drivers-sound = { path = "../../sound", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

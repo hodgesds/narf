@@ -284,6 +284,20 @@ HDA exposes S16LE/S32LE, 48 kHz stereo, 128-byte period alignment and a
 512–1024 frame periods, four periods and 16–32 KiB buffer. Refine queries
 are side-effect-free; actual configuration still validates in the engine.
 
+Crate layout: `narf-audio` is the PCM subsystem facade. The native
+controller drivers are separate dual-build crates it depends on and
+re-exports, so `narf_audio::{hda, hda_codec, acp3x, acp6, acp63,
+acp63_sdw, acp63_sdw_dma, soundwire, soundwire_rt1316, soundwire_rt711}`
+paths are unchanged: `narf-drivers-audio-hda` (HDA controller + codec;
+its PCI match table is `narf_drivers_audio_hda::ids`, compiled in both
+builds) and `narf-drivers-audio-acp` (ACP PDM + SoundWire). Both share
+`narf-drivers-audio-core` (`native_pci` power-on, `native_irq` routing,
+`native_pcm::Ring`, `native_firmware` ACPI queries), which is always
+built-in. Either driver also builds as a registration-only loadable `.ko`
+(`cargo xtask build-module --package <crate> --no-default-features
+--features module`, `target_domain=scratch`) whose probe returns
+`-ENOSYS` until the device datapath ABI covers a PCM device.
+
 Subsystem initcalls register PCI probes; late init publishes native cards
 through the sound file bridge. Capture is never started by enumeration.
 HDA and ACP register their actual bus address with the sound registry, so

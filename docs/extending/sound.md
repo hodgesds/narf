@@ -3,7 +3,8 @@
 Prereq: [drivers.md](drivers.md). This covers the audio-stream seam a sound
 card / codec driver publishes into.
 
-Source: `audio/src/lib.rs`. Reference drivers: Intel HDA (`audio/src/hda.rs`)
+Source: `audio/src/lib.rs`. Reference drivers: Intel HDA (`drivers/audio/hda/src/hda.rs`,
+re-exported as `narf_audio::hda`)
 and virtio-sound (`drivers/virtio` via `narf_drivers_virtio::snd_pci`).
 
 The trait is out-of-tree-implementable; the **active-stream picker is
@@ -48,7 +49,7 @@ A sound driver has two independent registrations:
 
 ### 2.1 PCI registration (HDA reference)
 
-`register_pci_driver` (`audio/src/hda.rs:1851`) — note it loops over a whole ID
+`register_pci_driver` (`drivers/audio/hda/src/hda.rs`) — note it loops over a whole ID
 table under one probe:
 
 ```rust
@@ -57,7 +58,7 @@ pub fn register_pci_driver() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
             kind: narf_bus::MatchKind::VendorDevice { vendor, device },
-            probe,                                          // audio/src/hda.rs:1705
+            probe,                                          // drivers/audio/hda/src/hda/runtime.rs
         });
     }
 }
@@ -65,7 +66,7 @@ pub fn register_pci_driver() {
 
 Probe signature is the standard
 `fn(BusDevice, Cap<BusDeviceCap, Write>) -> Result<(), ProbeError>`
-(`audio/src/hda.rs:1705`). Wired at `Stage::Subsys` (`audio/src/lib.rs:440`):
+(`drivers/audio/hda/src/hda/runtime.rs`). Wired at `Stage::Subsys` (`audio/src/lib.rs`, `register_initcalls`):
 
 ```rust
 narf_init::register(Stage::Subsys, "hda-pci", || {

@@ -2,10 +2,7 @@
 use narf_bus::{BusDevice, BusDeviceCap, BusKind, ProbeError};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-pub(crate) fn power_on(
-    device: &BusDevice,
-    cap: &Cap<BusDeviceCap, Write>,
-) -> Result<(), ProbeError> {
+pub fn power_on(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
     cap.invoke(PowerOn(device))
         .map_err(|_| ProbeError::BadDevice)?
 }

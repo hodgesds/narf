@@ -699,6 +699,19 @@ also consult upstream Linux GPL sources.
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
   `(0, 0)` VID/PID wildcard, not a match for an unrelated interface.
+- Loadable-module matches: `class_registry::install_module_host()`
+  (called from `register_initcalls`, before any module can load) installs
+  the registry as the `narf_bus::module_usb` host, the backend of the
+  `narf_register_usb_driver` kernel-ABI export. Module entries live in a
+  separate table (64 entries, all modules together; `-ENOSPC` past it) so
+  module id tables never take built-in `MAX_DRIVERS` slots. An identical
+  match held by another module is `-EBUSY`; the same owner replaces its
+  own. `dispatch_probe` offers a device to module entries only after every
+  built-in driver declined it, in registration order, calling each probe
+  through `narf_bus::module_usb::call_module_usb_probe` with
+  `module_usb_token(controller, slot)` (tag `0x55` in bits 63:56,
+  controller in 15:8, slot in 7:0; opaque — no USB datapath export accepts
+  it yet). 0 claims the device; any negative errno tries the next entry.
 - Disconnect lifecycle: the supervisor polls connection state each cycle.
   A claimed root port (or bound hub downstream port) that leaves the
   connected set is detached via `attach::detach_slot`: class bindings are
@@ -876,7 +889,16 @@ also consult upstream Linux GPL sources.
   encoding (payload-format-spec minor version, host inits to zero
   on first Probe SET) is documented on
   `VsProbeCommit::preferred_version` for future work.
-- `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
+- btusb lives in `narf-drivers-bluetooth-btusb` (dual-build; a `.ko`
+  registers its 0xE0/0x01/0x01 match through `narf_register_usb_driver`).
+  This crate reaches it only through `bluetooth_hooks`: `set_binder`
+  installs the attach-cascade binder, run at btusb's historic cascade
+  position (after CDC-ECM, before fingerprint), and `set_wake_watch` the
+  supervisor's per-cycle remote-wakeup watch (before the pumps). With no
+  binder installed a Bluetooth device falls through to the class registry.
+  `firmware_cap(name)` (crate root) is the shared trusted-loader firmware
+  lookup btusb and r8152 use.
+- `btusb::try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
   running the full mandatory HCI sequence, adopting the ready controller, and

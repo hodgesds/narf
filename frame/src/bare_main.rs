@@ -3287,6 +3287,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_usbpd::register_initcalls();
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
+            narf_drivers_bluetooth_btusb::register_initcalls();
             narf_drivers_video::register_initcalls();
             narf_drivers_media::register_initcalls();
             narf_drivers_thunderbolt::register_initcalls();
@@ -3342,6 +3343,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_fb::register_initcalls();
             narf_audio::register_initcalls();
             narf_bluetooth::register_initcalls();
+            narf_drivers_bluetooth_btintel_pcie::register_initcalls();
             narf_power::register_initcalls();
             narf_wireless::register_initcalls();
             narf_accel::register_initcalls();
@@ -3976,8 +3978,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // Rootfs firmware scan must execute AFTER the root filesystem is mounted
             // by root-mount-auto so /lib/firmware/ exists.
             narf_firmware::register_rootfs_scan_initcall();
-            #[cfg(target_arch = "x86_64")]
-            narf_bluetooth::register_firmware_initcalls();
+            narf_drivers_bluetooth_btintel_pcie::register_firmware_initcalls();
             // Bluetooth bring-up runs AFTER the btintel PCIe
             // firmware download registers its transport (Stage::Late
             // runs in registration order), so bring_up_all finds a

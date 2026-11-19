@@ -9,7 +9,7 @@ use super::{
     device_init::Endpoints,
     packet_codec::{self, Kind, Record, MAX_TRANSFER},
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use narf_drivers_usb::device::UsbError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

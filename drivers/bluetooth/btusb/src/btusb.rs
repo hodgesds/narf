@@ -1071,20 +1071,8 @@ pub(crate) async fn drain_pending_events(xhci: &Xhci, slot_id: u8, event_dci: u8
     }
 }
 
-/// Open a firmware blob from the registry under the trusted-loader
-/// authority — the same capability path `btusb_qca` uses. `None` when
-/// the authority or the blob is unavailable; vendor setup treats
-/// that as a hard failure for chips that cannot run without their
-/// firmware.
-pub(crate) fn firmware_cap(
-    name: &str,
-) -> Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>> {
-    use narf_capabilities::Cap;
-    let write = narf_firmware::trusted_loader_authority()?;
-    let read: Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read> =
-        write.derive().ok()?;
-    narf_firmware::open(name, &read).ok()
-}
+/// Firmware lookup shared with the rest of the USB stack.
+pub(crate) use narf_drivers_usb::firmware_cap;
 
 /// Decode Read Local Version's Command Complete return parameters.
 /// The first byte is HCI Status; the eight-byte version payload follows.

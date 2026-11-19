@@ -1,0 +1,36 @@
+# Shared native-audio helpers (PCI power-on, IRQ routing, PCM ring, ACPI
+# firmware queries) used by the HDA and ACP driver crates. Always built-in;
+# never linked into a .ko.
+
+[package]
+name         = "narf-drivers-audio-core"
+description  = "Shared helpers for the native audio controller drivers (HDA, AMD ACP)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_audio_core"
+path = "src/lib.rs"
+
+[features]
+kernel-test = ["dep:narf-kernel-test"]
+
+[dependencies]
+narf-acpi         = { path = "../../../acpi" }
+narf-aml          = { path = "../../../aml" }
+narf-bus          = { path = "../../../bus" }
+narf-capabilities = { path = "../../../capabilities" }
+narf-drivers-sound = { path = "../../sound" }
+narf-interrupts   = { path = "../../../interrupts" }
+narf-io           = { path = "../../../io" }
+narf-lib          = { path = "../../../lib" }
+narf-memory       = { path = "../../../memory" }
+narf-scheduler    = { path = "../../../scheduler" }
+narf-time         = { path = "../../../time" }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

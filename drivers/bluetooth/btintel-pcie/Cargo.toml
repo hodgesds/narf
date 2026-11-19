@@ -1,0 +1,61 @@
+# Intel PCIe Bluetooth controller (btintel_pcie) — dual-build.
+#
+# Promoted out of `narf-bluetooth` (the HCI/L2CAP/GATT host stack, which stays
+# built-in). The driver depends on the stack's transport/controller/pm
+# registries; the stack no longer knows about the driver.
+#
+#   * `builtin` (default): rlib linked into the kernel; `frame` registers its
+#     Stage::Subsys PCI match and Stage::Late firmware download (x86_64 only —
+#     the driver needs the PCIe bus).
+#   * `module`: built to a loadable `.ko` via `cargo xtask build-module
+#     --package narf-drivers-bluetooth-btintel-pcie --no-default-features
+#     --features module`. Registration-only: the probe thunk returns -ENOSYS;
+#     it registers the driver's PCI ids through `narf_register_pci_driver`.
+#
+# Tests gate on a dedicated `kernel-test` feature implying `builtin`.
+
+[package]
+name         = "narf-drivers-bluetooth-btintel-pcie"
+description  = "Intel PCIe Bluetooth controller — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_bluetooth_btintel_pcie"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-bluetooth", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-console", "dep:narf-drivers", "dep:narf-efi",
+    "dep:narf-firmware", "dep:narf-init", "dep:narf-io", "dep:narf-lib",
+    "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
+]
+module = []
+kernel-test = ["builtin", "dep:narf-kernel-test", "narf-bluetooth/kernel-test"]
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+
+narf-bluetooth    = { path = "../../../bluetooth", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-efi          = { path = "../../../efi", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-init         = { path = "../../../init", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

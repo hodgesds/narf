@@ -3,7 +3,7 @@ use alloc::{format, string::String, vec::Vec};
 use narf_aml::{NameValue, Value};
 use narf_bus::{BusDevice, BusKind};
 
-pub(crate) fn value(path: &str) -> Option<Value> {
+pub fn value(path: &str) -> Option<Value> {
     fn convert(v: NameValue) -> Option<Value> {
         Some(match v {
             NameValue::Integer(v) => Value::Integer(v),
@@ -28,7 +28,7 @@ fn integer(path: &str) -> Option<u64> {
 }
 /// Match root segment/bus and each bridge's secondary bus before the endpoint.
 /// This disambiguates identical device/function numbers on different buses.
-pub(crate) fn pci_path(device: &BusDevice) -> Option<String> {
+pub fn pci_path(device: &BusDevice) -> Option<String> {
     let BusKind::Pcie { addr: target, .. } = device.kind else {
         return None;
     };
@@ -93,7 +93,7 @@ pub(crate) fn pci_path(device: &BusDevice) -> Option<String> {
     None
 }
 
-pub(crate) fn acp_dmic_present(device: &BusDevice) -> bool {
+pub fn acp_dmic_present(device: &BusDevice) -> bool {
     let Some(parent) = pci_path(device) else {
         return false;
     };

@@ -19,6 +19,8 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-console      = { path = "../../console" }
 narf-net          = { path = "../../net" }
 narf-drivers-usb  = { path = "../usb" }
+narf-drivers-wwan-core = { path = "core" }
+narf-drivers-wwan-cdc-mbim = { path = "cdc-mbim" }
 
 [features]
 kernel-test = []

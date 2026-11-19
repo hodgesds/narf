@@ -172,6 +172,7 @@ So the surface is small and grows deliberately. Today:
 | `narf_kfree` | `(*mut u8, usize, usize) -> ()` | must repeat the exact size and align |
 | `narf_monotonic_ns` | `() -> u64` | monotonic clock |
 | `narf_register_pci_driver` | `(*const u8, usize, u16, u16, usize) -> i32` | register a PCI ID and C-ABI probe callback |
+| `narf_register_usb_driver` | `(*const u8, usize, u16, u16, u16, u8, u8, u8, usize) -> i32` | name, `match_flags`, vendor, product, interface class/subclass/protocol, probe; flags as Linux `usb_device_id` (1 VID/PID, 2 class, 4 subclass, 8 protocol). Offered only devices no built-in driver claimed; `-ENODEV` without a USB stack |
 | `narf_pci_enable` | `(u64, u16) -> i32` | enable command bits on the callback's device |
 | `narf_bar_map` | `(u64, u8) -> u64` | map a BAR and return an opaque handle |
 | `narf_mmio_read32` | `(u64, u64, u64, *mut u32) -> i32` | bounded BAR read |

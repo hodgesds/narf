@@ -18,6 +18,15 @@ transport activation and user-facing modem policy remain out of scope.
 
 ## 3. Public interface
 
+- Crate layout: `narf-drivers-wwan` is the facade. It re-exports
+  `narf-drivers-wwan-core` (everything below except `usb_mbim`: port
+  registry, `mbim`, `qmi`, `session`, `bearer`, `iosm`) and
+  `narf-drivers-wwan-cdc-mbim::usb_mbim`, so all `narf_drivers_wwan::…`
+  paths are unchanged, and owns `register_initcalls`. The CDC-MBIM crate is
+  dual-build: built-in, or a registration-only loadable `.ko`
+  (`target_domain=net`) that registers the same interface match (class
+  0x02, subclass 0x0E) through the `narf_register_usb_driver` export; its
+  probe returns `-ENOSYS` until a USB transfer datapath is exported.
 - `WwanPort` exposes `name`, `kind`, `send`, and `recv`. It requires
   `Send + Sync` because registered `Arc` ports are stored in one
   cross-CPU registry and may be called through shared references.
@@ -69,7 +78,7 @@ the parser and session state machine do not assume x86 register access.
 
 ## 6. Dependencies
 
-The crate depends on the USB device/class registry, scheduler async
+The crates depend on the USB device/class registry, scheduler async
 bridge, network-device registry, and the shared driver framework.
 
 ## 7. Stage assignment

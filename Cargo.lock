@@ -871,6 +871,9 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-audio-acp",
+ "narf-drivers-audio-core",
+ "narf-drivers-audio-hda",
  "narf-drivers-sound",
  "narf-drivers-virtio",
  "narf-filesystem",
@@ -1207,6 +1210,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-audio-acp"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-audio-core",
+ "narf-drivers-sound",
+ "narf-firmware",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-audio-core"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-drivers-sound",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-audio-hda"
+version = "0.0.0"
+dependencies = [
+ "narf-aml",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-audio-core",
+ "narf-drivers-sound",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-backlight"
 version = "0.0.0"
 dependencies = [
@@ -1223,6 +1286,46 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-pwm",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-bluetooth-btintel-pcie"
+version = "0.0.0"
+dependencies = [
+ "narf-bluetooth",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-efi",
+ "narf-firmware",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-bluetooth-btusb"
+version = "0.0.0"
+dependencies = [
+ "narf-bluetooth",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers-usb",
+ "narf-filesystem",
+ "narf-firmware",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -2479,7 +2582,6 @@ dependencies = [
  "narf-aml",
  "narf-arch",
  "narf-block",
- "narf-bluetooth",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
@@ -2744,8 +2846,32 @@ version = "0.0.0"
 dependencies = [
  "narf-console",
  "narf-drivers-usb",
+ "narf-drivers-wwan-cdc-mbim",
+ "narf-drivers-wwan-core",
  "narf-init",
  "narf-kernel-test",
+ "narf-lib",
+ "narf-net",
+ "narf-scheduler",
+]
+
+[[package]]
+name = "narf-drivers-wwan-cdc-mbim"
+version = "0.0.0"
+dependencies = [
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers-usb",
+ "narf-drivers-wwan-core",
+ "narf-lib",
+ "narf-scheduler",
+]
+
+[[package]]
+name = "narf-drivers-wwan-core"
+version = "0.0.0"
+dependencies = [
+ "narf-drivers-usb",
  "narf-lib",
  "narf-net",
  "narf-scheduler",
@@ -2900,6 +3026,8 @@ dependencies = [
  "narf-crypto",
  "narf-drivers",
  "narf-drivers-backlight",
+ "narf-drivers-bluetooth-btintel-pcie",
+ "narf-drivers-bluetooth-btusb",
  "narf-drivers-crypto",
  "narf-drivers-fingerprint",
  "narf-drivers-fs-9p",

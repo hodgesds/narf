@@ -48,6 +48,20 @@ carrier down.
 The crate registers exactly one initcall, `wwan-usb-mbim` at
 Stage::Subsys.
 
+## Layout and loadable module
+
+`narf-drivers-wwan` (this directory's `src/`) is a facade over
+`core/` (`narf-drivers-wwan-core`: ports, codecs, session, bearer,
+IOSM ids) and `cdc-mbim/` (`narf-drivers-wwan-cdc-mbim`: the USB
+binding above). The CDC-MBIM crate also builds as a registration-only
+`.ko` that claims the same CDC-MBIM interfaces through
+`narf_register_usb_driver`:
+
+```
+cargo xtask build-module --package narf-drivers-wwan-cdc-mbim \
+  --no-default-features --features module
+```
+
 ## Deferred
 
 IOSM/PCIe activation (the ID tables are in place; there is still no

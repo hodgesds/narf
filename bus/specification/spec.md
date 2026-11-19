@@ -565,6 +565,43 @@ through its own probe grant. This query never detaches an existing binding.
 The permanent native host's discovery bypasses that preference check, while
 still refusing to alias an already bound radio.
 
+### 3.12a Loadable USB class-driver registration
+
+Bus sits below the USB stack, so module USB matches go through one
+permanent host the USB class registry installs at boot:
+
+```rust
+pub mod module_usb {
+    pub const MATCH_VENDOR_PRODUCT: u16 = 1 << 0; // Linux USB_DEVICE_ID_MATCH_DEVICE
+    pub const MATCH_INT_CLASS: u16 = 1 << 1;
+    pub const MATCH_INT_SUBCLASS: u16 = 1 << 2;
+    pub const MATCH_INT_PROTOCOL: u16 = 1 << 3;
+    pub struct ModuleUsbMatch { pub vendor_id: u16, pub product_id: u16,
+        pub class: Option<u8>, pub subclass: Option<u8>, pub protocol: Option<u8> }
+    impl ModuleUsbMatch {
+        pub fn from_flags(flags: u16, vendor: u16, product: u16,
+            class: u8, subclass: u8, protocol: u8) -> Result<Self, i32>;
+    }
+    pub struct Host {
+        pub register: fn(owner: u64, name: &'static str, m: ModuleUsbMatch,
+                         probe: ModuleProbeFn) -> i32,
+        pub unregister: fn(owner: u64),
+    }
+    pub fn register(host: &'static Host) -> Result<(), i32>; // one host; other = -EBUSY
+    pub unsafe fn register_module_usb_driver(owner: u64, name: &str,
+        m: ModuleUsbMatch, probe: usize) -> i32;            // no host = -ENODEV
+    pub fn unregister_module_usb_drivers(owner: u64);
+    pub fn call_module_usb_probe(owner: u64, probe: ModuleProbeFn, dev_token: u64) -> i32;
+}
+```
+
+`from_flags` rejects no/unknown flags and a vendor/product match on the
+reserved VID 0. A module USB probe only ever runs through
+`call_module_usb_probe`, i.e. the same module probe call gate as PCI
+(§3.6): no gate installed means `-ENODEV`, never a direct call into module
+text. The loader calls `unregister_module_usb_drivers` beside
+`unregister_module_pci_drivers`, after the exit hook and before unmapping.
+
 ### 3.13 DMA configuration
 
 ```rust

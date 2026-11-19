@@ -23,8 +23,11 @@ to it.
 - A general IOMMU per-domain mapping story (the IOMMU is identity-mode today —
   `io/src/iommu.rs`).
 - Hot-unplug / surprise-removal of a module-driven device.
-- Non-PCI buses (I²C/SPI/platform/USB) — separate per-bus registration exports,
-  out of scope here.
+- Non-PCI buses (I²C/SPI/platform) — separate per-bus registration exports,
+  out of scope here. USB has its registration export
+  (`narf_register_usb_driver`, through `narf_bus::module_usb`); a USB
+  datapath (control/bulk/interrupt transfers on the probe token) is not
+  designed yet.
 
 ## The core constraint
 

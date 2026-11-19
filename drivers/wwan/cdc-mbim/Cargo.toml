@@ -1,0 +1,43 @@
+# USB CDC-MBIM cellular modem binding — dual-build.
+#
+# Promoted out of `narf-drivers-wwan` (now the facade, which re-exports
+# `usb_mbim` and registers it from its Stage::Subsys `wwan-usb-mbim` initcall).
+#
+#   * `builtin` (default): rlib dependency of the facade.
+#   * `module`: `cargo xtask build-module --package narf-drivers-wwan-cdc-mbim
+#     --no-default-features --features module`. Registration-only: registers
+#     the CDC-MBIM interface match through `narf_register_usb_driver`; the
+#     probe returns -ENOSYS until a USB transfer datapath is exported.
+
+[package]
+name         = "narf-drivers-wwan-cdc-mbim"
+description  = "USB CDC-MBIM cellular modem binding — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wwan_cdc_mbim"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-drivers-wwan-core", "dep:narf-console", "dep:narf-drivers-usb",
+    "dep:narf-lib", "dep:narf-scheduler",
+]
+module = []
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+
+narf-drivers-wwan-core = { path = "../core", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-drivers-usb  = { path = "../../usb", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+
+[lints]
+workspace = true

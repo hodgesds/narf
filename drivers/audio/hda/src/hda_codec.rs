@@ -17,7 +17,7 @@
 //!
 //! ## What this module is
 //!
-//! The bulk of `audio/src/hda.rs` is the controller-side bring-up
+//! The bulk of `hda.rs` is the controller-side bring-up
 //! that pumps verbs through CORB / RIRB MMIO. This module is its
 //! *transport-neutral* sibling: given any closure that resolves a
 //! 32-bit verb to a 32-bit response, [`enumerate`] returns a fully

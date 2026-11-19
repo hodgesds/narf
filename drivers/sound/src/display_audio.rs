@@ -15,7 +15,7 @@
 //!     consumes this exact seam as the second publisher** — it
 //!     must not grow a second sink. The AMD display-audio gap
 //!     (#778) closes by publishing here too when that lane runs.
-//!   - **Consumers**: the HDA codec side (`audio/src/hda/hdmi.rs`
+//!   - **Consumers**: the HDA codec side (`drivers/audio/hda/src/hda/hdmi.rs`
 //!     `display_sink`) reads [`display_audio_snapshot`] and exposes
 //!     the selected publication through the HDMI jack + ELD controls
 //!     and the format limits; the ALSA bridge surfaces those controls

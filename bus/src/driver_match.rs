@@ -566,7 +566,12 @@ pub fn set_module_tx_call_gate(gate: ModuleTxCallGate) {
     MODULE_TX_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
 }
 
-fn call_module_probe(owner: u64, thunk: ModuleProbeFn, dev_token: u64, reserved: u64) -> i32 {
+pub(crate) fn call_module_probe(
+    owner: u64,
+    thunk: ModuleProbeFn,
+    dev_token: u64,
+    reserved: u64,
+) -> i32 {
     let gate = MODULE_PROBE_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
     if gate == 0 {
         return -19; // -ENODEV: never execute module text without its gate.
@@ -627,7 +632,7 @@ pub fn module_pci_driver_registered(vendor: u16, device: u16) -> bool {
 /// the same name don't grow the table without bound.
 static INTERNED_NAMES: IrqSafeSpinLock<Vec<&'static str>> = IrqSafeSpinLock::new(Vec::new());
 
-fn intern_name(name: &str) -> &'static str {
+pub(crate) fn intern_name(name: &str) -> &'static str {
     let mut g = INTERNED_NAMES.lock();
     if let Some(found) = g.iter().copied().find(|n| *n == name) {
         return found;

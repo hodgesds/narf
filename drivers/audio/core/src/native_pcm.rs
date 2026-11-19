@@ -6,7 +6,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 
 #[derive(Debug)]
-pub(crate) struct Ring {
+pub struct Ring {
     pub data: DmaBuffer,
     pub bdl: DmaBuffer,
     pub params: HwParams,
