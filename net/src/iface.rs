@@ -1209,15 +1209,40 @@ pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
 }
 
 pub fn snapshot_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
-    let g = IFACES.lock();
-    let v = match g.as_ref() {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    v.iter()
+    counters_for_namespace(IFACES.lock().as_deref().unwrap_or_default(), net_ns_id)
+}
+
+fn counters_for_namespace(entries: &[NetIfaceEntry], net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
+    entries
+        .iter()
         .filter(|e| e.net_ns_id == net_ns_id)
         .map(|e| e.stats.clone())
         .collect()
+}
+
+/// Inventory for /proc/net/dev, including the synthetic loopback and driver-only devices.
+pub fn proc_dev_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
+    // Driver-only devices belong to the initial namespace. Take their snapshot
+    // before the iface lock; registry methods can call back into the driver.
+    let drivers = if net_ns_id == 0 {
+        crate::registry().snapshots()
+    } else {
+        Vec::new()
+    };
+    let g = IFACES.lock();
+    let entries = g.as_deref().unwrap_or_default();
+    let mut counters = counters_for_namespace(entries, net_ns_id);
+    // As in RTM_GETLINK, each namespace owns a loopback even before it has
+    // registered an L3 device. Prefer measured counters whenever present.
+    if !counters.iter().any(|c| c.name == "lo") {
+        counters.insert(0, IfaceCounterSnapshot::empty("lo"));
+    }
+    for driver in drivers {
+        if !driver.is_loopback && !entries.iter().any(|e| e.name == driver.name) {
+            counters.push(IfaceCounterSnapshot::empty(&driver.name));
+        }
+    }
+    counters
 }
 
 /// Snapshot EVERY registered interface, by value. Used by the rtnetlink

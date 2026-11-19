@@ -171,6 +171,10 @@ masked. Register/domain restoration keeps that mask until the atomic user
 return instruction. A notification received late in kernel mode therefore
 cannot be consumed by an IPI after the final wake check but before user entry.
 
+Boot installs the procfs network snapshot adapters. Each adapter queries the
+network stack using the namespace ID supplied by the open procfs file,
+including for IPv6 addresses and routes.
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.

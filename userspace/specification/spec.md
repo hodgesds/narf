@@ -1532,6 +1532,13 @@ returns backing to its per-node pool, and `fork` eagerly copies private huge
 mappings on their original nodes. File-backed hugetlbfs and shared huge
 mappings fail explicitly because NARF has no hugetlbfs or shared-huge refcount
 contract.
+Userspace resolves procfs network table opens to the calling thread or named
+outer PID/TID and retains its network namespace for the open file. A named
+task that has exited cannot supply a new table view. The raw socket providers
+snapshot live AF_INET and AF_INET6 raw endpoints through weak references.
+Multicast providers read per-device IPv4 and IPv6 membership counts keyed
+by network namespace and interface index.
+
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.

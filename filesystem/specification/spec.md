@@ -1916,10 +1916,18 @@ optional local address. Queued stream connections have inode zero until
 accepted. Abstract names render NUL bytes as `@` and retain other bytes.
 The address column is masked and the reference count reports native socket
 ownership, excluding the temporary reference used for enumeration.
-Registered network tables can implement `ProcFile::net_view` to select the
-caller (`None`) or an outer PID/TID (`Some(id)`). The Unix table uses
-`ProcFile::read_at` to retain one snapshot across short reads. Reading
-again at offset zero refreshes the snapshot in the selected namespace.
+All network tables registered with `procfs::net::register_table` appear under
+`/proc/net`, `/proc/<pid>/net` and the corresponding thread directories.
+`ProcFile::net_view` binds the open file to the calling thread (`None`) or
+the named outer PID/TID (`Some(id)`). Userspace supplies the namespace
+reference. Each open keeps it through namespace changes and target exit.
+Renderers receive the selected network table ID, including zero for the
+initial namespace. Reads at offset zero refresh the table. Short reads
+at subsequent offsets continue the same snapshot.
+The raw IPv4 and IPv6 tables enumerate raw IP sockets with their creator UID,
+inode and IP protocol in the local port column. The multicast tables show
+interface indices, group addresses and device membership counts for the
+selected namespace, including implicit all-hosts and all-nodes groups.
 
 `/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
 congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,

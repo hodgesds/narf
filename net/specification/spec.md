@@ -989,9 +989,11 @@ datagram's transport checksum is verified in software over the whole
 payload. `ip_fragment::stats_in(ns)` returns the ReasmReqds / ReasmOKs /
 ReasmFails / ReasmTimeout counters `/proc/net/snmp` reports.
 
-Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
-the calling task's network namespace and exclude objects owned by every other
-namespace.
+Procfs network snapshot hooks accept the namespace ID selected when the file
+was opened. Socket tables, neighbours, routes, IPv6 addresses, interface
+counters, and aggregate statistics all query that namespace. The device
+table includes its loopback and interfaces owned by it. Driver-only interfaces
+without a namespace assignment belong to the initial namespace.
 TCP snapshots expose Linux `get_tcp4_sock` transport fields rather than
 placeholders: the active timer and USER_HZ deadline, retransmit/probe counts,
 RTO and delayed-ACK deadline, congestion window, and slow-start threshold.

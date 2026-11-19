@@ -37,10 +37,12 @@ mod inet6_dgram;
 mod inet_dgram;
 mod inet_port;
 pub(crate) mod packet;
-pub(crate) mod proc_unix;
+pub(crate) mod proc_sockets;
 mod sockopt;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 pub use packet::{AF_PACKET, SOCK_PACKET, SOL_PACKET};
+pub use proc_sockets::{raw4_snapshot_in, raw6_snapshot_in};
+pub use sockopt::{igmp6_snapshot_in, igmp_snapshot_in};
 pub use sockopt::{timeo_ns, SockOptExt};
 
 // ── POSIX-numbered constants ────────────────────────────────────
@@ -2038,8 +2040,8 @@ impl SocketFile {
     /// IPPROTO_*, and so SO_PROTOCOL round-trips. Also seeds the
     /// state with InetRaw for AF_INET/SOCK_RAW.
     pub fn with_protocol(domain: u16, kind: u32, protocol: u32) -> Arc<Self> {
-        let net_ns_id = if domain == AF_UNIX {
-            proc_unix::current_net_ns_id()
+        let net_ns_id = if proc_sockets::tracked(domain, kind) {
+            proc_sockets::current_net_ns_id()
         } else {
             0
         };
@@ -2260,8 +2262,8 @@ impl SocketFile {
             netlink_uevent_subscribed: AtomicBool::new(false),
             uevent_readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
         });
-        if domain == AF_UNIX && !pending_accept {
-            proc_unix::track(&socket);
+        if proc_sockets::tracked(domain, kind) && !pending_accept {
+            proc_sockets::track(&socket);
         }
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
@@ -9779,7 +9781,7 @@ impl SocketFile {
                         }
                         // Publish only after the queued endpoint has its state
                         // and local name. A refused connect never gets a row.
-                        proc_unix::track(&server_end);
+                        proc_sockets::track(&server_end);
                         pending.push_back(server_end);
                         // Durable per-fd wake: fire the acceptor armed on the
                         // listener's cell directly. poll_readiness clears it when
@@ -12051,8 +12053,8 @@ fn unix_skb_truesize(unit: usize) -> usize {
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
-        if self.domain == AF_UNIX {
-            proc_unix::forget(self.inode.ino);
+        if proc_sockets::tracked(self.domain, self.kind) {
+            proc_sockets::forget(self.domain, self.inode.ino);
         }
         let native = self.native_source.lock().retire();
         native.notify();

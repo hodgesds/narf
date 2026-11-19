@@ -7093,7 +7093,12 @@ fn spawn_net_check_listener() -> Result<u16> {
 /// imprecise match only shifts load, never drops coverage). First match
 /// wins; order matters.
 fn musl_case_group(cmd: &str) -> &'static str {
-    if matches!(cmd, "userns_smoke" | "unix_listen_wake_smoke --proc-netns") {
+    if matches!(
+        cmd,
+        "userns_smoke"
+            | "unix_listen_wake_smoke --proc-netns"
+            | "unix_listen_wake_glibc --proc-netns"
+    ) {
         return "userns";
     }
     let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
@@ -7539,6 +7544,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
         ("unix_listen_wake_smoke --proc-netns", "proc-netns-ok"),
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("unix_listen_wake_glibc --proc-netns", "proc-netns-ok"),
         ("wlproxy_sockpair_smoke", "wlproxy-ok"),
         ("wlproxy_sockpair_glibc", "wlproxy-ok"),
         // A blocking AF_UNIX stream send queues the whole payload; signal,

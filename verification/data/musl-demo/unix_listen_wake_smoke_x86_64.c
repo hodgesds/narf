@@ -15,6 +15,7 @@
 // Success token "unix-listen-wake-ok".
 #define _GNU_SOURCE
 #include <errno.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
@@ -114,11 +115,148 @@ static int has_proc_row(const char *table, unsigned long inode, unsigned kind,
     return found;
 }
 
+// Compare socket inodes, since two namespaces can choose the same local port.
+static int bind_udp(unsigned long *inode) {
+    struct sockaddr_in addr = {.sin_family = AF_INET};
+    struct stat st;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd >= 0 && bind(fd, (void *)&addr, sizeof addr) == 0 && fstat(fd, &st) == 0) {
+        *inode = st.st_ino;
+        return fd;
+    }
+    if (fd >= 0) close(fd);
+    return -1;
+}
+
+// A zero argument omits that check. Kernel-internal rows may have inode zero.
+static int socket_view(FILE *table, unsigned long present, unsigned long absent) {
+    char line[512];
+    unsigned long inode;
+    int found = 0;
+    if (!table || !fgets(line, sizeof line, table) || !strstr(line, "inode")) return 0;
+    while (fgets(line, sizeof line, table)) {
+        if (sscanf(line, "%*s %*s %*s %*s %*s %*s %*s %*s %*s %lu", &inode) != 1)
+            continue;
+        if (inode == present) found = 1;
+        if (absent && inode == absent) return 0;
+    }
+    return (!present || found) && !ferror(table);
+}
+
+// Linux can create tunnel devices by default in every namespace. A physical
+// device from the parent has a sysfs device link and cannot appear in the child.
+static int dev_view(FILE *table, char *parent_nic, int discover, int *nic_seen) {
+    char line[512], iface[64], path[128];
+    int count = 0, lo = 0;
+    if (!table) return -1;
+    while (fgets(line, sizeof line, table)) {
+        if (!strchr(line, ':') || sscanf(line, " %63[^: ]", iface) != 1) continue;
+        count++;
+        if (strcmp(iface, "lo") == 0) lo++;
+        if (discover && !parent_nic[0]) {
+            snprintf(path, sizeof path, "/sys/class/net/%s/device", iface);
+            if (access(path, F_OK) == 0) strcpy(parent_nic, iface);
+        }
+        if (strcmp(iface, parent_nic) == 0) *nic_seen = 1;
+    }
+    return !ferror(table) && lo == 1 ? count : -1;
+}
+
+static int has_group(const char *path, const char *group) {
+    FILE *f = fopen(path, "r");
+    char line[256];
+    int found = 0;
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, group)) found = 1;
+    if (ferror(f)) found = -1;
+    fclose(f);
+    return found;
+}
+
+static int check_raw_and_groups(int parent, int family) {
+    int v6 = family == AF_INET6;
+    int raw = socket(family, SOCK_RAW, v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+    int dgram = socket(family, SOCK_DGRAM, 0);
+    char parent_path[64], group[40];
+    const char *self_raw = v6 ? "/proc/self/net/raw6" : "/proc/self/net/raw";
+    const char *self_groups = v6 ? "/proc/self/net/igmp6" : "/proc/self/net/igmp";
+    struct stat st;
+    if (raw < 0 || dgram < 0 || fstat(raw, &st) != 0) return 0;
+    snprintf(parent_path, sizeof parent_path, "/proc/%d/net/%s", parent, v6 ? "raw6" : "raw");
+    FILE *child_raw = fopen(self_raw, "r");
+    FILE *parent_raw = fopen(parent_path, "r");
+    int ok = socket_view(child_raw, st.st_ino, 0) && socket_view(parent_raw, 0, st.st_ino);
+    if (child_raw) fclose(child_raw);
+    if (parent_raw) fclose(parent_raw);
+    close(raw);
+
+    int joined;
+    if (v6) {
+        struct ipv6_mreq m = {.ipv6mr_interface = 1};
+        m.ipv6mr_multiaddr.s6_addr[0] = 0xff;
+        m.ipv6mr_multiaddr.s6_addr[1] = 2;
+        m.ipv6mr_multiaddr.s6_addr[14] = 0x5a;
+        m.ipv6mr_multiaddr.s6_addr[15] = 0x42;
+        strcpy(group, "ff020000000000000000000000005a42");
+        joined = setsockopt(dgram, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m, sizeof m);
+    } else {
+        struct ip_mreqn m = {.imr_ifindex = 1, .imr_multiaddr.s_addr = htonl(0xefc05a42)};
+        snprintf(group, sizeof group, "%08X", m.imr_multiaddr.s_addr);
+        joined = setsockopt(dgram, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+    }
+    snprintf(parent_path, sizeof parent_path, "/proc/%d/net/%s", parent, v6 ? "igmp6" : "igmp");
+    ok = ok && joined == 0 && has_group(self_groups, group) == 1 && has_group(parent_path, group) == 0;
+    close(dgram);
+    if (!ok || has_group(self_groups, group) != 0) {
+        fprintf(stderr, "proc-netns: raw socket or multicast group mismatch, family %d\n", family);
+        return 0;
+    }
+    return 1;
+}
+
+static int check_inet_views(int parent, FILE *before_udp, int parent_count, char *parent_nic, unsigned long parent_udp) {
+    unsigned long child_udp;
+    int sock = bind_udp(&child_udp);
+    if (sock < 0) return 0;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/net/udp", parent);
+    FILE *parent_table = fopen(path, "r");
+    FILE *private_table = fopen("/proc/thread-self/net/udp", "r");
+    int ok = socket_view(before_udp, parent_udp, child_udp) &&
+             socket_view(parent_table, parent_udp, child_udp) &&
+             socket_view(private_table, child_udp, parent_udp);
+    if (parent_table) fclose(parent_table);
+    if (private_table) fclose(private_table);
+    close(sock);
+    snprintf(path, sizeof path, "/proc/%d/net/dev", parent);
+    FILE *parent_dev = fopen(path, "r");
+    FILE *private_dev = fopen("/proc/self/net/dev", "r");
+    int in_parent = 0, in_child = 0;
+    ok = ok && parent_count > 0 &&
+         dev_view(parent_dev, parent_nic, 0, &in_parent) == parent_count &&
+         dev_view(private_dev, parent_nic, 0, &in_child) > 0 &&
+         (!parent_nic[0] || (in_parent && !in_child));
+    if (parent_dev) fclose(parent_dev);
+    if (private_dev) fclose(private_dev);
+    if (!ok) fprintf(stderr, "proc-netns: UDP inode or interface visibility mismatch\n");
+    return ok;
+}
+
 // A proc fd opened before unshare keeps its namespace even on its first read.
 // /proc/<parent>/net selects the parent; /proc/net and thread-self select us.
-static int check_private_net(int parent, unsigned long inode) {
+static int check_private_net(int parent, unsigned long inode, unsigned long parent_udp) {
     FILE *before = fopen("/proc/net/unix", "r");
-    if (!before || unshare(CLONE_NEWNET) != 0) return 0;
+    FILE *before_udp = fopen("/proc/net/udp", "r");
+    FILE *before_dev = fopen("/proc/net/dev", "r");
+    char parent_nic[64] = "";
+    int seen = 0;
+    int parent_count = dev_view(before_dev, parent_nic, 1, &seen);
+    if (!before || !before_udp || parent_count < 1 || unshare(CLONE_NEWNET) != 0) return 0;
+    int inet_ok = check_inet_views(parent, before_udp, parent_count, parent_nic, parent_udp);
+    fclose(before_udp);
+    fclose(before_dev);
+    if (!inet_ok || !check_raw_and_groups(parent, AF_INET) || !check_raw_and_groups(parent, AF_INET6)) return 0;
     char table[64];
     snprintf(table, sizeof table, "/proc/%d/net/unix", parent);
     int ok = find_proc_row(before, inode, SOCK_DGRAM, 0, 1, "") == 1 &&
@@ -140,12 +278,16 @@ static int check_proc_netns(void) {
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) return 0;
+    unsigned long parent_udp;
+    int udp = bind_udp(&parent_udp);
+    if (udp < 0) return 0;
     pid_t parent = getpid(), child = fork();
-    if (child == 0) _exit(check_private_net(parent, st.st_ino) ? 0 : 1);
+    if (child == 0) _exit(check_private_net(parent, st.st_ino, parent_udp) ? 0 : 1);
     int status;
     int ok = child > 0 && waitpid(child, &status, 0) == child &&
              WIFEXITED(status) && WEXITSTATUS(status) == 0;
     close(fd);
+    close(udp);
     puts(ok ? "proc-netns-ok" : "proc-netns-failed");
     return ok;
 }

@@ -463,7 +463,7 @@ fn install_procfs_net_hooks() {
     pn::install_hooks(
         tcp_adapter,
         udp_adapter,
-        raw_adapter,
+        narf_userspace::socket::raw4_snapshot_in,
         arp_adapter,
         route_adapter,
         iface_counters_adapter,
@@ -471,11 +471,11 @@ fn install_procfs_net_hooks() {
         ipv6_route_adapter,
         conntrack_adapter,
         snmp_adapter,
-        igmp_adapter,
-        igmp6_adapter,
+        narf_userspace::socket::igmp_snapshot_in,
+        narf_userspace::socket::igmp6_snapshot_in,
         tcp6_adapter,
         udp6_adapter,
-        raw6_adapter,
+        narf_userspace::socket::raw6_snapshot_in,
     );
     // Register the actual /proc/net/* files on the procfs registry.
     pn::register_all();
@@ -494,21 +494,8 @@ fn install_procfs_net_hooks() {
     }
 }
 
-#[cfg(feature = "container")]
-fn current_net_ns_id() -> u64 {
-    let task = narf_userspace::handlers::current_task_id();
-    narf_userspace::namespaces::current_net_ns(task)
-        .map(|namespace| namespace.id())
-        .unwrap_or(0)
-}
-
-#[cfg(not(feature = "container"))]
-fn current_net_ns_id() -> u64 {
-    0
-}
-
-fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
-    narf_net::tcp::core::snapshot_in(current_net_ns_id())
+fn tcp_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
+    narf_net::tcp::core::snapshot_in(net_ns_id)
         .into_iter()
         .map(|t| {
             let (uid, inode) = narf_userspace::handlers::tcb_socket(t.id).unwrap_or((0, 0));
@@ -536,8 +523,8 @@ fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
         .collect()
 }
 
-fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnapshot> {
-    narf_net::udp_sock::snapshot_in(current_net_ns_id())
+fn udp_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnapshot> {
+    narf_net::udp_sock::snapshot_in(net_ns_id)
         .into_iter()
         .map(|u| narf_filesystem::procfs::net::UdpSocketSnapshot {
             local_addr: u.local_addr,
@@ -551,7 +538,7 @@ fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnaps
             inode: 0,
         })
         .chain(
-            narf_userspace::socket::udp_snapshot_in(current_net_ns_id())
+            narf_userspace::socket::udp_snapshot_in(net_ns_id)
                 .into_iter()
                 .map(|u| narf_filesystem::procfs::net::UdpSocketSnapshot {
                     local_addr: u.local_addr,
@@ -568,24 +555,8 @@ fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnaps
         .collect()
 }
 
-fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnapshot> {
-    narf_net::raw_sock::snapshot_in(current_net_ns_id())
-        .into_iter()
-        .map(|r| narf_filesystem::procfs::net::RawSocketSnapshot {
-            local_addr: r.local_addr,
-            local_port: r.local_port,
-            remote_addr: r.remote_addr,
-            remote_port: r.remote_port,
-            state_code: r.state_code,
-            uid: 0,
-            inode: 0,
-            protocol: r.protocol,
-        })
-        .collect()
-}
-
-fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
-    narf_net::arp_cache::snapshot_in(current_net_ns_id())
+fn arp_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
+    narf_net::arp_cache::snapshot_in(net_ns_id)
         .into_iter()
         .map(|a| narf_filesystem::procfs::net::ArpSnapshot {
             ip: a.ip,
@@ -596,8 +567,8 @@ fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
         .collect()
 }
 
-fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapshot> {
-    narf_net::route::snapshot_in(current_net_ns_id())
+fn route_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapshot> {
+    narf_net::route::snapshot_in(net_ns_id)
         .into_iter()
         .map(|r| narf_filesystem::procfs::net::RouteSnapshot {
             iface: r.iface,
@@ -615,8 +586,10 @@ fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapsho
         .collect()
 }
 
-fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IfaceCounterSnapshot> {
-    narf_net::iface::snapshot_counters_in(current_net_ns_id())
+fn iface_counters_adapter(
+    net_ns_id: u64,
+) -> alloc::vec::Vec<narf_filesystem::procfs::net::IfaceCounterSnapshot> {
+    narf_net::iface::proc_dev_counters_in(net_ns_id)
         .into_iter()
         .map(|c| narf_filesystem::procfs::net::IfaceCounterSnapshot {
             name: c.name,
@@ -640,8 +613,10 @@ fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ifa
         .collect()
 }
 
-fn ipv6_ifaddr_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6IfAddrSnapshot> {
-    narf_net::ipv6::addrs::snapshot()
+fn ipv6_ifaddr_adapter(
+    net_ns_id: u64,
+) -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6IfAddrSnapshot> {
+    narf_net::ipv6::addrs::snapshot_in(net_ns_id)
         .into_iter()
         .map(|a| narf_filesystem::procfs::net::Ipv6IfAddrSnapshot {
             iface: a.iface,
@@ -654,8 +629,10 @@ fn ipv6_ifaddr_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6If
         .collect()
 }
 
-fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6RouteSnapshot> {
-    narf_net::ipv6::route::snapshot()
+fn ipv6_route_adapter(
+    net_ns_id: u64,
+) -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6RouteSnapshot> {
+    narf_net::ipv6::route::snapshot_in(net_ns_id)
         .into_iter()
         .map(|r| narf_filesystem::procfs::net::Ipv6RouteSnapshot {
             dst: r.dst,
@@ -672,8 +649,10 @@ fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6Rou
         .collect()
 }
 
-fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ConntrackSnapshot> {
-    narf_net::netfilter::conntrack::snapshot_in(current_net_ns_id())
+fn conntrack_adapter(
+    net_ns_id: u64,
+) -> alloc::vec::Vec<narf_filesystem::procfs::net::ConntrackSnapshot> {
+    narf_net::netfilter::conntrack::snapshot_in(net_ns_id)
         .into_iter()
         .map(|c| narf_filesystem::procfs::net::ConntrackSnapshot {
             l3proto: c.l3proto,
@@ -696,14 +675,14 @@ fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Conntrac
         .collect()
 }
 
-fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
+fn snmp_adapter(net_ns_id: u64) -> narf_filesystem::procfs::net::SnmpMib {
     // SNMP counters live in atomic globals across the net stack;
     // until those land in narf_net, surface a baseline MIB with
     // the static defaults RFC 1213 specifies as well-known. The reassembly
     // counters are real (`IPSTATS_MIB_REASM*`, per network namespace), as
     // are the output fragmentation counters (`IPSTATS_MIB_FRAG*`).
-    let reasm = narf_net::ip_fragment::stats_in(current_net_ns_id());
-    let frag = narf_net::ip_output::frag_stats_in(current_net_ns_id());
+    let reasm = narf_net::ip_fragment::stats_in(net_ns_id);
+    let frag = narf_net::ip_output::frag_stats_in(net_ns_id);
     narf_filesystem::procfs::net::SnmpMib {
         ip_reasm_timeout: reasm.timeout,
         ip_reasm_reqds: reasm.reqds,
@@ -722,20 +701,8 @@ fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
     }
 }
 
-fn igmp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IgmpSnapshot> {
-    // IGMP membership tracking lives in pkt_dhcp / dhcp paths and
-    // isn't centralised yet. Return empty — the header line still
-    // renders so libnetfilter-mcast probes don't fail.
-    alloc::vec::Vec::new()
-}
-
-fn igmp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Igmp6Snapshot> {
-    // MLD membership: same status as IGMP — empty until centralised.
-    alloc::vec::Vec::new()
-}
-
-fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
-    narf_net::tcp::core::snapshot6_in(current_net_ns_id())
+fn tcp6_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
+    narf_net::tcp::core::snapshot6_in(net_ns_id)
         .into_iter()
         .map(|t| {
             let (uid, inode) = narf_userspace::handlers::tcb_socket(t.id).unwrap_or((0, 0));
@@ -756,8 +723,10 @@ fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot>
         .collect()
 }
 
-fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSnapshot> {
-    narf_userspace::socket::udp6_snapshot_in(current_net_ns_id())
+fn udp6_adapter(
+    net_ns_id: u64,
+) -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSnapshot> {
+    narf_userspace::socket::udp6_snapshot_in(net_ns_id)
         .into_iter()
         .map(|u| narf_filesystem::procfs::net::Udp6SocketSnapshot {
             local_addr: u.local_addr,
@@ -773,6 +742,52 @@ fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSna
         .collect()
 }
 
-fn raw6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Raw6SocketSnapshot> {
-    alloc::vec::Vec::new()
+#[cfg(all(feature = "kernel-test", feature = "container"))]
+fn smoke_proc_net_ipv6_namespaces() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    use narf_net::ipv6::{addrs, route};
+    use narf_userspace::namespaces::NetNamespace;
+
+    let first = NetNamespace::new_with_loopback();
+    let second = NetNamespace::new_with_loopback();
+    let addr = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let cases = [(first.id(), 64, 50), (second.id(), 96, 75)];
+    for (id, prefix_len, metric) in cases {
+        addrs::add_in(
+            id,
+            addrs::Ipv6IfAddr {
+                iface: "lo".into(),
+                addr,
+                prefix_len,
+                state: addrs::AddrState::Preferred,
+                scope: addrs::AddrScope::Global,
+                preferred_deadline_ns: u64::MAX,
+                valid_deadline_ns: u64::MAX,
+                temporary: false,
+            },
+        );
+        route::add_in(
+            id,
+            route::Route {
+                iface: "lo".into(),
+                prefix: addr,
+                prefix_len: 128,
+                gateway: None,
+                metric,
+                valid_deadline_ns: 0,
+            },
+        );
+    }
+    for (id, prefix_len, metric) in cases {
+        let addresses = ipv6_ifaddr_adapter(id);
+        let routes = ipv6_route_adapter(id);
+        if !matches!(addresses.as_slice(), [row] if row.addr == addr && row.prefix_len == prefix_len)
+            || !matches!(routes.as_slice(), [row] if row.dst == addr && row.metric == metric)
+        {
+            return TestResult::Fail("procfs IPv6 adapter selected the wrong network namespace");
+        }
+    }
+    TestResult::Pass
 }
+#[cfg(all(feature = "kernel-test", feature = "container"))]
+narf_kernel_test::kernel_test_in!("filesystem/procfs/net", smoke_proc_net_ipv6_namespaces);
