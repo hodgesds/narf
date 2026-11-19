@@ -1,4 +1,5 @@
 use super::*;
+use alloc::boxed::Box;
 use alloc::{sync::Arc, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
