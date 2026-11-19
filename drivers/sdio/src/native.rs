@@ -384,6 +384,26 @@ pub fn register_function_driver(driver: FunctionDriver) -> bool {
     drivers.push(driver);
     true
 }
+
+/// Remove a function driver registered by [`register_function_driver`], by its
+/// unique `name`. Returns `true` if one was removed. Used by the loadable-module
+/// SDIO host to drop a module's matches before its text is unmapped.
+pub fn unregister_function_driver(name: &str) -> bool {
+    let mut drivers = DRIVERS.lock();
+    match drivers.iter().position(|d| d.name == name) {
+        Some(pos) => {
+            drivers.remove(pos);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Test-only: whether a function driver with `name` is registered.
+#[cfg(feature = "kernel-test")]
+pub fn registered_function_driver(name: &str) -> bool {
+    DRIVERS.lock().iter().any(|d| d.name == name)
+}
 fn matching_driver(card: &NativeCard) -> Option<FunctionDriver> {
     DRIVERS.lock().iter().copied().find(|driver| {
         card.function(driver.function)
@@ -419,6 +439,9 @@ pub fn register_pci_driver() {
             probe,
         });
     }
+    // Back `narf_bus::module_sdio` so a loadable `.ko` can register an SDIO
+    // function-driver match. Idempotent.
+    crate::module::install();
 }
 
 /// Map a card-initialisation outcome onto the bus arbitration
