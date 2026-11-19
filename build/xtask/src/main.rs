@@ -44,6 +44,7 @@ mod crate_release;
 mod efi_image;
 mod frame_budget;
 mod http3_smoke;
+mod kallsyms;
 mod kaslr_knob;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
@@ -71,6 +72,20 @@ struct RelocsArgs {
     /// Patch the table into the image's reserved `.kaslr_relocs` section.
     #[arg(long)]
     patch: bool,
+}
+
+#[derive(clap::Args)]
+struct KallsymsArgs {
+    /// Linked kernel ELF to read.
+    elf: std::path::PathBuf,
+    /// Write the table into the image's reserved `.kallsyms` section.
+    #[arg(long)]
+    patch: bool,
+    /// Print the image's (patched) table in `/proc/kallsyms` format, with
+    /// every address moved by this KASLR slide (hex `0x...` or decimal; the
+    /// panic report's "Kernel Offset:"). For symbolising a capture offline.
+    #[arg(long)]
+    print_slide: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -109,6 +124,11 @@ enum Cmd {
     /// boot-time slide would have to patch. Requires a kernel linked with
     /// `--emit-relocs`.
     Relocs(RelocsArgs),
+    /// Generate the kernel symbol table (`/proc/kallsyms`) from a linked
+    /// image, optionally patching it into the `.kallsyms` reservation or
+    /// printing it. Every `xtask build` already patches; this is for
+    /// inspecting an image or symbolising a capture.
+    Kallsyms(KallsymsArgs),
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Build a self-contained x86_64 EFI image; optionally run it through OVMF.
@@ -4748,6 +4768,17 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 "xtask: KASLR relocation table -> {} sites ({} bytes)",
                 table.total(),
                 table.encoded_len()
+            );
+            // `/proc/kallsyms`: same reserve-then-patch scheme, same reason
+            // to run on every link — an unpatched image boots fine and
+            // simply has an empty symbol table, which nothing would notice
+            // until perf could not symbolise a kernel sample.
+            let ksyms = kallsyms::patch(&elf).with_context(|| {
+                format!("patching the kernel symbol table into {}", elf.display())
+            })?;
+            println!(
+                "xtask: kernel symbol table -> {} symbols, {} names ({} bytes)",
+                ksyms.symbols, ksyms.names, ksyms.total
             );
             if matches!(args.arch, Arch::Aarch64) {
                 // Written on every link — 0 unless asked — so an image patched
@@ -15465,6 +15496,29 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Kallsyms(args) => {
+            if args.patch {
+                kallsyms::patch(&args.elf)?;
+            } else if args.print_slide.is_none() {
+                let bytes = std::fs::read(&args.elf)?;
+                let (_, stats, ex) = kallsyms::generate(&bytes)?;
+                println!(
+                    "xtask kallsyms: {} symbols, {} names ({} truncated), table {} bytes",
+                    stats.symbols, stats.names, ex.truncated, stats.total
+                );
+            }
+            if let Some(raw) = args.print_slide.as_deref() {
+                let raw = raw.trim();
+                let slide = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                    Some(hex) => u64::from_str_radix(hex, 16),
+                    None => raw.parse(),
+                }
+                .with_context(|| format!("--print-slide {raw:?} is not a number"))?;
+                let bytes = std::fs::read(&args.elf)?;
+                print!("{}", kallsyms::render(&bytes, slide)?);
+            }
+            Ok(())
+        }
         Cmd::ClippyChanged(args) => ci_clippy::run(&args, &workspace_root()?),
         Cmd::CrateRelease(args) => crate_release::run(&args, &workspace_root()?),
         Cmd::Affected(args) => {
@@ -15687,6 +15741,12 @@ fn host_test_cmd() -> Result<()> {
                 // must run them on every push, not only when a kernel boots.
                 "-p",
                 "narf-bpf-btf",
+                // The `/proc/kallsyms` table format. Its decoder reads bytes
+                // the build wrote into the image and must never panic on a
+                // corrupt or stale table; the encoder must match Linux's
+                // token algorithm. Both are pure and host-testable.
+                "-p",
+                "narf-kallsyms",
                 // xtask itself: `bench_stats` implements the §8 protocol, and
                 // its distribution functions are anchored on closed forms
                 // (Cauchy at ν=1, the ν=2 closed form, the normal at ±1.96).
