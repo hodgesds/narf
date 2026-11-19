@@ -206,7 +206,9 @@ impl ApEventAuthority {
     }
 }
 /// Serialized for the original AP event source/receiver only. Its final
-/// delivery performs no dynamic current callback, endpoint lookup or recapture.
+/// delivery re-validates the guard's current authority (live role and
+/// generation, reply source, reservation, registry, admin grant) before the
+/// fixed message is emitted; it performs no endpoint lookup or recapture.
 /// It grants no native receive/key/RF/DATA authority: the concrete driver must
 /// recheck those original proofs immediately before consuming this token.
 pub struct PreparedApEvent {
@@ -223,9 +225,16 @@ impl fmt::Debug for PreparedApEvent {
 }
 impl PreparedApEvent {
     pub fn deliver(self) -> Result<(), WirelessError> {
+        // `matches_control` compares the emission authority's captured
+        // mode/generation against the guard's snapshots from the same bind,
+        // so it cannot see a live mode/generation ABA bump after
+        // preparation. Re-validate the guard's current authority as well:
+        // it re-reads the live role and generation, and also re-checks the
+        // reply source, reservation lease, registry entry and admin grant.
         if !matches!(self.source.guard.kind, ControlKind::Ap)
             || !matches!(self.source.guard.mode, 3 | 9)
             || !self.original.matches_control(&self.source.guard)
+            || self.source.guard.current().is_err()
         {
             return Err(WirelessError::Denied);
         }
