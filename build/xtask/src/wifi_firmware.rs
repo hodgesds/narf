@@ -324,7 +324,7 @@ mod tests {
         for (family, source, prefix) in [
             (
                 "ath10k",
-                include_str!("../../../drivers/wireless/src/ath10k/profile.rs"),
+                include_str!("../../../drivers/wireless/ath10k/src/ath10k/profile.rs"),
                 "",
             ),
             (
