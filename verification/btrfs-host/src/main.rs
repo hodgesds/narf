@@ -159,6 +159,7 @@ struct Scenario {
 enum Source {
     Mkfs {
         populate: fn(&Path, u64, usize),
+        csum: &'static str,
         scale: usize,
         size: u64,
     },
@@ -217,6 +218,7 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
     match &sc.source {
         Source::Mkfs {
             populate,
+            csum,
             scale,
             size,
         } => {
@@ -232,7 +234,7 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
                     ),
                     size: *size,
                     nodesize: 16384,
-                    csum: "crc32c",
+                    csum,
                     features: "block-group-tree,free-space-tree,no-holes",
                 },
             )?;
@@ -461,30 +463,40 @@ fn run_gate(args: &Args) -> Result<String, String> {
     std::fs::create_dir_all(rootdir.join("@/etc")).unwrap();
     std::fs::create_dir_all(rootdir.join("@home")).unwrap();
     std::fs::write(rootdir.join("@/etc/hostname"), b"gate\n").unwrap();
-    let cases: [(&str, &str, &str); 4] = [
+    let cases = [
         (
             "accepted baseline",
             "crc32c",
             "block-group-tree,free-space-tree,no-holes",
+            true,
         ),
         (
             "non-skinny metadata",
             "crc32c",
             "^skinny-metadata,free-space-tree,block-group-tree",
+            false,
         ),
         (
             "xxhash checksums",
             "xxhash",
             "block-group-tree,free-space-tree",
+            true,
+        ),
+        (
+            "sha256 outside root-rw",
+            "sha256",
+            "block-group-tree,free-space-tree",
+            false,
         ),
         (
             "no free-space tree",
             "crc32c",
             "^free-space-tree,^block-group-tree",
+            false,
         ),
     ];
     let mut lines = Vec::new();
-    for (i, (what, csum, features)) in cases.iter().enumerate() {
+    for (i, (what, csum, features, should_accept)) in cases.into_iter().enumerate() {
         let img = dir.join(format!("gate{i}.img"));
         fixture::mkfs(
             &img,
@@ -509,7 +521,7 @@ fn run_gate(args: &Args) -> Result<String, String> {
         drop(r);
         narf::reset();
         let writes = dev.writes();
-        if i == 0 {
+        if should_accept {
             if !accepted {
                 return Err(format!("gate: {what} refused: {refusal:?}"));
             }
@@ -616,6 +628,7 @@ fn regress(name: &'static str, script: fn() -> Vec<Op>) -> Scenario {
         cuts: 1,
         source: Source::Mkfs {
             populate: fixture::populate_regress,
+            csum: "crc32c",
             scale: 1,
             size: 256 << 20,
         },
@@ -654,6 +667,7 @@ fn main() {
             cuts: args.cuts,
             source: Source::Mkfs {
                 populate: fixture::populate_root,
+                csum: "crc32c",
                 scale: 1,
                 size: 1 << 30,
             },
@@ -686,6 +700,7 @@ fn main() {
             cuts: args.cuts / 3,
             source: Source::Mkfs {
                 populate: fixture::populate_root,
+                csum: "xxhash",
                 scale: 1,
                 size: 768 << 20,
             },

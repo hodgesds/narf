@@ -369,7 +369,10 @@ pub fn check_superblock(
         if sb.log_root != 0 {
             return Err(Refusal::LogTree(sb.log_root));
         }
-        if sb.csum_type != format::CSUM_TYPE_CRC32 {
+        if !matches!(
+            sb.csum_type,
+            format::CSUM_TYPE_CRC32 | format::CSUM_TYPE_XXHASH
+        ) {
             return Err(Refusal::ChecksumType(sb.csum_type));
         }
         if sb.sectorsize != 4096 {

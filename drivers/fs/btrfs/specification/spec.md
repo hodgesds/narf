@@ -26,7 +26,11 @@ all twelve inode permission bits (`0o7777`), including setuid, setgid and
 sticky bits. Ownership is reported independently. Exec and namespace policy
 still decide whether those bits confer privilege or restrict mutations.
 
-Write safety (`rw_gate`):
+Write safety (`rw_gate`)
+
+For an installed `narf.disks=root-rw` root, the accepted on-disk checksum
+algorithms are CRC32C and xxHash64. The selected algorithm covers the
+superblock, metadata blocks and data checksum items on write.
 
 ```rust
 pub mod rw_gate {

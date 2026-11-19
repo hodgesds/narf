@@ -9,7 +9,8 @@ mirrored op-for-op into a model, then judges the result with Linux
 userspace (`btrfs check`, `btrfs restore`), a fresh NARF remount, and a
 crash-consistency replay of the recorded write/flush stream.
 
-Scenarios (`--scenario`): `regress`, `root`, `snapshots`, `lba4k`, `gate`,
+Scenarios (`--scenario`): `regress`, `root` (CRC32C), `snapshots`,
+`lba4k` (xxHash64 on 4 KiB logical sectors), `gate`,
 `fst` (free-space trees maintained incrementally: grown multi-level by
 thousands of punched holes, and the bitmap fixture), `enospc` (metadata
 filled on a full device until `ENOSPC`, and block groups filled until a DATA
