@@ -7,9 +7,15 @@ extern crate alloc;
 // `crate::firmware_asset` / `crate::future_heap` references keep resolving.
 pub use narf_drivers_wireless_core::{firmware_asset, future_heap, watchdog_work};
 
-pub mod ath10k;
 pub mod ath11k;
 pub mod ath9k;
+
+// Qualcomm Atheros ath10k. Promoted out of the former `src/ath10k/` module into
+// the standalone dual-build crate `narf-drivers-wireless-ath10k` (see
+// drivers/wireless/ath10k/). Its inner driver module is re-exported here as
+// `ath10k` so existing `crate::ath10k::{hw,register,…}` references keep
+// resolving.
+pub use narf_drivers_wireless_ath10k::ath10k;
 pub mod brcmfmac;
 pub mod cyw43439;
 // Shared Atheros/Qualcomm code promoted to `narf-drivers-wireless-ath-core`.

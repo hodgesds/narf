@@ -170,7 +170,7 @@ impl PciBoot {
             .derive::<narf_capabilities::Read>()
             .ok()
             .and_then(|read| {
-                crate::qualcomm_pci::invoke(&self.mmio.cap, || {
+                narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&self.mmio.cap, || {
                     narf_bus::pci_express::read_status(&read, &self.device)
                 })
                 .ok()

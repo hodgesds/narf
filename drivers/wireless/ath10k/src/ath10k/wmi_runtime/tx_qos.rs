@@ -36,7 +36,7 @@ pub(super) fn priority(ethernet: &[u8], acm: [bool; 4]) -> u8 {
     let mut up = if ethernet.len() >= 14 && ethernet[12..14] == [0x88, 0x8e] {
         7
     } else {
-        crate::ath11k::tx_hdr::classify8021d(ethernet) & 7
+        narf_drivers_wireless_ath_core::eth::classify8021d(ethernet) & 7
     };
     // No TSPEC is ever admitted by this owner (`tspec` row).
     while acm[UP_TO_ACI[usize::from(up)]] {

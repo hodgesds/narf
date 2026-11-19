@@ -498,7 +498,7 @@ impl super::PciBoot {
         let cap = self.mmio.cap;
         let device = self.device;
         let clear = || {
-            crate::qualcomm_pci::invoke(&cap, || {
+            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 let value =
                     narf_bus::pci::read_config32(&cap, &device, 0x40).map_err(|_| BmiError::Pci)?;
                 if let Some(cleared) = crate::ath10k::pm::retry_timeout(value) {
@@ -522,7 +522,7 @@ impl super::PciBoot {
             let cap = self.mmio.cap;
             let device = self.device;
             let restore = || {
-                crate::qualcomm_pci::invoke(&cap, || {
+                narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                     narf_bus::pci_express::clear_and_set_link_control(
                         &cap,
                         &device,

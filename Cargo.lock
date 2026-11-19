@@ -2712,6 +2712,7 @@ dependencies = [
  "narf-drivers-spi",
  "narf-drivers-usb",
  "narf-drivers-wireless-ath-core",
+ "narf-drivers-wireless-ath10k",
  "narf-drivers-wireless-core",
  "narf-drivers-wireless-iwlwifi",
  "narf-drivers-wireless-mt76",
@@ -2745,6 +2746,36 @@ dependencies = [
  "narf-firmware-smbios",
  "narf-kernel-test",
  "narf-wireless",
+]
+
+[[package]]
+name = "narf-drivers-wireless-ath10k"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-crypto",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-wireless-ath-core",
+ "narf-drivers-wireless-core",
+ "narf-firmware",
+ "narf-firmware-fdt",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+ "narf-wifi-fixtures",
+ "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]

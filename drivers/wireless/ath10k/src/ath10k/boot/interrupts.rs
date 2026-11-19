@@ -61,14 +61,15 @@ impl PciBoot {
         }
         let cap = &self.mmio.cap;
         let device = &self.device;
-        let mut config =
-            crate::qualcomm_pci::invoke(cap, || narf_bus::msi::enable_msi(cap, device, 1))
-                .ok()?
-                .ok()?;
+        let mut config = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || {
+            narf_bus::msi::enable_msi(cap, device, 1)
+        })
+        .ok()?
+        .ok()?;
         let vector = narf_interrupts::vector::alloc().ok()?;
         // SAFETY: this retained owner is the sole user of the function's cfg
         // space; MSI Enable is set only after the handler is installed.
-        let programmed = crate::qualcomm_pci::invoke(cap, || unsafe {
+        let programmed = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || unsafe {
             narf_bus::msi::program_msi(&mut config, 0, vector)
         });
         if !matches!(programmed, Ok(Ok(_))) {
@@ -85,8 +86,9 @@ impl PciBoot {
         };
         narf_interrupts::enable_irq(vector);
         // SAFETY: as above.
-        let enabled =
-            crate::qualcomm_pci::invoke(cap, || unsafe { narf_bus::msi::enable(&msi.config) });
+        let enabled = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || unsafe {
+            narf_bus::msi::enable(&msi.config)
+        });
         if !matches!(enabled, Ok(Ok(()))) {
             self.drop_msi(msi);
             return None;
@@ -98,8 +100,9 @@ impl PciBoot {
     fn drop_msi(&mut self, msi: Msi) {
         let cap = &self.mmio.cap;
         // SAFETY: sole owner of this function's MSI capability.
-        let disabled =
-            crate::qualcomm_pci::invoke(cap, || unsafe { narf_bus::msi::disable(&msi.config) });
+        let disabled = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || unsafe {
+            narf_bus::msi::disable(&msi.config)
+        });
         if matches!(disabled, Ok(Ok(()))) {
             release(msi);
         } else {

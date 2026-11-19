@@ -223,7 +223,7 @@ kernel_test_in!(
 /// validation bounds; `Program` gates net-detect on the NLO service and
 /// sets the NLO_DETECTED event bit.
 fn smoke_ath10k_wow_nlo_config_layout() -> TestResult {
-    use crate::ath11k::wmi::{NloConfig, NloNetwork};
+    use narf_drivers_wireless_ath_core::wmi_nlo::{NloConfig, NloNetwork};
     let nlo = |probe_ssids: Vec<Vec<u8>>,
                random_mac: Option<narf_wireless::ScanRandomMac>|
      -> NloConfig {

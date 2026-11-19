@@ -83,6 +83,7 @@ members = [
     "drivers/net/vmxnet3",
     "drivers/wireless",
     "drivers/wireless/ath-core",
+    "drivers/wireless/ath10k",
     "drivers/wireless/core",
     "drivers/wireless/iwlwifi",
     "drivers/wireless/mt76",

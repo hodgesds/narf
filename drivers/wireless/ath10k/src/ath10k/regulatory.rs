@@ -18,8 +18,8 @@
 //! A country hint or CTL identifier alone never grants host transmit rights.
 use super::wmi_runtime::beacon_hints::Receipt;
 use super::wmi_runtime::Error;
-pub use crate::qualcomm_regulatory::{Factory, FactoryError};
 use alloc::sync::Arc;
+pub use narf_drivers_wireless_ath_core::qualcomm_regulatory::{Factory, FactoryError};
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 

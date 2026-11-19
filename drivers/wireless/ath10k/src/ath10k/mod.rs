@@ -76,8 +76,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 pub mod bmi;
 mod boot;
 pub mod ce;

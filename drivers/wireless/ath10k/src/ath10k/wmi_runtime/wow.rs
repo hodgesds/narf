@@ -16,7 +16,7 @@
 //! Keys stay in the firmware key cache and host PN/replay counters stay in
 //! the retained station owner; neither is reset by this sequence.
 use super::*;
-use crate::ath11k::wmi::NloConfig;
+use narf_drivers_wireless_ath_core::wmi_nlo::NloConfig;
 use narf_wireless::{NetDetectConfig, WowlanConfig, WowlanSupport};
 
 /// `ATH10K_FW_FEATURE_WOWLAN_SUPPORT`.
@@ -248,7 +248,7 @@ fn nlo_from_net_detect(nd: &NetDetectConfig) -> NloConfig {
         networks: nd
             .matches
             .iter()
-            .map(|m| crate::ath11k::wmi::NloNetwork {
+            .map(|m| narf_drivers_wireless_ath_core::wmi_nlo::NloNetwork {
                 ssid: m.ssid.clone(),
                 rssi_threshold_dbm: m.rssi_threshold_dbm,
                 hidden: false,
