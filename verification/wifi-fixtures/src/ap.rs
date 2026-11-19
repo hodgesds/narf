@@ -574,6 +574,15 @@ impl FakeAp {
                 self.phase = ApPhase::Association;
                 Ok(vec![response])
             }
+            // hostapd `handle_auth` answers every Open System request: a
+            // station whose first response was lost authenticates again.
+            (ApPhase::Association, 0xb0)
+                if fc & 0x0300 == 0 && frame.get(24..30) == Some(&[0, 0, 1, 0, 0, 0]) =>
+            {
+                let mut response = self.header(0xb0, self.plan.station);
+                response.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+                Ok(vec![response])
+            }
             (ApPhase::Association, 0x00 | 0x20) if fc & 0x0300 == 0 => {
                 // A Reassociation Request (roaming within the ESS) carries
                 // the Current AP Address and is answered by a

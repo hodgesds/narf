@@ -7,6 +7,7 @@ use core::future::Future;
 use narf_wireless::ap_control::{RadioControlAuthority, RadioInterfaceIdentity};
 #[path = "p2p_roc.rs"]
 mod roc;
+pub(super) use roc::JoinRoc;
 pub(super) use roc::Receipt as RocReceipt;
 
 #[derive(Debug)]

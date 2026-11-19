@@ -981,6 +981,46 @@ kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mt76_native_txs_type_zero_reaches_status_parser
 );
+
+/// A TX-free notification whose MSDU_CNT overruns the packet: Linux
+/// `mt7921_mac_tx_free` drops it (WARN_ON_ONCE). With no token owned it
+/// cannot concern a NARF payload, so the router drops it and the active
+/// wait goes on; while a token is owned it fails closed.
+fn mt76_unwalkable_tx_free_drops_unless_a_token_is_owned() -> TestResult {
+    // MSDU_CNT 2, 12 bytes: one entry short.
+    const SHORT: [u32; 3] = [0x3002_000c, 0, 0x0001_0001];
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("TX-free drop fixture allocation"),
+    };
+    hw.owner.published = true;
+    inject_rx(&mut words, &hw, 1, &words_to_bytes(&SHORT));
+    if hw.route_rx(None) != Ok(None) || hw.owner.storage.as_ref().unwrap().rx[1].index != 1 {
+        return TestResult::Fail("an unowned unwalkable TX-free aborted the receive");
+    }
+    if Backend::submit_management(
+        &mut hw,
+        crate::mt7921::vif_slots::Vif::HOME,
+        &management_frame(),
+        1,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("management frame publication");
+    }
+    inject_rx(&mut words, &hw, 1, &words_to_bytes(&SHORT));
+    let result = hw.management_complete();
+    hw.owner.published = false; // the model has no DMA engine
+    if result != Err(Error::MalformedEvent) {
+        return TestResult::Fail("an unwalkable TX-free beside an owned token did not fail closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx",
+    mt76_unwalkable_tx_free_drops_unless_a_token_is_owned
+);
 fn mcu_packet_router_separates_forwarded_management_from_command_replies() -> TestResult {
     let (mut words, mut hw) = match rig() {
         Ok(rig) => rig,
