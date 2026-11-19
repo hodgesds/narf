@@ -665,10 +665,13 @@ kernel_test_in!(
 /// pages. The session's INFO size, the programmed OABUFFER field and the
 /// sysfs `oa_buffer_size` node all track the requested size.
 fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
+    // Card 34: the OA config registry is global per card for the boot, so
+    // this test needs a card no earlier test registered uuid(1) on — card
+    // 61 is already taken by smoke_oa_per_context_enable_disable_sequence (EADDRINUSE).
     use narf_filesystem::sysfs::Kobject;
     const READ: u32 = 1;
     const PRIVATE: u32 = 2;
-    let backend = Backend::over(device(61, MTL, 1270), Hw::with_host_pages());
+    let backend = Backend::over(device(34, MTL, 1270), Hw::with_host_pages());
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let base = [(2u32, 1u64), (4, A24U40), (3, config)];
@@ -704,7 +707,7 @@ fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
     let _fd = open_at(&with(None)).unwrap();
     let file = wire.file();
     assert_eq!(info(&file), 16 << 20);
-    assert!(oa_status_string(61).contains("oa_buffer_size: 16777216"));
+    assert!(oa_status_string(34).contains("oa_buffer_size: 16777216"));
     drop(file);
     backend.poll(1);
 
@@ -718,7 +721,7 @@ fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
         file.validate_mmap(0, 16 << 20, READ, PRIVATE),
         Err(FsError::InvalidData)
     );
-    assert!(oa_status_string(61).contains("oa_buffer_size: 16777216"));
+    assert!(oa_status_string(34).contains("oa_buffer_size: 16777216"));
     drop(file);
     backend.poll(1);
 
@@ -737,7 +740,7 @@ fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
     let _fd = open_at(&with(Some(32 << 20))).unwrap();
     let file = wire.file();
     assert_eq!(info(&file), 32 << 20);
-    assert!(oa_status_string(61).contains("oa_buffer_size: 33554432"));
+    assert!(oa_status_string(34).contains("oa_buffer_size: 33554432"));
     assert!(backend
         .hw
         .take()
@@ -752,14 +755,14 @@ fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
     let _fd = open_at(&with(Some(128 << 20))).unwrap();
     let file = wire.file();
     assert_eq!(info(&file), 128 << 20);
-    assert!(oa_status_string(61).contains("oa_buffer_size: 134217728"));
+    assert!(oa_status_string(34).contains("oa_buffer_size: 134217728"));
     assert!(backend
         .hw
         .take()
         .iter()
         .any(|&(reg, value)| reg == OABUFFER && value == BASE | 1 | 7 << 3));
-    let card = Kobject::new_root("card61");
-    install_metrics_for_test(61, &card);
+    let card = Kobject::new_root("card34");
+    install_metrics_for_test(34, &card);
     let oa = card.get_child("oa").expect("oa child exists");
     assert_eq!(
         oa.attr_show("oa_buffer_size").as_deref(),
