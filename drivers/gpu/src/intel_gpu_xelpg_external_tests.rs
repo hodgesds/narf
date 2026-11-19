@@ -49,6 +49,8 @@ pub struct Sink {
     pub fec_config: u8,
     pub dsc_enable: u8,
     pub fec_status: u8,
+    /// Inject NACKs on DP_FEC_STATUS reads while the link is trained.
+    fec_status_nacks: u8,
     /// Native writes to the DSC/FEC registers, in order.
     pub dsc_log: Vec<(u32, u8)>,
 }
@@ -78,6 +80,7 @@ impl Sink {
             fec_config: 0,
             dsc_enable: 0,
             fec_status: 0,
+            fec_status_nacks: 0,
             dsc_log: Vec::new(),
         }
     }
@@ -167,6 +170,10 @@ impl Sink {
         }
         let cmd = wire[0] >> 4;
         let addr = (((wire[0] & 0xF) as u32) << 16) | ((wire[1] as u32) << 8) | wire[2] as u32;
+        if cmd == 0x9 && addr == dsc::DP_FEC_STATUS && self.fec_status_nacks != 0 {
+            self.fec_status_nacks -= 1;
+            return alloc::vec![0x10];
+        }
         if cmd & 0x8 == 0 && addr != 0x50 {
             return alloc::vec![0x40];
         }
@@ -327,6 +334,8 @@ pub struct ExtFake {
     /// No TRANSCONF ever acknowledges a disable.
     pub pipeconf_stuck: Cell<bool>,
     pub act_stuck: Cell<bool>,
+    /// Number of FEC rising edges the source will fail to acknowledge.
+    fec_missed_enables: Cell<u8>,
     frames: [Cell<u32>; 4],
     /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
     /// primary `PLANE_SURF` write: (register, enabled).
@@ -377,6 +386,7 @@ impl ExtFake {
             confs: Default::default(),
             pipeconf_stuck: Cell::new(false),
             act_stuck: Cell::new(false),
+            fec_missed_enables: Cell::new(0),
             frames: Default::default(),
             irq_log: RefCell::new(Vec::new()),
             sink: RefCell::new(sink),
@@ -638,6 +648,20 @@ impl MmioWindow for ExtFake {
             return;
         }
         self.writes.borrow_mut().push((off, value));
+        if (0..4).any(|p| off == 0x60540 + p * 0x1000)
+            && (self.phy.read32(off) ^ value) & dsc::DP_TP_CTL_FEC_ENABLE != 0
+        {
+            let mut status = self.phy.read32(off + 4) & !dsc::DP_TP_STATUS_FEC_ENABLE_LIVE;
+            if value & dsc::DP_TP_CTL_FEC_ENABLE != 0 {
+                if self.fec_missed_enables.get() == 0 {
+                    status |= dsc::DP_TP_STATUS_FEC_ENABLE_LIVE;
+                } else {
+                    self.fec_missed_enables
+                        .set(self.fec_missed_enables.get() - 1);
+                }
+            }
+            self.phy.write32(off + 4, status);
+        }
         if (0..4).any(|p| off == 0x60400 + p * 0x1000)
             && (self.phy.read32(off) ^ value) & (1 << 8) != 0
             && !self.act_stuck.get()
@@ -2924,13 +2948,12 @@ fn dsc_monitor(fec: bool) -> Sink {
 fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
     use crate::intel_gpu_xelpg_dsc::{
         decide_dp, DpDscSink, DscDpcd, DscSink, LinkDecision, LinkLimits, DP_TP_CTL_FEC_ENABLE,
-        DP_TP_STATUS_FEC_ENABLE_LIVE, PIPE_BPP,
+        PIPE_BPP,
     };
     // 594 MHz needs 1782000 kBps at 24 bpp and 1336500 at 18; one HBR3
     // lane carries 810000. Linux compresses with FEC: 169/16 bpp, two
     // slices on two engines, HBR3 x1.
     let io = ExtFake::new(XeLpgPort::B, dsc_monitor(true));
-    io.phy.write32(0x6_1544, DP_TP_STATUS_FEC_ENABLE_LIVE);
     let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("the DSC monitor must probe"),
@@ -3046,6 +3069,87 @@ fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_dsc_with_fec_lights_and_stops
+);
+
+fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
+    for (ip, missed, nacks, expected_enables) in [
+        (DisplayIp::Xe2Lpd, 1, 0, 1),
+        (DisplayIp::Xe3Lpd, 1, 0, 2),
+        (DisplayIp::WildcatLake, 0, 1, 2),
+        (DisplayIp::WildcatLake, 0, 4, 4),
+    ] {
+        // HBR x1 cannot carry this 1080p60 mode even at 6 bpc.
+        let port = XeLpgPort::Tc2;
+        let mut sink = dsc_monitor(true);
+        sink.edid = edid_1080();
+        sink.caps[1] = 0x0a;
+        sink.fec_status_nacks = nacks;
+        let io = ExtFake::new(port, sink);
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        io.fec_missed_enables.set(missed);
+        let Some(panel) = io.light_panel_ip(ip) else {
+            return TestResult::Fail("could not light the panel for the FEC fixture");
+        };
+        let probe = match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), port, false)
+            .and_then(|link| probe_sink_link(&io, link))
+        {
+            Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
+            _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
+        };
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let result = activate(&io, probe, fb, &display);
+        let pps = io.first_write(|off, _| off == 0x6_1350);
+        let mut enabled = false;
+        let mut rising = 0;
+        // A successful handshake precedes the first PPS. On a failure all
+        // attempts precede rollback, which only clears FEC.
+        for &(off, value) in io.writes.borrow().iter().take(pps.unwrap_or(usize::MAX)) {
+            if off == DP_TP_CTL_B {
+                let next = value & dsc::DP_TP_CTL_FEC_ENABLE != 0;
+                rising += usize::from(next && !enabled);
+                enabled = next;
+            }
+        }
+        if rising != expected_enables {
+            return TestResult::Fail("wrong number of FEC enables before the first PPS");
+        }
+        if nacks == 4 {
+            let Err(ActivateError::Failed(route, ExternalError::FecNotReady)) = result else {
+                return TestResult::Fail("the fourth failed FEC handshake must roll back");
+            };
+            if pps.is_some()
+                || io
+                    .first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0)
+                    .is_some()
+                || route.state() != RouteState::Stopped
+                || route.reserved()
+                || io.sink.borrow().fec_config != 0
+                || io.sink.borrow().dsc_enable != 0
+                || route.release(&io).is_err()
+            {
+                return TestResult::Fail("failed FEC must leave the compressed stream stopped");
+            }
+        } else {
+            let Ok(mut route) = result else {
+                return TestResult::Fail(
+                    "the compressed route must activate after its FEC sequence",
+                );
+            };
+            if pps.is_none() || !enabled || route.stop(&io).is_err() || route.release(&io).is_err()
+            {
+                return TestResult::Fail("the compressed route must send PPS and stop cleanly");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_confirms_fec_before_pps
 );
 
 fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {

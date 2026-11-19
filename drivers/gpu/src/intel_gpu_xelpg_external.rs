@@ -119,6 +119,8 @@
 //! training loop programs each source pattern and drive level before its
 //! matching sink write. A rate/width fallback stops the buffer before
 //! retuning the owned PHY or fabric clock and restarting CR/EQ.
+//! Display 30 confirms both source FEC live and sink decode before the PPS.
+//! Up to three disable/enable retries precede rollback of a failed handshake.
 //!
 //! Sources (Linux b90c984d): `intel_ddi.c` (`mtl_ddi_pre_enable_dp`,
 //! `mtl_ddi_prepare_link_retrain`, `intel_ddi_init_dp_buf_reg`,
@@ -347,6 +349,8 @@ pub enum ExternalError {
     PortBusy,
     /// A fallback retry trained at yet another configuration.
     TrainingMismatch,
+    /// Display 30 could not confirm FEC for a compressed output.
+    FecNotReady,
     /// Programming or observation failed.
     Modeset(ModesetError),
     /// Register authority was lost.
@@ -1517,6 +1521,46 @@ fn program_mn<M: MmioWindow + ?Sized>(
     write(io, base + PIPE_LINK_N1_OFFSET, ln)
 }
 
+fn fec_enabled<M: MmioWindow + ?Sized>(
+    io: &M,
+    trans: Transcoder,
+    probe: &MtlSinkProbe,
+) -> Result<bool, dsc::AccessLost> {
+    if !dsc::poll_fec_live(io, trans, true)? {
+        return Ok(false);
+    }
+    let mut aux = IntelAux::xelpdp(io, probe.port.aux_base(), probe.tbt());
+    Ok(dsc::wait_fec_detected(&mut aux, |us| {
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ns(u64::from(us) * 1_000),
+        );
+    }))
+}
+
+/// Display 30's intel_ddi_enable_fec retries the source enable only after
+/// observing it off. Some MST hubs never report decode-disabled over AUX.
+fn enable_stream_fec<M: MmioWindow + ?Sized>(
+    io: &M,
+    trans: Transcoder,
+    probe: &MtlSinkProbe,
+) -> Result<(), ExternalError> {
+    let lost = |_| ExternalError::AccessLost;
+    for attempt in 0..=3 {
+        if attempt > 0 {
+            dsc::disable_fec(io, trans).map_err(lost)?;
+            if !dsc::poll_fec_live(io, trans, false).map_err(lost)? {
+                continue;
+            }
+        }
+        dsc::enable_fec(io, trans).map_err(lost)?;
+        if !probe.display_ip.is_display30() || fec_enabled(io, trans, probe).map_err(lost)? {
+            return Ok(());
+        }
+    }
+    Err(ExternalError::FecNotReady)
+}
+
 /// The rest of `mtl_ddi_pre_enable_dp` (trained levels, 6.n DP_TP_CTL
 /// normal), `hsw_crtc_enable` (M/N, source size, timings, RGB bypass),
 /// `intel_ddi_enable` (`TRANS_DDI_FUNC_CTL` enable, transcoder enable) and
@@ -1589,7 +1633,7 @@ fn finish<M: MmioWindow + ?Sized>(
         // intel_ddi_enable_fec, then intel_dsc_dp_pps_write; then
         // hsw_crtc_enable's intel_dsc_enable on the route's pipe.
         if plan.fec {
-            dsc::enable_fec(io, trans).map_err(lost)?;
+            enable_stream_fec(io, trans, &route.probe)?;
         }
         dsc::write_pps_sdp(io, trans, plan).map_err(lost)?;
         dsc::enable_engines(io, pipe, plan).map_err(lost)?;
@@ -1624,14 +1668,7 @@ fn finish<M: MmioWindow + ?Sized>(
     rp.pipes.enable(io, pipe)?;
     // intel_ddi_wait_for_fec_status(true): Linux only logs a timeout.
     if plan.is_some_and(|p| p.fec) {
-        let _ = dsc::wait_fec_live(io, trans, true);
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
-        let _ = dsc::wait_fec_detected(&mut aux, |us| {
-            let _ = narf_scheduler::responsive_spin_until(
-                || false,
-                narf_time::Deadline::after_ns(u64::from(us) * 1_000),
-            );
-        });
+        let _ = fec_enabled(io, trans, &route.probe).map_err(lost)?;
     }
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)

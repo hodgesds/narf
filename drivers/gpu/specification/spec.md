@@ -243,6 +243,12 @@ with typed `ExternalError`s before any register write. A stop that cannot be
 observed, or a release that cannot repartition, quarantines the route and
 keeps its Type-C/AUX/framebuffer leases and its pipe reservation.
 
+On Panther and Wildcat Lake a compressed USB-C DP stream requires the
+source FEC-live bit and the sink's FEC-decode acknowledgement before
+transmitting the DSC picture parameter set. The driver can retry three
+times, waiting for the source to disable FEC before each new enable.
+Exhaustion returns `ExternalError::FecNotReady` and runs route teardown.
+
 `intel_gpu_xelpg_hpd` publishes `ConnectorStatus` per owned pin (DDI B and
 TC1-TC4) and `MtlHpdEvent`s (Connected(mode), Disconnected, ShortPulse,
 Redetect). Owned sources are IER-enabled with IMR masked, and only a latched

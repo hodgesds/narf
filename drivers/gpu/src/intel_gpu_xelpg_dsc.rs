@@ -1957,6 +1957,14 @@ pub fn disable_fec<M: MmioWindow + ?Sized>(io: &M, trans: Transcoder) -> Result<
 /// The source half of `intel_ddi_wait_for_fec_status`:
 /// `DP_TP_STATUS_FEC_ENABLE_LIVE` reaching `enabled` within 1 ms.
 pub fn wait_fec_live<M: MmioWindow + ?Sized>(io: &M, trans: Transcoder, enabled: bool) -> bool {
+    poll_fec_live(io, trans, enabled).unwrap_or(false)
+}
+
+pub(crate) fn poll_fec_live<M: MmioWindow + ?Sized>(
+    io: &M,
+    trans: Transcoder,
+    enabled: bool,
+) -> Result<bool, AccessLost> {
     let r = trans.base() + DP_TP_STATUS_OFFSET;
     let mut lost = false;
     let done = narf_scheduler::responsive_spin_until(
@@ -1967,7 +1975,11 @@ pub fn wait_fec_live<M: MmioWindow + ?Sized>(io: &M, trans: Transcoder, enabled:
         },
         narf_time::Deadline::after_ns(1_000_000),
     );
-    done && !lost
+    if lost {
+        Err(AccessLost)
+    } else {
+        Ok(done)
+    }
 }
 
 // ── Sink side ────────────────────────────────────────────────────
@@ -2004,14 +2016,16 @@ pub fn set_sink_fec_ready<A: AuxChannel>(aux: &mut A, enable: bool) -> Result<()
 /// `wait_for_fec_detected(enabled)`: `DP_FEC_DECODE_EN_DETECTED` polled
 /// every 10 ms for 200 ms.
 pub fn wait_fec_detected<A: AuxChannel>(aux: &mut A, delay_us: impl Fn(u32)) -> bool {
-    for _ in 0..=20 {
+    for attempt in 0..=20 {
         let mut v = [0u8; 1];
         match aux.dpcd_read(DP_FEC_STATUS, &mut v) {
             Ok(()) if v[0] & DP_FEC_DECODE_EN_DETECTED != 0 => return true,
             Ok(()) => {}
             Err(_) => return false,
         }
-        delay_us(10_000);
+        if attempt < 20 {
+            delay_us(10_000);
+        }
     }
     false
 }
