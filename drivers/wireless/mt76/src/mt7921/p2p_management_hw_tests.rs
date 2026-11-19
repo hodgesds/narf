@@ -44,6 +44,9 @@ fn native() -> Result<(), &'static str> {
     let mut event = vec![0; 36];
     event[..4].copy_from_slice(&(7u32 << 27 | 36).to_le_bytes());
     event[28] = 0x55;
+    // A command reply (nonzero sequence) waits for its command; a
+    // sequence-0 event would be unsolicited and freed at RX time.
+    event[29] = 1;
     inject_rx(&mut words, &hw, 1, &event);
     hw.configure_p2p_capture(Some(first))
         .map_err(|_| "native completed prefix before first management epoch")?;

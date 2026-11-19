@@ -245,14 +245,57 @@ impl Command {
     }
 }
 
+/// Linux `mt7921_mcu_rx_event`: the events dispatched to
+/// `mt7921_mcu_(uni_)rx_unsolicited_event` instead of the reply queue.
+/// A frame too short to carry the MCU RXD header is not an event at all.
 fn unsolicited(frame: &[u8]) -> bool {
-    frame[29] == 0
-        || frame[30] & 4 != 0
-        || frame[32] == 0x87
-        || matches!(
-            frame[28],
-            0x07 | 0x0d | 0x0f | 0x13 | 0x23 | 0x27 | 0x96 | 0xf0
-        )
+    let (Some(&eid), Some(&seq), Some(&option), Some(&ext_eid)) =
+        (frame.get(28), frame.get(29), frame.get(30), frame.get(32))
+    else {
+        return false;
+    };
+    seq == 0
+        || option & 4 != 0
+        || ext_eid == 0x87
+        || matches!(eid, 0x07 | 0x0d | 0x0f | 0x13 | 0x23 | 0x27 | 0x96 | 0xf0)
+}
+
+/// Linux handles an unsolicited event when it is received and frees it
+/// (`mt7921_mcu_rx_unsolicited_event`); it never waits in the reply queue.
+/// Only the ones a later owner here consumes are kept: SCAN_DONE and
+/// SCHED_SCAN_DONE (`mt7921_mcu_scan_event`) and the unified ROC grant
+/// (`mt7921_mcu_uni_roc_event`). LP_INFO, TX_DONE, DBG_MSG, RSSI_NOTIFY,
+/// the rate report, BSS_BEACON_LOSS (acted on only with the firmware beacon
+/// filter, `IEEE80211_VIF_BEACON_FILTER`, which this owner does not enable)
+/// and every other unsolicited event carry nothing a later owner reads.
+fn retained_unsolicited(frame: &[u8]) -> bool {
+    match (frame.get(28), frame.get(30)) {
+        (Some(&eid), Some(&option)) if option & 4 != 0 => eid == 0x27,
+        (Some(&eid), Some(_)) => matches!(eid, 0x0d | 0x23),
+        _ => false,
+    }
+}
+
+/// Whether an MCU event that no command is waiting for may be queued:
+/// every reply (`mt76_mcu_rx_event` -> `res_q`) and the unsolicited events
+/// [`retained_unsolicited`] keeps. The rest are dropped as Linux frees them,
+/// so a firmware that reports them while nothing waits (an idle associated
+/// link) cannot fill the bounded queues.
+pub(super) fn queued_event(frame: &[u8]) -> bool {
+    !unsolicited(frame) || retained_unsolicited(frame)
+}
+
+/// An event the waiter of reply `seq` hands back to the owner's mailbox:
+/// a kept unsolicited event. A reply to another sequence is stale and freed
+/// (`mt7921_mcu_parse_response` returns -EAGAIN and the skb is freed).
+pub(super) fn mailbox_event(frame: &[u8]) -> bool {
+    unsolicited(frame) && retained_unsolicited(frame)
+}
+
+/// The firmware reported an assert (`MCU_EVENT_COREDUMP`): Linux collects
+/// the dump and resets the device. Logged where the event is dropped.
+pub(super) fn coredump_event(frame: &[u8]) -> bool {
+    frame.get(28) == Some(&0xf0) && frame.get(30).is_some_and(|option| option & 4 == 0)
 }
 
 impl<B: Backend> Session<B> {
@@ -281,10 +324,12 @@ impl<B: Backend> Session<B> {
             }
             event.truncate(len);
             if event[29] != seq || unsolicited(&event) {
-                if self.events.len() == MAX_EVENTS {
-                    return Err(Error::EventOverflow);
+                if mailbox_event(&event) {
+                    if self.events.len() == MAX_EVENTS {
+                        return Err(Error::EventOverflow);
+                    }
+                    self.events.push_back(event);
                 }
-                self.events.push_back(event);
                 continue;
             }
             match command {

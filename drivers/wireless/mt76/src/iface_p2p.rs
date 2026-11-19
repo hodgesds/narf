@@ -209,6 +209,10 @@ impl Mt76Iface {
     }
 }
 impl P2pDeviceIface {
+    /// The device is started and its maintenance runs on every worker pass.
+    pub(crate) fn running(&self) -> bool {
+        self.owned.load(Ordering::Acquire)
+    }
     pub(crate) fn management_subscriptions(
         &self,
     ) -> crate::mt7921::firmware_transport::p2p_management_filters::Shared {

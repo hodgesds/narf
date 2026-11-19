@@ -240,6 +240,34 @@ impl Owner {
                 .flatten()
                 .any(|a| Self::expired(a, now))
     }
+    /// The earliest time [`Self::tick`] or [`Self::pending`] changes with
+    /// no frame received: queued work or released frames (now), a held
+    /// frame's reorder release (mac80211 `reorder_timer`,
+    /// `HT_RX_REORDER_BUF_TIMEOUT`; 40 ms for the voice/video TIDs here) or
+    /// an agreement's inactivity timeout (`session_timer`).
+    pub fn next_deadline(&self) -> Option<u64> {
+        if !self.work.is_empty() || !self.ready.is_empty() {
+            return Some(0);
+        }
+        let mut next: Option<u64> = None;
+        let mut at = |deadline: u64| next = Some(next.map_or(deadline, |n| n.min(deadline)));
+        for (tid, a) in self.agreements.iter().enumerate() {
+            let Some(a) = a.as_ref().filter(|a| a.phase == Phase::Active) else {
+                continue;
+            };
+            if a.request.timeout != 0 {
+                at(a.activity
+                    .saturating_add(u64::from(a.request.timeout) * 1_024_000));
+            }
+            if a.epoch == self.epoch {
+                let reorder = if tid >= 4 { 40_000_000 } else { 100_000_000 };
+                for packet in a.slots.iter().flatten() {
+                    at(packet.at.saturating_add(reorder));
+                }
+            }
+        }
+        next
+    }
     fn expired(a: &Agreement, now: u64) -> bool {
         a.phase == Phase::Active
             && a.request.timeout != 0

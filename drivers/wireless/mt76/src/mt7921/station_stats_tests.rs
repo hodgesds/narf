@@ -229,8 +229,28 @@ fn mt7922_regulatory_change_reprograms_or_leaves_the_channel() -> TestResult {
     five.rules[0].freq_end_mhz = 5330;
     policy.database.install(five);
     let _ = run(Box::pin(session.service_keys()));
-    if matches!(session.state, State::Associated { .. }) && session.station.permission.is_some() {
+    // `reg_leave_invalid_chans` -> `cfg80211_leave`: the link ends with a
+    // local DEAUTH_LEAVING, packet service closes, and the teardown sends
+    // no frame the new policy forbids. A working firmware is not recovered.
+    if !session.station.peer_lost
+        || session.station.loss
+            != Some(LinkLoss {
+                reason: 3,
+                from_ap: false,
+            })
+        || !matches!(session.step_network(None), Err(Error::DeviceGone))
+    {
         return TestResult::Fail("station kept a channel the new policy forbids");
+    }
+    let before = session.backend.frames.len();
+    if run(Box::pin(session.disassociate_station())).is_err()
+        || !matches!(session.state, State::ScanReady(_))
+        || session.station.permission.is_some()
+        || session.backend.frames[before..]
+            .iter()
+            .any(|(scatter, frame)| !scatter && frame.first() == Some(&0xc0))
+    {
+        return TestResult::Fail("the forbidden channel was not left cleanly and silently");
     }
     TestResult::Pass
 }

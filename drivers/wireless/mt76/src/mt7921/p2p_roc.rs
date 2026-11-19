@@ -492,7 +492,7 @@ impl<B: Backend> Session<B> {
             }
             event.truncate(length);
             if event[28] != 0x27 {
-                if roc_ack(&event) {
+                if roc_ack(&event) || !super::super::station::mailbox_event(&event) {
                     continue;
                 }
                 if self.events.len() == super::super::MAX_EVENTS {

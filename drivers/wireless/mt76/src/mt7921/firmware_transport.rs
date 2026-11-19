@@ -667,6 +667,46 @@ pub struct PacketStep {
     pub receive_epoch: u64,
 }
 
+/// Why an associated link ended without an operator request: the reason
+/// and origin mac80211 reports (`ieee80211_report_disconnect` ->
+/// `cfg80211_rx_mlme_mgmt` for the AP's Deauthentication / Disassociation,
+/// `cfg80211_tx_mlme_mgmt` for a local `ieee80211_set_disassoc`), which
+/// cfg80211 turns into `NL80211_CMD_DISCONNECT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LinkLoss {
+    pub(crate) reason: u16,
+    pub(crate) from_ap: bool,
+}
+
+/// The reason the home station's association ended, if a peer loss ended
+/// it (`None` for a firmware or transport failure).
+pub(crate) fn boot_link_loss() -> Option<LinkLoss> {
+    BOOT_OWNER
+        .try_lock()
+        .and_then(|owner| owner.as_ref().and_then(Transport::link_loss))
+}
+
+/// Start of one worker service pass (`mt792x_irq_tasklet`): mask and
+/// acknowledge the device's pending interrupt sources. `Busy` while another
+/// owner operation (a control command, key work) holds the transport.
+pub(crate) fn boot_interrupts_begin() -> Result<u32, Error> {
+    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
+    owner.as_ref().ok_or(Error::Busy)?.interrupts_begin()
+}
+
+/// End of the pass (`napi_complete` -> `mt76_connac_irq_enable`).
+pub(crate) fn boot_interrupts_end() -> Result<(), Error> {
+    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
+    owner.as_ref().ok_or(Error::Busy)?.interrupts_end()
+}
+
+/// The associated home station's next timed work (monotonic ns; `None`:
+/// nothing timed). `Err(Busy)` when the owner is held elsewhere.
+pub(crate) fn boot_service_deadline() -> Result<Option<u64>, Error> {
+    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
+    Ok(owner.as_ref().ok_or(Error::Busy)?.service_deadline())
+}
+
 /// Recheck before every unlocked kernel callback and IPC publication. A
 /// retained key future temporarily removes BOOT_OWNER, closing publication.
 /// False drops only this stale batch and must not tear down a newer owner.
@@ -1127,14 +1167,34 @@ pub(super) fn start_boot() -> narf_init::InitResult {
 async fn boot_radio() {
     use core::fmt::Write;
     let result = provision_boot_radio().await;
-    let _ = writeln!(
-        narf_console::Writer,
-        "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
-        boot_status()
-    );
+    if let Ok(info) = &result {
+        // `mt7921_run_firmware` / `mt76_connac2_load_ram`:
+        // `WM Firmware Version: %.10s, Build Time: %.15s`.
+        let text = |bytes: &[u8]| {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            alloc::string::String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: ASIC revision: {:x}; WM Firmware Version: {}, Build Time: {}",
+            info.chip_id,
+            text(&info.firmware.version),
+            text(&info.firmware.build_date),
+        );
+    }
     if result.is_ok() {
+        let _ = writeln!(
+            narf_console::PriorityWriter::<7>,
+            "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
+            boot_status()
+        );
         return;
     }
+    let _ = writeln!(
+        narf_console::PriorityWriter::<3>,
+        "mt76: firmware {result:?}; retained {:?}",
+        boot_status()
+    );
     if matches!(
         boot_status(),
         BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
@@ -1795,6 +1855,8 @@ struct StationLink {
     tx_ba: tx_ba::Owner,
     tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
+    /// Why `peer_lost` ended this association, for the disconnect report.
+    loss: Option<LinkLoss>,
     /// Signal and receive rate of the frames from this link's AP, for
     /// NL80211_CMD_GET_STATION; reset with each association.
     link_stats: crate::mt7921::link_stats::LinkStats,
@@ -1873,6 +1935,7 @@ impl StationLink {
             tx_ba: tx_ba::Owner::default(),
             tx_restart: None,
             peer_lost: false,
+            loss: None,
             link_stats: crate::mt7921::link_stats::LinkStats::default(),
             ps_wanted: false,
             ps_applied: false,
@@ -2182,10 +2245,14 @@ impl<B: Backend> Session<B> {
                 return Err(Error::MalformedEvent);
             }
             if event[29] != seq || event[30] & 4 != 0 {
-                if self.events.len() == MAX_EVENTS {
-                    return Err(Error::EventOverflow);
+                // A stale reply is freed; only an unsolicited event a later
+                // owner consumes is kept (`station::mailbox_event`).
+                if station::mailbox_event(&event) {
+                    if self.events.len() == MAX_EVENTS {
+                        return Err(Error::EventOverflow);
+                    }
+                    self.events.push_back(event);
                 }
-                self.events.push_back(event);
                 continue;
             }
             if cmd == 0x10 || cmd == 0x07 {
