@@ -2788,6 +2788,118 @@ kernel_test_in!(
     smoke_usb_class_registry_checks_interface_triples
 );
 
+// ── drivers/usb/class-registry loadable-module matches ────────────
+//
+// `narf_register_usb_driver` reaches this registry through the
+// `narf_bus::module_usb` host. The smoke drives that exact path (bus
+// entry point -> installed host -> module table) with synthetic owners
+// and unmatchable ids, and cleans up after itself, since the boot
+// registry is shared with later smokes.
+
+extern "C" fn module_usb_smoke_probe(_dev_token: u64, _reserved: u64) -> i32 {
+    -38 // -ENOSYS: registration-only, like the in-tree `.ko` builds.
+}
+
+fn smoke_usb_class_registry_module_matches() -> TestResult {
+    use crate::class_registry::{module_candidates, module_match_count, module_usb_token};
+    use narf_bus::module_usb::{
+        register_module_usb_driver, unregister_module_usb_drivers, ModuleUsbMatch, MATCH_INT_CLASS,
+        MATCH_INT_PROTOCOL, MATCH_INT_SUBCLASS, MATCH_VENDOR_PRODUCT,
+    };
+    const OWNER_A: u64 = 0x5A5A_0001;
+    const OWNER_B: u64 = 0x5A5A_0002;
+    let probe = module_usb_smoke_probe as usize;
+
+    crate::class_registry::install_module_host();
+    unregister_module_usb_drivers(OWNER_A);
+    unregister_module_usb_drivers(OWNER_B);
+    let base = module_match_count();
+
+    // Flag validation happens before the host is reached.
+    if ModuleUsbMatch::from_flags(0, 1, 1, 0, 0, 0) != Err(-22)
+        || ModuleUsbMatch::from_flags(1 << 7, 1, 1, 0, 0, 0) != Err(-22)
+        || ModuleUsbMatch::from_flags(MATCH_VENDOR_PRODUCT, 0, 1, 0, 0, 0) != Err(-22)
+    {
+        return TestResult::Fail("module USB match accepted empty/unknown flags or VID 0");
+    }
+    let Ok(by_id) = ModuleUsbMatch::from_flags(MATCH_VENDOR_PRODUCT, 0xFFFD, 0xFFFD, 9, 9, 9)
+    else {
+        return TestResult::Fail("valid VID/PID module match rejected");
+    };
+    if by_id.class.is_some() || by_id.subclass.is_some() || by_id.protocol.is_some() {
+        return TestResult::Fail("unselected interface fields were not wildcards");
+    }
+    // A CDC-MBIM-shaped interface triple, matched on class/subclass/protocol.
+    let flags = MATCH_INT_CLASS | MATCH_INT_SUBCLASS | MATCH_INT_PROTOCOL;
+    let Ok(by_class) = ModuleUsbMatch::from_flags(flags, 0x1234, 0x5678, 0x02, 0x0E, 0x00) else {
+        return TestResult::Fail("valid interface-class module match rejected");
+    };
+    if by_class.vendor_id != 0 || by_class.product_id != 0 {
+        return TestResult::Fail("class-only module match kept a VID/PID");
+    }
+
+    // SAFETY: `probe` is a valid `ModuleProbeFn` for the program's lifetime.
+    if unsafe { register_module_usb_driver(OWNER_A, "smoke-usb-module", by_id, 0) } != -22 {
+        return TestResult::Fail("null module USB probe accepted");
+    }
+    // SAFETY: as above.
+    if unsafe { register_module_usb_driver(OWNER_A, "smoke-usb-module", by_id, probe) } != 0 {
+        unregister_module_usb_drivers(OWNER_A);
+        return TestResult::Fail("module USB registration through the bus host failed");
+    }
+    // Same owner re-registering the same match replaces it in place.
+    // SAFETY: as above.
+    let again = unsafe { register_module_usb_driver(OWNER_A, "smoke-usb-module", by_id, probe) };
+    // SAFETY: as above.
+    let stolen = unsafe { register_module_usb_driver(OWNER_B, "smoke-usb-other", by_id, probe) };
+    // SAFETY: as above.
+    let class_rc =
+        unsafe { register_module_usb_driver(OWNER_B, "smoke-usb-class", by_class, probe) };
+    let count = module_match_count();
+    let id_hits = module_candidates(0xFFFD, 0xFFFD, &[]);
+    let other_id = module_candidates(0xFFFD, 0xFFFC, &[]);
+    let mbim_cfg = build_cfg_with_class(0x02, 0x0E, 0x00, 0);
+    let ecm_cfg = build_cfg_with_class(0x02, 0x06, 0x00, 0);
+    let class_hits = module_candidates(0x2C7C, 0x0125, &mbim_cfg);
+    let class_miss = module_candidates(0x2C7C, 0x0125, &ecm_cfg);
+
+    unregister_module_usb_drivers(OWNER_A);
+    let after_a = module_match_count();
+    unregister_module_usb_drivers(OWNER_B);
+    let after_b = module_match_count();
+
+    if again != 0 {
+        return TestResult::Fail("same-owner re-registration was refused");
+    }
+    if stolen != -16 {
+        return TestResult::Fail("another module's identical match was not -EBUSY");
+    }
+    if class_rc != 0 || count != base + 2 {
+        return TestResult::Fail("module match table did not hold exactly the two entries");
+    }
+    if id_hits.len() != 1 || id_hits[0].0 != OWNER_A || !other_id.is_empty() {
+        return TestResult::Fail("VID/PID module match selected the wrong devices");
+    }
+    if class_hits.len() != 1 || class_hits[0].1 != "smoke-usb-class" || !class_miss.is_empty() {
+        return TestResult::Fail("interface-triple module match selected the wrong devices");
+    }
+    if (id_hits[0].2)(0, 0) != -38 {
+        return TestResult::Fail("recorded module probe is not the one registered");
+    }
+    if after_a != base + 1 || after_b != base {
+        return TestResult::Fail("module unload did not remove exactly its own matches");
+    }
+    let token = module_usb_token(3, 0x2A);
+    if token >> 56 != 0x55 || (token >> 8) & 0xFF != 3 || token & 0xFF != 0x2A {
+        return TestResult::Fail("module USB device token encoding changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_module_matches
+);
+
 // ── drivers/usb/class-registry unbind dispatch ────────────────────
 //
 // The disconnect lifecycle (attach::detach_slot) reaches registered

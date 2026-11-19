@@ -272,6 +272,57 @@ kernel_abi! {
         unsafe { narf_bus::register_module_pci_driver(owner, name, vendor, device, probe) }
     }
 
+    /// Register a USB class-driver match for this module. `match_flags`
+    /// selects which fields are compared, as Linux `usb_device_id`:
+    /// bit 0 `(idVendor, idProduct)`, bit 1 interface class, bit 2 interface
+    /// subclass, bit 3 interface protocol; unselected fields are ignored.
+    /// `probe` is a `ModuleProbeFn` called through the module call gate, in
+    /// task context, for a device no built-in driver claimed; its `dev_token`
+    /// is an opaque USB device token (no USB datapath export accepts it yet)
+    /// and a 0 return claims the device. Returns 0, `-EINVAL` for a bad
+    /// name, null probe, no/unknown flags or a vendor match on VID 0,
+    /// `-ENODEV` when the kernel has no USB stack, `-EBUSY` when another
+    /// module holds the same match, or `-ENOSPC` when the module match table
+    /// is full.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes valid for the call. `probe`
+    /// must stay mapped for as long as the match is registered; module unload
+    /// removes the match before unmapping the owner's text.
+    // Flat C arguments, one per `usb_device_id` field, so no `repr(C)` struct
+    // has to be shared with separately compiled modules.
+    #[allow(clippy::too_many_arguments)]
+    fn narf_register_usb_driver(
+        name: *const u8,
+        name_len: usize,
+        match_flags: u16,
+        vendor: u16,
+        product: u16,
+        class: u8,
+        subclass: u8,
+        protocol: u8,
+        probe: usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || probe == 0 {
+            return -22; // -EINVAL
+        }
+        // SAFETY: the module promises `name` names `name_len` readable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            return -22;
+        };
+        let m = match narf_bus::module_usb::ModuleUsbMatch::from_flags(
+            match_flags, vendor, product, class, subclass, protocol,
+        ) {
+            Ok(m) => m,
+            Err(errno) => return errno,
+        };
+        let owner = crate::symbols::current_init_id().0;
+        // SAFETY: `probe` is non-null (checked); the unload path removes the
+        // match before the owner's text is unmapped.
+        unsafe { narf_bus::module_usb::register_module_usb_driver(owner, name, m, probe) }
+    }
+
     // ── Device datapath: PCI/MMIO (Stage 1) + coherent DMA (Stage 2) ───────
     //
     // These let a module's probe actually drive the device it was handed. The
@@ -1026,3 +1077,45 @@ fn smoke_kabi_register_pci_driver_round_trips() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_register_pci_driver_round_trips);
+
+/// `narf_register_usb_driver` validates its C arguments itself and forwards a
+/// well-formed match to the USB registry's `narf_bus::module_usb` host. The
+/// registry side (dedup, `-EBUSY`, unload sweep, match selection) is proven
+/// by `drivers/usb/class-registry`; this pins the export's own contract.
+fn smoke_kabi_register_usb_driver_validates_and_forwards() -> TestResult {
+    const VP: u16 = 1; // MATCH_VENDOR_PRODUCT
+    let name = b"narf-kabi-usb-smoke";
+    let probe = kabi_smoke_probe_thunk as usize;
+    // SAFETY: `name` names its bytes for each call; nothing else is read.
+    let call = |n: *const u8, len: usize, flags: u16, vendor: u16, p: usize| unsafe {
+        narf_register_usb_driver(n, len, flags, vendor, 0xFACE, 0, 0, 0, p)
+    };
+    if call(core::ptr::null(), name.len(), VP, 0xFEED, probe) != -22
+        || call(name.as_ptr(), 0, VP, 0xFEED, probe) != -22
+        || call(name.as_ptr(), name.len(), VP, 0xFEED, 0) != -22
+    {
+        return TestResult::Fail("narf_register_usb_driver accepted a null name or probe");
+    }
+    if call(name.as_ptr(), name.len(), 0, 0xFEED, probe) != -22
+        || call(name.as_ptr(), name.len(), 0x8000, 0xFEED, probe) != -22
+        || call(name.as_ptr(), name.len(), VP, 0, probe) != -22
+    {
+        return TestResult::Fail("narf_register_usb_driver accepted bad match flags or VID 0");
+    }
+    let bad_utf8 = [0xFFu8, 0xFE];
+    if call(bad_utf8.as_ptr(), bad_utf8.len(), VP, 0xFEED, probe) != -22 {
+        return TestResult::Fail("narf_register_usb_driver accepted a non-UTF-8 name");
+    }
+    let rc = call(name.as_ptr(), name.len(), VP, 0xFEED, probe);
+    let owner = crate::symbols::current_init_id().0;
+    narf_bus::module_usb::unregister_module_usb_drivers(owner);
+    match rc {
+        0 => TestResult::Pass,
+        -19 => TestResult::Skip("no USB stack registered a module host in this build"),
+        _ => TestResult::Fail("narf_register_usb_driver rejected a valid registration"),
+    }
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_register_usb_driver_validates_and_forwards
+);

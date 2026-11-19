@@ -239,6 +239,25 @@ struct SuspendEntry {
 /// pass rather than at attach time.
 static SUSPEND_HOOKS: IrqSafeSpinLock<Vec<SuspendEntry>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Bound on match entries registered by loadable modules (all modules
+/// together). Separate from [`MAX_DRIVERS`]: a module's id table must not
+/// crowd built-in drivers out of their slots.
+const MAX_MODULE_MATCHES: usize = 64;
+
+/// One match entry registered by a loadable module through the
+/// `narf_register_usb_driver` kernel-ABI export (via
+/// `narf_bus::module_usb`). The probe is module text: it is only ever
+/// called through `narf_bus::module_usb::call_module_usb_probe`, and the
+/// entry is removed before that text is unmapped.
+struct ModuleDriverEntry {
+    owner: u64,
+    name: &'static str,
+    matches: UsbClassMatch,
+    probe: narf_bus::ModuleProbeFn,
+}
+
+static MODULE_DRIVERS: IrqSafeSpinLock<Vec<ModuleDriverEntry>> = IrqSafeSpinLock::new(Vec::new());
+
 // ── Public API ──────────────────────────────────────────────────────
 
 /// Register a USB class driver. Called at Stage::Subsys before any
@@ -318,6 +337,82 @@ pub fn register_suspend_hook(name: &'static str, hook: UsbSuspendFn) -> Result<(
     }
     g.push(SuspendEntry { name, hook });
     Ok(())
+}
+
+/// Register one match entry for a loadable module. Reached only through
+/// the `narf_bus::module_usb` host installed by [`install_module_host`].
+/// A re-registration of the same match by the same owner replaces its
+/// probe; the same match held by another module is `-EBUSY`. `-ENOSPC`
+/// past [`MAX_MODULE_MATCHES`].
+fn register_module_driver(
+    owner: u64,
+    name: &'static str,
+    m: narf_bus::module_usb::ModuleUsbMatch,
+    probe: narf_bus::ModuleProbeFn,
+) -> i32 {
+    let matches = UsbClassMatch {
+        vendor_id: m.vendor_id,
+        product_id: m.product_id,
+        class: m.class,
+        subclass: m.subclass,
+        protocol: m.protocol,
+    };
+    let same = |e: &ModuleDriverEntry| {
+        e.matches.vendor_id == matches.vendor_id
+            && e.matches.product_id == matches.product_id
+            && e.matches.class == matches.class
+            && e.matches.subclass == matches.subclass
+            && e.matches.protocol == matches.protocol
+    };
+    let mut g = MODULE_DRIVERS.lock();
+    if let Some(entry) = g.iter_mut().find(|e| same(e)) {
+        if entry.owner != owner {
+            return -16; // -EBUSY: another module owns this match.
+        }
+        entry.name = name;
+        entry.probe = probe;
+        return 0;
+    }
+    if g.len() >= MAX_MODULE_MATCHES {
+        return -28; // -ENOSPC
+    }
+    g.push(ModuleDriverEntry {
+        owner,
+        name,
+        matches,
+        probe,
+    });
+    0
+}
+
+/// Remove every match entry `owner` registered. Idempotent.
+fn unregister_module_drivers(owner: u64) {
+    MODULE_DRIVERS.lock().retain(|e| e.owner != owner);
+}
+
+static MODULE_HOST: narf_bus::module_usb::Host = narf_bus::module_usb::Host {
+    register: register_module_driver,
+    unregister: unregister_module_drivers,
+};
+
+/// Install this registry as the `narf_bus::module_usb` host, so loadable
+/// modules can register USB matches. Idempotent; called at boot from
+/// [`crate::register_initcalls`], before any module can load.
+pub fn install_module_host() {
+    let _ = narf_bus::module_usb::register(&MODULE_HOST);
+}
+
+/// Opaque per-device token handed to a module's USB probe: the xHCI
+/// controller index in bits 15:8 and the slot id in bits 7:0, under a
+/// USB tag in bits 63:56 so it can never alias a PCI token. No USB
+/// datapath export accepts it yet; it identifies the device in logs.
+pub const fn module_usb_token(controller: u8, slot_id: u8) -> u64 {
+    (0x55u64 << 56) | ((controller as u64) << 8) | slot_id as u64
+}
+
+/// Number of module-registered match entries. For smoke tests.
+pub fn module_match_count() -> usize {
+    MODULE_DRIVERS.lock().len()
 }
 
 /// Invoke every registered suspend hook for one hub port, in
@@ -490,7 +585,56 @@ pub fn dispatch_probe(device: Arc<USBDevice>, config: &[u8], hub_port: Option<(u
             }
         }
     }
+    dispatch_module_probe(&device, vid, pid, config)
+}
+
+/// Offer a device no built-in driver claimed to the loadable-module
+/// matches, in registration order. A probe returning 0 claims the device;
+/// any negative errno (`-ENOSYS` from a registration-only module, `-ENODEV`
+/// for "not mine") lets the next entry try.
+fn dispatch_module_probe(device: &Arc<USBDevice>, vid: u16, pid: u16, config: &[u8]) -> bool {
+    let snapshot = module_candidates(vid, pid, config);
+    if snapshot.is_empty() {
+        return false;
+    }
+    let token = module_usb_token(device.controller().id(), device.slot_id());
+    for (owner, name, probe) in snapshot {
+        let rc = narf_bus::module_usb::call_module_usb_probe(owner, probe, token);
+        use core::fmt::Write as _;
+        if rc == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-class-registry: {:04x}:{:04x} claimed by module {}",
+                vid,
+                pid,
+                name
+            );
+            return true;
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  usb-class-registry: {:04x}:{:04x} module probe {} declined: {}",
+            vid,
+            pid,
+            name,
+            rc
+        );
+    }
     false
+}
+
+/// Module match entries accepting this device, in registration order, as
+/// `(owner, name, probe)`. Snapshotted so no probe runs under the lock.
+pub(crate) fn module_candidates(
+    vid: u16,
+    pid: u16,
+    config: &[u8],
+) -> Vec<(u64, &'static str, narf_bus::ModuleProbeFn)> {
+    let g = MODULE_DRIVERS.lock();
+    g.iter()
+        .filter(|e| match_entry(&e.matches, vid, pid, config))
+        .map(|e| (e.owner, e.name, e.probe))
+        .collect()
 }
 
 /// Return the number of currently registered class drivers.
@@ -523,4 +667,5 @@ pub fn would_match(vendor_id: u16, product_id: u16) -> bool {
 pub fn reset_for_test() {
     REGISTRY.lock().clear();
     SUSPEND_HOOKS.lock().clear();
+    MODULE_DRIVERS.lock().clear();
 }

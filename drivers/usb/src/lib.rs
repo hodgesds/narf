@@ -59,6 +59,11 @@ mod tests;
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Let loadable modules register USB class matches
+    // (`narf_register_usb_driver`). Installed now, not from an initcall:
+    // it only publishes a kernel-resident adapter, and must be in place
+    // before the module loader can run any module init.
+    class_registry::install_module_host();
     // Install devfs hooks so /dev/ttyUSB<N> nodes resolve.
     // Linux ref: `drivers/usb/serial/usb-serial.c:usb_serial_register_drivers`.
     narf_init::register(Stage::Subsys, "usb-serial-devfs", || {
