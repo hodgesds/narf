@@ -886,3 +886,177 @@ kernel_test_in!(
     "observability",
     smoke_obs_gdb_bp_map_preserves_original_byte
 );
+
+// ── lockup detector (`watchdog`) ────────────────────────────────────
+
+const WD_SEC: u64 = 1_000_000_000;
+const WD_THRESH: u64 = crate::watchdog::WATCHDOG_THRESH_SECS * WD_SEC;
+
+fn wd_sample(halted: bool, passes: u64, ticks: u64) -> crate::watchdog::CpuSample {
+    crate::watchdog::CpuSample {
+        online: true,
+        halted,
+        sched_passes: passes,
+        timer_ticks: ticks,
+    }
+}
+
+/// The native-boot false positive: an idle desktop's CPUs sit halted with
+/// frozen counters for minutes. A halted CPU is responsive (it sleeps with
+/// interrupts enabled), so neither detector may ever report it; nor a busy
+/// CPU that keeps scheduling.
+fn smoke_obs_watchdog_idle_and_busy_cpus_never_report() -> TestResult {
+    use crate::watchdog::CpuWatch;
+    let idle = CpuWatch::new();
+    let busy = CpuWatch::new();
+    for i in 0..3_600u64 {
+        let now = (i + 1) * WD_SEC;
+        if idle
+            .observe(&wd_sample(true, 7, 9), now, WD_THRESH)
+            .is_some()
+        {
+            return TestResult::Fail("a halted CPU was reported as locked up");
+        }
+        // Scheduling every second, ticking only now and then (tickless).
+        if busy
+            .observe(&wd_sample(false, i, i / 30), now, WD_THRESH)
+            .is_some()
+        {
+            return TestResult::Fail("a CPU that keeps scheduling was reported");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_idle_and_busy_cpus_never_report
+);
+
+/// Soft lockup (Linux `is_softlockup`): awake, taking ticks, no scheduling
+/// point for `2 * watchdog_thresh`. Reported first at the threshold, then
+/// every threshold while it lasts; scheduling again ends the episode.
+fn smoke_obs_watchdog_soft_lockup_reports_on_threshold() -> TestResult {
+    use crate::watchdog::{CpuWatch, Lockup};
+    let w = CpuWatch::new();
+    let mut reports = alloc::vec::Vec::new();
+    // Baseline at t=1 s, stuck (passes frozen at 5) from then on.
+    for t in 1..=61u64 {
+        if let Some(l) = w.observe(&wd_sample(false, 5, t * 1000), t * WD_SEC, WD_THRESH) {
+            reports.push((t, l));
+        }
+    }
+    let want = [
+        (
+            21,
+            Lockup::Soft {
+                stuck_ns: 20 * WD_SEC,
+                first: true,
+            },
+        ),
+        (
+            41,
+            Lockup::Soft {
+                stuck_ns: 40 * WD_SEC,
+                first: false,
+            },
+        ),
+        (
+            61,
+            Lockup::Soft {
+                stuck_ns: 60 * WD_SEC,
+                first: false,
+            },
+        ),
+    ];
+    if reports[..] != want[..] {
+        return TestResult::Fail("soft lockup not reported at 2*thresh and every 2*thresh after");
+    }
+    // It schedules again: quiet, and a later stall is a new first report.
+    for t in 62..=81u64 {
+        if w.observe(&wd_sample(false, 6, t * 1000), t * WD_SEC, WD_THRESH)
+            .is_some()
+        {
+            return TestResult::Fail("reported a CPU within 2*thresh of its last scheduling point");
+        }
+    }
+    match w.observe(&wd_sample(false, 6, 82_000), 82 * WD_SEC, WD_THRESH) {
+        Some(Lockup::Soft { first: true, .. }) => TestResult::Pass,
+        _ => TestResult::Fail("a new stall after recovery must be a first report"),
+    }
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_soft_lockup_reports_on_threshold
+);
+
+/// Hard lockup (Linux `is_hardlockup`): awake, no timer interrupt and no
+/// scheduling point for `watchdog_thresh`. Reported once per episode; a
+/// tick ends the episode.
+fn smoke_obs_watchdog_hard_lockup_reports_once() -> TestResult {
+    use crate::watchdog::{CpuWatch, Lockup};
+    let w = CpuWatch::new();
+    let mut reports = alloc::vec::Vec::new();
+    for t in 1..=40u64 {
+        if let Some(l) = w.observe(&wd_sample(false, 3, 4), t * WD_SEC, WD_THRESH) {
+            reports.push((t, l));
+        }
+    }
+    if reports[..]
+        != [(
+            11,
+            Lockup::Hard {
+                stuck_ns: 10 * WD_SEC,
+            },
+        )][..]
+    {
+        return TestResult::Fail("hard lockup not reported exactly once at watchdog_thresh");
+    }
+    // Ticks resume but it still does not schedule: that is a soft lockup
+    // (timer interrupts arrive), not a second hard one.
+    for t in 41..=60u64 {
+        match w.observe(&wd_sample(false, 3, t), t * WD_SEC, WD_THRESH) {
+            None | Some(Lockup::Soft { .. }) => {}
+            Some(Lockup::Hard { .. }) => {
+                return TestResult::Fail("a CPU taking ticks was reported as a hard lockup")
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_hard_lockup_reports_once
+);
+
+/// A round more than a soft threshold after the previous one (suspend, a
+/// paused VM) judges nobody: elapsed time says nothing about any CPU. A
+/// zero threshold disables both detectors (`watchdog_thresh=0`).
+fn smoke_obs_watchdog_gap_and_disable() -> TestResult {
+    use crate::watchdog::LockupWatch;
+    let w: LockupWatch<2> = LockupWatch::new();
+    if !w.begin_round(WD_SEC, WD_THRESH) {
+        return TestResult::Fail("the first round must run");
+    }
+    let _ = w.observe(0, &wd_sample(false, 1, 1), WD_SEC, WD_THRESH);
+    let resumed = 600 * WD_SEC;
+    if w.begin_round(resumed, WD_THRESH) {
+        return TestResult::Fail("a 10-minute gap between rounds must re-baseline");
+    }
+    if w.observe(0, &wd_sample(false, 1, 1), resumed, WD_THRESH)
+        .is_some()
+    {
+        return TestResult::Fail("reported a CPU across a checker gap");
+    }
+    let off: LockupWatch<1> = LockupWatch::new();
+    for t in 1..=100u64 {
+        let _ = off.begin_round(t * WD_SEC, 0);
+        if off
+            .observe(0, &wd_sample(false, 1, 1), t * WD_SEC, 0)
+            .is_some()
+        {
+            return TestResult::Fail("watchdog_thresh=0 must disable the lockup detectors");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability/watchdog", smoke_obs_watchdog_gap_and_disable);
