@@ -133,7 +133,7 @@ fn smoke_multi_ccs_ads_defaults_per_instance_private_execution_and_retirement() 
                     assert_eq!(
                         ads[header + 1],
                         if platform == GtPlatform::Battlemage {
-                            18
+                            19
                         } else {
                             16
                         }

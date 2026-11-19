@@ -30,6 +30,16 @@ pub(crate) const fn disable_rc_sema_idle_msg(graphics: u16) -> bool {
     matches!(graphics, 2001..=3001)
 }
 
+/// Physical graphics engines covered by xe_wa_oob.rules Wa_16023105232.
+/// All currently admitted IPs in this range also require Wa_14025941587.
+pub(crate) const fn adjust_ring_idle_delay(graphics: u16) -> bool {
+    matches!(graphics, 2001..=3005)
+}
+
+pub(crate) const RING_IDLEDLY: u32 = 0x23c;
+const IDLE_DELAY: u32 = (1 << 21) - 1;
+const INHIBIT_SWITCH_UNTIL_PREEMPTED: u32 = 1 << 31;
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
@@ -356,6 +366,81 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt_registers",
         smoke_global_register_xe2_fuse_and_ip_vectors
+    );
+
+    fn smoke_engine_idle_delay_clock_bounds_and_preservation() -> TestResult {
+        // Literal vectors from xe_gt_clock.c and the 640ns MAXCNT unit.
+        // Vary the CTC shift independently of the crystal selector.
+        let reserved = 0x4420_0000;
+        for (rpm, delay, maxcnt, expected) in [
+            (0x06, 0, 100, 8),                           // 24 MHz
+            (0x08, 0, 100, 13),                          // 19.2 MHz
+            (0x12, 0, 100, 13),                          // 38.4 MHz
+            (0x1e, 0, 100, 8),                           // 25 MHz
+            (0x18, 0x8000_000e, 100, 14),                // inhibit alone
+            (0x18, 14, 100, 14),                         // already valid
+            (0x18, 20, 20, 19),                          // exactly at cap
+            (0x10, 0, 8, 12),                            // minimum rounds past cap
+            (0x10, 0, 7, 10),                            // cap wins over minimum
+            (0x18, 0x8000_0010, 0, 0),                   // unprogrammed cap
+            (0x10, 0x001f_ffff, 0x000f_ffff, 1_610_621), // full-width fields
+        ] {
+            let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, 2, 0, false, 1);
+            w.regs.borrow_mut().extend([
+                (0xd00, rpm),
+                (0x223c, reserved | delay),
+                (0x2054, 0x7ff0_0000 | maxcnt),
+            ]);
+            assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(_))));
+            assert_eq!(w.read32(0x223c), reserved | expected);
+            assert_eq!(w.read32(0x2054), 0x7ff0_0000 | maxcnt);
+            assert_eq!(
+                w.writes.borrow().iter().any(|&(reg, _)| reg == 0x223c),
+                expected != delay
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_engine_idle_delay_clock_bounds_and_preservation
+    );
+
+    fn smoke_engine_idle_delay_failure_and_previous_ip() -> TestResult {
+        // An unavailable later copy engine must fail preflight before RCS0
+        // is changed. A rejected write releases the selector and semaphore.
+        for (unavailable, reject, rpm, error) in [
+            (0xd00, 0, 0, RegisterError::Unavailable),
+            (0, 0, 0x20, RegisterError::Unavailable),
+            (0x3ee054, 0, 0, RegisterError::Unavailable),
+            (0x3ee23c, 0, 0, RegisterError::Unavailable),
+            (0, 0x223c, 0, RegisterError::Verify(0x223c)),
+        ] {
+            let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, 1, 0, false, 1);
+            w.regs
+                .borrow_mut()
+                .extend([(0xd00, rpm), (0x223c, 0), (0x2054, 100)]);
+            w.unavailable.set(unavailable);
+            w.reject.set(reject);
+            assert_eq!(init.poll(&w, 11), Poll::Ready(Err(error)));
+            assert_eq!(w.read32(0x223c), 0);
+            assert_eq!(
+                w.writes.borrow().iter().any(|&(reg, _)| reg == 0x223c),
+                reject == 0x223c
+            );
+            assert_eq!(w.read32(0xfd4), 0x8000_0101);
+            assert_eq!(w.writes.borrow().last(), Some(&(0xfd0, 1)));
+        }
+        let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+        let (w, init) = fixture(platform, 0x7d55, 70, 0, false, 1);
+        w.unavailable.set(0xd00);
+        assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
+        assert!(!w.writes.borrow().iter().any(|&(reg, _)| reg == 0x223c));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_engine_idle_delay_failure_and_previous_ip
     );
 
     fn smoke_global_multi_ccs_partition_requires_posted_write_proof() -> TestResult {
@@ -766,7 +851,8 @@ impl RegisterInit {
         } else {
             false
         };
-        let entries = self.entries(flat);
+        let mut entries = self.entries(flat);
+        self.add_idle_delay_entries(mmio, &mut entries)?;
         // Preflight every readable register before publishing any WA. Masked
         // writes never use the read value; ordinary writes preserve its bits.
         let mut values = Vec::with_capacity(entries.len());
@@ -799,6 +885,56 @@ impl RegisterInit {
         }
         self.engine_policy()?.install(mmio)?;
         Ok(vram)
+    }
+
+    /// xe_hw_engine.c::adjust_idledly (Linux 7.4-rc1). The graphics GT is
+    /// awake, quiescent, and qualified as a physical function at this point.
+    fn add_idle_delay_entries(
+        &self,
+        mmio: &impl MmioWindow,
+        entries: &mut Vec<Entry>,
+    ) -> Result<(), RegisterError> {
+        if !adjust_ring_idle_delay(self.seed.graphics) {
+            return Ok(());
+        }
+        let read = |reg| match mmio.read32(reg) {
+            u32::MAX => Err(RegisterError::Unavailable),
+            value => Ok(value),
+        };
+        // xe_gt_clock.c: eight timestamp-base periods per IDLEDLY tick.
+        // The CTC shift used for command-stream timestamps does not apply.
+        let tick_ps: u64 = 8 * match (read(crate::intel_gpu_oa::RPM_CONFIG0_REG)? >> 3) & 7 {
+            0 => 83_333,
+            1 | 2 => 52_083,
+            3 => 80_000,
+            _ => return Err(RegisterError::Unavailable),
+        };
+        let min_ticks = 5_000_000u64.div_ceil(tick_ps);
+        for engine in self.engines().iter() {
+            let base = engine.base();
+            let reg = u64::from(base + RING_IDLEDLY);
+            let old = read(reg)?;
+            let max_wait_ns = u64::from(read(u64::from(base + 0x54))? & 0x000f_ffff) * 640;
+            let mut ticks = u64::from(old & IDLE_DELAY).max(min_ticks);
+            // Wa_16023105232 has priority over the 5us minimum, including
+            // when rounding that minimum up would cross the limit. A zero
+            // MAXCNT yields zero ticks. Keep a valid hardware delay intact.
+            if ticks * tick_ps >= max_wait_ns * 1000 {
+                ticks = max_wait_ns.saturating_sub(1) * 1000 / tick_ps;
+            }
+            let clear = INHIBIT_SWITCH_UNTIL_PREEMPTED | IDLE_DELAY;
+            if old & clear != ticks as u32 {
+                entries.push(Entry {
+                    reg,
+                    clear,
+                    set: ticks as u32,
+                    masked: false,
+                    verify: true,
+                    target: Target::Direct,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn entries(&self, flat: bool) -> Vec<Entry> {

@@ -2913,7 +2913,7 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 )
             );
             assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
-            assert_eq!(ads[0x300 / 4 + 1], if xe2 { 18 } else { 16 });
+            assert_eq!(ads[0x300 / 4 + 1], if xe2 { 19 } else { 16 });
             let saves = ads_registers(&w, crate::intel_gpu_engine::Engine::Bcs0);
             assert_eq!(saves[&0x2229c].1, 0);
             assert_eq!(saves[&0x220c4].1, 1);
@@ -2939,7 +2939,7 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 (ads[(0x123c + 128) / 4], ads[(0x123c + 528) / 4]),
                 (0x20202000, 1)
             );
-            assert_eq!(ads[0x400 / 4 + 1], if xe2 { 18 } else { 16 });
+            assert_eq!(ads[0x400 / 4 + 1], if xe2 { 19 } else { 16 });
             // GuC follows the class/physical-instance header, not adjacency
             // to another engine's save list. An absent BCS8 leaves its own
             // reserved save range empty before CCS0's range.

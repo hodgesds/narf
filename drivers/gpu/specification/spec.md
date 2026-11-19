@@ -2326,6 +2326,14 @@ and in the GuC reset register list. Graphics 30.03–30.05 omits that
 register from both. Wildcat Lake uses the Xe3 non-privileged register
 policy when initializing its engines.
 
+For physical graphics engines on supported IPs from 20.01 through 30.05,
+the driver clears the preemption-inhibit bit in each engine's `RING_IDLEDLY`.
+It uses the crystal clock to round the 5 µs minimum up to a whole tick
+(Wa_14025941587). The delay must also stay below `RING_PWRCTX_MAXCNT`
+(Wa_16023105232). This upper limit takes priority, and a zero limit sets
+the delay to zero. GuC saves the full register across isolated engine
+resets on these IPs, including Wildcat Lake and Nova Lake-S.
+
 BMG's architecture-present BCS8 uses hardware base 0x3ee000 and physical
 instance eight, with its own two-page copy LRC, HWS, golden image and private
 PPGTT startup store probe. ADS enables physical COPY bits 0 and 8 (0x101),

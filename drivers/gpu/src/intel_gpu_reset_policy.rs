@@ -148,6 +148,11 @@ impl ResetPolicy {
         if crate::intel_gpu_gt_registers::disable_rc_sema_idle_msg(self.graphics) {
             add(base + 0x50, 1);
         }
+        // xe_guc_ads.c adds this unmasked register for the separate OOB
+        // workaround even if the firmware already programmed a valid delay.
+        if crate::intel_gpu_gt_registers::adjust_ring_idle_delay(self.graphics) {
+            add(base + crate::intel_gpu_gt_registers::RING_IDLEDLY, 0);
+        }
         // RCS0 is the first render/compute engine and therefore owns all
         // shared engine-reset-domain state. Never duplicate it on each CCS.
         if engine == Engine::Rcs0 {

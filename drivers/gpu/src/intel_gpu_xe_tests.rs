@@ -1897,7 +1897,7 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
         for engine in gt.engines().unwrap().iter() {
             assert_eq!(
                 ads_registers(&w, engine).len(),
-                if engine == Engine::Rcs0 { 28 } else { 18 }
+                if engine == Engine::Rcs0 { 29 } else { 19 }
             );
         }
 
@@ -1984,6 +1984,7 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 d.regs.extend([
                     (0xd8c, 30 << 22 | release << 14 | step),
                     (0x6210, 0xa4000001),
+                    (0xd00, 0x1e), // 25 MHz crystal, 640 ns per idle-delay tick
                     (0x913c, 0),
                     (0x9150, 0),
                     (0x9154, 0x80000000),
@@ -1995,6 +1996,12 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     (0x9118, 0x0003_0001),
                     (0x9130, 0xfd),
                 ]);
+                for base in [
+                    0x2000, 0x22000, 0x3ee000, 0x1a000, 0x1c000, 0x1e000, 0x26000,
+                ] {
+                    d.regs
+                        .extend([(base + 0x23c, 0xc020_0020), (base + 0x54, 20)]);
+                }
             }
             hardware_discovery(&mut gt, &w, 0xdfc);
             hardware_scheduling_reload_mode(&mut gt, &w, 4);
@@ -2100,16 +2107,18 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     release <= 1
                 );
                 assert_eq!(saves.contains_key(&ring_psmi), release <= 1);
+                assert_eq!(w.read32(u64::from(engine.base() + 0x23c)), 0x4020_0013);
+                assert_eq!(saves[&(engine.base() + 0x23c)].1, 0);
                 assert_eq!(
                     saves.len(),
                     (if engine == Engine::Rcs0 {
                         if release == 0 && step < 4 {
-                            27
+                            28
                         } else {
-                            25
+                            26
                         }
                     } else {
-                        18
+                        19
                     }) - usize::from(release > 1)
                 );
             }
