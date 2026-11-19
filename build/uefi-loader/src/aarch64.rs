@@ -254,6 +254,12 @@ fn load_and_start() -> Result<(), LoadError> {
 
     let page_start = align_down(elf.load_start, PAGE_SIZE);
     let page_end = align_up(elf.load_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
+    // One snapshot for the DTB relocation below, the tail validation, the
+    // hole-tolerant allocation, and the allocation-failure diagnostics. The
+    // snapshot may list its own backing buffer as a LOADER_DATA hole inside
+    // the span; the partition below treats that like any other reclaimable
+    // hole.
+    let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| LoadError::Allocation)?;
     // Each sub-check names itself. #2127 printed the operands but not which
     // disjunct fired, so every InvalidElf sighting since showed the span
     // line and then a bare `InvalidElf` (issue #2125): the span overrun and
@@ -271,7 +277,17 @@ fn load_and_start() -> Result<(), LoadError> {
         );
         return Err(LoadError::InvalidElf);
     }
-    if ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end) {
+    // The firmware-placed DTB may sit inside the load span: AAVMF parks it
+    // at 0x47df5000 on the smoke path, past the file-backed end, in the
+    // span's .bss tail — that overlap refusal is hang sighting #49 onward
+    // (issue #2125). Relocate the DTB instead of refusing: copy it to
+    // LOADER_DATA pages outside the span while boot services are live and
+    // hand the kernel the new address. The kernel parses the DTB from x0
+    // first and reserves its range before its allocator runs
+    // (boot/src/aarch64/mod.rs `parse_raw`), so the relocation preserves
+    // the handoff contract. No home for it is a loud refusal, not a
+    // silent boot.
+    let dtb = if ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end) {
         #[cfg(not(test))]
         uefi::println!(
             "NARF UEFI loader: DTB {:#x}-{:#x} overlaps load span {:#x}-{:#x} (file-backed end {:#x})",
@@ -281,8 +297,10 @@ fn load_and_start() -> Result<(), LoadError> {
             page_end,
             elf.file_backed_end
         );
-        return Err(LoadError::InvalidElf);
-    }
+        relocate_dtb(&map, dtb, dtb_size, page_start, page_end)?
+    } else {
+        dtb
+    };
 
     // Allocate only the FILE-backed prefix, not the whole memsz span.
     //
@@ -301,11 +319,6 @@ fn load_and_start() -> Result<(), LoadError> {
     // contract, and it removes the size ceiling entirely rather than buying
     // headroom that the next 215 KB of growth would eat.
     let alloc_end = align_up(elf.file_backed_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
-    // One snapshot for the tail validation, the hole-tolerant allocation
-    // below, and the allocation-failure diagnostics. The snapshot may list
-    // its own backing buffer as a LOADER_DATA hole inside the span; the
-    // partition below treats that like any other reclaimable hole.
-    let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| LoadError::Allocation)?;
     // The deferred tail must be memory the OS actually owns after
     // ExitBootServices. Anything else (MMIO, runtime-services, reserved) would
     // make the post-EBS zeroing corrupt something, so refuse to boot instead.
@@ -821,6 +834,114 @@ const fn ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
+/// Find a home for the DTB outside the kernel load span.
+///
+/// Returns the start of the lowest CONVENTIONAL run that fits the
+/// page-aligned DTB size entirely outside `[page_start, page_end)`. A
+/// CONVENTIONAL run straddling the span contributes only its outside
+/// part. `None` means no such home exists and the boot must refuse
+/// loudly. The choice is deterministic for a given map: the lowest
+/// fitting address wins. Only CONVENTIONAL runs are candidates, so the
+/// destination can never be the memory-map snapshot's own backing buffer
+/// (LOADER_DATA), the firmware DTB source (inside the span), or any
+/// range the span allocation below will claim.
+fn find_dtb_relocation(
+    entries: impl Iterator<Item = MapEntry>,
+    dtb_size: usize,
+    page_start: u64,
+    page_end: u64,
+) -> Option<u64> {
+    let needed = align_up(dtb_size as u64, PAGE_SIZE)?;
+    let mut best: Option<u64> = None;
+    for entry in entries {
+        if !matches!(entry.ty, MemoryType::CONVENTIONAL) {
+            continue;
+        }
+        for (candidate_start, candidate_end) in [
+            (entry.start, entry.end.min(page_start)),
+            (entry.start.max(page_end), entry.end),
+        ] {
+            if candidate_end <= candidate_start || candidate_end - candidate_start < needed {
+                continue;
+            }
+            if best.is_none_or(|best| candidate_start < best) {
+                best = Some(candidate_start);
+            }
+        }
+    }
+    best
+}
+
+/// Copy the firmware DTB to LOADER_DATA pages outside the kernel load span
+/// and return the new address. Runs before ExitBootServices, while the
+/// firmware-owned source is still valid and allocation is still possible.
+/// The destination is claimed with `AllocateAddress` before the span
+/// allocation and hole-fill staging below, so neither can reuse it; after
+/// ExitBootServices it is ordinary OS-owned memory, and the kernel
+/// reserves the DTB range before its allocator runs
+/// (boot/src/aarch64/mod.rs `parse_raw`).
+fn relocate_dtb(
+    map: &impl MemoryMap,
+    dtb: usize,
+    dtb_size: usize,
+    page_start: u64,
+    page_end: u64,
+) -> Result<usize, LoadError> {
+    let Some(dest) = find_dtb_relocation(
+        map.entries().map(|d| MapEntry {
+            start: d.phys_start,
+            end: d
+                .phys_start
+                .saturating_add(d.page_count.saturating_mul(PAGE_SIZE)),
+            ty: d.ty,
+        }),
+        dtb_size,
+        page_start,
+        page_end,
+    ) else {
+        #[cfg(not(test))]
+        uefi::println!(
+            "NARF UEFI loader: no CONVENTIONAL home outside load span {:#x}-{:#x} for the {:#x}-byte DTB",
+            page_start,
+            page_end,
+            dtb_size
+        );
+        return Err(LoadError::InvalidElf);
+    };
+    let pages = usize::try_from(
+        align_up(dtb_size as u64, PAGE_SIZE).ok_or(LoadError::Arithmetic)? / PAGE_SIZE,
+    )
+    .map_err(|_| LoadError::Arithmetic)?;
+    let allocation =
+        boot::allocate_pages(AllocateType::Address(dest), MemoryType::LOADER_DATA, pages)
+            .map_err(|_| LoadError::Allocation)?;
+    if allocation.as_ptr() as u64 != dest {
+        return Err(LoadError::Allocation);
+    }
+    // SAFETY: the source is the firmware DTB, valid through
+    // ExitBootServices; the destination is freshly allocated LOADER_DATA
+    // exclusively owned by this loader.
+    unsafe {
+        ptr::copy_nonoverlapping(dtb as *const u8, dest as *mut u8, dtb_size);
+    }
+    // Re-validate the copy: a corrupt destination would make the kernel
+    // read a garbage DTB at entry, so fail loudly here instead.
+    // SAFETY: the destination holds exactly `dtb_size` copied bytes, and
+    // `dtb_size` is at least `FDT_HEADER_SIZE` by validation above.
+    let copied = unsafe { slice::from_raw_parts(dest as *const u8, FDT_HEADER_SIZE) };
+    validate_dtb_header(copied)?;
+    #[cfg(not(test))]
+    uefi::println!(
+        "NARF UEFI loader: relocated DTB {:#x}-{:#x} to {:#x}-{:#x}",
+        dtb,
+        dtb.checked_add(dtb_size).ok_or(LoadError::Arithmetic)?,
+        dest,
+        dest.checked_add(dtb_size as u64)
+            .ok_or(LoadError::Arithmetic)?
+    );
+    Ok(dest as usize)
+}
+
 /// Memory the OS owns after ExitBootServices, so the loader may write it
 /// once boot services are gone — the same rule the .bss-tail validation
 /// already applies. Anything else (runtime services, reserved, MMIO) must
@@ -1205,5 +1326,81 @@ mod tests {
                 "{ty:?} must not be reclaimable"
             );
         }
+    }
+
+    #[test]
+    fn relocation_finds_home_above_span() {
+        // The live smoke-path layout: the firmware DTB sits at
+        // 0x47df5000-0x47ffa000 inside the load span
+        // 0x40080000-0x49c45000, with CONVENTIONAL RAM above the span.
+        let entries = [
+            conventional(0x4000_0000, 0x4008_0000),
+            firmware_hole(0x47df_5000, 0x47ff_a000),
+            conventional(0x49c4_5000, 0x8000_0000),
+        ];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x205_000, 0x4008_0000, 0x49c4_5000),
+            Some(0x49c4_5000)
+        );
+    }
+
+    #[test]
+    fn relocation_skips_runs_inside_the_span() {
+        let entries = [conventional(0x4008_0000, 0x4400_0000)];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x1000, 0x4008_0000, 0x49c4_5000),
+            None
+        );
+    }
+
+    #[test]
+    fn relocation_skips_firmware_memory() {
+        let entries = [firmware_hole(0x49c4_5000, 0x5000_0000)];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x1000, 0x4008_0000, 0x49c4_5000),
+            None
+        );
+    }
+
+    #[test]
+    fn relocation_uses_below_span_part_of_straddling_run() {
+        let entries = [conventional(0x4000_0000, 0x4010_0000)];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x80000, 0x4008_0000, 0x49c4_5000),
+            Some(0x4000_0000)
+        );
+    }
+
+    #[test]
+    fn relocation_uses_above_span_part_when_below_is_too_small() {
+        let entries = [
+            conventional(0x4000_0000, 0x4009_0000),
+            conventional(0x49c4_5000, 0x4a00_0000),
+        ];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x100_000, 0x4008_0000, 0x49c4_5000),
+            Some(0x49c4_5000)
+        );
+    }
+
+    #[test]
+    fn relocation_returns_none_when_outside_run_is_too_small() {
+        let entries = [conventional(0x49c4_5000, 0x49c4_6000)];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x2000, 0x4008_0000, 0x49c4_5000),
+            None
+        );
+    }
+
+    #[test]
+    fn relocation_picks_lowest_fitting_address() {
+        let entries = [
+            conventional(0x5000_0000, 0x6000_0000),
+            conventional(0x49c4_5000, 0x4a00_0000),
+        ];
+        assert_eq!(
+            find_dtb_relocation(entries.iter().copied(), 0x1000, 0x4008_0000, 0x49c4_5000),
+            Some(0x49c4_5000)
+        );
     }
 }

@@ -21,7 +21,11 @@ media. It validates and loads the ELF at its physical `PT_LOAD` addresses,
 obtains the standard EFI devicetree configuration table, exits Boot Services,
 and enters the kernel with the Linux `x0 = dtb` ABI. The DTB is
 header-validated and bounded to 4 MiB, covering the expanded tree published by
-current ArmVirt EDK2 firmware.
+current ArmVirt EDK2 firmware. When the firmware-placed DTB overlaps the
+kernel load span, the loader copies it to LOADER_DATA pages outside the span
+before ExitBootServices and hands the kernel the new address; the kernel
+parses the DTB from `x0` first and reserves its range before its allocator
+runs, so the relocation preserves the handoff contract.
 
 The linked loader is intentionally unbootable until
 `packaging/bind-aarch64-uefi.py` replaces its retained digest placeholder with
