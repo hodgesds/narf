@@ -9,7 +9,9 @@ use super::{
     dma_be as d, power,
 };
 use alloc::{collections::VecDeque, vec::Vec};
-use core::sync::atomic::{compiler_fence, fence, Ordering};
+#[cfg(not(target_arch = "aarch64"))]
+use core::sync::atomic::fence;
+use core::sync::atomic::{compiler_fence, Ordering};
 use narf_io::DmaBuffer;
 #[path = "checked_packet_8922a.rs"]
 pub(super) mod packet;
