@@ -1776,9 +1776,13 @@ fn module_probe_trampoline(
     // negative errno => it declined; release the context + cap.
     match call_module_probe(owner, f, token, 0) {
         0 => Ok(()),
-        _ => {
+        error => {
             remove_device_ctx(token);
-            Err(ProbeError::Other("module probe declined"))
+            if error == -19 {
+                Err(ProbeError::NotForThisDriver)
+            } else {
+                Err(ProbeError::Other("module probe failed"))
+            }
         }
     }
 }

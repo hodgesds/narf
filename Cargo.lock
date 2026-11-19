@@ -1497,6 +1497,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-gpu-intel"
+version = "0.0.0"
+dependencies = [
+ "narf-driver-macros",
+ "narf-drivers-gpu",
+]
+
+[[package]]
 name = "narf-drivers-hwmon"
 version = "0.0.0"
 dependencies = [

@@ -87,6 +87,7 @@ members = [
     "drivers/gpio",
     "drivers/i3c",
     "drivers/gpu",
+    "drivers/gpu/intel",
     "drivers/gpu/nvidia",
     "drivers/psp",
     "drivers/crypto",

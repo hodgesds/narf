@@ -46,6 +46,15 @@ infrastructure (Phase B).
 
 ### Vendor driver feature split
 
+The Intel registration crate builds as a relocatable NARF module with
+`cargo xtask build-module --package narf-drivers-gpu-intel --no-default-features --features module`.
+The loader places `intel_gpu` in the graphics domain by default. Its exact
+PCI matches come from the built-in driver's tables, including its gated
+IDs. Its probe currently returns `-ENODEV` and permits the resident
+driver to bind. Modesetting, USB-C DP and GuC submission run in the
+resident driver. Failed module init and module unload withdraw only the
+loadable driver's registrations.
+
 The crate's vendor driver sets are cargo features: `amdgpu` and
 `intel`, both in `default`, so a default build compiles and
 registers exactly the driver set it did before the split. With a
@@ -59,9 +68,8 @@ fixture pins the registered initcall names against the compiled
 feature set. The named-config registry in build/xtask
 (`configs.rs`) selects these features per build configuration:
 laptop/desktop-class configs enable `intel`; `minimal` and
-AMD-only configs do not. Neither vendor is offered as a loadable
-module: the module loader exists, but there is no GPU-class
-datapath ABI yet, so the feature gate is the selection mechanism.
+AMD-only configs do not. These features select the native GPU datapaths.
+The Intel registration module uses the PCI module ABI.
 
 The feature split applies to the shared DRM render-node hooks, native AMD
 plane metadata and placement admission, and vendor-specific test helpers

@@ -92,6 +92,8 @@ macro_rules! __modinfo_line {
 ///
 /// The `kernel_abi` modinfo line is emitted as a `0x00000000` placeholder;
 /// `cargo xtask build-module` stamps it with the running kernel's ABI hash.
+/// A fallible registrar uses `register: path => i32`. Its return value is
+/// forwarded to module init so the loader can undo partial registration.
 #[macro_export]
 macro_rules! narf_driver {
     (
@@ -104,7 +106,7 @@ macro_rules! narf_driver {
             target_domain: $domain:literal,
             $(required_caps: $required_caps:literal,)?
         },
-        register: $register:path $(,)?
+        register: $register:path $(=> $status:ty)? $(,)?
     ) => {
         #[cfg(all(feature = "builtin", feature = "module"))]
         compile_error!("a NARF driver builds either `builtin` or `module`, not both");
@@ -115,8 +117,8 @@ macro_rules! narf_driver {
         ///
         /// Called from the subsystem facade's `Stage::Subsys` initcall when
         /// built-in, and from `narf_module_init` when loaded as a `.ko`.
-        pub fn register() {
-            $register();
+        pub fn register() $(-> $status)? {
+            $register()
         }
 
         #[cfg(feature = "module")]
@@ -138,8 +140,7 @@ macro_rules! narf_driver {
             /// `sys_init_module`.
             #[unsafe(no_mangle)]
             pub extern "C" fn narf_module_init() -> i32 {
-                super::register();
-                0
+                $crate::narf_driver!(@init super::register $(=> $status)?)
             }
 
             // A `no_std` staticlib for `*-unknown-none` carries its own panic
@@ -153,6 +154,13 @@ macro_rules! narf_driver {
                 }
             }
         }
+    };
+    (@init $register:path) => {{
+        $register();
+        0
+    }};
+    (@init $register:path => $status:ty) => {
+        $register()
     };
 }
 
