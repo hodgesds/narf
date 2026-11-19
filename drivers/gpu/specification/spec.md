@@ -621,6 +621,21 @@ post-driver-FLR proof checks only power-well and pipe-DMC bits
 owned by the observed topology; WCL's nonexistent Pipe-D bits are not treated
 as hardware state, while NVL-S Pipe D remains fail-closed.
 
+On an opted-in Wildcat Lake with a lit internal panel, the GT cold start
+preserves Pipe A. It pairs the exact PCI ID with display 30.02 and checks
+secondary fetchers on pipes A–C, including FBC and the pipe-DMC flip
+queues. Panther Lake uses the same checks on A–D with display 30.00.
+KMS maps GEM scanout, display command buffers and cursor pages on both
+with the Xe3 uncached PAT index 3. Pipe A observes flip completion,
+primary-plane faults, plane ATS faults and FIFO underrun. Tiled GEM
+surfaces use the display page table.
+
+The internal panel can take over its GEM scanout arena while an owned
+external primary is lit. KMS checks the integrated PCI function and BAR,
+the published layout's display IP and pipe reservation, and the external
+surface address in both the programmed and live plane registers. A
+mismatch prevents takeover and leaves the external surface in place.
+
 The module also holds the display-20 facts: `CDCLK_TABLE`,
 `mdclk_cdclk_ratio`, `mbus_throttle`, `dbuf_min_tracker`, `dbuf_ctl`,
 `dbox`, `program_mdclk_ratio`, `raise_cdclk_floor`, `pkgc_latency`,
@@ -684,9 +699,9 @@ KMS and DC services on display 20:
   PSR return `Unsupported` on display 20.
 - `intel_gpu_cursor::Owner::new_for(io, bar_len, timing, generation)` and
   `intel_gpu_dsb::Owner::reserve_for(io, bar_len, generation)` are the
-  non-Gen12 owners for Meteor Lake and Lunar Lake (anything else is
-  `Unsupported` before a read; a missing PAT entry is `NoDevice`). Their
-  pages take `display_pte`; the display-20 cursor's fault mask drops both
+  non-Gen12 owners for Meteor Lake, Lunar Lake and the exact opted-in
+  Panther/Wildcat Lake routes. A missing PAT entry returns `NoDevice`. Their
+  pages take the route's PTE profile. The display-20 cursor's fault mask drops both
   PIPEDMC faults. `reserve` (Meteor Lake) is test-only; the cursor's `new`
   is removed. `intel_gpu_color::Owner::capture` admits `LunarLake` with
   `Profile::Mtl`.
@@ -2077,8 +2092,8 @@ WCL uses Linux's PTL device descriptor and PTL GuC selection but keeps its
 product identity in the canonical census and its GT policy in the distinct
 `GtPlatform::WildcatLake`. Runtime GMD checks admit only graphics
 30.03/30.04/30.05 and media 30.02. WCL skips the media-30.00-only GGTT dummy
-write and PTL graphics-30.00 A0 workarounds; display 30.02 still refuses before
-takeover.
+write and PTL graphics-30.00 A0 workarounds. Its display-preserving GT path
+requires the opted-in display 30.02 route and the owned panel on Pipe A.
 NVL-S has a distinct `GtPlatform::NovaLakeS`, DMA46/root4/VA48 and source
 Xe2 cache policy. It requests `xe/nvl_guc_70.bin` first. A missing registry
 entry triggers lookup of Linux 7.0-rc7's `xe/nvl_guc_70.55.4.bin`.

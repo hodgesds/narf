@@ -61,8 +61,8 @@ pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8
 }
 
 /// [`display_pte`] for an owner whose install proved its display IP:
-/// Panther Lake is owned only as display 30.00 (the opted-in route), whose
-/// GEM scanout PTEs are the Xe2 format at xe_pat.c's display
+/// Panther Lake (30.00) and Wildcat Lake (30.02) use the Xe2 format
+/// for GEM scanout PTEs at xe_pat.c's display
 /// `idx[XE_CACHE_NONE]` = 3 (`xe3_lpg_pat_table[3]` =
 /// `XE2_PAT(0, 0, 0, 3, 3, 0)`, the same uncached entry as Xe2). Every
 /// other generation keeps [`display_pte`].
@@ -71,9 +71,7 @@ pub(crate) const fn display_pte_ip(
     ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
 ) -> Option<(PteFormat, u8)> {
     match (generation, ip) {
-        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
-            Some((PteFormat::Xe2, 3))
-        }
+        (Generation::PantherLake, Some(ip)) if ip.is_display30() => Some((PteFormat::Xe2, 3)),
         _ => display_pte(generation),
     }
 }
@@ -91,13 +89,13 @@ pub(crate) const fn display_pte_for(
 }
 
 /// [`owned_status`] for an owner whose install proved its display IP:
-/// display 30.00 takes `gen8_de_pipe_fault_mask`'s display >= 20 set.
+/// both display-30 IPs take `gen8_de_pipe_fault_mask`'s display >= 20 set.
 pub(crate) const fn owned_status_ip(
     generation: Generation,
     ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
 ) -> u32 {
     match (generation, ip) {
-        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
+        (Generation::PantherLake, Some(ip)) if ip.is_display30() => {
             owned_status(Generation::LunarLake)
         }
         _ => owned_status(generation),
@@ -122,17 +120,14 @@ pub(crate) const fn owned_status_for(
 }
 
 /// [`display_pat_programmed`] for an owner whose install proved its display
-/// IP: display 30.00 requires the GT owner's `PAT_INDEX(3)` to read 0x3c.
-#[allow(dead_code)]
+/// IP: display 30 requires the GT owner's `PAT_INDEX(3)` to read 0x3c.
 pub(crate) fn display_pat_programmed_ip(
     io: &(impl MmioWindow + ?Sized),
     generation: Generation,
     ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
 ) -> bool {
     match (generation, ip) {
-        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
-            io.read32(0x480c) == 0x3c
-        }
+        (Generation::PantherLake, Some(ip)) if ip.is_display30() => io.read32(0x480c) == 0x3c,
         _ => display_pat_programmed(io, generation),
     }
 }
@@ -272,8 +267,8 @@ impl<M: DisplayAccess> PollIo<M> {
         bar_len: u64,
     ) -> Result<Self, IoError> {
         // Lunar Lake is admitted only as display 20.00, which the KMS owner
-        // verified (GMD_ID_DISPLAY) before installing; Panther Lake only as
-        // the display 30.00 its install proved (`display_ip`).
+        // verified (GMD_ID_DISPLAY) before installing. Panther and Wildcat
+        // Lake carry their exact display-30 identity through `display_ip`.
         let Some((format, _)) =
             display_pte_for(generation, mmio.display_ip(), mmio.discrete_display())
         else {
