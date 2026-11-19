@@ -158,6 +158,36 @@ pub fn peek_cap_root(t: TaskId, cap: &Cap<Diagnostics, Read>) -> CapRootView;
 - No backdoor: these caps are minted by the boot process and can be
   revoked.
 
+### 3.5 Lockup detector decisions (`watchdog`)
+
+```rust
+pub const WATCHDOG_THRESH_SECS: u64 = 10;          // Linux watchdog_thresh
+pub struct CpuSample { pub online: bool, pub halted: bool,
+                       pub sched_passes: u64, pub timer_ticks: u64 }
+pub enum Lockup { Soft { stuck_ns: u64, first: bool }, Hard { stuck_ns: u64 } }
+pub struct CpuWatch;                 // per-CPU state, const-constructible
+impl CpuWatch {
+    pub fn touch(&self, s: &CpuSample, now_ns: u64);
+    pub fn observe(&self, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup>;
+}
+pub struct LockupWatch<const CPUS: usize>;
+impl<const CPUS: usize> LockupWatch<CPUS> {
+    pub fn begin_round(&self, now_ns: u64, thresh_ns: u64) -> bool;
+    pub fn observe(&self, cpu: usize, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup>;
+}
+```
+
+Pure decision logic of Linux's `kernel/watchdog.c` over samples the caller
+takes (the `frame/` stall watchdog, from the timer tick). A **soft lockup**
+is an awake CPU with no executor scheduling point for `2 * thresh`,
+reported then and every `2 * thresh` while it lasts (`first` marks the
+episode's first report). A **hard lockup** is an awake CPU with neither a
+timer interrupt nor a scheduling point for `thresh`, reported once per
+episode. A halted CPU is responsive and touches both detectors, so an idle
+system never reports; `thresh == 0` disables both. `begin_round` returns
+`false` (and re-baselines every CPU) when the previous round is more than
+`2 * thresh` old — the checker itself did not run (suspend, paused VM).
+
 ## 4. Invariants & safety properties
 
 - `panic_hook` completes in bounded time even when the system is
