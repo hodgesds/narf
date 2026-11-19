@@ -1138,11 +1138,18 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
     // Module A loads + registers an exported symbol.
     let a = arc_test_module("a_dep", 0xFF);
     let _ = crate::registry::insert_unique(a.clone());
+    // Only a Live module can be unloaded (a Loading one is still running
+    // init), so bring A up first.
+    // SAFETY: freshly built module in state `Loading` with `init_addr` =
+    // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
+    if unsafe { crate::loader::invoke_init(&a) }.is_err() {
+        return TestResult::Fail("fixture init");
+    }
     // Simulate B holding a reference to A via the refcount.
     a.refcount.get();
-    // SAFETY: module `a` is in state `Loading`/`Live` with `exit_addr` =
-    // `noop_exit` (a real `extern "C"` fn); `invoke_exit` returns Busy on
-    // the held refcount before invoking exit, meeting its state contract.
+    // SAFETY: module `a` is Live with `exit_addr` = `noop_exit` (a real
+    // `extern "C"` fn); `invoke_exit` returns Busy on the held refcount
+    // before invoking exit, meeting its state contract.
     // SAFETY: Valid memory or trusted environment
     let unload = unsafe { crate::loader::invoke_exit(&a) };
     match unload {

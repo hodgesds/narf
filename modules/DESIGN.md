@@ -27,8 +27,9 @@ Known gaps, each expanded where it belongs below:
     core.** x86_64 enforces image/data placement through PKS or PCID;
     MTE-capable aarch64 enforces tagged module allocations but cannot tag the
     PC-relative executable image. See §2.
-  * **A task preempted inside module code can resume on unmapped
-    text.** See §6.
+  * ~~**A task preempted inside module code can resume on unmapped
+    text.**~~ Closed: unload starts only from Live with no call in flight.
+    See §6.
 
 The QEMU harness stages a rustc-built reference `.ko`; an in-kernel smoke
 loads it, executes its real relocated init/exit code, checks its
@@ -517,14 +518,31 @@ asserts:
     answers EBUSY. This is `try_module_get` moved from per-call to link
     time, which matches how NARF already handles cap requirements (§1).
 
-  * **A task preempted inside module code.** Still open, and distinct
-    from the above. `delete_module` unmaps the image once the refcount is
-    zero and the exports are swept, but a task that entered the module
-    before `invoke_exit` and was preempted inside it would resume on
-    unmapped text. Closing this needs a real grace period between the
-    sweep and the free. `rcu::sync()` is *not* it: `qsbr::sync_blocking`
-    drives quiescence locally and gives up after 8 rounds, so on SMP it
-    would supply the appearance of a grace period without the guarantee.
+  * ~~**A task preempted inside module code.**~~ **Closed**, by an
+    invariant rather than a grace period: module text is entered only
+    through `init`, `exit` and the module call gate
+    (`call_in_module_context`, behind every PCI/USB probe, poller, IRQ
+    pump, USB completion, netif TX and block request), and each entry is
+    accounted for under the module's state lock.
+    - A gate call checks Live and takes a reference under the state lock
+      and holds it until module text returns.
+    - `invoke_exit` moves Live → Going under the same lock, only with a
+      zero reference count, so no call is inside the module once it
+      succeeds and none can enter afterwards.
+    - It refuses a module that is still Loading (`init` runs without a
+      reference) and one already Going or Dead (a second unload would run
+      `exit` twice, possibly after the first unmapped it), both `-EBUSY`
+      as in Linux `delete_module`.
+    - Calls into another module's exports are pinned by the dependency
+      references above.
+
+    A refused unload changes nothing, so a busy module keeps working;
+    retry is the caller's (Linux `rmmod` behaves the same). A grace
+    period would only be needed if module text could be entered *without*
+    the gate; adding such a path means adding its accounting too.
+    `modules/e2e` covers unload during init, a concurrent second unload,
+    unload from inside a call, and e1000.ko unloading, reloading and
+    driving its NIC again.
   * **Livepatch.** Symbol ownership interacts with livepatch if a patched
     symbol is later unregistered; deferred until livepatch lands.
   * **`__reset_for_test` resets the MODULE_ID_ALLOC counter.** Tests that

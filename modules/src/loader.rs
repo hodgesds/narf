@@ -805,6 +805,23 @@ pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::Lifec
 /// re-entered this function partway).
 pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::LifecycleError> {
     let mut state = module.state.lock();
+    // Only a Live module may start unloading, and the Live -> Going step is
+    // taken under the state lock the module call gate checks. That makes it
+    // the single point after which no new call enters module text:
+    //   * Loading: `init` is still running module text without a reference;
+    //     unloading now would unmap it under the running init.
+    //   * Going / Dead: another unload owns the module. Letting a second one
+    //     through would run `exit` twice, the second time possibly after the
+    //     first has already unmapped the image.
+    if *state != ModuleState::Live {
+        return Err(crate::lifecycle::LifecycleError::BadState {
+            from: *state,
+            to: ModuleState::Going,
+        });
+    }
+    // Every gate call into module text holds a reference for its whole
+    // duration, taken under this same lock after checking Live, so a zero
+    // count here means no CPU is inside module text and none can enter.
     if !module.refcount.is_zero() {
         return Err(crate::lifecycle::LifecycleError::Busy(
             module.refcount.snapshot(),
