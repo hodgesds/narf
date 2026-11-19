@@ -13,6 +13,13 @@ struct Selector {
     peer: Option<[u8; 6]>,
 }
 fn selector(attrs: &[(u16, &[u8])]) -> Result<Selector, i32> {
+    // Key material (7) and the key-sequence container (80) are never valid
+    // GET_KEY request selectors: a malformed request (EINVAL), not an
+    // unsupported operation. Checked before `reject_unknown`, whose generic
+    // EOPNOTSUPP would otherwise mask them.
+    if attrs.iter().any(|(kind, _)| matches!(kind, 7 | 80)) {
+        return Err(EINVAL);
+    }
     reject_unknown(attrs, &[3, 6, 8, 55, 313])?;
     if attr(attrs, 313).is_some() {
         return Err(EINVAL);
