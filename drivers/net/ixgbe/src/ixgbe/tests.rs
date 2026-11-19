@@ -3673,7 +3673,7 @@ fn smoke_ixgbe_fdir_restore_conversation() -> TestResult {
         REG_FDIRM, REG_FDIRPORT, REG_FDIRSIPV6_BASE, REG_FDIRSKEY, REG_FDIRVLAN,
     };
     use super::fdir::{REG_FDIRDIP4M, REG_FDIRIP6M, REG_FDIRSIP4M, REG_FDIRTCPM, REG_FDIRUDPM};
-    use super::wol::REG_IP6AT_BASE;
+    use super::wol::{REG_IP6AT_BASE, REG_IPAV};
     let mut state = FdirState {
         config: Some(FdirConfig {
             mode: FdirMode::Perfect,
@@ -3747,6 +3747,7 @@ fn smoke_ixgbe_fdir_restore_conversation() -> TestResult {
         (REG_IP6AT_BASE + 4, 0),
         (REG_IP6AT_BASE + 8, 0),
         (REG_IP6AT_BASE + 12, 0x0200_0000),
+        (REG_IPAV, 0x0001_0000),
         (REG_FDIRSIPV6_BASE, 0x0A01_A8C0),
         (REG_FDIRSIPV6_BASE + 4, 0),
         (REG_FDIRSIPV6_BASE + 8, 0),
@@ -4467,7 +4468,7 @@ fn smoke_ixgbe_multiqueue_vector_routing_table() -> TestResult {
         return TestResult::Fail("IVAR[0] asymmetric routing wrong");
     }
     // q2 RX+TX v2 -> 0x8282; q3 RX-only v3 -> 0x830000 (TX field 0).
-    if bank.read32(REG_IVAR_BASE + 4) != 0x8300_8282 {
+    if bank.read32(REG_IVAR_BASE + 4) != 0x0083_8282 {
         return TestResult::Fail("IVAR[1] asymmetric routing wrong");
     }
     // q4 RX-only v4 -> 0x0084; q5 nothing -> high half 0.
@@ -4697,7 +4698,7 @@ fn smoke_ixgbe_vmdq_rss_composition() -> TestResult {
     if enable_vmdq_rss(&mut bank, &rss).is_err() {
         return TestResult::Fail("enable_vmdq_rss failed on a valid config");
     }
-    if bank.read32(REG_MRQC) != 0xFFF3_000B {
+    if bank.read32(REG_MRQC) != 0xFFFF_000B {
         return TestResult::Fail("MRQC VMDQRSS64EN word wrong");
     }
     if bank.read32(REG_MTQC) != 0x6 {
@@ -4762,7 +4763,7 @@ fn smoke_ixgbe_vmdq_rss_composition() -> TestResult {
         Err(VmdqError::BadRssQueues) => {}
         _ => return TestResult::Fail("VMDq RSS accepted an out-of-pool RETA entry"),
     }
-    if bank.read32(REG_MRQC) != 0xFFF3_000B {
+    if bank.read32(REG_MRQC) != 0xFFFF_000B {
         return TestResult::Fail("failed VMDq RSS call rewrote MRQC");
     }
     TestResult::Pass
