@@ -14,6 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 narf-boot-protocol = { path = "../../boot/protocol" }
+# `/proc/kallsyms` table: the encoder half of the format the kernel decodes.
+narf-kallsyms = { path = "../../observability/kallsyms", features = ["alloc"] }
+# Rust symbol demangling for that table, to the form `nm -C` prints.
+rustc-demangle = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 wait-timeout = "0.2"
