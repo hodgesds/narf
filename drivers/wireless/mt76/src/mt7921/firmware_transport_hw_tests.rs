@@ -473,7 +473,7 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     let expected = [
         0x2000003eu32,
         0x80026013,
-        0x8000000b,
+        0x8000200b,
         0x10007800,
         0,
         0,
@@ -538,6 +538,16 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             let ring = &hw.owner.storage.as_ref().unwrap().data;
             if ring.word(slot, 1) != (64 << 16) | LAST {
                 return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
+            }
+            // SAFETY: the fake device has no concurrent writer and this
+            // fixture owns the coherent TXD/TXP plus complete auth frame.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(ring.buffers[slot].cpu_ptr::<u8>(), 64 + frame.len())
+            };
+            if bytes[8..12] != 0x8000200bu32.to_le_bytes() || bytes[64..] != frame {
+                return TestResult::Fail(
+                    "published auth TXD lacks fixed-rate HTC_VLD or changed MPDU",
+                );
             }
             if hw.submit_management(
                 crate::mt7921::vif_slots::Vif::HOME,

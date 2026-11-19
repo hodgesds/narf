@@ -399,10 +399,10 @@ fn task_registry_snapshot() -> Vec<Arc<Task>> {
 /// is simply skipped by the caller's own lookup, which matches the racy
 /// nature of the Linux syscall anyway.
 pub fn task_ids() -> alloc::vec::Vec<u64> {
-    let mut ids: Vec<u64> = task_registry_snapshot()
-        .into_iter()
-        .map(|task| task.tid)
-        .collect();
+    let mut ids = Vec::new();
+    for shard in &TASKS {
+        ids.extend(shard.tasks.lock().keys().copied());
+    }
     ids.sort_unstable();
     ids
 }
@@ -772,11 +772,21 @@ pub fn __test_reset_cpu_ns(tid: u64) {
 /// CPU-time sum: the task still exists until it is reaped, and Linux keeps
 /// it in the group list until `release_task`.
 pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
-    let mut tids: Vec<u64> = task_registry_snapshot()
-        .into_iter()
-        .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
-        .map(|task| task.tid)
-        .collect();
+    let mut tids = Vec::new();
+    for shard in &TASKS {
+        // Procfs needs only matching IDs. The registry guard pins each Task
+        // during this atomic pid read; copying every Task Arc first made
+        // every per-process thread walk retain and drop the whole registry.
+        // No per-task work or nested lock runs while the shard is held.
+        tids.extend(
+            shard
+                .tasks
+                .lock()
+                .values()
+                .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
+                .map(|task| task.tid),
+        );
+    }
     tids.sort_unstable();
     tids
 }

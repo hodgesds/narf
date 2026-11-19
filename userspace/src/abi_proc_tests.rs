@@ -3728,6 +3728,55 @@ fn smoke_abi_proc_thread_group_member_index() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_thread_group_member_index);
 
+fn smoke_abi_proc_thread_list_index_lifecycle() -> TestResult {
+    use crate::handlers::{
+        __test_forget_task_pid, __test_forget_thread, __test_register_thread, proc_thread_list,
+        register_task_to_pid,
+    };
+    const PID: u64 = 0x7000_4100;
+    const LEADER: u64 = 0x7000_4200;
+    const THREAD: u64 = LEADER + 1;
+    const LINUX_TID: u64 = PID + 1;
+    const STALE: u64 = LEADER + 2;
+    const MOVED: u64 = LEADER + 3;
+
+    let leader = crate::task::Task::new_registered(LEADER, PID);
+    let thread = crate::task::Task::new_registered(THREAD, PID);
+    let moved = crate::task::Task::new_registered(MOVED, PID + 2);
+    register_task_to_pid(LEADER, PID);
+    __test_register_thread(LINUX_TID, THREAD, PID);
+    // Simulate teardown/exec windows: the index still names a removed Task
+    // or a Task whose authoritative group has already changed.
+    register_task_to_pid(STALE, PID);
+    register_task_to_pid(MOVED, PID);
+    let live = proc_thread_list(PID);
+    thread.state.store(
+        crate::task::TASK_ZOMBIE,
+        core::sync::atomic::Ordering::Release,
+    );
+    let zombie = proc_thread_list(PID);
+    crate::task::release_task(THREAD);
+    let reaped = proc_thread_list(PID);
+
+    __test_forget_thread(THREAD);
+    for tid in [LEADER, STALE, MOVED] {
+        __test_forget_task_pid(tid);
+    }
+    crate::task::release_task(LEADER);
+    crate::task::release_task(MOVED);
+    drop((leader, thread, moved));
+    if live != [PID, LINUX_TID] || zombie != live || reaped != [PID] {
+        return TestResult::Fail(
+            "proc thread index lost Linux IDs/zombies or exposed stale members",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi/proc_threads",
+    smoke_abi_proc_thread_list_index_lifecycle
+);
+
 /// Linux advertises `HWCAP2_FSGSBASE` (bit 1) in `AT_HWCAP2` whenever it turns
 /// CR4.FSGSBASE on (arch/x86/kernel/cpu/common.c); wasm2c and other runtimes
 /// read it to pick `WRGSBASE` over `arch_prctl`. NARF enables CR4.FSGSBASE, so

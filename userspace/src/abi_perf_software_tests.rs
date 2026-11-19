@@ -20,15 +20,21 @@ impl TestIrq {
     }
 
     fn fire(&self, fd: u32, user: bool) {
-        narf_lib::sync::without_interrupts(|| {
-            assert!(crate::perf_event::expire_software_clock_for_test(fd));
-            let state = narf_interrupts::InterruptedUserState {
+        self.fire_state(
+            fd,
+            narf_interrupts::InterruptedUserState {
                 user,
                 abi: 1,
                 ip: 0x1234_5678,
                 sp: 0,
                 regs: [0; 34],
-            };
+            },
+        );
+    }
+
+    fn fire_state(&self, fd: u32, state: narf_interrupts::InterruptedUserState) {
+        narf_lib::sync::without_interrupts(|| {
+            assert!(crate::perf_event::expire_software_clock_for_test(fd));
             narf_interrupts::on_irq_with_user_state(self.0, state.ip, Some(&state));
         });
     }
@@ -376,4 +382,308 @@ fn smoke_perf_software_clock_writable_mmap_syscall() -> TestResult {
 kernel_test_in!(
     "syscall_abi/perf_software_clock",
     smoke_perf_software_clock_writable_mmap_syscall
+);
+
+// Use the real IRQ producer and a poll callback: the callback must be able to
+// acquire the registry, and another IRQ arriving there must survive the drain.
+#[cfg(feature = "kernel-test")]
+fn smoke_perf_deferred_drain_liveness() -> TestResult {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct WakeProbe {
+        irq: Arc<TestIrq>,
+        fd: u32,
+        calls: AtomicUsize,
+        registry_free: AtomicBool,
+    }
+    impl Wake for WakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            if !crate::perf_event::sample_registry_unlocked_for_test() {
+                self.registry_free.store(false, Ordering::Relaxed);
+            }
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.irq.fire(self.fd, true);
+            }
+        }
+    }
+
+    with_setup(|| {
+        let irq = Arc::new(TestIrq::new()?);
+        let attr = PerfEventAttr {
+            type_: PERF_TYPE_SOFTWARE,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: PERF_COUNT_SW_CPU_CLOCK,
+            sample_period_or_freq: 1_000_000_000,
+            sample_type: PERF_SAMPLE_IP,
+            flags: PERF_ATTR_FLAG_DISABLED,
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("deferred clock open failed"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("deferred clock fd missing")?;
+        let frames = ops.mmap_frames(0, 8192).map_err(|_| "clock mmap failed")?;
+        let probe = Arc::new(WakeProbe {
+            irq: irq.clone(),
+            fd,
+            calls: AtomicUsize::new(0),
+            registry_free: AtomicBool::new(true),
+        });
+        let waker = core::task::Waker::from(probe.clone());
+        if ops.arm_readiness(FAKE_TASK, narf_filesystem::POLL_IN, &waker)
+            != Some(core::task::Poll::Pending)
+        {
+            return Err("empty clock ring was already readable");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("deferred clock enable failed");
+        }
+        irq.fire(fd, true);
+        let _ = call(Syscall::GetPid.raw(), SyscallArgs::default());
+        if read_word(frames[0], 1024) != 0 {
+            return Err("unrelated syscall drained perf work in the caller");
+        }
+        crate::perf_event::drain_irq_samples();
+        if probe.calls.load(Ordering::Relaxed) == 0 || !probe.registry_free.load(Ordering::Relaxed)
+        {
+            return Err("sample wake ran under the event registry lock");
+        }
+        if !crate::perf_event::sample_drain_pending_for_test() {
+            return Err("IRQ publication during drain lost its next-pass notification");
+        }
+        crate::perf_event::drain_irq_samples();
+        if read_word(frames[0], 1024) != 32 {
+            return Err("racing IRQ sample was lost or duplicated");
+        }
+        ops.disarm_readiness(FAKE_TASK);
+        // Closing the fd must also work while a consumer still retains the
+        // event. Its disabled, queued sample is discarded before final drop.
+        irq.fire(fd, true);
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_DISABLE, 0),
+        ) != Some(0)
+            || call(Syscall::Close.raw(), a0(fd as u64)) != Some(0)
+        {
+            return Err("closing a sampled event failed");
+        }
+        crate::perf_event::drain_irq_samples();
+        if read_word(frames[0], 1024) != 32 {
+            return Err("disabled event emitted its queued sample after close");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/perf_software_clock",
+    smoke_perf_deferred_drain_liveness
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_perf_x86_dwarf_register_record() -> TestResult {
+    use narf_linux_perf_uapi::{
+        PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL, PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER,
+        PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER,
+        PERF_SAMPLE_STACK_USER, PERF_SAMPLE_WEIGHT,
+    };
+
+    with_setup(|| {
+        let irq = TestIrq::new()?;
+        // Upstream perf --call-graph dwarf,4096 requests this exact register
+        // mask and excludes only its redundant frame-pointer user callchain.
+        let mut attr = PerfEventAttr {
+            type_: PERF_TYPE_SOFTWARE,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: PERF_COUNT_SW_CPU_CLOCK,
+            sample_period_or_freq: 99,
+            sample_type: PERF_SAMPLE_IP
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER
+                | PERF_SAMPLE_WEIGHT,
+            sample_regs_user: 0xff0fff,
+            sample_stack_user: 4096,
+            flags: PERF_ATTR_FLAG_DISABLED
+                | PERF_ATTR_FLAG_FREQ
+                | PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_USER,
+            ..PerfEventAttr::default()
+        };
+        let open = |attr: &PerfEventAttr| {
+            call(
+                Syscall::PerfEventOpen.raw(),
+                a3(attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            )
+        };
+        for unsupported in [12, 13, 14, 15, 24, 32] {
+            attr.sample_regs_user = 1u64 << unsupported;
+            if open(&attr) != Some(-crate::errno::EOPNOTSUPP) {
+                return Err("perf accepted an uncaptured segment/reserved/XMM register");
+            }
+        }
+        attr.sample_regs_user = 0xff0fff;
+        let fd = match open(&attr) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("upstream perf DWARF register mask/flags rejected"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| table.get(fd).map(|e| e.ops.clone()))
+            .flatten()
+            .ok_or("DWARF event fd missing")?;
+        let frames = ops.mmap_frames(0, 8192).map_err(|_| "DWARF mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("DWARF enable failed");
+        }
+        let mut regs = [0; 34];
+        // The real x86 trap packs these twenty values consecutively. On the
+        // wire the last eight correspond to Linux indices 16..23, not 12..19.
+        let expected = [
+            0xa0,
+            0xb0,
+            0xc0,
+            0xd0,
+            0x51,
+            0xd1,
+            0,
+            0,
+            0x1234_5678,
+            0x202,
+            0x23,
+            0x1b,
+            0x8888,
+            0x9999,
+            0xaaaa,
+            0xbbbb,
+            0xcccc,
+            0xdddd,
+            0xeeee,
+            0xffff,
+        ];
+        regs[..20].copy_from_slice(&expected);
+        irq.fire_state(
+            fd,
+            narf_interrupts::InterruptedUserState {
+                user: true,
+                abi: 1,
+                ip: 0x1234_5678,
+                sp: 0,
+                regs,
+            },
+        );
+        crate::perf_event::drain_irq_samples();
+        // PERIOD precedes CALLCHAIN. An empty stack has no dyn_size word;
+        // WEIGHT follows it immediately.
+        if read_word(frames[0], 1024) != 216
+            || read_word(frames[1], 0) >> 48 != 216
+            || read_word(frames[1], 16) != 1_000_000_000 / 99
+            || read_word(frames[1], 24) != 0 // excluded user callchain
+            || read_word(frames[1], 32) != 2 // Linux ABI_64, not ABI_32
+            || read_word(frames[1], 200) != 0
+            || read_word(frames[1], 208) != 0
+        {
+            return Err("DWARF user record has wrong ABI tag/shape");
+        }
+        for (index, value) in expected.iter().enumerate() {
+            if read_word(frames[1], 40 + index as u64 * 8) != *value {
+                return Err("DWARF register values do not follow Linux x86 numbering");
+            }
+        }
+        irq.fire(fd, false);
+        crate::perf_event::drain_irq_samples();
+        if read_word(frames[0], 1024) != 280
+            || read_word(frames[1], 216) >> 48 != 64
+            || read_word(frames[1], 232) != 1_000_000_000 / 99
+            || read_word(frames[1], 240) != 1 // kernel IP retained
+            || read_word(frames[1], 248) != 0x1234_5678
+            || read_word(frames[1], 256) != 0 // ABI_NONE, no register words
+            || read_word(frames[1], 264) != 0 // empty stack
+            || read_word(frames[1], 272) != 0
+        // weight
+        {
+            return Err("DWARF dropped or malformed a kernel-context sample");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        drop(ops);
+
+        attr.flags =
+            PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_FREQ | PERF_ATTR_FLAG_EXCLUDE_CALLCHAIN_KERNEL;
+        attr.sample_type = PERF_SAMPLE_IP
+            | PERF_SAMPLE_ID
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_READ
+            | PERF_SAMPLE_CALLCHAIN;
+        attr.sample_regs_user = 0;
+        attr.sample_stack_user = 0;
+        let fd = match open(&attr) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("kernel callchain exclusion rejected"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| table.get(fd).map(|e| e.ops.clone()))
+            .flatten()
+            .ok_or("callchain event fd missing")?;
+        let frames = ops
+            .mmap_frames(0, 8192)
+            .map_err(|_| "callchain mmap failed")?;
+        let mut event_id = 0u64;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ID, &mut event_id as *mut _ as u64),
+        ) != Some(0)
+        {
+            return Err("callchain event ID query failed");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("callchain enable failed");
+        }
+        irq.fire(fd, true);
+        crate::perf_event::drain_irq_samples();
+        irq.fire(fd, false);
+        crate::perf_event::drain_irq_samples();
+        // ID/PERIOD must precede both the counter READ and CALLCHAIN blocks.
+        if read_word(frames[0], 1024) != 104
+            || read_word(frames[1], 0) >> 48 != 56
+            || read_word(frames[1], 16) != event_id
+            || read_word(frames[1], 24) != 1_000_000_000 / 99
+            || read_word(frames[1], 40) != 1
+            || read_word(frames[1], 48) != 0x1234_5678
+            || read_word(frames[1], 56) >> 48 != 48
+            || read_word(frames[1], 72) != event_id
+            || read_word(frames[1], 80) != 1_000_000_000 / 99
+            || read_word(frames[1], 96) != 0
+        {
+            return Err("kernel callchain exclusion suppressed user samples or kept kernel frames");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/perf_software_clock",
+    smoke_perf_x86_dwarf_register_record
 );

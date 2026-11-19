@@ -263,7 +263,9 @@ pub fn pmu::update_sampling_period(counter: &pmu::PmuCounter, period: u64);
 #[cfg(target_arch = "x86_64")]
 pub fn pmu::last_overflow_period(cpu: usize, counter: usize) -> u64;
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
+// Caller supplies a mapped, device-typed virtual address. Current-CPU APIC
+// mode selection and mapping ownership live in narf_interrupts::x86_64::apic.
+pub unsafe fn pmi::program_lvt_pc(lapic_base: usize, vector: u8, nmi: bool, masked: bool);
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::alloc_cycle_counter() -> Result<pmu::CycleCounter, pmu::PmuError>;

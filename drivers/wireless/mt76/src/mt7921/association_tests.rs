@@ -39,6 +39,10 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     if plan.peer_record(42, true) != Err(Error::Busy) {
         return TestResult::Fail("station marked associated before AP response");
     }
+    let initial = plan.peer_record(0, false).unwrap();
+    if initial[16] != 2 || initial[64] != 0 || initial[18..20] != [0, 0] {
+        return TestResult::Fail("initial firmware peer differs from Linux sta_add NONE state");
+    }
     let auth = plan.start_authentication().unwrap().to_vec();
     if auth.len() != 30
         || auth[24..] != [0, 0, 1, 0, 0, 0]
@@ -72,7 +76,7 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     if record.len() != 120
         || record[..8] != [0, 1, 5, 0, 1, 0, 0, 0]
         || record[8..16] != [0, 0, 20, 0, 2, 0, 1, 0]
-        || record[16] != 1
+        || record[16] != 2
         || record[64] != 2
         || record[18..20] != [42, 0]
         || record[20..26] != AP
@@ -80,7 +84,7 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
         || record[68..80] != [13, 0, 52, 0, 1, 1, 3, 0, 0, 0, 0, 0]
         || record[112..120] != [6, 0, 8, 0, 1, 0, 1, 0]
     {
-        return TestResult::Fail("station/WTBL layout or controlled port prematurely secured");
+        return TestResult::Fail("station/WTBL layout or firmware enabled-peer state");
     }
     let key = [0xabu8; 16];
     let sec_rec = plan.secure_peer_record(42, &key).unwrap();

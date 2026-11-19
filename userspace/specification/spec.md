@@ -25,6 +25,12 @@ applications above NARF.
 
 ## 3. Public interface
 
+`proc_thread_list` enumerates the maintained thread-group membership index,
+then validates each member against the task registry outside the index lock.
+It includes registered zombies until reap, rejects stale or moved members,
+and translates scheduler task IDs to namespace-visible Linux thread IDs.
+Listing one process's threads does not snapshot unrelated tasks.
+
 The `native-ring` Cargo feature is off by default. Enabling it registers
 `Bootstrap` (0x4001) and `RingKick` (0x4003), compiles native session/dispatcher
 support, and forwards the feature to `narf-abi` and `narf-scheduler`.
@@ -1667,19 +1673,27 @@ close.
 On x86_64, sampled hardware events arm the owned GP counter for
 interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
 hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
-the complete Linux-numbered user register file, up to 8 KiB of resident user
+the native user register snapshot, up to 8 KiB of resident user
 stack, counter identity, and the overflow's exact period into a bounded
 64-entry per-CPU ring without allocation or user faults. A dedicated task is
 woken through an IRQ-safe readiness cell; timer and PMI callbacks do not call
-the allocating global I/O-waiter wake hook. That task and normal syscall
-context drain those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
-advances `data_head` with release ordering, and wakes poll/epoll readers.
+the allocating global I/O-waiter wake hook. Tracepoint producers, including
+loss-only publications, wake the same task. A release/acquire CPU mask limits
+its drain to queues with published work and preserves arrivals racing a drain.
+Ordinary syscall dispatch does not scan perf queues. The consumer retains event
+references under the registry lock, then releases it before record encoding,
+readiness callbacks, refresh expiry or reference destruction. It emits
+`PERF_RECORD_SAMPLE`/`LOST`, advances `data_head` with release ordering, and wakes
+poll/epoll readers.
 If that IRQ ring is full, loss is aggregated by the event ID active on each
 overflowed physical counter, so later counter reuse cannot transfer loss to a
 different event.
 Task-scoped samples are admitted by task/inheritance ownership; system-wide
 samples are admitted by the pending slot's source CPU matching the event's
 owning CPU, without requiring a synthetic target task.
+On x86_64, remote counter allocation/control uses fixed IPIs in both x2APIC
+and permanently mapped xAPIC mode; xAPIC alone is not a reason to reject a
+system-wide hardware event.
 Committed exec, comm-change, fork/clone-process, and process-exit paths emit
 Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
 attribute bits are selected. Variable records are eight-byte aligned;
@@ -1707,12 +1721,24 @@ enabled/running scaling times, IDs, and loss fields when selected.
 Sample records also serialize `ADDR`, `CALLCHAIN`, `RAW`, `REGS_USER`,
 `STACK_USER`, `WEIGHT`, `DATA_SRC`, `TRANSACTION`, `PHYS_ADDR`,
 `DATA_PAGE_SIZE`, and `WEIGHT_STRUCT` in Linux
-field order. Counting PMUs provide no sampled memory address or load/store
+field order. In particular, `ID`, `STREAM_ID`, `CPU` and `PERIOD` precede the
+variable-length `READ` and `CALLCHAIN` blocks, regardless of sample-bit order.
+Counting PMUs provide no sampled memory address or load/store
 metadata, so those fields carry Linux's unavailable value (`0`). Callchains
 start at the exact interrupted IP and walk validated, monotonically increasing
 x86 RBP or aarch64 X29 frames only within the captured stack. The register and
 stack payload also gives upstream perf the real input needed for offline DWARF
 and symbol unwind; mapping records name the corresponding ELF images.
+The exporter translates the compact x86 trap register image to Linux indices:
+AX..SS at 0..11, R8..R15 at 16..23 (mask `0xff0fff`); DS/ES/FS/GS and XMM
+registers remain unsupported. Native 64-bit register records use Linux's
+`PERF_SAMPLE_REGS_ABI_64` tag (2). Without a captured user image, the record
+contains `ABI_NONE` (0) and no register words, preserving the kernel sample.
+Callchain user/kernel exclusions suppress only the selected callchain context,
+independently of register/stack collection and counting exclusions. In
+particular, DWARF's `exclude_callchain_user` keeps the requested user register
+and stack payload. Stack records never exceed `sample_stack_user`; an empty
+stack omits Linux's conditional `dyn_size` word.
 Sample headers identify user versus kernel context through `misc`, and their
 CPU field identifies the captured source CPU even when another CPU drains it.
 Sample and COMM/MMAP/FORK/EXIT records export Linux process/thread IDs;

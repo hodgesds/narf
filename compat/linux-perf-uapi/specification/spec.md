@@ -15,7 +15,9 @@ alignment on NARF's supported 64-bit architectures.
 
 The crate exports `PerfEventAttr`, `PerfEventHeader`, attribute-size constants,
 event/config constants, sample/read-format bits, attribute flag bits, and
-record type/misc constants.
+record type/misc constants, and `PERF_SAMPLE_REGS_ABI_{NONE,32,64}` tags.
+Callchain exclusion flags describe stack collection independently of the
+sample's user/kernel counting exclusions.
 
 ## 4. Invariants
 

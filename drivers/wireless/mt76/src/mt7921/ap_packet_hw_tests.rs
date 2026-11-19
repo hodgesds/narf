@@ -34,6 +34,8 @@ fn mt76_ap_actual_peer_and_bmc_raw_descriptors_require_both_packet_receipts() ->
             let payload = ring.buffers[0].dma_addr().raw() + 64;
             if words[(TX_DATA + 8) as usize / 4] != 1
                 || word(4) != 0x80026000 | u32::from(wcid)
+                || word(8) & ((1 << 31) | (1 << 13))
+                    != if wcid == 19 { (1 << 31) | (1 << 13) } else { 0 }
                 || word(12) & ((1 << 1) | (1 << 31)) != 0
                 || bytes[64..128] != frame
                 || word(40) != payload as u32

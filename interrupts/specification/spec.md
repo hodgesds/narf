@@ -60,7 +60,16 @@ pub enum IrqTarget {
 pub fn end_of_interrupt(n: IrqNum);
 pub fn trigger_sw(n: IrqNum, target_cpu: CpuId);
 
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn apic::program_current_lvt_pc(vector: u8, masked: bool) -> bool;
+// Requires CPL0, completed APIC bring-up and ownership of the current CPU's
+// LVT-PC. Uses the x2APIC MSR or the permanent device-typed xAPIC mapping;
+// returns false when that mapping is absent, never using a physical pointer.
+
 pub struct InterruptedUserState {
+    // Native trap layout: x86 AX..SS, R8..R15 packed into the first 20 slots;
+    // aarch64 X0..X30, SP, PC, PSTATE. abi=1 marks native 64-bit capture.
+    // Consumers translate this layout before exporting a userspace ABI.
     pub user: bool,
     pub abi: u64,
     pub ip: u64,
@@ -444,7 +453,7 @@ pattern.
 
 The in-kernel trap entry (`frame/`) calls
 `narf_interrupts::on_irq_with_user_state(vector, state)` followed by `eoi()`.
-The state contains the architecture's Linux perf register image when the IRQ
+The state contains the architecture's native register image when the IRQ
 interrupted userspace. Synthetic/test callers may use `on_irq(vector)`, which
 supplies no user state. A synchronous handler can read the contextual value
 through `interrupted_user_state()` (or its IP through `interrupted_ip()`) only

@@ -2397,7 +2397,7 @@ fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
         return TestResult::Fail("channel switch command not emitted");
     }
     // Actual unified command payload starts at48. The Open associated
-    // peer has CONN_STATE_PORT_SECURE=2 and AID42, unlike initial setup.
+    // peer has CONN_STATE_PORT_SECURE=2 and AID42; initial setup has AID0.
     let sta_rec = frames.iter().find(|(scatter, f)| {
         !scatter
             && f.len() >= 168
@@ -2478,6 +2478,79 @@ fn mcu_live_join_peer_rejection_and_timeout() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mcu_live_join_peer_rejection_and_timeout
+);
+
+fn mcu_live_join_enabled_firmware_peer_does_not_authorize_host_data() -> TestResult {
+    use crate::mt7921::association::Security;
+    for protected in [false, true] {
+        let (mut session, bss) = wmm_tests::prepared(false, protected);
+        let hold = Arc::new(ap_runtime_tests::Hold::default());
+        session.backend.packet_hold = Some(hold.clone());
+        let security = if protected {
+            Security::Wpa2Psk { psk: [0x55; 32] }
+        } else {
+            Security::Open
+        };
+        let start = session.backend.frames.len();
+        let mut join = alloc::boxed::Box::pin(session.associate_station(
+            &bss,
+            b"narf",
+            security,
+            test_permission(),
+            &[],
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..8192 {
+            if join.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail("join completed without authentication TX retirement");
+            }
+            if hold.seen.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        // A cancelled waiter must preserve the same closed host port while
+        // the firmware owns its enabled peer and authentication token.
+        drop(join);
+        if !hold.seen.load(Ordering::Acquire)
+            || session.state != State::Running(Stage::Authenticate)
+            || session.backend.receive_open
+            || session.station.security.is_some()
+        {
+            return TestResult::Fail("held authentication opened host state or capture");
+        }
+        let frames = &session.backend.frames[start..];
+        let Some(auth) = frames.iter().position(|(_, f)| f.first() == Some(&0xb0)) else {
+            return TestResult::Fail("initial authentication TX missing");
+        };
+        let Some((_, peer)) = frames[..auth]
+            .iter()
+            .rev()
+            .find(|(_, f)| f.len() >= 168 && f[34..36] == [3, 0] && f[43] == 7 && f[49] == 1)
+        else {
+            return TestResult::Fail("authentication TX preceded enabled firmware peer");
+        };
+        // Unified payload begins at48: BASIC.conn_state +16, AID +18,
+        // STATE.state +64. Linux sta_add enables the peer with MLME NONE.
+        if peer[64] != 2 || peer[66..68] != [0, 0] || peer[112] != 0 {
+            return TestResult::Fail("pre-authentication firmware peer differs from Linux sta_add");
+        }
+        let mut ethernet = vec![0xff; 18];
+        ethernet[6..12].copy_from_slice(&wmm_tests::NETWORK.station);
+        ethernet[12..14].copy_from_slice(&[8, 0]);
+        if session.start_ethernet(&ethernet) != Err(Error::Busy)
+            || session
+                .receive_ethernet()
+                .is_ok_and(|frame| frame.is_some())
+            || session.backend.receive_open
+        {
+            return TestResult::Fail("enabled firmware peer bypassed host Ethernet port");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mcu_live_join_enabled_firmware_peer_does_not_authorize_host_data
 );
 
 fn mcu_live_join_cnm_roc_and_pre_auth_timing_rlm() -> TestResult {

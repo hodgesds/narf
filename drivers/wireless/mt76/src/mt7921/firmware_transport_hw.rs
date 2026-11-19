@@ -894,10 +894,15 @@ impl Hardware {
             ("rx-post", &storage.rx[1], true),
             ("rx-data", &storage.rx[2], true),
         ] {
-            let slot = if rx || ring.pending {
+            let slot = if rx {
                 ring.index
             } else {
-                (ring.index + DEPTH - 1) % DEPTH
+                // The producer has already advanced. Inspect the oldest
+                // owned token's slot, not the next empty descriptor.
+                storage
+                    .tokens
+                    .pending_head()
+                    .map_or((ring.index + DEPTH - 1) % DEPTH, |(_, _, slot, _, _)| slot)
             };
             dma_barrier();
             let _ = writeln!(
@@ -909,6 +914,26 @@ impl Hardware {
                 ring.pending,
                 ring.word(slot, 1),
             );
+            if !rx && storage.tokens.pending_head().is_some() {
+                let mut header = [0u32; 16];
+                for (word, value) in header.iter_mut().enumerate() {
+                    // SAFETY: the retained token owns this coherent slot;
+                    // all 64 TXD/TXP bytes are in-bounds. No payload/key bytes
+                    // are read, and volatile sampling is only on timeout.
+                    *value = u32::from_le(unsafe {
+                        ring.buffers[slot]
+                            .cpu_ptr::<u32>()
+                            .add(word)
+                            .read_volatile()
+                    });
+                }
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "mt76: associate tx-header slot={slot} txd={:08x?} txp={:08x?}",
+                    &header[..8],
+                    &header[8..],
+                );
+            }
         }
     }
 

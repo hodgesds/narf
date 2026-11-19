@@ -14904,8 +14904,14 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
 /// `task_pid_nr_ns(task, ns)` and skips a thread invisible in `ns`
 /// (fs/proc/base.c); `proc_pid_report` is that filter-and-translate.
 pub fn proc_thread_list(pid: u64) -> alloc::vec::Vec<u64> {
-    crate::task::thread_group_tids(pid)
+    // The reverse index bounds this walk to the requested group. Validate
+    // after releasing its lock: reap may remove the Task before its index
+    // entry, and exec can move a member to another group.
+    thread_group_members(pid)
         .into_iter()
+        .filter(|&tid| {
+            crate::task::task_get(tid).is_some_and(|task| task.pid.load(Ordering::Relaxed) == pid)
+        })
         .filter_map(|task| proc_pid_report(task_to_linux_tid_raw(task).unwrap_or(pid)))
         .filter(|&v| v != 0)
         .collect()

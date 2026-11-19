@@ -441,8 +441,10 @@ pub fn on_irq(vector: u8) {
     on_irq_with_context(vector, 0);
 }
 
-/// Architecture-neutral interrupted user register snapshot. `regs` uses the
-/// Linux perf register numbering for the current architecture.
+/// Interrupted native register snapshot. x86 stores AX..SS at 0..12 and
+/// R8..R15 at 12..20 (no DS/ES/FS/GS slots); aarch64 stores X0..X30, SP, PC,
+/// PSTATE. `abi == 1` is the trap's native-64 marker, not Linux's ABI enum.
+/// The perf exporter translates both numbering and ABI tag to the wire format.
 #[derive(Clone, Copy, Debug)]
 pub struct InterruptedUserState {
     pub user: bool,

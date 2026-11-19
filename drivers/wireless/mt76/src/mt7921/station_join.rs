@@ -2151,8 +2151,9 @@ impl<B: Backend> Session<B> {
                 .finish_ap_timing(!matches!(band, crate::mt7921::channel::Band::Ghz2), false)?;
             self.check_station_tx()?;
 
-            // Publish BSSID and an unauthorized AP WCID before management
-            // or EAPOL RX; a scan-only BSS has no peer address installed.
+            // Publish BSSID and enable the firmware AP WCID before management
+            // or EAPOL RX, like Linux sta_add. Host data authorization remains
+            // closed until MLME/RSNA completes; a scan-only BSS has no peer.
             let mut bss_record =
                 crate::mt7921::association::bss_record_qos_on(self.station.link, bss, false, false)
                     .map_err(|_| Error::Bounds)?;
