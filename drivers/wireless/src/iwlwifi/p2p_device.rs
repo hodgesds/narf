@@ -260,8 +260,14 @@ impl Child {
                 // authority; all old requests and filters stay retired.
                 *self.role.lock() = narf_net::native_emission::ProviderLifetime::new();
                 self.stop_requested.store(false, Ordering::Release);
+            // The retained stop is local teardown (firmware REMOVE
+            // commands plus local state retirement), not new RF work, so it
+            // runs even when quarantined: refusing it strands the worker
+            // engaged forever, since the Service path is gated the same
+            // way and the stop poll then fails with HardwareError. The
+            // Stop work item's own error result is swallowed (no reply);
+            // only the engaged flag gates completion.
             } else if idle
-                && !self.parent.quarantined()
                 && self
                     .enqueue(Operation::Stop, None, None, None, None)
                     .is_ok()
