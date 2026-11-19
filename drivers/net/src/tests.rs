@@ -3708,14 +3708,27 @@ kernel_test_in!("drivers/net/core", smoke_netdev_rx_dispatch_mirror_contract);
 fn smoke_netdev_single_pump_construction_r8169() -> TestResult {
     const SRC: &str = include_str!("../realtek/src/r8169.rs");
 
+    // Pin production construction only: the `mod tests` module at the
+    // end of the file holds `TxTimeoutFixture`, which legitimately
+    // builds its own channel pair for its private `RtlNic` instance
+    // (it never calls `spawn_pumps`). Counting the whole file would
+    // see two pairs and false-fail; the invariant is about the one
+    // production pair in `bring_up`.
+    let Some(tests_start) = SRC.find("\nmod tests {") else {
+        return TestResult::Fail(
+            "r8169 test module not found — source layout changed, re-verify the single-pump invariant",
+        );
+    };
+    let prod_src = &SRC[..tests_start];
+
     // One channel pair per device: one RX channel + one TX channel.
-    if SRC.matches("channel::<Frame").count() != 2 {
+    if prod_src.matches("channel::<Frame").count() != 2 {
         return TestResult::Fail(
             "r8169 creates more (or fewer) than one IPC channel pair — duplicate-pump risk",
         );
     }
     // One `spawn_pumps` definition + exactly one call site.
-    if SRC.matches("spawn_pumps(").count() != 2 {
+    if prod_src.matches("spawn_pumps(").count() != 2 {
         return TestResult::Fail(
             "r8169 has more (or fewer) than one spawn_pumps call site — duplicate-pump risk",
         );
@@ -3723,15 +3736,15 @@ fn smoke_netdev_single_pump_construction_r8169() -> TestResult {
     // The probe body — from `pub fn probe(` up to the `spawn_pumps`
     // definition that follows it — must create no channels and
     // spawn no pumps.
-    let Some(probe_start) = SRC.find("pub fn probe(") else {
+    let Some(probe_start) = prod_src.find("pub fn probe(") else {
         return TestResult::Fail(
             "r8169 probe not found — source layout changed, re-verify the single-pump invariant",
         );
     };
-    let Some(spawn_def) = SRC[probe_start..].find("\nfn spawn_pumps(") else {
+    let Some(spawn_def) = prod_src[probe_start..].find("\nfn spawn_pumps(") else {
         return TestResult::Fail("r8169 spawn_pumps no longer follows probe — source layout changed, re-verify the single-pump invariant");
     };
-    let probe_body = &SRC[probe_start..probe_start + spawn_def];
+    let probe_body = &prod_src[probe_start..probe_start + spawn_def];
     if probe_body.contains("channel::") || probe_body.contains("spawn_pumps(") {
         return TestResult::Fail(
             "r8169 probe creates channels or spawns pumps — a second pump pair would orphan the mirror sink",
