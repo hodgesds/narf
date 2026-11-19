@@ -9,6 +9,11 @@ use super::{
     device_init::Endpoints,
     packet_codec::{self, Kind, Record, MAX_TRANSFER},
 };
+// `Box` is unused in this module, but the test submodule reaches it via
+// `use super::*;`: `async_trait` expansion and `Box::pin` both need it in
+// scope. Keep the import; the allow silences clippy's unused_imports lint.
+#[allow(unused_imports)]
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use narf_drivers_usb::device::UsbError;
 
