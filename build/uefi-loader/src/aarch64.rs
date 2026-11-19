@@ -7,7 +7,7 @@ use core::{ptr, slice};
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     cstr16, entry, guid,
-    mem::memory_map::{MemoryDescriptor, MemoryMap},
+    mem::memory_map::MemoryMap,
     prelude::Status,
     proto::media::file::{File, FileAttribute, FileMode, RegularFile},
     system,
@@ -528,8 +528,13 @@ fn load_and_start() -> Result<(), LoadError> {
     }
     // The post-EBS markers bypass boot services entirely (direct PL011
     // writes), but only when a PL011 was positively identified before
-    // ExitBootServices — see `pl011_available`.
-    let probe = pl011_available(&map);
+    // ExitBootServices — see `pl011_available`. The DTB is the
+    // (possibly relocated) firmware tree, header-validated above and
+    // re-validated after the copy; its range stays live until EBS.
+    // SAFETY: `dtb` points at the validated DTB and `dtb_size` is its
+    // total size, so the slice covers exactly the firmware tree.
+    let dtb_blob = unsafe { slice::from_raw_parts(dtb as *const u8, dtb_size) };
+    let probe = pl011_available(dtb_blob);
     let uart = probe.is_available();
     if !uart {
         uefi::println!(
@@ -1154,23 +1159,22 @@ fn copy_segment_piece(
 }
 
 /// Outcome of the PL011 probe, with the failure reason attached. The
-/// verdict logic is the guard's: the map must list the address as MMIO
-/// and the ID block must read as a PL011. The reason is carried so the
-/// [hang147] diagnostic can report *why* the post-EBS markers were
-/// disabled from runtime evidence — the log on sighting #150 recorded
-/// no reason. Prints only; the verdict is unchanged.
+/// verdict logic is the guard's: the DTB must describe a PL011 at the
+/// UART address, and the ID block must read as a PL011. The reason is
+/// carried so the [hang147] diagnostic can report *why* the post-EBS
+/// markers were disabled from runtime evidence — the log on sighting
+/// #150 recorded no reason, and the why-reporting on sighting #154
+/// showed the old memory-map half could never pass: AAVMF's
+/// `GetMemoryMap()` contains no entry covering the UART address.
+/// Prints only; the verdict is unchanged.
 #[derive(Debug)]
 enum Pl011Probe {
     /// Both halves passed; post-EBS markers may write to the UART.
     Available,
-    /// No memory-map MMIO entry covers the UART address. `before` and
-    /// `after` are the nearest map entries bracketing the address
-    /// (nearest first in each direction), so the log shows what the
-    /// map actually contains there.
-    NoMmioEntry {
-        before: [Option<MemoryDescriptor>; 2],
-        after: [Option<MemoryDescriptor>; 2],
-    },
+    /// The DTB describes no PL011 at the UART address. `found` is the
+    /// base of the first `arm,pl011` node with a decodable `reg`, if
+    /// any such node exists at all.
+    NoDtbUart { found: Option<u64> },
     /// The ID block did not read as a PL011; the six raw bytes read,
     /// in register order (periph ID0/ID1, cell ID0–ID3).
     IdMismatch { id: [u8; 6] },
@@ -1187,27 +1191,17 @@ impl Pl011Probe {
     fn print_why(&self) {
         match self {
             Self::Available => {}
-            Self::NoMmioEntry { before, after } => {
+            Self::NoDtbUart { found: None } => {
                 uefi::println!(
-                    "NARF UEFI loader: [hang147] why: no MMIO map entry covers {:#x}",
+                    "NARF UEFI loader: [hang147] why: no arm,pl011 node with a decodable reg in the DTB"
+                );
+            }
+            Self::NoDtbUart { found: Some(addr) } => {
+                uefi::println!(
+                    "NARF UEFI loader: [hang147] why: DTB PL011 at {:#x}, not {:#x}",
+                    addr,
                     PL011_BASE
                 );
-                // Ascending address order: second-nearest below, nearest
-                // below, nearest above, second-nearest above.
-                for entry in [before[1], before[0], after[0], after[1]]
-                    .into_iter()
-                    .flatten()
-                {
-                    let end = entry
-                        .phys_start
-                        .saturating_add(entry.page_count.saturating_mul(PAGE_SIZE));
-                    uefi::println!(
-                        "NARF UEFI loader: [hang147] why: nearest map {:?} {:#x}-{:#x}",
-                        entry.ty,
-                        entry.phys_start,
-                        end
-                    );
-                }
             }
             Self::IdMismatch { id } => {
                 uefi::println!(
@@ -1219,44 +1213,59 @@ impl Pl011Probe {
     }
 }
 
-/// Is there a real PL011 at the QEMU `virt` UART address? Both halves are
-/// checked while boot services are live: the memory map must list the
-/// address as MMIO, and the PrimeCell ID block must read as a PL011. The
-/// result is carried into the post-EBS stages, where no firmware service
-/// can answer the question anymore — and where a wrong guess would write
-/// marker bytes into an unrelated device's registers.
-fn pl011_available(map: &impl MemoryMap) -> Pl011Probe {
-    // Nearest entries bracketing PL011_BASE, for the [hang147]
-    // diagnostic. Tracked by comparison, not iteration order: the map
-    // is sorted in practice but the trait does not promise it.
-    let mut before: [Option<MemoryDescriptor>; 2] = [None; 2];
-    let mut after: [Option<MemoryDescriptor>; 2] = [None; 2];
-    let mut mmio = false;
-    for d in map.entries().copied() {
-        let end = d
-            .phys_start
-            .saturating_add(d.page_count.saturating_mul(PAGE_SIZE));
-        if d.ty == MemoryType::MMIO && d.phys_start <= PL011_BASE && PL011_BASE < end {
-            mmio = true;
-        }
-        if d.phys_start <= PL011_BASE {
-            if before[0].is_none_or(|b| d.phys_start >= b.phys_start) {
-                before[1] = before[0];
-                before[0] = Some(d);
-            } else if before[1].is_none_or(|b| d.phys_start >= b.phys_start) {
-                before[1] = Some(d);
+/// Scan the DTB for `arm,pl011` nodes. Returns `(at_base, first)`:
+/// whether any such node's `reg` base is the UART address, and the
+/// base of the first `arm,pl011` node with a decodable `reg` (for the
+/// why-report when none sits at the UART address). The `reg` layout
+/// follows whatever `#address-cells` / `#size-cells` the DTB's parent
+/// declares — QEMU's `virt` tree uses 2/2 with
+/// `reg = <0x0 0x09000000 0x0 0x1000>` on `serial@9000000`, but
+/// nothing here assumes that shape. A malformed DTB simply yields no
+/// match (the walker returns early), so the probe fails safe.
+fn dtb_pl011(dtb: &[u8]) -> (bool, Option<u64>) {
+    let mut first: Option<u64> = None;
+    let mut at_base = false;
+    narf_firmware_fdt::for_each_compatible(dtb, "arm,pl011", |_path, props, cells| {
+        let mut base = None;
+        for (name, value) in props {
+            if name == "reg" {
+                base = cells.read_one_reg(value, 0).map(|(addr, _size)| addr);
+                break;
             }
-        } else if after[0].is_none_or(|a| d.phys_start <= a.phys_start) {
-            after[1] = after[0];
-            after[0] = Some(d);
-        } else if after[1].is_none_or(|a| d.phys_start <= a.phys_start) {
-            after[1] = Some(d);
         }
+        if let Some(addr) = base {
+            if first.is_none() {
+                first = Some(addr);
+            }
+            if addr == PL011_BASE {
+                at_base = true;
+            }
+        }
+    });
+    (at_base, first)
+}
+
+/// Is there a real PL011 at the QEMU `virt` UART address? Both halves
+/// are checked while boot services are live: the DTB must describe a
+/// PL011 at the address, and the PrimeCell ID block must read as a
+/// PL011. The result is carried into the post-EBS stages, where no
+/// firmware service can answer the question anymore — and where a
+/// wrong guess would write marker bytes into an unrelated device's
+/// registers.
+///
+/// The first half used to be a UEFI memory-map MMIO lookup; that
+/// premise is wrong for this firmware (AAVMF's `GetMemoryMap()` never
+/// lists the platform UART — device MMIO is described via DT, UEFI
+/// spec 15.4 — confirmed from runtime evidence on sighting #154,
+/// whose why-lines printed `no MMIO map entry covers 0x9000000`).
+/// The DTB is the firmware's own device description and the loader
+/// already holds and validates it, so it is the principled source.
+fn pl011_available(dtb: &[u8]) -> Pl011Probe {
+    let (at_base, first) = dtb_pl011(dtb);
+    if !at_base {
+        return Pl011Probe::NoDtbUart { found: first };
     }
-    if !mmio {
-        return Pl011Probe::NoMmioEntry { before, after };
-    }
-    // SAFETY: the memory map lists this range as MMIO, and the ID
+    // SAFETY: the DTB describes a PL011 at this address, and the ID
     // registers are read-only by the PrimeCell specification.
     let id =
         |offset: u64| unsafe { ptr::read_volatile((PL011_BASE + offset) as *const u32) & 0xff };
@@ -1341,7 +1350,6 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
-    use uefi::mem::memory_map::{MemoryAttribute, MemoryMapMeta, MemoryMapRef};
 
     fn valid_elf() -> Vec<u8> {
         let mut bytes = vec![0u8; ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE + 4];
@@ -1669,59 +1677,143 @@ mod tests {
         );
     }
 
-    fn map_descriptor(ty: MemoryType, start: u64, pages: u64) -> MemoryDescriptor {
-        MemoryDescriptor {
-            ty,
-            phys_start: start,
-            virt_start: 0,
-            page_count: pages,
-            att: MemoryAttribute::empty(),
+    /// Build a minimal DTB: root with `#address-cells` /
+    /// `#size-cells` 2/2 (like QEMU's `virt` tree) plus flat child
+    /// nodes, each a name with (prop-name, value) pairs. Mirrors
+    /// `firmware/fdt`'s `build_blob` test helper.
+    fn build_dtb(nodes: &[(&str, &[(&str, &[u8])])]) -> Vec<u8> {
+        let mut strings: Vec<u8> = Vec::new();
+        let intern = |strings: &mut Vec<u8>, name: &str| -> u32 {
+            let target = name.as_bytes();
+            let mut i = 0;
+            while i + target.len() < strings.len() {
+                if &strings[i..i + target.len()] == target && strings[i + target.len()] == 0 {
+                    return i as u32;
+                }
+                i += 1;
+            }
+            let off = strings.len() as u32;
+            strings.extend_from_slice(target);
+            strings.push(0);
+            off
+        };
+
+        let mut s: Vec<u8> = Vec::new();
+        // Root open: BEGIN_NODE + empty name + pad.
+        s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+        s.extend_from_slice(&[0, 0, 0, 0]);
+        for (pname, pval) in [
+            ("#address-cells", 2u32.to_be_bytes()),
+            ("#size-cells", 2u32.to_be_bytes()),
+        ] {
+            let off = intern(&mut strings, pname);
+            s.extend_from_slice(&narf_firmware_fdt::FDT_PROP.to_be_bytes());
+            s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
+            s.extend_from_slice(&off.to_be_bytes());
+            s.extend_from_slice(&pval);
         }
+        for (node_name, props) in nodes {
+            s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+            s.extend_from_slice(node_name.as_bytes());
+            s.push(0);
+            while s.len() % 4 != 0 {
+                s.push(0);
+            }
+            for (pname, pval) in *props {
+                let off = intern(&mut strings, pname);
+                s.extend_from_slice(&narf_firmware_fdt::FDT_PROP.to_be_bytes());
+                s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
+                s.extend_from_slice(&off.to_be_bytes());
+                s.extend_from_slice(pval);
+                while s.len() % 4 != 0 {
+                    s.push(0);
+                }
+            }
+            s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+        }
+        s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+        s.extend_from_slice(&narf_firmware_fdt::FDT_END.to_be_bytes());
+
+        let struct_size = s.len() as u32;
+        let strings_size = strings.len() as u32;
+        // Empty reserve map: just the 16-byte terminator.
+        let off_rsvmap = 40u32;
+        let off_struct = off_rsvmap + 16;
+        let off_strings = off_struct + struct_size;
+        let totalsize = off_strings + strings_size;
+
+        let mut out: Vec<u8> = Vec::with_capacity(totalsize as usize);
+        out.extend_from_slice(&FDT_MAGIC.to_be_bytes());
+        out.extend_from_slice(&totalsize.to_be_bytes());
+        out.extend_from_slice(&off_struct.to_be_bytes());
+        out.extend_from_slice(&off_strings.to_be_bytes());
+        out.extend_from_slice(&off_rsvmap.to_be_bytes());
+        out.extend_from_slice(&17u32.to_be_bytes());
+        out.extend_from_slice(&16u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&strings_size.to_be_bytes());
+        out.extend_from_slice(&struct_size.to_be_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&s);
+        out.extend_from_slice(&strings);
+        out
     }
 
-    fn map_ref(descriptors: &[MemoryDescriptor]) -> MemoryMapRef<'_> {
-        // SAFETY: the descriptor slice is a valid, 8-byte-aligned byte
-        // buffer of exactly `desc_size`-sized entries.
-        let bytes = unsafe {
-            slice::from_raw_parts(
-                descriptors.as_ptr() as *const u8,
-                core::mem::size_of_val(descriptors),
-            )
-        };
-        MemoryMapRef::new(
-            bytes,
-            MemoryMapMeta {
-                map_size: bytes.len(),
-                desc_size: core::mem::size_of::<MemoryDescriptor>(),
-                map_key: Default::default(),
-                desc_version: MemoryDescriptor::VERSION,
-            },
-        )
-        .unwrap()
+    /// `reg = <0x0 <base> 0x0 0x1000>` under root cells 2/2.
+    fn pl011_reg(base: u32) -> [u8; 16] {
+        let mut reg = [0u8; 16];
+        reg[4..8].copy_from_slice(&base.to_be_bytes());
+        reg[12..16].copy_from_slice(&0x1000u32.to_be_bytes());
+        reg
     }
 
     #[test]
-    fn pl011_probe_reports_missing_mmio_entry_with_nearest_entries() {
-        // The observed AAVMF shape: NOR flash and the PCI window bracket
-        // the UART address, and no MMIO entry covers it. The probe must
-        // say so and name the bracketing entries — in address order even
-        // when the map is unsorted. The ID half never runs here (no
-        // volatile read of the hardware address on the host).
-        let descriptors = [
-            map_descriptor(MemoryType::CONVENTIONAL, 0x4000_0000, 0x8000),
-            map_descriptor(MemoryType::MMIO, 0x1000_0000, 0x1000),
-            map_descriptor(MemoryType::MMIO, 0x0000_0000, 0x4000),
-            map_descriptor(MemoryType::CONVENTIONAL, 0x4402_0000, 0x1000),
-        ];
-        let map = map_ref(&descriptors);
-        let probe = pl011_available(&map);
-        let (before, after) = match probe {
-            Pl011Probe::NoMmioEntry { before, after } => (before, after),
-            _ => panic!("expected NoMmioEntry, got {probe:?}"),
-        };
-        assert_eq!(before[0].map(|d| d.phys_start), Some(0x0000_0000));
-        assert!(before[1].is_none());
-        assert_eq!(after[0].map(|d| d.phys_start), Some(0x1000_0000));
-        assert_eq!(after[1].map(|d| d.phys_start), Some(0x4000_0000));
+    fn dtb_pl011_finds_virt_uart_at_0x09000000() {
+        // QEMU `virt` shape: `serial@9000000` with compatible
+        // "arm,pl011", "arm,primecell" and reg <0x0 0x09000000 0x0 0x1000>.
+        let reg = pl011_reg(0x0900_0000);
+        let blob = build_dtb(&[(
+            "serial@9000000",
+            &[
+                ("compatible", b"arm,pl011\0arm,primecell\0" as &[u8]),
+                ("reg", &reg),
+            ][..],
+        )]);
+        assert_eq!(dtb_pl011(&blob), (true, Some(0x0900_0000)));
+    }
+
+    #[test]
+    fn dtb_pl011_reports_pl011_at_another_address() {
+        let reg = pl011_reg(0x0901_0000);
+        let blob = build_dtb(&[(
+            "serial@9010000",
+            &[("compatible", b"arm,pl011\0" as &[u8]), ("reg", &reg)][..],
+        )]);
+        assert_eq!(dtb_pl011(&blob), (false, Some(0x0901_0000)));
+    }
+
+    #[test]
+    fn dtb_pl011_reports_no_pl011_node() {
+        let blob = build_dtb(&[(
+            "ethernet@a000000",
+            &[("compatible", b"virtio,mmio\0" as &[u8])][..],
+        )]);
+        assert_eq!(dtb_pl011(&blob), (false, None));
+        // A malformed blob fails safe the same way.
+        assert_eq!(dtb_pl011(&[0u8; 64]), (false, None));
+    }
+
+    #[test]
+    fn pl011_probe_reports_missing_dtb_uart() {
+        // The DTB half of the probe, without touching hardware: no
+        // PL011 node means the probe reports NoDtbUart and the ID
+        // half never runs (no volatile read of the hardware address
+        // on the host). The Available path is CI-only for the same
+        // reason.
+        let blob = build_dtb(&[]);
+        match pl011_available(&blob) {
+            Pl011Probe::NoDtbUart { found: None } => {}
+            probe => panic!("expected NoDtbUart with no node, got {probe:?}"),
+        }
     }
 }

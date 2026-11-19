@@ -95,11 +95,31 @@ name = "narf-boot-protocol"
 version = "0.0.0"
 
 [[package]]
+name = "narf-firmware-fdt"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-kernel-test"
+version = "0.0.0"
+
+[[package]]
+name = "narf-lib"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-uefi-loader"
 version = "0.0.0"
 dependencies = [
  "blake2",
  "narf-boot-protocol",
+ "narf-firmware-fdt",
  "sha2",
  "uefi",
 ]
