@@ -343,7 +343,8 @@ kernel IPC. CI checks both native-ring feature configurations.
   stanza loads that ELF directly; on x86_64 UEFI it chainloads the bundled
   Limine EFI app from `target/grub-x86_64/esp/`, which also contains the
   canonical kernel, initramfs, and Limine configuration for installation to
-  the ESP.
+  the ESP. With `--root-policy`, `--cmdline-extra openrc_pid1` selects the
+  installed OpenRC init and omits the generated systemd options.
 - `packaging/build-release.sh --version X.Y.Z [--arch x86_64|aarch64]
   [--uefi-loader FILE] [--limine-efi FILE] [--limine-tool FILE]
   [--secure-boot-key FILE

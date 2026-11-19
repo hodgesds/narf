@@ -4100,16 +4100,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 let auth = narf_filesystem::bootstrap_mount_authority();
 
-                // A systemd PID-1 boot with an explicit root selector must
+                // A distro PID-1 boot with an explicit root selector must
                 // stage that exact filesystem at /mnt. In particular, a
                 // removable-media boot must not pick the first ext volume
                 // observed after the selected root has mounted at /: on real
                 // laptops that is commonly the internal disk. A bind mount
                 // captures the selected session root before boot-init overlays
                 // native fallback filesystems at /bin, /etc, /lib and
-                // /usr/lib; systemd then sees the selected distro tree through
+                // /usr/lib; the init process sees the selected distro tree through
                 // its existing /mnt root.
-                if narf_boot::args().has_flag("systemd_pid1")
+                if narf_boot::args().distro_init().is_some()
                     && narf_filesystem::root_selector::RootSelector::from_cmdline(
                         narf_boot::cmdline(),
                     )
@@ -4134,7 +4134,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                 }
 
-                let session_writable_root = narf_boot::args().has_flag("systemd_pid1");
+                let session_writable_root = narf_boot::args().distro_init().is_some();
                 // `narf.disks=boot-only`: never mount a disk other than the
                 // identified boot medium (on a laptop the first ext volume is
                 // typically the internal disk).
@@ -4848,7 +4848,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // vmapped), its depth measured. Still synchronous: the stages run
             // on this CPU, in order, before boot continues.
             const INIT_STACK_BYTES: usize = 128 * 1024;
-            narf_init::set_initcall_hook(init_depth::hook);
+            if narf_boot::args().has_flag("narf.rootlog") {
+                narf_init::set_initcall_hook(|stage, name, entering| {
+                    if entering {
+                        narf_filesystem::root_bootlog::checkpoint();
+                    }
+                    init_depth::hook(stage, name, entering);
+                });
+            } else {
+                narf_init::set_initcall_hook(init_depth::hook);
+            }
             let init_depth =
                 narf_scheduler::stackful::run_on_kernel_stack(INIT_STACK_BYTES, move || {
                     // Run stages one at a time.
@@ -5881,49 +5890,10 @@ fn boot_userspace_init() {
         true
     }
 
-    // Directly load a dynamic program from an already-mounted filesystem root.
-    // The task's root is installed before it is enqueued, so systemd is the
-    // first and only process in its PID-1 chain — no chroot shell/launcher is
-    // involved.
-    /// Spawn a rooted PID 1 straight from its path.
-    ///
-    /// Takes the PATH, not the bytes: the loader resolves the file itself and
-    /// demand-pages the image, the way `execve` has since #472. Slurping it into
-    /// a `Vec` here meant the one process on the system guaranteed to be large —
-    /// systemd is tens of megabytes — was the only one that paid the full read
-    /// and the full resident cost, while every process it went on to exec did
-    /// not.
-    fn spawn_rooted_pid1(name: &'static str, path: &str, root: &str) -> bool {
+    /// Demand-page the installed init and set its filesystem root before
+    /// publishing the task to the scheduler.
+    fn spawn_rooted_pid1(name: &'static str, path: &str, root: &str, envp: &[&str]) -> bool {
         let argv = [name];
-        // systemd in container mode (container= below) evaluates
-        // ConditionKernelCommandLine= against PID 1's argv rather than
-        // /proc/cmdline, which hides every boot flag QEMU appended. Hand it
-        // the real cmdline through its documented override so cmdline-keyed
-        // units (e.g. the narf_net_check network acceptance gate) still
-        // trigger.
-        let proc_cmdline = alloc::format!("SYSTEMD_PROC_CMDLINE={}", narf_boot::cmdline());
-        // `container=narf` runs systemd in container mode, which the generated
-        // QEMU distro images rely on. An installed system booted from its own
-        // root (`narf.disks=root-ro|root-rw`) is the machine's OS, not a
-        // container: in container mode systemd reports "container-other",
-        // getty-generator starts console-getty next to getty@tty1 (two
-        // gettys reading one console), and units conditioned on
-        // ConditionVirtualization=!container are skipped.
-        let installed_root = narf_block::disk_policy::policy().is_root_policy();
-        let envp_container = [
-            "container=narf",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            proc_cmdline.as_str(),
-        ];
-        let envp_host = [
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            proc_cmdline.as_str(),
-        ];
-        let envp: &[&str] = if installed_root {
-            &envp_host
-        } else {
-            &envp_container
-        };
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc = match unsafe {
             narf_userspace::process::load_user_process_from_path(
@@ -5939,7 +5909,7 @@ fn boot_userspace_init() {
             Err(e) => {
                 let _ = writeln!(
                     console::Writer,
-                    "  boot-init: {name}: direct load failed: {e:?}"
+                    "  boot-init: {name}: direct load failed: {e:?} ({path})"
                 );
                 return false;
             }
@@ -5963,6 +5933,14 @@ fn boot_userspace_init() {
         narf_filesystem::cgroupfs::attach_to_root(pid.raw());
         narf_userspace::handlers::set_proc_argv(tid.raw(), &argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: starting {path} as PID {}",
+            pid.raw()
+        );
+        if narf_boot::args().has_flag("narf.rootlog") {
+            narf_filesystem::root_bootlog::checkpoint();
+        }
         pending.spawn();
         true
     }
@@ -6876,31 +6854,35 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         }
     }
 
-    // `systemd_pid1` cmdline flag: boot the mounted /mnt rootfs's
-    // `/usr/lib/systemd/systemd` directly as PID 1 instead of the NARF
-    // init/getty/shell stack. When an explicit root= selector was present,
-    // mnt-mount-ext2 bound that exact root at /mnt before native boot-init
-    // overlays /bin, /etc, /lib and /usr/lib. The mounted distro filesystem
-    // is installed as the task's root before scheduler publication; there is
-    // no launcher, shell, chroot helper, or exec chain ahead of systemd.
-    // The Stage::Late root/dev/proc/sys/cgroup initcalls have already run
-    // synchronously above (see the run_stage loop in `_start_rust`) before
-    // this task is published. init/getty are skipped in this mode.
-    let systemd_pid1 = narf_boot::args().has_flag("systemd_pid1");
-    if systemd_pid1 {
-        let systemd_path = "/mnt/usr/lib/systemd/systemd";
-        // Resolve-only: confirms the binary is reachable and gives the same
-        // diagnostic as before without reading a byte of it. The loader opens it
-        // again and demand-pages from there.
-        if narf_userspace::process::resolve_exec_file(systemd_path).is_none() {
-            let _ = writeln!(
-                console::Writer,
-                "  boot-init: systemd_pid1 requested but {systemd_path} is unavailable"
-            );
-        } else {
-            spawn_rooted_pid1("systemd", systemd_path, "/mnt");
+    if let Some(init) = narf_boot::args().distro_init() {
+        use narf_boot::args::DistroInit;
+        const PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+        match init {
+            DistroInit::OpenRc => {
+                spawn_rooted_pid1("openrc-init", "/mnt/sbin/openrc-init", "/mnt", &[PATH]);
+            }
+            DistroInit::Systemd => {
+                // Container-mode systemd reads ConditionKernelCommandLine from
+                // PID 1's argv. Give it the actual command line for unit selection.
+                let cmdline = alloc::format!("SYSTEMD_PROC_CMDLINE={}", narf_boot::cmdline());
+                let env = [PATH, cmdline.as_str(), "container=narf"];
+                let env = if narf_block::disk_policy::policy().is_root_policy() {
+                    &env[..2]
+                } else {
+                    &env[..]
+                };
+                let path = "/mnt/usr/lib/systemd/systemd";
+                if narf_userspace::process::resolve_exec_file(path).is_none() {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  boot-init: systemd_pid1 requested but {path} is unavailable"
+                    );
+                } else {
+                    spawn_rooted_pid1("systemd", path, "/mnt", env);
+                }
+            }
         }
-        let _ = baked_shell;
         return;
     }
 

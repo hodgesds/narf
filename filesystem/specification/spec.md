@@ -209,13 +209,23 @@ the development initramfs login.
 
 `try_mount_root_with_options` additionally accepts
 `RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`
-`systemd_pid1` installed-distro boot path), the selected filesystem is the
+`openrc_pid1` or `systemd_pid1` installed-distro boot path under `root-ro`), the selected filesystem is the
 immutable OverlayFS lower and a Linux-compatible `TmpFs` upper becomes the
 visible `/` before PID 1 starts. The selector-free installed-root fallback
 uses the same wrapper at `/mnt` before PID 1 is rooted there.
 The upper inherits the lower root's owner and mode, is limited by the normal
 tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
 `RootMountError::TmpfsOverlay` reports failure to construct that session view.
+
+With `narf.rootlog` on a designated writable Btrfs root, the kernel creates
+a fresh mode-0600 `/var/log/narf-boot-NNNN.log` in the mounted subvolume.
+It commits the filename and buffered kernel messages before returning from
+the root mount. The boot thread checkpoints the file before each remaining
+initcall and before publishing the installed PID 1. A kernel task appends
+and syncs new records once per second, up to 4 MiB per boot. The root must contain
+the `var/log` directories. A logging failure is reported to the console and
+boot continues. If the kernel stops before mounting the root, it cannot
+create the file. The panic handler does not enter Btrfs transactions.
 
 ### 3.0c System-wide sync
 
