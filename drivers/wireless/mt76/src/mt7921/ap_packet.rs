@@ -93,6 +93,7 @@ pub(super) fn descriptor_on(
         (frame.len() as u32 + 32) | (queue << 25),
         1 << 31 | u32::from(tid) << 20 | 2 << 16 | (header as u32 / 2) << 11 | u32::from(wcid),
         u32::from(fixed) << 31
+            | u32::from(fixed) << 13 // HTC_VLD follows FIX_RATE, as in connac2 TXWI.
             | u32::from(multicast) << 10
             | u32::from(kind) << 4
             | u32::from(subtype),

@@ -59,7 +59,13 @@ pub(super) fn management(
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
         (1 << 31) | (u32::from(tid) << 20) | (2 << 16) | (12 << 11) | u32::from(wcid),
-        (1 << 31) | (u32::from(multicast) << 10) | subtype | if is_data { 2 << 4 } else { 0 },
+        // Linux sets HTC_VLD whenever FIX_RATE is selected, including raw
+        // management/EAPOL frames without an HT-Control field.
+        (1 << 31)
+            | (1 << 13)
+            | (u32::from(multicast) << 10)
+            | subtype
+            | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
         if add_ba { 1 << 14 } else { 0 },

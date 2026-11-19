@@ -756,8 +756,9 @@ impl JoinPlan {
     pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.common.append_sme_ies(bytes)
     }
-    /// Initial unencrypted AP record: CONN_STATE_CONNECT, never PORT_SECURE.
-    /// Native RX remains enabled so later EAPOL processing sees full MPDUs.
+    /// Enable the firmware AP peer as Linux mt76_connac_mcu_sta_cmd does.
+    /// Firmware CONN_STATE_PORT_SECURE enables packet processing; the host
+    /// MLME/RSNA state and copy-time RX gate still own data authorization.
     pub fn peer_record(&self, aid: u16, associated: bool) -> Result<Vec<u8>, Error> {
         self.peer_record_on(Link::HOME, aid, associated)
     }
@@ -790,11 +791,7 @@ impl JoinPlan {
         out[5] = link.omac();
         let basic = tlv(&mut out, 0, 20);
         out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-        out[basic + 8] = if associated && self.security == SecurityMode::Open {
-            2
-        } else {
-            1
-        };
+        out[basic + 8] = 2; // CONN_STATE_PORT_SECURE for an enabled firmware peer.
         out[basic + 9] = u8::from(associated && self.wmm.is_some());
         out[basic + 10..basic + 12].copy_from_slice(&aid.to_le_bytes());
         out[basic + 12..basic + 18].copy_from_slice(&self.peer);
@@ -811,7 +808,9 @@ impl JoinPlan {
         let ra = tlv(&mut out, 1, 16);
         out[ra + 4..ra + 6].copy_from_slice(&((rates & 15) | ((rates >> 4) << 6)).to_le_bytes());
         let state = tlv(&mut out, 7, 12);
-        out[state + 8] = if associated { 2 } else { 1 }; // MLME state, independent of port authorization.
+        // mt7921_mac_sta_add starts at MT76_STA_INFO_STATE_NONE (0), not
+        // AUTH (1); the successful association update uses ASSOC (2).
+        out[state + 8] = if associated { 2 } else { 0 };
         let wtbl = tlv(&mut out, 13, 12); // outer TLV + eight-byte WTBL request
         out[wtbl + 4] = link.peer();
         out[wtbl + 5] = 1;

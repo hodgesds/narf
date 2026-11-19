@@ -69,11 +69,13 @@ fn replace_key(session: &mut Session<Model>) -> Result<(), &'static str> {
     session.backend.own_mac = OWN;
     session.backend.ap_mac = AP;
     session.backend.anonce = [0x55; 32];
-    run(session.service_keys()).map_err(|_| "receive epoch native M2/retirement")?;
+    run(alloc::boxed::Box::pin(session.service_keys()))
+        .map_err(|_| "receive epoch native M2/retirement")?;
     if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
         return Err("receive epoch real replacement M3");
     }
-    run(session.service_keys()).map_err(|_| "receive epoch native key receipts")?;
+    run(alloc::boxed::Box::pin(session.service_keys()))
+        .map_err(|_| "receive epoch native key receipts")?;
     Ok(())
 }
 fn batch(session: &mut Session<Model>, secure: bool) -> Result<PacketStep, &'static str> {
@@ -139,17 +141,20 @@ fn reentrant() -> Result<(), &'static str> {
                 let result = if secure {
                     replace_key(&mut session)
                 } else {
-                    run(session.disassociate_station())
+                    // This callback is inlined into deliver_received_batch.
+                    // Keep complete MLME futures off its kernel stack while
+                    // retaining the actual reentrant teardown/rejoin path.
+                    run(alloc::boxed::Box::pin(session.disassociate_station()))
                         .map_err(|_| "reentrant native Open retirement")
                         .and_then(|()| {
                             reset_open_peer(&mut session);
-                            run(session.associate_station(
+                            run(alloc::boxed::Box::pin(session.associate_station(
                                 &bss,
                                 b"narf",
                                 Security::Open,
                                 permission,
                                 &[],
-                            ))
+                            )))
                             .map(|_| ())
                             .map_err(|_| "reentrant native Open replacement")
                         })
