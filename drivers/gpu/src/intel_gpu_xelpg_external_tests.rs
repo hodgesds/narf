@@ -33,6 +33,7 @@ pub struct Sink {
     i2c_ptr: usize,
     lanes_set: u8,
     pattern: u8,
+    training_writes: Vec<(u32, u8)>,
     cr_locked: bool,
     eq_locked: bool,
     polls: u32,
@@ -68,6 +69,7 @@ impl Sink {
             i2c_ptr: 0,
             lanes_set: 0,
             pattern: 0,
+            training_writes: Vec::new(),
             cr_locked: false,
             eq_locked: false,
             polls: 0,
@@ -87,6 +89,12 @@ impl Sink {
     pub fn drop_lock(&mut self) {
         self.cr_locked = false;
         self.eq_locked = false;
+    }
+    pub(super) fn training_writes_to(&self, reg: u32) -> Vec<u8> {
+        self.training_writes
+            .iter()
+            .filter_map(|&(r, v)| (r == reg).then_some(v))
+            .collect()
     }
     fn lanes_ok(&self) -> bool {
         self.max_good_lanes == 0 || self.lanes_set <= self.max_good_lanes
@@ -131,10 +139,12 @@ impl Sink {
                 self.polls = 0;
             }
             0x101 => {
+                self.training_writes.push((addr, value));
                 self.lanes_set = value & 0x1F;
                 self.drop_lock();
             }
             0x102 => {
+                self.training_writes.push((addr, value));
                 self.pattern = value & 0x7;
                 self.polls = 0;
             }
@@ -500,7 +510,9 @@ impl ExtFake {
             };
             let correct = (0..4).any(|pipe| {
                 let source = self.phy.read32(0x60540 + pipe * 0x1000);
-                source & (1 << 31) != 0 && (source >> 8) & 7 == expected
+                source & (1 << 31) != 0
+                    && (source >> 8) & 7 == expected
+                    && (source & (1 << 7) != 0) == (wire[4] & (1 << 5) != 0)
             });
             if !correct {
                 self.aux_done
@@ -1244,6 +1256,97 @@ fn smoke_mtl_external_lane_fallback_retries_at_trained_width() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_lane_fallback_retries_at_trained_width
+);
+
+fn smoke_xe3_usb_c_uses_receiver_training_patterns() -> TestResult {
+    for (ip, revision, lane_cap, spread_cap, expected_rate, expected_patterns) in [
+        // The extended block supplies TPS4. CR fails at four lanes, then
+        // succeeds at two; the final modeset retries that trained width.
+        (
+            DisplayIp::Xe3Lpd,
+            0x14,
+            4,
+            0x80,
+            TrainRate::Rbr,
+            &[0x21, 0, 0x21, 7, 0, 0x21, 7, 0][..],
+        ),
+        // The TPS4 bit is reserved before DPCD 1.4.
+        (
+            DisplayIp::WildcatLake,
+            0x13,
+            0xc1,
+            0x80,
+            TrainRate::Hbr2,
+            &[0x21, 0x23, 0][..],
+        ),
+        // Some HBR2 receivers do not advertise TPS3.
+        (
+            DisplayIp::WildcatLake,
+            0x14,
+            1,
+            0,
+            TrainRate::Hbr2,
+            &[0x21, 0x22, 0][..],
+        ),
+    ] {
+        let fallback = expected_rate == TrainRate::Rbr;
+        let edid = if fallback { edid_1024() } else { edid_1080() };
+        let mut sink = Sink::new(0x14, edid);
+        let mut caps = [0; 15];
+        caps[..4].copy_from_slice(&[revision, 0x14, lane_cap, spread_cap]);
+        if fallback {
+            sink.caps[2] = 0x84;
+            sink.caps[14] = 0x80;
+            sink.extended_caps = Some(caps);
+            sink.max_good_lanes = 2;
+        } else {
+            sink.caps[..15].copy_from_slice(&caps);
+        }
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        let Some(panel) = io.light_panel_ip(ip) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        let mut service = MtlExternalService::new();
+        service.set_profile(ExternalDisplayProfile::for_ip(ip));
+        service.set_display(MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        });
+        let result = service.handle(
+            &io,
+            tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt)),
+            &mut fb_for,
+        );
+        if !matches!(result, ServiceOutcome::Activated { pipe: Pipe::B, .. }) {
+            return TestResult::Fail("the USB-C receiver must train and reach scanout");
+        }
+        let Some(MtlRoute::Dp(route)) = service.route() else {
+            return TestResult::Fail("the service must own the trained DP route");
+        };
+        assert_eq!(route.trained.rate, expected_rate);
+        assert_eq!(
+            io.sink.borrow().training_writes_to(0x102),
+            expected_patterns
+        );
+        let expected_lanes = match (fallback, lane_cap & 0x80 != 0) {
+            (true, _) => &[4, 2, 2][..],
+            (false, true) => &[0x81],
+            (false, false) => &[1],
+        };
+        assert_eq!(io.sink.borrow().training_writes_to(0x101), expected_lanes);
+        let enhanced = lane_cap & 0x80 != 0;
+        assert!(io
+            .writes_to(DP_TP_CTL_B)
+            .iter()
+            .filter(|v| **v & ENABLE != 0)
+            .all(|v| (v & (1 << 18) != 0) == enhanced));
+        assert!(service.teardown(&io));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_usb_c_uses_receiver_training_patterns
 );
 
 fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {

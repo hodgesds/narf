@@ -393,6 +393,18 @@ Errors reading the advertised extension propagate to the probe. SST
 link negotiation, MST discovery and the Type-C spread-spectrum decision
 use the selected block.
 
+The Meteor/Arrow, Lunar, Panther and Wildcat Lake external 8b/10b
+DisplayPort trainer uses TPS1 for clock recovery. For channel
+equalization it selects TPS4 when a DP 1.4+ receiver advertises it at
+DPCD 0x003 bit 7, TPS3 when a DP 1.2+ receiver advertises it at 0x002
+bit 6, and TPS2 otherwise. The source programs the matching pattern
+before each sink write. TPS1 through TPS3 disable scrambling on the
+link, while TPS4 and normal operation use scrambling. Rate and lane
+fallback retain the receiver's equalization pattern. For SST, the source
+and sink enable enhanced framing only with a DP 1.1+ receiver advertising
+DPCD 0x002 bit 7. Every attempted lane count uses this framing setting.
+MST uses its own transport mode and clears the enhanced-framing bit.
+
 `drm_dsc` (ungated) holds DRM's VESA DSC helpers: `Pps` (drm_dsc_config),
 `compute_rc_parameters`, `pack_pps`, `set_rc_buf_thresh` and
 `dp_pps_header`; `amdgpu_dsc` re-exports `Pps` and `pack_pps`.

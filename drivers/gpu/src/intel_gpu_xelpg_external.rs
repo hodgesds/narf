@@ -142,8 +142,8 @@ pub use mst::{MstFailure, MtlMstRoute};
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{
-    negotiate, stream_demand_kbps, train_link, DpcdCaps, LinkError, LinkRate as TrainRate,
-    NegotiatedLink, SourceCaps, TrainedLink,
+    negotiate, stream_demand_kbps, train_link_with_receiver, DpcdCaps, LinkError,
+    LinkRate as TrainRate, NegotiatedLink, ReceiverTraining, SourceCaps, TrainedLink,
 };
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
@@ -1321,7 +1321,12 @@ fn enable_port<M: MmioWindow + ?Sized>(
     }
     // mtl_ddi_prepare_link_retrain: 6.d DP_TP_CTL TPS1 (SST), 6.f D2D,
     // 6.g levels, 6.h PORT_BUF_CTL1, 6.i DDI_CTL_DE + buffer active.
-    let enhanced = if route.probe.caps.enhanced_framing {
+    let receiver = ReceiverTraining::for_receiver(
+        &route.probe.caps,
+        route.probe.max_downspread,
+        route.probe.mst.is_some(),
+    );
+    let enhanced = if receiver.enhanced_framing {
         DP_TP_CTL_ENHANCED_FRAME
     } else {
         0
@@ -1368,7 +1373,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
             })
         },
     );
-    let result = train_link(&mut aux, rate, lanes, |us| {
+    let result = train_link_with_receiver(&mut aux, rate, lanes, Some(receiver), |us| {
         let _ = narf_scheduler::responsive_spin_until(
             || false,
             narf_time::Deadline::after_ns(us as u64 * 1_000),

@@ -82,6 +82,46 @@ pub enum TrainingPattern {
     Tps4 = 7,
 }
 
+/// Framing and DPCD training patterns for an 8b/10b link.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ReceiverTraining {
+    pub enhanced_framing: bool,
+    clock_recovery: u8,
+    equalization: u8,
+}
+
+impl ReceiverTraining {
+    fn for_rate(select: RateSelect) -> Self {
+        Self {
+            enhanced_framing: true,
+            clock_recovery: TrainingPattern::Tps1 as u8,
+            equalization: select.eq_pattern() as u8,
+        }
+    }
+
+    /// i915 intel_dp_training_pattern for a source supporting TPS3 and TPS4.
+    /// DP_LINK_SCRAMBLING_DISABLE must be clear for TPS4.
+    #[cfg(feature = "intel")]
+    pub(crate) fn for_receiver(caps: &DpcdCaps, max_downspread: u8, mst: bool) -> Self {
+        const SCRAMBLING_DISABLE: u8 = 1 << 5;
+        const TPS4_SUPPORTED: u8 = 1 << 7;
+        let equalization = if caps.dpcd_rev >= 0x14 && max_downspread & TPS4_SUPPORTED != 0 {
+            TrainingPattern::Tps4 as u8
+        } else if caps.tps3_supported {
+            TrainingPattern::Tps3 as u8 | SCRAMBLING_DISABLE
+        } else {
+            TrainingPattern::Tps2 as u8 | SCRAMBLING_DISABLE
+        };
+        Self {
+            // intel_dp_compute_config sets enhanced framing on 8b/10b SST
+            // when drm_dp_enhanced_frame_cap accepts the receiver.
+            enhanced_framing: !mst && caps.dpcd_rev >= 0x11 && caps.enhanced_framing,
+            clock_recovery: TrainingPattern::Tps1 as u8 | SCRAMBLING_DISABLE,
+            equalization,
+        }
+    }
+}
+
 /// Link-training state.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TrainingState {
@@ -554,8 +594,9 @@ fn set_link_rate<A: AuxChannel>(
     aux: &mut A,
     select: RateSelect,
     lanes: u8,
+    enhanced_framing: bool,
 ) -> Result<(), AuxError> {
-    let lane_count = (lanes & 0x1F) | 0x80;
+    let lane_count = (lanes & 0x1F) | if enhanced_framing { 0x80 } else { 0 };
     match select {
         RateSelect::LinkBw(rate) => {
             aux.dpcd_write(DPCD_LINK_BW_SET, &[rate as u8])?;
@@ -577,18 +618,34 @@ pub fn train_clock_recovery_select<A: AuxChannel>(
     lanes: u8,
     delay_us: impl Fn(u32),
 ) -> Result<VSwingPe, LinkError> {
+    clock_recovery(
+        aux,
+        select,
+        lanes,
+        ReceiverTraining::for_rate(select),
+        delay_us,
+    )
+}
+
+fn clock_recovery<A: AuxChannel>(
+    aux: &mut A,
+    select: RateSelect,
+    lanes: u8,
+    receiver: ReceiverTraining,
+    delay_us: impl Fn(u32),
+) -> Result<VSwingPe, LinkError> {
     let n_lanes = lanes as usize;
     if n_lanes == 0 || n_lanes > MAX_LANES {
         return Err(LinkError::Aborted);
     }
 
     // Program the link rate + LANE_COUNT_SET + enhanced framing.
-    set_link_rate(aux, select, lanes)?;
+    set_link_rate(aux, select, lanes, receiver.enhanced_framing)?;
 
     // Start with level-0 drive on every lane and pattern TPS1.
     let mut vswing_pe = VSwingPe::default();
     write_vswing_pe(aux, &vswing_pe, n_lanes)?;
-    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[TrainingPattern::Tps1 as u8])?;
+    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[receiver.clock_recovery])?;
 
     // Track repeats of the same MAX vswing — DP 1.4a §3.5.1.2.2.
     let mut max_swing_repeat = 0u8;
@@ -662,13 +719,29 @@ pub fn train_channel_equalization_select<A: AuxChannel>(
     start_vswing_pe: VSwingPe,
     delay_us: impl Fn(u32),
 ) -> Result<VSwingPe, LinkError> {
+    channel_equalization(
+        aux,
+        select.eq_pattern() as u8,
+        lanes,
+        start_vswing_pe,
+        delay_us,
+    )
+}
+
+fn channel_equalization<A: AuxChannel>(
+    aux: &mut A,
+    pattern: u8,
+    lanes: u8,
+    start_vswing_pe: VSwingPe,
+    delay_us: impl Fn(u32),
+) -> Result<VSwingPe, LinkError> {
     let n_lanes = lanes as usize;
     if n_lanes == 0 || n_lanes > MAX_LANES {
         return Err(LinkError::Aborted);
     }
     let mut vswing_pe = start_vswing_pe;
 
-    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[select.eq_pattern() as u8])?;
+    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[pattern])?;
     write_vswing_pe(aux, &vswing_pe, n_lanes)?;
 
     for _ in 0..MAX_PHASE_ATTEMPTS {
@@ -732,10 +805,13 @@ fn train_one<A: AuxChannel>(
     aux: &mut A,
     rate: LinkRate,
     lanes: u8,
+    receiver: Option<ReceiverTraining>,
     delay_us: impl Fn(u32) + Copy,
 ) -> Result<TrainedLink, LinkError> {
-    let vswing_pe = train_clock_recovery(aux, rate, lanes, delay_us)?;
-    let vswing_pe = train_channel_equalization(aux, rate, lanes, vswing_pe, delay_us)?;
+    let select = RateSelect::LinkBw(rate);
+    let receiver = receiver.unwrap_or_else(|| ReceiverTraining::for_rate(select));
+    let vswing_pe = clock_recovery(aux, select, lanes, receiver, delay_us)?;
+    let vswing_pe = channel_equalization(aux, receiver.equalization, lanes, vswing_pe, delay_us)?;
     Ok(TrainedLink {
         rate,
         lanes,
@@ -766,6 +842,18 @@ pub fn train_link<A: AuxChannel>(
     requested_lanes: u8,
     delay_us: impl Fn(u32) + Copy,
 ) -> Result<TrainedLink, LinkError> {
+    train_link_with_receiver(aux, requested_rate, requested_lanes, None, delay_us)
+}
+
+/// Run the fallback ladder with the receiver's framing and training
+/// patterns on every attempt. Without receiver data use each rate's pattern.
+pub(crate) fn train_link_with_receiver<A: AuxChannel>(
+    aux: &mut A,
+    requested_rate: LinkRate,
+    requested_lanes: u8,
+    receiver: Option<ReceiverTraining>,
+    delay_us: impl Fn(u32) + Copy,
+) -> Result<TrainedLink, LinkError> {
     let lanes = match requested_lanes {
         1 | 2 | 4 => requested_lanes,
         _ => return Err(LinkError::Aborted),
@@ -782,7 +870,7 @@ pub fn train_link<A: AuxChannel>(
     let mut last_err = LinkError::Aborted;
 
     loop {
-        match train_one(aux, rate, cur_lanes, delay_us) {
+        match train_one(aux, rate, cur_lanes, receiver, delay_us) {
             Ok(trained) => return Ok(trained),
             Err(e) => {
                 last_err = e;
