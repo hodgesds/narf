@@ -118,7 +118,7 @@ fn native() -> Result<(), &'static str> {
             )
             .map_err(|_| "normal MSDU after sample")?;
             let bytes = hw.owner.storage.as_ref().unwrap().data.buffers[1].as_slice();
-            if bytes[20..24] != [0; 4]
+            if bytes[20..24] != [1, 0, 0, 0]
                 || u32::from_le_bytes(bytes[28..32].try_into().unwrap()) & (1 << 10) == 0
             {
                 return Err("single sample disabled ordinary native TX A-MSDU");
@@ -176,7 +176,7 @@ fn fragments() -> Result<(), &'static str> {
     hw.submit_fragment(crate::mt7921::vif_slots::Link::HOME, &first)
         .map_err(|_| "first actual user fragment")?;
     if hw.transmit_sequence_published(5)
-        || hw.owner.storage.as_ref().unwrap().data.buffers[0].as_slice()[20..24] != [0; 4]
+        || hw.owner.storage.as_ref().unwrap().data.buffers[0].as_slice()[20..24] != [1, 0, 0, 0]
     {
         return Err("sample observed a partial fragmented MSDU");
     }
@@ -241,7 +241,7 @@ fn rate_sample() -> Result<(), &'static str> {
     {
         return Err("first home frame did not request a rate status");
     }
-    if second[20..24] != [0; 4] || word(second, 28) & (1 << 10) == 0 {
+    if second[20..24] != [1, 0, 0, 0] || word(second, 28) & (1 << 10) == 0 {
         return Err("a frame inside HZ/4 was sampled again");
     }
     if Backend::tx_rate_report(&hw).is_some() {

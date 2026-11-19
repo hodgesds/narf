@@ -250,7 +250,9 @@ fn final_fragment() -> Result<(), &'static str> {
         return Err("async fragmented MSDU returned before final real native token");
     }
     let headers = &session.backend.data_headers[session.backend.data_headers.len() - 4..];
-    if headers[..3].iter().any(|header| header[20..24] != [0; 4])
+    if headers[..3]
+        .iter()
+        .any(|header| header[20..24] != [1, 0, 0, 0])
         || headers[3][20..24] != [3, 4, 0, 0]
         || fragments[3].1[1] & 4 != 0
         || fragments[3].1[22] != 3

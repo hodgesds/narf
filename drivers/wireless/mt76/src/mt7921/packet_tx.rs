@@ -5,6 +5,10 @@ use alloc::{collections::VecDeque, vec::Vec};
 
 pub(super) const HEADER: usize = 64; // 32-byte TXD + 32-byte hardware TXP.
 const TOKEN_LIMIT: u16 = 8192; // Linux MT7921_TOKEN_SIZE; zero is unused here.
+
+// mt76_tx_status_skb_add: acknowledged packets without a requested HOST
+// status use NO_SKB (1). PID 0 is reserved for NO_ACK, not "no TXS request".
+const PACKET_ID_NO_SKB: u32 = 1;
 /// Less than the16-entry physical ring: producer equality never means a
 /// completely full ring, and each submitted payload keeps its own dual proof.
 pub(super) const PIPELINE: usize = 8;
@@ -68,7 +72,7 @@ pub(super) fn management(
             | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
-        if add_ba { 1 << 14 } else { 0 },
+        (if multicast { 0 } else { PACKET_ID_NO_SKB }) | if add_ba { 1 << 14 } else { 0 },
         4 | (u32::from(rate.hardware()) << 16),
         (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
     ];
@@ -148,7 +152,7 @@ pub(super) fn fragment(
         (position << 14) | (2 << 4) | subtype,
         (15 << 11) | (u32::from(protected) << 1),
         0,
-        0,
+        PACKET_ID_NO_SKB,
         0,
         (2 << 20) | (subtype << 16),
     ];
@@ -243,7 +247,7 @@ fn ethernet_txd(
         (2 << 4) | if qos { 8 } else { 0 }, // DATA / QoS DATA; AP receiver is unicast.
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1), // BA_DISABLE; installed PTK only.
         0,
-        0,
+        PACKET_ID_NO_SKB,
         0,
         (2 << 20) | if qos { 8 << 16 } else { 0 },
     ];
