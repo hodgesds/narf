@@ -2010,12 +2010,62 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/xpad", smoke_xpad360w_4slot_demux);
+
+    /// A vendor-class interface that is not an Xbox pad (an FTDI FT232 shape)
+    /// must not match xpad: xpad claims synchronously, so a wildcard there hid
+    /// such devices from loadable-module matches entirely.
+    fn smoke_xpad_match_leaves_other_vendor_class_devices() -> TestResult {
+        use crate::class_registry::match_entry;
+        // One vendor-class (0xFF/0xFF/0xFF) interface, as on an FTDI FT232; an
+        // Xbox 360 wired pad's interface is 0xFF/0x5D/0x01.
+        const CONFIG: [u8; 25] = [
+            9, 0x02, 25, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 0x04, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0, // interface 0
+            7, 0x05, 0x81, 0x03, 32, 0, 4, // interrupt IN
+        ];
+        let mut xbox = CONFIG;
+        xbox[15] = 0x5D;
+        xbox[16] = 0x01;
+        let xpad_takes = |cfg: &[u8]| {
+            super::XPAD_MATCH
+                .iter()
+                .any(|m| match_entry(m, 0x0403, 0x6001, cfg))
+        };
+        if xpad_takes(&CONFIG) {
+            return TestResult::Fail("xpad matched a non-Xbox vendor-class interface");
+        }
+        if !xpad_takes(&xbox) {
+            return TestResult::Fail("xpad no longer matches an Xbox 360 interface");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/xpad",
+        smoke_xpad_match_leaves_other_vendor_class_devices
+    );
 }
 
-pub static XPAD_MATCH: [crate::class_registry::UsbClassMatch; 1] =
-    [crate::class_registry::UsbClassMatch::class_only(
-        USB_CLASS_VENDOR_SPEC,
-    )];
+/// The exact interface triples [`match_interface`] accepts (Linux xpad's
+/// `XPAD_XBOX360_VENDOR_PROTOCOL` / `XPAD_XBOXONE_VENDOR_PROTOCOL` shapes).
+/// Not a bare vendor-class (0xFF) wildcard: [`probe`] claims synchronously
+/// and only then checks the interface, so a wildcard would swallow every
+/// vendor-class device no other driver matched — USB-serial adapters and
+/// loadable-module matches included.
+pub static XPAD_MATCH: [crate::class_registry::UsbClassMatch; 3] = [
+    xpad_triple(XBOX360_INTF_SUBCLASS, XBOX360_INTF_PROTOCOL_WIRED),
+    xpad_triple(XBOX360_INTF_SUBCLASS, XBOX360_INTF_PROTOCOL_WIRELESS),
+    xpad_triple(XBOXONE_INTF_SUBCLASS, XBOXONE_INTF_PROTOCOL),
+];
+
+const fn xpad_triple(subclass: u8, protocol: u8) -> crate::class_registry::UsbClassMatch {
+    crate::class_registry::UsbClassMatch {
+        vendor_id: 0,
+        product_id: 0,
+        class: Some(USB_CLASS_VENDOR_SPEC),
+        subclass: Some(subclass),
+        protocol: Some(protocol),
+    }
+}
 
 /// Scan the configuration descriptor for an Xbox-compatible interface
 /// and its IN/OUT endpoints. Returns `(interface_num, xtype, ep_in, ep_out)`.

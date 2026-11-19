@@ -952,7 +952,15 @@ impl FileOps for TtyUsbFile {
     /// `drivers/usb/serial/generic.c` — enqueues data into the urb
     /// write buffer, then calls `usb_serial_generic_write_start`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let n = self.port.lock().tx.push(buf);
+        let (n, index) = {
+            let mut port = self.port.lock();
+            (port.tx.push(buf), port.index)
+        };
+        // A module-owned node has no supervisor pump: tell its driver
+        // (outside the port lock) that bytes are queued.
+        if n > 0 {
+            crate::module_datapath::serial_kick(index);
+        }
         Box::pin(async move { Ok(n) })
     }
 

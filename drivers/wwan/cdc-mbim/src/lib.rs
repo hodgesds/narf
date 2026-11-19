@@ -8,7 +8,8 @@
 //! The `module` build registers the same CDC-MBIM interface match
 //! (class 0x02 Communications, subclass 0x0E MBIM, any protocol) through the
 //! `narf_register_usb_driver` KSYMTAB export. Registration-only: the probe
-//! returns `-ENOSYS` until a USB transfer datapath is exported to modules.
+//! returns `-ENOSYS`: the USB transfer datapath exists (`narf_usb_*`), but
+//! no WWAN-port / netdev export lets a module publish its sessions yet.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -79,7 +80,8 @@ mod module_probe {
     }
 
     extern "C" fn probe_c(_dev_token: u64, _reserved: u64) -> i32 {
-        // -ENOSYS: no USB transfer datapath is exported to modules yet.
+        // -ENOSYS: transfers are exported (`narf_usb_*`), but there is no
+        // WWAN-port / netdev sink a module could publish sessions through.
         -38
     }
 

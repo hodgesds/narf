@@ -2591,6 +2591,7 @@ dependencies = [
  "narf-drivers-fingerprint",
  "narf-drivers-leds",
  "narf-drivers-sound",
+ "narf-drivers-usb-ftdi",
  "narf-drivers-video",
  "narf-filesystem",
  "narf-firmware",
@@ -2607,6 +2608,13 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-usb-ftdi"
+version = "0.0.0"
+dependencies = [
+ "narf-driver-macros",
 ]
 
 [[package]]

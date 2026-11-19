@@ -710,8 +710,45 @@ also consult upstream Linux GPL sources.
   built-in driver declined it, in registration order, calling each probe
   through `narf_bus::module_usb::call_module_usb_probe` with
   `module_usb_token(controller, slot)` (tag `0x55` in bits 63:56,
-  controller in 15:8, slot in 7:0; opaque — no USB datapath export accepts
-  it yet). 0 claims the device; any negative errno tries the next entry.
+  controller in 15:8, slot in 7:0; opaque to the module). 0 claims the
+  device; any negative errno tries the next entry.
+- Module datapath (`module_datapath`, the `narf_bus::module_usb::Datapath`
+  backend behind the `narf_usb_*` kernel-ABI exports, installed with the
+  registration host):
+  - `open(owner, token, device, config)` mints one context per
+    `(module, token)` immediately before that module's probe; a declined
+    probe, `dispatch_unbind` for the slot, and `unregister_module_drivers`
+    (module unload, after its exit hook) retire it. At most 32 contexts and
+    32 unconsumed requests per context (`-ENOSPC`). Every hook resolves
+    `(owner, token)`; another owner's token is `-ENODEV`.
+  - `configure` takes endpoint addresses only; type, `wMaxPacketSize` and
+    `bInterval` come from the probed configuration descriptor. Isochronous
+    endpoints are `-EOPNOTSUPP`. Transfers require a configured endpoint.
+  - Control requests run in kernel tasks (OUT data copied at submit, IN
+    data at poll); standard `SET_ADDRESS` is refused. Bulk requests post a
+    TD through `begin_bulk_*`; interrupt-IN arms once and is re-armed by
+    the xHCI poll; a per-context pump task polls pending bulk/interrupt
+    receipts every millisecond while any are pending. One transfer per
+    endpoint (`-EBUSY`). Status is a Linux URB errno (`-EPIPE` stall,
+    `-EPROTO`, `-EOVERFLOW`, `-ETIMEDOUT`, `-ENODEV`, `-ECANCELED`).
+  - `cancel` stops a bulk TD through `stop_bulk` in a kernel task (an OUT
+    may already have reached the device) and completes an interrupt-IN
+    wait as `-ECANCELED`; control, configure and interrupt-OUT run to
+    completion (`-EBUSY`). Retirement stops posted bulk TDs the same way
+    and never calls module text.
+  - Completion callbacks run outside every datapath lock, only through
+    `call_module_usb_callback`.
+  - `serial_register` publishes `/dev/ttyUSB<N>` (family code 0 ch341,
+    1 ftdi_sio, 2 pl2303, 3 cp210x) backed by the context: a writer's
+    bytes queue in the node's TX ring and run the module's kick callback;
+    `serial_tx` drains that ring (nothing while `TCXONC` stopped it) and
+    `serial_rx` feeds readers. Termios ioctls on a module node update its
+    cached state only (`port::binding_for_tty` has no built-in binding).
+- Feature `ftdi-module-only`: the serial cascade skips the FTDI family so
+  FTDI parts reach a loadable `ftdi_sio` module's match
+  (`narf-drivers-usb-ftdi`). The FTDI wire codec (`serial::ftdi`'s request
+  codes, divisors, modem-control encoding) is re-exported from that crate,
+  so both builds program identical values.
 - Disconnect lifecycle: the supervisor polls connection state each cycle.
   A claimed root port (or bound hub downstream port) that leaves the
   connected set is detached via `attach::detach_slot`: class bindings are

@@ -220,6 +220,14 @@ enum Cmd {
     /// loads it into an operator-selected driver frame before PCI probing,
     /// and leaves the built-in e1000 registration disabled for this boot.
     E1000ModuleNetSmoke(BuildArgs),
+    /// USB datapath C-ABI proof over QEMU's `usb-serial` (an FTDI FT232BM).
+    /// Builds and ABI-stamps ftdi.ko (`narf-drivers-usb-ftdi`), autoloads it
+    /// from the initramfs with the built-in FTDI binder stepped aside
+    /// (`narf-drivers-usb/ftdi-module-only`), then has the guest shell write
+    /// to and read from the module's `/dev/ttyUSB0` while a host socket plays
+    /// the far end of the serial line. Proves control, bulk-IN and bulk-OUT
+    /// transfers driven entirely by module text.
+    FtdiModuleSerialSmoke(BuildArgs),
     /// The same live TCP/UDP/DNS smoke over the built-in igb driver bound to
     /// QEMU's `-device igb` (82576, 0x10C9). Boots LegacyOnly with the static
     /// IPv4 late initcall so igb is the sole NIC and owns the SLIRP lease,
@@ -1948,6 +1956,18 @@ impl Arch {
                     // QEMU smoke harness exercises the full
                     // xHCI → HID-boot-keyboard → narf_input pipeline.
                     args.extend_from_slice(&["-device".into(), "usb-kbd,bus=xhci0.0".into()]);
+                    // `XTASK_QEMU_USB_SERIAL_SOCKET=<path>`: an FTDI FT232BM
+                    // (`usb-serial`, 0403:6001) whose serial line is a host
+                    // unix socket the caller is already listening on. Used by
+                    // `ftdi-module-serial-smoke`; absent otherwise.
+                    if let Ok(sock) = std::env::var("XTASK_QEMU_USB_SERIAL_SOCKET") {
+                        args.extend_from_slice(&[
+                            "-chardev".into(),
+                            format!("socket,id=usbser0,path={sock},server=off"),
+                            "-device".into(),
+                            "usb-serial,bus=xhci0.0,chardev=usbser0,always-plugged=on".into(),
+                        ]);
+                    }
                     if gpu_backend != GpuBackend::Virgl {
                         args.extend_from_slice(&[
                             "-device".into(),
@@ -8484,6 +8504,143 @@ enum NetSmokeNic {
 /// NIC ownership and QEMU backend differ.
 fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     net_smoke_cmd_with_nic(args, NetSmokeNic::Virtio)
+}
+
+/// `cargo xtask ftdi-module-serial-smoke` — see [`Cmd::FtdiModuleSerialSmoke`].
+fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const PING: &[u8] = b"NARF-FTDI-PING";
+    const PONG: &[u8] = b"HOST-FTDI-PONG";
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask ftdi-module-serial-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+    }
+    let root = workspace_root()?;
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "module-allow-unsigned");
+    ensure_feature(&mut build.features, "narf-drivers-usb/ftdi-module-only");
+
+    let abi = kernel_abi_hash_from_source(&root)?;
+    let module =
+        build_module_fixture_with_abi("narf-drivers-usb-ftdi", build.arch, &root, Some(abi))?;
+    let cpio = encode_cpio_newc(&[("lib/modules/ftdi.ko", module.as_slice())]);
+    let initrd = root
+        .join("target")
+        .join("ftdi-module-serial-smoke-initramfs.cpio");
+    std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
+    println!("xtask ftdi-module-serial-smoke: staged ABI 0x{abi:08x} ftdi.ko for autoload");
+
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!("expected kernel binary at {}", kernel.display());
+    }
+
+    // The far end of the FT232's serial line. QEMU connects as a client
+    // (`server=off`), so listen before launching it. Every byte the guest
+    // writes through the module's bulk-OUT lands here; once the ping
+    // arrives the host answers, and that answer must come back through the
+    // module's bulk-IN to the guest shell's `cat`.
+    let sock = root.join("target").join("ftdi-module-serial-smoke.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener =
+        UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let received = received.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut answered = false;
+            let mut buf = [0u8; 256];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        let saw_ping = {
+                            let Ok(mut g) = received.lock() else { return };
+                            g.extend_from_slice(&buf[..n]);
+                            g.windows(PING.len()).any(|w| w == PING)
+                        };
+                        if saw_ping && !answered {
+                            answered = true;
+                            let _ = stream.write_all(PONG);
+                            let _ = stream.write_all(b"\r\n");
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+    std::env::set_var("XTASK_QEMU_USB_SERIAL_SOCKET", &sock);
+    {
+        let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+        let extra = "no_redis modules_load=lib/modules/ftdi.ko";
+        let combined = if existing.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{existing} {extra}")
+        };
+        std::env::set_var("XTASK_QEMU_APPEND", combined);
+    }
+
+    // The sleeps give the USB supervisor time to attach the FT232 and the
+    // module time to finish its completion-driven bring-up after the shell
+    // prompt appears; then one write and one read through the module node.
+    let typed = "sleep 4; echo NARF-FTDI-PING > /dev/ttyUSB0; sleep 2; cat /dev/ttyUSB0";
+    let transcript = run_interactive_boot(
+        &kernel,
+        Some(&initrd),
+        &build,
+        typed,
+        std::str::from_utf8(PONG).expect("ASCII"),
+    );
+    let _ = std::fs::remove_file(&sock);
+    let transcript = transcript?;
+
+    let host_saw_ping = received
+        .lock()
+        .map(|g| g.windows(PING.len()).any(|w| w == PING))
+        .unwrap_or(false);
+    let required: [(&str, &str); 3] = [
+        (
+            "modules: autoloaded ftdi_sio from lib/modules/ftdi.ko",
+            "ftdi.ko was not autoloaded from the initramfs",
+        ),
+        (
+            "claimed by module ftdi_sio-module",
+            "the FT232 was not claimed through the module match",
+        ),
+        (
+            "ftdi_sio: module driver bound ttyUSB",
+            "the module did not finish its bring-up",
+        ),
+    ];
+    for (needle, why) in required {
+        if !transcript.contains(needle) {
+            bail!("xtask ftdi-module-serial-smoke: {why} (missing `{needle}`)");
+        }
+    }
+    if !host_saw_ping {
+        bail!("xtask ftdi-module-serial-smoke: the host end never received the guest's bytes");
+    }
+    println!(
+        "xtask ftdi-module-serial-smoke: PASS — guest→host bulk-OUT and host→guest bulk-IN through ftdi.ko"
+    );
+    Ok(())
 }
 
 fn e1000_module_net_smoke_cmd(args: &BuildArgs) -> Result<()> {
@@ -15588,6 +15745,7 @@ fn main() -> Result<()> {
         Cmd::NvmePoweroffCheck(args) => nvme_poweroff_check_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
+        Cmd::FtdiModuleSerialSmoke(args) => ftdi_module_serial_smoke_cmd(&args),
         Cmd::IgbNetSmoke(args) => igb_net_smoke_cmd(&args),
         Cmd::NetPeer(args) => net_robust::net_peer_main(&args.sock, args.mask, args.long),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),

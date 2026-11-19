@@ -31,6 +31,7 @@ pub mod hub;
 pub mod intr;
 pub mod iso;
 pub mod lan95xx;
+pub mod module_datapath;
 pub mod msc;
 pub mod ohci;
 pub mod r8152;

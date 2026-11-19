@@ -191,6 +191,15 @@ So the surface is small and grows deliberately. Today:
 | `narf_netif_register` | `(u64, *const u8, usize, *mut u32) -> i32` | register a copy-mode Ethernet interface and TX callback; requires `NetIface` |
 | `narf_netif_register_with_context` | `(u64, *const u8, usize, *mut u32) -> i32` | TX callback receives `(dev_token, frame, len)`; use for multiple devices per module; requires `NetIface` |
 | `narf_netif_rx` | `(u64, u32, *mut u8, usize) -> i32` | synchronously deliver copied RX bytes to the registered interface |
+| `narf_usb_config_descriptor` | `(u64, *mut u8, usize, *mut usize) -> i32` | copy the probed configuration descriptor; `-105` with the required length when short; requires `BusDevice` |
+| `narf_usb_configure` | `(u64, *const u8, usize, usize, u64, *mut u64) -> i32` | configure endpoints by address (attributes come from the descriptor); returns a request id |
+| `narf_usb_control` | `(u64, *const u8, *const u8, usize, usize, u64, *mut u64) -> i32` | 8-byte SETUP + OUT data (or `len = 0` for IN); `SET_ADDRESS` refused |
+| `narf_usb_submit` | `(u64, u8, *const u8, usize, usize, u64, *mut u64) -> i32` | one bulk/interrupt transfer on a configured endpoint; IN passes a null data pointer and its capacity |
+| `narf_usb_poll` | `(u64, u64, *mut u8, usize, *mut usize) -> i32` | `-11` pending; `-105` keeps the result; otherwise copies IN data, stores the length, returns the URB status and consumes the id |
+| `narf_usb_cancel` | `(u64, u64) -> i32` | request cancellation of a bulk or interrupt-IN request; keep polling |
+| `narf_usb_serial_register` | `(u64, u32, usize, u64, *mut u32) -> i32` | publish `/dev/ttyUSB<N>` backed by the device; kick callback on writes |
+| `narf_usb_serial_tx` | `(u64, u32, *mut u8, usize, *mut usize) -> i32` | take bytes writers queued on the node |
+| `narf_usb_serial_rx` | `(u64, u32, *const u8, usize) -> i32` | deliver received bytes to readers; returns bytes accepted |
 
 Declare them as you would any foreign function:
 
@@ -208,7 +217,11 @@ resolve those imports when the declaration is absent. MSI-X, IRQ, and poller
 exports likewise require `BusDevice` (for example,
 `required_caps=DmaBuffer:Write,BusDevice:Write`). Network registration and RX
 require `NetIface`; a driver using the full device path normally declares all
-three. The retained per-device cap is still checked on every invocation; the
+three. The USB datapath exports (`narf_usb_*`) require `BusDevice`. Their
+`dev` is the token a USB probe received; every request is submitted, then
+optionally reported through a completion callback (task context, the
+module's domain) and collected with `narf_usb_poll`. `drivers/usb/ftdi` is the
+worked example: a USB-serial driver built entirely from completions. The retained per-device cap is still checked on every invocation; the
 manifest declaration only controls whether the imports can link.
 
 IRQ callbacks never run in hard-IRQ context. The FRAME handler accounts and

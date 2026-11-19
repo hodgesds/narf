@@ -26,7 +26,8 @@ transport activation and user-facing modem policy remain out of scope.
   dual-build: built-in, or a registration-only loadable `.ko`
   (`target_domain=net`) that registers the same interface match (class
   0x02, subclass 0x0E) through the `narf_register_usb_driver` export; its
-  probe returns `-ENOSYS` until a USB transfer datapath is exported.
+  probe returns `-ENOSYS` until a WWAN-port / netdev export exists for
+  modules (the USB transfer datapath itself is exported).
 - `WwanPort` exposes `name`, `kind`, `send`, and `recv`. It requires
   `Send + Sync` because registered `Arc` ports are stored in one
   cross-CPU registry and may be called through shared references.

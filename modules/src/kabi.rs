@@ -126,6 +126,41 @@ macro_rules! kernel_abi {
     };
 }
 
+// USB datapath export helpers. Kept above the `kernel_abi!` block: xtask
+// compiles that block alone (to compute the ABI hash), without kernel crates.
+
+/// Build a completion notification from an export's raw callback argument.
+///
+/// # Safety
+/// `callback` is 0 or the address of an `extern "C" fn(u64) -> i32` in the
+/// calling module's text, which stays mapped until the module's USB
+/// contexts are retired at unload.
+unsafe fn usb_completion(callback: usize, cookie: u64) -> narf_bus::module_usb::Completion {
+    narf_bus::module_usb::Completion {
+        callback: (callback != 0).then(|| {
+            // SAFETY: the caller promises the documented C callback address.
+            unsafe { core::mem::transmute::<usize, narf_bus::ModuleCallbackFn>(callback) }
+        }),
+        cookie,
+    }
+}
+
+/// Store a submitted request id, or return the submit error.
+///
+/// # Safety
+/// `out_urb` is non-null and names writable, aligned `u64` storage.
+unsafe fn usb_submitted(result: Result<u64, i32>, out_urb: *mut u64) -> i32 {
+    match result {
+        Ok(urb) => {
+            // SAFETY: the caller checked `out_urb` is non-null, and the
+            // export contract promises writable, aligned storage.
+            unsafe { out_urb.write(urb) };
+            0
+        }
+        Err(e) => e,
+    }
+}
+
 kernel_abi! {
     /// Write `len` bytes of UTF-8 at `ptr` to the kernel console.
     ///
@@ -787,6 +822,224 @@ kernel_abi! {
     fn narf_wireless_close(dev: u64, session: u64) -> i32 {
         narf_bus::module_wireless::close(crate::symbols::current_execution_id().0, dev, session)
     }
+
+    // ── Device datapath: USB transfers (URB-style) ──────────────────
+    //
+    // `dev` is the token a USB probe (`narf_register_usb_driver`) received.
+    // Every request is kernel-owned: submit returns an opaque, never-reused
+    // id; the kernel optionally calls `callback(cookie)` (an `extern "C"
+    // fn(u64) -> i32`, task context, module domain) once the request is
+    // terminal; `narf_usb_poll` collects it. Payloads are copied: module
+    // memory is never a DMA target. See `narf_bus::module_usb`.
+
+    /// Copy the configuration descriptor the device was probed with into
+    /// `buf`, storing its length through `out_len`. `-ENOBUFS` (nothing
+    /// copied, required length stored) when `len` is too small, so a call
+    /// with `len = 0` sizes the buffer.
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes (it may be null when `len` is 0) and
+    /// `out_len` names writable, aligned `usize` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_config_descriptor(dev: u64, buf: *mut u8, len: usize, out_len: *mut usize) -> i32 {
+        if out_len.is_null() || len > narf_bus::module_usb::MAX_CONFIG_DESCRIPTOR
+            || (len != 0 && buf.is_null()) { return -22; }
+        let out = if len == 0 { &mut [] } else {
+            // SAFETY: non-null, bounded writable module storage for this call.
+            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        let (status, required) = narf_bus::module_usb::config_descriptor(owner, dev, out);
+        // SAFETY: writable aligned output, per the export contract.
+        unsafe { out_len.write(required) };
+        status
+    }
+
+    /// Request xHCI configuration of `count` endpoints, named by address
+    /// (bit 7 = IN) as they appear in the configuration descriptor; the
+    /// kernel takes type, packet size and interval from that descriptor.
+    /// The request id is stored through `out_urb`; poll it for the result.
+    ///
+    /// # Safety
+    /// `endpoints` names `count` readable bytes; `out_urb` names writable
+    /// `u64` storage; `callback` is 0 or stays mapped until unload.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_configure(
+        dev: u64, endpoints: *const u8, count: usize,
+        callback: usize, cookie: u64, out_urb: *mut u64,
+    ) -> i32 {
+        if endpoints.is_null() || out_urb.is_null()
+            || count == 0 || count > narf_bus::module_usb::MAX_CONFIGURE_ENDPOINTS { return -22; }
+        // SAFETY: the module promises `count` readable bytes; bounded above.
+        let endpoints = unsafe { core::slice::from_raw_parts(endpoints, count) };
+        // SAFETY: `callback` is 0 or a valid `extern "C" fn(u64) -> i32`
+        // address; unload retires the context before unmapping it.
+        let done = unsafe { usb_completion(callback, cookie) };
+        let owner = crate::symbols::current_execution_id().0;
+        // SAFETY: `out_urb` was checked non-null above.
+        unsafe { usb_submitted(narf_bus::module_usb::configure(owner, dev, endpoints, done), out_urb) }
+    }
+
+    /// Submit one control transfer on EP0. `setup` names the 8-byte SETUP
+    /// packet. For an OUT request `data`/`len` is the data stage and `len`
+    /// must equal `wLength`; for an IN request pass `len = 0` and poll with
+    /// a buffer of at least `wLength` bytes. `SET_ADDRESS` is refused.
+    ///
+    /// # Safety
+    /// `setup` names 8 readable bytes, `data` names `len` readable bytes
+    /// (null when `len` is 0), `out_urb` names writable `u64` storage, and
+    /// `callback` is 0 or stays mapped until unload.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_control(
+        dev: u64, setup: *const u8, data: *const u8, len: usize,
+        callback: usize, cookie: u64, out_urb: *mut u64,
+    ) -> i32 {
+        if setup.is_null() || out_urb.is_null() || len > narf_bus::module_usb::MAX_TRANSFER
+            || (len != 0 && data.is_null()) { return -22; }
+        let mut packet = [0u8; 8];
+        // SAFETY: the module promises eight readable bytes.
+        packet.copy_from_slice(unsafe { core::slice::from_raw_parts(setup, 8) });
+        let data = if len == 0 { &[] } else {
+            // SAFETY: non-null, bounded readable module storage; copied
+            // before this call returns.
+            unsafe { core::slice::from_raw_parts(data, len) }
+        };
+        // SAFETY: same callback contract as `narf_usb_configure`.
+        let done = unsafe { usb_completion(callback, cookie) };
+        let owner = crate::symbols::current_execution_id().0;
+        // SAFETY: `out_urb` was checked non-null above.
+        unsafe { usb_submitted(narf_bus::module_usb::control(owner, dev, packet, data, done), out_urb) }
+    }
+
+    /// Submit one bulk or interrupt transfer on a configured endpoint. For
+    /// an IN endpoint pass `data = null` and `len` = receive capacity; for an
+    /// OUT endpoint `data`/`len` is the payload, copied before return. An
+    /// endpoint carries one transfer at a time (`-EBUSY` otherwise).
+    ///
+    /// # Safety
+    /// For OUT, `data` names `len` readable bytes; `out_urb` names writable
+    /// `u64` storage; `callback` is 0 or stays mapped until unload.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_submit(
+        dev: u64, endpoint: u8, data: *const u8, len: usize,
+        callback: usize, cookie: u64, out_urb: *mut u64,
+    ) -> i32 {
+        if out_urb.is_null() || len == 0 || len > narf_bus::module_usb::MAX_TRANSFER { return -22; }
+        let is_in = endpoint & 0x80 != 0;
+        if is_in != data.is_null() { return -22; }
+        let data = if is_in { &[] } else {
+            // SAFETY: non-null, bounded readable module storage; copied
+            // before this call returns.
+            unsafe { core::slice::from_raw_parts(data, len) }
+        };
+        // SAFETY: same callback contract as `narf_usb_configure`.
+        let done = unsafe { usb_completion(callback, cookie) };
+        let owner = crate::symbols::current_execution_id().0;
+        // SAFETY: `out_urb` was checked non-null above.
+        unsafe { usb_submitted(narf_bus::module_usb::transfer(owner, dev, endpoint, data, len, done), out_urb) }
+    }
+
+    /// Poll one request. `-EAGAIN` while pending. `-ENOBUFS` stores the
+    /// required length and retains the result. Otherwise the request is
+    /// consumed: IN data is copied to `buf`, the transferred length is stored
+    /// through `out_len`, and the terminal status is returned (0, or a
+    /// Linux URB errno such as `-EPIPE` for a stall or `-ECANCELED`).
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes (null when `len` is 0); `out_len`
+    /// names writable, aligned `usize` storage not overlapping `buf`.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_poll(dev: u64, urb: u64, buf: *mut u8, len: usize, out_len: *mut usize) -> i32 {
+        if out_len.is_null() || len > narf_bus::module_usb::MAX_TRANSFER
+            || (len != 0 && buf.is_null()) { return -22; }
+        let out = if len == 0 { &mut [] } else {
+            // SAFETY: non-null, bounded writable module storage for this call.
+            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        let (status, n) = narf_bus::module_usb::poll(owner, dev, urb, out);
+        // SAFETY: writable aligned output, per the export contract.
+        unsafe { out_len.write(n) };
+        status
+    }
+
+    /// Request cancellation of a pending bulk or interrupt-IN request; keep
+    /// polling it for the terminal status. Control, configure and
+    /// interrupt-OUT requests run to completion (`-EBUSY`).
+    ///
+    /// # Safety
+    /// `dev`/`urb` are this module's own token and request id.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_cancel(dev: u64, urb: u64) -> i32 {
+        narf_bus::module_usb::cancel(crate::symbols::current_execution_id().0, dev, urb)
+    }
+
+    /// Publish a `/dev/ttyUSB<N>` node backed by this device and store its
+    /// port number through `out_port`. `family` names the chip for sysfs
+    /// (0 ch341, 1 ftdi_sio, 2 pl2303, 3 cp210x). `kick` (0 or an `extern
+    /// "C" fn(u64) -> i32`) runs with `cookie` whenever a writer queues bytes.
+    ///
+    /// # Safety
+    /// `out_port` names writable `u32` storage; `kick` is 0 or stays mapped
+    /// until unload.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_serial_register(
+        dev: u64, family: u32, kick: usize, cookie: u64, out_port: *mut u32,
+    ) -> i32 {
+        if out_port.is_null() { return -22; }
+        // SAFETY: same callback contract as `narf_usb_configure`.
+        let kick = unsafe { usb_completion(kick, cookie) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_usb::serial_register(owner, dev, family, kick) {
+            Ok(port) => {
+                // SAFETY: non-null above; the module promises writable storage.
+                unsafe { out_port.write(port) };
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Take up to `len` bytes writers queued on this device's serial node,
+    /// storing the count through `out_len` (0 when none, or while output is
+    /// stopped by `TCXONC`).
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes; `out_len` names writable `usize`.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_serial_tx(dev: u64, port: u32, buf: *mut u8, len: usize, out_len: *mut usize) -> i32 {
+        if buf.is_null() || out_len.is_null() || len == 0
+            || len > narf_bus::module_usb::MAX_TRANSFER { return -22; }
+        // SAFETY: non-null, bounded writable module storage for this call.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_usb::serial_tx(owner, dev, port, out) {
+            Ok(n) => {
+                // SAFETY: writable aligned output, per the export contract.
+                unsafe { out_len.write(n) };
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Deliver `len` received bytes to readers of this device's serial node.
+    /// Returns the number of bytes accepted (the ring may be full), or a
+    /// negative errno.
+    ///
+    /// # Safety
+    /// `data` names `len` readable bytes.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_serial_rx(dev: u64, port: u32, data: *const u8, len: usize) -> i32 {
+        if data.is_null() || len == 0 || len > narf_bus::module_usb::MAX_TRANSFER { return -22; }
+        // SAFETY: non-null, bounded readable module storage; copied here.
+        let data = unsafe { core::slice::from_raw_parts(data, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_usb::serial_rx(owner, dev, port, data) {
+            Ok(n) => n as i32,
+            Err(e) => e,
+        }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -1119,3 +1372,62 @@ kernel_test_in!(
     "modules/kabi",
     smoke_kabi_register_usb_driver_validates_and_forwards
 );
+
+/// The USB datapath exports reject malformed arguments before reaching the
+/// USB stack, and a token no probe context was minted for is `-ENODEV`
+/// (never another module's device). `0x55 << 56` is the USB token tag.
+fn smoke_kabi_usb_datapath_validates_arguments() -> TestResult {
+    const UNKNOWN: u64 = (0x55u64 << 56) | 0xFEFE;
+    let mut urb = 0u64;
+    let mut n = 0usize;
+    let mut buf = [0u8; 64];
+    let setup = [0x80u8, 0x06, 0, 1, 0, 0, 18, 0];
+    let eps = [0x81u8];
+    // SAFETY: every pointer below is either null (to prove rejection) or
+    // names live, correctly sized local storage; callbacks are 0.
+    let rejected = unsafe {
+        narf_usb_poll(UNKNOWN, 1, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut()) == -22
+            && narf_usb_poll(UNKNOWN, 1, core::ptr::null_mut(), 8, &mut n) == -22
+            && narf_usb_config_descriptor(UNKNOWN, buf.as_mut_ptr(), 1 << 20, &mut n) == -22
+            && narf_usb_control(UNKNOWN, core::ptr::null(), core::ptr::null(), 0, 0, 0, &mut urb) == -22
+            && narf_usb_control(UNKNOWN, setup.as_ptr(), core::ptr::null(), 4, 0, 0, &mut urb) == -22
+            // IN endpoint with a data pointer, OUT endpoint without one.
+            && narf_usb_submit(UNKNOWN, 0x81, buf.as_ptr(), 8, 0, 0, &mut urb) == -22
+            && narf_usb_submit(UNKNOWN, 0x02, core::ptr::null(), 8, 0, 0, &mut urb) == -22
+            && narf_usb_submit(UNKNOWN, 0x81, core::ptr::null(), 0, 0, 0, &mut urb) == -22
+            && narf_usb_configure(UNKNOWN, eps.as_ptr(), 0, 0, 0, &mut urb) == -22
+            && narf_usb_configure(UNKNOWN, eps.as_ptr(), 1, 0, 0, core::ptr::null_mut()) == -22
+            && narf_usb_serial_register(UNKNOWN, 1, 0, 0, core::ptr::null_mut()) == -22
+            && narf_usb_serial_tx(UNKNOWN, 0, buf.as_mut_ptr(), 0, &mut n) == -22
+            && narf_usb_serial_rx(UNKNOWN, 0, core::ptr::null(), 4) == -22
+    };
+    if !rejected {
+        return TestResult::Fail("a USB datapath export accepted a malformed argument");
+    }
+    let mut port = 0u32;
+    // SAFETY: as above; all arguments are well formed.
+    let unknown = unsafe {
+        [
+            narf_usb_config_descriptor(UNKNOWN, buf.as_mut_ptr(), buf.len(), &mut n),
+            narf_usb_control(
+                UNKNOWN,
+                setup.as_ptr(),
+                core::ptr::null(),
+                0,
+                0,
+                0,
+                &mut urb,
+            ),
+            narf_usb_submit(UNKNOWN, 0x81, core::ptr::null(), 8, 0, 0, &mut urb),
+            narf_usb_configure(UNKNOWN, eps.as_ptr(), 1, 0, 0, &mut urb),
+            narf_usb_poll(UNKNOWN, 1, buf.as_mut_ptr(), buf.len(), &mut n),
+            narf_usb_cancel(UNKNOWN, 1),
+            narf_usb_serial_register(UNKNOWN, 1, 0, 0, &mut port),
+        ]
+    };
+    if unknown.iter().any(|&rc| rc != -19) {
+        return TestResult::Fail("a USB datapath export reached a device with no probe context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_usb_datapath_validates_arguments);
