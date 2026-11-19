@@ -1897,6 +1897,20 @@ namespace (the target's parent for self-reads).
 memory fields are derived from VMA extents and resident page counts. Procfs
 values that have no authoritative NARF provider remain absent rather than
 fabricated measurements.
+`/proc/net/unix` lists live AF_UNIX sockets in the caller's network namespace.
+The `net/unix` entries under process and thread directories select the named
+task's namespace. An open file retains that selection across namespace changes.
+Reads from offset zero refresh the table, and subsequent chunks use the same
+snapshot. Rows include the socket type, state, accept flag, sockfs inode, and
+optional local address. Queued stream connections have inode zero until
+accepted. Abstract names render NUL bytes as `@` and retain other bytes.
+The address column is masked and the reference count reports native socket
+ownership, excluding the temporary reference used for enumeration.
+Registered network tables can implement `ProcFile::net_view` to select the
+caller (`None`) or an outer PID/TID (`Some(id)`). The Unix table uses
+`ProcFile::read_at` to retain one snapshot across short reads. Reading
+again at offset zero refreshes the snapshot in the selected namespace.
+
 `/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
 congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,
 and congestion values come from the TCP snapshot hook. The uid and inode

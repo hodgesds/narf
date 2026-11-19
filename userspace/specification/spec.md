@@ -655,6 +655,14 @@ and applicable inherited access ACL. The creator can subsequently `chmod` its
 socket without `CAP_FOWNER`; ownership checks on unrelated inodes remain in
 force. Abstract addresses create no filesystem inode.
 
+Unix socket creation publishes a weak reference for procfs enumeration in
+the creator's network namespace. A queued stream endpoint inherits the
+connecting socket's namespace and the listener's local address. Accept
+publishes its sockfs inode to procfs, and final destruction removes the row.
+Connecting an AF_UNIX datagram socket marks both endpoints connected in
+procfs. An explicit disconnect also clears the old destination's connected
+state when that destination has no outgoing peer.
+
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 pathname binds materialize their socket inode before publishing the endpoint

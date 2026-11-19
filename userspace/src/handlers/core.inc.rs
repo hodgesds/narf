@@ -1470,6 +1470,10 @@ pub fn init_per_task_state() {
         crate::proc_ipc_limit_read,
         crate::proc_ipc_limit_write,
     );
+    narf_filesystem::procfs::register_proc(
+        "net/unix",
+        Arc::new(crate::socket::proc_unix::UnixSockets),
+    );
     // `/proc/narf/tasks`: scheduler tasks `/proc` does not list, and what
     // they still hold (see `narf_tasks_report`).
     narf_filesystem::procfs::register_proc("narf/tasks", Arc::new(NarfTasksFile));

@@ -7086,7 +7086,7 @@ fn spawn_net_check_listener() -> Result<u16> {
 /// imprecise match only shifts load, never drops coverage). First match
 /// wins; order matters.
 fn musl_case_group(cmd: &str) -> &'static str {
-    if cmd == "userns_smoke" {
+    if matches!(cmd, "userns_smoke" | "unix_listen_wake_smoke --proc-netns") {
         return "userns";
     }
     let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
@@ -7530,6 +7530,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pthread_sched_smoke", "pthread-sched-ok"),
         ("pthread_sched_glibc", "pthread-sched-ok"),
         ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
+        ("unix_listen_wake_smoke --proc-netns", "proc-netns-ok"),
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
         ("wlproxy_sockpair_smoke", "wlproxy-ok"),
         ("wlproxy_sockpair_glibc", "wlproxy-ok"),
@@ -7737,7 +7738,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
 
     // Select this invocation's group (or all groups when unset).
     let want = |cmd: &str| {
-        (cmd != "userns_smoke" || args.build.features.split(',').any(|f| f == "container"))
+        (musl_case_group(cmd) != "userns"
+            || args.build.features.split(',').any(|f| f == "container"))
             && args
                 .group
                 .as_deref()

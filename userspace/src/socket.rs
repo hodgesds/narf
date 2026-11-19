@@ -37,6 +37,7 @@ mod inet6_dgram;
 mod inet_dgram;
 mod inet_port;
 pub(crate) mod packet;
+pub(crate) mod proc_unix;
 mod sockopt;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 pub use packet::{AF_PACKET, SOCK_PACKET, SOL_PACKET};
@@ -979,6 +980,11 @@ pub struct SocketFile {
     /// `Weak` owners); upgrading this bridges read(2)/write(2) onto the same
     /// dispatch path as recv(2)/send(2).
     self_weak: Weak<SocketFile>,
+    /// A queued Unix server endpoint has no file inode visible until accept.
+    unix_pending_accept: AtomicBool,
+    /// unix_dgram_connect marks both endpoints established, even when only
+    /// one of them has an outgoing peer. A self-connect needs no second lock.
+    unix_dgram_established: AtomicBool,
     state: IrqSafeSpinLock<SocketState>,
     /// Per-socket option storage. Setsockopt writes here; getsockopt
     /// reads. Values that affect packet shape (TCP_NODELAY,
@@ -1618,7 +1624,7 @@ enum SocketState {
     UnixDgram {
         addr: Option<UnixAddr>,
         inbox: VecDeque<DgramPacket>,
-        peer: Option<UnixAddr>,
+        peer: Option<(UnixAddr, Weak<SocketFile>)>,
     },
     /// AF_INET6 SOCK_STREAM — same ring shape as InetConnected,
     /// addressed by 16-byte IPv6 addr instead of u32 IPv4.
@@ -2032,6 +2038,21 @@ impl SocketFile {
     /// IPPROTO_*, and so SO_PROTOCOL round-trips. Also seeds the
     /// state with InetRaw for AF_INET/SOCK_RAW.
     pub fn with_protocol(domain: u16, kind: u32, protocol: u32) -> Arc<Self> {
+        let net_ns_id = if domain == AF_UNIX {
+            proc_unix::current_net_ns_id()
+        } else {
+            0
+        };
+        Self::with_protocol_in(domain, kind, protocol, net_ns_id, false)
+    }
+
+    fn with_protocol_in(
+        domain: u16,
+        kind: u32,
+        protocol: u32,
+        net_ns_id: u64,
+        pending_accept: bool,
+    ) -> Arc<Self> {
         // `inet_create` resolves protocol 0 to the type's default
         // (`net/ipv4/af_inet.c:281-283`), so SO_PROTOCOL on a
         // socket(AF_INET, SOCK_DGRAM, 0) reports IPPROTO_UDP.
@@ -2174,6 +2195,8 @@ impl SocketFile {
             inode: narf_filesystem::inode_id::PseudoFs::Sock.new_inode(),
             sk_uid: crate::handlers::current_fsuid(),
             self_weak: self_weak.clone(),
+            unix_pending_accept: AtomicBool::new(pending_accept),
+            unix_dgram_established: AtomicBool::new(false),
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
@@ -2187,7 +2210,7 @@ impl SocketFile {
             send_udp_gso: IrqSafeSpinLock::new(BTreeMap::new()),
             send_txtime: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
-            net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            net_ns_id: core::sync::atomic::AtomicU64::new(net_ns_id),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
             bound_unix_path: IrqSafeSpinLock::new(None),
             connected_unix_path: IrqSafeSpinLock::new(None),
@@ -2237,6 +2260,9 @@ impl SocketFile {
             netlink_uevent_subscribed: AtomicBool::new(false),
             uevent_readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
         });
+        if domain == AF_UNIX && !pending_accept {
+            proc_unix::track(&socket);
+        }
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
@@ -3540,7 +3566,9 @@ impl SocketFile {
             SocketState::Inet6Raw {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in6(*a, *p)),
-            SocketState::UnixDgram { peer: Some(p), .. } => Some(SockAddr {
+            SocketState::UnixDgram {
+                peer: Some((p, _)), ..
+            } => Some(SockAddr {
                 family: AF_UNIX,
                 body: p.to_body(),
             }),
@@ -9610,6 +9638,7 @@ impl SocketFile {
                 match &mut *state {
                     SocketState::UnixListener { pending, .. } => {
                         if let Some(s) = pending.pop_front() {
+                            s.unix_pending_accept.store(false, Ordering::Release);
                             self.set_listener_readiness(!pending.is_empty());
                             SocketOpResult::Accepted {
                                 socket: s,
@@ -9708,7 +9737,8 @@ impl SocketFile {
                 // Give the new accepted endpoint to the listener's
                 // pending queue; configure our local state with
                 // the matching pair.
-                let server_end = SocketFile::new(AF_UNIX, self.kind);
+                let server_end =
+                    SocketFile::with_protocol_in(AF_UNIX, self.kind, 0, self.net_ns_id(), true);
                 {
                     let mut srv_state = server_end.state.lock();
                     *srv_state = SocketState::UnixConnected {
@@ -9741,7 +9771,15 @@ impl SocketFile {
                 server_end.set_peer_groups(client_groups);
                 {
                     let mut lst = listener.state.lock();
-                    if let SocketState::UnixListener { pending, .. } = &mut *lst {
+                    if let SocketState::UnixListener { pending, addr } = &mut *lst {
+                        if let SocketState::UnixConnected { local_addr, .. } =
+                            &mut *server_end.state.lock()
+                        {
+                            *local_addr = Some(addr.clone());
+                        }
+                        // Publish only after the queued endpoint has its state
+                        // and local name. A refused connect never gets a row.
+                        proc_unix::track(&server_end);
                         pending.push_back(server_end);
                         // Durable per-fd wake: fire the acceptor armed on the
                         // listener's cell directly. poll_readiness clears it when
@@ -10803,6 +10841,21 @@ impl SocketFile {
         self.dispatch_unix_dgram_with_fds(op, Vec::new(), None)
     }
 
+    /// Mirror unix_dgram_connect's old-peer state transition after releasing
+    /// the sender's state lock. An endpoint with its own peer stays connected.
+    fn unix_dgram_disconnect_old(old: Option<(UnixAddr, Weak<Self>)>, new: Option<&Arc<Self>>) {
+        let Some(old) = old.and_then(|(_, socket)| socket.upgrade()) else {
+            return;
+        };
+        if new.is_some_and(|new| Arc::ptr_eq(new, &old)) {
+            return;
+        }
+        let state = old.state.lock();
+        if matches!(&*state, SocketState::UnixDgram { peer: None, .. }) {
+            old.unix_dgram_established.store(false, Ordering::Release);
+        }
+    }
+
     fn dispatch_unix_dgram_with_fds(
         self: &Arc<Self>,
         op: SocketOp<'_>,
@@ -10858,10 +10911,17 @@ impl SocketFile {
                 // succeeds; any other non-AF_UNIX family fails
                 // `unix_validate_addr` with EINVAL.
                 if addr.family == AF_UNSPEC {
-                    *self.connected_unix_path.lock() = None;
-                    if let SocketState::UnixDgram { peer, .. } = &mut *self.state.lock() {
-                        *peer = None;
+                    let mut state = self.state.lock();
+                    let old = match &mut *state {
+                        SocketState::UnixDgram { peer, .. } => peer.take(),
+                        _ => None,
+                    };
+                    if old.is_some() {
+                        *self.connected_unix_path.lock() = None;
+                        self.unix_dgram_established.store(false, Ordering::Release);
                     }
+                    drop(state);
+                    Self::unix_dgram_disconnect_old(old, None);
                     return SocketOpResult::Ok(0);
                 }
                 if addr.family != AF_UNIX {
@@ -10876,47 +10936,53 @@ impl SocketFile {
                 // first send): missing pathname → -ENOENT, a stream socket at the
                 // path → -EPROTOTYPE, otherwise no bound datagram receiver →
                 // -ECONNREFUSED. Abstract names resolve only in ABSTRACT_DGRAM.
-                match &uaddr {
-                    UnixAddr::Path(p) if !unix_dgram_bound_at_path(p) => {
-                        if !crate::handlers::unix_path_final_node_exists(p) {
-                            return SocketOpResult::Err(SockError::NoEntry);
-                        } else if unix_stream_listener_at_path(p) {
-                            return SocketOpResult::Err(SockError::ProtoType);
-                        } else {
-                            return SocketOpResult::Err(SockError::ConnectionRefused);
-                        }
-                    }
-                    UnixAddr::Abstract(n) => {
-                        let bound = ABSTRACT_DGRAM
+                let (target, path) = match &uaddr {
+                    UnixAddr::Path(p) => {
+                        let key = UnixPathKey::for_connect_path(p);
+                        let target = UNIX_DGRAM_BOUND
                             .lock()
                             .as_ref()
-                            .is_some_and(|m| m.contains_key(&(self.net_ns_id(), n.clone())));
-                        if !bound {
-                            return SocketOpResult::Err(SockError::ConnectionRefused);
+                            .and_then(|m| m.get(&key).cloned());
+                        if target.is_none() {
+                            if !crate::handlers::unix_path_final_node_exists(p) {
+                                return SocketOpResult::Err(SockError::NoEntry);
+                            }
+                            if unix_stream_listener_at_path(p) {
+                                return SocketOpResult::Err(SockError::ProtoType);
+                            }
                         }
+                        (target, Some(key))
                     }
-                    _ => {}
-                }
+                    UnixAddr::Abstract(n) => {
+                        let target = ABSTRACT_DGRAM
+                            .lock()
+                            .as_ref()
+                            .and_then(|m| m.get(&(self.net_ns_id(), n.clone())).cloned());
+                        (target, None)
+                    }
+                    UnixAddr::Unnamed => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let Some(target) = target else {
+                    return SocketOpResult::Err(SockError::ConnectionRefused);
+                };
                 let mut state = self.state.lock();
-                if let UnixAddr::Path(p) = &uaddr {
-                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_connect_path(p));
-                } else {
-                    *self.connected_unix_path.lock() = None;
-                }
                 if matches!(&*state, SocketState::Fresh) {
                     *state = SocketState::UnixDgram {
                         addr: None,
                         inbox: VecDeque::new(),
-                        peer: Some(uaddr),
+                        peer: None,
                     };
-                    return SocketOpResult::Ok(0);
                 }
-                if let SocketState::UnixDgram { peer, .. } = &mut *state {
-                    *peer = Some(uaddr);
-                    SocketOpResult::Ok(0)
-                } else {
-                    SocketOpResult::Err(SockError::InvalidArg)
-                }
+                let SocketState::UnixDgram { peer, .. } = &mut *state else {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                };
+                let old = peer.replace((uaddr, Arc::downgrade(&target)));
+                *self.connected_unix_path.lock() = path;
+                self.unix_dgram_established.store(true, Ordering::Release);
+                target.unix_dgram_established.store(true, Ordering::Release);
+                drop(state);
+                Self::unix_dgram_disconnect_old(old, Some(&target));
+                SocketOpResult::Ok(0)
             }
             SocketOp::Send { buf, flags, addr } => {
                 // Linux `unix_dgram_sendmsg`: MSG_OOB → -EOPNOTSUPP (checked
@@ -10944,7 +11010,7 @@ impl SocketFile {
                                 Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
                                 _ => return SocketOpResult::Err(SockError::InvalidArg),
                             }
-                        } else if let Some(p) = peer {
+                        } else if let Some((p, _)) = peer {
                             p.clone()
                         } else {
                             // No destination address and no connected peer. Linux
@@ -11985,6 +12051,9 @@ fn unix_skb_truesize(unit: usize) -> usize {
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
+        if self.domain == AF_UNIX {
+            proc_unix::forget(self.inode.ino);
+        }
         let native = self.native_source.lock().retire();
         native.notify();
         self.release_multicast();

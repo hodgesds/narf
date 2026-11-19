@@ -45,6 +45,7 @@ Semcode call-chain analysis covered all four seams. In particular:
 | `/proc/<pid>/fdinfo/<fd>` | compatible implemented fields | Baseline `pos`, `flags`, `mnt_id`, and `ino` fields come from the live fd entry and backing VFS object. Provider absence produces neutral values rather than fabricated identity. |
 | `/proc/<pid>/mountinfo`, `/proc/mounts` | compatible implemented fields | Rows use the `proc` filesystem name and task-visible mount/chroot projection. Optional Linux fields are omitted when NARF has no corresponding state. |
 | `/proc/<pid>/ns/*` | compatible implemented flavours | Link text, symlink metadata, followed `open(2)` to an nsfs-like fd, and `setns(2)` work for UTS, network, IPC, PID, mount, user, and enabled cgroup namespaces. Initial namespaces retain stable identities; `O_PATH|O_NOFOLLOW` opens the link itself. |
+| `/proc/net/unix`, `/proc/<pid>/net/unix` | live AF_UNIX sockets | Opens select the caller's or target thread's network namespace. Rows include sockfs inodes, listener flags, queued connections, and raw abstract names. |
 | registered stub and bus nodes | compatible discovery shape | Existing proc stubs and `/proc/bus` are registered during procfs boot instead of being test-only unreachable code. |
 
 ## Findings corrected
@@ -76,13 +77,14 @@ Semcode call-chain analysis covered all four seams. In particular:
   identities. The same bridge also completes pidfd namespace ioctls.
 - `fdinfo` now receives the live offset, open-file status flags, mount ID, and
   backing inode in the same provider snapshot as the fd link target.
+- Directory entries own generated names. Iterating dynamic proc directories
+  releases those names when the caller drops the entries.
 
 ## Remaining gaps
 
-- Dynamic proc directory iteration currently interns generated names for the
-  lifetime of the kernel because `DirEntry` carries a borrowed string. Removing
-  that leak requires a VFS directory-entry ownership change rather than a
-  procfs-only patch.
+- The per-task `net/` directory exposes the Unix socket provider. The other
+  registered network tables still require providers that can select the target
+  thread's network namespace.
 - Linux exposes many optional and subsystem-specific proc nodes that NARF does
   not implement. Missing nodes must remain absent or return a Linux-shaped
   error; adding plausible-looking fabricated data is not compatible behavior.
