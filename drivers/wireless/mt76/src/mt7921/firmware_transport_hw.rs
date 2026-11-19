@@ -384,46 +384,52 @@ impl Hardware {
         bytes: Vec<u8>,
         event: Option<bool>,
     ) -> Result<Option<CapturedData>, Error> {
+        use crate::mt7921::txrx::{rx_packet, RxPacket};
         let now = self.now_ns();
         let rxd = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let kind = rxd >> 27;
-        let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        if kind == 0 {
-            storage
-                .tokens
-                .firmware_done(&packet_tx::releases(&bytes)?)?;
-        } else if kind == 1 {
-            storage.tx_sequence.receive(&bytes)?;
-        } else if normal {
-            storage.p2p_capture.copy(&bytes, now);
-            let packet = CapturedData {
-                bytes,
-                epoch: storage.receive_epoch,
-                port_open: storage.receive_open,
-            };
-            if event == Some(false) {
-                return Ok(Some(packet));
+        // Linux `mt7921_queue_rx_skb` (`mt7921_rx_check` on the DMA path).
+        match rx_packet(rxd) {
+            RxPacket::TxFree => {
+                // `mt7921_mac_tx_free`: the firmware's token releases.
+                storage
+                    .tokens
+                    .firmware_done(&packet_tx::releases(&bytes)?)?;
             }
-            if storage.pending_data.len() == 32 {
-                storage.pending_data.pop_front(); // bounded RX loss under overload
-            }
-            storage.pending_data.push_back(packet);
-        } else if kind == 7 {
-            if bytes.len() < 32 {
-                return Err(Error::MalformedEvent);
-            }
-            if event == Some(true) {
-                return Ok(Some(CapturedData {
+            RxPacket::TxStatus => storage.tx_sequence.receive(&bytes)?,
+            RxPacket::Normal => {
+                storage.p2p_capture.copy(&bytes, now);
+                let packet = CapturedData {
                     bytes,
-                    epoch: 0,
-                    port_open: false,
-                }));
+                    epoch: storage.receive_epoch,
+                    port_open: storage.receive_open,
+                };
+                if event == Some(false) {
+                    return Ok(Some(packet));
+                }
+                if storage.pending_data.len() == 32 {
+                    storage.pending_data.pop_front(); // bounded RX loss under overload
+                }
+                storage.pending_data.push_back(packet);
             }
-            if storage.pending_events.len() == 32 {
-                return Err(Error::EventOverflow);
+            RxPacket::Event => {
+                if bytes.len() < 32 {
+                    return Err(Error::MalformedEvent);
+                }
+                if event == Some(true) {
+                    return Ok(Some(CapturedData {
+                        bytes,
+                        epoch: 0,
+                        port_open: false,
+                    }));
+                }
+                if storage.pending_events.len() == 32 {
+                    return Err(Error::EventOverflow);
+                }
+                storage.pending_events.push_back(bytes);
             }
-            storage.pending_events.push_back(bytes);
+            // TXRXV and the remaining types: `dev_kfree_skb`.
+            RxPacket::Other => {}
         }
         Ok(None)
     }
