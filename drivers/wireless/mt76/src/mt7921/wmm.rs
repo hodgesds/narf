@@ -133,3 +133,22 @@ pub(crate) fn legacy_edca() -> [u8; 44] {
     }
     .encode(false)
 }
+
+/// Initial station queues, before authentication: mac80211 interface open
+/// calls ieee80211_set_wmm_default with no channel context and QoS disabled.
+/// BSS_CHANGED_QOS then drives mt7921_mcu_set_tx, enabling firmware TXCMD
+/// after BSS_INFO. Apply the selected channel's limits before native TX.
+pub(crate) fn initial_edca(rule: Option<narf_wireless::reg::WmmRule>) -> [u8; 44] {
+    Parameters {
+        parameter_set_count: 0,
+        acm: 0,
+        ac: [Ac {
+            cw_min: 15,
+            cw_max: 1023,
+            txop: 0,
+            aifs: 2,
+        }; 4],
+    }
+    .limited(rule)
+    .encode(false)
+}
