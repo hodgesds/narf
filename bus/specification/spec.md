@@ -602,6 +602,44 @@ reserved VID 0. A module USB probe only ever runs through
 text. The loader calls `unregister_module_usb_drivers` beside
 `unregister_module_pci_drivers`, after the exit hook and before unmapping.
 
+**Transfer datapath.** Once a probe accepts a device the module drives it
+through a second permanent hook table, also installed by the USB stack:
+
+```rust
+pub mod module_usb {
+    pub const MAX_TRANSFER: usize = 4096;          // one xHCI endpoint page
+    pub const MAX_CONFIG_DESCRIPTOR: usize = 4096;
+    pub const MAX_CONFIGURE_ENDPOINTS: usize = 30; // DCI 2..=31
+    pub struct Completion { pub callback: Option<ModuleCallbackFn>, pub cookie: u64 }
+    pub struct Datapath {                         // all fields are fn pointers
+        pub config_descriptor, pub configure, pub control, pub transfer,
+        pub poll, pub cancel, pub serial_register, pub serial_tx, pub serial_rx,
+    }
+    pub fn register_datapath(d: &'static Datapath) -> Result<(), i32>; // other = -EBUSY
+    pub fn config_descriptor(owner: u64, token: u64, out: &mut [u8]) -> (i32, usize);
+    pub fn configure(owner: u64, token: u64, endpoints: &[u8], done: Completion) -> Result<u64, i32>;
+    pub fn control(owner: u64, token: u64, setup: [u8; 8], data: &[u8], done: Completion) -> Result<u64, i32>;
+    pub fn transfer(owner: u64, token: u64, endpoint: u8, data: &[u8], len: usize,
+                    done: Completion) -> Result<u64, i32>;
+    pub fn poll(owner: u64, token: u64, urb: u64, out: &mut [u8]) -> (i32, usize);
+    pub fn cancel(owner: u64, token: u64, urb: u64) -> i32;
+    pub fn serial_register(owner: u64, token: u64, family: u32, kick: Completion) -> Result<u32, i32>;
+    pub fn serial_tx(owner: u64, token: u64, port: u32, out: &mut [u8]) -> Result<usize, i32>;
+    pub fn serial_rx(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize, i32>;
+    pub fn call_module_usb_callback(owner: u64, cb: ModuleCallbackFn, cookie: u64) -> i32;
+}
+```
+
+Every request is kernel-owned and gets a never-reused id. `poll` returns
+`-EAGAIN` while pending, `(-ENOBUFS, required)` while retaining a result
+too large for `out`, otherwise the terminal status, consuming the id. With
+no datapath installed every call is `-ENODEV`; a token with no context for
+`owner` is `-ENODEV`. Bus validates only shapes (endpoint 0, zero or
+oversize lengths, empty endpoint lists); contexts, endpoint attributes and
+transfers belong to the USB stack (`drivers/usb` §3).
+`call_module_usb_callback` is the module callback gate (§3.6): it refuses
+once the module is no longer Live.
+
 ### 3.13 DMA configuration
 
 ```rust

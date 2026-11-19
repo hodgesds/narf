@@ -10,10 +10,14 @@
 //! A module's probe never runs directly: the USB dispatcher calls it through
 //! [`call_module_usb_probe`], i.e. the module subsystem's probe call gate,
 //! which pins the module Live and enters its effective protection domain.
+//!
+//! Once a probe accepts a device, the module drives it through the
+//! [`Datapath`] hooks below (URB-style control/bulk/interrupt requests and a
+//! module-backed serial node), which the same USB stack installs.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::driver_match::{call_module_probe, intern_name, ModuleProbeFn};
+use crate::driver_match::{call_module_probe, intern_name, ModuleCallbackFn, ModuleProbeFn};
 
 /// Match on `(idVendor, idProduct)`. Linux `USB_DEVICE_ID_MATCH_DEVICE`.
 pub const MATCH_VENDOR_PRODUCT: u16 = 1 << 0;
@@ -139,4 +143,191 @@ pub fn call_module_usb_probe(owner: u64, probe: ModuleProbeFn, dev_token: u64) -
 /// Test-only: forget the installed host so a smoke can prove `-ENODEV`.
 pub fn __reset_host_for_test() {
     HOST.store(0, Ordering::Release);
+}
+
+// ── Transfer datapath (URB-style submit / poll / cancel) ────────────
+//
+// A module's USB probe runs inside the async attach cascade, and module
+// text cannot produce or await a `Future`. So every transfer is a
+// kernel-owned request ("URB"): the module submits it and gets an opaque,
+// never-reused id; the USB stack runs the transfer in its own tasks; when
+// the request reaches a terminal state the kernel optionally calls the
+// module's completion callback (task context, through the module callback
+// gate); the module collects the result with `poll`. The module never sees
+// a `USBDevice`, a DMA page or a kernel pointer, and every transfer buffer
+// is kernel memory: an unloaded module's text and data are never a DMA
+// target.
+
+/// Largest single transfer or control data stage. One xHCI endpoint page.
+pub const MAX_TRANSFER: usize = 4096;
+/// Largest configuration descriptor copied to a module.
+pub const MAX_CONFIG_DESCRIPTOR: usize = 4096;
+/// Most endpoints one `configure` request may name (DCI 2..=31).
+pub const MAX_CONFIGURE_ENDPOINTS: usize = 30;
+
+/// Optional task-context completion notification. The callback is module
+/// text and only ever runs through [`call_module_usb_callback`].
+#[derive(Copy, Clone, Debug)]
+pub struct Completion {
+    /// `extern "C" fn(cookie) -> i32`; the return value is ignored.
+    pub callback: Option<ModuleCallbackFn>,
+    pub cookie: u64,
+}
+
+/// `(owner, token, setup, data, done)` → request id. See [`control`].
+pub type ControlHook =
+    fn(owner: u64, token: u64, setup: [u8; 8], data: &[u8], done: Completion) -> Result<u64, i32>;
+
+/// `(owner, token, endpoint, data, len, done)` → request id. See [`transfer`].
+pub type TransferHook = fn(
+    owner: u64,
+    token: u64,
+    endpoint: u8,
+    data: &[u8],
+    len: usize,
+    done: Completion,
+) -> Result<u64, i32>;
+
+/// Permanent, kernel-resident datapath hooks, installed by the USB stack.
+/// Every hook re-validates `(owner, token)` against a context the stack
+/// minted for that module's probe; a forged or stale token is `-ENODEV`.
+/// `poll` returns `(status, length)`: `-EAGAIN` pending, `-ENOBUFS` with the
+/// required length (the result is retained), otherwise the terminal status,
+/// after which the request id is consumed.
+#[derive(Debug)]
+pub struct Datapath {
+    /// `(0, len)` after copying, or `(-ENOBUFS, required_len)`.
+    pub config_descriptor: fn(owner: u64, token: u64, out: &mut [u8]) -> (i32, usize),
+    pub configure:
+        fn(owner: u64, token: u64, endpoints: &[u8], done: Completion) -> Result<u64, i32>,
+    pub control: ControlHook,
+    pub transfer: TransferHook,
+    pub poll: fn(owner: u64, token: u64, urb: u64, out: &mut [u8]) -> (i32, usize),
+    pub cancel: fn(owner: u64, token: u64, urb: u64) -> i32,
+    pub serial_register:
+        fn(owner: u64, token: u64, family: u32, kick: Completion) -> Result<u32, i32>,
+    pub serial_tx: fn(owner: u64, token: u64, port: u32, out: &mut [u8]) -> Result<usize, i32>,
+    pub serial_rx: fn(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize, i32>,
+}
+
+static DATAPATH: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the USB stack's datapath hooks. Same one-host rule as
+/// [`register`]: the same table is a no-op success, a different one `-EBUSY`.
+pub fn register_datapath(datapath: &'static Datapath) -> Result<(), i32> {
+    let new = datapath as *const Datapath as usize;
+    match DATAPATH.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(old) if old == new => Ok(()),
+        Err(_) => Err(-16),
+    }
+}
+
+fn datapath() -> Result<&'static Datapath, i32> {
+    let raw = DATAPATH.load(Ordering::Acquire);
+    if raw == 0 {
+        return Err(-19);
+    }
+    // SAFETY: only `register_datapath` stores here, and it stores a
+    // `&'static Datapath`.
+    Ok(unsafe { &*(raw as *const Datapath) })
+}
+
+/// Copy the configuration descriptor the device was probed with:
+/// `(0, len)`, or `(-ENOBUFS, required_len)` with nothing copied.
+pub fn config_descriptor(owner: u64, token: u64, out: &mut [u8]) -> (i32, usize) {
+    match datapath() {
+        Ok(d) => (d.config_descriptor)(owner, token, out),
+        Err(e) => (e, 0),
+    }
+}
+
+/// Request xHCI endpoint configuration for endpoint addresses taken from
+/// the probed configuration descriptor. Attributes come from that
+/// descriptor, never from the module.
+pub fn configure(owner: u64, token: u64, endpoints: &[u8], done: Completion) -> Result<u64, i32> {
+    if endpoints.is_empty() || endpoints.len() > MAX_CONFIGURE_ENDPOINTS {
+        return Err(-22);
+    }
+    (datapath()?.configure)(owner, token, endpoints, done)
+}
+
+/// Submit one control transfer on EP0. Direction comes from bit 7 of
+/// `bmRequestType`; an OUT data stage is copied before this returns.
+pub fn control(
+    owner: u64,
+    token: u64,
+    setup: [u8; 8],
+    data: &[u8],
+    done: Completion,
+) -> Result<u64, i32> {
+    if data.len() > MAX_TRANSFER {
+        return Err(-22);
+    }
+    (datapath()?.control)(owner, token, setup, data, done)
+}
+
+/// Submit one bulk or interrupt transfer on a configured endpoint. For IN
+/// endpoints `len` is the receive capacity and `data` is empty; for OUT
+/// endpoints `data` is copied before this returns.
+pub fn transfer(
+    owner: u64,
+    token: u64,
+    endpoint: u8,
+    data: &[u8],
+    len: usize,
+    done: Completion,
+) -> Result<u64, i32> {
+    if endpoint & 0x0f == 0 || len == 0 || len > MAX_TRANSFER {
+        return Err(-22);
+    }
+    (datapath()?.transfer)(owner, token, endpoint, data, len, done)
+}
+
+/// Poll one request; see [`Datapath`] for the status contract.
+pub fn poll(owner: u64, token: u64, urb: u64, out: &mut [u8]) -> (i32, usize) {
+    match datapath() {
+        Ok(d) => (d.poll)(owner, token, urb, out),
+        Err(e) => (e, 0),
+    }
+}
+
+/// Request cancellation. The request stays pollable until it is terminal.
+pub fn cancel(owner: u64, token: u64, urb: u64) -> i32 {
+    match datapath() {
+        Ok(d) => (d.cancel)(owner, token, urb),
+        Err(e) => e,
+    }
+}
+
+/// Publish a `/dev/ttyUSB<N>` node backed by this module device. `kick`
+/// runs (task context, module gate) whenever a writer queues bytes.
+pub fn serial_register(owner: u64, token: u64, family: u32, kick: Completion) -> Result<u32, i32> {
+    (datapath()?.serial_register)(owner, token, family, kick)
+}
+
+/// Take queued TX bytes written to the module's serial node.
+pub fn serial_tx(owner: u64, token: u64, port: u32, out: &mut [u8]) -> Result<usize, i32> {
+    (datapath()?.serial_tx)(owner, token, port, out)
+}
+
+/// Deliver received bytes to readers of the module's serial node.
+pub fn serial_rx(owner: u64, token: u64, port: u32, data: &[u8]) -> Result<usize, i32> {
+    if data.len() > MAX_TRANSFER {
+        return Err(-22);
+    }
+    (datapath()?.serial_rx)(owner, token, port, data)
+}
+
+/// Run a module completion/kick callback through the module callback gate
+/// (pins the module Live, enters its effective domain). `-ENODEV` without a
+/// gate or once the module is no longer Live: module text never runs then.
+pub fn call_module_usb_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
+    crate::driver_match::call_module_callback(owner, callback, cookie)
+}
+
+#[doc(hidden)]
+/// Test-only: forget the installed datapath so a smoke can prove `-ENODEV`.
+pub fn __reset_datapath_for_test() {
+    DATAPATH.store(0, Ordering::Release);
 }

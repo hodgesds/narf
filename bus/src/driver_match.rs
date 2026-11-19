@@ -582,7 +582,7 @@ pub(crate) fn call_module_probe(
     gate(owner, thunk, dev_token, reserved)
 }
 
-fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
+pub(crate) fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
     let gate = MODULE_CALLBACK_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
     if gate == 0 {
         return -19;

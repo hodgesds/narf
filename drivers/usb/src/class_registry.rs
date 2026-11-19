@@ -385,9 +385,13 @@ fn register_module_driver(
     0
 }
 
-/// Remove every match entry `owner` registered. Idempotent.
+/// Remove every match entry `owner` registered, and retire every device
+/// context it was driving (`crate::module_datapath`). Idempotent. The
+/// loader calls this after the module's exit hook and before unmapping its
+/// text, so no later completion or kick can name the module's callbacks.
 fn unregister_module_drivers(owner: u64) {
     MODULE_DRIVERS.lock().retain(|e| e.owner != owner);
+    crate::module_datapath::retire_owner(owner);
 }
 
 static MODULE_HOST: narf_bus::module_usb::Host = narf_bus::module_usb::Host {
@@ -400,12 +404,14 @@ static MODULE_HOST: narf_bus::module_usb::Host = narf_bus::module_usb::Host {
 /// [`crate::register_initcalls`], before any module can load.
 pub fn install_module_host() {
     let _ = narf_bus::module_usb::register(&MODULE_HOST);
+    crate::module_datapath::install();
 }
 
 /// Opaque per-device token handed to a module's USB probe: the xHCI
 /// controller index in bits 15:8 and the slot id in bits 7:0, under a
-/// USB tag in bits 63:56 so it can never alias a PCI token. No USB
-/// datapath export accepts it yet; it identifies the device in logs.
+/// USB tag in bits 63:56 so it can never alias a PCI token. The
+/// `narf_usb_*` datapath exports resolve it, together with the calling
+/// module's identity, to the context minted for that module's probe.
 pub const fn module_usb_token(controller: u8, slot_id: u8) -> u64 {
     (0x55u64 << 56) | ((controller as u64) << 8) | slot_id as u64
 }
@@ -461,6 +467,9 @@ pub async fn dispatch_suspend(controller: u8, hub_slot: u8, port: u8) -> Suspend
 /// regardless of this report. (A hook that panics cannot be
 /// contained — see [`UsbUnbindFn`]: panic is fatal by policy.)
 pub fn dispatch_unbind(controller: u8, slot_id: u8) -> UnbindReport {
+    // A module-driven device loses its datapath context first: its pending
+    // requests are dropped and no later completion reaches module text.
+    crate::module_datapath::retire_token(module_usb_token(controller, slot_id));
     let hooks: alloc::vec::Vec<UsbUnbindFn> = {
         let g = REGISTRY.lock();
         g.iter().filter_map(|entry| entry.unbind).collect()
@@ -599,6 +608,11 @@ fn dispatch_module_probe(device: &Arc<USBDevice>, vid: u16, pid: u16, config: &[
     }
     let token = module_usb_token(device.controller().id(), device.slot_id());
     for (owner, name, probe) in snapshot {
+        // The context the module's datapath calls resolve against exists
+        // before its probe runs, and only for this owner.
+        if !crate::module_datapath::open(owner, token, Arc::clone(device), config) {
+            continue;
+        }
         let rc = narf_bus::module_usb::call_module_usb_probe(owner, probe, token);
         use core::fmt::Write as _;
         if rc == 0 {
@@ -611,6 +625,7 @@ fn dispatch_module_probe(device: &Arc<USBDevice>, vid: u16, pid: u16, config: &[
             );
             return true;
         }
+        crate::module_datapath::retire_token(token);
         let _ = writeln!(
             narf_console::Writer,
             "  usb-class-registry: {:04x}:{:04x} module probe {} declined: {}",
