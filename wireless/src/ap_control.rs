@@ -213,11 +213,24 @@ impl ApControlAuthority {
     }
 
     fn check(&self, receiver: Option<*const ()>) -> Result<(), WirelessError> {
-        if !self.reply.current()
-            || self
-                .reservation
-                .as_ref()
-                .is_some_and(|lease| !lease.current())
+        if !self.reply.current() {
+            return Err(WirelessError::Denied);
+        }
+        self.check_without_reply(receiver)
+    }
+
+    /// Re-validate the live role, generation, target, registry membership,
+    /// reservation lease and admin grant without invoking the reply sink's
+    /// `current()` callback. `PreparedApEvent::deliver` uses this so final
+    /// delivery performs no dynamic source callback (#2255) while still
+    /// catching a live mode/generation bump after preparation (#2214): the
+    /// reservation lease is atomic serialization state, and source
+    /// liveness is covered separately by `ApEmissionAuthority::current()`.
+    fn check_without_reply(&self, receiver: Option<*const ()>) -> Result<(), WirelessError> {
+        if self
+            .reservation
+            .as_ref()
+            .is_some_and(|lease| !lease.current())
         {
             return Err(WirelessError::Denied);
         }

@@ -206,11 +206,13 @@ impl ApEventAuthority {
     }
 }
 /// Serialized for the original AP event source/receiver only. Its final
-/// delivery re-validates the guard's current authority (live role and
-/// generation, reply source, reservation, registry, admin grant) before the
-/// fixed message is emitted; it performs no endpoint lookup or recapture.
-/// It grants no native receive/key/RF/DATA authority: the concrete driver must
-/// recheck those original proofs immediately before consuming this token.
+/// delivery re-validates the guard's live authority (live role and
+/// generation, reservation, target, registry, admin grant) before the
+/// fixed message is emitted, without invoking the reply sink's `current()`
+/// callback; source liveness is covered by the retained emission
+/// authority. It grants no native receive/key/RF/DATA authority: the
+/// concrete driver must recheck those original proofs immediately before
+/// consuming this token.
 pub struct PreparedApEvent {
     source: ApEventAuthority,
     original: ApEmissionAuthority,
@@ -228,13 +230,17 @@ impl PreparedApEvent {
         // `matches_control` compares the emission authority's captured
         // mode/generation against the guard's snapshots from the same bind,
         // so it cannot see a live mode/generation ABA bump after
-        // preparation. Re-validate the guard's current authority as well:
-        // it re-reads the live role and generation, and also re-checks the
-        // reply source, reservation lease, registry entry and admin grant.
+        // preparation. Re-validate the guard's live authority as well —
+        // but without `guard.current()`: `check()` calls the reply sink's
+        // `current()` callback, and final delivery must perform no dynamic
+        // source callback (#2255). `check_without_reply` re-reads the live
+        // role and generation and re-checks the reservation lease, target,
+        // registry entry and admin grant; source liveness is already
+        // covered by `matches_control` → `ApEmissionAuthority::current()`.
         if !matches!(self.source.guard.kind, ControlKind::Ap)
             || !matches!(self.source.guard.mode, 3 | 9)
             || !self.original.matches_control(&self.source.guard)
-            || self.source.guard.current().is_err()
+            || self.source.guard.check_without_reply(None).is_err()
         {
             return Err(WirelessError::Denied);
         }
