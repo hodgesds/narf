@@ -81,6 +81,7 @@ narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }
 narf-bluetooth       = { path = "../bluetooth" }
 narf-drivers-bluetooth-btintel-pcie = { path = "../drivers/bluetooth/btintel-pcie" }
+narf-drivers-bluetooth-btusb = { path = "../drivers/bluetooth/btusb" }
 narf-edid            = { path = "../edid" }
 narf-efi             = { path = "../efi" }
 narf-hid             = { path = "../hid" }
@@ -293,6 +294,7 @@ kernel-test  = [
     "narf-audio/kernel-test",
     "narf-bluetooth/kernel-test",
     "narf-drivers-bluetooth-btintel-pcie/kernel-test",
+    "narf-drivers-bluetooth-btusb/kernel-test",
     "narf-edid/kernel-test",
     "narf-efi/kernel-test",
     "narf-boot/kernel-test",

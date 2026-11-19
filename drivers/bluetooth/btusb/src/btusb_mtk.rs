@@ -525,6 +525,7 @@ pub(crate) async fn setup_mediatek(
     Ok(())
 }
 
+#[cfg(feature = "kernel-test")]
 #[path = "btusb_mtk_tests.rs"]
 mod conversations;
 

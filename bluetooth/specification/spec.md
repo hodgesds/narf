@@ -180,9 +180,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 
 Controller drivers are not part of this crate. They plug into the
 public `transport` / `controller` / `pm` registries from their own
-crates: btusb from `narf-drivers-usb`, and the Intel PCIe controller
-from `narf-drivers-bluetooth-btintel-pcie` (dual-build: built-in, or a
-registration-only loadable `.ko`). That crate owns the `btintel-pcie`
+crates: btusb from `narf-drivers-bluetooth-btusb` and the Intel PCIe
+controller from `narf-drivers-bluetooth-btintel-pcie` (both dual-build:
+built-in, or a registration-only loadable `.ko`). That crate owns the `btintel-pcie`
 Stage::Subsys and `btintel-pcie-firmware` Stage::Late initcalls, which
 `frame` registers; `narf-bluetooth` no longer exports
 `register_firmware_initcalls` or a `btintel_pcie` module.
@@ -735,7 +735,7 @@ identity and complete firmware/protocol enable before generic HCI commands.
 
 ### Out of scope (deliberate)
 - Realtek / Broadcom USB vendor firmware protocols (Intel, MediaTek and
-  Qualcomm loaders live in `narf-drivers-usb::btusb`) and Bluetooth
+  Qualcomm loaders live in `narf-drivers-bluetooth-btusb::btusb`) and Bluetooth
   policy daemons.
 - Pairing initiation from the kernel on application policy trigger
   (no upper-layer trigger API yet), and SCO/eSCO isochronous USB

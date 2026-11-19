@@ -32,8 +32,8 @@
 //!
 //! Controller drivers live outside this crate and plug into the
 //! [`transport`] / [`controller`] / [`pm`] registries: btusb in
-//! `narf-drivers-usb`, the Intel PCIe controller in
-//! `narf-drivers-bluetooth-btintel-pcie` (dual-build, built-in or `.ko`).
+//! `narf-drivers-bluetooth-btusb` and the Intel PCIe controller in
+//! `narf-drivers-bluetooth-btintel-pcie` (both dual-build, built-in or `.ko`).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -115,7 +115,7 @@ pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
 /// per-stage placeholder so the boot summary records that the
 /// Bluetooth subsystem is wired in; the actual USB transport bind
 /// runs out of the USB host supervisor's per-port attach pass
-/// (`narf_drivers_usb::btusb::try_bind_btusb_already_addressed`).
+/// (`narf_drivers_bluetooth_btusb::btusb::try_bind_btusb_already_addressed`).
 ///
 /// The HCI event-pump task is enabled here: [`pump::enable_spawning`]
 /// adopts every controller that is already ready, and controllers

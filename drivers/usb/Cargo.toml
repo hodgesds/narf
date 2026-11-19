@@ -31,7 +31,6 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-net          = { path = "../../net" }
-narf-bluetooth    = { path = "../../bluetooth" }
 narf-firmware     = { path = "../../firmware" }
 narf-drivers-video = { path = "../video" }
 narf-drivers-fingerprint = { path = "../fingerprint" }

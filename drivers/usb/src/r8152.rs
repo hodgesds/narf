@@ -6559,7 +6559,7 @@ async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usiz
     // `request_firmware` — warn and continue, never a bind
     // failure (this crate has no logging sink, so the absence is
     // silent here and visible only as the skipped step).
-    let fw_cap = firmware_name_for(version).and_then(crate::btusb::firmware_cap);
+    let fw_cap = firmware_name_for(version).and_then(crate::firmware_cap);
     let fw_view = match &fw_cap {
         Some(cap) => narf_firmware::view_of(cap).ok(),
         None => None,

@@ -124,6 +124,7 @@ members = [
     "drivers/audio/acp",
     "bluetooth",
     "drivers/bluetooth/btintel-pcie",
+    "drivers/bluetooth/btusb",
     "edid",
     "efi",
     "hid",

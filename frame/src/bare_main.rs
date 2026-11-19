@@ -3287,6 +3287,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_usbpd::register_initcalls();
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
+            narf_drivers_bluetooth_btusb::register_initcalls();
             narf_drivers_video::register_initcalls();
             narf_drivers_media::register_initcalls();
             narf_drivers_thunderbolt::register_initcalls();

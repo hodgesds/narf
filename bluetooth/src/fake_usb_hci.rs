@@ -49,7 +49,7 @@
 //!   conversation (opcodes 0xFC05 / 0xFC0D / 0xFC09 / 0xFC01,
 //!   Secure Send fragment types, the 0xFF/0x02 bootup event).
 //!   The same conversation is distilled in
-//!   `drivers/usb/src/btusb_intel.rs` (module docs); the fixture
+//!   `drivers/bluetooth/btusb/src/btusb_intel.rs` (module docs); the fixture
 //!   follows that documented sequence, not the loader's code.
 //!
 //! ## What the fake deliberately does NOT model

@@ -11,7 +11,7 @@
 //! - `drivers/bluetooth/btintel.c` — Intel firmware-load sequence
 //!   (HCI_Reset → vendor command 0xFC0D read boot params → secure
 //!   send of the .sfi over 0xFC09 → Intel Reset 0xFC01 boot → .ddc
-//!   over 0xFC8B). Implemented in `narf-drivers-usb::btusb_intel`;
+//!   over 0xFC8B). Implemented in `narf-drivers-bluetooth-btusb::btusb_intel`;
 //!   this module records the identity + blob names it selects from.
 //! - `drivers/bluetooth/btrtl.c` — Realtek firmware-load sequence
 //!   (read ROM version via H4 vendor pkt, fetch `rtl_bt/rtl8761*.bin`

@@ -889,7 +889,16 @@ also consult upstream Linux GPL sources.
   encoding (payload-format-spec minor version, host inits to zero
   on first Probe SET) is documented on
   `VsProbeCommit::preferred_version` for future work.
-- `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
+- btusb lives in `narf-drivers-bluetooth-btusb` (dual-build; a `.ko`
+  registers its 0xE0/0x01/0x01 match through `narf_register_usb_driver`).
+  This crate reaches it only through `bluetooth_hooks`: `set_binder`
+  installs the attach-cascade binder, run at btusb's historic cascade
+  position (after CDC-ECM, before fingerprint), and `set_wake_watch` the
+  supervisor's per-cycle remote-wakeup watch (before the pumps). With no
+  binder installed a Bluetooth device falls through to the class registry.
+  `firmware_cap(name)` (crate root) is the shared trusted-loader firmware
+  lookup btusb and r8152 use.
+- `btusb::try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
   running the full mandatory HCI sequence, adopting the ready controller, and

@@ -1299,7 +1299,10 @@ async fn dispatch_after_address(
         // precedent): parent hub slot + downstream port, None on a
         // root port — the btusb bind records it for autosuspend
         // activity accounting (#820).
-        if crate::btusb::try_bind_btusb_already_addressed(
+        // The binder is btusb's (`narf-drivers-bluetooth-btusb`), installed
+        // through `bluetooth_hooks`; without it a Bluetooth device falls
+        // through to the class registry below.
+        if crate::bluetooth_hooks::bind(
             xhci_dev,
             slot_id,
             dev_vid,
@@ -1308,7 +1311,6 @@ async fn dispatch_after_address(
             parent_hub_slot.map(|slot| (slot, port)),
         )
         .await
-        .is_ok()
         {
             return AttachOutcome::Bluetooth;
         }

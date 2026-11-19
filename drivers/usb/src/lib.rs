@@ -8,13 +8,8 @@ extern crate alloc;
 
 pub mod attach;
 pub mod ax88179;
+pub mod bluetooth_hooks;
 mod boot_root;
-pub mod btusb;
-mod btusb_bcm;
-mod btusb_intel;
-mod btusb_mtk;
-mod btusb_qca;
-mod btusb_rtl;
 pub mod bulk;
 pub mod ccid;
 pub mod cdc;
@@ -57,6 +52,20 @@ mod host_test_shims;
 mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
+/// Open firmware blob `name` from the firmware registry through the
+/// trusted loader authority. `None` when the authority or the blob is
+/// unavailable; callers whose chip cannot run without its firmware treat
+/// that as a hard failure. Shared by r8152 and the btusb vendor setups.
+pub fn firmware_cap(
+    name: &str,
+) -> Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>> {
+    use narf_capabilities::Cap;
+    let write = narf_firmware::trusted_loader_authority()?;
+    let read: Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read> =
+        write.derive().ok()?;
+    narf_firmware::open(name, &read).ok()
+}
+
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     // Let loadable modules register USB class matches
@@ -135,10 +144,6 @@ pub fn register_initcalls() {
         r8152::register();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "usb-btusb", || {
-        btusb::register();
-        InitResult::Ok
-    });
     narf_init::register(Stage::Subsys, "usb-ax88179", || {
         ax88179::register();
         InitResult::Ok
@@ -166,13 +171,9 @@ pub fn register_initcalls() {
         msc::register_initcalls();
         InitResult::Ok
     });
-    // btusb binds through the attach cascade, not the class registry;
-    // this registration exists so the registry's unbind dispatch
-    // (detach path) can reach btusb::detach_btusb_slot (#890).
-    narf_init::register(Stage::Subsys, "usb-btusb", || {
-        btusb::register_initcalls();
-        InitResult::Ok
-    });
+    // btusb lives in `narf-drivers-bluetooth-btusb`; it registers its own
+    // `usb-btusb` initcalls and installs `bluetooth_hooks` (attach binder,
+    // wake watch).
     // Fingerprint binds through the attach cascade, not the class
     // registry; this registration exists so the registry's unbind
     // dispatch (detach path) can reach fingerprint::detach_fp for
@@ -850,7 +851,7 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // it signals remote wakeup, or when host TX demand
             // resumes its port through the transport.
             wake_suspended_nic_ports(c).await;
-            btusb::wake_suspended_ports(c).await;
+            bluetooth_hooks::wake_watch(c).await;
             pump_bound_devices(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose

@@ -1,0 +1,65 @@
+# USB Bluetooth HCI controller driver (btusb) — dual-build.
+#
+# Promoted out of `narf-drivers-usb`: btusb depends on the USB host stack
+# (xHCI, attach, class registry) and on the `narf-bluetooth` host stack, and
+# installs the stack's `bluetooth_hooks` (attach-cascade binder, remote-wakeup
+# watch) instead of being called directly. Vendor setup (Intel, Realtek,
+# Broadcom, MediaTek, Qualcomm) moves with it.
+#
+#   * `builtin` (default): rlib linked into the kernel; `frame` calls
+#     `register_initcalls`, which installs the hooks and registers the
+#     `usb-btusb` initcalls.
+#   * `module`: `cargo xtask build-module --package
+#     narf-drivers-bluetooth-btusb --no-default-features --features module`.
+#     Registration-only: registers the Bluetooth interface match (0xE0/0x01/
+#     0x01) through `narf_register_usb_driver`; the probe returns -ENOSYS until
+#     a USB transfer datapath is exported to modules.
+#
+# Tests gate on a dedicated `kernel-test` feature implying `builtin`.
+
+[package]
+name         = "narf-drivers-bluetooth-btusb"
+description  = "USB Bluetooth HCI controller driver (btusb) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_bluetooth_btusb"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-bluetooth", "dep:narf-capabilities", "dep:narf-console",
+    "dep:narf-drivers-usb", "dep:narf-filesystem", "dep:narf-firmware",
+    "dep:narf-init", "dep:narf-lib", "dep:narf-power", "dep:narf-scheduler",
+    "dep:narf-time",
+]
+module = []
+kernel-test = [
+    "builtin", "dep:narf-kernel-test",
+    "narf-bluetooth/kernel-test", "narf-drivers-usb/kernel-test",
+]
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+
+narf-bluetooth    = { path = "../../../bluetooth", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-drivers-usb  = { path = "../../usb", optional = true }
+narf-filesystem   = { path = "../../../filesystem", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-init         = { path = "../../../init", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true
