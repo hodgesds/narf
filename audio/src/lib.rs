@@ -27,22 +27,17 @@
 
 extern crate alloc;
 
-pub mod acp3x;
-pub mod acp6;
-pub mod acp63;
-pub mod acp63_sdw;
-pub mod acp63_sdw_dma;
-pub mod hda;
-pub mod hda_codec;
+// Controller drivers live in their own dual-build crates (built-in here, or
+// a registration-only `.ko`); re-exported so `narf_audio::hda::…` and the
+// other historical paths keep resolving.
+pub use narf_drivers_audio_acp::{
+    acp3x, acp6, acp63, acp63_sdw, acp63_sdw_dma, soundwire, soundwire_rt1316, soundwire_rt711,
+};
+#[allow(unused_imports)]
+use narf_drivers_audio_core::{native_firmware, native_irq, native_pci, native_pcm};
+pub use narf_drivers_audio_hda::{hda, hda_codec};
 pub mod msbc;
-mod native_firmware;
-mod native_irq;
-mod native_pci;
-mod native_pcm;
 pub mod sbc;
-pub mod soundwire;
-pub mod soundwire_rt1316;
-pub mod soundwire_rt711;
 
 mod hda_tests;
 mod tests;

@@ -871,6 +871,9 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-audio-acp",
+ "narf-drivers-audio-core",
+ "narf-drivers-audio-hda",
  "narf-drivers-sound",
  "narf-drivers-virtio",
  "narf-filesystem",
@@ -1204,6 +1207,66 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-tpm",
+]
+
+[[package]]
+name = "narf-drivers-audio-acp"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-audio-core",
+ "narf-drivers-sound",
+ "narf-firmware",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-audio-core"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-drivers-sound",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-audio-hda"
+version = "0.0.0"
+dependencies = [
+ "narf-aml",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-audio-core",
+ "narf-drivers-sound",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
