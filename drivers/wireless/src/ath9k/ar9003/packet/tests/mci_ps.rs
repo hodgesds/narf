@@ -461,7 +461,14 @@ fn ftp_native() -> Result<(), &'static str> {
     let mut actor = Actor::default();
     let mut radio = joined(&model, link.clone(), &mut peer, &mut actor, false)?;
     model.now.set(model.now.get() + 1);
-    gpm(&model, &link, 0, [0x0004_050c, 0x0001_0101, 0]);
+    // A BNEP/PAN BT-coex profile. The polled station harness never arms the
+    // MCI async interrupt, so `service_begin` does not walk a GPM written to
+    // the ring; apply the profile's duty-cycle scheme directly, exactly as an
+    // interrupt-delivered GPM would (`btcoex_period` 53 >> 1 = 26 for 2 GHz).
+    let mut profile = [0u8; 16];
+    profile[4..8].copy_from_slice(&0x0004_050cu32.to_le_bytes());
+    profile[8..12].copy_from_slice(&0x0001_0101u32.to_le_bytes());
+    ar9003::mci::apply_profile_gpm_for_test(&mut link.lock().btcoex.mci, &profile);
     poll(&model, &mut radio, &mut peer, &mut actor)?;
     // Five actual awake periods cannot create a sleeping callback.
     for _ in 0..5 {

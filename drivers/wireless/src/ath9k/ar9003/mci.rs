@@ -2131,6 +2131,19 @@ fn update_scheme(mci: &mut Mci) {
     mci.profiles.btcoex_no_stomp = mci.profiles.btcoex_period * (100 - duty_cycle) / 100;
 }
 
+/// Test-only: apply a BT-coex profile-info GPM and recompute the duty-cycle
+/// scheme, the state half of [`process_profile_msg`] without its register
+/// access. The polled station test harness never drives the MCI interrupt
+/// path, so a GPM written to the ring is otherwise never processed into a
+/// profile; this lets a test establish the same scheme an interrupt-delivered
+/// GPM would.
+#[cfg(feature = "kernel-test")]
+pub(in crate::ath9k) fn apply_profile_gpm_for_test(mci: &mut Mci, gpm: &[u8]) {
+    if mci.profiles.process_profile(&ProfileInfo::from_gpm(gpm)) {
+        update_scheme(mci);
+    }
+}
+
 /// `ar9003_mci.c::ar9003_mci_process_gpm_extra`: the hw-level reaction
 /// to a received coex-agent GPM — answer version queries, learn the BT
 /// version from responses, re-send WLAN channels on a status query,
