@@ -120,15 +120,7 @@ impl Sink {
             0x090 => self.fec_cap,
             0x120 => self.fec_config,
             0x160 => self.dsc_enable,
-            // The decoder reports FEC once the source sends it (ready, and
-            // the link trained).
-            0x280 => {
-                if self.fec_config & 1 != 0 && self.eq_locked {
-                    self.fec_status | 1
-                } else {
-                    self.fec_status
-                }
-            }
+            0x280 => self.fec_status,
             _ => 0,
         }
     }
@@ -336,6 +328,10 @@ pub struct ExtFake {
     pub act_stuck: Cell<bool>,
     /// Number of FEC rising edges the source will fail to acknowledge.
     fec_missed_enables: Cell<u8>,
+    /// Override Pipe B's transport status after FEC has been disabled.
+    fec_stop_status: Cell<Option<u32>>,
+    /// Drop Pipe B's live FEC indication on enabling this register.
+    fec_drop_on_enable: Cell<Option<u64>>,
     frames: [Cell<u32>; 4],
     /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
     /// primary `PLANE_SURF` write: (register, enabled).
@@ -387,6 +383,8 @@ impl ExtFake {
             pipeconf_stuck: Cell::new(false),
             act_stuck: Cell::new(false),
             fec_missed_enables: Cell::new(0),
+            fec_stop_status: Cell::new(None),
+            fec_drop_on_enable: Cell::new(None),
             frames: Default::default(),
             irq_log: RefCell::new(Vec::new()),
             sink: RefCell::new(sink),
@@ -533,6 +531,13 @@ impl MmioWindow for ExtFake {
             return self.phy.read32(off) & !crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_RUN_BUSY;
         }
         if (0..4).any(|p| off == 0x60544 + p * 0x1000) {
+            if off == DP_TP_CTL_B + 4
+                && self.phy.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE == 0
+            {
+                if let Some(status) = self.fec_stop_status.get() {
+                    return status;
+                }
+            }
             let mut value = self.phy.read32(off);
             if self.phy.read32(off - 4) & (7 << 8) == 2 << 8 {
                 value |= 1 << 25;
@@ -648,6 +653,13 @@ impl MmioWindow for ExtFake {
             return;
         }
         self.writes.borrow_mut().push((off, value));
+        if self.fec_drop_on_enable.get() == Some(off) && value & ENABLE != 0 {
+            let status = DP_TP_CTL_B + 4;
+            self.phy.write32(
+                status,
+                self.phy.read32(status) & !dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            );
+        }
         if (0..4).any(|p| off == 0x60540 + p * 0x1000)
             && (self.phy.read32(off) ^ value) & dsc::DP_TP_CTL_FEC_ENABLE != 0
         {
@@ -655,6 +667,11 @@ impl MmioWindow for ExtFake {
             if value & dsc::DP_TP_CTL_FEC_ENABLE != 0 {
                 if self.fec_missed_enables.get() == 0 {
                     status |= dsc::DP_TP_STATUS_FEC_ENABLE_LIVE;
+                    let mut sink = self.sink.borrow_mut();
+                    if sink.eq_locked && sink.fec_config & 1 != 0 {
+                        // DP_FEC_DECODE_EN_DETECTED is latched until W1C.
+                        sink.fec_status |= 1;
+                    }
                 } else {
                     self.fec_missed_enables
                         .set(self.fec_missed_enables.get() - 1);
@@ -2945,6 +2962,17 @@ fn dsc_monitor(fec: bool) -> Sink {
     sink
 }
 
+// One HBR lane cannot carry 1080p60 even at 6 bpc, forcing DSC with FEC.
+fn compressed_tc(nacks: u8) -> ExtFake {
+    let mut sink = dsc_monitor(true);
+    sink.edid = edid_1080();
+    sink.caps[1] = 0x0a;
+    sink.fec_status_nacks = nacks;
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    io
+}
+
 fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
     use crate::intel_gpu_xelpg_dsc::{
         decide_dp, DpDscSink, DscDpcd, DscSink, LinkDecision, LinkLimits, DP_TP_CTL_FEC_ENABLE,
@@ -3078,30 +3106,37 @@ fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
         (DisplayIp::WildcatLake, 0, 1, 2),
         (DisplayIp::WildcatLake, 0, 4, 4),
     ] {
-        // HBR x1 cannot carry this 1080p60 mode even at 6 bpc.
-        let port = XeLpgPort::Tc2;
-        let mut sink = dsc_monitor(true);
-        sink.edid = edid_1080();
-        sink.caps[1] = 0x0a;
-        sink.fec_status_nacks = nacks;
-        let io = ExtFake::new(port, sink);
-        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        let io = compressed_tc(nacks);
         io.fec_missed_enables.set(missed);
         let Some(panel) = io.light_panel_ip(ip) else {
             return TestResult::Fail("could not light the panel for the FEC fixture");
         };
-        let probe = match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), port, false)
-            .and_then(|link| probe_sink_link(&io, link))
-        {
-            Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
-            _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
-        };
+        let probe =
+            match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), io.port, false)
+                .and_then(|link| probe_sink_link(&io, link))
+            {
+                Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
+                _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
+            };
         let fb = fb_for(&probe.mode).unwrap();
         let display = MtlDisplay {
             panel: Some(panel),
             pipe_dmc: &NoPipeDmc,
         };
         let result = activate(&io, probe, fb, &display);
+        if io
+            .sink
+            .borrow()
+            .dsc_log
+            .iter()
+            .filter(|&&(addr, value)| addr == 0x280 && value == 3)
+            .count()
+            != 1
+        {
+            return TestResult::Fail(
+                "clear the sink's FEC detected flags once when setting FEC_READY",
+            );
+        }
         let pps = io.first_write(|off, _| off == 0x6_1350);
         let mut enabled = false;
         let mut rising = 0;
@@ -3150,6 +3185,149 @@ fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_xe3_external_dsc_confirms_fec_before_pps
+);
+
+fn fec_service(io: &ExtFake, ip: DisplayIp, dmc: &'static DmcEvents) -> Option<MtlExternalService> {
+    let mut service = MtlExternalService::new();
+    service.set_profile(ExternalDisplayProfile::for_ip(ip));
+    service.set_display(beside(io.light_panel_ip(ip)?, dmc));
+    Some(service)
+}
+
+fn tc2_event(kind: MtlHpdKind) -> MtlHpdEvent {
+    MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind,
+    }
+}
+
+fn smoke_xe3_external_dsc_requires_live_fec_through_scanout() -> TestResult {
+    for (ip, drop_on) in [
+        (DisplayIp::Xe3Lpd, PIPECONF_B),
+        (DisplayIp::WildcatLake, PLANE_CTL_1_B),
+    ] {
+        let io = compressed_tc(0);
+        let dmc = DmcEvents::leak();
+        let Some(mut service) = fec_service(&io, ip, dmc) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        io.fec_drop_on_enable.set(Some(drop_on));
+        let result = service.handle(
+            &io,
+            tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt)),
+            &mut fb_for,
+        );
+        if !matches!(
+            result,
+            ServiceOutcome::Refused {
+                error: RouteError::Dp(ExternalError::FecNotReady),
+                ..
+            }
+        ) || service.route().is_some()
+            || io.writes_to(0x6_1350).is_empty()
+            || io
+                .first_write(|r, v| r == PIPECONF_B && v & ENABLE != 0)
+                .is_none()
+            || io
+                .first_write(|r, v| r == PLANE_CTL_1_B && v & ENABLE != 0)
+                .is_some()
+                != (drop_on == PLANE_CTL_1_B)
+            || io.read32(TRANS_CLK_SEL_B) != 0
+            || io.aux_power.get()
+            || dmc.events() != [(1, true), (1, false)]
+            || !panel_never_blanked(&io)
+        {
+            return TestResult::Fail(
+                "lost source FEC must withdraw the compressed stream before publication",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_requires_live_fec_through_scanout
+);
+
+fn smoke_xe3_external_dsc_retains_clock_until_fec_stops() -> TestResult {
+    for (ip, stop_status, error, rollback) in [
+        (
+            DisplayIp::Xe3Lpd,
+            dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            ExternalError::FecStopTimeout,
+            false,
+        ),
+        (
+            DisplayIp::WildcatLake,
+            u32::MAX,
+            ExternalError::AccessLost,
+            false,
+        ),
+        (
+            DisplayIp::WildcatLake,
+            dsc::DP_TP_STATUS_FEC_ENABLE_LIVE,
+            ExternalError::FecStopTimeout,
+            true,
+        ),
+    ] {
+        let io = compressed_tc(u8::from(rollback));
+        let dmc = DmcEvents::leak();
+        let Some(mut service) = fec_service(&io, ip, dmc) else {
+            return TestResult::Fail("could not light the panel");
+        };
+        if rollback {
+            io.fec_stop_status.set(Some(stop_status));
+        }
+        let connect = tc2_event(MtlHpdKind::Connected(LiveMode::DpAlt));
+        let disconnect = tc2_event(MtlHpdKind::Disconnected);
+        let mut outcome = service.handle(&io, connect, &mut fb_for);
+        if !rollback {
+            if !matches!(outcome, ServiceOutcome::Activated { pipe: Pipe::B, .. }) {
+                return TestResult::Fail("the compressed route must light before the forced stop");
+            }
+            io.fec_stop_status.set(Some(stop_status));
+            outcome = service.handle(&io, disconnect, &mut fb_for);
+        }
+        if !matches!(outcome, ServiceOutcome::Retained { error: RouteError::Dp(e), .. } if e == error)
+            || !matches!(service.route(), Some(MtlRoute::Dp(r)) if r.state() == RouteState::Quarantined && r.reserved())
+            || io.read32(DP_TP_CTL_B) & (DP_TP_CTL_ENABLE | dsc::DP_TP_CTL_FEC_ENABLE) != 0
+            || io.read32(TRANS_CLK_SEL_B) == 0
+            || io.read32(io.port.buf_ctl1()) & TC_PHY_OWNERSHIP == 0
+            || !io.aux_power.get()
+            || dmc.events() != [(1, true)]
+        {
+            return TestResult::Fail(
+                "an unproven FEC stop must retain the pipe, clock, Type-C and AUX",
+            );
+        }
+        io.writes.borrow_mut().clear();
+        if !matches!(service.handle(&io, disconnect, &mut fb_for), ServiceOutcome::Retained { error: RouteError::Dp(e), .. } if e == error)
+            || !io.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("a retry while FEC is unproven may only sample source status");
+        }
+        io.fec_stop_status.set(None);
+        io.sink.borrow_mut().nack_all = true; // A detached sink cannot acknowledge AUX.
+        if !matches!(
+            service.handle(&io, disconnect, &mut fb_for),
+            ServiceOutcome::Withdrawn { .. }
+        ) || service.route().is_some()
+            || io.read32(TRANS_CLK_SEL_B) != 0
+            || io.read32(io.port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+            || io.aux_power.get()
+            || dmc.events() != [(1, true), (1, false)]
+            || !panel_never_blanked(&io)
+        {
+            return TestResult::Fail(
+                "after source FEC stops the same reservation must release on unplug",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_external_dsc_retains_clock_until_fec_stops
 );
 
 fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {

@@ -456,6 +456,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         trained,
         pipe,
         reservation: None,
+        awaiting_fec_stop: false,
         state: RouteState::Stopped,
     };
     let result = (|| {

@@ -248,6 +248,13 @@ source FEC-live bit and the sink's FEC-decode acknowledgement before
 transmitting the DSC picture parameter set. The driver can retry three
 times, waiting for the source to disable FEC before each new enable.
 Exhaustion returns `ExternalError::FecNotReady` and runs route teardown.
+The source must still report FEC live after transcoder enable and at the
+first verified scanout frame. During teardown, a source that continues
+reporting FEC live returns `ExternalError::FecStopTimeout`, and an
+unreadable status returns `ExternalError::AccessLost`. The quarantined
+route keeps its port clock, pipe reservation and Type-C/AUX leases. A
+later stop resumes from that status check and releases the resources once
+the source reports FEC off, even if the sink has disconnected.
 
 `intel_gpu_xelpg_hpd` publishes `ConnectorStatus` per owned pin (DDI B and
 TC1-TC4) and `MtlHpdEvent`s (Connected(mode), Disconnected, ShortPulse,
