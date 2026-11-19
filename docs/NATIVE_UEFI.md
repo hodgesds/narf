@@ -166,6 +166,15 @@ menuentry 'NARF native EFI' {
 }
 ```
 
+On the NUC with the ESP mounted at `/boot` and the above entry in
+`/boot/grub/grub.cfg`, install an image and select it for one boot with
+`sudo packaging/install-next-boot.sh path/to/BOOTX64.EFI`. Omit the image
+path to use the latest staged native EFI build. The script verifies the
+image, replaces `/boot/EFI/NARF-NATIVE/narf.efi`, and sets GRUB's
+`next_entry`. GRUB clears this selection before launching NARF and uses
+its regular default on the following boot. To cancel before restarting,
+run `sudo grub-editenv /boot/grub/grubenv unset next_entry`.
+
 For systemd-boot, create an administrator-managed Type #1 entry on the ESP:
 
 ```ini
