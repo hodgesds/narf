@@ -3011,6 +3011,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-observability",
  "narf-rcu",
  "narf-scheduler",
  "narf-time",
@@ -3404,6 +3405,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kallsyms",
  "narf-kernel-test",
  "narf-lib",
  "narf-time",

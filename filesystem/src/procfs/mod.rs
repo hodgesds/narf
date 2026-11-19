@@ -72,6 +72,7 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, 
 
 pub mod aggregate;
 pub mod bus;
+pub mod kallsyms;
 pub mod mem;
 pub use mem::{install_proc_mem_hook, ProcMemAccess, ProcMemOpenFn};
 pub mod net;
@@ -1418,6 +1419,21 @@ pub trait ProcFile: Send + Sync + core::fmt::Debug {
     fn mtime_cycles(&self) -> u64 {
         narf_time::monotonic_ns()
     }
+
+    /// Per-open instance, minted by `open(2)` after the DAC check and in the
+    /// opener's context — Linux's `proc_ops::proc_open`, where
+    /// `file->f_cred` is the opener's credential. `ino` is the registry
+    /// entry's inode, `write` whether the open asked for write access.
+    ///
+    /// A file whose content depends on WHO opened it (`/proc/kallsyms`'
+    /// `kallsyms_show_value(file->f_cred)`), or that streams a body too large
+    /// to regenerate per `read(2)`, returns its own `FileOps` here; that
+    /// instance then serves every read and write on the descriptor. The
+    /// default `None` keeps the shared adapter, which calls [`Self::read`]
+    /// afresh for every read.
+    fn open(&self, _ino: u64, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        Ok(None)
+    }
 }
 
 /// A node in the dynamic procfs tree — either a file (leaf) or a
@@ -1688,6 +1704,9 @@ impl FileOps for ProcDynFile {
     }
     fn inode_attrs(&self) -> crate::InodeAttrs {
         proc_attrs()
+    }
+    fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        self.file.open(self.ino, write)
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { self.file.read_at(offset, buf) })

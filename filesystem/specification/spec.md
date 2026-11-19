@@ -2079,6 +2079,60 @@ pub fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError
 the caller's pid namespace and perform the capability check. Before the hooks
 are installed it reads `0` and refuses writes.
 
+### 3.14 Kernel symbols: `/proc/kallsyms` and `kernel.kptr_restrict`
+
+`/proc/kallsyms` (0444) renders the image's symbol table
+(`narf_observability::kallsyms`, built by `xtask kallsyms`) in Linux's
+`kernel/kallsyms.c::s_show` format, one `%px %c %s\n` line per symbol in
+ascending address order: 16 zero-padded lowercase hex digits, the `nm(1)`
+type letter, and the `nm -C` name (Rust names demangled without the hash,
+at most `KSYM_NAME_LEN - 1` = 511 bytes). Text and data symbols are listed
+(`CONFIG_KALLSYMS_ALL`), including `_text`, `_stext`, `_etext`, `_sdata`,
+`_edata` and `_end`; addresses are runtime (KASLR-slid) addresses. There are
+no module symbols yet and no `\t[module]` suffix; `/proc/modules` is empty.
+An image linked without the patch step has an empty `/proc/kallsyms`.
+
+```rust
+// procfs::kallsyms
+pub const CAP_SYSLOG: u32;                                   // 34
+pub fn kallsyms_show_value(cap_syslog: impl FnOnce() -> bool) -> bool;
+pub fn register_all();
+
+// procfs::sys_kernel
+pub fn kptr_restrict() -> u32;           // live kernel.kptr_restrict, 0..=2
+pub fn perf_event_paranoid() -> i32;     // live kernel.perf_event_paranoid
+```
+
+`kallsyms_show_value` is `kernel/ksyms_common.c`'s: `kptr_restrict` 0 shows
+values when `perf_event_paranoid <= 1`, else falls through to 1; 1 shows them
+to an opener holding `CAP_SYSLOG` in the initial user namespace
+(`caller_capable`); 2 shows them to nobody. The answer is computed ONCE, in
+`ProcFile::open` (the opener's context, Linux's `file->f_cred`), and fixed
+for the descriptor: dropping privilege after open does not hide values, and
+gaining it does not reveal them. A reader denied values sees every address as
+`0000000000000000` — never a subset — while names and types are unchanged.
+Reads stream through a per-open cursor (seq_file semantics: sequential reads
+continue, any other offset re-renders from the start).
+
+`kernel.kptr_restrict` is a 0644 sysctl, `proc_dointvec_minmax_sysadmin`
+over `[0, 2]`: a write needs `CAP_SYS_ADMIN` (`EPERM` otherwise, whatever the
+file mode allowed) and anything else is `EINVAL`. It boots at **2**, not
+Linux's compiled-in 0: NARF exposes kernel layout only on an administrator's
+explicit request.
+
+`ProcFile` gains a per-open hook, the analogue of `proc_ops::proc_open`:
+
+```rust
+fn open(&self, ino: u64, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+    Ok(None)   // default: the shared read()-per-call adapter
+}
+```
+
+The registry adapter's `open_instance_checked` calls it after the DAC check,
+in the opener's context. A file whose content depends on who opened it, or
+that streams a large body, returns its own `FileOps`, which then serves every
+read and write on that descriptor.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can
@@ -2123,7 +2177,8 @@ Arch-neutral at the spec level. Two arch-touches:
   `scheduler/`, `rcu/` (QSBR for immutable mount-routing snapshots and the
   non-sleeping dentry fast path). A walk that may await leaves QSBR first and
   continues through owned references; sleepable RCU is not held across
-  filesystem I/O.
+  filesystem I/O. `observability/` (the image's kernel symbol table, for
+  `/proc/kallsyms`).
 - **Provides to:** `userspace/` (the file-shaped ABI), `process/` (log
   storage for audit trails), future daemons (package manager,
   session manager, etc.).
