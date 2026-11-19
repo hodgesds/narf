@@ -2055,6 +2055,22 @@ impl super::queues::RegBank for FwFakeBank {
         if offset % 4 != 0 {
             return;
         }
+        // FWSTS.FWRI is clear-by-write-one (X550 §11.8.2.1
+        // step 1; Linux `ixgbe_hic_unlocked` writes FWSTS back
+        // with FWRI set to clear it): a written 1 clears the
+        // bit, a written 0 leaves it alone. Without this,
+        // `host_interface_command`'s step-(1) write *sets*
+        // FWRI in the fake and the step-(6) check always
+        // reports `FwReset`. The firmware side still sets FWRI
+        // directly in storage (`HicFwReset` mode), so that
+        // path keeps firing — now for real.
+        if offset == hic::REG_FWSTS {
+            let st = self.state_mut();
+            if let Some(slot) = st.regs.get_mut((offset / 4) as usize) {
+                *slot = (*slot & !(value & hic::FWSTS_FWRI)) | (value & !hic::FWSTS_FWRI);
+            }
+            return;
+        }
         self.poke(offset, value);
         if offset == hic::REG_HICR && value & hic::HICR_C != 0 {
             self.hic_firmware_side();
