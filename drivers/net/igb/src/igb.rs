@@ -4904,6 +4904,17 @@ mod tests {
         if vflre != 0x02 {
             return TestResult::Fail("VFLRE clear-write drift");
         }
+        // The fake does not model W1C clearing: the pump's
+        // `write32(REG_VFLRE, bit)` stored 0x02 instead of clearing
+        // the bit, so drive the cause word to zero before the ack
+        // steps — otherwise the reset event re-fires on every pump
+        // step, rebuilds `VfState`, and clears the ack-NACK latch
+        // (issue #2261). Same workaround as
+        // `smoke_igb_mailbox_pump_reset_and_mac`'s idle pump.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::REG_VFLRE, 0);
+        }
         if vmolr1 != vmdq::VMOLR_AUPE {
             return TestResult::Fail("reset event did not restore VMOLR AUPE");
         }
