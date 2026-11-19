@@ -141,7 +141,7 @@ impl PciBoot {
             self.stop_interrupts();
             // A failed wake/reference proof never skips the last available
             // PCI-only BME-off attempt. No allocation is reclaimable here.
-            let _ = crate::qualcomm_pci::invoke(&cap, || {
+            let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::clear_command(&cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
             });
             return Err(error);
@@ -156,7 +156,7 @@ impl PciBoot {
         let cap = self.retire_scope()?;
         let device = self.device;
         let halted = silence(&mut self.mmio, self.hardware, || {
-            crate::qualcomm_pci::invoke(&cap, || {
+            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
                     .map_err(|_| BmiError::Pci)?;
                 let command =
@@ -183,7 +183,7 @@ impl PciBoot {
         let cap = self.retire_scope()?;
         let device = self.device;
         park(&mut self.mmio, self.hardware, || {
-            crate::qualcomm_pci::invoke(&cap, || {
+            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
                     .map_err(|_| BmiError::Pci)?;
                 let command =

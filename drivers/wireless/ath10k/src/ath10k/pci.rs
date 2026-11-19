@@ -542,11 +542,12 @@ pub fn resume() -> bool {
 
 fn restart_parked(parked: super::boot::Restart, revision: u32) {
     let (cap, device) = (parked.cap, parked.device);
-    let read =
-        crate::qualcomm_pci::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40));
+    let read = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
+        narf_bus::pci::read_config32(&cap, &device, 0x40)
+    });
     if let Ok(Ok(value)) = read {
         if let Some(cleared) = super::pm::retry_timeout(value) {
-            let _ = crate::qualcomm_pci::invoke(&cap, || {
+            let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::write_config32(&cap, &device, 0x40, cleared)
             });
         }
@@ -1038,7 +1039,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         .as_ref()
         .map(|controller| controller.address);
     let occupied = owner.is_some();
-    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
+    narf_drivers_wireless_ath_core::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath10k singleton already owns another radio",
@@ -1111,7 +1112,7 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
     hw_rev: HwRev,
 ) -> Result<Ath10kDevice, ProbeError> {
-    crate::qualcomm_pci::invoke(cap, || {
+    narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || {
         // SAFETY: forwarded exclusive BAR/config ownership. The actual
         // mapping, wake and identity accesses stay inside this invocation.
         unsafe { bring_up_live(device, cap, hw_rev) }
@@ -1125,7 +1126,7 @@ unsafe fn bring_up_live(
     hw_rev: HwRev,
 ) -> Result<Ath10kDevice, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = crate::qualcomm_pci::map_bar_control(device, cap, 0)
+    let mmio_bar0 = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(device, cap, 0)
         .map_err(|_| ProbeError::Bar0MapFailed)?;
 
     let registers = hw_rev.registers().ok_or(ProbeError::LegacyChipRejected)?;
@@ -1242,10 +1243,9 @@ async fn boot_task(
                 // whose variant (when present) replaces the SMBIOS one. The
                 // function's DT/NVMEM calibration sources are read once here.
                 let sources = super::firmware::Platform::for_device(&device);
-                let variant = sources
-                    .variant
-                    .clone()
-                    .unwrap_or_else(|| crate::ath11k::board::check_smbios().bdf_ext);
+                let variant = sources.variant.clone().unwrap_or_else(|| {
+                    narf_drivers_wireless_ath_core::board::check_smbios().bdf_ext
+                });
                 let variant = core::str::from_utf8(&variant)
                     .map_err(|_| super::firmware::Error::Unsupported)?;
                 let address = match device.addr {

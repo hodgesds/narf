@@ -77,53 +77,9 @@ fn is_multicast(a: &[u8]) -> bool {
     a[0] & 1 != 0
 }
 
-/// `cfg80211_classify8021d(skb, NULL)` for a frame from the stack:
-/// `skb->protocol` is the Ethernet type, `skb->priority` is 0 (so not
-/// the 256..263 override) and no VLAN tag is offloaded. Returns the
-/// 802.1D user priority (= TID).
-pub fn classify8021d(eth: &[u8]) -> u8 {
-    if eth.len() < ETH_HLEN {
-        return 0;
-    }
-    let dscp: u32 = match be16(eth, 12) {
-        // ipv4_get_dsfield: the TOS byte.
-        ETH_P_IP => match eth.get(ETH_HLEN + 1) {
-            Some(&tos) => tos as u32 & 0xfc,
-            None => return 0,
-        },
-        // ipv6_get_dsfield: traffic class = bits 11:4 of the first word.
-        ETH_P_IPV6 => match eth.get(ETH_HLEN..ETH_HLEN + 2) {
-            Some(b) => (be16(b, 0) >> 4) as u32 & 0xfc,
-            None => return 0,
-        },
-        ETH_P_MPLS_UC | ETH_P_MPLS_MC => {
-            // skb_header_pointer → NULL ⇒ 0; TC = bits 11:9 of the entry.
-            return match eth.get(ETH_HLEN..ETH_HLEN + 4) {
-                Some(b) => {
-                    ((u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x0000_0e00) >> 9) as u8
-                }
-                None => 0,
-            };
-        }
-        // "802.21 is always network control traffic"
-        ETH_P_80221 => return 7,
-        _ => return 0,
-    };
-    // RFC 8325 §2.3: the three MSBs of the DSCP, with §4's exceptions.
-    let mut ret = dscp >> 5;
-    match dscp >> 2 {
-        10 | 12 | 14 => ret = 0, // AF11..AF13
-        16 => ret = 0,           // CS2
-        18 | 20 | 22 => ret = 3, // AF21..AF23
-        24 => ret = 4,           // CS3
-        26 | 28 | 30 => ret = 4, // AF31..AF33
-        44 => ret = 6,           // VA
-        46 => ret = 6,           // EF
-        48 => ret = 7,           // CS6
-        _ => {}
-    }
-    (ret & 7) as u8
-}
+// `classify8021d` promoted to `narf_drivers_wireless_ath_core::eth`
+// (shared with ath10k); re-exported so this module's callers resolve it.
+pub use narf_drivers_wireless_ath_core::eth::classify8021d;
 
 /// `ieee80211_select_queue` for the AP station: `(skb->priority, AC)`.
 /// Without WMM (`sta->sta.wme` false) the priority is forced to 0 and

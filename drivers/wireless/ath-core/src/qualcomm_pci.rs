@@ -51,7 +51,7 @@ impl Config for Function<'_> {
         narf_bus::pci::read_command(self.cap, self.device).map_err(|_| ())
     }
 }
-pub(crate) fn park(
+pub fn park(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     memory: bool,
@@ -76,7 +76,7 @@ fn map_prepared<T>(config: &mut impl Config, map: impl FnOnce() -> Result<T, ()>
     prepare(config, true)?;
     Ok(region)
 }
-pub(crate) fn invoke<T>(
+pub fn invoke<T>(
     cap: &Cap<BusDeviceCap, Write>,
     operation: impl FnOnce() -> T,
 ) -> Result<T, CapError> {
@@ -89,7 +89,7 @@ pub(crate) fn invoke<T>(
     }
     cap.invoke(Access(operation))
 }
-pub(crate) fn map_bar_control(
+pub fn map_bar_control(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     index: u8,
