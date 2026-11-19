@@ -534,8 +534,12 @@ pub fn try_mount_root_with_options(
         } else {
             fs
         };
+        // The kernel mounts the root from its device, as `mount_root_generic`
+        // does from `/dev/root`; the device node is what `/proc/mounts`
+        // names (`mnt_devname`, for a filesystem without `show_devname`).
+        let devname = alloc::format!("/dev/{device_name}");
         let _handle = crate::registry()
-            .mount_arc(authority, "/", fs)
+            .mount_arc_with_source(authority, "/", fs, 0, Some(&devname))
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;
         mapping.0 = false;
         return Ok(MountReport {
@@ -609,8 +613,15 @@ pub fn try_mount_efi_system_partition(
                 continue;
             }
         };
+        let devname = alloc::format!("/dev/{}", entry.name);
         let boot_handle = crate::registry()
-            .mount_arc(authority, EFI_SYSTEM_PARTITION_MOUNTPOINT, fs.clone())
+            .mount_arc_with_source(
+                authority,
+                EFI_SYSTEM_PARTITION_MOUNTPOINT,
+                fs.clone(),
+                0,
+                Some(&devname),
+            )
             .map_err(|error| RootMountError::FactoryFailed(detect, error))?;
         if installed_root_mounts_own_esp() {
             // The installed root's fstab mounts the ESP itself (CachyOS:
@@ -621,10 +632,12 @@ pub fn try_mount_efi_system_partition(
                 fs_type: detect,
             });
         }
-        if let Err(error) = crate::registry().mount_arc(
+        if let Err(error) = crate::registry().mount_arc_with_source(
             authority,
             INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT,
             fs,
+            0,
+            Some(&devname),
         ) {
             // Do not report a half-mounted ESP.  The handle was minted by the
             // first attach and remains live here, so rollback is best-effort

@@ -17,6 +17,28 @@ validates options and returns an unattached `Arc<dyn FsInstance>`.
 Both legacy mount and fsconfig use this constructor. Existing volume/node APIs
 are described in the [driver README](../README.md) and their Rust documentation.
 
+Mount table identity (`/proc/<pid>/mounts`, `mountinfo`, `statmount`):
+
+```rust
+impl VolCore {
+    pub fn device_name(&self) -> Option<String>;   // "/dev/nvme1n1p2"
+    pub fn note_device_name(&self, name: &str);    // first one stays
+}
+impl BtrfsVolume {
+    pub fn mounted_subvol_path(&self) -> Option<String>; // "/@", "/" for the top level
+}
+```
+
+`registry::mount` records the `/dev` node of the block-registry device the
+filesystem is opened from (Linux `fs_devices->latest_dev`); every view's
+`FsInstance::show_devname` prints it (`btrfs_show_devname`). Selecting a
+subvolume — by `subvol=`, `subvolid=` or the on-disk default — resolves its
+path from the top level by `ROOT_BACKREF` / `INODE_REF`
+(`btrfs_get_subvol_name_from_objectid`); `show_root` reports it as the mount's
+root and `show_options` as `subvol=` for every subvolume mount (a
+subvolume whose backrefs cannot be walked keeps the `subvol=` spelling it was
+mounted with, or shows none for a `subvolid=` mount, and reports root `/`).
+
 Directory ownership and mode updates through `DirOps` use the same persistent
 inode update path as `FileOps`. In particular, the ownership and mode assigned
 by `mkdir(2)` are visible through both views and survive remounting; directory

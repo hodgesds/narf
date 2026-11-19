@@ -104,6 +104,15 @@ pub async fn mount(
     result
 }
 
+/// The `/dev` node of `source` in the block registry, if it is registered
+/// there — what `btrfs_show_devname` prints for the filesystem.
+fn registered_device_name(source: &Arc<dyn BlockDeviceSync>) -> Option<alloc::string::String> {
+    narf_block::block_devices()
+        .into_iter()
+        .find(|entry| Arc::ptr_eq(&entry.dev, source))
+        .map(|entry| alloc::format!("/dev/{}", entry.name))
+}
+
 async fn mount_inner(
     source: &Arc<dyn BlockDeviceSync>,
     devices: Vec<Arc<SyncBlock>>,
@@ -111,12 +120,16 @@ async fn mount_inner(
     read_only: bool,
 ) -> Result<Arc<BtrfsVolume<SyncBlock>>, FsError> {
     let _serial = MOUNT_LOCK.lock().await;
+    let device_name = registered_device_name(source);
     if let Some((fsid, devid)) = peek_identity(&**source) {
         if let Some(core) = lookup(&fsid) {
             // Same fsid but not one of the instance's members: a cloned disk.
             // Linux refuses to assemble a second device under a mounted fsid.
             if !core.has_member(devid) {
                 return Err(FsError::Busy);
+            }
+            if let Some(name) = &device_name {
+                core.note_device_name(name);
             }
             return Box::pin(BtrfsVolume::mount_view(&core, subvol, read_only)).await;
         }
@@ -141,6 +154,9 @@ async fn mount_inner(
         ))
         .await?
     };
+    if let Some(name) = &device_name {
+        volume.core().note_device_name(name);
+    }
     register(volume.core());
     Ok(volume)
 }

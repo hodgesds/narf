@@ -3227,16 +3227,27 @@ fn vfsmnt_options(mnt_opts: &str, show_options: &str, super_opts: &str) -> Strin
 /// `/proc/mounts` — a split view makes them disagree about whether something
 /// is a mount point at all.
 pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
+    ns_vfsmnt_rows(pid)
+        .into_iter()
+        .map(|(path, fs_name, options, _)| (path, fs_name, options))
+        .collect()
+}
+
+/// [`ns_mounts_for`] with each mount's source field: `(path, fstype,
+/// options, source)`.
+fn ns_vfsmnt_rows(pid: u64) -> Vec<(String, String, String, String)> {
     if let Some(rows) = hook_ns_mountinfo(pid) {
         // Hook rows are "id\tparent\tpath\tfsname\tmount-options\t
-        // show-options\tsuper-options" — SEVEN fields; the last three are
-        // optional (older rows stop after fsname). Splitting fewer than seven
-        // leaves "show-options\tsuper-options" in one field, which put a tab
-        // and a seventh column into every /proc/mounts line.
-        let parsed: Vec<(String, String, String)> = rows
+        // show-options\tsuper-options\tsource\troot" — NINE fields; the last
+        // five are optional (older rows stop after fsname, or after the super
+        // options). Splitting fewer than nine leaves the tail in one field,
+        // which put a tab and extra columns into every /proc/mounts line. A
+        // row with no source is a mount made without one, which reports its
+        // filesystem's name.
+        let parsed: Vec<(String, String, String, String)> = rows
             .lines()
             .filter_map(|line| {
-                let mut it = line.splitn(7, '\t');
+                let mut it = line.splitn(9, '\t');
                 let _id = it.next()?;
                 let _parent = it.next()?;
                 let path = it.next()?;
@@ -3244,10 +3255,12 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
                 let mnt_opts = it.next().unwrap_or("rw");
                 let show_options = it.next().unwrap_or("");
                 let super_opts = it.next().unwrap_or("rw");
+                let source = it.next().unwrap_or(fs_name);
                 Some((
                     String::from(path),
                     String::from(fs_name),
                     vfsmnt_options(mnt_opts, show_options, super_opts),
+                    String::from(source),
                 ))
             })
             .collect();
@@ -3259,9 +3272,9 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
         .list_mountinfo()
         .into_iter()
         .map(
-            |(_, _, path, fs_name, mnt_opts, show_options, super_opts)| {
+            |(_, _, path, fs_name, mnt_opts, show_options, super_opts, source, _)| {
                 let options = vfsmnt_options(&mnt_opts, &show_options, &super_opts);
-                (path, fs_name, options)
+                (path, fs_name, options, source)
             },
         )
         .collect()
@@ -3282,20 +3295,15 @@ fn gen_mounts() -> String {
 /// `/proc/<pid>/mounts` body for `pid`'s mount namespace, one
 /// `show_vfsmnt` row per mount: `device mountpoint fstype options 0 0`.
 ///
-/// NARF records no separate mount source, so the filesystem name stands in
-/// for `mnt_devname`; an absent one prints `none`, as `alloc_vfsmnt` stores
-/// for a NULL source. Device and type go through `mangle()` and the mount
-/// point through `seq_path_root`'s escape set, so whitespace or a backslash
-/// in any field cannot split the row.
+/// The device is `show_devname`'s, else the source the mount was made with
+/// (`mnt_devname`, `none` for a `mount(2)` with no source) — see
+/// [`crate::Mount::source`]. Device and type go through `mangle()` and the
+/// mount point through `seq_path_root`'s escape set, so whitespace or a
+/// backslash in any field cannot split the row.
 pub(crate) fn render_proc_mounts(pid: u64) -> String {
     let mut s = String::new();
-    for (path, fs_name, options) in ns_mounts_for(pid) {
-        let devname = if fs_name.is_empty() {
-            "none"
-        } else {
-            fs_name.as_str()
-        };
-        mangle_into(&mut s, devname, MANGLE_NAME);
+    for (path, fs_name, options, source) in ns_vfsmnt_rows(pid) {
+        mangle_into(&mut s, &source, MANGLE_NAME);
         s.push(' ');
         mangle_into(&mut s, &path, MANGLE_PATH);
         s.push(' ');
