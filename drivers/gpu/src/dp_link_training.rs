@@ -82,12 +82,14 @@ pub enum TrainingPattern {
     Tps4 = 7,
 }
 
-/// Framing and DPCD training patterns for an 8b/10b link.
+/// Framing, training patterns and receiver polling intervals for an 8b/10b link.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ReceiverTraining {
     pub enhanced_framing: bool,
     clock_recovery: u8,
     equalization: u8,
+    clock_recovery_delay_us: u32,
+    equalization_delay_us: u32,
 }
 
 impl ReceiverTraining {
@@ -96,6 +98,8 @@ impl ReceiverTraining {
             enhanced_framing: true,
             clock_recovery: TrainingPattern::Tps1 as u8,
             equalization: select.eq_pattern() as u8,
+            clock_recovery_delay_us: 100,
+            equalization_delay_us: 400,
         }
     }
 
@@ -112,12 +116,22 @@ impl ReceiverTraining {
         } else {
             TrainingPattern::Tps2 as u8 | SCRAMBLING_DISABLE
         };
+        // drm_dp_read_{clock_recovery,channel_eq}_delay for a direct DPRX
+        // on 8b/10b. Linux uses the reported interval even above value 4.
+        let interval = caps.training_aux_rd_interval & !DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT;
+        let interval_us = u32::from(interval) * 4_000;
         Self {
             // intel_dp_compute_config sets enhanced framing on 8b/10b SST
             // when drm_dp_enhanced_frame_cap accepts the receiver.
             enhanced_framing: !mst && caps.dpcd_rev >= 0x11 && caps.enhanced_framing,
             clock_recovery: TrainingPattern::Tps1 as u8 | SCRAMBLING_DISABLE,
             equalization,
+            clock_recovery_delay_us: if caps.dpcd_rev >= 0x14 || interval == 0 {
+                100
+            } else {
+                interval_us
+            },
+            equalization_delay_us: if interval == 0 { 400 } else { interval_us },
         }
     }
 }
@@ -652,7 +666,7 @@ fn clock_recovery<A: AuxChannel>(
     let mut prev_swing0 = u8::MAX;
 
     for _ in 0..MAX_PHASE_ATTEMPTS {
-        delay_us(100);
+        delay_us(receiver.clock_recovery_delay_us);
         let status = read_lane_status(aux)?;
         if all_cr_done(&status, n_lanes) {
             return Ok(vswing_pe);
@@ -721,7 +735,7 @@ pub fn train_channel_equalization_select<A: AuxChannel>(
 ) -> Result<VSwingPe, LinkError> {
     channel_equalization(
         aux,
-        select.eq_pattern() as u8,
+        ReceiverTraining::for_rate(select),
         lanes,
         start_vswing_pe,
         delay_us,
@@ -730,7 +744,7 @@ pub fn train_channel_equalization_select<A: AuxChannel>(
 
 fn channel_equalization<A: AuxChannel>(
     aux: &mut A,
-    pattern: u8,
+    receiver: ReceiverTraining,
     lanes: u8,
     start_vswing_pe: VSwingPe,
     delay_us: impl Fn(u32),
@@ -741,11 +755,11 @@ fn channel_equalization<A: AuxChannel>(
     }
     let mut vswing_pe = start_vswing_pe;
 
-    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[pattern])?;
+    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[receiver.equalization])?;
     write_vswing_pe(aux, &vswing_pe, n_lanes)?;
 
     for _ in 0..MAX_PHASE_ATTEMPTS {
-        delay_us(400);
+        delay_us(receiver.equalization_delay_us);
         let status = read_lane_status(aux)?;
         let align = aux_read_one(aux, DPCD_LANE_ALIGN_STATUS_UPDATED)?;
 
@@ -811,7 +825,7 @@ fn train_one<A: AuxChannel>(
     let select = RateSelect::LinkBw(rate);
     let receiver = receiver.unwrap_or_else(|| ReceiverTraining::for_rate(select));
     let vswing_pe = clock_recovery(aux, select, lanes, receiver, delay_us)?;
-    let vswing_pe = channel_equalization(aux, receiver.equalization, lanes, vswing_pe, delay_us)?;
+    let vswing_pe = channel_equalization(aux, receiver, lanes, vswing_pe, delay_us)?;
     Ok(TrainedLink {
         rate,
         lanes,

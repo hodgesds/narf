@@ -404,6 +404,12 @@ fallback retain the receiver's equalization pattern. For SST, the source
 and sink enable enhanced framing only with a DP 1.1+ receiver advertising
 DPCD 0x002 bit 7. Every attempted lane count uses this framing setting.
 MST uses its own transport mode and clears the enhanced-framing bit.
+Each training attempt waits the effective direct receiver's AUX read
+interval before polling link status. DPCD 0x00e bits 6:0 give the
+interval in 4 ms units. Zero selects 100 µs for clock recovery and
+400 µs for channel equalization. DP 1.4 and later always use 100 µs for
+clock recovery. As in Linux, values above four retain their reported
+delay in phases that use the interval.
 
 `drm_dsc` (ungated) holds DRM's VESA DSC helpers: `Pps` (drm_dsc_config),
 `compute_rc_parameters`, `pack_pps`, `set_rc_buf_thresh` and

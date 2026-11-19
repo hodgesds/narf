@@ -1349,6 +1349,57 @@ kernel_test_in!(
     smoke_xe3_usb_c_uses_receiver_training_patterns
 );
 
+fn smoke_xe3_usb_c_receiver_training_poll_intervals() -> TestResult {
+    use crate::intel_gpu_modeset::training::{Change, State, TrainingAux};
+    for (rev, interval, width, expected) in [
+        (0x12, 0x80, 2, &[100, 400][..]),
+        (0x12, 0x82, 2, &[8_000, 8_000][..]),
+        // Above the specified interval range Linux still waits the reported duration.
+        (0x12, 0x85, 2, &[20_000, 20_000][..]),
+        // Five CR polls at four lanes fail. The two-lane retry needs one CR
+        // and one EQ poll, with the DP 1.4 fixed CR delay on both attempts.
+        (0x14, 0x82, 4, &[100, 100, 100, 100, 100, 100, 8_000][..]),
+    ] {
+        let mut sink = Sink::new(0x06, edid_1024());
+        sink.caps[0] = rev;
+        sink.caps[14] = 0x80;
+        let mut extended = [0; 15];
+        extended.copy_from_slice(&sink.caps[..15]);
+        extended[14] = interval;
+        sink.extended_caps = Some(extended);
+        sink.max_good_lanes = 2;
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        let mut aux = IntelAux::xelpdp(&io, io.port.aux_base(), false);
+        aux_power_enable(&io, io.port).unwrap();
+        let caps = crate::dp_link_training::read_caps(&mut aux).unwrap();
+        let receiver = ReceiverTraining::for_receiver(&caps, 0, false);
+        let mut aux = TrainingAux::new(
+            aux,
+            State::new(crate::intel_gpu_pll::LinkRate::DpRbr, width),
+            |state: &State, change| {
+                if change == Change::Pattern {
+                    io.phy.write32(DP_TP_CTL_B, ENABLE | state.pattern_bits()?);
+                }
+                Ok(())
+            },
+        );
+        let delays = RefCell::new(Vec::new());
+        let result =
+            train_link_with_receiver(&mut aux, TrainRate::Rbr, width, Some(receiver), |us| {
+                delays.borrow_mut().push(us)
+            })
+            .unwrap();
+        assert_eq!(result.lanes, 2);
+        assert_eq!(delays.borrow().as_slice(), expected);
+        aux_power_disable(&io, io.port).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_xe3_usb_c_receiver_training_poll_intervals
+);
+
 fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     if probe_sink(&NoAccess, Generation::TigerLake, XeLpgPort::Tc1, false).err()
         != Some(ExternalError::UnsupportedGeneration)
