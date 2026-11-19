@@ -1194,18 +1194,19 @@ impl Pl011Probe {
                 );
                 // Ascending address order: second-nearest below, nearest
                 // below, nearest above, second-nearest above.
-                for slot in [before[1], before[0], after[0], after[1]] {
-                    if let Some(entry) = slot {
-                        let end = entry
-                            .phys_start
-                            .saturating_add(entry.page_count.saturating_mul(PAGE_SIZE));
-                        uefi::println!(
-                            "NARF UEFI loader: [hang147] why: nearest map {:?} {:#x}-{:#x}",
-                            entry.ty,
-                            entry.phys_start,
-                            end
-                        );
-                    }
+                for entry in [before[1], before[0], after[0], after[1]]
+                    .into_iter()
+                    .flatten()
+                {
+                    let end = entry
+                        .phys_start
+                        .saturating_add(entry.page_count.saturating_mul(PAGE_SIZE));
+                    uefi::println!(
+                        "NARF UEFI loader: [hang147] why: nearest map {:?} {:#x}-{:#x}",
+                        entry.ty,
+                        entry.phys_start,
+                        end
+                    );
                 }
             }
             Self::IdMismatch { id } => {
@@ -1684,7 +1685,7 @@ mod tests {
         let bytes = unsafe {
             slice::from_raw_parts(
                 descriptors.as_ptr() as *const u8,
-                descriptors.len() * core::mem::size_of::<MemoryDescriptor>(),
+                core::mem::size_of_val(descriptors),
             )
         };
         MemoryMapRef::new(
