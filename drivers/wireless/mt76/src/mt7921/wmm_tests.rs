@@ -79,6 +79,66 @@ fn command(frame: &[u8], id: u8) -> bool {
     frame.len() >= 64 && frame[36] == id && frame[37] == 0xa0
 }
 
+fn qos_edca(frame: &[u8]) -> bool {
+    command(frame, 0x1d) && frame.get(105) == Some(&1)
+}
+
+fn mt76_initial_edca_precedes_authentication_without_opening_data_port() -> TestResult {
+    for wmm in [false, true] {
+        for wpa2 in [false, true] {
+            let (mut session, bss) = prepared(wmm, wpa2);
+            session.backend.management_stall_after = Some(0);
+            {
+                let mut future = alloc::boxed::Box::pin(session.associate_station(
+                    &bss,
+                    b"narf",
+                    security(wpa2),
+                    test_permission(),
+                    &[],
+                ));
+                let mut cx = Context::from_waker(Waker::noop());
+                if future.as_mut().poll(&mut cx).is_ready() {
+                    return TestResult::Fail(
+                        "initial EDCA fixture did not suspend at authentication",
+                    );
+                }
+            }
+            let frames = &session.backend.frames;
+            let edca = frames.iter().position(|(_, frame)| command(frame, 0x1d));
+            let auth = frames.iter().position(|(_, frame)| {
+                frame.first() == Some(&0xb0) && frame.get(10..16) == Some(OWN.as_slice())
+            });
+            let Some((edca, auth)) = edca.zip(auth) else {
+                return TestResult::Fail("missing initial EDCA or authentication publication");
+            };
+            let body = &frames[edca].1[64..];
+            if body.len() != 44
+                || body[..40]
+                    .chunks_exact(10)
+                    .any(|row| row != [15, 0, 255, 3, 0, 0, 2, 0, 0, 0])
+                || body[40..] != [0, 0, 0, 0]
+                || !command(&frames[edca + 1].1, 0xc0)
+                || edca + 1 >= auth
+                || !frames[..edca].iter().any(|(_, frame)| {
+                    frame.len() >= 84 && frame[34..36] == [2, 0] && frame[43] == 7
+                })
+                || session.station.wmm.is_some()
+                || session.station.security.is_some()
+                || session.backend.receive_open
+                || !session.backend.data_qos.is_empty()
+                || !matches!(session.state, State::Running(Stage::Authenticate))
+            {
+                return TestResult::Fail("initial EDCA wire/order or closed host port");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/wmm",
+    mt76_initial_edca_precedes_authentication_without_opening_data_port
+);
+
 fn mt76_wmm_parameter_validation_and_native_edca_wire_values() -> TestResult {
     let parameters = Parameters::parse(&PARAMETERS).unwrap().unwrap();
     // mt7921_mcu_set_tx's ten-byte EDCA rows in BE/BK/VI/VO ACI order;
@@ -148,7 +208,7 @@ fn mt76_wmm_negotiated_open_and_wpa2_program_edca_before_qos_peer() -> TestResul
         let assoc = frames.iter().position(|(_, frame)| {
             frame.first() == Some(&0) && frame.get(10..16) == Some(OWN.as_slice())
         });
-        let edca = frames.iter().position(|(_, frame)| command(frame, 0x1d));
+        let edca = frames.iter().position(|(_, frame)| qos_edca(frame));
         let Some((assoc, edca)) = assoc.zip(edca) else {
             return TestResult::Fail("WMM association request/EDCA command missing");
         };
@@ -256,7 +316,7 @@ fn mt76_wmm_downgrade_malformed_and_unsolicited_responses() -> TestResult {
             || matches!(session.state, State::Associated { .. })
             || session.backend.frames[before..]
                 .iter()
-                .any(|(_, frame)| command(frame, 0x1d))
+                .any(|(_, frame)| qos_edca(frame))
             || case == 4 && session.backend.frames.len() != before
         {
             return TestResult::Fail("invalid/downgraded WMM published QoS or device writes");
@@ -272,7 +332,7 @@ fn mt76_wmm_downgrade_malformed_and_unsolicited_responses() -> TestResult {
             .backend
             .frames
             .iter()
-            .any(|(_, frame)| command(frame, 0x1d))
+            .any(|(_, frame)| qos_edca(frame))
     {
         return TestResult::Fail("non-WMM legacy path was upgraded or blocked");
     }
@@ -292,6 +352,8 @@ fn mt76_wmm_edca_cancellation_retains_owner_and_never_opens_port() -> TestResult
             || !matches!(failed.state, State::Failed { .. })
             || failed.station.wmm.is_some()
             || !failed.backend.owner.published
+            || !failed.backend.management_rates.is_empty()
+            || failed.backend.receive_open
             || failed.backend.frames.iter().any(|(_, frame)| {
                 frame.len() >= 168
                     && frame[34..36] == [3, 0]
@@ -315,11 +377,13 @@ fn mt76_wmm_edca_cancellation_retains_owner_and_never_opens_port() -> TestResult
             return TestResult::Fail("EDCA fixture did not suspend at device publication");
         }
     }
-    if !matches!(session.state, State::Running(Stage::Associate))
+    if !matches!(session.state, State::Running(Stage::ChannelSwitch))
         || !session.backend.owner.published
         || session.station.wmm.is_some()
         || session.station.security.is_some()
         || !session.backend.data_qos.is_empty()
+        || !session.backend.management_rates.is_empty()
+        || session.backend.receive_open
         || !session
             .backend
             .frames
@@ -626,7 +690,7 @@ fn mt76_wmm_policy_loss_after_every_port_and_key_receipt_stops_next_publication(
             .backend
             .frames
             .iter()
-            .position(|(_, frame)| command(frame, 0x1d))
+            .position(|(_, frame)| qos_edca(frame))
             .unwrap();
         // Covers EDCA/PSE, connected QBSS, unauthorized/secure QoS peer,
         // group peer, M2/M4 and final PTK/GTK receipts. The fixture loses

@@ -72,7 +72,11 @@ fn mt76_country_wmm_rule_limits_association_and_dynamic_edca() -> TestResult {
     if run(session.associate_station(&bss, b"narf", Security::Open, grant, &[])) != Ok(42) {
         return TestResult::Fail("ETSI-rule association");
     }
-    if edca_commands(&session, before) != [expected.to_vec()] {
+    let mut initial = [15, 0, 255, 3, 0, 0, 2, 0, 0, 0].repeat(4);
+    initial[6] = 3; // BE AIFS is raised by the ETSI client rule.
+    initial[16] = 7; // BK AIFS is raised independently.
+    initial.extend_from_slice(&[0, 0, 0, 0]); // Non-QoS, BSS/WMM0.
+    if edca_commands(&session, before) != [initial, expected.to_vec()] {
         return TestResult::Fail("association EDCA not regulatory-limited");
     }
     // A dynamic update (new Parameter Set Count, VO CWmin 1) is limited by

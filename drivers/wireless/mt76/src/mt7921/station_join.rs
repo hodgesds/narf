@@ -2185,6 +2185,28 @@ impl<B: Backend> Session<B> {
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
 
+            // Linux interface open -> ieee80211_set_wmm_default ->
+            // BSS_CHANGED_QOS -> mt7921_mcu_set_tx initializes TXCMD after
+            // BSS_INFO, before authentication. Waiting for negotiated WMM
+            // left the first authentication frame without this setup.
+            self.associate_step = "initial-edca";
+            self.check_station_tx()?;
+            self.notify(
+                Command::Ce {
+                    id: 0x1d,
+                    query: false,
+                },
+                &crate::mt7921::association::wmm::on_vif(
+                    self.station.link.vif(),
+                    crate::mt7921::association::wmm::initial_edca(
+                        self.station.permission.and_then(|p| p.wmm_rule()),
+                    ),
+                ),
+            )
+            .await?;
+            self.confirm_command_progress().await?;
+            self.check_station_tx()?;
+
             // Enable standard STA RX filter (`MT7921_FILTER_ENABLE` without
             // monitor promiscuity) before sending Authentication, matching
             // Linux `mt7921_configure_filter`.
