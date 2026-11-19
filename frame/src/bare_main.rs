@@ -1880,28 +1880,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // queues exist — `spawn` here, before `scheduler::init`, would panic.
             narf_memory::reclaim::set_kswapd_wake_hook(kswapd_wake);
 
-            // Report the image's placement on BOTH arches.
+            // The image's placement is NOT printed here.
             //
-            // A zero slide and a slide computed but never applied look identical
-            // in a boot log, and a layout-dependent bug is unbisectable without
-            // the value. The delta has a sharper edge still: physical relocation
-            // fails CLOSED, so "no safe target" and "the selector is broken" are
-            // the same clean boot at delta 0.
+            // This block used to log the slide, the slid base and the physical
+            // delta on every boot. That is the KASLR secret, handed to anyone
+            // who can read the kernel log or the serial console — Linux never
+            // prints it at boot for that reason, only in panic output. NARF now
+            // matches: the panic and fatal-exception printers report it
+            // (`narf_memory::kaslr::KernelOffset`, "Kernel Offset: ..."), and a
+            // CAP_SYSLOG reader gets the slid addresses from /proc/kallsyms once
+            // `kernel.kptr_restrict` allows it.
             //
-            // This used to live inside the x86_64-only MMU-handoff block below,
-            // which meant aarch64 — where the stub keeps its own page tables and
-            // there is no handoff to narrate — printed neither number, and a
-            // physical relocation that silently did not happen there was
-            // indistinguishable from one that did.
+            // What the line was also for: telling "slid" from "computed but
+            // never applied" is `smoke_kaslr_kernel_image_is_slid`'s job, which
+            // checks the recorded slide and delta against where the image
+            // really is rather than leaving it to a reader of the log; and a
+            // layout-dependent crash still gets both values, in its report.
             {
-                let _ = writeln!(
-                    console::Writer,
-                    "  mmu: kernel image slide {:#x}, base {:#018x}, phys delta {:#x} (at {:#x})",
-                    narf_memory::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed),
-                    narf_memory::kaslr::kernel_virt_base(),
-                    narf_memory::kaslr::image_phys_delta(),
-                    narf_memory::kaslr::image_phys_bounds().0
-                );
                 // Every page of the image must be mapped at this slide: a hole
                 // faults only when something there first runs or is read.
                 #[cfg(target_arch = "aarch64")]

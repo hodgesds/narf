@@ -1751,6 +1751,9 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
 kernel_test_in!("aarch64", smoke_aarch64_sa_siginfo_sets_three_args);
 
 fn dump_frame(f: &TrapFrame) {
+    // Fatal-path only (every caller is `-> !`): the KASLR offset the boot log
+    // no longer carries, so the slid registers below can be symbolised.
+    let _ = writeln!(Writer, "  {}", narf_memory::kaslr::KernelOffset::current());
     let _ = writeln!(Writer, "  x0:  {:#018x}   x1:  {:#018x}", f.x0, f.x1);
     let _ = writeln!(Writer, "  x2:  {:#018x}   x3:  {:#018x}", f.x2, f.x3);
     let _ = writeln!(Writer, "  x30: {:#018x}", f.x30);
