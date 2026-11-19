@@ -22,6 +22,7 @@ narf-init         = { path = "../init" }
 narf-time         = { path = "../time" }
 narf-capabilities = { path = "../capabilities" }
 narf-bus          = { path = "../bus" }
+narf-block        = { path = "../block" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-filesystem   = { path = "../filesystem" }
 narf-initramfs    = { path = "../initramfs" }

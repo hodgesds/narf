@@ -455,6 +455,10 @@ pub fn module_netif_rx(
     ifindex: u32,
     frame: &mut [u8],
 ) -> i32;
+/// Whether `owner` holds a probe context for `dev` whose device cap still
+/// validates. Sinks outside the bus (the module block sink in
+/// `narf-modules`) gate registration on it.
+pub fn module_device_live(owner: u64, dev: u64) -> bool;
 ```
 
 The module subsystem installs all three call gates. They resolve `owner` to the

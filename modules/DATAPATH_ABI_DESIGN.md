@@ -300,9 +300,10 @@ Each stage is independently reviewable and testable; we stop/reassess after any.
   backstop; normal delivery is waker-driven.
 - **ABI churn.** ~20 new CRC entries; every signature is a promise. Keep them
   primitive-only (handles + pointers + lengths), never a `repr(Rust)` type.
-- **Beyond the reference consumer.** e1000 is the implemented runtime-load
-  consumer. Other dual-build drivers should add exports only as their concrete
-  datapaths require them rather than widening this ABI speculatively.
+- **Beyond the reference consumer.** e1000 (net), ftdi (USB) and nvme
+  (block) are the implemented runtime-load consumers. Other dual-build
+  drivers should add exports only as their concrete datapaths require them
+  rather than widening this ABI speculatively.
 - **Perf.** Copy-mode DMA (A) is fine for bring-up/bulk-NIC but not for a
   high-rate datapath; (B) is the eventual answer and needs the IOMMU work.
 
@@ -452,5 +453,68 @@ shell's `echo` reaches the host socket through module-submitted bulk-OUT,
 and the host's reply reaches the shell's `cat` through module-submitted
 bulk-IN. In-kernel smokes (`drivers/usb/module-datapath`,
 `modules/kabi`) cover argument validation, owner isolation, the serial
-bridge, retirement and a real control request against the kernel-test
-VM's QEMU keyboard.
+bridge, retirement and the control-request lifecycle. The kernel-test VM
+never attaches its QEMU keyboard, so that lifecycle smoke runs against a
+synthesised slot and compares bytes only when a slot really answers.
+
+## Block datapath
+
+Status: **implemented; `nvme.ko` (`drivers/nvme`, `module_probe.rs`) is the
+reference consumer**, proven by `cargo xtask nvme-module-block-smoke`.
+
+Every storage `.ko` (nvme, ahci, sdhci, the RAID HBAs) had only a
+registration path: PCI/MMIO/DMA let a module drive a controller, but there
+was nowhere to deliver sectors. The block sink is that place:
+
+```text
+narf_blk_register(dev, name, name_len, geometry[4], request, cookie) -> i32
+narf_blk_copy_in(dev, request, dma, dma_off, req_off, len) -> i32
+narf_blk_copy_out(dev, request, dma, dma_off, req_off, len) -> i32
+```
+
+All three require `BlockDevice`. They are implemented in the modules crate
+(`modules/src/module_block.rs`), which owns the module call gate and can
+reach both the bus DMA table and the block registry.
+
+- **A real disk.** `narf_blk_register` validates the name (lowercase ASCII,
+  at most 31 bytes, unused) and geometry (`[block size 512..=4096, capacity,
+  max blocks <= 1 MiB of data, flags]`; bit 0 volatile write cache, bit 1
+  read-only), checks that the caller holds a live probe context for `dev`
+  (`narf_bus::module_device_live`), and registers an ordinary
+  `BlockDeviceSync`. `/dev/<name>`, the disk-write policy, partition
+  scanning and filesystems treat it like any built-in disk.
+- **Synchronous requests, like the built-in polled drivers.** `read`,
+  `write` and `flush` call the module's
+  `extern "C" fn(cookie, request, op, lba, count) -> i32` through the module
+  call gate and return when it does. Requests are split to the module's max
+  blocks and serialised per disk, so a module sees one request at a time.
+  A module that registers a disk from its probe and is then read during
+  that registration (disk policy) is already in its own context; that
+  nested request skips the gate and still takes the per-disk slot.
+- **Kernel-side copies, no shared pointers.** The module never sees the
+  caller's buffer and the kernel never dereferences module memory. Inside a
+  request the module asks the kernel to copy between the request and one of
+  its own DMA buffers (`narf_bus::module_dma_read`/`write`). A copy is
+  checked against the request's owner, token, direction and length, and a
+  second concurrent copy of the same request is `-EBUSY`. Request ids are
+  never reused, so a copy after the callback returned is `-EINVAL`.
+- **Unload.** `delete_module` (and a failed init) calls `retire_owner`
+  before the bus context goes: new requests fail `DeviceRemoved`, a running
+  one is waited out (5 s bound), and every disk is unregistered, all before
+  module text is unmapped.
+
+The reference driver is deliberately small: one admin and one I/O queue,
+polled with `narf_dma_wait8`, namespace 1 only, a 64 KiB data buffer with a
+fixed PRP list. The built-in driver (MSI-X, every namespace, AER, power
+states) stays the default. `narf-drivers-nvme/nvme-module-only` withdraws
+the built-in PCI matches so a module loaded before PCI probing binds the
+controller.
+
+Proof: `nvme-module-block-smoke` serves a purpose-built 32 KiB image with a
+host-only marker in sector 1. The guest shell writes a token into sector 0
+of `/dev/nvme0n1` (a read-modify-write through the module), then reads the
+whole disk back: the token and the marker must both come back. After QEMU
+exits, the host image must hold the token at byte 0 with every other byte
+unchanged. In-kernel smokes (`modules/block`, `modules/kabi`) cover name
+and geometry validation, limits, request splitting, errno mapping, read-only
+and flush flags, copy checks and retirement.

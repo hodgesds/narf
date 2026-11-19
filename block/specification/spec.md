@@ -446,6 +446,27 @@ backing device revokes both guards. A failed root mount removes the view.
 `fs_detect::detect_filesystem_sync(&dyn BlockDeviceSync)` offers the same
 read-only probes as the Arc wrapper before adapter registration.
 
+### 3.7 Module-backed disks
+
+A loadable storage driver publishes a disk through the `narf_blk_*` kernel
+ABI (`modules/src/module_block.rs`; design in
+`modules/DATAPATH_ABI_DESIGN.md` §"Block datapath"). The modules crate
+registers it with `register_block_device` as an ordinary `BlockDeviceSync`,
+so this crate needs no module-specific code: the disk-write policy guard,
+`/dev/<name>`, partition scanning and filesystems apply unchanged.
+
+- `read`/`write`/`flush` are synchronous: each calls the module's request
+  callback through the module call gate and returns when it does. Requests
+  are split to the module's advertised maximum and serialised per disk.
+- `capabilities()` reports the module's volatile-cache flag (never native
+  FUA), and `has_real_flush()` is true exactly when that flag is set, so a
+  write-through module disk never advertises a flush it does not perform
+  (#841).
+- Module errnos map to `BlockIoError`: `-ENODEV` → `DeviceRemoved`,
+  `-EROFS` → `ReadOnly`, anything else → `DriverError`.
+- Unload unregisters the disk (`unregister_block_device`) before module
+  text is unmapped; a holder of the old `Arc` then sees `DeviceRemoved`.
+
 ## 4. Invariants & safety properties
 
 - No byte of I/O data ever lives in `block/` address space; all
