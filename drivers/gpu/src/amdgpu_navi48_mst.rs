@@ -2527,26 +2527,28 @@ impl ColdBoot {
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
+            // Construct and poll the encoder setup futures off this frame.
+            // Both carry packet programming state across hardware waits.
             if uhbr {
-                self.prepare_display_uhbr_mst_stream(
+                crate::out_of_line::boxed!(self.prepare_display_uhbr_mst_stream(
                     port,
                     source,
                     pipe,
                     stream.slots,
                     selection.uhbr_sdp(),
-                )
+                ))
                 .await?;
             } else {
                 // The stream's VSC/HDR SDPs, as for SST (enc401's
                 // update_dp_info_packets serves DIO MST streams too).
-                self.prepare_display_dp_frontend(
+                crate::out_of_line::boxed!(self.prepare_display_dp_frontend(
                     port,
                     otg::DpFrontendRequest {
                         vsc_colorimetry: selection.vsc_colorimetry,
                         hdr: selection.hdr_packet(),
                         ..otg::DpFrontendRequest::new(source, pipe)
                     },
-                )
+                ))
                 .await?;
             }
             self.teardowns
