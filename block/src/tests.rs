@@ -3004,6 +3004,225 @@ fn smoke_sync_block_discard_forwarding() -> TestResult {
 }
 kernel_test_in!("block/discard", smoke_sync_block_discard_forwarding);
 
+/// The #2254 remainder: `PolicyGuard` and `EncryptedBlockDevice`
+/// must forward `supports_trim`/`trim` like `PartitionBlockDevice`
+/// already does, so `BlockFeature::Discard` is advertised through
+/// every wrapper. The guard gates both on the write policy (a trim
+/// deallocates media, so a read-only guard refuses it exactly like
+/// a write); the encrypted device translates the range to inner
+/// LBAs exactly as its read/write do and forwards it — trim carries
+/// no data, so there is nothing to encrypt.
+fn smoke_sync_block_trim_forwarding_through_wrappers() -> TestResult {
+    use crate::disk_policy::{self, DiskPolicy, PolicyGuard};
+    use crate::encrypted::EncryptedBlockDevice;
+    use crate::partition::PartitionBlockDevice;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use async_trait::async_trait;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    /// Recorded (lba, n_blocks) pairs from a `TrimProbe`'s `trim`.
+    type TrimLog = Arc<IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>;
+
+    #[derive(Debug)]
+    struct TrimProbe {
+        capable: bool,
+        trims: TrimLog,
+    }
+    impl crate::BlockDeviceSync for TrimProbe {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            1024
+        }
+        fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn supports_trim(&self) -> bool {
+            self.capable
+        }
+        fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), crate::BlockIoError> {
+            self.trims.lock().push((lba, n_blocks));
+            Ok(())
+        }
+    }
+
+    fn probe(capable: bool) -> (TrimProbe, TrimLog) {
+        let trims = Arc::new(IrqSafeSpinLock::new(alloc::vec::Vec::new()));
+        (
+            TrimProbe {
+                capable,
+                trims: trims.clone(),
+            },
+            trims,
+        )
+    }
+
+    // Mock TPM (same shape as the encrypted round-trip test).
+    struct MockTpm;
+    #[async_trait]
+    impl narf_tpm::TpmDevice for MockTpm {
+        fn get_info(&self) -> narf_tpm::TpmInfo {
+            narf_tpm::TpmInfo {
+                manufacturer: 0,
+                version: 2,
+                spec_level: 0,
+            }
+        }
+        async fn submit_raw(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
+        async fn get_random(&self, _bytes: u16) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), narf_tpm::TpmError> {
+            Ok(())
+        }
+        async fn read_pcr(&self, _pcr: u32) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
+    }
+
+    // Guard + partition: the global policy is reset on every path.
+    let result = (|| {
+        // Writable policy: Discard advertised, trim reaches the device.
+        let (inner, recorded) = probe(true);
+        let inner = Arc::new(inner) as Arc<dyn crate::BlockDeviceSync>;
+        let guard = Arc::new(PolicyGuard::new("trim-guard", u64::MAX - 0x7d15, inner));
+        let bridge = crate::SyncBlock::new(guard.clone());
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+        if !crate::BlockDevice::supports(&*bridge, crate::BlockFeature::Discard) {
+            return Err("guard must advertise Discard while writes are permitted");
+        }
+        let _ = poll_ready_block(crate::BlockDevice::discard(
+            &*bridge,
+            crate::LbaRange {
+                start: 10,
+                blocks: 5,
+            },
+        ));
+        if recorded.lock().as_slice() != [(10, 5)] {
+            return Err("guard discard() must forward (lba, blocks) to trim");
+        }
+        if crate::BlockDeviceSync::trim(&*guard, 20, 3).is_err() {
+            return Err("guard trim must forward while writes are permitted");
+        }
+        if recorded.lock().as_slice() != [(10, 5), (20, 3)] {
+            return Err("guard trim must forward the range intact");
+        }
+
+        // Read-only policy: no advertisement, trim refused, nothing recorded.
+        disk_policy::__set_policy_for_test(Some(DiskPolicy::BootOnly));
+        if crate::BlockDevice::supports(&*bridge, crate::BlockFeature::Discard) {
+            return Err("guard must not advertise Discard while writes are refused");
+        }
+        if crate::BlockDeviceSync::trim(&*guard, 10, 5).is_ok() {
+            return Err("guard trim must be refused while writes are refused");
+        }
+        if recorded.lock().len() != 2 {
+            return Err("a refused guard trim must not reach the device");
+        }
+
+        // Partition: trim is offset by the start LBA and range-checked.
+        let (inner, recorded) = probe(true);
+        let inner = Arc::new(inner) as Arc<dyn crate::BlockDeviceSync>;
+        let part = Arc::new(PartitionBlockDevice::new(inner, 100, 64));
+        let bridge = crate::SyncBlock::new(part.clone());
+        if !crate::BlockDevice::supports(&*bridge, crate::BlockFeature::Discard) {
+            return Err("partition must advertise Discard its parent supports");
+        }
+        if crate::BlockDeviceSync::trim(&*part, 10, 5).is_err() {
+            return Err("partition trim must forward");
+        }
+        if recorded.lock().as_slice() != [(110, 5)] {
+            return Err("partition trim must offset by the start LBA");
+        }
+        if crate::BlockDeviceSync::trim(&*part, 60, 5).is_ok() {
+            return Err("partition trim past its end must fail");
+        }
+        Ok(())
+    })();
+    disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+
+    // Encrypted: the range is translated by the data offset and
+    // forwarded; out-of-range is refused before the device sees it.
+    // Same spawn + drain pattern as the encrypted round-trip test.
+    narf_scheduler::__reset_queues_for_test();
+    let enc_fail: Arc<IrqSafeSpinLock<Option<&'static str>>> = Arc::new(IrqSafeSpinLock::new(None));
+    let enc_fail_w = enc_fail.clone();
+    narf_scheduler::spawn(async move {
+        let tpm = MockTpm;
+        let fail = |why: &'static str| {
+            *enc_fail_w.lock() = Some(why);
+        };
+        let (inner, recorded) = probe(true);
+        let inner = Arc::new(inner) as Arc<dyn crate::BlockDeviceSync>;
+        let enc = match EncryptedBlockDevice::open(inner, &tpm).await {
+            Ok(enc) => enc,
+            Err(_) => {
+                fail("encrypted open failed");
+                return;
+            }
+        };
+        if !crate::BlockDeviceSync::supports_trim(&enc) {
+            fail("encrypted device must advertise trim its inner supports");
+            return;
+        }
+        if crate::BlockDeviceSync::trim(&enc, 0, 1).is_err() {
+            fail("encrypted trim must forward");
+            return;
+        }
+        if recorded.lock().as_slice() != [(8, 1)] {
+            fail("encrypted trim must offset by the data offset");
+            return;
+        }
+        // Capacity is 1024 - 8 = 1016 LBAs: the last block trims,
+        // one past it is refused before the device sees it.
+        if crate::BlockDeviceSync::trim(&enc, 1015, 1).is_err() {
+            fail("encrypted trim at the last block must succeed");
+            return;
+        }
+        if crate::BlockDeviceSync::trim(&enc, 1016, 1).is_ok() {
+            fail("encrypted trim past capacity must fail");
+            return;
+        }
+        if recorded.lock().len() != 2 {
+            fail("a refused encrypted trim must not reach the device");
+            return;
+        }
+        // Trim-incapable inner: no advertisement.
+        let (inner, _) = probe(false);
+        let inner = Arc::new(inner) as Arc<dyn crate::BlockDeviceSync>;
+        let enc = match EncryptedBlockDevice::open(inner, &tpm).await {
+            Ok(enc) => enc,
+            Err(_) => {
+                fail("encrypted open failed");
+                return;
+            }
+        };
+        if crate::BlockDeviceSync::supports_trim(&enc) {
+            fail("encrypted device must not advertise trim its inner lacks");
+        }
+    });
+    narf_scheduler::run_until_empty();
+    let result = match *enc_fail.lock() {
+        Some(why) => TestResult::Fail(why),
+        None => TestResult::Pass,
+    };
+    result
+}
+kernel_test_in!(
+    "block/discard",
+    smoke_sync_block_trim_forwarding_through_wrappers
+);
+
 fn poll_ready_block<F: core::future::Future>(fut: F) -> Option<F::Output> {
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     static VTABLE: RawWakerVTable =
