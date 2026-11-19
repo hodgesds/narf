@@ -686,8 +686,9 @@ pub struct Ixgbe {
     pub eee_state: IrqSafeSpinLock<Option<eee::EeeState>>,
     /// Board WoL capability record for X540-and-newer parts
     /// (Linux EEPROM-cap rule, see wol.rs `WolBoardCap`).
-    /// Default opts nothing in; the board/platform layer sets it
-    /// via `set_wol_board_cap`.
+    /// Probe populates it from EEPROM word 0x2c (issue #1266);
+    /// default opts nothing in; the board/platform layer may
+    /// override it via `set_wol_board_cap`.
     pub wol_board_cap: IrqSafeSpinLock<wol::WolBoardCap>,
     /// True while the datapath is quiesced (suspend/detach): tx/rx
     /// paths refuse work instead of feeding a stopped device.
@@ -903,6 +904,30 @@ impl Ixgbe {
         //    Receive Address.
         let mac = read_mac(&mmio).unwrap_or_else(|_| read_mac_from_rar(&mmio));
 
+        // PCI function number (== lan_id for these parts, see the
+        // `lan_id` field docs) — needed for the DEVICE_CAPS record
+        // below, where the PORT0-only cap permits function 0 only.
+        let lan_id = match device.addr {
+            narf_bus::BusAddr::Pcie(pci) => pci.function,
+            narf_bus::BusAddr::Mmio(_) => 0,
+        };
+
+        // 4b. EEPROM DEVICE_CAPS word (0x2c) — the X540+ WoL opt-in
+        // (issue #1266; Linux ixgbe_main.c reads this offset at
+        // probe). Same raw-EERD probe pattern as the MAC read above:
+        // START → poll DONE with timeout → decode. No SWFW EEPROM
+        // semaphore is taken — Linux's generic EERD-buffer path
+        // takes one, but NARF's probe EERD path does not (the MAC
+        // read already runs unprotected), so a semaphore retrofit
+        // is a separate, pre-existing gap that would have to cover
+        // the MAC read too. A failed read leaves the default record,
+        // which permits nothing; populating the record arms nothing
+        // by itself — `configure_wol` / `suspend` still gate on it.
+        let wol_board_cap = match eeprom_read_word(&mmio, wol::EEPROM_DEVICE_CAPS_WORD) {
+            Ok(word) => wol::WolBoardCap::from_device_caps(word, lan_id),
+            Err(_) => wol::WolBoardCap::default(),
+        };
+
         // 5. Tell firmware the OS driver has loaded.
         // SAFETY: same.
         unsafe {
@@ -1036,11 +1061,6 @@ impl Ixgbe {
             }
         }
 
-        let lan_id = match device.addr {
-            narf_bus::BusAddr::Pcie(pci) => pci.function,
-            narf_bus::BusAddr::Mmio(_) => 0,
-        };
-
         let ixgbe = Arc::new(Self {
             mmio,
             tx_queues,
@@ -1063,7 +1083,7 @@ impl Ixgbe {
             fdir_state: IrqSafeSpinLock::new(fdir::FdirState::default()),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
-            wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
+            wol_board_cap: IrqSafeSpinLock::new(wol_board_cap),
             quiesced: IrqSafeSpinLock::new(false),
             tx_timeouts: AtomicU64::new(0),
             tx_resets: AtomicU64::new(0),
@@ -1838,9 +1858,9 @@ impl Ixgbe {
     /// (see wol.rs `WolBoardCap`). Explicit opt-in only: the
     /// default record permits nothing, and setting a record arms
     /// nothing by itself — `configure_wol` / `suspend` still gate
-    /// on it. The record is a board-layer statement (today from
-    /// board configuration; later it can come from EEPROM word
-    /// 0x2c via the EERD helper).
+    /// on it. Probe populates the record from EEPROM word 0x2c
+    /// (issue #1266); this setter is the board-layer override for
+    /// a platform that knows better than the EEPROM image.
     pub fn set_wol_board_cap(&self, cap: wol::WolBoardCap) {
         *self.wol_board_cap.lock() = cap;
     }

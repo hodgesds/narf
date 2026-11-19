@@ -1115,6 +1115,48 @@ fn smoke_ixgbe_wol_board_cap() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_board_cap);
 
+// ── WoL DEVICE_CAPS probe mapping (#1266) ─────────────────────────
+
+fn smoke_ixgbe_wol_device_caps() -> TestResult {
+    use super::wol::{wol_allowed, WolBoardCap, EEPROM_DEVICE_CAPS_WORD};
+    // The DEVICE_CAPS word lives at EEPROM offset 0x2c
+    // (ixgbe_main.c:11913).
+    if EEPROM_DEVICE_CAPS_WORD != 0x2c {
+        return TestResult::Fail("DEVICE_CAPS EEPROM word is not 0x2c");
+    }
+    // 0x2c -> WolBoardCap mapping, all mask cases, both functions:
+    // (raw word, func) -> wol_allowed on X540. Mirrors the
+    // WolBoardCap rule table: masked 0x4 permits any func, masked
+    // 0x8 permits func 0 only, anything else permits nothing.
+    // (The probe's EERD-timeout fallback to the default record is
+    // not exercisable here — it lives in `bring_up_with_config`,
+    // not in the mapping — but the default record permits nothing,
+    // as `smoke_ixgbe_wol_board_cap` already proves.)
+    let cases: [(u16, u8, bool); 10] = [
+        (0x0000, 0, false),
+        (0x0000, 1, false),
+        (0x0004, 0, true),
+        (0x0004, 1, true),
+        (0x0008, 0, true),
+        (0x0008, 1, false),
+        (0x000C, 0, false),
+        (0x000C, 1, false),
+        (0xFFF4, 1, true),  // unrelated high bits ignored
+        (0xFFF8, 1, false), // masked 0x8, func 1
+    ];
+    for (word, func, want) in cases {
+        let cap = WolBoardCap::from_device_caps(word, func);
+        if cap.cap_bits != word || cap.func != func {
+            return TestResult::Fail("from_device_caps did not store the raw word");
+        }
+        if wol_allowed(super::IXGBE_DEV_X540, cap) != want {
+            return TestResult::Fail("0x2c -> WolBoardCap mapping mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_device_caps);
+
 fn smoke_ixgbe_wol_ipav() -> TestResult {
     use super::queues::RegBank;
     use super::wol::{
