@@ -490,7 +490,11 @@ fn hardware_model_with_identity(
                 (0x380dfc, 0),
                 (
                     0x380d8c,
-                    if platform.is_ptl() {
+                    if platform == GtPlatform::NovaLakeS {
+                        35 << 22
+                    } else if platform == GtPlatform::WildcatLake {
+                        (30 << 22) | (2 << 14)
+                    } else if platform.is_ptl() {
                         30 << 22
                     } else {
                         20 << 22
@@ -514,6 +518,8 @@ fn hardware_model_with_identity(
             0xd8c,
             if platform.is_gen12() {
                 u32::MAX // pre-GMD hardware must never read this absent register
+            } else if matches!(platform, GtPlatform::NovaLakeS | GtPlatform::WildcatLake) {
+                (30 << 22) | (3 << 14)
             } else if platform.is_ptl() {
                 30 << 22
             } else if platform.is_lnl() {
@@ -537,10 +543,9 @@ fn hardware_model_with_identity(
     (window, arena, gt)
 }
 
-// Independent source-generation discriminator for shared Xe2/Xe3 ring
-// literals. PTL30.00/30.01 uses this path as well as existing gfx20 profiles.
+// Independent source-generation discriminator for shared Xe2/Xe3 ring literals.
 fn model_has_xe2_ring(gmd: u32) -> bool {
-    gmd >> 22 == 20 || (gmd >> 22 == 30 && (gmd >> 14) & 255 <= 1)
+    gmd >> 22 == 20 || (gmd >> 22 == 30 && matches!((gmd >> 14) & 255, 0 | 1 | 3..=5))
 }
 
 fn lnl_progress(w: &Window) {
@@ -583,14 +588,14 @@ fn hardware_discovery<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Windo
         }
         assert_eq!(gt.state(), GtState::Ready);
         gt.begin_hwconfig(9).unwrap();
-        let ptl = w.0.borrow().profile.is_some_and(GtPlatform::is_ptl);
+        let xe3 = w.0.borrow().profile.is_some_and(GtPlatform::is_xe3_lpg);
         w.0.borrow_mut()
             .regs
-            .insert(0x190240, if ptl { 0xf0000018 } else { 0xf000000c });
+            .insert(0x190240, if xe3 { 0xf0000018 } else { 0xf000000c });
         assert!(gt.poll(10).is_pending());
         hwconfig_device_write(
             w,
-            if ptl {
+            if xe3 {
                 &[1, 1, 12, 70, 1, 96]
             } else {
                 &[7, 1, 8]
@@ -1747,7 +1752,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
                     let gen12 = d.profile.is_some_and(GtPlatform::is_gen12);
-                    let ptl = d.profile.is_some_and(GtPlatform::is_ptl);
+                    let xe3 = d.profile.is_some_and(GtPlatform::is_xe3_lpg);
                     assert!(d.synced.contains(&base));
                     let image = d.memory[&base].clone();
                     let ring_base = image.borrow()[1024 + 9];
@@ -1839,10 +1844,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                             && ring[off + 5] == first;
                         if oa || per_context {
                             assert!(svg.is_empty(), "OA jobs carry no state commands");
-                        } else if gen12 || ptl {
+                        } else if gen12 || xe3 {
                             // Source Wa14019789679 ends at graphics20.04;
-                            // neither Gen12 nor PTL uses this SVG seed.
-                            assert!(svg.is_empty(), "Gen12/PTL seed has no XeHP SVG commands");
+                            // neither Gen12 nor Xe3 uses this SVG seed.
+                            assert!(svg.is_empty(), "Gen12/Xe3 seed has no XeHP SVG commands");
                         } else {
                             assert_eq!(svg.len(), 50);
                             assert_eq!(
@@ -1869,8 +1874,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         image.borrow_mut()[0x2000 / 4] = 0xc01dcafe;
                         image.borrow_mut()[0x2004 / 4] = d.regs[&if gen12 {
                             0x7018
-                        } else if ptl {
-                            // PTL has no legacy 0x7044 workaround. Its
+                        } else if xe3 {
+                            // Xe3 has no legacy 0x7044 workaround. Its
                             // common seed resets this actual RCS selector.
                             0x20cc
                         } else {
@@ -1878,7 +1883,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         }];
                         // Fixture-only opaque save area, not a claimed hardware
                         // SVG layout. Capture proves every header reaches clones.
-                        if !gen12 && !ptl && !oa && !per_context {
+                        if !gen12 && !xe3 && !oa && !per_context {
                             image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
                         }
                     } else {

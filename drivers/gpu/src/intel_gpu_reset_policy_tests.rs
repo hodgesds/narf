@@ -30,7 +30,10 @@ fn expected_saves(
         entries.insert(base + offset, 0);
     }
     if platform.is_xe2() {
-        entries.extend([(base + 0x50, 1), (base + 0xd4, 1)]);
+        entries.insert(base + 0xd4, 1);
+        if !matches!(platform, GtPlatform::WildcatLake | GtPlatform::NovaLakeS) {
+            entries.insert(base + 0x50, 1);
+        }
     }
     if engine != Engine::Rcs0 {
         return entries;

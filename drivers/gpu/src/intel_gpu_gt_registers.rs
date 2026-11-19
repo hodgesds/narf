@@ -24,6 +24,12 @@ pub enum RegisterError {
     Verify(u64),
 }
 
+/// xe_wa.c Wa_16023105232, graphics GT arm. GuC must save the per-engine
+/// RING_PSMI_CTL only on IPs where the host installs this workaround.
+pub(crate) const fn disable_rc_sema_idle_msg(graphics: u16) -> bool {
+    matches!(graphics, 2001..=3001)
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
@@ -930,13 +936,15 @@ impl RegisterInit {
                 add(0xe530, 0x400, 0x400, false, Dss);
                 for engine in self.engines().iter() {
                     add(u64::from(engine.base()) + 0xd4, 0x80, 0x80, true, Direct);
-                    add(
-                        u64::from(engine.base()) + 0x50,
-                        0x1000,
-                        0x1000,
-                        true,
-                        Direct,
-                    );
+                    if disable_rc_sema_idle_msg(self.seed.graphics) {
+                        add(
+                            u64::from(engine.base()) + 0x50,
+                            0x1000,
+                            0x1000,
+                            true,
+                            Direct,
+                        );
+                    }
                 }
             }
             _ if self.platform.is_lnl() => {

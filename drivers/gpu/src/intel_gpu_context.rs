@@ -241,14 +241,23 @@ impl ContextSeed {
         for (reg, value) in masked {
             words.extend_from_slice(&[reg, value]);
         }
-        if self.platform.is_lnl()
-            || (self.platform.is_xe3_lpg() && self.graphics == 3000 && self.step < 4)
-        {
+        if self.platform.is_xe3_lpg() {
+            // Linux 7.3-rc4 xe_wa.c Wa_14026781792: disable TE patch control
+            // in the golden render context. FF_MODE also carries the two mesh
+            // autostrip disables on 30.00 A-stepping. Write the merged mask
+            // from a live DSS so the other FF_MODE fields survive capture.
+            let bits = if self.graphics == 3000 && self.step < 4 {
+                0x18010
+            } else {
+                0x10
+            };
+            rmw(&mut words, 0x6210, bits, bits, self.dss);
+        } else if self.platform.is_lnl() {
             rmw(&mut words, 0x6210, 0x18000, 0x18000, self.dss);
         } else if self.graphics == 2001 {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
-        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_xe3_lpg() {
+        } else if self.platform != GtPlatform::Battlemage {
             if self.platform.is_dg2() {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
@@ -706,7 +715,7 @@ pub(crate) mod tests {
             );
             assert_eq!(regs[&0x2580], 2); // source WMTP-disabled fuse
             let early = release == 0 && step < 4;
-            assert_eq!(regs[&0x6210], if early { 0xa4018001 } else { 0xa4000001 });
+            assert_eq!(regs[&0x6210], if early { 0xa4018011 } else { 0xa4000011 });
             assert_eq!(
                 regs.get(&0x6204).copied().unwrap_or(0),
                 if early { 0x40 } else { 0 }

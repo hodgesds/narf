@@ -106,6 +106,7 @@ impl EnginePolicy {
             GtPlatform::ArcticSoundM
             | GtPlatform::Alchemist
             | GtPlatform::Battlemage
+            | GtPlatform::WildcatLake
             | GtPlatform::NovaLakeS
             | GtPlatform::Integrated(
                 crate::intel_gpu::Generation::MeteorLake

@@ -1962,26 +1962,34 @@ kernel_test_in!(
     smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion
 );
 
-fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -> TestResult {
+fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -> TestResult {
     use crate::intel_gpu_engine::Engine;
-    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
     for device in [
         0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-        0xb0b0,
+        0xb0b0, 0xfd80, 0xfd81, 0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745,
     ] {
-        for (release, step) in [(0u32, 0u32), (0, 4), (1, 0)] {
+        let (platform, versions) = match device {
+            0xfd80 | 0xfd81 => (GtPlatform::WildcatLake, [(3, 0), (4, 0), (5, 0)]),
+            0xd740..=0xd745 => (GtPlatform::NovaLakeS, [(3, 0), (4, 0), (5, 0)]),
+            _ => (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+                [(0, 0), (0, 4), (1, 0)],
+            ),
+        };
+        for (release, step) in versions {
             let (w, arena, mut gt) = hardware_model_with_identity(platform, 0xdfc, 1, Some(device));
             {
                 let mut d = w.0.borrow_mut();
+                *d.regs.get_mut(&0x380d8c).unwrap() |= step;
                 d.regs.extend([
                     (0xd8c, 30 << 22 | release << 14 | step),
+                    (0x6210, 0xa4000001),
                     (0x913c, 0),
                     (0x9150, 0),
                     (0x9154, 0x80000000),
                     (0x9144, 0),
                     (0x9148, 0x80000000),
                     (0x914c, 0),
-                    (0x380d8c, 30 << 22 | step),
                     // XE2_NODE_ENABLE_MASK nodes 0-1 over the harness's
                     // MEML3 nibble; MIRROR_L3BANK_ENABLE without bank 1.
                     (0x9118, 0x0003_0001),
@@ -2074,15 +2082,27 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     (0x6210, 0x62a8, 0x1000dafc, 0x1000db01, 0xdb1c)
                 );
                 assert_eq!(d.regs[&0x20d4] & 0xc080, 0x80);
+                assert_eq!(
+                    d.regs[&0x6210],
+                    if release == 0 && step < 4 { 0xa4018011 } else { 0xa4000011 },
+                    "FF_MODE after executing the golden render context"
+                );
                 assert!(!d.regs.contains_key(&0xb154)); // no LNL-only RW flush tuning
                 for reg in [0x220c4, 0x3ee0c4, 0x1a0c4, 0x1c0c4, 0x1e0c4, 0x260c4] {
                     assert_eq!(d.regs[&reg], 0x306);
                 }
             }
             for engine in gt.engines().unwrap().iter() {
+                let ring_psmi = engine.base() + 0x50;
+                let saves = ads_registers(&w, engine);
                 assert_eq!(
-                    ads_registers(&w, engine).len(),
-                    if engine == Engine::Rcs0 {
+                    w.0.borrow().writes.contains(&(u64::from(ring_psmi), 0x1000_1000)),
+                    release <= 1
+                );
+                assert_eq!(saves.contains_key(&ring_psmi), release <= 1);
+                assert_eq!(
+                    saves.len(),
+                    (if engine == Engine::Rcs0 {
                         if release == 0 && step < 4 {
                             27
                         } else {
@@ -2090,7 +2110,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                         }
                     } else {
                         18
-                    }
+                    }) - usize::from(release > 1)
                 );
             }
 
@@ -2181,7 +2201,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     Ok(0)
                 );
             }
-            // LNL exposes only programmed noncompressed coherent policies.
+            // These integrated GTs expose the programmed coherent PAT entries.
             for pat in [0, 3, 6, 8, 15, 16, 31] {
                 assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
             }
@@ -2197,7 +2217,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe",
-    smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
+    smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
 );
 
 /// Negative publication: without `narf.intel.media_gt=1` (or before its

@@ -2289,6 +2289,15 @@ receives each BCS engine's ENGINE_BASE copies of Wa_16021639441/priority-read
 (CSFE_CHICKEN1 0x220d4 / 0x3ee0d4) and Wa_16023105232
 (RING_PSMI_CTL 0x22050 / 0x3ee050).
 
+On the Xe3 graphics GT, Panther Lake, Wildcat Lake and Nova Lake-S
+apply Wa_14026781792 to the golden render context's `FF_MODE`. The
+context update preserves unrelated bits and the early 30.00 mesh
+workarounds. Graphics IP 30.00/30.01 receives the per-engine
+`RING_PSMI_CTL` idle-message workaround during GT initialization
+and in the GuC reset register list. Graphics 30.03–30.05 omits that
+register from both. Wildcat Lake uses the Xe3 non-privileged register
+policy when initializing its engines.
+
 BMG's architecture-present BCS8 uses hardware base 0x3ee000 and physical
 instance eight, with its own two-page copy LRC, HWS, golden image and private
 PPGTT startup store probe. ADS enables physical COPY bits 0 and 8 (0x101),
