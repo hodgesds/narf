@@ -1966,11 +1966,12 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
     use crate::intel_gpu_engine::Engine;
     for device in [
         0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-        0xb0b0, 0xfd80, 0xfd81, 0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745,
+        0xb0a1, 0xb0b0, 0xfd80, 0xfd81, 0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745, 0xd74a,
+        0xd74b,
     ] {
         let (platform, versions) = match device {
             0xfd80 | 0xfd81 => (GtPlatform::WildcatLake, [(3, 0), (4, 0), (5, 0)]),
-            0xd740..=0xd745 => (GtPlatform::NovaLakeS, [(3, 0), (4, 0), (5, 0)]),
+            0xd740..=0xd745 | 0xd74a | 0xd74b => (GtPlatform::NovaLakeS, [(3, 0), (4, 0), (5, 0)]),
             _ => (
                 GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
                 [(0, 0), (0, 4), (1, 0)],

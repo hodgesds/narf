@@ -242,7 +242,7 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
     .to_vec();
     for device in [
         0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-        0xb0b0,
+        0xb0a1, 0xb0b0,
     ] {
         for (release, step) in [(0, 0), (0, 4), (1, 0)] {
             cases.push((

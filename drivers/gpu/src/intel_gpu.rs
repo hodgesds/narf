@@ -123,8 +123,14 @@ pub struct ChipInfo {
     pub asic: &'static str,
 }
 
-pub(crate) fn source_known_unqualified(did: u16) -> bool {
-    CRI_IDS.contains(&did)
+fn unqualified_probe_message(did: u16) -> Option<&'static str> {
+    if CRI_IDS.contains(&did) {
+        Some("recognized Crescent Island — GuC firmware profile absent; execution gated")
+    } else if NVLP_IDS.contains(&did) {
+        Some("recognized Nova Lake-P — GuC firmware profile absent; execution gated")
+    } else {
+        None
+    }
 }
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
@@ -581,11 +587,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    if source_known_unqualified(device.id.device) {
-        log_probe(
-            "recognized Crescent Island — GuC firmware profile absent; execution gated",
-            &device,
-        );
+    if let Some(note) = unqualified_probe_message(device.id.device) {
+        log_probe(note, &device);
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     let Some(platform) =
@@ -2878,6 +2881,7 @@ pub mod tests {
             (0xB08F, "pantherlake"),
             (0xB090, "pantherlake"),
             (0xB0A0, "pantherlake"),
+            (0xB0A1, "pantherlake"),
             (0xB0B0, "pantherlake"),
             (0xFD80, "wildcatlake"),
             (0xFD81, "wildcatlake"),
@@ -2887,6 +2891,8 @@ pub mod tests {
             (0xD743, "novalake-s"),
             (0xD744, "novalake-s"),
             (0xD745, "novalake-s"),
+            (0xD74A, "novalake-s"),
+            (0xD74B, "novalake-s"),
         ];
         if DEVICE_TABLE.len() != EXPECTED.len() {
             return TestResult::Fail("device table size drifted from the spec §5 census");
@@ -2962,7 +2968,10 @@ pub mod tests {
             narf_bus::ecam::__test_windows(&[(cfg_phys, config.as_mut_ptr().cast(), 4096)])
         };
         config[1] = 1; // firmware left I/O-space decoding enabled
-        for did in [0x46b4, CRI_674C] {
+        for did in [0x46b4, 0xd746, 0xd74c, 0xd758, 0xb0a2]
+            .into_iter()
+            .chain(CRI_IDS.iter().chain(NVLP_IDS).copied())
+        {
             let device = BusDevice {
                 addr: BusAddr::Pcie(addr),
                 kind: BusKind::Pcie { addr, cfg_phys },
@@ -2992,13 +3001,33 @@ pub mod tests {
     );
 
     fn smoke_crescent_island_identity_is_exact_and_fail_closed() -> TestResult {
-        if !source_known_unqualified(CRI_674C)
-            || source_known_unqualified(0x674b)
-            || source_known_unqualified(0x674d)
-            || chip_info_for_pci_id(INTEL_VENDOR, CRI_674C).is_some()
-            || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, CRI_674C).is_some()
-        {
-            return TestResult::Fail("Crescent Island fail-closed identity boundary");
+        for (ids, family) in [
+            (
+                &[0x674c, 0x674d, 0x674e, 0x674f, 0x6750][..],
+                "Crescent Island",
+            ),
+            (
+                &[
+                    0xd750, 0xd751, 0xd752, 0xd753, 0xd754, 0xd755, 0xd756, 0xd757, 0xd75f,
+                ][..],
+                "Nova Lake-P",
+            ),
+        ] {
+            for &did in ids {
+                if !unqualified_probe_message(did).is_some_and(|message| message.contains(family))
+                    || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
+                    || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did).is_some()
+                {
+                    return TestResult::Fail("unqualified PCI family entered an active profile");
+                }
+            }
+        }
+        for did in [0x674b, 0x6751, 0xd74f, 0xd758, 0xd75e, 0xd760] {
+            if unqualified_probe_message(did).is_some() {
+                return TestResult::Fail(
+                    "neighboring PCI ID classified as Crescent Island or Nova Lake-P",
+                );
+            }
         }
         TestResult::Pass
     }
@@ -3009,7 +3038,7 @@ pub mod tests {
 
     fn smoke_arctic_sound_m_identity_is_exact_and_pf_only() -> TestResult {
         for did in [ATSM_56C0, ATSM_56C1, ATSM_56C2] {
-            if source_known_unqualified(did)
+            if unqualified_probe_message(did).is_some()
                 || chip_info_for_pci_id(INTEL_VENDOR, did).is_some()
                 || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
                     != Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
@@ -3018,7 +3047,7 @@ pub mod tests {
             }
         }
         for did in [0x56bfu16, 0x56c3] {
-            if source_known_unqualified(did)
+            if unqualified_probe_message(did).is_some()
                 || crate::intel_gpu_gt::GtPlatform::from_pci(INTEL_VENDOR, did)
                     == Some(crate::intel_gpu_gt::GtPlatform::ArcticSoundM)
             {

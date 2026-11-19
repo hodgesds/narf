@@ -131,6 +131,7 @@ pub const PTL_B08F: u16 = 0xB08F;
 pub const PTL_B090: u16 = 0xB090;
 /// Panther Lake-H — the SKU on the Minisforum MS-03 (Core Ultra 5 336H).
 pub const PTL_B0A0: u16 = 0xB0A0;
+pub const PTL_B0A1: u16 = 0xB0A1;
 pub const PTL_B0B0: u16 = 0xB0B0;
 
 // Wildcat Lake (Xe3-LPG). Linux binds both IDs to the Panther Lake GT
@@ -144,13 +145,21 @@ pub const NVLS_D740: u16 = 0xD740;
 pub const NVLS_D741: u16 = 0xD741;
 pub const NVLS_D742: u16 = 0xD742;
 pub const NVLS_D743: u16 = 0xD743;
+/// Retained from Linux 7.0-rc7's INTEL_NVLS_IDS.
 pub const NVLS_D744: u16 = 0xD744;
 pub const NVLS_D745: u16 = 0xD745;
+pub const NVLS_D74A: u16 = 0xD74A;
+pub const NVLS_D74B: u16 = 0xD74B;
 
 // Crescent Island is source-known but execution remains gated: the current
 // Linux xe firmware manifest has no CRESCENTISLAND GuC entry.
 pub const CRI_674C: u16 = 0x674C;
-pub(crate) const CRI_IDS: &[u16] = &[CRI_674C];
+pub(crate) const CRI_IDS: &[u16] = &[CRI_674C, 0x674d, 0x674e, 0x674f, 0x6750];
+// Linux 7.4-rc1 INTEL_NVLP_IDS uses a distinct force-probe descriptor.
+// xe_uc_fw.c does not supply a GuC profile for NOVALAKE_P.
+pub(crate) const NVLP_IDS: &[u16] = &[
+    0xd750, 0xd751, 0xd752, 0xd753, 0xd754, 0xd755, 0xd756, 0xd757, 0xd75f,
+];
 
 // Arctic Sound-M. Linux `INTEL_ATS_M_IDS`: M150 = 56C0/56C2, M75 = 56C1.
 // These use the DG2 platform machinery but are display-less, SR-IOV-capable
@@ -804,13 +813,18 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         asic: "pantherlake",
     },
     DeviceEntry {
+        name: "intel-gpu-ptl-B0A1",
+        did: PTL_B0A1,
+        generation: Generation::PantherLake,
+        asic: "pantherlake",
+    },
+    DeviceEntry {
         name: "intel-gpu-ptl-B0B0",
         did: PTL_B0B0,
         generation: Generation::PantherLake,
         asic: "pantherlake",
     },
-    // Wildcat Lake uses Linux's ptl_desc GT profile. Its distinct display
-    // 30.02 path remains a typed refusal.
+    // Wildcat Lake uses Linux's ptl_desc GT profile and its own display 30.02 route.
     DeviceEntry {
         name: "intel-gpu-wcl-FD80",
         did: WCL_FD80,
@@ -861,6 +875,18 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         generation: Generation::PantherLake,
         asic: "novalake-s",
     },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D74A",
+        did: NVLS_D74A,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
+    DeviceEntry {
+        name: "intel-gpu-nvls-D74B",
+        did: NVLS_D74B,
+        generation: Generation::PantherLake,
+        asic: "novalake-s",
+    },
 ];
 
 pub(crate) const DG2_IDS: &[u16] = &[
@@ -882,6 +908,7 @@ pub(crate) fn pci_matches() -> impl Iterator<Item = (&'static str, u16)> {
         ("intel-gpu-bmg", BMG_IDS),
         ("intel-gpu-atsm", ATSM_IDS),
         ("intel-gpu-cri-gated", CRI_IDS),
+        ("intel-gpu-nvlp-gated", NVLP_IDS),
     ]
     .into_iter()
     .flat_map(|(name, ids)| ids.iter().map(move |&id| (name, id)))

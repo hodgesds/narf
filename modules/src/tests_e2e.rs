@@ -1217,7 +1217,7 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
             OWNER,
             "intel-gpu-fixture",
             0x8086,
-            0xd745,
+            0xd74b,
             decline as usize,
         )
     } != 0
@@ -1231,7 +1231,7 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
             crate::lifecycle::LifecycleError::InitFailed(-16)
         ))
     ) && count() == before + 1
-        && __module_thunk_for_test(0x8086, 0xd745).is_some();
+        && __module_thunk_for_test(0x8086, 0xd74b).is_some();
     narf_bus::unregister_module_pci_drivers(OWNER);
     if !rolled_back {
         let _ = sys_delete_module("intel_gpu");
@@ -1245,15 +1245,17 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
     };
     let representatives = [
         0x9a49, 0x4c80, 0x46b3, 0x7d55, 0x7d41, 0x6420, 0xb080, 0xfd80, 0xd740, 0x4905, 0x56a0,
-        0xe202, 0x56c0, 0x674c,
+        0xe202, 0x56c0, 0x674c, 0x6750, 0xd750, 0xd75f, 0xb0a1, 0xd74a, 0xd74b,
     ];
     let matches_installed = module.name() == "intel_gpu"
         && module.domain == narf_lib::id::DomainId::DRIVER_2
-        && count() == before + 152
+        && count() == before + 168
         && representatives
             .iter()
             .all(|&id| __module_thunk_for_test(0x8086, id).is_some())
-        && __module_thunk_for_test(0x8086, 0xffff).is_none();
+        && [0xb0a2, 0xd746, 0xd74c, 0xd758, 0x6751, 0xffff]
+            .iter()
+            .all(|&id| __module_thunk_for_test(0x8086, id).is_none());
     // Exercise the real module callback via the bus trampoline. A declined
     // Meteor Lake probe must let arbitration continue with a fresh cap.
     let addr = PcieAddr::new(0x7f34, 0, 2, 0);

@@ -1036,7 +1036,7 @@ mod tests {
             crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
         for id in [
             0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-            0xb0b0,
+            0xb0a1, 0xb0b0,
         ] {
             assert_eq!(
                 crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
@@ -1282,7 +1282,9 @@ mod tests {
     );
     fn smoke_nvls_distinct_firmware_media_and_display_identity() -> TestResult {
         let platform = crate::intel_gpu_gt::GtPlatform::NovaLakeS;
-        for id in [0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745] {
+        for id in [
+            0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745, 0xd74a, 0xd74b,
+        ] {
             assert_eq!(
                 crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, id),
                 Some(platform)

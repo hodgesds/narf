@@ -146,12 +146,6 @@ pub enum Gen12Platform {
     AlderLakeN,
 }
 
-// Exact source IDs, including mobile/embedded variants; no range matches.
-pub(crate) const PTL_IDS: &[u16] = &[
-    0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0, 0xb0b0,
-];
-pub(crate) const WCL_IDS: &[u16] = &[0xfd80, 0xfd81];
-pub(crate) const NVLS_IDS: &[u16] = &[0xd740, 0xd741, 0xd742, 0xd743, 0xd744, 0xd745];
 pub(crate) use crate::intel_gpu::{BMG_IDS, DG1_IDS, DG2_IDS};
 
 /// Linux `dg2_g10_ids`: DG2 G10 plus ATS-M150.
@@ -197,12 +191,15 @@ impl GtPlatform {
             .iter()
             .find(|entry| entry.did == device)
         {
-            if entry.generation == Generation::PantherLake
-                && !PTL_IDS.contains(&device)
-                && !WCL_IDS.contains(&device)
-                && !NVLS_IDS.contains(&device)
-            {
-                return None;
+            if entry.generation == Generation::PantherLake {
+                // All three products share the broad display generation. The
+                // exact PCI table entry determines which GT and GuC to use.
+                return match entry.asic {
+                    "pantherlake" => Some(Self::Integrated(Generation::PantherLake)),
+                    "wildcatlake" => Some(Self::WildcatLake),
+                    "novalake-s" => Some(Self::NovaLakeS),
+                    _ => None,
+                };
             }
             let family = match entry.asic {
                 "tigerlake" => Some(Gen12Platform::TigerLake),
@@ -214,12 +211,6 @@ impl GtPlatform {
                 "alderlake-n" => Some(Gen12Platform::AlderLakeN),
                 _ => None,
             };
-            if entry.asic == "wildcatlake" {
-                return Some(Self::WildcatLake);
-            }
-            if entry.asic == "novalake-s" {
-                return Some(Self::NovaLakeS);
-            }
             return Some(family.map_or(Self::Integrated(entry.generation), Self::Gen12));
         }
         if DG1_IDS.contains(&device) {
@@ -516,9 +507,6 @@ mod tests {
             || DG2_IDS.len() != 25
             || DG1_IDS.len() != 5
             || BMG_IDS.len() != 13
-            || PTL_IDS.len() != 12
-            || WCL_IDS.len() != 2
-            || NVLS_IDS.len() != 6
         {
             return TestResult::Fail("unsupported GT or approximate PCI range admitted");
         }

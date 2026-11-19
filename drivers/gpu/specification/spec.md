@@ -2071,8 +2071,9 @@ numeric range)
 and includes every currently qualified TGL/ADL variant from Linux
 `include/drm/intel/pciids.h`, including TGL 9A59/9AC0/9AC9/9AD9/9AF8 and
 ADL 46A2/46B2/46C2, plus the six exact RKL IDs
-4C80/4C8A/4C8B/4C8C/4C90/4C9A, WCL FD80/FD81 and NVL-S
-D740/D741/D742/D743/D744/D745. `ChipInfo::asic` reports Alder Lake-P
+4C80/4C8A/4C8B/4C8C/4C90/4C9A, PTL B0A1, WCL FD80/FD81 and NVL-S
+D740/D741/D742/D743/D744/D745/D74A/D74B. D744 retains its Linux 7.0-rc7
+profile. B0A1, D74A and D74B follow Linux 7.4-rc1. `ChipInfo::asic` reports Alder Lake-P
 for 46B0–46B3 and Raptor Lake-U for A721/A7A1/A7A9/A7AC/A7AD.
 Both mobile Raptor Lake variants select the Alder Lake-P display and GT
 profiles. Every row must resolve to a qualified `guc()` profile in
@@ -2107,9 +2108,12 @@ entry triggers lookup of Linux 7.0-rc7's `xe/nvl_guc_70.55.4.bin`.
 Both names require GuC 70.55.4 or newer. Its live identity admits only
 graphics 30.03/30.04/30.05 and media 35.00; display 35.00 remains on the
 headless driver-FLR route and is never treated as PTL display 30.00.
-The exact CRI 674C PCI-device ID is registered separately and announced, but
-refuses before D-state/BAR/command/MMIO effects: Linux describes DMA52, VA57,
-root4, non-flat CCS and graphics 35.11/media 35.03, while its current GuC
+Linux 7.4-rc1 lists the exact CRI IDs 674C through 6750 and NVL-P IDs
+D750 through D757 plus D75F. The resident and loadable drivers register
+those IDs for identification. The resident driver reports the family and
+declines before PCI setup. NVL-P has its own Xe descriptor and lacks a
+GuC firmware entry. Crescent Island has DMA52, VA57,
+root4, non-flat CCS and graphics 35.11/media 35.03. Its current GuC
 firmware table contains no `CRESCENTISLAND` entry. No other family's firmware
 or memory policy is substituted.
 The exact ATS-M 56C0/56C1/56C2 VGA IDs bind a display-less, PF-only owner.
@@ -3547,13 +3551,13 @@ its distinct 46-bit DMA limit; the shared wire codec is not platform proof.
 
 LNL accepts only PCI 6420/64a0/64b0, observed graphics 20.04/media 20.00 and
 `xe/lnl_guc_70.bin` 70.53.0+. PTL accepts only PCI
-b080/b081/b082/b083/b084/b085/b086/b087/b08f/b090/b0a0/b0b0,
+b080/b081/b082/b083/b084/b085/b086/b087/b08f/b090/b0a0/b0a1/b0b0,
 graphics 30.00/30.01, media 30.00 and `xe/ptl_guc_70.bin` 70.54.0+.
 WCL IDs fd80/fd81 select that same Linux PTL descriptor and firmware profile,
 but use a distinct `GtPlatform::WildcatLake`: graphics 30.03/30.04/30.05 and
 media 30.02 are admitted with source-versioned Xe3 policies. Display 30.02
 has an exact, separately opted-in production probe/KMS/hotplug route.
-NVL-S accepts only PCI d740-d745, graphics 30.03/30.04/30.05, media 35.00 and
+NVL-S accepts PCI d740 through d745, d74a and d74b, with graphics 30.03/30.04/30.05, media 35.00 and
 Nova Lake-S GuC firmware 70.55.4+. Its display 35.00 identity has post-FLR refusal
 proofs and a separately opted-in read-only route decision; it has no
 display-preserving route.
