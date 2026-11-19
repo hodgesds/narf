@@ -314,8 +314,11 @@ fn smoke_klog_trap_text_reaches_readers() -> TestResult {
 }
 kernel_test_in!("console/klog", smoke_klog_trap_text_reaches_readers);
 
-/// A trap can interrupt the store lock itself. Recording must never wait for
-/// that lock, and losing that fragment must not prevent a subsequent record.
+/// A trap can interrupt the store lock itself, or find it held by a CPU that
+/// will never release it. Recording must wait for that lock only a bounded
+/// time, must not prevent a subsequent record, and must not lose the text
+/// silently: the next stored record is preceded by Linux's
+/// `** N printk messages dropped **` notice.
 fn smoke_klog_trap_text_does_not_wait_for_store() -> TestResult {
     let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
     {
@@ -328,12 +331,115 @@ fn smoke_klog_trap_text_does_not_wait_for_store() -> TestResult {
     }
     let seq = next_seq();
     crate::trap_sink("narf-trap-after-busy-probe-7c91\n");
-    if !has(&text_since(seq), b"narf-trap-after-busy-probe-7c91") {
+    let text = text_since(seq);
+    if !has(&text, b"narf-trap-after-busy-probe-7c91") {
         return TestResult::Fail("trap recording did not recover after store contention");
+    }
+    let notice = text
+        .windows(b"printk messages dropped **".len())
+        .position(|w| w == b"printk messages dropped **");
+    let probe = text
+        .windows(b"narf-trap-after-busy-probe".len())
+        .position(|w| w == b"narf-trap-after-busy-probe");
+    match (notice, probe) {
+        (Some(n), Some(p)) if n < p => TestResult::Pass,
+        (None, _) => TestResult::Fail("refused trap text left no dropped-messages notice"),
+        _ => TestResult::Fail("dropped-messages notice must precede the next record"),
+    }
+}
+kernel_test_in!("console/klog", smoke_klog_trap_text_does_not_wait_for_store);
+
+/// Native-boot regression: a `/dev/kmsg` reader on another CPU takes the store
+/// lock once per record, so during a watchdog dump it held the lock while the
+/// trap writer emitted some fragments of a `writeln!`. Each such fragment was
+/// dropped, tearing the line (`sigwait=0xSTALL-WD task ...` when the lost
+/// fragment held the newline). A formatted trap line must reach the store as
+/// one whole record whatever happens to the store lock while it is formatted.
+fn smoke_klog_trap_line_whole_under_store_contention() -> TestResult {
+    use core::fmt::Write as _;
+    /// Formats while the store lock is held, as a concurrent reader does.
+    struct HeldStore(&'static str);
+    impl core::fmt::Display for HeldStore {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let _reader = RING.lock();
+            f.write_str(self.0)
+        }
+    }
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    let seq = next_seq();
+    let _ = writeln!(
+        crate::TrapWriter,
+        "narf-trap-whole-probe sigwait={:#x} held={} end={}",
+        0,
+        HeldStore("x1"),
+        42
+    );
+    if !has(
+        &text_since(seq),
+        b"narf-trap-whole-probe sigwait=0x0 held=x1 end=42\n",
+    ) {
+        return TestResult::Fail("trap line torn while the store lock was held");
     }
     TestResult::Pass
 }
-kernel_test_in!("console/klog", smoke_klog_trap_text_does_not_wait_for_store);
+kernel_test_in!(
+    "console/klog",
+    smoke_klog_trap_line_whole_under_store_contention
+);
+
+/// A record landing while a `writeln!` is being formatted (another CPU's
+/// line, a `/dev/kmsg` write) must not split it: Linux commits a printk as
+/// one record, never as a prefix plus a `LOG_CONT` tail.
+fn smoke_klog_writer_line_whole_across_injection() -> TestResult {
+    use core::fmt::Write as _;
+    /// Formats after another writer's record has landed.
+    struct Injects;
+    impl core::fmt::Display for Injects {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            emit(LOG_USER, 6, b"narf-inject-probe-41d2\n");
+            f.write_str("mid")
+        }
+    }
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    let seq = next_seq();
+    let _ = writeln!(crate::Writer, "narf-writer-whole-probe [{}] tail", Injects);
+    let text = text_since(seq);
+    if !has(&text, b"narf-inject-probe-41d2\n") {
+        return TestResult::Fail("injected record missing");
+    }
+    if !has(&text, b"narf-writer-whole-probe [mid] tail\n") {
+        return TestResult::Fail("formatted line split around a concurrent record");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "console/klog",
+    smoke_klog_writer_line_whole_across_injection
+);
+
+/// Trap-context text never extends the half-line of the task it interrupted
+/// on the same CPU (Linux's per-context `caller_id`), and the task's line
+/// resumes as a `LOG_CONT` record.
+fn smoke_klog_trap_caller_does_not_extend_task_line() -> TestResult {
+    let mut st = Store::boxed();
+    st.append(4, 0, task_caller(0), b"task-half ");
+    st.append(4, 0, trap_caller(0), b"trap line\n");
+    st.append(4, 0, task_caller(0), b"rest\n");
+    if st.next_seq != 3
+        || st.rec_text(&st.desc(0)) != b"task-half "
+        || st.rec_text(&st.desc(1)) != b"trap line"
+        || st.desc(1).flags & LOG_CONT != 0
+        || st.rec_text(&st.desc(2)) != b"rest"
+        || st.desc(2).flags & LOG_CONT == 0
+    {
+        return TestResult::Fail("trap text merged into, or broke the flags of, a task line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "console/klog",
+    smoke_klog_trap_caller_does_not_extend_task_line
+);
 
 /// `export_since` renders dmesg-style lines, chunks by size without
 /// duplicating or skipping a record, and reports records lost to the ring.

@@ -97,12 +97,27 @@ The `quiet` boot token selects that threshold, suppressing routine boot and
 runtime chatter; `debug` selects level 10, and `loglevel=N` selects an explicit
 1..15 threshold in command-line order. Panic and fatal-trap sinks bypass this
 filter and remain visible. The panic sink bypasses the store. `trap_sink`
-and `TrapWriter` also attempt to record their text without waiting for the
-store lock, so `dmesg`, `/dev/kmsg` and persistent-log exports can retain CPU
-samples, watchdog reports and fatal diagnostics without a serial connection.
-A reentrant or contended store drops that fragment; physical trap output
-still proceeds without the console lock or framebuffer hook. This path never
-allocates, and keeps the ordinary record/continuation format.
+and `TrapWriter` also record their text, so `dmesg`, `/dev/kmsg` and
+persistent-log exports can retain CPU samples, watchdog reports and fatal
+diagnostics without a serial connection. Trap text never waits for a store
+lock held on its own CPU, and waits at most 2 ms for one held on another
+(after one such wait expires, later trap text only tries the lock until any
+writer gets it again — a CPU stopped with the lock held costs one wait).
+Text the store refuses is counted, and the next stored record is preceded by
+Linux's `** N printk messages dropped **` notice, so a loss is never silent.
+Physical trap output still proceeds without the console lock or framebuffer
+hook. This path never allocates, and keeps the ordinary record/continuation
+format; trap-context text has its own continuation caller id per CPU (Linux
+`printk_caller_id`), so it never extends a task's half-written line.
+
+Every `fmt::Write` adapter (`Writer`, `PriorityWriter`, `ConsoleOnlyWriter`,
+`TrapWriter`) overrides `write_fmt`: one `write!`/`writeln!` is formatted
+into a per-CPU staging buffer (`RECORD_TEXT_MAX` bytes) and reaches its sink
+as ONE string, so it is one record and one console write, never interleaved
+with another CPU mid-line — Linux's `vprintk_store` formatting a printk into
+its record before committing it. A message longer than the buffer continues
+in `LOG_CONT` records; a writer nested on a CPU whose buffer is in use (an
+NMI or fault during formatting) falls back to per-fragment writes.
 
 The store is RECORD-based, like Linux's printk ringbuffer: each record has a
 64-bit sequence number, a monotonic timestamp (`set_clock`; 0 until the clock
