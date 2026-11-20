@@ -13882,7 +13882,7 @@ fn hand_back_traced_zombie(reaper: &WaitParentIds, entry: PendingExit) {
             u32::from(link.exit_signal),
             GroupSigInfo::Queued(sigchld_exit_info(link.parent, child, entry.status)),
         );
-        narf_net::readiness::notify(0);
+        // The raise wakes the parent's signal waiters and signalfds; no wake-all.
     }
     wake_wait_child_group(link.parent);
 }
@@ -16442,7 +16442,7 @@ fn notify_tracer_of_thread_exit(pid: u64, tid: u64) {
         u32::from(SIGCHLD),
         GroupSigInfo::Queued(sigchld_exit_info(tracer_task, linux_tid, status)),
     );
-    narf_net::readiness::notify(0);
+    // The raise and `wake_wait_child_group` are the whole wake (no wake-all).
     wake_wait_child_group(tracer_task);
 }
 
@@ -16868,7 +16868,9 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             signum,
             GroupSigInfo::Queued(sigchld_exit_info(parent, child_pid, status)),
         );
-        narf_net::readiness::notify(0);
+        // The raise is the whole wake: it fires the group's signal waiters and
+        // signalfds (Linux `do_notify_parent` wakes nothing else); a wake-all
+        // of every parked poller here ran on every child exit.
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
     // was stored by `UserTaskFuture::poll` when it found the pending-
