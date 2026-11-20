@@ -2,7 +2,7 @@
 //! Keep the PSP image, VCPU context, writebacks and logical sequences across
 //! idle; reset only ring pointers when restoring the hardware.
 use super::*;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const IDLE_NS: u64 = 1_000_000_000; // Linux VCN_IDLE_TIMEOUT
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +130,7 @@ impl<I: Io> Engine<I> {
             .power([self.vcn[0].is_some(), self.vcn[1].is_some()], false)
             .await?;
         self.runtime.phase = Phase::Asleep;
+        MEDIA_ASLEEP.store(true, Ordering::Release);
         Ok(true)
     }
     pub(crate) async fn begin_use(
@@ -167,6 +168,9 @@ impl<I: Io> Engine<I> {
         };
         self.runtime.last_use = Some(now);
         self.runtime.phase = Phase::Waking;
+        // The idle work runs again from the next use on (Linux
+        // `amdgpu_vcn_ring_begin_use` cancels it, `end_use` re-queues it).
+        wake_idle_work();
         if asleep {
             if self.runtime.gated
                 && !pm
@@ -199,13 +203,51 @@ impl<I: Io> Engine<I> {
 }
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// The media engines are gated: the idle work has nothing to do until the
+/// next `begin_use`, so its task parks instead of polling.
+static MEDIA_ASLEEP: AtomicBool = AtomicBool::new(false);
+static IDLE_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn wake_idle_work() {
+    MEDIA_ASLEEP.store(false, Ordering::Release);
+    let waker = IDLE_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+/// Resolves when the media is in use again or the idle work stopped.
+fn media_in_use(epoch: u64) -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(move |cx| {
+        let done =
+            || !MEDIA_ASLEEP.load(Ordering::Acquire) || EPOCH.load(Ordering::Acquire) != epoch;
+        if done() {
+            return core::task::Poll::Ready(());
+        }
+        *IDLE_WAKER.lock() = Some(cx.waker().clone());
+        if done() {
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    })
+}
+
 pub(crate) fn stop() {
     EPOCH.fetch_add(1, Ordering::AcqRel);
+    let waker = IDLE_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
 }
 pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    MEDIA_ASLEEP.store(false, Ordering::Release);
     narf_scheduler::spawn(async move {
         loop {
+            // Gated media: no idle work until the next use (Linux queues
+            // `idle_work` from `ring_end_use` only).
+            media_in_use(epoch).await;
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
