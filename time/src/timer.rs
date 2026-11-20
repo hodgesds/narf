@@ -1070,7 +1070,26 @@ pub fn snapshot_wheel(
 ) -> Option<(WheelBaseStats, usize)> {
     let b = cpu_bases(cpu)?;
     let base = b.bases.get(index)?;
-    out.reserve(64);
+    // Size the copy from a count taken under the lock first, so the copy
+    // itself never allocates under it (timers armed in between show up
+    // as the reported excess).
+    let pending = narf_lib::sync::without_interrupts(|| {
+        let g = base.inner.lock();
+        let mut n = 0usize;
+        let mut walk = |mut p: *mut TimerList| {
+            while !p.is_null() {
+                n += 1;
+                // SAFETY: linked nodes are live and guarded by the lock.
+                p = unsafe { *(*p).next.get() };
+            }
+        };
+        walk(g.expiring);
+        for head in g.vectors.iter() {
+            walk(*head);
+        }
+        n
+    });
+    out.reserve(pending + 16);
     narf_lib::sync::without_interrupts(|| {
         let g = base.inner.lock();
         let room = out.capacity();
