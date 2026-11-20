@@ -119,7 +119,7 @@ fn smoke_abi_kallsyms_show_value_follows_the_opener() -> TestResult {
         if a.is_empty() || b.is_empty() {
             return Err("/proc/kallsyms read back no lines");
         }
-        if a.iter().any(|&v| v == 0) {
+        if a.contains(&0) {
             return Err("dropping CAP_SYSLOG after open hid addresses from a privileged fd");
         }
         if b.iter().any(|&v| v != 0) {

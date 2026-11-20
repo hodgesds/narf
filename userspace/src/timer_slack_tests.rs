@@ -13,7 +13,7 @@ const US: u64 = 1_000;
 fn smoke_select_estimate_accuracy_matches_linux() -> TestResult {
     let cases: [(u64, i32, u64, u64); 9] = [
         // (remaining, nice, task slack, expected)
-        (1_000 * MS, 0, 50 * US, 1 * MS),
+        (1_000 * MS, 0, 50 * US, MS),
         (1_000 * MS, 5, 50 * US, 5 * MS),
         (1_500 * MS, 0, 50 * US, 1_500 * US),
         (10 * MS, 0, 50 * US, 50 * US),
@@ -29,7 +29,7 @@ fn smoke_select_estimate_accuracy_matches_linux() -> TestResult {
         }
     }
     // `__estimate_accuracy` truncates the nanoseconds part on its own.
-    if estimate_accuracy(1_000 * MS + 999, 0) != 1 * MS {
+    if estimate_accuracy(1_000 * MS + 999, 0) != MS {
         return TestResult::Fail("estimate_accuracy rounds the ns part like Linux");
     }
     TestResult::Pass

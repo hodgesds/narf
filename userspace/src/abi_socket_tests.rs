@@ -580,6 +580,7 @@ kernel_test_in!(
 
 /// Unlink a pathname socket's S_IFSOCK node. The node is created
 /// best-effort at bind, so a missing one (ENOENT) is fine.
+#[cfg(feature = "kernel-test")]
 fn unlink_socket_node(path: &[u8]) -> Result<(), &'static str> {
     match call(
         Syscall::Unlinkat.raw(),
