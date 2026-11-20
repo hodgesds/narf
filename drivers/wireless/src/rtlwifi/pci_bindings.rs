@@ -63,7 +63,7 @@ impl Bindings {
             if device
                 .native
                 .as_ref()
-                .is_none_or(|native| !ae.same_native(native))
+                .is_some_and(|native| !ae.same_native(native))
             {
                 return false;
             }
