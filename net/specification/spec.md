@@ -168,6 +168,7 @@ pub fn register_with_context(
     cookie: u64,
     send: SendCtxFn,
 ) -> String;
+pub fn reserve_ethernet_name(mac: [u8; 6]) -> &'static str;
 pub fn unregister(name: &str) -> bool;
 pub fn retire_for_rebind(name: &str) -> bool;
 pub fn rebind_name(name: &str) -> Option<&'static str>;
@@ -175,6 +176,14 @@ pub enum NetSysfsEvent<'a> { Added(&'a str), Updated(&'a str), Removed(&'a str) 
 pub type NetSysfsFn = fn(NetSysfsEvent<'_>);
 pub fn install_net_sysfs_hook(hook: NetSysfsFn);
 ```
+
+For a port registered or reserved with the Ethernet `eth%d` pattern, the boot
+argument `ifname=ethN:aa:bb:cc:dd:ee:ff` assigns that name to its probe-time
+unicast MAC. The kernel reserves each mapped name during dynamic name allocation
+even if a different port probes first. Names use canonical decimal indices.
+The first valid mapping for a name or MAC wins. A duplicate hardware MAC
+falls back to an available unpinned name if the mapped name is occupied.
+Explicit driver names and rebind reservations keep their existing semantics.
 
 `register_with_context` stores only an opaque cookie and a permanent in-tree
 trampoline. It never stores module text directly. A snapshot may outlive

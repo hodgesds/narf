@@ -30,6 +30,9 @@ reach the hand-off (that's `frame/`), paging after hand-off (`memory/`).
 precedence over `systemd_pid1` if both appear. With neither flag the kernel
 launches the in-tree init and getty.
 
+The Ethernet registry consumes repeatable `ifname=ethN:aa:bb:cc:dd:ee:ff`
+arguments when naming ports at probe time (net §3).
+
 The native x86_64 EFI application (`cargo xtask efi-image`) embeds its
 kernel, initramfs and command line, then produces the existing Multiboot2
 handoff. `narf-boot-protocol` (`boot/protocol/`) validates the ELF load plan
