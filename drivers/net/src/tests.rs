@@ -3266,6 +3266,16 @@ fn smoke_rtl8139_multi_instance_cookie_dispatch() -> TestResult {
     if narf_net::iface::send_on(name, &frame).is_err() {
         return TestResult::Fail("send_on cookie-0 TX failed");
     }
+    // TX free-slot predicate (issue #2251): cycle the remaining
+    // slots and reuse slot 0. Every post must succeed — after
+    // reset each TSD reads 0x2000 (host owns), and a posted slot
+    // frees again once its frame completes (TOK|OWN). The old
+    // inverted poll failed even the first post here.
+    for _ in 0..4 {
+        if ctrl.tx(&frame).is_err() {
+            return TestResult::Fail("rtl8139 TX slot cycle failed");
+        }
+    }
     let authority = bootstrap_registry_authority();
     let _ = probe_all_pci(&authority);
     let after = match rtl8139::controller(0) {
