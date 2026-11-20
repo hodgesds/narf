@@ -957,7 +957,12 @@ pub fn global_next_for(cpu: usize) -> u64 {
 
 /// `tmigr_requires_handle_remote` for this CPU.
 pub fn requires_handle_remote() -> bool {
-    TMIGR.requires_handle_remote(this_cpu(), crate::timer::jiffies())
+    requires_handle_remote_on(this_cpu())
+}
+
+/// `tmigr_requires_handle_remote` for `cpu`, read from any CPU. Lock-free.
+pub fn requires_handle_remote_on(cpu: usize) -> bool {
+    TMIGR.requires_handle_remote(cpu, crate::timer::jiffies())
 }
 
 /// `tmigr_handle_remote` for this CPU (timer softirq). Returns callbacks

@@ -904,7 +904,14 @@ pub fn __global_next_for_test(cpu: usize) -> u64 {
     global_next(cpu)
 }
 
-/// `run_local_timers` from the tick: raise the softirq when a base is due.
+/// `run_local_timers` from the tick: raise the softirq when a base is due,
+/// or when this CPU must expire an idle CPU's due global timers
+/// (`tmigr_requires_handle_remote`, which Linux checks for `BASE_DEF`).
+///
+/// Raising it for the remote work too is what makes the next event reported
+/// while that work is pending one tick out ([`next_timer_event_ns_local`])
+/// rather than the hierarchy's due expiry, which re-armed the clockevent into
+/// the past at its minimum delta until the softirq ran.
 pub fn timer_tick() {
     let Some(b) = cpu_bases(this_cpu()) else {
         return;
@@ -913,9 +920,16 @@ pub fn timer_tick() {
     if b.bases
         .iter()
         .any(|x| x.next_expiry.load(Ordering::Acquire) <= now)
+        || crate::timer_migration::requires_handle_remote()
     {
         b.softirq_raised.store(true, Ordering::Release);
     }
+}
+
+/// `local_timer_softirq_pending` for `cpu`: its `TIMER_SOFTIRQ` is raised
+/// and has not run yet. Lock-free.
+pub fn softirq_pending_on(cpu: usize) -> bool {
+    cpu_bases(cpu).is_some_and(|b| b.softirq_raised.load(Ordering::Acquire))
 }
 
 /// Next expiry (jiffies) of `cpu`'s base `index`, `u64::MAX` when empty.

@@ -956,6 +956,11 @@ pub fn hrtimer_run_queues() {
     tick_program_event(next);
 }
 
+/// `cpu`'s `HRTIMER_SOFTIRQ` is raised and has not run yet. Lock-free.
+pub fn softirq_pending_on(cpu: usize) -> bool {
+    cpu_base(cpu).is_some_and(|b| b.softirq_raised.load(Ordering::Acquire))
+}
+
 /// `hrtimer_run_softirq`: expire this CPU's soft timers (executor context).
 /// Also expires hard timers already due, so a missed or not-yet-delivered
 /// interrupt never strands a local timer. Returns the callbacks run.
