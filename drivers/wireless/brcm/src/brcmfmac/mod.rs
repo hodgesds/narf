@@ -39,8 +39,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 pub(crate) mod ap;
 pub(crate) mod ap_beacon;
 pub(crate) mod ap_key;

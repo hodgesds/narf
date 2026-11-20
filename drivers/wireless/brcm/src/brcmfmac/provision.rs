@@ -579,4 +579,4 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
 
 #[cfg(feature = "kernel-test")]
 #[path = "provision_tests.rs"]
-pub(crate) mod tests;
+pub mod tests;

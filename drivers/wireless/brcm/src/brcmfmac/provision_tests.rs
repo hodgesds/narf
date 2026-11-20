@@ -56,7 +56,7 @@ fn install(
         .map_err(|_| narf_firmware::FirmwareError::AuthorityRevoked)?
 }
 type RegistryCaps = (Cap<FirmwareRegistry, Write>, Cap<FirmwareRegistry, Read>);
-pub(crate) fn registry() -> Result<RegistryCaps, &'static str> {
+pub fn registry() -> Result<RegistryCaps, &'static str> {
     let (write, read) = narf_firmware::bootstrap_authority();
     for (key, bytes) in [
         ("narf-test/brcm/fw", FW),

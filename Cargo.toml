@@ -85,6 +85,7 @@ members = [
     "drivers/wireless",
     "drivers/wireless/ath-core",
     "drivers/wireless/ath10k",
+    "drivers/wireless/brcm",
     "drivers/wireless/core",
     "drivers/wireless/iwlwifi",
     "drivers/wireless/mt76",

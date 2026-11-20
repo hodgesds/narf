@@ -66,8 +66,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 pub mod backplane;
 pub mod bootstrap;
 pub(crate) mod channel;
