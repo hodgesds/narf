@@ -8736,12 +8736,25 @@ pub fn proc_task_info(
             }
         })
         .or_else(|| {
-            crate::task::thread_group_tids(pid)
-                .into_iter()
-                .filter(|&member| member != tid)
-                .find_map(|member| {
-                    narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member))
-                })
+            // The group's reverse index (Linux walks `signal->thread_head`),
+            // not a scan of every task in the system: a process whose own
+            // mm is not live here (an exited leader, a zombie) used to cost
+            // a full registry walk per /proc file read. The index may lag a
+            // reap or an exec into another group, so re-check membership.
+            let mut found = None;
+            for_each_group_member(pid, |member| {
+                if member == tid
+                    || !crate::task::with_task_ref(member, |t| {
+                        t.pid.load(Ordering::Acquire) == pid
+                    })
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+                found = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member));
+                found.is_none()
+            });
+            found
         });
     if query == TaskInfoQuery::Statm {
         let stats = as_arc

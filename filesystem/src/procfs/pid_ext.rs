@@ -464,14 +464,19 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
 /// a wrong answer to a different question.
 fn render_io(pid: u64) -> String {
     let (rchar, wchar, syscr, syscw) = crate::procfs::io_accounting_for(pid);
-    let mut s = String::new();
-    let _ = writeln!(s, "rchar: {rchar}");
-    let _ = writeln!(s, "wchar: {wchar}");
-    let _ = writeln!(s, "syscr: {syscr}");
-    let _ = writeln!(s, "syscw: {syscw}");
-    let _ = writeln!(s, "read_bytes: 0");
-    let _ = writeln!(s, "write_bytes: 0");
-    let _ = writeln!(s, "cancelled_write_bytes: 0");
+    // `proc_pid_io_accounting`: seq_printf of plain decimals.
+    let mut s = String::with_capacity(160);
+    for (label, value) in [
+        ("rchar: ", rchar),
+        ("wchar: ", wchar),
+        ("syscr: ", syscr),
+        ("syscw: ", syscw),
+    ] {
+        s.push_str(label);
+        super::put_decimal(&mut s, value);
+        s.push('\n');
+    }
+    s.push_str("read_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n");
     s
 }
 
@@ -960,14 +965,21 @@ fn render_statm(pid: u64) -> String {
 }
 
 fn render_statm_info(info: &super::ProcTaskInfo) -> String {
-    format!(
-        "{} {} {} {} 0 {} 0\n",
-        info.vm_size_bytes / 4096,
+    // `proc_pid_statm`'s seq_put_decimal_ull sequence.
+    let mut s = String::with_capacity(64);
+    super::put_decimal(&mut s, info.vm_size_bytes / 4096);
+    for value in [
         info.resident_pages,
         info.shared_resident_pages,
         info.text_pages,
-        info.data_stack_bytes / 4096,
-    )
+    ] {
+        s.push(' ');
+        super::put_decimal(&mut s, value);
+    }
+    s.push_str(" 0 ");
+    super::put_decimal(&mut s, info.data_stack_bytes / 4096);
+    s.push_str(" 0\n");
+    s
 }
 
 // ── /proc/<pid>/fd/<n> directory ────────────────────────────────────

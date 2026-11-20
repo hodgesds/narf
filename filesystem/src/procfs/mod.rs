@@ -3781,7 +3781,86 @@ fn gen_version() -> String {
 
 // ── Per-pid renderers ───────────────────────────────────────────
 
+/// `seq_put_decimal_ull`: append `value` in decimal. Linux's
+/// `do_task_stat` emits every number this way rather than through
+/// `seq_printf`; the `core::fmt` integer path (a `Formatter`, `pad_integral`
+/// and a `write_str` per piece) is the equivalent cost here, and a monitor
+/// pays it for every field of every process on every refresh.
+pub(crate) fn put_decimal(out: &mut String, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for &digit in &digits[at..] {
+        out.push(char::from(digit));
+    }
+}
+
+/// [`put_decimal`] for a signed value (`seq_put_decimal_ll`).
+pub(crate) fn put_decimal_signed(out: &mut String, value: i64) {
+    if value < 0 {
+        out.push('-');
+    }
+    put_decimal(out, value.unsigned_abs());
+}
+
+/// Fields 40..=52 of `/proc/<pid>/stat`, all zero.
+const STAT_TAIL: &str = " 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+/// Fields 25..=38, all zero.
+const STAT_MIDDLE: &str = " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ";
+
 fn render_stat(info: &ProcTaskInfo) -> String {
+    // Built with `put_decimal` (Linux `do_task_stat` + `seq_put_decimal_ull`)
+    // into one exactly-sized allocation; `render_stat_reference` below is
+    // the field-for-field `format!` form it must match.
+    let mut s = String::with_capacity(info.comm.len() + 192);
+    put_decimal(&mut s, info.pid);
+    s.push_str(" (");
+    s.push_str(&info.comm);
+    s.push_str(") ");
+    s.push(info.state);
+    for value in [info.ppid, info.pgrp, info.session, info.tty_nr] {
+        s.push(' ');
+        put_decimal(&mut s, value);
+    }
+    s.push(' ');
+    put_decimal_signed(&mut s, info.tpgid);
+    // flags minflt cminflt majflt cmajflt
+    s.push_str(" 0 0 0 0 0");
+    for value in [
+        info.utime_ticks,
+        info.stime_ticks,
+        info.cutime_ticks,
+        info.cstime_ticks,
+    ] {
+        s.push(' ');
+        put_decimal(&mut s, value);
+    }
+    // priority nice
+    s.push_str(" 20 0 ");
+    put_decimal(&mut s, info.num_threads.max(1));
+    // itrealvalue
+    s.push_str(" 0 ");
+    put_decimal(&mut s, info.starttime_ticks);
+    s.push(' ');
+    put_decimal(&mut s, info.vm_size_bytes);
+    s.push(' ');
+    put_decimal(&mut s, info.resident_pages);
+    s.push_str(STAT_MIDDLE);
+    put_decimal(&mut s, u64::from(info.processor));
+    s.push_str(STAT_TAIL);
+    s
+}
+
+/// The `format!` rendering [`render_stat`] replaced, kept as the oracle its
+/// smoke compares against.
+fn render_stat_reference(info: &ProcTaskInfo) -> String {
     // Linux /proc/[pid]/stat has 52 space-separated fields. We
     // populate the leading positions that real readers (ps, top,
     // glibc's getproctitle, /usr/bin/uptime) actually consume.
@@ -5442,6 +5521,42 @@ fn smoke_pid_stat_ppid_and_nthreads() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_pid_stat_ppid_and_nthreads);
+
+/// The allocation-light `render_stat` is byte-identical to the `format!`
+/// rendering it replaced, across boundary values: zero, `u64::MAX`, a
+/// negative and a `-1` tpgid, a multi-byte comm, and every state letter.
+fn smoke_pid_stat_fast_render_matches_reference() -> TestResult {
+    let mut info = ProcTaskInfo::default();
+    for (i, state) in ['R', 'S', 'D', 'T', 't', 'Z', 'X'].into_iter().enumerate() {
+        let i = i as u64;
+        info.pid = [0, 1, 4_194_303, u64::MAX][i as usize % 4];
+        info.comm =
+            String::from(["init", "", "kworker/0:1H", "\u{263a} smile ) (x"][i as usize % 4]);
+        info.state = state;
+        info.ppid = i * 977;
+        info.pgrp = u64::MAX - i;
+        info.session = 10u64.pow(i as u32 + 3);
+        info.tty_nr = (136 << 8) | i;
+        info.tpgid = [-1, 0, i64::MIN, i64::MAX, -42, 7, 1][i as usize];
+        info.utime_ticks = i * 123_456_789;
+        info.stime_ticks = 9;
+        info.cutime_ticks = 10;
+        info.cstime_ticks = 99_999;
+        info.num_threads = i; // 0 renders as 1
+        info.starttime_ticks = 1_000_000_007;
+        info.vm_size_bytes = 1 << (i * 9);
+        info.resident_pages = u64::MAX / (i + 1);
+        info.processor = [0, 1, 11, 255, u32::MAX, 7, 3][i as usize];
+        if render_stat(&info) != render_stat_reference(&info) {
+            return TestResult::Fail("fast /proc/<pid>/stat rendering differs from format!");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_pid_stat_fast_render_matches_reference
+);
 
 /// /proc/[pid]/stat field 39 (0-based index 38) is `processor`, which tools
 /// like htop read instead of assuming CPU 0.
