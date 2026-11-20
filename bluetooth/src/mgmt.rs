@@ -778,8 +778,8 @@ fn stop_discovery(index: u16, params: &[u8]) -> Vec<u8> {
     }
     // Copy the record out first: the arms below take DISCOVERING again,
     // and a scrutinee guard would still be held there.
-    let discovering = DISCOVERING.lock().get(&index).copied();
-    match discovering {
+    let active_discovery = DISCOVERING.lock().get(&index).copied();
+    match active_discovery {
         None => cmd_status(index, OP_STOP_DISCOVERY, STATUS_REJECTED),
         Some(active) if active != disc_type => {
             cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
