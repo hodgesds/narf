@@ -1134,15 +1134,23 @@ pub fn snapshot_wheel(
         // and their links are guarded by the base lock held here.
         let mut n = g.expiring;
         while !n.is_null() {
+            // SAFETY: `n` is a live linked node (mod_timer contract) and
+            // its links are guarded by the base lock held here.
             let t = unsafe { &*n };
             push(t, EXPIRING);
+            // SAFETY: `t` is a live node; `next` is guarded by the base
+            // lock held here.
             n = unsafe { *t.next.get() };
         }
         for idx in 0..WHEEL_SIZE {
             let mut n = g.vectors[idx];
             while !n.is_null() {
+                // SAFETY: `n` is a live linked node (mod_timer contract)
+                // and its links are guarded by the base lock held here.
                 let t = unsafe { &*n };
                 push(t, idx);
+                // SAFETY: `t` is a live node; `next` is guarded by the
+                // base lock held here.
                 n = unsafe { *t.next.get() };
             }
         }
