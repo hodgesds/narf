@@ -434,7 +434,7 @@ kernel_test_in!(
 /// mailbox by hand.
 fn smoke_led_engine_runs_as_delayed_work() -> TestResult {
     use crate::class::SimpleLed;
-    use crate::worker::{start_worker, submit_command, ACTION_SET_BRIGHTNESS};
+    use crate::worker::{__restart_for_test, start_worker, submit_command, ACTION_SET_BRIGHTNESS};
     crate::__reset_all_for_test();
     register_led(Arc::new(SimpleLed::brightness_led("wq-lvl")));
     let idx = led_devices()
@@ -442,6 +442,8 @@ fn smoke_led_engine_runs_as_delayed_work() -> TestResult {
         .position(|d| d.name() == "wq-lvl")
         .expect("registered") as u32;
     start_worker();
+    // An earlier smoke's scheduler queue reset can strand the boot engine.
+    __restart_for_test();
     if !submit_command(idx, ACTION_SET_BRIGHTNESS, 77) {
         return TestResult::Fail("mailbox rejected a brightness command");
     }

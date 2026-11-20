@@ -244,3 +244,13 @@ pub fn start_worker() {
     }
     queue_engine();
 }
+
+/// Test hook: re-arm the engine on the current workqueues.
+/// `narf_scheduler::__reset_queues_for_test` drops every pool's workers, so
+/// an engine queued before it stays PENDING on a pool nothing runs, and both
+/// its own re-queue and `start_worker` are no-ops from then on.
+#[doc(hidden)]
+pub fn __restart_for_test() {
+    narf_scheduler::workqueue::cancel_delayed_work(&ENGINE_WORK);
+    queue_engine();
+}
