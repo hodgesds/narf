@@ -42,24 +42,43 @@ pub unsafe fn start_timer(tval_ticks: u64) {
 static ARMED: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
 
-/// Program this CPU's timer to fire in `tval` ticks from `now`.
+/// Shortest countdown worth programming: Linux registers the arch timer with
+/// `min_delta_ticks = 0xf`, and `clockevents` floors every delta at 1 µs
+/// ("deltas less than 1usec are pointless noise"). A deadline already in the
+/// past is armed this far out, so it fires promptly without an interrupt
+/// storm on a fast counter.
+fn min_delta_ticks() -> u64 {
+    narf_time::ns_to_cycles(1_000).max(0xf)
+}
+
+/// Program this CPU's timer to fire in `tval` ticks from `now`. Like Linux
+/// `arch_timer_set_next_event`, this also enables and unmasks the timer: a
+/// clockevent stopped by [`stop_timer`] (or never started on this CPU) must
+/// still deliver the event it is programmed for.
 fn program(cpu: usize, now: u64, tval: u64) {
-    let tval = tval.max(1);
+    let tval = tval.max(min_delta_ticks());
     ARMED[cpu].store(now.saturating_add(tval), Ordering::Relaxed);
-    // SAFETY: CNTP_TVAL_EL0 writes are always legal at EL1.
+    // SAFETY: CNTP_TVAL_EL0 and CNTP_CTL_EL0 writes are always legal at EL1.
     unsafe {
         sysreg::write_cntp_tval_el0(tval);
+        // Enable (bit 0), unmask (bit 1 = 0).
+        sysreg::write_cntp_ctl_el0(1);
     }
 }
 
 /// `tick_program_event` for the hrtimer base: pull this CPU's timer in to
 /// `deadline_cycles` (counter ticks) if that is earlier than what it is
-/// programmed for. IRQ-masked so the tick handler cannot interleave.
+/// programmed for, or if nothing pending is programmed: an armed value in
+/// the past already fired, or fired while IRQs were masked and is no longer
+/// what the timer is set to (`hrtimer_reprogram`'s `expires >= expires_next`
+/// test, as x86's `should_rearm_tsc_deadline`). IRQ-masked so the tick
+/// handler cannot interleave.
 fn arm_hrtimer_event(deadline_cycles: u64) {
     narf_lib::sync::without_interrupts(|| {
         let cpu = narf_lib::percpu::current_cpu();
         let now = narf_time::now_cycles();
-        if deadline_cycles < ARMED[cpu].load(Ordering::Relaxed) {
+        let armed = ARMED[cpu].load(Ordering::Relaxed);
+        if armed <= now || deadline_cycles < armed {
             program(cpu, now, deadline_cycles.saturating_sub(now));
         }
     });
@@ -85,10 +104,13 @@ pub unsafe fn rearm_timer(tval_ticks: u64) {
 /// # Safety
 /// Always safe; stops subsequent IRQ deliveries.
 pub unsafe fn stop_timer() {
+    let cpu = narf_lib::percpu::current_cpu();
     // SAFETY: writes to CNTP_CTL_EL0 are always legal.
     unsafe {
         sysreg::write_cntp_ctl_el0(1 << 1); // IMASK = 1
     }
+    // Nothing is programmed now, so the next hrtimer arm must program.
+    ARMED[cpu].store(u64::MAX, Ordering::Relaxed);
 }
 
 /// Called from the generic-timer IRQ handler.
