@@ -1026,6 +1026,13 @@ fn handoff_wakes_parked_waiter() -> Result<(), &'static str> {
             );
             return Err("a lock handed to a parked waiter was not claimed within 100 ms");
         }
+        // The waiter signals `got` while its guard is still alive; the guard
+        // drops when its task finishes on CPU 4, so give that its own 100 ms.
+        let deadline =
+            narf_time::now_cycles().saturating_add(narf_time::wall::ns_to_cycles(100_000_000));
+        while lock.held_state().locked && narf_time::now_cycles() < deadline {
+            core::hint::spin_loop();
+        }
         if lock.held_state().locked {
             return Err("the waiter's guard did not release the lock");
         }
