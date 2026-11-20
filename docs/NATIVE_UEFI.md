@@ -90,6 +90,10 @@ cargo xtask efi-image --output target/narf-installed.efi \
 
 For Gentoo with OpenRC, select the installed `/sbin/openrc-init` as PID 1.
 OpenRC runs the services configured in the sysinit, boot and default runlevels.
+When building an installed-root kernel for OpenRC or systemd, `efi-image`
+includes cgroup v2 and namespace support. If using `--prebuilt`, compile the
+kernel with `boot-init,cgroup-all,container` so elogind can attach login
+sessions to their cgroups.
 On a desktop installation, the default runlevel typically includes
 `display-manager`. To try it with a RAM-backed writable view of the root, use
 
@@ -105,6 +109,22 @@ next unused number on subsequent boots. Once the scheduler runs, the kernel
 appends and syncs new messages once per second. After rebooting into Linux,
 read the newest numbered file on the same root. Gentoo's `syslogd` can also
 save its usual `/var/log/kern.log` after OpenRC starts.
+
+To capture OpenRC startup on the same writable root, install the optional
+trace configuration in the Gentoo root before booting with `openrc_pid1` and
+`narf.rootlog`.
+
+```sh
+sudo install -D -m 0644 packaging/narf-boot-trace.conf /etc/rc.conf.d/narf-boot-trace.conf
+```
+
+Each boot writes a private `/var/log/narf-openrc-*` file with periodic samples
+of service states, process waits, Ethernet carrier and packet counters, and
+IPv4 addresses and routes. For roughly the first ten minutes it also samples
+SSH sockets every three seconds, recording changes to the TCP state, queues,
+timer and retransmission count. The socket records use kernel uptime and
+procfs hexadecimal values. For example, state `0A` is listening and `01`
+is established. The OpenSSH authentication log records successful logins.
 
 A failure before the root mounts can leave no file. A later panic leaves
 the last committed batch on disk. The final panic report bypasses the

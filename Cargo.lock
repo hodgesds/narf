@@ -3419,6 +3419,7 @@ name = "narf-net"
 version = "0.0.0"
 dependencies = [
  "aes-gcm",
+ "narf-boot",
  "narf-capabilities",
  "narf-console",
  "narf-crypto",

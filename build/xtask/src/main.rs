@@ -537,7 +537,7 @@ struct GrubImageArgs {
 fn grub_image_build_args(grub: &GrubImageArgs) -> BuildArgs {
     let mut build = grub.build.clone();
     if grub.root_policy.is_some() {
-        configure_systemd_pid1_build(&mut build, false);
+        configure_distro_pid1_build(&mut build, false);
     }
     build
 }
@@ -1620,7 +1620,7 @@ mod systemd_marker_tests {
         let Cmd::SystemdPid1(mut args) = cli.cmd else {
             panic!("systemd-pid1 subcommand parsed as another variant");
         };
-        configure_systemd_pid1_build(&mut args, net_check);
+        configure_distro_pid1_build(&mut args, net_check);
         args.features.split(',').map(str::to_string).collect()
     }
 
@@ -6891,7 +6891,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let mut args = args.clone();
-    configure_systemd_pid1_build(&mut args, net_check);
+    configure_distro_pid1_build(&mut args, net_check);
 
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
@@ -7090,7 +7090,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// Add the kernel features required by a distro PID-1 boot under QEMU.
+/// Add the kernel features required by an installed distro PID 1.
 ///
 /// A distro boots like Linux without `ip=`: its NICs come up down and
 /// unconfigured, and the distro's network manager (NetworkManager on
@@ -7099,10 +7099,10 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 /// NetworkManager adopts an already-configured interface as "external" and
 /// never manages it. Only the `narf-net-check` acceptance run (`net_check`)
 /// keeps `qemu-net`, the gate that proves that static bring-up works.
-fn configure_systemd_pid1_build(args: &mut BuildArgs, net_check: bool) {
-    // boot-init compiles boot_userspace_init (which honours systemd_pid1);
-    // cgroup-all makes /sys/fs/cgroup a real cgroup2fs (systemd's hard
-    // gate); firmware-allow-unsigned mirrors the run-interactive boot;
+fn configure_distro_pid1_build(args: &mut BuildArgs, net_check: bool) {
+    // boot-init launches the selected distro init. systemd and OpenRC with
+    // elogind both need cgroup.procs on a real cgroup2 filesystem.
+    // firmware-allow-unsigned mirrors the run-interactive boot;
     // container turns on the namespace layer so systemd sandboxing
     // (PrivateNetwork= and friends) gets a real CLONE_NEWNET with an
     // isolated loopback instead of EINVAL.

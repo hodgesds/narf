@@ -1344,12 +1344,8 @@ impl RenderFile {
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
-        if cmd == crate::drm_uapi::DRM_IOCTL_VERSION
-            && (info.native_xe() || info.submission_ready())
-        {
-            return Some(
-                version(arg, user, if info.native_xe() { b"xe" } else { b"i915" }).map(|()| 0),
-            );
+        if cmd == crate::drm_uapi::DRM_IOCTL_VERSION {
+            return Some(version(arg, user, info).map(|()| 0));
         }
         if cmd == crate::drm_uapi::DRM_IOCTL_GET_CAP {
             let result = (|| {
@@ -2233,18 +2229,23 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     })
 }
 
-// The internal registry identity remains intel-gpu. A live i915-compatible
-// render UAPI exposes the loader name through fault-aware userspace copies.
-fn version(arg: u64, user: &dyn IoctlContext, name: &[u8]) -> Result<(), FsError> {
+// drm_version is a property of the registered driver, independent of KMS.
+// Only a published render backend selects its Mesa loader identity.
+fn version(arg: u64, user: &dyn IoctlContext, info: &DeviceInfo) -> Result<(), FsError> {
+    let (name, minor, desc): (&[u8], u32, &[u8]) = if info.native_xe() {
+        (b"xe", 6, b"NARF Intel RCS")
+    } else if info.submission_ready() {
+        (b"i915", 6, b"NARF Intel RCS")
+    } else if info.platform.is_discrete() {
+        (b"intel-gpu", 0, b"NARF Intel Arc Display")
+    } else {
+        (b"intel-gpu", 0, b"NARF Intel iGPU driver")
+    };
     let mut request = read(user, arg, 64)?;
     put32(&mut request, 0, 1);
-    put32(&mut request, 4, 6);
+    put32(&mut request, 4, minor);
     put32(&mut request, 8, 0);
-    for (offset, value) in [
-        (16, name),
-        (32, b"".as_slice()),
-        (48, b"NARF Intel RCS".as_slice()),
-    ] {
+    for (offset, value) in [(16, name), (32, b"0".as_slice()), (48, desc)] {
         let count = u64_at(&request, offset).min(value.len() as u64) as usize;
         let pointer = u64_at(&request, offset + 8);
         if count != 0 && pointer != 0 {
@@ -2806,7 +2807,7 @@ pub(crate) mod tests {
     fn smoke_intel_registry_routes_primary_and_render_nodes() -> TestResult {
         use narf_filesystem::DirOps;
         check(|| {
-            for device_id in [0x9a49, 0x7d55, 0x56a0, 0xe20b] {
+            for device_id in [0x9a49, 0x46b3, 0x7d55, 0x56a0, 0xe20b] {
                 let card = Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
                     alloc::string::String::from("Intel routing fixture"),
                     0x8086,
@@ -2837,6 +2838,31 @@ pub(crate) mod tests {
                         .lookup(&name)
                         .ok_or("second open")?;
                     let user = User::new();
+                    // libdrm's drmGetVersion sizes all three buffers before
+                    // making the same ioctl again on this identity-only card.
+                    let version = crate::drm_uapi::DRM_IOCTL_VERSION;
+                    narf_scheduler::block_on_spin(file.ioctl_user(version, 64, &user))
+                        .map_err(|_| "size VERSION through node")?;
+                    let mut buffers = user.load(64, 64);
+                    if u32_at(&buffers, 4) != 0
+                        || u64_at(&buffers, 16) != 9
+                        || u64_at(&buffers, 32) != 1
+                        || u64_at(&buffers, 48) == 0
+                    {
+                        return Err("identity-only VERSION lengths or ABI");
+                    }
+                    put64(&mut buffers, 24, 256);
+                    put64(&mut buffers, 40, 320);
+                    put64(&mut buffers, 56, 384);
+                    user.store(64, &buffers);
+                    narf_scheduler::block_on_spin(file.ioctl_user(version, 64, &user))
+                        .map_err(|_| "copy VERSION through node")?;
+                    if user.load(256, 9) != b"intel-gpu"
+                        || user.load(320, 1) != b"0"
+                        || user.load(384, 4) != b"NARF"
+                    {
+                        return Err("identity-only VERSION strings");
+                    }
                     let mut request = [0; 16];
                     put32(&mut request, 0, 4); // actual PCI device ID
                     put64(&mut request, 8, 256);
@@ -3664,7 +3690,7 @@ pub(crate) mod tests {
             if file
                 .dispatch(
                     &info(Generation::MeteorLake),
-                    crate::drm_uapi::DRM_IOCTL_VERSION,
+                    crate::drm_uapi::DRM_IOCTL_MODE_GETRESOURCES,
                     64,
                     &user,
                 )

@@ -63,7 +63,7 @@ pub struct Args {
 
 impl Args {
     fn build_args(&self) -> BuildArgs {
-        BuildArgs {
+        let mut build = BuildArgs {
             arch: self.arch,
             debug: self.debug,
             package: "narf-frame".into(),
@@ -78,7 +78,22 @@ impl Args {
             passthrough_devices: Vec::new(),
             initramfs_firmware: self.initramfs_firmware.clone(),
             kasan: self.kasan,
+        };
+        if self.smoke {
+            build.features = without_kernel_test_features(&build.features);
+            ensure_feature(&mut build.features, "boot-smoke");
         }
+        if self
+            .cmdline
+            .split_ascii_whitespace()
+            .any(|arg| matches!(arg, "openrc_pid1" | "systemd_pid1"))
+        {
+            configure_distro_pid1_build(&mut build, false);
+        } else {
+            ensure_feature(&mut build.features, "boot-init");
+            ensure_feature(&mut build.features, "firmware-allow-unsigned");
+        }
+        build
     }
 }
 
@@ -92,15 +107,7 @@ pub fn run(args: &Args) -> Result<()> {
         bail!("efi-image currently supports x86_64; aarch64 uses cargo xtask image --arch=aarch64");
     }
     let root = workspace_root()?;
-    let mut build = args.build_args();
-    if args.smoke {
-        build.features = without_kernel_test_features(&build.features);
-    }
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-    if args.smoke {
-        ensure_feature(&mut build.features, "boot-smoke");
-    }
+    let build = args.build_args();
     let plan = composition_plan(&build, &root)?;
     let extra = composition::boot_arguments(&plan).join(" ");
     let cmdline = if extra.is_empty() {
@@ -345,6 +352,37 @@ fn boot(args: &Args, esp: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn efi_distro_init_selects_native_cgroups_and_namespaces() {
+        for (cmdline, distro) in [
+            ("rw openrc_pid1", true),
+            ("systemd_pid1 quiet", true),
+            ("openrc_pid1=0", false),
+            ("init=openrc_pid1", false),
+            ("narf.disks=boot-only", false),
+        ] {
+            let cli = Cli::try_parse_from([
+                "xtask",
+                "efi-image",
+                "--cmdline",
+                cmdline,
+                "--features",
+                "user-task-smp",
+            ])
+            .unwrap();
+            let Cmd::EfiImage(args) = cli.cmd else {
+                panic!("wrong command")
+            };
+            let build = args.build_args();
+            let features: Vec<_> = build.features.split(',').collect();
+            assert_eq!(features.contains(&"cgroup-all"), distro, "{cmdline}");
+            assert_eq!(features.contains(&"container"), distro, "{cmdline}");
+            assert!(!features.contains(&"qemu-net"));
+            assert!(features.contains(&"user-task-smp"));
+            assert!(features.contains(&"boot-init"));
+        }
+    }
 
     #[test]
     fn efi_cli_is_opt_in_and_has_distinct_run_and_smoke_modes() {

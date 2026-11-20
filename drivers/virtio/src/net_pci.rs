@@ -3697,7 +3697,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         }
         name.into()
     } else {
-        narf_net::iface::reserve_name("eth%d").into()
+        narf_net::iface::reserve_ethernet_name(mac).into()
     };
     // Stash the name on the controller BEFORE either registry call
     // consumes it, so `virtio_net_detach` can publish link DOWN,

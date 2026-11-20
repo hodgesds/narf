@@ -6996,7 +6996,7 @@ fn atomic_commit(
         } else if let Some(frame) = gem_frame {
             present_frame(card_index, crtc_id, frame, flip_ticket);
         } else if let Some(frame) = intel {
-            present_intel_frame(&frame)?;
+            present_intel_frame(card_index, &frame)?;
         } else if let Some(src_phys) = src_phys {
             present_frame(
                 card_index,
@@ -8193,7 +8193,7 @@ fn handle_setcrtc_decoded(
     } else if let Some(f) = gem_frame {
         present_frame(card_index, req.crtc_id, f, None);
     } else if let Some(frame) = intel {
-        present_intel_frame(&frame)?;
+        present_intel_frame(card_index, &frame)?;
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -8273,7 +8273,7 @@ fn handle_dirty_fb(
     };
     // An Intel GEM framebuffer is copied whole: the copy keeps no damage.
     if let Some(frame) = intel.filter(|_| !crtcs.is_empty()) {
-        present_intel_frame(&frame)?;
+        present_intel_frame(card_index, &frame)?;
         return Ok(0);
     }
     let rows = frame.as_ref().map_or(0..0, |f| cmd.rows(&clips, f.height));
@@ -8522,7 +8522,7 @@ fn handle_page_flip_decoded(
     } else if let Some(f) = gem_frame {
         present_frame(card_index, req.crtc_id, f, flip_ticket);
     } else if let Some(frame) = intel {
-        present_intel_frame(&frame)?;
+        present_intel_frame(card_index, &frame)?;
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -9022,7 +9022,7 @@ fn present_frame(
     if driver == Some("virtio_gpu") {
         blit_to_virtio_scanout(src_phys, src_pitch, src_w, src_h);
     } else {
-        blit_to_scanout(src_phys, src_pitch, src_w, src_h);
+        blit_to_scanout(card_index, src_phys, src_pitch, src_w, src_h);
     }
 }
 
@@ -9097,8 +9097,8 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
 ///
 /// The scanout geometry is fetched through the DRM fbdev hook installed
 /// by `narf_fb` at `Stage::Late` — avoids a circular crate dependency.
-fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
-    blit_rows_to_scanout(src_w, src_h, src_pitch, |row, dst, len| {
+fn blit_to_scanout(card_index: u32, src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+    blit_rows_to_scanout(card_index, src_w, src_h, src_pitch, |row, dst, len| {
         let src_row = src_phys + u64::from(row) * u64::from(src_pitch);
         // SAFETY: src is an identity-mapped dumb buffer validated by its
         // allocator; `len` is within its row (blit_rows_to_scanout's
@@ -9117,15 +9117,18 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
 /// `copy_row(row, dst, len)` writes `len` bytes (at most `src_w` and the
 /// scanout's width in pixels) of source row `row` to `dst`.
 fn blit_rows_to_scanout(
+    card_index: u32,
     src_w: u32,
     src_h: u32,
     src_pitch: u32,
     mut copy_row: impl FnMut(u32, *mut u8, usize),
 ) {
+    let target =
+        crate::drm_registry::mode_state(card_index).and_then(|card| card.lock().firmware_scanout);
     // SAFETY: fb replaces its generic mapping through scanout_access; all
     // destination accesses below finish before this view is dropped.
     let view = unsafe { crate::scanout_access::snapshot(crate::drm_fb_hook::query_scanout) };
-    let info = match *view {
+    let info = match (*view).filter(|geom| target.is_none_or(|fb| geom.matches_firmware(fb))) {
         Some(i) => i,
         None => {
             // No live scanout: the client's pixels are being dropped on the
@@ -9615,7 +9618,7 @@ fn intel_frame(_fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
 /// write-combining one is never cached), and each line is then copied across
 /// the object's scattered pages. Only 32-bpp frames match the scanout.
 #[cfg(feature = "intel")]
-fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+fn present_intel_frame(card_index: u32, frame: &IntelFrame) -> Result<(), FsError> {
     // Native-only input: refuse before fence waits, CPU sync or console copy.
     if frame.format == crate::drm::card::PixelFormat::Xrgb2101010 {
         return Err(FsError::Unsupported);
@@ -9643,11 +9646,17 @@ fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
     }
     let pages: Vec<u64> = object.pages().collect();
     let size = object.size();
-    blit_rows_to_scanout(frame.width, frame.height, frame.pitch, |row, dst, len| {
-        // SAFETY: `pages` are the retained object's frames; `dst` has `len`
-        // bytes (blit_rows_to_scanout's contract).
-        unsafe { copy_object_row(&pages, size, frame.pitch, row, dst, len) };
-    });
+    blit_rows_to_scanout(
+        card_index,
+        frame.width,
+        frame.height,
+        frame.pitch,
+        |row, dst, len| {
+            // SAFETY: `pages` are the retained object's frames; `dst` has `len`
+            // bytes (blit_rows_to_scanout's contract).
+            unsafe { copy_object_row(&pages, size, frame.pitch, row, dst, len) };
+        },
+    );
     Ok(())
 }
 
@@ -9683,7 +9692,7 @@ pub(crate) unsafe fn copy_object_row(
     len
 }
 #[cfg(not(feature = "intel"))]
-fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+fn present_intel_frame(_card_index: u32, frame: &IntelFrame) -> Result<(), FsError> {
     match frame.0 {}
 }
 

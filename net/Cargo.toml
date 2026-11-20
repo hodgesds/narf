@@ -12,6 +12,7 @@ name = "narf_net"
 path = "src/lib.rs"
 
 [dependencies]
+narf-boot         = { path = "../boot" }
 narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-crypto       = { path = "../crypto" }

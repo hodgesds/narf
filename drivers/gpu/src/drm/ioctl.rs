@@ -722,8 +722,8 @@ pub(crate) fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
     info.vsync_start = info.vdisplay + 3;
     info.vsync_end = info.vdisplay + 8;
     // Approximate pixel clock: h × v × refresh / 1000 = kHz.
-    let dot_clk_khz = (info.htotal as u32) * (info.vtotal as u32) * m.refresh_hz as u32;
-    info.clock = dot_clk_khz / 1000;
+    let dot_clk_hz = u64::from(info.htotal) * u64::from(info.vtotal) * u64::from(m.refresh_hz);
+    info.clock = (dot_clk_hz / 1000).min(u64::from(u32::MAX)) as u32;
     // Mode name — libdrm/modetest match a requested mode by this string
     // (e.g. `1280x800`). An empty name means `modetest -s 3@1:1280x800`
     // can't find the mode and falls through to a 0×0 dumb buffer (EINVAL).

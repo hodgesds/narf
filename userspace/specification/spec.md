@@ -352,6 +352,9 @@ configuration calls see EBUSY while construction is in progress. Both mount
 APIs attach instances through the caller's mount namespace and report shared
 construction errors (including ENOENT for a missing registered block source).
 Bind, move, remount and propagation operate on existing mount objects.
+`open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
+includes its child mounts. A plain bind of the installed root therefore exposes
+the on-disk directory beneath a mounted `/run`.
 
 The Linux ABI installation registers the linked FAT aliases, ext2/3/4,
 btrfs, SquashFS, exFAT, MINIX, ISO9660 and UDF constructors. Filesystem-owned
@@ -656,7 +659,9 @@ membership/options/statistics and `PACKET_AUXDATA` follow Linux
 non-zero virtio-net headers fail explicitly because packet mmap/GSO is not
 implemented. Interface promiscuity/all-multicast memberships are
 reference-counted and visible through both `SIOCGIFFLAGS` and net sysfs.
-Pathname AF_UNIX `bind` creates its socket marker with the caller's filesystem
+Pathname AF_UNIX `bind` uses the bytes up to the first NUL within the supplied
+`sun_path` for both inode creation and endpoint lookup. It creates its
+socket marker with the caller's filesystem
 UID and GID (the parent GID when the directory is setgid), mode `0777 & ~umask`,
 and applicable inherited access ACL. The creator can subsequently `chmod` its
 socket without `CAP_FOWNER`; ownership checks on unrelated inodes remain in

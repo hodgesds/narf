@@ -16,6 +16,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[path = "iface_admin.rs"]
 pub(crate) mod admin;
+#[path = "iface_boot_names.rs"]
+mod boot_names;
 #[path = "iface_monitor.rs"]
 mod monitor;
 pub use admin::{set_open_stop_target, OpenStopEvent, OpenStopTarget};
@@ -607,26 +609,32 @@ static RESERVED: IrqSafeSpinLock<Vec<String>> = IrqSafeSpinLock::new(Vec::new())
 /// Linux `dev_alloc_name`: a name containing `%d` takes the lowest number not
 /// already used by a registered or reserved device; any other name is used
 /// as-is.
-fn alloc_name(ifaces: &[NetIfaceEntry], reserved: &[String], pattern: &str) -> String {
-    let Some((prefix, suffix)) = pattern.split_once("%d") else {
-        return String::from(pattern);
-    };
-    (0u32..)
-        .map(|n| alloc::format!("{prefix}{n}{suffix}"))
-        .find(|candidate| {
-            ifaces.iter().all(|entry| entry.name != *candidate)
-                && reserved.iter().all(|name| name != candidate)
-        })
-        .unwrap_or_default()
+fn alloc_name(
+    ifaces: &[NetIfaceEntry],
+    reserved: &[String],
+    pattern: &str,
+    mac: Option<[u8; 6]>,
+) -> String {
+    boot_names::allocate(narf_boot::args(), pattern, mac, |candidate| {
+        ifaces.iter().any(|entry| entry.name == candidate)
+            || reserved.iter().any(|name| name == candidate)
+    })
 }
 
-/// Allocate a device name (`dev_alloc_name`) for a driver that needs it
-/// before it calls [`register`] — Linux names a `net_device` when it is set
-/// up, before `register_netdevice`. The name is held until registered.
+/// Allocate a device name before registration. The name stays reserved until registered.
 pub fn reserve_name(pattern: &str) -> &'static str {
+    reserve_device_name(pattern, None)
+}
+
+/// Reserve the name of a frame-ring Ethernet port using its probe-time MAC.
+pub fn reserve_ethernet_name(mac: [u8; 6]) -> &'static str {
+    reserve_device_name("eth%d", Some(mac))
+}
+
+fn reserve_device_name(pattern: &str, mac: Option<[u8; 6]>) -> &'static str {
     let g = IFACES.lock();
     let mut reserved = RESERVED.lock();
-    let name = alloc_name(g.as_deref().unwrap_or(&[]), &reserved, pattern);
+    let name = alloc_name(g.as_deref().unwrap_or(&[]), &reserved, pattern, mac);
     reserved.push(name.clone());
     alloc::boxed::Box::leak(name.into_boxed_str())
 }
@@ -906,7 +914,7 @@ fn register_inner(
     let v = g.get_or_insert_with(Vec::new);
     let name = {
         let mut reserved = RESERVED.lock();
-        let name = alloc_name(v, &reserved, name);
+        let name = alloc_name(v, &reserved, name, Some(mac));
         // Registering a reserved name consumes the reservation.
         reserved.retain(|held| *held != name);
         name

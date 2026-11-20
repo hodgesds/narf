@@ -920,6 +920,16 @@ precedence; only explicitly supported, noncolliding full i915 encodings reach
 the compatibility dispatcher. Unknown encodings never select an ABI by number
 alone. This routing is independent of temporary suspend/loss readiness.
 Legacy backends retain their i915 profile. Internal routing remains `intel-gpu`.
+Without a published render backend, both nodes report `intel-gpu` 1.0.0
+through the two-call DRM VERSION query, including cards without KMS state.
+On a Gen12 board whose VBT lists only external displays, probe skips eDP
+power sequencing. A live linear XRGB8888 primary whose latched GGTT surface,
+stride and dimensions match the boot framebuffer inside this function's
+graphics aperture below the first driver-owned GGTT window exposes one fixed
+KMS mode. Its connector type is Unknown, as in Linux simpledrm. The DRM master
+presents by copying to the matching kernel framebuffer mapping. While firmware
+owns that scanout, the PCI function stays in D0 and native hotplug modesetting
+stays disabled to preserve its pipe and shared display configuration.
 
 #### Native Xe profile
 

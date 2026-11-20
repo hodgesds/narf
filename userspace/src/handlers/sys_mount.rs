@@ -560,7 +560,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         // (`mount --rbind /x /x`) included, which stacks a copy of `/x` and of
         // each submount, exactly as mountinfo shows on Linux.
         let descendants = if flags & MS_REC != 0 {
-            current_clone_mount_subtree(source_base)
+            current_clone_mount_subtree(source_base, true)
                 .map(|(_, descendants)| descendants)
                 .unwrap_or_default()
         } else {

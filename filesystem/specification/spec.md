@@ -815,7 +815,10 @@ retain the false default; the syscall layer records this distinction in
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
-values, and expose stable non-zero inode identities. The root accepts runtime
+values, and expose stable non-zero inode identities. The root and its runtime
+directories also support pathname Unix sockets. A bound socket such as
+sysklogd's `/dev/log` has a stable `S_IFSOCK` inode, creator ownership and
+mutable permissions until unlink. The root accepts runtime
 device-node, directory, and symlink creation plus rename/removal. Dynamic
 device nodes preserve type, mode, uid/gid, rdev, and inode across lookups;
 dynamic directories preserve mode and inode identity. An unclaimed dynamic
