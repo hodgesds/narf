@@ -161,6 +161,10 @@ fn park_would_block(ctx: &mut dyn TrapContext, handle_id: u64, timeout_ptr: u64)
             let user = &*user_task;
             user.sleep_deadline_ns.store(deadline, Ordering::Release);
             user.net_io_wait.store(true, Ordering::Release);
+            // Not an epoll park: a stale `epoll_wait_fd` from an earlier
+            // epoll_wait would route this park's recheck to that epoll.
+            user.epoll_wait_fd.store(0, Ordering::Release);
+            user.durable_io_wait.store(false, Ordering::Release);
             user.epoll_park_gen
                 .store(narf_net::readiness::generation(), Ordering::Release);
             // Keep the signalfd park guard's snapshot fresh on this net_io_wait
