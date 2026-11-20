@@ -154,8 +154,9 @@ kernel_test_in!(
 fn smoke_aqc113_mac_decode_from_shared() -> TestResult {
     // MAC 52:54:00:AB:CD:EF in the IN buffer's MAC dwords:
     // dword0 LE bytes [52,54,00,AB] = 0xAB005452,
-    // dword1 LE bytes [EF,CD,00,00] = 0x0000CDEF.
-    let mac = match decode_mac_from_shared(&[0xAB00_5452, 0x0000_CDEF]) {
+    // dword1 LE bytes [CD,EF,00,00] = 0x0000EFCD (Linux copies the
+    // dwords in memory order: ether_addr_copy of mac_address[2]).
+    let mac = match decode_mac_from_shared(&[0xAB00_5452, 0x0000_EFCD]) {
         Some(m) => m,
         None => return TestResult::Fail("decode_mac_from_shared returned None"),
     };
@@ -507,7 +508,7 @@ impl FakeRegs {
     fn preload_fw_in_mac(&self) {
         let mut sh_in = self.sh_in.lock();
         sh_in[2] = 0xAB00_5452;
-        sh_in[3] = 0x0000_CDEF;
+        sh_in[3] = 0x0000_EFCD;
     }
 
     fn bank_read(&self, off: u64) -> u32 {
