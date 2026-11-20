@@ -253,7 +253,7 @@ kernel_test_in!("interrupts/oneshot", oneshot_smp_cpus_wake_from_own_lapic);
 fn run_smp_wake(online: u64, me: usize, hpet_vector: Option<u8>) -> TestResult {
     use core::fmt::Write as _;
     let selected = narf_time::clockevent::select_primary(1000, crate::VECTOR_TIMER);
-    if !selected.is_some_and(|d| d.name() == "lapic") {
+    if selected.is_none_or(|d| d.name() != "lapic") {
         return TestResult::Fail("the LAPIC was not selected as the primary clockevent");
     }
     if !apic::local_timer_mode(me).is_oneshot() {
