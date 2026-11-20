@@ -86,6 +86,9 @@ pub mod budget;
 #[cfg(feature = "cgroup")]
 pub mod cgroup;
 pub mod cpu_lifecycle;
+pub mod cputime;
+#[cfg(feature = "kernel-test")]
+mod cputime_tests;
 pub mod donation;
 pub mod eevdf;
 pub mod numa;
@@ -131,6 +134,7 @@ pub use cgroup::{
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
 };
+pub use cputime::{cpu_times, nr_context_switches, CpuTimes, TaskCputime, TaskTimes};
 pub use donation::{
     current_donation_policy_name, install_donation_policy, BackQueueDonation, Donation,
     DonationError, DonationPolicy, EnqueueDonee, HeadQueueDonation,
@@ -153,8 +157,8 @@ pub use steal::{
 };
 pub use user_policy::{
     alloc_user_task_id, inherit_user_scheduling, release_user_scheduling, set_user_scheduling,
-    user_scheduling, yield_user_scheduling, UserPolicy, UserScheduling, UserSchedulingAuthority,
-    UserSchedulingError,
+    user_scheduling, user_task_cputime, yield_user_scheduling, UserPolicy, UserScheduling,
+    UserSchedulingAuthority, UserSchedulingError,
 };
 
 // re-export the Invoke rights marker for callers who need to type a
@@ -1389,6 +1393,10 @@ pub(crate) struct WakeCell {
     /// while parked. A parked idle worker is not work: `run_until_empty`
     /// treats a CPU whose only parked tasks are idle workers as empty.
     idle_worker: AtomicBool,
+    /// The task's utime/stime (`cputime`). Shared with `UserControl` for a
+    /// user task so the process layer reads it without a queue scan. `None`
+    /// only for a `block_on` bridge cell, which is never dispatched.
+    pub(crate) cputime: Option<Arc<cputime::TaskCputime>>,
 }
 
 impl WakeCell {
@@ -1674,6 +1682,20 @@ pub(crate) fn activate_direct_task(
 }
 
 fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
+    new_wake_cell_with_cputime(
+        id,
+        cpu,
+        direct_eligible,
+        Arc::new(cputime::TaskCputime::new()),
+    )
+}
+
+fn new_wake_cell_with_cputime(
+    id: TaskId,
+    cpu: u32,
+    direct_eligible: bool,
+    cputime: Arc<cputime::TaskCputime>,
+) -> Arc<WakeCell> {
     Arc::new(WakeCell {
         blocking_wake: AtomicBool::new(false),
         flag: AtomicBool::new(true),
@@ -1693,6 +1715,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         direct_runtime_cycles: AtomicU64::new(0),
         last_run_cycles: AtomicU64::new(0),
         sync_requeue_cpu: AtomicU32::new(NO_SYNC_REQUEUE_CPU),
+        cputime: Some(cputime),
     })
 }
 
@@ -2181,6 +2204,8 @@ fn run_pending_migration(cpu: usize) {
     let Some((task_id, target_raw)) = pending else {
         return;
     };
+    // Linux runs a policy-requested rebalance from `SCHED_SOFTIRQ`.
+    let _softirq = narf_lib::kstat::softirq_enter(narf_lib::kstat::vector::SCHED);
     let target = target_raw as usize;
     if target >= narf_lib::percpu::MAX_CPUS
         || target == cpu
@@ -3144,6 +3169,14 @@ fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
     narf_rcu::exit_idle();
     #[cfg(feature = "native-ring")]
     let _authority = authority::CurrentGuard::enter(&slot.authority);
+    // CPU time from here to the matching exit belongs to this task (system,
+    // or softirq for a NAPI-style poller); user-mode spans inside a stackful
+    // poll are split off at the trap boundary.
+    let cputime_dispatcher = slot
+        .awake
+        .cputime
+        .as_deref()
+        .map(|task| cputime::dispatch_enter(task, slot.spec.work_kind == WorkKind::SoftIrq));
     let executor_domain = narf_memory::save_domain_state();
     let task_domain = slot.domain_saved.unwrap_or(executor_domain);
     // Avoid an identity restore.  On the stackful user path the outer
@@ -3176,6 +3209,9 @@ fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
     }
     narf_arch::set_current_domain_byte(incoming_reported);
     slot.domain_saved = Some(returned_task_domain);
+    if let Some(dispatcher) = cputime_dispatcher {
+        cputime::dispatch_exit(dispatcher);
+    }
     result
 }
 
@@ -3385,6 +3421,9 @@ pub fn init() {
     steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
+    // Softirq handlers below the scheduler (timer wheel, RCU) report their
+    // CPU time through `narf_lib::kstat`.
+    cputime::init();
     // Hrtimer sleepers whose waker is ours expire in hard IRQ: our
     // `wake_by_ref` only publishes the awake bit and places the wake (no
     // allocation, no free). Every other waker expires from the executor.
@@ -5305,7 +5344,12 @@ where
         && spec.budget_cap.is_none();
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let direct_eligible = false;
-    let awake = new_wake_cell(id, 0, direct_eligible);
+    let awake = new_wake_cell_with_cputime(
+        id,
+        0,
+        direct_eligible,
+        user_scheduling.control.cputime.clone(),
+    );
     user_policy::bind(&user_scheduling, &awake);
     // Preserve the load-aware admission decision through the child's first
     // dispatch. Without this short locality window, an idle CPU can steal a
@@ -6874,54 +6918,16 @@ pub fn poll_one_round() -> usize {
     ready_this_round
 }
 
-/// Idle the current CPU until there may be new work, honouring the
-/// reliability of the clock-event tick.
-///
-/// On a dependable tick (TSC-deadline self-rearming one-shot) we HLT and
-/// trust the periodic IRQ — or any device IRQ — to wake us; `next_deadline`
-/// lets us skip the halt when a wheel deadline has already passed.
-///
-/// On the uncalibrated InitialCount periodic fallback (CPUID reports no
-/// TSC-deadline, e.g. QEMU `qemu64` under TCG) a tick can be dropped or
-/// arrive late. Halting there risks stranding a CPU past a parked sleeper's
-/// deadline and — worse — stops the sleep-pumps from re-running, so a parked
-/// interval-timer owner's SIGALRM never fires (it's the pump, not the wheel,
-/// that raises it; see `frame`'s timer trap). We instead busy-wait a short
-/// bounded slice so the executor loop re-evaluates and re-pumps promptly,
-/// independent of IRQ delivery. Costs 100% CPU while idle on such hosts —
-/// the price of an undependable tick, paid only where TSC-deadline is
-/// unavailable. `narf_time::set_tick_reliable` publishes which case we're in.
-/// Per-CPU accumulated idle time (ns) — the real data behind
-/// /proc/stat's per-cpu idle column. Folded around every actual
-/// sleep: `idle_wait`'s halt/pump slice and the production idle
-/// halts in `run_until_empty`, `run_forever` and
-/// `park_for_cpu_lifecycle` (via `credit_idle_since`). The adaptive
-/// halt-poll spin windows (bounded ~60µs, see run_until_empty) are
-/// deliberately NOT counted — they're latency polling, and at their
-/// scale the distinction is noise for a 100Hz-tick consumer.
-static PERCPU_IDLE_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
-
-/// Accumulated idle ns for `cpu` since boot (0 for an out-of-range id).
+/// Accumulated idle ns for `cpu` since boot, iowait included and hard-IRQ
+/// time excluded (0 for an out-of-range id). Every production halt —
+/// `idle_wait`'s halt/pump slice and the idle halts in `run_until_empty`,
+/// `run_forever`, `bridge_idle_wait` and `park_for_cpu_lifecycle` — is
+/// bracketed by `cputime::idle_enter`/`idle_exit`, which is the source. The
+/// adaptive halt-poll spin windows (bounded ~60µs, see run_until_empty) stay
+/// system time: they are latency polling outside the halt bracket.
 pub fn cpu_idle_ns(cpu: usize) -> u64 {
-    PERCPU_IDLE_NS
-        .get(cpu)
-        .map(|a| a.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
-/// Fold the interval since `t0_cycles` (a `narf_time::now_cycles`
-/// stamp taken just before a halt) into `cpu`'s accumulated idle
-/// time. Every production halt site must bracket its halt with a
-/// stamp + this fold: before it landed, `busy = elapsed − idle` in
-/// /proc/stat charged the halted interval to `user`, so an idle
-/// guest read as 100% busy to interval-sampling monitors (btop).
-fn credit_idle_since(cpu: usize, t0_cycles: u64) {
-    let dt_cycles = narf_time::now_cycles().wrapping_sub(t0_cycles);
-    let ns = narf_time::cycles_to_ns(dt_cycles);
-    if let Some(slot) = PERCPU_IDLE_NS.get(cpu) {
-        slot.fetch_add(ns, Ordering::Relaxed);
-    }
+    let times = cputime::cpu_times(cpu);
+    times.idle.saturating_add(times.iowait)
 }
 
 /// Per-CPU accumulated steal time (ns) — the real data behind
@@ -6985,10 +6991,27 @@ pub fn cpu_steal_ns(cpu: usize) -> u64 {
         .unwrap_or(0)
 }
 
+/// Idle the current CPU until there may be new work, honouring the
+/// reliability of the clock-event tick.
+///
+/// On a dependable tick (TSC-deadline self-rearming one-shot) we HLT and
+/// trust the periodic IRQ — or any device IRQ — to wake us; `next_deadline`
+/// lets us skip the halt when a wheel deadline has already passed.
+///
+/// On the uncalibrated InitialCount periodic fallback (CPUID reports no
+/// TSC-deadline, e.g. QEMU `qemu64` under TCG) a tick can be dropped or
+/// arrive late. Halting there risks stranding a CPU past a parked sleeper's
+/// deadline and — worse — stops the sleep-pumps from re-running, so a parked
+/// interval-timer owner's SIGALRM never fires (it's the pump, not the wheel,
+/// that raises it; see `frame`'s timer trap). We instead busy-wait a short
+/// bounded slice so the executor loop re-evaluates and re-pumps promptly,
+/// independent of IRQ delivery. Costs 100% CPU while idle on such hosts —
+/// the price of an undependable tick, paid only where TSC-deadline is
+/// unavailable. `narf_time::set_tick_reliable` publishes which case we're in.
 fn idle_wait(next_deadline: Option<u64>) {
-    let t0 = narf_time::now_cycles();
+    let idle = cputime::idle_enter();
     idle_wait_inner(next_deadline);
-    credit_idle_since(narf_lib::percpu::current_cpu(), t0);
+    cputime::idle_exit(idle);
 }
 
 /// The `block_on` bridge's halt: `idle_wait(None)` made race-free the way
@@ -7034,7 +7057,7 @@ fn bridge_idle_wait(awake: &WakeCell) {
         idle_wait(None);
         return;
     }
-    let t0 = narf_time::now_cycles();
+    let idle = cputime::idle_enter();
     // SAFETY: re-enabled below on every path; masking IRQs across the
     // check and the halt is what closes race 1.
     unsafe {
@@ -7059,7 +7082,7 @@ fn bridge_idle_wait(awake: &WakeCell) {
     unsafe {
         narf_arch::enable_interrupts();
     }
-    credit_idle_since(cpu, t0);
+    cputime::idle_exit(idle);
 }
 
 #[inline]
@@ -7935,12 +7958,14 @@ pub fn run_until_empty() {
                 let entered = if deadline_passed {
                     false
                 } else {
+                    let idle = cputime::idle_enter();
                     // SAFETY: IRQs are masked and the final wake check passed.
-                    unsafe { narf_power_core::executor::enter_idle(idle_plan) }
+                    let entered = unsafe { narf_power_core::executor::enter_idle(idle_plan) };
+                    cputime::idle_exit(idle);
+                    entered
                 };
                 let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
                 if entered {
-                    credit_idle_since(cpu, idle_t0);
                     if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
                         HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
                     }
@@ -8906,12 +8931,12 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
         // later returns to service the parked interval must not be
         // charged to busy. The spin fallback below is active
         // polling, not a halt, so it stays uncredited.
-        let idle_t0 = narf_time::now_cycles();
+        let idle = cputime::idle_enter();
         // SAFETY: IRQs were disabled above. This is the architecture's atomic
         // enable/halt/disable sequence, so a bring-up IPI cannot be lost in
         // the final state-check-to-halt window.
         unsafe { narf_arch::idle_halt_then_disable() };
-        credit_idle_since(cpu, idle_t0);
+        cputime::idle_exit(idle);
     } else {
         core::hint::spin_loop();
     }
@@ -9041,13 +9066,13 @@ pub fn run_forever() -> ! {
             let entered = if next_deadline.is_some_and(|deadline| idle_t0 >= deadline) {
                 false
             } else {
+                let idle = cputime::idle_enter();
                 // SAFETY: IRQs are masked and the final wake check passed.
-                unsafe { narf_power_core::executor::enter_idle(idle_plan) }
+                let entered = unsafe { narf_power_core::executor::enter_idle(idle_plan) };
+                cputime::idle_exit(idle);
+                entered
             };
             let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
-            if entered {
-                credit_idle_since(cpu, idle_t0);
-            }
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             narf_rcu::exit_idle();
@@ -9068,9 +9093,9 @@ pub fn run_forever() -> ! {
             // accounting too: with IRQs enabled it is a real HLT, and
             // masked it degrades to a single spin hint whose folded
             // delta is negligible.
-            let idle_t0 = narf_time::now_cycles();
+            let idle = cputime::idle_enter();
             narf_arch::halt_until_irq();
-            credit_idle_since(cpu, idle_t0);
+            cputime::idle_exit(idle);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             narf_rcu::exit_idle();
@@ -9479,6 +9504,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         direct_runtime_cycles: AtomicU64::new(0),
         last_run_cycles: AtomicU64::new(0),
         sync_requeue_cpu: AtomicU32::new(NO_SYNC_REQUEUE_CPU),
+        cputime: None,
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

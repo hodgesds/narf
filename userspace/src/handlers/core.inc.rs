@@ -663,7 +663,6 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
     // continuation stays on this task's private kernel stack while asleep.
     let uc = unsafe { &*uctx };
     let task = current_task_id();
-    crate::handlers::close_kernel_span(uc, task);
     // What this task waits on, for `/proc/<pid>/stack`: the lock, if a lock
     // is what this poll is waiting for, and otherwise the kernel code that
     // parked it (the `poll_blocking` caller).
@@ -693,7 +692,6 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
         .store(false, core::sync::atomic::Ordering::Release);
     uc.park_site.store(0, core::sync::atomic::Ordering::Relaxed);
     PARKED_WAITER.lock().remove(&task);
-    crate::handlers::open_kernel_span(uc);
     true
 }
 
@@ -797,7 +795,6 @@ pub(crate) fn cond_resched() -> bool {
         // SAFETY: as in `park_pending_future`: the in-flight task's
         // poller-pinned context.
         let uc = unsafe { &*uctx };
-        crate::handlers::close_kernel_span(uc, current_task_id());
         uc.yield_site.store(
             caller as *const _ as usize,
             core::sync::atomic::Ordering::Relaxed,
@@ -811,7 +808,6 @@ pub(crate) fn cond_resched() -> bool {
         // SAFETY: as above.
         let uc = unsafe { &*uctx };
         uc.yield_site.store(0, core::sync::atomic::Ordering::Relaxed);
-        crate::handlers::open_kernel_span(uc);
     }
     yielded
 }
@@ -14252,7 +14248,7 @@ pub fn wait_init() {
     // `pid`, so they're independent of ordering.
     crate::user_task::register_thread_exit_observer(on_thread_exit);
     // Perf snapshots final user + kernel software-clock time before the master
-    // table sweep removes TASK_KERN_NS. Register it ahead of that sweep; the
+    // table sweep and the task's release. Register it ahead of that sweep; the
     // retired total then remains readable after every inherited task exits.
     crate::user_task::register_thread_exit_observer(crate::perf_event::on_thread_exit);
     crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
@@ -14509,8 +14505,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
             return child_pid as i64;
         }
         // Charge the reaped child's CPU time to the parent (RUSAGE_CHILDREN
-        // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
-        // this covers the blocking wait4 + waitid path.
+        // / tms.cutime/cstime). Same fold as the synchronous reap path in
+        // sys_wait4; this covers the blocking wait4 + waitid path.
         let _ = account_reaped_child(parent_id, child_pid);
         // Cleanup is deferred to `finish_wait_child`: it must first translate
         // this outer PID through the waiter's still-live namespace binding.
@@ -14544,35 +14540,36 @@ pub(crate) fn finish_wait_child(
     let child_pid = reaped as u64;
     let is_terminal = status != CONTINUED_WSTATUS && status & 0xff != 0x7f;
     let peek = options & WNOWAIT != 0;
+    // The child's CPU time is read from its still-registered zombie group
+    // (release is deferred to the caller); the exit snapshot holds its RSS.
     let snap = if is_terminal && peek {
         let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
-        Some(peek_exit_rusage(child_pid).unwrap_or_else(|| {
-            (
-                cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
-                task_rss_bytes(child_tid) / 1024,
-            )
-        }))
+        Some((
+            rusage_both_of_pid(child_pid),
+            peek_exit_rusage(child_pid).unwrap_or_else(|| task_rss_bytes(child_tid) / 1024),
+        ))
     } else if is_terminal {
         // A terminal reap must always consume the saved snapshot, even when
         // this particular wait did not request rusage.
-        take_exit_rusage(child_pid)
+        let kb = take_exit_rusage(child_pid).unwrap_or(0);
+        (rusage_ptr != 0).then(|| (rusage_both_of_pid(child_pid), kb))
     } else if rusage_ptr != 0 {
         let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
         Some((
-            cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
+            rusage_both_of_pid(child_pid),
             task_rss_bytes(child_tid) / 1024,
         ))
     } else {
         // Stop/continue is not a reap and has no snapshot to clean up. Most
-        // waitpid calls pass no rusage pointer, so avoid three cold accounting
+        // waitpid calls pass no rusage pointer, so avoid cold accounting
         // lookups on this job-control hot path.
         None
     };
     let reaped_visible = report_pid_to(parent, reaped as u64) as i64;
-    let (ns, kb) = snap.unwrap_or((0, 0));
+    let (times, kb) = snap.unwrap_or_default();
     let result = if is_waitid {
         // Linux waitid copies rusage before siginfo.
-        if rusage_ptr != 0 && write_rusage_utime(rusage_ptr, ns, kb).is_err() {
+        if rusage_ptr != 0 && write_rusage(rusage_ptr, times, kb).is_err() {
             errno_ret(EFAULT).value
         } else if status_ptr != 0 {
             let si = encode_waitid_siginfo(reaped_visible, status);
@@ -14597,7 +14594,7 @@ pub(crate) fn finish_wait_child(
         };
         let rusage_fault = !status_fault
             && rusage_ptr != 0
-            && write_rusage_utime(rusage_ptr, ns, kb).is_err();
+            && write_rusage(rusage_ptr, times, kb).is_err();
         if status_fault || rusage_fault {
             errno_ret(EFAULT).value
         } else {
@@ -15352,7 +15349,7 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
 //                             (observer order must not matter),
 //   - TASK_STOPPED          — on_child_exit already removes it,
 //   - PENDING_TERMINATION   — drained by on_child_exit (wstatus),
-//   - TASK_CPU_NS/CHILD     — needed at reap (account_reaped_child),
+//   - CPU time              — lives on the Task until reap (account_reaped_child),
 //   - PID_TO_TASK/TASK_TO_PID — needed through the zombie window,
 //                             removed at reap (release_reaped_task),
 //   - fd table              — fd::detach (on_child_exit) owns it.
@@ -15469,7 +15466,6 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    task_account_remove(&TASK_KERN_NS, tid);
     ioprio_release(tid);
     // POSIX record locks: normally already drained (fd::detach runs
     // first in exit-observer order and wakes the waiters); this second
@@ -18778,15 +18774,12 @@ fn rlimit_cpu_tick(task: u64) {
         return;
     };
     // Registry contention just defers to the next tick (see
-    // `thread_group_cpu_ns_try`).
-    let Some(folded) = crate::task::thread_group_cpu_ns_try(pid) else {
+    // `thread_group_cpu_ns_try`). The sample includes the span this task is
+    // in the middle of, so a task spinning in user mode without syscalls is
+    // held to its limit on time.
+    let Some(ptime) = crate::task::thread_group_cpu_ns_try(task) else {
         return;
     };
-    // Add the slice this task is in the middle of. A task spinning in user
-    // mode without syscalls folds its slice only when something preempts it,
-    // so without this the very process the limit exists to stop is the one
-    // whose accounting lags furthest behind.
-    let ptime = folded.saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
     const NSEC_PER_SEC: u64 = 1_000_000_000;
 
     // Hard limit: SIGKILL, and nothing further.
@@ -19541,8 +19534,8 @@ pub(crate) const CLK_TCK_HZ: u64 = 100;
 //
 // Linux's `struct rusage` is 16 fields after the leading two
 // timevals (each timeval is two i64s on x86_64), totaling 18 i64s
-// = 144 bytes. We populate ru_utime from monotonic_ns and zero
-// the rest — same accounting story as sys_times. The two-field
+// = 144 bytes. `write_rusage` fills ru_utime/ru_stime from the exact
+// CPU-time accounting and ru_maxrss, and zeroes the rest. The two-field
 // timeval layout matches what glibc's <sys/time.h> exposes.
 
 const RUSAGE_TIMEVAL_FIELDS: usize = 4; // ru_utime + ru_stime

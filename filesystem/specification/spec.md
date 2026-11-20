@@ -2024,6 +2024,23 @@ pub fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError
 the caller's pid namespace and perform the capability check. Before the hooks
 are installed it reads `0` and refuses writes.
 
+### 3.14 CPU statistics (`/proc/stat`, `/proc/softirqs`, task stat times)
+
+`/proc/stat` follows `fs/proc/stat.c::show_stat`. The aggregate and per-CPU
+lines carry `user nice system idle iowait irq softirq steal guest guest_nice`
+in USER_HZ (100) ticks from `narf_scheduler::cpu_times` (`scheduler/` §3.4.1);
+the aggregate sums nanoseconds before converting, so it may exceed the sum of
+the per-CPU lines by less than one tick per CPU. `ctxt` is
+`nr_context_switches()`, `procs_blocked` is `narf_lib::kstat::nr_iowait_total`
+and `softirq` is the total followed by the ten per-vector totals.
+`/proc/softirqs` (`fs/proc/softirqs.c`) prints the per-CPU execution counts of
+each vector (`narf_lib::kstat`, mapping in `lib/` §3.9) for every online CPU.
+`/proc/uptime`'s idle sums the CPUs' idle time, iowait excluded.
+`ProcTaskInfo::{utime,stime,cutime,cstime}_ticks` are stat fields 14-17:
+the thread group's times and its reaped children's for `/proc/<pid>/stat`; a
+`/proc/<pid>/task/<tid>/stat` row substitutes the thread's own utime/stime
+from `ThreadStat` and keeps the group's cutime/cstime (`do_task_stat`).
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

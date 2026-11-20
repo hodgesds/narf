@@ -279,6 +279,12 @@ cannot be consumed by an IPI after the final wake check but before user entry.
 - The trap-frame prefix carries a saved state plus a discriminator: inactive,
   `IA32_PKRS`, or CR3/PCID. Fast `SYSCALL` entry uses the same ordering before
   Rust and restores the snapshot on both SYSRET and IRET exits.
+- CPU-time boundary (`scheduler/` §3.4.1): after the domain prefix and before
+  the dispatcher, a trap whose frame CS is a user selector, and every SYSCALL
+  entry while IF is still clear, call `narf_cputime_user_exit`; after the
+  dispatcher returns and with IF clear (`cli`), a return through a user CS
+  and every SYSRET call `narf_cputime_user_enter`, before the domain restore.
+  Both are a TSC read and per-CPU stores; no lock, I/O or allocation.
 
 ### aarch64
 - EL1 vector table aligned to 2 KiB; four groups of four vectors.
@@ -287,6 +293,11 @@ cannot be consumed by an IPI after the final wake check but before user entry.
   comes from MPIDR (`narf_arch::aarch64::cpu::current_cpu`), not from a
   `CpuLocal` pointer in `TPIDR_EL1`.
 - SP_EL0 for user, SP_EL1 for kernel; SPSel=1 on entry.
+- CPU-time boundary (`scheduler/` §3.4.1): `__narf_vec_sync_el0` calls
+  `narf_cputime_user_exit` before its dispatcher and
+  `narf_cputime_sync_el0_return` (masks IRQs; acts only for an EL0 SPSR)
+  after it; `rust_aarch64_irq` does the same around an IRQ taken from EL0,
+  the exit after `finish_user_return`.
 - Each AP receives one contiguous 64 KiB kernel stack before `CPU_ON`. The AP
   entry trampoline uses its physical top with the MMU off, then rebases the
   empty stack to the high direct map before entering Rust. Before entering its

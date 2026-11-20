@@ -2153,26 +2153,11 @@ impl PerfEventFile {
     }
 
     fn selected_task_time(&self, task: u64) -> u64 {
-        let current = task == crate::handlers::current_task_id();
-        let slice = crate::handlers::cpu_time_ns_of(task).saturating_add(if current {
-            narf_scheduler::stackful::current_slice_elapsed_ns()
-        } else {
-            0
-        });
         // Linux software CPU/task clocks count scheduled task time regardless
         // of exclude_user/exclude_kernel (perf's :u/:k modifiers produce the
-        // same value for these software events). x86's own-stack ledger is
-        // already total time; aarch64's legacy ledger needs its syscall time.
-        #[cfg(target_arch = "x86_64")]
-        return slice;
-        #[cfg(not(target_arch = "x86_64"))]
-        return slice
-            .saturating_add(crate::handlers::kern_time_ns_of(task))
-            .saturating_add(if current {
-                crate::handlers::current_kernel_span_elapsed_ns()
-            } else {
-                0
-            });
+        // same value for these software events): the task's utime + stime,
+        // its running span included.
+        crate::handlers::thread_cpu_times(task).total_ns()
     }
 
     fn is_task_software_clock(&self) -> bool {

@@ -207,6 +207,14 @@ common_trap:
     wrmsr
 .Ldomain_enter_done:
 
+    /* CPU time: a trap taken at CPL3 ends the user span. The frame's CS
+     * sits above the domain prefix (16), the GPRs (120) and vector+error
+     * (16) and the RIP (8): rsp + 160. IF=0 (interrupt gate). */
+    test qword ptr [rsp + 160], 0x3
+    jz 3f
+    call narf_cputime_user_exit
+3:
+
     /* RDI = pointer to the trap frame (the current RSP). */
     mov rdi, rsp
 
@@ -218,6 +226,16 @@ common_trap:
      *   - call exit_kernel internally → never returns here.
      */
     call rust_trap_handler
+
+    /* CPU time: returning through a user CS (possibly rewritten by the
+     * handler) starts a user span. IF must be clear for the transition and
+     * already is for every path that reaches iretq; `cli` makes it explicit
+     * (iretq restores the user RFLAGS). */
+    test qword ptr [rsp + 160], 0x3
+    jz 4f
+    cli
+    call narf_cputime_user_enter
+4:
 
     /* Restore the exact state captured on entry. Nested traps naturally save
      * and restore the neutral state established by their outer trap. */

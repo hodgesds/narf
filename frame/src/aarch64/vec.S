@@ -305,8 +305,13 @@ __narf_vec_sync_sp0:
 .type __narf_vec_sync_el0, @function
 __narf_vec_sync_el0:
     SAVE_ALL_GPRS
+    /* CPU time: the user span ends (IRQs masked by exception entry). */
+    bl      narf_cputime_user_exit
     mov     x0, sp
     bl      rust_aarch64_sync_dispatch
+    /* CPU time: a return to EL0 starts a user span (masks IRQs itself). */
+    mov     x0, sp
+    bl      narf_cputime_sync_el0_return
     RESTORE_ALL_GPRS
     eret
 .size __narf_vec_sync_el0, . - __narf_vec_sync_el0

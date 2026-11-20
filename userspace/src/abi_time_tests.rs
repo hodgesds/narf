@@ -539,7 +539,9 @@ fn smoke_abi_time_cpu_accounting() -> TestResult {
         };
         // RUSAGE_SELF reflects accounted CPU time.
         let self_before = read_ru_utime_ns(0).ok_or("getrusage(RUSAGE_SELF) failed")?;
-        crate::handlers::account_user_cpu_ns(300_000_000); // 300 ms
+        if !crate::handlers::__test_account_cpu_ns(FAKE_TASK, 300_000_000) {
+            return Err("CPU-accounting fixture task is not registered");
+        }
         let self_after = read_ru_utime_ns(0).ok_or("getrusage(RUSAGE_SELF) failed")?;
         if self_after.saturating_sub(self_before) < 250_000_000 {
             return Err("getrusage(RUSAGE_SELF).ru_utime must track accounted CPU, not uptime");
@@ -561,9 +563,13 @@ fn smoke_abi_time_cpu_accounting() -> TestResult {
         // time to the parent's children bucket. `99_001` stands in for a
         // reaped child; account_reaped_child returns its total and folds it.
         let child_before = read_ru_utime_ns(-1).ok_or("getrusage(RUSAGE_CHILDREN) failed")?;
-        crate::handlers::__test_account_cpu_ns(99_001, 400_000_000);
+        let child = crate::task::Task::new_registered(99_001, 99_001);
+        let charged = crate::handlers::__test_account_cpu_ns(99_001, 400_000_000)
+            && crate::handlers::__test_account_kernel_ns(99_001, 50_000_000);
         let folded = crate::handlers::account_reaped_child(FAKE_TASK, 99_001);
-        if folded < 350_000_000 {
+        crate::task::release_task(99_001);
+        drop(child);
+        if !charged || folded.utime_ns < 350_000_000 || folded.stime_ns != 50_000_000 {
             return Err("account_reaped_child should return the child's accumulated CPU time");
         }
         let child_after = read_ru_utime_ns(-1).ok_or("getrusage(RUSAGE_CHILDREN) failed")?;

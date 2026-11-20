@@ -754,7 +754,7 @@ impl BlockDevice for SyncBlock {
     /// at a time.
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
         if let Some(q) = &self.1 {
-            return crate::queue::SyncSubmit::Queued(q.submit(req));
+            return crate::queue::SyncSubmit::queued(q.submit(req));
         }
         let buffer = narf_io::resolve_cap(&req.buffer);
         let result = self.do_io(&req, buffer);
@@ -774,7 +774,7 @@ impl BlockDevice for SyncBlock {
     }
     fn flush_result(&self) -> impl Future<Output = Result<(), BlockError>> + Send {
         if let Some(q) = &self.1 {
-            return crate::queue::SyncFlush::Queued(q.flush());
+            return crate::queue::SyncFlush::queued(q.flush());
         }
         crate::queue::SyncFlush::Ready(Some(self.0.flush().map_err(map_io_err)))
     }
@@ -801,7 +801,7 @@ impl BlockDevice for SyncBlock {
     /// calls, one bounce per child range.
     fn submit_sg(&self, req: crate::SgRequest) -> impl Future<Output = BlockCompletion> + Send {
         if let Some(q) = &self.1 {
-            return crate::queue::SyncSubmit::Queued(crate::queue::submit_sg(&**q, req));
+            return crate::queue::SyncSubmit::queued(crate::queue::submit_sg(&**q, req));
         }
         let result = self.do_sg_iter(&req);
         crate::queue::SyncSubmit::Ready(Some(BlockCompletion {

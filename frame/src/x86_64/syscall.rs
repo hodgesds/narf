@@ -217,6 +217,9 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "wrmsr",
         "9:",
 
+        // CPU time: the user span ends here (IF=0 from IA32_FMASK).
+        "call {cputime_user_exit}",
+
         // Re-enable interrupts for the body of the syscall. SYSCALL
         // entry cleared IF via IA32_FMASK (SFMASK_BITS); now that the
         // full UserState snapshot is safe on the kernel stack and we're
@@ -271,6 +274,12 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "2:",
         // Preserve the folded result before the domain restore reuses RAX/RDX.
         "mov [rsp + 112], rax",
+
+        // CPU time: the kernel span ends here. Mask first: the body may have
+        // run with IF=1 (`syscall_irq_on`), and the transition must not be
+        // interrupted. IF stays clear until `sysretq` restores user RFLAGS.
+        "cli",
+        "call {cputime_user_enter}",
 
         // Restore the entry rights before resuming the task. FRAME remains
         // accessible in every admitted domain, so the UserState loads below
@@ -354,7 +363,31 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "swapgs",
         "sysretq",
         dispatch = sym dispatch_syscall,
+        cputime_user_exit = sym narf_cputime_user_exit,
+        cputime_user_enter = sym narf_cputime_user_enter,
     )
+}
+
+/// CPU-time boundary: the CPU entered the kernel from user mode (Linux
+/// `vtime_user_exit`). Called by the SYSCALL entry above and by
+/// `common_trap` (`trap_entry.S`) for a trap taken at CPL3, after the domain
+/// prefix and before the dispatcher, so before any hard-IRQ accounting of
+/// the same entry.
+#[unsafe(no_mangle)]
+extern "C" fn narf_cputime_user_exit() {
+    // SAFETY: both callers run with IF=0 (IA32_FMASK / interrupt gate) on
+    // the kernel stack, ahead of the entry's own interrupt accounting.
+    unsafe { narf_scheduler::cputime::user_exit_irqs_off() }
+}
+
+/// CPU-time boundary: the CPU is about to return to user mode (Linux
+/// `vtime_user_enter`). Called by the SYSRET tail above and by `common_trap`
+/// when the frame it will `iretq` through has a user CS.
+#[unsafe(no_mangle)]
+extern "C" fn narf_cputime_user_enter() {
+    // SAFETY: both callers have IF=0 and keep it clear until SYSRET/IRET
+    // restores the user RFLAGS.
+    unsafe { narf_scheduler::cputime::user_enter_irqs_off() }
 }
 
 /// C-ABI dispatcher invoked from the naked asm. The state
