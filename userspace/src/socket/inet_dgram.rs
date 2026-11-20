@@ -1415,6 +1415,12 @@ impl SocketFile {
                     if !peek {
                         inbox.pop_front();
                         *rmem = rmem.saturating_sub(full_len + DGRAM_TRUESIZE_OVERHEAD);
+                        // Emptied under the state lock: drop POLL_IN so a
+                        // blocking receiver that arms next parks rather than
+                        // spinning on a stale "readable".
+                        if inbox.is_empty() {
+                            self.dgram_readiness.set(0, narf_filesystem::POLL_IN);
+                        }
                     }
                     // `copied < ulen` sets MSG_TRUNC and `flags & MSG_TRUNC`
                     // returns the datagram's real length

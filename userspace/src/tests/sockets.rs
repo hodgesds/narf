@@ -1004,6 +1004,120 @@ fn smoke_socket_inet6_udp_loopback_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet6_udp_loopback_round_trip);
 
+static INET6_WAKES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn inet6_counting_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable};
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        INET6_WAKES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable functions never dereference the null data pointer.
+    unsafe { core::task::Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+/// `udp_poll` uses the socket's own wait queue for every family. An IPv6
+/// datagram socket used to arm NOTHING (it fell to the legacy path) while its
+/// receive path woke only that unarmed cell and never the generic waiter, so
+/// an epoll_wait or poll over it (systemd-resolved's LLMNR and DNS-over-v6
+/// sockets) slept through every datagram.
+fn smoke_socket_inet6_udp_wakes_armed_waiters() -> TestResult {
+    use narf_filesystem::FileOps;
+    let rx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let tx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let addr = crate::socket::make_sockaddr_in6(loopback, 8124);
+    if !matches!(
+        rx.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("AF_INET6 UDP bind(::1) failed");
+    }
+    let waker = inet6_counting_waker();
+    INET6_WAKES.store(0, core::sync::atomic::Ordering::SeqCst);
+    const EPOLL_ID: u64 = (1 << 63) | 0x6601;
+    const POLL_ID: u64 = 0x6602;
+    let interest = narf_filesystem::POLL_IN | narf_filesystem::POLL_ERR | narf_filesystem::POLL_HUP;
+    let persistent = rx.arm_readiness_persistent(EPOLL_ID, interest, &waker);
+    let one_shot = rx.arm_readiness(POLL_ID, interest, &waker);
+    let send = tx.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"llmnr",
+        flags: 0,
+        addr: Some(addr),
+    });
+    let wakes = INET6_WAKES.load(core::sync::atomic::Ordering::SeqCst);
+    rx.disarm_readiness(EPOLL_ID);
+    rx.disarm_readiness(POLL_ID);
+    rx.unregister();
+    tx.unregister();
+    if persistent != Some(0) {
+        return TestResult::Fail("an IPv6 datagram socket has no epoll wait queue");
+    }
+    if !matches!(one_shot, Some(core::task::Poll::Pending)) {
+        return TestResult::Fail("an IPv6 datagram socket has no poll wait queue");
+    }
+    if !matches!(send, crate::socket::SocketOpResult::Ok(5)) {
+        return TestResult::Fail("AF_INET6 UDP sendto(::1) failed");
+    }
+    if wakes < 2 {
+        return TestResult::Fail("an IPv6 datagram did not wake both armed waiters");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket/wake",
+    smoke_socket_inet6_udp_wakes_armed_waiters
+);
+
+/// A blocking receive that drained the queue must park on its next arm, not
+/// read a stale "readable" from the cell and re-execute into EAGAIN forever.
+fn smoke_socket_dgram_recv_clears_readable_when_drained() -> TestResult {
+    use narf_filesystem::FileOps;
+    let rx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let tx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let addr = crate::socket::make_sockaddr_in6(loopback, 8125);
+    if !matches!(
+        rx.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("AF_INET6 UDP bind(::1) failed");
+    }
+    let _ = tx.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"one",
+        flags: 0,
+        addr: Some(addr),
+    });
+    let mut out = [0u8; 8];
+    let got = rx.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    });
+    let waker = inet6_counting_waker();
+    let armed = rx.arm_readiness_exclusive(
+        0x6603,
+        narf_filesystem::POLL_IN | narf_filesystem::POLL_ERR | narf_filesystem::POLL_HUP,
+        &waker,
+    );
+    rx.disarm_readiness(0x6603);
+    rx.unregister();
+    tx.unregister();
+    if !matches!(got, crate::socket::SocketOpResult::Received { n: 3, .. }) {
+        return TestResult::Fail("recv did not return the datagram");
+    }
+    if !matches!(armed, Some(core::task::Poll::Pending)) {
+        return TestResult::Fail("a drained datagram socket still arms as readable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket/wake",
+    smoke_socket_dgram_recv_clears_readable_when_drained
+);
+
 fn make_sockaddr_in6(ip: [u8; 16], port: u16, scope_id: u32) -> crate::socket::SockAddr {
     let mut body = alloc::vec::Vec::with_capacity(26);
     body.extend_from_slice(&port.to_be_bytes());

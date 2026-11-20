@@ -4671,7 +4671,9 @@ impl FileOps for SocketFile {
             SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 D::Wired(*tcb_id)
             }
-            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
+            SocketState::UnixDgram { .. }
+            | SocketState::InetDgram { .. }
+            | SocketState::Inet6Dgram { .. } => D::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
             | SocketState::Inet6Listener { .. } => D::Listener,
@@ -4808,7 +4810,12 @@ impl SocketFile {
             SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 Arm::Wired(*tcb_id)
             }
-            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
+            // `udp_poll`/`datagram_poll` use the socket's own wait queue for
+            // every family: an IPv6 datagram socket must arm the same cell its
+            // receive path (`enqueue6`, `deliver_wire`) sets and notifies.
+            SocketState::UnixDgram { .. }
+            | SocketState::InetDgram { .. }
+            | SocketState::Inet6Dgram { .. } => Arm::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
             | SocketState::Inet6Listener { .. } => Arm::Listener,
@@ -4885,9 +4892,17 @@ impl SocketFile {
             // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
             // inbox is non-empty.
             Arm::Dgram => {
+                // ERR/HUP ride along: a queued ICMP error is a
+                // `notify(POLL_ERR)` on this cell (`sock_def_error_report`),
+                // and epoll always waits for them (`epds.events |=
+                // EPOLLERR | EPOLLHUP`).
                 let ready = arm_one(
                     &self.dgram_readiness,
-                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                    interest
+                        & (narf_filesystem::POLL_IN
+                            | narf_filesystem::POLL_OUT
+                            | narf_filesystem::POLL_ERR
+                            | narf_filesystem::POLL_HUP),
                 );
                 if ready != 0 {
                     if let Some(id) = one_shot_id {
@@ -4935,7 +4950,11 @@ impl SocketFile {
             // enqueue `notify`s POLL_IN so a same-level refill is still an epoll
             // ready-list edge.
             Arm::Netlink(readable) => {
-                let interested = interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT);
+                let interested = interest
+                    & (narf_filesystem::POLL_IN
+                        | narf_filesystem::POLL_OUT
+                        | narf_filesystem::POLL_ERR
+                        | narf_filesystem::POLL_HUP);
                 let armed = arm_one(&self.netlink_readiness, interested);
                 self.netlink_readiness.set(
                     if readable {
@@ -10490,6 +10509,13 @@ impl SocketFile {
         }
         *state = wired;
         self.inet_connecting.store(true, Ordering::Release);
+        drop(state);
+        // Record the connecting task as the TCB's owner, as listen and accept
+        // already do. Without an owner every segment of an actively opened
+        // connection fell through `wake_io_waiters` to the wake-ALL fallback,
+        // re-running every parked non-durable poller in the system; with one,
+        // the stack's notify reaches this socket's cell and its owner only.
+        crate::handlers::set_tcb_owner(tcb_id, crate::handlers::current_task_id());
         SocketOpResult::Err(SockError::InProgress)
     }
 
@@ -11189,6 +11215,13 @@ impl SocketFile {
                             },
                         );
                     } else if let Some(pkt) = inbox.pop_front() {
+                        // The queue just emptied: drop POLL_IN under the same
+                        // state lock the sender raises it under, so a blocking
+                        // receiver that arms next parks instead of reading a
+                        // stale "readable" and re-executing into EAGAIN.
+                        if inbox.is_empty() {
+                            self.dgram_readiness.set(0, narf_filesystem::POLL_IN);
+                        }
                         // Stash this record's ancillary data against the
                         // RECEIVING TASK so a concurrent receiver's dequeue
                         // cannot overwrite it (see `dgram_recv_ancillary`).
