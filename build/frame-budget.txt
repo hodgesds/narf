@@ -16,7 +16,7 @@
 23176 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
 21960 narf_drivers_wireless::ath11k::pci::probe
 21720 narf_drivers_wireless_ath10k::ath10k::pci::probe
-21464 narf_drivers_wireless::cyw43439::interface::attach_runtime::{{closure}}
+21464 narf_drivers_wireless_brcm::cyw43439::interface::attach_runtime::{{closure}}
 21368 narf_drivers_wireless_ath10k::ath10k::pci::queue_recovery::{{closure}}
 21240 narf_drivers_wireless_ath10k::ath10k::pci::restart_parked
 21192 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::station::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::Owner>::station_join::{{closure}}
@@ -52,7 +52,7 @@
 9160 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::search_config
 9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
-8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
+8904 narf_drivers_wireless_brcm::brcmfmac::native_runtime::provision_using::{{closure}}
 8808 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
 8664 narf_drivers_wireless_iwlwifi::iwlwifi::device::ap::<impl narf_drivers_wireless_iwlwifi::iwlwifi::device::Device>::ap_control::{{closure}}

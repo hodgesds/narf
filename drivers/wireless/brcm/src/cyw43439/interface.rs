@@ -99,7 +99,9 @@ impl<R: Fullmac> State<R> {
     }
     fn drop_frame(&self, frame: &Frame) {
         self.telemetry
-            .dropped(crate::ath11k::tx_hdr::classify8021d(frame.payload()));
+            .dropped(narf_drivers_wireless_ath_core::eth::classify8021d(
+                frame.payload(),
+            ));
     }
 
     /// One synchronous progress step, shared by the timer and kernel
@@ -133,7 +135,7 @@ impl<R: Fullmac> State<R> {
             return Ok(());
         };
         // Linux brcmf_netdev_start_xmit: cfg80211_classify8021d.
-        let priority = crate::ath11k::tx_hdr::classify8021d(pending.frame.payload());
+        let priority = narf_drivers_wireless_ath_core::eth::classify8021d(pending.frame.payload());
         let length = pending.frame.payload().len();
         let result = if pending.deadline.expired() {
             Err(Error::Timeout)
@@ -763,7 +765,7 @@ impl<R: Fullmac + 'static> Device<R> {
                 break;
             }
             self.telemetry.received(
-                crate::ath11k::tx_hdr::classify8021d(&frame.bytes),
+                narf_drivers_wireless_ath_core::eth::classify8021d(&frame.bytes),
                 frame.bytes.len(),
             );
             // No state/publication/ring guard survives the final admission.

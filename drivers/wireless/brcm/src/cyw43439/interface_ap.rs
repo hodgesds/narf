@@ -178,7 +178,7 @@ impl<R: Fullmac> State<R> {
         match ap.begin_data(&mut self.station, pending.frame.payload(), original) {
             Ok(_ticket) => {
                 self.telemetry.transmitted(
-                    crate::ath11k::tx_hdr::classify8021d(pending.frame.payload()),
+                    narf_drivers_wireless_ath_core::eth::classify8021d(pending.frame.payload()),
                     pending.frame.payload().len(),
                 );
                 self.pending = None;
@@ -799,7 +799,7 @@ impl<R: Fullmac + 'static> Device<R> {
                     if self.ap_final(&original) {
                         let _ = original.publish(|| {
                             self.telemetry.received(
-                                crate::ath11k::tx_hdr::classify8021d(&bytes),
+                                narf_drivers_wireless_ath_core::eth::classify8021d(&bytes),
                                 bytes.len(),
                             );
                             narf_net::iface::on_rx_frame_from(&self.name, &mut bytes);

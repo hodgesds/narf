@@ -16,8 +16,15 @@ pub mod ath9k;
 // `ath10k` so existing `crate::ath10k::{hw,register,…}` references keep
 // resolving.
 pub use narf_drivers_wireless_ath10k::ath10k;
-pub mod brcmfmac;
-pub mod cyw43439;
+// Broadcom/Infineon FullMAC Wi-Fi family. Promoted out of the former
+// `src/{brcmfmac,cyw43439}/` modules into the standalone dual-build family
+// crate `narf-drivers-wireless-brcm` (see drivers/wireless/brcm/). The two
+// drivers are a bidirectionally-coupled Broadcom FullMAC pair, so they share a
+// crate; their inner modules are re-exported here as `brcmfmac`/`cyw43439` so
+// existing `crate::brcmfmac::{…}` / `crate::cyw43439::{…}` references (each
+// other, e2e_tests, firmware_asset_tests) and the `brcmfmac::register()` /
+// `cyw43439::register()` initcalls keep resolving.
+pub use narf_drivers_wireless_brcm::{brcmfmac, cyw43439};
 // Shared Atheros/Qualcomm code promoted to `narf-drivers-wireless-ath-core`.
 // Re-exported at the crate root so the still-inlined ath9k/ath10k/ath11k
 // drivers' `crate::qualcomm_pci` / `crate::qualcomm_regulatory` references

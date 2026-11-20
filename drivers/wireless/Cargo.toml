@@ -59,6 +59,9 @@ narf-drivers-wireless-core = { path = "core" }
 narf-drivers-wireless-ath-core = { path = "ath-core" }
 # Qualcomm Atheros ath10k (promoted from the former src/ath10k/).
 narf-drivers-wireless-ath10k = { path = "ath10k", default-features = false, features = ["builtin"] }
+# Broadcom/Infineon FullMAC family (promoted from the former
+# src/{brcmfmac,cyw43439}/): brcmfmac PCIe + CYW43439 SDIO in one family crate.
+narf-drivers-wireless-brcm = { path = "brcm", default-features = false, features = ["builtin"] }
 # Shared Realtek USB transport primitives (Io/ControlIo/UsbIo/UsbControl +
 # RTL8XXXU_USB_IDS), used by the inlined rtl8xxxu driver and the rtw family crate.
 narf-drivers-wireless-rtl-usb = { path = "rtl-usb" }
@@ -66,7 +69,7 @@ async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath10k/kernel-test"]
+kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-brcm/kernel-test"]
 
 [lints]
 workspace = true

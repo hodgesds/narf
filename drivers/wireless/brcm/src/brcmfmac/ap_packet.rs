@@ -104,9 +104,11 @@ impl Session {
             return Err(Error::Busy);
         }
         original.current().map_err(|_| Error::Authority)?;
-        station
-            .runtime
-            .ap_send(bytes, crate::ath11k::tx_hdr::classify8021d(bytes), original)
+        station.runtime.ap_send(
+            bytes,
+            narf_drivers_wireless_ath_core::eth::classify8021d(bytes),
+            original,
+        )
     }
 
     pub(crate) async fn control<R: Fullmac>(

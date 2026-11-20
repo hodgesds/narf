@@ -1010,7 +1010,7 @@ fn vif_transmit<R: Fullmac>(runtime: &mut R, shell: &VifDevice, ifidx: u8) {
             return;
         };
         // brcmf_netdev_start_xmit: cfg80211_classify8021d.
-        let priority = crate::ath11k::tx_hdr::classify8021d(frame.payload());
+        let priority = narf_drivers_wireless_ath_core::eth::classify8021d(frame.payload());
         match runtime.send_vif_data(ifidx, frame.payload(), priority) {
             Err(Error::Busy) => return,
             _ => *pending = None,
