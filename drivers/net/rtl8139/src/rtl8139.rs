@@ -98,6 +98,26 @@ pub enum Rtl8139Error {
     Other(&'static str),
 }
 
+/// Whether a TX status word marks its descriptor free for the host
+/// to post into (issue #2251).
+///
+/// Guide/QEMU semantics (RTL8139 Programming Guide §1; QEMU
+/// hw/net/rtl8139.c): OWN (bit 13) set means the *host* owns the
+/// descriptor — the chip sets it when TX DMA completes, and reset
+/// leaves TSD = 0x2000 (`TxHostOwns`) on all four descriptors. TOK
+/// (bit 15) set means the previous frame transmitted OK, which is
+/// also free. The only busy state is OWN clear *and* TOK clear:
+/// the chip owns the descriptor and has not finished with it. In
+/// particular TSD = 0 — what a zero-filled fake MMIO reads — is
+/// busy, not free.
+///
+/// NOTE for the #796 watchdog lane: OWN=1 + TOK=0 is also the
+/// never-posted idle state, so a watchdog reap signal must be TOK
+/// set, not OWN alone.
+fn tx_slot_free(tsd: u32) -> bool {
+    tsd & TSD_OWN != 0 || tsd & TSD_TOK != 0
+}
+
 pub struct Rtl8139 {
     mmio: MmioRegion,
     mac: [u8; 6],
@@ -286,17 +306,23 @@ impl Rtl8139 {
         }
         let mut idx_lock = self.tx_index.lock();
         let idx = *idx_lock;
-        // Wait for this slot to be free (OWN cleared by chip after
-        // the previous transmission). responsive_spin_until ticks
-        // sleep_pumps. After power-on TSD reads 0, which counts as
-        // OWN=0 + never-transmitted; in steady state we see
-        // OWN-clear after the prior TX completes. 250 ms wall-clock
-        // budget covers a worst-case retried TX at the slowest link.
+        // Wait for this slot to be free. Per the Programming Guide
+        // §1 and QEMU's rtl8139 model, OWN=1 means the *host* owns
+        // the descriptor: the chip sets OWN when TX DMA completes,
+        // and reset leaves every TSD at 0x2000 (TxHostOwns), so a
+        // fresh slot is free immediately. Writing the TSD clears
+        // OWN — the chip claims the slot — and sets TOK once the
+        // frame is on the wire. responsive_spin_until ticks
+        // sleep_pumps. 250 ms wall-clock budget covers a worst-case
+        // retried TX at the slowest link. (Issue #2251: the old
+        // predicate had this backwards, polling `OWN == 0`, so
+        // tx() timed out as TxBusy on every slot after reset and
+        // the doorbell write below was unreachable.)
         let free = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let tsd = unsafe { self.mmio.read32(REG_TSD0 + (idx as u64) * 4) };
-                tsd & TSD_OWN == 0 || (tsd & TSD_TOK) != 0
+                tx_slot_free(tsd)
             },
             narf_time::Deadline::after_ms(250),
         );
@@ -683,4 +709,50 @@ pub fn register_pci_driver() {
         },
         probe,
     });
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+mod tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{tx_slot_free, TSD_OWN, TSD_TOK};
+
+    /// TX free-slot predicate (issue #2251). The fixture models the
+    /// TSD values real silicon / QEMU produce, not a zero-filled
+    /// fake: reset leaves TSD = 0x2000 (OWN set, TOK clear), a
+    /// completed TX leaves TOK|OWN, and an in-flight descriptor
+    /// reads its size with neither bit set. A zero-filled fake
+    /// (TSD = 0) is busy — the old inverted predicate treated it as
+    /// free, which is why the inversion survived coverage that
+    /// only ever saw zeroed registers.
+    fn smoke_rtl8139_tx_slot_free_reset_and_post_tx() -> TestResult {
+        // Reset: TxHostOwns on every descriptor — free at once.
+        if !tx_slot_free(TSD_OWN) {
+            return TestResult::Fail("reset TSD (OWN set) not free");
+        }
+        // Post-TX: TOK|OWN — free for the next frame.
+        if !tx_slot_free(TSD_TOK | TSD_OWN) {
+            return TestResult::Fail("post-TX TSD (TOK|OWN) not free");
+        }
+        // TOK alone is also a completed TX.
+        if !tx_slot_free(TSD_TOK) {
+            return TestResult::Fail("TOK-only TSD not free");
+        }
+        // In-flight: chip owns the descriptor (size latched, no
+        // status bits) — busy.
+        if tx_slot_free(64) {
+            return TestResult::Fail("in-flight TSD (size only) reported free");
+        }
+        // Zero-filled fake MMIO: OWN clear and TOK clear — busy,
+        // not free (the old predicate returned free here).
+        if tx_slot_free(0) {
+            return TestResult::Fail("zero TSD reported free");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/rtl8139",
+        smoke_rtl8139_tx_slot_free_reset_and_post_tx
+    );
 }
