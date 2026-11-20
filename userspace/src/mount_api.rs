@@ -1390,7 +1390,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     // open_tree lookup. systemd first opens the mount covering `/run`, then
     // addresses `run` relative to that detached mount root.
     if !raw_path.starts_with('/') {
-        if let Some(base_mount) =
+        if let Some(mut base_mount) =
             mount_of(task, a.arg0 as u32).and_then(|mid| with_mounts(|m| m.get(&mid).cloned()))
         {
             let mut dir = base_mount.fs.root();
@@ -1414,6 +1414,9 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             // The fd names the looked-up directory, as Linux's
             // `dentry_open(&path, O_PATH)` does.
             let root = dir_identity(&dir);
+            if a.arg2 & OPEN_TREE_CLONE != 0 && a.arg2 & AT_RECURSIVE == 0 {
+                base_mount.descendants.clear();
+            }
             let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             with_mounts(|m| m.insert(mid, base_mount));
             match install_fd(
@@ -1486,7 +1489,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     // `clone_mnt`: the copy keeps the source mount's `mnt_devname`.
     let devname = current_mount_devname_at(&path);
     let mount = match if a.arg2 & OPEN_TREE_CLONE != 0 {
-        current_clone_mount_subtree(&path)
+        current_clone_mount_subtree(&path, a.arg2 & AT_RECURSIVE != 0)
             .map(|(fs, descendants)| MountObject {
                 fs,
                 descendants,

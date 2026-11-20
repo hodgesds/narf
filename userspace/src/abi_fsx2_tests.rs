@@ -2217,10 +2217,13 @@ fn smoke_abi_fsx2_cross_dir_rename_errno() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_cross_dir_rename_errno);
 
-fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
+fn smoke_abi_fsx2_open_tree_clone_recursion() -> TestResult {
     with_setup(|| {
+        const AT_FDCWD: u64 = (-100i64) as u64;
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const OPEN_TREE_CLONE: u64 = 1;
+        const AT_RECURSIVE: u64 = 0x8000;
+        const AT_EMPTY_PATH: u64 = 0x1000;
         let result = (|| {
             if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
                 return Err("private mount namespace setup failed");
@@ -2242,40 +2245,50 @@ fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
                 return Err("detached-tree mount setup failed");
             }
 
-            let source = b"/abi-tree-source\0";
-            let mfd = match call(
-                Syscall::OpenTree.raw(),
-                a2((-100i64) as u64, source.as_ptr() as u64, OPEN_TREE_CLONE),
-            ) {
-                Some(fd) if fd >= 0 => fd as u64,
-                _ => return Err("open_tree(CLONE) failed"),
+            let clone = |dfd, path: &core::ffi::CStr, flags| {
+                call(
+                    Syscall::OpenTree.raw(),
+                    a2(dfd, path.as_ptr() as u64, OPEN_TREE_CLONE | flags),
+                )
+                .filter(|fd| *fd >= 0)
+                .map(|fd| fd as u64)
+                .ok_or("open_tree(CLONE) failed")
             };
-            let target = b"/abi-tree-target\0";
-            let attach = SyscallArgs {
-                arg0: mfd,
-                arg1: 0,
-                arg2: (-100i64) as u64,
-                arg3: target.as_ptr() as u64,
-                arg4: MOVE_MOUNT_F_EMPTY_PATH,
-                ..Default::default()
-            };
-            if call(Syscall::MoveMount.raw(), attach) != Some(0) {
-                return Err("move_mount of cloned tree failed");
+            let source = c"/abi-tree-source";
+            let plain = clone(AT_FDCWD, source, 0)?;
+            let recursive = clone(AT_FDCWD, source, AT_RECURSIVE)?;
+            let plain_from_fd = clone(recursive, c"", AT_EMPTY_PATH)?;
+            for (fd, target, expected_fs) in [
+                (plain, c"/abi-plain", "tree-root"),
+                (plain_from_fd, c"/abi-fd", "tree-root"),
+                (recursive, c"/abi-rec", "tree-child"),
+            ] {
+                let attach = SyscallArgs {
+                    arg0: fd,
+                    arg1: c"".as_ptr() as u64,
+                    arg2: AT_FDCWD,
+                    arg3: target.as_ptr() as u64,
+                    arg4: MOVE_MOUNT_F_EMPTY_PATH,
+                    ..Default::default()
+                };
+                if call(Syscall::MoveMount.raw(), attach) != Some(0) {
+                    return Err("move_mount of cloned tree failed");
+                }
+                let child_path = alloc::format!("{}/run/incoming", target.to_str().unwrap());
+                if ns.resolve_absolute(&child_path, |fs, _| fs.name() == expected_fs) != Some(true)
+                {
+                    return Err("only a recursive clone should expose the child mount");
+                }
             }
-            match ns.resolve_absolute("/abi-tree-target/run/incoming", |fs, rel| {
-                rel.is_empty() && fs.name() == "tree-child"
-            }) {
-                Some(true) => Ok(()),
-                _ => Err("move_mount must rebase descendant mounts with the detached root"),
-            }
+            Ok(())
         })();
         crate::handlers::clear_current_mount_namespace_for_test();
         result
     })
 }
 kernel_test_in!(
-    "syscall_abi",
-    smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos
+    "syscall_abi/mount",
+    smoke_abi_fsx2_open_tree_clone_recursion
 );
 
 fn smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos() -> TestResult {

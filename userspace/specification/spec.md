@@ -352,6 +352,9 @@ configuration calls see EBUSY while construction is in progress. Both mount
 APIs attach instances through the caller's mount namespace and report shared
 construction errors (including ENOENT for a missing registered block source).
 Bind, move, remount and propagation operate on existing mount objects.
+`open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
+includes its child mounts. A plain bind of the installed root therefore exposes
+the on-disk directory beneath a mounted `/run`.
 
 The Linux ABI installation registers the linked FAT aliases, ext2/3/4,
 btrfs, SquashFS, exFAT, MINIX, ISO9660 and UDF constructors. Filesystem-owned

@@ -4579,13 +4579,19 @@ type DetachedMountSubtree = (
     )>,
 );
 
-pub(crate) fn current_clone_mount_subtree(path: &str) -> Option<DetachedMountSubtree> {
+pub(crate) fn current_clone_mount_subtree(
+    path: &str,
+    recursive: bool,
+) -> Option<DetachedMountSubtree> {
     let base = if path == "/" {
         "/"
     } else {
         path.trim_end_matches('/')
     };
     let root = current_clone_tree_at(base)?;
+    if !recursive {
+        return Some((root, alloc::vec::Vec::new()));
+    }
     let paths = current_mount_namespace()
         .map(|ns| ns.list())
         .unwrap_or_else(|| narf_filesystem::registry().list());
