@@ -305,6 +305,48 @@ slowest, so recording `now + latest` as the armed time never treats a still
 counting device as expired. Pure 32.32 fixed point with 128-bit products;
 host-tested.
 
+### 3.10 Kernel CPU statistics (`kstat`)
+
+Linux `kernel_stat.h` softirq counters and `rq->nr_iowait`, kept here because
+their producers (time, rcu, block) sit below the scheduler.
+
+```rust
+pub const NR_SOFTIRQS: usize = 10;
+pub mod vector { HI, TIMER, NET_TX, NET_RX, BLOCK, IRQ_POLL, TASKLET, SCHED, HRTIMER, RCU }
+pub const SOFTIRQ_NAMES: [&str; NR_SOFTIRQS];
+pub fn softirq_enter(vec: usize) -> SoftirqGuard;   // count + softirq CPU time until drop
+pub fn note_softirq(vec: usize);                    // count only
+pub fn softirq_count(cpu: usize, vec: usize) -> u64;
+pub fn set_softirq_time_hooks(enter: fn() -> usize, exit: fn(usize)); // scheduler
+pub struct IoWait;  // block() on the waiting CPU, wake()/drop on any CPU
+pub struct IoWaitFuture<F>; // Pending polls are I/O wait
+pub fn nr_iowait(cpu: usize) -> u64;
+pub fn nr_iowait_total() -> u64;                    // /proc/stat procs_blocked
+```
+
+Vector mapping: `TIMER` = timer-wheel expiry, `HRTIMER` = soft hrtimer expiry,
+`NET_RX` = a `WorkKind::SoftIrq` task poll, `SCHED` = a policy-requested
+migration, `RCU` = an RCU callback batch; `HI`, `NET_TX`, `BLOCK`, `IRQ_POLL`
+and `TASKLET` have no NARF equivalent and stay 0. A vector counts once per
+handler execution that had work. `SoftirqGuard` is `!Send`; the hooks mask
+interrupts themselves and neither allocates nor takes a lock. A task counts in
+`nr_iowait` of the CPU it blocked on until its wait completes (`SyncSubmit` /
+`SyncFlush` waits on a queued block request are I/O wait).
+
+### 3.11 CPU-time arithmetic (`cputime`)
+
+Pure, host-tested helpers behind `scheduler/` §3.4.1 and the `/proc` and
+syscall reporting:
+
+```rust
+pub const USER_HZ: u64 = 100;
+pub const fn ns_to_clock_t(ns: u64) -> u64;          // nsec_to_clock_t, truncating
+pub const fn clock_t_to_ns(ticks: u64) -> u64;
+pub const fn exclusive_span(now: u64, stamp: u64, irq_now: u64, irq_stamp: u64) -> u64;
+pub fn cputime_adjust(stime: u64, utime: u64, rtime: u64,
+    prev: &mut (u64, u64)) -> (u64, u64);            // Linux cputime_adjust
+```
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a
