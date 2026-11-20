@@ -2630,10 +2630,16 @@ fn publish_installed() -> bool {
     let Some(ctrl) = probed_sdhci() else {
         return false;
     };
-    if let Some(emmc) = ctrl.emmc.lock().as_ref().copied() {
+    // Copy both out in their own statements: an `if let` scrutinee's
+    // guard lives to the end of the whole if/else chain, so matching on
+    // `ctrl.card.lock()` held the card lock across `publish_card`, whose
+    // partition scan reads through `read_blocks` and takes it again.
+    let emmc = ctrl.emmc.lock().as_ref().copied();
+    let card = ctrl.card.lock().as_ref().copied();
+    if let Some(emmc) = emmc {
         emmc::publish_emmc(&emmc);
         true
-    } else if let Some(card) = ctrl.card.lock().as_ref().copied() {
+    } else if let Some(card) = card {
         publish_card(card.capacity_blocks);
         false
     } else {
