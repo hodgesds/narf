@@ -63,11 +63,12 @@ pub mod regs {
     /// First of the six DevID registers (`SCP_DEVID_0..=SCP_DEVID_5`).
     pub const SCP_DEVID_0: u32 = 0x0050;
 
-    /// Base of data port `port`'s register block (DP0 included: its block
-    /// carries the bulk-register-access registers). Blocks are 0x100
-    /// apart, DP0 at 0x0100, DPn at `0x0100 + 0x100 * n`.
+    /// Base of data port `port`'s register block (DP0 included). Blocks
+    /// are 0x100 apart with DPn at `0x100 * n`, as in Linux
+    /// `SDW_DPN_BLOCKCTRL1(n) = 0x3 + SDW_DPN_SIZE * (n)`; DP0's
+    /// registers (`SDW_DP0_PORTCTRL` 0x2, ...) share 0x00-0xFF with SCP.
     pub const fn dpn_base(port: u8) -> u32 {
-        0x0100 + 0x100 * (port as u32)
+        0x100 * (port as u32)
     }
     /// Within-block offset of DPn interrupt status.
     pub const DPN_INT: u32 = 0x00;
@@ -1506,13 +1507,13 @@ mod tests {
         }
         let log = card.bus.lock().transport().log();
         // Each prepare writes BLOCKCTRL1 on its port's block: DP3
-        // (0x0403), DP4 (0x0503), DP2 (0x0303), in open order.
+        // (0x0303), DP4 (0x0403), DP2 (0x0203), in open order.
         let blockctrl: Vec<u32> = log
             .iter()
             .filter(|xfer| xfer.write == Some(15))
             .map(|xfer| xfer.addr)
             .collect();
-        if blockctrl != [0x0403, 0x0503, 0x0303] {
+        if blockctrl != [0x0303, 0x0403, 0x0203] {
             return TestResult::Fail("RT711 port routing mismatch");
         }
         drop(playback);
