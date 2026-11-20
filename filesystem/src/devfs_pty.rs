@@ -626,18 +626,24 @@ pub struct Pty {
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
     pub(crate) slave_tx_to_master: ByteRing<65536>,
 
-    /// Durable readiness for the MASTER endpoint (readable ⇔ `slave_tx_to_master`
-    /// has deliverable bytes). Set after every queue/state mutation so a parked
-    /// master poll/epoll/read (a terminal emulator's event loop) wakes on the
-    /// exact edge. Before this the PTY exposed no cell, so a blocked peer only
-    /// re-checked when unrelated activity nudged the global readiness generation.
-    pub(crate) master_readiness: narf_lib::readiness::Readiness,
+    /// The MASTER endpoint's wait queue (Linux: the master tty's `read_wait` and
+    /// `write_wait`). A master poller, epoll item or blocking read registers
+    /// here and THEN computes [`Self::master_poll_mask`]; every mutation that can
+    /// change that mask wakes the queue afterwards ([`Self::sync_master_readiness`]).
+    ///
+    /// There is deliberately no cached level. A cell holding one had to be
+    /// reconciled by computing the mask under the data locks and publishing it
+    /// under the cell lock; two reconcilers on different CPUs could publish in
+    /// the opposite order, so a stale "not readable" overwrote a fresh
+    /// "readable" (the waiter then armed against it and slept with the byte
+    /// queued), or a stale "readable" swallowed the next rising edge.
+    pub(crate) master_wait: narf_lib::readiness::WaitQueue,
 
-    /// Durable readiness for the SLAVE endpoint (readable ⇔ `input` has a
-    /// completed line / raw bytes / latched EOF). The missing wake here is why a
-    /// shell under konsole never saw a typed line until something else nudged the
-    /// generation — pressing Enter appeared to do nothing.
-    pub(crate) slave_readiness: narf_lib::readiness::Readiness,
+    /// The SLAVE endpoint's wait queue (the slave tty's `read_wait` and
+    /// `write_wait`), with the same register-then-compute contract over
+    /// [`Self::slave_poll_mask`]. This is what a shell's blocked `read` or
+    /// `poll` sleeps on until Enter completes its line.
+    pub(crate) slave_wait: narf_lib::readiness::WaitQueue,
 
     /// Non-canonical read timing (VMIN/VTIME). Linux keeps the equivalent
     /// on the stack of `n_tty_read`, which blocks; NARF's reads are
@@ -835,7 +841,10 @@ impl Pty {
         {
             mask |= crate::POLL_OUT;
         }
-        if self.input.lock().readable() > 0 {
+        // `input_available_p`: a completed line, raw bytes, or a pending `^D`
+        // EOF (a zero-length canonical line, which a read returns as 0). The
+        // EOF counts: a `^D` on an empty line must wake the parked reader.
+        if !self.input.lock().would_block() {
             mask |= crate::POLL_IN;
         }
         if self.master_closed.load(Ordering::Acquire) {
@@ -855,29 +864,30 @@ impl Pty {
         self.sync_slave_readiness();
     }
 
-    /// Every readiness bit the two PTY endpoints ever assert — the clear-mask
-    /// complement so [`narf_lib::readiness::Readiness::set`] tracks the current
-    /// level exactly and fires waiters on the rising edge.
-    const PTY_READY_BITS: u32 =
-        crate::POLL_IN | crate::POLL_OUT | crate::POLL_ERR | crate::POLL_HUP | crate::POLL_PRI;
-
-    /// Reconcile the master cell to the current level and wake any master
-    /// poll/epoll/read waiter whose interest just went ready. Call after any
-    /// mutation that can change what the master can read (a slave write, the
-    /// line discipline's echo of a master write, a slave close). Must be called
+    /// Wake every master waiter whose interest the master's current readiness
+    /// satisfies (`wake_up_interruptible_poll(&tty->read_wait, ..)`). Call after
+    /// any mutation that can change what the master can read or write (a slave
+    /// write, the line discipline's echo of a master write, a slave close),
     /// with the input lock released.
+    ///
+    /// The mask is computed after the mutation and only selects which waiters
+    /// to wake; nothing is cached. A waiter registers before it computes, so a
+    /// mutation it did not see is followed by this wake, which finds it.
     pub(crate) fn sync_master_readiness(&self) {
         let m = self.master_poll_mask();
-        self.master_readiness.set(m, Self::PTY_READY_BITS & !m);
+        self.master_wait.wake(m);
     }
 
-    /// Reconcile the slave cell and wake a parked slave reader/poller (the
-    /// shell) when a completed line, raw byte, EOF or hangup arrives. Call after
-    /// a master write feeds the line discipline, a slave read drains input, or
-    /// the master closes. Must be called with the input lock released.
+    /// Wake every slave waiter (the shell's blocked read or poll) whose
+    /// interest the slave's current readiness satisfies: a completed line, raw
+    /// byte, EOF or hangup arrived, or output room freed. Call after a master
+    /// write feeds the line discipline, a slave read drains input, a master
+    /// read frees output room, or the master closes, with the input lock
+    /// released. Same no-cached-level contract as
+    /// [`Self::sync_master_readiness`].
     pub(crate) fn sync_slave_readiness(&self) {
         let m = self.slave_poll_mask();
-        self.slave_readiness.set(m, Self::PTY_READY_BITS & !m);
+        self.slave_wait.wake(m);
     }
 
     /// Decide whether a non-canonical read may return, per the VMIN/VTIME
@@ -1070,6 +1080,46 @@ impl Pty {
         let updated = *cur;
         drop(cur);
         self.note_termios_change(&previous, &updated);
+        self.ldisc_set_termios(&previous, &updated);
+    }
+
+    /// `n_tty_set_termios`: replan the line discipline's buffered input for
+    /// the new modes, then wake both ends, since the change can make the tty
+    /// ready for I/O.
+    ///
+    /// On an ICANON or EXTPROC change Linux resets the line start to the read
+    /// tail. Leaving canonical mode makes EVERYTHING buffered readable,
+    /// including a partially edited line (`canon_head = read_tail`): a shell
+    /// that types ahead while a command runs cooked, then switches back to raw
+    /// for its own line editor, must read those bytes. Without this they sat in
+    /// the cooked line buffer, invisible to the raw reader, and surfaced later
+    /// behind newer input or glued onto the next cooked line. Entering
+    /// canonical mode with raw bytes queued pushes them as one readable chunk
+    /// (`push = 1`), which NARF's `ready` queue already models.
+    fn ldisc_set_termios(&self, old: &Termios, new: &Termios) {
+        let mode_changed = old.icanon() != new.icanon() || old.extproc() != new.extproc();
+        if mode_changed {
+            let mut st = self.input.lock();
+            if !new.icanon() && !st.line.is_empty() {
+                let line = core::mem::take(&mut st.line);
+                st.ready.extend(line);
+            }
+            st.lnext = false;
+            st.erasing = false;
+        }
+        // `n_tty_set_termios`: "If we turn off IXON, we must start the tty"
+        // (`if (!I_IXON(tty) && old && (old->c_iflag & IXON) && !tty->flow.tco_stopped)
+        // start_tty(tty)`). Otherwise output stopped by a ^S stays stopped for
+        // good, since ^Q is no longer recognised.
+        if old.ixon() && !new.ixon() {
+            let was_stopped = core::mem::replace(&mut self.input.lock().stopped, false);
+            if was_stopped {
+                self.note_flow_change(false);
+            }
+        }
+        // `wake_up_interruptible(&tty->write_wait)` and `read_wait`.
+        self.sync_slave_readiness();
+        self.sync_master_readiness();
     }
 
     /// `TIOCSTI`: push one byte back into this tty's input queue.
@@ -1382,8 +1432,8 @@ impl Pty {
                 raw: [0u8; TERMIOS_WIRE_LEN],
             }),
             slave_tx_to_master: ByteRing::new(),
-            master_readiness: narf_lib::readiness::Readiness::new(crate::POLL_OUT),
-            slave_readiness: narf_lib::readiness::Readiness::new(crate::POLL_OUT),
+            master_wait: narf_lib::readiness::WaitQueue::new(),
+            slave_wait: narf_lib::readiness::WaitQueue::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
             ctrl: IrqSafeSpinLock::new(PtyControl::default()),
@@ -2735,15 +2785,16 @@ impl FileOps for PtyMaster {
                 // line-discipline knobs take effect.
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.set_termios_locked(raw);
                 // TCSETSF additionally DISCARDS queued input
                 // (`tty_ioctl.c::set_termios` -> `tty_ldisc_flush`), which
                 // is the whole reason `tcsetattr(TCSAFLUSH)` exists: a
                 // program switching to raw mode must not then read the
-                // keystrokes typed while it was still cooked.
+                // keystrokes typed while it was still cooked. Linux flushes
+                // BEFORE applying the new modes.
                 if cmd == TCSETSF {
                     self.pty.flush_input();
                 }
+                self.pty.set_termios_locked(raw);
                 Ok(0)
             }
             TCGETS2 => {
@@ -2755,10 +2806,12 @@ impl FileOps for PtyMaster {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.set_termios_locked(raw);
+                // `set_termios`: TERMIOS_FLUSH discards input BEFORE the new
+                // modes apply, so nothing arriving in between is dropped.
                 if cmd == TCSETSF2 {
                     self.pty.flush_input();
                 }
+                self.pty.set_termios_locked(raw);
                 Ok(0)
             }
             TIOCEXCL => {
@@ -2905,11 +2958,38 @@ impl FileOps for PtyMaster {
         true
     }
 
-    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
-        // Reconcile the lazily-maintained cell for a first observer before it
-        // arms, exactly as the pipe does in `activate_readiness`.
-        self.pty.sync_master_readiness();
-        Some(&self.pty.master_readiness)
+    /// `pty_poll` → `n_tty_poll`: `poll_wait(file, &tty->read_wait, wait)`
+    /// and `write_wait`, then compute the mask. Also what a blocking master
+    /// read parks on.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(
+            self.pty
+                .master_wait
+                .arm(id, interest, waker, || self.pty.master_poll_mask()),
+        )
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(
+            self.pty
+                .master_wait
+                .arm_persistent(id, interest, waker, || self.pty.master_poll_mask()),
+        )
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.pty.master_wait.disarm(id);
+        true
     }
 }
 
@@ -3215,11 +3295,12 @@ impl FileOps for PtySlave {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.set_termios_locked(raw);
-                // TCSETSF discards queued input; TCSETS and TCSETSW do not.
+                // TCSETSF discards queued input (before the new modes apply);
+                // TCSETS and TCSETSW do not.
                 if cmd == TCSETSF {
                     self.pty.flush_input();
                 }
+                self.pty.set_termios_locked(raw);
                 Ok(0)
             }
             TCGETS2 => {
@@ -3231,10 +3312,12 @@ impl FileOps for PtySlave {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.set_termios_locked(raw);
+                // `set_termios`: TERMIOS_FLUSH discards input BEFORE the new
+                // modes apply, so nothing arriving in between is dropped.
                 if cmd == TCSETSF2 {
                     self.pty.flush_input();
                 }
+                self.pty.set_termios_locked(raw);
                 Ok(0)
             }
             TIOCEXCL => {
@@ -3332,9 +3415,36 @@ impl FileOps for PtySlave {
         true
     }
 
-    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
-        self.pty.sync_slave_readiness();
-        Some(&self.pty.slave_readiness)
+    /// `n_tty_poll`: register on the slave's wait queue, then compute.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(
+            self.pty
+                .slave_wait
+                .arm(id, interest, waker, || self.pty.slave_poll_mask()),
+        )
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(
+            self.pty
+                .slave_wait
+                .arm_persistent(id, interest, waker, || self.pty.slave_poll_mask()),
+        )
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.pty.slave_wait.disarm(id);
+        true
     }
 
     /// Job control: the slave's tty id is its pty's system-wide id — the
