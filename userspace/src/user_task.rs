@@ -264,6 +264,18 @@ pub struct UserTaskCtx {
     /// sibling steal the signal from an interruptible sleeper selected by
     /// complete_group_signal. Sigwait and signalfd still read the shared set.
     pub(crate) signal_delivery_notified: AtomicBool,
+    /// Linux `TIF_SIGPENDING` for this thread's private state: set by every
+    /// writer that can make a signal (or stop) actionable here — a bit added
+    /// to its private pending set, an unblockable bit added to its group's
+    /// shared set, a mask that unblocks, a job-control stop — and consumed
+    /// only by the thread's own return to user mode, which swaps it clear
+    /// BEFORE reading the state and re-sets it when deliverable work remains
+    /// (`recalc_sigpending`). Together with `signal_delivery_notified` (the
+    /// shared-set selection) and the global group-stop count it lets an
+    /// ordinary syscall return skip every signal-table lock; a standing
+    /// BLOCKED pending signal anywhere in the system no longer sends every
+    /// task down the locked path. Starts set so the first return checks.
+    pub(crate) sigpending: AtomicBool,
     /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
     /// means this I/O wait is not epoll). After registering the task waker,
     /// the park path passively re-scans this instance before switching out.
@@ -982,6 +994,7 @@ impl UserTaskCtx {
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             signal_delivery_notified: AtomicBool::new(false),
+            sigpending: AtomicBool::new(true),
             epoll_wait_fd: AtomicU64::new(0),
             epoll_wait_node: crate::epoll::EpollWaitNode::new(),
             futex_uaddr: AtomicU64::new(0),

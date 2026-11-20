@@ -552,6 +552,12 @@ pub fn register_signalfd_cell(task: u64, cell: &Arc<narf_lib::readiness::Readine
     SIGNALFD_CELL_ROWS.fetch_add(1, Ordering::Release);
 }
 
+/// Whether any signalfd readiness cell is registered (one atomic load).
+#[inline]
+pub(crate) fn signalfds_armed() -> bool {
+    SIGNALFD_CELL_ROWS.load(Ordering::Acquire) != 0
+}
+
 /// Fire the readiness wait-queue of every signalfd owned by `task` — called from
 /// the signal-raise path. `set`+`notify` POLL_IN so an armed poll/epoll waiter
 /// (including an EPOLLET consumer between non-parking waits) wakes; the fd's

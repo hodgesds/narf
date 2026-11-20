@@ -4513,9 +4513,10 @@ pub fn kernel_syscall_entry_plain_with_state(
         }
     }
     table.dispatch(n, &mut ctx);
-    if let Some(u) = crate::user_task::current_user_task().filter(|_| in_syscall.is_some()) {
-        // SAFETY: as above. Re-read: a park may have moved this continuation
-        // to another CPU, where `current_user_task` is still this task.
+    if let Some(u) = in_syscall {
+        // SAFETY: as above. The context is the task's own (it lives in its
+        // `Task`), so it stays valid and correct even when a park moved this
+        // continuation to another CPU; no per-CPU re-resolution is needed.
         unsafe {
             (*u).in_syscall
                 .store(0, core::sync::atomic::Ordering::Relaxed);
@@ -4617,7 +4618,7 @@ pub fn kernel_syscall_entry_plain_with_state(
         let restart_pending = syscall_frame_is_restart_pending(
             entry_rip,
             ctx.rip(),
-            crate::user_task::current_user_task().is_some_and(|u| {
+            in_syscall.is_some_and(|u| {
                 // SAFETY: the in-flight task's poller-pinned ctx; atomic load.
                 unsafe {
                     (*u).syscall_parked_restarting
@@ -4637,7 +4638,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             // a restart-pending park. In particular, wait4 parks without a RIP
             // rewind; retaining its marker across rt_sigreturn used to add two
             // bytes to the restored PC and enter a handler mid-instruction.
-            if let Some(u) = crate::user_task::current_user_task() {
+            if let Some(u) = in_syscall {
                 // SAFETY: as above; atomic store only.
                 unsafe {
                     (*u).syscall_parked_restarting
