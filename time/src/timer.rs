@@ -936,6 +936,14 @@ pub(crate) fn global_next(cpu: usize) -> u64 {
 /// an idle CPU). Lock-free.
 pub fn next_timer_event_ns_local() -> u64 {
     let cpu = this_cpu();
+    // `tick_nohz_next_event`: with the timer softirq already raised
+    // (`local_timer_softirq_pending`), the next event is one tick out. The
+    // due expiry is the softirq's to run, in task context; reporting it again
+    // would re-arm the clockevent into the past and re-fire it until the
+    // executor gets back to the softirq, which those interrupts starve.
+    if cpu_bases(cpu).is_some_and(|b| b.softirq_raised.load(Ordering::Acquire)) {
+        return jiffies_to_ns(jiffies().saturating_add(1));
+    }
     let idle = !crate::timer_migration::cpu_active(cpu);
     let mut next = base_next(cpu, BASE_LOCAL);
     next = next.min(crate::timer_migration::global_next_for(cpu));
