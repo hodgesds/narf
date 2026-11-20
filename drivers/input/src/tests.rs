@@ -551,7 +551,7 @@ fn smoke_i8042_mouse_explorer_side_extra_buttons() -> TestResult {
     use crate::i8042_mouse;
     use crate::psmouse::PsmouseProtocol;
     use narf_input::{
-        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+        __reset_global_ring_for_test, init_global_ring, pop_pointer, pop_scroll, PointerButtons,
     };
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -571,20 +571,21 @@ fn smoke_i8042_mouse_explorer_side_extra_buttons() -> TestResult {
         PointerButtons::SIDE | PointerButtons::EXTRA,
         PointerButtons::EMPTY,
     ];
-    for (i, w) in want.iter().enumerate() {
-        match pop_global() {
-            Some(InputEvent::Pointer(p)) => {
+    // Typed pops: the global ring is one ring per event class, so
+    // `pop_global` after the first Pointer returns the next Pointer.
+    for w in want.iter() {
+        match pop_pointer() {
+            Some(p) => {
                 if p.buttons != *w {
                     return TestResult::Fail("Explorer side/extra button state wrong");
                 }
             }
-            _ => return TestResult::Fail("missing PointerEvent in Explorer button sequence"),
+            None => return TestResult::Fail("missing PointerEvent in Explorer button sequence"),
         }
-        // Wheel is zero in all three packets: no ScrollEvent follows.
-        if pop_global().is_some() {
-            return TestResult::Fail("wheel-zero Explorer packet leaked a ScrollEvent");
-        }
-        let _ = i;
+    }
+    // Wheel is zero in all three packets: no ScrollEvent at all.
+    if pop_scroll().is_some() {
+        return TestResult::Fail("wheel-zero Explorer packet leaked a ScrollEvent");
     }
     TestResult::Pass
 }
@@ -602,17 +603,18 @@ fn smoke_i8042_mouse_explorer_tilt_hwheel() -> TestResult {
     i8042_mouse::__reset_for_test();
     i8042_mouse::set_protocol_for_test(PsmouseProtocol::ExplorerTilt);
 
-    // 4th byte 0x41: top bits 0x40 = Explorer 4.0 horizontal scroll,
-    // value (0x41 & 32) - (0x41 & 31) = 31 on REL_HWHEEL.
+    // 4th byte 0x61: top bits 0x40 = Explorer 4.0 horizontal scroll,
+    // value (0x61 & 32) - (0x61 & 31) = 32 - 1 = 31 on REL_HWHEEL
+    // (Linux `psmouse_process_byte`: `-sign_extend32(packet[3], 5)`).
     i8042_mouse::feed_byte_for_test(0x08);
     i8042_mouse::feed_byte_for_test(0x00);
     i8042_mouse::feed_byte_for_test(0x00);
-    i8042_mouse::feed_byte_for_test(0x41);
+    i8042_mouse::feed_byte_for_test(0x61);
     let _ = pop_global(); // Pointer half
     match pop_global() {
         Some(InputEvent::Scroll(s)) => {
             if s.dx != 31 || s.dy != 0 {
-                return TestResult::Fail("tilt 0x41 should scroll dx=+31");
+                return TestResult::Fail("tilt 0x61 should scroll dx=+31");
             }
         }
         _ => return TestResult::Fail("no ScrollEvent for tilt packet"),
@@ -6006,9 +6008,10 @@ fn smoke_i8042_pm_resume_redrives_desired_leds() -> TestResult {
     if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
         return TestResult::Fail("exchange must start with exactly [0xED]");
     }
-    if i8042::pm_resume().is_err() {
-        return TestResult::Fail("resume must be Ok");
-    }
+    // `pm_resume` only re-drives when `STATE.initialized`, which
+    // the re-probe fixture clears; run the port-free half of the
+    // initialised path directly.
+    i8042::__pm_resume_leds_for_test();
     // The stale exchange was parked and a fresh one started for
     // the preserved desired bitmap: a second 0xED, still in flight.
     if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED] {
@@ -7995,8 +7998,8 @@ mod alps_smokes {
     use crate::alps::*;
     use crate::i8042_mouse;
     use narf_input::{
-        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent,
-        PointerButtons, TouchState,
+        __reset_global_ring_for_test, abs, init_global_ring, pop_absolute, pop_global, pop_pointer,
+        pop_touch, InputEvent, PointerButtons, TouchState,
     };
 
     /// Fake PS/2 transport: records every sent byte, serves
@@ -8335,7 +8338,12 @@ mod alps_smokes {
         if f.fingers != 2 || f.mt[0].x != 1000 || f.mt[0].y != 800 {
             return TestResult::Fail("rushmore bitmap mt[0]/fingers wrong");
         }
-        if f.mt[1].x != 428 || f.mt[1].y != 980 {
+        // Rushmore bitmaps are 16x12 bits and, unlike Pinnacle, not
+        // Y-flipped (Linux `alps_process_bitmap` flips only
+        // `ALPS_PROTO_V3`/`V4`): corners (466,445) (400,445)
+        // (400,381) (466,381); st (1000,800) is closest to corner 0,
+        // so mt[1] is corner 2.
+        if f.mt[1].x != 400 || f.mt[1].y != 381 {
             return TestResult::Fail("rushmore bitmap mt[1] wrong");
         }
         if f.x_map != 0x18 || f.y_map != 0x18 {
@@ -8651,9 +8659,10 @@ mod alps_smokes {
         if !enter_absolute_mode(&mut t, AlpsVersion::V6) {
             return TestResult::Fail("v6 enable failed");
         }
+        // Nibble 1 is `SETRATE 0x0a` in Linux `alps_v6_nibble_commands`.
         let want: [u8; 23] = [
             0xec, 0xe9, 0xf5, 0xf5, 0xe7, 0xe6, 0xe7, 0xe9, 0xf4, 0xf4, 0xe8, 0x00, 0xf4, 0xf4,
-            0xf4, 0xf4, 0xf3, 0x01, 0xf2, 0xf3, 0x01, 0xf5, 0xec,
+            0xf4, 0xf4, 0xf3, 0x0a, 0xf2, 0xf3, 0x0a, 0xf5, 0xec,
         ];
         if t.sent != want {
             return TestResult::Fail("v6 monitor-mode wire wrong");
@@ -8716,8 +8725,10 @@ mod alps_smokes {
         i8042_mouse::set_alps_protocol(proto, [0x73, 0x00, 0x14]);
         // Touch down: x=1000 y=800 z=50, left.
         feed(&[0xff, 0xe8, 0x20, 0x39, 0x30, 0x32]);
-        match pop_global() {
-            Some(InputEvent::Touch(t)) => {
+        // Typed pops: the global ring is one ring per event class
+        // (`pop_global` drains Pointer before Absolute before Touch).
+        match pop_touch() {
+            Some(t) => {
                 if t.slot != 0 || t.x != 1000 || t.y != 800 || t.pressure != 50 {
                     return TestResult::Fail("ALPS Touch down shape wrong");
                 }
@@ -8725,27 +8736,27 @@ mod alps_smokes {
                     return TestResult::Fail("first touch must be Down");
                 }
             }
-            _ => return TestResult::Fail("no Touch event for ALPS packet"),
+            None => return TestResult::Fail("no Touch event for ALPS packet"),
         }
-        match pop_global() {
-            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 1000 => {}
+        match pop_absolute() {
+            Some(a) if a.axis == abs::ABS_X && a.value == 1000 => {}
             _ => return TestResult::Fail("ABS_X event wrong"),
         }
-        match pop_global() {
-            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 800 => {}
+        match pop_absolute() {
+            Some(a) if a.axis == abs::ABS_Y && a.value == 800 => {}
             _ => return TestResult::Fail("ABS_Y event wrong"),
         }
-        match pop_global() {
-            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_PRESSURE && a.value == 50 => {}
+        match pop_absolute() {
+            Some(a) if a.axis == abs::ABS_PRESSURE && a.value == 50 => {}
             _ => return TestResult::Fail("ABS_PRESSURE event wrong"),
         }
-        match pop_global() {
-            Some(InputEvent::Pointer(p)) => {
+        match pop_pointer() {
+            Some(p) => {
                 if p.dx != 0 || p.dy != 0 || !p.buttons.contains(PointerButtons::LEFT) {
                     return TestResult::Fail("ALPS Pointer button event wrong");
                 }
             }
-            _ => return TestResult::Fail("no Pointer event for ALPS button edge"),
+            None => return TestResult::Fail("no Pointer event for ALPS button edge"),
         }
         if pop_global().is_some() {
             return TestResult::Fail("ALPS down packet emitted extra events");
@@ -8756,13 +8767,13 @@ mod alps_smokes {
         }
         // Lift (z=0): a single Touch Up reusing the last position.
         feed(&[0xff, 0xe8, 0x20, 0x39, 0x30, 0x00]);
-        match pop_global() {
-            Some(InputEvent::Touch(t)) => {
+        match pop_touch() {
+            Some(t) => {
                 if t.state != TouchState::Up || t.x != 1000 || t.y != 800 || t.pressure != 0 {
                     return TestResult::Fail("ALPS Touch up shape wrong");
                 }
             }
-            _ => return TestResult::Fail("no Touch Up for ALPS lift"),
+            None => return TestResult::Fail("no Touch Up for ALPS lift"),
         }
         if pop_global().is_some() {
             return TestResult::Fail("ALPS lift emitted extra events");
@@ -8780,15 +8791,17 @@ mod alps_smokes {
         if pop_global().is_some() {
             return TestResult::Fail("ALPS-active feed must drop standard packets");
         }
-        // …but a real v2 packet still decodes afterwards.
+        // …but a real v2 packet still decodes afterwards. Its byte 3
+        // (0x56) also carries right + middle, so a Pointer edge rides
+        // the Pointer ring, which `pop_global` would drain first.
         feed(&[0xf8, 0x5c, 0x58, 0x56, 0x3c, 0x1e]);
-        match pop_global() {
-            Some(InputEvent::Touch(t)) => {
+        match pop_touch() {
+            Some(t) => {
                 if t.x != 1500 || t.y != 700 {
                     return TestResult::Fail("v2 packet after rejection decoded wrong");
                 }
             }
-            _ => return TestResult::Fail("v2 packet after rejection produced no Touch"),
+            None => return TestResult::Fail("v2 packet after rejection produced no Touch"),
         }
         // Clearing the protocol restores the 3-byte path.
         i8042_mouse::clear_alps_protocol();
@@ -8829,21 +8842,23 @@ mod alps_smokes {
         }
         feed(&[0x56, 0x3c, 0x1e]);
         // Bare PS/2 part first: relative motion, no buttons.
-        match pop_global() {
-            Some(InputEvent::Pointer(p)) => {
+        match pop_pointer() {
+            Some(p) => {
                 if p.dx != 5 || p.dy != -3 || p.buttons != PointerButtons::EMPTY {
                     return TestResult::Fail("interleaved bare motion wrong");
                 }
             }
-            _ => return TestResult::Fail("no Pointer for interleaved bare part"),
+            None => return TestResult::Fail("no Pointer for interleaved bare part"),
         }
-        match pop_global() {
-            Some(InputEvent::Touch(t)) => {
+        // The ALPS part's right + middle edge (byte 6 = 0x56) is the
+        // next Pointer; the Touch rides its own ring.
+        match pop_touch() {
+            Some(t) => {
                 if t.x != 1500 || t.y != 700 || t.state != TouchState::Down {
                     return TestResult::Fail("interleaved touchpad report wrong");
                 }
             }
-            _ => return TestResult::Fail("no Touch for interleaved ALPS part"),
+            None => return TestResult::Fail("no Touch for interleaved ALPS part"),
         }
         if i8042_mouse::take_rel_delta() != (5, -3) {
             return TestResult::Fail("interleaved bare motion must accumulate rel delta");

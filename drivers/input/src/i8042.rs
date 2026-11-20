@@ -509,16 +509,31 @@ pub(crate) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendErro
         if enable_keyboard_channel().is_err() {
             return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
         }
-        // The keyboard reset cleared its LED state; re-drive the
-        // desired bitmap if any LED is lit (the keyboard now
-        // shows all-off regardless of what `inflight` recorded).
-        let desired = LED_TX.lock().desired;
-        if desired != 0 {
-            on_led_state(desired);
-        }
+        redrive_desired_leds();
     }
     crate::i8042_mouse::resume();
     Ok(())
+}
+
+/// The keyboard reset cleared its LED state; re-drive the desired
+/// bitmap if any LED is lit (the keyboard now shows all-off
+/// regardless of what `inflight` recorded). Linux
+/// `atkbd_reconnect` → `atkbd_set_leds`.
+fn redrive_desired_leds() {
+    let desired = LED_TX.lock().desired;
+    if desired != 0 {
+        on_led_state(desired);
+    }
+}
+
+/// Test hook: the port-free half of an initialised `pm_resume`
+/// (decode-state reset + LED re-drive) without the channel
+/// bring-up, so the re-drive is testable whatever
+/// `STATE.initialized` an earlier fixture left behind.
+#[doc(hidden)]
+pub fn __pm_resume_leds_for_test() {
+    resume_decode_state();
+    redrive_desired_leds();
 }
 
 /// Disable both PS/2 channels + drain the output buffer. Best
