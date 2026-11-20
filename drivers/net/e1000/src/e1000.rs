@@ -4527,7 +4527,8 @@ fn e1000_send_frame_zc(
 /// Drain one frame from each live controller's RX ring + dispatch it
 /// through the network stack's RX handler. Returns true iff any ring
 /// advanced (a frame was delivered, or a verdict-dropped frame was
-/// consumed). Called from a kernel-side polling task spawned at boot.
+/// consumed). The stack's busy-wait RX drain (`install_rx_drain`); the
+/// per-port interrupt-driven `e1000_rx_pump` handles receive otherwise.
 /// Every live port is drained (not just the first): with one global
 /// drain step, a second NIC's replies would otherwise stall until its
 /// async pump gets CPU — which never happens while the syscall is

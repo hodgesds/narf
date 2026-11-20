@@ -425,34 +425,12 @@ fn install_net_stack() {
             narf_drivers_virtio::net_pci::primary_num_pairs()
         );
     }
-    // Stackful: the e1000 RX pump's inner `while rx_pump_step()`
-    // could starve the executor on real silicon if the device's
-    // RX descriptor ring stays "ready" indefinitely (e.g.
-    // 0xFFFFFFFF reads on absent-device). Preemption caps it at
-    // a 10 ms slice.
-    //
-    // Idle backoff: the old form `yield_now().await` after every empty
-    // drain self-woke on EVERY executor round, so this task was always
-    // runnable — the cooperative executor never halted (nr_running never
-    // hit 0), pinning the CPU and pacing every round at the spin rate.
-    // With an idle e1000 (off-box redis runs on virtio-net) it spun
-    // forever, adding ~one-round (~230 µs) of latency to every request on
-    // the OTHER NIC. PARK ~1 ms on the wheel after an empty drain so the
-    // executor can halt; tight-poll only while frames are flowing.
-    narf_scheduler::spawn_stackful(async {
-        let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
-        loop {
-            let mut any = false;
-            while narf_drivers_net::e1000::rx_pump_step() {
-                any = true;
-            }
-            if any {
-                narf_scheduler::yield_now().await;
-            } else {
-                narf_time::sleep_cycles(idle_park_cycles).await;
-            }
-        }
-    });
+    // e1000 receive needs no boot-time poller: each probed port runs its own
+    // interrupt-driven pump (`e1000_rx_pump`, NAPI's shape) and installs
+    // `rx_pump_step` as the stack's busy-wait drain, as igb and vmxnet3 do.
+    // A global 1 ms poller here woke the boot CPU 1000 times a second for
+    // the life of the system, e1000 present or not (Linux: no device, no
+    // timer).
 }
 
 // ── /proc/net/* — bridge the net stack into procfs ──────────────
