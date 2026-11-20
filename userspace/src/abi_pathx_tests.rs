@@ -116,10 +116,10 @@ fn smoke_setattr_via_var_run_symlink() -> TestResult {
             .mount(&auth, "/var", MemFs::with_seeds("var", &[]))
             .map_err(|_| "mounting /var failed")?;
         let result = (|| {
-            if call_symlink(b"../run\0".as_ptr() as u64, b"/var/run\0".as_ptr() as u64) != Some(0) {
+            if call_symlink(c"../run".as_ptr() as u64, c"/var/run".as_ptr() as u64) != Some(0) {
                 return Err("creating /var/run symlink failed");
             }
-            let alias = b"/var/run/utmp\0".as_ptr() as u64;
+            let alias = c"/var/run/utmp".as_ptr() as u64;
             if call_chown(alias, u32::MAX as u64, 22) != Some(0)
                 || file_owners("/run/utmp") != Some((0, 22))
             {
@@ -141,11 +141,11 @@ kernel_test_in!("syscall_abi/setattr", smoke_setattr_via_var_run_symlink);
 
 fn smoke_setattr_symlink_dotdot_at_process_root() -> TestResult {
     let result = with_memfs("/jail", "jail", &[("file", b"")], || {
-        if call(Syscall::Chroot.raw(), a0(b"/jail\0".as_ptr() as u64)) != Some(0) {
+        if call(Syscall::Chroot.raw(), a0(c"/jail".as_ptr() as u64)) != Some(0) {
             return Err("chroot failed");
         }
-        let link = b"/link\0".as_ptr() as u64;
-        if call_symlink(b"../file\0".as_ptr() as u64, link) != Some(0) {
+        let link = c"/link".as_ptr() as u64;
+        if call_symlink(c"../file".as_ptr() as u64, link) != Some(0) {
             return Err("creating relative link in the process root failed");
         }
         if call_chmod(link, 0o620) != Some(0) || file_perms("/jail/file") != Some(0o620) {

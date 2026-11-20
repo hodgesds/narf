@@ -2152,7 +2152,7 @@ fn smoke_abi_fsnotify_filter_follows_watch_lifetime() -> TestResult {
             // test), and the instance's last close removes it.
             let dir_wd = match call(
                 Syscall::InotifyAddWatch.raw(),
-                a2(ifd, b"/inofast\0".as_ptr() as u64, IN_MODIFY),
+                a2(ifd, c"/inofast".as_ptr() as u64, IN_MODIFY),
             ) {
                 Some(wd) if wd >= 1 => wd as i32,
                 _ => return Err("directory watch failed"),

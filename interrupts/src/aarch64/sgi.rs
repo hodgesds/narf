@@ -69,9 +69,27 @@ pub fn clear_resched(cpu: u32) {
 
 /// Default RESCHED handler — flips `NEEDS_RESCHED[current_cpu()]`
 /// so the scheduler's next poll knows to look for new work.
+///
+/// Being interrupted is most of the point: the SGI ends the target's WFI,
+/// and its executor drains its wake list at the next round. As on x86_64
+/// (`install_resched_ipi`), the handler also re-programs this CPU's
+/// clockevent when another CPU queued an earlier hrtimer on its base and
+/// kicked it (`retrigger_next_event`, a flag test otherwise).
 fn default_resched_handler() {
     let cpu = narf_lib::percpu::current_cpu();
     NEEDS_RESCHED[cpu].store(true, Ordering::Release);
+    narf_time::hrtimer::retrigger_next_event();
+}
+
+/// Send [`SGI_RESCHED`] to logical CPU `cpu` (Linux `smp_send_reschedule`
+/// → `IPI_RESCHEDULE`). A CPU not yet in the MPIDR map is not online and
+/// is skipped.
+fn send_resched(cpu: u32) {
+    if let Some(aff) = narf_arch::aarch64::cpu::mpidr_aff_of(cpu) {
+        // SAFETY: the hooks below are installed by `install_defaults`, which
+        // runs after this CPU's GIC bring-up (`init_bsp` / `init_ap`).
+        unsafe { send_to_cpu_aff(SGI_RESCHED, aff) };
+    }
 }
 
 /// Default PANIC_HALT handler — masks IRQs + spins in WFI. Used
@@ -99,6 +117,11 @@ fn default_panic_halt_handler() -> ! {
 /// can override via `set_handler` after this runs.
 pub fn install_defaults() {
     set_handler(SGI_RESCHED, default_resched_handler);
+    // The senders: the scheduler's reschedule kick for a halted target, and
+    // the hrtimer's remote kick (`trigger_dyntick_cpu`). Without them a wake
+    // aimed at a halted CPU waited for that CPU's next unrelated interrupt.
+    narf_scheduler::set_resched_ipi_hook(send_resched);
+    narf_time::hrtimer::set_remote_kick(send_resched);
     // PANIC_HALT is `fn() -> !` while SgiHandler is `fn()`; the
     // never-returning fn fits with one extra trampoline.
     fn panic_halt_trampoline() {

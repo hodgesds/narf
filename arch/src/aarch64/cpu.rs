@@ -71,6 +71,14 @@ pub fn mpidr_aff() -> u32 {
     (aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0
 }
 
+/// MPIDR affinity of logical CPU `logical`, as [`set_current_cpu`]
+/// registered it (`cpu_logical_map`); `None` before that CPU is mapped.
+#[inline]
+pub fn mpidr_aff_of(logical: u32) -> Option<u32> {
+    let aff = MPIDR_TABLE.get(logical as usize)?.load(Ordering::Acquire);
+    (aff != u32::MAX).then_some(aff)
+}
+
 /// Register `(mpidr_aff, logical_id)` in the translation table.
 ///
 /// # Safety

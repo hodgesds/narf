@@ -239,7 +239,7 @@ impl Task {
             .filter(|&leader| leader != tid)
             .and_then(task_get)
             .map(|leader| leader.process_cputime.clone())
-            .unwrap_or_else(crate::proc_cpu_time::ProcessCputime::new);
+            .unwrap_or_default();
         process_cputime.join(&cputime);
         #[cfg(feature = "native-ring")]
         let (authority, authority_control) =

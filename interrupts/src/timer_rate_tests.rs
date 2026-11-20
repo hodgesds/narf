@@ -17,18 +17,24 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
+#[cfg(target_arch = "x86_64")]
 use core::fmt::Write as _;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Timer interrupts per second an idle CPU may take.
+#[cfg(target_arch = "x86_64")]
 const PER_CPU_IDLE_MAX: u64 = 250;
 /// Time for the APs to go idle with the tick stopped.
+#[cfg(target_arch = "x86_64")]
 const SETTLE_NS: u64 = 200_000_000;
 /// Sampling window.
+#[cfg(target_arch = "x86_64")]
 const WINDOW_NS: u64 = 3_000_000_000;
 
+#[cfg(target_arch = "x86_64")]
 fn spin_for(ns: u64) {
     let end = narf_time::monotonic_ns() + ns;
     while narf_time::monotonic_ns() < end {
@@ -37,6 +43,7 @@ fn spin_for(ns: u64) {
 }
 
 /// Print `cpu`'s queued hrtimers with their arm sites and tasks.
+#[cfg(target_arch = "x86_64")]
 fn dump_timers(cpu: usize) {
     let mut w = narf_console::Writer;
     let _ = writeln!(w, "  idle-rate: cpu {} queued hrtimers:", cpu);
@@ -69,9 +76,6 @@ fn dump_timers(cpu: usize) {
 fn kick(mask: u64) {
     crate::x86_64::apic::send_fixed_ipi(mask, crate::VECTOR_RESCHED);
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-fn kick(_mask: u64) {}
 
 fn smoke_idle_timer_interrupt_rate_is_linux_like() -> TestResult {
     #[cfg(not(target_arch = "x86_64"))]

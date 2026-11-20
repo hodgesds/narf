@@ -2288,6 +2288,43 @@ fn build_xsdt(table_phys: u64) -> Vec<u8> {
     x
 }
 
+/// A synthetic ACPI table copied into its own frame. The parser reads table
+/// pointers as physical addresses bounded by the mapped window
+/// (`check_table_window`), so a heap pointer, which is virtual, is rejected.
+/// Freed on drop.
+struct TableFrame(narf_memory::frame::PhysFrame);
+
+impl TableFrame {
+    fn new(bytes: &[u8]) -> Option<Self> {
+        let frame = TableFrame(narf_memory::frame::alloc_frame().ok()?);
+        frame.write(bytes);
+        Some(frame)
+    }
+
+    fn write(&self, bytes: &[u8]) {
+        assert!(bytes.len() <= 4096, "synthetic table larger than a frame");
+        // SAFETY: the frame is exclusively owned and reached through the
+        // direct map; the copy is at most one frame long.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.0.start_address().kernel_mut_ptr::<u8>(),
+                bytes.len(),
+            );
+        }
+    }
+
+    fn phys(&self) -> u64 {
+        self.0.start_address().raw()
+    }
+}
+
+impl Drop for TableFrame {
+    fn drop(&mut self) {
+        narf_memory::frame::free_frame(self.0);
+    }
+}
+
 fn build_rsdp(xsdt_phys: u64) -> [u8; 36] {
     let mut r = [0u8; 36];
     r[0..8].copy_from_slice(b"RSD PTR ");
@@ -2313,9 +2350,16 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
     // probe-core fixtures make.)
     let model_addr: u64 = 0xD000_0000;
     let mut table = build_tpm2_table(model_addr, 7);
-    let xsdt = build_xsdt(table.as_ptr() as u64);
-    let rsdp = build_rsdp(xsdt.as_ptr() as u64);
-    let rsdp_phys = narf_memory::PhysAddr::new(rsdp.as_ptr() as u64);
+    let (Some(table_frame), Some(xsdt_frame), Some(rsdp_frame)) = (
+        TableFrame::new(&table),
+        TableFrame::new(&[]),
+        TableFrame::new(&[]),
+    ) else {
+        return TestResult::Fail("no frames for the synthetic ACPI tables");
+    };
+    xsdt_frame.write(&build_xsdt(table_frame.phys()));
+    rsdp_frame.write(&build_rsdp(xsdt_frame.phys()));
+    let rsdp_phys = narf_memory::PhysAddr::new(rsdp_frame.phys());
 
     let cleanup = |msg: &'static str| -> TestResult {
         narf_acpi::__reset_tpm2_for_test();
@@ -2327,10 +2371,9 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
     // through the production parser (the composition the audit
     // found had no fixture: the parser had a body-decode smoke,
     // the chain and its consumer had none).
-    // SAFETY: the chain lives in heap buffers kept alive for the
-    // whole fixture; the parser reads through the phys map, the
-    // same in-process pattern the acpi crate's own synthetic
-    // fixtures use.
+    // SAFETY: the chain lives in frames kept alive for the whole
+    // fixture; the parser reads them through the direct map, as the
+    // acpi crate's own synthetic fixtures do.
     if unsafe { narf_acpi::parse_tpm2(rsdp_phys) }.is_err() {
         return cleanup("synthetic TPM2 chain did not parse");
     }
@@ -2348,6 +2391,7 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
     }
     table[48..52].copy_from_slice(&11u32.to_le_bytes());
     sdt_checksum(&mut table);
+    table_frame.write(&table);
     // SAFETY: as above; re-parse overwrites the TPM2 state.
     if unsafe { narf_acpi::parse_tpm2(rsdp_phys) }.is_err() {
         return cleanup("re-parse of the method-11 table failed");
@@ -2357,6 +2401,7 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
     }
     table[48..52].copy_from_slice(&7u32.to_le_bytes());
     sdt_checksum(&mut table);
+    table_frame.write(&table);
     // SAFETY: as above.
     if unsafe { narf_acpi::parse_tpm2(rsdp_phys) }.is_err() {
         return cleanup("re-parse of the method-7 table failed");
@@ -2434,7 +2479,8 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
     let pcr_ok = dev.pcr(4) == pcr_extend_value(&[0u8; 32], &digest);
     narf_acpi::__reset_tpm2_for_test();
     narf_tpm::registry::__reset_for_test();
-    let _ = (table, xsdt, rsdp, cmd_mem, rsp_mem);
+    let _ = (table, cmd_mem, rsp_mem);
+    drop((table_frame, xsdt_frame, rsdp_frame));
     if stages != [true; 4] {
         return TestResult::Fail("boot conversation stage failed (see stage order in source)");
     }

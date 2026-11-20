@@ -591,7 +591,7 @@ fn is_const_allow(prog: &[SockFilter], nr: u32) -> bool {
 fn cache_prepare(prog: &[SockFilter], prev: Option<&SeccompFilter>) -> [u64; SECCOMP_CACHE_WORDS] {
     let mut bitmap = [0u64; SECCOMP_CACHE_WORDS];
     for nr in 0..SECCOMP_CACHE_NR {
-        let below = prev.map_or(true, |p| p.cache_allows(nr as u32));
+        let below = prev.is_none_or(|p| p.cache_allows(nr as u32));
         if below && is_const_allow(prog, nr as u32) {
             bitmap[nr / 64] |= 1u64 << (nr % 64);
         }

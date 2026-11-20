@@ -61,10 +61,6 @@ impl Inner {
 }
 
 impl ProcessCputime {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
     /// A thread joined the group (fork leader or `CLONE_THREAD` sibling).
     pub(crate) fn join(&self, thread: &Arc<TaskCputime>) {
         let mut inner = self.inner.lock();
@@ -120,7 +116,7 @@ impl ProcessCputime {
 
 #[cfg(any(test, feature = "kernel-test"))]
 fn group_accounting_is_exact() -> bool {
-    let group = ProcessCputime::new();
+    let group = Arc::new(ProcessCputime::default());
     let leader = Arc::new(TaskCputime::new());
     let sibling = Arc::new(TaskCputime::new());
     group.join(&leader);
