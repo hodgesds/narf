@@ -1088,6 +1088,52 @@ pub fn realtime_bandwidth(cpu: CpuId) -> RealtimeBandwidth;
   kernel tasks and own-stack user tasks are tick-preemptive on both
   architectures. NMI/FIQ entry accounting remains incomplete.
 
+### 3.4.0 Polling idle, reschedule kicks and `/proc/schedstat`
+
+A CPU committing to idle in its executor publishes a per-CPU idle word before
+`CPU_HALTED` and its Dekker fence: `IDLE_EXEC` always, and `IDLE_POLLING` when
+the prepared idle plan polls (power §3.1). Every remote kick of a halted CPU
+(`notify_wake_cpu`, `resched_remote`, `resched_remote_force`) first tries Linux
+`set_nr_if_polling`: if `IDLE_POLLING` is set it stores `IDLE_KICKED` into the
+monitored word and sends no IPI. A wake to a CPU halted in its executor whose
+`WAKE_PENDING` is already set sends no second IPI (the setter that took the
+false→true edge kicked it, as `llist_add` on an empty `call_single_queue`
+does); a CPU halted in a `block_on` bridge or a lifecycle park, which does not
+consume `WAKE_PENDING`, is still kicked for every wake. The CPU drops the word
+(consuming a kick) after it leaves idle and before its next executor round.
+
+Wake placement keeps Linux `wake_affine_idle`: when the wakee's previous CPU is
+busy and the waking CPU is idle (its executor runs no task, nothing else is
+runnable or staged there), shares a last-level cache with it, and is allowed,
+the wakee is enqueued on the waking CPU — locally, with no IPI.
+
+```rust
+pub struct ReschedKickStats { pub ipi_sent: u64, pub skip_pending: u64,
+                              pub skip_polling: u64, pub skip_in_flight: u64 }
+pub fn resched_kick_stats(cpu: usize) -> ReschedKickStats; // this CPU as sender
+pub fn cpu_idle_polling(cpu: usize) -> bool;               // diagnostic snapshot
+
+// narf_scheduler::schedstat — Linux /proc/schedstat version 17
+pub const SCHEDSTAT_VERSION: u32 = 17;
+pub struct CpuSchedstat {
+    pub yld_count: u64, pub sched_count: u64, pub sched_goidle: u64,
+    pub ttwu_count: u64, pub ttwu_local: u64, pub rq_cpu_time_ns: u64,
+    pub run_delay_ns: u64, pub pcount: u64,
+    pub ttwu_move_affine: u64, pub ttwu_move_balance: u64,
+    pub ttwu_move_balance_far: u64, pub ttwu_remote_llc: u64, pub ttwu_remote_far: u64,
+}
+pub fn cpu_schedstat(cpu: usize) -> CpuSchedstat;
+pub struct SchedDomain { pub name: &'static str, pub span: u64 }
+pub fn sched_domains(cpu: usize) -> ([SchedDomain; 2], usize); // MC, then PKG if wider
+impl TaskCputime { pub fn run_delay_ns(&self) -> u64; }      // /proc/<pid>/schedstat
+```
+
+`ttwu_count`/`ttwu_local` are counted on the waking CPU, as Linux's
+`ttwu_stat` counts on `this_rq()`; a task re-arming its own waker is not a
+wakeup. `run_delay` and `pcount` are charged at dispatch from the wake stamp.
+The load-balancer columns of the domain lines are zero: NARF has no periodic
+balancer with Linux's per-idle-type accounting.
+
 ### 3.4.1 CPU-time accounting (`cputime`)
 
 Linux `kernel/sched/cputime.c` with `VIRT_CPU_ACCOUNTING_GEN` (time measured at

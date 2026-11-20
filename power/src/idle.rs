@@ -81,8 +81,11 @@ pub unsafe fn idle() {
         now_cycles: narf_time::now_cycles(),
         next_deadline_cycles: narf_time::hrtimer::next_event_cycles_local(),
     });
+    // No scheduler wake word here: a polling plan watches a word nothing
+    // writes, so, like HALT, only an interrupt ends the wait.
+    static UNWATCHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     // SAFETY: caller owns IRQ state and the wake handshake.
-    unsafe { narf_power_core::executor::enter_idle(plan) };
+    unsafe { narf_power_core::executor::enter_idle(plan, &UNWATCHED, 0) };
 }
 
 #[doc(hidden)]
