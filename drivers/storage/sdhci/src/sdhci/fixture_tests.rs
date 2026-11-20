@@ -1137,6 +1137,10 @@ impl FixtureTransport {
         let mut regs = [0u8; 0x100];
         regs[0x40..0x44].copy_from_slice(&FIXTURE_CAPS.to_le_bytes());
         regs[0xFE] = FIXTURE_SPEC_VERSION;
+        // Installed fixtures skip `bring_up`, which always leaves the
+        // slot powered at 3.3 V before identify; start there, so a
+        // power cycle has the 3.3 V field to preserve.
+        regs[REG_POWER_CONTROL as usize] = POWER_3V3 | POWER_ON;
         FixtureTransport {
             state: IrqSafeSpinLock::new(FixtureState {
                 regs,
