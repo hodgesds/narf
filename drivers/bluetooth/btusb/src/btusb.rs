@@ -1128,7 +1128,7 @@ pub(crate) fn apply_buffer_size_return(
 }
 
 /// Decode Read Local Name's Command Complete return parameters
-/// (§7.4.14): Status (1) + Local_Name (248). The name mgmt
+/// (§7.3.12): Status (1) + Local_Name (248). The name mgmt
 /// READ_INFO reports (issue #815).
 pub(crate) fn apply_local_name_return(
     info: &mut ControllerInfo,
@@ -1145,7 +1145,7 @@ pub(crate) fn apply_local_name_return(
 }
 
 /// Decode Read Class Of Device's Command Complete return parameters
-/// (§7.4.23): Status (1) + Class_Of_Device (3). The class mgmt
+/// (§7.3.25): Status (1) + Class_Of_Device (3). The class mgmt
 /// READ_INFO reports (issue #815).
 pub(crate) fn apply_class_return(info: &mut ControllerInfo, ret: &[u8]) -> Result<(), BtUsbError> {
     if ret.len() < 4 {
@@ -1480,7 +1480,7 @@ pub async fn try_bind_btusb_already_addressed(
     )
     .await?;
 
-    // Local name + Class of Device (§7.4.14/§7.4.23), mirroring the
+    // Local name + Class of Device (§7.3.12/§7.3.25), mirroring the
     // sync bring-up: the identity mgmt READ_INFO reports (issue
     // #815). Read after the event mask, before registration, so no
     // mgmt socket ever sees a zeroed name/class for a controller

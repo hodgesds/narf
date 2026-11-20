@@ -530,8 +530,10 @@ pub mod tests {
     fn smoke_h4_transport_bring_up_end_to_end() -> TestResult {
         // Scripted controller answers, return-parameters after the
         // status byte (Vol 4 Part E §7.4.1/§7.4.2/§7.4.5):
-        // local version, BD_ADDR, buffer size, plus bare status for
-        // Reset and Set Event Mask.
+        // local version, BD_ADDR, buffer size, local name, class of
+        // device, plus bare status for Reset and Set Event Mask.
+        let mut name = alloc::vec![0u8; 248];
+        name[..6].copy_from_slice(b"narf-1");
         let script = alloc::vec![
             (0x0C03u16, alloc::vec![]),
             (
@@ -544,6 +546,8 @@ pub mod tests {
                 alloc::vec![0xFD, 0x03, 0xFF, 0x0A, 0x00, 0x02, 0x00]
             ),
             (0x0C01u16, alloc::vec![]),
+            (0x0C14u16, name),
+            (0x0C23u16, alloc::vec![0x0C, 0x01, 0x00]),
         ];
         let (fake, transport) = fixture_transport(script);
         let transport: Arc<dyn HciTransport> = Arc::new(transport);
@@ -563,7 +567,9 @@ pub mod tests {
         kt_assert_eq!(info.sco_data_mtu, 0xFF);
         kt_assert_eq!(info.acl_total_num, 10);
         kt_assert_eq!(info.sco_total_num, 2);
-        // The five bring-up commands, in order, as literal H4
+        kt_assert_eq!(&info.local_name[..6], b"narf-1");
+        kt_assert_eq!(info.dev_class, [0x0C, 0x01, 0x00]);
+        // The seven bring-up commands, in order, as literal H4
         // frames — including the 8-byte default event mask
         // (0xFF×5, 0x1F, 0x00, 0x00) on Set Event Mask.
         kt_assert_eq!(
@@ -574,8 +580,9 @@ pub mod tests {
                 0x01, 0x09, 0x10, 0x00, // Read BD_ADDR
                 0x01, 0x05, 0x10, 0x00, // Read Buffer Size
                 0x01, 0x01, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00,
-                0x00,
-                // Set Event Mask
+                0x00, // Set Event Mask
+                0x01, 0x14, 0x0C, 0x00, // Read Local Name
+                0x01, 0x23, 0x0C, 0x00, // Read Class of Device
             ]
         );
         TestResult::Pass

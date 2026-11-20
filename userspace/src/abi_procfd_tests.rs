@@ -254,24 +254,30 @@ kernel_test_in!(
 fn smoke_abi_procfd_created_file_is_named() -> TestResult {
     with_fs(|| {
         let made = open("/pf/new", O_CREAT | O_RDWR, "open(O_CREAT) failed")?;
-        let path = b"/pf/new2\0";
-        let creat = new_fd(
-            call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)),
-            "creat failed",
-        );
-        let r = expect(
+        let mut r = expect(
             made,
             "/pf/new",
             "an O_CREAT descriptor is not named by its path",
-        )
-        .and(creat)
-        .and_then(|fd| {
-            expect(
-                fd,
-                "/pf/new2",
-                "a creat() descriptor is not named by its path",
-            )
-        });
+        );
+        // creat(2) exists only where the arch wires it: arm64's generic
+        // table has none (libc builds it from openat), as on Linux.
+        let creat = if wired(Syscall::Creat) {
+            let path = b"/pf/new2\0";
+            let creat = new_fd(
+                call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)),
+                "creat failed",
+            );
+            r = r.and(creat).and_then(|fd| {
+                expect(
+                    fd,
+                    "/pf/new2",
+                    "a creat() descriptor is not named by its path",
+                )
+            });
+            creat
+        } else {
+            Err("creat is not wired on this arch")
+        };
         if let Ok(fd) = creat {
             close(fd);
         }

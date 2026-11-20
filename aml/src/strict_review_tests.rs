@@ -128,6 +128,10 @@ fn dsdt_revision_establishes_the_strict_integer_profile() -> TestResult {
         table[4..8].copy_from_slice(&((36 + aml.len()) as u32).to_le_bytes());
         table[8] = revision;
         table.extend_from_slice(&aml);
+        // The table walk verifies the ACPI checksum (§5.2.6): every
+        // byte, the checksum byte included, sums to zero.
+        let sum = table.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        table[9] = 0u8.wrapping_sub(sum);
         let physical = narf_memory::PhysAddr::from_kernel_ptr(table.as_ptr()).raw();
         // SAFETY: complete owned SDT/header/body covered by the kernel direct
         // map; walk_aml_table copies all referenced code before it returns.

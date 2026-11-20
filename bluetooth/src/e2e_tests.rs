@@ -863,6 +863,8 @@ fn smoke_e2e_sysfs_hci_address_after_bringup() -> TestResult {
     lt.enqueue_event(cc(op::HCI_READ_BD_ADDR, 0x00, &want));
     lt.enqueue_event(cc(op::HCI_READ_BUFFER_SIZE, 0x00, &[0; 7]));
     lt.enqueue_event(cc(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+    lt.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, 0x00, &[0; 248]));
+    lt.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, 0x00, &[0; 3]));
     let controller = Controller::new(lt.clone());
     let cap = bootstrap_bluetooth_authority();
     let info = match controller.bring_up(&cap) {

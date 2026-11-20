@@ -156,7 +156,7 @@ fn smoke_controller_bringup_drives_mandatory_sequence() -> TestResult {
         ],
     ));
     lt.enqueue_event(make_command_complete(op::HCI_SET_EVENT_MASK, 0x00, &[]));
-    // Identity reads (§7.4.14/§7.4.23): the name/class mgmt
+    // Identity reads (§7.3.12/§7.3.25): the name/class mgmt
     // READ_INFO reports (issue #815). Enqueued after the event
     // mask, matching the bring-up order.
     let mut name_ret = [0u8; 248];
@@ -5499,7 +5499,7 @@ fn seed_bringup_sequence(lt: &LoopbackTransport, bd_addr: [u8; 6]) {
         &[0x40, 0x01, 0x40, 0x10, 0x00, 0x08, 0x00],
     ));
     lt.enqueue_event(make_command_complete(op::HCI_SET_EVENT_MASK, 0x00, &[]));
-    // Identity reads (§7.4.14/§7.4.23, issue #815): bring-up
+    // Identity reads (§7.3.12/§7.3.25, issue #815): bring-up
     // reads the local name (248 bytes) and Class of Device after
     // the event mask, so the seed must answer both.
     let mut name = [0u8; 248];

@@ -834,8 +834,12 @@ pub(crate) fn pss_verify_sha256(
     for (i, &b) in masked_db.iter().enumerate() {
         db.push(b ^ db_mask[i]);
     }
-    if top_bits > 0 && (db[0] >> (8 - top_bits)) != 0 {
-        return false;
+    // RFC 8017 §9.1.2 step 9: CLEAR the leftmost 8*emLen - emBits
+    // bits of DB. They are maskedDB's zero bits (checked in step 6)
+    // XORed with MGF1 output, so they are arbitrary; rejecting on
+    // them refused about half of all valid signatures.
+    if top_bits > 0 {
+        db[0] &= 0xFF >> top_bits;
     }
     // DB = PS(00…) || 0x01 || salt.
     let db_len = em_len - h_len - 1;

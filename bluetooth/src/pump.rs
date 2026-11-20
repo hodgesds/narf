@@ -7569,7 +7569,7 @@ mod tests {
             &[0, 0xFE, 0x03, 64, 0x08, 0x00, 0x04, 0x00],
         ));
         fake.enqueue_event(cc(op::HCI_SET_EVENT_MASK, &[0]));
-        // Identity reads (§7.4.14/§7.4.23): the name/class mgmt
+        // Identity reads (§7.3.12/§7.3.25): the name/class mgmt
         // READ_INFO reports (issue #815). `cc`'s `ret` starts with
         // the status byte, so the name payload is 1 + 248 bytes.
         let mut name_ret = alloc::vec![0u8; 249];
