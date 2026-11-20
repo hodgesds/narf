@@ -88,7 +88,13 @@ impl CeIrq for FakeIrq {
     fn take_pending(&self) -> u32 {
         0
     }
-    async fn wait(&self, _ms: u32) {}
+    /// No interrupt fires, so the wait runs out its timeout. Completing at
+    /// once made the registered netdev's `run` loop (`service_once`, then
+    /// this wait) never yield: the netdev outlives the smoke, and the next
+    /// test to poll the executor spun in it forever.
+    async fn wait(&self, ms: u32) {
+        narf_time::sleep_ms(u64::from(ms.max(1))).await;
+    }
 }
 
 impl super::super::runtime::DpIrq for FakeIrq {
