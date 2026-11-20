@@ -185,27 +185,13 @@ mod tests {
         }
     }
 
-    fn poll_ready<F: core::future::Future>(fut: F) -> Option<F::Output> {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn raw() -> RawWaker {
-            unsafe fn clone(_: *const ()) -> RawWaker {
-                raw()
-            }
-            unsafe fn noop(_: *const ()) {}
-            const VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-            RawWaker::new(core::ptr::null(), &VT)
-        }
-        // SAFETY: every vtable entry is a no-op that never reads the data
-        // pointer.
-        let waker = unsafe { Waker::from_raw(raw()) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = Box::pin(fut);
-        for _ in 0..64 {
-            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-                return Some(v);
-            }
-        }
-        None
+    /// One `sync(2)` pass, waited the way boot code waits a filesystem
+    /// future. `sync_all` walks every mount in the kernel, including the
+    /// device-backed ones earlier tests left mounted, and their `syncfs`
+    /// completes on a device interrupt, so a bounded poll with a no-op
+    /// waker cannot finish it.
+    fn run_sync_all() -> super::SyncReport {
+        crate::fs_registry::mount_wait(super::sync_all())
     }
 
     /// `sync(2)`'s walk reaches every superblock exactly once: a
@@ -218,9 +204,7 @@ mod tests {
         // an earlier test left behind. Judge the report against a baseline
         // taken before this test's fixtures exist, so only their outcome
         // counts.
-        let Some(baseline) = poll_ready(super::sync_all()) else {
-            return TestResult::Fail("baseline sync_all did not complete");
-        };
+        let baseline = run_sync_all();
         let auth = crate::bootstrap_mount_authority();
         let shared = Arc::new(CountFs::default());
         let private = Arc::new(CountFs::default());
@@ -247,14 +231,14 @@ mod tests {
         narf_block::register_block_device("narfsync0", disk.clone());
         narf_block::register_partition_device("narfsync0p1", "narfsync0", disk.clone(), None);
 
-        let report = poll_ready(super::sync_all());
+        let report = run_sync_all();
         let shared_syncs = shared.root.syncs.load(Ordering::Acquire);
         let private_syncs = private.root.syncs.load(Ordering::Acquire);
         let flushes = disk.flushes.load(Ordering::Acquire);
 
         // A second pass after the private namespace is gone skips it.
         drop(ns);
-        let _ = poll_ready(super::sync_all());
+        let _ = run_sync_all();
         let private_after = private.root.syncs.load(Ordering::Acquire);
 
         narf_block::unregister_block_device("narfsync0p1");
@@ -263,9 +247,6 @@ mod tests {
         let _ = reg.unmount(&hb, b);
         let _ = reg.unmount(&ha, a);
 
-        let Some(report) = report else {
-            return TestResult::Fail("sync_all did not complete");
-        };
         if shared_syncs != 1 {
             return TestResult::Fail("a filesystem mounted three ways must be synced exactly once");
         }

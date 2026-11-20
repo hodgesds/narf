@@ -1803,8 +1803,14 @@ fn fixture_sdhci_clock_divisor_pure() -> TestResult {
     if select_dma_mode(SPEC_300, adma | CAPS_CAN_64BIT) != Some(DmaMode::Adma64) {
         return TestResult::Fail("64-bit host + ADMA2 must select Adma64");
     }
-    if select_dma_mode(SPEC_200, adma) != Some(DmaMode::Sdma) {
-        return TestResult::Fail("spec 2.00 host must fall back to SDMA");
+    // ADMA2 needs spec 2.00 (Linux `sdhci_setup_host`: `version >=
+    // SDHCI_SPEC_200`), so a 2.00 host with ADMA2 uses it ...
+    if select_dma_mode(SPEC_200, adma) != Some(DmaMode::Adma32) {
+        return TestResult::Fail("spec 2.00 host + ADMA2 must select Adma32");
+    }
+    // ... and only a 1.00 host (version 0) falls back to SDMA.
+    if select_dma_mode(0, adma) != Some(DmaMode::Sdma) {
+        return TestResult::Fail("spec 1.00 host must fall back to SDMA");
     }
     if select_dma_mode(SPEC_300, CAPS_CAN_DO_SDMA) != Some(DmaMode::Sdma) {
         return TestResult::Fail("SDMA-only host must select Sdma");
@@ -3396,12 +3402,13 @@ fn fixture_emmc_rpmb_auth_round_trip() -> TestResult {
         // The conversation, counted: program key (3×CMD23,
         // 2×CMD25, 1×CMD18), counter read (2, 1, 1), write
         // (counter 2/1/1 + send 1/1/0 + result 2/1/1), counter
-        // read (2, 1, 1), read (2, 1, 1) = 14 CMD23, 8 CMD25,
-        // 6 CMD18 — and no CMD17/CMD24 at all on the RPMB path.
+        // read (2, 1, 1), and two reads (2, 1, 1 each) = 16 CMD23,
+        // 9 CMD25, 7 CMD18 — and no CMD17/CMD24 at all on the RPMB
+        // path.
         let indices = transport.cmd_indices();
         let count = |idx: u8| indices.iter().filter(|&&i| i == idx).count();
-        if count(23) != 14 || count(25) != 8 || count(18) != 6 {
-            return Err("RPMB conversation must be CMD23 + CMD18/CMD25 (14/8/6)");
+        if count(23) != 16 || count(25) != 9 || count(18) != 7 {
+            return Err("RPMB conversation must be CMD23 + CMD18/CMD25 (16/9/7)");
         }
         // Eleven SWITCHes: the identify pin to the user area,
         // then to RPMB (0x0B) and back (0x08) for each of the

@@ -2994,11 +2994,14 @@ mod tests {
 
         crate::transport::__test_reset();
         controller::__test_reset_controllers();
-        SETTINGS.lock().clear();
+        __test_reset();
         crate::pm::__reset_for_test();
 
-        let transport: Arc<dyn crate::transport::HciTransport> =
-            Arc::new(LoopbackTransport::new("mgmt-truthful"));
+        // Power-on runs the real HCI sequence (reset, identity,
+        // recorded settings), so each SET_POWERED(1) needs its
+        // Command Completes queued, as in the other mgmt fixtures.
+        let lt = Arc::new(LoopbackTransport::new("mgmt-truthful"));
+        let transport: Arc<dyn crate::transport::HciTransport> = lt.clone();
         crate::transport::register(transport.clone());
         let index =
             controller::register_ready_transport(transport, controller::ControllerInfo::default())
@@ -3007,7 +3010,7 @@ mod tests {
         let cleanup = || {
             crate::transport::__test_reset();
             controller::__test_reset_controllers();
-            SETTINGS.lock().clear();
+            __test_reset();
             crate::pm::__reset_for_test();
         };
 
@@ -3017,6 +3020,7 @@ mod tests {
             return TestResult::Fail("fresh controller reads powered or parked");
         }
         // SET_POWERED(1) → powered and unparked.
+        enqueue_power_on_ccs(&lt, &[0u8; 248], &[0u8; 3], false, false);
         let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         if !is_powered(index) || crate::pm::is_parked(index as usize) {
             cleanup();
@@ -3042,12 +3046,14 @@ mod tests {
         }
         crate::pm::unpark_autosuspend(index as usize);
         // SET_POWERED(0) → not powered, pump parked.
+        enqueue_power_off_cc(&lt);
         let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
         if is_powered(index) || !crate::pm::is_parked(index as usize) {
             cleanup();
             return TestResult::Fail("SET_POWERED(0) did not park the controller");
         }
         // Power back on → powered, unparked.
+        enqueue_power_on_ccs(&lt, &[0u8; 248], &[0u8; 3], false, false);
         let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         if !is_powered(index) || crate::pm::is_parked(index as usize) {
             cleanup();

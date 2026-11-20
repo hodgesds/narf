@@ -485,7 +485,9 @@ fn enable_sriov_cfg(
             i += 1;
             continue;
         }
-        if size % (page_size as u64) != 0 {
+        // `page_size` is the register encoding: bit n is a
+        // 2^(n+12)-byte page (PCIe r6.0 §7.8.3.9).
+        if size % ((page_size as u64) << 12) != 0 {
             return Err(SriovError::BarUnaligned);
         }
         let window = size
@@ -694,8 +696,8 @@ mod tests {
         {
             return TestResult::Fail("32-bit VF BAR size math drift");
         }
-        // 64-bit: low 0, high 0xFFFF_F000 -> 2^48.
-        if vf_bar_size_64(0, 0xFFFF_F000) != 0x1_0000_0000_0000 || vf_bar_size_64(0, 0) != 0 {
+        // 64-bit: low 0, high 0xFFFF_F000 -> 2^44.
+        if vf_bar_size_64(0, 0xFFFF_F000) != 0x1000_0000_0000 || vf_bar_size_64(0, 0) != 0 {
             return TestResult::Fail("64-bit VF BAR size math drift");
         }
         TestResult::Pass

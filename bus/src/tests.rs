@@ -72,12 +72,14 @@ fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // via the DTB walker, parses its `reg` property for the ECAM
     // base, and runs the shared walker. Other smokes that do
     // `init(None)` reset the registry; re-init explicitly with the
-    // xtask-loaded DTB physical address so this test is order-
-    // independent.
+    // DTB boot handed to `init`, so this test is order-independent.
+    // xtask places the DTB per image, so no fixed address is right.
     use crate::{devices, BusKind};
-    use narf_memory::PhysAddr;
-    // SAFETY: xtask loads the DTB at this address; identity-mapped.
-    let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
+    let Some(dtb) = crate::boot_dtb() else {
+        return TestResult::Skip("boot passed no DTB");
+    };
+    // SAFETY: the boot DTB, identity-mapped, as boot's `init` used it.
+    let _ = unsafe { crate::init(Some(dtb)) };
     let devs = devices();
     let n_pcie = devs
         .iter()
@@ -106,10 +108,12 @@ kernel_test_in!("bus", smoke_bus_pcie_dtb_aarch64);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_discovers_pmu_ppi_from_dtb() -> TestResult {
-    use narf_memory::PhysAddr;
-    // SAFETY: xtask installs QEMU virt's live DTB at this identity-mapped
-    // address. The PMUv3 node describes PPI number 7, hence INTID 23.
-    match unsafe { crate::aarch64::discover_pmu_ppi(PhysAddr::new(0x4F00_0000)) } {
+    let Some(dtb) = crate::boot_dtb() else {
+        return TestResult::Skip("boot passed no DTB");
+    };
+    // SAFETY: the boot DTB (QEMU virt's live tree), identity-mapped. The
+    // PMUv3 node describes PPI number 7, hence INTID 23.
+    match unsafe { crate::aarch64::discover_pmu_ppi(dtb) } {
         Some(23) => TestResult::Pass,
         Some(_) => TestResult::Fail("PMUv3 node resolved to an unexpected PPI"),
         None => TestResult::Fail("PMUv3 PPI was not discovered from the DTB"),
@@ -2728,10 +2732,12 @@ fn smoke_aer_isr_aggregates_counters() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        use narf_memory::PhysAddr;
-        // SAFETY: xtask loads QEMU virt's live DTB at this identity-mapped
-        // address; the enumerator only walks firmware-described MMIO windows.
-        let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
+        let Some(dtb) = crate::boot_dtb() else {
+            return TestResult::Skip("boot passed no DTB");
+        };
+        // SAFETY: the boot DTB (QEMU virt's live tree), identity-mapped; the
+        // enumerator only walks firmware-described MMIO windows.
+        let _ = unsafe { crate::init(Some(dtb)) };
     }
 
     // Snapshot counters, run ISR, verify no decrease.
