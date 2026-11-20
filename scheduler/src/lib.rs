@@ -8524,6 +8524,28 @@ pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     }
 }
 
+/// Whether `cpu`'s executor has work its idle commit would refuse to halt
+/// over (the `woke_late` test, read without consuming anything): a pending
+/// wake or reschedule request, an undrained wake list, or a dispatchable
+/// task. The stall watchdog reports a CPU that stays halted with this set
+/// (Linux's workqueue lockup). A busy ready-queue lock reads as `false`.
+pub fn dbg_cpu_runnable(cpu: usize) -> bool {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return false;
+    }
+    if WAKE_PENDING[cpu].load(Ordering::SeqCst)
+        || NEED_RESCHED[cpu].load(Ordering::SeqCst)
+        || wake_list_pending(cpu)
+    {
+        return true;
+    }
+    let now = narf_time::now_cycles();
+    READY[cpu].try_lock().is_some_and(|q| {
+        q.as_ref()
+            .is_some_and(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
+    })
+}
+
 /// NUMA node ID of the executing CPU, or `None` when SRAT
 /// topology wasn't published. Thin wrapper over
 /// `narf_acpi::cpu_node(current_cpu())` so callers in this crate

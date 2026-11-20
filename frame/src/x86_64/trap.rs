@@ -68,6 +68,10 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 /// * **Hard lockup** — an awake CPU that has taken no timer interrupt and
 ///   passed no scheduling point for `watchdog_thresh` (10 s):
 ///   `Watchdog detected hard LOCKUP on cpu N`, once per episode.
+/// * **Executor lockup** — a halted CPU with work its idle commit would not
+///   halt over (a pending wake, a dispatchable task) and no scheduling point
+///   for 20 s: `BUG: executor lockup - CPU#N idle with runnable work for
+///   Ns!`, Linux's workqueue lockup. A wake whose kick never reached it.
 /// * **RCU stall** — a CPU holding a grace period open; one report.
 /// * **Stranded wakeup** — a parked task whose own epoll or poll set is
 ///   ready, window after window: a lost wakeup, which no idle system shows.
@@ -374,6 +378,27 @@ mod stall_wd {
         }
     }
 
+    /// `%pS` for a dump line: `name+0xoff/0xsize` when `addr` is kernel
+    /// text covered by the embedded symbol table, else `?` (user addresses,
+    /// an image without a table). Allocation-free, so safe from the tick.
+    struct Sym(u64);
+
+    impl core::fmt::Display for Sym {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut name = narf_observability::kallsyms::NameBuf::new();
+            match narf_observability::kallsyms::lookup(self.0, &mut name) {
+                Some((_, off, size)) => {
+                    let name = name.as_str().unwrap_or("?");
+                    match size {
+                        Some(size) => write!(f, "{name}+{off:#x}/{size:#x}"),
+                        None => write!(f, "{name}+{off:#x}"),
+                    }
+                }
+                None => f.write_str("?"),
+            }
+        }
+    }
+
     /// Linux's soft/hard-lockup detectors over every CPU (see the module
     /// note). The checking CPU samples the others, like the buddy detector.
     fn lockup_check(now_ns: u64, p: &Params) {
@@ -393,6 +418,8 @@ mod stall_wd {
                 halted,
                 sched_passes: passes,
                 timer_ticks: perf.user_ticks.wrapping_add(perf.kernel_ticks),
+                // Only a halted CPU is judged on it (an executor lockup).
+                runnable: halted && narf_scheduler::dbg_cpu_runnable(cpu),
             };
             let task = TaskName(last_task.load(Ordering::Relaxed));
             match LOCKUP.observe(cpu, &sample, now_ns, p.thresh_ns) {
@@ -404,6 +431,16 @@ mod stall_wd {
                         stuck_ns / 1_000_000_000
                     );
                     soft = true;
+                    dump_due |= first;
+                }
+                Some(Lockup::Stalled { stuck_ns, first }) => {
+                    // Linux `BUG: workqueue lockup - pool cpus=N ... stuck
+                    // for Ns!`: halted over work it was never kicked for.
+                    let _ = writeln!(
+                        TrapWriter,
+                        "BUG: executor lockup - CPU#{cpu} idle with runnable work for {}s! [{task}]",
+                        stuck_ns / 1_000_000_000
+                    );
                     dump_due |= first;
                 }
                 Some(Lockup::Hard { stuck_ns }) => {
@@ -625,7 +662,9 @@ mod stall_wd {
             };
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} nmi_rip={nmi_rip:#x} nmi_cpl={nmi_cpl} contended_irq_lock={contended_lock:#x} -> {verdict}"
+                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} ({}) nmi_rip={nmi_rip:#x} ({}) nmi_cpl={nmi_cpl} contended_irq_lock={contended_lock:#x} -> {verdict}",
+                Sym(rip),
+                Sym(nmi_rip),
             );
             // The counts above say a halted CPU has runnable work; only the
             // per-slot state says which slot and why it is not running. An

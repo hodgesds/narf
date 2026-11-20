@@ -898,8 +898,80 @@ fn wd_sample(halted: bool, passes: u64, ticks: u64) -> crate::watchdog::CpuSampl
         halted,
         sched_passes: passes,
         timer_ticks: ticks,
+        runnable: false,
     }
 }
+
+fn wd_runnable(passes: u64) -> crate::watchdog::CpuSample {
+    crate::watchdog::CpuSample {
+        runnable: true,
+        ..wd_sample(true, passes, 0)
+    }
+}
+
+/// Executor lockup (Linux's workqueue watchdog): a CPU halted over work it
+/// would not have halted over, with no scheduling point for `2 * thresh`,
+/// is reported then and every `2 * thresh`; scheduling ends the episode. A
+/// halted CPU that keeps waking for its work, or one with nothing to run,
+/// never reports.
+fn smoke_obs_watchdog_executor_lockup_reports_halted_runnable_cpu() -> TestResult {
+    use crate::watchdog::{CpuWatch, Lockup};
+    let stuck = CpuWatch::new();
+    let mut reports = alloc::vec::Vec::new();
+    for t in 1..=41u64 {
+        if let Some(l) = stuck.observe(&wd_runnable(9), t * WD_SEC, WD_THRESH) {
+            reports.push((t, l));
+        }
+    }
+    let want = [
+        (
+            21,
+            Lockup::Stalled {
+                stuck_ns: 20 * WD_SEC,
+                first: true,
+            },
+        ),
+        (
+            41,
+            Lockup::Stalled {
+                stuck_ns: 40 * WD_SEC,
+                first: false,
+            },
+        ),
+    ];
+    if reports[..] != want[..] {
+        return TestResult::Fail("a CPU halted over runnable work was not reported at 2*thresh");
+    }
+    // It runs its work: quiet again.
+    for t in 42..=61u64 {
+        if stuck
+            .observe(&wd_runnable(10), t * WD_SEC, WD_THRESH)
+            .is_some()
+        {
+            return TestResult::Fail("reported within 2*thresh of a scheduling point");
+        }
+    }
+    let woken = CpuWatch::new();
+    let empty = CpuWatch::new();
+    for i in 0..600u64 {
+        let now = (i + 1) * WD_SEC;
+        // Halted between bursts of its work, scheduling every few seconds.
+        if woken.observe(&wd_runnable(i / 5), now, WD_THRESH).is_some() {
+            return TestResult::Fail("a CPU that wakes for its work was reported");
+        }
+        if empty
+            .observe(&wd_sample(true, 3, 0), now, WD_THRESH)
+            .is_some()
+        {
+            return TestResult::Fail("an idle CPU with nothing to run was reported");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_executor_lockup_reports_halted_runnable_cpu
+);
 
 /// The native-boot false positive: an idle desktop's CPUs sit halted with
 /// frozen counters for minutes. A halted CPU is responsive (it sleeps with
@@ -1018,6 +1090,9 @@ fn smoke_obs_watchdog_hard_lockup_reports_once() -> TestResult {
             None | Some(Lockup::Soft { .. }) => {}
             Some(Lockup::Hard { .. }) => {
                 return TestResult::Fail("a CPU taking ticks was reported as a hard lockup")
+            }
+            Some(Lockup::Stalled { .. }) => {
+                return TestResult::Fail("an awake CPU was reported as an executor lockup")
             }
         }
     }

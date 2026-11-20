@@ -187,8 +187,10 @@ pub fn peek_cap_root(t: TaskId, cap: &Cap<Diagnostics, Read>) -> CapRootView;
 ```rust
 pub const WATCHDOG_THRESH_SECS: u64 = 10;          // Linux watchdog_thresh
 pub struct CpuSample { pub online: bool, pub halted: bool,
-                       pub sched_passes: u64, pub timer_ticks: u64 }
-pub enum Lockup { Soft { stuck_ns: u64, first: bool }, Hard { stuck_ns: u64 } }
+                       pub sched_passes: u64, pub timer_ticks: u64,
+                       pub runnable: bool }
+pub enum Lockup { Soft { stuck_ns: u64, first: bool }, Hard { stuck_ns: u64 },
+                  Stalled { stuck_ns: u64, first: bool } }
 pub struct CpuWatch;                 // per-CPU state, const-constructible
 impl CpuWatch {
     pub fn touch(&self, s: &CpuSample, now_ns: u64);
@@ -208,7 +210,10 @@ reported then and every `2 * thresh` while it lasts (`first` marks the
 episode's first report). A **hard lockup** is an awake CPU with neither a
 timer interrupt nor a scheduling point for `thresh`, reported once per
 episode. A halted CPU is responsive and touches both detectors, so an idle
-system never reports; `thresh == 0` disables both. `begin_round` returns
+system never reports, unless it is halted over work its executor would not
+halt over (`runnable`): an **executor lockup** (Linux's workqueue lockup),
+reported with the soft cadence when such a CPU passes no scheduling point
+for `2 * thresh`. `thresh == 0` disables all three. `begin_round` returns
 `false` (and re-baselines every CPU) when the previous round is more than
 `2 * thresh` old — the checker itself did not run (suspend, paused VM).
 

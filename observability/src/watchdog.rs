@@ -21,6 +21,14 @@
 //! * An idle (halted) CPU is responsive by definition — it sleeps with
 //!   interrupts enabled — so halting touches both detectors, as Linux's idle
 //!   CPUs are touched by their watchdog hrtimer.
+//! * **Executor lockup** — Linux's workqueue watchdog (`wq_watchdog_timer_fn`,
+//!   `BUG: workqueue lockup - pool cpus=N ... stuck for Ns!`): work is queued
+//!   for a CPU that does not run it. NARF's form is a CPU halted over work
+//!   its own idle commit would have refused to halt over (a pending wake or
+//!   reschedule request, an undrained wake list, a dispatchable task), with
+//!   no scheduling point for `2 * watchdog_thresh`: a wake whose kick never
+//!   reached it. The soft and hard detectors cannot see it, since the CPU is
+//!   halted.
 //!
 //! Reports follow Linux: a soft lockup is re-reported every soft threshold
 //! while it lasts (`update_report_ts`), a hard lockup once per episode
@@ -42,6 +50,9 @@ pub struct CpuSample {
     pub sched_passes: u64,
     /// Timer interrupts this CPU has taken (monotonic).
     pub timer_ticks: u64,
+    /// Its executor has work it would not halt over: a pending wake or
+    /// reschedule request, an undrained wake list, or a dispatchable task.
+    pub runnable: bool,
 }
 
 /// A lockup the detector has decided to report.
@@ -61,6 +72,15 @@ pub enum Lockup {
     Hard {
         /// Time since the CPU last took a timer interrupt.
         stuck_ns: u64,
+    },
+    /// `BUG: executor lockup - CPU#N idle with runnable work for Ns!` —
+    /// halted over runnable work, not scheduling, for `stuck_ns` (Linux's
+    /// workqueue lockup). Repeated like a soft lockup.
+    Stalled {
+        /// Time since the CPU last scheduled.
+        stuck_ns: u64,
+        /// The first report of this episode.
+        first: bool,
     },
 }
 
@@ -109,7 +129,8 @@ impl CpuWatch {
     /// (`watchdog_thresh`; zero disables both detectors, as in Linux).
     /// Callers sample every CPU from one place at a time.
     pub fn observe(&self, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup> {
-        if thresh_ns == 0 || !s.online || s.halted || self.pass_ns.load(Ordering::Relaxed) == 0 {
+        let idle = s.halted && !s.runnable;
+        if thresh_ns == 0 || !s.online || idle || self.pass_ns.load(Ordering::Relaxed) == 0 {
             self.touch(s, now_ns);
             return None;
         }
@@ -124,6 +145,15 @@ impl CpuWatch {
             self.hard_warned.store(false, Ordering::Relaxed);
         }
         let no_sched = now_ns.saturating_sub(self.pass_ns.load(Ordering::Relaxed));
+        if s.halted {
+            // Halted over runnable work. A halted CPU is tickless by design,
+            // so only the scheduling-point clock judges it.
+            self.tick_ns.store(now_ns.max(1), Ordering::Relaxed);
+            self.hard_warned.store(false, Ordering::Relaxed);
+            return self
+                .soft_due(no_sched, now_ns, thresh_ns)
+                .map(|(stuck_ns, first)| Lockup::Stalled { stuck_ns, first });
+        }
         let no_tick = now_ns.saturating_sub(self.tick_ns.load(Ordering::Relaxed));
         if no_tick >= thresh_ns && no_sched >= thresh_ns {
             if self.hard_warned.swap(true, Ordering::Relaxed) {
@@ -131,6 +161,13 @@ impl CpuWatch {
             }
             return Some(Lockup::Hard { stuck_ns: no_tick });
         }
+        self.soft_due(no_sched, now_ns, thresh_ns)
+            .map(|(stuck_ns, first)| Lockup::Soft { stuck_ns, first })
+    }
+
+    /// The soft-threshold cadence (`2 * thresh`, then every `2 * thresh`
+    /// while the episode lasts): `(stuck_ns, first)` when a report is due.
+    fn soft_due(&self, no_sched: u64, now_ns: u64, thresh_ns: u64) -> Option<(u64, bool)> {
         let soft_thresh = thresh_ns.saturating_mul(2);
         if no_sched < soft_thresh {
             return None;
@@ -140,10 +177,7 @@ impl CpuWatch {
             return None;
         }
         self.soft_report_ns.store(now_ns.max(1), Ordering::Relaxed);
-        Some(Lockup::Soft {
-            stuck_ns: no_sched,
-            first: reported == 0,
-        })
+        Some((no_sched, reported == 0))
     }
 }
 
