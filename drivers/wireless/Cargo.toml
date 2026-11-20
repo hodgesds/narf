@@ -57,6 +57,8 @@ narf-drivers-wireless-core = { path = "core" }
 # Shared Atheros/Qualcomm code (qualcomm_pci/regulatory + eth/board/wmi_nlo),
 # re-exported from the crate root for the still-inlined ath9k/ath10k/ath11k.
 narf-drivers-wireless-ath-core = { path = "ath-core" }
+# Qualcomm Atheros ath9k (promoted from the former src/ath9k{.rs,/}).
+narf-drivers-wireless-ath9k = { path = "ath9k", default-features = false, features = ["builtin"] }
 # Qualcomm Atheros ath10k (promoted from the former src/ath10k/).
 narf-drivers-wireless-ath10k = { path = "ath10k", default-features = false, features = ["builtin"] }
 # Qualcomm ath11k Wi-Fi 6 (promoted from the former src/ath11k/).
@@ -74,7 +76,7 @@ async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-ath11k/kernel-test", "narf-drivers-wireless-brcm/kernel-test", "narf-drivers-wireless-rtl/kernel-test"]
+kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath9k/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-ath11k/kernel-test", "narf-drivers-wireless-brcm/kernel-test", "narf-drivers-wireless-rtl/kernel-test"]
 
 [lints]
 workspace = true
