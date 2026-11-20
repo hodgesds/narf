@@ -526,9 +526,14 @@ fn smoke_led_composition_registers_initcalls() -> TestResult {
     // Stage::Device initcalls. Before the fix the list contained
     // no leds entries at all and none of the subsystem ever ran
     // in production.
-    let names = narf_init::registered_names(narf_init::Stage::Device);
-    for want in ["leds/class", "leds/sysfs", "leds/worker"] {
-        if !names.contains(&want) {
+    // The class and sysfs initcalls are Stage::Device; the trigger worker
+    // runs as delayed work and registers at Stage::Late (0506a097a).
+    for (stage, want) in [
+        (narf_init::Stage::Device, "leds/class"),
+        (narf_init::Stage::Device, "leds/sysfs"),
+        (narf_init::Stage::Late, "leds/worker"),
+    ] {
+        if !narf_init::registered_names(stage).contains(&want) {
             return TestResult::Fail("LED initcall missing from composed boot");
         }
     }
