@@ -895,7 +895,11 @@ pub(crate) fn poll_wait_kernel(
     match deadline_ns {
         None => uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release),
         Some(0) => uctx.sleep_deadline_ns.store(0, Ordering::Release),
-        Some(deadline) => uctx.sleep_deadline_ns.store(deadline, Ordering::Release),
+        Some(deadline) => {
+            // `do_select` / `do_poll`: `select_estimate_accuracy(end_time)`.
+            uctx.note_select_timeout(deadline, now, crate::handlers::nice_of_task(task_id));
+            uctx.sleep_deadline_ns.store(deadline, Ordering::Release)
+        }
     }
 
     // Snapshot the net readiness generation (kept for the epoll snapshot
@@ -1138,13 +1142,20 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns:
         let uctx = unsafe { &*uctx_ptr };
         if let Some(duration) = timeout_ns {
             let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+            let now = narf_scheduler::narf_time::monotonic_ns();
             let d = if persisted != 0 {
                 persisted
             } else {
-                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(duration);
+                let d = now.saturating_add(duration);
                 uctx.blocking_deadline_ns.store(d, Ordering::Release);
                 d
             };
+            // `do_poll`: the timeout's slack is `select_estimate_accuracy`.
+            uctx.note_select_timeout(
+                d,
+                now,
+                crate::handlers::nice_of_task(crate::handlers::current_task_id()),
+            );
             uctx.sleep_deadline_ns.store(d, Ordering::Release);
             Some(d)
         } else {

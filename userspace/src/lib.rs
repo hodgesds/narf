@@ -89,6 +89,7 @@ pub mod socket;
 pub mod syscall;
 pub mod sysvipc;
 pub mod task;
+pub mod timer_slack;
 
 /// `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,shmmni,
 /// shm_rmid_forced}` — read one key of the calling task's IPC namespace

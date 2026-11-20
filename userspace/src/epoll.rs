@@ -2328,14 +2328,20 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 // past its deadline detects expiry below instead of computing a
                 // fresh `now + timeout` and re-arming forever.
                 let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+                let now = narf_scheduler::narf_time::monotonic_ns();
                 let d = if persisted != 0 {
                     persisted
                 } else {
-                    let d = narf_scheduler::narf_time::monotonic_ns()
-                        .saturating_add((timeout_ms as u64) * 1_000_000);
+                    let d = now.saturating_add((timeout_ms as u64) * 1_000_000);
                     uctx.blocking_deadline_ns.store(d, Ordering::Release);
                     d
                 };
+                // `ep_poll`: `select_estimate_accuracy(&end_time)` slack.
+                uctx.note_select_timeout(
+                    d,
+                    now,
+                    crate::handlers::nice_of_task(crate::handlers::current_task_id()),
+                );
                 // Re-publish the scheduler wake signal (cleared on each expiry).
                 uctx.sleep_deadline_ns.store(d, Ordering::Release);
                 Some(d)

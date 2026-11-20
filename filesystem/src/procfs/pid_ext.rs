@@ -51,6 +51,10 @@ pub enum PidExtField {
     Limits,
     OomScore,
     OomScoreAdj,
+    /// `/proc/<pid>/timerslack_ns` — the task's `timer_slack_ns`, mode
+    /// 0666; reading or writing another task's needs `CAP_SYS_NICE` over
+    /// it. Linux ref: `fs/proc/base.c:timerslack_ns_{show,write}`.
+    TimerslackNs,
     CoredumpFilter,
     Mountinfo,
     Mountstats,
@@ -153,6 +157,12 @@ impl FileOps for PidExtFile {
         let pid = self.pid;
         let field = self.field;
         Box::pin(async move {
+            if let PidExtField::TimerslackNs = field {
+                // `timerslack_ns_show` fails the read itself (EPERM), not
+                // with an empty body.
+                let ns = super::hook_timerslack_get(pid)?;
+                return slice_read(format!("{}\n", ns).as_bytes(), offset, buf);
+            }
             let bytes = render_ext(pid, field);
             slice_read(&bytes, offset, buf)
         })
@@ -171,6 +181,14 @@ impl FileOps for PidExtFile {
                         return Err(FsError::InvalidData);
                     }
                     hook_oom_adj_set(pid, val as i16).map_err(|_| FsError::InvalidData)?;
+                    Ok(buf.len())
+                }
+                PidExtField::TimerslackNs => {
+                    // `kstrtoull_from_user(buf, count, 10, &slack_ns)`.
+                    let s = core::str::from_utf8(buf.trim_ascii_end())
+                        .map_err(|_| FsError::InvalidData)?;
+                    let ns: u64 = s.parse().map_err(|_| FsError::InvalidData)?;
+                    super::hook_timerslack_set(pid, ns)?;
                     Ok(buf.len())
                 }
                 PidExtField::CoredumpFilter => {
@@ -264,6 +282,19 @@ impl FileOps for PidExtFile {
             }
             _ => {}
         }
+        if let PidExtField::TimerslackNs = self.field {
+            // `REG("timerslack_ns", S_IRUGO|S_IWUGO, ...)`: open to all; the
+            // read and write check `CAP_SYS_NICE` for another task.
+            return Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms: 0o666,
+                },
+                mtime_cycles: 0,
+            };
+        }
         let writable = matches!(
             self.field,
             PidExtField::OomScoreAdj
@@ -308,6 +339,7 @@ pub fn lookup_pid_ext(pid: u64, name: &str) -> Option<PidExtFile> {
         "limits" => PidExtField::Limits,
         "oom_score" => PidExtField::OomScore,
         "oom_score_adj" => PidExtField::OomScoreAdj,
+        "timerslack_ns" => PidExtField::TimerslackNs,
         "coredump_filter" => PidExtField::CoredumpFilter,
         "mountinfo" => PidExtField::Mountinfo,
         "mountstats" => PidExtField::Mountstats,
@@ -350,6 +382,10 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
             let adj = hook_oom_adj_get(pid);
             format!("{}\n", adj).into_bytes()
         }
+        PidExtField::TimerslackNs => match super::hook_timerslack_get(pid) {
+            Ok(ns) => format!("{}\n", ns).into_bytes(),
+            Err(_) => Vec::new(),
+        },
         PidExtField::CoredumpFilter => {
             let bits = hook_coredump_get(pid);
             format!("{:x}\n", bits).into_bytes()
@@ -2554,4 +2590,79 @@ fn smoke_procfs_task_dir_lists_leader_without_hook() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs",
     smoke_procfs_task_dir_lists_leader_without_hook
+);
+
+static SLACK_STUB: AtomicU64 = AtomicU64::new(50_000);
+fn slack_stub_get(pid: u64) -> Result<u64, FsError> {
+    match pid {
+        1 => Ok(SLACK_STUB.load(Ordering::Relaxed)),
+        2 => Err(FsError::OperationNotPermitted),
+        _ => Err(FsError::NotFound),
+    }
+}
+fn slack_stub_set(pid: u64, ns: u64) -> Result<(), FsError> {
+    match pid {
+        1 => {
+            SLACK_STUB.store(ns, Ordering::Relaxed);
+            Ok(())
+        }
+        2 => Err(FsError::OperationNotPermitted),
+        _ => Err(FsError::NotFound),
+    }
+}
+
+/// `/proc/<pid>/timerslack_ns` (fs/proc/base.c): listed and looked up, mode
+/// 0666, reads `"<ns>\n"`, writes a decimal value, refuses garbage, and
+/// passes the task side's EPERM (no `CAP_SYS_NICE` over another task)
+/// through both the read and the write.
+fn smoke_timerslack_ns_reads_writes_and_refuses() -> TestResult {
+    use super::poll_once;
+    let saved = (
+        super::TIMERSLACK_GET_HOOK.load(Ordering::Acquire),
+        super::TIMERSLACK_SET_HOOK.load(Ordering::Acquire),
+    );
+    super::set_timerslack_hooks(slack_stub_get, slack_stub_set);
+    let result = (|| {
+        let Some(f) = lookup_pid_ext(1, "timerslack_ns") else {
+            return TestResult::Fail("timerslack_ns is not looked up");
+        };
+        if f.stat().mode.perms != 0o666 {
+            return TestResult::Fail("timerslack_ns is not mode 0666");
+        }
+        let mut buf = [0u8; 32];
+        match poll_once(f.read(0, &mut buf)) {
+            Some(Ok(n)) if &buf[..n] == b"50000\n" => {}
+            _ => return TestResult::Fail("timerslack_ns read is not the slack"),
+        }
+        if !matches!(poll_once(f.write(0, b"123456\n")), Some(Ok(7)))
+            || SLACK_STUB.load(Ordering::Relaxed) != 123_456
+        {
+            return TestResult::Fail("timerslack_ns write did not set the slack");
+        }
+        if !matches!(
+            poll_once(f.write(0, b"12x\n")),
+            Some(Err(FsError::InvalidData))
+        ) {
+            return TestResult::Fail("timerslack_ns accepted a non-number");
+        }
+        let other = PidExtFile::new(2, PidExtField::TimerslackNs);
+        if !matches!(
+            poll_once(other.read(0, &mut buf)),
+            Some(Err(FsError::OperationNotPermitted))
+        ) || !matches!(
+            poll_once(other.write(0, b"1\n")),
+            Some(Err(FsError::OperationNotPermitted))
+        ) {
+            return TestResult::Fail("timerslack_ns did not refuse another task");
+        }
+        TestResult::Pass
+    })();
+    super::TIMERSLACK_GET_HOOK.store(saved.0, Ordering::Release);
+    super::TIMERSLACK_SET_HOOK.store(saved.1, Ordering::Release);
+    SLACK_STUB.store(50_000, Ordering::Relaxed);
+    result
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_timerslack_ns_reads_writes_and_refuses
 );

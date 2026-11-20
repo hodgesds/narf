@@ -63,6 +63,10 @@ fn apply_user_scheduling_from(task: u64, state: &SchedState, nice: i32, parent: 
     let result = if let Some(parent) = parent {
         narf_scheduler::inherit_user_scheduling(TaskId(parent), id, config)
     } else { narf_scheduler::set_user_scheduling(id, config, authority) };
+    if result.is_ok() {
+        // `__setscheduler_params`: a real-time task has no timer slack.
+        crate::timer_slack::apply_policy(task, matches!(policy, UserPolicy::Fifo | UserPolicy::RoundRobin));
+    }
     result.map_err(|error| match error {
         UserSchedulingError::TaskNotFound => ESRCH,
         UserSchedulingError::InvalidParameters | UserSchedulingError::NoOnlineCpu => EINVAL,
