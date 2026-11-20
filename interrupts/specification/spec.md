@@ -139,6 +139,16 @@ pub unsafe fn ipi::shoot_range_mask(
 pub unsafe fn ipi::shoot_tag_only_mask(tag: u16, target_cpus: u64);
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ipi::shoot_full_mask(target_cpus: u64);
+/// Per-CPU shootdown accounting: untagged (kernel) and tagged requests this
+/// CPU published, the peers they named, IPIs actually sent (a target already
+/// pending is not re-sent), and requests applied for other CPUs. An untagged
+/// request's handler runs INVLPG plus an all-PCID non-global flush (memory §3).
+#[cfg(target_arch = "x86_64")]
+pub struct ipi::ShootdownCpuStats { pub kernel_requests: u64, pub tagged_requests: u64,
+                                    pub request_targets: u64, pub ipis_sent: u64,
+                                    pub received: u64 }
+#[cfg(target_arch = "x86_64")]
+pub fn ipi::cpu_stats(cpu: u32) -> ipi::ShootdownCpuStats;
 
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
