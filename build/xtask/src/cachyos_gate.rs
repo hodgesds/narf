@@ -1476,6 +1476,13 @@ impl Gate {
             }
         };
         println!("cachyos-gate:   login after {:.0}s", booted.as_secs_f64());
+        // Diagnostic hook: `NARF_GATE_CMD` runs once in the logged-in shell
+        // and its output is printed (e.g. `sleep 20; cat /proc/timer_list`
+        // to look for overdue kernel timers after the system settles).
+        if let Ok(cmd) = std::env::var("NARF_GATE_CMD") {
+            let (status, out) = vm.run(&cmd, Duration::from_secs(300))?;
+            println!("cachyos-gate:   NARF_GATE_CMD exit {status}:\n{out}");
+        }
         Ok((vm, booted))
     }
 
