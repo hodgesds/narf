@@ -372,15 +372,16 @@ pub fn now_wall() -> WallInstant {
     }
 }
 
-/// Test helper: restore every wall-clock static to its default.
+/// Test helper: clear the wall-clock offset and any leap smear.
+///
+/// The cycle/ns scale is left as calibrated. Resetting it to the
+/// pre-calibration identity made every later test in the boot run on a
+/// clock `tsc_hz / 1e9` times too fast (`monotonic_ns`, `Deadline`, timer
+/// expiry). A test that wants the identity scale sets it explicitly and
+/// restores the calibrated `set_clock_hz` afterwards.
 #[doc(hidden)]
 pub fn __test_reset() {
     WALL_OFFSET_NS.store(0, Ordering::Release);
     SMEAR_END_CYCLES.store(0, Ordering::Release);
     SMEAR_DELTA_NS_REMAINING.store(0, Ordering::Release);
-    CYCLES_PER_NS.store(1, Ordering::Release);
-    C2N_MULT.store(1, Ordering::Release);
-    C2N_SHIFT.store(0, Ordering::Release);
-    N2C_MULT.store(1, Ordering::Release);
-    N2C_SHIFT.store(0, Ordering::Release);
 }
