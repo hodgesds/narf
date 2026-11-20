@@ -1430,6 +1430,97 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
 }
 kernel_test_in!("syscall_abi/perf", smoke_abi_perf_event_open_validation);
 
+/// The context-switch hook's fast gates (Linux `perf_sched_events` plus the
+/// per-task `perf_event_ctxp` test) follow event lifetime exactly: a
+/// task-bound event marks its target, an inherited child is marked at fork and
+/// unmarked at exit, close unmarks everything, and per-CPU events never mark a
+/// task. A leaked mark costs a slow path; a missing one would leave a task's
+/// counters unscheduled.
+fn smoke_abi_perf_switch_gates_follow_event_lifetime() -> TestResult {
+    with_setup(|| {
+        let attr = PerfEventAttr {
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            type_: 1,  // PERF_TYPE_SOFTWARE
+            config: 0, // PERF_COUNT_SW_CPU_CLOCK
+            flags: PERF_ATTR_FLAG_INHERIT,
+            ..PerfEventAttr::default()
+        };
+        // A child whose filter slot differs from the parent's, so each count
+        // below observes exactly one task.
+        let parent_slot = crate::perf_event::__test_perf_switch_gates(FAKE_TASK).3;
+        let child = (FAKE_TASK + 1..FAKE_TASK + 64)
+            .find(|&t| crate::perf_event::__test_perf_switch_gates(t).3 != parent_slot)
+            .ok_or("no distinct filter slot near the fixture task")?;
+        let (bound0, user0, parent0, _) = crate::perf_event::__test_perf_switch_gates(FAKE_TASK);
+        let child0 = crate::perf_event::__test_perf_switch_gates(child).2;
+
+        // Per-CPU events (perf top / perf record -a) leave the task gates alone.
+        let cpu_attr = PerfEventAttr {
+            flags: PERF_ATTR_FLAG_EXCLUDE_KERNEL,
+            ..attr
+        };
+        let cpu_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &cpu_attr as *const _ as u64,
+                -1i32 as u64,
+                narf_lib::percpu::current_cpu() as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("per-CPU cpu-clock open failed"),
+        };
+        let (bound, user, parent, _) = crate::perf_event::__test_perf_switch_gates(FAKE_TASK);
+        if bound != bound0 || parent != parent0 || user != user0 + 1 {
+            return Err("a per-CPU event changed the task-switch gates");
+        }
+        let _ = call(Syscall::Close.raw(), a0(cpu_fd));
+        if crate::perf_event::__test_perf_switch_gates(FAKE_TASK).1 != user0 {
+            return Err("closing a per-CPU user clock left its accounting gate set");
+        }
+
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("task cpu-clock open failed"),
+        };
+        let (bound, _, parent, _) = crate::perf_event::__test_perf_switch_gates(FAKE_TASK);
+        if bound != bound0 + 1 || parent != parent0 + 1 {
+            return Err("a task-bound event did not mark its target");
+        }
+        crate::perf_event::on_fork(FAKE_TASK, child, FAKE_TASK, child);
+        if crate::perf_event::__test_perf_switch_gates(child).2 != child0 + 1 {
+            return Err("an inherited child was not marked at fork");
+        }
+        crate::perf_event::on_thread_exit(child, child);
+        if crate::perf_event::__test_perf_switch_gates(child).2 != child0 {
+            return Err("an exited inherited child stayed marked");
+        }
+        // A second inherited child stays live until close drops the event.
+        crate::perf_event::on_fork(FAKE_TASK, child, FAKE_TASK, child);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let (bound, _, parent, _) = crate::perf_event::__test_perf_switch_gates(FAKE_TASK);
+        if bound != bound0
+            || parent != parent0
+            || crate::perf_event::__test_perf_switch_gates(child).2 != child0
+        {
+            return Err("closing a task-bound event left task marks behind");
+        }
+        // The hook is a no-op for an unmarked task: it must not fault or
+        // block even with no event in the registry.
+        crate::perf_event::on_task_switch(child, true);
+        crate::perf_event::on_task_switch(child, false);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/perf_switch",
+    smoke_abi_perf_switch_gates_follow_event_lifetime
+);
+
 fn smoke_abi_perf_inherited_software_clock_survives_thread_exit() -> TestResult {
     with_setup(|| {
         const CHILD_TID: u64 = 0x5045_5246_4348;
