@@ -776,7 +776,10 @@ fn stop_discovery(index: u16, params: &[u8]) -> Vec<u8> {
     if current_settings(index) & SETTING_POWERED == 0 {
         return cmd_status(index, OP_STOP_DISCOVERY, STATUS_NOT_POWERED);
     }
-    match DISCOVERING.lock().get(&index).copied() {
+    // Copy the record out first: the arms below take DISCOVERING again,
+    // and a scrutinee guard would still be held there.
+    let discovering = DISCOVERING.lock().get(&index).copied();
+    match discovering {
         None => cmd_status(index, OP_STOP_DISCOVERY, STATUS_REJECTED),
         Some(active) if active != disc_type => {
             cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
@@ -1743,7 +1746,11 @@ fn generate_non_resolvable(index: u16) -> Result<[u8; 6], u8> {
 /// is skipped when the desired address is already programmed.
 fn program_random_address(index: u16, settings: u32) -> Result<(), u8> {
     let desired = if privacy_mode(index) != 0 {
-        match CURRENT_RPA.lock().get(&index).copied() {
+        // Read the RPA into a local first: a guard in the `match`
+        // scrutinee lives for the whole match, and the `None` arm takes
+        // CURRENT_RPA again (IrqSafeSpinLock is not re-entrant).
+        let current = CURRENT_RPA.lock().get(&index).copied();
+        match current {
             Some(rpa) => Some(rpa),
             None => {
                 let rpa = generate_rpa(index)?;
