@@ -585,6 +585,10 @@ pub struct Xhci {
     /// Waker of this controller's USB supervisor, poked by the demux on a
     /// Port Status Change Event.
     supervisor_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Per-endpoint completion wakers `(slot, dci, waker)`: the demux wakes
+    /// an endpoint's owner when a Transfer Event for it arrives, the shape
+    /// of a Linux URB completion handler (`btusb_intr_complete`).
+    endpoint_wakers: IrqSafeSpinLock<Vec<(u8, u8, core::task::Waker)>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1969,6 +1973,7 @@ impl Xhci {
             id: 0,
             bus_addr: device.addr,
             supervisor_waker: IrqSafeSpinLock::new(None),
+            endpoint_wakers: IrqSafeSpinLock::new(Vec::new()),
         })
     }
 
@@ -2016,6 +2021,51 @@ impl Xhci {
     /// Transfer Event (e.g. a completed HID Interrupt-IN report).
     pub fn has_pending_transfer_events(&self) -> bool {
         !self.transfer_events.lock().is_empty()
+    }
+
+    /// Have `waker` woken whenever a Transfer Event for endpoint `dci` of
+    /// `slot_id` is demuxed — from the interrupt handler, or by any poller
+    /// that drains the event ring — the completion half of a Linux URB.
+    /// Replaces the endpoint's previous waker; it stays registered until
+    /// [`Self::clear_endpoint_waker`].
+    pub fn set_endpoint_waker(&self, slot_id: u8, dci: u8, waker: &core::task::Waker) {
+        let mut g = self.endpoint_wakers.lock();
+        if let Some(e) = g.iter_mut().find(|e| e.0 == slot_id && e.1 == dci) {
+            if !e.2.will_wake(waker) {
+                e.2 = waker.clone();
+            }
+            return;
+        }
+        g.push((slot_id, dci, waker.clone()));
+    }
+
+    /// Drop endpoint `dci` of `slot_id`'s completion waker.
+    pub fn clear_endpoint_waker(&self, slot_id: u8, dci: u8) {
+        self.endpoint_wakers
+            .lock()
+            .retain(|e| !(e.0 == slot_id && e.1 == dci));
+    }
+
+    /// Whether this controller's events reach the demux from an interrupt
+    /// (MSI-X or INTx). Without one, events are seen only when something
+    /// polls, and completion wakers fire only then.
+    pub fn has_event_interrupt(&self) -> bool {
+        self.irq_vector.is_some()
+    }
+
+    /// Wake the owner of the endpoint a Transfer Event names.
+    fn wake_endpoint(&self, ev: &[u32; 4]) {
+        let slot = (ev[3] >> 24) as u8;
+        let dci = ((ev[3] >> 16) & 31) as u8;
+        let w = self
+            .endpoint_wakers
+            .lock()
+            .iter()
+            .find(|e| e.0 == slot && e.1 == dci)
+            .map(|e| e.2.clone());
+        if let Some(w) = w {
+            w.wake_by_ref();
+        }
     }
 
     /// Wake this controller's supervisor if it registered a waker. The
@@ -2628,6 +2678,10 @@ impl Xhci {
         // poll_event released its ring locks before this call. No await or
         // reservation-lock acquisition occurs while devices is held.
         if self.latch_owned_event(ev) {
+            drop(_publication);
+            if (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT == TRB_TYPE_TRANSFER_EVENT {
+                self.wake_endpoint(&ev);
+            }
             return Some(ev);
         }
         let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
@@ -2660,6 +2714,7 @@ impl Xhci {
         drop(g);
         drop(_publication);
         if ty == TRB_TYPE_TRANSFER_EVENT {
+            self.wake_endpoint(&ev);
             self.wake_supervisor();
         }
         Some(ev)
