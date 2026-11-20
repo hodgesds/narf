@@ -3494,6 +3494,13 @@ pub(crate) fn parse_proc_fd_magic_path(task: u64, host_path: &str) -> Option<u32
     parse_proc_self_fd(visible_path_of(task, host_path)?)
 }
 
+/// [`parse_proc_fd_magic_path`] with the descriptor's OWNER: `(task whose
+/// table holds it, N)`. `/proc/<pid>/fd/N` names the pid's descriptor N, not
+/// the caller's (`proc_fd_link` uses the target task's files table).
+pub(crate) fn parse_proc_fd_magic_link(task: u64, host_path: &str) -> Option<(u64, u32)> {
+    proc_fd_link_owner(task, visible_path_of(task, host_path)?)
+}
+
 /// `host_path` (chroot applied) as the task names it, or `None` when it lies
 /// outside the task's root. Boundary-aware: a chroot at `/srv/a` does not
 /// strip `/srv/another`.

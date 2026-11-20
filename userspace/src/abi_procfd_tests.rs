@@ -911,3 +911,40 @@ kernel_test_in!(
     "syscall_abi/procfd",
     smoke_abi_procfd_link_is_relative_to_the_readers_root
 );
+
+/// Opening `/proc/<pid>/fd/N` reopens the PID's descriptor N, not the
+/// caller's (`proc_fd_link` walks the target task's files table). NARF
+/// resolved N in the caller's own table: with the number free there the
+/// reopen of another process's eventfd failed ENOENT, and with it in use the
+/// caller silently got its own file (a diagnostic that reopened another
+/// process's pty that way read FIONREAD from its own stdin: ENOTTY).
+fn smoke_abi_procfd_reopen_names_the_owners_descriptor() -> TestResult {
+    with_fs(|| {
+        let event = new_fd(call(Syscall::Eventfd.raw(), a1(0, 0)), "eventfd failed")?;
+        fork_process(OTHER);
+        // The child keeps its inherited eventfd at `event`; the caller (the
+        // parent) closes its own copy, so that number is free in its table.
+        close(event);
+        let reopened = open(
+            &alloc::format!("/proc/{OTHER}/fd/{event}"),
+            O_RDWR,
+            "reopen of another process's anonymous descriptor failed",
+        );
+        let r = reopened.and_then(|fd| {
+            expect(
+                fd,
+                "anon_inode:[eventfd]",
+                "/proc/<pid>/fd/N reopened something other than the pid's descriptor",
+            )
+        });
+        if let Ok(fd) = reopened {
+            close(fd);
+        }
+        reap_process(OTHER);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_procfd_reopen_names_the_owners_descriptor
+);
