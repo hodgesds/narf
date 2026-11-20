@@ -8209,6 +8209,12 @@ pub fn run_until_empty() {
                 // global counter here would make every CPU refuse to halt while
                 // any peer has an undrained waker.
                 || narf_lib::deferred_wake::has_pending_local()
+                // A timer interrupt since this round's softirq run raised one
+                // (`tick_nohz_stop_tick` refuses to stop the tick with a
+                // softirq pending, and Linux would have run it at `irq_exit`).
+                // Its due event is no longer the clockevent's next event, so
+                // halting here would sleep over it until an unrelated IRQ.
+                || narf_time::softirq_pending_local()
                 || {
                     let now = narf_time::now_cycles();
                     let q = READY[cpu].lock();
@@ -8327,10 +8333,14 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
             return true;
         }
     }
-    // This CPU is the timer migrator of a group whose idle CPU has a due
-    // global timer (`tmigr_requires_handle_remote`): the executor round runs
-    // it, so a CPU-bound task must yield as for its own timers.
-    if narf_time::timer_migration::requires_handle_remote() {
+    // A timer softirq is pending (`local_softirq_pending`): a due wheel base
+    // the tick raised, an idle CPU's global timers to expire as its timer
+    // migrator, or the hrtimer soft queue. Linux runs it at `irq_exit` over
+    // whatever task is running; here the executor round runs it, so a
+    // CPU-bound task must yield. Once raised the due event is no longer
+    // reported as the next event (it would re-arm the clockevent into the
+    // past), so the deadline check above cannot see it.
+    if narf_time::softirq_pending_local() {
         return true;
     }
     // A cross-core wake is staged for this CPU (Linux `rq->wake_list`).
@@ -8576,8 +8586,8 @@ pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
 
 /// Whether `cpu`'s executor has work its idle commit would refuse to halt
 /// over (the `woke_late` test, read without consuming anything): a pending
-/// wake or reschedule request, an undrained wake list, or a dispatchable
-/// task. The stall watchdog reports a CPU that stays halted with this set
+/// wake or reschedule request, an undrained wake list, a pending timer
+/// softirq, or a dispatchable task. The stall watchdog reports a CPU that stays halted with this set
 /// (Linux's workqueue lockup). A busy ready-queue lock reads as `false`.
 pub fn dbg_cpu_runnable(cpu: usize) -> bool {
     if cpu >= narf_lib::percpu::MAX_CPUS {
@@ -8586,6 +8596,7 @@ pub fn dbg_cpu_runnable(cpu: usize) -> bool {
     if WAKE_PENDING[cpu].load(Ordering::SeqCst)
         || NEED_RESCHED[cpu].load(Ordering::SeqCst)
         || wake_list_pending(cpu)
+        || narf_time::softirq_pending_on(cpu)
     {
         return true;
     }
