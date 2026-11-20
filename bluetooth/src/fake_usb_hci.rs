@@ -981,10 +981,10 @@ fn smoke_fake_usb_hci_e2e_attach_firmware_bringup_pump() -> TestResult {
         return fail("pump responses missing, misrouted, or off the bulk-OUT endpoint");
     }
     // USB-level accounting: every event the host consumed came off
-    // the interrupt-IN endpoint (9 firmware CCs + bootup + 5
+    // the interrupt-IN endpoint (9 firmware CCs + bootup + 7
     // bring-up CCs + 1 connection event), every inbound ACL off
     // bulk-IN, every outbound ACL onto bulk-OUT.
-    if fake.interrupt_in_served() != 16 {
+    if fake.interrupt_in_served() != 18 {
         return fail("interrupt-IN event count wrong");
     }
     if fake.bulk_in_served() != 2 {

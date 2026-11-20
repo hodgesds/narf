@@ -2754,6 +2754,11 @@ mod tests {
         lt.enqueue_event(cc(op::HCI_WRITE_PAGE_SCAN_TYPE, 0, &[]));
     }
 
+    /// HCI commands every power-on issues before any feature step: one
+    /// per Command Complete `enqueue_power_on_ccs` queues (reset, event
+    /// mask, name, class, scan enable, the five single settings).
+    const POWER_ON_BASE_COMMANDS: usize = 10;
+
     /// Enqueue the Command Complete a power-off consumes (the
     /// best-effort Write_Scan_Enable quiesce).
     fn enqueue_power_off_cc(lt: &LoopbackTransport) {
@@ -4359,7 +4364,9 @@ mod tests {
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_CLEAR_RESOLVING_LIST, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();
@@ -4399,7 +4406,9 @@ mod tests {
                 == 0;
         enqueue_power_on_ccs(&lt, &[0u8; 248], &[0u8; 3], false, false);
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered2 = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();
@@ -4559,7 +4568,9 @@ mod tests {
         add2[23..39].copy_from_slice(&[0xAA; 16]);
         lt.enqueue_event(cc(op::HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered2 = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();
