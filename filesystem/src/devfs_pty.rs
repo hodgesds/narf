@@ -1047,6 +1047,15 @@ impl Pty {
     /// a setuid program from, say, clearing ECHO on a shared terminal.
     pub(crate) fn set_termios_locked(&self, mut raw: [u8; TERMIOS_WIRE_LEN]) {
         let locked = *self.locked_termios.lock();
+        // `tty_set_termios` holds `termios_rwsem` for write across the store
+        // and `n_tty_set_termios`, and `n_tty_receive_buf_common` holds it for
+        // read: a master write processes each byte under one termios and the
+        // buffer layout that termios implies. The input lock plays that role
+        // here (the master write samples termios under it). Without it, a
+        // write that sampled the cooked termios fed its bytes into the cooked
+        // line AFTER a concurrent switch to raw had flushed that line to the
+        // reader, stranding them behind newer input (a reordered keystroke).
+        let mut input = self.input.lock();
         let mut cur = self.termios.lock();
         // c_iflag/c_oflag/c_cflag/c_lflag: four u32s at offsets 0, 4, 8, 12.
         for off in [0usize, 4, 8, 12] {
@@ -1079,8 +1088,16 @@ impl Pty {
         cur.raw = raw;
         let updated = *cur;
         drop(cur);
+        let restarted = Self::ldisc_set_termios(&mut input, &previous, &updated);
+        drop(input);
         self.note_termios_change(&previous, &updated);
-        self.ldisc_set_termios(&previous, &updated);
+        if restarted {
+            self.note_flow_change(false);
+        }
+        // `n_tty_set_termios`: `wake_up_interruptible(&tty->write_wait)` and
+        // `read_wait` — the change can make the tty ready for I/O.
+        self.sync_slave_readiness();
+        self.sync_master_readiness();
     }
 
     /// `n_tty_set_termios`: replan the line discipline's buffered input for
@@ -1096,10 +1113,13 @@ impl Pty {
     /// behind newer input or glued onto the next cooked line. Entering
     /// canonical mode with raw bytes queued pushes them as one readable chunk
     /// (`push = 1`), which NARF's `ready` queue already models.
-    fn ldisc_set_termios(&self, old: &Termios, new: &Termios) {
+    ///
+    /// Runs under the input lock, with the new termios already stored. Returns
+    /// whether output a ^S had stopped was restarted, for the caller to report
+    /// once the lock is released.
+    fn ldisc_set_termios(st: &mut crate::ntty::LineState, old: &Termios, new: &Termios) -> bool {
         let mode_changed = old.icanon() != new.icanon() || old.extproc() != new.extproc();
         if mode_changed {
-            let mut st = self.input.lock();
             if !new.icanon() && !st.line.is_empty() {
                 let line = core::mem::take(&mut st.line);
                 st.ready.extend(line);
@@ -1111,15 +1131,7 @@ impl Pty {
         // (`if (!I_IXON(tty) && old && (old->c_iflag & IXON) && !tty->flow.tco_stopped)
         // start_tty(tty)`). Otherwise output stopped by a ^S stays stopped for
         // good, since ^Q is no longer recognised.
-        if old.ixon() && !new.ixon() {
-            let was_stopped = core::mem::replace(&mut self.input.lock().stopped, false);
-            if was_stopped {
-                self.note_flow_change(false);
-            }
-        }
-        // `wake_up_interruptible(&tty->write_wait)` and `read_wait`.
-        self.sync_slave_readiness();
-        self.sync_master_readiness();
+        old.ixon() && !new.ixon() && core::mem::replace(&mut st.stopped, false)
     }
 
     /// `TIOCSTI`: push one byte back into this tty's input queue.
@@ -2605,7 +2617,6 @@ impl FileOps for PtyMaster {
     /// (^C/^\/^Z) raise a signal to this PTY's foreground process group.
     /// Linux ref: `pty.c pty_write` → `n_tty_receive_buf` on `tty->link`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let t = *self.pty.termios.lock();
         // Collect ISIG signals to deliver AFTER releasing the discipline
         // lock (signal delivery allocates + takes the pgid/signal locks).
         let mut sigs: Vec<u32> = Vec::new();
@@ -2619,9 +2630,12 @@ impl FileOps for PtyMaster {
         // raw here is what "staircased" konsole. Deferring OPOST also keeps the
         // input lock and the output lock from nesting.
         let mut echo_raw: Vec<u8> = Vec::new();
-        {
+        let t = {
             let pty = &*self.pty;
             let mut state = pty.input.lock();
+            // Sample termios under the input lock (`termios_rwsem` held for
+            // read by `n_tty_receive_buf_common`; see `set_termios_locked`).
+            let t = *pty.termios.lock();
             for &b in buf {
                 crate::ntty::feed_byte(&mut state, &t, b, &mut |c| echo_raw.push(c), &mut |bb| {
                     match signal_for_cc(&t, bb) {
@@ -2633,7 +2647,8 @@ impl FileOps for PtyMaster {
                     }
                 });
             }
-        }
+            t
+        };
         if !echo_raw.is_empty() {
             let mut processed: Vec<u8> = Vec::with_capacity(echo_raw.len() + 8);
             {
