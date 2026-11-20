@@ -2008,7 +2008,7 @@ fn open_impl_reserved(
     // it and calling `open_impl` again would let a CLONE_FILES sibling steal
     // the lowest free number while this task is resolving the target.
     let proc_fd_magic = if mnt_len == 0 && follow_final {
-        parse_proc_fd_magic_path(task, path)
+        parse_proc_fd_magic_link(task, path)
     } else {
         None
     };
@@ -2016,8 +2016,18 @@ fn open_impl_reserved(
         ctx.set_return(errno_ret(ELOOP)); // -ELOOP
         return;
     }
-    if let Some(n) = proc_fd_magic {
-        if let Some(target) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
+    if let Some((owner, n)) = proc_fd_magic {
+        // `/proc/<pid>/fd/N` is the PID's descriptor N. Resolving N in the
+        // caller's own table reopened whatever the caller happened to hold
+        // there (its stdin, say), so a diagnostic that opened another
+        // process's pty through it got ENOTTY from its FIONREAD.
+        // `proc_pid_get_link`: following it needs `proc_fd_access_allowed`,
+        // i.e. `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`.
+        if owner != task && !ptrace_may_access_mode(task, owner, PtraceCreds::Fs) {
+            ctx.set_return(errno_ret(EACCES)); // -EACCES
+            return;
+        }
+        if let Some(target) = fd_path_for_task(owner, n).filter(|p| p.starts_with('/')) {
             open_impl_reserved(ctx, target, flags, 0, 0, create_mode, reservation);
             return;
         }
@@ -2026,7 +2036,7 @@ fn open_impl_reserved(
         // filesystem pathname to walk. The proc magic link therefore obtains
         // another reference to the same object, with a fresh per-open
         // description and the caller's requested status/fd flags.
-        let ops = fd::with_table(task, |table| table.get(n).map(|entry| entry.ops.clone()))
+        let ops = fd::with_table(owner, |table| table.get(n).map(|entry| entry.ops.clone()))
             .flatten();
         let Some(ops) = ops else {
             // A stale proc fd link is a dangling link, not EBADF from an
@@ -4251,7 +4261,23 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     let anchored_proc_view = anchored_procfs_view(raw);
     let magic_src = anchored_proc_view.as_deref().unwrap_or(raw);
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(magic_src).filter(|_| follow_final) {
+    let raw: &str = if let Some((owner, n)) =
+        proc_fd_link_owner(task, magic_src).filter(|_| follow_final)
+    {
+        if owner != task {
+            // `/proc/<pid>/fd/N` names the pid's descriptor, not the
+            // caller's (see `open_impl`): stat what it names.
+            if !ptrace_may_access_mode(task, owner, PtraceCreds::Fs) {
+                ctx.set_return(errno_ret(EACCES));
+                return;
+            }
+            let ops = fd::with_table(owner, |t| t.get(n).map(|e| e.ops.clone())).flatten();
+            match ops {
+                Some(ops) => stat_linux_ops(ctx, &ops, out_ptr),
+                None => ctx.set_return(errno_ret(ENOENT)),
+            }
+            return;
+        }
         if anchored_proc_view.is_some() || !fd_file_within_root(task, n) {
             stat_linux_fd(ctx, n, out_ptr);
             return;
