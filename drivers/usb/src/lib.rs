@@ -249,17 +249,9 @@ pub fn register_initcalls() {
         start_supervisors();
         InitResult::Ok
     });
-    // CCID slot-change pump: services the readers' Interrupt-IN
-    // endpoints (NotifySlotChange) so card insert/remove reaches
-    // the /dev/ccid<N> presence state. Same NotPresent rule as the
-    // HID supervisor when no xHCI controller is bound.
-    narf_init::register(Stage::Late, "usb-ccid-supervisor", || {
-        if !xhci::is_probed() {
-            return InitResult::NotPresent;
-        }
-        ccid::devfs_bridge::spawn_slot_change_pump();
-        InitResult::Ok
-    });
+    // The CCID slot-change pump starts with the first bound reader
+    // (`ccid::devfs_bridge::register_reader`), not here: with no reader it
+    // would poll nothing every few milliseconds for the life of the system.
     // Stage::Subsys banner for the HID vendor quirk tables (Apple /
     // Microsoft / Logitech DJ + HID++). These modules don't bind
     // their own xHCI / interrupt-IN endpoints — they hang off the
