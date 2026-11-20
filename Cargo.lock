@@ -2834,6 +2834,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "narf-arch",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
