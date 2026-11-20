@@ -22,18 +22,6 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // A pathname AF_UNIX bind materialises a real S_IFSOCK inode in Linux.
-    // Grab the path before the op consumes `addr` (family is checked in the
-    // op; AF_UNIX bodies are the sun_path bytes).
-    let unix_path: Option<alloc::string::String> = if addr.family == crate::socket::AF_UNIX
-        && sock.domain == crate::socket::AF_UNIX
-    {
-        core::str::from_utf8(&addr.body)
-            .ok()
-            .map(|s| alloc::string::String::from(s.trim_end_matches('\0')))
-    } else {
-        None
-    };
     // `unix_bind_bsd()` creates the S_IFSOCK dentry before publishing the
     // socket.  The registry key is consequently the inode identity from the
     // outset, which lets a later file bind find the same endpoint through a
@@ -47,14 +35,17 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     // must not leave a node behind).
     // `unix_validate_addr` (an over-long sun_path is EINVAL) runs before the
     // mknod, so only a well-formed address may create a node.
-    let well_formed = addr.body.len() <= 108;
-    if let Some(p) = unix_path.as_deref().filter(|p| !p.is_empty() && well_formed) {
-        if crate::handlers::unix_path_final_node_exists(p) {
-            ctx.set_return(errno_ret(EADDRINUSE));
-            return;
-        }
-        if sock.is_fresh() {
-            create_unix_socket_node(p);
+    if addr.family == crate::socket::AF_UNIX && sock.domain == crate::socket::AF_UNIX {
+        if let Some(crate::socket::UnixAddr::Path(path)) =
+            crate::socket::UnixAddr::parse(&addr.body)
+        {
+            if crate::handlers::unix_path_final_node_exists(&path) {
+                ctx.set_return(errno_ret(EADDRINUSE));
+                return;
+            }
+            if sock.is_fresh() {
+                create_unix_socket_node(&path);
+            }
         }
     }
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {

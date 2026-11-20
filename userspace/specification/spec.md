@@ -659,7 +659,9 @@ membership/options/statistics and `PACKET_AUXDATA` follow Linux
 non-zero virtio-net headers fail explicitly because packet mmap/GSO is not
 implemented. Interface promiscuity/all-multicast memberships are
 reference-counted and visible through both `SIOCGIFFLAGS` and net sysfs.
-Pathname AF_UNIX `bind` creates its socket marker with the caller's filesystem
+Pathname AF_UNIX `bind` uses the bytes up to the first NUL within the supplied
+`sun_path` for both inode creation and endpoint lookup. It creates its
+socket marker with the caller's filesystem
 UID and GID (the parent GID when the directory is setgid), mode `0777 & ~umask`,
 and applicable inherited access ACL. The creator can subsequently `chmod` its
 socket without `CAP_FOWNER`; ownership checks on unrelated inodes remain in

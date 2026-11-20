@@ -735,6 +735,39 @@ kernel_test_in!(
     smoke_abi_socket_errno_bind_unix_existing_path
 );
 
+/// sysklogd binds a full sockaddr_un, then chmods its NUL-terminated path.
+/// Linux unix_mkname_bsd ignores the unused bytes after the first NUL.
+fn smoke_abi_socket_bind_unix_padded_path() -> TestResult {
+    with_memfs("/pad", "pad", &[], || {
+        let path = c"/pad/log";
+        let (mut padded, used) = unix_addr(path.to_bytes_with_nul());
+        padded[used as usize..110].fill(0xff);
+        let server = open(AF_UNIX, SOCK_DGRAM, 0)?;
+        if bind(server, &padded[..110]) != Some(0)
+            || call_chmod(path.as_ptr() as u64, 0o660) != Some(0)
+        {
+            return Err("bind with non-UTF-8 padding did not create the socket at its pathname");
+        }
+        let client = open(AF_UNIX, SOCK_DGRAM, 0)?;
+        if connect(client, &padded[..used as usize]) != Some(0) {
+            return Err("a client using the short address did not find the socket");
+        }
+        close(client);
+        close(server);
+        padded[used as usize..110].fill(b'x');
+        let second = open(AF_UNIX, SOCK_DGRAM, 0)?;
+        if bind(second, &padded[..110]) != Some(EADDRINUSE_ERR) {
+            return Err("printable address padding hid the existing socket inode");
+        }
+        close(second);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bind_unix_padded_path
+);
+
 /// systemd's `socket_address_listen` + `socket_apply_socket_options`
 /// (v261, src/shared/socket-label.c / src/core/socket.c) for a user unit like
 /// `pipewire.socket` — two `ListenStream=` paths, the second named with the

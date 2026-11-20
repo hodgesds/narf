@@ -87,6 +87,18 @@ struct MknodMetadata {
     gid: u32,
 }
 
+impl MknodMetadata {
+    fn device(file_type: FileType, rdev: u64) -> Self {
+        Self {
+            file_type,
+            rdev,
+            perms: 0o600,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
 pub(crate) struct MknodNode {
     inode: u64,
     metadata: IrqSafeSpinLock<MknodMetadata>,
@@ -94,7 +106,7 @@ pub(crate) struct MknodNode {
 
 #[derive(Clone)]
 pub(crate) enum DynamicNode {
-    Device(Arc<MknodNode>),
+    Node(Arc<MknodNode>),
     Symlink { target: String, inode: u64 },
     Directory(Arc<DynamicDirectory>),
 }
@@ -114,7 +126,7 @@ static DYNAMIC_NODES: IrqSafeSpinLock<DynamicMap> =
 
 static NEXT_DYNAMIC_INO: AtomicU64 = AtomicU64::new(0x1000);
 
-/// FileOps for a `mknod`-created char/block node.
+/// Metadata shared by lookups of a runtime device or pathname socket.
 struct MknodFile {
     node: Arc<MknodNode>,
 }
@@ -173,10 +185,8 @@ impl FileOps for MknodFile {
 fn mknod_register(
     nodes: &IrqSafeSpinLock<DynamicMap>,
     name: &str,
-    file_type: FileType,
-    rdev: u64,
-    perms: u16,
-) -> Result<Arc<MknodNode>, FsError> {
+    metadata: MknodMetadata,
+) -> Result<Arc<dyn FileOps>, FsError> {
     if !valid_leaf_name(name) {
         return Err(FsError::InvalidPath);
     }
@@ -186,16 +196,32 @@ fn mknod_register(
     }
     let node = Arc::new(MknodNode {
         inode: NEXT_DYNAMIC_INO.fetch_add(1, Ordering::Relaxed),
-        metadata: IrqSafeSpinLock::new(MknodMetadata {
-            file_type,
-            rdev,
-            perms,
-            uid: 0,
-            gid: 0,
-        }),
+        metadata: IrqSafeSpinLock::new(metadata),
     });
-    nodes.insert(name.into(), DynamicNode::Device(node.clone()));
-    Ok(node)
+    nodes.insert(name.into(), DynamicNode::Node(node.clone()));
+    Ok(Arc::new(MknodFile { node }))
+}
+
+fn dynamic_socket<'a>(
+    nodes: &'a IrqSafeSpinLock<DynamicMap>,
+    name: &'a str,
+    perms: u16,
+    uid: u32,
+    gid: u32,
+) -> FsFuture<'a, Arc<dyn FileOps>> {
+    Box::pin(async move {
+        mknod_register(
+            nodes,
+            name,
+            MknodMetadata {
+                file_type: FileType::Socket,
+                rdev: 0,
+                perms: perms & 0o7777,
+                uid,
+                gid,
+            },
+        )
+    })
 }
 
 /// Reset the dynamic-node registry (test isolation).
@@ -1847,7 +1873,7 @@ pub(crate) fn dynamic_lookup_file(
     name: &str,
 ) -> Option<Arc<dyn FileOps>> {
     match nodes.lock().get(name).cloned()? {
-        DynamicNode::Device(node) => Some(Arc::new(MknodFile { node }) as Arc<dyn FileOps>),
+        DynamicNode::Node(node) => Some(Arc::new(MknodFile { node }) as Arc<dyn FileOps>),
         DynamicNode::Symlink { target, inode } => {
             Some(Arc::new(DevSymlink { target, inode }) as Arc<dyn FileOps>)
         }
@@ -1858,7 +1884,7 @@ pub(crate) fn dynamic_lookup_file(
 fn dynamic_lookup_dir(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Option<Arc<dyn DirOps>> {
     match nodes.lock().get(name).cloned()? {
         DynamicNode::Directory(dir) => Some(dir as Arc<dyn DirOps>),
-        DynamicNode::Device(_) | DynamicNode::Symlink { .. } => None,
+        DynamicNode::Node(_) | DynamicNode::Symlink { .. } => None,
     }
 }
 
@@ -1868,7 +1894,7 @@ pub(crate) fn dynamic_enumerate(nodes: &IrqSafeSpinLock<DynamicMap>) -> Vec<(Str
         .iter()
         .map(|(name, node)| {
             let file_type = match node {
-                DynamicNode::Device(node) => node.metadata.lock().file_type,
+                DynamicNode::Node(node) => node.metadata.lock().file_type,
                 DynamicNode::Symlink { .. } => FileType::Symlink,
                 DynamicNode::Directory(_) => FileType::Dir,
             };
@@ -2036,9 +2062,22 @@ impl DirOps for DynamicDirectory {
             if !matches!(file_type, FileType::Special | FileType::Block) {
                 return Err(FsError::Unsupported);
             }
-            let node = mknod_register(&self.entries, name, file_type, rdev, 0o600)?;
-            Ok(Arc::new(MknodFile { node }) as Arc<dyn FileOps>)
+            mknod_register(&self.entries, name, MknodMetadata::device(file_type, rdev))
         })
+    }
+
+    fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        self.create_socket_with_attrs(name, perms, 0, 0)
+    }
+
+    fn create_socket_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        dynamic_socket(&self.entries, name, perms, uid, gid)
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -2119,6 +2158,26 @@ struct DevDir;
 impl DirOps for DevDir {
     fn ino(&self) -> u64 {
         2
+    }
+
+    fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        self.create_socket_with_attrs(name, perms, 0, 0)
+    }
+
+    fn create_socket_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        if static_entry_type(name).is_some()
+            || self.lookup(name).is_some()
+            || self.lookup_dir(name).is_some()
+        {
+            return Box::pin(async { Err(FsError::Busy) });
+        }
+        dynamic_socket(&DYNAMIC_NODES, name, perms, uid, gid)
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -2257,8 +2316,7 @@ impl DirOps for DevDir {
             }
             // mknod_common immediately applies the caller's mode and owners;
             // use Linux devtmpfs's conservative initial root-owned mode.
-            let node = mknod_register(&DYNAMIC_NODES, name, file_type, rdev, 0o600)?;
-            Ok(Arc::new(MknodFile { node }) as Arc<dyn FileOps>)
+            mknod_register(&DYNAMIC_NODES, name, MknodMetadata::device(file_type, rdev))
         })
     }
 
@@ -2650,6 +2708,47 @@ kernel_test_in!(
     "filesystem/devfs",
     smoke_dev_runtime_symlink_create_lookup_unlink
 );
+
+/// sysklogd binds its datagram socket and chmods the resulting /dev/log.
+fn smoke_dev_pathname_socket() -> TestResult {
+    let dir = DevDir;
+    let name = "syslog-test.sock";
+    let socket = match poll_once_devfs(dir.create_socket_with_attrs(name, 0o700, 8, 9)) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("could not create devtmpfs socket"),
+    };
+    let inode = socket.ino();
+    if inode == 0 || socket.owners() != (8, 9) || socket.stat().mode.perms != 0o700 {
+        return TestResult::Fail("devtmpfs socket lost its creation attributes");
+    }
+    if !matches!(poll_once_devfs(socket.set_perms(0o666)), Some(Ok(()))) {
+        return TestResult::Fail("chmod of devtmpfs socket failed");
+    }
+    let Some(node) = dir.lookup(name) else {
+        return TestResult::Fail("bound devtmpfs socket has no pathname");
+    };
+    if node.ino() != inode
+        || node.stat().mode.file_type != FileType::Socket
+        || node.stat().mode.perms != 0o666
+        || node.rdev() != 0
+    {
+        return TestResult::Fail("devtmpfs socket stat is inconsistent across lookup");
+    }
+    if !matches!(
+        poll_once_devfs(dir.create_socket(name, 0o600)),
+        Some(Err(FsError::Busy))
+    ) || !matches!(
+        poll_once_devfs(dir.create_socket("null", 0o600)),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("socket creation replaced an existing devtmpfs entry");
+    }
+    if !matches!(poll_once_devfs(dir.unlink(name)), Some(Ok(()))) || dir.lookup(name).is_some() {
+        return TestResult::Fail("could not remove devtmpfs socket");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_pathname_socket);
 
 /// Smoke: /dev/{shm,mqueue,hugepages} exist as (empty) mountpoint-stub
 /// directories that an init O_PATH-opens to mount tmpfs / mqueue /
