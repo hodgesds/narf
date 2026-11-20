@@ -1883,6 +1883,14 @@ impl Gate {
         }
         let (_, wnotes) = Self::workload(&mut vm, "linux")?;
         notes.push(format!("Linux workload ok ({wnotes})"));
+        // Diagnostic hook: `CACHYOS_GATE_LINUX_CMD` runs once in the Linux
+        // shell after its workload, so Linux shapes the image NARF boots
+        // next (e.g. data block groups filled to a host root's 99.8 % with
+        // scattered holes) and its output is printed.
+        if let Ok(cmd) = std::env::var("CACHYOS_GATE_LINUX_CMD") {
+            let (status, out) = vm.run(&cmd, Duration::from_secs(3600))?;
+            println!("cachyos-gate:   CACHYOS_GATE_LINUX_CMD exit {status}:\n{out}");
+        }
         let (rc, out) = vm.run("btrfs scrub start -B /", Duration::from_secs(1800))?;
         if rc != 0 || !out.contains("no errors found") {
             bail!("btrfs scrub under Linux: rc {rc}: {}", tail(&out, 8));
