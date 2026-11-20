@@ -118,11 +118,11 @@ path = "drivers/wireless/src/ath9k"
 tags = ["drivers/wireless/ath9k"]
 
 [[leaf]]
-path = "drivers/wireless/src/brcmfmac"
+path = "drivers/wireless/brcm/src/brcmfmac"
 tags = ["drivers/wireless/brcmfmac"]
 
 [[leaf]]
-path = "drivers/wireless/src/cyw43439"
+path = "drivers/wireless/brcm/src/cyw43439"
 tags = ["drivers/wireless/cyw43439"]
 
 [[leaf]]
