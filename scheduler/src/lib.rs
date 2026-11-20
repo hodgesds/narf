@@ -94,6 +94,7 @@ pub mod eevdf;
 pub mod numa;
 pub mod policy;
 pub mod priority;
+pub mod schedstat;
 pub mod stackful;
 pub mod steal;
 mod user_policy;
@@ -109,6 +110,7 @@ mod pmu;
 #[cfg(feature = "instruction-quantum")]
 mod instructions;
 
+mod idle_poll_tests;
 mod strand_tests;
 mod tests;
 #[cfg(feature = "kernel-test")]
@@ -1746,6 +1748,104 @@ static WAKE_PRESSURE: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS
 static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
+/// Per-CPU idle word: NARF's `TIF_POLLING_NRFLAG` and the store that ends a
+/// polling idle. It has a cache line to itself because an idle CPU in a
+/// polling state (MWAIT C1, poll) MONITORs exactly this line.
+///
+/// Bits, all owned by this CPU's executor idle commit except [`IDLE_KICKED`]:
+/// - [`IDLE_EXEC`]: committed to idle in its executor. That commit consumed
+///   `WAKE_PENDING` under the `CPU_HALTED` fence, so a `WAKE_PENDING` seen set
+///   while this bit is set was set after the commit by a waker that took the
+///   false→true edge and has already sent the kick (Linux: `llist_add` only
+///   IPIs the first entry of `call_single_queue`). Never set by the `block_on`
+///   bridge or lifecycle parking, which do not consume `WAKE_PENDING`.
+/// - [`IDLE_POLLING`]: the idle state watches this word. A waker sets
+///   [`IDLE_KICKED`] instead of sending an IPI (Linux `set_nr_if_polling`).
+/// - [`IDLE_KICKED`]: a waker's store; the CPU leaves idle on it, then runs
+///   its executor round, which observes the wake the waker published first.
+///
+/// Written with the same SeqCst discipline as `CPU_HALTED`: the bits are set
+/// before `CPU_HALTED` and its Dekker fence, and cleared (swap to 0) after
+/// the CPU leaves idle.
+#[repr(align(64))]
+struct IdleWord(core::sync::atomic::AtomicU32);
+
+static IDLE_WORD: [IdleWord; narf_lib::percpu::MAX_CPUS] =
+    [const { IdleWord(core::sync::atomic::AtomicU32::new(0)) }; narf_lib::percpu::MAX_CPUS];
+
+const IDLE_EXEC: u32 = 1 << 0;
+const IDLE_POLLING: u32 = 1 << 1;
+const IDLE_KICKED: u32 = 1 << 2;
+
+/// Publish this CPU's executor idle commit (and, for a polling plan, that it
+/// polls). Must precede the `CPU_HALTED` store and its fence. Returns the
+/// value the idle entry waits on while it is still undisturbed.
+#[inline]
+fn idle_word_arm(cpu: usize, polls: bool) -> u32 {
+    let armed = IDLE_EXEC | if polls { IDLE_POLLING } else { 0 };
+    if let Some(word) = IDLE_WORD.get(cpu) {
+        word.0.store(armed, Ordering::SeqCst);
+    }
+    armed
+}
+
+/// Leave idle: drop every bit, consuming a kick. Runs after the CPU has left
+/// its idle state and before it next runs its executor round, so a kick that
+/// landed here is covered by that round's view of the waker's wake.
+#[inline]
+fn idle_word_disarm(cpu: usize) {
+    if let Some(word) = IDLE_WORD.get(cpu) {
+        word.0.swap(0, Ordering::SeqCst);
+    }
+}
+
+/// Linux `set_nr_if_polling`: if `cpu` idles in a polling state, end that
+/// state with a store to its monitored word and report that no interrupt is
+/// needed. The caller published its wake (queue node, `WAKE_PENDING` or
+/// `NEED_RESCHED`) and fenced before calling, so the woken CPU's executor
+/// round, which follows its acquire swap of this word, sees it.
+///
+/// Returns `false` when `cpu` is not polling: it is running, halted in a
+/// non-polling state (HLT, an ACPI I/O C-state), or between idle states, and
+/// only an interrupt reaches it.
+#[inline]
+fn set_kick_if_polling(cpu: usize) -> bool {
+    IDLE_WORD
+        .get(cpu)
+        .is_some_and(|word| kick_word_if_polling(&word.0))
+}
+
+/// [`set_kick_if_polling`] on an explicit word (tests drive it directly).
+#[inline]
+fn kick_word_if_polling(word: &core::sync::atomic::AtomicU32) -> bool {
+    let mut value = word.load(Ordering::SeqCst);
+    loop {
+        if value & IDLE_POLLING == 0 {
+            return false;
+        }
+        if value & IDLE_KICKED != 0 {
+            return true;
+        }
+        match word.compare_exchange_weak(
+            value,
+            value | IDLE_KICKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => value = seen,
+        }
+    }
+}
+
+/// Whether `cpu` has committed to idle in its executor (see [`IDLE_EXEC`]).
+#[inline]
+fn idle_committed_in_executor(cpu: usize) -> bool {
+    IDLE_WORD
+        .get(cpu)
+        .is_some_and(|word| word.0.load(Ordering::SeqCst) & IDLE_EXEC != 0)
+}
+
 /// "The CPU is halted in a `block_on` bridge, not in its executor." The
 /// bridge (`bridge_idle_wait`) publishes `CPU_HALTED` like the executor's
 /// idle path — so a waker IPIs it through the unchanged `resched_remote`
@@ -2340,15 +2440,16 @@ pub fn wake_race_track(task_id: u64) {
     }
 }
 
-/// Wake side: stamp the false→true transition with the wake cycle + the home
-/// CPU's current HALT_GEN. `home` is the wake's target CPU.
+/// Wake side: stamp the false→true transition with the wake cycle (the
+/// start of Linux's `sched_info` run delay) and, for the wake-race
+/// instrument, the home CPU's current HALT_GEN. `home` is the wake's target CPU.
 #[inline]
 fn wake_race_stamp(cell: &WakeCell, home: u32) {
+    cell.wake_cyc
+        .store(narf_time::now_cycles(), Ordering::Relaxed);
     if !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    cell.wake_cyc
-        .store(narf_time::now_cycles(), Ordering::Relaxed);
     let g = if (home as usize) < HALT_GEN.len() {
         HALT_GEN[home as usize].load(Ordering::Relaxed)
     } else {
@@ -2357,18 +2458,22 @@ fn wake_race_stamp(cell: &WakeCell, home: u32) {
     cell.wake_halt_gen.store(g, Ordering::Relaxed);
 }
 
-/// Dispatch side: a slot with a set awake flag is about to run on `cpu`. Record
-/// wake→run latency and whether a HLT intervened since the wake.
+/// Dispatch side: a slot with a set awake flag is about to run on `cpu`. Charge
+/// the wake→run delay to this CPU's and the task's `sched_info` (Linux
+/// `sched_info_arrive`), and for the wake-race instrument record the latency
+/// and whether a HLT intervened since the wake.
 #[inline]
 fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
-    if !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
     let w = cell.wake_cyc.swap(0, Ordering::Relaxed);
-    if w == 0 {
+    let now = if w == 0 { 0 } else { narf_time::now_cycles() };
+    let waited = now.saturating_sub(w);
+    schedstat::note_dispatch(waited);
+    if let Some(cputime) = cell.cputime.as_ref() {
+        cputime.note_run_delay(waited);
+    }
+    if w == 0 || !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let now = narf_time::now_cycles();
     let us = narf_time::cycles_to_ns(now.wrapping_sub(w)) / 1000;
     let halted = cpu < HALT_GEN.len()
         && HALT_GEN[cpu].load(Ordering::Relaxed) != cell.wake_halt_gen.load(Ordering::Relaxed);
@@ -2540,8 +2645,17 @@ fn arm_scheduler_deadline(deadline: u64) {
 /// keeping remote-wake and bounded-completion paths off shared counter lines.
 #[repr(C, align(64))]
 struct SchedulerTelemetry {
+    /// Reschedule IPIs this CPU sent (wakes, reschedule requests, kicks).
     resched_sent: AtomicU64,
+    /// Remote wakes/requests that needed no IPI: the target is awake and
+    /// already has the notification pending.
     resched_skip: AtomicU64,
+    /// Remote wakes/requests that ended a polling idle with a store instead
+    /// of an IPI (Linux `set_nr_if_polling` / `sched_wake_idle_without_ipi`).
+    resched_poll_skip: AtomicU64,
+    /// Remote wakes to a CPU halted in its executor whose kick was already
+    /// in flight from the wake that set its notification.
+    resched_dup_skip: AtomicU64,
     forward_progress: AtomicU64,
     /// Scheduling points this CPU's top-level executor has passed (a round
     /// started, a polled task returned, a direct handoff). Written only by
@@ -2569,6 +2683,8 @@ impl SchedulerTelemetry {
         Self {
             resched_sent: AtomicU64::new(0),
             resched_skip: AtomicU64::new(0),
+            resched_poll_skip: AtomicU64::new(0),
+            resched_dup_skip: AtomicU64::new(0),
             forward_progress: AtomicU64::new(0),
             sched_passes: AtomicU64::new(0),
             staged_tick_pass: AtomicU64::new(0),
@@ -2579,7 +2695,7 @@ impl SchedulerTelemetry {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<SchedulerTelemetry>() == 64);
+const _: () = assert!(core::mem::size_of::<SchedulerTelemetry>() == 128);
 
 static SCHEDULER_TELEMETRY: [SchedulerTelemetry; narf_lib::percpu::MAX_CPUS] =
     [const { SchedulerTelemetry::new() }; narf_lib::percpu::MAX_CPUS];
@@ -2649,6 +2765,45 @@ fn cpu_not_rescheduling(cpu: usize, now: u64) -> bool {
     !halted.load(Ordering::Acquire)
         && now.saturating_sub(telemetry.sched_pass_cycles.load(Ordering::Relaxed))
             >= narf_time::ns_to_cycles(NOT_RESCHEDULING_NS)
+}
+
+/// Scheduling points `cpu` has passed (Linux `rq->sched_count`).
+pub(crate) fn cpu_sched_passes(cpu: usize) -> u64 {
+    SCHEDULER_TELEMETRY.get(cpu).map_or(0, |telemetry| {
+        telemetry.sched_passes.load(Ordering::Relaxed)
+    })
+}
+
+/// What one CPU's reschedule kicks did since boot (it is the sender).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReschedKickStats {
+    /// Reschedule IPIs sent.
+    pub ipi_sent: u64,
+    /// No IPI: the awake target already had the notification pending.
+    pub skip_pending: u64,
+    /// No IPI: the target polled in idle and was woken by a store.
+    pub skip_polling: u64,
+    /// No IPI: the halted target's kick was already in flight.
+    pub skip_in_flight: u64,
+}
+
+/// `cpu`'s reschedule-kick counters. Zero for an out-of-range CPU.
+pub fn resched_kick_stats(cpu: usize) -> ReschedKickStats {
+    SCHEDULER_TELEMETRY
+        .get(cpu)
+        .map_or(ReschedKickStats::default(), |t| ReschedKickStats {
+            ipi_sent: t.resched_sent.load(Ordering::Relaxed),
+            skip_pending: t.resched_skip.load(Ordering::Relaxed),
+            skip_polling: t.resched_poll_skip.load(Ordering::Relaxed),
+            skip_in_flight: t.resched_dup_skip.load(Ordering::Relaxed),
+        })
+}
+
+/// Whether `cpu` is idle in a polling state right now (diagnostic snapshot).
+pub fn cpu_idle_polling(cpu: usize) -> bool {
+    IDLE_WORD
+        .get(cpu)
+        .is_some_and(|word| word.0.load(Ordering::Acquire) & IDLE_POLLING != 0)
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
@@ -2735,8 +2890,27 @@ pub fn __test_set_wake_next(cpu: u32, task: u64) {
     }
 }
 
+/// Kick remote `target_cpu`, whose wake or request the caller has already
+/// published and fenced: end its polling idle with a store when it polls
+/// (Linux `set_nr_if_polling`), otherwise send the reschedule IPI.
+#[inline]
+fn kick_remote_cpu(target_cpu: u32) {
+    let telemetry = local_scheduler_telemetry();
+    if set_kick_if_polling(target_cpu as usize) {
+        telemetry.resched_poll_skip.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    telemetry.resched_sent.fetch_add(1, Ordering::Relaxed);
+    send_resched_ipi(target_cpu);
+}
+
 /// Publish runnable work after queue publication. Batch remote IPIs until the
 /// target claims the notification, including while the target runs user code.
+///
+/// Linux `__ttwu_queue_wakelist`: the first entry on an empty wake list kicks
+/// the target (`llist_add` returned true) and later entries ride on that kick;
+/// the kick is a store, not an IPI, when the target polls in idle
+/// (`send_call_function_single_ipi` → `set_nr_if_polling`).
 #[inline]
 fn notify_wake_cpu(target_cpu: u32) {
     let cpu = target_cpu as usize;
@@ -2748,11 +2922,21 @@ fn notify_wake_cpu(target_cpu: u32) {
     if cpu == narf_lib::percpu::current_cpu() {
         return;
     }
-    if !pending || CPU_HALTED[cpu].load(Ordering::SeqCst) {
-        local_scheduler_telemetry()
-            .resched_sent
-            .fetch_add(1, Ordering::Relaxed);
-        send_resched_ipi(target_cpu);
+    if !pending {
+        kick_remote_cpu(target_cpu);
+    } else if CPU_HALTED[cpu].load(Ordering::SeqCst) {
+        // A halted target with the notification already set. Its executor
+        // idle commit consumed `WAKE_PENDING` under the halted fence, so the
+        // waker that set it since took the false→true edge above and kicked
+        // it; a second IPI wakes nothing (`IDLE_EXEC`). A `block_on` bridge
+        // or a lifecycle park halts without consuming it, so it is kicked.
+        if idle_committed_in_executor(cpu) {
+            local_scheduler_telemetry()
+                .resched_dup_skip
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            kick_remote_cpu(target_cpu);
+        }
     } else {
         local_scheduler_telemetry()
             .resched_skip
@@ -2795,14 +2979,13 @@ fn resched_remote(target_cpu: u32) {
             .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    local_scheduler_telemetry()
-        .resched_sent
-        .fetch_add(1, Ordering::Relaxed);
-    send_resched_ipi(target_cpu);
+    kick_remote_cpu(target_cpu);
 }
 
 /// Publish a policy/timer/control request and interrupt a remote CPU even if
-/// it is busy. Ordinary runnable delivery uses notify_wake_cpu instead.
+/// it is busy. Ordinary runnable delivery uses notify_wake_cpu instead. A
+/// target polling in idle is ended with a store instead (Linux `resched_curr`
+/// → `set_nr_and_not_polling`): its executor round then sees the request.
 #[inline]
 pub(crate) fn resched_remote_force(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -2817,10 +3000,7 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
     // Pair the push (release) with the target's drain (acquire): the staged slot
     // must be visible before the IPI lands and the handler drains.
     core::sync::atomic::fence(Ordering::SeqCst);
-    local_scheduler_telemetry()
-        .resched_sent
-        .fetch_add(1, Ordering::Relaxed);
-    send_resched_ipi(target_cpu);
+    kick_remote_cpu(target_cpu);
 }
 
 /// Timer-tick half of the idle balance: ask one idle CPU to come and look
@@ -6165,6 +6345,11 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 #[inline]
 fn note_fresh_wake(cell: &WakeCell, home: u32) {
     wake_race_stamp(cell, home);
+    // Linux `ttwu_stat` on the waker's run queue. A task re-arming its own
+    // waker to stay runnable is not a `try_to_wake_up`.
+    if cell.task != current_task_id().raw() {
+        schedstat::note_ttwu(home);
+    }
     note_runnable_peer(home, cell.task);
     user_policy::note_rt_wake(cell, home);
     // Placement counts fresh wakes, not repeated notifications of runnable work.
@@ -6501,7 +6686,15 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
     let allowed_set = task_affinity(TaskId(task));
     let allowed = |c: CpuId| allowed_set.is_none_or(|set| set.contains(c));
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
+    // Linux `available_idle_cpu(this_cpu)` from interrupt/softirq context: a
+    // waker running in its executor between polls, with nothing else to run,
+    // is an idle CPU. `wake_affine_idle` then keeps a wake whose previous CPU
+    // is busy on the waker when they share a cache: a local enqueue, no IPI.
+    let waker_idle = remote && waker_cpu_idle(me);
     let is_idle = |c: crate::affinity::CpuId| {
+        if c.0 as usize == me {
+            return waker_idle;
+        }
         cpu_halted_and_schedulable(c.0 as usize)
             && !wake_notification_pending(c.0 as usize)
             && !wake_list_pending(c.0 as usize)
@@ -6525,6 +6718,7 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
     // kicked it.
     if try_migrate_wakee_to(home, t.0, cell) {
         note_wake_placement(WakePlacement::Moved);
+        schedstat::note_ttwu_move(home, t.0, t.0 as usize == me);
         return;
     }
     // Not moved. A busy home that is rescheduling runs it at its next round.
@@ -6536,6 +6730,25 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
         notify_wake_cpu_once(t.0, notified);
         note_wake_placement(WakePlacement::PullKick);
     }
+}
+
+/// Whether the waking CPU `cpu` is idle in Linux's `available_idle_cpu` sense:
+/// its executor runs no task (the wake comes from executor-context timer,
+/// deferred-IRQ or maintenance work), no other runnable task or staged wake is
+/// waiting for it, and it schedules normally. A stale `peer` reads busy, which
+/// only forgoes the wake-affine move.
+#[inline]
+fn waker_cpu_idle(cpu: usize) -> bool {
+    cpu < CURRENT_TASK.len()
+        && CURRENT_TASK[cpu].0.load(Ordering::Acquire) == TaskId::NONE.raw()
+        && !RUNNABLE_STATE[cpu].peer.load(Ordering::Acquire)
+        && !wake_list_pending(cpu)
+        && !wake_notification_pending(cpu)
+        && narf_lib::smp::is_online(cpu as u32)
+        && matches!(
+            policy::cpu_state(CpuId(cpu as u32)),
+            CpuState::Active | CpuState::Idle
+        )
 }
 
 /// Whether `cpu` is halted in the executor's idle path and will run a steal
@@ -7231,7 +7444,7 @@ unsafe fn read_active_address_space_root() -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn restore_active_address_space_root(root: u64, _cpu: usize) {
+unsafe fn restore_active_address_space_root(root: u64, cpu: usize) {
     // Preserve the incoming nonzero PCID just as Linux's switch_mm_irqs_off()
     // does when its generation is current. Process-residency bits remain set:
     // with NOFLUSH they describe conservative TLB history, not only the
@@ -7243,8 +7456,24 @@ unsafe fn restore_active_address_space_root(root: u64, _cpu: usize) {
     } else {
         root
     };
-    // SAFETY: `root` is the complete CR3 value captured on this CPU.
-    unsafe { narf_arch::x86_64::cr::write_cr3(value) };
+    // Load it through the shootdown residency protocol, as
+    // `AddressSpace::activate` does, so this CPU stops reading as running the
+    // user root it leaves (Linux `cpu_tlbstate.loaded_mm`): a later flush of
+    // that address space charges this CPU a deferred flush instead of an IPI,
+    // and a debt owed by the restored root's bucket is paid before the write.
+    let tag = (root & 0xFFF) as u16;
+    let base = root & 0x000F_FFFF_FFFF_F000;
+    let cpu = cpu as u32;
+    narf_lib::sync::without_interrupts(|| {
+        if narf_memory::tlb_shootdown::begin_context_load(cpu, tag, base) {
+            // SAFETY: CPL0; dropping every non-global entry is always a
+            // correct (over-)invalidation.
+            unsafe { narf_memory::x86_64::paging::flush_nonglobal_all_pcids_local() };
+        }
+        // SAFETY: `root` is the complete CR3 value captured on this CPU.
+        unsafe { narf_arch::x86_64::cr::write_cr3(value) };
+        narf_memory::tlb_shootdown::finish_context_load(cpu, tag, base);
+    });
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -7907,6 +8136,10 @@ pub fn run_until_empty() {
                 narf_time::clockevent::set_idle_tick(idle_plan.stop_tick(), budget_deadline);
             }
             narf_memory::tlb_shootdown::mark_idle(cpu as u32);
+            // Idle word before CPU_HALTED: a waker that sees this CPU halted
+            // also sees whether it polls (Linux `__current_set_polling` before
+            // `need_resched()` in `do_idle`).
+            let armed = idle_word_arm(cpu, race_free_halt && idle_plan.polls());
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             // Authoritative O(1) resched check first (Linux `need_resched()`):
@@ -7935,6 +8168,7 @@ pub fn run_until_empty() {
                 };
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                idle_word_disarm(cpu);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 narf_rcu::exit_idle();
                 if race_free_halt {
@@ -7946,7 +8180,8 @@ pub fn run_until_empty() {
                 }
                 continue;
             }
-            // Idle until a wake is plausible.
+            // Idle until a wake is plausible (Linux: `__schedule` picked idle).
+            schedstat::note_goidle();
             if race_free_halt {
                 // IRQs are masked here. Skip the HLT if the deadline already
                 // passed; otherwise sti;hlt;cli — atomic enable+halt so a
@@ -7959,8 +8194,12 @@ pub fn run_until_empty() {
                     false
                 } else {
                     let idle = cputime::idle_enter();
-                    // SAFETY: IRQs are masked and the final wake check passed.
-                    let entered = unsafe { narf_power_core::executor::enter_idle(idle_plan) };
+                    // SAFETY: IRQs are masked and the final wake check passed;
+                    // a polling plan waits on this CPU's idle word, which a
+                    // waker changes instead of sending an IPI.
+                    let entered = unsafe {
+                        narf_power_core::executor::enter_idle(idle_plan, &IDLE_WORD[cpu].0, armed)
+                    };
                     cputime::idle_exit(idle);
                     entered
                 };
@@ -7971,6 +8210,7 @@ pub fn run_until_empty() {
                     }
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                idle_word_disarm(cpu);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 narf_rcu::exit_idle();
                 // SAFETY: restore the IRQ state to the idle path's natural
@@ -7992,6 +8232,7 @@ pub fn run_until_empty() {
                     HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                idle_word_disarm(cpu);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 narf_rcu::exit_idle();
             }
@@ -9041,6 +9282,8 @@ pub fn run_forever() -> ! {
             narf_time::clockevent::set_idle_tick(idle_plan.stop_tick(), None);
         }
         narf_memory::tlb_shootdown::mark_idle(cpu as u32);
+        // As in run_until_empty: idle word first, then CPU_HALTED and fence.
+        let armed = idle_word_arm(cpu, race_free_halt && idle_plan.polls());
         CPU_HALTED[cpu].store(true, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);
         let work_arrived = {
@@ -9067,6 +9310,7 @@ pub fn run_forever() -> ! {
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            idle_word_disarm(cpu);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             narf_rcu::exit_idle();
             if race_free_halt {
@@ -9078,19 +9322,24 @@ pub fn run_forever() -> ! {
             }
             continue;
         }
+        schedstat::note_goidle();
         if race_free_halt {
             let idle_t0 = narf_time::now_cycles();
             let entered = if next_deadline.is_some_and(|deadline| idle_t0 >= deadline) {
                 false
             } else {
                 let idle = cputime::idle_enter();
-                // SAFETY: IRQs are masked and the final wake check passed.
-                let entered = unsafe { narf_power_core::executor::enter_idle(idle_plan) };
+                // SAFETY: IRQs are masked and the final wake check passed;
+                // see run_until_empty for the polling wake word.
+                let entered = unsafe {
+                    narf_power_core::executor::enter_idle(idle_plan, &IDLE_WORD[cpu].0, armed)
+                };
                 cputime::idle_exit(idle);
                 entered
             };
             let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            idle_word_disarm(cpu);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             narf_rcu::exit_idle();
             // SAFETY: restore the enabled state this idle path runs with.
@@ -9114,6 +9363,7 @@ pub fn run_forever() -> ! {
             narf_arch::halt_until_irq();
             cputime::idle_exit(idle);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            idle_word_disarm(cpu);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             narf_rcu::exit_idle();
         }

@@ -101,6 +101,9 @@ pub struct TaskCputime {
     cpu: AtomicU32,
     /// `task_nice(p) > 0`: this task's user time is the `nice` column.
     nice: AtomicBool,
+    /// Time spent runnable but waiting for a CPU, in TSC cycles (Linux
+    /// `sched_info.run_delay`, `/proc/<pid>/schedstat`'s second field).
+    run_delay_cycles: AtomicU64,
 }
 
 const _: () = assert!(core::mem::align_of::<TaskCputime>() > WORD_FLAGS);
@@ -133,7 +136,21 @@ impl TaskCputime {
             stime_ns: AtomicU64::new(0),
             cpu: AtomicU32::new(u32::MAX),
             nice: AtomicBool::new(false),
+            run_delay_cycles: AtomicU64::new(0),
         }
+    }
+
+    /// Charge `cycles` of waiting-to-run to this task (`sched_info_arrive`).
+    #[inline]
+    pub(crate) fn note_run_delay(&self, cycles: u64) {
+        if cycles != 0 {
+            self.run_delay_cycles.fetch_add(cycles, Ordering::Relaxed);
+        }
+    }
+
+    /// Total time this task has waited runnable for a CPU, in ns.
+    pub fn run_delay_ns(&self) -> u64 {
+        narf_time::cycles_to_ns(self.run_delay_cycles.load(Ordering::Relaxed))
     }
 
     /// Record the task's nice value; positive nice moves its user time to

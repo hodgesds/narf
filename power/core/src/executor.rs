@@ -2,7 +2,7 @@
 
 use super::{CState, CStateIdx, IdleGovernor, Power, PowerError};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use narf_capabilities::{Cap, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -39,6 +39,9 @@ pub struct IdleDecision {
 pub enum IdleEntry {
     Poll,
     Halt,
+    /// Linux `mwait_idle`: MONITOR, then `sti; mwait` with EAX=0/ECX=0. The
+    /// built-in C1 where `prefer_mwait_c1_over_halt` holds; never firmware.
+    MwaitIdle,
     Mwait {
         hint: u32,
     },
@@ -78,6 +81,7 @@ const HALT: IdleState = IdleState {
 pub struct IdlePlan {
     state: IdleState,
     stop_tick: bool,
+    polls: bool,
     generation: u64,
     cpu: usize,
 }
@@ -89,6 +93,13 @@ impl IdlePlan {
     pub fn stop_tick(&self) -> bool {
         self.stop_tick
     }
+    /// Whether the chosen state is a polling idle: it watches the wake word
+    /// handed to [`enter_idle`], so a store there ends it without an
+    /// interrupt (Linux `TIF_POLLING_NRFLAG`). The scheduler publishes its
+    /// polling flag only for such a plan.
+    pub fn polls(&self) -> bool {
+        self.polls
+    }
 }
 
 impl Default for IdlePlan {
@@ -96,6 +107,7 @@ impl Default for IdlePlan {
         Self {
             state: HALT,
             stop_tick: true,
+            polls: false,
             generation: 0,
             cpu: usize::MAX,
         }
@@ -114,6 +126,9 @@ struct CpuIdle {
     generation: u64,
     states: [IdleState; MAX_IDLE_STATES],
     len: usize,
+    /// MWAIT on this CPU is woken by a store to the monitored line (no
+    /// `X86_BUG_MONITOR`), so its MWAIT states poll.
+    mwait_polls: bool,
     stats: IdleStats,
     latency_limit_us: u64,
 }
@@ -123,6 +138,7 @@ impl CpuIdle {
             generation: 0,
             states: [POLL; MAX_IDLE_STATES],
             len: 0,
+            mwait_polls: false,
             stats: IdleStats {
                 entries: 0,
                 residency_cycles: 0,
@@ -219,6 +235,12 @@ fn refresh_states(cpu: usize) {
     let mut states = [POLL; MAX_IDLE_STATES];
     states[1] = HALT;
     let mut len = 2;
+    // Whether a store to the monitored line wakes MWAIT on this CPU (no
+    // `X86_BUG_MONITOR`); only x86 has MWAIT states to classify.
+    #[cfg(not(target_arch = "x86_64"))]
+    let mwait_polls = false;
+    #[cfg(target_arch = "x86_64")]
+    let mwait_polls;
     // Legacy registered callbacks remain supported, including BPF-visible IDs.
     {
         let registered = super::CSTATES.lock();
@@ -239,6 +261,17 @@ fn refresh_states(cpu: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         let caps = super::x86::CpuIdleCaps::probe();
+        super::x86::note_caps(caps);
+        mwait_polls = !caps.monitor_bug;
+        // Linux `select_idle_routine`: the default idle is `mwait_idle` when
+        // `prefer_mwait_c1_over_halt` holds, else HALT. A firmware C1 below
+        // still replaces it, as a cpuidle driver replaces `x86_idle`.
+        if caps.supports(IdleEntry::MwaitIdle) {
+            states[1] = IdleState {
+                entry: IdleEntry::MwaitIdle,
+                ..HALT
+            };
+        }
         let firmware = FIRMWARE
             .lock()
             .iter()
@@ -268,7 +301,18 @@ fn refresh_states(cpu: usize) {
     let mut current = CPUS[cpu].0.lock();
     current.states = states;
     current.len = len;
+    current.mwait_polls = mwait_polls;
     current.generation = generation;
+}
+
+/// Whether `entry` is a polling idle given this CPU's MONITOR behaviour.
+#[inline]
+fn entry_polls(entry: IdleEntry, mwait_polls: bool) -> bool {
+    match entry {
+        IdleEntry::Poll => true,
+        IdleEntry::MwaitIdle | IdleEntry::Mwait { .. } => mwait_polls,
+        _ => false,
+    }
 }
 
 fn with_governor<R>(cpu: usize, f: impl FnOnce(Option<&dyn IdleGovernor>) -> R) -> R {
@@ -300,7 +344,7 @@ pub fn prepare_idle(hints: IdleHints) -> IdlePlan {
         return IdlePlan::default();
     }
     refresh_states(hints.cpu);
-    let (states, len, history, latency, generation) = {
+    let (states, len, history, latency, generation, mwait_polls) = {
         let state = CPUS[hints.cpu].0.lock();
         (
             state.states,
@@ -308,6 +352,7 @@ pub fn prepare_idle(hints: IdleHints) -> IdlePlan {
             state.stats,
             state.latency_limit_us,
             state.generation,
+            state.mwait_polls,
         )
     };
     let deadline_us = hints.next_deadline_cycles.map_or(u64::MAX, |deadline| {
@@ -349,6 +394,7 @@ pub fn prepare_idle(hints: IdleHints) -> IdlePlan {
     IdlePlan {
         state: chosen,
         stop_tick: decision.stop_tick,
+        polls: entry_polls(chosen.entry, mwait_polls),
         generation,
         cpu: hints.cpu,
     }
@@ -357,11 +403,20 @@ pub fn prepare_idle(hints: IdleHints) -> IdlePlan {
 /// Enter a previously validated plan after the scheduler has published halted,
 /// fenced, and rechecked all wake sources. No lock or policy callback spans idle.
 ///
+/// `wake` is the scheduler's per-CPU wake word and `armed` the value it stored
+/// there when it published this CPU as polling. A polling plan
+/// ([`IdlePlan::polls`]) monitors that word and waits only while it still
+/// holds `armed`, so a waker's store ends the wait without an interrupt (Linux
+/// `mwait_idle`: monitor `&ti->flags`, recheck `need_resched()`, MWAIT). Other
+/// plans ignore it and wait for an interrupt.
+///
 /// # Safety
 /// Must execute on the CPU that prepared the plan, with IRQs masked, outside
 /// any task poll/RCU read section, and with a live clockevent for its deadlines.
-/// Returns with IRQs masked. `true` means a hardware idle state was entered.
-pub unsafe fn enter_idle(plan: IdlePlan) -> bool {
+/// `wake` must be a permanently mapped word owned by the caller's wake
+/// protocol. Returns with IRQs masked. `true` means a hardware idle state was
+/// entered.
+pub unsafe fn enter_idle(plan: IdlePlan, wake: &AtomicU32, armed: u32) -> bool {
     if plan.cpu != narf_lib::percpu::current_cpu()
         || plan.generation != STATE_GENERATION.load(Ordering::Acquire)
     {
@@ -383,12 +438,20 @@ pub unsafe fn enter_idle(plan: IdlePlan) -> bool {
         }
         #[cfg(target_arch = "x86_64")]
         entry => {
-            // SAFETY: refresh_states validated this CPU's driver capabilities.
-            unsafe { super::x86::enter(entry) };
+            if plan.polls {
+                // SAFETY: refresh_states validated this CPU's driver
+                // capabilities and that a store to the monitored line wakes
+                // MWAIT here; the caller owns `wake`.
+                unsafe { super::x86::enter_monitored(entry, wake, armed) };
+            } else {
+                // SAFETY: refresh_states validated this CPU's driver capabilities.
+                unsafe { super::x86::enter(entry) };
+            }
             true
         }
         #[cfg(not(target_arch = "x86_64"))]
         _ => {
+            let _ = (wake, armed);
             // SAFETY: unsupported architecture falls back to its normal idle.
             unsafe { narf_arch::idle_halt_then_disable() };
             true

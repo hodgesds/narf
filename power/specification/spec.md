@@ -82,7 +82,7 @@ pub trait IdleGovernor: Send + Sync + 'static {
 }
 // narf_power_core::executor
 pub fn prepare_idle(hints: IdleHints) -> IdlePlan;
-pub unsafe fn enter_idle(plan: IdlePlan) -> bool;
+pub unsafe fn enter_idle(plan: IdlePlan, wake: &AtomicU32, armed: u32) -> bool;
 pub fn reflect_idle(cpu: usize, plan: IdlePlan, elapsed_cycles: u64);
 pub fn idle_stats(cpu: usize) -> Option<IdleStats>;
 pub fn set_idle_latency_limit(cap: &Cap<Power, Grant>, cpu: usize,
@@ -98,9 +98,28 @@ The C1 fallback prevents a short prediction from causing perpetual busy polling.
 An explicit zero latency limit or custom C0 recommendation may select polling.
 
 `IdleState` contains `id`, `exit_latency_us`, `target_residency_us`, and a typed
-`IdleEntry` (`Poll`, `Halt`, exact `Mwait { hint }`, `SystemIo { port, acpi_type }`,
-or a registered callback). `IdlePlan` exposes read-only `state()` and
-`stop_tick()` accessors. The core revalidates recommendations against this CPU's
+`IdleEntry` (`Poll`, `Halt`, `MwaitIdle`, exact `Mwait { hint }`,
+`SystemIo { port, acpi_type }`, or a registered callback). `IdlePlan` exposes
+read-only `state()`, `stop_tick()` and `polls()` accessors.
+
+The built-in C1 follows Linux `select_idle_routine`: it is `MwaitIdle` (Linux
+`mwait_idle`: MONITOR, then `sti; mwait` with EAX=0/ECX=0) when
+`x86::prefer_mwait_c1_over_halt` holds on the CPU — MWAIT enumerated, no
+`X86_BUG_MONITOR` (Intel Goldmont, Lunar Lake M) and no AMD erratum-400 C1E
+part, and either no MWAIT extensions or at least one C1 sub-state in
+CPUID.05H:EDX — else `Halt`. A hypervisor that hides MWAIT (KVM without
+`cpu-pm=on`) therefore keeps HLT. A firmware `_CST` C1 still replaces it, as a
+cpuidle driver replaces `x86_idle`. MWAIT C1 keeps the LAPIC timer running, so
+one-shot/TSC-deadline and ARAT handling are unchanged.
+
+`IdlePlan::polls()` is true for `Poll`, `MwaitIdle` and `Mwait { .. }` unless the
+CPU has `X86_BUG_MONITOR` (Linux sets `TIF_POLLING_NRFLAG` across `poll_idle`,
+`mwait_idle` and `mwait_idle_with_hints` on the same terms). For a polling plan
+`enter_idle` MONITORs the caller's `wake` word, re-reads it, and waits only
+while it still holds `armed`, so a store to it ends the idle without an
+interrupt; `X86_BUG_CLFLUSH_MONITOR` parts flush the line first. Other plans
+ignore `wake` and wait for an interrupt. The scheduler passes its per-CPU idle
+word (scheduler §3.1, polling idle). The core revalidates recommendations against this CPU's
 supported table, latency and residency constraints. An invalid recommendation
 falls back to C1 if allowed, then C0. Registry changes invalidate prepared plans.
 
