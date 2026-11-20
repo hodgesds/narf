@@ -1916,6 +1916,9 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
 
     let result = (|| {
         identify_and_publish()?;
+        // Publishing scans for partitions with a single-block read;
+        // only the commands after it belong to the multi-block calls.
+        let published = transport.cmd_indices().len();
         // 4-block write + read-back through CMD25 / CMD18.
         let mut data = alloc::vec![0u8; 4 * 512];
         for b in 0..4 {
@@ -1937,7 +1940,7 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
                 _ => return Err("PIO multi-block write must land on the card blocks"),
             }
         }
-        let indices = transport.cmd_indices();
+        let indices = transport.cmd_indices().split_off(published);
         if !indices.contains(&18) || !indices.contains(&25) {
             return Err("multi-block calls must issue CMD18/CMD25");
         }
@@ -1960,7 +1963,7 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
         if big_back != big {
             return Err("65-block PIO read-back must match");
         }
-        let indices = transport.cmd_indices();
+        let indices = transport.cmd_indices().split_off(published);
         if indices.iter().filter(|&&i| i == 17).count() != 1
             || indices.iter().filter(|&&i| i == 24).count() != 1
         {
@@ -3419,12 +3422,12 @@ fn fixture_emmc_rpmb_auth_round_trip() -> TestResult {
         if count(23) != 16 || count(25) != 9 || count(18) != 7 {
             return Err("RPMB conversation must be CMD23 + CMD18/CMD25 (16/9/7)");
         }
-        // Eleven SWITCHes: the identify pin to the user area,
-        // then to RPMB (0x0B) and back (0x08) for each of the
-        // five operations.
+        // Thirteen SWITCHes: the identify pin to the user area,
+        // then to RPMB (0x0B) and back (0x08) for each of the six
+        // operations (key, counter, write, counter, two reads).
         let switches = transport.switch_args();
         let switch_arg = |value: u8| (3u32 << 24) | (179u32 << 16) | ((value as u32) << 8);
-        if switches.len() != 11 || !switches.contains(&switch_arg(0x0B)) {
+        if switches.len() != 13 || !switches.contains(&switch_arg(0x0B)) {
             return Err("each RPMB op must switch to RPMB and back to the user area");
         }
         // The model saw the write land exactly once.
