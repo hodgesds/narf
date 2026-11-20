@@ -2313,7 +2313,14 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     if status.group1_function() != 3 {
         return TestResult::Fail("SwitchStatus must report byte 16 low nibble as current function");
     }
-    if !status.supports_function(3) || status.supports_function(4) {
+    // 0x1F advertises SDR12..DDR50 (bits 0-4); a mask without bit 4
+    // must report DDR50 unsupported.
+    let no_ddr50 = SwitchStatus::parse(&switch_status_bytes(0x0F, 3));
+    if !status.supports_function(3)
+        || !status.supports_function(4)
+        || !no_ddr50.supports_function(3)
+        || no_ddr50.supports_function(4)
+    {
         return TestResult::Fail("SwitchStatus supports_function must match the support bits");
     }
     // Mode table: function values, max clocks, HOST_CONTROL2

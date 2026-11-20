@@ -3343,6 +3343,8 @@ mod tests {
         let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
         let powered = power_on(&lt, index, &name, &[0x04, 0x0C, 0x02], false, false);
         CAPTURED.lock().clear();
+        // Powered, both writes go to the controller: queue their CCs.
+        lt.enqueue_event(cc(op::HCI_WRITE_CLASS_OF_DEVICE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_DEV_CLASS, index, &[0x0C, 0x02]));
         let class_ok = is_cmd_complete(&r, OP_SET_DEV_CLASS, STATUS_SUCCESS)
             && r[0][9..12] == [0x04, 0x0C, 0x02][..];
@@ -3359,6 +3361,7 @@ mod tests {
         params[..12].copy_from_slice(b"narf-renamed");
         params[249..253].copy_from_slice(b"narf");
         CAPTURED.lock().clear();
+        lt.enqueue_event(cc(op::HCI_WRITE_LOCAL_NAME, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_LOCAL_NAME, index, &params));
         let name_ok = is_cmd_complete(&r, OP_SET_LOCAL_NAME, STATUS_SUCCESS)
             && r[0][9..21] == b"narf-renamed"[..]

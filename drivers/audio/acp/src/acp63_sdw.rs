@@ -872,7 +872,7 @@ mod tests {
         if fixture.model.regs.get(&0xb721).copied() != Some(0xc0)
             || fixture.model.regs.get(&0x4f12).copied() != Some(0x91)
             || fixture.model.regs.get(&0xb501).copied() != Some(0x03)
-            || fixture.model.regs.get(&0x8420).copied() != Some(0x49)
+            || fixture.model.regs.get(&0x84a0).copied() != Some(0x49)
         {
             return TestResult::Fail("RT711 attach-time init did not land");
         }

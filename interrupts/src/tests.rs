@@ -578,6 +578,13 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
     if let Err(result) = ensure_timer_pump_for_test() {
         return result;
     }
+    // The pump duplicates wheel deadlines onto HPET only as the fallback
+    // for a missing or unreliable LAPIC TSC-deadline primary
+    // (`timer_pump::wheel_arm`). With the LAPIC primary, the HPET carries
+    // no wheel deadline and this path is not in use.
+    if !timer_pump::uses_hpet_fallback() {
+        return TestResult::Skip("LAPIC TSC-deadline is the primary; HPET pump not in use");
+    }
 
     struct CW(AtomicUsize);
     impl Wake for CW {

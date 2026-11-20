@@ -586,19 +586,19 @@ mod tests {
         }
         /// Collect the (index, value) pairs of every index write
         /// in the log, in order: an index write is the four-transfer
-        /// pattern [W(0x7520,0), W(0x8520,idx), W(0x7420,hi),
-        /// W(0x8420,lo)].
+        /// pattern [W(0x7520,0), W(0x85a0,idx), W(0x7420,hi),
+        /// W(0x84a0,lo)].
         fn index_writes(&self) -> Vec<(u8, u16)> {
             let log = self.log();
             let mut out = Vec::new();
             let mut i = 0;
             while i + 3 < log.len() {
                 if log[i] == w(1, 0x7520, 0)
-                    && log[i + 1].addr == 0x8520
+                    && log[i + 1].addr == 0x85a0
                     && log[i + 1].write.is_some()
                     && log[i + 2].addr == 0x7420
                     && log[i + 2].write.is_some()
-                    && log[i + 3].addr == 0x8420
+                    && log[i + 3].addr == 0x84a0
                     && log[i + 3].write.is_some()
                 {
                     let idx = log[i + 1].write.unwrap();
@@ -623,7 +623,7 @@ mod tests {
                 }
             }
             if let Some(value) = write {
-                if addr == 0x8520 {
+                if addr == 0x85a0 {
                     *self.last_index.lock() = value;
                 }
                 if addr == 0xaca0 {
@@ -727,11 +727,11 @@ mod tests {
         }
         let expected = [
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x91),
+            w(1, 0x85a0, 0x91),
             w(1, 0x7420, 0x01),
-            w(1, 0x8420, 0x54),
+            w(1, 0x84a0, 0x54),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x09),
+            w(1, 0x85a0, 0x09),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
@@ -739,7 +739,7 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x09),
+            w(1, 0x85a0, 0x09),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
@@ -747,9 +747,9 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x09),
+            w(1, 0x85a0, 0x09),
             w(1, 0x7420, 0x20),
-            w(1, 0x8420, 0x02),
+            w(1, 0x84a0, 0x02),
         ];
         if bus.transport().log() != expected {
             return TestResult::Fail("index conversation mismatch");
@@ -771,7 +771,7 @@ mod tests {
         let expected = [
             w(1, 0xff01, 0x00),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x1a),
+            w(1, 0x85a0, 0x1a),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
@@ -779,9 +779,9 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x1a),
+            w(1, 0x85a0, 0x1a),
             w(1, 0x7420, 0x40),
-            w(1, 0x8420, 0x00),
+            w(1, 0x84a0, 0x00),
             w(1, 0x3501, 0x00),
             w(1, 0x3719, 0x25),
             w(1, 0x3721, 0xc0),
@@ -814,25 +814,25 @@ mod tests {
             w(1, 0x4e21, 0x11),
             w(1, 0x4f21, 0x01),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x91),
+            w(1, 0x85a0, 0x91),
             w(1, 0x7420, 0x01),
-            w(1, 0x8420, 0x54),
+            w(1, 0x84a0, 0x54),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x4a),
+            w(1, 0x85a0, 0x4a),
             w(1, 0x7420, 0x20),
-            w(1, 0x8420, 0x1b),
+            w(1, 0x84a0, 0x1b),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x45),
+            w(1, 0x85a0, 0x45),
             w(1, 0x7420, 0x50),
-            w(1, 0x8420, 0x89),
+            w(1, 0x84a0, 0x89),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x6b),
+            w(1, 0x85a0, 0x6b),
             w(1, 0x7420, 0x50),
-            w(1, 0x8420, 0x64),
+            w(1, 0x84a0, 0x64),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x48),
+            w(1, 0x85a0, 0x48),
             w(1, 0x7420, 0xd2),
-            w(1, 0x8420, 0x49),
+            w(1, 0x84a0, 0x49),
             w(1, 0x3501, 0x03),
         ];
         if bus.transport().log() != expected {
@@ -855,13 +855,13 @@ mod tests {
             w(1, 0x3821, 0x81),
             w(1, 0x3855, 0x83),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x10),
+            w(1, 0x85a0, 0x10),
             w(1, 0x7420, 0x24),
-            w(1, 0x8420, 0x20),
+            w(1, 0x84a0, 0x20),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x19),
+            w(1, 0x85a0, 0x19),
             w(1, 0x7420, 0x2e),
-            w(1, 0x8420, 0x11),
+            w(1, 0x84a0, 0x11),
             w(1, 0x3501, 0x03),
         ];
         if bus.transport().log() != expected {
@@ -884,15 +884,15 @@ mod tests {
             w(1, 0x3821, 0x81),
             w(1, 0x3855, 0x83),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x10),
+            w(1, 0x85a0, 0x10),
             w(1, 0x7420, 0x24),
-            w(1, 0x8420, 0x20),
+            w(1, 0x84a0, 0x20),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x19),
+            w(1, 0x85a0, 0x19),
             w(1, 0x7420, 0x2e),
-            w(1, 0x8420, 0x11),
+            w(1, 0x84a0, 0x11),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x09),
+            w(1, 0x85a0, 0x09),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
@@ -900,11 +900,11 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x09),
+            w(1, 0x85a0, 0x09),
             w(1, 0x7420, 0x20),
-            w(1, 0x8420, 0x02),
+            w(1, 0x84a0, 0x02),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x11),
+            w(1, 0x85a0, 0x11),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
@@ -912,9 +912,9 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x11),
+            w(1, 0x85a0, 0x11),
             w(1, 0x7420, 0x04),
-            w(1, 0x8420, 0x00),
+            w(1, 0x84a0, 0x00),
             w(1, 0x3501, 0x03),
         ];
         if bus.transport().log() != expected {
@@ -980,7 +980,7 @@ mod tests {
             r(1, 0x2014),
             r(1, 0x2015),
             w(1, 0x7520, 0x00),
-            w(1, 0x8520, 0x46),
+            w(1, 0x85a0, 0x46),
             w(1, 0x9c20, 0x00),
             w(1, 0xaca0, 0x00),
             r(1, 0x2012),
