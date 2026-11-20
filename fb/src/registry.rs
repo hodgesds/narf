@@ -72,6 +72,25 @@ impl core::fmt::Debug for Entry {
 
 static REGISTRY: IrqSafeSpinLock<Vec<Arc<Entry>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+/// The drain task, parked while no client is connected; `connect` wakes it.
+static DRAIN_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> = IrqSafeSpinLock::new(None);
+
+/// Resolves once at least one client is connected: the drain loop parks on
+/// it instead of polling an empty registry (no client, no timer).
+pub fn connected() -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(|cx| {
+        if count() != 0 {
+            return core::task::Poll::Ready(());
+        }
+        *DRAIN_WAKER.lock() = Some(cx.waker().clone());
+        // Registered before the re-check: `connect` publishes, then wakes.
+        if count() != 0 {
+            DRAIN_WAKER.lock().take();
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    })
+}
 
 /// Errors from `connect`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -123,6 +142,10 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
         draining: AtomicBool::new(false),
         drained: AtomicU64::new(0),
     }));
+    let waker = DRAIN_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
     Ok(handle)
 }
 
