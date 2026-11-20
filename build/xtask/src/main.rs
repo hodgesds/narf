@@ -2498,8 +2498,16 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
         "2" => "-gicv2",
         _ => "",
     };
+    // The dumped tree's /memory node is the guest's RAM size, so the size is
+    // part of the name too; 512 MiB keeps the historical names.
+    let mem_mb = qemu_guest_mem_mb();
+    let mem = if mem_mb == 512 {
+        String::new()
+    } else {
+        format!("-{mem_mb}M")
+    };
     let path = if cmdline.is_empty() && initrd_len == 0 {
-        root.join("target").join(format!("qemu-virt{gic}.dtb"))
+        root.join("target").join(format!("qemu-virt{gic}{mem}.dtb"))
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in cmdline.as_bytes() {
@@ -2511,7 +2519,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
         root.join("target")
-            .join(format!("qemu-virt{gic}-{h:016x}.dtb"))
+            .join(format!("qemu-virt{gic}{mem}-{h:016x}.dtb"))
     };
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -2569,7 +2577,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             .arg("-smp")
             .arg("2")
             .arg("-m")
-            .arg("512M")
+            .arg(format!("{mem_mb}M"))
             .arg("-display")
             .arg("none")
             .arg("-no-reboot")
