@@ -2193,6 +2193,12 @@ fn smoke_drm_laptop_display_audio_apply_executes_audio_after_video() -> TestResu
         Some(m) if m.width == 1920 && m.height == 1080 && m.surface_phys == 0x8000_0000 => {}
         _ => return TestResult::Fail("DP CRTC mode not recorded"),
     }
+    // The DP apply above snapshots its audio writes into the
+    // process-global SAVED_DISPLAY_AUDIO (the PM-resume shape):
+    // drop it here so a later set_mode with the same timing does
+    // not replay this test's audio writes into its own fixture
+    // (#2274).
+    crate::amdgpu::reset_saved_display_audio_for_test();
     TestResult::Pass
 }
 #[cfg(feature = "amdgpu")]
