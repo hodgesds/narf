@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -144,6 +144,11 @@ pub struct Task {
     /// drop or an RCU operation in a timer handler.
     rlimit_override: IrqSafeSpinLock<Option<Arc<crate::rlimit::ProcessLimits>>>,
     rlimits_rebound: AtomicBool,
+    /// Linux `SYSCALL_WORK_SECCOMP` for this task: whether its syscall
+    /// entry must consult seccomp at all (`crate::seccomp::secure_computing`).
+    /// `SECCOMP_WORK_UNKNOWN` until the entry path or a mode change resolves
+    /// it; only `SECCOMP_WORK_NONE` lets the entry skip seccomp.
+    pub(crate) seccomp_work: AtomicU8,
     /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
     /// thread group is terminating. Consulted so a sibling that races
     /// the group exit reports the group's status.
@@ -271,6 +276,7 @@ impl Task {
             rlimit_override: IrqSafeSpinLock::new(None),
             rlimits_rebound: AtomicBool::new(false),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
+            seccomp_work: AtomicU8::new(crate::seccomp::SECCOMP_WORK_UNKNOWN),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             select_park: narf_lib::sync::IrqSafeSpinLock::new(None),
@@ -438,6 +444,26 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
 /// must be short and must not take another task-registry lock.
 pub fn try_with_task<R>(tid: u64, f: impl FnOnce(&Task) -> R) -> Option<R> {
     let tasks = task_registry_shard(tid).tasks.try_lock()?;
+    tasks.get(&tid).map(|task| f(task))
+}
+
+/// Apply `f` to registered task `tid` WITHOUT taking a reference: the
+/// current task is reached through the scheduler-published owner, any other
+/// under its registry shard lock. No `Arc` is cloned or dropped, so this is
+/// usable from IRQ context (rule 4 above). `f` runs under the shard lock for
+/// a cross-task call, so it must be a few atomic operations and must not take
+/// another registry lock.
+pub(crate) fn with_task_ref<R>(tid: u64, f: impl FnOnce(&Task) -> R) -> Option<R> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if !ptr.is_null() {
+        // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+        // in-flight `UserTaskFuture` retains that Arc for this complete access.
+        let task = unsafe { &*ptr };
+        if task.tid == tid {
+            return Some(f(task));
+        }
+    }
+    let tasks = task_registry_shard(tid).tasks.lock();
     tasks.get(&tid).map(|task| f(task))
 }
 
