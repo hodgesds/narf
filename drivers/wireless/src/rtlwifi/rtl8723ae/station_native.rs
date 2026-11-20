@@ -97,6 +97,20 @@ impl<I: crate::rtlwifi::firmware_transport::Io, M: Memory> Prepared<I, M> {
                 .adapter()
                 .version;
             crate::rtlwifi::rtl8723ae::radio_switch::on(&self.io, version)
+        } else if self.chip == super::super::Chip::Rtl8723be {
+            // Linux rtl8723be_gpio_radio_on_off_checking: make the switch
+            // pin an input (REG_GPIO_IO_SEL_2 0x62 bit 1 clear), then read
+            // REG_GPIO_PIN_CTRL_2 (0x60) bit 1; set is RF on. 0x6c bit 31,
+            // the fallback below, is the RTL8188EE switch (REG_GPIO_OUTPUT);
+            // on this chip 0x6c is a GPIO output register.
+            // LINUX-GAP: `rtlphy->polarity_ctl`, which inverts the sense, is
+            // not modelled; the default (non-inverted) sense applies.
+            let sel = self.io.read8(0x62)?;
+            self.io.write8(0x62, sel & !(1 << 1))?;
+            if self.io.read8(0x60)? & (1 << 1) == 0 {
+                return Err(crate::rtlwifi::prepare::Error::RadioOff);
+            }
+            Ok(())
         } else {
             crate::rtlwifi::station_control::radio_on(&self.io)
         }

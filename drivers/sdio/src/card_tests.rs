@@ -574,6 +574,12 @@ fn smoke_sdio_card_function_disable_requires_native_ready_and_preserves_other_ow
             state.hold_disabled_ready = fault == 1;
             state.refuse_commands = fault == 2;
         }
+        // The held-ready fault polls IO_READY until the function's
+        // enable timeout (1 s floor, from the CIS). Model CMD52s cost
+        // nanoseconds, so a full second logs millions of commands and
+        // the log outgrows the largest heap block; a short timeout
+        // proves the same refusal.
+        card.functions[2].enable_timeout_ms = 5;
         let result = card.disable_func(2);
         if (fault == 0) != result.is_ok() || card.enabled & 4 != 0 {
             return TestResult::Fail("function disable invented native ready/command receipt");

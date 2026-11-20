@@ -2930,7 +2930,10 @@ fn smoke_scheduler_maintained_task_counts() -> TestResult {
         return TestResult::Fail("fresh spawn counted as parked");
     }
 
-    crate::run_until_empty();
+    // Drive single rounds: `run_until_empty` keeps servicing a CPU while a
+    // parked resident remains (sleepers need timer-wheel service), so it
+    // never returns with this task parked on a waker only the test fires.
+    let _ = crate::poll_one_round();
     // Parked until woken: total +1, parked +1, enumeration +1.
     if crate::total_task_count() != pre_total + 1 {
         return TestResult::Fail("parked task left total_task_count");
@@ -2949,7 +2952,14 @@ fn smoke_scheduler_maintained_task_counts() -> TestResult {
     if let Some(w) = PARKED_WAKER.lock().take() {
         w.wake();
     }
-    crate::run_until_empty();
+    // The wake lands on this CPU's wake list; a round or two folds it in,
+    // polls the task to completion and drops it.
+    for _ in 0..8 {
+        let _ = crate::poll_one_round();
+        if crate::total_task_count() == pre_total {
+            break;
+        }
+    }
     // Completed and dropped: all three back to baseline.
     if crate::total_task_count() != pre_total {
         return TestResult::Fail("completed task didn't drop total_task_count");

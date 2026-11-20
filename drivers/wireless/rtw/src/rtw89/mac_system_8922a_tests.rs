@@ -346,6 +346,11 @@ fn smoke_rtw8922a_native_system_current_authority_and_bounds() -> TestResult {
     // SAFETY: same exclusive BAR RAM, intentionally shortened checked extent.
     let mut short_port = unsafe { NativeRegs::new(&short, &cap) };
     kt_assert_eq!(short_port.read32(0x10004), Err(power::Error::Access));
+    // Each refused probe above latched that port's fault for good, so the
+    // revocation case needs a fresh port over the same BAR.
+    drop(native);
+    // SAFETY: same exclusive BAR RAM; the faulted port is gone.
+    let native = unsafe { NativeRegs::new(&region, &cap) };
     let mut system = System::default();
     let mut revoking = RevokeOnReadback { native, cap };
     // SAFETY: exclusive inert BAR model; capability expires after the first write.

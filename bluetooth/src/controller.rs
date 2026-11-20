@@ -30,12 +30,12 @@ pub enum BringupPhase {
     ReadBdAddr = 2,
     ReadBufferSize = 3,
     SetEventMask = 4,
-    /// HCI_Read_Local_Name (§7.4.14) — the name mgmt READ_INFO
+    /// HCI_Read_Local_Name (§7.3.12) — the name mgmt READ_INFO
     /// reports (issue #815). Informational, after the mandatory
     /// sequence; a controller that cannot answer it fails bring-up
     /// rather than reporting a zeroed name.
     ReadLocalName = 5,
-    /// HCI_Read_Class_Of_Device (§7.4.23) — the class mgmt READ_INFO
+    /// HCI_Read_Class_Of_Device (§7.3.25) — the class mgmt READ_INFO
     /// reports (issue #815). Same discipline as the local name.
     ReadClassOfDevice = 6,
     Ready = 7,
@@ -97,12 +97,12 @@ pub struct ControllerInfo {
     pub acl_total_num: u16,
     /// Number of HC SCO data buffers.
     pub sco_total_num: u16,
-    /// 3-byte Class of Device (§7.4.23). All-zero until
+    /// 3-byte Class of Device (§7.3.25). All-zero until
     /// ReadClassOfDevice completes; mgmt READ_INFO reports this
     /// verbatim, so a zero here means "not yet read", never a
     /// fabricated class (issue #815).
     pub dev_class: [u8; 3],
-    /// 248-byte local name (§7.4.14, NUL-padded). All-zero until
+    /// 248-byte local name (§7.3.12, NUL-padded). All-zero until
     /// ReadLocalName completes; mgmt READ_INFO reports this verbatim
     /// (issue #815).
     pub local_name: [u8; 248],
@@ -262,7 +262,7 @@ impl Controller {
             |_, _| Ok(()),
         )?;
 
-        // Local name + Class of Device (§7.4.14/§7.4.23): the
+        // Local name + Class of Device (§7.3.12/§7.3.25): the
         // identity mgmt READ_INFO reports. Informational, not part
         // of the §3 mandatory sequence, but read here so the
         // registry never advertises a zeroed name/class for a

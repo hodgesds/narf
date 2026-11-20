@@ -520,7 +520,7 @@ fn smoke_tcg2_log_rejects_malformed() -> TestResult {
     use crate::tcg2::{parse_tcg2_log, Tcg2LogError};
     let algs = [(0x0004u16, 20u16), (0x000Bu16, 32u16)];
     let good = tcg2_spec_id_record(&algs);
-    let mut rec = tcg2_event2_record(
+    let rec = tcg2_event2_record(
         0,
         0x0000_0008,
         &[(0x0004, &[0x11u8; 20]), (0x000B, &[0x22u8; 32])],
@@ -537,10 +537,12 @@ fn smoke_tcg2_log_rejects_malformed() -> TestResult {
     if parse_tcg2_log(&sha1_only) != Err(Tcg2LogError::NoSha256Bank) {
         return TestResult::Fail("SHA-1-only log accepted");
     }
-    // Digest count (1) != numberOfAlgorithms (2).
+    // Digest count (1) != numberOfAlgorithms (2), on a copy: the
+    // truncation case below needs the well-formed record.
     let mut log = good.clone();
-    rec[8..12].copy_from_slice(&1u32.to_le_bytes());
-    log.extend_from_slice(&rec);
+    let mut bad_count = rec.clone();
+    bad_count[8..12].copy_from_slice(&1u32.to_le_bytes());
+    log.extend_from_slice(&bad_count);
     if parse_tcg2_log(&log) != Err(Tcg2LogError::BadDigestCount) {
         return TestResult::Fail("digest-count mismatch accepted");
     }

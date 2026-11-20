@@ -76,7 +76,13 @@ pub(crate) struct BePort(Arc<IrqSafeSpinLock<Model>>);
 impl BePort {
     pub(crate) fn new() -> Self {
         Self(Arc::new(IrqSafeSpinLock::new(Model {
-            regs: vec![0; 0x1000],
+            // The hardware radio switch reads on (REG_GPIO_PIN_CTRL_2
+            // 0x60 bit 1), as on a board with the switch pulled up.
+            regs: {
+                let mut regs = vec![0; 0x1000];
+                regs[0x60] = 1 << 1;
+                regs
+            },
             writes: Vec::new(),
             kicks: Vec::new(),
             master: false,

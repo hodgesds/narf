@@ -370,7 +370,9 @@ mod tests {
         if paged_write(&bus, 1, 0x4100_1888, 0x00) != Ok(()) {
             return TestResult::Fail("paged SDCA write failed");
         }
-        // A plain register at or above 0x8000 pages too (pages 0,0).
+        // A plain register at or above 0x8000 pages too: Linux
+        // `sdw_fill_msg` takes ADDRPAGE2 from bits [22:15], so 0xc710
+        // (bit 15 set) goes out as page1 0, page2 1.
         if paged_write(&bus, 1, 0xc710, 0x17) != Ok(()) {
             return TestResult::Fail("paged plain write failed");
         }
@@ -394,7 +396,7 @@ mod tests {
             w(1, 0x0049, 0x00),
             w(1, 0x9888, 0x00),
             w(1, 0x0048, 0x00),
-            w(1, 0x0049, 0x00),
+            w(1, 0x0049, 0x01),
             w(1, 0xc710, 0x17),
         ];
         if bus.transport().log() != expected {
@@ -478,8 +480,9 @@ mod tests {
             (0xd002, 0xbf),
             (0xd003, 0x03),
             (0xd004, 0xbf),
+            // The last paged access (0xd004) leaves page1 0, page2 1.
             (0x0048, 0x00),
-            (0x0049, 0x00),
+            (0x0049, 0x01),
         ];
         let regs = bus.transport().regs.lock();
         for &(addr, value) in expected_state {

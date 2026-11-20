@@ -776,7 +776,10 @@ fn stop_discovery(index: u16, params: &[u8]) -> Vec<u8> {
     if current_settings(index) & SETTING_POWERED == 0 {
         return cmd_status(index, OP_STOP_DISCOVERY, STATUS_NOT_POWERED);
     }
-    match DISCOVERING.lock().get(&index).copied() {
+    // Copy the record out first: the arms below take DISCOVERING again,
+    // and a scrutinee guard would still be held there.
+    let active_discovery = DISCOVERING.lock().get(&index).copied();
+    match active_discovery {
         None => cmd_status(index, OP_STOP_DISCOVERY, STATUS_REJECTED),
         Some(active) if active != disc_type => {
             cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
@@ -1743,7 +1746,11 @@ fn generate_non_resolvable(index: u16) -> Result<[u8; 6], u8> {
 /// is skipped when the desired address is already programmed.
 fn program_random_address(index: u16, settings: u32) -> Result<(), u8> {
     let desired = if privacy_mode(index) != 0 {
-        match CURRENT_RPA.lock().get(&index).copied() {
+        // Read the RPA into a local first: a guard in the `match`
+        // scrutinee lives for the whole match, and the `None` arm takes
+        // CURRENT_RPA again (IrqSafeSpinLock is not re-entrant).
+        let current = CURRENT_RPA.lock().get(&index).copied();
+        match current {
             Some(rpa) => Some(rpa),
             None => {
                 let rpa = generate_rpa(index)?;
@@ -2747,6 +2754,11 @@ mod tests {
         lt.enqueue_event(cc(op::HCI_WRITE_PAGE_SCAN_TYPE, 0, &[]));
     }
 
+    /// HCI commands every power-on issues before any feature step: one
+    /// per Command Complete `enqueue_power_on_ccs` queues (reset, event
+    /// mask, name, class, scan enable, the five single settings).
+    const POWER_ON_BASE_COMMANDS: usize = 10;
+
     /// Enqueue the Command Complete a power-off consumes (the
     /// best-effort Write_Scan_Enable quiesce).
     fn enqueue_power_off_cc(lt: &LoopbackTransport) {
@@ -3343,6 +3355,8 @@ mod tests {
         let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
         let powered = power_on(&lt, index, &name, &[0x04, 0x0C, 0x02], false, false);
         CAPTURED.lock().clear();
+        // Powered, both writes go to the controller: queue their CCs.
+        lt.enqueue_event(cc(op::HCI_WRITE_CLASS_OF_DEVICE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_DEV_CLASS, index, &[0x0C, 0x02]));
         let class_ok = is_cmd_complete(&r, OP_SET_DEV_CLASS, STATUS_SUCCESS)
             && r[0][9..12] == [0x04, 0x0C, 0x02][..];
@@ -3359,6 +3373,7 @@ mod tests {
         params[..12].copy_from_slice(b"narf-renamed");
         params[249..253].copy_from_slice(b"narf");
         CAPTURED.lock().clear();
+        lt.enqueue_event(cc(op::HCI_WRITE_LOCAL_NAME, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_LOCAL_NAME, index, &params));
         let name_ok = is_cmd_complete(&r, OP_SET_LOCAL_NAME, STATUS_SUCCESS)
             && r[0][9..21] == b"narf-renamed"[..]
@@ -4165,8 +4180,9 @@ mod tests {
         // peer, channels 0x07, filter 0x00. Data: flags [0x02,
         // 0x01, 0x00] (discoverable off, BR/EDR on) + complete
         // name "narf-mgmt"; scan response empty; enable [0x01].
+        // Significant length: flags AD (3) + name AD (2 + 9) = 14.
         let mut adv_params = [0u8; 32];
-        adv_params[0] = 15;
+        adv_params[0] = 14;
         adv_params[1..4].copy_from_slice(&[0x02, 0x01, 0x00]);
         adv_params[4] = 0x0A;
         adv_params[5] = 0x09;
@@ -4349,7 +4365,9 @@ mod tests {
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_CLEAR_RESOLVING_LIST, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();
@@ -4389,7 +4407,9 @@ mod tests {
                 == 0;
         enqueue_power_on_ccs(&lt, &[0u8; 248], &[0u8; 3], false, false);
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered2 = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();
@@ -4549,7 +4569,9 @@ mod tests {
         add2[23..39].copy_from_slice(&[0xAA; 16]);
         lt.enqueue_event(cc(op::HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST, 0, &[]));
         lt.enqueue_event(cc(op::HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE, 0, &[]));
-        let sent_len = lt.sent_commands().len();
+        // Power-on's base sequence comes first; the checks below are
+        // about what follows it.
+        let sent_len = lt.sent_commands().len() + POWER_ON_BASE_COMMANDS;
         let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let powered2 = is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS);
         let sent = lt.sent_commands();

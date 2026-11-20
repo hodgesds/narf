@@ -2558,13 +2558,15 @@ fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
     }
     let verbs = &fixture.model.verbs;
     // The 44-verb bass-speaker sequence, verbatim and in order,
-    // is the only coef traffic: ALC287 has no init coef table.
+    // is the only coef traffic: ALC287 has no init coef table. Coef
+    // traffic is the coef verbs (verb id in bits [19:16]): SET_PROC_COEF
+    // 0x4, SET_COEF_INDEX 0x5, GET_PROC_COEF 0xc, GET_COEF_INDEX 0xd;
+    // enumeration's GET_PARAMETER (0xf) to the same node is not.
     let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
-    let coef_verbs: Vec<u32> = verbs
-        .iter()
-        .copied()
-        .filter(|v| (*v >> 20) & 0xff == coef_node)
-        .collect();
+    let is_coef = |v: &u32| {
+        (*v >> 20) & 0xff == coef_node && matches!((*v >> 16) & 0xf, 0x4 | 0x5 | 0xc | 0xd)
+    };
+    let coef_verbs: Vec<u32> = verbs.iter().copied().filter(is_coef).collect();
     if coef_verbs.len() != 44 {
         return TestResult::Fail("YOGA9 quirk must issue exactly its 44-verb sequence");
     }
@@ -2577,7 +2579,7 @@ fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
     }
     // The sequence runs before enumeration.
     let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
-    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    let last_coef = verbs.iter().rposition(is_coef);
     match (first_pincfg, last_coef) {
         (Some(at), Some(last)) if last < at => {}
         _ => return TestResult::Fail("YOGA9 coef sequence must precede enumeration"),

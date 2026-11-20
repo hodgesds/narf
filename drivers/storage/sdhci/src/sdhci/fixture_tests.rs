@@ -1137,6 +1137,10 @@ impl FixtureTransport {
         let mut regs = [0u8; 0x100];
         regs[0x40..0x44].copy_from_slice(&FIXTURE_CAPS.to_le_bytes());
         regs[0xFE] = FIXTURE_SPEC_VERSION;
+        // Installed fixtures skip `bring_up`, which always leaves the
+        // slot powered at 3.3 V before identify; start there, so a
+        // power cycle has the 3.3 V field to preserve.
+        regs[REG_POWER_CONTROL as usize] = POWER_3V3 | POWER_ON;
         FixtureTransport {
             state: IrqSafeSpinLock::new(FixtureState {
                 regs,
@@ -1916,6 +1920,9 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
 
     let result = (|| {
         identify_and_publish()?;
+        // Publishing scans for partitions with a single-block read;
+        // only the commands after it belong to the multi-block calls.
+        let published = transport.cmd_indices().len();
         // 4-block write + read-back through CMD25 / CMD18.
         let mut data = alloc::vec![0u8; 4 * 512];
         for b in 0..4 {
@@ -1937,7 +1944,7 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
                 _ => return Err("PIO multi-block write must land on the card blocks"),
             }
         }
-        let indices = transport.cmd_indices();
+        let indices = transport.cmd_indices().split_off(published);
         if !indices.contains(&18) || !indices.contains(&25) {
             return Err("multi-block calls must issue CMD18/CMD25");
         }
@@ -1960,7 +1967,7 @@ fn fixture_sdhci_multiblock_pio() -> TestResult {
         if big_back != big {
             return Err("65-block PIO read-back must match");
         }
-        let indices = transport.cmd_indices();
+        let indices = transport.cmd_indices().split_off(published);
         if indices.iter().filter(|&&i| i == 17).count() != 1
             || indices.iter().filter(|&&i| i == 24).count() != 1
         {
@@ -2313,7 +2320,14 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     if status.group1_function() != 3 {
         return TestResult::Fail("SwitchStatus must report byte 16 low nibble as current function");
     }
-    if !status.supports_function(3) || status.supports_function(4) {
+    // 0x1F advertises SDR12..DDR50 (bits 0-4); a mask without bit 4
+    // must report DDR50 unsupported.
+    let no_ddr50 = SwitchStatus::parse(&switch_status_bytes(0x0F, 3));
+    if !status.supports_function(3)
+        || !status.supports_function(4)
+        || !no_ddr50.supports_function(3)
+        || no_ddr50.supports_function(4)
+    {
         return TestResult::Fail("SwitchStatus supports_function must match the support bits");
     }
     // Mode table: function values, max clocks, HOST_CONTROL2
@@ -2357,9 +2371,11 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     }
     // Mode selection matrix (Linux `sd_update_bus_speed_mode`
     // preference: SDR104 > DDR50 > SDR50 > SDR25).
+    // Caps_1 0x3 is SDR50 + SDR104 without DDR50, so the base clock
+    // alone decides between SDR25 and SDR50 there.
     let cases: [(u8, u32, u32, Option<UhsMode>); 8] = [
-        (0x1F, 0x7, 50_000_000, Some(UhsMode::Sdr25)),
-        (0x1F, 0x7, 100_000_000, Some(UhsMode::Sdr50)),
+        (0x1F, 0x3, 50_000_000, Some(UhsMode::Sdr25)),
+        (0x1F, 0x3, 100_000_000, Some(UhsMode::Sdr50)),
         (0x1F, 0x7, 208_000_000, Some(UhsMode::Sdr104)),
         (0x1F, 0x4, 50_000_000, Some(UhsMode::Ddr50)),
         (0x1F, 0x5, 100_000_000, Some(UhsMode::Ddr50)),
@@ -3410,12 +3426,12 @@ fn fixture_emmc_rpmb_auth_round_trip() -> TestResult {
         if count(23) != 16 || count(25) != 9 || count(18) != 7 {
             return Err("RPMB conversation must be CMD23 + CMD18/CMD25 (16/9/7)");
         }
-        // Eleven SWITCHes: the identify pin to the user area,
-        // then to RPMB (0x0B) and back (0x08) for each of the
-        // five operations.
+        // Thirteen SWITCHes: the identify pin to the user area,
+        // then to RPMB (0x0B) and back (0x08) for each of the six
+        // operations (key, counter, write, counter, two reads).
         let switches = transport.switch_args();
         let switch_arg = |value: u8| (3u32 << 24) | (179u32 << 16) | ((value as u32) << 8);
-        if switches.len() != 11 || !switches.contains(&switch_arg(0x0B)) {
+        if switches.len() != 13 || !switches.contains(&switch_arg(0x0B)) {
             return Err("each RPMB op must switch to RPMB and back to the user area");
         }
         // The model saw the write land exactly once.

@@ -1349,6 +1349,10 @@ pub mod tests {
             op::HCI_READ_LOCAL_VERSION => &[0x0C, 0x10, 0x00, 0x0C, 0xAA, 0xBB, 0x01, 0x00],
             op::HCI_READ_BD_ADDR => &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
             op::HCI_READ_BUFFER_SIZE => &[0x40, 0x01, 0x40, 0x10, 0x00, 0x08, 0x00],
+            // Local_Name (248 bytes) and Class_Of_Device (3), both read
+            // by bring-up.
+            op::HCI_READ_LOCAL_NAME => &[0u8; 248],
+            op::HCI_READ_CLASS_OF_DEVICE => &[0x0C, 0x01, 0x00],
             _ => &[],
         };
         let mut params = Vec::with_capacity(4 + ret.len());
@@ -1894,15 +1898,16 @@ pub mod tests {
         if info.bd_addr != [0x11, 0x22, 0x33, 0x44, 0x55, 0x66] {
             return TestResult::Fail("BD_ADDR not captured");
         }
-        // Five commands, each at the next sequence number.
+        // Seven commands (reset, version, BD_ADDR, buffer size, event
+        // mask, local name, class), each at the next sequence number.
         let frames = peer.received_frames();
         let cmds: Vec<u8> = frames
             .iter()
             .filter(|f| f.header.ptype == H5PacketType::HciCommand)
             .map(|f| f.header.seq)
             .collect();
-        if cmds != alloc::vec![0u8, 1, 2, 3, 4] {
-            return TestResult::Fail("bring-up commands not sequenced 0..4");
+        if cmds != alloc::vec![0u8, 1, 2, 3, 4, 5, 6] {
+            return TestResult::Fail("bring-up commands not sequenced 0..6");
         }
         TestResult::Pass
     }

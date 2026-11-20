@@ -42,15 +42,17 @@ pub const HCI_READ_LOCAL_SUPPORTED_FEATURES: u16 = opcode(OGF_INFORMATIONAL, 0x0
 /// HCI_Read_BD_ADDR (§7.4.6). Returns the 6-byte BD_ADDR.
 pub const HCI_READ_BD_ADDR: u16 = opcode(OGF_INFORMATIONAL, 0x0009);
 
-/// HCI_Read_Local_Name (§7.4.14). Returns Status (1) + the 248-byte
-/// local name (NUL-padded). Read during bring-up so mgmt READ_INFO
-/// reports the controller's real name (issue #815).
-pub const HCI_READ_LOCAL_NAME: u16 = opcode(OGF_INFORMATIONAL, 0x0014);
+/// HCI_Read_Local_Name (§7.3.12, a Controller & Baseband command).
+/// Returns Status (1) + the 248-byte local name (NUL-padded). Read
+/// during bring-up so mgmt READ_INFO reports the controller's real
+/// name (issue #815).
+pub const HCI_READ_LOCAL_NAME: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0014);
 
-/// HCI_Read_Class_Of_Device (§7.4.23). Returns Status (1) + the
-/// 3-byte Class of Device. Read during bring-up so mgmt READ_INFO
-/// reports the controller's real class (issue #815).
-pub const HCI_READ_CLASS_OF_DEVICE: u16 = opcode(OGF_INFORMATIONAL, 0x0023);
+/// HCI_Read_Class_of_Device (§7.3.25, a Controller & Baseband
+/// command). Returns Status (1) + the 3-byte Class of Device. Read
+/// during bring-up so mgmt READ_INFO reports the controller's real
+/// class (issue #815).
+pub const HCI_READ_CLASS_OF_DEVICE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0023);
 
 /// HCI_Read_Buffer_Size (§7.4.5). Returns ACL/SCO MTU + count.
 pub const HCI_READ_BUFFER_SIZE: u16 = opcode(OGF_INFORMATIONAL, 0x0005);
@@ -379,10 +381,12 @@ mod selftest_ext {
     const _: () = assert!(HCI_WRITE_INQUIRY_MODE == 0x0C45);
     // §7.4.5: OGF=0x04 OCF=0x0005 → 0x1005.
     const _: () = assert!(HCI_READ_BUFFER_SIZE == 0x1005);
-    // §7.4.14: OGF=0x04 OCF=0x0014 → 0x1014.
-    const _: () = assert!(HCI_READ_LOCAL_NAME == 0x1014);
-    // §7.4.23: OGF=0x04 OCF=0x0023 → 0x1023.
-    const _: () = assert!(HCI_READ_CLASS_OF_DEVICE == 0x1023);
+    // §7.3.12: OGF=0x03 OCF=0x0014 → 0x0C14 (Linux
+    // HCI_OP_READ_LOCAL_NAME).
+    const _: () = assert!(HCI_READ_LOCAL_NAME == 0x0C14);
+    // §7.3.25: OGF=0x03 OCF=0x0023 → 0x0C23 (Linux
+    // HCI_OP_READ_CLASS_OF_DEV).
+    const _: () = assert!(HCI_READ_CLASS_OF_DEVICE == 0x0C23);
     // §7.3.31: OGF=0x03 OCF=0x0020 → 0x0C20.
     const _: () = assert!(HCI_WRITE_AUTHENTICATION_ENABLE == 0x0C20);
     // §7.3.44: OGF=0x03 OCF=0x0047 → 0x0C47.

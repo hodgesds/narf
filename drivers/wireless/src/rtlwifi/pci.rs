@@ -1234,6 +1234,24 @@ mod provision_tests {
         if ae.registered_for(&firmware) {
             return TestResult::Fail("AE capsule registered before Bindings commit");
         }
+        // Bindings::commit admits an AE controller only with the native
+        // owner its capsule holds, so attach the transport and native as
+        // probe does.
+        let prepared = controller.prepared.as_ref().unwrap().clone();
+        if ae.attach_transport(prepared.clone()).is_err() {
+            return TestResult::Fail("AE capsule refused the prepared transport");
+        }
+        let native = Arc::new(super::super::interface::Device::new(
+            controller.name,
+            prepared,
+            controller.factory.as_ref().unwrap().clone(),
+            super::super::interface::NativeEnvironment::new(firmware.clone()),
+            1,
+        ));
+        if ae.attach_native(native.clone()).is_err() {
+            return TestResult::Fail("AE capsule refused the native owner");
+        }
+        controller.native = Some(native);
         controller.ae = Some(ae.clone());
         let mut bindings = pci_bindings::Bindings::new();
         if !matches!(

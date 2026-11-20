@@ -26,11 +26,14 @@ env:
   # kernel-test don't crash the emulator; the balloon smokes Skip and
   # init skips the probe. See build/xtask/src/main.rs::qemu_args.
   XTASK_QEMU_NO_BALLOON: "1"
-  # Extra buddy headroom for the x86_64 QEMU jobs (boot-smoke / musl-demo
-  # / kernel-test). The ~5129-smoke suite sits near the buddy margin at
+  # Extra buddy headroom for the QEMU jobs (boot-smoke / musl-demo /
+  # kernel-test). The ~5129-smoke suite sits near the buddy margin at
   # the 1 GiB default; a DMA-heavy probe can then host-SIGSEGV GHA's
-  # QEMU. 2 GiB (1 GiB per NUMA node) keeps it comfortably in range.
-  # aarch64 + non-QEMU jobs ignore it. See qemu_args / NARF_QEMU_MEM_MB.
+  # QEMU. 2 GiB (1 GiB per x86_64 NUMA node) keeps it comfortably in
+  # range. The aarch64 `virt` runs size from it too, capped at the 1 GiB
+  # the kernel's linear map covers (they had a fixed 512 MiB, which btrfs
+  # and drivers-wireless outgrew); non-QEMU jobs ignore it. See
+  # qemu_args / aarch64_guest_mem_mb / NARF_QEMU_MEM_MB.
   NARF_QEMU_MEM_MB: "2048"
   # Kernel-test and boot-smoke still capture serial for marker parsing, but
   # relay it live so a long guest run has visible forward progress in Actions.

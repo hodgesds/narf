@@ -2206,12 +2206,13 @@ impl Arch {
                     "2".into(),
                     "-m".into(),
                     // Same knob as the x86_64 arm: `NARF_QEMU_MEM_MB`
-                    // (default 1024). The hardcoded 512M starved the
-                    // kernel-test suite — the frame pool drains
-                    // cumulatively per group boot until alloc panics
-                    // (#2278) — and ignored the CI headroom bump to 2048
-                    // that x86_64 already honors.
-                    format!("{}M", qemu_guest_mem_mb()),
+                    // (default 1024), capped by `aarch64_guest_mem_mb` at
+                    // the 1 GiB the kernel's linear map covers. The hardcoded
+                    // 512M starved the kernel-test suite — the frame pool
+                    // drains cumulatively per group boot until alloc panics
+                    // (#2278). The dumped DTB below describes the same size;
+                    // without that the guest still saw 512 MiB.
+                    format!("{}M", aarch64_guest_mem_mb()),
                     "-serial".into(),
                     "stdio".into(),
                     "-display".into(),
@@ -2498,8 +2499,16 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
         "2" => "-gicv2",
         _ => "",
     };
+    // The dumped tree's /memory node is the guest's RAM size, so the size is
+    // part of the name too; 512 MiB keeps the historical names.
+    let mem_mb = aarch64_guest_mem_mb();
+    let mem = if mem_mb == 512 {
+        String::new()
+    } else {
+        format!("-{mem_mb}M")
+    };
     let path = if cmdline.is_empty() && initrd_len == 0 {
-        root.join("target").join(format!("qemu-virt{gic}.dtb"))
+        root.join("target").join(format!("qemu-virt{gic}{mem}.dtb"))
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in cmdline.as_bytes() {
@@ -2511,7 +2520,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
         root.join("target")
-            .join(format!("qemu-virt{gic}-{h:016x}.dtb"))
+            .join(format!("qemu-virt{gic}{mem}-{h:016x}.dtb"))
     };
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -2569,7 +2578,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             .arg("-smp")
             .arg("2")
             .arg("-m")
-            .arg("512M")
+            .arg(format!("{mem_mb}M"))
             .arg("-display")
             .arg("none")
             .arg("-no-reboot")
@@ -4876,9 +4885,19 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     run_cmd_inner(&args, false)
 }
 
+/// aarch64 `virt` guest RAM in MiB: `qemu_guest_mem_mb`, at most 1 GiB. The
+/// kernel's TTBR1 linear map is a single 1 GiB window at PA 0x4000_0000
+/// (`KERNEL_DIRECT_MAP_PHYS_END`, built in `frame/src/aarch64/boot.S`), and
+/// the frame allocator does not yet clip the DTB's memory to it: with 2 GiB
+/// the first frame above PA 0x8000_0000 faults on its first write.
+fn aarch64_guest_mem_mb() -> u64 {
+    qemu_guest_mem_mb().min(1024)
+}
+
 /// Total QEMU guest RAM in MiB: `NARF_QEMU_MEM_MB`, default 1024. Shared by
-/// the x86_64 and aarch64 arms of `qemu_args`. Must be even — on x86_64 the
-/// two NUMA nodes each get half; on aarch64 the evenness is harmless.
+/// the x86_64 and (capped by `aarch64_guest_mem_mb`) aarch64 arms of
+/// `qemu_args`. Must be even — on x86_64 the two NUMA nodes each get half; on
+/// aarch64 the evenness is harmless.
 fn qemu_guest_mem_mb() -> u64 {
     std::env::var("NARF_QEMU_MEM_MB")
         .ok()

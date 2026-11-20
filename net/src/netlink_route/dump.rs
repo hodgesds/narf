@@ -1223,10 +1223,14 @@ fn ipv4_routes(net_ns_id: u64) -> Vec<crate::route::Route> {
     // Link/address dumps always expose loopback. Mirror that invariant in
     // route dumps even during early boot before net init installs the
     // canonical loopback FIB entry.
-    if !routes
-        .iter()
-        .any(|r| r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8)
-    {
+    // Only the local-table entry counts: a 127/8 route on lo in another
+    // table does not stand in for it.
+    if !routes.iter().any(|r| {
+        r.iface == "lo"
+            && r.table == crate::route::TABLE_LOCAL
+            && r.dst.addr.0 == [127, 0, 0, 0]
+            && r.dst.prefix_len == 8
+    }) {
         routes.push(crate::route::Route {
             net_ns_id,
             dst: crate::route::Ipv4Net {

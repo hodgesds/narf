@@ -371,6 +371,7 @@ pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8)
         addr: net_addr,
         prefix_len,
     };
+    let (table, scope) = connected_route_placement(iface_name);
     route_add(Route {
         net_ns_id: crate::iface::lookup(iface_name).map_or(0, |iface| iface.net_ns_id),
         dst,
@@ -378,10 +379,23 @@ pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8)
         iface: String::from(iface_name),
         src_hint: Some(addr),
         metric: 0,
-        scope: Scope::Link,
-        table: TABLE_MAIN,
+        scope,
+        table,
         protocol: crate::route::RTPROT_KERNEL,
     });
+}
+
+/// Where an address's prefix route goes (Linux `fib_add_ifaddr` →
+/// `fib_magic`): on a loopback device the prefix is RTN_LOCAL, which
+/// `fib_magic` files in the local table at host scope (`local 127.0.0.0/8
+/// dev lo table local scope host`, the same route `install_loopback_route`
+/// installs); every other device gets a link-scope main-table route.
+fn connected_route_placement(iface_name: &str) -> (u8, Scope) {
+    if iface_name == "lo" {
+        (TABLE_LOCAL, Scope::Host)
+    } else {
+        (TABLE_MAIN, Scope::Link)
+    }
 }
 
 /// Remove the connected route that was auto-installed for `addr/prefix_len`.
@@ -393,7 +407,7 @@ pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) 
         addr: net_addr,
         prefix_len,
     };
-    route_delete(dst, iface_name, TABLE_MAIN);
+    route_delete(dst, iface_name, connected_route_placement(iface_name).0);
 }
 
 /// Install the loopback route (127.0.0.0/8 → "lo"). Must be called at

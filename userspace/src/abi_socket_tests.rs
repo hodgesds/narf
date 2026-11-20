@@ -531,8 +531,12 @@ fn smoke_abi_socket_unix_connect_racing_listener_close_refused() -> TestResult {
         if r != ECONNREFUSED {
             return Err("connect racing the listener's last close succeeded into a dead listener");
         }
-        // The name was released: a fresh listener can bind it and serve a
-        // normal connect/accept.
+        // The listener's registration was released, so after the usual
+        // unlink of its socket node (a pathname bind creates an S_IFSOCK
+        // inode that outlives the socket, so rebinding without it is
+        // EADDRINUSE, as on Linux) a fresh listener can bind the name and
+        // serve a normal connect/accept.
+        unlink_socket_node(b"/abi-ghost-connect\0")?;
         let srv2 = open_unix_stream()?;
         if call(
             Syscall::SocketBind.raw(),
@@ -565,7 +569,7 @@ fn smoke_abi_socket_unix_connect_racing_listener_close_refused() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(conn as u64));
         let _ = call(Syscall::Close.raw(), a0(srv));
         let _ = call(Syscall::Close.raw(), a0(srv2));
-        Ok(())
+        unlink_socket_node(b"/abi-ghost-connect\0")
     })
 }
 #[cfg(feature = "kernel-test")]
@@ -573,6 +577,18 @@ kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_unix_connect_racing_listener_close_refused
 );
+
+/// Unlink a pathname socket's S_IFSOCK node. The node is created
+/// best-effort at bind, so a missing one (ENOENT) is fine.
+fn unlink_socket_node(path: &[u8]) -> Result<(), &'static str> {
+    match call(
+        Syscall::Unlinkat.raw(),
+        a2(AT_FDCWD, path.as_ptr() as u64, 0),
+    ) {
+        Some(0) | Some(ENOENT) => Ok(()),
+        _ => Err("unlinking the socket node failed"),
+    }
+}
 
 // ──────────────────────────── SocketAccept4 ───────────────────────────
 

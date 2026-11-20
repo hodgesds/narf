@@ -535,6 +535,19 @@ impl FakeUsbHci {
             op::HCI_SET_EVENT_MASK => {
                 self.enqueue_event(Self::cc(op::HCI_SET_EVENT_MASK, &[0]));
             }
+            op::HCI_READ_LOCAL_NAME => {
+                // Status + Local_Name (248 bytes, NUL-padded).
+                let mut ret = vec![0u8; 249];
+                ret[1..10].copy_from_slice(b"narf-fake");
+                self.enqueue_event(Self::cc(op::HCI_READ_LOCAL_NAME, &ret));
+            }
+            op::HCI_READ_CLASS_OF_DEVICE => {
+                // Status + Class_Of_Device: computer / laptop.
+                self.enqueue_event(Self::cc(
+                    op::HCI_READ_CLASS_OF_DEVICE,
+                    &[0, 0x0C, 0x01, 0x00],
+                ));
+            }
             _ => {
                 // Unmodelled command: recorded, unanswered (see
                 // module docs).
@@ -812,8 +825,10 @@ fn attach_firmware_bringup() -> Result<Arc<FakeUsbHci>, &'static str> {
         op::HCI_READ_BD_ADDR,
         op::HCI_READ_BUFFER_SIZE,
         op::HCI_SET_EVENT_MASK,
+        op::HCI_READ_LOCAL_NAME,
+        op::HCI_READ_CLASS_OF_DEVICE,
     ];
-    if sent.len() != 14 || sent[9..] != want_tail {
+    if sent.len() != 16 || sent[9..] != want_tail {
         return Err("bring-up command order/count drifted");
     }
     // Every control transfer's Setup packet must equal the
@@ -966,10 +981,10 @@ fn smoke_fake_usb_hci_e2e_attach_firmware_bringup_pump() -> TestResult {
         return fail("pump responses missing, misrouted, or off the bulk-OUT endpoint");
     }
     // USB-level accounting: every event the host consumed came off
-    // the interrupt-IN endpoint (9 firmware CCs + bootup + 5
+    // the interrupt-IN endpoint (9 firmware CCs + bootup + 7
     // bring-up CCs + 1 connection event), every inbound ACL off
     // bulk-IN, every outbound ACL onto bulk-OUT.
-    if fake.interrupt_in_served() != 16 {
+    if fake.interrupt_in_served() != 18 {
         return fail("interrupt-IN event count wrong");
     }
     if fake.bulk_in_served() != 2 {

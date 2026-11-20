@@ -296,6 +296,13 @@ impl<R: Registers> Controller<R> {
         if status == u32::MAX {
             return Err(Error::Gone);
         }
+        // An ADMA fault can land while the command phase is still
+        // completing; Linux routes SDHCI_INT_ADMA_ERROR to the data path
+        // (`sdhci_data_irq`) either way, so report it as `finish_dma` does
+        // and let the DMA reset / PIO fallback run.
+        if status & INT_ADMA_ERROR != 0 {
+            return Err(Error::Dma(io.read32(ADMA_ERROR)));
+        }
         if status & (INT_ERROR | 0xffff_0000) != 0 {
             return Err(Error::Controller(status));
         }

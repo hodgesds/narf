@@ -424,6 +424,20 @@ fn pkg_length_for(payload: usize) -> alloc::vec::Vec<u8> {
 /// Build a `Method(\NAME, flags, body)` blob with a correctly
 /// sized (possibly multi-byte) PkgLength. Same shape as
 /// `build_eval_method_blob`, without its 63-byte ceiling.
+/// `Method(NAME, flags) { body }` with a relative NameSeg, so it lands
+/// in whatever scope encloses it.
+fn build_relative_method_blob(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    // PkgLength value = 1 (PkgLength byte) + 4 (NameSeg) + 1 (flags) + body.
+    let pkg_total = 1 + 4 + 1 + body.len();
+    let mut blob = alloc::vec::Vec::new();
+    blob.push(0x14); // MethodOp
+    blob.push(pkg_total as u8); // single-byte PkgLength (must fit in 6 bits)
+    blob.extend_from_slice(name4);
+    blob.push(flags);
+    blob.extend_from_slice(body);
+    blob
+}
+
 fn build_eval_method_blob_long(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
     // PkgLength covers itself + root char + NameSeg + flags + body.
     let pkglen = pkg_length_for(1 + 4 + 1 + body.len());
@@ -636,8 +650,10 @@ fn smoke_aml_namespace_deep_scope_nesting_stops() -> TestResult {
     // MethodNotFound). Expected node count: scopes Z00..Z15 (16;
     // Z15 is registered by its parent before its body walk hits
     // the budget) + ZPK1 = 17.
-    let deep_method = build_eval_method_blob(b"ZPK2", 0, &[0xA4, 0x0A, 0x02]);
-    let shallow_method = build_eval_method_blob(b"ZPK1", 0, &[0xA4, 0x0A, 0x01]);
+    // Relative names: a root-prefixed `\ZPK1` would register at the
+    // root whatever scope encloses it.
+    let deep_method = build_relative_method_blob(b"ZPK2", 0, &[0xA4, 0x0A, 0x02]);
+    let shallow_method = build_relative_method_blob(b"ZPK1", 0, &[0xA4, 0x0A, 0x01]);
     // Innermost: Scope(Z19) { Method ZPK2 }.
     let mut inner = scope_blob(b"Z19_", &deep_method);
     // Wrap Z18..Z03 around it.
