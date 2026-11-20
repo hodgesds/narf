@@ -289,8 +289,12 @@ async fn worker(cpu: usize) {
         return;
     }
     loop {
-        let deadline = narf_time::Deadline::after_ms(TICK_INTERVAL_MS as u64);
-        narf_time::SleepUntil::new(deadline.as_instant()).await;
+        // A deferrable timer, as the ondemand/conservative governors' `dbs`
+        // work (`INIT_DEFERRABLE_WORK`): an idle CPU has no load to sample
+        // and is not woken for it; the sample runs when the CPU next wakes.
+        let expires = narf_time::timer::jiffies()
+            + narf_time::timer::msecs_to_jiffies(TICK_INTERVAL_MS as u64);
+        narf_time::sleep_until_jiffies(expires, narf_time::timer::TIMER_DEFERRABLE).await;
         let _ = tick_cpu(cpu);
     }
 }
