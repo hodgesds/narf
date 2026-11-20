@@ -398,6 +398,47 @@ kernel_abi! {
         unsafe { narf_bus::module_sdio::register_module_sdio_driver(owner, name, m, probe) }
     }
 
+    /// Register a Devicetree driver match for this module. `name`/`name_len`
+    /// name the driver; `compatible`/`compatible_len` are the single
+    /// `of_device_id.compatible` string it claims. `probe` is a `ModuleProbeFn`
+    /// called through the module call gate, in task context, for a DT node no
+    /// built-in driver claimed; its `dev_token` is an opaque DT token (no DT
+    /// datapath export accepts it yet) and a 0 return binds the node. Returns
+    /// 0, `-EINVAL` for a bad/non-UTF-8 name or compatible or a null probe,
+    /// `-EBUSY` when another module already claims the compatible.
+    ///
+    /// # Safety
+    /// `name`/`compatible` must name their readable byte lengths for the call.
+    /// `probe` must be a valid `ModuleProbeFn` pointer that stays mapped for as
+    /// long as the driver is registered; module unload removes the callback and
+    /// its device contexts before unmapping the owner's text.
+    fn narf_register_dt_driver(
+        name: *const u8,
+        name_len: usize,
+        compatible: *const u8,
+        compatible_len: usize,
+        probe: usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || compatible.is_null() || compatible_len == 0 || probe == 0
+        {
+            return -22; // -EINVAL
+        }
+        // SAFETY: the module promises each pointer names its byte length.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        // SAFETY: as above.
+        let compat_bytes = unsafe { core::slice::from_raw_parts(compatible, compatible_len) };
+        let Ok(compatible) = core::str::from_utf8(compat_bytes) else {
+            return -22;
+        };
+        let owner = crate::symbols::current_init_id().0;
+        // SAFETY: `probe` is non-null (checked); the unload path removes the
+        // match before the owner's text is unmapped.
+        unsafe { narf_bus::module_dt::register_module_dt_driver(owner, name, compatible, probe) }
+    }
+
     // ── Device datapath: PCI/MMIO (Stage 1) + coherent DMA (Stage 2) ───────
     //
     // These let a module's probe actually drive the device it was handed. The
@@ -1525,6 +1566,7 @@ fn smoke_kabi_register_usb_driver_validates_and_forwards() -> TestResult {
     let owner = crate::symbols::current_init_id().0;
     narf_bus::module_usb::unregister_module_usb_drivers(owner);
     narf_bus::module_sdio::unregister_module_sdio_drivers(owner);
+    narf_bus::module_dt::unregister_module_dt_drivers(owner);
     match rc {
         0 => TestResult::Pass,
         -19 => TestResult::Skip("no USB stack registered a module host in this build"),
