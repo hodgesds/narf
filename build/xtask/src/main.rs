@@ -2205,7 +2205,13 @@ impl Arch {
                     "-smp".into(),
                     "2".into(),
                     "-m".into(),
-                    "512M".into(),
+                    // Same knob as the x86_64 arm: `NARF_QEMU_MEM_MB`
+                    // (default 1024). The hardcoded 512M starved the
+                    // kernel-test suite — the frame pool drains
+                    // cumulatively per group boot until alloc panics
+                    // (#2278) — and ignored the CI headroom bump to 2048
+                    // that x86_64 already honors.
+                    format!("{}M", qemu_guest_mem_mb()),
                     "-serial".into(),
                     "stdio".into(),
                     "-display".into(),
@@ -4870,8 +4876,9 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     run_cmd_inner(&args, false)
 }
 
-/// Total x86_64 guest RAM in MiB: `NARF_QEMU_MEM_MB`, default 1024. Must be
-/// even — the two NUMA nodes each get half.
+/// Total QEMU guest RAM in MiB: `NARF_QEMU_MEM_MB`, default 1024. Shared by
+/// the x86_64 and aarch64 arms of `qemu_args`. Must be even — on x86_64 the
+/// two NUMA nodes each get half; on aarch64 the evenness is harmless.
 fn qemu_guest_mem_mb() -> u64 {
     std::env::var("NARF_QEMU_MEM_MB")
         .ok()
