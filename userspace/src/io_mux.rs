@@ -351,14 +351,20 @@ fn timerfd_tmrproc(
         } else {
             now
         };
-        (s.expire(due), s.next_fire_ns)
+        let expired = s.expire(due);
+        if expired {
+            // Every expiry wakes the wait queue, rising edge or not (an unread
+            // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
+            // each expiry, as on Linux). Published under the state lock, as
+            // `timerfd_triggered` does under `ctx->wqh.lock`: a read draining
+            // concurrently then cannot interleave its clear between this
+            // expiry's count and its publication and leave the cell
+            // "readable" over zero expirations.
+            tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
+        }
+        (expired, s.next_fire_ns)
     };
-    if expired {
-        // Every expiry wakes the wait queue, rising edge or not (an unread
-        // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
-        // each expiry, as on Linux).
-        tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
-    }
+    let _ = expired;
     if next == 0 {
         return HrtimerRestart::NoRestart;
     }
@@ -402,8 +408,8 @@ impl TimerFd {
             s.next_fire_ns = value_ns;
             s.interval_ns = interval_ns;
             s.expirations = 0;
+            self.readiness.set(0, POLL_IN);
         }
-        self.readiness.set(0, POLL_IN);
         if value_ns != 0 {
             // SAFETY: the fd is Arc-allocated and Drop cancels the timer.
             unsafe {
@@ -446,8 +452,9 @@ impl TimerFd {
     /// still be on its way). Called from `read` and `poll_readiness`.
     fn tick(&self) {
         let now = self.now();
-        let expired = self.state.lock().expire(now);
-        if expired {
+        let mut s = self.state.lock();
+        // Count and publish under one hold (see `timerfd_tmrproc`).
+        if s.expire(now) {
             self.readiness.set(POLL_IN, 0);
         }
     }
@@ -503,8 +510,10 @@ impl FileOps for TimerFd {
             }
             buf[..8].copy_from_slice(&s.expirations.to_le_bytes());
             s.expirations = 0;
-            drop(s);
+            // Clear under the same hold the expiry publishes under, so the
+            // last writer of the cell is the last change to `expirations`.
             self.readiness.set(0, POLL_IN);
+            drop(s);
             Ok(8)
         })
     }
