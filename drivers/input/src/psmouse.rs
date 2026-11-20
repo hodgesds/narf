@@ -2118,16 +2118,19 @@ impl SynapticsPktType {
 /// * NEWABS strict: mask `{0xC8,0,0,0xC8,0}`, result `{0x80,0,0,0xC0,0}`
 /// * NEWABS relaxed: mask `{0xC0,0,0,0xC0,0}`, result `{0x80,0,0,0xC0,0}`
 /// * OLDABS: mask `{0xC0,0x60,0,0xC0,0x60}`, result `{0xC0,0,0,0x80,0}`
+///
+/// An unclassified NEWABS stream validates with the relaxed masks
+/// (Linux: `case SYN_NEWABS: case SYN_NEWABS_RELAXED:`).
 pub fn synaptics_validate_byte(buf: &[u8; 6], idx: usize, pkt_type: SynapticsPktType) -> bool {
     if idx > 4 {
         return false;
     }
     let (mask, rslt): ([u8; 5], [u8; 5]) = match pkt_type {
-        SynapticsPktType::NewAbs | SynapticsPktType::NewAbsStrict => (
+        SynapticsPktType::NewAbsStrict => (
             [0xC8, 0x00, 0x00, 0xC8, 0x00],
             [0x80, 0x00, 0x00, 0xC0, 0x00],
         ),
-        SynapticsPktType::NewAbsRelaxed => (
+        SynapticsPktType::NewAbs | SynapticsPktType::NewAbsRelaxed => (
             [0xC0, 0x00, 0x00, 0xC0, 0x00],
             [0x80, 0x00, 0x00, 0xC0, 0x00],
         ),

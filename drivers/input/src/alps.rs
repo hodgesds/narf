@@ -2038,10 +2038,9 @@ impl AlpsDecoder {
                 c.x = self.x_max - c.x;
             }
         }
-        if matches!(
-            self.version(),
-            AlpsVersion::V3 | AlpsVersion::V3Rushmore | AlpsVersion::V4
-        ) {
+        // Linux tests `ALPS_PROTO_V3 || ALPS_PROTO_V4` exactly;
+        // Rushmore (`ALPS_PROTO_V3_RUSHMORE`) is not flipped.
+        if matches!(self.version(), AlpsVersion::V3 | AlpsVersion::V4) {
             for c in corner.iter_mut() {
                 c.y = self.y_max - c.y;
             }
