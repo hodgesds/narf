@@ -122,7 +122,7 @@ pub fn register_all() {
     register_proc("buddyinfo", agg(gen_buddyinfo));
     register_proc("numastat", agg(gen_numastat));
     register_proc("pagetypeinfo", agg(gen_pagetypeinfo));
-    register_proc("timer_list", agg(gen_timer_list));
+    super::timer_list::register();
     register_proc("locks", agg(gen_locks));
     register_proc("devices", agg(gen_devices));
     register_proc("consoles", agg(gen_consoles));
@@ -240,9 +240,18 @@ fn gen_interrupts() -> Vec<u8> {
     }
     let _ = writeln!(s, "   Non-maskable interrupts");
 
+    // `LOC`: the per-CPU local timer (`irq_stat.apic_timer_irqs`), here the
+    // primary clockevent's vector, counted per CPU by the dispatcher.
+    let tick_vector =
+        narf_time::clockevent::TICK_VECTOR.load(core::sync::atomic::Ordering::Acquire);
     let _ = write!(s, "LOC:");
-    for _ in 0..per_cpu {
-        let _ = write!(s, " {:>10}", 0);
+    for cpu in 0..per_cpu {
+        let n = if tick_vector == 0 {
+            0
+        } else {
+            narf_interrupts::fire_count_on_cpu(tick_vector, cpu)
+        };
+        let _ = write!(s, " {:>10}", n);
     }
     let _ = writeln!(s, "   Local timer interrupts");
 
@@ -984,38 +993,7 @@ fn gen_pagetypeinfo() -> Vec<u8> {
     s.into_bytes()
 }
 
-// ── /proc/timer_list ─────────────────────────────────────────────────
-//
-// Linux: kernel/time/timer_list.c show_timer_list
-// NARF's hrtimers are per-CPU bases (narf-time::hrtimer), listed per CPU.
-
-fn gen_timer_list() -> Vec<u8> {
-    let mut s = String::new();
-    let _ = writeln!(s, "Timer List Version: v0.9");
-    let _ = writeln!(
-        s,
-        "HRTIMER_MAX_CLOCK_BASES: {}",
-        narf_time::hrtimer::HRTIMER_MAX_CLOCK_BASES
-    );
-    let _ = writeln!(s, "now at {} nsecs", narf_time::monotonic_ns());
-    for cpu in 0..narf_lib::percpu::MAX_CPUS {
-        if !narf_lib::smp::is_online(cpu as u32) {
-            continue;
-        }
-        let _ = writeln!(s);
-        let _ = writeln!(s, "cpu: {}", cpu);
-        let queued = narf_time::hrtimer::nr_queued_on(cpu);
-        if queued == 0 {
-            let _ = writeln!(s, " no timers pending");
-        } else {
-            let _ = writeln!(s, " pending timers: {}", queued);
-        }
-        if let Some(next) = narf_time::hrtimer::next_event_ns_of(cpu) {
-            let _ = writeln!(s, " expires_next: {} nsecs", next);
-        }
-    }
-    s.into_bytes()
-}
+// /proc/timer_list lives in `super::timer_list` (kernel/time/timer_list.c).
 
 // ── /proc/locks ──────────────────────────────────────────────────────
 //
