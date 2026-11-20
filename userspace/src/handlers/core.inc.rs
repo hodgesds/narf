@@ -11497,10 +11497,14 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
     // Private and group-shared: a shared signal this thread does not block
-    // interrupts its wait just like a thread-directed one.
-    let pending = signal_pending_of(task);
-    let mask = signal_mask_of(task);
-    if (pending & !mask) != 0 {
+    // interrupts its wait just like a thread-directed one. Ask the SAME
+    // predicate the delivery hook selects with (`signal_pending_for_delivery`
+    // gates a group-shared signal on this thread having been chosen for it):
+    // the raw `pending & !mask` test said "interrupt" for a shared signal the
+    // hook would then decline to deliver, so pause/sigsuspend returned -EINTR
+    // with no handler run and the caller looped (`sigsuspend` → EINTR →
+    // `sigsuspend` ...) without ever reaping its child.
+    if has_interrupting_signal(task) {
         if let Some(hook) = signal_delivery_hook() {
             // EINTR
             ctx.set_return(errno_ret(EINTR));

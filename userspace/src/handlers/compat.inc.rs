@@ -7219,6 +7219,115 @@ fn smoke_shared_signal_selected_thread_and_consumers() -> narf_kernel_test::Test
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("userspace/signals", smoke_shared_signal_selected_thread_and_consumers);
 
+/// A shell's child-reaping loop: block SIGCHLD, fork, and `sigsuspend` with
+/// it unblocked. When the child exits before the parent reaches `sigsuspend`,
+/// the group-shared SIGCHLD is pending while blocked, so the raise notified
+/// no thread. `sigsuspend`'s mask install must recompute that claim
+/// (`set_current_blocked` → `recalc_sigpending`); a raw mask store left the
+/// signal undeliverable to this thread, so the wait returned -EINTR with no
+/// handler run (or slept through it) and zsh/dash never reaped the child.
+#[cfg(feature = "kernel-test")]
+fn smoke_sigsuspend_unblocks_shared_pending_signal() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const LEADER: u64 = 0x5A78_0000;
+    const PID: u64 = LEADER + 2;
+    // The shell installs a SIGCHLD handler; with no handler SIGCHLD is ignored
+    // (and never interrupts), so this fixture stands SIGUSR1 in for it: same
+    // group-shared raise, a default action that is not Ignore.
+    const SIGCHLD: u32 = 10;
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+    }
+    fn lookup() -> u64 {
+        LEADER
+    }
+    let _kbuf = kernel_buffers_guard();
+    let leader = crate::task::Task::new_registered(LEADER, PID);
+    register_pid_task_mapping(PID, LEADER);
+    install_task_id_lookup(lookup);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = take_suspend_saved_mask(LEADER);
+            release_shared_pending(LEADER);
+            release_task_tables(LEADER);
+            crate::task::release_task(LEADER);
+            let _identity = PID_TASK_MUTATION.lock();
+            if let Some(map) = TASK_TO_PID[pid_task_shard(LEADER)].map.lock().as_mut() {
+                map.remove(&LEADER);
+            }
+            tgid_member_remove(LEADER, PID);
+            if let Some(map) = PID_TO_TASK[pid_task_shard(PID)].map.lock().as_mut() {
+                map.remove(&PID);
+            }
+            __test_reset_task_id_lookup();
+        }
+    }
+    let _cleanup = Cleanup;
+    pending_signal_bits_update_or_init(LEADER, |_| {});
+    // `child_block()`: SIGCHLD blocked while the child runs and exits.
+    set_signal_mask_for_task(LEADER, sig_bit(SIGCHLD));
+    leader
+        .uctx
+        .signal_delivery_notified
+        .store(false, Ordering::Release);
+    let _ = raise_group_signal(LEADER, SIGCHLD, GroupSigInfo::None);
+    if has_interrupting_signal(LEADER) {
+        return TestResult::Fail("a blocked shared SIGCHLD must not interrupt");
+    }
+    // `sigsuspend(&empty)`.
+    let empty: u64 = 0;
+    let mut ctx = Ctx {
+        args: SyscallArgs {
+            arg0: &empty as *const u64 as u64,
+            arg1: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    // No handler frame can be built on this synthetic context: run the
+    // suspend with delivery unhooked (the kernel-test pause fallback).
+    let saved_hook = SIGNAL_DELIVERY_HOOK.swap(0, Ordering::AcqRel);
+    handler_sys_rt_sigsuspend::sys_rt_sigsuspend(&mut ctx);
+    SIGNAL_DELIVERY_HOOK.store(saved_hook, Ordering::Release);
+    if signal_mask_of(LEADER) & sig_bit(SIGCHLD) != 0 {
+        return TestResult::Fail("sigsuspend did not install its mask");
+    }
+    if !has_interrupting_signal(LEADER) {
+        return TestResult::Fail(
+            "sigsuspend unblocked a pending shared SIGCHLD but the thread cannot take it",
+        );
+    }
+    if take_suspend_saved_mask(LEADER) != Some(sig_bit(SIGCHLD)) {
+        return TestResult::Fail("sigsuspend did not save the pre-suspend mask");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "userspace/signals/suspend",
+    smoke_sigsuspend_unblocks_shared_pending_signal
+);
+
 
 /// Consume one instance of the lowest pending signal in `set` for a
 /// `rt_sigtimedwait` caller: the private set first, then the group's shared
