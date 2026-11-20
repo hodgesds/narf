@@ -4738,7 +4738,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 return;
             }
             software_clock::period(&attr)
-        } else if attr.type_ == PERF_TYPE_TRACEPOINT {
+        } else if (attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY)
+            || attr.type_ == PERF_TYPE_TRACEPOINT
+        {
+            // No counter overflows for these: a dummy event carries only
+            // sideband and directly emitted records, as on x86_64 above.
             attr.sample_period_or_freq
         } else {
             if pmu_event.is_none() || ensure_pmi_route().is_err() {
