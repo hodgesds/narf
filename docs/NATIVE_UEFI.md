@@ -106,6 +106,18 @@ appends and syncs new messages once per second. After rebooting into Linux,
 read the newest numbered file on the same root. Gentoo's `syslogd` can also
 save its usual `/var/log/kern.log` after OpenRC starts.
 
+To capture OpenRC startup on the same writable root, install the optional
+trace configuration in the Gentoo root before booting with `openrc_pid1` and
+`narf.rootlog`.
+
+```sh
+sudo install -D -m 0644 packaging/narf-boot-trace.conf /etc/rc.conf.d/narf-boot-trace.conf
+```
+
+Each boot writes a private `/var/log/narf-openrc-*` file with periodic samples
+of service states, process waits, Ethernet carrier and packet counters, IPv4
+addresses and routes, and TCP listeners on port 22.
+
 A failure before the root mounts can leave no file. A later panic leaves
 the last committed batch on disk. The final panic report bypasses the
 kernel log buffer. The optional
