@@ -1377,6 +1377,34 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     unsafe { unmap_4kb_locked(root, virt, true) }
 }
 
+/// Unmap `pages` kernel leaves from `base` and release each backing frame
+/// after its invalidation completed. The x86_64 twin batches one cross-CPU
+/// IPI per run; here every leaf's `TLBI ...IS` is already broadcast by the
+/// inner-shareable domain and completes (`DSB ISH`) before `unmap_4kb`
+/// returns, so the per-page loop is the batch. Returns leaves removed.
+///
+/// # Safety
+/// As the x86_64 `unmap_kernel_pages`.
+pub unsafe fn unmap_kernel_pages(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+    release: &mut dyn FnMut(PhysAddr),
+) -> u64 {
+    let mut removed = 0;
+    for k in 0..pages {
+        let va = VirtAddr::new(base.raw() + k * 4096);
+        // SAFETY: forwarded caller contract.
+        if let Ok(phys) = unsafe { unmap_4kb(root, va) } {
+            if phys.raw() != 0 {
+                removed += 1;
+                release(phys);
+            }
+        }
+    }
+    removed
+}
+
 /// True when `e` is a valid TABLE descriptor rather than a block or an
 /// invalid entry. Bit 1 distinguishes the two at L1/L2; at L0 with a 4 KiB
 /// granule and a 48-bit VA every valid entry is a table per the ARM ARM.
