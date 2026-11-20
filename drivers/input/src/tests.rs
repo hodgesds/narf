@@ -8066,8 +8066,9 @@ mod alps_smokes {
     }
 
     fn smoke_alps_model_table_lookup() -> TestResult {
-        if ALPS_MODEL_TABLE.len() != 21 {
-            return TestResult::Fail("model table must carry 21 Linux rows");
+        // Linux drivers/input/mouse/alps.c `alps_model_data[]` has 22 rows.
+        if ALPS_MODEL_TABLE.len() != 22 {
+            return TestResult::Fail("model table must carry 22 Linux rows");
         }
         // V1: UMAX-530T.
         let m = match lookup_model(&[0x33, 0x02, 0x0a]) {
@@ -8521,8 +8522,18 @@ mod alps_smokes {
         if f.pressure != 96 || !f.left {
             return TestResult::Fail("v8 ONE pressure/buttons wrong");
         }
-        // STICK: dx=16 dy=-8 pressure=32.
-        let d = decode(ALPS_V8_PROTOCOL, &[0x18, 0x10, 0x08, 0x28, 0x20, 0x00]);
+        // STICK: dx=16 dy=-8 pressure=32. Linux alps_process_packet_ss4_v2
+        // drops stick packets from a device without ALPS_DUALPOINT, which
+        // v8 gains from its OTP when a trackstick is present.
+        let stick = [0x18, 0x10, 0x08, 0x28, 0x20, 0x00];
+        if decode(ALPS_V8_PROTOCOL, &stick).events[0].is_some() {
+            return TestResult::Fail("v8 stick packet accepted from a non-DualPoint device");
+        }
+        let dualpoint = AlpsProtocol {
+            flags: FLAG_DUALPOINT,
+            ..ALPS_V8_PROTOCOL
+        };
+        let d = decode(dualpoint, &stick);
         match d.events[0] {
             Some(AlpsEvent::Trackstick {
                 dx, dy, pressure, ..
