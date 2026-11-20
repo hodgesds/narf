@@ -84,6 +84,7 @@ pub mod sys_fs;
 pub mod sys_kernel;
 pub mod sys_net;
 pub mod sys_vm;
+pub mod timer_list;
 
 // ── Inode identity ───────────────────────────────────────────────
 //
