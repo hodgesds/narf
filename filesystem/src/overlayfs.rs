@@ -1386,6 +1386,32 @@ impl FileOps for OverlayFile {
         self.active().readiness_notifies()
     }
 
+    fn poll_requires_rescan(&self) -> bool {
+        self.active().poll_requires_rescan()
+    }
+
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.active().arm_readiness(id, interest, waker)
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.active().arm_readiness_persistent(id, interest, waker)
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.active().disarm_readiness(id)
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         self.active().ioctl(cmd, arg)
     }

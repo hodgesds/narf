@@ -953,13 +953,25 @@ static SWITCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(No
 static BYTE_RING_WAKERS: IrqSafeSpinLock<alloc::vec::Vec<Waker>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Wake every parked console reader (see [`BYTE_RING_WAKERS`]). Call with
-/// no ring lock held.
+/// The console ttys' `tty->read_wait` for `poll`/`select`/`epoll`: every
+/// console-input push (a serial byte or a key event) wakes it AFTER the event
+/// is in its ring, and a poller queued here recomputes its own tty's line
+/// discipline (`n_tty_poll`). Blocking reads keep [`BYTE_RING_WAKERS`].
+pub static CONSOLE_INPUT_WAIT: narf_lib::readiness::WaitQueue =
+    narf_lib::readiness::WaitQueue::new();
+
+/// `POLLIN` in the poll ABI every NARF readiness bit set uses.
+const CONSOLE_POLL_IN: u32 = 0x0001;
+
+/// Wake every parked console reader (see [`BYTE_RING_WAKERS`]) and every
+/// console poller ([`CONSOLE_INPUT_WAIT`]). Call with no ring lock held, after
+/// the event is visible in its ring.
 fn wake_console_readers() {
     let wakers = core::mem::take(&mut *BYTE_RING_WAKERS.lock());
     if !wakers.is_empty() {
         narf_lib::deferred_wake::push_pending(wakers.into_iter().map(Some));
     }
+    CONSOLE_INPUT_WAIT.wake(CONSOLE_POLL_IN);
 }
 
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {

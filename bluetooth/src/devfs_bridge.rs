@@ -179,6 +179,12 @@ impl FileOps for RfcommPort {
     ///
     /// Linux ref: `rfcomm_tty_poll` / `tty_poll` test `POLLIN|POLLRDNORM`
     /// against the tty port's receive buffer occupancy.
+    /// Known wait-queue gap: RFCOMM receive fills the port without waking
+    /// any poller, so a blocking poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        true
+    }
+
     fn poll_readiness(&self) -> u32 {
         if self.has_rx() {
             POLL_IN

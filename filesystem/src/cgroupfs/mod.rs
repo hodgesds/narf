@@ -202,12 +202,14 @@ pub struct Cgroup {
     /// a field reported by `cgroup.events` (`populated`, `frozen`). An
     /// open `cgroup.events` file (`CgroupAttrFile`) captures this value
     /// and reports `POLLPRI` from `poll_readiness` while the live gen is
-    /// ahead of what that fd last read — the level-triggered, busy-poll
-    /// equivalent of the edge `kernfs_notify` systemd waits on to detect
-    /// an emptied (or frozen) cgroup. NARF's poll layer is poll-only
-    /// (no waker registration), so a generation an fd compares against
-    /// is the right shape rather than a parked `Waker` list.
+    /// ahead of what that fd last read — the edge `kernfs_notify` systemd
+    /// waits on to detect an emptied (or frozen) cgroup. The generation is
+    /// per-open state (`kernfs_open_file::event`); the wake is
+    /// [`Self::events_wait`].
     events_gen: AtomicU64,
+    /// `kernfs_open_node::poll`: the wait queue `cgroup.events` pollers sleep
+    /// on. [`Self::bump_events`] wakes it after advancing `events_gen`.
+    events_wait: narf_lib::readiness::WaitQueue,
     /// Last-published `populated` bit, to detect transitions.
     last_populated: AtomicBool,
     /// POSIX owner of this cgroup's DIRECTORY (`st_uid`/`st_gid`).
@@ -272,6 +274,7 @@ impl Cgroup {
             #[cfg(feature = "cgroup-psi")]
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
+            events_wait: narf_lib::readiness::WaitQueue::new(),
             last_populated: AtomicBool::new(false),
             owner: IrqSafeSpinLock::new((0, 0)),
             file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -310,6 +313,7 @@ impl Cgroup {
             #[cfg(feature = "cgroup-psi")]
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
+            events_wait: narf_lib::readiness::WaitQueue::new(),
             last_populated: AtomicBool::new(false),
             owner: IrqSafeSpinLock::new((0, 0)),
             file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -377,6 +381,9 @@ impl Cgroup {
     /// [`notify_events`] on `populated` transitions.
     fn bump_events(&self) {
         self.events_gen.fetch_add(1, Ordering::AcqRel);
+        // `kernfs_notify`: wake the pollers after the generation they
+        // compare against has moved.
+        self.events_wait.wake(POLL_IN | POLL_PRI | crate::POLL_ERR);
     }
 
     /// This cgroup's path inside the hierarchy: `""` for the root,
@@ -2011,6 +2018,51 @@ impl FileOps for CgroupAttrFile {
         } else {
             POLL_IN
         }
+    }
+
+    /// `kernfs_generic_poll`: `poll_wait(.., &on->poll, ..)` then the
+    /// generation compare. Every other cgroupfs file is constant-ready and
+    /// queues nothing.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        if self.is_events() {
+            return Some(
+                self.cg
+                    .events_wait
+                    .arm(id, interest, waker, || self.poll_readiness()),
+            );
+        }
+        Some(match self.poll_readiness() & interest {
+            0 => core::task::Poll::Pending,
+            ready => core::task::Poll::Ready(ready),
+        })
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        if self.is_events() {
+            return Some(
+                self.cg
+                    .events_wait
+                    .arm_persistent(id, interest, waker, || self.poll_readiness()),
+            );
+        }
+        Some(self.poll_readiness() & interest)
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        if self.is_events() {
+            self.cg.events_wait.disarm(id);
+        }
+        true
     }
 }
 

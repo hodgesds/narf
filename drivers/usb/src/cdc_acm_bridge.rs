@@ -744,6 +744,12 @@ impl FileOps for TtyAcmFile {
 
     /// `POLL_IN` when the RX ring has bytes; `POLL_OUT` unless
     /// output is `TCXONC`-stopped.
+    /// Known wait-queue gap: the ACM bulk-in completion fills `rx` without
+    /// waking any poller, so a blocking poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        true
+    }
+
     fn poll_readiness(&self) -> u32 {
         let p = self.port.lock();
         let mut ev = 0u32;

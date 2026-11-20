@@ -531,6 +531,12 @@ impl FileOps for CcidFile {
     /// `POLL_IN` when a response is pending or an unacknowledged
     /// presence change exists; `POLL_OUT` when the fd accepts a
     /// new command.
+    /// Known wait-queue gap: the CCID bulk-in completion updates `state`
+    /// without waking any poller, so a blocking poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        true
+    }
+
     fn poll_readiness(&self) -> u32 {
         let st = self.state.lock();
         let gen = self.node.shared.lock().change_gen;

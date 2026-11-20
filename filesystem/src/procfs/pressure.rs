@@ -96,6 +96,11 @@ struct ProcPressureFile {
     res: Resource,
     /// `/proc/pressure/<res>`'s inode (registered entries: `proc_create`).
     ino: u64,
+    /// `psi_trigger_poll`'s wait queue. NARF evaluates no PSI triggers, so
+    /// the level is a constant `POLL_OUT` and nothing ever wakes it: a
+    /// `POLLPRI` waiter parks durably with no rescan, as it would on an
+    /// idle Linux system.
+    readiness: narf_lib::readiness::Readiness,
 }
 
 impl FileOps for ProcPressureFile {
@@ -144,6 +149,10 @@ impl FileOps for ProcPressureFile {
         // withholding POLL_IN and POLL_PRI — is exactly that.
         POLL_OUT
     }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
+    }
 }
 
 /// The `/proc/pressure` directory itself. Static (no feature gate, no
@@ -162,8 +171,13 @@ impl ProcPressureDir {
     /// the three PSI resources.
     fn child(name: &str) -> Option<Arc<dyn FileOps>> {
         let ino = super::proc_static_ino(Self::dir_ino(), name);
-        Resource::from_name(name)
-            .map(|res| Arc::new(ProcPressureFile { res, ino }) as Arc<dyn FileOps>)
+        Resource::from_name(name).map(|res| {
+            Arc::new(ProcPressureFile {
+                res,
+                ino,
+                readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
+            }) as Arc<dyn FileOps>
+        })
     }
 }
 
@@ -267,6 +281,7 @@ fn smoke_pressure_read_through_fileops() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Memory,
         ino: 0,
+        readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
     };
     let mut buf = [0u8; 256];
     match poll_once(f.read(0, &mut buf)) {
@@ -282,6 +297,7 @@ fn smoke_pressure_write_accepts_trigger() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Memory,
         ino: 0,
+        readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
     };
     let trigger = b"some 150000 1000000\n";
     match poll_once(f.write(0, trigger)) {
@@ -297,6 +313,7 @@ fn smoke_pressure_poll_out_only() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Cpu,
         ino: 0,
+        readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
     };
     let r = f.poll_readiness();
     if r & POLL_OUT == POLL_OUT && r & POLL_IN == 0 && r & POLL_PRI == 0 {
@@ -312,6 +329,7 @@ fn smoke_pressure_stat_is_rw() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Io,
         ino: 0,
+        readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
     };
     if f.stat().mode == Mode::FILE_RW {
         TestResult::Pass

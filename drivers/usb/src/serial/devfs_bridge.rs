@@ -984,6 +984,12 @@ impl FileOps for TtyUsbFile {
     }
 
     /// `POLL_IN` when RX ring has bytes; `POLL_OUT` always (TX has space).
+    /// Known wait-queue gap: the USB-serial bulk-in completion fills `rx`
+    /// without waking any poller, so a blocking poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        true
+    }
+
     fn poll_readiness(&self) -> u32 {
         let has_rx = self.port.lock().rx.has_data();
         if has_rx {
