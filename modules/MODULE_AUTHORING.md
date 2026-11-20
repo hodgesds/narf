@@ -556,6 +556,19 @@ if let Some(m) = narf_modules::registry::lookup("rtl9999") {
 there's no way to refuse from inside `exit`. To refuse unload,
 keep the refcount non-zero.
 
+`rmmod` itself answers `-EBUSY`, changing nothing, while:
+
+  * the module's `init` is still running;
+  * another unload of it is already in progress;
+  * any kernel callback is inside the module's text (a probe, poller, IRQ
+    or USB completion, netif TX, block request). Every callback pins the
+    module for its duration automatically; you do not take references
+    for them.
+
+Once `rmmod` succeeds no callback is running and none can start: `exit`
+runs exactly once, then the kernel withdraws your matches, device
+contexts, disks and interfaces before unmapping the image.
+
 ## Differences vs Linux `.ko`
 
 | Aspect | Linux | NARF |

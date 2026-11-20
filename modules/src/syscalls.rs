@@ -132,7 +132,9 @@ pub fn sys_finit_module_with_params(
 /// those today (we never block).
 ///
 /// Sequence mirrors `linux/kernel/module/main.c::free_module`:
-///   1. invoke_exit (state Going → Dead)
+///   1. invoke_exit (Live → Going → Dead). Refused with `-EBUSY` unless the
+///      module is Live with a zero refcount: not while `init` is running,
+///      not while a call is inside its text, not twice.
 ///   2. sweep KSYMTAB — `unregister_exports_of` removes all entries
 ///      owned by this module, preventing use-after-free on any later
 ///      `resolve` call (DESIGN.md §6)
@@ -169,14 +171,16 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // unreachable — it is out of the registry and its exports are gone — so
     // this is the point at which returning the frames is safe.
     //
-    // NOT yet safe against a CPU still *executing* module code: a task that
-    // entered the module before `invoke_exit` and is preempted inside it
-    // would resume on unmapped text. Closing that needs an RCU grace period
-    // between the sweep above and this free, which is the same gap
-    // `DESIGN.md` records for inter-module symbol references. Linux serialises
-    // this differently — `delete_module` refuses unless the refcount is zero
-    // *and* the module is quiesced via `stop_machine` on
-    // `CONFIG_MODULE_UNLOAD_TAINT_TRACKING` kernels.
+    // No CPU can be executing module text here. Module text runs in exactly
+    // three ways: `init` (the module was Loading, and `invoke_exit` refuses
+    // to start an unload then), `exit` (run once, by the unload that moved
+    // the module Live -> Going), and calls through the module call gate.
+    // A gate call checks Live and takes a reference under the state lock,
+    // holding it until it returns, and `invoke_exit` requires both Live and
+    // a zero count under that lock. So once it succeeds no gate call is in
+    // flight and none can start. (Linux's `try_stop_module` makes the same
+    // refcount-zero-then-GOING transition.) A module calling another
+    // module's exports pins its provider through `take_dependency_refs`.
     //
     // SAFETY: `invoke_exit` returned, the refcount was zero, the exports are
     // swept, and the registry no longer names this module.
@@ -229,7 +233,8 @@ impl ModuleSyscallError {
 
     /// Convert to a negative errno suitable for the syscall return
     /// register. The wire numbers match Linux:
-    ///   * `-EBUSY = -16` — refcount > 0 in delete_module.
+    ///   * `-EBUSY = -16` — refcount > 0, or the module is not Live
+    ///     (still initialising, or another unload owns it), in delete_module.
     ///   * `-ENOENT = -2` — module name not found.
     ///   * `-EBADF = -9` — invalid image.
     ///   * `-EINVAL = -22` — manifest / arch / sig rejection.
@@ -259,6 +264,11 @@ impl ModuleSyscallError {
             ModuleSyscallError::Load(LoadError::WrongArch { .. }) => -8,
             ModuleSyscallError::InitFailed(_) => -22,
             ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(_)) => -16,
+            // Linux `delete_module`: a module still initialising or already
+            // going away is -EBUSY.
+            ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::BadState {
+                ..
+            }) => -16,
             ModuleSyscallError::ExitFailed(_) => -22,
             ModuleSyscallError::NotFound => -2,
         }

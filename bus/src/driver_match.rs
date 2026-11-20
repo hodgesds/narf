@@ -1903,6 +1903,12 @@ pub fn unregister_module_pci_drivers(owner: u64) {
     };
 
     if !owned_matches.is_empty() {
+        // The module's bindings go with its matches: a device it bound is
+        // unbound, so diagnostics stop counting it and a later probe (a
+        // reload, another driver) finds it free.
+        BOUND
+            .lock()
+            .retain(|b| !owned_matches.iter().any(|(name, _, _)| b.name == *name));
         REGISTRY.lock().retain(|entry| {
             !owned_matches.iter().any(|(name, vendor, device)| {
                 entry.name == *name
@@ -1943,6 +1949,12 @@ pub fn __module_thunk_for_test(vendor: u16, device: u16) -> Option<ModuleProbeFn
         .iter()
         .find(|t| t.vendor == vendor && t.device == device)
         .map(|t| t.thunk)
+}
+
+#[doc(hidden)]
+/// Test-only: devices currently recorded as bound by the match `name`.
+pub fn __bound_count_for_test(name: &str) -> usize {
+    BOUND.lock().iter().filter(|b| b.name == name).count()
 }
 
 #[doc(hidden)]

@@ -1171,6 +1171,258 @@ fn e2e_driver_module_drives_device() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_driver_module_drives_device);
 
+// ── Safe unload ─────────────────────────────────────────────────────
+//
+// Module text runs only in `init`, in `exit`, and inside module call-gate
+// calls. Unload must start only from Live with no call in flight, and only
+// once, or it can unmap text a CPU is still running.
+
+/// `exit` runs of the counting smoke modules.
+static EXIT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// What a self-unloading `init` observed: 1 = refused as still Loading.
+static INIT_UNLOAD_SEEN: AtomicU32 = AtomicU32::new(0);
+const UNLOAD_IN_INIT: &str = "e2e_unload_in_init";
+
+extern "C" fn counting_exit() {
+    EXIT_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// An `init` that tries to unload its own module while it is still running.
+extern "C" fn self_unloading_init() -> i32 {
+    let seen = match sys_delete_module(UNLOAD_IN_INIT) {
+        Err(ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::BadState {
+            from: crate::lifecycle::ModuleState::Loading,
+            ..
+        })) => 1,
+        _ => 2,
+    };
+    INIT_UNLOAD_SEEN.store(seen, Ordering::Release);
+    0
+}
+
+fn counting_elf(name: &str, abi: u32, init: extern "C" fn() -> i32) -> Vec<u8> {
+    build_smoke_elf(&SmokeElfSpec {
+        modinfo: build_modinfo(name, abi, None),
+        init_addr: init as usize as u64,
+        exit_addr: counting_exit as usize as u64,
+    })
+}
+
+/// An unload attempted while `init` is still running is refused: init holds
+/// no reference, so only the Loading state stands between it and an unmap.
+fn e2e_unload_refused_while_initialising() -> TestResult {
+    let abi = fresh_abi();
+    fresh_state(abi);
+    EXIT_COUNT.store(0, Ordering::Release);
+    INIT_UNLOAD_SEEN.store(0, Ordering::Release);
+    let elf = counting_elf(UNLOAD_IN_INIT, abi, self_unloading_init);
+    let Ok(module) = sys_init_module(&elf) else {
+        return TestResult::Fail("self-unloading module failed to load");
+    };
+    let seen = INIT_UNLOAD_SEEN.load(Ordering::Acquire);
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let exits_during_init = EXIT_COUNT.load(Ordering::Acquire);
+    drop(module);
+    let unloaded = sys_delete_module(UNLOAD_IN_INIT).is_ok();
+    if seen != 1 {
+        return TestResult::Fail("an unload during init was not refused as still Loading");
+    }
+    if exits_during_init != 0 || !live {
+        return TestResult::Fail("an unload during init ran exit or left the module not Live");
+    }
+    if !unloaded || EXIT_COUNT.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("the module did not unload cleanly once init had finished");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_unload_refused_while_initialising);
+
+/// Unload runs `exit` exactly once: a second unload while one owns the module
+/// is -EBUSY, an unload from inside a call into the module is -EBUSY and
+/// leaves it Live, and an unload after the module is gone is NotFound.
+fn e2e_unload_runs_exit_once() -> TestResult {
+    const NAME: &str = "e2e_unload_once";
+    let abi = fresh_abi();
+    fresh_state(abi);
+    EXIT_COUNT.store(0, Ordering::Release);
+    let elf = counting_elf(NAME, abi, smoke_init);
+    let Ok(module) = sys_init_module(&elf) else {
+        return TestResult::Fail("counting module failed to load");
+    };
+
+    // Another unload already owns the module.
+    *module.state.lock() = crate::lifecycle::ModuleState::Going;
+    let concurrent = sys_delete_module(NAME);
+    *module.state.lock() = crate::lifecycle::ModuleState::Live;
+    let concurrent_ok = matches!(
+        &concurrent,
+        Err(ModuleSyscallError::ExitFailed(
+            crate::lifecycle::LifecycleError::BadState {
+                from: crate::lifecycle::ModuleState::Going,
+                ..
+            }
+        ))
+    ) && concurrent.as_ref().err().map(ModuleSyscallError::to_errno)
+        == Some(-16);
+
+    // An unload from inside a gate call: the call holds a reference.
+    let id = module.id.0;
+    let inside = crate::call_in_module_context(id, || match sys_delete_module(NAME) {
+        Err(ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(_))) => 0,
+        _ => -1,
+    });
+    let still_live = *module.state.lock() == crate::lifecycle::ModuleState::Live
+        && crate::registry::contains(NAME);
+    let exits_before = EXIT_COUNT.load(Ordering::Acquire);
+    drop(module);
+
+    let first = sys_delete_module(NAME).is_ok();
+    let second = sys_delete_module(NAME);
+    let exits = EXIT_COUNT.load(Ordering::Acquire);
+    if !concurrent_ok {
+        return TestResult::Fail("an unload while another owned the module was not -EBUSY");
+    }
+    if inside != 0 || !still_live {
+        return TestResult::Fail("an unload from inside a module call was not refused cleanly");
+    }
+    if exits_before != 0 {
+        return TestResult::Fail("a refused unload ran the module's exit");
+    }
+    if !first || !matches!(second, Err(ModuleSyscallError::NotFound)) || exits != 1 {
+        return TestResult::Fail("unload did not run exit exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_unload_runs_exit_once);
+
+/// A real driving module survives a refused unload, then unloads, reloads
+/// and drives its device again: e1000.ko against QEMU's 82540EM.
+fn e2e_driver_module_unload_and_reload() -> TestResult {
+    const E1000_VENDOR: u16 = 0x8086;
+    const E1000_DEV_82540EM: u16 = 0x100E;
+    const MATCH_NAME: &str = "e1000-82540em";
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("no staged initramfs for driver module smoke");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_drivers_net_e1000.ko")
+    else {
+        return TestResult::Skip("narf_drivers_net_e1000.ko was not staged");
+    };
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    narf_bus::driver_match::__reset_for_test();
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("driver module has no ABI placeholder");
+    };
+
+    // How many QEMU 82540EMs this guest has. aarch64 has none: the lifecycle
+    // part of the test still runs, the device part does not.
+    #[cfg(target_arch = "x86_64")]
+    let nics = {
+        // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the harness
+        // maps; `init` only walks that ECAM region and is idempotent.
+        let _ = unsafe { narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE) };
+        narf_bus::devices()
+            .iter()
+            .filter(|d| {
+                matches!(&d.kind, narf_bus::BusKind::Pcie { .. })
+                    && d.id.vendor == E1000_VENDOR
+                    && d.id.device == E1000_DEV_82540EM
+            })
+            .count()
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let nics = 0usize;
+
+    // Load, bind every 82540EM, and run the poller once. Returns the owner.
+    let bring_up = |round: &'static str| -> Result<u64, &'static str> {
+        let module = sys_init_module_with_params(&image, "domain=driver2").map_err(|_| round)?;
+        let owner = module.id.0;
+        if nics != 0 {
+            let authority = narf_bus::bootstrap_registry_authority();
+            match narf_bus::probe_all_pci(&authority) {
+                Ok(n) if n as usize >= nics => {}
+                _ => return Err("probe_all did not bind the module to every 82540EM"),
+            }
+            let _ = narf_scheduler::poll_one_round();
+            if narf_bus::driver_match::__module_netif_count_for_test(owner) != nics
+                || narf_bus::driver_match::__module_callback_invocation_count_for_test(owner) == 0
+            {
+                return Err("the module did not drive the NIC (interface or poller missing)");
+            }
+        }
+        Ok(owner)
+    };
+
+    let owner = match bring_up("e1000.ko failed to load") {
+        Ok(owner) => owner,
+        Err(why) => {
+            narf_bus::driver_match::__reset_for_test();
+            return TestResult::Fail(why);
+        }
+    };
+
+    // A refused unload (from inside a call into the module) must not break
+    // it: its poller keeps running and its interface stays up.
+    let refused = crate::call_in_module_context(owner, || match sys_delete_module("e1000") {
+        Err(ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(_))) => 0,
+        _ => -1,
+    });
+    let callbacks = narf_bus::driver_match::__module_callback_invocation_count_for_test(owner);
+    let still_driving = nics == 0
+        || narf_scheduler::responsive_spin_until(
+            || {
+                let _ = narf_scheduler::poll_one_round();
+                narf_bus::driver_match::__module_callback_invocation_count_for_test(owner)
+                    > callbacks
+            },
+            narf_time::Deadline::after_ms(100),
+        );
+    if refused != 0 || !still_driving {
+        narf_bus::driver_match::__reset_for_test();
+        return TestResult::Fail("a refused unload stopped the module driving its device");
+    }
+
+    // Unload for real: matches, bindings, contexts and interfaces all go.
+    let unloaded = |owner: u64| {
+        sys_delete_module("e1000").is_ok()
+            && narf_bus::driver_match::__module_thunk_for_test(E1000_VENDOR, E1000_DEV_82540EM)
+                .is_none()
+            && narf_bus::driver_match::__module_device_context_count_for_test(owner) == 0
+            && narf_bus::driver_match::__module_netif_count_for_test(owner) == 0
+            && narf_bus::driver_match::__bound_count_for_test(MATCH_NAME) == 0
+            && !crate::registry::contains("e1000")
+    };
+    if !unloaded(owner) {
+        narf_bus::driver_match::__reset_for_test();
+        return TestResult::Fail("unload left a match, binding, context or interface behind");
+    }
+
+    // Reload the same image: it must bind and drive the device again.
+    let owner = match bring_up("e1000.ko failed to reload") {
+        Ok(owner) => owner,
+        Err(why) => {
+            narf_bus::driver_match::__reset_for_test();
+            return TestResult::Fail(why);
+        }
+    };
+    let clean = unloaded(owner);
+    narf_bus::driver_match::__reset_for_test();
+    if !clean {
+        return TestResult::Fail("the reloaded module did not unload cleanly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_driver_module_unload_and_reload);
+
 fn stamp_fixture_abi(staged: &[u8], abi: u32) -> Option<Vec<u8>> {
     const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
     let start = staged
