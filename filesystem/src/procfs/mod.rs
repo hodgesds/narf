@@ -1375,6 +1375,17 @@ pub trait ProcFile: Send + Sync + core::fmt::Debug {
     /// Generate the file's content at this moment.
     fn read(&self) -> Vec<u8>;
 
+    /// Bind a network table to the calling thread (`None`) or to an outer
+    /// PID/TID. Tables that implement this are also visible under that task's
+    /// `net/` directory. Each open keeps its selected network namespace.
+    fn net_view(&self, _outer_id: Option<u64>) -> Option<Arc<dyn ProcFile>> {
+        None
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        slice_read(&self.read(), offset, buf)
+    }
+
     /// `true` if the file accepts writes. Default is read-only.
     fn writable(&self) -> bool {
         false
@@ -1679,10 +1690,7 @@ impl FileOps for ProcDynFile {
         proc_attrs()
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move {
-            let bytes = self.file.read();
-            slice_read(&bytes, offset, buf)
-        })
+        Box::pin(async move { self.file.read_at(offset, buf) })
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let writable = self.file.writable();
@@ -2046,7 +2054,7 @@ impl ProcPidDir {
                     attrs: crate::DirOps::inode_attrs(&dir),
                 });
             }
-            "fd" | "fdinfo" | "ns" | "attr" => {
+            "fd" | "fdinfo" | "ns" | "attr" | "net" => {
                 return try_proc_file_node(ProcDirMarker::new(pid_entry_ino(self.pid, name)));
             }
             _ => {}
@@ -2121,6 +2129,12 @@ impl DirOps for ProcPidDir {
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
+            "net" => Some(Arc::new(ProcPidNetDir {
+                outer_id: match self.thread {
+                    Some(tid) => pid_resolve(tid)?,
+                    None => self.pid,
+                },
+            })),
             "fd" => Some(Arc::new(pid_ext::ProcFdDir { pid: self.pid })),
             "fdinfo" => Some(Arc::new(pid_ext::ProcFdInfoDir { pid: self.pid })),
             "task" => Some(Arc::new(pid_ext::ProcTaskDir { pid: self.pid })),
@@ -2277,6 +2291,10 @@ impl DirOps for ProcPidDir {
                     file_type: FileType::File,
                 },
                 // Subdirectories.
+                DirEntry {
+                    name: "net".into(),
+                    file_type: FileType::Dir,
+                },
                 DirEntry {
                     name: "fd".into(),
                     file_type: FileType::Dir,
@@ -2807,7 +2825,14 @@ impl DirOps for ProcDynamicDir {
         path.push(name);
         let ino = registry_ino(&path);
         match lookup_registry(&path) {
-            Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f, ino })),
+            Some(ProcNodeSnapshot::File(file)) => {
+                let file = if self.path_components.as_slice() == ["net"] {
+                    file.net_view(None).unwrap_or(file)
+                } else {
+                    file
+                };
+                Some(Arc::new(ProcDynFile { file, ino }))
+            }
             Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker::new(ino))),
             None => None,
         }
@@ -2845,6 +2870,49 @@ impl DirOps for ProcDynamicDir {
             })
             .collect();
         Box::new(entries.into_iter())
+    }
+}
+
+/// Per-task net directory. Only providers that can render the requested
+/// namespace participate; never substitute the reader's network tables.
+#[derive(Debug)]
+struct ProcPidNetDir {
+    outer_id: u64,
+}
+
+impl DirOps for ProcPidNetDir {
+    fn ino(&self) -> u64 {
+        pid_entry_ino(self.outer_id, "net")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let path = ["net", name];
+        let ProcNodeSnapshot::File(provider) = lookup_registry(&path)? else {
+            return None;
+        };
+        let file = provider.net_view(Some(self.outer_id))?;
+        Some(Arc::new(ProcDynFile {
+            file,
+            ino: registry_ino(&path),
+        }))
+    }
+    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+    fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
+        Box::new(
+            list_registry_dir(&["net"])
+                .into_iter()
+                .filter_map(|(name, _)| {
+                    self.lookup(&name)?;
+                    Some(DirEntry {
+                        name: name.into(),
+                        file_type: FileType::File,
+                    })
+                }),
+        )
     }
 }
 

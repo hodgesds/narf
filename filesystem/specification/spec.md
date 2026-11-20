@@ -209,13 +209,23 @@ the development initramfs login.
 
 `try_mount_root_with_options` additionally accepts
 `RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`
-`systemd_pid1` installed-distro boot path), the selected filesystem is the
+`openrc_pid1` or `systemd_pid1` installed-distro boot path under `root-ro`), the selected filesystem is the
 immutable OverlayFS lower and a Linux-compatible `TmpFs` upper becomes the
 visible `/` before PID 1 starts. The selector-free installed-root fallback
 uses the same wrapper at `/mnt` before PID 1 is rooted there.
 The upper inherits the lower root's owner and mode, is limited by the normal
 tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
 `RootMountError::TmpfsOverlay` reports failure to construct that session view.
+
+With `narf.rootlog` on a designated writable Btrfs root, the kernel creates
+a fresh mode-0600 `/var/log/narf-boot-NNNN.log` in the mounted subvolume.
+It commits the filename and buffered kernel messages before returning from
+the root mount. The boot thread checkpoints the file before each remaining
+initcall and before publishing the installed PID 1. A kernel task appends
+and syncs new records once per second, up to 4 MiB per boot. The root must contain
+the `var/log` directories. A logging failure is reported to the console and
+boot continues. If the kernel stops before mounting the root, it cannot
+create the file. The panic handler does not enter Btrfs transactions.
 
 ### 3.0c System-wide sync
 
@@ -1897,6 +1907,28 @@ namespace (the target's parent for self-reads).
 memory fields are derived from VMA extents and resident page counts. Procfs
 values that have no authoritative NARF provider remain absent rather than
 fabricated measurements.
+`/proc/net/unix` lists live AF_UNIX sockets in the caller's network namespace.
+The `net/unix` entries under process and thread directories select the named
+task's namespace. An open file retains that selection across namespace changes.
+Reads from offset zero refresh the table, and subsequent chunks use the same
+snapshot. Rows include the socket type, state, accept flag, sockfs inode, and
+optional local address. Queued stream connections have inode zero until
+accepted. Abstract names render NUL bytes as `@` and retain other bytes.
+The address column is masked and the reference count reports native socket
+ownership, excluding the temporary reference used for enumeration.
+All network tables registered with `procfs::net::register_table` appear under
+`/proc/net`, `/proc/<pid>/net` and the corresponding thread directories.
+`ProcFile::net_view` binds the open file to the calling thread (`None`) or
+the named outer PID/TID (`Some(id)`). Userspace supplies the namespace
+reference. Each open keeps it through namespace changes and target exit.
+Renderers receive the selected network table ID, including zero for the
+initial namespace. Reads at offset zero refresh the table. Short reads
+at subsequent offsets continue the same snapshot.
+The raw IPv4 and IPv6 tables enumerate raw IP sockets with their creator UID,
+inode and IP protocol in the local port column. The multicast tables show
+interface indices, group addresses and device membership counts for the
+selected namespace, including implicit all-hosts and all-nodes groups.
+
 `/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
 congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,
 and congestion values come from the TCP snapshot hook. The uid and inode

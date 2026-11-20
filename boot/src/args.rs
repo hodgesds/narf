@@ -41,6 +41,13 @@
 
 use core::str::FromStr;
 
+/// Distro executable selected for direct launch as PID 1 on the mounted root.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DistroInit {
+    OpenRc,
+    Systemd,
+}
+
 /// A parsed, zero-copy view over the kernel command line.
 ///
 /// Cheap to copy (it is just a borrowed `&str`); parsing happens
@@ -91,6 +98,19 @@ impl<'a> KernelCmdline<'a> {
             }
         }
         level
+    }
+
+    /// Select the installed root's init. An explicit OpenRC boot takes priority
+    /// over the legacy systemd flag if a bootloader supplies both.
+    #[must_use]
+    pub fn distro_init(&self) -> Option<DistroInit> {
+        if self.has_flag("openrc_pid1") {
+            Some(DistroInit::OpenRc)
+        } else if self.has_flag("systemd_pid1") {
+            Some(DistroInit::Systemd)
+        } else {
+            None
+        }
     }
 
     /// True iff a token is exactly `name` — a bare flag with no `=`.
@@ -211,6 +231,23 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("boot/args", smoke_recognizes_flags_and_values);
+
+    fn smoke_distro_init_selection() -> TestResult {
+        for (line, want) in [
+            ("", None),
+            ("openrc_pid1=0", None),
+            ("systemd_pid1", Some(DistroInit::Systemd)),
+            ("openrc_pid1", Some(DistroInit::OpenRc)),
+            ("systemd_pid1 openrc_pid1", Some(DistroInit::OpenRc)),
+            ("openrc_pid1 systemd_pid1", Some(DistroInit::OpenRc)),
+        ] {
+            if KernelCmdline::new(line).distro_init() != want {
+                return TestResult::Fail("installed init selection differs");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/args", smoke_distro_init_selection);
 
     fn smoke_console_loglevel_obeys_order_and_bounds() -> TestResult {
         for (raw, expected) in [

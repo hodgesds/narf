@@ -1345,7 +1345,7 @@ impl DirOps for ProcTaskTidDir {
                 ino: proc_pid_ino(self.ino, name),
                 wchan: name == "wchan",
             })),
-            "fd" | "fdinfo" | "ns" => {
+            "fd" | "fdinfo" | "ns" | "net" => {
                 Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name))))
             }
             _ => None,
@@ -1359,6 +1359,9 @@ impl DirOps for ProcTaskTidDir {
         match name {
             "fd" => Some(Arc::new(ProcFdDir { pid: self.pid })),
             "fdinfo" => Some(Arc::new(ProcFdInfoDir { pid: self.pid })),
+            "net" => Some(Arc::new(super::ProcPidNetDir {
+                outer_id: super::pid_resolve(self.tid)?,
+            })),
             // Namespace membership is per thread. Resolve the reader-visible
             // tid to its outer number; never substitute the group leader.
             "ns" => Some(Arc::new(super::ProcNsDir {
@@ -1371,7 +1374,7 @@ impl DirOps for ProcTaskTidDir {
         let files = ["comm", "mem", "stat", "syscall", "wchan"]
             .into_iter()
             .map(|name| (name, FileType::File));
-        let dirs = ["fd", "fdinfo", "ns"]
+        let dirs = ["fd", "fdinfo", "ns", "net"]
             .into_iter()
             .map(|name| (name, FileType::Dir));
         Box::new(files.chain(dirs).map(|(name, file_type)| DirEntry {

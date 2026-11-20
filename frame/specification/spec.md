@@ -23,6 +23,16 @@ those subsystems the hooks they need.
 
 ## 3. Public interface
 
+With `boot-init` and `openrc_pid1`, the framekernel directly starts the
+selected root's `/sbin/openrc-init` as PID 1 with the system executable
+search path. It installs the distro root before scheduling the task. OpenRC
+selects the runlevels and services from that root. A loader error is reported
+on the boot console and ends the launch attempt.
+
+With `narf.rootlog`, the init thread checkpoints the writable Btrfs root
+log before each remaining initcall and before publishing the installed PID 1.
+The filesystem owns the log file and its sync operations.
+
 Kernel-stack overflow handling (see §4):
 
 ```rust
@@ -160,6 +170,10 @@ wakes and perform policy-approved rescheduling, then returns with interrupts
 masked. Register/domain restoration keeps that mask until the atomic user
 return instruction. A notification received late in kernel mode therefore
 cannot be consumed by an IPI after the final wake check but before user entry.
+
+Boot installs the procfs network snapshot adapters. Each adapter queries the
+network stack using the namespace ID supplied by the open procfs file,
+including for IPv6 addresses and routes.
 
 ## 4. Invariants & safety properties
 

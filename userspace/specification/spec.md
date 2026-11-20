@@ -655,6 +655,14 @@ and applicable inherited access ACL. The creator can subsequently `chmod` its
 socket without `CAP_FOWNER`; ownership checks on unrelated inodes remain in
 force. Abstract addresses create no filesystem inode.
 
+Unix socket creation publishes a weak reference for procfs enumeration in
+the creator's network namespace. A queued stream endpoint inherits the
+connecting socket's namespace and the listener's local address. Accept
+publishes its sockfs inode to procfs, and final destruction removes the row.
+Connecting an AF_UNIX datagram socket marks both endpoints connected in
+procfs. An explicit disconnect also clears the old destination's connected
+state when that destination has no outgoing peer.
+
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 pathname binds materialize their socket inode before publishing the endpoint
@@ -716,13 +724,16 @@ references, revalidates both the directory and slot identity, and leaves its
 RCU read section before I/O or parking; the returned references own their
 lifetimes. `flock` obtains its operations and owner from one slot and retains
 that description through each acquisition attempt even if a shared-table peer
-closes the descriptor concurrently. Owned references are released before a
-retry parks, including the legacy nonlocal-yield path. Retired metadata contains
-only weak references, so grace periods do not postpone last-description close
-effects. Directory growth follows the table's geometric capacity; all RCU
-metadata allocations are fallible and allocation failure falls back to locked
-lookup. Close clears a slot without
-allocating, and metadata allocation runs outside read sections.
+closes the descriptor concurrently. A conflicting blocking `flock` waits
+interruptibly and retries even if the descriptor has `O_NONBLOCK`.
+`LOCK_NB` requests an immediate `EWOULDBLOCK`. Converting a shared lock to
+exclusive releases the previous lock before waiting. Owned references are
+released before a retry parks, including the legacy nonlocal-yield path.
+Retired metadata contains only weak references, so grace periods do not
+postpone last-description close effects. Directory growth follows the table's
+geometric capacity. All RCU metadata allocations are fallible, and allocation
+failure falls back to locked lookup. Close clears a slot without allocating,
+and metadata allocation runs outside read sections.
 IRQ table access permanently selects that locked fallback without invoking
 RCU. Whole-table replacement also invalidates the read view. `FdTable::get_mut`
 returns an `FdEntryMut` guard which publishes changed slot metadata on drop.
@@ -1521,6 +1532,13 @@ returns backing to its per-node pool, and `fork` eagerly copies private huge
 mappings on their original nodes. File-backed hugetlbfs and shared huge
 mappings fail explicitly because NARF has no hugetlbfs or shared-huge refcount
 contract.
+Userspace resolves procfs network table opens to the calling thread or named
+outer PID/TID and retains its network namespace for the open file. A named
+task that has exited cannot supply a new table view. The raw socket providers
+snapshot live AF_INET and AF_INET6 raw endpoints through weak references.
+Multicast providers read per-device IPv4 and IPv6 membership counts keyed
+by network namespace and interface index.
+
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.

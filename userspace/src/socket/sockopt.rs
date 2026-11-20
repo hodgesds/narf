@@ -427,6 +427,77 @@ type McGroupTable<G> = IrqSafeSpinLock<BTreeMap<(u64, u32, G), u32>>;
 static IP_MC_GROUPS: McGroupTable<u32> = IrqSafeSpinLock::new(BTreeMap::new());
 static IP6_MC_GROUPS: McGroupTable<[u8; 16]> = IrqSafeSpinLock::new(BTreeMap::new());
 
+// Snapshot the device join counts under their lock, then combine them with
+// the implicit memberships that host_joined_v4/v6 use on each interface.
+fn multicast_groups<G: Ord + Copy>(
+    ns: u64,
+    joined: &McGroupTable<G>,
+    implicit: &[G],
+) -> Vec<(u32, String, G, u32)> {
+    let mut groups: BTreeMap<(u32, G), u32> = joined
+        .lock()
+        .iter()
+        .filter(|((owner, _, _), _)| *owner == ns)
+        .map(|(&(_, index, group), &users)| ((index, group), users))
+        .collect();
+    let mut devices: BTreeMap<u32, String> = narf_net::iface::snapshot_all_in(ns)
+        .into_iter()
+        .map(|iface| (iface.ifindex, iface.name))
+        .collect();
+    devices
+        .entry(LOOPBACK_IFINDEX)
+        .or_insert_with(|| String::from("lo"));
+    for &index in devices.keys() {
+        for &group in implicit {
+            *groups.entry((index, group)).or_default() += 1;
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|((index, group), users)| {
+            Some((index, devices.get(&index)?.clone(), group, users))
+        })
+        .collect()
+}
+
+pub fn igmp_snapshot_in(ns: u64) -> Vec<narf_filesystem::procfs::net::IgmpSnapshot> {
+    multicast_groups(ns, &IP_MC_GROUPS, &[IGMP_ALL_HOSTS])
+        .into_iter()
+        .map(
+            |(ifindex, iface, group, users)| narf_filesystem::procfs::net::IgmpSnapshot {
+                ifindex,
+                iface,
+                group: group.to_be_bytes(),
+                users,
+                timer: 0,
+                reporter: 0,
+            },
+        )
+        .collect()
+}
+
+pub fn igmp6_snapshot_in(ns: u64) -> Vec<narf_filesystem::procfs::net::Igmp6Snapshot> {
+    let mut all_nodes = [0; 16];
+    all_nodes[0] = 0xff;
+    all_nodes[1] = 1;
+    all_nodes[15] = 1;
+    let mut link_local = all_nodes;
+    link_local[1] = 2;
+    multicast_groups(ns, &IP6_MC_GROUPS, &[all_nodes, link_local])
+        .into_iter()
+        .map(
+            |(ifindex, iface, group, users)| narf_filesystem::procfs::net::Igmp6Snapshot {
+                ifindex,
+                iface,
+                group,
+                users,
+                flags: 0,
+                timer: 0,
+            },
+        )
+        .collect()
+}
+
 /// Source of `sock_gen_cookie` values.
 static NEXT_SOCK_COOKIE: AtomicU64 = AtomicU64::new(1);
 

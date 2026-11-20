@@ -395,7 +395,7 @@ device NARF does not have), then
   - generation 0;
   - a balance item, reloc roots, or a started or suspended device replace.
 
-  Under `root-rw` the gate also requires one device, crc32c, 4 KiB sectors,
+  Under `root-rw` the gate also requires one device, CRC32C or xxHash64 checksums, 4 KiB sectors,
   a power-of-two nodesize of 4–64 KiB, a valid free-space tree and an empty
   log tree (`log_root == 0`; mount once on Linux to replay a dirty log). Its
   incompat set is limited to `MIXED_BACKREF DEFAULT_SUBVOL COMPRESS_LZO

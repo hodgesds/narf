@@ -186,33 +186,33 @@ pub struct RootMountOptions {
 }
 
 /// How the root selected on the command line is attached, as a function of
-/// the disk policy (`narf.disks=`), whether an installed distro's systemd
+/// the disk policy (`narf.disks=`), whether the installed distro init
 /// runs as PID 1, and the command line's `ro` / `rw`.
 ///
-/// - `root-ro`: the root is always constructed read-only. A systemd PID 1
-///   gets the session-writable tmpfs overlay over it, so systemd sees a
+/// - `root-ro`: the root is always constructed read-only. A distro PID 1
+///   gets the session-writable tmpfs overlay over it, so init sees a
 ///   writable `/` while not one byte reaches the disk.
 /// - `root-rw`: the real root is the writable root, with no overlay. Only an
 ///   explicit `ro` keeps it read-only; the command line's default (neither
 ///   `ro` nor `rw`) is treated as `rw`, because NARF cannot later flip a
 ///   constructed btrfs volume to read-write the way `systemd-remount-fs`
 ///   expects.
-/// - every other policy keeps the pre-existing behaviour: a systemd PID 1
+/// - every other policy keeps the pre-existing behaviour: a distro PID 1
 ///   boot with an explicit `root=` gets the tmpfs overlay, and `ro` is
 ///   honoured.
 pub fn plan_root(
     policy: narf_block::disk_policy::DiskPolicy,
-    systemd_pid1: bool,
+    distro_pid1: bool,
     spec: &crate::root_selector::RootSpec,
 ) -> RootMountOptions {
     use crate::root_selector::RootAccess;
     use narf_block::disk_policy::DiskPolicy;
     let explicit_ro = spec.access == RootAccess::ReadOnly;
     let (read_only, tmpfs_overlay, designate) = match policy {
-        DiskPolicy::RootRo => (true, systemd_pid1, true),
+        DiskPolicy::RootRo => (true, distro_pid1, true),
         DiskPolicy::RootRw => (explicit_ro, false, true),
         DiskPolicy::All | DiskPolicy::BootOnly => {
-            (explicit_ro, systemd_pid1 && spec.selector.is_some(), false)
+            (explicit_ro, distro_pid1 && spec.selector.is_some(), false)
         }
     };
     RootMountOptions {
@@ -316,14 +316,14 @@ pub fn try_mount_root(
     let spec = crate::root_selector::RootSpec::from_cmdline(narf_boot::cmdline());
     // An installed Linux userspace needs a writable root for state such as
     // browser profiles, package caches, and `/var`. Unless `narf.disks=root-rw`
-    // makes the real root writable, systemd PID 1 boots with an explicit root
+    // makes the real root writable, distro PID 1 boots with an explicit root
     // selector receive a tmpfs-backed OverlayFS root while the on-disk image
     // stays the lower, untouched layer (see [`plan_root`]). The selector-free
     // installed-root fallback is attached later at `/mnt` and applies the
     // same wrapper there before PID 1 is spawned.
     let options = plan_root(
         narf_block::disk_policy::policy(),
-        narf_boot::args().has_flag("systemd_pid1"),
+        narf_boot::args().distro_init().is_some(),
         &spec,
     );
     let result = try_mount_root_with_options(authority, spec.selector.as_ref(), options);
@@ -535,9 +535,17 @@ pub fn try_mount_root_with_options(
             fs
         };
         let _handle = crate::registry()
-            .mount_arc(authority, "/", fs)
+            .mount_arc(authority, "/", fs.clone())
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;
         mapping.0 = false;
+        if options.designate
+            && !options.read_only
+            && !options.tmpfs_overlay
+            && detect == FsType::Btrfs
+            && narf_boot::args().has_flag("narf.rootlog")
+        {
+            crate::root_bootlog::start(fs.as_ref());
+        }
         return Ok(MountReport {
             device_name: String::from(device_name),
             fs_type: detect,

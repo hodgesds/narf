@@ -34,7 +34,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{register_proc, ProcFile};
+use super::{register_proc, slice_read, ProcFile};
+use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 
 // ── Net-subsystem snapshot hooks ────────────────────────────────
 //
@@ -91,15 +92,10 @@ pub struct UdpSocketSnapshot {
 #[derive(Clone, Debug)]
 pub struct RawSocketSnapshot {
     pub local_addr: [u8; 4],
-    pub local_port: u16,
     pub remote_addr: [u8; 4],
-    pub remote_port: u16,
     pub state_code: u8,
     pub uid: u32,
     pub inode: u64,
-    /// IPv4 protocol number this raw socket is bound to. For raw
-    /// IPPROTO_ICMP this is 1; for AF_PACKET sockets (lifted into
-    /// the IPv4 raw view) this is 0xFF as a sentinel.
     pub protocol: u8,
 }
 
@@ -289,6 +285,7 @@ pub struct SnmpMib {
 
 #[derive(Clone, Debug)]
 pub struct IgmpSnapshot {
+    pub ifindex: u32,
     pub iface: String,
     pub group: [u8; 4],
     pub users: u32,
@@ -308,21 +305,21 @@ pub struct Igmp6Snapshot {
 
 // ── Hook slots ──────────────────────────────────────────────────
 
-type TcpSnapshotFn = fn() -> Vec<TcbSnapshot>;
-type UdpSnapshotFn = fn() -> Vec<UdpSocketSnapshot>;
-type RawSnapshotFn = fn() -> Vec<RawSocketSnapshot>;
-type ArpSnapshotFn = fn() -> Vec<ArpSnapshot>;
-type RouteSnapshotFn = fn() -> Vec<RouteSnapshot>;
-type IfaceCountersFn = fn() -> Vec<IfaceCounterSnapshot>;
-type Ipv6IfAddrFn = fn() -> Vec<Ipv6IfAddrSnapshot>;
-type Ipv6RouteFn = fn() -> Vec<Ipv6RouteSnapshot>;
-type ConntrackFn = fn() -> Vec<ConntrackSnapshot>;
-type SnmpFn = fn() -> SnmpMib;
-type IgmpFn = fn() -> Vec<IgmpSnapshot>;
-type Igmp6Fn = fn() -> Vec<Igmp6Snapshot>;
-type Tcp6SnapshotFn = fn() -> Vec<Tcb6Snapshot>;
-type Udp6SnapshotFn = fn() -> Vec<Udp6SocketSnapshot>;
-type Raw6SnapshotFn = fn() -> Vec<Raw6SocketSnapshot>;
+type TcpSnapshotFn = fn(u64) -> Vec<TcbSnapshot>;
+type UdpSnapshotFn = fn(u64) -> Vec<UdpSocketSnapshot>;
+type RawSnapshotFn = fn(u64) -> Vec<RawSocketSnapshot>;
+type ArpSnapshotFn = fn(u64) -> Vec<ArpSnapshot>;
+type RouteSnapshotFn = fn(u64) -> Vec<RouteSnapshot>;
+type IfaceCountersFn = fn(u64) -> Vec<IfaceCounterSnapshot>;
+type Ipv6IfAddrFn = fn(u64) -> Vec<Ipv6IfAddrSnapshot>;
+type Ipv6RouteFn = fn(u64) -> Vec<Ipv6RouteSnapshot>;
+type ConntrackFn = fn(u64) -> Vec<ConntrackSnapshot>;
+type SnmpFn = fn(u64) -> SnmpMib;
+type IgmpFn = fn(u64) -> Vec<IgmpSnapshot>;
+type Igmp6Fn = fn(u64) -> Vec<Igmp6Snapshot>;
+type Tcp6SnapshotFn = fn(u64) -> Vec<Tcb6Snapshot>;
+type Udp6SnapshotFn = fn(u64) -> Vec<Udp6SocketSnapshot>;
+type Raw6SnapshotFn = fn(u64) -> Vec<Raw6SocketSnapshot>;
 
 #[derive(Clone, Debug)]
 pub struct Tcb6Snapshot {
@@ -355,9 +352,7 @@ pub struct Udp6SocketSnapshot {
 #[derive(Clone, Debug)]
 pub struct Raw6SocketSnapshot {
     pub local_addr: [u8; 16],
-    pub local_port: u16,
     pub remote_addr: [u8; 16],
-    pub remote_port: u16,
     pub state_code: u8,
     pub uid: u32,
     pub inode: u64,
@@ -417,154 +412,154 @@ pub fn install_hooks(
     RAW6_HOOK.store(raw6 as usize, Ordering::Release);
 }
 
-fn tcp_snapshot() -> Vec<TcbSnapshot> {
+fn tcp_snapshot(namespace: u64) -> Vec<TcbSnapshot> {
     let v = TCP_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a TcpSnapshotFn fn-pointer; non-zero confirms it.
     let f: TcpSnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn udp_snapshot() -> Vec<UdpSocketSnapshot> {
+fn udp_snapshot(namespace: u64) -> Vec<UdpSocketSnapshot> {
     let v = UDP_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a UdpSnapshotFn fn-pointer; non-zero confirms it.
     let f: UdpSnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn raw_snapshot() -> Vec<RawSocketSnapshot> {
+fn raw_snapshot(namespace: u64) -> Vec<RawSocketSnapshot> {
     let v = RAW_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a RawSnapshotFn fn-pointer; non-zero confirms it.
     let f: RawSnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn arp_snapshot() -> Vec<ArpSnapshot> {
+fn arp_snapshot(namespace: u64) -> Vec<ArpSnapshot> {
     let v = ARP_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an ArpSnapshotFn fn-pointer; non-zero confirms it.
     let f: ArpSnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn route_snapshot() -> Vec<RouteSnapshot> {
+fn route_snapshot(namespace: u64) -> Vec<RouteSnapshot> {
     let v = ROUTE_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a RouteSnapshotFn fn-pointer; non-zero confirms it.
     let f: RouteSnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn iface_counters() -> Vec<IfaceCounterSnapshot> {
+fn iface_counters(namespace: u64) -> Vec<IfaceCounterSnapshot> {
     let v = IFACE_COUNTERS_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an IfaceCountersFn fn-pointer; non-zero confirms it.
     let f: IfaceCountersFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn ipv6_ifaddr_snapshot() -> Vec<Ipv6IfAddrSnapshot> {
+fn ipv6_ifaddr_snapshot(namespace: u64) -> Vec<Ipv6IfAddrSnapshot> {
     let v = IPV6_IFADDR_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an Ipv6IfAddrFn fn-pointer; non-zero confirms it.
     let f: Ipv6IfAddrFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn ipv6_route_snapshot() -> Vec<Ipv6RouteSnapshot> {
+fn ipv6_route_snapshot(namespace: u64) -> Vec<Ipv6RouteSnapshot> {
     let v = IPV6_ROUTE_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an Ipv6RouteFn fn-pointer; non-zero confirms it.
     let f: Ipv6RouteFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn conntrack_snapshot() -> Vec<ConntrackSnapshot> {
+fn conntrack_snapshot(namespace: u64) -> Vec<ConntrackSnapshot> {
     let v = CONNTRACK_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a ConntrackFn fn-pointer; non-zero confirms it.
     let f: ConntrackFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn snmp_snapshot() -> SnmpMib {
+fn snmp_snapshot(namespace: u64) -> SnmpMib {
     let v = SNMP_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return SnmpMib::default();
     }
     // SAFETY: v was stored by install_hooks as a SnmpFn fn-pointer; non-zero confirms it.
     let f: SnmpFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn igmp_snapshot() -> Vec<IgmpSnapshot> {
+fn igmp_snapshot(namespace: u64) -> Vec<IgmpSnapshot> {
     let v = IGMP_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an IgmpFn fn-pointer; non-zero confirms it.
     let f: IgmpFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn igmp6_snapshot() -> Vec<Igmp6Snapshot> {
+fn igmp6_snapshot(namespace: u64) -> Vec<Igmp6Snapshot> {
     let v = IGMP6_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as an Igmp6Fn fn-pointer; non-zero confirms it.
     let f: Igmp6Fn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn tcp6_snapshot() -> Vec<Tcb6Snapshot> {
+fn tcp6_snapshot(namespace: u64) -> Vec<Tcb6Snapshot> {
     let v = TCP6_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a Tcp6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Tcp6SnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn udp6_snapshot() -> Vec<Udp6SocketSnapshot> {
+fn udp6_snapshot(namespace: u64) -> Vec<Udp6SocketSnapshot> {
     let v = UDP6_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a Udp6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Udp6SnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
-fn raw6_snapshot() -> Vec<Raw6SocketSnapshot> {
+fn raw6_snapshot(namespace: u64) -> Vec<Raw6SocketSnapshot> {
     let v = RAW6_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Vec::new();
     }
     // SAFETY: v was stored by install_hooks as a Raw6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Raw6SnapshotFn = unsafe { core::mem::transmute(v) };
-    f()
+    f(namespace)
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -633,235 +628,179 @@ const SOCK_HDR_LINE: &str =
 
 // ── ProcFile impls ──────────────────────────────────────────────
 
-#[derive(Debug)]
-struct TcpFile;
-
-impl ProcFile for TcpFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, tcb) in tcp_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv4_port(tcb.local_addr, tcb.local_port);
-            let remote = fmt_ipv4_port(tcb.remote_addr, tcb.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {} 2 0000000000000000 {:>8} {:>8} 0 {:>5} {:>5}",
-                i,
-                local,
-                remote,
-                tcb.state_code,
-                tcb.tx_queue,
-                tcb.rx_queue,
-                tcb.timer_active,
-                tcb.timer_expires,
-                tcb.retrnsmt,
-                tcb.uid,
-                tcb.probes_out,
-                tcb.inode,
-                tcb.rto,
-                tcb.ack_timeout,
-                tcb.snd_cwnd,
-                tcb.snd_ssthresh,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct UdpFile;
-
-impl ProcFile for UdpFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, u) in udp_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv4_port(u.local_addr, u.local_port);
-            let remote = fmt_ipv4_port(u.remote_addr, u.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} 2 0 0 0 0 ",
-                i, local, remote, u.state_code,
-                u.tx_queue, u.rx_queue,
-                0u8, 0u32, 0u32,
-                u.uid,
-                u.inode,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct RawFile;
-
-impl ProcFile for RawFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, r) in raw_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv4_port(r.local_addr, r.local_port);
-            let remote = fmt_ipv4_port(r.remote_addr, r.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
-                i, local, remote, r.state_code, r.uid, r.inode,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct Tcp6File;
-
-impl ProcFile for Tcp6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, tcb) in tcp6_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv6_port(tcb.local_addr, tcb.local_port);
-            let remote = fmt_ipv6_port(tcb.remote_addr, tcb.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} ",
-                i,
-                local,
-                remote,
-                tcb.state_code,
-                tcb.tx_queue,
-                tcb.rx_queue,
-                0u8,
-                0u32,
-                tcb.retrnsmt,
-                tcb.uid,
-                tcb.inode,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct Udp6File;
-
-impl ProcFile for Udp6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, u) in udp6_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv6_port(u.local_addr, u.local_port);
-            let remote = fmt_ipv6_port(u.remote_addr, u.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} 2 0 0 0 0 ",
-                i, local, remote, u.state_code,
-                u.tx_queue, u.rx_queue,
-                0u8, 0u32, 0u32,
-                u.uid, u.inode,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct Raw6File;
-
-impl ProcFile for Raw6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(SOCK_HDR_LINE);
-        for (i, r) in raw6_snapshot().into_iter().enumerate() {
-            let local = fmt_ipv6_port(r.local_addr, r.local_port);
-            let remote = fmt_ipv6_port(r.remote_addr, r.remote_port);
-            let _ = writeln!(
-                s,
-                "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
-                i, local, remote, r.state_code, r.uid, r.inode,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct SockstatFile;
-
-impl ProcFile for SockstatFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let tcp = tcp_snapshot();
-        let udp = udp_snapshot();
-        let raw = raw_snapshot();
-        let tcp_inuse = tcp.iter().filter(|t| t.state_code != 0x06).count();
-        let tcp_tw = tcp.len().saturating_sub(tcp_inuse);
-        let used = tcp
-            .len()
-            .saturating_add(udp.len())
-            .saturating_add(raw.len());
-        let mut s = String::new();
-        let _ = writeln!(s, "sockets: used {used}");
+fn render_tcp(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, tcb) in tcp_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv4_port(tcb.local_addr, tcb.local_port);
+        let remote = fmt_ipv4_port(tcb.remote_addr, tcb.remote_port);
         let _ = writeln!(
             s,
-            "TCP: inuse {tcp_inuse} orphan 0 tw {tcp_tw} alloc {} mem 0",
-            tcp.len()
+            "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {} 2 0000000000000000 {:>8} {:>8} 0 {:>5} {:>5}",
+            i,
+            local,
+            remote,
+            tcb.state_code,
+            tcb.tx_queue,
+            tcb.rx_queue,
+            tcb.timer_active,
+            tcb.timer_expires,
+            tcb.retrnsmt,
+            tcb.uid,
+            tcb.probes_out,
+            tcb.inode,
+            tcb.rto,
+            tcb.ack_timeout,
+            tcb.snd_cwnd,
+            tcb.snd_ssthresh,
         );
-        let _ = writeln!(s, "UDP: inuse {} mem 0", udp.len());
-        let _ = writeln!(s, "UDPLITE: inuse 0");
-        let _ = writeln!(s, "RAW: inuse {}", raw.len());
-        let _ = writeln!(s, "FRAG: inuse 0 memory 0");
-        s.into_bytes()
     }
+    s.into_bytes()
 }
 
-#[derive(Debug)]
-struct Sockstat6File;
-
-impl ProcFile for Sockstat6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::new();
-        let _ = writeln!(s, "TCP6: inuse {}", tcp6_snapshot().len());
-        let _ = writeln!(s, "UDP6: inuse {}", udp6_snapshot().len());
-        let _ = writeln!(s, "UDPLITE6: inuse 0");
-        let _ = writeln!(s, "RAW6: inuse {}", raw6_snapshot().len());
-        let _ = writeln!(s, "FRAG6: inuse 0 memory 0");
-        s.into_bytes()
+fn render_udp(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, u) in udp_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv4_port(u.local_addr, u.local_port);
+        let remote = fmt_ipv4_port(u.remote_addr, u.remote_port);
+        let _ = writeln!(
+            s,
+            "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} 2 0 0 0 0 ",
+            i, local, remote, u.state_code, u.tx_queue, u.rx_queue, 0u8, 0u32, 0u32, u.uid, u.inode,
+        );
     }
+    s.into_bytes()
 }
 
-#[derive(Debug)]
-struct NetstatFile;
+fn render_raw(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, r) in raw_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv4_port(r.local_addr, u16::from(r.protocol));
+        let remote = fmt_ipv4_port(r.remote_addr, 0);
+        let _ = writeln!(
+            s,
+            "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
+            i, local, remote, r.state_code, r.uid, r.inode,
+        );
+    }
+    s.into_bytes()
+}
 
-impl ProcFile for NetstatFile {
-    fn read(&self) -> Vec<u8> {
-        let m = snmp_snapshot();
-        // Linux emits each MIB family as a header row followed by a value row.
-        // Keep the two lists positionally identical: iproute2 and procps parse
-        // them by zipping fields rather than by accepting ad-hoc key/value text.
-        alloc::format!(
-            "TcpExt: SyncookiesSent SyncookiesRecv SyncookiesFailed EmbryonicRsts PruneCalled RcvPruned OfoPruned OutOfWindowIcmps LockDroppedIcmps TW TWRecycled TWKilled PAWSActive PAWSEstab DelayedACKs DelayedACKLocked DelayedACKLost ListenOverflows ListenDrops TCPTimeouts TCPRetransFail\n\
+fn render_tcp6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, tcb) in tcp6_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv6_port(tcb.local_addr, tcb.local_port);
+        let remote = fmt_ipv6_port(tcb.remote_addr, tcb.remote_port);
+        let _ = writeln!(
+            s,
+            "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} ",
+            i,
+            local,
+            remote,
+            tcb.state_code,
+            tcb.tx_queue,
+            tcb.rx_queue,
+            0u8,
+            0u32,
+            tcb.retrnsmt,
+            tcb.uid,
+            tcb.inode,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_udp6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, u) in udp6_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv6_port(u.local_addr, u.local_port);
+        let remote = fmt_ipv6_port(u.remote_addr, u.remote_port);
+        let _ = writeln!(
+            s,
+            "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} 2 0 0 0 0 ",
+            i, local, remote, u.state_code, u.tx_queue, u.rx_queue, 0u8, 0u32, 0u32, u.uid, u.inode,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_raw6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(SOCK_HDR_LINE);
+    for (i, r) in raw6_snapshot(namespace).into_iter().enumerate() {
+        let local = fmt_ipv6_port(r.local_addr, u16::from(r.protocol));
+        let remote = fmt_ipv6_port(r.remote_addr, 0);
+        let _ = writeln!(
+            s,
+            "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
+            i, local, remote, r.state_code, r.uid, r.inode,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_sockstat(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let tcp = tcp_snapshot(namespace);
+    let udp = udp_snapshot(namespace);
+    let raw = raw_snapshot(namespace);
+    let tcp_inuse = tcp.iter().filter(|t| t.state_code != 0x06).count();
+    let tcp_tw = tcp.len().saturating_sub(tcp_inuse);
+    let used = tcp
+        .len()
+        .saturating_add(udp.len())
+        .saturating_add(raw.len());
+    let mut s = String::new();
+    let _ = writeln!(s, "sockets: used {used}");
+    let _ = writeln!(
+        s,
+        "TCP: inuse {tcp_inuse} orphan 0 tw {tcp_tw} alloc {} mem 0",
+        tcp.len()
+    );
+    let _ = writeln!(s, "UDP: inuse {} mem 0", udp.len());
+    let _ = writeln!(s, "UDPLITE: inuse 0");
+    let _ = writeln!(s, "RAW: inuse {}", raw.len());
+    let _ = writeln!(s, "FRAG: inuse 0 memory 0");
+    s.into_bytes()
+}
+
+fn render_sockstat6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "TCP6: inuse {}", tcp6_snapshot(namespace).len());
+    let _ = writeln!(s, "UDP6: inuse {}", udp6_snapshot(namespace).len());
+    let _ = writeln!(s, "UDPLITE6: inuse 0");
+    let _ = writeln!(s, "RAW6: inuse {}", raw6_snapshot(namespace).len());
+    let _ = writeln!(s, "FRAG6: inuse 0 memory 0");
+    s.into_bytes()
+}
+
+fn render_netstat(namespace: u64) -> Vec<u8> {
+    let m = snmp_snapshot(namespace);
+    // Linux emits each MIB family as a header row followed by a value row.
+    // Keep the two lists positionally identical: iproute2 and procps parse
+    // them by zipping fields rather than by accepting ad-hoc key/value text.
+    alloc::format!(
+        "TcpExt: SyncookiesSent SyncookiesRecv SyncookiesFailed EmbryonicRsts PruneCalled RcvPruned OfoPruned OutOfWindowIcmps LockDroppedIcmps TW TWRecycled TWKilled PAWSActive PAWSEstab DelayedACKs DelayedACKLocked DelayedACKLost ListenOverflows ListenDrops TCPTimeouts TCPRetransFail\n\
 TcpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0\n\
 IpExt: InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts OutBcastPkts InOctets OutOctets InNoECTPkts InECT1Pkts InECT0Pkts InCEPkts\n\
 IpExt: {} 0 0 0 0 0 0 0 0 0 0 0\n\
 MPTcpExt: MPCapableSYNRX MPCapableSYNTX MPCapableSYNACKRX MPCapableACKRX\n\
 MPTcpExt: 0 0 0 0\n",
-            m.tcp_attempt_fails,
-            m.ip_out_no_routes,
-        )
-        .into_bytes()
-    }
+        m.tcp_attempt_fails,
+        m.ip_out_no_routes,
+    )
+    .into_bytes()
 }
 
-#[derive(Debug)]
-struct Snmp6File;
-
-impl ProcFile for Snmp6File {
-    fn read(&self) -> Vec<u8> {
-        let m = snmp_snapshot();
-        alloc::format!(
-            "Ip6InReceives                  {}\n\
+fn render_snmp6(namespace: u64) -> Vec<u8> {
+    let m = snmp_snapshot(namespace);
+    alloc::format!(
+        "Ip6InReceives                  {}\n\
 Ip6InHdrErrors                 {}\n\
 Ip6InAddrErrors                {}\n\
 Ip6InUnknownProtos             {}\n\
@@ -879,403 +818,446 @@ Udp6InDatagrams                {}\n\
 Udp6NoPorts                    {}\n\
 Udp6InErrors                   {}\n\
 Udp6OutDatagrams               {}\n",
-            m.ip_in_receives,
-            m.ip_in_hdr_errors,
-            m.ip_in_addr_errors,
-            m.ip_in_unknown_protos,
-            m.ip_in_discards,
-            m.ip_in_delivers,
-            m.ip_forwd_datagrams,
-            m.ip_out_requests,
-            m.ip_out_discards,
-            m.ip_out_no_routes,
-            m.icmp_in_msgs,
-            m.icmp_in_errors,
-            m.icmp_out_msgs,
-            m.icmp_out_errors,
-            m.udp_in_datagrams,
-            m.udp_no_ports,
-            m.udp_in_errors,
-            m.udp_out_datagrams,
-        )
-        .into_bytes()
-    }
+        m.ip_in_receives,
+        m.ip_in_hdr_errors,
+        m.ip_in_addr_errors,
+        m.ip_in_unknown_protos,
+        m.ip_in_discards,
+        m.ip_in_delivers,
+        m.ip_forwd_datagrams,
+        m.ip_out_requests,
+        m.ip_out_discards,
+        m.ip_out_no_routes,
+        m.icmp_in_msgs,
+        m.icmp_in_errors,
+        m.icmp_out_msgs,
+        m.icmp_out_errors,
+        m.udp_in_datagrams,
+        m.udp_no_ports,
+        m.udp_in_errors,
+        m.udp_out_datagrams,
+    )
+    .into_bytes()
 }
 
-#[derive(Debug)]
-struct ArpFile;
-
-impl ProcFile for ArpFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(
-            "IP address       HW type     Flags       HW address            Mask     Device\n",
+fn render_arp(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(
+        "IP address       HW type     Flags       HW address            Mask     Device\n",
+    );
+    for e in arp_snapshot(namespace) {
+        let _ = writeln!(
+            s,
+            "{:<16} 0x1         0x{:X}         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
+            alloc::format!("{}.{}.{}.{}", e.ip[0], e.ip[1], e.ip[2], e.ip[3]),
+            e.flags,
+            e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
+            e.iface,
         );
-        for e in arp_snapshot() {
+    }
+    s.into_bytes()
+}
+
+fn render_route(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
+    );
+    for r in route_snapshot(namespace) {
+        // Linux uses host-endian hex per u32. Same trick as the
+        // tcp file: bytes printed in reverse to match the host
+        // byte order on x86.
+        let dst_hex = u32::from_le_bytes(r.dst);
+        let gw_hex = u32::from_le_bytes(r.gateway);
+        let mask_hex = u32::from_le_bytes(r.mask);
+        let _ = writeln!(
+            s,
+            "{}\t{:08X}\t{:08X}\t{:04X}\t{}\t{}\t{}\t{:08X}\t{}\t{}\t{}",
+            r.iface,
+            dst_hex,
+            gw_hex,
+            r.flags,
+            r.refcnt,
+            r.use_count,
+            r.metric,
+            mask_hex,
+            r.mtu,
+            r.window,
+            r.irtt,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_dev(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::from(
+        "Inter-|   Receive                                                |  Transmit\n \
+         face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+    );
+    for c in iface_counters(namespace) {
+        let _ = writeln!(
+            s,
+            "{:>6}: {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
+            c.name,
+            c.rx_bytes, c.rx_packets, c.rx_errs, c.rx_drop,
+            c.rx_fifo, c.rx_frame, c.rx_compressed, c.rx_multicast,
+            c.tx_bytes, c.tx_packets, c.tx_errs, c.tx_drop,
+            c.tx_fifo, c.tx_colls, c.tx_carrier, c.tx_compressed,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_if_inet6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    for a in ipv6_ifaddr_snapshot(namespace) {
+        // Linux format (one line per address):
+        //   <32-hex-addr> <ifindex-hex> <prefix_len-hex>
+        //   <scope-hex> <flags-hex> <devname>
+        let _ = writeln!(
+            s,
+            "{} {:02x} {:02x} {:02x} {:02x} {:>8}",
+            fmt_ipv6_raw(a.addr),
+            a.ifindex,
+            a.prefix_len,
+            a.scope,
+            a.flags,
+            a.iface,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_ipv6_route(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    for r in ipv6_route_snapshot(namespace) {
+        // Linux net/ipv6/route.c::rt6_info_format:
+        //   <dst> <plen> <src> <splen> <next-hop> <metric>
+        //   <ref> <use> <flags> <device>
+        let _ = writeln!(
+            s,
+            "{} {:02x} {} {:02x} {} {:08x} {:08x} {:08x} {:08x} {:>8}",
+            fmt_ipv6_raw(r.dst),
+            r.dst_prefix_len,
+            fmt_ipv6_raw(r.src),
+            r.src_prefix_len,
+            fmt_ipv6_raw(r.gateway),
+            r.metric,
+            r.refcnt,
+            r.use_count,
+            r.flags,
+            r.iface,
+        );
+    }
+    s.into_bytes()
+}
+
+fn render_igmp(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    // Linux /proc/net/igmp header: 1 line per interface, then
+    // 1 line per joined group indented by tab. Even with no
+    // groups the file always exists with at least the version
+    // marker so libnetfilter-mcast probes succeed.
+    let mut s = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
+    let groups = igmp_snapshot(namespace);
+    for iface in groups.chunk_by(|a, b| a.ifindex == b.ifindex) {
+        let first = &iface[0];
+        let _ = writeln!(
+            s,
+            "{}\t{:<10}: {:5} {:>7}",
+            first.ifindex,
+            first.iface,
+            iface.len(),
+            "V3"
+        );
+        for group in iface {
             let _ = writeln!(
                 s,
-                "{:<16} 0x1         0x{:X}         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
-                alloc::format!("{}.{}.{}.{}", e.ip[0], e.ip[1], e.ip[2], e.ip[3]),
-                e.flags,
-                e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
-                e.iface,
+                "\t\t\t\t{:08X} {:5} {}:{:08X}\t\t{}",
+                u32::from_ne_bytes(group.group),
+                group.users,
+                u8::from(group.timer != 0),
+                group.timer,
+                group.reporter
             );
         }
-        s.into_bytes()
     }
+    s.into_bytes()
 }
 
-#[derive(Debug)]
-struct RouteFile;
-
-impl ProcFile for RouteFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(
-            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
+fn render_igmp6(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    for g in igmp6_snapshot(namespace) {
+        let _ = writeln!(
+            s,
+            "{:<4} {:<15} {} {:5} {:08X} {}",
+            g.ifindex,
+            g.iface,
+            fmt_ipv6_raw(g.group),
+            g.users,
+            g.flags,
+            g.timer,
         );
-        for r in route_snapshot() {
-            // Linux uses host-endian hex per u32. Same trick as the
-            // tcp file: bytes printed in reverse to match the host
-            // byte order on x86.
-            let dst_hex = u32::from_le_bytes(r.dst);
-            let gw_hex = u32::from_le_bytes(r.gateway);
-            let mask_hex = u32::from_le_bytes(r.mask);
-            let _ = writeln!(
-                s,
-                "{}\t{:08X}\t{:08X}\t{:04X}\t{}\t{}\t{}\t{:08X}\t{}\t{}\t{}",
-                r.iface,
-                dst_hex,
-                gw_hex,
-                r.flags,
-                r.refcnt,
-                r.use_count,
-                r.metric,
-                mask_hex,
-                r.mtu,
-                r.window,
-                r.irtt,
-            );
+    }
+    s.into_bytes()
+}
+
+fn render_snmp(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let m = snmp_snapshot(namespace);
+    let mut s = String::new();
+    // IP MIB
+    let _ = writeln!(
+        s,
+        "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates",
+    );
+    let _ = writeln!(
+        s,
+        "Ip: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        m.ip_forwarding,
+        m.ip_default_ttl,
+        m.ip_in_receives,
+        m.ip_in_hdr_errors,
+        m.ip_in_addr_errors,
+        m.ip_forwd_datagrams,
+        m.ip_in_unknown_protos,
+        m.ip_in_discards,
+        m.ip_in_delivers,
+        m.ip_out_requests,
+        m.ip_out_discards,
+        m.ip_out_no_routes,
+        m.ip_reasm_timeout,
+        m.ip_reasm_reqds,
+        m.ip_reasm_oks,
+        m.ip_reasm_fails,
+        m.ip_frag_oks,
+        m.ip_frag_fails,
+        m.ip_frag_creates,
+    );
+    // ICMP MIB
+    let _ = writeln!(
+        s,
+        "Icmp: InMsgs InErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps",
+    );
+    let _ = writeln!(
+        s,
+        "Icmp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        m.icmp_in_msgs,
+        m.icmp_in_errors,
+        m.icmp_in_dest_unreachs,
+        m.icmp_in_time_excds,
+        m.icmp_in_parm_probs,
+        m.icmp_in_src_quenchs,
+        m.icmp_in_redirects,
+        m.icmp_in_echos,
+        m.icmp_in_echo_reps,
+        m.icmp_in_timestamps,
+        m.icmp_in_timestamp_reps,
+        m.icmp_in_addr_masks,
+        m.icmp_in_addr_mask_reps,
+        m.icmp_out_msgs,
+        m.icmp_out_errors,
+        m.icmp_out_dest_unreachs,
+        m.icmp_out_time_excds,
+        m.icmp_out_parm_probs,
+        m.icmp_out_src_quenchs,
+        m.icmp_out_redirects,
+        m.icmp_out_echos,
+        m.icmp_out_echo_reps,
+        m.icmp_out_timestamps,
+        m.icmp_out_timestamp_reps,
+        m.icmp_out_addr_masks,
+        m.icmp_out_addr_mask_reps,
+    );
+    // TCP MIB — 15 standard counters per RFC 1213.
+    let _ = writeln!(
+        s,
+        "Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors",
+    );
+    let _ = writeln!(
+        s,
+        "Tcp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        m.tcp_rto_algorithm,
+        m.tcp_rto_min,
+        m.tcp_rto_max,
+        // `snmp_seq_show_tcp_udp` prints MaxConn signed: RFC 2012's
+        // "dynamic" is -1, not 18446744073709551615.
+        m.tcp_max_conn as i64,
+        m.tcp_active_opens,
+        m.tcp_passive_opens,
+        m.tcp_attempt_fails,
+        m.tcp_estab_resets,
+        m.tcp_curr_estab,
+        m.tcp_in_segs,
+        m.tcp_out_segs,
+        m.tcp_retrans_segs,
+        m.tcp_in_errs,
+        m.tcp_out_rsts,
+        m.tcp_in_csum_errors,
+    );
+    // UDP MIB
+    let _ = writeln!(
+        s,
+        "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti",
+    );
+    let _ = writeln!(
+        s,
+        "Udp: {} {} {} {} {} {} {} {}",
+        m.udp_in_datagrams,
+        m.udp_no_ports,
+        m.udp_in_errors,
+        m.udp_out_datagrams,
+        m.udp_rcvbuf_errors,
+        m.udp_sndbuf_errors,
+        m.udp_in_csum_errors,
+        m.udp_ignored_multi,
+    );
+    s.into_bytes()
+}
+
+fn render_nf_conntrack(namespace: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    for ct in conntrack_snapshot(namespace) {
+        // Linux ref: net/netfilter/nf_conntrack_standalone.c::ct_seq_show
+        // <l3proto> <l3proto_num> <l4proto> <l4proto_num>
+        //   <timeout> <state>
+        //   src=... dst=... sport=... dport=...
+        //   src=... dst=... sport=... dport=...
+        //   [ASSURED] mark=0 use=N
+        let _ = write!(
+            s,
+            "{:<8} {} {:<7} {} {:>6} {:<10} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={}",
+            ct.l3proto, ct.l3proto_num,
+            ct.l4proto, ct.l4proto_num,
+            ct.timeout, ct.state,
+            ct.orig_src[0], ct.orig_src[1], ct.orig_src[2], ct.orig_src[3],
+            ct.orig_dst[0], ct.orig_dst[1], ct.orig_dst[2], ct.orig_dst[3],
+            ct.orig_sport, ct.orig_dport,
+            ct.reply_src[0], ct.reply_src[1], ct.reply_src[2], ct.reply_src[3],
+            ct.reply_dst[0], ct.reply_dst[1], ct.reply_dst[2], ct.reply_dst[3],
+            ct.reply_sport, ct.reply_dport,
+        );
+        if ct.assured {
+            let _ = write!(s, " [ASSURED]");
         }
-        s.into_bytes()
+        let _ = writeln!(s, " mark=0 use={}", ct.use_count);
     }
-}
-
-#[derive(Debug)]
-struct DevFile;
-
-impl ProcFile for DevFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::from(
-            "Inter-|   Receive                                                |  Transmit\n \
-             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
-        );
-        for c in iface_counters() {
-            let _ = writeln!(
-                s,
-                "{:>6}: {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
-                c.name,
-                c.rx_bytes, c.rx_packets, c.rx_errs, c.rx_drop,
-                c.rx_fifo, c.rx_frame, c.rx_compressed, c.rx_multicast,
-                c.tx_bytes, c.tx_packets, c.tx_errs, c.tx_drop,
-                c.tx_fifo, c.tx_colls, c.tx_carrier, c.tx_compressed,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct IfInet6File;
-
-impl ProcFile for IfInet6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::new();
-        for a in ipv6_ifaddr_snapshot() {
-            // Linux format (one line per address):
-            //   <32-hex-addr> <ifindex-hex> <prefix_len-hex>
-            //   <scope-hex> <flags-hex> <devname>
-            let _ = writeln!(
-                s,
-                "{} {:02x} {:02x} {:02x} {:02x} {:>8}",
-                fmt_ipv6_raw(a.addr),
-                a.ifindex,
-                a.prefix_len,
-                a.scope,
-                a.flags,
-                a.iface,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct Ipv6RouteFile;
-
-impl ProcFile for Ipv6RouteFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::new();
-        for r in ipv6_route_snapshot() {
-            // Linux net/ipv6/route.c::rt6_info_format:
-            //   <dst> <plen> <src> <splen> <next-hop> <metric>
-            //   <ref> <use> <flags> <device>
-            let _ = writeln!(
-                s,
-                "{} {:02x} {} {:02x} {} {:08x} {:08x} {:08x} {:08x} {:>8}",
-                fmt_ipv6_raw(r.dst),
-                r.dst_prefix_len,
-                fmt_ipv6_raw(r.src),
-                r.src_prefix_len,
-                fmt_ipv6_raw(r.gateway),
-                r.metric,
-                r.refcnt,
-                r.use_count,
-                r.flags,
-                r.iface,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct IgmpFile;
-
-impl ProcFile for IgmpFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        // Linux /proc/net/igmp header: 1 line per interface, then
-        // 1 line per joined group indented by tab. Even with no
-        // groups the file always exists with at least the version
-        // marker so libnetfilter-mcast probes succeed.
-        let mut s =
-            String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
-        // Group entries grouped by iface name. Stage-1: a flat
-        // walk; in practice we only have one or two ifaces.
-        let mut current_iface: Option<String> = None;
-        let mut idx = 0u32;
-        for g in igmp_snapshot() {
-            if current_iface.as_deref() != Some(g.iface.as_str()) {
-                idx += 1;
-                let _ = writeln!(s, "{}\t{:<10}: 1 V3", idx, g.iface,);
-                current_iface = Some(g.iface.clone());
-            }
-            let _ = writeln!(
-                s,
-                "\t\t\t{:02X}{:02X}{:02X}{:02X} {:>5} {:>5}:{:08x}\t\t{}",
-                g.group[3], g.group[2], g.group[1], g.group[0], g.users, 0u32, g.timer, g.reporter,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct Igmp6File;
-
-impl ProcFile for Igmp6File {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::new();
-        for g in igmp6_snapshot() {
-            let _ = writeln!(
-                s,
-                "{}\t{:<10}{} {} {:08x} {:>5}",
-                g.ifindex,
-                g.iface,
-                fmt_ipv6_raw(g.group),
-                g.users,
-                g.flags,
-                g.timer,
-            );
-        }
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct SnmpFile;
-
-impl ProcFile for SnmpFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let m = snmp_snapshot();
-        let mut s = String::new();
-        // IP MIB
-        let _ = writeln!(
-            s,
-            "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates",
-        );
-        let _ = writeln!(
-            s,
-            "Ip: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.ip_forwarding,
-            m.ip_default_ttl,
-            m.ip_in_receives,
-            m.ip_in_hdr_errors,
-            m.ip_in_addr_errors,
-            m.ip_forwd_datagrams,
-            m.ip_in_unknown_protos,
-            m.ip_in_discards,
-            m.ip_in_delivers,
-            m.ip_out_requests,
-            m.ip_out_discards,
-            m.ip_out_no_routes,
-            m.ip_reasm_timeout,
-            m.ip_reasm_reqds,
-            m.ip_reasm_oks,
-            m.ip_reasm_fails,
-            m.ip_frag_oks,
-            m.ip_frag_fails,
-            m.ip_frag_creates,
-        );
-        // ICMP MIB
-        let _ = writeln!(
-            s,
-            "Icmp: InMsgs InErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps",
-        );
-        let _ = writeln!(
-            s,
-            "Icmp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.icmp_in_msgs,
-            m.icmp_in_errors,
-            m.icmp_in_dest_unreachs,
-            m.icmp_in_time_excds,
-            m.icmp_in_parm_probs,
-            m.icmp_in_src_quenchs,
-            m.icmp_in_redirects,
-            m.icmp_in_echos,
-            m.icmp_in_echo_reps,
-            m.icmp_in_timestamps,
-            m.icmp_in_timestamp_reps,
-            m.icmp_in_addr_masks,
-            m.icmp_in_addr_mask_reps,
-            m.icmp_out_msgs,
-            m.icmp_out_errors,
-            m.icmp_out_dest_unreachs,
-            m.icmp_out_time_excds,
-            m.icmp_out_parm_probs,
-            m.icmp_out_src_quenchs,
-            m.icmp_out_redirects,
-            m.icmp_out_echos,
-            m.icmp_out_echo_reps,
-            m.icmp_out_timestamps,
-            m.icmp_out_timestamp_reps,
-            m.icmp_out_addr_masks,
-            m.icmp_out_addr_mask_reps,
-        );
-        // TCP MIB — 15 standard counters per RFC 1213.
-        let _ = writeln!(
-            s,
-            "Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors",
-        );
-        let _ = writeln!(
-            s,
-            "Tcp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.tcp_rto_algorithm,
-            m.tcp_rto_min,
-            m.tcp_rto_max,
-            // `snmp_seq_show_tcp_udp` prints MaxConn signed: RFC 2012's
-            // "dynamic" is -1, not 18446744073709551615.
-            m.tcp_max_conn as i64,
-            m.tcp_active_opens,
-            m.tcp_passive_opens,
-            m.tcp_attempt_fails,
-            m.tcp_estab_resets,
-            m.tcp_curr_estab,
-            m.tcp_in_segs,
-            m.tcp_out_segs,
-            m.tcp_retrans_segs,
-            m.tcp_in_errs,
-            m.tcp_out_rsts,
-            m.tcp_in_csum_errors,
-        );
-        // UDP MIB
-        let _ = writeln!(
-            s,
-            "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti",
-        );
-        let _ = writeln!(
-            s,
-            "Udp: {} {} {} {} {} {} {} {}",
-            m.udp_in_datagrams,
-            m.udp_no_ports,
-            m.udp_in_errors,
-            m.udp_out_datagrams,
-            m.udp_rcvbuf_errors,
-            m.udp_sndbuf_errors,
-            m.udp_in_csum_errors,
-            m.udp_ignored_multi,
-        );
-        s.into_bytes()
-    }
-}
-
-#[derive(Debug)]
-struct NfConntrackFile;
-
-impl ProcFile for NfConntrackFile {
-    fn read(&self) -> Vec<u8> {
-        use core::fmt::Write as _;
-        let mut s = String::new();
-        for ct in conntrack_snapshot() {
-            // Linux ref: net/netfilter/nf_conntrack_standalone.c::ct_seq_show
-            // <l3proto> <l3proto_num> <l4proto> <l4proto_num>
-            //   <timeout> <state>
-            //   src=... dst=... sport=... dport=...
-            //   src=... dst=... sport=... dport=...
-            //   [ASSURED] mark=0 use=N
-            let _ = write!(
-                s,
-                "{:<8} {} {:<7} {} {:>6} {:<10} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={}",
-                ct.l3proto, ct.l3proto_num,
-                ct.l4proto, ct.l4proto_num,
-                ct.timeout, ct.state,
-                ct.orig_src[0], ct.orig_src[1], ct.orig_src[2], ct.orig_src[3],
-                ct.orig_dst[0], ct.orig_dst[1], ct.orig_dst[2], ct.orig_dst[3],
-                ct.orig_sport, ct.orig_dport,
-                ct.reply_src[0], ct.reply_src[1], ct.reply_src[2], ct.reply_src[3],
-                ct.reply_dst[0], ct.reply_dst[1], ct.reply_dst[2], ct.reply_dst[3],
-                ct.reply_sport, ct.reply_dport,
-            );
-            if ct.assured {
-                let _ = write!(s, " [ASSURED]");
-            }
-            let _ = writeln!(s, " mark=0 use={}", ct.use_count);
-        }
-        s.into_bytes()
-    }
+    s.into_bytes()
 }
 
 // ── Public registration ─────────────────────────────────────────
+
+/// Selection retained until the last reference to the open table is dropped.
+#[derive(Debug)]
+pub enum TableNamespace {
+    Initial,
+    Private(Arc<dyn crate::NsObject>),
+}
+
+impl TableNamespace {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Initial => 0,
+            Self::Private(namespace) => namespace.ns_id(),
+        }
+    }
+}
+
+type NamespaceResolver = fn(Option<u64>) -> Option<TableNamespace>;
+static NAMESPACE_RESOLVER: OnceLock<NamespaceResolver> = OnceLock::new();
+
+/// Select the calling thread (None) or an outer PID/TID. A missing target has no view.
+pub fn install_namespace_resolver(resolve: NamespaceResolver) {
+    let _ = NAMESPACE_RESOLVER.set(resolve);
+}
+
+fn resolve_namespace(target: Option<u64>) -> Option<TableNamespace> {
+    match NAMESPACE_RESOLVER.get() {
+        Some(resolve) => resolve(target),
+        None => target.is_none().then_some(TableNamespace::Initial),
+    }
+}
+
+#[derive(Debug)]
+struct NetworkTable(fn(u64) -> Vec<u8>);
+
+impl ProcFile for NetworkTable {
+    fn net_view(&self, target: Option<u64>) -> Option<Arc<dyn ProcFile>> {
+        Some(Arc::new(OpenNetworkTable {
+            namespace: resolve_namespace(target)?,
+            render: self.0,
+            contents: IrqSafeSpinLock::new(None),
+        }))
+    }
+
+    fn read(&self) -> Vec<u8> {
+        resolve_namespace(None).map_or_else(Vec::new, |namespace| (self.0)(namespace.id()))
+    }
+}
+
+#[derive(Debug)]
+struct OpenNetworkTable {
+    namespace: TableNamespace,
+    render: fn(u64) -> Vec<u8>,
+    contents: IrqSafeSpinLock<Option<Vec<u8>>>,
+}
+
+impl ProcFile for OpenNetworkTable {
+    fn read(&self) -> Vec<u8> {
+        (self.render)(self.namespace.id())
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::FsError> {
+        if offset != 0 {
+            if let Some(bytes) = self.contents.lock().as_ref() {
+                return slice_read(bytes, offset, buf);
+            }
+        }
+        // Render outside the cache lock because providers may acquire network or socket locks.
+        let fresh = self.read();
+        let mut cache = self.contents.lock();
+        let bytes = if offset == 0 {
+            cache.insert(fresh)
+        } else {
+            cache.get_or_insert(fresh)
+        };
+        slice_read(bytes, offset, buf)
+    }
+}
+
+/// Register a network table at its procfs registry path (e.g. `net/unix`).
+pub fn register_table(path: &str, render: fn(u64) -> Vec<u8>) {
+    register_proc(path, Arc::new(NetworkTable(render)));
+}
 
 /// Register every /proc/net/* file. Called from a single boot-time
 /// initcall so the files appear together. Idempotent — repeated
 /// calls just replace the old `Arc<dyn ProcFile>` handles.
 pub fn register_all() {
-    register_proc("net/tcp", Arc::new(TcpFile));
-    register_proc("net/udp", Arc::new(UdpFile));
-    register_proc("net/raw", Arc::new(RawFile));
-    register_proc("net/tcp6", Arc::new(Tcp6File));
-    register_proc("net/udp6", Arc::new(Udp6File));
-    register_proc("net/raw6", Arc::new(Raw6File));
-    register_proc("net/arp", Arc::new(ArpFile));
-    register_proc("net/route", Arc::new(RouteFile));
-    register_proc("net/dev", Arc::new(DevFile));
-    register_proc("net/if_inet6", Arc::new(IfInet6File));
-    register_proc("net/ipv6_route", Arc::new(Ipv6RouteFile));
-    register_proc("net/igmp", Arc::new(IgmpFile));
-    register_proc("net/igmp6", Arc::new(Igmp6File));
-    register_proc("net/snmp", Arc::new(SnmpFile));
-    register_proc("net/netstat", Arc::new(NetstatFile));
-    register_proc("net/snmp6", Arc::new(Snmp6File));
-    register_proc("net/sockstat", Arc::new(SockstatFile));
-    register_proc("net/sockstat6", Arc::new(Sockstat6File));
-    register_proc("net/nf_conntrack", Arc::new(NfConntrackFile));
+    register_table("net/tcp", render_tcp);
+    register_table("net/udp", render_udp);
+    register_table("net/raw", render_raw);
+    register_table("net/tcp6", render_tcp6);
+    register_table("net/udp6", render_udp6);
+    register_table("net/raw6", render_raw6);
+    register_table("net/arp", render_arp);
+    register_table("net/route", render_route);
+    register_table("net/dev", render_dev);
+    register_table("net/if_inet6", render_if_inet6);
+    register_table("net/ipv6_route", render_ipv6_route);
+    register_table("net/igmp", render_igmp);
+    register_table("net/igmp6", render_igmp6);
+    register_table("net/snmp", render_snmp);
+    register_table("net/netstat", render_netstat);
+    register_table("net/snmp6", render_snmp6);
+    register_table("net/sockstat", render_sockstat);
+    register_table("net/sockstat6", render_sockstat6);
+    register_table("net/nf_conntrack", render_nf_conntrack);
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -1290,7 +1272,7 @@ fn install_tcp_then<F: FnOnce() -> bool>(snap: Vec<TcbSnapshot>, f: F) -> bool {
     // static slot the hook reads from.
     static FAKE_TCP: IrqSafeSpinLock<Vec<TcbSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     *FAKE_TCP.lock() = snap;
-    fn fake_tcp_fn() -> Vec<TcbSnapshot> {
+    fn fake_tcp_fn(_: u64) -> Vec<TcbSnapshot> {
         FAKE_TCP.lock().clone()
     }
     let prev = TCP_HOOK.swap(fake_tcp_fn as usize, Ordering::AcqRel);
@@ -1298,8 +1280,6 @@ fn install_tcp_then<F: FnOnce() -> bool>(snap: Vec<TcbSnapshot>, f: F) -> bool {
     TCP_HOOK.store(prev, Ordering::Release);
     ok
 }
-
-use narf_lib::sync::IrqSafeSpinLock;
 
 fn smoke_tcp_one_socket_emits_one_line() -> TestResult {
     register_all();
@@ -1324,7 +1304,7 @@ fn smoke_tcp_one_socket_emits_one_line() -> TestResult {
         inode: 0,
     }];
     let ok = install_tcp_then(snap, || {
-        let body = TcpFile.read();
+        let body = render_tcp(0);
         let text = core::str::from_utf8(&body).unwrap_or("");
         text.lines().count() == 2 && text.lines().next().unwrap().contains("sl")
     });
@@ -1358,7 +1338,7 @@ fn smoke_tcp_linux_timer_and_tail_columns() -> TestResult {
         inode: 99,
     }];
     let ok = install_tcp_then(snap, || {
-        let body = TcpFile.read();
+        let body = render_tcp(0);
         let row = core::str::from_utf8(&body)
             .unwrap_or("")
             .lines()
@@ -1412,7 +1392,7 @@ fn smoke_sockstat_linux_shape_and_counts() -> TestResult {
         inode: 0,
     }];
     let ok = install_tcp_then(snap, || {
-        let body = SockstatFile.read();
+        let body = render_sockstat(0);
         let text = core::str::from_utf8(&body).unwrap_or("");
         text.starts_with("sockets: used ")
             && text.contains("TCP: inuse 1 orphan 0 tw 0 alloc 1 mem 0\n")
@@ -1431,7 +1411,7 @@ kernel_test_in!(
 );
 
 fn smoke_netstat_has_paired_linux_mib_rows() -> TestResult {
-    let body = NetstatFile.read();
+    let body = render_netstat(0);
     let text = core::str::from_utf8(&body).unwrap_or("");
     let lines: Vec<&str> = text.lines().collect();
     let paired = lines.chunks_exact(2).all(|pair| {
@@ -1450,7 +1430,7 @@ kernel_test_in!(
 );
 
 fn smoke_snmp6_uses_one_counter_per_line() -> TestResult {
-    let body = Snmp6File.read();
+    let body = render_snmp6(0);
     let text = core::str::from_utf8(&body).unwrap_or("");
     if text
         .lines()
@@ -1508,11 +1488,11 @@ fn smoke_udp_two_sockets_two_lines() -> TestResult {
             inode: 0,
         },
     ];
-    fn fake_udp_fn() -> Vec<UdpSocketSnapshot> {
+    fn fake_udp_fn(_: u64) -> Vec<UdpSocketSnapshot> {
         FAKE_UDP.lock().clone()
     }
     let prev = UDP_HOOK.swap(fake_udp_fn as usize, Ordering::AcqRel);
-    let body = UdpFile.read();
+    let body = render_udp(0);
     UDP_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     if text.lines().count() == 3 {
@@ -1531,11 +1511,11 @@ fn smoke_arp_one_entry_parses_through_regex() -> TestResult {
         iface: String::from("eth0"),
         flags: 2,
     }];
-    fn fake_arp_fn() -> Vec<ArpSnapshot> {
+    fn fake_arp_fn(_: u64) -> Vec<ArpSnapshot> {
         FAKE_ARP.lock().clone()
     }
     let prev = ARP_HOOK.swap(fake_arp_fn as usize, Ordering::AcqRel);
-    let body = ArpFile.read();
+    let body = render_arp(0);
     ARP_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     let ok = text.contains("192.168.1.1")
@@ -1568,11 +1548,11 @@ fn smoke_route_hex_destination_gateway() -> TestResult {
         window: 0,
         irtt: 0,
     }];
-    fn fake_route_fn() -> Vec<RouteSnapshot> {
+    fn fake_route_fn(_: u64) -> Vec<RouteSnapshot> {
         FAKE_ROUTE.lock().clone()
     }
     let prev = ROUTE_HOOK.swap(fake_route_fn as usize, Ordering::AcqRel);
-    let body = RouteFile.read();
+    let body = render_route(0);
     ROUTE_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     // Destination is 0.0.0.0 → 00000000.
@@ -1607,11 +1587,11 @@ fn smoke_dev_per_iface_counter_line() -> TestResult {
         tx_carrier: 0,
         tx_compressed: 0,
     }];
-    fn fake_fn() -> Vec<IfaceCounterSnapshot> {
+    fn fake_fn(_: u64) -> Vec<IfaceCounterSnapshot> {
         FAKE_DEV.lock().clone()
     }
     let prev = IFACE_COUNTERS_HOOK.swap(fake_fn as usize, Ordering::AcqRel);
-    let body = DevFile.read();
+    let body = render_dev(0);
     IFACE_COUNTERS_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     if text.contains("eth0") && text.contains("123456") && text.contains("789012") {
@@ -1650,11 +1630,11 @@ fn smoke_if_inet6_link_local_and_global() -> TestResult {
             flags: 0x80,
         },
     ];
-    fn fake_fn() -> Vec<Ipv6IfAddrSnapshot> {
+    fn fake_fn(_: u64) -> Vec<Ipv6IfAddrSnapshot> {
         FAKE_IFADDR.lock().clone()
     }
     let prev = IPV6_IFADDR_HOOK.swap(fake_fn as usize, Ordering::AcqRel);
-    let body = IfInet6File.read();
+    let body = render_if_inet6(0);
     IPV6_IFADDR_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     let two_lines = text.lines().count() == 2;
@@ -1672,7 +1652,7 @@ kernel_test_in!(
 );
 
 fn smoke_snmp_tcp_has_15_standard_counters() -> TestResult {
-    let body = SnmpFile.read();
+    let body = render_snmp(0);
     let text = core::str::from_utf8(&body).unwrap_or("");
     // The Tcp: header line names 15 counters.
     let tcp_header = text.lines().find(|l| l.starts_with("Tcp: RtoAlgorithm"));
@@ -1713,11 +1693,11 @@ fn smoke_nf_conntrack_one_entry_one_line() -> TestResult {
         assured: true,
         use_count: 2,
     }];
-    fn fake_fn() -> Vec<ConntrackSnapshot> {
+    fn fake_fn(_: u64) -> Vec<ConntrackSnapshot> {
         FAKE_CT.lock().clone()
     }
     let prev = CONNTRACK_HOOK.swap(fake_fn as usize, Ordering::AcqRel);
-    let body = NfConntrackFile.read();
+    let body = render_nf_conntrack(0);
     CONNTRACK_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     let ok = text.lines().count() == 1
@@ -1756,11 +1736,11 @@ fn smoke_ipv6_route_default_line() -> TestResult {
         flags: 0x00000001,
         iface: String::from("eth0"),
     }];
-    fn fake_fn() -> Vec<Ipv6RouteSnapshot> {
+    fn fake_fn(_: u64) -> Vec<Ipv6RouteSnapshot> {
         FAKE_R.lock().clone()
     }
     let prev = IPV6_ROUTE_HOOK.swap(fake_fn as usize, Ordering::AcqRel);
-    let body = Ipv6RouteFile.read();
+    let body = render_ipv6_route(0);
     IPV6_ROUTE_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     let ok = text.contains("eth0") && text.contains("fe80");
@@ -1775,7 +1755,7 @@ kernel_test_in!("filesystem/procfs/net", smoke_ipv6_route_default_line);
 fn smoke_igmp_at_least_header_when_empty() -> TestResult {
     // No hook installed → empty body but header still present.
     let prev = IGMP_HOOK.swap(0, Ordering::AcqRel);
-    let body = IgmpFile.read();
+    let body = render_igmp(0);
     IGMP_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
     if text.starts_with("Idx") && text.contains("Device") {

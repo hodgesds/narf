@@ -174,7 +174,7 @@ pub fn populate_root(dir: &Path, seed: u64, scale: usize) {
     );
 }
 
-/// `mkfs.btrfs` options for the root fixture: 16K nodes, crc32c, the
+/// `mkfs.btrfs` options for the root fixture: 16K nodes, the selected checksums, the
 /// free-space tree and block-group tree, `@` (default) and `@home`, zstd:1.
 pub struct MkfsSpec<'a> {
     pub uuid: &'a str,

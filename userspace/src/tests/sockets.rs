@@ -1565,6 +1565,86 @@ kernel_test_in!(
     smoke_net_ns_loopback_delivery_and_final_teardown
 );
 
+#[cfg(feature = "container")]
+fn smoke_proc_net_table_lifetime() -> TestResult {
+    use crate::abi_test_support::{with_setup, FAKE_TASK};
+    use crate::socket::{SocketFile, AF_UNIX, SOCK_DGRAM};
+    use narf_filesystem::procfs::{net, poll_once, ProcFs};
+    use narf_filesystem::{FileOps, FsInstance};
+
+    with_setup(|| {
+        net::register_all();
+        crate::namespaces::unshare_net(FAKE_TASK);
+        let namespace = crate::namespaces::current_net_ns(FAKE_TASK).ok_or("missing namespace")?;
+        let weak = alloc::sync::Arc::downgrade(&namespace);
+        drop(namespace);
+
+        let dir = ProcFs
+            .root()
+            .lookup_dir("self")
+            .and_then(|pid| pid.lookup_dir("net"))
+            .ok_or("missing PID net directory")?;
+        let names: alloc::vec::Vec<_> = dir.iter().map(|entry| entry.name).collect();
+        for name in [
+            "unix",
+            "tcp",
+            "udp",
+            "raw",
+            "tcp6",
+            "udp6",
+            "raw6",
+            "arp",
+            "route",
+            "dev",
+            "if_inet6",
+            "ipv6_route",
+            "igmp",
+            "igmp6",
+            "snmp",
+            "snmp6",
+            "netstat",
+            "sockstat",
+            "sockstat6",
+            "nf_conntrack",
+        ] {
+            if !names.iter().any(|entry| entry.as_ref() == name) || dir.lookup(name).is_none() {
+                return Err("PID net directory omitted a registered table");
+            }
+        }
+        let file = dir.lookup("unix").ok_or("missing Unix table")?;
+        let socket = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+        let inode = alloc::format!("{:5}\n", socket.ino());
+        let mut buf = [0; 512];
+        if poll_once(file.read(0, &mut buf[..1])) != Some(Ok(1)) {
+            return Err("first byte of namespace table was unreadable");
+        }
+        drop(socket);
+        crate::namespaces::release_task(FAKE_TASK);
+        if weak.upgrade().is_none() {
+            return Err("open network table lost its namespace");
+        }
+        let tail = poll_once(file.read(1, &mut buf))
+            .and_then(Result::ok)
+            .ok_or("short read")?;
+        if !buf[..tail].ends_with(inode.as_bytes()) {
+            return Err("short read lost the original socket row");
+        }
+        let len = poll_once(file.read(0, &mut buf))
+            .and_then(Result::ok)
+            .ok_or("rewind")?;
+        if buf[..len].ends_with(inode.as_bytes()) {
+            return Err("rewind retained a closed socket");
+        }
+        drop(file);
+        if weak.upgrade().is_some() {
+            return Err("final close retained a retired namespace");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/socket", smoke_proc_net_table_lifetime);
+
 fn smoke_stack_admin_delegates_only_to_current_netlink_socket() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
     use narf_net::{StackAttach, StackDaemon};

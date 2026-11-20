@@ -502,7 +502,11 @@ pub fn register_rootfs_scan_initcall() {
         };
         match scan_rootfs(&auth) {
             Ok(n) => {
-                let _ = n;
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  firmware: registered {n} blob(s) from rootfs"
+                );
                 InitResult::Ok
             }
             Err(FirmwareError::NotFound) => {
@@ -636,8 +640,51 @@ pub fn scan_rootfs(auth: &Cap<FirmwareRegistry, Write>) -> Result<usize, Firmwar
     walk_and_register_dir(lib_firmware_dir, String::new(), BlobSource::Rootfs, auth)
 }
 
-/// Shared recursive directory walker used by both `scan_initramfs`
-/// (flat CPIO) and `scan_rootfs` (nested ext2/ext4 directory tree).
+/// Read all requested bytes, including short reads from disk-backed files.
+async fn read_exact_at(
+    file: &dyn narf_filesystem::FileOps,
+    mut offset: u64,
+    mut dst: &mut [u8],
+) -> Result<(), FirmwareError> {
+    while !dst.is_empty() {
+        let count = dst.len().min(64 * 1024);
+        let n = file
+            .read(offset, &mut dst[..count])
+            .await
+            .map_err(|_| FirmwareError::BadFormat)?;
+        if n == 0 || n > count {
+            return Err(FirmwareError::BadFormat);
+        }
+        offset += n as u64;
+        dst = &mut dst[n..];
+    }
+    Ok(())
+}
+
+/// A distro's firmware tree contains raw vendor files as well as any packed
+/// NARF blobs. Inspect the footer before reserving payload-sized storage.
+async fn read_rootfs_blob(
+    file: &dyn narf_filesystem::FileOps,
+) -> Result<alloc::vec::Vec<u8>, FirmwareError> {
+    let size = file.stat().size;
+    let mut footer = [0u8; 8];
+    let offset = size
+        .checked_sub(footer.len() as u64)
+        .ok_or(FirmwareError::BadFormat)?;
+    read_exact_at(file, offset, &mut footer).await?;
+    signature::payload_end(size, &footer)?;
+
+    let size = usize::try_from(size).map_err(|_| FirmwareError::OutOfMemory)?;
+    let mut bytes = alloc::vec::Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| FirmwareError::OutOfMemory)?;
+    bytes.resize(size, 0);
+    read_exact_at(file, 0, &mut bytes).await?;
+    Ok(bytes)
+}
+
+/// Recursive directory walker for `scan_rootfs`.
 ///
 /// Iterates `dir` via `enumerate_async` (the async-safe path that
 /// ext2 implements) and descends into subdirectories with
@@ -710,28 +757,13 @@ fn walk_and_register_dir(
                     Ok(f) => f,
                     Err(_) => continue,
                 };
-                let size = file.stat().size as usize;
-                if size == 0 {
-                    continue;
-                }
-                let mut buf: Vec<u8> = alloc::vec![0u8; size];
-                let n_read = narf_scheduler::block_on(file.read(0, &mut buf)).unwrap_or(0);
-                if n_read == 0 {
-                    continue;
-                }
-                buf.truncate(n_read);
-                // Leak the canonical name into `&'static str` so
-                // the registry (which requires `name: &'static str`)
-                // can keep it for the kernel's lifetime. The blob
-                // bytes are copied by `install_blob` into DMA-coherent
-                // memory, so `buf` may be dropped after the call.
-                let name_static: &'static str = alloc::boxed::Box::leak(canonical.into_boxed_str());
-                match registry::install_blob(name_static, &buf, source) {
-                    Ok(()) => n_ok += 1,
-                    Err(_) => {
-                        // Best-effort: malformed/unsigned blob logged
-                        // by the observability layer in a future iter.
+                match narf_scheduler::block_on(read_rootfs_blob(file.as_ref())) {
+                    Ok(bytes) => {
+                        if registry::install_blob(canonical, &bytes, source).is_ok() {
+                            n_ok += 1;
+                        }
                     }
+                    Err(_) => registry::note_rejection(&canonical),
                 }
             }
             _ => continue,

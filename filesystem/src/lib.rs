@@ -104,6 +104,7 @@ pub mod pipe_buffer;
 pub mod pipe_queue;
 pub mod posix_acl;
 pub mod procfs;
+pub mod root_bootlog;
 pub mod root_mount;
 pub mod root_selector;
 pub mod sync_all;

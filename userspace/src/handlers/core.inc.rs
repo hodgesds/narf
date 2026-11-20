@@ -1427,6 +1427,27 @@ fn wait_for_demand_owner(
     .unwrap_or(Err(narf_memory::AddressSpaceError::Bus))
 }
 
+fn proc_net_namespace(
+    outer_id: Option<u64>,
+) -> Option<narf_filesystem::procfs::net::TableNamespace> {
+    use narf_filesystem::procfs::net::TableNamespace;
+    let task = match outer_id {
+        None => current_task_id(),
+        Some(id) => pid_to_task_raw(id).or_else(|| linux_tid_to_task_raw(id))?,
+    };
+    // Exit marks the task dead before releasing its namespace. Checking after
+    // taking the reference prevents a racing exit from exposing the initial namespace.
+    #[cfg(feature = "container")]
+    let namespace = crate::namespaces::current_net_ns(task)
+        .map_or(TableNamespace::Initial, |ns| TableNamespace::Private(ns));
+    #[cfg(not(feature = "container"))]
+    let namespace = TableNamespace::Initial;
+    if outer_id.is_some() && crate::task::task_has_exited(task) {
+        return None;
+    }
+    Some(namespace)
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
     narf_memory::address_space::install_demand_page_wait_hook(wait_for_demand_owner);
@@ -1470,6 +1491,8 @@ pub fn init_per_task_state() {
         crate::proc_ipc_limit_read,
         crate::proc_ipc_limit_write,
     );
+    narf_filesystem::procfs::net::install_namespace_resolver(proc_net_namespace);
+    narf_filesystem::procfs::net::register_table("net/unix", crate::socket::proc_sockets::render_unix);
     // `/proc/narf/tasks`: scheduler tasks `/proc` does not list, and what
     // they still hold (see `narf_tasks_report`).
     narf_filesystem::procfs::register_proc("narf/tasks", Arc::new(NarfTasksFile));

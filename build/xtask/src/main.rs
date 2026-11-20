@@ -512,11 +512,8 @@ struct GrubImageArgs {
     cmdline_extra: Vec<String>,
 }
 
-/// The kernel build `grub-image` stages. A `--root-policy` bundle boots the
-/// installed distro's systemd as PID 1, so it gets the same feature set as
-/// every other systemd PID 1 path (`configure_systemd_pid1_build`): without
-/// `boot-init` the kernel never honours `systemd_pid1`, and without
-/// `cgroup-all` systemd refuses to start.
+/// Installed-root bundles include boot-init for direct PID 1 launch and the
+/// cgroup support required by the default systemd selection.
 fn grub_image_build_args(grub: &GrubImageArgs) -> BuildArgs {
     let mut build = grub.build.clone();
     if grub.root_policy.is_some() {
@@ -636,23 +633,22 @@ fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<Stri
     if grub.rootflags.split_whitespace().count() != 1 {
         bail!("--rootflags must be a single token, e.g. subvol=/@");
     }
-    let tail = format!(
-        "{} root=UUID={uuid} rootflags={} systemd_pid1",
+    let mut tail = format!(
+        "{} root=UUID={uuid} rootflags={}",
         policy.arg(),
         grub.rootflags
     );
-    let mut tail = if cmdline.split_whitespace().any(|a| a == "systemd_pid1") {
-        tail.trim_end_matches(" systemd_pid1").to_string()
-    } else {
-        tail
-    };
-    let chooses_zram = cmdline
+    let tokens = cmdline
         .split_whitespace()
-        .chain(grub.cmdline_extra.iter().flat_map(|e| e.split_whitespace()))
-        .any(|a| a.starts_with("systemd.zram="));
-    if !chooses_zram {
-        tail.push(' ');
-        tail.push_str(NO_ZRAM_ARG);
+        .chain(grub.cmdline_extra.iter().flat_map(|e| e.split_whitespace()));
+    if !tokens.clone().any(|arg| arg == "openrc_pid1") {
+        if !tokens.clone().any(|arg| arg == "systemd_pid1") {
+            tail.push_str(" systemd_pid1");
+        }
+        if !tokens.clone().any(|arg| arg.starts_with("systemd.zram=")) {
+            tail.push(' ');
+            tail.push_str(NO_ZRAM_ARG);
+        }
     }
     Ok(if cmdline.is_empty() {
         tail
@@ -949,6 +945,17 @@ mod disk_policy_tests {
         ]);
         let line = grub_image_cmdline("", &zram).unwrap();
         assert!(line.contains(" systemd_pid1 systemd.zram=1"), "{line}");
+        let openrc = grub(&[
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID,
+            "--cmdline-extra",
+            "openrc_pid1",
+        ]);
+        let line = grub_image_cmdline("", &openrc).unwrap();
+        assert!(line.split_whitespace().any(|arg| arg == "openrc_pid1"));
+        assert!(!line.contains("systemd"));
         let plain = grub(&["--cmdline-extra", "quiet"]);
         assert_eq!(
             grub_image_cmdline("", &plain).unwrap(),
@@ -7137,7 +7144,12 @@ fn spawn_net_check_listener() -> Result<u16> {
 /// imprecise match only shifts load, never drops coverage). First match
 /// wins; order matters.
 fn musl_case_group(cmd: &str) -> &'static str {
-    if cmd == "userns_smoke" {
+    if matches!(
+        cmd,
+        "userns_smoke"
+            | "unix_listen_wake_smoke --proc-netns"
+            | "unix_listen_wake_glibc --proc-netns"
+    ) {
         return "userns";
     }
     let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
@@ -7581,7 +7593,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pthread_sched_smoke", "pthread-sched-ok"),
         ("pthread_sched_glibc", "pthread-sched-ok"),
         ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
+        ("unix_listen_wake_smoke --proc-netns", "proc-netns-ok"),
         ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("unix_listen_wake_glibc --proc-netns", "proc-netns-ok"),
         ("wlproxy_sockpair_smoke", "wlproxy-ok"),
         ("wlproxy_sockpair_glibc", "wlproxy-ok"),
         // A blocking AF_UNIX stream send queues the whole payload; signal,
@@ -7788,7 +7802,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
 
     // Select this invocation's group (or all groups when unset).
     let want = |cmd: &str| {
-        (cmd != "userns_smoke" || args.build.features.split(',').any(|f| f == "container"))
+        (musl_case_group(cmd) != "userns"
+            || args.build.features.split(',').any(|f| f == "container"))
             && args
                 .group
                 .as_deref()

@@ -14860,6 +14860,11 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
     if op & LOCK_EX != 0 {
         // Exclusive conflicts with any other holder, shared or not.
         if e.other_holder_exists(owner) {
+            // Linux drops the shared lock before waiting for conversion.
+            // Otherwise two readers upgrading together would wait forever.
+            if let Some(i) = e.position_of(owner) {
+                e.holders.remove(i);
+            }
             return Err(());
         }
         match e.position_of(owner) {

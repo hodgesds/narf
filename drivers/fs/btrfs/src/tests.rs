@@ -11658,9 +11658,15 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
         ),
         (
             "xxhash64 checksums",
-            |sb, _| sb.csum_type = 1,
+            |sb, _| sb.csum_type = format::CSUM_TYPE_XXHASH,
             None,
-            Some(Refusal::ChecksumType(1)),
+            None,
+        ),
+        (
+            "sha256 outside root-rw",
+            |sb, _| sb.csum_type = format::CSUM_TYPE_SHA256,
+            None,
+            Some(Refusal::ChecksumType(format::CSUM_TYPE_SHA256)),
         ),
         (
             "8 KiB sectors",

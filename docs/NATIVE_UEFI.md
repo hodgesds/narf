@@ -88,6 +88,30 @@ cargo xtask efi-image --output target/narf-installed.efi \
   --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID systemd_pid1 narf.disks=root-ro'
 ```
 
+For Gentoo with OpenRC, select the installed `/sbin/openrc-init` as PID 1.
+OpenRC runs the services configured in the sysinit, boot and default runlevels.
+On a desktop installation, the default runlevel typically includes
+`display-manager`. To try it with a RAM-backed writable view of the root, use
+
+```sh
+cargo xtask efi-image --output target/narf-openrc.efi \
+  --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID narf.disks=root-ro openrc_pid1 console=ttyS0 console=tty0'
+```
+
+For a disk log before OpenRC starts, replace `narf.disks=root-ro` with
+`narf.disks=root-rw rw narf.rootlog`. When the kernel mounts the selected
+Btrfs root it creates and syncs `/var/log/narf-boot-0001.log`, choosing the
+next unused number on subsequent boots. Once the scheduler runs, the kernel
+appends and syncs new messages once per second. After rebooting into Linux,
+read the newest numbered file on the same root. Gentoo's `syslogd` can also
+save its usual `/var/log/kern.log` after OpenRC starts.
+
+A failure before the root mounts can leave no file. A later panic leaves
+the last committed batch on disk. The final panic report bypasses the
+kernel log buffer. The optional
+`narf.bootlog=<token>` setting selects a separate panic sink on a marked
+FAT USB stick.
+
 Use the actual filesystem UUID and a root filesystem supported by NARF. This
 preserves the existing installed-root compatibility limits. See
 [Booting NARF from CachyOS](BOOTING_ON_CACHYOS.md) for the root policy and
@@ -99,11 +123,14 @@ Configuration is bound at build time. EFI shell arguments, firmware load
 options, and boot-manager `options` lines do not override it. Rebuild and
 replace the EFI file when changing the command line or initramfs.
 
-Firmware is included from the existing `target/firmware/` inventory using
-repeatable globs:
+To supply firmware before the root mounts, import the desired vendor files
+from the build host and select them from `target/firmware/` with repeatable
+`--initramfs-firmware` arguments. For example, for Alder Lake-P graphics:
 
 ```sh
-cargo xtask efi-image --initramfs-firmware 'iwlwifi/*'
+cargo xtask import-firmware --source /lib/firmware --vendor i915
+cargo xtask efi-image --initramfs-firmware 'i915/adlp_dmc.bin' \
+  --initramfs-firmware 'i915/adlp_guc_70.bin' --initramfs-firmware 'i915/tgl_huc.bin'
 ```
 
 Only matching blobs are added, under the existing `firmware/` archive prefix;
@@ -111,6 +138,10 @@ an unmatched selection is an error. Existing NRFW signature and trusted-key
 policy still applies. Importing firmware and qualifying its hardware support
 are separate steps. Firmware not selected for the archive is not copied to
 an installed root by this command.
+
+After mounting the root, NARF automatically scans its `/lib/firmware` for
+files with the NARF firmware trailer. Drivers request them by relative name,
+such as `i915/adlp_dmc.bin`. The root search directory is fixed in this build.
 
 ## Package installation
 
@@ -165,6 +196,15 @@ menuentry 'NARF native EFI' {
     boot
 }
 ```
+
+On the NUC with the ESP mounted at `/boot` and the above entry in
+`/boot/grub/grub.cfg`, install an image and select it for one boot with
+`sudo packaging/install-next-boot.sh path/to/BOOTX64.EFI`. Omit the image
+path to use the latest staged native EFI build. The script verifies the
+image, replaces `/boot/EFI/NARF-NATIVE/narf.efi`, and sets GRUB's
+`next_entry`. GRUB clears this selection before launching NARF and uses
+its regular default on the following boot. To cancel before restarting,
+run `sudo grub-editenv /boot/grub/grubenv unset next_entry`.
 
 For systemd-boot, create an administrator-managed Type #1 entry on the ESP:
 
@@ -234,7 +274,7 @@ The prompt consumes raw serial input; USB keyboard and graphical password
 entry require a later early-userspace design and are not available here.
 
 `narf.disks=root-ro` preserves all media and can supply the existing RAM-backed
-overlay to `systemd_pid1`. `root-rw` additionally requires btrfs inside the
+overlay to `openrc_pid1` or `systemd_pid1`. `root-rw` additionally requires btrfs inside the
 container and its existing write-safety gate; the designated container
 partition, its decrypted view, and the verified root-disk ESP gain write
 permission. Other partitions and the whole-disk device remain read-only.

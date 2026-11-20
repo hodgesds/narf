@@ -45,6 +45,17 @@ use crate::FirmwareError;
 /// Trailing magic identifying a NARF firmware blob.
 pub const BLOB_TRAILER_MAGIC: [u8; 4] = *b"NRFW";
 
+/// The payload ends before the signature, signer, metadata and footer.
+/// The rootfs scanner can check this from a single small read at EOF.
+pub(super) fn payload_end(size: u64, footer: &[u8; 8]) -> Result<u64, FirmwareError> {
+    if footer[4..] != BLOB_TRAILER_MAGIC {
+        return Err(FirmwareError::BadFormat);
+    }
+    let metadata_len = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+    size.checked_sub(64 + 32 + 8 + u64::from(metadata_len))
+        .ok_or(FirmwareError::BadFormat)
+}
+
 /// Decoded trailer. Lifetimes borrow into the blob bytes the
 /// caller hands to `decode`.
 #[derive(Debug)]
@@ -75,30 +86,14 @@ impl<'a> BlobTrailer<'a> {
 /// Returns `BadFormat` on truncated input or magic mismatch. Does
 /// NOT verify the signature — call `verify` after decode.
 pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
-    // Minimum trailer = 64 (sig) + 32 (signer) + 4 (mlen) + 0 (md)
-    // + 4 (magic) = 104 bytes.
-    if blob.len() < 104 {
-        return Err(FirmwareError::BadFormat);
-    }
-
     let n = blob.len();
-    let magic = &blob[n - 4..];
-    if magic != BLOB_TRAILER_MAGIC {
-        return Err(FirmwareError::BadFormat);
-    }
-
-    let mlen = u32::from_le_bytes([blob[n - 8], blob[n - 7], blob[n - 6], blob[n - 5]]) as usize;
-    // Bounds-check the metadata length.
-    let trailer_size = 64 + 32 + 4 + mlen + 4;
-    if trailer_size > n {
-        return Err(FirmwareError::BadFormat);
-    }
+    let footer = blob.last_chunk::<8>().ok_or(FirmwareError::BadFormat)?;
 
     // Trailer layout (back from end):
     //   payload | sig(64) | signer(32) | metadata(mlen) | mlen(4) | magic(4)
     // mlen sits at fixed offset (n-8..n-4) so the decoder can find
     // it without walking metadata first.
-    let payload_end = n - trailer_size;
+    let payload_end = payload_end(n as u64, footer)? as usize;
     let mut off = payload_end;
     let mut sig = [0u8; 64];
     sig.copy_from_slice(&blob[off..off + 64]);
@@ -106,7 +101,7 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
     let mut signer = [0u8; 32];
     signer.copy_from_slice(&blob[off..off + 32]);
     off += 32;
-    let metadata = &blob[off..off + mlen];
+    let metadata = &blob[off..n - 8];
     // remaining: 4 (mlen) + 4 (magic) — we've already validated both.
 
     // Metadata format: a sequence of TLV records with 1-byte tag
