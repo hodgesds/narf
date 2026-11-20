@@ -1947,7 +1947,15 @@ impl FwFakeBank {
             st.regs[base + 1 + i] = v.swap_bytes();
         }
         let mut hicr = st.regs[(hic::REG_HICR / 4) as usize];
-        hicr &= !hic::HICR_C;
+        // The firmware owns SV per command (X550 §8.2.2.20.5:
+        // SV is driver-read-only, valid only when C is
+        // cleared): a completion without status must leave
+        // SV clear, not inherit it from the previous
+        // command. Without the clear, the PHY-token
+        // completion that precedes every X550EM_a activity
+        // leaves SV set and a HicNoSv activity completion
+        // looks like a valid status (#2284).
+        hicr &= !(hic::HICR_C | hic::HICR_SV);
         if self.mode != FwMode::HicNoSv {
             hicr |= hic::HICR_SV;
         }
