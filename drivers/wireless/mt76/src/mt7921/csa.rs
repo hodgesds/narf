@@ -267,27 +267,6 @@ pub(crate) fn ap_chandef(ap: &ApElements, primary: u8) -> Option<Chandef> {
     (forty.width == CH_BW_40 && wide.secondary() == forty.secondary()).then_some(wide)
 }
 
-/// The AP's HT Operation with the width fields cleared: the secondary
-/// channel offset, the STA channel width and the CCFS2 bits.
-fn ht_static(operation: [u8; 22]) -> [u8; 22] {
-    let mut operation = super::ht20::static_operation(operation);
-    operation[1] &= !7;
-    operation[2] &= !0xe0;
-    operation[3] &= !0x1f;
-    operation
-}
-
-/// The AP's PHY facts are unchanged apart from the channel width (and the
-/// dynamic HT protection bits): a width change mac80211 follows
-/// (`ieee80211_config_bw`) rather than a new PHY mode.
-pub(crate) fn width_only_change(bound: &ApElements, current: &ApElements) -> bool {
-    bound.ht_capability() == current.ht_capability()
-        && bound.vht_capability() == current.vht_capability()
-        && bound.ht_operation().map(ht_static) == current.ht_operation().map(ht_static)
-        && bound.vht_operation().map(|op| [op[3], op[4]])
-            == current.vht_operation().map(|op| [op[3], op[4]])
-}
-
 /// A Beacon / Probe Response's PHY elements against the bound ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BeaconPhy {
@@ -299,19 +278,40 @@ pub(crate) enum BeaconPhy {
     Changed,
 }
 
+/// mac80211 `ieee80211_config_bw` for a Beacon of the associated AP: no
+/// bandwidth tracking for a legacy connection; a changed connection mode
+/// (`ieee80211_determine_ap_chan`: the HT, VHT or HE capability and
+/// operation pair appearing or disappearing) or an operating channel that
+/// no longer fits (`!cfg80211_chandef_valid`, a primary that moved without
+/// an announced switch) ends the link; a new width is followed. Capability
+/// element contents are not compared: mac80211 keeps the association's
+/// capabilities. A Beacon whose elements do not parse changes nothing
+/// (`ieee802_11_parse_elems` keeps what it could parse).
 pub(crate) fn beacon_phy(bound: &ApElements, ies: &[u8]) -> BeaconPhy {
-    match ApElements::parse(ies) {
-        Ok(current) if super::ht20::same_ap_phy(bound, &current) => BeaconPhy::Same,
-        Ok(current)
-            if width_only_change(bound, &current)
-                && current
-                    .ht_operation()
-                    .is_some_and(|op| ap_chandef(&current, op[0]).is_some()) =>
-        {
-            BeaconPhy::Width(alloc::boxed::Box::new(current))
-        }
-        _ => BeaconPhy::Changed,
+    let Ok(current) = ApElements::parse(ies) else {
+        return BeaconPhy::Same;
+    };
+    let Some(primary) = bound.ht_operation().map(|op| op[0]) else {
+        return BeaconPhy::Same;
+    };
+    if connection_mode(bound) != connection_mode(&current) {
+        return BeaconPhy::Changed;
     }
+    match (ap_chandef(bound, primary), ap_chandef(&current, primary)) {
+        (Some(old), Some(new)) if old == new => BeaconPhy::Same,
+        (_, Some(_)) => BeaconPhy::Width(alloc::boxed::Box::new(current)),
+        (_, None) => BeaconPhy::Changed,
+    }
+}
+
+/// The connection mode `ieee80211_determine_ap_chan` reads from an AP's
+/// elements: HT, VHT and HE each need their capability and operation.
+fn connection_mode(ap: &ApElements) -> (bool, bool, bool) {
+    (
+        ap.ht_capability().is_some() && ap.ht_operation().is_some(),
+        ap.vht_capability().is_some() && ap.vht_operation().is_some(),
+        ap.he_capability().is_some() && ap.he_operation().is_some(),
+    )
 }
 
 /// The BSS's elements describing `def` as its channel: DS Parameter Set,

@@ -108,30 +108,38 @@ kernel_test_in!(
 );
 
 fn failures() -> Result<(), &'static str> {
-    for timeout in [false, true] {
-        let mut session = joined(true, true)?;
-        fill(&mut session)?;
-        let error = if timeout {
-            session
-                .backend
-                .ticks
-                .set(session.backend.ticks.get() + 4_000_000_000);
-            Error::Timeout
-        } else {
-            session.backend.tx_stall = false;
-            session.backend.completion_status = 3;
-            Error::Rejected(3)
-        };
-        if session.poll_data_tx() != Err(error)
-            || !matches!(session.state, State::Failed { .. })
-            || session.data_pending.len() != if timeout { 8 } else { 7 }
-            || session.station.security.is_some()
-            || session.station.permission.is_some()
-            || !session.backend.owner.published
-            || session.start_ethernet(&frame(9)) != Err(Error::Busy)
-        {
-            return Err("pipeline failure released uncertain tail or retained producer/key grant");
-        }
+    // A lost TX completion (the watchdog) still fails the data owner.
+    let mut session = joined(true, true)?;
+    fill(&mut session)?;
+    session
+        .backend
+        .ticks
+        .set(session.backend.ticks.get() + 4_000_000_000);
+    if session.poll_data_tx() != Err(Error::Timeout)
+        || !matches!(session.state, State::Failed { .. })
+        || session.data_pending.len() != 8
+        || session.station.security.is_some()
+        || session.station.permission.is_some()
+        || !session.backend.owner.published
+        || session.start_ethernet(&frame(9)) != Err(Error::Busy)
+    {
+        return Err("pipeline failure released uncertain tail or retained producer/key grant");
+    }
+    // `mt7921_mac_tx_free`: frames the firmware released as failed are
+    // counted (`wcid->stats.tx_failed`) and freed; the link stays and
+    // keeps transmitting.
+    let mut session = joined(true, true)?;
+    fill(&mut session)?;
+    session.backend.tx_stall = false;
+    session.backend.completion_status = 3;
+    if session.poll_data_tx().is_err()
+        || !matches!(session.state, State::Associated { .. })
+        || session.station.link_stats.tx_free_failed == 0
+        || session.station.security.is_none()
+        || session.station.permission.is_none()
+        || session.start_ethernet(&frame(9)).is_err()
+    {
+        return Err("a failed TX status ended the link instead of being counted");
     }
     Ok(())
 }

@@ -92,6 +92,7 @@ fn rig_with(
             sequence_reset: SequenceReset::None,
             wake: wake::Wake::default(),
             irq: None,
+            pace: None,
         },
     ))
 }

@@ -157,7 +157,9 @@ impl<B: Backend> Session<B> {
             {
                 break;
             }
-            narf_scheduler::yield_now().await;
+            // The firmware scans on its own; sleep until its next event
+            // (frame, SCAN_DONE) as `mt7921_mcu_scan_event` is IRQ driven.
+            self.park_once().await;
         }
         self.state = associated;
         for (epoch, frame) in delivered {

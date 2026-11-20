@@ -296,6 +296,9 @@ struct Hardware {
     wake: wake::Wake,
     /// The function's MSI vector (`None`: the owner is polled).
     irq: Option<crate::mt7921::irq::Binding>,
+    /// The parked owner wait's bound (`park`): a lost event or a hung MCU
+    /// still re-polls, so the wait's own timeout runs.
+    pace: Option<core::pin::Pin<alloc::boxed::Box<narf_time::SleepUntil>>>,
 }
 impl Drop for Hardware {
     /// An owner dropped while its rings are still published (dead firmware,
@@ -1096,6 +1099,38 @@ impl Backend for Hardware {
     /// of a chip reset is info, so a firmware recovery stays visible. The
     /// join and leave steps log their mac80211-style info lines themselves,
     /// and failures their own errors.
+    /// Sleep until the next MSI: acknowledge what is pending (an event
+    /// since the last acknowledgement re-polls at once), park the waker,
+    /// then unmask, so a source set meanwhile raises a fresh message. A
+    /// 10 ms timer bounds the sleep.
+    fn park(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        use crate::mt7921::irq::LINE;
+        use core::future::Future;
+        if self.irq.is_none() {
+            return false;
+        }
+        let seen = LINE.raised();
+        let pending = self.acknowledge_interrupts();
+        if pending != Ok(0) {
+            let _ = self.interrupts_end();
+            return false;
+        }
+        if !LINE.park(cx.waker(), seen) {
+            let _ = self.interrupts_end();
+            return false;
+        }
+        if self.interrupts_end().is_err() {
+            return false;
+        }
+        let pace = self.pace.get_or_insert_with(|| {
+            alloc::boxed::Box::pin(narf_time::sleep_until(narf_time::Deadline::after_ms(10)))
+        });
+        if pace.as_mut().poll(cx).is_ready() {
+            self.pace = None;
+            return false;
+        }
+        true
+    }
     fn progress(&mut self, stage: super::Stage) {
         use core::fmt::Write;
         if stage == super::Stage::RecoveryPark {
@@ -1984,6 +2019,7 @@ impl Transport {
                         sequence_reset: SequenceReset::None,
                         wake: wake::Wake::default(),
                         irq: None,
+                        pace: None,
                     },
                     firmware,
                 ),

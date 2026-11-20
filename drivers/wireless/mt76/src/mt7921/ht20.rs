@@ -17,18 +17,6 @@ pub(crate) fn static_operation(mut operation: [u8; 22]) -> [u8; 22] {
     operation
 }
 
-/// Bound AP PHY facts are unchanged apart from dynamic HT protection state.
-pub(crate) fn same_ap_phy(
-    bound: &narf_wireless::association::phy::ApElements,
-    current: &narf_wireless::association::phy::ApElements,
-) -> bool {
-    bound.ht_capability() == current.ht_capability()
-        && bound.vht_capability() == current.vht_capability()
-        && bound.vht_operation() == current.vht_operation()
-        && bound.ht_operation().map(static_operation)
-            == current.ht_operation().map(static_operation)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
     capability: [u8; 26],
