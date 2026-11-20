@@ -2820,8 +2820,10 @@ fn do_execve_resolved(
         // /home/daniel/.local/bin/codex then becomes /home/home/daniel/... on
         // a separately mounted /home, even though open/stat find the file.
         // Expand through the caller's mounts and chroot before opening it.
-        let ep = resolve_vfs_symlink_path_scoped(&apply_chroot(p), true)
-            .map_err(|errno| -errno)?;
+        // The scoped resolver already reports negative (wire) errnos, the
+        // same convention as this closure; negating them again made a
+        // symlink loop exec return +ELOOP (40) instead of -ELOOP.
+        let ep = resolve_vfs_symlink_path_scoped(&apply_chroot(p), true)?;
         // Linux checks path_noexec on the file it opened, including each
         // script interpreter, rather than the mount containing a symlink.
         // Anonymous fd images never enter this path and have no mount.
