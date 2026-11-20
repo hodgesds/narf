@@ -42,8 +42,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 pub mod ahb;
 pub mod ahb_hif;
 pub mod ahb_live;

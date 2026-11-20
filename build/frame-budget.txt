@@ -9,12 +9,12 @@
 28904 narf_drivers_gpu::amdgpu::claim_navi48
 28248 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
 26728 <narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard as core::ops::drop::Drop>::drop
-26376 <narf_drivers_wireless::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
+26376 <narf_drivers_wireless_ath11k::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
 25688 narf_drivers_wireless_rtw::rtw89::bootstrap::Bootstrap::generation::{{closure}}
 23976 narf_drivers_wireless_rtw::rtw89::efuse_be::read_factory
 23960 narf_drivers_wireless_rtw::rtw89::efuse_be::BeFactory::read
 23176 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
-21960 narf_drivers_wireless::ath11k::pci::probe
+21960 narf_drivers_wireless_ath11k::ath11k::pci::probe
 21720 narf_drivers_wireless_ath10k::ath10k::pci::probe
 21464 narf_drivers_wireless::cyw43439::interface::attach_runtime::{{closure}}
 21368 narf_drivers_wireless_ath10k::ath10k::pci::queue_recovery::{{closure}}
@@ -53,7 +53,7 @@
 9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
 8904 narf_drivers_wireless::brcmfmac::native_runtime::provision_using::{{closure}}
-8808 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
+8808 narf_drivers_wireless_ath11k::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
 8664 narf_drivers_wireless_iwlwifi::iwlwifi::device::ap::<impl narf_drivers_wireless_iwlwifi::iwlwifi::device::Device>::ap_control::{{closure}}
 8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
@@ -63,8 +63,7 @@
 8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
 8296 narf_memory::compress::lz4_encode
 29672 narf_drivers_wireless::rtl8xxxu::interface::interface_power::<impl narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E>>::request_admin::{{closure}}
-28808 narf_drivers_wireless::ath11k::core::pci_start::{{closure}}
-13296 narf_drivers_wireless::ath11k::iface::register_ahb
-13144 narf_drivers_wireless::ath11k::iface::register_pci_netdev
-8824 narf_drivers_wireless::ath11k::pci::mhi_task::{{closure}}
-18312 narf_drivers_wireless::ath11k::runtime::register_ahb_radios
+28808 narf_drivers_wireless_ath11k::ath11k::core::pci_start::{{closure}}
+13296 narf_drivers_wireless_ath11k::ath11k::iface::register_ahb
+13144 narf_drivers_wireless_ath11k::ath11k::iface::register_pci_netdev
+8824 narf_drivers_wireless_ath11k::ath11k::pci::mhi_task::{{closure}}
