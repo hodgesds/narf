@@ -3332,7 +3332,11 @@ fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
             if rd_u32(&buf, sm::OFF_SIZE) as usize <= sm::SIZE {
                 return Err("statmount's size does not account for the string area");
             }
-            if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_ROOT)) != "/" {
+            // mnt_root is the mount's root within its filesystem: "/" for a
+            // whole filesystem, the source directory for a bind of a
+            // subdirectory ("/subdir" for the mount_bind_subdir smoke's
+            // mount, as on Linux). Either way it is absolute.
+            if !sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_ROOT)).starts_with('/') {
                 return Err("mnt_root should be the mount's root within its filesystem");
             }
             // The parent of a mount is another mount, so its id must also
