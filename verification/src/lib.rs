@@ -30,6 +30,8 @@
 extern crate alloc;
 
 #[cfg(feature = "user-mode-e2e")]
+mod cputime_user;
+#[cfg(feature = "user-mode-e2e")]
 mod pipe_abi;
 #[cfg(target_arch = "x86_64")]
 mod timer_strand;
