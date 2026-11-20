@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod card;
 pub mod dma;
 pub mod host;
+pub mod module;
 pub mod native;
 pub mod pio;
 pub mod sdhci;

@@ -358,6 +358,46 @@ kernel_abi! {
         unsafe { narf_bus::module_usb::register_module_usb_driver(owner, name, m, probe) }
     }
 
+    /// Register an SDIO function-driver match for this module. `vendor`/`device`
+    /// are the card's SDIO ids and `function` the function number (F1..=F7) to
+    /// claim. `probe` is a `ModuleProbeFn` called through the module call gate,
+    /// in task context, for a card no built-in driver claimed; its `dev_token`
+    /// is an opaque SDIO device token (no SDIO datapath export accepts it yet)
+    /// and a 0 return claims the card. Returns 0, `-EINVAL` for a bad name,
+    /// null probe or an out-of-range function, `-ENODEV` when the kernel has no
+    /// SDIO stack, `-EBUSY` when another module owns the match.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes valid for the call. `probe`
+    /// must be a valid `ModuleProbeFn` pointer that stays mapped for as long as
+    /// the driver is registered; module unload removes the callback and its
+    /// device contexts before unmapping the owner's text.
+    fn narf_register_sdio_driver(
+        name: *const u8,
+        name_len: usize,
+        vendor: u16,
+        device: u16,
+        function: u8,
+        probe: usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || probe == 0 {
+            return -22; // -EINVAL
+        }
+        // SAFETY: the module promises `name` names `name_len` readable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            return -22;
+        };
+        let m = match narf_bus::module_sdio::ModuleSdioMatch::new(vendor, device, function) {
+            Ok(m) => m,
+            Err(errno) => return errno,
+        };
+        let owner = crate::symbols::current_init_id().0;
+        // SAFETY: `probe` is non-null (checked); the unload path removes the
+        // match before the owner's text is unmapped.
+        unsafe { narf_bus::module_sdio::register_module_sdio_driver(owner, name, m, probe) }
+    }
+
     // ── Device datapath: PCI/MMIO (Stage 1) + coherent DMA (Stage 2) ───────
     //
     // These let a module's probe actually drive the device it was handed. The
@@ -1484,6 +1524,7 @@ fn smoke_kabi_register_usb_driver_validates_and_forwards() -> TestResult {
     let rc = call(name.as_ptr(), name.len(), VP, 0xFEED, probe);
     let owner = crate::symbols::current_init_id().0;
     narf_bus::module_usb::unregister_module_usb_drivers(owner);
+    narf_bus::module_sdio::unregister_module_sdio_drivers(owner);
     match rc {
         0 => TestResult::Pass,
         -19 => TestResult::Skip("no USB stack registered a module host in this build"),
