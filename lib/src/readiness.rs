@@ -458,6 +458,102 @@ impl Readiness {
     }
 }
 
+/// A Linux `wait_queue_head_t` for providers whose readiness is COMPUTED by
+/// the provider's own `->poll` (a sequence number, a per-open cursor, a line
+/// discipline) rather than stored as a level a [`Readiness`] cell could hold.
+///
+/// The waiter set is a [`Readiness`] whose level is permanently zero, so every
+/// arm registers. The arm methods take the provider's level function and run
+/// it AFTER registering: Linux's `poll_wait(); mask = compute();` order. A
+/// producer that publishes its state change and then calls [`wake`] can
+/// therefore never slip between a waiter's check and its registration — the
+/// check happens after the registration is visible under the queue lock.
+///
+/// [`wake`]: WaitQueue::wake
+pub struct WaitQueue {
+    waiters: Readiness,
+}
+
+impl core::fmt::Debug for WaitQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WaitQueue")
+            .field("waiters", &self.waiters.waiter_count())
+            .finish()
+    }
+}
+
+impl Default for WaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WaitQueue {
+    /// An empty wait queue.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            waiters: Readiness::new(0),
+        }
+    }
+
+    /// `poll_wait` + `->poll` for a one-shot waiter (`poll(2)`, `select(2)`):
+    /// register `id`, then evaluate `level`. Returns [`Poll::Ready`] (and
+    /// removes the registration) when `level() & interest` is non-zero,
+    /// otherwise leaves `id` registered and returns [`Poll::Pending`].
+    #[must_use = "a Pending arm means the caller must park; a Ready arm carries the revents"]
+    pub fn arm(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &Waker,
+        level: impl FnOnce() -> u32,
+    ) -> Poll<u32> {
+        // The level is zero, so this always registers.
+        let _ = self.waiters.arm(id, interest, waker);
+        let ready = level() & interest;
+        if ready != 0 {
+            self.waiters.disarm(id);
+            Poll::Ready(ready)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// `ep_insert`'s `ep_item_poll` for a persistent (epoll) waiter: register
+    /// `id` for the waiter's lifetime in the set, then return `level() &
+    /// interest` so the caller can seed its ready list.
+    pub fn arm_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &Waker,
+        level: impl FnOnce() -> u32,
+    ) -> u32 {
+        let _ = self.waiters.arm_persistent(id, interest, waker);
+        level() & interest
+    }
+
+    /// Remove `id` from the queue.
+    pub fn disarm(&self, id: u64) {
+        self.waiters.disarm(id);
+    }
+
+    /// `wake_up_poll(wq, bits)`: wake every waiter whose interest intersects
+    /// `bits`. Call AFTER the state change the waiters recompute is visible.
+    /// Wakes by reference under the queue lock (see [`Readiness::notify`]), so
+    /// it is IRQ-safe and allocation-free.
+    pub fn wake(&self, bits: u32) {
+        self.waiters.notify(bits);
+    }
+
+    /// Number of registered waiters. Diagnostics/tests only.
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.waiter_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +971,57 @@ mod tests {
         assert_eq!(r.seq(), 1);
         r.set(IN, 0); // rising again
         assert_eq!(r.seq(), 2);
+    }
+
+    #[test]
+    fn wait_queue_checks_after_registering() {
+        // The producer publishes and wakes BETWEEN a waiter's first look and
+        // its registration. The arm's own post-registration evaluation must
+        // observe the published state: that is the whole point of the order.
+        let q = WaitQueue::new();
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+        let published = core::cell::Cell::new(false);
+        // First look: nothing. The event lands and the producer wakes an
+        // empty queue.
+        assert!(!published.get());
+        published.set(true);
+        q.wake(IN);
+        // The arm registers first, then re-evaluates: Ready, no waiter left.
+        let got = q.arm(7, IN, &w, || if published.get() { IN } else { 0 });
+        assert_eq!(got, Poll::Ready(IN));
+        assert_eq!(q.waiter_count(), 0);
+    }
+
+    #[test]
+    fn wait_queue_wakes_registered_waiter_by_interest() {
+        let q = WaitQueue::new();
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+        assert_eq!(q.arm(1, IN, &w, || 0), Poll::Pending);
+        q.wake(OUT);
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            0,
+            "disjoint interest must not wake"
+        );
+        q.wake(IN);
+        assert_eq!(n.load(Ordering::SeqCst), 1, "matching wake must fire");
+        q.disarm(1);
+        q.wake(IN);
+        assert_eq!(n.load(Ordering::SeqCst), 1, "disarmed waiter must not fire");
+    }
+
+    #[test]
+    fn wait_queue_persistent_survives_wakes_and_seeds_level() {
+        let q = WaitQueue::new();
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+        assert_eq!(q.arm_persistent(9, IN | OUT, &w, || OUT), OUT);
+        q.wake(IN);
+        q.wake(IN);
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+        assert_eq!(q.waiter_count(), 1, "persistent waiter is never consumed");
     }
 
     #[test]
