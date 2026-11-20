@@ -1762,6 +1762,37 @@ impl FileOps for EpollInstance {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+
+    /// `ep_show_fdinfo`: one `tfd:` line per registered descriptor.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let registrations: Vec<Arc<EpollRegistration>> = self
+            .inner
+            .lock()
+            .interest
+            .values()
+            .map(|item| Arc::clone(&item.registration))
+            .collect();
+        for registration in registrations {
+            let Some(file) = registration.file.upgrade() else {
+                continue;
+            };
+            let (events, data) = {
+                let state = registration.state.lock();
+                (state.events, state.data)
+            };
+            let _ = writeln!(
+                out,
+                "tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}",
+                registration.fd,
+                events,
+                data,
+                registration.offset as i64,
+                file.ino(),
+                file.inode_attrs().dev,
+            );
+        }
+    }
 }
 
 impl Drop for EpollInstance {

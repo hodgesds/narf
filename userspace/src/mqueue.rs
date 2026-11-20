@@ -1137,6 +1137,24 @@ impl FileOps for InotifyFile {
         }
     }
 
+    /// `inotify_fdinfo`: one line per watch. NARF's watches are keyed by
+    /// path, not by inode, so `ino`/`sdev` (the watched inode's identity)
+    /// print as 0; `wd` and `mask` are exact.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let watches: Vec<(i32, u32)> = with_inotify(|m| {
+            m.get(&self.id)
+                .map(|s| s.watches.iter().map(|(wd, w)| (*wd, w.mask)).collect())
+                .unwrap_or_default()
+        });
+        for (wd, mask) in watches {
+            let _ = writeln!(
+                out,
+                "inotify wd:{wd:x} ino:0 sdev:0 mask:{mask:x} ignored_mask:0 "
+            );
+        }
+    }
+
     /// Inotify-specific ioctls. `FIONREAD` / `TIOCINQ` reports the exact
     /// unread byte count of the serialized event stream. Qt's inotify
     /// integration probes it after `ppoll` before choosing its read buffer;

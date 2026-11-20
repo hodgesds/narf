@@ -178,6 +178,17 @@ impl FileOps for SignalFdFile {
         }
     }
 
+    /// `signalfd_show_fdinfo`: `render_sigset_t(m, "sigmask:\t", ..)`. The
+    /// internal mask is the user `sigset_t` layout (signal N is bit N-1).
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "sigmask:\t{:016x}",
+            self.mask.load(core::sync::atomic::Ordering::Acquire)
+        );
+    }
+
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.readiness)
     }

@@ -24,6 +24,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub struct EventFd {
     counter: AtomicU64,
     semaphore: bool,
+    /// `eventfd_ctx::id`, shown as `eventfd-id:` in fdinfo.
+    id: u32,
     /// Durable per-fd readiness cell — the SOLE readiness mechanism (there is no
     /// edge token). Mirrors POLL_IN (counter > 0) and POLL_OUT (counter < MAX-1);
     /// every counter change publishes the new level via `set`; same-level write
@@ -40,6 +42,7 @@ impl EventFd {
         Arc::new(Self {
             counter: AtomicU64::new(initval),
             semaphore: (flags & EFD_SEMAPHORE) != 0,
+            id: NEXT_EVENTFD_ID.fetch_add(1, Ordering::Relaxed),
             readiness: narf_lib::readiness::Readiness::new(
                 POLL_OUT | if initval != 0 { POLL_IN } else { 0 },
             ),
@@ -220,7 +223,22 @@ impl FileOps for EventFd {
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.readiness)
     }
+
+    /// `eventfd_show_fdinfo`: the counter, the fd's id and its mode.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let _ = write!(
+            out,
+            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: {}\n",
+            self.counter.load(Ordering::Acquire),
+            self.id,
+            u8::from(self.semaphore),
+        );
+    }
 }
+
+/// `eventfd_ida`: the id each eventfd reports in its fdinfo.
+static NEXT_EVENTFD_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ── timerfd ─────────────────────────────────────────────────────
 
@@ -522,6 +540,33 @@ impl FileOps for TimerFd {
             Some(s.next_fire_ns)
         }
     }
+
+    /// `timerfd_show`: clock, pending expirations, and the
+    /// `timerfd_gettime` view of the timer. NARF keeps the clock base, not
+    /// the `_ALARM` variant or the settime flags, so those print as their
+    /// base clock and 0.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        use narf_scheduler::narf_time::hrtimer::ClockId;
+        let clockid = match self.clock {
+            ClockId::Realtime => 0,
+            ClockId::Monotonic => 1,
+            ClockId::Boottime => 7,
+            ClockId::Tai => 11,
+        };
+        let ticks = self.state.lock().expirations;
+        let (value, interval) = self.current();
+        const NS: u64 = 1_000_000_000;
+        let _ = write!(
+            out,
+            "clockid: {clockid}\nticks: {ticks}\nsettime flags: 00\n\
+             it_value: ({}, {})\nit_interval: ({}, {})\n",
+            value / NS,
+            value % NS,
+            interval / NS,
+            interval % NS,
+        );
+    }
 }
 
 // ── signalfd ────────────────────────────────────────────────────
@@ -706,6 +751,13 @@ impl FileOps for SignalFd {
         }
     }
 
+    /// `signalfd_show_fdinfo`: `render_sigset_t(m, "sigmask:\t", ..)`. The
+    /// internal mask is the user `sigset_t` layout (signal N is bit N-1).
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let _ = writeln!(out, "sigmask:\t{:016x}", self.mask.load(Ordering::Acquire));
+    }
+
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.readiness)
     }
@@ -845,4 +897,37 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/io_mux", smoke_timerfd_poll_deadline_never_past);
+
+    /// `/proc/<pid>/fdinfo/<fd>` carries each event fd's own state, as
+    /// Linux's `show_fdinfo` hooks print it: a hung eventfd consumer's
+    /// counter, a timerfd's pending ticks and schedule, a signalfd's mask.
+    fn smoke_event_fds_show_linux_fdinfo() -> TestResult {
+        use narf_scheduler::narf_time::hrtimer::ClockId;
+        let mut out = alloc::string::String::new();
+        EventFd::new(0x2a, EFD_SEMAPHORE).show_fdinfo(&mut out);
+        if !out.contains("eventfd-count:               2a\n")
+            || !out.contains("eventfd-id: ")
+            || !out.contains("eventfd-semaphore: 1\n")
+        {
+            return TestResult::Fail("eventfd fdinfo lacks Linux's count/id/semaphore lines");
+        }
+        out.clear();
+        let tfd = TimerFd::new(ClockId::Monotonic);
+        // `arm` takes an absolute deadline in the fd's clock.
+        tfd.arm(tfd.now() + 60_000_000_000, 1_500_000_000);
+        tfd.show_fdinfo(&mut out);
+        if !out.starts_with("clockid: 1\nticks: 0\nsettime flags: 00\nit_value: (")
+            || !out.contains("it_interval: (1, 500000000)\n")
+        {
+            return TestResult::Fail("timerfd fdinfo does not match timerfd_show");
+        }
+        tfd.arm(0, 0);
+        out.clear();
+        SignalFd::new(1 << 16, 0).show_fdinfo(&mut out);
+        if out != "sigmask:\t0000000000010000\n" {
+            return TestResult::Fail("signalfd fdinfo does not render its sigmask");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/io_mux", smoke_event_fds_show_linux_fdinfo);
 }
