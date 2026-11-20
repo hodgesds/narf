@@ -983,7 +983,8 @@ mod smokes {
 
     /// Reset every registry the fixture smokes touch: the backlight
     /// registries, sysfs, the AML namespace + notify table, and the
-    /// brightness-key handler.
+    /// brightness-key handler. Callers hold a `__test_namespace_scope`, so
+    /// the namespace cleared here is the scope's, not the boot one.
     fn reset_fixture_state() {
         __reset_all_for_test();
         sysfs_reset();
@@ -1023,6 +1024,9 @@ mod smokes {
     // ── 27. Fixture DSDT _BCL parse end to end (AML→registry) ──────
 
     fn smoke_fixture_dsdt_bcl_parse_end_to_end() -> TestResult {
+        // SAFETY: serialized test; the scope puts the boot namespace back
+        // on drop, after the fixture DSDT replaced it.
+        let _namespace = unsafe { narf_aml::__test_namespace_scope() };
         reset_fixture_state();
         if let Err(e) = install_fixture_dsdt() {
             reset_fixture_state();
@@ -1087,6 +1091,9 @@ mod smokes {
     // ── 28. Fixture DSDT _BCM captures the dispatched argument ─────
 
     fn smoke_fixture_dsdt_bcm_captures_argument() -> TestResult {
+        // SAFETY: serialized test; the scope puts the boot namespace back
+        // on drop, after the fixture DSDT replaced it.
+        let _namespace = unsafe { narf_aml::__test_namespace_scope() };
         reset_fixture_state();
         if let Err(e) = install_fixture_dsdt() {
             reset_fixture_state();
@@ -1149,6 +1156,9 @@ mod smokes {
     // ── 29. Fixture DSDT sysfs end to end ──────────────────────────
 
     fn smoke_fixture_dsdt_sysfs_end_to_end() -> TestResult {
+        // SAFETY: serialized test; the scope puts the boot namespace back
+        // on drop, after the fixture DSDT replaced it.
+        let _namespace = unsafe { narf_aml::__test_namespace_scope() };
         reset_fixture_state();
         sysfs_reset();
         if let Err(e) = install_fixture_dsdt() {
@@ -1215,6 +1225,9 @@ mod smokes {
     // ── 30. Composition: fixture panel is populated by the composed boot path ──
 
     fn smoke_fixture_dsdt_composition_populates_panel() -> TestResult {
+        // SAFETY: serialized test; the scope puts the boot namespace back
+        // on drop, after the fixture DSDT replaced it.
+        let _namespace = unsafe { narf_aml::__test_namespace_scope() };
         reset_fixture_state();
         sysfs_reset();
         if let Err(e) = install_fixture_dsdt() {

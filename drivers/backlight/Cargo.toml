@@ -29,7 +29,7 @@ narf-pwm          = { path = "../../pwm" }
 async-trait       = "0.1"
 
 [features]
-kernel-test = ["narf-drivers-leds/kernel-test"]
+kernel-test = ["narf-drivers-leds/kernel-test", "narf-aml/kernel-test"]
 
 [lints]
 workspace = true
