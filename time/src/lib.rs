@@ -128,6 +128,30 @@ pub fn periodic_tick_wanted(cpu: usize) -> bool {
     cpu >= TICK_MAX_CPUS || PERIODIC_TICK_WANTED[cpu].load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// `local_softirq_pending()` for the timer softirqs: this CPU has raised
+/// `TIMER_SOFTIRQ` (a due wheel base, or an idle CPU's global timers to
+/// expire as timer migrator) or `HRTIMER_SOFTIRQ`, and the executor round
+/// that runs them ([`hrtimer::hrtimer_run_softirq`]) has not run yet.
+///
+/// Linux runs pending softirqs at `irq_exit`, whatever task the interrupt
+/// came in on, and `tick_nohz_stop_tick` / the idle loop never stop the tick
+/// or halt over one. NARF runs them in the executor round, so the scheduler
+/// asks this both before letting a running task keep the CPU and before
+/// committing a CPU to halt. The due event itself is no longer reported once
+/// raised (it would re-arm the clockevent into the past), so this is the
+/// only place a pending one shows. Lock-free.
+pub fn softirq_pending_local() -> bool {
+    softirq_pending_on(narf_lib::percpu::current_cpu())
+}
+
+/// [`softirq_pending_local`] for `cpu`, read from any CPU (diagnostics: the
+/// stall watchdog's "halted over runnable work" test).
+pub fn softirq_pending_on(cpu: usize) -> bool {
+    timer::softirq_pending_on(cpu)
+        || hrtimer::softirq_pending_on(cpu)
+        || timer_migration::requires_handle_remote_on(cpu)
+}
+
 /// Boot policy for tickless idle. The local clockevent must also support it.
 static NOHZ_IDLE_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

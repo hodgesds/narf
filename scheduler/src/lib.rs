@@ -2458,6 +2458,55 @@ fn wake_race_stamp(cell: &WakeCell, home: u32) {
     cell.wake_halt_gen.store(g, Ordering::Relaxed);
 }
 
+/// Wake-to-run delays at least this long are kept for the stall watchdog
+/// to report (a woken task that waited a second for its CPU: a lost kick or
+/// a CPU monopolised by something that does not reach a scheduling point).
+const LONG_RUN_DELAY_NS: u64 = 1_000_000_000;
+
+/// Per CPU, the longest wake-to-run delay (cycles) of at least
+/// [`LONG_RUN_DELAY_NS`] since the watchdog last took it, and its task.
+#[repr(C, align(64))]
+struct LongRunDelay {
+    cycles: AtomicU64,
+    task: AtomicU64,
+}
+
+static LONG_RUN_DELAY: [LongRunDelay; narf_lib::percpu::MAX_CPUS] = [const {
+    LongRunDelay {
+        cycles: AtomicU64::new(0),
+        task: AtomicU64::new(0),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn note_long_run_delay(cpu: usize, task: u64, waited: u64) {
+    let Some(slot) = LONG_RUN_DELAY.get(cpu) else {
+        return;
+    };
+    if waited < narf_time::ns_to_cycles(LONG_RUN_DELAY_NS)
+        || waited <= slot.cycles.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    // Two stores, read together only by the watchdog: a torn pair names
+    // one of two long waiters, which is still a report worth having.
+    slot.task.store(task, Ordering::Relaxed);
+    slot.cycles.store(waited, Ordering::Release);
+}
+
+/// Take `cpu`'s longest wake-to-run delay of at least a second since the last
+/// call: `(task, ns)`. The stall watchdog reports it.
+pub fn dbg_take_long_run_delay(cpu: usize) -> Option<(u64, u64)> {
+    let slot = LONG_RUN_DELAY.get(cpu)?;
+    let cycles = slot.cycles.swap(0, Ordering::Acquire);
+    (cycles != 0).then(|| {
+        (
+            slot.task.load(Ordering::Relaxed),
+            narf_time::cycles_to_ns(cycles),
+        )
+    })
+}
+
 /// Dispatch side: a slot with a set awake flag is about to run on `cpu`. Charge
 /// the wake→run delay to this CPU's and the task's `sched_info` (Linux
 /// `sched_info_arrive`), and for the wake-race instrument record the latency
@@ -2471,6 +2520,7 @@ fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
     if let Some(cputime) = cell.cputime.as_ref() {
         cputime.note_run_delay(waited);
     }
+    note_long_run_delay(cpu, cell.task, waited);
     if w == 0 || !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -8159,6 +8209,12 @@ pub fn run_until_empty() {
                 // global counter here would make every CPU refuse to halt while
                 // any peer has an undrained waker.
                 || narf_lib::deferred_wake::has_pending_local()
+                // A timer interrupt since this round's softirq run raised one
+                // (`tick_nohz_stop_tick` refuses to stop the tick with a
+                // softirq pending, and Linux would have run it at `irq_exit`).
+                // Its due event is no longer the clockevent's next event, so
+                // halting here would sleep over it until an unrelated IRQ.
+                || narf_time::softirq_pending_local()
                 || {
                     let now = narf_time::now_cycles();
                     let q = READY[cpu].lock();
@@ -8277,10 +8333,14 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
             return true;
         }
     }
-    // This CPU is the timer migrator of a group whose idle CPU has a due
-    // global timer (`tmigr_requires_handle_remote`): the executor round runs
-    // it, so a CPU-bound task must yield as for its own timers.
-    if narf_time::timer_migration::requires_handle_remote() {
+    // A timer softirq is pending (`local_softirq_pending`): a due wheel base
+    // the tick raised, an idle CPU's global timers to expire as its timer
+    // migrator, or the hrtimer soft queue. Linux runs it at `irq_exit` over
+    // whatever task is running; here the executor round runs it, so a
+    // CPU-bound task must yield. Once raised the due event is no longer
+    // reported as the next event (it would re-arm the clockevent into the
+    // past), so the deadline check above cannot see it.
+    if narf_time::softirq_pending_local() {
         return true;
     }
     // A cross-core wake is staged for this CPU (Linux `rq->wake_list`).
@@ -8522,6 +8582,29 @@ pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
         },
         None => (0, 0, halted, true),
     }
+}
+
+/// Whether `cpu`'s executor has work its idle commit would refuse to halt
+/// over (the `woke_late` test, read without consuming anything): a pending
+/// wake or reschedule request, an undrained wake list, a pending timer
+/// softirq, or a dispatchable task. The stall watchdog reports a CPU that stays halted with this set
+/// (Linux's workqueue lockup). A busy ready-queue lock reads as `false`.
+pub fn dbg_cpu_runnable(cpu: usize) -> bool {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return false;
+    }
+    if WAKE_PENDING[cpu].load(Ordering::SeqCst)
+        || NEED_RESCHED[cpu].load(Ordering::SeqCst)
+        || wake_list_pending(cpu)
+        || narf_time::softirq_pending_on(cpu)
+    {
+        return true;
+    }
+    let now = narf_time::now_cycles();
+    READY[cpu].try_lock().is_some_and(|q| {
+        q.as_ref()
+            .is_some_and(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
+    })
 }
 
 /// NUMA node ID of the executing CPU, or `None` when SRAT

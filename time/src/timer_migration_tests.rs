@@ -131,18 +131,24 @@ fn fired_fn(r: timer::TimerRef) {
     f.count.fetch_add(1, Ordering::AcqRel);
 }
 
-/// An idle CPU's GLOBAL timer is run by the migrator's softirq walk — here a
-/// CPU in another cache group, so the walk climbs to the node group — while
+/// An idle CPU's GLOBAL timer is run by the migrator's softirq walk while
 /// the idle CPU stays idle; afterwards its event is gone and its next one
-/// (a second, later timer) is queued in its place.
-fn smoke_tmigr_idle_cpu_global_timer_runs_on_migrator() -> TestResult {
+/// (a second, later timer) is queued in its place. `same_cache` puts both
+/// CPUs in one level-0 group, where the event the walk pops is the idle
+/// CPU's own (one last-level cache, as on a Zen 4 desktop); otherwise the
+/// idle CPU is in another cache group and the walk pops that group's event
+/// in the node group.
+fn idle_cpu_global_timer_runs_on_migrator(same_cache: bool) -> TestResult {
     let Some([idle, migrator]) = dead_cpus::<2>() else {
         return TestResult::Skip("needs two CPU indices that never came online");
     };
     timer::timers_prepare_cpu(idle);
     let h = Box::new(Tmigr::new());
     h.cpu_online(migrator, Some(1), Some(0));
-    h.cpu_online(idle, Some(2), Some(0));
+    h.cpu_online(idle, Some(if same_cache { 1 } else { 2 }), Some(0));
+    if (h.group_id(idle) == h.group_id(migrator)) != same_cache {
+        return TestResult::Fail("the CPUs' level-0 groups do not follow their caches");
+    }
     let mk = || {
         Box::new(Fired {
             timer: TimerList::new(fired_fn, 0),
@@ -193,9 +199,26 @@ fn smoke_tmigr_idle_cpu_global_timer_runs_on_migrator() -> TestResult {
     }
     TestResult::Pass
 }
+
+/// [`idle_cpu_global_timer_runs_on_migrator`] across cache groups.
+fn smoke_tmigr_idle_cpu_global_timer_runs_on_migrator() -> TestResult {
+    idle_cpu_global_timer_runs_on_migrator(false)
+}
 kernel_test_in!(
     "time/tmigr",
     smoke_tmigr_idle_cpu_global_timer_runs_on_migrator
+);
+
+/// [`idle_cpu_global_timer_runs_on_migrator`] within one level-0 group.
+/// Popping the idle CPU's own event there once also marked it ignored, which
+/// `handle_remote_cpu` reads as "that CPU went active": the expiry bailed,
+/// the event was already off the queue, and the timer never ran.
+fn smoke_tmigr_idle_cpu_global_timer_runs_on_same_cache_migrator() -> TestResult {
+    idle_cpu_global_timer_runs_on_migrator(true)
+}
+kernel_test_in!(
+    "time/tmigr",
+    smoke_tmigr_idle_cpu_global_timer_runs_on_same_cache_migrator
 );
 
 /// The last CPU to go idle is woken for the hierarchy's first timer and, in
@@ -233,3 +256,53 @@ fn smoke_tmigr_last_idle_cpu_covers_all() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/tmigr", smoke_tmigr_last_idle_cpu_covers_all);
+
+/// The whole group idle: the last CPU to go idle is told to wake for the
+/// first global timer of its sibling, and its wake-up walk (no migrator in
+/// the group) runs that timer on time while the sibling stays idle. This is
+/// the path a desktop's boot CPU takes once its executor idles: every
+/// timer of an idle sibling in the one cache group goes through it.
+fn smoke_tmigr_last_idle_cpu_runs_sibling_timer() -> TestResult {
+    let Some([idle, last]) = dead_cpus::<2>() else {
+        return TestResult::Skip("needs two CPU indices that never came online");
+    };
+    timer::timers_prepare_cpu(idle);
+    let h = Box::new(Tmigr::new());
+    h.cpu_online(last, Some(1), Some(0));
+    h.cpu_online(idle, Some(1), Some(0));
+    let soon = Box::new(Fired {
+        timer: TimerList::new(fired_fn, 0),
+        count: AtomicUsize::new(0),
+        cpu: AtomicUsize::new(usize::MAX),
+    });
+    // SAFETY: the Box outlives the timer; deleted below.
+    unsafe { timer::add_timer_on(&soon.timer, timer::jiffies() + 2, idle) };
+    let first = timer::global_next(idle);
+    let sibling_told = h.deactivate(idle, first);
+    let last_told = h.deactivate(last, NONE);
+    let end = crate::monotonic_ns() + 500_000_000;
+    let mut ran = 0;
+    while soon.count.load(Ordering::Acquire) == 0 && crate::monotonic_ns() < end {
+        ran += h.handle_remote(last, timer::jiffies());
+        core::hint::spin_loop();
+    }
+    let still_idle = !h.cpu_active(idle);
+    timer::del_timer_sync(&soon.timer);
+    if sibling_told != Some(NONE) || last_told != Some(first) {
+        return TestResult::Fail("the last CPU to idle was not told to wake for its sibling's timer");
+    }
+    if soon.count.load(Ordering::Acquire) != 1 || ran != 1 {
+        return TestResult::Fail("the last idle CPU's walk did not run its sibling's due timer once");
+    }
+    if !still_idle {
+        return TestResult::Fail("the idle sibling left idle");
+    }
+    if h.__validate().is_err() {
+        return TestResult::Fail("hierarchy invariants broken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/tmigr",
+    smoke_tmigr_last_idle_cpu_runs_sibling_timer
+);

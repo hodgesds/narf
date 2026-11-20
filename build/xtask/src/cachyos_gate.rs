@@ -1316,7 +1316,16 @@ impl Gate {
                 "if=pflash,format=raw,unit=1,file={}",
                 self.ovmf_vars.display()
             ))
-            .args(["-machine", "q35", "-cpu", "max", "-smp", "4", "-m", "4096M"])
+            // `NARF_QEMU_CPU` / `NARF_QEMU_SMP` / `NARF_QEMU_EXTRA` as for
+            // `qemu_args`: e.g. `NARF_QEMU_CPU=host
+            // NARF_QEMU_EXTRA="-overcommit cpu-pm=on"` exposes MWAIT to the
+            // guest so its polling idle runs as on hardware (KVM hides MWAIT
+            // otherwise).
+            .args(["-machine", "q35", "-cpu"])
+            .arg(std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()))
+            .arg("-smp")
+            .arg(std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| "4".into()))
+            .args(["-m", "4096M"])
             .args([
                 "-serial",
                 "stdio",
@@ -1356,6 +1365,9 @@ impl Gate {
             .args(["-device", "usb-kbd,bus=xhci0.0"]);
         if let Some(a) = &self.accel {
             c.args(["-accel", a]);
+        }
+        if let Ok(extra) = std::env::var("NARF_QEMU_EXTRA") {
+            c.args(extra.split_whitespace());
         }
         c
     }
@@ -1464,6 +1476,13 @@ impl Gate {
             }
         };
         println!("cachyos-gate:   login after {:.0}s", booted.as_secs_f64());
+        // Diagnostic hook: `NARF_GATE_CMD` runs once in the logged-in shell
+        // and its output is printed (e.g. `sleep 20; cat /proc/timer_list`
+        // to look for overdue kernel timers after the system settles).
+        if let Ok(cmd) = std::env::var("NARF_GATE_CMD") {
+            let (status, out) = vm.run(&cmd, Duration::from_secs(300))?;
+            println!("cachyos-gate:   NARF_GATE_CMD exit {status}:\n{out}");
+        }
         Ok((vm, booted))
     }
 
@@ -1864,6 +1883,14 @@ impl Gate {
         }
         let (_, wnotes) = Self::workload(&mut vm, "linux")?;
         notes.push(format!("Linux workload ok ({wnotes})"));
+        // Diagnostic hook: `CACHYOS_GATE_LINUX_CMD` runs once in the Linux
+        // shell after its workload, so Linux shapes the image NARF boots
+        // next (e.g. data block groups filled to a host root's 99.8 % with
+        // scattered holes) and its output is printed.
+        if let Ok(cmd) = std::env::var("CACHYOS_GATE_LINUX_CMD") {
+            let (status, out) = vm.run(&cmd, Duration::from_secs(3600))?;
+            println!("cachyos-gate:   CACHYOS_GATE_LINUX_CMD exit {status}:\n{out}");
+        }
         let (rc, out) = vm.run("btrfs scrub start -B /", Duration::from_secs(1800))?;
         if rc != 0 || !out.contains("no errors found") {
             bail!("btrfs scrub under Linux: rc {rc}: {}", tail(&out, 8));

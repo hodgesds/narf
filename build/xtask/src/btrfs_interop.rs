@@ -82,6 +82,27 @@ pub struct Args {
     /// Seconds to wait for each boot's verdict.
     #[arg(long, default_value_t = 240)]
     pub timeout: u64,
+
+    /// Instead of the built images, boot NARF once on this prepared GPT disk
+    /// (its btrfs partition's fsid is `--external-uuid`, which must carry
+    /// the harness prefix the kernel requires) under `--external-mode`, with
+    /// `narf.rootlog`. For a copy of a real root's metadata (`btrfs-image`
+    /// restored and given a harness fsid with `btrfstune -U`).
+    #[arg(long, requires = "external_uuid")]
+    pub external_image: Option<std::path::PathBuf>,
+
+    /// The btrfs fsid of `--external-image`'s root partition.
+    #[arg(long)]
+    pub external_uuid: Option<String>,
+
+    /// The subvolume of `--external-image` to mount at `/` (`subvolid=`, as
+    /// a scrambled-name copy has no usable `subvol=` path).
+    #[arg(long, default_value_t = 256)]
+    pub external_subvolid: u64,
+
+    /// The workload mode for `--external-image`.
+    #[arg(long, default_value = "churn")]
+    pub external_mode: String,
 }
 
 fn tool(name: &str) -> Result<()> {
@@ -455,6 +476,38 @@ fn verdict(lines: &[String]) -> Option<&str> {
         .iter()
         .filter(|l| !l.contains("ROOTRW-INTEROP: detail"))
         .find_map(|l| l.split_once("ROOTRW-INTEROP: ").map(|(_, v)| v.trim()))
+}
+
+/// `--external-image`: one boot on a prepared disk, the verdict printed.
+fn external_boot(args: &Args, kernel: &Path, image: &Path, uuid: &str) -> Result<()> {
+    let uuid = uuid.to_ascii_lowercase();
+    if !uuid.starts_with("c4c405ee-0000-4a11-9e57-") {
+        bail!("btrfs-rootrw-interop: --external-uuid {uuid} lacks the harness prefix; the kernel would refuse it");
+    }
+    let cmdline = format!(
+        "narf.disks=root-rw root=UUID={uuid} rootflags=subvolid={} narf.rootrw_interop={} narf.rootlog",
+        args.external_subvolid, args.external_mode
+    );
+    let verdicts = [
+        "ROOTRW-INTEROP: PASS",
+        "ROOTRW-INTEROP: FAIL",
+        "ROOTRW-INTEROP: NO-ROOT",
+        "ROOTRW-INTEROP: REFUSED",
+    ];
+    let lines = boot_with(args, kernel, image, &cmdline, &[], &verdicts, 3000)?;
+    let lines: Vec<String> = lines.into_iter().map(|(_, l)| l).collect();
+    match verdict(&lines) {
+        Some(v) if v.starts_with("PASS") => {
+            println!("btrfs-rootrw-interop: external image: {v}");
+            Ok(())
+        }
+        Some(v) => bail!("btrfs-rootrw-interop: external image: {v}"),
+        None => bail!(
+            "btrfs-rootrw-interop: external image: no verdict within {} s; last lines:\n{}",
+            args.timeout,
+            lines[lines.len().saturating_sub(30)..].join("\n")
+        ),
+    }
 }
 
 fn cmdline(subvol: &str, mode: &str) -> String {
@@ -939,6 +992,10 @@ pub fn run_cmd(args: &Args) -> Result<()> {
     let kernel = super::cargo_build(&args.build, &root)?.join(&args.build.package);
     if !kernel.exists() {
         bail!("expected kernel at {}", kernel.display());
+    }
+
+    if let (Some(image), Some(uuid)) = (&args.external_image, &args.external_uuid) {
+        return external_boot(args, &kernel, image, uuid);
     }
 
     // Host flags minus BLOCK_GROUP_TREE: the full write test.

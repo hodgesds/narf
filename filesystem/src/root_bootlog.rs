@@ -97,17 +97,26 @@ pub(super) fn start(fs: &dyn FsInstance) {
         }
     };
     *crate::sync_wait::wait_sync(BOOT_LOG.lock()) = Some(log);
-    narf_scheduler::spawn_stackful(async {
-        loop {
-            {
-                let mut session = BOOT_LOG.lock().await;
-                if !flush(&mut session).await {
-                    return;
+    // Any CPU, not the boot CPU's default pin: the log must keep reaching
+    // the disk when the boot CPU itself stops scheduling, the failure the
+    // stall watchdog's buddy-CPU reports describe. The task touches only the
+    // async log lock, the kernel log store and filesystem writes, which user
+    // tasks reach from every CPU.
+    narf_scheduler::spawn_stackful_with_spec(
+        async {
+            loop {
+                {
+                    let mut session = BOOT_LOG.lock().await;
+                    if !flush(&mut session).await {
+                        return;
+                    }
                 }
+                narf_time::sleep_ms(1000).await;
             }
-            narf_time::sleep_ms(1000).await;
-        }
-    });
+        },
+        narf_scheduler::TaskSpec::kernel_any(),
+        narf_scheduler::StackfulOptions::default(),
+    );
 }
 
 async fn flush(session: &mut Option<Log>) -> bool {

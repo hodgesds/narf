@@ -249,15 +249,23 @@ impl TmigrGroup {
         }
     }
 
-    /// `tmigr_next_expired_groupevt`: pop the first event if due at `now`,
-    /// marking it ignored (it is no longer queued). Lock held.
+    /// `tmigr_next_expired_groupevt`: pop the first event if due at `now`.
+    /// Lock held.
+    ///
+    /// Dequeue only, as Linux does. The popped event is not marked ignored:
+    /// in a level-0 group it is the idle CPU's own `cpuevt`, and
+    /// [`Tmigr::handle_remote_cpu`] reads `cpuevt.ignore` as "that CPU went
+    /// active and expires its own timers" (only activation sets it), so
+    /// marking it here made the expiry of every idle CPU sharing a level-0
+    /// group with the migrator bail out, with the event already off the
+    /// queue: its due global timers stayed stranded until it woke for
+    /// something else.
     fn next_expired_groupevt(&self, g: &mut GroupState, now: u64) -> Option<&'static TmigrEvent> {
         let evt = self.next_groupevt(g)?;
         if evt.expires() > now {
             return None;
         }
         dequeue(g, evt);
-        evt.ignore.store(true, Ordering::Release);
         let _ = self.next_groupevt(g);
         Some(evt)
     }
@@ -949,7 +957,12 @@ pub fn global_next_for(cpu: usize) -> u64 {
 
 /// `tmigr_requires_handle_remote` for this CPU.
 pub fn requires_handle_remote() -> bool {
-    TMIGR.requires_handle_remote(this_cpu(), crate::timer::jiffies())
+    requires_handle_remote_on(this_cpu())
+}
+
+/// `tmigr_requires_handle_remote` for `cpu`, read from any CPU. Lock-free.
+pub fn requires_handle_remote_on(cpu: usize) -> bool {
+    TMIGR.requires_handle_remote(cpu, crate::timer::jiffies())
 }
 
 /// `tmigr_handle_remote` for this CPU (timer softirq). Returns callbacks

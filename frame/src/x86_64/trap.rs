@@ -68,6 +68,10 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 /// * **Hard lockup** — an awake CPU that has taken no timer interrupt and
 ///   passed no scheduling point for `watchdog_thresh` (10 s):
 ///   `Watchdog detected hard LOCKUP on cpu N`, once per episode.
+/// * **Executor lockup** — a halted CPU with work its idle commit would not
+///   halt over (a pending wake, a dispatchable task) and no scheduling point
+///   for 20 s: `BUG: executor lockup - CPU#N idle with runnable work for
+///   Ns!`, Linux's workqueue lockup. A wake whose kick never reached it.
 /// * **RCU stall** — a CPU holding a grace period open; one report.
 /// * **Stranded wakeup** — a parked task whose own epoll or poll set is
 ///   ready, window after window: a lost wakeup, which no idle system shows.
@@ -117,6 +121,53 @@ mod stall_wd {
             NMI_SEQ[cpu].fetch_add(1, Ordering::Release);
         }
     }
+    /// Linux `watchdog_timer_fn` (kernel/watchdog.c): a pinned hard hrtimer
+    /// on every CPU every `sample_period` (`watchdog_thresh * 2 / 5`, 4 s),
+    /// tickless idle or not. Its interrupt runs [`tick`], so the detectors
+    /// keep running when every CPU idles, and every CPU takes an interrupt
+    /// at least that often, as on Linux. Armed by each CPU's own first tick.
+    static WD_TIMER: [narf_scheduler::narf_time::hrtimer::HrTimer; MAXC] = [const {
+        narf_scheduler::narf_time::hrtimer::HrTimer::new(
+            wd_timer_fn,
+            narf_scheduler::narf_time::hrtimer::ClockId::Monotonic,
+            narf_scheduler::narf_time::hrtimer::HrtimerMode::ABS_HARD,
+        )
+    }; MAXC];
+    /// `sample_period` in ns (0 until the first tick reads the parameters,
+    /// and while the detectors are disabled).
+    static SAMPLE_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+
+    fn wd_timer_fn(
+        t: &narf_scheduler::narf_time::hrtimer::HrTimer,
+    ) -> narf_scheduler::narf_time::hrtimer::HrtimerRestart {
+        use narf_scheduler::narf_time::hrtimer::HrtimerRestart;
+        let period = SAMPLE_PERIOD_NS.load(Ordering::Relaxed);
+        if period == 0 {
+            return HrtimerRestart::NoRestart;
+        }
+        t.forward(narf_scheduler::narf_time::monotonic_ns(), period);
+        HrtimerRestart::Restart
+    }
+
+    /// Arm this CPU's watchdog hrtimer if it is not queued (`watchdog_enable`).
+    fn arm_wd_timer(cpu: usize, p: &Params) {
+        let period = p.thresh_ns.saturating_mul(2) / 5;
+        if period == 0 || cpu >= MAXC || WD_TIMER[cpu].is_queued() {
+            return;
+        }
+        SAMPLE_PERIOD_NS.store(period, Ordering::Relaxed);
+        let first = narf_scheduler::narf_time::monotonic_ns().saturating_add(period);
+        // SAFETY: the timer is a static: it never moves and is never freed.
+        unsafe {
+            narf_scheduler::narf_time::hrtimer::hrtimer_start_range_ns(
+                &WD_TIMER[cpu],
+                first,
+                0,
+                narf_scheduler::narf_time::hrtimer::HrtimerMode::ABS_PINNED,
+            )
+        };
+    }
+
     // Check cadence (whichever CPU ticks first in a window runs it).
     static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
     /// Check windows run so far (~1 s each).
@@ -206,6 +257,7 @@ mod stall_wd {
             LAST_RIP[cpu].store(rip, Ordering::Relaxed);
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
             LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
+            arm_wd_timer(cpu, &params());
         }
         // User-mode sampling profile. The census can say a task is
         // COMPUTING rather than stalled; only this says what it is
@@ -338,6 +390,7 @@ mod stall_wd {
             }
         }
         lockup_check(now_ns, &p);
+        long_run_delay_check();
         hung_task_check(now_ns, &p);
         // Past boot (window 20 ≈ 20 s uptime): early-boot readiness churn is
         // not a lost wakeup.
@@ -374,6 +427,27 @@ mod stall_wd {
         }
     }
 
+    /// `%pS` for a dump line: `name+0xoff/0xsize` when `addr` is kernel
+    /// text covered by the embedded symbol table, else `?` (user addresses,
+    /// an image without a table). Allocation-free, so safe from the tick.
+    struct Sym(u64);
+
+    impl core::fmt::Display for Sym {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut name = narf_observability::kallsyms::NameBuf::new();
+            match narf_observability::kallsyms::lookup(self.0, &mut name) {
+                Some((_, off, size)) => {
+                    let name = name.as_str().unwrap_or("?");
+                    match size {
+                        Some(size) => write!(f, "{name}+{off:#x}/{size:#x}"),
+                        None => write!(f, "{name}+{off:#x}"),
+                    }
+                }
+                None => f.write_str("?"),
+            }
+        }
+    }
+
     /// Linux's soft/hard-lockup detectors over every CPU (see the module
     /// note). The checking CPU samples the others, like the buddy detector.
     fn lockup_check(now_ns: u64, p: &Params) {
@@ -393,6 +467,8 @@ mod stall_wd {
                 halted,
                 sched_passes: passes,
                 timer_ticks: perf.user_ticks.wrapping_add(perf.kernel_ticks),
+                // Only a halted CPU is judged on it (an executor lockup).
+                runnable: halted && narf_scheduler::dbg_cpu_runnable(cpu),
             };
             let task = TaskName(last_task.load(Ordering::Relaxed));
             match LOCKUP.observe(cpu, &sample, now_ns, p.thresh_ns) {
@@ -404,6 +480,16 @@ mod stall_wd {
                         stuck_ns / 1_000_000_000
                     );
                     soft = true;
+                    dump_due |= first;
+                }
+                Some(Lockup::Stalled { stuck_ns, first }) => {
+                    // Linux `BUG: workqueue lockup - pool cpus=N ... stuck
+                    // for Ns!`: halted over work it was never kicked for.
+                    let _ = writeln!(
+                        TrapWriter,
+                        "BUG: executor lockup - CPU#{cpu} idle with runnable work for {}s! [{task}]",
+                        stuck_ns / 1_000_000_000
+                    );
                     dump_due |= first;
                 }
                 Some(Lockup::Hard { stuck_ns }) => {
@@ -421,6 +507,26 @@ mod stall_wd {
         }
         if soft && p.softlockup_panic {
             panic!("softlockup: hung tasks");
+        }
+    }
+
+    /// A task that waited at least a second between its wake and running: a
+    /// wake whose kick never reached its CPU (rescued by a later interrupt,
+    /// at worst the watchdog hrtimer) or a CPU that stopped scheduling. The
+    /// scheduler keeps each CPU's longest such delay; report and clear it.
+    fn long_run_delay_check() {
+        for cpu in 0..MAXC {
+            if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+                continue;
+            }
+            if let Some((task, ns)) = narf_scheduler::dbg_take_long_run_delay(cpu) {
+                let _ = writeln!(
+                    TrapWriter,
+                    "sched: CPU#{cpu} ran [{}] {} ms after its wake",
+                    TaskName(task),
+                    ns / 1_000_000
+                );
+            }
         }
     }
 
@@ -625,7 +731,9 @@ mod stall_wd {
             };
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} nmi_rip={nmi_rip:#x} nmi_cpl={nmi_cpl} contended_irq_lock={contended_lock:#x} -> {verdict}"
+                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} ({}) nmi_rip={nmi_rip:#x} ({}) nmi_cpl={nmi_cpl} contended_irq_lock={contended_lock:#x} -> {verdict}",
+                Sym(rip),
+                Sym(nmi_rip),
             );
             // The counts above say a halted CPU has runnable work; only the
             // per-slot state says which slot and why it is not running. An

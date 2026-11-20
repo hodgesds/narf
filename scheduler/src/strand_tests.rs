@@ -1531,8 +1531,9 @@ const WAKE_BOUND_NS: u64 = 100_000_000;
 
 /// A wake aimed at a halted CPU wakes it with one reschedule IPI: under
 /// tickless idle there is no tick to wait for, so the task runs only because
-/// of the IPI the wake sent. A CPU the idle governor keeps polling instead of
-/// halting gets none and still runs it at once.
+/// of the IPI the wake sent. A CPU the idle governor keeps polling instead —
+/// spinning, or in MWAIT on its idle word, which the wake writes — gets none
+/// and still runs it at once.
 fn smoke_scheduler_wake_to_idle_cpu_runs_by_ipi() -> TestResult {
     reset_probes();
     let me = narf_lib::percpu::current_cpu();
@@ -1559,6 +1560,9 @@ fn smoke_scheduler_wake_to_idle_cpu_runs_by_ipi() -> TestResult {
     };
     let ipis = crate::__test_resched_ipis_sent(me);
     let halted_at_wake = crate::CPU_HALTED[ap].load(Ordering::SeqCst);
+    // Halted in a polling state (MWAIT on the idle word): the wake's store
+    // to that word is what wakes it, with no IPI (Linux `set_nr_if_polling`).
+    let polling_at_wake = crate::cpu_idle_polling(ap);
     waker.wake();
     let sent = crate::__test_resched_ipis_sent(me).wrapping_sub(ipis);
     let ran = wait_for(WAKE_BOUND_NS, || polls(0) == 2);
@@ -1571,9 +1575,11 @@ fn smoke_scheduler_wake_to_idle_cpu_runs_by_ipi() -> TestResult {
     if sent > 1 {
         return TestResult::Fail("a wake to an idle CPU sent more than one IPI");
     }
-    // A CPU the idle governor keeps polling is not halted and needs no IPI
-    // (Linux `TIF_POLLING_NRFLAG`); one seen halted just before the wake does.
-    if sent == 0 && halted_at_wake {
+    // A CPU the idle governor keeps polling needs no IPI (Linux
+    // `TIF_POLLING_NRFLAG`), whether it spins or waits in MWAIT on its idle
+    // word; one seen halted in a state that does not poll just before the
+    // wake does.
+    if sent == 0 && halted_at_wake && !polling_at_wake {
         return TestResult::Fail("a wake to a CPU seen halted sent no IPI");
     }
     if !ran || ran_on != ap {

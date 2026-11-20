@@ -30,6 +30,10 @@
 #   CACHYOS_ROOT_COMPRESS=no     store file data uncompressed (default zstd:1)
 #   CACHYOS_ROOT_PACKAGES="..."  extra packages to install
 #   CACHYOS_ROOT_BTRFS_MIB=<n>   size of the btrfs partition (default 4096)
+#   CACHYOS_ROOT_WORK=<dir>      work tree: installed rootfs, staged subvolumes
+#                                and filesystems (default target/cachyos-root-work);
+#                                a variant image with extra staged files keeps
+#                                its own, so the default image never sees them
 #   CACHYOS_ROOT_SYNC=1          refresh the image's private copy of the sync
 #                                databases first: the host's copy can name a
 #                                package version the mirrors no longer carry
@@ -40,7 +44,7 @@ set -euo pipefail
 
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 OUT="${CACHYOS_ROOT_IMG:-$ROOT/target/narf-cachyos-root.img}"
-WORK="$ROOT/target/cachyos-root-work"
+WORK="${CACHYOS_ROOT_WORK:-$ROOT/target/cachyos-root-work}"
 STAGE="$WORK/stage"
 R="$STAGE/@"
 

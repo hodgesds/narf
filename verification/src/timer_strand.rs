@@ -331,6 +331,13 @@ kernel_test_in!(
 
 static TMIGR_FIRED_CPU: [AtomicUsize; 2] =
     [AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX)];
+static TMIGR_FIRED_JIFFY: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+/// Jiffies a migrated global timer may run after its expiry: the migrator's
+/// next tick and softirq round, with slack for a loaded host.
+const TMIGR_LATE_JIFFIES: u64 = 4;
 
 #[repr(C)]
 struct TmigrTimer {
@@ -342,6 +349,7 @@ fn tmigr_timer_fn(r: narf_time::timer::TimerRef) {
     // SAFETY: only `TmigrTimer` uses this callback; `timer` is its first
     // field (repr(C)); the test keeps it alive.
     let slot = unsafe { (*(r.as_ptr() as *const TmigrTimer)).slot };
+    TMIGR_FIRED_JIFFY[slot].store(narf_time::timer::jiffies(), Ordering::Release);
     TMIGR_FIRED_CPU[slot].store(narf_lib::percpu::current_cpu(), Ordering::Release);
 }
 
@@ -349,7 +357,14 @@ fn tmigr_timer_fn(r: narf_time::timer::TimerRef) {
 /// a tickless-idle AP does not count toward that AP's next event while
 /// another CPU is active, and is expired on time anyway — by this active
 /// CPU's timer softirq, or by the AP if it woke for something else first.
-/// A PINNED one wakes its own AP and fires there.
+/// Once it is due, this CPU's tick raises the timer softirq for it and
+/// reports the next event one tick out, not the due expiry in the past. A
+/// PINNED one wakes its own AP and fires there.
+///
+/// "On time" is checked: on a machine with one last-level cache the AP and
+/// this CPU share a level-0 group, where the expiry once dropped the AP's
+/// timer, and only the AP's own wake for its pinned timer 40 jiffies later
+/// ran it.
 fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
     use narf_time::timer::{self, TimerList, TIMER_PINNED};
     let me = narf_lib::percpu::current_cpu();
@@ -373,6 +388,9 @@ fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
     for s in &TMIGR_FIRED_CPU {
         s.store(usize::MAX, Ordering::Release);
     }
+    for s in &TMIGR_FIRED_JIFFY {
+        s.store(u64::MAX, Ordering::Release);
+    }
     narf_time::timer_migration::tmigr_cpu_activate();
     let global = alloc::boxed::Box::new(TmigrTimer {
         timer: TimerList::new(tmigr_timer_fn, 0),
@@ -393,6 +411,22 @@ fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
     // While this CPU is active, the idle AP leaves its global timers to it.
     let handed_over = narf_time::timer_migration::cpu_active(ap)
         || narf_time::timer_migration::global_next_for(ap) == u64::MAX;
+    // Let the global timer come due without running this CPU's softirq,
+    // then take a tick: it must raise TIMER_SOFTIRQ for the idle AP's timer
+    // (`tmigr_requires_handle_remote`) and report the next event one tick
+    // out, or the clockevent is re-armed into the past until the softirq
+    // runs. Skipped if the AP woke and ran the timer itself meanwhile.
+    // Due when its bucket is: one jiffy or more after `at` (the wheel fires
+    // a timer on the tick after its expiry), as the AP's GLOBAL base says.
+    let came_due = wait_for(1_000_000_000, || {
+        timer::__global_next_for_test(ap) <= timer::jiffies()
+            || TMIGR_FIRED_CPU[0].load(Ordering::Acquire) != usize::MAX
+    });
+    narf_time::timer::timer_tick();
+    let unran = TMIGR_FIRED_CPU[0].load(Ordering::Acquire) == usize::MAX;
+    let raised = narf_time::softirq_pending_local();
+    let next_ns = narf_time::timer::next_timer_event_ns_local();
+    let tick_ns = narf_time::monotonic_ns();
     // This CPU is active: its softirq is where idle CPUs' global timers run.
     let end = narf_time::monotonic_ns() + 1_000_000_000;
     while narf_time::monotonic_ns() < end
@@ -407,6 +441,7 @@ fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
         TMIGR_FIRED_CPU[0].load(Ordering::Acquire),
         TMIGR_FIRED_CPU[1].load(Ordering::Acquire),
     );
+    let g_jiffy = TMIGR_FIRED_JIFFY[0].load(Ordering::Acquire);
     timer::del_timer_sync(&global.timer);
     timer::del_timer_sync(&pinned.timer);
     prod.restore();
@@ -418,6 +453,24 @@ fn smoke_tmigr_global_timer_runs_on_active_cpu() -> TestResult {
     }
     if g != me && g != ap {
         return TestResult::Fail("an idle AP's global timer never fired");
+    }
+    if !came_due {
+        return TestResult::Fail("jiffies did not advance to the global timer's expiry");
+    }
+    if unran && !raised {
+        return TestResult::Fail(
+            "the migrator's tick did not raise the timer softirq for an idle AP's due timer",
+        );
+    }
+    if unran && next_ns < tick_ns {
+        return TestResult::Fail(
+            "with an idle AP's timer due, the tick reported a next event in the past",
+        );
+    }
+    if g_jiffy > at + TMIGR_LATE_JIFFIES {
+        return TestResult::Fail(
+            "an idle AP's global timer ran late: the migrator dropped it and only a later wake ran it",
+        );
     }
     TestResult::Pass
 }

@@ -273,3 +273,57 @@ fn smoke_timer_wheel_delete_from_collected_batch() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/timer", smoke_timer_wheel_delete_from_collected_batch);
+
+/// A tick that finds this CPU's pinned timer due raises `TIMER_SOFTIRQ`, and
+/// from then until the softirq runs the timer is visible only as that: the
+/// next event reported is one tick out, not the due expiry (re-arming the
+/// clockevent into the past re-fired it until the softirq ran), so whoever
+/// decides whether the softirq gets the CPU — tick preemption of a running
+/// task, the idle commit — must ask [`crate::softirq_pending_local`]. Running
+/// the softirq fires the timer and clears it.
+fn smoke_timer_raised_softirq_is_pending_not_next_event() -> TestResult {
+    let me = narf_lib::percpu::current_cpu();
+    timer::timers_prepare_cpu(me);
+    timer::run_timer_softirq();
+    let c = counted(TIMER_PINNED);
+    let at = jiffies() + 1;
+    // SAFETY: the Box outlives the timer; deleted below.
+    unsafe { add_timer_on(&c.timer, at, me) };
+    // Let it come due without running the softirq, then take the tick. Its
+    // level-0 bucket expires one jiffy after `at` (Linux `calc_index`: a
+    // wheel timer fires on the tick after its expiry), and that is when the
+    // tick finds the base due.
+    let end = crate::monotonic_ns() + 1_000_000_000;
+    while jiffies() <= at && crate::monotonic_ns() < end {
+        core::hint::spin_loop();
+    }
+    let due = jiffies() > at;
+    timer::timer_tick();
+    let pending = crate::softirq_pending_local() && timer::softirq_pending_on(me);
+    let next = timer::next_timer_event_ns_local();
+    let now = crate::monotonic_ns();
+    let unfired = c.fired.load(Ordering::Acquire) == 0;
+    let fired = run_until(|| c.fired.load(Ordering::Acquire) == 1);
+    let cleared = !timer::softirq_pending_on(me);
+    del_timer_sync(&c.timer);
+    if !due {
+        return TestResult::Skip("jiffies did not advance");
+    }
+    if !unfired {
+        return TestResult::Skip("the timer ran before the tick (interrupt-context softirq)");
+    }
+    if !pending {
+        return TestResult::Fail("a tick with a due pinned timer did not leave TIMER_SOFTIRQ pending");
+    }
+    if next < now {
+        return TestResult::Fail("with the softirq raised, the next event was reported in the past");
+    }
+    if !fired || !cleared {
+        return TestResult::Fail("running the softirq did not fire the timer and clear the raise");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/timer",
+    smoke_timer_raised_softirq_is_pending_not_next_event
+);
