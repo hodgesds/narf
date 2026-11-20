@@ -6053,23 +6053,31 @@ fn pending_signal_bits_update<R>(
     task: u64,
     update: impl FnOnce(&mut u64) -> R,
 ) -> Option<R> {
-    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
-    let slot = values.as_mut()?.entry(task).or_insert(0);
-    let before = *slot;
-    let result = update(slot);
-    note_pending_transition(before, *slot);
+    let (result, added) = {
+        let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+        let slot = values.as_mut()?.entry(task).or_insert(0);
+        let before = *slot;
+        let result = update(slot);
+        note_pending_transition(before, *slot);
+        (result, *slot & !before)
+    };
+    note_pending_added(task, added);
     Some(result)
 }
 
 fn pending_signal_bits_update_or_init<R>(task: u64, update: impl FnOnce(&mut u64) -> R) -> R {
-    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
-    let slot = values
-        .get_or_insert_with(BTreeMap::new)
-        .entry(task)
-        .or_insert(0);
-    let before = *slot;
-    let result = update(slot);
-    note_pending_transition(before, *slot);
+    let (result, added) = {
+        let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+        let slot = values
+            .get_or_insert_with(BTreeMap::new)
+            .entry(task)
+            .or_insert(0);
+        let before = *slot;
+        let result = update(slot);
+        note_pending_transition(before, *slot);
+        (result, *slot & !before)
+    };
+    note_pending_added(task, added);
     result
 }
 
@@ -6077,12 +6085,79 @@ fn pending_signal_bits_update_existing<R>(
     task: u64,
     update: impl FnOnce(&mut u64) -> R,
 ) -> Option<R> {
-    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
-    let slot = values.as_mut()?.get_mut(&task)?;
-    let before = *slot;
-    let result = update(slot);
-    note_pending_transition(before, *slot);
+    let (result, added) = {
+        let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+        let slot = values.as_mut()?.get_mut(&task)?;
+        let before = *slot;
+        let result = update(slot);
+        note_pending_transition(before, *slot);
+        (result, *slot & !before)
+    };
+    note_pending_added(task, added);
     Some(result)
+}
+
+/// `signal_wake_up`'s `TIF_SIGPENDING` half for bits just added to pending
+/// set `key`, published after the bits themselves (the set's lock has been
+/// released), so a return to user that consumes the hint and then reads the
+/// set cannot miss them.
+///
+/// A private set hints its thread. A shared set needs no hint for ordinary
+/// signals: `complete_group_signal` selects the thread that takes it and sets
+/// that thread's `signal_delivery_notified`, which the return gate also reads
+/// (other threads may not take a shared handler signal). Unblockable bits are
+/// takeable by any thread, so they hint the whole group. Allocation- and
+/// reference-free: IRQ-context raises reach here too.
+#[inline]
+fn note_pending_added(key: u64, added: u64) {
+    if added == 0 {
+        return;
+    }
+    if key & SHARED_PENDING_KEY_BIT == 0 {
+        signal_hint_task(key);
+    } else if added & UNBLOCKABLE_MASK != 0 {
+        let leader = key & !SHARED_PENDING_KEY_BIT;
+        let tgid = task_to_pid_raw(leader).unwrap_or(leader);
+        signal_hint_task(leader);
+        for_each_group_member(tgid, |member| {
+            signal_hint_task(member);
+            true
+        });
+    }
+}
+
+/// Set `task`'s `TIF_SIGPENDING` hint (see [`UserTaskCtx::sigpending`]). A
+/// task without a registered `Task` (kernel-test fixtures) has no hint; its
+/// return path takes the table-driven check unconditionally.
+#[inline]
+pub(crate) fn signal_hint_task(task: u64) {
+    let _ = crate::task::with_task_ref(task, |t| t.uctx.sigpending.store(true, Ordering::Release));
+}
+
+/// Test view of the hint: `None` for a task with no registered `Task`.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_signal_hint(task: u64) -> Option<bool> {
+    crate::task::with_task_ref(task, |t| t.uctx.sigpending.load(Ordering::Acquire))
+}
+
+/// Test hook: clear the hint as a return to user would.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_signal_hint_clear(task: u64) {
+    let _ = crate::task::with_task_ref(task, |t| t.uctx.sigpending.store(false, Ordering::Release));
+}
+
+/// The return-to-user gate on `uctx`: false only when no signal, shared-set
+/// selection or group stop can need this thread's attention.
+#[inline]
+fn signal_return_needs_work(uctx: &crate::user_task::UserTaskCtx) -> bool {
+    uctx.sigpending.load(Ordering::Acquire)
+        || uctx.signal_delivery_notified.load(Ordering::Acquire)
+        || group_stops_active()
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_signal_return_needs_work(task: u64) -> Option<bool> {
+    crate::task::with_task_ref(task, |t| signal_return_needs_work(&t.uctx))
 }
 
 fn pending_signal_bits_remove(task: u64) {
@@ -6960,15 +7035,46 @@ fn pop_sigreturn_record(task: u64) -> Option<SigReturnRecord> {
 // install (the user retook control of the mask) and swept on task exit.
 static SUSPEND_SAVED_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Records in [`SUSPEND_SAVED_MASK`], changed under its lock. Linux keeps
+/// this state per task (`TIF_RESTORE_SIGMASK` + `saved_sigmask`); a single
+/// global lock taken by every `rt_sigprocmask` in the system serialised all
+/// CPUs on it. A task's own record is published before its own later reads,
+/// so a zero count proves it has none without touching the lock.
+static SUSPEND_SAVED_MASKS: AtomicUsize = AtomicUsize::new(0);
 
 fn set_suspend_saved_mask(task: u64, mask: u64) {
     let mut g = SUSPEND_SAVED_MASK.lock();
-    g.get_or_insert_with(BTreeMap::new).insert(task, mask);
+    if g.get_or_insert_with(BTreeMap::new).insert(task, mask).is_none() {
+        SUSPEND_SAVED_MASKS.fetch_add(1, Ordering::Release);
+    }
 }
 
 fn take_suspend_saved_mask(task: u64) -> Option<u64> {
+    if SUSPEND_SAVED_MASKS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     let mut g = SUSPEND_SAVED_MASK.lock();
-    g.as_mut().and_then(|m| m.remove(&task))
+    let taken = g.as_mut().and_then(|m| m.remove(&task));
+    if taken.is_some() {
+        SUSPEND_SAVED_MASKS.fetch_sub(1, Ordering::Release);
+    }
+    taken
+}
+
+fn peek_suspend_saved_mask(task: u64) -> Option<u64> {
+    if SUSPEND_SAVED_MASKS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    SUSPEND_SAVED_MASK
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+}
+
+fn clear_suspend_saved_masks() {
+    let mut g = SUSPEND_SAVED_MASK.lock();
+    *g = Some(BTreeMap::new());
+    SUSPEND_SAVED_MASKS.store(0, Ordering::Release);
 }
 
 /// Mask to place in the current thread's user signal frame. A suspended wait
@@ -6976,9 +7082,7 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 /// only a successfully installed frame consumes the suspend record.
 pub fn signal_mask_for_delivery() -> u64 {
     let task = current_task_id();
-    let suspended = SUSPEND_SAVED_MASK.lock().as_ref()
-        .and_then(|m| m.get(&task).copied());
-    suspended.unwrap_or_else(|| signal_mask_of(task))
+    peek_suspend_saved_mask(task).unwrap_or_else(|| signal_mask_of(task))
 }
 
 #[cfg(feature = "kernel-test")]
@@ -7010,10 +7114,7 @@ narf_kernel_test::kernel_test_in!("userspace/signals", smoke_delivery_mask_prese
 /// an interrupting signal delivery consumes the saved value and arranges for
 /// sigreturn to restore it after the handler.
 pub(crate) fn install_temporary_signal_mask(task: u64, mask: u64) {
-    let already_installed = SUSPEND_SAVED_MASK
-        .lock()
-        .as_ref()
-        .is_some_and(|m| m.contains_key(&task));
+    let already_installed = peek_suspend_saved_mask(task).is_some();
     if already_installed {
         let _ = set_signal_mask_for_task(task, mask);
         return;
@@ -7057,7 +7158,7 @@ pub fn __test_signal_reset() {
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
     sigqueue_clear();
-    *SUSPEND_SAVED_MASK.lock() = Some(BTreeMap::new());
+    clear_suspend_saved_masks();
 }
 
 // ── Thread-group shared pending (Linux `signal->shared_pending`) ─────
@@ -7215,6 +7316,114 @@ fn smoke_shared_signal_selected_thread_and_consumers() -> narf_kernel_test::Test
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("userspace/signals", smoke_shared_signal_selected_thread_and_consumers);
 
+/// The return-to-user gate (Linux `TIF_SIGPENDING`) is set by every writer
+/// that can make work actionable for a thread and stays clear otherwise:
+/// a private raise (even of a blocked signal), an unblocking mask change, a
+/// shared signal's thread selection, an unblockable group signal for every
+/// thread, a job-control stop. A blocking mask change and an ordinary shared
+/// signal another thread was selected for leave it clear, so a standing
+/// blocked signal costs nothing at syscall exit.
+#[cfg(feature = "kernel-test")]
+fn smoke_signal_return_gate_follows_writers() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const LEADER: u64 = 0x5A79_0000;
+    const SIBLING: u64 = LEADER + 1;
+    const PID: u64 = LEADER + 2;
+    let leader = crate::task::Task::new_registered(LEADER, PID);
+    let sibling = crate::task::Task::new_registered(SIBLING, PID);
+    register_pid_task_mapping(PID, LEADER);
+    register_task_to_pid(SIBLING, PID);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            release_shared_pending(LEADER);
+            for tid in [SIBLING, LEADER] {
+                release_task_tables(tid);
+                crate::task::release_task(tid);
+                let _identity = PID_TASK_MUTATION.lock();
+                if let Some(map) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
+                    map.remove(&tid);
+                }
+                tgid_member_remove(tid, PID);
+            }
+            let _identity = PID_TASK_MUTATION.lock();
+            if let Some(map) = PID_TO_TASK[pid_task_shard(PID)].map.lock().as_mut() {
+                map.remove(&PID);
+            }
+        }
+    }
+    let _cleanup = Cleanup;
+    for tid in [LEADER, SIBLING] {
+        pending_signal_bits_update_or_init(tid, |_| {});
+    }
+    let quiet = |tid: u64| {
+        __test_signal_hint_clear(tid);
+        let _ = crate::task::with_task_ref(tid, |t| {
+            t.uctx.signal_delivery_notified.store(false, Ordering::Release)
+        });
+    };
+    let needs = |tid: u64| __test_signal_return_needs_work(tid) == Some(true);
+    if __test_signal_hint(LEADER) != Some(true) {
+        return TestResult::Fail("a new thread must check on its first return");
+    }
+    if group_stops_active() {
+        // Another smoke left a stop assembling; the gate is conservatively
+        // open for everyone and the clear-state assertions cannot hold.
+        return TestResult::Skip("a group stop is in flight");
+    }
+    quiet(LEADER);
+    quiet(SIBLING);
+    if needs(LEADER) || needs(SIBLING) {
+        return TestResult::Fail("a quiet thread's return gate was open");
+    }
+    // Blocking changes nothing a return must act on.
+    set_signal_mask_for_task(LEADER, sig_bit(10));
+    if needs(LEADER) {
+        return TestResult::Fail("a blocking mask change opened the gate");
+    }
+    // A private raise opens it, blocked or not (the return recalculates).
+    raise_signal_pending(LEADER, 10);
+    if !needs(LEADER) || needs(SIBLING) {
+        return TestResult::Fail("a private raise did not open exactly its thread's gate");
+    }
+    quiet(LEADER);
+    // Unblocking the pending signal opens it again.
+    set_signal_mask_for_task(LEADER, 0);
+    if !needs(LEADER) {
+        return TestResult::Fail("unblocking a pending signal left the gate closed");
+    }
+    clear_signal_pending(LEADER, 10);
+    quiet(LEADER);
+    // An ordinary shared signal opens only the selected thread's gate.
+    let _ = raise_group_signal(LEADER, 14, GroupSigInfo::None);
+    if !needs(LEADER) || needs(SIBLING) {
+        return TestResult::Fail("a shared signal did not open only the selected thread");
+    }
+    flush_group_pending_signal(LEADER, 14);
+    quiet(LEADER);
+    quiet(SIBLING);
+    // An unblockable shared signal is takeable by any thread: all open.
+    let _ = raise_group_signal(LEADER, 19, GroupSigInfo::None);
+    if !needs(LEADER) || !needs(SIBLING) {
+        return TestResult::Fail("an unblockable group signal skipped a thread");
+    }
+    clear_pending_signal_bits(shared_pending_key(LEADER), sig_bit(19));
+    quiet(LEADER);
+    quiet(SIBLING);
+    // A job-control stop is taken at the next exit to user mode.
+    insert_task_stopped(SIBLING, 19);
+    let stopped = needs(SIBLING);
+    let _ = clear_task_stopped(SIBLING);
+    if !stopped {
+        return TestResult::Fail("a job-control stop left the gate closed");
+    }
+    drop(leader);
+    drop(sibling);
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/signals", smoke_signal_return_gate_follows_writers);
+
 
 /// Consume one instance of the lowest pending signal in `set` for a
 /// `rt_sigtimedwait` caller: the private set first, then the group's shared
@@ -7272,7 +7481,15 @@ pub(crate) fn flush_group_pending_signal(task: u64, signum: u32) {
 /// that can still take them.
 #[inline]
 pub(crate) fn note_mask_change(task: u64, old: u64, new: u64) {
-    if old & !new & signal_pending_shared(task) != 0 {
+    if old & !new != 0 {
+        // `recalc_sigpending` after `__set_current_blocked`: a pending
+        // private signal may now be deliverable.
+        signal_hint_task(task);
+    }
+    // The shared-set lookups are only needed when bits actually changed;
+    // an unchanged mask (the common `sigprocmask(SIG_SETMASK, &same)` of
+    // libc's signal-blocking wrappers) touches no other table.
+    if old & !new != 0 && old & !new & signal_pending_shared(task) != 0 {
         crate::user_task::with_user_task_ctx(task, |ctx| {
             ctx.signal_delivery_notified.store(true, Ordering::Release);
         });
@@ -9452,13 +9669,20 @@ fn group_signal_notify(target: u64, key: u64, was_empty: bool) {
     signal_bits_update_or_init(&SIGNAL_RAISE_GEN, key, |generation| {
         *generation = generation.wrapping_add(1);
     });
-    let pid = task_to_pid_raw(target).unwrap_or(target);
-    let mut members = thread_group_members(pid);
-    if !members.contains(&target) {
-        members.push(target);
+    // `signalfd_notify` has nothing to wake while no signalfd exists; and
+    // the walk itself needs no snapshot vector.
+    if !crate::io_mux::signalfds_armed() {
+        return;
     }
-    for t in members {
+    let pid = task_to_pid_raw(target).unwrap_or(target);
+    let mut saw_target = false;
+    for_each_group_member(pid, |t| {
+        saw_target |= t == target;
         crate::io_mux::wake_signalfds(t);
+        true
+    });
+    if !saw_target {
+        crate::io_mux::wake_signalfds(target);
     }
 }
 
@@ -12383,6 +12607,18 @@ pub(crate) fn default_signal_delivery_restricted(
     // the empty check could erase that raise. Clear stale notifications even
     // when sigwait/signalfd on another thread consumed the final shared bit.
     let user = crate::user_task::current_user_task();
+    if let Some(ptr) = user {
+        // SAFETY: the in-flight task owns this poller-pinned context.
+        let uctx = unsafe { &*ptr };
+        // `exit_to_user_mode_loop`'s single `TIF_SIGPENDING` test.
+        if !signal_return_needs_work(uctx) {
+            return false;
+        }
+        // Consume the hint BEFORE reading the state it summarises. A raise
+        // that lands after this swap re-sets it and is seen next return; the
+        // tail below re-sets it if deliverable work is left behind.
+        uctx.sigpending.swap(false, Ordering::AcqRel);
+    }
     let notified = user.map(|ptr| {
         // SAFETY: the in-flight task owns this poller-pinned context.
         let task = unsafe { &*ptr };
@@ -12399,10 +12635,18 @@ pub(crate) fn default_signal_delivery_restricted(
     let selected = notified || signal_pending_private(task) & !signal_mask_of(task) != 0;
     let allowed = if selected { restrict } else { restrict & UNBLOCKABLE_MASK };
     let delivered = default_signal_delivery_restricted_active(ctx, syscall_no, allowed, prerewound);
-    if selected && signal_pending_of(task) & !signal_mask_of(task) != 0 {
-        if let Some(ptr) = user {
-            // SAFETY: as above; only the atomic notification is touched.
-            unsafe { &*ptr }.signal_delivery_notified.store(true, Ordering::Release);
+    if let Some(ptr) = user {
+        // SAFETY: as above; only atomic notification state is touched.
+        let uctx = unsafe { &*ptr };
+        let mask = signal_mask_of(task);
+        if selected && signal_pending_of(task) & !mask != 0 {
+            uctx.signal_delivery_notified.store(true, Ordering::Release);
+        }
+        // `recalc_sigpending`: work this return did not finish — a second
+        // pending signal, one held back by a sigwait reservation or by
+        // `restrict`, a stop still assembling — keeps the hint set.
+        if signal_pending_private(task) & !mask != 0 || task_job_stopped(task) {
+            uctx.sigpending.store(true, Ordering::Release);
         }
     }
     delivered

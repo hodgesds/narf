@@ -67,6 +67,10 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
         prior
     });
     set_suspend_saved_mask(task, prior);
+    if prior & !mask != 0 {
+        // The suspend mask may unblock a signal that is already pending.
+        signal_hint_task(task);
+    }
 
     // Pause until signal.
     sys_pause(ctx);

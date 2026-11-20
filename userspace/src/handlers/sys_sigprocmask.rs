@@ -30,8 +30,13 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     // (2) Snapshot the pre-change mask (Linux `old_set = current->blocked`
     // before the nset install). NARF's internal mask layout is bit N-1 =
     // signal N — identical to a userspace `sigset_t` — so it copies out
-    // verbatim later.
-    let old_mask = signal_bits_get(&SIGNAL_MASK, task);
+    // verbatim later. An install reads it inside its own locked update
+    // instead, so the common path takes the mask lock once.
+    let mut old_mask = if set_ptr == 0 {
+        signal_bits_get(&SIGNAL_MASK, task)
+    } else {
+        0
+    };
 
     if set_ptr != 0 {
         let mut buf = [0u8; 8];
@@ -51,26 +56,28 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // (see SIGNAL_PENDING), so the new mask installs verbatim.
         let set = u64::from_ne_bytes(buf);
         let updated = signal_bits_update(&SIGNAL_MASK, task, |slot| {
+            let old = *slot;
             match how {
                 SIG_BLOCK => *slot |= set,
                 SIG_UNBLOCK => *slot &= !set,
                 SIG_SETMASK => *slot = set,
-                _ => return false, // unreachable — `how` validated above
+                _ => return None, // unreachable — `how` validated above
             }
             // Linux strips SIGKILL/SIGSTOP from every installed mask —
             // a task must never be able to block its own fatal kill.
             *slot &= !UNBLOCKABLE_MASK;
-            true
+            Some((old, *slot))
         });
-        if updated != Some(true) {
+        let Some(Some((old, new))) = updated else {
             // No mask slot for the task (a NARF-internal condition, not a
             // Linux-reachable path); EINVAL is the least-wrong answer.
             ctx.set_return(errno_ret(EINVAL));
             return;
-        }
+        };
+        old_mask = old;
         // `__set_task_blocked` -> `retarget_shared_pending` for signals the
         // caller just blocked.
-        note_mask_change(task, old_mask, signal_bits_get(&SIGNAL_MASK, task));
+        note_mask_change(task, old, new);
         // An explicit mask install means the user retook control of the
         // mask — drop any suspend-saved record a signal-less (aborted)
         // rt_sigsuspend left behind, so a much-later delivery can't

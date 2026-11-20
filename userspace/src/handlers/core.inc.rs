@@ -13447,7 +13447,10 @@ fn clear_task_stopped(task: u64) -> Option<u32> {
 
 fn insert_task_stopped(task: u64, signum: u32) -> bool {
     if let Some(inserted) = crate::task::with_task_local(task, |task| {
-        task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0
+        let inserted = task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0;
+        // The stop is taken at this thread's next exit to user mode.
+        task.uctx.sigpending.store(true, Ordering::Release);
+        inserted
     }) {
         return inserted;
     }
@@ -15422,9 +15425,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SIGRETURN_STACK.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = SUSPEND_SAVED_MASK.lock().as_mut() {
-        m.remove(&tid);
-    }
+    let _ = take_suspend_saved_mask(tid);
 
     // Parked-waker registrations. All wakers are Arc<WakeCell>, so a
     // stale entry is "only" a leak + a spurious wake — but under task
