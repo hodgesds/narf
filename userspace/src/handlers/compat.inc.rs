@@ -3490,13 +3490,10 @@ pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
 ///
 /// This is deliberately a boundary-aware prefix strip: a chroot at `/srv/a`
 /// must not make `/srv/another/proc/self/fd/3` look like a proc magic link.
-pub(crate) fn parse_proc_fd_magic_path(task: u64, host_path: &str) -> Option<u32> {
-    parse_proc_self_fd(visible_path_of(task, host_path)?)
-}
-
-/// [`parse_proc_fd_magic_path`] with the descriptor's OWNER: `(task whose
-/// table holds it, N)`. `/proc/<pid>/fd/N` names the pid's descriptor N, not
-/// the caller's (`proc_fd_link` uses the target task's files table).
+///
+/// Returns the descriptor's OWNER with it: `(task whose table holds it, N)`.
+/// `/proc/<pid>/fd/N` names the pid's descriptor N, not the caller's
+/// (`proc_fd_link` uses the target task's files table).
 pub(crate) fn parse_proc_fd_magic_link(task: u64, host_path: &str) -> Option<(u64, u32)> {
     proc_fd_link_owner(task, visible_path_of(task, host_path)?)
 }
@@ -3522,7 +3519,7 @@ fn visible_path_of(task: u64, host_path: &str) -> Option<&str> {
 
 /// `/proc/{self,thread-self,<pid>}/{root,cwd,exe}` — the per-task magic links
 /// whose target is an ordinary pathname — as named in the task's VISIBLE
-/// namespace. Boundary-aware chroot strip, like [`parse_proc_fd_magic_path`]:
+/// namespace. Boundary-aware chroot strip, like [`parse_proc_fd_magic_link`]:
 /// a chroot at `/srv/a` must not make `/srv/another/proc/self/root` match.
 fn proc_task_link_path(task: u64, host_path: &str) -> bool {
     let visible = match root_dir_prefix(task).as_deref() {
