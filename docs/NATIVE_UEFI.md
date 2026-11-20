@@ -115,8 +115,12 @@ sudo install -D -m 0644 packaging/narf-boot-trace.conf /etc/rc.conf.d/narf-boot-
 ```
 
 Each boot writes a private `/var/log/narf-openrc-*` file with periodic samples
-of service states, process waits, Ethernet carrier and packet counters, IPv4
-addresses and routes, and TCP listeners on port 22.
+of service states, process waits, Ethernet carrier and packet counters, and
+IPv4 addresses and routes. For roughly the first ten minutes it also samples
+SSH sockets every three seconds, recording changes to the TCP state, queues,
+timer and retransmission count. The socket records use kernel uptime and
+procfs hexadecimal values. For example, state `0A` is listening and `01`
+is established. The OpenSSH authentication log records successful logins.
 
 A failure before the root mounts can leave no file. A later panic leaves
 the last committed batch on disk. The final panic report bypasses the
