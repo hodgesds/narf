@@ -104,12 +104,27 @@ destination remain the unsafe caller's responsibility.
 
 ```rust
 pub struct Deadline(Instant);
-pub fn sleep_until(d: Deadline) -> SleepUntil;
-pub fn sleep(dur: Duration)      -> SleepUntil;
-pub fn sleep_ns(ns: u64)         -> SleepUntil;
-pub fn sleep_us(us: u64)         -> SleepUntil;
-pub fn sleep_ms(ms: u64)         -> SleepUntil;
-pub fn sleep_cycles(cycles: u64) -> SleepUntil; // raw TSC ticks
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;          // init_task.timer_slack_ns
+pub fn sleep_until(d: Deadline) -> SleepUntil;           // hrtimer, default slack
+pub fn sleep(dur: Duration)      -> SleepUntil;          // fsleep
+pub fn sleep_ns(ns: u64)         -> SleepUntil;          // fsleep
+pub fn sleep_us(us: u64)         -> SleepUntil;          // fsleep
+pub fn sleep_ms(ms: u64)         -> SleepUntil;          // msleep (wheel)
+pub fn sleep_cycles(cycles: u64) -> SleepUntil;          // fsleep of the duration
+pub fn fsleep(us: u64) -> SleepUntil;                    // fsleep_ns(us * 1000)
+pub fn usleep_range(min_us: u64, max_us: u64) -> SleepUntil;
+pub fn msleep(ms: u64) -> SleepUntil;
+pub fn schedule_hrtimeout_range(d: Deadline, delta_ns: u64) -> SleepUntil;
+pub fn sleep_jiffies(j: u64) -> SleepUntil;              // schedule_timeout
+pub fn sleep_until_jiffies(expires: u64, flags: u32) -> SleepUntil; // TIMER_DEFERRABLE ok
+impl SleepUntil {
+    pub fn new(i: Instant) -> Self;                      // hrtimer, DEFAULT_TIMER_SLACK_NS
+    pub fn exact(i: Instant) -> Self;                    // schedule_hrtimeout (0 slack)
+    pub fn range(i: Instant, delta_ns: u64) -> Self;     // schedule_hrtimeout_range
+    pub fn coarse(i: Instant) -> Self;                   // msleep / schedule_timeout
+    pub fn wheel(i: Instant, flags: u32) -> Self;
+}
+pub fn timeout<F: Future>(d: Deadline, f: F) -> Timeout<F>; // wheel (wait_event_timeout)
 
 pub struct Timer;
 pub fn timer_oneshot(d: Deadline, cb: TimerCb, cap: &Cap<Timer, Arm>) -> Timer;
@@ -124,8 +139,26 @@ pub fn timer_cancel(t: Timer);
 pub fn next_deadline() -> Option<Instant>;
 ```
 
-- `sleep*` return the `SleepUntil` future (an hrtimer sleeper, §3.2.1;
-  self-wake fallback when no clockevent programmer is installed). Wall-time
+- Timer and slack follow Linux (`kernel/time/sleep_timeout.c`,
+  `include/linux/delay.h`): duration sleeps (`sleep_ns`/`_us`/`sleep`/
+  `sleep_cycles`) are `fsleep` — below `USLEEP_RANGE_UPPER_BOUND`
+  (`TICK_NSEC << 2` = 4 ms) an hrtimer with 25 % slack
+  (`usleep_range(us, us + us/4)`), from there `msleep` of the delay rounded
+  up to whole ms (the wheel, at most 12.5 % late past level 0). Absolute
+  sleeps (`sleep_until`, `SleepUntil::new`) take the default task slack
+  (50 µs, `init_task.timer_slack_ns`, as `hrtimer_nanosleep` and poll/futex
+  timeouts take `current->timer_slack_ns`). `SleepUntil::exact` is
+  `schedule_hrtimeout` (0 slack) for waits whose deadline is the point.
+  `timeout` and `msleep` sleep on the wheel (`schedule_timeout`). Linux
+  busy-waits (`udelay`) under 10 µs; an async task yields on an hrtimer
+  range instead. Slack only lengthens a sleep.
+- Each constructor records its caller (`#[track_caller]`) as the timer's arm
+  site; the hrtimer sleeper and the wheel timeout also record the arming
+  task (`hrtimer::set_current_task_hook`). `/proc/timer_list` prints both
+  (one pointer and one task id stored per arm, nothing per expiry).
+- `sleep*` return the `SleepUntil` future (an hrtimer sleeper, §3.2.1, or a
+  wheel timeout, §3.2.2; self-wake fallback when no clockevent programmer is
+  installed). Wall-time
   helpers convert
   through the calibrated ns→cycles scale, which is 1 cycle/ns until
   calibration; callers needing hardware-specified delays before frame's
@@ -158,7 +191,9 @@ pub fn next_deadline() -> Option<Instant>;
 | `hrtimers_cpu_dying` | `hrtimers_cpu_dying(cpu)`: moves every queued timer to the calling CPU |
 | `struct hrtimer_sleeper`, `hrtimer_wakeup`, `schedule_hrtimeout_range` | `SleepHandle` (`arm`, `start`, `refresh_waker`, drop = cancel); expiry wakes by reference |
 | `clock_was_set` | `clock_was_set()` re-evaluates every base; called by every wall-clock step (`clock_settime`, `settimeofday`, `ADJ_SETOFFSET`, an NTP step), not by slews |
-| `current->timer_slack_ns`, `PR_SET_TIMERSLACK` | `UserTaskCtx::timer_slack_ns` (`userspace/`), used as the range of every park timer (nanosleep, poll/select/epoll, futex) |
+| `current->timer_slack_ns`, `PR_SET_TIMERSLACK`, `/proc/<pid>/timerslack_ns` | `UserTaskCtx::timer_slack_ns` (`userspace/`), the range of nanosleep and futex park timers; 0 for SCHED_FIFO/RR (`__setscheduler_params`) |
+| `select_estimate_accuracy` (fs/select.c) | `userspace::timer_slack::select_estimate_accuracy`: poll/select/epoll timeouts park with 0.1 % of the time left (0.5 % niced), ≤ 100 ms, ≥ the task slack |
+| `timer_list.c` `print_timer` / `print_active_timers` | `snapshot_base(cpu, index, &mut Vec<TimerSnapshot>)` (one lock hold into pre-reserved space), `cpu_base_stats`, `clock_base_offset`; sleepers carry `owner_task` and `site` (Linux's former `CONFIG_TIMER_STATS` `start_pid` / `start_site`) |
 
 Users today: `SleepUntil` (every kernel `sleep*`), the user-task park timer
 behind nanosleep/clock_nanosleep, poll/ppoll/select/pselect/epoll_wait,
@@ -197,7 +232,9 @@ executor.
 | `get_next_timer_interrupt` / `tick_nohz_next_event` | `next_timer_event_ns_local()`, folded into the CPU's next clockevent event (`hrtimer::next_event_cycles_local`, `hrtimer_interrupt`, `retrigger_next_event`); DEF timers count only while the CPU is active |
 | `trigger_dyntick_cpu` | a new first non-deferrable timer on another CPU's base kicks it (`hrtimer::kick_cpu_next_event`) |
 | `timers_dead_cpu` | `timers_dead_cpu(cpu)` from CPU offline |
-| `schedule_timeout` / `msleep` | `TimeoutHandle` (`process_timeout` wakes by reference); `narf_time::msleep` |
+| `schedule_timeout` / `msleep` | `TimeoutHandle` (`process_timeout` wakes by reference); `narf_time::msleep`, `sleep_jiffies`, `sleep_until_jiffies` |
+| `round_jiffies`, `round_jiffies_relative`, `round_jiffies_up(_relative)`, `__round_jiffies(_relative)` | same names; whole-second rounding with Linux's 3-jiffy-per-CPU skew (`round_jiffies_common_at` is the pure core); `msecs_to_jiffies` |
+| (no Linux file) | `snapshot_wheel(cpu, base, &mut Vec<WheelTimerSnapshot>)`: pending wheel timers with level, bucket expiry and, for timeouts, the arming task and site — `/proc/timer_list`'s NARF wheel section |
 | `struct tmigr_group` hierarchy, `TMIGR_CHILDREN_PER_GROUP` = 8 | `timer_migration::Tmigr`: level 0 groups CPUs sharing a last-level cache, level 1 groups those by package / NUMA node, level 2 fans in by eight, level 3 is the root (four levels reach one root for up to 4096 CPUs); built at CPU online (`tmigr_cpu_online(cpu, llc, node)` from the scheduler's CPU startup) |
 | `migr_state` (active mask, migrator), `tmigr_active_up` / `tmigr_inactive_up` | per group: active children and one migrator child; going idle hands the role to an active sibling, and a group with none left goes idle in its parent; waking takes the role in a group without one and continues up. One atomic word per group (active mask, migrator, 16-bit sequence) changed only by compare-and-exchange, as Linux: activation takes no lock and leaves its queued events marked `ignore` (dropped lazily under the group lock); an inactive walk keeps a child group's bit if that child went active again meanwhile |
 | `struct tmigr_event`, `tmigr_update_events` | an idle CPU's next GLOBAL expiry is an event in its group; an idle group's first event (with its CPU) is an event in the parent. A walk carries the child's view into the parent while holding the child's lock |

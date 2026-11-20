@@ -26,6 +26,7 @@ pub mod timerqueue;
 pub mod wall;
 
 mod hrtimer_tests;
+mod sleep_tests;
 mod tests;
 mod timer_migration_tests;
 mod timer_tests;
@@ -302,40 +303,147 @@ pub fn busy_wait_cycles(cycles: u64) {
     }
 }
 
+// ── kernel sleeps (Linux kernel/time/sleep_timeout.c, include/linux/delay.h)
+//
+// Which timer a sleep arms and how much slack it gets follow Linux:
+//
+// | NARF                                         | Linux                                    | timer, slack                       |
+// |----------------------------------------------|------------------------------------------|------------------------------------|
+// | `sleep_ns` / `sleep_us` / `sleep` / `sleep_cycles` / `fsleep` | `fsleep`                 | < 4 ms: hrtimer, 25 %; else wheel  |
+// | `usleep_range`                               | `usleep_range`                           | hrtimer, `max - min`               |
+// | `sleep_ms` / `msleep`                        | `msleep`                                 | wheel (at most 12.5 % past 8 ms)   |
+// | `sleep_jiffies` / `sleep_until_jiffies`      | `schedule_timeout`, `delayed_work` timer | wheel                              |
+// | `sleep_until` / `SleepUntil::new`            | `schedule_hrtimeout_range(abs, current->timer_slack_ns)` | hrtimer, 50 µs     |
+// | `SleepUntil::range` / `schedule_hrtimeout_range` | `schedule_hrtimeout_range`           | hrtimer, explicit                  |
+// | `SleepUntil::exact`                          | `schedule_hrtimeout`                     | hrtimer, 0                         |
+// | `timeout`                                    | `wait_event_timeout` / `schedule_timeout` | wheel                             |
+//
+// Slack only ever makes a sleep longer, never shorter: an hrtimer with range
+// `[t, t + slack]` expires at the first interrupt at or after `t` that runs
+// before `t + slack`, which is what lets nearby timers share one interrupt.
+
+/// `init_task.timer_slack_ns`: the slack every Linux task, kernel threads
+/// included, starts with (50 µs), and what `PR_SET_TIMERSLACK(0)` restores.
+/// Absolute kernel sleeps ([`SleepUntil::new`]) use it as `hrtimer_nanosleep`
+/// and the `poll` / `futex` timeouts use `current->timer_slack_ns`.
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
+
+/// `TICK_NSEC` at `HZ` = 1000.
+pub const TICK_NSEC: u64 = 1_000_000_000 / timer::HZ;
+
+/// `max_slack_shift` (`include/linux/delay.h`): `fsleep` allows 25 % slack.
+const MAX_SLACK_SHIFT: u32 = 2;
+
+/// `USLEEP_RANGE_UPPER_BOUND` in ns: below `TICK_NSEC << max_slack_shift`
+/// (4 ms at HZ = 1000) a jiffy-granular `msleep` could overshoot by more than
+/// 25 %, so `fsleep` uses an hrtimer range; from there on, the wheel.
+pub const USLEEP_RANGE_UPPER_BOUND_NS: u64 = TICK_NSEC << MAX_SLACK_SHIFT;
+
+/// How a [`SleepUntil`] waits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SleepKind {
+    /// An hrtimer sleeper with range `[deadline, deadline + slack_ns]`.
+    Hrtimer { slack_ns: u64 },
+    /// A timer-wheel timeout (`schedule_timeout`) with `TIMER_*` flags.
+    Wheel { flags: u32 },
+}
+
 /// Future that yields Pending until `deadline` has passed, driven by an
-/// hrtimer sleeper on the polling CPU's base (Linux `schedule_hrtimeout`).
+/// hrtimer sleeper on the polling CPU's base (Linux
+/// `schedule_hrtimeout_range`) or by a timer-wheel timeout (Linux
+/// `schedule_timeout`), as its constructor chose (see the table above).
 ///
-/// The first pending poll arms a [`hrtimer::SleepHandle`] for the deadline;
-/// its expiry wakes the task by reference. Later polls only refresh the
-/// waker. Without a clockevent programmer (early boot, bare tests) the future
-/// self-wakes and polls. Dropping it while pending cancels the timer.
+/// The first pending poll arms the timer; its expiry wakes the task by
+/// reference. Later polls only refresh the waker. Without a clockevent
+/// programmer (early boot, bare tests) the future self-wakes and polls.
+/// Dropping it while pending cancels the timer. The constructor's caller is
+/// recorded as the timer's arm site for `/proc/timer_list`.
 #[derive(Debug)]
 pub struct SleepUntil {
     deadline: Instant,
+    kind: SleepKind,
+    site: &'static core::panic::Location<'static>,
     handle: Option<hrtimer::SleepHandle>,
-    /// `msleep`: a coarse sleep on the timer wheel instead of an hrtimer.
     coarse: Option<timer::TimeoutHandle>,
-    wheel: bool,
 }
 
 impl SleepUntil {
+    /// Sleep until `deadline` on an hrtimer with the default task slack
+    /// ([`DEFAULT_TIMER_SLACK_NS`]): Linux `schedule_hrtimeout_range(abs,
+    /// current->timer_slack_ns)`, the absolute-deadline sleep every Linux
+    /// task path (`clock_nanosleep(TIMER_ABSTIME)`, futex and poll timeouts)
+    /// takes. Use [`Self::exact`] where the deadline must not slip at all.
+    #[track_caller]
     pub fn new(deadline: Instant) -> Self {
+        Self::range(deadline, DEFAULT_TIMER_SLACK_NS)
+    }
+
+    /// `schedule_hrtimeout`: an hrtimer with no slack. For waits whose
+    /// deadline is itself the point (timing measurements, tests).
+    #[track_caller]
+    pub fn exact(deadline: Instant) -> Self {
+        Self::range(deadline, 0)
+    }
+
+    /// `schedule_hrtimeout_range(deadline, delta_ns)`: wake at the first
+    /// timer interrupt in `[deadline, deadline + delta_ns]`.
+    #[track_caller]
+    pub fn range(deadline: Instant, delta_ns: u64) -> Self {
         Self {
             deadline,
+            kind: SleepKind::Hrtimer { slack_ns: delta_ns },
+            site: core::panic::Location::caller(),
             handle: None,
             coarse: None,
-            wheel: false,
         }
     }
 
-    /// Linux `msleep`: sleep on the timer wheel (`schedule_timeout`), which
-    /// may fire up to one wheel-level granularity late but costs no
-    /// hrtimer reprogramming.
+    /// Linux `msleep` / `schedule_timeout`: sleep on the timer wheel, which
+    /// may fire up to one wheel-level granularity late (one jiffy below
+    /// 63 ms, then at most 12.5 %) but costs no hrtimer reprogramming and
+    /// shares its bucket's interrupt with every other timer in it.
+    #[track_caller]
     pub fn coarse(deadline: Instant) -> Self {
+        Self::wheel(deadline, 0)
+    }
+
+    /// [`Self::coarse`] with `TIMER_*` flags (`TIMER_DEFERRABLE`: never wake
+    /// an idle CPU for it, like `INIT_DEFERRABLE_WORK` housekeeping).
+    #[track_caller]
+    pub fn wheel(deadline: Instant, flags: u32) -> Self {
         Self {
-            wheel: true,
-            ..Self::new(deadline)
+            deadline,
+            kind: SleepKind::Wheel { flags },
+            site: core::panic::Location::caller(),
+            handle: None,
+            coarse: None,
         }
+    }
+
+    /// The deadline this sleep ends at, at the earliest.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// The hrtimer slack this sleep allows (`None` for a wheel sleep).
+    pub fn slack_ns(&self) -> Option<u64> {
+        match self.kind {
+            SleepKind::Hrtimer { slack_ns } => Some(slack_ns),
+            SleepKind::Wheel { .. } => None,
+        }
+    }
+
+    /// The `TIMER_*` flags of a wheel sleep (`None` for an hrtimer sleep).
+    pub fn wheel_flags(&self) -> Option<u32> {
+        match self.kind {
+            SleepKind::Wheel { flags } => Some(flags),
+            SleepKind::Hrtimer { .. } => None,
+        }
+    }
+
+    /// Where the sleep was constructed (its timer's arm site).
+    pub fn site(&self) -> &'static core::panic::Location<'static> {
+        self.site
     }
 }
 
@@ -360,17 +468,21 @@ impl Future for SleepUntil {
             this.coarse = None;
             return Poll::Ready(());
         }
-        if this.wheel {
-            // The first jiffy whose start is at or after the deadline.
-            let expires = timer::ns_to_jiffies(deadline_cycles_to_ns(this.deadline.as_cycles()));
-            this.coarse
-                .get_or_insert_with(|| timer::TimeoutHandle::new(0))
-                .arm(expires, cx.waker());
-            if !hrtimer::arm_callback_installed() {
-                cx.waker().wake_by_ref();
+        let slack_ns = match this.kind {
+            SleepKind::Wheel { flags } => {
+                // The first jiffy whose start is at or after the deadline.
+                let expires =
+                    timer::ns_to_jiffies(deadline_cycles_to_ns(this.deadline.as_cycles()));
+                this.coarse
+                    .get_or_insert_with(|| timer::TimeoutHandle::new(flags))
+                    .arm_from(expires, cx.waker(), this.site);
+                if !hrtimer::arm_callback_installed() {
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Pending;
             }
-            return Poll::Pending;
-        }
+            SleepKind::Hrtimer { slack_ns } => slack_ns,
+        };
         let refreshed = this
             .handle
             .as_ref()
@@ -379,10 +491,16 @@ impl Future for SleepUntil {
             // First poll, or woken before the deadline after the timer had
             // already fired: (re)arm.
             let expires = deadline_cycles_to_ns(this.deadline.as_cycles());
-            match this.handle.as_ref() {
-                Some(h) => h.start(expires, 0, hrtimer::HrtimerMode::ABS, cx.waker()),
-                None => this.handle = Some(hrtimer::SleepHandle::arm(expires, 0, cx.waker())),
-            }
+            let h = this
+                .handle
+                .get_or_insert_with(|| hrtimer::SleepHandle::new(hrtimer::ClockId::Monotonic));
+            h.start_from(
+                expires,
+                slack_ns,
+                hrtimer::HrtimerMode::ABS,
+                cx.waker(),
+                this.site,
+            );
         }
         if !hrtimer::arm_callback_installed() {
             cx.waker().wake_by_ref();
@@ -391,47 +509,109 @@ impl Future for SleepUntil {
     }
 }
 
-/// Convenience: sleep for `cycles` from now.
-pub fn sleep_cycles(cycles: u64) -> SleepUntil {
-    SleepUntil::new(Instant::now().plus_cycles(cycles))
+/// `fsleep` for a delay in ns: under [`USLEEP_RANGE_UPPER_BOUND_NS`] an
+/// hrtimer with 25 % slack (`usleep_range(us, us + us / 4)`), otherwise
+/// `msleep` of the delay rounded up to whole milliseconds.
+///
+/// Linux busy-waits (`udelay`) for 10 µs and less; an async task yields to
+/// the executor instead, so short delays take the hrtimer range too.
+#[track_caller]
+pub fn fsleep_ns(ns: u64) -> SleepUntil {
+    if ns < USLEEP_RANGE_UPPER_BOUND_NS {
+        SleepUntil::range(Deadline::after_ns(ns).as_instant(), ns >> MAX_SLACK_SHIFT)
+    } else {
+        SleepUntil::coarse(Deadline::after_ms(ns.div_ceil(1_000_000)).as_instant())
+    }
 }
 
-/// Sleep until `deadline` (spec §3.2).
+/// Linux `fsleep(usecs)`: the flexible sleep that picks the mechanism with
+/// at most 25 % slack (see [`fsleep_ns`]).
+#[track_caller]
+pub fn fsleep(us: u64) -> SleepUntil {
+    fsleep_ns(us.saturating_mul(1_000))
+}
+
+/// Linux `usleep_range(min, max)`: at least `min_us`, ending at the first
+/// timer interrupt before `max_us` (an hrtimer with range `max - min`).
+/// `max_us < min_us` gets no slack (Linux warns and does the same).
+#[track_caller]
+pub fn usleep_range(min_us: u64, max_us: u64) -> SleepUntil {
+    let delta_ns = max_us.saturating_sub(min_us).saturating_mul(1_000);
+    SleepUntil::range(Deadline::after_us(min_us).as_instant(), delta_ns)
+}
+
+/// Linux `schedule_hrtimeout_range(&deadline, delta_ns, HRTIMER_MODE_ABS)`.
+#[track_caller]
+pub fn schedule_hrtimeout_range(deadline: Deadline, delta_ns: u64) -> SleepUntil {
+    SleepUntil::range(deadline.0, delta_ns)
+}
+
+/// Linux `schedule_timeout(j)`: sleep `j` jiffies on the timer wheel.
+#[track_caller]
+pub fn sleep_jiffies(j: u64) -> SleepUntil {
+    sleep_until_jiffies(timer::jiffies().saturating_add(j), 0)
+}
+
+/// Sleep on the wheel until absolute jiffy `expires` with `TIMER_*` flags:
+/// the timer a Linux `delayed_work` re-queued for `expires` (with
+/// `round_jiffies`, or `INIT_DEFERRABLE_WORK` for `TIMER_DEFERRABLE`) arms.
+#[track_caller]
+pub fn sleep_until_jiffies(expires: u64, flags: u32) -> SleepUntil {
+    // The deadline is the start of jiffy `expires`; the wheel fires the
+    // bucket at or after it.
+    let deadline = Instant(ns_to_cycles(timer::jiffies_to_ns(expires)));
+    SleepUntil::wheel(deadline, flags)
+}
+
+/// Sleep for `cycles` counter cycles from now: [`fsleep_ns`] of the
+/// equivalent duration.
+#[track_caller]
+pub fn sleep_cycles(cycles: u64) -> SleepUntil {
+    fsleep_ns(cycles_to_ns(cycles))
+}
+
+/// Sleep until `deadline` (spec §3.2): [`SleepUntil::new`], an hrtimer with
+/// the default task slack.
+#[track_caller]
 pub fn sleep_until(deadline: Deadline) -> SleepUntil {
     SleepUntil::new(deadline.0)
 }
 
-/// Sleep for a wall-clock duration (spec §3.2). Like every ns-based
-/// constructor, this uses the calibrated scale; before calibration it is
-/// 1 cycle per ns and expires early on a >1 GHz TSC (see [`Deadline`]).
+/// Sleep for a wall-clock duration (spec §3.2): [`fsleep_ns`]. Like every
+/// ns-based constructor, this uses the calibrated scale; before calibration
+/// it is 1 cycle per ns and expires early on a >1 GHz TSC (see [`Deadline`]).
+#[track_caller]
 pub fn sleep(duration: core::time::Duration) -> SleepUntil {
-    sleep_ns(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+    fsleep_ns(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// Sleep for `ns` nanoseconds of wall-clock time. Prefer this (or
-/// [`sleep_us`] / [`sleep_ms`]) over [`sleep_cycles`] with a hand-converted
-/// count: a literal cycle count is a different duration on every CPU.
+/// Sleep for `ns` nanoseconds of wall-clock time: [`fsleep_ns`]. Prefer this
+/// (or [`sleep_us`] / [`sleep_ms`]) over [`sleep_cycles`] with a
+/// hand-converted count: a literal cycle count is a different duration on
+/// every CPU.
+#[track_caller]
 pub fn sleep_ns(ns: u64) -> SleepUntil {
-    sleep_until(Deadline::after_ns(ns))
+    fsleep_ns(ns)
 }
 
-/// Sleep for `us` microseconds of wall-clock time.
+/// Sleep for `us` microseconds of wall-clock time: Linux [`fsleep`].
+#[track_caller]
 pub fn sleep_us(us: u64) -> SleepUntil {
-    sleep_until(Deadline::after_us(us))
+    fsleep(us)
 }
 
 /// Sleep for `ms` milliseconds of wall-clock time: Linux `msleep`, a coarse
 /// sleep on the timer wheel ([`msleep`]) — it ends no earlier than `ms` and
 /// at most one wheel-level granularity later (within a jiffy or two below
-/// 63 ms).
-/// Use [`sleep_us`] / [`sleep_ns`] (hrtimers) where the millisecond matters.
+/// 63 ms). Use [`usleep_range`] where the millisecond matters.
+#[track_caller]
 pub fn sleep_ms(ms: u64) -> SleepUntil {
     msleep(ms)
 }
 
 /// Linux `msleep`: a coarse sleep on the timer wheel, which may end up to
-/// one wheel-level granularity late. For waits whose length does not
-/// matter to the millisecond; use [`sleep_ms`] otherwise.
+/// one wheel-level granularity late.
+#[track_caller]
 pub fn msleep(ms: u64) -> SleepUntil {
     SleepUntil::coarse(Deadline::after_ms(ms).0)
 }
@@ -513,16 +693,20 @@ pub struct Elapsed;
 /// `Err(Elapsed)` if the deadline passes first. Cancels the
 /// inner future via Drop on timeout.
 ///
-/// Cheap-when-not-firing: when the inner future completes
-/// promptly the timer-wheel slot is cancelled in `drop` without
-/// the wheel ever having to fire. The combinator polls the inner
-/// future first on each round so a ready inner short-circuits
-/// the deadline check.
+/// The deadline is a timer-wheel timeout, as Linux's
+/// `wait_event_timeout` / `wait_for_completion_timeout` are
+/// (`schedule_timeout`): it ends no earlier than `deadline` and at most
+/// one wheel-level granularity later. Cheap-when-not-firing: when the
+/// inner future completes promptly the timer-wheel slot is cancelled in
+/// `drop` without the wheel ever having to fire. The combinator polls the
+/// inner future first on each round so a ready inner short-circuits the
+/// deadline check.
 #[inline]
+#[track_caller]
 pub fn timeout<F: Future>(deadline: Deadline, fut: F) -> Timeout<F> {
     Timeout {
         fut,
-        sleep: SleepUntil::new(deadline.as_instant()),
+        sleep: SleepUntil::coarse(deadline.as_instant()),
     }
 }
 
