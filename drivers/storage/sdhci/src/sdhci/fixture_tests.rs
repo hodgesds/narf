@@ -2364,9 +2364,11 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     }
     // Mode selection matrix (Linux `sd_update_bus_speed_mode`
     // preference: SDR104 > DDR50 > SDR50 > SDR25).
+    // Caps_1 0x3 is SDR50 + SDR104 without DDR50, so the base clock
+    // alone decides between SDR25 and SDR50 there.
     let cases: [(u8, u32, u32, Option<UhsMode>); 8] = [
-        (0x1F, 0x7, 50_000_000, Some(UhsMode::Sdr25)),
-        (0x1F, 0x7, 100_000_000, Some(UhsMode::Sdr50)),
+        (0x1F, 0x3, 50_000_000, Some(UhsMode::Sdr25)),
+        (0x1F, 0x3, 100_000_000, Some(UhsMode::Sdr50)),
         (0x1F, 0x7, 208_000_000, Some(UhsMode::Sdr104)),
         (0x1F, 0x4, 50_000_000, Some(UhsMode::Ddr50)),
         (0x1F, 0x5, 100_000_000, Some(UhsMode::Ddr50)),
