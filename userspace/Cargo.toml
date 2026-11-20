@@ -74,6 +74,12 @@ syscall-trace = []
 # lines exist to measure — an observer effect large enough to invalidate the
 # number. This lets the gap be measured on an otherwise quiet boot.
 unix-latency-trace = []
+# Syscall-path and procfs-read microbenchmarks (`hotpath_bench.rs`), emitted
+# as raw samples for the host-side verification §8 statistics. Off by default
+# so ordinary kernel-test suites never pay for them; enable with
+# `cargo xtask test --features narf-userspace/hotpath-bench --subsystem
+# userspace/hotpath_bench`.
+hotpath-bench = []
 
 # In-kernel test harness build. The `abi_*_tests.rs` modules are compiled
 # unconditionally (they register into the `narf.tests` link section), so

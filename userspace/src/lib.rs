@@ -195,6 +195,7 @@ mod abi_udp_gso_tests;
 mod abi_udp_tests;
 mod abi_unix_stream_tests;
 mod abi_vconsole_tests;
+mod hotpath_bench;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
