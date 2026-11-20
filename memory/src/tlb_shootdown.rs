@@ -1422,7 +1422,7 @@ fn smoke_tlb_owner_root_racing_load_never_missed() -> TestResult {
         }
         // After the announcement (at >= 1) the CPU holds or is loading the
         // root: it must be interrupted. Before it, the claim pays the debt.
-        if !(claimed || interrupted) || (at >= 1 && !interrupted) {
+        if !interrupted && (!claimed || at >= 1) {
             return TestResult::Fail("a sender and a racing loader both missed each other");
         }
     }
