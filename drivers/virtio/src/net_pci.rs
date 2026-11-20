@@ -928,6 +928,19 @@ fn malformed_tx() -> VirtioPciError {
 /// shifts the IP header by `VLAN_TAG_LEN`, so checksum/TSO layout
 /// computed over an inserted tag stays correct. A second tag
 /// (Q-in-Q) falls through to the rejection arm — one tag only.
+/// The IP header offset and inner EtherType of an Ethernet frame, past an
+/// optional 802.1Q tag. Callers have checked the frame holds them (as
+/// `l4_checksum_layout` does).
+fn l3_layout(frame: &[u8]) -> (usize, u16) {
+    match u16::from_be_bytes([frame[12], frame[13]]) {
+        ETHERTYPE_VLAN => (
+            ETH_HDR_LEN + VLAN_TAG_LEN,
+            u16::from_be_bytes([frame[16], frame[17]]),
+        ),
+        outer => (ETH_HDR_LEN, outer),
+    }
+}
+
 fn l4_checksum_layout(
     frame: &[u8],
     kind: narf_net::L4CsumKind,
@@ -935,18 +948,12 @@ fn l4_checksum_layout(
     if frame.len() < ETH_HDR_LEN {
         return Err(malformed_tx());
     }
-    let outer = u16::from_be_bytes([frame[12], frame[13]]);
-    let (l2, ethertype) = if outer == ETHERTYPE_VLAN {
-        if frame.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
-            return Err(malformed_tx());
-        }
-        (
-            ETH_HDR_LEN + VLAN_TAG_LEN,
-            u16::from_be_bytes([frame[16], frame[17]]),
-        )
-    } else {
-        (ETH_HDR_LEN, outer)
-    };
+    if u16::from_be_bytes([frame[12], frame[13]]) == ETHERTYPE_VLAN
+        && frame.len() < ETH_HDR_LEN + VLAN_TAG_LEN
+    {
+        return Err(malformed_tx());
+    }
+    let (l2, ethertype) = l3_layout(frame);
     if frame.len() < l2 + IPV4_MIN_HDR_LEN {
         return Err(malformed_tx());
     }
@@ -1150,8 +1157,9 @@ pub(crate) fn tx_header_for_frame(
             // path, mislabeling v6 super-frames as TCPV4 with a seed
             // read from the wrong offsets. A v6 frame with only TSO4
             // negotiated is now rejected instead of mis-emitted.
-            let ip = ETH_HDR_LEN;
-            match u16::from_be_bytes([frame[12], frame[13]]) {
+            // Past an optional 802.1Q tag, as `l4_checksum_layout` read it.
+            let (ip, ethertype) = l3_layout(frame);
+            match ethertype {
                 0x0800 => {
                     if !profile.tso4_enabled() {
                         return Err(malformed_tx());
@@ -1234,8 +1242,8 @@ pub(crate) fn tx_header_for_frame(
             if mss == 0 || frame.len() <= header_len {
                 return Err(malformed_tx());
             }
-            let ip = ETH_HDR_LEN;
-            let seed = match u16::from_be_bytes([frame[12], frame[13]]) {
+            let (ip, ethertype) = l3_layout(frame);
+            let seed = match ethertype {
                 0x0800 => ipv4_pseudo_seed(
                     [
                         frame[ip + 12],
@@ -4665,7 +4673,8 @@ mod tx_tests {
             frame.fill(0);
             frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
             frame[14] = 0x60;
-            frame[16..18].copy_from_slice(&((FRAME_LEN - 54) as u16).to_be_bytes());
+            // IPv6 payload length is header bytes 4..6.
+            frame[18..20].copy_from_slice(&((FRAME_LEN - 54) as u16).to_be_bytes());
             frame[20] = 6;
             frame[22..38]
                 .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
