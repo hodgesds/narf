@@ -1767,6 +1767,7 @@ fn store_all(cells: &[AtomicU32; MAX_CPUS], values: &[u32; MAX_CPUS]) {
 
 /// The parsed tables [`__reset_for_test`] clears, as a smoke found them.
 /// Restored by [`TestStateScope`]'s drop.
+#[derive(Debug)]
 pub struct TestStateScope {
     cpu_node: [u32; MAX_CPUS],
     processor_uids: [u32; MAX_CPUS],
