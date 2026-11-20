@@ -206,8 +206,9 @@ pub fn notify_thread_exit(tid: u64) {
     };
     if let Some(st) = st {
         st.exited.store(true, Ordering::Release);
+        // The pidfd's own wait queue is the whole wake (`do_notify_pidfd`
+        // wakes `pid->wait_pidfd`), not a wake-all of every parked poller.
         st.readiness.set(POLL_IN, 0);
-        narf_net::readiness::notify(0);
     }
 }
 
@@ -239,7 +240,8 @@ pub fn notify_process_exit(pid: u64, leader_tid: u64) -> bool {
                 slot.insert(record);
             }
             drop(g);
-            narf_net::readiness::notify(0);
+            // No pidfd exists yet, so nobody can be waiting on one; a pidfd
+            // minted later starts from the recorded exit.
             return false;
         }
     }
@@ -264,15 +266,11 @@ pub fn notify_exit(pid: u64) -> bool {
         // between this set and its own arm still observes POLL_IN via the level.
         st.readiness.set(POLL_IN, 0);
     }
-    // Wake any task parked in epoll_wait/poll on a pidfd: systemd 257 tracks
-    // every service child by epolling its pidfd for POLLIN-on-exit, and blocks
-    // in epoll_wait until then. Flipping `exited` above only makes a fresh
-    // poll_readiness return POLLIN — without this wake the parked epoll_wait
-    // never re-scans, so every service job hangs "running" forever. Fire the
-    // readiness bridge (wake-all; the woken tasks re-query poll_readiness).
-    // Unconditional so a pidfd minted AFTER this exit still races correctly via
-    // its own already-exited state.
-    narf_net::readiness::notify(0);
+    // systemd 257 tracks every service child by epolling its pidfd for
+    // POLLIN-on-exit. The `set` above wakes exactly the poll/epoll waiters
+    // armed on this pidfd (poll and epoll both arm the cell), which is Linux's
+    // `wake_up_all(&pid->wait_pidfd)`. The wake-all `notify(0)` that used to
+    // follow re-ran every parked poller in the system on every process exit.
     found
 }
 
