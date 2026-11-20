@@ -3147,6 +3147,21 @@ pub(crate) fn abort_restart_pending_park_state(task: u64) {
             .load(core::sync::atomic::Ordering::Acquire);
         crate::select::abort_interrupted(task, (deadline != 0).then_some(deadline));
         crate::poll::abort_interrupted(task, uc);
+        // An epoll_wait completed here never reaches its own teardown: take
+        // its wait node off the instance and hand on any event it was woken
+        // for (`ep_poll`'s wait entry leaves the queue on every return).
+        crate::epoll::abort_task_wait(&uc.epoll_wait_node);
+        // The park routing flags belong to the call that just ended. Left
+        // set, the task's next park inherited them: a stale `epoll_wait_fd`
+        // sent a poll's lost-wake recheck to the old epoll instance, and a
+        // stale `durable_io_wait` made the next epoll_wait skip the generic
+        // I/O waiter its fallback registrations depend on.
+        uc.net_io_wait
+            .store(false, core::sync::atomic::Ordering::Release);
+        uc.durable_io_wait
+            .store(false, core::sync::atomic::Ordering::Release);
+        uc.epoll_wait_fd
+            .store(0, core::sync::atomic::Ordering::Release);
         // SAFETY: the in-flight task's poller-pinned ctx; atomics only.
         let pending = unsafe {
             (*uctx)
@@ -14930,6 +14945,9 @@ fn park_reexecute_on_io_until(
         // check→park lost-wake guard.
         uc.futex_uaddr.store(0, Ordering::Release);
         uc.net_io_wait.store(true, Ordering::Release);
+        // Not an epoll park: a stale `epoll_wait_fd` from an interrupted
+        // epoll_wait would route this park's recheck to that epoll instance.
+        uc.epoll_wait_fd.store(0, Ordering::Release);
         uc.durable_io_wait
             .store(durable_io_wait, Ordering::Release);
         uc.epoll_park_gen
