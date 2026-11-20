@@ -96,6 +96,7 @@ impl Igc {
     }
     pub fn request_admin(&self, up: bool) {
         self.admin_up.store(up, Ordering::Release);
+        self.kick_maintenance();
     }
     pub(super) fn maintain_admin(&self) {
         let desired = self.admin_up.load(Ordering::Acquire);
@@ -997,10 +998,12 @@ impl narf_bus::pcie_recovery::ErrorCallback for Igc {
     }
     fn slot_reset(&self) -> narf_bus::pcie_recovery::PciErsResult {
         self.recovery_requested.store(true, Ordering::Release);
+        self.kick_maintenance();
         narf_bus::pcie_recovery::PciErsResult::Recovered
     }
     fn resume(&self) {
         self.recovery_requested.store(true, Ordering::Release);
+        self.kick_maintenance();
     }
 }
 
