@@ -787,6 +787,10 @@ mod module_wireless_tests;
 #[path = "module_probe_tests.rs"]
 mod module_probe_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "module_dt_tests.rs"]
+mod module_dt_tests;
+
 fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
     // A reprobe replaces the old ownership record only after disabling the
     // command bits it enabled.
