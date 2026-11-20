@@ -109,6 +109,58 @@ fn smoke_abi_pathx_chmod_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_chmod_pos);
 
+fn smoke_setattr_via_var_run_symlink() -> TestResult {
+    with_memfs("/run", "run", &[("utmp", b"")], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let var = registry()
+            .mount(&auth, "/var", MemFs::with_seeds("var", &[]))
+            .map_err(|_| "mounting /var failed")?;
+        let result = (|| {
+            if call_symlink(b"../run\0".as_ptr() as u64, b"/var/run\0".as_ptr() as u64) != Some(0) {
+                return Err("creating /var/run symlink failed");
+            }
+            let alias = b"/var/run/utmp\0".as_ptr() as u64;
+            if call_chown(alias, u32::MAX as u64, 22) != Some(0)
+                || file_owners("/run/utmp") != Some((0, 22))
+            {
+                return Err("chgrp through /var/run did not update the /run inode");
+            }
+            if call_chmod(alias, 0o664) != Some(0) || file_perms("/run/utmp") != Some(0o664) {
+                return Err("chmod through /var/run did not update the /run inode");
+            }
+            if call_lchown(alias, 0, 23) != Some(0) || file_owners("/run/utmp") != Some((0, 23)) {
+                return Err("AT_SYMLINK_NOFOLLOW must still follow the intermediate link");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&var, "/var");
+        result
+    })
+}
+kernel_test_in!("syscall_abi/setattr", smoke_setattr_via_var_run_symlink);
+
+fn smoke_setattr_symlink_dotdot_at_process_root() -> TestResult {
+    let result = with_memfs("/jail", "jail", &[("file", b"")], || {
+        if call(Syscall::Chroot.raw(), a0(b"/jail\0".as_ptr() as u64)) != Some(0) {
+            return Err("chroot failed");
+        }
+        let link = b"/link\0".as_ptr() as u64;
+        if call_symlink(b"../file\0".as_ptr() as u64, link) != Some(0) {
+            return Err("creating relative link in the process root failed");
+        }
+        if call_chmod(link, 0o620) != Some(0) || file_perms("/jail/file") != Some(0o620) {
+            return Err("relative symlink at process root must resolve inside that root");
+        }
+        Ok(())
+    });
+    crate::handlers::__test_root_dir_reset();
+    result
+}
+kernel_test_in!(
+    "syscall_abi/setattr",
+    smoke_setattr_symlink_dotdot_at_process_root
+);
+
 fn smoke_abi_pathx_chmod_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";

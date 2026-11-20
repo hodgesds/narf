@@ -132,7 +132,9 @@ and the ELF `AT_RANDOM` aux vector. The pool's entropy contract (issue
   the boot console line, and the kernel log announce a Conditioned or
   VirtioRng seed or an unseeded pool; `RNDGETENTCNT` and
   `/proc/sys/kernel/random/entropy_avail` report `entropy_avail_bits()`
-  (4096 seeded, 0 unseeded) rather than constants.
+  (4096 seeded, 0 unseeded) rather than constants. The read-only
+  `/proc/sys/kernel/random/poolsize` reports that capacity in bits
+  independently of readiness, so seedrng can size its saved seed.
 
 ### 3.0b Inode timestamps
 

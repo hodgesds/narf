@@ -1022,11 +1022,14 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
                 // straight out of the sandbox the caller asked for.
                 match scope.as_ref().filter(|s| s.in_root) {
                     Some(sc) => normalize_abs(&alloc::format!("{}/{}", sc.root, target)),
-                    None => apply_chroot(target),
+                    None => apply_chroot(&normalize_abs(target)),
                 }
-            } else if parent.is_empty() {
-                normalize_abs(&alloc::format!("/{target}"))
+            } else if let Some(visible) = visible_path_of(current_task_id(), parent) {
+                // Resolve ".." in the caller's view, where "/" is the
+                // process root, before converting back to a mount-table path.
+                apply_chroot(&normalize_abs(&alloc::format!("{visible}/{target}")))
             } else {
+                // A directory fd retained across chroot may start outside it.
                 normalize_abs(&alloc::format!("{parent}/{target}"))
             };
             let tail = &components[index + 1..];
@@ -1634,16 +1637,12 @@ fn path_stat_of(ops: &dyn narf_filesystem::FileOps) -> PathStat {
     (ops.stat(), ops.ino(), ops.rdev(), uid, gid, ops.inode_attrs())
 }
 
-/// Where a FOLLOWED `/proc/{self,thread-self,<pid>}/fd/N` lands for a
-/// syscall that changes the inode itself (`chmod`, `chown`). Following the
-/// magic link installs the descriptor's own file (`proc_fd_link` ->
-/// `nd_jump_link`), so the change applies to what the descriptor names —
-/// a pipe or a socket included, which has no path to walk.
-pub(crate) enum ProcFdJump {
+/// The object a pathname-based chmod or chown acts on.
+enum SetattrTarget {
     /// One of the caller's own descriptors: act on it as `AT_EMPTY_PATH`
     /// would.
     Own(u32),
-    /// Another process's descriptor, as its file's caller-view path.
+    /// Resolved path in the caller's mount namespace, in host coordinates.
     Path(alloc::string::String),
 }
 
@@ -1651,7 +1650,7 @@ pub(crate) enum ProcFdJump {
 /// being followed. `None` for anything else, and for a descriptor the table
 /// does not hold — that is no entry of the directory, and the ordinary walk
 /// reports ENOENT for it as Linux's lookup does.
-pub(crate) fn proc_fd_jump(task: u64, user_path: &str) -> Option<ProcFdJump> {
+fn proc_fd_jump(task: u64, user_path: &str) -> Option<SetattrTarget> {
     let own = user_path
         .strip_prefix("/proc/self/fd/")
         .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"));
@@ -1660,10 +1659,35 @@ pub(crate) fn proc_fd_jump(task: u64, user_path: &str) -> Option<ProcFdJump> {
             let n = n.parse::<u32>().ok()?;
             fd::with_table(task, |t| t.get(n).is_some())
                 .unwrap_or(false)
-                .then_some(ProcFdJump::Own(n))
+                .then_some(SetattrTarget::Own(n))
         }
-        None => proc_fd_magic_target(task, user_path).map(ProcFdJump::Path),
+        None => proc_fd_magic_target(task, user_path)
+            .map(|target| SetattrTarget::Path(resolve_cwd_path(task, &target))),
     }
+}
+
+fn resolve_setattr_at(
+    task: u64,
+    dirfd: i64,
+    raw: &str,
+    follow_final: bool,
+) -> Result<SetattrTarget, i64> {
+    let effective = resolve_at_path(task, dirfd, raw)?;
+    let path = resolve_cwd_path(task, &effective);
+    if follow_final {
+        if let Some(jump) = visible_path_of(task, &path).and_then(|p| proc_fd_jump(task, p)) {
+            return Ok(jump);
+        }
+    }
+    // A link such as /var/run -> ../run can select a different mount.
+    // Expand it before inode lookup and the target mount's write check.
+    let resolved = resolve_vfs_symlink_path_scoped(&path, follow_final)?;
+    if follow_final && resolved != path {
+        if let Some(jump) = visible_path_of(task, &resolved).and_then(|p| proc_fd_jump(task, p)) {
+            return Ok(jump);
+        }
+    }
+    Ok(SetattrTarget::Path(resolved))
 }
 
 /// A node found by [`user_path_lookup`].

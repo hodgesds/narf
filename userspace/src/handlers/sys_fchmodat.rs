@@ -72,41 +72,26 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
         return;
     }
 
-    let effective = match resolve_at_path(task, args.arg0 as i64, &raw) {
-        Ok(path) => path,
+    let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let path = match resolve_setattr_at(task, args.arg0 as i64, &raw, follow_final) {
+        Ok(SetattrTarget::Path(path)) => path,
+        Ok(SetattrTarget::Own(fd)) => {
+            fchmod_fd(ctx, fd, args.arg2, true);
+            return;
+        }
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
-    let mut path = resolve_cwd_path(task, &effective);
-    let mut follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
-    // A followed `/proc/self/fd/N` changes the descriptor's own file
-    // (`nd_jump_link`), which the walk below cannot reach: it would take
-    // the procfs link's text literally. systemd's `fchmod_opath` falls back
-    // to `chmod("/proc/self/fd/N")` on kernels without fchmodat2.
-    if follow_final {
-        match proc_fd_jump(task, &resolve_cwd_path_user(task, &effective)) {
-            Some(ProcFdJump::Own(fd)) => {
-                fchmod_fd(ctx, fd, args.arg2, true);
-                return;
-            }
-            Some(ProcFdJump::Path(target)) => {
-                path = resolve_cwd_path(task, &target);
-                follow_final = false;
-            }
-            None => {}
-        }
-    }
 
     // `do_fchmodat`: `user_path_at` first, so a missing name is ENOENT
     // (ENOTDIR for a file used as a directory) even on a read-only mount;
     // only then `chmod_common` -> `mnt_want_write` -> `notify_change`.
     //
-    // Follow a final symlink by default, exactly as Linux's LOOKUP_FOLLOW
-    // path does. Ext2 also exposes directories through FileOps, so this arm
-    // intentionally precedes the dir-only fallback.
-    if let Some(file) = resolve_file_absolute_ext(&path, follow_final) {
+    // Ext2 also exposes directories through FileOps, so this arm precedes
+    // the dir-only fallback.
+    if let Some(file) = resolve_file_absolute_ext(&path, false) {
         // A mode change is a write to the inode: EROFS on a read-only mount.
         if let Err(errno) = mnt_want_write(&path) {
             ctx.set_return(SyscallReturn::ok(errno as u64));
