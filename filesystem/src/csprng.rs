@@ -736,6 +736,9 @@ pub fn seed_class() -> Option<SeedClass> {
     }
 }
 
+/// Capacity reported by the Linux random-device and sysctl interfaces, in bits.
+pub const POOL_BITS: u32 = 4096;
+
 /// Bits of entropy userspace readiness queries report
 /// (`RNDGETENTCNT`, `/proc/sys/kernel/random/entropy_avail`): the
 /// full 4096-bit pool size once seeded, 0 while unseeded — the real
@@ -743,7 +746,7 @@ pub fn seed_class() -> Option<SeedClass> {
 /// fabricate.
 pub fn entropy_avail_bits() -> u32 {
     if is_seeded() {
-        4096
+        POOL_BITS
     } else {
         0
     }

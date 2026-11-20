@@ -894,7 +894,12 @@ chain that already exists returns `EEXIST` under `NLM_F_EXCL`, `EOPNOTSUPP`
 under `NLM_F_REPLACE`, and otherwise succeeds as a no-op update
 (`nf_tables_newtable` / `nf_tables_newchain`). nf_tables requests for a
 family other than IPv4 return `EOPNOTSUPP` (`nft_supported_family`), except
-that `NFPROTO_UNSPEC` table/chain dumps list the IPv4 ruleset. Rule-expression and
+that `NFPROTO_UNSPEC` table/chain dumps list the IPv4 ruleset.
+`NFT_MSG_GETGEN` returns the namespace's nonzero ruleset generation as
+`NFTA_GEN_ID` in a single `NFT_MSG_NEWGEN` reply. Table and chain records
+carry the low 16 bits of their snapshot's generation in `nfgenmsg.res_id`.
+An nfnetlink transaction beginning with `NFNL_MSG_BATCH_BEGIN` returns
+`EOPNOTSUPP` without applying its enclosed mutations. Rule-expression and
 conntrack mutations plus unsupported nfnetlink subsystems return
 `EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
 

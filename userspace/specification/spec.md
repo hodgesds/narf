@@ -1243,6 +1243,8 @@ spelling. `execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantic
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
+Intermediate symlinks can cross mounts in the caller's mount namespace.
+The resolved inode's mount supplies the read-only check.
 Legacy `fchmodat` always uses zero flags; `fchmodat2` supports
 `AT_EMPTY_PATH`, including `AT_FDCWD` naming cwd. Chmod preserves all `07777`
 mode bits. Chown preserves a field requested as `(uid_t)-1` and clears setuid

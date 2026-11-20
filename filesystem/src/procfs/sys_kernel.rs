@@ -794,6 +794,10 @@ fn read_entropy_avail() -> String {
     format!("{}\n", crate::csprng::entropy_avail_bits())
 }
 
+fn read_poolsize() -> String {
+    format!("{}\n", crate::csprng::POOL_BITS)
+}
+
 fn read_random_uuid() -> String {
     format!("{}\n", fmt_uuid(cheap_uuid_bytes()))
 }
@@ -1025,6 +1029,12 @@ pub fn register_all() {
         perms: 0o555,
     });
     // kernel/random/*
+    register_sysctl(SysctlEntry {
+        path: "kernel/random/poolsize",
+        read: read_poolsize,
+        write: None,
+        perms: 0o444,
+    });
     register_sysctl(SysctlEntry {
         path: "kernel/random/entropy_avail",
         read: read_entropy_avail,
@@ -1527,6 +1537,14 @@ kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_printk_default);
 
 fn smoke_kernel_entropy_avail_default() -> TestResult {
     register_all();
+    let Some(pool) = lookup_sys("kernel/random/poolsize") else {
+        return TestResult::Fail("kernel/random/poolsize missing");
+    };
+    if read_sys("kernel/random/poolsize") != Some(format!("{}\n", crate::csprng::POOL_BITS))
+        || pool.write(b"0\n").is_ok()
+    {
+        return TestResult::Fail("random pool capacity must be readable in bits and read-only");
+    }
     match read_sys("kernel/random/entropy_avail") {
         Some(s)
             if s == format!("{}\n", crate::csprng::entropy_avail_bits())

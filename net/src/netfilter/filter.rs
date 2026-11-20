@@ -27,12 +27,23 @@ pub enum RulesetError {
     NotEmpty,
 }
 
-/// Builtin filter table — the single global rule store. Stage-3 only
-/// implements one table; nftables-style multi-table support is a
-/// straightforward extension.
+#[derive(Debug)]
+struct Ruleset {
+    tables: Vec<Table>,
+    generation: u32,
+}
+
+impl Ruleset {
+    fn changed(&mut self) {
+        // Linux reserves zero for an unspecified generation.
+        self.generation = self.generation.wrapping_add(1).max(1);
+    }
+}
+
+/// Tables and their generation belong to the same network namespace.
 #[derive(Debug)]
 pub struct Filter {
-    inner: IrqSafeSpinLock<Vec<Table>>,
+    inner: IrqSafeSpinLock<Ruleset>,
 }
 
 impl Default for Filter {
@@ -44,7 +55,10 @@ impl Default for Filter {
 impl Filter {
     pub const fn new() -> Self {
         Self {
-            inner: IrqSafeSpinLock::new(Vec::new()),
+            inner: IrqSafeSpinLock::new(Ruleset {
+                tables: Vec::new(),
+                generation: 1,
+            }),
         }
     }
 
@@ -53,7 +67,8 @@ impl Filter {
     where
         F: FnOnce(&mut Table) -> R,
     {
-        let mut tables = self.inner.lock();
+        let mut ruleset = self.inner.lock();
+        let tables = &mut ruleset.tables;
         let idx = tables.iter().position(|t| t.name == name);
         let i = match idx {
             Some(i) => i,
@@ -62,7 +77,9 @@ impl Filter {
                 tables.len() - 1
             }
         };
-        f(&mut tables[i])
+        let result = f(&mut tables[i]);
+        ruleset.changed();
+        result
     }
 
     /// Add a rule. Auto-creates the table and chain.
@@ -74,16 +91,19 @@ impl Filter {
     }
 
     pub fn create_table(&self, name: &str) -> Result<(), RulesetError> {
-        let mut tables = self.inner.lock();
+        let mut ruleset = self.inner.lock();
+        let tables = &mut ruleset.tables;
         if tables.iter().any(|table| table.name == name) {
             return Err(RulesetError::AlreadyExists);
         }
         tables.push(Table::new(name.to_string()));
+        ruleset.changed();
         Ok(())
     }
 
     pub fn delete_table(&self, name: &str) -> Result<(), RulesetError> {
-        let mut tables = self.inner.lock();
+        let mut ruleset = self.inner.lock();
+        let tables = &mut ruleset.tables;
         let index = tables
             .iter()
             .position(|table| table.name == name)
@@ -92,12 +112,14 @@ impl Filter {
             return Err(RulesetError::NotEmpty);
         }
         tables.remove(index);
+        ruleset.changed();
         Ok(())
     }
 
     pub fn create_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
-        let mut tables = self.inner.lock();
-        let table = tables
+        let mut ruleset = self.inner.lock();
+        let table = ruleset
+            .tables
             .iter_mut()
             .find(|candidate| candidate.name == table)
             .ok_or(RulesetError::NotFound)?;
@@ -113,12 +135,14 @@ impl Filter {
             _ => HookPoint::LocalIn,
         };
         table.chains.push(Chain::new(chain.to_string(), hook));
+        ruleset.changed();
         Ok(())
     }
 
     pub fn delete_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
-        let mut tables = self.inner.lock();
-        let table = tables
+        let mut ruleset = self.inner.lock();
+        let table = ruleset
+            .tables
             .iter_mut()
             .find(|candidate| candidate.name == table)
             .ok_or(RulesetError::NotFound)?;
@@ -131,6 +155,7 @@ impl Filter {
             return Err(RulesetError::NotEmpty);
         }
         table.chains.remove(index);
+        ruleset.changed();
         Ok(())
     }
 
@@ -145,9 +170,9 @@ impl Filter {
     /// Snapshot every chain bound to `hook` across every table —
     /// returns clones to avoid lock-during-eval.
     fn chains_at(&self, hook: HookPoint) -> Vec<Chain> {
-        let tables = self.inner.lock();
+        let ruleset = self.inner.lock();
         let mut out = Vec::new();
-        for t in tables.iter() {
+        for t in &ruleset.tables {
             for c in t.chains.iter() {
                 if c.hook == hook {
                     out.push(c.clone());
@@ -161,13 +186,24 @@ impl Filter {
     /// Cloning under the one store lock prevents userspace from observing a
     /// table/chain/rule mixture from different updates.
     pub fn snapshot(&self) -> Vec<Table> {
-        self.inner.lock().clone()
+        self.inner.lock().tables.clone()
+    }
+
+    pub(crate) fn snapshot_with_generation(&self) -> (u32, Vec<Table>) {
+        let ruleset = self.inner.lock();
+        (ruleset.generation, ruleset.tables.clone())
+    }
+
+    pub(crate) fn generation(&self) -> u32 {
+        self.inner.lock().generation
     }
 
     /// Reset to empty. Test-only.
     #[doc(hidden)]
     pub fn __reset_for_test(&self) {
-        self.inner.lock().clear();
+        let mut ruleset = self.inner.lock();
+        ruleset.tables.clear();
+        ruleset.generation = 1;
     }
 }
 

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 const NLMSG_HDRLEN: usize = 16;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
+const NFNL_MSG_BATCH_BEGIN: u16 = 0x10;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
@@ -31,6 +32,9 @@ const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_GETCHAIN: u16 = 4;
 const NFT_MSG_DELCHAIN: u16 = 5;
+const NFT_MSG_NEWGEN: u16 = 15;
+const NFT_MSG_GETGEN: u16 = 16;
+const NFTA_GEN_ID: u16 = 1;
 const NFTA_TABLE_NAME: u16 = 1;
 const NFTA_TABLE_FLAGS: u16 = 2;
 const NFTA_TABLE_USE: u16 = 3;
@@ -207,10 +211,12 @@ fn requested_tuple(attrs: &[u8]) -> Option<crate::netfilter::Tuple> {
 fn nft_table_record(
     table: &crate::netfilter::rules::Table,
     handle: u64,
+    generation: u32,
     seq: u32,
     multipart: bool,
 ) -> Vec<u8> {
     let mut body = alloc::vec![AF_INET, 0, 0, 0];
+    body[2..4].copy_from_slice(&(generation as u16).to_be_bytes());
     push_string_attr(&mut body, NFTA_TABLE_NAME, &table.name);
     push_be_u32_attr(&mut body, NFTA_TABLE_FLAGS, 0);
     push_be_u32_attr(&mut body, NFTA_TABLE_USE, table.chains.len() as u32);
@@ -227,10 +233,12 @@ fn nft_chain_record(
     table: &crate::netfilter::rules::Table,
     chain: &crate::netfilter::rules::Chain,
     handle: u64,
+    generation: u32,
     seq: u32,
     multipart: bool,
 ) -> Vec<u8> {
     let mut body = alloc::vec![AF_INET, 0, 0, 0];
+    body[2..4].copy_from_slice(&(generation as u16).to_be_bytes());
     push_string_attr(&mut body, NFTA_CHAIN_TABLE, &table.name);
     push_be_u64_attr(&mut body, NFTA_CHAIN_HANDLE, handle);
     push_string_attr(&mut body, NFTA_CHAIN_NAME, &chain.name);
@@ -264,23 +272,41 @@ fn attr_string(attrs: &[u8], kind: u16) -> Option<&str> {
 }
 
 fn build_nft_get(net_ns_id: u64, kind: u16, flags: u16, seq: u32, request: &[u8]) -> Vec<Vec<u8>> {
+    let namespace = (net_ns_id != 0).then(|| crate::netfilter::namespace::get(net_ns_id));
+    let filter = namespace
+        .as_ref()
+        .map(|namespace| &namespace.filter)
+        .unwrap_or_else(|| crate::netfilter::filter::filter());
+    if kind == NFT_MSG_GETGEN {
+        let generation = filter.generation();
+        let mut body = alloc::vec![NFPROTO_UNSPEC, 0, 0, 0];
+        body[2..4].copy_from_slice(&(generation as u16).to_be_bytes());
+        // nf_tables_fill_gen_info uses nla_put_be32, with the plain attribute ID.
+        push_attr(&mut body, NFTA_GEN_ID, &generation.to_be_bytes());
+        return alloc::vec![frame(
+            (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN,
+            0,
+            seq,
+            &body
+        )];
+    }
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
     let attrs = &request[NLMSG_HDRLEN + 4..];
     let requested_table = attr_string(attrs, NFTA_TABLE_NAME);
     let requested_chain = attr_string(attrs, NFTA_CHAIN_NAME);
-    let ruleset = if net_ns_id == 0 {
-        crate::netfilter::filter::filter().snapshot()
-    } else {
-        crate::netfilter::namespace::get(net_ns_id)
-            .filter
-            .snapshot()
-    };
+    let (generation, ruleset) = filter.snapshot_with_generation();
     let mut out = Vec::new();
     match kind {
         NFT_MSG_GETTABLE => {
             for (table_index, table) in ruleset.iter().enumerate() {
                 if requested_table.is_none_or(|name| name == table.name) {
-                    out.push(nft_table_record(table, table_index as u64 + 1, seq, dump));
+                    out.push(nft_table_record(
+                        table,
+                        table_index as u64 + 1,
+                        generation,
+                        seq,
+                        dump,
+                    ));
                 }
             }
         }
@@ -292,7 +318,9 @@ fn build_nft_get(net_ns_id: u64, kind: u16, flags: u16, seq: u32, request: &[u8]
                 for (chain_index, chain) in table.chains.iter().enumerate() {
                     if requested_chain.is_none_or(|name| name == chain.name) {
                         let handle = ((table_index as u64 + 1) << 32) | (chain_index as u64 + 1);
-                        out.push(nft_chain_record(table, chain, handle, seq, dump));
+                        out.push(nft_chain_record(
+                            table, chain, handle, generation, seq, dump,
+                        ));
                     }
                 }
             }
@@ -418,7 +446,7 @@ fn build_one(
         // NFPROTO_IPV4 is supported — plus NFPROTO_UNSPEC on GET, which
         // Linux dumps as "every family" (`nft list ruleset`).
         let get = matches!(message, NFT_MSG_GETTABLE | NFT_MSG_GETCHAIN);
-        if family != AF_INET && !(get && family == NFPROTO_UNSPEC) {
+        if message != NFT_MSG_GETGEN && family != AF_INET && !(get && family == NFPROTO_UNSPEC) {
             return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
         }
     } else if family != AF_INET {
@@ -436,7 +464,10 @@ fn build_one(
                 Vec::new()
             });
         }
-        if !matches!(message, NFT_MSG_GETTABLE | NFT_MSG_GETCHAIN) {
+        if !matches!(
+            message,
+            NFT_MSG_GETTABLE | NFT_MSG_GETCHAIN | NFT_MSG_GETGEN
+        ) {
             return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
         }
         let mut out = build_nft_get(net_ns_id, message, flags, seq, request);
@@ -512,6 +543,12 @@ pub fn build_replies_authorized(
         if len < NLMSG_HDRLEN || len > remaining.len() {
             return Err(());
         }
+        // An nft transaction is one unit. Until rule expressions and commits
+        // are supported, reject the envelope before applying any table edits.
+        if offset == 0 && u16::from_ne_bytes([remaining[4], remaining[5]]) == NFNL_MSG_BATCH_BEGIN {
+            let seq = u32::from_ne_bytes(remaining[8..12].try_into().unwrap());
+            return Ok(alloc::vec![error(EOPNOTSUPP, seq, &remaining[..len])]);
+        }
         replies.extend(build_one(net_ns_id, &remaining[..len], admin)?);
         let step = align(len);
         if step > remaining.len() {
@@ -537,6 +574,88 @@ mod tests {
             &[AF_INET, 0, 0, 0],
         )
     }
+
+    fn nft_ruleset_generation() -> narf_kernel_test::TestResult {
+        let id = 0x7566_7701;
+        let other_id = id + 1;
+        crate::netfilter::namespace::remove(id);
+        crate::netfilter::namespace::remove(other_id);
+        let namespace = crate::netfilter::namespace::get(id);
+        let filter = &namespace.filter;
+        let get = frame(
+            (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETGEN,
+            NLM_F_REQUEST | NLM_F_ACK,
+            43,
+            &[NFPROTO_UNSPEC, 0, 0, 0],
+        );
+        let check = |ns, expected: u32| {
+            let reply = build_replies_in(ns, &get).unwrap();
+            let mut body = alloc::vec![NFPROTO_UNSPEC, 0, 0, 0];
+            body[2..4].copy_from_slice(&(expected as u16).to_be_bytes());
+            push_attr(&mut body, NFTA_GEN_ID, &expected.to_be_bytes());
+            reply
+                == alloc::vec![
+                    frame((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN, 0, 43, &body),
+                    error(0, 43, &get),
+                ]
+        };
+        narf_kernel_test::kt_assert!(check(id, 1));
+        filter.create_table("filter").unwrap();
+        narf_kernel_test::kt_assert!(filter.create_table("filter").is_err());
+        narf_kernel_test::kt_assert!(check(id, 2));
+        filter.create_chain("filter", "input").unwrap();
+        let dump = frame(
+            (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETCHAIN,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            44,
+            &[NFPROTO_UNSPEC, 0, 0, 0],
+        );
+        let records = build_replies_in(id, &dump).unwrap();
+        narf_kernel_test::kt_assert_eq!(&records[0][18..20], &3u16.to_be_bytes());
+        filter.delete_chain("filter", "input").unwrap();
+        filter.delete_table("filter").unwrap();
+        narf_kernel_test::kt_assert!(check(id, 5) && check(other_id, 1));
+        crate::netfilter::namespace::remove(id);
+        crate::netfilter::namespace::remove(other_id);
+        narf_kernel_test::TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!("net/netlink_netfilter", nft_ruleset_generation);
+
+    fn unsupported_nft_batch_preserves_ruleset() -> narf_kernel_test::TestResult {
+        let id = 0x7566_7703;
+        let admin = crate::netfilter::NetfilterAdminHandle::mint(
+            id,
+            crate::netfilter::NetfilterRights::RULESET,
+        );
+        let mut transaction = frame(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 10, &[0, 0, 0, 10]);
+        let rejected = error(EOPNOTSUPP, 10, &transaction);
+        let mut body = alloc::vec![AF_INET, 0, 0, 0];
+        push_string_attr(&mut body, NFTA_TABLE_NAME, "batch-test");
+        transaction.extend(frame(
+            (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWTABLE,
+            NLM_F_REQUEST,
+            11,
+            &body,
+        ));
+        transaction.extend(frame(
+            NFNL_MSG_BATCH_BEGIN + 1,
+            NLM_F_REQUEST,
+            12,
+            &[0, 0, 0, 10],
+        ));
+        let replies = build_replies_authorized(id, &transaction, Some(&admin)).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies, alloc::vec![rejected]);
+        narf_kernel_test::kt_assert!(crate::netfilter::namespace::get(id)
+            .filter
+            .snapshot()
+            .is_empty());
+        crate::netfilter::namespace::remove(id);
+        narf_kernel_test::TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_netfilter",
+        unsupported_nft_batch_preserves_ruleset
+    );
 
     fn empty_conntrack_dump_terminates() -> narf_kernel_test::TestResult {
         crate::netfilter::conntrack::__reset_for_test();
