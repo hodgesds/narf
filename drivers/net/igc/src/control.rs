@@ -115,6 +115,9 @@ impl Igc {
         if self.removed.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The receive pumps and the transmit consumer sleep on their
+        // interrupt and ring only; let them see the removal.
+        self.wake_removal_waiters();
         let mut fenced = false;
         if let Ok(_control) = self.control() {
             self.state.store(CHANGING, Ordering::SeqCst);
@@ -622,6 +625,12 @@ impl NicControl for Igc {
         let queues = self.queues();
         let queue = queues.get(usize::from(q)).ok_or(22)?;
         queue.poll_xsk(&self.hw, usize::from(q), self.mtu());
+        // `igc_xsk_wakeup`: raise the queue's own interrupt (EICS) so its
+        // receive pump polls too and re-arms descriptors from the refilled
+        // FILL ring; the pump sleeps on that interrupt alone.
+        if let Some(r) = self.route(usize::from(q)) {
+            self.hw.write(0x1520, 1u32 << r.index);
+        }
         Ok(())
     }
     fn runtime_suspend(&self) -> Result<(), i32> {

@@ -437,6 +437,10 @@ pub struct Igc {
     ifname: crate::publish::IfName,
     cookie: u64,
     removed: AtomicBool,
+    /// Tasks parked until the device goes away (`until_removed`): the
+    /// receive pumps and the transmit consumer, which otherwise sleep on
+    /// their interrupt or ring alone.
+    removal_wakers: IrqSafeSpinLock<Vec<core::task::Waker>>,
     admin_up: AtomicBool,
     recovery_requested: AtomicBool,
     completion_autopsy_pending: AtomicBool,
@@ -526,6 +530,37 @@ fn queue_cpu(queue: usize) -> u32 {
 }
 
 impl Igc {
+    /// Run `f` until it completes or the device is removed (`None`).
+    async fn until_removed<F: core::future::Future>(&self, f: F) -> Option<F::Output> {
+        let mut f = core::pin::pin!(f);
+        core::future::poll_fn(|cx| {
+            if self.removed.load(Ordering::Acquire) {
+                return core::task::Poll::Ready(None);
+            }
+            {
+                let mut w = self.removal_wakers.lock();
+                if !w.iter().any(|w| w.will_wake(cx.waker())) {
+                    w.push(cx.waker().clone());
+                }
+            }
+            // Registered before the re-check: `remove` sets the flag, then
+            // wakes every registered waiter.
+            if self.removed.load(Ordering::Acquire) {
+                return core::task::Poll::Ready(None);
+            }
+            f.as_mut().poll(cx).map(Some)
+        })
+        .await
+    }
+
+    /// Wake every task parked in [`Self::until_removed`].
+    pub(crate) fn wake_removal_waiters(&self) {
+        let wakers = core::mem::take(&mut *self.removal_wakers.lock());
+        for w in wakers {
+            w.wake();
+        }
+    }
+
     /// Initialize a single exclusively owned PCI function.
     ///
     /// # Safety
@@ -620,6 +655,7 @@ impl Igc {
             ifname: crate::publish::IfName::new(),
             cookie: NEXT_COOKIE.fetch_add(1, Ordering::Relaxed),
             removed: AtomicBool::new(false),
+            removal_wakers: IrqSafeSpinLock::new(Vec::new()),
             admin_up: AtomicBool::new(true),
             recovery_requested: AtomicBool::new(false),
             completion_autopsy_pending: AtomicBool::new(false),
@@ -2099,12 +2135,9 @@ fn spawn_pumps(
                 let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
-                    let waiter = route.map(|r| {
-                        narf_interrupts::wait_for_irq_until(
-                            r.vector,
-                            narf_time::Deadline::after_ms(10),
-                        )
-                    });
+                    // NAPI: the queue's interrupt alone schedules the next
+                    // poll (`igc_msix_ring` → `napi_schedule`); no timer.
+                    let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
                     // Only a reset replaces the queue set; one handle serves
                     // the whole poll.
                     let queue = rx.queues().get(q).cloned();
@@ -2193,7 +2226,7 @@ fn spawn_pumps(
                     narf_net::tcp_stack::gro_flush();
                     match waiter {
                         Some(w) => {
-                            let _ = w.await;
+                            let _ = rx.until_removed(w).await;
                         }
                         None => narf_time::sleep_cycles(narf_time::ns_to_cycles(1_000_000)).await,
                     }
@@ -2211,23 +2244,9 @@ fn spawn_pumps(
     narf_scheduler::spawn_with_spec(
         async move {
             while !tx.removed.load(Ordering::Acquire) {
-                let result = {
-                    use core::future::Future;
-                    let receive = tx_cons.recv();
-                    let timer = narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000));
-                    let mut receive = core::pin::pin!(receive);
-                    let mut timer = core::pin::pin!(timer);
-                    core::future::poll_fn(|cx| {
-                        if let core::task::Poll::Ready(v) = receive.as_mut().poll(cx) {
-                            return core::task::Poll::Ready(Some(v));
-                        }
-                        if timer.as_mut().poll(cx).is_ready() {
-                            return core::task::Poll::Ready(None);
-                        }
-                        core::task::Poll::Pending
-                    })
-                    .await
-                };
+                // The ring alone wakes it (Linux transmits synchronously from
+                // `ndo_start_xmit`; nothing polls), or the device's removal.
+                let result = tx.until_removed(tx_cons.recv()).await;
                 match result {
                     Some(Ok(frame)) => {
                         if !tx.removed.load(Ordering::Acquire) {
