@@ -3682,6 +3682,7 @@ dependencies = [
  "narf-lib",
  "narf-net",
  "narf-scheduler",
+ "narf-time",
  "zeroize",
 ]
 

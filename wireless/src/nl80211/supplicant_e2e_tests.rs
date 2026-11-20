@@ -469,6 +469,7 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
         namespace: 0,
         busy: true,
         results: Vec::new(),
+        seen: Vec::new(),
     });
     EVENTS.lock().clear();
     narf_scheduler::block_on_spin(execute(
@@ -843,6 +844,7 @@ fn smoke_nl80211_wpa_supplicant_wpa3_sae_offload_end_to_end() -> TestResult {
         namespace: 0,
         busy: true,
         results: Vec::new(),
+        seen: Vec::new(),
     });
     let mut scan = ifindex_attr(ifindex);
     let mut ssids = Vec::new();

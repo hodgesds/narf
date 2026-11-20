@@ -596,7 +596,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
         .results
         .clone();
     if cached.len() != 1
-        || !scan_reply(index, &cached[0].0, &cached[0].1, false)
+        || !scan_reply(index, &cached[0].0, &cached[0].1, false, None)
             .attrs
             .windows(4)
             .any(|b| b == b"test")
@@ -877,9 +877,10 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
     };
     let wiphy = match crate::registry::list()
         .iter()
-        .position(|i| i.name() == INTEROP_NAME)
+        .find(|i| i.name() == INTEROP_NAME)
+        .and_then(|i| crate::registry::wiphy_index(i.wiphy_id()))
     {
-        Some(index) => index as u32,
+        Some(index) => index,
         None => return TestResult::Fail("interop iface missing from registry"),
     };
     let ctx = RequestContext {
@@ -999,6 +1000,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
         namespace: 0,
         busy: true,
         results: Vec::new(),
+        seen: Vec::new(),
     });
     INTEROP_EVENTS.lock().clear();
     narf_scheduler::block_on_spin(execute(
@@ -1520,6 +1522,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
             },
             Vec::new(),
         )],
+        seen: Vec::new(),
     });
     if handle(AUTHENTICATE, &auth(0, &[]), false, ctx).is_err() {
         return TestResult::Fail("valid AUTHENTICATE rejected");
@@ -2128,6 +2131,7 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
         namespace: 0,
         busy: true,
         results: Vec::new(),
+        seen: Vec::new(),
     });
     INTEROP_EVENTS.lock().clear();
     narf_scheduler::block_on_spin(execute(
@@ -2286,6 +2290,7 @@ fn smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery() -> TestRe
         namespace: 0,
         busy: true,
         results: Vec::new(),
+        seen: Vec::new(),
     });
     INTEROP_EVENTS.lock().clear();
     narf_scheduler::block_on_spin(execute(
@@ -2319,4 +2324,201 @@ fn smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery() -> TestRe
 kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery
+);
+
+/// A station connected to `HELD_BSS`, for the BSS-table tests.
+struct HeldBssStub {
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+}
+const HELD_BSS: [u8; 6] = [2, 0x4b, 0, 0, 0, 1];
+impl Interface for HeldBssStub {
+    fn name(&self) -> &str {
+        "nlwifi-held"
+    }
+    fn mac(&self) -> [u8; 6] {
+        [2, 0, 0, 0, 0x4b, 2]
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for HeldBssStub {
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessIfaceInfo {
+            base_name: self.name().into(),
+            base_mac: self.mac(),
+            bands: Vec::new(),
+            modes: crate::iface::WirelessModes::STATION,
+            hw_caps: crate::iface::HwCaps {
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        Some(HELD_BSS)
+    }
+    async fn scan(
+        &self,
+        _: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        Ok(Vec::new())
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+}
+
+/// cfg80211's BSS table across scans: a scan merges into the table
+/// (`cfg80211_bss_update`) rather than replacing it, an entry not reported
+/// for `IEEE80211_SCAN_RESULT_EXPIRE` (30 s) is aged out
+/// (`cfg80211_bss_expire`, also at the start of `nl80211_dump_scan`), and
+/// the connected BSS is held (`cfg80211_hold_bss`). A later scan that
+/// misses the connected BSS still dumps it, as NL80211_BSS_STATUS_ASSOCIATED,
+/// so wpa_supplicant keeps finding its current network.
+fn smoke_nl80211_scan_table_holds_the_connected_bss() -> TestResult {
+    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(HeldBssStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register(iface.name(), iface.mac(), |_, _| Ok(()));
+    crate::registry::register(iface.clone());
+    let _cleanup = CacheNetdev("nlwifi-held");
+    let index = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap();
+    let bss = |bssid: [u8; 6], frequency_mhz: u32| crate::BssInfo {
+        bssid,
+        ssid: b"held".to_vec(),
+        frequency_mhz,
+        channel: 0,
+        rssi: -50,
+        security: crate::scan::BssSecurity::Wpa2,
+    };
+    let other = [2, 0x4b, 0, 0, 0, 2];
+    let later = [2, 0x4b, 0, 0, 0, 3];
+    let start = narf_time::wall::monotonic_ns().saturating_sub(40_000_000_000);
+    drop(begin_operation(iface.name(), 0, index).unwrap());
+    {
+        let mut caches = CACHE.lock();
+        let Some(cache) = caches
+            .iter_mut()
+            .find(|c| c.matches(iface.name(), 0, index))
+        else {
+            return TestResult::Fail("no table for the netdev");
+        };
+        // The scan that found the AP the station then connected to.
+        cache.merge(
+            alloc::vec![
+                (bss(HELD_BSS, 5805), Vec::new()),
+                (bss(other, 5180), Vec::new())
+            ],
+            Some(HELD_BSS),
+            start,
+            true,
+        );
+        // A later scan that misses both, 31 s on: the unheld entry ages out.
+        cache.merge(
+            alloc::vec![(bss(later, 2437), Vec::new())],
+            Some(HELD_BSS),
+            start + 31_000_000_000,
+            true,
+        );
+    }
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    let Ok(replies) = handle(GET_SCAN, &attrs, true, RequestContext::default()) else {
+        return TestResult::Fail("GET_SCAN dump failed");
+    };
+    let mut dumped = Vec::new();
+    for reply in &replies {
+        let Some(nested) = find_attr(&reply.attrs, 47 | NLA_F_NESTED) else {
+            return TestResult::Fail("dump entry without NL80211_ATTR_BSS");
+        };
+        let (Some(bssid), Some(seen)) = (find_attr(nested, 1), find_attr(nested, 10)) else {
+            return TestResult::Fail("dump entry without BSSID or SEEN_MS_AGO");
+        };
+        let associated = find_attr(nested, 9) == Some(&1u32.to_ne_bytes()[..]);
+        dumped.push((bssid.to_vec(), associated, seen.to_vec()));
+    }
+    if dumped.len() != 2
+        || !dumped
+            .iter()
+            .any(|(bssid, associated, _)| bssid[..] == HELD_BSS && *associated)
+        || !dumped
+            .iter()
+            .any(|(bssid, associated, _)| bssid[..] == later && !*associated)
+        || dumped.iter().any(|(bssid, _, _)| bssid[..] == other)
+    {
+        return TestResult::Fail("table lost the connected BSS or kept an expired entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_scan_table_holds_the_connected_bss
+);
+
+/// `__cfg80211_disconnected` -> `nl80211_send_disconnected`: a driver's
+/// own disconnect releases the connection owner (`conn_owner_nlportid = 0`)
+/// and the DISCONNECT event leads with NL80211_ATTR_WIPHY, then IFINDEX,
+/// REASON_CODE and DISCONNECTED_BY_AP, on the mlme group.
+fn smoke_nl80211_driver_disconnect_matches_cfg80211_disconnected() -> TestResult {
+    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(HeldBssStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register(iface.name(), iface.mac(), |_, _| Ok(()));
+    crate::registry::register(iface.clone());
+    let _cleanup = CacheNetdev("nlwifi-held");
+    let _restore = SinkRestore(narf_net::netlink_generic::install_event_sink(interop_sink));
+    let index = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap();
+    let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).unwrap();
+    station::set_owner(iface.name(), 0, 77, Some(HELD_BSS));
+    if station::check_owner(iface.name(), 78).is_ok() {
+        return TestResult::Fail("fixture owner was not installed");
+    }
+    INTEROP_EVENTS.lock().clear();
+    super::super::notify_disconnect(iface.name(), 7, true);
+    let event = INTEROP_EVENTS
+        .lock()
+        .iter()
+        .find(|(ns, group, msg)| *ns == 0 && *group == 19 && msg.get(16) == Some(&48))
+        .map(|(_, _, msg)| msg[20..].to_vec());
+    let Some(attrs) = event else {
+        return TestResult::Fail("no DISCONNECT event on the mlme group");
+    };
+    if attrs.get(2..4) != Some(&1u16.to_ne_bytes()[..])
+        || find_attr(&attrs, 1) != Some(&wiphy.to_ne_bytes()[..])
+        || find_attr(&attrs, 3) != Some(&index.to_ne_bytes()[..])
+        || find_attr(&attrs, 54) != Some(&7u16.to_ne_bytes()[..])
+        || find_attr(&attrs, 71).is_none()
+    {
+        return TestResult::Fail("DISCONNECT attributes differ from nl80211_send_disconnected");
+    }
+    if station::check_owner(iface.name(), 78).is_err() {
+        return TestResult::Fail("the connection owner survived the disconnect");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_driver_disconnect_matches_cfg80211_disconnected
 );

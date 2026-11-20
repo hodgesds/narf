@@ -85,8 +85,10 @@ const AUTHENTICATE: u8 = 37;
 const ASSOCIATE: u8 = 38;
 const DEAUTHENTICATE: u8 = 39;
 const DISASSOCIATE: u8 = 40;
-const ASSOC_COMEBACK: u8 = 152;
-const ATTR_TIMEOUT: u16 = 248;
+/// `NL80211_CMD_ASSOC_COMEBACK` (uapi value 147).
+const ASSOC_COMEBACK: u8 = 147;
+/// `NL80211_ATTR_TIMEOUT` (uapi value 272).
+const ATTR_TIMEOUT: u16 = 272;
 const REGISTER_FRAME: u8 = 58;
 const FRAME: u8 = 59;
 const FRAME_TX_STATUS: u8 = 60;
@@ -119,11 +121,110 @@ struct Cache {
     ifindex: u32,
     namespace: u64,
     busy: bool,
+    /// The netdev's BSS table (cfg80211 `rdev->bss_list`).
     results: Vec<(crate::BssInfo, Vec<u8>)>,
+    /// When each entry was last reported (cfg80211 `bss->ts`), by BSSID and
+    /// frequency. An entry without a stamp counts as reported now.
+    seen: Vec<([u8; 6], u32, u64)>,
 }
+/// `IEEE80211_SCAN_RESULT_EXPIRE` (30 * HZ).
+const SCAN_RESULT_EXPIRE_NS: u64 = 30_000_000_000;
+/// The table bound (cfg80211 limits it with `bss_entries`).
+const SCAN_TABLE_MAX: usize = 256;
 impl Cache {
     fn matches(&self, name: &str, namespace: u64, index: u32) -> bool {
         self.name == name && self.namespace == namespace && self.ifindex == index
+    }
+    /// `cfg80211_inform_bss` -> `cfg80211_bss_update` for each new result:
+    /// an entry with the same BSSID on the same channel is updated in
+    /// place and re-stamped, a new one is added. Nothing is replaced
+    /// wholesale. A completed scan then ages the table
+    /// (`___cfg80211_scan_done` -> `cfg80211_bss_expire`); scheduled-scan
+    /// results do not (`cfg80211_sched_scan_results_wk` without FLUSH).
+    fn merge(
+        &mut self,
+        results: Vec<(crate::BssInfo, Vec<u8>)>,
+        held: Option<[u8; 6]>,
+        now: u64,
+        scan_done: bool,
+    ) {
+        for (bss, ies) in results {
+            let key = (bss.bssid, bss.frequency_mhz);
+            match self.seen.iter_mut().find(|e| (e.0, e.1) == key) {
+                Some(entry) => entry.2 = now,
+                None => self.seen.push((key.0, key.1, now)),
+            }
+            match self
+                .results
+                .iter_mut()
+                .find(|(old, _)| (old.bssid, old.frequency_mhz) == key)
+            {
+                Some(slot) => *slot = (bss, ies),
+                None => self.results.push((bss, ies)),
+            }
+        }
+        if scan_done {
+            self.expire(held, now);
+        }
+        // `cfg80211_bss_expire_oldest`: past the bound, the oldest unheld
+        // entries go first.
+        while self.results.len() > SCAN_TABLE_MAX {
+            let oldest = self
+                .results
+                .iter()
+                .enumerate()
+                .filter(|(_, (bss, _))| Some(bss.bssid) != held)
+                .map(|(index, (bss, _))| (index, self.stamp_of(bss)))
+                .min_by_key(|(_, at)| *at);
+            let Some((index, _)) = oldest else {
+                break;
+            };
+            self.results.remove(index);
+        }
+        self.retain_stamps();
+    }
+    fn stamp_of(&self, bss: &crate::BssInfo) -> u64 {
+        self.seen
+            .iter()
+            .find(|e| (e.0, e.1) == (bss.bssid, bss.frequency_mhz))
+            .map_or(u64::MAX, |e| e.2)
+    }
+    /// `cfg80211_bss_expire`: an entry not reported for
+    /// `IEEE80211_SCAN_RESULT_EXPIRE` goes, unless it is held: the connected
+    /// BSS (`cfg80211_hold_bss` for `wdev->links[].client.current_bss`)
+    /// stays for the life of the connection.
+    fn expire(&mut self, held: Option<[u8; 6]>, now: u64) {
+        for (bss, _) in &self.results {
+            let key = (bss.bssid, bss.frequency_mhz);
+            if !self.seen.iter().any(|e| (e.0, e.1) == key) {
+                self.seen.push((key.0, key.1, now));
+            }
+        }
+        let seen = &self.seen;
+        self.results.retain(|(bss, _)| {
+            Some(bss.bssid) == held
+                || seen
+                    .iter()
+                    .find(|e| (e.0, e.1) == (bss.bssid, bss.frequency_mhz))
+                    .is_none_or(|e| now.saturating_sub(e.2) < SCAN_RESULT_EXPIRE_NS)
+        });
+        self.retain_stamps();
+    }
+    fn retain_stamps(&mut self) {
+        let results = &self.results;
+        self.seen.retain(|e| {
+            results
+                .iter()
+                .any(|(bss, _)| (bss.bssid, bss.frequency_mhz) == (e.0, e.1))
+        });
+    }
+    /// Milliseconds since `bss` was last reported (`NL80211_BSS_SEEN_MS_AGO`).
+    fn seen_ms_ago(&self, bss: &crate::BssInfo, now: u64) -> u32 {
+        let at = self.stamp_of(bss);
+        if at == u64::MAX {
+            return 0;
+        }
+        u32::try_from(now.saturating_sub(at) / 1_000_000).unwrap_or(u32::MAX)
     }
 }
 static CACHE: IrqSafeSpinLock<Vec<Cache>> = IrqSafeSpinLock::new(Vec::new());
@@ -143,22 +244,30 @@ pub(crate) fn scheduled_results(
         return Err(crate::WirelessError::Denied);
     }
     source.current()?;
-    results.truncate(256);
+    results.truncate(SCAN_TABLE_MAX);
+    let now = narf_time::wall::monotonic_ns();
     if let Some(cache) = caches.iter_mut().find(|c| c.name == name) {
         if cache.busy {
             return Err(crate::WirelessError::Busy);
         }
+        if cache.ifindex != index || cache.namespace != namespace {
+            cache.results.clear();
+            cache.seen.clear();
+        }
         cache.ifindex = index;
         cache.namespace = namespace;
-        cache.results = results;
+        cache.merge(results, None, now, false);
     } else {
-        caches.push(Cache {
+        let mut cache = Cache {
             name: name.into(),
             ifindex: index,
             namespace,
             busy: false,
-            results,
-        });
+            results: Vec::new(),
+            seen: Vec::new(),
+        };
+        cache.merge(results, None, now, false);
+        caches.push(cache);
     }
     Ok(())
 }
@@ -192,6 +301,7 @@ fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGu
             cache.ifindex = index;
             cache.namespace = namespace;
             cache.results.clear();
+            cache.seen.clear();
             cache.busy = false;
         }
         if cache.busy {
@@ -199,6 +309,7 @@ fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGu
         }
         if cache.namespace != namespace {
             cache.results.clear();
+            cache.seen.clear();
             cache.namespace = namespace;
         }
         cache.busy = true;
@@ -209,6 +320,7 @@ fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGu
             namespace,
             busy: true,
             results: Vec::new(),
+            seen: Vec::new(),
         });
     }
     Ok(OperationGuard(name.into(), index, namespace))
@@ -1394,15 +1506,28 @@ fn route(
             return Err(EOPNOTSUPP);
         }
         let connected = iface.connected_bssid();
-        let cache = CACHE.lock();
-        let results = cache
-            .iter()
+        let now = narf_time::wall::monotonic_ns();
+        let mut caches = CACHE.lock();
+        let Some(cache) = caches
+            .iter_mut()
             .find(|c| c.matches(iface.name(), context.net_ns_id, index))
-            .map(|c| c.results.as_slice())
-            .unwrap_or_default();
-        return Ok(results
+        else {
+            return Ok(Vec::new());
+        };
+        // `nl80211_dump_scan` -> `cfg80211_bss_expire` before the first entry.
+        cache.expire(connected, now);
+        return Ok(cache
+            .results
             .iter()
-            .map(|(bss, ies)| scan_reply(index, bss, ies, connected == Some(bss.bssid)))
+            .map(|(bss, ies)| {
+                scan_reply(
+                    index,
+                    bss,
+                    ies,
+                    connected == Some(bss.bssid),
+                    Some(cache.seen_ms_ago(bss, now)),
+                )
+            })
             .collect());
     }
     if dump {
@@ -3088,6 +3213,30 @@ fn publish_assoc_comeback(
     );
 }
 
+/// `__cfg80211_disconnected`'s `wdev->conn_owner_nlportid = 0`.
+pub(super) fn clear_connection_owner(name: &str) {
+    station::clear_owner(name);
+}
+
+/// `cfg80211_assoc_comeback` for a driver whose own MLME received the
+/// temporary rejection (mac80211 `ieee80211_rx_mgmt_assoc_resp`), with the
+/// AP's comeback time in TUs.
+pub fn notify_assoc_comeback(name: &str, peer: [u8; 6], timeout_tu: u32) {
+    let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(iface) = crate::registry::list()
+        .into_iter()
+        .find(|iface| iface.name() == name)
+    else {
+        return;
+    };
+    publish_assoc_comeback(iface.as_ref(), net.net_ns_id, index, peer, timeout_tu);
+}
+
 /// A validated userspace-SME frame exchange, run asynchronously off the
 /// `mlme_handle` dispatch (split out so the resulting event is exercisable
 /// directly, as `execute` is for CONNECT/SCAN).
@@ -4522,12 +4671,14 @@ async fn execute(
                             (bss, ies)
                         })
                         .collect();
+                    let held = iface.connected_bssid();
+                    let now = narf_time::wall::monotonic_ns();
                     if let Some(cache) = CACHE
                         .lock()
                         .iter_mut()
                         .find(|c| c.matches(iface.name(), ns, index))
                     {
-                        cache.results = results;
+                        cache.merge(results, held, now, true);
                     }
                     (34, 18)
                 } else {
@@ -4853,10 +5004,11 @@ fn scan_reply(
     bss: &crate::BssInfo,
     information_elements: &[u8],
     associated: bool,
+    seen_ms_ago: Option<u32>,
 ) -> GenlReply {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
-    scan_reply_with(attrs, bss, information_elements, associated)
+    scan_reply_aged(attrs, bss, information_elements, associated, seen_ms_ago)
 }
 
 /// `nl80211_send_bss` for a wdev without a netdev: the selector is
@@ -4868,13 +5020,28 @@ fn scan_reply_wdev(wdev: u64, bss: &crate::BssInfo, information_elements: &[u8])
 }
 
 fn scan_reply_with(
-    mut attrs: Vec<u8>,
+    attrs: Vec<u8>,
     bss: &crate::BssInfo,
     information_elements: &[u8],
     associated: bool,
 ) -> GenlReply {
+    scan_reply_aged(attrs, bss, information_elements, associated, None)
+}
+
+/// `nl80211_send_bss`, with `NL80211_BSS_SEEN_MS_AGO`
+/// (`jiffies_to_msecs(jiffies - intbss->ts)`) for a table entry.
+fn scan_reply_aged(
+    mut attrs: Vec<u8>,
+    bss: &crate::BssInfo,
+    information_elements: &[u8],
+    associated: bool,
+    seen_ms_ago: Option<u32>,
+) -> GenlReply {
     let mut nested = Vec::new();
     push_attr(&mut nested, 1, &bss.bssid);
+    if let Some(ms) = seen_ms_ago {
+        push_attr(&mut nested, 10, &ms.to_ne_bytes());
+    }
     if associated {
         // NL80211_BSS_STATUS = NL80211_BSS_STATUS_ASSOCIATED: `iw link` and
         // wpa_supplicant's nl80211_get_assoc_freq find the current BSS by it.
