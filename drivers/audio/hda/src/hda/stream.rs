@@ -167,7 +167,13 @@ impl Stream {
             return Err(SoundError::BadState);
         }
         ring.running = true;
+        // The service task tracks the position of running streams only.
+        dev.kick_service();
         Ok(())
+    }
+    /// Whether this stream's DMA engine runs.
+    pub fn is_running(&self) -> bool {
+        self.ring.as_ref().is_some_and(|r| r.running)
     }
     pub fn update(&mut self, dev: &IntelHda) {
         let Some(ring) = self.ring.as_mut() else {

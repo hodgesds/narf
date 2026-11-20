@@ -88,6 +88,9 @@ pub struct IntelHda {
     /// cleared by reinit. The PCM bring-up paths reinit when they
     /// see it set; the service loops skip work while it is set.
     suspended: AtomicBool,
+    /// The stream service task, parked while no stream runs; a stream
+    /// start (and teardown) wakes it.
+    service_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -254,6 +257,7 @@ impl IntelHda {
             hdmi_playback: IrqSafeSpinLock::new(super::hdmi::Playback::from_converter(0)),
             card: AtomicU32::new(u32::MAX),
             suspended: AtomicBool::new(false),
+            service_waker: IrqSafeSpinLock::new(None),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -884,6 +888,48 @@ impl IntelHda {
             state.lock().update(self);
         }
     }
+
+    /// Whether the service task has work: a stream's DMA engine runs (its
+    /// position needs tracking), or the controller has no interrupt route,
+    /// so nothing else acknowledges its RIRB / stream status (a controller
+    /// that counts responses against RINTCNT stops writing them until it is
+    /// acknowledged).
+    pub(super) fn needs_service(&self) -> bool {
+        self.irq_vector.is_none() || self.streams.iter().any(|s| s.lock().is_running())
+    }
+
+    /// Wake the parked stream service task (a stream started, or the
+    /// controller is going away).
+    pub(super) fn kick_service(&self) {
+        let waker = self.service_waker.lock().take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+/// Parks the stream service task until it has work (`needs_service`) or the
+/// controller is gone (`Ready(None)`). Holds no strong reference while parked, so the
+/// controller can still be dropped, which wakes it.
+struct StreamsIdle<'a>(&'a alloc::sync::Weak<IntelHda>);
+
+impl core::future::Future for StreamsIdle<'_> {
+    type Output = Option<()>;
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<()>> {
+        let Some(dev) = self.0.upgrade() else {
+            return core::task::Poll::Ready(None);
+        };
+        // Register, then re-check, so a start racing this poll wakes us.
+        *dev.service_waker.lock() = Some(cx.waker().clone());
+        if dev.needs_service() {
+            dev.service_waker.lock().take();
+            return core::task::Poll::Ready(Some(()));
+        }
+        core::task::Poll::Pending
+    }
 }
 
 // ── Power management (#779) ──────────────────────────────────────────
@@ -1238,6 +1284,8 @@ impl Drop for CommandLease<'_> {
 }
 impl Drop for IntelHda {
     fn drop(&mut self) {
+        // The parked service task sees the controller gone and exits.
+        self.kick_service();
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {
             self.bar0.write32(REG_INTCTL, 0);
@@ -1357,10 +1405,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
     dev.card.store(card, Ordering::Release);
     CONTROLLERS.lock().push((device.addr, dev.clone(), card));
+    // Stream service: position tracking and xrun detection, every 2 ms
+    // while a stream runs. With no stream running there is nothing to track
+    // and the interrupt handler acknowledges controller status itself, so
+    // the task parks until a start wakes it: an idle controller arms no
+    // timer, as Linux's interrupt-driven `azx_interrupt` arms none. A
+    // controller without an interrupt route keeps the 2 ms service, which
+    // is all that acknowledges its status.
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {
         loop {
-            narf_time::SleepUntil::new(Deadline::after_ms(2).as_instant()).await;
+            if StreamsIdle(&weak).await.is_none() {
+                break;
+            }
+            narf_time::usleep_range(2_000, 2_500).await;
             let Some(dev) = weak.upgrade() else {
                 break;
             };
