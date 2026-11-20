@@ -2458,6 +2458,55 @@ fn wake_race_stamp(cell: &WakeCell, home: u32) {
     cell.wake_halt_gen.store(g, Ordering::Relaxed);
 }
 
+/// Wake-to-run delays at least this long are kept for the stall watchdog
+/// to report (a woken task that waited a second for its CPU: a lost kick or
+/// a CPU monopolised by something that does not reach a scheduling point).
+const LONG_RUN_DELAY_NS: u64 = 1_000_000_000;
+
+/// Per CPU, the longest wake-to-run delay (cycles) of at least
+/// [`LONG_RUN_DELAY_NS`] since the watchdog last took it, and its task.
+#[repr(C, align(64))]
+struct LongRunDelay {
+    cycles: AtomicU64,
+    task: AtomicU64,
+}
+
+static LONG_RUN_DELAY: [LongRunDelay; narf_lib::percpu::MAX_CPUS] = [const {
+    LongRunDelay {
+        cycles: AtomicU64::new(0),
+        task: AtomicU64::new(0),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn note_long_run_delay(cpu: usize, task: u64, waited: u64) {
+    let Some(slot) = LONG_RUN_DELAY.get(cpu) else {
+        return;
+    };
+    if waited < narf_time::ns_to_cycles(LONG_RUN_DELAY_NS)
+        || waited <= slot.cycles.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    // Two stores, read together only by the watchdog: a torn pair names
+    // one of two long waiters, which is still a report worth having.
+    slot.task.store(task, Ordering::Relaxed);
+    slot.cycles.store(waited, Ordering::Release);
+}
+
+/// Take `cpu`'s longest wake-to-run delay of at least a second since the last
+/// call: `(task, ns)`. The stall watchdog reports it.
+pub fn dbg_take_long_run_delay(cpu: usize) -> Option<(u64, u64)> {
+    let slot = LONG_RUN_DELAY.get(cpu)?;
+    let cycles = slot.cycles.swap(0, Ordering::Acquire);
+    (cycles != 0).then(|| {
+        (
+            slot.task.load(Ordering::Relaxed),
+            narf_time::cycles_to_ns(cycles),
+        )
+    })
+}
+
 /// Dispatch side: a slot with a set awake flag is about to run on `cpu`. Charge
 /// the wake→run delay to this CPU's and the task's `sched_info` (Linux
 /// `sched_info_arrive`), and for the wake-race instrument record the latency
@@ -2471,6 +2520,7 @@ fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
     if let Some(cputime) = cell.cputime.as_ref() {
         cputime.note_run_delay(waited);
     }
+    note_long_run_delay(cpu, cell.task, waited);
     if w == 0 || !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }

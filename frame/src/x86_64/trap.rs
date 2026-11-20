@@ -121,6 +121,53 @@ mod stall_wd {
             NMI_SEQ[cpu].fetch_add(1, Ordering::Release);
         }
     }
+    /// Linux `watchdog_timer_fn` (kernel/watchdog.c): a pinned hard hrtimer
+    /// on every CPU every `sample_period` (`watchdog_thresh * 2 / 5`, 4 s),
+    /// tickless idle or not. Its interrupt runs [`tick`], so the detectors
+    /// keep running when every CPU idles, and every CPU takes an interrupt
+    /// at least that often, as on Linux. Armed by each CPU's own first tick.
+    static WD_TIMER: [narf_scheduler::narf_time::hrtimer::HrTimer; MAXC] = [const {
+        narf_scheduler::narf_time::hrtimer::HrTimer::new(
+            wd_timer_fn,
+            narf_scheduler::narf_time::hrtimer::ClockId::Monotonic,
+            narf_scheduler::narf_time::hrtimer::HrtimerMode::ABS_HARD,
+        )
+    }; MAXC];
+    /// `sample_period` in ns (0 until the first tick reads the parameters,
+    /// and while the detectors are disabled).
+    static SAMPLE_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+
+    fn wd_timer_fn(
+        t: &narf_scheduler::narf_time::hrtimer::HrTimer,
+    ) -> narf_scheduler::narf_time::hrtimer::HrtimerRestart {
+        use narf_scheduler::narf_time::hrtimer::HrtimerRestart;
+        let period = SAMPLE_PERIOD_NS.load(Ordering::Relaxed);
+        if period == 0 {
+            return HrtimerRestart::NoRestart;
+        }
+        t.forward(narf_scheduler::narf_time::monotonic_ns(), period);
+        HrtimerRestart::Restart
+    }
+
+    /// Arm this CPU's watchdog hrtimer if it is not queued (`watchdog_enable`).
+    fn arm_wd_timer(cpu: usize, p: &Params) {
+        let period = p.thresh_ns.saturating_mul(2) / 5;
+        if period == 0 || cpu >= MAXC || WD_TIMER[cpu].is_queued() {
+            return;
+        }
+        SAMPLE_PERIOD_NS.store(period, Ordering::Relaxed);
+        let first = narf_scheduler::narf_time::monotonic_ns().saturating_add(period);
+        // SAFETY: the timer is a static: it never moves and is never freed.
+        unsafe {
+            narf_scheduler::narf_time::hrtimer::hrtimer_start_range_ns(
+                &WD_TIMER[cpu],
+                first,
+                0,
+                narf_scheduler::narf_time::hrtimer::HrtimerMode::ABS_PINNED,
+            )
+        };
+    }
+
     // Check cadence (whichever CPU ticks first in a window runs it).
     static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
     /// Check windows run so far (~1 s each).
@@ -210,6 +257,7 @@ mod stall_wd {
             LAST_RIP[cpu].store(rip, Ordering::Relaxed);
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
             LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
+            arm_wd_timer(cpu, &params());
         }
         // User-mode sampling profile. The census can say a task is
         // COMPUTING rather than stalled; only this says what it is
@@ -342,6 +390,7 @@ mod stall_wd {
             }
         }
         lockup_check(now_ns, &p);
+        long_run_delay_check();
         hung_task_check(now_ns, &p);
         // Past boot (window 20 ≈ 20 s uptime): early-boot readiness churn is
         // not a lost wakeup.
@@ -458,6 +507,26 @@ mod stall_wd {
         }
         if soft && p.softlockup_panic {
             panic!("softlockup: hung tasks");
+        }
+    }
+
+    /// A task that waited at least a second between its wake and running: a
+    /// wake whose kick never reached its CPU (rescued by a later interrupt,
+    /// at worst the watchdog hrtimer) or a CPU that stopped scheduling. The
+    /// scheduler keeps each CPU's longest such delay; report and clear it.
+    fn long_run_delay_check() {
+        for cpu in 0..MAXC {
+            if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+                continue;
+            }
+            if let Some((task, ns)) = narf_scheduler::dbg_take_long_run_delay(cpu) {
+                let _ = writeln!(
+                    TrapWriter,
+                    "sched: CPU#{cpu} ran [{}] {} ms after its wake",
+                    TaskName(task),
+                    ns / 1_000_000
+                );
+            }
         }
     }
 
