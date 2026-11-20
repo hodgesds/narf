@@ -18,7 +18,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use narf_filesystem::{
     mqueuefs, FileOps, FsError, FsFuture, Mode, MqueueAttr, MqueueOpenOptions, Stat,
@@ -854,7 +854,7 @@ fn serialize_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
 /// (MODIFY/CLOSE_WRITE/OPEN/MOVED/CREATE/DELETE) are numerically identical
 /// between the two ABIs, so one `mask` drives both.
 fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
-    if !fs_notify_active() {
+    if !fs_notify_active() || !event_maybe_watched(abs_path) {
         return;
     }
     // Each dispatch wakes ONLY the inotify/fanotify instances whose watch
@@ -891,29 +891,25 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
         let mut woken: Vec<Arc<narf_lib::readiness::Readiness>> = Vec::new();
         for st in m.values_mut() {
             let cookie = 0u32;
-            let matched: Vec<(i32, &'static str, bool)> = st
+            // Most instances watch neither the object nor its parent: find
+            // that out without allocating.
+            let hit = |w: &Watch| w.mask & mask != 0 && (w.path == abs_path || w.path == parent);
+            if !st.watches.values().any(hit) {
+                continue;
+            }
+            let matched: Vec<(i32, bool)> = st
                 .watches
                 .iter()
-                .filter_map(|(wd, w)| {
-                    if w.mask & mask == 0 {
-                        None
-                    } else if w.path == abs_path {
-                        Some((*wd, "", false)) // watch on the object: no name
-                    } else if w.path == parent {
-                        Some((*wd, "", true)) // watch on the parent: name = base
-                    } else {
-                        None
-                    }
-                })
+                .filter(|(_, w)| hit(w))
+                // A watch on the object carries no name; one on the parent
+                // names the child.
+                .map(|(wd, w)| (*wd, w.path != abs_path))
                 .collect();
-            let produced = !matched.is_empty();
-            for (wd, _, use_base) in matched {
+            for (wd, use_base) in matched {
                 let name = if use_base { base } else { "" };
                 st.enqueue(serialize_event(wd, full_mask, cookie, name));
             }
-            if produced {
-                woken.push(st.readiness.clone());
-            }
+            woken.push(st.readiness.clone());
         }
         woken
     });
@@ -978,6 +974,18 @@ pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
     }
 }
 
+/// `fsnotify_modify(file)` for a write that already holds its open file:
+/// the name is the description's own, so no second descriptor-table lookup
+/// runs between the write and its event.
+pub(crate) fn notify_modify_description(description: &crate::fd::OpenFileDescription) {
+    if !fs_notify_active() {
+        return;
+    }
+    if let Some(name) = description.name().filter(|name| !name.deleted) {
+        fs_notify(&name.path, IN_MODIFY, false);
+    }
+}
+
 /// Release the mqueue notification `fd` registered, on its close.
 ///
 /// `sys_close` removes the descriptor before running close hooks, matching
@@ -1007,6 +1015,9 @@ pub(crate) fn notify_close(path: &str, writable: bool, is_dir: bool) {
 
 /// Paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie, for a rename.
 pub(crate) fn notify_moved(from: &str, to: &str) {
+    if !fs_notify_active() || (!event_maybe_watched(from) && !event_maybe_watched(to)) {
+        return;
+    }
     // Allocate one cookie per rename and stamp both legs with it.
     let (fp, fb) = parent_and_base(from);
     let (tp, tb) = parent_and_base(to);
@@ -1092,10 +1103,18 @@ struct InotifyFile {
 /// instance exists.
 impl Drop for InotifyFile {
     fn drop(&mut self) {
-        with_inotify_active(|m, active| {
-            m.remove(&self.id);
+        let instance = with_inotify_active(|m, active| {
+            let instance = m.remove(&self.id);
+            if let Some(st) = &instance {
+                for watch in st.watches.values() {
+                    watched_path_remove(&watch.path);
+                }
+            }
             active.store(!m.is_empty(), Ordering::Release);
+            instance
         });
+        // Queued records and watch strings are freed off the registry lock.
+        drop(instance);
     }
 }
 
@@ -1487,6 +1506,7 @@ pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
         let Some(wd) = st.allocate_watch_descriptor() else {
             return Some(Err(ENOSPC));
         };
+        watched_path_add(&path);
         st.watches.insert(wd, Watch { path, mask });
         Some(Ok(wd))
     });
@@ -1519,7 +1539,14 @@ pub fn sys_inotify_rm_watch(ctx: &mut dyn TrapContext) {
         }
     };
     let wd = a.arg1 as i32;
-    let removed = with_inotify(|m| m.get_mut(&id).map(|st| st.watches.remove(&wd).is_some()));
+    let removed = with_inotify(|m| {
+        m.get_mut(&id).map(|st| {
+            st.watches
+                .remove(&wd)
+                .map(|watch| watched_path_remove(&watch.path))
+                .is_some()
+        })
+    });
     match removed {
         Some(true) => ctx.set_return(SyscallReturn::ok(0)),
         Some(false) => ctx.set_return(err(EINVAL)),
@@ -1612,6 +1639,63 @@ fn fs_notify_active() -> bool {
     INOTIFY_ACTIVE.load(Ordering::Acquire) || FANOTIFY_ACTIVE.load(Ordering::Acquire)
 }
 
+// ── Watched-object filter ───────────────────────────────────────────
+//
+// Linux's `fsnotify()` returns before taking any lock when neither the
+// inode, its parent, the mount nor the superblock carries a mark
+// (`inode->i_fsnotify_marks`, `fsnotify_sb_has_watchers`). NARF keys watches
+// and marks by path, so its equivalent is a counting filter over every
+// watched path: each inotify watch and fanotify inode mark counts once in the
+// slot its path hashes to, adjusted under the registry lock that changes the
+// watch. A zero slot for both the object and its parent proves no watch can
+// match; a collision only costs the exact scan. Without it, once any
+// inotify instance existed (every desktop session has dozens), each write(2)
+// and open(2) in the system serialised on the global registry lock, scanned
+// every watch of every instance and allocated a match vector per instance.
+
+const WATCHED_PATH_SLOTS: usize = 4096;
+static WATCHED_PATHS: [AtomicU32; WATCHED_PATH_SLOTS] =
+    [const { AtomicU32::new(0) }; WATCHED_PATH_SLOTS];
+
+#[inline]
+fn watched_path_slot(path: &str) -> usize {
+    // FNV-1a: cheap, and every byte of the path participates.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in path.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash ^ (hash >> 32)) as usize & (WATCHED_PATH_SLOTS - 1)
+}
+
+fn watched_path_add(path: &str) {
+    WATCHED_PATHS[watched_path_slot(path)].fetch_add(1, Ordering::Release);
+}
+
+fn watched_path_remove(path: &str) {
+    let previous = WATCHED_PATHS[watched_path_slot(path)].fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous != 0, "fsnotify watched-path filter underflow");
+}
+
+/// False only when no inotify watch or fanotify mark is keyed by `path`.
+#[inline]
+fn path_maybe_watched(path: &str) -> bool {
+    WATCHED_PATHS[watched_path_slot(path)].load(Ordering::Acquire) != 0
+}
+
+/// Could an event on `abs_path` match any watch: one on the object itself,
+/// or (inotify) one on its parent directory?
+#[inline]
+fn event_maybe_watched(abs_path: &str) -> bool {
+    let (parent, _) = parent_and_base(abs_path);
+    path_maybe_watched(abs_path) || path_maybe_watched(parent)
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_event_maybe_watched(abs_path: &str) -> bool {
+    event_maybe_watched(abs_path)
+}
+
 fn with_fanotify<R>(f: impl FnOnce(&mut BTreeMap<u64, FanGroup>) -> R) -> R {
     let mut g = FANOTIFY.lock();
     f(g.get_or_insert_with(BTreeMap::new))
@@ -1686,10 +1770,17 @@ struct FanotifyFile {
 /// groups. See `InotifyFile::drop` for the gate-under-lock reasoning.
 impl Drop for FanotifyFile {
     fn drop(&mut self) {
-        with_fanotify_active(|m, active| {
-            m.remove(&self.id);
+        let group = with_fanotify_active(|m, active| {
+            let group = m.remove(&self.id);
+            if let Some(g) = &group {
+                for path in g.marks.keys() {
+                    watched_path_remove(path);
+                }
+            }
             active.store(!m.is_empty(), Ordering::Release);
+            group
         });
+        drop(group);
     }
 }
 
@@ -2010,6 +2101,9 @@ pub fn sys_fanotify_mark(ctx: &mut dyn TrapContext) {
         if flags & FANOTIFY_MARK_TYPE_BITS == 0 {
             with_fanotify(|m| {
                 if let Some(g) = m.get_mut(&id) {
+                    for path in g.marks.keys() {
+                        watched_path_remove(path);
+                    }
                     g.marks.clear();
                 }
             });
@@ -2077,13 +2171,17 @@ pub fn sys_fanotify_mark(ctx: &mut dyn TrapContext) {
     let r = with_fanotify(|m| {
         let g = m.get_mut(&id)?;
         if cmd == FAN_MARK_ADD {
-            let e = g.marks.entry(path).or_insert(0);
+            let e = g.marks.entry(path).or_insert_with_key(|path| {
+                watched_path_add(path);
+                0
+            });
             *e |= mask;
             Some(Ok(()))
         } else if let Some(cur) = g.marks.get_mut(&path) {
             *cur &= !mask;
             if *cur == 0 {
                 g.marks.remove(&path);
+                watched_path_remove(&path);
             }
             Some(Ok(()))
         } else {

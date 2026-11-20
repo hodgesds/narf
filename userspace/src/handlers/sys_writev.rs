@@ -241,7 +241,7 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         endpoint.description.set_offset(offset);
     }
     if total != 0 {
-        crate::mqueue::notify_modify_fd(task, fd_num);
+        crate::mqueue::notify_modify_description(&endpoint.description);
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

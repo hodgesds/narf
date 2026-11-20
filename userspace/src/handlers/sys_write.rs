@@ -303,7 +303,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         endpoint.description.set_offset(offset);
     }
     if total != 0 {
-        crate::mqueue::notify_modify_fd(task, fd_num);
+        crate::mqueue::notify_modify_description(&endpoint.description);
         // Re-enqueue a FIFO reader parked on the empty buffer (see the helper).
         wake_fifo_io_waiters(endpoint.ops.as_ref());
     }
