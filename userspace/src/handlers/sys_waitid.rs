@@ -164,8 +164,8 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         // affects only the return value, not event visibility.
         if rusage_ptr != 0 {
             let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
-            let ns = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
-            if write_rusage_utime(rusage_ptr, ns, task_rss_bytes(child_tid) / 1024).is_err() {
+            let times = rusage_both_of_pid(child_pid);
+            if write_rusage(rusage_ptr, times, task_rss_bytes(child_tid) / 1024).is_err() {
                 ctx.set_return(errno_ret(EFAULT));
                 return;
             }
@@ -196,21 +196,19 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         // WNOWAIT reads but does not consume the saved usage. A real reap
         // charges the parent and removes the snapshot even if a later user
         // copy faults, matching Linux's consume-before-copy ordering.
-        let (ns, kb) = if peek {
+        let (times, kb) = if peek {
             let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
-            peek_exit_rusage(child_pid).unwrap_or_else(|| {
-                (
-                    cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
-                    task_rss_bytes(child_tid) / 1024,
-                )
-            })
+            (
+                rusage_both_of_pid(child_pid),
+                peek_exit_rusage(child_pid).unwrap_or_else(|| task_rss_bytes(child_tid) / 1024),
+            )
         } else {
-            let child_cpu_ns = account_reaped_child(parent, child_pid);
-            take_exit_rusage(child_pid).unwrap_or((child_cpu_ns, 0))
+            let times = account_reaped_child(parent, child_pid);
+            (times, take_exit_rusage(child_pid).unwrap_or(0))
         };
         let mut copy_errno = None;
         if rusage_ptr != 0 {
-            if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+            if let Err(errno) = write_rusage(rusage_ptr, times, kb) {
                 copy_errno = Some(errno);
             }
         }

@@ -4358,28 +4358,26 @@ kernel_test_in!(
     smoke_abi_proc2_pkey_fork_copies_and_drop_retires
 );
 
+/// utime and stime are independent exact accumulators: every procfs view of
+/// one task reports the same split, and runtime is exactly their sum.
 #[cfg(feature = "kernel-test")]
 fn smoke_proc_cpu_time_split_matches_thread_and_sched_views() -> TestResult {
     with_setup(|| {
-        struct Restore(bool);
+        struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
                 crate::handlers::__test_reset_cpu_times_for(FAKE_TASK);
-                if !self.0 {
-                    narf_scheduler::stackful::__reset_user_own_stack_for_test();
-                }
             }
         }
-        let _restore = Restore(narf_scheduler::stackful::user_own_stack_enabled());
-        narf_scheduler::stackful::enable_user_own_stack();
+        let _restore = Restore;
         crate::handlers::__test_reset_cpu_times_for(FAKE_TASK);
-        for (total_add, kernel_add, expected) in [
-            (300_000_000, 100_000_000, (20, 10)),
-            (0, 100_000_000, (20, 10)),
-            (100_000_000, 0, (20, 20)),
-            (200_000_000, 100_000_000, (30, 30)),
+        for (user_add, kernel_add, expected) in [
+            (300_000_000, 100_000_000, (30, 10)),
+            (0, 100_000_000, (30, 20)),
+            (100_000_000, 0, (40, 20)),
+            (200_000_000, 100_000_000, (60, 30)),
         ] {
-            if !crate::task::__test_add_cpu_ns(FAKE_TASK, total_add, kernel_add) {
+            if !crate::task::__test_add_cpu_ns(FAKE_TASK, user_add, kernel_add) {
                 return Err("missing CPU-accounting fixture task");
             }
             for query in [

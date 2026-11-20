@@ -1465,6 +1465,19 @@ fn task_wake_cell(task: &KernelTask) -> Option<&crate::WakeCell> {
     Some(unsafe { &*ptr })
 }
 
+/// Switch CPU-time accounting to `next`'s continuation, charging `next`'s
+/// own accumulator unless it stopped inside a nested poll of another task.
+/// Returns the outgoing continuation's context word, for it to keep.
+#[inline]
+fn cputime_switch_to(next: &KernelTask) -> crate::cputime::ContextWord {
+    let task = task_wake_cell(next)
+        .and_then(|cell| cell.cputime.as_deref())
+        .map_or(core::ptr::null(), |t| {
+            t as *const crate::cputime::TaskCputime
+        });
+    crate::cputime::context_swap(next.cputime_ctx.load(Ordering::Relaxed), task)
+}
+
 /// Restore the wake a preemption swallowed, on the preempted continuation's
 /// resume.
 ///
@@ -1674,6 +1687,9 @@ unsafe fn try_direct_handoff(
 
         user_perf_switch(source_cell.task, false, source_ref);
         user_perf_switch(target.id, true, target_ref);
+        source_ref
+            .cputime_ctx
+            .store(cputime_switch_to(target_ref), Ordering::Relaxed);
         narf_arch::set_current_domain_byte(target_ref.domain_byte.load(Ordering::Relaxed));
         // SAFETY: target AS/TLS/stack state was validated and published above.
         unsafe { prepare_direct_arch_state(target_ref) };
@@ -1773,6 +1789,11 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     // SAFETY: same owned target-cell reference established above.
     user_perf_switch(unsafe { (*target).task }, false, current_ref);
     user_perf_switch(root_cell.task, true, root_ref);
+    // Whether the next switch lands in the root itself or in its executor
+    // continuation, the root's own accounting context is the one to resume.
+    current_ref
+        .cputime_ctx
+        .store(cputime_switch_to(root_ref), Ordering::Relaxed);
 }
 
 /// Return an active direct target to its exact runnable root task.
@@ -2518,6 +2539,12 @@ pub struct KernelTask {
     /// reference; adapter teardown clears current-task publication before RCU
     /// defers destruction of both the future and this field.
     user_context: AtomicPtr<()>,
+    /// CPU-time context this continuation had when it last switched out
+    /// (`cputime::ContextWord`): a task preempted inside an idle bracket or a
+    /// softirq handler takes that context with it instead of leaving it on the
+    /// CPU for whatever runs next. Written and read only around this task's
+    /// own switches, which the run-queue claim serializes.
+    cputime_ctx: AtomicUsize,
     /// Per-task user address-space CR3, published by the userspace
     /// `UserTaskFuture::poll` (and the inline execve path) once the AS is
     /// activated. In the own-stack model a preempted/parked task resumes via
@@ -2689,6 +2716,7 @@ impl KernelTask {
             #[cfg(target_arch = "x86_64")]
             user_pkru: AtomicU32::new(0),
             user_context: AtomicPtr::new(core::ptr::null_mut()),
+            cputime_ctx: AtomicUsize::new(crate::cputime::FRESH_CONTEXT),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
             #[cfg(target_arch = "x86_64")]
@@ -3051,9 +3079,14 @@ impl KernelTask {
             // that gate. No task code runs between this mask and the switch.
             unsafe { narf_arch::disable_interrupts() };
         }
+        let exec_cputime = cputime_switch_to(self);
         // SAFETY: both contexts and the task-owned stack remain live across
         // this switch; `exec_ctx` is this CPU's exclusive persistent slot.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        self.cputime_ctx.store(
+            crate::cputime::context_restore(exec_cputime),
+            Ordering::Relaxed,
+        );
         let resumed_cpu = this_cpu();
         if MASKED_EXCEPTION_RETURN.inner[resumed_cpu].swap(false, Ordering::AcqRel) {
             // A task just parked from a masked trap. The trap continuation is
@@ -3221,9 +3254,14 @@ impl KernelTask {
             // SAFETY: mirrors the x86 interrupt-gate continuation contract.
             unsafe { narf_arch::disable_interrupts() };
         }
+        let exec_cputime = cputime_switch_to(self);
         // SAFETY: both contexts and the task-owned stack remain live, and this
         // CPU exclusively owns the executor context for the switch round trip.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        self.cputime_ctx.store(
+            crate::cputime::context_restore(exec_cputime),
+            Ordering::Relaxed,
+        );
         let resumed_cpu = this_cpu();
         if MASKED_EXCEPTION_RETURN.inner[resumed_cpu].swap(false, Ordering::AcqRel) {
             // SAFETY: the masked exception continuation is suspended on its
@@ -3953,12 +3991,8 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
 
-    // A timer preemption is a real slice boundary just like a voluntary
-    // kernel_switch. Pause any open userspace syscall span before switching
-    // away so its off-CPU residency is not billed as kernel CPU time, and
-    // fold the complete on-CPU slice before the resume path restamps it.
-    let kernel_span_paused = pause_user_kernel_span();
-    fold_current_slice(task_ptr);
+    // CPU time needs nothing here: the executor side of the switch below
+    // (`poll_to_yield`) closes this task's span and keeps its context word.
 
     // Save the user FPU before another task clobbers XMM/x87/AVX. This CPL0
     // tick preempted the current task IN THE KERNEL — but if it is a USER task
@@ -4028,9 +4062,6 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // absorbed before the interrupted poll can return `Pending`.
     // SAFETY: same live task as the re-publication above.
     rearm_wake_after_preempt(unsafe { &*task_ptr });
-    if kernel_span_paused {
-        resume_user_kernel_span();
-    }
     // Restore this task's user FPU, clobbered by whatever ran while we were
     // switched out. Must run AFTER re-publishing CURRENT above (which
     // `user_fpu_restore` reads to resolve the area) and before the `iretq`
@@ -4148,12 +4179,6 @@ pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> b
         }
     }
     task.preempted.store(true, Ordering::Release);
-    let kernel_span_paused = if from_user {
-        false
-    } else {
-        pause_user_kernel_span()
-    };
-    fold_current_slice(task_ptr);
     if from_user {
         user_fpu_save();
     }
@@ -4180,9 +4205,6 @@ pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> b
         // An EL1 preemption interrupted a poll in progress: give back any wake
         // the resuming dispatch consumed (see `rearm_wake_after_preempt`).
         rearm_wake_after_preempt(task);
-    }
-    if kernel_span_paused {
-        resume_user_kernel_span();
     }
     if from_user {
         user_fpu_restore();
@@ -4294,10 +4316,6 @@ unsafe fn try_preempt_user_inner(frame: &mut TrapFrame, tick: bool) -> bool {
         }
         drop(g);
     }
-    // This preemption ends the current on-CPU slice. Fold it before the resume
-    // path restamps tsc_started; otherwise every timer-preempted interval
-    // disappears from task-clock accounting.
-    fold_current_slice(task_ptr);
     // This Pending return suspended an arbitrary continuation. The executor
     // must not report a QSBR quiescent state for the slot.
     // SAFETY: `task_ptr` names the live current task (same pointer used above).
@@ -4338,98 +4356,6 @@ unsafe fn try_preempt_user_inner(frame: &mut TrapFrame, tick: bool) -> bool {
 /// per-task-own-stack replacement for the longjmp-based voluntary yield / park
 /// (sys_yield, futex/wait/console park). No-op if no stackful task is current.
 ///
-/// User-slice accounting hook: called with the elapsed ns of the slice
-/// ending at every own-stack yield-out (the hook resolves the task id
-/// itself via the current-task lookup, which is still this task here).
-/// Installed by the userspace crate (`account_user_cpu_ns`) — under the
-/// own-stack model, slices end HERE via kernel_switch instead of
-/// returning through `UserTaskFuture::poll`'s fold, so without this
-/// hook a CPU-bound own-stack task accumulates ZERO utime (the alpine
-/// probe's `time` showed user 0.00 for a 5 s busy loop).
-static SLICE_ACCOUNT_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Optional userspace hooks that split a live syscall span around a CPL0
-/// timer preemption. `pause` returns true only when it closed a span; `resume`
-/// is then called after the task is current again and its slice clock has been
-/// restarted. Both callbacks run with interrupts disabled and must be
-/// allocation-free after their per-task accounting rows have been created.
-static KERNEL_SPAN_PAUSE_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static KERNEL_SPAN_RESUME_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_user_slice_account_hook(hook: fn(u64)) {
-    SLICE_ACCOUNT_HOOK.store(hook as usize, Ordering::Release);
-}
-
-pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn()) {
-    KERNEL_SPAN_PAUSE_HOOK.store(pause as usize, Ordering::Release);
-    KERNEL_SPAN_RESUME_HOOK.store(resume as usize, Ordering::Release);
-}
-
-fn pause_user_kernel_span() -> bool {
-    let hook = KERNEL_SPAN_PAUSE_HOOK.load(Ordering::Acquire);
-    if hook == 0 {
-        return false;
-    }
-    // SAFETY: the setter accepts exactly fn() -> bool and publishes its
-    // address with Release before this Acquire load.
-    let pause: fn() -> bool = unsafe { core::mem::transmute(hook) };
-    pause()
-}
-
-fn resume_user_kernel_span() {
-    let hook = KERNEL_SPAN_RESUME_HOOK.load(Ordering::Acquire);
-    if hook == 0 {
-        return;
-    }
-    // SAFETY: the setter accepts exactly fn() and publishes its address with
-    // Release before this Acquire load.
-    let resume: fn() = unsafe { core::mem::transmute(hook) };
-    resume();
-}
-
-fn fold_current_slice(p: *mut KernelTask) {
-    let h = SLICE_ACCOUNT_HOOK.load(Ordering::Acquire);
-    if h == 0 {
-        return;
-    }
-    // SAFETY: caller guarantees `p` is the live current task.
-    let started = unsafe { (*p).tsc_started.load(Ordering::Acquire) };
-    if started == 0 {
-        return;
-    }
-    let delta = narf_time::now_cycles().saturating_sub(started);
-    // SAFETY: `h` was stored by set_user_slice_account_hook as a fn(u64).
-    let f: fn(u64) = unsafe { core::mem::transmute(h) };
-    f(narf_time::cycles_to_ns(delta));
-}
-
-/// Elapsed ns of the CURRENT (un-folded) slice — lets getrusage/times/
-/// the exit-time rusage snapshot include the in-flight slice a running
-/// task hasn't yielded out of yet. 0 when no stackful task is current.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub fn current_slice_elapsed_ns() -> u64 {
-    let cpu = this_cpu();
-    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-    if p.is_null() {
-        return 0;
-    }
-    // SAFETY: in-flight task on this CPU (poll_to_yield holds it alive).
-    let started = unsafe { (*p).tsc_started.load(Ordering::Acquire) };
-    if started == 0 {
-        return 0;
-    }
-    narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started))
-}
-
-/// Unsupported architectures have no own-stack model or in-flight slice.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn current_slice_elapsed_ns() -> u64 {
-    0
-}
-
 /// # Safety
 /// Called from a syscall handler running in kernel mode on the current task's
 /// own kernel stack, with a stackful task current on this CPU.
@@ -4500,9 +4426,6 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
         unsafe { (*p).resume_irqs_masked.store(true, Ordering::Release) };
         MASKED_EXCEPTION_RETURN.inner[cpu].store(true, Ordering::Release);
     }
-    // Slice ends here — fold it before the switch (the resume side
-    // restamps tsc_started below).
-    fold_current_slice(p);
     // Any switch satisfies a deferred syscall-exit reschedule request. Clear
     // it before handing control away so a blocking syscall does not inherit a
     // stale request into the fresh slice in which it later resumes.

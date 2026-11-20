@@ -114,6 +114,10 @@ struct Desired {
 pub(crate) struct UserControl {
     desired: IrqSafeSpinLock<Desired>,
     cell: IrqSafeSpinLock<Weak<crate::WakeCell>>,
+    /// The task's utime/stime, created with its identity so the process
+    /// layer can hold it before the task is first dispatched and after its
+    /// slot is gone (a zombie's times are still reported and reaped).
+    pub(crate) cputime: Arc<crate::cputime::TaskCputime>,
     generation: AtomicU64,
     pub(crate) home: AtomicU32,
     /// Last CPU (`0..`) on which a continuation slice for this task started
@@ -140,6 +144,7 @@ impl UserControl {
                 order: None,
             }),
             cell: IrqSafeSpinLock::new(Weak::new()),
+            cputime: Arc::new(crate::cputime::TaskCputime::new()),
             generation: AtomicU64::new(1),
             home: AtomicU32::new(u32::MAX),
             last_cpu: AtomicU32::new(u32::MAX),
@@ -202,6 +207,16 @@ pub fn alloc_user_task_id() -> TaskId {
     let id = crate::alloc_task_id();
     CONTROLS.lock().insert(id, Arc::new(UserControl::new()));
     id
+}
+
+/// The utime/stime accumulator of user task `id`, from its identity
+/// reservation ([`alloc_user_task_id`]) until its scheduling state is
+/// released. Holders keep reading it after that.
+pub fn user_task_cputime(id: TaskId) -> Option<Arc<crate::cputime::TaskCputime>> {
+    CONTROLS
+        .lock()
+        .get(&id)
+        .map(|control| control.cputime.clone())
 }
 
 pub fn user_scheduling(id: TaskId) -> Option<UserScheduling> {
@@ -312,6 +327,11 @@ fn publish(
             authority,
             order,
         };
+        control.cputime.set_nice(if config.policy.is_realtime() {
+            0
+        } else {
+            config.nice
+        });
         control.generation.fetch_add(1, Ordering::Release);
     }
     if let Some(cell) = control.cell.lock().upgrade() {

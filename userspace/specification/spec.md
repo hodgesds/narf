@@ -2535,6 +2535,30 @@ socket with staged data (local queue or pump peek), POLL_OUT on a
 channel socket always; the pump publishes a channel event when a
 socket-claimable channel opens or data lands, waking parked waiters.
 
+### 3.5 Task and process CPU time
+
+Each `Task` holds its thread's `narf_scheduler::TaskCputime` (`scheduler/`
+§3.4.1, created by `alloc_user_task_id`) and a `ProcessCputime` shared by its
+thread group (Linux `signal_struct`): `CLONE_THREAD` joins the group its pid
+names, anything else starts one. Releasing a thread moves its final times into
+the group's dead total under the group lock, so a thread is counted exactly
+once. Reaping a child (`account_reaped_child`, called by every wait4/waitid
+reap before the child is released) adds its `RUSAGE_BOTH` — the child group's
+times plus its own children's — to the waiter's group children total.
+
+```rust
+pub fn handlers::thread_cpu_times(task: u64) -> TaskTimes;   // RUSAGE_THREAD, CLOCK_THREAD_CPUTIME_ID
+pub fn handlers::process_cpu_times(task: u64) -> TaskTimes;  // RUSAGE_SELF, times(), CLOCK_PROCESS_CPUTIME_ID
+pub fn handlers::children_cpu_times(task: u64) -> TaskTimes; // RUSAGE_CHILDREN, tms_cutime/cstime
+pub fn handlers::account_reaped_child(parent_task: u64, child_pid: u64) -> TaskTimes;
+```
+
+getrusage, times, wait4/waitid rusage, `/proc` stat fields 14-17, the CPU
+clocks (`CPUCLOCK_VIRT` = utime, `CPUCLOCK_PROF`/`CPUCLOCK_SCHED` = utime +
+stime), CPU itimers, RLIMIT_CPU (thread-group total) and the perf task clock
+all read these. Off-CPU time of a parked or preempted task, interrupt time and
+idle are never charged.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

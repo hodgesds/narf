@@ -49,14 +49,15 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            // Stage-4 processes are single-threaded in the common path, so
-            // both clocks use the calling task's existing user+kernel
-            // accounting. Include the active slice, which has not yet been
-            // folded into TASK_CPU_NS.
+            // `posix_cpu_clock_get` on CPUCLOCK_SCHED: the thread's, or the
+            // whole thread group's, on-CPU time including the open span.
             let task = current_task_id();
-            let ns = cpu_time_ns_of(task)
-                .saturating_add(kern_time_ns_of(task))
-                .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
+            let ns = if id == CLOCK_THREAD_CPUTIME_ID {
+                thread_cpu_times(task)
+            } else {
+                process_cpu_times(task)
+            }
+            .total_ns();
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         // `SYSCALL_DEFINE2(clock_gettime)` looks the clock up first:

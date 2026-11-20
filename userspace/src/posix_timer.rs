@@ -1796,23 +1796,16 @@ pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
 /// deadlock against a registry holder; a miss just defers to the next
 /// tick.
 fn cpu_clocks_now_try(task: u64) -> Option<(u64, u64)> {
-    let (user, kern) = crate::task::cpu_times_try(task)?;
-    let slice = narf_scheduler::stackful::current_slice_elapsed_ns();
-    let virt = user.saturating_add(slice);
-    let prof = user.saturating_add(kern).saturating_add(slice);
-    Some((virt, prof))
+    let times = crate::task::cpu_times_try(task)?;
+    Some((times.utime_ns, times.total_ns()))
 }
 
 /// The blocking-read variant for the task's own syscall context
 /// (`setitimer`/`getitimer`), where taking the registry lock is fine and a
 /// deferred answer is not.
 fn cpu_clocks_now(task: u64) -> (u64, u64) {
-    let (user, kern) = crate::task::cpu_times(task);
-    let slice = narf_scheduler::stackful::current_slice_elapsed_ns();
-    (
-        user.saturating_add(slice),
-        user.saturating_add(kern).saturating_add(slice),
-    )
+    let times = crate::task::cpu_times(task);
+    (times.utime_ns, times.total_ns())
 }
 
 /// The reference instant a `which` slot's deadlines live on: monotonic ns

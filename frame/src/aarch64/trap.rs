@@ -23,12 +23,42 @@ pub use narf_arch::aarch64::trap_frame::TrapFrame;
 /// Device mapping, untagged, so reachable from FRAME in every task).
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_irq(frame: &mut TrapFrame) {
+    if frame.spsr & 0xF == 0 {
+        // SAFETY: IRQ entry masked interrupts; hard-IRQ accounting of this
+        // entry begins inside `dispatch_irq`, after this transition.
+        unsafe { narf_scheduler::cputime::user_exit_irqs_off() };
+    }
     dispatch_irq(frame);
     if frame.spsr & 0xF == 0 {
         // SAFETY: dispatch has dropped IRQ guards/locks on the task stack;
         // the vector restore keeps IRQs masked until eret restores user state.
         unsafe { narf_scheduler::stackful::finish_user_return() };
+        // SAFETY: finish_user_return returns with IRQs masked and the vector
+        // restore keeps them masked until eret.
+        unsafe { narf_scheduler::cputime::user_enter_irqs_off() };
     }
+}
+
+/// CPU-time boundary: a synchronous exception from EL0 (`__narf_vec_sync_el0`)
+/// ends the user span (Linux `vtime_user_exit`), before its dispatcher runs.
+#[unsafe(no_mangle)]
+extern "C" fn narf_cputime_user_exit() {
+    // SAFETY: exception entry masks IRQs; nothing has run since the vector.
+    unsafe { narf_scheduler::cputime::user_exit_irqs_off() }
+}
+
+/// CPU-time boundary after `rust_aarch64_sync_dispatch` returned to
+/// `__narf_vec_sync_el0`: an `eret` to EL0 starts a user span.
+#[unsafe(no_mangle)]
+extern "C" fn narf_cputime_sync_el0_return(frame: &TrapFrame) {
+    if frame.spsr & 0xF != 0 {
+        return;
+    }
+    // SAFETY: masking IRQs has no memory effect; eret restores the user
+    // PSTATE from SPSR_EL1, so nothing after this needs them enabled.
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
+    // SAFETY: IRQs are masked until the eret below this call's return.
+    unsafe { narf_scheduler::cputime::user_enter_irqs_off() }
 }
 
 fn dispatch_irq(frame: &mut TrapFrame) {

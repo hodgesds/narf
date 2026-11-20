@@ -320,13 +320,6 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // The kernel-test harness runs every test as one shared task, so prior
-    // tests' kernel_syscall_entry brackets accumulated in-syscall CPU time
-    // against it. Clear it so this test measures a FRESH task's stime (== 0)
-    // rather than the suite's cumulative kernel time — which under slow TCG
-    // execution exceeds one tick and flaps the stime==0 assertion below.
-    crate::handlers::__test_reset_kernel_time();
-
     let mut buf = [0i64; 4];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -341,15 +334,14 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
         _ => return TestResult::Fail("times did not return OK"),
     };
     // The RETURN value is wall-clock uptime in ticks. The tms FIELDS carry
-    // per-task CPU time: utime / cutime are the task's own + reaped-children
-    // CPU ticks (>= 0; not the wall return — that decoupling is the whole
-    // point of the accounting fix), and we never split out system time so
-    // stime / cstime are always zero.
-    if buf[1] != 0 || buf[3] != 0 {
-        return TestResult::Fail("times: stime/cstime must be zero (no user/sys split)");
+    // CPU time: the process's utime/stime and its reaped children's
+    // cutime/cstime, all non-negative ticks and none of them the wall return
+    // (that decoupling is the whole point of the accounting).
+    if buf.iter().any(|&ticks| ticks < 0) {
+        return TestResult::Fail("times: utime/stime/cutime/cstime must be non-negative ticks");
     }
-    if buf[0] < 0 || buf[2] < 0 {
-        return TestResult::Fail("times: utime/cutime must be non-negative CPU ticks");
+    if buf[0].saturating_add(buf[1]) > wall {
+        return TestResult::Fail("times: this process's CPU time exceeds the uptime");
     }
     if wall < 0 {
         return TestResult::Fail("times surfaced a negative wall-clock");

@@ -638,26 +638,6 @@ pub struct UserTaskCtx {
     /// FROZEN while `parked_in_syscall` stays true means the task is never
     /// re-polled at all — its backstop registration or executor wake was
     /// lost — which no CPU-time metric can distinguish from ordinary idle.
-    /// Monotonic-ns at which this task's CURRENT on-CPU kernel span began,
-    /// or 0 when it is not executing in a syscall.
-    ///
-    /// In-syscall CPU time (`ru_stime` / `tms_stime` / `/proc` stat field
-    /// 15) used to be one bracket across the whole syscall, discarded
-    /// entirely when the syscall parked — because the span would otherwise
-    /// include arbitrary off-CPU sleep. Under the own-stack executor almost
-    /// every syscall parks at least once, so the accumulator stayed EMPTY
-    /// for every task on the system and stime read 0 forever.
-    ///
-    /// Splitting the bracket at each park fixes both halves: the span is
-    /// folded and cleared before yielding, restarted on resume, so what
-    /// accumulates is exactly the on-CPU time and never the sleep.
-    pub kern_span_start_ns: AtomicU64,
-    /// Bit N is set after normal syscall entry has created this task's
-    /// kernel-time row in CPU N's ledger. A migrated task prepares the new
-    /// CPU's row before opening its span. Timer preemption may close a span
-    /// from IRQ context, where inserting the first BTreeMap node (and therefore
-    /// allocating) is not permitted.
-    pub kern_account_ready: AtomicU64,
     pub dbg_park_checks: AtomicU64,
     /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
     /// park time so the stall watchdog can re-run the readiness scan for a
@@ -1019,8 +999,6 @@ impl UserTaskCtx {
             nanosleep_restart_deadline_ns: AtomicU64::new(0),
             ppoll_timeout_ptr: AtomicU64::new(0),
             futex_block_active: AtomicBool::new(false),
-            kern_span_start_ns: AtomicU64::new(0),
-            kern_account_ready: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),
             poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
             poll_wait_nfds: AtomicU32::new(0),
@@ -1974,10 +1952,8 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
             }
             break;
         }
-        // Close the on-CPU kernel span BEFORE yielding: everything from here
-        // to the resume below is sleep, and billing it as stime is exactly
-        // the mistake that made the whole-syscall bracket unusable.
-        crate::handlers::close_kernel_span(uc, narf_scheduler::current_task_id().raw());
+        // The sleep from here to the resume below is off-CPU: the scheduler's
+        // CPU-time accounting stops charging this task at the switch.
         // This slice is ending voluntarily — the task has work pending and is
         // giving up the CPU to wait for it (`nr_voluntary_switches`).
         crate::task::note_park(narf_scheduler::current_task_id().raw());
@@ -2004,9 +1980,6 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
         // ctx → netserve's accept() wedged into an infinite futex wait → net
         // echo hang).
         install_current(uctx);
-        // Resumed and executing again — re-open the span.
-        // SAFETY: as above; `uctx` is this task's poller-pinned ctx.
-        crate::handlers::open_kernel_span(unsafe { &*uctx });
         // An io-wait park (a readiness scan parked in poll/epoll/blocking
         // read) must RE-EXECUTE its syscall after ANY wake — including the
         // ~10 ms lost-wake backstop — so the readiness SCAN re-runs. Silent
@@ -2542,18 +2515,8 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
-    // Own-stack user-CPU accounting: slices end at kernel_switch yields
-    // (yield_current_stackful), never through this poll's fold — without
-    // the hook every own-stack task reports utime 0 (getrusage / times /
-    // ps TIME / `time`'s user column, per the alpine probe).
-    narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
-    // A CPL0 timer preemption may interrupt an active syscall. Split its
-    // kernel-time span around the off-CPU interval, matching the explicit
-    // close/yield/open sequence used by blocking syscall parks.
-    narf_scheduler::stackful::set_user_kernel_preempt_hooks(
-        crate::handlers::pause_current_kernel_span,
-        crate::handlers::resume_current_kernel_span,
-    );
+    // CPU time needs no hook: the scheduler's `cputime` accounting follows
+    // the trap boundary and every switch of the own-stack continuation.
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     // Lets the scheduler's park-with-CPU-local-state report name the system
     // call the offending task is in.
@@ -3562,12 +3525,11 @@ impl core::future::Future for UserTaskFuture {
             core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
 
-        // Mark the start of this user run-slice for CPU-time accounting
-        // (getrusage / times). Captured here (before setjmp, only read
-        // after the trap-return below — never mutated in between, so it is
-        // longjmp-safe) so the delta covers entry→trap, i.e. the time the
-        // task actually executed in user mode. See `account_user_cpu_ns`.
-        let slice_start_ns = narf_scheduler::narf_time::monotonic_ns();
+        // CPU time: every branch below enters user mode without passing the
+        // trap/syscall return hooks, so start the user span here (Linux
+        // `vtime_user_enter`). The trap that ends it closes it on entry. Runs
+        // before setjmp: the longjmp return lands after it, in kernel context.
+        narf_scheduler::cputime::user_enter();
 
         // ── Per-task-own-stack model (the new path) ──────────────────
         // The task runs on its OWN kernel stack with TSS.rsp0 / SYSCALL gs:[8]
@@ -3584,7 +3546,6 @@ impl core::future::Future for UserTaskFuture {
             narf_scheduler::stackful::set_current_user_fpu(&*this.fpu as *const FpuArea as *mut u8);
             narf_scheduler::stackful::arm_current_user_fpu();
             let top = narf_scheduler::stackful::current_stackful_stack_top();
-            let _ = slice_start_ns; // CPU accounting on the own-stack path TODO
             match this.state {
                 TaskState::Initial => {
                     this.state = TaskState::Running;
@@ -3686,18 +3647,10 @@ impl core::future::Future for UserTaskFuture {
         }
 
         // The trap returned control here: this user run-slice just ended.
-        // Charge the elapsed user-mode time to the running task so
-        // getrusage(RUSAGE_SELF) / times() report real consumed CPU time
-        // rather than wall-clock uptime. `current_task_id()` is still this
-        // task (install_current set it at the top of poll, before setjmp).
-        {
-            let now = narf_scheduler::narf_time::monotonic_ns();
-            crate::handlers::account_user_cpu_ns(now.saturating_sub(slice_start_ns));
-            // Same boundary, the other half of what `/proc/<pid>/schedstat`
-            // and `/proc/<pid>/sched` report: one slice, and whether it ended
-            // because the task parked.
-            crate::task::note_slice_end();
-        }
+        // Its CPU time was closed at the trap entry (`cputime`); what
+        // `/proc/<pid>/schedstat` and `/proc/<pid>/sched` still need from this
+        // boundary is one slice, and whether it ended because the task parked.
+        crate::task::note_slice_end();
 
         // Save this task's x87/SSE register file. The trap left the
         // user's live XMM/x87 in the hardware registers (the kernel is
@@ -4129,6 +4082,10 @@ impl core::future::Future for UserTaskFuture {
             narf_scheduler::stackful::set_current_user_tls_base(tls_base);
         }
 
+        // CPU time: start the user span (see the x86_64 poll). Before
+        // setjmp, so the legacy longjmp return lands in kernel context.
+        narf_scheduler::cputime::user_enter();
+
         // Own-stack AArch64 execution mirrors x86_64: reset SP_EL1 to the
         // task stack top before ERET, then preserve the live vector frame via
         // kernel_switch on preemption/park. This branch never re-enters the
@@ -4274,11 +4231,6 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
-    narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
-    narf_scheduler::stackful::set_user_kernel_preempt_hooks(
-        crate::handlers::pause_current_kernel_span,
-        crate::handlers::resume_current_kernel_span,
-    );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     narf_scheduler::stackful::enable_user_own_stack();

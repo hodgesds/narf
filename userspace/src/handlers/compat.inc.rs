@@ -3326,6 +3326,8 @@ fn do_execve_resolved(
         #[cfg(target_arch = "x86_64")]
         narf_scheduler::stackful::note_abandoned_stack();
         let top = narf_scheduler::stackful::current_stackful_stack_top();
+        // This jump skips the syscall return path and its CPU-time hook.
+        narf_scheduler::cputime::user_enter();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
@@ -5719,28 +5721,22 @@ pub(crate) fn cpu_clock_target(caller: u64, clock: i32, gettime: bool) -> Option
     (process_state_key(task) == task).then_some(CpuClockTarget::Process(task))
 }
 
-/// Sample a CPU clock (`cpu_clock_sample` / `cpu_clock_sample_group`) in ns.
-///
-/// LINUX-GAP: NARF accounts CPU time per task only, with no thread-group
-/// aggregate (getrusage(RUSAGE_SELF) and CLOCK_PROCESS_CPUTIME_ID share the
-/// gap). A process clock therefore samples one member: the caller itself
-/// when it is a member — exactly what CLOCK_PROCESS_CPUTIME_ID reports —
-/// otherwise the group leader.
+/// Sample a CPU clock (`cpu_clock_sample` / `cpu_clock_sample_group`) in ns:
+/// `CPUCLOCK_VIRT` is utime, `CPUCLOCK_PROF` and `CPUCLOCK_SCHED` are
+/// utime + stime. NARF's accounting is exact, so the scheduler runtime
+/// Linux keeps separately for `CPUCLOCK_SCHED` (`sum_exec_runtime`) is the
+/// same sum; both exclude interrupt time, as `IRQ_TIME_ACCOUNTING` does.
+/// A process clock sums the whole thread group (`thread_group_cputime`).
 pub(crate) fn cpu_clock_sample_ns(caller: u64, target: CpuClockTarget, which: i32) -> u64 {
-    let task = match target {
-        CpuClockTarget::Thread(t) => t,
-        CpuClockTarget::Process(t) if same_thread_group(t, caller) => caller,
-        CpuClockTarget::Process(t) => process_state_key(t),
+    let times = match target {
+        CpuClockTarget::Thread(t) => thread_cpu_times(t),
+        CpuClockTarget::Process(t) if same_thread_group(t, caller) => process_cpu_times(caller),
+        CpuClockTarget::Process(t) => process_cpu_times(process_state_key(t)),
     };
-    let mut user = cpu_time_ns_of(task);
-    if task == caller {
-        // The active slice has not yet been folded into TASK_CPU_NS.
-        user = user.saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
-    }
     if which == CPUCLOCK_VIRT {
-        user
+        times.utime_ns
     } else {
-        user.saturating_add(kern_time_ns_of(task))
+        times.total_ns()
     }
 }
 
@@ -6114,48 +6110,25 @@ pub fn __test_signal_bucket_index(task: u64) -> usize {
     signal_bits_bucket(task)
 }
 
-// ── Per-task CPU-time accounting (getrusage / times) ────────────────
+// ── Per-task CPU-time accounting (getrusage / times / wait4 / /proc) ──
 //
-// NARF previously reported `monotonic_ns()` (wall-clock uptime since
-// boot) as every process's user CPU time — so getrusage(RUSAGE_SELF)
-// / times() returned the same huge, ever-growing value for every
-// task, inflating e.g. stress-ng's per-stressor usr-time ~17x. These
-// two tables instead track REAL consumed CPU time, keyed by TaskId
-// (tid) — the same key getrusage/times resolve via current_task_id().
+// Every thread's utime/stime is the scheduler's exact transition-based
+// accounting (`narf_scheduler::cputime`, Linux `kernel/sched/cputime.c`
+// vtime with IRQ_TIME_ACCOUNTING): user spans end at each trap or syscall
+// from user mode, kernel spans at each return to it, and the off-CPU time of
+// a parked or preempted task, interrupt time and idle are never charged.
+// `crate::task::Task::cputime` holds it; `Task::process_cputime` is the
+// thread group's `signal_struct` (released threads and reaped children).
 //
-// `TASK_CPU_NS`: nanoseconds this task itself has spent executing in
-// user mode, summed over every user run-slice (accumulated by the
-// UserTaskFuture poll boundary in user_task.rs: it brackets each
-// enter-user-mode → trap-return slice and folds the delta in here).
-// The ledgers are per-CPU: hot-path folds touch only the executing CPU's
-// cache line, while cold readers aggregate a task across every CPU it ran on.
-// This mirrors Linux's per-CPU accounting shape and removes the global lock
-// cache-line bounce between unrelated tasks on different CPUs.
+// These accessors are what the syscall and /proc layers read:
 //
-// `TASK_CHILD_CPU_NS`: nanoseconds of CPU time charged to this task's
-// REAPED children (RUSAGE_CHILDREN / tms.cutime), folded in by wait4 /
-// waitid when a zombie is collected (Linux charges child time at reap,
-// not at exit).
-const TASK_ACCOUNT_CPUS: usize = narf_lib::percpu::MAX_CPUS;
-
-/// One CPU's task-time ledger. Cache-line alignment keeps the lock word and
-/// BTreeMap root from false-sharing with the neighbouring CPU's hot ledger.
-#[repr(align(64))]
-struct TaskCpuLedger {
-    values: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, u64>>,
-}
-
-impl TaskCpuLedger {
-    const fn new() -> Self {
-        Self {
-            values: narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()),
-        }
-    }
-}
-
-type TaskCpuLedgers = [TaskCpuLedger; TASK_ACCOUNT_CPUS];
-
-static TASK_CPU_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
+// * `thread_cpu_times`  — RUSAGE_THREAD, CLOCK_THREAD_CPUTIME_ID,
+//   `/proc/<pid>/task/<tid>/stat`;
+// * `process_cpu_times` — RUSAGE_SELF, times(), CLOCK_PROCESS_CPUTIME_ID,
+//   `/proc/<pid>/stat` (Linux `thread_group_cputime_adjusted`);
+// * `children_cpu_times` — RUSAGE_CHILDREN, tms_cutime/cstime,
+//   `/proc/<pid>/stat` cutime/cstime;
+// * `account_reaped_child` — the `wait_task_zombie` fold.
 
 /// Task creation timestamp (monotonic ns) — /proc/[pid]/stat field 22
 /// (starttime, in USER_HZ ticks since boot). Recorded by
@@ -6179,98 +6152,30 @@ fn task_start_ns(tid: u64) -> u64 {
         .and_then(|m| m.get(&tid).copied())
         .unwrap_or(0)
 }
-static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[inline]
-fn task_account_cpu() -> usize {
-    narf_lib::percpu::current_cpu() % TASK_ACCOUNT_CPUS
+/// `utime`/`stime` of thread `task` (a TaskId), including its open span.
+pub fn thread_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::cpu_times(task)
 }
 
-fn task_account_add_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64, delta_ns: u64) {
-    let mut values = ledgers[cpu % TASK_ACCOUNT_CPUS].values.lock();
-    let entry = values.entry(task).or_insert(0);
-    *entry = entry.saturating_add(delta_ns);
+/// `utime`/`stime` of the thread group `task` belongs to: every member,
+/// live or already released. A synthetic identity with no registered task
+/// reads as zero.
+pub fn process_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::process_cputime_of(task).map_or_else(Default::default, |group| group.group())
 }
 
-#[inline]
-fn task_account_add(ledgers: &TaskCpuLedgers, task: u64, delta_ns: u64) {
-    // Keep CPU selection and the update on one CPU. Without this bracket a
-    // timer could migrate the task after `current_cpu()` and make the resumed
-    // CPU write the old CPU's ledger, reintroducing cross-CPU contention.
-    narf_lib::sync::without_interrupts(|| {
-        task_account_add_on_cpu(ledgers, task_account_cpu(), task, delta_ns);
-    });
+/// `cutime`/`cstime` of the thread group `task` belongs to: reaped children
+/// and everything they had collected from their own reaped children.
+pub fn children_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::process_cputime_of(task).map_or_else(Default::default, |group| group.children())
 }
 
-fn task_account_ensure_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64) {
-    ledgers[cpu % TASK_ACCOUNT_CPUS]
-        .values
-        .lock()
-        .entry(task)
-        .or_insert(0);
-}
-
-fn task_account_get(ledgers: &TaskCpuLedgers, task: u64) -> u64 {
-    ledgers.iter().fold(0u64, |total, ledger| {
-        total.saturating_add(ledger.values.lock().get(&task).copied().unwrap_or(0))
-    })
-}
-
-#[cfg(feature = "unix-latency-trace")]
-fn task_account_try_get(ledgers: &TaskCpuLedgers, task: u64) -> Option<u64> {
-    let mut total = 0u64;
-    for ledger in ledgers {
-        total = total.saturating_add(ledger.values.try_lock()?.get(&task).copied().unwrap_or(0));
-    }
-    Some(total)
-}
-
-fn task_account_remove(ledgers: &TaskCpuLedgers, task: u64) {
-    for ledger in ledgers {
-        ledger.values.lock().remove(&task);
-    }
-}
-
-/// Fold a completed user run-slice (`delta_ns` of on-CPU user time) into
-/// the currently-running task's accumulated CPU time. Called from the
-/// UserTaskFuture poll on every trap-return. Alloc-free on the hot path
-/// once the task's slot exists; IRQ-safe (the poll runs with IF=0 around
-/// the trap boundary).
-pub fn account_user_cpu_ns(delta_ns: u64) {
-    if delta_ns == 0 {
-        return;
-    }
-    if crate::task::account_current_cpu_ns(0, delta_ns, 0) {
-        return;
-    }
-    let task = current_task_id();
-    if task == 0 {
-        return;
-    }
-    task_account_add(&TASK_CPU_NS, task, delta_ns);
-}
-
-/// Time this task has spent inside syscall handlers (ns) — the
-/// ru_stime / tms_stime / stat-field-15 source. Folded by
-/// `kernel_syscall_entry`'s dispatch bracket; same shape and cost as
-/// the user-time fold above (one map lock per syscall).
-static TASK_KERN_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
-
-/// Fold a completed syscall's handler duration into the current task's
-/// kernel-time accumulator. Called from `kernel_syscall_entry`.
-pub fn account_kernel_cpu_ns(delta_ns: u64) {
-    if delta_ns == 0 {
-        return;
-    }
-    if crate::task::account_current_cpu_ns(0, 0, delta_ns) {
-        return;
-    }
-    let task = current_task_id();
-    if task == 0 {
-        return;
-    }
-    task_account_add(&TASK_KERN_NS, task, delta_ns);
+/// `RUSAGE_BOTH` of the process whose visible pid is `pid`: its group plus
+/// its reaped children — what `wait4` reports for it.
+fn rusage_both_of_pid(pid: u64) -> narf_scheduler::TaskTimes {
+    let tid = pid_to_task_raw(pid).unwrap_or(pid);
+    crate::task::process_cputime_of(tid).map_or_else(Default::default, |group| group.both())
 }
 
 /// Timer-trap-safe `(user_ns, kernel_ns)` for `task`. `None` on lock
@@ -6283,277 +6188,78 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
 /// cost, which IS ours.
 #[cfg(feature = "unix-latency-trace")]
 pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
-    let (task_u, task_k) = crate::task::cpu_times_try(task)?;
-    let u = task_u.saturating_add(task_account_try_get(&TASK_CPU_NS, task)?);
-    let k = task_k.saturating_add(task_account_try_get(&TASK_KERN_NS, task)?);
-    Some((u, k))
+    let times = crate::task::cpu_times_try(task)?;
+    Some((times.utime_ns, times.stime_ns))
 }
 
-/// Fold the currently-open on-CPU kernel span into `task`'s accumulator and
-/// close it. Idempotent: a closed span (start == 0) folds nothing.
-///
-/// Called at every point the task stops executing kernel code — the park
-/// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
-/// only, never the sleep in between.
-pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    let start = uc
-        .kern_span_start_ns
-        .swap(0, core::sync::atomic::Ordering::AcqRel);
-    if start == 0 {
-        return;
-    }
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let delta = now.saturating_sub(start);
-    if delta == 0 {
-        return;
-    }
-    if !crate::task::account_current_cpu_ns(task, 0, delta) {
-        task_account_add(&TASK_KERN_NS, task, delta);
-    }
-}
-
-fn open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    // The normal own-stack path owns its accounting atomics in `Task`, so no
-    // per-CPU ledger row or interrupt-masked CPU selection is needed. A timer
-    // interrupt observes either zero or the complete release-published start.
-    if task != 0 && crate::task::current_task_is(task) {
-        uc.kern_span_start_ns.store(
-            narf_scheduler::narf_time::monotonic_ns(),
-            core::sync::atomic::Ordering::Release,
-        );
-        return;
-    }
-    narf_lib::sync::without_interrupts(|| {
-        // The pause hook can close this span from timer IRQ context. Create
-        // the task's row here, on the normal syscall path, so that close only
-        // updates an existing BTreeMap node and never allocates in the
-        // interrupt handler. Keep IRQs masked from CPU selection through the
-        // span-start store: otherwise a migration in that window could make
-        // the first close on the destination CPU allocate.
-        let cpu = task_account_cpu();
-        let cpu_bit = 1u64 << cpu;
-        if uc
-            .kern_account_ready
-            .load(core::sync::atomic::Ordering::Acquire)
-            & cpu_bit
-            == 0
-            && task != 0
-        {
-            task_account_ensure_on_cpu(&TASK_KERN_NS, cpu, task);
-            uc.kern_account_ready
-                .fetch_or(cpu_bit, core::sync::atomic::Ordering::Release);
-        }
-        uc.kern_span_start_ns.store(
-            narf_scheduler::narf_time::monotonic_ns(),
-            core::sync::atomic::Ordering::Release,
-        );
-    });
-}
-
-/// Open (or re-open) the on-CPU kernel span for the current task.
-pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
-    open_kernel_span_for(uc, current_task_id());
-}
-
-/// Test hook: open a kernel span for an explicit stand-in task. Kernel-test
-/// functions execute outside a user-task poll, so the production current-task
-/// lookup correctly returns zero there.
+/// Test hook: charge user CPU time to a registered stand-in task (the
+/// production path only ever charges the running task, through the
+/// scheduler). Returns false for an unregistered tid.
 #[doc(hidden)]
-pub fn __test_open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    open_kernel_span_for(uc, task);
+pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) -> bool {
+    crate::task::__test_add_cpu_ns(task, delta_ns, 0)
 }
 
-/// Pause the current user task's active syscall span before the scheduler
-/// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
-/// when a matching resume must re-open the span.
-fn pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    if uc
-        .kern_span_start_ns
-        .load(core::sync::atomic::Ordering::Acquire)
-        == 0
-    {
-        return false;
-    }
-    close_kernel_span(uc, task);
-    true
-}
-
-pub fn pause_current_kernel_span() -> bool {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return false;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // current own-stack user continuation.
-    pause_kernel_span_for(unsafe { &*uc }, current_task_id())
-}
-
-/// Test hook: pause a kernel span for an explicit stand-in task.
+/// Test hook: charge system CPU time to a registered stand-in task.
 #[doc(hidden)]
-pub fn __test_pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    pause_kernel_span_for(uc, task)
+pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) -> bool {
+    crate::task::__test_add_cpu_ns(task, 0, delta_ns)
 }
 
-/// Resume a syscall span previously paused by `pause_current_kernel_span`.
-pub fn resume_current_kernel_span() {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // resumed own-stack user continuation.
-    open_kernel_span(unsafe { &*uc });
-}
-
-/// Elapsed time in the current task's still-open syscall span. Adding this to
-/// the folded kernel ledger produces a monotonic live snapshot: close folds
-/// the same interval before clearing the start timestamp.
-pub fn current_kernel_span_elapsed_ns() -> u64 {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return 0;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // current user continuation.
-    let start = unsafe { &*uc }
-        .kern_span_start_ns
-        .load(core::sync::atomic::Ordering::Acquire);
-    if start == 0 {
-        0
-    } else {
-        narf_scheduler::narf_time::monotonic_ns().saturating_sub(start)
-    }
-}
-
-/// This task's accumulated in-syscall (kernel) CPU time (ns).
-pub fn kern_time_ns_of(task: u64) -> u64 {
-    crate::task::cpu_times(task)
-        .1
-        .saturating_add(task_account_get(&TASK_KERN_NS, task))
-}
-
-/// Test hook: clear the current task's accumulated in-syscall (kernel) CPU
-/// time. The kernel-test harness runs every test as ONE shared task, so every
-/// prior test's `kernel_syscall_entry` bracket accumulates here; under slow
-/// (TCG) execution that cumulative time crosses one tick and flaps the `times`
-/// stime==0 assertion. The times test resets it first so it measures a fresh
-/// task, which is what the assertion means.
-/// Test hook: clear `task`'s accumulated in-syscall CPU time. The
-/// no-argument form only reaches the CURRENT task, which a test driving a
-/// stand-in `UserTaskCtx` is not.
-#[doc(hidden)]
-pub fn __test_reset_kernel_time_for(task: u64) {
-    crate::task::reset_cpu_times(task, false, true);
-    task_account_remove(&TASK_KERN_NS, task);
-}
-
-#[doc(hidden)]
-pub fn __test_reset_kernel_time() {
-    let task = current_task_id();
-    task_account_remove(&TASK_KERN_NS, task);
-}
-
-/// Test hook: account `delta_ns` to an arbitrary task (the production
-/// path only ever charges the currently-running task). Lets the ABI test
-/// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
-#[doc(hidden)]
-pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
-    task_account_add(&TASK_CPU_NS, task, delta_ns);
-}
-
-/// Test hook: seed a task's user CPU time on a selected CPU ledger. Models a
-/// task migrating between CPUs without relying on test-runner affinity.
-#[doc(hidden)]
-pub fn __test_account_cpu_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
-    task_account_add_on_cpu(&TASK_CPU_NS, cpu, task, delta_ns);
-}
-
-/// Test hook: charge syscall CPU time to a stand-in task so perf inheritance
-/// tests can exercise the exit snapshot without running a real child syscall.
-#[doc(hidden)]
-pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) {
-    task_account_add(&TASK_KERN_NS, task, delta_ns);
-}
-
-/// Test hook: seed a task's kernel CPU time on a selected CPU ledger.
-#[doc(hidden)]
-pub fn __test_account_kernel_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
-    task_account_add_on_cpu(&TASK_KERN_NS, cpu, task, delta_ns);
-}
-
-/// Test hook: model the master exit-table sweep after perf has captured a
-/// child's final software-clock contribution.
+/// Test hook: zero a registered task's own CPU time.
 #[doc(hidden)]
 pub fn __test_reset_cpu_times_for(task: u64) {
-    crate::task::reset_cpu_times(task, true, true);
-    task_account_remove(&TASK_CPU_NS, task);
-    task_account_remove(&TASK_KERN_NS, task);
+    crate::task::__test_reset_cpu_ns(task);
 }
 
-/// This task's own accumulated user CPU time (ns).
-pub fn cpu_time_ns_of(task: u64) -> u64 {
-    crate::task::cpu_times(task)
-        .0
-        .saturating_add(task_account_get(&TASK_CPU_NS, task))
+/// Test hook: zero a registered task's group children total.
+#[doc(hidden)]
+pub fn __test_reset_children_times_for(task: u64) {
+    if let Some(group) = crate::task::process_cputime_of(task) {
+        group.__test_reset_children();
+    }
 }
 
-/// Accumulated CPU time (ns) of `task`'s reaped children.
-fn child_cpu_time_ns_of(task: u64) -> u64 {
-    TASK_CHILD_CPU_NS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
-}
-
-// Exit-time rusage snapshot: `(cpu_ns, vm_kb)` captured in the DYING
-// task's own context — the only point where its address space is still
-// resolvable (`current_address_space`); by reap time the scheduler slot
-// that owned the AS Arc is long dropped, so a reap-time
-// `task_rss_bytes(child)` reads 0. Consumed (removed) at reap by both
-// the synchronous wait4 path and `finish_wait_child`; an orphan that is
-// never reaped leaks one small entry, same lifetime class as its
+// Exit-time rusage snapshot: `vm_kb` captured in the DYING task's own
+// context — the only point where its address space is still resolvable
+// (`current_address_space`); by reap time the scheduler slot that owned the
+// AS Arc is long dropped, so a reap-time `task_rss_bytes(child)` reads 0.
+// CPU time needs no snapshot: the zombie leader's `Task` keeps its thread
+// group's `ProcessCputime` until the reap reads it. Consumed (removed) at
+// reap by both the synchronous wait4 path and `finish_wait_child`; an orphan
+// that is never reaped leaks one small entry, same lifetime class as its
 // PENDING_EXITS record.
-static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, (u64, u64)>>> =
+static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Snapshot the current (dying) task's rusage numbers for its parent's
-/// wait4. MUST run in the exiting task's own trap context. Keyed by the
-/// VISIBLE pid — the key wait4 reaps with — while the CPU tables are
-/// read by tid (fork mints ProcessId and TaskId separately).
-pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
-    // Include the CURRENT (never-to-be-yielded) slice: the dying task is
-    // mid-slice right now and exit_current_stackful switches away without
-    // folding it.
-    let cpu = cpu_time_ns_of(tid)
-        .saturating_add(child_cpu_time_ns_of(tid))
-        .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
-    // CPU time only — NO RSS snapshot here. A CLONE_THREAD sibling shares its
-    // address space and every sibling overwrites the same pid-keyed entry, so
-    // repeating even the O(1) address-space accounting locks is pure waste.
-    // Fill the RSS half ONCE, at the group-dead transition, while the final
-    // thread's address space is still alive.
+/// Open the dying process's exit-rusage row for its parent's wait4. MUST run
+/// in the exiting task's own trap context. Keyed by the VISIBLE pid — the
+/// key wait4 reaps with. A CLONE_THREAD sibling's exit finds the row open
+/// and leaves it; the RSS half is filled ONCE, at the group-dead transition,
+/// while the final thread's address space is still alive.
+pub(crate) fn record_exit_rusage(_tid: u64, pid: u64) {
     let mut g = EXIT_RUSAGE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let vm_kb = m.get(&pid).map_or(0, |&(_, vm)| vm);
-    m.insert(pid, (cpu, vm_kb));
+    g.get_or_insert_with(BTreeMap::new).entry(pid).or_insert(0);
 }
 
-/// Fill in the vm_kb half of the exit-rusage snapshot for `pid` — called
-/// exactly once per process, on the group-dead transition inside
+/// Fill in the vm_kb of the exit-rusage snapshot for `pid` — called exactly
+/// once per process, on the group-dead transition inside
 /// `notify_task_exited`, while the last thread's address space is still
-/// resolvable. Keeps the (already recorded) cpu time.
+/// resolvable.
 pub(crate) fn finalize_exit_rusage_vm(pid: u64, tid: u64) {
     let vm_kb = task_rss_bytes(tid) / 1024;
     let mut g = EXIT_RUSAGE.lock();
     if let Some(e) = g.get_or_insert_with(BTreeMap::new).get_mut(&pid) {
-        e.1 = vm_kb;
+        *e = vm_kb;
     }
 }
 
-fn take_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+fn take_exit_rusage(tid: u64) -> Option<u64> {
     let mut g = EXIT_RUSAGE.lock();
     g.as_mut().and_then(|m| m.remove(&tid))
 }
 
-fn peek_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+fn peek_exit_rusage(tid: u64) -> Option<u64> {
     EXIT_RUSAGE
         .lock()
         .as_ref()
@@ -6594,49 +6300,45 @@ fn take_wait_rusage_ptr(parent: u64) -> u64 {
     g.as_mut().and_then(|m| m.remove(&parent)).unwrap_or(0)
 }
 
-/// Reaping `child` from `parent`: charge the child's total CPU time (its
-/// own + whatever it had already accumulated from its own reaped
-/// grandchildren, per POSIX) to the parent's child-time accumulator, then
-/// drop the child's rows. Returns the child's total CPU ns so wait4 can
-/// also fill its `struct rusage` out-param. Idempotent-safe: a second
-/// reap of an already-dropped child contributes 0.
-pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
-    // `child` is the VISIBLE pid (wait4's reap key); the CPU tables key
-    // on TaskId (folds run under current_task_id()). Fork mints the two
-    // separately, so an untranslated lookup read 0 for every forked
-    // child — `time`'s user column showed 0.00 for a 5 s burn (alpine
-    // probe). Translate first, like proc_task_info does.
-    let child_tid = pid_to_task_raw(child).unwrap_or(child);
-    let child_total = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
-    if parent != 0 {
-        let mut g = TASK_CHILD_CPU_NS.lock();
-        let m = g.get_or_insert_with(BTreeMap::new);
-        let e = m.entry(parent).or_insert(0);
-        *e = e.saturating_add(child_total);
+/// Reaping `child` (a visible pid) from the waiting task `parent` (a
+/// TaskId): Linux `wait_task_zombie` adds the child's thread-group times plus
+/// its own reaped-children totals to the parent's `cutime`/`cstime`. Returns
+/// that `RUSAGE_BOTH` sum for wait4/waitid's `struct rusage`. Call before the
+/// child's task is released.
+pub fn account_reaped_child(parent: u64, child: u64) -> narf_scheduler::TaskTimes {
+    // `child` is the VISIBLE pid (wait4's reap key); the CPU state hangs off
+    // the zombie leader's Task, found by TaskId. Fork mints the two
+    // separately, so translate first, like proc_task_info does.
+    let both = rusage_both_of_pid(child);
+    if let Some(group) = crate::task::process_cputime_of(parent) {
+        group.add_children(both);
     }
-    task_account_remove(&TASK_CPU_NS, child_tid);
-    if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
-        m.remove(&child_tid);
-    }
-    child_total
+    both
 }
 
-/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory
-/// with `ru_utime` set from `ns` and every other field zero. Linux reports a
-/// failed wait4/waitid rusage copy as `EFAULT` after consuming the wait event,
-/// so callers must propagate this result rather than treating it as best-effort.
-fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) -> Result<(), u64> {
-    let mut kbuf = [0u8; 18 * 8];
-    let sec = (ns / 1_000_000_000) as i64;
-    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
-    kbuf[..8].copy_from_slice(&sec.to_ne_bytes()); // ru_utime.tv_sec
-    kbuf[8..16].copy_from_slice(&usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                      // ru_stime (16..32) stays 0 — NARF doesn't split kernel time out.
+/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory with
+/// `ru_utime`/`ru_stime` from `times` and `ru_maxrss` from `maxrss_kb`, every
+/// other field zero. Linux reports a failed wait4/waitid rusage copy as
+/// `EFAULT` after consuming the wait event, so callers must propagate this
+/// result rather than treating it as best-effort.
+fn write_rusage(out_ptr: u64, times: narf_scheduler::TaskTimes, maxrss_kb: u64) -> Result<(), u64> {
+    let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
+    let timeval = |ns: u64| {
+        (
+            (ns / 1_000_000_000) as i64,
+            ((ns % 1_000_000_000) / 1_000) as i64,
+        )
+    };
+    let (usec_s, usec_us) = timeval(times.utime_ns);
+    let (ssec_s, ssec_us) = timeval(times.stime_ns);
+    kbuf[..8].copy_from_slice(&usec_s.to_ne_bytes()); // ru_utime.tv_sec
+    kbuf[8..16].copy_from_slice(&usec_us.to_ne_bytes()); // ru_utime.tv_usec
+    kbuf[16..24].copy_from_slice(&ssec_s.to_ne_bytes()); // ru_stime.tv_sec
+    kbuf[24..32].copy_from_slice(&ssec_us.to_ne_bytes()); // ru_stime.tv_usec
     kbuf[32..40].copy_from_slice(&(maxrss_kb as i64).to_ne_bytes()); // ru_maxrss (KB)
-                                                                     // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
-                                                                     // checked by the caller); copy_to_user range-validates and
-                                                                     // SMAP-brackets the 144-byte write.
-    // SAFETY: range validation and the SMAP/PAN bracket are in copy_to_user.
+    // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
+    // checked by the caller); copy_to_user range-validates and SMAP-brackets
+    // the 144-byte write.
     unsafe { copy_to_user(out_ptr, &kbuf) }
 }
 
@@ -8029,31 +7731,38 @@ fn live_task_state(task: u64) -> char {
     }
 }
 
-/// Own-stack CPU slices include kernel execution. Export a monotonic split
-/// instead of adding the syscall ledger a second time to htop's utime+stime.
-fn proc_cpu_times_ns(task: u64) -> (u64, u64) {
-    let kernel = kern_time_ns_of(task);
-    let runtime_or_user = cpu_time_ns_of(task);
-    if narf_scheduler::stackful::user_own_stack_enabled() {
-        crate::task::adjusted_proc_cpu_times(task, runtime_or_user, kernel)
+/// `/proc` stat fields 14-17 (`utime stime cutime cstime`) in USER_HZ
+/// ticks, as `fs/proc/array.c::do_task_stat` builds them: `whole` (the
+/// `/proc/<pid>/stat` view) sums the thread group, otherwise the one thread
+/// (`/proc/<pid>/task/<tid>/stat`); both report the group's reaped children.
+fn proc_stat_cpu_ticks(task: u64, whole: bool) -> (u64, u64, u64, u64) {
+    use narf_scheduler::cputime::ns_to_clock_t;
+    let own = if whole {
+        process_cpu_times(task)
     } else {
-        (runtime_or_user, kernel)
-    }
+        thread_cpu_times(task)
+    };
+    let children = children_cpu_times(task);
+    (
+        ns_to_clock_t(own.utime_ns),
+        ns_to_clock_t(own.stime_ns),
+        ns_to_clock_t(children.utime_ns),
+        ns_to_clock_t(children.stime_ns),
+    )
 }
 
 /// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
 /// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
-    const NS_PER_TICK: u64 = 10_000_000;
     let task = task_of_visible_tid(tid)?;
     let syscall = proc_task_syscall_frame(task);
-    let (user_ns, kernel_ns) = proc_cpu_times_ns(task);
+    let (utime_ticks, stime_ticks, _, _) = proc_stat_cpu_ticks(task, false);
     Some(narf_filesystem::procfs::ThreadStat {
         wchan: proc_wchan_of_frame(syscall),
         syscall,
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
-        utime_ticks: user_ns / NS_PER_TICK,
-        stime_ticks: kernel_ns / NS_PER_TICK,
+        utime_ticks,
+        stime_ticks,
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
         state: live_task_state(task),
@@ -8093,10 +7802,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         .as_ref()
         .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
-        run_ns: {
-            let (user, kernel) = proc_cpu_times_ns(task);
-            user.saturating_add(kernel)
-        },
+        run_ns: thread_cpu_times(task).total_ns(),
         timeslices,
         voluntary_switches,
         involuntary_switches,
@@ -8832,7 +8538,8 @@ pub fn proc_task_info(
             .map(|space| space.memory_stats())
             .unwrap_or_default();
         let (tty_nr, tpgid) = proc_stat_tty(tid);
-        let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
+        let (utime_ticks, stime_ticks, cutime_ticks, cstime_ticks) =
+            proc_stat_cpu_ticks(tid, true);
         const NS_PER_TICK: u64 = 10_000_000;
         return Some(ProcTaskInfo {
             pid: visible_pid,
@@ -8851,8 +8558,10 @@ pub fn proc_task_info(
             session: pgid_to_user(read_sid(tid)),
             tty_nr,
             tpgid,
-            utime_ticks: user_ns / NS_PER_TICK,
-            stime_ticks: kernel_ns / NS_PER_TICK,
+            utime_ticks,
+            stime_ticks,
+            cutime_ticks,
+            cstime_ticks,
             num_threads: thread_group_live_count(pid),
             starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
             vm_size_bytes: stats.mapped_bytes,
@@ -9038,7 +8747,7 @@ pub fn proc_task_info(
     const NS_PER_TICK: u64 = 10_000_000;
     // One pass over the disposition table; it is behind a lock.
     let dispositions = sig_disposition_masks(tid);
-    let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
+    let (utime_ticks, stime_ticks, cutime_ticks, cstime_ticks) = proc_stat_cpu_ticks(tid, true);
     Some(ProcTaskInfo {
         // Report the pid the reader asked for (its namespace view), not the
         // outer ProcessId — stat field 1 must echo /proc/<N>.
@@ -9079,8 +8788,10 @@ pub fn proc_task_info(
         session: pgid_to_user(read_sid(tid)),
         tty_nr,
         tpgid,
-        utime_ticks: user_ns / NS_PER_TICK,
-        stime_ticks: kernel_ns / NS_PER_TICK,
+        utime_ticks,
+        stime_ticks,
+        cutime_ticks,
+        cstime_ticks,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
         // Effective uid/gid from the per-task credential table — surfaced as
         // the status Uid:/Gid: lines. Defaults to 0/0 (root) for tasks that

@@ -103,18 +103,15 @@ pub struct Task {
     /// Raw wstatus staged at exit (also mirrored in the pending-
     /// termination table until the reap plumbing migrates here).
     pub exit_code: AtomicI32,
-    /// User-mode/on-task CPU time folded at each scheduler slice boundary.
-    /// The current task is the sole writer at any instant; an atomic keeps
-    /// cold `/proc`, rusage, and perf readers lock-free across CPU migration.
-    user_cpu_ns: AtomicU64,
-    /// Time spent executing syscall continuations for this task. Kept beside
-    /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
-    kernel_cpu_ns: AtomicU64,
-    /// Cold procfs readers serialize only the adjusted view, never accounting.
-    proc_cpu_time: IrqSafeSpinLock<crate::proc_cpu_time::AdjustedCpuTime>,
+    /// This thread's utime/stime (`task_struct::{utime, stime}`), maintained
+    /// by the scheduler's exact CPU-time accounting; lock-free to read.
+    pub(crate) cputime: Arc<narf_scheduler::TaskCputime>,
+    /// The thread group's CPU time (`signal_struct`): live members, released
+    /// threads and reaped children. Shared by every `CLONE_THREAD` sibling.
+    pub(crate) process_cputime: Arc<crate::proc_cpu_time::ProcessCputime>,
     /// Run slices this task has completed — Linux's third
     /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
-    /// at the same slice boundary as `user_cpu_ns`.
+    /// at the slice boundary of the legacy (non-own-stack) user path.
     timeslices: AtomicU64,
     /// Slices that ended because the task PARKED (`nr_voluntary_switches`).
     voluntary_switches: AtomicU64,
@@ -226,6 +223,19 @@ impl Task {
     /// itself from its very first syscall.
     pub fn new_registered(tid: u64, pid: u64) -> Arc<Task> {
         let limits = crate::handlers::rlimit_for_new_task(tid, pid);
+        // The scheduler created this identity's CPU-time accumulator with its
+        // scheduling control (`alloc_user_task_id`); a synthetic identity
+        // without one still gets its own. A CLONE_THREAD child joins the
+        // group of the task its pid already names; anything else (fork, the
+        // first image) starts a group.
+        let cputime = narf_scheduler::user_task_cputime(narf_scheduler::TaskId(tid))
+            .unwrap_or_else(|| Arc::new(narf_scheduler::TaskCputime::new()));
+        let process_cputime = crate::handlers::pid_to_task_raw(pid)
+            .filter(|&leader| leader != tid)
+            .and_then(task_get)
+            .map(|leader| leader.process_cputime.clone())
+            .unwrap_or_else(crate::proc_cpu_time::ProcessCputime::new);
+        process_cputime.join(&cputime);
         #[cfg(feature = "native-ring")]
         let (authority, authority_control) =
             narf_scheduler::create_user_authority(narf_scheduler::TaskId(tid))
@@ -247,9 +257,8 @@ impl Task {
             proc_identity: crate::proc_identity::owner(tid),
             job_stop_signal: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
-            user_cpu_ns: AtomicU64::new(0),
-            kernel_cpu_ns: AtomicU64::new(0),
-            proc_cpu_time: IrqSafeSpinLock::new(crate::proc_cpu_time::AdjustedCpuTime::default()),
+            cputime,
+            process_cputime,
             timeslices: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
@@ -621,38 +630,6 @@ pub(crate) fn __test_cached_process_group(tid: u64) -> Option<(u64, u64)> {
     })
 }
 
-/// Charge CPU time to the currently-published stackful user task without
-/// cloning its `Arc` or consulting the global task registry. The scheduler's
-/// opaque context points at the `Task` owned by the in-flight future, so it is
-/// stable for this complete call.
-#[inline]
-pub(crate) fn account_current_cpu_ns(expected_tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
-    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
-    if ptr.is_null() {
-        return false;
-    }
-    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
-    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
-    let task = unsafe { &*ptr };
-    if expected_tid != 0 && task.tid != expected_tid {
-        return false;
-    }
-    if user_ns != 0 {
-        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
-    }
-    if kernel_ns != 0 {
-        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
-    }
-    true
-}
-
-#[inline]
-pub(crate) fn current_task_is(tid: u64) -> bool {
-    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
-    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`.
-    !ptr.is_null() && unsafe { (*ptr).tid == tid }
-}
-
 /// Note that the current task is parking: the slice about to end is a
 /// VOLUNTARY switch. Called from the park funnel in `user_task`, which is the
 /// only place a user task stops running while still having work to do.
@@ -664,7 +641,7 @@ pub(crate) fn note_park(tid: u64) {
 }
 
 /// Fold a completed run slice into the switch counters. Called at the same
-/// slice boundary that charges `user_cpu_ns`, so one slice is one count.
+/// slice boundary of the legacy user path, so one slice is one count.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn note_slice_end() {
@@ -672,7 +649,7 @@ pub(crate) fn note_slice_end() {
     if ptr.is_null() {
         return;
     }
-    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` for the poll
     // — the scheduler published this pointer for the in-flight task and keeps
     // it pinned for the duration of the poll.
     let task = unsafe { &*ptr };
@@ -720,38 +697,25 @@ pub(crate) fn running_syscall(tid: u64) -> Option<u32> {
     task.uctx.in_syscall.load(Ordering::Relaxed).checked_sub(1)
 }
 
+/// `utime`/`stime` of thread `tid`, its open span included. A tid with no
+/// registered task (a kernel thread, an already-released one) reads as zero.
 #[inline]
-pub(crate) fn cpu_times(tid: u64) -> (u64, u64) {
-    task_get(tid).map_or((0, 0), |task| {
-        (
-            task.user_cpu_ns.load(Ordering::Relaxed),
-            task.kernel_cpu_ns.load(Ordering::Relaxed),
-        )
-    })
+pub(crate) fn cpu_times(tid: u64) -> narf_scheduler::TaskTimes {
+    task_get(tid).map_or_else(Default::default, |task| task.cputime.sample())
 }
 
-/// A per-task monotonic procfs split, retained through zombie inspection.
-pub(crate) fn adjusted_proc_cpu_times(tid: u64, runtime: u64, kernel: u64) -> (u64, u64) {
-    if let Some(task) = task_get(tid) {
-        task.proc_cpu_time.lock().sample(runtime, kernel)
-    } else {
-        // Bootstrap/test contexts have no Task and no persistent proc view.
-        crate::proc_cpu_time::AdjustedCpuTime::default().sample(runtime, kernel)
-    }
+/// The thread group (`signal_struct`) CPU-time state of thread `tid`.
+pub(crate) fn process_cputime_of(tid: u64) -> Option<Arc<crate::proc_cpu_time::ProcessCputime>> {
+    task_get(tid).map(|task| task.process_cputime.clone())
 }
 
-/// Test hook: add CPU time to a registry entry directly.
-///
-/// The production path (`account_current_cpu_ns`) writes these same fields,
-/// but only when the scheduler has published an in-flight user context —
-/// which the ABI harness, having no real user task, never does. Writing the
-/// field the real accounting writes keeps the RLIMIT_CPU smokes exercising
-/// the real sampling path rather than a parallel one.
+/// Test hook: charge CPU time to a registered thread directly, as the
+/// scheduler's accounting would have folded it. Only for a thread that is
+/// not running (every ABI fixture identity).
 #[doc(hidden)]
 pub fn __test_add_cpu_ns(tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
     task_get(tid).is_some_and(|task| {
-        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
-        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
+        task.cputime.__test_charge(user_ns, kernel_ns);
         true
     })
 }
@@ -766,9 +730,7 @@ pub fn __test_add_cpu_ns(tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
 #[doc(hidden)]
 pub fn __test_reset_cpu_ns(tid: u64) {
     if let Some(task) = task_get(tid) {
-        task.user_cpu_ns.store(0, Ordering::Relaxed);
-        task.kernel_cpu_ns.store(0, Ordering::Relaxed);
-        *task.proc_cpu_time.lock() = Default::default();
+        task.cputime.__test_reset();
     }
 }
 
@@ -799,8 +761,8 @@ pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
     tids
 }
 
-/// Total CPU time (user + system) of thread group `pid`, in nanoseconds —
-/// Linux's `CPUCLOCK_PROF` sample for a process.
+/// Total CPU time (user + system) of the thread group thread `tid` belongs
+/// to, in nanoseconds — Linux's `CPUCLOCK_PROF` sample for a process.
 ///
 /// `RLIMIT_CPU` is a PROCESS limit, not a per-thread one: a four-thread
 /// process that could each burn the limit separately would get four times
@@ -811,46 +773,26 @@ pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
 /// in IRQ context — the same reason [`cpu_times_try`] exists. `None` is lock
 /// contention, and the caller simply rechecks on the next tick; a limit
 /// measured in whole seconds does not care about a missed sample.
-pub(crate) fn thread_group_cpu_ns_try(pid: u64) -> Option<u64> {
-    let mut total = 0u64;
-    for shard in &TASKS {
-        let tasks = shard.tasks.try_lock()?;
-        total = tasks
-            .values()
-            .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
-            .fold(total, |total, task| {
-                total
-                    .saturating_add(task.user_cpu_ns.load(Ordering::Relaxed))
-                    .saturating_add(task.kernel_cpu_ns.load(Ordering::Relaxed))
-            });
-    }
-    Some(total)
+pub(crate) fn thread_group_cpu_ns_try(tid: u64) -> Option<u64> {
+    let tasks = task_registry_shard(tid).tasks.try_lock()?;
+    let Some(task) = tasks.get(&tid) else {
+        return Some(0);
+    };
+    task.process_cputime
+        .group_try()
+        .map(narf_scheduler::TaskTimes::total_ns)
 }
 
 /// Non-blocking form for timer-trap callers (the unix-latency-trace
 /// diagnostics and the CPU-itimer tick check). `None` means registry lock
 /// contention; an absent task is a successful zero snapshot.
-pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
+pub(crate) fn cpu_times_try(tid: u64) -> Option<narf_scheduler::TaskTimes> {
     let tasks = task_registry_shard(tid).tasks.try_lock()?;
-    Some(tasks.get(&tid).map_or((0, 0), |task| {
-        (
-            task.user_cpu_ns.load(Ordering::Relaxed),
-            task.kernel_cpu_ns.load(Ordering::Relaxed),
-        )
-    }))
-}
-
-#[doc(hidden)]
-pub(crate) fn reset_cpu_times(tid: u64, user: bool, kernel: bool) {
-    if let Some(task) = task_get(tid) {
-        *task.proc_cpu_time.lock() = Default::default();
-        if user {
-            task.user_cpu_ns.store(0, Ordering::Relaxed);
-        }
-        if kernel {
-            task.kernel_cpu_ns.store(0, Ordering::Relaxed);
-        }
-    }
+    Some(
+        tasks
+            .get(&tid)
+            .map_or_else(Default::default, |task| task.cputime.sample()),
+    )
 }
 
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────
@@ -1662,6 +1604,10 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
     let owner = task_get(tid)?;
     let _binding = owner.rlimit_override.lock();
     let removed = task_registry_shard(tid).tasks.lock().remove(&tid);
+    // `__exit_signal`: the released thread's times stay in its group's total.
+    if removed.is_some() {
+        owner.process_cputime.leave(&owner.cputime);
+    }
     // Every retained-target transaction takes this task's binding gate before
     // revalidating TASKS. Unregistration therefore needs no shared process
     // lock; siblings retain their own owners and may keep using their limits.

@@ -961,6 +961,8 @@ pub fn hrtimer_run_softirq() -> u64 {
         let next = narf_lib::sync::without_interrupts(|| {
             let mut g = base.inner.lock();
             if raised || now >= g.softirq_expires_next {
+                // `HRTIMER_SOFTIRQ`: counted, callbacks charged to softirq.
+                let _softirq = narf_lib::kstat::softirq_enter(narf_lib::kstat::vector::HRTIMER);
                 g.softirq_activated = false;
                 g = run_queues(base, g, now, HRTIMER_ACTIVE_SOFT);
             }

@@ -233,10 +233,18 @@ pub struct ProcTaskInfo {
     /// already rendered in the reader's namespace; -1 when there is no
     /// controlling tty (Linux fills -1 there).
     pub tpgid: i64,
-    /// Consumed user CPU time in USER_HZ (100) ticks — stat field 14.
+    /// User-mode CPU time in USER_HZ (100) ticks — stat field 14. The
+    /// thread group's for `/proc/<pid>/stat`, the thread's own for
+    /// `/proc/<pid>/task/<tid>/stat` (`do_task_stat`'s `whole`).
     pub utime_ticks: u64,
-    /// In-syscall (kernel) CPU time in USER_HZ ticks — stat field 15.
+    /// Kernel-mode CPU time (syscalls, faults, kernel work done for the
+    /// task; never interrupt time) in USER_HZ ticks — stat field 15.
     pub stime_ticks: u64,
+    /// Reaped children's user / kernel CPU time, including what they had
+    /// collected from their own reaped children — stat fields 16 and 17
+    /// (`signal_struct::cutime`/`cstime`, the same for every thread).
+    pub cutime_ticks: u64,
+    pub cstime_ticks: u64,
     /// Creation time in USER_HZ ticks since boot — stat field 22; `ps`
     /// composes it with /proc/stat's btime for wall start times.
     pub starttime_ticks: u64,
@@ -3555,63 +3563,75 @@ fn gen_filesystems() -> String {
     text
 }
 
-/// `/proc/stat` — system-wide kernel/scheduler stats. `top`, `uptime`,
-/// `vmstat` and most monitors read this. Per-CPU idle is real: the
-/// scheduler folds each CPU's halted time into its idle counter, and
-/// busy is derived per CPU as elapsed − idle in the `user` column.
-/// NARF doesn't account per-task CPU time and has no
-/// user/system/irq split, so the remaining columns are 0; the
-/// structure is what tools parse.
+/// `/proc/stat` — system-wide kernel/scheduler stats (`fs/proc/stat.c`
+/// `show_stat`). `top`, `htop`, `vmstat` and `mpstat` read this.
+///
+/// The CPU columns are the scheduler's exact transition-based accounting
+/// (`narf_scheduler::cputime`), in USER_HZ ticks:
+///
+/// * `user` / `nice` — time in user mode, `nice` for tasks with nice > 0;
+/// * `system` — kernel mode: syscalls, exceptions, kernel and executor
+///   tasks, the scheduler itself;
+/// * `idle` / `iowait` — halted, `iowait` while a task that last ran on the
+///   CPU waits for block I/O (`nr_iowait`);
+/// * `irq` — hard interrupt handlers (entry to exit, nested NMIs included);
+/// * `softirq` — timer-wheel and soft-hrtimer callbacks, RCU callback
+///   batches, load-balance migration and `WorkKind::SoftIrq` (NAPI) polls;
+/// * `steal` — KVM steal time (0 on bare metal); `guest`/`guest_nice` 0.
+///
+/// Each span is charged to exactly one column (interrupt and steal time are
+/// removed from the context they interrupted), so a CPU's columns sum to
+/// its elapsed time since it first transitioned. Like Linux, the aggregate
+/// line sums nanoseconds before converting, so it may exceed the sum of the
+/// per-CPU lines by less than one tick per CPU.
 fn gen_stat() -> String {
     use core::fmt::Write as _;
     use narf_interrupts::snapshot_counters;
+    use narf_scheduler::cputime::ns_to_clock_t;
+
+    fn columns(out: &mut String, label: &str, t: &narf_scheduler::CpuTimes) {
+        let _ = writeln!(
+            out,
+            "{} {} {} {} {} {} {} {} {} 0 0",
+            label,
+            ns_to_clock_t(t.user),
+            ns_to_clock_t(t.nice),
+            ns_to_clock_t(t.system),
+            ns_to_clock_t(t.idle),
+            ns_to_clock_t(t.iowait),
+            ns_to_clock_t(t.irq),
+            ns_to_clock_t(t.softirq),
+            ns_to_clock_t(t.steal),
+        );
+    }
 
     let mut s = String::new();
     let up_ns = narf_time::monotonic_ns();
-    // USER_HZ = 100 → jiffies are centiseconds.
-    let elapsed = up_ns / 10_000_000;
-    // Per-CPU lines with REAL idle time — the scheduler folds each
-    // CPU's actual sleep (HLT / idle pump) into a per-cpu counter
-    // (`narf_scheduler::cpu_idle_ns`) — and busy derived as
-    // elapsed − idle in the `user` column (NARF has no per-cpu
-    // user/system/irq split). htop-class per-core bars are real now.
-    // On KVM guests the host-stolen share (`cpu_steal_ns`, 0 elsewhere)
-    // is reported in the steal column and excluded from busy, so a
-    // preempted vCPU no longer inflates `user` (issue #660).
-    // Columns: user nice system idle iowait irq softirq steal guest gnice.
-    // Online CPUs via the SMP bitmap — no queue locks (issue #2134:
-    // `cpu_queue_depths()` locked every READY queue per read). The
-    // per-CPU lines need only the cpu id plus the O(1) idle/steal
-    // counters, never a queue depth.
-    let mut busy_sum: u64 = 0;
-    let mut idle_sum: u64 = 0;
-    let mut steal_sum: u64 = 0;
+    // Online CPUs via the SMP bitmap; each CPU's times are a lock-free
+    // sequence-count read of its own accounting cell (issue #2134: no queue
+    // locks on the /proc path).
+    let mut total = narf_scheduler::CpuTimes::default();
+    let mut softirqs = [0u64; narf_lib::kstat::NR_SOFTIRQS];
     let mut cpu_lines = String::new();
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if !narf_lib::smp::is_online(cpu as u32) {
             continue;
         }
-        let idle = (narf_scheduler::cpu_idle_ns(cpu) / 10_000_000).min(elapsed);
-        // Clamp steal to what idle does not already cover so
-        // busy = elapsed − idle − steal can never go negative even if
-        // the two counters are sampled at slightly different instants.
-        let steal =
-            (narf_scheduler::cpu_steal_ns(cpu) / 10_000_000).min(elapsed.saturating_sub(idle));
-        let busy = elapsed - idle - steal;
-        busy_sum += busy;
-        idle_sum += idle;
-        steal_sum += steal;
-        let _ = writeln!(
-            cpu_lines,
-            "cpu{} {} 0 0 {} 0 0 0 {} 0 0",
-            cpu, busy, idle, steal
-        );
+        let t = narf_scheduler::cpu_times(cpu);
+        total.user += t.user;
+        total.nice += t.nice;
+        total.system += t.system;
+        total.idle += t.idle;
+        total.iowait += t.iowait;
+        total.irq += t.irq;
+        total.softirq += t.softirq;
+        total.steal += t.steal;
+        for (vec, sum) in softirqs.iter_mut().enumerate() {
+            *sum += narf_lib::kstat::softirq_count(cpu, vec);
+        }
+        columns(&mut cpu_lines, &alloc::format!("cpu{}", cpu), &t);
     }
-    let _ = writeln!(
-        s,
-        "cpu  {} 0 0 {} 0 0 0 {} 0 0",
-        busy_sum, idle_sum, steal_sum
-    );
+    columns(&mut s, "cpu ", &total);
     s.push_str(&cpu_lines);
     let irq_snapshots = snapshot_counters();
     let total_intr: u64 = irq_snapshots.iter().map(|snapshot| snapshot.total).sum();
@@ -3624,7 +3644,8 @@ fn gen_stat() -> String {
         let _ = write!(s, " {}", count);
     }
     s.push('\n');
-    let _ = writeln!(s, "ctxt 0");
+    // `nr_context_switches()`: task (or idle) changes on every CPU.
+    let _ = writeln!(s, "ctxt {}", narf_scheduler::nr_context_switches());
     // btime = wall-now minus uptime (UNIX seconds the system booted).
     let btime = (narf_time::now_wall().secs as u64).saturating_sub(up_ns / 1_000_000_000);
     let _ = writeln!(s, "btime {}", btime);
@@ -3633,9 +3654,14 @@ fn gen_stat() -> String {
     let _ = writeln!(s, "processes {}", tasks);
     let running = narf_scheduler::unparked_task_count();
     let _ = writeln!(s, "procs_running {}", running.max(1));
-    let _ = writeln!(s, "procs_blocked 0");
-    // HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU.
-    let _ = writeln!(s, "softirq 0 0 0 0 0 0 0 0 0 0 0");
+    // `nr_iowait()`: tasks blocked waiting for block I/O.
+    let _ = writeln!(s, "procs_blocked {}", narf_lib::kstat::nr_iowait_total());
+    // softirq <total> HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU.
+    let _ = write!(s, "softirq {}", softirqs.iter().sum::<u64>());
+    for count in softirqs {
+        let _ = write!(s, " {}", count);
+    }
+    s.push('\n');
     s
 }
 
@@ -3684,10 +3710,11 @@ fn gen_uptime() -> String {
     // O(1) per-CPU idle counters over the online bitmap (issue #2134) —
     // no queue locks, where `cpu_queue_depths()` locked every READY
     // queue per read.
+    // `fs/proc/uptime.c` sums `get_idle_time`, which excludes iowait.
     let mut idle_ns: u64 = 0;
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if narf_lib::smp::is_online(cpu as u32) {
-            idle_ns += narf_scheduler::cpu_idle_ns(cpu);
+            idle_ns += narf_scheduler::cpu_times(cpu).idle;
         }
     }
     let idle_seconds = idle_ns / 1_000_000_000;
@@ -3721,7 +3748,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     let rss_pages = info.resident_pages;
     let num_threads = info.num_threads.max(1); // field 20; 0 → 1
     format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.pid,
         info.comm,
         info.state,
@@ -3732,6 +3759,8 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         info.tpgid,  // field 8
         info.utime_ticks,
         info.stime_ticks,
+        info.cutime_ticks,
+        info.cstime_ticks,
         num_threads,
         info.starttime_ticks,
         vsize,
@@ -4752,6 +4781,8 @@ fn sample_task_info() -> ProcTaskInfo {
         tpgid: -1,
         utime_ticks: 0,
         stime_ticks: 0,
+        cutime_ticks: 0,
+        cstime_ticks: 0,
         starttime_ticks: 0,
         uid: 0,
         gid: 0,
@@ -5155,6 +5186,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         tpgid: 3,
         utime_ticks: 5,
         stime_ticks: 9,
+        cutime_ticks: 11,
+        cstime_ticks: 13,
         starttime_ticks: 6,
         uid: 0,
         gid: 0,
@@ -5191,6 +5224,9 @@ fn smoke_pid_stat_real_fields() -> TestResult {
     if f[13] != "5" || f[14] != "9" {
         return TestResult::Fail("utime/stime must land in fields 14-15");
     }
+    if f[15] != "11" || f[16] != "13" {
+        return TestResult::Fail("cutime/cstime must land in fields 16-17");
+    }
     if f[21] != "6" || f[22] != "8192" || f[23] != "2" {
         return TestResult::Fail("starttime/vsize/rss must land in fields 22-24");
     }
@@ -5205,46 +5241,95 @@ fn smoke_pid_stat_real_fields() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs", smoke_pid_stat_real_fields);
 
-/// /proc/stat per-cpu lines carry real idle jiffies now (the
-/// scheduler's idle_wait bracket) with busy = elapsed − idle in the
-/// user column. Shape checks: aggregate + one line per CPU, 11 tokens
-/// each, aggregate = per-cpu sums, idle ≤ elapsed.
+/// /proc/stat CPU lines (`show_stat`): an aggregate line and one line per
+/// online CPU, 11 tokens each. The aggregate sums nanoseconds before
+/// converting to ticks, so it lies within [sum of per-CPU lines, that sum
+/// + one tick per CPU) for every column. Each CPU's columns together track
+/// its elapsed time: never more than the uptime.
 fn smoke_stat_per_cpu_lines_real_idle() -> TestResult {
+    let uptime_ticks = narf_time::monotonic_ns() / 10_000_000;
     let s = gen_stat();
-    let mut agg: Option<(u64, u64)> = None;
-    let mut busy_sum = 0u64;
-    let mut idle_sum = 0u64;
-    let mut cpus = 0usize;
+    let mut agg: Option<[u64; 10]> = None;
+    let mut sums = [0u64; 10];
+    let mut cpus = 0u64;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("cpu") {
             let toks: Vec<&str> = line.split_whitespace().collect();
             if toks.len() != 11 {
                 return TestResult::Fail("cpu lines must have 11 tokens");
             }
-            let user: u64 = toks[1].parse().unwrap_or(u64::MAX);
-            let idle: u64 = toks[4].parse().unwrap_or(u64::MAX);
-            if user == u64::MAX || idle == u64::MAX {
-                return TestResult::Fail("cpu busy/idle must be integers");
+            let mut cols = [0u64; 10];
+            for (col, tok) in cols.iter_mut().zip(&toks[1..]) {
+                match tok.parse() {
+                    Ok(v) => *col = v,
+                    Err(_) => return TestResult::Fail("cpu columns must be integers"),
+                }
             }
             if rest.starts_with(' ') {
-                agg = Some((user, idle));
+                agg = Some(cols);
             } else {
                 cpus += 1;
-                busy_sum += user;
-                idle_sum += idle;
+                if cols.iter().sum::<u64>() > uptime_ticks + 1 {
+                    return TestResult::Fail("a CPU accounted more time than has elapsed");
+                }
+                for (sum, col) in sums.iter_mut().zip(cols) {
+                    *sum += col;
+                }
             }
         }
     }
     if cpus == 0 {
         return TestResult::Fail("stat must render at least cpu0");
     }
-    match agg {
-        Some((b, i)) if b == busy_sum && i == idle_sum => TestResult::Pass,
-        Some(_) => TestResult::Fail("aggregate cpu line must equal per-cpu sums"),
-        None => TestResult::Fail("aggregate cpu line missing"),
+    let Some(agg) = agg else {
+        return TestResult::Fail("aggregate cpu line missing");
+    };
+    if agg
+        .iter()
+        .zip(sums)
+        .any(|(&total, sum)| total < sum || total >= sum + cpus)
+    {
+        return TestResult::Fail("aggregate cpu line must be the per-cpu sum within rounding");
     }
+    TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_stat_per_cpu_lines_real_idle);
+
+/// The `ctxt`, `procs_blocked` and `softirq` lines carry real counters:
+/// `softirq`'s first value is the sum of the ten vectors that follow, which
+/// are the per-vector totals of `/proc/softirqs`.
+fn smoke_stat_counter_lines_are_live() -> TestResult {
+    let s = gen_stat();
+    let field = |name: &str| -> Option<Vec<u64>> {
+        s.lines()
+            .find(|line| line.split_whitespace().next() == Some(name))
+            .map(|line| {
+                line.split_whitespace()
+                    .skip(1)
+                    .filter_map(|tok| tok.parse().ok())
+                    .collect()
+            })
+    };
+    let Some(ctxt) = field("ctxt") else {
+        return TestResult::Fail("stat ctxt line missing");
+    };
+    if ctxt.len() != 1 || ctxt[0] != narf_scheduler::nr_context_switches().min(ctxt[0]) {
+        return TestResult::Fail("ctxt must count the scheduler's context switches");
+    }
+    if field("procs_blocked").map(|v| v.len()) != Some(1) {
+        return TestResult::Fail("procs_blocked line missing");
+    }
+    let Some(softirq) = field("softirq") else {
+        return TestResult::Fail("stat softirq line missing");
+    };
+    if softirq.len() != 1 + narf_lib::kstat::NR_SOFTIRQS
+        || softirq[0] != softirq[1..].iter().sum::<u64>()
+    {
+        return TestResult::Fail("softirq total must be the sum of its ten vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_stat_counter_lines_are_live);
 
 /// Build a fully-populated `ProcTaskInfo` for the status/stat renderers.
 fn sample_info() -> ProcTaskInfo {
@@ -5271,6 +5356,8 @@ fn sample_info() -> ProcTaskInfo {
         tpgid: -1,
         utime_ticks: 1,
         stime_ticks: 2,
+        cutime_ticks: 0,
+        cstime_ticks: 0,
         starttime_ticks: 9,
         uid: 1000,
         gid: 1001,
