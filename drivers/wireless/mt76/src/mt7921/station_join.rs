@@ -150,6 +150,7 @@ fn note_comeback(bssid: [u8; 6], tu: u32) {
         "mt76: {} rejected association temporarily; comeback duration {tu} TU ({ms} ms)",
         Mac(bssid)
     );
+    crate::iface::report_assoc_comeback(bssid, tu);
 }
 
 /// mac80211's `authenticate with %pM` / `associate with %pM` info lines.
@@ -1324,16 +1325,29 @@ impl<B: Backend> Session<B> {
                     && f[10..16] == peer
                     && f[16..22] == peer
                     && (f[4..10] == own || f[4..10] == [255; 6])
-                    && (matches!(f[0], 0x50 | 0x80)
-                        && f.get(36..).is_some_and(|ies| !profile.matches(ies))
-                        || f[0] == 0xd0 && (f[24..26] == [21, 2] || f[24..26] == [7, 0]))
+                    && matches!(f[0], 0x50 | 0x80)
+                    && f.get(36..).is_some_and(|ies| !profile.matches(ies))
                 {
-                    let why = if f[0] == 0xd0 {
-                        "changed its operating mode (action frame) in a way we can't support"
-                    } else {
-                        "changed caps/bw in a way we can't support"
-                    };
-                    return Err(self.lose_peer(peer, WLAN_REASON_DEAUTH_LEAVING, false, why));
+                    return Err(self.lose_peer(
+                        peer,
+                        WLAN_REASON_DEAUTH_LEAVING,
+                        false,
+                        "changed caps/bw in a way we can't support",
+                    ));
+                }
+                // The AP's VHT Operating Mode Notification or HT Notify
+                // Channel Width: mac80211 `ieee80211_vht_handle_opmode` /
+                // `ieee80211_ht_handle_chanwidth_notif` update the AP
+                // station's bandwidth and NSS for `rate_control_rate_update`.
+                // mt7921 has hardware rate control and no `sta_rc_update`
+                // op, so nothing is programmed; the link is kept.
+                if native.ccmp.is_none()
+                    && f.len() >= 26
+                    && f[0] == 0xd0
+                    && f[10..16] == peer
+                    && (f[24..26] == [21, 2] || f[24..26] == [7, 0])
+                {
+                    continue;
                 }
             }
             if let Some(ap) = self.station.ap_phy {
@@ -1413,29 +1427,30 @@ impl<B: Backend> Session<B> {
             let Some(header) = frame.get(..24) else {
                 continue;
             };
-            if let Some(profile) = self
-                .station
-                .ht20_profile
-                .filter(|_| self.station.ap_phy.is_none())
-            {
-                if matches!(header[0], 0x80 | 0x50)
-                    && header[1] & 0xc7 == 0
-                    && header[10..16] == peer
-                    && header[16..22] == peer
-                    && (header[4..10] == own || header[4..10] == [0xff; 6])
-                    && frame.get(36..).is_some_and(|ies| {
-                        !crate::mt7921::ht20::Profile::parse(ies, channel)
-                            .and_then(|p| p.with_secondary(profile.negotiated_secondary()))
-                            .is_ok_and(|current| current.same_static(profile))
+            if self.station.ht20_profile.is_some()
+                && self.station.ap_phy.is_none()
+                && matches!(header[0], 0x80 | 0x50)
+                && header[1] & 0xc7 == 0
+                && header[10..16] == peer
+                && header[16..22] == peer
+                && (header[4..10] == own || header[4..10] == [0xff; 6])
+                && frame.get(36..).is_some_and(|ies| {
+                    // `ieee80211_config_bw`: only a lost HT mode or a
+                    // moved primary channel ends an HT connection; an
+                    // unparseable Beacon changes nothing, and capability
+                    // contents are not compared.
+                    narf_wireless::association::phy::ApElements::parse(ies).is_ok_and(|ap| {
+                        ap.ht_capability().is_none()
+                            || ap.ht_operation().is_none_or(|op| op[0] != channel)
                     })
-                {
-                    return Err(self.lose_peer(
-                        peer,
-                        WLAN_REASON_DEAUTH_LEAVING,
-                        false,
-                        "changed HT caps/operation in a way we can't support",
-                    ));
-                }
+                })
+            {
+                return Err(self.lose_peer(
+                    peer,
+                    WLAN_REASON_DEAUTH_LEAVING,
+                    false,
+                    "changed HT operation in a way we can't support",
+                ));
             }
             // The AP announces it is leaving this channel (Channel Switch
             // Announcement, element 37, or Extended CSA, element 60), on a
@@ -1488,17 +1503,11 @@ impl<B: Backend> Session<B> {
                             // tokens retain their original ownership until drain.
                             self.station.wmm_pending = Some(updated);
                         }
-                        _ => {
-                            // Missing/malformed parameters or changed rows with
-                            // an unchanged change counter cannot authorize TX.
-                            self.station.wmm_pending = None;
-                            return Err(self.lose_peer(
-                                peer,
-                                WLAN_REASON_DEAUTH_LEAVING,
-                                false,
-                                "sent WMM parameters we can't use",
-                            ));
-                        }
+                        // mac80211 `ieee80211_sta_wmm_params`: a Beacon without
+                        // (a parseable) WMM Parameter element, or with an
+                        // unchanged parameter set count, keeps the current
+                        // parameters.
+                        _ => {}
                     }
                 }
             }
@@ -1722,8 +1731,11 @@ impl<B: Backend> Session<B> {
                     let Some(completion) = self.retire_data(completion) else {
                         continue;
                     };
+                    // `mt7921_mac_tx_free`: a frame the firmware gave up on is
+                    // counted (`wcid->stats.tx_failed`) and freed; the link
+                    // and the MSDU's remaining fragments go on.
                     if completion.status != 0 {
-                        return Err(self.fail_data(Error::Rejected(completion.status)));
+                        self.station.link_stats.count_tx_failure();
                     }
                     if self.station.tx_fragments.is_empty() {
                         return Ok(completion);
@@ -1963,12 +1975,12 @@ impl<B: Backend> Session<B> {
     }
 
     /// Apply terminal TX statuses the other station owner's waits retired
-    /// for this owner (`retire_data`): a failure fails this owner's data
-    /// path, a success releases its next fragment.
+    /// for this owner (`retire_data`): a failure is counted, as
+    /// `mt7921_mac_tx_free` does, and each status releases the next fragment.
     fn settle_tx_credit(&mut self) -> Result<(), Error> {
         while let Some(status) = self.station.tx_credit.pop_front() {
             if status != 0 {
-                return Err(self.fail_data(Error::Rejected(status)));
+                self.station.link_stats.count_tx_failure();
             }
             if !self.station.tx_fragments.is_empty() {
                 if let Err(error) = self.check_station_tx() {
@@ -1999,8 +2011,12 @@ impl<B: Backend> Session<B> {
                 let Some(completion) = self.retire_data(completion) else {
                     continue;
                 };
+                // `mt7921_mac_tx_free`: `wcid->stats.tx_failed += !!stat`;
+                // the frame is freed and the link kept. Rate control is the
+                // firmware's (`IEEE80211_HW_HAS_RATE_CONTROL`), fed by the
+                // same TX status.
                 if completion.status != 0 {
-                    return Err(self.fail_data(Error::Rejected(completion.status)));
+                    self.station.link_stats.count_tx_failure();
                 }
                 // The next fragment follows its predecessor's terminal TX.
                 if !self.station.tx_fragments.is_empty() {

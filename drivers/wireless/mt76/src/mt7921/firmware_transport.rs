@@ -1602,6 +1602,14 @@ trait Backend {
         narf_crypto::try_fill_random_bytes(out).map_err(|_| Error::EntropyUnavailable)
     }
     fn progress(&mut self, _stage: Stage) {}
+    /// Sleep an owner wait until the device's next event instead of
+    /// re-polling at once (Linux `mt76_mcu_get_response` sleeps on
+    /// `mcu.wait`, woken by the MCU RX NAPI). True when `cx` is registered
+    /// for that wake; false re-polls at once (a pure model, or an event
+    /// already pending).
+    fn park(&mut self, _cx: &mut core::task::Context<'_>) -> bool {
+        false
+    }
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;
     fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
@@ -2200,10 +2208,29 @@ impl<B: Backend> Session<B> {
                 Ok(Some(value)) => Poll::Ready(Ok(value)),
                 Err(error) => Poll::Ready(Err(error)),
                 Ok(None) => {
-                    cx.waker().wake_by_ref();
+                    if !self.backend.park(cx) {
+                        cx.waker().wake_by_ref();
+                    }
                     Poll::Pending
                 }
             }
+        })
+        .await
+    }
+
+    /// One pause of a polling owner loop (the associated scan): until the
+    /// device's next event, or at once without an interrupt line.
+    async fn park_once(&mut self) {
+        let mut parked = false;
+        poll_fn(|cx| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            if !self.backend.park(cx) {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
         })
         .await
     }

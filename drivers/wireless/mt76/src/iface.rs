@@ -967,7 +967,12 @@ fn station_info_from(
         chain_signal_dbm,
         rx_bitrate: link.rx_rate,
         tx_bitrate: link.tx_rate,
-        tx_failed: link.tx_failed,
+        // `mt792x_sta_statistics`: `wcid->stats.tx_failed` (released
+        // failures) and the sampled TX status failures.
+        tx_failed: match (link.tx_failed, link.tx_free_failed) {
+            (None, 0) => None,
+            (sampled, released) => Some(sampled.unwrap_or(0).saturating_add(released)),
+        },
         rx_packets: counters.map(|c| clamp(c.rx_packets)),
         tx_packets: counters.map(|c| clamp(c.tx_packets)),
         ..Default::default()
@@ -2092,6 +2097,16 @@ pub(crate) fn remove_scan_iface() {
         narf_net::registry().unregister_for_handle(&cap);
     }
     narf_net::iface::unregister(&iface.name);
+}
+
+/// `cfg80211_assoc_comeback` (from mac80211 `ieee80211_rx_mgmt_assoc_resp`)
+/// for the active station: NL80211_CMD_ASSOC_COMEBACK with the AP and its
+/// comeback time in TUs.
+pub(crate) fn report_assoc_comeback(bssid: [u8; 6], timeout_tu: u32) {
+    let Some(iface) = ACTIVE.lock().clone() else {
+        return;
+    };
+    narf_wireless::nl80211::notify_assoc_comeback(&iface.name, bssid, timeout_tu);
 }
 
 pub(crate) fn is_active(iface: &Arc<Mt76Iface>) -> bool {

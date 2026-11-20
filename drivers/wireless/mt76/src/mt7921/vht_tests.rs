@@ -986,26 +986,17 @@ kernel_test_in!(
 );
 
 fn changes() -> Result<(), &'static str> {
-    for action in [false, true] {
+    // mac80211 `ieee80211_config_bw`, `ieee80211_vht_handle_opmode`:
+    // 0: an unchanged Beacon; 1: changed VHT Capabilities contents (mac80211
+    // keeps the association's capabilities); 2: the AP's VHT Operating Mode
+    // Notification; 3: a Beacon that lost its VHT elements (a new
+    // connection mode). Only the last ends the link.
+    for case in 0..4 {
         let (mut s, b, p) = prepared(2, false);
         if join(&mut s, &b, p, false) != Ok(42) {
             return Err("VHT change fixture");
         }
-        let mut unchanged = vec![0; 36];
-        unchanged[0] = 0x80;
-        unchanged[4..10].copy_from_slice(&OWN);
-        unchanged[10..16].copy_from_slice(&AP);
-        unchanged[16..22].copy_from_slice(&AP);
-        unchanged.extend_from_slice(&super::wmm_tests::PARAMETERS);
-        let (ht, vht) = elements(2, 36);
-        unchanged.extend_from_slice(&ht);
-        unchanged.extend_from_slice(&vht);
-        let mut packet = descriptor(&unchanged);
-        packet[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
-        s.backend.packets.push_back(packet);
-        if s.receive_ethernet() != Ok(None) || s.station.peer_lost {
-            return Err("unchanged AP PHY facts compared with local transmit intersection");
-        }
+        let action = case == 2;
         let mut frame = vec![0; if action { 27 } else { 36 }];
         frame[0] = if action { 0xd0 } else { 0x80 };
         frame[4..10].copy_from_slice(&OWN);
@@ -1014,28 +1005,38 @@ fn changes() -> Result<(), &'static str> {
         if action {
             frame[24..27].copy_from_slice(&[21, 2, 1]);
         } else {
+            frame.extend_from_slice(&super::wmm_tests::PARAMETERS);
             let (ht, mut vht) = elements(2, 36);
-            vht[2] ^= 32;
+            if case == 1 {
+                vht[2] ^= 32;
+            }
             frame.extend_from_slice(&ht);
-            frame.extend_from_slice(&vht);
+            if case != 3 {
+                frame.extend_from_slice(&vht);
+            }
         }
         let mut packet = descriptor(&frame);
         packet[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
         s.backend.packets.push_back(packet);
-        if s.receive_ethernet() != Err(Error::DeviceGone)
-            || s.start_ethernet(&tx()) != Err(Error::DeviceGone)
-        {
-            return Err("bound VHT change kept packet admission");
+        let received = s.receive_ethernet();
+        if case == 3 {
+            if received != Err(Error::DeviceGone)
+                || s.start_ethernet(&tx()) != Err(Error::DeviceGone)
+            {
+                return Err("a lost VHT mode kept packet admission");
+            }
+        } else if received != Ok(None) || s.station.peer_lost || s.start_ethernet(&tx()).is_err() {
+            return Err("a Beacon or opmode change mac80211 follows ended the link");
         }
     }
     Ok(())
 }
-fn mt76_vht_bound_operation_or_opmode_change_closes_both_packet_owners() -> TestResult {
+fn mt76_vht_only_a_lost_mode_ends_the_link_opmode_and_same_channel_follow() -> TestResult {
     changes().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/vht",
-    mt76_vht_bound_operation_or_opmode_change_closes_both_packet_owners
+    mt76_vht_only_a_lost_mode_ends_the_link_opmode_and_same_channel_follow
 );
 
 fn capability() -> Result<(), &'static str> {

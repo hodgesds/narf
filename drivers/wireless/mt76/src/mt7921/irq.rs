@@ -42,7 +42,11 @@ pub(crate) struct Line {
     delivered: AtomicU64,
     /// A device vector is bound and its sources are routed to this line.
     bound: AtomicBool,
+    /// The service worker's wait.
     waker: IrqSafeSpinLock<Option<Waker>>,
+    /// An owner operation's MCU or scan wait (Linux `mcu.wait`): its own
+    /// slot, so it never displaces the worker's waker.
+    owner_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
 impl Line {
@@ -52,15 +56,31 @@ impl Line {
             delivered: AtomicU64::new(0),
             bound: AtomicBool::new(false),
             waker: IrqSafeSpinLock::new(None),
+            owner_waker: IrqSafeSpinLock::new(None),
         }
     }
-    /// Record a source and wake the worker.
+    /// Record a source and wake the worker and any parked owner wait.
     pub(crate) fn raise(&self) {
         self.raised.fetch_add(1, Ordering::AcqRel);
         let waker = self.waker.lock().take();
         if let Some(waker) = waker {
             waker.wake();
         }
+        let waker = self.owner_waker.lock().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    /// Park an owner wait (`wait_event_timeout(dev->mcu.wait, ...)`) until
+    /// the next raise after `seen`. False when one already happened: the
+    /// caller polls again at once.
+    pub(crate) fn park(&self, waker: &Waker, seen: u64) -> bool {
+        *self.owner_waker.lock() = Some(waker.clone());
+        if self.raised() != seen {
+            self.owner_waker.lock().take();
+            return false;
+        }
+        true
     }
     pub(crate) fn raised(&self) -> u64 {
         self.raised.load(Ordering::Acquire)
@@ -217,6 +237,19 @@ mod tests {
         }
         if line.bound() || line.delivered() != 0 {
             return TestResult::Fail("a software raise counted as a device interrupt");
+        }
+        // An owner wait parks in its own slot beside the worker's wait.
+        let seen = line.raised();
+        let mut wait = core::pin::pin!(line.wait(seen));
+        if wait.as_mut().poll(&mut cx).is_ready() || !line.park(cx.waker(), seen) {
+            return TestResult::Fail("an owner wait did not park beside the worker");
+        }
+        line.raise();
+        if line.waker.lock().is_some() || line.owner_waker.lock().is_some() {
+            return TestResult::Fail("a raise did not wake both the worker and the owner wait");
+        }
+        if line.park(cx.waker(), seen) {
+            return TestResult::Fail("an owner wait parked past a raise it had not seen");
         }
         TestResult::Pass
     }

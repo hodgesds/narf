@@ -141,16 +141,20 @@ kernel_test_in!(
 );
 
 fn mt76_tx_fragment_failure_and_teardown_drop_the_remaining_fragments() -> TestResult {
-    // A rejected fragment fails the data owner and drops the rest.
+    // A fragment the firmware released as failed is counted, as
+    // `mt7921_mac_tx_free` does; the link stays and mac80211's remaining
+    // fragments of the MSDU still go out.
     let mut session = joined(false, true);
     session.frag_threshold = 256;
     session.start_ethernet(&ethernet(1000)).unwrap();
+    let queued = session.station.tx_fragments.len();
     session.backend.completion_status = 1;
-    if session.poll_data_tx().is_ok()
-        || !session.station.tx_fragments.is_empty()
-        || session.station.security.is_some()
+    if session.poll_data_tx().is_err()
+        || session.station.link_stats.tx_free_failed == 0
+        || session.station.tx_fragments.len() >= queued
+        || session.station.security.is_none()
     {
-        return TestResult::Fail("rejected fragment kept the remaining fragments");
+        return TestResult::Fail("a failed fragment ended the link or stopped the MSDU");
     }
     // Teardown with fragments queued drains only the one in flight.
     let mut session = joined(false, true);

@@ -51,6 +51,9 @@ pub(crate) struct LinkStats {
     pub tx_failed: Option<u32>,
     /// The TX status report already taken (`RateReport::sequence`).
     pub txs_sequence: Option<u32>,
+    /// Frames the firmware released as failed (`mt7921_mac_tx_free`'s
+    /// `wcid->stats.tx_failed`).
+    pub tx_free_failed: u32,
 }
 
 impl LinkStats {
@@ -102,6 +105,11 @@ impl LinkStats {
             self.tx_rate = Some(rate);
         }
         self.tx_failed = Some(report.failures);
+    }
+
+    /// One frame the firmware released with a failure status.
+    pub fn count_tx_failure(&mut self) {
+        self.tx_free_failed = self.tx_free_failed.wrapping_add(1);
     }
 
     /// `NL80211_STA_INFO_SIGNAL_AVG`.
