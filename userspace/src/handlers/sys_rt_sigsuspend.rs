@@ -61,16 +61,14 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
 
     // Temporarily install the new mask, remembering the prior one so the
     // interrupting delivery's sigreturn restores IT (not the temp mask).
-    let prior = signal_bits_update_or_init(&SIGNAL_MASK, task, |slot| {
-        let prior = *slot;
-        *slot = mask;
-        prior
-    });
-    set_suspend_saved_mask(task, prior);
-    if prior & !mask != 0 {
-        // The suspend mask may unblock a signal that is already pending.
-        signal_hint_task(task);
-    }
+    //
+    // `sigsuspend` → `set_current_blocked` → `__set_task_blocked`: the install
+    // goes through the one mask-change path, which recomputes this thread's
+    // claim on group-shared pending signals (`recalc_sigpending`). A raw store
+    // here left a SIGCHLD that arrived while it was blocked invisible to this
+    // thread's delivery, so a shell's `sigsuspend` reaping loop never saw its
+    // child exit. A re-execution after a park keeps the saved original.
+    install_temporary_signal_mask(task, mask);
 
     // Pause until signal.
     sys_pause(ctx);
