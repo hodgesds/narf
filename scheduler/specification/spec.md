@@ -178,8 +178,6 @@ pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn address_space_of_running(id: TaskId) -> Option<Arc<AddressSpace>>;
 pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
-pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
-pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());
 pub unsafe fn set_current_user_context(context: *mut ());
 pub fn current_user_context() -> *mut ();
 #[cfg(target_arch = "x86_64")]
@@ -286,12 +284,12 @@ after the future can no longer be polled. This counter intentionally does not
 follow passive `Arc` clones, including `active_mm`: memory's OOM reaper needs an
 O(1) proof that no task can fault or contend a VMA lock, not proof that no
 kernel code retains the page-table allocation.
-On x86_64 and aarch64, every own-stack switch-out folds the elapsed on-CPU slice through
-the slice-account hook. A CPL0 timer preemption additionally calls `pause`
-before switching and calls `resume` only when `pause` reported an open syscall
-span, preventing off-CPU residency from being charged as kernel CPU time. The
-callbacks run with interrupts disabled and may not sleep or take a non-IRQ-safe
-lock.
+On x86_64 and aarch64, every switch of an own-stack continuation (executor ↔
+task in `poll_to_yield`, task ↔ task in a direct handoff) also switches its
+CPU-time context word (§3.4.1): the outgoing continuation keeps the context it
+stopped in, so off-CPU residency of a parked or preempted task is never charged
+to it, and a task preempted inside an idle bracket or softirq handler does not
+leave that context on the CPU.
 Own-stack user tasks are timer-preemptible at the CPL3 scheduler tick. The
 preemption path retains the task's live trap frame, FPU state, address space,
 TLS base, and dedicated kernel-stack continuation across requeue, so a
@@ -1090,6 +1088,61 @@ pub fn realtime_bandwidth(cpu: CpuId) -> RealtimeBandwidth;
   kernel tasks and own-stack user tasks are tick-preemptive on both
   architectures. NMI/FIQ entry accounting remains incomplete.
 
+### 3.4.1 CPU-time accounting (`cputime`)
+
+Linux `kernel/sched/cputime.c` with `VIRT_CPU_ACCOUNTING_GEN` (time measured at
+every transition) and `IRQ_TIME_ACCOUNTING` (interrupt time removed from the
+interrupted context). Source of `/proc/stat`'s CPU lines and `ctxt`, and of
+every task's utime/stime (`/proc/<pid>/stat`, getrusage, times, wait4 rusage,
+`CLOCK_*_CPUTIME_ID`, CPU itimers, RLIMIT_CPU, perf task-clock).
+
+```rust
+pub struct TaskCputime;                     // utime/stime of one task
+impl TaskCputime {
+    pub const fn new() -> Self;
+    pub fn sample(&self) -> TaskTimes;      // includes the open span
+    pub fn set_nice(&self, nice: i8);       // nice > 0 ⇒ `nice` column
+}
+pub struct TaskTimes { pub utime_ns: u64, pub stime_ns: u64 }
+pub struct CpuTimes { pub user, nice, system, idle, iowait, irq, softirq, steal: u64 } // ns
+pub fn cpu_times(cpu: usize) -> CpuTimes;   // lock-free, includes the open span
+pub fn nr_context_switches() -> u64;        // `ctxt`
+pub fn cputime::cpu_context_switches(cpu: usize) -> u64;
+pub fn user_task_cputime(id: TaskId) -> Option<Arc<TaskCputime>>; // from alloc_user_task_id
+pub fn cpu_idle_ns(cpu: usize) -> u64;      // idle + iowait
+// Trap boundary, called by frame/ with interrupts masked:
+pub unsafe fn cputime::user_exit_irqs_off(); // entered the kernel from CPL3/EL0
+pub unsafe fn cputime::user_enter_irqs_off(); // about to return to CPL3/EL0
+pub fn cputime::user_enter();                // masking variant (first user entry)
+pub const cputime::USER_HZ: u64 = 100;
+pub const fn cputime::ns_to_clock_t(ns: u64) -> u64;
+pub fn cputime::cputime_adjust(stime: u64, utime: u64, rtime: u64,
+    prev: &mut (u64, u64)) -> (u64, u64);   // Linux cputime_adjust
+```
+
+- Each CPU is in exactly one context — user, system, softirq or idle — and
+  each span between transitions is charged to that context minus the hard
+  IRQ/NMI cycles measured inside it (`accounting`) and minus KVM steal
+  (sampled at most once per ms and removed from later spans). `irq` is the
+  hard-IRQ accounting itself; `steal` is `cpu_steal_ns`. A CPU's columns
+  therefore sum to its elapsed time since its first transition.
+- Transitions: trap/syscall entry from and return to user mode (frame/), the
+  first user entry of a task (userspace/), `poll_with_domain` (dispatch of
+  every task: system, or softirq for `WorkKind::SoftIrq`), the stackful
+  switches (each continuation keeps its own context word), every idle halt
+  bracket, and the softirq scopes installed into `narf_lib::kstat`.
+- The running task is charged the same span: user spans as utime, system and
+  softirq-kind dispatch spans as stime. Idle and softirq handlers that
+  interrupt a task are charged to no task.
+- Idle with `narf_lib::kstat::nr_iowait(cpu) > 0` is iowait
+  (`get_cpu_iowait_time_us`).
+- `ctxt` counts changes of the task (or idle) a CPU runs (`prev != next`).
+- Writers are the owning CPU only, with interrupts masked, inside a
+  sequence-count section; a transition costs one TSC read and stores to the
+  CPU's own cache lines — no lock, allocation or I/O. Readers on other CPUs
+  retry a torn snapshot (bounded) and add the open span themselves, so each
+  column and each task field is monotonic.
+
 ### 3.5 CPU hot-plug
 
 ```rust
@@ -1322,6 +1375,12 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   it sees either the old CPU or a new CPU; never a torn migration.
 - Resource-budget accounting is never racy: a task that exceeds its
   budget cannot cause a refund to another task.
+- CPU-time accounting (§3.4.1) is observational: no scheduling, budget,
+  preemption or domain decision reads it. Only the owning CPU writes its
+  cell, always with interrupts masked; a transition never takes a lock,
+  allocates or performs I/O, and every task pointer in a CPU's context word is
+  pinned by the dispatch or switch that installed it until a later transition
+  removes it. Remote readers never dereference another CPU's task pointer.
 - A policy cannot override budget eligibility. Regular eligible work always
   outranks idle-borrow work, and strict-throttled work cannot be polled before
   replenishment.

@@ -668,6 +668,11 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     };
     let _ = writeln!(buf, "\n*** KERNEL PANIC ***");
     let _ = writeln!(buf, "{info}");
+    // The KASLR offset, so the slid addresses below can be symbolised
+    // (`xtask kallsyms --print-slide`). Linux prints it from its panic
+    // notifier and nowhere else; the boot log deliberately does not carry
+    // it. Early in the report so the fixed-size buffer cannot cut it off.
+    let _ = writeln!(buf, "{}", narf_memory::kaslr::KernelOffset::current());
     // Best-effort RBP-chain walk. Rust kernels keep frame pointers
     // by default; each frame is `[saved_rbp, return_addr]`. Stop at
     // null / unaligned / outside [0xffff_8000_0000_0000, 0xffff_ffff_ffff_ffff]
@@ -877,7 +882,125 @@ pub fn trap_sink(s: &str) {
     }
 }
 
-/// Nonblocking `fmt::Write` adapter for the trap printer.
+// ── One record per formatted message ────────────────────────────────
+//
+// `write!` / `writeln!` reach a `fmt::Write` sink as many `write_str` calls,
+// one per literal piece and per argument. Each used to go to the log store
+// and the UART on its own, so two CPUs printing at once interleaved
+// mid-line, and a trap writer that could not take the store lock for one
+// fragment silently lost it — tearing a line and, when the lost fragment
+// held the `\n`, running it into the next one. Linux formats a whole printk
+// into its record before committing it (`vprintk_store` → `printk_sprint`),
+// so readers see whole records. The writers below do the same: `write_fmt`
+// renders the message into a staging buffer and hands the sink one string.
+
+/// Bytes one staged message holds — a whole record. A longer message is
+/// handed on in record-sized pieces, which the store continues as
+/// `LOG_CONT` records exactly as before.
+const STAGE_BYTES: usize = klog::RECORD_TEXT_MAX;
+
+/// A message being formatted. Claimed through `busy`, not by CPU identity, so
+/// a formatter that is preempted and migrates keeps sole use of it; a
+/// writer that finds its CPU's buffer claimed (an interrupt or NMI on top of
+/// a formatting task) streams its fragments as before.
+struct Stage {
+    busy: AtomicBool,
+    buf: core::cell::UnsafeCell<[u8; STAGE_BYTES]>,
+}
+
+// SAFETY: `buf` is accessed only by the holder of `busy` (claimed with an
+// Acquire CAS, released with a Release store), so accesses never overlap.
+unsafe impl Sync for Stage {}
+
+static STAGES: [Stage; narf_lib::percpu::MAX_CPUS] = [const {
+    Stage {
+        busy: AtomicBool::new(false),
+        buf: core::cell::UnsafeCell::new([0; STAGE_BYTES]),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+/// `fmt::Write` into a claimed [`Stage`], handing full buffers to `sink`.
+struct StageWriter<'a> {
+    buf: &'a mut [u8; STAGE_BYTES],
+    len: usize,
+    sink: fn(&str),
+}
+
+impl StageWriter<'_> {
+    fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // Only whole `&str` pieces cut at char boundaries are copied in.
+        if let Ok(text) = core::str::from_utf8(&self.buf[..self.len]) {
+            (self.sink)(text);
+        }
+        self.len = 0;
+    }
+}
+
+impl fmt::Write for StageWriter<'_> {
+    fn write_str(&mut self, mut s: &str) -> fmt::Result {
+        while !s.is_empty() {
+            let room = STAGE_BYTES - self.len;
+            let mut take = s.len().min(room);
+            while !s.is_char_boundary(take) {
+                take -= 1;
+            }
+            self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.len += take;
+            s = &s[take..];
+            if !s.is_empty() {
+                self.flush();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `fmt::Write` that forwards every fragment (the nested-writer fallback).
+struct Fragments(fn(&str));
+
+impl fmt::Write for Fragments {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        (self.0)(s);
+        Ok(())
+    }
+}
+
+/// Render `args` and hand `sink` the whole message in one call (see the
+/// section note above).
+fn write_message(args: fmt::Arguments<'_>, sink: fn(&str)) -> fmt::Result {
+    if let Some(s) = args.as_str() {
+        sink(s);
+        return Ok(());
+    }
+    let cpu = narf_lib::percpu::current_cpu() % narf_lib::percpu::MAX_CPUS;
+    let stage = &STAGES[cpu];
+    if stage
+        .busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return fmt::write(&mut Fragments(sink), args);
+    }
+    // SAFETY: the CAS above made this writer the stage's only user until
+    // the Release store below.
+    let buf = unsafe { &mut *stage.buf.get() };
+    let mut w = StageWriter { buf, len: 0, sink };
+    let r = fmt::write(&mut w, args);
+    w.flush();
+    stage.busy.store(false, Ordering::Release);
+    r
+}
+
+fn write_str_at<const LEVEL: u32>(s: &str) {
+    write_str_level(LEVEL, s);
+}
+
+/// Nonblocking `fmt::Write` adapter for the trap printer. Each `write!` /
+/// `writeln!` is one [`trap_sink`] call, so it reaches the log store as one
+/// record.
 pub struct TrapWriter;
 
 impl fmt::Debug for TrapWriter {
@@ -890,6 +1013,10 @@ impl fmt::Write for TrapWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         trap_sink(s);
         Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        write_message(args, trap_sink)
     }
 }
 
@@ -917,6 +1044,10 @@ impl fmt::Write for ConsoleOnlyWriter {
         write_str_console_only(s);
         Ok(())
     }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        write_message(args, write_str_console_only)
+    }
 }
 
 /// Formatter adapter for an explicitly prioritised kernel message.
@@ -935,12 +1066,20 @@ impl<const LEVEL: u32> fmt::Write for PriorityWriter<LEVEL> {
         write_str_level(LEVEL, s);
         Ok(())
     }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        write_message(args, write_str_at::<LEVEL>)
+    }
 }
 
 impl fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         write_str(s);
         Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        write_message(args, write_str)
     }
 }
 

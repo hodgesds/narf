@@ -753,6 +753,9 @@ fn run_base(base: &'static TimerBase) -> u64 {
     if base.next_expiry.load(Ordering::Acquire) > now {
         return 0;
     }
+    // A due base is `TIMER_SOFTIRQ` work: counted, and its callbacks' CPU
+    // time charged to softirq (`narf_lib::kstat`).
+    let _softirq = narf_lib::kstat::softirq_enter(narf_lib::kstat::vector::TIMER);
     let mut ran = 0;
     let mut g = base.inner.lock();
     if g.expiry_active {

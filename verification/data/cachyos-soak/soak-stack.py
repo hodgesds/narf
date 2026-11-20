@@ -60,15 +60,16 @@ def main():
     run = sys.argv[1]
     words = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
     report = load_report()
-    slide = 0
-    with open(os.path.join(run, "serial.log"), "rb") as f:
-        m = re.search(rb"kernel image slide (0x[0-9a-f]+)", f.read())
-        if m:
-            slide = int(m.group(1), 16)
-    syms = report.Symbols(os.path.join(run, "narf-frame"), slide)
-    lo, hi = syms.addrs[0] + slide, syms.addrs[-1] + slide
+    elf = os.path.join(run, "narf-frame")
     qmp = os.path.join(run, "qmp.sock")
     registers = hmp(qmp, "info registers -a")
+    # The guest is live, so its IDT base gives the slide directly; the boot
+    # log no longer prints it (only a panic report does).
+    slide = report.slide_from_registers(registers, elf)
+    if slide is None:
+        slide = report.kaslr_slide(run, report.load(run), elf)
+    syms = report.Symbols(elf, slide)
+    lo, hi = syms.addrs[0] + slide, syms.addrs[-1] + slide
     for block in re.split(r"(?m)^CPU#", registers)[1:]:
         cpu = block.split("\n", 1)[0].strip()
         rip = int(re.search(r"RIP=([0-9a-f]+)", block).group(1), 16)

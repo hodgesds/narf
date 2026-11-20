@@ -239,6 +239,20 @@ impl Agreement {
     pub fn pending(&self, now: u64) -> bool {
         self.phase == Phase::Stopping || self.expired(now)
     }
+    /// When [`Self::pending`] next turns true without traffic: now for a
+    /// stopping agreement, else its inactivity timeout (`session_timer`).
+    pub fn next_deadline(&self) -> Option<u64> {
+        if self.phase == Phase::Stopping {
+            Some(0)
+        } else if self.active() && self.timeout != 0 {
+            Some(
+                self.activity
+                    .saturating_add(u64::from(self.timeout) * 1_024_000),
+            )
+        } else {
+            None
+        }
+    }
     pub fn tick(&mut self, now: u64) {
         if self.expired(now) {
             self.stop(true);
@@ -358,6 +372,12 @@ impl Owner {
     }
     pub fn pending(&self, now: u64) -> bool {
         self.agreements.iter().any(|a| a.pending(now))
+    }
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.agreements
+            .iter()
+            .filter_map(Agreement::next_deadline)
+            .min()
     }
     pub fn capacity(&self) -> usize {
         self.agreements

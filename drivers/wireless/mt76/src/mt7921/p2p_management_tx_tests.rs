@@ -28,7 +28,7 @@ fn request(concrete: &Concrete, multicast: bool) -> narf_wireless::MgmtTxRequest
 }
 fn report(pid: u8, ack: bool) -> Vec<u8> {
     [
-        1u32 << 27 | 40,
+        40u32, // RXD0: length 40, PKT_TYPE_TXS (0) in bits 31:27
         0,
         if ack { 0 } else { 1 << 16 },
         0,

@@ -220,6 +220,22 @@ impl SaeAp {
                 self.session.on_commit(body).ok()?;
                 Some((1, want, commit))
             }
+            // hostapd `handle_auth_sae`: on an infrastructure BSS a Commit
+            // in Committed state (the station re-sent it because our Commit
+            // was lost) restarts the instance ("Allow previous PWE to be
+            // reused") and is answered with a new Commit.
+            1 if status == want && self.session.state() == SaeState::Committed => {
+                let (own, peer) = self.addresses;
+                self.session = match self.pwe {
+                    ApSaePwe::HuntAndPeck => {
+                        SaeSession::new_hunt_and_peck(&self.password, own, peer)
+                    }
+                    ApSaePwe::HashToElement => {
+                        SaeSession::new_h2e_bytes(&self.ssid, &self.password, own, peer)
+                    }
+                };
+                self.step(seq, status, body)
+            }
             2 if status == 0 && self.session.state() == SaeState::Committed => {
                 let confirm = self.session.build_confirm();
                 self.session.on_confirm(body).ok()?;

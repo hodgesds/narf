@@ -55,9 +55,9 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::sync::{IrqSafeSpinLock, IrqSafeSpinLockGuard};
 
 /// `CONFIG_LOG_BUF_SHIFT` — Linux's Kconfig default (`init/Kconfig`), which
 /// is also what Arch Linux and most distribution kernels ship.
@@ -131,8 +131,10 @@ struct Cont {
     /// `LOG_CONT` when this line's beginning was already committed as an
     /// earlier record.
     flags: u8,
-    /// CPU whose line this is — Linux's `caller_id` check in
-    /// `prb_reserve_in_last`: a fragment from another CPU never extends it.
+    /// Caller id whose line this is — Linux's `caller_id` check in
+    /// `prb_reserve_in_last`: a fragment from another CPU, or from trap
+    /// context on the same CPU, never extends it (see [`task_caller`] and
+    /// [`trap_caller`]).
     owner: usize,
 }
 
@@ -172,9 +174,9 @@ struct Store {
     syslog_seq: u64,
     syslog_partial: usize,
     cont: Cont,
-    /// CPUs (bit `cpu % 64`) whose last line was cut short; their next
-    /// record is a `LOG_CONT` fragment.
-    cont_broken: u64,
+    /// Caller ids (bit [`caller_bit`]) whose last line was cut short; their
+    /// next record is a `LOG_CONT` fragment.
+    cont_broken: u128,
 }
 
 impl Store {
@@ -319,25 +321,26 @@ impl Store {
         self.cont.active = false;
         self.cont.len = 0;
         if !newline {
-            self.cont_broken |= cpu_bit(self.cont.owner);
+            self.cont_broken |= caller_bit(self.cont.owner);
         }
     }
 
-    /// Kernel `write_str` path: fragments accumulate until `\n`. `cpu` is
-    /// the writer's CPU: a fragment never extends another CPU's line.
-    fn append(&mut self, level: u8, ts_nsec: u64, cpu: usize, s: &[u8]) {
-        if self.cont.active && self.cont.owner != cpu {
+    /// Kernel `write_str` path: fragments accumulate until `\n`. `caller`
+    /// is the writer's caller id ([`task_caller`] / [`trap_caller`]): a
+    /// fragment never extends another caller's line.
+    fn append(&mut self, level: u8, ts_nsec: u64, caller: usize, s: &[u8]) {
+        if self.cont.active && self.cont.owner != caller {
             self.flush_cont(false);
         }
         let mut rest = s;
         while !rest.is_empty() {
             if !self.cont.active {
-                let bit = cpu_bit(cpu);
+                let bit = caller_bit(caller);
                 self.cont.active = true;
                 self.cont.len = 0;
                 self.cont.level = level & 7;
                 self.cont.ts_nsec = ts_nsec;
-                self.cont.owner = cpu;
+                self.cont.owner = caller;
                 self.cont.flags = if self.cont_broken & bit != 0 {
                     LOG_CONT
                 } else {
@@ -548,8 +551,59 @@ impl Store {
     }
 }
 
-fn cpu_bit(cpu: usize) -> u64 {
-    1u64 << (cpu % 64)
+/// Caller id of ordinary (task-context) kernel text on `cpu`.
+///
+/// Linux's `printk_caller_id` is the task pid in task context and
+/// `0x80000000 + cpu` otherwise, so a line an interrupt prints never extends
+/// the half-line of the task it interrupted. NARF's trap writers are the
+/// interrupt-context printers; [`trap_caller`] is their id.
+fn task_caller(cpu: usize) -> usize {
+    cpu % narf_lib::percpu::MAX_CPUS
+}
+
+/// Caller id of trap-context text ([`try_record_trap`]) on `cpu`.
+fn trap_caller(cpu: usize) -> usize {
+    narf_lib::percpu::MAX_CPUS + task_caller(cpu)
+}
+
+fn caller_bit(caller: usize) -> u128 {
+    1u128 << (caller % 128)
+}
+
+/// Commit the "messages dropped" notice for every record attempt that could
+/// not enter the store since the last notice ([`note_dropped`]).
+///
+/// Linux's ringbuffer never refuses a writer, so a reader only ever loses
+/// whole records, and the console prints `** %lu printk messages dropped **`
+/// in place of what it could not keep up with (`console_prepend_dropped`).
+/// NARF's store is lock-based: trap text cannot wait indefinitely for a lock
+/// a stopped or interrupted holder owns, so it can be refused. A refused
+/// record leaves no sequence-number gap for a reader to notice; this record
+/// makes the loss explicit at the point it happened instead.
+fn report_dropped(st: &mut Store, ts_nsec: u64) {
+    let n = DROPPED.swap(0, Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    let mut text = [0u8; 64];
+    let mut len = 0;
+    let mut num = [0u8; 24];
+    let digits = fmt_u64(n, 0, b' ', &mut num);
+    for part in [
+        &b"** "[..],
+        &num[..digits],
+        &b" printk messages dropped **"[..],
+    ] {
+        text[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
+    }
+    st.commit(
+        LOG_KERN,
+        DEFAULT_MESSAGE_LOGLEVEL as u8,
+        LOG_NEWLINE,
+        ts_nsec,
+        &text[..len],
+    );
 }
 
 // ── formatting ──────────────────────────────────────────────────────
@@ -712,6 +766,79 @@ static RING: IrqSafeSpinLock<Store> = IrqSafeSpinLock::new(Store::new());
 /// Other CPUs simply wait for the lock — their messages are not lost.
 static IN_RECORD: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// Record attempts refused since the last "messages dropped" notice (see
+/// [`report_dropped`]).
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn note_dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How long trap-context text waits for a store lock another CPU holds.
+///
+/// Every store critical section is short and bounded: one record's copy, or
+/// one record's render for a reader. A `/dev/kmsg` reader (journald) takes
+/// the lock once per record, so during a burst it holds it often. Trap
+/// text that only TRIED the lock was refused whenever it collided with one
+/// of those reads, which tore every line of a watchdog dump. Waiting a
+/// bounded time for a holder on another CPU loses nothing to ordinary
+/// contention, while a holder that never releases (a CPU stopped by the
+/// panic NMI with the lock held) costs one wait, not one per line: see
+/// [`TRAP_WAIT_EXPIRED`].
+const TRAP_WAIT_NS: u64 = 2_000_000;
+
+/// Bound for [`TRAP_WAIT_NS`] before the record clock is installed.
+const TRAP_WAIT_SPINS: u32 = 1 << 20;
+
+/// Set when a trap writer's bounded wait expired; later trap writers only
+/// try the lock until any writer gets it again.
+static TRAP_WAIT_EXPIRED: AtomicBool = AtomicBool::new(false);
+
+/// The store was entered: trap text may wait for it again. Reads first so
+/// the common case writes no shared cache line.
+fn clear_trap_wait_expired() {
+    if TRAP_WAIT_EXPIRED.load(Ordering::Relaxed) {
+        TRAP_WAIT_EXPIRED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Take the store for trap text: wait a bounded time for a holder on another
+/// CPU (see [`TRAP_WAIT_NS`]), never for one on this CPU (the caller has
+/// already checked [`IN_RECORD`]).
+fn lock_for_trap() -> Option<IrqSafeSpinLockGuard<'static, Store>> {
+    if let Some(g) = RING.try_lock() {
+        clear_trap_wait_expired();
+        return Some(g);
+    }
+    if TRAP_WAIT_EXPIRED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let start = now_ns();
+    let mut spins: u32 = 0;
+    loop {
+        core::hint::spin_loop();
+        if let Some(g) = RING.try_lock() {
+            clear_trap_wait_expired();
+            return Some(g);
+        }
+        spins = spins.wrapping_add(1);
+        // Trap context runs with interrupts masked: answer TLB-shootdown and
+        // membarrier requests while waiting, as `IrqSafeSpinLock::lock` does.
+        if spins & 0xFF == 0 {
+            narf_lib::sync::service_masked_work();
+        }
+        let expired = if start != 0 {
+            now_ns().saturating_sub(start) >= TRAP_WAIT_NS
+        } else {
+            spins >= TRAP_WAIT_SPINS
+        };
+        if expired {
+            TRAP_WAIT_EXPIRED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    }
+}
+
 fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
     let cpu = narf_lib::percpu::current_cpu();
     if IN_RECORD.load(Ordering::Acquire) == cpu {
@@ -759,27 +886,47 @@ pub fn record_level(level: u32, s: &str) {
     }
     let ts = now_ns();
     let cpu = narf_lib::percpu::current_cpu();
-    let _ = with_store(|st| st.append(level.min(7) as u8, ts, cpu, s.as_bytes()));
+    let stored = with_store(|st| {
+        report_dropped(st, ts);
+        st.append(level.min(7) as u8, ts, task_caller(cpu), s.as_bytes());
+    });
+    if stored.is_none() {
+        // An NMI or fault on the CPU inside the store's critical section.
+        note_dropped();
+    } else {
+        clear_trap_wait_expired();
+    }
 }
 
-/// Best-effort trap text: never wait for a store lock the interrupted code
-/// (or a stopped peer) may hold. Keep the ordinary continuation and timestamp
-/// format so kmsg readers and persistent-log exports can capture diagnostics
-/// on hosts without an attached serial console. No allocation or console I/O.
+/// Trap text: never wait for a store lock the interrupted code on this CPU
+/// holds, and wait only a bounded time for one held elsewhere (see
+/// [`TRAP_WAIT_NS`]). Text that cannot be stored is counted and reported by
+/// the next record that is ([`report_dropped`]), never silently lost. Keep the
+/// ordinary continuation and timestamp format so kmsg readers and
+/// persistent-log exports can capture diagnostics on hosts without an
+/// attached serial console. No allocation or console I/O.
 pub(crate) fn try_record_trap(s: &str) {
     if s.is_empty() {
         return;
     }
     let cpu = narf_lib::percpu::current_cpu();
     if IN_RECORD.load(Ordering::Acquire) == cpu {
+        note_dropped();
         return;
     }
     let ts = now_ns();
-    let Some(mut store) = RING.try_lock() else {
+    let Some(mut store) = lock_for_trap() else {
+        note_dropped();
         return;
     };
     IN_RECORD.store(cpu, Ordering::Release);
-    store.append(DEFAULT_MESSAGE_LOGLEVEL as u8, ts, cpu, s.as_bytes());
+    report_dropped(&mut store, ts);
+    store.append(
+        DEFAULT_MESSAGE_LOGLEVEL as u8,
+        ts,
+        trap_caller(cpu),
+        s.as_bytes(),
+    );
     IN_RECORD.store(usize::MAX, Ordering::Release);
 }
 
@@ -788,7 +935,13 @@ pub(crate) fn try_record_trap(s: &str) {
 /// is truncated to [`RECORD_TEXT_MAX`].
 pub fn emit(facility: u8, level: u8, text: &[u8]) {
     let ts = now_ns();
-    let _ = with_store(|st| st.emit(facility, level, ts, text));
+    let stored = with_store(|st| {
+        report_dropped(st, ts);
+        st.emit(facility, level, ts, text);
+    });
+    if stored.is_none() {
+        note_dropped();
+    }
 }
 
 /// `prb_first_valid_seq` — the oldest stored record.

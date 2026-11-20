@@ -103,18 +103,15 @@ pub struct Task {
     /// Raw wstatus staged at exit (also mirrored in the pending-
     /// termination table until the reap plumbing migrates here).
     pub exit_code: AtomicI32,
-    /// User-mode/on-task CPU time folded at each scheduler slice boundary.
-    /// The current task is the sole writer at any instant; an atomic keeps
-    /// cold `/proc`, rusage, and perf readers lock-free across CPU migration.
-    user_cpu_ns: AtomicU64,
-    /// Time spent executing syscall continuations for this task. Kept beside
-    /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
-    kernel_cpu_ns: AtomicU64,
-    /// Cold procfs readers serialize only the adjusted view, never accounting.
-    proc_cpu_time: IrqSafeSpinLock<crate::proc_cpu_time::AdjustedCpuTime>,
+    /// This thread's utime/stime (`task_struct::{utime, stime}`), maintained
+    /// by the scheduler's exact CPU-time accounting; lock-free to read.
+    pub(crate) cputime: Arc<narf_scheduler::TaskCputime>,
+    /// The thread group's CPU time (`signal_struct`): live members, released
+    /// threads and reaped children. Shared by every `CLONE_THREAD` sibling.
+    pub(crate) process_cputime: Arc<crate::proc_cpu_time::ProcessCputime>,
     /// Run slices this task has completed — Linux's third
     /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
-    /// at the same slice boundary as `user_cpu_ns`.
+    /// at the slice boundary of the legacy (non-own-stack) user path.
     timeslices: AtomicU64,
     /// Slices that ended because the task PARKED (`nr_voluntary_switches`).
     voluntary_switches: AtomicU64,
@@ -126,6 +123,12 @@ pub struct Task {
     /// per-task reason. (Reading the executor's own preemption flag would
     /// consume it and break its QSBR decision.)
     parked_this_slice: AtomicU32,
+    /// Hung-task detector bookkeeping (Linux `last_switch_count` /
+    /// `last_switch_time`): the uninterruptible-park count the detector
+    /// last saw, and when it first saw it. Written only by
+    /// [`check_hung_tasks`].
+    hung_last_switch_count: AtomicU64,
+    hung_last_switch_ns: AtomicU64,
     /// Number of process children created by this task. Fork placement uses
     /// the per-parent sequence so a child's own helper forks cannot consume
     /// another parent's CPU rotation.
@@ -220,6 +223,19 @@ impl Task {
     /// itself from its very first syscall.
     pub fn new_registered(tid: u64, pid: u64) -> Arc<Task> {
         let limits = crate::handlers::rlimit_for_new_task(tid, pid);
+        // The scheduler created this identity's CPU-time accumulator with its
+        // scheduling control (`alloc_user_task_id`); a synthetic identity
+        // without one still gets its own. A CLONE_THREAD child joins the
+        // group of the task its pid already names; anything else (fork, the
+        // first image) starts a group.
+        let cputime = narf_scheduler::user_task_cputime(narf_scheduler::TaskId(tid))
+            .unwrap_or_else(|| Arc::new(narf_scheduler::TaskCputime::new()));
+        let process_cputime = crate::handlers::pid_to_task_raw(pid)
+            .filter(|&leader| leader != tid)
+            .and_then(task_get)
+            .map(|leader| leader.process_cputime.clone())
+            .unwrap_or_else(crate::proc_cpu_time::ProcessCputime::new);
+        process_cputime.join(&cputime);
         #[cfg(feature = "native-ring")]
         let (authority, authority_control) =
             narf_scheduler::create_user_authority(narf_scheduler::TaskId(tid))
@@ -241,13 +257,14 @@ impl Task {
             proc_identity: crate::proc_identity::owner(tid),
             job_stop_signal: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
-            user_cpu_ns: AtomicU64::new(0),
-            kernel_cpu_ns: AtomicU64::new(0),
-            proc_cpu_time: IrqSafeSpinLock::new(crate::proc_cpu_time::AdjustedCpuTime::default()),
+            cputime,
+            process_cputime,
             timeslices: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             parked_this_slice: AtomicU32::new(0),
+            hung_last_switch_count: AtomicU64::new(0),
+            hung_last_switch_ns: AtomicU64::new(0),
             fork_sequence: AtomicU64::new(0),
             fork_base_cpu: AtomicU32::new(u32::MAX),
             rlimits: limits,
@@ -613,38 +630,6 @@ pub(crate) fn __test_cached_process_group(tid: u64) -> Option<(u64, u64)> {
     })
 }
 
-/// Charge CPU time to the currently-published stackful user task without
-/// cloning its `Arc` or consulting the global task registry. The scheduler's
-/// opaque context points at the `Task` owned by the in-flight future, so it is
-/// stable for this complete call.
-#[inline]
-pub(crate) fn account_current_cpu_ns(expected_tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
-    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
-    if ptr.is_null() {
-        return false;
-    }
-    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
-    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
-    let task = unsafe { &*ptr };
-    if expected_tid != 0 && task.tid != expected_tid {
-        return false;
-    }
-    if user_ns != 0 {
-        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
-    }
-    if kernel_ns != 0 {
-        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
-    }
-    true
-}
-
-#[inline]
-pub(crate) fn current_task_is(tid: u64) -> bool {
-    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
-    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`.
-    !ptr.is_null() && unsafe { (*ptr).tid == tid }
-}
-
 /// Note that the current task is parking: the slice about to end is a
 /// VOLUNTARY switch. Called from the park funnel in `user_task`, which is the
 /// only place a user task stops running while still having work to do.
@@ -656,7 +641,7 @@ pub(crate) fn note_park(tid: u64) {
 }
 
 /// Fold a completed run slice into the switch counters. Called at the same
-/// slice boundary that charges `user_cpu_ns`, so one slice is one count.
+/// slice boundary of the legacy user path, so one slice is one count.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn note_slice_end() {
@@ -664,7 +649,7 @@ pub(crate) fn note_slice_end() {
     if ptr.is_null() {
         return;
     }
-    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` for the poll
     // — the scheduler published this pointer for the in-flight task and keeps
     // it pinned for the duration of the poll.
     let task = unsafe { &*ptr };
@@ -712,38 +697,25 @@ pub(crate) fn running_syscall(tid: u64) -> Option<u32> {
     task.uctx.in_syscall.load(Ordering::Relaxed).checked_sub(1)
 }
 
+/// `utime`/`stime` of thread `tid`, its open span included. A tid with no
+/// registered task (a kernel thread, an already-released one) reads as zero.
 #[inline]
-pub(crate) fn cpu_times(tid: u64) -> (u64, u64) {
-    task_get(tid).map_or((0, 0), |task| {
-        (
-            task.user_cpu_ns.load(Ordering::Relaxed),
-            task.kernel_cpu_ns.load(Ordering::Relaxed),
-        )
-    })
+pub(crate) fn cpu_times(tid: u64) -> narf_scheduler::TaskTimes {
+    task_get(tid).map_or_else(Default::default, |task| task.cputime.sample())
 }
 
-/// A per-task monotonic procfs split, retained through zombie inspection.
-pub(crate) fn adjusted_proc_cpu_times(tid: u64, runtime: u64, kernel: u64) -> (u64, u64) {
-    if let Some(task) = task_get(tid) {
-        task.proc_cpu_time.lock().sample(runtime, kernel)
-    } else {
-        // Bootstrap/test contexts have no Task and no persistent proc view.
-        crate::proc_cpu_time::AdjustedCpuTime::default().sample(runtime, kernel)
-    }
+/// The thread group (`signal_struct`) CPU-time state of thread `tid`.
+pub(crate) fn process_cputime_of(tid: u64) -> Option<Arc<crate::proc_cpu_time::ProcessCputime>> {
+    task_get(tid).map(|task| task.process_cputime.clone())
 }
 
-/// Test hook: add CPU time to a registry entry directly.
-///
-/// The production path (`account_current_cpu_ns`) writes these same fields,
-/// but only when the scheduler has published an in-flight user context —
-/// which the ABI harness, having no real user task, never does. Writing the
-/// field the real accounting writes keeps the RLIMIT_CPU smokes exercising
-/// the real sampling path rather than a parallel one.
+/// Test hook: charge CPU time to a registered thread directly, as the
+/// scheduler's accounting would have folded it. Only for a thread that is
+/// not running (every ABI fixture identity).
 #[doc(hidden)]
 pub fn __test_add_cpu_ns(tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
     task_get(tid).is_some_and(|task| {
-        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
-        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
+        task.cputime.__test_charge(user_ns, kernel_ns);
         true
     })
 }
@@ -758,9 +730,7 @@ pub fn __test_add_cpu_ns(tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
 #[doc(hidden)]
 pub fn __test_reset_cpu_ns(tid: u64) {
     if let Some(task) = task_get(tid) {
-        task.user_cpu_ns.store(0, Ordering::Relaxed);
-        task.kernel_cpu_ns.store(0, Ordering::Relaxed);
-        *task.proc_cpu_time.lock() = Default::default();
+        task.cputime.__test_reset();
     }
 }
 
@@ -791,8 +761,8 @@ pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
     tids
 }
 
-/// Total CPU time (user + system) of thread group `pid`, in nanoseconds —
-/// Linux's `CPUCLOCK_PROF` sample for a process.
+/// Total CPU time (user + system) of the thread group thread `tid` belongs
+/// to, in nanoseconds — Linux's `CPUCLOCK_PROF` sample for a process.
 ///
 /// `RLIMIT_CPU` is a PROCESS limit, not a per-thread one: a four-thread
 /// process that could each burn the limit separately would get four times
@@ -803,46 +773,26 @@ pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
 /// in IRQ context — the same reason [`cpu_times_try`] exists. `None` is lock
 /// contention, and the caller simply rechecks on the next tick; a limit
 /// measured in whole seconds does not care about a missed sample.
-pub(crate) fn thread_group_cpu_ns_try(pid: u64) -> Option<u64> {
-    let mut total = 0u64;
-    for shard in &TASKS {
-        let tasks = shard.tasks.try_lock()?;
-        total = tasks
-            .values()
-            .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
-            .fold(total, |total, task| {
-                total
-                    .saturating_add(task.user_cpu_ns.load(Ordering::Relaxed))
-                    .saturating_add(task.kernel_cpu_ns.load(Ordering::Relaxed))
-            });
-    }
-    Some(total)
+pub(crate) fn thread_group_cpu_ns_try(tid: u64) -> Option<u64> {
+    let tasks = task_registry_shard(tid).tasks.try_lock()?;
+    let Some(task) = tasks.get(&tid) else {
+        return Some(0);
+    };
+    task.process_cputime
+        .group_try()
+        .map(narf_scheduler::TaskTimes::total_ns)
 }
 
 /// Non-blocking form for timer-trap callers (the unix-latency-trace
 /// diagnostics and the CPU-itimer tick check). `None` means registry lock
 /// contention; an absent task is a successful zero snapshot.
-pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
+pub(crate) fn cpu_times_try(tid: u64) -> Option<narf_scheduler::TaskTimes> {
     let tasks = task_registry_shard(tid).tasks.try_lock()?;
-    Some(tasks.get(&tid).map_or((0, 0), |task| {
-        (
-            task.user_cpu_ns.load(Ordering::Relaxed),
-            task.kernel_cpu_ns.load(Ordering::Relaxed),
-        )
-    }))
-}
-
-#[doc(hidden)]
-pub(crate) fn reset_cpu_times(tid: u64, user: bool, kernel: bool) {
-    if let Some(task) = task_get(tid) {
-        *task.proc_cpu_time.lock() = Default::default();
-        if user {
-            task.user_cpu_ns.store(0, Ordering::Relaxed);
-        }
-        if kernel {
-            task.kernel_cpu_ns.store(0, Ordering::Relaxed);
-        }
-    }
+    Some(
+        tasks
+            .get(&tid)
+            .map_or_else(Default::default, |task| task.cputime.sample()),
+    )
 }
 
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────
@@ -1074,12 +1024,11 @@ pub fn dbg_proc_roster() {
 /// `unix-latency-trace`: print a one-line park report for every task
 /// currently parked in a syscall.
 ///
-/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
-/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
-/// the boot (an early RCU stall trips it around t+25 s), so on a real
-/// desktop run the census never fires. This one is called from ahead of
-/// that gate and repeats, which is what a process that freezes MINUTES
-/// into the session requires.
+/// The stall watchdog's own reports list only tasks that are NOT in a
+/// healthy interruptible park, and only when a detector fires; this census
+/// lists every parked task and repeats, which is what attributing a
+/// process that freezes MINUTES into the session (with nothing stalled)
+/// requires.
 ///
 /// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
 /// healthy parked poller re-executes its syscall on a 1 ms deadline, so
@@ -1204,58 +1153,185 @@ pub fn dbg_park_census(tag: &str) {
     }
 }
 
-/// Diagnostic snapshot for the stall watchdog: one entry per registered
-/// task — `(tid, pid, state, sleep_deadline_ns, futex_uaddr,
-/// futex_namespace, futex_park_gen, futex_val, net_io_wait,
-/// wait_child_pending, flock_key, parked_in_syscall)`. Clones the Arcs out
-/// under the lock, reads the
-/// atomics lock-free after.
-#[allow(clippy::type_complexity)]
-pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
-    u64,
-    u64,
-    u32,
-    u64,
-    u64,
-    u64,
-    u64,
-    u32,
-    bool,
-    bool,
-    usize,
-    bool,
+/// One task's park state, for the stall watchdog's dump
+/// ([`dbg_park_snapshot`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ParkSnapshot {
+    pub tid: u64,
+    pub pid: u64,
+    pub state: u32,
+    pub deadline: u64,
+    pub futex: u64,
+    pub futex_ns: u64,
+    pub futex_gen: u64,
+    pub futex_val: u32,
+    pub netio: bool,
+    pub waitchild: bool,
+    pub flock: usize,
+    pub parked: bool,
     // Park-path discriminators — which interruptible wait the task is in, so a
     // parked task that is in NONE of the wakeable waits (all zero/false) but
     // still has `parked=true` + a pending signal is the waker-less strand.
-    u64,  // sigwait_set (sigtimedwait/sigwaitinfo park; 0 = not)
-    bool, // console_read_pending (fd-0 blocking read park)
-    u64,  // epoll_wait_fd (biased +1; 0 = not in epoll_wait)
-    bool, // has_signal_waker — can wake_signal actually rouse it?
-)> {
+    /// `sigtimedwait`/`sigwaitinfo` set (0 = not in one).
+    pub sigwait: u64,
+    /// Blocking fd-0 read park.
+    pub console_read: bool,
+    /// `epoll_wait` fd, biased +1 (0 = not in `epoll_wait`).
+    pub epoll_fd: u64,
+    /// Whether `wake_signal` can rouse it.
+    pub has_sigwaker: bool,
+    /// Parked in an uninterruptible wait (see [`check_hung_tasks`]).
+    pub uninterruptible: bool,
+}
+
+/// Diagnostic snapshot for the stall watchdog: one entry per registered
+/// task. Clones the Arcs out under the registry lock, reads the atomics
+/// lock-free after.
+pub fn dbg_park_snapshot() -> alloc::vec::Vec<ParkSnapshot> {
     let tasks = task_registry_snapshot();
     tasks
         .iter()
-        .map(|t| {
-            (
-                t.tid,
-                t.pid.load(Ordering::Relaxed),
-                t.state.load(Ordering::Relaxed),
-                t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
-                t.uctx.futex_uaddr.load(Ordering::Relaxed),
-                t.uctx.futex_namespace.load(Ordering::Relaxed),
-                t.uctx.futex_park_gen.load(Ordering::Relaxed),
-                t.uctx.futex_val.load(Ordering::Relaxed),
-                t.uctx.net_io_wait.load(Ordering::Relaxed),
-                t.uctx.wait_child_pending.load(Ordering::Relaxed),
-                t.uctx.flock_key.load(Ordering::Relaxed),
-                t.uctx.parked_in_syscall.load(Ordering::Relaxed),
-                t.uctx.sigwait_set.load(Ordering::Relaxed),
-                t.uctx.console_read_pending.load(Ordering::Relaxed),
-                t.uctx.epoll_wait_fd.load(Ordering::Relaxed),
-                crate::handlers::dbg_has_signal_waker(t.tid),
-            )
+        .map(|t| ParkSnapshot {
+            tid: t.tid,
+            pid: t.pid.load(Ordering::Relaxed),
+            state: t.state.load(Ordering::Relaxed),
+            deadline: t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
+            futex: t.uctx.futex_uaddr.load(Ordering::Relaxed),
+            futex_ns: t.uctx.futex_namespace.load(Ordering::Relaxed),
+            futex_gen: t.uctx.futex_park_gen.load(Ordering::Relaxed),
+            futex_val: t.uctx.futex_val.load(Ordering::Relaxed),
+            netio: t.uctx.net_io_wait.load(Ordering::Relaxed),
+            waitchild: t.uctx.wait_child_pending.load(Ordering::Relaxed),
+            flock: t.uctx.flock_key.load(Ordering::Relaxed),
+            parked: t.uctx.parked_in_syscall.load(Ordering::Relaxed),
+            sigwait: t.uctx.sigwait_set.load(Ordering::Relaxed),
+            console_read: t.uctx.console_read_pending.load(Ordering::Relaxed),
+            epoll_fd: t.uctx.epoll_wait_fd.load(Ordering::Relaxed),
+            has_sigwaker: crate::handlers::dbg_has_signal_waker(t.tid),
+            uninterruptible: in_uninterruptible_park(t),
         })
         .collect()
+}
+
+// ── hung-task detector (Linux `kernel/hung_task.c`) ─────────────────
+
+/// `CONFIG_DEFAULT_HUNG_TASK_TIMEOUT`, seconds.
+pub const HUNG_TASK_TIMEOUT_SECS: u64 = 120;
+
+/// `sysctl_hung_task_warnings` default: reports per boot.
+pub const HUNG_TASK_WARNINGS: u64 = 10;
+
+/// Whether `t` is parked in an uninterruptible wait — NARF's
+/// TASK_UNINTERRUPTIBLE.
+///
+/// NARF has no per-task sleep state; the park entry point decides it:
+///
+/// | Park                                        | Linux state           |
+/// |---------------------------------------------|-----------------------|
+/// | `park_pending_future` — a synchronous kernel wait: filesystem I/O, a kernel `Mutex`, a btrfs gate | `D` (uninterruptible) |
+/// | `own_stack_park_until` — nanosleep/pause, futex, poll/ppoll/select, epoll_wait, socket/pipe/tty I/O (`net_io_wait`, `console_read_pending`), sigtimedwait, flock/F_SETLKW, SysV sem/msg, fifo open | `S` (interruptible)   |
+/// | `own_stack_wait_child` — wait4/waitid       | `S` (interruptible)   |
+/// | job-control stop / ptrace stop               | `T` / `t`             |
+///
+/// The interruptible parks all register the task's signal waker and end on
+/// a deliverable signal; a synchronous kernel wait ends only when its
+/// future completes. Some of those futures also give up on SIGKILL
+/// (`narf_filesystem::killable`), which Linux would call TASK_KILLABLE and
+/// skip. NARF counts them as uninterruptible anyway: the kill arm is inside
+/// the awaited future, not a task state, and it wraps waits Linux performs
+/// uninterruptibly — btrfs bio completion among them — so skipping them
+/// would hide the I/O stalls this detector exists to report.
+fn in_uninterruptible_park(t: &Task) -> bool {
+    t.state.load(Ordering::Acquire) != TASK_ZOMBIE
+        && t.uctx.parked_in_syscall.load(Ordering::Acquire)
+        && t.uctx.park_site.load(Ordering::Relaxed) & crate::handlers::PARK_SITE_UNINTERRUPTIBLE
+            != 0
+}
+
+/// Linux `task_is_hung`: `Some(blocked_ns)` when `t` is in an
+/// uninterruptible wait it entered at least `timeout_ns` ago, judged by its
+/// uninterruptible-park count not having moved since this detector first
+/// saw it (a task woken and parked again counts as a new wait).
+fn task_is_hung(t: &Task, now_ns: u64, timeout_ns: u64) -> Option<u64> {
+    if !in_uninterruptible_park(t) {
+        return None;
+    }
+    let switches = t.uctx.uninterruptible_parks.load(Ordering::Relaxed);
+    if switches == 0 {
+        return None;
+    }
+    if switches != t.hung_last_switch_count.load(Ordering::Relaxed) {
+        t.hung_last_switch_count.store(switches, Ordering::Relaxed);
+        t.hung_last_switch_ns.store(now_ns, Ordering::Relaxed);
+        return None;
+    }
+    let blocked = now_ns.saturating_sub(t.hung_last_switch_ns.load(Ordering::Relaxed));
+    (blocked >= timeout_ns).then_some(blocked)
+}
+
+/// Linux `check_hung_uninterruptible_tasks`: report every user task that
+/// has sat in one uninterruptible wait for `timeout_ns` (0 disables), while
+/// `warnings` lasts (`sysctl_hung_task_warnings`; `u64::MAX` is unlimited).
+/// Returns how many tasks were hung this round, reported or not.
+///
+/// The report names what Linux's does — the task, how long, and where it
+/// waits (the park site `/proc/<pid>/stack` shows; for a lock, the lock's
+/// `lock()` call site and the waiter it holds) — in place of a stack trace.
+///
+/// Runs from the stall watchdog's timer tick: the registry snapshot and the
+/// site strings allocate, as the watchdog's other task scans do, and the
+/// task name is read without waiting for its lock.
+pub fn check_hung_tasks(now_ns: u64, timeout_ns: u64, warnings: &AtomicU64) -> usize {
+    use core::fmt::Write as _;
+    if timeout_ns == 0 {
+        return 0;
+    }
+    let mut hung = 0;
+    for t in task_registry_snapshot() {
+        let Some(blocked_ns) = task_is_hung(&t, now_ns, timeout_ns) else {
+            continue;
+        };
+        hung += 1;
+        let left = warnings.load(Ordering::Relaxed);
+        if left == 0 {
+            continue;
+        }
+        if left != u64::MAX {
+            warnings.store(left - 1, Ordering::Relaxed);
+        }
+        let mut comm = [0u8; 16];
+        let n = crate::handlers::proc_comm_of_task_into(t.tid, &mut comm);
+        let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+        let pid = t.pid.load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "INFO: task {comm}:{pid} blocked for more than {} seconds.",
+            blocked_ns / 1_000_000_000
+        );
+        let syscall = t.uctx.in_syscall.load(Ordering::Relaxed);
+        let (kind, site) = match crate::handlers::parked_wait_site(t.tid) {
+            Some(lock) => ("lock", Some(lock)),
+            None => ("site", crate::handlers::parked_park_site(t.tid)),
+        };
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "      tid={} state=D syscall={} {kind}={}",
+            t.tid,
+            syscall.wrapping_sub(1) as i32,
+            site.as_deref().unwrap_or("?")
+        );
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "\"sysctl.kernel.hung_task_timeout_secs=0\" on the kernel command line disables this message."
+        );
+        if left == 1 {
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings"
+            );
+        }
+    }
+    hung
 }
 
 /// Parked tasks whose epoll set already reports a ready descriptor —
@@ -1528,6 +1604,10 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
     let owner = task_get(tid)?;
     let _binding = owner.rlimit_override.lock();
     let removed = task_registry_shard(tid).tasks.lock().remove(&tid);
+    // `__exit_signal`: the released thread's times stay in its group's total.
+    if removed.is_some() {
+        owner.process_cputime.leave(&owner.cputime);
+    }
     // Every retained-target transaction takes this task's binding gate before
     // revalidating TASKS. Unregistration therefore needs no shared process
     // lock; siblings retain their own owners and may keep using their limits.

@@ -6,7 +6,7 @@
 //!
 //!   /proc/diskstats     — per-block-device I/O counters
 //!   /proc/interrupts    — per-IRQ per-CPU fire counts
-//!   /proc/softirqs      — per-softirq-type per-CPU counters (stub)
+//!   /proc/softirqs      — per-softirq-type per-CPU counters
 //!   /proc/swaps         — swap area list (header only — no area is enabled)
 //!   /proc/modules       — loadable kernel modules (deferred: LKM agent)
 //!   /proc/iomem         — physical memory layout (deferred: MM wiring)
@@ -257,33 +257,31 @@ fn gen_interrupts() -> Vec<u8> {
 
 // ── /proc/softirqs ──────────────────────────────────────────────────
 //
-// Linux: fs/proc/softirqs.c show_softirqs
-// 10 standard types: HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET
-//                    SCHED HRTIMER RCU
-// DEFERRED: wire real per-CPU softirq counters when the softirq
-//           subsystem is implemented. All zero for now.
+// Linux: fs/proc/softirqs.c show_softirqs — executions of each of the 10
+// softirq vectors on each CPU. NARF's deferred-work contexts are counted
+// under the Linux vector they correspond to (`narf_lib::kstat` documents the
+// mapping); vectors with no NARF equivalent stay 0.
 
-const SOFTIRQ_NAMES: [&str; 10] = [
-    "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
-];
+const SOFTIRQ_NAMES: [&str; narf_lib::kstat::NR_SOFTIRQS] = narf_lib::kstat::SOFTIRQ_NAMES;
 
 fn gen_softirqs() -> Vec<u8> {
     let mut s = String::new();
-    let ncpus = cpu_count().max(1) as usize;
-    let per_cpu = ncpus.min(PERCPU_FIRES_MAX);
+    let cpus: Vec<usize> = (0..narf_lib::percpu::MAX_CPUS)
+        .filter(|&cpu| narf_lib::smp::is_online(cpu as u32))
+        .collect();
 
-    // Header
+    // Header: `seq_printf(p, "CPU%-8d", i)` after 20 spaces.
     let _ = write!(s, "                    ");
-    for cpu in 0..per_cpu {
-        let _ = write!(s, "      CPU{:<3}", cpu);
+    for cpu in &cpus {
+        let _ = write!(s, "CPU{:<8}", cpu);
     }
     let _ = writeln!(s);
 
-    // Body: all zeroes
-    for name in SOFTIRQ_NAMES {
-        let _ = write!(s, "{:>16}:", name);
-        for _ in 0..per_cpu {
-            let _ = write!(s, " {:>10}", 0u64);
+    // One row per vector: `"%12s:"` then `" %10u"` per CPU.
+    for (vec, name) in SOFTIRQ_NAMES.iter().enumerate() {
+        let _ = write!(s, "{:>12}:", name);
+        for &cpu in &cpus {
+            let _ = write!(s, " {:>10}", narf_lib::kstat::softirq_count(cpu, vec));
         }
         let _ = writeln!(s);
     }

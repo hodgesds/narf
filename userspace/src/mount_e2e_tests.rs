@@ -1913,7 +1913,9 @@ kernel_test_in!("userspace/mount", smoke_move_mount_overmount_no_ebusy);
 // ── Smoke 9: chroot applied exactly once ───────────────────────────
 // apply_chroot must prefix the root exactly ONCE — a double-prefix
 // ("/jail9/jail9/...") was a real container bug. Also confirm the root
-// path itself ("/") maps to the jail root, not "/jail9/".
+// path itself ("/") maps to the jail root directory, "/jail9", not
+// "/jail9/": a stored "<root>/" became "<root>//etc/..." after a nested
+// chroot (pacman's chroot("/") then ldconfig's chroot(".")).
 fn smoke_chroot_applied_once() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -1947,7 +1949,7 @@ fn smoke_chroot_applied_once() -> TestResult {
     }
 
     let once = crate::handlers::apply_chroot_for_test("/etc/passwd") == "/jail9/etc/passwd";
-    let root_maps = crate::handlers::apply_chroot_for_test("/") == "/jail9/";
+    let root_maps = crate::handlers::apply_chroot_for_test("/") == "/jail9";
 
     crate::handlers::__test_root_dir_reset();
     let _ = unmount_for_test("/jail9");
@@ -1955,7 +1957,7 @@ fn smoke_chroot_applied_once() -> TestResult {
     if once && root_maps {
         TestResult::Pass
     } else {
-        TestResult::Fail("apply_chroot must prefix /jail9 exactly once")
+        TestResult::Fail("apply_chroot must prefix /jail9 exactly once and map / to /jail9")
     }
 }
 kernel_test_in!("userspace/mount", smoke_chroot_applied_once);

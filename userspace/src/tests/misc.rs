@@ -4474,3 +4474,96 @@ kernel_test_in!(
     "userspace",
     smoke_blocked_syscall_frame_reports_user_sp_and_pc
 );
+
+/// Hung-task detector (Linux `kernel/hung_task.c`): only a task parked in an
+/// UNINTERRUPTIBLE wait — a synchronous kernel wait — that has not been
+/// woken for `hung_task_timeout_secs` is reported, at most
+/// `hung_task_warnings` times. The native-boot false positive was the
+/// opposite: an idle desktop whose every task sat in an interruptible park
+/// (epoll, poll, futex, nanosleep, wait4) had all of them dumped, every
+/// few seconds, as a "stall".
+fn smoke_userspace_hung_task_reports_only_uninterruptible_waits() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    const SEC: u64 = 1_000_000_000;
+    const TIMEOUT: u64 = crate::task::HUNG_TASK_TIMEOUT_SECS * SEC;
+    // Fabricated tids far above anything a kernel-test boot allocates.
+    const IDLE: u64 = 0xFACE_D1D0;
+    const HUNG: u64 = 0xFACE_D1D1;
+    let idle = crate::task::Task::new_registered(IDLE, IDLE);
+    let hung = crate::task::Task::new_registered(HUNG, HUNG);
+    crate::handlers::set_proc_comm(HUNG, "hungprobe");
+    let site = core::panic::Location::caller() as *const _ as usize;
+    // An idle event loop: parked in epoll_wait, interruptible.
+    idle.uctx.net_io_wait.store(true, Ordering::Relaxed);
+    idle.uctx.epoll_wait_fd.store(6, Ordering::Relaxed);
+    idle.uctx.park_site.store(site, Ordering::Relaxed);
+    idle.uctx.parked_in_syscall.store(true, Ordering::Release);
+    // A synchronous filesystem wait, as `park_pending_future` publishes it.
+    hung.uctx.uninterruptible_parks.store(1, Ordering::Relaxed);
+    hung.uctx.park_site.store(
+        site | crate::handlers::PARK_SITE_UNINTERRUPTIBLE,
+        Ordering::Relaxed,
+    );
+    hung.uctx.parked_in_syscall.store(true, Ordering::Release);
+
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    let warnings = AtomicU64::new(2);
+    let seq = narf_console::klog::next_seq();
+    // Far past real uptime so no real task's bookkeeping lines up with it.
+    let t0 = 1_000_000 * SEC;
+    let first = crate::task::check_hung_tasks(t0, TIMEOUT, &warnings);
+    let early = crate::task::check_hung_tasks(t0 + TIMEOUT - SEC, TIMEOUT, &warnings);
+    let early_text = narf_console::klog::text_since(seq);
+    let due = crate::task::check_hung_tasks(t0 + TIMEOUT, TIMEOUT, &warnings);
+    let due_text = narf_console::klog::text_since(seq);
+    // Woken and parked again: a new wait, timed afresh.
+    hung.uctx.uninterruptible_parks.store(2, Ordering::Relaxed);
+    let _ = crate::task::check_hung_tasks(t0 + 2 * TIMEOUT, TIMEOUT, &warnings);
+    let rewoken_text = narf_console::klog::text_since(seq);
+    // Hung again; the second warning is the last one.
+    let _ = crate::task::check_hung_tasks(t0 + 3 * TIMEOUT, TIMEOUT, &warnings);
+    let last_text = narf_console::klog::text_since(seq);
+    let after_budget = crate::task::check_hung_tasks(t0 + 4 * TIMEOUT, TIMEOUT, &warnings);
+    let quiet_text = narf_console::klog::text_since(seq);
+    let disabled = crate::task::check_hung_tasks(t0 + 9 * TIMEOUT, 0, &warnings);
+
+    // Cleanup BEFORE asserting so a failure doesn't leak fake parked tasks
+    // into the rest of the boot.
+    idle.uctx.parked_in_syscall.store(false, Ordering::Release);
+    hung.uctx.parked_in_syscall.store(false, Ordering::Release);
+    let _ = crate::task::release_task(IDLE);
+    let _ = crate::task::release_task(HUNG);
+
+    let probe = alloc::format!("INFO: task hungprobe:{HUNG} blocked for more than 120 seconds.");
+    let probe = probe.as_bytes();
+    let idle_probe = alloc::format!(":{IDLE} blocked");
+    let tail = |text: &[u8], from: usize| text.get(from..).unwrap_or(&[]).to_vec();
+    if first != 0 || early != 0 || has(&early_text, b"hungprobe") {
+        return TestResult::Fail("reported a task before hung_task_timeout_secs elapsed");
+    }
+    if due == 0 || !has(&due_text, probe) {
+        return TestResult::Fail("an uninterruptible wait past the timeout was not reported");
+    }
+    if has(&due_text, idle_probe.as_bytes()) {
+        return TestResult::Fail("an interruptible (epoll) park was reported as hung");
+    }
+    if has(&tail(&rewoken_text, due_text.len()), b"hungprobe") {
+        return TestResult::Fail("a task woken and parked again was reported as still hung");
+    }
+    if !has(&tail(&last_text, rewoken_text.len()), probe)
+        || !has(&last_text, b"Future hung task reports are suppressed")
+    {
+        return TestResult::Fail("the last warning was not reported or not marked as the last");
+    }
+    if after_budget == 0 || has(&tail(&quiet_text, last_text.len()), b"hungprobe") {
+        return TestResult::Fail("reported past hung_task_warnings, or stopped counting");
+    }
+    if disabled != 0 {
+        return TestResult::Fail("hung_task_timeout_secs=0 must disable the detector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/hung_task",
+    smoke_userspace_hung_task_reports_only_uninterruptible_waits
+);

@@ -172,9 +172,20 @@ pub fn op_writes(op: BlockOp) -> bool {
 /// The future [`crate::SyncBlock::submit`] returns: either a completion
 /// computed synchronously (the device has no queue, or the request was
 /// refused before dispatch) or a queued submission still in flight.
+///
+/// A task that waits on a queued submission is in I/O wait (Linux
+/// `submit_bio_wait` → `io_schedule`): it counts in `procs_blocked`, and its
+/// CPU's idle time while it waits is iowait.
 pub enum SyncSubmit {
     Ready(Option<BlockCompletion>),
-    Queued(BoxedCompletion),
+    Queued(narf_lib::kstat::IoWaitFuture<BoxedCompletion>),
+}
+
+impl SyncSubmit {
+    /// A submission in flight at the device's queue.
+    pub fn queued(completion: BoxedCompletion) -> Self {
+        Self::Queued(narf_lib::kstat::IoWaitFuture::new(completion))
+    }
 }
 
 impl core::fmt::Debug for SyncSubmit {
@@ -195,15 +206,23 @@ impl Future for SyncSubmit {
         let this = unsafe { self.get_unchecked_mut() };
         match this {
             SyncSubmit::Ready(c) => Poll::Ready(c.take().expect("SyncSubmit polled after Ready")),
-            SyncSubmit::Queued(f) => f.as_mut().poll(cx),
+            SyncSubmit::Queued(f) => Pin::new(f).poll(cx),
         }
     }
 }
 
-/// The future [`crate::SyncBlock::flush_result`] returns.
+/// The future [`crate::SyncBlock::flush_result`] returns. A wait on a queued
+/// flush is I/O wait, as for [`SyncSubmit`].
 pub enum SyncFlush {
     Ready(Option<Result<(), BlockError>>),
-    Queued(BoxedResult),
+    Queued(narf_lib::kstat::IoWaitFuture<BoxedResult>),
+}
+
+impl SyncFlush {
+    /// A flush in flight at the device's queue.
+    pub fn queued(flush: BoxedResult) -> Self {
+        Self::Queued(narf_lib::kstat::IoWaitFuture::new(flush))
+    }
 }
 
 impl core::fmt::Debug for SyncFlush {
@@ -222,7 +241,7 @@ impl Future for SyncFlush {
         let this = unsafe { self.get_unchecked_mut() };
         match this {
             SyncFlush::Ready(c) => Poll::Ready(c.take().expect("SyncFlush polled after Ready")),
-            SyncFlush::Queued(f) => f.as_mut().poll(cx),
+            SyncFlush::Queued(f) => Pin::new(f).poll(cx),
         }
     }
 }

@@ -641,11 +641,18 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         initial_namespace: current_mount_namespace().is_none(),
         read_only: flags & MS_RDONLY != 0,
     };
+    // `do_new_mount` -> `vfs_parse_fs_string(fc, "source", name)` only for a
+    // non-NULL name, and `vfs_create_mount` stores `fc->source ?: "none"` as
+    // `mnt_devname`: the string as the caller passed it, before any
+    // resolution, which is what `/proc/mounts` prints for it.
+    let devname = if args.arg0 == 0 { "none" } else { source.as_str() };
     ctx.set_return(match fs_type.init(&request) {
-        Ok(fs) => match current_mount_arc_with_flags(&auth, &target, fs, mnt_flags) {
-            Ok(_) => SyscallReturn::ok(0),
-            Err(error) => mount_attach_errno(error),
-        },
+        Ok(fs) => {
+            match current_mount_arc_with_source(&auth, &target, fs, mnt_flags, Some(devname)) {
+                Ok(_) => SyscallReturn::ok(0),
+                Err(error) => mount_attach_errno(error),
+            }
+        }
         Err(error) => mount_attach_errno(error),
     });
 }

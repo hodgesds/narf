@@ -33,6 +33,18 @@ KERNEL_IMAGE_SIZE = 0x40000000;   /* 1 GiB. LLD takes K/M, not G. */
  * table does not fit rather than writing a short one. */
 KASLR_RELOC_RESERVE = 8M;
 
+/* Space reserved for the kernel symbol table (`/proc/kallsyms`). Filled after
+ * linking by `xtask kallsyms`, the same reserve-then-patch scheme as the
+ * relocation table: the table is computed from the linked image, so its size
+ * has to be fixed before the link or every address it records would move —
+ * the reason Linux links vmlinux two or three times. Measured tables: the
+ * x86_64 `xtask test` image (every kernel test linked in) 4.4 MiB for 384k
+ * symbols, a native x86_64 release image 2.4 MiB for 195k, aarch64 release
+ * 4.0 MiB for 351k, debug builds ~1.8 MiB. 8 MiB leaves ~1.8x over the
+ * largest, the same margin `KASLR_RELOC_RESERVE` keeps. `xtask` fails the
+ * build rather than truncating if a table outgrows it. */
+KALLSYMS_RESERVE = 8M;
+
 /* Largest slide the kernel window may take, as a mask of the low bits.
  *
  * The module text window begins 1 GiB above the link base, so the image plus
@@ -109,7 +121,15 @@ SECTIONS
 
     .text : AT(ADDR(.text) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __text_start = .;
+        /* Linux's image markers. perf locates the running kernel by `_text`
+         * (or `_stext`) in /proc/kallsyms and bounds its map with `_etext` /
+         * `_edata` (tools/perf/util/machine.c::machine__get_running_kernel_start);
+         * crash and bpftrace read the same names. Every kallsyms offset is
+         * relative to `_text`, so it has to be the lowest kernel-half symbol. */
+        _text = .;
+        _stext = .;
         *(.text .text.*)
+        _etext = .;
         __text_end = .;
     } :text
 
@@ -132,6 +152,22 @@ SECTIONS
         QUAD(0);
         . = __kaslr_relocs_start + KASLR_RELOC_RESERVE;
         __kaslr_relocs_end = .;
+    } :rodata
+
+    /* Kernel symbol table, read by `/proc/kallsyms`.
+     *
+     * Reserved here and filled after linking by `xtask kallsyms` (see
+     * `KALLSYMS_RESERVE`). The table holds symbol offsets from `_text`, never
+     * absolute addresses, so it carries no relocation records and the KASLR
+     * pass leaves it alone; the kernel adds the runtime `_text` when it reads
+     * it, as Linux adds `kallsyms_relative_base`. PROGBITS for the same reason
+     * as `.kaslr_relocs`: NOBITS has no file bytes to write into. The leading
+     * QUAD(0) is the magic slot an unpatched image is recognised by. */
+    .kallsyms : AT(ADDR(.kallsyms) - KERNEL_VIRT_BASE) ALIGN(4K) {
+        __kallsyms_start = .;
+        QUAD(0);
+        . = __kallsyms_start + KALLSYMS_RESERVE;
+        __kallsyms_end = .;
     } :rodata
 
     /* Physical alias of the table, for the 32-bit apply pass in boot.S.
@@ -195,7 +231,9 @@ SECTIONS
 
     .data : AT(ADDR(.data) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __data_start = .;
+        _sdata = .;
         *(.data .data.*)
+        _edata = .;
         __data_end = .;
     } :data
 
@@ -266,6 +304,7 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
+        _end = .;
     } :data
 
     /* Physical aliases of the GOT, for the 32-bit slide pass.

@@ -3,7 +3,8 @@ use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 fn report(pid: u8, tid: u8, wcid: u16, sequence: u16) -> Vec<u8> {
     let mut bytes = alloc::vec![0;40];
-    bytes[..4].copy_from_slice(&(1u32 << 27 | 40).to_le_bytes());
+    // RXD0: length 40, PKT_TYPE_TXS (0) in bits 31:27.
+    bytes[..4].copy_from_slice(&40u32.to_le_bytes());
     bytes[8..12].copy_from_slice(&(u32::from(tid) << 26 | 1 << 15).to_le_bytes());
     bytes[12..16].copy_from_slice(&(u32::from(sequence) << 20).to_le_bytes());
     bytes[16..20].copy_from_slice(&(u32::from(wcid) << 16).to_le_bytes());
@@ -137,6 +138,12 @@ fn invalid() -> Result<(), &'static str> {
         if fault == 7 {
             if result.is_err() || owner.take(3) != Err(Error::Rejected(1)) {
                 return Err("failed native TXS accepted as current sequence");
+            }
+        } else if fault == 4 {
+            // mt7921_rx_check walks complete 8-dword records only: a
+            // 39-byte packet carries none, so nothing is reported.
+            if result.is_err() || owner.take(3) != Ok(None) {
+                return Err("a partial TXS record became a report");
             }
         } else if result != Err(Error::MalformedEvent) || owner.take(3) != Ok(None) {
             return Err("malformed/cross-TID/WCID/aggregate TXS changed sample authority");

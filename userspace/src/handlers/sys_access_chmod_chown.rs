@@ -166,6 +166,26 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32, follow: bool, e
     } else {
         path
     };
+    // The expansion stops AT a proc-fd magic link (`/dev/stdin` ->
+    // `/proc/self/fd/0`); following it lands on the descriptor's own file,
+    // which is what is checked — a pipe's or socket's inode included.
+    let landed;
+    let path = if follow {
+        let task = current_task_id();
+        match visible_path_of(task, path).and_then(|visible| proc_fd_landing(task, visible)) {
+            Some(ProcFdLanding::Object(file)) => {
+                access_file(ctx, &file, mode, eaccess);
+                return;
+            }
+            Some(ProcFdLanding::Path(host)) => {
+                landed = host;
+                landed.as_str()
+            }
+            None => path,
+        }
+    } else {
+        path
+    };
     // Resolve through the caller's PRIVATE mount namespace, not the global
     // registry (which `xattr_file` uses). A systemd service sandbox pivot_roots
     // into `/run/systemd/mount-rootfs` with the API filesystems bound in; a

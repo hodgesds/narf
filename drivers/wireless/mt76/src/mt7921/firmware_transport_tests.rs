@@ -49,6 +49,8 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "join_retry_tests.rs"]
+mod join_retry_tests;
 #[path = "key_replace_tests.rs"]
 mod key_replace_tests;
 #[path = "monitor_tests.rs"]
@@ -276,6 +278,8 @@ struct Model {
     malformed: bool,
     semaphore: u8,
     notifications: usize,
+    /// The MCU event ID of those notifications (seq 0, unsolicited).
+    notification_eid: u8,
     revoke_on_submit: bool,
     wtbl_stall: bool,
     wtbl_clears: Vec<u8>,
@@ -302,6 +306,21 @@ struct Model {
     sequence: crate::mt7921::tx_sequence::Owner,
     tx_status: VecDeque<Vec<u8>>,
     data_headers: Vec<[u8; 64]>,
+    /// The next N station management frames are lost on air: the fixture
+    /// AP never sees them and their TX status reports no ACK (status 1).
+    unacked_management: usize,
+    /// Restricts `unacked_management` to frames whose first byte (frame
+    /// control) is this; others are delivered.
+    unacked_kind: Option<u8>,
+    /// The next N fixture-AP replies are lost on air after the AP took
+    /// (and ACKed) the frame they answer.
+    lost_replies: usize,
+    /// TX statuses for submitted-but-unacknowledged management frames.
+    unacked_status: VecDeque<u8>,
+    /// The next (Re)Association Requests are refused by the fixture AP's
+    /// address with this status and optional association comeback time
+    /// (TUs); the AP itself keeps waiting for an association.
+    assoc_refusals: VecDeque<(u16, Option<u32>)>,
 }
 #[path = "associated_scan_tests.rs"]
 mod associated_scan_tests;
@@ -420,6 +439,7 @@ impl Model {
             malformed: false,
             semaphore: 2,
             notifications: 0,
+            notification_eid: 1,
             revoke_on_submit: false,
             wtbl_stall: false,
             wtbl_clears: Vec::new(),
@@ -445,6 +465,11 @@ impl Model {
             sequence: crate::mt7921::tx_sequence::Owner::new(),
             tx_status: VecDeque::new(),
             data_headers: Vec::new(),
+            unacked_management: 0,
+            unacked_kind: None,
+            lost_replies: 0,
+            unacked_status: VecDeque::new(),
+            assoc_refusals: VecDeque::new(),
         }
     }
 }
@@ -552,7 +577,9 @@ impl Backend for Model {
             }
             if cmd != 4 {
                 for _ in 0..self.notifications {
-                    self.replies.push_back(event(1, 0, 0));
+                    let mut notification = event(1, 0, 0);
+                    notification[28] = self.notification_eid;
+                    self.replies.push_back(notification);
                 }
                 self.notifications = 0;
                 let status = if cmd == 0x10 {
@@ -1046,6 +1073,15 @@ impl Backend for Model {
         self.tx_vifs.push(vif.index());
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
+        if self.unacked_management > 0
+            && self
+                .unacked_kind
+                .is_none_or(|kind| frame.first() == Some(&kind))
+        {
+            self.unacked_management -= 1;
+            self.unacked_status.push_back(1);
+            return Ok(());
+        }
         if frame.first() == Some(&0xc0) {
             if let Some(ap) = &self.access_point {
                 // The shared AP speaks auth/association/EAPOL through its
@@ -1181,9 +1217,47 @@ impl Backend for Model {
                 return Ok(()); // Bound firmware adapter, not a new AP/port authority.
             }
         }
+        if matches!(frame.first(), Some(0x00 | 0x20)) && frame.len() >= 24 {
+            if let (Some(ap), Some(&(status, comeback))) =
+                (&self.access_point, self.assoc_refusals.front())
+            {
+                // hostapd `send_assoc_resp` refusing the request: the
+                // matching response subtype, status, AID 0 and, for
+                // WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY, the Timeout
+                // Interval element (type 3, association comeback time).
+                let bssid = ap.beacon()[10..16].to_vec();
+                self.assoc_refusals.pop_front();
+                let mut reply = vec![frame[0] + 0x10, 0, 0, 0];
+                reply.extend_from_slice(&frame[10..16]);
+                reply.extend_from_slice(&bssid);
+                reply.extend_from_slice(&bssid);
+                reply.extend_from_slice(&[0, 0, 0x11, 0]);
+                reply.extend_from_slice(&status.to_le_bytes());
+                reply.extend_from_slice(&[0, 0]);
+                if let Some(tu) = comeback {
+                    reply.extend_from_slice(&[56, 5, 3]);
+                    reply.extend_from_slice(&tu.to_le_bytes());
+                }
+                let mut packet = vec![0u8; 32 + reply.len()];
+                let len = packet.len();
+                packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+                packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
+                packet[12..16]
+                    .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
+                packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                packet[32..].copy_from_slice(&reply);
+                self.packets.push_back(packet);
+                return Ok(());
+            }
+        }
         if let Some(ap) = &mut self.access_point {
             let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
             for mut reply in replies {
+                if self.lost_replies > 0 {
+                    self.lost_replies -= 1;
+                    continue;
+                }
                 if reply.first() == Some(&0x10) {
                     if let Some(parameters) = &self.wmm_reply {
                         reply.extend_from_slice(parameters);
@@ -1545,7 +1619,10 @@ impl Backend for Model {
         }
         let completion = crate::mt7921::packet_tx::Completion {
             token: 1,
-            status: self.completion_status,
+            status: self
+                .unacked_status
+                .pop_front()
+                .unwrap_or(self.completion_status),
         };
         self.sequence.terminal(completion);
         Ok(Some(completion))
@@ -1711,6 +1788,9 @@ kernel_test_in!(
     mcu_firmware_cancelled_future_cannot_replay_or_free_dma
 );
 
+/// Linux `mt7921_mcu_rx_event` frees an unsolicited event no owner reads
+/// (`mt7921_mcu_rx_unsolicited_event`); a stream of them never fills the
+/// mailbox. A kept one (SCAN_DONE) stays bounded.
 fn mcu_firmware_notifications_are_bounded_and_patch_skip_is_explicit() -> TestResult {
     let mut model = Model::new();
     model.notifications = 2;
@@ -1723,14 +1803,28 @@ fn mcu_firmware_notifications_are_bounded_and_patch_skip_is_explicit() -> TestRe
             bytes_transferred: 32,
             ..
         })
-    ) || session.events.len() != 2
+    ) || !session.events.is_empty()
     {
-        return TestResult::Fail("patch skip or notification preservation");
+        return TestResult::Fail("patch skip, or a notification no owner reads was kept");
     }
     let mut model = Model::new();
     model.notifications = 33;
+    let mut session = Session::new(model, firmware(32));
+    if run(session.run()).is_err() || !session.events.is_empty() {
+        return TestResult::Fail("unread notifications filled the bounded mailbox");
+    }
+    let mut model = Model::new();
+    model.notifications = 2;
+    model.notification_eid = 0x0d;
+    let mut session = Session::new(model, firmware(32));
+    if run(session.run()).is_err() || session.events.len() != 2 {
+        return TestResult::Fail("a SCAN_DONE notification was not kept for its owner");
+    }
+    let mut model = Model::new();
+    model.notifications = 33;
+    model.notification_eid = 0x0d;
     if run(Session::new(model, firmware(32)).run()) != Err(Error::EventOverflow) {
-        return TestResult::Fail("unsolicited events exhausted an unbounded queue");
+        return TestResult::Fail("kept unsolicited events exhausted an unbounded queue");
     }
     TestResult::Pass
 }
@@ -3718,6 +3812,115 @@ fn mt76_peer_disconnect_stops_data_and_teardown_requires_firmware_ack() -> TestR
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mt76_peer_disconnect_stops_data_and_teardown_requires_firmware_ack
+);
+
+/// mac80211 `ieee80211_rx_mgmt_deauth` -> `ieee80211_report_disconnect`:
+/// the AP's Deauthentication ends the link with its own reason, reported
+/// as sent by the AP, and the station does not answer it with one. A local
+/// decision (`ieee80211_set_disassoc(..., tx = true)`) is reported as
+/// locally generated, and its teardown sends the station's
+/// Deauthentication so the AP (with PMF) keeps no stale association.
+fn mt76_link_loss_reports_its_reason_and_origin() -> TestResult {
+    let mut session = secure_model();
+    let State::Associated { info, peer, .. } = session.state else {
+        unreachable!()
+    };
+    let own = info.capabilities.mac;
+    let mut deauth = vec![0; 26];
+    deauth[0] = 0xc0;
+    deauth[4..10].copy_from_slice(&own);
+    deauth[10..16].copy_from_slice(&peer);
+    deauth[16..22].copy_from_slice(&peer);
+    deauth[24] = 7; // WLAN_REASON_CLASS3_FRAME_FROM_NONASSOC_STA
+    session.backend.packets.push_back(descriptor(&deauth));
+    if session.receive_ethernet() != Err(Error::DeviceGone)
+        || session.station.loss
+            != Some(LinkLoss {
+                reason: 7,
+                from_ap: true,
+            })
+    {
+        return TestResult::Fail("the AP's Deauthentication was not recorded as its own");
+    }
+    let start = session.backend.frames.len();
+    if run(session.disassociate_station()).is_err()
+        || session.station.loss.is_some()
+        || session.backend.frames[start..]
+            .iter()
+            .any(|(scatter, frame)| !scatter && frame.first() == Some(&0xc0))
+    {
+        return TestResult::Fail("a station deauthenticated by its AP answered with its own");
+    }
+
+    let mut session = secure_model();
+    let _ = session.lose_peer(peer, 3, false, "test decision");
+    if session.station.loss
+        != Some(LinkLoss {
+            reason: 3,
+            from_ap: false,
+        })
+        || !matches!(session.step_network(None), Err(Error::DeviceGone))
+    {
+        return TestResult::Fail("a local leave was not recorded as locally generated");
+    }
+    let start = session.backend.frames.len();
+    if run(session.disassociate_station()).is_err()
+        || !matches!(session.state, State::ScanReady(_))
+        || !session.backend.frames[start..]
+            .iter()
+            .any(|(scatter, frame)| {
+                !scatter
+                    && frame.len() == 26
+                    && frame[0] == 0xc0
+                    && frame[4..10] == peer
+                    && frame[10..16] == own
+                    && frame[24..26] == [3, 0]
+            })
+    {
+        return TestResult::Fail("a local leave did not send its Deauthentication");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mt76_link_loss_reports_its_reason_and_origin
+);
+
+/// An idle associated link has no timed work (`service_deadline` is
+/// `None`): the interrupt-driven worker sleeps until the device or the
+/// host raises its line. Queued work is due at once; a frame in flight is
+/// due at its TX completion watchdog; an unassociated owner is never timed.
+fn mt76_idle_association_has_no_timed_service() -> TestResult {
+    let unassociated = Session::new(Model::new(), firmware(32));
+    if unassociated.service_deadline().is_some() {
+        return TestResult::Fail("an unassociated owner asked for timed service");
+    }
+    let mut session = secure_model();
+    if session.service_deadline().is_some() {
+        return TestResult::Fail("an idle association asked for timed service");
+    }
+    session.station.control_pending.push_back(vec![0xd0; 28]);
+    if session.service_deadline() != Some(0) {
+        return TestResult::Fail("queued control work was not due at once");
+    }
+    session.station.control_pending.clear();
+    let mut eth = vec![0u8; 60];
+    eth[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    eth[6..12].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    eth[12..14].copy_from_slice(&[0x08, 0x00]);
+    let before = session.backend.ticks.get();
+    if session.start_ethernet(&eth).is_err() {
+        return TestResult::Fail("model data frame was not admitted");
+    }
+    match session.service_deadline() {
+        Some(at) if at >= before + TIMEOUT_MS * 1_000_000 => {}
+        _ => return TestResult::Fail("a frame in flight was not timed by its TX watchdog"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mt76_idle_association_has_no_timed_service
 );
 
 fn mt76_native_eapol_txd_sets_data_type_in_both_hardware_fields() -> TestResult {

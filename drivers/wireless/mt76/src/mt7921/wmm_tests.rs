@@ -533,18 +533,21 @@ fn mt76_wmm_bound_beacon_change_closes_port_and_preserves_qos_replay() -> TestRe
     if session.receive_ethernet() != Ok(None) || session.station.peer_lost {
         return TestResult::Fail("foreign AP changed negotiated EDCA");
     }
+    // mac80211 `ieee80211_sta_wmm_params`: rows changed under the same
+    // parameter set count are no update; the negotiated EDCA and the link
+    // stay, and no new EDCA is programmed.
+    let negotiated = session.station.wmm;
     session.backend.packets.push_back(packet(&beacon));
-    let mut eth = vec![0xff; 18];
-    eth[6..12].copy_from_slice(&OWN);
-    eth[12..14].copy_from_slice(&[8, 0]);
     let count = session.backend.frames.len();
-    if session.receive_ethernet() != Err(Error::DeviceGone)
-        || session.start_ethernet(&eth) != Err(Error::DeviceGone)
+    if session.receive_ethernet() != Ok(None)
+        || session.station.peer_lost
+        || session.station.wmm != negotiated
+        || session.station.wmm_pending.is_some()
         || session.backend.frames.len() != count
         || run(session.disassociate_station()).is_err()
         || session.station.wmm.is_some()
     {
-        return TestResult::Fail("changed bound AP EDCA retained port or replay authority");
+        return TestResult::Fail("an unchanged WMM parameter set count changed the link or EDCA");
     }
     TestResult::Pass
 }

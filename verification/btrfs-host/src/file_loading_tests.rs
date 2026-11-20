@@ -188,3 +188,47 @@ fn unlinked_inode_is_recovered_after_a_crash() {
     narf::reset();
     linux::check(&crash, true).unwrap();
 }
+
+/// glibc `ldconfig` (`elf/cache.c::save_cache`) on the root subvolume, in
+/// the order strace shows: `open("/etc/ld.so.cache~",
+/// O_CREAT|O_WRONLY|O_TRUNC|O_NOFOLLOW, 0600)`, `write`s, `chmod(0644)` of
+/// the name while the file is open, `fsync`, `close`, `rename` over the live
+/// cache — twice, as two pacman transactions do. Every step reaches the
+/// inode the create made.
+#[test]
+fn ldconfig_cache_rewrite_changes_mode_of_open_file() {
+    let _boot = BOOT.lock().unwrap_or_else(|e| e.into_inner());
+    let (image, views) = fixture("ldconfig");
+    let root = views[0].root();
+    block_on(async {
+        let etc = root.lookup_dir_async("etc").await.unwrap();
+        for round in 0..2u8 {
+            let tmp = etc
+                .create_with_attrs("ld.so.cache~", 0o600, 0, 0)
+                .await
+                .unwrap();
+            assert_eq!(tmp.stat().mode.perms, 0o600);
+            let data = vec![0x40 + round; 187287];
+            assert_eq!(tmp.write(0, &data[..89376]).await.unwrap(), 89376);
+            assert_eq!(
+                tmp.write(89376, &data[89376..]).await.unwrap(),
+                data.len() - 89376
+            );
+            let named = etc.lookup_async("ld.so.cache~").await.unwrap();
+            named.set_perms(0o644).await.unwrap();
+            assert_eq!(named.stat().mode.perms, 0o644);
+            tmp.fsync(false).await.unwrap();
+            drop(tmp);
+            drop(named);
+            etc.rename("ld.so.cache~", "ld.so.cache").await.unwrap();
+            let cache = etc.lookup_async("ld.so.cache").await.unwrap();
+            assert_eq!(cache.stat().mode.perms, 0o644);
+            read_exact(&cache, &data).await;
+        }
+        root.syncfs().await.unwrap();
+    });
+    drop(root);
+    drop(views);
+    narf::reset();
+    linux::check(&image, true).unwrap();
+}

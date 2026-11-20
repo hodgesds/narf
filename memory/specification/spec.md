@@ -1586,6 +1586,25 @@ assignments to 16-byte boundaries. Callers passing a `VirtRange` that
 is page-aligned satisfy both arches; passing a sub-page range on
 x86_64 is rejected at runtime.
 
+**Reporting the KASLR offset.** `kaslr::KernelOffset` is the only sanctioned
+way to print the slide:
+
+```rust
+pub struct KernelOffset { pub slide: u64, pub phys_delta: u64 }
+impl KernelOffset { pub fn current() -> Self; }          // two atomic loads
+impl core::fmt::Display for KernelOffset { /* below */ }
+// "Kernel Offset: 0x<slide> from 0x<link base>
+//  (relocation range: 0x<base>-0x<base+KERNEL_IMAGE_SIZE-1>)   [x86_64 only]
+//  , physical delta 0x<delta>"
+```
+
+It is Linux's `dump_kernel_offset` line and is printed only by fatal-path
+reporters — the panic sink and the x86_64 / aarch64 fatal-exception
+printers. The normal boot log carries neither the slide, the slid base, nor
+the physical delta (Linux never prints them at boot); runtime readers get
+slid addresses only through `/proc/kallsyms` under `kernel.kptr_restrict`
+(`filesystem/` §3.14).
+
 ## 4. Invariants & safety properties
 
 - **A kernel stack never has a mapped page below it.** Every `KernelStack`

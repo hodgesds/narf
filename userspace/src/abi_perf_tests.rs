@@ -1472,17 +1472,23 @@ fn smoke_abi_perf_inherited_software_clock_survives_thread_exit() -> TestResult 
 
         let parent_tid = crate::handlers::current_task_id();
         let parent_pid = crate::handlers::task_to_pid_raw(parent_tid).unwrap_or(parent_tid);
-        crate::perf_event::on_fork(parent_pid, CHILD_PID, parent_tid, CHILD_TID);
-        // x86's own-stack scheduler records total on-CPU slice time in the
-        // primary ledger; the legacy aarch64 path records user time alone.
-        #[cfg(target_arch = "x86_64")]
-        crate::handlers::__test_account_cpu_ns(
-            CHILD_TID,
-            CHILD_USER_NS.saturating_add(CHILD_KERNEL_NS),
+        // A registered stand-in child: CPU time lives on the task.
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                crate::task::release_task(CHILD_TID);
+            }
+        }
+        let _child = (
+            crate::task::Task::new_registered(CHILD_TID, CHILD_PID),
+            Release,
         );
-        #[cfg(not(target_arch = "x86_64"))]
-        crate::handlers::__test_account_cpu_ns(CHILD_TID, CHILD_USER_NS);
-        crate::handlers::__test_account_kernel_ns(CHILD_TID, CHILD_KERNEL_NS);
+        crate::perf_event::on_fork(parent_pid, CHILD_PID, parent_tid, CHILD_TID);
+        if !crate::handlers::__test_account_cpu_ns(CHILD_TID, CHILD_USER_NS)
+            || !crate::handlers::__test_account_kernel_ns(CHILD_TID, CHILD_KERNEL_NS)
+        {
+            return Err("stand-in child task was not registered");
+        }
 
         let mut live = [0u64; 3];
         for (index, fd) in fds.iter().copied().enumerate() {

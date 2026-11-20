@@ -492,7 +492,7 @@ impl<B: Backend> Session<B> {
             }
             event.truncate(length);
             if event[28] != 0x27 {
-                if roc_ack(&event) {
+                if roc_ack(&event) || !super::super::station::mailbox_event(&event) {
                     continue;
                 }
                 if self.events.len() == super::super::MAX_EVENTS {
@@ -528,12 +528,30 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// Linux `mt7921_mgd_prepare_tx` for one MLME try. `mt7921_set_roc`
+    /// leaves a live join grant alone (`MT76_STATE_ROC` stays set until
+    /// `roc_timer` fires at the grant's `max_interval`); once it has expired
+    /// the stale request is aborted and a new grant acquired.
+    pub(in crate::mt7921::firmware_transport) async fn prepare_join_tx(
+        &mut self,
+        active: &mut Option<JoinRoc>,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<(), Error> {
+        let now = self.backend.now_ns();
+        if active.is_some_and(|roc| now < roc.until_ns) {
+            return self.check_station_tx();
+        }
+        self.acquire_join_roc(active, frequency_mhz, duration_ms)
+            .await
+    }
+
     /// Acquire a CONNAC2 CNM join grant (`MT7921_ROC_REQ_JOIN`) before station
     /// management TX when firmware advertises `MT792x_FW_CAP_CNM`, mirroring
     /// Linux `mt7921_mgd_prepare_tx`.
     pub(in crate::mt7921::firmware_transport) async fn acquire_join_roc(
         &mut self,
-        active: &mut Option<p2p_wire::Request>,
+        active: &mut Option<JoinRoc>,
         frequency_mhz: u32,
         duration_ms: u32,
     ) -> Result<(), Error> {
@@ -554,12 +572,24 @@ impl<B: Backend> Session<B> {
             &request.acquire(),
         )
         .await?;
-        *active = Some(request);
+        // Not yet granted: a later try acquires again.
+        *active = Some(JoinRoc {
+            request,
+            until_ns: 0,
+        });
         let event = self
             .wait_roc_grant(bss, request.token(), Self::check_station_tx)
             .await?;
         self.events.retain(|event| !roc_ack(event));
-        let _ = request.grant(&event[36..])?;
+        let granted_ms = request.grant(&event[36..])?;
+        // `mt7921_mcu_uni_roc_event`: roc_timer = jiffies + max_interval.
+        *active = Some(JoinRoc {
+            request,
+            until_ns: self
+                .backend
+                .now_ns()
+                .saturating_add(u64::from(granted_ms) * 1_000_000),
+        });
         self.check_station_tx()
     }
 
@@ -567,13 +597,20 @@ impl<B: Backend> Session<B> {
     /// `mt7921_mgd_complete_tx`.
     pub(in crate::mt7921::firmware_transport) async fn abort_join_roc(
         &mut self,
-        active: &mut Option<p2p_wire::Request>,
+        active: &mut Option<JoinRoc>,
     ) -> Result<(), Error> {
-        let Some(request) = active.take() else {
+        let Some(roc) = active.take() else {
             return Ok(());
         };
-        self.send_roc_abort(request.abort()).await
+        self.send_roc_abort(roc.request.abort()).await
     }
+}
+
+/// The station's CNM join request and the end of its granted interval.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::mt7921::firmware_transport) struct JoinRoc {
+    request: p2p_wire::Request,
+    until_ns: u64,
 }
 fn roc_ack(event: &[u8]) -> bool {
     event.len() == 44 && event[28] == 1 && event[30] & 4 == 0 && event[36] == 0x27

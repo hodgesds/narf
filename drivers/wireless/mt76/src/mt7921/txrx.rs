@@ -99,14 +99,59 @@ pub const TXD_SIZE: usize = 32;
 /// RXD dword 0 — packet length + type.
 ///
 /// `MT_RXD0_LENGTH`   = GENMASK(15, 0). Total frame length.
-/// `MT_RXD0_PKT_TYPE` = GENMASK(31, 27). Type: 0=normal, 1=event.
+/// `MT_RXD0_PKT_FLAG` = GENMASK(19, 16).
+/// `MT_RXD0_PKT_TYPE` = GENMASK(31, 27), values from `enum rx_pkt_type`
+/// (`mt76_connac.h`); see [`RxPacket`].
 pub const RXD0_LENGTH_MASK: u32 = 0xFFFF;
+pub const RXD0_PKT_FLAG_SHIFT: u32 = 16;
+pub const RXD0_PKT_FLAG_MASK: u32 = 0xF << RXD0_PKT_FLAG_SHIFT;
 pub const RXD0_PKT_TYPE_SHIFT: u32 = 27;
 pub const RXD0_PKT_TYPE_MASK: u32 = 0x1F << RXD0_PKT_TYPE_SHIFT;
-/// Packet type: normal data frame.
-pub const RXD0_PKT_TYPE_NORMAL: u32 = 0;
-/// Packet type: MCU event frame (delivered to `RXQ_MCU_EVENT`).
-pub const RXD0_PKT_TYPE_EVENT: u32 = 1 << RXD0_PKT_TYPE_SHIFT;
+/// `PKT_TYPE_TXS`: TX status records.
+pub const RXD0_PKT_TYPE_TXS: u32 = 0;
+/// `PKT_TYPE_TXRXV`: TX/RX vector report.
+pub const RXD0_PKT_TYPE_TXRXV: u32 = 1;
+/// `PKT_TYPE_NORMAL`: received 802.11 frame.
+pub const RXD0_PKT_TYPE_NORMAL: u32 = 2;
+/// `PKT_TYPE_TXRX_NOTIFY`: TX-free token release (MMIO devices only).
+pub const RXD0_PKT_TYPE_TXRX_NOTIFY: u32 = 6;
+/// `PKT_TYPE_RX_EVENT`: MCU event frame.
+pub const RXD0_PKT_TYPE_EVENT: u32 = 7;
+/// `PKT_TYPE_NORMAL_MCU`: received 802.11 frame forwarded by the MCU.
+pub const RXD0_PKT_TYPE_NORMAL_MCU: u32 = 8;
+
+/// What `mt7921_queue_rx_skb` (`mt7921/mac.c`) does with one native RX
+/// packet, from its RXD0 alone.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxPacket {
+    /// `PKT_TYPE_TXS` → `mt7921_mac_add_txs` per 8-dword record.
+    TxStatus,
+    /// `PKT_TYPE_TXRX_NOTIFY` → `mt7921_mac_tx_free` (token release).
+    TxFree,
+    /// `PKT_TYPE_RX_EVENT` → `mt7921_mcu_rx_event`.
+    Event,
+    /// `PKT_TYPE_NORMAL`, `PKT_TYPE_NORMAL_MCU`, or `PKT_TYPE_RX_EVENT`
+    /// with `PKT_FLAG` 1 (rewritten to `PKT_TYPE_NORMAL_MCU`) →
+    /// `mt7921_mac_fill_rx`.
+    Normal,
+    /// Every other type (`PKT_TYPE_TXRXV`, `PKT_TYPE_RX_DUP_RFB`, …),
+    /// which Linux frees unread.
+    Other,
+}
+
+/// Classify a native RX packet by its RXD0 (`mt7921_queue_rx_skb`).
+pub const fn rx_packet(rxd0: u32) -> RxPacket {
+    let kind = (rxd0 & RXD0_PKT_TYPE_MASK) >> RXD0_PKT_TYPE_SHIFT;
+    let flag = (rxd0 & RXD0_PKT_FLAG_MASK) >> RXD0_PKT_FLAG_SHIFT;
+    match kind {
+        RXD0_PKT_TYPE_TXS => RxPacket::TxStatus,
+        RXD0_PKT_TYPE_TXRX_NOTIFY => RxPacket::TxFree,
+        RXD0_PKT_TYPE_EVENT if flag == 1 => RxPacket::Normal,
+        RXD0_PKT_TYPE_EVENT => RxPacket::Event,
+        RXD0_PKT_TYPE_NORMAL | RXD0_PKT_TYPE_NORMAL_MCU => RxPacket::Normal,
+        _ => RxPacket::Other,
+    }
+}
 
 /// RXD dword 1 — WLAN index + security + error flags.
 ///
@@ -227,7 +272,7 @@ pub fn encode_txd(info: &TxdInfo, out: &mut [u8]) -> Option<()> {
 pub struct RxdInfo {
     /// Total length of the received frame payload in bytes.
     pub frame_len: u16,
-    /// Packet type: 0 = normal data, 1 = MCU event.
+    /// `MT_RXD0_PKT_TYPE` (`RXD0_PKT_TYPE_*`, e.g. 2 = normal frame).
     pub pkt_type: u8,
     /// WLAN index (station that sent the frame).
     pub wlan_idx: u16,

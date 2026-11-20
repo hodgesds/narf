@@ -6,6 +6,7 @@ pub(crate) use control::scheduled_results;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub use control::connect_for_test;
+pub use control::notify_assoc_comeback;
 
 pub use control::station::{
     control_port_over_nl80211, notify_control_port_tx_status, notify_gtk_rekey,
@@ -222,7 +223,15 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
     let Some(iface) = narf_net::iface::lookup(name) else {
         return;
     };
-    let attrs = disconnect_attrs(index, reason, from_ap);
+    // `__cfg80211_disconnected`: the connection owner is released
+    // (`wdev->conn_owner_nlportid = 0`) before `nl80211_send_disconnected`,
+    // which leads with NL80211_ATTR_WIPHY.
+    control::clear_connection_owner(name);
+    let mut attrs = Vec::new();
+    if let Some(wiphy) = wiphy_for_name(name) {
+        push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+    }
+    attrs.extend_from_slice(&disconnect_attrs(index, reason, from_ap));
     narf_net::netlink_generic::publish_event(
         NL80211_FAMILY_ID,
         19,

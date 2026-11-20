@@ -1,4 +1,12 @@
-//! x2APIC initialisation + LAPIC-timer periodic IRQ driver.
+//! x2APIC initialisation + the per-CPU LAPIC-timer clockevent.
+//!
+//! Every CPU's LAPIC timer is its own one-shot clockevent (Linux
+//! `lapic_events`, `setup_APIC_timer`): TSC-deadline where the CPU has it
+//! (`lapic_next_deadline`), otherwise the LVT one-shot mode counting `TMICT`
+//! down (`lapic_next_event`) at a rate calibrated once against the TSC
+//! (`calibrate_APIC_clock`). Both carry the CPU's periodic tick, its
+//! scheduler deadline and its own next hrtimer event. The hardware periodic
+//! InitialCount mode remains only for a LAPIC timer that failed calibration.
 //!
 //! x2APIC uses MSRs (0x800+) for LAPIC register access, avoiding the
 //! MMIO aliasing headache of xAPIC. Modern hardware (and QEMU `-cpu
@@ -17,10 +25,14 @@
 //! 0x839   APIC_TIMER_CUR_COUNT    — current count (read)
 //! 0x83E   APIC_TIMER_DIVIDE       — divide configuration
 //! ```
+//!
+//! xAPIC MMIO has the same registers at `(msr - 0x800) * 16` (LVT timer
+//! 0x320, initial count 0x380, current count 0x390, divide 0x3E0).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, AtomicU8, Ordering};
 
 use narf_arch::x86_64::msr::{rdmsr, wrmsr};
+use narf_lib::clockevent_scale::ClockEventScale;
 
 const IA32_APIC_BASE: u32 = 0x0000_001B;
 
@@ -45,6 +57,7 @@ const SIVR_ENABLE: u64 = 1 << 8;
 
 /// LVT Timer mode bits 17:18. `00` = one-shot, `01` = periodic,
 /// `10` = TSC-deadline.
+const LVT_TIMER_ONESHOT: u64 = 0;
 const LVT_TIMER_PERIODIC: u64 = 1 << 17;
 const LVT_TIMER_TSC_DEADLINE: u64 = 2 << 17;
 /// LVT bit 16: masked. Clear to unmask.
@@ -62,7 +75,230 @@ const IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
 ///   100 = /32, 101 = /64, 110 = /128, 111 = /1.
 const DIV_16: u64 = 0b011;
 
+/// xAPIC MMIO offsets of the timer registers (Intel SDM Vol 3 §10.5.4, AMD
+/// APM Vol 2 §16.4.1, identical layout). The x2APIC MSR is `0x800 + off/16`.
+const LAPIC_LVTT: u64 = 0x320;
+const LAPIC_TMICT: u64 = 0x380;
+const LAPIC_TMCCT: u64 = 0x390;
+const LAPIC_TDCR: u64 = 0x3E0;
+
+/// Programmable one-shot range in divide-by-16 ticks: Linux
+/// `lapic_init_clockevent` (`min_delta_ticks = 0xF`,
+/// `max_delta_ticks = 0x7FFFFFFF`).
+const LAPIC_MIN_DELTA_TICKS: u64 = 0xF;
+const LAPIC_MAX_DELTA_TICKS: u64 = 0x7FFF_FFFF;
+
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Write LAPIC timer register `offset` through whichever interface is live
+/// (x2APIC MSR or xAPIC MMIO), fenced against compiler reordering on both
+/// sides (AGENTS.md invariant #4; `wrmsr` carries its own fence pair).
+///
+/// # Safety
+/// This CPU's LAPIC is enabled; in xAPIC mode its registers are reachable
+/// through [`lapic_reg`].
+#[inline]
+unsafe fn timer_write(offset: u64, value: u32) {
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        // SAFETY: x2APIC is live, so the timer MSR `0x800 + offset/16` exists.
+        unsafe { wrmsr(0x800 + (offset >> 4) as u32, u64::from(value)) };
+    } else {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller guarantees the mapped register page; aligned 32-bit.
+        unsafe { core::ptr::write_volatile(lapic_reg(offset), value) };
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Read LAPIC timer register `offset`; see [`timer_write`].
+///
+/// # Safety
+/// As for [`timer_write`].
+#[inline]
+unsafe fn timer_read(offset: u64) -> u32 {
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        // SAFETY: x2APIC is live, so the timer MSR `0x800 + offset/16` exists.
+        unsafe { rdmsr(0x800 + (offset >> 4) as u32) as u32 }
+    } else {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller guarantees the mapped register page; aligned 32-bit.
+        let v = unsafe { core::ptr::read_volatile(lapic_reg(offset)) };
+        compiler_fence(Ordering::SeqCst);
+        v
+    }
+}
+
+/// The LAPIC timer's count rate against the TSC (Linux `lapic_timer_period`
+/// and the `lapic_clockevent` mult/min/max it configures). Measured once, on
+/// the boot CPU, and shared by every CPU: `setup_APIC_timer` copies the boot
+/// CPU's calibrated device the same way. `None` means the timer did not count
+/// during calibration; CPUs then keep the hardware periodic mode.
+static LAPIC_SCALE: narf_lib::sync::OnceLock<Option<ClockEventScale>> =
+    narf_lib::sync::OnceLock::new();
+
+/// Calibration window: at least this many divide-by-16 ticks AND TSC cycles,
+/// so the one-tick count quantisation and the TMCCT read brackets stay near
+/// 1e-4 of the window. About 10 ms on Zen (100 MHz APIC clock), 7 ms under
+/// KVM (1 GHz emulated bus), 55 ms for a 19.2 MHz crystal.
+const CAL_MIN_TICKS: u64 = 1 << 16;
+const CAL_MIN_CYCLES: u64 = 1 << 25;
+/// Abandon a calibration that has not completed after this many TSC cycles:
+/// the timer does not count, or counts implausibly slowly.
+const CAL_MAX_CYCLES: u64 = 1 << 31;
+
+/// One calibration sample: `count` (TMCCT) read between two ordered TSC
+/// reads, stamped at their midpoint. `half_bracket` bounds the stamp error.
+#[derive(Copy, Clone, Debug)]
+struct CalSample {
+    tsc: u64,
+    count: u32,
+    half_bracket: u64,
+}
+
+/// The narrowest of four bracketed `(TSC, TMCCT)` reads. Under a hypervisor
+/// a TMCCT read is a VM exit (~1-2 µs); the bracket records that cost as
+/// measurement uncertainty instead of letting it bias the ratio.
+///
+/// # Safety
+/// As for [`timer_read`].
+unsafe fn cal_sample() -> CalSample {
+    let mut best = CalSample {
+        tsc: 0,
+        count: 0,
+        half_bracket: u64::MAX,
+    };
+    for _ in 0..4 {
+        let t0 = narf_time::raw_cycles();
+        // SAFETY: forwarded caller contract.
+        let count = unsafe { timer_read(LAPIC_TMCCT) };
+        let t1 = narf_time::raw_cycles();
+        let width = t1.saturating_sub(t0);
+        let half = width.div_ceil(2);
+        if half < best.half_bracket {
+            best = CalSample {
+                tsc: t0 + width / 2,
+                count,
+                half_bracket: half,
+            };
+        }
+    }
+    best
+}
+
+/// Linux `calibrate_APIC_clock`: run this CPU's LAPIC timer masked at divide
+/// 16 from `0xFFFF_FFFF` and count it against the invariant TSC. The ratio
+/// does not depend on the TSC frequency calibration, so it is valid before
+/// `narf_time` has calibrated (the boot CPU measures it in [`init_bsp`]).
+/// Leaves the timer masked and stopped.
+fn calibrate_lapic_timer() -> Option<ClockEventScale> {
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: the LAPIC is enabled on this CPU (its init ran); the timer
+        // stays masked for the whole measurement, so no interrupt is raised.
+        unsafe {
+            timer_write(LAPIC_LVTT, (LVT_MASKED | LVT_TIMER_ONESHOT) as u32);
+            timer_write(LAPIC_TDCR, DIV_16 as u32);
+            timer_write(LAPIC_TMICT, u32::MAX);
+            let start = cal_sample();
+            let scale = loop {
+                let now = cal_sample();
+                let cycles = now.tsc.saturating_sub(start.tsc);
+                // The current count runs down; one that went up is not a
+                // timer this can calibrate.
+                let Some(ticks) = start.count.checked_sub(now.count).map(u64::from) else {
+                    break None;
+                };
+                if ticks >= CAL_MIN_TICKS && cycles >= CAL_MIN_CYCLES {
+                    break ClockEventScale::from_measurement(
+                        cycles,
+                        ticks,
+                        start.half_bracket + now.half_bracket,
+                        LAPIC_MIN_DELTA_TICKS,
+                        LAPIC_MAX_DELTA_TICKS,
+                    );
+                }
+                if cycles >= CAL_MAX_CYCLES || (ticks == 0 && cycles >= CAL_MIN_CYCLES) {
+                    break None;
+                }
+                core::hint::spin_loop();
+            };
+            timer_write(LAPIC_TMICT, 0);
+            timer_write(LAPIC_LVTT, LVT_MASKED as u32);
+            scale
+        }
+    })
+}
+
+/// The calibrated LAPIC one-shot conversion (TSC cycles to divide-by-16
+/// ticks), measuring it on first use. A first-use measurement reprograms the
+/// calling CPU's LAPIC timer (masked), so it must come from a CPU that is
+/// about to start its timer or is not using it.
+pub fn lapic_timer_scale() -> Option<&'static ClockEventScale> {
+    LAPIC_SCALE.get_or_init(calibrate_lapic_timer).as_ref()
+}
+
+/// The calibration if it has already been measured (never measures).
+#[inline]
+fn lapic_timer_scale_ready() -> Option<&'static ClockEventScale> {
+    LAPIC_SCALE.get().and_then(Option::as_ref)
+}
+
+/// Boot-log the calibrated one-shot device once the TSC frequency is known
+/// (Linux prints `lapic_timer_period` from `calibrate_APIC_clock`).
+fn log_oneshot_calibration(scale: &ClockEventScale) {
+    use core::fmt::Write as _;
+    let ns_per_mtick = narf_time::cycles_to_ns(scale.ticks_to_units(1_000_000)).max(1);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  apic: LAPIC one-shot timer {} kHz (divide 16), delta {} ns..{} s",
+        1_000_000_000_000u64 / ns_per_mtick,
+        narf_time::cycles_to_ns(scale.min_delta()),
+        narf_time::cycles_to_ns(scale.max_delta()) / 1_000_000_000,
+    );
+}
+
+/// How a CPU's LAPIC timer is running.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LocalTimerMode {
+    /// Masked; never started, or stopped.
+    Stopped = 0,
+    /// Hardware periodic InitialCount mode: ticks at a fixed rate and cannot
+    /// be programmed per event (Linux's low-resolution periodic tick). Only
+    /// for a LAPIC timer that failed calibration.
+    Periodic = 1,
+    /// `IA32_TSC_DEADLINE` one-shot (Linux `lapic-deadline`).
+    TscDeadline = 2,
+    /// LVT one-shot counting `TMICT` down (Linux `lapic` in oneshot state,
+    /// `lapic_next_event`).
+    Oneshot = 3,
+}
+
+impl LocalTimerMode {
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Periodic,
+            2 => Self::TscDeadline,
+            3 => Self::Oneshot,
+            _ => Self::Stopped,
+        }
+    }
+
+    /// Whether the mode programs individual events (tickless idle, precise
+    /// hrtimers): Linux `CLOCK_EVT_FEAT_ONESHOT`.
+    pub const fn is_oneshot(self) -> bool {
+        matches!(self, Self::TscDeadline | Self::Oneshot)
+    }
+
+    /// Short name for boot logs.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Periodic => "periodic",
+            Self::TscDeadline => "tsc-deadline",
+            Self::Oneshot => "one-shot",
+        }
+    }
+}
 
 /// Set true by `init_bsp` only after the IA32_APIC_BASE.EXTD bit
 /// is verified to have stuck. QEMU TCG's qemu64 model advertises
@@ -166,6 +402,7 @@ pub unsafe fn init_bsp() {
             init_lapic_xapic();
         }
         install_apic_diag_handlers();
+        calibrate_boot_lapic_timer(&feats);
         return;
     }
     X2APIC_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
@@ -189,6 +426,23 @@ pub unsafe fn init_bsp() {
         wrmsr(APIC_LVT_ERROR_MSR, super::super::VECTOR_APIC_ERROR as u64);
     }
     install_apic_diag_handlers();
+    calibrate_boot_lapic_timer(&feats);
+}
+
+/// Boot CPU: measure the LAPIC timer rate before any AP starts, so every CPU
+/// without TSC-deadline starts its timer directly in one-shot mode (Linux
+/// `setup_boot_APIC_clock` → `calibrate_APIC_clock` runs before SMP boot,
+/// and `setup_secondary_APIC_clock` reuses the result). A TSC-deadline CPU
+/// never uses the count rate and skips the ~10 ms measurement.
+fn calibrate_boot_lapic_timer(feats: &narf_arch::x86_64::Features) {
+    if feats.tsc_deadline || lapic_timer_scale().is_some() {
+        return;
+    }
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  apic: LAPIC timer did not count during calibration; periodic InitialCount tick"
+    );
 }
 
 /// xAPIC MMIO initialisation: program SIVR (software-enable +
@@ -309,23 +563,51 @@ pub static APIC_ERROR_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic:
 pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Start the LAPIC timer in periodic mode firing IRQ `timer_vector`.
+/// Start this CPU's LAPIC timer as its clockevent, firing IRQ
+/// `timer_vector`, with a periodic tick every `initial_count` divide-by-16
+/// LAPIC ticks.
 ///
-/// `initial_count` is in LAPIC-timer ticks (post-divide). Exact
-/// real-time spacing depends on the bus/core frequency (Stage-3
-/// calibration).
+/// With a calibrated LAPIC timer ([`lapic_timer_scale`]) the timer runs in
+/// LVT one-shot mode and the tick is emulated in software at the same rate,
+/// exactly as the TSC-deadline mode does: each interrupt re-arms `TMICT` for
+/// the earliest of the next tick, the scheduler deadline and this CPU's next
+/// hrtimer event, and an idle CPU can stop the tick (Linux
+/// `lapic_timer_set_oneshot` + `tick_setup_periodic` in oneshot mode). Only
+/// a timer that failed calibration falls back to the hardware periodic
+/// InitialCount mode.
+///
+/// # Safety
+/// `init_bsp` (or `init_ap`) must have run on this CPU; caller still owns
+/// IRQ masking.
+pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
+    if let Some(scale) = lapic_timer_scale() {
+        let period_cycles = scale.ticks_to_units(u64::from(initial_count)).max(1);
+        // SAFETY: forwarded caller contract.
+        unsafe { start_timer_oneshot(timer_vector, period_cycles) };
+        return;
+    }
+    // SAFETY: forwarded caller contract.
+    unsafe { start_timer_periodic(timer_vector, initial_count) };
+}
+
+/// Start the LAPIC timer in hardware periodic mode firing IRQ
+/// `timer_vector` every `initial_count` divide-by-16 ticks. For a LAPIC
+/// timer that could not be calibrated (`start_timer` prefers one-shot).
 ///
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
-pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
+unsafe fn start_timer_periodic(timer_vector: u8, initial_count: u32) {
     // Periodic mode expires this CPU's hrtimers from its own tick
     // (`on_timer_tick` → `hrtimer_run_queues`, Linux's low-resolution
     // mode), so timers need no per-event programming here; publish that a
-    // clockevent backs them, as the TSC-deadline path does, so a sleeper
-    // does not self-wake and poll. `arm_hrtimer_event` is a no-op on a CPU
-    // without TSC-deadline; the HPET pump, when it comes up, installs the
-    // programmer that also arms the precise broadcast.
-    narf_time::hrtimer::hrtimers_prepare_cpu(tsc_cpu());
+    // clockevent backs them, as the one-shot paths do, so a sleeper does not
+    // self-wake and poll. `arm_hrtimer_event` is a no-op on a periodic CPU;
+    // the HPET pump, when it comes up, installs the programmer that also
+    // arms the precise broadcast.
+    let cpu = tsc_cpu();
+    TICK_PERIOD_CYCLES[cpu].store(0, Ordering::Relaxed);
+    LOCAL_MODE[cpu].store(LocalTimerMode::Periodic as u8, Ordering::Relaxed);
+    narf_time::hrtimer::hrtimers_prepare_cpu(cpu);
     if !narf_time::hrtimer::arm_callback_installed() {
         narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
     }
@@ -386,55 +668,51 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
 pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
-/// `ClockEvent` adapter wrapping the LAPIC-timer primitives above.
+/// `ClockEvent` adapter wrapping the LAPIC-timer primitives above: one
+/// per-CPU one-shot device (Linux `lapic_clockevent` copied per CPU by
+/// `setup_APIC_timer`).
 ///
-/// LAPIC timer ticks at `(bus_freq / divider)` Hz; with DIV_16 a
-/// typical 100 MHz FSB gives ~6.25 MHz post-divide, so a desired
-/// `100 Hz` (10 ms period) maps to ~62_500 ticks.
+/// The timer runs in TSC-deadline mode where the CPU has it, otherwise in
+/// LVT one-shot mode at the divide-by-16 rate calibrated against the TSC at
+/// boot ([`lapic_timer_scale`]). Either way each CPU programs its own next
+/// event; nothing about one CPU's timers involves another CPU's interrupt.
 ///
-/// Phase 1 uses a hardcoded estimate of post-divide freq (100 MHz
-/// raw / 16 = 6.25 MHz) — close enough on most platforms to deliver
-/// at least *some* ticks per second so `probe_fires` can verify.
-/// Phase 2 lands proper calibration against HPET / TSC.
-///
-/// On Intel, the LAPIC timer stops in C3 and deeper C-states
-/// **unless** CPUID 0x06 EAX[2] (ARAT — Always Running APIC
-/// Timer) is set, in which case the timer continues running. We
-/// detect ARAT via [`narf_arch::x86_64::Features::arat`] but don't
-/// currently use the result here — Linux's optimisation is to
-/// clear the `CLOCK_EVT_FEAT_C3STOP` clockevent flag, but NARF
-/// doesn't yet enter deep C-states in the idle path, so the
-/// information is informational for diagnostics.
+/// On CPUs without ARAT (CPUID 0x06 EAX[2], or implied by the vendor as in
+/// Linux `init_amd`) the LAPIC timer stops in C3 and deeper C-states (Linux
+/// `CLOCK_EVT_FEAT_C3STOP`); `timer_pump` then keeps the HPET broadcast
+/// armed for every CPU's events. With ARAT no broadcast is needed.
 #[derive(Debug)]
 pub struct LapicClockEvent;
 
 impl narf_time::clockevent::ClockEvent for LapicClockEvent {
     fn can_stop_idle_tick(&self) -> bool {
-        tsc_deadline_active()
+        local_oneshot_active()
     }
 
     fn set_idle_tick(&self, stop_tick: bool, budget_deadline: Option<u64>) -> bool {
-        // The TSC-deadline MSR compares against the raw counter; scheduler
-        // and hrtimer deadlines are monotonic counter time (which excludes
-        // time spent suspended). Convert at this boundary.
+        // Both one-shot modes are programmed in raw counter time (the
+        // TSC-deadline MSR compares against it; the TMICT mode converts a
+        // raw-counter delta); scheduler and hrtimer deadlines are monotonic
+        // counter time (which excludes time spent suspended). Convert at this
+        // boundary.
         let budget_deadline = budget_deadline.map(narf_time::mono_to_raw_cycles);
         let enabled = narf_arch::interrupts_enabled();
         // SAFETY: serialize the local deadline registers with the timer ISR.
         unsafe { narf_arch::disable_interrupts() };
         let cpu = tsc_cpu();
-        let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
+        let period = TICK_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
         if period != 0 {
             let now = narf_time::raw_cycles();
             let was_stopped = !narf_time::periodic_tick_wanted(cpu);
             narf_time::set_periodic_tick_wanted(cpu, !stop_tick);
             if !stop_tick && was_stopped {
-                TSC_DEADLINE_NEXT[cpu].store(now.saturating_add(period), Ordering::Relaxed);
+                TICK_NEXT[cpu].store(now.saturating_add(period), Ordering::Relaxed);
             }
             TSC_SCHED_DEADLINE[cpu].store(budget_deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
             let periodic = if stop_tick {
                 u64::MAX
             } else {
-                TSC_DEADLINE_NEXT[cpu].load(Ordering::Relaxed)
+                TICK_NEXT[cpu].load(Ordering::Relaxed)
             };
             // This CPU's own next hrtimer event (`tick_nohz_stop_tick` →
             // `hrtimer_get_next_event`); every CPU carries its own.
@@ -446,7 +724,7 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
                 wheel,
                 MIN_DELTA_CYCLES,
             );
-            program_tsc_deadline(cpu, target);
+            program_next_event(cpu, target);
         }
         if enabled {
             // SAFETY: restore the caller's IRQ state.
@@ -472,27 +750,23 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         if hz == 0 || hz > 100_000 {
             return Err(narf_time::clockevent::ClockEventError::InvalidFrequency);
         }
-        // Prefer TSC-deadline mode (CPUID 01H ECX[24]) — modern
-        // Linux's default for x86. Avoids LAPIC bus calibration
-        // entirely: each IRQ re-arms by writing the next TSC
-        // value. Renoir / Phoenix / QEMU TCG all support it.
-        //
-        // Fallback to periodic-InitialCount with a fixed small
-        // count when TSC-deadline is unavailable (very old CPUs).
-        // SAFETY: BSP, IRQs masked at the caller (clockevent
-        // select_primary runs with IRQs disabled outside the
-        // probe window).
-        // SAFETY: Valid memory or trusted environment
+        // Linux `setup_APIC_timer`: TSC-deadline (CPUID 01H ECX[24]) when the
+        // CPU has it — each IRQ re-arms by writing the next TSC value, no
+        // LAPIC calibration needed. Otherwise the LVT one-shot mode at the
+        // rate `calibrate_APIC_clock` measured (AMD Zen 2/3/4 have no
+        // TSC-deadline). Only a timer that failed calibration falls back to
+        // the hardware periodic InitialCount mode.
+        // SAFETY: CPUID is always legal at CPL=0.
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        // Period in TSC cycles for the requested IRQ rate.
+        //
+        // `ns_to_cycles`, NOT `* cycles_per_ns()`. The latter was a
+        // TRUNCATED integer GHz clamped to 1..=6, so a 3.293 GHz TSC
+        // read back as 3 and the period came out ~9.8% long — every
+        // CPU ticking at ~1097 Hz against the 1000 Hz this asks for.
+        let period_ns = 1_000_000_000u64 / hz as u64;
+        let period_cycles = narf_time::wall::ns_to_cycles(period_ns).max(1);
         if feats.tsc_deadline {
-            // Period in TSC cycles for the requested IRQ rate.
-            //
-            // `ns_to_cycles`, NOT `* cycles_per_ns()`. The latter was a
-            // TRUNCATED integer GHz clamped to 1..=6, so a 3.293 GHz TSC
-            // read back as 3 and the period came out ~9.8% long — every
-            // CPU ticking at ~1097 Hz against the 1000 Hz this asks for.
-            let period_ns = 1_000_000_000u64 / hz as u64;
-            let period_cycles = narf_time::wall::ns_to_cycles(period_ns).max(1);
             // SAFETY: caller upholds exclusive LAPIC access; we
             // gated on CPUID for TSC-deadline support.
             // SAFETY: Valid memory or trusted environment
@@ -502,15 +776,23 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             // Self-rearming one-shot: each IRQ writes the next deadline, so
             // the tick is dependable and a halted CPU may trust it to wake.
             narf_time::set_tick_reliable(true);
+        } else if let Some(scale) = lapic_timer_scale() {
+            // SAFETY: caller upholds exclusive LAPIC access; the timer is
+            // calibrated, so one-shot TMICT programming is defined.
+            unsafe {
+                start_timer_oneshot(vector, period_cycles);
+            }
+            log_oneshot_calibration(scale);
+            // Self-rearming one-shot, as the TSC-deadline mode above.
+            narf_time::set_tick_reliable(true);
         } else {
             // Periodic-InitialCount fallback. See start_timer
             // commentary; 10_000 is safely fast on any plausible
             // post-divide bus speed.
-            let _ = hz;
             let initial_count = 10_000u32;
             // SAFETY: same.
             unsafe {
-                start_timer(vector, initial_count);
+                start_timer_periodic(vector, initial_count);
             }
             // Periodic LAPIC tick on every CPU (each AP arms its own in
             // `smp.rs`): it keeps firing through `hlt` (C1), so a halted CPU
@@ -545,15 +827,17 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         // (sub-nanosecond on modern Intel/AMD); resolution_ns has
         // u64 ns granularity, so report 1 ns — Linux's
         // lapic_clockevent_rating uses the same effective floor.
-        // Classic periodic-InitialCount mode gives post-divide
-        // 6.25 MHz on a typical 100 MHz BCLK ≈ 160 ns per tick.
-        // ARAT (Intel) doesn't change resolution, only the C3
-        // behaviour.
+        // The TMICT one-shot resolves one divide-by-16 tick (160 ns at
+        // a 100 MHz APIC clock). The uncalibrated periodic fallback
+        // assumes that typical clock. ARAT doesn't change resolution,
+        // only the C3 behaviour.
         //
         // SAFETY: CPUID is always legal at CPL=0.
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
         if feats.tsc_deadline {
             1
+        } else if let Some(scale) = lapic_timer_scale_ready() {
+            narf_time::cycles_to_ns(scale.ticks_to_units(1)).max(1)
         } else {
             160
         }
@@ -675,28 +959,33 @@ pub fn send_fixed_ipi(cpu_mask: u64, vector: u8) {
 /// Global singleton for registration with the clockevent registry.
 pub static LAPIC_CLOCKEVENT: LapicClockEvent = LapicClockEvent;
 
-/// Stop the LAPIC timer (mask the LVT entry, zero the initial count).
+/// Stop this CPU's LAPIC timer (Linux `lapic_timer_shutdown`): mask the LVT
+/// entry, then zero the counter of the active mode — the initial count, or
+/// `IA32_TSC_DEADLINE` in TSC-deadline mode ("belt and suspenders" for AMD
+/// erratum 411, which can fire a masked timer).
 ///
 /// # Safety
 /// `init_bsp` must have run.
 pub unsafe fn stop_timer() {
-    TSC_DEADLINE_PERIOD_CYCLES[tsc_cpu()].store(0, Ordering::Relaxed);
-    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-        // SAFETY: APIC is enabled.
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = tsc_cpu();
+        let was = LocalTimerMode::from_raw(
+            LOCAL_MODE[cpu].swap(LocalTimerMode::Stopped as u8, Ordering::Relaxed),
+        );
+        TICK_PERIOD_CYCLES[cpu].store(0, Ordering::Relaxed);
+        TSC_ARMED[cpu].store(u64::MAX, Ordering::Relaxed);
+        // SAFETY: the LAPIC is enabled (caller contract); masking the LVT
+        // keeps its mode bits, so the matching counter is cleared below.
         unsafe {
-            wrmsr(APIC_TIMER_INIT_MSR, 0);
-            wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+            let lvt = timer_read(LAPIC_LVTT) | LVT_MASKED as u32;
+            timer_write(LAPIC_LVTT, lvt);
+            if was == LocalTimerMode::TscDeadline {
+                wrmsr(IA32_TSC_DEADLINE, 0);
+            } else {
+                timer_write(LAPIC_TMICT, 0);
+            }
         }
-        return;
-    }
-    // xAPIC MMIO path — mirror of start_timer's fallback.
-    let lvt_timer = lapic_reg(0x320);
-    let init_ct = lapic_reg(0x380);
-    // SAFETY: same as start_timer.
-    unsafe {
-        core::ptr::write_volatile(init_ct, 0);
-        core::ptr::write_volatile(lvt_timer, LVT_MASKED as u32);
-    }
+    });
 }
 
 /// Signal end-of-interrupt to the LAPIC.
@@ -1206,21 +1495,25 @@ pub unsafe fn init_ap() {
 
 /// Called from the Rust trap handler on the timer IRQ.
 ///
-/// TSC-deadline mode is one-shot in hardware; periodicity is a software
-/// construct. This ISR multiplexes the periodic 1 kHz tick with the
-/// timer-wheel's earliest (possibly sub-tick) deadline so a wheel sleep
-/// fires precisely instead of rounding up to the next periodic tick
-/// (mirrors a Linux hrtimer one-shot tracking `min(tick, earliest hrtimer)`).
+/// Both one-shot modes (TSC-deadline and TMICT) fire once per programming;
+/// periodicity is a software construct. This ISR multiplexes the periodic
+/// tick with the timer-wheel's earliest (possibly sub-tick) deadline so a
+/// wheel sleep fires precisely instead of rounding up to the next periodic
+/// tick (mirrors a Linux hrtimer one-shot tracking `min(tick, earliest
+/// hrtimer)`, `tick_sched_timer` in oneshot mode).
 ///
 /// Only a genuine periodic expiry (`now >= periodic_next`) bumps
 /// TIMER_TICKS + advances the periodic accounting; an early wheel-deadline
 /// fire must NOT advance the periodic deadline. We then re-arm the one-shot
 /// to the sooner of the (possibly unchanged) periodic deadline and the
-/// wheel's earliest, floored to `now + MIN_DELTA_CYCLES`.
+/// wheel's earliest, floored to `now + MIN_DELTA_CYCLES`. The TMICT
+/// conversion never fires early ([`ClockEventScale::program`]), so each
+/// tick interrupt is a genuine expiry rather than a premature one that
+/// would need a second, minimum-delta interrupt.
 #[inline]
 pub fn on_timer_tick() {
     let cpu = tsc_cpu();
-    let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
+    let period = TICK_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
     if period == 0 {
         // InitialCount periodic mode: hardware auto-reloads; count, and run
         // the low-resolution hrtimer expiry (`hrtimer_run_queues`).
@@ -1230,7 +1523,7 @@ pub fn on_timer_tick() {
     }
     // SAFETY: _rdtsc compiles to RDTSC, unconditionally legal at CPL=0.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
-    let mut periodic_next = TSC_DEADLINE_NEXT[cpu].load(Ordering::Relaxed);
+    let mut periodic_next = TICK_NEXT[cpu].load(Ordering::Relaxed);
     if now >= periodic_next {
         // Genuine periodic expiry (not an early wheel-deadline fire).
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -1241,7 +1534,7 @@ pub fn on_timer_tick() {
         } else {
             now.wrapping_add(period)
         };
-        TSC_DEADLINE_NEXT[cpu].store(periodic_next, Ordering::Relaxed);
+        TICK_NEXT[cpu].store(periodic_next, Ordering::Relaxed);
     }
     // NO_HZ_IDLE: while this CPU is idle the scheduler clears
     // PERIODIC_TICK_WANTED, so we DON'T anchor the next deadline to the periodic
@@ -1256,7 +1549,7 @@ pub fn on_timer_tick() {
     // carries only its own base, so a stuck CPU delays only its own timers)
     // and learn its next event. Expiry retires the due timers here, so the
     // re-arm below never lands on an already-past event (no re-fire storm).
-    // Monotonic → raw counter time for the TSC-deadline MSR.
+    // Monotonic → raw counter time, which both one-shot modes program in.
     let next_hrtimer = narf_time::mono_to_raw_cycles(narf_time::hrtimer::hrtimer_interrupt());
     let wheel_earliest = (next_hrtimer != u64::MAX).then_some(next_hrtimer);
     let scheduler =
@@ -1268,7 +1561,7 @@ pub fn on_timer_tick() {
         wheel_earliest,
         MIN_DELTA_CYCLES,
     );
-    program_tsc_deadline(cpu, target);
+    program_next_event(cpu, target);
 }
 
 pub(crate) const fn pending_scheduler_deadline(now: u64, deadline: u64) -> u64 {
@@ -1279,32 +1572,67 @@ pub(crate) const fn pending_scheduler_deadline(now: u64, deadline: u64) -> u64 {
     }
 }
 
-fn program_tsc_deadline(cpu: usize, target: u64) {
-    TSC_ARMED[cpu].store(target, Ordering::Relaxed);
-    // SAFETY: TSC-deadline MSR is unconditionally writable when the
-    // LVT_TIMER is configured for deadline mode, which is the gate that
-    // set TSC_DEADLINE_PERIOD_CYCLES non-zero.
-    //
-    // MFENCE before the WRMSR mirrors Linux's `weak_wrmsr_fence()` (an
-    // alt-patched MFENCE enabled specifically on TSC-deadline-capable
-    // CPUs). Intel erratum: certain Skylake-era chips reorder memory ops
-    // around the IA32_TSC_DEADLINE WRMSR; AMD APM is silent, but the
-    // fence is cheap and Linux applies it unconditionally on TSC-deadline
-    // chips.
-    unsafe {
-        core::arch::asm!("mfence", options(nostack, preserves_flags));
-        wrmsr(
-            IA32_TSC_DEADLINE,
-            if target == u64::MAX { 0 } else { target },
-        );
+/// Program this CPU's one-shot to fire at raw-counter `target` (`u64::MAX`
+/// disarms) and record in `TSC_ARMED` when it will have fired (Linux
+/// `clockevents_program_event` → `set_next_event`). Callers hold IRQs
+/// masked. No-op unless this CPU runs a one-shot mode.
+fn program_next_event(cpu: usize, target: u64) {
+    match LocalTimerMode::from_raw(LOCAL_MODE[cpu].load(Ordering::Relaxed)) {
+        LocalTimerMode::TscDeadline => {
+            TSC_ARMED[cpu].store(target, Ordering::Relaxed);
+            // SAFETY: TSC-deadline MSR is unconditionally writable when the
+            // LVT_TIMER is configured for deadline mode, which is what the
+            // TscDeadline mode records.
+            //
+            // MFENCE before the WRMSR mirrors Linux's `weak_wrmsr_fence()`
+            // (an alt-patched MFENCE enabled specifically on
+            // TSC-deadline-capable CPUs). Intel erratum: certain Skylake-era
+            // chips reorder memory ops around the IA32_TSC_DEADLINE WRMSR; AMD
+            // APM is silent, but the fence is cheap and Linux applies it
+            // unconditionally on TSC-deadline chips.
+            unsafe {
+                core::arch::asm!("mfence", options(nostack, preserves_flags));
+                wrmsr(
+                    IA32_TSC_DEADLINE,
+                    if target == u64::MAX { 0 } else { target },
+                );
+            }
+        }
+        LocalTimerMode::Oneshot => {
+            let Some(scale) = lapic_timer_scale_ready() else {
+                return;
+            };
+            if target == u64::MAX {
+                TSC_ARMED[cpu].store(u64::MAX, Ordering::Relaxed);
+                // SAFETY: the LVT is in one-shot mode on this CPU; a zero
+                // initial count stops the countdown without an interrupt.
+                unsafe { timer_write(LAPIC_TMICT, 0) };
+                return;
+            }
+            // Linux `lapic_next_event`: TMICT is relative, so convert the
+            // remaining delta. The countdown starts at the write; `TSC_ARMED`
+            // is stamped after it with the latest the timer can fire, so a
+            // re-arm never mistakes a still-counting timer for an expired one
+            // and cancels the interrupt it was about to raise.
+            let now = narf_time::raw_cycles();
+            let p = scale.program(target.saturating_sub(now));
+            // SAFETY: the LVT is in one-shot mode on this CPU; `p.ticks` is
+            // within the programmable range (<= 0x7FFF_FFFF).
+            unsafe { timer_write(LAPIC_TMICT, p.ticks as u32) };
+            TSC_ARMED[cpu].store(
+                narf_time::raw_cycles().saturating_add(p.latest),
+                Ordering::Relaxed,
+            );
+        }
+        LocalTimerMode::Stopped | LocalTimerMode::Periodic => {}
     }
     // Hrtimer expiry in `on_timer_tick` wakes by reference only: the sleeper
     // keeps its Waker, so no Arc is released (freed) in this IRQ context.
 }
 
-/// Per-CPU TSC-deadline timer state. The LAPIC TSC-deadline MSR is
-/// inherently per-CPU (each core has its own LVT_TIMER + IA32_TSC_DEADLINE),
-/// so the *software* state that mirrors it — the period, the next periodic
+/// Per-CPU one-shot timer state. The LAPIC timer registers (LVT_TIMER,
+/// TMICT, IA32_TSC_DEADLINE) are inherently per-CPU, so the *software*
+/// state that mirrors them — the mode, the period, the next periodic
 /// deadline, and the currently-armed value — MUST be per-CPU too. Indexed
 /// by `narf_lib::percpu::current_cpu()` (via `tsc_cpu()`).
 ///
@@ -1337,20 +1665,24 @@ fn tsc_cpu() -> usize {
     }
 }
 
-/// Period (TSC cycles) between consecutive TSC-deadline IRQs, per CPU.
-/// Non-zero gates the ISR's auto-rearm path; 0 means the timer
-/// is in classic periodic-InitialCount mode and the ISR does
-/// nothing extra (hardware re-loads from InitialCount).
-static TSC_DEADLINE_PERIOD_CYCLES: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+/// [`LocalTimerMode`] of each CPU's LAPIC timer.
+static LOCAL_MODE: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
 
-/// Last deadline written to this CPU's IA32_TSC_DEADLINE. ISR computes the
-/// next deadline as `max(prev + period, now + period)` to
-/// preserve drift-free periodicity while never slipping behind
-/// the current TSC if a long handler delayed us.
-static TSC_DEADLINE_NEXT: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+/// Period (TSC cycles) of the software periodic tick a one-shot mode
+/// emulates, per CPU. Non-zero gates the ISR's auto-rearm path; 0 means the
+/// timer is stopped or in classic periodic-InitialCount mode and the ISR
+/// does nothing extra (hardware re-loads from InitialCount).
+static TICK_PERIOD_CYCLES: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
 
-/// Absolute TSC value currently programmed into this CPU's IA32_TSC_DEADLINE
-/// (the earliest of its periodic tick and any wheel deadline). Lets
+/// This CPU's next periodic-tick deadline (raw TSC). The ISR computes the
+/// next one as `max(prev + period, now + period)` to preserve drift-free
+/// periodicity while never slipping behind the current TSC if a long
+/// handler delayed us.
+static TICK_NEXT: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+
+/// Absolute TSC value by which this CPU's armed one-shot will have fired
+/// (the earliest of its periodic tick and any wheel deadline): the
+/// IA32_TSC_DEADLINE value, or the TMICT expiry's upper bound. Lets
 /// `arm_tsc_deadline_if_earlier` reprogram only when a strictly-earlier
 /// deadline appears (mirrors Linux hrtimer_reprogram's `expires >=
 /// expires_next` guard) — now against THIS CPU's armed value, not a global.
@@ -1410,21 +1742,23 @@ pub(crate) const fn should_rearm_tsc_deadline(
     armed <= now || armed.saturating_sub(target) > coalesce_slack
 }
 
-/// Reprogram the LAPIC TSC-deadline one-shot to `deadline_cycles` IFF it is
-/// earlier than what's currently armed (mirrors hrtimer_reprogram). Called
-/// from the hrtimer arm callback when a new (possibly sub-tick) earliest
-/// event is queued on this CPU's base, so it fires precisely instead of
-/// waiting for the periodic tick. No-op in InitialCount mode. Brief IRQ-off
-/// RCW so on_timer_tick (which also writes TSC_ARMED + the MSR) can't
-/// interleave. `hrtimer_event` false = a scheduler budget deadline, which is
-/// also recorded so it survives an earlier interrupt.
-fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
-    // Callers pass monotonic counter time; the MSR compares the raw counter.
+/// Reprogram this CPU's LAPIC one-shot (TSC-deadline or TMICT) to
+/// `deadline_cycles` IFF it is earlier than what's currently armed (mirrors
+/// hrtimer_reprogram). Called from the hrtimer arm callback when a new
+/// (possibly sub-tick) earliest event is queued on this CPU's base, so it
+/// fires precisely instead of waiting for the periodic tick. No-op in
+/// InitialCount mode. Brief IRQ-off RCW so on_timer_tick (which also writes
+/// TSC_ARMED + the timer) can't interleave. `hrtimer_event` false = a
+/// scheduler budget deadline, which is also recorded so it survives an
+/// earlier interrupt.
+fn arm_local_event(deadline_cycles: u64, hrtimer_event: bool) {
+    // Callers pass monotonic counter time; the one-shot modes program the
+    // raw counter.
     let deadline_cycles = narf_time::mono_to_raw_cycles(deadline_cycles);
     // IRQs are masked across the whole RCW below (see the disable/enable
     // pair), so `tsc_cpu()` is stable — we can't migrate mid-function — and
-    // the per-CPU `TSC_ARMED`/MSR we read, compare, and write all belong to
-    // the same core.
+    // the per-CPU `TSC_ARMED`/timer we read, compare, and write all belong
+    // to the same core.
     // Read RFLAGS.IF so we only re-enable IRQs if they were on coming in
     // (don't blindly STI inside an already-IRQ-disabled caller, e.g. an
     // hrtimer enqueue under its base lock).
@@ -1436,7 +1770,7 @@ fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
         }
     }
     let cpu = tsc_cpu();
-    if TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed) == 0 {
+    if TICK_PERIOD_CYCLES[cpu].load(Ordering::Relaxed) == 0 {
         if irqs_were_on {
             // SAFETY: restore caller IRQ state before the early return.
             unsafe {
@@ -1466,13 +1800,8 @@ fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
         TSC_SCHED_DEADLINE[cpu].store(pending.min(deadline_cycles), Ordering::Relaxed);
     }
     if should_rearm_tsc_deadline(now, armed, target, COALESCE_SLACK_CYCLES) {
-        TSC_ARMED[cpu].store(target, Ordering::Relaxed);
-        // SAFETY: TSC-deadline MSR writable (period != 0 gate above);
-        // MFENCE mirrors Linux weak_wrmsr_fence (see on_timer_tick).
-        unsafe {
-            core::arch::asm!("mfence", options(nostack, preserves_flags));
-            wrmsr(IA32_TSC_DEADLINE, target);
-        }
+        // Period != 0 gate above: this CPU runs a one-shot mode.
+        program_next_event(cpu, target);
     }
     if irqs_were_on {
         // SAFETY: pairs with the disable above; restores caller IRQ state.
@@ -1482,23 +1811,109 @@ fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
     }
 }
 
-/// Whether THIS CPU's LAPIC timer runs in TSC-deadline (one-shot,
-/// per-event programmable) mode. False in the periodic InitialCount mode
-/// CPUs without TSC-deadline use (AMD Zen 2/4 desktops among them).
+/// Whether THIS CPU's LAPIC timer runs in TSC-deadline mode.
 pub fn tsc_deadline_active() -> bool {
-    TSC_DEADLINE_PERIOD_CYCLES[tsc_cpu()].load(Ordering::Relaxed) != 0
+    local_timer_mode(tsc_cpu()) == LocalTimerMode::TscDeadline
+}
+
+/// Whether THIS CPU's LAPIC timer is a one-shot, per-event programmable
+/// clockevent (TSC-deadline or TMICT; Linux `CLOCK_EVT_FEAT_ONESHOT`).
+/// False only for a stopped timer or the uncalibrated periodic fallback.
+pub fn local_oneshot_active() -> bool {
+    local_timer_mode(tsc_cpu()).is_oneshot()
+}
+
+/// How `cpu`'s LAPIC timer is running (diagnostics, tests).
+pub fn local_timer_mode(cpu: usize) -> LocalTimerMode {
+    LOCAL_MODE.get(cpu).map_or(LocalTimerMode::Stopped, |m| {
+        LocalTimerMode::from_raw(m.load(Ordering::Relaxed))
+    })
+}
+
+/// Period of `cpu`'s software periodic tick in TSC cycles; 0 when it does
+/// not run a one-shot mode (diagnostics, tests).
+pub fn local_tick_period_cycles(cpu: usize) -> u64 {
+    TICK_PERIOD_CYCLES
+        .get(cpu)
+        .map_or(0, |p| p.load(Ordering::Relaxed))
 }
 
 /// Reprogram this CPU's LAPIC deadline if `deadline_cycles` is materially
 /// earlier than its current one-shot. Scheduler/budget deadlines use this.
+/// Applies to both one-shot modes; the historical name is kept for the boot
+/// hook that installs it.
 pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
-    arm_tsc_deadline(deadline_cycles, false);
+    arm_local_event(deadline_cycles, false);
 }
 
 /// `tick_program_event` for this CPU's hrtimer base: pull the local one-shot
 /// in to `deadline_cycles`.
 pub(crate) fn arm_hrtimer_event(deadline_cycles: u64) {
-    arm_tsc_deadline(deadline_cycles, true);
+    arm_local_event(deadline_cycles, true);
+}
+
+/// One masked TMICT one-shot measured against the TSC
+/// ([`__test_masked_oneshot`]). All stamps are raw TSC.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct MaskedOneshot {
+    /// What the production conversion loaded.
+    pub programmed: narf_lib::clockevent_scale::Programmed,
+    /// Just before / after the TMICT write that started the countdown.
+    pub before_write: u64,
+    pub after_write: u64,
+    /// Start of the last current-count read that was still non-zero.
+    pub last_nonzero_start: u64,
+    /// End of the first current-count read that returned zero.
+    pub zero_read_end: u64,
+}
+
+/// Test-only: load a MASKED TMICT one-shot for `delta_cycles` through the
+/// production conversion ([`ClockEventScale::program`]) on this CPU, and poll
+/// the current count until it expires. Needs this CPU's timer stopped, and
+/// leaves it stopped. `None` without a calibration or if the count never
+/// reaches zero within 2^34 cycles.
+#[doc(hidden)]
+pub fn __test_masked_oneshot(delta_cycles: u64) -> Option<MaskedOneshot> {
+    let scale = lapic_timer_scale()?;
+    narf_lib::sync::without_interrupts(|| {
+        if local_timer_mode(tsc_cpu()) != LocalTimerMode::Stopped {
+            return None;
+        }
+        // SAFETY: this CPU's LAPIC is enabled and its timer stopped; the LVT
+        // stays masked, so the expiry raises no interrupt.
+        unsafe {
+            timer_write(LAPIC_LVTT, (LVT_MASKED | LVT_TIMER_ONESHOT) as u32);
+            timer_write(LAPIC_TDCR, DIV_16 as u32);
+            let programmed = scale.program(delta_cycles);
+            let before_write = narf_time::raw_cycles();
+            timer_write(LAPIC_TMICT, programmed.ticks as u32);
+            let after_write = narf_time::raw_cycles();
+            let mut last_nonzero_start = after_write;
+            let out = loop {
+                let a = narf_time::raw_cycles();
+                let count = timer_read(LAPIC_TMCCT);
+                let b = narf_time::raw_cycles();
+                if count == 0 {
+                    break Some(MaskedOneshot {
+                        programmed,
+                        before_write,
+                        after_write,
+                        last_nonzero_start,
+                        zero_read_end: b,
+                    });
+                }
+                last_nonzero_start = a;
+                if b.saturating_sub(before_write) > 1 << 34 {
+                    break None;
+                }
+                core::hint::spin_loop();
+            };
+            timer_write(LAPIC_TMICT, 0);
+            timer_write(LAPIC_LVTT, LVT_MASKED as u32);
+            out
+        }
+    })
 }
 
 /// Test-only: install this CPU-local LAPIC programmer as the hrtimer
@@ -1532,32 +1947,12 @@ pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
     // Caller owns IRQ masking (doc contract), so `tsc_cpu()` is stable and
     // this initialises THIS CPU's slot — each AP calls this on itself.
     let cpu = tsc_cpu();
-    // `hrtimers_prepare_cpu`: this CPU's base exists before its first tick.
-    narf_time::hrtimer::hrtimers_prepare_cpu(cpu);
-    TSC_DEADLINE_PERIOD_CYCLES[cpu].store(period_cycles, Ordering::Release);
-    // The local TSC-deadline clockevent is the hrtimer programmer
-    // (`tick_program_event`) whether or not the HPET pump comes up; the pump,
-    // when it does, installs a programmer that also drives this one.
-    if !narf_time::hrtimer::arm_callback_installed() {
-        narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
-    }
-    // SAFETY: caller upholds CPL=0 + LAPIC live.
-    let now = unsafe { core::arch::x86_64::_rdtsc() };
-    let first = now.wrapping_add(period_cycles);
-    TSC_DEADLINE_NEXT[cpu].store(first, Ordering::Release);
+    let first = start_local_oneshot(cpu, LocalTimerMode::TscDeadline, period_cycles);
     TSC_ARMED[cpu].store(first, Ordering::Release);
-    TSC_SCHED_DEADLINE[cpu].store(u64::MAX, Ordering::Relaxed);
-    narf_time::set_periodic_tick_wanted(cpu, true);
-    narf_time::clockevent::register_local(&LAPIC_CLOCKEVENT);
     let lvt = LVT_TIMER_TSC_DEADLINE | (timer_vector as u64);
     // SAFETY: APIC live; TSC-deadline support implied by caller.
     unsafe {
-        if X2APIC_ACTIVE.load(Ordering::Acquire) {
-            wrmsr(APIC_LVT_TIMER_MSR, lvt);
-        } else {
-            let lvt_ptr = lapic_reg(0x320);
-            core::ptr::write_volatile(lvt_ptr, lvt as u32);
-        }
+        timer_write(LAPIC_LVTT, lvt as u32);
         // SDM 10.5.4.1: a serializing MFENCE between the LVT
         // mode write and the deadline write avoids a race where
         // the deadline write is observed before the LVT mode
@@ -1565,6 +1960,58 @@ pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
         core::arch::asm!("mfence", options(nostack, preserves_flags));
         wrmsr(IA32_TSC_DEADLINE, first);
     }
+}
+
+/// Start this CPU's LAPIC timer as a TMICT one-shot clockevent firing IRQ
+/// `timer_vector` (Linux `lapic_timer_set_oneshot`: LVT one-shot, divide
+/// 16; then `lapic_next_event` per event) that also carries a periodic tick
+/// every `period_cycles` TSC cycles, exactly as the TSC-deadline mode does.
+/// For CPUs without TSC-deadline; requires the boot calibration.
+///
+/// # Safety
+/// - `init_bsp` (or `init_ap`) ran on this CPU and [`lapic_timer_scale`]
+///   returned a calibration.
+/// - The caller owns this CPU's LAPIC timer.
+unsafe fn start_timer_oneshot(timer_vector: u8, period_cycles: u64) {
+    // IRQs masked so the ISR never sees half-initialised state (the BSP's
+    // `arm_periodic` runs from `select_primary` with interrupts enabled).
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = tsc_cpu();
+        let first = start_local_oneshot(cpu, LocalTimerMode::Oneshot, period_cycles);
+        // SAFETY: caller contract — this CPU's LAPIC is enabled and owned.
+        // Writing the LVT mode disarms any previous countdown (SDM
+        // §10.5.4); `program_next_event` then loads the first TMICT.
+        unsafe {
+            timer_write(LAPIC_LVTT, (LVT_TIMER_ONESHOT | timer_vector as u64) as u32);
+            timer_write(LAPIC_TDCR, DIV_16 as u32);
+        }
+        program_next_event(cpu, first);
+    });
+}
+
+/// Software state shared by both one-shot modes, published before the
+/// hardware is programmed: this CPU's hrtimer base, its mode and periodic
+/// tick, the programmer hook and its `register_local` clockevent. Returns
+/// the first periodic deadline (raw TSC).
+fn start_local_oneshot(cpu: usize, mode: LocalTimerMode, period_cycles: u64) -> u64 {
+    // `hrtimers_prepare_cpu`: this CPU's base exists before its first tick.
+    narf_time::hrtimer::hrtimers_prepare_cpu(cpu);
+    TICK_PERIOD_CYCLES[cpu].store(period_cycles, Ordering::Release);
+    LOCAL_MODE[cpu].store(mode as u8, Ordering::Release);
+    // The local one-shot clockevent is the hrtimer programmer
+    // (`tick_program_event`) whether or not the HPET pump comes up; the pump,
+    // when it does, installs a programmer that also drives this one.
+    if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
+    }
+    // SAFETY: RDTSC is unconditionally legal at CPL=0.
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let first = now.wrapping_add(period_cycles);
+    TICK_NEXT[cpu].store(first, Ordering::Release);
+    TSC_SCHED_DEADLINE[cpu].store(u64::MAX, Ordering::Relaxed);
+    narf_time::set_periodic_tick_wanted(cpu, true);
+    narf_time::clockevent::register_local(&LAPIC_CLOCKEVENT);
+    first
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.

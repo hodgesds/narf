@@ -124,3 +124,16 @@ pub(crate) fn interrupt_cycles(cpu: usize) -> u64 {
         .load(Ordering::Acquire)
         .saturating_add(NMI_CYCLES[cpu].load(Ordering::Acquire))
 }
+
+/// Cycles of the hard interrupt (or NMI) `cpu` is executing at `now` that
+/// [`interrupt_cycles`] has not folded yet: zero when the CPU is not inside
+/// one. A remote CPU-time reader adds this so time spent in a running
+/// handler is reported as interrupt time immediately, not first charged to
+/// the interrupted context and taken back when the handler returns.
+pub(crate) fn interrupt_in_progress_cycles(cpu: usize, now: u64) -> u64 {
+    let since = |start: &AtomicU64| match start.load(Ordering::Acquire) {
+        0 => 0,
+        started => now.saturating_sub(started),
+    };
+    since(&HARDIRQ_START[cpu]).max(since(&NMI_START[cpu]))
+}

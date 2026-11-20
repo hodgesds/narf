@@ -93,9 +93,10 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
             }
         }
         if rusage_ptr != 0 {
+            // A stopped/continued child is live: `getrusage(p, RUSAGE_BOTH)`.
             let child_tid = pid_to_task_raw(child).unwrap_or(child);
-            let ns = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
-            if write_rusage_utime(rusage_ptr, ns, task_rss_bytes(child_tid) / 1024).is_err() {
+            let times = rusage_both_of_pid(child);
+            if write_rusage(rusage_ptr, times, task_rss_bytes(child_tid) / 1024).is_err() {
                 ctx.set_return(errno_ret(EFAULT));
                 return;
             }
@@ -119,15 +120,14 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
             }
         }
         // Charge the reaped child's CPU time to the parent's children
-        // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
-        // passed a `struct rusage*`, fill ru_utime with it.
-        let child_cpu_ns = account_reaped_child(parent, reaped);
+        // accumulator (RUSAGE_CHILDREN / tms.cutime/cstime) and, if the
+        // caller passed a `struct rusage*`, report it there.
+        let child_times = account_reaped_child(parent, reaped);
         // Consume the child's exit-time snapshot even when the caller
         // passed no rusage* — the entry must not outlive the reap.
-        let snap = take_exit_rusage(reaped);
+        let kb = take_exit_rusage(reaped).unwrap_or(0);
         if copy_errno.is_none() && rusage_ptr != 0 {
-            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-            if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+            if let Err(errno) = write_rusage(rusage_ptr, child_times, kb) {
                 copy_errno = Some(errno);
             }
         }
@@ -256,11 +256,10 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
                     copy_errno = Some(errno);
                 }
             }
-            let child_cpu_ns = account_reaped_child(parent, child);
-            let snap = take_exit_rusage(child);
+            let child_times = account_reaped_child(parent, child);
+            let kb = take_exit_rusage(child).unwrap_or(0);
             if copy_errno.is_none() && rusage_ptr != 0 {
-                let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-                if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+                if let Err(errno) = write_rusage(rusage_ptr, child_times, kb) {
                     copy_errno = Some(errno);
                 }
             }

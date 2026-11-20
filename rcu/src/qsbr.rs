@@ -468,6 +468,11 @@ pub fn run_offloaded_reclaim_for(worker: usize) -> usize {
 /// `list` is a chain of nodes whose grace period has elapsed and which the
 /// caller exclusively owns.
 pub(super) unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
+    if list.is_null() {
+        return 0;
+    }
+    // One callback batch is Linux's `rcu_do_batch` from `RCU_SOFTIRQ`.
+    let _softirq = narf_lib::kstat::softirq_enter(narf_lib::kstat::vector::RCU);
     let mut ran = 0usize;
     while !list.is_null() {
         // SAFETY: per the contract — an owned, reclaimable node. `dropper`

@@ -747,7 +747,7 @@ fn render_mountinfo(pid: u64) -> String {
     if let Some(rows) = super::hook_ns_mountinfo(pid) {
         let mut s = String::new();
         for line in rows.lines() {
-            let mut it = line.splitn(7, '\t');
+            let mut it = line.splitn(9, '\t');
             let id = it.next().unwrap_or("1");
             let parent = it.next().unwrap_or("0");
             let path = it.next().unwrap_or("/");
@@ -759,15 +759,24 @@ fn render_mountinfo(pid: u64) -> String {
             let mnt_opts = it.next().unwrap_or("rw");
             let sb_opts = it.next().unwrap_or("");
             let super_flags = it.next().unwrap_or("rw");
+            // A row with no source is a mount made without one, which
+            // reports its filesystem's name; with no root, the filesystem's
+            // own root.
+            let source = it.next().unwrap_or(fs_name);
+            let root = it.next().unwrap_or("/");
             push_mountinfo_row(
                 &mut s,
-                id,
-                parent,
-                path,
-                mnt_opts,
-                fs_name,
-                super_flags,
-                sb_opts,
+                MountinfoRow {
+                    id,
+                    parent,
+                    root,
+                    path,
+                    mnt_opts,
+                    fs_name,
+                    source,
+                    super_flags,
+                    sb_opts,
+                },
             );
         }
         if s.is_empty() {
@@ -776,18 +785,22 @@ fn render_mountinfo(pid: u64) -> String {
         return s;
     }
     let mut s = String::new();
-    for (id, parent, path, fs_name, mnt_opts, sb_opts, super_flags) in
+    for (id, parent, path, fs_name, mnt_opts, sb_opts, super_flags, source, root) in
         crate::registry().list_mountinfo()
     {
         push_mountinfo_row(
             &mut s,
-            &id.to_string(),
-            &parent.to_string(),
-            &path,
-            &mnt_opts,
-            &fs_name,
-            &super_flags,
-            &sb_opts,
+            MountinfoRow {
+                id: &id.to_string(),
+                parent: &parent.to_string(),
+                root: &root,
+                path: &path,
+                mnt_opts: &mnt_opts,
+                fs_name: &fs_name,
+                source: &source,
+                super_flags: &super_flags,
+                sb_opts: &sb_opts,
+            },
         );
     }
     if s.is_empty() {
@@ -797,30 +810,37 @@ fn render_mountinfo(pid: u64) -> String {
     s
 }
 
-/// One `show_mountinfo` row. The mount point is escaped with
-/// `seq_path_root`'s set and the fstype / source with `mangle()`'s
-/// (`fs/proc_namespace.c`); the filesystem name stands in for the source
-/// (`none` when absent, as for a NULL `mnt_devname`).
-#[allow(clippy::too_many_arguments)]
-fn push_mountinfo_row(
-    s: &mut String,
-    id: &str,
-    parent: &str,
-    path: &str,
-    mnt_opts: &str,
-    fs_name: &str,
-    super_flags: &str,
-    sb_opts: &str,
-) {
+/// The fields of one `show_mountinfo` row.
+struct MountinfoRow<'a> {
+    id: &'a str,
+    parent: &'a str,
+    /// The mount root's path inside its filesystem (`show_path`).
+    root: &'a str,
+    path: &'a str,
+    mnt_opts: &'a str,
+    fs_name: &'a str,
+    /// `show_devname`, else `mnt_devname`.
+    source: &'a str,
+    super_flags: &'a str,
+    sb_opts: &'a str,
+}
+
+/// One `show_mountinfo` row. The root and the mount point are escaped with
+/// `seq_dentry`'s / `seq_path_root`'s set and the fstype / source with
+/// `mangle()`'s (`fs/proc_namespace.c`). The source is the mount record's
+/// ([`crate::Mount::source`]), which is already `none` for a mount made with
+/// no source string.
+fn push_mountinfo_row(s: &mut String, row: MountinfoRow<'_>) {
     use super::{mangle_into, MANGLE_NAME, MANGLE_PATH};
-    let _ = write!(s, "{} {} 0:1 / ", id, parent);
-    mangle_into(s, path, MANGLE_PATH);
-    let _ = write!(s, " {} - ", mnt_opts);
-    mangle_into(s, fs_name, MANGLE_NAME);
+    let _ = write!(s, "{} {} 0:1 ", row.id, row.parent);
+    mangle_into(s, row.root, MANGLE_PATH);
     s.push(' ');
-    let source = if fs_name.is_empty() { "none" } else { fs_name };
-    mangle_into(s, source, MANGLE_NAME);
-    let _ = writeln!(s, " {}{}", super_flags, sb_opts);
+    mangle_into(s, row.path, MANGLE_PATH);
+    let _ = write!(s, " {} - ", row.mnt_opts);
+    mangle_into(s, row.fs_name, MANGLE_NAME);
+    s.push(' ');
+    mangle_into(s, row.source, MANGLE_NAME);
+    let _ = writeln!(s, " {}{}", row.super_flags, row.sb_opts);
 }
 
 /// `/proc/<pid>/mountstats` — per-task mount stats.
@@ -830,11 +850,12 @@ fn push_mountinfo_row(
 /// with zero counters so `mount -v` parsers see valid structure.
 fn render_mountstats(_pid: u64) -> String {
     let mut s = String::new();
-    for (path, fs_name) in crate::registry().list_with_names() {
+    // `show_vfsstat`: the same device field `show_vfsmnt` prints.
+    for (_, _, path, fs_name, _, _, _, source, _) in crate::registry().list_mountinfo() {
         let _ = writeln!(
             s,
             "device {} mounted on {} with fstype {}",
-            fs_name, path, fs_name
+            source, path, fs_name
         );
     }
     if s.is_empty() {

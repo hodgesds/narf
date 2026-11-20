@@ -256,6 +256,13 @@ that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
 launcher.
 
+A task root is stored as a directory's canonical host path (no trailing `/`
+except `/` itself, no empty or dot components), and a task's `/` joins to
+that root exactly. `chroot("/")` or `chroot(".")` naming the current root
+therefore leaves the root unchanged, as on Linux — pacman runs every hook
+with `chroot("/")` inside PID 1's root, and `ldconfig -r .` adds its own
+`chroot(".")`.
+
 `narf_user_runtime::execve` does not return on success and returns the kernel's
 positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,
@@ -1565,6 +1572,16 @@ aliases), it reopens descriptor `N`; path-backed descriptors restart normal
 open permission and flag handling, while anonymous descriptors retain a live
 reference to their object. `O_NOFOLLOW` preserves the final devtmpfs link and
 `RESOLVE_NO_MAGICLINKS` rejects the proc-fd jump with `ELOOP`.
+A followed proc-fd link lands on the descriptor's file for the path `stat`
+family and `access(2)` too (`stat("/dev/stdin")` with standard input a pipe
+describes the pipe), and a proc-fd link that is NOT the last component is
+jumped by every path syscall: `resolve_cwd_path` and friends rewrite
+`/proc/{self,thread-self,<pid>}/fd/N/<rest>` to `<the file's path>/<rest>`
+(`..` in `<rest>` climbs from that file's real directory), so Bun's
+`openat("/proc/self/fd/N/name", O_CREAT|O_EXCL)`, `rename` and `statx`
+through the link reach the directory `N` names. A descriptor with no name
+(a pipe, a socket, a removed directory) is left as written and the walk's
+errno is Linux's (ENOTDIR for a non-directory, ENOENT under a dead one).
 `/proc/{self,thread-self,<pid>}/{root,cwd,exe}` are magic links whose target
 is an ordinary pathname. Following one — through `open(2)` or a path `stat`
 — restarts the walk at that pathname, so `open("/proc/<pid>/root",
@@ -2517,6 +2534,30 @@ reports POLL_IN on a listener with a pending channel and on a channel
 socket with staged data (local queue or pump peek), POLL_OUT on a
 channel socket always; the pump publishes a channel event when a
 socket-claimable channel opens or data lands, waking parked waiters.
+
+### 3.5 Task and process CPU time
+
+Each `Task` holds its thread's `narf_scheduler::TaskCputime` (`scheduler/`
+§3.4.1, created by `alloc_user_task_id`) and a `ProcessCputime` shared by its
+thread group (Linux `signal_struct`): `CLONE_THREAD` joins the group its pid
+names, anything else starts one. Releasing a thread moves its final times into
+the group's dead total under the group lock, so a thread is counted exactly
+once. Reaping a child (`account_reaped_child`, called by every wait4/waitid
+reap before the child is released) adds its `RUSAGE_BOTH` — the child group's
+times plus its own children's — to the waiter's group children total.
+
+```rust
+pub fn handlers::thread_cpu_times(task: u64) -> TaskTimes;   // RUSAGE_THREAD, CLOCK_THREAD_CPUTIME_ID
+pub fn handlers::process_cpu_times(task: u64) -> TaskTimes;  // RUSAGE_SELF, times(), CLOCK_PROCESS_CPUTIME_ID
+pub fn handlers::children_cpu_times(task: u64) -> TaskTimes; // RUSAGE_CHILDREN, tms_cutime/cstime
+pub fn handlers::account_reaped_child(parent_task: u64, child_pid: u64) -> TaskTimes;
+```
+
+getrusage, times, wait4/waitid rusage, `/proc` stat fields 14-17, the CPU
+clocks (`CPUCLOCK_VIRT` = utime, `CPUCLOCK_PROF`/`CPUCLOCK_SCHED` = utime +
+stime), CPU itimers, RLIMIT_CPU (thread-group total) and the perf task clock
+all read these. Off-CPU time of a parked or preempted task, interrupt time and
+idle are never charged.
 
 ## 4. Invariants & safety properties
 

@@ -142,6 +142,30 @@ parsers must tolerate truncation at any section boundary.
 - **String table + note section** (ELF-core-compatible where
   possible, for tool reuse — `gdb`, `crash`).
 
+### 3.3a Kernel symbol table (`kallsyms`)
+
+The image's own symbol table, written into the linker-reserved `.kallsyms`
+section after the link by `xtask kallsyms` (`build/` §3) in the
+`narf-kallsyms` format (`observability/kallsyms/specification/spec.md`).
+Linux's `kernel/kallsyms.c` decoder:
+
+```rust
+pub use narf_kallsyms::{Entry, Error, NameBuf, Table, KSYM_NAME_LEN, MAX_NAME};
+
+pub fn table() -> Result<Table<'static>, Error>;   // validated once; BadMagic if unpatched
+pub fn text_base() -> u64;                         // runtime _text (link + KASLR slide)
+pub fn address(entry: &Entry) -> u64;              // text_base() + entry.offset
+pub fn lookup(addr: u64, name: &mut NameBuf)       // kallsyms_lookup_size_offset
+    -> Option<(Entry, u64 /* offset in symbol */, Option<u32> /* size */)>;
+```
+
+Addresses are runtime addresses: offsets are relative to `_text`, and
+`text_base()` takes `_text`'s address, which the KASLR pass relocates like
+any other reference. Allocation-free after the first `table()` call, and
+lock-free (usable on fatal paths). This module decides nothing about who may
+see an address — exposing one defeats KASLR, so each presenter applies
+`kallsyms_show_value` (`/proc/kallsyms`: `filesystem/` §3.14).
+
 ### 3.4 Live inspection (diagnostic peek)
 
 Capability-gated read-only access to kernel state for diagnosis:
@@ -157,6 +181,36 @@ pub fn peek_cap_root(t: TaskId, cap: &Cap<Diagnostics, Read>) -> CapRootView;
   tracer Narf-Ring.
 - No backdoor: these caps are minted by the boot process and can be
   revoked.
+
+### 3.5 Lockup detector decisions (`watchdog`)
+
+```rust
+pub const WATCHDOG_THRESH_SECS: u64 = 10;          // Linux watchdog_thresh
+pub struct CpuSample { pub online: bool, pub halted: bool,
+                       pub sched_passes: u64, pub timer_ticks: u64 }
+pub enum Lockup { Soft { stuck_ns: u64, first: bool }, Hard { stuck_ns: u64 } }
+pub struct CpuWatch;                 // per-CPU state, const-constructible
+impl CpuWatch {
+    pub fn touch(&self, s: &CpuSample, now_ns: u64);
+    pub fn observe(&self, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup>;
+}
+pub struct LockupWatch<const CPUS: usize>;
+impl<const CPUS: usize> LockupWatch<CPUS> {
+    pub fn begin_round(&self, now_ns: u64, thresh_ns: u64) -> bool;
+    pub fn observe(&self, cpu: usize, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup>;
+}
+```
+
+Pure decision logic of Linux's `kernel/watchdog.c` over samples the caller
+takes (the `frame/` stall watchdog, from the timer tick). A **soft lockup**
+is an awake CPU with no executor scheduling point for `2 * thresh`,
+reported then and every `2 * thresh` while it lasts (`first` marks the
+episode's first report). A **hard lockup** is an awake CPU with neither a
+timer interrupt nor a scheduling point for `thresh`, reported once per
+episode. A halted CPU is responsive and touches both detectors, so an idle
+system never reports; `thresh == 0` disables both. `begin_round` returns
+`false` (and re-baselines every CPU) when the previous round is more than
+`2 * thresh` old — the checker itself did not run (suspend, paused VM).
 
 ## 4. Invariants & safety properties
 
@@ -191,10 +245,12 @@ pub fn peek_cap_root(t: TaskId, cap: &Cap<Diagnostics, Read>) -> CapRootView;
 
 - **Consumes:** `arch/` (PMU + debug-register primitives), `frame/`
   (panic hook), `console/` (fallback sink), `capabilities/` (cap
-  gating), `tracing/` (flight-recorder snapshot API).
+  gating), `tracing/` (flight-recorder snapshot API), `observability/kallsyms`
+  (symbol-table format).
 - **Provides to:** `verification/` (PMU readings feeding perf
   benchmarks), `process/` (crash dumps referenced in bug reports),
-  maintainers and AI agents (debugger, post-mortem).
+  maintainers and AI agents (debugger, post-mortem), `filesystem/`
+  (`/proc/kallsyms`).
 
 ## 7. Stage assignment
 

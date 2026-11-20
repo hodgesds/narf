@@ -63,10 +63,10 @@ pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
         //
         // Linux reports a tick for the two CPU-time clocks
         // (`posix_cpu_clock_getres`: `tp->tv_nsec = (NSEC_PER_SEC + HZ - 1)
-        // / HZ`). NARF's answer is genuinely finer: `sys_clock_gettime`
-        // folds `current_slice_elapsed_ns()` — cycle-derived — into the
-        // accumulated total, so two reads inside one tick do differ. 1 ns
-        // describes this kernel; a tick would describe Linux's.
+        // / HZ`). NARF's answer is genuinely finer: its CPU time is
+        // accounted from the TSC at every user/kernel transition and the
+        // open span is included on read, so two reads inside one tick do
+        // differ. 1 ns describes this kernel; a tick would describe Linux's.
         kbuf[8..16].copy_from_slice(&1i64.to_ne_bytes());
         // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
         // range-validates the 16-byte write.

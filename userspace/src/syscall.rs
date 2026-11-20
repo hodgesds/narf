@@ -3626,14 +3626,13 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             );
             trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
-        // Kernel-time accounting (getrusage ru_stime / times tms_stime /
-        // /proc stat field 15).
-        // Open the on-CPU kernel span. Park sites close and re-open it, so
-        // what accumulates is execution time and never the sleep in between.
+        // Kernel CPU time (ru_stime / tms_stime / /proc stat field 15) needs
+        // nothing here: the scheduler's accounting closed the user span at
+        // the syscall entry and charges this task's on-CPU kernel time until
+        // the return to user, never the sleep of a park in between.
         if let Some(u) = crate::user_task::current_user_task() {
             // SAFETY: in-flight task's poller-pinned UserTaskCtx.
             let uc = unsafe { &*u };
-            crate::handlers::open_kernel_span(uc);
             // Only a syscall the task made: the kernel's own dispatches (the
             // file-op ring bridge) run inside some other syscall's span.
             if ctx.returning_to_user() {
@@ -3678,13 +3677,6 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
             );
         }
-        // Close the span. This used to SKIP the fold entirely whenever the
-        // syscall had parked, on the grounds that the bracket would include
-        // off-CPU sleep — but under the own-stack executor nearly every
-        // syscall parks at least once, so `TASK_KERN_NS` stayed empty for
-        // every task and `/proc` stime, `ru_stime` and `tms_stime` all read
-        // 0 forever. The span is now split at each park instead, so there is
-        // no sleep left in it to discard.
         if let Some(u) = crate::user_task::current_user_task() {
             // SAFETY: in-flight task's poller-pinned UserTaskCtx.
             let uc = unsafe { &*u };
@@ -3694,7 +3686,6 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 uc.in_syscall
                     .store(0, core::sync::atomic::Ordering::Relaxed);
             }
-            crate::handlers::close_kernel_span(uc, crate::handlers::current_task_id());
         }
     } else {
         // A syscall number this kernel has no entry for. Linux answers

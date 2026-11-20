@@ -44,6 +44,44 @@ fn dma_barrier() {
 
 const DEPTH: usize = packet_tx::RING_SLOTS;
 
+/// Native reports dropped as unusable (`mt7921_queue_rx_skb` frees them).
+static DROPPED_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// One line for the 1st, 2nd, 4th, 8th, ... dropped report: visible like
+/// Linux's WARN_ON_ONCE without flooding the console.
+#[cold]
+#[inline(never)]
+fn dropped_report(kind: &str, rxd0: u32, error: Error) {
+    use core::fmt::Write;
+    let count = DROPPED_REPORTS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if count.is_power_of_two() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: dropped unusable {kind} report rxd0={rxd0:#010x} ({error:?}); {count} dropped"
+        );
+    }
+}
+
+/// `MCU_EVENT_COREDUMP` reached the host: the firmware asserted. Linux
+/// (`mt76_connac_mcu_coredump_event`) collects the dump, then resets; this
+/// owner has no dump collector, and the hung MCU fails the next command.
+#[cold]
+#[inline(never)]
+fn coredump_report() {
+    use core::fmt::Write;
+    static FRAGMENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // A dump arrives as many fragments: the 1st, 2nd, 4th, ... are reported.
+    let count = FRAGMENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if count.is_power_of_two() {
+        let _ = writeln!(
+            narf_console::PriorityWriter::<3>,
+            "mt76: firmware coredump event (firmware assert); {count} fragment(s) dropped"
+        );
+    }
+}
+
 #[cold]
 fn register_access_error(operation: &str, addr: u32, error: registers::Error) -> Error {
     use core::fmt::Write;
@@ -256,6 +294,11 @@ struct Hardware {
     hw_amsdu: bool,
     sequence_reset: SequenceReset,
     wake: wake::Wake,
+    /// The function's MSI vector (`None`: the owner is polled).
+    irq: Option<crate::mt7921::irq::Binding>,
+    /// The parked owner wait's bound (`park`): a lost event or a hung MCU
+    /// still re-polls, so the wait's own timeout runs.
+    pace: Option<core::pin::Pin<alloc::boxed::Box<narf_time::SleepUntil>>>,
 }
 impl Drop for Hardware {
     /// An owner dropped while its rings are still published (dead firmware,
@@ -266,6 +309,11 @@ impl Drop for Hardware {
     /// `Retained` keeps them forever, exactly as before.
     fn drop(&mut self) {
         let _ = self.block_for_reclaim();
+        if let Some(irq) = self.irq.take() {
+            // `mt7921_pci_remove`: sources masked before the vector is freed.
+            let _ = self.write(MT_WFDMA0_HOST_INT_ENA, 0);
+            irq.release(&self.authority);
+        }
     }
 }
 impl Hardware {
@@ -384,46 +432,73 @@ impl Hardware {
         bytes: Vec<u8>,
         event: Option<bool>,
     ) -> Result<Option<CapturedData>, Error> {
+        use crate::mt7921::txrx::{rx_packet, RxPacket};
         let now = self.now_ns();
         let rxd = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let kind = rxd >> 27;
-        let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        if kind == 0 {
-            storage
-                .tokens
-                .firmware_done(&packet_tx::releases(&bytes)?)?;
-        } else if kind == 1 {
-            storage.tx_sequence.receive(&bytes)?;
-        } else if normal {
-            storage.p2p_capture.copy(&bytes, now);
-            let packet = CapturedData {
-                bytes,
-                epoch: storage.receive_epoch,
-                port_open: storage.receive_open,
-            };
-            if event == Some(false) {
-                return Ok(Some(packet));
-            }
-            if storage.pending_data.len() == 32 {
-                storage.pending_data.pop_front(); // bounded RX loss under overload
-            }
-            storage.pending_data.push_back(packet);
-        } else if kind == 7 {
-            if bytes.len() < 32 {
-                return Err(Error::MalformedEvent);
-            }
-            if event == Some(true) {
-                return Ok(Some(CapturedData {
+        // Linux `mt7921_queue_rx_skb` (`mt7921_rx_check` on the DMA path).
+        match rx_packet(rxd) {
+            // `mt7921_mac_tx_free`: the firmware's token releases. Linux
+            // drops a release it cannot walk (WARN_ON_ONCE). One that may
+            // concern an owned token instead fails closed ("a malformed
+            // native completion closes host security/grant/producer state").
+            RxPacket::TxFree => match packet_tx::releases(&bytes) {
+                Ok(records) => storage.tokens.firmware_done(&records)?,
+                Err(error) if storage.tokens.is_empty() => {
+                    dropped_report("TX-free", rxd, error);
+                }
+                Err(error) => return Err(error),
+            },
+            // `mt7921_mac_add_txs`. Every routed length decodes (complete
+            // records only), so `receive` refuses a report only when it
+            // conflicts with a published sample's PID: that owner's
+            // ambiguous receipt, which quarantines it ("Ambiguous/malformed
+            // or missing receipts quarantine the owner until verified
+            // reset"). Reports no owner waits for are ignored there.
+            RxPacket::TxStatus => storage.tx_sequence.receive(&bytes)?,
+            RxPacket::Normal => {
+                storage.p2p_capture.copy(&bytes, now);
+                let packet = CapturedData {
                     bytes,
-                    epoch: 0,
-                    port_open: false,
-                }));
+                    epoch: storage.receive_epoch,
+                    port_open: storage.receive_open,
+                };
+                if event == Some(false) {
+                    return Ok(Some(packet));
+                }
+                if storage.pending_data.len() == 32 {
+                    storage.pending_data.pop_front(); // bounded RX loss under overload
+                }
+                storage.pending_data.push_back(packet);
             }
-            if storage.pending_events.len() == 32 {
-                return Err(Error::EventOverflow);
+            RxPacket::Event => {
+                if bytes.len() < 32 {
+                    return Err(Error::MalformedEvent);
+                }
+                if event == Some(true) {
+                    return Ok(Some(CapturedData {
+                        bytes,
+                        epoch: 0,
+                        port_open: false,
+                    }));
+                }
+                // No command waits here (packet service or a TX-status
+                // pump): Linux dispatches an unsolicited event at RX time
+                // and frees it (`mt7921_mcu_rx_event`). Only replies and the
+                // events a later owner consumes may wait for a receiver.
+                if !super::station::queued_event(&bytes) {
+                    if super::station::coredump_event(&bytes) {
+                        coredump_report();
+                    }
+                    return Ok(None);
+                }
+                if storage.pending_events.len() == 32 {
+                    return Err(Error::EventOverflow);
+                }
+                storage.pending_events.push_back(bytes);
             }
-            storage.pending_events.push_back(bytes);
+            // TXRXV and the remaining types: `dev_kfree_skb`.
+            RxPacket::Other => {}
         }
         Ok(None)
     }
@@ -805,6 +880,53 @@ impl Hardware {
     fn update(&self, addr: u32, clear: u32, set: u32) -> Result<(), Error> {
         self.write(addr, (self.read(addr)? & !clear) | set)
     }
+    /// `mt792x_dma_enable` / `mt7921e_mac_reset`: the PCIe MAC interrupt,
+    /// the WFDMA TX/RX/MCU sources and the MCU's WAKE_RX_PCIE software
+    /// interrupt, once a vector is bound. A polled owner leaves them masked.
+    fn enable_host_interrupts(&self) -> Result<(), Error> {
+        if self.irq.is_none() {
+            return Ok(());
+        }
+        self.program_host_interrupts()
+    }
+    /// The register sequence of [`Self::enable_host_interrupts`].
+    fn program_host_interrupts(&self) -> Result<(), Error> {
+        use crate::mt7921::irq::HOST_INT_MASK;
+        self.write(MT_PCIE_MAC_INT_ENABLE, 0xff)?;
+        self.write(MT_WFDMA0_HOST_INT_ENA, HOST_INT_MASK)?;
+        self.update(MT_MCU2HOST_SW_INT_ENA, 0, MT_MCU_CMD_WAKE_RX_PCIE)
+    }
+    /// `mt792x_irq_handler` + `mt792x_irq_tasklet` for one service pass:
+    /// mask the sources, then read and acknowledge the pending ones (and
+    /// the MCU software interrupt). Returns the acknowledged sources.
+    pub(super) fn interrupts_begin(&self) -> Result<u32, Error> {
+        if self.irq.is_none() {
+            return Ok(0);
+        }
+        self.acknowledge_interrupts()
+    }
+    /// The register sequence of [`Self::interrupts_begin`].
+    fn acknowledge_interrupts(&self) -> Result<u32, Error> {
+        use crate::mt7921::irq::{HOST_INT_MASK, MT_INT_MCU_CMD};
+        self.write(MT_WFDMA0_HOST_INT_ENA, 0)?;
+        let status = self.read(MT_WFDMA0_HOST_INT_STA)? & HOST_INT_MASK;
+        if status != 0 {
+            self.write(MT_WFDMA0_HOST_INT_STA, status)?;
+        }
+        if status & MT_INT_MCU_CMD != 0 {
+            let software = self.read(MT_MCU_CMD)?;
+            self.write(MT_MCU_CMD, software)?;
+        }
+        Ok(status)
+    }
+    /// The NAPI-complete half (`mt76_connac_irq_enable`): unmask after the
+    /// pass serviced the rings. A source set meanwhile raises a new MSI.
+    pub(super) fn interrupts_end(&self) -> Result<(), Error> {
+        if self.irq.is_none() {
+            return Ok(());
+        }
+        self.write(MT_WFDMA0_HOST_INT_ENA, crate::mt7921::irq::HOST_INT_MASK)
+    }
     /// Snapshot only a terminal boot timeout. Never reads payloads or
     /// changes device/ring ownership, and never runs in the polling loop.
     #[cold]
@@ -973,9 +1095,51 @@ impl Backend for Hardware {
     ) -> Result<Option<super::p2p_management_capture::Captured>, Error> {
         Hardware::receive_p2p_management(self)
     }
+    /// Each firmware step is a debug line (Linux `dev_dbg`); only the start
+    /// of a chip reset is info, so a firmware recovery stays visible. The
+    /// join and leave steps log their mac80211-style info lines themselves,
+    /// and failures their own errors.
+    /// Sleep until the next MSI: acknowledge what is pending (an event
+    /// since the last acknowledgement re-polls at once), park the waker,
+    /// then unmask, so a source set meanwhile raises a fresh message. A
+    /// 10 ms timer bounds the sleep.
+    fn park(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        use crate::mt7921::irq::LINE;
+        use core::future::Future;
+        if self.irq.is_none() {
+            return false;
+        }
+        let seen = LINE.raised();
+        let pending = self.acknowledge_interrupts();
+        if pending != Ok(0) {
+            let _ = self.interrupts_end();
+            return false;
+        }
+        if !LINE.park(cx.waker(), seen) {
+            let _ = self.interrupts_end();
+            return false;
+        }
+        if self.interrupts_end().is_err() {
+            return false;
+        }
+        let pace = self.pace.get_or_insert_with(|| {
+            alloc::boxed::Box::pin(narf_time::sleep_until(narf_time::Deadline::after_ms(10)))
+        });
+        if pace.as_mut().poll(cx).is_ready() {
+            self.pace = None;
+            return false;
+        }
+        true
+    }
     fn progress(&mut self, stage: super::Stage) {
         use core::fmt::Write;
-        let _ = writeln!(narf_console::Writer, "mt76: firmware {stage:?}");
+        if stage == super::Stage::RecoveryPark {
+            let _ = writeln!(narf_console::Writer, "mt76: chip reset (firmware recovery)");
+        }
+        let _ = writeln!(
+            narf_console::PriorityWriter::<7>,
+            "mt76: firmware {stage:?}"
+        );
     }
     fn now_ns(&self) -> u64 {
         narf_time::wall::monotonic_ns()
@@ -1081,11 +1245,9 @@ impl Backend for Hardware {
         {
             return Err(Error::Authority);
         }
-        // The native owner is polled: host interrupt enables stay masked,
-        // exactly as initialize() leaves them.
         self.update(GLOBAL, 0, ENABLE)?;
         let _ = self.read(GLOBAL)?;
-        Ok(())
+        self.enable_host_interrupts()
     }
     fn park_bus_master(&mut self) -> Result<(), Error> {
         if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
@@ -1223,7 +1385,7 @@ impl Backend for Hardware {
         }
         self.update(GLOBAL, 0, ENABLE)?;
         let _ = self.read(GLOBAL)?;
-        Ok(())
+        self.enable_host_interrupts()
     }
     fn request_driver_own(&mut self) -> Result<(), Error> {
         self.write(0x18060010, 2)
@@ -1802,7 +1964,7 @@ impl Transport {
         firmware: Firmware,
         generation: u64,
     ) -> Result<Self, Error> {
-        crate::mt7921::pci::invoke(&authority, || {
+        let mut transport = crate::mt7921::pci::invoke(&authority, || {
             authority.check_live().map_err(|_| Error::Authority)?;
             if !matches!(device.id.vendor, 0x14c3 | 0x0e8d)
                 || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
@@ -1856,13 +2018,19 @@ impl Transport {
                         hw_amsdu: false,
                         sequence_reset: SequenceReset::None,
                         wake: wake::Wake::default(),
+                        irq: None,
+                        pace: None,
                     },
                     firmware,
                 ),
                 generation,
             })
         })
-        .map_err(|_| Error::Authority)?
+        .map_err(|_| Error::Authority)??;
+        // `pci_alloc_irq_vectors` + `devm_request_irq` once the function is
+        // validated; without a vector the owner stays polled.
+        transport.session.backend.irq = crate::mt7921::irq::Binding::bind(&device, &authority);
+        Ok(transport)
     }
     fn diagnose_boot_timeout(&self) {
         if matches!(
@@ -2356,6 +2524,25 @@ impl Transport {
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
         self.session.receive_current(epoch)
+    }
+    /// See [`Hardware::interrupts_begin`].
+    pub(super) fn interrupts_begin(&self) -> Result<u32, Error> {
+        self.session.backend.interrupts_begin()
+    }
+    /// See [`Hardware::interrupts_end`].
+    pub(super) fn interrupts_end(&self) -> Result<(), Error> {
+        self.session.backend.interrupts_end()
+    }
+    /// The associated home station's next timed work (`None`: none).
+    pub(super) fn service_deadline(&self) -> Option<u64> {
+        self.session.service_deadline()
+    }
+    pub(super) fn link_loss(&self) -> Option<super::LinkLoss> {
+        self.session
+            .station
+            .peer_lost
+            .then_some(self.session.station.loss)
+            .flatten()
     }
     pub(super) fn current_receive_epoch(&self) -> Result<Option<u64>, Error> {
         let epoch = self.session.receive_epoch;

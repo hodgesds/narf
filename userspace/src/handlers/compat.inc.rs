@@ -371,15 +371,22 @@ fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::stri
     if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
         return normalize_abs(host);
     }
-    let normalized = if is_normalized_abs(&path) {
+    let normalized = if is_normalized_abs(&path) && !path.contains("/fd/") {
         path
     } else {
-        resolve_cwd_path_user(task, &path)
+        match normalize_user_walk(task, &cwd_joined(task, &path)) {
+            WalkedPath::User(normalized) => normalized,
+            WalkedPath::Host(host) => return host,
+        }
     };
     let prefix = match root_dir_prefix(task) {
         Some(prefix) if prefix != "/" => prefix,
         _ => return normalized,
     };
+    // The task's `/` is its root itself (see `apply_chroot`).
+    if normalized == "/" {
+        return prefix;
+    }
     let mut rooted = alloc::string::String::with_capacity(prefix.len() + normalized.len());
     rooted.push_str(&prefix);
     rooted.push_str(&normalized);
@@ -468,12 +475,12 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
         return normalize_abs(host);
     }
-    let normalized = resolve_cwd_path_user(task, path);
-    // Re-root under the task's chroot (if any) so a chrooted process —
-    // e.g. a container — resolves paths against the chrooted rootfs, not
-    // the host root. No-op for tasks without a chroot.
-    {
-        apply_chroot(&normalized)
+    match normalize_user_walk(task, &cwd_joined(task, path)) {
+        // Re-root under the task's chroot (if any) so a chrooted process —
+        // e.g. a container — resolves paths against the chrooted rootfs, not
+        // the host root. No-op for tasks without a chroot.
+        WalkedPath::User(normalized) => apply_chroot(&normalized),
+        WalkedPath::Host(host) => host,
     }
 }
 
@@ -1063,15 +1070,113 @@ fn path_is_within(path: &str, root: &str) -> bool {
 /// "/mnt/mnt/proc/stat" → busybox top's "can't open 'stat'"), and
 /// getcwd leaked the host-side prefix into the container.
 pub(crate) fn resolve_cwd_path_user(task: u64, path: &str) -> alloc::string::String {
+    let joined = cwd_joined(task, path);
+    match normalize_user_walk(task, &joined) {
+        WalkedPath::User(path) => path,
+        // A caller-view path cannot name a file outside the caller's root;
+        // the host-producing resolvers below carry that jump.
+        WalkedPath::Host(_) => normalize_abs(&joined),
+    }
+}
+
+/// `path` made absolute against `task`'s cwd, not yet normalised.
+fn cwd_joined(task: u64, path: &str) -> alloc::borrow::Cow<'_, str> {
     if path.starts_with('/') {
-        normalize_abs(path)
+        alloc::borrow::Cow::Borrowed(path)
     } else {
         let mut joined = cwd_of(task);
         if !joined.ends_with('/') {
             joined.push('/');
         }
         joined.push_str(path);
-        normalize_abs(&joined)
+        alloc::borrow::Cow::Owned(joined)
+    }
+}
+
+/// An absolute pathname after [`normalize_user_walk`].
+enum WalkedPath {
+    /// In the caller's view, before its chroot prefix.
+    User(alloc::string::String),
+    /// Host-absolute: a proc-fd magic link jumped to a file outside the
+    /// caller's root (a descriptor opened before a later chroot).
+    Host(alloc::string::String),
+}
+
+/// [`normalize_abs`], plus `nd_jump_link` for each proc-fd magic link the
+/// walk goes ON from.
+///
+/// `link_path_walk` follows every non-final symlink, and following
+/// `/proc/self/fd/N` (or `thread-self`, or `<pid>`) installs the open file's
+/// own path, from which the remaining components are walked — `..`
+/// included, which climbs out of that file's real directory. Bun reaches
+/// every name this way: it opens a directory `O_PATH` and then creates,
+/// stats and renames `/proc/self/fd/N/<name>` (Claude Code's every file
+/// write). Left in place, the name went to procfs, which has no `N/<name>`,
+/// and every write failed ENOENT.
+///
+/// Only a descriptor that still has its name is jumped through here. One
+/// with none (a pipe, a socket, a removed directory) is left as written: the
+/// walk into procfs then fails, and its errno is classified as Linux's walk
+/// would answer (`path_lookup_errno` stats the link, which lands on the
+/// object: ENOTDIR for a non-directory, ENOENT under a dead directory).
+/// A final magic link is left to the syscall, which decides whether to
+/// follow it (O_NOFOLLOW, AT_SYMLINK_NOFOLLOW, lstat).
+fn normalize_user_walk(task: u64, joined: &str) -> WalkedPath {
+    // The common path has no fd link to jump; keep it allocation-light.
+    if !joined.contains("/fd/") {
+        return WalkedPath::User(normalize_abs(joined));
+    }
+    let components: alloc::vec::Vec<&str> = joined.split('/').collect();
+    let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut host = false;
+    let mut jumps = 0usize;
+    for (index, component) in components.iter().enumerate() {
+        match *component {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+                continue;
+            }
+            name => out.push(alloc::string::String::from(name)),
+        }
+        let walked_on = components[index + 1..].iter().any(|next| !next.is_empty());
+        if !walked_on
+            || jumps >= SYMLOOP_MAX
+            || out.len() < 2
+            || out[out.len() - 2] != "fd"
+        {
+            continue;
+        }
+        let prefix = alloc::format!("/{}", out.join("/"));
+        let visible = if host {
+            match visible_path_of(task, &prefix) {
+                Some(visible) => alloc::string::String::from(visible),
+                None => continue,
+            }
+        } else {
+            prefix
+        };
+        let Some(ProcFdLanding::Path(target)) = proc_fd_landing(task, &visible) else {
+            continue;
+        };
+        jumps += 1;
+        let view = visible_path_of(task, &target).map(alloc::string::String::from);
+        let (view, in_host) = match view {
+            Some(view) => (view, false),
+            None => (target, true),
+        };
+        host = in_host;
+        out = view
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+    }
+    let path = alloc::format!("/{}", out.join("/"));
+    if host {
+        WalkedPath::Host(path)
+    } else {
+        WalkedPath::User(path)
     }
 }
 
@@ -1462,22 +1567,71 @@ fn path_lookup_errno(path: &str, first: Option<narf_filesystem::FsError>) -> i64
 /// path. `None` for anything else (the ordinary walk then applies), including
 /// a closed fd or a pathless one (memfd, socket, anon inode).
 fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::String> {
-    let (owner, fd) = if let Some(n) = user_path
-        .strip_prefix("/proc/self/fd/")
-        .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"))
-    {
-        (task, n.parse::<u32>().ok()?)
-    } else {
-        let n = parse_proc_self_fd(user_path)?;
-        let pid = user_path
-            .strip_prefix("/proc/")?
-            .split_once('/')?
-            .0
-            .parse::<u64>()
-            .ok()?;
-        (proc_pid_to_tid(pid), n)
-    };
+    let (owner, fd) = proc_fd_link_owner(task, user_path)?;
     fd_path_for_task(owner, fd).filter(|p| p.starts_with('/'))
+}
+
+/// The descriptor a `/proc/self/fd/N`, `/proc/thread-self/fd/N` or
+/// `/proc/<pid>/fd/N` link (caller view) refers to: `(owning task, N)`.
+/// `self` and `thread-self` are the caller, whose thread shares the
+/// process's table; a pid is resolved in the caller's pid namespace.
+fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
+    let n = parse_proc_self_fd(user_path)?;
+    if user_path.starts_with("/proc/self/fd/")
+        || user_path.starts_with("/proc/thread-self/fd/")
+    {
+        return Some((task, n));
+    }
+    let pid = user_path
+        .strip_prefix("/proc/")?
+        .split_once('/')?
+        .0
+        .parse::<u64>()
+        .ok()?;
+    Some((proc_pid_to_tid(pid), n))
+}
+
+/// Where FOLLOWING a proc-fd magic link lands. `proc_fd_link` hands
+/// `nd_jump_link` the open file's own `f_path`: the walk goes on from the
+/// file itself, never from the link's readlink text, which for a file with
+/// no name (`pipe:[ino]`) names nothing.
+pub(crate) enum ProcFdLanding {
+    /// The open file still has its name: the host path of it.
+    Path(alloc::string::String),
+    /// The open file has no name a walk could take — a pipe, socket,
+    /// anonymous inode or memfd, or a file whose name was removed: the
+    /// object itself.
+    Object(alloc::sync::Arc<dyn narf_filesystem::FileOps>),
+}
+
+/// `user_path` (caller view, absolute, normalised) followed as a proc-fd
+/// magic link. `None` when it is not one, and when it names no open
+/// descriptor — that is a missing entry of the fd directory, which the
+/// ordinary walk reports as ENOENT just as Linux's lookup does.
+pub(crate) fn proc_fd_landing(task: u64, user_path: &str) -> Option<ProcFdLanding> {
+    let (owner, n) = proc_fd_link_owner(task, user_path)?;
+    let (ops, name) = crate::fd::with_table(owner, |table| {
+        Some((
+            table.get(n)?.ops.clone(),
+            table.description(n).and_then(|description| description.name()),
+        ))
+    })
+    .flatten()?;
+    if internal_file_path(&*ops).is_some() {
+        return Some(ProcFdLanding::Object(ops));
+    }
+    Some(match name {
+        Some(name) if !name.deleted => {
+            ProcFdLanding::Path(alloc::string::String::from(&*name.path))
+        }
+        _ => ProcFdLanding::Object(ops),
+    })
+}
+
+/// The stat tuple of an object a walk landed on rather than looked up.
+fn path_stat_of(ops: &dyn narf_filesystem::FileOps) -> PathStat {
+    let (uid, gid) = ops.owners();
+    (ops.stat(), ops.ino(), ops.rdev(), uid, gid, ops.inode_attrs())
 }
 
 /// Where a FOLLOWED `/proc/{self,thread-self,<pid>}/fd/N` lands for a
@@ -1800,6 +1954,26 @@ fn stat_ino_path_dir_aware_depth(
     depth: u8,
 ) -> Result<PathStat, narf_filesystem::FsError> {
     const MAX_STAT_RETRY: u8 = 2;
+    // A FOLLOWED proc-fd magic link lands on the descriptor's own file and
+    // stops there (`proc_fd_link` -> `nd_jump_link`): describe that file, by
+    // its name when it has one (without following it further — an
+    // O_PATH|O_NOFOLLOW descriptor on a symlink describes the symlink), and
+    // as the object itself when it has none. Walking the link instead
+    // followed its readlink text, which for a pipe is `pipe:[ino]`: `stat`
+    // of `/proc/self/fd/0`, of `/dev/fd/0` and of `/dev/stdin` with standard
+    // input a pipe was ENOENT, which is what `install -Dm644 /dev/stdin
+    // /boot/vmlinuz-linux` (mkinitcpio's install hook) died on.
+    if follow_final && depth < MAX_STAT_RETRY {
+        let task = current_task_id();
+        let landing =
+            visible_path_of(task, path).and_then(|visible| proc_fd_landing(task, visible));
+        if let Some(landing) = landing {
+            return match landing {
+                ProcFdLanding::Path(host) => stat_ino_path_dir_aware_depth(&host, false, depth + 1),
+                ProcFdLanding::Object(ops) => Ok(path_stat_of(&*ops)),
+            };
+        }
+    }
     // The first walk's error, if it failed.
     let mut first: Option<narf_filesystem::FsError> = None;
     let file = current_resolve_absolute(path, |fs, root, rel| {
@@ -1953,30 +2127,10 @@ fn stat_ino_path_dir_aware_depth(
                 // The expansion deliberately stops AT a proc-fd magic link
                 // rather than following its readlink text, because that text
                 // describes the object and for an anonymous descriptor names
-                // nothing. `open` performs the jump itself; a path `stat` has
-                // to do the same here, or a path that opens fine cannot be
-                // described — `/dev/fd/0` is a devtmpfs symlink into procfs,
-                // so `[ -e /dev/fd/0 ]` expanded to `/proc/self/fd/0` and then
-                // had nothing left to walk.
-                //
-                // `nd_jump_link` stops at the descriptor's own file, so the
-                // target is described directly and the walk does not continue
-                // into it (`follow_final` false) — the same shape the statx
-                // handler already uses for a literal `/proc/<pid>/fd/N`.
-                if follow_final {
-                    let task = current_task_id();
-                    if let Some(fd) = parse_proc_fd_magic_path(task, &expanded) {
-                        if let Some(target) =
-                            fd_path_for_task(task, fd).filter(|p| p.starts_with('/'))
-                        {
-                            return retried(stat_ino_path_dir_aware_depth(
-                                &apply_chroot(&target),
-                                false,
-                                depth + 1,
-                            ));
-                        }
-                    }
-                }
+                // nothing. `/dev/fd/0` is a devtmpfs symlink into procfs, so
+                // `[ -e /dev/fd/0 ]` expands to `/proc/self/fd/0`; the retry
+                // lands on the descriptor's file (see the top of this
+                // function), as `open` does.
                 return retried(stat_ino_path_dir_aware_depth(
                     &expanded,
                     follow_final,
@@ -3172,6 +3326,8 @@ fn do_execve_resolved(
         #[cfg(target_arch = "x86_64")]
         narf_scheduler::stackful::note_abandoned_stack();
         let top = narf_scheduler::stackful::current_stackful_stack_top();
+        // This jump skips the syscall return path and its CPU-time hook.
+        narf_scheduler::cputime::user_enter();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
@@ -4400,6 +4556,15 @@ pub(crate) fn current_fs_arc_at(
     }
 }
 
+/// [`current_fs_arc_at`]'s mount's `mnt_devname`.
+pub(crate) fn current_mount_devname_at(path: &str) -> Option<alloc::string::String> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_devname_at(path)
+    } else {
+        narf_filesystem::registry().mount_devname_at(path)
+    }
+}
+
 pub(crate) fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
     current_mount_namespace()
         .map(|ns| ns.list())
@@ -4503,10 +4668,26 @@ pub(crate) fn current_mount_arc_with_flags(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    current_mount_arc_with_source(authority, path, fs, flags, None)
+}
+
+/// [`current_mount_arc_with_flags`] recording the source string the mount
+/// was made with (`mnt_devname`): `mount(2)`'s `source` (`"none"` for a NULL
+/// one), or the new mount API's `fsconfig("source")`.
+pub(crate) fn current_mount_arc_with_source(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    flags: u64,
+    devname: Option<&str>,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.mount_arc_with_flags(authority, path, fs, flags)
+        ns.mount_arc_with_source(authority, path, fs, flags, devname)
     } else {
-        narf_filesystem::registry().mount_arc_with_flags(authority, path, fs, flags)
+        narf_filesystem::registry().mount_arc_with_source(authority, path, fs, flags, devname)
     };
     // Mount propagation: a filesystem mount attached under a shared mount is
     // mirrored into every peer namespace (Linux `propagate_mnt`). No-op unless
@@ -4991,7 +5172,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts, super_flags) in rows {
+    for (id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -5003,14 +5184,15 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        // The last three fields are the option halves: this attachment's
-        // MNT_* flags, then the filesystem's `show_options` text, then the
-        // superblock's `rw`/`ro` + `show_sb_opts`. procfs renders the first
-        // before mountinfo's `-` and the other two after it.
+        // Then the option halves: this attachment's MNT_* flags, the
+        // filesystem's `show_options` text, and the superblock's `rw`/`ro` +
+        // `show_sb_opts` (procfs renders the first before mountinfo's `-`
+        // and the other two after it); then the source (`show_devname`, else
+        // `mnt_devname`) and the mount root's path inside its filesystem.
         let _ = writeln!(
             s,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            id, parent, visible, name, mnt_opts, sb_opts, super_flags
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root
         );
     }
     Some(s)
@@ -5294,6 +5476,10 @@ fn set_root_dir(task: u64, root: alloc::string::String) {
 }
 
 fn set_root_dir_key(key: u64, root: alloc::string::String) {
+    // A root is a directory's host path: no trailing `/` (but `/` itself),
+    // no empty or dot components — the form every join and prefix test
+    // below assumes. `chroot("/")` inside a root names that root.
+    let root = normalize_abs(&root);
     let mut shard = ROOT_DIR_TABLE[task_map_shard(key)].map.lock();
     let roots = shard.get_or_insert_with(BTreeMap::new);
     if !roots.contains_key(&key) {
@@ -5363,6 +5549,14 @@ pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     };
     if !path.starts_with('/') {
         return alloc::string::String::from(path);
+    }
+    // The task's `/` is its root directory itself. Joining gave `<root>/`,
+    // and `chroot("/")` — pacman's `_alpm_run_chroot` inside PID 1's root,
+    // then `ldconfig -r .`'s `chroot(".")` — stored that as the new root, so
+    // every later path became `<root>//etc/...`: `chmod` took the empty
+    // component literally and failed ENOENT on a file `open` had just made.
+    if path == "/" && prefix != "/" {
+        return prefix;
     }
     // Compose prefix + path; prefix has no trailing `/` (except when
     // it equals `/`), path starts with `/`.
@@ -5527,28 +5721,22 @@ pub(crate) fn cpu_clock_target(caller: u64, clock: i32, gettime: bool) -> Option
     (process_state_key(task) == task).then_some(CpuClockTarget::Process(task))
 }
 
-/// Sample a CPU clock (`cpu_clock_sample` / `cpu_clock_sample_group`) in ns.
-///
-/// LINUX-GAP: NARF accounts CPU time per task only, with no thread-group
-/// aggregate (getrusage(RUSAGE_SELF) and CLOCK_PROCESS_CPUTIME_ID share the
-/// gap). A process clock therefore samples one member: the caller itself
-/// when it is a member — exactly what CLOCK_PROCESS_CPUTIME_ID reports —
-/// otherwise the group leader.
+/// Sample a CPU clock (`cpu_clock_sample` / `cpu_clock_sample_group`) in ns:
+/// `CPUCLOCK_VIRT` is utime, `CPUCLOCK_PROF` and `CPUCLOCK_SCHED` are
+/// utime + stime. NARF's accounting is exact, so the scheduler runtime
+/// Linux keeps separately for `CPUCLOCK_SCHED` (`sum_exec_runtime`) is the
+/// same sum; both exclude interrupt time, as `IRQ_TIME_ACCOUNTING` does.
+/// A process clock sums the whole thread group (`thread_group_cputime`).
 pub(crate) fn cpu_clock_sample_ns(caller: u64, target: CpuClockTarget, which: i32) -> u64 {
-    let task = match target {
-        CpuClockTarget::Thread(t) => t,
-        CpuClockTarget::Process(t) if same_thread_group(t, caller) => caller,
-        CpuClockTarget::Process(t) => process_state_key(t),
+    let times = match target {
+        CpuClockTarget::Thread(t) => thread_cpu_times(t),
+        CpuClockTarget::Process(t) if same_thread_group(t, caller) => process_cpu_times(caller),
+        CpuClockTarget::Process(t) => process_cpu_times(process_state_key(t)),
     };
-    let mut user = cpu_time_ns_of(task);
-    if task == caller {
-        // The active slice has not yet been folded into TASK_CPU_NS.
-        user = user.saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
-    }
     if which == CPUCLOCK_VIRT {
-        user
+        times.utime_ns
     } else {
-        user.saturating_add(kern_time_ns_of(task))
+        times.total_ns()
     }
 }
 
@@ -5922,48 +6110,25 @@ pub fn __test_signal_bucket_index(task: u64) -> usize {
     signal_bits_bucket(task)
 }
 
-// ── Per-task CPU-time accounting (getrusage / times) ────────────────
+// ── Per-task CPU-time accounting (getrusage / times / wait4 / /proc) ──
 //
-// NARF previously reported `monotonic_ns()` (wall-clock uptime since
-// boot) as every process's user CPU time — so getrusage(RUSAGE_SELF)
-// / times() returned the same huge, ever-growing value for every
-// task, inflating e.g. stress-ng's per-stressor usr-time ~17x. These
-// two tables instead track REAL consumed CPU time, keyed by TaskId
-// (tid) — the same key getrusage/times resolve via current_task_id().
+// Every thread's utime/stime is the scheduler's exact transition-based
+// accounting (`narf_scheduler::cputime`, Linux `kernel/sched/cputime.c`
+// vtime with IRQ_TIME_ACCOUNTING): user spans end at each trap or syscall
+// from user mode, kernel spans at each return to it, and the off-CPU time of
+// a parked or preempted task, interrupt time and idle are never charged.
+// `crate::task::Task::cputime` holds it; `Task::process_cputime` is the
+// thread group's `signal_struct` (released threads and reaped children).
 //
-// `TASK_CPU_NS`: nanoseconds this task itself has spent executing in
-// user mode, summed over every user run-slice (accumulated by the
-// UserTaskFuture poll boundary in user_task.rs: it brackets each
-// enter-user-mode → trap-return slice and folds the delta in here).
-// The ledgers are per-CPU: hot-path folds touch only the executing CPU's
-// cache line, while cold readers aggregate a task across every CPU it ran on.
-// This mirrors Linux's per-CPU accounting shape and removes the global lock
-// cache-line bounce between unrelated tasks on different CPUs.
+// These accessors are what the syscall and /proc layers read:
 //
-// `TASK_CHILD_CPU_NS`: nanoseconds of CPU time charged to this task's
-// REAPED children (RUSAGE_CHILDREN / tms.cutime), folded in by wait4 /
-// waitid when a zombie is collected (Linux charges child time at reap,
-// not at exit).
-const TASK_ACCOUNT_CPUS: usize = narf_lib::percpu::MAX_CPUS;
-
-/// One CPU's task-time ledger. Cache-line alignment keeps the lock word and
-/// BTreeMap root from false-sharing with the neighbouring CPU's hot ledger.
-#[repr(align(64))]
-struct TaskCpuLedger {
-    values: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, u64>>,
-}
-
-impl TaskCpuLedger {
-    const fn new() -> Self {
-        Self {
-            values: narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()),
-        }
-    }
-}
-
-type TaskCpuLedgers = [TaskCpuLedger; TASK_ACCOUNT_CPUS];
-
-static TASK_CPU_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
+// * `thread_cpu_times`  — RUSAGE_THREAD, CLOCK_THREAD_CPUTIME_ID,
+//   `/proc/<pid>/task/<tid>/stat`;
+// * `process_cpu_times` — RUSAGE_SELF, times(), CLOCK_PROCESS_CPUTIME_ID,
+//   `/proc/<pid>/stat` (Linux `thread_group_cputime_adjusted`);
+// * `children_cpu_times` — RUSAGE_CHILDREN, tms_cutime/cstime,
+//   `/proc/<pid>/stat` cutime/cstime;
+// * `account_reaped_child` — the `wait_task_zombie` fold.
 
 /// Task creation timestamp (monotonic ns) — /proc/[pid]/stat field 22
 /// (starttime, in USER_HZ ticks since boot). Recorded by
@@ -5987,98 +6152,30 @@ fn task_start_ns(tid: u64) -> u64 {
         .and_then(|m| m.get(&tid).copied())
         .unwrap_or(0)
 }
-static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[inline]
-fn task_account_cpu() -> usize {
-    narf_lib::percpu::current_cpu() % TASK_ACCOUNT_CPUS
+/// `utime`/`stime` of thread `task` (a TaskId), including its open span.
+pub fn thread_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::cpu_times(task)
 }
 
-fn task_account_add_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64, delta_ns: u64) {
-    let mut values = ledgers[cpu % TASK_ACCOUNT_CPUS].values.lock();
-    let entry = values.entry(task).or_insert(0);
-    *entry = entry.saturating_add(delta_ns);
+/// `utime`/`stime` of the thread group `task` belongs to: every member,
+/// live or already released. A synthetic identity with no registered task
+/// reads as zero.
+pub fn process_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::process_cputime_of(task).map_or_else(Default::default, |group| group.group())
 }
 
-#[inline]
-fn task_account_add(ledgers: &TaskCpuLedgers, task: u64, delta_ns: u64) {
-    // Keep CPU selection and the update on one CPU. Without this bracket a
-    // timer could migrate the task after `current_cpu()` and make the resumed
-    // CPU write the old CPU's ledger, reintroducing cross-CPU contention.
-    narf_lib::sync::without_interrupts(|| {
-        task_account_add_on_cpu(ledgers, task_account_cpu(), task, delta_ns);
-    });
+/// `cutime`/`cstime` of the thread group `task` belongs to: reaped children
+/// and everything they had collected from their own reaped children.
+pub fn children_cpu_times(task: u64) -> narf_scheduler::TaskTimes {
+    crate::task::process_cputime_of(task).map_or_else(Default::default, |group| group.children())
 }
 
-fn task_account_ensure_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64) {
-    ledgers[cpu % TASK_ACCOUNT_CPUS]
-        .values
-        .lock()
-        .entry(task)
-        .or_insert(0);
-}
-
-fn task_account_get(ledgers: &TaskCpuLedgers, task: u64) -> u64 {
-    ledgers.iter().fold(0u64, |total, ledger| {
-        total.saturating_add(ledger.values.lock().get(&task).copied().unwrap_or(0))
-    })
-}
-
-#[cfg(feature = "unix-latency-trace")]
-fn task_account_try_get(ledgers: &TaskCpuLedgers, task: u64) -> Option<u64> {
-    let mut total = 0u64;
-    for ledger in ledgers {
-        total = total.saturating_add(ledger.values.try_lock()?.get(&task).copied().unwrap_or(0));
-    }
-    Some(total)
-}
-
-fn task_account_remove(ledgers: &TaskCpuLedgers, task: u64) {
-    for ledger in ledgers {
-        ledger.values.lock().remove(&task);
-    }
-}
-
-/// Fold a completed user run-slice (`delta_ns` of on-CPU user time) into
-/// the currently-running task's accumulated CPU time. Called from the
-/// UserTaskFuture poll on every trap-return. Alloc-free on the hot path
-/// once the task's slot exists; IRQ-safe (the poll runs with IF=0 around
-/// the trap boundary).
-pub fn account_user_cpu_ns(delta_ns: u64) {
-    if delta_ns == 0 {
-        return;
-    }
-    if crate::task::account_current_cpu_ns(0, delta_ns, 0) {
-        return;
-    }
-    let task = current_task_id();
-    if task == 0 {
-        return;
-    }
-    task_account_add(&TASK_CPU_NS, task, delta_ns);
-}
-
-/// Time this task has spent inside syscall handlers (ns) — the
-/// ru_stime / tms_stime / stat-field-15 source. Folded by
-/// `kernel_syscall_entry`'s dispatch bracket; same shape and cost as
-/// the user-time fold above (one map lock per syscall).
-static TASK_KERN_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
-
-/// Fold a completed syscall's handler duration into the current task's
-/// kernel-time accumulator. Called from `kernel_syscall_entry`.
-pub fn account_kernel_cpu_ns(delta_ns: u64) {
-    if delta_ns == 0 {
-        return;
-    }
-    if crate::task::account_current_cpu_ns(0, 0, delta_ns) {
-        return;
-    }
-    let task = current_task_id();
-    if task == 0 {
-        return;
-    }
-    task_account_add(&TASK_KERN_NS, task, delta_ns);
+/// `RUSAGE_BOTH` of the process whose visible pid is `pid`: its group plus
+/// its reaped children — what `wait4` reports for it.
+fn rusage_both_of_pid(pid: u64) -> narf_scheduler::TaskTimes {
+    let tid = pid_to_task_raw(pid).unwrap_or(pid);
+    crate::task::process_cputime_of(tid).map_or_else(Default::default, |group| group.both())
 }
 
 /// Timer-trap-safe `(user_ns, kernel_ns)` for `task`. `None` on lock
@@ -6091,277 +6188,78 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
 /// cost, which IS ours.
 #[cfg(feature = "unix-latency-trace")]
 pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
-    let (task_u, task_k) = crate::task::cpu_times_try(task)?;
-    let u = task_u.saturating_add(task_account_try_get(&TASK_CPU_NS, task)?);
-    let k = task_k.saturating_add(task_account_try_get(&TASK_KERN_NS, task)?);
-    Some((u, k))
+    let times = crate::task::cpu_times_try(task)?;
+    Some((times.utime_ns, times.stime_ns))
 }
 
-/// Fold the currently-open on-CPU kernel span into `task`'s accumulator and
-/// close it. Idempotent: a closed span (start == 0) folds nothing.
-///
-/// Called at every point the task stops executing kernel code — the park
-/// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
-/// only, never the sleep in between.
-pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    let start = uc
-        .kern_span_start_ns
-        .swap(0, core::sync::atomic::Ordering::AcqRel);
-    if start == 0 {
-        return;
-    }
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let delta = now.saturating_sub(start);
-    if delta == 0 {
-        return;
-    }
-    if !crate::task::account_current_cpu_ns(task, 0, delta) {
-        task_account_add(&TASK_KERN_NS, task, delta);
-    }
-}
-
-fn open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    // The normal own-stack path owns its accounting atomics in `Task`, so no
-    // per-CPU ledger row or interrupt-masked CPU selection is needed. A timer
-    // interrupt observes either zero or the complete release-published start.
-    if task != 0 && crate::task::current_task_is(task) {
-        uc.kern_span_start_ns.store(
-            narf_scheduler::narf_time::monotonic_ns(),
-            core::sync::atomic::Ordering::Release,
-        );
-        return;
-    }
-    narf_lib::sync::without_interrupts(|| {
-        // The pause hook can close this span from timer IRQ context. Create
-        // the task's row here, on the normal syscall path, so that close only
-        // updates an existing BTreeMap node and never allocates in the
-        // interrupt handler. Keep IRQs masked from CPU selection through the
-        // span-start store: otherwise a migration in that window could make
-        // the first close on the destination CPU allocate.
-        let cpu = task_account_cpu();
-        let cpu_bit = 1u64 << cpu;
-        if uc
-            .kern_account_ready
-            .load(core::sync::atomic::Ordering::Acquire)
-            & cpu_bit
-            == 0
-            && task != 0
-        {
-            task_account_ensure_on_cpu(&TASK_KERN_NS, cpu, task);
-            uc.kern_account_ready
-                .fetch_or(cpu_bit, core::sync::atomic::Ordering::Release);
-        }
-        uc.kern_span_start_ns.store(
-            narf_scheduler::narf_time::monotonic_ns(),
-            core::sync::atomic::Ordering::Release,
-        );
-    });
-}
-
-/// Open (or re-open) the on-CPU kernel span for the current task.
-pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
-    open_kernel_span_for(uc, current_task_id());
-}
-
-/// Test hook: open a kernel span for an explicit stand-in task. Kernel-test
-/// functions execute outside a user-task poll, so the production current-task
-/// lookup correctly returns zero there.
+/// Test hook: charge user CPU time to a registered stand-in task (the
+/// production path only ever charges the running task, through the
+/// scheduler). Returns false for an unregistered tid.
 #[doc(hidden)]
-pub fn __test_open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    open_kernel_span_for(uc, task);
+pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) -> bool {
+    crate::task::__test_add_cpu_ns(task, delta_ns, 0)
 }
 
-/// Pause the current user task's active syscall span before the scheduler
-/// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
-/// when a matching resume must re-open the span.
-fn pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    if uc
-        .kern_span_start_ns
-        .load(core::sync::atomic::Ordering::Acquire)
-        == 0
-    {
-        return false;
-    }
-    close_kernel_span(uc, task);
-    true
-}
-
-pub fn pause_current_kernel_span() -> bool {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return false;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // current own-stack user continuation.
-    pause_kernel_span_for(unsafe { &*uc }, current_task_id())
-}
-
-/// Test hook: pause a kernel span for an explicit stand-in task.
+/// Test hook: charge system CPU time to a registered stand-in task.
 #[doc(hidden)]
-pub fn __test_pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    pause_kernel_span_for(uc, task)
+pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) -> bool {
+    crate::task::__test_add_cpu_ns(task, 0, delta_ns)
 }
 
-/// Resume a syscall span previously paused by `pause_current_kernel_span`.
-pub fn resume_current_kernel_span() {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // resumed own-stack user continuation.
-    open_kernel_span(unsafe { &*uc });
-}
-
-/// Elapsed time in the current task's still-open syscall span. Adding this to
-/// the folded kernel ledger produces a monotonic live snapshot: close folds
-/// the same interval before clearing the start timestamp.
-pub fn current_kernel_span_elapsed_ns() -> u64 {
-    let Some(uc) = crate::user_task::current_user_task() else {
-        return 0;
-    };
-    // SAFETY: current_user_task returns the poller-pinned context of the
-    // current user continuation.
-    let start = unsafe { &*uc }
-        .kern_span_start_ns
-        .load(core::sync::atomic::Ordering::Acquire);
-    if start == 0 {
-        0
-    } else {
-        narf_scheduler::narf_time::monotonic_ns().saturating_sub(start)
-    }
-}
-
-/// This task's accumulated in-syscall (kernel) CPU time (ns).
-pub fn kern_time_ns_of(task: u64) -> u64 {
-    crate::task::cpu_times(task)
-        .1
-        .saturating_add(task_account_get(&TASK_KERN_NS, task))
-}
-
-/// Test hook: clear the current task's accumulated in-syscall (kernel) CPU
-/// time. The kernel-test harness runs every test as ONE shared task, so every
-/// prior test's `kernel_syscall_entry` bracket accumulates here; under slow
-/// (TCG) execution that cumulative time crosses one tick and flaps the `times`
-/// stime==0 assertion. The times test resets it first so it measures a fresh
-/// task, which is what the assertion means.
-/// Test hook: clear `task`'s accumulated in-syscall CPU time. The
-/// no-argument form only reaches the CURRENT task, which a test driving a
-/// stand-in `UserTaskCtx` is not.
-#[doc(hidden)]
-pub fn __test_reset_kernel_time_for(task: u64) {
-    crate::task::reset_cpu_times(task, false, true);
-    task_account_remove(&TASK_KERN_NS, task);
-}
-
-#[doc(hidden)]
-pub fn __test_reset_kernel_time() {
-    let task = current_task_id();
-    task_account_remove(&TASK_KERN_NS, task);
-}
-
-/// Test hook: account `delta_ns` to an arbitrary task (the production
-/// path only ever charges the currently-running task). Lets the ABI test
-/// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
-#[doc(hidden)]
-pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
-    task_account_add(&TASK_CPU_NS, task, delta_ns);
-}
-
-/// Test hook: seed a task's user CPU time on a selected CPU ledger. Models a
-/// task migrating between CPUs without relying on test-runner affinity.
-#[doc(hidden)]
-pub fn __test_account_cpu_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
-    task_account_add_on_cpu(&TASK_CPU_NS, cpu, task, delta_ns);
-}
-
-/// Test hook: charge syscall CPU time to a stand-in task so perf inheritance
-/// tests can exercise the exit snapshot without running a real child syscall.
-#[doc(hidden)]
-pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) {
-    task_account_add(&TASK_KERN_NS, task, delta_ns);
-}
-
-/// Test hook: seed a task's kernel CPU time on a selected CPU ledger.
-#[doc(hidden)]
-pub fn __test_account_kernel_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
-    task_account_add_on_cpu(&TASK_KERN_NS, cpu, task, delta_ns);
-}
-
-/// Test hook: model the master exit-table sweep after perf has captured a
-/// child's final software-clock contribution.
+/// Test hook: zero a registered task's own CPU time.
 #[doc(hidden)]
 pub fn __test_reset_cpu_times_for(task: u64) {
-    crate::task::reset_cpu_times(task, true, true);
-    task_account_remove(&TASK_CPU_NS, task);
-    task_account_remove(&TASK_KERN_NS, task);
+    crate::task::__test_reset_cpu_ns(task);
 }
 
-/// This task's own accumulated user CPU time (ns).
-pub fn cpu_time_ns_of(task: u64) -> u64 {
-    crate::task::cpu_times(task)
-        .0
-        .saturating_add(task_account_get(&TASK_CPU_NS, task))
+/// Test hook: zero a registered task's group children total.
+#[doc(hidden)]
+pub fn __test_reset_children_times_for(task: u64) {
+    if let Some(group) = crate::task::process_cputime_of(task) {
+        group.__test_reset_children();
+    }
 }
 
-/// Accumulated CPU time (ns) of `task`'s reaped children.
-fn child_cpu_time_ns_of(task: u64) -> u64 {
-    TASK_CHILD_CPU_NS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
-}
-
-// Exit-time rusage snapshot: `(cpu_ns, vm_kb)` captured in the DYING
-// task's own context — the only point where its address space is still
-// resolvable (`current_address_space`); by reap time the scheduler slot
-// that owned the AS Arc is long dropped, so a reap-time
-// `task_rss_bytes(child)` reads 0. Consumed (removed) at reap by both
-// the synchronous wait4 path and `finish_wait_child`; an orphan that is
-// never reaped leaks one small entry, same lifetime class as its
+// Exit-time rusage snapshot: `vm_kb` captured in the DYING task's own
+// context — the only point where its address space is still resolvable
+// (`current_address_space`); by reap time the scheduler slot that owned the
+// AS Arc is long dropped, so a reap-time `task_rss_bytes(child)` reads 0.
+// CPU time needs no snapshot: the zombie leader's `Task` keeps its thread
+// group's `ProcessCputime` until the reap reads it. Consumed (removed) at
+// reap by both the synchronous wait4 path and `finish_wait_child`; an orphan
+// that is never reaped leaks one small entry, same lifetime class as its
 // PENDING_EXITS record.
-static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, (u64, u64)>>> =
+static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Snapshot the current (dying) task's rusage numbers for its parent's
-/// wait4. MUST run in the exiting task's own trap context. Keyed by the
-/// VISIBLE pid — the key wait4 reaps with — while the CPU tables are
-/// read by tid (fork mints ProcessId and TaskId separately).
-pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
-    // Include the CURRENT (never-to-be-yielded) slice: the dying task is
-    // mid-slice right now and exit_current_stackful switches away without
-    // folding it.
-    let cpu = cpu_time_ns_of(tid)
-        .saturating_add(child_cpu_time_ns_of(tid))
-        .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
-    // CPU time only — NO RSS snapshot here. A CLONE_THREAD sibling shares its
-    // address space and every sibling overwrites the same pid-keyed entry, so
-    // repeating even the O(1) address-space accounting locks is pure waste.
-    // Fill the RSS half ONCE, at the group-dead transition, while the final
-    // thread's address space is still alive.
+/// Open the dying process's exit-rusage row for its parent's wait4. MUST run
+/// in the exiting task's own trap context. Keyed by the VISIBLE pid — the
+/// key wait4 reaps with. A CLONE_THREAD sibling's exit finds the row open
+/// and leaves it; the RSS half is filled ONCE, at the group-dead transition,
+/// while the final thread's address space is still alive.
+pub(crate) fn record_exit_rusage(_tid: u64, pid: u64) {
     let mut g = EXIT_RUSAGE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let vm_kb = m.get(&pid).map_or(0, |&(_, vm)| vm);
-    m.insert(pid, (cpu, vm_kb));
+    g.get_or_insert_with(BTreeMap::new).entry(pid).or_insert(0);
 }
 
-/// Fill in the vm_kb half of the exit-rusage snapshot for `pid` — called
-/// exactly once per process, on the group-dead transition inside
+/// Fill in the vm_kb of the exit-rusage snapshot for `pid` — called exactly
+/// once per process, on the group-dead transition inside
 /// `notify_task_exited`, while the last thread's address space is still
-/// resolvable. Keeps the (already recorded) cpu time.
+/// resolvable.
 pub(crate) fn finalize_exit_rusage_vm(pid: u64, tid: u64) {
     let vm_kb = task_rss_bytes(tid) / 1024;
     let mut g = EXIT_RUSAGE.lock();
     if let Some(e) = g.get_or_insert_with(BTreeMap::new).get_mut(&pid) {
-        e.1 = vm_kb;
+        *e = vm_kb;
     }
 }
 
-fn take_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+fn take_exit_rusage(tid: u64) -> Option<u64> {
     let mut g = EXIT_RUSAGE.lock();
     g.as_mut().and_then(|m| m.remove(&tid))
 }
 
-fn peek_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+fn peek_exit_rusage(tid: u64) -> Option<u64> {
     EXIT_RUSAGE
         .lock()
         .as_ref()
@@ -6402,49 +6300,45 @@ fn take_wait_rusage_ptr(parent: u64) -> u64 {
     g.as_mut().and_then(|m| m.remove(&parent)).unwrap_or(0)
 }
 
-/// Reaping `child` from `parent`: charge the child's total CPU time (its
-/// own + whatever it had already accumulated from its own reaped
-/// grandchildren, per POSIX) to the parent's child-time accumulator, then
-/// drop the child's rows. Returns the child's total CPU ns so wait4 can
-/// also fill its `struct rusage` out-param. Idempotent-safe: a second
-/// reap of an already-dropped child contributes 0.
-pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
-    // `child` is the VISIBLE pid (wait4's reap key); the CPU tables key
-    // on TaskId (folds run under current_task_id()). Fork mints the two
-    // separately, so an untranslated lookup read 0 for every forked
-    // child — `time`'s user column showed 0.00 for a 5 s burn (alpine
-    // probe). Translate first, like proc_task_info does.
-    let child_tid = pid_to_task_raw(child).unwrap_or(child);
-    let child_total = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
-    if parent != 0 {
-        let mut g = TASK_CHILD_CPU_NS.lock();
-        let m = g.get_or_insert_with(BTreeMap::new);
-        let e = m.entry(parent).or_insert(0);
-        *e = e.saturating_add(child_total);
+/// Reaping `child` (a visible pid) from the waiting task `parent` (a
+/// TaskId): Linux `wait_task_zombie` adds the child's thread-group times plus
+/// its own reaped-children totals to the parent's `cutime`/`cstime`. Returns
+/// that `RUSAGE_BOTH` sum for wait4/waitid's `struct rusage`. Call before the
+/// child's task is released.
+pub fn account_reaped_child(parent: u64, child: u64) -> narf_scheduler::TaskTimes {
+    // `child` is the VISIBLE pid (wait4's reap key); the CPU state hangs off
+    // the zombie leader's Task, found by TaskId. Fork mints the two
+    // separately, so translate first, like proc_task_info does.
+    let both = rusage_both_of_pid(child);
+    if let Some(group) = crate::task::process_cputime_of(parent) {
+        group.add_children(both);
     }
-    task_account_remove(&TASK_CPU_NS, child_tid);
-    if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
-        m.remove(&child_tid);
-    }
-    child_total
+    both
 }
 
-/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory
-/// with `ru_utime` set from `ns` and every other field zero. Linux reports a
-/// failed wait4/waitid rusage copy as `EFAULT` after consuming the wait event,
-/// so callers must propagate this result rather than treating it as best-effort.
-fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) -> Result<(), u64> {
-    let mut kbuf = [0u8; 18 * 8];
-    let sec = (ns / 1_000_000_000) as i64;
-    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
-    kbuf[..8].copy_from_slice(&sec.to_ne_bytes()); // ru_utime.tv_sec
-    kbuf[8..16].copy_from_slice(&usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                      // ru_stime (16..32) stays 0 — NARF doesn't split kernel time out.
+/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory with
+/// `ru_utime`/`ru_stime` from `times` and `ru_maxrss` from `maxrss_kb`, every
+/// other field zero. Linux reports a failed wait4/waitid rusage copy as
+/// `EFAULT` after consuming the wait event, so callers must propagate this
+/// result rather than treating it as best-effort.
+fn write_rusage(out_ptr: u64, times: narf_scheduler::TaskTimes, maxrss_kb: u64) -> Result<(), u64> {
+    let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
+    let timeval = |ns: u64| {
+        (
+            (ns / 1_000_000_000) as i64,
+            ((ns % 1_000_000_000) / 1_000) as i64,
+        )
+    };
+    let (usec_s, usec_us) = timeval(times.utime_ns);
+    let (ssec_s, ssec_us) = timeval(times.stime_ns);
+    kbuf[..8].copy_from_slice(&usec_s.to_ne_bytes()); // ru_utime.tv_sec
+    kbuf[8..16].copy_from_slice(&usec_us.to_ne_bytes()); // ru_utime.tv_usec
+    kbuf[16..24].copy_from_slice(&ssec_s.to_ne_bytes()); // ru_stime.tv_sec
+    kbuf[24..32].copy_from_slice(&ssec_us.to_ne_bytes()); // ru_stime.tv_usec
     kbuf[32..40].copy_from_slice(&(maxrss_kb as i64).to_ne_bytes()); // ru_maxrss (KB)
-                                                                     // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
-                                                                     // checked by the caller); copy_to_user range-validates and
-                                                                     // SMAP-brackets the 144-byte write.
-    // SAFETY: range validation and the SMAP/PAN bracket are in copy_to_user.
+    // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
+    // checked by the caller); copy_to_user range-validates and SMAP-brackets
+    // the 144-byte write.
     unsafe { copy_to_user(out_ptr, &kbuf) }
 }
 
@@ -7837,31 +7731,38 @@ fn live_task_state(task: u64) -> char {
     }
 }
 
-/// Own-stack CPU slices include kernel execution. Export a monotonic split
-/// instead of adding the syscall ledger a second time to htop's utime+stime.
-fn proc_cpu_times_ns(task: u64) -> (u64, u64) {
-    let kernel = kern_time_ns_of(task);
-    let runtime_or_user = cpu_time_ns_of(task);
-    if narf_scheduler::stackful::user_own_stack_enabled() {
-        crate::task::adjusted_proc_cpu_times(task, runtime_or_user, kernel)
+/// `/proc` stat fields 14-17 (`utime stime cutime cstime`) in USER_HZ
+/// ticks, as `fs/proc/array.c::do_task_stat` builds them: `whole` (the
+/// `/proc/<pid>/stat` view) sums the thread group, otherwise the one thread
+/// (`/proc/<pid>/task/<tid>/stat`); both report the group's reaped children.
+fn proc_stat_cpu_ticks(task: u64, whole: bool) -> (u64, u64, u64, u64) {
+    use narf_scheduler::cputime::ns_to_clock_t;
+    let own = if whole {
+        process_cpu_times(task)
     } else {
-        (runtime_or_user, kernel)
-    }
+        thread_cpu_times(task)
+    };
+    let children = children_cpu_times(task);
+    (
+        ns_to_clock_t(own.utime_ns),
+        ns_to_clock_t(own.stime_ns),
+        ns_to_clock_t(children.utime_ns),
+        ns_to_clock_t(children.stime_ns),
+    )
 }
 
 /// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
 /// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
 pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
-    const NS_PER_TICK: u64 = 10_000_000;
     let task = task_of_visible_tid(tid)?;
     let syscall = proc_task_syscall_frame(task);
-    let (user_ns, kernel_ns) = proc_cpu_times_ns(task);
+    let (utime_ticks, stime_ticks, _, _) = proc_stat_cpu_ticks(task, false);
     Some(narf_filesystem::procfs::ThreadStat {
         wchan: proc_wchan_of_frame(syscall),
         syscall,
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
-        utime_ticks: user_ns / NS_PER_TICK,
-        stime_ticks: kernel_ns / NS_PER_TICK,
+        utime_ticks,
+        stime_ticks,
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
         state: live_task_state(task),
@@ -7901,10 +7802,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         .as_ref()
         .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
-        run_ns: {
-            let (user, kernel) = proc_cpu_times_ns(task);
-            user.saturating_add(kernel)
-        },
+        run_ns: thread_cpu_times(task).total_ns(),
         timeslices,
         voluntary_switches,
         involuntary_switches,
@@ -8640,7 +8538,8 @@ pub fn proc_task_info(
             .map(|space| space.memory_stats())
             .unwrap_or_default();
         let (tty_nr, tpgid) = proc_stat_tty(tid);
-        let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
+        let (utime_ticks, stime_ticks, cutime_ticks, cstime_ticks) =
+            proc_stat_cpu_ticks(tid, true);
         const NS_PER_TICK: u64 = 10_000_000;
         return Some(ProcTaskInfo {
             pid: visible_pid,
@@ -8659,8 +8558,10 @@ pub fn proc_task_info(
             session: pgid_to_user(read_sid(tid)),
             tty_nr,
             tpgid,
-            utime_ticks: user_ns / NS_PER_TICK,
-            stime_ticks: kernel_ns / NS_PER_TICK,
+            utime_ticks,
+            stime_ticks,
+            cutime_ticks,
+            cstime_ticks,
             num_threads: thread_group_live_count(pid),
             starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
             vm_size_bytes: stats.mapped_bytes,
@@ -8846,7 +8747,7 @@ pub fn proc_task_info(
     const NS_PER_TICK: u64 = 10_000_000;
     // One pass over the disposition table; it is behind a lock.
     let dispositions = sig_disposition_masks(tid);
-    let (user_ns, kernel_ns) = proc_cpu_times_ns(tid);
+    let (utime_ticks, stime_ticks, cutime_ticks, cstime_ticks) = proc_stat_cpu_ticks(tid, true);
     Some(ProcTaskInfo {
         // Report the pid the reader asked for (its namespace view), not the
         // outer ProcessId — stat field 1 must echo /proc/<N>.
@@ -8887,8 +8788,10 @@ pub fn proc_task_info(
         session: pgid_to_user(read_sid(tid)),
         tty_nr,
         tpgid,
-        utime_ticks: user_ns / NS_PER_TICK,
-        stime_ticks: kernel_ns / NS_PER_TICK,
+        utime_ticks,
+        stime_ticks,
+        cutime_ticks,
+        cstime_ticks,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
         // Effective uid/gid from the per-task credential table — surfaced as
         // the status Uid:/Gid: lines. Defaults to 0/0 (root) for tasks that

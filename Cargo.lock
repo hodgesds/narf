@@ -3011,6 +3011,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-observability",
  "narf-rcu",
  "narf-scheduler",
  "narf-time",
@@ -3325,6 +3326,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-kallsyms"
+version = "0.0.0"
+
+[[package]]
 name = "narf-kernel-test"
 version = "0.0.0"
 
@@ -3400,6 +3405,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kallsyms",
  "narf-kernel-test",
  "narf-lib",
  "narf-time",
@@ -3742,6 +3748,7 @@ dependencies = [
  "narf-lib",
  "narf-net",
  "narf-scheduler",
+ "narf-time",
  "zeroize",
 ]
 
@@ -4043,6 +4050,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
 
 [[package]]
 name = "rustc-hash"
@@ -4651,9 +4664,11 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "narf-boot-protocol",
+ "narf-kallsyms",
  "proc-macro2",
  "quinn",
  "rcgen",
+ "rustc-demangle",
  "rustls",
  "semver",
  "serde",

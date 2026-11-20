@@ -138,6 +138,7 @@ impl<B: Backend> Session<B> {
         self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.data_pending.clear();
         self.station.peer_lost = false;
+        self.station.loss = None;
         self.events.clear();
         self.transferred = 0;
         self.seq = 0;

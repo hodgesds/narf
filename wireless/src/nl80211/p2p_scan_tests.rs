@@ -93,12 +93,26 @@ fn smoke_nl80211_wdev_scan_routing_keeps_ifindex_scans() -> TestResult {
     ) else {
         return TestResult::Fail("GET_SCAN dump refused");
     };
+    // Two dumps differ only in NL80211_BSS_SEEN_MS_AGO (the time between).
+    let aged = |reply: &GenlReply| {
+        let mut nested = reply_attr(reply, 47)
+            .or_else(|| reply_attr(reply, 47 | NLA_F_NESTED))
+            .unwrap_or_default();
+        let mut offset = 0;
+        while offset + 8 <= nested.len() {
+            let len = u16::from_ne_bytes([nested[offset], nested[offset + 1]]) as usize;
+            if u16::from_ne_bytes([nested[offset + 2], nested[offset + 3]]) == 10 && len == 8 {
+                nested[offset + 4..offset + 8].fill(0);
+            }
+            offset += (len.max(4) + 3) & !3;
+        }
+        nested
+    };
     if indexed.len() != 1
         || indexed.len() != wdev_dump.len()
-        || indexed
-            .iter()
-            .zip(&wdev_dump)
-            .any(|(a, b)| a.command != b.command || a.attrs != b.attrs)
+        || indexed.iter().zip(&wdev_dump).any(|(a, b)| {
+            a.command != b.command || reply_attr(a, 3) != reply_attr(b, 3) || aged(a) != aged(b)
+        })
     {
         return TestResult::Fail("netdev WDEV GET_SCAN differs from its IFINDEX dump");
     }

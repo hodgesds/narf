@@ -35,9 +35,9 @@ use crate::fd;
 use crate::handlers::{
     apply_chroot, copy_from_user_vec, copy_user_cstr_checked, current_change_propagation,
     current_clone_mount_subtree, current_clone_tree_at, current_fs_arc_at, current_mount_arc,
-    current_mount_flags_exact, current_mount_list, current_set_mount_flags, current_task_id,
-    fd_path_for_task, mount_admin, parse_proc_self_fd, resolve_at_path, resolve_cwd_path,
-    stat_path_dir_aware,
+    current_mount_arc_with_source, current_mount_devname_at, current_mount_flags_exact,
+    current_mount_list, current_set_mount_flags, current_task_id, fd_path_for_task, mount_admin,
+    parse_proc_self_fd, resolve_at_path, resolve_cwd_path, stat_path_dir_aware,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
@@ -202,6 +202,9 @@ fn require_mountpoint(path: &str) -> Result<(), i64> {
 struct MountObject {
     fs: Arc<dyn FsInstance>,
     descendants: alloc::vec::Vec<(String, Arc<dyn FsInstance>)>,
+    /// `mnt_devname`: the context's `source` for an `fsmount`, the cloned
+    /// mount's for an `open_tree`.
+    devname: Option<String>,
 }
 
 static CONTEXTS: IrqSafeSpinLock<Option<BTreeMap<u64, FsContext>>> = IrqSafeSpinLock::new(None);
@@ -1133,10 +1136,17 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
             return Some(Err(EBUSY));
         }
         c.phase = CtxPhase::ReconfParams;
-        Some(Ok(fs))
+        // `vfs_create_mount`: `mnt->mnt_devname = fc->source ?: "none"`.
+        let devname = c
+            .options
+            .get("source")
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| String::from("none"));
+        Some(Ok((fs, devname)))
     });
-    let fs = match fs {
-        Some(Ok(fs)) => fs,
+    let (fs, devname) = match fs {
+        Some(Ok(created)) => created,
         Some(Err(errno)) => {
             ctx.set_return(err(errno));
             return;
@@ -1154,6 +1164,7 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
             MountObject {
                 fs,
                 descendants: alloc::vec::Vec::new(),
+                devname: Some(devname),
             },
         )
     });
@@ -1317,7 +1328,8 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if current_mount_arc(&auth, &target, mount.fs).is_err() {
+    if current_mount_arc_with_source(&auth, &target, mount.fs, 0, mount.devname.as_deref()).is_err()
+    {
         ctx.set_return(err(EBUSY));
         return;
     }
@@ -1471,9 +1483,15 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     // fd_path_of() deliberately strips the task's chroot prefix. Resolve
     // them back to the backing mount-table path before cloning the tree.
     let path = apply_chroot(&visible_path);
+    // `clone_mnt`: the copy keeps the source mount's `mnt_devname`.
+    let devname = current_mount_devname_at(&path);
     let mount = match if a.arg2 & OPEN_TREE_CLONE != 0 {
         current_clone_mount_subtree(&path)
-            .map(|(fs, descendants)| MountObject { fs, descendants })
+            .map(|(fs, descendants)| MountObject {
+                fs,
+                descendants,
+                devname: devname.clone(),
+            })
             .or_else(|| {
                 raw_path
                     .is_empty()
@@ -1482,6 +1500,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
                     .map(|fs| MountObject {
                         fs,
                         descendants: alloc::vec::Vec::new(),
+                        devname: devname.clone(),
                     })
             })
     } else {
@@ -1490,6 +1509,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             .map(|fs| MountObject {
                 fs,
                 descendants: alloc::vec::Vec::new(),
+                devname: devname.clone(),
             })
     } {
         Some(mount) => mount,

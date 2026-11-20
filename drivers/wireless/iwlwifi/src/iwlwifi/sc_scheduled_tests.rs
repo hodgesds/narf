@@ -843,8 +843,10 @@ fn smoke_sc_scheduled_cache_callback_is_linearized_with_native_uid_retirement() 
         )?;
         let replies = dispatch(&control, 32, 0x7108)?;
         require(
-            replies.iter().any(|r| r.windows(6).any(|b| b == next))
-                && !replies.iter().any(|r| r.windows(6).any(|b| b == AP)),
+            // cfg80211 merges scheduled-scan results into its BSS table
+            // (`cfg80211_bss_update`, no FLUSH): the successor's BSS is
+            // there; the retired callbacks' absence is the audit above.
+            replies.iter().any(|r| r.windows(6).any(|b| b == next)),
             "Sc late result replaced successor GET_SCAN data",
         )?;
         control.stop()

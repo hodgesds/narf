@@ -373,6 +373,31 @@ kernel IPC. CI checks both native-ring feature configurations.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.
+- **Kernel symbol table (`/proc/kallsyms`).** Both linker scripts reserve a
+  `KALLSYMS_RESERVE` (8 MiB) PROGBITS `.kallsyms` section in the read-only
+  segment, bounded by `__kallsyms_start`/`__kallsyms_end`, and define Linux's
+  image markers `_text` = `_stext` (start of `.text`, the lowest kernel-half
+  symbol), `_etext`, `_sdata`/`_edata` (around `.data`) and `_end` (end of
+  `.bss`). Every kernel link (`xtask build/run/test/...`) runs
+  `kallsyms::patch` after the KASLR table: it reads the image's `.symtab`,
+  keeps kernel-half text and data symbols with their `nm(1)` letters (dropping
+  undefined, absolute, debugging, `$x`/`$d` mapping, `.L*` local and LLVM
+  `anon.*` constants, as `scripts/mksysmap` does), demangles Rust names to the
+  `nm -C` form, truncates names to 511 bytes, and writes the
+  `narf-kallsyms` table (offsets from `_text`, deduplicated front-coded names,
+  Linux's best-pair token compression) into the reservation, zero-filling the
+  rest. Filling a fixed reservation moves no address, so one link reaches what
+  Linux's multi-pass `link-vmlinux.sh` does; the table holds no absolute
+  address and needs no KASLR relocation. A table larger than the reservation
+  fails the build. Measured: 4.4 MiB for the x86_64 `xtask test` image
+  (384k symbols, 89k distinct names, 39 MB of names), 2.4 MiB for a native
+  x86_64 release image (195k symbols), 4.0 MiB for aarch64 release.
+- `cargo xtask kallsyms ELF [--patch] [--print-slide OFFSET]` reports the
+  table an image would carry, patches it, or prints the patched table in
+  `/proc/kallsyms` format with every address moved by `OFFSET` (the panic
+  report's `Kernel Offset:`), for symbolising a capture offline. The boot log
+  no longer prints the KASLR slide; only panic and fatal-exception reports do
+  (`memory/` §3, `narf_memory::kaslr::KernelOffset`).
 - The x86_64 ELF uses a 256 MiB physical load base for both PVH and
   Multiboot2. The complete load span includes `.bss`; it must avoid firmware
   reservations, not just place the entry point in free RAM. In particular,
