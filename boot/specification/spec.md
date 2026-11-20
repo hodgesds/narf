@@ -101,6 +101,14 @@ most 32 bytes are kept. A zero tag-12 pointer is treated as absent.
 `loglevel=N` (clamped to 1..15) in command-line order and returns the final
 explicit threshold, or `None` when no verbosity token was supplied.
 
+`KernelCmdline::dyndbg_print(module)` is the boot-time form of Linux dynamic
+debug: `<module>.dyndbg=<flags>` tokens apply in command-line order (`+p`
+enables, `-p` disables, `=<flags>` sets exactly, so `=p` enables and `=_`
+disables; other flag letters are ignored; surrounding quotes are stripped).
+It returns whether the module's debug messages print, default `false` as for
+`pr_debug`/`dev_dbg`. The quoted `dyndbg="module <name> +p"` query form is not
+supported, since the command line splits on whitespace.
+
 **Cmdline store contract (per-arch `parse_raw`):** the bootloader-supplied
 command line is copied into a static 2048-byte buffer (`CMDLINE_CAP`,
 matching Linux's `COMMAND_LINE_SIZE`); the store keeps at most
