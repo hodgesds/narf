@@ -17,7 +17,12 @@
 //!   set INTX_DISABLE, so there is no legacy INTx route.
 //!
 //! The IRQ handler only records the event; IVs are decoded and dispatched by
-//! task-context drains driven by subscribers (interrupt wake or watchdog).
+//! task-context drains driven by subscribers. With MSI or MSI-X delivery the
+//! interrupt alone drives them, as Linux's `amdgpu_irq_handler` →
+//! `amdgpu_ih_process` is: a subscriber registers for the vector before it
+//! drains, and a drain that ran while an interrupt arrived drains again (the
+//! `restart_ih` re-read of the write pointer), so no IV waits for a timer.
+//! Only polled (or not yet routed) delivery samples the ring on a timer.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip,
@@ -42,6 +47,9 @@ const MASK: u32 = (RING - 1) as u32;
 const RB_SIZE: u32 = 16; // linux: n/a (order_base_2(IH_RING_SIZE / 4), amdgpu_ih_ring_init)
 const BATCH: usize = 32; // linux: AMDGPU_IH_MAX_NUM_IVS
 const ROUNDS: usize = 8; // linux: n/a (NARF drain policy)
+/// Drains restarted because an interrupt arrived meanwhile (Linux
+/// `amdgpu_ih_process` restarts while its `count` budget lasts).
+const RESTARTS: usize = 16;
 const QUEUE: usize = 64; // linux: n/a (NARF mailbox depth)
 const SLOTS: usize = 64; // linux: n/a (NARF subscriber slots)
 const CLIENTS: u8 = 0x20; // linux: SOC15_IH_CLIENTID_MAX
@@ -782,6 +790,18 @@ impl Hub {
             _ => Err(Closed::Failed),
         }
     }
+    /// Wake every parked waiter without closing (their next poll drains).
+    fn kick(&self) {
+        let wakers: Vec<Waker> = {
+            let mut table = self.table.lock();
+            table
+                .slots
+                .iter_mut()
+                .filter_map(|s| s.waker.take())
+                .collect()
+        };
+        wakers.into_iter().for_each(Waker::wake);
+    }
     /// First terminal reason wins; every parked waiter is woken.
     fn close(&self, reason: Closed) {
         let _ = self.closed.compare_exchange(
@@ -823,13 +843,14 @@ impl Hub {
         let vector = self.vector.load(Ordering::Acquire);
         (vector != NO_VECTOR).then_some(vector as u8)
     }
-    /// Watchdog period: a lost MSI is recovered within 10 ms; polling mode
-    /// samples every millisecond.
-    fn watchdog_us(&self) -> u64 {
-        if self.delivery() == Delivery::Polling {
-            1000
-        } else {
-            10_000
+    /// Ring sampling period for deliveries with no interrupt: polling mode
+    /// samples every millisecond, a ring not yet routed every 10 ms. MSI and
+    /// MSI-X need none (Linux `navi10_ih` has no IH timer).
+    fn watchdog_us(&self) -> Option<u64> {
+        match self.delivery() {
+            Delivery::Polling => Some(1000),
+            Delivery::Pending => Some(10_000),
+            Delivery::MsiX { .. } | Delivery::Msi { .. } => None,
         }
     }
     fn dispatch(&self, ivs: &[Iv]) {
@@ -881,17 +902,48 @@ impl<I: Io> Port for Shared<I> {
         &self.hub
     }
     fn drain(&self) -> Result<usize, Closed> {
-        self.hub.closed()?;
-        // A concurrent drainer dispatches on our behalf; waiters stay parked
-        // on the vector and their watchdog.
-        let Some(mut engine) = self.engine.try_lock() else {
-            return Ok(0);
-        };
-        if engine.state != State::Enabled {
-            return Ok(0);
-        }
-        let signalled = self.hub.pending.swap(false, Ordering::AcqRel);
         let mut total = 0;
+        for _ in 0..RESTARTS {
+            // A busy engine: its holder re-checks `pending` once it lets go
+            // (`redrain_if_pending`), so this waiter can park.
+            let Some((n, more)) = self.drain_once()? else {
+                return Ok(total);
+            };
+            total += n;
+            if more {
+                // The pass used its whole budget: what is left is drained by
+                // the subscribers' next waits, which this wakes, rather than
+                // by holding the CPU here.
+                self.hub.kick();
+                return Ok(total);
+            }
+            // An interrupt that arrived while the engine was held found the
+            // drain busy and left only `pending` behind: drain again now the
+            // engine is free (Linux `amdgpu_ih_process` re-reads the write
+            // pointer and restarts).
+            if !self.pending_after_release() {
+                return Ok(total);
+            }
+        }
+        self.hub.kick();
+        Ok(total)
+    }
+}
+
+impl<I: Io> Shared<I> {
+    /// One budgeted pass over the ring under the engine lock: IVs drained
+    /// and whether more remain; `None` if another owner holds the engine.
+    fn drain_once(&self) -> Result<Option<(usize, bool)>, Closed> {
+        self.hub.closed()?;
+        let Some(mut engine) = self.engine.try_lock() else {
+            return Ok(None);
+        };
+        let signalled = self.hub.pending.swap(false, Ordering::SeqCst);
+        if engine.state != State::Enabled {
+            return Ok(Some((0, false)));
+        }
+        let mut total = 0;
+        let mut more = false;
         for _ in 0..ROUNDS {
             let mut ivs = [Iv::default(); BATCH];
             let batch = match engine.collect(&mut ivs) {
@@ -915,14 +967,30 @@ impl<I: Io> Port for Shared<I> {
             hub.drained.fetch_add(batch.count as u64, Ordering::Relaxed);
             hub.dispatch(&ivs[..batch.count]);
             total += batch.count;
-            if !batch.more {
+            more = batch.more;
+            if !more {
                 break;
             }
         }
         if total != 0 && !signalled {
             self.hub.unsignalled.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(total)
+        Ok(Some((total, more)))
+    }
+
+    /// After letting go of the engine: whether an interrupt left IVs behind.
+    fn pending_after_release(&self) -> bool {
+        fence(Ordering::SeqCst);
+        self.hub.pending.load(Ordering::SeqCst)
+    }
+
+    /// Every engine holder other than a drain calls this once it lets go: an
+    /// interrupt that found the engine busy left its IVs behind for the
+    /// holder to drain.
+    fn redrain_if_pending(&self) {
+        if self.pending_after_release() {
+            let _ = Port::drain(self);
+        }
     }
 }
 
@@ -1093,6 +1161,15 @@ impl Future for Next<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         loop {
+            // Register for the host vector BEFORE draining: an interrupt from
+            // here on wakes this waiter, and every IV the device posted
+            // before it (the IV write precedes its MSI) is in the ring the
+            // drain below reads, so no IV can fall between the two.
+            let vector = this.subscription.port.hub().vector();
+            if let Some(vector) = vector {
+                narf_interrupts::dispatch::set_waker(vector, cx.waker().clone());
+                this.vector = Some((vector, cx.waker().clone()));
+            }
             match this.subscription.try_next() {
                 Ok(Some(iv)) => return Poll::Ready(Ok(iv)),
                 Err(reason) => return Poll::Ready(Err(reason)),
@@ -1109,11 +1186,11 @@ impl Future for Next<'_> {
             if let Err(reason) = hub.closed() {
                 return Poll::Ready(Err(reason));
             }
-            if let Some(vector) = hub.vector() {
-                narf_interrupts::dispatch::set_waker(vector, cx.waker().clone());
-                this.vector = Some((vector, cx.waker().clone()));
-            }
-            let period = hub.watchdog_us();
+            let Some(period) = hub.watchdog_us() else {
+                // Interrupt-driven: the vector waker registered above wakes
+                // this waiter for every IV posted after the drain.
+                return Poll::Pending;
+            };
             let timer = this.timer.get_or_insert_with(|| {
                 narf_time::SleepUntil::new(narf_time::Deadline::after_us(period).as_instant())
             });
@@ -1268,7 +1345,12 @@ impl Ih {
             }
         };
         match result {
-            Ok(_) => self.state = State::Enabled,
+            Ok(_) => {
+                self.state = State::Enabled;
+                // An interrupt raised while the ring was being enabled found
+                // the engine held.
+                self.shared.redrain_if_pending();
+            }
             Err(Error::Busy) => {}
             Err(_) => {
                 self.state = State::Failed;
@@ -1376,10 +1458,13 @@ impl Ih {
         self.proof = Some(Err(error));
     }
     pub fn state(&self) -> State {
-        self.shared
-            .engine
-            .try_lock()
-            .map_or(self.state, |engine| engine.state)
+        let Some(engine) = self.shared.engine.try_lock() else {
+            return self.state;
+        };
+        let state = engine.state;
+        drop(engine);
+        self.shared.redrain_if_pending();
+        state
     }
     pub fn status(&self) -> Status {
         Status {
