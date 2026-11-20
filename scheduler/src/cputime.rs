@@ -456,6 +456,7 @@ unsafe fn transition(next: impl FnOnce(ContextWord) -> ContextWord) -> ContextWo
     // effect from the task's next return to user mode.
     if new & CTX_MASK == CTX_USER
         && !task.is_null()
+        // SAFETY: caller contract — `task` is live while installed.
         && unsafe { (*task).nice.load(Ordering::Relaxed) }
     {
         new |= WORD_NICE;
