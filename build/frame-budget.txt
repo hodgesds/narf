@@ -66,5 +66,3 @@
 28808 narf_drivers_wireless::ath11k::core::pci_start::{{closure}}
 13296 narf_drivers_wireless::ath11k::iface::register_ahb
 13144 narf_drivers_wireless::ath11k::iface::register_pci_netdev
-8824 narf_drivers_wireless::ath11k::pci::mhi_task::{{closure}}
-18312 narf_drivers_wireless::ath11k::runtime::register_ahb_radios
