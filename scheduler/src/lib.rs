@@ -7965,10 +7965,8 @@ pub fn run_until_empty() {
                     entered
                 };
                 let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
-                if entered {
-                    if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
-                        HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
-                    }
+                if entered && WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+                    HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
