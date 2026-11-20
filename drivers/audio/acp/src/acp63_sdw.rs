@@ -868,10 +868,13 @@ mod tests {
         // The enumerated codec is an RT711, so compose ran its
         // attach-time init: the pin widget, a config default, the
         // final power-D3 write and the last index write must have
-        // landed on the peripheral model.
-        if fixture.model.regs.get(&0xb721).copied() != Some(0xc0)
+        // landed on the peripheral model. SET verbs below 0x4fff go out
+        // at their own address (Linux rt711_sdw_write), so the HP pin
+        // widget is 0x3721 and the AFG power state 0x3501; the 0xbxxx
+        // addresses are the GET verbs, which nothing writes.
+        if fixture.model.regs.get(&0x3721).copied() != Some(0xc0)
             || fixture.model.regs.get(&0x4f12).copied() != Some(0x91)
-            || fixture.model.regs.get(&0xb501).copied() != Some(0x03)
+            || fixture.model.regs.get(&0x3501).copied() != Some(0x03)
             || fixture.model.regs.get(&0x84a0).copied() != Some(0x49)
         {
             return TestResult::Fail("RT711 attach-time init did not land");
