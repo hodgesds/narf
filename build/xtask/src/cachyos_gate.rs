@@ -1316,7 +1316,16 @@ impl Gate {
                 "if=pflash,format=raw,unit=1,file={}",
                 self.ovmf_vars.display()
             ))
-            .args(["-machine", "q35", "-cpu", "max", "-smp", "4", "-m", "4096M"])
+            // `NARF_QEMU_CPU` / `NARF_QEMU_SMP` / `NARF_QEMU_EXTRA` as for
+            // `qemu_args`: e.g. `NARF_QEMU_CPU=host
+            // NARF_QEMU_EXTRA="-overcommit cpu-pm=on"` exposes MWAIT to the
+            // guest so its polling idle runs as on hardware (KVM hides MWAIT
+            // otherwise).
+            .args(["-machine", "q35", "-cpu"])
+            .arg(std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()))
+            .arg("-smp")
+            .arg(std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| "4".into()))
+            .args(["-m", "4096M"])
             .args([
                 "-serial",
                 "stdio",
@@ -1356,6 +1365,9 @@ impl Gate {
             .args(["-device", "usb-kbd,bus=xhci0.0"]);
         if let Some(a) = &self.accel {
             c.args(["-accel", a]);
+        }
+        if let Ok(extra) = std::env::var("NARF_QEMU_EXTRA") {
+            c.args(extra.split_whitespace());
         }
         c
     }
