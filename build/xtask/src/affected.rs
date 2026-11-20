@@ -17,11 +17,22 @@
 //!    the subsystems that call it).
 //! 4. Trip `full = true` (run everything, exactly like today) when the
 //!    change touches build infrastructure, a hub crate, an unrecognized
-//!    path, or when the CI event is a nightly / manual run.
+//!    path, or when the CI event is a nightly / manual run — or a push
+//!    to `main`, whose oracle must always run the whole matrix.
+//! 5. Leaf-driver narrowing: when every non-ignorable changed file falls
+//!    under a directory in `driver-test-map.toml`, the kernel-test
+//!    filter narrows to that driver's tags plus `frame`, instead of
+//!    expanding through the reverse-dependency closure (which would
+//!    pull in every sibling driver via the family aggregator crate).
+//!    Anything not leaf-covered falls through to the closure logic
+//!    above, unchanged.
 //!
 //! The policy (which crates are hubs, which crates map to which job) lives
-//! in this one file so there is a single place to reason about correctness.
-//! Everything below the I/O helpers is pure and unit-tested in `host-test`.
+//! in this one file so there is a single place to reason about correctness;
+//! the leaf-driver map is the one exception — it lives in the data file
+//! `build/xtask/driver-test-map.toml` so it can be reviewed and extended
+//! without touching the decision code. Everything below the I/O helpers
+//! is pure and unit-tested in `host-test`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -335,15 +346,164 @@ fn narrowed_tags(
     }
 }
 
+/// One entry of `driver-test-map.toml`: a repo-relative directory prefix
+/// and the kernel-test subsystem tags that name the driver living there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafDriverEntry {
+    pub path: String,
+    pub tags: BTreeSet<String>,
+}
+
+/// The parsed `driver-test-map.toml`. `Default` is the empty map (no leaf
+/// narrowing); the real map is loaded by `affected_cmd` and passed to
+/// `plan()`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LeafDriverMap {
+    pub entries: Vec<LeafDriverEntry>,
+}
+
+impl LeafDriverMap {
+    /// Longest-prefix match: the entry whose `path` is the longest
+    /// repo-relative directory prefix of `rel`, or `None`.
+    fn entry_for(&self, rel: &str) -> Option<&LeafDriverEntry> {
+        let mut best: Option<&LeafDriverEntry> = None;
+        for e in &self.entries {
+            let under = rel == e.path || rel.starts_with(&format!("{}/", e.path));
+            if !under {
+                continue;
+            }
+            match best {
+                Some(b) if b.path.len() >= e.path.len() => {}
+                _ => best = Some(e),
+            }
+        }
+        best
+    }
+}
+
+/// Validate one subsystem tag the same way the kernel-test CLI does
+/// (see `validate_test_subsystems` in main.rs): letters, digits, `/`,
+/// `_`, `-`, `.` only, and non-empty.
+fn valid_subsystem_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+}
+
+/// Parse `driver-test-map.toml` contents. Rejects duplicate paths,
+/// malformed paths (empty, absolute, `..`, trailing slash), and
+/// malformed/empty tag lists, so a bad map fails loudly at load time
+/// instead of silently narrowing (or widening) a run.
+fn parse_leaf_driver_map(text: &str) -> Result<LeafDriverMap> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        leaf: Option<Vec<RawLeaf>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawLeaf {
+        path: String,
+        tags: Vec<String>,
+    }
+    let raw: Raw = toml::from_str(text).context("parsing driver-test-map.toml")?;
+    let mut map = LeafDriverMap::default();
+    for leaf in raw.leaf.unwrap_or_default() {
+        let path = leaf.path.trim().to_string();
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            bail!("driver-test-map.toml: invalid leaf path {:?}", leaf.path);
+        }
+        if leaf.tags.is_empty() || leaf.tags.iter().any(|t| !valid_subsystem_tag(t)) {
+            bail!(
+                "driver-test-map.toml: leaf {:?} has an empty or malformed tag list",
+                path
+            );
+        }
+        if map.entries.iter().any(|e| e.path == path) {
+            bail!("driver-test-map.toml: duplicate leaf path {:?}", path);
+        }
+        map.entries.push(LeafDriverEntry {
+            path,
+            tags: leaf.tags.into_iter().collect(),
+        });
+    }
+    Ok(map)
+}
+
+/// Load `build/xtask/driver-test-map.toml` under the workspace `root`.
+pub fn load_leaf_driver_map(root: &Path) -> Result<LeafDriverMap> {
+    let path = root.join("build/xtask/driver-test-map.toml");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    parse_leaf_driver_map(&text)
+}
+
+/// Leaf-driver narrowing for the kernel-test filter. Returns `Some(tags)`
+/// when every non-ignorable changed file falls under a mapped leaf path:
+/// the union of the matched entries' tags plus `frame` (the composition
+/// tests that ride along on every narrowed run, as today). Returns `None`
+/// — fall through to the closure logic — when any non-ignorable file is
+/// not leaf-covered, or when a matched entry's tags match nothing in the
+/// scanned `universe` (a stale map entry must never under-select).
+/// `frame` is added only when the universe has `frame`-prefixed tags.
+fn leaf_driver_tags(
+    changed_files: &[String],
+    leaf_map: &LeafDriverMap,
+    universe: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut tags: BTreeSet<String> = BTreeSet::new();
+    for f in changed_files {
+        if is_ignorable_path(f) {
+            continue;
+        }
+        let entry = leaf_map.entry_for(f)?;
+        // Every mapped tag must select at least one real test; a tag
+        // that matches nothing means the map drifted from the tree.
+        let entry_tags: BTreeSet<String> = entry
+            .tags
+            .iter()
+            .filter(|t| {
+                universe
+                    .iter()
+                    .any(|u| u == *t || u.starts_with(&format!("{t}/")))
+            })
+            .cloned()
+            .collect();
+        if entry_tags.len() != entry.tags.len() {
+            return None;
+        }
+        tags.extend(entry_tags);
+    }
+    if tags.is_empty() {
+        return None;
+    }
+    if universe
+        .iter()
+        .any(|u| u == "frame" || u.starts_with("frame/"))
+    {
+        tags.insert("frame".to_string());
+    }
+    Some(tags)
+}
+
 /// The pure decision function. `tag_map` maps crate name → the kernel-test
 /// subsystem tags registered in that crate; `dir_tag_map` maps crate name
 /// → directory (relative to the crate dir) → the tags registered in that
 /// directory's subtree, used only for `DIR_NARROW_CRATES` narrowing.
+/// `leaf_map` is the parsed `driver-test-map.toml` (`Default` is the
+/// empty map, which disables leaf narrowing — that is what most tests
+/// pass); the real map is loaded by `affected_cmd`.
 pub fn plan(
     changed_files: &[String],
     crates: &[CrateInfo],
     tag_map: &BTreeMap<String, BTreeSet<String>>,
     dir_tag_map: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    leaf_map: &LeafDriverMap,
     event: &str,
     force_full: bool,
 ) -> Plan {
@@ -355,7 +515,11 @@ pub fn plan(
         p.reasons
             .push("forced (--force-full / ci-full label)".into());
     }
-    if matches!(event, "schedule" | "workflow_dispatch") {
+    // Pushes only happen on `main`, and the main oracle must always run
+    // the whole matrix — a push used to be diffed like a PR, so a
+    // driver-only merge ran a filtered suite and never proved the rest
+    // of the tree still passes on the tip.
+    if matches!(event, "schedule" | "workflow_dispatch" | "push") {
         p.full = true;
         p.reasons
             .push(format!("event `{event}` always runs the full matrix"));
@@ -372,6 +536,10 @@ pub fn plan(
     let mut seeds: BTreeSet<String> = BTreeSet::new();
     let mut embedded = false;
     let mut cargo_toml_touched = false;
+    // `push` is deliberately absent here: a push runs the full *test*
+    // matrix (see the event trigger above), but clippy still lints only
+    // the changed crates — linting all ~170 crates × 2 arches × 4
+    // feature contexts on every merge would stall the oracle.
     let mut lint_all =
         force_full || matches!(event, "schedule" | "workflow_dispatch") || changed_files.is_empty();
     for f in changed_files {
@@ -539,19 +707,32 @@ pub fn plan(
     // whole universe under a prefix to be selected, so a narrowed
     // filter can never silently broaden.
     if p.run_kernel_test {
+        let universe: BTreeSet<String> = tag_map.values().flatten().cloned().collect();
+        // Leaf-driver narrowing: a change confined to mapped driver
+        // directories runs only that driver's tests (+ frame). This
+        // replaces the closure expansion for the subsystem filter only;
+        // every other gate (boot-smoke, clippy, musl/net-smoke) still
+        // uses the closure, unchanged.
         let mut tags: BTreeSet<String> = BTreeSet::new();
-        for c in &closure {
-            if p.changed_crates.contains(c) {
-                if let Some(narrowed) = narrowed_tags(c, changed_files, crates, dir_tag_map) {
-                    tags.extend(narrowed);
-                    continue;
+        if let Some(leaf_tags) = leaf_driver_tags(changed_files, leaf_map, &universe) {
+            p.reasons.push(format!(
+                "leaf-driver change — kernel-test narrowed to {}",
+                leaf_tags.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+            tags = leaf_tags;
+        } else {
+            for c in &closure {
+                if p.changed_crates.contains(c) {
+                    if let Some(narrowed) = narrowed_tags(c, changed_files, crates, dir_tag_map) {
+                        tags.extend(narrowed);
+                        continue;
+                    }
+                }
+                if let Some(t) = tag_map.get(c) {
+                    tags.extend(t.iter().cloned());
                 }
             }
-            if let Some(t) = tag_map.get(c) {
-                tags.extend(t.iter().cloned());
-            }
         }
-        let universe = tag_map.values().flatten().cloned().collect();
         let collapsed = compact_tags(tags, &universe);
         let filter_bytes = collapsed.iter().map(|t| t.len() + 1).sum::<usize>();
         if filter_bytes > MAX_SUBSYSTEM_FILTER_BYTES {
@@ -933,8 +1114,20 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
         }
     };
 
-    let force_full = args.force_full || diff_failed || scan_failed;
-    let p = plan(&changed, &crates, &tag_map, &dir_map, &event, force_full);
+    // A map load failure is treated like a scan failure: force full
+    // rather than silently running with an empty (or partial) map.
+    let (leaf_map, map_failed) = match load_leaf_driver_map(root) {
+        Ok(map) => (map, false),
+        Err(e) => {
+            eprintln!("xtask affected: driver-test-map failed to load ({e:#}); using full matrix");
+            (LeafDriverMap::default(), true)
+        }
+    };
+
+    let force_full = args.force_full || diff_failed || scan_failed || map_failed;
+    let p = plan(
+        &changed, &crates, &tag_map, &dir_map, &leaf_map, &event, force_full,
+    );
 
     let github = args.github || matches!(args.format, OutputFormat::Github);
     if github {
@@ -1052,6 +1245,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1080,6 +1274,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1106,6 +1301,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1116,6 +1312,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1128,6 +1325,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             true,
         );
@@ -1151,6 +1349,7 @@ mod tests {
             &crates,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1166,6 +1365,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1185,6 +1385,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1207,6 +1408,7 @@ mod tests {
                 &cr,
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1222,6 +1424,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1232,6 +1435,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1241,17 +1445,255 @@ mod tests {
     }
 
     #[test]
-    fn push_event_uses_changed_crates() {
+    fn push_event_runs_full_matrix() {
+        // Pushes only happen on `main`, and the main oracle must always
+        // run the whole matrix (a push used to be diffed like a PR).
         let cr = fixture();
         let p = plan(
             &["filesystem/src/page_cache.rs".to_string()],
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "push",
             false,
         );
-        assert!(!p.full, "push-to-main diffs against the event before SHA");
+        assert!(p.full, "push-to-main always runs the full matrix");
+        assert_eq!(
+            p.clippy_crates,
+            BTreeSet::from(["narf-filesystem".to_string()]),
+            "push keeps changed-crates clippy — only the test matrix is full"
+        );
+    }
+
+    /// Fixture for leaf-driver tests, mirroring the real tree shape:
+    /// the family aggregator `narf-drivers-net` depends on the vendor
+    /// crates and registers the broad family tag set in its own `src/`,
+    /// so without leaf narrowing a one-file vendor change runs every
+    /// vendor's tags via the closure.
+    fn leaf_fixture() -> Vec<CrateInfo> {
+        vec![
+            ci("narf-lib", "lib", &[]),
+            ci("narf-net", "net", &["narf-lib"]),
+            ci("narf-drivers-net-igb", "drivers/net/igb", &["narf-net"]),
+            ci("narf-drivers-net-igc", "drivers/net/igc", &["narf-net"]),
+            ci(
+                "narf-drivers-net",
+                "drivers/net",
+                &["narf-net", "narf-drivers-net-igb", "narf-drivers-net-igc"],
+            ),
+            ci("narf-frame", "frame", &["narf-drivers-net"]),
+            ci("narf-verification", "verification", &["narf-drivers-net"]),
+        ]
+    }
+
+    fn leaf_tags() -> BTreeMap<String, BTreeSet<String>> {
+        let mut m = BTreeMap::new();
+        let mut igb = BTreeSet::new();
+        igb.insert("drivers/net/igb".to_string());
+        m.insert("narf-drivers-net-igb".to_string(), igb);
+        let mut igc = BTreeSet::new();
+        igc.insert("drivers/net/igc".to_string());
+        m.insert("narf-drivers-net-igc".to_string(), igc);
+        let mut family = BTreeSet::new();
+        family.insert("drivers/net/igb".to_string());
+        family.insert("drivers/net/igc".to_string());
+        family.insert("drivers/net/core".to_string());
+        m.insert("narf-drivers-net".to_string(), family);
+        let mut frame = BTreeSet::new();
+        frame.insert("frame".to_string());
+        frame.insert("frame/canary".to_string());
+        m.insert("narf-frame".to_string(), frame);
+        m
+    }
+
+    fn leaf_map() -> LeafDriverMap {
+        parse_leaf_driver_map(
+            "[[leaf]]\npath = \"drivers/net/igb\"\ntags = [\"drivers/net/igb\"]\n\
+             [[leaf]]\npath = \"drivers/net/igc\"\ntags = [\"drivers/net/igc\"]\n",
+        )
+        .expect("test map parses")
+    }
+
+    #[test]
+    fn leaf_single_driver_narrows_to_driver_plus_frame() {
+        let cr = leaf_fixture();
+        let changed = vec!["drivers/net/igb/src/igb.rs".to_string()];
+        // Without the map, the closure pulls in the family aggregator's
+        // broad tag set; `compact_tags` then collapses every selected
+        // `drivers/net/*` tag to `drivers` (the fixture universe holds
+        // nothing else under `drivers/`; in the real tree the collapse
+        // stops at the individual vendor tags).
+        let broad = plan(
+            &changed,
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &LeafDriverMap::default(),
+            "pull_request",
+            false,
+        );
+        assert_eq!(
+            broad.subsystems,
+            BTreeSet::from(["drivers".to_string(), "frame".to_string()])
+        );
+        // With the map, only the driver's tests (+ frame) run.
+        let p = plan(
+            &changed,
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &leaf_map(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(p.run_kernel_test && p.run_boot_smoke);
+        assert_eq!(
+            p.subsystems,
+            BTreeSet::from(["drivers/net/igb".to_string(), "frame".to_string()]),
+            "leaf change runs only the driver's tests plus frame"
+        );
+    }
+
+    #[test]
+    fn leaf_multi_driver_unions_tags() {
+        let cr = leaf_fixture();
+        let p = plan(
+            &[
+                "drivers/net/igb/src/igb.rs".to_string(),
+                "drivers/net/igc/src/igc.rs".to_string(),
+            ],
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &leaf_map(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert_eq!(
+            p.subsystems,
+            BTreeSet::from([
+                "drivers/net/igb".to_string(),
+                "drivers/net/igc".to_string(),
+                "frame".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn leaf_plus_shared_falls_through_to_closure() {
+        let cr = leaf_fixture();
+        let p = plan(
+            &[
+                "drivers/net/igb/src/igb.rs".to_string(),
+                "drivers/net/src/rx.rs".to_string(),
+            ],
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &leaf_map(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(
+            p.subsystems.contains("drivers"),
+            "unmapped shared file disables leaf narrowing"
+        );
+    }
+
+    #[test]
+    fn leaf_plus_infra_is_full() {
+        let cr = leaf_fixture();
+        let p = plan(
+            &[
+                "drivers/net/igb/src/igb.rs".to_string(),
+                ".github/workflows/ci.yml".to_string(),
+            ],
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &leaf_map(),
+            "pull_request",
+            false,
+        );
+        assert!(p.full, "infra path forces full even on a leaf change");
+    }
+
+    #[test]
+    fn leaf_stale_entry_falls_through_to_closure() {
+        let cr = leaf_fixture();
+        let stale = parse_leaf_driver_map(
+            "[[leaf]]\npath = \"drivers/net/igb\"\n\
+             tags = [\"drivers/net/igb\", \"drivers/net/nonexistent\"]\n",
+        )
+        .expect("stale map still parses");
+        let p = plan(
+            &["drivers/net/igb/src/igb.rs".to_string()],
+            &cr,
+            &leaf_tags(),
+            &BTreeMap::new(),
+            &stale,
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(
+            p.subsystems.contains("drivers"),
+            "a tag matching no real test must never under-select"
+        );
+    }
+
+    #[test]
+    fn leaf_map_parse_rejects_bad_entries() {
+        assert!(parse_leaf_driver_map(
+            "[[leaf]]\npath = \"drivers/net/igb\"\ntags = [\"drivers/net/igb\"]\n\
+             [[leaf]]\npath = \"drivers/net/igb\"\ntags = [\"drivers/net/igb\"]\n"
+        )
+        .is_err());
+        assert!(parse_leaf_driver_map(
+            "[[leaf]]\npath = \"../net/igb\"\ntags = [\"drivers/net/igb\"]\n"
+        )
+        .is_err());
+        assert!(
+            parse_leaf_driver_map("[[leaf]]\npath = \"drivers/net/igb\"\ntags = []\n").is_err()
+        );
+        assert!(parse_leaf_driver_map(
+            "[[leaf]]\npath = \"drivers/net/igb\"\ntags = [\"drivers/net/igb!\"]\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shipped_driver_test_map_loads_and_matches_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let map = load_leaf_driver_map(&root).expect("driver-test-map.toml loads");
+        // Update this count when extending the map.
+        assert_eq!(map.entries.len(), 22);
+        let igb = map
+            .entries
+            .iter()
+            .find(|e| e.path == "drivers/net/igb")
+            .expect("igb entry present");
+        assert_eq!(igb.tags, BTreeSet::from(["drivers/net/igb".to_string()]));
+        let mt76 = map
+            .entries
+            .iter()
+            .find(|e| e.path == "drivers/wireless/mt76")
+            .expect("mt76 entry present");
+        assert_eq!(
+            mt76.tags,
+            BTreeSet::from(["drivers/wireless/mt7921".to_string()])
+        );
+        for e in &map.entries {
+            assert!(
+                root.join(&e.path).is_dir(),
+                "leaf path {} must exist in the tree",
+                e.path
+            );
+        }
     }
 
     #[test]
@@ -1262,6 +1704,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1277,6 +1720,7 @@ mod tests {
             &cr,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1300,6 +1744,7 @@ mod tests {
             &cr,
             &tm,
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1342,6 +1787,7 @@ mod tests {
                 &fixture(),
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1358,6 +1804,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1369,6 +1816,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1385,6 +1833,7 @@ mod tests {
                 &fixture(),
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1402,6 +1851,7 @@ mod tests {
                 &fixture(),
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 event,
                 false,
             );
@@ -1420,6 +1870,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1429,6 +1880,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             true,
         );
@@ -1447,6 +1899,7 @@ mod tests {
                 &fixture(),
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1466,6 +1919,7 @@ mod tests {
             &crates,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1482,6 +1936,7 @@ mod tests {
                 &fixture(),
                 &tags(),
                 &BTreeMap::new(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1492,6 +1947,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1509,6 +1965,7 @@ mod tests {
             &crates,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1520,6 +1977,7 @@ mod tests {
             &crates,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1529,6 +1987,7 @@ mod tests {
             &crates,
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1571,6 +2030,7 @@ mod tests {
             &cr,
             &tm,
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1604,6 +2064,7 @@ mod tests {
             &fixture(),
             &tags(),
             &BTreeMap::new(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1707,6 +2168,7 @@ mod tests {
             &cr,
             &wireless_tags(),
             &wireless_dir_tags(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1728,6 +2190,7 @@ mod tests {
             &cr,
             &wireless_tags(),
             &wireless_dir_tags(),
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );
@@ -1750,6 +2213,7 @@ mod tests {
                 &cr,
                 &wireless_tags(),
                 &wireless_dir_tags(),
+                &LeafDriverMap::default(),
                 "pull_request",
                 false,
             );
@@ -1776,6 +2240,7 @@ mod tests {
             &cr,
             &tags(),
             &dirs,
+            &LeafDriverMap::default(),
             "pull_request",
             false,
         );

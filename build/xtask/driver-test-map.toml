@@ -1,0 +1,134 @@
+# Leaf-driver test map for `cargo xtask affected`.
+#
+# When EVERY non-ignorable changed file falls under a mapped leaf path,
+# the kernel-test filter narrows to just that driver's tests (plus the
+# `frame` composition tests) instead of expanding through the
+# reverse-dependency closure — which otherwise pulls in every sibling
+# driver via the family aggregator crate (a one-file `drivers/net/igb`
+# change used to run all 26 net subsystems; with this map it runs
+# `drivers/net/igb` + `frame` only).
+#
+# Each entry is a repo-relative directory prefix → the kernel-test
+# subsystem tags that name that driver. Tags are matched as `/`-boundary
+# prefixes at runtime, so a tag selects the driver's tests wherever they
+# were registered (several vendor tags also appear in the shared family
+# crate, e.g. `drivers/net/src` registers `drivers/net/igc` tests).
+# A path whose tags do not match the scanned tag universe disqualifies
+# the leaf rule for that change (fall through to the closure logic),
+# and `cargo xtask host-test` fails if any entry is stale — so keep this
+# file in sync with the tree; do not invent entries.
+#
+# Deliberately NOT mapped (fall through to the closure logic):
+# - `drivers/gpu`, `drivers/usb`: flat `src/` layouts whose tags do not
+#   mirror directories; they need a filename-prefix map or a crate split.
+# - `drivers/net/src`, `drivers/wireless/src`: shared family crates,
+#   except their per-driver subdirs mapped below.
+# - Vendor dirs with no registered tests (`bnxt`, `cxgb4`, `enic`,
+#   `rtl8139`, `ath-core`, `rtl-usb`): nothing to select; a change there
+#   runs the closure set, as today.
+#
+# To extend: add a `[[leaf]]` entry with the tags from a
+# `kernel_test_in!` census of the driver (see the `host-test` failure
+# message if a tag is mistyped).
+
+# Wired Ethernet vendors (each a nested crate under drivers/net/).
+[[leaf]]
+path = "drivers/net/igb"
+tags = ["drivers/net/igb"]
+
+[[leaf]]
+path = "drivers/net/igc"
+tags = ["drivers/net/igc"]
+
+[[leaf]]
+path = "drivers/net/ixgbe"
+tags = ["drivers/net/ixgbe"]
+
+[[leaf]]
+path = "drivers/net/e1000"
+tags = ["drivers/net/e1000"]
+
+[[leaf]]
+path = "drivers/net/tg3"
+tags = ["drivers/net/tg3"]
+
+[[leaf]]
+path = "drivers/net/mlx5"
+tags = ["drivers/net/mlx5"]
+
+[[leaf]]
+path = "drivers/net/i40e"
+tags = ["drivers/net/i40e"]
+
+[[leaf]]
+path = "drivers/net/forcedeth"
+tags = ["drivers/net/forcedeth"]
+
+[[leaf]]
+path = "drivers/net/vmxnet3"
+tags = ["drivers/net/vmxnet3"]
+
+# The aqc1xx directory registers its tests as drivers/net/aqc113.
+[[leaf]]
+path = "drivers/net/aqc1xx"
+tags = ["drivers/net/aqc113"]
+
+[[leaf]]
+path = "drivers/net/atheros"
+tags = ["drivers/net/atheros"]
+
+# Realtek is one directory holding several chips/PHY blocks.
+[[leaf]]
+path = "drivers/net/realtek"
+tags = [
+    "drivers/net/rtl8127",
+    "drivers/net/rtl8125",
+    "drivers/net/rtl8126",
+    "drivers/net/r8169",
+    "drivers/net/realtek-features",
+    "drivers/net/realtek-phy-access",
+]
+
+# Wi-Fi families (each a nested crate under drivers/wireless/).
+# The mt76 crate registers its tests under the chip-family tag mt7921.
+[[leaf]]
+path = "drivers/wireless/mt76"
+tags = ["drivers/wireless/mt7921"]
+
+[[leaf]]
+path = "drivers/wireless/ath10k"
+tags = ["drivers/wireless/ath10k"]
+
+# iwlwifi also has net-side tests in drivers/net/src/iwlwifi/.
+[[leaf]]
+path = "drivers/wireless/iwlwifi"
+tags = ["drivers/wireless/iwlwifi", "drivers/net/iwlwifi"]
+
+[[leaf]]
+path = "drivers/wireless/rtw"
+tags = ["drivers/wireless/rtw89", "drivers/wireless/rtw88"]
+
+# Per-driver subdirs of the shared drivers/wireless crate.
+[[leaf]]
+path = "drivers/wireless/src/ath11k"
+tags = ["drivers/wireless/ath11k"]
+
+[[leaf]]
+path = "drivers/wireless/src/ath9k"
+tags = ["drivers/wireless/ath9k"]
+
+[[leaf]]
+path = "drivers/wireless/src/brcmfmac"
+tags = ["drivers/wireless/brcmfmac"]
+
+[[leaf]]
+path = "drivers/wireless/src/cyw43439"
+tags = ["drivers/wireless/cyw43439"]
+
+[[leaf]]
+path = "drivers/wireless/src/rtl8xxxu"
+tags = ["drivers/wireless/rtl8xxxu"]
+
+[[leaf]]
+path = "drivers/wireless/src/rtlwifi"
+tags = ["drivers/wireless/rtlwifi"]
