@@ -4180,8 +4180,9 @@ mod tests {
         // peer, channels 0x07, filter 0x00. Data: flags [0x02,
         // 0x01, 0x00] (discoverable off, BR/EDR on) + complete
         // name "narf-mgmt"; scan response empty; enable [0x01].
+        // Significant length: flags AD (3) + name AD (2 + 9) = 14.
         let mut adv_params = [0u8; 32];
-        adv_params[0] = 15;
+        adv_params[0] = 14;
         adv_params[1..4].copy_from_slice(&[0x02, 0x01, 0x00]);
         adv_params[4] = 0x0A;
         adv_params[5] = 0x09;
