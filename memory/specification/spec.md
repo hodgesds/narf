@@ -1396,7 +1396,32 @@ pub fn tlb_shootdown::shootdown(req: ShootdownRequest);
 /// `shootdown` for the address space rooted at `owner_root`. A tag-0 request
 /// targets only CPUs whose live or announced CR3 root is the owner (while the
 /// entry assembly cannot restore a tag-0 root outside `activate`).
+/// A process-tag request with a known owner interrupts exactly the CPUs whose
+/// live or announced root is the owner (Linux `should_flush_tlb`:
+/// `loaded_mm == mm`) and charges every other resident CPU a flush debt on
+/// the tag's bucket, paid by its next `begin_context_load` of that bucket
+/// (Linux `tlb_gen` catch-up). Sender: store debt, then read LOADING then
+/// CURRENT root; loader: store LOADING, then read debt (all SeqCst).
 pub fn tlb_shootdown::shootdown_owned(owner_root: u64, req: ShootdownRequest);
+/// `shootdown_owned` for a flush that retires detached page tables (Linux
+/// `mmu_gather.freed_tables`): an idle CPU still holding the owner's root is
+/// interrupted instead of deferred, since it may walk the tables speculatively
+/// while servicing interrupts.
+pub fn tlb_shootdown::shootdown_owned_freeing_tables(owner_root: u64, req: ShootdownRequest);
+/// Kernel-range unmap (Linux `vunmap_range` + one `flush_tlb_kernel_range`):
+/// clear up to 32 leaves per `pt_lock` hold, invalidate once on every online
+/// CPU, then release each frame. aarch64 loops `unmap_4kb` (TLBI ...IS).
+pub unsafe fn x86_64::paging::unmap_kernel_pages(root: PhysAddr, base: VirtAddr, pages: u64,
+                                                 release: &mut dyn FnMut(PhysAddr)) -> u64;
+pub unsafe fn aarch64::paging::unmap_kernel_pages(/* same */) -> u64;
+/// With CR4.PCIDE set, drop every non-global translation and every PCID's
+/// paging-structure caches on this CPU (INVPCID type 3, else a CR4.PGE
+/// toggle). Runtime kernel mappings are non-global and cached under every
+/// PCID a CPU ran; INVLPG reaches only the current one (Intel SDM Vol. 3A
+/// §4.10.4.1), so every kernel-range invalidation (`invlpg_global*`,
+/// `unmap_kernel_pages`, `free_empty_pt`, and the untagged remote handler)
+/// runs this after its INVLPGs.
+pub unsafe fn x86_64::paging::flush_nonglobal_all_pcids_local();
 pub fn tlb_shootdown::shootdown_remote(req: ShootdownRequest);
 pub fn tlb_shootdown::shootdown_remote_full_for_tag(tag: u16);
 /// Residency is published before a context load and cleared only after a

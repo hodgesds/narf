@@ -428,7 +428,9 @@ fn running_root_mask(
         scan &= scan - 1;
         let running = match (current.get(cpu), loading.get(cpu)) {
             (Some(c), Some(l)) => {
-                c.load(Ordering::SeqCst) == root || l.load(Ordering::SeqCst) == root
+                // LOADING first: a loader stores CURRENT before clearing LOADING,
+                // so reading in this order cannot miss a completed load.
+                l.load(Ordering::SeqCst) == root || c.load(Ordering::SeqCst) == root
             }
             // Outside the tracked range: stay conservative.
             _ => true,
@@ -476,6 +478,52 @@ fn split_current_targets(
         }
         stale[cpu].fetch_or(bit, Ordering::SeqCst);
         if current[cpu].load(Ordering::SeqCst) & bit != 0 {
+            ipi |= 1u64 << cpu;
+        } else {
+            deferred |= 1u64 << cpu;
+        }
+    }
+    (ipi, deferred)
+}
+
+/// Sender half keyed by the owning root: split resident `candidates` into CPUs
+/// whose CR3 holds or is about to hold `root` (interrupt now) and CPUs that
+/// only cached the root's PCID (charge `bit`'s bucket a flush on their next
+/// load of it). The loader's half is unchanged: [`begin_context_load`] stores
+/// `LOADING_ROOT` and then reads `STALE_BUCKETS`; this stores `STALE_BUCKETS`
+/// and then reads both root cells, all SeqCst, so a racing load either pays
+/// the debt before its CR3 write or is interrupted. Possibly both; never
+/// neither. Linux: `should_flush_tlb` plus the `tlb_gen` catch-up in
+/// `switch_mm_irqs_off`.
+fn split_running_root_targets(
+    candidates: u64,
+    bit: u64,
+    root: u64,
+    current: &[AtomicU64],
+    loading: &[AtomicU64],
+    stale: &[AtomicU64],
+) -> (u64, u64) {
+    let mut ipi = 0u64;
+    let mut deferred = 0u64;
+    let mut scan = candidates;
+    while scan != 0 {
+        let cpu = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        let running = |cpu: usize| match (current.get(cpu), loading.get(cpu)) {
+            (Some(c), Some(l)) => {
+                // LOADING before CURRENT: `finish_context_load` stores CURRENT
+                // before clearing LOADING, so a load that completes between the
+                // two reads is still seen.
+                l.load(Ordering::SeqCst) == root || c.load(Ordering::SeqCst) == root
+            }
+            _ => true,
+        };
+        if cpu >= stale.len() || running(cpu) {
+            ipi |= 1u64 << cpu;
+            continue;
+        }
+        stale[cpu].fetch_or(bit, Ordering::SeqCst);
+        if running(cpu) {
             ipi |= 1u64 << cpu;
         } else {
             deferred |= 1u64 << cpu;
@@ -588,21 +636,43 @@ pub fn shootdown(req: ShootdownRequest) {
         .shootdown_count
         .fetch_add(1, Ordering::Relaxed);
 
-    dispatch_remote(req, req, None);
+    dispatch_remote(req, req, None, false);
     #[cfg(any(test, feature = "kernel-test"))]
     notify_completion_for_test(req);
 }
 
 /// [`shootdown`] for an invalidation of the address space whose page-table
-/// root is `owner_root`. A tag-0 request then targets only CPUs running that
-/// root (see the tag-0 notes above); other tags behave as `shootdown`.
+/// root is `owner_root` — Linux `flush_tlb_mm_range`. Only CPUs whose CR3
+/// holds (or is about to hold) that root are interrupted (Linux
+/// `should_flush_tlb`: `loaded_mm == info->mm`); a CPU that merely cached
+/// the root's PCID earlier is charged a flush on its next load of it, and an
+/// idle CPU flushes before it next dispatches (see the lazy-residency notes).
 pub fn shootdown_owned(owner_root: u64, req: ShootdownRequest) {
     apply_local(req);
     local_stats()
         .shootdown_count
         .fetch_add(1, Ordering::Relaxed);
 
-    dispatch_remote(req, req, Some(owner_root));
+    dispatch_remote(req, req, Some(owner_root), false);
+    #[cfg(any(test, feature = "kernel-test"))]
+    notify_completion_for_test(req);
+}
+
+/// [`shootdown_owned`] for an invalidation that also retires page-table pages
+/// the caller detached and is about to free (Linux `mmu_gather` with
+/// `freed_tables`). A CPU idling with `owner_root` still in CR3 may walk those
+/// tables speculatively while it services interrupts, so it is interrupted
+/// rather than deferred, exactly as Linux sends `freed_tables` flushes to lazy
+/// CPUs (`native_flush_tlb_multi`). CPUs that do not hold the root keep their
+/// deferred flush: they cannot walk it before their next load of it, which
+/// pays the debt first.
+pub fn shootdown_owned_freeing_tables(owner_root: u64, req: ShootdownRequest) {
+    apply_local(req);
+    local_stats()
+        .shootdown_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    dispatch_remote(req, req, Some(owner_root), true);
     #[cfg(any(test, feature = "kernel-test"))]
     notify_completion_for_test(req);
 }
@@ -648,7 +718,7 @@ pub fn shootdown_remote(req: ShootdownRequest) {
     local_stats()
         .shootdown_count
         .fetch_add(1, Ordering::Relaxed);
-    dispatch_remote(req, req, None);
+    dispatch_remote(req, req, None, false);
 }
 
 /// Remotely flush every non-global entry, but target only CPUs that may hold
@@ -662,6 +732,7 @@ pub fn shootdown_remote_full_for_tag(residency_tag: u16) {
         ShootdownRequest::full(),
         ShootdownRequest::for_tag(residency_tag),
         None,
+        false,
     );
 }
 
@@ -669,6 +740,7 @@ fn dispatch_remote(
     payload: ShootdownRequest,
     residency: ShootdownRequest,
     owner_root: Option<u64>,
+    freed_tables: bool,
 ) {
     // Pair the page-table writer's stores with a CPU's pre-context-load
     // residency publication. Without this StoreLoad barrier, both sides
@@ -698,17 +770,48 @@ fn dispatch_remote(
             .fetch_add(budget, Ordering::Relaxed);
     }
 
-    let candidates = residency_target_mask(residency);
+    // Domain tags (1..=N_DOMAINS) are also loaded by the trap/syscall entry
+    // assembly, which publishes no residency and runs on an idle CPU's
+    // interrupts before `mark_busy`: every online peer may hold them now.
+    let domain_tag = matches!(
+        residency.tag,
+        Some(tag) if tag != crate::asid_alloc::TAG_RESERVED && !deferrable_tag(tag)
+    );
+    let candidates = if domain_tag {
+        narf_lib::smp::online_bitmap() & !(1u64 << (narf_lib::percpu::current_cpu() & 63))
+    } else {
+        residency_target_mask(residency)
+    };
     // Owner-root targeting is an x86 tag-0 refinement; aarch64 tagged TLBI
     // returned above and its untagged requests stay broadcast.
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = owner_root;
+    let _ = (owner_root, freed_tables);
     #[cfg(target_arch = "x86_64")]
     let candidates = match (residency.tag, owner_root) {
         (Some(crate::asid_alloc::TAG_RESERVED), Some(root))
             if root != 0 && tag0_roots_tracked() =>
         {
             running_root_mask(candidates, root, &CURRENT_ROOT, &LOADING_ROOT)
+        }
+        // The owner is known: interrupt exactly the CPUs running its root
+        // (Linux `mm_cpumask` ∩ `loaded_mm`), defer the rest of its PCID's
+        // residency. Bucket matching below would also interrupt every CPU
+        // running an unrelated address space whose tag shares the bucket.
+        (Some(tag), Some(root)) if root != 0 && deferrable_tag(tag) => {
+            let (ipi, deferred) = split_running_root_targets(
+                candidates,
+                1u64 << pcid_bucket(tag),
+                root,
+                &CURRENT_ROOT,
+                &LOADING_ROOT,
+                &STALE_BUCKETS,
+            );
+            if deferred != 0 {
+                local_stats()
+                    .stale_deferred
+                    .fetch_add(deferred.count_ones() as u64, Ordering::Relaxed);
+            }
+            ipi
         }
         (Some(tag), _) if deferrable_tag(tag) => {
             let (ipi, deferred) = split_current_targets(
@@ -726,8 +829,22 @@ fn dispatch_remote(
         }
         _ => candidates,
     };
+    // Idle CPUs flush before their next dispatch instead — unless page tables
+    // are being freed and the CPU still holds the owner's root, which it may
+    // walk speculatively while idle (`shootdown_owned_freeing_tables`).
     #[cfg(target_arch = "x86_64")]
-    let targets = defer_idle_targets(candidates, &IDLE_MASK, &DEFERRED_FULL_FLUSH);
+    let targets = match owner_root {
+        _ if domain_tag => candidates,
+        Some(root) if freed_tables && root != 0 => freed_tables_targets(
+            candidates,
+            root,
+            &CURRENT_ROOT,
+            &LOADING_ROOT,
+            &IDLE_MASK,
+            &DEFERRED_FULL_FLUSH,
+        ),
+        _ => defer_idle_targets(candidates, &IDLE_MASK, &DEFERRED_FULL_FLUSH),
+    };
     #[cfg(not(target_arch = "x86_64"))]
     let targets = candidates;
     if targets == 0 {
@@ -755,6 +872,21 @@ fn defer_idle_targets(candidates: u64, idle: &AtomicU64, deferred: &AtomicU64) -
         deferred.fetch_or(debt, Ordering::SeqCst);
     }
     candidates & !idle.load(Ordering::SeqCst)
+}
+
+/// Idle deferral when page tables are being freed: an idle candidate whose
+/// CR3 holds (or is about to hold) `root` is interrupted, the rest defer.
+#[cfg(target_arch = "x86_64")]
+fn freed_tables_targets(
+    candidates: u64,
+    root: u64,
+    current: &[AtomicU64],
+    loading: &[AtomicU64],
+    idle: &AtomicU64,
+    deferred: &AtomicU64,
+) -> u64 {
+    let kept = candidates & running_root_mask(candidates, root, current, loading);
+    defer_idle_targets(candidates & !kept, idle, deferred) | kept
 }
 
 #[inline]
@@ -1205,4 +1337,131 @@ fn smoke_tlb_tag0_targets_cpus_running_the_root() -> TestResult {
 kernel_test_in!(
     "memory/tlb_shootdown",
     smoke_tlb_tag0_targets_cpus_running_the_root
+);
+
+/// Owner-root targeting (Linux `should_flush_tlb`: `loaded_mm == mm`): only a
+/// CPU whose CR3 holds or is loading the root is interrupted; a CPU that only
+/// cached its PCID is charged a flush instead, whatever else shares the bucket.
+#[cfg(target_arch = "x86_64")]
+fn smoke_tlb_owner_root_targets_running_cpus_only() -> TestResult {
+    const ROOT: u64 = 0x4444_0000;
+    const OTHER: u64 = 0x5555_0000;
+    let bit = 1u64 << pcid_bucket(0x140);
+    // CPU0 runs ROOT; CPU1 runs OTHER (same bucket: a collision); CPU2 is
+    // mid-load of ROOT; CPU3 finished loading ROOT (CURRENT set, LOADING 0).
+    let current = [
+        AtomicU64::new(ROOT),
+        AtomicU64::new(OTHER),
+        AtomicU64::new(OTHER),
+        AtomicU64::new(ROOT),
+    ];
+    let loading = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(ROOT),
+        AtomicU64::new(0),
+    ];
+    let stale = [const { AtomicU64::new(0) }; 4];
+    let (ipi, deferred) = split_running_root_targets(0b1111, bit, ROOT, &current, &loading, &stale);
+    if ipi != 0b1101 || deferred != 0b0010 {
+        return TestResult::Fail(
+            "owner targeting did not interrupt exactly the CPUs holding the root",
+        );
+    }
+    if stale[1].load(Ordering::Acquire) != bit || stale[0].load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("the bucket-colliding CPU was not charged the deferred flush");
+    }
+    // Switch back: CPU1 loads ROOT later and must pay the debt before CR3.
+    let cur_buckets = AtomicU64::new(0);
+    if !claim_stale_on_load(bit, &cur_buckets, &stale[1]) {
+        return TestResult::Fail("switching back to the root skipped its deferred flush");
+    }
+    // A CPU outside the tracked arrays stays a target.
+    let (ipi, _) = split_running_root_targets(1u64 << 9, bit, ROOT, &current, &loading, &stale);
+    if ipi != 1u64 << 9 {
+        return TestResult::Fail("an untracked CPU was dropped from the targets");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_owner_root_targets_running_cpus_only
+);
+
+/// The Dekker pair between a sender and a CPU loading the root, in every
+/// order the two halves can interleave: the loader either sees the debt
+/// before its CR3 write or the sender interrupts it. Never neither.
+#[cfg(target_arch = "x86_64")]
+fn smoke_tlb_owner_root_racing_load_never_missed() -> TestResult {
+    const ROOT: u64 = 0x7777_0000;
+    const OLD: u64 = 0x8888_0000;
+    let bit = 1u64 << pcid_bucket(0x155);
+    // Loader steps: 0 announce LOADING, 1 claim debt, 2 publish CURRENT,
+    // 3 clear LOADING. The sender's whole split runs before step `at`.
+    for at in 0..=4 {
+        let current = [AtomicU64::new(OLD)];
+        let loading = [AtomicU64::new(0)];
+        let stale = [AtomicU64::new(0)];
+        let buckets = AtomicU64::new(0);
+        let mut claimed = false;
+        let mut interrupted = false;
+        for step in 0..=4 {
+            if step == at {
+                let (ipi, _) =
+                    split_running_root_targets(0b1, bit, ROOT, &current, &loading, &stale);
+                interrupted = ipi != 0;
+            }
+            match step {
+                0 => loading[0].store(ROOT, Ordering::SeqCst),
+                1 => claimed = claim_stale_on_load(bit, &buckets, &stale[0]),
+                2 => current[0].store(ROOT, Ordering::SeqCst),
+                3 => loading[0].store(0, Ordering::SeqCst),
+                _ => {}
+            }
+        }
+        // After the announcement (at >= 1) the CPU holds or is loading the
+        // root: it must be interrupted. Before it, the claim pays the debt.
+        if !(claimed || interrupted) || (at >= 1 && !interrupted) {
+            return TestResult::Fail("a sender and a racing loader both missed each other");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_owner_root_racing_load_never_missed
+);
+
+/// Linux `freed_tables`: while page tables are freed, an idle CPU still
+/// holding the root is interrupted (it may walk them speculatively while
+/// servicing interrupts); an idle CPU on another root defers as usual.
+#[cfg(target_arch = "x86_64")]
+fn smoke_tlb_freed_tables_interrupt_idle_holder() -> TestResult {
+    const ROOT: u64 = 0x9999_0000;
+    let current = [AtomicU64::new(ROOT), AtomicU64::new(0x1234_0000)];
+    let loading = [AtomicU64::new(0), AtomicU64::new(0)];
+    let idle = AtomicU64::new(0b11);
+    let deferred = AtomicU64::new(0);
+    let targets = freed_tables_targets(0b11, ROOT, &current, &loading, &idle, &deferred);
+    if targets != 0b01 {
+        return TestResult::Fail(
+            "freed tables did not interrupt exactly the idle CPU holding the root",
+        );
+    }
+    if deferred.load(Ordering::Acquire) != 0b10 {
+        return TestResult::Fail("the idle CPU on another root did not keep its deferred flush");
+    }
+    // Without freed tables both idle CPUs defer.
+    let deferred = AtomicU64::new(0);
+    if defer_idle_targets(0b11, &idle, &deferred) != 0 || deferred.load(Ordering::Acquire) != 0b11 {
+        return TestResult::Fail("idle CPUs were interrupted for an ordinary flush");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_freed_tables_interrupt_idle_holder
 );
