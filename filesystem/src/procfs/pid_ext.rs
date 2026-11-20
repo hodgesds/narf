@@ -138,6 +138,45 @@ impl FileOps for PidExtFile {
         ready
     }
 
+    /// `mounts_poll`: `poll_wait(file, &ns->poll, wait)` then the generation
+    /// compare. Every other field's readiness is constant, so it is answered
+    /// without queueing anything.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        if matches!(self.field, PidExtField::Mountinfo) {
+            return Some(crate::MOUNTINFO_WAIT.arm(id, interest, waker, || self.poll_readiness()));
+        }
+        Some(match self.poll_readiness() & interest {
+            0 => core::task::Poll::Pending,
+            ready => core::task::Poll::Ready(ready),
+        })
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        if matches!(self.field, PidExtField::Mountinfo) {
+            return Some(
+                crate::MOUNTINFO_WAIT.arm_persistent(id, interest, waker, || self.poll_readiness()),
+            );
+        }
+        Some(self.poll_readiness() & interest)
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        if matches!(self.field, PidExtField::Mountinfo) {
+            crate::MOUNTINFO_WAIT.disarm(id);
+        }
+        true
+    }
+
     fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
         if matches!(self.field, PidExtField::Mountinfo)
             && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0

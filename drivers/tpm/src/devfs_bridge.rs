@@ -166,12 +166,16 @@ impl TpmDevState {
 #[derive(Debug)]
 pub struct DevTpm0 {
     state: IrqSafeSpinLock<TpmDevState>,
+    /// `tpm_common_poll`'s wait queue: `POLL_IN` while a response is
+    /// pending, `POLL_OUT` always. Kept in step with `state` under its lock.
+    readiness: narf_lib::readiness::Readiness,
 }
 
 impl DevTpm0 {
     pub fn new() -> Self {
         Self {
             state: IrqSafeSpinLock::new(TpmDevState::new()),
+            readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
         }
     }
 }
@@ -241,6 +245,7 @@ impl FileOps for DevTpm0 {
                 let mut st = self.state.lock();
                 st.response = resp;
                 st.response_read = false;
+                self.readiness.set(POLL_IN, 0);
                 Box::pin(async move { Ok(len) })
             }
             Err(()) => Box::pin(async move { Err(FsError::Io(BlockError::IOError)) }),
@@ -265,6 +270,7 @@ impl FileOps for DevTpm0 {
         if off >= st.response.len() {
             st.response_read = true;
             st.response.clear();
+            self.readiness.set(0, POLL_IN);
             return Box::pin(async move { Ok(0) });
         }
         let src = &st.response[off..];
@@ -274,6 +280,7 @@ impl FileOps for DevTpm0 {
         if off + n >= st.response.len() {
             st.response_read = true;
             st.response.clear();
+            self.readiness.set(0, POLL_IN);
         }
         Box::pin(async move { Ok(n) })
     }
@@ -294,6 +301,10 @@ impl FileOps for DevTpm0 {
     /// dev_t = (major<<8)|minor. Linux: `drivers/char/tpm` TPM_MINOR = 224.
     fn rdev(&self) -> u64 {
         (10u64 << 8) | 224
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
     }
 
     /// `POLL_IN` when a response is pending; `POLL_OUT` always.
@@ -323,6 +334,9 @@ impl FileOps for DevTpm0 {
 #[derive(Debug)]
 pub struct DevTpmRm0 {
     state: IrqSafeSpinLock<TpmDevState>,
+    /// `tpm_common_poll`'s wait queue: `POLL_IN` while a response is
+    /// pending, `POLL_OUT` always. Kept in step with `state` under its lock.
+    readiness: narf_lib::readiness::Readiness,
     /// Transient handles allocated during this open fd's lifetime.
     /// Flushed on drop (close). Linux tpm2-space.c tracks these in
     /// `tpm_space.context_tbl` (line 25).
@@ -333,6 +347,7 @@ impl DevTpmRm0 {
     pub fn new() -> Self {
         Self {
             state: IrqSafeSpinLock::new(TpmDevState::new()),
+            readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
             transient_handles: IrqSafeSpinLock::new(Vec::new()),
         }
     }
@@ -456,6 +471,7 @@ impl FileOps for DevTpmRm0 {
                 let mut st = self.state.lock();
                 st.response = resp;
                 st.response_read = false;
+                self.readiness.set(POLL_IN, 0);
                 Box::pin(async move { Ok(len) })
             }
             Err(()) => Box::pin(async move { Err(FsError::Io(BlockError::IOError)) }),
@@ -471,6 +487,7 @@ impl FileOps for DevTpmRm0 {
         if off >= st.response.len() {
             st.response_read = true;
             st.response.clear();
+            self.readiness.set(0, POLL_IN);
             return Box::pin(async move { Ok(0) });
         }
         let src = &st.response[off..];
@@ -479,6 +496,7 @@ impl FileOps for DevTpmRm0 {
         if off + n >= st.response.len() {
             st.response_read = true;
             st.response.clear();
+            self.readiness.set(0, POLL_IN);
         }
         Box::pin(async move { Ok(n) })
     }
@@ -499,6 +517,10 @@ impl FileOps for DevTpmRm0 {
     /// dev_t = (major<<8)|minor. Linux: TPMRM_MINOR = 225.
     fn rdev(&self) -> u64 {
         (10u64 << 8) | 225
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
     }
 
     fn poll_readiness(&self) -> u32 {

@@ -14276,6 +14276,10 @@ pub fn wait_init() {
         core::sync::atomic::AtomicBool::new(false);
     if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         narf_scheduler::sleep_pumps::register(sysrq_pump);
+        // `wake_up_klogd`'s irq_work: a printk can commit a record from any
+        // context, so the `/dev/kmsg` poller wake runs from the executor's
+        // pump (idle, or at least every ~1 ms when busy).
+        narf_scheduler::sleep_pumps::register(narf_console::klog::flush_kmsg_wakeups);
     }
     // The orderly power-off (power button with no logind, thermal trip)
     // runs `kernel.poweroff_cmd` through this usermode helper, as Linux

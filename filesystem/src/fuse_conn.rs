@@ -106,6 +106,10 @@ pub struct FuseConnection {
     connection_id: u64,
     sysfs_registered: AtomicBool,
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    /// `fuse_iqueue::waitq`: the daemon's `/dev/fuse` pollers and blocking
+    /// readers sleep here; every enqueue onto `pending` and the disconnect
+    /// wake it after the queue change is visible.
+    request_wait: narf_lib::readiness::WaitQueue,
     background_deferred: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     background_active: IrqSafeSpinLock<BTreeSet<u64>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, FuseReplySlot>>,
@@ -159,6 +163,7 @@ impl FuseConnection {
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             sysfs_registered: AtomicBool::new(false),
             pending: IrqSafeSpinLock::new(VecDeque::new()),
+            request_wait: narf_lib::readiness::WaitQueue::new(),
             background_deferred: IrqSafeSpinLock::new(VecDeque::new()),
             background_active: IrqSafeSpinLock::new(BTreeSet::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -406,6 +411,10 @@ impl FuseConnection {
         self.delivered.lock().clear();
         self.background_deferred.lock().clear();
         self.background_active.lock().clear();
+        // `fuse_abort_conn` → `wake_up_all(&fiq->waitq)`: a poller learns of
+        // the disconnect from its recomputed readiness.
+        self.request_wait
+            .wake(POLL_IN | POLL_OUT | crate::POLL_ERR | crate::POLL_HUP);
     }
 
     fn send_destroy(&self) {
@@ -441,7 +450,7 @@ impl FuseConnection {
         let mut msg = pod_as_bytes(&hdr);
         msg.extend_from_slice(body);
         self.replies.lock().insert(unique, FuseReplySlot::default());
-        self.pending.lock().push_back(msg);
+        self.queue_request(msg);
         unique
     }
 
@@ -462,7 +471,7 @@ impl FuseConnection {
         };
         let mut msg = pod_as_bytes(&hdr);
         msg.extend_from_slice(body);
-        self.pending.lock().push_back(msg);
+        self.queue_request(msg);
     }
 
     /// Enqueue a reply-bearing operation whose caller cannot await it (for
@@ -488,7 +497,7 @@ impl FuseConnection {
         let mut active = self.background_active.lock();
         if active.len() < self.max_background() as usize {
             active.insert(unique);
-            self.pending.lock().push_back(msg);
+            self.queue_request(msg);
         } else {
             self.background_deferred.lock().push_back(msg);
         }
@@ -504,6 +513,7 @@ impl FuseConnection {
         let mut active = self.background_active.lock();
         let mut deferred = self.background_deferred.lock();
         let mut pending = self.pending.lock();
+        let mut promoted = false;
         while active.len() < limit {
             let Some(request) = deferred.pop_front() else {
                 break;
@@ -513,7 +523,21 @@ impl FuseConnection {
             };
             active.insert(header.unique);
             pending.push_back(request);
+            promoted = true;
         }
+        drop(pending);
+        drop(deferred);
+        drop(active);
+        if promoted {
+            self.request_wait.wake(POLL_IN);
+        }
+    }
+
+    /// `fuse_dev_queue_req`: append one request for the daemon, then wake
+    /// the daemon's `/dev/fuse` waiters (`wake_up(&fiq->waitq)`).
+    fn queue_request(&self, request: Vec<u8>) {
+        self.pending.lock().push_back(request);
+        self.request_wait.wake(POLL_IN);
     }
 
     fn complete_background(&self, unique: u64) -> bool {
@@ -672,7 +696,7 @@ impl FuseConnection {
         let mut request = pod_as_bytes(&header);
         request.extend_from_slice(&pod_as_bytes(&input));
         request.extend_from_slice(data);
-        self.pending.lock().push_back(request);
+        self.queue_request(request);
     }
 
     /// Daemon side: complete the request identified by the reply's
@@ -1110,6 +1134,39 @@ impl FileOps for DevFuse {
             ev |= POLL_IN;
         }
         ev
+    }
+
+    /// `fuse_dev_poll`: `poll_wait(file, &fiq->waitq, wait)`, then the queue
+    /// check. Also what a blocking daemon `read` parks on.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(
+            self.conn
+                .request_wait
+                .arm(id, interest, waker, || self.poll_readiness()),
+        )
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(
+            self.conn
+                .request_wait
+                .arm_persistent(id, interest, waker, || self.poll_readiness()),
+        )
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.conn.request_wait.disarm(id);
+        true
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -1870,6 +1927,13 @@ impl FileOps for FuseFile {
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
+    }
+
+    /// Known wait-queue gap: a daemon's `FUSE_NOTIFY_POLL` / poll reply
+    /// updates `readiness` without waking any poller (Linux `fuse_file_poll`
+    /// waits on `ff->poll_wait`), so a blocking poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        true
     }
 
     fn poll_readiness(&self) -> u32 {

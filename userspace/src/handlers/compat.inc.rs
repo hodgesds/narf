@@ -2347,6 +2347,10 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.readiness_notifies()
     }
 
+    fn poll_requires_rescan(&self) -> bool {
+        self.inner.poll_requires_rescan()
+    }
+
     fn arm_readiness(
         &self,
         task_id: u64,

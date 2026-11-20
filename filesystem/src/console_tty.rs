@@ -441,6 +441,53 @@ impl TtyPort {
         !state.would_block()
     }
 
+    /// Whether this port's input can arrive with no wake: a probed `ttyS1+`
+    /// UART is read by polling its LSR and raises no interrupt NARF services
+    /// (see [`Self::next_input_byte`]). `ttyS0` and the VT are interrupt-fed
+    /// and wake [`narf_input::CONSOLE_INPUT_WAIT`] on every input event.
+    pub fn input_unnotified(&self) -> bool {
+        matches!(self.kind, PortKind::SerialPort(..))
+    }
+
+    /// `n_tty_poll`'s `poll_wait(file, &tty->read_wait, wait)` followed by
+    /// its readiness computation, for a one-shot poller. `None` for a port
+    /// with no input wake ([`Self::input_unnotified`]).
+    pub fn arm_input(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+        level: impl FnOnce() -> u32,
+    ) -> Option<core::task::Poll<u32>> {
+        if self.input_unnotified() {
+            return None;
+        }
+        Some(narf_input::CONSOLE_INPUT_WAIT.arm(id, interest, waker, level))
+    }
+
+    /// [`Self::arm_input`] for a persistent (epoll) waiter.
+    pub fn arm_input_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+        level: impl FnOnce() -> u32,
+    ) -> Option<u32> {
+        if self.input_unnotified() {
+            return None;
+        }
+        Some(narf_input::CONSOLE_INPUT_WAIT.arm_persistent(id, interest, waker, level))
+    }
+
+    /// Remove `id` from this port's input wait queue.
+    pub fn disarm_input(&self, id: u64) -> bool {
+        if self.input_unnotified() {
+            return false;
+        }
+        narf_input::CONSOLE_INPUT_WAIT.disarm(id);
+        true
+    }
+
     /// Bytes immediately readable without blocking — completed
     /// line-discipline output plus raw device input still queued. Used by
     /// FIONREAD and `poll(2)` readiness.

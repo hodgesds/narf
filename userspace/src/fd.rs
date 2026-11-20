@@ -1768,6 +1768,30 @@ impl FileOps for ConsoleFile {
         }
         mask
     }
+    /// `n_tty_poll`: queue on the console's input wait queue, then recompute.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        console_port().arm_input(id, interest, waker, || self.poll_readiness())
+    }
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        console_port().arm_input_persistent(id, interest, waker, || self.poll_readiness())
+    }
+    fn disarm_readiness(&self, id: u64) -> bool {
+        console_port().disarm_input(id)
+    }
+    /// See `DevConsole::poll_requires_rescan`.
+    fn poll_requires_rescan(&self) -> bool {
+        console_port().input_unnotified()
+    }
     /// Job control: the boot console's stable tty id.
     fn tty_id(&self) -> Option<u32> {
         Some(console_port().tty_id())

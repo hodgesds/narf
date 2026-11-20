@@ -614,6 +614,65 @@ kernel_test_in!(
     smoke_global_mount_change_fires_wake_hook
 );
 
+static MOUNTINFO_WAKES: AtomicUsize = AtomicUsize::new(0);
+fn mountinfo_counting_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable};
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        MOUNTINFO_WAKES.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable functions never dereference the null data pointer.
+    unsafe { core::task::Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+/// `mounts_poll`: a `/proc/<pid>/mountinfo` poller (GLib's mount monitor,
+/// libmount) sleeps on the namespace's poll wait queue, and a mount-table
+/// change wakes it. The file used to have no wait queue at all, so every
+/// GLib program's main-loop poll carried a 10 ms rescan timer for it.
+fn smoke_mountinfo_poller_woken_by_mount_change() -> TestResult {
+    use crate::FileOps;
+    const PATH: &str = "/mountinfo-wait-wake";
+    let auth = bootstrap_mount_authority();
+    let file =
+        crate::procfs::pid_ext::PidExtFile::new(1, crate::procfs::pid_ext::PidExtField::Mountinfo);
+    let waker = mountinfo_counting_waker();
+    MOUNTINFO_WAKES.store(0, Ordering::SeqCst);
+    let interest = crate::POLL_PRI | crate::POLL_ERR;
+    let armed = file.arm_readiness(0x6d01, interest, &waker);
+    let persistent = file.arm_readiness_persistent((1 << 63) | 0x6d02, interest, &waker);
+    let mounted = registry()
+        .mount(&auth, PATH, MemFs::new("mountinfo-wait-wake"))
+        .ok();
+    let after_mount = MOUNTINFO_WAKES.load(Ordering::SeqCst);
+    let unmounted = mounted
+        .as_ref()
+        .is_some_and(|handle| registry().unmount(handle, PATH).is_ok());
+    let after_unmount = MOUNTINFO_WAKES.load(Ordering::SeqCst);
+    file.disarm_readiness(0x6d01);
+    file.disarm_readiness((1 << 63) | 0x6d02);
+    if !matches!(armed, Some(core::task::Poll::Pending)) || persistent.is_none() {
+        return TestResult::Fail("mountinfo has no poll wait queue");
+    }
+    if mounted.is_none() || !unmounted {
+        return TestResult::Fail("mount change setup failed");
+    }
+    if after_mount < 2 {
+        return TestResult::Fail("a mount did not wake both mountinfo waiters");
+    }
+    if after_unmount <= after_mount {
+        return TestResult::Fail("an unmount did not wake the persistent mountinfo waiter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_mountinfo_poller_woken_by_mount_change
+);
+
 /// A private `MountNamespace` (the path a service takes after
 /// `unshare(CLONE_NEWNS)`) supports the same overmount stacking as the global
 /// registry: overmount succeeds, topmost is visible, unmount reveals the lower.
