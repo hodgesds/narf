@@ -1723,6 +1723,7 @@ kernel_test_in!("acpi", smoke_acpi_srat_memory_node_lookup);
 fn smoke_acpi_srat_synthetic_lapic_entry() -> TestResult {
     // Feed a synthetic SRAT body: one Type-0 LAPIC affinity entry
     // for APIC id 7, proximity domain 3, enabled flag set.
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     let entry: [u8; 16] = [
         0,  // type = 0
@@ -1867,6 +1868,7 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     // Synthetic PMTT body: 1 socket containing 1 memory controller
     // containing 2 DIMMs. Verify the hierarchical decoder threads
     // socket id and controller id down to the DIMM entries.
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
 
     // The synthetic-body shim isn't exposed for PMTT (the real
@@ -2032,6 +2034,7 @@ kernel_test_in!("acpi", smoke_acpi_pmtt_synthetic_dimm_entry);
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     let mut entry = [0u8; 40];
     entry[0] = 1; // type
@@ -2255,6 +2258,7 @@ kernel_test_in!("acpi", smoke_acpi_hmat_kind_distinct);
 fn smoke_acpi_unknown_state_clean_after_reset() -> TestResult {
     // __reset_for_test must take the global ACPI state back to its
     // pre-parse shape.
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     if crate::is_topology_known() {
         return TestResult::Fail("topology_known true after reset");
@@ -2298,6 +2302,7 @@ kernel_test_in!("acpi", smoke_acpi_unknown_state_clean_after_reset);
 
 fn smoke_acpi_copy_memory_ranges_empty_after_reset() -> TestResult {
     use crate::MemRange;
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     let mut buf = [MemRange {
         base: 0,
@@ -2315,6 +2320,7 @@ kernel_test_in!("acpi", smoke_acpi_copy_memory_ranges_empty_after_reset);
 
 fn smoke_acpi_hmat_value_returns_none_when_unknown() -> TestResult {
     use crate::HmatLatBwKind;
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     if crate::hmat_value(HmatLatBwKind::AccessLatency, 0, 0, 0).is_some() {
         return TestResult::Fail("hmat_value returned Some after reset");
@@ -2324,6 +2330,7 @@ fn smoke_acpi_hmat_value_returns_none_when_unknown() -> TestResult {
 kernel_test_in!("acpi", smoke_acpi_hmat_value_returns_none_when_unknown);
 
 fn smoke_acpi_pmtt_counts_zero_after_reset() -> TestResult {
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     let (sockets, dimms, ctrls) = crate::pmtt_counts();
     if sockets != 0 || dimms != 0 || ctrls != 0 {
@@ -2335,6 +2342,7 @@ kernel_test_in!("acpi", smoke_acpi_pmtt_counts_zero_after_reset);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_gpe_blocks_none_after_reset() -> TestResult {
+    let _acpi = crate::__test_state_scope();
     crate::__reset_for_test();
     if crate::gpe0_block().is_some() {
         return TestResult::Fail("gpe0_block returned Some after reset");

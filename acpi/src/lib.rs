@@ -1737,6 +1737,114 @@ pub fn __reset_for_test() {
     *GPE1_BLOCK.lock() = None;
 }
 
+/// Copy `src` into a fresh heap allocation without a stack temporary: the
+/// HMAT and MADT tables are kilobytes, too large for a test's frame.
+fn boxed_copy<T: Copy>(src: &T) -> alloc::boxed::Box<T> {
+    let mut b = alloc::boxed::Box::<T>::new_uninit();
+    // SAFETY: `src` is a valid `T` and `b` is a fresh, aligned allocation
+    // for one `T`; `T: Copy`, so a bitwise copy is a complete value.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, b.as_mut_ptr(), 1);
+        b.assume_init()
+    }
+}
+
+/// Overwrite `dst` with `src` in place (the restore half of [`boxed_copy`]).
+fn copy_into<T: Copy>(dst: &mut T, src: &T) {
+    // SAFETY: both are valid, aligned, distinct `T`s; `T: Copy`.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, 1) };
+}
+
+fn load_all(cells: &[AtomicU32; MAX_CPUS]) -> [u32; MAX_CPUS] {
+    core::array::from_fn(|i| cells[i].load(Ordering::Acquire))
+}
+
+fn store_all(cells: &[AtomicU32; MAX_CPUS], values: &[u32; MAX_CPUS]) {
+    for (cell, &v) in cells.iter().zip(values) {
+        cell.store(v, Ordering::Release);
+    }
+}
+
+/// The parsed tables [`__reset_for_test`] clears, as a smoke found them.
+/// Restored by [`TestStateScope`]'s drop.
+pub struct TestStateScope {
+    cpu_node: [u32; MAX_CPUS],
+    processor_uids: [u32; MAX_CPUS],
+    apic_ids: [u32; MAX_CPUS],
+    memory_ranges: alloc::boxed::Box<MemRangeTable>,
+    madt: alloc::boxed::Box<MadtTables>,
+    hmat: alloc::boxed::Box<HmatTables>,
+    pmtt: alloc::boxed::Box<PmttTables>,
+    gpe0: Option<GpeBlockInfo>,
+    gpe1: Option<GpeBlockInfo>,
+    srat_parsed: bool,
+    sci_vector: u8,
+    node_count: u32,
+    madt_parsed: bool,
+    madt_cpu_count: u32,
+    lapic_base: u64,
+    mcfg_base: u64,
+    dsdt_phys: u64,
+    hmat_parsed: bool,
+    pmtt_parsed: bool,
+}
+
+/// Test-only: snapshot the boot's parsed ACPI state and put it back when
+/// the returned scope drops. A smoke that calls [`__reset_for_test`] or
+/// [`__parse_srat_body_for_test`] must hold one: those replace the shared
+/// tables (CPU → node map, memory ranges, MADT, HMAT, ...) that the rest of
+/// the boot keeps reading — the allocator sizes its per-CPU caches from the
+/// CPU → node map — and left them replaced for every later smoke.
+#[doc(hidden)]
+#[must_use = "the boot's ACPI state is restored when the scope drops"]
+pub fn __test_state_scope() -> TestStateScope {
+    TestStateScope {
+        cpu_node: load_all(&CPU_NODE),
+        processor_uids: load_all(&PROCESSOR_UIDS),
+        apic_ids: load_all(&APIC_IDS),
+        memory_ranges: boxed_copy(&*MEMORY_RANGES.lock()),
+        madt: boxed_copy(&*MADT_DATA.lock()),
+        hmat: boxed_copy(&*HMAT_DATA.lock()),
+        pmtt: boxed_copy(&*PMTT_DATA.lock()),
+        gpe0: *GPE0_BLOCK.lock(),
+        gpe1: *GPE1_BLOCK.lock(),
+        srat_parsed: SRAT_PARSED.load(Ordering::Acquire),
+        sci_vector: SCI_VECTOR.load(Ordering::Acquire),
+        node_count: NODE_COUNT.load(Ordering::Acquire),
+        madt_parsed: MADT_PARSED.load(Ordering::Acquire),
+        madt_cpu_count: MADT_CPU_COUNT.load(Ordering::Acquire),
+        lapic_base: LAPIC_BASE.load(Ordering::Acquire),
+        mcfg_base: MCFG_BASE.load(Ordering::Acquire),
+        dsdt_phys: DSDT_PHYS.load(Ordering::Acquire),
+        hmat_parsed: HMAT_PARSED.load(Ordering::Acquire),
+        pmtt_parsed: PMTT_PARSED.load(Ordering::Acquire),
+    }
+}
+
+impl Drop for TestStateScope {
+    fn drop(&mut self) {
+        store_all(&CPU_NODE, &self.cpu_node);
+        store_all(&PROCESSOR_UIDS, &self.processor_uids);
+        store_all(&APIC_IDS, &self.apic_ids);
+        copy_into(&mut *MEMORY_RANGES.lock(), &self.memory_ranges);
+        copy_into(&mut *MADT_DATA.lock(), &self.madt);
+        copy_into(&mut *HMAT_DATA.lock(), &self.hmat);
+        copy_into(&mut *PMTT_DATA.lock(), &self.pmtt);
+        *GPE0_BLOCK.lock() = self.gpe0;
+        *GPE1_BLOCK.lock() = self.gpe1;
+        SRAT_PARSED.store(self.srat_parsed, Ordering::Release);
+        SCI_VECTOR.store(self.sci_vector, Ordering::Release);
+        NODE_COUNT.store(self.node_count, Ordering::Release);
+        MADT_PARSED.store(self.madt_parsed, Ordering::Release);
+        MADT_CPU_COUNT.store(self.madt_cpu_count, Ordering::Release);
+        LAPIC_BASE.store(self.lapic_base, Ordering::Release);
+        MCFG_BASE.store(self.mcfg_base, Ordering::Release);
+        DSDT_PHYS.store(self.dsdt_phys, Ordering::Release);
+        HMAT_PARSED.store(self.hmat_parsed, Ordering::Release);
+        PMTT_PARSED.store(self.pmtt_parsed, Ordering::Release);
+    }
+}
+
 // ── FADT (Fixed ACPI Description Table) → GPE block pointers ────────
 //
 // GPE0_BLK and GPE1_BLK carry port or memory addresses for the General
