@@ -9,7 +9,7 @@ impl PciIo {
         // Reuse only the scalar PCI adapter, not AE's register recipe.
         let io = super::ae_park::ParkIo(self);
         let result = super::super::rtl8821ae::park::close(&io, || {
-            crate::rtw88::pci_park::invoke(&self.cap, || {
+            narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
                 self.check_identity()?;
                 narf_bus::pci::clear_command(
                     &self.cap,
@@ -29,7 +29,7 @@ impl PciIo {
             })
             .map_err(|_| Error::Access)?
         });
-        let irq = crate::rtw88::pci_park::invoke(&self.cap, || {
+        let irq = narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_identity()?;
             let _ = self.deliver(false);
             if self.msi.lock().is_some() || self.quarantined.load(Ordering::Acquire) {

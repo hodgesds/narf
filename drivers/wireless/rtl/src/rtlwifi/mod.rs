@@ -47,8 +47,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 mod aspm;
 pub mod btcoex;
 pub mod channel;

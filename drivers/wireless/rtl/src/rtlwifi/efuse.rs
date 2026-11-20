@@ -137,8 +137,11 @@ pub(super) fn read_factory_with(
     }
     result?;
     let mut logical = [0xff; 512];
-    crate::rtw88::efuse::decode_map(&raw[..physical], &mut logical[..logical_size])
-        .map_err(|_| EfuseError::MalformedMap)?;
+    narf_drivers_wireless_rtw::rtw88::efuse::decode_map(
+        &raw[..physical],
+        &mut logical[..logical_size],
+    )
+    .map_err(|_| EfuseError::MalformedMap)?;
     let mut mac = [0; 6];
     mac.copy_from_slice(&logical[mac_offset..mac_offset + 6]);
     if !mac_is_valid(mac) {

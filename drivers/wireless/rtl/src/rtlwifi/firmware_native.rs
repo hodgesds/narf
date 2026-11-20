@@ -128,9 +128,11 @@ impl PciIo {
         if self.msi.lock().is_some() {
             return false;
         }
-        let Ok(Ok(mut config)) = crate::rtw88::pci_park::invoke(&self.cap, || {
-            narf_bus::msi::enable_msi(&self.cap, &self.device, 1)
-        }) else {
+        let Ok(Ok(mut config)) =
+            narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
+                narf_bus::msi::enable_msi(&self.cap, &self.device, 1)
+            })
+        else {
             return false;
         };
         let Ok(vector) = narf_interrupts::vector::alloc() else {
@@ -143,7 +145,7 @@ impl PciIo {
         }
         // SAFETY: this sole retained function owns its cfg space; delivery
         // is disabled again below before any chip interrupt is unmasked.
-        let programmed = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+        let programmed = narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || unsafe {
             narf_bus::msi::program_msi(&mut config, 0, vector)
         });
         if !matches!(programmed, Ok(Ok(_))) {
@@ -164,7 +166,7 @@ impl PciIo {
         };
         // SAFETY: same owned cfg space; MSI Enable stays clear until the
         // running owner programs HIMR.
-        let disabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+        let disabled = narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || unsafe {
             narf_bus::msi::disable(&msi.config)
         });
         if !matches!(disabled, Ok(Ok(()))) {
@@ -189,15 +191,16 @@ impl PciIo {
         if enabled {
             narf_interrupts::enable_irq(msi.vector);
             // SAFETY: sole owner of this function's MSI capability.
-            let enabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
-                narf_bus::msi::enable(&msi.config)
-            });
+            let enabled =
+                narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || unsafe {
+                    narf_bus::msi::enable(&msi.config)
+                });
             if matches!(enabled, Ok(Ok(()))) {
                 return true;
             }
         }
         // SAFETY: as above.
-        let disabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+        let disabled = narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || unsafe {
             narf_bus::msi::disable(&msi.config)
         });
         let Some(msi) = retained.take() else {
@@ -220,7 +223,7 @@ impl PciIo {
         if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
             return Err(Error::Gate);
         }
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             let command =
                 narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
@@ -284,7 +287,7 @@ impl PciIo {
     }
     /// PMCSR power-state write of this exact function (config space only).
     pub(super) fn set_pci_power(&self, state: narf_bus::pci::PciPowerState) -> Result<(), Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_function_identity()?;
             narf_bus::pci::set_power_state(&self.cap, &self.device, state)
                 .map_err(|_| Error::Access)
@@ -292,7 +295,7 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     pub(super) fn pci_power(&self) -> Result<Option<narf_bus::pci::PciPowerState>, Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_function_identity()?;
             narf_bus::pci::power_state(&self.cap, &self.device).map_err(|_| Error::Access)
         })
@@ -302,7 +305,7 @@ impl PciIo {
         if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
             return Err(Error::Gate);
         }
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_identity()?;
             let saved =
                 narf_bus::pci::save_config(&self.cap, &self.device).map_err(|_| Error::Access)?;
@@ -316,7 +319,7 @@ impl PciIo {
             return Err(Error::Gate);
         }
         command_gate(saved.command, false)?;
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_function_identity()?;
             // Config decoding may have been lost in S3. Disable DMA and MEM
             // before restoring BARs; the saved command restores only parked
@@ -392,7 +395,7 @@ impl PciIo {
         }
         // Current PCI authority and parked DMA are checked in the same
         // invocation that allocates storage for this exact retained function.
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             narf_io::alloc_coherent_masked(
                 bytes,
@@ -406,7 +409,7 @@ impl PciIo {
     fn access<T>(&self, reg: u16, width: usize, operation: impl FnOnce() -> T) -> Result<T, Error> {
         // The PCI command check and actual MMIO execute in the same live
         // capability operation; returning a raw register handle is forbidden.
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(reg, width)?;
             Ok(operation())
         })
@@ -430,7 +433,7 @@ impl PciIo {
         active: bool,
         operation: impl FnOnce() -> Result<T, super::prepare::Error>,
     ) -> Result<Result<T, super::prepare::Error>, Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             let command =
                 narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
@@ -444,7 +447,7 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     pub(super) fn packet_master(&self, enabled: bool) -> Result<(), Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             if enabled {
                 // This private one-shot port is reachable only after the

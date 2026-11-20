@@ -67,7 +67,7 @@ impl PciIo {
         let result = super::super::rtl8723ae::park::close(&io, || {
             // This narrow operation disables BME only; no command path may
             // enable it or mint replacement MMIO/reset/DMA-idle authority.
-            crate::rtw88::pci_park::invoke(&self.cap, || {
+            narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
                 self.check_identity()?;
                 narf_bus::pci::clear_command(
                     &self.cap,
@@ -89,7 +89,7 @@ impl PciIo {
         });
         // IRQ delivery is independent of the MAC/BME attempt. Existing MSI
         // withdrawal quarantines the vector when its current write is denied.
-        let irq = crate::rtw88::pci_park::invoke(&self.cap, || {
+        let irq = narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check_identity()?;
             let _ = self.deliver(false);
             if self.msi.lock().is_some() || self.quarantined.load(Ordering::Acquire) {

@@ -664,198 +664,206 @@ pub unsafe fn bring_up(
         narf_bus::BusAddr::Pcie(addr) => addr.function,
         _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
     };
-    let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
-        let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
-            .map_err(|_| ProbeError::RegisterBarMapFailed)?;
-        if registers.len < REG_EFUSE_ACCESS + 1
-            || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
-            || (device.id.device == RTL_DEV_8821AE
-                && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
-            || (device.id.device == RTL_DEV_8192EE
-                && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
-            || (device.id.device == RTL_DEV_8723AE
-                && registers.len < super::rtl8723ae::MMIO_SIZE as u64)
-            || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
-            || (rtl8723be && registers.len < super::rtl8723be::MMIO_SIZE as u64)
-        {
-            return Err(ProbeError::RegisterBarMapFailed);
-        }
-
-        if retained {
-            // SAFETY: this exact exclusive function owns the validated BAR2;
-            // its packet DMA is parked before any power/EFUSE access.
-            let control = unsafe { PciIo::new(*device, *cap, registers) };
-            control.disable_aspm().map_err(|_| ProbeError::PciAccess)?;
-        }
-
-        // Power-on (cardemu → active).  Optional — chips not in the table
-        // are tolerated for forward compat; the rest fall through to MAC
-        // init unchanged.
-        if power::power_on_table_for(did).is_some() {
-            // SAFETY: BAR2 mapped, no other thread holds the chip.
-            unsafe { power::power_on(&registers, did) }?;
-        }
-
-        // The diagnostic identity stage does not own packet DMA or an IRQ
-        // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
-        // SAFETY: BAR2 mapped and owned.
-        unsafe { irq::disable_interrupts_for(&registers, did) };
-
-        // rtl8723ae/hw.c::rtl8723e_read_eeprom_info selects the Wi-Fi EFUSE
-        // bank (REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0) before reading it.
-        if did == RTL_DEV_8723AE {
-            use super::rtl8723ae::adapter::{efuse_test_wifi_sel, REG_EFUSE_TEST};
-            // SAFETY: BAR2 mapped (length covers REG_EFUSE_ACCESS) and owned.
-            unsafe {
-                let value = registers.read32(u64::from(REG_EFUSE_TEST));
-                registers.write32(u64::from(REG_EFUSE_TEST), efuse_test_wifi_sel(value));
+    let (registers, factory) =
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+            let registers =
+                narf_drivers_wireless_rtw::rtw88::pci_park::map_bar_control(device, cap, 2)
+                    .map_err(|_| ProbeError::RegisterBarMapFailed)?;
+            if registers.len < REG_EFUSE_ACCESS + 1
+                || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
+                || (device.id.device == RTL_DEV_8821AE
+                    && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
+                || (device.id.device == RTL_DEV_8192EE
+                    && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
+                || (device.id.device == RTL_DEV_8723AE
+                    && registers.len < super::rtl8723ae::MMIO_SIZE as u64)
+                || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
+                || (rtl8723be && registers.len < super::rtl8723be::MMIO_SIZE as u64)
+            {
+                return Err(ProbeError::RegisterBarMapFailed);
             }
-        }
 
-        let factory = Box::new(
-            // SAFETY: BAR2 is mapped and exclusively owned, with EFUSE read
-            // clocks configured by the helper. The actual PCI function picks
-            // the dual-MAC factory address; boxing changes metadata storage.
-            unsafe { efuse::read_factory(&registers, did, function) }.map_err(ProbeError::Efuse)?,
-        );
+            if retained {
+                // SAFETY: this exact exclusive function owns the validated BAR2;
+                // its packet DMA is parked before any power/EFUSE access.
+                let control = unsafe { PciIo::new(*device, *cap, registers) };
+                control.disable_aspm().map_err(|_| ProbeError::PciAccess)?;
+            }
 
-        // RTL8192EE: the facts `configure_rtl8192ee` re-derives, checked
-        // before the function is retained. A test chip, an unprovisioned
-        // map, a BT-coexist board (`rtl92ee_read_bt_coexist_info_from_hwpg`
-        // board type 1) or a map without TX power (`0x11 == 0xff`, Linux's
-        // autoload-fail TX power branch) stays diagnostic.
-        let admissible = did != RTL_DEV_8192EE || {
-            use super::rtl8192ee::{adapter, txpower};
-            // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-            let (sys_cfg1, cr9346) = unsafe {
-                (
-                    registers.read32(u64::from(adapter::REG_SYS_CFG1)),
-                    registers.read8(u64::from(adapter::REG_9346CR)),
-                )
-            };
-            adapter::Adapter::from_hardware(sys_cfg1, cr9346, &factory.logical)
-                .is_ok_and(|facts| !facts.bt_coexist && facts.mac == factory.mac)
-                && txpower::Efuse::from_logical(&factory.logical).is_ok()
-        };
+            // Power-on (cardemu → active).  Optional — chips not in the table
+            // are tolerated for forward compat; the rest fall through to MAC
+            // init unchanged.
+            if power::power_on_table_for(did).is_some() {
+                // SAFETY: BAR2 mapped, no other thread holds the chip.
+                unsafe { power::power_on(&registers, did) }?;
+            }
 
-        // RTL8192CE / RTL8188CE: the facts `configure_rtl8192ce`
-        // re-derives. `_rtl92ce_read_chip_version` must qualify (no
-        // `TRP_VAUX_EN` test chip, no `CHIP_BONDING_92C_1T2R`, no unknown
-        // cut, so the RF type is RF_1T1R or RF_2T2R), the map must be
-        // provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`), the
-        // board must not be BT-coexist (`RF_OPTION1[7:5]`), the EFUSE MAC
-        // must be the factory identity and the TX-power areas must decode.
-        let admissible = admissible
-            && (!rtl8192ce || {
-                use super::rtl8192ce::{adapter, txpower, version};
+            // The diagnostic identity stage does not own packet DMA or an IRQ
+            // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
+            // SAFETY: BAR2 mapped and owned.
+            unsafe { irq::disable_interrupts_for(&registers, did) };
+
+            // rtl8723ae/hw.c::rtl8723e_read_eeprom_info selects the Wi-Fi EFUSE
+            // bank (REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0) before reading it.
+            if did == RTL_DEV_8723AE {
+                use super::rtl8723ae::adapter::{efuse_test_wifi_sel, REG_EFUSE_TEST};
+                // SAFETY: BAR2 mapped (length covers REG_EFUSE_ACCESS) and owned.
+                unsafe {
+                    let value = registers.read32(u64::from(REG_EFUSE_TEST));
+                    registers.write32(u64::from(REG_EFUSE_TEST), efuse_test_wifi_sel(value));
+                }
+            }
+
+            let factory = Box::new(
+                // SAFETY: BAR2 is mapped and exclusively owned, with EFUSE read
+                // clocks configured by the helper. The actual PCI function picks
+                // the dual-MAC factory address; boxing changes metadata storage.
+                unsafe { efuse::read_factory(&registers, did, function) }
+                    .map_err(ProbeError::Efuse)?,
+            );
+
+            // RTL8192EE: the facts `configure_rtl8192ee` re-derives, checked
+            // before the function is retained. A test chip, an unprovisioned
+            // map, a BT-coexist board (`rtl92ee_read_bt_coexist_info_from_hwpg`
+            // board type 1) or a map without TX power (`0x11 == 0xff`, Linux's
+            // autoload-fail TX power branch) stays diagnostic.
+            let admissible = did != RTL_DEV_8192EE || {
+                use super::rtl8192ee::{adapter, txpower};
                 // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                let (sys_cfg, cr9346) = unsafe {
+                let (sys_cfg1, cr9346) = unsafe {
                     (
-                        registers.read32(u64::from(version::REG_SYS_CFG)),
+                        registers.read32(u64::from(adapter::REG_SYS_CFG1)),
                         registers.read8(u64::from(adapter::REG_9346CR)),
                     )
                 };
-                // SAFETY: as above (HPON_FSM is read only for 92C serials).
-                let hpon = || unsafe { registers.read32(u64::from(version::REG_HPON_FSM)) };
-                version::Version::from_registers(sys_cfg, hpon).is_ok_and(|qualified| {
-                    adapter::Adapter::from_hardware(qualified, cr9346, &factory.logical).is_ok_and(
-                        |facts| {
-                            !facts.bt_coexistence()
-                                && facts.mac == factory.mac
-                                && txpower::Efuse::from_hwinfo(&facts.hwinfo).is_ok()
+                adapter::Adapter::from_hardware(sys_cfg1, cr9346, &factory.logical)
+                    .is_ok_and(|facts| !facts.bt_coexist && facts.mac == factory.mac)
+                    && txpower::Efuse::from_logical(&factory.logical).is_ok()
+            };
+
+            // RTL8192CE / RTL8188CE: the facts `configure_rtl8192ce`
+            // re-derives. `_rtl92ce_read_chip_version` must qualify (no
+            // `TRP_VAUX_EN` test chip, no `CHIP_BONDING_92C_1T2R`, no unknown
+            // cut, so the RF type is RF_1T1R or RF_2T2R), the map must be
+            // provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`), the
+            // board must not be BT-coexist (`RF_OPTION1[7:5]`), the EFUSE MAC
+            // must be the factory identity and the TX-power areas must decode.
+            let admissible = admissible
+                && (!rtl8192ce || {
+                    use super::rtl8192ce::{adapter, txpower, version};
+                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                    let (sys_cfg, cr9346) = unsafe {
+                        (
+                            registers.read32(u64::from(version::REG_SYS_CFG)),
+                            registers.read8(u64::from(adapter::REG_9346CR)),
+                        )
+                    };
+                    // SAFETY: as above (HPON_FSM is read only for 92C serials).
+                    let hpon = || unsafe { registers.read32(u64::from(version::REG_HPON_FSM)) };
+                    version::Version::from_registers(sys_cfg, hpon).is_ok_and(|qualified| {
+                        adapter::Adapter::from_hardware(qualified, cr9346, &factory.logical)
+                            .is_ok_and(|facts| {
+                                !facts.bt_coexistence()
+                                    && facts.mac == factory.mac
+                                    && txpower::Efuse::from_hwinfo(&facts.hwinfo).is_ok()
+                            })
+                    })
+                });
+
+            // RTL8723BE: the facts `configure_rtl8723be` re-derives.
+            // `_rtl8723be_read_chip_version` must carry `CHIP_8723B`, the map
+            // must be provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`;
+            // `_rtl8723be_read_package_type` reads physical `0x1fb`, 0 after a
+            // timeout), the EFUSE MAC must be the factory identity and the
+            // path-A TX-power area must decode (`0x11 != 0xff`).
+            let admissible = admissible
+                && (!rtl8723be || {
+                    use super::rtl8723be::{adapter, txpower, version};
+                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                    let (sys_cfg1, sys_cfg, cr9346, multi_func_ctrl) = unsafe {
+                        (
+                            registers.read32(u64::from(version::REG_SYS_CFG1)),
+                            registers.read32(u64::from(version::REG_SYS_CFG)),
+                            registers.read8(u64::from(adapter::REG_9346CR)),
+                            registers.read32(u64::from(adapter::REG_MULTI_FUNC_CTRL)),
+                        )
+                    };
+                    // SAFETY: as above; only the EFUSE read registers are touched.
+                    let package = unsafe {
+                        efuse::read_physical_byte(&registers, adapter::EFUSE_PACKAGE_ADDR)
+                    }
+                    .unwrap_or(0);
+                    version::Version::from_registers(sys_cfg1, sys_cfg).is_ok_and(|qualified| {
+                        adapter::Adapter::from_hardware(
+                            qualified,
+                            cr9346,
+                            multi_func_ctrl,
+                            &factory.logical,
+                            package,
+                        )
+                        .is_ok_and(|facts| facts.mac == factory.mac)
+                    }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
+                });
+
+            // RTL8723AE: the facts `configure_rtl8723ae` would re-derive.
+            // `_rtl8723e_read_chip_version` must qualify (no `TRP_VAUX_EN`
+            // test chip, `BT_FUNC` set so Linux assigns `RF_1T1R`), the map
+            // must be provisioned (`REG_9346CR` EFUSE boot, autoload,
+            // `0x8129`) and the EFUSE MAC must be the factory identity. A
+            // BT-coexist board is the norm for this combo chip, not a refusal.
+            let admissible = admissible
+                && (!rtl8723ae || {
+                    use super::rtl8723ae::{adapter, version};
+                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                    let (sys_cfg, gpio, multi, cr9346) = unsafe {
+                        (
+                            registers.read32(u64::from(version::REG_SYS_CFG)),
+                            registers.read32(u64::from(version::REG_GPIO_OUTSTS)),
+                            registers.read32(u64::from(version::REG_MULTI_FUNC_CTRL)),
+                            registers.read8(u64::from(adapter::REG_9346CR)),
+                        )
+                    };
+                    version::Version::from_registers(sys_cfg, || gpio, || multi).is_ok_and(
+                        |qualified| {
+                            adapter::Adapter::from_hardware(
+                                qualified,
+                                cr9346,
+                                multi,
+                                &factory.logical,
+                            )
+                            .is_ok_and(|facts| facts.mac == factory.mac)
                         },
                     )
-                })
-            });
+                });
 
-        // RTL8723BE: the facts `configure_rtl8723be` re-derives.
-        // `_rtl8723be_read_chip_version` must carry `CHIP_8723B`, the map
-        // must be provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`;
-        // `_rtl8723be_read_package_type` reads physical `0x1fb`, 0 after a
-        // timeout), the EFUSE MAC must be the factory identity and the
-        // path-A TX-power area must decode (`0x11 != 0xff`).
-        let admissible = admissible
-            && (!rtl8723be || {
-                use super::rtl8723be::{adapter, txpower, version};
-                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                let (sys_cfg1, sys_cfg, cr9346, multi_func_ctrl) = unsafe {
-                    (
-                        registers.read32(u64::from(version::REG_SYS_CFG1)),
-                        registers.read32(u64::from(version::REG_SYS_CFG)),
-                        registers.read8(u64::from(adapter::REG_9346CR)),
-                        registers.read32(u64::from(adapter::REG_MULTI_FUNC_CTRL)),
-                    )
-                };
-                // SAFETY: as above; only the EFUSE read registers are touched.
-                let package =
-                    unsafe { efuse::read_physical_byte(&registers, adapter::EFUSE_PACKAGE_ADDR) }
-                        .unwrap_or(0);
-                version::Version::from_registers(sys_cfg1, sys_cfg).is_ok_and(|qualified| {
-                    adapter::Adapter::from_hardware(
-                        qualified,
-                        cr9346,
-                        multi_func_ctrl,
-                        &factory.logical,
-                        package,
-                    )
-                    .is_ok_and(|facts| facts.mac == factory.mac)
-                }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
-            });
+            // RTL8192DE: the facts `configure_rtl8192de` / `prepare_rtl8192de`
+            // re-derive. `_rtl92de_read_chip_version` must not be a test chip
+            // (`REG_SYS_CFG` version bits), EFUSE autoload must have succeeded
+            // (`REG_9346CR` BIT(5): an autoload-failed board has no power-group
+            // store for the channel step) and the PROM mode
+            // (`rtl92d_read_eeprom_info` `EEPROM_MAC_FUNCTION`) must give this
+            // function a bandset holding the 2.4 GHz station plan (a dual-dual
+            // MAC0 is 5 GHz only; the composed station is 2.4 GHz legacy).
+            let admissible = admissible
+                && (!rtl8192de || {
+                    use super::rtl8192de::{mode_from_prom, native_channel, version, Interface};
+                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                    let (sys_cfg, cr9346) = unsafe {
+                        (
+                            registers.read32(u64::from(version::REG_SYS_CFG)),
+                            registers.read8(u64::from(version::REG_9346CR)),
+                        )
+                    };
+                    sys_cfg != u32::MAX
+                        && sys_cfg & version::SYS_CFG_VERSION_MASK != 0
+                        && cr9346 & version::CR9346_AUTOLOAD_OK != 0
+                        && mode_from_prom(Interface::Pci, &factory.logical)
+                            .is_some_and(|mode| native_channel(1, mode, function))
+                });
 
-        // RTL8723AE: the facts `configure_rtl8723ae` would re-derive.
-        // `_rtl8723e_read_chip_version` must qualify (no `TRP_VAUX_EN`
-        // test chip, `BT_FUNC` set so Linux assigns `RF_1T1R`), the map
-        // must be provisioned (`REG_9346CR` EFUSE boot, autoload,
-        // `0x8129`) and the EFUSE MAC must be the factory identity. A
-        // BT-coexist board is the norm for this combo chip, not a refusal.
-        let admissible = admissible
-            && (!rtl8723ae || {
-                use super::rtl8723ae::{adapter, version};
-                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                let (sys_cfg, gpio, multi, cr9346) = unsafe {
-                    (
-                        registers.read32(u64::from(version::REG_SYS_CFG)),
-                        registers.read32(u64::from(version::REG_GPIO_OUTSTS)),
-                        registers.read32(u64::from(version::REG_MULTI_FUNC_CTRL)),
-                        registers.read8(u64::from(adapter::REG_9346CR)),
-                    )
-                };
-                version::Version::from_registers(sys_cfg, || gpio, || multi).is_ok_and(
-                    |qualified| {
-                        adapter::Adapter::from_hardware(qualified, cr9346, multi, &factory.logical)
-                            .is_ok_and(|facts| facts.mac == factory.mac)
-                    },
-                )
-            });
-
-        // RTL8192DE: the facts `configure_rtl8192de` / `prepare_rtl8192de`
-        // re-derive. `_rtl92de_read_chip_version` must not be a test chip
-        // (`REG_SYS_CFG` version bits), EFUSE autoload must have succeeded
-        // (`REG_9346CR` BIT(5): an autoload-failed board has no power-group
-        // store for the channel step) and the PROM mode
-        // (`rtl92d_read_eeprom_info` `EEPROM_MAC_FUNCTION`) must give this
-        // function a bandset holding the 2.4 GHz station plan (a dual-dual
-        // MAC0 is 5 GHz only; the composed station is 2.4 GHz legacy).
-        let admissible = admissible
-            && (!rtl8192de || {
-                use super::rtl8192de::{mode_from_prom, native_channel, version, Interface};
-                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                let (sys_cfg, cr9346) = unsafe {
-                    (
-                        registers.read32(u64::from(version::REG_SYS_CFG)),
-                        registers.read8(u64::from(version::REG_9346CR)),
-                    )
-                };
-                sys_cfg != u32::MAX
-                    && sys_cfg & version::SYS_CFG_VERSION_MASK != 0
-                    && cr9346 & version::CR9346_AUTOLOAD_OK != 0
-                    && mode_from_prom(Interface::Pci, &factory.logical)
-                        .is_some_and(|mode| native_channel(1, mode, function))
-            });
-
-        Ok((registers, (factory, admissible)))
-    })
-    .map_err(|_| ProbeError::PciAccess)??;
+            Ok((registers, (factory, admissible)))
+        })
+        .map_err(|_| ProbeError::PciAccess)??;
     let (factory, admissible) = factory;
     let retained = retained && admissible;
     let mac = factory.mac;

@@ -1,0 +1,88 @@
+# Legacy Realtek Wi-Fi family — `rtl8xxxu` (USB) + `rtlwifi` (PCIe) — dual-build.
+#
+# Promoted from the former `drivers/wireless/src/{rtl8xxxu,rtlwifi}/` modules
+# into one family crate: rtl8xxxu reuses rtlwifi's `wmm::priority` helper (a
+# one-directional dependency that keeps them in a single crate, inner module
+# paths `rtl8xxxu`/`rtlwifi` preserved). Both reuse the shared Realtek USB
+# transport (`narf-drivers-wireless-rtl-usb`), the iwlwifi MLME builder and
+# rtw88's efuse decoder from their already-promoted crates. Built-in or a
+# loadable `.ko`; the `.ko` registers BOTH buses — rtl8xxxu's Realtek USB
+# VID/PIDs via `narf_register_usb_driver` and rtlwifi's Realtek PCIe ids via
+# `narf_register_pci_driver`. Registration-only: the probe thunk returns
+# -ENOSYS until the Wi-Fi device datapath ABI lands.
+
+[package]
+name         = "narf-drivers-wireless-rtl"
+description  = "Legacy Realtek Wi-Fi (rtl8xxxu USB + rtlwifi PCIe) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_rtl"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-bus", "dep:narf-capabilities", "dep:narf-console",
+    "dep:narf-crypto", "dep:narf-drivers", "dep:narf-drivers-usb",
+    "dep:narf-drivers-wireless-ath-core", "dep:narf-drivers-wireless-core",
+    "dep:narf-drivers-wireless-iwlwifi", "dep:narf-drivers-wireless-rtl-usb",
+    "dep:narf-drivers-wireless-rtw", "dep:narf-firmware", "dep:narf-init",
+    "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc", "dep:narf-lib",
+    "dep:narf-memory", "dep:narf-net", "dep:narf-power", "dep:narf-scheduler",
+    "dep:narf-time", "dep:narf-wireless", "dep:zeroize",
+    # The reused inner modules (iwlwifi::mlme, rtw88::efuse) sit behind those
+    # crates' own `builtin` gate, so cascade it.
+    "narf-drivers-wireless-iwlwifi/builtin", "narf-drivers-wireless-rtw/builtin",
+]
+module = []
+kernel-test = [
+    "builtin",
+    "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
+    "narf-wireless/kernel-test", "narf-bus/kernel-test",
+    "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test",
+    "narf-drivers-wireless-rtl-usb/kernel-test",
+    "narf-drivers-wireless-rtw/kernel-test",
+    "narf-drivers-wireless-iwlwifi/kernel-test",
+    "narf-drivers-wireless-ath-core/kernel-test",
+]
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+async-trait        = "0.1"
+
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-drivers-usb  = { path = "../../usb", optional = true }
+narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true }
+narf-drivers-wireless-core = { path = "../core", optional = true }
+narf-drivers-wireless-iwlwifi = { path = "../iwlwifi", default-features = false, optional = true }
+narf-drivers-wireless-rtl-usb = { path = "../rtl-usb", optional = true }
+narf-drivers-wireless-rtw = { path = "../rtw", default-features = false, optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-init         = { path = "../../../init", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+# Test-only: harness + Wi-Fi fixtures.
+narf-kernel-test   = { path = "../../../verification/kernel-test", optional = true }
+narf-wifi-fixtures = { path = "../../../verification/wifi-fixtures", optional = true }
+
+[lints]
+workspace = true

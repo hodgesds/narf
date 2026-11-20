@@ -24,7 +24,7 @@ impl PciIdentity {
         cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     ) -> Result<Self, crate::rtlwifi::firmware_transport::Error> {
         use crate::rtlwifi::firmware_transport::Error;
-        crate::rtw88::pci_park::invoke(cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(cap, || {
             let id = narf_bus::pci::read_config32(cap, &device, 0).map_err(|_| Error::Access)?;
             let subsystem =
                 narf_bus::pci::read_config32(cap, &device, 0x2c).map_err(|_| Error::Access)?;

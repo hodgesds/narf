@@ -133,18 +133,20 @@ impl Publication {
                 })?;
                 result.ok_or(Error::State)?
             }
-            PublicationSource::Native(device, cap) => crate::rtw88::pci_park::invoke(cap, || {
-                let cmd = narf_bus::pci::read_command(cap, device)
-                    .map_err(|_| Error::Access(super::AccessError::Access))?;
-                let bits = narf_bus::pci::cmd::MEM_SPACE
-                    | narf_bus::pci::cmd::BUS_MASTER
-                    | narf_bus::pci::cmd::INTX_DISABLE;
-                if cmd == u16::MAX || cmd & bits != bits {
-                    return Err(Error::State);
-                }
-                operation()
-            })
-            .map_err(|_| Error::Access(super::AccessError::Access))?,
+            PublicationSource::Native(device, cap) => {
+                narf_drivers_wireless_rtw::rtw88::pci_park::invoke(cap, || {
+                    let cmd = narf_bus::pci::read_command(cap, device)
+                        .map_err(|_| Error::Access(super::AccessError::Access))?;
+                    let bits = narf_bus::pci::cmd::MEM_SPACE
+                        | narf_bus::pci::cmd::BUS_MASTER
+                        | narf_bus::pci::cmd::INTX_DISABLE;
+                    if cmd == u16::MAX || cmd & bits != bits {
+                        return Err(Error::State);
+                    }
+                    operation()
+                })
+                .map_err(|_| Error::Access(super::AccessError::Access))?
+            }
             #[cfg(any(test, feature = "kernel-test"))]
             PublicationSource::Model(check) => {
                 check()?;
