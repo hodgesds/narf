@@ -1,0 +1,81 @@
+# Qualcomm ath11k Wi-Fi 6 (QCA6390/WCN6855/QCN9074 PCIe + IPQ8074/6018/5018,
+# WCN6750 AHB/DT) — dual-build.
+#
+# Promoted from the former `drivers/wireless/src/ath11k/` module into a proper
+# per-driver crate on `narf-drivers-wireless-ath-core`. Built-in or a loadable
+# `.ko`; the `.ko` registers BOTH buses — PCI ids via `narf_register_pci_driver`
+# and the AHB DT compatibles via `narf_register_dt_driver` (the Tier-2 DT shim).
+# Registration-only: the probe thunk returns -ENOSYS until the device datapath
+# ABI lands.
+
+[package]
+name         = "narf-drivers-wireless-ath11k"
+description  = "Qualcomm ath11k Wi-Fi 6 (QCA6390/WCN6855/QCN9074 PCIe + IPQ AHB/DT) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_ath11k"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-boot", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-console", "dep:narf-crypto", "dep:narf-drivers",
+    "dep:narf-drivers-qcom-soc", "dep:narf-drivers-wireless-ath-core",
+    "dep:narf-drivers-wireless-core", "dep:narf-firmware",
+    "dep:narf-firmware-fdt", "dep:narf-firmware-smbios", "dep:narf-interrupts",
+    "dep:narf-io", "dep:narf-ipc", "dep:narf-lib", "dep:narf-memory",
+    "dep:narf-net", "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
+    "dep:narf-wireless", "dep:zeroize",
+]
+module = []
+kernel-test = [
+    "builtin",
+    "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
+    "dep:narf-drivers-wireless-iwlwifi",
+    "narf-wireless/kernel-test", "narf-bus/kernel-test",
+    "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test",
+    "narf-drivers-wireless-ath-core/kernel-test",
+]
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+async-trait        = "0.1"
+
+narf-boot         = { path = "../../../boot", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-drivers-qcom-soc = { path = "../../soc/qcom", optional = true }
+narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true }
+narf-drivers-wireless-core = { path = "../core", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-firmware-fdt = { path = "../../../firmware/fdt", optional = true }
+narf-firmware-smbios = { path = "../../../firmware/smbios", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+# Test-only: harness + Wi-Fi fixtures, and iwlwifi as the reference oracle for
+# the AES-key-unwrap cross-check in mac_tests.
+narf-kernel-test   = { path = "../../../verification/kernel-test", optional = true }
+narf-wifi-fixtures = { path = "../../../verification/wifi-fixtures", optional = true }
+narf-drivers-wireless-iwlwifi = { path = "../iwlwifi", optional = true }
+
+[lints]
+workspace = true

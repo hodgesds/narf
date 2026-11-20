@@ -76,6 +76,7 @@ pub fn sys_init_module_with_params(
         narf_bus::unregister_module_pci_drivers(module.id.0);
         narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
         narf_bus::module_sdio::unregister_module_sdio_drivers(module.id.0);
+        narf_bus::module_dt::unregister_module_dt_drivers(module.id.0);
         let _removed = crate::symbols::unregister_exports_of(module.id);
         registry::remove(module.name());
         // SAFETY: init failed, so the module is not Live; its exports are
@@ -161,6 +162,7 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     narf_bus::unregister_module_pci_drivers(module.id.0);
     narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
     narf_bus::module_sdio::unregister_module_sdio_drivers(module.id.0);
+    narf_bus::module_dt::unregister_module_dt_drivers(module.id.0);
 
     // Sweep all KSYMTAB entries registered by this module during its
     // init.  Must happen before the Arc is dropped so that if the

@@ -193,7 +193,7 @@ pub struct NativeIo {
 }
 impl NativeIo {
     fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, narf_capabilities::CapError> {
-        crate::qualcomm_pci::invoke(&self.cap, operation)
+        narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&self.cap, operation)
     }
     /// The static-window BAR0 offset of `offset`, if it has one.
     fn static_at(&self, offset: u32, direct: bool) -> Option<u32> {
@@ -408,7 +408,7 @@ fn teardown_msi(state: &MsiState, cap: &Cap<BusDeviceCap, Write>) {
     // write fails (for example, a surprise-removed function), do not recycle
     // its vector: its MSI source cannot be proven quiesced.
     if matches!(
-        crate::qualcomm_pci::invoke(cap, || {
+        narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || {
             // SAFETY: current original PCI cap owns this configured MSI capability.
             unsafe { narf_bus::msi::disable(&state.bus_cfg) }
         }),
@@ -578,7 +578,7 @@ fn pci_aspm_restore() {
     if a.restore {
         a.restore = false;
         let lnkctl = narf_bus::pci_express::LNKCTL_ASPMC;
-        let r = crate::qualcomm_pci::invoke(&a.cap, || {
+        let r = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&a.cap, || {
             narf_bus::pci_express::clear_and_set_link_control(
                 &a.cap,
                 &a.device,
@@ -606,7 +606,7 @@ fn pci_aspm_disable() {
     let Some(mut a) = ASPM_RESTORE.lock().take() else {
         return;
     };
-    if let Ok(Ok(cur)) = crate::qualcomm_pci::invoke(&a.cap, || {
+    if let Ok(Ok(cur)) = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&a.cap, || {
         narf_bus::pci_express::clear_and_set_link_control(
             &a.cap,
             &a.device,
@@ -1118,7 +1118,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         .map(|controller| controller.address);
     let occupied = owner.is_some();
     let profile = validate_runtime_profile(chip.default_hw_rev);
-    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
+    narf_drivers_wireless_ath_core::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath11k singleton already owns another radio",
@@ -1143,7 +1143,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // The silicon and all software profiles have now been accepted;
         // no firmware DMA was enabled during identification or reset.
         if !matches!(
-            crate::qualcomm_pci::invoke(&cap, || {
+            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::set_command(&cap,&device,narf_bus::pci::cmd::BUS_MASTER)?;
                 narf_bus::pci::read_command(&cap,&device)
             }),
@@ -1153,7 +1153,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         ) {
             teardown_msi(&dev.msi, &cap);
             if let Some(link_ctl) = dev.saved_link_ctl {
-                let _ = crate::qualcomm_pci::invoke(&cap, || {
+                let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                     narf_bus::pci_express::clear_and_set_link_control(
                         &cap,
                         &device,
@@ -1172,7 +1172,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // No controller was published, so no later lifecycle path will
             // revoke the command bits.  In particular, leaving BUS_MASTER
             // set after a rejected probe would let an unbound function DMA.
-            let _ = crate::qualcomm_pci::invoke(&cap, || {
+            let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
                 narf_bus::pci::clear_command(
                     &cap,
                     &device,
@@ -1294,8 +1294,10 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
     chip: ChipInfo,
 ) -> Result<Ath11kDevice, ProbeError> {
-    crate::qualcomm_pci::invoke(cap, || bring_up_current(device, cap, chip))
-        .map_err(|_| ProbeError::PciConfiguration)?
+    narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || {
+        bring_up_current(device, cap, chip)
+    })
+    .map_err(|_| ProbeError::PciConfiguration)?
 }
 fn bring_up_current(
     device: &BusDevice,
@@ -1304,7 +1306,7 @@ fn bring_up_current(
 ) -> Result<Ath11kDevice, ProbeError> {
     // SAFETY: `bring_up`'s contract is that the caller owns the device's BARs
     // exclusively — exactly the precondition `map_bar_control` requires.
-    let mmio_bar0 = crate::qualcomm_pci::map_bar_control(device, cap, 0)
+    let mmio_bar0 = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(device, cap, 0)
         .map_err(|_| ProbeError::Bar0MapFailed)?;
     if mmio_bar0.len < 0x100000 {
         return Err(ProbeError::Bar0MapFailed);

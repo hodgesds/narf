@@ -43,6 +43,7 @@ pub mod driver_match;
 pub mod dt_match;
 pub mod ecam;
 pub mod hotplug;
+pub mod module_dt;
 pub mod module_sdio;
 pub mod module_usb;
 pub mod module_wireless;

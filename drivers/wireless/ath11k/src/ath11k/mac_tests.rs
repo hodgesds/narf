@@ -2704,7 +2704,8 @@ fn smoke_ath11k_mac_key_wrap_vector() -> TestResult {
             "test-side wrap matches RFC 3394"
         );
         ensure!(
-            crate::iwlwifi::rekey::aes_key_unwrap(&kek, &want).as_deref() == Some(&key[..]),
+            narf_drivers_wireless_iwlwifi::iwlwifi::rekey::aes_key_unwrap(&kek, &want).as_deref()
+                == Some(&key[..]),
             "the unwrap the mac layer uses"
         );
         Ok(())

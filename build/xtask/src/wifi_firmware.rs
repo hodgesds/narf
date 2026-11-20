@@ -329,7 +329,7 @@ mod tests {
             ),
             (
                 "ath11k",
-                include_str!("../../../drivers/wireless/src/ath11k/hw.rs"),
+                include_str!("../../../drivers/wireless/ath11k/src/ath11k/hw.rs"),
                 "ath11k/",
             ),
         ] {
