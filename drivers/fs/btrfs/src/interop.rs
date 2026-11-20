@@ -20,6 +20,10 @@
 //!   journal, removal of an old archived one.
 //! - `fstab` (`@`): mount the six other CachyOS subvolumes read-write as
 //!   the fstab does — views of one shared core — and write into each.
+//! - `churn` (any subvolume): 90 s of a boot's first-minute writes (an
+//!   append+fsync log, write+fsync+rename, create/unlink, mkdir) under a new
+//!   directory, each operation timed; needs no existing path, for a
+//!   `btrfs-image -s` metadata copy of a real root.
 
 use alloc::format;
 use alloc::string::String;
@@ -616,6 +620,122 @@ async fn run_fstab(root: &Arc<dyn DirOps>) -> Result<(), &'static str> {
     expect(root, "narf-fstab.txt", &fstab_marker("@")).await
 }
 
+/// How long the `churn` mode writes.
+pub const CHURN_SECS: u64 = 90;
+/// A `churn` operation slower than this is reported on its own line.
+const CHURN_SLOW_NS: u64 = 2_000_000_000;
+
+/// `churn` mode: the writes of a systemd boot's first minute, on whichever
+/// subvolume is mounted, through names it creates itself — so it runs on a
+/// `btrfs-image -s` metadata copy of a long-used root, whose existing names
+/// are scrambled and whose file data reads back as zeros:
+///
+/// - an append-and-fsync log (what `narf.rootlog` and journald do),
+/// - a state file replaced by write+fsync+rename (systemd's random seed,
+///   pacman's db version),
+/// - small files created and, a few rounds later, unlinked (unit state,
+///   sockets, caches), and a directory every tenth round.
+///
+/// Every operation is timed; one slower than [`CHURN_SLOW_NS`] gets a
+/// detail line as it completes, and a detail line every 100 rounds says how
+/// far it got, so a wedge shows as the last line on the console.
+async fn run_churn(root: &Arc<dyn DirOps>) -> Result<(), &'static str> {
+    let detail = |text: &str| {
+        let _ = writeln!(narf_console::Writer, "{MARKER} detail churn {text}");
+    };
+    let name = format!("narf-churn-{}", narf_time::wall::monotonic_ns() / 1_000_000);
+    let dir = root.mkdir(&name).await.map_err(|_| "mkdir churn dir")?;
+    let log = dir.create("log").await.map_err(|_| "create log")?;
+    let start = narf_time::wall::monotonic_ns();
+    let mut worst = (0u64, "none");
+    let mut log_at = 0u64;
+    let mut round = 0u32;
+    while narf_time::wall::monotonic_ns() - start < CHURN_SECS * 1_000_000_000 {
+        round += 1;
+        let mut timed = |what: &'static str, began: u64| {
+            let took = narf_time::wall::monotonic_ns() - began;
+            if took > worst.0 {
+                worst = (took, what);
+            }
+            if took > CHURN_SLOW_NS {
+                detail(&format!(
+                    "round {round}: {what} took {} ms",
+                    took / 1_000_000
+                ));
+            }
+        };
+        let t = narf_time::wall::monotonic_ns();
+        let chunk = pattern(round, 16 * 1024);
+        if let Err(e) = write_all(&log, log_at, &chunk).await {
+            detail(&format!("round {round}: log append failed: {e:?}"));
+            return Err("log append");
+        }
+        log_at += chunk.len() as u64;
+        if let Err(e) = log.fsync(false).await {
+            detail(&format!("round {round}: log fsync failed: {e:?}"));
+            return Err("log fsync");
+        }
+        timed("log append+fsync", t);
+
+        let t = narf_time::wall::monotonic_ns();
+        if let Err(e) = replace_file(&dir, "state.tmp", "state", &pattern(round, 512)).await {
+            detail(&format!("round {round}: state replace failed: {e:?}"));
+            return Err("state replace");
+        }
+        timed("state write+fsync+rename", t);
+
+        let t = narf_time::wall::monotonic_ns();
+        let small = format!("f{round}");
+        let made = match dir.create(&small).await {
+            Ok(file) => write_all(&file, 0, &pattern(round, 8192)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = made {
+            detail(&format!("round {round}: small file failed: {e:?}"));
+            return Err("small file");
+        }
+        if round > 8 && round % 4 == 0 {
+            if let Err(e) = dir.unlink(&format!("f{}", round - 8)).await {
+                detail(&format!("round {round}: unlink failed: {e:?}"));
+                return Err("unlink");
+            }
+        }
+        if round % 10 == 0 {
+            let made = match dir.mkdir(&format!("d{round}")).await {
+                Ok(sub) => match sub.create("unit").await {
+                    Ok(file) => write_all(&file, 0, &pattern(round, 300)).await,
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(e) = made {
+                detail(&format!("round {round}: mkdir round failed: {e:?}"));
+                return Err("mkdir round");
+            }
+        }
+        timed("create/write/unlink/mkdir", t);
+
+        if round % 100 == 0 {
+            detail(&format!(
+                "round {round} at {} s, log {} KiB, slowest {} ms ({})",
+                (narf_time::wall::monotonic_ns() - start) / 1_000_000_000,
+                log_at >> 10,
+                worst.0 / 1_000_000,
+                worst.1
+            ));
+        }
+        narf_time::sleep_ms(20).await;
+    }
+    root.syncfs().await.map_err(|_| "final syncfs")?;
+    detail(&format!(
+        "{round} rounds, log {} KiB, slowest {} ms ({})",
+        log_at >> 10,
+        worst.0 / 1_000_000,
+        worst.1
+    ));
+    expect(&dir, "state", &pattern(round, 512)).await
+}
+
 /// Machine id of the interop image (journal directory name).
 pub const MACHINE_ID: &str = "4e415246c4c405ee00000000000000aa";
 
@@ -660,6 +780,7 @@ pub fn run(mode: &str) -> narf_init::InitResult {
             "log" => run_log(&root, MACHINE_ID).await,
             "fstab" => run_fstab(&root).await,
             "files" => run_files(&fs, &root).await,
+            "churn" => run_churn(&root).await,
             _ => Err("unknown mode"),
         }
     });
