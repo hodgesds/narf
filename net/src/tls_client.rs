@@ -1002,6 +1002,9 @@ impl<'a, T: Transport> TlsClient<'a, T> {
         self.client_ap_secret = Some(c_ap);
         self.server_ap_secret = Some(s_ap);
         self.server_protection = Protection::Application;
+        // Each key change restarts that direction's record sequence at 0
+        // (RFC 8446 §5.3), as KeyUpdate does below.
+        self.server_seq = 0;
 
         // Client flight: [Certificate] + Finished, under the client
         // handshake traffic secret.
@@ -1025,6 +1028,7 @@ impl<'a, T: Transport> TlsClient<'a, T> {
         self.write_protected_handshake(&msg)?;
         self.transcript.extend_from_slice(&msg);
         self.client_protection = Protection::Application;
+        self.client_seq = 0;
         Ok(())
     }
 
