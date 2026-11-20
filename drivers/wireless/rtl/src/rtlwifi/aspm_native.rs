@@ -7,7 +7,7 @@ use narf_capabilities::Read;
 impl aspm::Port for PciIo {}
 impl PciIo {
     fn aspm_policy(&self, enabled: bool) -> Result<Option<u16>, Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             self.check_identity()?;
             let read = self.cap.derive::<Read>().map_err(|_| Error::Access)?;
@@ -32,7 +32,7 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     fn aspm_control(&self, desired: u16) -> Result<(), Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             self.check(0, 1)?;
             self.check_identity()?;
             // SAFETY: bounded standard capability discovery over this exact

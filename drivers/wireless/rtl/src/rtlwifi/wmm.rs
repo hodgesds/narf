@@ -73,7 +73,7 @@ fn program_profile(io: &impl Io, p: Parameters, short: bool, ht: bool) -> Result
 /// BK is the terminal fallback exactly as in mac80211. BE ACM is already
 /// refused by [`admit`] before association.
 pub(crate) fn priority(ethernet: &[u8], p: &Parameters) -> u8 {
-    let mut tid = crate::ath11k::tx_hdr::classify8021d(ethernet) & 7;
+    let mut tid = narf_drivers_wireless_ath_core::eth::classify8021d(ethernet) & 7;
     // Parameters use canonical ACI order BE0, BK1, VI2, VO3.
     while p.ac[match tid {
         1 | 2 => 1,

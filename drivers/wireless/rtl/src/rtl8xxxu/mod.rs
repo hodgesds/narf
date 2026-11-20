@@ -31,8 +31,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 mod ba_sessions;
 pub mod btcoex;
 mod calibration;
@@ -105,7 +103,7 @@ pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 // chip-independent; only the TX submission path differs between
 // iwlwifi (PCIe UMAC cmd) and rtl8xxxu (bulk-OUT with TxDesc header).
 
-pub use crate::iwlwifi::mlme::{
+pub use narf_drivers_wireless_iwlwifi::iwlwifi::mlme::{
     auth_algorithm, build_assoc_request, build_assoc_request_rsn, build_open_auth_body,
     parse_beacon, parse_beacon_to_bss, AssocParams, AssocParamsRsn, AssocResponseFields,
     AuthResponse, BeaconInfo, BssDescriptor, ScanRequest,
@@ -317,7 +315,7 @@ pub static DEVICES: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Rtl8xxxuDevi
 pub fn register() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "rtl8xxxu-usb-ids", || {
-        let _ = crate::iwlwifi::mlme::build_open_auth_body; // force link
+        let _ = narf_drivers_wireless_iwlwifi::iwlwifi::mlme::build_open_auth_body; // force link
 
         // Register with the USB class-driver registry so any
         // RTL8XXXU dongle that enumerates on xHCI is handed to

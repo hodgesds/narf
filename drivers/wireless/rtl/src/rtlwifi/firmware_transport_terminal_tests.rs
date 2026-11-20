@@ -29,7 +29,8 @@ struct Original {
 }
 impl Original {
     fn current<T>(&self, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
-        crate::rtw88::pci_park::invoke(&self.cap, f).map_err(|_| Error::Access)?
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, f)
+            .map_err(|_| Error::Access)?
     }
     fn put(&self, r: u16, v: u32, width: u8) -> Result<(), Error> {
         self.current(|| {
@@ -298,7 +299,7 @@ fn smoke_8821_terminal_scalar_retirement_and_owned_publication_close_last() -> T
         let pci = raw.cap;
         let publication =
             crate::rtlwifi::prepare::packet::Publication::model(Arc::new(move || {
-                crate::rtw88::pci_park::invoke(&pci, || Ok(()))
+                narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&pci, || Ok(()))
                     .map_err(|_| crate::rtlwifi::prepare::Error::State)?
             }));
         let publication = io.guard_8821_publication(publication);

@@ -256,7 +256,8 @@ impl Owner {
             *byte = map_byte(io, address as u16)?;
         }
         let mut logical = Box::new([0xff; 512]);
-        crate::rtw88::efuse::decode_map(&raw[..], &mut logical[..256]).map_err(|_| Error::Map)?;
+        narf_drivers_wireless_rtw::rtw88::efuse::decode_map(&raw[..], &mut logical[..256])
+            .map_err(|_| Error::Map)?;
         if logical[..] != factory.logical {
             return Err(Error::Identity);
         }

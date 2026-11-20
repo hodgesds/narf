@@ -76,7 +76,7 @@ impl Port {
         event: Event,
         f: impl FnOnce(&mut Model) -> Result<T, AccessError>,
     ) -> Result<T, AccessError> {
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || {
             let (result, revoke) = {
                 let mut m = self.model.lock();
                 m.events.push(event);

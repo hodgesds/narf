@@ -52,7 +52,8 @@ impl Backend for CheckedPort {
         &self,
         f: impl FnOnce(&Self) -> Result<T, AccessError>,
     ) -> Result<T, AccessError> {
-        crate::rtw88::pci_park::invoke(&self.cap, || f(self)).map_err(|_| AccessError::Access)?
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.cap, || f(self))
+            .map_err(|_| AccessError::Access)?
     }
     fn identity(&self) -> Result<cold_storage::PciIdentity, AccessError> {
         self.current(|_| Ok(cold_storage::PciIdentity::fixture(self.address())))

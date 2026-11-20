@@ -30,8 +30,14 @@ pub use narf_drivers_wireless_brcm::{brcmfmac, cyw43439};
 // drivers' `crate::qualcomm_pci` / `crate::qualcomm_regulatory` references
 // keep resolving.
 pub use narf_drivers_wireless_ath_core::{qualcomm_pci, qualcomm_regulatory};
-pub mod rtl8xxxu;
-pub mod rtlwifi;
+// Legacy Realtek Wi-Fi family. Promoted out of the former
+// `src/{rtl8xxxu,rtlwifi}/` modules into the standalone dual-build family
+// crate `narf-drivers-wireless-rtl` (see drivers/wireless/rtl/). rtl8xxxu (USB)
+// reuses rtlwifi's (PCIe) `wmm::priority`, so they share a crate; their inner
+// modules are re-exported here as `rtl8xxxu`/`rtlwifi` so existing
+// `crate::rtl8xxxu::{…}` / `crate::rtlwifi::{…}` references and the
+// `rtl8xxxu::register()` / `rtlwifi::register()` initcalls keep resolving.
+pub use narf_drivers_wireless_rtl::{rtl8xxxu, rtlwifi};
 
 // MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920). Promoted out of the
 // former `src/mt7921/` module into the standalone dual-build crate

@@ -170,7 +170,8 @@ pub(super) async fn factory<I: ControlIo>(owner: &Owner<I>) -> Result<Factory, E
     // Every prior transfer completed; closing the read gate is safe here.
     owner.write8(0xcf, 0).await?;
     let mut map = [0xff; 512];
-    crate::rtw88::efuse::decode_map(&physical, &mut map).map_err(|_| Error::BadEfuse)?;
+    narf_drivers_wireless_rtw::rtw88::efuse::decode_map(&physical, &mut map)
+        .map_err(|_| Error::BadEfuse)?;
     parse_factory(cut, &map)
 }
 

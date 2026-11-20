@@ -121,7 +121,7 @@ impl CoexPort {
         self.source.base.with_current(|| {
             self.source.identity.invoke(|| {
                 let original = || {
-                    crate::rtw88::pci_park::invoke(&self.source.pci, operation)
+                    narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.source.pci, operation)
                         .map_err(|_| Error::State)?
                 };
                 if let Some(program) = self.source.program.get() {
@@ -303,7 +303,8 @@ impl Io for CoexPort {
 struct PciOnly(CoexPort);
 impl PciOnly {
     fn current<T>(&self, op: impl FnOnce() -> Result<T, AccessError>) -> Result<T, AccessError> {
-        crate::rtw88::pci_park::invoke(&self.0.source.pci, op).map_err(|_| AccessError::Gate)?
+        narf_drivers_wireless_rtw::rtw88::pci_park::invoke(&self.0.source.pci, op)
+            .map_err(|_| AccessError::Gate)?
     }
 }
 #[async_trait::async_trait]
