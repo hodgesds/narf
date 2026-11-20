@@ -8956,6 +8956,11 @@ pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
     out
 }
 
+/// The nice value of scheduler task `task` (`task_nice(current)`).
+pub(crate) fn nice_of_task(task: u64) -> i32 {
+    read_nice(task)
+}
+
 /// Return the nice value for `pid`. Default 0.
 pub fn nice_of(pid: u64) -> i32 {
     // NICE_TABLE is keyed by TaskId (read_nice's param is a task id).

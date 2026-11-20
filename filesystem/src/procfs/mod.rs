@@ -1316,6 +1316,44 @@ pub(crate) fn hook_set_comm(pid: u64, name: &str) -> Result<(), FsError> {
     f(pid, name)
 }
 
+// ── /proc/<pid>/timerslack_ns ───────────────────────────────────
+
+/// Read a task's `timer_slack_ns`, applying `timerslack_ns_show`'s access
+/// rule for the caller.
+pub type TimerslackGetFn = fn(u64) -> Result<u64, FsError>;
+/// Set a task's `timer_slack_ns` (`timerslack_ns_write`).
+pub type TimerslackSetFn = fn(u64, u64) -> Result<(), FsError>;
+static TIMERSLACK_GET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static TIMERSLACK_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire `/proc/<pid>/timerslack_ns` to the task table.
+pub fn set_timerslack_hooks(get: TimerslackGetFn, set: TimerslackSetFn) {
+    TIMERSLACK_GET_HOOK.store(get as usize, Ordering::Release);
+    TIMERSLACK_SET_HOOK.store(set as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_timerslack_get(pid: u64) -> Result<u64, FsError> {
+    let v = TIMERSLACK_GET_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
+    // SAFETY: only `set_timerslack_hooks` stores this cell, from a
+    // `TimerslackGetFn`; non-zero confirms it.
+    let f: TimerslackGetFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_timerslack_set(pid: u64, ns: u64) -> Result<(), FsError> {
+    let v = TIMERSLACK_SET_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
+    // SAFETY: only `set_timerslack_hooks` stores this cell, from a
+    // `TimerslackSetFn`; non-zero confirms it.
+    let f: TimerslackSetFn = unsafe { core::mem::transmute(v) };
+    f(pid, ns)
+}
+
 pub(crate) fn hook_oom_adj_get(pid: u64) -> i16 {
     let v = OOM_ADJ_GET_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -2254,6 +2292,10 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "oom_score_adj".into(),
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "timerslack_ns".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {

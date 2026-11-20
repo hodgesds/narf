@@ -173,6 +173,15 @@ fn install_proc_ext_hooks() {
     narf_filesystem::procfs::set_fd_list_hook(narf_userspace::handlers::proc_fd_list);
     // /proc/<pid>/personality: the per-task execution domain + flags.
     narf_filesystem::procfs::set_personality_hook(narf_userspace::handlers::personality_of_pid);
+    // /proc/<pid>/timerslack_ns: the task's `timer_slack_ns`.
+    narf_filesystem::procfs::set_timerslack_hooks(
+        narf_userspace::timer_slack::proc_timerslack_get,
+        narf_userspace::timer_slack::proc_timerslack_set,
+    );
+    // /proc/timer_list names a user task's timers by its comm.
+    narf_filesystem::procfs::timer_list::set_task_comm_hook(
+        narf_userspace::handlers::proc_comm_of_task,
+    );
     // /proc/<pid>/{sched,schedstat,wchan,syscall}: the per-task scheduler
     // accounting and the saved frame of a task parked in a syscall.
     narf_filesystem::procfs::set_sched_snapshot_hook(narf_userspace::handlers::proc_sched_snapshot);
