@@ -126,7 +126,7 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     }
 
     if total != 0 {
-        crate::mqueue::notify_modify_fd(task, fd);
+        crate::mqueue::notify_modify_description(&endpoint.description);
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
