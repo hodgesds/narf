@@ -437,6 +437,16 @@ pub struct Igc {
     ifname: crate::publish::IfName,
     cookie: u64,
     removed: AtomicBool,
+    /// Tasks parked until the device goes away (`until_removed`): the
+    /// receive pumps and the transmit consumer, which otherwise sleep on
+    /// their interrupt or ring alone.
+    removal_wakers: IrqSafeSpinLock<Vec<core::task::Waker>>,
+    /// The maintenance worker while it sleeps out its watchdog period, and
+    /// whether something asked for a pass sooner (an admin or recovery
+    /// request, a TX timestamp, the link-change interrupt) — Linux's
+    /// `mod_timer(&adapter->watchdog_timer, jiffies + 1)`.
+    maint_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    maint_kicked: AtomicBool,
     admin_up: AtomicBool,
     recovery_requested: AtomicBool,
     completion_autopsy_pending: AtomicBool,
@@ -504,19 +514,35 @@ pub const fn isr_rearm_mask(index: u8) -> u32 {
 /// Acknowledge one MSI-X vector: clear the legacy causes (ICR is
 /// clear-on-read under GPIE.NSICR), then restore the EIMS bits this
 /// handler owns.
-pub(crate) fn service_vector(r: &impl Registers, rearm: u32) {
-    let _ = r.read(0x1500);
+pub(crate) fn service_vector(r: &impl Registers, rearm: u32) -> u32 {
+    let icr = r.read(0x1500);
     if rearm != 0 {
         r.write(0x1524, rearm);
     }
+    icr
 }
 fn igc_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
-    let bound = *ISR_HW[cookie as usize & 255].lock();
+    let vector = cookie as usize & 255;
+    let bound = *ISR_HW[vector].lock();
     if let Some((hw, rearm)) = bound {
-        service_vector(&hw, rearm);
+        // `igc_msix_other` / `igc_intr`: a link change re-runs the watchdog
+        // at once (`mod_timer(&adapter->watchdog_timer, jiffies + 1)`).
+        if service_vector(&hw, rearm) & IMS_LSC != 0 {
+            MAINT_KICKS[vector].store(true, Ordering::Release);
+            let w = MAINT_WAKERS[vector].lock().clone();
+            if let Some(w) = w {
+                w.wake_by_ref();
+            }
+        }
     }
     narf_interrupts::dispatch::IrqStatus::Handled
 }
+
+/// Per vector: the maintenance worker of the device the vector belongs to,
+/// and whether a link-change interrupt asked it for a pass.
+static MAINT_WAKERS: [IrqSafeSpinLock<Option<core::task::Waker>>; 256] =
+    [const { IrqSafeSpinLock::new(None) }; 256];
+static MAINT_KICKS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 fn queue_cpu(queue: usize) -> u32 {
     let bits = narf_scheduler::online_cpu_set().bits();
     (0..64)
@@ -526,6 +552,93 @@ fn queue_cpu(queue: usize) -> u32 {
 }
 
 impl Igc {
+    /// Run `f` until it completes or the device is removed (`None`).
+    async fn until_removed<F: core::future::Future>(&self, f: F) -> Option<F::Output> {
+        let mut f = core::pin::pin!(f);
+        core::future::poll_fn(|cx| {
+            if self.removed.load(Ordering::Acquire) {
+                return core::task::Poll::Ready(None);
+            }
+            {
+                let mut w = self.removal_wakers.lock();
+                if !w.iter().any(|w| w.will_wake(cx.waker())) {
+                    w.push(cx.waker().clone());
+                }
+            }
+            // Registered before the re-check: `remove` sets the flag, then
+            // wakes every registered waiter.
+            if self.removed.load(Ordering::Acquire) {
+                return core::task::Poll::Ready(None);
+            }
+            f.as_mut().poll(cx).map(Some)
+        })
+        .await
+    }
+
+    /// Ask the maintenance worker for a pass now (`igc_watchdog` re-armed
+    /// for the next jiffy). Safe from interrupt context.
+    pub(crate) fn kick_maintenance(&self) {
+        self.maint_kicked.store(true, Ordering::Release);
+        let w = self.maint_waker.lock().clone();
+        if let Some(w) = w {
+            w.wake_by_ref();
+        }
+    }
+
+    /// Whether maintenance has time-critical work that a 2 s watchdog
+    /// would delay: a TX timestamp in flight or undelivered (Linux takes
+    /// these from the TS interrupt, `igc_ptp_tx_work`), or frame preemption
+    /// on (its verify handshake and responses run on a 10 ms clock, as
+    /// `ethtool_mmsv`'s verify timer does).
+    fn maintenance_hurried(&self) -> bool {
+        let ptp = self.ptp.lock();
+        if ptp.pending.iter().any(Option::is_some) || !ptp.events.is_empty() {
+            return true;
+        }
+        drop(ptp);
+        self.merge.lock().config.enabled
+    }
+
+    /// Sleep until the next maintenance pass: 10 ms while
+    /// [`Self::maintenance_hurried`], else Linux's `igc_watchdog` period,
+    /// `round_jiffies(jiffies + 2 * HZ)`, cut short by a kick.
+    async fn maintenance_sleep(&self) {
+        if self.maintenance_hurried() {
+            narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
+            return;
+        }
+        let expires =
+            narf_time::timer::round_jiffies(narf_time::timer::jiffies() + 2 * narf_time::timer::HZ);
+        let mut sleep = narf_time::sleep_until_jiffies(expires, 0);
+        let wait = core::future::poll_fn(|cx| {
+            *self.maint_waker.lock() = Some(cx.waker().clone());
+            for r in &self.irq_routes {
+                *MAINT_WAKERS[r.vector as usize].lock() = Some(cx.waker().clone());
+            }
+            let mut kicked = self.maint_kicked.swap(false, Ordering::AcqRel);
+            for r in &self.irq_routes {
+                kicked |= MAINT_KICKS[r.vector as usize].swap(false, Ordering::AcqRel);
+            }
+            if kicked {
+                return core::task::Poll::Ready(());
+            }
+            core::future::Future::poll(core::pin::Pin::new(&mut sleep), cx)
+        });
+        let _ = self.until_removed(wait).await;
+        self.maint_waker.lock().take();
+        for r in &self.irq_routes {
+            MAINT_WAKERS[r.vector as usize].lock().take();
+        }
+    }
+
+    /// Wake every task parked in [`Self::until_removed`].
+    pub(crate) fn wake_removal_waiters(&self) {
+        let wakers = core::mem::take(&mut *self.removal_wakers.lock());
+        for w in wakers {
+            w.wake();
+        }
+    }
+
     /// Initialize a single exclusively owned PCI function.
     ///
     /// # Safety
@@ -620,6 +733,9 @@ impl Igc {
             ifname: crate::publish::IfName::new(),
             cookie: NEXT_COOKIE.fetch_add(1, Ordering::Relaxed),
             removed: AtomicBool::new(false),
+            removal_wakers: IrqSafeSpinLock::new(Vec::new()),
+            maint_waker: IrqSafeSpinLock::new(None),
+            maint_kicked: AtomicBool::new(false),
             admin_up: AtomicBool::new(true),
             recovery_requested: AtomicBool::new(false),
             completion_autopsy_pending: AtomicBool::new(false),
@@ -1102,6 +1218,9 @@ impl Igc {
                 .ptp
                 .lock()
                 .reserve(q, cookie, narf_time::monotonic_ns())?;
+            // The timestamp is collected by maintenance, which now runs on
+            // its fast clock until it is delivered.
+            self.kick_maintenance();
         }
         let result = self.queues()[q].post_options(&self.hw, q, frame, meta, self.mtu(), options);
         if result.is_err() && timing.timestamp_cookie.is_some() {
@@ -2099,12 +2218,9 @@ fn spawn_pumps(
                 let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
-                    let waiter = route.map(|r| {
-                        narf_interrupts::wait_for_irq_until(
-                            r.vector,
-                            narf_time::Deadline::after_ms(10),
-                        )
-                    });
+                    // NAPI: the queue's interrupt alone schedules the next
+                    // poll (`igc_msix_ring` → `napi_schedule`); no timer.
+                    let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
                     // Only a reset replaces the queue set; one handle serves
                     // the whole poll.
                     let queue = rx.queues().get(q).cloned();
@@ -2193,7 +2309,7 @@ fn spawn_pumps(
                     narf_net::tcp_stack::gro_flush();
                     match waiter {
                         Some(w) => {
-                            let _ = w.await;
+                            let _ = rx.until_removed(w).await;
                         }
                         None => narf_time::sleep_cycles(narf_time::ns_to_cycles(1_000_000)).await,
                     }
@@ -2211,23 +2327,9 @@ fn spawn_pumps(
     narf_scheduler::spawn_with_spec(
         async move {
             while !tx.removed.load(Ordering::Acquire) {
-                let result = {
-                    use core::future::Future;
-                    let receive = tx_cons.recv();
-                    let timer = narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000));
-                    let mut receive = core::pin::pin!(receive);
-                    let mut timer = core::pin::pin!(timer);
-                    core::future::poll_fn(|cx| {
-                        if let core::task::Poll::Ready(v) = receive.as_mut().poll(cx) {
-                            return core::task::Poll::Ready(Some(v));
-                        }
-                        if timer.as_mut().poll(cx).is_ready() {
-                            return core::task::Poll::Ready(None);
-                        }
-                        core::task::Poll::Pending
-                    })
-                    .await
-                };
+                // The ring alone wakes it (Linux transmits synchronously from
+                // `ndo_start_xmit`; nothing polls), or the device's removal.
+                let result = tx.until_removed(tx_cons.recv()).await;
                 match result {
                     Some(Ok(frame)) => {
                         if !tx.removed.load(Ordering::Acquire) {
@@ -2274,7 +2376,7 @@ fn spawn_pumps(
                         .store(link.speed_mbps.unwrap_or(0), Ordering::Release);
                     *device.published_link.lock() = link;
                 }
-                narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
+                device.maintenance_sleep().await;
             }
         },
         narf_scheduler::TaskSpec::kernel_any(),

@@ -55,10 +55,12 @@ pub enum PowerError {
 struct ProbePower<'a>(&'a MmioRegion);
 impl super::mac_power::Io for ProbePower<'_> {
     fn stage(&mut self, stage: super::mac_power::Stage) {
-        let _ = writeln!(
-            narf_console::PriorityWriter::<7>,
-            "  mt7921: probe power {stage:?}"
-        );
+        if crate::mt7921::debug::enabled() {
+            let _ = writeln!(
+                narf_console::PriorityWriter::<7>,
+                "  mt7921: probe power {stage:?}"
+            );
+        }
     }
     fn read(&mut self, address: u32) -> Result<u32, PowerError> {
         // SAFETY: the enclosing probe owns the mapped BAR and L1 selector.

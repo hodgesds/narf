@@ -2796,10 +2796,20 @@ const MEMBARRIER_STATE_MASK: u32 = 0xFF;
 const LIVE_USER_TASKS_SHIFT: u32 = 8;
 const LIVE_USER_TASKS_MASK: u32 = !MEMBARRIER_STATE_MASK;
 
+/// Whether a mutation of an address space must run the remote invalidation
+/// half. Always: Linux `flush_tlb_mm_range` consults `mm_cpumask` for every
+/// mm, because the mutator need not be the address space's own thread
+/// (`process_madvise`, writeback refreshing a shared file page in every
+/// mapper, swap-out, NUMA hinting, the OOM reaper), so even a single-threaded
+/// tag-0 address space can be live on another CPU while it is changed. The
+/// remote half interrupts only CPUs whose CR3 holds the owner's root
+/// (`tlb_shootdown::shootdown_owned`), so an address space changing itself
+/// with no other CPU holding its root sends no IPI.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 const fn ordinary_mutation_needs_remote_tlb(tag: u16, vm_shared: bool) -> bool {
-    tag != crate::asid_alloc::TAG_RESERVED || vm_shared
+    let _ = (tag, vm_shared);
+    true
 }
 
 impl AddressSpace {
@@ -3170,14 +3180,11 @@ impl AddressSpace {
         self.vm_shared.load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Whether an ordinary mutation by this address space can leave a stale
-    /// translation on another x86 CPU.
-    ///
+    /// Whether a mutation of this address space can leave a stale translation
+    /// on another x86 CPU: always (see `ordinary_mutation_needs_remote_tlb`).
     /// A nonzero lifetime PCID may remain cached on every CPU in its residency
-    /// history. Tag 0 is different: every task switch reloads CR3 without
-    /// NOFLUSH, so a single-threaded address space can retain translations only
-    /// on the CPU performing the mutation. A CLONE_VM address space can still
-    /// execute concurrently and therefore always needs the remote half.
+    /// history; any root, tag 0 included, may be live on another CPU while a
+    /// foreign mutator changes it.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn needs_remote_tlb_invalidation(&self) -> bool {
@@ -7439,7 +7446,7 @@ impl AddressSpace {
         // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
         // Detached page tables widen it to whole PT granules.
         match &reclaimed {
-            Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+            Some((_, lo, span)) => self.flush_region_broadcast_tables(*lo, *span, true),
             None => self.flush_region_broadcast(region.base, region.pte_span_pages()),
         }
         #[cfg(target_arch = "x86_64")]
@@ -7763,7 +7770,7 @@ impl AddressSpace {
                 return Ok(());
             }
             match &reclaimed {
-                Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+                Some((_, lo, span)) => self.flush_region_broadcast_tables(*lo, *span, true),
                 None => self.flush_region_broadcast(region.base, region.len >> 12),
             }
             if self.root.as_u64() != 0 {
@@ -8087,7 +8094,7 @@ impl AddressSpace {
         }
         if punched_pages > 0 {
             match &reclaimed {
-                Some((_, rlo, span)) => self.flush_region_broadcast(*rlo, *span),
+                Some((_, rlo, span)) => self.flush_region_broadcast_tables(*rlo, *span, true),
                 None => self.flush_region_broadcast(base, (hi - lo) >> 12),
             }
         }
@@ -8587,7 +8594,11 @@ impl AddressSpace {
         {
             return;
         }
-        self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
+        self.flush_region_broadcast_tables(
+            VirtAddr::new(0),
+            Self::USER_HALF_END >> 12,
+            !batch.page_tables.is_empty(),
+        );
         if self.root.as_u64() != 0 {
             for region in &batch.regions {
                 self.free_region_frames(region);
@@ -8640,33 +8651,40 @@ impl AddressSpace {
     /// MUST have already torn down / rewritten the covered leaves and must call
     /// this before frame reuse.
     fn flush_region_broadcast(&self, base: VirtAddr, pages: u64) {
+        self.flush_region_broadcast_tables(base, pages, false);
+    }
+
+    /// [`Self::flush_region_broadcast`] when `freed_tables`: the caller
+    /// detached page-table pages in the range and frees them after this
+    /// returns (Linux `mmu_gather.freed_tables`), so CPUs idling with this
+    /// root loaded are interrupted instead of deferred.
+    fn flush_region_broadcast_tables(&self, base: VirtAddr, pages: u64, freed_tables: bool) {
         #[cfg(target_arch = "x86_64")]
         {
             const FULL_FLUSH_PAGE_CEILING: u64 = 512;
             if pages == 0 || !self.needs_remote_tlb_invalidation() {
                 return;
             }
-            if pages > FULL_FLUSH_PAGE_CEILING {
-                crate::tlb_shootdown::shootdown_owned(
-                    self.root.as_u64(),
-                    crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
-                );
+            let req = if pages > FULL_FLUSH_PAGE_CEILING {
+                crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag())
             } else {
-                crate::tlb_shootdown::shootdown_owned(
-                    self.root.as_u64(),
-                    crate::tlb_shootdown::ShootdownRequest::for_range(
-                        self.translation_tag(),
-                        base.as_u64(),
-                        pages,
-                    ),
-                );
+                crate::tlb_shootdown::ShootdownRequest::for_range(
+                    self.translation_tag(),
+                    base.as_u64(),
+                    pages,
+                )
+            };
+            if freed_tables {
+                crate::tlb_shootdown::shootdown_owned_freeing_tables(self.root.as_u64(), req);
+            } else {
+                crate::tlb_shootdown::shootdown_owned(self.root.as_u64(), req);
             }
         }
         // aarch64: `unmap_4kb`'s TLBI already covers the shareability
         // domain in hardware — no software broadcast needed.
         #[cfg(not(target_arch = "x86_64"))]
         {
-            let _ = (base, pages);
+            let _ = (base, pages, freed_tables);
         }
     }
 
@@ -17657,8 +17675,12 @@ kernel_test_in!("memory", smoke_memory_drop_hook_runs_without_its_lock);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_tag0_remote_tlb_gate_matches_switch_contract() -> TestResult {
-    if ordinary_mutation_needs_remote_tlb(crate::asid_alloc::TAG_RESERVED, false) {
-        return TestResult::Fail("single-owner tag 0 requested a remote invalidation");
+    // A single-threaded tag-0 space can still be live on another CPU while a
+    // foreign mutator changes it; the owner-targeted remote half decides.
+    if !ordinary_mutation_needs_remote_tlb(crate::asid_alloc::TAG_RESERVED, false) {
+        return TestResult::Fail(
+            "single-owner tag 0 skipped its owner-targeted remote invalidation",
+        );
     }
     if !ordinary_mutation_needs_remote_tlb(crate::asid_alloc::TAG_RESERVED, true) {
         return TestResult::Fail("CLONE_VM tag 0 skipped its remote invalidation");

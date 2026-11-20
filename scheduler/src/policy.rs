@@ -746,10 +746,18 @@ pub(crate) fn select_idle_sibling(
 ) -> Option<CpuId> {
     let node = narf_acpi::cpu_node(prev_cpu.0);
     let same_node = |c: CpuId| node.is_none() || narf_acpi::cpu_node(c.0) == node;
+    // Linux `wake_affine_idle`: an idle waker takes the wake only when it
+    // shares a cache with `prev_cpu` ("otherwise an interrupt intensive
+    // workload could force all tasks onto one node"). Unknown LLCs fall back
+    // to the node test.
+    let shares_cache = |c: CpuId| match (crate::steal::llc_id(prev_cpu), crate::steal::llc_id(c)) {
+        (Some(a), Some(b)) => a == b,
+        _ => same_node(c),
+    };
     if waker_cpu != prev_cpu
         && is_online(waker_cpu)
         && is_idle(waker_cpu)
-        && same_node(waker_cpu)
+        && shares_cache(waker_cpu)
         && allowed(waker_cpu)
     {
         return Some(waker_cpu);

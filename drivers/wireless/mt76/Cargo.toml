@@ -40,7 +40,7 @@ default = ["builtin"]
 # Built-in: pull the real kernel crates. The driver body only compiles here.
 builtin = [
     "dep:narf-init",
-    "dep:narf-arch", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-arch", "dep:narf-boot", "dep:narf-bus", "dep:narf-capabilities",
     "dep:narf-console", "dep:narf-driver-runtime", "dep:narf-drivers",
     "dep:narf-firmware", "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc",
     "dep:narf-kernel-test", "dep:narf-wifi-fixtures", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
@@ -58,6 +58,7 @@ narf-driver-macros = { path = "../../../driver-macros" }
 
 # Real kernel crates — present for `builtin`, absent for `module`.
 narf-arch         = { path = "../../../arch", optional = true }
+narf-boot         = { path = "../../../boot", optional = true }
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }

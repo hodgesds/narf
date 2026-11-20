@@ -500,6 +500,7 @@ pub trait FileOps {
     fn arm_readiness_persistent_exclusive(&self, id: u64, interest: u32, waker: &Waker)
         -> Option<u32>;
     fn disarm_readiness(&self, task_id: u64) -> bool;
+    fn poll_requires_rescan(&self) -> bool;
     fn drm_execbuf_fence(&self) -> Option<Arc<dyn DrmFence>>;
     fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64>;
     fn tty_fg_pgrp(&self) -> Option<u64>;
@@ -658,6 +659,19 @@ its inner monitor.
 readable (`POLLIN`) but never writable (`POLLOUT`), and a mount-namespace
 generation change additionally reports `POLLPRI | POLLERR` until the accepting
 epoll instance acknowledges that edge.
+Every provider whose readiness can change implements `arm_readiness` (Linux
+`->poll`'s `poll_wait`): either through a `Readiness` cell, or through a
+`narf_lib::readiness::WaitQueue` whose arm registers and then computes the
+provider's mask, with every producer waking the queue after it publishes.
+`poll`/`select` register on every file and THEN scan (`do_poll` order), so a
+wake between a first scan and the registration is never lost and no rescan
+timer exists. `poll_requires_rescan` defaults to `false`; it is `true` only for
+a provider whose readiness can change with no wake at all (a polled `ttyS1+`
+UART, and the driver bridges not yet given a wait queue: CCID, CDC-ACM,
+USB-serial, RFCOMM, FUSE `FUSE_POLL` files), and a blocking poll holding one
+rescans that file every 10 ms. A file with no readiness cell and no rescan
+declaration is constant (a regular file) or is woken by the generic I/O
+waiter.
 `arm_readiness_exclusive` is used only by a blocking I/O syscall. Its default
 delegates to ordinary `arm_readiness`; providers backed by a Linux-style
 exclusive wait queue override it so one consumable event wakes one syscall.
@@ -2152,6 +2166,20 @@ each vector (`narf_lib::kstat`, mapping in `lib/` §3.10) for every online CPU.
 the thread group's times and its reaped children's for `/proc/<pid>/stat`; a
 `/proc/<pid>/task/<tid>/stat` row substitutes the thread's own utime/stime
 from `ThreadStat` and keeps the group's cutime/cstime (`do_task_stat`).
+
+`/proc/schedstat` follows `kernel/sched/stats.c::show_schedstat` at version
+17: `version 17`, `timestamp <jiffies>`, then per online CPU a
+`cpuN yld_count 0 sched_count sched_goidle ttwu_count ttwu_local rq_cpu_time
+run_delay pcount` line and its `domainN <name> <%*pb span>` lines carrying
+3×11 load-balance, 9 active/exec/fork-balance and the `ttwu_wake_remote
+ttwu_move_affine ttwu_move_balance` counters, from `narf_scheduler::schedstat`
+(`scheduler/` §3.4.0; the load-balance columns are zero).
+`/proc/<pid>/schedstat` (`proc_pid_schedstat`) prints `run_time wait_time
+timeslices`, `wait_time` being the task's `run_delay`. `/proc/narf/ipi` prints
+one row per online CPU: reschedule IPIs received, sent, and avoided (target
+already notified, target polling in idle, kick already in flight), whether it
+is polling in idle now, and TLB-shootdown IPIs received, requests published
+(kernel and tagged), peers targeted and IPIs sent.
 
 ## 4. Invariants & safety properties
 

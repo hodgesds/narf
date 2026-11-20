@@ -130,6 +130,19 @@ fn publish_perf_event(registry: &mut Vec<Weak<PerfEventFile>>, file: &Arc<PerfEv
     let _gate = PERF_EVENT_GATE_LOCK.lock();
     file.registered.store(true, Ordering::Release);
     registry.push(Arc::downgrade(file));
+    // Under the registry lock, like the snapshot that records it: a cached
+    // drain snapshot either holds this event or sees a newer generation.
+    PERF_REGISTRY_GENERATION.fetch_add(1, Ordering::Release);
+    if file.target_task != u64::MAX {
+        // The task enters the filter before the event can be scheduled for it.
+        perf_task_filter_add(file.target_task);
+        TASK_BOUND_PERF_EVENTS.fetch_add(1, Ordering::Release);
+    }
+    if file.reads_cpu_user_time() && CPU_USER_CLOCK_EVENTS.fetch_add(1, Ordering::AcqRel) == 0 {
+        // A new accounting epoch: per-CPU depths recorded while the hook was
+        // gated off are stale and must not leak into this event's deltas.
+        CPU_USER_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
     if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Release) == 0 {
         narf_lib::perf::set_enabled(true);
     }
@@ -137,11 +150,91 @@ fn publish_perf_event(registry: &mut Vec<Weak<PerfEventFile>>, file: &Arc<PerfEv
 
 fn unpublish_perf_event(file: &PerfEventFile) {
     let _gate = PERF_EVENT_GATE_LOCK.lock();
-    if file.registered.swap(false, Ordering::AcqRel)
-        && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel) == 1
-    {
+    // The fork/exit hooks add and remove filter entries for `live` under this
+    // same lock, gated on `registered`; flipping it here makes the removal
+    // below pair with exactly the additions they made.
+    let inherited = file.inherited_tasks.lock();
+    if !file.registered.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if file.target_task != u64::MAX {
+        for &task in &inherited.live {
+            perf_task_filter_remove(task);
+        }
+        perf_task_filter_remove(file.target_task);
+        TASK_BOUND_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel);
+    }
+    drop(inherited);
+    if file.reads_cpu_user_time() {
+        CPU_USER_CLOCK_EVENTS.fetch_sub(1, Ordering::AcqRel);
+    }
+    if ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel) == 1 {
         narf_lib::perf::set_enabled(false);
     }
+}
+
+/// Registered events bound to a task (`pid != -1`). Linux's
+/// `perf_sched_events` static key: only these need context-switch work. A
+/// system-wide `perf top`/`perf record -a` opens per-CPU events only, and its
+/// cost on a context switch must be nothing.
+static TASK_BOUND_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
+/// Registered system-wide `cpu-clock` events that exclude user or kernel time
+/// and therefore read [`cpu_user_time_ns`], the only consumer of the
+/// per-switch user-slice accounting.
+static CPU_USER_CLOCK_EVENTS: AtomicUsize = AtomicUsize::new(0);
+/// Bumped when [`CPU_USER_CLOCK_EVENTS`] leaves zero. A CPU whose slice state
+/// was written in an older epoch restarts it, because the switch that would
+/// have closed it ran while the hook was gated off.
+static CPU_USER_EPOCH: AtomicU64 = AtomicU64::new(1);
+static CPU_USER_SEEN_EPOCH: [AtomicU64; SAMPLE_CPU_SLOTS] =
+    [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
+/// Bumped on every publish; lets the sample drain reuse one registry snapshot
+/// per pass instead of taking one per sample.
+static PERF_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Counting filter over the tasks that task-bound events track (their target
+/// plus inherited children): Linux reaches `task->perf_event_ctxp` from the
+/// task itself, and a context switch of a task without a context does no perf
+/// work. Each slot counts the tracked tasks hashing to it, so a zero slot
+/// proves the task is untracked; a collision only costs the exact slow path.
+const PERF_TASK_FILTER_SLOTS: usize = 1024;
+static PERF_TASK_FILTER: [AtomicU32; PERF_TASK_FILTER_SLOTS] =
+    [const { AtomicU32::new(0) }; PERF_TASK_FILTER_SLOTS];
+
+#[inline]
+fn perf_task_filter_slot(task: u64) -> usize {
+    // Fibonacci hashing: task ids are dense and monotonic, so the multiply
+    // spreads siblings created back to back across distinct slots.
+    (task.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PERF_TASK_FILTER_SLOTS.trailing_zeros()))
+        as usize
+}
+
+fn perf_task_filter_add(task: u64) {
+    PERF_TASK_FILTER[perf_task_filter_slot(task)].fetch_add(1, Ordering::Release);
+}
+
+fn perf_task_filter_remove(task: u64) {
+    let previous = PERF_TASK_FILTER[perf_task_filter_slot(task)].fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous != 0, "perf task filter underflow");
+}
+
+/// False only when no task-bound event tracks `task`.
+#[inline]
+fn perf_task_maybe_tracked(task: u64) -> bool {
+    PERF_TASK_FILTER[perf_task_filter_slot(task)].load(Ordering::Acquire) != 0
+}
+
+/// `(task-bound events, user-time cpu-clock events, filter count of task's
+/// slot, task's slot)` for the switch-gate smokes.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_perf_switch_gates(task: u64) -> (usize, usize, u32, usize) {
+    let slot = perf_task_filter_slot(task);
+    (
+        TASK_BOUND_PERF_EVENTS.load(Ordering::Acquire),
+        CPU_USER_CLOCK_EVENTS.load(Ordering::Acquire),
+        PERF_TASK_FILTER[slot].load(Ordering::Acquire),
+        slot,
+    )
 }
 const PENDING_TRACE_BYTES: usize = 256;
 static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
@@ -1245,6 +1338,15 @@ impl PerfEventFile {
 
     fn counts_user(&self) -> bool {
         self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0
+    }
+
+    /// A system-wide `cpu-clock` that splits user from kernel time: the one
+    /// reader of [`cpu_user_time_ns`] (see `raw_count`).
+    fn reads_cpu_user_time(&self) -> bool {
+        self.attr.type_ == PERF_TYPE_SOFTWARE
+            && self.attr.config == PERF_COUNT_SW_CPU_CLOCK
+            && self.target_task == u64::MAX
+            && (!self.counts_kernel() || !self.counts_user())
     }
 
     fn is_task_hardware_event(&self) -> bool {
@@ -2626,6 +2728,11 @@ pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_ti
             let mut inherited = event.inherited_tasks.lock();
             if !inherited.live.contains(&child_tid) {
                 inherited.live.push(child_tid);
+                // Under the inherited lock, so unpublish's removal of `live`
+                // pairs with exactly these additions.
+                if event.target_task != u64::MAX && event.registered.load(Ordering::Acquire) {
+                    perf_task_filter_add(child_tid);
+                }
                 if let Some(clock) = &event.software_clock {
                     clock.inherit(child_tid);
                 }
@@ -2702,6 +2809,9 @@ pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
                     .saturating_add(event.selected_task_time(tid));
             }
             inherited.live.swap_remove(index);
+            if event.target_task != u64::MAX && event.registered.load(Ordering::Acquire) {
+                perf_task_filter_remove(tid);
+            }
         }
         true
     });
@@ -3032,12 +3142,39 @@ fn ensure_pmi_route() -> Result<(), ()> {
 /// Drain published snapshots from the dedicated task (or explicit test driver).
 /// Event references outlive the registry guard: sample encoding, poll wakeups,
 /// refresh expiry and final-reference cleanup must not run under that lock.
-fn sample_events_snapshot() -> Vec<Arc<PerfEventFile>> {
-    PERF_EVENT_REGISTRY
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect()
+/// One registry snapshot shared by every sample of a drain pass. Linux writes
+/// each sample straight into its event's ring; taking a fresh snapshot per
+/// staged sample made a busy `perf record` pay an allocation, the registry
+/// lock and an Arc round-trip per event for every sample. Refreshed whenever
+/// an event was published after it was taken, so a sample from a new event
+/// still finds its owner.
+struct DrainSnapshot {
+    events: Vec<Arc<PerfEventFile>>,
+    generation: Option<u64>,
+}
+
+impl DrainSnapshot {
+    const fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            generation: None,
+        }
+    }
+
+    fn events(&mut self) -> &[Arc<PerfEventFile>] {
+        let current = PERF_REGISTRY_GENERATION.load(Ordering::Acquire);
+        if self.generation != Some(current) {
+            let registry = PERF_EVENT_REGISTRY.lock();
+            // Read under the lock that publish bumps it under.
+            let generation = PERF_REGISTRY_GENERATION.load(Ordering::Acquire);
+            let events: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
+            drop(registry);
+            // The previous snapshot's references drop outside the lock.
+            self.events = events;
+            self.generation = Some(generation);
+        }
+        &self.events
+    }
 }
 
 #[cfg(feature = "kernel-test")]
@@ -3063,6 +3200,7 @@ pub(crate) fn drain_irq_samples() {
 #[inline(never)]
 fn drain_irq_samples_active(cpus: u64) {
     let mut notify = false;
+    let mut snapshot = DrainSnapshot::new();
     {
         for (cpu, buckets) in PENDING_LOSSES.iter().enumerate() {
             if cpus & (1u64 << cpu) == 0 {
@@ -3079,8 +3217,8 @@ fn drain_irq_samples_active(cpus: u64) {
                 let event_id = bucket.event_id.load(Ordering::Relaxed);
                 let lost = bucket.count.swap(0, Ordering::Relaxed);
                 if lost != 0 {
-                    let events = sample_events_snapshot();
-                    for event in &events {
+                    let events = snapshot.events();
+                    for event in events {
                         if event.id == event_id {
                             event.sample_lost.fetch_add(lost, Ordering::Relaxed);
                             break;
@@ -3125,8 +3263,8 @@ fn drain_irq_samples_active(cpus: u64) {
             // SAFETY: this consumer exclusively owns the acquired state-1 slot.
             let user_stack = unsafe { pending.user_stack.slice(stack_size) };
             {
-                let events = sample_events_snapshot();
-                for event in &events {
+                let events = snapshot.events();
+                for event in events {
                     let matched_counter = (0..8).find(|&idx| {
                         counters & (1 << idx) != 0
                             && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
@@ -3176,8 +3314,8 @@ fn drain_irq_samples_active(cpus: u64) {
             }
             let type_id = bucket.event_id.load(Ordering::Relaxed);
             let lost = bucket.count.swap(0, Ordering::Relaxed);
-            let events = sample_events_snapshot();
-            for event in &events {
+            let events = snapshot.events();
+            for event in events {
                 if event.attr.type_ == PERF_TYPE_TRACEPOINT && event.attr.config == type_id {
                     event.sample_lost.fetch_add(lost, Ordering::Relaxed);
                 }
@@ -3206,8 +3344,8 @@ fn drain_irq_samples_active(cpus: u64) {
             // SAFETY: this consumer owns the acquired state-1 slot.
             let raw =
                 unsafe { core::slice::from_raw_parts(pending.bytes.0.as_ptr().cast::<u8>(), len) };
-            let events = sample_events_snapshot();
-            for event in &events {
+            let events = snapshot.events();
+            for event in events {
                 if event.attr.type_ != PERF_TYPE_TRACEPOINT
                     || event.attr.config != type_id
                     || !event.enabled.load(Ordering::Acquire)
@@ -3444,8 +3582,31 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    account_cpu_user_switch(running);
+    if CPU_USER_CLOCK_EVENTS.load(Ordering::Relaxed) != 0 {
+        account_cpu_user_switch(running);
+    }
+    // `perf_sched_events`: per-CPU events (perf top / perf record -a) need no
+    // context-switch work at all.
+    if TASK_BOUND_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let cpu = narf_lib::percpu::current_cpu();
+    // `perf_event_task_sched_in/out` touch only a task with a perf context.
+    // The multiplex cursor still needs every selected task (see below).
+    if !perf_task_maybe_tracked(task) {
+        if running {
+            PERF_LAST_SELECTED_TASK[cpu].store(task, Ordering::Relaxed);
+        }
+        return;
+    }
+    on_task_switch_tracked(task, running, cpu);
+}
+
+/// The switch hook for a task some task-bound event may track: the exact
+/// registry walk. Kept out of line so the common untracked switch inlines to a
+/// few loads.
+#[inline(never)]
+fn on_task_switch_tracked(task: u64, running: bool, cpu: usize) {
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| weak.strong_count() != 0);
     if registry.is_empty() {
@@ -3579,7 +3740,8 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
 /// This is allocation-free and uses only IRQ-safe locks. Sampled events carry
 /// their exact hardware `period_left` through the stop/reallocate path.
 pub(crate) fn on_multiplex_tick(task: u64) {
-    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+    // Only task hardware events multiplex here; they are all task-bound.
+    if TASK_BOUND_PERF_EVENTS.load(Ordering::Relaxed) == 0 || !perf_task_maybe_tracked(task) {
         return;
     }
     let cpu = narf_lib::percpu::current_cpu();
@@ -3676,6 +3838,17 @@ fn account_cpu_user_switch(running: bool) {
     let Some(depth) = CPU_USER_DEPTH.get(cpu) else {
         return;
     };
+    // Only this CPU writes its slice state. A slice opened in an earlier epoch
+    // lost its closing switch while the hook was gated off: drop it.
+    let epoch = CPU_USER_EPOCH.load(Ordering::Acquire);
+    if CPU_USER_SEEN_EPOCH[cpu].load(Ordering::Relaxed) != epoch {
+        depth.store(0, Ordering::Relaxed);
+        CPU_USER_SLICE_START_NS[cpu].store(0, Ordering::Relaxed);
+        CPU_USER_SEEN_EPOCH[cpu].store(epoch, Ordering::Release);
+        if !running {
+            return;
+        }
+    }
     if running {
         if depth.fetch_add(1, Ordering::AcqRel) == 0 {
             CPU_USER_SLICE_START_NS[cpu].store(narf_time::monotonic_ns(), Ordering::Release);
@@ -3707,7 +3880,11 @@ fn cpu_user_time_ns(cpu: usize) -> u64 {
         return 0;
     };
     let mut value = total.load(Ordering::Acquire);
-    if CPU_USER_DEPTH[cpu].load(Ordering::Acquire) != 0 {
+    // A CPU that has not switched since the epoch began has no slice open in
+    // it; whatever its depth says belongs to an abandoned epoch.
+    let current_epoch =
+        CPU_USER_SEEN_EPOCH[cpu].load(Ordering::Acquire) == CPU_USER_EPOCH.load(Ordering::Acquire);
+    if current_epoch && CPU_USER_DEPTH[cpu].load(Ordering::Acquire) != 0 {
         let start = CPU_USER_SLICE_START_NS[cpu].load(Ordering::Acquire);
         if start != 0 {
             value = value.saturating_add(narf_time::monotonic_ns().saturating_sub(start));

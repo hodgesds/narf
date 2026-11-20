@@ -147,7 +147,10 @@ fn timer_fires_behind_stuck_cpu(masked: bool) -> TestResult {
     WOKE_CPU.store(usize::MAX, Ordering::Release);
     narf_scheduler::spawn_with_spec(
         async {
-            let mut early = narf_time::sleep_ns(EARLY_NS);
+            // hrtimers, as the test is named for: a plain `sleep_ns` of
+            // this length is `fsleep` and goes to the timer wheel.
+            let mut early =
+                narf_time::SleepUntil::exact(narf_time::Deadline::after_ns(EARLY_NS).as_instant());
             core::future::poll_fn(|cx| {
                 let _ = Pin::new(&mut early).poll(cx);
                 Poll::Ready(())
@@ -175,7 +178,8 @@ fn timer_fires_behind_stuck_cpu(masked: bool) -> TestResult {
     let start = narf_time::monotonic_ns();
     narf_scheduler::spawn_with_spec(
         async {
-            narf_time::sleep_ns(SLEEP_NS).await;
+            narf_time::SleepUntil::exact(narf_time::Deadline::after_ns(SLEEP_NS).as_instant())
+                .await;
             WOKE_NS.store(narf_time::monotonic_ns(), Ordering::Release);
             WOKE_CPU.store(narf_lib::percpu::current_cpu(), Ordering::Release);
         },

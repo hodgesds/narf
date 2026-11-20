@@ -269,6 +269,30 @@ Continuation alone does not create a poll edge. The callback can run once per
 direction under the readiness lock and must neither allocate nor drop wakers.
 This prevents available data/space from stranding other exclusive blockers.
 
+```rust
+pub struct WaitQueue;
+impl WaitQueue {
+    pub const fn new() -> Self;
+    pub fn arm(&self, id: u64, interest: u32, waker: &Waker,
+               level: impl FnOnce() -> u32) -> Poll<u32>;
+    pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker,
+                          level: impl FnOnce() -> u32) -> u32;
+    pub fn disarm(&self, id: u64);
+    pub fn wake(&self, bits: u32);
+}
+```
+
+`WaitQueue` is the Linux `wait_queue_head_t` for providers whose readiness is
+computed by the provider (`->poll`) rather than held as a level: a sequence
+cursor (`/dev/kmsg`, mountinfo, `cgroup.events`), a line discipline (ttys,
+ptys), a request queue (`/dev/fuse`). It keeps no level, so it cannot hold a
+stale one. `arm` and `arm_persistent` register first and then call `level`,
+outside the queue lock (`poll_wait(); mask = compute();`); `arm` removes the
+registration when it reports `Ready`. A producer publishes its state change and
+then calls `wake`, which wakes every waiter whose interest intersects `bits`
+by reference under the queue lock (IRQ-safe, allocation-free). Either the
+waiter's computation sees the change or the wake finds the waiter queued.
+
 ### 3.8 Deferred IRQ wakes
 
 `deferred_wake::{push_pending_iter, try_push_one}` publish wakers to a bounded

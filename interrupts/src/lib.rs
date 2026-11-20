@@ -27,10 +27,13 @@ pub mod wake;
 
 mod gic_dt_tests;
 mod gic_spi_tests;
+#[cfg(target_arch = "x86_64")]
+mod ipi_smp_tests;
 #[path = "its_tests.rs"]
 mod its_tests;
 mod lapic_oneshot_tests;
 mod tests;
+mod timer_rate_tests;
 
 pub use dispatch::{
     add_nmi_handler, disable_irq, enable_irq, fire_count, fire_count_on_cpu,

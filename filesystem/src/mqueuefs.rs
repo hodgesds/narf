@@ -225,18 +225,20 @@ impl Queue {
     /// two are never held together). Called after every `send`/`receive`;
     /// `event` is the just-changed direction (POLL_IN on send, POLL_OUT on recv).
     fn sync_readiness(&self, event: u32) {
-        let (readable, writable) = {
-            let state = self.state.lock();
-            (
-                !state.messages.is_empty(),
-                state.messages.len() < self.maxmsg as usize,
-            )
-        };
+        // Sample and publish under ONE state hold. Sampled under the lock and
+        // published after it, a sender's "readable" and a receiver's "empty"
+        // could land in the opposite order and leave the cell stale (a waiter
+        // then armed against a level the queue no longer has). Waking under
+        // the state lock is safe: a waker never takes a queue's state lock.
+        let state = self.state.lock();
+        let readable = !state.messages.is_empty();
+        let writable = state.messages.len() < self.maxmsg as usize;
         let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
         let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
         self.readiness.set(add, clear);
         // Fire the wait-queue for the just-changed direction, masked to ready.
         self.readiness.notify(event & add);
+        drop(state);
     }
 }
 

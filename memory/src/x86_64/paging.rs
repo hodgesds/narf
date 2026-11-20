@@ -646,6 +646,7 @@ pub unsafe fn invlpg_global(virt: VirtAddr) {
     // SAFETY: caller upholds invlpg's contract.
     unsafe {
         invlpg(virt);
+        flush_nonglobal_all_pcids_local();
     }
     let h = SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if h != 0 {
@@ -679,7 +680,7 @@ pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
     if pages == 0 {
         return;
     }
-    // Local INVLPG over each page.
+    // Local INVLPG over each page, then every other PCID's copies.
     for k in 0..pages {
         let v = VirtAddr::new(va_base.raw() + k * 4096);
         // SAFETY: per the function contract.
@@ -687,9 +688,139 @@ pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
             invlpg(v);
         }
     }
+    // SAFETY: CPL=0 per the function contract.
+    unsafe { flush_nonglobal_all_pcids_local() };
     // SAFETY: the local half was completed above for this exact range.
     unsafe { invlpg_remote_range(va_base, pages) };
 }
+
+/// Per-CPU memo of CPUID(7,0).EBX[10] (INVPCID): 0 unknown, 1 absent,
+/// 2 present. CPUID exits to the hypervisor on every execution, and the
+/// all-PCID flush below runs once per kernel-range invalidation.
+static INVPCID_MEMO: [core::sync::atomic::AtomicU8; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn invpcid_usable_here() -> bool {
+    use core::sync::atomic::Ordering;
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    match INVPCID_MEMO[cpu].load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let present = narf_arch::x86_64::pcid::invpcid_supported();
+            INVPCID_MEMO[cpu].store(if present { 2 } else { 1 }, Ordering::Relaxed);
+            present
+        }
+    }
+}
+
+/// Drop every non-global translation this CPU caches under ANY PCID, together
+/// with every PCID's paging-structure caches. The local half of a kernel-range
+/// invalidation when CR4.PCIDE is set; a no-op otherwise (a single context,
+/// which INVLPG already covers).
+///
+/// Runtime kernel mappings (vmalloc, kernel stacks, BPF and module text, the
+/// driver-domain heaps) are deliberately non-global (`vmalloc::kernel_leaf_flags`),
+/// and the kernel runs on the trapping task's process PCID (`trap_entry.S`
+/// keeps a process CR3 loaded), so a CPU caches such a mapping under every PCID
+/// it has run since. INVLPG removes only the current PCID's entry and the
+/// current PCID's paging-structure caches (Intel SDM Vol. 3A §4.10.4.1; the
+/// AMD APM Vol. 2 §5.5 PCID rules match), so a copy tagged with another PCID
+/// would survive the unmap and become live again on that PCID's next
+/// no-flush CR3 load, pointing at a freed frame or a page table that was
+/// freed and reused. Linux never meets this because its kernel mappings are
+/// global whenever PCID is on (`flush_tlb_one_kernel` relies on it).
+///
+/// INVPCID type 3 (all contexts, globals retained) is exact; without INVPCID,
+/// toggling CR4.PGE invalidates every entry of every PCID (Linux
+/// `native_flush_tlb_global`).
+///
+/// # Safety
+/// CPL=0.
+pub unsafe fn flush_nonglobal_all_pcids_local() {
+    use core::sync::atomic::{compiler_fence, Ordering};
+    if !narf_arch::x86_64::pcid::pcide_enabled() {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+    if invpcid_usable_here() {
+        // SAFETY: INVPCID present and CR4.PCIDE set on this CPU.
+        unsafe { narf_arch::x86_64::pcid::invpcid_all_without_globals() };
+    } else {
+        use narf_arch::x86_64::cr::{read_cr4, write_cr4, CR4_PGE};
+        // SAFETY: each write differs from the previous value only in PGE;
+        // any change of CR4.PGE invalidates all TLB entries for all PCIDs.
+        unsafe {
+            let cr4 = read_cr4();
+            write_cr4(cr4 ^ CR4_PGE);
+            write_cr4(cr4);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Unmap `pages` kernel leaves from `base` in `root` and hand each removed
+/// backing frame to `release` only after every CPU has dropped the old
+/// translation: Linux `vunmap_range` followed by one `flush_tlb_kernel_range`
+/// (the kernel side of `mmu_gather`), instead of one broadcast IPI and
+/// ack-wait per page.
+///
+/// Leaves are cleared under one `pt_lock` hold per batch of
+/// [`KERNEL_UNMAP_BATCH`] pages with a local INVLPG each; the lock is dropped
+/// before the cross-CPU invalidation (every online peer, idle ones included,
+/// as `flush_tlb_kernel_range` does — a kernel mapping has no address-space
+/// owner to narrow by), then the batch's frames are released. Absent leaves
+/// are skipped. Returns the number of leaves removed.
+///
+/// # Safety
+/// `root` is the live kernel root; the range was mapped by the caller, holds
+/// no global leaf, and nothing references it any more.
+pub unsafe fn unmap_kernel_pages(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+    release: &mut dyn FnMut(PhysAddr),
+) -> u64 {
+    let mut removed = 0;
+    let mut frames = [0u64; KERNEL_UNMAP_BATCH];
+    let mut done = 0u64;
+    while done < pages {
+        let n = (pages - done).min(KERNEL_UNMAP_BATCH as u64);
+        let chunk = VirtAddr::new(base.raw() + done * 4096);
+        {
+            let _pt_guard = pt_lock_for(root).lock();
+            for (k, slot) in frames.iter_mut().enumerate().take(n as usize) {
+                let va = VirtAddr::new(chunk.raw() + k as u64 * 4096);
+                *slot = if is_canonical(va) {
+                    // SAFETY: lock held, canonical and page-aligned (`base`
+                    // is); local INVLPG only, the batch flush follows.
+                    unsafe { unmap_4kb_locked(root, va, false, true) }.map_or(0, |pa| pa.raw())
+                } else {
+                    0
+                };
+            }
+        }
+        // SAFETY: every leaf of the chunk was cleared above and locally
+        // invalidated; this completes the other PCIDs and the peers.
+        unsafe {
+            flush_nonglobal_all_pcids_local();
+            invlpg_remote_range(chunk, n);
+        }
+        for &frame in frames.iter().take(n as usize) {
+            if frame != 0 {
+                removed += 1;
+                release(PhysAddr::new(frame));
+            }
+        }
+        done += n;
+    }
+    removed
+}
+
+/// Leaves per cross-CPU invalidation in [`unmap_kernel_pages`]: a 64 KiB
+/// kernel stack is one batch. Bounded so the frame buffer stays small.
+pub const KERNEL_UNMAP_BATCH: usize = 32;
 
 /// Broadcast a range invalidation to peer CPUs without repeating the current
 /// CPU's invalidation. This is the second half of a batched page-table helper
@@ -1729,11 +1860,45 @@ pub unsafe fn protect_4kb(
 ///
 /// # Safety
 /// `root` must be the live kernel root. The caller MUST have already unmapped
-/// every present leaf in this PT with a GLOBAL INVLPG (as `unmap_4kb` does):
-/// INVLPG invalidates the paging-structure caches for the address on all CPUs,
-/// so once every leaf is flushed, no CPU can walk the freed PT frame after it
-/// is reused.
+/// every present leaf in this PT through a kernel-range invalidation
+/// (`unmap_4kb`, `invlpg_global*`, `unmap_kernel_pages`): each runs INVLPG
+/// plus, with CR4.PCIDE set, an all-PCID flush on every online CPU. INVLPG
+/// alone drops only the current PCID's paging-structure caches (Intel SDM
+/// Vol. 3A §4.10.4.1); the all-PCID flush drops the rest, so no CPU can walk
+/// the freed PT frame after it is reused.
 pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    // Detach under the lock, invalidate, then free: a CPU may have re-cached
+    // the PD/PDPT entry naming the table between the caller's leaf flush and
+    // the detach (a speculative walk of the now-empty range), and that cached
+    // entry must be gone before the frame can be reused (Linux frees page
+    // tables only after the `mmu_gather` flush).
+    let mut detached = [0u64; 2];
+    // SAFETY: forwarded caller contract.
+    let freed = unsafe { detach_empty_kernel_pt(root, virt, &mut detached) };
+    if !freed {
+        return false;
+    }
+    // SAFETY: CPL=0; one page of the granule reaches every CPU's handler,
+    // whose INVLPG plus all-PCID flush drops all paging-structure caches.
+    unsafe {
+        flush_nonglobal_all_pcids_local();
+        invlpg_remote_range(VirtAddr::new(virt.raw() & !0x1F_FFFF), 1);
+    }
+    for frame in detached {
+        if frame != 0 {
+            crate::frame::free_frame(crate::frame::PhysFrame::new(PhysAddr::new(frame)));
+        }
+    }
+    true
+}
+
+/// [`free_empty_pt`]'s locked half: clear the PD entry of an empty PT (and the
+/// PDPT entry of a PD that emptied with it), unregister both, and return their
+/// frames in `out` for the caller to free after its invalidation.
+///
+/// # Safety
+/// As [`free_empty_pt`].
+unsafe fn detach_empty_kernel_pt(root: PhysAddr, virt: VirtAddr, out: &mut [u64; 2]) -> bool {
     let _guard = pt_lock_for(root).lock();
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: root is identity-reachable and the mutation lock is held.
@@ -1762,20 +1927,18 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     if pt.entries.iter().any(|e| e.is_present()) {
         return false;
     }
-    // Detach and free the now-empty PT. The caller's per-leaf global INVLPGs
-    // already flushed the paging-structure caches covering this range, so the
-    // freed frame cannot be walked into after reuse.
+    // Detach the now-empty PT; the caller frees it after its invalidation.
     pd.entries[idx.pd] = PageTableEntry::EMPTY;
     crate::frame::__pagetable_unregister(pt_phys.raw());
-    crate::frame::free_frame(crate::frame::PhysFrame::new(pt_phys));
-    // Cascade: if that emptied the PD too, free it and clear its PDPT entry.
+    out[0] = pt_phys.raw();
+    // Cascade: if that emptied the PD too, detach it and clear its PDPT entry.
     // Stop at the PDPT — it is the reserved slot's shared child every address
     // space copies, so it must persist.
     if !pd.entries.iter().any(|e| e.is_present()) {
         let pd_phys = pdpte.addr();
         pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
         crate::frame::__pagetable_unregister(pd_phys.raw());
-        crate::frame::free_frame(crate::frame::PhysFrame::new(pd_phys));
+        out[1] = pd_phys.raw();
     }
     true
 }

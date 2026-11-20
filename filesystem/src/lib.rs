@@ -1730,6 +1730,22 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// True only for a provider whose readiness can change with NO wake at
+    /// all: hardware polled without an interrupt (a probed `ttyS1+` UART read
+    /// by polling the LSR) or a driver bridge not yet given a wait queue.
+    /// A blocking `poll`/`select` over such a file keeps a bounded rescan
+    /// timer for this file only.
+    ///
+    /// Every other file is either constant (a regular file: its readiness
+    /// never changes, so nothing needs to wake a poller), or has a wait queue
+    /// (`arm_readiness` returns `Some`, the Linux `->poll` + `poll_wait`
+    /// contract), or is woken by the generic I/O waiter. Linux has no
+    /// equivalent: every file's `->poll` names its wait queue. A `true` here is
+    /// therefore a known gap, and each override says why it is one.
+    fn poll_requires_rescan(&self) -> bool {
+        false
+    }
+
     /// Linux `ioctl(2)` dispatch for this file. `cmd` is the encoded
     /// request word (Linux `_IOC(dir, type, nr, size)`); `arg` is the
     /// raw user-pointer argument the syscall layer received.
@@ -3948,6 +3964,7 @@ pub mod sb_flags {
             super::note_mnt_flags(super::mnt_flags::READONLY);
         }
         GENERATION.fetch_add(1, Ordering::AcqRel);
+        super::notify_mount_change();
     }
 
     /// See [`GENERATION`].
@@ -4309,7 +4326,18 @@ pub fn install_mount_change_hook(hook: fn()) {
     MOUNT_CHANGE_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// `mnt_namespace::poll`: the wait queue `/proc/<pid>/mountinfo` pollers
+/// sleep on. Linux keeps one per namespace; NARF keeps one for all of them,
+/// and every woken poller recomputes its own namespace's generation, which is
+/// the same answer at the cost of waking a monitor whose namespace did not
+/// change (mount changes are rare).
+pub static MOUNTINFO_WAIT: narf_lib::readiness::WaitQueue = narf_lib::readiness::WaitQueue::new();
+
+/// Publish a mount-table change to its pollers: `__touch_mnt_namespace`'s
+/// `wake_up_interruptible(&ns->poll)`. Every caller bumps the generation the
+/// pollers compare against BEFORE calling this.
 fn notify_mount_change() {
+    MOUNTINFO_WAIT.wake(POLL_PRI | POLL_ERR | POLL_IN);
     let raw = MOUNT_CHANGE_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if raw != 0 {
         // SAFETY: `install_mount_change_hook` stores only `fn()` values.
@@ -5153,6 +5181,10 @@ impl MountNamespace {
         self.store()
             .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        // A remount's changed options are a mountinfo change (Linux
+        // `do_reconfigure_mnt` → `touch_mnt_namespace`).
+        notify_mount_change();
         true
     }
 
@@ -5943,6 +5975,8 @@ impl VfsRegistry {
         note_mnt_flags(flags);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         true
     }
 

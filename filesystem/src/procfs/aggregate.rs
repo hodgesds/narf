@@ -122,7 +122,9 @@ pub fn register_all() {
     register_proc("buddyinfo", agg(gen_buddyinfo));
     register_proc("numastat", agg(gen_numastat));
     register_proc("pagetypeinfo", agg(gen_pagetypeinfo));
-    register_proc("timer_list", agg(gen_timer_list));
+    super::timer_list::register();
+    register_proc("schedstat", agg(gen_schedstat));
+    register_proc("narf/ipi", agg(gen_narf_ipi));
     register_proc("locks", agg(gen_locks));
     register_proc("devices", agg(gen_devices));
     register_proc("consoles", agg(gen_consoles));
@@ -240,9 +242,18 @@ fn gen_interrupts() -> Vec<u8> {
     }
     let _ = writeln!(s, "   Non-maskable interrupts");
 
+    // `LOC`: the per-CPU local timer (`irq_stat.apic_timer_irqs`), here the
+    // primary clockevent's vector, counted per CPU by the dispatcher.
+    let tick_vector =
+        narf_time::clockevent::TICK_VECTOR.load(core::sync::atomic::Ordering::Acquire);
     let _ = write!(s, "LOC:");
-    for _ in 0..per_cpu {
-        let _ = write!(s, " {:>10}", 0);
+    for cpu in 0..per_cpu {
+        let n = if tick_vector == 0 {
+            0
+        } else {
+            narf_interrupts::fire_count_on_cpu(tick_vector, cpu)
+        };
+        let _ = write!(s, " {:>10}", n);
     }
     let _ = writeln!(s, "   Local timer interrupts");
 
@@ -984,35 +995,147 @@ fn gen_pagetypeinfo() -> Vec<u8> {
     s.into_bytes()
 }
 
-// ── /proc/timer_list ─────────────────────────────────────────────────
-//
-// Linux: kernel/time/timer_list.c show_timer_list
-// NARF's hrtimers are per-CPU bases (narf-time::hrtimer), listed per CPU.
+// /proc/timer_list lives in `super::timer_list` (kernel/time/timer_list.c).
 
-fn gen_timer_list() -> Vec<u8> {
+// ── /proc/schedstat ──────────────────────────────────────────────────
+//
+// Linux: kernel/sched/stats.c show_schedstat, SCHEDSTAT_VERSION 17. Field
+// sources and the zero load-balancer columns are documented in
+// narf_scheduler::schedstat.
+
+/// Linux `%*pb` for a cpumask of `nr_cpu_ids` bits: hex, 32-bit groups
+/// separated by commas, the most significant group only as wide as needed.
+fn cpumask_pb(mask: u64, nr_cpu_ids: usize) -> String {
+    let nr = nr_cpu_ids.clamp(1, 64);
+    let mut out = String::new();
+    let groups = nr.div_ceil(32);
+    for g in (0..groups).rev() {
+        let bits = if g == groups - 1 { nr - g * 32 } else { 32 };
+        let width = bits.div_ceil(4);
+        let value = (mask >> (g * 32))
+            & if bits == 32 {
+                0xffff_ffff
+            } else {
+                (1u64 << bits) - 1
+            };
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let _ = write!(out, "{:0width$x}", value, width = width);
+    }
+    out
+}
+
+fn gen_schedstat() -> Vec<u8> {
     let mut s = String::new();
-    let _ = writeln!(s, "Timer List Version: v0.9");
     let _ = writeln!(
         s,
-        "HRTIMER_MAX_CLOCK_BASES: {}",
-        narf_time::hrtimer::HRTIMER_MAX_CLOCK_BASES
+        "version {}",
+        narf_scheduler::schedstat::SCHEDSTAT_VERSION
     );
-    let _ = writeln!(s, "now at {} nsecs", narf_time::monotonic_ns());
-    for cpu in 0..narf_lib::percpu::MAX_CPUS {
-        if !narf_lib::smp::is_online(cpu as u32) {
-            continue;
+    let _ = writeln!(s, "timestamp {}", narf_time::timer::jiffies());
+    let online = narf_lib::smp::online_bitmap() | 1;
+    let nr_cpu_ids = (u64::BITS - online.leading_zeros()) as usize;
+    let mut scan = online;
+    while scan != 0 {
+        let cpu = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        let st = narf_scheduler::schedstat::cpu_schedstat(cpu);
+        let _ = writeln!(
+            s,
+            "cpu{} {} 0 {} {} {} {} {} {} {}",
+            cpu,
+            st.yld_count,
+            st.sched_count,
+            st.sched_goidle,
+            st.ttwu_count,
+            st.ttwu_local,
+            st.rq_cpu_time_ns,
+            st.run_delay_ns,
+            st.pcount
+        );
+        let (domains, count) = narf_scheduler::schedstat::sched_domains(cpu);
+        for (level, domain) in domains.iter().take(count).enumerate() {
+            let _ = write!(
+                s,
+                "domain{} {} {}",
+                level,
+                domain.name,
+                cpumask_pb(domain.span, nr_cpu_ids)
+            );
+            // lb_* for CPU_IDLE, CPU_NOT_IDLE, CPU_NEWLY_IDLE: 3 x 11 fields.
+            for _ in 0..33 {
+                s.push_str(" 0");
+            }
+            // alb_*, sbe_*, sbf_*: 9 fields.
+            for _ in 0..9 {
+                s.push_str(" 0");
+            }
+            let (remote, affine, balance) = if level == 0 {
+                (
+                    st.ttwu_remote_llc,
+                    st.ttwu_move_affine,
+                    st.ttwu_move_balance,
+                )
+            } else {
+                (st.ttwu_remote_far, 0, st.ttwu_move_balance_far)
+            };
+            let _ = writeln!(s, " {} {} {}", remote, affine, balance);
         }
-        let _ = writeln!(s);
-        let _ = writeln!(s, "cpu: {}", cpu);
-        let queued = narf_time::hrtimer::nr_queued_on(cpu);
-        if queued == 0 {
-            let _ = writeln!(s, " no timers pending");
-        } else {
-            let _ = writeln!(s, " pending timers: {}", queued);
-        }
-        if let Some(next) = narf_time::hrtimer::next_event_ns_of(cpu) {
-            let _ = writeln!(s, " expires_next: {} nsecs", next);
-        }
+    }
+    s.into_bytes()
+}
+
+// ── /proc/narf/ipi ───────────────────────────────────────────────────
+//
+// Per-CPU reschedule and TLB-shootdown IPI accounting: what each CPU sent,
+// what it avoided sending (and why), and what it received.
+
+fn gen_narf_ipi() -> Vec<u8> {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "cpu resched_rcvd resched_sent skip_pending skip_polling skip_in_flight idle_polling \
+         tlb_rcvd tlb_kernel_req tlb_tagged_req tlb_targets tlb_ipis_sent"
+    );
+    let mut scan = narf_lib::smp::online_bitmap() | 1;
+    while scan != 0 {
+        let cpu = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        let k = narf_scheduler::resched_kick_stats(cpu);
+        let resched_rcvd =
+            narf_interrupts::dispatch::fire_count_on_cpu(narf_interrupts::VECTOR_RESCHED, cpu);
+        let tlb_rcvd = narf_interrupts::dispatch::fire_count_on_cpu(
+            narf_interrupts::VECTOR_TLB_SHOOTDOWN,
+            cpu,
+        );
+        #[cfg(target_arch = "x86_64")]
+        let t = narf_interrupts::x86_64::ipi::cpu_stats(cpu as u32);
+        #[cfg(target_arch = "x86_64")]
+        let (kreq, treq, targets, sent) = (
+            t.kernel_requests,
+            t.tagged_requests,
+            t.request_targets,
+            t.ipis_sent,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let (kreq, treq, targets, sent) = (0u64, 0u64, 0u64, 0u64);
+        let _ = writeln!(
+            s,
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
+            cpu,
+            resched_rcvd,
+            k.ipi_sent,
+            k.skip_pending,
+            k.skip_polling,
+            k.skip_in_flight,
+            u8::from(narf_scheduler::cpu_idle_polling(cpu)),
+            tlb_rcvd,
+            kreq,
+            treq,
+            targets,
+            sent
+        );
     }
     s.into_bytes()
 }
@@ -1707,3 +1830,49 @@ kernel_test_in!(
     "filesystem/procfs/aggregate",
     smoke_filesystems_lists_unmounted_registered_types
 );
+
+/// `/proc/schedstat` has Linux's version-17 shape: the header, one 10-token
+/// `cpuN` line per online CPU, then its `domainN` lines (name, span and 45
+/// counters), so `perf sched stats` and similar parsers accept it.
+fn smoke_schedstat_v17_shape() -> TestResult {
+    let body = String::from_utf8(gen_schedstat()).unwrap_or_default();
+    let mut lines = body.lines();
+    if lines.next() != Some("version 17") {
+        return TestResult::Fail("schedstat does not start with `version 17`");
+    }
+    if !lines.next().is_some_and(|l| l.starts_with("timestamp ")) {
+        return TestResult::Fail("schedstat lacks the timestamp line");
+    }
+    let mut cpus = 0;
+    for line in lines {
+        let fields = line.split_whitespace().count();
+        if line.starts_with("cpu") {
+            cpus += 1;
+            if fields != 10 {
+                return TestResult::Fail("a cpu line does not carry the nine v17 fields");
+            }
+        } else if line.starts_with("domain") {
+            if fields != 48 {
+                return TestResult::Fail("a domain line does not carry name, span and 45 counters");
+            }
+        } else {
+            return TestResult::Fail("schedstat carries a line that is neither cpu nor domain");
+        }
+    }
+    if cpus != (narf_lib::smp::online_bitmap() | 1).count_ones() {
+        return TestResult::Fail("schedstat does not list every online CPU");
+    }
+    if cpumask_pb(0xfff, 12) != "fff" || cpumask_pb(0x1_0000_0001, 33) != "1,00000001" {
+        return TestResult::Fail("cpumask spans are not in Linux's %*pb format");
+    }
+    let ipi = String::from_utf8(gen_narf_ipi()).unwrap_or_default();
+    if ipi
+        .lines()
+        .skip(1)
+        .any(|l| l.split_whitespace().count() != 12)
+    {
+        return TestResult::Fail("/proc/narf/ipi rows do not match its header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs/schedstat", smoke_schedstat_v17_shape);

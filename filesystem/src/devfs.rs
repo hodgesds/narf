@@ -515,6 +515,31 @@ impl FileOps for DevKmsg {
         self.readable()
     }
 
+    /// `devkmsg_poll`: `poll_wait(file, &log_wait, wait)`, then the cursor
+    /// check against the record store.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(narf_console::klog::KMSG_WAIT.arm(id, interest, waker, || self.readable()))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(narf_console::klog::KMSG_WAIT.arm_persistent(id, interest, waker, || self.readable()))
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        narf_console::klog::KMSG_WAIT.disarm(id);
+        true
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         if buf.is_empty() {
             // `sys_read` answers a zero-count read before reaching here.
@@ -1361,6 +1386,37 @@ impl FileOps for DevConsole {
             mask |= crate::POLL_IN;
         }
         mask
+    }
+
+    /// `n_tty_poll`: queue on the port's input wait queue, then recompute.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.port()
+            .arm_input(id, interest, waker, || self.poll_readiness())
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.port()
+            .arm_input_persistent(id, interest, waker, || self.poll_readiness())
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.port().disarm_input(id)
+    }
+
+    /// A probed `ttyS1+` UART is polled, not interrupt-driven: nothing wakes
+    /// a poller when a byte lands, so its poll keeps a bounded rescan.
+    fn poll_requires_rescan(&self) -> bool {
+        self.port().input_unnotified()
     }
 
     /// Park an empty `/dev/console` read on the input waker rather than

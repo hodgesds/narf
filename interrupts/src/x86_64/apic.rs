@@ -1695,20 +1695,6 @@ static TSC_SCHED_DEADLINE: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX)
 /// storm. ~a few µs at multi-GHz; mirrors Linux clockevents min_delta_ns.
 const MIN_DELTA_CYCLES: u64 = 10_000;
 
-/// Coalescing slack (TSC cycles, ≈ 80 µs at 2.5 GHz) for the wheel-driven
-/// re-arm path. `arm_tsc_deadline_if_earlier` reprograms the one-shot only
-/// when the new deadline is earlier than what's already armed by MORE than
-/// this — so a cluster of sleepers landing just before the already-armed
-/// (typically the 1 kHz periodic) deadline does NOT trigger an MSR write
-/// each. This is the hysteresis/slack Linux gets from hrtimer `_softexpires`
-/// ranges and timer-wheel buckets; without it, ~1 ms sleepers re-arming the
-/// LAPIC a hair early drove the effective IRQ rate to ~5x the configured
-/// 1 kHz. A coalesced timer fires at most `COALESCE_SLACK_CYCLES` late
-/// (bounded because we only skip when armed − target ≤ slack), and the next
-/// periodic tick re-arms to the exact wheel minimum regardless, so precision
-/// for genuinely sub-slack sleeps (which reprogram exactly) is preserved.
-const COALESCE_SLACK_CYCLES: u64 = 200_000;
-
 /// Earliest deadline to arm the one-shot for: the sooner of the next
 /// periodic tick and the earliest wheel deadline, floored to `now +
 /// min_delta` so we never program the past. Pure; unit-tested.
@@ -1732,14 +1718,15 @@ pub(crate) fn next_arm_target(
     }
 }
 
+/// Whether the one-shot must be reprogrammed for `target`: it is no longer
+/// armed (its mirror is in the past) or `target` is earlier than what is
+/// armed — Linux `hrtimer_reprogram`'s `expires >= expires_next` test, with
+/// no extra hysteresis. Timer coalescing is the hrtimers' own business
+/// (`[_softexpires, expires]` ranges, the wheel's buckets): delaying an
+/// earlier event here would make even a zero-slack timer late.
 #[inline]
-pub(crate) const fn should_rearm_tsc_deadline(
-    now: u64,
-    armed: u64,
-    target: u64,
-    coalesce_slack: u64,
-) -> bool {
-    armed <= now || armed.saturating_sub(target) > coalesce_slack
+pub(crate) const fn should_rearm_tsc_deadline(now: u64, armed: u64, target: u64) -> bool {
+    armed <= now || target < armed
 }
 
 /// Reprogram this CPU's LAPIC one-shot (TSC-deadline or TMICT) to
@@ -1789,7 +1776,7 @@ fn arm_local_event(deadline_cycles: u64, hrtimer_event: bool) {
     };
     // Reprogram when the software mirror is already expired (the hardware
     // one-shot is then unarmed), or when the new target is earlier than the
-    // live deadline by more than the coalescing slack. The expired case is
+    // live deadline. The expired case is
     // load-bearing for the idle backstop: treating a stale past `TSC_ARMED`
     // value as "earlier" suppresses the future backstop and lets a CPU HLT
     // forever with an awake task queued.
@@ -1799,7 +1786,7 @@ fn arm_local_event(deadline_cycles: u64, hrtimer_event: bool) {
             pending_scheduler_deadline(now, TSC_SCHED_DEADLINE[cpu].load(Ordering::Relaxed));
         TSC_SCHED_DEADLINE[cpu].store(pending.min(deadline_cycles), Ordering::Relaxed);
     }
-    if should_rearm_tsc_deadline(now, armed, target, COALESCE_SLACK_CYCLES) {
+    if should_rearm_tsc_deadline(now, armed, target) {
         // Period != 0 gate above: this CPU runs a one-shot mode.
         program_next_event(cpu, target);
     }
@@ -2012,6 +1999,42 @@ fn start_local_oneshot(cpu: usize, mode: LocalTimerMode, period_cycles: u64) -> 
     narf_time::set_periodic_tick_wanted(cpu, true);
     narf_time::clockevent::register_local(&LAPIC_CLOCKEVENT);
     first
+}
+
+/// The tick period, in TSC cycles, of a `hz` tick on the calibrated TSC.
+pub fn tick_period_cycles_for(hz: u32) -> u64 {
+    narf_time::wall::ns_to_cycles(1_000_000_000 / u64::from(hz.max(1))).max(1)
+}
+
+/// Give every other CPU's one-shot tick the `hz` period, once the TSC is
+/// calibrated. The application processors start their tick during
+/// bring-up, before calibration, so their periods were derived from an
+/// uncalibrated scale (TSC-deadline: 10 ms at 1 cycle/ns; TMICT: 10 000
+/// LAPIC counts, 1.6 ms at 100 MHz) instead of the boot CPU's `HZ`; Linux
+/// sets every CPU's tick up from the calibrated clock
+/// (`setup_APIC_timer` / `clockevents_config_and_register`). A CPU adopts
+/// the period at its next tick (its next deadline is the previous one plus
+/// the period); an idle CPU with its tick stopped, when it restarts it.
+/// CPUs in the hardware periodic or stopped modes are left alone. Returns
+/// how many CPUs were retuned.
+pub fn retune_local_ticks(hz: u32) -> usize {
+    let period = tick_period_cycles_for(hz);
+    let me = tsc_cpu();
+    let mut retuned = 0;
+    for (cpu, p) in TICK_PERIOD_CYCLES.iter().enumerate() {
+        if cpu == me {
+            continue;
+        }
+        let old = p.load(Ordering::Acquire);
+        if old != 0
+            && old != period
+            && p.compare_exchange(old, period, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            retuned += 1;
+        }
+    }
+    retuned
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.

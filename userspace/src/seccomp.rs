@@ -222,6 +222,11 @@ impl SeccompData {
 pub struct SeccompFilter {
     prog: Vec<SockFilter>,
     prev: Option<Arc<SeccompFilter>>,
+    /// Linux `seccomp_filter.cache.allow_native`: bit `nr` set iff this
+    /// filter AND every filter below it return `SECCOMP_RET_ALLOW` for `nr`
+    /// on the native arch whatever the arguments and instruction pointer
+    /// are. A set bit lets syscall entry skip the BPF for that syscall.
+    allow_cache: [u64; SECCOMP_CACHE_WORDS],
     /// `SECCOMP_FILTER_FLAG_LOG`.
     log: bool,
     /// The single user-notification listener created with this filter, if
@@ -257,6 +262,30 @@ impl Drop for SeccompFilter {
 }
 
 impl SeccompFilter {
+    /// A filter attached on top of `prev`, with its action cache prepared.
+    fn new(
+        prog: Vec<SockFilter>,
+        prev: Option<Arc<SeccompFilter>>,
+        log: bool,
+        listener: Option<Arc<UserNotifListener>>,
+    ) -> Self {
+        let allow_cache = cache_prepare(&prog, prev.as_deref());
+        Self {
+            prog,
+            prev,
+            allow_cache,
+            log,
+            listener,
+        }
+    }
+
+    /// Does the chain from `self` down always allow `nr`?
+    #[inline]
+    fn cache_allows(&self, nr: u32) -> bool {
+        let nr = nr as usize;
+        nr < SECCOMP_CACHE_NR && self.allow_cache[nr / 64] & (1u64 << (nr % 64)) != 0
+    }
+
     /// Filters on the chain starting at `self`.
     fn chain_len(self: &Arc<Self>) -> usize {
         let mut n = 0;
@@ -499,6 +528,75 @@ pub fn validate(mut prog: Vec<SockFilter>) -> Option<Vec<SockFilter>> {
         return None;
     }
     Some(prog)
+}
+
+// ── Action cache ──
+//
+// Linux `seccomp_cache_prepare` (kernel/seccomp.c): at attach, every syscall
+// number is run through an emulator that knows only `nr` and `arch`. When a
+// filter reaches `RET ALLOW` touching nothing else, the result cannot depend
+// on the arguments, and the syscall entry may skip the BPF. Anything that
+// reads an argument or the instruction pointer, or any instruction the
+// emulator does not model, makes the number uncacheable — arg-dependent
+// filters therefore always run.
+
+/// Syscall numbers the cache covers (Linux sizes it `NR_syscalls`). x86_64
+/// and arm64 Linux numbers are all below 512; anything above always
+/// evaluates.
+const SECCOMP_CACHE_NR: usize = 512;
+const SECCOMP_CACHE_WORDS: usize = SECCOMP_CACHE_NR / 64;
+
+/// `seccomp_is_const_allow`: does `prog` return ALLOW for `nr` on the native
+/// arch without consulting any other `seccomp_data` field?
+fn is_const_allow(prog: &[SockFilter], nr: u32) -> bool {
+    let mut a: u32 = 0;
+    let mut pc = 0usize;
+    while pc < prog.len() {
+        let ins = prog[pc];
+        let k = ins.k;
+        pc += 1;
+        match ins.code {
+            c if c == BPF_LD | BPF_W | BPF_ABS => match k {
+                0 => a = nr,
+                4 => a = AUDIT_ARCH_NATIVE,
+                // A non-constant load: the arguments or the IP.
+                _ => return false,
+            },
+            c if c == BPF_RET | BPF_K => return k == SECCOMP_RET_ALLOW,
+            c if c == BPF_JMP | BPF_JA => pc += k as usize,
+            c if c == BPF_JMP | BPF_JEQ | BPF_K
+                || c == BPF_JMP | BPF_JGE | BPF_K
+                || c == BPF_JMP | BPF_JGT | BPF_K
+                || c == BPF_JMP | BPF_JSET | BPF_K =>
+            {
+                let taken = match c & 0xf0 {
+                    BPF_JEQ => a == k,
+                    BPF_JGE => a >= k,
+                    BPF_JGT => a > k,
+                    _ => a & k != 0,
+                };
+                pc += if taken { ins.jt } else { ins.jf } as usize;
+            }
+            c if c == BPF_ALU | BPF_AND | BPF_K => a &= k,
+            // Unmodelled: assume it depends on something unknown.
+            _ => return false,
+        }
+    }
+    // Validation guarantees a terminating RET; running off the end is a bug.
+    false
+}
+
+/// `seccomp_cache_prepare_bitmap`: a number stays cached only if every
+/// filter below (`prev`'s bitmap) already allows it and `prog` does too.
+fn cache_prepare(prog: &[SockFilter], prev: Option<&SeccompFilter>) -> [u64; SECCOMP_CACHE_WORDS] {
+    let mut bitmap = [0u64; SECCOMP_CACHE_WORDS];
+    for nr in 0..SECCOMP_CACHE_NR {
+        let below = prev.map_or(true, |p| p.cache_allows(nr as u32));
+        if below && is_const_allow(prog, nr as u32) {
+            bitmap[nr / 64] |= 1u64 << (nr % 64);
+        }
+    }
+    bitmap
 }
 
 // ── Interpreter ──
@@ -958,6 +1056,16 @@ fn set(task: u64, st: TaskSeccomp) {
         g.insert(task, st);
     }
     drop(g);
+    // `set_task_syscall_work(SECCOMP)`, after the state it summarises is
+    // visible: an entry that reads ACTIVE then finds the filter. Disabling
+    // (only at release) forgets the summary instead of claiming NONE, so a
+    // racing entry recomputes it from the table.
+    let work = if now == SECCOMP_MODE_DISABLED {
+        SECCOMP_WORK_UNKNOWN
+    } else {
+        SECCOMP_WORK_ACTIVE
+    };
+    let _ = crate::task::with_task_ref(task, |t| t.seccomp_work.store(work, Ordering::Release));
     match (was == SECCOMP_MODE_DISABLED, now == SECCOMP_MODE_DISABLED) {
         (true, false) => {
             ACTIVE_TASKS.fetch_add(1, Ordering::Release);
@@ -1052,7 +1160,19 @@ pub enum Verdict {
 
 /// The decision for syscall `nr` of `task`, without acting on it.
 pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
-    let st = get(task);
+    let st = {
+        let map = shard(task).lock();
+        let Some(st) = map.get(&task) else {
+            return Verdict::Allow;
+        };
+        // `seccomp_cache_check_allow`: decided without running BPF, and
+        // without bouncing the shared filter's reference count.
+        if st.mode == SECCOMP_MODE_FILTER && st.filter.as_ref().is_some_and(|f| f.cache_allows(nr))
+        {
+            return Verdict::Allow;
+        }
+        st.clone()
+    };
     match st.mode {
         SECCOMP_MODE_DISABLED => Verdict::Allow,
         SECCOMP_MODE_STRICT => {
@@ -1123,12 +1243,77 @@ pub fn secure_computing(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     if ACTIVE_TASKS.load(Ordering::Acquire) == 0 {
         return Some(nr);
     }
+    // `SYSCALL_WORK_SECCOMP` clear: this task has no filter and no strict
+    // mode, so the entry never touches the seccomp table.
+    if current_seccomp_work() == Some(SECCOMP_WORK_NONE) {
+        return Some(nr);
+    }
     secure_computing_slow(ctx, nr)
+}
+
+/// `SYSCALL_WORK_SECCOMP` states (see `Task::seccomp_work`).
+pub(crate) const SECCOMP_WORK_UNKNOWN: u8 = 0;
+pub(crate) const SECCOMP_WORK_NONE: u8 = 1;
+pub(crate) const SECCOMP_WORK_ACTIVE: u8 = 2;
+
+/// The current task's summary, or `None` when no `Task` is published for
+/// it (kernel-test fixtures), which always takes the table path.
+#[inline]
+fn current_seccomp_work() -> Option<u8> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<crate::task::Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc for this whole syscall.
+    let task = unsafe { &*ptr };
+    // A skip must never be granted to the wrong task: confirm the published
+    // owner is the task the scheduler is running.
+    (task.tid == current_task_id()).then(|| task.seccomp_work.load(Ordering::Acquire))
+}
+
+/// Resolve an UNKNOWN summary for `task` after reading its table row.
+/// `set` stores ACTIVE after publishing a filter, so the compare-exchange
+/// can only install NONE when no publish raced past the read: a filter that
+/// lands concurrently either fails the exchange or overwrites NONE.
+fn note_seccomp_work(task: u64, mode: u8) {
+    let work = if mode == SECCOMP_MODE_DISABLED {
+        SECCOMP_WORK_NONE
+    } else {
+        SECCOMP_WORK_ACTIVE
+    };
+    let _ = crate::task::with_task_ref(task, |t| {
+        let _ = t.seccomp_work.compare_exchange(
+            SECCOMP_WORK_UNKNOWN,
+            work,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    });
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_seccomp_work(task: u64) -> Option<u8> {
+    crate::task::with_task_ref(task, |t| t.seccomp_work.load(Ordering::Acquire))
 }
 
 #[inline(never)]
 fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     let task = current_task_id();
+    if crate::task::with_task_ref(task, |t| {
+        t.seccomp_work.load(Ordering::Acquire) == SECCOMP_WORK_UNKNOWN
+    }) == Some(true)
+    {
+        // Read the row only after observing UNKNOWN (see note_seccomp_work).
+        let mode = shard(task)
+            .lock()
+            .get(&task)
+            .map_or(SECCOMP_MODE_DISABLED, |s| s.mode);
+        note_seccomp_work(task, mode);
+        if mode == SECCOMP_MODE_DISABLED {
+            return Some(nr);
+        }
+    }
     // `if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) && unlikely(current->ptrace &
     // PT_SUSPEND_SECCOMP)) return 0;`
     if crate::ptrace::seccomp_suspended(task) {
@@ -1357,12 +1542,12 @@ fn set_mode_filter(flags: u32, uargs: u64) -> SyscallReturn {
     }
     let listener =
         (flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0).then(|| Arc::new(UserNotifListener::new()));
-    let filter = Arc::new(SeccompFilter {
+    let filter = Arc::new(SeccompFilter::new(
         prog,
-        prev: st.filter.clone(),
-        log: flags & SECCOMP_FILTER_FLAG_LOG != 0,
-        listener: listener.clone(),
-    });
+        st.filter.clone(),
+        flags & SECCOMP_FILTER_FLAG_LOG != 0,
+        listener.clone(),
+    ));
     // Reserve the descriptor before publishing the filter: an EMFILE must not
     // leave a task permanently subject to RET_USER_NOTIF with no monitor able
     // to receive the request.  `fd::install` honours RLIMIT_NOFILE.
@@ -1621,12 +1806,12 @@ mod tests {
     /// Across a chain the lowest action wins, KILL_PROCESS below everything.
     fn smoke_seccomp_chain_precedence() -> TestResult {
         let f = |ret: u32, prev: Option<Arc<SeccompFilter>>| {
-            Arc::new(SeccompFilter {
-                prog: alloc::vec![stmt(BPF_RET | BPF_K, ret)],
+            Arc::new(SeccompFilter::new(
+                alloc::vec![stmt(BPF_RET | BPF_K, ret)],
                 prev,
-                log: false,
-                listener: None,
-            })
+                false,
+                None,
+            ))
         };
         let a = f(SECCOMP_RET_ALLOW, None);
         let b = f(SECCOMP_RET_ERRNO | 1, Some(a.clone()));
@@ -1647,6 +1832,200 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/seccomp", smoke_seccomp_chain_precedence);
+
+    /// The action cache (Linux `seccomp_cache_prepare`) marks a syscall
+    /// allowed only when every filter on the chain returns ALLOW for it
+    /// without reading an argument or the IP; every other number — denied,
+    /// arg-dependent, IP-dependent, LOG, or decided by an instruction the
+    /// emulator does not model — still runs the BPF and still denies.
+    fn smoke_seccomp_action_cache_edges() -> TestResult {
+        const GETPID: u32 = 39;
+        const WRITE: u32 = 1;
+        const READ: u32 = 0;
+        const UNAME: u32 = 63;
+        const OPENAT: u32 = 257;
+        let errno = |e: u32| stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | e);
+        let allow = stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        let load_nr = stmt(BPF_LD | BPF_W | BPF_ABS, 0);
+        // Filter 1, the shape systemd and libseccomp emit: check the arch,
+        // deny getpid outright, make write depend on its first argument
+        // (fd == 2 is refused), make read depend on the IP, log uname, and
+        // allow everything else.
+        let prog = alloc::vec![
+            stmt(BPF_LD | BPF_W | BPF_ABS, 4),
+            jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_NATIVE, 1, 0),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+            load_nr,
+            jump(BPF_JMP | BPF_JEQ | BPF_K, GETPID, 0, 1),
+            errno(1),
+            jump(BPF_JMP | BPF_JEQ | BPF_K, WRITE, 0, 3),
+            stmt(BPF_LD | BPF_W | BPF_ABS, 16), // args[0] low word
+            jump(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1),
+            errno(13),
+            load_nr,
+            jump(BPF_JMP | BPF_JEQ | BPF_K, READ, 0, 4),
+            stmt(BPF_LD | BPF_W | BPF_ABS, 8), // instruction_pointer
+            jump(BPF_JMP | BPF_JGT | BPF_K, 0x1000, 1, 0),
+            errno(1),
+            allow,
+            jump(BPF_JMP | BPF_JEQ | BPF_K, UNAME, 0, 1),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_LOG),
+            allow,
+        ];
+        let Some(prog) = validate(prog) else {
+            return TestResult::Fail("cache fixture failed validation");
+        };
+        let f1 = Arc::new(SeccompFilter::new(prog, None, false, None));
+        if f1.cache_allows(GETPID) {
+            return TestResult::Fail("a denied syscall was cached as allowed");
+        }
+        if f1.cache_allows(WRITE) {
+            return TestResult::Fail("an argument-dependent syscall was cached as allowed");
+        }
+        if f1.cache_allows(READ) {
+            return TestResult::Fail("an IP-dependent syscall was cached as allowed");
+        }
+        if f1.cache_allows(UNAME) {
+            return TestResult::Fail("RET_LOG was cached as RET_ALLOW");
+        }
+        if !f1.cache_allows(OPENAT) {
+            return TestResult::Fail("an unconditionally allowed syscall was not cached");
+        }
+        if f1.cache_allows(SECCOMP_CACHE_NR as u32) {
+            return TestResult::Fail("a number past the bitmap was cached");
+        }
+        // An instruction the emulator does not model makes it uncacheable
+        // even though this program does allow.
+        let opaque = validate(alloc::vec![
+            load_nr,
+            stmt(BPF_ALU | BPF_ADD | BPF_K, 0),
+            allow,
+        ])
+        .expect("opaque fixture validates");
+        if Arc::new(SeccompFilter::new(opaque, None, false, None)).cache_allows(OPENAT) {
+            return TestResult::Fail("an unmodelled ALU op was trusted by the cache");
+        }
+        // Filter 2 on top denies openat: the chain's cache drops it, and
+        // keeps nothing filter 1 did not allow.
+        let deny_openat = validate(alloc::vec![
+            load_nr,
+            jump(BPF_JMP | BPF_JEQ | BPF_K, OPENAT, 0, 1),
+            errno(1),
+            allow,
+        ])
+        .expect("deny-openat fixture validates");
+        let f2 = Arc::new(SeccompFilter::new(
+            deny_openat,
+            Some(f1.clone()),
+            false,
+            None,
+        ));
+        if f2.cache_allows(OPENAT) || f2.cache_allows(GETPID) || f2.cache_allows(WRITE) {
+            return TestResult::Fail("the chain cache allowed what a filter in it denies");
+        }
+        if !f2.cache_allows(UNAME + 1) {
+            return TestResult::Fail("the chain cache lost a number both filters allow");
+        }
+
+        // End to end through evaluate(): cached and uncached numbers decide
+        // exactly as the interpreter does.
+        const TASK: u64 = 0x5ECC_0000;
+        let _m = MUTATION.lock();
+        set(
+            TASK,
+            TaskSeccomp {
+                mode: SECCOMP_MODE_FILTER,
+                filter: Some(f2),
+            },
+        );
+        drop(_m);
+        let verdict = |nr: u32, ip: u64, a0: u64| evaluate(TASK, nr, ip, [a0, 0, 0, 0, 0, 0]);
+        let result = (|| {
+            if !matches!(verdict(GETPID, 0x2000, 0), Verdict::Return(-1)) {
+                return Err("getpid was not denied");
+            }
+            if !matches!(verdict(WRITE, 0x2000, 2), Verdict::Return(-13)) {
+                return Err("write(2, ..) was not denied by its argument check");
+            }
+            if !matches!(verdict(WRITE, 0x2000, 1), Verdict::Allow) {
+                return Err("write(1, ..) was denied");
+            }
+            if !matches!(verdict(READ, 0x10, 0), Verdict::Return(-1)) {
+                return Err("read at a low IP was not denied by its IP check");
+            }
+            if !matches!(verdict(READ, 0x2000, 0), Verdict::Allow) {
+                return Err("read at a high IP was denied");
+            }
+            if !matches!(verdict(OPENAT, 0x2000, 0), Verdict::Return(-1)) {
+                return Err("openat was not denied by the top filter");
+            }
+            if !matches!(verdict(UNAME + 1, 0x2000, 0), Verdict::Allow) {
+                return Err("a cached allow did not allow");
+            }
+            Ok(())
+        })();
+        release_task(TASK);
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("userspace/seccomp", smoke_seccomp_action_cache_edges);
+
+    /// `SYSCALL_WORK_SECCOMP`: a registered task starts UNKNOWN, a filter
+    /// install publishes ACTIVE, and the entry's NONE resolution can never
+    /// overwrite an ACTIVE a filter install published.
+    fn smoke_seccomp_task_work_summary() -> TestResult {
+        const TID: u64 = 0x5ECC_1000;
+        let task = crate::task::Task::new_registered(TID, TID);
+        let result = (|| {
+            if __test_seccomp_work(TID) != Some(SECCOMP_WORK_UNKNOWN) {
+                return Err("a new task did not start UNKNOWN");
+            }
+            // The entry path resolves an unfiltered task to NONE.
+            note_seccomp_work(TID, SECCOMP_MODE_DISABLED);
+            if __test_seccomp_work(TID) != Some(SECCOMP_WORK_NONE) {
+                return Err("an unfiltered task was not resolved to NONE");
+            }
+            let prog = validate(alloc::vec![stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)])
+                .expect("allow-all validates");
+            let filter = Arc::new(SeccompFilter::new(prog, None, false, None));
+            {
+                let _m = MUTATION.lock();
+                set(
+                    TID,
+                    TaskSeccomp {
+                        mode: SECCOMP_MODE_FILTER,
+                        filter: Some(filter),
+                    },
+                );
+            }
+            if __test_seccomp_work(TID) != Some(SECCOMP_WORK_ACTIVE) {
+                return Err("installing a filter did not publish ACTIVE");
+            }
+            // A stale entry-side resolution racing the install loses.
+            note_seccomp_work(TID, SECCOMP_MODE_DISABLED);
+            if __test_seccomp_work(TID) != Some(SECCOMP_WORK_ACTIVE) {
+                return Err("a stale NONE overwrote ACTIVE");
+            }
+            Ok(())
+        })();
+        release_task(TID);
+        drop(task);
+        crate::task::release_task(TID);
+        // After the task is gone its summary is unreachable: a late install
+        // or resolution (a racing TSYNC, an exit/reap race) is a no-op, and
+        // task ids are never reused, so no later task inherits it.
+        note_seccomp_work(TID, SECCOMP_MODE_FILTER);
+        if result.is_ok() && __test_seccomp_work(TID).is_some() {
+            return TestResult::Fail("a released task's summary stayed reachable");
+        }
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("userspace/seccomp", smoke_seccomp_task_work_summary);
 
     /// Listener IDs remain valid until SEND, RECV describes the exact
     /// seccomp_data payload, and CONTINUE is distinguishable from an emulated

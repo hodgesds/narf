@@ -89,6 +89,7 @@ pub mod socket;
 pub mod syscall;
 pub mod sysvipc;
 pub mod task;
+pub mod timer_slack;
 
 /// `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,shmmni,
 /// shm_rmid_forced}` — read one key of the calling task's IPC namespace
@@ -194,6 +195,7 @@ mod abi_udp_gso_tests;
 mod abi_udp_tests;
 mod abi_unix_stream_tests;
 mod abi_vconsole_tests;
+mod hotpath_bench;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;

@@ -746,6 +746,17 @@ impl EpollInstance {
     /// List `fd` as ready (its per-fd waker fired) and wake the parked poller.
     /// No-op if `fd` left the interest set.
     fn push_ready(&self, registration: &Arc<EpollRegistration>) {
+        // `ep_poll_callback`: "If the event mask does not contain any poll(2)
+        // event, we consider the descriptor to be disabled" — a disarmed
+        // EPOLLONESHOT item is neither queued nor allowed to take a wake.
+        {
+            let events = registration.state.lock().events;
+            if (events & EPOLLONESHOT) != 0
+                && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
+            {
+                return;
+            }
+        }
         if !self.list_ready(registration) {
             return;
         }
@@ -1115,12 +1126,20 @@ impl EpollInstance {
         waker: &core::task::Waker,
     ) {
         let owner = self as *const Self as usize;
+        let previous_owner = node.owner.load(Ordering::Acquire);
+        if previous_owner != 0 && previous_owner != owner {
+            // A task runs one blocking epoll syscall at a time, so a node
+            // still linked on another instance is left over from a wait that
+            // ended without its teardown. Detach it there (handing on any
+            // event it was woken for) before publishing it here; refusing
+            // instead left this wait parked with no waiter published.
+            abort_task_wait(node);
+        }
         let mut waiters = self.waiters.lock();
         let previous_owner = node.owner.load(Ordering::Acquire);
         if previous_owner != 0 && previous_owner != owner {
-            // A task cannot execute two blocking epoll syscalls at once. If
-            // this fires, preserve the earlier live queue rather than corrupt
-            // two intrusive lists with one node.
+            // The previous instance is gone (its Drop drains the queue) or
+            // raced a concurrent detach; never link one node into two lists.
             debug_assert_eq!(previous_owner, owner, "epoll wait node has another owner");
             return;
         }
@@ -1384,7 +1403,13 @@ impl EpollInstance {
                     } else {
                         state.last_mask &= cur_mask;
                         let still_ready = cur_mask & (want | EPOLLERR | EPOLLHUP) != 0;
-                        keep_ready = state.cell_backed
+                        // A disarmed EPOLLONESHOT item delivers nothing until
+                        // EPOLL_CTL_MOD re-arms it, so it must not stay queued:
+                        // requeueing it on a standing ERR/HUP made
+                        // `has_deliverable` report work that this pass never
+                        // delivers, and epoll_wait spun.
+                        keep_ready = armed
+                            && state.cell_backed
                             && (state.events & EPOLLET) != 0
                             && *dequeued
                             && still_ready;
@@ -1438,6 +1463,16 @@ impl EpollInstance {
         self.finish_ready_cycle_with(ready_remains);
 
         results
+    }
+
+    /// True when every registration is queued on its provider's wait queue,
+    /// so a provider event always reaches this instance's ready list and
+    /// parked waiter. A fallback (non-queued) registration, or a nested epoll
+    /// (whose own fallback items only a rescan can observe), still needs the
+    /// generic I/O waiter.
+    fn wakes_only_through_ready_list(&self) -> bool {
+        let ready = self.ready.lock();
+        ready.always_poll.is_empty() && ready.deadline_poll.is_empty()
     }
 
     fn fallback_registrations(&self) -> Vec<Arc<EpollRegistration>> {
@@ -1727,6 +1762,37 @@ impl FileOps for EpollInstance {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+
+    /// `ep_show_fdinfo`: one `tfd:` line per registered descriptor.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let registrations: Vec<Arc<EpollRegistration>> = self
+            .inner
+            .lock()
+            .interest
+            .values()
+            .map(|item| Arc::clone(&item.registration))
+            .collect();
+        for registration in registrations {
+            let Some(file) = registration.file.upgrade() else {
+                continue;
+            };
+            let (events, data) = {
+                let state = registration.state.lock();
+                (state.events, state.data)
+            };
+            let _ = writeln!(
+                out,
+                "tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}",
+                registration.fd,
+                events,
+                data,
+                registration.offset as i64,
+                file.ino(),
+                file.inode_attrs().dev,
+            );
+        }
+    }
 }
 
 impl Drop for EpollInstance {
@@ -1812,6 +1878,31 @@ pub(crate) fn detach_task_wait_node(node: &Arc<EpollWaitNode>) {
     if let Some(ops) = owner.and_then(|weak| weak.upgrade()) {
         if let Some(instance) = as_epoll(&ops) {
             instance.disarm_wait_node(node);
+        }
+    }
+}
+
+/// An `epoll_wait` that ends WITHOUT running its collection pass — completed
+/// as -EINTR by signal delivery on its restart-pending exit frame — must leave
+/// the instance exactly as Linux's `ep_poll` does when its on-stack wait entry
+/// goes out of scope: off the wait queue, and with any event it was woken for
+/// handed on. A woken waiter is the instance's one selected consumer; if it
+/// leaves with the ready list non-empty, another sleeper must be woken for
+/// those events (the role `ep_done_scan`'s re-wake plays), or they sleep with
+/// work queued. Left linked, the node also refused the task's NEXT epoll_wait
+/// on a different instance (`set_parked_waker` saw another owner), so that
+/// wait parked with no waiter published at all.
+pub(crate) fn abort_task_wait(node: &Arc<EpollWaitNode>) {
+    if node.owner.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let owner = node.owner_file.lock().clone();
+    if let Some(ops) = owner.and_then(|weak| weak.upgrade()) {
+        if let Some(instance) = as_epoll(&ops) {
+            instance.disarm_wait_node(node);
+            if !instance.ready_list_empty() {
+                instance.finish_ready_cycle_with(true);
+            }
         }
     }
 }
@@ -2328,14 +2419,20 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 // past its deadline detects expiry below instead of computing a
                 // fresh `now + timeout` and re-arming forever.
                 let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+                let now = narf_scheduler::narf_time::monotonic_ns();
                 let d = if persisted != 0 {
                     persisted
                 } else {
-                    let d = narf_scheduler::narf_time::monotonic_ns()
-                        .saturating_add((timeout_ms as u64) * 1_000_000);
+                    let d = now.saturating_add((timeout_ms as u64) * 1_000_000);
                     uctx.blocking_deadline_ns.store(d, Ordering::Release);
                     d
                 };
+                // `ep_poll`: `select_estimate_accuracy(&end_time)` slack.
+                uctx.note_select_timeout(
+                    d,
+                    now,
+                    crate::handlers::nice_of_task(crate::handlers::current_task_id()),
+                );
                 // Re-publish the scheduler wake signal (cleared on each expiry).
                 uctx.sleep_deadline_ns.store(d, Ordering::Release);
                 Some(d)
@@ -2570,6 +2667,16 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // of waiting out the deadline).
                             uc.net_io_wait.store(true, Ordering::Release);
                             uc.epoll_wait_fd.store((epfd as u64) + 1, Ordering::Release);
+                            // Linux's epoll waiter sleeps on `ep->wq` only:
+                            // every source wakes it through its own wait queue
+                            // (`ep_poll_callback`). When every registration is
+                            // queued on its provider (no fallback item, and no
+                            // nested epoll whose own fallbacks could only be
+                            // seen by a rescan), the parked waker published
+                            // above is the whole wake path, so stay off the
+                            // generic I/O waiter list and its wake-all herd.
+                            uc.durable_io_wait
+                                .store(instance.wakes_only_through_ready_list(), Ordering::Release);
                             // Clamp the scheduler wake-up to the nearest armed
                             // timerfd in the interest set. A timerfd expiry does
                             // NOT fire a readiness notify (unlike socket data), so
@@ -3197,6 +3304,96 @@ mod tests {
     kernel_test_in!(
         "userspace/epoll",
         smoke_epoll_push_ready_wakes_one_parked_waiter_per_event
+    );
+
+    /// A woken epoll waiter whose call is then completed as -EINTR by signal
+    /// delivery at syscall exit never runs its collection pass. Its event
+    /// must pass to another sleeper (Linux: the wait entry leaves the queue
+    /// and the events are still there for the next `ep_poll`), and the node
+    /// must be free to wait on a different instance next. Before, the node
+    /// stayed linked and selected: the other sleeper slept with the event
+    /// queued, and the task's next epoll_wait elsewhere published no waiter.
+    fn smoke_epoll_interrupted_wait_hands_on_and_detaches() -> TestResult {
+        __test_reset();
+        let reset = || {
+            for w in &TEST_WOKE {
+                w.store(false, Ordering::Relaxed);
+            }
+        };
+        reset();
+        let (a, _fa) = one_fd(EPOLLIN, POLL_IN, 0, false, false);
+        let a_ops = a.clone() as Arc<dyn FileOps>;
+        let first = EpollWaitNode::new();
+        let second = EpollWaitNode::new();
+        a.set_parked_waker(&first, &a_ops, &test_waker(0));
+        a.set_parked_waker(&second, &a_ops, &test_waker(1));
+        a.push_ready(&a.inner.lock().interest[&FD].registration);
+        if !TEST_WOKE[0].load(Ordering::Relaxed) || TEST_WOKE[1].load(Ordering::Relaxed) {
+            return TestResult::Fail("the event must select the first sleeper only");
+        }
+        reset();
+        // The selected waiter's call ends -EINTR without collecting.
+        abort_task_wait(&first);
+        if first.owner.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("an interrupted wait left its node on the instance");
+        }
+        if !TEST_WOKE[1].load(Ordering::Relaxed) {
+            return TestResult::Fail("an interrupted waiter's event was not handed on");
+        }
+        // `second` is now selected on `a` and, as if its call too ended
+        // without teardown, the task waits on another instance next.
+        reset();
+        let (b, _fb) = one_fd(EPOLLIN, POLL_IN, 0, false, false);
+        let b_ops = b.clone() as Arc<dyn FileOps>;
+        b.set_parked_waker(&second, &b_ops, &test_waker(2));
+        b.push_ready(&b.inner.lock().interest[&FD].registration);
+        let woke_on_b = TEST_WOKE[2].load(Ordering::Relaxed);
+        b.disarm_wait_node(&second);
+        a.disarm_wait_node(&second);
+        __test_reset();
+        if !woke_on_b {
+            return TestResult::Fail(
+                "a node left over from an earlier wait could not park on another instance",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_interrupted_wait_hands_on_and_detaches
+    );
+
+    /// `ep_poll_callback` ignores a disabled (fired EPOLLONESHOT) item until
+    /// EPOLL_CTL_MOD re-arms it. NARF kept requeueing a disarmed ET|ONESHOT
+    /// item while its source stayed HUP, so `has_deliverable` (the park
+    /// recheck) kept saying "work" that collection never delivered: a
+    /// 100%-CPU epoll_wait.
+    fn smoke_epoll_disarmed_oneshot_is_not_requeued() -> TestResult {
+        __test_reset();
+        let (ep, file) = one_fd(EPOLLIN | EPOLLET | EPOLLONESHOT, POLL_IN, 0, true, true);
+        if ep.collect_ready(0, 8).len() != 1 {
+            return TestResult::Fail("the armed oneshot item must deliver once");
+        }
+        // The peer hangs up: HUP stands and the provider notifies again.
+        file.mask
+            .store(POLL_IN | narf_filesystem::POLL_HUP, Ordering::Release);
+        let registration = Arc::clone(&ep.inner.lock().interest[&FD].registration);
+        ep.push_ready(&registration);
+        let delivered = ep.collect_ready(0, 8);
+        let queued = !ep.ready_list_empty();
+        let deliverable = ep.has_deliverable(0);
+        __test_reset();
+        if !delivered.is_empty() {
+            return TestResult::Fail("a disarmed oneshot item delivered an event");
+        }
+        if queued || deliverable {
+            return TestResult::Fail("a disarmed oneshot item stayed queued and deliverable");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_disarmed_oneshot_is_not_requeued
     );
 
     /// Detaching a ready node transfers the queue's strong reference to the

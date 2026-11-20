@@ -5304,6 +5304,14 @@ fn run_async_demo() -> ! {
                     narf_interrupts::VECTOR_TIMER,
                     dev.tick_count(),
                 );
+                // The APs started their ticks before calibration; give
+                // them the same 1000 Hz as this CPU.
+                let retuned = narf_interrupts::x86_64::apic::retune_local_ticks(1000);
+                let _ = writeln!(
+                    console::Writer,
+                    "  clockevent: {} AP tick(s) set to 1000 Hz",
+                    retuned
+                );
             }
             None => {
                 // No backend's probe passed. The trap-handler

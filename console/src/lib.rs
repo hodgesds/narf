@@ -480,6 +480,9 @@ static FB_USER_SAVED_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// second take while already owned is a no-op, so the DRM blit path may
 /// call it on every page flip.
 pub fn fb_take_for_user() {
+    // Called on every page flip too: the software cursor is redrawn over
+    // the new frame.
+    note_cursor_change();
     if FB_USER_OWNED.swap(true, Ordering::AcqRel) {
         return; // already owned
     }
@@ -491,6 +494,7 @@ pub fn fb_take_for_user() {
 /// and clear the ownership flag. Idempotent — releasing when not owned is
 /// a no-op. Called when the last DRM master node closes.
 pub fn fb_release_from_user() {
+    note_cursor_change();
     if !FB_USER_OWNED.swap(false, Ordering::AcqRel) {
         return; // wasn't owned
     }
@@ -529,12 +533,40 @@ static CURSOR_MANAGED: AtomicBool = AtomicBool::new(false);
 /// alive for that case while still yielding to a compositor that draws its own.
 static CURSOR_EVER_SHOWN: AtomicBool = AtomicBool::new(false);
 
+/// Bumped by every change the cursor renderer must redraw for (a cursor
+/// ioctl, a flip, an ownership change); its waker sleeps on it.
+static CURSOR_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CURSOR_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> = IrqSafeSpinLock::new(None);
+
+fn note_cursor_change() {
+    CURSOR_GEN.fetch_add(1, Ordering::AcqRel);
+    let waker = CURSOR_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+/// Generation of cursor-relevant changes (see [`set_cursor_waker`]).
+pub fn cursor_generation() -> u64 {
+    CURSOR_GEN.load(Ordering::Acquire)
+}
+
+/// Wake `waker` (once) at the next cursor ioctl, page flip or scanout
+/// ownership change — what the cursor renderer redraws for.
+pub fn set_cursor_waker(waker: &core::task::Waker) {
+    let mut g = CURSOR_WAKER.lock();
+    if !g.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        *g = Some(waker.clone());
+    }
+}
+
 /// Move the compositor cursor to scanout pixel `(x, y)` (sprite top-left).
 /// Called from the DRM `DRM_MODE_CURSOR_MOVE` path.
 pub fn user_cursor_move(x: u32, y: u32) {
     CURSOR_X.store(x as usize, Ordering::Release);
     CURSOR_Y.store(y as usize, Ordering::Release);
     CURSOR_MANAGED.store(true, Ordering::Release);
+    note_cursor_change();
 }
 
 /// Show the compositor cursor (`DRM_MODE_CURSOR_BO` with a non-zero handle).
@@ -542,12 +574,14 @@ pub fn user_cursor_show() {
     CURSOR_VISIBLE.store(true, Ordering::Release);
     CURSOR_MANAGED.store(true, Ordering::Release);
     CURSOR_EVER_SHOWN.store(true, Ordering::Release);
+    note_cursor_change();
 }
 
 /// Hide the compositor cursor (`DRM_MODE_CURSOR_BO` with handle 0).
 pub fn user_cursor_hide() {
     CURSOR_VISIBLE.store(false, Ordering::Release);
     CURSOR_MANAGED.store(true, Ordering::Release);
+    note_cursor_change();
 }
 
 /// Current compositor-cursor state: `(x, y, visible, managed)`. When

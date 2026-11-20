@@ -329,30 +329,25 @@ unsafe fn map_kernel_page(va: VirtAddr, phys: PhysAddr) -> Result<(), ()> {
     unsafe { crate::paging::map_4kb(root, va, phys, kernel_leaf_flags()) }.map_err(|_| ())
 }
 
-/// Unmap one kernel page at `va`, returning the physical frame it backed. The
-/// underlying `unmap_4kb` performs the global TLB invalidation.
-///
-/// # Safety
-/// `va` must be a page currently mapped by `map_kernel_page`.
-unsafe fn unmap_kernel_page(va: VirtAddr) -> Result<PhysAddr, ()> {
-    let root = crate::bpf_text::kernel_root_for_mapping().ok_or(())?;
-    // SAFETY: `root` is the live kernel root; `va` was mapped here by us.
-    unsafe { crate::paging::unmap_4kb(root, va) }.map_err(|_| ())
-}
-
 /// Unmap + free the first `count` pages of the range at VA `base`.
 ///
 /// # Safety
 /// `[base, base + count*4096)` must be pages this module mapped.
 unsafe fn unmap_and_free(base: u64, count: usize) {
-    for i in 0..count {
-        let va = VirtAddr::new(base + (i as u64) * 4096);
-        // SAFETY: mapped by `map_kernel_page` for this allocation.
-        if let Ok(phys) = unsafe { unmap_kernel_page(va) } {
-            if phys.raw() != 0 {
-                crate::frame::free_frame(PhysFrame::new(phys));
-            }
-        }
+    // One cross-CPU invalidation per batch of leaves instead of one per page
+    // (Linux `vunmap_range` + `flush_tlb_kernel_range`); each frame is freed
+    // only after every CPU dropped its translation.
+    if let Some(root) = crate::bpf_text::kernel_root_for_mapping() {
+        // SAFETY: mapped by `map_kernel_page` for this allocation (non-global
+        // leaves); the owner is freeing it, so nothing references it.
+        unsafe {
+            crate::paging::unmap_kernel_pages(
+                root,
+                VirtAddr::new(base),
+                count as u64,
+                &mut |phys| crate::frame::free_frame(PhysFrame::new(phys)),
+            )
+        };
     }
     // Fully reclaim page tables: free any last-level table the freed range
     // leaves empty (checked once per 2 MiB granule; a table still holding a

@@ -24,13 +24,20 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub struct EventFd {
     counter: AtomicU64,
     semaphore: bool,
-    /// Durable per-fd readiness cell — the SOLE readiness mechanism (there is no
-    /// edge token). Mirrors POLL_IN (counter > 0) and POLL_OUT (counter < MAX-1);
-    /// every counter change publishes the new level via `set`; same-level write
-    /// events additionally fire `notify` (see [`EventFd::sync_readiness`]). This
-    /// wakes armed poll/epoll waiters, including an EPOLLET consumer on another
-    /// write while the counter remains readable.
-    readiness: narf_lib::readiness::Readiness,
+    /// `eventfd_ctx::id`, shown as `eventfd-id:` in fdinfo.
+    id: u32,
+    /// `eventfd_ctx::wqh`: poll/epoll waiters and blocking readers/writers
+    /// register here and then compute the level from `counter`; every counter
+    /// change wakes it afterwards (see [`EventFd::sync_readiness`]).
+    ///
+    /// There is deliberately no cached level. A cell mirroring the counter was
+    /// reconciled by loading the counter and then publishing under the cell
+    /// lock, so concurrent writers and a reader (a GLib/Qt wakeup eventfd is
+    /// written from many threads) could publish in the opposite order and
+    /// leave the cell "readable" over an empty counter: every poll arm then
+    /// disagreed with the poll scan, and a blocking read re-executed into
+    /// EAGAIN until the next write.
+    wait: narf_lib::readiness::WaitQueue,
 }
 
 pub const EFD_SEMAPHORE: u32 = 1;
@@ -40,28 +47,19 @@ impl EventFd {
         Arc::new(Self {
             counter: AtomicU64::new(initval),
             semaphore: (flags & EFD_SEMAPHORE) != 0,
-            readiness: narf_lib::readiness::Readiness::new(
-                POLL_OUT | if initval != 0 { POLL_IN } else { 0 },
-            ),
+            id: NEXT_EVENTFD_ID.fetch_add(1, Ordering::Relaxed),
+            wait: narf_lib::readiness::WaitQueue::new(),
         })
     }
 
-    /// Recompute the durable readiness cell from the current counter. `set`
-    /// publishes the level and wakes waiters on a rising edge. When the caller
-    /// reports a same-level event, `notify` fires the wait queue explicitly so
-    /// an EPOLLET consumer observes another write to an already-readable
-    /// counter. Avoid notifying after a rising edge: `set` already delivered
-    /// that event, and a second callback only relists the fd and wakes another
-    /// shared-epoll waiter for the same write.
-    fn sync_readiness(&self, event: u32, same_level_event: bool) {
-        let c = self.counter.load(Ordering::Acquire);
-        let readable = c > 0;
-        let writable = c < u64::MAX - 1;
-        let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
-        let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
-        self.readiness.set(add, clear);
-        if same_level_event {
-            self.readiness.notify(event & add);
+    /// `wake_up_locked_poll(&ctx->wqh, event)`: after a counter change, wake
+    /// the waiters for `event` (POLL_IN after a write, POLL_OUT after a read)
+    /// if the counter now satisfies it. Every write wakes, readable already or
+    /// not, so an EPOLLET consumer sees each one as Linux's does.
+    fn sync_readiness(&self, event: u32, _same_level_event: bool) {
+        let bits = event & self.poll_readiness();
+        if bits != 0 {
+            self.wait.wake(bits);
         }
     }
 }
@@ -217,10 +215,48 @@ impl FileOps for EventFd {
         bits
     }
 
-    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
-        Some(&self.readiness)
+    /// `eventfd_poll`: `poll_wait(file, &ctx->wqh, wait)`, then the counter.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(self.wait.arm(id, interest, waker, || self.poll_readiness()))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(
+            self.wait
+                .arm_persistent(id, interest, waker, || self.poll_readiness()),
+        )
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.wait.disarm(id);
+        true
+    }
+
+    /// `eventfd_show_fdinfo`: the counter, the fd's id and its mode.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let _ = write!(
+            out,
+            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: {}\n",
+            self.counter.load(Ordering::Acquire),
+            self.id,
+            u8::from(self.semaphore),
+        );
     }
 }
+
+/// `eventfd_ida`: the id each eventfd reports in its fdinfo.
+static NEXT_EVENTFD_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ── timerfd ─────────────────────────────────────────────────────
 
@@ -315,14 +351,20 @@ fn timerfd_tmrproc(
         } else {
             now
         };
-        (s.expire(due), s.next_fire_ns)
+        let expired = s.expire(due);
+        if expired {
+            // Every expiry wakes the wait queue, rising edge or not (an unread
+            // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
+            // each expiry, as on Linux). Published under the state lock, as
+            // `timerfd_triggered` does under `ctx->wqh.lock`: a read draining
+            // concurrently then cannot interleave its clear between this
+            // expiry's count and its publication and leave the cell
+            // "readable" over zero expirations.
+            tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
+        }
+        (expired, s.next_fire_ns)
     };
-    if expired {
-        // Every expiry wakes the wait queue, rising edge or not (an unread
-        // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
-        // each expiry, as on Linux).
-        tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
-    }
+    let _ = expired;
     if next == 0 {
         return HrtimerRestart::NoRestart;
     }
@@ -366,8 +408,8 @@ impl TimerFd {
             s.next_fire_ns = value_ns;
             s.interval_ns = interval_ns;
             s.expirations = 0;
+            self.readiness.set(0, POLL_IN);
         }
-        self.readiness.set(0, POLL_IN);
         if value_ns != 0 {
             // SAFETY: the fd is Arc-allocated and Drop cancels the timer.
             unsafe {
@@ -410,8 +452,9 @@ impl TimerFd {
     /// still be on its way). Called from `read` and `poll_readiness`.
     fn tick(&self) {
         let now = self.now();
-        let expired = self.state.lock().expire(now);
-        if expired {
+        let mut s = self.state.lock();
+        // Count and publish under one hold (see `timerfd_tmrproc`).
+        if s.expire(now) {
             self.readiness.set(POLL_IN, 0);
         }
     }
@@ -467,8 +510,10 @@ impl FileOps for TimerFd {
             }
             buf[..8].copy_from_slice(&s.expirations.to_le_bytes());
             s.expirations = 0;
-            drop(s);
+            // Clear under the same hold the expiry publishes under, so the
+            // last writer of the cell is the last change to `expirations`.
             self.readiness.set(0, POLL_IN);
+            drop(s);
             Ok(8)
         })
     }
@@ -522,6 +567,33 @@ impl FileOps for TimerFd {
             Some(s.next_fire_ns)
         }
     }
+
+    /// `timerfd_show`: clock, pending expirations, and the
+    /// `timerfd_gettime` view of the timer. NARF keeps the clock base, not
+    /// the `_ALARM` variant or the settime flags, so those print as their
+    /// base clock and 0.
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        use narf_scheduler::narf_time::hrtimer::ClockId;
+        let clockid = match self.clock {
+            ClockId::Realtime => 0,
+            ClockId::Monotonic => 1,
+            ClockId::Boottime => 7,
+            ClockId::Tai => 11,
+        };
+        let ticks = self.state.lock().expirations;
+        let (value, interval) = self.current();
+        const NS: u64 = 1_000_000_000;
+        let _ = write!(
+            out,
+            "clockid: {clockid}\nticks: {ticks}\nsettime flags: 00\n\
+             it_value: ({}, {})\nit_interval: ({}, {})\n",
+            value / NS,
+            value % NS,
+            interval / NS,
+            interval % NS,
+        );
+    }
 }
 
 // ── signalfd ────────────────────────────────────────────────────
@@ -550,6 +622,12 @@ pub fn register_signalfd_cell(task: u64, cell: &Arc<narf_lib::readiness::Readine
     let mut cells = SIGNALFD_CELLS.lock();
     cells.entry(task).or_default().push(Arc::downgrade(cell));
     SIGNALFD_CELL_ROWS.fetch_add(1, Ordering::Release);
+}
+
+/// Whether any signalfd readiness cell is registered (one atomic load).
+#[inline]
+pub(crate) fn signalfds_armed() -> bool {
+    SIGNALFD_CELL_ROWS.load(Ordering::Acquire) != 0
 }
 
 /// Fire the readiness wait-queue of every signalfd owned by `task` — called from
@@ -706,6 +784,13 @@ impl FileOps for SignalFd {
         }
     }
 
+    /// `signalfd_show_fdinfo`: `render_sigset_t(m, "sigmask:\t", ..)`. The
+    /// internal mask is the user `sigset_t` layout (signal N is bit N-1).
+    fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write as _;
+        let _ = writeln!(out, "sigmask:\t{:016x}", self.mask.load(Ordering::Acquire));
+    }
+
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.readiness)
     }
@@ -845,4 +930,37 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/io_mux", smoke_timerfd_poll_deadline_never_past);
+
+    /// `/proc/<pid>/fdinfo/<fd>` carries each event fd's own state, as
+    /// Linux's `show_fdinfo` hooks print it: a hung eventfd consumer's
+    /// counter, a timerfd's pending ticks and schedule, a signalfd's mask.
+    fn smoke_event_fds_show_linux_fdinfo() -> TestResult {
+        use narf_scheduler::narf_time::hrtimer::ClockId;
+        let mut out = alloc::string::String::new();
+        EventFd::new(0x2a, EFD_SEMAPHORE).show_fdinfo(&mut out);
+        if !out.contains("eventfd-count:               2a\n")
+            || !out.contains("eventfd-id: ")
+            || !out.contains("eventfd-semaphore: 1\n")
+        {
+            return TestResult::Fail("eventfd fdinfo lacks Linux's count/id/semaphore lines");
+        }
+        out.clear();
+        let tfd = TimerFd::new(ClockId::Monotonic);
+        // `arm` takes an absolute deadline in the fd's clock.
+        tfd.arm(tfd.now() + 60_000_000_000, 1_500_000_000);
+        tfd.show_fdinfo(&mut out);
+        if !out.starts_with("clockid: 1\nticks: 0\nsettime flags: 00\nit_value: (")
+            || !out.contains("it_interval: (1, 500000000)\n")
+        {
+            return TestResult::Fail("timerfd fdinfo does not match timerfd_show");
+        }
+        tfd.arm(0, 0);
+        out.clear();
+        SignalFd::new(1 << 16, 0).show_fdinfo(&mut out);
+        if out != "sigmask:\t0000000000010000\n" {
+            return TestResult::Fail("signalfd fdinfo does not render its sigmask");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/io_mux", smoke_event_fds_show_linux_fdinfo);
 }

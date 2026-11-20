@@ -918,6 +918,10 @@ impl SocketFile {
                 if !peek {
                     inbox.pop_front();
                     *rmem = rmem.saturating_sub(full_len + DGRAM_TRUESIZE_OVERHEAD);
+                    // See `inet_dgram_recv`: emptied under the state lock.
+                    if inbox.is_empty() {
+                        self.dgram_readiness.set(0, narf_filesystem::POLL_IN);
+                    }
                 }
                 return if n < full_len {
                     SocketOpResult::ReceivedTruncated {

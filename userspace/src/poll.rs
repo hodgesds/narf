@@ -402,6 +402,43 @@ fn write_ppoll_remaining(ptr: u64, deadline_ns: u64) {
 /// path keeps using `do_poll`). Same per-fd rules as `do_poll`: negative fd
 /// ignored, closed fd → POLLNVAL, open fd → `poll_readiness() & (events|ERR|HUP|NVAL)`.
 pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
+    let files = resolve_poll_files(task_id, fds);
+    let mut n_ready = 0usize;
+    for (item, slot) in fds.iter_mut().zip(files.iter()) {
+        if item.fd < 0 {
+            item.revents = 0;
+            continue;
+        }
+        match slot {
+            None => {
+                item.revents = POLL_NVAL as u16;
+                n_ready += 1;
+            }
+            Some((o, offset)) => {
+                let mask = o.poll_readiness_at(*offset);
+                let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+                let ready = (mask as u16) & (item.events | always);
+                item.revents = ready;
+                if ready != 0 {
+                    // `poll_scan` is used only by paths that immediately
+                    // return this result to the poll caller. Retire a
+                    // source-local edge now; readiness-only park probes must
+                    // use installed_poll_files_ready(), which is passive.
+                    o.acknowledge_poll_readiness(ready as u32);
+                    n_ready += 1;
+                }
+            }
+        }
+    }
+    n_ready
+}
+
+/// The file (and current offset) each slot of `fds` polls. The scan, the
+/// wait-queue registration and its teardown all use this one resolution, so a
+/// poll registers on, rechecks, and finally leaves exactly the files it holds
+/// (Linux `do_sys_poll` resolves each fd once and `poll_freewait` removes the
+/// entries from the same files' queues).
+fn resolve_poll_files(task_id: u64, fds: &[PollFd]) -> Vec<Option<(Arc<dyn FileOps>, u64)>> {
     // Snapshot ops under the lock, poll OUTSIDE it — a nested epoll fd's
     // `poll_readiness` re-enters the fd-table lock (see `do_poll`).
     //
@@ -447,34 +484,7 @@ pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
             .collect()
     })
     .unwrap_or_default();
-    let mut n_ready = 0usize;
-    for (item, slot) in fds.iter_mut().zip(files.iter()) {
-        if item.fd < 0 {
-            item.revents = 0;
-            continue;
-        }
-        match slot {
-            None => {
-                item.revents = POLL_NVAL as u16;
-                n_ready += 1;
-            }
-            Some((o, offset)) => {
-                let mask = o.poll_readiness_at(*offset);
-                let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
-                let ready = (mask as u16) & (item.events | always);
-                item.revents = ready;
-                if ready != 0 {
-                    // `poll_scan` is used only by paths that immediately
-                    // return this result to the poll caller. Retire a
-                    // source-local edge now; readiness-only park probes must
-                    // use installed_poll_files_ready(), which is passive.
-                    o.acknowledge_poll_readiness(ready as u32);
-                    n_ready += 1;
-                }
-            }
-        }
-    }
-    n_ready
+    files
 }
 
 /// Earliest absolute monotonic-ns deadline at which any fd becomes ready with
@@ -502,8 +512,14 @@ fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
 
 /// Scheduler wake deadline, distinct from the caller's actual timeout.
 /// Shared by poll/ppoll and the kernel-owned select/pselect fd array.
-/// A legacy provider without a notification source (e.g. a serial tty)
-/// requires a sleeping recheck; a generic network wake cannot rescue it.
+///
+/// It is the caller's deadline clamped to any time-driven provider's next
+/// event (`FileOps::poll_deadline`: an armed timerfd, a DRM flip's vblank).
+/// The one exception is `arms.needs_rescan`: a provider that declares
+/// [`FileOps::poll_requires_rescan`] (polled hardware with no interrupt) can
+/// change state with no wake at all, so a set holding one rescans it every
+/// [`UNNOTIFIED_RESCAN_NS`]. Every other provider wakes its poller through its
+/// wait queue, and no timer is armed for it.
 pub(crate) fn poll_wake_deadline(
     task_id: u64,
     fds: &[PollFd],
@@ -519,8 +535,7 @@ pub(crate) fn poll_wake_deadline(
         }
     });
     if arms.needs_rescan {
-        const SILENT_RECHECK_NS: u64 = 10_000_000;
-        let retry = now.saturating_add(SILENT_RECHECK_NS);
+        let retry = now.saturating_add(UNNOTIFIED_RESCAN_NS);
         if wake == 0 {
             retry
         } else {
@@ -530,6 +545,10 @@ pub(crate) fn poll_wake_deadline(
         wake
     }
 }
+
+/// Rescan period for a poll set holding a provider with no wake source
+/// ([`FileOps::poll_requires_rescan`]).
+pub(crate) const UNNOTIFIED_RESCAN_NS: u64 = 10_000_000;
 
 /// Record a blocking poll park's fd set into the task ctx for the stall
 /// watchdog (see `UserTaskCtx::poll_wait_fds`): slot = `events<<32 | (fd+1)`.
@@ -688,11 +707,12 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
 /// Result of arming a poll set's durable readiness cells.
 ///
 /// `all_armed` is true only when every live descriptor is protected by a
-/// cell's arm-vs-set lock. In that case the generic I/O waiter is redundant
-/// and harmful: its broadcast wake re-executes this poll on every unrelated
-/// readiness transition. A set containing even one legacy descriptor keeps
-/// the generic waiter. A legacy provider that does not notify also needs a
-/// bounded scheduler recheck; no I/O-generation event is promised for it.
+/// wait queue's arm-vs-wake lock. In that case the generic I/O waiter is
+/// redundant and harmful: its broadcast wake re-executes this poll on every
+/// unrelated readiness transition. A set containing even one descriptor
+/// without a wait queue keeps the generic waiter. `needs_rescan` is set only
+/// by a provider that declares [`FileOps::poll_requires_rescan`]: hardware
+/// polled without an interrupt, the one case where no wake exists at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadinessArms {
     pub(crate) any_ready: bool,
@@ -701,76 +721,157 @@ pub(crate) struct ReadinessArms {
 }
 
 impl ReadinessArms {
+    /// No registration was possible: the legacy (non-own-stack) execution
+    /// model has no stackful waker to queue. That model cannot promise a wake
+    /// from any provider, so its infinite park keeps the bounded rescan.
     const NONE: Self = Self {
         any_ready: false,
         all_armed: false,
-        // No provider registrations are known (including after a consumed
-        // readiness edge caused us to disarm). Never trust an infinite park.
         needs_rescan: true,
     };
 }
 
-/// Arm every polled fd that owns a durable [`Readiness`](narf_lib::readiness::Readiness)
-/// cell (`FileOps::readiness()`), keyed by this task id, so a readiness edge on
-/// it wakes THIS poll directly via the cell's `set` instead of the generic I/O
-/// waiter. `any_ready` is the register-then-recheck result: the caller must not
-/// park when it is true. `all_armed` distinguishes a fully durable set from a
-/// mixed set that still needs the legacy wake path.
+/// Queue this task on every polled file's wait queue (`FileOps::arm_readiness`,
+/// Linux `poll_wait`), keyed by its task id. `any_ready` reports that some
+/// provider found itself ready while arming, in which case it did NOT stay
+/// registered. `all_armed` distinguishes a fully durable set from a mixed set
+/// that still needs the generic wake path.
+///
+/// Arming runs outside the fd-table lock on the files `poll_scan` polls (see
+/// [`resolve_poll_files`]): a provider's arm may take its own locks or poll a
+/// nested epoll, and the teardown must find the same files after a sibling
+/// thread's `close()`.
 pub(crate) fn arm_readiness_cells(
     task_id: u64,
     fds: &[PollFd],
     waker: &core::task::Waker,
 ) -> ReadinessArms {
-    fd::with_table(task_id, |t| {
-        let mut any_ready = false;
-        let mut all_armed = true;
-        let mut needs_rescan = false;
-        for pfd in fds {
-            if pfd.fd < 0 {
-                continue;
-            }
-            let (armed, notifies) = t.get(pfd.fd as u32).map_or((None, false), |e| {
-                let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
-                (
-                    e.ops.arm_readiness(task_id, interest, waker),
-                    e.ops.readiness_notifies(),
-                )
-            });
-            match armed {
-                Some(poll) => {
-                    if poll.is_ready() {
-                        any_ready = true;
-                    }
-                }
-                None => {
-                    all_armed = false;
-                    needs_rescan |= !notifies;
+    let files = resolve_poll_files(task_id, fds);
+    let mut any_ready = false;
+    let mut all_armed = true;
+    let mut needs_rescan = false;
+    for (pfd, slot) in fds.iter().zip(files.iter()) {
+        if pfd.fd < 0 {
+            continue;
+        }
+        let Some((ops, _)) = slot else {
+            // Closed with no held file: `poll_scan` reports POLLNVAL and the
+            // poll returns before it can park.
+            all_armed = false;
+            continue;
+        };
+        let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
+        match ops.arm_readiness(task_id, interest, waker) {
+            Some(poll) => {
+                if poll.is_ready() {
+                    any_ready = true;
                 }
             }
+            None => {
+                all_armed = false;
+                needs_rescan |= ops.poll_requires_rescan();
+            }
         }
-        ReadinessArms {
-            any_ready,
-            all_armed,
-            needs_rescan,
-        }
-    })
-    .unwrap_or(ReadinessArms::NONE)
+    }
+    ReadinessArms {
+        any_ready,
+        all_armed,
+        needs_rescan,
+    }
 }
 
-/// Remove this task's registration from every polled fd's Readiness cell.
+/// Remove this task's registration from every polled file's wait queue.
 /// Called on every non-park return (ready / timeout / EINTR) so a woken-but-
-/// returned poll leaves no stale waiter behind. No-op for legacy-path fds.
+/// returned poll leaves no stale waiter behind (Linux `poll_freewait`).
 fn disarm_readiness_cells(task_id: u64, fds: &[PollFd]) {
-    let _ = fd::with_table(task_id, |t| {
-        for pfd in fds {
-            if pfd.fd < 0 {
-                continue;
-            }
-            if let Some(e) = t.get(pfd.fd as u32) {
-                e.ops.disarm_readiness(task_id);
-            }
+    let files = resolve_poll_files(task_id, fds);
+    for (pfd, slot) in fds.iter().zip(files.iter()) {
+        if pfd.fd < 0 {
+            continue;
         }
-    });
+        if let Some((ops, _)) = slot {
+            ops.disarm_readiness(task_id);
+        }
+    }
+}
+
+/// How a blocking poll's registering pass ended.
+pub(crate) enum ArmedScan {
+    /// The post-registration scan found `n` ready descriptors; every
+    /// registration has already been removed.
+    Ready(usize),
+    /// Nothing is ready and the waiters stay queued; park with these arms.
+    Park(ReadinessArms),
+}
+
+/// Bound on re-registration passes when a provider arm keeps reporting ready
+/// while the provider's own poll delivers nothing (see [`arm_then_scan`]).
+const ARM_RETRY_PASSES: usize = 4;
+
+/// `do_poll`'s order: queue on every file's wait queue FIRST, then compute
+/// each file's readiness. A producer publishes its state and then wakes the
+/// queue; either the scan below sees the published state, or the wake finds
+/// this task queued. There is no third outcome, so no timer is needed to
+/// recover a wake that landed between a first look and the registration.
+///
+/// The scan runs on the same files the arm used (`resolve_poll_files`) and
+/// reuses `poll_scan`, so a ready result is acknowledged exactly as the
+/// ordinary return path acknowledges it.
+///
+/// A provider arm that reports ready did not register. If the scan then finds
+/// nothing, another consumer drained the source between the two looks; the
+/// next pass registers against the drained level. A provider that reports a
+/// ready arm its own poll never delivers on every pass disagrees with itself
+/// — a provider bug. Rather than park unregistered on it, the set parks on
+/// the generic waiter with a bounded rescan and says so on the console.
+pub(crate) fn arm_then_scan(
+    task_id: u64,
+    fds: &mut [PollFd],
+    waker: &core::task::Waker,
+) -> ArmedScan {
+    for _ in 0..ARM_RETRY_PASSES {
+        let arms = arm_readiness_cells(task_id, fds, waker);
+        let n = poll_scan(task_id, fds);
+        if n != 0 {
+            disarm_readiness_cells(task_id, fds);
+            return ArmedScan::Ready(n);
+        }
+        if !arms.any_ready {
+            return ArmedScan::Park(arms);
+        }
+    }
+    note_arm_scan_disagreement(task_id, fds);
+    ArmedScan::Park(ReadinessArms {
+        any_ready: false,
+        all_armed: false,
+        needs_rescan: true,
+    })
+}
+
+/// Report a provider whose arm says ready while its poll delivers nothing.
+/// Rate-limited: one line per 2^10 occurrences after the first eight.
+#[cold]
+fn note_arm_scan_disagreement(task_id: u64, fds: &[PollFd]) {
+    use core::fmt::Write as _;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 8 && n % 1024 != 0 {
+        return;
+    }
+    let _ = write!(
+        narf_console::ConsoleOnlyWriter,
+        "poll: tid={task_id} provider arm reports ready but poll finds nothing (#{n}); fds=["
+    );
+    for pfd in fds.iter().take(16) {
+        let _ = write!(
+            narf_console::ConsoleOnlyWriter,
+            "{}:{:#x} ",
+            pfd.fd,
+            pfd.events
+        );
+    }
+    let _ = writeln!(narf_console::ConsoleOnlyWriter, "]");
 }
 
 /// Result of the kernel-buffer poll wait used by select/pselect. `deadline_ns`
@@ -895,7 +996,11 @@ pub(crate) fn poll_wait_kernel(
     match deadline_ns {
         None => uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release),
         Some(0) => uctx.sleep_deadline_ns.store(0, Ordering::Release),
-        Some(deadline) => uctx.sleep_deadline_ns.store(deadline, Ordering::Release),
+        Some(deadline) => {
+            // `do_select` / `do_poll`: `select_estimate_accuracy(end_time)`.
+            uctx.note_select_timeout(deadline, now, crate::handlers::nice_of_task(task_id));
+            uctx.sleep_deadline_ns.store(deadline, Ordering::Release)
+        }
     }
 
     // Snapshot the net readiness generation (kept for the epoll snapshot
@@ -956,25 +1061,24 @@ pub(crate) fn poll_wait_kernel(
         }
     };
 
-    let mut arms = if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
-        arm_readiness_cells(task_id, fds, &waker)
+    // `do_select`: queue on every file, then compute readiness (see
+    // `arm_then_scan`).
+    let arms = if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
+        match arm_then_scan(task_id, fds, &waker) {
+            ArmedScan::Ready(_) => {
+                finish_kernel_poll_wait(task_id, fds, uctx);
+                return KernelPollWait::Ready { deadline_ns };
+            }
+            ArmedScan::Park(arms) => arms,
+        }
     } else {
         ReadinessArms::NONE
     };
-    if arms.any_ready {
-        disarm_readiness_cells(task_id, fds);
-        let ready = poll_scan(task_id, fds);
-        if ready != 0 {
-            finish_kernel_poll_wait(task_id, fds, uctx);
-            return KernelPollWait::Ready { deadline_ns };
-        }
-        // The recheck consumed no event, and we just disarmed every cell.
-        // Fall back to the legacy wake source for this cycle; advertising a
-        // durable wait here would let park sleep with no cell registration.
-        arms = ReadinessArms::NONE;
-    }
 
     uctx.net_io_wait.store(true, Ordering::Release);
+    // Not an epoll park: route the park recheck to THIS poll set, never to
+    // an epoll fd an earlier interrupted epoll_wait left recorded.
+    uctx.epoll_wait_fd.store(0, Ordering::Release);
     uctx.durable_io_wait
         .store(arms.all_armed, Ordering::Release);
     record_poll_wait(uctx, fds);
@@ -1075,16 +1179,15 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns:
     // user tasks), starves every peer: a compositor looping poll() over
     // {wayland, DRM, input, dbus, ...} otherwise wedges the whole session.
     //
-    // We park even when the set contains an fd that becomes ready via a write
-    // (pipe/eventfd/tty). Task #32's per-fd `Readiness` migration gives each such
-    // fd a DURABLE wake that fires on that ready transition, so the park is
-    // revived by the fd's own cell — the ~10 ms lost-wake backstop that used to
-    // catch a missed edge is deleted (per-fd wake, not a periodic re-scan). An
-    // fd type that STILL fired no readiness notify would strand here; closing any
-    // such gap is exactly the remaining scope of the per-fd migration. A closed
-    // fd is caught by `poll_scan`'s POLLNVAL on the first pass below (immediate
-    // return, no park). Only a non-blocking poll or
-    // one with no task context (early boot) still takes the one-shot busy path.
+    // Every file whose readiness can change has a wait queue: `arm_readiness`
+    // queues this task on it and the producer wakes it after publishing (the
+    // Linux `->poll` + `poll_wait` contract), so the park is revived by the
+    // file itself, never by a periodic rescan. The only exception is a provider
+    // that declares `poll_requires_rescan` (polled hardware with no interrupt);
+    // see `poll_wake_deadline`. A closed fd is caught by `poll_scan`'s POLLNVAL
+    // on the first pass below (immediate return, no park). Only a non-blocking
+    // poll or one with no task context (early boot) still takes the one-shot
+    // busy path.
     let can_park = timeout_ns != Some(0) && uctx_opt.is_some();
     if !can_park {
         #[cfg(feature = "syscall-trace")]
@@ -1138,13 +1241,20 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns:
         let uctx = unsafe { &*uctx_ptr };
         if let Some(duration) = timeout_ns {
             let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+            let now = narf_scheduler::narf_time::monotonic_ns();
             let d = if persisted != 0 {
                 persisted
             } else {
-                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(duration);
+                let d = now.saturating_add(duration);
                 uctx.blocking_deadline_ns.store(d, Ordering::Release);
                 d
             };
+            // `do_poll`: the timeout's slack is `select_estimate_accuracy`.
+            uctx.note_select_timeout(
+                d,
+                now,
+                crate::handlers::nice_of_task(crate::handlers::current_task_id()),
+            );
             uctx.sleep_deadline_ns.store(d, Ordering::Release);
             Some(d)
         } else {
@@ -1252,44 +1362,35 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns:
             }
             return;
         }
-        // Durable per-fd wake: arm each polled fd that owns a Readiness cell so
-        // a `set` edge wakes this poll directly (alongside the legacy
-        // net_io_wait path during migration). The arm IS the register-then-
-        // recheck: if a cell fd went ready in the poll_scan → arm window, do NOT
-        // park — disarm, re-scan, and return, exactly like the epoll
-        // ready-after-registration path. No-op while no fd has migrated
-        // (`readiness()` still `None` everywhere → `any_ready == false`).
-        let mut arms = if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
-            arm_readiness_cells(task, &fds, &w)
+        // `do_poll`: queue this task on every polled file's wait queue, THEN
+        // compute readiness (`arm_then_scan`). A producer that publishes and
+        // wakes in the gap since the scan above is either seen by that second
+        // scan or finds this task queued — no recheck timer recovers it.
+        let arms = if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
+            match arm_then_scan(task, &mut fds, &w) {
+                ArmedScan::Ready(n) => {
+                    // SAFETY: clearing this task's own park deadlines.
+                    unsafe {
+                        (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                        (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                        clear_poll_wait_record(task, &*uctx_ptr);
+                    }
+                    // SAFETY: same pointer/length as the parse step.
+                    unsafe { write_pollfds(ptr, &fds) };
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                    return;
+                }
+                ArmedScan::Park(arms) => arms,
+            }
         } else {
             ReadinessArms::NONE
         };
-        if arms.any_ready {
-            disarm_readiness_cells(task, &fds);
-            let n = poll_scan(task, &mut fds);
-            if n != 0 {
-                // SAFETY: clearing this task's own park deadlines.
-                unsafe {
-                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                    clear_poll_wait_record(task, &*uctx_ptr);
-                }
-                // SAFETY: same pointer/length as the parse step.
-                unsafe { write_pollfds(ptr, &fds) };
-                ctx.set_return(SyscallReturn::ok(n as u64));
-                return;
-            }
-            // A readiness edge can be consumed between `poll_scan` and the
-            // registration recheck. We just disarmed every cell, so returning
-            // zero here would turn that benign race into a userspace busy loop.
-            // Mirror `poll_wait_kernel`: retain the deadline and park using the
-            // generic wake source for this cycle instead.
-            arms = ReadinessArms::NONE;
-        }
         // SAFETY: in-flight task's UserTaskCtx; we park exactly this task.
         unsafe {
             let uc = &*uctx_ptr;
             uc.net_io_wait.store(true, Ordering::Release);
+            // Not an epoll park (see `poll_wait_kernel`).
+            uc.epoll_wait_fd.store(0, Ordering::Release);
             uc.durable_io_wait.store(arms.all_armed, Ordering::Release);
             // Record the parked fd set for the stall watchdog (the poll twin
             // of `epoll_wait_fd`) so a wedged poller's readiness can be

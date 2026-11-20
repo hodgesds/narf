@@ -371,7 +371,18 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // kernel/sys.c: arg2 > 0 sets `current->timer_slack_ns`; 0 restores
             // `default_timer_slack_ns`. The slack widens every hrtimer sleep and
             // timeout this task arms (nanosleep, poll/select/epoll, futex).
-            if let Some(uc) = crate::user_task::current_user_task() {
+            let realtime = narf_scheduler::user_scheduling(narf_scheduler::TaskId(
+                current_task_id(),
+            ))
+            .is_some_and(|s| {
+                matches!(
+                    s.policy,
+                    narf_scheduler::UserPolicy::Fifo | narf_scheduler::UserPolicy::RoundRobin
+                )
+            });
+            // `if (rt_or_dl_task_policy(current)) break;`: a real-time task
+            // keeps no slack.
+            if let Some(uc) = crate::user_task::current_user_task().filter(|_| !realtime) {
                 // SAFETY: the running task's live ctx; atomics only.
                 let uc = unsafe { &*uc };
                 let slack = if arg_a == 0 {

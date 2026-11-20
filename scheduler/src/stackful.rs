@@ -4549,6 +4549,8 @@ pub fn sched_yield_current() -> bool {
     if p.is_null() {
         return false;
     }
+    // Linux `do_sched_yield`: `schedstat_inc(rq->yld_count)`.
+    crate::schedstat::note_yield();
     let current = crate::current_task_id_on(cpu).raw();
     if current == crate::TaskId::NONE.raw() {
         return false;

@@ -67,7 +67,15 @@ struct IpiStats {
     invpcid_path_taken: AtomicU64,
     ack_count: AtomicU64,
     ever_received: AtomicU64,
-    _pad: [u8; 40],
+    /// Requests this CPU published as a source, by kind: untagged (kernel
+    /// range or full flush) and PCID-tagged (one address space).
+    kernel_requests: AtomicU64,
+    tagged_requests: AtomicU64,
+    /// Target CPUs those requests named, and IPIs actually sent for them
+    /// (fewer when a target already had a request pending).
+    request_targets: AtomicU64,
+    ipis_sent: AtomicU64,
+    _pad: [u8; 8],
 }
 
 impl IpiStats {
@@ -76,8 +84,39 @@ impl IpiStats {
             invpcid_path_taken: AtomicU64::new(0),
             ack_count: AtomicU64::new(0),
             ever_received: AtomicU64::new(0),
-            _pad: [0; 40],
+            kernel_requests: AtomicU64::new(0),
+            tagged_requests: AtomicU64::new(0),
+            request_targets: AtomicU64::new(0),
+            ipis_sent: AtomicU64::new(0),
+            _pad: [0; 8],
         }
+    }
+}
+
+/// What one CPU sent and received through the TLB-shootdown vector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShootdownCpuStats {
+    /// Untagged requests published (kernel ranges, full flushes).
+    pub kernel_requests: u64,
+    /// PCID-tagged requests published (one address space).
+    pub tagged_requests: u64,
+    /// Peer CPUs those requests targeted.
+    pub request_targets: u64,
+    /// TLB-shootdown IPIs sent.
+    pub ipis_sent: u64,
+    /// Requests this CPU applied for other sources.
+    pub received: u64,
+}
+
+/// `cpu`'s TLB-shootdown counters.
+pub fn cpu_stats(cpu: u32) -> ShootdownCpuStats {
+    let s = &IPI_STATS[(cpu as usize).min(MAX_CPUS - 1)];
+    ShootdownCpuStats {
+        kernel_requests: s.kernel_requests.load(Ordering::Relaxed),
+        tagged_requests: s.tagged_requests.load(Ordering::Relaxed),
+        request_targets: s.request_targets.load(Ordering::Relaxed),
+        ipis_sent: s.ipis_sent.load(Ordering::Relaxed),
+        received: s.ack_count.load(Ordering::Relaxed),
     }
 }
 
@@ -253,6 +292,11 @@ unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
                 narf_memory::x86_64::paging::invlpg(narf_memory::VirtAddr::new(addr));
             }
         }
+        // An untagged request is a kernel-range invalidation: its non-global
+        // leaves may be cached under every PCID this CPU has run, and INVLPG
+        // only reached the current one (see `flush_nonglobal_all_pcids_local`).
+        // SAFETY: CPL=0 in the shootdown handler or its polling twin.
+        unsafe { narf_memory::x86_64::paging::flush_nonglobal_all_pcids_local() };
     }
 }
 
@@ -446,6 +490,18 @@ unsafe fn shoot_request_mask(va: u64, pages: u64, tag: u16, target_mask: u64) {
     if kick != 0 {
         apic::send_fixed_ipi(kick, crate::VECTOR_TLB_SHOOTDOWN);
     }
+    let stats = &IPI_STATS[source];
+    if tag == 0 {
+        stats.kernel_requests.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.tagged_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    stats
+        .request_targets
+        .fetch_add(targets.count_ones() as u64, Ordering::Relaxed);
+    stats
+        .ipis_sent
+        .fetch_add(kick.count_ones() as u64, Ordering::Relaxed);
 
     // This wait must not time out and return: the caller may immediately reuse
     // a frame whose stale translation is still cached on a target CPU. Polling

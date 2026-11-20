@@ -2185,16 +2185,25 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             m.config(),
             dev.reg_info.as_deref(),
         );
+        // The open and the station/AP replay are as large as the transport
+        // rebuild; keep each in its own heap-backed poll for the same reason.
         let opened = if was_open {
-            self.do_open(&mut mac).await
+            super::future_heap::build(|| self.do_open(&mut mac)).await
         } else {
             Ok(())
         };
         let restored = match opened {
             Ok(()) => match station_recovery {
-                Some(state) => mac.restore_station_recovery(state).await,
+                Some(state) => {
+                    super::future_heap::build(|| mac.restore_station_recovery(state)).await
+                }
                 None => match ap_recovery {
-                    Some(state) => mac.restore_ap_recovery(state, ap_source_templates).await,
+                    Some(state) => {
+                        super::future_heap::build(|| {
+                            mac.restore_ap_recovery(state, ap_source_templates)
+                        })
+                        .await
+                    }
                     None => Ok(()),
                 },
             },
@@ -2226,7 +2235,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         // A PCI radio coordinator calls `reconfig_complete` only after every
         // live vdev has been rebuilt. The single-vdev path completes here.
         if complete_reconfig {
-            self.shared.reconfig_complete().await;
+            super::future_heap::build(|| self.shared.reconfig_complete()).await;
         }
         if restoring_ap {
             self.shared.set_mbssid_beacons(self.vdev_id, ap_beacons);
@@ -2248,7 +2257,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             }
             Some((req, ConnectOrigin::Kernel)) => {
                 *self.last_assoc.lock() = Some((copy_request(&req), ConnectOrigin::Kernel));
-                self.reconnect(req).await;
+                super::future_heap::build(|| self.reconnect(req)).await;
             }
             Some((_, ConnectOrigin::Nl80211)) | None => {}
         }

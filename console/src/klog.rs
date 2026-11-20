@@ -299,6 +299,9 @@ impl Store {
         };
         self.head_lpos = end;
         self.next_seq = seq + 1;
+        // `vprintk_emit` → `wake_up_klogd()`: a record is now readable.
+        // Defer the wake (see [`KMSG_WAKE_PENDING`]).
+        KMSG_WAKE_PENDING.store(true, Ordering::Release);
     }
 
     /// Commit the pending line. `newline == false` means the line was cut
@@ -759,6 +762,28 @@ fn record_print_text(d: &Desc, text: &[u8], w: &mut Bounded) {
 // ── global store ────────────────────────────────────────────────────
 
 static RING: IrqSafeSpinLock<Store> = IrqSafeSpinLock::new(Store::new());
+
+/// `log_wait`: the wait queue `/dev/kmsg` and `syslog(2)` pollers sleep on.
+pub static KMSG_WAIT: narf_lib::readiness::WaitQueue = narf_lib::readiness::WaitQueue::new();
+
+/// `wake_up_klogd`'s pending bit. A record can be committed from any context
+/// — an interrupt, a trap, a scheduler or wait-queue path holding its own lock
+/// — so, as Linux does with `irq_work`, the commit only marks the wake
+/// pending and [`flush_kmsg_wakeups`] performs it from task context.
+static KMSG_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// `wake_up_klogd_work_func`: wake the `/dev/kmsg` pollers if a record was
+/// committed since the last call. Run from task context with no lock held
+/// (NARF runs it from an executor pump; it costs one atomic load when idle).
+pub fn flush_kmsg_wakeups() {
+    if KMSG_WAKE_PENDING.load(Ordering::Acquire) && KMSG_WAKE_PENDING.swap(false, Ordering::AcqRel)
+    {
+        KMSG_WAIT.wake(KMSG_POLL_IN);
+    }
+}
+
+/// `POLLIN` in the poll ABI every NARF readiness bit set uses.
+const KMSG_POLL_IN: u32 = 0x0001;
 
 /// Re-entrancy guard: the CPU currently inside the store's critical section
 /// (`usize::MAX` when none). A `record` from an NMI or fault on THAT CPU

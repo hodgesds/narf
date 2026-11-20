@@ -2008,7 +2008,7 @@ fn open_impl_reserved(
     // it and calling `open_impl` again would let a CLONE_FILES sibling steal
     // the lowest free number while this task is resolving the target.
     let proc_fd_magic = if mnt_len == 0 && follow_final {
-        parse_proc_fd_magic_path(task, path)
+        parse_proc_fd_magic_link(task, path)
     } else {
         None
     };
@@ -2016,8 +2016,18 @@ fn open_impl_reserved(
         ctx.set_return(errno_ret(ELOOP)); // -ELOOP
         return;
     }
-    if let Some(n) = proc_fd_magic {
-        if let Some(target) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
+    if let Some((owner, n)) = proc_fd_magic {
+        // `/proc/<pid>/fd/N` is the PID's descriptor N. Resolving N in the
+        // caller's own table reopened whatever the caller happened to hold
+        // there (its stdin, say), so a diagnostic that opened another
+        // process's pty through it got ENOTTY from its FIONREAD.
+        // `proc_pid_get_link`: following it needs `proc_fd_access_allowed`,
+        // i.e. `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`.
+        if owner != task && !ptrace_may_access_mode(task, owner, PtraceCreds::Fs) {
+            ctx.set_return(errno_ret(EACCES)); // -EACCES
+            return;
+        }
+        if let Some(target) = fd_path_for_task(owner, n).filter(|p| p.starts_with('/')) {
             open_impl_reserved(ctx, target, flags, 0, 0, create_mode, reservation);
             return;
         }
@@ -2026,7 +2036,7 @@ fn open_impl_reserved(
         // filesystem pathname to walk. The proc magic link therefore obtains
         // another reference to the same object, with a fresh per-open
         // description and the caller's requested status/fd flags.
-        let ops = fd::with_table(task, |table| table.get(n).map(|entry| entry.ops.clone()))
+        let ops = fd::with_table(owner, |table| table.get(n).map(|entry| entry.ops.clone()))
             .flatten();
         let Some(ops) = ops else {
             // A stale proc fd link is a dangling link, not EBADF from an
@@ -3147,6 +3157,21 @@ pub(crate) fn abort_restart_pending_park_state(task: u64) {
             .load(core::sync::atomic::Ordering::Acquire);
         crate::select::abort_interrupted(task, (deadline != 0).then_some(deadline));
         crate::poll::abort_interrupted(task, uc);
+        // An epoll_wait completed here never reaches its own teardown: take
+        // its wait node off the instance and hand on any event it was woken
+        // for (`ep_poll`'s wait entry leaves the queue on every return).
+        crate::epoll::abort_task_wait(&uc.epoll_wait_node);
+        // The park routing flags belong to the call that just ended. Left
+        // set, the task's next park inherited them: a stale `epoll_wait_fd`
+        // sent a poll's lost-wake recheck to the old epoll instance, and a
+        // stale `durable_io_wait` made the next epoll_wait skip the generic
+        // I/O waiter its fallback registrations depend on.
+        uc.net_io_wait
+            .store(false, core::sync::atomic::Ordering::Release);
+        uc.durable_io_wait
+            .store(false, core::sync::atomic::Ordering::Release);
+        uc.epoll_wait_fd
+            .store(0, core::sync::atomic::Ordering::Release);
         // SAFETY: the in-flight task's poller-pinned ctx; atomics only.
         let pending = unsafe {
             (*uctx)
@@ -4236,7 +4261,23 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     let anchored_proc_view = anchored_procfs_view(raw);
     let magic_src = anchored_proc_view.as_deref().unwrap_or(raw);
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(magic_src).filter(|_| follow_final) {
+    let raw: &str = if let Some((owner, n)) =
+        proc_fd_link_owner(task, magic_src).filter(|_| follow_final)
+    {
+        if owner != task {
+            // `/proc/<pid>/fd/N` names the pid's descriptor, not the
+            // caller's (see `open_impl`): stat what it names.
+            if !ptrace_may_access_mode(task, owner, PtraceCreds::Fs) {
+                ctx.set_return(errno_ret(EACCES));
+                return;
+            }
+            let ops = fd::with_table(owner, |t| t.get(n).map(|e| e.ops.clone())).flatten();
+            match ops {
+                Some(ops) => stat_linux_ops(ctx, &ops, out_ptr),
+                None => ctx.set_return(errno_ret(ENOENT)),
+            }
+            return;
+        }
         if anchored_proc_view.is_some() || !fd_file_within_root(task, n) {
             stat_linux_fd(ctx, n, out_ptr);
             return;
@@ -11482,10 +11523,14 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
     // Private and group-shared: a shared signal this thread does not block
-    // interrupts its wait just like a thread-directed one.
-    let pending = signal_pending_of(task);
-    let mask = signal_mask_of(task);
-    if (pending & !mask) != 0 {
+    // interrupts its wait just like a thread-directed one. Ask the SAME
+    // predicate the delivery hook selects with (`signal_pending_for_delivery`
+    // gates a group-shared signal on this thread having been chosen for it):
+    // the raw `pending & !mask` test said "interrupt" for a shared signal the
+    // hook would then decline to deliver, so pause/sigsuspend returned -EINTR
+    // with no handler run and the caller looped (`sigsuspend` → EINTR →
+    // `sigsuspend` ...) without ever reaping its child.
+    if has_interrupting_signal(task) {
         if let Some(hook) = signal_delivery_hook() {
             // EINTR
             ctx.set_return(errno_ret(EINTR));
@@ -13447,7 +13492,10 @@ fn clear_task_stopped(task: u64) -> Option<u32> {
 
 fn insert_task_stopped(task: u64, signum: u32) -> bool {
     if let Some(inserted) = crate::task::with_task_local(task, |task| {
-        task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0
+        let inserted = task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0;
+        // The stop is taken at this thread's next exit to user mode.
+        task.uctx.sigpending.store(true, Ordering::Release);
+        inserted
     }) {
         return inserted;
     }
@@ -13834,7 +13882,7 @@ fn hand_back_traced_zombie(reaper: &WaitParentIds, entry: PendingExit) {
             u32::from(link.exit_signal),
             GroupSigInfo::Queued(sigchld_exit_info(link.parent, child, entry.status)),
         );
-        narf_net::readiness::notify(0);
+        // The raise wakes the parent's signal waiters and signalfds; no wake-all.
     }
     wake_wait_child_group(link.parent);
 }
@@ -14273,6 +14321,10 @@ pub fn wait_init() {
         core::sync::atomic::AtomicBool::new(false);
     if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         narf_scheduler::sleep_pumps::register(sysrq_pump);
+        // `wake_up_klogd`'s irq_work: a printk can commit a record from any
+        // context, so the `/dev/kmsg` poller wake runs from the executor's
+        // pump (idle, or at least every ~1 ms when busy).
+        narf_scheduler::sleep_pumps::register(narf_console::klog::flush_kmsg_wakeups);
     }
     // The orderly power-off (power button with no logind, thermal trip)
     // runs `kernel.poweroff_cmd` through this usermode helper, as Linux
@@ -14923,6 +14975,9 @@ fn park_reexecute_on_io_until(
         // check→park lost-wake guard.
         uc.futex_uaddr.store(0, Ordering::Release);
         uc.net_io_wait.store(true, Ordering::Release);
+        // Not an epoll park: a stale `epoll_wait_fd` from an interrupted
+        // epoll_wait would route this park's recheck to that epoll instance.
+        uc.epoll_wait_fd.store(0, Ordering::Release);
         uc.durable_io_wait
             .store(durable_io_wait, Ordering::Release);
         uc.epoll_park_gen
@@ -15422,9 +15477,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SIGRETURN_STACK.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = SUSPEND_SAVED_MASK.lock().as_mut() {
-        m.remove(&tid);
-    }
+    let _ = take_suspend_saved_mask(tid);
 
     // Parked-waker registrations. All wakers are Arc<WakeCell>, so a
     // stale entry is "only" a leak + a spurious wake — but under task
@@ -16389,7 +16442,7 @@ fn notify_tracer_of_thread_exit(pid: u64, tid: u64) {
         u32::from(SIGCHLD),
         GroupSigInfo::Queued(sigchld_exit_info(tracer_task, linux_tid, status)),
     );
-    narf_net::readiness::notify(0);
+    // The raise and `wake_wait_child_group` are the whole wake (no wake-all).
     wake_wait_child_group(tracer_task);
 }
 
@@ -16815,7 +16868,9 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             signum,
             GroupSigInfo::Queued(sigchld_exit_info(parent, child_pid, status)),
         );
-        narf_net::readiness::notify(0);
+        // The raise is the whole wake: it fires the group's signal waiters and
+        // signalfds (Linux `do_notify_parent` wakes nothing else); a wake-all
+        // of every parked poller here ran on every child exit.
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
     // was stored by `UserTaskFuture::poll` when it found the pending-

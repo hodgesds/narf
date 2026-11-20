@@ -117,8 +117,10 @@ async fn worker(cpu: usize) {
         return;
     };
     loop {
-        let deadline = narf_time::Deadline::after_ms(SAMPLE_MS);
-        narf_time::SleepUntil::new(deadline.as_instant()).await;
+        // Deferrable: Linux samples APERF/MPERF from the tick of a CPU that
+        // runs (`arch_scale_freq_tick`), never waking an idle one for it.
+        let expires = narf_time::timer::jiffies() + narf_time::timer::msecs_to_jiffies(SAMPLE_MS);
+        narf_time::sleep_until_jiffies(expires, narf_time::timer::TIMER_DEFERRABLE).await;
         if !narf_lib::smp::is_online(cpu as u32) {
             *SAMPLES[cpu].lock() = None;
             return;

@@ -1689,3 +1689,67 @@ fn smoke_fbdev_blank_levels_map_as_drm_fb_helper_blank() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fbdev_blank_levels_map_as_drm_fb_helper_blank);
+
+/// The cursor renderer sleeps until the cursor can have changed: a pointer
+/// event, an absolute-position update or a compositor cursor ioctl wakes
+/// it; nothing else does (Linux has no cursor timer outside fbcon's
+/// text-mode blink).
+fn smoke_cursor_pump_parks_until_pointer_or_cursor_change() -> TestResult {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Waker};
+    use narf_input::{push_global, InputEvent, PointerButtons, PointerEvent};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let woken = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    let seen = (
+        narf_input::pointer_generation(),
+        narf_console::cursor_generation(),
+    );
+    let mut idle = core::pin::pin!(crate::cursor::cursor_activity(seen));
+    if idle.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("the cursor pump woke with nothing changed");
+    }
+    // A compositor cursor ioctl wakes it at once.
+    narf_console::user_cursor_move(4, 4);
+    if woken.0.load(Ordering::Acquire) != 1 || idle.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("a cursor ioctl did not wake the cursor pump");
+    }
+    // A pointer event ends the next wait.
+    let seen = (
+        narf_input::pointer_generation(),
+        narf_console::cursor_generation(),
+    );
+    let mut idle = core::pin::pin!(crate::cursor::cursor_activity(seen));
+    if idle.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("the cursor pump woke with nothing changed");
+    }
+    let event = || {
+        InputEvent::Pointer(PointerEvent {
+            dx: 1,
+            dy: 1,
+            buttons: PointerButtons::EMPTY,
+        })
+    };
+    if !push_global(event()) {
+        narf_input::init_global_ring(64);
+        let _ = push_global(event());
+    }
+    if idle.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("a pointer event did not end the cursor pump's wait");
+    }
+    while narf_input::pop_pointer().is_some() {}
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb/cursor",
+    smoke_cursor_pump_parks_until_pointer_or_cursor_change
+);

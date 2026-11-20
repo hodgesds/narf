@@ -953,13 +953,25 @@ static SWITCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(No
 static BYTE_RING_WAKERS: IrqSafeSpinLock<alloc::vec::Vec<Waker>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Wake every parked console reader (see [`BYTE_RING_WAKERS`]). Call with
-/// no ring lock held.
+/// The console ttys' `tty->read_wait` for `poll`/`select`/`epoll`: every
+/// console-input push (a serial byte or a key event) wakes it AFTER the event
+/// is in its ring, and a poller queued here recomputes its own tty's line
+/// discipline (`n_tty_poll`). Blocking reads keep [`BYTE_RING_WAKERS`].
+pub static CONSOLE_INPUT_WAIT: narf_lib::readiness::WaitQueue =
+    narf_lib::readiness::WaitQueue::new();
+
+/// `POLLIN` in the poll ABI every NARF readiness bit set uses.
+const CONSOLE_POLL_IN: u32 = 0x0001;
+
+/// Wake every parked console reader (see [`BYTE_RING_WAKERS`]) and every
+/// console poller ([`CONSOLE_INPUT_WAIT`]). Call with no ring lock held, after
+/// the event is visible in its ring.
 fn wake_console_readers() {
     let wakers = core::mem::take(&mut *BYTE_RING_WAKERS.lock());
     if !wakers.is_empty() {
         narf_lib::deferred_wake::push_pending(wakers.into_iter().map(Some));
     }
+    CONSOLE_INPUT_WAIT.wake(CONSOLE_POLL_IN);
 }
 
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
@@ -1071,6 +1083,7 @@ static CURSOR_ABS_Y: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub fn set_cursor_abs_px(x: u32, y: u32) {
     CURSOR_ABS_X.store(x, Ordering::Relaxed);
     CURSOR_ABS_Y.store(y, Ordering::Relaxed);
+    note_pointer_activity();
 }
 
 /// Latest absolute cursor position in pixels, or `None` if no absolute pointer
@@ -1143,10 +1156,16 @@ pub fn __reset_modifiers_for_test() {
 pub fn push_global(ev: InputEvent) -> bool {
     let is_key = matches!(ev, InputEvent::Key(_));
     let is_ascii = matches!(ev, InputEvent::AsciiByte(_));
+    let is_pointer = matches!(ev, InputEvent::Pointer(_));
     let ring = ring_for(&ev);
     let g = ring.lock();
     if let Some(r) = g.as_ref() {
         let ok = r.push(ev);
+        if ok && is_pointer {
+            drop(g);
+            note_pointer_activity();
+            return ok;
+        }
         if ok {
             if is_key {
                 KEY_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1180,6 +1199,38 @@ pub fn pop_key() -> Option<KeyEvent> {
         Some(k)
     } else {
         None
+    }
+}
+
+// ── Pointer activity notification ───────────────────────────────────
+//
+// The FB cursor renderer sleeps until the pointer moves (Linux has no cursor
+// timer: a cursor moves on input). Every pointer push and absolute-position
+// publication bumps `POINTER_GEN` and wakes the registered waker (deferred,
+// so a push from interrupt context never runs a waker under a lock).
+
+static POINTER_GEN: AtomicU64 = AtomicU64::new(0);
+static POINTER_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+
+fn note_pointer_activity() {
+    POINTER_GEN.fetch_add(1, Ordering::AcqRel);
+    let waker = POINTER_WAKER.lock().take();
+    if waker.is_some() {
+        narf_lib::deferred_wake::push_pending(core::iter::once(waker));
+    }
+}
+
+/// Generation of pointer activity: changes on every pointer event and
+/// absolute-position update.
+pub fn pointer_generation() -> u64 {
+    POINTER_GEN.load(Ordering::Acquire)
+}
+
+/// Wake `waker` (once) at the next pointer activity.
+pub fn set_pointer_waker(waker: &Waker) {
+    let mut g = POINTER_WAKER.lock();
+    if !g.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        *g = Some(waker.clone());
     }
 }
 

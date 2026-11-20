@@ -1136,10 +1136,12 @@ impl Backend for Hardware {
         if stage == super::Stage::RecoveryPark {
             let _ = writeln!(narf_console::Writer, "mt76: chip reset (firmware recovery)");
         }
-        let _ = writeln!(
-            narf_console::PriorityWriter::<7>,
-            "mt76: firmware {stage:?}"
-        );
+        if crate::mt7921::debug::enabled() {
+            let _ = writeln!(
+                narf_console::PriorityWriter::<7>,
+                "mt76: firmware {stage:?}"
+            );
+        }
     }
     fn now_ns(&self) -> u64 {
         narf_time::wall::monotonic_ns()

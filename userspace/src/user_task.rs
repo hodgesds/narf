@@ -188,6 +188,12 @@ pub struct UserTaskCtx {
     pub timer_slack_ns: AtomicU64,
     /// `current->default_timer_slack_ns`: what `PR_SET_TIMERSLACK(0)` restores.
     pub default_timer_slack_ns: AtomicU64,
+    /// The slack a `poll` / `select` / `epoll_wait` timeout parks with
+    /// (`select_estimate_accuracy`), for the deadline in
+    /// `select_slack_deadline_ns`. Any other park deadline uses
+    /// `timer_slack_ns`, as `nanosleep` and futex waits do in Linux.
+    pub select_slack_ns: AtomicU64,
+    pub select_slack_deadline_ns: AtomicU64,
     /// Absolute CLOCK_REALTIME expiry of the current park, valid while
     /// `sleep_realtime_mono_ns == sleep_deadline_ns` (see
     /// `note_realtime_park`); 0 = none.
@@ -258,6 +264,18 @@ pub struct UserTaskCtx {
     /// sibling steal the signal from an interruptible sleeper selected by
     /// complete_group_signal. Sigwait and signalfd still read the shared set.
     pub(crate) signal_delivery_notified: AtomicBool,
+    /// Linux `TIF_SIGPENDING` for this thread's private state: set by every
+    /// writer that can make a signal (or stop) actionable here — a bit added
+    /// to its private pending set, an unblockable bit added to its group's
+    /// shared set, a mask that unblocks, a job-control stop — and consumed
+    /// only by the thread's own return to user mode, which swaps it clear
+    /// BEFORE reading the state and re-sets it when deliverable work remains
+    /// (`recalc_sigpending`). Together with `signal_delivery_notified` (the
+    /// shared-set selection) and the global group-stop count it lets an
+    /// ordinary syscall return skip every signal-table lock; a standing
+    /// BLOCKED pending signal anywhere in the system no longer sends every
+    /// task down the locked path. Starts set so the first return checks.
+    pub(crate) sigpending: AtomicBool,
     /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
     /// means this I/O wait is not epoll). After registering the task waker,
     /// the park path passively re-scans this instance before switching out.
@@ -927,6 +945,31 @@ impl UserTaskCtx {
         self.timer_slack_ns.load(Ordering::Relaxed)
     }
 
+    /// Record that a `poll` / `select` / `epoll_wait` timeout parks until
+    /// `deadline_ns`: its slack is `select_estimate_accuracy` of the time
+    /// left (`fs/select.c`), not the bare task slack. `nice` is the task's.
+    pub fn note_select_timeout(&self, deadline_ns: u64, now_ns: u64, nice: i32) {
+        let slack = crate::timer_slack::select_estimate_accuracy(
+            deadline_ns.saturating_sub(now_ns),
+            nice,
+            self.timer_slack(),
+        );
+        self.select_slack_ns.store(slack, Ordering::Relaxed);
+        self.select_slack_deadline_ns
+            .store(deadline_ns, Ordering::Release);
+    }
+
+    /// The hrtimer slack for a park ending at `deadline_ns`.
+    #[inline]
+    pub fn park_slack(&self, deadline_ns: u64) -> u64 {
+        if deadline_ns != 0 && self.select_slack_deadline_ns.load(Ordering::Acquire) == deadline_ns
+        {
+            self.select_slack_ns.load(Ordering::Relaxed)
+        } else {
+            self.timer_slack()
+        }
+    }
+
     /// Construct a fresh context with all state zeroed.
     pub fn new() -> Self {
         Self {
@@ -936,6 +979,8 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            select_slack_ns: AtomicU64::new(0),
+            select_slack_deadline_ns: AtomicU64::new(0),
             sleep_realtime_ns: AtomicU64::new(0),
             sleep_realtime_mono_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
@@ -949,6 +994,7 @@ impl UserTaskCtx {
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             signal_delivery_notified: AtomicBool::new(false),
+            sigpending: AtomicBool::new(true),
             epoll_wait_fd: AtomicU64::new(0),
             epoll_wait_node: crate::epoll::EpollWaitNode::new(),
             futex_uaddr: AtomicU64::new(0),
@@ -1791,20 +1837,17 @@ fn park_should_block(
                 }
                 return true;
             }
-            // `schedule_hrtimeout_range(deadline, current->timer_slack_ns)`:
-            // (re)arm this park's hrtimer sleeper on this CPU's base. Re-arming
-            // the same sleeper on every park keeps its expiry current (a futex
-            // park broken by its gen guard re-parks here with a new deadline).
+            // `schedule_hrtimeout_range(deadline, slack)`: (re)arm this park's
+            // hrtimer sleeper on this CPU's base, with `current->timer_slack_ns`
+            // (nanosleep, futex) or, for a poll/select/epoll timeout,
+            // `select_estimate_accuracy`. Re-arming the same sleeper on every
+            // park keeps its expiry current (a futex park broken by its gen
+            // guard re-parks here with a new deadline).
+            let slack = uc.park_slack(deadline);
             if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
-                arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
+                arm_park_timer(sleep_handle, fire_ns, slack, waker);
             } else {
-                arm_park_timer_on(
-                    sleep_handle,
-                    park_clock,
-                    park_expiry,
-                    uc.timer_slack(),
-                    waker,
-                );
+                arm_park_timer_on(sleep_handle, park_clock, park_expiry, slack, waker);
             }
             if uc.net_io_wait.load(Ordering::Acquire) {
                 #[cfg(feature = "syscall-trace")]
@@ -3166,7 +3209,7 @@ impl core::future::Future for UserTaskFuture {
                 // fires a durable wake that normally revives us long before the
                 // timeout, and the check→register race is closed above.
                 let fire_ns = deadline;
-                let slack = this.task.uctx.timer_slack();
+                let slack = this.task.uctx.park_slack(deadline);
                 if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
                     arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
                 } else {

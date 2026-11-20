@@ -2438,3 +2438,228 @@ kernel_test_in!(
     "filesystem/pty",
     smoke_pty_slave_write_preserves_large_burst_and_backpressures
 );
+
+// ── Wait-queue readiness: no cached level ────────────────────────────────────
+//
+// The PTY endpoints used to cache their readiness in a cell that every
+// mutation reconciled by computing the mask and then publishing it. Two
+// reconcilers on different CPUs could publish in the opposite order: a stale
+// "not readable" left a shell's poll armed against a queued Enter, and a stale
+// "readable" swallowed the next write's edge so an epoll waiter (the tmux
+// client) never heard about any later keystroke. With the wait queue a waiter
+// registers and then computes, and every mutation wakes.
+
+/// lflag bits for a raw slave (`cfmakeraw` clears both).
+const TEST_L_ICANON: u32 = 0x0000_0002;
+const TEST_L_ECHO: u32 = 0x0000_0008;
+
+fn set_lflag(pty: &crate::devfs_pty::Pty, clear: u32) {
+    use crate::devfs_pty::Termios;
+    let mut t = Termios::default();
+    let lflag = u32::from_ne_bytes(t.raw[12..16].try_into().unwrap()) & !clear;
+    t.raw[12..16].copy_from_slice(&lflag.to_ne_bytes());
+    pty.set_termios_locked(t.raw);
+}
+
+// Linux wakes `read_wait` on every receive (`n_tty_receive_buf_common`), so an
+// epoll waiter gets an event for each keystroke even while earlier ones are
+// still unread. The cached-level cell fired only on the first (rising) one.
+fn smoke_pty_every_master_write_wakes_queued_slave_waiter() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup returned None");
+    };
+    set_lflag(&pty, TEST_L_ICANON | TEST_L_ECHO);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let waker = counting_waker();
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    if slave.arm_readiness_persistent(0x7701, crate::POLL_IN, &waker) != Some(0) {
+        return TestResult::Fail("persistent slave arm must register and report not-ready");
+    }
+    let mut wakes = [0u32; 3];
+    for (i, byte) in [b"a", b"b", b"\r"].iter().enumerate() {
+        if !matches!(poll_once(master.write(0, *byte)), Some(Ok(1))) {
+            slave.disarm_readiness(0x7701);
+            return TestResult::Fail("master write didn't return 1");
+        }
+        wakes[i] = PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+    }
+    slave.disarm_readiness(0x7701);
+    if wakes[0] == 0 {
+        return TestResult::Fail("the first keystroke did not wake the slave waiter");
+    }
+    if wakes[1] <= wakes[0] || wakes[2] <= wakes[1] {
+        return TestResult::Fail("a keystroke behind unread input woke no slave waiter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_every_master_write_wakes_queued_slave_waiter
+);
+
+// The mirror: slave output behind unread output must still wake the master.
+fn smoke_pty_every_slave_write_wakes_queued_master_waiter() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup returned None");
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let waker = counting_waker();
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    if master.arm_readiness_persistent(0x7702, crate::POLL_IN, &waker) != Some(0) {
+        return TestResult::Fail("persistent master arm must register and report not-ready");
+    }
+    let mut wakes = [0u32; 2];
+    for (i, byte) in [b"x", b"y"].iter().enumerate() {
+        if !matches!(poll_once(slave.write(0, *byte)), Some(Ok(1))) {
+            master.disarm_readiness(0x7702);
+            return TestResult::Fail("slave write didn't return 1");
+        }
+        wakes[i] = PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+    }
+    master.disarm_readiness(0x7702);
+    if wakes[0] == 0 || wakes[1] <= wakes[0] {
+        return TestResult::Fail("slave output behind unread output woke no master waiter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_every_slave_write_wakes_queued_master_waiter
+);
+
+// `n_tty_set_termios`: leaving canonical mode makes the partially edited line
+// readable at once and wakes the readers. A shell runs commands cooked, the
+// user types ahead, and the shell then switches back to raw for its editor;
+// those keystrokes must be the next thing it reads.
+fn smoke_pty_leaving_icanon_makes_partial_line_readable() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup returned None");
+    };
+    // Cooked, no echo (the shell's "running a command" mode).
+    set_lflag(&pty, TEST_L_ECHO);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    if !matches!(poll_once(master.write(0, b"ls")), Some(Ok(2))) {
+        return TestResult::Fail("master write didn't return 2");
+    }
+    if slave.poll_readiness() & crate::POLL_IN != 0 {
+        return TestResult::Fail("a partial canonical line must not be readable");
+    }
+    let waker = counting_waker();
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    if !matches!(
+        slave.arm_readiness(0x7703, crate::POLL_IN, &waker),
+        Some(Poll::Pending)
+    ) {
+        return TestResult::Fail("slave arm must park on a partial canonical line");
+    }
+    // Back to raw: the typed-ahead "ls" becomes readable and wakes the reader.
+    set_lflag(&pty, TEST_L_ICANON | TEST_L_ECHO);
+    let woke = PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) != 0;
+    slave.disarm_readiness(0x7703);
+    if !woke {
+        return TestResult::Fail("leaving ICANON with input buffered woke no reader");
+    }
+    if slave.poll_readiness() & crate::POLL_IN == 0 {
+        return TestResult::Fail("typed-ahead bytes are not readable after leaving ICANON");
+    }
+    let mut buf = [0u8; 8];
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(2)) if &buf[..2] == b"ls" => {}
+        _ => return TestResult::Fail("raw read did not return the typed-ahead bytes"),
+    }
+    // A later keystroke follows them, not precedes them.
+    if !matches!(poll_once(master.write(0, b"x")), Some(Ok(1))) {
+        return TestResult::Fail("master write didn't return 1");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == b'x' => TestResult::Pass,
+        _ => TestResult::Fail("the next raw keystroke was not read after the type-ahead"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_leaving_icanon_makes_partial_line_readable
+);
+
+// A `^D` on an empty canonical line is readable (the read returns 0, EOF):
+// `n_tty_receive_handle_newline` wakes the readers for it. The slave mask
+// counted only buffered bytes, so `cat` polling its tty never saw the EOF.
+fn smoke_pty_eof_on_empty_line_wakes_slave_poller() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup returned None");
+    };
+    set_lflag(&pty, TEST_L_ECHO);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let waker = counting_waker();
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    if !matches!(
+        slave.arm_readiness(0x7704, crate::POLL_IN, &waker),
+        Some(Poll::Pending)
+    ) {
+        return TestResult::Fail("an empty canonical slave must arm as not readable");
+    }
+    if !matches!(poll_once(master.write(0, &[0x04])), Some(Ok(1))) {
+        slave.disarm_readiness(0x7704);
+        return TestResult::Fail("master write of ^D didn't return 1");
+    }
+    let woke = PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) != 0;
+    slave.disarm_readiness(0x7704);
+    if !woke || slave.poll_readiness() & crate::POLL_IN == 0 {
+        return TestResult::Fail("^D on an empty line neither woke nor readied the reader");
+    }
+    let mut buf = [0u8; 4];
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(0)) => TestResult::Pass,
+        _ => TestResult::Fail("^D on an empty line must read as EOF"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_eof_on_empty_line_wakes_slave_poller
+);
+
+// `n_tty_set_termios`: turning IXON off restarts output a ^S stopped. With
+// IXON off ^Q is an ordinary byte, so the stop was otherwise permanent and a
+// pane's output froze (`stty -ixon` after an accidental ^S).
+fn smoke_pty_clearing_ixon_restarts_stopped_output() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup returned None");
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+    // ^S from the terminal stops the slave's output (default termios: IXON).
+    if !matches!(poll_once(master.write(0, &[0x13])), Some(Ok(1))) {
+        return TestResult::Fail("master write of ^S didn't return 1");
+    }
+    let _ = poll_once(slave.write(0, b"x"));
+    if master.poll_readiness() & crate::POLL_IN != 0 {
+        return TestResult::Fail("^S did not stop the slave's output");
+    }
+    let waker = counting_waker();
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    let _ = master.arm_readiness(0x7705, crate::POLL_IN, &waker);
+    // `stty -ixon`.
+    use crate::devfs_pty::Termios;
+    let mut t = Termios::default();
+    t.raw[0..4].copy_from_slice(&0u32.to_ne_bytes());
+    pty.set_termios_locked(t.raw);
+    let woke = PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) != 0;
+    master.disarm_readiness(0x7705);
+    if !woke || master.poll_readiness() & crate::POLL_IN == 0 {
+        return TestResult::Fail("clearing IXON left the stopped output stopped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_clearing_ixon_restarts_stopped_output
+);

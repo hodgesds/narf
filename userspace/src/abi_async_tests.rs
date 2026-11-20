@@ -2097,6 +2097,91 @@ fn smoke_abi_async_inotify_fire_modify() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_modify);
 
+/// The watched-path filter (Linux `fsnotify()`'s no-mark early return) is
+/// exact across every watch lifecycle edge, and the write hook that now uses
+/// the written description still delivers. A watch makes its object and its
+/// children pass; `inotify_rm_watch` and the instance's last close make them
+/// fail again; a write to an unwatched sibling queues nothing.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_fsnotify_filter_follows_watch_lifetime() -> TestResult {
+    with_memfs(
+        "/inofast",
+        "inofast",
+        &[("a", b"...."), ("b", b"....")],
+        || {
+            use crate::mqueue::__test_event_maybe_watched as watched;
+            if watched("/inofast/a") || watched("/inofast/b") {
+                return Err("unwatched files passed the watched-path filter");
+            }
+            let (ifd, wd) = watch(b"/inofast/a\0", IN_MODIFY)?;
+            if !watched("/inofast/a") || watched("/inofast/b") {
+                return Err("a file watch did not mark exactly its object");
+            }
+            let write = |path: &[u8]| -> Result<(), &'static str> {
+                let fd = match call_open(path.as_ptr() as u64, O_WRONLY) {
+                    Some(fd) if fd >= 0 => fd as u64,
+                    _ => return Err("open for write failed"),
+                };
+                let data = *b"XY";
+                let wrote = call(Syscall::Write.raw(), a2(fd, data.as_ptr() as u64, 2));
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                if wrote != Some(2) {
+                    return Err("write failed");
+                }
+                Ok(())
+            };
+            write(b"/inofast/b\0")?;
+            if !read_events(ifd).is_empty() {
+                return Err("a write to an unwatched sibling queued an event");
+            }
+            write(b"/inofast/a\0")?;
+            match read_events(ifd)
+                .iter()
+                .find(|e| e.mask & IN_MODIFY as u32 != 0)
+            {
+                Some(e) if e.wd == wd && e.name.is_empty() => {}
+                _ => return Err("IN_MODIFY did not fire on the watched file"),
+            }
+            if call(Syscall::InotifyRmWatch.raw(), a2(ifd, wd as u64, 0)) != Some(0) {
+                return Err("inotify_rm_watch failed");
+            }
+            if watched("/inofast/a") {
+                return Err("inotify_rm_watch left the object marked");
+            }
+            // A directory watch covers its children (the parent half of the
+            // test), and the instance's last close removes it.
+            let dir_wd = match call(
+                Syscall::InotifyAddWatch.raw(),
+                a2(ifd, b"/inofast\0".as_ptr() as u64, IN_MODIFY),
+            ) {
+                Some(wd) if wd >= 1 => wd as i32,
+                _ => return Err("directory watch failed"),
+            };
+            if !watched("/inofast/a") || !watched("/inofast/b") {
+                return Err("a directory watch did not cover its children");
+            }
+            write(b"/inofast/b\0")?;
+            match read_events(ifd)
+                .iter()
+                .find(|e| e.mask & IN_MODIFY as u32 != 0)
+            {
+                Some(e) if e.wd == dir_wd && e.name == "b" => {}
+                _ => return Err("a directory watch missed its child's IN_MODIFY"),
+            }
+            let _ = call(Syscall::Close.raw(), a0(ifd));
+            if watched("/inofast/a") || watched("/inofast/b") {
+                return Err("closing the instance left its watches marked");
+            }
+            Ok(())
+        },
+    )
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/fsnotify_fast",
+    smoke_abi_fsnotify_filter_follows_watch_lifetime
+);
+
 /// A kernel-side `cgroup.events` transition must traverse the same inotify
 /// queue that systemd reads.  Unlike an ordinary file write, moving a task
 /// into or out of a cgroup has no syscall write path on which to emit

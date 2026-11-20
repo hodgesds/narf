@@ -126,8 +126,13 @@ fn faccessat_common(ctx: &mut dyn TrapContext, dirfd: u64, path_ptr: u64, mode: 
     // the textual link expansion below cannot reach it. Mirror the stat
     // family's handling and check the descriptor's inode directly.
     if follow {
-        if let Some(n) = parse_proc_self_fd(&effective) {
-            let ops = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone())).flatten();
+        // `/proc/<pid>/fd/N` is the pid's descriptor N, not the caller's.
+        if let Some((owner, n)) = proc_fd_link_owner(task, &effective) {
+            if owner != task && !ptrace_may_access_mode(task, owner, PtraceCreds::Fs) {
+                ctx.set_return(errno_ret(EACCES));
+                return;
+            }
+            let ops = fd::with_table(owner, |t| t.get(n).map(|e| e.ops.clone())).flatten();
             if let Some(file) = ops {
                 access_file(ctx, &file, mode, eaccess);
                 return;

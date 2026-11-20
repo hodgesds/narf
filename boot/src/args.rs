@@ -100,6 +100,40 @@ impl<'a> KernelCmdline<'a> {
         level
     }
 
+    /// Whether `<module>.dyndbg=<flags>` enables a module's debug messages,
+    /// the boot-time form of Linux dynamic debug
+    /// (`Documentation/admin-guide/dynamic-debug-howto.rst`). Debug messages
+    /// are off by default, as `pr_debug`/`dev_dbg` are. Each matching token
+    /// applies in command-line order: `+p` enables printing, `-p` disables
+    /// it, and `=` sets exactly the listed flags (so `=p` enables and `=_`
+    /// disables). Other flag letters (`f`, `l`, `m`, `t`) are accepted and
+    /// ignored, and surrounding quotes are stripped. The quoted
+    /// `dyndbg="module <name> +p"` query form is not supported: the command
+    /// line splits on whitespace.
+    #[must_use]
+    pub fn dyndbg_print(&self, module: &str) -> bool {
+        let mut print = false;
+        for token in self.tokens() {
+            let Some((key, value)) = token.split_once('=') else {
+                continue;
+            };
+            if key.strip_suffix(".dyndbg") != Some(module) {
+                continue;
+            }
+            let value = value.trim_matches('"');
+            let mut chars = value.chars();
+            let flags = chars.as_str().get(1..).unwrap_or("");
+            let has_p = flags.contains('p');
+            match chars.next() {
+                Some('+') if has_p => print = true,
+                Some('-') if has_p => print = false,
+                Some('=') => print = has_p,
+                _ => {}
+            }
+        }
+        print
+    }
+
     /// Select the installed root's init. An explicit OpenRC boot takes priority
     /// over the legacy systemd flag if a bootloader supplies both.
     #[must_use]
@@ -267,6 +301,30 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("boot/args", smoke_console_loglevel_obeys_order_and_bounds);
+
+    fn smoke_dyndbg_print_follows_linux_flag_ops() -> TestResult {
+        for (raw, module, expected) in [
+            ("", "mt76", false),
+            ("mt76.dyndbg=+p", "mt76", true),
+            ("mt76.dyndbg=\"+p\"", "mt76", true),
+            ("mt76.dyndbg=+pmf", "mt76", true),
+            ("mt76.dyndbg=+p mt76.dyndbg=-p", "mt76", false),
+            ("mt76.dyndbg=-p mt76.dyndbg=+p", "mt76", true),
+            ("mt76.dyndbg=+p mt76.dyndbg==_", "mt76", false),
+            ("mt76.dyndbg==p", "mt76", true),
+            ("mt76.dyndbg=+f", "mt76", false),
+            ("mt76.dyndbg=+p", "mt7921", false),
+            ("xmt76.dyndbg=+p", "mt76", false),
+            ("mt76.dyndbg", "mt76", false),
+            ("mt76.dyndbg=", "mt76", false),
+        ] {
+            if KernelCmdline::new(raw).dyndbg_print(module) != expected {
+                return TestResult::Fail("dyndbg flag parsing differs from Linux dynamic debug");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/args", smoke_dyndbg_print_follows_linux_flag_ops);
 
     fn smoke_negative_absent_tokens() -> TestResult {
         let a = KernelCmdline::new(REAL);

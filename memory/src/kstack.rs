@@ -399,15 +399,14 @@ impl Drop for KernelStack {
 /// # Safety
 /// The pages must have been mapped by [`KernelStack::alloc`] and be unused.
 unsafe fn unmap_pages(root: PhysAddr, base: u64, count: usize) {
-    for i in 0..count {
-        let va = VirtAddr::new(base + i as u64 * 4096);
-        // SAFETY: forwarded; `unmap_4kb` performs the global invalidation.
-        if let Ok(phys) = unsafe { crate::paging::unmap_4kb(root, va) } {
-            if phys.raw() != 0 {
-                crate::frame::free_frame(PhysFrame::new(phys));
-            }
-        }
-    }
+    // One cross-CPU invalidation for the whole stack (Linux: one
+    // `flush_tlb_kernel_range` per `vunmap`), frames freed after it.
+    // SAFETY: forwarded; the stack is unused and holds no global leaf.
+    unsafe {
+        crate::paging::unmap_kernel_pages(root, VirtAddr::new(base), count as u64, &mut |phys| {
+            crate::frame::free_frame(PhysFrame::new(phys))
+        })
+    };
     if count != 0 {
         // SAFETY: every leaf above was unmapped and flushed; a table still
         // holding another stack's leaves is kept by `free_empty_pt`.

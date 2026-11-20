@@ -82,6 +82,9 @@ const DRAIN_PERIOD_CYCLES: u64 = 50_000_000;
 /// drain loop has its own kernel stack.
 pub async fn drain_loop(writer: FbWriter) {
     loop {
+        // Nothing to drain without a client: park until one connects rather
+        // than waking 60 times a second for an empty registry.
+        registry::connected().await;
         drain_once(&writer);
         // NOTE: status::paint moved out to the fb-status-refresh
         // task. status::paint takes CONTROLLER + AML + I2C + GPIO +
