@@ -2341,16 +2341,22 @@ fn smoke_tsc_deadline_rearms_after_expiry() -> TestResult {
 
     let now = 10_000;
     let target = 12_000;
-    let slack = 100;
-    if should_rearm_tsc_deadline(now, 9_000, target, slack)
-        && should_rearm_tsc_deadline(now, now, target, slack)
-        && !should_rearm_tsc_deadline(now, 11_000, target, slack)
-        && should_rearm_tsc_deadline(now, 15_000, target, slack)
+    if !(should_rearm_tsc_deadline(now, 9_000, target)
+        && should_rearm_tsc_deadline(now, now, target)
+        && !should_rearm_tsc_deadline(now, 11_000, target)
+        && !should_rearm_tsc_deadline(now, target, target)
+        && should_rearm_tsc_deadline(now, 15_000, target))
     {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("TSC deadline stale/live re-arm decision is incorrect")
+        return TestResult::Fail("TSC deadline stale/live re-arm decision is incorrect");
     }
+    // An event earlier than the armed one by any amount reprograms: no
+    // hidden coalescing makes a zero-slack timer late (`hrtimer_reprogram`).
+    if !should_rearm_tsc_deadline(now, target + 1, target)
+        || !should_rearm_tsc_deadline(now, target + 199_999, target)
+    {
+        return TestResult::Fail("an earlier event within the old coalescing window was not armed");
+    }
+    TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/timer", smoke_tsc_deadline_rearms_after_expiry);

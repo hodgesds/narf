@@ -133,3 +133,78 @@ kernel_test_in!(
     "time/idle-rate",
     smoke_idle_timer_interrupt_rate_is_linux_like
 );
+
+/// A busy CPU takes `HZ` ticks a second (`time/tick-rate`), as Linux's
+/// `tick_sched_timer` gives every CPU: once the TSC is calibrated,
+/// `retune_local_ticks` sets each application processor's one-shot tick to
+/// the boot CPU's 1000 Hz (they start before calibration, from an
+/// uncalibrated scale). An AP kept busy by a pinned spinning task must then
+/// take 1000 ± 20 % timer interrupts a second.
+#[cfg(target_arch = "x86_64")]
+fn smoke_busy_ap_ticks_at_hz() -> TestResult {
+    use crate::x86_64::apic;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static SPIN: AtomicBool = AtomicBool::new(false);
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    let me = narf_lib::percpu::current_cpu();
+    let Some(ap) =
+        (0..narf_lib::percpu::MAX_CPUS.min(crate::dispatch::PERCPU_FIRES_MAX)).find(|&c| {
+            c != me && narf_lib::smp::is_online(c as u32) && apic::local_timer_mode(c).is_oneshot()
+        })
+    else {
+        return TestResult::Skip("no AP runs a one-shot LAPIC tick");
+    };
+    SPIN.store(true, Ordering::Release);
+    RUNNING.store(false, Ordering::Release);
+    narf_scheduler::spawn_stackful_pinned(
+        async {
+            RUNNING.store(true, Ordering::Release);
+            while SPIN.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            RUNNING.store(false, Ordering::Release);
+        },
+        ap as u32,
+    );
+    kick(1u64 << ap);
+    let started = narf_time::monotonic_ns() + 1_000_000_000;
+    while !RUNNING.load(Ordering::Acquire) && narf_time::monotonic_ns() < started {
+        core::hint::spin_loop();
+    }
+    if !RUNNING.load(Ordering::Acquire) {
+        SPIN.store(false, Ordering::Release);
+        return TestResult::Skip("the pinned busy task never ran on the AP");
+    }
+    let count = || crate::fire_count_on_cpu(crate::VECTOR_TIMER, ap);
+    let rate_over = |ns: u64| {
+        let before = count();
+        let t0 = narf_time::monotonic_ns();
+        spin_for(ns);
+        let elapsed_ms = (narf_time::monotonic_ns() - t0) / 1_000_000;
+        (count() - before) * 1_000 / elapsed_ms.max(1)
+    };
+    // The tick the AP started with at bring-up, before calibration.
+    let boot_rate = rate_over(300_000_000);
+    let _ = apic::retune_local_ticks(1000);
+    let retuned = apic::local_tick_period_cycles(ap) == apic::tick_period_cycles_for(1000);
+    // Let the AP adopt the period at its next ticks, then measure.
+    spin_for(50_000_000);
+    let rate = rate_over(500_000_000);
+    SPIN.store(false, Ordering::Release);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  tick-rate: busy AP {} takes {} timer IRQs/s with its bring-up tick, {} at HZ",
+        ap,
+        boot_rate,
+        rate
+    );
+    if !retuned {
+        return TestResult::Fail("an AP's tick was not retuned to 1000 Hz");
+    }
+    if !(800..=1200).contains(&rate) {
+        return TestResult::Fail("a busy AP does not tick at HZ");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("time/tick-rate", smoke_busy_ap_ticks_at_hz);
