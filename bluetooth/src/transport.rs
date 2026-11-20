@@ -129,6 +129,19 @@ pub trait HciTransport: Send + Sync + Debug {
         Ok(None)
     }
 
+    /// Have `waker` woken whenever inbound data may be pending: the event,
+    /// ACL and SCO pipes' completions (Linux `btusb_intr_complete` /
+    /// `btusb_bulk_complete` resubmitting their URBs and handing the
+    /// packet up). The registration stays until [`Self::clear_rx_waker`].
+    /// Returns `false` when the transport cannot signal that, and the pump
+    /// then samples it on a timer. Default: unsupported.
+    fn register_rx_waker(&self, _waker: &core::task::Waker) -> bool {
+        false
+    }
+
+    /// Drop the waker [`Self::register_rx_waker`] installed.
+    fn clear_rx_waker(&self) {}
+
     /// Stable transport name for diagnostics ("usb", "uart-115200",
     /// "vhci-test").
     fn name(&self) -> &'static str;

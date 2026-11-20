@@ -145,6 +145,8 @@ pub fn park_mgmt(index: usize) {
 /// system-suspend or autosuspend park (see [`is_parked`]).
 pub fn unpark_mgmt(index: usize) {
     update(index, |s| s.parked_mgmt = false);
+    // The pump task waits for work; let it see the controller back.
+    crate::pump::kick(index);
 }
 
 /// Park controller `index` for system suspend. Called by the
@@ -157,6 +159,8 @@ pub fn suspend_controller(index: usize) {
 /// handler. Idempotent; does not clear a mgmt or autosuspend park.
 pub fn resume_controller(index: usize) {
     update(index, |s| s.parked_system = false);
+    // The pump task waits for work; let it see the controller back.
+    crate::pump::kick(index);
 }
 
 /// Park controller `index` for USB autosuspend. Called by the
@@ -171,6 +175,8 @@ pub fn park_autosuspend(index: usize) {
 /// Idempotent.
 pub fn unpark_autosuspend(index: usize) {
     update(index, |s| s.parked_autosuspend = false);
+    // The pump task waits for work; let it see the controller back.
+    crate::pump::kick(index);
 }
 
 /// Idle timeout (ms) for controller `index` — the value sysfs

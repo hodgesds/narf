@@ -5788,6 +5788,10 @@ struct PumpSlot {
     /// stream (before that, sockets keep today's direct-transport
     /// behaviour and tests see no behaviour change).
     active: bool,
+    /// The driver task, while it waits for work: woken by the transport's
+    /// completions, by any API call that touches the slot (new outbound
+    /// work) and by a stop or unpark.
+    waker: Option<core::task::Waker>,
 }
 
 static PUMPS: IrqSafeSpinLock<Vec<PumpSlot>> = IrqSafeSpinLock::new(Vec::new());
@@ -5829,13 +5833,38 @@ pub fn notify_controller_ready(index: usize) {
             stop: false,
             task_running: false,
             active: false,
+            waker: None,
         });
     }
     start_task_if_enabled(index);
 }
 
+/// The slot of controller `index`, for a caller that may have queued work
+/// for the pump or changed its state: the waiting driver task is woken to
+/// run a step (it parks again if there was nothing to do).
 fn find_slot_mut(pumps: &mut [PumpSlot], index: usize) -> Option<&mut PumpSlot> {
+    let slot = find_slot_mut_quiet(pumps, index)?;
+    if let Some(w) = slot.waker.as_ref() {
+        w.wake_by_ref();
+    }
+    Some(slot)
+}
+
+/// [`find_slot_mut`] without the wake, for the driver task's own step.
+fn find_slot_mut_quiet(pumps: &mut [PumpSlot], index: usize) -> Option<&mut PumpSlot> {
     pumps.iter_mut().find(|s| s.index == index)
+}
+
+/// Wake controller `index`'s driver task (an unpark, a resume).
+pub(crate) fn kick(index: usize) {
+    let waker = PUMPS
+        .lock()
+        .iter()
+        .find(|s| s.index == index)
+        .and_then(|s| s.waker.clone());
+    if let Some(w) = waker {
+        w.wake();
+    }
 }
 
 /// Enable pump task spawning (Stage::Late `bluetooth-pump` initcall)
@@ -5863,7 +5892,7 @@ fn start_task_if_enabled(index: usize) {
         slot.active = true;
     }
     narf_scheduler::spawn_stackful(async move {
-        pump_task(index);
+        pump_task(index).await;
     });
 }
 
@@ -5876,29 +5905,74 @@ fn stop_requested(index: usize) -> bool {
         .unwrap_or(true)
 }
 
+/// Resolves on its second poll: the task returns to the executor once and
+/// runs again when something wakes it. A wake that lands between the
+/// waker's registration and this park makes the executor poll again at
+/// once, so none is lost.
+struct Park(bool);
+
+impl core::future::Future for Park {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            return core::task::Poll::Ready(());
+        }
+        self.0 = true;
+        core::task::Poll::Pending
+    }
+}
+
 /// The driver task: step the pump until [`stop_pump`] is requested.
 ///
 /// Stackful (kernel thread) rather than an executor task because the
 /// USB transport's `HciTransport` methods bridge through `block_on`.
-fn pump_task(index: usize) {
+///
+/// Event-driven, as Linux btusb is: an idle task sleeps until the
+/// transport reports a completion (`register_rx_waker`), an API call
+/// queues outbound work or changes the slot (`find_slot_mut`), or a stop
+/// or unpark wakes it. A transport that cannot report completions is
+/// sampled every 2 ms on a timer instead (never by spinning).
+async fn pump_task(index: usize) {
+    let waker = core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await;
+    let transport = {
+        let mut pumps = PUMPS.lock();
+        find_slot_mut_quiet(&mut pumps, index).and_then(|slot| {
+            slot.waker = Some(waker.clone());
+            slot.core.as_ref().map(|c| c.transport.clone())
+        })
+    };
     loop {
         if stop_requested(index) {
             break;
         }
+        // Registered before the step, so a completion during or after it
+        // wakes the park below. Re-registered every step: the transport
+        // re-arms its pipes after a resume.
+        let event_driven = transport
+            .as_ref()
+            .is_some_and(|t| t.register_rx_waker(&waker));
         let step = pump_once(index);
         if stop_requested(index) {
             break;
         }
         if step.is_idle() {
-            let _ = narf_scheduler::responsive_spin_until(
-                || stop_requested(index),
-                narf_time::Deadline::after_ms(2),
-            );
+            if event_driven {
+                Park(false).await;
+            } else {
+                narf_time::usleep_range(2_000, 2_500).await;
+            }
         }
     }
+    if let Some(t) = transport.as_ref() {
+        t.clear_rx_waker();
+    }
     let mut pumps = PUMPS.lock();
-    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+    if let Some(slot) = find_slot_mut_quiet(&mut pumps, index) {
         slot.task_running = false;
+        slot.waker = None;
     }
 }
 
@@ -5931,7 +6005,12 @@ pub fn remove_pump(index: usize) -> bool {
         return false;
     };
     pumps[pos].stop = true;
-    pumps.swap_remove(pos);
+    let slot = pumps.swap_remove(pos);
+    drop(pumps);
+    // A waiting driver task observes the missing slot and exits.
+    if let Some(w) = slot.waker {
+        w.wake();
+    }
     true
 }
 
@@ -7289,7 +7368,7 @@ pub fn hogp_boot_mode(index: usize, handle: u16) -> Option<bool> {
 pub fn pump_once(index: usize) -> PumpStep {
     let mut core = {
         let mut pumps = PUMPS.lock();
-        let Some(slot) = find_slot_mut(&mut pumps, index) else {
+        let Some(slot) = find_slot_mut_quiet(&mut pumps, index) else {
             return PumpStep::default();
         };
         slot.active = true;
@@ -7386,7 +7465,7 @@ pub fn pump_once(index: usize) -> PumpStep {
 
     let final_stats = core.stats;
     let mut pumps = PUMPS.lock();
-    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+    if let Some(slot) = find_slot_mut_quiet(&mut pumps, index) {
         slot.core = Some(core);
         // Merge this step's fan-out drops into the cumulative total
         // before publishing the slot stats. `final_stats` comes from
@@ -7415,6 +7494,10 @@ pub fn __test_reset() {
     #[cfg(any(test, feature = "kernel-test"))]
     test_entropy::clear();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "pump_wake_tests.rs"]
+mod wake_tests;
 
 // ── Fixtures: fake HCI controller conversations ─────────────────────
 

@@ -570,6 +570,9 @@ pub fn register_initcalls() {
 /// directly; this transport exists so Stage-1+ callers (the pump
 /// task, socket sends) can issue HCI commands once L2CAP / GATT
 /// pumps are wired up.
+/// Size of the staged ACL bulk-IN transfer.
+const ACL_RX_BYTES: usize = 1024;
+
 pub struct UsbHciTransport {
     /// Controller index ([`crate::xhci::Xhci::id`]) the slot belongs to.
     controller: u8,
@@ -593,6 +596,11 @@ pub struct UsbHciTransport {
     /// Re-arm flag: set the first time `recv_event` is called so the
     /// interrupt-IN endpoint is pre-armed before the first poll.
     armed: AtomicBool,
+    /// The ACL bulk-IN TD kept staged between polls, as Linux btusb keeps
+    /// its bulk URBs submitted (`btusb_submit_bulk_urb`, resubmitted from
+    /// `btusb_bulk_complete`). `None` until the first poll stages one and
+    /// after each completion.
+    acl_rx: IrqSafeSpinLock<Option<crate::xhci::BulkToken>>,
     /// Isochronous SCO endpoints of the bind-selected alternate
     /// setting. `None` when the device offers no SCO transport (or
     /// the alternate switch failed) — SCO is refused, never rerouted.
@@ -636,6 +644,7 @@ pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransp
         hub_port: None,
         hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(false),
+        acl_rx: IrqSafeSpinLock::new(None),
         sco_in_dci: None,
         sco_out_dci: None,
         sco_alts: [None; MAX_SCO_ALT_SETTINGS],
@@ -725,6 +734,16 @@ impl UsbHciTransport {
         if index != usize::MAX {
             narf_bluetooth::pm::unpark_autosuspend(index);
         }
+    }
+
+    /// The staged ACL bulk-IN TD, staging one if none is.
+    fn take_acl_rx(&self, xhci: &Xhci) -> Option<crate::xhci::BulkToken> {
+        if let Some(token) = self.acl_rx.lock().take() {
+            return Some(token);
+        }
+        let generation = xhci.device_generation(self.slot_id)?;
+        xhci.begin_bulk_in(self.slot_id, self.acl_in_dci, generation, ACL_RX_BYTES)
+            .ok()
     }
 
     fn arm_event_in(&self, xhci: &Xhci) -> Result<(), TransportError> {
@@ -897,21 +916,59 @@ impl HciTransport for UsbHciTransport {
     }
 
     fn recv_acl(&self) -> Result<Option<Vec<u8>>, TransportError> {
-        // Stage 2: pull an ACL packet from the bulk-IN endpoint.
-        // Bridges via block_on_spin, not the halting block_on:
-        // this runs in the HCI pump task's executor poll, where
-        // CURRENT_TASK != 0 would make the halting bridge panic.
-        // See the `UsbHciTransport` docs. Ref: btusb_bulk_in()
-        // in drivers/bluetooth/btusb.c.
+        // Pull an ACL packet from the bulk-IN endpoint without waiting:
+        // the TD stays staged between polls and its completion wakes the
+        // pump (`register_rx_waker`), as `btusb_bulk_complete` hands the
+        // packet up and resubmits the URB. Ref: btusb_submit_bulk_urb() /
+        // btusb_bulk_complete() in drivers/bluetooth/btusb.c.
         let xhci = self.xhci()?;
-        let mut buf = [0u8; 1024];
-        match narf_scheduler::block_on_spin(xhci.bulk_in(self.slot_id, self.acl_in_dci, &mut buf)) {
-            Ok(0) => Ok(None),
-            Ok(n) => {
+        let Some(token) = self.take_acl_rx(&xhci) else {
+            return Ok(None);
+        };
+        let mut buf = [0u8; ACL_RX_BYTES];
+        match xhci.poll_bulk_in(&token, &mut buf) {
+            // Not complete: keep it staged.
+            Ok(None) => {
+                *self.acl_rx.lock() = Some(token);
+                Ok(None)
+            }
+            Ok(Some(0)) => Ok(None),
+            Ok(Some(n)) => {
                 self.mark_activity();
                 Ok(Some(buf[..n].to_vec()))
             }
+            // A failed TD is retired; the next poll stages a fresh one.
             Err(_) => Ok(None),
+        }
+    }
+
+    fn register_rx_waker(&self, waker: &core::task::Waker) -> bool {
+        let Ok(xhci) = self.xhci() else {
+            return false;
+        };
+        // Both pipes staged, as btusb submits its interrupt and bulk URBs
+        // when the device opens (`btusb_open`).
+        if self.arm_event_in(&xhci).is_err() {
+            return false;
+        }
+        if let Some(token) = self.take_acl_rx(&xhci) {
+            *self.acl_rx.lock() = Some(token);
+        }
+        xhci.set_endpoint_waker(self.slot_id, self.event_dci, waker);
+        xhci.set_endpoint_waker(self.slot_id, self.acl_in_dci, waker);
+        if let Some(dci) = self.sco_in_dci {
+            xhci.set_endpoint_waker(self.slot_id, dci, waker);
+        }
+        xhci.has_event_interrupt()
+    }
+
+    fn clear_rx_waker(&self) {
+        if let Ok(xhci) = self.xhci() {
+            xhci.clear_endpoint_waker(self.slot_id, self.event_dci);
+            xhci.clear_endpoint_waker(self.slot_id, self.acl_in_dci);
+            if let Some(dci) = self.sco_in_dci {
+                xhci.clear_endpoint_waker(self.slot_id, dci);
+            }
         }
     }
 
@@ -1534,6 +1591,7 @@ pub async fn try_bind_btusb_already_addressed(
         hub_port,
         hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(true), // already armed by the bring-up
+        acl_rx: IrqSafeSpinLock::new(None),
         sco_in_dci,
         sco_out_dci,
         sco_alts: eps.sco_alts,
