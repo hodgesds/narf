@@ -7811,6 +7811,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: thread_cpu_times(task).total_ns(),
+        wait_ns: crate::task::run_delay_ns(task),
         timeslices,
         voluntary_switches,
         involuntary_switches,

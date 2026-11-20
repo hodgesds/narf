@@ -580,7 +580,7 @@ fn nice_to_weight(nice: i32) -> u64 {
 /// fields are real.
 fn render_schedstat(pid: u64) -> String {
     let sched = super::hook_sched_snapshot(pid);
-    format!("{} {} {}\n", sched.run_ns, 0, sched.timeslices)
+    format!("{} {} {}\n", sched.run_ns, sched.wait_ns, sched.timeslices)
 }
 
 /// `/proc/<pid>/stack` — kernel-stack backtrace (privileged).
@@ -1594,6 +1594,7 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_schedstat_shape);
 fn test_sched_snapshot(_pid: u64) -> super::ProcSchedSnapshot {
     super::ProcSchedSnapshot {
         run_ns: 1_234_567_890,
+        wait_ns: 5_000,
         timeslices: 42,
         voluntary_switches: 7,
         involuntary_switches: 3,
@@ -1615,8 +1616,10 @@ fn smoke_sched_files_report_the_tasks_accounting() -> TestResult {
     let syscall = render_syscall(1);
     super::__test_sched_snapshot_hook_restore(prev);
 
-    if schedstat != "1234567890 0 42\n" {
-        return TestResult::Fail("schedstat should report run_time_ns and timeslices");
+    if schedstat != "1234567890 5000 42\n" {
+        return TestResult::Fail(
+            "schedstat should report run_time_ns, run_delay_ns and timeslices",
+        );
     }
     if !sched.contains("nr_voluntary_switches              :                 7")
         || !sched.contains("nr_involuntary_switches            :                 3")

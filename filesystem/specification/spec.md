@@ -2153,6 +2153,20 @@ the thread group's times and its reaped children's for `/proc/<pid>/stat`; a
 `/proc/<pid>/task/<tid>/stat` row substitutes the thread's own utime/stime
 from `ThreadStat` and keeps the group's cutime/cstime (`do_task_stat`).
 
+`/proc/schedstat` follows `kernel/sched/stats.c::show_schedstat` at version
+17: `version 17`, `timestamp <jiffies>`, then per online CPU a
+`cpuN yld_count 0 sched_count sched_goidle ttwu_count ttwu_local rq_cpu_time
+run_delay pcount` line and its `domainN <name> <%*pb span>` lines carrying
+3×11 load-balance, 9 active/exec/fork-balance and the `ttwu_wake_remote
+ttwu_move_affine ttwu_move_balance` counters, from `narf_scheduler::schedstat`
+(`scheduler/` §3.4.0; the load-balance columns are zero).
+`/proc/<pid>/schedstat` (`proc_pid_schedstat`) prints `run_time wait_time
+timeslices`, `wait_time` being the task's `run_delay`. `/proc/narf/ipi` prints
+one row per online CPU: reschedule IPIs received, sent, and avoided (target
+already notified, target polling in idle, kick already in flight), whether it
+is polling in idle now, and TLB-shootdown IPIs received, requests published
+(kernel and tagged), peers targeted and IPIs sent.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

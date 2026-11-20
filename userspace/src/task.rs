@@ -704,6 +704,12 @@ pub(crate) fn cpu_times(tid: u64) -> narf_scheduler::TaskTimes {
     task_get(tid).map_or_else(Default::default, |task| task.cputime.sample())
 }
 
+/// Time thread `tid` has spent runnable, waiting for a CPU, in ns (Linux
+/// `sched_info.run_delay`). Zero for an unknown thread.
+pub(crate) fn run_delay_ns(tid: u64) -> u64 {
+    task_get(tid).map_or(0, |task| task.cputime.run_delay_ns())
+}
+
 /// The thread group (`signal_struct`) CPU-time state of thread `tid`.
 pub(crate) fn process_cputime_of(tid: u64) -> Option<Arc<crate::proc_cpu_time::ProcessCputime>> {
     task_get(tid).map(|task| task.process_cputime.clone())

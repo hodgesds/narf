@@ -646,6 +646,9 @@ type PersonalityFn = fn(u64) -> u32;
 pub struct ProcSchedSnapshot {
     /// `se.sum_exec_runtime` — on-CPU time, ns (user + in-syscall).
     pub run_ns: u64,
+    /// `sched_info.run_delay` — time runnable but waiting for a CPU, ns
+    /// (`/proc/<pid>/schedstat`'s second field).
+    pub wait_ns: u64,
     /// Completed run slices (`/proc/<pid>/schedstat`'s third field).
     pub timeslices: u64,
     /// `nr_voluntary_switches` — slices that ended in a park.
