@@ -1183,11 +1183,13 @@ async fn boot_radio() {
         );
     }
     if result.is_ok() {
-        let _ = writeln!(
-            narf_console::PriorityWriter::<7>,
-            "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
-            boot_status()
-        );
+        if crate::mt7921::debug::enabled() {
+            let _ = writeln!(
+                narf_console::PriorityWriter::<7>,
+                "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
+                boot_status()
+            );
+        }
         return;
     }
     let _ = writeln!(
