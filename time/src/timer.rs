@@ -26,7 +26,9 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::panic::Location;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
@@ -54,6 +56,74 @@ pub fn jiffies_to_ns(j: u64) -> u64 {
 #[inline]
 pub fn ns_to_jiffies(ns: u64) -> u64 {
     ns.div_ceil(NSEC_PER_JIFFY)
+}
+
+/// `msecs_to_jiffies`: whole jiffies covering `ms` (rounded up).
+#[inline]
+pub fn msecs_to_jiffies(ms: u64) -> u64 {
+    ns_to_jiffies(ms.saturating_mul(1_000_000))
+}
+
+// ── round_jiffies (kernel/time/timer.c) ─────────────────────────────────
+//
+// Periodic housekeeping whose exact phase does not matter rounds its expiry
+// to a whole second, so the timers of one CPU (and, skewed by 3 jiffies per
+// CPU, of the whole system) fire in one interrupt instead of one each.
+
+/// `round_jiffies_common`, against an explicit `now` (pure; tests).
+pub fn round_jiffies_common_at(j: u64, cpu: u64, force_up: bool, now: u64) -> u64 {
+    let original = j;
+    let skew = cpu.saturating_mul(3);
+    let mut j = j.wrapping_add(skew);
+    let rem = j % HZ;
+    // Just past a whole second (a delayed tick): round down, unless forced up.
+    if rem < HZ / 4 && !force_up {
+        j -= rem;
+    } else {
+        j = j - rem + HZ;
+    }
+    j = j.wrapping_sub(skew);
+    // Still in the future (`time_is_after_jiffies`), or the original.
+    if j > now {
+        j
+    } else {
+        original
+    }
+}
+
+/// `__round_jiffies`: round absolute jiffy `j` to a whole second as seen
+/// from `cpu`.
+pub fn __round_jiffies(j: u64, cpu: usize) -> u64 {
+    round_jiffies_common_at(j, cpu as u64, false, jiffies())
+}
+
+/// `__round_jiffies_relative`: [`__round_jiffies`] for a delay.
+pub fn __round_jiffies_relative(j: u64, cpu: usize) -> u64 {
+    let j0 = jiffies();
+    round_jiffies_common_at(j.saturating_add(j0), cpu as u64, false, j0) - j0
+}
+
+/// `round_jiffies`: round absolute jiffy `j` to a whole second for this CPU.
+pub fn round_jiffies(j: u64) -> u64 {
+    __round_jiffies(j, this_cpu())
+}
+
+/// `round_jiffies_relative`: round a delay of `j` jiffies so it ends on a
+/// whole second for this CPU.
+pub fn round_jiffies_relative(j: u64) -> u64 {
+    __round_jiffies_relative(j, this_cpu())
+}
+
+/// `round_jiffies_up`: like [`round_jiffies`] but never earlier than `j`.
+pub fn round_jiffies_up(j: u64) -> u64 {
+    round_jiffies_common_at(j, this_cpu() as u64, true, jiffies())
+}
+
+/// `round_jiffies_up_relative`: like [`round_jiffies_relative`] but never
+/// shorter than `j`.
+pub fn round_jiffies_up_relative(j: u64) -> u64 {
+    let j0 = jiffies();
+    round_jiffies_common_at(j.saturating_add(j0), this_cpu() as u64, true, j0) - j0
 }
 
 // ── wheel geometry (kernel/time/timer.c) ────────────────────────────────
@@ -932,6 +1002,140 @@ pub fn __test_expired_on(cpu: usize) -> u64 {
     })
 }
 
+// ── /proc/timer_list snapshots ──────────────────────────────────────────
+
+/// The wheel base names `/proc/timer_list` prints (Linux `BASE_LOCAL`,
+/// `BASE_GLOBAL`, `BASE_DEF`).
+pub const BASE_NAMES: [&str; NR_BASES] = ["BASE_LOCAL", "BASE_GLOBAL", "BASE_DEF"];
+
+/// Number of wheel bases per CPU.
+pub const NR_TIMER_BASES: usize = NR_BASES;
+
+/// One pending wheel timer, copied under its base lock.
+#[derive(Clone, Copy, Debug)]
+pub struct WheelTimerSnapshot {
+    pub addr: usize,
+    pub function: usize,
+    /// `TIMER_*` flags.
+    pub flags: u32,
+    /// Expiry in jiffies, and the jiffy its bucket fires at (the expiry
+    /// rounded up to the bucket's level granularity).
+    pub expires: u64,
+    pub bucket_expiry: u64,
+    /// Wheel level of its bucket (`EXPIRING` timers report `LVL_DEPTH`).
+    pub level: u8,
+    /// Coarse sleepers (`process_timeout`) only: arming task and site.
+    pub owner_task: u64,
+    pub site: Option<&'static Location<'static>>,
+}
+
+/// A wheel base's clock and next expiry (jiffies) plus its timers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WheelBaseStats {
+    pub clk: u64,
+    /// `u64::MAX` when nothing is pending.
+    pub next_expiry: u64,
+    pub nr_expired: u64,
+}
+
+/// The jiffy bucket `idx` fires at, for a timer filed there with expiry
+/// `expires` while the base clock read `clk`. `calc_index` files a timer at
+/// `e = (expires >> shift) + 1`; a timer filed late (already due) or capped
+/// at `WHEEL_TIMEOUT_MAX` does not match that and is placed from the clock.
+fn bucket_expiry_of(idx: usize, clk: u64, expires: u64) -> u64 {
+    let lvl = idx / LVL_SIZE;
+    let pos = (idx % LVL_SIZE) as u64;
+    let shift = lvl_shift(lvl);
+    let e = (expires >> shift) + 1;
+    if e & LVL_MASK == pos {
+        return e << shift;
+    }
+    // Pending buckets of a level lie at or after the clock's position.
+    let cur = clk >> shift;
+    let mut e = (cur & !LVL_MASK) | pos;
+    if e < cur {
+        e += LVL_SIZE as u64;
+    }
+    e << shift
+}
+
+/// Append every timer pending on wheel base `index` of `cpu`. Returns the
+/// base's clock/next-expiry and how many timers were pending (more than were
+/// appended when timers were armed faster than the reserve grew). Task
+/// context only.
+pub fn snapshot_wheel(
+    cpu: usize,
+    index: usize,
+    out: &mut Vec<WheelTimerSnapshot>,
+) -> Option<(WheelBaseStats, usize)> {
+    let b = cpu_bases(cpu)?;
+    let base = b.bases.get(index)?;
+    out.reserve(64);
+    narf_lib::sync::without_interrupts(|| {
+        let g = base.inner.lock();
+        let room = out.capacity();
+        let mut seen = 0;
+        let mut push = |t: &TimerList, idx: usize| {
+            seen += 1;
+            if out.len() >= room {
+                return;
+            }
+            let (owner_task, site) = if t.function as usize == process_timeout as usize {
+                // SAFETY: only `TimeoutNode`s use `process_timeout`; the
+                // timer is the first field of the repr(C) node.
+                let n = unsafe { &*(t as *const TimerList as *const TimeoutNode) };
+                let site = n.site.load(Ordering::Relaxed);
+                // SAFETY: null or a `&'static Location` (arm_from).
+                (n.owner_task.load(Ordering::Relaxed), unsafe {
+                    site.as_ref()
+                })
+            } else {
+                (0, None)
+            };
+            let (level, bucket_expiry) = if idx == EXPIRING {
+                (LVL_DEPTH as u8, g.clk)
+            } else {
+                (
+                    (idx / LVL_SIZE) as u8,
+                    bucket_expiry_of(idx, g.clk, t.expires()),
+                )
+            };
+            out.push(WheelTimerSnapshot {
+                addr: t as *const TimerList as usize,
+                function: t.function as usize,
+                flags: t.flags,
+                expires: t.expires(),
+                bucket_expiry,
+                level,
+                owner_task,
+                site,
+            });
+        };
+        // SAFETY (both walks): linked nodes are live (mod_timer contract)
+        // and their links are guarded by the base lock held here.
+        let mut n = g.expiring;
+        while !n.is_null() {
+            let t = unsafe { &*n };
+            push(t, EXPIRING);
+            n = unsafe { *t.next.get() };
+        }
+        for idx in 0..WHEEL_SIZE {
+            let mut n = g.vectors[idx];
+            while !n.is_null() {
+                let t = unsafe { &*n };
+                push(t, idx);
+                n = unsafe { *t.next.get() };
+            }
+        }
+        let stats = WheelBaseStats {
+            clk: g.clk,
+            next_expiry: base.next_expiry.load(Ordering::Acquire),
+            nr_expired: base.nr_expired.load(Ordering::Relaxed),
+        };
+        Some((stats, seen))
+    })
+}
+
 // ── schedule_timeout ────────────────────────────────────────────────────
 
 /// A coarse sleeper on the wheel (`schedule_timeout`'s `process_timeout`
@@ -941,6 +1145,10 @@ pub fn __test_expired_on(cpu: usize) -> u64 {
 struct TimeoutNode {
     timer: TimerList,
     waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Who armed it last (task, 0 = unknown) and where, for
+    /// `/proc/timer_list`; written at arm only.
+    owner_task: AtomicU64,
+    site: AtomicPtr<Location<'static>>,
 }
 
 fn process_timeout(r: TimerRef) {
@@ -969,11 +1177,31 @@ impl TimeoutHandle {
         Self(Box::new(TimeoutNode {
             timer: TimerList::new(process_timeout, flags),
             waker: IrqSafeSpinLock::new(None),
+            owner_task: AtomicU64::new(0),
+            site: AtomicPtr::new(ptr::null_mut()),
         }))
     }
 
-    /// (Re)arm to wake `waker` at jiffy `expires`.
+    /// (Re)arm to wake `waker` at jiffy `expires`; the caller is recorded as
+    /// the arm site.
+    #[track_caller]
     pub fn arm(&self, expires: u64, waker: &core::task::Waker) {
+        self.arm_from(expires, waker, Location::caller());
+    }
+
+    /// [`Self::arm`] recording `site` (a wrapper's own caller).
+    pub fn arm_from(
+        &self,
+        expires: u64,
+        waker: &core::task::Waker,
+        site: &'static Location<'static>,
+    ) {
+        self.0
+            .site
+            .store(site as *const _ as *mut _, Ordering::Relaxed);
+        self.0
+            .owner_task
+            .store(crate::hrtimer::current_task_id(), Ordering::Relaxed);
         let old = {
             let mut w = self.0.waker.lock();
             match w.as_ref() {

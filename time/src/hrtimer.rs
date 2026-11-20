@@ -48,7 +48,9 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::panic::Location;
 use core::ptr;
 use core::sync::atomic::{
     fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
@@ -306,6 +308,11 @@ pub struct HrTimerCpuBase {
     retrigger: AtomicBool,
     /// Callbacks run from this base (diagnostic).
     nr_events: AtomicU64,
+    /// `cpu_base->nr_retries`: interrupts that re-ran the queues because
+    /// callbacks ran past the next event.
+    nr_retries: AtomicU64,
+    /// `cpu_base->nr_hangs`: interrupts that gave up retrying.
+    nr_hangs: AtomicU64,
 }
 
 impl core::fmt::Debug for HrTimerCpuBase {
@@ -341,6 +348,8 @@ impl HrTimerCpuBase {
             softirq_raised: AtomicBool::new(false),
             retrigger: AtomicBool::new(false),
             nr_events: AtomicU64::new(0),
+            nr_retries: AtomicU64::new(0),
+            nr_hangs: AtomicU64::new(0),
         }
     }
 }
@@ -888,10 +897,15 @@ fn expire_hard(base: &'static HrTimerCpuBase) -> Ktime {
         g = run_queues(base, g, now, HRTIMER_ACTIVE_HARD);
         let next = update_next_event(base, &mut g);
         // Linux retries a few times when callbacks ran past the next event.
-        if next > crate::monotonic_ns() || retries >= 3 {
+        if next > crate::monotonic_ns() {
+            break next;
+        }
+        if retries >= 3 {
+            base.nr_hangs.fetch_add(1, Ordering::Relaxed);
             break next;
         }
         retries += 1;
+        base.nr_retries.fetch_add(1, Ordering::Relaxed);
     };
     g.in_hrtirq = false;
     next
@@ -1098,6 +1112,117 @@ pub fn nr_queued_all() -> usize {
         .sum()
 }
 
+// ── /proc/timer_list snapshots ──────────────────────────────────────────
+
+/// One queued hrtimer as `/proc/timer_list` prints it (`print_timer`):
+/// copied under its base lock, printed after the lock is dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct TimerSnapshot {
+    /// The timer's address (`<%p>`).
+    pub addr: usize,
+    /// Its callback's address (`%ps`).
+    pub function: usize,
+    /// `timer->is_queued`.
+    pub state: u8,
+    /// Soft and hard expiry in the base's clock (`_softexpires`, `expires`).
+    pub softexpires: Ktime,
+    pub expires: Ktime,
+    /// Sleepers (`hrtimer_wakeup`) only: the task that armed it (0 if
+    /// unknown) and where it was armed.
+    pub owner_task: u64,
+    pub site: Option<&'static Location<'static>>,
+}
+
+/// Per-CPU base counters `/proc/timer_list` prints after the clock bases.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuBaseStats {
+    /// Programmed next event, monotonic ns (`KTIME_MAX`: none).
+    pub expires_next: Ktime,
+    /// `nr_events`: callbacks run.
+    pub nr_events: u64,
+    pub nr_retries: u64,
+    pub nr_hangs: u64,
+    /// Timers queued over all clock bases.
+    pub nr_queued: usize,
+}
+
+/// `base->offset` of clock base `index` (0..[`HRTIMER_MAX_CLOCK_BASES`]):
+/// that base's clock minus CLOCK_MONOTONIC, in ns.
+pub fn clock_base_offset(index: usize) -> i64 {
+    base_offset(index)
+}
+
+/// The counters of `cpu`'s base, if it was prepared.
+pub fn cpu_base_stats(cpu: usize) -> Option<CpuBaseStats> {
+    let b = cpu_base(cpu)?;
+    Some(CpuBaseStats {
+        expires_next: b.next_event.load(Ordering::Acquire),
+        nr_events: b.nr_events.load(Ordering::Relaxed),
+        nr_retries: b.nr_retries.load(Ordering::Relaxed),
+        nr_hangs: b.nr_hangs.load(Ordering::Relaxed),
+        nr_queued: b.queued.load(Ordering::Relaxed),
+    })
+}
+
+/// Append every timer queued on clock base `index` of `cpu`, earliest
+/// first (`print_active_timers`). Returns how many were queued; when that
+/// exceeds what was appended, timers were queued faster than the reserve
+/// grew and the tail was dropped (the next read sees them).
+///
+/// Linux re-takes the base lock once per timer (its O(N²) walk) because it
+/// prints under no lock; here the whole tree is copied in one lock hold into
+/// space reserved beforehand, so nothing allocates under the IRQ-safe lock.
+/// Task context only (it may allocate before locking).
+pub fn snapshot_base(cpu: usize, index: usize, out: &mut Vec<TimerSnapshot>) -> usize {
+    let Some(base) = cpu_base(cpu) else {
+        return 0;
+    };
+    if index >= HRTIMER_MAX_CLOCK_BASES {
+        return 0;
+    }
+    // Head-room for timers queued between this read and the lock.
+    out.reserve(base.queued.load(Ordering::Relaxed) + 16);
+    let room = out.capacity();
+    narf_lib::sync::without_interrupts(|| {
+        let g = base.inner.lock();
+        let head = &g.clock_base[index];
+        let mut n = head.first();
+        let mut seen = 0;
+        while !n.is_null() {
+            // SAFETY: linked ⇒ the owning timer is live while the base lock
+            // is held (start contract).
+            let t = unsafe { &*HrTimer::from_node(n) };
+            seen += 1;
+            if out.len() < room {
+                let (owner_task, site) = if is_sleeper(t) {
+                    // SAFETY: only sleepers use `hrtimer_wakeup`, and the
+                    // timer is the first field of the `repr(C)` sleeper.
+                    let sl = unsafe { &*(t as *const HrTimer as *const HrTimerSleeper) };
+                    let site = sl.site.load(Ordering::Relaxed);
+                    // SAFETY: null or a `&'static Location` (start_from).
+                    (sl.owner_task.load(Ordering::Relaxed), unsafe {
+                        site.as_ref()
+                    })
+                } else {
+                    (0, None)
+                };
+                out.push(TimerSnapshot {
+                    addr: t as *const HrTimer as usize,
+                    function: t.function as usize,
+                    state: t.state.load(Ordering::Relaxed),
+                    softexpires: t.softexpires(),
+                    expires: t.expires(),
+                    owner_task,
+                    site,
+                });
+            }
+            // SAFETY: `n` is linked into `head`; the base lock is held.
+            n = unsafe { head.next_of(n) };
+        }
+        seen
+    })
+}
+
 /// `hrtimers_cpu_dying`: move every timer queued on `dying` to the calling
 /// CPU's base (the CPU must be on its way offline, its interrupts no longer
 /// expiring timers). Returns the timers moved.
@@ -1163,6 +1288,41 @@ struct HrTimerSleeper {
     timer: HrTimer,
     waker: IrqSafeSpinLock<Option<Waker>>,
     fired: AtomicBool,
+    /// Who armed it last, for `/proc/timer_list`: the task (0 = unknown) and
+    /// the call site. Linux's former `CONFIG_TIMER_STATS` recorded the same
+    /// `start_pid` / `start_site` pair in every hrtimer. Written at each
+    /// arm, read only by [`snapshot_base`]; nothing on the expiry path
+    /// touches them.
+    owner_task: AtomicU64,
+    site: AtomicPtr<Location<'static>>,
+}
+
+// ── arm-site bookkeeping ────────────────────────────────────────────────
+
+static TASK_ID_CB: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the "which task is running on this CPU" query used to record a
+/// sleeper's owner at arm time (the scheduler's `current_task_id`). Without
+/// one, owners read as 0.
+pub fn set_current_task_hook(f: fn() -> u64) {
+    TASK_ID_CB.store(f as usize, Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn current_task_id() -> u64 {
+    let raw = TASK_ID_CB.load(Ordering::Acquire);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: only `fn() -> u64` values are stored by the setter.
+    let f: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    f()
+}
+
+/// `hrtimer_wakeup` as an address, so a snapshot can tell sleepers apart.
+#[inline]
+fn is_sleeper(t: &HrTimer) -> bool {
+    t.function as usize == hrtimer_wakeup as usize
 }
 
 /// `hrtimer_wakeup`.
@@ -1202,20 +1362,46 @@ impl SleepHandle {
             timer: HrTimer::new(hrtimer_wakeup, clock, HrtimerMode::ABS),
             waker: IrqSafeSpinLock::new(None),
             fired: AtomicBool::new(false),
+            owner_task: AtomicU64::new(0),
+            site: AtomicPtr::new(ptr::null_mut()),
         }))
     }
 
     /// New sleeper armed for monotonic `expires_ns` with `slack_ns` range.
+    #[track_caller]
     pub fn arm(expires_ns: Ktime, slack_ns: u64, waker: &Waker) -> Self {
         let h = Self::new(ClockId::Monotonic);
-        h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker);
+        h.start_from(
+            expires_ns,
+            slack_ns,
+            HrtimerMode::ABS,
+            waker,
+            Location::caller(),
+        );
         h
     }
 
     /// (Re)arm for `expires` (clock time; `mode` absolute or relative) with a
     /// `slack_ns` range, waking `waker`. Reuses the sleeper; no allocation.
+    /// The caller is recorded as the arm site.
+    #[track_caller]
     pub fn start(&self, expires: Ktime, slack_ns: u64, mode: HrtimerMode, waker: &Waker) {
+        self.start_from(expires, slack_ns, mode, waker, Location::caller());
+    }
+
+    /// [`Self::start`] recording `site` as the arm site, for wrappers that
+    /// captured their own caller (`narf_time::SleepUntil`).
+    pub fn start_from(
+        &self,
+        expires: Ktime,
+        slack_ns: u64,
+        mode: HrtimerMode,
+        waker: &Waker,
+        site: &'static Location<'static>,
+    ) {
         let sl = &*self.0;
+        sl.site.store(site as *const _ as *mut _, Ordering::Relaxed);
+        sl.owner_task.store(current_task_id(), Ordering::Relaxed);
         let hard = waker_is_hardirq_safe(waker);
         let old = {
             let mut slot = sl.waker.lock();
@@ -1252,7 +1438,10 @@ impl SleepHandle {
             // Different wake context: requeue on the right base.
             let exp = sl.timer.softexpires();
             let slack = sl.timer.expires() - exp;
-            self.start(exp, slack, HrtimerMode::ABS, waker);
+            let site = sl.site.load(Ordering::Relaxed);
+            // SAFETY: `site` is null or a `&'static Location` stored above.
+            let site = unsafe { site.as_ref() }.unwrap_or(Location::caller());
+            self.start_from(exp, slack, HrtimerMode::ABS, waker, site);
             return true;
         }
         let old = {

@@ -70,6 +70,17 @@ impl TimerQueueHead {
         self.root.is_null()
     }
 
+    /// In-order successor of linked `node`, or null after the last one
+    /// (`timerqueue_iterate_next`).
+    ///
+    /// # Safety
+    /// `node` is linked into this queue; the caller holds the queue's lock.
+    #[inline]
+    pub unsafe fn next_of(&self, node: *mut TimerQueueNode) -> *mut TimerQueueNode {
+        // SAFETY: caller contract.
+        unsafe { next(node) }
+    }
+
     /// Link `node`. Returns `true` when it became the earliest node
     /// (`timerqueue_add`).
     ///
