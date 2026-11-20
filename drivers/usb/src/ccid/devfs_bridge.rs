@@ -36,9 +36,9 @@
 //!     - `CCID_IOC_SET_SLOT` (nr 3): `arg` selects the fd's slot
 //!       (validated against the reader's slot count).
 //! - Slot presence is tracked per node from
-//!   `RDR_to_PC_NotifySlotChange` reports. The
-//!   `usb-ccid-supervisor` Stage::Late pump
-//!   (`spawn_slot_change_pump`) arms each reader's Interrupt-IN
+//!   `RDR_to_PC_NotifySlotChange` reports. The slot-change pump
+//!   (`spawn_slot_change_pump`, started by the first bound reader)
+//!   arms each reader's Interrupt-IN
 //!   endpoint and feeds reports into `handle_notify_report`;
 //!   readers without an interrupt endpoint are polled via
 //!   `GetSlotStatus` on a slow divider (`refresh_slot_presence`).
@@ -267,7 +267,11 @@ pub fn register_ccid_transport(transport: Arc<dyn CcidTransport>) -> usize {
 /// Called from the bind path, so node index == reader index by
 /// construction.
 pub fn register_reader(reader_index: usize) -> usize {
-    register_ccid_transport(Arc::new(XhciTransport { reader_index }))
+    let node = register_ccid_transport(Arc::new(XhciTransport { reader_index }));
+    // The slot-change pump serves bound readers only: it starts with the
+    // first one, so a system without a reader runs no CCID timer.
+    spawn_slot_change_pump();
+    node
 }
 
 /// Number of published CCID nodes.
@@ -563,19 +567,24 @@ pub fn enumerate_ccid() -> Vec<(String, FileType)> {
 
 // ── Slot-change supervisor pump ──────────────────────────────────
 
-/// Pump cadence, in cycles — the same order as the HID
-/// supervisor's poll loop; slot changes are human-speed events.
-const PUMP_CYCLES: u64 = 16_000_000;
+/// Pump cadence: slot changes are human-speed events, so a coarse
+/// timer-wheel sleep of the HID supervisor's order (Linux leaves CCID to
+/// pcscd's interrupt URB; the kernel arms no timer for it).
+const PUMP_MS: u64 = 16;
+/// The pump runs once, from the first bound reader.
+static PUMP_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// GetSlotStatus fallback runs every Nth pump cycle for readers
 /// without an interrupt endpoint.
 const STATUS_POLL_DIVIDER: u32 = 32;
 
-/// Spawn the slot-change pump: arms each bound reader's
+/// Spawn the slot-change pump (once): arms each bound reader's
 /// Interrupt-IN endpoint and feeds NotifySlotChange reports into
 /// the bridge presence state; readers without the endpoint get a
-/// periodic GetSlotStatus refresh. Spawned by the
-/// `usb-ccid-supervisor` Stage::Late initcall once xHCI is probed.
+/// periodic GetSlotStatus refresh. Started by [`register_reader`].
 pub fn spawn_slot_change_pump() {
+    if PUMP_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     narf_scheduler::spawn_stackful(async {
         let mut armed: Vec<bool> = Vec::new();
         let mut cycle: u32 = 0;
@@ -625,7 +634,7 @@ pub fn spawn_slot_change_pump() {
                     }
                 }
             }
-            narf_time::sleep_cycles(PUMP_CYCLES).await;
+            narf_time::msleep(PUMP_MS).await;
         }
     });
 }
