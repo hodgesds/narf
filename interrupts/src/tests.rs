@@ -432,6 +432,9 @@ fn smoke_hpet_oneshot_fires_handler() -> TestResult {
             | hpet_oneshot::HpetOneshotError::IoapicRoutingFailed => {
                 TestResult::Skip("IOAPIC route to HPET unavailable")
             }
+            hpet_oneshot::HpetOneshotError::ComparatorOwned => {
+                TestResult::Skip("HPET comparator 0 belongs to the timer pump")
+            }
             _ => TestResult::Fail("arm_oneshot returned an error"),
         };
     }
@@ -1853,6 +1856,7 @@ fn smoke_hpet_oneshot_error_variants_distinct() -> TestResult {
         HpetOneshotError::IoapicRoutingFailed,
         HpetOneshotError::NoLocalApic,
         HpetOneshotError::AlreadyArmed,
+        HpetOneshotError::ComparatorOwned,
     ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {

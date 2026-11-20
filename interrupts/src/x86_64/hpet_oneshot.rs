@@ -50,6 +50,10 @@ pub enum HpetOneshotError {
     /// Internal: comparator 0 is already armed by an earlier caller
     /// that hasn't released it. The Stage-cut API is single-slot.
     AlreadyArmed,
+    /// Comparator 0 belongs to the timer pump (`timer_pump::init`
+    /// claimed it). Arming it here would re-route the pump's IOAPIC
+    /// pin to this vector and silence the pump's deadlines.
+    ComparatorOwned,
 }
 
 /// Per-vector state needed by the IRQ stub (it only knows its own
@@ -171,6 +175,12 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
     }
     if narf_time::hpet::num_comparators() == 0 {
         return Err(HpetOneshotError::NoComparators);
+    }
+    // Both this facility and the timer pump drive comparator 0 through a
+    // GSI chosen by the same `pick_gsi(route_cap(0), 16)`; once the pump
+    // owns it, taking it would steal the pump's route.
+    if crate::x86_64::timer_pump::is_initialised() {
+        return Err(HpetOneshotError::ComparatorOwned);
     }
 
     // Try to claim slot 0. Only one in-flight one-shot at a time
