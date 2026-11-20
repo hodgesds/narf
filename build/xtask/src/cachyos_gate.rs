@@ -2157,7 +2157,7 @@ fn stage_bundle(
     let mut build = args.build.clone();
     // The bundle a host install uses for the distro root: the systemd PID 1
     // configuration (boot-init, cgroup-all, container, unsigned firmware).
-    super::configure_systemd_pid1_build(&mut build, false);
+    super::configure_distro_pid1_build(&mut build, false);
     super::ensure_feature(&mut build.features, "boot-init");
     super::ensure_feature(&mut build.features, "firmware-allow-unsigned");
     let grub = super::GrubImageArgs {

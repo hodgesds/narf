@@ -341,7 +341,7 @@ fn print_report(report: &str) {
 /// as root through PAM and run [`CHECK_COMMANDS`].
 fn boot_and_login(args: &Args) -> Result<()> {
     let mut build = args.build.clone();
-    super::configure_systemd_pid1_build(&mut build, false);
+    super::configure_distro_pid1_build(&mut build, false);
     super::add_passthrough_firmware(&mut build);
     let root = super::workspace_root()?;
     let (kernel, out_dir) = match &args.prebuilt {

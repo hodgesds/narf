@@ -90,6 +90,10 @@ cargo xtask efi-image --output target/narf-installed.efi \
 
 For Gentoo with OpenRC, select the installed `/sbin/openrc-init` as PID 1.
 OpenRC runs the services configured in the sysinit, boot and default runlevels.
+When building an installed-root kernel for OpenRC or systemd, `efi-image`
+includes cgroup v2 and namespace support. If using `--prebuilt`, compile the
+kernel with `boot-init,cgroup-all,container` so elogind can attach login
+sessions to their cgroups.
 On a desktop installation, the default runlevel typically includes
 `display-manager`. To try it with a RAM-backed writable view of the root, use
 

@@ -31,7 +31,9 @@ kernel IPC. CI checks both native-ring feature configurations.
 - `cargo xtask efi-image [--arch=x86_64] [--run | --smoke]` builds a
   self-contained PE/COFF application embedding the kernel, CPIO initramfs, and
   command line. Defaults to `boot-init` and `narf.disks=boot-only`; smoke mode
-  adds `boot-smoke` and writes a distinct artifact. `--prebuilt ELF` selects an
+  adds `boot-smoke` and writes a distinct artifact. Building with either
+  `openrc_pid1` or `systemd_pid1` on the command line enables `cgroup-all`
+  and `container` for the installed distribution. `--prebuilt ELF` selects an
   exact existing kernel without rebuilding it; `--initramfs CPIO` supplies the
   complete uncompressed `newc` archive; `--cmdline STRING` binds boot policy;
   `--output EFI` selects the output path. The generated archive includes
