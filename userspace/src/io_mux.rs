@@ -26,13 +26,18 @@ pub struct EventFd {
     semaphore: bool,
     /// `eventfd_ctx::id`, shown as `eventfd-id:` in fdinfo.
     id: u32,
-    /// Durable per-fd readiness cell — the SOLE readiness mechanism (there is no
-    /// edge token). Mirrors POLL_IN (counter > 0) and POLL_OUT (counter < MAX-1);
-    /// every counter change publishes the new level via `set`; same-level write
-    /// events additionally fire `notify` (see [`EventFd::sync_readiness`]). This
-    /// wakes armed poll/epoll waiters, including an EPOLLET consumer on another
-    /// write while the counter remains readable.
-    readiness: narf_lib::readiness::Readiness,
+    /// `eventfd_ctx::wqh`: poll/epoll waiters and blocking readers/writers
+    /// register here and then compute the level from `counter`; every counter
+    /// change wakes it afterwards (see [`EventFd::sync_readiness`]).
+    ///
+    /// There is deliberately no cached level. A cell mirroring the counter was
+    /// reconciled by loading the counter and then publishing under the cell
+    /// lock, so concurrent writers and a reader (a GLib/Qt wakeup eventfd is
+    /// written from many threads) could publish in the opposite order and
+    /// leave the cell "readable" over an empty counter: every poll arm then
+    /// disagreed with the poll scan, and a blocking read re-executed into
+    /// EAGAIN until the next write.
+    wait: narf_lib::readiness::WaitQueue,
 }
 
 pub const EFD_SEMAPHORE: u32 = 1;
@@ -43,28 +48,18 @@ impl EventFd {
             counter: AtomicU64::new(initval),
             semaphore: (flags & EFD_SEMAPHORE) != 0,
             id: NEXT_EVENTFD_ID.fetch_add(1, Ordering::Relaxed),
-            readiness: narf_lib::readiness::Readiness::new(
-                POLL_OUT | if initval != 0 { POLL_IN } else { 0 },
-            ),
+            wait: narf_lib::readiness::WaitQueue::new(),
         })
     }
 
-    /// Recompute the durable readiness cell from the current counter. `set`
-    /// publishes the level and wakes waiters on a rising edge. When the caller
-    /// reports a same-level event, `notify` fires the wait queue explicitly so
-    /// an EPOLLET consumer observes another write to an already-readable
-    /// counter. Avoid notifying after a rising edge: `set` already delivered
-    /// that event, and a second callback only relists the fd and wakes another
-    /// shared-epoll waiter for the same write.
-    fn sync_readiness(&self, event: u32, same_level_event: bool) {
-        let c = self.counter.load(Ordering::Acquire);
-        let readable = c > 0;
-        let writable = c < u64::MAX - 1;
-        let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
-        let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
-        self.readiness.set(add, clear);
-        if same_level_event {
-            self.readiness.notify(event & add);
+    /// `wake_up_locked_poll(&ctx->wqh, event)`: after a counter change, wake
+    /// the waiters for `event` (POLL_IN after a write, POLL_OUT after a read)
+    /// if the counter now satisfies it. Every write wakes, readable already or
+    /// not, so an EPOLLET consumer sees each one as Linux's does.
+    fn sync_readiness(&self, event: u32, _same_level_event: bool) {
+        let bits = event & self.poll_readiness();
+        if bits != 0 {
+            self.wait.wake(bits);
         }
     }
 }
@@ -220,8 +215,31 @@ impl FileOps for EventFd {
         bits
     }
 
-    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
-        Some(&self.readiness)
+    /// `eventfd_poll`: `poll_wait(file, &ctx->wqh, wait)`, then the counter.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(self.wait.arm(id, interest, waker, || self.poll_readiness()))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        Some(
+            self.wait
+                .arm_persistent(id, interest, waker, || self.poll_readiness()),
+        )
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.wait.disarm(id);
+        true
     }
 
     /// `eventfd_show_fdinfo`: the counter, the fd's id and its mode.

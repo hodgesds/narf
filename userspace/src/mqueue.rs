@@ -631,17 +631,19 @@ struct InotifyState {
     /// still linked; the effect is the same — at most one overflow record is
     /// outstanding, however many events are dropped behind it.
     overflow_queued: bool,
-    /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the SOLE
-    /// readiness mechanism (there is no edge token). An inotify fd is read-only
-    /// and never EOFs, so the cell only ever carries POLL_IN: `set`+`notify` when
-    /// an event is queued (the produce sites, `inotify_dispatch`/`notify_moved`)
-    /// — `notify` fires the wait-queue on EVERY event so an EPOLLET consumer
-    /// re-fires even at the same readable level — and cleared by the read that
-    /// drains the queue (the consume site). It lives behind the global `INOTIFY`
-    /// lock, so — like the lock-guarded ring cells in `socket.rs` — `InotifyFile`
-    /// reaches it by cloning this `Arc` out UNDER that lock and arming/`set`ting
-    /// OFF it (the cell has its own lock; never nest it under `INOTIFY`).
-    readiness: Arc<narf_lib::readiness::Readiness>,
+    /// `fsnotify_group::notification_waitq`: pollers and epoll items register
+    /// here and then compute readiness from `events` (`inotify_poll`). Every
+    /// produce site (`inotify_dispatch`, `notify_moved`) wakes it after
+    /// enqueueing, so an EPOLLET consumer sees each event. It lives behind the
+    /// global `INOTIFY` lock: `InotifyFile` clones the `Arc` out under that lock
+    /// and arms or wakes OFF it.
+    ///
+    /// It keeps no level. The cell it replaces was cleared by the draining read
+    /// after sampling the queue outside the lock, so a reader's stale "empty"
+    /// and a producer's delayed "readable" could land in either order: a cell
+    /// left readable over an empty queue made every poll arm disagree with the
+    /// poll scan (the fish-like shell in the readiness stress hit it).
+    readiness: Arc<narf_lib::readiness::WaitQueue>,
 }
 
 /// `IN_Q_OVERFLOW` — the queue overflowed and events were lost.
@@ -706,28 +708,6 @@ impl InotifyState {
     fn is_overflow(record: &[u8]) -> bool {
         record.len() >= 4
             && i32::from_ne_bytes([record[0], record[1], record[2], record[3]]) == OVERFLOW_WD
-    }
-}
-
-/// Republish an inotify instance's durable readiness after its event queue
-/// changed occupancy: POLL_IN iff events remain, else clear it. Snapshots the
-/// occupancy and clones the cell UNDER the `INOTIFY` lock, then `set`s OFF the
-/// lock — the cell has its own lock and must never be nested under `INOTIFY`.
-/// A no-op if the instance has been torn down. Called on the read that drains
-/// the queue (the consume site); the produce sites (`inotify_dispatch`,
-/// `notify_moved`) publish the rising POLL_IN edge inline once they have
-/// enqueued, since a dispatch only ever adds events.
-fn sync_inotify_readiness(id: u64) {
-    let snapshot = with_inotify(|m| {
-        m.get(&id)
-            .map(|st| (st.readiness.clone(), !st.events.is_empty()))
-    });
-    if let Some((cell, has_events)) = snapshot {
-        if has_events {
-            cell.set(narf_filesystem::POLL_IN, 0);
-        } else {
-            cell.set(0, narf_filesystem::POLL_IN);
-        }
     }
 }
 
@@ -863,7 +843,7 @@ fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
     }
     // Each dispatch wakes ONLY the inotify/fanotify instances whose watch
     // actually matched this path, via that instance's durable `Readiness` cell
-    // (see the `cell.set`/`cell.notify` at the end of each). A poll/epoll waiter
+    // (see the `cell.wake` at the end of each). A poll/epoll waiter
     // on an inotify/fanotify fd arms that same cell, so the targeted wake covers
     // it. We must NOT also fire the global `readiness::notify(0)` here: that is a
     // system-wide wake-ALL of every parked io-waiter, and fs_notify runs on
@@ -892,7 +872,7 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
     let full_mask = if is_dir { mask | IN_ISDIR } else { mask };
     let (parent, base) = parent_and_base(abs_path);
     let woken = with_inotify(|m| {
-        let mut woken: Vec<Arc<narf_lib::readiness::Readiness>> = Vec::new();
+        let mut woken: Vec<Arc<narf_lib::readiness::WaitQueue>> = Vec::new();
         for st in m.values_mut() {
             let cookie = 0u32;
             let matched: Vec<(i32, &'static str, bool)> = st
@@ -927,10 +907,9 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
     // on this inotify fd wakes via its durable cell — additive to the kept
     // notify(0) fired by fs_notify after this returns.
     for cell in woken {
-        cell.set(narf_filesystem::POLL_IN, 0);
         // Linux wait-queue: fire on every queued event so an EPOLLET consumer
         // re-fires even when the fd stays readable at the same level.
-        cell.notify(narf_filesystem::POLL_IN);
+        cell.wake(narf_filesystem::POLL_IN);
     }
 }
 
@@ -1015,7 +994,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
     let (fp, fb) = parent_and_base(from);
     let (tp, tb) = parent_and_base(to);
     let woken = with_inotify(|m| {
-        let mut woken: Vec<Arc<narf_lib::readiness::Readiness>> = Vec::new();
+        let mut woken: Vec<Arc<narf_lib::readiness::WaitQueue>> = Vec::new();
         for st in m.values_mut() {
             let cookie = st.next_cookie.wrapping_add(1);
             st.next_cookie = cookie;
@@ -1070,10 +1049,9 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
     // queued a MOVED_* record, OFF the INOTIFY lock — additive to the kept
     // notify(0) fired below.
     for cell in woken {
-        cell.set(narf_filesystem::POLL_IN, 0);
         // Linux wait-queue: fire on every queued event so an EPOLLET consumer
         // re-fires even when the fd stays readable at the same level.
-        cell.notify(narf_filesystem::POLL_IN);
+        cell.wake(narf_filesystem::POLL_IN);
     }
     // fanotify sees the same move as two events on the affected objects.
     fanotify_dispatch(from, IN_MOVED_FROM as u64);
@@ -1244,14 +1222,9 @@ impl FileOps for InotifyFile {
                 }
                 Ok(written)
             });
-            // Consume site: draining may have emptied the queue (clear POLL_IN)
-            // or left events queued (keep it readable). Republish the durable
-            // cell's absolute level OFF the INOTIFY lock so a later arm and an
-            // epoll ET edge reflect the new occupancy — without this an emptied
-            // fd would stay POLL_IN in the cell and a re-arm would busy-spin.
-            // Idempotent on the WouldBlock/InvalidData paths (no occupancy
-            // change). The kept notify(0)/poll_readiness path is unchanged.
-            sync_inotify_readiness(id);
+            // Consume site: nothing to publish. The wait queue keeps no level;
+            // a later arm computes occupancy itself (see `InotifyState::readiness`).
+            let _ = id;
             result
         })
     }
@@ -1279,7 +1252,7 @@ impl FileOps for InotifyFile {
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
         let cell = with_inotify(|m| m.get(&self.id).map(|st| st.readiness.clone()))?;
-        Some(cell.arm(task_id, interest, waker))
+        Some(cell.arm(task_id, interest, waker, || self.poll_readiness()))
     }
 
     /// Persistent arm (epoll `eppoll_entry`): register a never-consumed waiter on
@@ -1291,7 +1264,7 @@ impl FileOps for InotifyFile {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         let cell = with_inotify(|m| m.get(&self.id).map(|st| st.readiness.clone()))?;
-        Some(cell.arm_persistent(id, interest, waker))
+        Some(cell.arm_persistent(id, interest, waker, || self.poll_readiness()))
     }
 
     fn arm_readiness_persistent_exclusive(
@@ -1301,7 +1274,7 @@ impl FileOps for InotifyFile {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         let cell = with_inotify(|m| m.get(&self.id).map(|st| st.readiness.clone()))?;
-        Some(cell.arm_persistent_exclusive(id, interest, waker))
+        Some(cell.arm_persistent(id, interest, waker, || self.poll_readiness()))
     }
 
     /// Remove this task's waiter from the instance cell; `false` if the instance
@@ -1361,7 +1334,7 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 overflow_queued: false,
                 next_cookie: 0,
                 // Fresh instance: no events queued, never writable → mask 0.
-                readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
+                readiness: Arc::new(narf_lib::readiness::WaitQueue::new()),
             },
         );
         active.store(true, Ordering::Release);
@@ -1611,16 +1584,12 @@ struct FanGroup {
     marks: BTreeMap<String, u64>,
     /// Queued events: (affected path, event mask, causing pid).
     events: VecDeque<(String, u64, i32)>,
-    /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the migration
-    /// target that fuses the arm/notify wake for a poll/epoll parked on this
-    /// fanotify group fd. A fanotify group fd is read-only, so the cell carries
-    /// only POLL_IN: set inline when `fanotify_dispatch` queues an event (the
-    /// produce site) and cleared by `fanotify_drain` when the queue empties (the
-    /// consume site). Behind the global `FANOTIFY` lock, so `FanotifyFile`
-    /// clones this `Arc` out UNDER the lock and arms/`set`s OFF it (the cell has
-    /// its own lock; never nest it under `FANOTIFY`), like the ring cells in
-    /// `socket.rs`. Additive to the kept `narf_net::readiness::notify(0)`.
-    readiness: Arc<narf_lib::readiness::Readiness>,
+    /// The group's notification wait queue (`fanotify_poll`): waiters register
+    /// and then compute readiness from `events`; `fanotify_dispatch` wakes it
+    /// after queueing. No cached level (see `InotifyState::readiness`). Behind
+    /// the global `FANOTIFY` lock: `FanotifyFile` clones the `Arc` out under
+    /// it and arms or wakes OFF it.
+    readiness: Arc<narf_lib::readiness::WaitQueue>,
 }
 
 static FANOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, FanGroup>>> = IrqSafeSpinLock::new(None);
@@ -1655,7 +1624,7 @@ fn fanotify_dispatch(abs_path: &str, mask: u64) {
     }
     let pid = current_task_id() as i32;
     let woken = with_fanotify(|m| {
-        let mut woken: Vec<Arc<narf_lib::readiness::Readiness>> = Vec::new();
+        let mut woken: Vec<Arc<narf_lib::readiness::WaitQueue>> = Vec::new();
         for group in m.values_mut() {
             if let Some(&mark_mask) = group.marks.get(abs_path) {
                 let hit = mark_mask & mask;
@@ -1673,29 +1642,9 @@ fn fanotify_dispatch(abs_path: &str, mask: u64) {
     // durable cell — additive to the kept notify(0) fired by the fs_notify /
     // notify_moved caller after this returns.
     for cell in woken {
-        cell.set(narf_filesystem::POLL_IN, 0);
         // Linux wait-queue: fire on every queued event so an EPOLLET consumer
         // re-fires even when the fd stays readable at the same level.
-        cell.notify(narf_filesystem::POLL_IN);
-    }
-}
-
-/// Republish a fanotify group's durable readiness after its queue changed:
-/// POLL_IN iff events remain, else clear it. Snapshots occupancy and clones the
-/// cell UNDER the `FANOTIFY` lock, then `set`s OFF the lock. Called by
-/// `fanotify_drain` (the consume site); the produce side publishes inline in
-/// `fanotify_dispatch`.
-fn sync_fanotify_readiness(id: u64) {
-    let snapshot = with_fanotify(|m| {
-        m.get(&id)
-            .map(|g| (g.readiness.clone(), !g.events.is_empty()))
-    });
-    if let Some((cell, has_events)) = snapshot {
-        if has_events {
-            cell.set(narf_filesystem::POLL_IN, 0);
-        } else {
-            cell.set(0, narf_filesystem::POLL_IN);
-        }
+        cell.wake(narf_filesystem::POLL_IN);
     }
 }
 
@@ -1798,7 +1747,7 @@ impl FileOps for FanotifyFile {
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
         let cell = with_fanotify(|m| m.get(&self.id).map(|g| g.readiness.clone()))?;
-        Some(cell.arm(task_id, interest, waker))
+        Some(cell.arm(task_id, interest, waker, || self.poll_readiness()))
     }
 
     /// Persistent arm (epoll `eppoll_entry`): register a never-consumed waiter on
@@ -1810,7 +1759,7 @@ impl FileOps for FanotifyFile {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         let cell = with_fanotify(|m| m.get(&self.id).map(|g| g.readiness.clone()))?;
-        Some(cell.arm_persistent(id, interest, waker))
+        Some(cell.arm_persistent(id, interest, waker, || self.poll_readiness()))
     }
 
     fn arm_readiness_persistent_exclusive(
@@ -1820,7 +1769,7 @@ impl FileOps for FanotifyFile {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         let cell = with_fanotify(|m| m.get(&self.id).map(|g| g.readiness.clone()))?;
-        Some(cell.arm_persistent_exclusive(id, interest, waker))
+        Some(cell.arm_persistent(id, interest, waker, || self.poll_readiness()))
     }
 
     /// Remove this task's waiter from the group cell; `false` if the group is
@@ -1855,11 +1804,8 @@ pub(crate) fn fanotify_drain(group_id: u64, max: usize) -> Vec<(String, u64, i32
             }
         }
     });
-    // Consume site: draining may have emptied the queue — republish the cell's
-    // absolute level OFF the FANOTIFY lock so it stops reporting readable (else
-    // a re-arm / epoll ET on an emptied group would busy-spin). No-op when
-    // events remain. The kept notify(0)/poll_readiness path is unchanged.
-    sync_fanotify_readiness(group_id);
+    // Consume site: nothing to publish; the group's wait queue keeps no level.
+    let _ = group_id;
     out
 }
 
@@ -1947,7 +1893,7 @@ pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
                 marks: BTreeMap::new(),
                 events: VecDeque::new(),
                 // Fresh group: no events queued, never writable → mask 0.
-                readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
+                readiness: Arc::new(narf_lib::readiness::WaitQueue::new()),
             },
         );
         active.store(true, Ordering::Relaxed);
