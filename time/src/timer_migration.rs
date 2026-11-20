@@ -249,15 +249,23 @@ impl TmigrGroup {
         }
     }
 
-    /// `tmigr_next_expired_groupevt`: pop the first event if due at `now`,
-    /// marking it ignored (it is no longer queued). Lock held.
+    /// `tmigr_next_expired_groupevt`: pop the first event if due at `now`.
+    /// Lock held.
+    ///
+    /// Dequeue only, as Linux does. The popped event is not marked ignored:
+    /// in a level-0 group it is the idle CPU's own `cpuevt`, and
+    /// [`Tmigr::handle_remote_cpu`] reads `cpuevt.ignore` as "that CPU went
+    /// active and expires its own timers" (only activation sets it), so
+    /// marking it here made the expiry of every idle CPU sharing a level-0
+    /// group with the migrator bail out, with the event already off the
+    /// queue: its due global timers stayed stranded until it woke for
+    /// something else.
     fn next_expired_groupevt(&self, g: &mut GroupState, now: u64) -> Option<&'static TmigrEvent> {
         let evt = self.next_groupevt(g)?;
         if evt.expires() > now {
             return None;
         }
         dequeue(g, evt);
-        evt.ignore.store(true, Ordering::Release);
         let _ = self.next_groupevt(g);
         Some(evt)
     }
