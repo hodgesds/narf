@@ -41,6 +41,15 @@ pub struct ScanoutGeom {
     pub virt: u64,
 }
 
+impl ScanoutGeom {
+    /// The kernel mapping may have been rebased, but this fixed-mode
+    /// firmware card can only present into its original physical surface.
+    pub(crate) fn matches_firmware(&self, fb: narf_graphics_driver::generic::GenericFb) -> bool {
+        (self.phys, self.width, self.height, self.stride_bytes)
+            == (fb.addr, fb.width, fb.height, fb.pitch)
+    }
+}
+
 type QueryFn = fn() -> Option<ScanoutGeom>;
 type FlushFn = fn();
 

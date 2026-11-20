@@ -227,6 +227,9 @@ pub struct IntelGpu {
     /// and plane programming succeed. `None` on PTL (display
     /// gated off) or when allocation failed (logged at probe).
     pub scanout: Option<ScanoutAllocation>,
+    /// Firmware still owns the display timing and GGTT backing. Device PM
+    /// cannot restore this image after a D3 transition.
+    pub(crate) firmware_display: bool,
     /// The same card instance installed in the DRM registry. A future PCI GT
     /// owner publishes discovery here instead of through a global device-ID map.
     pub drm_card: Option<alloc::sync::Arc<crate::drm_devfs_bridge::IntelGpuCard>>,
@@ -299,6 +302,7 @@ impl IntelGpu {
             display_cap: *cap,
             active_scanout: narf_lib::sync::IrqSafeSpinLock::new(None),
             scanout: None,
+            firmware_display: false,
             drm_card: None,
         })
     }
@@ -583,6 +587,9 @@ const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
         && pipeconf[3] & busy == 0
 }
 
+#[path = "intel_gpu_firmware_display.rs"]
+mod firmware_display;
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -716,8 +723,31 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     }
 
+    let external_only =
+        crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip).is_some_and(|family| {
+            crate::intel_gpu_vbt::gen12_ddc_overrides().external_only_for(family)
+        });
+    let mut firmware_scanout = None;
     let mut panel_mode: Option<crate::intel_gpu_modeset::Mode> = None;
-    if dev.chip.generation.display_supported() {
+    if external_only {
+        firmware_scanout = crate::intel_gpu_vram::boot_framebuffer().and_then(|fb| {
+            let io = dev.mode_window();
+            let scanout = firmware_display::scanout(&io, dev.gmadr.phys.raw(), dev.gmadr.len, fb);
+            if scanout.is_none() {
+                firmware_display::log_mismatch(&io, dev.gmadr.phys.raw(), fb);
+            }
+            scanout
+        });
+        dev.firmware_display = firmware_scanout.is_some();
+        log_probe(
+            if firmware_scanout.is_some() {
+                "external-only VBT, retaining the active firmware framebuffer for fixed-mode KMS"
+            } else {
+                "external-only VBT, no active linear firmware primary matched the boot framebuffer"
+            },
+            &device,
+        );
+    } else if dev.chip.generation.display_supported() {
         // eDP panel power sequencing (#1020): the panel must be
         // sequenced on before any AUX traffic (the EDID read
         // inside takeover), modeset, or backlight enable. A
@@ -1125,7 +1155,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             )));
             index
         }
-        None => crate::drm_registry::register_drm_card(intel_card),
+        None => match firmware_scanout {
+            Some(fb) => crate::drm_registry::register_drm_card_with_state(
+                intel_card,
+                firmware_display::fixed_mode_card(fb),
+            ),
+            None => crate::drm_registry::register_drm_card(intel_card),
+        },
     };
     if let Some(console) = kms_console {
         crate::intel_gpu_kms::install(card_index, kms_generation, gt_bar, device, cap, console);
@@ -1172,8 +1208,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // attached at boot. The session connect path re-checks the
     // generation's display support itself.
     with_controller(|gpu| {
-        let window = gpu.mode_window();
-        enable_external_hpd(&window, gpu.chip.generation);
+        if !gpu.firmware_display {
+            enable_external_hpd(&gpu.mode_window(), gpu.chip.generation);
+        }
     });
     poll_dp_hpd_events();
 
@@ -1566,8 +1603,14 @@ static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock
 /// boot is picked up there); a future periodic-polled caller
 /// can invoke it the same way.
 pub fn poll_dp_hpd_events() {
-    let display =
-        with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr)).flatten();
+    // The inherited pipe, port and shared watermarks have no native
+    // allocation. A hotplug modeset must not overwrite their configuration.
+    let Some(bar) =
+        with_controller(|gpu| (!gpu.firmware_display).then_some(gpu.gtt_mmadr)).flatten()
+    else {
+        return;
+    };
+    let display = crate::intel_gpu_kms::display_for_bar(&bar);
     let mut ownership = match display.as_ref() {
         Some(display) => match display.legacy() {
             Ok(guard) => Some(guard),

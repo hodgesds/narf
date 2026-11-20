@@ -1100,6 +1100,9 @@ pub struct Card {
     pub version: (u32, u32, u32),
     /// Description string for DRM_IOCTL_VERSION.
     pub driver_desc: &'static str,
+    /// The firmware handoff a fixed-mode card may target through the CPU
+    /// copy path. A later, unrelated scanout never inherits this card's master.
+    pub(crate) firmware_scanout: Option<narf_graphics_driver::generic::GenericFb>,
     /// Connectors — one entry per physical output port.
     pub connectors: Vec<Connector>,
     /// Encoders.
@@ -1451,6 +1454,7 @@ impl Card {
             driver_name,
             version,
             driver_desc,
+            firmware_scanout: None,
             connectors: Vec::new(),
             encoders: Vec::new(),
             crtcs: Vec::new(),

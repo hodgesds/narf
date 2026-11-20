@@ -14,9 +14,9 @@
 
 use crate::amdgpu_vram::{Pool, Reservation, UnmappedPool, UnmappedReservation};
 use alloc::sync::Arc;
-use core::ops::Range;
 use narf_bus::MmioRegion;
 use narf_filesystem::FsError;
+use narf_graphics_driver::generic::GenericFb;
 use narf_lib::sync::IrqSafeSpinLock;
 
 const GIB: u64 = 1 << 30;
@@ -136,14 +136,18 @@ impl VramLayout {
     }
 }
 
-static BOOT_FRAMEBUFFER: IrqSafeSpinLock<Option<Range<u64>>> = IrqSafeSpinLock::new(None);
+static BOOT_FRAMEBUFFER: IrqSafeSpinLock<Option<GenericFb>> = IrqSafeSpinLock::new(None);
+
+pub(crate) fn boot_framebuffer() -> Option<GenericFb> {
+    *BOOT_FRAMEBUFFER.lock()
+}
 
 /// The firmware console framebuffer's physical bytes. A scanout inside the
 /// LMEM BAR stays excluded from allocation for the pool's lifetime.
-pub fn record_boot_framebuffer(fb: narf_graphics_driver::generic::GenericFb) {
+pub fn record_boot_framebuffer(fb: GenericFb) {
     let bytes = u64::from(fb.pitch) * u64::from(fb.height);
-    if let Some(end) = fb.addr.checked_add(bytes).filter(|_| bytes != 0) {
-        BOOT_FRAMEBUFFER.lock().get_or_insert(fb.addr..end);
+    if bytes != 0 && fb.addr.checked_add(bytes).is_some() {
+        BOOT_FRAMEBUFFER.lock().get_or_insert(fb);
     }
 }
 
@@ -225,10 +229,10 @@ impl Vram {
             kind: bar.kind,
         };
         let mut protected = alloc::vec::Vec::new();
-        if let Some(fb) = BOOT_FRAMEBUFFER.lock().clone() {
+        if let Some(fb) = boot_framebuffer() {
             let base = mapping.phys.raw();
-            let start = fb.start.max(base);
-            let end = fb.end.min(base + len);
+            let start = fb.addr.max(base);
+            let end = (fb.addr + u64::from(fb.pitch) * u64::from(fb.height)).min(base + len);
             if start < end {
                 protected.push(start - base..end - base);
             }

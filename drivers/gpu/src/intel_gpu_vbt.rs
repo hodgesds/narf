@@ -1708,6 +1708,7 @@ pub fn discover(asls: u32) -> Option<(Vbt, VbtSource)> {
 pub struct Gen12DdcOverrides {
     family: Option<crate::intel_gpu_gt::Gen12Platform>,
     pins: [Option<PinPair>; 8],
+    external_only: bool,
 }
 
 impl Gen12DdcOverrides {
@@ -1715,6 +1716,7 @@ impl Gen12DdcOverrides {
     pub const NONE: Self = Self {
         family: None,
         pins: [None; 8],
+        external_only: false,
     };
 
     /// The overrides a VBT declares for `family`.
@@ -1728,7 +1730,16 @@ impl Gen12DdcOverrides {
         Self {
             family: Some(family),
             pins,
+            external_only: !vbt.children().is_empty()
+                && vbt.children().iter().all(|child| {
+                    child.device_type() & device_type::INTERNAL_CONNECTOR == 0
+                        && (child.supports_dvi() || child.supports_dp() || child.supports_crt())
+                }),
         }
+    }
+
+    pub(crate) fn external_only_for(&self, family: crate::intel_gpu_gt::Gen12Platform) -> bool {
+        self.family == Some(family) && self.external_only
     }
 
     /// The HDMI DDC pin for `ddi` on `family`: the VBT pin when these

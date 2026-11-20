@@ -336,7 +336,10 @@ fn smoke_mtl_xr30_discovery_addfb_and_copy_boundaries() -> TestResult {
         narf_filesystem::dma_buf::DmaResvUsage::Write,
     );
     // The real legacy helper rejects at entry, including before WRITE waits.
-    assert_eq!(present_intel_frame(&intel), Err(FsError::Unsupported));
+    assert_eq!(
+        present_intel_frame(u32::MAX, &intel),
+        Err(FsError::Unsupported)
+    );
     no_wait.0.store(true, Ordering::Release);
     let touched = AtomicUsize::new(0);
     assert_eq!(

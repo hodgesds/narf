@@ -1037,6 +1037,9 @@ fn production_window() -> Option<PmBarWindow> {
 
 /// The device-PM suspend entry (registry-facing).
 pub fn production_suspend() -> Result<(), PmError> {
+    if crate::intel_gpu::with_controller(|gpu| gpu.firmware_display) == Some(true) {
+        return Err(PmError::Busy);
+    }
     let window = production_window().ok_or(PmError::NotProbed)?;
     let display = crate::intel_gpu_kms::display_for_bar(&window.0);
     let mut ownership = match display.as_ref() {

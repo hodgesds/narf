@@ -1272,6 +1272,28 @@ fn vbt_gen12_ddc_overrides_follow_map_ddc_pin() -> TestResult {
     )
     .unwrap();
     let o = Gen12DdcOverrides::from_vbt(&vbt, Gen12Platform::TigerLake);
+    assert!(o.external_only_for(Gen12Platform::TigerLake));
+    assert!(!o.external_only_for(Gen12Platform::AlderLakeP));
+    assert!(!Gen12DdcOverrides::NONE.external_only_for(Gen12Platform::TigerLake));
+    let panel = Vbt::parse(
+        &VbtImage::new(250)
+            .block(
+                block::GENERAL_DEFINITIONS,
+                general_definitions(
+                    44,
+                    &[
+                        Child::new(EDP, dvo_port::DPA),
+                        Child::new(HDMI, dvo_port::HDMIB),
+                    ],
+                ),
+            )
+            .build(),
+    )
+    .unwrap();
+    assert!(
+        !Gen12DdcOverrides::from_vbt(&panel, Gen12Platform::TigerLake)
+            .external_only_for(Gen12Platform::TigerLake)
+    );
     if o.pin(Gen12Platform::TigerLake, Ddi::D) != Some(PinPair::Pin10Tc2)
         || o.pin(Gen12Platform::TigerLake, Ddi::B) != Some(PinPair::Pin2Bxt)
         || o.pin(Gen12Platform::TigerLake, Ddi::E) != Some(PinPair::Pin10Tc2)
