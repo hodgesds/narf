@@ -459,9 +459,42 @@ const PUMP_PERIOD_CYCLES: u64 = 50_000_000;
 /// fills.
 pub async fn pump(fb: FbWriter) {
     loop {
+        let seen = (
+            narf_input::pointer_generation(),
+            narf_console::cursor_generation(),
+        );
         drain_and_render(&fb);
+        // Frame pacing: a burst of events is drained at most once per
+        // `PUMP_PERIOD_CYCLES`.
         narf_time::sleep_cycles(PUMP_PERIOD_CYCLES).await;
+        // Linux has no cursor timer outside fbcon's text-mode blink: a
+        // cursor moves on input and on the compositor's cursor ioctls
+        // (`drm_mode_cursor_ioctl`). With nothing new since the snapshot
+        // above, sleep until one of those happens.
+        cursor_activity(seen).await;
     }
+}
+
+/// Resolves once the pointer or the cursor state changed since `seen`.
+pub(crate) fn cursor_activity(seen: (u64, u64)) -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(move |cx| {
+        let changed = || {
+            (
+                narf_input::pointer_generation(),
+                narf_console::cursor_generation(),
+            ) != seen
+        };
+        if changed() {
+            return core::task::Poll::Ready(());
+        }
+        narf_input::set_pointer_waker(cx.waker());
+        narf_console::set_cursor_waker(cx.waker());
+        // Registered before the re-check: a change in between is seen.
+        if changed() {
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    })
 }
 
 /// Sleep-pump variant for the userspace `sys_sleep` busy-wait,
