@@ -10,12 +10,15 @@ use crate::{
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_gmc_navi22_fault.rs"]
+mod fault;
 #[path = "amdgpu_gmc_navi22_gart.rs"]
 mod gart;
 #[path = "amdgpu_gmc_navi22_regs.rs"]
 mod regs;
 #[path = "amdgpu_gmc_navi22_vm.rs"]
 mod vm;
+pub use fault::{fault_client, FaultStatus, StatusLine};
 pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM};
 pub use vm::{
@@ -97,6 +100,8 @@ struct Layout {
     /// NBIO BASE_IDX 0 (PCIE_INDEX2/PCIE_DATA2) and HDP BASE_IDX 0.
     pcie: u64,
     hdp: u64,
+    /// Discovered MMHUB IP version (`amdgpu_ip_version(adev, MMHUB_HWIP, 0)`).
+    mmhub: (u8, u8, u8),
 }
 /// nbio_v2_3.c smnPCIE_CONFIG_CNTL and its CI_SWUS_MAX_READ_REQUEST_SIZE_MODE
 /// (bit 27) / _PRIV (bits 29:28) fields (nbio_2_3_sh_mask.h).
@@ -141,6 +146,9 @@ impl Layout {
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
+        let mmhub = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MMHUB, 0)
+            .map(|b| (b.major, b.minor, b.revision))
+            .ok_or(Error::Unsupported)?;
         let nbif = [
             (2, 3, 0),
             (2, 3, 1),
@@ -166,6 +174,7 @@ impl Layout {
                 0,
                 HDP_MISC_CNTL as u32,
             )?,
+            mmhub,
         })
     }
 }
@@ -757,6 +766,19 @@ impl Gmc {
     /// Interrupt-handler hook for decoded VMC/UTCL2 fault IVs.
     pub fn handle_fault(&mut self, fault: Fault) -> Result<FaultOwner, Error> {
         self.engine.handle_fault(fault)
+    }
+    /// The discovered MMHUB IP version: it selects the client table a fault
+    /// report names MMHUB clients from (`mmhub_v2_0_init_client_info`).
+    pub fn mmhub_version(&self) -> (u8, u8, u8) {
+        self.engine.layout.mmhub
+    }
+    /// One fault's decoded L2 status (`status` from `handle_fault`'s read).
+    pub fn status_line(&self, hub: Hub, status: u32) -> StatusLine {
+        StatusLine {
+            hub,
+            mmhub: self.engine.layout.mmhub,
+            status: FaultStatus(status),
+        }
     }
     /// gmc_v10_0_vm_fault_interrupt_state. Enable only once an IH owner drains.
     pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {
