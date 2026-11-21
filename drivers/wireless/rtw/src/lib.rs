@@ -41,15 +41,21 @@ pub mod rtw89;
 #[cfg(feature = "module")]
 mod module_probe;
 
+// Stage 1 of the rtw88-USB loadable-module datapath (enumerate + Realtek
+// control proof over `narf_usb_*`). See
+// drivers/wireless/specification/rtw88-usb-module-datapath.md.
+#[cfg(feature = "module")]
+mod module_usb;
+
 narf_driver! {
     name: "rtw",
     module: {
         version: "0.1.0",
         license: "GPL-2.0-or-later",
         author: "narf",
-        description: "Realtek RTW88/RTW89 PCIe Wi-Fi",
+        description: "Realtek RTW88/RTW89 PCIe Wi-Fi + RTL8821CU/8822BU USB",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -63,4 +69,5 @@ fn do_register() {
 #[cfg(feature = "module")]
 fn do_register() {
     module_probe::register();
+    module_usb::register();
 }

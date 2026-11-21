@@ -904,6 +904,82 @@ kernel_abi! {
         narf_bus::module_wireless::close(crate::symbols::current_execution_id().0, dev, session)
     }
 
+    /// Resolve a vendor firmware blob by `name` and retain it for this module.
+    /// `out_handle` receives an owner-scoped, never-reused handle and
+    /// `out_size` the total blob size; read it in bounded chunks with
+    /// `narf_firmware_read`, then release it with `narf_firmware_close`. No
+    /// kernel memory or `Cap<FirmwareBlob>` crosses the boundary.
+    ///
+    /// # Safety
+    /// `name` names `name_len` readable bytes; `out_handle`/`out_size` are
+    /// writable/aligned and must not overlap.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_open(
+        name: *const u8, name_len: usize, out_handle: *mut u64, out_size: *mut usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || name_len > narf_firmware::module_fetch::MAX_NAME
+            || out_handle.is_null() || out_size.is_null()
+        {
+            return -22;
+        }
+        // SAFETY: the module promises `name_len` readable bytes for this call.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            return -22;
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_firmware::module_fetch::open(owner, name) {
+            Ok((handle, size)) => {
+                // SAFETY: writable aligned outputs, per the export contract.
+                unsafe {
+                    out_handle.write(handle);
+                    out_size.write(size);
+                }
+                0
+            }
+            Err(error) => error,
+        }
+    }
+
+    /// Copy up to `len` bytes of firmware `handle` starting at `offset` into
+    /// the module's `buf`; `out_len` receives the count copied (`0` past end).
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes; `out_len` is writable/aligned. The
+    /// handle must come from this module's `narf_firmware_open`.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_read(
+        handle: u64, offset: u64, buf: *mut u8, len: usize, out_len: *mut usize,
+    ) -> i32 {
+        if buf.is_null() || len == 0 || len > narf_firmware::module_fetch::MAX_CHUNK
+            || out_len.is_null()
+        {
+            return -22;
+        }
+        // SAFETY: the module promises `len` writable bytes; the broker copies
+        // into them synchronously and never retains the pointer.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_firmware::module_fetch::read(owner, handle, offset, out) {
+            Ok(copied) => {
+                // SAFETY: writable aligned scalar output, per the contract.
+                unsafe { out_len.write(copied) };
+                0
+            }
+            Err(error) => error,
+        }
+    }
+
+    /// Release a firmware handle. Module unload releases any still-open handle.
+    ///
+    /// # Safety
+    /// The handle must come from this module's `narf_firmware_open`; no later
+    /// use of it is permitted.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_close(handle: u64) -> i32 {
+        narf_firmware::module_fetch::close(crate::symbols::current_execution_id().0, handle)
+    }
+
     // ── Device datapath: USB transfers (URB-style) ──────────────────
     //
     // `dev` is the token a USB probe (`narf_register_usb_driver`) received.

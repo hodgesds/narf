@@ -40,6 +40,8 @@ use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// Loadable-module firmware blob fetch broker (`narf_firmware_*` exports).
+pub mod module_fetch;
 pub mod registry;
 mod signature;
 
