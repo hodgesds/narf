@@ -2783,6 +2783,592 @@ kernel_test_in!(
     smoke_abi_userns_pivot_root_keeps_the_old_roots_mounts
 );
 
+// ── bubblewrap's sandbox setup, replayed syscall for syscall ─────────────
+//
+// Both sequences below were recorded with `strace -f` on Linux 7.3 (CachyOS):
+// `bwrap --unshare-user --dev-bind / / true` (bubblewrap 0.13.1, what a user
+// or Flatpak runs) and Steam's `srt-bwrap --bind / / true` (bubblewrap
+// 0.11.2, run by `steam-runtime-check-requirements` to decide whether Steam
+// can start at all). The setup is the same up to the first pivot_root; the
+// two builds then bind the old root onto the new one differently, and finish
+// with the same rprivate + lazy unmount of the old root and the second
+// pivot_root(".", ".") into newroot.
+
+/// Which recorded bubblewrap sequence to replay.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BwrapBuild {
+    /// bubblewrap 0.13.1: binds via openat2(RESOLVE_IN_ROOT) and
+    /// `/proc/self/fd/N` magic links through its own bind of oldroot/proc.
+    V0_13,
+    /// bubblewrap 0.11.2 (Steam's srt-bwrap): binds by path, then reads
+    /// `/oldroot/proc/self/fd/N` and `/proc/self/mountinfo` to remount.
+    V0_11,
+}
+
+/// Fail a replay step: name it, and log what the syscall returned.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_step(step: &'static str, got: Option<i64>, ok: bool) -> Result<i64, &'static str> {
+    use core::fmt::Write as _;
+    if ok {
+        return Ok(got.unwrap_or(0));
+    }
+    let _ = writeln!(narf_console::Writer, "userns-bwrap: {step} = {got:?}");
+    Err(step)
+}
+
+/// A syscall that must return 0.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_zero(step: &'static str, num: u32, args: SyscallArgs) -> Result<(), &'static str> {
+    let got = call(num, args);
+    bwrap_step(step, got, got == Some(0)).map(|_| ())
+}
+
+/// A syscall that must return a descriptor.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_fd(step: &'static str, num: u32, args: SyscallArgs) -> Result<u64, &'static str> {
+    let got = call(num, args);
+    bwrap_step(step, got, got.is_some_and(|fd| fd >= 0)).map(|fd| fd as u64)
+}
+
+/// `readlink(path)` must name `want`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_readlink(step: &'static str, path: &str, want: &str) -> Result<(), &'static str> {
+    use core::fmt::Write as _;
+    let path = alloc::format!("{path}\0");
+    let mut buf = [0u8; 256];
+    let got = call_readlink(
+        path.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if let Some(n) = got.filter(|n| *n >= 0) {
+        if &buf[..n as usize] == want.as_bytes() {
+            return Ok(());
+        }
+        let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("<non-utf8>");
+        let _ = writeln!(narf_console::Writer, "userns-bwrap: {step} = {text:?}");
+        return Err(step);
+    }
+    bwrap_step(step, got, false).map(|_| ())
+}
+
+/// `fstat(fd)` must report a directory.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_fstat_dir(step: &'static str, fd: u64) -> Result<(), &'static str> {
+    let mut sb = [0u8; STAT_SIZE];
+    let got = call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64));
+    bwrap_step(
+        step,
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o040000,
+    )
+    .map(|_| ())
+}
+
+/// `stat(path)`'s raw result, for the existence checks.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_stat(path: &core::ffi::CStr) -> Option<i64> {
+    let mut sb = [0u8; STAT_SIZE];
+    call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+}
+
+/// `openat2(dirfd, path, how)`: `struct open_how { flags, mode, resolve }`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_openat2(
+    step: &'static str,
+    dirfd: u64,
+    path: &core::ffi::CStr,
+    flags: u64,
+    resolve: u64,
+) -> Result<u64, &'static str> {
+    let how = [flags, 0u64, resolve];
+    bwrap_fd(
+        step,
+        Syscall::Openat2.raw(),
+        a3(dirfd, path.as_ptr() as u64, how.as_ptr() as u64, 24),
+    )
+}
+
+/// Read `/proc/self/mountinfo` through bubblewrap's `/proc` descriptor and
+/// list the mount points `bind_mount()` would remount for `root`: the topmost
+/// mount AT `root`, then every mount below it by parent id, skipping one a
+/// later sibling covers (bubblewrap's `parse_mountinfo` / `collect_mounts`).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_mount_tab(
+    proc_fd: u64,
+    root: &str,
+) -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    use alloc::vec::Vec;
+    use core::fmt::Write as _;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    let fd = bwrap_fd(
+        "openat(proc_fd, self/mountinfo)",
+        Syscall::Openat.raw(),
+        a3(proc_fd, c"self/mountinfo".as_ptr() as u64, O_CLOEXEC, 0),
+    )?;
+    let mut text = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+        ) {
+            Some(0) => break,
+            Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+            other => {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return bwrap_step("read(self/mountinfo)", other, false).map(|_| Vec::new());
+            }
+        }
+    }
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    let text = core::str::from_utf8(&text).map_err(|_| "mountinfo is not UTF-8")?;
+    // (id, parent id, mount point) per line, in file order.
+    let lines: Vec<(u64, u64, &str)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let id = f.next()?.parse().ok()?;
+            let parent = f.next()?.parse().ok()?;
+            let _devno = f.next()?;
+            let _mnt_root = f.next()?;
+            Some((id, parent, f.next()?))
+        })
+        .collect();
+    let Some(top) = lines.iter().rposition(|(_, _, path)| *path == root) else {
+        let _ = writeln!(narf_console::Writer, "userns-bwrap: mountinfo:\n{text}");
+        return Err("bind_mount: the destination is not in /proc/self/mountinfo");
+    };
+    let mut out = alloc::vec![alloc::string::String::from(root)];
+    let mut stack = alloc::vec![lines[top].0];
+    while let Some(parent) = stack.pop() {
+        let children: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].1 == parent).collect();
+        for (k, &i) in children.iter().enumerate() {
+            let path = lines[i].2;
+            let covered = children[k + 1..].iter().any(|&j| {
+                let later = lines[j].2;
+                later == path
+                    || (path.starts_with(later) && path.as_bytes().get(later.len()) == Some(&b'/'))
+            });
+            if !covered {
+                out.push(alloc::string::String::from(path));
+            }
+            stack.push(lines[i].0);
+        }
+    }
+    Ok(out)
+}
+
+/// Replay one recorded bubblewrap sandbox setup as the clone child `child`,
+/// with `proc_fd` the `/proc` descriptor its parent opened before cloning.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'static str> {
+    const O_RDONLY: u64 = 0;
+    const O_RDWR: u64 = 0o2;
+    const O_NOCTTY: u64 = 0o400;
+    const O_DIRECTORY: u64 = 0o200_000;
+    const O_NOFOLLOW: u64 = 0o400_000;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const O_PATH: u64 = 0o10_000_000;
+    const MS_NOSUID: u64 = 0x2;
+    const MS_NODEV: u64 = 0x4;
+    const MS_REMOUNT: u64 = 0x20;
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    const MS_SILENT: u64 = 0x8000;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_MGC_VAL: u64 = 0xC0ED_0000;
+    const MNT_DETACH: u64 = 2;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const AT_EACCESS: u64 = 0x200;
+    const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const EEXIST: i64 = -17;
+    const EINVAL: i64 = -22;
+    const ENOENT: i64 = -2;
+    let mount = |step: &'static str, src: u64, dst: u64, fstype: u64, flags: u64| {
+        bwrap_zero(step, Syscall::Mount.raw(), a4(src, dst, fstype, flags, 0))
+    };
+
+    set_task(child);
+    // `write_uid_gid_map`: through the /proc fd the parent opened.
+    let self_fd = bwrap_fd(
+        "openat(proc_fd, self, O_PATH)",
+        Syscall::Openat.raw(),
+        a3(proc_fd, c"self".as_ptr() as u64, O_RDONLY | O_PATH, 0),
+    )?;
+    for (step, file, data) in [
+        ("write uid_map", c"uid_map", &b"1000 1000 1\n"[..]),
+        ("write setgroups", c"setgroups", &b"deny\n"[..]),
+        ("write gid_map", c"gid_map", &b"1000 1000 1\n"[..]),
+    ] {
+        let fd = bwrap_fd(
+            step,
+            Syscall::Openat.raw(),
+            a3(self_fd, file.as_ptr() as u64, O_RDWR | O_CLOEXEC, 0),
+        )?;
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd, data.as_ptr() as u64, data.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        bwrap_step(step, wrote, wrote == Some(data.len() as i64))?;
+    }
+    let _ = call(Syscall::Close.raw(), a0(self_fd));
+
+    mount(
+        "mount(NULL, /, MS_SLAVE|MS_REC)",
+        0,
+        c"/".as_ptr() as u64,
+        0,
+        MS_REC | MS_SILENT | MS_SLAVE,
+    )?;
+    mount(
+        "mount(tmpfs, /tmp)",
+        c"tmpfs".as_ptr() as u64,
+        c"/tmp".as_ptr() as u64,
+        c"tmpfs".as_ptr() as u64,
+        MS_NOSUID | MS_NODEV,
+    )?;
+    bwrap_zero(
+        "chdir(/tmp)",
+        Syscall::Chdir.raw(),
+        a0(c"/tmp".as_ptr() as u64),
+    )?;
+    bwrap_zero(
+        "mkdir(newroot)",
+        Syscall::Mkdir.raw(),
+        a1(c"newroot".as_ptr() as u64, 0o755),
+    )?;
+    mount(
+        "mount(newroot, newroot, MS_BIND|MS_REC)",
+        c"newroot".as_ptr() as u64,
+        c"newroot".as_ptr() as u64,
+        0,
+        MS_MGC_VAL | MS_BIND | MS_REC | MS_SILENT,
+    )?;
+    bwrap_zero(
+        "mkdir(oldroot)",
+        Syscall::Mkdir.raw(),
+        a1(c"oldroot".as_ptr() as u64, 0o755),
+    )?;
+    bwrap_zero(
+        "pivot_root(/tmp, oldroot)",
+        Syscall::PivotRoot.raw(),
+        a1(c"/tmp".as_ptr() as u64, c"oldroot".as_ptr() as u64),
+    )?;
+    bwrap_zero("chdir(/)", Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64))?;
+
+    match build {
+        BwrapBuild::V0_13 => {
+            // Its own /proc, bound from the old root's.
+            bwrap_zero(
+                "mkdir(proc)",
+                Syscall::Mkdir.raw(),
+                a1(c"proc".as_ptr() as u64, 0o755),
+            )?;
+            mount(
+                "mount(oldroot/proc, proc, MS_BIND|MS_REC)",
+                c"oldroot/proc".as_ptr() as u64,
+                c"proc".as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            // setup_newroot: the --dev-bind source and destination.
+            let old = bwrap_fd(
+                "openat(/oldroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/oldroot".as_ptr() as u64,
+                    O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            let source = bwrap_openat2(
+                "openat2(/oldroot, /, RESOLVE_IN_ROOT)",
+                old,
+                c"/",
+                O_RDONLY | O_PATH,
+                RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+            )?;
+            bwrap_fstat_dir("fstat(source)", source)?;
+            let new = bwrap_fd(
+                "openat(/newroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            let dest_dir = bwrap_openat2(
+                "openat2(/newroot, /, RESOLVE_IN_ROOT)",
+                new,
+                c"/",
+                O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY,
+                RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+            )?;
+            let got = call(
+                Syscall::Mkdirat.raw(),
+                a2(dest_dir, c".".as_ptr() as u64, 0o755),
+            );
+            bwrap_step("mkdirat(dest, .)", got, got == Some(EEXIST))?;
+            let dest = bwrap_fd(
+                "openat(dest, ., O_PATH|O_NOFOLLOW)",
+                Syscall::Openat.raw(),
+                a3(
+                    dest_dir,
+                    c".".as_ptr() as u64,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            bwrap_fstat_dir("fstat(dest)", dest)?;
+            bwrap_readlink(
+                "readlink(/proc/self/fd/<dest>)",
+                &alloc::format!("/proc/self/fd/{dest}"),
+                "/newroot",
+            )?;
+            let src_link = alloc::format!("/proc/self/fd/{source}\0");
+            let dst_link = alloc::format!("/proc/self/fd/{dest}\0");
+            mount(
+                "mount(/proc/self/fd/<source>, /proc/self/fd/<dest>, MS_BIND|MS_REC)",
+                src_link.as_ptr() as u64,
+                dst_link.as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            let attr_fd = bwrap_fd(
+                "openat(/newroot, O_PATH) for mount_setattr",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            let attr = [MOUNT_ATTR_NOSUID, 0u64, 0, 0];
+            bwrap_zero(
+                "mount_setattr(/newroot, AT_RECURSIVE, NOSUID)",
+                Syscall::MountSetattr.raw(),
+                SyscallArgs {
+                    arg0: attr_fd,
+                    arg1: c"".as_ptr() as u64,
+                    arg2: AT_EMPTY_PATH | AT_RECURSIVE,
+                    arg3: attr.as_ptr() as u64,
+                    arg4: 32,
+                    arg5: 0,
+                },
+            )?;
+        }
+        BwrapBuild::V0_11 => {
+            for (step, path) in [
+                ("stat(/oldroot/)", c"/oldroot/"),
+                ("stat(/newroot)", c"/newroot"),
+                ("stat(/newroot/)", c"/newroot/"),
+            ] {
+                let got = bwrap_stat(path);
+                bwrap_step(step, got, got == Some(0))?;
+            }
+            mount(
+                "mount(/oldroot/, /newroot/, MS_BIND|MS_REC)",
+                c"/oldroot/".as_ptr() as u64,
+                c"/newroot/".as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            // realpath("/newroot/").
+            let mut buf = [0u8; 64];
+            let got = call_readlink(
+                c"/newroot".as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            );
+            bwrap_step("readlink(/newroot)", got, got == Some(EINVAL))?;
+            bwrap_zero(
+                "faccessat2(/newroot/, F_OK, AT_EACCESS)",
+                Syscall::Faccessat2.raw(),
+                a3(AT_FDCWD, c"/newroot/".as_ptr() as u64, 0, AT_EACCESS),
+            )?;
+            let dest = bwrap_fd(
+                "openat(/newroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            bwrap_readlink(
+                "readlink(/oldroot/proc/self/fd/<dest>)",
+                &alloc::format!("/oldroot/proc/self/fd/{dest}"),
+                "/newroot",
+            )?;
+            for path in bwrap_mount_tab(proc_fd, "/newroot")? {
+                let target = alloc::format!("{path}\0");
+                mount(
+                    "mount(none, <bound mount>, MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV)",
+                    c"none".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT,
+                )?;
+            }
+        }
+    }
+
+    mount(
+        "mount(oldroot, oldroot, MS_REC|MS_PRIVATE)",
+        c"oldroot".as_ptr() as u64,
+        c"oldroot".as_ptr() as u64,
+        0,
+        MS_REC | MS_SILENT | MS_PRIVATE,
+    )?;
+    bwrap_zero(
+        "umount2(oldroot, MNT_DETACH)",
+        Syscall::Umount2.raw(),
+        a1(c"oldroot".as_ptr() as u64, MNT_DETACH),
+    )?;
+    // The second pivot.
+    let oldrootfd = bwrap_fd(
+        "open(/, O_DIRECTORY)",
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, c"/".as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+    )?;
+    bwrap_zero(
+        "chdir(/newroot)",
+        Syscall::Chdir.raw(),
+        a0(c"/newroot".as_ptr() as u64),
+    )?;
+    bwrap_zero(
+        "pivot_root(., .)",
+        Syscall::PivotRoot.raw(),
+        a1(c".".as_ptr() as u64, c".".as_ptr() as u64),
+    )?;
+    bwrap_zero("fchdir(oldrootfd)", Syscall::Fchdir.raw(), a0(oldrootfd))?;
+    bwrap_zero(
+        "umount2(., MNT_DETACH)",
+        Syscall::Umount2.raw(),
+        a1(c".".as_ptr() as u64, MNT_DETACH),
+    )?;
+    bwrap_zero(
+        "chdir(/) after the second pivot",
+        Syscall::Chdir.raw(),
+        a0(c"/".as_ptr() as u64),
+    )?;
+    // bubblewrap returns to the caller's working directory, then execs.
+    bwrap_zero(
+        "chdir(old cwd)",
+        Syscall::Chdir.raw(),
+        a0(c"/abi-bwrap-cwd".as_ptr() as u64),
+    )?;
+
+    // The sandbox root IS the host root (`--bind / /`): its directories are
+    // there, bubblewrap's staging directories are not, and /proc is procfs.
+    let got = bwrap_stat(c"/abi-bwrap-cwd");
+    bwrap_step("stat(/abi-bwrap-cwd) in the sandbox", got, got == Some(0))?;
+    for (step, path) in [
+        ("stat(/newroot) in the sandbox", c"/newroot"),
+        ("stat(/oldroot) in the sandbox", c"/oldroot"),
+    ] {
+        let got = bwrap_stat(path);
+        bwrap_step(step, got, got == Some(ENOENT))?;
+    }
+    let got = bwrap_stat(c"/proc/self/status");
+    bwrap_step(
+        "stat(/proc/self/status) in the sandbox",
+        got,
+        got == Some(0),
+    )?;
+    Ok(())
+}
+
+/// Run [`bwrap_replay`] the way bubblewrap starts it: an unprivileged
+/// uid-1000 parent opens `/proc` (O_PATH) and makes the sandbox child with
+/// `clone(CLONE_NEWNS | CLONE_NEWUSER | SIGCHLD)`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn with_bwrap_sandbox(build: BwrapBuild) -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const O_PATH: u64 = 0o10_000_000;
+        // The procfs wiring a booted kernel installs at init.
+        install_idmap_proc_hooks()?;
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        let saved_pidns = narf_filesystem::procfs::__test_pidns_hooks_snapshot();
+        narf_filesystem::procfs::install_proc_pidns_hooks(
+            crate::handlers::proc_current_outer_pid,
+            crate::handlers::proc_pid_resolve,
+            crate::handlers::proc_pid_report,
+            crate::handlers::proc_current_tid,
+        );
+        let saved_fd_path = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+        let result = (|| {
+            install_test_address_space()?;
+            narf_scheduler::__reset_queues_for_test();
+            // The host root's /tmp and the caller's working directory.
+            narf_filesystem::__test_ensure_mount_target("/tmp");
+            narf_filesystem::__test_ensure_mount_target("/abi-bwrap-cwd");
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            drop_all_caps();
+            if call(Syscall::Chdir.raw(), a0(c"/abi-bwrap-cwd".as_ptr() as u64)) != Some(0) {
+                return Err("chdir to the caller's working directory failed");
+            }
+            let proc_fd = bwrap_fd(
+                "openat(/proc, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, c"/proc".as_ptr() as u64, O_PATH, 0),
+            )?;
+            let child = clone_child(CLONE_NEWNS | CLONE_NEWUSER)
+                .map_err(|_| "clone(CLONE_NEWNS|CLONE_NEWUSER) failed")?;
+            let replay = bwrap_replay(build, child, proc_fd);
+            release_clone_child(child);
+            replay
+        })();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(saved_fd_path);
+        narf_filesystem::procfs::__test_pidns_hooks_restore(saved_pidns);
+        result
+    })
+}
+
+/// `bwrap --unshare-user --dev-bind / / true` (bubblewrap 0.13.1).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_13_dev_bind_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_13)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap",
+    smoke_abi_userns_bwrap_0_13_dev_bind_root
+);
+
+/// Steam's `srt-bwrap --bind / / true` (bubblewrap 0.11.2), the probe
+/// `steam-runtime-check-requirements` runs before Steam starts.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_11_bind_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_11)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap",
+    smoke_abi_userns_bwrap_0_11_bind_root
+);
+
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
     with_setup(|| {
         // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|
