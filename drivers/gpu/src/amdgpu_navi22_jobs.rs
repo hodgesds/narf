@@ -81,6 +81,62 @@ mod tests {
         "drivers/gpu/amdgpu/fence-errors",
         rdna2_hang_preserves_guilt_and_late_publication_errors
     );
+    /// `amdgpu_job_timedout` on a video ring: the timed-out job ends with
+    /// ETIME (its context guilty) and the other jobs of that engine's rings
+    /// with ECANCELED, while every other ring keeps running and retiring.
+    /// Linux resets the VCN instance alone (`amdgpu_vcn_reset_engine`); a
+    /// media timeout never fails graphics work.
+    fn rdna2_media_timeout_fails_only_its_engines_rings() -> TestResult {
+        let mut jobs = Jobs::new(4);
+        let tickets = [
+            ticket(4, 0, 7), // GFX
+            ticket(4, 4, 3), // VCN decode, the timed-out job
+            ticket(4, 4, 4), // VCN decode, queued behind it
+            ticket(4, 5, 9), // VCN encode 0, same VCPU
+            ticket(4, 7, 2), // JPEG
+        ];
+        let health: Vec<Arc<Health>> = tickets.iter().map(|_| Arc::default()).collect();
+        for (t, h) in tickets.iter().zip(&health) {
+            jobs.emitted(*t, h);
+        }
+        jobs.fail_rings(4, 0b111 << 4);
+        let errors: Vec<_> = tickets.iter().map(|t| jobs.error(*t)).collect();
+        if errors
+            != [
+                None,
+                Some(FsError::TimedOut),
+                Some(FsError::Canceled),
+                Some(FsError::Canceled),
+                None,
+            ]
+            || health[0].error().is_some()
+            || health[4].error().is_some()
+            || jobs.terminal.is_some()
+        {
+            return TestResult::Fail("a media timeout errors other than its engine's jobs");
+        }
+        let late = Arc::new(Health::default());
+        jobs.emitted(ticket(4, 6, 1), &late);
+        if late.error() != Some(FsError::Canceled) || jobs.error(ticket(4, 6, 1)).is_none() {
+            return TestResult::Fail("a job published on a timed-out media ring runs");
+        }
+        let mut completed = [0; RING_IDS];
+        completed[0] = 7;
+        completed[7] = 2;
+        jobs.observe(completed);
+        if !jobs.retired(tickets[0]) || !jobs.retired(tickets[4]) || jobs.retired(tickets[1]) {
+            return TestResult::Fail("other rings stop retiring after a media timeout");
+        }
+        jobs.finish(FsError::Canceled);
+        if jobs.error(tickets[1]) != Some(FsError::TimedOut) {
+            return TestResult::Fail("the timed-out media job lost its guilt");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-tdr/media",
+        rdna2_media_timeout_fails_only_its_engines_rings
+    );
 }
 impl Jobs {
     pub fn new(epoch: u64) -> Self {
@@ -134,6 +190,10 @@ impl Jobs {
             self.finish(FsError::Canceled);
         }
     }
+    /// A media engine's job on ring `hung` timed out and no recovery
+    /// follows; `rings` (ticket ring-id bits) are that engine's rings.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub fn fail_rings(&mut self, _hung: usize, _rings: u16) {}
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if self.retired(ticket) {
             return None;

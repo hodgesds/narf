@@ -701,6 +701,7 @@ pub(crate) fn progress<I: Io>(
         checked(io.read(l.hdp + 0xd1 * 4))?; // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
         Ok(crate::amdgpu_navi22_tdr::Progress {
             engine: queue.engine,
+            media: None,
             emitted: queue.seq,
             signaled,
         })
