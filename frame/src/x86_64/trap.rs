@@ -57,8 +57,10 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 ///
 /// * **Hung task** — a user task parked in an uninterruptible wait (a
 ///   synchronous kernel wait: filesystem I/O or a kernel lock; see
-///   `narf_userspace::task::check_hung_tasks` for the mapping) that has not
-///   been woken for `hung_task_timeout_secs` (120 s):
+///   `narf_userspace::task::check_hung_tasks` for the mapping), or a kernel
+///   task blocked in one (`narf_lib::hung_task`: an async mutex, a btrfs
+///   transaction join or close), that has not been woken for
+///   `hung_task_timeout_secs` (120 s):
 ///   `INFO: task <comm>:<pid> blocked for more than N seconds.`, at most
 ///   `hung_task_warnings` (10) times per boot. Checked every timeout, as
 ///   khungtaskd does.
@@ -636,8 +638,10 @@ mod stall_wd {
         }
     }
 
-    /// Linux's khungtaskd: every `hung_task_timeout_secs`, report user tasks
-    /// that have sat in one uninterruptible wait for at least that long.
+    /// Linux's khungtaskd: every `hung_task_timeout_secs`, report tasks that
+    /// have sat in one uninterruptible wait for at least that long — user
+    /// tasks parked in a synchronous kernel wait, and kernel tasks blocked
+    /// on an async mutex or a btrfs transaction gate.
     fn hung_task_check(now_ns: u64, p: &Params) {
         if p.hung_timeout_ns == 0 {
             return;
@@ -649,7 +653,12 @@ mod stall_wd {
         HUNG_LAST_SCAN_NS.store(now_ns.max(1), Ordering::Relaxed);
         let warned = HUNG_WARNINGS.load(Ordering::Relaxed) != 0;
         let hung =
-            narf_userspace::task::check_hung_tasks(now_ns, p.hung_timeout_ns, &HUNG_WARNINGS);
+            narf_userspace::task::check_hung_tasks(now_ns, p.hung_timeout_ns, &HUNG_WARNINGS)
+                + narf_userspace::task::check_hung_kernel_tasks(
+                    now_ns,
+                    p.hung_timeout_ns,
+                    &HUNG_WARNINGS,
+                );
         if hung == 0 {
             return;
         }

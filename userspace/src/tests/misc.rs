@@ -4567,3 +4567,73 @@ kernel_test_in!(
     "userspace/hung_task",
     smoke_userspace_hung_task_reports_only_uninterruptible_waits
 );
+
+/// Hung kernel task (Linux `check_hung_uninterruptible_tasks` naming a
+/// D-state kthread, "task btrfs-transacti blocked for more than 120
+/// seconds"): a kernel task blocked on an async mutex past
+/// `hung_task_timeout_secs` is reported with its name, what it waits on and
+/// the `lock()` call; a younger wait is not, a zero timeout disables the
+/// check, and a wait that ended is never reported.
+fn smoke_userspace_hung_task_reports_blocked_kernel_task() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const SEC: u64 = 1_000_000_000;
+    const TIMEOUT: u64 = crate::task::HUNG_TASK_TIMEOUT_SECS * SEC;
+    static LOCK: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+    static TOOK: AtomicBool = AtomicBool::new(false);
+    TOOK.store(false, Ordering::Release);
+    let Some(holder) = LOCK.try_lock() else {
+        return TestResult::Fail("test lock already held");
+    };
+    let lock_line = line!() + 2;
+    let id = narf_scheduler::spawn(async {
+        let _held = LOCK.lock().await;
+        TOOK.store(true, Ordering::Release);
+    });
+    let _ = narf_scheduler::poll_one_round();
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let warnings = AtomicU64::new(u64::MAX);
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    let mine = alloc::format!(":{} blocked for more than", id.raw());
+    let seq = narf_console::klog::next_seq();
+    let _ = crate::task::check_hung_kernel_tasks(now + TIMEOUT / 2, TIMEOUT, &warnings);
+    let early = narf_console::klog::text_since(seq);
+    let due = crate::task::check_hung_kernel_tasks(now + TIMEOUT + SEC, TIMEOUT, &warnings);
+    let due_text = narf_console::klog::text_since(seq);
+    let disabled = crate::task::check_hung_kernel_tasks(now + 9 * TIMEOUT, 0, &warnings);
+    drop(holder);
+    let deadline = narf_scheduler::narf_time::monotonic_ns() + SEC;
+    while !TOOK.load(Ordering::Acquire) && narf_scheduler::narf_time::monotonic_ns() < deadline {
+        let _ = narf_scheduler::poll_one_round();
+    }
+    let seq = narf_console::klog::next_seq();
+    let _ = crate::task::check_hung_kernel_tasks(now + 9 * TIMEOUT, TIMEOUT, &warnings);
+    let after = narf_console::klog::text_since(seq);
+
+    let report = alloc::format!(
+        "INFO: task smoke_userspace_hung_task_reports_blocked_kernel_task:{} blocked for more than 121 seconds.",
+        id.raw()
+    );
+    let site = alloc::format!("misc.rs:{lock_line} object=");
+    if has(&early, mine.as_bytes()) {
+        return TestResult::Fail("a kernel wait was reported before hung_task_timeout_secs");
+    }
+    if due == 0 || !has(&due_text, report.as_bytes()) {
+        return TestResult::Fail(
+            "a kernel task blocked on a mutex past the timeout was not reported",
+        );
+    }
+    if !has(&due_text, b"wait=\"mutex\" at ") || !has(&due_text, site.as_bytes()) {
+        return TestResult::Fail("the hung kernel task's report did not name its mutex wait");
+    }
+    if disabled != 0 {
+        return TestResult::Fail("hung_task_timeout_secs=0 must disable the kernel check");
+    }
+    if !TOOK.load(Ordering::Acquire) || has(&after, mine.as_bytes()) {
+        return TestResult::Fail("a wait that ended was still reported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/hung_task",
+    smoke_userspace_hung_task_reports_blocked_kernel_task
+);

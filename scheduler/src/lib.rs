@@ -3708,6 +3708,9 @@ pub fn init() {
     // Softirq handlers below the scheduler (timer wheel, RCU) report their
     // CPU time through `narf_lib::kstat`.
     cputime::init();
+    // Uninterruptible kernel waits (async mutex, btrfs transaction gate)
+    // name the task they block, for the hung-task detector.
+    narf_lib::hung_task::set_hooks(|| current_task_id().raw(), narf_time::monotonic_ns);
     // Hrtimer sleepers whose waker is ours expire in hard IRQ: our
     // `wake_by_ref` only publishes the awake bit and places the wake (no
     // allocation, no free). Every other waker expires from the executor.

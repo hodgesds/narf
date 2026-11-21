@@ -30,6 +30,22 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The hung-task detector's name for a join waiting behind a commit (Linux
+/// `wait_current_trans`, TASK_UNINTERRUPTIBLE). The detail is the task
+/// holding the transaction closed, 0 while the close is only queued.
+pub(crate) static JOIN_WAIT: narf_lib::hung_task::WaitKind = narf_lib::hung_task::WaitKind {
+    name: "btrfs txn join",
+    detail: "closer",
+};
+
+/// A close waiting for the running operations to leave (Linux
+/// `btrfs_commit_transaction` waiting for `num_writers`). The detail is how
+/// many operations are still joined.
+pub(crate) static CLOSE_WAIT: narf_lib::hung_task::WaitKind = narf_lib::hung_task::WaitKind {
+    name: "btrfs txn close",
+    detail: "joined",
+};
+
 /// The caller's identity: the task whose operation is running — the
 /// scheduler task being polled on this CPU, or, for a killed task's
 /// operation handed off to another scheduler task to finish
@@ -141,20 +157,26 @@ impl TxnGate {
     }
 
     /// Join the running transaction for one operation's read-to-stage span.
+    #[track_caller]
     pub(crate) fn join(&self) -> JoinFuture<'_> {
         JoinFuture {
             gate: self,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            site: core::panic::Location::caller(),
+            blocked: narf_lib::hung_task::BlockedWait::new(),
         }
     }
 
     /// Close the transaction: wait for every joined operation to leave and
     /// keep new ones out until the guard drops.
+    #[track_caller]
     pub(crate) fn close(&self) -> CloseFuture<'_> {
         CloseFuture {
             gate: self,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             queued: false,
+            site: core::panic::Location::caller(),
+            blocked: narf_lib::hung_task::BlockedWait::new(),
         }
     }
 
@@ -201,6 +223,9 @@ impl TxnGate {
 pub(crate) struct JoinFuture<'a> {
     gate: &'a TxnGate,
     id: u64,
+    /// Where `join()` was called, for the hung-task report.
+    site: &'static core::panic::Location<'static>,
+    blocked: narf_lib::hung_task::BlockedWait,
 }
 
 impl<'a> Future for JoinFuture<'a> {
@@ -213,12 +238,22 @@ impl<'a> Future for JoinFuture<'a> {
             let me = task();
             state.own(me);
             state.unpark(this.id);
+            drop(state);
+            this.blocked.wake();
             return Poll::Ready(Joined {
                 gate: this.gate,
                 task: me,
             });
         }
         state.park(this.id, cx.waker());
+        let closer = state.closer;
+        drop(state);
+        this.blocked.block(
+            &JOIN_WAIT,
+            this.site,
+            core::ptr::from_ref(this.gate) as usize,
+            closer,
+        );
         Poll::Pending
     }
 }
@@ -246,6 +281,9 @@ pub(crate) struct CloseFuture<'a> {
     gate: &'a TxnGate,
     id: u64,
     queued: bool,
+    /// Where `close()` was called, for the hung-task report.
+    site: &'static core::panic::Location<'static>,
+    blocked: narf_lib::hung_task::BlockedWait,
 }
 
 impl<'a> Future for CloseFuture<'a> {
@@ -264,9 +302,19 @@ impl<'a> Future for CloseFuture<'a> {
             state.closer = task();
             state.unpark(this.id);
             this.queued = false;
+            drop(state);
+            this.blocked.wake();
             return Poll::Ready(Closed { gate: this.gate });
         }
         state.park(this.id, cx.waker());
+        let joined = state.joined as u64;
+        drop(state);
+        this.blocked.block(
+            &CLOSE_WAIT,
+            this.site,
+            core::ptr::from_ref(this.gate) as usize,
+            joined,
+        );
         Poll::Pending
     }
 }
