@@ -11647,8 +11647,16 @@ newer owner's IVs. `close(reason)` lets other owners report device loss.
 resume at wptr+32, clear pulse) and decodes up to 8×32 SOC15 IVs per call
 (`Iv`, with `cp_queue`, `page_fault`, `hpd` helpers). It skips client ids
 ≥ 0x20, all-ones and misaligned entries as malformed and writes the rptr back.
-It runs in task context only: the IRQ handler records a count, and waiters
-drain on wake or on a watchdog (10 ms with MSI, 1 ms polling).
+It runs in task context only: the IRQ handler records a count. With MSI or
+MSI-X the vector alone wakes a waiter, which registers for it before draining
+(no timer, as Linux drains from `amdgpu_irq_handler`); polled delivery samples
+the ring every 1 ms and a ring not yet routed every 10 ms. The boot trap round
+trip (`prove`) that finds its IV in the ring without an interrupt for it
+treats the route as failed: it tears the vector down as a failed routing in
+`initialize` does, falls back to `Delivery::Polling` (RPTR_REARM cleared) and
+wakes parked waiters onto the polling timer. `status()` reads the engine under
+one hold and then drains what an interrupt left while it held it, as `state()`
+does.
 All-ones registers or revoked authority close every waiter. `Stats` exposes
 interrupts, drained, unhandled, malformed, overflows, dropped, unsignalled
 (found without an interrupt) and watchdog counts. `source::*` holds the GFX
