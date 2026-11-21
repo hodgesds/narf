@@ -642,6 +642,14 @@ impl<I: Io> Engine<I> {
         self.state = State::Enabled;
         Ok(())
     }
+    /// `IH_RB_CNTL.RPTR_REARM`, set only with MSI (`navi10_ih_enable_ring`).
+    fn rearm(&mut self, msi: bool) -> Result<(), Error> {
+        if self.state != State::Enabled {
+            return Ok(());
+        }
+        let value = if msi { RPTR_REARM } else { 0 };
+        self.access(|io, l| Self::update(io, Self::reg(l, RB_CNTL), RPTR_REARM, value).map(drop))
+    }
     /// navi10_ih_get_wptr: writeback first, register only on overflow.
     fn wptr(io: &mut I, l: Layout, map: MmioRegion, rptr: &mut u32) -> Result<(u32, bool), Error> {
         let writeback = io.read_memory(map, WPTR_WB);
@@ -992,6 +1000,44 @@ impl<I: Io> Shared<I> {
             let _ = Port::drain(self);
         }
     }
+
+    /// The trap round trip that proves the route ([`prove`]). With MSI or
+    /// MSI-X delivery nothing but the vector wakes a waiter (Linux
+    /// `amdgpu_irq_handler` → `amdgpu_ih_process`; no IH timer), so a trap
+    /// whose IV reached the ring with no interrupt for it shows the route
+    /// delivers nothing and every later IV would wait forever. The ring is
+    /// then sampled instead, as for a route that could not be programmed.
+    async fn prove_route(
+        &self,
+        waiter: &mut Subscription,
+        context: u32,
+        interrupts: u64,
+    ) -> Result<Proof, Error> {
+        let result = prove(&self.hub, waiter, context, interrupts).await;
+        if matches!(
+            result,
+            Ok(Proof {
+                interrupt: false,
+                ..
+            })
+        ) && matches!(
+            self.hub.delivery(),
+            Delivery::Msi { .. } | Delivery::MsiX { .. }
+        ) {
+            self.sample_ring().await;
+        }
+        result
+    }
+
+    /// Fall back to `Delivery::Polling`: `RPTR_REARM` clear as
+    /// `program(false)` leaves it (`navi10_ih_enable_ring` sets it only with
+    /// MSI), and the waiters parked on the vector alone re-plan onto the
+    /// polling timer.
+    async fn sample_ring(&self) {
+        self.hub.set_delivery(Delivery::Polling);
+        let _ = self.engine.lock().await.rearm(false);
+        self.hub.kick();
+    }
 }
 
 /// Cloneable dispatch endpoint for other Navi22 owners (rings, VM, DCN).
@@ -1166,6 +1212,9 @@ impl Future for Next<'_> {
             // before it (the IV write precedes its MSI) is in the ring the
             // drain below reads, so no IV can fall between the two.
             let vector = this.subscription.port.hub().vector();
+            if let Some((old, waker)) = this.vector.take_if(|(old, _)| Some(*old) != vector) {
+                narf_interrupts::dispatch::clear_waker(old, &waker);
+            }
             if let Some(vector) = vector {
                 narf_interrupts::dispatch::set_waker(vector, cx.waker().clone());
                 this.vector = Some((vector, cx.waker().clone()));
@@ -1224,7 +1273,7 @@ fn interrupt(cookie: u64) -> narf_interrupts::IrqStatus {
 enum Route {
     None,
     MsiX(narf_bus::MsixTable),
-    Msi,
+    Msi(narf_bus::msi::MsiConfig),
 }
 
 /// Exclusive IH ring owner.
@@ -1402,7 +1451,7 @@ impl Ih {
                     // SAFETY: same.
                     && unsafe { narf_bus::msi::enable(&cfg) }.is_ok()
                 {
-                    self.route = Route::Msi;
+                    self.route = Route::Msi(cfg);
                     return Delivery::Msi { vector };
                 }
             }
@@ -1430,7 +1479,7 @@ impl Ih {
                 match &mut self.route {
                     // SAFETY: IH has stopped raising interrupts.
                     Route::MsiX(table) => unsafe { table.disable() },
-                    Route::Msi | Route::None => {}
+                    Route::Msi(_) | Route::None => {}
                 }
                 narf_interrupts::dispatch::disable_irq(vector);
                 narf_interrupts::dispatch::synchronize_irq(vector);
@@ -1447,9 +1496,45 @@ impl Ih {
         context: u32,
         interrupts: u64,
     ) -> Result<Proof, Error> {
-        let result = prove(&self.shared.hub, waiter, context, interrupts).await;
+        let vector = self.shared.hub.vector();
+        let result = self.shared.prove_route(waiter, context, interrupts).await;
+        if let Some(vector) = vector.filter(|_| self.shared.hub.vector().is_none()) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::PriorityWriter::<4>,
+                "amdgpu: navi22 IH vector {vector} raised no interrupt for its trap; sampling the ring"
+            );
+            // SAFETY: `new`'s exclusive ownership of the PCI function and
+            // its interrupt capabilities still holds.
+            unsafe { self.unroute(vector) };
+        }
         self.proof = Some(result);
         result
+    }
+    /// Undo `route` for a vector the proof showed silent: the teardown
+    /// `route` runs when programming fails.
+    /// # Safety
+    /// Caller owns the PCI function's config space and MSI-X table.
+    unsafe fn unroute(&mut self, vector: u8) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use narf_interrupts::{dispatch, vector as vectors};
+            match core::mem::replace(&mut self.route, Route::None) {
+                // SAFETY: the IH's own table; caller-owned function.
+                Route::MsiX(mut table) => unsafe { table.disable() },
+                Route::Msi(cfg) => {
+                    // SAFETY: same owned config space.
+                    let _ = unsafe { narf_bus::msi::disable(&cfg) };
+                }
+                Route::None => {}
+            }
+            let cookie = &self.shared.hub as *const Hub as u64;
+            dispatch::remove_handler(vector, "amdgpu-navi22-ih", cookie);
+            dispatch::synchronize_irq(vector);
+            let _ = vectors::free(vector);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = vector;
     }
     pub(crate) fn interrupts(&self) -> u64 {
         self.shared.hub.interrupts.load(Ordering::Acquire)
@@ -1467,14 +1552,22 @@ impl Ih {
         state
     }
     pub fn status(&self) -> Status {
+        // One engine hold, then the redrain every non-drain holder owes
+        // (`redrain_if_pending`): an interrupt that found it held left its
+        // IVs for this holder.
+        let (state, inherited) = match self.shared.engine.try_lock() {
+            Some(engine) => {
+                let read = (engine.state, engine.inherited);
+                drop(engine);
+                self.shared.redrain_if_pending();
+                read
+            }
+            None => (self.state, false),
+        };
         Status {
-            state: self.state(),
+            state,
             delivery: self.shared.hub.delivery(),
-            inherited: self
-                .shared
-                .engine
-                .try_lock()
-                .is_some_and(|engine| engine.inherited),
+            inherited,
             proof: self.proof,
             stats: self.shared.hub.stats(),
         }

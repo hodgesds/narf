@@ -795,3 +795,98 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_ih_programs_dispatches_and_disables_with_versioned_self_iv
 );
+
+/// Polls a future only after its waker fired, expiring hrtimers between polls
+/// as an executor round does: a wait no wake reaches stays pending, as it
+/// would in a task (`block_on_spin` re-polls regardless of wakes).
+struct Woken {
+    flag: Arc<Flag>,
+    waker: Waker,
+}
+struct Flag(core::sync::atomic::AtomicBool);
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+impl Woken {
+    fn new() -> Self {
+        let flag = Arc::new(Flag(core::sync::atomic::AtomicBool::new(true)));
+        Self {
+            waker: Waker::from(flag.clone()),
+            flag,
+        }
+    }
+    /// Drive `f` for up to `ms` milliseconds; `None` if it did not complete.
+    fn run_for<F: Future + ?Sized>(&self, f: Pin<&mut F>, ms: u64) -> Option<F::Output> {
+        let mut f = f;
+        let deadline = narf_time::Deadline::after_ms(ms);
+        loop {
+            if self.flag.0.swap(false, Ordering::SeqCst) {
+                if let Poll::Ready(v) = f.as_mut().poll(&mut Context::from_waker(&self.waker)) {
+                    return Some(v);
+                }
+            }
+            if deadline.expired() {
+                return None;
+            }
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// With MSI delivery a waiter has no IH timer: the vector alone wakes it
+/// (`amdgpu_irq_handler` → `amdgpu_ih_process`). A trap round trip whose IV
+/// reached the ring with no interrupt for it shows the route delivers
+/// nothing, so the ring is sampled instead, as for a route that could not be
+/// programmed: a waiter parked before the proof still gets a later IV that
+/// raises no interrupt, within 10 ms.
+fn ih_navi22_proof_without_interrupt_falls_back_to_polling() -> TestResult {
+    let (_pool, shared, handle) = fixture();
+    enable(&shared, true).unwrap();
+    let Ok(vector) = narf_interrupts::vector::alloc() else {
+        return TestResult::Skip("no free host vector");
+    };
+    shared.hub.set_delivery(Delivery::MsiX { vector });
+    let result = (|| {
+        let mut trap = handle.subscribe(source::SDMA0_TRAP).unwrap();
+        let mut sub = handle.subscribe(source::GFX_EOP).unwrap();
+        let driver = Woken::new();
+        let mut next = core::pin::pin!(sub.wait());
+        if driver.run_for(next.as_mut(), 2).is_some() {
+            return TestResult::Fail("empty wait completed");
+        }
+        // The trap's IV lands; its MSI never comes.
+        let interrupts = shared.hub.interrupts.load(Ordering::SeqCst);
+        with(&shared, |e| {
+            e.io.push(iv(source::SDMA0_TRAP, 0, 0x0675_0022))
+        });
+        let proof = run(shared.prove_route(&mut trap, 0x0675_0022, interrupts));
+        if proof.map(|p| p.interrupt) != Ok(false) {
+            return TestResult::Fail("proof did not report the missing interrupt");
+        }
+        if driver.run_for(next.as_mut(), 2).is_some() {
+            return TestResult::Fail("wait completed before its IV");
+        }
+        with(&shared, |e| e.io.push(iv(source::GFX_EOP, 0, 9)));
+        match driver.run_for(next.as_mut(), 10) {
+            Some(Ok(iv)) if iv.src_data[0] == 9 => {}
+            Some(_) => return TestResult::Fail("wrong delivery"),
+            None => return TestResult::Fail("IV raised no interrupt and no waiter woke in 10 ms"),
+        }
+        if !matches!(handle.delivery(), Delivery::Polling) {
+            return TestResult::Fail("delivery still names the silent vector");
+        }
+        if with(&shared, |e| e.io.regs[&(OSS + 0x80 * 4)]) & RPTR_REARM != 0 {
+            return TestResult::Fail("RPTR_REARM left set without MSI (navi10_ih_enable_ring)");
+        }
+        TestResult::Pass
+    })();
+    let _ = narf_interrupts::vector::free(vector);
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/ih-navi22",
+    ih_navi22_proof_without_interrupt_falls_back_to_polling
+);
