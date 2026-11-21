@@ -647,6 +647,8 @@ pub use amdgpu_rdna2_smu_telemetry as amdgpu_smu_navi22_telemetry;
 pub mod amdgpu_dp_bridge;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_nbio_v7_2;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_raphael_boot;
 #[path = "amdgpu_vcn_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;

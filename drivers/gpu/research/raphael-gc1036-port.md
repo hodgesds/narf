@@ -199,7 +199,31 @@ as now.
    - **SDMA 5.2.6**: one engine, and NBIO 7.2 has a single SDMA doorbell range
      (GDC0, through the port pair) where NBIO 2.3 has one per engine.
    - KIQ and fences touch no NBIO or HDP register.
-8. The APU cold-boot coordinator and the PSP handover from the display path.
+8. ~~The APU cold-boot coordinator and the PSP handover from the display
+   path~~ (done, `amdgpu_raphael_boot`).
+   - **PSP handover.** The display path keeps the one PSP session.
+     `amdgpu_platform` hands its loader Raphael's graphics set
+     (`Loader::set_graphics`), and its PSP boot loads every non-PSP firmware
+     in `psp_load_non_psp_fw` order (SDMA, CE, PFP, ME, MEC, MEC2, RLC with
+     its autoload, VCN, DMCUB). It then waits for the RLC boot, in place of
+     DMCUB alone. The set's DMCUB payload must be the signed instructions the
+     loader validated. `amdgpu.rdna2_accel=0`, or a set that cannot be
+     opened, keeps the display-only load.
+   - **Coordinator.** After DMUB boots, `ColdBoot` runs once on the display
+     pool:
+     - SMU start and `DisallowGfxOff`;
+     - GMC and GART, then IH;
+     - golden settings, then the SDMA0 proof and its trap round trip;
+     - doorbells, GFX setup, KIQ, compute and GFX rings, SDMA queues;
+     - IB tests, fence interrupts, topology.
+
+     Each engine is its discrete owner's Raphael resolution. A failure stops
+     there and leaves the display as it is; the owners are retained.
+   - **Suspend.** After a graphics boot, the loader refuses to stop, so
+     suspend is refused. Releasing the TMR needs the RLC and CP that run from
+     it reset, and no Raphael graphics reset or resume exists yet.
+   - Not done: publishing acceleration to userspace (INFO/render node), any
+     GFXOFF or power-gating policy (GFX stays powered), and suspend/resume.
 9. Media: VCN and JPEG 3.1.2.
 
 ## Open

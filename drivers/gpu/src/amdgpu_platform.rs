@@ -684,9 +684,10 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
         )?);
         // SAFETY: exact GPU, authenticated containers, lifetime mappings and
         // exclusive PSP/DMUB ownership are retained by the loader and pool.
-        let loader = stage_failed("psp-loader", unsafe {
+        let mut loader = stage_failed("psp-loader", unsafe {
             Loader::new_psp(gpu, cap, &pool, &firmware, &toc)
         })?;
+        graphics(gpu, &fw_cap, &mut loader);
         Ok((loader, pool))
     })
     .ok_or(Error::Unsupported)
@@ -699,6 +700,86 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
     })?
 }
 
+/// Bring Raphael's graphics engines up on the display path's pool, once its
+/// PSP session loaded the graphics set and the RLC autoload completed. A
+/// failure is reported and leaves the display as it is; the owner is returned
+/// either way, since an engine may still reach memory it published.
+async fn graphics_boot(pool: &Pool) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
+    use core::fmt::Write as _;
+    let authority = crate::amdgpu::pci_authority()?;
+    let device = crate::amdgpu::pci_device()?;
+    // SAFETY: this display owner holds the whole GPU after the boot handoff:
+    // no other graphics owner exists, the pool is its free carve-out, and the
+    // PSP has loaded the graphics set. Construction performs no register I/O.
+    let boot = crate::amdgpu::with_controller(|gpu| unsafe {
+        crate::amdgpu_raphael_boot::ColdBoot::new(gpu, authority, pool, device)
+    })?;
+    let mut boot = match boot {
+        Ok(boot) => boot,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics refused: {error:?}"
+            );
+            return None;
+        }
+    };
+    // SAFETY: as above, and the RLC autoload has completed.
+    match unsafe { boot.run() }.await {
+        Ok(report) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics up: smu {:#x}, {} CUs, RB mask {:#x}",
+                report.smu.smu,
+                report.topology.active_cus,
+                report.topology.enabled_rb_mask
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics failed: {error:?}"
+            );
+        }
+    }
+    Some(boot)
+}
+/// On Raphael, hand the loader the graphics set so its PSP session loads every
+/// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
+/// autoload, instead of DMCUB alone; `amdgpu_raphael_boot` then brings the
+/// engines up. `amdgpu.rdna2_accel=0` keeps the display-only load. A set that
+/// cannot be opened or does not match the DMCUB the loader validated leaves
+/// the display path as it was, and says why.
+fn graphics(
+    gpu: &AmdGpu,
+    fw_cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    loader: &mut Loader,
+) {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did).is_none() {
+        return;
+    }
+    if !crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).accel {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: graphics firmware not loaded (amdgpu.rdna2_accel=0)"
+        );
+        return;
+    }
+    let result = crate::amdgpu_gfx_navi22::Firmware::open_raphael(gpu, fw_cap)
+        .map_err(|e| alloc::format!("{e:?}"))
+        .and_then(|set| {
+            loader
+                .set_graphics(set)
+                .map_err(|e| alloc::format!("{e:?}"))
+        });
+    if let Err(why) = result {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: graphics firmware not loaded ({why}); display only"
+        );
+    }
+}
 /// A hub pixel pipe is free when it is blanked and its timing generator is
 /// stopped; claiming one that is not would disturb a live scanout. These are the
 /// same two signals the boot inventory uses to decide a surface is in use.
@@ -869,6 +950,9 @@ struct Display {
     pool: Arc<Pool>,
     stream: Option<Stream>,
     attempted: bool,
+    /// Raphael's graphics engines, retained whether or not their bring-up
+    /// finished: an engine may still reach memory it published.
+    graphics: Option<crate::amdgpu_raphael_boot::ColdBoot>,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
@@ -904,6 +988,7 @@ pub(crate) fn start() -> bool {
         pool,
         stream: None,
         attempted: false,
+        graphics: None,
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();
@@ -925,6 +1010,9 @@ pub(crate) fn start() -> bool {
                 // Retain both the owner and busy phase after a partial boot.
                 // No attach fallback can race an outstanding PSP command.
                 return;
+            }
+            if display.loader.graphics_booted() {
+                display.graphics = graphics_boot(&display.pool).await;
             }
         }
         crate::amdgpu_usbc::finish_cycle();
