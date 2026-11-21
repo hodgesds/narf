@@ -136,13 +136,19 @@ pub fn dense() -> impl Iterator<Item = u32> {
 /// GC BASE_IDX 1 dword segment; `steering` is
 /// `gfx_v10_0_init_pa_sc_tile_steering_override` (0 on GC 10.3).
 pub fn csb(gc1: u32, steering: u32) -> Option<[u32; CSB_DWORDS]> {
+    let mut out = [0; CSB_DWORDS];
+    csb_into(gc1, steering, &mut out)?;
+    Some(out)
+}
+/// [`csb`] into caller storage, so a heap buffer never passes through a
+/// 3.8 KB stack array (and the frame copies the by-value form makes).
+pub fn csb_into(gc1: u32, steering: u32, out: &mut [u32; CSB_DWORDS]) -> Option<()> {
     let steering_index = gc1
         .checked_add(PA_SC_TILE_STEERING_OVERRIDE)?
         .checked_sub(SET_CONTEXT_REG_START)?;
     if steering_index >= 0x400 {
         return None; // not a context register; the base is wrong
     }
-    let mut out = [0; CSB_DWORDS];
     let mut n = 0;
     let mut push = |v| {
         out[n] = v;
@@ -167,7 +173,7 @@ pub fn csb(gc1: u32, steering: u32) -> Option<[u32; CSB_DWORDS]> {
     push(PREAMBLE_END_CLEAR_STATE);
     push(packet3(PACKET3_CLEAR_STATE, 0));
     push(0);
-    Some(out)
+    Some(())
 }
 
 #[cfg(feature = "kernel-test")]

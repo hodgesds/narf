@@ -1087,6 +1087,16 @@ pub(crate) struct GfxEngine<I: Io> {
     /// does not rewrite them after other engines started.
     pub golden: bool,
 }
+/// `gfx_v10_0_get_csb_buffer` for GC segment 1, built on the heap. By value,
+/// its 3.8 KB array sat (copied three times) in the frames of the async
+/// engine steps that emit it, past the kernel's 8 KiB frame budget.
+fn clear_state(gc1: u32) -> Result<alloc::boxed::Box<[u32]>, Error> {
+    use crate::amdgpu_clearstate_gfx10 as cs;
+    let mut csb = alloc::vec![0; cs::CSB_DWORDS].into_boxed_slice();
+    let out: &mut [u32; cs::CSB_DWORDS] = (&mut *csb).try_into().map_err(|_| Error::Invalid)?;
+    cs::csb_into(gc1, 0, out).ok_or(Error::Unsupported)?;
+    Ok(csb)
+}
 fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     let rows =
         crate::amdgpu_rdna2::golden::for_gc(l.profile.gc_version).ok_or(Error::Unsupported)?;
@@ -1146,8 +1156,7 @@ impl<I: Io> GfxEngine<I> {
         self.finish(result, GfxState::Configured)
     }
     async fn configure_inner(&mut self) -> Result<(), Error> {
-        let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
-            .ok_or(Error::Unsupported)?;
+        let csb = clear_state(self.hw.layout.segment(1))?;
         let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             checked(io.read(l.reg(GRBM_CNTL)))?;
@@ -1362,8 +1371,7 @@ impl<I: Io> GfxEngine<I> {
                 Ok((checked(io.read(l.reg(CP_STAT)))? == 0).then_some(()))
             })
             .await;
-        let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
-            .ok_or(Error::Unsupported)?;
+        let csb = clear_state(self.hw.layout.segment(1))?;
         let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             queue.emit(io, &csb)?;

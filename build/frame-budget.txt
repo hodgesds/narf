@@ -39,7 +39,6 @@
 13560 narf_drivers_wireless_ath10k::ath10k::interface::publish_with_mac
 12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
 12408 narf_scheduler::block_on_inner
-12216 <narf_drivers_gpu::amdgpu_rdna2_boot::Hardware as narf_drivers_gpu::amdgpu_rdna2_boot::Backend>::step::{{closure}}
 11984 narf_drivers_wireless_mt76::mt7921::firmware_transport::KeyWork<T>::prepare
 11896 narf_drivers_wireless_ath10k::ath10k::interface::ap::<impl narf_drivers_wireless_ath10k::ath10k::interface::Device<T>>::ap_control::{{closure}}
 11640 narf_drivers_wireless_iwlwifi::iwlwifi::connection::Connection::associate_links_in_domain::{{closure}}
