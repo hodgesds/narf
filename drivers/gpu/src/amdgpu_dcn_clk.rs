@@ -15,6 +15,7 @@
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as discovery,
+    amdgpu_smn::{NBIO_VERSIONS as NBIO_VERSIONS_315, PCIE_DATA2},
     amdgpu_vram::{Pool, Reservation},
 };
 use core::{
@@ -54,12 +55,6 @@ const MSG_SMN_315: u32 = 0x03b1_050c; // linux: n/a (DCN 3.1.5 path: mmMP1_C2PMS
 const MSG_WRITE_RETRIES: u32 = 5; // linux: n/a (DCN 3.1.5 path)
 const MSG_SET_DTBCLK_315: u32 = 0x0a; // linux: n/a (DCN 3.1.5 path)
 const MSG_GET_DPREFCLK_315: u32 = 0x13; // linux: n/a (DCN 3.1.5 path)
-/// `regBIF_BX0_PCIE_INDEX2` / `_DATA2` at NBIO `_BASE_IDX 0`, the same in
-/// `nbio_7_2_0_offset.h` and `nbio_7_7_0_offset.h` (`nbio_v7_2`/`v7_7`
-/// `get_pcie_index_offset`).
-const PCIE_INDEX2: u64 = 0x0e; // linux: n/a (DCN 3.1.5 path: regBIF_BX0_PCIE_INDEX2)
-const PCIE_DATA2: u64 = 0x0f; // linux: n/a (DCN 3.1.5 path: regBIF_BX0_PCIE_DATA2)
-const NBIO_VERSIONS_315: &[(u8, u8, u8)] = &[(7, 2, 0), (7, 2, 1), (7, 7, 0), (7, 7, 1)];
 /// `DpmClocks_315_t`: seven 4-entry arrays, four 12-byte DF p-states, the
 /// enabled-level counts and the GFX clock range.
 const TABLE_SIZE_315: u64 = 176; // linux: n/a (DCN 3.1.5 path)
@@ -311,27 +306,15 @@ impl Io for Mmio {
         let Some(nbio) = self.nbio else {
             return u32::MAX;
         };
-        // SAFETY: the constructor bounds the NBIO bank through PCIE_DATA2; the
-        // caller excludes every other user of the index/data pair.
-        unsafe {
-            // amdgpu_device_indirect_rreg: index, read back to post it, data.
-            self.regs.write32(nbio + PCIE_INDEX2 * 4, address);
-            self.regs.read32(nbio + PCIE_INDEX2 * 4);
-            self.regs.read32(nbio + PCIE_DATA2 * 4)
-        }
+        // SAFETY: the constructor bounds the NBIO bank through PCIE_DATA2.
+        unsafe { crate::amdgpu_smn::read(&self.regs, nbio, address) }
     }
     fn write_smn(&mut self, address: u32, value: u32) {
         let Some(nbio) = self.nbio else {
             return;
         };
         // SAFETY: as read_smn.
-        unsafe {
-            // amdgpu_device_indirect_wreg: each write read back to post it.
-            self.regs.write32(nbio + PCIE_INDEX2 * 4, address);
-            self.regs.read32(nbio + PCIE_INDEX2 * 4);
-            self.regs.write32(nbio + PCIE_DATA2 * 4, value);
-            self.regs.read32(nbio + PCIE_DATA2 * 4);
-        }
+        unsafe { crate::amdgpu_smn::write(&self.regs, nbio, address, value) }
     }
     fn read_table(&mut self, offset: u64) -> u32 {
         // Firmware wrote this through its own path; order the read after the
@@ -686,8 +669,9 @@ impl ClockManager {
     /// DCN 3.1.4; C2PMSG_37/38 and MP1_C2PMSG_3 on DCN 3.1.5) for this
     /// object's lifetime, holds matching PCI authority and permanent register
     /// and pool mappings, and owns the pool's remaining memory. On DCN 3.1.5
-    /// nothing else may use NBIO's PCIE_INDEX2/DATA2 pair while this object
-    /// sends a message. The table reservation is published to firmware, so it
+    /// the message goes through NBIO's PCIE_INDEX2/DATA2 pair, which
+    /// `amdgpu_smn` serializes against its other users. The table reservation
+    /// is published to firmware, so it
     /// must not be reused unless this object is dropped after firmware stops
     /// writing it.
     pub unsafe fn new(

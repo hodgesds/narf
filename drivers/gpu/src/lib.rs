@@ -239,6 +239,8 @@ pub mod amdgpu_dcn401_spl_filters;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_clk;
 #[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_smn;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_color;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_dccg;
@@ -648,6 +650,8 @@ pub mod amdgpu_dp_bridge;
 pub mod amdgpu_rdna2_vcn;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_apu_telemetry;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_raphael;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48;
 #[cfg(feature = "amdgpu")]

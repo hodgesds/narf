@@ -103,8 +103,19 @@ as now.
      and the graphics set goes up after the TMR alone. The RLC autoload wait
      reads GC 10.3's `CP_STAT` and `RLC_RLCS_BOOTLOAD_STATUS`.
    - Nothing calls the load yet. That is the coordinator (step 8).
-3. SMU 13.0.5 graphics mailbox over SMN: versions, the driver interface check,
-   GFXOFF control, VCN/JPEG power.
+3. ~~SMU 13.0.5 graphics mailbox over SMN: versions, the driver interface
+   check, GFXOFF control, VCN/JPEG power~~ (done, `amdgpu_smu_raphael`).
+   - `MP1_C2PMSG_2/33/34` are SMN 0x3b10508/0x3b10984/0x3b10988 with MP1
+     segment 0 at 0x16000; the constructor refuses any other base.
+   - `start` checks `MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED` (SMN 0x3b10024),
+     then sends GetDriverIfVersion with no pre-poll (`SMU_FW_INIT`) and
+     GetSmuVersion. A driver interface other than 5 is recorded, not refused,
+     as Linux only logs it.
+   - Rejections carry the firmware's status; an unknown response marks the
+     firmware hung (`SMU_FW_HANG`), and nothing more is sent.
+   - The NBIO `PCIE_INDEX2/DATA2` latch is now one lock (`amdgpu_smn`, Linux's
+     `pcie_idx_lock`) shared with the display clock manager's message write.
+     Before, it was only a safety contract.
 4. NBIO 7.2/7.7: doorbell apertures, `ih_control`, the HDP flush register.
 5. GMC: `gfxhub_v2_1` on 10.3.6, `mmhub_v2_3`, a 1 GiB GART in the carve-out.
 6. IH on NBIO 7.x.
