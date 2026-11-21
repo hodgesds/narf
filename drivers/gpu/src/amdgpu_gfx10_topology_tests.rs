@@ -145,9 +145,8 @@ fn layout() -> Layout {
         sdma_high: None,
         gc: [0x1260 * 4, 0xa000 * 4],
         nbio: 0xd20 * 4,
-        hdp: Some(0xf20 * 4),
+        hdp: core::num::NonZeroU64::new(0xf20 * 4),
         oss: 0x10a0 * 4,
-        nbio_v7_2: None,
     }
 }
 struct Fake {
@@ -265,7 +264,7 @@ fn gfx10_topology_revision_does_not_require_gc_harvest() -> TestResult {
         dead: true,
         disabled_sa: 0,
     };
-    if sample_revision(&mut f, &layout()) != Ok(2)
+    if sample_revision(&mut f, &layout(), RCC_DEV0_EPF0_STRAP0) != Ok(2)
         || !f.writes.is_empty()
         || sample(&mut f, &layout(), limits()) != Err(Error::DeviceGone)
         || f.index != BROADCAST

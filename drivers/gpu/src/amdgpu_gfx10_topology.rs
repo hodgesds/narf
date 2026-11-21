@@ -214,10 +214,7 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
-fn sample_revision(io: &mut impl Io, layout: &Layout) -> Result<u8, Error> {
-    let strap = layout.nbio_v7_2.map_or(RCC_DEV0_EPF0_STRAP0, |b| {
-        crate::amdgpu_nbio_v7_2::strap0(b.version)
-    });
+fn sample_revision(io: &mut impl Io, layout: &Layout, strap: u32) -> Result<u8, Error> {
     Ok(((checked(io.read(layout.nbio(strap)))? >> 24) & 0xf) as u8)
 }
 /// The GC revisions whose `gfx_v10_0_setup_rb` and `gfx_v10_0_get_cu_info`
@@ -288,7 +285,9 @@ pub unsafe fn read_revision(
 ) -> Result<u8, Error> {
     let layout = Layout::resolve_rdna2(gpu).map_err(|_| Error::Unsupported)?;
     authority
-        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
+        .invoke(Op(|| {
+            sample_revision(&mut Mmio(gpu.regs), &layout, RCC_DEV0_EPF0_STRAP0)
+        }))
         .map_err(|_| Error::Revoked)?
 }
 /// Raphael's revision strap, from the register its NBIO 7.2 version uses.
@@ -300,8 +299,11 @@ pub unsafe fn read_revision_raphael(
     authority: &Cap<BusDeviceCap, Write>,
 ) -> Result<u8, Error> {
     let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    // nbio_v7_2_get_rev_id's strap register depends on the NBIO version.
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+    let strap = crate::amdgpu_nbio_v7_2::strap0(banks.version);
     authority
-        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout, strap)))
         .map_err(|_| Error::Revoked)?
 }
 /// Sample and derive Raphael's topology, skipping the shader arrays

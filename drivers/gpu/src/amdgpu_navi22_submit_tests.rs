@@ -533,6 +533,7 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(s.start()).is_err() || run(s.test_ib()).is_err() {
         return TestResult::Fail("SDMA bring-up");
@@ -1064,6 +1065,7 @@ fn navi22_vmid_clients_on_two_rings_keep_their_own_translations() -> TestResult 
         .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(s.start()).is_err() || run(s.test_ib()).is_err() {
         return TestResult::Fail("SDMA bring-up");
@@ -1300,7 +1302,7 @@ fn rdna2_sequences_wrap_without_zero_or_false_device_loss() -> TestResult {
     e.queue.seq = u32::MAX;
     e.hw.io.mem.insert(e.queue.address(FENCE), u32::MAX);
     e.hw.io.revoke = Some((
-        crate::amdgpu_cp_navi22::tests::layout().hdp.unwrap() + 0xd1 * 4,
+        crate::amdgpu_cp_navi22::tests::layout().hdp.unwrap().get() + 0xd1 * 4,
         1,
         e.hw.authority,
     ));
@@ -1335,6 +1337,7 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         ],
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(engine.start()).is_err() || run(engine.test_ib()).is_err() {
         return TestResult::Fail("kernel SDMA setup");
@@ -1425,7 +1428,7 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         || words[tail - 3..tail]
             != [
                 14 | (0xf << 28),
-                bank_reg(layout.hdp.unwrap(), HDP_READ_CACHE_INVALIDATE),
+                bank_reg(layout.hdp.unwrap().get(), HDP_READ_CACHE_INVALIDATE),
                 1,
             ]
         || words[tail..] != fence_words[..]

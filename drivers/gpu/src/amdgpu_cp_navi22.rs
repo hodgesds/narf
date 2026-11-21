@@ -150,11 +150,11 @@ pub(crate) struct Layout {
     /// HDP 5.0's bank, whose read cache is invalidated before the CPU samples
     /// engine writes and in every ring/IB frame. HDP 5.2.1 (Raphael) has no
     /// read cache (`hdp_v5_2_funcs` has no `invalidate_hdp`): `None`.
-    pub hdp: Option<u64>,
+    /// Nonzero, so the option costs no space: this layout is copied into every
+    /// register access, and the queue owners' futures carry those copies.
+    pub hdp: Option<core::num::NonZeroU64>,
     /// OSSSYS segment 0: the IH VMID LUT a client job's flush writes.
     pub oss: u64,
-    /// NBIO 7.2's banks, for the registers it moved off segment 2.
-    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -202,19 +202,21 @@ impl Layout {
                 2,
                 LAST_NBIO,
             )?,
-            hdp: Some(reg(
-                ip::HW_ID_HDP,
-                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
-                0,
-                0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-            )?),
+            hdp: Some(
+                core::num::NonZeroU64::new(reg(
+                    ip::HW_ID_HDP,
+                    &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                    0,
+                    0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+                )?)
+                .ok_or(Error::Unsupported)?,
+            ),
             oss: reg(
                 ip::HW_ID_OSSSYS,
                 oss_versions,
                 0,
                 crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
             )?,
-            nbio_v7_2: None,
         };
         Self::validated(gpu, layout)
     }
@@ -251,7 +253,6 @@ impl Layout {
                 0,
                 crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
             )?,
-            nbio_v7_2: Some(nbio),
         };
         Self::validated(gpu, layout)
     }
@@ -288,7 +289,7 @@ impl Layout {
     /// HDP 5.0's `HDP_READ_CACHE_INVALIDATE`, if this HDP has a read cache.
     pub(crate) fn hdp_invalidate(&self) -> Option<u64> {
         // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-        self.hdp.map(|hdp| hdp + 0xd1 * 4)
+        self.hdp.map(|hdp| hdp.get() + 0xd1 * 4)
     }
     /// A register whose all-ones read means the device is gone: HDP 5.0's
     /// invalidate (read back after the write that invalidates), or, where HDP

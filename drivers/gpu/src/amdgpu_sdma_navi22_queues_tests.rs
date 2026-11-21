@@ -18,6 +18,7 @@ fn engine(model: Model) -> (Pool, Engine<Model>) {
             queues: queues.into(),
             state: State::Prepared,
             proof: Proof::default(),
+            nbio_v7_2: None,
         },
     )
 }

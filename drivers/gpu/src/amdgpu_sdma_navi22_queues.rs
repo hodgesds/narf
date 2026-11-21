@@ -49,6 +49,9 @@ pub(crate) struct Engine<I: Io> {
     pub queues: Vec<Queue>,
     pub state: State,
     pub proof: Proof,
+    /// NBIO 7.2's banks, whose single SDMA doorbell range is GDC0's; `None`
+    /// on NBIO 2.3, which has one range per engine on segment 2.
+    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 fn reg(l: Layout, instance: u32, r: Reg) -> u64 {
     l.sdma(instance, r)
@@ -166,6 +169,7 @@ impl<I: Io> Engine<I> {
         let q = &mut self.queues[i as usize];
         let (base, rptr, wptr, index) =
             (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
+        let nbio_v7_2 = self.nbio_v7_2;
         self.hw.access(|io, l| {
             let r = |reg_: Reg| reg(l, i, reg_);
             io.write(r(SDMA0_SEM_WAIT_FAIL_TIMER_CNTL), 0);
@@ -199,7 +203,7 @@ impl<I: Io> Engine<I> {
             // linux-lit: 0x0fff_fffc=SDMA0_GFX_DOORBELL_OFFSET__OFFSET_MASK@gc
             // linux-lit: 2=SDMA0_GFX_DOORBELL_OFFSET__OFFSET__SHIFT@gc
             update(io, r(SDMA0_GFX_DOORBELL_OFFSET), 0x0fff_fffc, index << 2)?;
-            match l.nbio_v7_2 {
+            match nbio_v7_2 {
                 None => {
                     // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
                     let range = l.nbio(
@@ -490,6 +494,11 @@ impl Sdma {
                 queues,
                 state: State::Prepared,
                 proof: Proof::default(),
+                nbio_v7_2: if layout.profile == &crate::amdgpu_rdna2::RAPHAEL {
+                    Some(crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?)
+                } else {
+                    None
+                },
             },
         })
     }

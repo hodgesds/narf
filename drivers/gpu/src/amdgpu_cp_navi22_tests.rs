@@ -28,9 +28,8 @@ pub(crate) fn layout() -> Layout {
         sdma_high: None,
         gc: [GC0, GC1],
         nbio: NBIO,
-        hdp: Some(HDP),
+        hdp: core::num::NonZeroU64::new(HDP),
         oss: OSS,
-        nbio_v7_2: None,
     }
 }
 pub(crate) fn pool(len: u64) -> Pool {
@@ -1508,11 +1507,9 @@ pub(crate) fn raphael_cp_gpu() -> AmdGpu {
 /// discrete GPU are refused, and the discrete layout refuses Raphael.
 fn raphael_cp_layout_takes_only_raphaels_blocks() -> TestResult {
     let gpu = raphael_cp_gpu();
-    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(&gpu).unwrap();
     let expected = Layout {
         profile: &crate::amdgpu_rdna2::RAPHAEL,
         hdp: None,
-        nbio_v7_2: Some(banks),
         ..layout()
     };
     if Layout::resolve_raphael(&gpu) != Ok(expected)
