@@ -93,7 +93,10 @@ const CONFIG_BUF: usize = 512;
 // ── Bring-up stages ────────────────────────────────────────────────────────
 const ST_CONFIGURE: u32 = 1;
 const ST_READ_CFG: u32 = 2;
+/// Enumerated: endpoints configured + chip-config word read.
 const ST_UP: u32 = 3;
+/// Firmware blob fetched (`narf_firmware_*`) and its header validated.
+const ST_FW_PARSED: u32 = 4;
 const ST_FAILED: u32 = 0xff;
 /// Single outstanding-URB event kind (one request in flight per device).
 const EV_SETUP: u64 = 1;
@@ -137,6 +140,91 @@ unsafe extern "C" {
         out_urb: *mut u64,
     ) -> i32;
     fn narf_usb_poll(dev: u64, urb: u64, buf: *mut u8, len: usize, out_len: *mut usize) -> i32;
+    fn narf_firmware_open(
+        name: *const u8,
+        name_len: usize,
+        out_handle: *mut u64,
+        out_size: *mut usize,
+    ) -> i32;
+    fn narf_firmware_read(
+        handle: u64,
+        offset: u64,
+        buf: *mut u8,
+        len: usize,
+        out_len: *mut usize,
+    ) -> i32;
+    fn narf_firmware_close(handle: u64) -> i32;
+}
+
+/// rtw88 firmware header length (`firmware_transport.rs::HEADER`).
+const FW_HEADER: usize = 64;
+/// Per-section checksum trailer (`firmware_transport.rs::CHECKSUM`).
+const FW_CHECKSUM: usize = 8;
+/// `firmware_transport.rs::MAX_IMAGE`.
+const FW_MAX_IMAGE: usize = 1024 * 1024;
+
+/// The registered firmware blob name for a representative chip `did`
+/// (`firmware_transport.rs::filename`).
+fn fw_name(did: u16) -> Option<&'static str> {
+    match did {
+        0xC821 => Some("rtw88/rtw8821c_fw.bin"),
+        0xB822 => Some("rtw88/rtw8822b_fw.bin"),
+        _ => None,
+    }
+}
+
+/// Little-endian u32 at `off` (bounds-checked; `None` on overrun).
+fn word(bytes: &[u8], off: usize) -> Option<u32> {
+    bytes
+        .get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Validate the 64-byte rtw88 firmware header for `did` against the total blob
+/// `size`, returning the firmware version. A faithful header-level port of
+/// `firmware_transport.rs::parse` (section OCP bases/sizes + checksum trailers
+/// must exactly span the blob); it does not copy the section bodies.
+fn parse_fw_header(did: u16, header: &[u8], size: usize) -> Result<u16, ()> {
+    let signature: [u8; 2] = match did {
+        0xC821 => [0x21, 0x88],
+        0xB822 => [0x22, 0x88],
+        _ => return Err(()),
+    };
+    if header.len() < FW_HEADER
+        || !(FW_HEADER..=FW_MAX_IMAGE).contains(&size)
+        || header[..2] != signature
+    {
+        return Err(());
+    }
+    let imem_base = if did == 0xB822 { 0 } else { 0x30000 };
+    let has_emem = header[0x18] & 0x10 != 0 && word(header, 0x34).ok_or(())? != 0;
+    // (kind base, limit, size-field, address-field, enabled)
+    let plan = [
+        (0x20_0000u32, 0x30_0000u32, 0x24usize, 0x20usize, true),
+        (imem_base, 0x10_0000, 0x30, 0x3c, true),
+        (0x10_0000, 0x20_0000, 0x34, 0x38, has_emem),
+    ];
+    let mut offset = FW_HEADER;
+    for (base, limit, size_at, addr_at, enabled) in plan {
+        if !enabled {
+            continue;
+        }
+        let sec_size = word(header, size_at).ok_or(())?;
+        let address = word(header, addr_at).ok_or(())? & 0x7fff_ffff;
+        let length = sec_size.checked_add(FW_CHECKSUM as u32).ok_or(())?;
+        if sec_size == 0
+            || address != base
+            || address.checked_add(length).is_none_or(|end| end > limit)
+        {
+            return Err(());
+        }
+        offset = offset.checked_add(length as usize).ok_or(())?;
+    }
+    // The header's sections + checksums must span exactly the blob.
+    if offset != size {
+        return Err(());
+    }
+    Ok(u16::from_le_bytes([header[4], header[5]]))
 }
 
 /// One claimed USB device's enumerate state. One outstanding URB at a time,
@@ -150,6 +238,11 @@ struct Device {
     config_value: AtomicU32,
     urb: AtomicU64,
     chip_cfg: AtomicU32,
+    /// Representative chip `did` (set by the per-chip probe) selecting the
+    /// firmware name and header signature.
+    did: AtomicU32,
+    /// Parsed firmware version once `ST_FW_PARSED` is reached.
+    fw_version: AtomicU32,
 }
 
 impl Device {
@@ -163,6 +256,8 @@ impl Device {
             config_value: AtomicU32::new(0),
             urb: AtomicU64::new(0),
             chip_cfg: AtomicU32::new(0),
+            did: AtomicU32::new(0),
+            fw_version: AtomicU32::new(0),
         }
     }
 
@@ -239,11 +334,22 @@ fn claim(token: u64) -> Option<usize> {
     })
 }
 
-extern "C" fn probe_c(dev_token: u64, _reserved: u64) -> i32 {
+/// RTL8821CU devices probe with the 8821c firmware/header identity.
+extern "C" fn probe_8821cu(dev_token: u64, _reserved: u64) -> i32 {
+    start_probe(dev_token, 0xC821)
+}
+
+/// RTL8822BU devices probe with the 8822b firmware/header identity.
+extern "C" fn probe_8822bu(dev_token: u64, _reserved: u64) -> i32 {
+    start_probe(dev_token, 0xB822)
+}
+
+fn start_probe(dev_token: u64, did: u16) -> i32 {
     let Some(slot) = claim(dev_token) else {
         return EBUSY;
     };
     let dev = &DEVICES[slot];
+    dev.did.store(u32::from(did), Ordering::Relaxed);
 
     // Configuration descriptor is a synchronous read. Uninitialised on purpose
     // (no `memset` in the `.ko`): the kernel writes `cfg_len` bytes and only
@@ -357,8 +463,49 @@ fn on_setup(dev: &Device, slot: usize) {
             dev.chip_cfg
                 .store(u32::from_le_bytes(buf), Ordering::Release);
             dev.stage.store(ST_UP, Ordering::Release);
+            // Enumeration proven; fetch + validate the firmware blob. The
+            // `narf_firmware_*` calls are synchronous (no URB), so this runs
+            // inline on this completion.
+            if fetch_and_parse_firmware(dev) {
+                dev.stage.store(ST_FW_PARSED, Ordering::Release);
+            } else {
+                dev.stage.store(ST_FAILED, Ordering::Release);
+            }
         }
         _ => {}
+    }
+}
+
+/// Fetch this chip's firmware through the `narf_firmware_*` ABI and validate
+/// its header. The section-download to the chip (cpu reset, download-enable,
+/// reserved-page bulk writes, checksum) is the next sub-stage.
+fn fetch_and_parse_firmware(dev: &Device) -> bool {
+    let did = dev.did.load(Ordering::Acquire) as u16;
+    let Some(name) = fw_name(did) else {
+        return false;
+    };
+    let mut handle = 0u64;
+    let mut size = 0usize;
+    // SAFETY: `name` is 'static readable; `handle`/`size` are writable.
+    let rc = unsafe { narf_firmware_open(name.as_ptr(), name.len(), &mut handle, &mut size) };
+    if rc != 0 {
+        return false;
+    }
+    let mut header = [0u8; FW_HEADER];
+    let mut got = 0usize;
+    // SAFETY: `header` is writable for its length; `got` is writable.
+    let rc = unsafe { narf_firmware_read(handle, 0, header.as_mut_ptr(), header.len(), &mut got) };
+    // SAFETY: `handle` came from the matching open above.
+    let close = unsafe { narf_firmware_close(handle) };
+    if rc != 0 || got < FW_HEADER || close != 0 {
+        return false;
+    }
+    match parse_fw_header(did, &header, size) {
+        Ok(version) => {
+            dev.fw_version.store(u32::from(version), Ordering::Release);
+            true
+        }
+        Err(()) => false,
     }
 }
 
@@ -381,9 +528,12 @@ extern "C" fn on_event(cookie: u64) -> i32 {
 pub fn register() {
     const NAME_8821CU: &[u8] = b"rtw88-8821cu-usb-module";
     const NAME_8822BU: &[u8] = b"rtw88-8822bu-usb-module";
-    for (name, ids) in [(NAME_8821CU, RTL8821CU_IDS), (NAME_8822BU, RTL8822BU_IDS)] {
+    for (name, ids, probe) in [
+        (NAME_8821CU, RTL8821CU_IDS, probe_8821cu as usize),
+        (NAME_8822BU, RTL8822BU_IDS, probe_8822bu as usize),
+    ] {
         for &(vendor, product) in ids {
-            // SAFETY: `name` is 'static; `probe_c` is a valid extern "C" fn; the
+            // SAFETY: `name` is 'static; `probe` is a valid extern "C" fn; the
             // loader unregisters every match before unmapping this image.
             unsafe {
                 narf_register_usb_driver(
@@ -395,7 +545,7 @@ pub fn register() {
                     0,
                     0,
                     0,
-                    probe_c as usize,
+                    probe,
                 );
             }
         }

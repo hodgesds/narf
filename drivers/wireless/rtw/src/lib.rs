@@ -55,7 +55,7 @@ narf_driver! {
         author: "narf",
         description: "Realtek RTW88/RTW89 PCIe Wi-Fi + RTL8821CU/8822BU USB",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,Firmware:Read",
     },
     register: do_register,
 }
