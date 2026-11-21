@@ -791,6 +791,21 @@ async fn media_boot(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot, loader:
         }
     }
 }
+/// Publish a completed Raphael graphics boot to clients: its submitter,
+/// VMIDs and heap, then `ACCEL_WORKING`. `graphics` loaded the set only with
+/// `amdgpu.rdna2_accel` on, the switch the discrete boot turns this on with.
+fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
+    if !graphics.queues_verified() {
+        return;
+    }
+    crate::amdgpu_navi22_cs::register_raphael(graphics);
+    if crate::amdgpu_navi22_cs::drm_card()
+        .and_then(crate::amdgpu_cs::submitter)
+        .is_some()
+    {
+        crate::amdgpu_info_navi22::set_accel(true);
+    }
+}
 /// On Raphael, hand the loader the graphics set so its PSP session loads every
 /// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
 /// autoload, instead of DMCUB alone; `amdgpu_raphael_boot` then brings the
@@ -1003,6 +1018,20 @@ struct Display {
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
+/// The display owner, locked for Raphael's client path
+/// (`amdgpu_rdna2_client`): the graphics coordinator lives beside the PSP
+/// session that loaded it, so a client job takes the same lock the display
+/// task holds across its bring-up and modesets.
+pub(crate) struct Graphics(narf_lib::mutex::MutexGuard<'static, Option<Display>>);
+impl Graphics {
+    pub(crate) fn get(&mut self) -> Option<&mut crate::amdgpu_raphael_boot::ColdBoot> {
+        self.0.as_mut()?.graphics.as_mut()
+    }
+}
+pub(crate) async fn graphics_owner() -> Graphics {
+    Graphics(DISPLAY.lock().await)
+}
+
 pub(crate) fn start() -> bool {
     // Every `false` below means "the native path did not take"; the caller
     // then falls back to attaching to running DAL firmware, which leaves the
@@ -1066,6 +1095,7 @@ pub(crate) fn start() -> bool {
                     alloc::boxed::Box::pin(graphics_boot(&display.pool, firmware)).await;
                 if let Some(graphics) = display.graphics.as_mut() {
                     alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
+                    serve_clients(graphics);
                 }
             }
         }

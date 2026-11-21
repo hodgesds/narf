@@ -259,11 +259,11 @@ display owner beside the PSP session that loaded them. So the work is to
 route those modules to it, not to write a second client backend.
 
 10. Publish acceleration:
-    1. Fence wakes. The FenceInterrupts stage subscribes the CP EOP, SDMA0
+    1. ~~Fence wakes~~ (done). The FenceInterrupts stage subscribes the CP EOP, SDMA0
        trap and CP fault sources through Navi22's `route_fences`, so client
        fences wake on interrupts. Without that they wait out the throttle
        deadline.
-    2. Identity. INFO answers Raphael through `amdgpu_info_navi22` with
+    2. ~~Identity~~ (done). INFO answers Raphael through `amdgpu_info_navi22` with
        `amdgpu_kms.c`'s APU rules:
        - `AMDGPU_FAMILY_GC_10_3_6`;
        - chip_rev from `nbio_v7_2_get_rev_id`, external_rev = rev + 1
@@ -277,12 +277,18 @@ route those modules to it, not to write a second client backend.
          the TOC).
        The coordinator publishes topology, chip and PCI revision. ACCEL
        stays off.
-    3. Submission. A small owner seam (`amdgpu_rdna2_client`) lets the RDNA2
+    3. ~~Submission~~ (done). A small owner seam (`amdgpu_rdna2_client`) lets the RDNA2
        submitter lock Navi22's cold boot or Raphael's coordinator. After
        graphics boots, Raphael registers the submitter, GFXHUB client VMIDs
        1–7 and a visible client heap from the carve-out (an APU has no
        hidden VRAM). ACCEL_WORKING and `available_rings` (one SDMA) follow
-       from that.
+       from that. Also needed:
+       - live READ_MMR_REG through the coordinator: nv.c's list, with no
+         GFXOFF reference, since GFXOFF stays disallowed;
+       - DRM version 3.64;
+       - the client frames drop the HDP read-cache invalidate.
+       All of it is unproven on silicon: the tests cover the layouts,
+       frames and INFO replies, not a Mesa context.
     4. Media rings: VCN decode/encode and JPEG for clients. `begin_use` /
        idle power goes through SMU 13.0.5 (`PowerUpVcn` / `PowerDownVcn`)
        where Navi22 uses SMU 11.

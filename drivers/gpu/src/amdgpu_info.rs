@@ -1807,6 +1807,12 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
     if which == uapi::AMDGPU_INFO_READ_MMR_REG && !rdna2 {
         return None;
     }
+    // Raphael's owner keeps no PMFW telemetry: sensors and the timestamp take
+    // the snapshot replies (ENOENT, ENODEV), as before it served clients.
+    let raphael = rdna2 && raphael(&snap).is_some();
+    if raphael && which != uapi::AMDGPU_INFO_READ_MMR_REG {
+        return None;
+    }
     Some(
         async {
             let pointer = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -1826,9 +1832,16 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
                 u32::from_le_bytes(bytes[16 + i * 4..20 + i * 4].try_into().unwrap())
             });
             crate::amdgpu_rdna2_mmr::validate(payload)?;
-            let (_power, owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
-            let boot = owner.as_ref().ok_or(FsError::NoDevice)?;
-            let reply = boot.read_mmr(payload, snap.navi22.topology.map(|t| t.gb_addr_config))?;
+            let cached_gb = snap.navi22.topology.map(|t| t.gb_addr_config);
+            let reply = if raphael {
+                let mut graphics = crate::amdgpu_platform::graphics_owner().await;
+                let boot = graphics.get().ok_or(FsError::NoDevice)?;
+                boot.read_mmr(payload, cached_gb)?
+            } else {
+                let (_power, owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
+                let boot = owner.as_ref().ok_or(FsError::NoDevice)?;
+                boot.read_mmr(payload, cached_gb)?
+            };
             // SAFETY: nonzero user pointer, bounded by the caller's return_size;
             // copy_out performs SMAP bracketing and address validation.
             unsafe {

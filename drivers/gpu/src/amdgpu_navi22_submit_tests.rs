@@ -21,6 +21,60 @@ const DST_MC: u64 = 0x9_2000_0000;
 
 const PASID: u16 = 0x0042;
 
+/// Raphael's client frames keep HDP's write flush (NBIO 7.2's request/done
+/// pair sits at NBIO 2.3's offsets) and drop the read-cache invalidate that
+/// HDP 5.2.1 does not have, on the CP and SDMA rings alike.
+fn raphael_client_frames_drop_the_hdp_invalidate() -> TestResult {
+    let navi22 = crate::amdgpu_cp_navi22::tests::layout();
+    let raphael = crate::amdgpu_cp_navi22::Layout {
+        hdp: None,
+        ..navi22
+    };
+    let ibs = [Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: 0,
+    }];
+    let frame = Frame {
+        gfx: true,
+        engine: 4,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    let sdma = Frame {
+        gfx: false,
+        engine: 13,
+        ..frame
+    };
+    let hdp = 0xf20 + 0xd1;
+    for (with, without) in [
+        (encode_cp(navi22, &frame), encode_cp(raphael, &frame)),
+        (encode_sdma(navi22, &sdma), encode_sdma(raphael, &sdma)),
+    ] {
+        let flush = 6;
+        if !with.contains(&hdp)
+            || without.contains(&hdp)
+            || with.get(..flush) != without.get(..flush)
+        {
+            return TestResult::Fail("Raphael client frames kept the HDP invalidate");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/raphael",
+    raphael_client_frames_drop_the_hdp_invalidate
+);
+
 fn navi22_client_hdp_commands_bracket_ibs() -> TestResult {
     let layout = crate::amdgpu_cp_navi22::tests::layout();
     let ibs = [Ib {

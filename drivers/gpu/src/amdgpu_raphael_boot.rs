@@ -27,8 +27,9 @@
 //!
 //! Construction reserves memory and maps the doorbell page but performs no
 //! register I/O. A failure stops the sequence at its stage; the display path
-//! that preceded it is unaffected. Nothing here publishes acceleration to
-//! userspace.
+//! that preceded it is unaffected. After a completed run the display owner
+//! hands the verified queues to clients (`amdgpu_navi22_cs::register_raphael`,
+//! through `amdgpu_rdna2_client`).
 use crate::{
     amdgpu::AmdGpu, amdgpu_cp_navi22 as cp, amdgpu_gmc_navi22 as gmc, amdgpu_ih_navi22 as ih,
     amdgpu_kiq_navi22 as kiq, amdgpu_sdma_navi22 as sdma, amdgpu_sdma_navi22_queues as sdma_queues,
@@ -217,6 +218,115 @@ impl ColdBoot {
     /// The live memory-hub owner after a completed boot.
     pub fn memory(&mut self) -> Option<&mut gmc::Gmc> {
         matches!(self.state, State::Ready(_)).then_some(&mut *self.gmc)
+    }
+
+    // ── Client work (amdgpu_navi22_cs through amdgpu_rdna2_client) ──────
+    /// A completed run: every kernel queue passed its ring and IB tests.
+    pub fn queues_verified(&self) -> bool {
+        matches!(self.state, State::Ready(_))
+    }
+    /// Queue a client job on a verified kernel queue, as Navi22's owner does.
+    pub(crate) fn submit(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+        state: &mut crate::amdgpu_navi22_submit::RingState,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        context: u64,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+    ) -> Result<u32, cp::Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(cp::Error::DeviceGone);
+        }
+        if ring == Ring::Compute {
+            state.configure_gds(self.gpu.gc_info);
+        }
+        match ring {
+            Ring::Gfx => self.gfx.submit(state, vm, context, ibs),
+            Ring::Compute => self.compute.submit(state, vm, context, ibs),
+            Ring::Sdma(i) => self.queues.submit(i, state, vm, context, ibs),
+        }
+    }
+    pub(crate) fn fences(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+    ) -> Result<(u32, u32), cp::Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(cp::Error::DeviceGone);
+        }
+        match ring {
+            Ring::Gfx => self.gfx.fences(),
+            Ring::Compute => self.compute.fences(),
+            Ring::Sdma(i) => self.queues.fences(i),
+        }
+    }
+    /// Lock-free fence reader over the verified kernel queues. Raphael's one
+    /// SDMA leaves the other SDMA slots absent, so no client reaches them.
+    pub fn client_fence_reader(&self) -> Option<cp::FenceReader> {
+        if !self.queues_verified() {
+            return None;
+        }
+        Some(self.gfx.fence_reader([
+            Some(self.gfx.fence_map()),
+            Some(self.compute.fence_map()),
+            self.queues.fence_map(0),
+            self.queues.fence_map(1),
+            self.queues.fence_map(2),
+            self.queues.fence_map(3),
+        ]))
+    }
+    /// Lend the GFXHUB client VMIDs (1..`first_kfd_vmid`), as Navi22 does.
+    pub fn reserve_client_vmids(&mut self) -> Result<gmc::ClientVmids, Error> {
+        self.memory()
+            .ok_or(Error::Busy)?
+            .reserve_client_vmids()
+            .map_err(Error::MemoryHubs)
+    }
+    /// Half of the carve-out the display left, as a client heap: Navi22's
+    /// policy. Everything an APU's pool holds is CPU-mapped.
+    pub fn reserve_client_vram(
+        &mut self,
+    ) -> Result<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap), Error> {
+        const ALIGN: u64 = 2 << 20; // linux: n/a (NARF policy, client heap alignment)
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let (fb_base, fb_offset) = self.gmc.framebuffer().ok_or(Error::Invalid)?;
+        let size = (self.pool.available() / 2) & !(ALIGN - 1);
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        let mut chunk = self
+            .pool
+            .reserve_aligned(size, ALIGN)
+            .map_err(|_| Error::Allocation)?;
+        // SAFETY: the reservation is this heap's alone, inside the owned,
+        // CPU-mapped carve-out the display path's pool covers.
+        let pool = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
+            .map_err(|_| Error::Allocation)?;
+        chunk.publish();
+        Ok((
+            chunk,
+            crate::amdgpu_gem::VramHeap {
+                pool,
+                fb_base,
+                fb_offset,
+                unmapped: None,
+            },
+        ))
+    }
+    /// `AMDGPU_INFO_READ_MMR_REG` from nv.c's allow-list. GFXOFF stays
+    /// disallowed after the Smu stage, so GC answers without a reference.
+    pub(crate) fn read_mmr(
+        &self,
+        payload: [u32; 4],
+        cached_gb: Option<u32>,
+    ) -> Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> {
+        if !self.queues_verified() {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        crate::amdgpu_rdna2_mmr::read(&self.gpu, &self.authority, payload, cached_gb)
     }
     /// Run every stage once. A failed or cancelled run cannot be replayed:
     /// the state records the stage before it starts.

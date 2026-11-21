@@ -6,13 +6,19 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_filesystem::FsError;
 
 use crate::amdgpu_rdna2::READ_MMR_GC as GC;
+/// The RDNA2 profile: a discrete part, or Raphael (whose GC 10.3.6 shares
+/// nv.c's list and the GC 10.3 header).
+fn profile(gpu: &AmdGpu) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+    crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+        .or_else(|| crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did))
+}
 fn base(gpu: &AmdGpu, hw: u16) -> Option<u32> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
         .filter(|b| b.hw_id == hw && b.instance == 0);
     let block = blocks.next()?;
-    let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)?;
+    let profile = profile(gpu)?;
     let expected = if hw == discovery::HW_ID_GC {
         profile.gc_version
     } else {
@@ -52,8 +58,7 @@ pub(crate) fn read(
     cached_gb: Option<u32>,
 ) -> Result<Vec<u8>, FsError> {
     let (offset, count) = validate(payload)?;
-    let profile =
-        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(FsError::NoDevice)?;
+    let profile = profile(gpu).ok_or(FsError::NoDevice)?;
     let gc = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_GC, 0).ok_or(FsError::NoDevice)?;
     if (gc.major, gc.minor, gc.revision) != profile.gc_version
         || base(gpu, discovery::HW_ID_GC).is_none()
@@ -150,5 +155,36 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/rdna2",
         rdna2_live_mmr_allowlist_and_authority
+    );
+    /// Raphael's GC 10.3.6 serves nv.c's list through its own profile, the
+    /// cached GB_ADDR_CONFIG included; its one SDMA leaves SDMA1's status
+    /// register unreachable.
+    fn raphael_live_mmr_follows_its_profile() -> TestResult {
+        let mut memory = alloc::vec![0u32; 0x20000];
+        let mut gpu = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+        gpu.regs.virt = memory.as_mut_ptr() as u64;
+        gpu.regs.len = memory.len() as u64 * 4;
+        let (Some(gc), Some(sdma0)) = (
+            base(&gpu, discovery::HW_ID_GC),
+            base(&gpu, discovery::HW_ID_SDMA0),
+        ) else {
+            return TestResult::Fail("Raphael's GC or SDMA bank refused");
+        };
+        let at = gc + 0x0e24;
+        memory[at as usize] = 0x5a5a;
+        let cap = Cap::bootstrap();
+        if read(&gpu, &cap, [at, 1, 0xffff, 0], None) != Ok(0x5a5au32.to_le_bytes().to_vec())
+            || read(&gpu, &cap, [gc + 0x13de, 1, 0xffff, 0], Some(0xbeef))
+                != Ok(0xbeefu32.to_le_bytes().to_vec())
+            || !allowed(&gpu, sdma0 + 0x25)
+            || base(&gpu, discovery::HW_ID_SDMA1).is_some()
+        {
+            return TestResult::Fail("Raphael MMR reads differ from nv.c's list");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/raphael",
+        raphael_live_mmr_follows_its_profile
     );
 }
