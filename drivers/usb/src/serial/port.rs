@@ -1001,6 +1001,14 @@ pub fn detach_serial(controller: u8, slot_id: u8) -> bool {
 /// Drop every vendor-serial binding and publication on `controller`. Called on a
 /// controller recovery epoch change, mirroring
 /// `cdc_acm::clear_acm`.
+/// Tell the supervisor pumping tty `tty_index` that it has bytes to
+/// send (Linux `usb_serial_generic_write` submits the write URB at once).
+///
+/// No kick yet: the supervisor's periodic cycle picks the bytes up.
+pub fn kick_tty(tty_index: usize) {
+    let _ = tty_index;
+}
+
 pub fn clear_serial(controller: u8) {
     let indices: Vec<usize> = {
         let mut g = SERIAL_PORTS.of(controller).lock();
@@ -1808,6 +1816,45 @@ pub mod tests {
         });
         idx
     }
+
+    /// A write to /dev/ttyUSB<N> kicks the supervisor that pumps the
+    /// port, so the bytes go out at once (Linux `usb_serial_generic_write`
+    /// submits the write URB from the write itself) instead of waiting
+    /// for a timer-driven cycle.
+    fn smoke_serial_write_kicks_supervisor() -> TestResult {
+        let Some(c) = crate::xhci::controller_by_id(0) else {
+            return TestResult::Skip("no xHCI controller");
+        };
+        devfs_bridge::__reset_for_test();
+        clear_serial(0);
+        let idx = fabricate_port(
+            206,
+            ChipFamily::Ch341,
+            0x7523,
+            LineSettings::default(),
+            None,
+        );
+        let Some(port) = devfs_bridge::get_port(idx) else {
+            return TestResult::Fail("fabricated tty not registered");
+        };
+        let node = devfs_bridge::TtyUsbFile::new(port);
+        let before = c.supervisor_kicks();
+        let wrote = narf_scheduler::block_on(narf_filesystem::FileOps::write(&node, 0, b"hi"));
+        let after = c.supervisor_kicks();
+        clear_serial(0);
+        devfs_bridge::__reset_for_test();
+        if !matches!(wrote, Ok(2)) {
+            return TestResult::Fail("the write did not queue its bytes");
+        }
+        if after == before {
+            return TestResult::Fail("a write queued TX bytes without kicking the supervisor");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/supervisor",
+        smoke_serial_write_kicks_supervisor
+    );
 
     fn smoke_serial_resume_snapshot_rebuilds_open_plan() -> TestResult {
         devfs_bridge::__reset_for_test();
