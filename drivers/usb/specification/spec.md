@@ -479,6 +479,8 @@ also consult upstream Linux GPL sources.
 - Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
   same as the hub-class reset) before the first SETUP, and Address Device
   waits 10 ms after its successful completion (Linux `hub_port_init`).
+- `Xhci::poll_isoch_in(token, out)` polls a TD from `begin_isoch_in`
+  without waiting, as `poll_bulk_in` does: `None` keeps it staged.
 - `USBDevice::{begin_bulk_in,begin_bulk_out}` submit one 1..4096-byte TD
   and return a `BulkToken`; `poll_bulk_in(token, out)` / `poll_bulk_out(token)`
   return `None` while the same TD remains active. A receive buffer must cover
@@ -1030,9 +1032,16 @@ also consult upstream Linux GPL sources.
   interface; bind configures the largest-budget complete alternate
   together with the base three endpoints and SET_INTERFACEs to it
   after SET_CONFIGURATION, and the registered transport carries SCO
-  over `isoch_out` / `isoch_in` (`send_sco` / `recv_sco`), with
+  over isochronous TDs (`send_sco` / `recv_sco`), with
   `select_sco_alt_setting` switching down to the smallest alternate
-  that fits a given payload. A device with no isoch endpoints still
+  that fits a given payload. These run inside executor polls (the HCI
+  pump), so none uses the halting `block_on`: `recv_sco` polls an iso-IN
+  TD kept staged between polls (`Xhci::poll_isoch_in`) — staged only
+  while a SCO/eSCO link is up, as tracked from the Connection Complete /
+  Synchronous Connection Complete / Disconnection Complete events
+  `recv_event` hands up (Linux `btusb_work` submits isoc IN URBs only
+  while `sco_num` is non-zero) — and `send_sco` / `select_sco_alt_setting`
+  bridge with `block_on_spin`. A device with no isoch endpoints still
   binds; its transport refuses SCO with
   `TransportError::Unsupported`, never routing it to bulk-OUT.
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind

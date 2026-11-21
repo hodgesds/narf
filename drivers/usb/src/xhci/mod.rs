@@ -5726,6 +5726,30 @@ impl Xhci {
             .map_err(bulk_error)
     }
 
+    /// Poll an already-published iso-IN TD without waiting (the shape of
+    /// [`Self::poll_bulk_in`]): `Ok(None)` keeps the TD and its page
+    /// staged; `Ok(Some(n))` retires it with `n` bytes copied to `out`.
+    pub fn poll_isoch_in(
+        &self,
+        token: &IsochToken,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, XhciError> {
+        if token.direction() != BulkDirection::In || out.len() < token.length() {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        self.validate_isoch(token)?;
+        match event_wait::poll_batch(
+            || self.take_matching_event(&mut |event| token.matches(event)),
+            || self.demux_one_event().is_some(),
+            || false,
+        ) {
+            Ok(Some(event)) => self.complete_isoch(token, &event, Some(out)),
+            Ok(None) => Ok(None),
+            Err(event_wait::PollError::Source(error)) => Err(error),
+            Err(event_wait::PollError::TimedOut) => Err(XhciError::CmdTimeout),
+        }
+    }
+
     pub(crate) async fn wait_isoch_in(
         &self,
         token: &IsochToken,
