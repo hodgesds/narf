@@ -669,8 +669,10 @@ DDI A / eDP, single pipe):
   SST, N = 2^23, M rounded up; LINK_N written last as the
   hardware update trigger).
 - **CDCLK floor** — CDCLK is raised (never lowered) to the
-  smallest ladder frequency satisfying the PRM rule
-  `pixel rate <= 2 * CDCLK` (CD2X divider 1, pipe A).
+  smallest `icl_cdclk_table` rung satisfying the PRM rule
+  `pixel rate <= 2 * CDCLK` (DE PLL ratio + CD2X divider
+  select, pipe none, pcode frequency-request notifies around
+  the change).
 - **Watermarks / DBUF allocation** — lane 1 programmed the
   PRM's "Display Buffer Allocation and Watermark Programming
   Prior to OS Boot" basics (160 DBUF blocks, one level). Lane
@@ -1970,7 +1972,23 @@ display14.00 modeset with every pipe off programs the CDCLK its
 resource transaction computes, raising or lowering it (§20,
 "Display14 resource transactions"); the inherited path raises CDCLK
 to the `pixel_clock ≤ 2 × CDCLK` floor and never lowers a faster
-firmware setting. The current-CDCLK
+firmware setting. On Gen12 (Tiger / Alder / Raptor Lake, display
+12/13) the inherited path programs the TGL model instead
+(`intel_gpu_gen12_cdclk`, MIT Linux `display/intel_cdclk.c`,
+`tgl_cdclk_funcs`): the `icl_cdclk_table` rung for the DSSM
+reference strap (19.2 / 24.0 / 38.4 MHz) at or above the floor,
+the DE PLL ratio in `BXT_DE_PLL_ENABLE` (0x46070) and the CD2X
+divider in `CDCLK_CTL` (0x46000: divider select + pipe none +
+decimal — never the SKL-only freq-sel bits 27:26 or SSA
+precharge), with pcode frequency-request notifies
+(`HSW_PCODE_DE_WRITE_FREQ_REQ` 0x17: pre DATA0 0x80000000, post
+DATA0 = the `tgl_calc_voltage_level` level) around the change.
+TGL has no CDCLK crawl or squash, so a VCO change is a full PLL
+disable/enable and a same-VCO change rewrites only the divider;
+the readback decodes ratio + divider and must match the rung
+exactly. A refused pre-notify leaves the firmware clock and
+degrades (the modeset proceeds), matching the standing
+pcode-degrade contract. The display-14 current-CDCLK
 readback decodes ratio + divider + squash popcount — under
 squash the CDCLK_CTL decimal field is nominal and is not
 trusted.
@@ -2027,9 +2045,10 @@ trusted.
   UHBR rates (the DP stack tops out at HBR3), MST, a second external
   route at once, linetime/pipe-chicken/frame-start-delay programming
   of Pipes B–D, TBT-alt tunnels, pin-assignment-D lane ownership,
-  CDCLK notifications on the inherited path (display 14
+  CDCLK notifications on the display-14 inherited path (display 14
   has no PCODE CDCLK mailbox; only the owned transaction sends
-  PM demand), and
+  PM demand — the Gen12 inherited path does send them, via
+  `intel_gpu_gen12_cdclk`), and
   per-iteration TX-level updates inside the DPCD training loop
   (would need a source-side callback in the shared
   `dp_link_training`; levels are staged before training and
