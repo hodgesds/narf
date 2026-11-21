@@ -222,8 +222,10 @@ the canonical bit definition without re-deriving it.
   `PLANE_CTL` / `PLANE_SURF` / `PLANE_STRIDE` codecs. Source:
   TGL PRM Vol. 14 "Display Engine".
 - **`intel_gpu_ddi`** — DDI port programming: `DDI_BUF_CTL`,
-  `DDI_BUF_TRANS_*`, voltage-swing/pre-emphasis tables for DP HBR
-  rates, the DDI ↔ transcoder route latch (`TRANS_DDI_FUNC_CTL`).
+  the DDI ↔ transcoder route latch (`TRANS_DDI_FUNC_CTL`).
+  Voltage-swing/pre-emphasis is NOT a `DDI_BUF_TRANS` table on
+  Gen12 — it lives in `intel_gpu_gen12_combo_phy` (PORT_TX
+  registers, per-family `.icl` tables).
   Source: TGL PRM Vol. 12 "Display DDI".
 - **`intel_gpu_gtt`** — 64-bit GTT page-table entry layout: phys
   separate GGTT / PPGTT address, permission and PAT fields;
@@ -679,10 +681,15 @@ DDI A / eDP, single pipe):
   Q6 (#1024) replaced that with the full latency-based
   algorithm — see the Q6 note below; the pre-boot programming
   remains as the fallback when the pcode latency read fails.
-- **DDI_BUF_TRANS** — the modeset loads the swing table for
-  the training start rate before link training and reloads if
-  training settles elsewhere. RBR/HBR resolve to the HBR2 table
-  (see `intel_gpu_ddi` for the rationale).
+- **Combo-PHY signal levels** — Gen12 combo ports never use
+  `DDI_BUF_TRANS` (`has_buf_trans_select` is DISPLAY_VER < 10);
+  the modeset programs the PHY through PORT_TX_DW2/DW4/DW5/DW7
+  + PORT_PCS_DW1 + PORT_CL_DW5/DW10 from the per-family `.icl`
+  tables (`intel_gpu_gen12_combo_phy`), prepared at (0, 0)
+  before training and updated per-iteration from the sink's
+  level requests via the `TrainingAux` callback. The old
+  4-entry `DDI_BUF_TRANS` tables in `intel_gpu_ddi` are
+  deleted.
 - **PLL table corrected** — DPLL_CFGCR0/1 field layouts and the
   four DP coefficient rows now match TGL PRM Vol. 12's
   "DisplayPort Mode PLL Values" for the 19.2/38.4 MHz reference
@@ -1583,9 +1590,11 @@ Two seams are defined here for named consumers:
 Modeset plan path (`Modeset::modeset_with_plan`): the DPLL
 is programmed at the negotiated rate, M/N and the
 `TRANS_DDI_FUNC_CTL` port width carry the planned rate/lanes,
-and if the fallback ladder settles elsewhere the DPLL, M/N,
-port width and BUF_TRANS are reprogrammed to the trained
-configuration before the DDI buffer enables. The legacy eDP
+and if the fallback ladder settles elsewhere the DPLL, M/N and
+port width are reprogrammed to the trained configuration before
+the DDI buffer enables (the combo-PHY levels need no such
+reprogramming — the training callback already re-selected the
+table for the settled rate). The legacy eDP
 path (`Modeset::modeset`) is byte-for-byte unchanged.
 
 Invariants:
@@ -1714,9 +1723,10 @@ decoded from the DSSM strap (lane Q6, #1024), as on the DP
 path. Rows are fixture-pinned with an
 independent decode check (DCO / (P·Q·K) must reproduce
 exactly 5× the TMDS clock). `Modeset::modeset_hdmi` omits
-the DP-only steps: no M/N, no BUF_TRANS load, no link
-training; the DDI buffer enables at the HDMI-fixed 4-lane
-width.
+the DP-only steps: no M/N, no link training; the combo-PHY
+HDMI default level (ICL HDMI table entry 6) is programmed
+before the DDI buffer enables, and the DDI buffer enables at
+the HDMI-fixed 4-lane width.
 
 Infoframes: AVI (type 0x82, v2, 13 data bytes) and audio
 (type 0x84, v1, 10 data bytes) packed per HDMI 1.4 §5.3.5
@@ -2050,10 +2060,11 @@ trusted.
   PM demand — the Gen12 inherited path does send them, via
   `intel_gpu_gen12_cdclk`), and
   per-iteration TX-level updates inside the DPCD training loop
-  (would need a source-side callback in the shared
-  `dp_link_training`; levels are staged before training and
-  re-applied after, the same simplification class as Gen12's
-  preloaded DDI_BUF_TRANS table).
+  (display 14 still stages levels before training and
+  re-applies after; the Gen12 combo path closed this with the
+  `TrainingAux` callback in `intel_gpu_gen12_combo_phy`, which
+  also deleted the preloaded DDI_BUF_TRANS table it used to
+  share the simplification with).
 - DSC is owned by `intel_gpu_xelpg_dsc` (§20, "Display-14 DSC"): the
   Pipe A eDP panel compresses when Linux would, and external DP routes
   compress with FEC. The same module picks the pipe bpp (§20, "Display-14
