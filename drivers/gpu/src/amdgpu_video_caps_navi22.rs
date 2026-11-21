@@ -59,6 +59,15 @@ pub const DECODE_VCN1: [Codec; 7] = [
     DECODE_VCN0[6],
 ];
 
+/// nv.c `yc_video_codecs_decode_array`: no MPEG2, MPEG4 or VC1.
+// linux: n/a (struct initializers: nv.c yc_video_codecs_decode_array)
+pub const DECODE_YC: [Codec; 5] = [
+    DECODE_VCN0[2],
+    DECODE_VCN0[4],
+    DECODE_VCN0[6],
+    DECODE_VCN0[5],
+    DECODE_VCN0[7],
+];
 /// Codec list for subquery `kind` (DECODE/ENCODE) given the harvested VCN
 /// mask. `None` is Linux's -EINVAL: every instance harvested or an unknown
 /// subquery.
@@ -89,6 +98,14 @@ pub fn caps_for(kind: u32, harvested: u8, version: (u8, u8, u8)) -> Option<DrmAm
     let codecs = match version {
         (3, 0, 0 | 64 | 192) => codecs(kind, harvested)?,
         (3, 0, 2 | 16) => codecs(kind, harvested & 2)?,
+        // nv_query_video_codecs: VCN 3.1.1/3.1.2 (Yellow Carp, Raphael) take
+        // sc_video_codecs_encode and yc_video_codecs_decode, whatever the
+        // harvest.
+        (3, 1, 1 | 2) => match kind {
+            AMDGPU_INFO_VIDEO_CAPS_ENCODE => &ENCODE[..],
+            AMDGPU_INFO_VIDEO_CAPS_DECODE => &DECODE_YC[..],
+            _ => return None,
+        },
         (3, 0, 33) if harvested & 3 != 3 => match kind {
             AMDGPU_INFO_VIDEO_CAPS_ENCODE => &[][..],
             AMDGPU_INFO_VIDEO_CAPS_DECODE => &[DECODE_VCN0[2], DECODE_VCN0[4], DECODE_VCN0[6]][..],

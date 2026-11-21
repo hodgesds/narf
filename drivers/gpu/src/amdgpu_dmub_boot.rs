@@ -677,6 +677,28 @@ impl Loader {
         self.graphics = Some(graphics);
         Ok(())
     }
+    /// `AMDGPU_INFO_FW_VERSION`'s view of the graphics set this loader holds:
+    /// its CP, RLC, SDMA, VCN and DMCUB headers, and the TOC its PSP session
+    /// took. SOS is the BIOS's, which Linux reports as 0.
+    pub(crate) fn graphics_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        use crate::amdgpu_gfx_firmware::Source;
+        let set = self.graphics.as_ref()?;
+        let g = |source| set.source_bytes(source);
+        crate::amdgpu_info_navi22::Firmware::parse(&crate::amdgpu_info_navi22::Files {
+            me: g(Source::Me)?,
+            pfp: g(Source::Pfp)?,
+            ce: g(Source::Ce)?,
+            mec: g(Source::Mec)?,
+            mec2: g(Source::Mec2),
+            rlc: g(Source::Rlc)?,
+            sdma: g(Source::Sdma)?,
+            sos: None,
+            toc: (!self.toc.is_empty()).then_some(self.toc.as_slice()),
+            vcn: g(Source::Vcn)?,
+            dmcub: g(Source::Dmcub)?,
+        })
+        .ok()
+    }
     /// Whether `boot` loaded the graphics set and the RLC autoload completed.
     pub fn graphics_booted(&self) -> bool {
         self.graphics_booted

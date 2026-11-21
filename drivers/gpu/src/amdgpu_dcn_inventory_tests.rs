@@ -322,6 +322,42 @@ kernel_test_in!(
     inventory_memory_configuration_is_never_defaulted
 );
 
+/// AMDGPU_INFO's APU memory fields, as
+/// `amdgpu_atomfirmware_get_integrated_system_info` derives them: DDR5
+/// channels of 64 bits, LPDDR5 of 32, a zero count as one channel, a type the
+/// APU arm does not name as UNKNOWN; content revision 3 reads the same bytes.
+fn inventory_apu_vram_follows_the_integrated_system_info() -> TestResult {
+    use crate::amdgpu_uapi as uapi;
+    for (kind, channels, want) in [
+        (MEM_TYPE_DDR5, 2, (uapi::AMDGPU_VRAM_TYPE_DDR5, 128)),
+        (MEM_TYPE_LPDDR5, 8, (uapi::AMDGPU_VRAM_TYPE_LPDDR5, 256)),
+        (MEM_TYPE_DDR5, 0, (uapi::AMDGPU_VRAM_TYPE_DDR5, 64)),
+        (26, 2, (uapi::AMDGPU_VRAM_TYPE_DDR4, 128)),
+        // LPDDR5X (36): no APU arm, and Linux's 32-bit width is LPDDR5's only.
+        (36, 4, (uapi::AMDGPU_VRAM_TYPE_UNKNOWN, 256)),
+    ] {
+        let mut image = Image::new();
+        image.integrated(kind, channels);
+        if crate::amdgpu_info::apu_vram(image.bytes()) != Some(want) {
+            return TestResult::Fail("APU memory type or width");
+        }
+    }
+    let mut v23 = Image::new();
+    v23.0[INTEGRATED + 3] = 3;
+    let mut old = Image::new();
+    old.0[INTEGRATED + 3] = 5;
+    if crate::amdgpu_info::apu_vram(v23.bytes()) != Some((uapi::AMDGPU_VRAM_TYPE_DDR5, 256))
+        || crate::amdgpu_info::apu_vram(old.bytes()).is_some()
+    {
+        return TestResult::Fail("integrated system info revisions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_apu_vram_follows_the_integrated_system_info
+);
+
 fn inventory_reference_clock_and_vco_are_range_checked() -> TestResult {
     let image = Image::new();
     // 2700 units of 10 kHz is the 27 MHz reference.

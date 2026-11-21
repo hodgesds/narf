@@ -704,15 +704,20 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
 /// PSP session loaded the graphics set and the RLC autoload completed. A
 /// failure is reported and leaves the display as it is; the owner is returned
 /// either way, since an engine may still reach memory it published.
-async fn graphics_boot(pool: &Pool) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
+async fn graphics_boot(
+    pool: &Pool,
+    firmware: Option<crate::amdgpu_info_navi22::Firmware>,
+) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
     use core::fmt::Write as _;
     let authority = crate::amdgpu::pci_authority()?;
     let device = crate::amdgpu::pci_device()?;
-    // SAFETY: this display owner holds the whole GPU after the boot handoff:
-    // no other graphics owner exists, the pool is its free carve-out, and the
-    // PSP has loaded the graphics set. Construction performs no register I/O.
-    let boot = crate::amdgpu::with_controller(|gpu| unsafe {
-        crate::amdgpu_raphael_boot::ColdBoot::new(gpu, authority, pool, device)
+    let boot = crate::amdgpu::with_controller(|gpu| {
+        crate::amdgpu_info::sample_raphael_board(gpu, &authority, &device);
+        // SAFETY: this display owner holds the whole GPU after the boot
+        // handoff: no other graphics owner exists, the pool is its free
+        // carve-out, and the PSP has loaded the graphics set. Construction
+        // performs no register I/O.
+        unsafe { crate::amdgpu_raphael_boot::ColdBoot::new(gpu, authority, pool, device) }
     })?;
     let mut boot = match boot {
         Ok(boot) => boot,
@@ -734,6 +739,17 @@ async fn graphics_boot(pool: &Pool) -> Option<crate::amdgpu_raphael_boot::ColdBo
                 report.topology.active_cus,
                 report.topology.enabled_rb_mask
             );
+            // AMDGPU_INFO_FW_VERSION describes what loaded. The rings stay
+            // unadvertised until a client submitter registers.
+            if let Some(firmware) = firmware {
+                crate::amdgpu_info::publish_navi22_boot(crate::amdgpu_info_navi22::Boot {
+                    firmware,
+                    smc: report.smu.smu,
+                    gfx_mhz: None,
+                    queues_verified: true,
+                    sdma_rings: 1,
+                });
+            }
         }
         Err(error) => {
             let _ = writeln!(
@@ -1045,7 +1061,9 @@ pub(crate) fn start() -> bool {
             if display.loader.graphics_booted() {
                 // Boxed: these futures hold the whole bring-up, which inline
                 // would make this task's own frame and future too large.
-                display.graphics = alloc::boxed::Box::pin(graphics_boot(&display.pool)).await;
+                let firmware = display.loader.graphics_versions();
+                display.graphics =
+                    alloc::boxed::Box::pin(graphics_boot(&display.pool, firmware)).await;
                 if let Some(graphics) = display.graphics.as_mut() {
                     alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
                 }

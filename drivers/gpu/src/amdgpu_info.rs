@@ -56,26 +56,30 @@ const GFX_HW_CONTEXTS: u32 = 8;
 ///
 /// Mesa keys ASIC behaviour off this plus the device id, so a wrong value here
 /// selects a different code path in the userspace driver.
-fn family_id(snap: &Snapshot) -> Option<u32> {
+pub(crate) fn family_id(snap: &Snapshot) -> Option<u32> {
     match snap.family {
         // Phoenix / Phoenix2 / HawkPoint are GFX 11.0.1.
         Family::Phoenix => Some(uapi::AMDGPU_FAMILY_GC_11_0_1),
         // Renoir / Cezanne / Lucienne / Barcelo are the Raven family line.
         Family::Renoir => Some(uapi::AMDGPU_FAMILY_RV),
         // Navi2 also contains Rembrandt, whose UAPI family differs. Only
-        // exact discrete RDNA2 profiles with matching GC discovery qualify.
+        // exact discrete RDNA2 profiles, and Raphael (amdgpu_discovery.c's
+        // GC 10.3.6 case: AMDGPU_FAMILY_GC_10_3_6), with matching GC
+        // discovery qualify.
         Family::Navi2 => {
-            let profile = crate::amdgpu_rdna2::for_pci_id(
-                crate::amdgpu::AMD_VENDOR,
-                snap.did.try_into().ok()?,
-            )?;
+            let did = snap.did.try_into().ok()?;
+            let (profile, family) =
+                match crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, did) {
+                    Some(profile) => (profile, uapi::AMDGPU_FAMILY_NV),
+                    None => (raphael(snap)?, uapi::AMDGPU_FAMILY_GC_10_3_6),
+                };
             let mut blocks = snap
                 .ip_blocks
                 .iter()
                 .filter(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0);
             let gc = blocks.next()?;
             (blocks.next().is_none() && (gc.major, gc.minor, gc.revision) == profile.gc_version)
-                .then_some(uapi::AMDGPU_FAMILY_NV)
+                .then_some(family)
         }
         // Both RDNA4 dies are AMDGPU_FAMILY_GC_12_0_0 (amdgpu_discovery.c's
         // GC 12.0.0 / 12.0.1 case); Mesa tells them apart by external_rev.
@@ -84,6 +88,13 @@ fn family_id(snap: &Snapshot) -> Option<u32> {
         // family whose userspace path we have not exercised.
         _ => None,
     }
+}
+
+/// Raphael's profile when `snap` is one (by PCI id; `family_id` also checks
+/// the discovered GC).
+pub(crate) fn raphael(snap: &Snapshot) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+    crate::amdgpu_rdna2::apu_for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did.try_into().ok()?)
+        .filter(|p| *p == &crate::amdgpu_rdna2::RAPHAEL)
 }
 
 /// The RDNA4 die a snapshot describes, by its single discovered GC.
@@ -192,6 +203,43 @@ pub fn rdna2_vram(vbios: &[u8], module: u8) -> Option<(u32, u32)> {
         _ => uapi::AMDGPU_VRAM_TYPE_UNKNOWN,
     };
     Some((kind, width))
+}
+/// `amdgpu_atomfirmware_get_integrated_system_info`'s frev 2 arms with the
+/// APU arm of `convert_atom_mem_type_to_vram_type`: the memory type, and
+/// `vram_width` as the channel count (0 counts as 1) times 32 bits for LPDDR5
+/// and 64 for anything else.
+pub fn apu_vram(vbios: &[u8]) -> Option<(u32, u32)> {
+    const LPDDR5: u8 = 35; // linux: LpDdr5MemType
+    let (kind, channels) = crate::amdgpu_dcn_inventory::integrated_memory(vbios)?;
+    let vram_type = match kind {
+        19 | 28 => uapi::AMDGPU_VRAM_TYPE_DDR2, // linux-lit: 19=Ddr2MemType; 28=LpDdr2MemType
+        24 | 29 => uapi::AMDGPU_VRAM_TYPE_DDR3, // linux-lit: 24=Ddr3MemType; 29=LpDdr3MemType
+        26 => uapi::AMDGPU_VRAM_TYPE_DDR4,      // linux-lit: 26=Ddr4MemType
+        30 => uapi::AMDGPU_VRAM_TYPE_LPDDR4,    // linux-lit: 30=LpDdr4MemType
+        34 => uapi::AMDGPU_VRAM_TYPE_DDR5,      // linux-lit: 34=Ddr5MemType
+        LPDDR5 => uapi::AMDGPU_VRAM_TYPE_LPDDR5,
+        _ => uapi::AMDGPU_VRAM_TYPE_UNKNOWN,
+    };
+    // linux: n/a (mem_channel_width literals in amdgpu_atomfirmware_get_integrated_system_info)
+    let width = if kind == LPDDR5 { 32 } else { 64 };
+    Some((vram_type, u32::from(channels.max(1)) * width))
+}
+/// Raphael's identity, sampled by its graphics owner before the cold boot:
+/// `nbio_v7_2_get_rev_id`'s strap (`adev->rev_id`) and `pdev->revision`.
+/// An APU has no strapped memory module, and Linux's PCIe and DPM clock
+/// fields need SMU messages this driver does not send, so those stay unset.
+pub(crate) fn sample_raphael_board(
+    gpu: &crate::amdgpu::AmdGpu,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    device: &narf_bus::BusDevice,
+) {
+    // SAFETY: the display owner holds the exclusive GPU claim and current
+    // PCI authority; the read-only NBIO strap does not need powered GC.
+    let revision = unsafe { crate::amdgpu_gfx10_topology::read_revision_raphael(gpu, cap) }.ok();
+    publish_rdna2_board(revision, None, None, None);
+    if let Ok(class_rev) = narf_bus::pci::read_config32(cap, device, 0x08) {
+        publish_navi22_pci_revision(class_rev as u8);
+    }
 }
 /// From the cold boot's `ReadTopology` stage.
 pub(crate) fn publish_navi22_topology(topology: crate::amdgpu_gfx10_topology::Topology) {
@@ -313,8 +361,11 @@ fn snapshot() -> Option<Snapshot> {
 impl Snapshot {
     pub(crate) fn from_gpu(gpu: &crate::amdgpu::AmdGpu) -> Self {
         // Discrete GC12 uses umc_info; RDNA2 uses the strapped vram_info
-        // module. Integrated-system-info decoding remains a separate path.
-        let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some();
+        // module; APUs use the integrated system info. Raphael's graphics
+        // owner publishes into the RDNA2 record too.
+        let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some()
+            || crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+                == Some(&crate::amdgpu_rdna2::RAPHAEL);
         let published = if rdna2 {
             *NAVI22.lock()
         } else {
@@ -324,7 +375,9 @@ impl Snapshot {
             .vbios
             .as_ref()
             .and_then(|v| {
-                if rdna2 {
+                if gpu.is_apu() {
+                    apu_vram(v.bytes())
+                } else if rdna2 {
                     rdna2_vram(v.bytes(), published.vram_module?)
                 } else if gpu.chip.family == Family::Navi4 && !gpu.is_apu() {
                     umc_vram(v.bytes())

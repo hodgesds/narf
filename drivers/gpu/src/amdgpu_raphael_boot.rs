@@ -388,10 +388,11 @@ impl ColdBoot {
                         .map_err(Error::Queues)?
                 }
                 Stage::ReadTopology => {
-                    self.topology = Some(
-                        crate::amdgpu_gfx10_topology::read_raphael(gpu, &authority)
-                            .map_err(Error::Topology)?,
-                    );
+                    let topology = crate::amdgpu_gfx10_topology::read_raphael(gpu, &authority)
+                        .map_err(Error::Topology)?;
+                    // AMDGPU_INFO's CU/RB fields and cached GB_ADDR_CONFIG.
+                    crate::amdgpu_info::publish_navi22_topology(topology);
+                    self.topology = Some(topology);
                 }
             }
         }

@@ -677,6 +677,18 @@ pub fn lttpr_caps(vbios: &[u8]) -> Result<(bool, bool), Error> {
     ))
 }
 
+/// `atom_integrated_system_info_v2_*`'s raw `memorytype` and
+/// `umachannelnumber`, at the same offsets in content revisions 1 to 3
+/// (`amdgpu_atomfirmware_get_integrated_system_info`'s frev 2 arms).
+pub(crate) fn integrated_memory(vbios: &[u8]) -> Option<(u8, u8)> {
+    let info = table(vbios, TABLE_INTEGRATED_SYSTEM_INFO).ok()?;
+    header(info, 2, &[1, 2, 3]).ok()?;
+    if (u16_at(info, 0) as usize) < CHANNEL_COUNT_OFFSET + 1 {
+        return None;
+    }
+    Some((info[MEMORY_TYPE_OFFSET], info[CHANNEL_COUNT_OFFSET]))
+}
+
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the
 /// type and channel count and from the firmware's own DPM table for the data
 /// rate. A zero channel count is refused: Linux substitutes four, but that is a

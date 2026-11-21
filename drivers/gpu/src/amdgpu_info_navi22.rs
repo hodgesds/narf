@@ -129,6 +129,8 @@ pub struct Firmware {
     /// Every discovered SDMA instance loads the same per-ASIC file.
     pub sdma: Version,
     pub sos: Version,
+    /// The PSP TOC (`psp_init_toc_microcode`); zero where none is loaded.
+    pub toc: Version,
     pub vcn: Version,
     pub dmcub: Version,
 }
@@ -168,7 +170,10 @@ pub struct Files<'a> {
     pub mec2: Option<&'a [u8]>,
     pub rlc: &'a [u8],
     pub sdma: &'a [u8],
-    pub sos: &'a [u8],
+    /// `None` on PSP 13.0.5, whose SOS is the BIOS's (Linux reports 0).
+    pub sos: Option<&'a [u8]>,
+    /// `None` where the PSP takes no TOC (MP0 11.0.x).
+    pub toc: Option<&'a [u8]>,
     pub vcn: &'a [u8],
     pub dmcub: &'a [u8],
 }
@@ -207,7 +212,8 @@ impl Firmware {
             rlcp: since(3, 172)?,
             rlcv: since(3, 188)?,
             sdma: header(files.sdma)?,
-            sos: header(files.sos)?,
+            sos: files.sos.map(header).transpose()?.unwrap_or_default(),
+            toc: files.toc.map(header).transpose()?.unwrap_or_default(),
             vcn: Version {
                 ver: word(files.vcn, 16)?,
                 feature: 0,
@@ -319,19 +325,24 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let info = uapi::DrmAmdgpuInfoDevice {
         device_id: snap.did,
         chip_rev: snap.navi22.chip_revision.map_or(0, u32::from),
+        // nv_common_early_init: GC 10.3.6 is rev_id + 0x01.
         external_rev: snap.navi22.chip_revision.map_or(0, |revision| {
             u32::from(revision)
-                + crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did as u16)
-                    .map_or(0, |p| match p.gc_version.2 {
-                        0 => 0x28,
-                        2 => 0x32,
-                        4 => 0x3c,
-                        5 => 0x46,
-                        _ => 0,
-                    })
+                + if crate::amdgpu_info::raphael(snap).is_some() {
+                    0x01
+                } else {
+                    crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did as u16)
+                        .map_or(0, |p| match p.gc_version.2 {
+                            0 => 0x28,
+                            2 => 0x32,
+                            4 => 0x3c,
+                            5 => 0x46,
+                            _ => 0,
+                        })
+                }
         }),
         pci_rev: snap.navi22.pci_revision.map_or(0, u32::from),
-        family: uapi::AMDGPU_FAMILY_NV,
+        family: crate::amdgpu_info::family_id(snap).ok_or(FsError::InvalidData)?,
         num_shader_engines: table.num_se,
         num_shader_arrays_per_engine: table.num_sa_per_se,
         max_engine_clock: max_sclk,
@@ -352,10 +363,15 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         enabled_rb_pipes_mask: topology.map_or(0, |t| t.enabled_rb_mask),
         num_rb_pipes: table.num_rb_per_se.saturating_mul(table.num_se),
         num_hw_gfx_contexts: MAX_HW_CONTEXTS,
-        // Discrete; MCBP and TMZ are off by default on GC 10.3.2 and
-        // CONFORMANT_TRUNC_COORD is GFX11-only. The native RDNA2 backend
-        // accepts one entity per ioctl, so it cannot claim GANG_SUBMIT.
-        ids_flags: 0,
+        // FUSION for an APU. MCBP and TMZ are off by default on GC 10.3.2
+        // and 10.3.6 (amdgpu_gmc_tmz_set), and CONFORMANT_TRUNC_COORD is
+        // GFX11-only. The native RDNA2 backend accepts one entity per ioctl,
+        // so it cannot claim GANG_SUBMIT.
+        ids_flags: if snap.is_apu {
+            u64::from(uapi::AMDGPU_IDS_FLAGS_FUSION)
+        } else {
+            0
+        },
         virtual_address_offset: va.low_offset,
         virtual_address_max: va.low_max,
         high_va_offset: va.high_offset,
@@ -501,7 +517,9 @@ fn fw_version(snap: &Snapshot, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
         uapi::AMDGPU_INFO_FW_GFX_RLC_RESTORE_LIST_SRM_MEM => fw.rlc_srls,
         uapi::AMDGPU_INFO_FW_GFX_RLCP => fw.rlcp,
         uapi::AMDGPU_INFO_FW_GFX_RLCV => fw.rlcv,
-        uapi::AMDGPU_INFO_FW_SDMA if index < 2 => fw.sdma,
+        // amdgpu_firmware_info: an index past `adev->sdma.num_instances` is
+        // -EINVAL (two on Navi22, one on Raphael).
+        uapi::AMDGPU_INFO_FW_SDMA if (index as usize) < sdma_instances(snap) => fw.sdma,
         uapi::AMDGPU_INFO_FW_SDMA => return Err(FsError::InvalidData),
         uapi::AMDGPU_INFO_FW_SOS => fw.sos,
         uapi::AMDGPU_INFO_FW_SMC => Version {
@@ -510,13 +528,14 @@ fn fw_version(snap: &Snapshot, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
         },
         uapi::AMDGPU_INFO_FW_VCN => fw.vcn,
         uapi::AMDGPU_INFO_FW_DMCUB => fw.dmcub,
+        // Loaded by PSP 13.0.5 (Raphael); zero on MP0 11.0.11.
+        uapi::AMDGPU_INFO_FW_TOC => fw.toc,
         // Not loaded for MP0 11.0.11 / GC 10.3.2: Linux reports zeros.
         uapi::AMDGPU_INFO_FW_VCE
         | uapi::AMDGPU_INFO_FW_UVD
         | uapi::AMDGPU_INFO_FW_GMC
         | uapi::AMDGPU_INFO_FW_ASD
         | uapi::AMDGPU_INFO_FW_DMCU
-        | uapi::AMDGPU_INFO_FW_TOC
         | uapi::AMDGPU_INFO_FW_CAP
         | uapi::AMDGPU_INFO_FW_MES_KIQ
         | uapi::AMDGPU_INFO_FW_MES
@@ -530,6 +549,22 @@ fn fw_version(snap: &Snapshot, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
         ver: v.ver,
         feature: v.feature,
     }))
+}
+
+/// `adev->sdma.num_instances`: the discovered SDMA blocks.
+fn sdma_instances(snap: &Snapshot) -> usize {
+    snap.ip_blocks
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.hw_id,
+                discovery::HW_ID_SDMA0
+                    | discovery::HW_ID_SDMA1
+                    | discovery::HW_ID_SDMA2
+                    | discovery::HW_ID_SDMA3
+            )
+        })
+        .count()
 }
 
 /// `nv_read_register` for the allowlist entry that needs no live MMIO.

@@ -70,7 +70,8 @@ impl Firmware {
             mec2: g(Source::Mec2),
             rlc: g(Source::Rlc)?,
             sdma: g(Source::Sdma)?,
-            sos: self.sos.bytes(),
+            sos: Some(self.sos.bytes()),
+            toc: None,
             vcn: g(Source::Vcn)?,
             dmcub: g(Source::Dmcub)?,
         })
