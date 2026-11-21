@@ -160,11 +160,20 @@ fn submission_ring(ibs: &[crate::amdgpu_cs::Ib]) -> Result<usize, FsError> {
 }
 /// Ticket ring ids: four original kernel queues, four media rings, SDMA2/3.
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
-/// IBs one job may carry on ring `id` (`AMDGPU_INFO_MAX_IBS`). Today the
-/// submitter inherits the trait's default of one.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-pub(crate) fn ring_max_ibs(_id: usize) -> u32 {
-    1
+/// IBs one job may carry on ring `id`, as `AMDGPU_INFO_MAX_IBS` reports it
+/// (Linux's `amdgpu_ring_max_ibs`): what the native queue accepts,
+/// `amdgpu_navi22_submit::validate` for the kernel queues and
+/// `validate_media` for VCN/JPEG. Mesa's RADV packs a submission's IBs up to
+/// this count and always spends one on its preamble, so a count of one fits no
+/// command buffer at all. 0 for an id the card does not run.
+pub(crate) fn ring_max_ibs(id: usize) -> u32 {
+    if (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id) {
+        crate::amdgpu_navi22_submit::MEDIA_MAX_IBS as u32
+    } else if id < RING_IDS {
+        crate::amdgpu_navi22_submit::MAX_IBS as u32
+    } else {
+        0
+    }
 }
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
@@ -339,6 +348,11 @@ impl crate::amdgpu_cs::Submitter for Submitter {
         ring_id(ip_type, ip_instance, ring)
             .filter(|id| fence_slot(*id).is_none_or(|slot| self.reader.present(slot)))
             .map(|id| ring_index(self.epoch, id))
+    }
+    /// `ring` is a ticket ring index (`ring_for`); its low four bits are the
+    /// ring id.
+    fn max_ibs(&self, ring: u32) -> u32 {
+        ring_max_ibs((ring & 15) as usize)
     }
     fn signalled(&self, ticket: u64) -> bool {
         // A vanished device makes no more progress; report done so waiters
