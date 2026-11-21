@@ -1633,7 +1633,12 @@ call — mount, UTS, IPC, PID, network, and cgroup — is owned by that new user
 namespace, as Linux `copy_namespaces` and `unshare_nsproxy_namespaces` pass
 the new credential's namespace to every constructor. A
 `clone(CLONE_NEWUSER | CLONE_NEWNS)` child therefore holds `CAP_SYS_ADMIN`
-over its own mount namespace and may change propagation and mount there. Real,
+over its own mount namespace and may change propagation and mount there.
+Creating any non-user namespace through `clone(2)` or `clone3(2)` requires
+`CAP_SYS_ADMIN` over the child credential's user namespace — the caller's own
+unless the same call creates a user namespace, in which the child holds every
+capability — and otherwise fails with `EPERM` before a PID is allocated, as
+`unshare(2)` already does. Real,
 effective, saved, filesystem IDs and supplementary groups retain their
 kernel-global identity across `clone(CLONE_NEWUSER)`, `unshare`, and `setns`.
 Credential getters and inode stat results translate to the caller's namespace;
