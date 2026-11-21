@@ -386,7 +386,16 @@ impl Config {
     /// Linear tiling pins the minimum swath height to the maximum, so the
     /// detile buffer is never split between luma and chroma here.
     pub fn geometry(&self) -> Result<Geometry, Error> {
+        self.geometry_with_det(self.dcn.det_buffer_kbytes())
+    }
+    /// [`Config::geometry`] against the DET this pipe is actually given — the
+    /// `det_size_override` / `det_buffer_size_kbytes` the populate step chose
+    /// (`amdgpu_dcn_hubbub::plan`) rather than the IP default.
+    pub fn geometry_with_det(&self, det_kbytes: u64) -> Result<Geometry, Error> {
         self.validate()?;
+        if det_kbytes == 0 {
+            return Err(Error::Invalid);
+        }
         let (h_ratio, v_ratio) = self.ratios();
         let format = self.plane.format;
         let bytes_per_pixel = format.bytes_per_pixel();
@@ -400,7 +409,7 @@ impl Config {
             surface_width_ub.min(ceil_multiple(swath_width - 1, block_width_256) + block_width_256);
         // Linear: MinimumSwathHeightY == MaximumSwathHeightY.
         let swath_height = block_height_256;
-        let det_bytes = ceil_multiple(self.dcn.det_buffer_kbytes(), 64) * 1024;
+        let det_bytes = ceil_multiple(det_kbytes, 64) * 1024;
         let swath_bytes = swath_width_ub
             .saturating_mul(bytes_per_pixel)
             .saturating_mul(swath_height);

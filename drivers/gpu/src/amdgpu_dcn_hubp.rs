@@ -66,9 +66,15 @@ const PER_LINE_DELIVERY: u64 = 0x065b; // linux: mmHUBPREQ0_PER_LINE_DELIVERY
 const REF_FREQ_TO_PIX_FREQ: u64 = 0x065d; // linux: mmHUBPREQ0_REF_FREQ_TO_PIX_FREQ
                                           // HUBPRET block, same stride.
 const HUBPRET_CONTROL: u64 = 0x066c; // linux: mmHUBPRET0_HUBPRET_CONTROL
+/// The cursor's request mode lives in the cursor block beside the HUBP, at
+/// the same per-pipe stride (`regCURSOR0_3_CURSOR_SIZE` 0x90f = 0x67b + 3 *
+/// 0xdc).
+const CURSOR_CONTROL: u64 = 0x0678; // linux: mmCURSOR0_0_CURSOR_CONTROL
+const HUBP_UNBOUNDED_REQ_MODE: u32 = 0x0000_0400; // linux: HUBP0_DCHUBP_CNTL__HUBP_UNBOUNDED_REQ_MODE_MASK
+const CURSOR_REQ_MODE: u32 = 0x0000_0004; // linux: CURSOR0_0_CURSOR_CONTROL__CURSOR_REQ_MODE_MASK
 const STRIDE: u64 = 0xdc; // linux: mmHUBP1_DCSURF_SURFACE_CONFIG - mmHUBP0_DCSURF_SURFACE_CONFIG
 #[cfg(feature = "kernel-test")]
-const LAST_REG: u32 = (HUBPRET_CONTROL + 3 * STRIDE) as u32; // linux: n/a (test-only bank bound)
+const LAST_REG: u32 = (CURSOR_CONTROL + 3 * STRIDE) as u32; // linux: n/a (test-only bank bound)
 /// `DC_SW_LINEAR`. No other swizzle is modelled by the mode math.
 const SW_MODE_LINEAR: u32 = 0; // linux: DC_SW_LINEAR@dc
 
@@ -527,7 +533,7 @@ impl Hubp {
             gpu,
             2, // linux-lit: 2=mmHUBP0_DCSURF_SURFACE_CONFIG_BASE_IDX
             // linux-ctx: reset
-            (HUBPRET_CONTROL + u64::from(profile.pipes() - 1) * STRIDE) as u32,
+            (HUBPRET_CONTROL.max(CURSOR_CONTROL) + u64::from(profile.pipes() - 1) * STRIDE) as u32,
         )?;
         Ok(Self(Engine {
             io: Mmio {
@@ -543,6 +549,22 @@ impl Hubp {
     }
     pub fn instance(&self) -> u8 {
         self.0.instance
+    }
+    /// `hubp31_set_unbounded_requesting`: the lone pipe may also return data
+    /// through the compressed buffer. Cursor requests are always set to start
+    /// early in the prefetch (`CURSOR_REQ_MODE = 1`), whatever `enable` is.
+    /// DCN 3.1.x only.
+    pub fn set_unbounded_requesting(&mut self, enable: bool) -> Result<(), Error> {
+        if self.0.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        self.0.update(
+            DCHUBP_CNTL,
+            HUBP_UNBOUNDED_REQ_MODE,
+            if enable { HUBP_UNBOUNDED_REQ_MODE } else { 0 },
+        )?;
+        self.0
+            .update(CURSOR_CONTROL, CURSOR_REQ_MODE, CURSOR_REQ_MODE)
     }
     pub fn blanked(&self) -> bool {
         self.0.blanked

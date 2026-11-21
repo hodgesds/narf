@@ -189,9 +189,36 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    Still open: `dcn315_update_soc_for_wm_a` uses the 129 µs latency only
    when DRAM clock change is possible in vactive, else the 10 µs dummy plus
    a p-state lock. That needs the DET/unbounded policy and the vactive
-   support decision; until then the longer latency is used. Neither DCN path
-   programs the DCHUBBUB DET split, compressed buffer, unbounded requesting
-   or arbiter watermarks yet.
+   support decision; until then the longer latency is used.
+
+   ~~DCHUBBUB DET split, compressed buffer, unbounded requesting and arbiter
+   watermarks~~ (done, both DCNs, `amdgpu_dcn_hubbub`). Neither path
+   programmed any of them before, so the firmware's split and watermarks
+   were inherited. hubbub31 serves both; the arbiter registers share offsets,
+   and the DET/COMPBUF block is +0x11 on DCN 3.1.5.
+   - The split follows `populate_dml_pipes_from_context`. A lone pipe with
+     a surface ≤ 5120 wide (on DCN 3.1.5 also below DPM DISPCLK / 1.0038)
+     gets 192 KB with unbounded requesting. Beside live pipes it gets 384 KB
+     (DCN 3.1.4) or an even share of 896 KB capped at 384 (DCN 3.1.5). A
+     pipe the boot firmware left live keeps its DET; a split that does not
+     fit beside it is refused. The mode math uses the DET actually given.
+   - The sequence is Linux's: raise the watermarks and shrink the compressed
+     buffer (to 64 KB on DCN 3.1.5) before the change, then the DET and
+     `hubp31_set_unbounded_requesting`, then grow the compressed buffer once
+     every DET has applied. Teardown returns the DET to 0.
+   - Watermarks are written to all four sets as `ns × refclk_MHz / 1000`
+     cycles; a value its field cannot hold is refused, not clamped.
+     `FRAC_URG_BW_NOM` is max(read, prefetch pixel) bandwidth over return
+     bandwidth. Linux lowers watermarks to values computed for the whole
+     state; this plane model does not see a pipe the GOP left live, so the
+     exact values (and allowing self-refresh) are written only when this
+     pipe is the hub's sole user, and otherwise only raised above what the
+     hardware holds.
+   - DCN 3.1.4's 2100 µs minimum Z8 residency applies unconditionally (no
+     stutter period is computed).
+
+   Still open: the vactive p-state decision above, which can now use the
+   DET and compressed-buffer sizes this plan supplies.
 9. DMUB `dcn_3_1_5_dmcub.bin` with PSP 13.0.5, then the boot-handoff window,
    then the Late worker arm.
 

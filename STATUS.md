@@ -1035,6 +1035,10 @@ The DCN314 stream pipeline is now implemented end to end. A fixed-point port
 of DML derives the detile geometry, the required clocks, the urgent, p-state and
 stutter watermarks and the prefetch schedule, and encodes them into the HUBP
 request, latency and throttle registers, refusing any value a field cannot hold.
+The DCHUBBUB arbiter receives the same watermarks, and the pipe's detile buffer
+and the compressed buffer are split as Linux splits them (192 KB with unbounded
+requesting for a lone pipe). Beside a pipe the boot firmware left live, the
+watermarks are only raised and that pipe keeps its detile buffer.
 The display clock manager latches the firmware's own DPM table and applies
 clocks in Linux's order; the clock generator divides them per pipe and routes a
 tunnelled stream's clock. The timing generator, hub pixel pipe, DPP, combiner,

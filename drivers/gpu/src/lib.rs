@@ -245,6 +245,8 @@ pub mod amdgpu_dcn_dccg;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_display;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dcn_hubbub;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_hubp;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_inventory;
