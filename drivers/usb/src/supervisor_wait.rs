@@ -31,6 +31,9 @@ pub(crate) const NO_IRQ_POLL_MS: u64 = 8;
 /// What the supervisor's wait can observe of its controller.
 pub(crate) trait KickSource: Sync {
     /// Kicks so far; a wait ends when this moves past the value it saw.
+    /// Read only by the kernel tests; production reads the count directly
+    /// (`Xhci::supervisor_kicks`) before parking.
+    #[cfg(feature = "kernel-test")]
     fn kicks(&self) -> u64;
     /// Register `waker` under `id` for the next kick and return whether a
     /// kick newer than `seen` has already happened.
@@ -40,6 +43,7 @@ pub(crate) trait KickSource: Sync {
 }
 
 impl KickSource for crate::xhci::Xhci {
+    #[cfg(feature = "kernel-test")]
     fn kicks(&self) -> u64 {
         self.supervisor_kicks()
     }
@@ -116,7 +120,8 @@ pub(crate) fn park<S: KickSource>(
 }
 
 impl<S: KickSource> Park<'_, S> {
-    /// Whether this wait armed a timer.
+    /// Whether this wait armed a timer (read by the kernel tests).
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn timer_armed(&self) -> bool {
         self.sleep.is_some()
     }
