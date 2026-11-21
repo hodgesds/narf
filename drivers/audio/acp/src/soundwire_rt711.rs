@@ -720,12 +720,16 @@ mod tests {
 
     impl Transport for FakeTransport {
         fn xfer(&self, dev: u8, addr: u32, write: Option<u8>) -> Result<Option<u8>, SdwError> {
-            {
-                let mut log = self.log.lock();
-                if log.len() < 1024 {
-                    log.push(Xfer { dev, addr, write });
-                }
-            }
+            // Record every transfer, uncapped: the log is the
+            // test's record of bus traffic, and a deadline-bounded
+            // poll legitimately generates tens of thousands of
+            // transfers in 10 ms (8 per index read). Capping the
+            // log silently dropped the post-timeout depop + D3
+            // writes, so `calibration_timeout_still_depops` could
+            // not see them even though the driver issued them.
+            // The longest spin-to-expiry in this module is 10 ms,
+            // so the log stays in the tens of thousands of entries.
+            self.log.lock().push(Xfer { dev, addr, write });
             if let Some(value) = write {
                 if addr & 0xff00 == 0x8500 {
                     *self.last_index.lock() = value;
