@@ -23,6 +23,10 @@
 //!
 //! ## Submission integration and remaining limits
 //!
+//! Tables live where `amdgpu_vm_pt_create` puts them: in VRAM on a card that
+//! registered a [`TableHeap`] (a dGPU; written through the BAR and committed
+//! with an HDP flush, `amdgpu_vm_cpu_commit`), else in system RAM.
+//!
 //! Native submitters bind each client's materialised root to a per-job VMID
 //! and emit ring-side invalidations when tlb_seq changes. Removed mappings
 //! retain their BOs until the jobs that could still use them have completed;
@@ -1501,16 +1505,71 @@ pub struct TableHeap {
 /// Cards whose client page tables live in VRAM, and their heaps.
 static TABLE_HEAPS: IrqSafeSpinLock<Vec<(u32, TableHeap)>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Give DRM card `card` VRAM page tables.
+/// Give DRM card `card` VRAM page tables, as Linux has them on a dGPU from
+/// the start: tables allocated from now on live in `heap`, and every
+/// registered space of the card is brought in line before this returns —
+/// one whose tables are still in system RAM moves them into VRAM, one
+/// whose VRAM tables were lost (S3, a recovery) has them rewritten from the
+/// CPU's copy. Either bumps the space's TLB sequence, so its next job
+/// flushes. Call it before the card takes jobs again.
 pub fn register_table_heap(card: u32, heap: TableHeap) {
-    let mut heaps = TABLE_HEAPS.lock();
-    heaps.retain(|(c, _)| *c != card);
-    heaps.push((card, heap));
+    {
+        let mut heaps = TABLE_HEAPS.lock();
+        heaps.retain(|(c, _)| *c != card);
+        heaps.push((card, heap.clone()));
+    }
+    let spaces: Vec<_> = VMS
+        .lock()
+        .iter()
+        .filter_map(|vm| vm.upgrade())
+        .filter(|vm| vm.card == Some(card))
+        .collect();
+    for space in spaces {
+        if let Err(error) = space.place_tables(&heap) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: card {card} page tables not placed in VRAM: {error:?}"
+            );
+        }
+    }
 }
 
-/// Withdraw card `card`'s table heap (recovery, suspend).
+/// Withdraw card `card`'s table heap (recovery, suspend). Spaces keep their
+/// tables; nothing new is allocated for a VRAM-placed space until the heap
+/// is registered again.
 pub fn unregister_table_heap(card: u32) {
     TABLE_HEAPS.lock().retain(|(c, _)| *c != card);
+}
+
+fn table_heap(card: u32) -> Option<TableHeap> {
+    TABLE_HEAPS
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map(|(_, heap)| heap.clone())
+}
+
+/// `amdgpu_vm_cpu_commit`: `mb()`, then the HDP flush, so the CPU's table
+/// stores through the BAR reach VRAM before a hub walks them. A device that
+/// stopped answering loses nothing here: its tables are rewritten when its
+/// heap is registered again.
+fn commit(heap: &TableHeap) {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let _ = heap.hdp.flush();
+}
+
+/// The VRAM half of a table on a card with a [`TableHeap`].
+#[derive(Debug)]
+struct VramTable {
+    /// CPU-visible VRAM (`AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`, as Linux
+    /// requires for tables the CPU updates). Never published: like a GEM
+    /// buffer it is freed only after the space's jobs completed
+    /// (`VmInner::release`).
+    memory: crate::amdgpu_vram::Reservation,
+    /// `amdgpu_gmc_vram_mc2pa` of its MC address: what a PDE or the context
+    /// base carries.
+    device: u64,
 }
 
 /// One allocated page table: `entries_at(level)` 64-bit entries.
@@ -1519,14 +1578,22 @@ pub fn unregister_table_heap(card: u32) {
 /// each level holds 512 entries of 8 bytes; a part whose `block_size` made a
 /// level larger would need a higher-order allocation, which [`PageTable::new`]
 /// computes rather than assumes.
+///
+/// Where the hardware walks it follows `amdgpu_vm_pt_create`: on a card
+/// with a [`TableHeap`] (a dGPU, `AMDGPU_GEM_DOMAIN_VRAM`) the table is
+/// VRAM written through the BAR and its system-RAM page is the CPU's copy
+/// (reads, and the source that rewrites VRAM after a loss); elsewhere the
+/// hub walks the system-RAM page itself.
 #[derive(Debug)]
 struct PageTable {
     phys: u64,
     order: u8,
+    entries: u64,
+    vram: Option<VramTable>,
 }
 
 impl PageTable {
-    /// Allocate and clear a table for `level`.
+    /// Allocate and clear a table for `level`, in `heap`'s VRAM when given.
     ///
     /// A fresh table is filled with the INVALID pattern, not with zeros.
     /// `amdgpu_vm_pt_clear` writes `AMDGPU_PTE_EXECUTABLE` into a leaf's
@@ -1534,37 +1601,115 @@ impl PageTable {
     /// and `AMDGPU_PDE_PTE` into a directory's. Neither carries `PTE_VALID`,
     /// so neither translates; the difference is which fault the hardware
     /// reports, and reporting the wrong one sends a future debugging session
-    /// in the wrong direction.
-    fn new(geometry: &Geometry, level: Level) -> Result<Self, FsError> {
-        let bytes = geometry.entries_at(level) * 8;
+    /// in the wrong direction. A VRAM table is committed (HDP flush) before
+    /// it is returned, as `amdgpu_vm_pt_clear` commits its clear before the
+    /// parent's PDE is written.
+    fn new(geometry: &Geometry, level: Level, heap: Option<&TableHeap>) -> Result<Self, FsError> {
+        let entries = geometry.entries_at(level);
+        let bytes = entries * 8;
         let pages = bytes.div_ceil(GPU_PAGE_SIZE);
         let mut order = 0u8;
         while (1u64 << order) < pages {
             order += 1;
         }
         let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
-        let table = PageTable {
+        let mut table = PageTable {
             phys: frame.start_address().raw(),
             order,
+            entries,
+            vram: None,
         };
         let invalid: u64 = if level == Level::Ptb {
             PTE_EXECUTABLE
         } else {
             geometry.format.pde_pte()
         };
-        for i in 0..geometry.entries_at(level) {
+        let in_vram = heap.is_some();
+        for i in 0..entries {
             // SAFETY: `i` is bounded by the table's entry count and the
             // allocation covers that many 8-byte entries.
-            unsafe { table.write(i, invalid) };
+            unsafe { table.write_copy(i, invalid, !in_vram) };
+        }
+        if let Some(heap) = heap {
+            table.attach(heap)?;
         }
         Ok(table)
     }
 
-    /// Write entry `index`.
+    /// Give this table its VRAM half: reserve CPU-visible VRAM, copy every
+    /// entry into it and commit.
+    fn attach(&mut self, heap: &TableHeap) -> Result<(), FsError> {
+        let bytes = (1u64 << self.order) * GPU_PAGE_SIZE;
+        let memory = heap
+            .pool
+            .reserve_aligned(bytes, GPU_PAGE_SIZE)
+            .map_err(|_| FsError::NoSpace)?;
+        let device = memory
+            .address()
+            .checked_sub(heap.fb_base)
+            .and_then(|a| a.checked_add(heap.fb_offset))
+            .ok_or(FsError::InvalidData)?;
+        // gmc_v10_0_get_vm_pde: BUG_ON(*addr & 0xFFFF00000000003FULL).
+        if device & 0xFFFF_0000_0000_003F != 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.vram = Some(VramTable { memory, device });
+        self.restore();
+        commit(heap);
+        Ok(())
+    }
+
+    /// Rewrite the VRAM half from the CPU's copy (after a VRAM loss).
+    fn restore(&self) {
+        for i in 0..self.entries {
+            // SAFETY: `i` is bounded by the table's entry count.
+            let value = unsafe { self.read(i) };
+            self.write_vram(i, value);
+        }
+    }
+
+    /// This table as its parent's PDE or a context base
+    /// (`amdgpu_gmc_get_pde_for_bo` with the level's `get_vm_pde`): a VRAM
+    /// table's MC→PA address with VALID (`amdgpu_ttm_tt_pde_flags` for a
+    /// VRAM placement), else the system-RAM page with VALID|SYSTEM|SNOOPED.
+    fn pde(&self) -> Result<u64, FsError> {
+        match &self.vram {
+            Some(vram) => Ok(vram.device | PTE_VALID),
+            None => make_pde(self.phys),
+        }
+    }
+
+    /// Write entry `index` where the hardware walks it: the BAR (committed
+    /// by the caller, `amdgpu_vm_cpu_commit`) for a VRAM table, else the
+    /// system-RAM page.
     ///
     /// # Safety
     /// `index` must be within the table's entry count.
     unsafe fn write(&self, index: u64, value: u64) {
+        let in_vram = self.vram.is_some();
+        // SAFETY: forwarded bound.
+        unsafe { self.write_copy(index, value, !in_vram) };
+        self.write_vram(index, value);
+    }
+
+    /// One 64-bit store of entry `index` into the VRAM half, if any
+    /// (`amdgpu_gmc_set_pte_pde`'s writeq: never torn).
+    fn write_vram(&self, index: u64, value: u64) {
+        if let Some(vram) = &self.vram {
+            if index < self.entries {
+                // SAFETY: the reservation maps this table's VRAM and `index`
+                // is inside its entries.
+                unsafe { vram.memory.mapping().write64(index * 8, value) };
+            }
+        }
+    }
+
+    /// Store entry `index` in the system-RAM page; `walked` when the hub
+    /// reads that page itself, so the store must leave the CPU cache.
+    ///
+    /// # Safety
+    /// `index` must be within the table's entry count.
+    unsafe fn write_copy(&self, index: u64, value: u64, walked: bool) {
         use core::sync::atomic::{compiler_fence, fence, Ordering};
         // SAFETY: physical memory is kernel-mapped at a fixed offset, and the
         // caller bounds `index` against the allocation.
@@ -1574,12 +1719,14 @@ impl PageTable {
             entry.write_volatile(value);
             entry
         };
-        // The tables live in system RAM (Linux keeps a dGPU's in VRAM and
-        // follows a CPU update with mb() + an HDP flush, amdgpu_vm_cpu_commit).
-        // Push the entry out of the CPU cache before any walk can read it, as
-        // the Intel GTT path does: on RX 6750 XT the GC walker read a fresh
-        // PTB's invalid pattern after the CPU had written a valid PTE
-        // (CPG read fault, PERMISSION_FAULTS valid|read, walk valid in RAM).
+        if !walked {
+            return;
+        }
+        // A system-RAM table on a card without a table heap: push the entry
+        // out of the CPU cache before any walk can read it, as the Intel GTT
+        // path does. On RX 6750 XT the GC walker read a fresh PTB's invalid
+        // pattern after the CPU had written a valid PTE (CPG read fault,
+        // PERMISSION_FAULTS valid|read, walk valid in RAM).
         compiler_fence(Ordering::SeqCst);
         #[cfg(target_arch = "x86_64")]
         if narf_arch::x86_64::cache::caps().clflush {
@@ -1595,7 +1742,7 @@ impl PageTable {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Read entry `index`.
+    /// Read entry `index` from the CPU's copy.
     ///
     /// # Safety
     /// As [`PageTable::write`].
@@ -1626,7 +1773,8 @@ struct Node {
 }
 
 /// `amdgpu_gmc_get_pde_for_bo` + `gmc_v11_0_get_vm_pde`, for a table in system
-/// memory — which every table here is.
+/// memory (a card without a [`TableHeap`]; `PageTable::pde` gives a VRAM
+/// table's).
 ///
 /// `amdgpu_ttm_tt_pde_flags` gives `VALID | SYSTEM | SNOOPED` for a cached
 /// TT placement, and `gmc_v11_0_get_vm_pde` then skips the VRAM MC→PA
@@ -1652,14 +1800,16 @@ fn make_pde(table_phys: u64) -> Result<u64, FsError> {
 const MAX_TABLES: u64 = 4096;
 
 impl VmInner {
-    /// Physical address of the root page directory, for
-    /// `VM_CONTEXTn_PAGE_TABLE_BASE_ADDR`. `None` until something is mapped.
-    /// The page-directory base a VM flush writes for this address space:
-    /// the root as a directory entry (system memory, VALID|SYSTEM|SNOOPED).
+    /// The page-directory base a VM flush writes for this address space
+    /// (`amdgpu_gmc_pd_addr`): the root as a directory entry — MC→PA|VALID
+    /// for a VRAM root, VALID|SYSTEM|SNOOPED for a system-RAM one. `None`
+    /// until something is mapped.
     pub fn root_pde(&self) -> Option<u64> {
-        make_pde(self.root_phys()?).ok()
+        self.root.lock().as_ref()?.table.pde().ok()
     }
 
+    /// Physical address of the root's system-RAM page: the table itself on a
+    /// card without a [`TableHeap`], the CPU's copy otherwise.
     pub fn root_phys(&self) -> Option<u64> {
         self.root.lock().as_ref().map(|n| n.table.phys)
     }
@@ -1692,15 +1842,96 @@ impl VmInner {
 
         let mut root_guard = self.root.lock();
         let mut tables = self.tables.lock();
-        if root_guard.is_none() {
-            *root_guard = Some(Node {
-                table: PageTable::new(&geometry, geometry.root_level)?,
-                children: BTreeMap::new(),
-                live: 0,
-            });
-            *tables += 1;
+        let heap = self.heap_for(root_guard.as_ref())?;
+        let result = (|| {
+            if root_guard.is_none() {
+                *root_guard = Some(Node {
+                    table: PageTable::new(&geometry, geometry.root_level, heap.as_ref())?,
+                    children: BTreeMap::new(),
+                    live: 0,
+                });
+                *tables += 1;
+            }
+            self.materialise_pages(
+                &mut root_guard,
+                &mut tables,
+                heap.as_ref(),
+                mapping,
+                address,
+                flags,
+                pages,
+            )
+        })();
+        if let Some(heap) = &heap {
+            commit(heap);
         }
+        result
+    }
 
+    /// The heap new tables of this space go to: the root's placement once a
+    /// root exists (a VRAM space whose card's heap is withdrawn takes no new
+    /// tables until it returns), else the card's [`TableHeap`] if it has one.
+    fn heap_for(&self, root: Option<&Node>) -> Result<Option<TableHeap>, FsError> {
+        let registered = self.card.and_then(table_heap);
+        match root {
+            Some(root) if root.table.vram.is_some() => registered.ok_or(FsError::Busy).map(Some),
+            Some(_) => Ok(None),
+            None => Ok(registered),
+        }
+    }
+
+    /// The card's heap a VRAM-placed space commits to; `None` for a
+    /// system-RAM space or while the heap is withdrawn.
+    fn committed_heap(&self, root: Option<&Node>) -> Option<TableHeap> {
+        root.filter(|root| root.table.vram.is_some())
+            .and(self.card)
+            .and_then(table_heap)
+    }
+
+    /// Bring this space's tables into `heap` (`register_table_heap`): a
+    /// system-RAM tree moves into VRAM bottom-up, each parent's PDEs
+    /// rewritten to its children's VRAM addresses; a VRAM tree is rewritten
+    /// from the CPU's copy. Then commit and bump the TLB sequence.
+    fn place_tables(&self, heap: &TableHeap) -> Result<(), FsError> {
+        let mut root = self.root.lock();
+        let Some(node) = root.as_mut() else {
+            return Ok(());
+        };
+        let result = Self::place_node(node, heap);
+        commit(heap);
+        drop(root);
+        self.tlb_seq
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        result
+    }
+
+    fn place_node(node: &mut Node, heap: &TableHeap) -> Result<(), FsError> {
+        for (&index, child) in node.children.iter_mut() {
+            Self::place_node(child, heap)?;
+            let pde = child.table.pde()?;
+            // SAFETY: child indices come from `index_at`, inside the table.
+            unsafe { node.table.write_copy(index, pde, node.table.vram.is_none()) };
+        }
+        if node.table.vram.is_some() {
+            node.table.restore();
+            Ok(())
+        } else {
+            node.table.attach(heap)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialise_pages(
+        &self,
+        root_guard: &mut Option<Node>,
+        tables: &mut u64,
+        heap: Option<&TableHeap>,
+        mapping: &Mapping,
+        address: &dyn Fn(u64) -> Option<u64>,
+        flags: u64,
+        pages: u64,
+    ) -> Result<(), FsError> {
+        let geometry = self.geometry;
         for page in 0..pages {
             let va = mapping.va + page * GPU_PAGE_SIZE;
             let phys =
@@ -1718,8 +1949,8 @@ impl VmInner {
                     if *tables >= MAX_TABLES {
                         return Err(FsError::NoSpace);
                     }
-                    let child = PageTable::new(&geometry, child_level)?;
-                    let pde = make_pde(child.phys)?;
+                    let child = PageTable::new(&geometry, child_level, heap)?;
+                    let pde = child.pde()?;
                     // SAFETY: `index` is masked to the level's entry count by
                     // `index_at`.
                     unsafe { node.table.write(index, pde) };
@@ -1780,6 +2011,9 @@ impl VmInner {
             // all GPU users are idle and the placement lease owns the page.
             unsafe { node.table.write(geometry.index_at(va, Level::Ptb), pte) };
         }
+        if let Some(heap) = self.committed_heap(root.as_ref()) {
+            commit(&heap);
+        }
     }
 
     /// Restore the invalid pattern over `[va, va+size)` and free directories
@@ -1791,6 +2025,7 @@ impl VmInner {
         {
             let mut root_guard = self.root.lock();
             let mut tables = self.tables.lock();
+            let heap = self.committed_heap(root_guard.as_ref());
             let Some(root) = root_guard.as_mut() else {
                 return;
             };
@@ -1803,6 +2038,9 @@ impl VmInner {
             if root.live == 0 {
                 *tables -= 1;
                 freed.extend(root_guard.take());
+            }
+            if let Some(heap) = heap {
+                commit(&heap);
             }
         }
         // The tables a running job may still walk outlive it.

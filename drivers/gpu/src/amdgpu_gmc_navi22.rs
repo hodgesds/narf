@@ -249,6 +249,24 @@ trait Io {
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
+/// `Gmc::hdp_flusher`: the HDP flush client page-table updates commit with.
+#[derive(Clone, Copy, Debug)]
+pub struct HdpFlusher {
+    regs: MmioRegion,
+    nbio: u64,
+    authority: Cap<BusDeviceCap, Write>,
+}
+impl crate::amdgpu_vm::HdpFlush for HdpFlusher {
+    fn flush(&self) -> Result<(), narf_filesystem::FsError> {
+        // The flush register write and read-back are idempotent and safe
+        // beside the owner's own MMIO, as the fence readers' HDP accesses.
+        invoke(&self.authority, &mut Mmio(self.regs), |io| {
+            flush(io, self.nbio);
+            Ok(())
+        })
+        .map_err(|_| narf_filesystem::FsError::NoDevice)
+    }
+}
 impl Io for Mmio {
     fn read(&mut self, address: u64) -> u32 {
         // SAFETY: Layout bounds both complete hub banks and the HDP remap;
@@ -939,6 +957,17 @@ impl Gmc {
     /// Interrupt-handler hook for decoded VMC/UTCL2 fault IVs.
     pub fn handle_fault(&mut self, fault: Fault) -> Result<FaultOwner, Error> {
         self.engine.handle_fault(fault)
+    }
+    /// `amdgpu_device_flush_hdp(adev, NULL)` for CPU page-table updates
+    /// (`amdgpu_vm_cpu_commit`), usable without this owner: the remapped
+    /// HDP_MEM_FLUSH_CNTL write and NBIO read-back `flush` does, under this
+    /// owner's live PCI authority.
+    pub fn hdp_flusher(&self) -> HdpFlusher {
+        HdpFlusher {
+            regs: self.engine.io.0,
+            nbio: self.engine.layout.nbio,
+            authority: self.engine.authority,
+        }
     }
     /// The discovered MMHUB IP version: it selects the client table a fault
     /// report names MMHUB clients from (`mmhub_v2_0_init_client_info`).
