@@ -12281,6 +12281,33 @@ including SDMA2/3). `amdgpu_vm::VmState` tracks sixteen ring slots. Fences are r
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
 
+Client page tables live in the card's VRAM, as `amdgpu_vm_pt_create` places
+them on a dGPU (`AMDGPU_GEM_DOMAIN_VRAM` unless `is_app_apu`); MMHUB cannot
+walk the system-RAM tables NARF used before (the RX 6750 XT's VCN faulted
+with the context pointing at a valid system-RAM root). Right after the client
+VRAM heap, `register` gives `amdgpu_vm::register_table_heap(card,
+TableHeap { pool, fb_base, fb_offset, hdp })` the same CPU-visible heap and
+`Gmc::hdp_flusher() -> HdpFlusher` (`amdgpu_vm::HdpFlush`: the remapped
+`HDP_MEM_FLUSH_CNTL` write and NBIO read-back under live PCI authority);
+`unregister` withdraws it (`unregister_table_heap`). Updates follow Linux's
+CPU update mode (`AMDGPU_VM_USE_CPU_FOR_GFX`: `amdgpu_vm_cpu_update`, then
+`amdgpu_vm_cpu_commit`'s `mb()` and HDP flush), which matches NARF's
+synchronous VA path; tables are CPU-visible VRAM as Linux requires for
+CPU-updated tables (`AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`). Every table of
+a space on such a card is a 64-bit-stored VRAM page plus a system-RAM copy
+the CPU reads (`describe_va`, unmaps) and restores from; a new table is
+committed before its PDE is written, every map/unmap/relocation rewrite
+commits once. `root_pde()` — the base both hubs' ring flushes program — and
+every PDE are `amdgpu_gmc_vram_mc2pa(mc) | VALID` with no SYSTEM/SNOOPED bit
+(`amdgpu_gmc_get_pde_for_bo`, `gmc_v10_0_get_vm_pde`); PTEs of GTT pages
+keep SYSTEM/SNOOPED. `register_table_heap` brings every registered space of
+the card in line before the card takes jobs: system-RAM tables (mapped
+before the heap existed) move into VRAM bottom-up, VRAM tables lost to S3
+or a recovery are rewritten from the copy; either bumps the space's TLB
+sequence. While the heap is withdrawn a VRAM space takes no new tables
+(`Busy`). Cards that register no table heap (Navi48, Phoenix) keep
+system-RAM tables with per-entry cache flushes.
+
 The native submitter retains pending jobs and their context health. A TDR
 marks the oldest pending context on that ring guilty (`TimedOut`), with
 other unfinished work `Canceled`; explicit unregister/reset also cancels

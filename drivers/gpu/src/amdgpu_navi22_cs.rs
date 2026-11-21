@@ -616,6 +616,21 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
                     });
             }
             crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+            // amdgpu_vm_pt_create on a dGPU: client page tables live in this
+            // CPU-visible VRAM, committed by the HDP flush (both hubs walk
+            // them; MMHUB cannot walk system-RAM tables). Before any job:
+            // existing spaces move in, or are rewritten after a VRAM loss.
+            if let Ok(gmc) = boot.memory() {
+                crate::amdgpu_vm::register_table_heap(
+                    card,
+                    crate::amdgpu_vm::TableHeap {
+                        pool: heap.pool.clone(),
+                        fb_base: heap.fb_base,
+                        fb_offset: heap.fb_offset,
+                        hdp: Arc::new(gmc.hdp_flusher()),
+                    },
+                );
+            }
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 client VRAM heap {} MiB, VMIDs {first}-{last}",
@@ -653,6 +668,7 @@ pub fn unregister() {
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
+        crate::amdgpu_vm::unregister_table_heap(card);
     }
     crate::amdgpu_vcn_navi22_cs::unregister();
     // Its owner is being replaced; the handle must not reach the new one.
