@@ -6108,13 +6108,18 @@ impl VfsRegistry {
     /// that root is:
     ///
     /// * at or below the pivot's new root — every task the pivot was made
-    ///   for: the copies are the mounts, and the entries at their former
-    ///   paths are stale, before and after a lazy unmount of put_old;
+    ///   for: the copies are the mounts while the attachment at put_old is
+    ///   mounted, and the entries at their former paths are stale;
     /// * anywhere else — a task still rooted in the old root, which Linux's
     ///   `chroot_fs_refs` would have moved but NARF leaves alone: it sees the
-    ///   old root's tree as it was, so neither the attachment at put_old (a
-    ///   second view of that tree) nor the new root's subtree (above the old
-    ///   root, unreachable from it) while the attachment is mounted.
+    ///   old root's tree as it was, so never the copies (a second view of
+    ///   that tree) and, while the attachment is mounted, not the new root's
+    ///   subtree either (above the old root, unreachable from it).
+    ///
+    /// Copies outliving their attachment — only a direct registry pop of
+    /// put_old's top mount leaves them — are listed for no one: Linux's
+    /// `umount_tree` takes an attachment's children with it, and a plain
+    /// umount of a mount with children is -EBUSY.
     ///
     /// Mount ids stay unique and the order stays attachment order, which is
     /// what `listmount`'s cursor relies on.
@@ -6124,10 +6129,19 @@ impl VfsRegistry {
         let under = |path: &str, base: &str| path == base || path_is_proper_descendant(path, base);
         let mut hidden = alloc::collections::BTreeSet::new();
         for pivot in pivots.iter() {
+            let attached = q.iter().any(|m| m.id == pivot.attachment);
             if under(root, &pivot.new_root) {
                 hidden.extend(pivot.originals.iter().copied());
-            } else if q.iter().any(|m| m.id == pivot.attachment) {
+                if !attached {
+                    // `umount_tree` takes an attachment's children with it;
+                    // copies left behind belong to no tree.
+                    hidden.extend(pivot.copies.iter().copied());
+                }
+            } else {
                 hidden.extend(pivot.copies.iter().copied());
+                if !attached {
+                    continue;
+                }
                 if let Some(new_root_mount) = pivot.new_root_mount {
                     hidden.extend(
                         q.iter()

@@ -281,6 +281,8 @@ a pivot a reader in the new root sees the old root's mounts at `put_old`, not
 at their former paths; a task still rooted in the old root (Linux's
 `chroot_fs_refs` would have moved it, NARF does not) sees the old root's tree
 as it was, without the new root's subtree or the `put_old` attachment.
+Mounts left below a `put_old` attachment that is no longer mounted belong to
+no tree and are not listed.
 A directory descriptor opened inside that old root follows it to `put_old`:
 `fchdir` to it lands at its `put_old` location while the attachment is
 mounted, as bubblewrap's `fchdir` back to the old root after its second
