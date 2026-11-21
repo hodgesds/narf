@@ -250,6 +250,11 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+  No pump holds its per-controller registry lock (IRQ-safe) across a
+  binding: the boot keyboard and boot mouse pumps move the bindings out
+  for the pass (`hid::pump_unlocked`), the others snapshot them, so the
+  event-ring drain, input routing and the pumps' console notes run with
+  interrupts enabled.
 - USB-HID RMI4 / Elan touchpads (issue #1681): after the PTP branch
   in the attach cascade, `hid::rmi_elan` classifies by VID/PID
   against the existing `RMI_DEVICE_TABLE` / `ELAN_DEVICE_TABLE`

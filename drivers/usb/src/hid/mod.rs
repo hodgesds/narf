@@ -85,6 +85,9 @@ pub mod wacom_features;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod e2e_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "pump_tests.rs"]
+mod pump_tests;
 
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {
@@ -794,11 +797,9 @@ pub(crate) fn saturating_sub(counter: &core::sync::atomic::AtomicU32, n: u32) {
 
 /// Lock-free atomic count of bound keyboards. Diagnostics
 /// (fb::status::paint, panel counters) read this WITHOUT taking
-/// the KEYBOARDS lock — that lock is held by `pump_all` for the
-/// duration of every interrupt-IN read across every bound
-/// keyboard, which on real silicon can be tens of ms. Reading
-/// the lock from the diagnostic path would freeze the executor
-/// (IrqSafeSpinLock disables IF on the waiter).
+/// the KEYBOARDS lock: `pump_all` moves the bindings out of the
+/// registry while it pumps them, so the registry would read empty
+/// mid-pump.
 pub static ATTACHED_KEYBOARD_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -819,9 +820,8 @@ pub fn attached_keyboard_count() -> usize {
 /// kernel pump — the device buffers state-change reports.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     PUMP_ALL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut g = KEYBOARDS.of(xhci_dev.id()).lock();
     let mut total = 0usize;
-    for kbd in g.iter_mut() {
+    pump_unlocked(KEYBOARDS.of(xhci_dev.id()), |kbd| {
         let before = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
         let result = kbd.pump_once(xhci_dev);
         let got = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed) != before;
@@ -835,8 +835,32 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         if let Ok(n) = result {
             total += n;
         }
-    }
+    });
     total
+}
+
+/// Run `pump` on every binding of one controller's `registry` without
+/// holding the registry's IRQ-safe lock: the event-ring drain
+/// (`poll_interrupt_in`), the input routing of each report and the
+/// pump's console notes then run with interrupts enabled, as Linux runs
+/// `hid_irq_in` from the URB completion with no driver-wide lock. The
+/// bindings are moved out for the pass and moved back in front of any
+/// bound meanwhile. A controller's bindings are added and removed only
+/// by its supervisor, which is also the only caller of its pumps, so no
+/// detach can miss a binding that is out.
+pub(crate) fn pump_unlocked<T>(
+    registry: &narf_lib::sync::IrqSafeSpinLock<Vec<T>>,
+    mut pump: impl FnMut(&mut T),
+) {
+    let mut bindings = core::mem::take(&mut *registry.lock());
+    for binding in bindings.iter_mut() {
+        pump(binding);
+    }
+    let mut g = registry.lock();
+    if !g.is_empty() {
+        bindings.append(&mut g);
+    }
+    *g = bindings;
 }
 
 /// Bring-up visibility for the input pumps, whose errors are otherwise
