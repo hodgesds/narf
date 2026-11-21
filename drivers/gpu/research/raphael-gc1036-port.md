@@ -243,6 +243,53 @@ as now.
      discrete size (the HDP option is a `NonZeroU64`). NBIO 7.2's banks live
      in the owners, not the layouts, and the coordinator boxes its owners.
 
+## Publishing to userspace
+
+Navi22 publishes acceleration through four modules that the discrete
+`for_pci_id` table and Navi22's cold-boot owner gate:
+- `amdgpu_info_navi22` (INFO replies);
+- `amdgpu_navi22_cs` (the `amdgpu_cs::Submitter`, client VMIDs, the visible
+  VRAM heap);
+- `amdgpu_rdna2_vram` (hidden-VRAM transfers);
+- `amdgpu_vcn_navi22_cs` (media rings).
+
+Raphael's coordinator holds the same engine owners (`cp::Gfx`,
+`kiq::Compute`, `sdma_queues::Sdma`, `vcn::Media`, `gmc::Gmc`), inside the
+display owner beside the PSP session that loaded them. So the work is to
+route those modules to it, not to write a second client backend.
+
+10. Publish acceleration:
+    1. Fence wakes. The FenceInterrupts stage subscribes the CP EOP, SDMA0
+       trap and CP fault sources through Navi22's `route_fences`, so client
+       fences wake on interrupts. Without that they wait out the throttle
+       deadline.
+    2. Identity. INFO answers Raphael through `amdgpu_info_navi22` with
+       `amdgpu_kms.c`'s APU rules:
+       - `AMDGPU_FAMILY_GC_10_3_6`;
+       - chip_rev from `nbio_v7_2_get_rev_id`, external_rev = rev + 1
+         (`nv_common_early_init`);
+       - `AMDGPU_IDS_FLAGS_FUSION`, no TMZ (`amdgpu_gmc_tmz_set` leaves
+         10.3.6 off);
+       - no MALL;
+       - VRAM type and width from `atom_integrated_system_info`
+         (`amdgpu_atomfirmware_get_vram_info`'s APU arm);
+       - firmware versions from the graphics set, SOS 0 (13.0.5 loads only
+         the TOC).
+       The coordinator publishes topology, chip and PCI revision. ACCEL
+       stays off.
+    3. Submission. A small owner seam (`amdgpu_rdna2_client`) lets the RDNA2
+       submitter lock Navi22's cold boot or Raphael's coordinator. After
+       graphics boots, Raphael registers the submitter, GFXHUB client VMIDs
+       1–7 and a visible client heap from the carve-out (an APU has no
+       hidden VRAM). ACCEL_WORKING and `available_rings` (one SDMA) follow
+       from that.
+    4. Media rings: VCN decode/encode and JPEG for clients. `begin_use` /
+       idle power goes through SMU 13.0.5 (`PowerUpVcn` / `PowerDownVcn`)
+       where Navi22 uses SMU 11.
+    5. Hangs. CP faults fail the faulting job, as on Navi22, but nothing
+       recovers the rings (APU mode-2 reset is not ported). A hung ring
+       times admissions out, and suspend stays refused.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
