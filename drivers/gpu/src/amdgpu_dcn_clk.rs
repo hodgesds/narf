@@ -43,8 +43,9 @@ const LEVELS: usize = 8; // linux: n/a (DCN 3.1.4 path)
 const DF_PSTATES: usize = 4; // linux: n/a (DCN 3.1.4 path)
 
 /// DCN314 drives DP reference and DTB from a fixed 600 MHz source
-/// (`dcn314_clk_mgr_construct`). Spread spectrum would adjust the DP DTO
-/// source only; this path does not enable it.
+/// (`dcn314_clk_mgr_construct`). When the boot firmware leaves the SPLL
+/// spreading, Linux lowers the DP DTO's reference by half the spread; that
+/// adjustment is not made here (see `amdgpu_dcn_dccg`'s `set_dp_dto`).
 pub const DPREFCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
 pub const DTBCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
 /// Linux clamps DPPCLK to 100 MHz to keep an eDP panel plus a 4K monitor from
@@ -489,6 +490,12 @@ impl ClockManager {
     }
     pub fn clocks(&self) -> Clocks {
         self.0.clocks
+    }
+    /// The DPREFCLK the DP DTOs synthesise pixel clocks from: DCN 3.1.4's
+    /// fixed 600 MHz. DCN 3.1.5 asks the SMU for it
+    /// (`dcn315_smu_get_dpref_clk`); that clock manager is not ported yet.
+    pub fn dprefclk_khz(&self) -> u32 {
+        DPREFCLK_KHZ
     }
     /// Apply a clock request in Linux's order. `safe_to_lower` must only be
     /// set when every pipe has already been reprogrammed for the lower clocks.

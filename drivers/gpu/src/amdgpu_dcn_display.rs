@@ -552,6 +552,13 @@ impl Pipeline {
             self.dccg
                 .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
         }
+        // dcn31_program_pix_clk: a DP stream's pixel clock is its OTG's DP
+        // DTO, which nothing else sets for a pipe the boot firmware left idle.
+        self.dccg.set_dp_dto(
+            self.pipe,
+            timing.pixel_clock_khz,
+            self.clocks.dprefclk_khz(),
+        )?;
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             self.dccg.set_dp_stream_clock(
                 self.route.aux,

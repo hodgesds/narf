@@ -134,6 +134,19 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    `dccg31_funcs` lacks `set_pixel_rate_div`, `set_dtbclk_p_src` and
    `trigger_dio_fifo_resync`, so the display skips the K1/K2 dividers as Linux
    does. dcn315 has no USB4 DPIA (dcn314: `usb4_dpia_count = 4`).
+
+   The DP DTO was missing on both DCNs and is now programmed.
+   `dcn31_program_pix_clk`, which both build, clocks a DP 8b/10b stream from
+   the OTG's DP DTO (`OTGn_PIXEL_RATE_CNTL`, `DP_DTOn_PHASE/MODULO`, stride
+   4, unchanged in the 3.1.5 header): phase = pixel clock, modulo =
+   DPREFCLK, or the video-optimized /1.001 ratio; then `DP_DTO0_ENABLE` and
+   `PIPE0_DTO_SRC_SEL = 1` (2 bits on 3.1.4, 1 bit on 3.1.5). NARF never
+   set it, so a pipe the GOP left idle had no programmed pixel clock. The
+   reference comes from `ClockManager::dprefclk_khz`: 600 MHz on DCN 3.1.4,
+   and from SMU `GetDprefclkFreq` on DCN 3.1.5 once step 7 lands. Open:
+   DCN 3.1.4's spread-spectrum adjustment of that reference
+   (`dcn314_is_spll_ssc_enabled`, VBIOS SS table,
+   `dce_adjust_dp_ref_freq_for_ss`) is not made.
 7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
    `dcn315_clk_mgr.c` DPM table parse.
 8. DML: dml31 with the dcn315 SoC bounding box; HUBBUB DET/COMPBUF offsets.

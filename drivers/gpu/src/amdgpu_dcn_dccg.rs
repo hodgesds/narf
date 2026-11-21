@@ -32,6 +32,15 @@ const OTG_PIXEL_RATE_DIV: u64 = 0x006f; // linux: n/a (DCN 3.1.4 path; refused o
 const DPPCLK0_DTO_PARAM: u64 = 0x0099; // linux: mmDPPCLK0_DTO_PARAM
 const DPPCLK_DTO_CTRL: u64 = 0x00b6; // linux: mmDPPCLK_DTO_CTRL
                                      // linux-ctx: hdr=dcn
+                                     // One OTG's pixel clock source and its DP DTO, stride 4.
+const OTG0_PIXEL_RATE_CNTL: u64 = 0x0080; // linux: mmOTG0_PIXEL_RATE_CNTL
+const DP_DTO0_PHASE: u64 = 0x0081; // linux: mmDP_DTO0_PHASE
+const DP_DTO0_MODULO: u64 = 0x0082; // linux: mmDP_DTO0_MODULO
+const DTO_STRIDE: u64 = 4; // linux: mmOTG1_PIXEL_RATE_CNTL - mmOTG0_PIXEL_RATE_CNTL
+const DP_DTO0_ENABLE: u32 = 0x0000_0010; // linux: OTG0_PIXEL_RATE_CNTL__DP_DTO0_ENABLE_MASK
+/// `PIPE0_DTO_SRC_SEL` is two bits on DCN 3.1.4 (0x3000) and one on DCN 3.1.5
+/// (0x1000); both select the DP DTO with 1.
+const PIPE0_DTO_SRC_SEL_SHIFT: u32 = 12; // linux: OTG0_PIXEL_RATE_CNTL__PIPE0_DTO_SRC_SEL__SHIFT
 /// The highest DCCG register this module touches, for the bank bound.
 const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32; // linux: n/a (bank bound)
 /// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
@@ -217,6 +226,54 @@ impl<I: Io> Engine<I> {
         };
         self.update(DPSTREAMCLK_CNTL, 0xf << shift, value << shift)
     }
+    /// `dcn31_program_pix_clk` for a DisplayPort 8b/10b stream: DCN 3.1.4
+    /// and 3.1.5 both build `dcn31_clk_src`, which drives a DP signal's pixel
+    /// clock from the OTG's DP DTO, never the VBIOS PLL command. Phase is the
+    /// pixel clock and modulo the DPREFCLK it is synthesised from (the
+    /// video-optimized ratio where one applies), then DP_DTO0_ENABLE with
+    /// PIPE0_DTO_SRC_SEL = 1. Navi22 programs its own in `amdgpu_navi22_modeset`.
+    ///
+    /// LINUX-GAP: with the SPLL spreading, DCN 3.1.4 lowers the reference by
+    /// half the VBIOS spread (`dcn314_init_clocks` →
+    /// `dce_adjust_dp_ref_freq_for_ss`). That needs the CLK6 SSC bit and the
+    /// SS table, which nothing here reads yet, so a spread SPLL leaves the
+    /// pixel clock high by half the spread; the sink's M/N auto-measurement
+    /// keeps the link valid, but the refresh runs that much fast.
+    fn set_dp_dto(&mut self, otg: u8, pixel_khz: u32, reference_khz: u32) -> Result<(), Error> {
+        if self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        if otg >= self.profile.pipes() {
+            return Err(Error::Invalid);
+        }
+        if pixel_khz == 0 || reference_khz == 0 {
+            return Err(Error::Invalid);
+        }
+        let (phase, modulo) = crate::amdgpu_navi22_modeset::dp_dto_ratio(pixel_khz, reference_khz);
+        // A DTO divides its reference; it cannot synthesise a faster clock.
+        // Linux divides the requested clock by the ODM segment count first
+        // (`dcn20_build_pipe_pix_clk_params`), and no DCN 3.1.x hwseq sets
+        // `is_dp_dig_pixel_rate_div_policy`, so on this one-segment path a
+        // stream above DPREFCLK would need ODM combine, which it does not do.
+        if phase > modulo {
+            return Err(Error::Invalid);
+        }
+        let at = u64::from(otg) * DTO_STRIDE;
+        self.access(|io| {
+            io.write(DP_DTO0_PHASE + at, phase);
+            io.write(DP_DTO0_MODULO + at, modulo);
+        })?;
+        let source = if self.profile.is_dcn314() {
+            0x3 << PIPE0_DTO_SRC_SEL_SHIFT // linux: OTG0_PIXEL_RATE_CNTL__PIPE0_DTO_SRC_SEL_MASK (dcn_3_1_4)
+        } else {
+            0x1 << PIPE0_DTO_SRC_SEL_SHIFT // linux: OTG0_PIXEL_RATE_CNTL__PIPE0_DTO_SRC_SEL_MASK (dcn_3_1_5)
+        };
+        self.update(
+            OTG0_PIXEL_RATE_CNTL + at,
+            DP_DTO0_ENABLE | source,
+            DP_DTO0_ENABLE | 1 << PIPE0_DTO_SRC_SEL_SHIFT,
+        )
+    }
     fn dispclk_dividers(&mut self) -> Result<(u32, u32), Error> {
         let value = self.access(|io| io.read(DENTIST_DISPCLK_CNTL))?;
         if value == u32::MAX {
@@ -330,6 +387,11 @@ impl Dccg {
         source: StreamClock,
     ) -> Result<(), Error> {
         self.0.set_dp_stream_clock(dpia, otg, source)
+    }
+    /// Clock OTG `otg` for a DisplayPort 8b/10b stream of `pixel_khz` from the
+    /// DP DTO against `dprefclk_khz` (see the engine's `set_dp_dto`).
+    pub fn set_dp_dto(&mut self, otg: u8, pixel_khz: u32, dprefclk_khz: u32) -> Result<(), Error> {
+        self.0.set_dp_dto(otg, pixel_khz, dprefclk_khz)
     }
     /// The DISPCLK divider DENTIST has applied, and the one requested.
     pub fn dispclk_dividers(&mut self) -> Result<(u32, u32), Error> {

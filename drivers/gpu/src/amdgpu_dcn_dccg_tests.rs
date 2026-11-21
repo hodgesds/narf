@@ -306,3 +306,65 @@ kernel_test_in!(
     "drivers/gpu/dcn-dccg",
     dccg_dcn315_keeps_dpp_dtos_and_refuses_dccg314_only_operations
 );
+
+/// `dcn31_program_pix_clk` for DP 8b/10b on DCN 3.1.4 and 3.1.5: phase and
+/// modulo first, then DP_DTO0_ENABLE with PIPE0_DTO_SRC_SEL = 1. OTG2's DTO is
+/// regOTG2_PIXEL_RATE_CNTL 0x0088 / DP_DTO2_PHASE 0x0089 / DP_DTO2_MODULO
+/// 0x008a in both headers. A /1.001 rate takes the video-optimized ratio.
+fn dccg_dp_dto_clocks_the_otg_from_dprefclk() -> TestResult {
+    for (profile, src_mask) in [(Profile::Dcn314, 0x3000u32), (Profile::Dcn315, 0x1000)] {
+        let mut dccg = dccg();
+        dccg.profile = profile;
+        // A stale source select from the boot firmware, and on DCN 3.1.5 a
+        // neighbouring bit that is not part of the field.
+        dccg.io.values[0x88] = 0x2000 | 0x0800;
+        if dccg.set_dp_dto(2, 148_350, 600_000).is_err() {
+            return TestResult::Fail("DP DTO rejected");
+        }
+        if dccg.io.values[0x89] != 148_500 * 1000 || dccg.io.values[0x8a] != 600_000 * 1001 {
+            return TestResult::Fail("148.35 MHz is 148.5 MHz / 1.001 against 600 MHz");
+        }
+        let cntl = dccg.io.values[0x88];
+        if cntl & (0x10 | src_mask) != 0x10 | 0x1000 || cntl & 0x0800 == 0 {
+            return TestResult::Fail("DTO enable or source select");
+        }
+        if profile == Profile::Dcn315 && cntl & 0x2000 == 0 {
+            return TestResult::Fail("DCN 3.1.5 clobbered a bit outside PIPE0_DTO_SRC_SEL");
+        }
+        // Phase and modulo land before the enable.
+        let w = &dccg.io.writes;
+        let (Some(phase), Some(enable)) = (
+            w.iter().position(|&(r, _)| r == 0x89),
+            w.iter().position(|&(r, v)| r == 0x88 && v & 0x10 != 0),
+        ) else {
+            return TestResult::Fail("DP DTO writes");
+        };
+        if phase > enable {
+            return TestResult::Fail("DTO enabled before its ratio");
+        }
+        // An ordinary rate is Hz over Hz.
+        dccg.set_dp_dto(0, 154_000, 600_000).unwrap();
+        if dccg.io.values[0x81] != 154_000_000 || dccg.io.values[0x82] != 600_000_000 {
+            return TestResult::Fail("plain DP DTO ratio");
+        }
+        // A DTO cannot run faster than its reference, nor past the pipes.
+        if dccg.set_dp_dto(0, 600_001, 600_000) != Err(Error::Invalid)
+            || dccg.set_dp_dto(4, 154_000, 600_000) != Err(Error::Invalid)
+            || dccg.set_dp_dto(0, 0, 600_000) != Err(Error::Invalid)
+        {
+            return TestResult::Fail("impossible DP DTO accepted");
+        }
+    }
+    // Navi22 programs its DTO in its own modeset.
+    let mut navi = dccg();
+    navi.profile = Profile::Navi22;
+    if navi.set_dp_dto(0, 154_000, 730_000) != Err(Error::Unsupported) || !navi.io.writes.is_empty()
+    {
+        return TestResult::Fail("DCN30 DP DTO taken by the DCN 3.1.x path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_dp_dto_clocks_the_otg_from_dprefclk
+);

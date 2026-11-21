@@ -731,13 +731,21 @@ pub(crate) fn select_dp_on(
 }
 /// `dcn3_program_pix_clk`'s DP DTO phase and modulo for `pixel_khz`.
 pub(crate) fn dp_dto(pixel_khz: u32) -> (u32, u32) {
+    dp_dto_ratio(pixel_khz, DPREFCLK_KHZ)
+}
+/// The DP DTO phase and modulo for `pixel_khz` against a `reference_khz`
+/// DPREFCLK, as every DCN's `program_pix_clk` computes them (`dcn3_` here,
+/// `dcn31_` for DCN 3.1.x): the video-optimized /1.001 or *1.001 rate when
+/// the requested clock falls in one of its ranges, else the clock itself in
+/// Hz over the reference in Hz.
+pub(crate) fn dp_dto_ratio(pixel_khz: u32, reference_khz: u32) -> (u32, u32) {
     match VIDEO_OPTIMIZED_RATES
         .iter()
         .find(|e| e.0 <= pixel_khz && pixel_khz <= e.1)
     {
-        Some(&(_, _, target, mult, div)) => (target * mult, DPREFCLK_KHZ * div),
+        Some(&(_, _, target, mult, div)) => (target * mult, reference_khz * div),
         // actual_pix_clk_100hz * 100 (Hz) over dprefclk in Hz.
-        None => (pixel_khz * 1000, DPREFCLK_KHZ * 1000),
+        None => (pixel_khz * 1000, reference_khz * 1000),
     }
 }
 /// The DCN30 admission of a lit sink, retained for KMS: the board SoC
