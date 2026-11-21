@@ -274,6 +274,10 @@ names files relative to the caller's new root. The mount table is path-keyed,
 so the attachment copies each entry (filesystem, root, flags, peer group,
 source); the originals stay at their old paths outside the new root, where
 only a descriptor opened before the pivot still reaches them.
+A directory descriptor opened inside that old root follows it to `put_old`:
+`fchdir` to it lands at its `put_old` location while the attachment is
+mounted, as bubblewrap's `fchdir` back to the old root after its second
+`pivot_root(".", ".")`, before `umount2(".", MNT_DETACH)`, requires.
 
 `narf_user_runtime::execve` does not return on success and returns the kernel's
 positive Linux errno on failure. `narf-libc::execve` publishes that exact value

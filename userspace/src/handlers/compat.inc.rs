@@ -5021,6 +5021,17 @@ pub(crate) fn current_attach_old_root(
     }
 }
 
+/// Where `host` — a path in an old root `pivot_root` moved — is attached now
+/// in the caller's mount namespace. See
+/// [`narf_filesystem::VfsRegistry::pivoted_location`].
+pub(crate) fn current_pivoted_location(host: &str) -> Option<alloc::string::String> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.pivoted_location(host)
+    } else {
+        narf_filesystem::registry().pivoted_location(host)
+    }
+}
+
 pub(crate) fn current_move_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,
