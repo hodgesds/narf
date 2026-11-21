@@ -3,7 +3,9 @@
 //! and its reset released, decodes the public VCN decode (PACKET0 to the
 //! internal command registers), encode and JRBC ring ABIs independently of
 //! the encoders, and executes work only after an HDP flush, inside an open
-//! NBIF aperture and the MMSCH doorbell range of the right instance.
+//! NBIF aperture and the MMSCH doorbell range of the right instance. Its
+//! encoder walks each IB's packages over the length VCN_ENC_CMD_IB names;
+//! a package that does not parse wedges the instance's VCPU.
 use super::*;
 use alloc::{collections::BTreeMap, rc::Rc, sync::Arc, vec::Vec};
 use core::{
@@ -110,6 +112,9 @@ struct Model {
     /// unpause, as the RX 6750 XT's VCN0 does (POWER_STATUS 0x906) while its
     /// encode rings hold IB-test commands they never ran.
     power_held: [bool; 2],
+    /// The VCPU never returned from an encode IB whose packages did not
+    /// parse: no ring of the instance runs again and it stays powered up.
+    wedged: [bool; 2],
 }
 fn mc(map: MmioRegion, offset: u64) -> u64 {
     map.phys.raw() - PHYS + MC + offset
@@ -160,6 +165,7 @@ impl Model {
             sram: Rc::new(RefCell::new(BTreeMap::new())),
             pause_stuck: false,
             power_held: [false; 2],
+            wedged: [false; 2],
         }
     }
     fn reg(&self, address: u64) -> u32 {
@@ -341,22 +347,54 @@ impl Model {
             }
         }
     }
-    fn enc(&mut self, i: usize, j: usize, words: &[u32]) {
+    /// The encoder firmware's IB walk: packages of `[size in bytes, type,
+    /// payload]` until the `dwords` the VCN_ENC_CMD_IB names are consumed.
+    /// A package that claims no size, is not whole dwords or runs past the
+    /// IB never advances the walk: the VCPU does not return from the IB.
+    /// Returns the session op, or None for such a wedge.
+    fn enc_ib(&self, address: u64, dwords: u32) -> Option<u32> {
+        let mut at = 0;
+        let mut op = None;
+        while at < dwords {
+            let size = self.word(address + u64::from(at) * 4);
+            if size == 0 || size % 4 != 0 || at + size / 4 > dwords {
+                return None;
+            }
+            let package: Vec<u32> = (0..size / 4)
+                .map(|n| self.word(address + u64::from(at + n) * 4))
+                .collect();
+            match package.get(1).copied() {
+                Some(1) => {
+                    assert_eq!(package.len(), 6, "session info size");
+                    assert_eq!(package[2], 1, "session handle 1");
+                    let session = (u64::from(package[3]) << 32) | u64::from(package[4]);
+                    assert_eq!(session % 4096, 0, "session buffer not page aligned");
+                }
+                Some(2) => assert_eq!(package, [0x14, 2, 0x1c, 0, 0], "task info"),
+                Some(code @ (0x0800_0001 | 0x0800_0002)) => {
+                    assert_eq!(package.len(), 2, "op size");
+                    op = Some(code);
+                }
+                other => panic!("unexpected encode package {other:?}"),
+            }
+            at += size / 4;
+        }
+        Some(op.expect("encode IB without an op"))
+    }
+    /// Run encode ring commands; `Err(k)`: the VCPU wedged in the IB at
+    /// command word `k` and consumed nothing from there on.
+    fn enc(&mut self, i: usize, j: usize, words: &[u32]) -> Result<(), usize> {
         let mut k = 0;
         while k < words.len() {
             k += match words[k] {
                 cmd::ENC_NOP | cmd::ENC_END => 1,
                 cmd::ENC_IB => {
                     assert_eq!(words[k + 1], 0, "kernel IB outside VMID0");
-                    assert_eq!(words[k + 4], 16);
                     let address = u64::from(words[k + 2]) | (u64::from(words[k + 3]) << 32);
-                    let ib: Vec<u32> = (0..16).map(|n| self.word(address + n * 4)).collect();
-                    assert_eq!(ib[..3], [0x18, 1, 1], "session info / handle 1");
-                    assert_eq!(ib[6..11], [0x14, 2, 0x1c, 0, 0], "task info");
-                    let session = (u64::from(ib[3]) << 32) | u64::from(ib[4]);
-                    assert_eq!(session % 4096, 0);
-                    assert_eq!(ib[11], 8);
-                    self.work.push(Work::Session(i, j, ib[12]));
+                    let Some(op) = self.enc_ib(address, words[k + 4]) else {
+                        return Err(k);
+                    };
+                    self.work.push(Work::Session(i, j, op));
                     5
                 }
                 cmd::ENC_FENCE => {
@@ -373,6 +411,7 @@ impl Model {
                 other => panic!("unexpected encode command {other:#x}"),
             };
         }
+        Ok(())
     }
     fn jpeg(&mut self, words: &[u32]) {
         for pair in words.chunks_exact(2) {
@@ -395,7 +434,7 @@ impl Model {
             if index == doorbell::dec(i as u32) {
                 let slot = 3 * i;
                 self.regs.insert(v(i, RBC_RB_WPTR), value);
-                if !self.booted(i) || self.stalled[slot] {
+                if !self.booted(i) || self.stalled[slot] || self.wedged[i] {
                     return;
                 }
                 if self.dpg(i) {
@@ -426,15 +465,26 @@ impl Model {
                 let slot = 3 * i + 1 + j;
                 self.regs.insert(v(i, RB_WPTR[j]), value);
                 // DPG keeps no encode ring state outside a pause.
-                if !self.booted(i) || self.stalled[slot] || (self.dpg(i) && !self.paused(i)) {
+                if !self.booted(i)
+                    || self.stalled[slot]
+                    || self.wedged[i]
+                    || (self.dpg(i) && !self.paused(i))
+                {
                     return;
                 }
                 assert_eq!(self.reg(v(i, RB_SIZE[j])), RING_DW);
                 let base = self.pair(v(i, RB_BASE_LO[j]), v(i, RB_BASE_HI[j]));
                 let words = self.ring(base, self.rptr[slot], value);
-                self.enc(i, j, &words);
-                self.rptr[slot] = value;
-                self.regs.insert(v(i, RB_RPTR[j]), value);
+                let rptr = match self.enc(i, j, &words) {
+                    Ok(()) => value,
+                    // The read pointer stays on the IB the VCPU never left.
+                    Err(k) => {
+                        self.wedged[i] = true;
+                        (self.rptr[slot] + k as u32) % RING_DW
+                    }
+                };
+                self.rptr[slot] = rptr;
+                self.regs.insert(v(i, RB_RPTR[j]), rptr);
                 return;
             }
             if i == 0 && index == doorbell::JPEG {
@@ -477,8 +527,11 @@ impl Io for Model {
         for i in [0, 1] {
             let power = self.reg(v(i, POWER_STATUS));
             if address == v(i, POWER_STATUS) && power & POWER_PG_MODE != 0 {
-                // Powered up (2) while paused and not stalled, else 1.
-                let up = self.power_held[i] || (self.paused(i) && power & POWER_STALL_DPG == 0);
+                // Powered up (2) while paused and not stalled, or while the
+                // VCPU is wedged; else 1.
+                let up = self.power_held[i]
+                    || self.wedged[i]
+                    || (self.paused(i) && power & POWER_STALL_DPG == 0);
                 return (power & !POWER_STATUS_MASK) | if up { 2 } else { 1 };
             }
         }
@@ -1925,6 +1978,59 @@ fn vcn_navi22_dpg_failures_are_terminal() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_dpg_failures_are_terminal
+);
+
+/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` write 13 dwords of
+/// packages (session info, task info, op) into a 16-dword IB and submit
+/// `ib->length_dw`, 13: `vcn_v2_0_enc_ring_emit_ib` names exactly the
+/// packages. An IB that names 16 makes the firmware walk a zero-sized
+/// package after the op. That is the RX 6750 XT's VCN0 at boot: both encode
+/// rings passed their ring tests, then never left their first IB-test IB
+/// (RPTR 0x40, WPTR 0xc0, fence 0, POWER_STATUS 2) and the VCPU stopped
+/// serving its decode ring as well.
+fn vcn_navi22_encode_ib_names_only_its_packages() -> TestResult {
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    if run(e.start(firmware(1), None, &mut psp)).is_err() || e.state != State::Running {
+        return TestResult::Fail("DPG start");
+    }
+    let result = run(e.test_ib());
+    let m = &e.hw.io;
+    let rptr = [m.reg(v(0, RB_RPTR[0])), m.reg(v(0, RB_RPTR[1]))];
+    if m.wedged[0] || rptr != [0xc0, 0xc0] {
+        return TestResult::Fail(
+            "the encode IB test wedged VCN0 in its first IB (RPTR 0x40, WPTR 0xc0, fence 0)",
+        );
+    }
+    if result.is_err() || e.state != State::Verified || e.proof.enc_ib[0] != [2, 2] {
+        return TestResult::Fail("encode IB tests");
+    }
+    let inst = e.vcn[0].as_ref().unwrap();
+    let map = inst.memory.mapping();
+    for (j, &ring) in ENC_RING.iter().enumerate() {
+        // Two submissions after the ring test, each VCN_ENC_CMD_IB first.
+        for (at, ib) in [(0x40, IBS[2]), (0x80, IBS[3])] {
+            let start = mc(map, ring) + at * 4;
+            let packet: Vec<u32> = (0..5).map(|k| m.word(start + k * 4)).collect();
+            let address = inst.address(ib);
+            if packet != [cmd::ENC_IB, 0, address as u32, (address >> 32) as u32, 13] {
+                return TestResult::Fail("VCN_ENC_CMD_IB does not name the 13 package dwords");
+            }
+        }
+        for op in [0x0800_0001, 0x0800_0002] {
+            if !m.work.contains(&Work::Session(0, j, op)) {
+                return TestResult::Fail("encode session initialize/close");
+            }
+        }
+    }
+    // The VCPU still serves decode after the encode IB tests.
+    if run(e.test_dec_ring(0)).is_err() {
+        return TestResult::Fail("VCN0 decode stopped after the encode IB tests");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/enc-ib",
+    vcn_navi22_encode_ib_names_only_its_packages
 );
 
 /// Every idle gate attempt that reaches the engine stop and the PMFW
