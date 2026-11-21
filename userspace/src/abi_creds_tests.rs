@@ -2682,6 +2682,71 @@ kernel_test_in!(
     smoke_abi_caps_unshare_needs_sys_admin_except_newuser
 );
 
+/// `kernel/nsproxy.c::copy_namespaces` — the clone(2)/clone3(2) twin of the
+/// unshare gate above:
+///
+///     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+///     if (likely(!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))) { ... }
+///     else if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+///             return -EPERM;
+///
+/// asked of the CHILD's credential. Without CLONE_NEWUSER that is a copy of
+/// the caller's, so an unprivileged clone creating any other namespace is
+/// -EPERM and no child exists. With CLONE_NEWUSER `copy_creds` has already
+/// bound the credential to the new user namespace with a full capability
+/// set, so the same clone succeeds — which is how bubblewrap, Chromium's
+/// zygote and Steam's pressure-vessel create their sandboxes unprivileged.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_caps_clone_new_namespaces_need_sys_admin() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+        for flag in [
+            CLONE_NEWNS,
+            CLONE_NEWUTS,
+            CLONE_NEWIPC,
+            CLONE_NEWPID,
+            CLONE_NEWNET,
+            CLONE_NEWCGROUP,
+        ] {
+            match clone_child(flag) {
+                Err(-1) => {}
+                Ok(child) => {
+                    release_clone_child(child);
+                    return Err("an unprivileged clone created a namespace without CAP_SYS_ADMIN");
+                }
+                Err(_) => return Err("unprivileged clone(CLONE_NEW*): want -EPERM"),
+            }
+        }
+        match clone_child(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS) {
+            Ok(child) => {
+                release_clone_child(child);
+                Ok(())
+            }
+            Err(_) => Err("clone(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWUTS) was refused"),
+        }
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone-caps",
+    smoke_abi_caps_clone_new_namespaces_need_sys_admin
+);
+
 fn smoke_abi_caps_unshare_einval_precedes_eperm() -> TestResult {
     with_setup(|| {
         // `check_unshare_flags` runs before the capability check, so an
