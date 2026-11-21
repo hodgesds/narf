@@ -2368,21 +2368,28 @@ pub unsafe fn spawn_display_monitor() {
     );
     narf_scheduler::spawn(async {
         loop {
-            let mut waited = 0;
-            while waited < MONITOR_MS
-                && !crate::amdgpu_navi22_kms::take_pending()
-                && RELIT.load(Ordering::Acquire) == crate::amdgpu_navi22_recovery::recoveries()
-            {
-                narf_time::SleepUntil::new(
-                    narf_time::Deadline::after_ms(MONITOR_STEP_MS).as_instant(),
-                )
-                .await;
-                waited += MONITOR_STEP_MS;
-            }
+            monitor_wait(None).await;
             // SAFETY: the monitor's contract, accepted at spawn.
             alloc::boxed::Box::pin(unsafe { monitor_pass() }).await;
         }
     });
+}
+
+/// The display monitor's wait for its next pass: a DRM request or HPD
+/// (`kms::wake`), a recovery, or the poll period.
+fn monitor_wait(poll: Option<u64>) -> impl core::future::Future<Output = ()> {
+    let _ = poll;
+    async {
+        let mut waited = 0;
+        while waited < MONITOR_MS
+            && !crate::amdgpu_navi22_kms::take_pending()
+            && RELIT.load(Ordering::Acquire) == crate::amdgpu_navi22_recovery::recoveries()
+        {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(MONITOR_STEP_MS).as_instant())
+                .await;
+            waited += MONITOR_STEP_MS;
+        }
+    }
 }
 
 /// Called by the recovery path once the new owner runs: the monitor relights
@@ -3885,5 +3892,60 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_variable_refresh_never_extrapolates_hardware_vblanks
+    );
+
+    struct Count(core::sync::atomic::AtomicUsize);
+    impl alloc::task::Wake for Count {
+        fn wake(self: alloc::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    /// Expire hrtimers for `ms`, as executor rounds do while a task parks.
+    fn idle_for(ms: u64) {
+        let deadline = narf_time::Deadline::after_ms(ms);
+        while !deadline.expired() {
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Linux runs display hot-plug from the HPD interrupt (amdgpu_dm's hpd
+    /// handler, then hotplug work) and DRM requests at commit; only a
+    /// connector without HPD is polled, every DRM_OUTPUT_POLL_PERIOD (10 s).
+    /// With no event the monitor's wait arms no short timer, and a request
+    /// (HPD or DRM, both `kms::wake`) ends it at once.
+    fn navi22_display_monitor_sleeps_until_an_event() -> TestResult {
+        use core::{future::Future, task::Context};
+        if amdgpu::pci_device().is_some() {
+            return TestResult::Skip("physical GPU: its monitor consumes requests");
+        }
+        let _ = crate::amdgpu_navi22_kms::take_pending();
+        for poll in [None, Some(10_000)] {
+            let count = alloc::sync::Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
+            let waker = core::task::Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut wait = core::pin::pin!(monitor_wait(poll));
+            if wait.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail("monitor wait ended with no event");
+            }
+            idle_for(150);
+            if count.0.load(Ordering::SeqCst) != 0 {
+                return TestResult::Fail(
+                    "the idle display monitor wakes on a timer (MONITOR_STEP_MS, 20 times a second)",
+                );
+            }
+            crate::amdgpu_navi22_kms::wake();
+            if count.0.load(Ordering::SeqCst) == 0 {
+                return TestResult::Fail("an HPD or DRM request did not wake the monitor at once");
+            }
+            if wait.as_mut().poll(&mut cx).is_pending() {
+                return TestResult::Fail("a woken monitor did not run its pass");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22/monitor",
+        navi22_display_monitor_sleeps_until_an_event
     );
 }
