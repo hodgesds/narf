@@ -25,6 +25,7 @@
 
 use core::future::Future;
 
+pub mod band5;
 pub mod mac;
 pub mod phy;
 pub mod radio;

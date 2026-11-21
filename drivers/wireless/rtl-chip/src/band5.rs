@@ -11,7 +11,7 @@
 
 /// `IS_CH_5G_BAND(channel)`: 1 = 36..=48, 2 = 52..=64, 3 = 100..=144,
 /// 4 = 149..=177; None outside the 5GHz bands.
-pub(super) const fn band(channel: u8) -> Option<u8> {
+pub const fn band(channel: u8) -> Option<u8> {
     match channel {
         36..=48 => Some(1),
         52..=64 => Some(2),
@@ -24,7 +24,7 @@ pub(super) const fn band(channel: u8) -> Option<u8> {
 /// `rtw_get_channel_group` for a 5GHz channel number listed by Linux
 /// (20/40/80MHz centers and primaries). Unlisted numbers return None where
 /// Linux would WARN and fall back to group 0.
-pub(super) const fn group(channel: u8) -> Option<usize> {
+pub const fn group(channel: u8) -> Option<usize> {
     Some(match channel {
         36 | 38 | 40 | 42 => 0,
         44 | 46 | 48 | 50 => 1,
@@ -46,7 +46,7 @@ pub(super) const fn group(channel: u8) -> Option<usize> {
 
 /// A 5GHz 20MHz primary: a multiple-of-four channel in a Linux band with a
 /// Linux channel group (36..=64, 100..=144, 149..=177 step 4 from 149).
-pub(super) const fn primary(channel: u8) -> bool {
+pub const fn primary(channel: u8) -> bool {
     band(channel).is_some()
         && group(channel).is_some()
         && if channel >= 149 {
@@ -57,7 +57,7 @@ pub(super) const fn primary(channel: u8) -> bool {
 }
 
 /// `ieee80211_channel_to_frequency` for a 5GHz channel.
-pub(super) const fn frequency(channel: u8) -> Option<u16> {
+pub const fn frequency(channel: u8) -> Option<u16> {
     match band(channel) {
         Some(_) => Some(5000 + 5 * channel as u16),
         None => None,
@@ -65,7 +65,7 @@ pub(super) const fn frequency(channel: u8) -> Option<u16> {
 }
 
 /// `rtw8822c_set_channel_bb` 5GHz REG_RXAGCCTL{0,} BITS_RXAGC_OFDM.
-pub(super) const fn rxagc_ofdm8822c(channel: u8) -> Option<u32> {
+pub const fn rxagc_ofdm8822c(channel: u8) -> Option<u32> {
     match band(channel) {
         Some(1 | 2) => Some(1),
         Some(3) => Some(2),
@@ -75,7 +75,7 @@ pub(super) const fn rxagc_ofdm8822c(channel: u8) -> Option<u32> {
 }
 
 /// `rtw8822c_set_channel_bb` 5GHz REG_SCOTRK (0xc30[11:0]).
-pub(super) const fn scotrk8822c(channel: u8) -> Option<u32> {
+pub const fn scotrk8822c(channel: u8) -> Option<u32> {
     Some(match channel {
         36..=51 => 0x494,
         52..=55 => 0x493,
@@ -88,7 +88,7 @@ pub(super) const fn scotrk8822c(channel: u8) -> Option<u32> {
 }
 
 /// `rtw8821c_set_channel_bb` 5GHz REG_TXSCALE_A (0xc1c[11:8]).
-pub(super) const fn txscale8821c(channel: u8) -> Option<u32> {
+pub const fn txscale8821c(channel: u8) -> Option<u32> {
     match channel {
         36..=64 => Some(1),
         100..=144 => Some(2),
@@ -100,7 +100,7 @@ pub(super) const fn txscale8821c(channel: u8) -> Option<u32> {
 /// `rtw8821c_set_channel_bb` 5GHz REG_CLKTRK (0x860[28:17]). Linux leaves
 /// the register unchanged for 5GHz numbers outside these ranges; such a
 /// channel is not a supported primary here.
-pub(super) const fn clktrk8821c(channel: u8) -> Option<u32> {
+pub const fn clktrk8821c(channel: u8) -> Option<u32> {
     Some(match channel {
         36..=48 => 0x494,
         52..=64 => 0x453,
@@ -118,7 +118,7 @@ const fn nibble(v: u8) -> i8 {
 /// One RF path's `struct rtw_5g_txpwr_idx` (bytes 18..42 of the 42-byte
 /// `rtw_txpwr_idx` record after `rtw_2g_txpwr_idx`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Power5g {
+pub struct Power5g {
     bw40_base: [u8; 14],
     /// `ht_1s_diff` (ofdm low nibble, bw20 high nibble).
     ht_1s: u8,
@@ -132,7 +132,7 @@ pub(super) struct Power5g {
 
 impl Power5g {
     /// Parse one path record without Linux's erased-value substitution.
-    pub(super) fn parse(path: &[u8]) -> Option<Self> {
+    pub fn parse(path: &[u8]) -> Option<Self> {
         let block = path.get(18..42)?;
         Some(Self {
             bw40_base: block[..14].try_into().ok()?,
@@ -157,12 +157,12 @@ impl Power5g {
     }
     /// `rtw_phy_get_5g_tx_power_index` for OFDM6..54: `bw40_base[group] +
     /// ht_1s_diff.ofdm * txgi_factor`.
-    pub(super) fn ofdm(&self, group: usize, factor: i8) -> Option<u8> {
+    pub fn ofdm(&self, group: usize, factor: i8) -> Option<u8> {
         Self::add(self.base(group)?, &[nibble(self.ht_1s & 15)], factor)
     }
     /// HT/VHT MCS at 20MHz: `+ ht_1s_diff.bw20` (+ `ht_2s_diff.bw20` for
     /// two spatial streams).
-    pub(super) fn bw20(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
+    pub fn bw20(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
         let one = nibble(self.ht_1s >> 4);
         let diffs: &[i8] = if two {
             &[one, nibble(self.ht_2s & 15)]
@@ -172,14 +172,14 @@ impl Power5g {
         Self::add(self.base(group)?, diffs, factor)
     }
     /// HT/VHT MCS at 40MHz: `bw40_base` (+ `ht_2s_diff.bw40` for two).
-    pub(super) fn bw40(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
+    pub fn bw40(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
         let diffs: &[i8] = if two { &[nibble(self.ht_2s >> 4)] } else { &[] };
         Self::add(self.base(group)?, diffs, factor)
     }
     /// VHT at 80MHz: average of `bw40_base[group]` and `[group + 1]` plus
     /// `vht_1s_diff.bw80` (+ `vht_2s_diff.bw80` for two). Linux integer
     /// division truncates.
-    pub(super) fn bw80(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
+    pub fn bw80(&self, group: usize, two: bool, factor: i8) -> Option<u8> {
         let avg = ((u16::from(self.base(group)?) + u16::from(self.base(group + 1)?)) / 2) as u8;
         let one = nibble(self.vht_1s >> 4);
         let diffs: &[i8] = if two {
@@ -195,7 +195,7 @@ impl Power5g {
 /// IEEE 802.11 Annex E 40MHz block (36/40, 44/48, ..., 157/161; class
 /// 116/117, 119/120, 122/123, 126/127), the secondary exactly 4 channels
 /// from the primary. 165/169 and 173/177 are not admitted.
-pub(super) const fn center40(first: u8, secondary: u8) -> Option<u8> {
+pub const fn center40(first: u8, secondary: u8) -> Option<u8> {
     let low = if first < secondary { first } else { secondary };
     let base = if low >= 149 { 149 } else { 36 };
     if !primary(first)
@@ -214,14 +214,14 @@ pub(super) const fn center40(first: u8, secondary: u8) -> Option<u8> {
 /// (1) / `_LOWER` (2); 80MHz additionally `RTW_SC_20_UPMOST` (3) /
 /// `_LOWEST` (4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Width {
+pub enum Width {
     Twenty,
     Forty(u8),
     Eighty(u8),
 }
 
 impl Width {
-    pub(super) const fn mhz(self) -> u8 {
+    pub const fn mhz(self) -> u8 {
         match self {
             Self::Twenty => 20,
             Self::Forty(_) => 40,
@@ -229,14 +229,14 @@ impl Width {
         }
     }
     /// `primary_ch_idx` (0 at 20MHz).
-    pub(super) const fn sc(self) -> u8 {
+    pub const fn sc(self) -> u8 {
         match self {
             Self::Twenty => 0,
             Self::Forty(sc) | Self::Eighty(sc) => sc,
         }
     }
     /// Well-formed sub-channel index for the width.
-    pub(super) const fn valid(self) -> bool {
+    pub const fn valid(self) -> bool {
         match self {
             Self::Twenty => true,
             Self::Forty(sc) => matches!(sc, 1 | 2),
@@ -246,7 +246,7 @@ impl Width {
     /// `mac.c::rtw_set_channel_mac` REG_DATA_SC (0x483): `BIT_TXSC_20M`
     /// = sc and, at 80MHz, `BIT_TXSC_40M` = `RTW_SC_40_UPPER` (9) for
     /// sc 1/3 else `RTW_SC_40_LOWER` (10).
-    pub(super) const fn data_sc(self) -> u8 {
+    pub const fn data_sc(self) -> u8 {
         match self {
             Self::Twenty => 0,
             Self::Forty(sc) => sc,
@@ -258,7 +258,7 @@ impl Width {
     }
     /// `rtw_set_channel_mac` REG_WMAC_TRXPTCL_CTL BIT_RFMOD field (0x668
     /// bits 8:7): 40MHz bit7, 80MHz bit8.
-    pub(super) const fn rfmod(self) -> u32 {
+    pub const fn rfmod(self) -> u32 {
         match self {
             Self::Twenty => 0,
             Self::Forty(_) => 1,
@@ -269,7 +269,7 @@ impl Width {
 
 /// `main.c::rtw_update_channel` sub-channel index of `primary` inside the
 /// 40MHz pair centered at `center`.
-pub(super) const fn sc40(primary: u8, center: u8) -> u8 {
+pub const fn sc40(primary: u8, center: u8) -> u8 {
     if primary > center {
         1
     } else {
@@ -278,14 +278,14 @@ pub(super) const fn sc40(primary: u8, center: u8) -> u8 {
 }
 
 /// `center` is the center channel of a [`center40`] pair.
-pub(super) const fn is_center40(center: u8) -> bool {
+pub const fn is_center40(center: u8) -> bool {
     center >= 38 && center40(center - 2, center + 2).is_some()
 }
 
 /// Center channel of the 5GHz 80MHz block holding `primary`: IEEE 802.11
 /// Annex E class 128 centers 42, 58, 106, 122, 138 and 155 (blocks
 /// 36..=48, 52..=64, 100..=112, 116..=128, 132..=144, 149..=161).
-pub(super) const fn center80(channel: u8) -> Option<u8> {
+pub const fn center80(channel: u8) -> Option<u8> {
     if !primary(channel) {
         return None;
     }
@@ -302,7 +302,7 @@ pub(super) const fn center80(channel: u8) -> Option<u8> {
 }
 
 /// `center` is a [`center80`] block center.
-pub(super) const fn is_center80(center: u8) -> bool {
+pub const fn is_center80(center: u8) -> bool {
     matches!(center, 42 | 58 | 106 | 122 | 138 | 155)
 }
 
@@ -310,7 +310,7 @@ pub(super) const fn is_center80(center: u8) -> bool {
 /// centered at `center`: above the center by 10MHz `RTW_SC_20_UPPER` (1),
 /// by 30MHz `RTW_SC_20_UPMOST` (3); below by 10MHz `RTW_SC_20_LOWER` (2),
 /// by 30MHz `RTW_SC_20_LOWEST` (4).
-pub(super) const fn sc80(primary: u8, center: u8) -> u8 {
+pub const fn sc80(primary: u8, center: u8) -> u8 {
     match (primary > center, primary.abs_diff(center) == 2) {
         (true, true) => 1,
         (true, false) => 3,
@@ -320,6 +320,6 @@ pub(super) const fn sc80(primary: u8, center: u8) -> u8 {
 }
 
 /// The four 20MHz primaries of the 80MHz block centered at `center`.
-pub(super) const fn constituents80(center: u8) -> [u8; 4] {
+pub const fn constituents80(center: u8) -> [u8; 4] {
     [center - 6, center - 2, center + 2, center + 6]
 }
