@@ -37,6 +37,7 @@ fn config(
     vfp: u32,
 ) -> Config {
     Config {
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: Timing {
             pixel_clock_khz: pclk,
             h_active: hact,

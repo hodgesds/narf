@@ -1,6 +1,6 @@
 use super::*;
 use crate::amdgpu_dml::{
-    ClockState, Format, Memory, MemoryKind, Plane, Timing, DEFAULT_DENTIST_VCO_KHZ,
+    ClockState, Dcn, Format, Memory, MemoryKind, Plane, Timing, DEFAULT_DENTIST_VCO_KHZ,
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -8,6 +8,7 @@ const REFCLK_KHZ: u32 = 100_000;
 
 fn config_1080p() -> Config {
     Config {
+        dcn: Dcn::Dcn314,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -314,4 +315,23 @@ fn dml_regs_field_widths_match_the_header_masks() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dml-regs",
     dml_regs_field_widths_match_the_header_masks
+);
+
+/// `display_rq_dlg_calc_31.c` programs MIN_DST_Y_NEXT_START from the vblank
+/// start, `v_total - v_front_porch`, not from the VBA's two-frame value:
+/// (1125 - 4) * 4 in U16.2.
+fn dml_regs_dcn315_next_start_is_the_vblank_start() -> TestResult {
+    let raphael = Config {
+        dcn: Dcn::Dcn315,
+        ..config_1080p()
+    };
+    match registers(&raphael) {
+        Ok(regs) if regs.dlg.min_dst_y_next_start == (1125 - 4) * 4 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("dcn315 min_dst_y_next_start"),
+        Err(_) => TestResult::Fail("dcn315 registers"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dml-regs",
+    dml_regs_dcn315_next_start_is_the_vblank_start
 );

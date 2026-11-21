@@ -309,6 +309,8 @@ pub struct Pipeline {
     opp: Opp,
     stream: Stream,
     source: amdgpu_dio::Source,
+    /// The DML parameters and rules this pipe's DCN follows.
+    dcn: crate::amdgpu_dml::Dcn,
     pipe: u8,
     route: Route,
     streaming: bool,
@@ -343,6 +345,11 @@ impl Pipeline {
         pipe: u8,
         route: Route,
     ) -> Result<Self, Error> {
+        let dcn = match crate::amdgpu_dcn_profile::Profile::resolve(gpu)? {
+            crate::amdgpu_dcn_profile::Profile::Dcn314 => crate::amdgpu_dml::Dcn::Dcn314,
+            crate::amdgpu_dcn_profile::Profile::Dcn315 => crate::amdgpu_dml::Dcn::Dcn315,
+            _ => return Err(Error::Hardware(clk::Error::Unsupported)),
+        };
         // SAFETY: every claim below is covered by this constructor's contract.
         unsafe {
             Ok(Self {
@@ -355,6 +362,7 @@ impl Pipeline {
                 opp: Opp::new(gpu, authority, pipe)?,
                 stream: Stream::new(gpu, authority, route.frontend)?,
                 source: amdgpu_dio::Source::new(gpu, authority, route).map_err(Error::Link)?,
+                dcn,
                 pipe,
                 route,
                 streaming: false,
@@ -437,6 +445,7 @@ impl Pipeline {
     ) -> Result<Plan, Error> {
         let levels = self.clocks.levels().ok_or(Error::Invalid)?;
         let config = Config {
+            dcn: self.dcn,
             timing: *timing,
             plane: Plane {
                 format: scanout.format,

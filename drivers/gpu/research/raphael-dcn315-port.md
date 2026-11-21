@@ -177,7 +177,21 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
      no such streams; neither DCN does it.
    - The watermark table transfer (`TABLE_WATERMARKS`, Dram2Smu) is not
      sent on either DCN.
-8. DML: dml31 with the dcn315 SoC bounding box; HUBBUB DET/COMPBUF offsets.
+8. ~~DML parameters and dml31 differences~~ (done). For one plane on one pipe,
+   dml31 and dml314 share the prefetch schedule, swath/DET configuration and
+   watermark formulas; they differ in `dcn3_15_ip`/`_soc` (192 KB default
+   DET, 0.38 % downspread, 9 tile repeaters, Z8 50/50 µs), the
+   `dcn315_clk_mgr.c` WM_A row (129/11.5/14.5 µs for DDR5 and LPDDR5), the
+   maximum VStartup (dml31: whole vblank − 1; dml314: also bounded by
+   `VBlankNomDefaultUS`) and `MIN_DST_Y_NEXT_START` (rq_dlg_calc_31
+   programs the vblank start).
+
+   Still open: `dcn315_update_soc_for_wm_a` uses the 129 µs latency only
+   when DRAM clock change is possible in vactive, else the 10 µs dummy plus
+   a p-state lock. That needs the DET/unbounded policy and the vactive
+   support decision; until then the longer latency is used. Neither DCN path
+   programs the DCHUBBUB DET split, compressed buffer, unbounded requesting
+   or arbiter watermarks yet.
 9. DMUB `dcn_3_1_5_dmcub.bin` with PSP 13.0.5, then the boot-handoff window,
    then the Late worker arm.
 

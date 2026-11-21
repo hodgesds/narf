@@ -36,6 +36,7 @@ fn timing(pclk: u32, h: (u32, u32, u32, u32), v: (u32, u32, u32, u32)) -> Timing
 /// The modeset's own plan of `t` on an `h_active`-pitch surface.
 fn lit(t: &Timing) -> dml30::Plan {
     let config = Config {
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: *t,
         plane: Plane {
             format: Format::Rgb32,

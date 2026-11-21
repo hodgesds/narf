@@ -176,6 +176,8 @@ fn stream_for(
     let vp = scaler.viewport;
     let ratio = |r| crate::amdgpu_dml::Fx::ratio(i64::from(scl::u3d19(r)), 1 << 19);
     let config = Config {
+        // dml30 reads only the timing and plane; `dcn` selects DCN 3.1.x math.
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: *timing,
         plane: Plane {
             format: Format::Rgb32,

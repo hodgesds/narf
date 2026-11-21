@@ -792,6 +792,8 @@ fn pitch(timing: &Timing) -> u32 {
 }
 fn config(timing: &Timing, vco_khz: u32) -> Config {
     Config {
+        // dml30 reads only the timing and plane; `dcn` selects DCN 3.1.x math.
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: *timing,
         plane: Plane {
             format: Format::Rgb32,

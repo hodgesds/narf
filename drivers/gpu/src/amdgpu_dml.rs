@@ -1,6 +1,12 @@
-//! DCN 3.1.4 display mode math: the geometry, buffer and clock derivation that
-//! Linux performs in DML. Parameters are `dcn3_14_ip` / `dcn3_14_soc` from
-//! `dcn314_fpu.c`; the algorithms follow `display_mode_vba_314.c`.
+//! DCN 3.1.4 and 3.1.5 display mode math: the geometry, buffer and clock
+//! derivation that Linux performs in DML. DCN 3.1.4's parameters are
+//! `dcn3_14_ip` / `dcn3_14_soc` (`dcn314_fpu.c`) and its algorithms
+//! `display_mode_vba_314.c`; DCN 3.1.5's are `dcn3_15_ip` / `dcn3_15_soc`
+//! (`dcn31_fpu.c`) and `display_mode_vba_31.c`, of which dml314 is a fork.
+//! For the single-plane scope below the two differ only in their parameters
+//! ([`Dcn`]), the maximum VStartup and `MIN_DST_Y_NEXT_START`; their
+//! prefetch schedule, swath/DET configuration and watermark formulas are the
+//! same code.
 //!
 //! DML computes in `double`. This port uses fixed point, because kernel
 //! floating point is not available here: `x86_64-unknown-none` is a soft-float
@@ -48,9 +54,10 @@ impl Fx {
     pub fn ratio(numerator: i64, denominator: i64) -> Fx {
         Fx::int(numerator).over(Fx::int(denominator))
     }
-    /// `1 + p%`, where `tenths` is p in tenths of a percent: 5 gives 1.005.
-    fn one_plus_percent_tenths(tenths: i64) -> Fx {
-        Fx::ONE.plus(Fx::ratio(tenths, 1000))
+    /// `1 + p%`, where `hundredths` is p in hundredths of a percent: 50 gives
+    /// 1.005.
+    fn one_plus_percent_hundredths(hundredths: i64) -> Fx {
+        Fx::ONE.plus(Fx::ratio(hundredths, 10_000))
     }
     pub fn plus(self, other: Fx) -> Fx {
         Fx(self.0.saturating_add(other.0))
@@ -131,9 +138,47 @@ fn dfs_down(clock_khz: Fx, vco_khz: Fx) -> Fx {
     quad.over(Fx::int(steps))
 }
 
-// ── dcn3_14_ip / dcn3_14_soc ────────────────────────────────────────────
-/// `det_buffer_size_kbytes` (`DCN3_14_DEFAULT_DET_SIZE`).
-pub const DET_BUFFER_KBYTES: u64 = 384;
+// ── dcn3_14_ip / dcn3_14_soc, and where dcn3_15 differs ([`Dcn`]) ──────
+/// Which DCN's IP and SoC parameters, and which DML, the mode math follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dcn {
+    /// Phoenix: `dcn3_14_ip` / `dcn3_14_soc`, `display_mode_vba_314.c`.
+    Dcn314,
+    /// Raphael: `dcn3_15_ip` / `dcn3_15_soc`, `display_mode_vba_31.c`.
+    Dcn315,
+}
+impl Dcn {
+    /// `det_buffer_size_kbytes`: `DCN3_14_DEFAULT_DET_SIZE` (384) or
+    /// `DCN3_15_DEFAULT_DET_SIZE` (192).
+    pub const fn det_buffer_kbytes(self) -> u64 {
+        match self {
+            Self::Dcn314 => 384, // linux: n/a (dcn314_fpu.h DCN3_14_DEFAULT_DET_SIZE)
+            Self::Dcn315 => 192, // linux: n/a (dcn31_fpu.h DCN3_15_DEFAULT_DET_SIZE)
+        }
+    }
+    /// `dcn_downspread_percent`: 0.5 or 0.38, in hundredths of a percent.
+    const fn downspread_hundredths(self) -> i64 {
+        match self {
+            Self::Dcn314 => 50,
+            Self::Dcn315 => 38,
+        }
+    }
+    /// `max_inter_dcn_tile_repeaters`.
+    const fn max_inter_dcn_tile_repeaters(self) -> i64 {
+        match self {
+            Self::Dcn314 => 8,
+            Self::Dcn315 => 9,
+        }
+    }
+    /// `sr_exit_z8_time_us` and `sr_enter_plus_exit_z8_time_us`, which the
+    /// watermark table does not override.
+    const fn z8_us(self) -> (i64, i64) {
+        match self {
+            Self::Dcn314 => (268, 393),
+            Self::Dcn315 => (50, 50),
+        }
+    }
+}
 const LINE_BUFFER_SIZE_BITS: u64 = 789_504;
 const LINE_BUFFER_BPP: u64 = 48;
 const MAX_DCHUB_TO_PSCL_PIX_PER_CLK: i64 = 4;
@@ -141,10 +186,8 @@ const MAX_PSCL_TO_LB_PIX_PER_CLK: i64 = 2;
 const MAX_SCL_RATIO: u32 = 6;
 const MAX_SCL_TAPS: u32 = 8;
 const RETURN_BUS_WIDTH_BYTES: i64 = 64;
-/// `dispclk_ramp_margin_percent` = 1.0, `dcn_downspread_percent` = 0.5, both in
-/// tenths of a percent.
-const DISPCLK_RAMP_MARGIN_TENTHS: i64 = 10;
-const DOWNSPREAD_TENTHS: i64 = 5;
+/// `dispclk_ramp_margin_percent` = 1.0 on both, in hundredths of a percent.
+const DISPCLK_RAMP_MARGIN_HUNDREDTHS: i64 = 100;
 /// `__DML_MIN_DCFCLK_FACTOR__`, in hundredths.
 const MIN_DCFCLK_FACTOR_HUNDREDTHS: i64 = 115;
 /// Linear surfaces are limited by the detile buffer, not the DPP line store.
@@ -246,6 +289,7 @@ pub struct Plane {
 /// One plane on one pipe, with the DENTIST VCO the clock manager measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
+    pub dcn: Dcn,
     pub timing: Timing,
     pub plane: Plane,
     pub dentist_vco_khz: u32,
@@ -356,7 +400,7 @@ impl Config {
             surface_width_ub.min(ceil_multiple(swath_width - 1, block_width_256) + block_width_256);
         // Linear: MinimumSwathHeightY == MaximumSwathHeightY.
         let swath_height = block_height_256;
-        let det_bytes = ceil_multiple(DET_BUFFER_KBYTES, 64) * 1024;
+        let det_bytes = ceil_multiple(self.dcn.det_buffer_kbytes(), 64) * 1024;
         let swath_bytes = swath_width_ub
             .saturating_mul(bytes_per_pixel)
             .saturating_mul(swath_height);
@@ -393,8 +437,8 @@ impl Config {
         self.validate()?;
         let pixel_clock = Fx::int(self.timing.pixel_clock_khz as i64);
         let vco = Fx::int(self.dentist_vco_khz as i64);
-        let downspread = Fx::one_plus_percent_tenths(DOWNSPREAD_TENTHS);
-        let ramping = Fx::one_plus_percent_tenths(DISPCLK_RAMP_MARGIN_TENTHS);
+        let downspread = Fx::one_plus_percent_hundredths(self.dcn.downspread_hundredths());
+        let ramping = Fx::one_plus_percent_hundredths(DISPCLK_RAMP_MARGIN_HUNDREDTHS);
         let Geometry {
             h_ratio, v_ratio, ..
         } = *geometry;
@@ -481,10 +525,8 @@ const PCT_IDEAL_DRAM_AFTER_URGENT_PIXEL_ONLY: i64 = 65;
 /// `urgent_latency_pixel_data_only_us`; the mixed and VM-only values match it,
 /// and `do_urgent_latency_adjustment` is false, so the max3 collapses.
 const URGENT_LATENCY_US_TENTHS: i64 = 40;
-/// Z8 self-refresh times stay from the SOC bounding box; only the three
-/// non-Z8 latencies are overridden per memory type.
-const SR_EXIT_Z8_US: i64 = 268;
-const SR_ENTER_PLUS_EXIT_Z8_US: i64 = 393;
+/// Z8 self-refresh times stay from the SOC bounding box ([`Dcn::z8_us`]); only
+/// the three non-Z8 latencies are overridden per memory type.
 /// DPP and DISPCLK pipeline delays in clocks (`dppclk_delay_*`,
 /// `dispclk_delay_subtotal`), and `max_inter_dcn_tile_repeaters`.
 const DPPCLK_DELAY_SUBTOTAL: i64 = 46;
@@ -493,8 +535,7 @@ const DPPCLK_DELAY_SCL_LB_ONLY: i64 = 16;
 const DPPCLK_DELAY_CNVC_FORMATTER: i64 = 27;
 const DPPCLK_DELAY_CNVC_CURSOR: i64 = 6;
 const DISPCLK_DELAY_SUBTOTAL: i64 = 119;
-const MAX_INTER_DCN_TILE_REPEATERS: i64 = 8;
-/// `VBlankNomDefaultUS`.
+/// `VBlankNomDefaultUS`, which only dml314's `CalculateMaxVStartup` reads.
 const VBLANK_NOM_DEFAULT_US: i64 = 668;
 /// `__DML_VBA_MIN_VSTARTUP__`, and the clamp
 /// `CalculateVStartupAndRelevantOtherParameters` applies — 1023, which is the
@@ -531,11 +572,25 @@ pub struct Memory {
 }
 impl Memory {
     /// The WM_A entry of Linux's per-memory-type watermark table overrides the
-    /// SOC bounding box's three non-Z8 latencies.
-    fn latencies(&self) -> (Fx, Fx, Fx) {
-        match self.kind {
-            MemoryKind::Ddr5 => (Fx::ratio(1172, 100), Fx::ratio(125, 10), Fx::ratio(145, 10)),
-            MemoryKind::Lpddr5 => (Fx::ratio(1_165_333, 100_000), Fx::int(30), Fx::int(32)),
+    /// SOC bounding box's three non-Z8 latencies (`update_soc_for_wm_a`):
+    /// (p-state, self-refresh exit, self-refresh enter plus exit) in µs.
+    ///
+    /// DCN 3.1.5's tables (`dcn315_clk_mgr.c`) give DDR5 and LPDDR5 the same
+    /// row. LINUX-GAP: `dcn315_update_soc_for_wm_a` uses that row's 129 µs
+    /// p-state latency only when DML finds the DRAM clock change possible in
+    /// vactive, and `dummy_pstate_latency_us` (10 µs) otherwise, with the
+    /// clock manager then locking p-state. This port does not yet compute that
+    /// support, so it keeps the longer latency — the larger watermark and
+    /// TTU blank — rather than assume a switch the DET may not hide.
+    fn latencies(&self, dcn: Dcn) -> (Fx, Fx, Fx) {
+        match (dcn, self.kind) {
+            (Dcn::Dcn314, MemoryKind::Ddr5) => {
+                (Fx::ratio(1172, 100), Fx::ratio(125, 10), Fx::ratio(145, 10))
+            }
+            (Dcn::Dcn314, MemoryKind::Lpddr5) => {
+                (Fx::ratio(1_165_333, 100_000), Fx::int(30), Fx::int(32))
+            }
+            (Dcn::Dcn315, _) => (Fx::int(129), Fx::ratio(115, 10), Fx::ratio(145, 10)),
         }
     }
     fn valid(&self) -> bool {
@@ -651,7 +706,8 @@ impl Config {
         if !memory.valid() || !clocks.valid() {
             return Err(Error::Invalid);
         }
-        let (pstate_latency, sr_exit, sr_enter_plus_exit) = memory.latencies();
+        let (pstate_latency, sr_exit, sr_enter_plus_exit) = memory.latencies(self.dcn);
+        let (sr_exit_z8, sr_enter_plus_exit_z8) = self.dcn.z8_us();
         let urgent_latency = Fx::ratio(URGENT_LATENCY_US_TENTHS, 10);
         let return_bw = self.return_bandwidth(memory, clocks);
         let extra_latency = self.extra_latency(memory, clocks, return_bw);
@@ -663,8 +719,8 @@ impl Config {
             pstate_change_us: pstate_latency.plus(urgent),
             stutter_exit_us: sr_exit.plus(extra_latency).plus(wake),
             stutter_enter_plus_exit_us: sr_enter_plus_exit.plus(extra_latency).plus(wake),
-            z8_stutter_exit_us: Fx::int(SR_EXIT_Z8_US).plus(extra_latency).plus(wake),
-            z8_stutter_enter_plus_exit_us: Fx::int(SR_ENTER_PLUS_EXIT_Z8_US)
+            z8_stutter_exit_us: Fx::int(sr_exit_z8).plus(extra_latency).plus(wake),
+            z8_stutter_enter_plus_exit_us: Fx::int(sr_enter_plus_exit_z8)
                 .plus(extra_latency)
                 .plus(wake),
             urgent_latency_us: urgent_latency,
@@ -675,13 +731,20 @@ impl Config {
             sr_enter_plus_exit_us: sr_enter_plus_exit,
         })
     }
-    /// `CalculateMaxVStartup`: progressive scan with no writeback delay, so the
-    /// vblank is reduced by a single line.
+    /// The maximum VStartup, progressive scan with no writeback delay, so the
+    /// vblank is reduced by a single line. dml314's `CalculateMaxVStartup` also
+    /// bounds the vblank by `VBlankNomDefaultUS`; dml31 uses the whole vblank.
     fn max_v_startup(&self) -> u32 {
-        let line_time = self.line_time_us();
         let vblank_actual = self.timing.v_total - self.timing.v_active;
-        let vblank_nom_default = Fx::int(VBLANK_NOM_DEFAULT_US).over(line_time).floor() as u32;
-        let vblank_size = vblank_actual.min(vblank_nom_default);
+        let vblank_size = match self.dcn {
+            Dcn::Dcn314 => {
+                let line_time = self.line_time_us();
+                let vblank_nom_default =
+                    Fx::int(VBLANK_NOM_DEFAULT_US).over(line_time).floor() as u32;
+                vblank_actual.min(vblank_nom_default)
+            }
+            Dcn::Dcn315 => vblank_actual,
+        };
         vblank_size.saturating_sub(1).min(MAX_VSTARTUP)
     }
     /// `CalculatePrefetchSourceLines` with viewport positioning honoured.
@@ -714,7 +777,7 @@ impl Config {
         let dispclk = mhz(clocks.dispclk_khz);
         let deep_sleep = mhz(clocks.deep_sleep_dcfclk_khz);
         let pixel_clock = mhz(self.timing.pixel_clock_khz);
-        let repeater_delay = Fx::int(MAX_INTER_DCN_TILE_REPEATERS)
+        let repeater_delay = Fx::int(self.dcn.max_inter_dcn_tile_repeaters())
             .times(Fx::int(2).over(dppclk).plus(Fx::int(3).over(dispclk)));
         let width = Fx::int(14)
             .over(deep_sleep)
