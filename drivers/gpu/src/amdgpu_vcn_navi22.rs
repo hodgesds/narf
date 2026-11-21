@@ -2191,6 +2191,11 @@ impl<I: Io> Engine<I> {
     /// path. A consumed ring with an unchanged fence needs a different
     /// investigation from a ring whose commands were never fetched.
     fn report_ib_timeout(&mut self, i: usize, slot: usize, seq: u32) {
+        self.report_ring_timeout(i, slot, seq, "IB fence timeout");
+    }
+    /// The snapshot of ring `slot` (0 decode, 1 + j encode) of instance `i`
+    /// whose fence `seq` did not land, labelled `what`.
+    fn report_ring_timeout(&mut self, i: usize, slot: usize, seq: u32, what: &str) {
         use core::fmt::Write;
         let Some(instance) = self.vcn[i].as_ref() else {
             return;
@@ -2229,7 +2234,7 @@ impl<I: Io> Engine<I> {
         let mut w = narf_console::Writer;
         let _ = write!(
             w,
-            "amdgpu: VCN{i} IB fence timeout ({:?}): slot={slot} ring={:?} base={:#x} doorbell={:#x} submitted_wptr={:#x} fence={:#x} expected={seq:#x}",
+            "amdgpu: VCN{i} {what} ({:?}): slot={slot} ring={:?} base={:#x} doorbell={:#x} submitted_wptr={:#x} fence={:#x} expected={seq:#x}",
             self.mode,
             ring.kind,
             instance.address(ring.base),
@@ -3042,14 +3047,98 @@ impl<I: Io> Engine<I> {
         })?;
         Ok((completed, throttle))
     }
-    /// Job-timeout samples (`amdgpu_navi22_tdr`) of the client rings in
-    /// `rings` (bit `MediaRing::index()`).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    /// Job-timeout samples (`amdgpu_navi22_tdr`, Linux's per-ring
+    /// drm_sched `video_timeout`) of the client rings in `rings` (bit
+    /// `MediaRing::index()`) that passed their ring and IB tests: each ring's
+    /// last sequence and its fence writeback, read after one HDP invalidate.
+    /// An all-ones invalidate read-back is device loss.
     pub(crate) fn client_progress(
         &mut self,
-        _rings: u8,
+        rings: u8,
     ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
-        Ok(alloc::vec::Vec::new())
+        let mut slots = alloc::vec::Vec::new();
+        for ring in MediaRing::ALL {
+            if rings & 1 << ring.index() == 0 || !self.client_ready(ring) {
+                continue;
+            }
+            let (r, map, _, fence_at) = client_ring(&mut self.vcn[0], &mut self.jpeg, ring)?;
+            let engine = if ring == MediaRing::Jpeg {
+                fence::Engine::Jpeg
+            } else {
+                fence::Engine::Vcn0
+            };
+            slots.push((ring, engine, r.seq, map, fence_at));
+        }
+        let mut samples = alloc::vec::Vec::new();
+        samples
+            .try_reserve_exact(slots.len())
+            .map_err(|_| Error::Allocation)?;
+        self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read(l.liveness()))?;
+            for &(ring, engine, emitted, map, fence_at) in &slots {
+                samples.push(crate::amdgpu_navi22_tdr::Progress {
+                    engine,
+                    media: Some(ring),
+                    emitted,
+                    signaled: io.read_memory(map, fence_at),
+                });
+            }
+            Ok(())
+        })?;
+        Ok(samples)
+    }
+    /// Timeout-only evidence for a client job on `ring` whose fence `seq`
+    /// never landed (`amdgpu_navi22_tdr`): the IB-timeout register line for
+    /// a VCN0 ring, the JRBC pointers and JPEG power state for JPEG.
+    pub(crate) fn report_client_timeout(&mut self, ring: MediaRing, seq: u32) {
+        use core::fmt::Write;
+        match ring {
+            MediaRing::Dec => self.report_ring_timeout(0, 0, seq, "client job timeout"),
+            MediaRing::Enc(j) => {
+                self.report_ring_timeout(0, 1 + usize::from(j & 1), seq, "client job timeout")
+            }
+            MediaRing::Jpeg => {
+                let Some(jpeg) = self.jpeg.as_ref() else {
+                    return;
+                };
+                let (map, wptr) = (jpeg.memory.mapping(), jpeg.ring.wptr);
+                let regs = [
+                    ("RPTR", JRBC_RB_RPTR),
+                    ("WPTR", JRBC_RB_WPTR),
+                    ("RB_CNTL", JRBC_RB_CNTL),
+                    ("JPEG_POWER_STATUS", JPEG_POWER_STATUS),
+                    ("PGFSM_STATUS", PGFSM_STATUS),
+                ];
+                let mut values = [0u32; 5];
+                let mut observed = 0;
+                let read = self.hw.access(|io, l| {
+                    for (value, (_, reg)) in values.iter_mut().zip(regs) {
+                        *value = io.read(l.reg(0, reg));
+                    }
+                    invalidate(io, l);
+                    observed = io.read_memory(map, JPEG_FENCE);
+                    Ok(())
+                });
+                let mut w = narf_console::Writer;
+                let _ = write!(
+                    w,
+                    "amdgpu: JPEG client job timeout: submitted_wptr={wptr:#x} expected={seq:#x}"
+                );
+                match read {
+                    Ok(()) => {
+                        let _ = write!(w, " observed={observed:#x}");
+                        for ((name, _), value) in regs.iter().zip(values) {
+                            let _ = write!(w, " {name}={value:#x}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = write!(w, " snapshot_refused={error:?}");
+                    }
+                }
+                let _ = writeln!(w);
+            }
+        }
     }
     /// Queue one client job on `ring` (see `amdgpu_navi22_submit`'s media
     /// section). JPEG IBs arrive as validated copies (`copies`, one per IB),
@@ -3154,6 +3243,8 @@ impl<I: Io> Engine<I> {
             r.seq = seq.wrapping_sub(1);
         }
         result?;
+        // drm_sched arms the ring's job timeout at job start.
+        crate::amdgpu_navi22_tdr::job_emitted();
         Ok(seq)
     }
 }
@@ -3256,6 +3347,18 @@ impl Media {
     /// (last completed, throttle) sequences of client ring `ring`.
     pub fn client_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), Error> {
         self.engine.client_fences(ring)
+    }
+    /// Job-timeout samples of the rings clients submit to
+    /// (`Engine::client_progress`).
+    pub(crate) fn client_progress(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        let rings = self.client_rings();
+        self.engine.client_progress(rings)
+    }
+    /// See `Engine::report_client_timeout`.
+    pub(crate) fn report_client_timeout(&mut self, ring: MediaRing, seq: u32) {
+        self.engine.report_client_timeout(ring, seq);
     }
 }
 

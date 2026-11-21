@@ -376,6 +376,21 @@ pub(crate) fn suspend() {
     *MEDIA.lock() = None;
     crate::amdgpu_info::publish_navi22_media_rings(0);
 }
+/// Withdraw the media rings in `mask` (bit `MediaRing::index()`) from
+/// clients after their engine timed out: `AMDGPU_INFO` stops offering them
+/// and new jobs are refused, while their fences stay readable so a late
+/// completion still retires its memory. The other media rings keep serving.
+pub fn withdraw(mask: u8) {
+    let rings = {
+        let mut media = MEDIA.lock();
+        let Some(m) = media.as_mut() else {
+            return;
+        };
+        m.rings &= !mask;
+        m.rings
+    };
+    crate::amdgpu_info::publish_navi22_media_rings(rings);
+}
 /// An address space closed: its sessions go with it.
 pub fn forget_owner(owner: u64) {
     if owner != 0 {

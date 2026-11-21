@@ -16,9 +16,17 @@ pub(super) struct Jobs {
     /// Jobs a recovery failed while the submitter carried on, with their
     /// error, kept after they retire. Bounded: the oldest entries go first.
     failed: Vec<(u64, FsError)>,
+    /// Ticket ring ids (bits) of a media engine that timed out
+    /// (`fail_rings`): their unretired jobs fail, the other rings run on.
+    failed_rings: u16,
 }
 /// How many recovered jobs keep their error after they retire.
 const FAILED_KEPT: usize = 64; // linux: n/a (NARF bound)
+
+/// The ticket's ring id (the low four bits of its ring index).
+fn ring_id(ticket: u64) -> usize {
+    ((ticket >> 32) as u32 & 15) as usize
+}
 
 #[cfg(feature = "kernel-test")]
 mod tests {
@@ -222,6 +230,7 @@ impl Jobs {
             terminal: None,
             pending: Vec::new(),
             failed: Vec::new(),
+            failed_rings: 0,
         }
     }
     pub fn retired(&self, ticket: u64) -> bool {
@@ -247,7 +256,7 @@ impl Jobs {
     /// [`Self::emitted`] for a job granted VMID `vmid`, which a soft recovery
     /// needs to name the waves it kills.
     pub fn emitted_on(&mut self, ticket: u64, health: &Arc<Health>, vmid: u8) {
-        if self.terminal.is_some() {
+        if self.terminal.is_some() || self.failed_rings & 1 << ring_id(ticket) != 0 {
             health.mark_canceled();
         }
         self.pending.push((ticket, health.clone(), vmid));
@@ -257,7 +266,7 @@ impl Jobs {
     pub fn oldest(&self, ring: usize) -> Option<(u64, u8)> {
         self.pending
             .iter()
-            .find(|(ticket, _, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
+            .find(|(ticket, _, _)| ring_id(*ticket) == ring)
             .map(|(ticket, _, vmid)| (*ticket, *vmid))
     }
     /// A recovery freed the ring that `ticket`'s job stalled: that job fails
@@ -280,7 +289,7 @@ impl Jobs {
             .pending
             .iter()
             .map(|(t, _, _)| *t)
-            .filter(|t| *t != ticket && (*t >> 32) as u32 & 15 == ring as u32)
+            .filter(|t| *t != ticket && ring_id(*t) == ring)
             .collect();
         for t in behind {
             self.fail(t, FsError::Canceled);
@@ -302,20 +311,35 @@ impl Jobs {
     }
     pub fn hang(&mut self, ring: usize) {
         if self.terminal.is_none() {
-            if let Some((_, health, _)) = self
-                .pending
-                .iter()
-                .find(|(ticket, _, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
-            {
-                health.mark_guilty();
-            }
+            self.mark_guilty(ring);
             self.finish(FsError::Canceled);
         }
     }
-    /// A media engine's job on ring `hung` timed out and no recovery
-    /// follows; `rings` (ticket ring-id bits) are that engine's rings.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    pub fn fail_rings(&mut self, _hung: usize, _rings: u16) {}
+    /// The oldest pending job of ring `ring` timed out (`-ETIME`).
+    fn mark_guilty(&mut self, ring: usize) {
+        if let Some((_, health, _)) = self.pending.iter().find(|(t, _, _)| ring_id(*t) == ring) {
+            health.mark_guilty();
+        }
+    }
+    /// A media engine's job on ring `hung` timed out (`amdgpu_job_timedout`
+    /// on a video ring); `rings` (ticket ring-id bits) are every ring of that
+    /// engine. The timed-out job ends with `-ETIME`, the other unretired
+    /// jobs of those rings and any published there later with `-ECANCELED`,
+    /// as Linux's VCN engine reset force-completes them. Other rings keep
+    /// running; unconfirmed media memory stays quarantined until its own
+    /// writeback retires it.
+    pub fn fail_rings(&mut self, hung: usize, rings: u16) {
+        if self.terminal.is_some() {
+            return;
+        }
+        self.mark_guilty(hung);
+        for (ticket, health, _) in &self.pending {
+            if rings & 1 << ring_id(*ticket) != 0 {
+                health.mark_canceled();
+            }
+        }
+        self.failed_rings |= rings;
+    }
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if let Some(&(_, error)) = self.failed.iter().find(|(t, _)| *t == ticket) {
             return Some(error);
@@ -323,7 +347,9 @@ impl Jobs {
         if self.retired(ticket) {
             return None;
         }
-        self.terminal.map(|error| {
+        let failed =
+            (self.failed_rings & 1 << ring_id(ticket) != 0).then_some(FsError::Canceled);
+        self.terminal.or(failed).map(|error| {
             if error == FsError::Canceled {
                 self.pending
                     .iter()
