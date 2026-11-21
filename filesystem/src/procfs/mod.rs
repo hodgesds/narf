@@ -5370,7 +5370,7 @@ kernel_test_in!("filesystem/procfs", smoke_pid_stat_real_fields);
 /// online CPU, 11 tokens each. The aggregate sums nanoseconds before
 /// converting to ticks, so it lies within [sum of per-CPU lines, that sum
 /// + one tick per CPU) for every column. Each CPU's columns together track
-/// its elapsed time: never more than the uptime.
+///   its elapsed time: never more than the uptime.
 fn smoke_stat_per_cpu_lines_real_idle() -> TestResult {
     let uptime_ticks = narf_time::monotonic_ns() / 10_000_000;
     let s = gen_stat();

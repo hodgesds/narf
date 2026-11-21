@@ -144,7 +144,7 @@ fn smoke_timer_list_prints_linux_print_timer_lines() -> TestResult {
     ];
     let lines: Vec<&str> = text.lines().collect();
     for w in &want {
-        if !lines.iter().any(|l| *l == w.as_str()) {
+        if !lines.contains(&w.as_str()) {
             console_log!("timer_list: missing line {:?}\n{}", w, text);
             return TestResult::Fail("timer_list: a Linux print_timer line is missing");
         }

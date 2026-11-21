@@ -289,10 +289,14 @@ fn smoke_tmigr_last_idle_cpu_runs_sibling_timer() -> TestResult {
     let still_idle = !h.cpu_active(idle);
     timer::del_timer_sync(&soon.timer);
     if sibling_told != Some(NONE) || last_told != Some(first) {
-        return TestResult::Fail("the last CPU to idle was not told to wake for its sibling's timer");
+        return TestResult::Fail(
+            "the last CPU to idle was not told to wake for its sibling's timer",
+        );
     }
     if soon.count.load(Ordering::Acquire) != 1 || ran != 1 {
-        return TestResult::Fail("the last idle CPU's walk did not run its sibling's due timer once");
+        return TestResult::Fail(
+            "the last idle CPU's walk did not run its sibling's due timer once",
+        );
     }
     if !still_idle {
         return TestResult::Fail("the idle sibling left idle");
@@ -302,7 +306,4 @@ fn smoke_tmigr_last_idle_cpu_runs_sibling_timer() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "time/tmigr",
-    smoke_tmigr_last_idle_cpu_runs_sibling_timer
-);
+kernel_test_in!("time/tmigr", smoke_tmigr_last_idle_cpu_runs_sibling_timer);

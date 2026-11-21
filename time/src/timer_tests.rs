@@ -313,10 +313,14 @@ fn smoke_timer_raised_softirq_is_pending_not_next_event() -> TestResult {
         return TestResult::Skip("the timer ran before the tick (interrupt-context softirq)");
     }
     if !pending {
-        return TestResult::Fail("a tick with a due pinned timer did not leave TIMER_SOFTIRQ pending");
+        return TestResult::Fail(
+            "a tick with a due pinned timer did not leave TIMER_SOFTIRQ pending",
+        );
     }
     if next < now {
-        return TestResult::Fail("with the softirq raised, the next event was reported in the past");
+        return TestResult::Fail(
+            "with the softirq raised, the next event was reported in the past",
+        );
     }
     if !fired || !cleared {
         return TestResult::Fail("running the softirq did not fire the timer and clear the raise");
