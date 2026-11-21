@@ -149,6 +149,11 @@ impl<I: Io> Engine<I> {
         MEDIA_ASLEEP.store(true, Ordering::Release);
         Ok(true)
     }
+    /// When the idle work should look again: every 100 ms until gated.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub(crate) fn idle_recheck(&self, _now: u64) -> Option<u64> {
+        (self.runtime.phase == Phase::Awake).then_some(100_000_000)
+    }
     pub(crate) async fn begin_use(
         &mut self,
         pm: &mut impl Control,
