@@ -2374,6 +2374,287 @@ kernel_test_in!(
     smoke_abi_caps_mount_follows_the_mount_namespace_owner
 );
 
+/// Fork-shaped `clone(flags | SIGCHLD)` issued by the harness task. On
+/// success returns the child's TaskId: the child is published but never
+/// polled, so a case can inspect its namespaces and issue syscalls AS it via
+/// [`set_task`]. Release it with [`release_clone_child`]. On failure returns
+/// the clone's Linux return value.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn clone_child(flags: u64) -> Result<u64, i64> {
+    const SIGCHLD: u64 = 17;
+    match call(Syscall::Clone.raw(), a1(flags | SIGCHLD, 0)) {
+        Some(pid) if pid > 0 => {
+            Ok(crate::handlers::pid_to_task_raw(pid as u64).unwrap_or(pid as u64))
+        }
+        Some(ret) => Err(ret),
+        None => Err(i64::MIN),
+    }
+}
+
+/// Drop the synthetic child [`clone_child`] made and switch back to the
+/// harness task. Namespace, credential and mount tables are reset by the
+/// harness teardown.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn release_clone_child(child: u64) {
+    set_task(FAKE_TASK);
+    let _ = crate::task::release_task(child);
+    narf_scheduler::__reset_queues_for_test();
+}
+
+/// `kernel/fork.c::copy_process` runs `copy_creds` — which, for
+/// CLONE_NEWUSER, creates the user namespace and binds the child's new
+/// credential to it (`create_user_ns` → `set_cred_user_ns`) — BEFORE
+/// `copy_namespaces`, and `copy_namespaces` hands that credential's namespace
+/// to every constructor:
+///
+///     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+///     ...
+///     new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+///
+/// so `copy_mnt_ns` records `new_ns->user_ns = get_user_ns(user_ns)`: the
+/// mount namespace a `clone(CLONE_NEWUSER | CLONE_NEWNS)` child gets belongs
+/// to the child's own user namespace, and `may_mount`
+/// (`ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN)`) passes
+/// for it.
+///
+/// This is bubblewrap's container setup verbatim: one raw clone creating
+/// both, then `mount(NULL, "/", NULL, MS_SILENT | MS_SLAVE | MS_REC, NULL)`
+/// in the child. Steam's runtime check runs exactly that and reported
+/// "Failed to make / slave: Operation not permitted" when the child's mount
+/// namespace was stamped with the PARENT's user namespace instead.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_clone_newuser_newns_child_may_mount() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const MS_REC: u64 = 0x4000;
+        const MS_SILENT: u64 = 0x8000;
+        const MS_SLAVE: u64 = 1 << 19;
+        const TARGET: &str = "/abi-userns-clone-mnt";
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        // The mount point must exist in the table the child's namespace is
+        // copied from, so create it before the clone takes that copy.
+        narf_filesystem::__test_ensure_mount_target(TARGET);
+        // An ordinary desktop user: no host privilege at all.
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+
+        let child = match clone_child(CLONE_NEWUSER | CLONE_NEWNS) {
+            Ok(child) => child,
+            Err(_) => return Err("unprivileged clone(CLONE_NEWUSER|CLONE_NEWNS) failed"),
+        };
+        let result = (|| {
+            let user_ns = crate::namespaces::user_ns_of(child)
+                .ok_or("clone(CLONE_NEWUSER) child has no user namespace")?;
+            let mnt_ns = crate::handlers::mount_namespace_of(child)
+                .ok_or("clone(CLONE_NEWNS) child has no private mount namespace")?;
+            if mnt_ns.owner().map(|owner| owner.ns_id()) != Some(user_ns.id()) {
+                return Err("child's mount namespace is not owned by its new user namespace");
+            }
+
+            set_task(child);
+            let root = b"/\0";
+            match call(
+                Syscall::Mount.raw(),
+                a4(0, root.as_ptr() as u64, 0, MS_SILENT | MS_SLAVE | MS_REC, 0),
+            ) {
+                Some(0) => {}
+                Some(-1) => return Err("bwrap's make-rslave of / was EPERM in the child"),
+                _ => return Err("make-rslave of / in the child failed"),
+            }
+            let target = b"/abi-userns-clone-mnt\0";
+            let fstype = b"tmpfs\0";
+            let source = b"tmpfs\0";
+            match call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    fstype.as_ptr() as u64,
+                    0,
+                    0,
+                ),
+            ) {
+                Some(0) => {}
+                Some(-1) => return Err("tmpfs mount in the child's own mount namespace was EPERM"),
+                _ => return Err("tmpfs mount in the child's own mount namespace failed"),
+            }
+            // The mount landed in the child's namespace, not the host's.
+            if mnt_ns.mount_id_at(TARGET).is_none() {
+                return Err("the child's tmpfs is missing from its own mount namespace");
+            }
+            if narf_filesystem::registry()
+                .list()
+                .iter()
+                .any(|mount| mount == TARGET)
+            {
+                return Err("the child's tmpfs leaked into the host mount namespace");
+            }
+            Ok(())
+        })();
+        release_clone_child(child);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_clone_newuser_newns_child_may_mount
+);
+
+/// Every namespace a single `clone()` creates alongside CLONE_NEWUSER is
+/// owned by the NEW user namespace: `create_new_namespaces` passes one
+/// `user_ns` — the child credential's — to `copy_mnt_ns`, `copy_utsname`,
+/// `copy_ipcs`, `copy_pid_ns`, `copy_cgroup_ns` and `copy_net_ns` alike.
+/// The owner is what every later `ns_capable(ns->user_ns, …)` test and
+/// `setns` measures against, and what `NS_GET_USERNS`/`listns` report.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_clone_newuser_owns_every_new_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        let flags = CLONE_NEWUSER
+            | CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWPID
+            | CLONE_NEWNET
+            | CLONE_NEWCGROUP;
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+
+        let child = match clone_child(flags) {
+            Ok(child) => child,
+            Err(_) => return Err("unprivileged clone(CLONE_NEWUSER|every namespace) failed"),
+        };
+        let result = (|| {
+            let owner = crate::namespaces::user_ns_of(child)
+                .ok_or("clone(CLONE_NEWUSER) child has no user namespace")?
+                .id();
+            let mnt = crate::handlers::mount_namespace_of(child)
+                .ok_or("child has no private mount namespace")?;
+            if mnt.owner().map(|o| o.ns_id()) != Some(owner) {
+                return Err("CLONE_NEWNS namespace is not owned by the new user namespace");
+            }
+            let uts = crate::namespaces::uts_ns_of(child).ok_or("child has no UTS namespace")?;
+            if uts.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWUTS namespace is not owned by the new user namespace");
+            }
+            let ipc = crate::namespaces::ipc_ns_of(child).ok_or("child has no IPC namespace")?;
+            if ipc.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWIPC namespace is not owned by the new user namespace");
+            }
+            let net = crate::namespaces::net_ns_of(child).ok_or("child has no net namespace")?;
+            if net.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWNET namespace is not owned by the new user namespace");
+            }
+            let pid = crate::pid_ns::ns_of(child).ok_or("child has no PID namespace")?;
+            if pid.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWPID namespace is not owned by the new user namespace");
+            }
+            #[cfg(feature = "cgroup")]
+            {
+                let outer = crate::handlers::task_to_pid_raw(child).unwrap_or(child);
+                let cgroup = narf_filesystem::cgroupfs::cgroup_namespace_of(outer);
+                if cgroup.owner().map(|o| o.ns_id()) != Some(owner) {
+                    return Err("CLONE_NEWCGROUP namespace is not owned by the new user namespace");
+                }
+            }
+            Ok(())
+        })();
+        release_clone_child(child);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_clone_newuser_owns_every_new_namespace
+);
+
+/// The `unshare(2)` twin of the clone case above: `ksys_unshare` runs
+/// `unshare_userns` first and hands the new credential to
+/// `unshare_nsproxy_namespaces`, whose `user_ns = new_cred ?
+/// new_cred->user_ns : current_user_ns()` owns everything it creates.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_unshare_newuser_owns_every_new_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        let flags = CLONE_NEWUSER
+            | CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWNET
+            | CLONE_NEWCGROUP;
+
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+        if call(Syscall::Unshare.raw(), a0(flags)) != Some(0) {
+            return Err("unprivileged unshare(CLONE_NEWUSER|every namespace) failed");
+        }
+        let owner = crate::namespaces::user_ns_of(FAKE_TASK)
+            .ok_or("unshare(CLONE_NEWUSER) left no user namespace")?
+            .id();
+        let mnt = crate::handlers::mount_namespace_of(FAKE_TASK)
+            .ok_or("unshare(CLONE_NEWNS) left no private mount namespace")?;
+        if mnt.owner().map(|o| o.ns_id()) != Some(owner) {
+            return Err("CLONE_NEWNS namespace is not owned by the new user namespace");
+        }
+        let uts = crate::namespaces::uts_ns_of(FAKE_TASK).ok_or("no UTS namespace")?;
+        if uts.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWUTS namespace is not owned by the new user namespace");
+        }
+        let ipc = crate::namespaces::ipc_ns_of(FAKE_TASK).ok_or("no IPC namespace")?;
+        if ipc.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWIPC namespace is not owned by the new user namespace");
+        }
+        let net = crate::namespaces::net_ns_of(FAKE_TASK).ok_or("no net namespace")?;
+        if net.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWNET namespace is not owned by the new user namespace");
+        }
+        #[cfg(feature = "cgroup")]
+        {
+            let cgroup = narf_filesystem::cgroupfs::cgroup_namespace_of(FAKE_TASK);
+            if cgroup.owner().map(|o| o.ns_id()) != Some(owner) {
+                return Err("CLONE_NEWCGROUP namespace is not owned by the new user namespace");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_unshare_newuser_owns_every_new_namespace
+);
+
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
     with_setup(|| {
         // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|
