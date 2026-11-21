@@ -1021,6 +1021,8 @@ async fn rebuild_graphics(
 /// 4. Async resume: a new coordinator, then media and clients. A suspend
 ///    that aborted before the PSP stopped never powered the GPU off, so
 ///    that resume runs a mode 2 reset first.
+///
+/// Suspend-to-idle takes none of this: see [`GraphicsPm::Idle`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraphicsPm {
     Running,
@@ -1028,6 +1030,38 @@ pub(crate) enum GraphicsPm {
     Quiesced,
     /// The PSP released the TMR for S3.
     Stopped,
+    /// Suspend-to-idle without s0ix: graphics and the display are left
+    /// running through the park, and the PSP keeps its TMR, as Linux's
+    /// amdgpu does when `amdgpu_acpi_is_s0ix_active` is false.
+    Idle,
+}
+/// Why Raphael would not take Linux's s0ix path for a suspend-to-idle
+/// (`amdgpu_acpi_is_s0ix_active` for an APU, in its order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum S0ix {
+    Active,
+    /// `amdgpu.ppfeaturemask` has no `PP_GFXOFF_MASK`.
+    NoGfxoff,
+    /// The FADT lacks `LOW_POWER_S0`: "BIOS has not been configured for
+    /// suspend-to-idle".
+    NoLowPowerS0,
+    /// No AMD PMC driver takes the SoC into S0i3 (Linux without
+    /// `CONFIG_AMD_PMC`).
+    NoPmc,
+}
+/// Whether an AMD PMC driver exists to send the SoC its S0i3 OS hint and
+/// run the LPS0 `_DSM` calls. None does yet.
+const AMD_PMC: bool = false;
+pub(crate) fn s0ix(gfxoff: bool, low_power_s0: bool, pmc: bool) -> S0ix {
+    if !gfxoff {
+        S0ix::NoGfxoff
+    } else if !low_power_s0 {
+        S0ix::NoLowPowerS0
+    } else if !pmc {
+        S0ix::NoPmc
+    } else {
+        S0ix::Active
+    }
 }
 /// What the async resume must do from the state suspend left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1040,7 +1074,7 @@ pub(crate) enum ResumeWork {
 }
 pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
     match state {
-        GraphicsPm::Running => ResumeWork::Nothing,
+        GraphicsPm::Running | GraphicsPm::Idle => ResumeWork::Nothing,
         GraphicsPm::Stopped => ResumeWork::Rebuild,
         GraphicsPm::Quiesced => ResumeWork::ResetThenRebuild,
     }
@@ -1075,6 +1109,39 @@ async fn rings_idle(ms: u64) -> bool {
         }
         narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
     }
+}
+/// Suspend-to-idle with graphics up. Linux's amdgpu suspends an APU for
+/// s2idle only on its s0ix path, which needs the SoC to reach S0i3 (it
+/// halts the RLC and relies on GFXOFF exit to restart it). Without that,
+/// `amdgpu_pmops_prepare` and `_suspend` leave the device alone. NARF has
+/// no AMD PMC driver, so that is always the case here: the device is marked
+/// [`GraphicsPm::Idle`] and nothing else changes. The S3 sequence is no
+/// substitute: it releases the TMR under GFX, which is sound only because
+/// S3 then cuts power.
+async fn prepare_graphics_idle() {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return;
+    }
+    let gfxoff = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).gfxoff;
+    let low_power_s0 = narf_acpi::fadt_pm().is_some_and(|fadt| fadt.low_power_s0);
+    let why = s0ix(gfxoff, low_power_s0, AMD_PMC);
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    if !display
+        .graphics
+        .as_ref()
+        .is_some_and(|g| g.queues_verified())
+    {
+        return;
+    }
+    display.graphics_pm = GraphicsPm::Idle;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael s2idle without s0ix ({why:?}): graphics and display stay up"
+    );
 }
 async fn prepare_graphics_suspend() {
     use core::fmt::Write as _;
@@ -1126,6 +1193,8 @@ async fn resume_graphics() {
     };
     let work = resume_work(display.graphics_pm);
     if work == ResumeWork::Nothing {
+        // A suspend-to-idle left everything running.
+        display.graphics_pm = GraphicsPm::Running;
         return;
     }
     let Display {
@@ -1176,6 +1245,19 @@ impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
             prepare_graphics_suspend().await;
+            Ok::<(), narf_power::device_pm::DevicePmError>(())
+        })
+    }
+    fn prepare_suspend_target<'a>(
+        &'a self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> narf_power::system_pm::SystemPmFuture<'a> {
+        use narf_power::system_pm::SystemSleepState;
+        alloc::boxed::Box::pin(async move {
+            match target {
+                SystemSleepState::S3 => prepare_graphics_suspend().await,
+                SystemSleepState::S0Idle => prepare_graphics_idle().await,
+            }
             Ok::<(), narf_power::device_pm::DevicePmError>(())
         })
     }
@@ -1615,6 +1697,10 @@ pub(crate) fn suspend() -> bool {
         graphics_pm,
         ..
     } = display;
+    if *graphics_pm == GraphicsPm::Idle {
+        // s2idle without s0ix: Linux suspends nothing, the display included.
+        return true;
+    }
     // Stop the stream before the firmware: a pipe left fetching across a GPU
     // suspend would read scanout memory the resume path has not re-established.
     // The stream itself is kept, with the mode it was validated for, so resume
@@ -1652,7 +1738,16 @@ pub(crate) fn resume() -> bool {
         return false;
     }
     use core::fmt::Write as _;
-    let Display { loader, stream, .. } = display;
+    let Display {
+        loader,
+        stream,
+        graphics_pm,
+        ..
+    } = display;
+    if *graphics_pm == GraphicsPm::Idle {
+        // Nothing was suspended (see `prepare_graphics_idle`).
+        return true;
+    }
     if narf_scheduler::block_on_spin(async {
         loader.boot(Default::default()).await?;
         loader.enable_notifications().await
@@ -1718,11 +1813,40 @@ mod tests {
         {
             return TestResult::Fail("S3 resume work");
         }
+        // A suspend-to-idle suspended nothing, so its resume does nothing:
+        // no rebuild (the GPU was never reset) and no mode 2 reset.
+        if resume_work(GraphicsPm::Idle) != ResumeWork::Nothing {
+            return TestResult::Fail("s2idle resume work");
+        }
+        TestResult::Pass
+    }
+    /// amdgpu_acpi_is_s0ix_active for an APU suspending to idle, in Linux's
+    /// order: GFXOFF allowed, the FADT's LOW_POWER_S0, then AMD PMC. NARF has
+    /// no PMC driver, so s0ix is never active yet.
+    fn raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active() -> TestResult {
+        for (gfxoff, lps0, pmc, want) in [
+            (false, true, true, S0ix::NoGfxoff),
+            (true, false, true, S0ix::NoLowPowerS0),
+            (true, true, false, S0ix::NoPmc),
+            (true, true, true, S0ix::Active),
+            (false, false, false, S0ix::NoGfxoff),
+        ] {
+            if s0ix(gfxoff, lps0, pmc) != want {
+                return TestResult::Fail("s0ix decision order");
+            }
+        }
+        if s0ix(true, true, AMD_PMC) == S0ix::Active {
+            return TestResult::Fail("s0ix active without an AMD PMC driver");
+        }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/raphael-reset",
         raphael_s3_resume_work_follows_the_suspend_state
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active
     );
     /// Every literal here is read off the AMD header, never off the row it
     /// checks. One case per row, so adding a GPU means adding a case: a new

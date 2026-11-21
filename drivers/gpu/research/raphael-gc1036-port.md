@@ -577,6 +577,36 @@ since the submitter is replaced. Raphael's port:
     disallowed. A re-arm returns the owner to Idle, since the reset left
     every gating register at its default.
 
+## Suspend-to-idle
+
+17. ~~s2idle~~ (done: Linux's fallback, `GraphicsPm::Idle`). Linux suspends
+    an APU for s2idle only on its s0ix path. `amdgpu_acpi_is_s0ix_active`
+    requires GFXOFF allowed (`PP_GFXOFF_MASK`), the FADT's `LOW_POWER_S0`
+    and `CONFIG_AMD_PMC`. That path is sound only when the SoC really
+    reaches S0i3:
+    - GFX, SDMA 5.x and the PSP are skipped in both directions, so GFX
+      stays in GFXOFF and its TMR stays loaded;
+    - their PG/CG are left gated;
+    - the SMU suspend halts the RLC (`smu_disable_dpms`), and nothing in
+      amdgpu restarts it; GFXOFF exit at S0i3 resume does.
+    Without s0ix, `amdgpu_pmops_prepare` and `_suspend` return before
+    touching the device, and `_resume` returns at once: graphics and the
+    display keep running through the park.
+
+    NARF has no AMD PMC driver (the S0i3 OS hint and the LPS0 `_DSM` calls),
+    so s0ix is never active. The S0Idle prepare marks the coordinator
+    `Idle`, the sync suspend and resume leave the display and PSP alone,
+    and the async resume clears the mark. The console line names why s0ix
+    was not taken. The FADT flag is now parsed, so the check needs only a
+    PMC driver to turn on, which would also need the s0ix sequence above.
+
+    Before this, an s2idle with graphics up ran the S3 sequence: the TMR was
+    released under quiesced graphics, and the resume re-armed the
+    coordinator. Both are sound only after S3's power-off, which s2idle
+    never does. Display-only boards (graphics not booted, or Phoenix)
+    still take their S3-style display cycle on s2idle, unchanged; Linux
+    would leave those alone too.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
