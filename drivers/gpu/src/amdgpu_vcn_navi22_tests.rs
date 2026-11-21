@@ -106,6 +106,10 @@ struct Model {
     sram: Rc<RefCell<BTreeMap<usize, Vec<u32>>>>,
     /// DPG_PAUSE requests that are never acknowledged.
     pause_stuck: bool,
+    /// The instance keeps reporting UVD_POWER_STATUS 2 after the DPG
+    /// unpause, as the RX 6750 XT's VCN0 does (POWER_STATUS 0x906) while its
+    /// encode rings hold IB-test commands they never ran.
+    power_held: [bool; 2],
 }
 fn mc(map: MmioRegion, offset: u64) -> u64 {
     map.phys.raw() - PHYS + MC + offset
@@ -155,6 +159,7 @@ impl Model {
             revoke: None,
             sram: Rc::new(RefCell::new(BTreeMap::new())),
             pause_stuck: false,
+            power_held: [false; 2],
         }
     }
     fn reg(&self, address: u64) -> u32 {
@@ -473,7 +478,7 @@ impl Io for Model {
             let power = self.reg(v(i, POWER_STATUS));
             if address == v(i, POWER_STATUS) && power & POWER_PG_MODE != 0 {
                 // Powered up (2) while paused and not stalled, else 1.
-                let up = self.paused(i) && power & POWER_STALL_DPG == 0;
+                let up = self.power_held[i] || (self.paused(i) && power & POWER_STALL_DPG == 0);
                 return (power & !POWER_STATUS_MASK) | if up { 2 } else { 1 };
             }
         }
@@ -2024,4 +2029,52 @@ fn vcn3_idle_gates_past_a_failed_ring_and_rechecks_each_second() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22/idle-cadence",
     vcn3_idle_gates_past_a_failed_ring_and_rechecks_each_second
+);
+
+/// Linux `vcn_v3_0_stop_dpg_mode` ignores every SOC15_WAIT_ON_RREG result:
+/// a ring that does not drain or a power status that never reads 1 is
+/// warned about, DPG is left and `vcn_v3_0_stop` powers VCN down anyway.
+/// This is the RX 6750 XT at its first idle gate: both VCN0 encode rings
+/// passed their ring tests, never ran their IB tests (RPTR 0x40, WPTR 0xc0)
+/// and keep the instance reporting power status 2.
+fn vcn3_dpg_gate_powers_down_past_register_wait_timeouts() -> TestResult {
+    let model = Model::new();
+    let psp = FakePsp::new(&model);
+    let (_pool, mut e) = engine(model, 3);
+    e.mode = StartMode::Dpg;
+    let mut pm = RuntimePm {
+        psp,
+        commands: Vec::new(),
+        gated: true,
+        stall: None,
+        fail: false,
+    };
+    if run(e.start(firmware(3), None, &mut pm)).is_err() {
+        return TestResult::Fail("start");
+    }
+    let _ = run(e.start_jpeg());
+    // Encode rings 0.0 and 0.1 stop consuming after their ring tests.
+    e.hw.io.stalled[1] = true;
+    e.hw.io.stalled[2] = true;
+    if run(e.test_ib()) != Err(Error::Timeout) || e.state != State::Verified {
+        return TestResult::Fail("decode did not serve past the stuck encode IB tests");
+    }
+    e.hw.io.power_held[0] = true;
+    if run(e.idle(&mut pm, 0)) != Ok(false) {
+        return TestResult::Fail("gated before VCN_IDLE_TIMEOUT");
+    }
+    if run(e.idle(&mut pm, 1_000_000_000)) != Ok(true)
+        || e.runtime.phase != idle::Phase::Asleep
+        || pm.commands != [([true, true], false)]
+    {
+        return TestResult::Fail("a register wait timeout in the DPG stop kept VCN from gating");
+    }
+    if e.hw.io.reg(v(0, POWER_STATUS)) & POWER_PG_MODE != 0 {
+        return TestResult::Fail("the DPG stop did not leave dynamic power gating");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/dpg-stop",
+    vcn3_dpg_gate_powers_down_past_register_wait_timeouts
 );
