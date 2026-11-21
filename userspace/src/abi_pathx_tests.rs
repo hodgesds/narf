@@ -1471,6 +1471,84 @@ kernel_test_in!(
     smoke_abi_pathx_openat2_beneath_escape_is_exdev
 );
 
+/// `RESOLVE_IN_ROOT` treats the dirfd as the root of the walk: `path_init`
+/// with LOOKUP_IN_ROOT sets `nd->root` to the dirfd, and an absolute name
+/// jumps to that root, so `openat2(dfd, "/", RESOLVE_IN_ROOT)` is `dfd`'s
+/// own directory and `"/x"` is `dfd/x` — whatever the caller's own root is.
+///
+/// Under a chroot (or after pivot_root) the caller's root is a directory
+/// inside the mount table. The absolute name used to be resolved from that
+/// root and then joined under the dirfd, naming `<dirfd>/<caller's root>`:
+/// bubblewrap 0.13's `openat2(fd_of("/oldroot"), "/", RESOLVE_IN_ROOT)` for a
+/// `--dev-bind / /` source was ENOENT ("Can't open source /").
+fn smoke_abi_pathx_openat2_in_root_absolute_name_under_a_chroot() -> TestResult {
+    with_memfs("/p3jail", "p3jail", &[("top", b"t")], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_DIRECTORY: u64 = 0o200000;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+        if call_mkdir(c"/p3jail/sub".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p3jail/sub failed");
+        }
+        if call_mkdir(c"/p3jail/sub/leaf".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p3jail/sub/leaf failed");
+        }
+        if call(Syscall::Chroot.raw(), a0(c"/p3jail".as_ptr() as u64)) != Some(0)
+            || call(Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64)) != Some(0)
+        {
+            return Err("chroot into /p3jail failed");
+        }
+        // (st_dev, st_ino) of an fd, from struct stat's first two words.
+        let identity = |fd: u64| -> Option<[u8; 16]> {
+            let mut sb = [0u8; STAT_SIZE];
+            (call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64)) == Some(0))
+                .then(|| sb[..16].try_into().expect("16-byte prefix"))
+        };
+        let open_dir = |path: &core::ffi::CStr| -> Option<u64> {
+            call_open(path.as_ptr() as u64, O_PATH | O_DIRECTORY)
+                .filter(|fd| *fd >= 0)
+                .map(|fd| fd as u64)
+        };
+        let dfd = open_dir(c"/sub").ok_or("open(/sub, O_PATH) inside the chroot failed")?;
+        let leaf = open_dir(c"/sub/leaf").ok_or("open(/sub/leaf, O_PATH) failed")?;
+        let how = [O_PATH | O_DIRECTORY, 0u64, RESOLVE_IN_ROOT];
+        for (path, want, msg) in [
+            (
+                c"/",
+                dfd,
+                "openat2(dfd, \"/\", RESOLVE_IN_ROOT) is not dfd's own directory",
+            ),
+            (
+                c"/leaf",
+                leaf,
+                "openat2(dfd, \"/leaf\", RESOLVE_IN_ROOT) is not dfd/leaf",
+            ),
+            (
+                c"/../leaf",
+                leaf,
+                "openat2(dfd, \"/../leaf\", RESOLVE_IN_ROOT) did not clamp .. at dfd",
+            ),
+        ] {
+            let fd = match call(
+                Syscall::Openat2.raw(),
+                a3(dfd, path.as_ptr() as u64, how.as_ptr() as u64, 24),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err(msg),
+            };
+            let same = identity(fd).is_some() && identity(fd) == identity(want);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            if !same {
+                return Err(msg);
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/openat2-in-root",
+    smoke_abi_pathx_openat2_in_root_absolute_name_under_a_chroot
+);
+
 // ── readlinkat (dirfd, NUL-term path, buf, buflen) → len / -1 ──────
 //
 // Resolves a symlink and copies its target into buf, returning the byte
