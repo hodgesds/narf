@@ -4298,7 +4298,12 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         .arg("-Z")
         .arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z")
-        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
+        // `panic_immediate_abort`: a `.ko` can't unwind and the kernel does not
+        // export core's `panic_const_*` helpers, so a panic path (e.g. an async
+        // state machine's poll-after-complete arm) would otherwise leave those
+        // symbols undefined and fail the nm-gate. The feature makes them
+        // `#[inline]` aborts — a module traps on panic, codegen'd locally.
+        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128,panic_immediate_abort");
     if args.no_default_features {
         cargo.arg("--no-default-features");
     }

@@ -6,7 +6,7 @@
 //! [`MacParams`], bridges the native firmware-owner `Io` to `RegIo`, and
 //! re-exports [`Info`]; DMA, MAC TX/RX and host queues stay closed pending RF.
 use super::firmware_transport::{Error, Io};
-use narf_drivers_wireless_rtl_chip::mac::{self as chip_mac, MacParams, UsbMacParams};
+use narf_drivers_wireless_rtl_chip::mac::{self as chip_mac, MacParams};
 use narf_drivers_wireless_rtl_chip::{ChipError, RegIo};
 
 pub use chip_mac::Info;
@@ -100,7 +100,8 @@ pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<I
         return Err(Error::Unsupported);
     }
     // `mac.c::txdma_queue_mapping` / `__priority_queue_cfg`: PCIe uses the fixed
-    // 0xc5a0 map and die-specific page counts; USB the bulk-out-count row.
+    // 0xc5a0 map and die-specific page counts; USB the bulk-out-count row (the
+    // rows live in the shared core, which both this and the `.ko` consume).
     let params = match hci {
         Hci::Pcie => MacParams {
             txdma_pq_map: 0xc5a0,
@@ -112,16 +113,8 @@ pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<I
             usb: None,
         },
         Hci::Usb { bulkout, speed } => {
-            let (rqpn, pages) = super::usb::usb_tables_for(did, usize::from(bulkout))
-                .map_err(|_| Error::Unsupported)?;
-            MacParams {
-                txdma_pq_map: u32::from(super::usb::txdma_pq_map(rqpn)),
-                pages: [pages.hq, pages.lq, pages.nq, pages.exq].map(u32::from),
-                usb: Some(UsbMacParams {
-                    tx_agg_desc_num: super::usb::TX_AGG_DESC_NUM,
-                    burst: speed_burst(speed),
-                }),
-            }
+            chip_mac::usb_mac_params(did, usize::from(bulkout), speed_burst(speed))
+                .ok_or(Error::Unsupported)?
         }
     };
     chip_mac::prepare(&mut IoReg(io), did, params)
