@@ -73,6 +73,7 @@ pub fn sys_init_module_with_params(
     if let Err(e) = invoke {
         drop_dependency_refs(&module);
         crate::module_block::retire_owner(module.id.0);
+        narf_firmware::module_fetch::retire_owner(module.id.0);
         narf_bus::unregister_module_pci_drivers(module.id.0);
         narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
         narf_bus::module_sdio::unregister_module_sdio_drivers(module.id.0);
@@ -159,6 +160,7 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // made unreachable or unmapped. Module disks go first: a running request
     // copies through the bus context's DMA buffers.
     crate::module_block::retire_owner(module.id.0);
+    narf_firmware::module_fetch::retire_owner(module.id.0);
     narf_bus::unregister_module_pci_drivers(module.id.0);
     narf_bus::module_usb::unregister_module_usb_drivers(module.id.0);
     narf_bus::module_sdio::unregister_module_sdio_drivers(module.id.0);

@@ -3476,6 +3476,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-filesystem",
+ "narf-firmware",
  "narf-init",
  "narf-initramfs",
  "narf-kernel-test",
