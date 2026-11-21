@@ -5918,9 +5918,10 @@ fn boot_userspace_init() {
             }
         };
         let pid = proc.pid;
+        // PID 1 runs on any CPU, as Linux's init does (`init_task_spec`).
         let pending = narf_userspace::user_task::prepare_user_process_initial(
             proc,
-            narf_scheduler::TaskSpec::unthrottled(),
+            narf_userspace::user_task::init_task_spec(),
         );
         let tid = pending.task_id();
         if !narf_userspace::handlers::install_root_dir(tid.raw(), root) {

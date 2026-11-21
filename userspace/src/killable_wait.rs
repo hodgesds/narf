@@ -219,7 +219,10 @@ fn detach_to_scheduler(op: Detached) {
             return hook(op);
         }
     }
-    narf_scheduler::spawn(op);
+    // On any CPU: the operation ran in a user task, which may run on any CPU,
+    // and may hold the filesystem's transaction or operation queue
+    // (`finishing_for` names it by scheduler task id, not CPU).
+    narf_scheduler::spawn_with_spec(op, narf_scheduler::TaskSpec::kernel_any());
 }
 
 fn discard<T>(_: T) {}

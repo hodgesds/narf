@@ -1642,7 +1642,7 @@ fn commit_on_last_drop<B: BlockDevice + 'static>(core: &Arc<VolCore<B>>) {
     let waker = noop_waker();
     let mut cx = core::task::Context::from_waker(&waker);
     if commit.as_mut().poll(&mut cx).is_pending() {
-        narf_scheduler::spawn(commit);
+        narf_scheduler::spawn_with_spec(commit, crate::write::background_task_spec());
     }
 }
 
