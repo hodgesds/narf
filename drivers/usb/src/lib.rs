@@ -728,11 +728,18 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     Some(h) => h,
                     None => continue,
                 };
-                let connected =
-                    enumeration_wait::run(hub_copy.connected_downstream_ports(c), || {
+                let suspended = hubs
+                    .lock()
+                    .get(idx)
+                    .filter(|h| h.hub.slot_id == *hub_slot)
+                    .map_or(0, |h| h.suspended_downstream);
+                let connected = enumeration_wait::run(
+                    hub_copy.connected_downstream_ports(c, suspended),
+                    || {
                         pump_bound_devices(c);
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 // Downstream disconnect pass: bound ports that left
                 // the connected set were unplugged. Detach each
                 // (class unbind → Disable Slot → reclaim) and clear
