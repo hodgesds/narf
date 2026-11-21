@@ -30,6 +30,14 @@
 //!   reached it. The soft and hard detectors cannot see it, since the CPU is
 //!   halted.
 //!
+//! * **Runnable but not dispatched** — Linux's workqueue watchdog again
+//!   (`wq_watchdog_timer_fn`, `show_cpu_pool_hog`), at task granularity: a
+//!   task that has sat runnable on one CPU (its ready queue, wake inbox or
+//!   woken-parked set) for `workqueue.watchdog_thresh` seconds without being
+//!   dispatched. The executor-lockup detector judges only halted CPUs and the
+//!   run-delay report fires only at dispatch, so a task that never runs on an
+//!   awake CPU is seen by neither. [`RunnableWatch`] reports it once per stall.
+//!
 //! Reports follow Linux: a soft lockup is re-reported every soft threshold
 //! while it lasts (`update_report_ts`), a hard lockup once per episode
 //! (`watchdog_hardlockup_warned`).
@@ -234,6 +242,108 @@ impl<const CPUS: usize> LockupWatch<CPUS> {
 }
 
 impl<const CPUS: usize> Default for LockupWatch<CPUS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── runnable-but-not-dispatched (Linux `wq_watchdog_timer_fn`) ──────────
+
+/// Default for `workqueue.watchdog_thresh`, seconds: how long a task may
+/// sit runnable on a CPU without being dispatched before it is reported.
+/// Linux's workqueue default is 30 s; NARF's executor dispatches every
+/// runnable task within a scheduling round, so a third of that is already
+/// a stall.
+pub const RUNNABLE_THRESH_SECS: u64 = 10;
+
+/// One CPU's oldest runnable-but-not-dispatched task, as sampled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RunnableSample {
+    /// The task's scheduler id.
+    pub task: u64,
+    /// When it became runnable without running since, on the same clock
+    /// as the `now` and `thresh` it is judged against (the caller's choice:
+    /// the scheduler stamps cycles). Zero is never a valid stamp.
+    pub since: u64,
+}
+
+#[derive(Debug)]
+struct RunnableCpu {
+    task: AtomicU64,
+    since: AtomicU64,
+    reported: AtomicBool,
+}
+
+impl RunnableCpu {
+    const fn new() -> Self {
+        Self {
+            task: AtomicU64::new(0),
+            since: AtomicU64::new(0),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn clear(&self) {
+        self.task.store(0, Ordering::Relaxed);
+        self.since.store(0, Ordering::Relaxed);
+        self.reported.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Per-CPU state of the runnable-task watchdog: which stall each CPU was
+/// last seen in and whether it has been reported.
+///
+/// A stall is one task runnable since one instant. It is reported once,
+/// when it has lasted the threshold and was already seen, unchanged, by the
+/// previous round: a single sample can catch a wake between setting its
+/// task's runnable bit and stamping the time, so one sighting is never
+/// enough. The task running (the CPU's oldest runnable task or its stamp
+/// changing) ends the stall; a later one is reported again.
+#[derive(Debug)]
+pub struct RunnableWatch<const CPUS: usize> {
+    cpus: [RunnableCpu; CPUS],
+}
+
+impl<const CPUS: usize> RunnableWatch<CPUS> {
+    /// Fresh state: nothing seen.
+    pub const fn new() -> Self {
+        Self {
+            cpus: [const { RunnableCpu::new() }; CPUS],
+        }
+    }
+
+    /// Judge `cpu`'s oldest runnable task `sample` (`None`: nothing
+    /// runnable is waiting) at `now` against `thresh`
+    /// (`workqueue.watchdog_thresh`; zero disables), all on one clock.
+    /// Returns how long the task has waited when this stall is due its one
+    /// report.
+    pub fn observe(
+        &self,
+        cpu: usize,
+        sample: Option<RunnableSample>,
+        now: u64,
+        thresh: u64,
+    ) -> Option<u64> {
+        let c = self.cpus.get(cpu)?;
+        let Some(s) = sample.filter(|s| thresh != 0 && s.since != 0) else {
+            c.clear();
+            return None;
+        };
+        if c.task.load(Ordering::Relaxed) != s.task || c.since.load(Ordering::Relaxed) != s.since {
+            c.task.store(s.task, Ordering::Relaxed);
+            c.since.store(s.since, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+            return None;
+        }
+        let waited = now.saturating_sub(s.since);
+        if waited < thresh || c.reported.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(waited)
+    }
+}
+
+impl<const CPUS: usize> Default for RunnableWatch<CPUS> {
     fn default() -> Self {
         Self::new()
     }

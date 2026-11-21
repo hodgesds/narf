@@ -1707,7 +1707,11 @@ fn new_wake_cell_with_cputime(
         wake_next: AtomicPtr::new(core::ptr::null_mut()),
         wake_list: AtomicU64::new(0),
         task: id.raw(),
-        wake_cyc: AtomicU64::new(0),
+        // Runnable from creation (`flag` starts set): Linux's
+        // `wake_up_new_task` → `sched_info_enqueue` stamps the new task's
+        // `last_queued` too, so its first run delay counts from here and a
+        // task that never runs at all is visible to `dbg_oldest_runnable`.
+        wake_cyc: AtomicU64::new(narf_time::now_cycles()),
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
         user_rt: AtomicBool::new(false),
@@ -6288,6 +6292,10 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             }
             let was_awake = slot.awake.flag.swap(true, Ordering::AcqRel);
             if !was_awake {
+                // A donation makes the donee runnable like a wake does.
+                slot.awake
+                    .wake_cyc
+                    .store(narf_time::now_cycles(), Ordering::Relaxed);
                 note_runnable_peer(cpu as u32, slot.id.raw());
             }
             if activated_reason.is_some() {
@@ -8605,6 +8613,154 @@ pub fn dbg_cpu_runnable(cpu: usize) -> bool {
         q.as_ref()
             .is_some_and(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
     })
+}
+
+/// Where [`dbg_oldest_runnable`] found a runnable task waiting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RunnableHold {
+    /// The CPU's ready queue (`READY`).
+    Ready,
+    /// Enqueued from another CPU, not yet folded in (`WAKE_INBOX`).
+    WakeInbox,
+    /// Woken while parked, not yet activated (`PARKED` + its wake inbox).
+    ParkedWake,
+}
+
+impl RunnableHold {
+    /// Short name for a report line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::WakeInbox => "wake-inbox",
+            Self::ParkedWake => "parked-wake",
+        }
+    }
+}
+
+/// The oldest task on one CPU that is runnable and has not been dispatched
+/// ([`dbg_oldest_runnable`]).
+#[derive(Copy, Clone, Debug)]
+pub struct OldestRunnable {
+    /// Its scheduler id.
+    pub task: u64,
+    /// The cycle since which it has been runnable without running: the
+    /// later of its last wake (Linux `sched_info.last_queued`) and the end
+    /// of its last run.
+    pub since_cycles: u64,
+    /// Which of the CPU's holding places it is in.
+    pub hold: RunnableHold,
+    /// The future's type name (`task_origins`).
+    pub origin: &'static str,
+    /// Where it was spawned.
+    pub site: &'static core::panic::Location<'static>,
+    /// Its affinity mask, and whether that mask includes this CPU.
+    pub affinity: u64,
+    pub allowed: bool,
+}
+
+/// When `slot` became runnable without running since, or 0 when it is not
+/// waiting to be dispatched (not runnable, directly claimed, budget
+/// throttled) or never stamped.
+fn runnable_since(slot: &TaskSlot, now: u64) -> u64 {
+    if !slot_is_dispatchable(slot, now) {
+        return 0;
+    }
+    // A wake stamps the false→true transition; a dispatch clears the stamp
+    // and the end of every run (direct handoffs included) is recorded, so
+    // a stamp older than the last run is a wake that already ran.
+    slot.awake
+        .wake_cyc
+        .load(Ordering::Relaxed)
+        .max(slot.awake.last_run_cycles.load(Ordering::Acquire))
+}
+
+/// Stall-watchdog probe (Linux `wq_watchdog_timer_fn` at task granularity):
+/// the task on `cpu` that has been runnable longest without being
+/// dispatched, wherever the CPU holds it — its ready queue, its wake inbox,
+/// or its parked set (woken, awaiting activation).
+///
+/// `try_lock` throughout, as [`dbg_cpu_stall`]: the CPU under investigation
+/// may hold any of these locks, and a busy one is skipped, not waited on.
+/// No allocation; one pass over each container.
+pub fn dbg_oldest_runnable(cpu: usize) -> Option<OldestRunnable> {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return None;
+    }
+    let now = narf_time::now_cycles();
+    let mut best: Option<OldestRunnable> = None;
+    let mut consider = |slot: &TaskSlot, hold: RunnableHold| {
+        let since = runnable_since(slot, now);
+        if since == 0 || best.is_some_and(|b| b.since_cycles <= since) {
+            return;
+        }
+        let allowed = slot.spec.affinity.allowed;
+        best = Some(OldestRunnable {
+            task: slot.id.raw(),
+            since_cycles: since,
+            hold,
+            origin: slot.origin,
+            site: slot.site,
+            affinity: allowed.bits(),
+            allowed: allowed.contains(CpuId(cpu as u32)),
+        });
+    };
+    if let Some(g) = READY[cpu].try_lock() {
+        for slot in g.iter().flatten() {
+            consider(slot, RunnableHold::Ready);
+        }
+    }
+    if let Some(inbox) = WAKE_INBOX[cpu].try_lock() {
+        for (slot, _) in inbox.iter() {
+            consider(slot, RunnableHold::WakeInbox);
+        }
+    }
+    if let Some(g) = PARKED[cpu].try_lock() {
+        if let Some(parked) = g.as_ref() {
+            for entry in parked.values() {
+                consider(&entry.slot, RunnableHold::ParkedWake);
+            }
+        }
+    }
+    best
+}
+
+/// The task executing on `cpu` right now (0: its executor, between polls).
+pub fn dbg_cpu_current_task(cpu: usize) -> u64 {
+    CURRENT_TASK
+        .get(cpu)
+        .map_or(0, |task| task.0.load(Ordering::Acquire))
+}
+
+/// A kernel task's `comm`: the function its future came from, the last named
+/// path segment of its type name (`narf_x::y::pump_task::{{closure}}` or
+/// `…::pump_task::{async_block#0}` → `pump_task`), as Linux names a kthread
+/// after its thread function.
+pub fn origin_comm(origin: &'static str) -> &'static str {
+    let path = origin.split('<').next().unwrap_or(origin);
+    path.rsplit("::")
+        .find(|segment| !segment.is_empty() && !segment.starts_with('{'))
+        .unwrap_or(origin)
+}
+
+/// The future type name and spawn site of task `task_id`, if one of the
+/// CPUs' ready queues or parked sets holds it now. For the hung-task report
+/// of a kernel task, which has no comm. `try_lock`; no allocation.
+pub fn dbg_task_origin(
+    task_id: u64,
+) -> Option<(&'static str, &'static core::panic::Location<'static>)> {
+    for (parked, ready) in PARKED.iter().zip(READY.iter()) {
+        if let Some(g) = parked.try_lock() {
+            if let Some(entry) = g.as_ref().and_then(|p| p.get(&TaskId(task_id))) {
+                return Some((entry.slot.origin, entry.slot.site));
+            }
+        }
+        if let Some(g) = ready.try_lock() {
+            if let Some(slot) = g.iter().flatten().find(|s| s.id.raw() == task_id) {
+                return Some((slot.origin, slot.site));
+            }
+        }
+    }
+    None
 }
 
 /// NUMA node ID of the executing CPU, or `None` when SRAT
