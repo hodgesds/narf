@@ -1190,9 +1190,11 @@ also consult upstream Linux GPL sources.
   CH341 break encodings are not modelled and return a typed
   `PortError::Unsupported`. TCXONC's TCOOFF parks the pump's TX
   drain via the node's `tx_stopped` flag. A write, and TCXONC's TCOON,
-  call `serial::port::kick_tty(index)` (ttyACM: `cdc_acm::kick_tty`) for
-  the supervisor that pumps the port; it does not kick yet, the
-  supervisor's periodic cycle drains the ring.
+  call `serial::port::kick_tty(index)` (ttyACM: `cdc_acm::kick_tty`),
+  which kicks the supervisor of the controller the port is bound on, so
+  the bytes go out at once (Linux `usb_serial_generic_write` /
+  `acm_tty_write`). The pumps send one 64-byte chunk per pass and kick
+  again while bytes remain and output is not stopped.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The

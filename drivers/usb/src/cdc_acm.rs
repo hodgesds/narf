@@ -1058,11 +1058,17 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
 /// modem state (#757). All controller calls here are non-blocking
 /// polls; no lock is held across any of them.
 /// Tell the supervisor pumping ttyACM `tty_index` that it has bytes to
-/// send (Linux `acm_tty_write` submits the write URB at once).
-///
-/// No kick yet: the supervisor's periodic cycle picks the bytes up.
+/// send (Linux `acm_tty_write` submits the write URB at once): kick the
+/// supervisor of the controller the device is bound on.
 pub fn kick_tty(tty_index: usize) {
-    let _ = tty_index;
+    for (controller, devs) in ACM_DEVICES.each() {
+        if devs.lock().iter().any(|d| d.tty_index == Some(tty_index)) {
+            if let Some(c) = crate::xhci::controller_by_id(controller) {
+                c.kick_supervisor();
+            }
+            return;
+        }
+    }
 }
 
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
@@ -1133,6 +1139,12 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
                                 Ok(Some(sent)) => {
                                     crate::cdc_acm_bridge::tx_skip(idx, sent.min(pending));
                                     total += sent;
+                                    // One chunk per pass: the next goes out
+                                    // on the pass this kick starts (Linux
+                                    // `acm_write_bulk` → `acm_tty_wakeup`).
+                                    if crate::cdc_acm_bridge::tx_peek(idx, &mut chunk) > 0 {
+                                        xhci_dev.kick_supervisor();
+                                    }
                                     break;
                                 }
                                 Ok(None) => continue,
