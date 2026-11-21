@@ -910,6 +910,10 @@ pub(crate) struct MediaFrame<'a> {
     pub ring: MediaRing,
     /// The hub's flush registers (`adev->vmhub[AMDGPU_MMHUB0(0)]`).
     pub hub: MediaHub,
+    /// HDP segment-0 dword base (`adev->reg_offset[HDP_HWIP][0][0]`) on a
+    /// dGPU; `None` on an APU, where `amdgpu_device_flush_hdp` and
+    /// `amdgpu_device_invalidate_hdp` return early on x86_64.
+    pub hdp: Option<u32>,
     pub engine: u32,
     pub flush: Option<VmRef>,
     /// IH LUT write after the flush: (absolute `IH_VMID_<vmid>_LUT_MM`

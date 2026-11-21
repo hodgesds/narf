@@ -269,6 +269,12 @@ kernel_test_in!(
 );
 
 const MMHUB: u32 = 0x1a000;
+/// HDP segment 0 (dword), as on the RX 6750 XT.
+const HDP: u32 = 0xf20;
+/// `(rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) >> 2`.
+const HDP_FLUSH: u32 = 0x7f000 >> 2;
+/// `mmHDP_READ_CACHE_INVALIDATE`.
+const HDP_INVALIDATE: u32 = HDP + 0xd1;
 /// OSSSYS segment 0 (0x10a0) + mmIH_VMID_0_LUT_MM (0x10) + VMID 3.
 const LUT: u32 = 0x10a0 + 0x10 + 3;
 const PTB: u64 = 0x0000_0001_2345_6001;
@@ -373,6 +379,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     let frame = |ring, flush: bool, ibs: &'static [Ib]| MediaFrame {
         ring,
         hub: crate::amdgpu_navi22_submit::MediaHub::mmhub_v2_0(MMHUB),
+        hdp: Some(HDP),
         engine: ring.inv_engine(1),
         flush: flush.then_some(vm(3)),
         pasid_map: flush.then_some((LUT, 0x42)),
@@ -394,13 +401,17 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
             flags: 0,
         },
     ];
-    // Decode: insert_start, flush, insert_start, IBs, fence, insert_end.
+    // Decode: insert_start, flush, insert_start, the HDP flush
+    // (amdgpu_device_flush_hdp -> amdgpu_hdp_generic_flush through the
+    // ring's emit_wreg), IBs, the HDP invalidate (hdp_v5_0_invalidate_hdp
+    // through emit_wreg), fence, insert_end.
     let mut want = Vec::new();
     let start = [p0(0x10), 0, p0(0x0f), 0x8000_0000 | (0xa << 1)];
     want.extend(start);
     flush(&mut want, dec_wreg, dec_wait, MMHUB, 0, 3, PTB);
     dec_wreg(&mut want, LUT, 0x42); // gmc_v10_0_emit_pasid_mapping (_LUT_MM)
     want.extend(start);
+    dec_wreg(&mut want, HDP_FLUSH, 0);
     for ib in &IBS {
         want.extend([
             p0(0x431),
@@ -413,6 +424,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
             ib.dwords,
         ]);
     }
+    dec_wreg(&mut want, HDP_INVALIDATE, 1);
     want.extend([
         p0(0x27),
         9,
@@ -434,24 +446,31 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     if encode_media(&frame(MediaRing::Dec, true, &IBS)) != want {
         return TestResult::Fail("decode frame differs from amdgpu_ib_schedule on vcn_v3_0 dec");
     }
-    // Without a flush: start, IBs, fence, end only.
+    // Without a flush: start, HDP flush, IBs, HDP invalidate, fence, end.
     let unflushed = encode_media(&frame(MediaRing::Dec, false, &IBS));
-    if unflushed.len() != 4 + 16 + 14 + 2 || unflushed[4] != p0(0x431) {
+    if unflushed.len() != 4 + 6 + 16 + 6 + 14 + 2
+        || unflushed[4..6] != [p0(0x10), HDP_FLUSH << 2]
+        || unflushed[10] != p0(0x431)
+    {
         return TestResult::Fail("decode frame without flush");
     }
-    // Encode ring 0 (MMHUB engine 1): flush, IB, fence + trap, end.
+    // Encode ring 0 (MMHUB engine 1): flush, HDP flush, IB, HDP
+    // invalidate, fence + trap, end.
     let mut want = Vec::new();
     flush(&mut want, enc_wreg, enc_wait, MMHUB, 1, 3, PTB);
     enc_wreg(&mut want, LUT, 0x42);
+    enc_wreg(&mut want, HDP_FLUSH, 0);
     for ib in &IBS {
         want.extend([2, 3, ib.va as u32, (ib.va >> 32) as u32, ib.dwords]);
     }
+    enc_wreg(&mut want, HDP_INVALIDATE, 1);
     want.extend([3, fence as u32, (fence >> 32) as u32, 9, 4, 1]);
     if encode_media(&frame(MediaRing::Enc(0), true, &IBS)) != want {
         return TestResult::Fail("encode frame differs from vcn_v3_0 enc ring");
     }
-    // JPEG (engine 5 with VCN1 harvested): start, flush, start, IBs from
-    // the kernel copy at VMID 0, fence, end.
+    // JPEG (engine 5 with VCN1 harvested): start, flush, start, HDP flush,
+    // IBs from the kernel copy at VMID 0, HDP invalidate, fence, end (both
+    // HDP registers lie outside the JPEG window: external writes).
     let base = 0x8_0090_0000u64;
     let jstart = [pj(0x1bfff, 0, 0), 0x68e04, pj(0x18000, 0, 0), 0x8001_0000];
     let mut want = Vec::new();
@@ -459,6 +478,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     flush(&mut want, jpeg_wreg, jpeg_wait, MMHUB, 5, 3, PTB);
     jpeg_wreg(&mut want, LUT, 0x42);
     want.extend(jstart);
+    jpeg_wreg(&mut want, HDP_FLUSH, 0);
     for ib in &IBS {
         want.extend([
             pj(0x4149, 0, 0),
@@ -487,6 +507,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
             2,
         ]);
     }
+    jpeg_wreg(&mut want, HDP_INVALIDATE, 1);
     want.extend([
         pj(0x402a, 0, 0),
         9,
@@ -586,6 +607,7 @@ fn vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush() -> TestResult {
     let words = encode_media(&MediaFrame {
         ring: MediaRing::Enc(0),
         hub: crate::amdgpu_navi22_submit::MediaHub::mmhub_v2_0(MMHUB),
+        hdp: Some(HDP),
         engine: 1,
         flush: None,
         pasid_map: None,
@@ -595,7 +617,8 @@ fn vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush() -> TestResult {
         seq: 1,
         ring_base: 0,
     });
-    if words.first() != Some(&2) || words.len() != 5 + 6 {
+    // HDP flush (3), the IB (5), HDP invalidate (3), fence + trap + end (6).
+    if words.first() != Some(&0xb) || words.get(3) != Some(&2) || words.len() != 3 + 5 + 3 + 6 {
         return TestResult::Fail("unflushed encode frame");
     }
     TestResult::Pass

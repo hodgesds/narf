@@ -1582,6 +1582,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         let want = encode_media(&MediaFrame {
             ring: MediaRing::Dec,
             hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+            hdp: Some((HDP / 4) as u32),
             engine: 0,
             flush: (k == 0).then_some(vm(true)),
             pasid_map: (k == 0).then_some((0x10a0 + 0x10 + 3, 0x42)),
@@ -1601,6 +1602,25 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         {
             return TestResult::Fail("decode client frame/sequence");
         }
+    }
+    // amdgpu_ib_schedule's HDP flush and invalidate ride in every frame as
+    // WRITE_REGs: the remapped HDP_MEM_FLUSH_CNTL and this layout's
+    // HDP_READ_CACHE_INVALIDATE.
+    let wreg = |byte: u32, value: u32| {
+        [
+            cmd::packet0(cmd::INTERNAL_DATA0),
+            byte,
+            cmd::packet0(cmd::INTERNAL_DATA1),
+            value,
+            cmd::packet0(cmd::INTERNAL_CMD),
+            cmd::DEC_KMD | (4 << 1),
+        ]
+    };
+    let (hdp_flush, hdp_invalidate) = (wreg(0x7f000, 0), wreg((HDP + 0xd1 * 4) as u32, 1));
+    if frames.iter().any(|(_, words, _)| {
+        !words.windows(6).any(|w| w == hdp_flush) || !words.windows(6).any(|w| w == hdp_invalidate)
+    }) {
+        return TestResult::Fail("decode client frame without the HDP flush/invalidate");
     }
     let m = &e.hw.io;
     let last = frames[1].2;
@@ -2872,6 +2892,7 @@ fn media_flush_follows_the_hub_registers() -> TestResult {
         encode_media(&MediaFrame {
             ring: MediaRing::Dec,
             hub,
+            hdp: None,
             engine,
             flush: Some(VmRef {
                 vmid: vmid as u8,

@@ -3322,6 +3322,10 @@ impl<I: Io> Engine<I> {
         let frame = submit::MediaFrame {
             ring,
             hub: client.hub,
+            // HDP 5.0's bank, which Layout bounds inside the sub-4 GiB
+            // register BAR. Raphael's HDP 5.2.1 has none: an APU skips
+            // amdgpu_device_{flush,invalidate}_hdp.
+            hdp: self.hw.layout.hdp.map(|hdp| (hdp.get() / 4) as u32),
             engine,
             flush: vm.flush.then_some(vm),
             pasid_map: (vm.flush && vm.map_pasid).then_some((
