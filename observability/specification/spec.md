@@ -287,7 +287,10 @@ id, closing task, operations joined). Every lockup line and every
 `STALL-WD` dump prints each CPU's hard-IRQ share over the last window:
 `STALL-WD   irq cpu=N rate=R/s hardirq=P% masked_arrivals=M/s window_ms=W
 top=V:R/s(handler) ...`, from the dispatch table's per-CPU fire counts,
-`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters.
+`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters. Every
+report line is one `TrapWriter` record, so it reaches the serial port whole
+even while another CPU prints (console §3: trap text takes the console lock
+per record).
 
 ## 4. Invariants & safety properties
 
