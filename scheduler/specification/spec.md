@@ -220,6 +220,7 @@ pub struct OldestRunnable { pub task: u64, pub since_cycles: u64, pub hold: Runn
                             pub site: &'static core::panic::Location<'static>,
                             pub affinity: u64, pub allowed: bool }
 pub fn dbg_oldest_runnable(cpu: usize) -> Option<OldestRunnable>;
+pub fn dbg_cpu_in_executor(cpu: usize) -> Option<u64>;   // entry cycle
 pub fn dbg_cpu_current_task(cpu: usize) -> u64;
 pub fn dbg_task_origin(task: u64)
     -> Option<(&'static str, &'static core::panic::Location<'static>)>;
@@ -459,7 +460,11 @@ dispatchable task on `cpu`'s ready queue, wake inbox or woken parked set
 whose `since_cycles` — the later of its wake stamp (the run-delay stamp a
 fresh wake already takes, and a task's creation, as Linux's
 `wake_up_new_task` stamps `sched_info.last_queued`) and the end of its last
-run — is oldest, allocation-free. `dbg_task_origin` names a queued or parked
+run — is oldest, allocation-free. It samples a CPU only while that CPU is
+inside its executor (`dbg_cpu_in_executor`: `run_forever`,
+`run_until_empty` or a `poll_one_round`, task polls included; a per-CPU
+depth and entry cycle written on executor entry and exit, never per poll),
+and counts no stamp from before the entry. `dbg_task_origin` names a queued or parked
 task's future and spawn site; `origin_comm` is the kthread-style name the
 reports print for a kernel task.
 
