@@ -12578,6 +12578,28 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     } else {
         None
     };
+    // `copy_namespaces` owns every namespace this clone creates by ONE user
+    // namespace, the child credential's:
+    //
+    //     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+    //     ...
+    //     new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+    //
+    // `copy_creds` ran first and, under CLONE_NEWUSER, bound that credential
+    // to the namespace prepared above. Taking the CREATING task's instead —
+    // the parent's — left a `clone(CLONE_NEWUSER | CLONE_NEWNS)` child
+    // without CAP_SYS_ADMIN over its own mount namespace, so bubblewrap's
+    // first mount in it was -EPERM. The PID namespace takes the same owner
+    // through `pid_owner` below; UTS/IPC/net read the child's installed
+    // credential, which is this namespace too.
+    #[cfg(feature = "container")]
+    let child_ns_owner: Option<alloc::sync::Arc<dyn narf_filesystem::NsOwner>> =
+        match prepared_user_ns.as_ref() {
+            Some(user_ns) => Some(user_ns.clone()),
+            None => ns_owner_for(parent_pid),
+        };
+    #[cfg(not(feature = "container"))]
+    let child_ns_owner = ns_owner_for(parent_pid);
     #[cfg(feature = "container")]
     let pid_plan = {
         let new_pid = flags & crate::namespaces::CLONE_NEWPID != 0;
@@ -12910,12 +12932,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             const CLONE_NEWCGROUP: u64 = 0x0200_0000;
             narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_visible_pid);
             if flags & CLONE_NEWCGROUP != 0 {
-                // The owner is the CREATING task's user namespace — the
-                // parent's, since `copy_cgroup_ns` runs with the parent's
-                // credentials before the child is running.
+                // `copy_cgroup_ns(flags, user_ns, ...)` gets the same
+                // `user_ns` as every other constructor in
+                // `create_new_namespaces`: the child credential's, i.e. the
+                // new user namespace under CLONE_NEWUSER.
                 narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(
                     child_visible_pid,
-                    ns_owner_for(current_task_id()),
+                    child_ns_owner.clone(),
                 );
             }
         }
@@ -13016,7 +13039,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // the inherited Arc above.
     const CLONE_NEWNS: u64 = 0x0002_0000;
     if !share_thread && flags & CLONE_NEWNS != 0 {
-        install_mount_namespace(child_tid.raw(), snapshot_current_mount_namespace());
+        install_mount_namespace(
+            child_tid.raw(),
+            snapshot_current_mount_namespace(child_ns_owner),
+        );
     }
 
     #[cfg(feature = "container")]
@@ -13024,7 +13050,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         let child = child_tid.raw();
         let parent_task = current_task_id();
         // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
-        // a fresh one for the child.
+        // a fresh one for the child. The user namespace goes first: the
+        // `unshare_*` constructors below stamp the CHILD's credential
+        // namespace as owner, which must already be `child_ns_owner`.
         crate::namespaces::inherit_into_child(parent_task, child);
         if flags & crate::namespaces::CLONE_NEWUSER != 0 {
             crate::namespaces::setns_user(

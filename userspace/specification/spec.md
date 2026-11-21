@@ -1627,7 +1627,13 @@ that retains the named namespace and is accepted by `setns(2)`. An
 `O_PATH|O_NOFOLLOW` open retains symlink-node semantics. Initial UTS, network,
 IPC, PID, mount, user, and enabled cgroup namespaces have stable nonzero
 identities even before a task unshares them.
-User namespace creation grants capabilities only in the new namespace. Real,
+User namespace creation grants capabilities only in the new namespace. Every
+other namespace created by the same `clone(2)`, `clone3(2)`, or `unshare(2)`
+call — mount, UTS, IPC, PID, network, and cgroup — is owned by that new user
+namespace, as Linux `copy_namespaces` and `unshare_nsproxy_namespaces` pass
+the new credential's namespace to every constructor. A
+`clone(CLONE_NEWUSER | CLONE_NEWNS)` child therefore holds `CAP_SYS_ADMIN`
+over its own mount namespace and may change propagation and mount there. Real,
 effective, saved, filesystem IDs and supplementary groups retain their
 kernel-global identity across `clone(CLONE_NEWUSER)`, `unshare`, and `setns`.
 Credential getters and inode stat results translate to the caller's namespace;

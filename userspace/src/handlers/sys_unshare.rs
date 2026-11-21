@@ -161,7 +161,9 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     if flags & CLONE_NEWNS != 0 {
         task_mount_ns_init();
         let task = current_task_id();
-        let snap = snapshot_current_mount_namespace();
+        // Owned by the credential CLONE_NEWUSER installed above, if any:
+        // `unshare_nsproxy_namespaces` hands `new_cred->user_ns` on.
+        let snap = snapshot_current_mount_namespace(ns_owner_for(task));
         install_mount_namespace(task, snap);
         any = true;
     }
