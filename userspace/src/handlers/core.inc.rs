@@ -12600,6 +12600,44 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         };
     #[cfg(not(feature = "container"))]
     let child_ns_owner = ns_owner_for(parent_pid);
+    // `copy_namespaces` gates every namespace other than a user namespace on
+    // CAP_SYS_ADMIN over that same credential's user namespace:
+    //
+    //     if (likely(!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))) { ... }
+    //     else if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+    //             return -EPERM;
+    //
+    // Under CLONE_NEWUSER the credential holds the full set
+    // `set_cred_user_ns` grants inside the namespace it now belongs to, so
+    // the test passes by construction — that is how an unprivileged
+    // bubblewrap gets its mount namespace. Otherwise it is the parent's
+    // credential in the parent's own namespace. Linux decides this after
+    // `copy_mm` and before `alloc_pid`, so a refused clone consumes no PID.
+    {
+        const CLONE_NS_ALL_EXCEPT_USER: u64 = 0x0000_0080 // CLONE_NEWTIME
+            | 0x0002_0000 // CLONE_NEWNS
+            | 0x0200_0000 // CLONE_NEWCGROUP
+            | 0x0400_0000 // CLONE_NEWUTS
+            | 0x0800_0000 // CLONE_NEWIPC
+            | 0x2000_0000 // CLONE_NEWPID
+            | 0x4000_0000; // CLONE_NEWNET
+        #[cfg(feature = "container")]
+        let in_new_user_ns = prepared_user_ns.is_some();
+        #[cfg(not(feature = "container"))]
+        let in_new_user_ns = false;
+        if flags & CLONE_NS_ALL_EXCEPT_USER != 0
+            && !in_new_user_ns
+            && !task_capable_in_own_ns(parent_pid, CAP_SYS_ADMIN)
+        {
+            if let Some(fd) = reserved_pidfd {
+                let _ = crate::fd::with_table(parent_pid, |table| {
+                    table.release_reserved(&[fd]);
+                });
+            }
+            ctx.set_return(errno_ret(EPERM));
+            return;
+        }
+    }
     #[cfg(feature = "container")]
     let pid_plan = {
         let new_pid = flags & crate::namespaces::CLONE_NEWPID != 0;
