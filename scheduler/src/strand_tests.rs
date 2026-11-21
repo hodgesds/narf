@@ -1653,11 +1653,16 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
                     && !narf_time::periodic_tick_wanted(cpu))
         })
     });
+    // Both probes are in hand before stealing is on: the parked one's waker,
+    // and the one to enqueue, built pinned to this CPU so that no idle CPU
+    // takes it off this (never rescheduling) CPU before it is moved.
+    let parked_waker = take_waker(0);
+    let slot = take_probe_here(1, 0, None);
     crate::enable_work_stealing();
     let placements = crate::__test_wake_placements();
 
     // The wake: issued at once, while the held CPU is running a task.
-    let woke = take_waker(0).map(|waker| {
+    let woke = parked_waker.map(|waker| {
         let ipis = crate::__test_resched_ipis_sent(me);
         waker.wake();
         crate::__test_resched_ipis_sent(me).wrapping_sub(ipis)
@@ -1666,8 +1671,6 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     // The enqueue: once the held CPU has passed no scheduling point for longer
     // than the not-rescheduling threshold.
     narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
-    crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
-    let slot = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front());
     let enqueued = slot.map(|slot| {
         let ipis = crate::__test_resched_ipis_sent(me);
         crate::enqueue_on(held, slot, TaskEnqueueReason::Requeued);
@@ -1715,20 +1718,40 @@ kernel_test_in!(
     smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere
 );
 
-/// Put a fresh probe straight into `cpu`'s ready queue, as that CPU's own
-/// round-start activation of a woken task does (`activate_wake_list`): no
-/// enqueue kick. Returns its wake cell.
-fn ready_probe_on(slot: usize, cpu: usize, affinity: Option<Affinity>) -> Option<Arc<WakeCell>> {
+/// A fresh probe's slot, taken off this CPU's ready queue, with `affinity`
+/// (any CPU, preferring this one, when `None`) applied once it is in hand.
+///
+/// The probe is spawned pinned to this CPU. The test thread passes no
+/// scheduling point, so an idle CPU may count this CPU as stalled and take an
+/// unpinned task from its queue at any moment, as it should; pinned, the
+/// probe stays until the test moves it.
+fn take_probe_here(
+    slot: usize,
+    parks: usize,
+    affinity: Option<Affinity>,
+) -> Option<crate::TaskSlot> {
     let me = narf_lib::percpu::current_cpu();
-    let id = crate::spawn_with_spec(Probe { slot, parks: 0 }, any_cpu_preferring(me));
+    let pinned = TaskSpec {
+        affinity: Affinity::pinned(CpuId(me as u32)),
+        ..TaskSpec::kernel_any()
+    };
+    let id = crate::spawn_with_spec(Probe { slot, parks }, pinned);
     let mut task = crate::READY[me].lock().as_mut().and_then(|q| {
         let at = q.iter().position(|task| task.id == id)?;
         q.remove(at)
     })?;
-    if let Some(affinity) = affinity {
-        task.spec.affinity = affinity;
-        task.affinity_generation = crate::register_task_affinity(id, affinity, false);
-    }
+    let affinity = affinity.unwrap_or(any_cpu_preferring(me).affinity);
+    task.spec.affinity = affinity;
+    task.affinity_generation = crate::register_task_affinity(id, affinity, false);
+    Some(task)
+}
+
+/// Put a fresh probe straight into `cpu`'s ready queue, as that CPU's own
+/// round-start activation of a woken task does (`activate_wake_list`): no
+/// enqueue kick. Returns its wake cell.
+fn ready_probe_on(slot: usize, cpu: usize, affinity: Option<Affinity>) -> Option<Arc<WakeCell>> {
+    let task = take_probe_here(slot, 0, affinity)?;
+    let id = task.id;
     task.awake.cpu.store(cpu as u32, Ordering::Release);
     let cell = task.awake.clone();
     crate::note_runnable_peer(cpu as u32, id.raw());
@@ -1936,12 +1959,7 @@ fn smoke_scheduler_ready_task_behind_cpu_in_maintenance_runs_elsewhere() -> Test
     ] {
         flag.store(false, Ordering::Release);
     }
-    let id = crate::spawn_with_spec(Probe { slot: 0, parks: 0 }, any_cpu_preferring(me));
-    let task = crate::READY[me].lock().as_mut().and_then(|q| {
-        let at = q.iter().position(|task| task.id == id)?;
-        q.remove(at)
-    });
-    let Some(task) = task else {
+    let Some(task) = take_probe_here(0, 0, None) else {
         leave_tickless_idle(live);
         reset_probes();
         return TestResult::Fail("spawned probe not found on this CPU");
