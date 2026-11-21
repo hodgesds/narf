@@ -788,7 +788,7 @@ pub struct EndpointConfig {
 
 impl EndpointConfig {
     /// DCI = (endpoint number * 2) + (1 if IN else 0). §4.8.1.
-    fn dci(self) -> u8 {
+    pub fn dci(self) -> u8 {
         let num = self.ep_addr & 0x0F;
         let in_bit = if self.kind.is_in() { 1 } else { 0 };
         (num * 2) + in_bit

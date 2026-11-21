@@ -42,7 +42,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::xhci::{self, PortSpeed, Topology, Xhci};
+use crate::xhci::{self, EndpointConfig, EndpointKind, PortSpeed, Topology, Xhci};
 
 // ── Class triple ───────────────────────────────────────────────────
 
@@ -76,6 +76,16 @@ trait HubTransport: Sync {
         slot: u8,
         request: HubRequest,
     ) -> impl core::future::Future<Output = Result<usize, xhci::XhciError>> + Send;
+
+    /// Add the hub's status-change interrupt-IN endpoint to the slot.
+    fn configure_status(
+        &self,
+        slot: u8,
+        endpoint: EndpointConfig,
+    ) -> impl core::future::Future<Output = Result<(), xhci::XhciError>> + Send;
+
+    /// Submit (or resubmit) the status-change transfer of `len` bytes.
+    fn arm_status(&self, slot: u8, dci: u8, len: u32) -> Result<(), xhci::XhciError>;
 }
 
 impl HubTransport for Xhci {
@@ -106,6 +116,18 @@ impl HubTransport for Xhci {
             &[],
         )
         .await
+    }
+
+    async fn configure_status(
+        &self,
+        slot: u8,
+        endpoint: EndpointConfig,
+    ) -> Result<(), xhci::XhciError> {
+        self.configure_endpoints(slot, &[endpoint]).await
+    }
+
+    fn arm_status(&self, slot: u8, dci: u8, len: u32) -> Result<(), xhci::XhciError> {
+        self.arm_interrupt_in(slot, dci, len).map(|_| ())
     }
 }
 
@@ -143,6 +165,30 @@ pub const C_PORT_ENABLE: u16 = 17;
 pub const C_PORT_SUSPEND: u16 = 18;
 pub const C_PORT_OVER_CURRENT: u16 = 19;
 pub const C_PORT_RESET: u16 = 20;
+
+/// Port change bits (status word bits 16..) the walk acknowledges, with
+/// the feature that clears each (Linux `port_event` /
+/// `hub_port_connect_change`). Bits 21..23 are the USB 3.x hub's
+/// C_BH_PORT_RESET / C_PORT_LINK_STATE / C_PORT_CONFIG_ERROR (USB 3.2
+/// §10.16.2.6), reserved zero on a USB 2.0 hub. C_PORT_SUSPEND stays set
+/// for the remote-wakeup watch (`suspend_change_set`), which owns it.
+const WALK_ACKED_CHANGES: [(u32, u16); 7] = [
+    (1 << 16, C_PORT_CONNECTION),
+    (1 << 17, C_PORT_ENABLE),
+    (1 << 19, C_PORT_OVER_CURRENT),
+    (1 << 20, C_PORT_RESET),
+    (1 << 21, 29), // C_BH_PORT_RESET
+    (1 << 22, 25), // C_PORT_LINK_STATE
+    (1 << 23, 26), // C_PORT_CONFIG_ERROR
+];
+/// Hub features C_HUB_LOCAL_POWER / C_HUB_OVER_CURRENT (§11.24.2,
+/// Table 11-17) and the hub-recipient request type.
+const C_HUB_LOCAL_POWER: u16 = 0;
+const C_HUB_OVER_CURRENT: u16 = 1;
+const RT_HOST_TO_DEV_CLASS_DEVICE: u8 = 0x20;
+/// Linux `hub->buffer` is 8 bytes: the status-change transfer is
+/// `min(wMaxPacketSize, 8)` (`hub_configure`).
+const STATUS_BUFFER_BYTES: u16 = 8;
 
 // Port status word bits (§11.24.2.7.1 Table 11-15).
 pub const PSTAT_CONNECTION: u16 = 1 << 0;
@@ -218,6 +264,54 @@ pub struct UsbHub {
     pub device_protocol: u8,
     pub interface_alt: u8,
     pub interface_protocol: u8,
+    /// The status-change interrupt-IN endpoint (USB 2.0 §11.12.1) and
+    /// the length of its transfer, from the configuration descriptor;
+    /// `None` when the hub offers none or `activate` could not submit it
+    /// (then only the supervisor's periodic walk sees port changes).
+    pub status: Option<HubStatusEndpoint>,
+}
+
+/// A hub's status-change endpoint as submitted (`UsbHub::activate`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HubStatusEndpoint {
+    pub endpoint: EndpointConfig,
+    pub dci: u8,
+    pub len: u16,
+}
+
+/// The status-change endpoint of hub interface `iface` alternate `alt`:
+/// its first endpoint, which must be interrupt-IN (Linux `hub_probe`:
+/// "bogus hub" otherwise).
+pub fn status_endpoint(config: &[u8], iface: u8, alt: u8) -> Option<EndpointConfig> {
+    let mut offset = 0;
+    let mut in_interface = false;
+    while offset + 2 <= config.len() {
+        let len = config[offset] as usize;
+        if len < 2 || offset + len > config.len() {
+            return None;
+        }
+        let d = &config[offset..offset + len];
+        match d[1] {
+            4 if len >= 9 => {
+                in_interface = d[2] == iface && d[3] == alt && d[5] == HUB_INTERFACE_CLASS;
+            }
+            5 if in_interface && len >= 7 => {
+                let ep_addr = d[2];
+                if ep_addr & 0x80 == 0 || d[3] & 0x3 != 3 {
+                    return None;
+                }
+                return Some(EndpointConfig {
+                    ep_addr,
+                    max_packet: u16::from_le_bytes([d[4], d[5]]),
+                    kind: EndpointKind::InterruptIn,
+                    interval: d[6],
+                });
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+    None
 }
 
 /// Resolve the active hub interface before any class request. USB 2.0
@@ -373,7 +467,84 @@ impl UsbHub {
             device_protocol,
             interface_alt,
             interface_protocol,
+            status: status_endpoint(config, iface_num, interface_alt).map(|endpoint| {
+                HubStatusEndpoint {
+                    endpoint,
+                    dci: endpoint.dci(),
+                    len: (endpoint.max_packet & 0x7ff).clamp(1, STATUS_BUFFER_BYTES),
+                }
+            }),
         })
+    }
+
+    /// Submit the hub's status-change transfer once the slot is marked
+    /// as a hub (Linux `hub_activate`: `usb_submit_urb(hub->urb)`), so a
+    /// port change reaches the supervisor as a Transfer Event (`hub_irq`
+    /// → `kick_hub_wq`) instead of waiting for its periodic walk. On
+    /// failure the hub keeps working through the walk alone and
+    /// `status` is cleared.
+    pub async fn activate(&mut self, xhci_dev: &Xhci) -> Result<(), HubError> {
+        self.activate_transport(xhci_dev).await
+    }
+
+    async fn activate_transport(&mut self, transport: &impl HubTransport) -> Result<(), HubError> {
+        let Some(status) = self.status else {
+            return Ok(());
+        };
+        let result = match transport
+            .configure_status(self.slot_id, status.endpoint)
+            .await
+        {
+            Ok(()) => transport.arm_status(self.slot_id, status.dci, u32::from(status.len)),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            self.status = None;
+            return Err(HubError::Xhci(error));
+        }
+        Ok(())
+    }
+
+    /// Consume a completed status-change transfer: the bitmap of what
+    /// changed (bit 0 the hub itself, bit N port N), or `None` when the
+    /// hub reported nothing. The transfer is resubmitted, as `hub_irq`
+    /// does.
+    pub fn take_status_change(&self, xhci_dev: &Xhci) -> Option<u64> {
+        let status = self.status?;
+        let mut buf = [0u8; STATUS_BUFFER_BYTES as usize];
+        let n = match xhci_dev.poll_interrupt_in(
+            self.slot_id,
+            status.dci,
+            &mut buf[..usize::from(status.len)],
+        ) {
+            Ok(Some(n)) => n.min(usize::from(status.len)),
+            _ => return None,
+        };
+        Some(
+            buf[..n]
+                .iter()
+                .enumerate()
+                .fold(0u64, |bits, (i, b)| bits | u64::from(*b) << (8 * i)),
+        )
+    }
+
+    /// Acknowledge a hub-level change (status-change bit 0): clear
+    /// C_HUB_LOCAL_POWER and C_HUB_OVER_CURRENT so the hub stops
+    /// reporting it (Linux `hub_event` → `hub_hub_status`).
+    pub async fn clear_hub_change(&self, xhci_dev: &Xhci) {
+        for feature in [C_HUB_LOCAL_POWER, C_HUB_OVER_CURRENT] {
+            let _ = HubTransport::write(
+                xhci_dev,
+                self.slot_id,
+                HubRequest {
+                    kind: RT_HOST_TO_DEV_CLASS_DEVICE,
+                    code: REQ_CLEAR_FEATURE,
+                    value: feature,
+                    index: 0,
+                },
+            )
+            .await;
+        }
     }
 
     /// Whether this is a high-speed multiple-TT hub.
@@ -404,14 +575,24 @@ impl UsbHub {
 
     /// Read the 4-byte port status word for `port` (1-indexed).
     pub async fn port_status(&self, xhci_dev: &Xhci, port: u8) -> Result<u32, HubError> {
+        self.port_status_transport(xhci_dev, port).await
+    }
+
+    async fn port_status_transport(
+        &self,
+        transport: &impl HubTransport,
+        port: u8,
+    ) -> Result<u32, HubError> {
         let mut buf = [0u8; 4];
-        xhci_dev
-            .control_in(
+        transport
+            .read(
                 self.slot_id,
-                RT_DEV_TO_HOST_CLASS_OTHER,
-                REQ_GET_STATUS,
-                0,
-                port as u16,
+                HubRequest {
+                    kind: RT_DEV_TO_HOST_CLASS_OTHER,
+                    code: REQ_GET_STATUS,
+                    value: 0,
+                    index: port as u16,
+                },
                 &mut buf,
             )
             .await?;
@@ -542,14 +723,37 @@ impl UsbHub {
     }
 
     /// Returns the list of downstream ports that report a connected
-    /// device (PORT_STATUS.CONNECTION = 1).
+    /// device (PORT_STATUS.CONNECTION = 1), acknowledging each port's
+    /// connect / enable / over-current / reset change bits on the way
+    /// (Linux `port_event`): the hub reports a port on its status-change
+    /// endpoint for as long as a change bit stays set.
     pub async fn connected_downstream_ports(&self, xhci_dev: &Xhci) -> Vec<u8> {
+        self.connected_downstream_ports_transport(xhci_dev).await
+    }
+
+    async fn connected_downstream_ports_transport(&self, transport: &impl HubTransport) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
         for p in 1..=self.descriptor.num_ports {
-            if let Ok(s) = self.port_status(xhci_dev, p).await {
-                if (s as u16) & PSTAT_CONNECTION != 0 {
-                    v.push(p);
+            let Ok(s) = self.port_status_transport(transport, p).await else {
+                continue;
+            };
+            for (bit, feature) in WALK_ACKED_CHANGES {
+                if s & bit != 0 {
+                    let _ = transport
+                        .write(
+                            self.slot_id,
+                            HubRequest {
+                                kind: RT_HOST_TO_DEV_CLASS_OTHER,
+                                code: REQ_CLEAR_FEATURE,
+                                value: feature,
+                                index: p as u16,
+                            },
+                        )
+                        .await;
                 }
+            }
+            if (s as u16) & PSTAT_CONNECTION != 0 {
+                v.push(p);
             }
         }
         v
