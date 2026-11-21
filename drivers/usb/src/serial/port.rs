@@ -1002,11 +1002,17 @@ pub fn detach_serial(controller: u8, slot_id: u8) -> bool {
 /// controller recovery epoch change, mirroring
 /// `cdc_acm::clear_acm`.
 /// Tell the supervisor pumping tty `tty_index` that it has bytes to
-/// send (Linux `usb_serial_generic_write` submits the write URB at once).
-///
-/// No kick yet: the supervisor's periodic cycle picks the bytes up.
+/// send (Linux `usb_serial_generic_write` submits the write URB at once):
+/// kick the supervisor of the controller the port is bound on.
 pub fn kick_tty(tty_index: usize) {
-    let _ = tty_index;
+    for (controller, ports) in SERIAL_PORTS.each() {
+        if ports.lock().iter().any(|p| p.tty_index == tty_index) {
+            if let Some(c) = crate::xhci::controller_by_id(controller) {
+                c.kick_supervisor();
+            }
+            return;
+        }
+    }
 }
 
 pub fn clear_serial(controller: u8) {
@@ -1237,8 +1243,19 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
                     for _ in 0..512 {
                         match xhci_dev.poll_bulk_out(&token) {
                             Ok(Some(sent)) => {
-                                tty.lock().tx.skip(sent.min(pending));
+                                let more = {
+                                    let mut t = tty.lock();
+                                    t.tx.skip(sent.min(pending));
+                                    !t.tx.is_empty() && !t.tx_stopped
+                                };
                                 moved += sent;
+                                // One chunk per pass: the next goes out on
+                                // the pass this kick starts (Linux
+                                // `usb_serial_generic_write_bulk_callback`
+                                // resubmits from the completion).
+                                if more {
+                                    xhci_dev.kick_supervisor();
+                                }
                                 break;
                             }
                             Ok(None) => continue,
