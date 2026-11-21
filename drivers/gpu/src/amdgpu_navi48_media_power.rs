@@ -25,17 +25,67 @@ pub(crate) fn enabled() -> bool {
     ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+const IDLE_NS: u64 = 1_000_000_000; // Linux VCN_IDLE_TIMEOUT
+
 /// When the media idle supervisor looks again, in ns from `now`, given each
 /// engine's (VCN, JPEG) last use and whether it is awake; `None`: not until
-/// the next use. At this point every 100 ms, awake or gated.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+/// the next use. As Linux's idle work: the rest of VCN_IDLE_TIMEOUT after a
+/// recent use, one timeout later while an engine stays awake past it, and
+/// nothing for gated or absent engines.
 pub(crate) fn next_idle_check(
     last_use: [Option<u64>; 2],
     awake: [bool; 2],
     now: u64,
 ) -> Option<u64> {
-    let _ = (last_use, awake, now);
-    Some(100_000_000)
+    (0..2)
+        .filter(|&k| awake[k])
+        .map(|k| {
+            let since = last_use[k].map_or(0, |last| now.saturating_sub(last));
+            if since < IDLE_NS {
+                IDLE_NS - since
+            } else {
+                IDLE_NS
+            }
+        })
+        .min()
+}
+
+/// The supervisor parked with every engine gated or absent.
+static IDLE_PARKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static IDLE_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// A media engine is used (`begin_media_use`), or the supervisor must look
+/// (stop): the parked supervisor runs again.
+pub(crate) fn media_used() {
+    IDLE_PARKED.store(false, core::sync::atomic::Ordering::Release);
+    let waker = IDLE_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+/// Park the supervisor until the next [`media_used`]. Called under OWNER,
+/// which `begin_media_use` also holds, so a use cannot fall between the
+/// decision and the park.
+pub(crate) fn park_idle() {
+    IDLE_PARKED.store(true, core::sync::atomic::Ordering::Release);
+}
+/// Whether the supervisor is parked.
+pub(crate) fn idle_parked() -> bool {
+    IDLE_PARKED.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Resolves after the next [`media_used`] (at once if not parked).
+pub(crate) fn media_in_use() -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(|cx| {
+        if !idle_parked() {
+            return core::task::Poll::Ready(());
+        }
+        *IDLE_WAKER.lock() = Some(cx.waker().clone());
+        if !idle_parked() {
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    })
 }
 
 #[cfg(feature = "kernel-test")]
