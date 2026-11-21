@@ -1300,7 +1300,7 @@ fn rdna2_sequences_wrap_without_zero_or_false_device_loss() -> TestResult {
     e.queue.seq = u32::MAX;
     e.hw.io.mem.insert(e.queue.address(FENCE), u32::MAX);
     e.hw.io.revoke = Some((
-        crate::amdgpu_cp_navi22::tests::layout().hdp + 0xd1 * 4,
+        crate::amdgpu_cp_navi22::tests::layout().hdp.unwrap() + 0xd1 * 4,
         1,
         e.hw.authority,
     ));
@@ -1425,7 +1425,7 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         || words[tail - 3..tail]
             != [
                 14 | (0xf << 28),
-                bank_reg(layout.hdp, HDP_READ_CACHE_INVALIDATE),
+                bank_reg(layout.hdp.unwrap(), HDP_READ_CACHE_INVALIDATE),
                 1,
             ]
         || words[tail..] != fence_words[..]

@@ -176,7 +176,29 @@ as now.
      NBIO has six segments (`dcn315_resource.c`), and Linux keeps every one,
      so the cap is now the parser's own bound of 16.
 7. GFX setup and topology (disabled shader arrays, CAM remapping), CP, KIQ,
-   compute and GFX rings, SDMA 5.2.6 queues, IB tests and fences.
+   compute and GFX rings, SDMA 5.2.6 queues, IB tests and fences. Against
+   the Navi22 backends:
+   - **CP layout** (`amdgpu_cp_navi22::Layout`) gets a Raphael resolution:
+     GC 10.3.6, the NBIO 7.2 segment-2 bank (the doorbell aperture,
+     self-ring and HDP flush req/done keep their NBIO 2.3 offsets), OSSSYS
+     5.0.x/5.2.x for the IH VMID LUT, and the 10.3.6 golden table.
+   - **HDP invalidates.** HDP 5.0's `HDP_READ_CACHE_INVALIDATE` is written by
+     the CPU before reading fences and results, and emitted as a WREG into
+     rings and IBs (`amdgpu_navi22_submit`). HDP 5.2 has none:
+     `hdp_v5_2_funcs` has no `invalidate_hdp`, so `amdgpu_hdp_invalidate`
+     emits nothing, and Raphael drops them. Watch packet sizes wherever a
+     frame is sized up front.
+   - **GRBM CAM remapping** (`gfx_v10_0_check_grbm_cam_remapping`): the APU
+     group (10.3.1/3/6/7) returns true without probing `VGT_ESGS_RING_SIZE`,
+     so Linux never programs the CAM there. Raphael skips the probe and the
+     setup.
+   - **Topology**: `gfx_v10_3_get_disabled_sa`'s whole-SA skip applies to
+     10.3.0/3/6/7 (NARF has only 10.3.0). `RCC_DEV0_EPF0_STRAP0` is 0x11 on
+     NBIO 7.2.0, as on 2.3, but `nbio_v7_2_get_rev_id` reads the `_YC`
+     variant (0x15) on 7.2.1/7.3.0/7.5.0.
+   - **SDMA 5.2.6**: one engine, and NBIO 7.2 has a single SDMA doorbell range
+     (GDC0, through the port pair) where NBIO 2.3 has one per engine.
+   - KIQ and fences touch no NBIO or HDP register.
 8. The APU cold-boot coordinator and the PSP handover from the display path.
 9. Media: VCN and JPEG 3.1.2.
 

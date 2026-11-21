@@ -28,8 +28,9 @@ pub(crate) fn layout() -> Layout {
         sdma_high: None,
         gc: [GC0, GC1],
         nbio: NBIO,
-        hdp: HDP,
+        hdp: Some(HDP),
         oss: OSS,
+        nbio_v7_2: None,
     }
 }
 pub(crate) fn pool(len: u64) -> Pool {
@@ -83,6 +84,8 @@ pub(crate) struct Model {
     pub doorbells: Vec<(u32, u64)>,
     dirty: bool,
     stale: bool,
+    /// HDP 5.2.1 (Raphael): no read cache, so CPU reads need no invalidate.
+    pub no_read_cache: bool,
     /// Hardware already remaps the VGT/SPI UMD aliases.
     pub cam_remapped: bool,
     pub cam: Vec<u32>,
@@ -138,6 +141,7 @@ impl Model {
             doorbells: Vec::new(),
             dirty: false,
             stale: false,
+            no_read_cache: false,
             cam_remapped: false,
             cam: Vec::new(),
             stalled: [false; 8],
@@ -725,7 +729,10 @@ impl Io for Model {
         }
     }
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32 {
-        assert!(!self.stale, "CPU read without HDP invalidate");
+        assert!(
+            self.no_read_cache || !self.stale,
+            "CPU read without HDP invalidate"
+        );
         self.word(mc(map, offset))
     }
     fn write_memory(&mut self, map: MmioRegion, offset: u64, value: u32) {
@@ -1469,4 +1476,155 @@ fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestRes
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs
+);
+
+/// Raphael's CP discovery: Navi22's banks (NBIO segments 0..2 are where
+/// Raphael's are) under GC 10.3.6, SDMA 5.2.6, NBIO 7.2.1 with segments 3..5,
+/// HDP 5.2.1 and OSSSYS 5.2.1.
+pub(crate) fn raphael_cp_gpu() -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let mut gpu = navi22_gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::RAPHAEL).unwrap();
+    for b in gpu.ip_blocks.iter_mut() {
+        let version = match b.hw_id {
+            d::HW_ID_GC => (10, 3, 6),
+            d::HW_ID_SDMA0 => (5, 2, 6),
+            d::HW_ID_HDP => (5, 2, 1),
+            d::HW_ID_OSSSYS => (5, 2, 1),
+            d::HW_ID_NBIF => {
+                b.num_bases = 6;
+                b.base_addrs[3..6].copy_from_slice(&[0x10400, 0x241_b000, 0x404_0000]);
+                (7, 2, 1)
+            }
+            _ => continue,
+        };
+        (b.major, b.minor, b.revision) = version;
+    }
+    gpu
+}
+
+/// Raphael's CP layout keeps Navi22's GC, NBIO segment-2 and OSSSYS banks, has
+/// no HDP read cache and carries the NBIO 7.2 banks; HDP 5.0, NBIO 2.3 and a
+/// discrete GPU are refused, and the discrete layout refuses Raphael.
+fn raphael_cp_layout_takes_only_raphaels_blocks() -> TestResult {
+    let gpu = raphael_cp_gpu();
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(&gpu).unwrap();
+    let expected = Layout {
+        profile: &crate::amdgpu_rdna2::RAPHAEL,
+        hdp: None,
+        nbio_v7_2: Some(banks),
+        ..layout()
+    };
+    if Layout::resolve_raphael(&gpu) != Ok(expected)
+        || expected.hdp_invalidate().is_some()
+        || expected.liveness() != NBIO + 0xc3 * 4
+        || layout().liveness() != layout().hdp_invalidate().unwrap()
+    {
+        return TestResult::Fail("Raphael CP layout or its HDP registers");
+    }
+    let swap = |id, v: (u8, u8, u8)| {
+        let mut g = raphael_cp_gpu();
+        for b in g.ip_blocks.iter_mut().filter(|b| b.hw_id == id) {
+            (b.major, b.minor, b.revision) = v;
+        }
+        g
+    };
+    let mut navi22 = raphael_cp_gpu();
+    navi22.chip =
+        crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap();
+    for (bad, why) in [
+        (swap(ip::HW_ID_HDP, (5, 0, 0)), "Raphael CP took HDP 5.0"),
+        (swap(ip::HW_ID_NBIF, (2, 3, 0)), "Raphael CP took NBIO 2.3"),
+        (
+            swap(ip::HW_ID_SDMA0, (5, 2, 2)),
+            "Raphael CP took Navi22's SDMA",
+        ),
+        (navi22, "Raphael CP took a discrete GPU"),
+    ] {
+        if Layout::resolve_raphael(&bad).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    if Layout::resolve_rdna2(&gpu).is_ok() {
+        return TestResult::Fail("the discrete CP layout took Raphael");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_cp_layout_takes_only_raphaels_blocks
+);
+
+/// GFX bring-up on Raphael's layout: the 10.3.6 golden sequence, then no CAM
+/// probe or setup (the APU group reports the CAM remapped), and ring and IB
+/// proofs whose frames carry no HDP invalidate.
+fn raphael_gfx_golden_cam_and_frames_follow_the_apu_group() -> TestResult {
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    engine.golden().unwrap();
+    let golden = engine.hw.io.writes.len();
+    if golden != crate::amdgpu_rdna2::golden::RAPHAEL.len() {
+        return TestResult::Fail("Raphael golden sequence");
+    }
+    run(engine.configure()).unwrap();
+    let cam = [
+        VGT_ESGS_RING_SIZE,
+        VGT_ESGS_RING_SIZE_UMD,
+        GRBM_CAM_INDEX,
+        GRBM_CAM_DATA,
+    ]
+    .map(|r| resolved.reg(r));
+    if engine.hw.io.writes[golden..]
+        .iter()
+        .any(|w| cam.contains(&w.0))
+        || engine.hw.io.reads.iter().any(|r| cam.contains(r))
+        || !engine.proof.cam_remapped
+    {
+        return TestResult::Fail("Raphael probed or programmed the GRBM CAM");
+    }
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    // Navi22's run invalidates HDP's read cache before the CPU samples an
+    // engine write; Raphael's HDP 5.2.1 has none to invalidate. (The ring and
+    // IB tests put no HDP packet in their frames; client jobs do.)
+    let hdp = HDP + 0xd1 * 4;
+    let (_navi22_pool, mut navi22) = gfx(enabled());
+    navi22.golden().unwrap();
+    run(navi22.configure()).unwrap();
+    run(navi22.start()).unwrap();
+    run(navi22.test_ib()).unwrap();
+    if engine.state != GfxState::Verified
+        || engine.hw.io.writes.iter().any(|w| w.0 == hdp)
+        || !navi22.hw.io.writes.iter().any(|w| w.0 == hdp)
+    {
+        return TestResult::Fail("Raphael GFX proof failed or invalidated an HDP it lacks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_golden_cam_and_frames_follow_the_apu_group
+);
+
+/// `port_update`: the address through the port index, read back, data read,
+/// then the new value written back whether or not it changed.
+fn raphael_port_update_follows_amdgpu_device_pcie_port_wreg() -> TestResult {
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(&raphael_cp_gpu()).unwrap();
+    let (index, data) = banks.port_pair();
+    let reg = crate::amdgpu_nbio_v7_2::GDC0_SDMA0_DOORBELL_RANGE;
+    let address = banks.port_address(reg).unwrap();
+    let mut model = Model::new();
+    model.regs.insert(data, 0x0002_0040);
+    if port_update(&mut model, banks, reg, |v| v).is_err()
+        || model.writes != alloc::vec![(index, address), (index, address), (data, 0x0002_0040)]
+    {
+        return TestResult::Fail("NBIO 7.2 port update sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_port_update_follows_amdgpu_device_pcie_port_wreg
 );

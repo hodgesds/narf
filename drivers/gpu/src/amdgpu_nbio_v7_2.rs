@@ -66,6 +66,16 @@ pub const fn read_request_size(current: u32) -> u32 {
         | READ_REQUEST_MODE_MASK
         | 1 << 28
 }
+/// `nbio_v7_2_get_rev_id`'s strap register: the `_YC` variant on 7.2.1,
+/// 7.3.0 and 7.5.0 (`nbio_v7_2.c`'s own define, 0x15), else NBIO 2.3's 0x11.
+/// Both carry STRAP_ATI_REV_ID_DEV0_F0 in bits 27:24.
+pub fn strap0(version: (u8, u8, u8)) -> u32 {
+    match version {
+        // linux: n/a (nbio_v7_2.c: regRCC_STRAP0_RCC_DEV0_EPF0_STRAP0_YC)
+        (7, 2, 1) | (7, 3, 0) | (7, 5, 0) => 0x0015,
+        _ => 0x0011, // linux: regRCC_STRAP0_RCC_DEV0_EPF0_STRAP0
+    }
+}
 /// Whether `nbio_v7_2_init_registers` also clears DEV2's no-soft-reset strap.
 pub fn clears_dev2_soft_reset_strap(version: (u8, u8, u8)) -> bool {
     matches!(version, (7, 3, 0) | (7, 5, 1))

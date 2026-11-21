@@ -172,3 +172,16 @@ kernel_test_in!(
     "drivers/gpu/nbio-v7-2",
     nbio_v7_2_init_registers_follow_the_version
 );
+
+/// `nbio_v7_2_get_rev_id`'s strap: the `_YC` register on 7.2.1/7.3.0/7.5.0.
+fn nbio_v7_2_strap0_follows_the_version() -> TestResult {
+    let versions = [(7, 2, 0), (7, 2, 1), (7, 3, 0), (7, 5, 0), (7, 5, 1)];
+    if versions.map(strap0) != [0x11, 0x15, 0x15, 0x15, 0x11] {
+        return TestResult::Fail("NBIO 7.2 strap register");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/nbio-v7-2",
+    nbio_v7_2_strap0_follows_the_version
+);

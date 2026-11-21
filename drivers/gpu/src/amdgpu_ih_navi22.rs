@@ -390,16 +390,6 @@ struct Layout {
     nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
     self_wptr_update: bool,
 }
-/// The OSSSYS revisions `amdgpu_discovery.c` gives `navi10_ih`, which reads
-/// `osssys_5_0_0_offset.h` for all of them.
-const NAVI10_IH_OSSSYS: &[(u8, u8, u8)] = &[
-    (5, 0, 0),
-    (5, 0, 1),
-    (5, 0, 2),
-    (5, 0, 3),
-    (5, 2, 0),
-    (5, 2, 1),
-];
 /// Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
 fn self_wptr_update(gpu: &AmdGpu) -> bool {
     gpu.ip_blocks.iter().any(|b| {
@@ -474,7 +464,12 @@ impl Layout {
         resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
         let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
         Ok(Self {
-            oss: resolve(ip::HW_ID_OSSSYS, NAVI10_IH_OSSSYS, 0, IH_CNTL2)?,
+            oss: resolve(
+                ip::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                IH_CNTL2,
+            )?,
             nbio: banks.bif,
             hdp: None,
             nbio_v7_2: Some(banks),

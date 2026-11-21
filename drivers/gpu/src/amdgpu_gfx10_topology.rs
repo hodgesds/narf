@@ -14,7 +14,7 @@
 //! board. Every value is read, never assumed: one PCI ID ships in several
 //! harvest configurations. GC 10.3.2 is not one of the versions whose
 //! `gfx_v10_3_get_disabled_sa` whole-SA skip applies (10.3.0/3/6/7), so every
-//! SA is sampled, as Linux does.
+//! SA is sampled, as Linux does; Raphael's 10.3.6 is.
 //!
 //! The derivation is a pure function of the raw samples ([`derive`]) so the
 //! values Mesa sees are tested against hand-derived Linux results without a
@@ -215,7 +215,15 @@ fn checked(v: u32) -> Result<u32, Error> {
     }
 }
 fn sample_revision(io: &mut impl Io, layout: &Layout) -> Result<u8, Error> {
-    Ok(((checked(io.read(layout.nbio(RCC_DEV0_EPF0_STRAP0)))? >> 24) & 0xf) as u8)
+    let strap = layout.nbio_v7_2.map_or(RCC_DEV0_EPF0_STRAP0, |b| {
+        crate::amdgpu_nbio_v7_2::strap0(b.version)
+    });
+    Ok(((checked(io.read(layout.nbio(strap)))? >> 24) & 0xf) as u8)
+}
+/// The GC revisions whose `gfx_v10_0_setup_rb` and `gfx_v10_0_get_cu_info`
+/// skip the shader arrays `gfx_v10_3_get_disabled_sa` reports.
+fn skips_disabled_sa(gc: (u8, u8, u8)) -> bool {
+    matches!(gc, (10, 3, 0) | (10, 3, 3) | (10, 3, 6) | (10, 3, 7))
 }
 fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, Error> {
     let index = layout.reg(GRBM_GFX_INDEX);
@@ -224,7 +232,7 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
         gb_addr_config: checked(io.read(layout.reg(GB_ADDR_CONFIG)))?,
         ..Sample::default()
     };
-    if layout.profile.gc_version == (10, 3, 0) {
+    if skips_disabled_sa(layout.profile.gc_version) {
         raw.disabled_sa = (((checked(io.read(layout.reg(CC_GC_SA_UNIT_DISABLE)))?
             | checked(io.read(layout.reg(GC_USER_SA_UNIT_DISABLE)))?)
             >> 8)

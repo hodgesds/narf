@@ -97,7 +97,7 @@ pub(super) fn capture<I: Io>(hw: &mut Hw<I>, queue: &Queue) -> Result<Snapshot, 
         let registers = REGISTERS.map(|(_, reg)| io.read(layout.reg(reg)));
         // One invalidate makes the writebacks and ring window CPU-visible.
         let rptr_writeback = queue.read(io, layout, RPTR);
-        checked(io.read(layout.hdp + 0xd1 * 4))?;
+        checked(io.read(layout.liveness()))?;
         let window_start = (u64::from(registers[13]) + RING_DW - BEFORE_RPTR) % RING_DW;
         let words = core::array::from_fn(|i| {
             io.read_memory(queue.map(), ((window_start + i as u64) % RING_DW) * 4)

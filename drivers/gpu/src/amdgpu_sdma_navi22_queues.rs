@@ -199,24 +199,42 @@ impl<I: Io> Engine<I> {
             // linux-lit: 0x0fff_fffc=SDMA0_GFX_DOORBELL_OFFSET__OFFSET_MASK@gc
             // linux-lit: 2=SDMA0_GFX_DOORBELL_OFFSET__OFFSET__SHIFT@gc
             update(io, r(SDMA0_GFX_DOORBELL_OFFSET), 0x0fff_fffc, index << 2)?;
-            // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
-            let range = l.nbio(
-                [
-                    NBIO_SDMA0_DOORBELL_RANGE,
-                    NBIO_SDMA1_DOORBELL_RANGE,
-                    NBIO_SDMA2_DOORBELL_RANGE,
-                    NBIO_SDMA3_DOORBELL_RANGE,
-                ][i as usize],
-            );
-            update(
-                io,
-                range,
-                // linux-lit: 0x001f_0ffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK | BIF_SDMA0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_SDMA0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK
-                // linux-lit: 16=BIF_SDMA0_DOORBELL_RANGE__SIZE__SHIFT
-                ((index << 2) & 0xffc) | (doorbell::SDMA_RANGE << 16),
-            )?;
+            match l.nbio_v7_2 {
+                None => {
+                    // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
+                    let range = l.nbio(
+                        [
+                            NBIO_SDMA0_DOORBELL_RANGE,
+                            NBIO_SDMA1_DOORBELL_RANGE,
+                            NBIO_SDMA2_DOORBELL_RANGE,
+                            NBIO_SDMA3_DOORBELL_RANGE,
+                        ][i as usize],
+                    );
+                    update(
+                        io,
+                        range,
+                        // linux-lit: 0x001f_0ffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK | BIF_SDMA0_DOORBELL_RANGE__SIZE_MASK
+                        0x001f_0ffc,
+                        // linux-lit: 2=BIF_SDMA0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK
+                        // linux-lit: 16=BIF_SDMA0_DOORBELL_RANGE__SIZE__SHIFT
+                        ((index << 2) & 0xffc) | (doorbell::SDMA_RANGE << 16),
+                    )?;
+                }
+                // nbio_v7_2_sdma_doorbell_range: one GDC0 range, whatever the
+                // instance, through the port pair. NBIO 7.2 parts have one SDMA.
+                Some(banks) if i == 0 => crate::amdgpu_cp_navi22::port_update(
+                    io,
+                    banks,
+                    crate::amdgpu_nbio_v7_2::GDC0_SDMA0_DOORBELL_RANGE,
+                    |old| {
+                        crate::amdgpu_nbio_v7_2::sdma_doorbell_range(
+                            old,
+                            Some((index, doorbell::SDMA_RANGE)),
+                        )
+                    },
+                )?,
+                Some(_) => return Err(Error::Unsupported),
+            }
             io.write(r(SDMA0_GFX_MINOR_PTR_UPDATE), 0);
             // linux-lit: 0x22=SDMA0_CNTL__UTC_L1_ENABLE_MASK@gc | SDMA0_CNTL__MIDCMD_PREEMPT_ENABLE_MASK@gc
             update(io, r(SDMA0_CNTL), 0x22, 0x22)?; // UTC_L1_ENABLE | MIDCMD_PREEMPT

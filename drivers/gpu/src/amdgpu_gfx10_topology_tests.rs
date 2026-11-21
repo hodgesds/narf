@@ -145,8 +145,9 @@ fn layout() -> Layout {
         sdma_high: None,
         gc: [0x1260 * 4, 0xa000 * 4],
         nbio: 0xd20 * 4,
-        hdp: 0xf20 * 4,
+        hdp: Some(0xf20 * 4),
         oss: 0x10a0 * 4,
+        nbio_v7_2: None,
     }
 }
 struct Fake {

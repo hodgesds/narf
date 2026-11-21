@@ -101,6 +101,17 @@ impl Profile {
 
 /// Compatible navi10_ih backends; discovery remains authoritative per board.
 pub const IH_OSSSYS_VERSIONS: &[(u8, u8, u8)] = &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3)];
+/// Every OSSSYS revision `amdgpu_discovery.c` gives `navi10_ih`, which reads
+/// `osssys_5_0_0_offset.h` for all of them: the discrete parts' and APUs'
+/// 5.2.0/5.2.1.
+pub const NAVI10_IH_OSSSYS_VERSIONS: &[(u8, u8, u8)] = &[
+    (5, 0, 0),
+    (5, 0, 1),
+    (5, 0, 2),
+    (5, 0, 3),
+    (5, 2, 0),
+    (5, 2, 1),
+];
 
 /// Linux's SMUIO11 ROM callback selection. The newer callback forces ROM
 /// clocks on when ROM_MGCG is absent; the older callback performs no I/O.

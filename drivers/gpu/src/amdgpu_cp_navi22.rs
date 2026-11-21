@@ -136,9 +136,14 @@ pub(crate) struct Layout {
     /// GC segment 2 for SDMA2/3, resolved only by the family queue owner.
     pub sdma_high: Option<u64>,
     pub nbio: u64,
-    pub hdp: u64,
-    /// OSSSYS 5.0.3 segment 0: the IH VMID LUT a client job's flush writes.
+    /// HDP 5.0's bank, whose read cache is invalidated before the CPU samples
+    /// engine writes and in every ring/IB frame. HDP 5.2.1 (Raphael) has no
+    /// read cache (`hdp_v5_2_funcs` has no `invalidate_hdp`): `None`.
+    pub hdp: Option<u64>,
+    /// OSSSYS segment 0: the IH VMID LUT a client job's flush writes.
     pub oss: u64,
+    /// NBIO 7.2's banks, for the registers it moved off segment 2.
+    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -186,18 +191,64 @@ impl Layout {
                 2,
                 LAST_NBIO,
             )?,
-            hdp: reg(
+            hdp: Some(reg(
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
                 0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-            )?,
+            )?),
             oss: reg(
                 ip::HW_ID_OSSSYS,
                 oss_versions,
                 0,
                 crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
             )?,
+            nbio_v7_2: None,
+        };
+        Self::validated(gpu, layout)
+    }
+    /// Raphael: GC 10.3.6 with SDMA 5.2.6, the NBIO 7.2 segment-2 bank (the
+    /// doorbell aperture, self-ring and HDP flush request/done keep their NBIO
+    /// 2.3 offsets there), HDP 5.2.1 and OSSSYS 5.0.x/5.2.x (`navi10_ih`, one
+    /// header) for the IH VMID LUT.
+    pub(crate) fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let profile = &crate::amdgpu_rdna2::RAPHAEL;
+        let reg = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        reg(ip::HW_ID_SDMA0, &[profile.sdma_version], 0, 0)?;
+        reg(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let layout = Self {
+            profile,
+            sdma_high: None,
+            gc: [
+                reg(ip::HW_ID_GC, &[profile.gc_version], 0, LAST_GC0)?,
+                reg(ip::HW_ID_GC, &[profile.gc_version], 1, LAST_GC1)?,
+            ],
+            nbio: nbio.bif,
+            hdp: None,
+            oss: reg(
+                ip::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
+            )?,
+            nbio_v7_2: Some(nbio),
+        };
+        Self::validated(gpu, layout)
+    }
+    /// Bound every golden row and refuse bases the packet encodings alias.
+    fn validated(gpu: &AmdGpu, layout: Self) -> Result<Self, Error> {
+        let profile = layout.profile;
+        let reg = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
         let golden =
             crate::amdgpu_rdna2::golden::for_gc(profile.gc_version).ok_or(Error::Unsupported)?;
@@ -222,6 +273,19 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         Ok(layout)
+    }
+    /// HDP 5.0's `HDP_READ_CACHE_INVALIDATE`, if this HDP has a read cache.
+    pub(crate) fn hdp_invalidate(&self) -> Option<u64> {
+        // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+        self.hdp.map(|hdp| hdp + 0xd1 * 4)
+    }
+    /// A register whose all-ones read means the device is gone: HDP 5.0's
+    /// invalidate (read back after the write that invalidates), or, where HDP
+    /// has no read cache, NBIO's RCC_CONFIG_MEMSIZE, the register Linux reads
+    /// to post an HDP flush.
+    pub(crate) fn liveness(&self) -> u64 {
+        // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+        self.hdp_invalidate().unwrap_or(self.nbio + 0xc3 * 4)
     }
     /// BAR5 byte address of a GC register.
     pub(crate) fn reg(&self, r: Reg) -> u64 {
@@ -373,6 +437,34 @@ pub(crate) fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> 
     io.write(address, (old & !mask) | (value & mask));
     Ok(())
 }
+/// `WREG32_PCIE_PORT(reg, f(RREG32_PCIE_PORT(reg)))` for an NBIO 7.2 segment-3
+/// register, through the register model and under the index latch the
+/// display clock manager shares. Like Linux, the value is written back
+/// whether or not it changed.
+pub(crate) fn port_update<I: Io>(
+    io: &mut I,
+    banks: crate::amdgpu_nbio_v7_2::Banks,
+    reg: u32,
+    f: impl FnOnce(u32) -> u32,
+) -> Result<(), Error> {
+    let address = banks.port_address(reg).ok_or(Error::Invalid)?;
+    let (index, data) = banks.port_pair();
+    crate::amdgpu_smn::with_latch(|| {
+        io.write(index, address);
+        io.read(index);
+        let old = checked(io.read(data))?;
+        io.write(index, address);
+        io.read(index);
+        io.write(data, f(old));
+        io.read(data);
+        Ok(())
+    })
+}
+/// `gfx_v10_0_check_grbm_cam_remapping` returns true for these GC revisions
+/// without touching `VGT_ESGS_RING_SIZE`.
+pub(crate) fn cam_remapped_without_probe(gc: (u8, u8, u8)) -> bool {
+    matches!(gc, (10, 3, 1) | (10, 3, 3) | (10, 3, 6) | (10, 3, 7))
+}
 /// CPU writes to VRAM through BAR0 must leave the HDP write cache before an
 /// engine fetches them (`amdgpu_device_flush_hdp`).
 pub(crate) fn flush<I: Io>(io: &mut I, l: Layout) {
@@ -384,8 +476,10 @@ pub(crate) fn flush<I: Io>(io: &mut I, l: Layout) {
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
 pub(crate) fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    if let Some(invalidate) = l.hdp_invalidate() {
+        io.write(invalidate, 1);
+        io.read(invalidate);
+    }
     barrier(Ordering::SeqCst);
 }
 /// `nv_grbm_select(me, pipe, queue, vmid)`.
@@ -698,7 +792,7 @@ pub(crate) fn progress<I: Io>(
 ) -> Result<crate::amdgpu_navi22_tdr::Progress, Error> {
     hw.access(|io, l| {
         let signaled = queue.read(io, l, FENCE);
-        checked(io.read(l.hdp + 0xd1 * 4))?; // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+        checked(io.read(l.liveness()))?;
         Ok(crate::amdgpu_navi22_tdr::Progress {
             engine: queue.engine,
             emitted: queue.seq,
@@ -852,7 +946,9 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
 #[derive(Clone, Copy, Debug)]
 pub struct FenceReader {
     regs: MmioRegion,
-    hdp_invalidate: u64,
+    hdp_invalidate: Option<u64>,
+    /// `Layout::liveness`.
+    liveness: u64,
     slots: [Option<MmioRegion>; 6],
     authority: Cap<BusDeviceCap, Write>,
 }
@@ -874,15 +970,17 @@ impl FenceReader {
             .copied()
             .flatten()
             .ok_or(Error::Invalid)?;
-        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        let (regs, hdp, liveness) = (self.regs, self.hdp_invalidate, self.liveness);
         self.authority
             .invoke(Op(|| {
-                // SAFETY: the HDP invalidate register lies in the BAR5 bank
-                // Layout bounded; the slot is the queue's permanent, published
-                // writeback reservation, whose FENCE dword is in bounds.
+                // SAFETY: the HDP invalidate and liveness registers lie in the
+                // BAR5 banks Layout bounded; the slot is the queue's permanent,
+                // published writeback reservation, whose FENCE dword is in bounds.
                 unsafe {
-                    regs.write32(hdp, 1);
-                    checked(regs.read32(hdp))?;
+                    if let Some(hdp) = hdp {
+                        regs.write32(hdp, 1);
+                    }
+                    checked(regs.read32(liveness))?;
                     barrier(Ordering::SeqCst);
                     // All 32 bits of a fence value, including all-ones,
                     // are valid. Detect loss from the HDP register instead.
@@ -900,7 +998,8 @@ impl Gfx {
     pub(crate) fn fence_reader(&self, slots: [Option<MmioRegion>; 6]) -> FenceReader {
         FenceReader {
             regs: self.engine.hw.io.regs,
-            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4,
+            hdp_invalidate: self.engine.hw.layout.hdp_invalidate(),
+            liveness: self.engine.hw.layout.liveness(),
             slots,
             authority: self.engine.hw.authority,
         }
@@ -1056,17 +1155,29 @@ impl<I: Io> GfxEngine<I> {
             if golden {
                 program_golden(io, l)?;
             }
-            // gfx_v10_0_check_grbm_cam_remapping
-            let data = checked(io.read(l.reg(VGT_ESGS_RING_SIZE)))?;
-            io.write(l.reg(VGT_ESGS_RING_SIZE), 0);
-            // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
-            io.write(l.reg(VGT_ESGS_RING_SIZE_UMD), 0xdead_beef);
-            // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
-            let remapped = io.read(l.reg(VGT_ESGS_RING_SIZE)) == 0xdead_beef;
-            if remapped {
-                io.write(l.reg(VGT_ESGS_RING_SIZE_UMD), data);
+            // gfx_v10_0_check_grbm_cam_remapping. The APU group (GC
+            // 10.3.1/3/6/7) reports the CAM remapped without probing, so
+            // Linux never programs it there; nor does this.
+            let remapped = if cam_remapped_without_probe(l.profile.gc_version) {
+                true
             } else {
-                io.write(l.reg(VGT_ESGS_RING_SIZE), data);
+                let data = checked(io.read(l.reg(VGT_ESGS_RING_SIZE)))?;
+                io.write(l.reg(VGT_ESGS_RING_SIZE), 0);
+                // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
+                io.write(l.reg(VGT_ESGS_RING_SIZE_UMD), 0xdead_beef);
+                // linux: n/a (pattern literal in gfx_v10_0_check_grbm_cam_remapping)
+                let remapped = io.read(l.reg(VGT_ESGS_RING_SIZE)) == 0xdead_beef;
+                io.write(
+                    l.reg(if remapped {
+                        VGT_ESGS_RING_SIZE_UMD
+                    } else {
+                        VGT_ESGS_RING_SIZE
+                    }),
+                    data,
+                );
+                remapped
+            };
+            if !remapped {
                 // gfx_v10_0_setup_grbm_cam_remapping, auto-incrementing index
                 io.write(l.reg(GRBM_CAM_INDEX), 0);
                 for (umd, target) in CAM_REMAP {

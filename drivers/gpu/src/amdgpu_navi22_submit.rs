@@ -211,7 +211,9 @@ fn kernel_words(
             offset += count;
         }
     }
-    words.extend(sdma_wreg(bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    if let Some(hdp) = l.hdp {
+        words.extend(sdma_wreg(bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     words.extend(pm4::sdma_fence(address, seq));
     Ok(words)
 }
@@ -523,7 +525,10 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
     if gfx {
         w.extend([packet3(PACKET3_FRAME_CONTROL, 0), 1 << 28]);
     }
-    w.extend(cp_wreg(gfx, bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    // amdgpu_ring_emit_hdp_invalidate: nothing where HDP has no read cache.
+    if let Some(hdp) = l.hdp {
+        w.extend(cp_wreg(gfx, bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     w.extend(pm4::release_mem(f.fence, f.seq));
     if gfx {
         // amdgpu_ib_schedule: emit_switch_buffer after the job fence
@@ -603,7 +608,9 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
             0,
         ]);
     }
-    w.extend(sdma_wreg(bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    if let Some(hdp) = l.hdp {
+        w.extend(sdma_wreg(bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     w.extend(pm4::sdma_fence(f.fence, f.seq));
     w
 }
