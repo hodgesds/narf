@@ -4475,14 +4475,21 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
-pub(crate) fn snapshot_current_mount_namespace() -> alloc::sync::Arc<narf_filesystem::MountNamespace>
-{
-    // `copy_mnt_ns` stamps the UNSHARING task's user namespace onto the new
-    // mount namespace, which is what `mount(2)`'s CAP_SYS_ADMIN check is
-    // later measured against. Without it a task that unshared a user
-    // namespace and then a mount namespace would own neither as far as the
-    // capability check could tell, and could not mount inside its own.
-    let owner = ns_owner_for(current_task_id());
+/// Copy the calling task's mount namespace for `unshare(CLONE_NEWNS)` or
+/// `clone(CLONE_NEWNS)`, owned by `owner`.
+///
+/// `copy_mnt_ns(flags, ns, user_ns, new_fs)` records `new_ns->user_ns =
+/// get_user_ns(user_ns)`, and `user_ns` is the NEW credential's namespace:
+/// `unshare_nsproxy_namespaces` passes `new_cred->user_ns` and
+/// `copy_namespaces` passes `task_cred_xxx(tsk, user_ns)` — the child's
+/// credential, which `copy_creds` has already bound to a CLONE_NEWUSER
+/// namespace. That owner is what `may_mount`'s CAP_SYS_ADMIN test is
+/// measured against, so the caller names it rather than this helper reading
+/// the copying task's: for a clone the copier is the parent, whose
+/// credential is the wrong one.
+pub(crate) fn snapshot_current_mount_namespace(
+    owner: Option<alloc::sync::Arc<dyn narf_filesystem::NsOwner>>,
+) -> alloc::sync::Arc<narf_filesystem::MountNamespace> {
     current_mount_namespace()
         .map(|ns| ns.snapshot_owned_by(owner.clone()))
         .unwrap_or_else(|| narf_filesystem::MountNamespace::snapshot_global_owned_by(owner))
