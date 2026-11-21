@@ -57,6 +57,12 @@ pub const EPP_PERFORMANCE: u8 = 0x00;
 pub const EPP_BALANCED_PERFORMANCE: u8 = 0x80;
 pub const EPP_POWERSAVE: u8 = 0xFF;
 
+/// Low four bytes of IA32_HWP_REQUEST. The EPP byte is reserved without
+/// CPUID.06H:EAX.HWP_EPP and must then be zero.
+pub(crate) fn request_value(min: u8, max: u8, desired: u8, epp: Option<u8>) -> u32 {
+    u32::from_le_bytes([min, max, desired, epp.unwrap_or(0)])
+}
+
 /// Decoded `IA32_HWP_CAPABILITIES` (Intel SDM Vol 4 §2.16):
 /// ```text
 ///   bits[7:0]   highest_perf
@@ -270,10 +276,13 @@ pub fn intel_hwp_summary() -> HwpSummary {
     }
     // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 = autonomous,
     // left unset), 24..31 = EPP.
-    let req = (caps.lowest_perf as u64)
-        | ((caps.highest_perf as u64) << 8)
-        | ((EPP_BALANCED_PERFORMANCE as u64) << 24);
-    if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, req).is_err() {
+    let req = request_value(
+        caps.lowest_perf,
+        caps.highest_perf,
+        0,
+        feats.epp.then_some(EPP_BALANCED_PERFORMANCE),
+    );
+    if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, u64::from(req)).is_err() {
         let _ = writeln!(
             narf_console::Writer,
             "  hwp: request #GP — firmware default"
