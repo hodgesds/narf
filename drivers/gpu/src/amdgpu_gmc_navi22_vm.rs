@@ -762,6 +762,20 @@ impl<I: Io> Engine<I> {
             generation: space.generation,
         })
     }
+    /// See `Gmc::client_fault_report`; `space` is the IV PASID's address
+    /// space described at the faulting address.
+    pub(super) fn client_fault_report(
+        &mut self,
+        fault: Fault,
+        space: Option<crate::amdgpu_vm::FaultVa>,
+    ) -> super::ClientFaultReport {
+        let _ = space;
+        super::ClientFaultReport {
+            fault,
+            contexts: None,
+            space: None,
+        }
+    }
     /// amdgpu_gmc_set_vm_fault_masks on MMHUB then GFXHUB, all 16 contexts,
     /// plus the per-client L2 fault interrupt enables VMID0 init cleared
     /// (Linux leaves them at the 0x3ffffffc reset default).

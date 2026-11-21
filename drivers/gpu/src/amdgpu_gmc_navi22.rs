@@ -19,7 +19,9 @@ mod gart;
 mod regs;
 #[path = "amdgpu_gmc_navi22_vm.rs"]
 mod vm;
-pub use fault::{fault_client, FaultStatus, StatusLine};
+pub use fault::{
+    fault_client, ClientFaultReport, ContextRegs, FaultCause, FaultStatus, StatusLine,
+};
 pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM, MM23};
 pub use vm::{
@@ -950,6 +952,13 @@ impl Gmc {
             mmhub: self.engine.layout.mmhub,
             status: FaultStatus(status),
         }
+    }
+    /// Evidence for a fault `handle_fault` charged to a lent client VMID:
+    /// both hubs' context registers for the VMID and the IV PASID's address
+    /// space at the faulting address (`amdgpu_vm::describe_fault`).
+    pub fn client_fault_report(&mut self, fault: Fault) -> ClientFaultReport {
+        let space = crate::amdgpu_vm::describe_fault(fault.pasid, fault.address);
+        self.engine.client_fault_report(fault, space)
     }
     /// gmc_v10_0_vm_fault_interrupt_state. Enable only once an IH owner drains.
     pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {

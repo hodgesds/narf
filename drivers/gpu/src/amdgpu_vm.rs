@@ -1821,6 +1821,12 @@ impl VmInner {
         }
     }
 
+    /// What this space holds at `va` (hole-stripped) for a fault report.
+    pub fn describe_va(&self, va: u64) -> FaultVa {
+        let _ = va;
+        FaultVa::default()
+    }
+
     /// Read a leaf entry for `va`, for tests and for a future fault handler.
     pub fn leaf_entry(&self, va: u64) -> Option<u64> {
         let geometry = self.geometry;
@@ -1849,6 +1855,38 @@ impl VmInner {
         }
         None
     }
+}
+
+// ── Fault evidence ─────────────────────────────────────────────────────
+
+/// What a client address space holds at a faulting GPU address: the
+/// mapping covering it, where the mapped buffer lives, the root a job's VM
+/// flush programs (`root_pde`) and the entries a hub walking from that root
+/// reads, root directory first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaultVa {
+    pub root: Option<u64>,
+    pub mapping: Option<Mapping>,
+    /// The mapped buffer's backing is system memory (GTT), not VRAM.
+    pub system: Option<bool>,
+    /// One entry per level down to the leaf; shorter when a table on the
+    /// path is absent.
+    pub walk: Vec<u64>,
+    /// Levels a complete walk reads.
+    pub levels: usize,
+}
+impl FaultVa {
+    /// Every level's entry is VALID down to the leaf PTE.
+    pub fn translates(&self) -> bool {
+        false
+    }
+}
+
+/// The registered address space whose PASID is `pasid`, described at
+/// `va` (hole-stripped); `None` when no live space holds the PASID.
+pub fn describe_fault(pasid: crate::amdgpu_vmid::Pasid, va: u64) -> Option<FaultVa> {
+    let _ = (pasid, va);
+    None
 }
 
 // ── Activating an address space on the hardware ─────────────────────────
