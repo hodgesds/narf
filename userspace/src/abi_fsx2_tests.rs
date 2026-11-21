@@ -3640,6 +3640,193 @@ kernel_test_in!(
     smoke_abi_fsx2_listmount_flags_limits_and_cursor
 );
 
+/// Each mount is listed once after a `pivot_root` the caller steps back out
+/// of — what `smoke_abi_fsx_pivot_root_pos` leaves behind in the initial
+/// mount namespace: it pivots into a tmpfs and then resets its root to "/".
+///
+/// `pivot_root` moves the old root's mounts to put_old (`attach_mnt`); NARF's
+/// path-keyed table holds them twice, as the copies at put_old and the
+/// entries they were made from. A reader rooted at "/" is where Linux's
+/// `chroot_fs_refs` would never have left it: still in the old root, which
+/// reaches neither the new root mount above it nor a second copy of its own
+/// tree. `show_mountinfo` (`seq_path_root`) and `do_listmount`
+/// (`is_path_reachable`) list the tree its root reaches, so the listings
+/// must be what they were plus the mount made since, with unique ids and a
+/// cursor that pages them to the end.
+///
+/// The copies were listed too, doubling the global table: every later case
+/// that reads /proc/mounts or mountinfo in one 4 KiB read, or lists 64 ids,
+/// stopped finding the mount it had just made.
+fn smoke_abi_fsx2_mount_listings_after_a_global_pivot_root() -> TestResult {
+    const LSMT_ROOT: u64 = u64::MAX;
+    const MNT_DETACH: u64 = 2;
+    with_setup(|| {
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        crate::handlers::__test_root_dir_reset();
+        let read_all = |path: &core::ffi::CStr| -> Result<alloc::string::String, &'static str> {
+            let fd = match call_open(path.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open of a mount listing failed"),
+            };
+            let mut text = alloc::vec::Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                match call(
+                    Syscall::Read.raw(),
+                    a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+                ) {
+                    Some(0) => break,
+                    Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+                    _ => {
+                        let _ = call(Syscall::Close.raw(), a0(fd));
+                        return Err("read of a mount listing failed");
+                    }
+                }
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            alloc::string::String::from_utf8(text).map_err(|_| "a mount listing is not UTF-8")
+        };
+        // Every id listmount(LSMT_ROOT) pages out one at a time.
+        let list_paged = || -> Result<alloc::vec::Vec<u64>, &'static str> {
+            let mut ids = alloc::vec::Vec::new();
+            let mut cursor = 0u64;
+            loop {
+                let req = mnt_id_req(32, LSMT_ROOT, cursor);
+                let mut one = [0u64; 1];
+                match call(
+                    Syscall::Listmount.raw(),
+                    a3(req.as_ptr() as u64, one.as_mut_ptr() as u64, 1, 0),
+                ) {
+                    Some(1) if one[0] > cursor => {
+                        ids.push(one[0]);
+                        cursor = one[0];
+                    }
+                    Some(0) => return Ok(ids),
+                    _ => return Err("listmount paging returned an id that did not advance"),
+                }
+                if ids.len() > 100_000 {
+                    return Err("listmount paging did not terminate");
+                }
+            }
+        };
+        let mount_points = |info: &str| -> alloc::vec::Vec<alloc::string::String> {
+            info.lines()
+                .filter_map(|line| line.split(' ').nth(4).map(alloc::string::String::from))
+                .collect()
+        };
+        let mount_tmpfs = |target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"none".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    c"tmpfs".as_ptr() as u64,
+                    0,
+                    0,
+                ),
+            ) == Some(0)
+        };
+        let umount = |target: &core::ffi::CStr| {
+            let _ = call(
+                Syscall::Umount2.raw(),
+                a1(target.as_ptr() as u64, MNT_DETACH),
+            );
+        };
+
+        let before = mount_points(&read_all(c"/proc/self/mountinfo")?);
+        let before_ids = list_paged()?;
+        // The pivot, as smoke_abi_fsx_pivot_root_pos makes it.
+        if !mount_tmpfs(c"/abi-pvl-new")
+            || call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, c"/abi-pvl-new/old".as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+        {
+            return Err("the new root tmpfs and its put_old were not set up");
+        }
+        let pivoted = call(
+            Syscall::PivotRoot.raw(),
+            a2(
+                c"/abi-pvl-new".as_ptr() as u64,
+                c"/abi-pvl-new/old".as_ptr() as u64,
+                0,
+            ),
+        );
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        let result = (|| {
+            if pivoted != Some(0) {
+                return Err("pivot_root into the tmpfs failed");
+            }
+            if !mount_tmpfs(c"/abi-pvl-after") {
+                return Err("the mount after the pivot failed");
+            }
+            let after = mount_points(&read_all(c"/proc/self/mountinfo")?);
+            if after.iter().any(|path| path.starts_with("/abi-pvl-new")) {
+                return Err("mountinfo lists the new root or the copy of the old root at put_old");
+            }
+            if after
+                .iter()
+                .filter(|path| *path == "/abi-pvl-after")
+                .count()
+                != 1
+            {
+                return Err("mountinfo does not list the mount made after the pivot exactly once");
+            }
+            if after.len() != before.len() + 1 {
+                return Err("mountinfo gained more than the one mount made after the pivot");
+            }
+            let mounts = read_all(c"/proc/mounts")?;
+            let mounts: alloc::vec::Vec<&str> = mounts
+                .lines()
+                .filter_map(|line| line.split(' ').nth(1))
+                .collect();
+            if mounts.iter().any(|path| path.starts_with("/abi-pvl-new"))
+                || mounts
+                    .iter()
+                    .filter(|path| **path == "/abi-pvl-after")
+                    .count()
+                    != 1
+            {
+                return Err("/proc/mounts does not list each mount once from the caller's root");
+            }
+            let ids = list_paged()?;
+            if ids.len() != before_ids.len() + 1 {
+                return Err("listmount gained more than the one mount made after the pivot");
+            }
+            let mut all = alloc::vec![0u64; ids.len() + 8];
+            let req = mnt_id_req(32, LSMT_ROOT, 0);
+            let n = call(
+                Syscall::Listmount.raw(),
+                a3(
+                    req.as_ptr() as u64,
+                    all.as_mut_ptr() as u64,
+                    all.len() as u64,
+                    0,
+                ),
+            );
+            if n != Some(ids.len() as i64) || all[..ids.len()] != ids[..] {
+                return Err(
+                    "paging listmount with its cursor reached a different set than one call",
+                );
+            }
+            Ok(())
+        })();
+        // Undo the case: the later mount, the old root's attachment at put_old,
+        // and the new root tmpfs.
+        umount(c"/abi-pvl-after");
+        umount(c"/abi-pvl-new/old");
+        umount(c"/abi-pvl-new");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pivot-listing",
+    smoke_abi_fsx2_mount_listings_after_a_global_pivot_root
+);
+
 /// `statmount`'s flag validation and the string-area sizing.
 ///
 /// `prepare_kstatmount` answers -EOVERFLOW for a request that asks for a
