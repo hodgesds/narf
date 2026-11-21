@@ -226,6 +226,12 @@ impl ThermalZone {
         if dk == 0 || dk == 0xFFFF_FFFF {
             return None;
         }
+        // Linux acpi_thermal_get_critical_trip rejects firmware _CRT at or
+        // below 273.2 K. Some NUCs return 2732 for both _CRT and _TMP,
+        // which would hold the CPU at its thermal minimum on every poll.
+        if leaf == "_CRT" && dk <= 2732 {
+            return None;
+        }
         Some(decik_to_milli_c(dk))
     }
 
@@ -588,6 +594,49 @@ mod tests {
     kernel_test_in!(
         "power/acpi_thermal",
         smoke_acpi_thermal_name_object_trip_points
+    );
+
+    fn smoke_acpi_thermal_rejects_freezing_critical_trip() -> TestResult {
+        // Name(_TMP, 2732) mirrors the NUC. Add a valid passive threshold to
+        // prove that rejecting its critical value preserves other cooling trips.
+        for (name, critical, expected) in [
+            ("TZC1", 2731u16, None),
+            ("TZC2", 2732, None),
+            ("TZC3", 2733, Some(150)),
+        ] {
+            // A Device without a thermal HID keeps these synthetic sensors
+            // out of the shared kernel-test boot's thermal-zone discovery.
+            let mut body = alloc::vec![0x5b, 0x82, 30, b'\\'];
+            body.extend_from_slice(name.as_bytes());
+            for (leaf, dk) in [(b"_TMP", 2732), (b"_CRT", critical), (b"_PSV", 3532)] {
+                body.push(0x08); // NameOp
+                body.extend_from_slice(leaf);
+                body.push(0x0b); // WordPrefix
+                body.extend_from_slice(&dk.to_le_bytes());
+            }
+            if narf_aml::__parse_body_for_test(&body, "\\").is_err() {
+                return TestResult::Fail("could not parse thermal zone");
+            }
+            let zone = ThermalZone {
+                path: alloc::format!("\\{name}"),
+            };
+            let trips = zone.trip_points();
+            if zone.temperature_c_milli() != Ok(50)
+                || trips.critical_milli_c != expected
+                || trips.passive_milli_c != Some(80_050)
+                || classify(50, &trips) != ActiveTrip::None
+            {
+                return TestResult::Fail("invalid _CRT must not throttle a valid sensor reading");
+            }
+            if critical == 2733 && classify(150, &trips) != ActiveTrip::Critical {
+                return TestResult::Fail("valid _CRT above the cutoff must still act");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_rejects_freezing_critical_trip
     );
 
     fn smoke_acpi_thermal_classify_precedence_critical_wins() -> TestResult {

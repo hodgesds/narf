@@ -161,7 +161,12 @@ base frequency times delta APERF / delta MPERF yields kHz. TSC calibration
 separately governs sample age. No counter is
 reset and no performance-control register is written. Missing calibration,
 zero deltas, counter resets/read faults and samples older than 500 ms are
-unavailable. Proc readers never read MSRs or wait for another CPU. Workers
+unavailable. On APERF/MPERF-capable x86 systems,
+`/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq` exposes the same
+cached measurement in kHz and reads empty while unavailable. The pinned HWP
+worker records its initial requested and observed IA32_HWP_REQUEST in the
+boot log, or reports its initialization or readback error. Proc and sysfs
+readers never read MSRs or wait for another CPU. Workers
 cover CPUs online at startup; bringing a later hotplugged CPU into telemetry
 is not implemented yet.
 
@@ -1061,7 +1066,10 @@ carries no zone model of its own (#910). Temperature and trip-point
 objects are evaluated as ACPI objects in either firmware shape — a
 Method returning deciKelvin or a Name holding it (the common DSDT
 shape for `_CRT`/`_PSV`/`_ACx`); a methods-only read silently
-produces an empty trip table (#986).
+produces an empty trip table (#986). Firmware `_CRT` values at or below 2732
+deciKelvin are discarded during trip discovery, matching Linux
+`acpi_thermal_get_critical_trip`. Sensor readings and other trip types retain
+their own validation.
 
 The bridge between the layers is the only registration/sampling path:
 
