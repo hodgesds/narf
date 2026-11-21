@@ -1127,7 +1127,9 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                 let Some(fault) = crate::amdgpu_gmc_navi22::Fault::from_iv(&iv) else {
                     continue;
                 };
-                let (result, line) = {
+                let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let logged = seen < FAULT_LOG_LIMIT;
+                let (result, line, report) = {
                     let mut owner = OWNER.lock().await;
                     let gmc = owner
                         .as_mut()
@@ -1138,13 +1140,20 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                             let result = gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs);
                             // gfxhub_v2_1/mmhub_v2_0_print_l2_protection_fault_status.
                             let status = crate::amdgpu_vmid::fault(fault.pasid).status;
-                            (result, Some(gmc.status_line(fault.hub, status)))
+                            let line = gmc.status_line(fault.hub, status);
+                            // Read back while the registers still hold what the
+                            // faulting job ran with.
+                            let client = matches!(
+                                result,
+                                Ok(crate::amdgpu_gmc_navi22::FaultOwner::Client { .. })
+                            );
+                            let report = (logged && client).then(|| gmc.client_fault_report(fault));
+                            (result, Some(line), report)
                         }
-                        Err(error) => (Err(error), None),
+                        Err(error) => (Err(error), None, None),
                     }
                 };
-                let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if seen < FAULT_LOG_LIMIT {
+                if logged {
                     use core::fmt::Write;
                     let _ = writeln!(
                         narf_console::Writer,
@@ -1153,6 +1162,9 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                     if let Some(line) = line {
                         let _ =
                             writeln!(narf_console::Writer, "amdgpu: navi22 GPU page fault {line}");
+                    }
+                    if let Some(report) = report {
+                        let _ = writeln!(narf_console::Writer, "{report}");
                     }
                 }
             }

@@ -1821,10 +1821,33 @@ impl VmInner {
         }
     }
 
-    /// What this space holds at `va` (hole-stripped) for a fault report.
+    /// What this space holds at `va` (hole-stripped) for a fault report:
+    /// the entries are read from the tables themselves, root first, as a
+    /// hub walking from `root_pde` reads them.
     pub fn describe_va(&self, va: u64) -> FaultVa {
-        let _ = va;
-        FaultVa::default()
+        let geometry = self.geometry;
+        let levels: Vec<Level> = geometry.levels().collect();
+        let mut walk = Vec::new();
+        {
+            let g = self.root.lock();
+            let mut node = g.as_ref();
+            for &level in &levels {
+                let Some(table) = node else {
+                    break;
+                };
+                let index = geometry.index_at(va, level);
+                // SAFETY: `index_at` masks to the table's entry count.
+                walk.push(unsafe { table.table.read(index) });
+                node = table.children.get(&index);
+            }
+        }
+        FaultVa {
+            root: self.root_pde(),
+            mapping: self.lookup(va),
+            system: self.mapped_object(va).map(|object| object.system()),
+            walk,
+            levels: levels.len(),
+        }
     }
 
     /// Read a leaf entry for `va`, for tests and for a future fault handler.
@@ -1878,15 +1901,24 @@ pub struct FaultVa {
 impl FaultVa {
     /// Every level's entry is VALID down to the leaf PTE.
     pub fn translates(&self) -> bool {
-        false
+        self.levels != 0
+            && self.walk.len() == self.levels
+            && self.walk.iter().all(|entry| entry & PTE_VALID != 0)
     }
 }
 
 /// The registered address space whose PASID is `pasid`, described at
 /// `va` (hole-stripped); `None` when no live space holds the PASID.
+/// Spaces that never allocated a PASID match nothing, PASID 0 included.
 pub fn describe_fault(pasid: crate::amdgpu_vmid::Pasid, va: u64) -> Option<FaultVa> {
-    let _ = (pasid, va);
-    None
+    let spaces: Vec<_> = VMS.lock().iter().filter_map(|vm| vm.upgrade()).collect();
+    let space = spaces.into_iter().find(|vm| {
+        vm.pasid
+            .lock()
+            .as_ref()
+            .is_some_and(|handle| handle.get() == pasid)
+    })?;
+    Some(space.describe_va(va))
 }
 
 // ── Activating an address space on the hardware ─────────────────────────

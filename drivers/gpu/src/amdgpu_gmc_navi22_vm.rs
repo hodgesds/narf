@@ -769,11 +769,41 @@ impl<I: Io> Engine<I> {
         fault: Fault,
         space: Option<crate::amdgpu_vm::FaultVa>,
     ) -> super::ClientFaultReport {
-        let _ = space;
+        let layout = self.layout;
+        let v = u32::from(fault.vmid);
+        let read64 = |io: &mut I, base: u64, reg: u32| {
+            u64::from(io.read(base + u64::from(reg) * 4))
+                | u64::from(io.read(base + u64::from(reg + 1) * 4)) << 32
+        };
+        let order = match fault.hub {
+            Hub::Mm => [
+                (Hub::Mm, layout.bases[1], layout.hubs[1]),
+                (Hub::Gfx, layout.bases[0], layout.hubs[0]),
+            ],
+            Hub::Gfx => [
+                (Hub::Gfx, layout.bases[0], layout.hubs[0]),
+                (Hub::Mm, layout.bases[1], layout.hubs[1]),
+            ],
+        };
+        // The registers setup_vmid_config and the ring's VM flush program.
+        let contexts = self
+            .access(|io| {
+                Ok(order.map(|(hub, base, r)| {
+                    let pair = v * r.ctx_addr_distance;
+                    let context = super::ContextRegs {
+                        cntl: io.read(base + u64::from(r.ctx + v * r.ctx_distance) * 4),
+                        base: read64(io, base, r.pt_base + pair),
+                        start: read64(io, base, r.pt_start + pair),
+                        end: read64(io, base, r.pt_end + pair),
+                    };
+                    (hub, context)
+                }))
+            })
+            .ok();
         super::ClientFaultReport {
             fault,
-            contexts: None,
-            space: None,
+            contexts,
+            space,
         }
     }
     /// amdgpu_gmc_set_vm_fault_masks on MMHUB then GFXHUB, all 16 contexts,

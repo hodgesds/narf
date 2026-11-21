@@ -199,12 +199,119 @@ pub struct ClientFaultReport {
     pub space: Option<crate::amdgpu_vm::FaultVa>,
 }
 impl ClientFaultReport {
+    /// The first explanation the evidence supports, in walk order: the
+    /// client's VM, then the faulting hub's context. `None` when the
+    /// context registers could not be read.
     pub fn cause(&self) -> Option<FaultCause> {
-        None
+        let Some(space) = self.space.as_ref() else {
+            return Some(FaultCause::NoSpace);
+        };
+        if space.mapping.is_none() {
+            return Some(FaultCause::Unmapped);
+        }
+        if !space.translates() {
+            return Some(FaultCause::NotTranslated);
+        }
+        let (_, context) = self.contexts?[0];
+        // linux-lit: 1=MMVM_CONTEXT1_CNTL__ENABLE_CONTEXT_MASK
+        if context.cntl & 1 == 0 {
+            return Some(FaultCause::ContextDisabled);
+        }
+        let page = self.fault.address >> 12; // linux: n/a (AMDGPU_GPU_PAGE_SHIFT)
+        if page < context.start || page > context.end {
+            return Some(FaultCause::ContextRange);
+        }
+        if space.root != Some(context.base) {
+            return Some(FaultCause::ContextElsewhere);
+        }
+        Some(FaultCause::HubWalk)
     }
 }
+const fn hub_name(hub: Hub) -> &'static str {
+    match hub {
+        Hub::Gfx => "GFX",
+        Hub::Mm => "MM",
+    }
+}
+/// Three console lines: the address space at the address, both hubs'
+/// contexts for the VMID, and the cause.
 impl core::fmt::Display for ClientFaultReport {
-    fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const PREFIX: &str = "amdgpu: navi22 GPU page fault";
+        let va = crate::amdgpu_vm::sign_extend(self.fault.address);
+        write!(f, "{PREFIX} va={va:#x} pasid={}: ", self.fault.pasid)?;
+        match &self.space {
+            None => write!(f, "no address space holds this PASID")?,
+            Some(space) => {
+                match &space.mapping {
+                    Some(m) => write!(
+                        f,
+                        "mapped va={:#x}+{:#x} handle={} offset={:#x} flags={:#x} {}",
+                        crate::amdgpu_vm::sign_extend(m.va),
+                        m.size,
+                        m.gem_handle,
+                        m.offset,
+                        m.vm_flags,
+                        match space.system {
+                            Some(true) => "system",
+                            Some(false) => "vram",
+                            None => "unbacked",
+                        },
+                    )?,
+                    None => write!(f, "unmapped")?,
+                }
+                match space.root {
+                    Some(root) => write!(f, " root={root:#x} walk=")?,
+                    None => write!(f, " root=none walk=")?,
+                }
+                for (i, entry) in space.walk.iter().enumerate() {
+                    let sep = if i == 0 { "" } else { "," };
+                    write!(f, "{sep}{entry:#x}")?;
+                }
+                if space.walk.is_empty() {
+                    write!(f, "none")?;
+                }
+            }
+        }
+        write!(f, "\n{PREFIX} vmid={} ", self.fault.vmid)?;
+        match &self.contexts {
+            None => write!(f, "contexts unreadable")?,
+            Some(contexts) => {
+                for (i, (hub, c)) in contexts.iter().enumerate() {
+                    write!(
+                        f,
+                        "{}{} cntl={:#x} base={:#x} start={:#x} end={:#x}",
+                        if i == 0 { "" } else { ", " },
+                        hub_name(*hub),
+                        c.cntl,
+                        c.base,
+                        c.start,
+                        c.end,
+                    )?;
+                }
+            }
+        }
+        let hub = hub_name(self.fault.hub);
+        write!(f, "\n{PREFIX} cause: ")?;
+        match self.cause() {
+            None => write!(f, "unknown (contexts unreadable)"),
+            Some(FaultCause::NoSpace) => write!(f, "no live address space holds the IV's PASID"),
+            Some(FaultCause::Unmapped) => write!(f, "the address is unmapped in the client's VM"),
+            Some(FaultCause::NotTranslated) => {
+                write!(f, "mapped, but the client's tables do not translate it")
+            }
+            Some(FaultCause::ContextDisabled) => write!(f, "the {hub} context is disabled"),
+            Some(FaultCause::ContextRange) => {
+                write!(f, "the address is outside the {hub} context's range")
+            }
+            Some(FaultCause::ContextElsewhere) => write!(
+                f,
+                "the {hub} context does not point at the client's root: the VM flush did not land"
+            ),
+            Some(FaultCause::HubWalk) => write!(
+                f,
+                "mapped, the client's tables translate it and the {hub} context points at their root: the hub cannot walk them"
+            ),
+        }
     }
 }
