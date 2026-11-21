@@ -563,6 +563,30 @@ fn quarter_lines(value: Fx, line_time: Fx) -> Fx {
     Fx::ratio(Fx::int(4).times(value).over(line_time).ceil(), 4)
 }
 
+/// `dcn3_15_soc.dummy_pstate_latency_us`: the DRAM-change latency DCN 3.1.5
+/// computes with once the change cannot happen in vactive and p-state is
+/// locked.
+pub const DUMMY_PSTATE_LATENCY_US: i64 = 10;
+/// `max_line_buffer_lines`, 12 on both DCNs.
+const MAX_LINE_BUFFER_LINES: i64 = 12;
+
+/// `DRAMClockChangeSupport`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DramClockChange {
+    /// The detile buffer and line buffer hide the change during active scan.
+    Vactive,
+    /// Only within the vertical blank.
+    Vblank,
+}
+/// The vactive margin and what it allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DramChangeSupport {
+    /// `ActiveDRAMClockChangeLatencyMargin`, in µs. Negative when the
+    /// buffers cannot hide the change in vactive.
+    pub margin_us: Fx,
+    pub support: DramClockChange,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {
     Ddr5,
@@ -585,12 +609,10 @@ impl Memory {
     /// (p-state, self-refresh exit, self-refresh enter plus exit) in µs.
     ///
     /// DCN 3.1.5's tables (`dcn315_clk_mgr.c`) give DDR5 and LPDDR5 the same
-    /// row. LINUX-GAP: `dcn315_update_soc_for_wm_a` uses that row's 129 µs
-    /// p-state latency only when DML finds the DRAM clock change possible in
-    /// vactive, and `dummy_pstate_latency_us` (10 µs) otherwise, with the
-    /// clock manager then locking p-state. This port does not yet compute that
-    /// support, so it keeps the longer latency — the larger watermark and
-    /// TTU blank — rather than assume a switch the DET may not hide.
+    /// row. `dcn315_update_soc_for_wm_a` uses that row's 129 µs p-state
+    /// latency only when the DRAM clock change fits in vactive
+    /// ([`Config::dram_clock_change`]); otherwise the caller recomputes with
+    /// [`DUMMY_PSTATE_LATENCY_US`] and the clock manager locks p-state.
     fn latencies(&self, dcn: Dcn) -> (Fx, Fx, Fx) {
         match (dcn, self.kind) {
             (Dcn::Dcn314, MemoryKind::Ddr5) => {
@@ -711,11 +733,23 @@ impl Config {
     /// `CalculateWatermarksAndDRAMSpeedChangeSupport` for a single plane with no
     /// writeback, so the writeback watermarks and their chunk term drop out.
     pub fn watermarks(&self, memory: &Memory, clocks: &ClockState) -> Result<Watermarks, Error> {
+        self.watermarks_with_pstate_latency(memory, clocks, None)
+    }
+    /// [`Config::watermarks`] with the DRAM-change latency replaced, as
+    /// `dcn315_update_soc_for_wm_a` replaces it with the dummy latency when the
+    /// change cannot happen in vactive.
+    pub fn watermarks_with_pstate_latency(
+        &self,
+        memory: &Memory,
+        clocks: &ClockState,
+        pstate_latency_us: Option<Fx>,
+    ) -> Result<Watermarks, Error> {
         self.validate()?;
         if !memory.valid() || !clocks.valid() {
             return Err(Error::Invalid);
         }
         let (pstate_latency, sr_exit, sr_enter_plus_exit) = memory.latencies(self.dcn);
+        let pstate_latency = pstate_latency_us.unwrap_or(pstate_latency);
         let (sr_exit_z8, sr_enter_plus_exit_z8) = self.dcn.z8_us();
         let urgent_latency = Fx::ratio(URGENT_LATENCY_US_TENTHS, 10);
         let return_bw = self.return_bandwidth(memory, clocks);
@@ -739,6 +773,63 @@ impl Config {
             sr_exit_us: sr_exit,
             sr_enter_plus_exit_us: sr_enter_plus_exit,
         })
+    }
+    /// `CalculateWatermarksAndDRAMSpeedChangeSupport`'s `DRAMClockChangeSupport`
+    /// for one plane with no chroma or writeback, on a DET of
+    /// `geometry.det_buffer_bytes` — plus, under unbounded requesting, the
+    /// whole compressed buffer, since this plane carries all the pixel
+    /// bandwidth (`EffectiveDETBufferSizeY`).
+    ///
+    /// The margin is the line-buffer and full-DET buffering time less the
+    /// scaler delay, the urgent watermark and the DRAM-change watermark. With
+    /// one timing generator, a change that does not fit in vactive still fits
+    /// in vblank at prefetch mode 0.
+    pub fn dram_clock_change(
+        &self,
+        geometry: &Geometry,
+        watermarks: &Watermarks,
+        prefetch: &Prefetch,
+        unbounded: bool,
+        compbuf_kbytes: u64,
+    ) -> DramChangeSupport {
+        let line_time = self.line_time_us();
+        let v_ratio = geometry.v_ratio;
+        let swath_width = Fx::int(geometry.swath_width.max(1) as i64);
+        // LBLatencyHidingSourceLinesY.
+        let lb_lines = Fx::int(LINE_BUFFER_SIZE_BITS as i64)
+            .over(Fx::int(LINE_BUFFER_BPP as i64))
+            .over(swath_width.over(geometry.h_ratio.max(Fx::ONE)))
+            .floor()
+            .min(MAX_LINE_BUFFER_LINES)
+            - (self.plane.v_taps as i64 - 1);
+        let lb_hiding = Fx::int(lb_lines.max(0)).over(v_ratio).times(line_time);
+        let effective_det =
+            geometry.det_buffer_bytes + if unbounded { compbuf_kbytes * 1024 } else { 0 };
+        // LinesInDETY, rounded down to whole swaths.
+        let lines_in_det =
+            effective_det / geometry.bytes_per_pixel.max(1) / geometry.swath_width.max(1);
+        let swath_height = geometry.swath_height.max(1);
+        let lines_rounded = lines_in_det / swath_height * swath_height;
+        let full_det = Fx::int(lines_rounded as i64).times(line_time).over(v_ratio);
+        let after_scaler = Fx::ratio(
+            prefetch.dst_x_after_scaler as i64,
+            self.timing.h_total as i64,
+        )
+        .plus(Fx::int(prefetch.dst_y_after_scaler as i64))
+        .times(line_time);
+        let margin_us = lb_hiding
+            .plus(full_det)
+            .minus(after_scaler)
+            .minus(watermarks.urgent_us)
+            .minus(watermarks.pstate_change_us);
+        DramChangeSupport {
+            margin_us,
+            support: if margin_us > Fx::ZERO {
+                DramClockChange::Vactive
+            } else {
+                DramClockChange::Vblank
+            },
+        }
     }
     /// The maximum VStartup, progressive scan with no writeback delay, so the
     /// vblank is reduced by a single line. dml314's `CalculateMaxVStartup` also

@@ -490,6 +490,38 @@ impl Pipeline {
         };
         let watermarks = config.watermarks(&platform.memory, &clocks)?;
         let prefetch = config.prefetch(&geometry, &clocks, &watermarks)?;
+        // "For 31x apu pstate change is only supported if possible in
+        // vactive" (dcn31_calculate_wm_and_dlg_fp), on the DET and compressed
+        // buffer this pipe is given.
+        let dram_change = config.dram_clock_change(
+            &geometry,
+            &watermarks,
+            &prefetch,
+            crb.unbounded,
+            u64::from(crb.compbuf_kbytes),
+        );
+        let pstate_supported = dram_change.support == crate::amdgpu_dml::DramClockChange::Vactive;
+        // dcn315_update_soc_for_wm_a: otherwise DCN 3.1.5 computes with the
+        // dummy p-state latency, and its clock manager locks p-state (see
+        // `ClockManager::set_pstate_support`). DCN 3.1.4 keeps its latency.
+        //
+        // LINUX-GAP: Linux picks the latency from the previous validation's
+        // result, so a mode that cannot hide 129 us alternates between commits.
+        // This takes the pairing that comment describes, deterministically.
+        let (watermarks, prefetch) =
+            if self.dcn == crate::amdgpu_dml::Dcn::Dcn315 && !pstate_supported {
+                let watermarks = config.watermarks_with_pstate_latency(
+                    &platform.memory,
+                    &clocks,
+                    Some(crate::amdgpu_dml::Fx::int(
+                        crate::amdgpu_dml::DUMMY_PSTATE_LATENCY_US,
+                    )),
+                )?;
+                let prefetch = config.prefetch(&geometry, &clocks, &watermarks)?;
+                (watermarks, prefetch)
+            } else {
+                (watermarks, prefetch)
+            };
         // FractionOfUrgentBandwidth for one linear plane without VM, DCC,
         // cursor or chroma: the larger of the active read and the prefetch
         // pixel bandwidth, over the return bandwidth, in thousandths.
@@ -523,6 +555,7 @@ impl Pipeline {
             registers,
             crb,
             arbiter,
+            pstate_supported,
             sync: GlobalSync {
                 v_startup_lines: prefetch.v_startup,
                 v_update_offset_pix: prefetch.v_update_offset_pix,
@@ -590,6 +623,7 @@ impl Pipeline {
             deep_sleep_dcfclk_khz: plan.clocks.deep_sleep_dcfclk_khz,
             dtbclk_enabled: self.route.channel == crate::amdgpu_dmub::Channel::Dpia,
         };
+        self.clocks.set_pstate_support(plan.pstate_supported);
         self.clocks.update(requested, false, &mut consumers).await?;
         self.clocks.enter_mission_mode().await?;
         // dcn20_prepare_bandwidth: raise the arbiter watermarks, and shrink
@@ -785,6 +819,8 @@ pub struct Plan {
     pub crb: crate::amdgpu_dcn_hubbub::Plan,
     /// The DCHUBBUB arbiter watermarks for this plane.
     pub arbiter: crate::amdgpu_dcn_hubbub::Watermarks,
+    /// Whether the DRAM clock may change: only when it fits in vactive.
+    pub pstate_supported: bool,
     pub sync: GlobalSync,
 }
 

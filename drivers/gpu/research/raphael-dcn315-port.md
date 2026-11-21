@@ -186,10 +186,19 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    `VBlankNomDefaultUS`) and `MIN_DST_Y_NEXT_START` (rq_dlg_calc_31
    programs the vblank start).
 
-   Still open: `dcn315_update_soc_for_wm_a` uses the 129 µs latency only
-   when DRAM clock change is possible in vactive, else the 10 µs dummy plus
-   a p-state lock. That needs the DET/unbounded policy and the vactive
-   support decision; until then the longer latency is used.
+   ~~The vactive p-state decision~~ (done). `DRAMClockChangeSupport` for one
+   plane is the line-buffer hiding time (≤ 12 lines) plus the full-DET
+   buffering time, less the scaler delay, the urgent and the DRAM-change
+   watermarks. Under unbounded requesting the DET includes the whole
+   compressed buffer. A margin > 0 is vactive; with one timing generator,
+   anything else is vblank. `dcn31_calculate_wm_and_dlg_fp` allows p-state
+   only in vactive, on both DCNs. On DCN 3.1.5 a non-vactive mode is then
+   recomputed with `dummy_pstate_latency_us` (10 µs), and the clock manager
+   locks p-state by asking for `UNSUPPORTED_DCFCLK` (10 GHz). DCN 3.1.4's
+   clock manager ignores the flag, as Linux's does. LINUX-GAP: Linux chooses
+   the latency from the *previous* validation, so such a mode alternates
+   between 129 µs and 10 µs across commits; NARF takes the
+   dummy-with-lock pairing deterministically.
 
    ~~DCHUBBUB DET split, compressed buffer, unbounded requesting and arbiter
    watermarks~~ (done, both DCNs, `amdgpu_dcn_hubbub`). Neither path
@@ -217,8 +226,8 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    - DCN 3.1.4's 2100 µs minimum Z8 residency applies unconditionally (no
      stutter period is computed).
 
-   Still open: the vactive p-state decision above, which can now use the
-   DET and compressed-buffer sizes this plan supplies.
+   The vactive decision above runs on the DET and compressed-buffer sizes
+   this plan supplies.
 9. DMUB `dcn_3_1_5_dmcub.bin` with PSP 13.0.5, then the boot-handoff window,
    then the Late worker arm.
 

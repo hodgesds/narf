@@ -221,6 +221,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             clocks: Clocks::default(),
             levels: None,
             dprefclk_khz: DPREFCLK_KHZ,
+            pstate_supported: true,
         },
     )
 }
@@ -706,4 +707,51 @@ fn dcn_clk_dcn315_start_reads_dprefclk_and_the_four_level_table() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/dcn-clk",
     dcn_clk_dcn315_start_reads_dprefclk_and_the_four_level_table
+);
+
+/// `dcn315_update_clocks`: "Lock pstate by requesting unsupported dcfclk if
+/// change is unsupported" — SetHardMinDcfclkByFreq(10000 MHz) and the
+/// sentinel recorded. DCN 3.1.4's clock manager has no such lock.
+fn dcn_clk_dcn315_locks_pstate_with_an_unsupported_dcfclk() -> TestResult {
+    let request = Clocks {
+        dispclk_khz: 600_000,
+        dppclk_khz: 600_000,
+        dcfclk_khz: 400_000,
+        deep_sleep_dcfclk_khz: 300_000,
+        dtbclk_enabled: false,
+    };
+    let (_pool, mut engine) = fixture_315();
+    engine.levels = Some(
+        parse_315(&{
+            let mut words = [0u32; (TABLE_SIZE / 4) as usize];
+            words[..(TABLE_SIZE_315 / 4) as usize].copy_from_slice(&table_words_315());
+            words
+        })
+        .unwrap(),
+    );
+    engine.pstate_supported = false;
+    let mut sink = Sink::default();
+    let Ok(applied) = run(engine.apply(request, false, &mut sink)) else {
+        return TestResult::Fail("DCN 3.1.5 locked apply");
+    };
+    if !engine
+        .io
+        .messages_315()
+        .contains(&(MSG_SET_HARD_MIN_DCFCLK, 10_000))
+        || applied.dcfclk_khz != UNSUPPORTED_DCFCLK_KHZ
+    {
+        return TestResult::Fail("p-state not locked through DCFCLK");
+    }
+    let (_pool, mut phoenix) = started();
+    phoenix.pstate_supported = false;
+    let mut sink = Sink::default();
+    match run(phoenix.apply(request, false, &mut sink)) {
+        Ok(applied) if applied.dcfclk_khz == 400_000 => {}
+        _ => return TestResult::Fail("DCN 3.1.4 must not lock p-state"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-clk",
+    dcn_clk_dcn315_locks_pstate_with_an_unsupported_dcfclk
 );

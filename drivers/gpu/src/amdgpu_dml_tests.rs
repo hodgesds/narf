@@ -618,3 +618,75 @@ kernel_test_in!(
     "drivers/gpu/dml",
     dml_dcn315_uses_dcn3_15_parameters_and_the_whole_vblank
 );
+
+/// `DRAMClockChangeSupport` for one 1080p linear RGB plane on DCN 3.1.5:
+/// 8 line-buffer lines (789504 / 48 / 1920), 25 DET lines on 192 KB, and with
+/// unbounded requesting the 832 KB compressed buffer as well, 136 lines. The
+/// margin falls by the DRAM-change watermark; a watermark the buffers cannot
+/// cover leaves the change to vblank. The dummy latency replaces 129 us.
+fn dml_dram_clock_change_counts_det_line_buffer_and_compbuf() -> TestResult {
+    let config = Config {
+        dcn: Dcn::Dcn315,
+        ..config_1080p()
+    };
+    let clocks = clocks_1080p();
+    let (Ok(geometry), Ok(wm)) = (
+        config.geometry_with_det(192),
+        config.watermarks(&memory_ddr5(), &clocks),
+    ) else {
+        return TestResult::Fail("dcn315 geometry or watermarks");
+    };
+    let Ok(prefetch) = config.prefetch(&geometry, &clocks, &wm) else {
+        return TestResult::Fail("dcn315 prefetch");
+    };
+    let line = config.line_time_us();
+    let bounded = config.dram_clock_change(&geometry, &wm, &prefetch, false, 832);
+    let unbounded = config.dram_clock_change(&geometry, &wm, &prefetch, true, 832);
+    let after_scaler = Fx::ratio(prefetch.dst_x_after_scaler as i64, 2200)
+        .plus(Fx::int(prefetch.dst_y_after_scaler as i64))
+        .times(line);
+    let want = Fx::int(8 + 25)
+        .times(line)
+        .minus(after_scaler)
+        .minus(wm.urgent_us)
+        .minus(wm.pstate_change_us);
+    let close = |a: Fx, b: Fx| (a.raw() - b.raw()).abs() <= 4;
+    if !close(bounded.margin_us, want) || bounded.support != DramClockChange::Vactive {
+        return TestResult::Fail("bounded vactive margin");
+    }
+    if !close(
+        unbounded.margin_us.minus(bounded.margin_us),
+        Fx::int(136 - 25).times(line),
+    ) {
+        return TestResult::Fail("the compressed buffer is not counted under unbounded requests");
+    }
+    // A DRAM change the buffers cannot hide goes to vblank.
+    let slow = Watermarks {
+        pstate_change_us: Fx::int(2000),
+        ..wm
+    };
+    if config
+        .dram_clock_change(&geometry, &slow, &prefetch, false, 832)
+        .support
+        != DramClockChange::Vblank
+    {
+        return TestResult::Fail("an unhidable DRAM change stayed in vactive");
+    }
+    // dcn315_update_soc_for_wm_a's dummy latency.
+    match config.watermarks_with_pstate_latency(
+        &memory_ddr5(),
+        &clocks,
+        Some(Fx::int(DUMMY_PSTATE_LATENCY_US)),
+    ) {
+        Ok(dummy)
+            if dummy.pstate_latency_us == Fx::int(10)
+                && dummy.pstate_change_us == Fx::int(10).plus(dummy.urgent_us)
+                && dummy.urgent_us == wm.urgent_us => {}
+        _ => return TestResult::Fail("dummy p-state latency"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml",
+    dml_dram_clock_change_counts_det_line_buffer_and_compbuf
+);

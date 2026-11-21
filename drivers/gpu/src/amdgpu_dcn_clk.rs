@@ -64,6 +64,9 @@ const NBIO_VERSIONS_315: &[(u8, u8, u8)] = &[(7, 2, 0), (7, 2, 1), (7, 7, 0), (7
 /// enabled-level counts and the GFX clock range.
 const TABLE_SIZE_315: u64 = 176; // linux: n/a (DCN 3.1.5 path)
 const LEVELS_315: usize = 4; // linux: n/a (DCN 3.1.5 path)
+/// `UNSUPPORTED_DCFCLK` (`dcn315_clk_mgr.c`): a hard-minimum DCFCLK no level
+/// meets, which PMFW takes as "lock p-state".
+const UNSUPPORTED_DCFCLK_KHZ: u32 = 10_000_000; // linux: n/a (DCN 3.1.5 path)
 /// `dc->debug.min_disp_clk_khz` on both DCN 3.1.4 and 3.1.5: the floor of
 /// what is asked of PMFW, though the requested clock is what is recorded.
 const MIN_DISPCLK_KHZ: u32 = 100_000; // linux: n/a (DCN 3.1.4/3.1.5 debug_defaults_drv)
@@ -376,6 +379,8 @@ struct Engine<I: Io> {
     /// DPREFCLK: DCN 3.1.4's fixed 600 MHz, or what DCN 3.1.5's firmware
     /// reports in `start` (zero until then, which the DP DTO refuses).
     dprefclk_khz: u32,
+    /// `new_clocks->p_state_change_support` for the next request.
+    pstate_supported: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -510,6 +515,11 @@ impl<I: Io> Engine<I> {
         if safe_to_lower && !target.dtbclk_enabled && self.clocks.dtbclk_enabled {
             self.send(set_dtbclk, 0).await?;
             self.clocks.dtbclk_enabled = false;
+        }
+        // dcn315_update_clocks: "Lock pstate by requesting unsupported dcfclk
+        // if change is unsupported". DCN 3.1.4's clock manager has no lock.
+        if self.mailbox == Mailbox::Dcn315 && !self.pstate_supported {
+            target.dcfclk_khz = UNSUPPORTED_DCFCLK_KHZ;
         }
         // A BIOS that left DCFCLK DPM disabled rejects these two; Linux warns
         // and continues, because the boot DCFCLK already satisfies the request.
@@ -737,6 +747,7 @@ impl ClockManager {
                 Mailbox::Dcn314 => DPREFCLK_KHZ,
                 Mailbox::Dcn315 => 0,
             },
+            pstate_supported: true,
         }))
     }
     /// Verify the mailbox answers and latch the firmware's DPM levels. Until
@@ -769,6 +780,13 @@ impl ClockManager {
     /// (`dcn315_smu_get_dpref_clk`) — zero before then.
     pub fn dprefclk_khz(&self) -> u32 {
         self.0.dprefclk_khz
+    }
+    /// Whether the mode being applied can take a DRAM clock change (only in
+    /// vactive on DCN 3.1.x). On DCN 3.1.5 an unsupported change locks
+    /// p-state on the next `update`; DCN 3.1.4's clock manager ignores it, as
+    /// Linux's does.
+    pub fn set_pstate_support(&mut self, supported: bool) {
+        self.0.pstate_supported = supported;
     }
     /// Apply a clock request in Linux's order. `safe_to_lower` must only be
     /// set when every pipe has already been reprogrammed for the lower clocks.
