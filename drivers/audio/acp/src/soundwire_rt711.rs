@@ -27,10 +27,14 @@
 //!   instead. Button detection (`rt711_button_detect`, IRQ flag
 //!   tables 0x80/0x81) needs an ALSA jack reporting consumer and is
 //!   not implemented.
-//! - DAC DC-offset calibration (`rt711_calibration`: FSM control,
-//!   vendor-calibration NID 0x58 trigger + poll, depop mode) runs
-//!   as deferred work in Linux and is not part of attach-time init
-//!   here; it is a follow-up.
+//! - DAC DC-offset calibration is implemented as
+//!   [`rt711_calibration`] (FSM control, vendor-calibration NID
+//!   0x58 trigger + poll, depop mode), but it is not part of
+//!   attach-time init: in Linux it runs at the end of `io_init`,
+//!   synchronously on the first init and as deferred work
+//!   (`calibration_work`) otherwise, and NARF has no deferred-work
+//!   queue yet, so no in-tree caller runs it — the ACP binding
+//!   runs it as deferred work once that exists.
 //! - `clock_config` is a pure mapping (`rt711_clock_config`); wiring
 //!   it into stream setup needs the manager's current data rate and
 //!   is a follow-up.
@@ -40,6 +44,8 @@ use narf_time::Deadline;
 
 /// Vendor-register node (`RT711_VENDOR_REG`).
 const VENDOR_REG: u8 = 0x20;
+/// Vendor-calibration node (`RT711_VENDOR_CALI`).
+const VENDOR_CALI: u8 = 0x58;
 
 /// HDA function-group node (`RT711_AUDIO_FUNCTION_GROUP`).
 const AUDIO_FUNCTION_GROUP: u16 = 0x01;
@@ -60,6 +66,9 @@ const ADC_IN1: u16 = 0x09;
 /// ADC-in 2 node (`RT711_ADC_IN2`).
 const ADC_IN2: u16 = 0x08;
 
+/// Vendor index: DAC DC-offset calibration control 1
+/// (`RT711_DAC_DC_CALI_CTL1`, behind `VENDOR_CALI`).
+const DAC_DC_CALI_CTL1: u8 = 0x00;
 /// Vendor index: jack-detect control 1 (`RT711_JD_CTL1`).
 const JD_CTL1: u8 = 0x08;
 /// Vendor index: jack-detect control 2 (`RT711_JD_CTL2`).
@@ -83,6 +92,8 @@ const INLINE_CMD_CTL: u8 = 0x48;
 const DIGITAL_MISC_CTRL4: u8 = 0x4a;
 /// Vendor index: VREF-out control (`RT711_VREFOUT_CTL`).
 const VREFOUT_CTL: u8 = 0x6b;
+/// Vendor index: FSM control (`RT711_FSM_CTL`).
+const FSM_CTL: u8 = 0x6f;
 /// Vendor index: TX/RX mux control (`RT711_TX_RX_MUX_CTL`).
 const TX_RX_MUX_CTL: u8 = 0x91;
 
@@ -150,6 +161,17 @@ const AUTO_DET_STATUS: u32 = 0x1 << 11;
 const AUTO_DET_TRS: u32 = 0x1 << 10;
 const AUTO_DET_CTIA: u32 = 0x1 << 9;
 const AUTO_DET_OMTP: u32 = 0x1 << 8;
+
+/// DAC DC-offset calibration trigger bit
+/// (`RT711_DAC_DC_CALI_TRIGGER`): set to start calibration; the
+/// codec clears it when calibration finishes.
+const DAC_DC_CALI_TRIGGER: u32 = 0x1 << 15;
+
+/// FSM control value: manual calibration mode
+/// (`RT711_CALI_CTL`).
+const CALI_CTL: u16 = 0x0;
+/// FSM control value: depop mode (`RT711_DEPOP_CTL`).
+const DEPOP_CTL: u16 = 0x3;
 
 /// Hidden software-reset bit in `PARA_VERB_CTL`
 /// (`RT711_HIDDEN_REG_SW_RESET`).
@@ -318,11 +340,12 @@ pub fn index_update_bits<T: Transport>(
 }
 
 /// Attach-time codec init (`rt711_io_init`, minus the deferred
-/// DAC DC-offset calibration, which is a follow-up): reset, power
-/// D0, pin widgets, gain mutes, configuration defaults, data-port
-/// arrangement and index settings, then power D3. Runs at attach
-/// (Linux `update_status` → `io_init`); the ACP binding calls it
-/// for every enumerated RT711.
+/// DAC DC-offset calibration — see [`rt711_calibration`], which
+/// runs as deferred work in Linux and is not wired in here):
+/// reset, power D0, pin widgets, gain mutes, configuration
+/// defaults, data-port arrangement and index settings, then power
+/// D3. Runs at attach (Linux `update_status` → `io_init`); the
+/// ACP binding calls it for every enumerated RT711.
 pub fn io_init<T: Transport>(bus: &Bus<T>, dev: u8) -> Result<(), SdwError> {
     // Reset: function reset + hidden software reset (`rt711_reset`).
     verb_write(bus, dev, FUNC_RESET, 0)?;
@@ -363,6 +386,72 @@ pub fn io_init<T: Transport>(bus: &Bus<T>, dev: u8) -> Result<(), SdwError> {
     index_write(bus, dev, VENDOR_REG, INLINE_CMD_CTL, 0xd249)?;
     // Finish initial settings, set power to D3.
     verb_write(bus, dev, SET_AUDIO_POWER_STATE, PWRST_D3)
+}
+
+/// DAC DC-offset calibration (`rt711_calibration`, Linux
+/// `sound/soc/codecs/rt711.c` @ `4dd10fbb` and `rt711.h`):
+/// power D0, set FSM control to manual calibration mode
+/// (`RT711_CALI_CTL`), trigger the DAC DC-offset calibration
+/// behind the vendor-calibration NID 0x58, poll the trigger bit
+/// until the codec clears it, set FSM control to depop mode
+/// (`RT711_DEPOP_CTL`), then power D3. `timeout_ms` bounds the
+/// poll: Linux allows up to 500 iterations ~10 ms apart (~5 s);
+/// pass that budget in production, a smaller one in tests. The
+/// poll here is deadline-bounded like [`jack_detect`] rather than
+/// sleeping 10 ms between reads as Linux does — the codec clears
+/// the bit as soon as calibration finishes either way. A
+/// transport failure aborts with its error; a poll that never
+/// completes fails `Timeout` — but the depop write and power-D3
+/// still run, exactly as Linux does (it sets depop + D3 even on
+/// `-ETIMEDOUT`).
+///
+/// Call-site note: in Linux this runs at the end of `io_init`,
+/// synchronously on the first init and as deferred work
+/// (`calibration_work`) otherwise. It is NOT part of attach-time
+/// [`io_init`]: the caller runs it as deferred work, and must
+/// serialize it against other codec access (Linux holds
+/// `calibrate_mutex`).
+pub fn rt711_calibration<T: Transport>(
+    bus: &Bus<T>,
+    dev: u8,
+    timeout_ms: u64,
+) -> Result<(), SdwError> {
+    // Power on.
+    verb_write(bus, dev, SET_AUDIO_POWER_STATE, PWRST_D0)?;
+    // Calibration manual mode: FSM_CTL = RT711_CALI_CTL.
+    index_update_bits(bus, dev, VENDOR_REG, FSM_CTL, 0xf, CALI_CTL)?;
+    // Trigger the DAC DC-offset calibration.
+    index_update_bits(
+        bus,
+        dev,
+        VENDOR_CALI,
+        DAC_DC_CALI_CTL1,
+        DAC_DC_CALI_TRIGGER as u16,
+        DAC_DC_CALI_TRIGGER as u16,
+    )?;
+    // Wait for the codec to clear the trigger bit.
+    let mut failure = None;
+    let finished = narf_scheduler::responsive_spin_until(
+        || match index_read(bus, dev, VENDOR_CALI, DAC_DC_CALI_CTL1) {
+            Ok(val) => val & DAC_DC_CALI_TRIGGER == 0,
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        },
+        Deadline::after_ms(timeout_ms),
+    );
+    let result = if let Some(error) = failure {
+        Err(error)
+    } else if !finished {
+        Err(SdwError::Timeout)
+    } else {
+        Ok(())
+    };
+    // Depop mode, then power D3 — Linux runs both even on timeout.
+    let depop = index_update_bits(bus, dev, VENDOR_REG, FSM_CTL, 0xf, DEPOP_CTL);
+    let power = verb_write(bus, dev, SET_AUDIO_POWER_STATE, PWRST_D3);
+    result.and(depop).and(power)
 }
 
 /// Arm jack detection (`rt711_jack_init`): power D0, enable
@@ -555,7 +644,12 @@ mod tests {
     /// Linux's `rt711_sdw_read` relies on, modelled from the
     /// driver, not from this module's code: the pending response
     /// is set by the *operation issued*, and the per-index values
-    /// are test inputs.
+    /// are test inputs, keyed by (NID, index) — the calibration
+    /// registers live behind NID 0x58, the rest behind 0x20.
+    /// `cali_clear_after` models the codec clearing the DAC
+    /// DC-offset calibration trigger bit: after that many reads
+    /// of the calibration control register, the trigger bit in
+    /// the pending response clears; `None` means it never clears.
     #[derive(Debug)]
     struct FakeTransport {
         regs: IrqSafeSpinLock<BTreeMap<u32, u8>>,
@@ -563,9 +657,11 @@ mod tests {
         pin_sense: IrqSafeSpinLock<u32>,
         pin_sense_after_first: IrqSafeSpinLock<Option<u32>>,
         pin_sense_reads: IrqSafeSpinLock<u32>,
-        index_values: IrqSafeSpinLock<BTreeMap<u8, u32>>,
+        index_values: IrqSafeSpinLock<BTreeMap<(u8, u8), u32>>,
         pending: IrqSafeSpinLock<u32>,
         last_index: IrqSafeSpinLock<u8>,
+        cali_reads: IrqSafeSpinLock<u32>,
+        cali_clear_after: IrqSafeSpinLock<Option<u32>>,
     }
 
     impl FakeTransport {
@@ -579,32 +675,40 @@ mod tests {
                 index_values: IrqSafeSpinLock::new(BTreeMap::new()),
                 pending: IrqSafeSpinLock::new(0),
                 last_index: IrqSafeSpinLock::new(0),
+                cali_reads: IrqSafeSpinLock::new(0),
+                cali_clear_after: IrqSafeSpinLock::new(None),
             }
         }
         fn log(&self) -> Vec<Xfer> {
             self.log.lock().clone()
         }
-        /// Collect the (index, value) pairs of every index write
-        /// in the log, in order: an index write is the four-transfer
-        /// pattern [W(0x7520,0), W(0x85a0,idx), W(0x7420,hi),
-        /// W(0x84a0,lo)].
-        fn index_writes(&self) -> Vec<(u8, u16)> {
+        /// Collect the (NID, index, value) triples of every index
+        /// write in the log, in order: an index write is the
+        /// four-transfer pattern [W(0x75nn,0), W(0x85nn,idx),
+        /// W(0x74nn,hi), W(0x84nn,lo)] where nn is the NID with
+        /// bit 7 set on the low registers.
+        fn index_writes(&self) -> Vec<(u8, u8, u16)> {
             let log = self.log();
             let mut out = Vec::new();
             let mut i = 0;
             while i + 3 < log.len() {
-                if log[i] == w(1, 0x7520, 0)
-                    && log[i + 1].addr == 0x85a0
+                let nid = (log[i].addr & 0x7f) as u8;
+                if log[i].addr & 0xff00 == 0x7500
+                    && log[i].write == Some(0)
+                    && log[i + 1].addr & 0xff00 == 0x8500
+                    && (log[i + 1].addr & 0x7f) as u8 == nid
                     && log[i + 1].write.is_some()
-                    && log[i + 2].addr == 0x7420
+                    && log[i + 2].addr & 0xff00 == 0x7400
+                    && (log[i + 2].addr & 0x7f) as u8 == nid
                     && log[i + 2].write.is_some()
-                    && log[i + 3].addr == 0x84a0
+                    && log[i + 3].addr & 0xff00 == 0x8400
+                    && (log[i + 3].addr & 0x7f) as u8 == nid
                     && log[i + 3].write.is_some()
                 {
                     let idx = log[i + 1].write.unwrap();
                     let hi = log[i + 2].write.unwrap() as u16;
                     let lo = log[i + 3].write.unwrap() as u16;
-                    out.push((idx, (hi << 8) | lo));
+                    out.push((nid, idx, (hi << 8) | lo));
                     i += 4;
                 } else {
                     i += 1;
@@ -623,12 +727,29 @@ mod tests {
                 }
             }
             if let Some(value) = write {
-                if addr == 0x85a0 {
+                if addr & 0xff00 == 0x8500 {
                     *self.last_index.lock() = value;
                 }
-                if addr == 0xaca0 {
+                if addr & 0xff00 == 0xac00 {
+                    let nid = (addr & 0x7f) as u8;
                     let idx = *self.last_index.lock();
-                    let response = self.index_values.lock().get(&idx).copied().unwrap_or(0);
+                    let mut response = self
+                        .index_values
+                        .lock()
+                        .get(&(nid, idx))
+                        .copied()
+                        .unwrap_or(0);
+                    // The codec clears the calibration trigger bit
+                    // when DAC DC-offset calibration finishes.
+                    if nid == VENDOR_CALI && idx == DAC_DC_CALI_CTL1 {
+                        let mut reads = self.cali_reads.lock();
+                        *reads += 1;
+                        if let Some(clear_after) = *self.cali_clear_after.lock() {
+                            if *reads > clear_after {
+                                response &= !DAC_DC_CALI_TRIGGER;
+                            }
+                        }
+                    }
                     *self.pending.lock() = response;
                 }
                 if addr == 0xb921 {
@@ -709,7 +830,10 @@ mod tests {
 
     fn index_read_write_update_bits() -> TestResult {
         let transport = FakeTransport::new();
-        transport.index_values.lock().insert(0x09, 0x0000_2002);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x09), 0x0000_2002);
         let bus = Bus::new(transport);
         // One index write: index-high 0, index-low, data-high,
         // data-low.
@@ -935,10 +1059,10 @@ mod tests {
         }
         if bus.transport().index_writes()
             != [
-                (0x10, 0x2420),
-                (0x19, 0x2e11),
-                (0x09, 0x0402),
-                (0x11, 0x0400),
+                (VENDOR_REG, 0x10, 0x2420),
+                (VENDOR_REG, 0x19, 0x2e11),
+                (VENDOR_REG, 0x09, 0x0402),
+                (VENDOR_REG, 0x11, 0x0400),
             ]
         {
             return TestResult::Fail("JD2_100k index writes mismatch");
@@ -949,12 +1073,12 @@ mod tests {
         }
         if bus.transport().index_writes()
             != [
-                (0x10, 0x2420),
-                (0x19, 0x2e11),
-                (0x08, 0x0000),
-                (0x09, 0x0402),
-                (0x0b, 0x000a),
-                (0x11, 0x0400),
+                (VENDOR_REG, 0x10, 0x2420),
+                (VENDOR_REG, 0x19, 0x2e11),
+                (VENDOR_REG, 0x08, 0x0000),
+                (VENDOR_REG, 0x09, 0x0402),
+                (VENDOR_REG, 0x0b, 0x000a),
+                (VENDOR_REG, 0x11, 0x0400),
             ]
         {
             return TestResult::Fail("JD2_1p8v index writes mismatch");
@@ -968,7 +1092,10 @@ mod tests {
         // CTIA set.
         let transport = FakeTransport::new();
         *transport.pin_sense.lock() = 0x8000_0000;
-        transport.index_values.lock().insert(0x46, 0x0000_0a00);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0a00);
         let bus = Bus::new(transport);
         if jack_detect(&bus, 1, 5000) != Ok(JackState::Headset) {
             return TestResult::Fail("headset detect mismatch");
@@ -994,7 +1121,10 @@ mod tests {
         // Headphone: status + TRS set.
         let transport = FakeTransport::new();
         *transport.pin_sense.lock() = 0x8000_0000;
-        transport.index_values.lock().insert(0x46, 0x0000_0c00);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0c00);
         let bus = Bus::new(transport);
         if jack_detect(&bus, 1, 5000) != Ok(JackState::Headphone) {
             return TestResult::Fail("headphone detect mismatch");
@@ -1026,7 +1156,10 @@ mod tests {
         let transport = FakeTransport::new();
         *transport.pin_sense.lock() = 0x8000_0000;
         *transport.pin_sense_after_first.lock() = Some(0x0000_0000);
-        transport.index_values.lock().insert(0x46, 0x0000_0000);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0000);
         let bus = Bus::new(transport);
         if jack_detect(&bus, 1, 5000) != Ok(JackState::Out) {
             return TestResult::Fail("mid-detect removal must report Out");
@@ -1034,7 +1167,10 @@ mod tests {
         // Timeout: attached, but the auto-detect status never sets.
         let transport = FakeTransport::new();
         *transport.pin_sense.lock() = 0x8000_0000;
-        transport.index_values.lock().insert(0x46, 0x0000_0000);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0000);
         let bus = Bus::new(transport);
         if jack_detect(&bus, 1, 10) != Err(SdwError::Timeout) {
             return TestResult::Fail("stuck auto-detect must time out");
@@ -1042,6 +1178,96 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire-rt711", jack_detect_removal_and_timeout);
+
+    fn calibration_conversation() -> TestResult {
+        let transport = FakeTransport::new();
+        // FSM_CTL starts in depop mode (0x3): the manual-mode
+        // update must clear the low nibble, and the depop update
+        // must land 0x3 again. The calibration trigger bit is set
+        // until the first poll read.
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, FSM_CTL), 0x0000_0003);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_CALI, DAC_DC_CALI_CTL1), DAC_DC_CALI_TRIGGER);
+        *transport.cali_clear_after.lock() = Some(0);
+        let bus = Bus::new(transport);
+        if rt711_calibration(&bus, 1, 5000) != Ok(()) {
+            return TestResult::Fail("calibration failed");
+        }
+        // Power D0 first, power D3 last.
+        let log = bus.transport().log();
+        if log.first() != Some(&w(1, 0x3501, 0x00)) || log.last() != Some(&w(1, 0x3501, 0x03)) {
+            return TestResult::Fail("calibration power framing mismatch");
+        }
+        // Manual mode (FSM_CTL = 0), trigger (CALI_CTL1 = trigger
+        // bit), depop mode (FSM_CTL = 3) — in that order.
+        if bus.transport().index_writes()
+            != [
+                (VENDOR_REG, FSM_CTL, CALI_CTL),
+                (VENDOR_CALI, DAC_DC_CALI_CTL1, DAC_DC_CALI_TRIGGER as u16),
+                (VENDOR_REG, FSM_CTL, DEPOP_CTL),
+            ]
+        {
+            return TestResult::Fail("calibration index writes mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire-rt711", calibration_conversation);
+
+    fn calibration_completes_after_polls() -> TestResult {
+        let transport = FakeTransport::new();
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, FSM_CTL), 0x0000_0003);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_CALI, DAC_DC_CALI_CTL1), DAC_DC_CALI_TRIGGER);
+        *transport.cali_clear_after.lock() = Some(2);
+        let bus = Bus::new(transport);
+        if rt711_calibration(&bus, 1, 5000) != Ok(()) {
+            return TestResult::Fail("calibration must complete after polls");
+        }
+        // One pre-read for the trigger update-bits plus two poll
+        // reads: the trigger clears on the second poll.
+        if *bus.transport().cali_reads.lock() != 3 {
+            return TestResult::Fail("calibration poll count mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire-rt711", calibration_completes_after_polls);
+
+    fn calibration_timeout_still_depops() -> TestResult {
+        let transport = FakeTransport::new();
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, FSM_CTL), 0x0000_0003);
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_CALI, DAC_DC_CALI_CTL1), DAC_DC_CALI_TRIGGER);
+        // No clear-after: the trigger bit never clears.
+        let bus = Bus::new(transport);
+        if rt711_calibration(&bus, 1, 10) != Err(SdwError::Timeout) {
+            return TestResult::Fail("stuck calibration must time out");
+        }
+        // Depop + power-D3 still ran after the timeout.
+        let log = bus.transport().log();
+        if log.last() != Some(&w(1, 0x3501, 0x03)) {
+            return TestResult::Fail("timed-out calibration must still power D3");
+        }
+        if bus.transport().index_writes().last() != Some(&(VENDOR_REG, FSM_CTL, DEPOP_CTL)) {
+            return TestResult::Fail("timed-out calibration must still set depop mode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire-rt711", calibration_timeout_still_depops);
 
     fn clock_config_mapping() -> TestResult {
         // `rt711_clock_config`'s table, keyed on `curr_dr_freq`:
