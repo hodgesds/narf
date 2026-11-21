@@ -140,8 +140,12 @@ pub unsafe fn cmdline(info_ptr: usize) -> Option<&'static [u8]> {
     if hdr.magic != MAGIC || hdr._cmdline == 0 {
         return None;
     }
-    // SAFETY: PVH spec; bound the scan at 512 bytes.
-    Some(unsafe { read_cstr(hdr._cmdline as usize, 512) })
+    // The PVH ABI sets no length; Linux's PVH entry hands
+    // `cmdline_paddr` to the `COMMAND_LINE_SIZE` copy every boot protocol
+    // uses, so the scan runs as far as the kernel's buffer and the store
+    // keeps `CMDLINE_CAP - 1` of it.
+    // SAFETY: PVH spec; the scan is bounded at the kernel's buffer.
+    Some(unsafe { read_cstr(hdr._cmdline as usize, super::CMDLINE_CAP) })
 }
 
 /// Read a NUL-terminated ASCII string from phys + bound the
