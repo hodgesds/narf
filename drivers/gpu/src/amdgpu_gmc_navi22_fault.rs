@@ -155,3 +155,56 @@ impl core::fmt::Display for StatusLine {
         )
     }
 }
+
+/// One hub context's programmed registers, read back for a fault report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextRegs {
+    /// `*VM_CONTEXTn_CNTL`.
+    pub cntl: u32,
+    /// `*VM_CONTEXTn_PAGE_TABLE_BASE_ADDR_LO32/HI32`.
+    pub base: u64,
+    /// `*VM_CONTEXTn_PAGE_TABLE_START_ADDR` / `_END_ADDR` (page numbers).
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Why a lent client VMID faulted, as far as the CPU can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultCause {
+    /// No registered address space holds the IV's PASID.
+    NoSpace,
+    /// The client's VM maps nothing at the address.
+    Unmapped,
+    /// Mapped, but the client's tables do not translate the address.
+    NotTranslated,
+    /// The faulting hub's context is disabled.
+    ContextDisabled,
+    /// The address lies outside the context's START..=END range.
+    ContextRange,
+    /// The faulting hub's context does not point at the client's root: the
+    /// job's VM flush did not land there.
+    ContextElsewhere,
+    /// Mapped, translated by the client's tables, and the faulting hub's
+    /// context points at their root: the hub cannot walk what the CPU wrote.
+    HubWalk,
+}
+
+/// Evidence for one fault on a lent client VMID: both hubs' context
+/// registers for the VMID (faulting hub first) and what the client's
+/// address space holds at the address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientFaultReport {
+    pub fault: super::Fault,
+    pub contexts: Option<[(Hub, ContextRegs); 2]>,
+    pub space: Option<crate::amdgpu_vm::FaultVa>,
+}
+impl ClientFaultReport {
+    pub fn cause(&self) -> Option<FaultCause> {
+        None
+    }
+}
+impl core::fmt::Display for ClientFaultReport {
+    fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Ok(())
+    }
+}
