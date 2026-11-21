@@ -585,3 +585,90 @@ pub fn kernel_rsp0() -> u64 {
             .read_unaligned()
     }
 }
+
+// ── Linux GDT layout (IA-32 emulation) ─────────────────────────────
+//
+// `arch/x86/include/asm/segment.h` (64-bit): 16 descriptors, the 32-bit user
+// code segment `__USER32_CS` at index 4 (0x23), `__USER_DS` at 5 (0x2b),
+// `__USER_CS` at 6 (0x33), the TSS at 8–9 (`GDT_ENTRY_TSS`) and the three
+// TLS slots `set_thread_area` hands out at 12–14 (selectors 0x63/0x6b/0x73).
+// NARF keeps its own kernel selectors (0x08 code, 0x10 data; the IDT and
+// `IA32_STAR` name them) — they are not user-visible.
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// The live GDTR (`SGDT`): `(limit, base)`.
+fn live_gdtr() -> (u16, u64) {
+    let mut image = [0u8; 10];
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: SGDT stores the 10-byte GDTR image into `image`, which is
+    // writable for 10 bytes; CPL0, no other side effect.
+    unsafe {
+        asm!("sgdt [{p}]", p = in(reg) image.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+    let mut base = [0u8; 8];
+    base.copy_from_slice(&image[2..10]);
+    (
+        u16::from_le_bytes([image[0], image[1]]),
+        u64::from_le_bytes(base),
+    )
+}
+
+/// The live task-register selector (`STR`).
+fn live_tr() -> u16 {
+    let tr: u16;
+    // SAFETY: STR copies the task-register selector into a register; it has
+    // no memory operand and no side effect.
+    unsafe {
+        asm!("str {t:x}", t = out(reg) tr, options(nomem, nostack, preserves_flags));
+    }
+    tr
+}
+
+/// The running CPU's GDT matches Linux's index layout: 16 entries, the TSS
+/// in TR at 0x40, `__USER32_CS` a flat DPL-3 32-bit code segment at index
+/// 4, user data and 64-bit user code at 5 and 6, and the unused slots empty.
+fn smoke_ia32_gdt_matches_linux_layout() -> TestResult {
+    // The CPU sets a code/data descriptor's accessed bit when it loads it.
+    const ACCESSED: u64 = 1 << 40;
+    let (limit, base) = live_gdtr();
+    if usize::from(limit) + 1 != 16 * 8 {
+        return TestResult::Fail("GDT limit is not 16 descriptors (Linux GDT_ENTRIES)");
+    }
+    if live_tr() != 0x40 {
+        return TestResult::Fail("TR is not the GDT_ENTRY_TSS selector 0x40");
+    }
+    let gdt = base as *const u64;
+    let desc = |i: usize| -> u64 {
+        // SAFETY: SGDT returned the live table and its limit covers 16
+        // descriptors (checked above); `i` is below 16 at every call.
+        unsafe { core::ptr::read_volatile(gdt.add(i)) }
+    };
+    if desc(1) & !ACCESSED != 0x00af_9a00_0000_ffff {
+        return TestResult::Fail("kernel code (0x08) is not a long-mode DPL-0 code segment");
+    }
+    if desc(2) & !ACCESSED != 0x00cf_9200_0000_ffff {
+        return TestResult::Fail("kernel data (0x10) is not a DPL-0 data segment");
+    }
+    if desc(4) & !ACCESSED != 0x00cf_fa00_0000_ffff {
+        return TestResult::Fail("__USER32_CS (0x23) is not a flat DPL-3 32-bit code segment");
+    }
+    if desc(5) & !ACCESSED != 0x00cf_f200_0000_ffff {
+        return TestResult::Fail("__USER_DS (0x2b) is not a flat DPL-3 data segment");
+    }
+    if desc(6) & !ACCESSED != 0x00af_fa00_0000_ffff {
+        return TestResult::Fail("__USER_CS (0x33) is not a long-mode DPL-3 code segment");
+    }
+    // Index 8: a present, busy 64-bit TSS (LTR marks it busy, type 0xB).
+    let tss_lo = desc(8);
+    if (tss_lo >> 40) & 0xF != 0xB || tss_lo & (1 << 47) == 0 {
+        return TestResult::Fail("GDT entry 8 is not the loaded 64-bit TSS");
+    }
+    for unused in [3usize, 7, 10, 11, 15] {
+        if desc(unused) != 0 {
+            return TestResult::Fail("an unused GDT slot (3, 7, 10, 11, 15) is not empty");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/ia32-gdt", smoke_ia32_gdt_matches_linux_layout);

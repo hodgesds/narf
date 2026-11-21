@@ -688,3 +688,35 @@ kernel_test_in!(
     "frame/x86_64",
     smoke_x86_64_sysret_noncanonical_rips_rewritten_to_zero
 );
+
+/// `IA32_CSTAR` is where an AMD CPU sends `syscall` executed in
+/// compatibility mode (Intel raises #UD there). With a 32-bit user code
+/// segment in the GDT any task can reach compatibility mode, so CSTAR must
+/// name a landing pad, never 0 (a CPL-0 jump to RIP 0 on the user stack).
+/// Linux without a compat SYSCALL entry uses `ignore_sysret`: return
+/// -ENOSYS in eax with `sysretl`, touching neither the stack nor GS.
+fn smoke_ia32_cstar_returns_enosys_to_compat_caller() -> TestResult {
+    const IA32_CSTAR: u32 = 0xC000_0083;
+    // `mov eax, -38` (ENOSYS); `sysretl` (0F 07 without REX.W).
+    const IGNORE_SYSRET: [u8; 7] = [0xB8, 0xDA, 0xFF, 0xFF, 0xFF, 0x0F, 0x07];
+    // SAFETY: RDMSR of an architectural MSR at CPL0.
+    let cstar = unsafe { msr::rdmsr(IA32_CSTAR) };
+    if cstar == 0 {
+        return TestResult::Fail("IA32_CSTAR is 0: a compat-mode SYSCALL jumps to RIP 0 at CPL0");
+    }
+    let code = cstar as *const u8;
+    let mut bytes = [0u8; 7];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: CSTAR names kernel text, mapped readable; the landing pad
+        // is at least these seven bytes long.
+        *byte = unsafe { core::ptr::read_volatile(code.add(i)) };
+    }
+    if bytes != IGNORE_SYSRET {
+        return TestResult::Fail("IA32_CSTAR does not land on the -ENOSYS sysretl stub");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/ia32-gdt",
+    smoke_ia32_cstar_returns_enosys_to_compat_caller
+);
