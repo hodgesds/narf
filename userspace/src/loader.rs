@@ -284,6 +284,11 @@ pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
 ) -> Result<(u64, PageInPlan), LoadBytesError> {
     let image = crate::elf::parse_from(src)?;
+    // See `load_elf_bytes_file`: no address space is laid out for an i386
+    // image yet, so neither a program nor an interpreter may be ELF32.
+    if image.is_compat32() {
+        return Err(LoadBytesError::Elf(crate::ElfError::Not64Bit));
+    }
     // SAFETY: forwarding this function's own contract.
     unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
 }
@@ -725,6 +730,12 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     // load addresses in its PT_LOAD vaddrs (NARF expects those in
     // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
     let image = crate::elf::parse_from(src)?;
+    // The parser accepts an i386 ELF32 image for the IA-32 compat ABI, but
+    // such an image can only be loaded into an address space laid out for a
+    // 32-bit task. Until that layout exists it stays ENOEXEC, as before.
+    if image.is_compat32() {
+        return Err(LoadBytesError::Elf(crate::ElfError::Not64Bit));
+    }
     // An image is placed inside one PML4 slot. Check it fits before mapping
     // anything: VA that falls outside the slot is either another mapping's or,
     // on the old slot-1 layout, kernel MMIO — and a region mapped there faults

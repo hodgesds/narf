@@ -1,7 +1,7 @@
-//! ELF64 parser.
+//! ELF64 and (x86_64) i386 ELF32 parser.
 //!
 //! Spec: `userspace/specification/spec.md`. Turns a byte slice
-//! holding an ELF64 executable into an `ExecImage` populated with
+//! holding an ELF executable into an `ExecImage` populated with
 //! every `PT_LOAD` program header. Downstream the loader walks
 //! `image.segments`, draws physical frames from the allocator, and
 //! calls `AddressSpace::map_region` + `materialize` to install PTEs.
@@ -12,8 +12,13 @@
 //! - Little-endian only (matches both x86_64 and aarch64 targets).
 //! - Recognises the `PT_INTERP` header and stores the interpreter
 //!   path so the dynamic-linker entry point can be located later.
-//! - Rejects 32-bit ELFs, non-ELF magic, and byte slices too short
-//!   for the declared header offsets.
+//! - On x86_64, an ELFCLASS32 image naming EM_386/EM_486 parses into an
+//!   `Elf32Exec`/`Elf32Dyn` image for the IA-32 compat ABI, as Linux's
+//!   `fs/compat_binfmt_elf.c` (`binfmt_elf.c` built for Elf32, gated by
+//!   `compat_elf_check_arch`) accepts it. Every other ELFCLASS32 image —
+//!   x32 among them — is `Not64Bit`.
+//! - Rejects non-ELF magic and byte slices too short for the declared
+//!   header offsets.
 //!
 //! Not covered yet (Stage-4+):
 //! - Section-header walk (we only need program headers for load).
@@ -38,8 +43,16 @@ const EI_MAG3: usize = 3;
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
 
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+
+/// `elf_check_arch_ia32` (`arch/x86/include/asm/elf.h`): the two machines an
+/// IA-32 ELF32 image may name.
+#[cfg(target_arch = "x86_64")]
+const EM_386: u16 = 3;
+#[cfg(target_arch = "x86_64")]
+const EM_486: u16 = 6;
 
 // `e_machine` values. The loader accepts only the machine it is running
 // on: an ELF built for another architecture is not executable here, and
@@ -102,6 +115,9 @@ const PF_R: u32 = 1 << 2;
 pub enum ElfError {
     TooShort,
     BadMagic,
+    /// Neither an ELFCLASS64 image nor an ELFCLASS32 image this kernel runs
+    /// under its compat ABI (x86_64 runs i386 EM_386/EM_486; x32 and every
+    /// other 32-bit machine are refused, as by `compat_elf_check_arch`).
     Not64Bit,
     NotLittleEndian,
     BadType,
@@ -198,7 +214,98 @@ impl ExecBytes for &[u8] {
     }
 }
 
-/// Parse an ELF64 little-endian executable into an `ExecImage`.
+/// ELF file class (`e_ident[EI_CLASS]`) a parse is decoding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Class {
+    Elf32,
+    Elf64,
+}
+
+/// One program header, widened to the ELF64 field types whatever its class.
+#[derive(Copy, Clone, Debug)]
+struct Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+impl Class {
+    /// `sizeof(ElfN_Phdr)`.
+    const fn phentsize(self) -> usize {
+        match self {
+            Class::Elf32 => 32,
+            Class::Elf64 => 56,
+        }
+    }
+
+    /// `sizeof(ElfN_Dyn)`.
+    const fn dynsize(self) -> usize {
+        match self {
+            Class::Elf32 => 8,
+            Class::Elf64 => 16,
+        }
+    }
+
+    /// Decode the program header at `off` in `tab`. `Elf32_Phdr` is not
+    /// `Elf64_Phdr` with narrower fields: its `p_flags` follows `p_memsz`
+    /// (offset 24) instead of `p_type` (offset 4).
+    fn phdr(self, tab: &[u8], off: usize) -> Phdr {
+        match self {
+            Class::Elf64 => Phdr {
+                p_type: read_u32(tab, off),
+                p_flags: read_u32(tab, off + 0x04),
+                p_offset: read_u64(tab, off + 0x08),
+                p_vaddr: read_u64(tab, off + 0x10),
+                p_filesz: read_u64(tab, off + 0x20),
+                p_memsz: read_u64(tab, off + 0x28),
+                p_align: read_u64(tab, off + 0x30),
+            },
+            Class::Elf32 => Phdr {
+                p_type: read_u32(tab, off),
+                p_offset: u64::from(read_u32(tab, off + 0x04)),
+                p_vaddr: u64::from(read_u32(tab, off + 0x08)),
+                p_filesz: u64::from(read_u32(tab, off + 0x10)),
+                p_memsz: u64::from(read_u32(tab, off + 0x14)),
+                p_flags: read_u32(tab, off + 0x18),
+                p_align: u64::from(read_u32(tab, off + 0x1C)),
+            },
+        }
+    }
+
+    /// One `ElfN_Dyn { d_tag, d_val }` at `off`. The 32-bit tag is an
+    /// `Elf32_Sword`, so it is sign-extended into [`DynEntry::tag`].
+    fn dyn_entry(self, buf: &[u8], off: usize) -> (i64, u64) {
+        match self {
+            Class::Elf64 => (read_i64(buf, off), read_u64(buf, off + 8)),
+            Class::Elf32 => (
+                i64::from(read_u32(buf, off) as i32),
+                u64::from(read_u32(buf, off + 4)),
+            ),
+        }
+    }
+}
+
+/// `elf_check_arch_ia32`: may an ELFCLASS32 image naming `machine` run here?
+/// Only on x86_64, whose IA-32 compat ABI runs i386 programs.
+#[inline]
+fn compat32_machine(machine: u16) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        machine == EM_386 || machine == EM_486
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = machine;
+        false
+    }
+}
+
+/// Parse an ELF64 (or, on x86_64, an i386 ELF32) little-endian executable
+/// into an `ExecImage`.
 /// `argv` / `envp` / `aux` on the returned image are left empty —
 /// the caller fills those in before handing the image to the
 /// loader.
@@ -226,17 +333,34 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
     {
         return Err(ElfError::BadMagic);
     }
-    if ehdr[EI_CLASS] != ELFCLASS64 {
-        return Err(ElfError::Not64Bit);
-    }
+    // ELFCLASS64 is the native class. ELFCLASS32 is an IA-32 program for the
+    // compat ABI — on x86_64 only, and only for EM_386/EM_486 (checked
+    // below); everything else is not a 64-bit image this kernel runs.
+    let class = match ehdr[EI_CLASS] {
+        ELFCLASS64 => Class::Elf64,
+        ELFCLASS32 => Class::Elf32,
+        _ => return Err(ElfError::Not64Bit),
+    };
     if ehdr[EI_DATA] != ELFDATA2LSB {
         return Err(ElfError::NotLittleEndian);
     }
 
+    // `e_type` and `e_machine` sit at the same offsets in both classes.
     let e_type = read_u16(ehdr, 0x10);
-    let kind = match e_type {
-        ET_EXEC => ExecKind::Elf64Exec,
-        ET_DYN => ExecKind::Elf64Dyn,
+    let e_machine = read_u16(ehdr, 0x12);
+    // `compat_elf_check_arch`: an ELFCLASS32 image is runnable only as an
+    // IA-32 program. x32 (ELFCLASS32 EM_X86_64) needs CONFIG_X86_X32_ABI,
+    // which NARF does not provide, so it stays `Not64Bit` like any other
+    // 32-bit image.
+    if class == Class::Elf32 && !compat32_machine(e_machine) {
+        return Err(ElfError::Not64Bit);
+    }
+
+    let kind = match (e_type, class) {
+        (ET_EXEC, Class::Elf64) => ExecKind::Elf64Exec,
+        (ET_DYN, Class::Elf64) => ExecKind::Elf64Dyn,
+        (ET_EXEC, Class::Elf32) => ExecKind::Elf32Exec,
+        (ET_DYN, Class::Elf32) => ExecKind::Elf32Dyn,
         _ => return Err(ElfError::BadType),
     };
 
@@ -245,32 +369,44 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
     // the entry point is a valid mapped address, and the process dies on
     // the first foreign instruction instead of being rejected up front.
     // The module loader already enforces the equivalent for ET_REL.
-    let e_machine = read_u16(ehdr, 0x12);
-    if e_machine != EM_NATIVE {
+    if class == Class::Elf64 && e_machine != EM_NATIVE {
         return Err(ElfError::WrongMachine);
     }
 
-    let e_entry = read_u64(ehdr, 0x18);
-    let e_phoff = read_u64(ehdr, 0x20);
-    let e_phentsize = read_u16(ehdr, 0x36);
-    let e_phnum = read_u16(ehdr, 0x38);
+    // `Elf64_Ehdr` and `Elf32_Ehdr` diverge from `e_entry` on: the 32-bit
+    // header's addresses and offsets are 4 bytes wide.
+    let (e_entry, e_phoff, e_phentsize, e_phnum) = match class {
+        Class::Elf64 => (
+            read_u64(ehdr, 0x18),
+            read_u64(ehdr, 0x20),
+            read_u16(ehdr, 0x36),
+            read_u16(ehdr, 0x38),
+        ),
+        Class::Elf32 => (
+            u64::from(read_u32(ehdr, 0x18)),
+            u64::from(read_u32(ehdr, 0x1C)),
+            read_u16(ehdr, 0x2A),
+            read_u16(ehdr, 0x2C),
+        ),
+    };
 
     let phoff = e_phoff as usize;
     let entsize = e_phentsize as usize;
     let phnum = e_phnum as usize;
 
     // Program-header table sanity, matching Linux's `load_elf_phdrs()`:
-    //   * `e_phentsize` must be exactly `sizeof(Elf64_Phdr)`. Accepting a
-    //     larger stride parses a table shape no toolchain emits and no other
-    //     loader would agree with.
+    //   * `e_phentsize` must be exactly `sizeof(struct elf_phdr)` for the
+    //     class (56 for Elf64, 32 for Elf32). Accepting a larger stride
+    //     parses a table shape no toolchain emits and no other loader would
+    //     agree with.
     //   * at least one program header, and no more than fit in Linux's
-    //     64 KiB table cap — `65536 / 56 == 1170`. This also keeps the
-    //     0xFFFF PN_XNUM sentinel out: Linux does not implement PN_XNUM
-    //     for executables either (it is a section-count escape), so a
+    //     64 KiB table cap — `65536 / 56 == 1170` (2048 for Elf32). This also
+    //     keeps the 0xFFFF PN_XNUM sentinel out: Linux does not implement
+    //     PN_XNUM for executables either (it is a section-count escape), so a
     //     binary using it is rejected rather than silently mis-parsed.
-    const PHENTSIZE64: usize = 56;
-    const MAX_PHNUM: usize = 65536 / PHENTSIZE64;
-    if entsize != PHENTSIZE64 || !(1..=MAX_PHNUM).contains(&phnum) {
+    let phentsize = class.phentsize();
+    let max_phnum = 65536 / phentsize;
+    if entsize != phentsize || !(1..=max_phnum).contains(&phnum) {
         return Err(ElfError::BadPhoff);
     }
     let ph_table_end = phoff
@@ -299,13 +435,15 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
     let mut max_align: u64 = 4096;
 
     for i in 0..phnum {
-        let off = i * entsize;
-        let p_type = read_u32(&phtab, off);
-        let p_flags = read_u32(&phtab, off + 0x04);
-        let p_offset = read_u64(&phtab, off + 0x08);
-        let p_vaddr = read_u64(&phtab, off + 0x10);
-        let p_filesz = read_u64(&phtab, off + 0x20);
-        let p_memsz = read_u64(&phtab, off + 0x28);
+        let Phdr {
+            p_type,
+            p_flags,
+            p_offset,
+            p_vaddr,
+            p_filesz,
+            p_memsz,
+            p_align,
+        } = class.phdr(&phtab, i * entsize);
 
         match p_type {
             PT_LOAD => {
@@ -319,9 +457,8 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 // `maximum_alignment()` in `fs/binfmt_elf.c`: take the largest
                 // alignment any PT_LOAD asks for, skipping non-powers-of-two as
                 // malformed rather than rejecting the image over them.
-                let seg_align = read_u64(&phtab, off + 0x30);
-                if seg_align > max_align && seg_align.is_power_of_two() {
-                    max_align = seg_align;
+                if p_align > max_align && p_align.is_power_of_two() {
+                    max_align = p_align;
                 }
                 let mut flags = SegmentFlags::default();
                 if p_flags & PF_R != 0 {
@@ -343,9 +480,9 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
             }
             PT_DYNAMIC => {
                 // Walk the array of `Elf64_Dyn { d_tag: i64, d_val: u64 }`
-                // entries (16 bytes each). The terminator is DT_NULL (0).
-                // We capture every tag here verbatim so the loader
-                // (which knows which DT_* it cares about) can match
+                // entries (16 bytes each; `Elf32_Dyn` is 8). The terminator
+                // is DT_NULL (0). We capture every tag here verbatim so the
+                // loader (which knows which DT_* it cares about) can match
                 // against a flat list rather than re-parsing.
                 let end = p_offset
                     .checked_add(p_filesz)
@@ -353,7 +490,8 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 if end > image_size {
                     return Err(ElfError::DynamicOutOfBounds);
                 }
-                if p_filesz % 16 != 0 {
+                let dynsize = class.dynsize();
+                if p_filesz % dynsize as u64 != 0 {
                     return Err(ElfError::DynamicOutOfBounds);
                 }
                 let span = usize::try_from(p_filesz).map_err(|_| ElfError::DynamicOutOfBounds)?;
@@ -364,10 +502,9 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 src.read_exact_at(p_offset, &mut buf)
                     .map_err(|_| ElfError::DynamicOutOfBounds)?;
                 let mut cur = 0usize;
-                while cur + 16 <= span {
-                    let tag = read_i64(&buf, cur);
-                    let val = read_u64(&buf, cur + 8);
-                    cur += 16;
+                while cur + dynsize <= span {
+                    let (tag, val) = class.dyn_entry(&buf, cur);
+                    cur += dynsize;
                     if tag == 0 {
                         break;
                     } // DT_NULL terminator.
@@ -382,7 +519,6 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 if tls.is_some() {
                     return Err(ElfError::MultiplePtTls);
                 }
-                let p_align = read_u64(&phtab, off + 0x30);
                 // Spec: p_align == 0 or 1 means "no alignment
                 // requirement" — normalise to 1 so callers can rely on
                 // the field being a non-zero power of two.
@@ -456,7 +592,12 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 // for nothing during load either: properties come from
                 // PT_GNU_PROPERTY, which is a separate header.
             }
-            PT_GNU_PROPERTY => {
+            // Only the native class carries properties NARF enforces. Linux on
+            // x86 does not select ARCH_USE_GNU_PROPERTY, so
+            // `parse_elf_properties` returns before reading the note for
+            // either class; an i386 image's note (4-byte aligned in ELF32)
+            // is ignored the same way here.
+            PT_GNU_PROPERTY if class == Class::Elf64 => {
                 property_span = Some((p_offset, p_filesz));
             }
             _ => { /* other PT_* ignored at this tier */ }

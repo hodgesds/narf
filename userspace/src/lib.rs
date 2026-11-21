@@ -501,6 +501,26 @@ impl CapType for Process {
 pub enum ExecKind {
     Elf64Exec,
     Elf64Dyn,
+    /// ELFCLASS32 i386 `ET_EXEC`, run under the IA-32 compat ABI (x86_64).
+    Elf32Exec,
+    /// ELFCLASS32 i386 `ET_DYN`: a PIE program, or a loader such as
+    /// `ld-linux.so.2` run directly.
+    Elf32Dyn,
+}
+
+impl ExecKind {
+    /// `ET_DYN` of either class: the loader picks its base.
+    #[inline]
+    pub const fn is_dyn(self) -> bool {
+        matches!(self, ExecKind::Elf64Dyn | ExecKind::Elf32Dyn)
+    }
+
+    /// An i386 ELF32 image — one that runs under the IA-32 compat ABI with
+    /// a 32-bit address space (`TASK_SIZE_32`), not the native one.
+    #[inline]
+    pub const fn is_elf32(self) -> bool {
+        matches!(self, ExecKind::Elf32Exec | ExecKind::Elf32Dyn)
+    }
 }
 
 /// A single loadable segment in the final address space.
@@ -668,6 +688,12 @@ impl ExecImage {
             envp: Vec::new(),
             aux: Vec::new(),
         }
+    }
+
+    /// Does this image run under the IA-32 compat ABI (an i386 ELF32)?
+    #[inline]
+    pub const fn is_compat32(&self) -> bool {
+        self.kind.is_elf32()
     }
 }
 

@@ -2699,6 +2699,29 @@ task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
 completed read/write-family calls. Block submission retains the issuing thread
 group's storage counters across asynchronous completion and process exit.
 
+### 3.6 IA-32 compat ABI (x86_64)
+
+NARF runs i386 Linux programs the way Linux does with `CONFIG_IA32_EMULATION`
+(`fs/compat_binfmt_elf.c`, `arch/x86/entry/syscalls/syscall_32.tbl`).
+
+**ELF32 images.** `elf::parse_from` accepts, on x86_64, an ELFCLASS32
+little-endian image whose `e_machine` is EM_386 or EM_486
+(`compat_elf_check_arch`), decoding the 52-byte `Elf32_Ehdr`, 32-byte
+`Elf32_Phdr` (2048-entry cap) and 8-byte `Elf32_Dyn` (tag sign-extended) into
+the same `ExecImage`. Its kind is `ExecKind::Elf32Exec` / `Elf32Dyn`;
+`ExecKind::is_elf32`, `ExecKind::is_dyn` and `ExecImage::is_compat32` classify
+it. x32 (ELFCLASS32 EM_X86_64) and every other 32-bit image is
+`ElfError::Not64Bit`; an ELF64 header naming EM_386 is `WrongMachine`. An
+ELF32 image's `PT_GNU_PROPERTY` is not decoded (Linux x86 parses no GNU
+properties). The loader refuses an ELF32 image (`Not64Bit`, ENOEXEC from
+execve) until the 32-bit address-space layout is installed.
+
+```rust
+pub enum ExecKind { Elf64Exec, Elf64Dyn, Elf32Exec, Elf32Dyn }
+impl ExecKind { pub const fn is_dyn(self) -> bool; pub const fn is_elf32(self) -> bool; }
+impl ExecImage { pub const fn is_compat32(&self) -> bool; }
+```
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
