@@ -1577,7 +1577,11 @@ fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::Str
 /// The descriptor a `/proc/self/fd/N`, `/proc/thread-self/fd/N` or
 /// `/proc/<pid>/fd/N` link (caller view) refers to: `(owning task, N)`.
 /// `self` and `thread-self` are the caller, whose thread shares the
-/// process's table; a pid is resolved in the caller's pid namespace.
+/// process's table; a pid is resolved in the caller's pid namespace
+/// (`find_task_by_vpid`), the namespace NARF's procfs lists pids in. That is
+/// how `self` reads once resolved: a dirfd opened through `self/fd/` is
+/// `/proc/<caller's own-namespace pid>/fd`. A pid that names no task there
+/// is not a link to anything; the ordinary walk then reports it.
 fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
     let n = parse_proc_self_fd(user_path)?;
     if user_path.starts_with("/proc/self/fd/")
@@ -1589,9 +1593,9 @@ fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
         .strip_prefix("/proc/")?
         .split_once('/')?
         .0
-        .parse::<u64>()
+        .parse::<i32>()
         .ok()?;
-    Some((proc_pid_to_tid(pid), n))
+    Some((find_task_by_vpid(task, pid)?, n))
 }
 
 /// Where FOLLOWING a proc-fd magic link lands. `proc_fd_link` hands

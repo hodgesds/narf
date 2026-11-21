@@ -901,7 +901,12 @@ reads its class: `pipe:[ino]`, `socket:[ino]`, `<nstype>:[ino]`,
 `/dmabuf:`. The helpers that re-resolve a descriptor (`fd_path_for_task`: a
 `*at` directory, a reopen or `stat` through the magic link, `fexecve`) return
 a path only while it leads to the file; one whose name was removed is reached
-as an object, like one that never had a name.
+as an object, like one that never had a name. Following `/proc/<pid>/fd/<n>`
+names the descriptor of the task that `<pid>` is in the caller's PID namespace
+(`find_task_by_vpid`, the namespace procfs lists pids in), checked with
+`ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` unless it is the caller's own
+thread group. A `self/fd/` directory opened through a `/proc` fd records that
+own-namespace pid, which is how Chromium's sandbox walks it after chrooting.
 Stdin is `O_RDONLY`, stdout/stderr are
 `O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
 type-based access-mode exceptions. Sequential transfer syscalls pin these
