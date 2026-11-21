@@ -186,16 +186,25 @@ pub(super) const fn fixed() -> Keyframe {
 /// Validate dynamic encoder output bounds and parsed quant/filter/tx fields before
 /// any address publication. This does not parse or trust an arbitrary client IB.
 pub(super) fn keyframe_message(frame: Keyframe) -> Result<[u8; 3828], Error> {
-    frame.validate()?;
-    Ok(build_message(frame))
-}
-fn build_message(frame: Keyframe) -> [u8; 3828] {
     let mut out = [0; 3828];
+    keyframe_message_into(frame, &mut out)?;
+    Ok(out)
+}
+/// [`keyframe_message`] into zeroed caller storage, so a caller that patches
+/// it (the 320x128 variant) holds one 3.8 KB array. Taken by value, its frame
+/// held this one and its own whenever LLVM kept the copy, and flipped between
+/// 3896 and 8440 bytes from build to build across the kernel frame budget.
+pub(super) fn keyframe_message_into(frame: Keyframe, out: &mut [u8; 3828]) -> Result<(), Error> {
+    frame.validate()?;
+    build_message(frame, out);
+    Ok(())
+}
+fn build_message(frame: Keyframe, out: &mut [u8; 3828]) {
     for (i, w) in [40, 3828, 2, 1, HANDLE, 0, 2, 56, 188, 0, 17, 244, 3584, 0]
         .into_iter()
         .enumerate()
     {
-        put(&mut out, i * 4, w);
+        put(out, i * 4, w);
     }
     let mut dec = [0u32; 47];
     dec[0] = 19;
@@ -217,7 +226,7 @@ fn build_message(frame: Keyframe) -> [u8; 3828] {
     dec[40] = 1;
     dec[41] = 128;
     for (i, w) in dec.into_iter().enumerate() {
-        put(&mut out, 56 + i * 4, w);
+        put(out, 56 + i * 4, w);
     }
     let v = &mut out[244..];
     put(
@@ -274,7 +283,6 @@ fn build_message(frame: Keyframe) -> [u8; 3828] {
     }
     put(v, 1528, frame.tile_offset);
     put(v, 1532, frame.tile_bytes);
-    out
 }
 pub(super) fn validate(base: u64) -> Result<(), Error> {
     if base == 0 || base & 4095 != 0 || base.checked_add(BYTES).is_none_or(|end| end > 1 << 48) {

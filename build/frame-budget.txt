@@ -57,7 +57,6 @@
 8664 narf_drivers_wireless_iwlwifi::iwlwifi::device::ap::<impl narf_drivers_wireless_iwlwifi::iwlwifi::device::Device>::ap_control::{{closure}}
 8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
 8576 narf_userspace::sysvipc::sys_msgget
-8440 narf_drivers_gpu::amdgpu_vcn_navi48::av1_320_words::keyframe_message
 8360 narf_userspace::abi_test_support::with_memfs
 8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
 8296 narf_memory::compress::lz4_encode

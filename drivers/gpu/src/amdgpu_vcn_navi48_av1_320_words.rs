@@ -74,7 +74,8 @@ fn put(out: &mut [u8], at: usize, word: u32) {
 /// Same parsed fixed-sequence contract as Keyframe; the 320x128 encoder has
 /// its own sequence prefix. Caller already checked that exact sequence/tools.
 pub(super) fn keyframe_message(frame: Keyframe) -> Result<[u8; 3828], Error> {
-    let mut out = base_words::keyframe_message(frame)?;
+    let mut out = [0; 3828];
+    base_words::keyframe_message_into(frame, &mut out)?;
     for (index, value) in [
         (2, 320),
         (6, TARGET_BYTES as u32),
