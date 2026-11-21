@@ -3956,7 +3956,14 @@ mod tests {
         if amdgpu::pci_device().is_some() {
             return TestResult::Skip("physical GPU: its monitor consumes requests");
         }
+        // Start with no event owed: no DRM/HPD request pending, and no relight
+        // owed for a recovery an earlier test ran (no monitor runs here to
+        // relight after it, so `monitor_wait` would rightly end at once).
         let _ = crate::amdgpu_navi22_kms::take_pending();
+        RELIT.store(
+            crate::amdgpu_navi22_recovery::recoveries(),
+            Ordering::Release,
+        );
         for poll in [None, Some(10_000)] {
             let count = alloc::sync::Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
             let waker = core::task::Waker::from(count.clone());
