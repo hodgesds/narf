@@ -439,8 +439,22 @@ also consult upstream Linux GPL sources.
   Linux `usb_kill_urb` → `xhci_urb_dequeue` → `xhci_handle_cmd_stop_ep`. The
   first 16 timeouts per controller also log the EP0 output-context state and
   dequeue, USBSTS, PORTSC, the TD's receipts and any unmatched Transfer
-  Events for the slot. A timed-out *command* is still only retired
-  (tombstoned); Command Abort (CRCR.CA) is not issued.
+  Events for the slot.
+- A timed-out *command* abandons its receipt and aborts the command ring
+  (Linux `xhci_handle_command_timeout`): a timed-out Stop Endpoint is
+  controller-fatal (`needs_recovery()` turns true and the supervisor runs
+  `recover_controller`); otherwise, with CRCR.CRR set, CRCR.CA is written
+  (full 64-bit write naming the executing command), CRR must clear within
+  5 s and the Command Ring Stopped completion follow within 2 s, else the
+  controller is reset. Once stopped, every abandoned command still on the
+  ring is rewritten as a No Op Command TRB (cycle bit kept) and the
+  doorbell restarts the ring; new commands queue without a doorbell while
+  the abort runs. An abandoned receipt keeps its ring entry reserved until
+  the controller completes the command (normally, Command Aborted, or as
+  the No Op) or completes a later command (execution is in ring order, so
+  a lost completion cannot pin the entry), so an entry is never reused
+  while the controller may fetch it. A Command Ring Stopped completion
+  completes no receipt.
 - Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
   same as the hub-class reset) before the first SETUP, and Address Device
   waits 10 ms after its successful completion (Linux `hub_port_init`).

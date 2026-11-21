@@ -67,31 +67,52 @@ struct Command {
     pointer: u64,
     slot: u8,
     completion: Latch,
+    /// The waiter timed out and gave the receipt up (#884). The entry
+    /// stays reserved until the controller completes the command —
+    /// normally, with Command Aborted, or as the No Op it was turned
+    /// into — so the ring entry is never reused while the controller
+    /// may still fetch it, and that completion is swallowed here.
+    abandoned: bool,
+    /// Publication order: the controller executes commands in order.
+    seq: u64,
 }
 /// At most one retained receipt per physical command-ring entry.
-/// A waiter that times out retires its own receipt (#884):
-/// `retire_pointer` drops the reservation and records the TRB
-/// pointer as retired, so a Command Completion Event that arrives
-/// late for it is swallowed by `record` instead of landing in the
-/// lossy command-event queue, where it could be misattributed to
-/// the next command recycled onto the same ring entry.
-/// Re-reserving the entry clears the tombstone — a later CCE
-/// naming the pointer then belongs to the new command. Residual
-/// race, inherent to the xHCI event format: a CCE carries no
-/// sequence number, so one that arrives after re-reserve but
-/// before the new command completes is indistinguishable from the
-/// new command's own CCE.
+///
+/// A waiter that times out abandons its receipt (`retire_pointer`)
+/// instead of dropping it: the command TRB is still on the ring, and
+/// the controller executes the ring in order, so the entry cannot be
+/// reused until the controller's completion for it arrives. That
+/// completion — success, failure, Command Aborted after a ring abort,
+/// or No Op success after `cmd_abort` rewrote the TRB — is swallowed
+/// by `record` and releases the entry (Linux frees a command only on
+/// its completion; `xhci_handle_stopped_cmd_ring` turns aborted ones
+/// into No Ops so they complete).
+///
+/// A Command Ring Stopped completion (code 24) names the ring's
+/// dequeue pointer, i.e. the next command to execute, not a completed
+/// one: it never completes a receipt and is reported through
+/// [`Self::take_ring_stopped`] instead (Linux `handle_cmd_completion`
+/// completes `cmd_ring_stop_completion` and returns).
+///
+/// Commands execute in ring order, so a completion for one command
+/// proves every command published before it was executed: an abandoned
+/// one whose own completion was lost (event ring overflow) is released
+/// then too, instead of holding its entry forever.
 pub(super) struct Commands {
     pending: Vec<Option<Command>>,
-    retired: Vec<u64>,
+    ring_stopped: bool,
+    next_seq: u64,
 }
 impl Commands {
     pub fn new(entries: usize) -> Self {
         Self {
             pending: core::iter::repeat_with(|| None).take(entries).collect(),
-            retired: Vec::new(),
+            ring_stopped: false,
+            next_seq: 0,
         }
     }
+    /// Whether any command is still on the ring (waited for or
+    /// abandoned).
     pub fn active(&self) -> bool {
         self.pending.iter().any(Option::is_some)
     }
@@ -105,10 +126,7 @@ impl Commands {
         for value in self.pending.iter_mut() {
             *value = None;
         }
-        // Ring pointers repeat after the reset cursors restart at
-        // zero: a stale tombstone would swallow the recycled
-        // entry's own completion, so recovery drops them too.
-        self.retired.clear();
+        self.ring_stopped = false;
     }
     pub fn reserve(&mut self, entry: usize, pointer: u64, slot: u8) -> Result<(), Conflict> {
         let value = self.pending.get_mut(entry).ok_or(Conflict)?;
@@ -119,46 +137,74 @@ impl Commands {
             pointer,
             slot,
             completion: Latch::new(),
+            abandoned: false,
+            seq: self.next_seq,
         });
-        // The entry is live again: a later CCE naming this pointer
-        // belongs to the new command, not the retired one.
-        self.retired.retain(|retired| *retired != pointer);
+        self.next_seq += 1;
         Ok(())
     }
-    /// Retire the receipt for a command whose waiter timed out
-    /// (#884) and remember its TRB pointer so a late CCE for it
-    /// is swallowed by `record`. Returns whether a receipt was
-    /// dropped; false when the pointer was already consumed or
-    /// never reserved. Pointers are unique per ring entry, so at
-    /// most one receipt matches.
-    pub fn retire_pointer(&mut self, pointer: u64) -> bool {
+    /// Release every abandoned command published before `seq`: the
+    /// controller has executed it, whatever became of its completion.
+    fn release_abandoned_before(&mut self, seq: u64) {
         for value in self.pending.iter_mut() {
             if value
                 .as_ref()
-                .is_some_and(|command| command.pointer == pointer)
+                .is_some_and(|command| command.abandoned && command.seq < seq)
             {
                 *value = None;
-                if !self.retired.contains(&pointer) {
-                    self.retired.push(pointer);
-                }
+            }
+        }
+    }
+    fn seq_at(&self, event: &Event) -> Option<u64> {
+        self.pending
+            .iter()
+            .flatten()
+            .find(|command| super::event_wait::command_pointer_matches(event, command.pointer))
+            .map(|command| command.seq)
+    }
+    /// Abandon the receipt for a command whose waiter timed out
+    /// (#884). Returns whether a waited-for receipt was abandoned;
+    /// false when the pointer was already consumed, abandoned or
+    /// never reserved. Pointers are unique per ring entry, so at most
+    /// one receipt matches.
+    pub fn retire_pointer(&mut self, pointer: u64) -> bool {
+        for command in self.pending.iter_mut().flatten() {
+            if command.pointer == pointer && !command.abandoned {
+                command.abandoned = true;
                 return true;
             }
         }
         false
     }
     pub fn record(&mut self, event: Event) -> bool {
-        // A CCE for a retired pointer arrived after its waiter
-        // gave up: swallow it here so the demux does not queue it,
-        // where it could be misattributed to the next command
-        // recycled onto the same ring entry.
-        let origin = u64::from(event[0]) | u64::from(event[1]) << 32;
-        if self.retired.contains(&(origin & !15)) {
+        if event[3] & (0x3f << 10) == 33 << 10
+            && (event[2] >> 24) as u8 == super::cmd_abort::CC_COMMAND_RING_STOPPED
+        {
+            // The ring stopped on the command it names (or on an empty
+            // slot): everything published before it was executed.
+            let stopped_at = self.seq_at(&event).unwrap_or(u64::MAX);
+            self.release_abandoned_before(stopped_at);
+            self.ring_stopped = true;
             return true;
         }
-        for command in self.pending.iter_mut().flatten() {
-            if super::event_wait::command_pointer_matches(&event, command.pointer)
-                && (command.slot == 0 || event[3] >> 24 == u32::from(command.slot))
-            {
+        if let Some(seq) = self.seq_at(&event) {
+            self.release_abandoned_before(seq);
+        }
+        for value in self.pending.iter_mut() {
+            let Some(command) = value else {
+                continue;
+            };
+            if !super::event_wait::command_pointer_matches(&event, command.pointer) {
+                continue;
+            }
+            if command.abandoned {
+                // Its waiter is gone: the completion only releases the
+                // entry. A No Op or aborted command reports slot 0, so
+                // the pointer alone identifies it.
+                *value = None;
+                return true;
+            }
+            if command.slot == 0 || event[3] >> 24 == u32::from(command.slot) {
                 command.completion.record(event);
                 return true;
             }
@@ -171,6 +217,9 @@ impl Commands {
     ) -> Result<Option<Event>, Conflict> {
         for value in &mut self.pending {
             if let Some(command) = value {
+                if command.abandoned {
+                    continue;
+                }
                 if let Some(event) = command.completion.take_matching(predicate)? {
                     *value = None;
                     return Ok(Some(event));
@@ -178,6 +227,21 @@ impl Commands {
             }
         }
         Ok(None)
+    }
+    /// Whether a Command Ring Stopped completion arrived since the last
+    /// call (consumes it).
+    pub fn take_ring_stopped(&mut self) -> bool {
+        core::mem::take(&mut self.ring_stopped)
+    }
+    /// Ring entries whose waiter gave up and whose command the
+    /// controller has not completed yet.
+    pub fn abandoned_entries(&self) -> Vec<usize> {
+        self.pending
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_ref().is_some_and(|command| command.abandoned))
+            .map(|(entry, _)| entry)
+            .collect()
     }
 }
 
