@@ -14,8 +14,9 @@ use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // OTG instance block, stride 0x80.
-// Profile selects DCN30 or DCN314; shared ids below were compared against
-// both Linux offset and mask headers. Generation differences stay explicit.
+// Profile selects DCN30, DCN314 or DCN315; shared ids below were compared
+// against each Linux offset and mask header. Generation differences stay
+// explicit: see `layout_shift`.
 // linux-ctx: hdr=dcn seg=2
 const OTG_H_TOTAL: u64 = 0x1b2a; // linux: mmOTG0_OTG_H_TOTAL
 const OTG_H_BLANK_START_END: u64 = 0x1b2b; // linux: mmOTG0_OTG_H_BLANK_START_END
@@ -39,8 +40,15 @@ const OTG_CLOCK_CONTROL: u64 = 0x1b85; // linux: mmOTG0_OTG_CLOCK_CONTROL - 1
 const OTG_VSTARTUP_PARAM: u64 = 0x1b86; // linux: mmOTG0_OTG_VSTARTUP_PARAM - 1
 const OTG_VUPDATE_PARAM: u64 = 0x1b87; // linux: mmOTG0_OTG_VUPDATE_PARAM - 1
 const OTG_VREADY_PARAM: u64 = 0x1b88; // linux: mmOTG0_OTG_VREADY_PARAM - 1
+/// DCN 3.1.5 inserts `OTG_CRC_CNTL2` here (`dcn_3_1_5_offset.h`) and so
+/// moves every DCN 3.1.4 OTG register at or above this offset — the clock and
+/// global-sync quartet among them — up one dword. Everything below it (timing,
+/// blank, sync, OTG_CONTROL, OTG_STATUS) is shared.
+const DCN315_INSERTED: u64 = 0x1b69; // linux: regOTG0_OTG_CRC_CNTL2
 const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_H_TOTAL - mmOTG0_OTG_H_TOTAL
                               // ODM instance block, stride 0x10.
+const OPTC_INPUT_GLOBAL_CONTROL: u64 = 0x1aca; // linux: mmODM0_OPTC_INPUT_GLOBAL_CONTROL
+const OPTC_UNDERFLOW_CLEAR: u32 = 0x1000; // linux: ODM0_OPTC_INPUT_GLOBAL_CONTROL__OPTC_UNDERFLOW_CLEAR_MASK
 const OPTC_DATA_SOURCE_SELECT: u64 = 0x1acb; // linux: mmODM0_OPTC_DATA_SOURCE_SELECT
 const OPTC_WIDTH_CONTROL: u64 = 0x1ace; // linux: mmODM0_OPTC_WIDTH_CONTROL
 const OPTC_MEMORY_CONFIG: u64 = 0x1ad0; // linux: mmODM0_OPTC_MEMORY_CONFIG
@@ -138,6 +146,19 @@ pub enum State {
     Running,
 }
 
+/// How far `profile` moves the DCN 3.1.4 OTG register `reg`.
+///
+/// DCN30 has one register before `OTG_CLOCK_CONTROL` that DCN 3.1.4 dropped;
+/// DCN 3.1.5 has `OTG_CRC_CNTL2` lower down, at [`DCN315_INSERTED`]. Both
+/// move what follows by one dword.
+fn layout_shift(profile: Profile, reg: u64) -> u64 {
+    match profile {
+        Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 => u64::from(reg >= OTG_CLOCK_CONTROL),
+        Profile::Dcn315 => u64::from(reg >= DCN315_INSERTED),
+        Profile::Dcn314 => 0,
+    }
+}
+
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -151,10 +172,7 @@ struct Engine<I: Io> {
 }
 impl<I: Io> Engine<I> {
     fn otg(&self, reg: u64) -> u64 {
-        // DCN30 inserts a register before CLOCK_CONTROL, moving the clock
-        // and global-sync quartet by one dword. Earlier timing ids match.
-        reg + self.instance as u64 * OTG_STRIDE
-            + u64::from(self.profile.is_dcn30() && reg >= OTG_CLOCK_CONTROL)
+        reg + self.instance as u64 * OTG_STRIDE + layout_shift(self.profile, reg)
     }
     fn segment_shift(&self) -> u32 {
         if self.profile.is_dcn30() {
@@ -431,9 +449,10 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// `optc31_disable_crtc`: park every segment, drop the master enable, stop
-    /// the vertical timing generator and wait for the block to go idle.
+    /// the vertical timing generator and wait for the block to go idle. DCN
+    /// 3.1.5 then clears the OPTC underflow, as optc31 does.
     async fn disable(&mut self) -> Result<(), Error> {
-        if self.profile == Profile::Dcn314 {
+        if !self.profile.is_dcn30() {
             self.set(
                 self.odm(OPTC_DATA_SOURCE_SELECT),
                 self.segments(SEGMENT_PARKED),
@@ -459,6 +478,14 @@ impl<I: Io> Engine<I> {
             }
             // linux-lit: 16=OTG0_OTG_CLOCK_CONTROL__OTG_BUSY__SHIFT
             if value & 1 << 16 == 0 {
+                if self.profile == Profile::Dcn315 {
+                    // optc1_clear_optc_underflow.
+                    self.update(
+                        self.odm(OPTC_INPUT_GLOBAL_CONTROL),
+                        OPTC_UNDERFLOW_CLEAR,
+                        OPTC_UNDERFLOW_CLEAR,
+                    )?;
+                }
                 self.state = State::Idle;
                 return Ok(());
             }
@@ -479,7 +506,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// One owned DCN30/DCN314 timing generator. Programming it does not light a panel:
+/// One owned DCN30/DCN314/DCN315 timing generator. Programming it does not light a panel:
 /// the stream still has to be unblanked by the OPP and carried by the stream
 /// encoder.
 #[derive(Debug)]
@@ -496,18 +523,11 @@ impl Otg {
         instance: u8,
     ) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
-        // DCN 3.1.5 runs optc31, not optc314: its clock and global-sync
-        // quartet (OTG_CLOCK_CONTROL..OTG_VREADY_PARAM) and static-screen
-        // control sit one dword above DCN 3.1.4's, and it has no
-        // OTG_INTERRUPT_CONTROL. Refused until that layout is ported.
-        if profile == Profile::Dcn315 {
-            return Err(Error::Unsupported);
-        }
         if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
         let last = OTG_VREADY_PARAM
-            + u64::from(profile.is_dcn30())
+            + layout_shift(profile, OTG_VREADY_PARAM)
             + u64::from(profile.pipes() - 1) * OTG_STRIDE;
         let base = profile.bank(gpu, 2, last as u32)?; // linux-lit: 2=mmOTG0_OTG_H_TOTAL_BASE_IDX
                                                        // linux-ctx: reset

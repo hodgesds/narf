@@ -36,7 +36,7 @@ it came from.
 | OPP | opp31 | opp31 | admitted (offsets identical) |
 | Connector inventory | DIG BE at 0x20b2 | DIG BE at 0x20b1 | admitted on the DCN30 arm |
 | HUBBUB | hubbub31 | hubbub31 | DET/COMPBUF/CRC registers +0x11 — audit before use |
-| OTG | **optc314** | optc31 | refused (`Otg::new`) |
+| OTG | **optc314** | optc31 | ported (`layout_shift`, optc31 disable) |
 | DCCG | **dccg314** | dccg31 | refused (`Dccg::new`) |
 | DIO stream encoder | **dcn314** | dcn30 | refused (`Stream::new`) |
 | DIO link encoder | dcn31 | dcn31 | refused (`amdgpu_dio` version list); DIG_BE_CNTL/EN_CNTL −1 |
@@ -92,8 +92,17 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
 
 1. ~~Identity: Family, firmware names, VCN line~~ (done).
 2. ~~`Profile::Dcn315` with shared-block admission and refusal of the rest~~ (done).
-3. OTG: optc31 layout (+1 quartet, static screen, DRR, no interrupt-control
-   register), checked against `dcn31_optc.c`.
+3. ~~OTG: optc31 layout and disable~~ (done). DCN 3.1.5 inserts
+   `OTG_CRC_CNTL2` at 0x1b69 and drops `OTG_INTERRUPT_CONTROL` (0x1b59); every
+   DCN 3.1.4 OTG register at or above 0x1b69 is +1. `optc31_enable_crtc` is
+   identical to optc314's, as is ODM bypass. `optc31_disable_crtc` parks the
+   segments, clears `OPTC_MEM_SEL` and then the OPTC underflow. DRR stays
+   DCN30-only, though DCN 3.1.5's `OTG_STATIC_SCREEN_CONTROL` (0x1b82) is
+   DCN30's offset.
+
+   Open question for the Phoenix path: NARF's DCN 3.1.4 `disable()` also
+   parks segments and clears `OPTC_MEM_SEL`, which is optc31's sequence;
+   Linux's `optc314_disable_crtc` does neither. It was left unchanged here.
 4. DIO link encoder and inventory: DIG BE −1, behind a DCN315 version entry.
 5. Stream encoder: `dcn30_dio_stream_encoder.c` enable/start sequence.
 6. DCCG: `dccg31.c` pixel-rate and DTBCLK paths.

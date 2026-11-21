@@ -6,7 +6,8 @@
 //! dpp3, mpc31, opp31 and hubbub31 exactly as `dcn314_resource.c` does, and
 //! the HUBP/DPP/MPC/OPP registers sit at the same offsets in both headers, so
 //! those blocks take [`Profile::Dcn315`] on their DCN 3.1.4 path. The timing
-//! generator (optc31, not optc314), DCCG (dccg31, not dccg314), DIO stream
+//! generator (optc31, not optc314) has its own register layout in
+//! `amdgpu_dcn_otg::layout_shift`. The DCCG (dccg31, not dccg314), DIO stream
 //! encoder (dcn30's, not dcn314's) and clock manager (SMU 13.0.5 mailbox)
 //! differ, and their constructors refuse it until each is ported.
 use crate::{amdgpu, amdgpu_dcn_clk::Error, amdgpu_discovery as ip};
@@ -125,9 +126,9 @@ mod tests {
         "drivers/gpu/dcn-profile",
         dcn_rdna2_constructors_follow_physical_capacity
     );
-    /// DCN 3.1.5 binds only on Raphael, admits the four blocks whose Linux
-    /// implementation and offsets it shares with DCN 3.1.4 (four pipes, as
-    /// `res_cap_dcn315`), and refuses the three whose layouts differ.
+    /// DCN 3.1.5 binds only on Raphael, admits the blocks whose layout is
+    /// shared with DCN 3.1.4 or ported (four pipes, as `res_cap_dcn315`), and
+    /// refuses the ones whose layouts differ and are not yet ported.
     fn dcn315_admits_shared_blocks_and_refuses_unported_ones() -> TestResult {
         use crate::{amdgpu, amdgpu_dcn_dccg::Dccg};
         let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
@@ -171,8 +172,10 @@ mod tests {
                     return TestResult::Fail("DCN 3.1.5 shared-block capacity");
                 }
             }
-            if !matches!(Otg::new(&gpu, cap, 0), Err(Error::Unsupported))
-                || !matches!(Stream::new(&gpu, cap, 0), Err(Error::Unsupported))
+            if Otg::new(&gpu, cap, 3).is_err() || Otg::new(&gpu, cap, 4).is_ok() {
+                return TestResult::Fail("DCN 3.1.5 OTG capacity");
+            }
+            if !matches!(Stream::new(&gpu, cap, 0), Err(Error::Unsupported))
                 || !matches!(Dccg::new(&gpu, cap), Err(Error::Unsupported))
             {
                 return TestResult::Fail("an unported DCN 3.1.4 layout admitted DCN 3.1.5");
