@@ -173,6 +173,7 @@ fn write_console_level(level: u32, s: &str) {
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     write_chunked(s.as_bytes(), |chunk| {
+        uart_tap(chunk);
         // SAFETY: `kind` + `base` were published via Release by `early_init`
         // or `remap_to_virtual`, and we hold the coarse lock; the backend
         // methods themselves uphold the compiler_fence discipline.
@@ -254,6 +255,7 @@ pub fn write_bytes_raw(bytes: &[u8]) {
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     write_chunked(bytes, |chunk| {
+        uart_tap(chunk);
         // SAFETY: `kind` + `base` were published via Release by `early_init`
         // or `remap_to_virtual`, and we hold the coarse lock.
         // SAFETY: Valid memory or trusted environment
@@ -277,6 +279,7 @@ pub fn write_uart_raw(bytes: &[u8]) {
     write_chunked_sinks(
         bytes,
         |chunk| {
+            uart_tap(chunk);
             // SAFETY: `kind` + `base` were published via Release by
             // `early_init` or `remap_to_virtual`, and we hold the coarse lock.
             unsafe {
@@ -370,6 +373,34 @@ fn read_byte_locked() -> Option<u8> {
     // no TX side effects.
     // SAFETY: Valid memory or trusted environment
     unsafe { backend::try_read_byte(base, kind) }
+}
+
+/// A kernel test's view of the UART: called with every run of bytes, in the
+/// order the console hands them to the UART, just before they are written
+/// (before `\n` → `\r\n` expansion). Lets a test see what a serial reader
+/// would, for instance whether two CPUs' lines came out whole. Unset outside
+/// tests, which costs each write one load.
+pub type UartTap = fn(&[u8]);
+
+/// Stored as `UartTap as usize`; 0 = none.
+static UART_TAP: AtomicUsize = AtomicUsize::new(0);
+
+/// Install (or with `None` remove) the [`UartTap`]; returns the previous one.
+#[doc(hidden)]
+pub fn __test_set_uart_tap(tap: Option<UartTap>) -> Option<UartTap> {
+    let prev = UART_TAP.swap(tap.map_or(0, |t| t as usize), Ordering::AcqRel);
+    // SAFETY: only this function stores the slot, from a `UartTap`.
+    (prev != 0).then(|| unsafe { core::mem::transmute::<usize, UartTap>(prev) })
+}
+
+#[inline]
+fn uart_tap(bytes: &[u8]) {
+    let t = UART_TAP.load(Ordering::Acquire);
+    if t != 0 {
+        // SAFETY: stored as `UartTap as usize` in `__test_set_uart_tap`.
+        let f: UartTap = unsafe { core::mem::transmute(t) };
+        f(bytes);
+    }
 }
 
 /// Type of the optional framebuffer fan-out callback. Boot-time
@@ -799,6 +830,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     if let Some(kind) = CONSOLE.kind.get() {
         let base = CONSOLE.base.load(Ordering::Acquire) as usize;
         if base != 0 {
+            uart_tap(msg);
             // SAFETY: kind + base published Release; we accept
             // the risk of interleaving with another CPU's
             // mid-write — better than deadlocking on the lock.
@@ -906,6 +938,7 @@ pub fn trap_sink(s: &str) {
     if let Some(kind) = CONSOLE.kind.get() {
         let base = CONSOLE.base.load(Ordering::Acquire) as usize;
         if base != 0 {
+            uart_tap(s.as_bytes());
             // SAFETY: kind + base were published Release; we accept
             // the interleave risk versus deadlocking on the lock.
             // SAFETY: Valid memory or trusted environment
