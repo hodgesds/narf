@@ -108,6 +108,13 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) 
     crate::amdgpu_fence_navi22::notify_all();
 }
 
+/// The client media rings (bit `MediaRing::index()`) whose jobs a timeout
+/// on media fence engine `engine` takes down.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+pub(crate) fn media_rings(_engine: crate::amdgpu_fence_navi22::Engine) -> u8 {
+    0
+}
+
 const RINGS: [Option<Ring>; 10] = [
     Some(Ring::Gfx),
     Some(Ring::Compute),
@@ -950,5 +957,29 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22-max-ibs",
         navi22_cs_max_ibs_is_what_the_native_queues_take
+    );
+
+    /// A VCN0 job timeout takes down every client ring of that VCPU (its
+    /// decode and both encode rings, as `amdgpu_vcn_reset_engine` resets the
+    /// instance under all three); a JPEG timeout only the JPEG ring. No
+    /// other fence engine carries client media rings.
+    fn navi22_cs_media_timeout_takes_down_its_engines_rings() -> TestResult {
+        use crate::amdgpu_fence_navi22::Engine;
+        use crate::amdgpu_navi22_submit::MediaRing;
+        let bits = |rings: &[MediaRing]| rings.iter().fold(0u8, |m, r| m | 1 << r.index());
+        let vcn0 = bits(&[MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)]);
+        if media_rings(Engine::Vcn0) != vcn0
+            || media_rings(Engine::Jpeg) != bits(&[MediaRing::Jpeg])
+            || media_rings(Engine::Vcn1) != 0
+            || media_rings(Engine::Gfx) != 0
+            || media_rings(Engine::Sdma0) != 0
+        {
+            return TestResult::Fail("a media timeout takes down the wrong rings");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-tdr/media",
+        navi22_cs_media_timeout_takes_down_its_engines_rings
     );
 }

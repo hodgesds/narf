@@ -4,8 +4,20 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn p(engine: Engine, emitted: u32, signaled: u32) -> Progress {
     Progress {
         engine,
+        media: None,
         emitted,
         signaled,
+    }
+}
+fn m(ring: MediaRing, emitted: u32, signaled: u32) -> Progress {
+    let engine = if ring == MediaRing::Jpeg {
+        Engine::Jpeg
+    } else {
+        Engine::Vcn0
+    };
+    Progress {
+        media: Some(ring),
+        ..p(engine, emitted, signaled)
     }
 }
 
@@ -31,6 +43,7 @@ fn navi22_tdr_times_out_only_stalled_pending_work() -> TestResult {
     }
     let hang = Hang {
         engine: Engine::Gfx,
+        media: None,
         emitted: 9,
         signaled: 8,
         stalled_ms: 2000,
@@ -168,4 +181,61 @@ fn navi22_tdr_arms_nothing_without_a_job_and_times_out_a_stuck_one() -> TestResu
 kernel_test_in!(
     "drivers/gpu/navi22-tdr/timer",
     navi22_tdr_arms_nothing_without_a_job_and_times_out_a_stuck_one
+);
+
+/// Linux gives every VCN and JPEG ring a drm_sched with `adev->video_timeout`
+/// (2 s, `amdgpu_device_get_job_timeout_settings`), so a media job that
+/// never completes times out on its own ring. VCN0's decode and encode
+/// rings share one fence engine but not one timer: an idle decode ring
+/// does not restart a stuck encode job's timeout.
+fn navi22_tdr_times_out_each_media_ring_like_linux_video_rings() -> TestResult {
+    let mut w = Watchdog::new(TIMEOUT_MS);
+    let mut hung = None;
+    for now in [0, 1000, TIMEOUT_MS] {
+        if w.observe(m(MediaRing::Dec, 5, 5), now) != Verdict::Idle {
+            return TestResult::Fail("idle decode ring not idle");
+        }
+        match w.observe(m(MediaRing::Enc(0), 3, 2), now) {
+            Verdict::Busy => {}
+            Verdict::Hung(hang) => hung = Some(hang),
+            _ => return TestResult::Fail("a pending encode ring reported idle"),
+        }
+    }
+    let want = Hang {
+        engine: Engine::Vcn0,
+        media: Some(MediaRing::Enc(0)),
+        emitted: 3,
+        signaled: 2,
+        stalled_ms: TIMEOUT_MS,
+    };
+    if hung != Some(want) {
+        return TestResult::Fail("a stuck encode job never timed out beside an idle decode ring");
+    }
+    // The JPEG ring, the other VCN0 encode ring and a kernel queue each
+    // keep their own timer.
+    let stalled = [
+        m(MediaRing::Jpeg, 9, 8),
+        m(MediaRing::Enc(1), 4, 3),
+        p(Engine::Sdma0, 2, 1),
+    ];
+    let mut w = Watchdog::new(TIMEOUT_MS);
+    if !record(&mut w, &stalled, 0).is_empty() || next_sample(&w, 0) != Some(TIMEOUT_MS) {
+        return TestResult::Fail("pending media jobs are not timed from their start");
+    }
+    let hangs = record(&mut w, &stalled, TIMEOUT_MS);
+    let rings: alloc::vec::Vec<_> = hangs.iter().map(|h| (h.engine, h.media)).collect();
+    if rings
+        != [
+            (Engine::Jpeg, Some(MediaRing::Jpeg)),
+            (Engine::Vcn0, Some(MediaRing::Enc(1))),
+            (Engine::Sdma0, None),
+        ]
+    {
+        return TestResult::Fail("media rings share a timer with each other or a kernel queue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-tdr/media",
+    navi22_tdr_times_out_each_media_ring_like_linux_video_rings
 );

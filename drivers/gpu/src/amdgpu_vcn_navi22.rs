@@ -3042,6 +3042,15 @@ impl<I: Io> Engine<I> {
         })?;
         Ok((completed, throttle))
     }
+    /// Job-timeout samples (`amdgpu_navi22_tdr`) of the client rings in
+    /// `rings` (bit `MediaRing::index()`).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub(crate) fn client_progress(
+        &mut self,
+        _rings: u8,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        Ok(alloc::vec::Vec::new())
+    }
     /// Queue one client job on `ring` (see `amdgpu_navi22_submit`'s media
     /// section). JPEG IBs arrive as validated copies (`copies`, one per IB),
     /// written to a kernel slot and fetched at VMID 0; VCN IBs run from the

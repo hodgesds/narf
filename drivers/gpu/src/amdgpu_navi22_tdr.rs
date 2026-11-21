@@ -17,6 +17,7 @@
 //! left stopped rather than recovered until VRAM runs out. Raphael re-arms
 //! its owners in place, but keeps the same budget.
 use crate::amdgpu_fence_navi22::{signaled, Engine};
+use crate::amdgpu_navi22_submit::MediaRing;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -31,6 +32,10 @@ const ENGINES: usize = crate::amdgpu_fence_navi22::ENGINES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub engine: Engine,
+    /// The client media ring on `engine` (VCN decode/encode, JPEG), each
+    /// with its own sequence as each has its own drm_sched in Linux; None
+    /// for a kernel queue.
+    pub media: Option<MediaRing>,
     pub emitted: u32,
     pub signaled: u32,
 }
@@ -39,6 +44,7 @@ pub struct Progress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hang {
     pub engine: Engine,
+    pub media: Option<MediaRing>,
     pub emitted: u32,
     pub signaled: u32,
     pub stalled_ms: u64,
@@ -109,6 +115,7 @@ impl Watchdog {
         slot.hung = true;
         Verdict::Hung(Hang {
             engine: p.engine,
+            media: p.media,
             emitted: p.emitted,
             signaled: p.signaled,
             stalled_ms,
@@ -221,6 +228,12 @@ static JOB_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> = IrqSafeSpinLock::
 pub(crate) fn job_emitted() {
     JOBS.store(true, Ordering::Release);
     wake_detector();
+}
+
+/// Test-only: whether a job was emitted since the last call (clears it).
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __take_job_emitted() -> bool {
+    JOBS.swap(false, Ordering::AcqRel)
 }
 
 fn wake_detector() {

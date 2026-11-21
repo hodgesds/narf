@@ -924,6 +924,7 @@ pub(crate) fn progress<I: Io>(
         checked(io.read(l.liveness()))?;
         Ok(crate::amdgpu_navi22_tdr::Progress {
             engine: queue.engine,
+            media: None,
             emitted: queue.seq,
             signaled,
         })

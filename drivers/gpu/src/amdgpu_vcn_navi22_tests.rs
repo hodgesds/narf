@@ -1729,6 +1729,87 @@ kernel_test_in!(
     vcn_navi22_client_jobs_frame_flush_and_throttle
 );
 
+/// Linux arms drm_sched's `video_timeout` when a media job starts on its
+/// ring, and `amdgpu_job_timedout` compares the ring's emitted and signalled
+/// sequences. A client media job wakes the hang detector, and each client
+/// ring is sampled on its own: its last sequence and its fence writeback.
+/// A ring that failed its IB test takes no job and is not sampled.
+fn vcn_navi22_client_jobs_are_sampled_for_the_job_timeout() -> TestResult {
+    use crate::amdgpu_navi22_submit::{Ib, MediaRing, VmRef};
+    use crate::amdgpu_navi22_tdr::Progress;
+    let mut model = Model::new();
+    model.drop_enc_fence[0][1] = true;
+    let (pool, mut e) = engine(model, 1);
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err() || run(e.start_jpeg()).is_err() {
+        return TestResult::Fail("media bring-up");
+    }
+    if run(e.test_ib()) != Err(Error::Timeout)
+        || e.state != State::Verified
+        || e.client_ready(MediaRing::Enc(1))
+    {
+        return TestResult::Fail("encode ring 1 should fail its IB test alone");
+    }
+    // Client frames are recorded, not executed: the job never completes.
+    e.hw.io.stalled = [true; 7];
+    let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
+    jpeg_ibs.publish();
+    let client = Client {
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+        oss: 0x10a0,
+        instances: 1,
+        jpeg_ibs: Some(jpeg_ibs),
+    };
+    let vm = VmRef {
+        vmid: 3,
+        page_table_base: 0x1_2345_6001,
+        pasid: 0x42,
+        flush: true,
+        map_pasid: true,
+    };
+    let ibs = [Ib {
+        va: 0x7000_0010_0000,
+        dwords: 16,
+        flags: 0,
+    }];
+    let _ = crate::amdgpu_navi22_tdr::__take_job_emitted();
+    let Ok(seq) = e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]) else {
+        return TestResult::Fail("decode client job refused");
+    };
+    if !crate::amdgpu_navi22_tdr::__take_job_emitted() {
+        return TestResult::Fail("a media job did not arm the job timeout");
+    }
+    let progress = |ring: MediaRing, emitted, signaled| Progress {
+        engine: if ring == MediaRing::Jpeg {
+            fence::Engine::Jpeg
+        } else {
+            fence::Engine::Vcn0
+        },
+        media: Some(ring),
+        emitted,
+        signaled,
+    };
+    let Ok(samples) = e.client_progress(0xf) else {
+        return TestResult::Fail("client ring sample refused");
+    };
+    if samples
+        != [
+            progress(MediaRing::Dec, seq, seq - 1),
+            progress(MediaRing::Enc(0), 2, 2),
+            progress(MediaRing::Jpeg, 0, 0),
+        ]
+    {
+        return TestResult::Fail("client media rings are not sampled for the job timeout");
+    }
+    if e.client_progress(1 << MediaRing::Dec.index()) != Ok(alloc::vec![samples[0]]) {
+        return TestResult::Fail("a ring outside the client set was sampled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/job-timeout",
+    vcn_navi22_client_jobs_are_sampled_for_the_job_timeout
+);
+
 fn dpg_engine(instances: u8) -> (Pool, Engine<Model>, FakePsp) {
     let model = Model::new();
     let psp = FakePsp::new(&model);
