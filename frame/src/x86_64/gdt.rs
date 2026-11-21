@@ -4,34 +4,92 @@
 //! every fault that could share a stack with a victim of the very fault
 //! it's handling (NMI, #DF, #MC, #VC) gets its own IST-backed stack.
 //!
-//! Layout of the new GDT, with a fixed 8-byte entry for descriptors and
-//! a 16-byte entry for the TSS (split into two consecutive 8-byte slots):
+//! Every CPU's GDT has Linux's 64-bit layout (`arch/x86/include/asm/
+//! segment.h`, 16 descriptors) for every user-visible selector; the
+//! authoritative table and the constants live in
+//! `narf_arch::x86_64::segments`:
 //!
-//! | selector | kind                                     |
-//! |----------|------------------------------------------|
-//! | 0x00     | null                                     |
-//! | 0x08     | kernel code — long-mode, DPL 0           |
-//! | 0x10     | kernel data — present, writable (cosmetic) |
-//! | 0x18     | TSS descriptor, low 8 bytes              |
-//! | 0x20     | TSS descriptor, high 8 bytes             |
+//! | index | selector | kind |
+//! |-------|----------|------|
+//! | 0     | 0x00     | null |
+//! | 1     | 0x08     | kernel code — long mode, DPL 0 |
+//! | 2     | 0x10     | kernel data — present, writable (cosmetic) |
+//! | 4     | 0x23     | `__USER32_CS` — 32-bit user code, DPL 3 |
+//! | 5     | 0x2b     | `__USER_DS` — user data, DPL 3 |
+//! | 6     | 0x33     | `__USER_CS` — long-mode user code, DPL 3 |
+//! | 8–9   | 0x40     | TSS (16-byte system descriptor) |
+//! | 12–14 | 0x63/0x6b/0x73 | TLS, the running task's (`set_thread_area`) |
 //!
-//! The kernel-code selector (0x08) is at the same offset as the one
-//! boot.S bootstrapped, so reloading CS isn't necessary — the current
-//! CS selector still points at a valid descriptor after LGDT.
+//! Slots 3, 7, 10–11 (LDT) and 15 stay empty. The kernel-code selector
+//! (0x08) is at the same offset as the one boot.S bootstrapped, so reloading
+//! CS isn't necessary — the current CS selector still points at a valid
+//! descriptor after LGDT.
 
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use narf_arch::x86_64::segments::{
+    self, DESC_KERNEL_CS, DESC_KERNEL_DS, DESC_USER32_CS, DESC_USER_CS, DESC_USER_DS, GDT_ENTRIES,
+};
+
 /// Kernel-code selector — byte offset into the GDT.
-pub const KCODE_SEL: u16 = 0x08;
+pub const KCODE_SEL: u16 = segments::KERNEL_CS;
 /// Kernel-data selector.
-pub const KDATA_SEL: u16 = 0x10;
-/// TSS selector.
-const TSS_SEL: u16 = 0x18;
-/// User-data selector (RPL = 3).
-pub const UDATA_SEL: u16 = 0x28 | 3; // index 5, RPL=3 → 0x2B
-/// User-code selector (RPL = 3) — long-mode code at DPL=3.
-pub const UCODE_SEL: u16 = 0x30 | 3; // index 6, RPL=3 → 0x33
+pub const KDATA_SEL: u16 = segments::KERNEL_DS;
+/// TSS selector (`GDT_ENTRY_TSS`, index 8).
+const TSS_SEL: u16 = segments::TSS_SELECTOR;
+/// User-data selector (`__USER_DS`, index 5, RPL 3 → 0x2B).
+pub const UDATA_SEL: u16 = segments::USER_DS;
+/// User-code selector (`__USER_CS`, index 6, RPL 3 → 0x33) — long-mode code
+/// at DPL=3.
+pub const UCODE_SEL: u16 = segments::USER_CS;
+
+/// `LGDT` limit of every CPU's table.
+const GDT_LIMIT: u16 = (GDT_ENTRIES * 8 - 1) as u16;
+
+/// Fill `gdt` (`GDT_ENTRIES` descriptors) with the layout above, its TSS
+/// descriptor naming the TSS at `tss_base`. The TLS slots start empty; the
+/// scheduler writes the running task's on every switch-in.
+///
+/// # Safety
+/// `gdt` must be writable for `GDT_ENTRIES` u64s and not yet loaded by any
+/// CPU.
+unsafe fn write_gdt(gdt: *mut u64, tss_base: u64) {
+    // TSS descriptor (system; 16 bytes):
+    //   low:  type=0x9 (available 64-bit TSS), P=1, limit=sizeof(TSS)-1,
+    //         base[31:0] stitched in.
+    //   high: base[63:32] in the low 32 bits.
+    let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
+    let tss_lo: u64 = (tss_limit & 0xFFFF)
+        | ((tss_base & 0x00FF_FFFF) << 16)
+        | (0x9 << 40)                     // type: available 64-bit TSS
+        | (1 << 47)                       // P
+        | (((tss_limit >> 16) & 0xF) << 48)
+        | (((tss_base >> 24) & 0xFF) << 56);
+    let tss_hi: u64 = tss_base >> 32;
+    // SAFETY: the caller owns `GDT_ENTRIES` writable descriptors at `gdt`;
+    // every index below is less than `GDT_ENTRIES`.
+    unsafe {
+        core::ptr::write_bytes(gdt, 0, GDT_ENTRIES);
+        gdt.add(1).write(DESC_KERNEL_CS); // kernel code   (0x08)
+        gdt.add(2).write(DESC_KERNEL_DS); // kernel data   (0x10)
+        gdt.add(4).write(DESC_USER32_CS); // __USER32_CS   (0x23)
+        gdt.add(5).write(DESC_USER_DS); // __USER_DS     (0x2B)
+        gdt.add(6).write(DESC_USER_CS); // __USER_CS     (0x33)
+        gdt.add(8).write(tss_lo); // TSS lo        (0x40)
+        gdt.add(9).write(tss_hi); // TSS hi
+    }
+}
+
+// The literal indices above are Linux's (`arch/x86/include/asm/segment.h`).
+const _: () = {
+    assert!(segments::GDT_ENTRY_DEFAULT_USER32_CS == 4);
+    assert!(segments::GDT_ENTRY_DEFAULT_USER_DS == 5);
+    assert!(segments::GDT_ENTRY_DEFAULT_USER_CS == 6);
+    assert!(segments::GDT_ENTRY_TSS == 8);
+    assert!(TSS_SEL == 0x40);
+    assert!(UDATA_SEL == 0x2B && UCODE_SEL == 0x33);
+};
 
 /// IST slot assignments, STAGE1.md Wave 2 #7.
 pub const IST_NMI: u8 = 1;
@@ -127,11 +185,9 @@ static mut TSS: Tss = Tss {
     io_map_base: 0,
 };
 
-/// 7 entries × 8 bytes = 56 bytes. Null + kernel-code + kernel-data +
-/// TSS-lo + TSS-hi + user-data + user-code. User descriptors sit
-/// after the TSS so the existing kernel selectors keep their byte
-/// offsets.
-static mut GDT: [u64; 7] = [0; 7];
+/// The BSP's GDT: `GDT_ENTRIES` (16) × 8 bytes in Linux's layout (see the
+/// module docs). Each AP builds its own copy in its `ApCpuBlock`.
+static mut GDT: [u64; GDT_ENTRIES] = [0; GDT_ENTRIES];
 
 /// Per-CPU pointer to the TSS the CPU's TR is loaded with — the static `TSS`
 /// for the BSP (CPU 0), each AP's leaked `ApCpuBlock.tss` otherwise. Lets
@@ -198,47 +254,17 @@ pub unsafe fn init() {
         set_kernel_rsp0(top);
     }
 
-    // ── build GDT descriptors ──
-    //
-    // Kernel code (long mode): L=1, P=1, DPL=0, S=1, Type=exec/read.
-    //   0x00af_9a00_0000_ffff
-    // Kernel data (present, writable): cosmetic in long mode.
-    //   0x00cf_9200_0000_ffff
-    // TSS descriptor (system; 16 bytes):
-    //   low:  type=0x9 (available 64-bit TSS), P=1, limit=sizeof(TSS)-1,
-    //         base[31:0] stitched in.
-    //   high: base[63:32] in the low 32 bits.
+    // ── build GDT descriptors (Linux layout, see the module docs) ──
     let tss_base = core::ptr::addr_of!(TSS) as u64;
-    let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
-
-    let tss_lo: u64 = (tss_limit & 0xFFFF)
-        | ((tss_base & 0x00FF_FFFF) << 16)
-        | (0x9 << 40)                     // type: available 64-bit TSS
-        | (1 << 47)                       // P
-        | (((tss_limit >> 16) & 0xF) << 48)
-        | (((tss_base >> 24) & 0xFF) << 56);
-    let tss_hi: u64 = tss_base >> 32;
-
-    // User-code (long mode, DPL=3): L=1, P=1, DPL=3, S=1, Type=exec/read.
-    //   0x00af_fa00_0000_ffff     (same as kernel code but DPL=3 → byte 5: 0xFA)
-    // User-data (present, writable, DPL=3): cosmetic in long mode.
-    //   0x00cf_f200_0000_ffff
-    //
-    // SAFETY: single-threaded boot path, no prior readers.
+    // SAFETY: single-threaded boot path; the static GDT has GDT_ENTRIES
+    // descriptors and no CPU has loaded it yet.
     unsafe {
-        let gdt = core::ptr::addr_of_mut!(GDT).cast::<u64>();
-        gdt.add(0).write(0); // null
-        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code  (0x08)
-        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data  (0x10)
-        gdt.add(3).write(tss_lo); // TSS lo       (0x18)
-        gdt.add(4).write(tss_hi); // TSS hi       (0x20)
-        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data    (0x28 | 3)
-        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code    (0x30 | 3)
+        write_gdt(core::ptr::addr_of_mut!(GDT).cast::<u64>(), tss_base);
     }
 
     // ── LGDT ──
     let ptr = Pseudo {
-        limit: (7 * 8 - 1) as u16,
+        limit: GDT_LIMIT,
         base: core::ptr::addr_of!(GDT) as u64,
     };
     compiler_fence(Ordering::SeqCst);
@@ -271,12 +297,20 @@ pub unsafe fn init() {
 
     // ── LTR ──
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: TSS selector 0x18 references the descriptor we just wrote.
+    // SAFETY: TSS selector 0x40 references the descriptor we just wrote.
     unsafe {
         asm!("ltr {s:x}", s = in(reg) TSS_SEL,
              options(nomem, nostack, preserves_flags));
     }
     compiler_fence(Ordering::SeqCst);
+
+    // Publish the BSP's table so the scheduler can load each task's TLS
+    // descriptors into its slots 12..=14 on switch-in.
+    // SAFETY: the static GDT has GDT_ENTRIES descriptors, is the BSP's live
+    // table (LGDT above) and lives for the life of the system.
+    unsafe {
+        segments::register_cpu_gdt(0, core::ptr::addr_of_mut!(GDT).cast::<u64>());
+    }
 }
 
 /// Write `top` into `TSS.rsp0`. The scheduler calls this when it
@@ -424,7 +458,7 @@ pub fn set_task_kernel_stack(top: u64) {
 /// encodes the (per-CPU) TSS base address.
 #[repr(C, align(16))]
 struct ApCpuBlock {
-    gdt: [u64; 7],
+    gdt: [u64; GDT_ENTRIES],
     tss: Tss,
     rsp0_stack: [u8; KERNEL_RSP0_BYTES],
     /// This AP's dedicated hardirq stack — genuinely per-CPU (lives in the
@@ -506,27 +540,12 @@ pub unsafe fn init_ap() -> (u64, u64) {
         // the BSP GDT (so the live CS / reloaded SS stay valid), with
         // a TSS descriptor pointing at *this AP's* TSS.
         let tss_base = core::ptr::addr_of!((*block).tss) as u64;
-        let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
-        let tss_lo: u64 = (tss_limit & 0xFFFF)
-            | ((tss_base & 0x00FF_FFFF) << 16)
-            | (0x9 << 40)
-            | (1 << 47)
-            | (((tss_limit >> 16) & 0xF) << 48)
-            | (((tss_base >> 24) & 0xFF) << 56);
-        let tss_hi: u64 = tss_base >> 32;
-
         let gdt = core::ptr::addr_of_mut!((*block).gdt).cast::<u64>();
-        gdt.add(0).write(0);
-        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code (0x08)
-        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data (0x10)
-        gdt.add(3).write(tss_lo); // TSS lo      (0x18)
-        gdt.add(4).write(tss_hi); // TSS hi      (0x20)
-        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data  (0x28|3)
-        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code  (0x30|3)
+        write_gdt(gdt, tss_base);
 
         // LGDT this AP's table.
         let ptr = Pseudo {
-            limit: (7 * 8 - 1) as u16,
+            limit: GDT_LIMIT,
             base: gdt as u64,
         };
         compiler_fence(Ordering::SeqCst);
@@ -554,6 +573,10 @@ pub unsafe fn init_ap() -> (u64, u64) {
              options(nomem, nostack, preserves_flags));
         compiler_fence(Ordering::SeqCst);
 
+        // Publish this AP's live table for the scheduler's TLS-slot loads
+        // (the block is leaked, so the pointer stays valid).
+        segments::register_cpu_gdt(cpu, gdt);
+
         (rsp0_top, irq_top)
     }
 }
@@ -567,7 +590,7 @@ pub fn gdt_base() -> u64 {
 
 /// Limit of the BSP-built GDT (size − 1). Used alongside `gdt_base`.
 pub fn gdt_limit() -> u16 {
-    (7 * 8 - 1) as u16
+    GDT_LIMIT
 }
 
 /// Read the currently-installed `TSS.rsp0`. Diagnostic helper —

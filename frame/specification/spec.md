@@ -175,6 +175,42 @@ Boot installs the procfs network snapshot adapters. Each adapter queries the
 network stack using the namespace ID supplied by the open procfs file,
 including for IPv6 addresses and routes.
 
+### 3.1 x86_64 IA-32 emulation (Linux `CONFIG_IA32_EMULATION`)
+
+Every CPU's GDT has Linux's 64-bit layout (`arch/x86/include/asm/segment.h`)
+for each user-visible selector; the constants live in
+`narf_arch::x86_64::segments`:
+
+| index | selector | descriptor |
+|-------|----------|------------|
+| 1 | 0x08 | kernel code (NARF's; Linux uses 0x10) |
+| 2 | 0x10 | kernel data |
+| 4 | 0x23 | `__USER32_CS`: flat 32-bit user code, DPL 3 |
+| 5 | 0x2b | `__USER_DS`: flat user data, DPL 3 |
+| 6 | 0x33 | `__USER_CS`: long-mode user code, DPL 3 |
+| 8–9 | 0x40 | TSS, loaded by `LTR` |
+| 12–14 | 0x63, 0x6b, 0x73 | TLS slots, the running task's |
+
+Slots 0, 3, 7, 10–11 (LDT, never installed) and 15 are empty. `gdt::init`
+(BSP) and `gdt::init_ap` (each AP) build the table and publish it with
+`segments::register_cpu_gdt(cpu, gdt)`; `segments::cpu_gdt(cpu)` returns it.
+
+`IA32_STAR[63:48]` is `__USER32_CS`: `sysretq` returns to 0x33/0x2b and
+`sysretl` to 0x23/0x2b. `IA32_CSTAR`, where AMD CPUs enter on a `syscall`
+from compatibility mode, is `syscall32_ignore_x86_64`: Linux's
+`ignore_sysret`, which returns -ENOSYS in eax with `sysretl` without touching
+the stack or GS. (Intel raises #UD for that `syscall`.)
+
+```rust
+// narf_arch::x86_64::segments
+pub const GDT_ENTRIES: usize = 16;
+pub const GDT_ENTRY_TLS_MIN: usize = 12; // ..=GDT_ENTRY_TLS_MAX (14)
+pub const USER32_CS: u16 = 0x23; pub const USER_DS: u16 = 0x2b;
+pub const USER_CS: u16 = 0x33;   pub const TSS_SELECTOR: u16 = 0x40;
+pub unsafe fn register_cpu_gdt(cpu: usize, gdt: *mut u64);
+pub fn cpu_gdt(cpu: usize) -> *mut u64;
+```
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
@@ -279,7 +315,8 @@ including for IPv6 addresses and routes.
 ## 5. Architecture notes
 
 ### x86_64
-- GDT: kernel code, kernel data, user code, user data, TSS per CPU.
+- GDT per CPU in Linux's 64-bit layout (§3.1): kernel code and data, 32-bit
+  user code, user data, 64-bit user code, the TSS and three TLS slots.
 - IDT: 256 entries, trap gates for exceptions, interrupt gates for IRQs.
 - Uses `swapgs` + per-CPU `KERNEL_GS_BASE` for `CpuLocal` pointer.
 - **TSS IST slot assignments** (fixed, not negotiable):
