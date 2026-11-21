@@ -3993,6 +3993,189 @@ kernel_test_in!(
     smoke_abi_pathx_statx_slow_lookup_preserves_metadata
 );
 
+/// `btrfs_symlink` -> `btrfs_new_inode` -> `inode_init_owner`: a new symlink
+/// belongs to its creator's fsuid, with its fsgid or a setgid parent's group,
+/// as every new inode does. NARF stamped owners after mkdir and create but
+/// not after symlink, so on btrfs, whose new inodes start at 0:0, a link made
+/// by uid 1000 was root's. GNU tar then could not set the link's times
+/// (utimensat AT_SYMLINK_NOFOLLOW with explicit times needs the owner) and
+/// Steam's bootstrap extraction aborted. The filesystem here behaves the
+/// same way: its symlinks report 0:0 until their owners are set.
+fn smoke_abi_pathx_symlink_belongs_to_its_creator() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_filesystem::{
+        DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
+    };
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    struct Link {
+        owners: IrqSafeSpinLock<(u32, u32)>,
+    }
+    impl FileOps for Link {
+        fn ino(&self) -> u64 {
+            0x4c49_4e4b_0001
+        }
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 6,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Symlink,
+                    perms: 0o777,
+                },
+                mtime_cycles: 0,
+            }
+        }
+        fn owners(&self) -> (u32, u32) {
+            *self.owners.lock()
+        }
+        fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+            *self.owners.lock() = (uid, gid);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Dir {
+        mode: u16,
+        owners: (u32, u32),
+        link: IrqSafeSpinLock<Option<Arc<Link>>>,
+    }
+    impl DirOps for Dir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name != "link" {
+                return None;
+            }
+            self.link
+                .lock()
+                .clone()
+                .map(|link| link as Arc<dyn FileOps>)
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+        fn dir_mode(&self) -> u16 {
+            self.mode
+        }
+        fn dir_owners(&self) -> (u32, u32) {
+            self.owners
+        }
+        fn symlink<'a>(
+            &'a self,
+            name: &'a str,
+            _target: &'a str,
+        ) -> FsFuture<'a, Arc<dyn FileOps>> {
+            let link = Arc::new(Link {
+                owners: IrqSafeSpinLock::new((0, 0)),
+            });
+            let created = (name == "link").then(|| {
+                *self.link.lock() = Some(Arc::clone(&link));
+                link as Arc<dyn FileOps>
+            });
+            Box::pin(async move { created.ok_or(FsError::Unsupported) })
+        }
+    }
+
+    struct Fs {
+        root: Arc<Dir>,
+    }
+    impl FsInstance for Fs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            self.root.clone()
+        }
+        fn name(&self) -> &str {
+            "symlink-owner"
+        }
+    }
+
+    with_setup(|| {
+        const UID: u64 = 1000;
+        const GID: u64 = 1000;
+        const SHARED_GID: u32 = 77;
+        // The gid first: dropping the uid clears the set-id capabilities.
+        if call(Syscall::Setresgid.raw(), a2(GID, GID, GID)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0)
+        {
+            return Err("fixture: could not become uid/gid 1000");
+        }
+        struct Case {
+            mount: &'static str,
+            link: &'static [u8],
+            /// The parent directory's mode and owners.
+            mode: u16,
+            owners: (u32, u32),
+            /// The link's owners lstat must report.
+            want: (u32, u32),
+        }
+        let cases = [
+            Case {
+                mount: "/symown-plain",
+                link: b"/symown-plain/link\0",
+                mode: 0o777,
+                owners: (0, 0),
+                want: (1000, 1000),
+            },
+            Case {
+                mount: "/symown-sgid",
+                link: b"/symown-sgid/link\0",
+                mode: 0o2777,
+                owners: (0, SHARED_GID),
+                want: (1000, SHARED_GID),
+            },
+        ];
+        for Case {
+            mount,
+            link,
+            mode,
+            owners,
+            want,
+        } in cases
+        {
+            let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+            let handle = registry()
+                .mount(
+                    &auth,
+                    mount,
+                    Fs {
+                        root: Arc::new(Dir {
+                            mode,
+                            owners,
+                            link: IrqSafeSpinLock::new(None),
+                        }),
+                    },
+                )
+                .map_err(|_| "fixture: mounting the test filesystem failed")?;
+            let created = call(
+                Syscall::Symlinkat.raw(),
+                a2(c"target".as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+            );
+            let got = lstat_owners(link);
+            let _ = registry().unmount(&handle, mount);
+            if created != Some(0) {
+                return Err("symlinkat on the test filesystem failed");
+            }
+            if got != Some(want) {
+                return Err(if mode & 0o2000 == 0 {
+                    "a new symlink does not belong to its creator's fsuid and fsgid"
+                } else {
+                    "a new symlink in a setgid directory did not take the directory's group"
+                });
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/symlink-owner",
+    smoke_abi_pathx_symlink_belongs_to_its_creator
+);
+
 // `fs/stat.c::SYSCALL_DEFINE2(newstat)` → vfs_stat → cp_new_stat.
 fn smoke_abi_pathx_stat_errnos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
