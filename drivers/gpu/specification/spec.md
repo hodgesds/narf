@@ -11547,6 +11547,18 @@ Unowned}`, recording `FaultInfo` (latest address/status, count) for
 stay masked until the IH owner calls `set_fault_interrupts(true)`;
 `Fault::from_iv(&ih::Iv)` adapts IVs from `ColdBoot::interrupts()` subscriptions
 to `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
+`FaultStatus(status)` decodes `*VM_L2_PROTECTION_FAULT_STATUS` (MORE_FAULTS,
+WALKER_ERROR, PERMISSION_FAULTS, MAPPING_ERROR, CID, RW, VMID; the same
+fields on both hubs). `fault_client(hub, mmhub_version, cid, write)` names
+the client as Linux prints it: `gfxhub_client_ids[cid]` on GFXHUB, and on
+MMHUB `amdgpu_mmhub_client_name(cid, rw)` over the table
+`mmhub_v2_0_init_client_info` picks for the discovered MMHUB IP
+(`mmhub_client_ids_sienna_cichlid` for 2.1.0/2.1.1, `_beige_goby` for
+2.1.2); `None` is "unknown". `Gmc::mmhub_version()` reports that IP and
+`Gmc::status_line(hub, status) -> StatusLine` formats
+`status=… hub=GFX|MM client=NAME (CID) more=… walker=… permission=…
+mapping=… rw=… vmid=…`, which the fault service prints after each of the
+first 16 faults it logs.
 `ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
 
 ### Shared discrete RDNA2 SDMA0 execution proof
