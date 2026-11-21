@@ -2078,3 +2078,25 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi22/dpg-stop",
     vcn3_dpg_gate_powers_down_past_register_wait_timeouts
 );
+
+/// Linux's `amdgpu_vcn_idle_work_handler` ignores `set_pg_state`'s result:
+/// a VCN that cannot gate never stops graphics. A failed gate closes video
+/// to clients; device loss is the TDR's and the fence sampler's to find.
+fn vcn3_failed_gate_closes_video_not_graphics() -> TestResult {
+    let before = crate::amdgpu_navi22_cs::abandoned();
+    for error in [
+        Error::Timeout,
+        Error::DeviceGone,
+        Error::Power(crate::amdgpu_smu_navi22::Error::Rejected(0xfd)),
+    ] {
+        idle::gate_failed(&crate::amdgpu_navi22_boot::Error::Media(error));
+    }
+    if crate::amdgpu_navi22_cs::abandoned() != before {
+        return TestResult::Fail("a failed VCN idle gate abandoned every client submission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/gate-failure",
+    vcn3_failed_gate_closes_video_not_graphics
+);

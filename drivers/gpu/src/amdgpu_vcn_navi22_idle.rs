@@ -341,6 +341,15 @@ pub(crate) fn stop() {
         w.wake();
     }
 }
+/// The idle work failed (the engine is already `Failed`); its task ends.
+pub(crate) fn gate_failed(error: &crate::amdgpu_navi22_boot::Error) {
+    crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 VCN idle failed: {error:?}"
+    );
+}
 pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     MEDIA_ASLEEP.store(false, Ordering::Release);
@@ -366,12 +375,7 @@ pub(crate) fn start() {
                 return;
             };
             if let Err(error) = boot.idle_media(narf_time::monotonic_ns()).await {
-                crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
-                use core::fmt::Write;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: navi22 VCN idle failed: {error:?}"
-                );
+                gate_failed(&error);
                 return;
             }
             match boot.media_idle_recheck(narf_time::monotonic_ns()) {

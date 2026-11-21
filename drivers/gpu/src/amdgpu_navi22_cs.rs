@@ -61,7 +61,16 @@ use crate::amdgpu_uapi as uapi;
 mod jobs;
 static CURRENT: IrqSafeSpinLock<Option<Weak<Submitter>>> = IrqSafeSpinLock::new(None);
 
+/// How many times every client submission was abandoned (kernel tests).
+#[cfg(feature = "kernel-test")]
+static ABANDONED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "kernel-test")]
+pub(crate) fn abandoned() -> u32 {
+    ABANDONED.load(core::sync::atomic::Ordering::Acquire)
+}
 pub(crate) fn abandon(error: FsError) {
+    #[cfg(feature = "kernel-test")]
+    ABANDONED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
     if let Some(current) = current {
         current.jobs.lock().finish(error);
