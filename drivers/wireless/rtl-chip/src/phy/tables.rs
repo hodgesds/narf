@@ -11655,7 +11655,7 @@ const TABLE_12: &[(u16, u32)] = &[
     (0x3f, 0x7deff),
     (0xef, 0x0),
 ];
-pub(super) fn select(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
+pub fn select(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
     if cut > 6 || rfe > 6 || kind > 4 {
         return None;
     }

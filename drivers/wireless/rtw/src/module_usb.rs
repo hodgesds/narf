@@ -1,5 +1,6 @@
-//! rtw88-USB loadable-module datapath — enumerate, chip-config read, and
-//! firmware download. See `drivers/wireless/specification/rtw88-usb-module-datapath.md`.
+//! rtw88-USB loadable-module datapath — enumerate, chip-config read, firmware
+//! download, and MAC/FIFO bring-up. See
+//! `drivers/wireless/specification/rtw88-usb-module-datapath.md`.
 //!
 //! The per-chip probe (`probe_8821cu`/`probe_8822bu`) drives a real rtw88 USB
 //! device entirely through the exported C-ABI (no kernel crates, so the `.ko`'s
@@ -7,19 +8,25 @@
 //!
 //! 1. **Enumerate** (event-driven, mirroring `drivers/usb/ftdi`: one
 //!    outstanding URB advanced from `on_event` under a per-device busy lock) —
-//!    configuration descriptor, bulk IN/OUT endpoint configuration, and a
-//!    Realtek `REG_SYS_CFG1` read (vendor control `0xC0`/`0x05`/`wValue=addr`).
+//!    configuration descriptor (bulk IN + the bulk-OUT pipe count), bulk
+//!    endpoint configuration, and a Realtek `REG_SYS_CFG1` read (vendor control
+//!    `0xC0`/`0x05`/`wValue=addr`).
 //! 2. **Firmware download** (synchronous: `narf_usb_wait`) — fetch the chip's
 //!    firmware blob via `narf_firmware_*`, validate the image header, then DDMA
 //!    every section to the chip (`run`/`section`/`page`, ported from
 //!    `firmware_transport.rs`/`usb_firmware.rs`) over `narf_usb_*` EP0 control
 //!    + BEACON reserved-page bulk writes.
+//! 3. **MAC/FIFO bring-up** (synchronous) — the shared
+//!    `narf-drivers-wireless-rtl-chip` `mac::prepare`, run over the module's
+//!    `UsbRegIo` (the same register sequence the builtin driver programs),
+//!    with the queue/page rows derived from the bulk-OUT pipe count.
 //!
-//! MAC/PHY/IQK/station bring-up, netdev publication and the cfg80211 control
+//! PHY/RF/IQK/station bring-up, netdev publication and the cfg80211 control
 //! plane are the remaining stages.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use narf_drivers_wireless_rtl_chip::mac as chip_mac;
 use narf_drivers_wireless_rtl_chip::{ChipError, RegIo};
 
 /// `usb_device_id` VID/PID match (`narf_bus::module_usb::MATCH_VENDOR_PRODUCT`).
@@ -104,6 +111,8 @@ const ST_UP: u32 = 3;
 const ST_FW_PARSED: u32 = 4;
 /// Firmware sections written to the chip and the MCU released (download done).
 const ST_FW_DOWNLOADED: u32 = 5;
+/// MAC/FIFO bring-up (`mac::prepare`) complete over the synchronous `UsbRegIo`.
+const ST_MAC_UP: u32 = 6;
 const ST_FAILED: u32 = 0xff;
 
 /// rtw88 TX descriptor length / firmware page size (`usb::TX_DESC`, `fw` page).
@@ -284,6 +293,9 @@ struct Device {
     stage: AtomicU32,
     bulk_in: AtomicU32,
     bulk_out: AtomicU32,
+    /// Number of bulk-OUT pipes on the first interface (2..=4), selecting the
+    /// `rqpn_table`/`page_table` row for the MAC queue/FIFO programming.
+    bulk_out_count: AtomicU32,
     config_value: AtomicU32,
     urb: AtomicU64,
     chip_cfg: AtomicU32,
@@ -302,6 +314,7 @@ impl Device {
             stage: AtomicU32::new(0),
             bulk_in: AtomicU32::new(0),
             bulk_out: AtomicU32::new(0),
+            bulk_out_count: AtomicU32::new(0),
             config_value: AtomicU32::new(0),
             urb: AtomicU64::new(0),
             chip_cfg: AtomicU32::new(0),
@@ -333,14 +346,16 @@ fn cookie(slot: usize, event: u64) -> u64 {
     ((slot as u64) << 8) | event
 }
 
-/// Find the first interface's bulk IN and OUT endpoints. Returns
-/// `(bConfigurationValue, bulk_in, bulk_out)`. Slice patterns + `split_at`
-/// only — no indexing that could panic.
-fn parse_config(cfg: &[u8]) -> Option<(u8, u8, u8)> {
+/// Find the first interface's bulk IN endpoint, its first bulk OUT endpoint,
+/// and the count of bulk OUT pipes. Returns
+/// `(bConfigurationValue, bulk_in, bulk_out, bulk_out_count)`. Slice patterns +
+/// `split_at` only — no indexing that could panic.
+fn parse_config(cfg: &[u8]) -> Option<(u8, u8, u8, u8)> {
     let &[_, 0x02, _, _, _, config_value, ..] = cfg else {
         return None;
     };
     let (mut bulk_in, mut bulk_out) = (0u8, 0u8);
+    let mut bulk_out_count = 0u8;
     let mut in_first_interface = false;
     let mut rest = cfg;
     while let Some(&len) = rest.first() {
@@ -360,10 +375,15 @@ fn parse_config(cfg: &[u8]) -> Option<(u8, u8, u8)> {
             }
             &[_, 0x05, address, attributes, ..] if len >= 7 && in_first_interface => {
                 if attributes & 0x03 == 2 {
-                    if address & 0x80 != 0 && bulk_in == 0 {
-                        bulk_in = address;
-                    } else if address & 0x80 == 0 && bulk_out == 0 {
-                        bulk_out = address;
+                    if address & 0x80 != 0 {
+                        if bulk_in == 0 {
+                            bulk_in = address;
+                        }
+                    } else {
+                        if bulk_out == 0 {
+                            bulk_out = address;
+                        }
+                        bulk_out_count = bulk_out_count.saturating_add(1);
                     }
                 }
             }
@@ -371,7 +391,7 @@ fn parse_config(cfg: &[u8]) -> Option<(u8, u8, u8)> {
         }
         rest = tail;
     }
-    (bulk_in != 0 && bulk_out != 0).then_some((config_value, bulk_in, bulk_out))
+    (bulk_in != 0 && bulk_out != 0).then_some((config_value, bulk_in, bulk_out, bulk_out_count))
 }
 
 /// Claim the first free device slot for `token`.
@@ -417,7 +437,7 @@ fn start_probe(dev_token: u64, did: u16) -> i32 {
     // `cfg_len <= CONFIG_BUF` (the export refuses a short buffer).
     let cfg =
         unsafe { core::slice::from_raw_parts(cfg.as_ptr().cast::<u8>(), cfg_len.min(CONFIG_BUF)) };
-    let Some((config_value, bulk_in, bulk_out)) = parse_config(cfg) else {
+    let Some((config_value, bulk_in, bulk_out, bulk_out_count)) = parse_config(cfg) else {
         dev.token.store(0, Ordering::Release);
         return EIO;
     };
@@ -425,6 +445,8 @@ fn start_probe(dev_token: u64, did: u16) -> i32 {
         .store(u32::from(config_value), Ordering::Relaxed);
     dev.bulk_in.store(u32::from(bulk_in), Ordering::Relaxed);
     dev.bulk_out.store(u32::from(bulk_out), Ordering::Relaxed);
+    dev.bulk_out_count
+        .store(u32::from(bulk_out_count), Ordering::Relaxed);
 
     // Configure the bulk endpoints; completion advances the state machine.
     let endpoints = [bulk_in, bulk_out];
@@ -514,12 +536,18 @@ fn on_setup(dev: &Device, slot: usize) {
             dev.stage.store(ST_UP, Ordering::Release);
             // Enumeration proven. Fetch the firmware over `narf_firmware_*`,
             // validate its header, and DDMA every section to the chip over
-            // `narf_usb_*`. Firmware fetch and the download transfers are
-            // synchronous (poll/wait), so the whole stage runs inline on this
-            // completion.
+            // `narf_usb_*`, then run the shared MAC/FIFO bring-up. Firmware
+            // fetch, the download transfers and the MAC register sequence are
+            // all synchronous (poll/wait), so the whole stage runs inline on
+            // this completion.
             dev.stage.store(ST_FW_PARSED, Ordering::Release);
-            if firmware_download(dev) {
-                dev.stage.store(ST_FW_DOWNLOADED, Ordering::Release);
+            if !firmware_download(dev) {
+                dev.stage.store(ST_FAILED, Ordering::Release);
+                return;
+            }
+            dev.stage.store(ST_FW_DOWNLOADED, Ordering::Release);
+            if mac_up(dev) {
+                dev.stage.store(ST_MAC_UP, Ordering::Release);
             } else {
                 dev.stage.store(ST_FAILED, Ordering::Release);
             }
@@ -631,11 +659,11 @@ fn reg_poll32(t: u64, a: u16, mask: u32, target: u32) -> Option<()> {
 
 /// [`RegIo`] over the `.ko`'s synchronous `narf_usb_*` EP0 control path.
 ///
-/// The MAC/PHY/RF/station bring-up is migrating into
-/// `narf-drivers-wireless-rtl-chip` generic over `RegIo`; in the module build
-/// it will run against this adapter (the builtin driver supplies its own
-/// `RegIo` over the native transport). The firmware download above uses the
-/// free `reg_*`/`ctl_*` helpers today and moves onto the trait with that work.
+/// The shared `narf-drivers-wireless-rtl-chip` bring-up (`mac::prepare`, and
+/// the PHY/RF/station stages as they move) runs against this adapter in the
+/// module build; the builtin driver supplies its own `RegIo` over the native
+/// transport. (The firmware download above predates the trait and still uses
+/// the free `reg_*`/`ctl_*` helpers, which `UsbRegIo` wraps.)
 struct UsbRegIo {
     token: u64,
 }
@@ -931,6 +959,25 @@ fn firmware_download(dev: &Device) -> bool {
     // SAFETY: `handle` came from the matching open above.
     let close = unsafe { narf_firmware_close(handle) };
     ok && close == 0
+}
+
+/// Run the shared MAC/FIFO bring-up (`mac::prepare`) over the module's
+/// synchronous [`UsbRegIo`] once the firmware is downloaded. The queue/page
+/// rows come from the bulk-out pipe count; the burst defaults to High — the
+/// `narf_usb_*` C-ABI does not expose the enumerated device speed, and High is
+/// the common case for these dongles (a wrong burst only detunes RX DMA
+/// aggregation, it does not break bring-up).
+fn mac_up(dev: &Device) -> bool {
+    /// `rtw_usb_init_burst_pkt_len` selector for a High-speed device.
+    const BURST_HIGH: u8 = 1;
+    let did = dev.did.load(Ordering::Acquire) as u16;
+    let token = dev.token.load(Ordering::Acquire);
+    let bulkout = dev.bulk_out_count.load(Ordering::Acquire) as usize;
+    let Some(params) = chip_mac::usb_mac_params(did, bulkout, BURST_HIGH) else {
+        return false;
+    };
+    let mut io = UsbRegIo { token };
+    block_on(chip_mac::prepare(&mut io, did, params)).is_ok()
 }
 
 extern "C" fn on_event(cookie: u64) -> i32 {

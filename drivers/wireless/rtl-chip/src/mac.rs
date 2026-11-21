@@ -70,6 +70,78 @@ pub struct UsbMacParams {
     pub burst: u8,
 }
 
+/// `rtw8821c.c::rqpn_table_8821c` (row-for-row equal to `rqpn_table_8822b`),
+/// indexed by the bulk-out pipe count. Each row is (vo, vi, be, bk, mg, hi) of
+/// `enum rtw_dma_mapping` values (Extra 0, Low 1, Normal 2, High 3).
+const USB_RQPN: [[u8; 6]; 5] = [
+    [2, 2, 1, 1, 0, 3],
+    [2, 2, 1, 1, 0, 3],
+    [2, 2, 2, 3, 3, 3],
+    [2, 2, 1, 1, 3, 3],
+    [2, 2, 1, 1, 0, 3],
+];
+/// `rtw8821c.c::page_table_8821c` / `rtw8822b.c::page_table_8822b`, indexed by
+/// the bulk-out pipe count. Each row is (hq, nq, lq, exq); the dies differ only
+/// in the per-queue page count (16 vs 64).
+const USB_PAGES_8821C: [[u32; 4]; 5] = [
+    [16, 16, 16, 14],
+    [16, 16, 16, 14],
+    [16, 16, 0, 0],
+    [16, 16, 16, 0],
+    [16, 16, 16, 14],
+];
+const USB_PAGES_8822B: [[u32; 4]; 5] = [
+    [64, 64, 64, 64],
+    [64, 64, 64, 64],
+    [64, 64, 0, 0],
+    [64, 64, 64, 0],
+    [64, 64, 64, 64],
+];
+/// `rtw8821c.c`/`rtw8822b.c` `usb_tx_agg_desc_num`.
+const USB_TX_AGG_DESC_NUM: u8 = 3;
+
+/// [`MacParams`] for a USB device: the `txdma_queue_mapping` / page rows for a
+/// `bulkout` pipe count (2..=4) and die `did` (RTL8821CU `0xc821` / RTL8822BU
+/// `0xb822`), plus the burst/aggregation tails. `burst` is the
+/// `rtw_usb_init_burst_pkt_len` selector (Super 0 / High 1 / Full 2). `None`
+/// for an unsupported die or pipe count (`txdma_queue_mapping` /
+/// `priority_queue_cfg` reject those).
+///
+/// `#[inline]` so a `module`-build `.ko` codegens it locally rather than
+/// leaving an undefined cross-crate symbol (the `.ko` is a single relocatable
+/// object; only the kernel-ABI exports may stay undefined).
+#[inline]
+pub fn usb_mac_params(did: u16, bulkout: usize, burst: u8) -> Option<MacParams> {
+    if !(2..=4).contains(&bulkout) {
+        return None;
+    }
+    let page_rows = match did {
+        0xc821 => &USB_PAGES_8821C,
+        0xb822 => &USB_PAGES_8822B,
+        _ => return None,
+    };
+    // mac.c::txdma_queue_mapping REG_TXDMA_PQ_MAP:
+    // (hi<<14)|(mg<<12)|(bk<<10)|(be<<8)|(vi<<6)|(vo<<4).
+    let r = USB_RQPN[bulkout];
+    let txdma_pq_map = (u32::from(r[5]) << 14)
+        | (u32::from(r[4]) << 12)
+        | (u32::from(r[3]) << 10)
+        | (u32::from(r[2]) << 8)
+        | (u32::from(r[1]) << 6)
+        | (u32::from(r[0]) << 4);
+    // FIFOPAGE_INFO_1..4 = hq, lq, nq, exq (the page row is hq, nq, lq, exq).
+    let p = page_rows[bulkout];
+    let pages = [p[0], p[2], p[1], p[3]];
+    Some(MacParams {
+        txdma_pq_map,
+        pages,
+        usb: Some(UsbMacParams {
+            tx_agg_desc_num: USB_TX_AGG_DESC_NUM,
+            burst,
+        }),
+    })
+}
+
 async fn w8(io: &mut impl Io, reg: u16, value: u32) -> Result<(), Error> {
     io.write8(reg, value as u8).await
 }

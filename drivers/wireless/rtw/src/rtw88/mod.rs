@@ -39,7 +39,10 @@
 
 #![allow(dead_code)]
 
-mod band5;
+/// 5GHz channel facts + the `Width` bandwidth type, shared with the loadable
+/// `.ko` (lives in `narf-drivers-wireless-rtl-chip`); re-exported so the
+/// in-crate `super::band5::…` users resolve unchanged.
+pub(crate) use narf_drivers_wireless_rtl_chip::band5;
 mod bf;
 mod calibration8821c;
 mod calibration8822b;
@@ -106,6 +109,7 @@ pub use tx_ba_power::Request as TxBaRequest;
 #[cfg(feature = "kernel-test")]
 mod rx_ba_tests;
 pub use rx_ba_power::Request as RxBaRequest;
+mod chip_bridge;
 #[cfg(feature = "kernel-test")]
 mod ht_tests;
 pub(super) mod interface;
