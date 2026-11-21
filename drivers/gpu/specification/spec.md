@@ -12015,7 +12015,12 @@ all-ones reads still fail rather than proving readiness.
 `unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
-every started ring and waits (1 s) for the fences; register waits are bounded
+every started ring and waits (1 s) for the fences. Each encoder IB names only
+its 13 package dwords (session info, task info, op), Linux's `ib->length_dw`
+after `amdgpu_vcn_enc_get_create_msg`/`_destroy_msg`: the firmware walks every
+dword the IB names as packages, and a zero-sized one past the op never
+returns (on the RX 6750 XT both encode rings stopped there, RPTR 0x40, and the
+VCPU no longer served decode). Register waits are bounded
 by 100 ms. As `amdgpu_ib_ring_tests`, each ring is tested on its own: a ring
 that fails is not ready (its `Proof::{dec_ib, enc_ib}` stays 0, so it takes no
 client job and is left out of idle accounting) while the rings that passed
