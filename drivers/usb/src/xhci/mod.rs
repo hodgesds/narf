@@ -77,6 +77,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod bulk_owner;
 mod bulk_stop;
 mod bulk_stop_native;
+mod cmd_abort;
 mod completion;
 mod control_cancel;
 #[cfg(feature = "kernel-test")]
@@ -143,6 +144,11 @@ const OP_PAGESIZE: u64 = 0x08; // u32
 const OP_CRCR: u64 = 0x18; // u64
 const OP_DCBAAP: u64 = 0x30; // u64
 const OP_CONFIG: u64 = 0x38; // u32
+
+// CRCR bits (xHCI 1.2 §5.4.5).
+const CRCR_RCS: u32 = 1 << 0; // Ring Cycle State
+const CRCR_CA: u32 = 1 << 2; // Command Abort
+const CRCR_CRR: u32 = 1 << 3; // Command Ring Running (RO)
 
 /// Port Register Set base (relative to operational base, §5.4.8).
 /// Each port is a 16-byte block: PORTSC / PORTPMSC / PORTLI / PORTHLPMC.
@@ -589,6 +595,18 @@ pub struct Xhci {
     /// an endpoint's owner when a Transfer Event for it arrives, the shape
     /// of a Linux URB completion handler (`btusb_intr_complete`).
     endpoint_wakers: IrqSafeSpinLock<Vec<(u8, u8, core::task::Waker)>>,
+    /// A command-ring abort is in progress (`cmd_abort`): new commands
+    /// are queued without ringing the doorbell, as Linux's
+    /// `CMD_RING_STATE_ABORTED` suppresses `xhci_ring_cmd_db`, and a
+    /// second timed-out waiter leaves the abort to the first.
+    cmd_abort_active: core::sync::atomic::AtomicBool,
+    /// TRB pointer of the last command the controller completed: the
+    /// command after it is the one the ring is executing.
+    cmd_last_completion: AtomicU64,
+    /// The controller must be reset (a Stop Endpoint timed out, a
+    /// command-ring abort failed, or USBSTS reported HSE/HCE): the
+    /// supervisor runs `recover_controller` (Linux `xhci_hc_died`).
+    fatal_error: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1158,7 +1176,23 @@ impl Xhci {
     /// poll this to decide between `soft_recover` (no slots owned)
     /// and `recover_controller` (slots owned).
     pub fn needs_recovery(&self) -> bool {
-        self.usbsts() & USBSTS_HCE != 0
+        self.fatal_error.load(Ordering::Acquire) || self.usbsts() & USBSTS_HCE != 0
+    }
+
+    /// Mark the controller dead until `recover_controller` resets it
+    /// (Linux `xhci_hc_died`), and wake the supervisor that runs the
+    /// recovery.
+    fn request_recovery(&self, why: &str) {
+        if !self.fatal_error.swap(true, Ordering::AcqRel) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci{}: {} — controller reset requested",
+                self.id,
+                why
+            );
+        }
+        self.wake_supervisor();
     }
 
     /// Number of completed full controller recoveries since
@@ -1240,12 +1274,14 @@ impl Xhci {
         drop(drained);
 
         self.command_completions.lock().clear();
+        self.cmd_last_completion.store(0, Ordering::Release);
         slots.reset();
         // `slots` stays in scope until the restart completes, so the
         // reservation is held across `reprogram_and_restart` as the
         // fn-level contract states.
         self.reprogram_and_restart()?;
 
+        self.fatal_error.store(false, Ordering::Release);
         let epoch = self.recovery_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(epoch)
     }
@@ -1974,6 +2010,9 @@ impl Xhci {
             bus_addr: device.addr,
             supervisor_waker: IrqSafeSpinLock::new(None),
             endpoint_wakers: IrqSafeSpinLock::new(Vec::new()),
+            cmd_abort_active: core::sync::atomic::AtomicBool::new(false),
+            cmd_last_completion: AtomicU64::new(0),
+            fatal_error: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2576,7 +2615,12 @@ impl Xhci {
         *enq_g += 1;
         drop(enq_g);
         drop(pcs_g);
-        self.ring_command_doorbell();
+        // While an abort stops the ring the TRB stays queued; the
+        // abort's restart rings the doorbell (Linux `xhci_ring_cmd_db`
+        // returns early unless the ring state is Running).
+        if !self.cmd_abort_active.load(Ordering::Acquire) {
+            self.ring_command_doorbell();
+        }
         Ok(trb_addr)
     }
 
@@ -2723,6 +2767,11 @@ impl Xhci {
     fn latch_owned_event(&self, event: event_wait::Event) -> bool {
         let kind = (event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
         if kind == TRB_TYPE_CMD_COMPLETION {
+            if (event[2] >> 24) as u8 != cmd_abort::CC_COMMAND_RING_STOPPED {
+                let origin = u64::from(event[0]) | u64::from(event[1]) << 32;
+                self.cmd_last_completion
+                    .store(origin & !15, Ordering::Release);
+            }
             return self.command_completions.lock().record(event);
         }
         if kind != TRB_TYPE_TRANSFER_EVENT {
@@ -2852,13 +2901,14 @@ impl Xhci {
 
     /// Await a Command Completion Event for a submitted command
     /// TRB (`command` is the phys address `submit_command_record`
-    /// returned). On timeout the receipt is retired (#884): the
-    /// waiter gives up the ring entry instead of leaving it
-    /// reserved forever, which would wedge the ring at wrap and
-    /// keep `soft_recover` refusing while `active()`. Only
-    /// `CmdTimeout` retires — a consumed event already released
-    /// the receipt, and other errors leave the receipt for the
-    /// recovery paths to clear.
+    /// returned). On timeout the waiter abandons its receipt (#884)
+    /// and the command ring is aborted (`handle_command_timeout`):
+    /// the controller stops executing the command, the abandoned
+    /// commands on the ring become No Ops, and the ring restarts, so
+    /// the entries are released by their completions instead of
+    /// wedging the ring. Only `CmdTimeout` abandons — a consumed
+    /// event already released the receipt, and other errors leave the
+    /// receipt for the recovery paths to clear.
     async fn await_command_event(
         &self,
         command: u64,
@@ -2867,17 +2917,152 @@ impl Xhci {
         match self.await_event(event_wait::Wait::Command, predicate).await {
             Ok(event) => Ok(event),
             Err(XhciError::CmdTimeout) => {
+                let kind = self.command_trb_type(command);
                 self.retire_command_receipt(command);
+                self.handle_command_timeout(command, kind).await;
                 Err(XhciError::CmdTimeout)
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Drop the command-ring receipt for `command` and purge any
-    /// already-queued CCE naming it (one the ISR demuxed after
-    /// the waiter's last scan). A CCE that arrives later still is
-    /// swallowed by the tombstone `retire_pointer` leaves behind.
+    /// TRB type of the command published at `command` (read before any
+    /// No Op rewrite).
+    fn command_trb_type(&self, command: u64) -> u32 {
+        // SAFETY: `command` is a TRB pointer inside the identity-mapped
+        // command ring page this controller published it on.
+        let d3 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(command + 12).kernel_ptr::<u32>())
+        };
+        (d3 & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT
+    }
+
+    /// A command did not complete within its wait: abort the command
+    /// ring so the controller stops executing it and the commands
+    /// queued behind it can run (Linux `xhci_handle_command_timeout`).
+    /// A second waiter timing out during an abort leaves it to the
+    /// first: its abandoned command is turned into a No Op by that
+    /// abort, or by the next timeout if it was queued later.
+    async fn handle_command_timeout(&self, command: u64, kind: u32) {
+        // A controller already marked dead is reset by its supervisor;
+        // aborting again would only stall its waiters.
+        if self.fatal_error.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .cmd_abort_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let outcome = cmd_abort::handle_timeout(&CommandRingAbort { xhci: self }, kind).await;
+        self.cmd_abort_active.store(false, Ordering::Release);
+        if self.timeouts.load(Ordering::Relaxed) <= TIMEOUT_REPORT_LIMIT {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci{}: command trb={:#x} type={} timed out: command ring {:?}",
+                self.id,
+                command,
+                kind,
+                outcome
+            );
+        }
+    }
+
+    /// Write CRCR with Command Abort. CRCR's pointer field is ignored
+    /// while the ring runs, but some controllers need all 64 bits
+    /// written, and if the ring stops between the two halves the
+    /// pointer takes effect, so it names the command the ring is
+    /// executing (Linux `xhci_abort_cmd_ring` keeps it valid the same
+    /// way): if it is abandoned it becomes a No Op before the restart.
+    fn write_command_abort(&self) {
+        let ring = self.cmd_ring.dma_addr().raw();
+        let last = self.cmd_last_completion.load(Ordering::Acquire);
+        let mut head = if last >= ring && last < ring + (CMD_RING_TRBS * 16) as u64 {
+            ((last - ring) / 16) as usize + 1
+        } else {
+            0
+        };
+        if head >= CMD_RING_TRBS - 1 {
+            head = 0;
+        }
+        let (enqueue, pcs) = {
+            let enq_g = self.cmd_enqueue.lock();
+            let pcs_g = self.cmd_pcs.lock();
+            (*enq_g, *pcs_g)
+        };
+        let enqueue = if enqueue >= CMD_RING_TRBS - 1 {
+            0
+        } else {
+            enqueue
+        };
+        let pointer = ring + (head * 16) as u64;
+        let cycle = if head == enqueue {
+            pcs & TRB_CYCLE_BIT
+        } else {
+            // SAFETY: `pointer` names a TRB of the identity-mapped
+            // command ring page.
+            let d3 = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(pointer + 12).kernel_ptr::<u32>(),
+                )
+            };
+            d3 & TRB_CYCLE_BIT
+        };
+        // SAFETY: identity-mapped MMIO; CRCR is a 64-bit operational
+        // register written low dword first, as `bring_up` does.
+        unsafe {
+            self.mmio.write32(
+                self.op_off + OP_CRCR,
+                (pointer as u32 & !0x3F) | CRCR_CA | (cycle & CRCR_RCS),
+            );
+            self.mmio
+                .write32(self.op_off + OP_CRCR + 4, (pointer >> 32) as u32);
+        }
+    }
+
+    /// Rewrite every abandoned command still on the ring as a No Op
+    /// Command TRB, keeping its cycle bit (Linux `trb_to_noop`), so the
+    /// restarted ring completes it instead of executing it.
+    fn noop_abandoned_commands(&self) -> usize {
+        // Serialize with command publication (`submit_command_record`
+        // takes the enqueue lock before the receipts).
+        let _enq_g = self.cmd_enqueue.lock();
+        let entries = self.command_completions.lock().abandoned_entries();
+        let ring = self.cmd_ring.dma_addr().raw();
+        for &entry in &entries {
+            let trb = ring + (entry * 16) as u64;
+            // SAFETY: identity-mapped DMA; `entry` is a data TRB of the
+            // command ring the controller is stopped on.
+            unsafe {
+                let d3 = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(trb + 12).kernel_ptr::<u32>(),
+                );
+                for offset in [0u64, 4, 8] {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(trb + offset).kernel_mut_ptr::<u32>(),
+                        0,
+                    );
+                }
+                self.cmd_ring.sync(entry * 16, 16);
+                device_dma_barrier();
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb + 12).kernel_mut_ptr::<u32>(),
+                    (cmd_abort::TRB_NO_OP_COMMAND << TRB_TYPE_SHIFT) | (d3 & TRB_CYCLE_BIT),
+                );
+            }
+            self.cmd_ring.sync(entry * 16, 16);
+            device_dma_barrier();
+        }
+        entries.len()
+    }
+
+    /// Abandon the command-ring receipt for `command` and purge any
+    /// already-queued CCE naming it. The entry stays reserved until
+    /// the controller's completion for it (normal, Command Aborted or
+    /// No Op) arrives; `record` swallows that completion.
     fn retire_command_receipt(&self, command: u64) {
         self.command_completions.lock().retire_pointer(command);
         self.cmd_events
@@ -6091,6 +6276,44 @@ impl control_cancel::Bus for ControlCancel<'_> {
         device.ctrl_pcs = plan.cycle;
         device.endpoint_configuration = false;
         Ok(())
+    }
+}
+
+/// xHCI adapter for the command-ring abort coordinator
+/// (`cmd_abort::handle_timeout`).
+struct CommandRingAbort<'a> {
+    xhci: &'a Xhci,
+}
+impl cmd_abort::Bus for CommandRingAbort<'_> {
+    fn ring_running(&self) -> bool {
+        // SAFETY: identity-mapped MMIO; CRCR reads return CRR (the
+        // pointer field reads as zero).
+        unsafe { self.xhci.mmio.read32(self.xhci.op_off + OP_CRCR) & CRCR_CRR != 0 }
+    }
+    fn write_abort(&self) {
+        self.xhci.write_command_abort();
+    }
+    fn take_ring_stopped(&self) -> bool {
+        self.xhci.drain_events();
+        self.xhci.command_completions.lock().take_ring_stopped()
+    }
+    fn noop_abandoned(&self) -> usize {
+        self.xhci.noop_abandoned_commands()
+    }
+    fn restart(&self) {
+        if self.xhci.command_completions.lock().active() {
+            self.xhci.ring_command_doorbell();
+        }
+    }
+    fn fatal(&self) {
+        self.xhci
+            .request_recovery("command ring did not stop or a Stop Endpoint timed out");
+    }
+    fn now_ms(&self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1_000_000
+    }
+    async fn pause(&self) {
+        narf_scheduler::yield_now().await;
     }
 }
 
