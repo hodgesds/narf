@@ -123,9 +123,12 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
      link (`reset_dio_stream_encoder`). Linux's earlier `enable_fifo` in
      `setup_dio_stream_encoder` is not repeated, because unblank resets and
      re-enables the FIFO anyway.
-   - `enc1_stream_encoder_dp_blank` (both DCNs) sets
-     `DP_VID_STREAM_DIS_DEFER = 2`, waits up to about 102 ms and then sets
-     `DP_STEER_FIFO_RESET`. NARF's `blank` waits 50 ms and does neither.
+   - ~~DP blank skipped the vblank defer and steering reset~~ (fixed).
+     `enc1_stream_encoder_dp_blank` (every DCN this module serves) leaves a
+     disabled stream alone. Otherwise it sets `DP_VID_STREAM_DIS_DEFER = 2`,
+     drops the enable, waits up to 100.2 ms for `DP_VID_STREAM_STATUS` to clear,
+     then sets `DP_STEER_FIFO_RESET`. NARF now does the same, except that a
+     timeout is an error and the steering reset is then withheld.
 6. DCCG: `dccg31.c` pixel-rate and DTBCLK paths.
 7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
    `dcn315_clk_mgr.c` DPM table parse.

@@ -33,8 +33,19 @@ const DP_MSA_TIMING_PARAM2: u64 = 0x214d; // linux: mmDP0_DP_MSA_TIMING_PARAM2
 const DP_MSA_TIMING_PARAM3: u64 = 0x214e; // linux: mmDP0_DP_MSA_TIMING_PARAM3
 const DP_MSA_TIMING_PARAM4: u64 = 0x214f; // linux: mmDP0_DP_MSA_TIMING_PARAM4
 const STRIDE: u64 = 0x100; // linux: mmDP1_DP_PIXEL_FORMAT - mmDP0_DP_PIXEL_FORMAT
-                           // The DIG front end beside each DP block, at the same 0x100 stride
-                           // (regDIG1_DIG_FIFO_CTRL0 0x2191 against DIG0's 0x2091).
+const DP_VID_STREAM_ENABLE: u32 = 0x0000_0001; // linux: DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
+const DP_VID_STREAM_DIS_DEFER: u32 = 0x0000_0300; // linux: DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_DIS_DEFER_MASK
+const DP_VID_STREAM_STATUS: u32 = 0x0001_0000; // linux: DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS_MASK
+const DP_STEER_FIFO_RESET: u32 = 0x0000_0001; // linux: DP0_DP_STEER_FIFO__DP_STEER_FIFO_RESET_MASK
+/// DP_VID_STREAM_DIS_DEFER 2: disable at the start of the next vertical blank.
+// linux: n/a (literal 2 in dcn10_stream_encoder.c:enc1_stream_encoder_dp_blank)
+const DIS_DEFER_NEXT_VBLANK: u32 = 2;
+/// `enc1_stream_encoder_dp_blank` polls 10 µs × DP_BLANK_MAX_RETRY (20) × 501
+/// = 100.2 ms, "the minimum 10 Hz mode + a little more".
+// linux: n/a (DP_BLANK_MAX_RETRY * 501 REG_WAIT polls of 10 us)
+const BLANK_TIMEOUT_MS: u64 = 101;
+// The DIG front end beside each DP block, at the same 0x100 stride
+// (regDIG1_DIG_FIFO_CTRL0 0x2191 against DIG0's 0x2091).
 const DIG_FE_CNTL: u64 = 0x208b; // linux: mmDIG0_DIG_FE_CNTL
 const DIG_FIFO_CTRL0: u64 = 0x2091; // linux: mmDIG0_DIG_FIFO_CTRL0
 const DIG_SYMCLK_FE_ON: u32 = 0x0100_0000; // linux: DIG0_DIG_FE_CNTL__DIG_SYMCLK_FE_ON_MASK
@@ -436,38 +447,64 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// Stop the stream and wait for the encoder to confirm it has stopped.
+    /// `enc1_stream_encoder_dp_blank` — every encoder here uses it
+    /// (`dcn30_str_enc_funcs`, and dcn314's, whose `dig_fifo_off_in_blank` is
+    /// off). A stream that is not enabled is left untouched. Otherwise the
+    /// disable is deferred to the start of the next vertical blank, so the
+    /// sink never sees a frame cut mid-line, and the wait covers a whole 10 Hz
+    /// frame. Only once the encoder reports stopped is DP_STEER_FIFO_RESET set,
+    /// telling the encoder to ignore the CRTC's timing until `unblank`
+    /// releases it; setting it earlier leaves DP_VID_STREAM_STATUS stuck at 1.
+    ///
+    /// LINUX-GAP: Linux's REG_WAIT only logs a timeout and sets the steering
+    /// reset anyway. A stream that never reports stopped is a `Timeout` here,
+    /// and the reset Linux's own comment says would wedge it is not issued.
     async fn blank(&mut self) -> Result<(), Error> {
-        // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
-        self.update(DP_VID_STREAM_CNTL, 1, 0)?;
         let status = self.reg(DP_VID_STREAM_CNTL);
-        let deadline = narf_time::Deadline::after_ms(50);
-        #[cfg(feature = "kernel-test")]
-        let mut polls = self.io.wait_poll_limit();
-        loop {
-            let value = self.access(|io| io.read(status))?;
-            if value == u32::MAX {
-                return Err(Error::DeviceGone);
-            }
-            // linux-lit: 16=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS__SHIFT
-            if value & 1 << 16 == 0 {
-                self.state = State::Programmed;
-                return Ok(());
-            }
+        let value = self.access(|io| io.read(status))?;
+        if value == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        if value & DP_VID_STREAM_ENABLE != 0 {
+            self.update(
+                DP_VID_STREAM_CNTL,
+                DP_VID_STREAM_DIS_DEFER,
+                DIS_DEFER_NEXT_VBLANK << DP_VID_STREAM_DIS_DEFER.trailing_zeros(),
+            )?;
+            self.update(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, 0)?;
+            let deadline = narf_time::Deadline::after_ms(BLANK_TIMEOUT_MS);
             #[cfg(feature = "kernel-test")]
-            if let Some(left) = &mut polls {
-                if *left == 0 {
+            let mut polls = self.io.wait_poll_limit();
+            loop {
+                let value = self.access(|io| io.read(status))?;
+                if value == u32::MAX {
+                    return Err(Error::DeviceGone);
+                }
+                if value & DP_VID_STREAM_STATUS == 0 {
+                    break;
+                }
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        return Err(Error::Timeout);
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
+                if deadline.expired() {
                     return Err(Error::Timeout);
                 }
-                *left -= 1;
-                narf_scheduler::yield_now().await;
-                continue;
+                delay_us(1000).await;
             }
-            if deadline.expired() {
-                return Err(Error::Timeout);
-            }
-            delay_us(1000).await;
+            self.update(DP_STEER_FIFO, DP_STEER_FIFO_RESET, DP_STEER_FIFO_RESET)?;
         }
+        // A blank does not program anything: an encoder that was never
+        // described to the sink stays unprogrammed, so `unblank` still refuses.
+        if self.state == State::Streaming {
+            self.state = State::Programmed;
+        }
+        Ok(())
     }
 }
 

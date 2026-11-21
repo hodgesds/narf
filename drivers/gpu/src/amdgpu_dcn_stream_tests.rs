@@ -285,6 +285,8 @@ fn stream_unblank_resets_the_steering_fifo_first() -> TestResult {
     // treated as quiet while it is still sending.
     let mut stuck = engine(2);
     stuck.program(&timing(), Depth::Bpc8).unwrap();
+    // Live: enabled, and its status never drops.
+    stuck.io.values[cntl as usize] |= DP_VID_STREAM_ENABLE;
     stuck.io.stuck = true;
     if run(stuck.blank()) != Err(Error::Timeout) {
         return TestResult::Fail("live stream reported as stopped");
@@ -477,4 +479,74 @@ fn stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-stream",
     stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream
+);
+
+/// `enc1_stream_encoder_dp_blank`, on every profile: an enabled stream gets
+/// DP_VID_STREAM_DIS_DEFER = 2 (next vertical blank) before the enable drops,
+/// and DP_STEER_FIFO_RESET only once DP_VID_STREAM_STATUS reads 0. A stream
+/// that is not enabled is not touched, and a blank never makes an
+/// unprogrammed encoder programmed.
+fn stream_blank_defers_to_vblank_and_resets_steering_after_stop() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314, Profile::Dcn315] {
+        let mut stream = engine(1);
+        stream.profile = profile;
+        stream.program(&timing(), Depth::Bpc8).unwrap();
+        stream.program_rate(148_500, 20).unwrap();
+        run(stream.unblank()).unwrap();
+        stream.io.writes.clear();
+        if run(stream.blank()).is_err() || stream.state != State::Programmed {
+            return TestResult::Fail("blank of a live stream");
+        }
+        let cntl = DP_VID_STREAM_CNTL + STRIDE;
+        let steer = DP_STEER_FIFO + STRIDE;
+        let writes = &stream.io.writes;
+        let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+        let (Some(defer), Some(stop), Some(reset)) = (
+            at(&|r, v| r == cntl && v & DP_VID_STREAM_DIS_DEFER == 2 << 8 && v & 1 != 0),
+            at(&|r, v| r == cntl && v & 1 == 0),
+            at(&|r, v| r == steer && v & DP_STEER_FIFO_RESET != 0),
+        ) else {
+            return TestResult::Fail("blank skipped the defer, stop or steering reset");
+        };
+        if !(defer < stop && stop < reset) {
+            return TestResult::Fail("steering reset must follow the confirmed stop");
+        }
+        if stream.io.values[cntl as usize] & (DP_VID_STREAM_ENABLE | DP_VID_STREAM_DIS_DEFER)
+            != 2 << 8
+            || stream.io.values[steer as usize] & DP_STEER_FIFO_RESET == 0
+        {
+            return TestResult::Fail("blanked encoder state");
+        }
+        // A second blank finds the stream already off and writes nothing.
+        stream.io.writes.clear();
+        if run(stream.blank()).is_err() || !stream.io.writes.is_empty() {
+            return TestResult::Fail("blank touched a stream that was not enabled");
+        }
+        // Blanking an encoder nobody programmed leaves it unprogrammed.
+        let mut idle = engine(1);
+        idle.profile = profile;
+        if run(idle.blank()).is_err()
+            || idle.state != State::Idle
+            || run(idle.unblank()) != Err(Error::Busy)
+        {
+            return TestResult::Fail("blank made an unprogrammed encoder programmed");
+        }
+        // A stream that never reports stopped times out, and the steering
+        // FIFO is not reset over it.
+        let mut stuck = engine(1);
+        stuck.profile = profile;
+        stuck.program(&timing(), Depth::Bpc8).unwrap();
+        stuck.io.values[cntl as usize] |= DP_VID_STREAM_ENABLE;
+        stuck.io.stuck = true;
+        if run(stuck.blank()) != Err(Error::Timeout)
+            || stuck.io.writes.iter().any(|&(r, _)| r == steer)
+        {
+            return TestResult::Fail("steering reset issued over a live stream");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_blank_defers_to_vblank_and_resets_steering_after_stop
 );
