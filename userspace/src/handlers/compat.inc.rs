@@ -5387,7 +5387,14 @@ fn proc_ns_idmap_write(
             "deny" => false,
             _ => return Err(narf_filesystem::FsError::InvalidData),
         };
-        if target_ns.parent().is_none() || !opened.opener_capable(target_ns, CAP_SYS_ADMIN) {
+        // `proc_setgroups_write` judges the request only against the
+        // namespace's state (`write_setgroups`): "allow" after a deny, or
+        // "deny" after a gid_map, is -EPERM — which is what the initial
+        // namespace's identity gid_map makes of "deny". It does not ask
+        // whether the namespace has a parent. The authority to write is the
+        // opener's CAP_SYS_ADMIN over the namespace, which
+        // `proc_setgroups_open` tested and the open captured.
+        if !opened.opener_capable(target_ns, CAP_SYS_ADMIN) {
             return Err(narf_filesystem::FsError::OperationNotPermitted);
         }
         return target_ns
