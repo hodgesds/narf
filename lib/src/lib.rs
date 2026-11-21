@@ -22,6 +22,7 @@ pub mod cputime;
 pub mod deferred_wake;
 pub mod directmap;
 pub mod errno;
+pub mod hung_task;
 pub mod id;
 pub mod intrusive;
 pub mod kstat;

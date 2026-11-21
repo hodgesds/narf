@@ -246,13 +246,16 @@ try-lock reads only):
 | `CPUr: Watchdog detected hard LOCKUP on cpu N (...)` | buddy detector | `watchdog_thresh` (10 s) |
 | `BUG: executor lockup - CPU#N idle with runnable work for Ns! [comm:pid]` | workqueue lockup | `2 * watchdog_thresh` |
 | `BUG: CPU#N: task [comm:pid] runnable for Ns without running` | `wq_watchdog_timer_fn` per task | `workqueue.watchdog_thresh` (10 s; Linux's workqueue default is 30) |
-| `INFO: task comm:pid blocked for more than N seconds.` | `check_hung_uninterruptible_tasks` | `sysctl.kernel.hung_task_timeout_secs` (120), `sysctl.kernel.hung_task_warnings` (10) |
+| `INFO: task comm:pid blocked for more than N seconds.` (user and kernel tasks) | `check_hung_uninterruptible_tasks` | `sysctl.kernel.hung_task_timeout_secs` (120), `sysctl.kernel.hung_task_warnings` (10) |
 
 A kernel task is named `comm:id`, `comm` being the function its future came
 from (`narf_scheduler::origin_comm`), as Linux names a kthread. The
 runnable report adds the task's holding place, spawn site and affinity and
 the CPU's current task, scheduling-point count and last-tick RIP with its
-symbol.
+symbol; the kernel hung-task report adds the kind of wait
+(`narf_lib::hung_task`: `mutex`, `btrfs txn join`, `btrfs txn close`), the
+waiting call's site, the lock or gate address and the kind's detail (waiter
+id, closing task, operations joined).
 
 ## 4. Invariants & safety properties
 

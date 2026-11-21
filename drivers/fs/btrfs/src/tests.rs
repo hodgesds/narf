@@ -28,6 +28,7 @@ mod data_cache;
 mod extent_window;
 mod group_commit;
 mod grow_tall;
+mod hung_wait;
 mod inode_lock;
 mod mirror_repair;
 mod ordered_data;

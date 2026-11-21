@@ -371,6 +371,44 @@ pub fn cputime_adjust(stime: u64, utime: u64, rtime: u64,
     prev: &mut (u64, u64)) -> (u64, u64);            // Linux cputime_adjust
 ```
 
+### 3.12 Uninterruptible kernel waits (`hung_task`)
+
+```rust
+pub struct WaitKind { pub name: &'static str, pub detail: &'static str }
+pub static MUTEX: WaitKind;                 // async Mutex waiter; detail = waiter id
+pub const MAX_BLOCKED: usize = 256;
+pub fn set_hooks(current_task: fn() -> u64, now_ns: fn() -> u64);
+pub struct BlockedWait;                     // held by the waiting future
+impl BlockedWait {
+    pub const fn new() -> Self;
+    pub fn block(&mut self, kind: &'static WaitKind,
+                 site: &'static core::panic::Location<'static>,
+                 object: usize, detail: u64);
+    pub fn wake(&mut self);                 // also on Drop
+    pub const fn is_blocked(&self) -> bool;
+}
+pub struct BlockedInfo { pub owner: u64, pub since_ns: u64, pub kind: &'static WaitKind,
+                         pub site: Option<&'static core::panic::Location<'static>>,
+                         pub object: usize, pub detail: u64 }
+pub fn for_each_blocked(f: impl FnMut(&BlockedInfo));
+pub const fn owner_is_anonymous(owner: u64) -> bool;
+pub fn overflowed() -> u64;
+```
+
+Linux's `TASK_UNINTERRUPTIBLE` for async kernel code, so the hung-task
+detector sees kernel tasks. A future that waits the way Linux waits
+uninterruptibly (`Mutex::lock` — `__mutex_lock_common`; the btrfs
+transaction gate's join and close) records the wait on its first `Pending`
+— the owner (the scheduler task being polled, or `1 << 63 | cpu` outside
+any task), when it began, the kind, the waiting call's site, the lock's
+address and a kind-specific detail — and releases it on `Ready` or drop.
+Re-polls of the same wait keep its start. The table is fixed-size and
+lock-free: a claim is one compare-exchange per slot tried, on the wait's
+slow path only; a full table counts (`overflowed`) and does not track.
+`for_each_blocked` never blocks a waiter and allocates nothing (the stall
+watchdog scans it from a timer interrupt); a slot changing hands mid-read
+is skipped. Nothing is recorded until the scheduler installs `set_hooks`.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a
