@@ -641,32 +641,58 @@ struct UsbRegIo {
 }
 
 impl RegIo for UsbRegIo {
-    fn read8(&mut self, reg: u16) -> Result<u8, ChipError> {
+    // Each width wraps a blocking `narf_usb_*` EP0 control transfer, so the
+    // futures are immediately ready; `async fn` satisfies the trait's `+ Send`
+    // bound since `UsbRegIo` holds only a `u64` token.
+    async fn read8(&mut self, reg: u16) -> Result<u8, ChipError> {
         reg_read8(self.token, reg).ok_or(ChipError::Access)
     }
-    fn read16(&mut self, reg: u16) -> Result<u16, ChipError> {
+    async fn read16(&mut self, reg: u16) -> Result<u16, ChipError> {
         reg_read16(self.token, reg).ok_or(ChipError::Access)
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, ChipError> {
+    async fn read32(&mut self, reg: u16) -> Result<u32, ChipError> {
         reg_read32(self.token, reg).ok_or(ChipError::Access)
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), ChipError> {
+    async fn write8(&mut self, reg: u16, value: u8) -> Result<(), ChipError> {
         reg_write8(self.token, reg, value).ok_or(ChipError::Access)
     }
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), ChipError> {
+    async fn write16(&mut self, reg: u16, value: u16) -> Result<(), ChipError> {
         reg_write16(self.token, reg, value).ok_or(ChipError::Access)
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), ChipError> {
+    async fn write32(&mut self, reg: u16, value: u32) -> Result<(), ChipError> {
         reg_write32(self.token, reg, value).ok_or(ChipError::Access)
     }
-    fn delay_us(&mut self, us: u32) {
+    async fn delay_us(&mut self, us: u32) {
         // Coarse busy delay; the bring-up's real pacing is register readback.
         // The volatile counter keeps the loop from being optimised away.
         let mut spin = 0u32;
         for _ in 0..us.saturating_mul(40) {
-            // SAFETY: `spin` is a local; the volatile access just blocks DCE.
+            // SAFETY: `spin` is a local; the volatile access blocks DCE.
             unsafe { core::ptr::write_volatile(&mut spin, spin.wrapping_add(1)) };
         }
+    }
+}
+
+/// Drive a `RegIo` bring-up future to completion synchronously. The module's
+/// `RegIo` futures never pend (each wraps a blocking `narf_usb_*` call), so a
+/// no-op waker + single poll chain suffices — no allocator, no runtime.
+fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    const VT: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VT),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: the vtable's clone returns a valid RawWaker; wake/drop are no-ops.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        core::hint::spin_loop();
     }
 }
 

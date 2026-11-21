@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Source-matched `rtw8822b.c::rtw8822b_mac_init`; host DMA/MAC gates remain
-//! closed. Every `WLAN_*`/`FAST_EDCA_*` value `rtw8822b.c` defines is
-//! numerically identical to the RTL8821C set, so the same frozen value table
-//! is reused; the sequence itself is the 8822B one (BIT_PRE_TX_CMD clear, no
-//! PRECNT/INIRTS/ACKTO_CCK/TRXPTCL writes, SND_PTCL before WMAC options).
-use super::rtl8821c::values::*;
-use super::{u8, w16, w8, Error, Io};
-
-/// `reg.h`: `REG_SW_AMPDU_BURST_MODE_CTRL` / `BIT_PRE_TX_CMD`.
-const REG_SW_AMPDU_BURST_MODE_CTRL: u16 = 0x04bc;
-const BIT_PRE_TX_CMD: u32 = 1 << 6;
+//! Source-matched rtw8821c_mac_init; host DMA/MAC gates remain closed.
+use super::{u8, w16, w8};
+use crate::{ChipError as Error, RegIo as Io};
+#[path = "rtl8821c_values.rs"]
+pub(super) mod values;
+use values::*;
 
 pub(super) async fn chip(io: &mut impl Io) -> Result<(), Error> {
-    // protocol configuration
-    u8(io, REG_SW_AMPDU_BURST_MODE_CTRL, BIT_PRE_TX_CMD, 0).await?;
     w8(io, REG_AMPDU_MAX_TIME_V1, WLAN_AMPDU_MAX_TIME).await?;
     u8(io, REG_TX_HANG_CTRL, 0, BIT_EN_EOF_V1).await?;
+    let pre = WLAN_PRE_TXCNT_TIME_TH | BIT_EN_PRECNT;
+    w8(io, REG_PRECNT_CTRL, pre & 255).await?;
+    w8(io, REG_PRECNT_CTRL + 1, pre >> 8).await?;
     io.write32(
         REG_PROT_MODE_CTRL,
         WLAN_RTS_LEN_TH
@@ -38,7 +34,7 @@ pub(super) async fn chip(io: &mut impl Io) -> Result<(), Error> {
     ] {
         w8(io, reg, value).await?;
     }
-    // EDCA configuration
+    u8(io, REG_INIRTS_RATE_SEL, 0, 1 << 5).await?;
     u8(io, REG_TIMER0_SRC_SEL, BIT_TSFT_SEL_TIMER0, 0).await?;
     // Explicit inactive projection: source TXPAUSE=0 never opens RF here.
     w16(io, REG_TXPAUSE, 255).await?;
@@ -54,7 +50,6 @@ pub(super) async fn chip(io: &mut impl Io) -> Result<(), Error> {
     w8(io, REG_DRVERLYINT, WLAN_DRV_EARLY_INT).await?;
     w8(io, REG_BCNDMATIM, WLAN_BCN_DMA_TIME).await?;
     u8(io, REG_TX_PTCL_CTRL + 1, BIT_SIFS_BK_EN >> 8, 0).await?;
-    // WMAC configuration
     w16(io, REG_RXFLTMAP0, WLAN_RX_FILTER0).await?;
     w16(io, REG_RXFLTMAP1, WLAN_RX_FILTER1).await?;
     w16(io, REG_RXFLTMAP2, WLAN_RX_FILTER2).await?;
@@ -62,9 +57,11 @@ pub(super) async fn chip(io: &mut impl Io) -> Result<(), Error> {
     w8(io, REG_RX_PKT_LIMIT, WLAN_RXPKT_MAX_SZ_512).await?;
     w8(io, REG_TCR + 2, WLAN_TX_FUNC_CFG2).await?;
     w8(io, REG_TCR + 1, WLAN_TX_FUNC_CFG1).await?;
+    w8(io, REG_ACKTO_CCK, 0x40).await?;
+    u8(io, REG_WMAC_TRXPTCL_CTL_H, 0, 1 << 1).await?;
+    u8(io, REG_SND_PTCL_CTRL, 0, BIT_DIS_CHK_VHTSIGB_CRC).await?;
     io.write32(REG_WMAC_OPTION_FUNCTION + 8, WLAN_MAC_OPT_FUNC2)
         .await?;
     w8(io, REG_WMAC_OPTION_FUNCTION + 4, WLAN_MAC_OPT_NORM_FUNC1).await?;
-    u8(io, REG_SND_PTCL_CTRL, 0, BIT_DIS_CHK_VHTSIGB_CRC).await?;
     Ok(())
 }
