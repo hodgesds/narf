@@ -107,35 +107,44 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) 
     crate::amdgpu_fence_navi22::notify_all();
 }
 
-/// The client media rings (bit `MediaRing::index()`) whose jobs a timeout
-/// on media fence engine `engine` takes down: every client ring of VCN0's
-/// VCPU (`amdgpu_vcn_reset_engine` resets the instance under its decode and
-/// encode rings), or the JPEG ring.
-pub(crate) fn media_rings(engine: crate::amdgpu_fence_navi22::Engine) -> u8 {
-    use crate::amdgpu_fence_navi22::Engine;
-    use crate::amdgpu_navi22_submit::MediaRing;
-    let rings: &[MediaRing] = match engine {
-        Engine::Vcn0 => &[MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)],
-        Engine::Jpeg => &[MediaRing::Jpeg],
-        _ => &[],
-    };
-    rings.iter().fold(0, |mask, r| mask | 1 << r.index())
+/// The current submitter of `generation`, if one is registered.
+fn current(generation: u64) -> Option<Arc<Submitter>> {
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    current.filter(|current| current.epoch == generation)
 }
-/// A client job on media ring `ring` of `engine` timed out (Linux
-/// `amdgpu_job_timedout` on a video ring): it fails with `-ETIME` and the
-/// other jobs of the engine's rings with `-ECANCELED`; graphics, compute and
-/// SDMA jobs are untouched.
-pub(crate) fn media_hung(
-    engine: crate::amdgpu_fence_navi22::Engine,
-    ring: crate::amdgpu_navi22_submit::MediaRing,
+/// A VCN engine reset force-completed `cancelled` (client ring, last
+/// completed, last emitted): those jobs end with `-ECANCELED`
+/// (`amdgpu_fence_driver_force_completion`). Called before the forced
+/// fences are written, so no job retires without its error.
+pub(crate) fn media_reset(
+    cancelled: &[crate::amdgpu_vcn_navi22::idle::Cancelled],
     generation: u64,
 ) {
-    let first = crate::amdgpu_vcn_navi22_cs::FIRST_ID;
-    let rings = u16::from(media_rings(engine)) << first;
-    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
-    if let Some(current) = current.filter(|current| current.epoch == generation) {
+    if let Some(current) = current(generation) {
+        let mut jobs = current.jobs.lock();
+        for &(ring, after, upto) in cancelled {
+            let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+            jobs.cancel(id, after, upto);
+        }
+    }
+}
+/// A media job timed out and nothing resets its ring (recovery disabled or
+/// spent): `-ETIME` on the job, `drm_sched_suspend_timeout`.
+pub(crate) fn media_timed_out(ring: crate::amdgpu_navi22_submit::MediaRing, generation: u64) {
+    if let Some(current) = current(generation) {
         let _ = current.progress();
-        current.jobs.lock().fail_rings(first + ring.index(), rings);
+        let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+        current.jobs.lock().time_out(id);
+    }
+}
+/// A media job timed out and the GPU recovers (`amdgpu_job_timedout`'s
+/// `-ETIME` and `amdgpu_device_gpu_recover`): as for a kernel queue, the
+/// job is guilty and every other job is abandoned.
+pub(crate) fn media_hung(ring: crate::amdgpu_navi22_submit::MediaRing, generation: u64) {
+    if let Some(current) = current(generation) {
+        let _ = current.progress();
+        let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+        current.jobs.lock().hang(id);
     }
     crate::amdgpu_fence_navi22::notify_all();
 }
@@ -788,29 +797,5 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22-max-ibs",
         navi22_cs_max_ibs_is_what_the_native_queues_take
-    );
-
-    /// A VCN0 job timeout takes down every client ring of that VCPU (its
-    /// decode and both encode rings, as `amdgpu_vcn_reset_engine` resets the
-    /// instance under all three); a JPEG timeout only the JPEG ring. No
-    /// other fence engine carries client media rings.
-    fn navi22_cs_media_timeout_takes_down_its_engines_rings() -> TestResult {
-        use crate::amdgpu_fence_navi22::Engine;
-        use crate::amdgpu_navi22_submit::MediaRing;
-        let bits = |rings: &[MediaRing]| rings.iter().fold(0u8, |m, r| m | 1 << r.index());
-        let vcn0 = bits(&[MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)]);
-        if media_rings(Engine::Vcn0) != vcn0
-            || media_rings(Engine::Jpeg) != bits(&[MediaRing::Jpeg])
-            || media_rings(Engine::Vcn1) != 0
-            || media_rings(Engine::Gfx) != 0
-            || media_rings(Engine::Sdma0) != 0
-        {
-            return TestResult::Fail("a media timeout takes down the wrong rings");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/navi22-tdr/media",
-        navi22_cs_media_timeout_takes_down_its_engines_rings
     );
 }

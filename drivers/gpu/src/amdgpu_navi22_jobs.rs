@@ -12,14 +12,26 @@ pub(super) struct Jobs {
     completed: [u32; RING_IDS],
     pub terminal: Option<FsError>,
     pending: Vec<(u64, Arc<Health>)>,
-    /// Ticket ring ids (bits) of a media engine that timed out
-    /// (`fail_rings`): their unretired jobs fail, the other rings run on.
-    failed: u16,
+    /// Sequences a VCN engine reset force-completed, per ring id: after
+    /// the first, up to the second (`cancel`). They end with `-ECANCELED`.
+    cancelled: Vec<(usize, u32, u32)>,
+    /// Jobs whose timeout was suspended (`time_out`): `-ETIME` once done.
+    timed_out: Vec<u64>,
 }
 
 /// The ticket's ring id (the low four bits of its ring index).
 fn ring_id(ticket: u64) -> usize {
     ((ticket >> 32) as u32 & 15) as usize
+}
+/// Whether `ticket` of `epoch` is one of the sequences an engine reset
+/// force-completed on a ring: (ring id, after, up to).
+fn forced(epoch: u64, (ring, after, upto): (usize, u32, u32), ticket: u64) -> bool {
+    use crate::amdgpu_fence_navi22::signaled;
+    let seq = ticket as u32;
+    (ticket >> 32) as u32 & !15 == ring_index(epoch, 0)
+        && ring_id(ticket) == ring
+        && signaled(upto, seq)
+        && !signaled(after, seq)
 }
 
 #[cfg(feature = "kernel-test")]
@@ -88,62 +100,6 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/fence-errors",
         rdna2_hang_preserves_guilt_and_late_publication_errors
-    );
-    /// `amdgpu_job_timedout` on a video ring: the timed-out job ends with
-    /// ETIME (its context guilty) and the other jobs of that engine's rings
-    /// with ECANCELED, while every other ring keeps running and retiring.
-    /// Linux resets the VCN instance alone (`amdgpu_vcn_reset_engine`); a
-    /// media timeout never fails graphics work.
-    fn rdna2_media_timeout_fails_only_its_engines_rings() -> TestResult {
-        let mut jobs = Jobs::new(4);
-        let tickets = [
-            ticket(4, 0, 7), // GFX
-            ticket(4, 4, 3), // VCN decode, the timed-out job
-            ticket(4, 4, 4), // VCN decode, queued behind it
-            ticket(4, 5, 9), // VCN encode 0, same VCPU
-            ticket(4, 7, 2), // JPEG
-        ];
-        let health: Vec<Arc<Health>> = tickets.iter().map(|_| Arc::default()).collect();
-        for (t, h) in tickets.iter().zip(&health) {
-            jobs.emitted(*t, h);
-        }
-        jobs.fail_rings(4, 0b111 << 4);
-        let errors: Vec<_> = tickets.iter().map(|t| jobs.error(*t)).collect();
-        if errors
-            != [
-                None,
-                Some(FsError::TimedOut),
-                Some(FsError::Canceled),
-                Some(FsError::Canceled),
-                None,
-            ]
-            || health[0].error().is_some()
-            || health[4].error().is_some()
-            || jobs.terminal.is_some()
-        {
-            return TestResult::Fail("a media timeout errors other than its engine's jobs");
-        }
-        let late = Arc::new(Health::default());
-        jobs.emitted(ticket(4, 6, 1), &late);
-        if late.error() != Some(FsError::Canceled) || jobs.error(ticket(4, 6, 1)).is_none() {
-            return TestResult::Fail("a job published on a timed-out media ring runs");
-        }
-        let mut completed = [0; RING_IDS];
-        completed[0] = 7;
-        completed[7] = 2;
-        jobs.observe(completed);
-        if !jobs.retired(tickets[0]) || !jobs.retired(tickets[4]) || jobs.retired(tickets[1]) {
-            return TestResult::Fail("other rings stop retiring after a media timeout");
-        }
-        jobs.finish(FsError::Canceled);
-        if jobs.error(tickets[1]) != Some(FsError::TimedOut) {
-            return TestResult::Fail("the timed-out media job lost its guilt");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/navi22-tdr/media",
-        rdna2_media_timeout_fails_only_its_engines_rings
     );
     /// `amdgpu_vcn_reset_engine` force-completes every unsignalled fence of
     /// the reset instance's rings with `-ECANCELED`
@@ -237,7 +193,8 @@ impl Jobs {
             completed: [0; RING_IDS],
             terminal: None,
             pending: Vec::new(),
-            failed: 0,
+            cancelled: Vec::new(),
+            timed_out: Vec::new(),
         }
     }
     pub fn retired(&self, ticket: u64) -> bool {
@@ -258,7 +215,7 @@ impl Jobs {
             .retain(|(ticket, _)| !super::job_done(epoch, completed, *ticket));
     }
     pub fn emitted(&mut self, ticket: u64, health: &Arc<Health>) {
-        if self.terminal.is_some() || self.failed & 1 << ring_id(ticket) != 0 {
+        if self.terminal.is_some() {
             health.mark_canceled();
         }
         self.pending.push((ticket, health.clone()));
@@ -283,39 +240,42 @@ impl Jobs {
             health.mark_guilty();
         }
     }
-    /// A media engine's job on ring `hung` timed out (`amdgpu_job_timedout`
-    /// on a video ring); `rings` (ticket ring-id bits) are every ring of that
-    /// engine. The timed-out job ends with `-ETIME`, the other unretired
-    /// jobs of those rings and any published there later with `-ECANCELED`,
-    /// as Linux's VCN engine reset force-completes them. Other rings keep
-    /// running; unconfirmed media memory stays quarantined until its own
-    /// writeback retires it.
-    pub fn fail_rings(&mut self, hung: usize, rings: u16) {
-        if self.terminal.is_some() {
-            return;
-        }
-        self.mark_guilty(hung);
+    /// A VCN engine reset force-completed ring `ring`'s sequences after
+    /// `after` up to `upto` (`amdgpu_fence_driver_force_completion`): those
+    /// jobs end with `-ECANCELED`, the timed-out one included, and keep that
+    /// error once their forced fences retire them. Their contexts' next
+    /// submissions fail (`drm_sched_entity_error`); no context is guilty.
+    pub fn cancel(&mut self, ring: usize, after: u32, upto: u32) {
+        let epoch = self.epoch;
         for (ticket, health) in &self.pending {
-            if rings & 1 << ring_id(*ticket) != 0 {
+            if forced(epoch, (ring, after, upto), *ticket) {
                 health.mark_canceled();
             }
         }
-        self.failed |= rings;
+        self.cancelled.push((ring, after, upto));
     }
-    /// A VCN engine reset force-completed ring `ring`'s sequences after
-    /// `after` up to `upto` (`amdgpu_fence_driver_force_completion`).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    pub fn cancel(&mut self, _ring: usize, _after: u32, _upto: u32) {}
-    /// Ring `ring`'s oldest job timed out with no reset to follow
-    /// (`drm_sched_suspend_timeout`).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    pub fn time_out(&mut self, _ring: usize) {}
-    pub fn error(&self, ticket: u64) -> Option<FsError> {
-        if self.retired(ticket) {
-            return None;
+    /// Ring `ring`'s oldest job timed out and nothing resets the ring
+    /// (`amdgpu_job_timedout` without recovery: `-ETIME` on the job's fence,
+    /// `drm_sched_suspend_timeout`). The job stays outstanding and reports
+    /// `-ETIME` once its fence lands; its context's next submission fails.
+    pub fn time_out(&mut self, ring: usize) {
+        if let Some((ticket, health)) = self.pending.iter().find(|(t, _)| ring_id(*t) == ring) {
+            health.mark_guilty();
+            self.timed_out.push(*ticket);
         }
-        let failed = (self.failed & 1 << ring_id(ticket) != 0).then_some(FsError::Canceled);
-        self.terminal.or(failed).map(|error| {
+    }
+    pub fn error(&self, ticket: u64) -> Option<FsError> {
+        let epoch = self.epoch;
+        if self.cancelled.iter().any(|&r| forced(epoch, r, ticket)) {
+            return Some(FsError::Canceled);
+        }
+        if self.retired(ticket) {
+            return self
+                .timed_out
+                .contains(&ticket)
+                .then_some(FsError::TimedOut);
+        }
+        self.terminal.map(|error| {
             if error == FsError::Canceled {
                 self.pending
                     .iter()

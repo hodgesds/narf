@@ -17,9 +17,9 @@
 //! stopped rather than recovered until VRAM runs out.
 //!
 //! Client media rings (VCN decode/encode, JPEG) are timed the same way,
-//! each on its own, with Linux's `video_timeout` (also 2 s). A media
-//! timeout fails that engine's jobs and withdraws its rings from clients;
-//! it never starts a whole-GPU recovery (see `media_timeout`).
+//! each on its own, with Linux's `video_timeout` (also 2 s). A VCN timeout
+//! resets that VCN instance first, as Linux's per-queue reset does, and
+//! recovers the GPU only when that fails (see `media_timeout`).
 use crate::amdgpu_fence_navi22::{signaled, Engine};
 use crate::amdgpu_navi22_submit::MediaRing;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -312,7 +312,9 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
         let now_ms = narf_time::wall::cycles_to_ns(narf_time::now_cycles()) / 1_000_000;
         for hang in record(&mut watchdog, &samples, now_ms) {
             if let Some(ring) = hang.media {
-                media_timeout(hang, ring, generation).await;
+                if media_timeout(hang, ring, generation).await {
+                    return; // a recovered owner starts a fresh detector
+                }
                 continue;
             }
             crate::amdgpu_navi22_cs::hung(hang.engine, generation);
@@ -362,52 +364,97 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
 /// timeout on bare metal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MediaAction {
-    /// Fail the engine's jobs and withdraw its rings (NARF today).
-    Withdraw,
-    /// `amdgpu_gpu_recovery=0` (or recovery spent): `-ETIME` on the job and
-    /// `drm_sched_suspend_timeout`; the job waits for its fence.
+    /// `amdgpu_gpu_recovery=0`: `-ETIME` on the job and
+    /// `drm_sched_suspend_timeout`; nothing is reset and the job waits for
+    /// its fence.
     Suspend,
-    /// The per-queue reset of the VCN instance (`amdgpu_vcn_ring_reset`).
+    /// The per-queue reset of the ring's VCN instance
+    /// (`amdgpu_vcn_ring_reset`); `Recover` if it fails.
     ResetEngine,
     /// No per-queue reset: `-ETIME` and `amdgpu_device_gpu_recover`.
     Recover,
 }
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-pub(crate) fn media_action(_automatic: bool, _ring: MediaRing) -> MediaAction {
-    MediaAction::Withdraw
+/// `amdgpu_job_timedout`'s first step for media ring `ring`, with Linux
+/// `amdgpu_gpu_recovery` set as `automatic`: a VCN 3.0 ring has
+/// `AMDGPU_RESET_TYPE_PER_QUEUE` and a reset hook; NARF has no JPEG ring
+/// reset (Linux's backs up and re-emits other contexts' work).
+pub(crate) fn media_action(automatic: bool, ring: MediaRing) -> MediaAction {
+    match (automatic, ring) {
+        (false, _) => MediaAction::Suspend,
+        (true, MediaRing::Jpeg) => MediaAction::Recover,
+        (true, _) => MediaAction::ResetEngine,
+    }
+}
+/// The Linux ring name (`vcn_v3_0_sw_init`, `jpeg_v3_0_sw_init`).
+fn ring_name(ring: MediaRing) -> &'static str {
+    match ring {
+        MediaRing::Dec => "vcn_dec_0",
+        MediaRing::Enc(0) => "vcn_enc_0.0",
+        MediaRing::Enc(_) => "vcn_enc_0.1",
+        MediaRing::Jpeg => "jpeg_dec",
+    }
 }
 
 /// A client job on media ring `ring` timed out: Linux `amdgpu_job_timedout`
-/// on a video ring. Its job fails with `-ETIME` and the other jobs of that
-/// engine's rings with `-ECANCELED` (`amdgpu_navi22_cs::media_hung`), so the
-/// client sees an error and can fall back. Linux then resets the VCN
-/// instance alone (`amdgpu_vcn_reset_engine`, VCN 3.0's
-/// `AMDGPU_RESET_TYPE_PER_QUEUE`) and graphics never notice; NARF has no
-/// per-engine VCN reset, and a whole-GPU recovery would stop graphics for a
-/// fault Linux keeps inside VCN. The engine's rings are withdrawn from
-/// clients instead (video closed, graphics continue) until the next recovery
-/// or boot rebuilds VCN.
-async fn media_timeout(hang: Hang, ring: MediaRing, generation: u64) {
+/// on bare metal. True when a whole-GPU recovery ran (the detector exits).
+///
+/// With `amdgpu.gpu_recovery=0` the job gets `-ETIME` once its fence lands
+/// and waits meanwhile (`drm_sched_suspend_timeout`). Otherwise a VCN ring
+/// resets its instance (`amdgpu_vcn_reset_engine`): on success every
+/// outstanding job of the instance ends with `-ECANCELED` and the rings keep
+/// serving. A failed reset, or a JPEG timeout, sets `-ETIME` and recovers
+/// the GPU (`amdgpu_device_gpu_recover`) as a kernel-queue hang does, within
+/// the same per-boot budget; past it the job waits as without recovery.
+async fn media_timeout(hang: Hang, ring: MediaRing, generation: u64) -> bool {
     use core::fmt::Write;
-    crate::amdgpu_navi22_cs::media_hung(hang.engine, ring, generation);
+    let name = ring_name(ring);
+    let mut w = narf_console::Writer;
     let _ = writeln!(
-        narf_console::Writer,
-        "amdgpu: navi22 ring {:?} {ring:?} timeout, signaled seq={}, emitted seq={} ({} ms)",
-        hang.engine,
-        hang.signaled,
-        hang.emitted,
-        hang.stalled_ms
+        w,
+        "amdgpu: navi22 ring {name} timeout, signaled seq={}, emitted seq={} ({} ms)",
+        hang.signaled, hang.emitted, hang.stalled_ms
     );
-    // Timeout-only evidence from the media owner, before the rings close.
+    // Timeout-only evidence from the media owner (amdgpu_job_core_dump).
     if let Some(boot) = crate::amdgpu_navi22_platform::owner().await.as_mut() {
         boot.media_timeout_report(ring, hang.emitted);
     }
-    let rings = crate::amdgpu_navi22_cs::media_rings(hang.engine);
-    crate::amdgpu_vcn_navi22_cs::withdraw(rings);
+    match media_action(AUTOMATIC.load(Ordering::Acquire), ring) {
+        MediaAction::Suspend => {
+            crate::amdgpu_navi22_cs::media_timed_out(ring, generation);
+            let _ = writeln!(
+                w,
+                "amdgpu: navi22 GPU recovery disabled (amdgpu.gpu_recovery=0); ring {name} timeout suspended"
+            );
+            return false;
+        }
+        MediaAction::ResetEngine => {
+            let _ = writeln!(w, "amdgpu: navi22 Starting {name} ring reset");
+            match crate::amdgpu_navi22_platform::reset_media_engine(0, generation).await {
+                Ok(()) => {
+                    let _ = writeln!(w, "amdgpu: navi22 Ring {name} reset succeeded");
+                    return false;
+                }
+                Err(error) => {
+                    let _ = writeln!(w, "amdgpu: navi22 Ring {name} reset failed ({error:?})");
+                }
+            }
+        }
+        MediaAction::Recover => {}
+    }
+    if claim_automatic_recovery() {
+        crate::amdgpu_navi22_cs::media_hung(ring, generation);
+        // SAFETY: the caller of set_automatic_recovery accepted recover()'s
+        // contract on behalf of every queue user.
+        let result = unsafe { crate::amdgpu_navi22_platform::recover() }.await;
+        let _ = writeln!(w, "amdgpu: navi22 recovery {result:?}");
+        return true;
+    }
+    crate::amdgpu_navi22_cs::media_timed_out(ring, generation);
     let _ = writeln!(
-        narf_console::Writer,
-        "amdgpu: navi22 media rings {rings:#x} withdrawn after the timeout; video closed, graphics continue"
+        w,
+        "amdgpu: navi22 GPU recovery limit ({MAX_AUTOMATIC_RECOVERIES} per boot) reached; ring {name} timeout suspended"
     );
+    false
 }
 
 /// Start a detector for the current owner; any previous one exits.
