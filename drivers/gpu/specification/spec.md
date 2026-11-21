@@ -11291,8 +11291,12 @@ hardware or releases its transfer buffer.
 The boot allowlist includes GFX DPM/prefetch, PPT/TDC, VR0HOT, firmware critical
 temperature, fan/thermal control, GFX spread spectrum, out-of-band monitoring
 and APCC DFLL when present in the board table. UCLK/FCLK/SOC/display/PCIe DPM,
-memory-voltage scaling, deep sleep, GFXOFF, BACO and hub/media gating remain
-disabled until their owners supply constraints. This does not install OS
+memory-voltage scaling, deep sleep, GFXOFF, BACO and hub gating remain
+disabled until their owners supply constraints. Multimedia DPM/power gating
+(MM_DPM_PG) is allowed when the board has it, as Linux's Navi22 `pg_flags`
+(`AMD_PG_SUPPORT_VCN`/`_JPEG`) make `sienna_cichlid_get_allowed_feature_mask`
+do; the VCN owner sends PowerUpVcn/PowerUpJpeg at start and PowerDownVcn at
+its idle gate. `amdgpu.rdna2_vcn_smu_pg=0` leaves it off. This does not install OS
 thermal interrupts or override board frequencies, voltages or fan curves.
 
 ### Shared discrete RDNA2 PSP ring, TMR and firmware upload
@@ -12128,8 +12132,9 @@ sampling.
 Recovery stops the worker before replacing the owner. Owned full shutdown
 uses `unsafe ColdBoot::stop_media().await`: callers block new publication,
 drain JPEG and retain all mappings/TMR; hardware stop precedes conditional
-SMU power-down. The existing media-gating opt-in still controls MM_DPM_PG;
-idle work does not enable that feature. Model coverage is not physical
+SMU power-down. MM_DPM_PG runs by default (Linux's Navi22 path;
+`amdgpu.rdna2_vcn_smu_pg=0` turns it off); idle work does not enable that
+feature itself. Model coverage is not physical
 power-transition acceptance.
 
 `amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's

@@ -47,10 +47,11 @@ pub struct BootOptions<'a> {
     /// (DMCUB implements the tables itself; its golden init does more than
     /// the bytecode). Diagnostic.
     pub atom_pixclk: bool,
-    /// `amdgpu.rdna2_vcn_smu_pg=1` allows the board's MM_DPM_PG, and the VCN
-    /// start powers the media islands up through PMFW (PowerUpVcn,
-    /// PowerUpJpeg), as Linux's default Navi22 configuration does.
-    /// Diagnostic.
+    /// Linux's Navi22 media power path, on by default (`pg_flags` carry
+    /// `AMD_PG_SUPPORT_VCN`/`_JPEG`): the boot allows the board's MM_DPM_PG,
+    /// the VCN start powers the media islands up through PMFW (PowerUpVcn,
+    /// PowerUpJpeg) and the idle gate powers VCN down (PowerDownVcn).
+    /// `amdgpu.rdna2_vcn_smu_pg=0` leaves MM_DPM_PG off and sends nothing.
     pub vcn_smu_pg: bool,
     /// `amdgpu.rdna2_vcn_dpg=0` starts VCN on Linux's static path (power
     /// gating off, every register written directly) instead of DPG with the
@@ -140,7 +141,7 @@ impl<'a> BootOptions<'a> {
             power_saving,
             dmub_tables: switch("amdgpu.rdna2_dmub_tables", None, true),
             atom_pixclk: switch("amdgpu.rdna2_atom_pixclk", None, false),
-            vcn_smu_pg: switch("amdgpu.rdna2_vcn_smu_pg", None, false),
+            vcn_smu_pg: switch("amdgpu.rdna2_vcn_smu_pg", None, true),
             vcn_dpg: switch("amdgpu.rdna2_vcn_dpg", None, true),
             connector: match value("amdgpu.rdna2_connector") {
                 Some(Some("dp" | "DP" | "displayport")) => Connector::DisplayPort,
@@ -199,6 +200,9 @@ mod tests {
         assert!(BootOptions::parse("amdgpu.gpu_recovery=-1").gpu_recovery);
         assert!(!BootOptions::parse("amdgpu.gpu_recovery=0").gpu_recovery);
         assert!(!default.multi);
+        // Linux's Navi22 media power path (MM_DPM_PG) unless turned off.
+        assert!(default.vcn_smu_pg);
+        assert!(!BootOptions::parse("amdgpu.rdna2_vcn_smu_pg=0").vcn_smu_pg);
         assert_eq!(default.power_saving, Some(DEFAULT_POWER_SAVING));
         // GFXOFF is opt-in until it is enabled with Linux's SMU-init set.
         assert!(!DEFAULT_POWER_SAVING.split(',').any(|t| t == "gfxoff"));

@@ -78,10 +78,12 @@ const DISPLAY_ALLOWED: u64 = DISPLAY_REQUIRED | (1 << 10) | (1 << 11);
 
 // linux-lit: 22=FEATURE_MM_DPM_PG_BIT
 const MM_DPM_PG: u64 = 1 << 22;
-/// `amdgpu.rdna2_vcn_smu_pg`: allow the board's MM_DPM_PG, so PMFW owns the
-/// VCN/JPEG power islands and the media start sends PowerUpVcn and
-/// PowerUpJpeg, as Linux's default Navi22 configuration does. Diagnostic.
-static VCN_SMU_PG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `amdgpu.rdna2_vcn_smu_pg` (on by default): allow the board's MM_DPM_PG,
+/// so PMFW owns the VCN/JPEG power islands, the media start sends
+/// PowerUpVcn and PowerUpJpeg and the idle gate PowerDownVcn, as Linux's
+/// Navi22 configuration does (`AMD_PG_SUPPORT_VCN`/`_JPEG`). `=0` turns it
+/// off.
+static VCN_SMU_PG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// Set once from the boot options, before the SMU is configured.
 pub fn set_vcn_smu_pg(enabled: bool) {
     VCN_SMU_PG.store(enabled, core::sync::atomic::Ordering::Relaxed);
