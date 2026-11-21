@@ -161,6 +161,12 @@ fn submission_ring(ibs: &[crate::amdgpu_cs::Ib]) -> Result<usize, FsError> {
 }
 /// Ticket ring ids: four original kernel queues, four media rings, SDMA2/3.
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
+/// IBs one job may carry on ring `id` (`AMDGPU_INFO_MAX_IBS`). Today the
+/// submitter inherits the trait's default of one.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+pub(crate) fn ring_max_ibs(_id: usize) -> u32 {
+    1
+}
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
     ((epoch as u32 & 0x07ff_ffff) << 4) | id as u32
@@ -896,5 +902,39 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_cs_tickets_name_ring_and_recovery_epoch
+    );
+
+    /// Mesa's RADV packs a submission's IBs up to `AMDGPU_INFO_MAX_IBS` per
+    /// ring, and its preamble IB always takes one of them. With one per ring,
+    /// as this card reported, no command buffer ever fits: RADV resubmitted
+    /// the preamble alone forever, so vkcube and GTK4's Vulkan renderer
+    /// (Steam's setup dialog) hung in their first vkQueueSubmit. Every ring
+    /// reports what its native queue takes: `validate` / `validate_media`.
+    fn navi22_cs_max_ibs_is_what_the_native_queues_take() -> TestResult {
+        for id in 0..RING_IDS {
+            let media = (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id);
+            let native = if media {
+                crate::amdgpu_navi22_submit::MEDIA_MAX_IBS
+            } else {
+                crate::amdgpu_navi22_submit::MAX_IBS
+            };
+            let reported = ring_max_ibs(id);
+            if reported < 2 {
+                return TestResult::Fail(
+                    "a ring has no room for RADV's preamble IB and a command buffer",
+                );
+            }
+            if reported as usize != native {
+                return TestResult::Fail("a ring reports other than its native queue's IB bound");
+            }
+        }
+        if ring_max_ibs(RING_IDS) != 0 {
+            return TestResult::Fail("a ring id the card does not run reports IBs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22-max-ibs",
+        navi22_cs_max_ibs_is_what_the_native_queues_take
     );
 }
