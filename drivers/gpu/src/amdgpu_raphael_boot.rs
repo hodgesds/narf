@@ -374,6 +374,16 @@ impl ColdBoot {
                     self.queues.test_ib().await.map_err(Error::Queues)?;
                 }
                 Stage::FenceInterrupts => {
+                    // Subscribe before unmasking, as Navi22 does. Without the
+                    // routes the queues still work, polled at each deadline.
+                    if let Err(error) = crate::amdgpu_navi22_boot::route_fences(&self.ih.handle()) {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: raphael FenceInterrupts: polling only {error:?}"
+                        );
+                        return Ok(());
+                    }
                     cp::enable_fence_interrupts_raphael(gpu, authority, self.doorbells)
                         .map_err(Error::Queues)?
                 }
