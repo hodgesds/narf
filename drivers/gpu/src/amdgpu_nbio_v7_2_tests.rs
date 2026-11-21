@@ -50,7 +50,7 @@ kernel_test_in!(
 );
 
 /// A GPU whose NBIO has Raphael's segments (`dcn315_resource.c`'s
-/// NBIO_BASE__INST0_SEG0..3: 0x0, 0x14, 0xd20, 0x10400), over `memory`.
+/// NBIO_BASE__INST0_SEG0..5), over `memory`.
 fn gpu(memory: &mut Vec<u32>, version: (u8, u8, u8)) -> AmdGpu {
     use crate::amdgpu_discovery as d;
     let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
@@ -65,8 +65,8 @@ fn gpu(memory: &mut Vec<u32>, version: (u8, u8, u8)) -> AmdGpu {
     let mut nbio = gpu.ip_blocks[0];
     nbio.hw_id = d::HW_ID_NBIF;
     (nbio.major, nbio.minor, nbio.revision) = version;
-    nbio.num_bases = 4;
-    nbio.base_addrs[..4].copy_from_slice(&[0, 0x14, 0xd20, 0x10400]);
+    nbio.num_bases = 6;
+    nbio.base_addrs[..6].copy_from_slice(&[0, 0x14, 0xd20, 0x10400, 0x241_b000, 0x404_0000]);
     gpu.ip_blocks = vec![nbio];
     gpu
 }
@@ -97,9 +97,16 @@ fn nbio_v7_2_banks_resolve_raphaels_segments() -> TestResult {
         }
     }
     let mut short = gpu(&mut memory, (7, 2, 1));
-    short.ip_blocks[0].num_bases = 3;
+    short.ip_blocks[0].num_bases = 5;
     if Banks::resolve(&short).is_some() {
-        return TestResult::Fail("NBIO without its GDC0 segment admitted");
+        return TestResult::Fail("NBIO without its fifth segment admitted");
+    }
+    if banks.version != (7, 2, 1)
+        || banks.smn_pair() != (0xe * 4, 0xf * 4)
+        || banks.port_pair() != (0x14 * 4, (0x14 + 1) * 4)
+        || banks.seg5_address(PCIE_CONFIG_CNTL) != Some((0x404_0000 + 0x42_0011) * 4)
+    {
+        return TestResult::Fail("NBIO 7.2 index pairs or segment 5");
     }
     TestResult::Pass
 }
@@ -135,4 +142,33 @@ fn nbio_v7_2_port_access_goes_through_the_rsmu_pair() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/nbio-v7-2",
     nbio_v7_2_port_access_goes_through_the_rsmu_pair
+);
+
+/// `nbio_v7_2_init_registers`: the read-request register by version, both
+/// fields set to 1 and nothing else changed, and the DEV2 strap only on 7.3.0
+/// and 7.5.1.
+fn nbio_v7_2_init_registers_follow_the_version() -> TestResult {
+    let versions = [(7, 2, 0), (7, 2, 1), (7, 3, 0), (7, 5, 0), (7, 5, 1)];
+    if versions.map(read_request_register)
+        != [
+            PCIE_CONFIG_CNTL,
+            BIF1_PCIE_MST_CTRL_3,
+            BIF1_PCIE_MST_CTRL_3,
+            BIF1_PCIE_MST_CTRL_3,
+            PCIE_CONFIG_CNTL,
+        ]
+        || versions.map(clears_dev2_soft_reset_strap) != [false, false, true, false, true]
+        || read_request_size(0) != 0x1800_0000
+        || read_request_size(0xffff_ffff) != 0xdfff_ffff
+        || (PCIE_CONFIG_CNTL, BIF1_PCIE_MST_CTRL_3, RCC_DEV2_EPF0_STRAP2)
+            != (0x420011, 0x4601c6, 0xd802)
+        || STRAP_NO_SOFT_RESET_DEV2_F0 != 0x80
+    {
+        return TestResult::Fail("NBIO 7.2 init_registers differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/nbio-v7-2",
+    nbio_v7_2_init_registers_follow_the_version
 );

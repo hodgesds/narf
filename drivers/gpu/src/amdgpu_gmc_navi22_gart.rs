@@ -223,7 +223,7 @@ impl<I: Io> Engine<I> {
         let table = geometry.physical(info.table) | PTE_VALID;
         let root = geometry.physical(gart.empty_root()) | PTE_VALID;
         invoke(authority, io, |io| {
-            for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+            for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
                 // init_gart_aperture_regs: PDE-form table base, page numbers.
                 pair(io, base, r.pt_base, table);
                 pair(io, base, r.pt_start, info.start >> 12);
@@ -233,21 +233,16 @@ impl<I: Io> Engine<I> {
                 // contexts at an all-invalid root so stray use only faults.
                 for step in 1..16u32 {
                     // linux: n/a (VMIDs 1..15, setup_vmid_config i <= 14)
-                    pair(io, base, r.pt_base + step * regs::CTX_ADDR_DISTANCE, root);
+                    pair(io, base, r.pt_base + step * r.ctx_addr_distance, root);
                     update(
                         io,
                         base,
-                        r.ctx + step * regs::CTX_DISTANCE,
+                        r.ctx + step * r.ctx_distance,
                         CTX_MASK,
                         CTX_VALUE | irqs,
                     )?;
-                    pair(io, base, r.pt_start + step * regs::CTX_ADDR_DISTANCE, 0);
-                    pair(
-                        io,
-                        base,
-                        r.pt_end + step * regs::CTX_ADDR_DISTANCE,
-                        MAX_PFN - 1,
-                    );
+                    pair(io, base, r.pt_start + step * r.ctx_addr_distance, 0);
+                    pair(io, base, r.pt_end + step * r.ctx_addr_distance, MAX_PFN - 1);
                 }
             }
             Ok(())

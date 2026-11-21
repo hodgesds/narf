@@ -1,10 +1,8 @@
 //! Linux gc_10_3_0 and mmhub_2_0_0 register headers, base index zero.
 //! `inv_*` name invalidation engine 17 (the GART/CPU engine); `ctx` and the
-//! page-table registers name context 0. Per-VMID strides match the hub init
-//! functions: `ctx_distance` 1, `ctx_addr_distance` 2 (LO/HI pairs).
-pub(super) const CTX_DISTANCE: u32 = 1; // linux: mmGCVM_CONTEXT1_CNTL@gc - mmGCVM_CONTEXT0_CNTL@gc
-                                        // linux: mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32@gc - mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32@gc
-pub(super) const CTX_ADDR_DISTANCE: u32 = 2;
+//! page-table registers name context 0. Per-VMID strides are each hub's own,
+//! as its init function sets them: 1 and 2 on gfxhub_v2_1 and mmhub_v2_0, 1
+//! and 8 on mmhub_v2_3, whose per-context and per-engine registers interleave.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HubRegs {
     pub fb_base: u32,
@@ -41,6 +39,14 @@ pub(super) struct HubRegs {
     pub inv_ack: u32,
     pub inv_sem: u32,
     pub inv_range: u32,
+    /// `hub->ctx_distance`: CONTEXT1_CNTL - CONTEXT0_CNTL.
+    pub ctx_distance: u32,
+    /// `hub->ctx_addr_distance`: CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 -
+    /// CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, which also strides START and END.
+    pub ctx_addr_distance: u32,
+    /// `hub->eng_addr_distance`: INVALIDATE_ENG1_ADDR_RANGE_LO32 -
+    /// INVALIDATE_ENG0_ADDR_RANGE_LO32.
+    pub eng_addr_distance: u32,
 }
 // linux-ctx: hdr=gc seg=0
 pub(super) const GFX: HubRegs = HubRegs {
@@ -75,6 +81,9 @@ pub(super) const GFX: HubRegs = HubRegs {
     inv_ack: 0x1642,         // linux: mmGCVM_INVALIDATE_ENG17_ACK
     inv_sem: 0x161e,         // linux: mmGCVM_INVALIDATE_ENG17_SEM
     inv_range: 0x1643,       // linux: mmGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+    ctx_distance: 1,         // linux: mmGCVM_CONTEXT1_CNTL - mmGCVM_CONTEXT0_CNTL
+    ctx_addr_distance: 2, // linux: mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 - mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    eng_addr_distance: 2, // linux: mmGCVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - mmGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
 };
 // linux-ctx: hdr=mmhub seg=0
 pub(super) const MM: HubRegs = HubRegs {
@@ -109,5 +118,46 @@ pub(super) const MM: HubRegs = HubRegs {
     inv_ack: 0x706,         // linux: mmMMVM_INVALIDATE_ENG17_ACK
     inv_sem: 0x6e2,         // linux: mmMMVM_INVALIDATE_ENG17_SEM
     inv_range: 0x707,       // linux: mmMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+    ctx_distance: 1,        // linux: mmMMVM_CONTEXT1_CNTL - mmMMVM_CONTEXT0_CNTL
+    ctx_addr_distance: 2, // linux: mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 - mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    eng_addr_distance: 2, // linux: mmMMVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - mmMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+};
+/// `mmhub_2_3_0_offset.h` (`mmhub_v2_3`, Raphael's MMHUB 2.3.0/2.4.x), every
+/// register on `_BASE_IDX` 1.
+pub(super) const MM23: HubRegs = HubRegs {
+    fb_base: 0x8ec,        // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_FB_LOCATION_BASE)
+    fb_top: 0x8ed,         // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_FB_LOCATION_TOP)
+    agp_base: 0x8f0,       // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_AGP_BASE)
+    agp_bot: 0x8ef,        // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_AGP_BOT)
+    agp_top: 0x8ee,        // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_AGP_TOP)
+    sys_low: 0x8f1,        // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_SYSTEM_APERTURE_LOW_ADDR)
+    sys_high: 0x8f2,       // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR)
+    sys_default_lo: 0x8d8, // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB)
+    sys_default_hi: 0x8d9, // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB)
+    l1: 0x8f3,             // linux: n/a (mmhub_2_3_0_offset.h: mmMMMC_VM_MX_L1_TLB_CNTL)
+    l2: 0x700,             // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CNTL)
+    l2_2: 0x701,           // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CNTL2)
+    l2_3: 0x702,           // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CNTL3)
+    l2_4: 0x718,           // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CNTL4)
+    l2_5: 0x720,           // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CNTL5)
+    fault_lo: 0x70f, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32)
+    fault_hi: 0x710, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32)
+    fault_cntl: 0x708, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_PROTECTION_FAULT_CNTL)
+    fault_cntl2: 0x709, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_PROTECTION_FAULT_CNTL2)
+    fault_status: 0x70c, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_PROTECTION_FAULT_STATUS)
+    ctx: 0x740,      // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_CNTL)
+    pt_base: 0x940,  // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)
+    pt_start: 0x942, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32)
+    pt_end: 0x944,   // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32)
+    identity_low: 0x712, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32)
+    identity_high: 0x714, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32)
+    identity_offset: 0x716, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32)
+    inv_req: 0xa89,         // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG17_REQ)
+    inv_ack: 0xa8a,         // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG17_ACK)
+    inv_sem: 0xa88,         // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG17_SEM)
+    inv_range: 0xa03, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32)
+    ctx_distance: 1, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT1_CNTL - mmMMVM_CONTEXT0_CNTL)
+    ctx_addr_distance: 8, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 - mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)
+    eng_addr_distance: 8, // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - mmMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32)
 };
 // linux-ctx: reset

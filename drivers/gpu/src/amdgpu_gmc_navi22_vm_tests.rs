@@ -1,5 +1,5 @@
 //! GART, user GPUVM and isolation models over the GMC register fake.
-use super::tests::{bar, fixture_sized, fixture_with, run, Fake, VRAM};
+use super::tests::{bar, fixture_hub, fixture_sized, fixture_with, run, Fake, VRAM};
 use super::*;
 use crate::amdgpu_uapi as uapi;
 use crate::amdgpu_vm::{Geometry as Layout, Level};
@@ -489,6 +489,45 @@ fn vm_navi22_failures_retain_buffers_and_tables() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     vm_navi22_failures_retain_buffers_and_tables
+);
+
+/// Raphael's MMHUB 2.3: the TLB flush, the fault-status re-arm and the
+/// fault-interrupt masks use mmhub_v2_3's registers, never MMHUB 2.0's at
+/// the same base. Linux's gmc_v10_0_flush_gpu_tlb, process_interrupt and
+/// amdgpu_gmc_set_vm_fault_masks all go through `adev->vmhub`.
+fn vm_raphael_mmhub_2_3_flush_and_faults() -> TestResult {
+    let (_pool, mut engine) = fixture_hub(BYTES + GART_BYTES + (1 << 20), &[], MM23);
+    engine.prepare_gart().unwrap();
+    if run(engine.initialize()).is_err() || run(engine.enable_gart()).is_err() {
+        return TestResult::Fail("MMHUB 2.3 hubs did not come up on the model");
+    }
+    let at = |r: u32| MM_BASE + u64::from(r) * 4;
+    let wrote = |e: &Engine<Fake>, r: u32| e.io.writes.iter().any(|w| w.0 == at(r));
+    let mm20 = [MM.inv_req, MM.inv_sem, MM.fault_cntl, MM.ctx, MM.ctx + 1];
+    if !wrote(&engine, MM23.inv_req) || mm20.iter().any(|&r| wrote(&engine, r)) {
+        return TestResult::Fail("TLB flush missed MMHUB 2.3's engine 17");
+    }
+    engine.io.registers.insert(at(MM23.fault_status), 0x55);
+    let cntl = reg(&engine, MM_BASE, MM23.fault_cntl);
+    let fault = Fault::decode(Fault::CLIENT_VMC, 0, 0, [0, 0x80]).unwrap();
+    if engine.handle_fault(fault) != Ok(FaultOwner::Kernel)
+        || reg(&engine, MM_BASE, MM23.fault_cntl) != cntl | 1
+    {
+        return TestResult::Fail("MMHUB fault status not re-armed on MMHUB 2.3");
+    }
+    engine.set_fault_interrupts(true).unwrap();
+    if (0..16)
+        .any(|c| reg(&engine, MM_BASE, MM23.ctx + c * MM23.ctx_distance) & 0x2a_aa00 != 0x2a_aa00)
+        || reg(&engine, MM_BASE, MM23.fault_cntl) & 0x3fff_e000 != 0x3fff_e000
+        || mm20.iter().any(|&r| wrote(&engine, r))
+    {
+        return TestResult::Fail("fault interrupts missed MMHUB 2.3's contexts");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-raphael",
+    vm_raphael_mmhub_2_3_flush_and_faults
 );
 
 fn vm_navi22_faults_attribute_to_owning_vm() -> TestResult {

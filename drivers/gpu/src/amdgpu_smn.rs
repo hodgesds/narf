@@ -100,3 +100,11 @@ pub(crate) unsafe fn port_write(regs: &MmioRegion, rsmu: u64, address: u32, valu
         regs.read32(rsmu + RSMU_DATA * 4);
     }
 }
+
+/// Run `f` holding the latch: for a caller whose register model performs
+/// the index/data steps itself (the GMC's `Io`). `f` must not await, and
+/// must not call the other functions here, which take the latch too.
+pub(crate) fn with_latch<T>(f: impl FnOnce() -> T) -> T {
+    let _latch = LATCH.lock();
+    f()
+}

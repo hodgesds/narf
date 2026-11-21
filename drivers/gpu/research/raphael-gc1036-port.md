@@ -133,8 +133,9 @@ as now.
      around it, as Linux does. The field layout is unchanged.
    - `dcn315_resource.c` gives Raphael's NBIO segments: 0x0, 0x14, 0xd20,
      0x10400, 0x241b000, 0x4040000.
-5. GMC: `gfxhub_v2_1` on 10.3.6, `mmhub_v2_3`, a 1 GiB GART in the carve-out.
-   What it takes, against `amdgpu_gmc_navi22`:
+5. ~~GMC: `gfxhub_v2_1` on 10.3.6, `mmhub_v2_3`~~ (done, `Gmc::new_raphael`).
+   The GART stays 512 MiB: a LINUX-GAP, since NARF's display does not scan
+   out of GTT. What it took, against `amdgpu_gmc_navi22`:
    - **MMHUB 2.3 programming is MMHUB 2.0's.** A body-by-body diff of
      `mmhub_v2_3.c` against `mmhub_v2_0.c` differs only in RLC-routed against
      plain writes and SR-IOV branches. The register table is different:
