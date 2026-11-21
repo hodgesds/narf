@@ -3454,3 +3454,44 @@ kernel_test_in!(
     "syscall_abi/userns-idmap",
     smoke_abi_userns_idmap_nested_under_a_pid_namespace
 );
+
+/// `kernel/user_namespace.c::proc_setgroups_write` checks only the request
+/// against the namespace's state, never where the namespace sits:
+///
+///     if (setgroups_allowed) {
+///             if (!(ns->flags & USERNS_SETGROUPS_ALLOWED))
+///                     goto out_unlock;            /* -EPERM */
+///     } else {
+///             if (ns->gid_map.nr_extents != 0)
+///                     goto out_unlock;            /* -EPERM */
+///             ns->flags &= ~USERNS_SETGROUPS_ALLOWED;
+///     }
+///
+/// so in the initial user namespace — identity gid_map, setgroups allowed —
+/// writing `allow` succeeds (it changes nothing) and writing `deny` is
+/// -EPERM. Who may write at all was decided at open: `proc_setgroups_open`
+/// wants CAP_SYS_ADMIN over the namespace, which the harness task holds.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_setgroups_write_in_the_initial_namespace() -> TestResult {
+    with_setup(|| {
+        const O_WRONLY: u64 = 0o1;
+        install_idmap_proc_hooks()?;
+        if !crate::namespaces::current_user_ns(FAKE_TASK).is_initial() {
+            return Err("the harness task is not in the initial user namespace");
+        }
+        proc_self_idmap_write("setgroups", b"allow\n", O_WRONLY)
+            .map_err(|_| "writing allow to the initial namespace's setgroups failed")?;
+        if proc_self_idmap_write("setgroups", b"deny\n", O_WRONLY).is_ok() {
+            return Err("the initial namespace's setgroups was denied after its gid_map");
+        }
+        if !crate::namespaces::current_user_ns(FAKE_TASK).setgroups_allowed() {
+            return Err("setgroups is no longer allowed in the initial namespace");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_setgroups_write_in_the_initial_namespace
+);
