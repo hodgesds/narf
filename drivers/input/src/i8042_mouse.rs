@@ -120,6 +120,16 @@
 //! (`ABS_X` / `ABS_Y` / `ABS_PRESSURE` + `BTN_TOUCH`, Linux
 //! `synaptics_process_packet` semantics: BTN_TOUCH hysteresis
 //! `z > 30` on / `z < 25` off, X/Y only when `z > 0 && x > 1`).
+//! On AGM pads (`SYN_CAP_ADV_GESTURE`) the `w == 2` packets feed
+//! the second-contact state and each SGM packet reports two
+//! semi-MT slots (Linux `synaptics_report_semi_mt_data`: min/max
+//! corners) plus `ABS_PRESSURE` and the `BTN_TOOL_*` finger-count
+//! keys — the MT frame carries `ABS_X`/`ABS_Y`/`BTN_TOUCH` via the
+//! shared slot-protocol-B emitter, so on two-finger frames those
+//! follow the lowest live slot (the min corner) rather than the
+//! SGM contact, and `BTN_TOUCH` tracks "any live slot" rather
+//! than the `z` hysteresis (single-finger frames are identical
+//! to Linux either way).
 //! The legacy global ring still gets pixel-scale relative deltas
 //! derived from successive absolute samples (same shape as the
 //! virtio-tablet `abs_to_px` bridge), and the absolute cursor
@@ -134,7 +144,8 @@ use narf_input::{
     btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_TRIPLETAP},
     evdev::{
         dispatch_key_to_node, dispatch_pointer_wheel_to_node, dispatch_synaptics_abs_to_node, key,
-        prop, rel, DeviceCaps, DeviceId, DeviceNode, MtContactUpdate, MtEvdevState, ROUTER,
+        prop, rel, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, MtContactUpdate,
+        MtEvdevState, ROUTER,
     },
     push_global, scanout_dims, set_cursor_abs_px, AbsoluteEvent, AxisInfo, InputEvent,
     PointerButtons, PointerEvent, ScrollEvent, TouchEvent, TouchState,
@@ -198,6 +209,14 @@ pub struct State {
     /// BTN_TOUCH hysteresis state (Linux `synaptics_process_packet`:
     /// asserts when `z > 30`, releases when `z < 25`).
     touch_pressed: core::sync::atomic::AtomicBool,
+    /// Last `ABS_PRESSURE` value emitted on the Synaptics AGM
+    /// (semi-MT) path, for edge-only emission; `-1` = none yet.
+    /// The single-finger path reports pressure on every frame
+    /// instead (via `dispatch_synaptics_abs_to_node`).
+    syn_prev_pressure: AtomicI32,
+    /// Last SGM finger count emitted on the Synaptics AGM path,
+    /// for edge-only `BTN_TOOL_*` emission; `-1` = none yet.
+    syn_prev_fingers: AtomicI32,
     /// Streaming Synaptics packet type, as a
     /// [`psmouse::SynapticsPktType`] discriminant (0=NewAbs,
     /// 1=Strict, 2=Relaxed, 3=OldAbs). Starts as
@@ -230,6 +249,8 @@ impl State {
             prev_abs_px: AtomicI32::new(i32::MIN),
             prev_abs_py: AtomicI32::new(i32::MIN),
             touch_pressed: core::sync::atomic::AtomicBool::new(false),
+            syn_prev_pressure: AtomicI32::new(-1),
+            syn_prev_fingers: AtomicI32::new(-1),
             syn_pkt_type: AtomicU8::new(0),
             initialized: core::sync::atomic::AtomicBool::new(false),
         }
@@ -272,6 +293,21 @@ static ELANTECH_PREV: narf_lib::sync::IrqSafeSpinLock<[psmouse::ElantechSlot; 5]
 /// tests that only force the protocol (global-ring assertions
 /// still run there).
 static ELANTECH_MT: narf_lib::sync::IrqSafeSpinLock<Option<MtEvdevState>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Synaptics AGM decode state (second-contact position + finger
+/// count from `w == 2` packets). Only ever taken on the IRQ/test
+/// feed path, so IRQ context is safe.
+static SYNAPTICS_AGM: narf_lib::sync::IrqSafeSpinLock<psmouse::SynapticsAgmState> =
+    narf_lib::sync::IrqSafeSpinLock::new(psmouse::SynapticsAgmState::new());
+/// Previous Synaptics semi-MT slots, for `TouchEvent` Down/Move/Up
+/// derivation on the global ring.
+static SYNAPTICS_PREV: narf_lib::sync::IrqSafeSpinLock<[psmouse::SynapticsMtSlot; 2]> =
+    narf_lib::sync::IrqSafeSpinLock::new([psmouse::SynapticsMtSlot::new(); 2]);
+/// Evdev protocol-B MT emitter for the Synaptics pad (2 semi-MT
+/// slots). Created in `init()` for AGM pads; `None` in tests that
+/// only force the protocol (global-ring assertions still run there).
+static SYNAPTICS_MT: narf_lib::sync::IrqSafeSpinLock<Option<MtEvdevState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 // ── ALPS absolute-mode state ────────────────────────────────────────────────
 
@@ -651,6 +687,11 @@ fn enable_mouse_channel() -> Result<bool, InitError> {
                     psmouse::PsmouseHardware::Synaptics,
                     psmouse::PsmouseProtocol::SynapticsAbsolute,
                 );
+                // The IRQ path needs the queried words (AGM /
+                // multifinger) for the `w == 2` decode and the
+                // semi-MT report; `init()` reads them back for
+                // the evdev caps below.
+                psmouse::set_synaptics_info(&hw);
                 STATE.syn_pkt_type.store(
                     psmouse::SynapticsPktType::initial(hw.newabs) as u8,
                     Ordering::Release,
@@ -760,6 +801,47 @@ pub unsafe fn init() -> Result<(), InitError> {
         caps.add_key(key::BTN_LEFT);
         caps.add_key(key::BTN_RIGHT);
         caps.add_key(key::BTN_TOUCH);
+        if psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c()) {
+            // AGM pad: two semi-MT slots (Linux
+            // `synaptics_report_semi_mt_data`), same shape as the
+            // Elantech MT caps; `ABS_PRESSURE` rides per frame and
+            // the finger-count keys track the SGM `w` decode.
+            // (No `ABS_MT_PRESSURE`: Linux's semi-MT report
+            // carries none.)
+            let axis = |max: i32| AxisInfo {
+                min: 0,
+                max,
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            };
+            caps.add_abs_info(abs::ABS_MT_SLOT, axis(1));
+            caps.add_abs_info(abs::ABS_MT_TRACKING_ID, axis(0xFFFF));
+            caps.add_abs_info(
+                abs::ABS_MT_POSITION_X,
+                AxisInfo {
+                    min: psmouse::SYN_X_MIN_NOMINAL,
+                    max: psmouse::SYN_X_MAX_NOMINAL,
+                    fuzz: 0,
+                    flat: 0,
+                    res: 0,
+                },
+            );
+            caps.add_abs_info(
+                abs::ABS_MT_POSITION_Y,
+                AxisInfo {
+                    min: psmouse::SYN_Y_MIN_NOMINAL,
+                    max: psmouse::SYN_Y_MAX_NOMINAL,
+                    fuzz: 0,
+                    flat: 0,
+                    res: 0,
+                },
+            );
+            caps.add_key(key::BTN_TOOL_FINGER);
+            caps.add_key(BTN_TOOL_DOUBLETAP);
+            caps.add_key(BTN_TOOL_TRIPLETAP);
+            *SYNAPTICS_MT.lock() = Some(MtEvdevState::new(2));
+        }
     } else {
         let name = match (hw, proto) {
             (psmouse::PsmouseHardware::Elantech, _) => "PS/2 Elantech TouchPad",
@@ -1056,6 +1138,133 @@ fn dispatch_absolute_to_evdev(
     );
 }
 
+/// Route one decoded Synaptics SGM packet on an AGM pad: per-slot
+/// `TouchEvent`s (Down/Move/Up from the previous frame) on the
+/// global ring, and one protocol-B MT frame on the evdev node
+/// (Linux `synaptics_report_semi_mt_data` + the
+/// `synaptics_process_packet` tail: `ABS_PRESSURE` from the SGM
+/// pressure, `BTN_TOOL_FINGER` / `BTN_TOOL_DOUBLETAP` /
+/// `BTN_TOOL_TRIPLETAP` from the finger count). The MT frame owns
+/// `ABS_X`/`ABS_Y`/`BTN_TOUCH`/buttons (`MtEvdevState` wire
+/// rules); pressure and the tool keys ride in a second
+/// SYN-terminated frame, exactly as Linux emits two `input_sync`s
+/// per packet on AGM pads (`synaptics_report_semi_mt_data` syncs,
+/// then the process-packet tail syncs again). A no-change frame
+/// emits nothing on evdev.
+///
+/// Per-slot pressure is not defined by Linux's semi-MT report
+/// (it carries no `ABS_MT_PRESSURE`), so the MT updates carry
+/// none; both ring slots carry the frame's SGM pressure instead,
+/// matching the `ABS_PRESSURE` in the evdev frame. The semi-MT
+/// slots are positional (min/max corners), so the slot index
+/// doubles as the tracking id — there is no stable per-contact
+/// identity to report.
+fn dispatch_synaptics_semi_mt(hw: &psmouse::SynapticsHwState, num_fingers: u8) {
+    let agm = SYNAPTICS_AGM.lock().agm;
+    let slots = psmouse::synaptics_semi_mt_slots(hw, &agm, num_fingers);
+    let mut prev = SYNAPTICS_PREV.lock();
+    for (slot, s) in slots.iter().enumerate() {
+        let was = prev[slot].active;
+        let state = match (was, s.active) {
+            (false, true) => Some(TouchState::Down),
+            (true, true) => Some(TouchState::Move),
+            (true, false) => Some(TouchState::Up),
+            (false, false) => None,
+        };
+        if let Some(state) = state {
+            // A release reports the last known position.
+            let (x, y) = if s.active {
+                (s.x, s.y)
+            } else {
+                (prev[slot].x, prev[slot].y)
+            };
+            let _ = push_global(InputEvent::Touch(TouchEvent {
+                slot: slot as u8,
+                tracking_id: if s.active { Some(slot as i32) } else { None },
+                id: slot as u16,
+                x,
+                y,
+                pressure: hw.z as i32,
+                state,
+            }));
+        }
+    }
+    *prev = slots;
+    drop(prev);
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    let mut mt = SYNAPTICS_MT.lock();
+    let Some(mt) = mt.as_mut() else {
+        return;
+    };
+    // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+    // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
+    // so the pointee outlives this borrow. Non-null checked just above.
+    let node_ref: &DeviceNode = unsafe { &*raw };
+    let updates = [
+        MtContactUpdate {
+            slot: 0,
+            active: slots[0].active,
+            tracking_id: 0,
+            x: slots[0].x,
+            y: slots[0].y,
+            pressure: None,
+        },
+        MtContactUpdate {
+            slot: 1,
+            active: slots[1].active,
+            tracking_id: 1,
+            x: slots[1].x,
+            y: slots[1].y,
+            pressure: None,
+        },
+    ];
+    mt.dispatch_frame(node_ref, &updates, hw.left, hw.right);
+    // Second frame (Linux's second `input_sync`): `ABS_PRESSURE`
+    // + `BTN_TOOL_*`, edge-only like the single-finger path's
+    // hysteresis/button edges.
+    let now = narf_time::monotonic_ns();
+    let mut emitted = 0;
+    let mut push = |type_: EventType, code: u16, value: i32| {
+        node_ref.dispatch(EvdevEvent {
+            time: now,
+            type_,
+            code,
+            value,
+        });
+        emitted += 1;
+    };
+    let prev_pressure = STATE.syn_prev_pressure.swap(hw.z as i32, Ordering::AcqRel);
+    if prev_pressure != hw.z as i32 {
+        push(EventType::Abs, abs::ABS_PRESSURE, hw.z as i32);
+    }
+    let prev_fingers = STATE
+        .syn_prev_fingers
+        .swap(num_fingers as i32, Ordering::AcqRel);
+    if prev_fingers != num_fingers as i32 {
+        push(
+            EventType::Key,
+            key::BTN_TOOL_FINGER,
+            if num_fingers == 1 { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_DOUBLETAP,
+            if num_fingers == 2 { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_TRIPLETAP,
+            if num_fingers == 3 { 1 } else { 0 },
+        );
+    }
+    if emitted > 0 {
+        node_ref.dispatch(EvdevEvent::syn_report(now));
+    }
+}
+
 /// Map an absolute sample onto the on-screen pixel `span` of its
 /// axis using the advertised range (virtio-tablet `abs_to_px`
 /// shape: clamp into the range, then scale linearly).
@@ -1087,31 +1296,55 @@ fn decode_absolute_packet() {
         psmouse::SynapticsPktType::OldAbs => psmouse::decode_synaptics_oldabs(&buf),
         _ => psmouse::decode_synaptics_newabs(&buf),
     };
+    // AGM packet (Linux `synaptics_parse_hw_state`: only NEWABS,
+    // only on AGM pads, only when `w == 2`): it updates the
+    // second-contact state / finger count and produces no report
+    // itself — the next SGM packet reports both contacts. A
+    // `w == 2` OLDABS packet is an ordinary single-finger packet
+    // (Linux never routes OLDABS through `synaptics_parse_agm`).
+    if pkt_type != psmouse::SynapticsPktType::OldAbs
+        && psmouse::synaptics_has_agm(psmouse::synaptics_ext_cap_0c())
+        && hw.w == 2
+    {
+        let mut agm = SYNAPTICS_AGM.lock();
+        psmouse::parse_synaptics_agm(&buf, hw.w, &mut agm);
+        narf_input::I8042_MOUSE_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // X/Y are reported only for a real finger (Linux:
     // `hw.z > 0 && hw.x > 1`); pressure, touch and buttons are
     // reported on every packet.
     let moved = hw.z > 0 && hw.x > 1;
     let y_inv = psmouse::synaptics_invert_y(hw.y);
 
-    // BTN_TOUCH hysteresis: asserts when `z > 30`, releases
-    // when `z < 25`; between the thresholds the state holds.
-    let touch_change = if hw.z > psmouse::SYN_TOUCH_ON_Z {
-        if STATE.touch_pressed.swap(true, Ordering::AcqRel) {
-            None
-        } else {
-            Some(true)
-        }
-    } else if hw.z < psmouse::SYN_TOUCH_OFF_Z {
-        if STATE.touch_pressed.swap(false, Ordering::AcqRel) {
-            Some(false)
-        } else {
-            None
-        }
+    if psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c()) {
+        // AGM pad: the SGM packet reports both contacts as two
+        // semi-MT slots (Linux `synaptics_report_semi_mt_data`).
+        // The MT frame owns ABS_X/Y + BTN_TOUCH + buttons; the
+        // legacy bridge below still runs on the SGM position.
+        let num_fingers = psmouse::synaptics_num_fingers(&hw, psmouse::synaptics_capabilities());
+        dispatch_synaptics_semi_mt(&hw, num_fingers);
     } else {
-        None
-    };
+        // BTN_TOUCH hysteresis: asserts when `z > 30`, releases
+        // when `z < 25`; between the thresholds the state holds.
+        let touch_change = if hw.z > psmouse::SYN_TOUCH_ON_Z {
+            if STATE.touch_pressed.swap(true, Ordering::AcqRel) {
+                None
+            } else {
+                Some(true)
+            }
+        } else if hw.z < psmouse::SYN_TOUCH_OFF_Z {
+            if STATE.touch_pressed.swap(false, Ordering::AcqRel) {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-    dispatch_absolute_to_evdev(&hw, y_inv, moved, touch_change);
+        dispatch_absolute_to_evdev(&hw, y_inv, moved, touch_change);
+    }
     narf_input::I8042_MOUSE_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // Legacy bridge (virtio-tablet shape): map the absolute
@@ -1537,10 +1770,15 @@ pub fn __reset_for_test() {
     STATE.prev_abs_px.store(i32::MIN, Ordering::Release);
     STATE.prev_abs_py.store(i32::MIN, Ordering::Release);
     STATE.touch_pressed.store(false, Ordering::Release);
+    STATE.syn_prev_pressure.store(-1, Ordering::Release);
+    STATE.syn_prev_fingers.store(-1, Ordering::Release);
     STATE.syn_pkt_type.store(0, Ordering::Release);
     *ELANTECH_STATE.lock() = psmouse::ElantechState::new();
     *ELANTECH_PREV.lock() = [psmouse::ElantechSlot::new(); 5];
     *ELANTECH_MT.lock() = None;
+    *SYNAPTICS_AGM.lock() = psmouse::SynapticsAgmState::new();
+    *SYNAPTICS_PREV.lock() = [psmouse::SynapticsMtSlot::new(); 2];
+    *SYNAPTICS_MT.lock() = None;
     ALPS.lock().reset();
     ALPS_ACTIVE.store(false, Ordering::Release);
     psmouse::set_detected(
@@ -1582,6 +1820,24 @@ pub fn set_synaptics_absolute_for_test(newabs: bool) {
         psmouse::SynapticsPktType::initial(newabs) as u8,
         Ordering::Release,
     );
+}
+
+/// Test-only: force Synaptics absolute mode on an AGM pad with the
+/// given queried hardware, so AGM packet fixtures can feed without
+/// a device; also creates the 2-slot MT emitter (mirroring what
+/// `init()` does for AGM pads). `__reset_for_test` restores
+/// `Standard` and clears the info/emitter.
+pub fn set_synaptics_agm_for_test(hw: &psmouse::SynapticsHw) {
+    psmouse::set_synaptics_info_for_test(hw);
+    psmouse::set_detected(
+        psmouse::PsmouseHardware::Synaptics,
+        psmouse::PsmouseProtocol::SynapticsAbsolute,
+    );
+    STATE.syn_pkt_type.store(
+        psmouse::SynapticsPktType::initial(hw.newabs) as u8,
+        Ordering::Release,
+    );
+    *SYNAPTICS_MT.lock() = Some(MtEvdevState::new(2));
 }
 
 /// Test-only: point the IRQ-path evdev dispatch at `node`
