@@ -3265,3 +3265,192 @@ kernel_test_in!(
     "syscall_abi/userns",
     smoke_abi_userns_map_fd_captures_opener_caps
 );
+
+/// Write `bytes` to `/proc/self/<file>` the way CPython's
+/// `open(path, "w").write(s)` does when `flags` carries O_CREAT|O_TRUNC:
+/// openat(flags, 0666), fstat, lseek(0, SEEK_CUR), write, close. With plain
+/// `O_WRONLY` it is util-linux `unshare`'s `map_id` / `setgroups_control`.
+#[cfg(feature = "container")]
+fn proc_self_idmap_write(file: &str, bytes: &[u8], flags: u64) -> Result<(), &'static str> {
+    use core::fmt::Write as _;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const SEEK_CUR: u64 = 1;
+    let path = alloc::format!("/proc/self/{}\0", file);
+    let open = call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, flags | O_CLOEXEC, 0o666),
+    );
+    let fd = match open {
+        Some(fd) if fd >= 0 => fd as u64,
+        other => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "userns-idmap: open(/proc/self/{file}, {flags:#o}) = {other:?}"
+            );
+            return Err("open of a /proc/self id-map file failed");
+        }
+    };
+    let mut sb = [0u8; STAT_SIZE];
+    let _ = call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64));
+    let _ = call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_CUR));
+    let wrote = call(
+        Syscall::Write.raw(),
+        a2(fd, bytes.as_ptr() as u64, bytes.len() as u64),
+    );
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    if wrote == Some(bytes.len() as i64) {
+        return Ok(());
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "userns-idmap: write(/proc/self/{file}) through a {flags:#o} open = {wrote:?}"
+    );
+    Err("write to a /proc/self id-map file failed")
+}
+
+/// Wire the procfs hooks an id-map case needs and check the real `/proc` is
+/// there to write through.
+#[cfg(feature = "container")]
+fn install_idmap_proc_hooks() -> Result<(), &'static str> {
+    narf_filesystem::procfs::install_ns_proc_hooks(
+        crate::handlers::proc_ns_readlink,
+        crate::handlers::proc_ns_mountinfo,
+        crate::handlers::proc_ns_idmap_open,
+        crate::handlers::proc_ns_idmap_owners,
+    );
+    if !registry().list().iter().any(|mount| mount == "/proc") {
+        return Err("/proc is not mounted in the test image");
+    }
+    Ok(())
+}
+
+/// Python's `open(path, "w")` and a shell `>` redirect open with
+/// `O_WRONLY | O_CREAT | O_TRUNC`, and that is how most tools write
+/// `/proc/<pid>/{setgroups,gid_map,uid_map}`. Linux accepts it: the files
+/// exist, so O_CREAT creates nothing, and O_TRUNC goes `do_open` →
+/// `handle_truncate` → `do_truncate` → `notify_change` → `proc_setattr`,
+/// which refuses only a mode change (`if (attr->ia_valid & ATTR_MODE)
+/// return -EPERM;`) and otherwise just copies the attributes. The write
+/// that follows is an ordinary `map_write` / `proc_setgroups_write`.
+///
+/// Runs the CPython sequence through the real `/proc` for a rootless
+/// identity mapping, and again one user namespace deeper: a nested
+/// namespace's owner maps the same id it holds in its parent
+/// (`new_idmap_permitted`'s one-id arm, with `make_kuid(ns->parent, id)`
+/// resolving through the parent's map).
+#[cfg(feature = "container")]
+fn smoke_abi_userns_idmap_writes_through_truncating_open() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const TRUNCATING: u64 = 0o1 | 0o100 | 0o1000; // O_WRONLY|O_CREAT|O_TRUNC
+        install_idmap_proc_hooks()?;
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        for level in 1..=2u32 {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                return Err("unprivileged unshare(CLONE_NEWUSER) failed");
+            }
+            proc_self_idmap_write("setgroups", b"deny", TRUNCATING)?;
+            proc_self_idmap_write("gid_map", b"1000 1000 1\n", TRUNCATING)?;
+            proc_self_idmap_write("uid_map", b"1000 1000 1\n", TRUNCATING)?;
+            let ns = crate::namespaces::current_user_ns(FAKE_TASK);
+            if ns.level() != level {
+                return Err("unshare(CLONE_NEWUSER) did not nest under the previous namespace");
+            }
+            if ns.translate_uid_to_host(1000) != 1000 || ns.translate_gid_to_host(1000) != 1000 {
+                return Err("the identity maps were not installed");
+            }
+            if ns.may_setgroups() {
+                return Err("setgroups was not denied");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_idmap_writes_through_truncating_open
+);
+
+/// The same nested identity mapping, in the shape Chromium's sandbox probe
+/// ran under: `unshare -U --map-user=1000 --map-group=1000 -p -n -f` (an
+/// outer user + PID + net namespace, mapped by util-linux with plain
+/// O_WRONLY writes, uid_map first), then the command — pid 1 of the new PID
+/// namespace — unshares a nested user namespace and writes its maps through
+/// `open(path, "w")`. `/proc/self` there names the writer by its
+/// in-namespace pid, which procfs must translate back to the writer itself
+/// (`proc_self_get_link` → `task_tgid_nr_ns(current, ns)` → `proc_pid_lookup`).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_idmap_nested_under_a_pid_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        const PLAIN: u64 = 0o1; // O_WRONLY
+        const TRUNCATING: u64 = 0o1 | 0o100 | 0o1000; // O_WRONLY|O_CREAT|O_TRUNC
+        install_idmap_proc_hooks()?;
+        // The boot wiring installs procfs's PID-namespace translation; the
+        // kernel-test image does not, so install the production hooks here.
+        let saved = narf_filesystem::procfs::__test_pidns_hooks_snapshot();
+        narf_filesystem::procfs::install_proc_pidns_hooks(
+            crate::handlers::proc_current_outer_pid,
+            crate::handlers::proc_pid_resolve,
+            crate::handlers::proc_pid_report,
+            crate::handlers::proc_current_tid,
+        );
+        let result = (|| {
+            install_test_address_space()?;
+            narf_scheduler::__reset_queues_for_test();
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            if call(
+                Syscall::Unshare.raw(),
+                a0(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET),
+            ) != Some(0)
+            {
+                return Err("unshare(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET) failed");
+            }
+            proc_self_idmap_write("uid_map", b"1000 1000 1", PLAIN)?;
+            proc_self_idmap_write("setgroups", b"deny", PLAIN)?;
+            proc_self_idmap_write("gid_map", b"1000 1000 1", PLAIN)?;
+            let child = clone_child(0).map_err(|_| "fork into the new PID namespace failed")?;
+            let nested = (|| {
+                set_task(child);
+                if call(Syscall::GetPid.raw(), a0(0)) != Some(1) {
+                    return Err("the forked command is not pid 1 of its PID namespace");
+                }
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                    return Err("nested unshare(CLONE_NEWUSER) failed");
+                }
+                proc_self_idmap_write("setgroups", b"deny", TRUNCATING)?;
+                proc_self_idmap_write("gid_map", b"1000 1000 1\n", TRUNCATING)?;
+                proc_self_idmap_write("uid_map", b"1000 1000 1\n", TRUNCATING)?;
+                let ns = crate::namespaces::current_user_ns(child);
+                if ns.level() != 2 {
+                    return Err("the nested user namespace is not two levels deep");
+                }
+                if ns.translate_uid_to_host(1000) != 1000 || ns.translate_gid_to_host(1000) != 1000
+                {
+                    return Err("the nested identity maps were not installed");
+                }
+                Ok(())
+            })();
+            release_clone_child(child);
+            nested
+        })();
+        narf_filesystem::procfs::__test_pidns_hooks_restore(saved);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_idmap_nested_under_a_pid_namespace
+);
