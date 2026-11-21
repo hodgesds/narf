@@ -384,3 +384,528 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_elf64_naming_i386_is_wrong_machine
 );
+
+// ── 32-bit address-space layout and startup stack ────────────────────
+
+/// `IA32_PAGE_OFFSET` / `TASK_SIZE_32`: the end of an IA-32 task's
+/// address space (`arch/x86/include/asm/page_64_types.h`).
+const TASK_SIZE_32: u64 = 0xFFFF_E000;
+/// `TASK_UNMAPPED_BASE` for a 32-bit task: `PAGE_ALIGN(TASK_SIZE_32 / 3)`.
+const COMPAT_MMAP_BASE: u64 = 0x5555_5000;
+/// RLIMIT_STACK-sized stack reservation under `TASK_SIZE_32`.
+const COMPAT_STACK_RESERVED: u64 = 8 * 1024 * 1024;
+
+const AT_PHDR: u32 = 3;
+const AT_PHENT: u32 = 4;
+const AT_PHNUM: u32 = 5;
+const AT_PAGESZ: u32 = 6;
+const AT_BASE: u32 = 7;
+const AT_ENTRY: u32 = 9;
+const AT_PLATFORM: u32 = 15;
+const AT_HWCAP: u32 = 16;
+const AT_SECURE: u32 = 23;
+const AT_RANDOM: u32 = 25;
+const AT_SYSINFO: u32 = 32;
+const AT_SYSINFO_EHDR: u32 = 33;
+
+/// Read `out.len()` bytes of `aspace` at user `va` through its page tables
+/// (no CR3 switch). `false` when any byte is not materialized.
+fn user_read(aspace: &narf_memory::AddressSpace, va: u64, out: &mut [u8]) -> bool {
+    for (i, byte) in out.iter_mut().enumerate() {
+        let v = va + i as u64;
+        // SAFETY: `aspace.root` is the live root the loader built; the walk
+        // only reads page-table entries for the page-aligned address.
+        let page = unsafe {
+            narf_memory::x86_64::paging::translate(
+                aspace.root,
+                narf_memory::VirtAddr::new(v & !0xFFF),
+            )
+        };
+        let Some(page) = page else {
+            return false;
+        };
+        // SAFETY: `page` is the frame backing that user page, reached
+        // through the kernel direct map; the in-page offset stays inside it.
+        *byte =
+            unsafe { *narf_memory::PhysAddr::new(page.as_u64() | (v & 0xFFF)).kernel_ptr::<u8>() };
+    }
+    true
+}
+
+fn user_u32(aspace: &narf_memory::AddressSpace, va: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    if user_read(aspace, va, &mut b) {
+        Some(u32::from_le_bytes(b))
+    } else {
+        None
+    }
+}
+
+/// The NUL-terminated string at `va` (without its NUL), at most 256 bytes.
+fn user_cstr(aspace: &narf_memory::AddressSpace, va: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for i in 0..256u64 {
+        let mut b = [0u8; 1];
+        if !user_read(aspace, va + i, &mut b) {
+            return None;
+        }
+        if b[0] == 0 {
+            return Some(out);
+        }
+        out.push(b[0]);
+    }
+    None
+}
+
+/// The startup stack an IA-32 program's `_start` reads at `esp`:
+/// `argc`, then 32-bit `argv[]`, `envp[]` and `Elf32_auxv_t` pairs.
+struct Stack32 {
+    argc: u32,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    auxv: Vec<(u32, u32)>,
+}
+
+impl Stack32 {
+    fn aux(&self, tag: u32) -> Option<u32> {
+        self.auxv.iter().find(|(t, _)| *t == tag).map(|&(_, v)| v)
+    }
+}
+
+/// Walk the 32-bit startup block at `esp`. Every pointer is 4 bytes wide
+/// (`elf_addr_t` is `Elf32_Addr` in `compat_binfmt_elf.c`).
+fn read_stack32(aspace: &narf_memory::AddressSpace, esp: u64) -> Option<Stack32> {
+    let argc = user_u32(aspace, esp)?;
+    let mut cursor = esp + 4;
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        let p = user_u32(aspace, cursor)?;
+        argv.push(user_cstr(aspace, u64::from(p))?);
+        cursor += 4;
+    }
+    if user_u32(aspace, cursor)? != 0 {
+        return None; // argv[argc] must be NULL
+    }
+    cursor += 4;
+    let mut envp = Vec::new();
+    loop {
+        let p = user_u32(aspace, cursor)?;
+        cursor += 4;
+        if p == 0 {
+            break;
+        }
+        envp.push(user_cstr(aspace, u64::from(p))?);
+        if envp.len() > 64 {
+            return None;
+        }
+    }
+    let mut auxv = Vec::new();
+    loop {
+        let tag = user_u32(aspace, cursor)?;
+        let val = user_u32(aspace, cursor + 4)?;
+        cursor += 8;
+        if tag == 0 {
+            break;
+        }
+        auxv.push((tag, val));
+        if auxv.len() > 64 {
+            return None;
+        }
+    }
+    Some(Stack32 {
+        argc,
+        argv,
+        envp,
+        auxv,
+    })
+}
+
+/// Load `bytes` the way exec does (fresh pid, argv/envp), or say why not.
+fn load_i386(
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<crate::UserProcess, &'static str> {
+    // SAFETY: the kernel-test harness keeps paging live and the frame
+    // allocator initialised, which is the loader's whole contract.
+    unsafe { crate::load_user_process_with(bytes, argv, envp, &[]) }
+        .map_err(|_| "an i386 ELF32 image failed to load")
+}
+
+/// Give a loaded process's pid and address space back.
+fn unload(proc: crate::UserProcess) {
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+}
+
+/// `load_elf_binary` for an ELFCLASS32 image (`compat_binfmt_elf.c`):
+///
+///   * the image maps where an ET_EXEC asks, below `TASK_SIZE_32`;
+///   * `STACK_TOP` is `TASK_SIZE_LOW` = `IA32_PAGE_OFFSET`, so `esp` sits in
+///     the RLIMIT_STACK window under 0xFFFFe000, 16-byte aligned
+///     (`STACK_ROUND`);
+///   * `create_elf_tables` writes `elf_addr_t` = `Elf32_Addr` words: a 4-byte
+///     `argc`, 4-byte `argv`/`envp` pointers and 8-byte `Elf32_auxv_t`;
+///   * the auxv carries AT_PHENT = sizeof(Elf32_Phdr), AT_PLATFORM =
+///     `COMPAT_ELF_PLATFORM` ("i686") and no AT_SYSINFO/AT_SYSINFO_EHDR while
+///     there is no vDSO32 (`ARCH_DLINFO_IA32` with `vdso32_enabled == 0`);
+///   * the thread starts with FS/GS bases of zero (`compat_start_thread`):
+///     an i386 libc sets its TLS up with `set_thread_area`.
+fn smoke_compat32_static_image_loads_in_a_32bit_layout() -> TestResult {
+    let bytes = i386_static_image();
+    let proc = match load_i386(&bytes, &["hello", "two"], &["A=1"]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = (|| -> Result<(), &'static str> {
+        if proc.entry.0.as_u64() != u64::from(STATIC_ENTRY) {
+            return Err("ET_EXEC entry moved: an i386 ET_EXEC loads at its own vaddrs");
+        }
+        let mut first = [0u8; 1];
+        if !user_read(&proc.address_space, u64::from(STATIC_ENTRY), &mut first) || first[0] != 0xB8
+        {
+            return Err("i386 text is not mapped at 0x08048000");
+        }
+        let esp = proc.stack_top.as_u64();
+        if esp >= TASK_SIZE_32 || esp < TASK_SIZE_32 - COMPAT_STACK_RESERVED {
+            return Err("startup esp is not in the stack window under TASK_SIZE_32");
+        }
+        if esp & 0xF != 0 {
+            return Err("startup esp is not 16-byte aligned");
+        }
+        let stack = read_stack32(&proc.address_space, esp)
+            .ok_or("the startup block is not a 32-bit argc/argv/envp/auxv layout")?;
+        if stack.argc != 2 || stack.argv[0] != b"hello" || stack.argv[1] != b"two" {
+            return Err("32-bit argv does not read back");
+        }
+        if stack.envp.len() != 1 || stack.envp[0] != b"A=1" {
+            return Err("32-bit envp does not read back");
+        }
+        if stack.aux(AT_PHDR) != Some(STATIC_TEXT_VA + EHDR32 as u32)
+            || stack.aux(AT_PHENT) != Some(PHDR32 as u32)
+            || stack.aux(AT_PHNUM) != Some(4)
+        {
+            return Err("AT_PHDR/AT_PHENT/AT_PHNUM do not describe the Elf32_Phdr table");
+        }
+        if stack.aux(AT_PAGESZ) != Some(4096)
+            || stack.aux(AT_ENTRY) != Some(STATIC_ENTRY)
+            || stack.aux(AT_BASE) != Some(0)
+        {
+            return Err("AT_PAGESZ/AT_ENTRY/AT_BASE wrong for a static i386 image");
+        }
+        if stack.aux(AT_HWCAP).is_none() || stack.aux(AT_SECURE) != Some(0) {
+            return Err("AT_HWCAP/AT_SECURE missing from the 32-bit auxv");
+        }
+        match stack.aux(AT_PLATFORM) {
+            Some(p)
+                if user_cstr(&proc.address_space, u64::from(p)).as_deref()
+                    == Some(&b"i686"[..]) => {}
+            _ => return Err("AT_PLATFORM must name COMPAT_ELF_PLATFORM \"i686\""),
+        }
+        match stack.aux(AT_RANDOM) {
+            Some(r) if u64::from(r) > esp && u64::from(r) + 16 <= TASK_SIZE_32 => {}
+            _ => return Err("AT_RANDOM must point at 16 bytes on the 32-bit stack"),
+        }
+        if stack.aux(AT_SYSINFO_EHDR).is_some() || stack.aux(AT_SYSINFO).is_some() {
+            return Err("no vDSO32 exists: AT_SYSINFO(_EHDR) must be absent, not the 64-bit vDSO");
+        }
+        if proc.fs_base.is_some() || proc.gs_base != 0 {
+            return Err("an i386 task must start with FS and GS bases of zero");
+        }
+        Ok(())
+    })();
+    unload(proc);
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_static_image_loads_in_a_32bit_layout
+);
+
+/// The compat process's address space, for the AS-lookup `fn` pointer.
+static COMPAT_AS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::sync::Arc<narf_memory::AddressSpace>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn compat_as_lookup() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+    COMPAT_AS.lock().clone()
+}
+
+/// Make `proc`'s address space the harness task's current one.
+fn install_compat_as(proc: &crate::UserProcess) {
+    *COMPAT_AS.lock() = Some(alloc::sync::Arc::clone(&proc.address_space));
+    crate::handlers::install_address_space_lookup(compat_as_lookup);
+}
+
+fn clear_compat_as() {
+    *COMPAT_AS.lock() = None;
+}
+
+/// `arch_pick_mmap_layout` / `arch_get_unmapped_area` and `load_elf_binary`'s
+/// brk for an IA-32 task: every mapping the kernel chooses lands below
+/// `TASK_SIZE_32`, mmap from the compat mmap base (`mmap_compat_base`; NARF
+/// uses the bottom-up `mmap_compat_legacy_base` layout), and the program
+/// break starts after the image's `.bss` (`mm->start_brk = ELF_PAGEALIGN
+/// (elf_brk)`, randomized by `arch_randomize_brk`), not in NARF's 64-bit
+/// heap arena. A fixed mapping anywhere in the 32-bit window above
+/// `mmap_min_addr` is legal.
+fn smoke_compat32_mmap_and_brk_stay_below_task_size_32() -> TestResult {
+    const PROT_RW: u64 = 0x3;
+    const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
+    const MAP_FIXED: u64 = 0x10;
+    let bytes = i386_static_image();
+    let proc = match load_i386(&bytes, &["hello"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup_strict(|| {
+        install_compat_as(&proc);
+        let reserved = proc.address_space.reserve_mmap_va(0x1000);
+        if reserved < COMPAT_MMAP_BASE || reserved + 0x1000 > TASK_SIZE_32 {
+            return Err("the mmap cursor of an i386 address space is outside the 32-bit window");
+        }
+        let anon = call(
+            Syscall::Mmap.raw(),
+            SyscallArgs {
+                arg0: 0,
+                arg1: 0x2000,
+                arg2: PROT_RW,
+                arg3: MAP_PRIVATE_ANON,
+                arg4: u64::MAX,
+                arg5: 0,
+            },
+        )
+        .ok_or("mmap returned a non-Linux status")?;
+        if anon < 0 || anon as u64 + 0x2000 > TASK_SIZE_32 || (anon as u64) < COMPAT_MMAP_BASE {
+            return Err("an anonymous mmap in an i386 address space landed above TASK_SIZE_32");
+        }
+        let fixed_va = 0x1000_0000u64;
+        let fixed = call(
+            Syscall::Mmap.raw(),
+            SyscallArgs {
+                arg0: fixed_va,
+                arg1: 0x1000,
+                arg2: PROT_RW,
+                arg3: MAP_PRIVATE_ANON | MAP_FIXED,
+                arg4: u64::MAX,
+                arg5: 0,
+            },
+        );
+        if fixed != Some(fixed_va as i64) {
+            return Err("MAP_FIXED inside the 32-bit window was refused");
+        }
+        let brk0 = call(Syscall::Brk.raw(), a0(0)).ok_or("brk returned a non-Linux status")?;
+        let image_end = u64::from(STATIC_DATA_VA) + u64::from(STATIC_DATA_MEM);
+        if (brk0 as u64) < image_end || brk0 as u64 >= COMPAT_MMAP_BASE {
+            return Err("an i386 program break must start after .bss and below the mmap base");
+        }
+        let grown = call(Syscall::Brk.raw(), a0(brk0 as u64 + 0x3000));
+        if grown != Some(brk0 + 0x3000) {
+            return Err("brk could not grow the i386 heap");
+        }
+        Ok(())
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_mmap_and_brk_stay_below_task_size_32
+);
+
+/// A one-page-text ET_DYN i386 object with an optional PT_INTERP, and a
+/// PT_DYNAMIC whose `DT_REL` table holds one `R_386_RELATIVE` against a slot
+/// carrying `rel_addend` when that is `Some`.
+fn i386_dyn_image(entry: u32, interp: Option<&[u8]>, rel_addend: Option<u32>) -> Vec<u8> {
+    let mut phdrs = Vec::new();
+    let nph = 4 + u32::from(interp.is_some());
+    phdrs.push(Ph32 {
+        p_type: PT_PHDR,
+        offset: EHDR32 as u32,
+        vaddr: EHDR32 as u32,
+        filesz: nph * PHDR32 as u32,
+        memsz: nph * PHDR32 as u32,
+        flags: PF_R,
+        align: 4,
+    });
+    if let Some(name) = interp {
+        phdrs.push(Ph32 {
+            p_type: PT_INTERP,
+            offset: 0x200,
+            vaddr: 0x200,
+            filesz: name.len() as u32,
+            memsz: name.len() as u32,
+            flags: PF_R,
+            align: 1,
+        });
+    }
+    phdrs.push(Ph32 {
+        p_type: PT_LOAD,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0x1000,
+        memsz: 0x1000,
+        flags: PF_R | PF_X,
+        align: 0x1000,
+    });
+    phdrs.push(Ph32 {
+        p_type: PT_LOAD,
+        offset: 0x1000,
+        vaddr: 0x1000,
+        filesz: 0x1000,
+        memsz: 0x1000,
+        flags: PF_R | PF_W,
+        align: 0x1000,
+    });
+    phdrs.push(Ph32 {
+        p_type: PT_DYNAMIC,
+        offset: 0x1000,
+        vaddr: 0x1000,
+        filesz: 4 * 8,
+        memsz: 4 * 8,
+        flags: PF_R | PF_W,
+        align: 4,
+    });
+    let mut b = elf32(ET_DYN, EM_386, entry, &phdrs, 0x2000);
+    if let Some(name) = interp {
+        b[0x200..0x200 + name.len()].copy_from_slice(name);
+    }
+    // Elf32_Dyn: DT_REL = 0x1100, DT_RELSZ, DT_RELENT = 8, then DT_NULL.
+    put32(&mut b, 0x1000, 17);
+    put32(&mut b, 0x1004, 0x1100);
+    put32(&mut b, 0x1008, 18);
+    put32(&mut b, 0x100C, if rel_addend.is_some() { 8 } else { 0 });
+    put32(&mut b, 0x1010, 19);
+    put32(&mut b, 0x1014, 8);
+    // One Elf32_Rel { r_offset = 0x1200, r_info = R_386_RELATIVE (8) } whose
+    // implicit addend sits in the slot itself.
+    if let Some(addend) = rel_addend {
+        put32(&mut b, 0x1100, 0x1200);
+        put32(&mut b, 0x1104, 8);
+        put32(&mut b, 0x1200, addend);
+    }
+    b
+}
+
+/// `load_elf_binary` for an i386 PIE naming an i386 interpreter:
+///
+///   * the PIE loads at `ELF_ET_DYN_BASE` = 0x400000 for `mmap_is_ia32()`
+///     (plus `arch_mmap_rnd`), the interpreter in the compat mmap region
+///     (`load_elf_interp` maps it through `get_unmapped_area`);
+///   * AT_BASE is the interpreter's load address and AT_ENTRY the program's;
+///   * the kernel applies no relocation to an i386 object: `ld.so`
+///     relocates itself, and `Elf32_Rel` has implicit addends, so a kernel
+///     pass would add the bias twice;
+///   * the interpreter must itself be an IA-32 image (`elf_check_arch` on
+///     `interp_elf_ex`, else `-ELIBBAD`); a 64-bit one is refused.
+fn smoke_compat32_pie_and_interpreter_load_in_the_compat_window() -> TestResult {
+    const NAME: &str = "/lib/ld-compat32-test.so.2";
+    const PROG_ENTRY: u32 = 0x100;
+    const INTERP_ENTRY: u32 = 0x80;
+    const REL_ADDEND: u32 = 0x0000_1234;
+    let interp: &'static [u8] = alloc::boxed::Box::leak(
+        i386_dyn_image(INTERP_ENTRY, None, Some(REL_ADDEND)).into_boxed_slice(),
+    );
+    crate::register_interpreter(NAME, interp);
+    let mut path = Vec::from(NAME.as_bytes());
+    path.push(0);
+    let prog = i386_dyn_image(PROG_ENTRY, Some(&path), None);
+    let proc = match load_i386(&prog, &["prog"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = (|| -> Result<(), &'static str> {
+        let stack = read_stack32(&proc.address_space, proc.stack_top.as_u64())
+            .ok_or("the startup block is not a 32-bit layout")?;
+        let base = u64::from(stack.aux(AT_BASE).ok_or("AT_BASE missing")?);
+        if base < COMPAT_MMAP_BASE || base + 0x2000 > TASK_SIZE_32 {
+            return Err("the i386 interpreter is not in the compat mmap window");
+        }
+        if proc.entry.0.as_u64() != base + u64::from(INTERP_ENTRY) {
+            return Err("the first entry is not the interpreter's entry at AT_BASE");
+        }
+        let bias = proc.program_bias;
+        if !(0x40_0000..=0x40_0000 + 0x0100_1000).contains(&bias) || bias & 0xFFF != 0 {
+            return Err("an i386 PIE must load at ELF_ET_DYN_BASE (0x400000) plus rnd");
+        }
+        if stack.aux(AT_ENTRY).map(u64::from) != Some(bias + u64::from(PROG_ENTRY))
+            || stack.aux(AT_PHDR).map(u64::from) != Some(bias + EHDR32 as u64)
+        {
+            return Err("AT_ENTRY/AT_PHDR not biased by the PIE's load base");
+        }
+        if user_u32(&proc.address_space, base + 0x1200) != Some(REL_ADDEND) {
+            return Err("the kernel relocated an i386 interpreter's Elf32_Rel slot");
+        }
+        Ok(())
+    })();
+    unload(proc);
+    if let Err(msg) = outcome {
+        return TestResult::Fail(msg);
+    }
+
+    // An i386 program whose PT_INTERP names a 64-bit object.
+    const NAME64: &str = "/lib/ld-compat32-test-64.so";
+    let mut interp64 = alloc::vec![0u8; 0x1000];
+    interp64[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    interp64[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+    interp64[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+    interp64[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    interp64[0x18..0x20].copy_from_slice(&0x80u64.to_le_bytes());
+    interp64[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    interp64[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    interp64[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    interp64[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    interp64[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    interp64[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+    interp64[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    interp64[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    interp64[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    let interp64: &'static [u8] = alloc::boxed::Box::leak(interp64.into_boxed_slice());
+    crate::register_interpreter(NAME64, interp64);
+    let mut path64 = Vec::from(NAME64.as_bytes());
+    path64.push(0);
+    let mixed = i386_dyn_image(PROG_ENTRY, Some(&path64), None);
+    match load_i386(&mixed, &["prog"], &[]) {
+        Ok(p) => {
+            unload(p);
+            TestResult::Fail("an i386 program loaded a 64-bit interpreter")
+        }
+        Err(_) => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_pie_and_interpreter_load_in_the_compat_window
+);
+
+/// Mixed exec, 64-bit to i386: a 64-bit task's `execve` of an i386 image
+/// goes through `compat_binfmt_elf` instead of failing with ENOEXEC
+/// ("exec format error", Steam's `ldd` of `steamui.so`). The harness has no
+/// user-task context, so a load that succeeds ends in the kernel-test bail
+/// (-ENOSYS) rather than in ring 3; -ENOEXEC means the image was refused.
+fn smoke_compat32_execve_of_an_i386_image_is_not_enoexec() -> TestResult {
+    let image = i386_static_image();
+    with_memfs(
+        "/compat32-exec",
+        "compat32-exec",
+        &[("hello", image.as_slice())],
+        || {
+            let path = b"/compat32-exec/hello\0";
+            match call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+                Some(ENOSYS) => Ok(()),
+                Some(ENOEXEC) => Err("execve of an i386 ELF32 image is still ENOEXEC"),
+                _ => Err("execve of an i386 image neither loaded nor reported ENOEXEC"),
+            }
+        },
+    )
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_execve_of_an_i386_image_is_not_enoexec
+);
