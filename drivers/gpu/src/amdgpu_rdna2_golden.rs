@@ -1,4 +1,5 @@
-//! Discrete RDNA2 golden sequences, in Linux gfx_v10_0_init_golden_registers order.
+//! RDNA2 golden sequences (discrete Navi21–24 and the Raphael APU), in Linux
+//! gfx_v10_0_init_golden_registers order.
 //! Register provenance: gc_10_1_0_offset.h and gfx_v10_0.c's local overrides.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1097,6 +1098,168 @@ pub const NAVI24: &[Golden] = &[
     },
 ];
 
+/// Raphael: `golden_settings_gc_10_3_6` is the only sequence Linux applies to
+/// GC 10.3.6 (no shared `golden_settings_gc_10_3` prefix). `GCR_GENERAL_CNTL`
+/// is `gfx_v10_0.c`'s local `mmGCR_GENERAL_CNTL_Vangogh` (0x1580), not the
+/// `gc_10_1_0_offset.h` offset.
+pub const RAPHAEL: &[Golden] = &[
+    // Linux golden_settings_gc_10_3_6 (22 rows).
+    // mmCGTT_SPI_CS_CLK_CTRL
+    Golden {
+        base_index: 1,
+        offset: 0x507c,
+        and_mask: 0xff7f0fff,
+        or_mask: 0x78000100,
+    },
+    // mmCH_PIPE_STEER
+    Golden {
+        base_index: 1,
+        offset: 0x2d90,
+        and_mask: 0x000000ff,
+        or_mask: 0x00000044,
+    },
+    // mmCPF_GCR_CNTL
+    Golden {
+        base_index: 0,
+        offset: 0x1f53,
+        and_mask: 0x0007ffff,
+        or_mask: 0x0000c200,
+    },
+    // mmDB_DEBUG3
+    Golden {
+        base_index: 0,
+        offset: 0x13ae,
+        and_mask: 0xffffffff,
+        or_mask: 0x00000280,
+    },
+    // mmDB_DEBUG4
+    Golden {
+        base_index: 0,
+        offset: 0x13af,
+        and_mask: 0xffffffff,
+        or_mask: 0x00800000,
+    },
+    // mmGB_ADDR_CONFIG
+    Golden {
+        base_index: 0,
+        offset: 0x13de,
+        and_mask: 0x0c1807ff,
+        or_mask: 0x00000042,
+    },
+    // mmGCR_GENERAL_CNTL_Vangogh
+    Golden {
+        base_index: 0,
+        offset: 0x1580,
+        and_mask: 0x1ff1ffff,
+        or_mask: 0x00000500,
+    },
+    // mmGL1_PIPE_STEER
+    Golden {
+        base_index: 1,
+        offset: 0x2d10,
+        and_mask: 0x000000ff,
+        or_mask: 0x00000044,
+    },
+    // mmGL2_PIPE_STEER_0
+    Golden {
+        base_index: 1,
+        offset: 0x2e25,
+        and_mask: 0x77777777,
+        or_mask: 0x32103210,
+    },
+    // mmGL2_PIPE_STEER_1
+    Golden {
+        base_index: 1,
+        offset: 0x2e26,
+        and_mask: 0x77777777,
+        or_mask: 0x32103210,
+    },
+    // mmGL2A_ADDR_MATCH_MASK
+    Golden {
+        base_index: 1,
+        offset: 0x2e21,
+        and_mask: 0xffffffff,
+        or_mask: 0xfffffff3,
+    },
+    // mmGL2C_ADDR_MATCH_MASK
+    Golden {
+        base_index: 1,
+        offset: 0x2e03,
+        and_mask: 0xffffffff,
+        or_mask: 0xfffffff3,
+    },
+    // mmGL2C_CM_CTRL1
+    Golden {
+        base_index: 1,
+        offset: 0x2e08,
+        and_mask: 0xff8fff0f,
+        or_mask: 0x580f1008,
+    },
+    // mmGL2C_CTRL3
+    Golden {
+        base_index: 1,
+        offset: 0x2e0c,
+        and_mask: 0xf7ffffff,
+        or_mask: 0x00f80988,
+    },
+    // mmLDS_CONFIG
+    Golden {
+        base_index: 0,
+        offset: 0x10a2,
+        and_mask: 0x000001ff,
+        or_mask: 0x00000020,
+    },
+    // mmPA_CL_ENHANCE
+    Golden {
+        base_index: 0,
+        offset: 0x1025,
+        and_mask: 0xf17fffff,
+        or_mask: 0x01200007,
+    },
+    // mmPA_SC_BINNER_TIMEOUT_COUNTER
+    Golden {
+        base_index: 0,
+        offset: 0x1070,
+        and_mask: 0xffffffff,
+        or_mask: 0x00000800,
+    },
+    // mmPA_SC_ENHANCE_2
+    Golden {
+        base_index: 0,
+        offset: 0x107c,
+        and_mask: 0xffffffbf,
+        or_mask: 0x00000820,
+    },
+    // mmSQG_CONFIG
+    Golden {
+        base_index: 0,
+        offset: 0x10ba,
+        and_mask: 0x000017ff,
+        or_mask: 0x00001000,
+    },
+    // mmSX_DEBUG_1
+    Golden {
+        base_index: 0,
+        offset: 0x11b8,
+        and_mask: 0xffffff7f,
+        or_mask: 0x00010020,
+    },
+    // mmTA_CNTL_AUX
+    Golden {
+        base_index: 0,
+        offset: 0x12e2,
+        and_mask: 0xfff7ffff,
+        or_mask: 0x01030000,
+    },
+    // mmUTCL1_CTRL
+    Golden {
+        base_index: 0,
+        offset: 0x1588,
+        and_mask: 0xffffffff,
+        or_mask: 0x00100000,
+    },
+];
+
 /// Unknown GC revisions have no safe default sequence.
 pub fn for_gc(version: (u8, u8, u8)) -> Option<&'static [Golden]> {
     match version {
@@ -1104,6 +1267,7 @@ pub fn for_gc(version: (u8, u8, u8)) -> Option<&'static [Golden]> {
         (10, 3, 2) => Some(NAVI22),
         (10, 3, 4) => Some(NAVI23),
         (10, 3, 5) => Some(NAVI24),
+        (10, 3, 6) => Some(RAPHAEL),
         _ => None,
     }
 }

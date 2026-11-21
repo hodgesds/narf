@@ -105,3 +105,85 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_power_table_admission_pins_complete_board_ranges_and_exact_sizes
 );
+
+/// Raphael is an RDNA2 APU: its own lookup, never the discrete one, so no
+/// discrete path (trained VRAM, driver-loaded SOS/SMC, PSP/SMU 11) can admit
+/// it. Its graphics, media and display names are Linux's and agree with
+/// `amdgpu::RAPHAEL_FW` in its UCODE_ID order; SOS and SMC are BIOS-resident.
+fn rdna2_raphael_is_an_apu_profile_with_linux_firmware() -> TestResult {
+    let raphael = crate::amdgpu::RAPHAEL;
+    if apu_for_pci_id(0x1002, raphael) != Some(&RAPHAEL)
+        || apu_for_pci_id(0x10de, raphael).is_some()
+        || for_pci_id(0x1002, raphael).is_some()
+        || native_start_available(0x1002, raphael)
+        || PROFILES.iter().any(|p| p.pci_ids.contains(&raphael))
+    {
+        return TestResult::Fail("Raphael reachable through the discrete RDNA2 lookup");
+    }
+    for profile in PROFILES {
+        if profile
+            .pci_ids
+            .iter()
+            .any(|&id| apu_for_pci_id(0x1002, id).is_some())
+        {
+            return TestResult::Fail("discrete RDNA2 reachable through the APU lookup");
+        }
+    }
+    let f = RAPHAEL.firmware;
+    if !f.sos.is_empty() || !f.smc.is_empty() {
+        return TestResult::Fail("Raphael names a driver-loaded SOS or SMC");
+    }
+    let names: alloc::vec::Vec<&str> = crate::amdgpu::RAPHAEL_FW
+        .iter()
+        .filter(|e| e.cmd == crate::amdgpu_psp::PSP_CMD_LOAD_IP_FW)
+        .map(|e| e.name)
+        .collect();
+    let expected = [
+        f.sdma, f.ce, f.pfp, f.me, f.mec, f.mec2, f.rlc, f.vcn, f.dmcub,
+    ];
+    if names != expected
+        || (
+            RAPHAEL.gc_version,
+            RAPHAEL.psp_version,
+            RAPHAEL.sdma_version,
+        ) != ((10, 3, 6), (13, 0, 5), (5, 2, 6))
+        || (RAPHAEL.dcn_version, RAPHAEL.vcn_versions) != ((3, 1, 5), &[(3, 1, 2)][..])
+    {
+        return TestResult::Fail("Raphael firmware or IP identity differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_raphael_is_an_apu_profile_with_linux_firmware
+);
+
+/// `golden_settings_gc_10_3_6`: 22 rows from `gc_10_1_0_offset.h`, with
+/// `gfx_v10_0.c`'s local `mmGCR_GENERAL_CNTL_Vangogh`, in Linux's order.
+fn rdna2_raphael_golden_matches_gc_10_3_6() -> TestResult {
+    let rows = golden::RAPHAEL;
+    let row = |i: usize| {
+        let r = &rows[i];
+        (r.base_index, r.offset, r.and_mask, r.or_mask)
+    };
+    if golden::for_gc((10, 3, 6)).map(<[_]>::as_ptr) != Some(rows.as_ptr())
+        || rows.len() != 22
+        // mmCGTT_SPI_CS_CLK_CTRL
+        || row(0) != (1, 0x507c, 0xff7f0fff, 0x78000100)
+        // mmGB_ADDR_CONFIG
+        || row(5) != (0, 0x13de, 0x0c1807ff, 0x00000042)
+        // mmGCR_GENERAL_CNTL_Vangogh
+        || row(6) != (0, 0x1580, 0x1ff1ffff, 0x00000500)
+        // mmGL2C_CM_CTRL1
+        || row(12) != (1, 0x2e08, 0xff8fff0f, 0x580f1008)
+        // mmUTCL1_CTRL
+        || row(21) != (0, 0x1588, 0xffffffff, 0x00100000)
+    {
+        return TestResult::Fail("GC 10.3.6 golden sequence differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_raphael_golden_matches_gc_10_3_6
+);
