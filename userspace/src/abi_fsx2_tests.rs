@@ -3827,6 +3827,162 @@ kernel_test_in!(
     smoke_abi_fsx2_mount_listings_after_a_global_pivot_root
 );
 
+/// The whole of a procfs mount listing, read until EOF.
+fn read_mount_listing(path: &core::ffi::CStr) -> Result<alloc::string::String, &'static str> {
+    let fd = match call_open(path.as_ptr() as u64, 0) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("open of a mount listing failed"),
+    };
+    let mut text = alloc::vec::Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+        ) {
+            Some(0) => break,
+            Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+            _ => {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return Err("read of a mount listing failed");
+            }
+        }
+    }
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    alloc::string::String::from_utf8(text).map_err(|_| "a mount listing is not UTF-8")
+}
+
+/// Every id `listmount(LSMT_ROOT)` pages out, one per call.
+fn listmount_paged_ids() -> Result<alloc::vec::Vec<u64>, &'static str> {
+    const LSMT_ROOT: u64 = u64::MAX;
+    let mut ids = alloc::vec::Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let req = mnt_id_req(32, LSMT_ROOT, cursor);
+        let mut one = [0u64; 1];
+        match call(
+            Syscall::Listmount.raw(),
+            a3(req.as_ptr() as u64, one.as_mut_ptr() as u64, 1, 0),
+        ) {
+            Some(1) if one[0] > cursor => {
+                ids.push(one[0]);
+                cursor = one[0];
+            }
+            Some(0) => return Ok(ids),
+            _ => return Err("listmount paging returned an id that did not advance"),
+        }
+        if ids.len() > 100_000 {
+            return Err("listmount paging did not terminate");
+        }
+    }
+}
+
+/// The same state after the cleanup the `userspace/mount` pivot smokes use:
+/// they pop the topmost mount at put_old and the new root straight from the
+/// registry, which takes the old root's attachment but not the mounts that
+/// were attached below it.
+///
+/// Linux cannot get there — `umount_tree` takes an attachment's children
+/// with it, and a plain umount of a mount with children is -EBUSY — so the
+/// children left behind belong to no tree any root reaches, and no listing
+/// shows them. They were listed, one copy of the whole global tree per such
+/// smoke (`/new_root/old/proc`, `/new_root2/...`), which is what kept
+/// `smoke_abi_fsx_noexec_nodev_are_enforced_and_reported`'s one 4 KiB read
+/// of /proc/mounts from reaching the mount it had made.
+fn smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root() -> TestResult {
+    with_setup(|| {
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        crate::handlers::__test_root_dir_reset();
+        let mount_points = |info: &str| -> alloc::vec::Vec<alloc::string::String> {
+            info.lines()
+                .filter_map(|line| line.split(' ').nth(4).map(alloc::string::String::from))
+                .collect()
+        };
+        let pop = |path: &str| {
+            let handle = narf_capabilities::Cap::<
+                narf_filesystem::MountPoint,
+                narf_capabilities::Write,
+            >::bootstrap();
+            let _ = registry().unmount(&handle, path);
+        };
+        let before = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
+        let before_ids = listmount_paged_ids()?;
+        let mounted = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"none".as_ptr() as u64,
+                c"/abi-pvo-new".as_ptr() as u64,
+                c"tmpfs".as_ptr() as u64,
+                0,
+                0,
+            ),
+        ) == Some(0);
+        if !mounted
+            || call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, c"/abi-pvo-new/old".as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+        {
+            return Err("the new root tmpfs and its put_old were not set up");
+        }
+        let pivoted = call(
+            Syscall::PivotRoot.raw(),
+            a2(
+                c"/abi-pvo-new".as_ptr() as u64,
+                c"/abi-pvo-new/old".as_ptr() as u64,
+                0,
+            ),
+        );
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        // The smokes' cleanup: the topmost mount at put_old, then the root.
+        pop("/abi-pvo-new/old");
+        pop("/abi-pvo-new");
+        let result = (|| {
+            if pivoted != Some(0) {
+                return Err("pivot_root into the tmpfs failed");
+            }
+            let after = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
+            if after.iter().any(|path| path.starts_with("/abi-pvo-new")) {
+                return Err("mountinfo lists mounts left behind by a popped put_old attachment");
+            }
+            if after != before {
+                return Err("mountinfo changed across a pivot whose mounts are all gone");
+            }
+            let mounts = read_mount_listing(c"/proc/mounts")?;
+            if mounts
+                .lines()
+                .filter_map(|line| line.split(' ').nth(1))
+                .any(|path| path.starts_with("/abi-pvo-new"))
+            {
+                return Err("/proc/mounts lists mounts left behind by a popped put_old attachment");
+            }
+            if listmount_paged_ids()?.len() != before_ids.len() {
+                return Err("listmount lists mounts left behind by a popped put_old attachment");
+            }
+            Ok(())
+        })();
+        // Pop what the registry still holds below the old new root, deepest
+        // first.
+        let mut left: alloc::vec::Vec<alloc::string::String> = registry()
+            .list()
+            .into_iter()
+            .filter(|path| path.starts_with("/abi-pvo-new/"))
+            .collect();
+        left.sort_by_key(|path| core::cmp::Reverse(path.len()));
+        for path in &left {
+            pop(path);
+        }
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pivot-listing",
+    smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root
+);
+
 /// `statmount`'s flag validation and the string-area sizing.
 ///
 /// `prepare_kstatmount` answers -EOVERFLOW for a request that asks for a
