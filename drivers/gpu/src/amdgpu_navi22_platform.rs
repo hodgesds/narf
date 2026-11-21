@@ -1127,13 +1127,21 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                 let Some(fault) = crate::amdgpu_gmc_navi22::Fault::from_iv(&iv) else {
                     continue;
                 };
-                let result = {
+                let (result, line) = {
                     let mut owner = OWNER.lock().await;
-                    owner
+                    let gmc = owner
                         .as_mut()
                         .ok_or(boot::Error::Invalid)
-                        .and_then(|boot| boot.memory())
-                        .and_then(|gmc| gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs))
+                        .and_then(|boot| boot.memory());
+                    match gmc {
+                        Ok(gmc) => {
+                            let result = gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs);
+                            // gfxhub_v2_1/mmhub_v2_0_print_l2_protection_fault_status.
+                            let status = crate::amdgpu_vmid::fault(fault.pasid).status;
+                            (result, Some(gmc.status_line(fault.hub, status)))
+                        }
+                        Err(error) => (Err(error), None),
+                    }
                 };
                 let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if seen < FAULT_LOG_LIMIT {
@@ -1142,38 +1150,10 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                         narf_console::Writer,
                         "amdgpu: navi22 GPU page fault {fault:?} -> {result:?}"
                     );
-                    // gfxhub_v2_1_print_l2_protection_fault_status.
-                    let status = crate::amdgpu_vmid::fault(fault.pasid).status;
-                    const CLIENTS: [&str; 18] = [
-                        "CB/DB",
-                        "Reserved",
-                        "GE1",
-                        "GE2",
-                        "CPF",
-                        "CPC",
-                        "CPG",
-                        "RLC",
-                        "TCP",
-                        "SQC (inst)",
-                        "SQC (data)",
-                        "SQG",
-                        "Reserved",
-                        "SDMA0",
-                        "SDMA1",
-                        "GCR",
-                        "SDMA2",
-                        "SDMA3",
-                    ];
-                    let cid = (status >> 9) & 0x1ff;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "amdgpu: navi22 GPU page fault status={status:#x} client={} walker={} permission={:#x} mapping={} rw={}",
-                        CLIENTS.get(cid as usize).copied().unwrap_or("?"),
-                        (status >> 1) & 7,
-                        (status >> 4) & 0xf,
-                        (status >> 8) & 1,
-                        (status >> 18) & 1,
-                    );
+                    if let Some(line) = line {
+                        let _ =
+                            writeln!(narf_console::Writer, "amdgpu: navi22 GPU page fault {line}");
+                    }
                 }
             }
         });

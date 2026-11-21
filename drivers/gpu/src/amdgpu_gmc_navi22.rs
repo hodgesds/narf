@@ -11,12 +11,15 @@ use crate::{
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_gmc_navi22_fault.rs"]
+mod fault;
 #[path = "amdgpu_gmc_navi22_gart.rs"]
 mod gart;
 #[path = "amdgpu_gmc_navi22_regs.rs"]
 mod regs;
 #[path = "amdgpu_gmc_navi22_vm.rs"]
 mod vm;
+pub use fault::{fault_client, FaultStatus, StatusLine};
 pub use gart::{GartInfo, Gtt, GART_SIZE};
 use regs::{HubRegs, GFX, MM, MM23};
 pub use vm::{
@@ -101,6 +104,8 @@ struct Layout {
     /// HDP 5.0's HDP_MISC_CNTL. HDP 5.2 (`hdp_v5_2_funcs`) has no
     /// `init_registers`, so there is nothing to program.
     hdp: Option<u64>,
+    /// Discovered MMHUB IP version (`amdgpu_ip_version(adev, MMHUB_HWIP, 0)`).
+    mmhub: (u8, u8, u8),
 }
 /// Which `nbio_*_init_registers` the hubs follow.
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +159,9 @@ impl Layout {
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
+        let mmhub = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MMHUB, 0)
+            .map(|b| (b.major, b.minor, b.revision))
+            .ok_or(Error::Unsupported)?;
         let nbif = [
             (2, 3, 0),
             (2, 3, 1),
@@ -182,6 +190,7 @@ impl Layout {
                 0,
                 HDP_MISC_CNTL as u32,
             )?),
+            mmhub,
         })
     }
     /// Raphael: GC 10.3.6's gfxhub_v2_1 (Navi22's), mmhub_v2_3 on MMHUB
@@ -197,6 +206,9 @@ impl Layout {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
         let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let mmhub = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MMHUB, 0)
+            .map(|b| (b.major, b.minor, b.revision))
+            .ok_or(Error::Unsupported)?;
         // The highest MM23 register: engine 17's ADDR_RANGE_HI32.
         let mm_last = MM23.inv_range + 17 * MM23.eng_addr_distance + 1;
         reg(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
@@ -215,6 +227,7 @@ impl Layout {
             nbio: nbio.bif,
             init: NbioInit::V7_2(nbio),
             hdp: None,
+            mmhub,
         })
     }
 }
@@ -924,6 +937,19 @@ impl Gmc {
     /// Interrupt-handler hook for decoded VMC/UTCL2 fault IVs.
     pub fn handle_fault(&mut self, fault: Fault) -> Result<FaultOwner, Error> {
         self.engine.handle_fault(fault)
+    }
+    /// The discovered MMHUB IP version: it selects the client table a fault
+    /// report names MMHUB clients from (`mmhub_v2_0_init_client_info`).
+    pub fn mmhub_version(&self) -> (u8, u8, u8) {
+        self.engine.layout.mmhub
+    }
+    /// One fault's decoded L2 status (`status` from `handle_fault`'s read).
+    pub fn status_line(&self, hub: Hub, status: u32) -> StatusLine {
+        StatusLine {
+            hub,
+            mmhub: self.engine.layout.mmhub,
+            status: FaultStatus(status),
+        }
     }
     /// gmc_v10_0_vm_fault_interrupt_state. Enable only once an IH owner drains.
     pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {

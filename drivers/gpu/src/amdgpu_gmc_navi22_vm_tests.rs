@@ -783,3 +783,74 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_gart_and_client_gpuvm_use_resolved_hubs_and_isolate_clients
 );
+
+/// The RX 6750 XT's first VCN decode logged MMHUB VMID 7 faults with
+/// `MMVM_L2_PROTECTION_FAULT_STATUS` 0x70133c, which the report named
+/// "SQC (inst)" from the GFXHUB table. As
+/// `mmhub_v2_0_print_l2_protection_fault_status` does, an MMHUB status names
+/// its client from the MMHUB IP's read/write table
+/// (`mmhub_client_ids_sienna_cichlid` for 2.1.0/2.1.1,
+/// `mmhub_client_ids_beige_goby` for 2.1.2) and prints the raw CID beside it;
+/// a GFXHUB status keeps `gfxhub_client_ids`.
+fn gmc_navi22_fault_report_names_mmhub_clients_like_mmhub_v2_0() -> TestResult {
+    let status = FaultStatus(0x0070_133c);
+    if status.cid() != 9
+        || status.walker_error() != 6
+        || status.permission_faults() != 3
+        || status.mapping_error() != 1
+        || status.rw() != 0
+        || status.vmid() != 7
+        || status.more_faults() != 0
+    {
+        return TestResult::Fail("MMVM_L2_PROTECTION_FAULT_STATUS fields");
+    }
+    /// (hub, MMHUB IP version, CID, write, expected name)
+    type Case = (Hub, (u8, u8, u8), u32, bool, Option<&'static str>);
+    let sienna = (2, 1, 0);
+    let cases: [Case; 13] = [
+        (Hub::Mm, sienna, 9, false, Some("VCNU0")),
+        (Hub::Mm, sienna, 9, true, Some("VCNU0")),
+        (Hub::Mm, sienna, 10, false, Some("JPEG")),
+        (Hub::Mm, sienna, 11, true, Some("VCN0")),
+        (Hub::Mm, sienna, 32 + 11, false, Some("VCN0")),
+        (Hub::Mm, sienna, 0, true, Some("DBGU0")),
+        (Hub::Mm, (2, 1, 1), 13, false, Some("VCN1")),
+        // Holes and the end of the table are unknown, as Linux prints them.
+        (Hub::Mm, sienna, 2, false, None),
+        (Hub::Mm, sienna, 8, true, None),
+        (Hub::Mm, sienna, 44, false, None),
+        (Hub::Mm, (2, 1, 2), 11, false, Some("VCN0")),
+        (Hub::Mm, (2, 1, 2), 10, false, None),
+        (Hub::Gfx, sienna, 9, false, Some("SQC (inst)")),
+    ];
+    for (hub, mmhub, cid, write, name) in cases {
+        if fault_client(hub, mmhub, cid, write) != name {
+            return TestResult::Fail("fault client table does not follow the hub's IP");
+        }
+    }
+    let line = StatusLine {
+        hub: Hub::Mm,
+        mmhub: sienna,
+        status,
+    };
+    if alloc::format!("{line}")
+        != "status=0x70133c hub=MM client=VCNU0 (0x9) more=0 walker=6 permission=0x3 mapping=1 rw=0 vmid=7"
+    {
+        return TestResult::Fail("MMHUB status line");
+    }
+    let unknown = StatusLine {
+        hub: Hub::Mm,
+        mmhub: sienna,
+        status: FaultStatus(0x0004_1001),
+    };
+    if alloc::format!("{unknown}")
+        != "status=0x41001 hub=MM client=unknown (0x8) more=1 walker=0 permission=0x0 mapping=0 rw=1 vmid=0"
+    {
+        return TestResult::Fail("unknown client line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22/fault-report",
+    gmc_navi22_fault_report_names_mmhub_clients_like_mmhub_v2_0
+);
