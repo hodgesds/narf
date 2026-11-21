@@ -48,6 +48,12 @@ pub const SPI_GDBG_TRAP_MASK: Reg = Reg(0, 0x1f73); // linux: mmSPI_GDBG_TRAP_MA
 pub const SPI_GDBG_TRAP_DATA0: Reg = Reg(0, 0x1f78); // linux: mmSPI_GDBG_TRAP_DATA0@gc101
 pub const SPI_GDBG_TRAP_DATA1: Reg = Reg(0, 0x1f79); // linux: mmSPI_GDBG_TRAP_DATA1@gc101
 
+// Soft recovery (gfx_v10_0_ring_soft_recovery, gfx_v10_0_set_safe_mode)
+pub const SQ_CMD: Reg = Reg(0, 0x111b); // linux: mmSQ_CMD@gc101
+pub const RLC_CNTL: Reg = Reg(1, 0x4c00); // linux: mmRLC_CNTL@gc101
+                                          // linux: mmRLC_SAFE_MODE_Sienna_Cichlid@gc101
+pub const RLC_SAFE_MODE: Reg = Reg(1, 0x4ca0);
+
 // RLC (rlc_resume with PSP autoload, kiq_setting)
 pub const RLC_SPM_MC_CNTL: Reg = Reg(1, 0x4c71); // linux: mmRLC_SPM_MC_CNTL@gc101
 pub const RLC_SRM_CNTL: Reg = Reg(1, 0x4c80); // linux: mmRLC_SRM_CNTL@gc101

@@ -544,6 +544,7 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         compute: Queue::new(&vram, Kind::Cp, doorbell::MEC_RING0, fence::Engine::Compute).unwrap(),
         state: crate::amdgpu_kiq_navi22::State::Prepared,
         proof: Default::default(),
+        mqd_backup: None,
     };
     if run(c.init_kiq()).is_err() || run(c.map_compute()).is_err() || run(c.test_ib()).is_err() {
         return TestResult::Fail("compute bring-up");

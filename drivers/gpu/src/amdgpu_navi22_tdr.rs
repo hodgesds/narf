@@ -267,7 +267,8 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
         }
         // A job emitted from here on is in this sample or wakes the next park.
         JOBS.store(false, Ordering::Release);
-        let samples = match crate::amdgpu_navi22_platform::queue_progress().await {
+        let who = crate::amdgpu_rdna2_client::name();
+        let samples = match crate::amdgpu_rdna2_client::queue_progress().await {
             Ok(samples) => samples,
             Err(crate::amdgpu_navi22_boot::Error::Busy) => {
                 // Owner busy: try again shortly.
@@ -284,26 +285,68 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
             return;
         }
         let now_ms = narf_time::wall::cycles_to_ns(narf_time::now_cycles()) / 1_000_000;
+        let raphael =
+            crate::amdgpu_rdna2_client::backend() == crate::amdgpu_rdna2_client::Backend::Raphael;
         for hang in record(&mut watchdog, &samples, now_ms) {
+            // amdgpu_job_timedout's first rung, Raphael only so far: a GFX or
+            // compute job whose waves die lets its ring go on.
+            if raphael && crate::amdgpu_navi22_cs::soft_recover(hang.engine, generation).await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael ring {:?} timeout, but soft recovered",
+                    hang.engine
+                );
+                continue;
+            }
+            // The next rung: reset that queue alone.
+            if raphael && matches!(hang.engine, Engine::Compute) {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael starting {:?} ring reset",
+                    hang.engine
+                );
+                if crate::amdgpu_navi22_cs::reset_queue(hang.engine, generation).await {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: raphael ring {:?} reset succeeded",
+                        hang.engine
+                    );
+                    continue;
+                }
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael ring {:?} reset failed",
+                    hang.engine
+                );
+            }
             crate::amdgpu_navi22_cs::hung(hang.engine, generation);
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 ring {:?} timeout, signaled seq={}, emitted seq={} ({} ms)",
+                "amdgpu: {who} ring {:?} timeout, signaled seq={}, emitted seq={} ({} ms)",
                 hang.engine,
                 hang.signaled,
                 hang.emitted,
                 hang.stalled_ms
             );
             if hang.engine == Engine::Gfx {
-                match crate::amdgpu_navi22_platform::gfx_hang_snapshot().await {
+                match crate::amdgpu_rdna2_client::gfx_hang_snapshot().await {
                     Ok(snapshot) => snapshot.report(),
                     Err(error) => {
                         let _ = writeln!(
                             narf_console::Writer,
-                            "amdgpu: navi22 Gfx hang snapshot {error:?}"
+                            "amdgpu: {who} Gfx hang snapshot {error:?}"
                         );
                     }
                 }
+            }
+            if raphael {
+                // Soft recovery failed and no later rung is ported for the
+                // APU: the hang fails every job and stops the submitter.
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael ring not recovered; client submission stopped"
+                );
+                continue;
             }
             if AUTOMATIC.load(Ordering::Acquire) {
                 if claim_automatic_recovery() {

@@ -316,6 +316,86 @@ impl ColdBoot {
             },
         ))
     }
+    /// The hang watchdog's sample (`amdgpu_navi22_tdr`): each verified
+    /// queue's emitted and signalled sequences, from fence writeback memory.
+    pub(crate) fn queue_progress(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, cp::Error> {
+        if !self.queues_verified() {
+            return Err(cp::Error::Busy);
+        }
+        let mut samples = alloc::vec::Vec::new();
+        samples
+            .try_reserve_exact(4)
+            .map_err(|_| cp::Error::Allocation)?;
+        samples.push(self.gfx.progress()?);
+        samples.extend(self.compute.progress()?);
+        samples.extend(self.queues.progress()?);
+        Ok(samples)
+    }
+    /// `amdgpu_ring_soft_recovery` on `ring` (GFX or compute): kill VMID
+    /// `vmid`'s waves until the job with sequence `seq` signals, for 10 ms at
+    /// most. True once it has.
+    pub(crate) async fn soft_recovery(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+        vmid: u8,
+        seq: u32,
+    ) -> Result<bool, cp::Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        const DEADLINE_NS: u64 = 10_000_000; // linux: n/a (ktime_add_us(ktime_get(), 10000))
+        if !matches!(ring, Ring::Gfx | Ring::Compute) {
+            return Err(cp::Error::Invalid);
+        }
+        let deadline = narf_time::monotonic_ns().saturating_add(DEADLINE_NS);
+        loop {
+            let (completed, _) = self.fences(ring)?;
+            if crate::amdgpu_fence_navi22::signaled(completed, seq) {
+                return Ok(true);
+            }
+            if narf_time::monotonic_ns() >= deadline {
+                return Ok(false);
+            }
+            self.gfx.kill_waves(vmid).await?;
+            narf_scheduler::yield_now().await;
+        }
+    }
+    /// `amdgpu_ring_reset` (`gfx_v10_0_reset_kcq`) for the compute ring. The
+    /// GFX ring's `reset_kgq` is not ported, and SDMA 5.2's queue reset needs
+    /// a PMFW message 13.0.5 lacks, so both are refused. Every job the ring
+    /// held is dropped; [`Self::force_complete`] then shows its fences done.
+    pub(crate) async fn reset_queue(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+    ) -> Result<(), cp::Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        if !self.queues_verified() {
+            return Err(cp::Error::Busy);
+        }
+        match ring {
+            Ring::Compute => self.compute.reset_compute().await,
+            Ring::Gfx | Ring::Sdma(_) => Err(cp::Error::Unsupported),
+        }
+    }
+    /// `amdgpu_fence_driver_force_completion` for a reset `ring`.
+    pub(crate) fn force_complete(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::Ring,
+    ) -> Result<(), cp::Error> {
+        use crate::amdgpu_navi22_submit::Ring;
+        match ring {
+            Ring::Compute => self.compute.force_complete_compute(),
+            Ring::Gfx | Ring::Sdma(_) => Err(cp::Error::Unsupported),
+        }
+    }
+    /// GC registers after a graphics timeout (`gfx_v10_0_dump_ip_state`).
+    /// GFXOFF stays disallowed, so no reference is taken.
+    pub(crate) fn gfx_hang_snapshot(&mut self) -> Result<cp::GfxHangSnapshot, cp::Error> {
+        if !self.queues_verified() {
+            return Err(cp::Error::Busy);
+        }
+        self.gfx.hang_snapshot()
+    }
     /// Client media rings (bit `MediaRing::index()`) and their fence reader,
     /// once `run_media` started VCN and JPEG.
     pub fn client_media(&self) -> Option<(u8, vcn::MediaFenceReader)> {

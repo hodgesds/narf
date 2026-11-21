@@ -456,7 +456,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                                 ticket,
                                 ticket | (1 << 63),
                             );
-                            self.jobs.lock().emitted(ticket, health);
+                            self.jobs.lock().emitted_on(ticket, health, grant.vmid);
                             break seq;
                         }
                         Err(crate::amdgpu_cp_navi22::Error::Busy) => {
@@ -574,6 +574,96 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
     crate::amdgpu_rdna2_vram::engine().kick();
 }
 
+/// `amdgpu_ring_soft_recovery` on Raphael's GFX or compute ring: kill the
+/// timed-out job's waves (`gfx_v10_0_ring_soft_recovery`) until its fence
+/// signals, for 10 ms at most, then fail that job alone. False when no
+/// client job is to blame (a kernel job, VMID 0), the fence did not signal,
+/// or the owner is gone; the caller then treats the hang as terminal.
+pub(crate) async fn soft_recover(
+    engine: crate::amdgpu_fence_navi22::Engine,
+    generation: u64,
+) -> bool {
+    use crate::amdgpu_fence_navi22::Engine;
+    let id = match engine {
+        Engine::Gfx => 0,
+        Engine::Compute => 1,
+        _ => return false,
+    };
+    let Some(ring) = RINGS[id] else {
+        return false;
+    };
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    let Some(current) = current.filter(|current| current.epoch == generation) else {
+        return false;
+    };
+    let _ = current.progress();
+    let Some((ticket, vmid)) = current.jobs.lock().oldest(id) else {
+        return false;
+    };
+    if vmid == 0 {
+        return false;
+    }
+    let recovered = {
+        let mut owner = crate::amdgpu_platform::graphics_owner().await;
+        let Some(boot) = owner.get() else {
+            return false;
+        };
+        boot.soft_recovery(ring, vmid, ticket as u32).await == Ok(true)
+    };
+    if recovered {
+        current.jobs.lock().recovered(ticket);
+        let _ = current.progress();
+        crate::amdgpu_fence_navi22::notify_all();
+    }
+    recovered
+}
+
+/// `amdgpu_ring_reset` on Raphael's `engine` ring, the rung after a failed
+/// soft recovery: reset that queue alone, fail its timed-out job and cancel
+/// the jobs behind it (`Jobs::reset`), then force its fences. Other rings
+/// and the submitter carry on. False when the queue reset is not ported for
+/// the ring (GFX, SDMA), fails, or the owner is gone; the caller then treats
+/// the hang as terminal.
+pub(crate) async fn reset_queue(
+    engine: crate::amdgpu_fence_navi22::Engine,
+    generation: u64,
+) -> bool {
+    use crate::amdgpu_fence_navi22::Engine;
+    let id = match engine {
+        Engine::Gfx => 0,
+        Engine::Compute => 1,
+        _ => return false,
+    };
+    let Some(ring) = RINGS[id] else {
+        return false;
+    };
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    let Some(current) = current.filter(|current| current.epoch == generation) else {
+        return false;
+    };
+    let _ = current.progress();
+    let Some((ticket, _)) = current.jobs.lock().oldest(id) else {
+        return false;
+    };
+    {
+        let mut owner = crate::amdgpu_platform::graphics_owner().await;
+        let Some(boot) = owner.get() else {
+            return false;
+        };
+        if boot.reset_queue(ring).await.is_err() {
+            return false;
+        }
+        // The errors are on record before the fences move.
+        current.jobs.lock().reset(id, ticket);
+        if boot.force_complete(ring).is_err() {
+            return false;
+        }
+    }
+    let _ = current.progress();
+    crate::amdgpu_fence_navi22::notify_all();
+    true
+}
+
 /// Register the card's submitter over `reader`'s queues, with `vmids` lent
 /// by the memory owner.
 fn install(
@@ -659,6 +749,8 @@ pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
         // VCN_IDLE_TIMEOUT after each use, through the coordinator's guard.
         crate::amdgpu_vcn_navi22::idle::start();
     }
+    // drm_sched's job timeout, sampling the coordinator's queues.
+    crate::amdgpu_navi22_tdr::start();
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The

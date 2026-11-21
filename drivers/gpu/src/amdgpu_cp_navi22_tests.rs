@@ -99,6 +99,8 @@ pub(crate) struct Model {
     pub clear_states: u32,
     pub resources: Vec<u64>,
     pub mapped: Vec<Mapped>,
+    /// UNMAP_QUEUES (RESET_QUEUES) packets the KIQ executed.
+    pub unmapped: u32,
     pub traps: u32,
     pub sdma_count: u32,
     rptr: [u64; 8],
@@ -151,6 +153,7 @@ impl Model {
             clear_states: 0,
             resources: Vec::new(),
             mapped: Vec::new(),
+            unmapped: 0,
             traps: 0,
             sdma_count: 2,
             rptr: [0; 8],
@@ -395,6 +398,13 @@ impl Model {
                         assert_ne!(body[0] & (1 << 18), 0, "gfx ME0 is ME field 1");
                     }
                     let mqd = u64::from(body[2]) | (u64::from(body[3]) << 32);
+                    if engine_sel == 0 {
+                        let select = ((body[0] >> 16) & 3)
+                            | (u32::from(body[0] & (1 << 18) != 0) + 1) << 2
+                            | ((body[0] >> 13) & 7) << 8;
+                        self.regs
+                            .insert(r(CP_HQD_ACTIVE) | u64::from(select) << 40, 1);
+                    }
                     // v10 compute and gfx MQDs both keep the rptr report
                     // address at dwords 139/140.
                     let rptr = u64::from(self.word(mqd + 139 * 4))
@@ -414,6 +424,35 @@ impl Model {
                         wptr: u64::from(body[4]) | (u64::from(body[5]) << 32),
                         rptr,
                     });
+                }
+                0xa3 => {
+                    // gfx10_kiq_unmap_queues: by doorbell, one queue, no
+                    // preemption fence. RESET_QUEUES dequeues the HQD and
+                    // its read pointer restarts.
+                    assert_eq!(engine, 1, "UNMAP_QUEUES outside KIQ");
+                    assert_eq!((n, body[0] & 0xf), (4, 1), "UNMAP_QUEUES RESET_QUEUES form");
+                    assert_eq!(body[0] & 0xf0, 0, "QUEUE_SEL by doorbell");
+                    assert_eq!(body[0] >> 29, 1, "NUM_QUEUES");
+                    let doorbell = body[1] >> 2;
+                    let at = self
+                        .mapped
+                        .iter()
+                        .position(|q| q.doorbell == doorbell)
+                        .expect("UNMAP_QUEUES of an unmapped queue");
+                    let q = self.mapped.remove(at);
+                    let select = q.pipe | q.me << 2 | q.queue << 8;
+                    self.regs
+                        .insert(r(CP_HQD_ACTIVE) | u64::from(select) << 40, 0);
+                    self.rptr[if q.me == 0 {
+                        if q.pipe == 0 {
+                            0
+                        } else {
+                            7
+                        }
+                    } else {
+                        2
+                    }] = 0;
+                    self.unmapped += 1;
                 }
                 _ => panic!("unexpected PM4 opcode {op:#x}"),
             }
@@ -717,6 +756,10 @@ impl Io for Model {
         }
         let key = self.key(self.cam_target(address));
         self.regs.insert(key, value);
+        // The RLC acknowledges a safe-mode request by clearing CMD.
+        if address == r(RLC_SAFE_MODE) {
+            self.regs.insert(key, value & !1);
+        }
         if address == r(CP_HQD_DEQUEUE_REQUEST) && value == 1 && !self.stuck_hqd {
             let active = self.key(r(CP_HQD_ACTIVE));
             self.regs.insert(active, 0);
@@ -1603,6 +1646,40 @@ fn raphael_gfx_golden_cam_and_frames_follow_the_apu_group() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/cp-raphael",
     raphael_gfx_golden_cam_and_frames_follow_the_apu_group
+);
+
+/// gfx_v10_0_ring_soft_recovery: SQ_CMD kill (CMD 3), broadcast (MODE 1) and
+/// CHECK_VMID with the job's VMID, inside RLC safe mode (requested with
+/// message 1, acknowledged, left with message 0) while the RLC runs; with
+/// the RLC stopped, SQ_CMD alone (amdgpu_gfx_rlc_enter_safe_mode's check).
+fn raphael_soft_recovery_kills_one_vmid_in_safe_mode() -> TestResult {
+    if sq_kill(5) != 0x5000_0093 || sq_kill(0x1f) != 0xf000_0093 {
+        return TestResult::Fail("SQ_CMD fields");
+    }
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    engine.golden().unwrap();
+    run(engine.configure()).unwrap();
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    let (safe, sq) = (resolved.reg(RLC_SAFE_MODE), resolved.reg(SQ_CMD));
+    let kill = |engine: &mut GfxEngine<Model>, rlc: u32, vmid: u8| {
+        engine.hw.io.regs.insert(resolved.reg(RLC_CNTL), rlc);
+        let from = engine.hw.io.writes.len();
+        run(engine.kill_waves(vmid)).map(|()| engine.hw.io.writes[from..].to_vec())
+    };
+    if kill(&mut engine, 1, 5) != Ok(alloc::vec![(safe, 0x3), (sq, 0x5000_0093), (safe, 0x1)])
+        || kill(&mut engine, 0, 2) != Ok(alloc::vec![(sq, sq_kill(2))])
+    {
+        return TestResult::Fail("soft recovery outside RLC safe mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_soft_recovery_kills_one_vmid_in_safe_mode
 );
 
 /// `port_update`: the address through the port index, read back, data read,

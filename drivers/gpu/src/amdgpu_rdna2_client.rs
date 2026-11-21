@@ -58,6 +58,46 @@ pub(crate) fn backend() -> Backend {
     }
 }
 
+/// The registered card's name in console lines.
+pub(crate) fn name() -> &'static str {
+    match backend() {
+        Backend::Navi22 => "navi22",
+        Backend::Raphael => "raphael",
+    }
+}
+
+/// The hang watchdog's sample of the registered card's kernel queues, with
+/// Navi22's cold-boot errors (`Busy`: try again shortly).
+pub(crate) async fn queue_progress(
+) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, BootError> {
+    match backend() {
+        Backend::Navi22 => crate::amdgpu_navi22_platform::queue_progress().await,
+        Backend::Raphael => {
+            let mut owner = crate::amdgpu_platform::graphics_owner().await;
+            let boot = owner.get().ok_or(BootError::Invalid)?;
+            boot.queue_progress().map_err(queue_error)
+        }
+    }
+}
+/// GC evidence after a graphics timeout. Navi22's takes a GFXOFF reference
+/// with its owner; Raphael's GFXOFF stays disallowed.
+pub(crate) async fn gfx_hang_snapshot() -> Result<cp::GfxHangSnapshot, BootError> {
+    match backend() {
+        Backend::Navi22 => crate::amdgpu_navi22_platform::gfx_hang_snapshot().await,
+        Backend::Raphael => {
+            let mut owner = crate::amdgpu_platform::graphics_owner().await;
+            let boot = owner.get().ok_or(BootError::Invalid)?;
+            boot.gfx_hang_snapshot().map_err(queue_error)
+        }
+    }
+}
+fn queue_error(error: cp::Error) -> BootError {
+    match error {
+        cp::Error::Busy => BootError::Busy,
+        error => BootError::Queues(error),
+    }
+}
+
 /// The locked owner of the registered card.
 pub(crate) enum Guard {
     Navi22(narf_lib::mutex::MutexGuard<'static, Option<crate::amdgpu_navi22_boot::ColdBoot>>),

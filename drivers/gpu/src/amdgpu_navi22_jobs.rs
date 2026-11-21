@@ -11,8 +11,14 @@ pub(super) struct Jobs {
     epoch: u64,
     completed: [u32; RING_IDS],
     pub terminal: Option<FsError>,
-    pending: Vec<(u64, Arc<Health>)>,
+    /// (ticket, context health, VMID the job ran in; 0 when not recorded).
+    pending: Vec<(u64, Arc<Health>, u8)>,
+    /// Jobs a recovery failed while the submitter carried on, with their
+    /// error, kept after they retire. Bounded: the oldest entries go first.
+    failed: Vec<(u64, FsError)>,
 }
+/// How many recovered jobs keep their error after they retire.
+const FAILED_KEPT: usize = 64; // linux: n/a (NARF bound)
 
 #[cfg(feature = "kernel-test")]
 mod tests {
@@ -81,6 +87,76 @@ mod tests {
         "drivers/gpu/amdgpu/fence-errors",
         rdna2_hang_preserves_guilt_and_late_publication_errors
     );
+    /// A recovered hang (soft recovery, queue reset) fails the timed-out job
+    /// alone, whose error outlives its retirement; the ledger stays open.
+    fn rdna2_recovered_hang_fails_only_the_timed_out_job() -> TestResult {
+        let mut jobs = Jobs::new(5);
+        let (guilty, behind, other) = (
+            Arc::new(Health::default()),
+            Arc::new(Health::default()),
+            Arc::new(Health::default()),
+        );
+        jobs.emitted_on(ticket(5, 0, 7), &guilty, 3);
+        jobs.emitted_on(ticket(5, 0, 8), &behind, 4);
+        jobs.emitted_on(ticket(5, 1, 2), &other, 5);
+        if jobs.oldest(0) != Some((ticket(5, 0, 7), 3)) || jobs.oldest(2).is_some() {
+            return TestResult::Fail("oldest job on a ring");
+        }
+        jobs.recovered(ticket(5, 0, 7));
+        let mut completed = [0; RING_IDS];
+        (completed[0], completed[1]) = (8, 2);
+        jobs.observe(completed);
+        if jobs.terminal.is_some()
+            || jobs.error(ticket(5, 0, 7)) != Some(FsError::TimedOut)
+            || guilty.error() != Some(FsError::TimedOut)
+            || !jobs.retired(ticket(5, 0, 7))
+            || jobs.error(ticket(5, 0, 8)).is_some()
+            || behind.error().is_some()
+            || jobs.error(ticket(5, 1, 2)).is_some()
+            || other.error().is_some()
+        {
+            return TestResult::Fail("recovery failed more than the timed-out job");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/fence-errors",
+        rdna2_recovered_hang_fails_only_the_timed_out_job
+    );
+    /// A queue reset fails the timed-out job (`TimedOut`, context guilty) and
+    /// cancels the jobs behind it on that ring without poisoning their
+    /// contexts; other rings and the ledger carry on.
+    fn rdna2_queue_reset_cancels_the_ring_behind_the_guilty_job() -> TestResult {
+        let mut jobs = Jobs::new(6);
+        let (guilty, behind, other) = (
+            Arc::new(Health::default()),
+            Arc::new(Health::default()),
+            Arc::new(Health::default()),
+        );
+        jobs.emitted_on(ticket(6, 1, 4), &guilty, 2);
+        jobs.emitted_on(ticket(6, 1, 5), &behind, 3);
+        jobs.emitted_on(ticket(6, 0, 9), &other, 4);
+        jobs.reset(1, ticket(6, 1, 4));
+        let mut completed = [0; RING_IDS];
+        (completed[0], completed[1]) = (9, 5);
+        jobs.observe(completed);
+        if jobs.terminal.is_some()
+            || jobs.error(ticket(6, 1, 4)) != Some(FsError::TimedOut)
+            || guilty.error() != Some(FsError::TimedOut)
+            || jobs.error(ticket(6, 1, 5)) != Some(FsError::Canceled)
+            || behind.error().is_some()
+            || jobs.error(ticket(6, 0, 9)).is_some()
+            || other.error().is_some()
+            || !jobs.retired(ticket(6, 1, 5))
+        {
+            return TestResult::Fail("queue reset failed the wrong jobs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/fence-errors",
+        rdna2_queue_reset_cancels_the_ring_behind_the_guilty_job
+    );
 }
 impl Jobs {
     pub fn new(epoch: u64) -> Self {
@@ -89,6 +165,7 @@ impl Jobs {
             completed: [0; RING_IDS],
             terminal: None,
             pending: Vec::new(),
+            failed: Vec::new(),
         }
     }
     pub fn retired(&self, ticket: u64) -> bool {
@@ -106,28 +183,73 @@ impl Jobs {
         self.completed = completed;
         let epoch = self.epoch;
         self.pending
-            .retain(|(ticket, _)| !super::job_done(epoch, completed, *ticket));
+            .retain(|(ticket, _, _)| !super::job_done(epoch, completed, *ticket));
     }
     pub fn emitted(&mut self, ticket: u64, health: &Arc<Health>) {
+        self.emitted_on(ticket, health, 0);
+    }
+    /// [`Self::emitted`] for a job granted VMID `vmid`, which a soft recovery
+    /// needs to name the waves it kills.
+    pub fn emitted_on(&mut self, ticket: u64, health: &Arc<Health>, vmid: u8) {
         if self.terminal.is_some() {
             health.mark_canceled();
         }
-        self.pending.push((ticket, health.clone()));
+        self.pending.push((ticket, health.clone(), vmid));
+    }
+    /// The oldest unfinished job on `ring` (the one a timeout blames) and
+    /// its VMID.
+    pub fn oldest(&self, ring: usize) -> Option<(u64, u8)> {
+        self.pending
+            .iter()
+            .find(|(ticket, _, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
+            .map(|(ticket, _, vmid)| (*ticket, *vmid))
+    }
+    /// A recovery freed the ring that `ticket`'s job stalled: that job fails
+    /// with its context guilty (`TimedOut`), and nothing else does. The ring
+    /// and every other job carry on.
+    pub fn recovered(&mut self, ticket: u64) {
+        if let Some((_, health, _)) = self.pending.iter().find(|(t, _, _)| *t == ticket) {
+            health.mark_guilty();
+        }
+        self.fail(ticket, FsError::TimedOut);
+    }
+    /// A queue reset dropped every job on `ring`: `ticket`'s (the timed-out
+    /// one) is [`Self::recovered`]'s, and the others fail `Canceled` with
+    /// their contexts left usable. Linux re-emits those other contexts' work
+    /// (`amdgpu_ring_reset_helper_end`); this does not. Record it before the
+    /// ring's fences are forced, so no sample retires them as done.
+    pub fn reset(&mut self, ring: usize, ticket: u64) {
+        self.recovered(ticket);
+        let behind: Vec<u64> = self
+            .pending
+            .iter()
+            .map(|(t, _, _)| *t)
+            .filter(|t| *t != ticket && (*t >> 32) as u32 & 15 == ring as u32)
+            .collect();
+        for t in behind {
+            self.fail(t, FsError::Canceled);
+        }
+    }
+    fn fail(&mut self, ticket: u64, error: FsError) {
+        if self.failed.len() == FAILED_KEPT {
+            self.failed.remove(0);
+        }
+        self.failed.push((ticket, error));
     }
     pub fn finish(&mut self, error: FsError) {
         if self.terminal.is_none() || error == FsError::NoDevice {
             self.terminal = Some(error);
         }
-        for (_, health) in &self.pending {
+        for (_, health, _) in &self.pending {
             health.mark_canceled();
         }
     }
     pub fn hang(&mut self, ring: usize) {
         if self.terminal.is_none() {
-            if let Some((_, health)) = self
+            if let Some((_, health, _)) = self
                 .pending
                 .iter()
-                .find(|(ticket, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
+                .find(|(ticket, _, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
             {
                 health.mark_guilty();
             }
@@ -135,6 +257,9 @@ impl Jobs {
         }
     }
     pub fn error(&self, ticket: u64) -> Option<FsError> {
+        if let Some(&(_, error)) = self.failed.iter().find(|(t, _)| *t == ticket) {
+            return Some(error);
+        }
         if self.retired(ticket) {
             return None;
         }
@@ -142,8 +267,8 @@ impl Jobs {
             if error == FsError::Canceled {
                 self.pending
                     .iter()
-                    .find(|(t, _)| *t == ticket)
-                    .and_then(|(_, h)| h.error())
+                    .find(|(t, _, _)| *t == ticket)
+                    .and_then(|(_, h, _)| h.error())
                     .unwrap_or(error)
             } else {
                 error

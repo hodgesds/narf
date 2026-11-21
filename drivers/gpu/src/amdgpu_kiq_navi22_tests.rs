@@ -1,7 +1,7 @@
 use super::*;
 use crate::amdgpu_cp_navi22::{
     tests::{cancel_at, enabled, hw, pool, r, run, Model},
-    FENCE, QUEUE_BYTES, SCRATCH,
+    FENCE, QUEUE_BYTES, SCRATCH, VM_FENCE,
 };
 use core::sync::atomic::Ordering;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -18,6 +18,7 @@ fn engine(model: Model) -> (Pool, Engine<Model>) {
             compute,
             state: State::Prepared,
             proof: Proof::default(),
+            mqd_backup: None,
         },
     )
 }
@@ -111,6 +112,80 @@ fn kiq_navi22_maps_compute_queue_and_runs_ring_and_ib_tests() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/kiq-navi22",
     kiq_navi22_maps_compute_queue_and_runs_ring_and_ib_tests
+);
+
+/// gfx_v10_0_reset_kcq on a hung compute ring: KIQ UNMAP_QUEUES
+/// (RESET_QUEUES), the HQD inactive, the MQD restored from its map-time
+/// backup with an empty ring, MAP_QUEUES and both ring tests. The stalled
+/// job never runs; force completion then shows the ring's last sequence on
+/// both fences, and the queue executes again.
+fn kiq_compute_reset_restores_an_empty_queue() -> TestResult {
+    let (_pool, mut e) = engine(enabled());
+    if run(e.init_kiq()).is_err() || run(e.map_compute()).is_err() || run(e.test_ib()).is_err() {
+        return TestResult::Fail("compute bring-up");
+    }
+    let mqd = |e: &Engine<Model>| -> alloc::vec::Vec<u32> {
+        (0..mqd::DWORDS as u64)
+            .map(|i| e.hw.io.word(e.compute.address(MQD + i * 4)))
+            .collect()
+    };
+    let backup = mqd(&e);
+    if e.mqd_backup.as_deref() != Some(&backup[..]) {
+        return TestResult::Fail("MQD backup differs from the mapped MQD");
+    }
+    // A job the engine never runs, and HQD state an unmap would save.
+    e.hw.io.stalled[2] = true;
+    let seq = e.compute.next_seq();
+    let (hw, compute) = (&mut e.hw, &mut e.compute);
+    hw.access(|io, l| {
+        compute.emit(io, &pm4::release_mem(compute.address(FENCE), seq))?;
+        compute.commit(io, l);
+        Ok(())
+    })
+    .unwrap();
+    e.hw.io
+        .mem
+        .insert(e.compute.address(MQD + 4 * 4), 0x0bad_0bad);
+    e.hw.io.stalled[2] = false;
+    e.hw.io.regs.insert(r(RLC_CNTL), 1);
+    let unmapped = e.hw.io.unmapped;
+    if run(e.reset_compute()).is_err() || e.state != State::Verified {
+        return TestResult::Fail("compute reset failed");
+    }
+    let m = &e.hw.io;
+    if m.unmapped != unmapped + 1
+        || m.mapped.len() != 1
+        || (m.mapped[0].me, m.mapped[0].doorbell) != (1, 6)
+        || mqd(&e) != backup
+        || m.word(e.compute.address(FENCE)) != seq - 1
+        || m.writes.iter().filter(|w| w.0 == r(RLC_SAFE_MODE)).count() != 2
+    {
+        return TestResult::Fail("reset kept the hung queue's state or ran its job");
+    }
+    if e.force_complete_compute().is_err()
+        || e.hw.io.word(e.compute.address(FENCE)) != seq
+        || e.hw.io.word(e.compute.address(VM_FENCE)) != seq
+    {
+        return TestResult::Fail("force completion");
+    }
+    if run(crate::amdgpu_cp_navi22::ring_test(
+        &mut e.hw,
+        &mut e.compute,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("reset compute ring does not execute");
+    }
+    // A second reset needs the backup only; a failed one is terminal.
+    e.hw.io.stalled[2] = true;
+    if run(e.reset_compute()).is_ok() || e.state != State::Failed {
+        return TestResult::Fail("a reset whose ring test fails left the queue usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/kiq-navi22",
+    kiq_compute_reset_restores_an_empty_queue
 );
 
 fn kiq_navi22_dequeues_inherited_kiq_or_stops_bounded() -> TestResult {

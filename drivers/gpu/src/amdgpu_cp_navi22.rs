@@ -12,7 +12,7 @@ use crate::{
     amdgpu_pm4_defs::{
         packet3, PACKET3_CLEAR_STATE, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP,
         PACKET3_RELEASE_MEM, PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG,
-        PACKET3_WRITE_DATA,
+        PACKET3_UNMAP_QUEUES, PACKET3_WRITE_DATA,
     },
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
@@ -580,6 +580,23 @@ pub(crate) mod pm4 {
             0, // linux: n/a (gds heap literal 0 in gfx10_kiq_set_resources)
         ]
     }
+    /// `enum amdgpu_unmap_queues_action`'s RESET_QUEUES.
+    pub(crate) const RESET_QUEUES: u32 = 1; // linux: RESET_QUEUES
+    /// `gfx10_kiq_unmap_queues` with any action but PREEMPT_QUEUES_NO_UNMAP
+    /// (so no preemption fence): QUEUE_SEL 0 (by doorbell), one queue,
+    /// ENGINE_SEL 0 compute or 4 gfx.
+    pub(crate) fn unmap_queues(action: u32, engine_sel: u32, doorbell: u32) -> [u32; 6] {
+        [
+            // linux: n/a (count literal in gfx_v10_0.c:gfx10_kiq_unmap_queues)
+            packet3(PACKET3_UNMAP_QUEUES, 4),
+            // linux-lit: 26=26 * (PACKET3_UNMAP_QUEUES_ENGINE_SEL(1) >> 26); 29=29 * (PACKET3_UNMAP_QUEUES_NUM_QUEUES(1) >> 29)
+            action | (engine_sel << 26) | (1 << 29),
+            doorbell << 2, // linux-lit: 2=2 * (PACKET3_UNMAP_QUEUES_DOORBELL_OFFSET0(1) >> 2)
+            0,
+            0,
+            0,
+        ]
+    }
     /// `gfx10_kiq_map_queues` for a compute queue (ENGINE_SEL 0).
     pub(crate) fn map_queues(
         me: u32,
@@ -703,6 +720,33 @@ impl Queue {
     }
     pub(crate) fn map(&self) -> MmioRegion {
         self.memory.mapping()
+    }
+    /// A per-queue reset's `amdgpu_ring_clear_ring` and pointer resets
+    /// (`gfx_v10_0_kcq_init_queue(ring, true)`): the ring filled with the
+    /// engine's NOP, the read and write pointers and their writebacks zeroed.
+    /// Fences, scratch and the MQD keep their contents.
+    pub(crate) fn reset_ring<I: Io>(&mut self, io: &mut I) {
+        let map = self.map();
+        let nop = match self.kind {
+            Kind::Cp => pm4::NOP,
+            Kind::Sdma => pm4::SDMA_NOP,
+        };
+        for dword in 0..RING_DW {
+            io.write_memory(map, dword * 4, nop);
+        }
+        for offset in [RPTR, RPTR + 4, WPTR, WPTR + 4] {
+            io.write_memory(map, offset, 0);
+        }
+        self.wptr = 0;
+    }
+    /// `amdgpu_fence_driver_force_completion` after a queue reset: the job
+    /// and VM-programming fences show the last sequence the ring emitted, so
+    /// every job it held reads as finished. Only after the reset proved the
+    /// queue can no longer fetch that work.
+    pub(crate) fn force_complete<I: Io>(&self, io: &mut I) {
+        let map = self.map();
+        io.write_memory(map, FENCE, self.seq);
+        io.write_memory(map, VM_FENCE, self.seq);
     }
     /// Zero all storage; scratch starts at Linux's 0xCAFEDEAD sentinel.
     pub(crate) fn clear<I: Io>(&mut self, io: &mut I) {
@@ -1087,6 +1131,53 @@ pub(crate) struct GfxEngine<I: Io> {
     /// does not rewrite them after other engines started.
     pub golden: bool,
 }
+const SQ_CMD_CMD_SHIFT: u32 = 0x0; // linux: SQ_CMD__CMD__SHIFT@gc101
+const SQ_CMD_MODE_SHIFT: u32 = 0x4; // linux: SQ_CMD__MODE__SHIFT@gc101
+const SQ_CMD_CHECK_VMID_SHIFT: u32 = 0x7; // linux: SQ_CMD__CHECK_VMID__SHIFT@gc101
+const SQ_CMD_VM_ID_SHIFT: u32 = 0x1c; // linux: SQ_CMD__VM_ID__SHIFT@gc101
+const RLC_ENABLE_F32: u32 = 1 << 0; // linux: RLC_CNTL__RLC_ENABLE_F32_MASK@gc101
+const SAFE_MODE_CMD: u32 = 1 << 0; // linux: RLC_SAFE_MODE__CMD_MASK@gc101
+const SAFE_MODE_MESSAGE_SHIFT: u32 = 1; // linux: RLC_SAFE_MODE__MESSAGE__SHIFT@gc101
+const SAFE_MODE_TIMEOUT_MS: u64 = 100; // linux: AMDGPU_MAX_USEC_TIMEOUT / 1000
+/// `gfx_v10_0_ring_soft_recovery`'s SQ_CMD: kill (CMD 3), broadcast (MODE
+/// 1), only the waves of `vmid` (CHECK_VMID).
+pub(crate) fn sq_kill(vmid: u8) -> u32 {
+    // linux-lit: 0x03=SQ_CMD.CMD kill; 0x01=SQ_CMD.MODE broadcast
+    0x03 << SQ_CMD_CMD_SHIFT
+        | 0x01 << SQ_CMD_MODE_SHIFT
+        | 1 << SQ_CMD_CHECK_VMID_SHIFT
+        | u32::from(vmid & 0xf) << SQ_CMD_VM_ID_SHIFT
+}
+
+/// `amdgpu_gfx_rlc_enter_safe_mode` (`gfx_v10_0_set_safe_mode`): only with
+/// the RLC running (`gfx_v10_0_is_rlc_enabled`); GC 10.3 has the CG flags it
+/// also checks. True when entered, for [`exit_safe_mode`].
+pub(crate) async fn enter_safe_mode<I: Io>(hw: &mut Hw<I>) -> Result<bool, Error> {
+    let rlc = hw.access(|io, l| Ok(checked(io.read(l.reg(RLC_CNTL)))? & RLC_ENABLE_F32 != 0))?;
+    if !rlc {
+        return Ok(false);
+    }
+    hw.access(|io, l| {
+        io.write(
+            l.reg(RLC_SAFE_MODE),
+            SAFE_MODE_CMD | 1 << SAFE_MODE_MESSAGE_SHIFT,
+        );
+        Ok(())
+    })?;
+    hw.poll(fence::Engine::Gfx, SAFE_MODE_TIMEOUT_MS, |io, l| {
+        Ok((checked(io.read(l.reg(RLC_SAFE_MODE)))? & SAFE_MODE_CMD == 0).then_some(()))
+    })
+    .await?;
+    Ok(true)
+}
+/// `gfx_v10_0_unset_safe_mode`: CMD with message 0.
+pub(crate) fn exit_safe_mode<I: Io>(hw: &mut Hw<I>) -> Result<(), Error> {
+    hw.access(|io, l| {
+        io.write(l.reg(RLC_SAFE_MODE), SAFE_MODE_CMD);
+        Ok(())
+    })
+}
+
 /// `gfx_v10_0_get_csb_buffer` for GC segment 1, built on the heap. By value,
 /// its 3.8 KB array sat (copied three times) in the frames of the async
 /// engine steps that emit it, past the kernel's 8 KiB frame budget.
@@ -1113,6 +1204,23 @@ fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     Ok(())
 }
 impl<I: Io> GfxEngine<I> {
+    /// One `gfx_v10_0_ring_soft_recovery`: inside RLC safe mode (entered only
+    /// with the RLC running, as `amdgpu_gfx_rlc_enter_safe_mode`; GC 10.3.6
+    /// has the CG flags it checks), SQ_CMD kills `vmid`'s waves.
+    pub(crate) async fn kill_waves(&mut self, vmid: u8) -> Result<(), Error> {
+        if self.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        let safe = enter_safe_mode(&mut self.hw).await?;
+        let killed = self.hw.access(|io, l| {
+            io.write(l.reg(SQ_CMD), sq_kill(vmid));
+            Ok(())
+        });
+        if safe {
+            exit_safe_mode(&mut self.hw)?;
+        }
+        killed
+    }
     /// The state is stored outside the future: cancellation leaves `busy`
     /// and blocks every later step, so no sequence is ever replayed.
     fn begin(&mut self, from: GfxState, busy: GfxState) -> Result<(), Error> {
@@ -1570,6 +1678,10 @@ impl Gfx {
         progress(&mut self.engine.hw, &self.engine.queue)
     }
     /// Timeout-only evidence; caller retains the GC power reference.
+    /// See `GfxEngine::kill_waves`.
+    pub(crate) async fn kill_waves(&mut self, vmid: u8) -> Result<(), Error> {
+        self.engine.kill_waves(vmid).await
+    }
     pub(crate) fn hang_snapshot(&mut self) -> Result<GfxHangSnapshot, Error> {
         if self.engine.state != GfxState::Verified {
             return Err(Error::Busy);

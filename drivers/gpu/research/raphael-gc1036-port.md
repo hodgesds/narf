@@ -316,6 +316,66 @@ route those modules to it, not to write a second client backend.
        deadline. Suspend stays refused while graphics is up
        (`Loader::stop`).
 
+## Ring recovery
+
+Linux's `amdgpu_job_timedout` climbs a ladder for a timed-out GC 10.3 job,
+each rung tried only if the one before failed:
+1. Soft recovery (`amdgpu_ring_soft_recovery`): `gfx_v10_0_ring_soft_recovery`
+   writes `SQ_CMD` (kill, broadcast, `CHECK_VMID`) for the job's VMID under
+   RLC safe mode, repeating for up to 10 ms until the fence signals. The
+   fence carries -ENODATA.
+2. Per-queue reset (`amdgpu_ring_reset`):
+   - `gfx_v10_0_reset_kcq`: KIQ UNMAP_QUEUES with RESET_QUEUES, the HQD
+     going inactive, MQD re-init, MAP_QUEUES, a ring test;
+   - `gfx_v10_0_reset_kgq`: `CP_VMID_RESET` through the KIQ, then the same
+     re-init.
+   SDMA 5.2's queue reset (`sdma_v5_2_reset_queue`) goes through
+   `amdgpu_dpm_reset_sdma`, which SMU 13.0.5 does not implement, so an
+   SDMA hang falls through.
+3. The full reset: mode 2 for MP1 13.0.5 (`nv_asic_reset_method`):
+   `GfxDeviceDriverReset(SMU_RESET_MODE_2)`, then every IP re-initialized,
+   firmware and display included.
+
+NARF's Navi22 has detection (`amdgpu_navi22_tdr`) and the full reset (a
+rebuilt owner after mode 1). Its job ledger treats any hang as terminal,
+since the submitter is replaced. Raphael's port:
+
+11. Ring recovery:
+    1. ~~Detection~~ (done). The watchdog (`amdgpu_navi22_tdr`) samples
+       Raphael's queues through the client seam and prints Linux's "ring
+       timeout" line. It starts when the submitter registers.
+    2. ~~Per-job guilt~~ (done). `Jobs::recovered` fails the timed-out job
+       alone: `TimedOut`, its context guilty, the error kept after it
+       retires. The ledger records each job's VMID for the next rung.
+    3. ~~Soft recovery~~ (done), GFX and compute. `GfxEngine::kill_waves`
+       writes `SQ_CMD` (kill, broadcast, `CHECK_VMID`) inside RLC safe
+       mode, entered only with the RLC running. The coordinator repeats it
+       for up to 10 ms until the job's fence signals. A kernel job (VMID 0),
+       an SDMA hang, or a fence that stays put is terminal, as before: every
+       job fails and the submitter stops.
+    4. Per-queue reset.
+       - ~~Compute~~ (done): `kiq::Engine::reset_compute`, after
+         `gfx_v10_0_reset_kcq`. KIQ UNMAP_QUEUES (RESET_QUEUES) and its ring
+         test; the HQD inactive under GRBM select in RLC safe mode; the MQD
+         restored from the map-time backup (unmapping saves live HQD state
+         into it), the ring NOP-filled, both pointers zeroed; MAP_QUEUES, then
+         the KIQ and compute ring tests.
+       - Jobs: `Jobs::reset` fails the timed-out job (`TimedOut`, context
+         guilty) and cancels the ones behind it on that ring, with their
+         contexts left usable; Linux re-emits those, this does not. The
+         errors are recorded before `force_complete` writes the ring's last
+         sequence into both fence writebacks, so no sample can retire the
+         guilty job as done. The queue's memory is released then: the
+         unmap proved it can no longer fetch that work.
+       - GFX (`gfx_v10_0_reset_kgq`) is not ported. It needs
+         `CP_VMID_RESET` for the job's VMID and pipe through the KIQ, a
+         WAIT_REG_MEM on the MQD's `cp_gfx_hqd_active`, and a GFX MQD
+         backup. A GFX hang that soft recovery does not clear stays
+         terminal.
+    5. Mode 2 (`GfxDeviceDriverReset(SMU_RESET_MODE_2)`), for SDMA hangs and
+       failed queue resets. It re-initializes every IP, display included,
+       so the display owner's DMUB and PSP session must come back with it.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
