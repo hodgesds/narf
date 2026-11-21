@@ -739,13 +739,19 @@ impl UsbHub {
         transport: &impl HubTransport,
         suspended: u64,
     ) -> Vec<u8> {
-        let _ = suspended;
         let mut v: Vec<u8> = Vec::new();
         for p in 1..=self.descriptor.num_ports {
             let Ok(s) = self.port_status_transport(transport, p).await else {
                 continue;
             };
-            for (bit, feature) in WALK_ACKED_CHANGES {
+            // On a port the host considers awake, C_PORT_SUSPEND only says
+            // a host resume completed (Linux `port_event` clears it); on a
+            // suspended one it is a remote wakeup, left to the watches.
+            let awake_resume = s & (1 << 18) != 0 && suspended & (1u64 << (p & 63)) == 0;
+            let acked = WALK_ACKED_CHANGES
+                .into_iter()
+                .chain(awake_resume.then_some((1 << 18, C_PORT_SUSPEND)));
+            for (bit, feature) in acked {
                 if s & bit != 0 {
                     let _ = transport
                         .write(
