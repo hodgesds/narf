@@ -638,6 +638,9 @@ impl Pipeline {
         record(self.stream.blank().await.map_err(Error::Hardware));
         record(self.hubp.blank().await.map_err(Error::Hardware));
         record(self.source.disable(loader).await.map_err(Error::Link));
+        // Linux's DP 8b/10b SST order: link down first so the sink never sees
+        // TPS1, then `disable_stream` releases the front end's FIFO.
+        record(self.stream.reset().map_err(Error::Hardware));
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             // Hand the tunnel's bandwidth back, or the other endpoints on this
             // router never see it again.

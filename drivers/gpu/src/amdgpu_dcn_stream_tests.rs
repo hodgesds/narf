@@ -7,6 +7,8 @@ struct Fake {
     writes: Vec<(u64, u32)>,
     /// The stream never reports stopped, to exercise the timeouts.
     stuck: bool,
+    /// DIG_FIFO_RESET_DONE stops following DIG_FIFO_RESET.
+    fifo_stuck: bool,
 }
 impl Fake {
     fn new() -> Self {
@@ -14,6 +16,7 @@ impl Fake {
             values: vec![0; LAST_REG as usize + 1],
             writes: Vec::new(),
             stuck: false,
+            fifo_stuck: false,
         }
     }
 }
@@ -34,6 +37,16 @@ impl Io for Fake {
     }
     fn write(&mut self, reg: u64, value: u32) {
         self.writes.push((reg, value));
+        let mut value = value;
+        // The FIFO reports a reset done once it has seen the reset.
+        if reg % STRIDE == DIG_FIFO_CTRL0 % STRIDE && !self.fifo_stuck {
+            value = value & !DIG_FIFO_RESET_DONE
+                | if value & DIG_FIFO_RESET != 0 {
+                    DIG_FIFO_RESET_DONE
+                } else {
+                    0
+                };
+        }
         self.values[reg as usize] = value;
     }
 }
@@ -375,4 +388,93 @@ fn stream_dcn315_unblank_pulses_dig_start_like_dcn30() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-stream",
     stream_dcn315_unblank_pulses_dig_start_like_dcn30
+);
+
+/// `enc314_stream_encoder_dp_unblank` ends with `enc314_enable_fifo`, after
+/// DP_VID_STREAM_ENABLE "per HW docs": read start level 7, a reset pulse whose
+/// edges wait for DIG_FIFO_RESET_DONE while DIG_SYMCLK_FE_ON, then
+/// DIG_FIFO_ENABLE. `setup_dio_stream_encoder` sets one pixel per container,
+/// and `reset` (`reset_dio_stream_encoder`) disables the FIFO again. DIG2's
+/// DIG_FIFO_CTRL0 is 0x2291 (`dcn_3_1_4_offset.h` regDIG0 0x2091 + 2 * 0x100).
+fn stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream() -> TestResult {
+    let ctrl = (DIG_FIFO_CTRL0 + 2 * STRIDE) as usize;
+    if ctrl != 0x2291 || DIG_FE_CNTL + 2 * STRIDE != 0x228b {
+        return TestResult::Fail("DIG FIFO register ids");
+    }
+    let mut stream = engine(2);
+    // A boot firmware that left two pixels per container and the FIFO off.
+    stream.io.values[ctrl] = DIG_FIFO_OUTPUT_PIXEL_MODE;
+    stream.io.values[(DIG_FE_CNTL + 2 * STRIDE) as usize] = DIG_SYMCLK_FE_ON;
+    stream.program(&timing(), Depth::Bpc8).unwrap();
+    if stream.io.values[ctrl] & DIG_FIFO_OUTPUT_PIXEL_MODE != 0 {
+        return TestResult::Fail("input mode not one pixel per container");
+    }
+    stream.program_rate(148_500, 20).unwrap();
+    stream.io.writes.clear();
+    if run(stream.unblank()).is_err() || stream.state != State::Streaming {
+        return TestResult::Fail("unblank with the DIG FIFO");
+    }
+    let writes = &stream.io.writes;
+    let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+    let cntl = DP_VID_STREAM_CNTL + 2 * STRIDE;
+    let ctrl = ctrl as u64;
+    let (Some(video), Some(reset), Some(release), Some(enable)) = (
+        at(&|r, v| r == cntl && v & 1 != 0),
+        at(&|r, v| r == ctrl && v & DIG_FIFO_RESET != 0),
+        writes
+            .iter()
+            .rposition(|&(r, v)| r == ctrl && v & DIG_FIFO_RESET == 0 && v & DIG_FIFO_ENABLE == 0),
+        at(&|r, v| r == ctrl && v & DIG_FIFO_ENABLE != 0),
+    ) else {
+        return TestResult::Fail("DIG FIFO enable skipped a step");
+    };
+    if !(video < reset && reset < release && release < enable) {
+        return TestResult::Fail("DIG FIFO must reset and enable after the video stream");
+    }
+    let value = stream.io.values[ctrl as usize];
+    if value & DIG_FIFO_READ_START_LEVEL != 7 << 2
+        || value & (DIG_FIFO_ENABLE | DIG_FIFO_RESET) != DIG_FIFO_ENABLE
+    {
+        return TestResult::Fail("DIG FIFO read start level or final state");
+    }
+    // Teardown releases it.
+    run(stream.blank()).unwrap();
+    if stream.reset().is_err() || stream.io.values[ctrl as usize] & DIG_FIFO_ENABLE != 0 {
+        return TestResult::Fail("reset left the DIG FIFO enabled");
+    }
+
+    // With the symbol clock running, a reset that never reports done times out.
+    let mut stuck = engine(2);
+    stuck.io.values[(DIG_FE_CNTL + 2 * STRIDE) as usize] = DIG_SYMCLK_FE_ON;
+    stuck.io.fifo_stuck = true;
+    stuck.program(&timing(), Depth::Bpc8).unwrap();
+    stuck.program_rate(148_500, 20).unwrap();
+    if run(stuck.unblank()) != Err(Error::Timeout) {
+        return TestResult::Fail("a stuck DIG FIFO reset was treated as done");
+    }
+    // Without it, Linux only waits 10 µs per edge: no RESET_DONE poll.
+    let mut cold = engine(2);
+    cold.io.fifo_stuck = true;
+    cold.program(&timing(), Depth::Bpc8).unwrap();
+    cold.program_rate(148_500, 20).unwrap();
+    if run(cold.unblank()).is_err() || cold.io.values[ctrl as usize] & DIG_FIFO_ENABLE == 0 {
+        return TestResult::Fail("DIG FIFO without a symbol clock");
+    }
+
+    // DCN30 and DCN 3.1.5 have no explicit FIFO enable: DIG_START resets it.
+    for profile in [Profile::Navi22, Profile::Dcn315] {
+        let mut other = engine(2);
+        other.profile = profile;
+        other.program(&timing(), Depth::Bpc8).unwrap();
+        other.program_rate(148_500, 20).unwrap();
+        run(other.unblank()).unwrap();
+        if other.reset().is_err() || other.io.writes.iter().any(|&(r, _)| r == ctrl) {
+            return TestResult::Fail("a non-DCN 3.1.4 encoder touched DIG_FIFO_CTRL0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream
 );

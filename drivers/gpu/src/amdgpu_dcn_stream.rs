@@ -33,6 +33,19 @@ const DP_MSA_TIMING_PARAM2: u64 = 0x214d; // linux: mmDP0_DP_MSA_TIMING_PARAM2
 const DP_MSA_TIMING_PARAM3: u64 = 0x214e; // linux: mmDP0_DP_MSA_TIMING_PARAM3
 const DP_MSA_TIMING_PARAM4: u64 = 0x214f; // linux: mmDP0_DP_MSA_TIMING_PARAM4
 const STRIDE: u64 = 0x100; // linux: mmDP1_DP_PIXEL_FORMAT - mmDP0_DP_PIXEL_FORMAT
+                           // The DIG front end beside each DP block, at the same 0x100 stride
+                           // (regDIG1_DIG_FIFO_CTRL0 0x2191 against DIG0's 0x2091).
+const DIG_FE_CNTL: u64 = 0x208b; // linux: mmDIG0_DIG_FE_CNTL
+const DIG_FIFO_CTRL0: u64 = 0x2091; // linux: mmDIG0_DIG_FIFO_CTRL0
+const DIG_SYMCLK_FE_ON: u32 = 0x0100_0000; // linux: DIG0_DIG_FE_CNTL__DIG_SYMCLK_FE_ON_MASK
+const DIG_FIFO_ENABLE: u32 = 0x0000_0001; // linux: DIG0_DIG_FIFO_CTRL0__DIG_FIFO_ENABLE_MASK
+const DIG_FIFO_RESET: u32 = 0x0000_0002; // linux: DIG0_DIG_FIFO_CTRL0__DIG_FIFO_RESET_MASK
+const DIG_FIFO_READ_START_LEVEL: u32 = 0x0000_007c; // linux: DIG0_DIG_FIFO_CTRL0__DIG_FIFO_READ_START_LEVEL_MASK
+const DIG_FIFO_OUTPUT_PIXEL_MODE: u32 = 0x0000_0100; // linux: DIG0_DIG_FIFO_CTRL0__DIG_FIFO_OUTPUT_PIXEL_MODE_MASK
+const DIG_FIFO_RESET_DONE: u32 = 0x0010_0000; // linux: DIG0_DIG_FIFO_CTRL0__DIG_FIFO_RESET_DONE_MASK
+/// The read start level `enc314_enable_fifo` programs.
+// linux: n/a (literal 0x7 in dcn314_dio_stream_encoder.c:enc314_enable_fifo)
+const FIFO_READ_START_LEVEL: u32 = 7;
 #[cfg(feature = "kernel-test")]
 // linux: n/a (test-only bank bound)
 const LAST_REG: u32 = (DP_MSA_TIMING_PARAM4 + 4 * STRIDE) as u32;
@@ -230,6 +243,11 @@ impl<I: Io> Engine<I> {
                 },
             PIXEL_ENCODING_RGB | depth.code() << DP_COMPONENT_DEPTH.trailing_zeros(),
         )?;
+        if self.profile.is_dcn314() {
+            // `enc314_set_dig_input_mode` from `setup_dio_stream_encoder`:
+            // one pixel per container, the only mode this path drives.
+            self.update(DIG_FIFO_CTRL0, DIG_FIFO_OUTPUT_PIXEL_MODE, 0)?;
+        }
         // MISC0: colorimetry depth in bits 7:5, full-range RGB elsewhere.
         // linux-lit: 24=DP0_DP_MSA_COLORIMETRY__DP_MSA_MISC0__SHIFT
         self.set(DP_MSA_COLORIMETRY, depth.colorimetry() << 5 << 24)?;
@@ -340,7 +358,82 @@ impl<I: Io> Engine<I> {
         delay_us(100).await;
         // linux-lit: 1=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK
         self.update(DP_VID_STREAM_CNTL, 1, 1)?;
+        if self.profile.is_dcn314() {
+            // "DIG Resync FIFO now needs to be explicitly enabled. This
+            // should come after DP_VID_STREAM_ENABLE per HW docs."
+            self.enable_dig_fifo().await?;
+        }
         self.state = State::Streaming;
+        Ok(())
+    }
+    /// `enc314_reset_fifo`: drive DIG_FIFO_RESET to `reset` and, while the
+    /// front end's symbol clock runs, wait for DIG_FIFO_RESET_DONE to follow
+    /// it (Linux: 10 µs × 5000). Without the clock the reset cannot report
+    /// done, so Linux only waits 10 µs.
+    async fn reset_dig_fifo(&mut self, reset: bool) -> Result<(), Error> {
+        self.update(
+            DIG_FIFO_CTRL0,
+            DIG_FIFO_RESET,
+            if reset { DIG_FIFO_RESET } else { 0 },
+        )?;
+        let front_end = self.reg(DIG_FE_CNTL);
+        let clock = self.access(|io| io.read(front_end))?;
+        if clock == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        if clock & DIG_SYMCLK_FE_ON == 0 {
+            delay_us(10).await;
+            return Ok(());
+        }
+        let want = if reset { DIG_FIFO_RESET_DONE } else { 0 };
+        let control = self.reg(DIG_FIFO_CTRL0);
+        let deadline = narf_time::Deadline::after_ms(50);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
+        loop {
+            let value = self.access(|io| io.read(control))?;
+            if value == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            if value & DIG_FIFO_RESET_DONE == want {
+                return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay_us(10).await;
+        }
+    }
+    /// `enc314_enable_fifo`: read start level 7, a full reset pulse, then the
+    /// enable. DCN 3.1.4 only — DCN30 and DCN 3.1.5 reset the FIFO through
+    /// DIG_START instead and have no explicit enable.
+    async fn enable_dig_fifo(&mut self) -> Result<(), Error> {
+        self.update(
+            DIG_FIFO_CTRL0,
+            DIG_FIFO_READ_START_LEVEL,
+            FIFO_READ_START_LEVEL << DIG_FIFO_READ_START_LEVEL.trailing_zeros(),
+        )?;
+        self.reset_dig_fifo(true).await?;
+        self.reset_dig_fifo(false).await?;
+        self.update(DIG_FIFO_CTRL0, DIG_FIFO_ENABLE, DIG_FIFO_ENABLE)
+    }
+    /// `reset_dio_stream_encoder` on DCN 3.1.4: `enc314_disable_fifo`, then
+    /// `enc314_set_dig_input_mode(0)`. Not refused on a stream that failed to
+    /// blank: teardown keeps going, and Linux disables the FIFO regardless.
+    fn reset(&mut self) -> Result<(), Error> {
+        if self.profile.is_dcn314() {
+            self.update(DIG_FIFO_CTRL0, DIG_FIFO_ENABLE, 0)?;
+            self.update(DIG_FIFO_CTRL0, DIG_FIFO_OUTPUT_PIXEL_MODE, 0)?;
+        }
         Ok(())
     }
     /// Stop the stream and wait for the encoder to confirm it has stopped.
@@ -426,6 +519,12 @@ impl Stream {
     }
     pub async fn blank(&mut self) -> Result<(), Error> {
         self.0.blank().await
+    }
+    /// Release the front end after the link is down: on DCN 3.1.4, disable
+    /// the DIG FIFO that `unblank` enabled. Linux does this in
+    /// `dce110_disable_stream`, after `disable_link` on an 8b/10b SST link.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        self.0.reset()
     }
 }
 

@@ -114,11 +114,15 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
 
    Two open questions on the shared DCN 3.1.4 path, found while diffing and
    not changed here:
-   - `enc314_stream_encoder_dp_unblank` ends with `enc314_enable_fifo`
+   - ~~DCN 3.1.4 never enabled the DIG FIFO~~ (fixed).
+     `enc314_stream_encoder_dp_unblank` ends with `enc314_enable_fifo`
      (`DIG_FIFO_CTRL0`: READ_START_LEVEL 7, reset pulse, `DIG_FIFO_ENABLE`),
-     "now needs to be explicitly enabled ... per HW docs". NARF's DCN 3.1.4
-     unblank never enables the DIG FIFO, so a DIG the GOP did not leave
-     running may never emit video.
+     which the code describes as "now needs to be explicitly enabled ... per HW docs".
+     NARF's unblank now does the same; `program` sets one pixel per container
+     (`enc314_set_dig_input_mode`), and teardown disables the FIFO after the
+     link (`reset_dio_stream_encoder`). Linux's earlier `enable_fifo` in
+     `setup_dio_stream_encoder` is not repeated, because unblank resets and
+     re-enables the FIFO anyway.
    - `enc1_stream_encoder_dp_blank` (both DCNs) sets
      `DP_VID_STREAM_DIS_DEFER = 2`, waits up to about 102 ms and then sets
      `DP_STEER_FIFO_RESET`. NARF's `blank` waits 50 ms and does neither.
