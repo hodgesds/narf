@@ -4434,3 +4434,45 @@ pub fn spawn_user_process_resume(
 ) -> narf_scheduler::TaskId {
     prepare_user_process_resume(process, state, spec).spawn()
 }
+
+/// The scheduling spec the distro init (PID 1) starts with: an ordinary user
+/// task, allowed on every online CPU and placed on an AP first
+/// ([`narf_scheduler::TaskSpec::user_task`]).
+///
+/// Linux starts `kernel_init` on the boot CPU and moves it to every
+/// housekeeping CPU before it execs init (`sched_init_smp`:
+/// `set_cpus_allowed_ptr(current, housekeeping_cpumask(HK_TYPE_DOMAIN))`).
+/// Pinned to the boot CPU, PID 1 shared it with every boot-pinned kernel task
+/// and every device interrupt, could not be taken by an idle CPU, and was not
+/// preemptible in the kernel: one long section there held PID 1 — and any
+/// filesystem transaction it had joined — for as long as it lasted. Nothing
+/// PID 1 does depends on running on the boot CPU; its children already run
+/// on any CPU with this spec.
+pub fn init_task_spec() -> narf_scheduler::TaskSpec {
+    narf_scheduler::TaskSpec::user_task()
+}
+
+#[cfg(feature = "kernel-test")]
+mod init_spec_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// PID 1 may run on any online CPU once user tasks may leave the boot
+    /// CPU, as Linux's init may. Pinned to the boot CPU it waits behind
+    /// every boot-pinned kernel task and every device interrupt there, and
+    /// a filesystem transaction it has joined waits with it.
+    fn smoke_init_task_is_not_boot_pinned() -> TestResult {
+        let online = narf_lib::smp::online_bitmap();
+        if online.count_ones() < 2 {
+            return TestResult::Skip("needs a second online CPU");
+        }
+        let was = narf_scheduler::__test_set_user_task_smp(true);
+        let spec = super::init_task_spec();
+        narf_scheduler::__test_set_user_task_smp(was);
+        let boot = 1u64 << narf_scheduler::affinity::CpuId::BOOT.0;
+        if spec.affinity.allowed.bits() & online & !boot == 0 {
+            return TestResult::Fail("PID 1 may run only on the boot CPU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/init_spec", smoke_init_task_is_not_boot_pinned);
+}

@@ -1742,9 +1742,27 @@ pub(crate) fn spawn_orphan_reaper<B: BlockDevice + 'static>(
 ) {
     // Boxed before `spawn` so the caller's frame holds a pointer, not the
     // task's state (`start_commit_timer` was 10 KiB deep with both inline).
-    narf_scheduler::spawn(alloc::boxed::Box::pin(orphan_reaper(
-        alloc::sync::Arc::downgrade(core),
-    )));
+    narf_scheduler::spawn_with_spec(
+        alloc::boxed::Box::pin(orphan_reaper(alloc::sync::Arc::downgrade(core))),
+        background_task_spec(),
+    );
+}
+
+/// Where the filesystem's own background work runs: the transaction timer,
+/// the orphan reaper and the commit at the last unmount — on any CPU, as
+/// Linux runs `transaction_kthread` and `cleaner_kthread` (unbound kthreads)
+/// and its btrfs workqueues (`WQ_UNBOUND`).
+///
+/// This work joins and closes the running transaction (`txn_gate`) and takes
+/// the operation queue, exactly as a system call does from whichever CPU it
+/// runs on: everything it touches is reached through the core's `Arc`/`Weak`
+/// and its locks, and the gate names its caller by task id, which does not
+/// change when the task moves. Held to the boot CPU it waited behind every
+/// boot-pinned task and device interrupt there, and while it held a join or
+/// a close every commit and, behind a waiting commit, every new operation on
+/// every CPU waited with it.
+pub(crate) fn background_task_spec() -> narf_scheduler::TaskSpec {
+    narf_scheduler::TaskSpec::kernel_any()
 }
 
 /// The reaper task's body: asleep until an unlinked inode's last reference
@@ -1790,26 +1808,29 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
 ) {
     let weak = alloc::sync::Arc::downgrade(core);
     // Boxed before `spawn`, as in `spawn_orphan_reaper`.
-    narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
-        let tick = commit_interval_cycles();
-        loop {
-            narf_time::sleep_cycles(tick).await;
-            let Some(core) = weak.upgrade() else {
-                return;
-            };
-            // One timer per filesystem, whichever mounts are open: commit as
-            // the subvolume the running transaction belongs to.
-            if core.is_core_read_only() {
-                continue; // remounted read-only: nothing may commit
+    narf_scheduler::spawn_with_spec(
+        alloc::boxed::Box::pin(async move {
+            let tick = commit_interval_cycles();
+            loop {
+                narf_time::sleep_cycles(tick).await;
+                let Some(core) = weak.upgrade() else {
+                    return;
+                };
+                // One timer per filesystem, whichever mounts are open: commit as
+                // the subvolume the running transaction belongs to.
+                if core.is_core_read_only() {
+                    continue; // remounted read-only: nothing may commit
+                }
+                let tree = match core.fs_batch().lock().await.as_ref() {
+                    Some(batch) => batch.tree_id(),
+                    None => continue,
+                };
+                let view = BtrfsVolume::view_for_tree(&core, tree);
+                let _ = commit_if_stale(&view).await;
             }
-            let tree = match core.fs_batch().lock().await.as_ref() {
-                Some(batch) => batch.tree_id(),
-                None => continue,
-            };
-            let view = BtrfsVolume::view_for_tree(&core, tree);
-            let _ = commit_if_stale(&view).await;
-        }
-    }));
+        }),
+        background_task_spec(),
+    );
 }
 
 /// Whether the open batch, if any, has already COWed `vol`'s fs tree.

@@ -18,6 +18,7 @@ use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
 mod admitted_ops;
+mod background;
 mod batch_commit;
 mod cache_bounds;
 mod cache_off;
