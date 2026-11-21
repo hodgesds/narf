@@ -14,6 +14,8 @@ struct Fake {
     memory: Vec<u32>,
     hw: u32,
     invalidated: bool,
+    /// HDP 5.2.1 (Raphael): no read cache, so ring reads need no invalidate.
+    no_read_cache: bool,
     gone: bool,
     forbid_self_iv: bool,
 }
@@ -47,7 +49,7 @@ impl Io for Fake {
         }
     }
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32 {
-        assert!(self.invalidated, "stale CPU HDP read");
+        assert!(self.no_read_cache || self.invalidated, "stale CPU HDP read");
         if self.gone {
             return u32::MAX;
         }
@@ -113,6 +115,7 @@ fn fixture() -> (Pool, Arc<Shared<Fake>>, Handle) {
             memory: vec![0xffff_ffff; (BYTES / 4) as usize],
             hw: 0,
             invalidated: false,
+            no_read_cache: false,
             gone: false,
             forbid_self_iv: false,
         },
@@ -120,7 +123,8 @@ fn fixture() -> (Pool, Arc<Shared<Fake>>, Handle) {
         layout: Layout {
             oss: OSS,
             nbio: NBIO,
-            hdp: HDP,
+            hdp: Some(HDP),
+            nbio_v7_2: None,
             self_wptr_update: true,
         },
         memory: pool.reserve(BYTES).unwrap(),
@@ -889,4 +893,138 @@ fn ih_navi22_proof_without_interrupt_falls_back_to_polling() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/ih-navi22",
     ih_navi22_proof_without_interrupt_falls_back_to_polling
+);
+
+/// Raphael's discovery for the IH: GC 10.3.6, OSSSYS `oss`, NBIO `nbio` with
+/// six segments (segment 2 at `NBIO`, the port pair at 0x50000, PCIE_INDEX2
+/// at 0x60000), HDP `hdp`.
+fn raphael_gpu(oss: (u8, u8, u8), nbio: (u8, u8, u8), hdp: (u8, u8, u8)) -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::RAPHAEL).unwrap();
+    let template = gpu.ip_blocks[0];
+    let block = |id, v: (u8, u8, u8), bases: &[u32]| {
+        let mut b = template;
+        b.hw_id = id;
+        (b.major, b.minor, b.revision) = v;
+        b.num_bases = bases.len() as u8;
+        b.base_addrs[..bases.len()].copy_from_slice(bases);
+        b
+    };
+    let nbio_bases = [
+        0x60000 / 4,
+        0x50000 / 4,
+        (NBIO / 4) as u32,
+        0x10400,
+        0x241_b000,
+        0x404_0000,
+    ];
+    gpu.ip_blocks = vec![
+        block(d::HW_ID_GC, (10, 3, 6), &[0]),
+        block(d::HW_ID_OSSSYS, oss, &[(OSS / 4) as u32]),
+        block(d::HW_ID_NBIF, nbio, &nbio_bases),
+        block(d::HW_ID_HDP, hdp, &[(HDP / 4) as u32]),
+    ];
+    gpu
+}
+
+/// Raphael takes `navi10_ih` on OSSSYS 5.0.x/5.2.x beside NBIO 7.2 and HDP
+/// 5.2.1, with no HDP read cache to invalidate; HDP 5.0, NBIO 7.7, OSSSYS 6
+/// (`ih_v6_0`) and a discrete GPU are refused, and the discrete layout
+/// refuses Raphael.
+fn raphael_ih_layout_takes_only_raphaels_blocks() -> TestResult {
+    for oss in [(5, 0, 3), (5, 2, 0), (5, 2, 1)] {
+        let Ok(l) = Layout::resolve_raphael(&raphael_gpu(oss, (7, 2, 1), (5, 2, 1))) else {
+            return TestResult::Fail("Raphael IH layout refused");
+        };
+        if l.oss != OSS
+            || l.nbio != NBIO
+            || l.hdp.is_some()
+            || !l.self_wptr_update
+            || l.nbio_v7_2.is_none_or(|b| b.version != (7, 2, 1))
+        {
+            return TestResult::Fail("Raphael IH banks");
+        }
+    }
+    let mut navi22 = raphael_gpu((5, 2, 1), (7, 2, 1), (5, 2, 1));
+    navi22.chip =
+        crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap();
+    for (bad, why) in [
+        (
+            raphael_gpu((5, 2, 1), (7, 2, 1), (5, 0, 0)),
+            "Raphael IH took HDP 5.0",
+        ),
+        (
+            raphael_gpu((5, 2, 1), (7, 7, 0), (5, 2, 1)),
+            "Raphael IH took NBIO 7.7",
+        ),
+        (
+            raphael_gpu((6, 0, 0), (7, 2, 1), (5, 2, 1)),
+            "Raphael IH took OSSSYS 6",
+        ),
+        (navi22, "Raphael IH took a discrete GPU"),
+    ] {
+        if Layout::resolve_raphael(&bad).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    if Layout::resolve_rdna2(&raphael_gpu((5, 2, 1), (7, 2, 1), (5, 2, 1))).is_ok() {
+        return TestResult::Fail("the discrete IH layout took Raphael");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih-raphael",
+    raphael_ih_layout_takes_only_raphaels_blocks
+);
+
+/// On NBIO 7.2 the ring's doorbell range is released through the port pair
+/// (`nbio_v7_2_ih_doorbell_range(use_doorbell = false)`: SIZE cleared, OFFSET
+/// kept), never as NBIO 2.3's segment-2 register; and with HDP 5.2.1 the ring
+/// is read without an HDP invalidate.
+fn raphael_ih_doorbell_and_reads_follow_nbio_7_2() -> TestResult {
+    use crate::amdgpu_nbio_v7_2 as nbio;
+    let (_pool, shared, handle) = fixture();
+    let banks = Layout::resolve_raphael(&raphael_gpu((5, 2, 1), (7, 2, 1), (5, 2, 1)))
+        .unwrap()
+        .nbio_v7_2
+        .unwrap();
+    let (index, data) = banks.port_pair();
+    let port = banks.port_address(nbio::GDC0_IH_DOORBELL_RANGE).unwrap();
+    with(&shared, |e| {
+        e.layout.hdp = None;
+        e.layout.nbio_v7_2 = Some(banks);
+        // No read cache to invalidate before any ring read.
+        e.io.no_read_cache = true;
+        e.io.regs.insert(data, 0x0002_02f0);
+    });
+    enable(&shared, true).unwrap();
+    let wrong = with(&shared, |e| {
+        let writes: Vec<_> =
+            e.io.writes
+                .iter()
+                .filter(|w| [index, data].contains(&w.0))
+                .copied()
+                .collect();
+        writes != vec![(index, port), (index, port), (data, 0x0000_02f0)]
+            || e.io.writes.iter().any(|w| w.0 == NBIO + 0x1d2 * 4)
+    });
+    if wrong {
+        return TestResult::Fail("IH doorbell range missed NBIO 7.2's port pair");
+    }
+    let mut eop = handle.subscribe(source::GFX_EOP).unwrap();
+    with(&shared, |e| e.io.push(iv(source::GFX_EOP, 0, 9)));
+    if handle.drain() != Ok(1)
+        || eop.try_next().unwrap().map(|i| i.src_data[0]) != Some(9)
+        || with(&shared, |e| {
+            e.io.writes.iter().any(|w| w.0 == HDP + 0xd1 * 4)
+        })
+    {
+        return TestResult::Fail("Raphael IH invalidated an HDP read cache it does not have");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih-raphael",
+    raphael_ih_doorbell_and_reads_follow_nbio_7_2
 );

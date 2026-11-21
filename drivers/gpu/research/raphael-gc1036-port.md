@@ -161,7 +161,20 @@ as now.
      512 MiB default), and Linux's x86_64 CPU access goes through the carve-out's
      physical address instead of the BAR, where NARF's pool keeps its own
      mapping.
-6. IH on NBIO 7.x.
+6. ~~IH on NBIO 7.2~~ (done, `Ih::new_raphael`).
+   - `navi10_ih` reads `osssys_5_0_0_offset.h` for every OSSSYS revision it
+     drives (5.0.x, 5.2.0, 5.2.1). Its only version branches are the
+     self-interrupt wptr update (5.0.3 and up) and `IH_CHICKEN` (direct
+     firmware load only), so Raphael's OSSSYS keeps Navi22's registers.
+   - NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap on segment 2. The
+     ring's doorbell range (released, as NARF polls its rptr through
+     `IH_RB_RPTR`) is GDC0's, through the port pair.
+   - HDP 5.2.1 has no read cache: no `HDP_READ_CACHE_INVALIDATE`, and no
+     cache fields left in `HDP_MISC_CNTL`. The ring is read through BAR0
+     without an invalidate.
+   - NARF's discovery parser kept only five base addresses per IP. Raphael's
+     NBIO has six segments (`dcn315_resource.c`), and Linux keeps every one,
+     so the cap is now the parser's own bound of 16.
 7. GFX setup and topology (disabled shader arrays, CAM remapping), CP, KIQ,
    compute and GFX rings, SDMA 5.2.6 queues, IB tests and fences.
 8. The APU cold-boot coordinator and the PSP handover from the display path.

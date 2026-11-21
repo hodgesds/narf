@@ -380,8 +380,33 @@ pub struct Status {
 struct Layout {
     oss: u64,
     nbio: u64,
-    hdp: u64,
+    /// HDP 5.0's read cache, invalidated before each ring read. HDP 5.2.1
+    /// has none: no `HDP_READ_CACHE_INVALIDATE`, and no cache fields left in
+    /// `HDP_MISC_CNTL` (`hdp_5_2_1_sh_mask.h`), as `hdp_v5_2_funcs` has no
+    /// `invalidate_hdp`.
+    hdp: Option<u64>,
+    /// NBIO 7.2, whose IH doorbell range is the GDC0 register reached through
+    /// the PCIe port pair. NBIO 2.3's is `BIF_IH_DOORBELL_RANGE` in `nbio`.
+    nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
     self_wptr_update: bool,
+}
+/// The OSSSYS revisions `amdgpu_discovery.c` gives `navi10_ih`, which reads
+/// `osssys_5_0_0_offset.h` for all of them.
+const NAVI10_IH_OSSSYS: &[(u8, u8, u8)] = &[
+    (5, 0, 0),
+    (5, 0, 1),
+    (5, 0, 2),
+    (5, 0, 3),
+    (5, 2, 0),
+    (5, 2, 1),
+];
+/// Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
+fn self_wptr_update(gpu: &AmdGpu) -> bool {
+    gpu.ip_blocks.iter().any(|b| {
+        b.hw_id == ip::HW_ID_OSSSYS
+            && b.instance == 0
+            && (b.major, b.minor, b.revision) >= (5, 0, 3)
+    })
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -408,12 +433,8 @@ impl Layout {
         };
         Ok(Self {
             oss: resolve(ip::HW_ID_OSSSYS, oss_versions, 0, IH_CNTL2)?,
-            // Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
-            self_wptr_update: gpu.ip_blocks.iter().any(|b| {
-                b.hw_id == ip::HW_ID_OSSSYS
-                    && b.instance == 0
-                    && (b.major, b.minor, b.revision) >= (5, 0, 3)
-            }),
+            self_wptr_update: self_wptr_update(gpu),
+            nbio_v7_2: None,
             nbio: resolve(
                 ip::HW_ID_NBIF,
                 &[
@@ -428,12 +449,36 @@ impl Layout {
                 2,
                 IH_DOORBELL_RANGE,
             )?,
-            hdp: resolve(
+            hdp: Some(resolve(
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
                 HDP_READ_CACHE_INVALIDATE,
-            )?,
+            )?),
+        })
+    }
+    /// Raphael: GC 10.3.6 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
+    /// HDP 5.2.1. NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap at
+    /// their NBIO 2.3 offsets on segment 2; only the doorbell range moves.
+    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        resolve(ip::HW_ID_GC, &[(10, 3, 6)], 0, 0)?;
+        resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        Ok(Self {
+            oss: resolve(ip::HW_ID_OSSSYS, NAVI10_IH_OSSSYS, 0, IH_CNTL2)?,
+            nbio: banks.bif,
+            hdp: None,
+            nbio_v7_2: Some(banks),
+            self_wptr_update: self_wptr_update(gpu),
         })
     }
 }
@@ -521,6 +566,26 @@ impl<I: Io> Engine<I> {
         let next = (checked(io.read(address))? & !mask) | value;
         io.write(address, next);
         Ok(next)
+    }
+    /// `nbio_v7_2_ih_doorbell_range(use_doorbell = false)`: read the GDC0
+    /// range through the port pair and write it back with SIZE cleared, under
+    /// the index latch Raphael's display clock manager shares.
+    fn port_doorbell_off(io: &mut I, banks: crate::amdgpu_nbio_v7_2::Banks) -> Result<(), Error> {
+        use crate::amdgpu_nbio_v7_2 as nbio;
+        let address = banks
+            .port_address(nbio::GDC0_IH_DOORBELL_RANGE)
+            .ok_or(Error::Invalid)?;
+        let (index, data) = banks.port_pair();
+        crate::amdgpu_smn::with_latch(|| {
+            io.write(index, address);
+            io.read(index);
+            let old = checked(io.read(data))?;
+            io.write(index, address);
+            io.read(index);
+            io.write(data, nbio::ih_doorbell_range(old, None));
+            io.read(data);
+            Ok(())
+        })
     }
     /// Read-only checks; must succeed before any host routing or writes.
     fn preflight(&mut self) -> Result<(), Error> {
@@ -634,7 +699,12 @@ impl<I: Io> Engine<I> {
             io.write(Self::reg(l, RB_WPTR), 0);
             io.write(Self::reg(l, RB_RPTR), 0);
             io.write(Self::reg(l, DOORBELL_RPTR), 0);
-            Self::update(io, Self::nbio(l, IH_DOORBELL_RANGE), DOORBELL_SIZE, 0)?;
+            match l.nbio_v7_2 {
+                None => {
+                    Self::update(io, Self::nbio(l, IH_DOORBELL_RANGE), DOORBELL_SIZE, 0)?;
+                }
+                Some(banks) => Self::port_doorbell_off(io, banks)?,
+            }
             Self::toggle(io, l, true)?;
             Self::self_int(io, l, true)
         })?;
@@ -673,8 +743,10 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         let mut rptr = self.rptr;
         let batch = self.access(|io, l| {
-            io.write(l.hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4, 1);
-            io.read(l.hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4);
+            if let Some(hdp) = l.hdp {
+                io.write(hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4, 1);
+                io.read(hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4);
+            }
             fence(Ordering::SeqCst);
             let (wptr, overflow) = Self::wptr(io, l, map, &mut rptr)?;
             let mut batch = Batch {
@@ -1326,6 +1398,23 @@ impl Ih {
         device: BusDevice,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve_rdna2(gpu)?;
+        Self::with_layout(gpu, authority, pool, device, layout)
+    }
+    /// Reserve Raphael's RB0 ring: GC 10.3.6, `navi10_ih` on OSSSYS 5.0.x/5.2.x,
+    /// NBIO 7.2 and HDP 5.2.1. The ring is in the carve-out, read through BAR0
+    /// with no HDP invalidate (HDP 5.2.1 has no read cache). No device I/O or
+    /// interrupt routing occurs during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael. NBIO's index pairs are shared through
+    /// `amdgpu_smn`.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_raphael(gpu)?;
         Self::with_layout(gpu, authority, pool, device, layout)
     }
     fn with_layout(
