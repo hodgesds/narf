@@ -360,13 +360,15 @@ impl ColdBoot {
             narf_scheduler::yield_now().await;
         }
     }
-    /// `amdgpu_ring_reset` (`gfx_v10_0_reset_kcq`) for the compute ring. The
-    /// GFX ring's `reset_kgq` is not ported, and SDMA 5.2's queue reset needs
-    /// a PMFW message 13.0.5 lacks, so both are refused. Every job the ring
-    /// held is dropped; [`Self::force_complete`] then shows its fences done.
+    /// `amdgpu_ring_reset`: `gfx_v10_0_reset_kcq` for the compute ring,
+    /// `gfx_v10_0_reset_kgq` for GFX ring 0 (its timed-out job's VMID `vmid`;
+    /// a kernel job's VMID 0 is refused). SDMA 5.2's queue reset needs a PMFW
+    /// message 13.0.5 lacks, so it is refused. Every job the ring held is
+    /// dropped; [`Self::force_complete`] then shows its fences done.
     pub(crate) async fn reset_queue(
         &mut self,
         ring: crate::amdgpu_navi22_submit::Ring,
+        vmid: u8,
     ) -> Result<(), cp::Error> {
         use crate::amdgpu_navi22_submit::Ring;
         if !self.queues_verified() {
@@ -374,6 +376,19 @@ impl ColdBoot {
         }
         match ring {
             Ring::Compute => self.compute.reset_compute().await,
+            Ring::Gfx if vmid != 0 => {
+                let map = self.gfx.begin_reset()?;
+                if let Err(error) = self.compute.reset_gfx_vmid(vmid, map).await {
+                    self.gfx.fail_reset();
+                    return Err(error);
+                }
+                self.gfx.restore_queue()?;
+                if let Err(error) = self.compute.remap_gfx(map).await {
+                    self.gfx.fail_reset();
+                    return Err(error);
+                }
+                self.gfx.end_reset().await
+            }
             Ring::Gfx | Ring::Sdma(_) => Err(cp::Error::Unsupported),
         }
     }
@@ -385,7 +400,8 @@ impl ColdBoot {
         use crate::amdgpu_navi22_submit::Ring;
         match ring {
             Ring::Compute => self.compute.force_complete_compute(),
-            Ring::Gfx | Ring::Sdma(_) => Err(cp::Error::Unsupported),
+            Ring::Gfx => self.gfx.force_complete(),
+            Ring::Sdma(_) => Err(cp::Error::Unsupported),
         }
     }
     /// GC registers after a graphics timeout (`gfx_v10_0_dump_ip_state`).

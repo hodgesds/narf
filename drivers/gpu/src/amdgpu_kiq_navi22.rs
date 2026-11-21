@@ -420,6 +420,49 @@ impl<I: Io> Engine<I> {
         ring_test(&mut self.hw, &mut self.kiq).await?;
         ring_test(&mut self.hw, &mut self.compute).await
     }
+    /// `gfx_v10_0_reset_kgq`'s KIQ half: CP_VMID_RESET for `vmid` on `map`'s
+    /// pipe, the MQD showing the queue inactive, the register cleared, and the
+    /// KIQ ring test proving all three were consumed.
+    pub(crate) async fn reset_gfx_vmid(
+        &mut self,
+        vmid: u8,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.begin(State::Verified, State::Mapping)?;
+        let kiq = &mut self.kiq;
+        let result = self.hw.access(|io, l| {
+            kiq.emit(io, &pm4::gfx_vmid_reset(l.dword(CP_VMID_RESET), vmid, &map))?;
+            kiq.commit(io, l);
+            Ok(())
+        });
+        let result = match result {
+            Ok(()) => ring_test(&mut self.hw, &mut self.kiq).await,
+            Err(error) => Err(error),
+        };
+        self.finish(result, State::Verified)
+    }
+    /// The reset gfx queue's MAP_QUEUES (ENGINE_SEL 4) and KIQ ring test.
+    pub(crate) async fn remap_gfx(
+        &mut self,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.begin(State::Verified, State::Mapping)?;
+        let kiq = &mut self.kiq;
+        let result = self.hw.access(|io, l| {
+            kiq.emit(
+                io,
+                // linux: n/a (ENGINE_SEL literal 4 for AMDGPU_RING_TYPE_GFX in gfx10_kiq_map_queues)
+                &pm4::map_queues_engine(0, map.pipe, 0, map.doorbell, map.mqd, map.wptr, 4),
+            )?;
+            kiq.commit(io, l);
+            Ok(())
+        });
+        let result = match result {
+            Ok(()) => ring_test(&mut self.hw, &mut self.kiq).await,
+            Err(error) => Err(error),
+        };
+        self.finish(result, State::Verified)
+    }
     /// After a compute reset: the ring's fences show its last sequence.
     pub(crate) fn force_complete_compute(&mut self) -> Result<(), Error> {
         let compute = &self.compute;
@@ -611,6 +654,21 @@ impl Compute {
     /// See `Engine::reset_compute`.
     pub(crate) async fn reset_compute(&mut self) -> Result<(), Error> {
         self.engine.reset_compute().await
+    }
+    /// See `Engine::reset_gfx_vmid`.
+    pub(crate) async fn reset_gfx_vmid(
+        &mut self,
+        vmid: u8,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.engine.reset_gfx_vmid(vmid, map).await
+    }
+    /// See `Engine::remap_gfx`.
+    pub(crate) async fn remap_gfx(
+        &mut self,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.engine.remap_gfx(map).await
     }
     /// See `Engine::force_complete_compute`.
     pub(crate) fn force_complete_compute(&mut self) -> Result<(), Error> {

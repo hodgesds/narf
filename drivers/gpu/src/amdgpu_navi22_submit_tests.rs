@@ -457,6 +457,7 @@ fn gfx_engine() -> (crate::amdgpu_vram::Pool, GfxEngine<Model>) {
         state: GfxState::Prepared,
         proof: GfxProof::default(),
         golden: false,
+        mqd_backup: None,
     };
     assert!(run(e.configure()).is_ok() && run(e.start()).is_ok() && run(e.test_ib()).is_ok());
     (pool, e)

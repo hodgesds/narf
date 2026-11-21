@@ -12,7 +12,7 @@ use crate::{
     amdgpu_pm4_defs::{
         packet3, PACKET3_CLEAR_STATE, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP,
         PACKET3_RELEASE_MEM, PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG,
-        PACKET3_UNMAP_QUEUES, PACKET3_WRITE_DATA,
+        PACKET3_UNMAP_QUEUES, PACKET3_WAIT_REG_MEM, PACKET3_WRITE_DATA,
     },
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
@@ -597,6 +597,72 @@ pub(crate) mod pm4 {
             0,
         ]
     }
+    /// `gfx_v10_0_ring_emit_wreg` on the KIQ: WRITE_DATA to register dword
+    /// `reg`, without address increment.
+    pub(crate) fn kiq_wreg(reg: u32, value: u32) -> [u32; 5] {
+        // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_ring_emit_wreg)
+        // linux-lit: 0x10000=1 << 16 (KIQ "no inc addr" in gfx_v10_0_ring_emit_wreg)
+        [packet3(PACKET3_WRITE_DATA, 3), 0x1_0000, reg, 0, value]
+    }
+    /// `gfx_v10_0_wait_reg_mem` on ME, function 3 (equal), poll interval
+    /// 0x20: memory at `address` (mem_space 1) or register dword `reg`
+    /// (mem_space 0, `gfx_v10_0_ring_emit_reg_wait`).
+    pub(crate) fn wait_mem_eq(address: u64, value: u32, mask: u32) -> [u32; 7] {
+        // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_wait_reg_mem)
+        // linux-lit: 4=WAIT_REG_MEM_MEM_SPACE shift; 3=WAIT_REG_MEM_FUNCTION(3); 0x20=poll interval in gfx_v10_0_reset_kgq
+        let words = [
+            1 << 4 | 3,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+            mask,
+            0x20,
+        ];
+        [
+            packet3(PACKET3_WAIT_REG_MEM, 5),
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            words[4],
+            words[5],
+        ]
+    }
+    pub(crate) fn wait_reg_eq(reg: u32, value: u32, mask: u32) -> [u32; 7] {
+        // linux: n/a (count literal in gfx_v10_0.c:gfx_v10_0_wait_reg_mem)
+        // linux-lit: 3=WAIT_REG_MEM_FUNCTION(3); 0x20=poll interval in gfx_v10_0_ring_emit_reg_wait
+        [
+            packet3(PACKET3_WAIT_REG_MEM, 5),
+            3,
+            reg,
+            0,
+            value,
+            mask,
+            0x20,
+        ]
+    }
+    /// `gfx_v10_0_reset_kgq`'s KIQ sequence for pipe `map.pipe`, queue 0:
+    /// CP_VMID_RESET for `vmid` and that pipe's queue, the MQD's
+    /// `cp_gfx_hqd_active` (dword 130) reaching 0, and CP_VMID_RESET reading
+    /// back 0. `reg` is CP_VMID_RESET's dword.
+    pub(crate) fn gfx_vmid_reset(reg: u32, vmid: u8, map: &GfxQueueMap) -> [u32; 19] {
+        // linux: CP_VMID_RESET__PIPE0_QUEUES__SHIFT@gc101
+        const PIPE0_QUEUES_SHIFT: u32 = 0x10;
+        // linux: CP_VMID_RESET__PIPE1_QUEUES__SHIFT@gc101
+        const PIPE1_QUEUES_SHIFT: u32 = 0x18;
+        const HQD_ACTIVE: u64 = 130; // linux: n/a (offsetof(struct v10_gfx_mqd, cp_gfx_hqd_active) / 4)
+        let queues = 1
+            << if map.pipe == 0 {
+                PIPE0_QUEUES_SHIFT
+            } else {
+                PIPE1_QUEUES_SHIFT
+            };
+        let mut out = [0; 19];
+        out[..5].copy_from_slice(&kiq_wreg(reg, 1 << (vmid & 0xf) | queues));
+        out[5..12].copy_from_slice(&wait_mem_eq(map.mqd + HQD_ACTIVE * 4, 0, 1));
+        out[12..].copy_from_slice(&wait_reg_eq(reg, 0, u32::MAX));
+        out
+    }
     /// `gfx10_kiq_map_queues` for a compute queue (ENGINE_SEL 0).
     pub(crate) fn map_queues(
         me: u32,
@@ -1130,6 +1196,9 @@ pub(crate) struct GfxEngine<I: Io> {
     /// The ASIC's golden sequence already applied (`golden`), so `configure`
     /// does not rewrite them after other engines started.
     pub golden: bool,
+    /// Ring 0's MQD as first mapped (`adev->gfx.me.mqd_backup`), which a
+    /// queue reset restores.
+    pub mqd_backup: Option<alloc::boxed::Box<[u32]>>,
 }
 const SQ_CMD_CMD_SHIFT: u32 = 0x0; // linux: SQ_CMD__CMD__SHIFT@gc101
 const SQ_CMD_MODE_SHIFT: u32 = 0x4; // linux: SQ_CMD__MODE__SHIFT@gc101
@@ -1418,6 +1487,7 @@ impl<I: Io> GfxEngine<I> {
     }
     fn prepare_inner(&mut self) -> Result<[GfxQueueMap; 2], Error> {
         let (ring0, ring1) = (&self.queue, &self.pipe1);
+        let backup = &mut self.mqd_backup;
         self.hw.access(|io, l| {
             checked(io.read(l.reg(GRBM_CNTL)))?;
             for (pipe, q) in [(0, ring0), (1, ring1)] {
@@ -1435,6 +1505,9 @@ impl<I: Io> GfxEngine<I> {
                 for (i, &word) in mqd.iter().enumerate() {
                     io.write_memory(q.map(), GFX_MQD + i as u64 * 4, word);
                 }
+                if pipe == 0 {
+                    *backup = Some(alloc::boxed::Box::from(&mqd[..]));
+                }
             }
             flush(io, l);
             Ok([0, 1].map(|pipe| {
@@ -1446,6 +1519,63 @@ impl<I: Io> GfxEngine<I> {
                     wptr: q.address(WPTR),
                 }
             }))
+        })
+    }
+    /// `gfx_v10_0_reset_kgq`'s gfx half, around the KIQ's: `begin_reset`
+    /// claims the verified ring 0 and returns its map, `restore_queue` is
+    /// `gfx_v10_0_kgq_init_queue(ring, true)` (the MQD from its backup, the
+    /// ring cleared, both pointers zeroed) once the KIQ reset the VMID, and
+    /// `end_reset` ring-tests the remapped queue (`amdgpu_ring_reset_helper_end`).
+    /// Ring 1 carries no client work and is left as it is.
+    pub(crate) fn begin_reset(&mut self) -> Result<GfxQueueMap, Error> {
+        if self.mqd_backup.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.begin(GfxState::Verified, GfxState::Mapping)?;
+        Ok(GfxQueueMap {
+            pipe: 0,
+            doorbell: self.queue.doorbell,
+            mqd: self.queue.address(GFX_MQD),
+            wptr: self.queue.address(WPTR),
+        })
+    }
+    pub(crate) fn restore_queue(&mut self) -> Result<(), Error> {
+        if self.state != GfxState::Mapping {
+            return Err(Error::Busy);
+        }
+        let (queue, backup) = (&mut self.queue, self.mqd_backup.as_deref());
+        let result = self.hw.access(|io, l| {
+            for (i, &word) in backup.into_iter().flatten().enumerate() {
+                io.write_memory(queue.map(), GFX_MQD + i as u64 * 4, word);
+            }
+            queue.reset_ring(io);
+            flush(io, l);
+            Ok(())
+        });
+        if result.is_err() {
+            self.state = GfxState::Failed;
+        }
+        result
+    }
+    pub(crate) async fn end_reset(&mut self) -> Result<(), Error> {
+        if self.state != GfxState::Mapping {
+            return Err(Error::Busy);
+        }
+        let result = ring_test(&mut self.hw, &mut self.queue).await;
+        self.finish(result, GfxState::Verified)
+    }
+    /// A KIQ step of the reset failed: the ring stays unusable.
+    pub(crate) fn fail_reset(&mut self) {
+        if self.state == GfxState::Mapping {
+            self.state = GfxState::Failed;
+        }
+    }
+    /// After a reset: ring 0's fences show its last sequence.
+    pub(crate) fn force_complete(&mut self) -> Result<(), Error> {
+        let queue = &self.queue;
+        self.hw.access(|io, _| {
+            queue.force_complete(io);
+            Ok(())
         })
     }
     /// The KIQ could not map the gfx queues: this owner cannot start.
@@ -1591,6 +1721,7 @@ impl Gfx {
                 state: GfxState::Prepared,
                 proof: GfxProof::default(),
                 golden: false,
+                mqd_backup: None,
             },
         })
     }
@@ -1681,6 +1812,22 @@ impl Gfx {
     /// See `GfxEngine::kill_waves`.
     pub(crate) async fn kill_waves(&mut self, vmid: u8) -> Result<(), Error> {
         self.engine.kill_waves(vmid).await
+    }
+    /// See `GfxEngine::begin_reset`.
+    pub(crate) fn begin_reset(&mut self) -> Result<GfxQueueMap, Error> {
+        self.engine.begin_reset()
+    }
+    pub(crate) fn restore_queue(&mut self) -> Result<(), Error> {
+        self.engine.restore_queue()
+    }
+    pub(crate) async fn end_reset(&mut self) -> Result<(), Error> {
+        self.engine.end_reset().await
+    }
+    pub(crate) fn fail_reset(&mut self) {
+        self.engine.fail_reset()
+    }
+    pub(crate) fn force_complete(&mut self) -> Result<(), Error> {
+        self.engine.force_complete()
     }
     pub(crate) fn hang_snapshot(&mut self) -> Result<GfxHangSnapshot, Error> {
         if self.engine.state != GfxState::Verified {

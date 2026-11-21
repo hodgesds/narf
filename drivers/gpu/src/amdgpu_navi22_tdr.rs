@@ -299,7 +299,7 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
                 continue;
             }
             // The next rung: reset that queue alone.
-            if raphael && matches!(hang.engine, Engine::Compute) {
+            if raphael && matches!(hang.engine, Engine::Compute | Engine::Gfx) {
                 let _ = writeln!(
                     narf_console::Writer,
                     "amdgpu: raphael starting {:?} ring reset",

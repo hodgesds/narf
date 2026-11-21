@@ -48,6 +48,9 @@ pub const SPI_GDBG_TRAP_MASK: Reg = Reg(0, 0x1f73); // linux: mmSPI_GDBG_TRAP_MA
 pub const SPI_GDBG_TRAP_DATA0: Reg = Reg(0, 0x1f78); // linux: mmSPI_GDBG_TRAP_DATA0@gc101
 pub const SPI_GDBG_TRAP_DATA1: Reg = Reg(0, 0x1f79); // linux: mmSPI_GDBG_TRAP_DATA1@gc101
 
+// GFX queue reset (gfx_v10_0_reset_kgq)
+pub const CP_VMID_RESET: Reg = Reg(0, 0x1e53); // linux: mmCP_VMID_RESET@gc101
+
 // Soft recovery (gfx_v10_0_ring_soft_recovery, gfx_v10_0_set_safe_mode)
 pub const SQ_CMD: Reg = Reg(0, 0x111b); // linux: mmSQ_CMD@gc101
 pub const RLC_CNTL: Reg = Reg(1, 0x4c00); // linux: mmRLC_CNTL@gc101

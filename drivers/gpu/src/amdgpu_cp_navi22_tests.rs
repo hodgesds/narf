@@ -101,6 +101,8 @@ pub(crate) struct Model {
     pub mapped: Vec<Mapped>,
     /// UNMAP_QUEUES (RESET_QUEUES) packets the KIQ executed.
     pub unmapped: u32,
+    /// CP_VMID_RESET values the KIQ wrote.
+    pub vmid_resets: Vec<u32>,
     pub traps: u32,
     pub sdma_count: u32,
     rptr: [u64; 8],
@@ -154,6 +156,7 @@ impl Model {
             resources: Vec::new(),
             mapped: Vec::new(),
             unmapped: 0,
+            vmid_resets: Vec::new(),
             traps: 0,
             sdma_count: 2,
             rptr: [0; 8],
@@ -292,6 +295,26 @@ impl Model {
                     let reg = 0xc000 + body[0];
                     self.regs.insert(u64::from(reg) * 4, body[1]);
                 }
+                0x37 if engine == 1 && body[0] == 1 << 16 => {
+                    // gfx_v10_0_ring_emit_wreg on the KIQ. CP_VMID_RESET
+                    // dequeues the named gfx queues (their MQDs read
+                    // inactive) and reads back 0 once done.
+                    self.engine_wreg(body[1], body[3]);
+                    if u64::from(body[1]) * 4 == r(CP_VMID_RESET) {
+                        self.vmid_resets.push(body[3]);
+                        let pipe0 = (body[3] >> 16) & 0xff;
+                        let pipe1 = (body[3] >> 24) & 0xff;
+                        for q in self.mapped.clone() {
+                            let named = if q.pipe == 0 { pipe0 } else { pipe1 };
+                            if q.me == 0 && named & (1 << q.queue) != 0 {
+                                self.put(q.mqd + 130 * 4, 0);
+                                self.mapped.retain(|m| m.doorbell != q.doorbell);
+                                self.rptr[if q.pipe == 0 { 0 } else { 7 }] = 0;
+                            }
+                        }
+                        self.regs.insert(r(CP_VMID_RESET), 0);
+                    }
+                }
                 0x37 if body[0] & 0xf00 == 0 => {
                     // WRITE_DATA to a register: ENGINE_SEL(1) on gfx only.
                     let want = if engine == 0 {
@@ -326,6 +349,13 @@ impl Model {
                                 self.word(address) & body[4],
                                 body[3],
                                 "pipeline sync would hang"
+                            );
+                        }
+                        (0, 0) => {
+                            assert_eq!(
+                                self.reg(u64::from(body[1]) * 4) & body[4],
+                                body[3],
+                                "register wait would hang"
                             );
                         }
                         (0, 1) => {
@@ -837,6 +867,7 @@ fn gfx(model: Model) -> (Pool, GfxEngine<Model>) {
             state: GfxState::Prepared,
             proof: GfxProof::default(),
             golden: false,
+            mqd_backup: None,
         },
     )
 }
@@ -853,6 +884,18 @@ impl GfxEngine<Model> {
             .collect();
         self.hw.io.pm4(&words, 1, false, 0);
         self.start_mapped().await
+    }
+    /// gfx_v10_0_reset_kgq against the model: the gfx owner's halves around
+    /// the KIQ's CP_VMID_RESET sequence and MAP_QUEUES, decoded by the
+    /// model's KIQ as the coordinator's KIQ owner would send them.
+    pub(crate) async fn reset_kgq(&mut self, vmid: u8) -> Result<(), Error> {
+        let map = self.begin_reset()?;
+        let reset = pm4::gfx_vmid_reset(self.hw.layout.dword(CP_VMID_RESET), vmid, &map);
+        self.hw.io.pm4(&reset, 1, false, 0);
+        self.restore_queue()?;
+        let words = pm4::map_queues_engine(0, map.pipe, 0, map.doorbell, map.mqd, map.wptr, 4);
+        self.hw.io.pm4(&words, 1, false, 0);
+        self.end_reset().await
     }
 }
 
@@ -1680,6 +1723,101 @@ fn raphael_soft_recovery_kills_one_vmid_in_safe_mode() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/cp-raphael",
     raphael_soft_recovery_kills_one_vmid_in_safe_mode
+);
+
+/// gfx_v10_0_reset_kgq on a hung GFX ring 0: CP_VMID_RESET for the job's
+/// VMID and pipe 0's queue 0, the MQD inactive, the register clear; the MQD
+/// restored from its map-time backup with an empty ring, MAP_QUEUES and the
+/// ring test. The stalled job never runs; force completion shows the ring's
+/// last sequence, ring 1 is untouched, and ring 0 executes again.
+fn raphael_gfx_queue_reset_restores_ring_0() -> TestResult {
+    if pm4::gfx_vmid_reset(
+        0x1e53,
+        5,
+        &GfxQueueMap {
+            pipe: 0,
+            doorbell: 0,
+            mqd: 0x1000,
+            wptr: 0,
+        },
+    )[..5]
+        != [
+            packet3(PACKET3_WRITE_DATA, 3),
+            0x1_0000,
+            0x1e53,
+            0,
+            1 << 5 | 1 << 16,
+        ]
+    {
+        return TestResult::Fail("CP_VMID_RESET write");
+    }
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut e) = gfx(enabled());
+    e.hw.layout = resolved;
+    e.hw.io.no_read_cache = true;
+    e.golden().unwrap();
+    run(e.configure()).unwrap();
+    run(e.start()).unwrap();
+    run(e.test_ib()).unwrap();
+    let mqd = |e: &GfxEngine<Model>| -> Vec<u32> {
+        (0..512u64)
+            .map(|i| e.hw.io.word(e.queue.address(GFX_MQD + i * 4)))
+            .collect()
+    };
+    let backup = mqd(&e);
+    if e.mqd_backup.as_deref() != Some(&backup[..]) {
+        return TestResult::Fail("gfx MQD backup differs from the mapped MQD");
+    }
+    let fence = e.hw.io.word(e.queue.address(FENCE));
+    e.hw.io.stalled[0] = true;
+    let seq = e.queue.next_seq();
+    let (hw, queue) = (&mut e.hw, &mut e.queue);
+    hw.access(|io, l| {
+        queue.emit(io, &pm4::release_mem(queue.address(FENCE), seq))?;
+        queue.commit(io, l);
+        Ok(())
+    })
+    .unwrap();
+    e.hw.io.stalled[0] = false;
+    let pipe1 =
+        e.hw.io
+            .mapped
+            .iter()
+            .filter(|q| q.me == 0 && q.pipe == 1)
+            .count();
+    if run(e.reset_kgq(5)).is_err() || e.state != GfxState::Verified {
+        return TestResult::Fail("gfx queue reset failed");
+    }
+    let m = &e.hw.io;
+    if m.vmid_resets != [1 << 5 | 1 << 16]
+        || m.reg(resolved.reg(CP_VMID_RESET)) != 0
+        || m.mapped.iter().filter(|q| q.me == 0 && q.pipe == 0).count() != 1
+        || m.mapped.iter().filter(|q| q.me == 0 && q.pipe == 1).count() != pipe1
+        || mqd(&e) != backup
+        || m.word(e.queue.address(FENCE)) != fence
+    {
+        return TestResult::Fail("gfx reset kept the hung queue's state or ran its job");
+    }
+    if e.force_complete().is_err()
+        || e.hw.io.word(e.queue.address(FENCE)) != seq
+        || e.hw.io.word(e.queue.address(VM_FENCE)) != seq
+        || run(ring_test(&mut e.hw, &mut e.queue)).is_err()
+    {
+        return TestResult::Fail("forced fences or the reset ring's execution");
+    }
+    // A claimed ring is not claimed twice; a failed KIQ step leaves it dead.
+    if e.begin_reset().is_err() || e.begin_reset().is_ok() {
+        return TestResult::Fail("a claimed ring was claimed again");
+    }
+    e.fail_reset();
+    if e.state != GfxState::Failed || run(e.end_reset()).is_ok() {
+        return TestResult::Fail("a failed reset left ring 0 usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_queue_reset_restores_ring_0
 );
 
 /// `port_update`: the address through the port index, read back, data read,

@@ -622,8 +622,8 @@ pub(crate) async fn soft_recover(
 /// soft recovery: reset that queue alone, fail its timed-out job and cancel
 /// the jobs behind it (`Jobs::reset`), then force its fences. Other rings
 /// and the submitter carry on. False when the queue reset is not ported for
-/// the ring (GFX, SDMA), fails, or the owner is gone; the caller then treats
-/// the hang as terminal.
+/// the ring (SDMA), the GFX job is a kernel one, the reset fails, or the
+/// owner is gone; the caller then treats the hang as terminal.
 pub(crate) async fn reset_queue(
     engine: crate::amdgpu_fence_navi22::Engine,
     generation: u64,
@@ -642,7 +642,7 @@ pub(crate) async fn reset_queue(
         return false;
     };
     let _ = current.progress();
-    let Some((ticket, _)) = current.jobs.lock().oldest(id) else {
+    let Some((ticket, vmid)) = current.jobs.lock().oldest(id) else {
         return false;
     };
     {
@@ -650,7 +650,7 @@ pub(crate) async fn reset_queue(
         let Some(boot) = owner.get() else {
             return false;
         };
-        if boot.reset_queue(ring).await.is_err() {
+        if boot.reset_queue(ring, vmid).await.is_err() {
             return false;
         }
         // The errors are on record before the fences move.

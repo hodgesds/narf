@@ -188,6 +188,41 @@ kernel_test_in!(
     kiq_compute_reset_restores_an_empty_queue
 );
 
+/// gfx_v10_0_reset_kgq's KIQ half: CP_VMID_RESET for the VMID and the
+/// mapped gfx queue, the MQD and register waits, the KIQ ring test; then
+/// the queue's MAP_QUEUES (ENGINE_SEL 4). The KIQ stays verified.
+fn kiq_resets_and_remaps_a_gfx_queue() -> TestResult {
+    let (pool, mut e) = engine(enabled());
+    if run(e.init_kiq()).is_err() || run(e.map_compute()).is_err() || run(e.test_ib()).is_err() {
+        return TestResult::Fail("compute bring-up");
+    }
+    let gfx = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx).unwrap();
+    let map = crate::amdgpu_cp_navi22::GfxQueueMap {
+        pipe: 0,
+        doorbell: gfx.doorbell,
+        mqd: gfx.address(crate::amdgpu_cp_navi22::GFX_MQD),
+        wptr: gfx.address(WPTR),
+    };
+    e.state = State::Mapped;
+    if run(e.map_gfx(&[map])).is_err() {
+        return TestResult::Fail("gfx map");
+    }
+    e.state = State::Verified;
+    let gfx_mapped = |e: &Engine<Model>| e.hw.io.mapped.iter().filter(|q| q.me == 0).count();
+    if run(e.reset_gfx_vmid(3, map)).is_err()
+        || e.hw.io.vmid_resets != [1 << 3 | 1 << 16]
+        || gfx_mapped(&e) != 0
+        || e.state != State::Verified
+    {
+        return TestResult::Fail("KIQ VMID reset");
+    }
+    if run(e.remap_gfx(map)).is_err() || gfx_mapped(&e) != 1 || e.state != State::Verified {
+        return TestResult::Fail("KIQ gfx remap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/kiq-navi22", kiq_resets_and_remaps_a_gfx_queue);
+
 fn kiq_navi22_dequeues_inherited_kiq_or_stops_bounded() -> TestResult {
     for stuck in [false, true] {
         let mut model = enabled();

@@ -367,13 +367,18 @@ since the submitter is replaced. Raphael's port:
          sequence into both fence writebacks, so no sample can retire the
          guilty job as done. The queue's memory is released then: the
          unmap proved it can no longer fetch that work.
-       - GFX (`gfx_v10_0_reset_kgq`) is not ported. It needs
-         `CP_VMID_RESET` for the job's VMID and pipe through the KIQ, a
-         WAIT_REG_MEM on the MQD's `cp_gfx_hqd_active`, and a GFX MQD
-         backup. A GFX hang that soft recovery does not clear stays
-         terminal.
-    5. Mode 2 (`GfxDeviceDriverReset(SMU_RESET_MODE_2)`), for SDMA hangs and
-       failed queue resets. It re-initializes every IP, display included,
+       - ~~GFX ring 0~~ (done), after `gfx_v10_0_reset_kgq`, split between
+         the two owners:
+         - the KIQ writes `CP_VMID_RESET` for the job's VMID and pipe 0's
+           queue, waits for the MQD's `cp_gfx_hqd_active` (dword 130) to
+           read 0 and the register to clear, then ring-tests;
+         - the GFX owner restores ring 0's MQD from its map-time backup and
+           empties the ring;
+         - the KIQ remaps it (ENGINE_SEL 4), and the GFX owner ring-tests it.
+         A kernel job (VMID 0) is not reset. Ring 1 carries no client work
+         and is left alone.
+    5. Mode 2 (`GfxDeviceDriverReset(SMU_RESET_MODE_2)`), for SDMA hangs,
+       kernel-job hangs and failed queue resets. Not started. It re-initializes every IP, display included,
        so the display owner's DMUB and PSP session must come back with it.
 
 ## Open
