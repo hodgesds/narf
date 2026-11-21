@@ -814,6 +814,7 @@ fn fake_hub_binding(slot_id: u8, num_ports: u8) -> crate::attach::HubBinding {
         bound_downstream: 0,
         suspended_downstream: 0,
         last_activity_tick: [0u64; 64],
+        walk_pending: false,
     }
 }
 

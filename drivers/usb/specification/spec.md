@@ -215,7 +215,12 @@ also consult upstream Linux GPL sources.
   each port's C_PORT_CONNECTION, C_PORT_ENABLE, C_PORT_OVER_CURRENT,
   C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET, C_PORT_LINK_STATE and
   C_PORT_CONFIG_ERROR (C_PORT_SUSPEND stays with the remote-wakeup
-  watch). The
+  watch). `HubBinding::walk_pending` marks a hub whose ports must be walked
+  (set at bind, by a status-change report, and kept while a port attempt
+  failed with retry budget left; `attach::set_walk_pending`);
+  `attach::hubs_to_walk` selects the hubs a cycle walks — today every
+  bound hub. The NIC and Bluetooth remote-wakeup watches run in a cycle
+  that walked a hub. The
   supervisor tries one root port per cycle but does not park while another
   connected, unclaimed port with retry budget remains
   (`enumeration_wait::root_ports_to_attempt`). Hub port power-on waits

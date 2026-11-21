@@ -698,9 +698,18 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     })
                     .collect()
             };
+            // Only hubs with a pending walk (just bound, a status-change
+            // report, a port to retry) are walked: Linux `hub_event`
+            // runs for a hub whose `event_bits` were set.
+            let due = attach::hubs_to_walk(&hubs.lock());
+            let mut walked_any = false;
             for (idx, (route, tier, root_port, hub_slot, num_ports, bound_mask)) in
                 walks.iter().enumerate()
             {
+                if !due.contains(hub_slot) {
+                    continue;
+                }
+                walked_any = true;
                 // Snapshot the UsbHub copy out of the registry lock so
                 // both connected_downstream_ports() and try_attach_via_hub
                 // can run their now-async control transfers without
@@ -752,6 +761,9 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     }
                 }
                 let mut new_bound_bits: u64 = 0;
+                // A port whose attempt failed with budget left keeps the
+                // walk pending, so it is retried without a timer.
+                let mut retry = false;
                 hub_fail_count
                     .retain(|&(slot, port), _| slot != *hub_slot || connected.contains(&port));
                 for &dp in &connected {
@@ -804,6 +816,7 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                                 MAX_PER_PORT_RETRIES,
                                 c.timeout_count() != timeouts_before,
                             );
+                            retry |= *fails < MAX_PER_PORT_RETRIES;
                             if before < MAX_PER_PORT_RETRIES && *fails >= MAX_PER_PORT_RETRIES {
                                 use core::fmt::Write as _;
                                 let _ = writeln!(
@@ -826,6 +839,7 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     // epoch its tick initialised to (#840).
                     attach::mark_ports_bound(c.id(), *hub_slot, new_bound_bits);
                 }
+                attach::set_walk_pending(c.id(), *hub_slot, retry);
             }
 
             SUPERVISOR_PHASE.store(7, core::sync::atomic::Ordering::Relaxed);
@@ -855,8 +869,14 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // (#820): a parked BT controller resumes only when
             // it signals remote wakeup, or when host TX demand
             // resumes its port through the transport.
-            wake_suspended_nic_ports(c).await;
-            bluetooth_hooks::wake_watch(c).await;
+            // A suspended device's remote wakeup is a C_PORT_SUSPEND
+            // change its hub reports on the status-change endpoint
+            // (Linux `hub_irq` → `port_event` → `usb_remote_wakeup`), so
+            // the watches read port status only after a hub walk.
+            if walked_any {
+                wake_suspended_nic_ports(c).await;
+                bluetooth_hooks::wake_watch(c).await;
+            }
             pump_bound_devices(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
