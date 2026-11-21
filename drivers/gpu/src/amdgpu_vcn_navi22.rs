@@ -61,6 +61,9 @@ pub(crate) mod regs {
     pub const POWER_STATUS: Reg = Reg(1, 0x004); // linux: mmUVD_POWER_STATUS
     pub const CC_UVD_HARVESTING: Reg = Reg(1, 0x007); // linux: mmCC_UVD_HARVESTING
     pub const JPEG_POWER_STATUS: Reg = Reg(1, 0x00a); // linux: mmUVD_JPEG_POWER_STATUS
+    pub const DPG_LMA_CTL: Reg = Reg(1, 0x011); // linux: mmUVD_DPG_LMA_CTL
+    pub const DPG_LMA_DATA: Reg = Reg(1, 0x012); // linux: mmUVD_DPG_LMA_DATA
+    pub const DPG_LMA_MASK: Reg = Reg(1, 0x013); // linux: mmUVD_DPG_LMA_MASK
     pub const DPG_PAUSE: Reg = Reg(1, 0x014); // linux: mmUVD_DPG_PAUSE
     pub const SCRATCH2: Reg = Reg(1, 0x016); // linux: mmUVD_SCRATCH2
     pub const SCRATCH9: Reg = Reg(1, 0x01d); // linux: mmUVD_SCRATCH9
@@ -68,11 +71,16 @@ pub(crate) mod regs {
     pub const STATUS: Reg = Reg(1, 0x080); // linux: mmUVD_STATUS
     pub const SOFT_RESET: Reg = Reg(1, 0x084); // linux: mmUVD_SOFT_RESET
     pub const CGC_GATE: Reg = Reg(1, 0x088); // linux: mmUVD_CGC_GATE
+    pub const GPCOM_VCPU_CMD: Reg = Reg(1, 0x08f); // linux: mmUVD_GPCOM_VCPU_CMD
+    pub const GPCOM_VCPU_DATA0: Reg = Reg(1, 0x090); // linux: mmUVD_GPCOM_VCPU_DATA0
+    pub const GPCOM_VCPU_DATA1: Reg = Reg(1, 0x091); // linux: mmUVD_GPCOM_VCPU_DATA1
     pub const CGC_CTRL: Reg = Reg(1, 0x08a); // linux: mmUVD_CGC_CTRL
     pub const SUVD_CGC_GATE: Reg = Reg(1, 0x08c); // linux: mmUVD_SUVD_CGC_GATE
     pub const SUVD_CGC_CTRL: Reg = Reg(1, 0x08e); // linux: mmUVD_SUVD_CGC_CTRL
     pub const SUVD_CGC_GATE2: Reg = Reg(1, 0x0ff); // linux: mmUVD_SUVD_CGC_GATE2
     pub const MASTINT_EN: Reg = Reg(1, 0x0a1); // linux: mmUVD_MASTINT_EN
+    pub const CONTEXT_ID: Reg = Reg(1, 0x0a7); // linux: mmUVD_CONTEXT_ID
+    pub const CONTEXT_ID2: Reg = Reg(1, 0x0a8); // linux: mmUVD_CONTEXT_ID2
     /// Encode ring 0 (general purpose) and ring 1 (low latency).
     // linux: mmUVD_RB_BASE_LO; mmUVD_RB_BASE_LO2
     pub const RB_BASE_LO: [Reg; 2] = [Reg(1, 0x0aa), Reg(1, 0x0af)];
@@ -1008,19 +1016,47 @@ impl Jpeg {
 }
 
 /// Instance registers of a ring-timeout snapshot, after the ring's own
-/// read and write pointers.
-pub(crate) const TIMEOUT_REGS: [(&str, Reg); 8] = [
+/// read and write pointers: Linux's VCN 3.0 dump (`vcn_reg_list_3_0` for
+/// `amdgpu_vcn_dump_ip_state`; encode rings 3 and 4 do not exist on VCN
+/// 3.0), then the decode RBC pointers, DPG scratch, interrupt, VCPU, reset
+/// and LMI state.
+pub(crate) const TIMEOUT_REGS: [(&str, Reg); 33] = [
     ("STATUS", STATUS),
     ("POWER_STATUS", POWER_STATUS),
+    ("CONTEXT_ID", CONTEXT_ID),
+    ("CONTEXT_ID2", CONTEXT_ID2),
+    ("GPCOM_VCPU_DATA0", GPCOM_VCPU_DATA0),
+    ("GPCOM_VCPU_DATA1", GPCOM_VCPU_DATA1),
+    ("GPCOM_VCPU_CMD", GPCOM_VCPU_CMD),
+    ("RB_BASE_HI", RB_BASE_HI[0]),
+    ("RB_BASE_LO", RB_BASE_LO[0]),
+    ("RB_BASE_HI2", RB_BASE_HI[1]),
+    ("RB_BASE_LO2", RB_BASE_LO[1]),
+    ("RB_RPTR", RB_RPTR[0]),
+    ("RB_WPTR", RB_WPTR[0]),
+    ("RB_RPTR2", RB_RPTR[1]),
+    ("RB_WPTR2", RB_WPTR[1]),
+    ("RB_SIZE", RB_SIZE[0]),
+    ("RB_SIZE2", RB_SIZE[1]),
+    ("PGFSM_CONFIG", PGFSM_CONFIG),
     ("PGFSM_STATUS", PGFSM_STATUS),
+    ("DPG_LMA_CTL", DPG_LMA_CTL),
+    ("DPG_LMA_DATA", DPG_LMA_DATA),
+    ("DPG_LMA_MASK", DPG_LMA_MASK),
     ("DPG_PAUSE", DPG_PAUSE),
+    ("RBC_RB_RPTR", RBC_RB_RPTR),
+    ("RBC_RB_WPTR", RBC_RB_WPTR),
     ("RB_ARB_CTRL", RB_ARB_CTRL),
     ("SCRATCH2", SCRATCH2),
     ("SCRATCH9", SCRATCH9),
     ("MASTINT_EN", MASTINT_EN),
+    ("VCPU_CNTL", VCPU_CNTL),
+    ("SOFT_RESET", SOFT_RESET),
+    ("LMI_CTRL2", LMI_CTRL2),
+    ("LMI_STATUS", LMI_STATUS),
 ];
 /// One ring's timeout evidence (`Engine::ring_snapshot`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RingSnapshot {
     pub rptr: u32,
     pub wptr: u32,
@@ -1033,6 +1069,19 @@ pub(crate) struct RingSnapshot {
     pub shared: [u32; 3],
     /// The ring dwords at the hardware read pointer.
     pub at_rptr: [u32; 5],
+}
+impl Default for RingSnapshot {
+    fn default() -> Self {
+        Self {
+            rptr: 0,
+            wptr: 0,
+            observed: 0,
+            shadow: 0,
+            regs: [0; TIMEOUT_REGS.len()],
+            shared: [0; 3],
+            at_rptr: [0; 5],
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1811,7 +1860,9 @@ impl<I: Io> Engine<I> {
         self.report_ring_timeout(i, slot, seq, "IB fence timeout");
     }
     /// Timeout evidence of ring `slot` (0 decode, 1 + j encode) of instance
-    /// `i`: its pointers, fence and shadow wptr and `TIMEOUT_REGS`.
+    /// `i`: its pointers, fence and shadow wptr, `TIMEOUT_REGS`, the
+    /// fw_shared queue modes and decode pointers, and the ring dwords at the
+    /// hardware read pointer (the command the engine sits on).
     pub(crate) fn ring_snapshot(&mut self, i: usize, slot: usize) -> Result<RingSnapshot, Error> {
         let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
         let (ring, rptr, wptr) = if slot == 0 {
@@ -1820,7 +1871,7 @@ impl<I: Io> Engine<I> {
             let j = (slot - 1) & 1;
             (&instance.enc[j], RB_RPTR[j], RB_WPTR[j])
         };
-        let (map, shadow) = (instance.memory.mapping(), ring.shadow);
+        let (map, shadow, base) = (instance.memory.mapping(), ring.shadow, ring.base);
         let mut s = RingSnapshot::default();
         self.hw.access(|io, l| {
             s.rptr = io.read(l.reg(i, rptr));
@@ -1831,6 +1882,20 @@ impl<I: Io> Engine<I> {
             invalidate(io, l);
             s.observed = io.read_memory(map, FENCE[slot]);
             s.shadow = io.read_memory(map, shadow);
+            for (word, at) in
+                s.shared
+                    .iter_mut()
+                    .zip([shared::QUEUE_MODES, shared::RB_RPTR, shared::RB_WPTR])
+            {
+                *word = io.read_memory(map, SHARED + at);
+            }
+            // The decode RBC pointer may carry flag bits (the DPG stop masks
+            // 0x7fffffff); the ring index wraps at its size either way.
+            let mut at = s.rptr % RING_DW;
+            for word in &mut s.at_rptr {
+                *word = io.read_memory(map, base + u64::from(at) * 4);
+                at = (at + 1) % RING_DW;
+            }
             Ok(())
         })?;
         Ok(s)
@@ -1869,6 +1934,12 @@ impl<I: Io> Engine<I> {
                 for ((name, _), value) in TIMEOUT_REGS.iter().zip(s.regs) {
                     let _ = write!(w, " {name}={value:#x}");
                 }
+                let [modes, rptr, wptr] = s.shared;
+                let _ = write!(
+                    w,
+                    " fw_shared_modes={modes:#x} fw_shared_rb={rptr:#x}/{wptr:#x} at_rptr={:x?}",
+                    s.at_rptr
+                );
             }
             Err(error) => {
                 let _ = write!(w, " snapshot_refused={error:?}");

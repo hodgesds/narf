@@ -12045,9 +12045,15 @@ that fails is not ready (its `Proof::{dec_ib, enc_ib}` stays 0, so it takes no
 client job and is left out of idle accounting) while the rings that passed
 serve; the engine is Verified when any ring passed and `test_ib` returns the
 first failure. Device loss or revoked authority ends the tests. An IB-test fence timeout emits one bounded, capability-checked
-snapshot identifying the instance/ring, expected and observed fence, submitted
-and shadow write pointers, hardware read/write pointers, status, power and DPG
-state. The polling path does no logging. A timeout does not release the IB,
+snapshot (`Engine::ring_snapshot`) identifying the instance/ring, expected and
+observed fence, submitted and shadow write pointers, hardware read/write
+pointers, and `TIMEOUT_REGS`: Linux's VCN 3.0 dump list (`vcn_reg_list_3_0`:
+status, power and PGFSM state, the DPG LMA window and pause, CONTEXT_ID/2,
+GPCOM_VCPU_CMD/DATA0/DATA1, both encode rings' base, size and pointers), the
+decode RBC pointers, DPG scratch, master interrupt, VCPU control, soft reset
+and LMI state; then the fw_shared queue-mode dword and `rb` pointers and the
+five ring dwords at the hardware read pointer. The polling path does no
+logging. A timeout does not release the IB,
 session or fence storage: they share the instance's published reservation,
 which remains excluded from reuse even if the failed owner is dropped.
 `unsafe stop()` runs `vcn_v3_0_stop` (DPG or static) and
