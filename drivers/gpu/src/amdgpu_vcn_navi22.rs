@@ -1520,8 +1520,33 @@ impl<I: Io> Engine<I> {
         self.paused[i] = true;
         Ok(())
     }
+    /// One `SOC15_WAIT_ON_RREG` of `vcn_v3_0_stop_dpg_mode`, whose result
+    /// Linux ignores: a register that never reaches `value` is warned about
+    /// and the stop goes on. Device loss and revoked authority still end it.
+    async fn stop_wait(
+        &mut self,
+        engine: fence::Engine,
+        i: usize,
+        what: &str,
+        address: u64,
+        value: u32,
+        mask: u32,
+    ) -> Result<(), Error> {
+        match self.hw.wait_reg(engine, address, value, mask).await {
+            Err(Error::Timeout) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::PriorityWriter::<4>,
+                    "amdgpu: VCN{i} stop: {what} did not reach {value:#x} (mask {mask:#x})"
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
     /// `vcn_v3_0_stop_dpg_mode`: unpause, wait for every ring to drain and
-    /// the instance to report powered, then leave dynamic power gating.
+    /// the instance to report powered, then leave dynamic power gating. As in
+    /// Linux the waits only warn, so `vcn_v3_0_stop` can still power VCN down.
     async fn stop_dpg(&mut self, i: usize) -> Result<(), Error> {
         let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
         let l = self.hw.layout;
@@ -1536,22 +1561,28 @@ impl<I: Io> Engine<I> {
             self.paused[i] = false;
         }
         let power = r(POWER_STATUS);
-        self.hw
-            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+        self.stop_wait(engine, i, "power status", power, 1, POWER_STATUS_MASK)
             .await?;
-        for (rptr, wptr, mask) in [
-            (RB_RPTR[0], RB_WPTR[0], u32::MAX),
-            (RB_RPTR[1], RB_WPTR[1], u32::MAX),
+        for (slot, rptr, wptr, mask) in [
+            (1, RB_RPTR[0], RB_WPTR[0], u32::MAX),
+            (2, RB_RPTR[1], RB_WPTR[1], u32::MAX),
             // linux: n/a (literal 0x7FFFFFFF in vcn_v3_0_stop_dpg_mode)
-            (RBC_RB_RPTR, RBC_RB_WPTR, 0x7fff_ffff),
+            (0, RBC_RB_RPTR, RBC_RB_WPTR, 0x7fff_ffff),
         ] {
             let want = self
                 .hw
                 .access(|io, _| Ok(checked(io.read(r(wptr)))? & mask))?;
-            self.hw.wait_reg(engine, r(rptr), want, u32::MAX).await?;
+            // A ring that failed its IB test may still hold the commands it
+            // never ran.
+            let what = if self.ring_counted(i, slot) {
+                "ring read pointer"
+            } else {
+                "ring read pointer (failed its IB test)"
+            };
+            self.stop_wait(engine, i, what, r(rptr), want, u32::MAX)
+                .await?;
         }
-        self.hw
-            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+        self.stop_wait(engine, i, "power status", power, 1, POWER_STATUS_MASK)
             .await?;
         self.hw.access(|io, _| {
             // disable dynamic power gating mode
@@ -1673,31 +1704,57 @@ impl<I: Io> Engine<I> {
             .await
     }
     /// `amdgpu_ib_ring_tests` for every VCN ring: the decoder create/destroy
-    /// message pair and the encoder session initialize/close pair.
+    /// message pair and the encoder session initialize/close pair. As in
+    /// Linux each ring is tested on its own: one that fails is not ready
+    /// (`ring->sched.ready = false`; its IB proof stays 0, so it takes no
+    /// client work and no idle accounting) and the rings that passed serve.
+    /// The engine is Verified when any ring passed; the first failure is
+    /// returned. Device loss or revoked authority ends the tests.
     pub(crate) async fn test_ib(&mut self) -> Result<(), Error> {
         if self.state != State::Running {
             return Err(Error::Busy);
         }
         self.state = State::Testing;
-        let mut result = Ok(());
+        let mut first = Ok(());
+        let mut passed = false;
         let instances: alloc::vec::Vec<usize> = self.active().collect();
-        for i in instances {
-            result = self.test_dec_ib(i).await;
-            for j in 0..self.enc_count {
-                if result.is_ok() {
-                    result = self.test_enc_ib(i, j).await;
+        'rings: for i in instances {
+            for slot in 0..=self.enc_count {
+                let result = if slot == 0 {
+                    self.test_dec_ib(i).await
+                } else {
+                    self.test_enc_ib(i, slot - 1).await
+                };
+                match result {
+                    Ok(()) => passed = true,
+                    Err(error @ (Error::DeviceGone | Error::Revoked)) => {
+                        first = first.and(Err(error));
+                        passed = false;
+                        break 'rings;
+                    }
+                    Err(error) => first = first.and(Err(error)),
                 }
             }
-            if result.is_err() {
-                break;
-            }
         }
-        self.state = if result.is_ok() {
+        self.state = if passed {
             State::Verified
         } else {
             State::Failed
         };
-        result
+        first
+    }
+    /// Whether idle accounting counts ring `slot` (0 decode, 1 + j encode)
+    /// of instance `i`. Once the IB tests ran, a ring that failed its test is
+    /// not ready: it takes no work, so its never-signalled test fence does
+    /// not keep the engine awake.
+    pub(crate) fn ring_counted(&self, i: usize, slot: usize) -> bool {
+        if self.state != State::Verified {
+            return true;
+        }
+        match slot {
+            0 => self.proof.dec_ib[i] != 0,
+            j => self.proof.enc_ib[i][(j - 1) & 1] != 0,
+        }
     }
     async fn wait_fence(&mut self, i: usize, slot: usize, seq: u32) -> Result<(), Error> {
         let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
@@ -2367,9 +2424,14 @@ impl<I: Io> Engine<I> {
     pub(crate) fn client_ready(&self, ring: MediaRing) -> bool {
         match ring {
             MediaRing::Jpeg => self.jpeg_state == JpegState::Verified,
-            MediaRing::Dec => self.state == State::Verified && self.proof.dec_ring[0],
+            MediaRing::Dec => {
+                self.state == State::Verified && self.proof.dec_ring[0] && self.proof.dec_ib[0] != 0
+            }
             MediaRing::Enc(j) => {
-                self.state == State::Verified && self.proof.enc_ring[0][usize::from(j & 1)]
+                let j = usize::from(j & 1);
+                self.state == State::Verified
+                    && self.proof.enc_ring[0][j]
+                    && self.proof.enc_ib[0][j] != 0
             }
         }
     }
@@ -2540,6 +2602,10 @@ impl Media {
         now: u64,
     ) -> Result<bool, Error> {
         self.engine.idle(control, now).await
+    }
+    /// See `Engine::idle_recheck`.
+    pub(crate) fn idle_recheck(&self, now: u64) -> Option<u64> {
+        self.engine.idle_recheck(now)
     }
     /// Bit `MediaRing::index()` per ring that accepts client jobs.
     pub fn client_rings(&self) -> u8 {

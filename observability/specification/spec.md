@@ -242,8 +242,14 @@ for `2 * thresh`. `thresh == 0` disables all three. `begin_round` returns
 `show_cpu_pool_hog`) at task granularity: the caller samples, per CPU, the
 task that has been runnable longest without being dispatched
 (`narf_scheduler::dbg_oldest_runnable`: ready queue, wake inbox, woken
-parked set; `since` is the later of its last wake and the end of its last
-run, a new task counting from its creation). A stall — one task runnable
+parked set; `since` is the latest of its last wake, the end of its last
+run and the CPU's entry into its executor, a new task counting from its
+creation). Only a CPU inside its executor is sampled
+(`narf_scheduler::dbg_cpu_in_executor`): the boot CPU running initcalls
+synchronously, a kernel-test harness or a CPU whose executor never started
+leaves its queue unserved by design, as Linux's workqueue watchdog judges
+pools only once workqueues run; a CPU stuck in a task poll inside its
+executor is the stall and stays judged. A stall — one task runnable
 since one instant — is reported once, when it has waited `thresh` and the
 previous round saw the same stall (one sighting can catch a wake between its
 runnable bit and its stamp). The task running or leaving ends the stall.
@@ -281,7 +287,10 @@ id, closing task, operations joined). Every lockup line and every
 `STALL-WD` dump prints each CPU's hard-IRQ share over the last window:
 `STALL-WD   irq cpu=N rate=R/s hardirq=P% masked_arrivals=M/s window_ms=W
 top=V:R/s(handler) ...`, from the dispatch table's per-CPU fire counts,
-`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters.
+`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters. Every
+report line is one `TrapWriter` record, so it reaches the serial port whole
+even while another CPU prints (console §3: trap text takes the console lock
+per record).
 
 ## 4. Invariants & safety properties
 

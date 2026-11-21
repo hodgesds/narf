@@ -594,36 +594,50 @@ mod stall_wd {
     }
 
     /// One CPU's interrupt share over the last window, for the dump and
-    /// the lockup reports.
+    /// the lockup reports. One `writeln!`, so one record: it reaches the
+    /// console whole, never split by another CPU's line.
     fn irq_line(cpu: usize) {
         if cpu >= MAXC {
             return;
         }
         let pm = IRQ_HARD_PM[cpu].load(Ordering::Relaxed);
-        let _ = write!(
+        let _ = writeln!(
             TrapWriter,
-            "STALL-WD   irq cpu={cpu} rate={}/s hardirq={}.{}% masked_arrivals={}/s window_ms={} top=",
+            "STALL-WD   irq cpu={cpu} rate={}/s hardirq={}.{}% masked_arrivals={}/s window_ms={} top={}",
             IRQ_RATE[cpu].load(Ordering::Relaxed),
             pm / 10,
             pm % 10,
             IRQ_MASKED_RATE[cpu].load(Ordering::Relaxed),
             IRQ_WINDOW_MS.load(Ordering::Relaxed),
+            TopVectors(cpu),
         );
-        let mut any = false;
-        for slot in &IRQ_TOP[cpu] {
-            let packed = slot.load(Ordering::Relaxed);
-            let (v, rate) = ((packed >> 56) as u8, packed & ((1 << 56) - 1));
-            if rate == 0 {
-                continue;
+    }
+
+    /// The `top=` field of [`irq_line`]: `vector:rate/s(handler) ...`, or
+    /// `none`.
+    struct TopVectors(usize);
+
+    impl core::fmt::Display for TopVectors {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut any = false;
+            for slot in &IRQ_TOP[self.0] {
+                let packed = slot.load(Ordering::Relaxed);
+                let (v, rate) = ((packed >> 56) as u8, packed & ((1 << 56) - 1));
+                if rate == 0 {
+                    continue;
+                }
+                any = true;
+                write!(
+                    f,
+                    "{v}:{rate}/s({}) ",
+                    narf_interrupts::dispatch::handler_name_try(v).unwrap_or("-"),
+                )?;
             }
-            any = true;
-            let _ = write!(
-                TrapWriter,
-                "{v}:{rate}/s({}) ",
-                narf_interrupts::dispatch::handler_name_try(v).unwrap_or("-"),
-            );
+            if !any {
+                f.write_str("none")?;
+            }
+            Ok(())
         }
-        let _ = writeln!(TrapWriter, "{}", if any { "" } else { "none" });
     }
 
     /// Linux's soft/hard-lockup detectors over every CPU (see the module

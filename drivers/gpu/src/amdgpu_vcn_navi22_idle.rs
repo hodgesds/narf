@@ -94,6 +94,9 @@ impl<I: Io> Engine<I> {
         if now.saturating_sub(last) < IDLE_NS {
             return Ok(false);
         }
+        // `amdgpu_fence_count_emitted` over the rings that are ready.
+        let counted: [[bool; 3]; 2] =
+            core::array::from_fn(|i| core::array::from_fn(|slot| self.ring_counted(i, slot)));
         let instances = &self.vcn;
         let enc_count = self.enc_count;
         let (all_done, enc_done) = self.hw.access(|io, l| {
@@ -106,9 +109,14 @@ impl<I: Io> Engine<I> {
                     continue;
                 };
                 let map = inst.memory.mapping();
-                all &= fence::signaled(io.read_memory(map, FENCE[0]), inst.dec.seq);
+                if counted[i][0] {
+                    all &= fence::signaled(io.read_memory(map, FENCE[0]), inst.dec.seq);
+                }
                 for j in 0..enc_count {
-                    enc[i] &= fence::signaled(io.read_memory(map, FENCE[j + 1]), inst.enc[j].seq);
+                    if counted[i][j + 1] {
+                        enc[i] &=
+                            fence::signaled(io.read_memory(map, FENCE[j + 1]), inst.enc[j].seq);
+                    }
                 }
                 all &= enc[i];
             }
@@ -148,6 +156,27 @@ impl<I: Io> Engine<I> {
         self.runtime.phase = Phase::Asleep;
         MEDIA_ASLEEP.store(true, Ordering::Release);
         Ok(true)
+    }
+    /// When the idle work should look again. Linux queues `idle_work`
+    /// VCN_IDLE_TIMEOUT after a ring's last use and re-queues it one timeout
+    /// later while fences remain emitted: the rest of the timeout after a
+    /// recent use, a full timeout while busy, and `None` once gated or
+    /// unusable, until the next `begin_use`.
+    pub(crate) fn idle_recheck(&self, now: u64) -> Option<u64> {
+        if self.runtime.phase != Phase::Awake
+            || !matches!(self.state, State::Running | State::Verified)
+        {
+            return None;
+        }
+        let since = self
+            .runtime
+            .last_use
+            .map_or(0, |last| now.saturating_sub(last));
+        Some(if since < IDLE_NS {
+            IDLE_NS - since
+        } else {
+            IDLE_NS
+        })
     }
     pub(crate) async fn begin_use(
         &mut self,
@@ -233,7 +262,8 @@ const GATE_SLOW_NS: u64 = 100_000_000;
 static LAST_GATE: narf_lib::sync::IrqSafeSpinLock<Option<GateTrace>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// The most recent gate attempt.
+/// The most recent gate attempt (read by the kernel tests).
+#[cfg(feature = "kernel-test")]
 pub(crate) fn last_gate() -> Option<GateTrace> {
     *LAST_GATE.lock()
 }
@@ -312,15 +342,35 @@ pub(crate) fn stop() {
         w.wake();
     }
 }
+/// The idle work failed (the engine is already `Failed`); its task ends.
+/// Linux's `amdgpu_vcn_idle_work_handler` ignores `set_pg_state`'s result:
+/// a VCN that cannot gate is a video failure, never the GPU's. Video is
+/// withdrawn from clients (`AMDGPU_INFO` stops offering the rings) and
+/// graphics keeps running. A GPU that really stopped answering is found by
+/// the paths that own graphics: the hang detector's HDP read-back and the
+/// submitter's fence sampling.
+pub(crate) fn gate_failed(error: &crate::amdgpu_navi22_boot::Error) {
+    crate::amdgpu_vcn_navi22_cs::unregister();
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 VCN idle failed: {error:?}; video closed, graphics continue"
+    );
+}
 pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     MEDIA_ASLEEP.store(false, Ordering::Release);
     narf_scheduler::spawn(async move {
+        // Linux queues `idle_work` VCN_IDLE_TIMEOUT after a ring's last use.
+        let mut delay = IDLE_NS;
         loop {
-            // Gated media: no idle work until the next use (Linux queues
-            // `idle_work` from `ring_end_use` only).
-            media_in_use(epoch).await;
-            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
+            // Gated or unusable media: no idle work until the next use
+            // (Linux queues `idle_work` from `ring_end_use` only).
+            if MEDIA_ASLEEP.load(Ordering::Acquire) {
+                media_in_use(epoch).await;
+                delay = IDLE_NS;
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ns(delay).as_instant()).await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
@@ -332,13 +382,14 @@ pub(crate) fn start() {
                 return;
             };
             if let Err(error) = boot.idle_media(narf_time::monotonic_ns()).await {
-                crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
-                use core::fmt::Write;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: navi22 VCN idle failed: {error:?}"
-                );
+                gate_failed(&error);
                 return;
+            }
+            match boot.media_idle_recheck(narf_time::monotonic_ns()) {
+                Some(ns) => delay = ns,
+                // Parked under the owner, which `begin_use` also holds, so its
+                // `wake_idle_work` cannot fall between this and the park.
+                None => MEDIA_ASLEEP.store(true, Ordering::Release),
             }
         }
     });

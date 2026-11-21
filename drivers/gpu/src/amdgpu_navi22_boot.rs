@@ -2224,6 +2224,11 @@ impl ColdBoot {
         };
         media.idle(&mut control, now).await.map_err(Error::Media)
     }
+    /// When the VCN idle work should look again; `None`: not until the next
+    /// media use (`Engine::idle_recheck`).
+    pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
+        self.sequence.backend.media.as_ref()?.idle_recheck(now)
+    }
     /// Stop owned media hardware before asking PMFW to gate VCN islands.
     /// # Safety
     /// Block new media publication and drain all JPEG jobs before this
@@ -2655,6 +2660,15 @@ impl ColdBoot {
     /// monitor pass calls this): no-op without admitted BTR. A refused
     /// stream is reported, not fatal to the pass, as Navi48's LFC frame
     /// service does.
+    /// Whether BTR frame insertion runs on a lit stream (single pipe or a
+    /// multi-stream member).
+    pub fn display_lfc_active(&self) -> bool {
+        let h = &self.sequence.backend;
+        h.modeset.as_ref().is_some_and(|p| p.lfc_active())
+            || h.group
+                .as_ref()
+                .is_some_and(|g| (0..g.members().len()).any(|k| g.lfc_active(k)))
+    }
     pub fn display_lfc_progress(&mut self) {
         use core::fmt::Write;
         let h = &mut self.sequence.backend;

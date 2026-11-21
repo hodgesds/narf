@@ -105,8 +105,18 @@ lock held on its own CPU, and waits at most 2 ms for one held on another
 writer gets it again — a CPU stopped with the lock held costs one wait).
 Text the store refuses is counted, and the next stored record is preceded by
 Linux's `** N printk messages dropped **` notice, so a loss is never silent.
-Physical trap output still proceeds without the console lock or framebuffer
-hook. This path never allocates, and keeps the ordinary record/continuation
+Physical trap output reaches the UART one record at a time, like every other
+console write: `trap_sink` takes the console lock ordinary writers hold for a
+whole message, waiting only while its holder keeps finishing chunks (Linux
+`console_trylock_spinning` / nbcon: an atomic context takes the console over
+only from an owner that is stuck). It writes without the lock — accepting an
+interleave over a deadlock — when this CPU holds it (the trap interrupted its
+own write), when the system is panicking (`panic_sink` marks it before
+stopping the other CPUs, which may hold it), or when the holder finished no
+chunk for 20 ms; after such an expiry later trap text only tries the lock
+until a writer takes it again, so a stuck holder costs one wait. The panic
+report itself is written directly, never waiting. The framebuffer hook is
+not used for trap text. This path never allocates, and keeps the ordinary record/continuation
 format; trap-context text has its own continuation caller id per CPU (Linux
 `printk_caller_id`), so it never extends a task's half-written line.
 

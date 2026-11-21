@@ -4260,7 +4260,8 @@ configuration, detected clock, all three channel locks, and scrambler status
 when scrambling is enabled. Legacy SCDC links also read reception flags.
 
 The display monitor checks running single-stream and multi-stream HDMI
-outputs at most once per second, with no IRQ lock held across DDC awaits.
+outputs on its passes (events only, see the Navi 22 hot-plug section), at
+most once per second, with no IRQ lock held across DDC awaits.
 `LinkMonitor` requests one ordinary withdrawal/relight after three consecutive
 observed failures per connection. Further sustained failures report a fault
 and suspend automatic recovery while retaining the context, so other working
@@ -6985,8 +6986,8 @@ runs `stop_modeset` and relights through `modeset_display_mode`, which
 selects that timing when the sink lists it and it fits, else the preferred
 one. If the requested mode fails to light, the preferred mode is lit and
 the request cleared. The last DRM file closing returns to the preferred
-mode. Mode changes are therefore asynchronous to the ioctl (the next monitor
-pass, up to a second). The teardown sequence now has its own progress and
+mode. Mode changes are therefore asynchronous to the ioctl (the monitor pass
+the request wakes). The teardown sequence now has its own progress and
 fault/cancellation models; partial activation recovery remains open. Unplug (and `stop_modeset`)
 publish the connector disconnected, with no modes, no EDID, and no mode
 accepted. The CRTC is disabled with its framebuffer cleared, and open
@@ -11804,7 +11805,13 @@ reports the alert, per-source counters and any shutdown reason.
 
 Hang detection (`amdgpu_navi22_tdr`) follows drm_sched's per-ring job timeout
 with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
-queues all verified, a task samples every 250 ms, under the owner lock,
+queues all verified, a task samples, under the owner lock, only while a job is
+in flight, as drm_sched arms its timeout at job start and cancels it when
+nothing is pending: `Queue::next_seq` (kernel and client job fences) and the
+SDMA kernel-frame path (`submit_kernel`) call `tdr::job_emitted`, which wakes
+the parked task; it samples at once, then
+at the earliest pending job's timeout (`tdr::next_sample`), and with nothing
+pending (or only hangs already reported) arms no timer. Each sample reads
 `Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
 (`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
 after an HDP invalidate; an all-ones read-back is device loss). The sample
@@ -12005,7 +12012,11 @@ all-ones reads still fail rather than proving readiness.
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
 every started ring and waits (1 s) for the fences; register waits are bounded
-by 100 ms. An IB-test fence timeout emits one bounded, capability-checked
+by 100 ms. As `amdgpu_ib_ring_tests`, each ring is tested on its own: a ring
+that fails is not ready (its `Proof::{dec_ib, enc_ib}` stays 0, so it takes no
+client job and is left out of idle accounting) while the rings that passed
+serve; the engine is Verified when any ring passed and `test_ib` returns the
+first failure. Device loss or revoked authority ends the tests. An IB-test fence timeout emits one bounded, capability-checked
 snapshot identifying the instance/ring, expected and observed fence, submitted
 and shadow write pointers, hardware read/write pointers, status, power and DPG
 state. The polling path does no logging. A timeout does not release the IB,
@@ -12019,9 +12030,16 @@ published memory. `status()` returns `Status { state, jpeg, proof }`.
 (client 0x10/0x0e: 124 decode, 119/120 encode) and JPEG (153) sources and
 forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
 
-The retained platform owner also runs VCN3 idle work at 100 ms intervals,
-with Linux's 1 s idle delay. It checks physical decode/encode writebacks
-on every active instance, independently of API error signalling. Encode
+The retained platform owner also runs VCN3 idle work as Linux's
+`amdgpu_vcn_idle_work_handler`: VCN_IDLE_TIMEOUT (1 s) after the last use,
+again one timeout later while fences remain (`Engine::idle_recheck`,
+`ColdBoot::media_idle_recheck`), and not at all once gated or unusable until
+the next begin-use. It checks physical decode/encode writebacks of the ready
+rings on every active instance, independently of API error signalling; a ring
+that failed its IB test is not counted. As in `vcn_v3_0_stop_dpg_mode`, every
+wait of the DPG stop (power status, each ring's read pointer) only warns on a
+timeout, so the stop still leaves DPG and VCN is powered down; device loss or
+revoked authority still fails it. Encode
 completion releases DPG pause even while decode remains busy. Once all VCN
 work drains it runs the hardware stop and, only when SMU11 MM_DPM_PG is
 running, sends PowerDownVcn (0x2b, instance in bits 16+).
@@ -12032,6 +12050,11 @@ writebacks and logical fence sequences; cached GB_ADDR_CONFIG avoids GC
 MMIO during resume. JPEG stays independent of VCN idle.
 Quiescing/Waking markers precede the first await; cancellation, failed
 shutdown or failed restore prevents replay and keeps client VCN closed.
+A failed idle work run (`idle::gate_failed`) also withdraws the media rings
+from clients (`AMDGPU_INFO`), and graphics, compute and SDMA submission keep
+running: Linux's `amdgpu_vcn_idle_work_handler` ignores `set_pg_state`'s
+result. Device loss is left to the hang detector and the submitter's fence
+sampling.
 Recovery stops the worker before replacing the owner. Owned full shutdown
 uses `unsafe ColdBoot::stop_media().await`: callers block new publication,
 drain JPEG and retain all mappings/TMR; hardware stop precedes conditional
@@ -13119,7 +13142,12 @@ retains each connector's verified link keyed by its receiver caps
 `aux_timeout(index, us)`. `ColdBoot::{display_hpd_senses(),
 forget_display_link(i), display_link_cap(i, dpcd), check_display_link(),
 retrain_display(), stop_unplugged_display()}` serve the platform display
-monitor, which each pass (1 s, or woken by HPD/HPD-RX vectors): tears the lit
+monitor. It runs a pass only for an event, as Linux's HPD interrupt and atomic
+commit do: an HPD or HPD-RX vector, a DRM request or a recovery
+(`amdgpu_navi22_kms::wake`, which wakes the parked monitor). It arms a timer
+only where Linux polls: every 10 s (DRM_OUTPUT_POLL_PERIOD) while a connector
+has no HPD line or HPD interrupts could not be armed, and every second while
+BTR frame insertion runs (`ColdBoot::display_lfc_active`). Each pass tears the lit
 display down without AUX when its HPD falls (connector disconnected),
 re-detects every connector when any HPD changes or pulses (EDID inventory of
 dark connectors; a pulsed lit sink is stopped and relit), checks the lit DP
@@ -13952,8 +13980,11 @@ runtime operations, cancellation leaves the mailbox owner busy and terminal
 transport errors forbid reuse. No display/GFX clock policy is changed.
 
 Normal retained VCN5/JPEG5 clients also have independent static-power idle
-paths. A generation-bound 100 ms supervisor uses Linux's 1 s media idle
-delay. Under OWNER it requires each engine's physical fence and complete
+paths. A generation-bound supervisor uses Linux's 1 s media idle
+delay: it looks VCN_IDLE_TIMEOUT after an engine's last use, one timeout later
+while an engine stays awake, and parks with every engine gated or absent until
+`begin_media_use` wakes it (`ColdBoot::media_idle_recheck`,
+`amdgpu_navi48_media_power::next_idle_check`). Under OWNER it requires each engine's physical fence and complete
 RPTR drain, then its VCPU/LMI or JMI clean shutdown before the SMU power-down
 message. VCN idle retains the shared NBIO doorbell range even if JPEG is
 busy; JPEG can sleep while VCN remains active. The same supervisor retains

@@ -721,7 +721,13 @@ impl FileOps for TtyAcmFile {
     /// Push `buf` into the TX ring; the ACM supervisor pump
     /// drains it onto the device's bulk-OUT endpoint.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let n = self.port.lock().tx.push(buf);
+        let (n, index) = {
+            let mut port = self.port.lock();
+            (port.tx.push(buf), port.index)
+        };
+        if n > 0 {
+            crate::cdc_acm::kick_tty(index);
+        }
         Box::pin(async move { Ok(n) })
     }
 
@@ -864,13 +870,25 @@ impl FileOps for TtyAcmFile {
                     Ok(0)
                 }
                 TCXONC => {
-                    let mut p = self.port.lock();
-                    match arg {
-                        0 => p.tx_stopped = true,
-                        1 => p.tx_stopped = false,
-                        // 2/3 steer input flow; the CDC RX path
-                        // has no XON/XOFF gate to steer.
-                        _ => return Err(FsError::InvalidData),
+                    let restarted = {
+                        let mut p = self.port.lock();
+                        match arg {
+                            0 => {
+                                p.tx_stopped = true;
+                                None
+                            }
+                            1 => {
+                                p.tx_stopped = false;
+                                Some(p.index)
+                            }
+                            // 2/3 steer input flow; the CDC RX path
+                            // has no XON/XOFF gate to steer.
+                            _ => return Err(FsError::InvalidData),
+                        }
+                    };
+                    // Output restarted: queued bytes go out now.
+                    if let Some(index) = restarted {
+                        crate::cdc_acm::kick_tty(index);
                     }
                     Ok(0)
                 }

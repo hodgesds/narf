@@ -161,6 +161,26 @@ also consult upstream Linux GPL sources.
   bound after the supervisors start gets its own. The interrupt handler
   services every controller. System PM halts/resumes every controller, and
   class resume replays run per controller.
+- Each supervisor waits between cycles in `supervisor_wait::park`, which
+  ends on a kick of its controller: `Xhci::kick_supervisor()` (an API
+  caller with work for the supervisor's pumps), and internally every Port
+  Status Change Event, queued Transfer Event (a HID report, a hub
+  status-change completion) and controller error.
+  `Xhci::supervisor_kicks()` counts kicks and
+  `Xhci::port_status_events()` that controller's Port Status Change
+  Events. As Linux's `hub_wq`, the supervisor arms a timer only for a
+  deadline of its own (`supervisor_wait::next_deadline`, an hrtimer at
+  exactly that time): the earliest idle-suspend window ending
+  (`attach::next_idle_suspend_ns`; a vetoed or refused suspend restamps
+  the port, so it waits a new window), a re-sample every 8 ms on a
+  controller without MSI-X/MSI/INTx or every 250 ms while a hub has no
+  status-change endpoint, and a 100 ms retry of a controller reset that
+  could not run. With none of these it parks with no timer. A kick that
+  is only pump work (input, serial TX) runs the pumps and parks again; a
+  Port Status Change Event of its controller, a hub status-change report,
+  a deadline or a controller error runs a full cycle. A cycle does not
+  park while a root port or a hub port still has an attempt to make.
+  System resume kicks every supervisor (Linux `hub_activate(HUB_RESUME)`).
 - Runtime suspend dispatch is
   `class_registry::dispatch_suspend(controller, hub_slot, port)`;
   `UsbSuspendFn` receives the same three coordinates. r8152, CDC-NCM,
@@ -204,11 +224,19 @@ also consult upstream Linux GPL sources.
   status-change transfers (`attach::hub_status_changed`, which resubmits
   them and clears C_HUB_LOCAL_POWER / C_HUB_OVER_CURRENT for a hub-level
   change) and starts the next cycle at once when one reported a change
-  (`hub_irq` → `kick_hub_wq`). `connected_downstream_ports` acknowledges
-  each port's C_PORT_CONNECTION, C_PORT_ENABLE, C_PORT_OVER_CURRENT,
-  C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET, C_PORT_LINK_STATE and
-  C_PORT_CONFIG_ERROR (C_PORT_SUSPEND stays with the remote-wakeup
-  watch). The
+  (`hub_irq` → `kick_hub_wq`). `connected_downstream_ports(xhci,
+  suspended)` acknowledges each port's C_PORT_CONNECTION, C_PORT_ENABLE,
+  C_PORT_OVER_CURRENT, C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET,
+  C_PORT_LINK_STATE and C_PORT_CONFIG_ERROR, and C_PORT_SUSPEND on a port
+  not in `suspended` (the hub's `suspended_downstream`): there it only
+  marks a host resume completing (Linux `port_event`). A suspended port's
+  C_PORT_SUSPEND is a remote wakeup and stays with the wake watches. `HubBinding::walk_pending` marks a hub whose ports must be walked
+  (set at bind, by a status-change report, and kept while a port attempt
+  failed with retry budget left; `attach::set_walk_pending`);
+  `attach::hubs_to_walk` selects the hubs a cycle walks: those with a walk
+  pending, and hubs without a status-change endpoint (Linux `hub_event`
+  for a hub whose `event_bits` are set). The NIC and Bluetooth remote-wakeup watches run in a cycle
+  that walked a hub. The
   supervisor tries one root port per cycle but does not park while another
   connected, unclaimed port with retry budget remains
   (`enumeration_wait::root_ports_to_attempt`). Hub port power-on waits
@@ -476,6 +504,11 @@ also consult upstream Linux GPL sources.
   a lost completion cannot pin the entry), so an entry is never reused
   while the controller may fetch it. A Command Ring Stopped completion
   completes no receipt.
+- Each supervisor cycle acknowledges every root port's PORTSC change bits
+  (`Xhci::ack_root_port_changes`; the write keeps the port neutral: PED,
+  PR and LWS are never set), so the next connect, disconnect or link
+  change raises a new Port Status Change Event (xHCI 1.2 §4.19.2; Linux
+  `xhci_clear_port_change_bit`).
 - Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
   same as the hub-class reset) before the first SETUP, and Address Device
   waits 10 ms after its successful completion (Linux `hub_port_init`).
@@ -1171,7 +1204,12 @@ also consult upstream Linux GPL sources.
   (SET_DATA bit 14) and CP210x (AN571 `SET_BREAK`); PL2303 and
   CH341 break encodings are not modelled and return a typed
   `PortError::Unsupported`. TCXONC's TCOOFF parks the pump's TX
-  drain via the node's `tx_stopped` flag.
+  drain via the node's `tx_stopped` flag. A write, and TCXONC's TCOON,
+  call `serial::port::kick_tty(index)` (ttyACM: `cdc_acm::kick_tty`),
+  which kicks the supervisor of the controller the port is bound on, so
+  the bytes go out at once (Linux `usb_serial_generic_write` /
+  `acm_tty_write`). The pumps send one 64-byte chunk per pass and kick
+  again while bytes remain and output is not stopped.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
