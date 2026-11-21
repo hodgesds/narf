@@ -155,6 +155,16 @@ pub struct Dmub {
     write: u32,
     read: u32,
     poisoned: bool,
+    dpias: u8,
+}
+/// The USB4 DPIAs this DCN's firmware serves: `dcn314_resource.c` sets
+/// `usb4_dpia_count = 4`; `dcn315_resource.c` sets none, so Linux never sends
+/// Raphael's firmware a DPIA command, and neither does this.
+pub(crate) fn dpia_count(ip: &crate::amdgpu_discovery::IpBlock) -> u8 {
+    match (ip.major, ip.minor, ip.revision) {
+        (3, 1, 4) => 4,
+        _ => 0,
+    }
 }
 impl Dmub {
     /// # Safety
@@ -167,7 +177,7 @@ impl Dmub {
         }
         let base = ip.base_addrs[2] as u64 * 4;
         // SAFETY: inherited mapping and exclusive mailbox ownership.
-        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base) }
+        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base, dpia_count(ip)) }
     }
     /// # Safety
     /// Valid DCN314 mappings and exclusive DMUB ownership must outlive Self.
@@ -175,6 +185,7 @@ impl Dmub {
         regs: MmioRegion,
         fb: MmioRegion,
         base: u64,
+        dpias: u8,
     ) -> Result<Self, Error> {
         if base.checked_add(0x478 * 4).is_none_or(|end| end > regs.len) {
             return Err(Error::Invalid);
@@ -190,6 +201,7 @@ impl Dmub {
             write: 0,
             read: 0,
             poisoned: false,
+            dpias,
         };
         if d.reg(0x1f6) & (1 << 16) == 0 || d.reg(0x1e3) & 3 != 3 {
             return Err(Error::NotReady);
@@ -342,6 +354,10 @@ impl Dmub {
         let mut command = header(71, 0, 4);
         command[4] = 1;
         self.command(command).await.map(|_| ())
+    }
+    /// How many DPIAs the firmware serves (see [`dpia_count`]).
+    pub(crate) fn dpias(&self) -> u8 {
+        self.dpias
     }
     pub async fn hpd(&mut self, instance: u8, channel: Channel) -> Result<bool, Error> {
         let mut command = header(82, 0, 12);
@@ -625,6 +641,7 @@ pub(crate) mod tests {
             write: 0,
             read: 0,
             poisoned: false,
+            dpias: 4,
         };
         let mut cx = Context::from_waker(Waker::noop());
         for next in [64u32, 0, 64] {
@@ -700,4 +717,27 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/amdgpu-dmub", dmub_mailbox_bounds);
+
+    /// DCN 3.1.4 serves four DPIAs (`dcn314_resource.c`); DCN 3.1.5 serves none
+    /// (`dcn315_resource.c` sets no `usb4_dpia_count`), so the sink scan sends
+    /// Raphael's firmware no DPIA command.
+    fn dmub_dpia_count_follows_the_dcn() -> TestResult {
+        use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+        let ip = |revision| IpBlock {
+            hw_id: HW_ID_DCN,
+            instance: 0,
+            major: 3,
+            minor: 1,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 3,
+        };
+        if dpia_count(&ip(4)) != 4 || dpia_count(&ip(5)) != 0 {
+            return TestResult::Fail("DPIA count per DCN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu-dmub", dmub_dpia_count_follows_the_dcn);
 }

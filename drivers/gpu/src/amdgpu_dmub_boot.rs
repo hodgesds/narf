@@ -462,6 +462,7 @@ pub struct Loader {
     psp: Option<crate::amdgpu_psp_ring::Psp>,
     signed_instructions: Vec<u8>,
     toc: Vec<u8>,
+    dpias: u8,
 }
 impl Loader {
     /// Provision firmware storage using VBIOS reservations, current DMUB
@@ -592,6 +593,7 @@ impl Loader {
             transport: None,
             ownership: Some(ownership),
             psp: None,
+            dpias: amdgpu_dmub::dpia_count(ip),
             signed_instructions: Vec::new(),
             toc: Vec::new(),
         })
@@ -662,7 +664,7 @@ impl Loader {
             .authority
             .invoke(IoOp(|| {
                 // SAFETY: this loader owns the verified running DCN314 and all mappings.
-                unsafe { Dmub::attach_regions(io.regs, self.fb, io.base) }
+                unsafe { Dmub::attach_regions(io.regs, self.fb, io.base, self.dpias) }
             }))
             .map_err(|_| Error::Revoked)
             .and_then(|result| result.map_err(Error::Transport));
