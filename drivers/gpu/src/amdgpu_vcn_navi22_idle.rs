@@ -125,10 +125,26 @@ impl<I: Io> Engine<I> {
             self.runtime.phase = Phase::Awake;
             return Ok(false);
         }
-        self.stop_instances().await?;
-        self.runtime.gated = pm
-            .power([self.vcn[0].is_some(), self.vcn[1].is_some()], false)
-            .await?;
+        let started = narf_time::monotonic_ns();
+        {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::PriorityWriter::<7>,
+                "amdgpu: navi22 VCN idle gate: stopping the engines and powering them off"
+            );
+        }
+        let result = match self.stop_instances().await {
+            Ok(()) => {
+                pm.power([self.vcn[0].is_some(), self.vcn[1].is_some()], false)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        note_gate(GateTrace {
+            elapsed_ns: narf_time::monotonic_ns().saturating_sub(started),
+            result,
+        });
+        self.runtime.gated = result?;
         self.runtime.phase = Phase::Asleep;
         MEDIA_ASLEEP.store(true, Ordering::Release);
         Ok(true)
@@ -200,6 +216,62 @@ impl<I: Io> Engine<I> {
         self.runtime.phase = Phase::Awake;
         Ok(())
     }
+}
+
+/// One idle gate attempt that reached the engine stop and PMFW power-off
+/// (`vcn_v3_0_stop` + `amdgpu_dpm_enable_vcn(false)`): how long it took and
+/// how it ended (`Ok(gated)`: whether PMFW gated the engines).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GateTrace {
+    pub elapsed_ns: u64,
+    pub result: Result<bool, Error>,
+}
+
+/// A gate attempt slower than this is reported above debug level.
+const GATE_SLOW_NS: u64 = 100_000_000;
+
+static LAST_GATE: narf_lib::sync::IrqSafeSpinLock<Option<GateTrace>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The most recent gate attempt.
+pub(crate) fn last_gate() -> Option<GateTrace> {
+    *LAST_GATE.lock()
+}
+
+/// Console level of a gate attempt's report: debug, unless it failed (err)
+/// or took longer than [`GATE_SLOW_NS`] (warning).
+pub(crate) fn gate_level(trace: &GateTrace) -> u32 {
+    if trace.result.is_err() {
+        3
+    } else if trace.elapsed_ns > GATE_SLOW_NS {
+        4
+    } else {
+        7
+    }
+}
+
+/// Record and report the end of a gate attempt.
+fn note_gate(trace: GateTrace) {
+    use core::fmt::Write;
+    *LAST_GATE.lock() = Some(trace);
+    let (ms, us) = (
+        trace.elapsed_ns / 1_000_000,
+        trace.elapsed_ns / 1_000 % 1_000,
+    );
+    let _ = match (gate_level(&trace), trace.result) {
+        (_, Err(error)) => writeln!(
+            narf_console::PriorityWriter::<3>,
+            "amdgpu: navi22 VCN idle gate failed after {ms}.{us:03} ms: {error:?}"
+        ),
+        (4, Ok(gated)) => writeln!(
+            narf_console::PriorityWriter::<4>,
+            "amdgpu: navi22 VCN idle gate took {ms}.{us:03} ms (power gated: {gated})"
+        ),
+        (_, Ok(gated)) => writeln!(
+            narf_console::PriorityWriter::<7>,
+            "amdgpu: navi22 VCN idle gate done in {ms}.{us:03} ms (power gated: {gated})"
+        ),
+    };
 }
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);

@@ -1917,3 +1917,53 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_dpg_failures_are_terminal
 );
+
+/// Every idle gate attempt that reaches the engine stop and the PMFW
+/// power-off is traced with its duration and outcome, and reported at debug
+/// level unless it failed (err) or took over 100 ms (warning): the gate runs
+/// about a second after the last media use, holding the platform owner.
+fn vcn3_idle_gate_attempts_are_traced_with_their_duration() -> TestResult {
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    run(e.idle(&mut pm, 0)).unwrap();
+    if !run(e.idle(&mut pm, 1_000_000_000)).unwrap() {
+        return TestResult::Fail("idle engines did not gate");
+    }
+    let Some(gated) = idle::last_gate() else {
+        return TestResult::Fail("gate attempt not traced");
+    };
+    if gated.result != Ok(true) || gated.elapsed_ns >= 100_000_000 {
+        return TestResult::Fail("gate trace outcome or duration");
+    }
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    run(e.idle(&mut pm, 0)).unwrap();
+    pm.fail = true;
+    if run(e.idle(&mut pm, 1_000_000_000)).is_ok() {
+        return TestResult::Fail("failed power-off reported success");
+    }
+    if !idle::last_gate().is_some_and(|t| t.result.is_err()) {
+        return TestResult::Fail("failed gate attempt not traced");
+    }
+    let quick = idle::GateTrace {
+        elapsed_ns: 2_000_000,
+        result: Ok(true),
+    };
+    let slow = idle::GateTrace {
+        elapsed_ns: 150_000_000,
+        ..quick
+    };
+    let failed = idle::GateTrace {
+        result: Err(Error::Timeout),
+        ..quick
+    };
+    if idle::gate_level(&quick) != 7
+        || idle::gate_level(&slow) != 4
+        || idle::gate_level(&failed) != 3
+    {
+        return TestResult::Fail("gate report level");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/idle-gate",
+    vcn3_idle_gate_attempts_are_traced_with_their_duration
+);
