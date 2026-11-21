@@ -1664,6 +1664,11 @@ unprivileged one-ID exception uses the opener's effective UID/GID. Offset must
 be zero and the write shorter than a page. The map's second column is rendered
 in the opener's namespace, or the target's parent when opened from the target.
 Writable `setgroups` opens require target CAP_SYS_ADMIN and capture that grant.
+A `setgroups` write is then refused only by the namespace's state — `allow`
+after `deny`, or `deny` once a gid_map exists — so in the initial namespace
+`allow` succeeds and `deny` is `EPERM`. Opening an id-map file with
+`O_CREAT|O_TRUNC` (Python `open(path, "w")`, a shell `>` redirect) is accepted
+and behaves as a plain write-only open.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.
