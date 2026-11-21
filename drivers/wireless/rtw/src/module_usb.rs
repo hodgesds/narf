@@ -1,21 +1,22 @@
-//! Stage 1 of the rtw88-USB loadable-module datapath — enumerate + Realtek
-//! control proof. See `drivers/wireless/specification/rtw88-usb-module-datapath.md`.
+//! rtw88-USB loadable-module datapath — enumerate, chip-config read, and
+//! firmware download. See `drivers/wireless/specification/rtw88-usb-module-datapath.md`.
 //!
-//! `probe_c` drives a real rtw88 USB device entirely through the `narf_usb_*`
-//! C-ABI (no kernel crates, so the `.ko`'s undefined-symbol set stays within
-//! the exported ABI): it fetches the configuration descriptor, configures the
-//! first interface's bulk IN/OUT endpoints, then reads the chip's
-//! `REG_SYS_CFG1` via the Realtek vendor control request (`bmRequestType 0xC0`,
-//! `bRequest 0x05`, `wValue = addr`). Reaching the `UP` stage with a plausible
-//! chip-config word proves the module speaks to the device.
+//! The per-chip probe (`probe_8821cu`/`probe_8822bu`) drives a real rtw88 USB
+//! device entirely through the exported C-ABI (no kernel crates, so the `.ko`'s
+//! undefined-symbol set stays within the ABI):
 //!
-//! Firmware download, MAC/PHY/IQK/station bring-up, netdev publication and the
-//! cfg80211 control plane are later stages. Firmware in particular needs a
-//! `narf_firmware_*` blob-fetch export that does not exist yet.
+//! 1. **Enumerate** (event-driven, mirroring `drivers/usb/ftdi`: one
+//!    outstanding URB advanced from `on_event` under a per-device busy lock) —
+//!    configuration descriptor, bulk IN/OUT endpoint configuration, and a
+//!    Realtek `REG_SYS_CFG1` read (vendor control `0xC0`/`0x05`/`wValue=addr`).
+//! 2. **Firmware download** (synchronous: `narf_usb_wait`) — fetch the chip's
+//!    firmware blob via `narf_firmware_*`, validate the image header, then DDMA
+//!    every section to the chip (`run`/`section`/`page`, ported from
+//!    `firmware_transport.rs`/`usb_firmware.rs`) over `narf_usb_*` EP0 control
+//!    + BEACON reserved-page bulk writes.
 //!
-//! The state machine mirrors `drivers/usb/ftdi` (one outstanding URB per
-//! device, advanced from the `on_event` completion callback under a per-device
-//! busy lock).
+//! MAC/PHY/IQK/station bring-up, netdev publication and the cfg80211 control
+//! plane are the remaining stages.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -25,6 +26,8 @@ const MATCH_VENDOR_PRODUCT: u16 = 1 << 0;
 /// Realtek vendor control: IN request type and the register command request
 /// (`narf_drivers_wireless_rtl_usb::{REALTEK_USB_READ, REALTEK_USB_CMD_REQ}`).
 const REALTEK_USB_READ: u8 = 0xC0;
+/// Realtek vendor control: OUT request type for register writes.
+const REALTEK_USB_WRITE: u8 = 0x40;
 const REALTEK_USB_CMD_REQ: u8 = 0x05;
 /// `rtw88::usb::REG_SYS_CFG1` — the chip-configuration word read as the
 /// enumerate proof (32-bit).
@@ -97,7 +100,18 @@ const ST_READ_CFG: u32 = 2;
 const ST_UP: u32 = 3;
 /// Firmware blob fetched (`narf_firmware_*`) and its header validated.
 const ST_FW_PARSED: u32 = 4;
+/// Firmware sections written to the chip and the MCU released (download done).
+const ST_FW_DOWNLOADED: u32 = 5;
 const ST_FAILED: u32 = 0xff;
+
+/// rtw88 TX descriptor length / firmware page size (`usb::TX_DESC`, `fw` page).
+const TX_DESC: usize = 48;
+const FW_PAGE: usize = 4096;
+/// BEACON transmit queue selector for reserved-page firmware writes
+/// (`usb::QSEL_BEACON`).
+const QSEL_BEACON: u8 = 0x10;
+/// Synchronous per-transfer wait, matching the native 2 s download cap.
+const USB_WAIT_NS: u64 = 2_000_000_000;
 /// Single outstanding-URB event kind (one request in flight per device).
 const EV_SETUP: u64 = 1;
 
@@ -140,6 +154,17 @@ unsafe extern "C" {
         out_urb: *mut u64,
     ) -> i32;
     fn narf_usb_poll(dev: u64, urb: u64, buf: *mut u8, len: usize, out_len: *mut usize) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn narf_usb_submit(
+        dev: u64,
+        endpoint: u8,
+        data: *const u8,
+        len: usize,
+        callback: usize,
+        cookie: u64,
+        out_urb: *mut u64,
+    ) -> i32;
+    fn narf_usb_wait(dev: u64, urb: u64, timeout_ns: u64) -> i32;
     fn narf_firmware_open(
         name: *const u8,
         name_len: usize,
@@ -180,11 +205,26 @@ fn word(bytes: &[u8], off: usize) -> Option<u32> {
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+/// One downloadable firmware section: a chip memory `address` and the blob
+/// byte range (`blob_off`..`blob_off+len`) carrying its body + 8-byte checksum.
+#[derive(Clone, Copy, Default)]
+struct FwSection {
+    address: u32,
+    blob_off: u32,
+    len: u32,
+}
+
 /// Validate the 64-byte rtw88 firmware header for `did` against the total blob
-/// `size`, returning the firmware version. A faithful header-level port of
-/// `firmware_transport.rs::parse` (section OCP bases/sizes + checksum trailers
-/// must exactly span the blob); it does not copy the section bodies.
-fn parse_fw_header(did: u16, header: &[u8], size: usize) -> Result<u16, ()> {
+/// `size`, filling `sections` with the enabled sections and returning
+/// `(version, count)`. A faithful port of `firmware_transport.rs::parse`
+/// (section OCP bases/sizes + checksum trailers must exactly span the blob);
+/// it records byte ranges rather than copying bodies.
+fn parse_fw_header(
+    did: u16,
+    header: &[u8],
+    size: usize,
+    sections: &mut [FwSection; 3],
+) -> Result<(u16, usize), ()> {
     let signature: [u8; 2] = match did {
         0xC821 => [0x21, 0x88],
         0xB822 => [0x22, 0x88],
@@ -198,13 +238,14 @@ fn parse_fw_header(did: u16, header: &[u8], size: usize) -> Result<u16, ()> {
     }
     let imem_base = if did == 0xB822 { 0 } else { 0x30000 };
     let has_emem = header[0x18] & 0x10 != 0 && word(header, 0x34).ok_or(())? != 0;
-    // (kind base, limit, size-field, address-field, enabled)
+    // (base, limit, size-field, address-field, enabled)
     let plan = [
         (0x20_0000u32, 0x30_0000u32, 0x24usize, 0x20usize, true),
         (imem_base, 0x10_0000, 0x30, 0x3c, true),
         (0x10_0000, 0x20_0000, 0x34, 0x38, has_emem),
     ];
-    let mut offset = FW_HEADER;
+    let mut offset = FW_HEADER as u32;
+    let mut count = 0usize;
     for (base, limit, size_at, addr_at, enabled) in plan {
         if !enabled {
             continue;
@@ -218,13 +259,19 @@ fn parse_fw_header(did: u16, header: &[u8], size: usize) -> Result<u16, ()> {
         {
             return Err(());
         }
-        offset = offset.checked_add(length as usize).ok_or(())?;
+        sections[count] = FwSection {
+            address,
+            blob_off: offset,
+            len: length,
+        };
+        count += 1;
+        offset = offset.checked_add(length).ok_or(())?;
     }
     // The header's sections + checksums must span exactly the blob.
-    if offset != size {
+    if offset as usize != size {
         return Err(());
     }
-    Ok(u16::from_le_bytes([header[4], header[5]]))
+    Ok((u16::from_le_bytes([header[4], header[5]]), count))
 }
 
 /// One claimed USB device's enumerate state. One outstanding URB at a time,
@@ -463,11 +510,14 @@ fn on_setup(dev: &Device, slot: usize) {
             dev.chip_cfg
                 .store(u32::from_le_bytes(buf), Ordering::Release);
             dev.stage.store(ST_UP, Ordering::Release);
-            // Enumeration proven; fetch + validate the firmware blob. The
-            // `narf_firmware_*` calls are synchronous (no URB), so this runs
-            // inline on this completion.
-            if fetch_and_parse_firmware(dev) {
-                dev.stage.store(ST_FW_PARSED, Ordering::Release);
+            // Enumeration proven. Fetch the firmware over `narf_firmware_*`,
+            // validate its header, and DDMA every section to the chip over
+            // `narf_usb_*`. Firmware fetch and the download transfers are
+            // synchronous (poll/wait), so the whole stage runs inline on this
+            // completion.
+            dev.stage.store(ST_FW_PARSED, Ordering::Release);
+            if firmware_download(dev) {
+                dev.stage.store(ST_FW_DOWNLOADED, Ordering::Release);
             } else {
                 dev.stage.store(ST_FAILED, Ordering::Release);
             }
@@ -476,37 +526,342 @@ fn on_setup(dev: &Device, slot: usize) {
     }
 }
 
-/// Fetch this chip's firmware through the `narf_firmware_*` ABI and validate
-/// its header. The section-download to the chip (cpu reset, download-enable,
-/// reserved-page bulk writes, checksum) is the next sub-stage.
-fn fetch_and_parse_firmware(dev: &Device) -> bool {
+// ── Synchronous narf_usb_* register I/O ─────────────────────────────────────
+//
+// The firmware download is a long, task-context sequence of short EP0/bulk
+// transfers. Rather than thread each through the `on_event` state machine, it
+// submits with no callback and blocks on `narf_usb_wait` — a synchronous
+// `UsbControl`/`Bulk` over the C-ABI (used by the download; also the basis for
+// the later MAC/PHY/station stages).
+
+/// Submit result: wait for the URB and consume it, optionally into `buf`.
+fn sync_done(token: u64, urb: u64, buf: *mut u8, len: usize) -> bool {
+    // SAFETY: `urb` came from a submit on `token`; wait blocks until terminal.
+    if unsafe { narf_usb_wait(token, urb, USB_WAIT_NS) } != 0 {
+        return false;
+    }
+    let mut n = 0usize;
+    // SAFETY: `buf` is writable for `len` (or null/0); `n` is writable.
+    unsafe { narf_usb_poll(token, urb, buf, len, &mut n) == 0 }
+}
+
+/// Realtek EP0 register write of `data` (1/2/4 bytes) at `addr`.
+fn ctl_out(token: u64, addr: u16, data: &[u8]) -> bool {
+    let [a0, a1] = addr.to_le_bytes();
+    let [l0, l1] = (data.len() as u16).to_le_bytes();
+    let setup = [REALTEK_USB_WRITE, REALTEK_USB_CMD_REQ, a0, a1, 0, 0, l0, l1];
+    let mut urb = 0u64;
+    // SAFETY: `setup` is 8 bytes; `data` is `len` readable; callback 0 (we
+    // poll). The kernel copies before returning.
+    let rc = unsafe {
+        narf_usb_control(
+            token,
+            setup.as_ptr(),
+            data.as_ptr(),
+            data.len(),
+            0,
+            0,
+            &mut urb,
+        )
+    };
+    rc == 0 && sync_done(token, urb, core::ptr::null_mut(), 0)
+}
+
+/// Realtek EP0 register read of `out.len()` (1/2/4) bytes at `addr`.
+fn ctl_in(token: u64, addr: u16, out: &mut [u8]) -> bool {
+    let [a0, a1] = addr.to_le_bytes();
+    let [l0, l1] = (out.len() as u16).to_le_bytes();
+    let setup = [REALTEK_USB_READ, REALTEK_USB_CMD_REQ, a0, a1, 0, 0, l0, l1];
+    let mut urb = 0u64;
+    // SAFETY: `setup` 8 bytes; IN request (no OUT data stage); callback 0.
+    let rc =
+        unsafe { narf_usb_control(token, setup.as_ptr(), core::ptr::null(), 0, 0, 0, &mut urb) };
+    rc == 0 && sync_done(token, urb, out.as_mut_ptr(), out.len())
+}
+
+/// Synchronous bulk-OUT of `data` on `ep`.
+fn bulk_out(token: u64, ep: u8, data: &[u8]) -> bool {
+    let mut urb = 0u64;
+    // SAFETY: `data` is `len` readable; callback 0 (we poll).
+    let rc = unsafe { narf_usb_submit(token, ep, data.as_ptr(), data.len(), 0, 0, &mut urb) };
+    rc == 0 && sync_done(token, urb, core::ptr::null_mut(), 0)
+}
+
+fn reg_read8(t: u64, a: u16) -> Option<u8> {
+    let mut b = [0u8; 1];
+    ctl_in(t, a, &mut b).then_some(b[0])
+}
+fn reg_read16(t: u64, a: u16) -> Option<u16> {
+    let mut b = [0u8; 2];
+    ctl_in(t, a, &mut b).then(|| u16::from_le_bytes(b))
+}
+fn reg_read32(t: u64, a: u16) -> Option<u32> {
+    let mut b = [0u8; 4];
+    ctl_in(t, a, &mut b).then(|| u32::from_le_bytes(b))
+}
+fn reg_write8(t: u64, a: u16, v: u8) -> Option<()> {
+    ctl_out(t, a, &v.to_le_bytes()).then_some(())
+}
+fn reg_write16(t: u64, a: u16, v: u16) -> Option<()> {
+    ctl_out(t, a, &v.to_le_bytes()).then_some(())
+}
+fn reg_write32(t: u64, a: u16, v: u32) -> Option<()> {
+    ctl_out(t, a, &v.to_le_bytes()).then_some(())
+}
+fn reg_update8(t: u64, a: u16, clear: u8, set: u8) -> Option<()> {
+    let v = reg_read8(t, a)?;
+    reg_write8(t, a, v & !clear | set)
+}
+/// Poll a 32-bit register until `value & mask == target` (`firmware_transport
+/// ::poll`): up to 1000 reads, `u32::MAX` means the device vanished.
+fn reg_poll32(t: u64, a: u16, mask: u32, target: u32) -> Option<()> {
+    for _ in 0..1000 {
+        let v = reg_read32(t, a)?;
+        if v == u32::MAX {
+            return None;
+        }
+        if v & mask == target {
+            return Some(());
+        }
+    }
+    None
+}
+
+// ── Freestanding mem intrinsics ─────────────────────────────────────────────
+//
+// `build-module` extracts only this crate's objects (dropping the
+// `compiler_builtins` members), and the `nm -u` gate permits only the KSYMTAB
+// C-ABI as undefined — so a `.ko` must carry any `memset`/`memcpy` it needs.
+// The firmware-page assembly zero-pads a descriptor buffer, which aarch64
+// codegen lowers to `memset`. These volatile-loop definitions satisfy it; the
+// `write_volatile` prevents LLVM from folding the loop back into a `memset`
+// call (self-recursion). Firmware download is not perf-critical.
+
+/// # Safety
+/// `dest` names `n` writable bytes.
+#[no_mangle]
+unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        // SAFETY: `i < n` and the caller guarantees `n` writable bytes.
+        unsafe { core::ptr::write_volatile(dest.add(i), c as u8) };
+        i += 1;
+    }
+    dest
+}
+
+/// # Safety
+/// `dest` and `src` name `n` writable/readable bytes and do not overlap.
+#[no_mangle]
+unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        // SAFETY: `i < n`; caller guarantees the ranges and non-overlap.
+        unsafe { core::ptr::write_volatile(dest.add(i), core::ptr::read(src.add(i))) };
+        i += 1;
+    }
+    dest
+}
+
+// ── TX descriptor + reserved-page firmware write ────────────────────────────
+
+/// `usb::descriptor`/`fill_checksum` for a reserved-page BEACON firmware write.
+///
+/// Returned as an explicit element literal (not a zero-filled `[0u8; N]`) so
+/// the `.ko` emits no `memset`. Only W0 (bytes 0..4) and W1 (4..8) are nonzero
+/// in the first 32 bytes, so the word-7 XOR checksum is computed arithmetically
+/// instead of by scanning the buffer.
+fn beacon_descriptor(size: u16) -> [u8; TX_DESC] {
+    // W0: TXPKTSIZE | OFFSET(TX_DESC) << 16 | LS << 26.
+    let w0 = u32::from(size) | (TX_DESC as u32) << 16 | 1 << 26;
+    // W1: QSEL(BEACON) << 8 (BEACON is not QSEL_HIGH, so no MORE_DATA).
+    let w1 = u32::from(QSEL_BEACON & 0x1f) << 8;
+    // `fill_checksum` XORs the eight u16 halves of bytes 0..32; only W0/W1 are
+    // nonzero (word-7's low 16 bits start at zero), so the sum is their halves.
+    let sum = (w0 as u16) ^ ((w0 >> 16) as u16) ^ (w1 as u16) ^ ((w1 >> 16) as u16);
+    let [a, b, c, d] = w0.to_le_bytes();
+    let [e, f, g, h] = w1.to_le_bytes();
+    let [s0, s1] = sum.to_le_bytes();
+    [
+        a, b, c, d, e, f, g, h, // bytes 0..8  (W0, W1)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // bytes 8..28 (20)
+        s0, s1, 0, 0, // bytes 28..32 (word-7: checksum low 16, high 16 = 0)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // bytes 32..48 (16)
+    ]
+}
+
+/// `usb_firmware.rs::page`: write one reserved-page firmware chunk (`want`
+/// bytes, ≤ one page, read straight from the firmware `handle` at `blob_off`)
+/// to the BEACON pipe and wait for a fresh BCN_VALID receipt.
+///
+/// The packet is assembled in an uninitialised buffer — the descriptor is
+/// written in place and the firmware body is copied by the kernel directly
+/// into the buffer via `narf_firmware_read` — so the `.ko` emits no `memset`
+/// or `memcpy` (`build-module` drops the `compiler_builtins` mem objects).
+fn write_page(token: u64, ep: u8, handle: u64, blob_off: u32, want: usize) -> Option<()> {
+    let beacon = reg_read8(token, 0x550)?;
+    reg_write16(token, 0x204, 1 << 15)?;
+    if reg_read16(token, 0x204)? & 1 << 15 != 0 {
+        return None;
+    }
+    let cr = reg_read8(token, 0x101)?;
+    reg_write8(token, 0x101, cr | 1)?;
+    reg_write8(token, 0x550, beacon & !8 | 16)?;
+
+    // `usb::reserved_page_packet`: descriptor + data, grown by one pad byte
+    // when descriptor+payload is a 512-byte multiple.
+    let mut size = want;
+    if (size + TX_DESC) & 511 == 0 {
+        size += 1;
+    }
+    let total = TX_DESC + size;
+    if want > FW_PAGE || total > TX_DESC + FW_PAGE + 1 {
+        return None;
+    }
+    let mut packet = core::mem::MaybeUninit::<[u8; TX_DESC + FW_PAGE + 1]>::uninit();
+    let base = packet.as_mut_ptr().cast::<u8>();
+    let desc = beacon_descriptor(size as u16);
+    // SAFETY: `base` owns TX_DESC+FW_PAGE+1 bytes; `desc` is TX_DESC bytes; the
+    // const-size copy inlines (no `memcpy`).
+    unsafe { core::ptr::copy_nonoverlapping(desc.as_ptr(), base, TX_DESC) };
+    let mut got = 0usize;
+    // SAFETY: `base + TX_DESC` is writable for `want` (< buffer); `got` writable.
+    let rc = unsafe {
+        narf_firmware_read(
+            handle,
+            u64::from(blob_off),
+            base.add(TX_DESC),
+            want,
+            &mut got,
+        )
+    };
+    if rc != 0 || got != want {
+        return None;
+    }
+    if size > want {
+        // SAFETY: single pad byte inside the buffer.
+        unsafe { base.add(TX_DESC + want).write(0) };
+    }
+    // SAFETY: bytes [0, total) are all initialised (descriptor + body + pad).
+    let packet = unsafe { core::slice::from_raw_parts(base, total) };
+    if !bulk_out(token, ep, packet) {
+        return None;
+    }
+    // BCN_VALID (REG_FIFOPAGE_CTRL_2 bit 15) proves the page landed.
+    reg_poll32(token, 0x204, 1 << 15, 1 << 15)
+}
+
+/// `firmware_transport.rs::section`: DDMA one firmware section's body (streamed
+/// from the firmware handle in page-sized chunks) to chip memory `address`.
+fn write_section(token: u64, ep: u8, handle: u64, section: &FwSection) -> Option<()> {
+    let control = reg_read32(token, 0x1208)?;
+    if control == u32::MAX {
+        return None;
+    }
+    reg_write32(token, 0x1208, control | 1 << 25)?;
+    let mut done = 0u32;
+    let mut part = 0u32;
+    while done < section.len {
+        let want = (section.len - done).min(FW_PAGE as u32) as usize;
+        write_page(token, ep, handle, section.blob_off + done, want)?;
+        reg_poll32(token, 0x1208, 1 << 31, 0)?;
+        let control = 1 << 31 | 1 << 29 | if part != 0 { 1 << 24 } else { 0 } | want as u32;
+        reg_write32(token, 0x1200, 0x1878_0000 + 48)?;
+        reg_write32(token, 0x1204, section.address + part * FW_PAGE as u32)?;
+        reg_write32(token, 0x1208, control)?;
+        reg_poll32(token, 0x1208, 1 << 31, 0)?;
+        done += want as u32;
+        part += 1;
+    }
+    let control = reg_read8(token, 0x80)?;
+    if reg_read32(token, 0x1208)? & 1 << 27 != 0 {
+        return None; // checksum
+    }
+    let bits = if section.address < 0x200000 {
+        0x18
+    } else {
+        0x60
+    };
+    reg_write8(token, 0x80, control | bits)
+}
+
+/// `firmware_transport.rs::run`: bring the 8051 down, DDMA every section, then
+/// release the MCU and wait for the firmware-ready report.
+fn run_download(
+    token: u64,
+    ep: u8,
+    handle: u64,
+    sections: &[FwSection; 3],
+    count: usize,
+) -> Option<()> {
+    // CPU down (`cpu(false)`): clear FEN_CPUEN then SYS_FUNC_EN FWDL.
+    reg_update8(token, 3, 4, 0)?;
+    reg_update8(token, 0x1d, 1, 0)?;
+    // Download-enable preamble (`run`): toggle MCUFWDL + checksum init.
+    reg_update8(token, 0x1082, 1, 0)?;
+    reg_update8(token, 9, 0x40, 0)?;
+    reg_update8(token, 0x1082, 0, 1)?;
+    reg_update8(token, 9, 0, 0x40)?;
+    let control = reg_read16(token, 0x80)? & 0x3800 | 1;
+    reg_write16(token, 0x80, control)?;
+    for section in &sections[..count] {
+        write_section(token, ep, handle, section)?;
+    }
+    reg_write32(token, 0x210, 4)?;
+    let control = reg_read16(token, 0x80)?;
+    if control & 0x50 != 0x50 {
+        return None; // checksum report
+    }
+    reg_write16(token, 0x80, (control | 1 << 14) & !1)?;
+    // CPU up (`cpu(true)`): SYS_FUNC_EN FWDL then FEN_CPUEN.
+    reg_update8(token, 0x1d, 0, 1)?;
+    reg_update8(token, 3, 0, 4)?;
+    // Firmware-ready report; a timeout here (`Error::Ready`) is tolerated.
+    let _ = reg_poll32(token, 0x80, 0xffff & !0x3000, 0xc078);
+    // Close the MAC/DMA gates (`finish_dma`).
+    let cr = reg_read8(token, 0x100)?;
+    reg_write8(token, 0x100, cr & !0xcf)?;
+    for register in [0xb0, 0xb8, 0x10b8] {
+        reg_write32(token, register, 0)?;
+    }
+    Some(())
+}
+
+/// Fetch the chip firmware through `narf_firmware_*`, validate the header, and
+/// DDMA every section to the chip over `narf_usb_*`. Returns true once the
+/// firmware-ready gate is closed.
+fn firmware_download(dev: &Device) -> bool {
     let did = dev.did.load(Ordering::Acquire) as u16;
+    let token = dev.token.load(Ordering::Acquire);
+    let ep = dev.bulk_out.load(Ordering::Acquire) as u8;
     let Some(name) = fw_name(did) else {
         return false;
     };
     let mut handle = 0u64;
     let mut size = 0usize;
     // SAFETY: `name` is 'static readable; `handle`/`size` are writable.
-    let rc = unsafe { narf_firmware_open(name.as_ptr(), name.len(), &mut handle, &mut size) };
-    if rc != 0 {
+    if unsafe { narf_firmware_open(name.as_ptr(), name.len(), &mut handle, &mut size) } != 0 {
         return false;
     }
-    let mut header = [0u8; FW_HEADER];
-    let mut got = 0usize;
-    // SAFETY: `header` is writable for its length; `got` is writable.
-    let rc = unsafe { narf_firmware_read(handle, 0, header.as_mut_ptr(), header.len(), &mut got) };
+    let ok = (|| {
+        let mut header = [0u8; FW_HEADER];
+        let mut got = 0usize;
+        // SAFETY: `header` is writable for its length; `got` writable.
+        let rc =
+            unsafe { narf_firmware_read(handle, 0, header.as_mut_ptr(), header.len(), &mut got) };
+        if rc != 0 || got < FW_HEADER {
+            return false;
+        }
+        let mut sections = [FwSection::default(); 3];
+        let Ok((version, count)) = parse_fw_header(did, &header, size, &mut sections) else {
+            return false;
+        };
+        dev.fw_version.store(u32::from(version), Ordering::Release);
+        run_download(token, ep, handle, &sections, count).is_some()
+    })();
     // SAFETY: `handle` came from the matching open above.
     let close = unsafe { narf_firmware_close(handle) };
-    if rc != 0 || got < FW_HEADER || close != 0 {
-        return false;
-    }
-    match parse_fw_header(did, &header, size) {
-        Ok(version) => {
-            dev.fw_version.store(u32::from(version), Ordering::Release);
-            true
-        }
-        Err(()) => false,
-    }
+    ok && close == 0
 }
 
 extern "C" fn on_event(cookie: u64) -> i32 {
