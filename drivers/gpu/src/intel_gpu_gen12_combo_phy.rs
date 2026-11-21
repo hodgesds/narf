@@ -79,9 +79,17 @@ const fn e(swing: u8, n: u8, cursor: u8, pc2: u8, pc1: u8) -> IclEntry {
 // Every table is transcribed verbatim; the entry comments in the
 // C source (nominal/transition mV, dB) are omitted — the values
 // are the ground truth and the selection tests pin them.
+//
+// The tables are `static`, not `const`, on purpose: eDP HBR3
+// selects the DP HBR2/HBR3 table by address, and a `const`
+// array has no unique address — each use site may materialize
+// its own copy, so a pointer-alias assertion against a `const`
+// fails in a multi-CGU build (kt-gpu regression, run
+// 44933361128). A `static` has exactly one address, so the
+// alias is real in every build.
 
 // Tiger Lake DP up to HBR (`tgl_combo_phy_trans_dp_hbr`).
-const TGL_DP_HBR: [IclEntry; 10] = [
+static TGL_DP_HBR: [IclEntry; 10] = [
     e(0xA, 0x32, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x71, 0x2F, 0x00, 0x10),
@@ -95,7 +103,7 @@ const TGL_DP_HBR: [IclEntry; 10] = [
 ];
 
 // Tiger Lake DP HBR2 (`tgl_combo_phy_trans_dp_hbr2`).
-const TGL_DP_HBR2: [IclEntry; 10] = [
+static TGL_DP_HBR2: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x63, 0x2F, 0x00, 0x10),
@@ -109,7 +117,7 @@ const TGL_DP_HBR2: [IclEntry; 10] = [
 ];
 
 // Tiger Lake UY DP HBR2 (`tgl_uy_combo_phy_trans_dp_hbr2`).
-const TGL_UY_DP_HBR2: [IclEntry; 10] = [
+static TGL_UY_DP_HBR2: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x36, 0x00, 0x09),
     e(0xC, 0x60, 0x32, 0x00, 0x0D),
@@ -126,11 +134,11 @@ const TGL_UY_DP_HBR2: [IclEntry; 10] = [
 // 9 entries): the HOBL entry cloned to every level, per the C
 // comment — "to comply with the voltage and pre-emphasis
 // entries that DisplayPort specification requires".
-const TGL_EDP_HBR2_HOBL: [IclEntry; 9] = [e(0x6, 0x7F, 0x3F, 0x00, 0x00); 9];
+static TGL_EDP_HBR2_HOBL: [IclEntry; 9] = [e(0x6, 0x7F, 0x3F, 0x00, 0x00); 9];
 
 // Shared ICL DP HBR2 / eDP HBR3
 // (`icl_combo_phy_trans_dp_hbr2_edp_hbr3`).
-const ICL_DP_HBR2_EDP_HBR3: [IclEntry; 10] = [
+static ICL_DP_HBR2_EDP_HBR3: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x71, 0x2F, 0x00, 0x10),
@@ -144,7 +152,7 @@ const ICL_DP_HBR2_EDP_HBR3: [IclEntry; 10] = [
 ];
 
 // Shared ICL eDP HBR2 (`icl_combo_phy_trans_edp_hbr2`).
-const ICL_EDP_HBR2: [IclEntry; 10] = [
+static ICL_EDP_HBR2: [IclEntry; 10] = [
     e(0x0, 0x7F, 0x3F, 0x00, 0x00),
     e(0x8, 0x7F, 0x38, 0x00, 0x07),
     e(0x1, 0x7F, 0x33, 0x00, 0x0C),
@@ -159,7 +167,7 @@ const ICL_EDP_HBR2: [IclEntry; 10] = [
 
 // Shared ICL HDMI (`icl_combo_phy_trans_hdmi`, 7 entries).
 // `hdmi_default_entry` is the last entry (index 6).
-const ICL_HDMI: [IclEntry; 7] = [
+static ICL_HDMI: [IclEntry; 7] = [
     e(0xA, 0x60, 0x3F, 0x00, 0x00),
     e(0xB, 0x73, 0x36, 0x00, 0x09),
     e(0x6, 0x7F, 0x31, 0x00, 0x0E),
@@ -175,7 +183,7 @@ const ICL_HDMI: [IclEntry; 7] = [
 const HDMI_DEFAULT_ENTRY: usize = 6;
 
 // Rocket Lake DP up to HBR (`rkl_combo_phy_trans_dp_hbr`).
-const RKL_DP_HBR: [IclEntry; 10] = [
+static RKL_DP_HBR: [IclEntry; 10] = [
     e(0xA, 0x2F, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x63, 0x2F, 0x00, 0x10),
@@ -189,7 +197,7 @@ const RKL_DP_HBR: [IclEntry; 10] = [
 ];
 
 // Rocket Lake DP HBR2/HBR3 (`rkl_combo_phy_trans_dp_hbr2_hbr3`).
-const RKL_DP_HBR2_HBR3: [IclEntry; 10] = [
+static RKL_DP_HBR2_HBR3: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x50, 0x38, 0x00, 0x07),
     e(0xC, 0x61, 0x33, 0x00, 0x0C),
@@ -205,7 +213,7 @@ const RKL_DP_HBR2_HBR3: [IclEntry; 10] = [
 // Alder Lake-S DP HBR2/HBR3 (`adls_combo_phy_trans_dp_hbr2_hbr3`),
 // which is also the ADL-S eDP HBR3 table
 // (`adls_combo_phy_trans_edp_hbr3` — same array in Linux).
-const ADLS_DP_HBR2_HBR3: [IclEntry; 10] = [
+static ADLS_DP_HBR2_HBR3: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x63, 0x31, 0x00, 0x0E),
@@ -219,7 +227,7 @@ const ADLS_DP_HBR2_HBR3: [IclEntry; 10] = [
 ];
 
 // Alder Lake-S eDP HBR2 (`adls_combo_phy_trans_edp_hbr2`).
-const ADLS_EDP_HBR2: [IclEntry; 10] = [
+static ADLS_EDP_HBR2: [IclEntry; 10] = [
     e(0x9, 0x73, 0x3D, 0x00, 0x02),
     e(0x9, 0x7A, 0x3C, 0x00, 0x03),
     e(0x9, 0x7F, 0x3B, 0x00, 0x04),
@@ -233,7 +241,7 @@ const ADLS_EDP_HBR2: [IclEntry; 10] = [
 ];
 
 // Alder Lake-P DP up to HBR (`adlp_combo_phy_trans_dp_hbr`).
-const ADLP_DP_HBR: [IclEntry; 10] = [
+static ADLP_DP_HBR: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x71, 0x31, 0x00, 0x0E),
@@ -250,7 +258,7 @@ const ADLP_DP_HBR: [IclEntry; 10] = [
 // which is also the ADL-P eDP HBR3 table
 // (`adlp_combo_phy_trans_edp_hbr3` — the struct aliases the same
 // array in Linux).
-const ADLP_DP_HBR2_HBR3: [IclEntry; 10] = [
+static ADLP_DP_HBR2_HBR3: [IclEntry; 10] = [
     e(0xA, 0x35, 0x3F, 0x00, 0x00),
     e(0xA, 0x4F, 0x37, 0x00, 0x08),
     e(0xC, 0x71, 0x30, 0x00, 0x0F),
@@ -266,7 +274,7 @@ const ADLP_DP_HBR2_HBR3: [IclEntry; 10] = [
 // Alder Lake-P eDP up to HBR2 (`adlp_combo_phy_trans_edp_hbr2`),
 // which is also the ADL-P eDP HBR2 table
 // (`adlp_combo_phy_trans_edp_up_to_hbr2` — same array).
-const ADLP_EDP_HBR2: [IclEntry; 10] = [
+static ADLP_EDP_HBR2: [IclEntry; 10] = [
     e(0x4, 0x50, 0x38, 0x00, 0x07),
     e(0x4, 0x58, 0x35, 0x00, 0x0A),
     e(0x4, 0x60, 0x34, 0x00, 0x0B),
@@ -280,7 +288,7 @@ const ADLP_EDP_HBR2: [IclEntry; 10] = [
 ];
 
 // DG1 DP HBR2/HBR3 (`dg1_combo_phy_trans_dp_hbr2_hbr3`).
-const DG1_DP_HBR2_HBR3: [IclEntry; 10] = [
+static DG1_DP_HBR2_HBR3: [IclEntry; 10] = [
     e(0xA, 0x32, 0x3F, 0x00, 0x00),
     e(0xA, 0x48, 0x35, 0x00, 0x0A),
     e(0xC, 0x63, 0x2F, 0x00, 0x10),
@@ -294,7 +302,7 @@ const DG1_DP_HBR2_HBR3: [IclEntry; 10] = [
 ];
 
 // DG1 DP RBR/HBR (`dg1_combo_phy_trans_dp_rbr_hbr`).
-const DG1_DP_RBR_HBR: [IclEntry; 10] = [
+static DG1_DP_RBR_HBR: [IclEntry; 10] = [
     e(0xA, 0x32, 0x3F, 0x00, 0x00),
     e(0xA, 0x48, 0x35, 0x00, 0x0A),
     e(0xC, 0x63, 0x2F, 0x00, 0x10),
@@ -525,10 +533,13 @@ const SCALING_MODE_SEL_MASK: u32 = 0x7 << 18;
 const SCALING_MODE_SEL_2: u32 = 0x2 << 18;
 const RTERM_SELECT_MASK: u32 = 0x7 << 3;
 const RTERM_SELECT_6: u32 = 0x6 << 3;
-/// `PORT_TX_DW7` N-scalar field (bits 30:24).
-const N_SCALAR_MASK: u32 = 0x3F << 24;
+/// `PORT_TX_DW7` N-scalar field (bits 30:24 — 7 bits; Linux
+/// `N_SCALAR_MASK` is `REG_GENMASK(30, 24)` in
+/// `display/intel_combo_phy_regs.h`, so values >= 0x40 such
+/// as the preset-4 0x47 must survive intact).
+const N_SCALAR_MASK: u32 = 0x7F << 24;
 const fn n_scalar(v: u8) -> u32 {
-    (v as u32 & 0x3F) << 24
+    (v as u32 & 0x7F) << 24
 }
 /// `DP_TP_CTL` (TGL variant: transcoder base + 0x540;
 /// `intel_display_regs.h`).
@@ -1476,5 +1487,84 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen12_combo_phy",
         smoke_combo_phy_prepare_and_training_update
+    );
+
+    fn smoke_combo_phy_edp_hbr3_aliases_dp_table() -> TestResult {
+        use Gen12Platform::*;
+        // eDP HBR3 (> 540 MHz) selects the DP HBR2/HBR3 table
+        // for every family — the shared ICL table on TGL/RKL/
+        // DG1, the family's own DP HBR2/HBR3 table on ADL-S/P/N
+        // (Linux `tgl/rkl/dg1_get_combo_buf_trans_edp` return
+        // `&icl_combo_phy_trans_dp_hbr2_edp_hbr3`;
+        // `adls/adlp_get_combo_buf_trans_edp` return their
+        // `edp_hbr3` table, whose entries are the DP HBR2/HBR3
+        // entries). This is a pointer comparison on purpose:
+        // the tables are `static`, so the alias must be the
+        // same storage, not merely equal contents — a `const`
+        // table fails this in multi-CGU builds (kt-gpu run
+        // 44933361128).
+        let cases: [(Gen12Platform, &[IclEntry]); 6] = [
+            (TigerLake, &ICL_DP_HBR2_EDP_HBR3),
+            (RocketLake, &ICL_DP_HBR2_EDP_HBR3),
+            (AlderLakeS, &ADLS_DP_HBR2_HBR3),
+            (AlderLakeP, &ADLP_DP_HBR2_HBR3),
+            (AlderLakeN, &ADLP_DP_HBR2_HBR3),
+            (Dg1, &ICL_DP_HBR2_EDP_HBR3),
+        ];
+        for (family, want) in cases {
+            let (table, _) = select_combo_buf_trans(family, true, 810_000, false, false, false);
+            if table.as_ptr() != want.as_ptr() {
+                return TestResult::Fail("eDP HBR3 must alias the DP HBR2/HBR3 table");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_edp_hbr3_aliases_dp_table
+    );
+
+    fn smoke_combo_phy_dw7_n_scalar_full_range() -> TestResult {
+        use Gen12Platform::TigerLake;
+        let io = Model::new();
+        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false).unwrap();
+        let base = 0x6C000u64; // PHY_B
+
+        // (swing, pre-emphasis) for presets 0..9 — the same
+        // order `preset_index` maps them in.
+        let levels: [(u8, u8); 10] = [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 0),
+            (2, 1),
+            (3, 0),
+        ];
+        for (preset, (vs, pe)) in levels.iter().enumerate() {
+            let want = (TGL_DP_HBR2[preset].dw7_n_scalar as u32) << 24;
+            if phy
+                .set_signal_levels(&io, LinkRate::DpHbr2, &[(*vs, *pe); 4], 4)
+                .is_err()
+            {
+                return TestResult::Fail("set_signal_levels must succeed for every preset");
+            }
+            // DW7 is bits 30:24 — 7 bits. The preset-4
+            // N-scalar 0x47, 0x4F/0x63/0x7B/0x7F entries: a
+            // 6-bit mask would truncate every one of them.
+            if io.last_write_to(base + 0x89C) != Some(want)
+                || io.last_write_to(base + 0xB9C) != Some(want)
+            {
+                return TestResult::Fail("DW7 must carry the full 7-bit preset N-scalar");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_dw7_n_scalar_full_range
     );
 }
