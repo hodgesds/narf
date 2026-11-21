@@ -57,6 +57,21 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `set_fs_pwd(current->fs, &fd_file(f)->f_path)` makes the cwd the
+    // descriptor's own directory — its mount and dentry, wherever that mount
+    // is attached now. A directory in an old root that `pivot_root` moved
+    // to put_old is at put_old: bubblewrap opens "/" before its second
+    // `pivot_root(".", ".")`, `fchdir`s back to it, and `umount2(".",
+    // MNT_DETACH)`s the old root stacked on the new one. Re-rooting the
+    // descriptor's pre-pivot path under the new root named a different
+    // directory, and that unmount then missed the old root.
+    let path = match crate::mqueue::fd_path(task, fd)
+        .filter(|_| !fd_file_within_root(task, fd))
+        .and_then(|host| current_pivoted_location(&host))
+    {
+        Some(moved) => strip_chroot_prefix(task, &moved),
+        None => path,
+    };
     // Store the USER view (chroot applies exactly once at resolution —
     // see resolve_cwd_path_user).
     let user_abs = resolve_cwd_path_user(task, &path);

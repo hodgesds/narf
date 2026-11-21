@@ -4316,12 +4316,26 @@ pub struct VfsRegistry {
     inner: IrqSafeSpinLock<Vec<Mount>>,
     lookup: RcuAtomic<MountLookupTable>,
     mountinfo_generation: core::sync::atomic::AtomicU64,
+    /// Old roots [`VfsRegistry::attach_old_root`] reattached, while their
+    /// attachment is still mounted. Always taken after `inner`.
+    pivots: IrqSafeSpinLock<Vec<PivotedRoot>>,
+}
+
+/// One `pivot_root`: the old root's tree at `old_root`, minus the new root's
+/// subtree at `new_root`, is attached at `put_old` as mount `attachment`.
+#[derive(Debug)]
+struct PivotedRoot {
+    old_root: String,
+    new_root: String,
+    put_old: String,
+    attachment: u64,
 }
 
 static REGISTRY: VfsRegistry = VfsRegistry {
     inner: IrqSafeSpinLock::new(Vec::new()),
     lookup: RcuAtomic::null(),
     mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
+    pivots: IrqSafeSpinLock::new(Vec::new()),
 };
 
 static NEXT_MOUNT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -4887,6 +4901,9 @@ impl MountNamespace {
                 inner: IrqSafeSpinLock::new(copied),
                 lookup,
                 mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
+                // The copies have new mount ids, so no earlier pivot's
+                // attachment exists in this table.
+                pivots: IrqSafeSpinLock::new(Vec::new()),
             }),
         });
         ns_tree_add(
@@ -5341,6 +5358,11 @@ impl MountNamespace {
         put_old: &str,
     ) -> Result<u64, FsError> {
         self.store().attach_old_root(old_root, new_root, put_old)
+    }
+
+    /// [`VfsRegistry::pivoted_location`] in this namespace's table.
+    pub fn pivoted_location(&self, path: &str) -> Option<String> {
+        self.store().pivoted_location(path)
     }
 
     /// Move the topmost mount at `source` to `target`.
@@ -6142,12 +6164,61 @@ impl VfsRegistry {
             .collect();
         q.push(root_copy);
         q.extend(below);
+        {
+            let mut pivots = self.pivots.lock();
+            pivots.retain(|pivot| q.iter().any(|m| m.id == pivot.attachment));
+            pivots.push(PivotedRoot {
+                old_root: String::from(old_root),
+                new_root: String::from(new_root),
+                put_old: String::from(put_old),
+                attachment: root_id,
+            });
+        }
         self.publish_lookup_locked(&q);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
         notify_mount_change();
         Ok(root_id)
+    }
+
+    /// Where `path` — a host path inside an old root that `pivot_root`
+    /// reattached — is attached now: under the old root's `put_old`
+    /// attachment, while that attachment is still mounted. `None` for a path
+    /// no live pivot moved (including one inside the new root's subtree,
+    /// which stayed where it was).
+    ///
+    /// A descriptor opened on such a path still names the mount Linux moved;
+    /// this is its current location. Once the attachment is unmounted the
+    /// original entry, outside the caller's root, stands for the detached
+    /// tree, as [`Self::attach_old_root`] describes.
+    pub fn pivoted_location(&self, path: &str) -> Option<String> {
+        let q = self.inner.lock();
+        let pivots = self.pivots.lock();
+        let under = |path: &str, base: &str| path == base || path_is_proper_descendant(path, base);
+        pivots
+            .iter()
+            .rev()
+            .find(|pivot| {
+                under(path, &pivot.old_root)
+                    && !under(path, &pivot.new_root)
+                    && q.iter()
+                        .any(|m| m.id == pivot.attachment && m.path == pivot.put_old)
+            })
+            .map(|pivot| {
+                let rel = if pivot.old_root != "/" {
+                    &path[pivot.old_root.len()..]
+                } else if path == "/" {
+                    ""
+                } else {
+                    path
+                };
+                if pivot.put_old == "/" {
+                    String::from(if rel.is_empty() { "/" } else { rel })
+                } else {
+                    alloc::format!("{}{}", pivot.put_old, rel)
+                }
+            })
     }
 
     /// ID of the visible mount covering `abs`.
