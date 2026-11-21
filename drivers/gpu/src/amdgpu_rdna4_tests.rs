@@ -235,7 +235,8 @@ fn rdna4_rev_id_strap_and_mall_info_match_linux() -> TestResult {
     let mut blocks = gpu.ip_blocks.clone();
     let mut nbio = umc(0);
     (nbio.hw_id, nbio.major, nbio.minor, nbio.revision) = (ip::HW_ID_NBIF, 6, 3, 1);
-    nbio.base_addrs = [0, 0x14, 0xd20, 0, 0];
+    nbio.base_addrs = [0; crate::amdgpu_discovery::MAX_BASE_ADDRS];
+    nbio.base_addrs[..3].copy_from_slice(&[0, 0x14, 0xd20]);
     nbio.num_bases = 3;
     blocks.push(nbio);
     for (version, reg) in [

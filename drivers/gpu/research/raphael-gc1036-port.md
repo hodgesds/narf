@@ -26,7 +26,7 @@ Raphael runs the same Linux graphics blocks as Navi22 — `gfx_v10_0`,
 | SMU (MP1) | 11.0.x, SMC loaded, PowerPlay table | 13.0.5 (`smu_v13_0_5_ppt.c`), PMFW BIOS-resident |
 | SDMA | 5.2.2, two engines | 5.2.6, one engine |
 | MMHUB | 2.1.0 (`mmhub_v2_0`) | 2.3.0/2.4.x (`mmhub_v2_3`) |
-| NBIO | 2.3 (`nbio_v2_3`) | 7.2 (`nbio_v7_2`) or 7.7 (`nbio_v7_7`) |
+| NBIO | 2.3 (`nbio_v2_3`) | 7.2/7.3/7.5 (`nbio_v7_2`), see below |
 | HDP | 5.0.x | 5.2.1 (`hdp_v5_2`) |
 | Memory | trained GDDR6 behind a BAR | the BIOS carve-out |
 
@@ -114,9 +114,25 @@ as now.
    - Rejections carry the firmware's status; an unknown response marks the
      firmware hung (`SMU_FW_HANG`), and nothing more is sent.
    - The NBIO `PCIE_INDEX2/DATA2` latch is now one lock (`amdgpu_smn`, Linux's
-     `pcie_idx_lock`) shared with the display clock manager's message write.
-     Before, it was only a safety contract.
-4. NBIO 7.2/7.7: doorbell apertures, `ih_control`, the HDP flush register.
+     `adev->reg.pcie.lock`) shared with the display clock manager's message
+     write. Before, it was only a safety contract.
+4. ~~NBIO 7.2: doorbell apertures, `ih_control`, the HDP flush register~~
+   (done, `amdgpu_nbio_v7_2`).
+   - Raphael's NBIO is `nbio_v7_2`'s. Discovery gives that driver 7.2.0,
+     7.2.1, 7.3.0, 7.5.0 and 7.5.1, all from `nbio_7_2_0_offset.h`. Linux
+     supported GC 10.3.6 (February 2022) before `nbio_v7_7` existed (May
+     2022, added with SOC21's PCIe-port helpers). The PSP and SMN rows now
+     accept all five; 7.7 stays only where its offsets are the same.
+   - On segment 2 every NBIO register the RDNA2 backends program keeps its
+     NBIO 2.3 offset and masks: doorbell aperture enable 0xc0, self-ring
+     0xf3..0xf5, `INTERRUPT_CNTL`/`2` 0xf1/0xf2, HDP flush req/done
+     0x106/0x107 and its CP0/CP2/SDMA0 bits, HDP remap 0x12d.
+   - Only the doorbell ranges move: IH, SDMA0 and VCN0 become GDC0 registers
+     (0x4f0af2/0x4f0af0/0x4f0af3 on segment 3) reached through the PCIe port
+     pair (`RSMU_INDEX/DATA`, segment 1). `amdgpu_smn` holds the same lock
+     around it, as Linux does. The field layout is unchanged.
+   - `dcn315_resource.c` gives Raphael's NBIO segments: 0x0, 0x14, 0xd20,
+     0x10400, 0x241b000, 0x4040000.
 5. GMC: `gfxhub_v2_1` on 10.3.6, `mmhub_v2_3`, a 1 GiB GART in the carve-out.
 6. IH on NBIO 7.x.
 7. GFX setup and topology (disabled shader arrays, CAM remapping), CP, KIQ,
@@ -127,6 +143,7 @@ as now.
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
-  nothing here has read.
+  nothing here has read; NBIO is inferred to be `nbio_v7_2`'s from Linux's
+  history (step 4).
 - PMFW's initial GFXOFF state on 13.0.5: Linux starts with a GFXOFF request
   count of 1 (disallowed) and never sends `DisallowGfxOff` at init.

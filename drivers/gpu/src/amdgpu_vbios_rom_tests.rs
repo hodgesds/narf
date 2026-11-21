@@ -243,7 +243,11 @@ fn navi48_rom_profile_and_snapshot_are_independent_of_navi22() -> TestResult {
         major,
         minor,
         revision,
-        base_addrs: [0x1000, 0, 0, 0, 0],
+        base_addrs: {
+            let mut bases = [0; crate::amdgpu_discovery::MAX_BASE_ADDRS];
+            bases[0] = 0x1000;
+            bases
+        },
         num_bases: 1,
         ..template
     })

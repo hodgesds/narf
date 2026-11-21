@@ -239,8 +239,6 @@ pub mod amdgpu_dcn401_spl_filters;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_clk;
 #[cfg(feature = "amdgpu")]
-pub(crate) mod amdgpu_smn;
-#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_color;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_dccg;
@@ -285,6 +283,8 @@ pub mod amdgpu_dmub_firmware;
 #[path = "amdgpu_dmub_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_dmub;
+#[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_smn;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_dmub as amdgpu_dmub_navi22;
@@ -645,17 +645,19 @@ pub mod amdgpu_rdna2_smu_telemetry;
 pub use amdgpu_rdna2_smu_telemetry as amdgpu_smu_navi22_telemetry;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dp_bridge;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_nbio_v7_2;
 #[path = "amdgpu_vcn_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_apu_telemetry;
 #[cfg(feature = "amdgpu")]
-pub mod amdgpu_smu_raphael;
-#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48_telemetry;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_raphael;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_temp;
 #[cfg(feature = "amdgpu")]

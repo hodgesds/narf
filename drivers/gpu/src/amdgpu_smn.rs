@@ -1,15 +1,16 @@
-//! SMN access through NBIO's `PCIE_INDEX2`/`PCIE_DATA2` pair on Raphael.
+//! Raphael's indirect register pairs: NBIO's `PCIE_INDEX2`/`PCIE_DATA2` for SMN
+//! registers past the MMIO BAR, and its PCIe port pair (`RSMU_INDEX`/`DATA`).
 //!
-//! An SMN register past the MMIO BAR is reached by writing its address to the
-//! index and then reading or writing the data (`amdgpu_device_indirect_rreg` /
-//! `_wreg`). The pair is one latch per device: two users interleaving the index
+//! Each is reached by writing an address to the index and then reading or
+//! writing the data (`amdgpu_device_indirect_rreg`/`_wreg`,
+//! `amdgpu_device_pcie_port_rreg`/`_wreg`). Two users interleaving the index
 //! and data steps would each reach the other's register. Linux serializes every
-//! user with `adev->pcie_idx_lock`; this is that lock, held across the whole
-//! sequence and never across an await.
+//! user of both pairs with one lock, `adev->reg.pcie.lock`; this is that lock,
+//! held across the whole sequence and never across an await.
 //!
 //! Users on Raphael: the display clock manager's VBIOSSMC message
-//! (`MP1_C2PMSG_3`) and the SMU 13.0.5 graphics mailbox (`MP1_C2PMSG_2/33/34`,
-//! `MP1_FIRMWARE_FLAGS`).
+//! (`MP1_C2PMSG_3`), the SMU 13.0.5 graphics mailbox (`MP1_C2PMSG_2/33/34`,
+//! `MP1_FIRMWARE_FLAGS`) and NBIO 7.2's GDC0 doorbell ranges.
 use narf_bus::MmioRegion;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -30,6 +31,11 @@ pub(crate) const NBIO_VERSIONS: &[(u8, u8, u8)] = &[
     (7, 7, 0),
     (7, 7, 1),
 ];
+
+/// `regBIF_BX_PF0_RSMU_INDEX` / `_DATA` at NBIO `_BASE_IDX 1` in
+/// `nbio_7_2_0_offset.h` (`nbio_v7_2_get_pcie_port_index_offset`).
+pub(crate) const RSMU_INDEX: u64 = 0x00; // linux: regBIF_BX_PF0_RSMU_INDEX
+pub(crate) const RSMU_DATA: u64 = 0x01; // linux: regBIF_BX_PF0_RSMU_DATA
 
 static LATCH: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
@@ -62,5 +68,35 @@ pub(crate) unsafe fn write(regs: &MmioRegion, nbio: u64, address: u32, value: u3
         regs.read32(nbio + PCIE_INDEX2 * 4);
         regs.write32(nbio + PCIE_DATA2 * 4, value);
         regs.read32(nbio + PCIE_DATA2 * 4);
+    }
+}
+
+/// `RREG32_PCIE_PORT(reg)`: `address` is `reg * 4`.
+///
+/// # Safety
+/// `rsmu` is the byte offset of a bounded NBIO bank in `regs` reaching
+/// `RSMU_DATA`, and `regs` stays mapped.
+pub(crate) unsafe fn port_read(regs: &MmioRegion, rsmu: u64, address: u32) -> u32 {
+    let _latch = LATCH.lock();
+    // SAFETY: caller's bank bound; the latch excludes every other user.
+    unsafe {
+        regs.write32(rsmu + RSMU_INDEX * 4, address);
+        regs.read32(rsmu + RSMU_INDEX * 4);
+        regs.read32(rsmu + RSMU_DATA * 4)
+    }
+}
+
+/// `WREG32_PCIE_PORT(reg, value)`.
+///
+/// # Safety
+/// As [`port_read`].
+pub(crate) unsafe fn port_write(regs: &MmioRegion, rsmu: u64, address: u32, value: u32) {
+    let _latch = LATCH.lock();
+    // SAFETY: as port_read.
+    unsafe {
+        regs.write32(rsmu + RSMU_INDEX * 4, address);
+        regs.read32(rsmu + RSMU_INDEX * 4);
+        regs.write32(rsmu + RSMU_DATA * 4, value);
+        regs.read32(rsmu + RSMU_DATA * 4);
     }
 }

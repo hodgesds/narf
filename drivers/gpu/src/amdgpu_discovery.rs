@@ -216,7 +216,7 @@ pub enum DiscoveryError {
     /// `num_dies > 16` (the wire format caps it at 16 — see
     /// `die_info[16]` in `discovery.h` line 81).
     TooManyDies,
-    /// `num_base_address > 16` — sanity bound. Real chips use 1-5.
+    /// `num_base_address > 16` — sanity bound. Real chips use up to 10.
     TooManyBaseAddresses,
     /// `table_list[GC].offset` is zero: the binary carries no GC table.
     /// Pre-discovery silicon, and QEMU.
@@ -233,11 +233,13 @@ pub enum DiscoveryError {
 
 // ── Output shape ──────────────────────────────────────────────────
 
-/// Up to this many 32-bit MMIO bases per IP. Matches Linux's
-/// `MAX_IP_BASE_ADDR` (drivers/gpu/drm/amd/include/amdgpu_socinfo.h
-/// uses 5 — the four aperture types AID/XCD/MMHUB/SOC plus a
-/// per-XCC extension on MI300).
-pub const MAX_BASE_ADDRS: usize = 5;
+/// Up to this many 32-bit MMIO bases per IP: every base the parser's
+/// `num_base_address` bound admits, so none is dropped. Linux keeps them all
+/// (`amdgpu_discovery_reg_base_init` points `reg_offset` at the table's own
+/// `base_address[]`), and real IPs use more than five: Raphael's NBIO has six
+/// segments (`dcn315_resource.c`'s NBIO_BASE__INST0_SEG0..5), and the DCN 4.x
+/// headers name SEG0..9.
+pub const MAX_BASE_ADDRS: usize = 16;
 
 /// One IP block enumerated by the discovery table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
