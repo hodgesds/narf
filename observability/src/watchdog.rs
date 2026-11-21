@@ -349,7 +349,7 @@ impl<const CPUS: usize> Default for RunnableWatch<CPUS> {
     }
 }
 
-// ── per-CPU hard-IRQ share ──────────────────────────────────────────────
+// ── per-CPU hard-IRQ share and interrupt storms ─────────────────────────
 
 /// Vectors an [`IrqShare`] keeps, busiest first.
 pub const IRQ_TOP_N: usize = 3;
@@ -400,4 +400,78 @@ pub fn permille(part: u64, whole: u64) -> u64 {
         return 0;
     }
     ((part as u128 * 1000) / whole as u128).min(1000) as u64
+}
+
+/// A single vector at or above this many interrupts a second on one CPU is
+/// a storm worth naming: far past any timer, and past what a busy device
+/// with interrupt moderation raises.
+pub const IRQ_STORM_RATE: u64 = 100_000;
+
+/// Consecutive watchdog windows (about a second each) a storm must last
+/// before it is reported.
+pub const IRQ_STORM_WINDOWS: u64 = 5;
+
+#[derive(Debug)]
+struct StormCpu {
+    /// Vector + 1 of the storm being watched, 0 for none.
+    vector: AtomicU64,
+    windows: AtomicU64,
+    reported: AtomicBool,
+}
+
+/// Per-CPU interrupt-storm detector: a CPU whose busiest vector stays at
+/// or above [`IRQ_STORM_RATE`] for [`IRQ_STORM_WINDOWS`] windows is
+/// reported once per episode. It only reports; the unhandled-IRQ detector
+/// is what disables a vector. A storm of handled interrupts is a device
+/// doing what it was told, too often, and starves whatever else that CPU
+/// runs, which is what the report is for.
+#[derive(Debug)]
+pub struct IrqStormWatch<const CPUS: usize> {
+    cpus: [StormCpu; CPUS],
+}
+
+impl<const CPUS: usize> IrqStormWatch<CPUS> {
+    /// Fresh state: no storm.
+    pub const fn new() -> Self {
+        Self {
+            cpus: [const {
+                StormCpu {
+                    vector: AtomicU64::new(0),
+                    windows: AtomicU64::new(0),
+                    reported: AtomicBool::new(false),
+                }
+            }; CPUS],
+        }
+    }
+
+    /// Judge `cpu`'s busiest vector over the window just ended,
+    /// `(vector, rate per second)`. Returns `(vector, windows)` when the
+    /// storm is due its one report.
+    pub fn observe(&self, cpu: usize, busiest: Option<(u8, u64)>) -> Option<(u8, u64)> {
+        let c = self.cpus.get(cpu)?;
+        let Some((vector, _)) = busiest.filter(|&(_, rate)| rate >= IRQ_STORM_RATE) else {
+            c.vector.store(0, Ordering::Relaxed);
+            c.windows.store(0, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+            return None;
+        };
+        let key = vector as u64 + 1;
+        if c.vector.swap(key, Ordering::Relaxed) != key {
+            c.windows.store(1, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+        } else {
+            c.windows.fetch_add(1, Ordering::Relaxed);
+        }
+        let windows = c.windows.load(Ordering::Relaxed);
+        if windows < IRQ_STORM_WINDOWS || c.reported.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some((vector, windows))
+    }
+}
+
+impl<const CPUS: usize> Default for IrqStormWatch<CPUS> {
+    fn default() -> Self {
+        Self::new()
+    }
 }

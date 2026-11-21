@@ -1236,3 +1236,47 @@ kernel_test_in!(
     "observability/watchdog",
     smoke_obs_watchdog_irq_share_ranks_vectors_and_rates
 );
+
+/// An interrupt storm (one vector at `IRQ_STORM_RATE` or more on one CPU for
+/// `IRQ_STORM_WINDOWS` windows) is reported once per episode; a storm that
+/// moves to another vector, or pauses, starts a new episode; a busy but
+/// ordinary rate never reports.
+fn smoke_obs_watchdog_irq_storm_reported_once() -> TestResult {
+    use crate::watchdog::{IrqStormWatch, IRQ_STORM_RATE, IRQ_STORM_WINDOWS};
+    let w: IrqStormWatch<2> = IrqStormWatch::new();
+    let storm = Some((65u8, IRQ_STORM_RATE * 3));
+    let mut reports = alloc::vec::Vec::new();
+    for window in 1..=20u64 {
+        if let Some(r) = w.observe(0, storm) {
+            reports.push((window, r));
+        }
+        if w.observe(1, Some((32, IRQ_STORM_RATE - 1))).is_some() {
+            return TestResult::Fail("a rate under the storm threshold was reported");
+        }
+    }
+    if reports[..] != [(IRQ_STORM_WINDOWS, (65, IRQ_STORM_WINDOWS))][..] {
+        return TestResult::Fail("a sustained storm was not reported exactly once");
+    }
+    // The storm moves to another vector: a new episode.
+    let mut moved = None;
+    for window in 1..=IRQ_STORM_WINDOWS {
+        if let Some(r) = w.observe(0, Some((66, IRQ_STORM_RATE))) {
+            moved = Some((window, r));
+        }
+    }
+    if moved != Some((IRQ_STORM_WINDOWS, (66, IRQ_STORM_WINDOWS))) {
+        return TestResult::Fail("a storm on a new vector was not a new episode");
+    }
+    // A quiet window ends it; a short burst after does not report.
+    let _ = w.observe(0, None);
+    for _ in 1..IRQ_STORM_WINDOWS {
+        if w.observe(0, Some((66, IRQ_STORM_RATE))).is_some() {
+            return TestResult::Fail("a burst shorter than the storm window was reported");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_irq_storm_reported_once
+);

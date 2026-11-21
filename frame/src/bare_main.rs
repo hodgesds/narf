@@ -5328,6 +5328,15 @@ fn run_async_demo() -> ! {
         let tickless = narf_boot::args().value("nohz") != Some("off");
         narf_time::set_nohz_idle_enabled(tickless);
         let _ = writeln!(console::Writer, "  tickless idle: {}", tickless);
+        // Linux `noirqdebug`: no unhandled-IRQ ("nobody cared") detection,
+        // so no vector is ever disabled for want of a handler claiming it.
+        if narf_boot::args().has_flag("noirqdebug") {
+            narf_interrupts::dispatch::set_irqdebug(false);
+            let _ = writeln!(
+                console::Writer,
+                "  noirqdebug: unhandled-IRQ detection DISABLED"
+            );
+        }
         // Latency-first virtio-net TX: kick the device for a lone frame instead
         // of letting EVENT_IDX suppression defer it (redis PING p99 tail).
         if narf_boot::args().has_flag("tx_always_kick") {

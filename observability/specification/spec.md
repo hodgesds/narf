@@ -216,6 +216,12 @@ impl IrqShare { pub fn add(&mut self, vector: u8, count: u64);
                 pub fn busiest(&self) -> Option<(u8, u64)>; }
 pub fn per_sec(count: u64, elapsed_ns: u64) -> u64;
 pub fn permille(part: u64, whole: u64) -> u64;
+pub const IRQ_STORM_RATE: u64 = 100_000;            // per second, one vector, one CPU
+pub const IRQ_STORM_WINDOWS: u64 = 5;
+pub struct IrqStormWatch<const CPUS: usize>;
+impl<const CPUS: usize> IrqStormWatch<CPUS> {
+    pub fn observe(&self, cpu: usize, busiest: Option<(u8, u64)>) -> Option<(u8, u64)>;
+}
 ```
 
 Pure decision logic of Linux's `kernel/watchdog.c` over samples the caller
@@ -246,6 +252,10 @@ runnable bit and its stamp). The task running or leaving ends the stall.
 `IrqShare` accumulates one CPU's interrupts over a window and keeps the
 `IRQ_TOP_N` busiest vectors (ties keep the earlier vector); `per_sec` and
 `permille` turn counts into the window's rate and hard-IRQ time fraction.
+`IrqStormWatch` reports a CPU whose busiest vector stays at or above
+`IRQ_STORM_RATE` for `IRQ_STORM_WINDOWS` consecutive windows, once per
+episode; a different vector or a quieter window starts a new one. It never
+masks anything (the unhandled-IRQ detector in `interrupts/` §3 does).
 
 **Reports** (`frame/` stall watchdog, `--features stall-watchdog`, from the
 per-CPU watchdog hrtimer; checks once a second on one CPU; lock-free or
@@ -258,6 +268,7 @@ try-lock reads only):
 | `BUG: executor lockup - CPU#N idle with runnable work for Ns! [comm:pid]` | workqueue lockup | `2 * watchdog_thresh` |
 | `BUG: CPU#N: task [comm:pid] runnable for Ns without running` | `wq_watchdog_timer_fn` per task | `workqueue.watchdog_thresh` (10 s; Linux's workqueue default is 30) |
 | `INFO: task comm:pid blocked for more than N seconds.` (user and kernel tasks) | `check_hung_uninterruptible_tasks` | `sysctl.kernel.hung_task_timeout_secs` (120), `sysctl.kernel.hung_task_warnings` (10) |
+| `irq storm: CPU#N vector V (handler) at R/s for W windows` | — | `IRQ_STORM_RATE` for `IRQ_STORM_WINDOWS` |
 
 A kernel task is named `comm:id`, `comm` being the function its future came
 from (`narf_scheduler::origin_comm`), as Linux names a kthread. The
