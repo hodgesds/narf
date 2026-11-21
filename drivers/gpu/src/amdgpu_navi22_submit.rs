@@ -257,6 +257,8 @@ pub(crate) fn submit_kernel<I: Io>(
     });
     result?;
     queue.seq = seq;
+    // The frame starts: the hang detector times it (drm_sched_job_begin).
+    crate::amdgpu_navi22_tdr::job_emitted();
     Ok(seq)
 }
 
