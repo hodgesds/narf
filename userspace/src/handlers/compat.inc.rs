@@ -5006,6 +5006,21 @@ fn current_bind_mount(
     r
 }
 
+/// `pivot_root`'s reattachment of the old root — with every mount below it
+/// except the new root's subtree — at `put_old`, in the caller's mount
+/// namespace. See [`narf_filesystem::VfsRegistry::attach_old_root`].
+pub(crate) fn current_attach_old_root(
+    old_root: &str,
+    new_root: &str,
+    put_old: &str,
+) -> Result<u64, narf_filesystem::FsError> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.attach_old_root(old_root, new_root, put_old)
+    } else {
+        narf_filesystem::registry().attach_old_root(old_root, new_root, put_old)
+    }
+}
+
 pub(crate) fn current_move_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,
