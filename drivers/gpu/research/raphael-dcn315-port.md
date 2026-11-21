@@ -40,7 +40,7 @@ it came from.
 | DCCG | **dccg314** | dccg31 | ported (DPP DTOs; dccg314-only operations refused) |
 | DIO stream encoder | **dcn314** | dcn30 | ported (enc2 unblank with DIG_START) |
 | DIO link encoder | dcn31 | dcn31 | ported (`DIG_WINDOWS`: DIG_BE_CNTL/EN_CNTL −1); PHY commands still need DMUB |
-| Clock manager | dcn314 + SMU 13.0.4 | dcn315 + SMU 13.0.5 | refused (SMU version list) |
+| Clock manager | dcn314 + SMU 13.0.4 | dcn315 + SMU 13.0.5 | ported (`Mailbox::Dcn315`) |
 | DMUB | DCN314 | DCN31 functions | refused (`amdgpu_dmub` version list) |
 | DML | dml314 | dml31 + dcn315 SoC BB (`dcn31_fpu.c`) | not started |
 | Boot handoff window | `DCN_3_1_4` | — | not present; HUBP/OTG_CONTROL offsets match |
@@ -156,8 +156,27 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    NARF reproduces this, including Linux's 31.32 fixed-point rounding:
    0.375 % on 600 MHz is 598 874 kHz, not 598 875. DCN 3.1.5's clock
    manager makes no such adjustment.
-7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
-   `dcn315_clk_mgr.c` DPM table parse.
+7. ~~Clock manager~~ (done). Chosen when discovery reports MP1 13.0.5
+   *and* DCN 3.1.5, and refused unless discovery's MP1 segment 0 is the
+   0x16000 Linux hard-codes. The parameter and response are C2PMSG_37/38.
+   The id is written to SMN `0x3B1050C` (`MP1_C2PMSG_3`) through NBIO
+   `PCIE_INDEX2/DATA2` (0xe/0xf at base 0 in nbio 7.2 and 7.7), read back
+   and retried up to five times; a rejection does not reset RESPONSE. Start
+   asks `GetDprefclkFreq` (0x13) for the DP DTO's reference. The table is the
+   176-byte `DpmClocks_315_t` (WCK ratio 1). `SetDtbClk` is 0x0A. Both
+   mailboxes now clamp what is asked of PMFW for DISPCLK to
+   `min_disp_clk_khz` (100 MHz), as Linux does on both.
+
+   Not ported, and the reasons:
+   - `dcn315_update_clocks` locks p-state with `UNSUPPORTED_DCFCLK` when
+     the mode cannot support a p-state change. NARF's DML makes no
+     p-state-support decision yet, so every plan is treated as supporting
+     one; step 8 has to supply that bit.
+   - `dcn315_disable_otg_wa` / `dcn314_disable_otg_wa` stop OTGs of streams
+     that are DPMS-off or have no plane around a DISPCLK change. NARF owns
+     no such streams; neither DCN does it.
+   - The watermark table transfer (`TABLE_WATERMARKS`, Dram2Smu) is not
+     sent on either DCN.
 8. DML: dml31 with the dcn315 SoC bounding box; HUBBUB DET/COMPBUF offsets.
 9. DMUB `dcn_3_1_5_dmcub.bin` with PSP 13.0.5, then the boot-handoff window,
    then the Late worker arm.

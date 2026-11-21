@@ -9,8 +9,8 @@
 //! generator (optc31, not optc314) has its own register layout in
 //! `amdgpu_dcn_otg::layout_shift`; the DIO stream encoder (dcn30's, not
 //! dcn314's) takes the DCN30 unblank; the DCCG (dccg31, not dccg314) offers
-//! only the operations dccg31 has. The clock manager (SMU 13.0.5 mailbox)
-//! differs, and refuses it until ported.
+//! only the operations dccg31 has; the clock manager speaks dcn315_smu.c's
+//! SMU 13.0.5 mailbox (`amdgpu_dcn_clk`).
 use crate::{amdgpu, amdgpu_dcn_clk::Error, amdgpu_discovery as ip};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
