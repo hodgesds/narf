@@ -1520,8 +1520,33 @@ impl<I: Io> Engine<I> {
         self.paused[i] = true;
         Ok(())
     }
+    /// One `SOC15_WAIT_ON_RREG` of `vcn_v3_0_stop_dpg_mode`, whose result
+    /// Linux ignores: a register that never reaches `value` is warned about
+    /// and the stop goes on. Device loss and revoked authority still end it.
+    async fn stop_wait(
+        &mut self,
+        engine: fence::Engine,
+        i: usize,
+        what: &str,
+        address: u64,
+        value: u32,
+        mask: u32,
+    ) -> Result<(), Error> {
+        match self.hw.wait_reg(engine, address, value, mask).await {
+            Err(Error::Timeout) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::PriorityWriter::<4>,
+                    "amdgpu: VCN{i} stop: {what} did not reach {value:#x} (mask {mask:#x})"
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
     /// `vcn_v3_0_stop_dpg_mode`: unpause, wait for every ring to drain and
-    /// the instance to report powered, then leave dynamic power gating.
+    /// the instance to report powered, then leave dynamic power gating. As in
+    /// Linux the waits only warn, so `vcn_v3_0_stop` can still power VCN down.
     async fn stop_dpg(&mut self, i: usize) -> Result<(), Error> {
         let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
         let l = self.hw.layout;
@@ -1536,8 +1561,7 @@ impl<I: Io> Engine<I> {
             self.paused[i] = false;
         }
         let power = r(POWER_STATUS);
-        self.hw
-            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+        self.stop_wait(engine, i, "power status", power, 1, POWER_STATUS_MASK)
             .await?;
         for (slot, rptr, wptr, mask) in [
             (1, RB_RPTR[0], RB_WPTR[0], u32::MAX),
@@ -1548,21 +1572,17 @@ impl<I: Io> Engine<I> {
             let want = self
                 .hw
                 .access(|io, _| Ok(checked(io.read(r(wptr)))? & mask))?;
-            match self.hw.wait_reg(engine, r(rptr), want, u32::MAX).await {
-                // A ring that failed its IB test may still hold the commands
-                // it never finished; Linux's SOC15_WAIT_ON_RREG only warns.
-                Err(Error::Timeout) if !self.ring_counted(i, slot) => {
-                    use core::fmt::Write;
-                    let _ = writeln!(
-                        narf_console::PriorityWriter::<4>,
-                        "amdgpu: VCN{i} stop: ring {slot} (failed its IB test) did not drain"
-                    );
-                }
-                result => result?,
-            }
+            // A ring that failed its IB test may still hold the commands it
+            // never ran.
+            let what = if self.ring_counted(i, slot) {
+                "ring read pointer"
+            } else {
+                "ring read pointer (failed its IB test)"
+            };
+            self.stop_wait(engine, i, what, r(rptr), want, u32::MAX)
+                .await?;
         }
-        self.hw
-            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+        self.stop_wait(engine, i, "power status", power, 1, POWER_STATUS_MASK)
             .await?;
         self.hw.access(|io, _| {
             // disable dynamic power gating mode

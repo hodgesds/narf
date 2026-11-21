@@ -12036,8 +12036,10 @@ again one timeout later while fences remain (`Engine::idle_recheck`,
 `ColdBoot::media_idle_recheck`), and not at all once gated or unusable until
 the next begin-use. It checks physical decode/encode writebacks of the ready
 rings on every active instance, independently of API error signalling; a ring
-that failed its IB test is not counted, and the DPG stop only warns if such a
-ring does not drain (Linux's SOC15_WAIT_ON_RREG). Encode
+that failed its IB test is not counted. As in `vcn_v3_0_stop_dpg_mode`, every
+wait of the DPG stop (power status, each ring's read pointer) only warns on a
+timeout, so the stop still leaves DPG and VCN is powered down; device loss or
+revoked authority still fails it. Encode
 completion releases DPG pause even while decode remains busy. Once all VCN
 work drains it runs the hardware stop and, only when SMU11 MM_DPM_PG is
 running, sends PowerDownVcn (0x2b, instance in bits 16+).
