@@ -610,6 +610,16 @@ pub struct UsbHciTransport {
     sco_alts: [Option<ScoAltSetting>; MAX_SCO_ALT_SETTINGS],
     /// Currently active SCO alternate setting (`0` = none / alt 0).
     sco_alt: AtomicU8,
+    /// The SCO iso-IN TD kept staged between polls while a SCO link is
+    /// up (Linux `btusb_submit_isoc_in_urb`, resubmitted from
+    /// `btusb_isoc_complete`).
+    sco_rx: IrqSafeSpinLock<Option<crate::xhci::IsochToken>>,
+    /// Handles of the SCO/eSCO links up on this controller, from the
+    /// connection events `recv_event` hands up. Linux btusb submits its
+    /// isoc IN URBs only while `hci_conn_num(hdev, SCO_LINK)` is
+    /// non-zero (`btusb_notify` → `btusb_work`); with none, no iso TD is
+    /// staged, so an idle controller gets no per-frame completions.
+    sco_links: IrqSafeSpinLock<Vec<u16>>,
 }
 
 impl fmt::Debug for UsbHciTransport {
@@ -649,10 +659,82 @@ pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransp
         sco_out_dci: None,
         sco_alts: [None; MAX_SCO_ALT_SETTINGS],
         sco_alt: AtomicU8::new(0),
+        sco_rx: IrqSafeSpinLock::new(None),
+        sco_links: IrqSafeSpinLock::new(Vec::new()),
+    }
+}
+
+/// Test-only transport with two complete SCO alternates on isoch IN
+/// 0x83 / OUT 0x03 (alt 1: 49-byte packets, active; alt 2: 25-byte).
+#[doc(hidden)]
+pub fn __test_transport_with_sco(controller: u8, slot_id: u8) -> UsbHciTransport {
+    let sco = |ep_addr: u8, kind: EndpointKind| EndpointConfig {
+        ep_addr,
+        max_packet: 49,
+        kind,
+        interval: 1,
+    };
+    let mut alts = [None; MAX_SCO_ALT_SETTINGS];
+    alts[0] = Some(ScoAltSetting {
+        alt_setting: 1,
+        sco_in: Some(sco(0x83, EndpointKind::IsochIn)),
+        sco_out: Some(sco(0x03, EndpointKind::IsochOut)),
+    });
+    // A smaller alternate on the same endpoints, for down-switches.
+    let small = |ep_addr: u8, kind: EndpointKind| EndpointConfig {
+        max_packet: 25,
+        ..sco(ep_addr, kind)
+    };
+    alts[1] = Some(ScoAltSetting {
+        alt_setting: 2,
+        sco_in: Some(small(0x83, EndpointKind::IsochIn)),
+        sco_out: Some(small(0x03, EndpointKind::IsochOut)),
+    });
+    let mut transport = __test_transport_without_sco(controller, slot_id);
+    transport.sco_in_dci = Some(ep_dci(0x83, true));
+    transport.sco_out_dci = Some(ep_dci(0x03, false));
+    transport.sco_alts = alts;
+    transport.sco_alt = AtomicU8::new(1);
+    transport
+}
+
+/// Record the SCO/eSCO links an HCI event opens or closes (Vol 4 Part E
+/// §7.7.3 Connection Complete with Link_Type SCO, §7.7.35 Synchronous
+/// Connection Complete, §7.7.5 Disconnection Complete).
+fn track_sco_links(links: &mut Vec<u16>, event: &Event) {
+    let p = &event.params;
+    let handle = |at: usize| u16::from_le_bytes([p[at], p[at + 1]]) & 0x0fff;
+    match event.code {
+        // Connection Complete: status, handle, BD_ADDR, Link_Type (0 = SCO).
+        0x03 if p.len() >= 10 && p[0] == 0 && p[9] == 0x00 => {
+            let h = handle(1);
+            if !links.contains(&h) {
+                links.push(h);
+            }
+        }
+        // Synchronous Connection Complete: status, handle, ...
+        0x2c if p.len() >= 3 && p[0] == 0 => {
+            let h = handle(1);
+            if !links.contains(&h) {
+                links.push(h);
+            }
+        }
+        // Disconnection Complete: status, handle, reason.
+        0x05 if p.len() >= 3 && p[0] == 0 => {
+            let h = handle(1);
+            links.retain(|l| *l != h);
+        }
+        _ => {}
     }
 }
 
 impl UsbHciTransport {
+    /// Account `event` as if `recv_event` had handed it up.
+    #[doc(hidden)]
+    pub fn __test_note_event(&self, event: &Event) {
+        track_sco_links(&mut self.sco_links.lock(), event);
+    }
+
     fn xhci(&self) -> Result<Arc<Xhci>, TransportError> {
         crate::xhci::controller_by_id(self.controller).ok_or(TransportError::Detached)
     }
@@ -807,7 +889,8 @@ impl UsbHciTransport {
     /// `TransportError::Unsupported` and leaves the active
     /// alternate unchanged.
     ///
-    /// Sync-context only (uses `block_on`, like `send_command`).
+    /// Bridges with `block_on_spin`, like `send_command`: its callers
+    /// run inside executor polls, where the halting `block_on` panics.
     pub fn select_sco_alt_setting(&self, payload_len: usize) -> Result<u8, TransportError> {
         // Compared in `usize` — see `sco_alt_for_payload`.
         let need = payload_len.saturating_add(SCO_PACKET_HEADER_LEN);
@@ -849,7 +932,7 @@ impl UsbHciTransport {
             return Ok(current);
         }
         let xhci = self.xhci()?;
-        narf_scheduler::block_on(xhci.control_out(
+        narf_scheduler::block_on_spin(xhci.control_out(
             self.slot_id,
             RT_SET_INTERFACE,
             STD_REQ_SET_INTERFACE,
@@ -895,6 +978,7 @@ impl HciTransport for UsbHciTransport {
                 // rejects them.
                 self.mark_activity();
                 let event = Event::decode(&buf[..n]).ok_or(TransportError::Transient)?;
+                track_sco_links(&mut self.sco_links.lock(), &event);
                 Ok(Some(event))
             }
             Ok(None) => Ok(None),
@@ -993,7 +1077,10 @@ impl HciTransport for UsbHciTransport {
             return Err(TransportError::Unsupported);
         }
         let xhci = self.xhci()?;
-        let r = narf_scheduler::block_on(xhci.isoch_out(self.slot_id, sco_out_dci, data))
+        // `block_on_spin`, as `send_acl`: this runs inside executor
+        // polls (the pump, the SCO socket path), where the halting
+        // `block_on` panics. One iso frame bounds the spin.
+        let r = narf_scheduler::block_on_spin(xhci.isoch_out(self.slot_id, sco_out_dci, data))
             .map_err(|_| TransportError::Transient);
         if r.is_ok() {
             self.mark_activity();
@@ -1015,11 +1102,34 @@ impl HciTransport for UsbHciTransport {
         };
         let xhci = self.xhci()?;
         let buf_len = (budget as usize).clamp(1, 1024);
+        // Poll the staged iso-IN TD without waiting, as `recv_acl` polls
+        // its bulk-IN TD; its completion wakes the pump. A TD is staged
+        // only while a SCO link is up (Linux `btusb_work`).
+        let token = match self.sco_rx.lock().take() {
+            Some(token) => token,
+            None => {
+                if self.sco_links.lock().is_empty() {
+                    return Ok(None);
+                }
+                let Some(generation) = xhci.device_generation(self.slot_id) else {
+                    return Ok(None);
+                };
+                match xhci.begin_isoch_in(self.slot_id, sco_in_dci, generation, buf_len) {
+                    Ok(token) => token,
+                    Err(_) => return Ok(None),
+                }
+            }
+        };
         let mut buf = [0u8; 1024];
-        match narf_scheduler::block_on(xhci.isoch_in(self.slot_id, sco_in_dci, &mut buf[..buf_len]))
-        {
-            Ok(0) => Ok(None),
-            Ok(n) => Ok(Some(buf[..n].to_vec())),
+        match xhci.poll_isoch_in(&token, &mut buf[..buf_len]) {
+            // Not complete: keep it staged.
+            Ok(None) => {
+                *self.sco_rx.lock() = Some(token);
+                Ok(None)
+            }
+            Ok(Some(0)) => Ok(None),
+            Ok(Some(n)) => Ok(Some(buf[..n].to_vec())),
+            // A failed TD is retired; the next poll stages a fresh one.
             Err(_) => Ok(None),
         }
     }
@@ -1596,6 +1706,8 @@ pub async fn try_bind_btusb_already_addressed(
         sco_out_dci,
         sco_alts: eps.sco_alts,
         sco_alt: AtomicU8::new(sco_alt_setting),
+        sco_rx: IrqSafeSpinLock::new(None),
+        sco_links: IrqSafeSpinLock::new(Vec::new()),
     });
     let transport: Arc<dyn HciTransport> = usb_transport.clone();
     narf_bluetooth::transport::register(transport.clone());
