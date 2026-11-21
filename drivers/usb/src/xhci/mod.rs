@@ -83,6 +83,9 @@ mod control_cancel;
 #[cfg(feature = "kernel-test")]
 #[path = "control_tests.rs"]
 mod control_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "demux_tests.rs"]
+mod demux_tests;
 mod event_wait;
 #[cfg(feature = "kernel-test")]
 #[path = "isoch_tests.rs"]
@@ -551,6 +554,9 @@ pub struct Xhci {
     /// visibility must imply its preceding forced TEs already quarantined.
     demux_publication: IrqSafeSpinLock<()>,
     events_overflowed: core::sync::atomic::AtomicU32,
+    /// Transfer Events dropped because nothing could ever take them
+    /// (`unowned_transfer_route`).
+    stray_events: core::sync::atomic::AtomicU32,
     /// Command and control-stage waits that expired since bring-up.
     /// The supervisor samples it around an enumeration attempt so a
     /// timed-out attempt is charged more of the port's retry budget
@@ -2000,6 +2006,7 @@ impl Xhci {
             transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             demux_publication: IrqSafeSpinLock::new(()),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
+            stray_events: core::sync::atomic::AtomicU32::new(0),
             timeouts: core::sync::atomic::AtomicU32::new(0),
             recovery_epoch: core::sync::atomic::AtomicU64::new(0),
             running: true,
@@ -2715,18 +2722,27 @@ impl Xhci {
     fn demux_one_event(&self) -> Option<[u32; 4]> {
         // No await/pump/slot reservation occurs under this short IRQ-safe
         // guard. Ring locks release before devices/latches; no reverse order.
-        let _publication = self.demux_publication.lock();
+        let publication = self.demux_publication.lock();
         let ev = self.poll_event()?;
+        self.route_event(ev, publication);
+        Some(ev)
+    }
+
+    /// Publish one event taken off the ring: latch it into its owner,
+    /// route a Port Status Change to the supervisor, queue it for a
+    /// waiter, or drop it. `publication` is the demux reservation held
+    /// since the event was popped.
+    fn route_event(&self, ev: [u32; 4], publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         // Short, blocking ownership locks are deliberate: falling back to
         // the lossy queues on another CPU's lock contention loses live TDs.
         // poll_event released its ring locks before this call. No await or
         // reservation-lock acquisition occurs while devices is held.
         if self.latch_owned_event(ev) {
-            drop(_publication);
+            drop(publication);
             if (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT == TRB_TYPE_TRANSFER_EVENT {
                 self.wake_endpoint(&ev);
             }
-            return Some(ev);
+            return;
         }
         let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
         // Route Port Status Change Events (xHCI 1.2 §6.4.2.3, TRB
@@ -2742,26 +2758,50 @@ impl Xhci {
             USB_PSCE_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
             // The counter publication is ordered already. Invoke arbitrary
             // registered wakers after releasing the demux reservation.
-            drop(_publication);
+            drop(publication);
             self.wake_supervisor();
-            return Some(ev);
+            return;
+        }
+        if ty == TRB_TYPE_TRANSFER_EVENT && unowned_transfer_route(&ev) == EventRoute::Drop {
+            // No control TD owns it, and nothing takes EP0 events from
+            // the shared queue: queued, it would sit there until slot
+            // reclaim and keep the supervisor's wait from ever parking.
+            self.stray_events.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
             t if t == TRB_TYPE_CMD_COMPLETION => &self.cmd_events,
             t if t == TRB_TYPE_TRANSFER_EVENT => &self.transfer_events,
-            _ => return Some(ev),
+            _ => return,
         };
         let mut g = queue.lock();
         if event_wait::enqueue(&mut g, ev) {
             self.events_overflowed.fetch_add(1, Ordering::Relaxed);
         }
         drop(g);
-        drop(_publication);
+        drop(publication);
         if ty == TRB_TYPE_TRANSFER_EVENT {
             self.wake_endpoint(&ev);
             self.wake_supervisor();
         }
-        Some(ev)
+    }
+
+    /// Route `ev` exactly as if the demux had just popped it off the
+    /// event ring (fixtures inject events a live controller would post).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_route_event(&self, ev: [u32; 4]) {
+        let publication = self.demux_publication.lock();
+        self.route_event(ev, publication);
+    }
+
+    /// Transfer Events for `slot_id` waiting in the shared queue.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_queued_transfer_events(&self, slot_id: u8) -> usize {
+        self.transfer_events
+            .lock()
+            .iter()
+            .filter(|event| event[3] >> 24 == u32::from(slot_id))
+            .count()
     }
 
     fn latch_owned_event(&self, event: event_wait::Event) -> bool {
@@ -6164,6 +6204,29 @@ impl Xhci {
 }
 
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Where a Transfer Event no owner latched goes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EventRoute {
+    /// The shared queue, for `poll_interrupt_in` / `take_matching_event`.
+    Queue,
+    /// Dropped: nothing can consume it.
+    Drop,
+}
+
+/// Route of a Transfer Event that no owner latched. EP0 (DCI 1)
+/// events belong to control TDs, whose receipts latch them: one that
+/// no receipt claims (a late event for a completed or cancelled TD, or
+/// for a slot without a device) can never be taken, as Linux
+/// `handle_tx_event` drops an event that matches no queued TD.
+/// Interrupt, bulk and isochronous events stay queued for their pumps.
+pub(crate) fn unowned_transfer_route(event: &[u32; 4]) -> EventRoute {
+    if (event[3] >> 16) & 0x1f == DCI_CONTROL_EP {
+        EventRoute::Drop
+    } else {
+        EventRoute::Queue
+    }
+}
 
 fn next_device_generation() -> Result<u64, XhciError> {
     NEXT_DEVICE_GENERATION

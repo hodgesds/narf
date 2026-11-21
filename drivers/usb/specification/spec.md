@@ -709,6 +709,13 @@ also consult upstream Linux GPL sources.
   CPU's contention cannot send an owned completion into a lossy fallback.
   Identical duplicates are idempotent; conflicting results poison reuse.
   Command-ring entries cannot overwrite an unconsumed or abandoned receipt.
+- A Transfer Event for EP0 that no control receipt latches (a late event
+  for a completed or cancelled TD, or a slot without a device) is dropped
+  and counted, never queued: nothing takes EP0 events from the shared
+  queue, and one sitting there kept `has_pending_transfer_events()` true
+  for good (Linux `handle_tx_event` drops an event matching no TD).
+  Unlatched interrupt, bulk and isochronous events still queue for their
+  pumps.
 - `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
