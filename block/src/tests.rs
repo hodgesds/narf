@@ -2727,6 +2727,17 @@ fn smoke_block_flush_and_fua_forwarding() -> TestResult {
         if part.write_fua(20, 1, &block).is_ok() {
             return Err("partition FUA write past its end accepted");
         }
+        let devices = crate::block_devices();
+        for name in ["flt-disk0", "flt-disk0p1"] {
+            let dev = devices
+                .iter()
+                .find(|dev| dev.name == name)
+                .ok_or("missing stats")?;
+            let fields = dev.stats.linux_fields();
+            if fields[4] != 1 || fields[6] != 1 || fields[8] != 0 {
+                return Err("only the completed partition FUA write should reach both totals");
+            }
+        }
         Ok(())
     })();
     disk_policy::__set_policy_for_test(None);

@@ -55,6 +55,8 @@
 //! private controller handle it never registered is outside this layer;
 //! see the boot-time audit in `docs/BOOTING_ON_CACHYOS.md`.
 
+use crate::stats::{Accounting, Operation};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -823,6 +825,7 @@ pub struct PolicyGuard {
     inner: Arc<dyn BlockDeviceSync>,
     warned: AtomicBool,
     pub(crate) write_parent: Option<DevId>,
+    pub(crate) accounting: Accounting,
 }
 
 impl core::fmt::Debug for PolicyGuard {
@@ -842,6 +845,7 @@ impl PolicyGuard {
             name,
             disk,
             dev: new_dev_id(),
+            accounting: Accounting::new(!inner.accounts_process_io()),
             inner,
             warned: AtomicBool::new(false),
             write_parent: None,
@@ -910,6 +914,9 @@ pub struct PolicyQueue {
     write_parent: Option<DevId>,
     warned: AtomicBool,
     inner: Arc<dyn crate::BlockQueue>,
+    bytes_per_block: u64,
+    real_flush: bool,
+    accounting: Accounting,
 }
 
 impl core::fmt::Debug for PolicyQueue {
@@ -933,11 +940,19 @@ impl crate::BlockQueue for PolicyQueue {
                 Err(crate::BlockError::PermissionDenied),
             );
         }
-        self.inner.submit(req)
+        let io = self
+            .accounting
+            .start(req.op.into(), u64::from(req.blocks) * self.bytes_per_block);
+        io.completion(self.inner.submit(req))
     }
     /// Forwarded even when writes are refused, as the sync `flush` is.
     fn flush(&self) -> crate::BoxedResult {
-        self.inner.flush()
+        if !self.real_flush {
+            return self.inner.flush();
+        }
+        let io = self.accounting.start(Operation::Flush, 0);
+        let future = self.inner.flush();
+        Box::pin(async move { io.finish(future.await) })
     }
     fn cancel(&self, tag: u64) -> crate::BoxedCancel {
         self.inner.cancel(tag)
@@ -954,11 +969,18 @@ impl crate::BlockQueue for PolicyQueue {
                 Err(crate::BlockError::PermissionDenied),
             );
         }
-        self.inner.submit_sg(req)
+        let io = self
+            .accounting
+            .start(req.op.into(), u64::from(req.blocks) * self.bytes_per_block);
+        io.completion(self.inner.submit_sg(req))
     }
 }
 
 impl BlockDeviceSync for PolicyGuard {
+    fn accounts_process_io(&self) -> bool {
+        true
+    }
+
     fn lba_size(&self) -> u32 {
         self.inner.lba_size()
     }
@@ -966,7 +988,8 @@ impl BlockDeviceSync for PolicyGuard {
         self.inner.capacity()
     }
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
-        self.inner.read(lba, n_blocks, out)
+        self.transfer(Operation::Read, n_blocks.into())
+            .finish(self.inner.read(lba, n_blocks, out))
     }
     fn is_read_only(&self) -> bool {
         !self.permits_write() || self.inner.is_read_only()
@@ -974,7 +997,12 @@ impl BlockDeviceSync for PolicyGuard {
     /// Forwarded even when writes are refused: a flush carries no data and
     /// changes no media contents, it only drains the device's own cache.
     fn flush(&self) -> Result<(), BlockIoError> {
-        self.inner.flush()
+        if !self.has_real_flush() {
+            return self.inner.flush();
+        }
+        self.accounting
+            .start(Operation::Flush, 0)
+            .finish(self.inner.flush())
     }
     fn has_real_flush(&self) -> bool {
         self.inner.has_real_flush()
@@ -984,13 +1012,17 @@ impl BlockDeviceSync for PolicyGuard {
     }
     fn write_fua(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         if self.permits_write() {
-            return self.inner.write_fua(lba, n_blocks, data);
+            return self
+                .transfer(Operation::Write, n_blocks.into())
+                .finish(self.inner.write_fua(lba, n_blocks, data));
         }
         self.refuse(lba, n_blocks)
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         if self.permits_write() {
-            return self.inner.write(lba, n_blocks, data);
+            return self
+                .transfer(Operation::Write, n_blocks.into())
+                .finish(self.inner.write(lba, n_blocks, data));
         }
         self.refuse(lba, n_blocks)
     }
@@ -1006,7 +1038,9 @@ impl BlockDeviceSync for PolicyGuard {
     /// `flush`, which carries no data and is forwarded regardless.
     fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), BlockIoError> {
         if self.permits_write() {
-            return self.inner.trim(lba, n_blocks);
+            return self
+                .transfer(Operation::Discard, n_blocks)
+                .finish(self.inner.trim(lba, n_blocks));
         }
         refuse_write(
             self.name,
@@ -1024,6 +1058,9 @@ impl BlockDeviceSync for PolicyGuard {
             disk: self.disk,
             dev: self.dev,
             write_parent: self.write_parent,
+            bytes_per_block: u64::from(self.lba_size()),
+            real_flush: self.has_real_flush(),
+            accounting: self.accounting.clone(),
             warned: AtomicBool::new(false),
             inner,
         }))
@@ -1031,6 +1068,11 @@ impl BlockDeviceSync for PolicyGuard {
 }
 
 impl PolicyGuard {
+    fn transfer(&self, op: Operation, blocks: u64) -> crate::stats::Transfer {
+        self.accounting
+            .start(op, blocks.saturating_mul(u64::from(self.lba_size())))
+    }
+
     fn refuse(&self, lba: u64, n_blocks: u16) -> Result<(), BlockIoError> {
         refuse_write(self.name, &self.warned, lba, n_blocks as u32);
         Err(BlockIoError::ReadOnly)

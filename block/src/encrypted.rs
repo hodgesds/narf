@@ -558,6 +558,10 @@ impl EncryptedBlockDevice {
 }
 
 impl BlockDeviceSync for EncryptedBlockDevice {
+    fn accounts_process_io(&self) -> bool {
+        self.inner.accounts_process_io()
+    }
+
     fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }

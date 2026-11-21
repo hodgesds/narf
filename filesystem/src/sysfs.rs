@@ -1040,6 +1040,7 @@ pub fn console_active_sysfs() -> String {
 }
 
 pub fn populate_block_class() {
+    use crate::devfs_block::BLOCK_EXT_MAJOR;
     let root = get_root();
     let class_block = {
         let class_dir = get_or_create_child(&root, "class");
@@ -1059,7 +1060,6 @@ pub fn populate_block_class() {
     // only needs a stable, unique <major>:<minor> to key /dev/<name>, its
     // by-devnum links, and the char/block-node mknod. Linux ref:
     // `include/linux/major.h` (BLOCK_EXT_MAJOR = 259).
-    const BLOCK_EXT_MAJOR: u32 = 259;
     for (idx, dev) in narf_block::block_devices().into_iter().enumerate() {
         let name: &'static str = dev.name;
         let capacity = dev.dev.capacity();
@@ -1069,11 +1069,8 @@ pub fn populate_block_class() {
         // DEVTYPE=partition so udev applies blkid and by-uuid rules instead
         // of treating it as a whole disk. This distinction is what turns an
         // fstab UUID into a satisfied systemd .device unit.
-        let devtype = if dev.partition.is_some() {
-            "partition"
-        } else {
-            "disk"
-        };
+        let is_partition = dev.partno.is_some() || dev.partition.is_some();
+        let devtype = if is_partition { "partition" } else { "disk" };
         // A filesystem UUID is already discovered while registering a
         // partition. Carry it through the ADD event so udev can associate the
         // existing `/dev/disk/by-uuid/<uuid>` devfs alias with this device.
@@ -1105,7 +1102,16 @@ pub fn populate_block_class() {
         // `part_size_show` prints `bdev_nr_sectors()`. lsblk, udisks and
         // blkid multiply it by 512.
         let sectors = capacity.saturating_mul(u64::from(lba_size)) / 512;
-        let is_partition = dev.partition.is_some();
+        let flat = get_or_create_child(&sys_block, name);
+        for node in [&class_kobj, &kobj, &flat] {
+            let stats = dev.stats.clone();
+            kobject_add_attr(node, "stat", move || {
+                crate::procfs::aggregate::disk_stat_line(&stats, is_partition)
+            });
+            if let Some(partno) = dev.partno {
+                kobject_add_attr(node, "partition", move || format!("{partno}\n"));
+            }
+        }
         for node in [&class_kobj, &kobj] {
             kobject_add_attr(node, "size", move || format!("{sectors}\n"));
             add_block_stacking_dirs(node, is_partition);
@@ -1137,7 +1143,6 @@ pub fn populate_block_class() {
         );
 
         // /sys/block/<name>/ — flat view
-        let flat = get_or_create_child(&sys_block, name);
         kobject_add_attr(&flat, "size", move || format!("{sectors}\n"));
         add_block_stacking_dirs(&flat, is_partition);
         kobject_add_attr(&flat, "removable", || "0\n".to_string());

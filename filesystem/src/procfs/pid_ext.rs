@@ -493,29 +493,24 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
 /// real: the syscall layer accounts every read/write-family call, the way
 /// `vfs_read`/`vfs_write` do.
 ///
-/// `read_bytes`/`write_bytes`/`cancelled_write_bytes` are the
-/// `CONFIG_TASK_IO_ACCOUNTING` half and mean something different — bytes
-/// this task caused to move to or from STORAGE, which needs block-layer
-/// attribution NARF does not have. They stay 0 deliberately rather than
-/// being aliased onto the character counts: `iotop` and `pidstat -d` read
-/// these specifically to separate page-cache traffic from disk traffic, so
-/// copying rchar into read_bytes would not be an approximation, it would be
-/// a wrong answer to a different question.
+/// Storage bytes count observed transfers on behalf of the issuing process.
 fn render_io(pid: u64) -> String {
-    let (rchar, wchar, syscr, syscw) = crate::procfs::io_accounting_for(pid);
+    let io = crate::procfs::io_accounting_for(pid);
     // `proc_pid_io_accounting`: seq_printf of plain decimals.
     let mut s = String::with_capacity(160);
     for (label, value) in [
-        ("rchar: ", rchar),
-        ("wchar: ", wchar),
-        ("syscr: ", syscr),
-        ("syscw: ", syscw),
+        ("rchar: ", io.rchar),
+        ("wchar: ", io.wchar),
+        ("syscr: ", io.syscr),
+        ("syscw: ", io.syscw),
+        ("read_bytes: ", io.read_bytes),
+        ("write_bytes: ", io.write_bytes),
     ] {
         s.push_str(label);
         super::put_decimal(&mut s, value);
         s.push('\n');
     }
-    s.push_str("read_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n");
+    s.push_str("cancelled_write_bytes: 0\n");
     s
 }
 

@@ -228,6 +228,18 @@ pub fn find_block_device_indexed(
 ) -> Option<(usize, Arc<dyn BlockDeviceSync>)>;
 ```
 
+Each registered device exposes a fresh `stats` handle. Its `linux_fields()`
+snapshot reports completed requests, transferred 512-byte sectors, requests
+in flight, and elapsed I/O time across synchronous and queued submissions.
+An undelivered queue completion contributes no successful transfer. A
+partition window identifies its live backing via `BlockDeviceSync::partition_backing_id()`,
+and each transfer contributes once to the corresponding whole disk.
+`stats::install_submitter` supplies a reference-counted process accumulator
+at submission. Completed data reads and writes charge once across registry
+guards, including partition windows and authenticated encrypted roots.
+`BlockDeviceSync::accounts_process_io()` follows the live backing handle,
+so a retained partition still charges its caller after the disk leaves the registry.
+
 Registered GPT partitions carry their GPT type GUID, label, and unique GUID
 plus a best-effort volume UUID parsed from immutable FAT, ext, LUKS1, or LUKS2
 identification bytes. `PartitionMetadata::is_efi_system_partition()` identifies

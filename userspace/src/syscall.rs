@@ -3512,6 +3512,16 @@ enum IoClass {
     Write,
 }
 
+impl IoClass {
+    fn account(self, ret: i64) {
+        let task = crate::handlers::current_task_id();
+        match self {
+            Self::Read => crate::handlers::io_account_read(task, ret),
+            Self::Write => crate::handlers::io_account_write(task, ret),
+        }
+    }
+}
+
 /// The read/write family Linux accounts, i.e. everything that reaches
 /// `vfs_read`/`vfs_write`/`do_readv`/`do_writev`.
 ///
@@ -3640,28 +3650,20 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                     .store(raw_n.wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
             }
         }
-        // `/proc/<pid>/io` accounting. Linux does this at ONE funnel —
-        // `vfs_read`/`vfs_write` — so every syscall that reaches the file
-        // op is counted and none is counted twice. NARF's equivalent
-        // single point is here, after dispatch, where the return value of
-        // whichever handler ran is visible. Doing it per handler would
-        // mean touching every early-return path, and `syscr`/`syscw` count
-        // FAILED calls too, so the error exits are exactly the ones that
-        // would get missed.
-        //
-        // Only the read/write family pays for the wrapper.
+        // Only read/write-family handlers need their result captured here.
+        // The x86 SYSCALL entry already has the result in its saved context.
         match io_accounting_class(variant) {
             Some(class) => {
+                let entry_rip = ctx.rip();
                 let mut cap = IoAccountCtx {
                     inner: ctx,
                     ret: None,
                 };
                 table.dispatch_ctx_versioned(variant, version, &mut cap);
-                let ret = cap.ret.map(|r| r.value as i64).unwrap_or(0);
-                let task = crate::handlers::current_task_id();
-                match class {
-                    IoClass::Read => crate::handlers::io_account_read(task, ret),
-                    IoClass::Write => crate::handlers::io_account_write(task, ret),
+                if cap.rip() == entry_rip {
+                    if let Some(ret) = cap.ret {
+                        class.account(ret.value as i64);
+                    }
                 }
             }
             None => table.dispatch_ctx_versioned(variant, version, ctx),
@@ -4513,6 +4515,13 @@ pub fn kernel_syscall_entry_plain_with_state(
         }
     }
     table.dispatch(n, &mut ctx);
+    // A rewound RIP parks the syscall for replay. Account its eventual
+    // userspace result once, including errors and zero-byte reads.
+    if !user_state.is_null() && ctx.rip() == entry_rip {
+        if let Some(class) = io_accounting_class(n) {
+            class.account(ctx.ret.value as i64);
+        }
+    }
     if let Some(u) = in_syscall {
         // SAFETY: as above. The context is the task's own (it lives in its
         // `Task`), so it stays valid and correct even when a park moved this

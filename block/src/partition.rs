@@ -445,6 +445,14 @@ impl core::fmt::Debug for PartitionBlockDevice {
 }
 
 impl BlockDeviceSync for PartitionBlockDevice {
+    fn accounts_process_io(&self) -> bool {
+        self.parent.accounts_process_io()
+    }
+
+    fn partition_backing_id(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.parent).cast::<()>() as usize)
+    }
+
     fn lba_size(&self) -> u32 {
         self.parent.lba_size()
     }

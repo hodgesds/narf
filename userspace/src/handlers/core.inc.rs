@@ -566,6 +566,13 @@ pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     narf_filesystem::killable::install_kill_hooks(&KILL_HOOKS);
     // A synchronous filesystem entry point's wait parks the user task.
     narf_filesystem::sync_wait::install_sync_wait_hooks(&SYNC_WAIT_HOOKS);
+    narf_block::stats::install_submitter(|| {
+        let tid = current_task_id();
+        if tid == 0 {
+            return None;
+        }
+        crate::task::with_task_local(tid, |task| task.storage_io.clone())
+    });
 }
 
 static SYNC_WAIT_HOOKS: narf_filesystem::sync_wait::SyncWaitHooks =
@@ -10020,14 +10027,8 @@ pub fn __test_task_mempolicy(task: u64) -> Option<(u32, u64, u32)> {
 
 /// `struct task_io_accounting` (`include/linux/task_io_accounting.h`).
 ///
-/// Only the `CONFIG_TASK_XACCT` half is tracked: `rchar`/`wchar` count
-/// bytes moved by read/write-family syscalls and `syscr`/`syscw` count the
-/// calls themselves. `read_bytes`/`write_bytes` are the
-/// `CONFIG_TASK_IO_ACCOUNTING` half and mean something different — bytes
-/// this task caused to be fetched from or sent to STORAGE — which needs
-/// block-layer attribution NARF does not have. They stay 0 rather than
-/// being aliased onto the character counts, because a monitoring tool
-/// reading them would take that as real disk traffic.
+/// Character and syscall counts. Storage transfer counters live on the
+/// owning process and are sampled separately by `io_accounting_for_pid`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TaskIoAccounting {
     pub rchar: u64,
@@ -10087,10 +10088,19 @@ pub fn io_accounting_of(task: u64) -> TaskIoAccounting {
 ///
 /// The pid is a process id; NARF's accounting is keyed by task id, so this
 /// resolves through the same mapping the other per-pid procfs files use.
-pub fn io_accounting_for_pid(pid: u64) -> (u64, u64, u64, u64) {
+pub fn io_accounting_for_pid(pid: u64) -> narf_filesystem::procfs::ProcessIo {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let a = io_accounting_of(task);
-    (a.rchar, a.wchar, a.syscr, a.syscw)
+    let (read_bytes, write_bytes) = crate::task::with_task_local(task, |t| t.storage_io.bytes())
+        .unwrap_or_default();
+    narf_filesystem::procfs::ProcessIo {
+        rchar: a.rchar,
+        wchar: a.wchar,
+        syscr: a.syscr,
+        syscw: a.syscw,
+        read_bytes,
+        write_bytes,
+    }
 }
 
 #[doc(hidden)]

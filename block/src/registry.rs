@@ -61,6 +61,19 @@ pub struct BlockCaps {
 
 /// Synchronous block-device interface usable behind `dyn`.
 pub trait BlockDeviceSync: Send + Sync {
+    /// Data address of the Arc backing this partition window, held live by
+    /// the window. Used only to aggregate statistics across registrations.
+    /// Other devices (including guards and separately addressable LUNs)
+    /// have no raw partition backing to account.
+    fn partition_backing_id(&self) -> Option<usize> {
+        None
+    }
+    /// Whether submissions through this live handle already charge process
+    /// I/O. Adapters forward the answer from their backing handle. This is
+    /// an immutable property of the I/O path, queried during registration.
+    fn accounts_process_io(&self) -> bool {
+        false
+    }
     /// LBA size in bytes (typically 512 or 4096).
     fn lba_size(&self) -> u32;
     /// Total capacity in LBAs.
@@ -346,6 +359,9 @@ pub struct RegisteredBlockDevice {
     /// The registered device behind its [`crate::disk_policy::PolicyGuard`].
     /// Every consumer of the registry writes through the guard.
     pub dev: Arc<dyn BlockDeviceSync>,
+    /// Block-layer counters for this registration.
+    pub stats: Arc<crate::stats::DiskStats>,
+    raw_device_id: usize,
     /// Physical-disk identity shared by a disk and its partitions; the unit
     /// [`crate::disk_policy::trust_boot_medium`] trusts.
     pub disk: crate::disk_policy::DiskId,
@@ -459,6 +475,8 @@ fn register_entry(
     identity: Option<Arc<DiskIdentity>>,
     write_parent: Option<crate::disk_policy::DevId>,
 ) -> Result<(), BlockIoError> {
+    let backing_id = dev.partition_backing_id();
+    let raw_device_id = Arc::as_ptr(&dev).cast::<()>() as usize;
     let (entry, replaced) = {
         let mut g = REGISTRY.lock();
         let parent_entry = parent_name.and_then(|parent| g.iter().find(|e| e.name == parent));
@@ -476,6 +494,11 @@ fn register_entry(
         // Every entry — disk or partition, any transport — is wrapped in the
         // `narf.disks` guard; nothing in the registry is reachable unguarded.
         let mut guard = crate::disk_policy::PolicyGuard::new(name, disk, dev);
+        // A window on a raw driver bypasses the parent guard. A window
+        // on a guarded disk already accounts there when it submits.
+        guard.accounting.raw_parent = parent_entry
+            .filter(|p| Some(p.raw_device_id) == backing_id)
+            .map(|p| p.stats.clone());
         // Only register_encrypted_root can request delegation; tie it to the
         // same parent snapshot under the registry lock, never a reused name.
         let write_parent = write_parent.filter(|id| parent_entry.is_some_and(|p| p.dev_id == *id));
@@ -486,6 +509,8 @@ fn register_entry(
             parent,
             partno,
             identity,
+            stats: guard.accounting.local.clone(),
+            raw_device_id,
             dev: Arc::new(guard) as Arc<dyn BlockDeviceSync>,
             disk,
             dev_id,

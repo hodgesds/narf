@@ -58,6 +58,8 @@ use crate::{FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, Stat};
 
 /// Default block-node ownership: root:disk (uid 0, gid 6), matching the Linux
 /// `50-udev-default.rules` convention before udev applies distro overrides.
+pub(crate) const BLOCK_EXT_MAJOR: u32 = 259;
+
 const DEFAULT_UID: u32 = 0;
 const DEFAULT_GID: u32 = 6;
 
@@ -465,7 +467,7 @@ impl FileOps for BlockFile {
 pub fn lookup_block_file(name: &str) -> Option<Arc<dyn FileOps>> {
     narf_block::find_block_device_indexed(name).map(|(minor, dev)| {
         let mut file = BlockFile::from_dev(dev);
-        file.rdev = crate::devfs::linux_makedev(259, minor as u32);
+        file.rdev = crate::devfs::linux_makedev(BLOCK_EXT_MAJOR, minor as u32);
         // Carry the registry name so chown/chmod persist across lookups.
         file.name = Some(String::from(name));
         Arc::new(file) as Arc<dyn FileOps>

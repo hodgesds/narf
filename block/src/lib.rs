@@ -45,6 +45,7 @@ pub mod ram;
 pub mod registry;
 pub mod scsi;
 pub mod sg;
+pub mod stats;
 
 mod e2e_tests;
 mod tests;

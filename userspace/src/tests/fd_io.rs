@@ -4284,7 +4284,29 @@ fn smoke_proc_pid_io_counts_reads_and_failures() -> TestResult {
         return TestResult::Fail("a failing read(2) must not move rchar");
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The SYSCALL instruction on x86 uses a different dispatcher.
+        let mut state = narf_scheduler::UserState {
+            rip: 0x4000,
+            rflags: 0x202,
+            valid: 1,
+            ..Default::default()
+        };
+        let ret = crate::kernel_syscall_entry_plain_with_state(
+            crate::Syscall::Write.raw(),
+            &ctx.args,
+            (&mut state as *mut narf_scheduler::UserState).cast(),
+        );
+        let counts = io_accounting_of(crate::handlers::current_task_id());
+        if ret.value as i64 != -9 || counts.syscw != 1 || counts.wchar != 0 || counts.syscr != 1 {
+            return TestResult::Fail("x86 SYSCALL must count one failed write and preserve EBADF");
+        }
+    }
     __test_io_accounting_reset();
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_proc_pid_io_counts_reads_and_failures);
+kernel_test_in!(
+    "userspace/io_accounting",
+    smoke_proc_pid_io_counts_reads_and_failures
+);
