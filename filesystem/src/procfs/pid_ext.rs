@@ -866,7 +866,7 @@ fn render_mountinfo(pid: u64) -> String {
     }
     let mut s = String::new();
     for (id, parent, path, fs_name, mnt_opts, sb_opts, super_flags, source, root) in
-        crate::registry().list_mountinfo()
+        crate::registry().list_mountinfo_from("/")
     {
         push_mountinfo_row(
             &mut s,
@@ -931,7 +931,7 @@ fn push_mountinfo_row(s: &mut String, row: MountinfoRow<'_>) {
 fn render_mountstats(_pid: u64) -> String {
     let mut s = String::new();
     // `show_vfsstat`: the same device field `show_vfsmnt` prints.
-    for (_, _, path, fs_name, _, _, _, source, _) in crate::registry().list_mountinfo() {
+    for (_, _, path, fs_name, _, _, _, source, _) in crate::registry().list_mountinfo_from("/") {
         let _ = writeln!(
             s,
             "device {} mounted on {} with fstype {}",

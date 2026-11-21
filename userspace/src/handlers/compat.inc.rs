@@ -5243,24 +5243,11 @@ pub fn caller_in_group_or_capable(uid: u32, gid: u32) -> bool {
 
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
     let mut s = alloc::string::String::new();
     use core::fmt::Write as _;
-    let rows = mount_namespace_of(task)
-        .map(|ns| ns.list_mountinfo())
-        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root) in rows {
-        let visible = if process_root == "/" {
-            path
-        } else if path == process_root {
-            alloc::string::String::from("/")
-        } else if path.starts_with(process_root.as_str())
-            && path.as_bytes().get(process_root.len()) == Some(&b'/')
-        {
-            alloc::string::String::from(&path[process_root.len()..])
-        } else {
-            continue;
-        };
+    for (id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root) in
+        mountinfo_rows_seen_by(task)
+    {
         // Then the option halves: this attachment's MNT_* flags, the
         // filesystem's `show_options` text, and the superblock's `rw`/`ro` +
         // `show_sb_opts` (procfs renders the first before mountinfo's `-`
@@ -5273,6 +5260,36 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         );
     }
     Some(s)
+}
+
+/// The mount rows `task` sees: its namespace's mounts reachable from its root,
+/// each once, with mount points relative to that root —
+/// `fs/proc_namespace.c::show_mountinfo` printing `seq_path_root` and
+/// skipping a mount the root does not reach, and `do_listmount` /
+/// `do_statmount` asking the same of the caller's root. A `pivot_root`'s
+/// moved mounts are listed once, where this root reaches them
+/// (`VfsRegistry::list_mountinfo_from`).
+pub(crate) fn mountinfo_rows_seen_by(task: u64) -> alloc::vec::Vec<narf_filesystem::MountInfoRow> {
+    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
+    let rows = mount_namespace_of(task)
+        .map(|ns| ns.list_mountinfo_from(&process_root))
+        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo_from(&process_root));
+    rows.into_iter()
+        .filter_map(|(id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root)| {
+            let visible = if process_root == "/" {
+                path
+            } else if path == process_root {
+                alloc::string::String::from("/")
+            } else if path.starts_with(process_root.as_str())
+                && path.as_bytes().get(process_root.len()) == Some(&b'/')
+            {
+                alloc::string::String::from(&path[process_root.len()..])
+            } else {
+                return None;
+            };
+            Some((id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root))
+        })
+        .collect()
 }
 
 /// Current mount-table generation in the named task's mount namespace. Procfs
