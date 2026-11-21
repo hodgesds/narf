@@ -2093,9 +2093,14 @@ impl Xhci {
 
     /// Drop endpoint `dci` of `slot_id`'s completion waker.
     pub fn clear_endpoint_waker(&self, slot_id: u8, dci: u8) {
-        self.endpoint_wakers
-            .lock()
-            .retain(|e| !(e.0 == slot_id && e.1 == dci));
+        let stale = {
+            let mut wakers = self.endpoint_wakers.lock();
+            wakers
+                .iter()
+                .position(|e| e.0 == slot_id && e.1 == dci)
+                .map(|index| wakers.swap_remove(index))
+        };
+        drop(stale);
     }
 
     /// Whether this controller's events reach the demux from an interrupt
@@ -3237,6 +3242,34 @@ impl Xhci {
                     && event[3] >> 24 == u32::from(slot_id))
             });
         }
+        // The slot's endpoint owners went with its device: a waker left
+        // here would be woken by the next occupant's completions (Linux
+        // kills a device's URBs, completion handlers included, before
+        // its slot is freed). Dropped after the lock is released.
+        let stale: Vec<(u8, u8, core::task::Waker)> = {
+            let mut wakers = self.endpoint_wakers.lock();
+            let mut stale = Vec::new();
+            let mut index = 0;
+            while index < wakers.len() {
+                if wakers[index].0 == slot_id {
+                    stale.push(wakers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            stale
+        };
+        drop(stale);
+    }
+
+    /// Endpoint completion wakers registered for `slot_id`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_endpoint_wakers(&self, slot_id: u8) -> usize {
+        self.endpoint_wakers
+            .lock()
+            .iter()
+            .filter(|entry| entry.0 == slot_id)
+            .count()
     }
 
     /// Reclaim a disabled slot so its id can be handed out again —

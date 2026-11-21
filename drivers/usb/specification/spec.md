@@ -747,6 +747,8 @@ also consult upstream Linux GPL sources.
   pollers in task context write ERDP with EHB when they find the ring
   empty after consuming events, and every drain updates ERDP (EHB kept)
   every half segment. Interrupt moderation is 40 µs (IMODI 160).
+- Reclaiming a slot (`purge_slot_events`) also drops the endpoint
+  completion wakers registered for it.
 - `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
@@ -1041,7 +1043,9 @@ also consult upstream Linux GPL sources.
   Synchronous Connection Complete / Disconnection Complete events
   `recv_event` hands up (Linux `btusb_work` submits isoc IN URBs only
   while `sco_num` is non-zero) — and `send_sco` / `select_sco_alt_setting`
-  bridge with `block_on_spin`. A device with no isoch endpoints still
+  bridge with `block_on_spin`. `clear_rx_waker` clears the endpoint
+  wakers on the controller `register_rx_waker` installed them on, even
+  if it has left the registry. A device with no isoch endpoints still
   binds; its transport refuses SCO with
   `TransportError::Unsupported`, never routing it to bulk-OUT.
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
