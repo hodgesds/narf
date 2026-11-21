@@ -476,6 +476,11 @@ also consult upstream Linux GPL sources.
   a lost completion cannot pin the entry), so an entry is never reused
   while the controller may fetch it. A Command Ring Stopped completion
   completes no receipt.
+- Each supervisor cycle acknowledges every root port's PORTSC change bits
+  (`Xhci::ack_root_port_changes`; the write keeps the port neutral: PED,
+  PR and LWS are never set), so the next connect, disconnect or link
+  change raises a new Port Status Change Event (xHCI 1.2 §4.19.2; Linux
+  `xhci_clear_port_change_bit`).
 - Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
   same as the hub-class reset) before the first SETUP, and Address Device
   waits 10 ms after its successful completion (Linux `hub_port_init`).

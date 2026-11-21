@@ -6323,11 +6323,18 @@ static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The PORTSC write that acknowledges the change bits set in `portsc`,
 /// or `None` when none needs acknowledging.
 ///
-/// Root port changes are not acknowledged yet: the supervisor re-reads
-/// PORTSC on its periodic cycle instead.
+/// The controller raises a Port Status Change Event only when a change
+/// bit goes from 0 to 1 (xHCI 1.2 §4.19.2), so every change the
+/// supervisor has seen is cleared — Linux's ClearPortFeature(C_*) →
+/// `xhci_clear_port_change_bit`. The write leaves the port neutral
+/// (`xhci_port_state_to_neutral`): PED and PR are never echoed, and the
+/// link state is not written (LWS stays clear).
 pub(crate) fn root_port_change_ack(portsc: u32) -> Option<u32> {
-    let _ = portsc;
-    None
+    let changes = portsc & PORTSC_CHG_MASK;
+    if changes == 0 {
+        return None;
+    }
+    Some(op::PortStatus::clear_changes_value(portsc, changes) & !op::PORTSC_LWS)
 }
 
 /// Where a Transfer Event no owner latched goes.
