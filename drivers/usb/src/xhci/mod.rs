@@ -6948,7 +6948,12 @@ fn xhci_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError
     }
     let resumed = controllers().iter().fold(true, |ok, c| {
         // SAFETY: same.
-        (unsafe { c.run_for_resume() }) && ok
+        let running = unsafe { c.run_for_resume() };
+        // The supervisor parks until kicked: after resume it re-checks
+        // its ports and resumes bound hub ports (Linux `hub_resume` →
+        // `hub_activate(HUB_RESUME)` kicks `hub_wq`).
+        c.kick_supervisor();
+        running && ok
     });
     if resumed {
         Ok(())

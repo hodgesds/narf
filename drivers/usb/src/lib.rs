@@ -396,6 +396,9 @@ async fn wake_suspended_nic_ports(controller: &xhci::Xhci) {
     cdc_ecm::wake_suspended_ports(controller).await;
 }
 
+/// Retry interval for a controller reset that could not run.
+const RECOVERY_RETRY_NS: u64 = 100_000_000;
+
 /// The long-running USB supervisor of one controller. Walks every
 /// root-hub port the controller reports as connected, then every
 /// downstream port of every hub bound on it, attempting to bind one
@@ -475,6 +478,11 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // pump_all calls all operate on the same `&Xhci` borrow.
             let c: &xhci::Xhci = &controller;
             let hubs = HUBS.of(c.id());
+            // Kicks and port events this cycle's wait looks past: any that
+            // land while the cycle runs end that wait at once.
+            let cycle_kicks = c.supervisor_kicks();
+            let cycle_port_events = c.port_status_events();
+            let mut recovery_retry_at: Option<u64> = None;
             SUPERVISOR_PHASE.store(2, core::sync::atomic::Ordering::Relaxed);
             if irq_vector.is_none() {
                 irq_vector = c.irq_vector;
@@ -487,8 +495,10 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // bump then tells us every binding/claim we hold names
             // a dead slot — drop them all and let the normal attach
             // phases re-enumerate from scratch.
-            if c.needs_recovery() {
-                let _ = c.recover_controller();
+            if c.needs_recovery() && c.recover_controller().is_err() {
+                // Retry the reset shortly rather than park on a dead
+                // controller that nothing will kick again.
+                recovery_retry_at = Some(narf_time::monotonic_ns() + RECOVERY_RETRY_NS);
             }
             let epoch = c.recovery_epoch();
             if epoch != last_epoch {
@@ -914,34 +924,36 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                 narf_scheduler::yield_now().await;
                 continue;
             }
-            // Inter-cycle event-driven pump (matching Linux's `usbhid`
-            // `hid_irq_in` -> `input_event` + `usb_submit_urb` flow in
-            // `drivers/hid/usbhid/hid-core.c:273-325`):
-            //
-            // When a bound USB HID device (mouse/keyboard/touchpad) has an
-            // armed Interrupt-IN TRB and sends a report, the xHCI MSI-X ISR
-            // (`xhci_isr` -> `demux_one_event`) moves the Transfer Event TRB
-            // into `c.transfer_events` and pokes `supervisor_waker`. Waiting
-            // on `register_supervisor_waker` wakes this task immediately on
-            // the hardware interrupt so `pump_bound_devices(c)` drains the
-            // report, pushes `EV_REL`/`EV_KEY`/`EV_SYN` into `evdev` (waking
-            // `kwin_wayland` out of `epoll_wait`), and immediately re-arms
-            // the next Interrupt-IN TRB (`arm_interrupt_in`) within
-            // microseconds — supporting 125 Hz..1000 Hz mice with zero
-            // busy-polling while the mouse is stationary. An 8 ms timer-wheel
-            // fallback slice covers controllers without MSI-X/INTx and bounds
-            // the outer ~96 ms window between full port/hub enumeration and
-            // idle-suspend passes.
+            // A hub port to retry: walk it again now, as root ports are.
+            if attach::hub_walk_pending(c.id()) {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            // Park until something happens, as Linux's `hub_wq` does: a
+            // Port Status Change Event, a hub's status-change completion
+            // (`hub_irq` → `kick_hub_wq`), a HID report (`hid_irq_in`: the
+            // ISR queues the Transfer Event and kicks this controller's
+            // supervisor, whose pumps deliver it at once and re-arm the
+            // next TRB), a controller error, or an API caller's kick
+            // (serial TX). A timer is armed only for a deadline of the
+            // supervisor's own: the earliest idle-suspend window ending, a
+            // re-sample of a source that cannot interrupt, a retry.
             let _ = irq_vector;
-            let cycle_deadline = narf_time::Deadline::after_ms(96);
-            let seen_psce = xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire);
-            let mut seen_kicks = c.supervisor_kicks();
-            while !cycle_deadline.expired() {
-                let deadline = supervisor_wait::next_deadline(
-                    narf_time::monotonic_ns(),
-                    &supervisor_wait::Needs::default(),
-                );
-                let _ = supervisor_wait::park(c, seen_kicks, deadline).await;
+            let needs = supervisor_wait::Needs {
+                idle_suspend_at_ns: attach::next_idle_suspend_ns(c.id()),
+                poll_every_ms: if !c.has_event_interrupt() {
+                    Some(supervisor_wait::NO_IRQ_POLL_MS)
+                } else if attach::has_hub_without_status(c.id()) {
+                    Some(supervisor_wait::POLL_INTERVAL_MS)
+                } else {
+                    None
+                },
+                retry_at_ns: recovery_retry_at,
+            };
+            let mut seen_kicks = cycle_kicks;
+            loop {
+                let deadline = supervisor_wait::next_deadline(narf_time::monotonic_ns(), &needs);
+                let woke = supervisor_wait::park(c, seen_kicks, deadline).await;
                 seen_kicks = c.supervisor_kicks();
                 pump_bound_devices(c);
                 // A hub's status-change transfer completed: walk its
@@ -949,7 +961,14 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                 if attach::hub_status_changed(c).await {
                     break;
                 }
-                if xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire) != seen_psce {
+                // A root port changed, a deadline came, or the controller
+                // needs (or had) a reset: run a cycle. Any other kick was
+                // work for the pumps, done above.
+                if woke == supervisor_wait::Woke::Deadline
+                    || c.port_status_events() != cycle_port_events
+                    || c.needs_recovery()
+                    || c.recovery_epoch() != last_epoch
+                {
                     break;
                 }
             }

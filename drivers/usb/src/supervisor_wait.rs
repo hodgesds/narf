@@ -1,18 +1,32 @@
-//! The USB supervisor's wait between cycles.
+//! The USB supervisor's wait between cycles, event-driven as Linux's
+//! `hub_wq` is: `hub_event` runs only when kicked — `hub_irq` when a
+//! hub's status-change URB completes, the roothub after a Port Status
+//! Change Event, an explicit `kick_hub_wq` — and HID input arrives by URB
+//! completion (`hid_irq_in`).
 //!
-//! Each controller's supervisor sleeps here between its port/hub passes.
-//! It wakes on a kick of its controller (`Xhci::kick_supervisor`: a Port
-//! Status Change Event, a queued Transfer Event such as a HID report or a
-//! hub status-change completion, a controller error, or an API caller with
-//! work for it) and, today, also every 8 ms on a timer-wheel sleep.
+//! The wait ends on a kick of the supervisor's controller
+//! (`Xhci::kick_supervisor`: a Port Status Change Event, a queued
+//! Transfer Event such as a HID report or a hub status-change completion,
+//! a controller error, or an API caller with work for its pumps), and
+//! otherwise only at a deadline the supervisor has of its own
+//! ([`Needs`]): an idle-suspend window ending, a source of change that
+//! cannot interrupt and must be re-sampled, a failed step to retry. With
+//! none, it arms no timer at all.
 
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
-/// Today's fallback: the supervisor re-samples every 8 ms on the wheel.
-const LEGACY_FALLBACK_MS: u64 = 8;
+/// Re-sample interval for a hub without a status-change endpoint: the
+/// period of Linux's roothub status timer (`usb_hcd_poll_rh_status`,
+/// `HZ / 4`).
+pub(crate) const POLL_INTERVAL_MS: u64 = 250;
+/// Re-sample interval for a controller without any interrupt (MSI-X,
+/// MSI and INTx all unavailable): its events are seen only when something
+/// drains the ring, so the supervisor keeps the input cadence it always
+/// had there.
+pub(crate) const NO_IRQ_POLL_MS: u64 = 8;
 
 /// What the supervisor's wait can observe of its controller.
 pub(crate) trait KickSource: Sync {
@@ -23,10 +37,6 @@ pub(crate) trait KickSource: Sync {
     fn arm(&self, id: u64, waker: &Waker, seen: u64) -> bool;
     /// Drop the registration of `id`.
     fn disarm(&self, id: u64);
-    /// Work is queued for the supervisor's pumps.
-    fn pending(&self) -> bool {
-        false
-    }
 }
 
 impl KickSource for crate::xhci::Xhci {
@@ -38,9 +48,6 @@ impl KickSource for crate::xhci::Xhci {
     }
     fn disarm(&self, id: u64) {
         self.disarm_supervisor_wait(id);
-    }
-    fn pending(&self) -> bool {
-        self.has_pending_transfer_events()
     }
 }
 
@@ -68,10 +75,17 @@ pub(crate) struct Needs {
     pub retry_at_ns: Option<u64>,
 }
 
-/// The deadline the supervisor's wait arms for `needs`, if any.
+/// The deadline the supervisor's wait arms for `needs`: the earliest of
+/// them, exactly, or none at all.
 pub(crate) fn next_deadline(now_ns: u64, needs: &Needs) -> Option<narf_time::Deadline> {
-    let _ = (now_ns, needs);
-    Some(narf_time::Deadline::after_ms(LEGACY_FALLBACK_MS))
+    let poll_at = needs
+        .poll_every_ms
+        .map(|ms| now_ns.saturating_add(ms.saturating_mul(1_000_000)));
+    let at = [needs.idle_suspend_at_ns, needs.retry_at_ns, poll_at]
+        .into_iter()
+        .flatten()
+        .min()?;
+    Some(narf_time::Deadline::after_ns(at.saturating_sub(now_ns)))
 }
 
 static NEXT_WAITER: AtomicU64 = AtomicU64::new(1);
@@ -85,7 +99,8 @@ pub(crate) struct Park<'a, S: KickSource> {
     sleep: Option<narf_time::SleepUntil>,
 }
 
-/// Wait for a kick of `source` newer than `seen`, or `deadline`.
+/// Wait for a kick of `source` newer than `seen`, or `deadline`. A wait
+/// without a deadline arms no timer.
 pub(crate) fn park<S: KickSource>(
     source: &S,
     seen: u64,
@@ -111,15 +126,21 @@ impl<S: KickSource> Future for Park<'_, S> {
     type Output = Woke;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Woke> {
         let this = self.get_mut();
-        if this.source.arm(this.id, cx.waker(), this.seen) || this.source.pending() {
+        // Registered before the check: a kick after it wakes this waker,
+        // one before it is seen in the count.
+        if this.source.arm(this.id, cx.waker(), this.seen) {
             return Poll::Ready(Woke::Kick);
         }
-        // Today's wait re-samples on an 8 ms wheel sleep, whatever the
-        // supervisor's own deadline.
-        let _ = this.deadline;
+        let Some(deadline) = this.deadline else {
+            return Poll::Pending;
+        };
+        if deadline.expired() {
+            return Poll::Ready(Woke::Deadline);
+        }
+        // An hrtimer for exactly that deadline.
         let sleep = this
             .sleep
-            .get_or_insert_with(|| narf_time::sleep_ms(LEGACY_FALLBACK_MS));
+            .get_or_insert_with(|| narf_time::sleep_until(deadline));
         match Pin::new(sleep).poll(cx) {
             Poll::Ready(()) => Poll::Ready(Woke::Deadline),
             Poll::Pending => Poll::Pending,
