@@ -888,7 +888,7 @@ pub fn set_clock(f: fn() -> u64) {
     CLOCK.store(f as usize, Ordering::Release);
 }
 
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     let f = CLOCK.load(Ordering::Acquire);
     if f == 0 {
         return 0;
