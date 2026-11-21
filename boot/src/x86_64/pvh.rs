@@ -220,3 +220,60 @@ pub unsafe fn parse_memory_map(
     }
     Ok(count)
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use crate::x86_64::CMDLINE_CAP;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A `hvm_start_info` whose `cmdline_paddr` is `line`.
+    fn start_info(line: &[u8]) -> HvmStartInfo {
+        HvmStartInfo {
+            magic: MAGIC,
+            _version: 1,
+            _flags: 0,
+            _nr_modules: 0,
+            _modlist: 0,
+            _cmdline: line.as_ptr() as u64,
+            rsdp_paddr: 0,
+            memmap_paddr: 0,
+            memmap_entries: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// QEMU's `-append` reaches the store whole, up to the kernel's
+    /// buffer: Linux's PVH entry hands `cmdline_paddr` to the same
+    /// `COMMAND_LINE_SIZE` copy as every boot protocol. A 1500-byte
+    /// `test_subsystem=` list keeps its last prefix, and a line with no
+    /// NUL in reach is read only as far as the buffer.
+    fn smoke_pvh_cmdline_reaches_the_kernel_buffer() -> TestResult {
+        let mut long = [b'x'; 1501];
+        long[1497..1500].copy_from_slice(b"end");
+        long[1500] = 0;
+        let info = start_info(&long);
+        // SAFETY: `info` is a hvm_start_info whose command line is
+        // NUL-terminated inside `long`, both alive for the call.
+        let Some(got) = (unsafe { cmdline(core::ptr::addr_of!(info) as usize) }) else {
+            return TestResult::Fail("a PVH command line was not read");
+        };
+        if got.len() != 1500 || !got.ends_with(b"end") {
+            return TestResult::Fail("a 1500-byte PVH command line lost its tail");
+        }
+
+        let over = [b'x'; CMDLINE_CAP + 64];
+        let info = start_info(&over);
+        // SAFETY: the scan is bounded below `over`'s length.
+        let Some(got) = (unsafe { cmdline(core::ptr::addr_of!(info) as usize) }) else {
+            return TestResult::Fail("an over-long PVH command line was not read");
+        };
+        if got.len() != CMDLINE_CAP {
+            return TestResult::Fail(
+                "an over-long PVH command line was not read to the kernel's buffer",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/pvh", smoke_pvh_cmdline_reaches_the_kernel_buffer);
+}
