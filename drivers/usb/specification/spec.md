@@ -1189,7 +1189,10 @@ also consult upstream Linux GPL sources.
   (SET_DATA bit 14) and CP210x (AN571 `SET_BREAK`); PL2303 and
   CH341 break encodings are not modelled and return a typed
   `PortError::Unsupported`. TCXONC's TCOOFF parks the pump's TX
-  drain via the node's `tx_stopped` flag.
+  drain via the node's `tx_stopped` flag. A write, and TCXONC's TCOON,
+  call `serial::port::kick_tty(index)` (ttyACM: `cdc_acm::kick_tty`) for
+  the supervisor that pumps the port; it does not kick yet, the
+  supervisor's periodic cycle drains the ring.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The

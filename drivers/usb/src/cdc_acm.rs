@@ -1057,6 +1057,14 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
 /// and notification-endpoint reports are decoded into the node's
 /// modem state (#757). All controller calls here are non-blocking
 /// polls; no lock is held across any of them.
+/// Tell the supervisor pumping ttyACM `tty_index` that it has bytes to
+/// send (Linux `acm_tty_write` submits the write URB at once).
+///
+/// No kick yet: the supervisor's periodic cycle picks the bytes up.
+pub fn kick_tty(tty_index: usize) {
+    let _ = tty_index;
+}
+
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     // Quiesced for system suspend (#763): the PM prepare hook
     // latches this before the controller fan-out; leave every
