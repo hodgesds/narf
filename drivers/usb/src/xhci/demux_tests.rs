@@ -55,3 +55,47 @@ kernel_test_in!(
     "drivers/usb/xhci/demux",
     smoke_xhci_stray_ep0_event_lets_supervisor_wait_park
 );
+
+struct Count(core::sync::atomic::AtomicUsize);
+impl alloc::task::Wake for Count {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Reclaiming a slot (`purge_slot_events`) drops its endpoint
+/// completion wakers with its events: left registered, they would be
+/// woken by the next occupant of the slot's completions, and keep a
+/// dead owner alive.
+fn smoke_xhci_slot_reclaim_drops_endpoint_wakers() -> TestResult {
+    let Some((c, slot)) = idle_slot() else {
+        return TestResult::Skip("no controller with an idle slot");
+    };
+    let woken = Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
+    let waker = core::task::Waker::from(woken.clone());
+    c.set_endpoint_waker(slot, 3, &waker);
+    c.set_endpoint_waker(slot, 4, &waker);
+    if c.__test_endpoint_wakers(slot) != 2 {
+        c.clear_endpoint_waker(slot, 3);
+        c.clear_endpoint_waker(slot, 4);
+        return TestResult::Fail("endpoint wakers did not register");
+    }
+    c.purge_slot_events(slot);
+    let left = c.__test_endpoint_wakers(slot);
+    c.clear_endpoint_waker(slot, 3);
+    c.clear_endpoint_waker(slot, 4);
+    if left != 0 {
+        return TestResult::Fail("slot reclaim left its endpoint wakers registered");
+    }
+    // The next occupant's completion wakes nobody.
+    c.__test_route_event(transfer(slot, 3, 0x7200, 13));
+    c.purge_slot_events(slot);
+    if woken.0.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a reclaimed slot's waker was woken by a later completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci/demux",
+    smoke_xhci_slot_reclaim_drops_endpoint_wakers
+);

@@ -601,6 +601,10 @@ pub struct UsbHciTransport {
     /// `btusb_bulk_complete`). `None` until the first poll stages one and
     /// after each completion.
     acl_rx: IrqSafeSpinLock<Option<crate::xhci::BulkToken>>,
+    /// The controller `register_rx_waker` installed the completion
+    /// wakers on, so `clear_rx_waker` removes them there even when the
+    /// controller is no longer in the registry.
+    rx_waker_on: IrqSafeSpinLock<Option<Arc<Xhci>>>,
     /// Isochronous SCO endpoints of the bind-selected alternate
     /// setting. `None` when the device offers no SCO transport (or
     /// the alternate switch failed) — SCO is refused, never rerouted.
@@ -655,6 +659,7 @@ pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransp
         hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(false),
         acl_rx: IrqSafeSpinLock::new(None),
+        rx_waker_on: IrqSafeSpinLock::new(None),
         sco_in_dci: None,
         sco_out_dci: None,
         sco_alts: [None; MAX_SCO_ALT_SETTINGS],
@@ -1043,16 +1048,22 @@ impl HciTransport for UsbHciTransport {
         if let Some(dci) = self.sco_in_dci {
             xhci.set_endpoint_waker(self.slot_id, dci, waker);
         }
-        xhci.has_event_interrupt()
+        let interrupt = xhci.has_event_interrupt();
+        *self.rx_waker_on.lock() = Some(xhci);
+        interrupt
     }
 
     fn clear_rx_waker(&self) {
-        if let Ok(xhci) = self.xhci() {
-            xhci.clear_endpoint_waker(self.slot_id, self.event_dci);
-            xhci.clear_endpoint_waker(self.slot_id, self.acl_in_dci);
-            if let Some(dci) = self.sco_in_dci {
-                xhci.clear_endpoint_waker(self.slot_id, dci);
-            }
+        // The controller the wakers were installed on, even if it left
+        // the registry since (a lookup by id would then skip the clear
+        // and leave the pump's waker registered).
+        let Some(xhci) = self.rx_waker_on.lock().take().or_else(|| self.xhci().ok()) else {
+            return;
+        };
+        xhci.clear_endpoint_waker(self.slot_id, self.event_dci);
+        xhci.clear_endpoint_waker(self.slot_id, self.acl_in_dci);
+        if let Some(dci) = self.sco_in_dci {
+            xhci.clear_endpoint_waker(self.slot_id, dci);
         }
     }
 
@@ -1702,6 +1713,7 @@ pub async fn try_bind_btusb_already_addressed(
         hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(true), // already armed by the bring-up
         acl_rx: IrqSafeSpinLock::new(None),
+        rx_waker_on: IrqSafeSpinLock::new(None),
         sco_in_dci,
         sco_out_dci,
         sco_alts: eps.sco_alts,
