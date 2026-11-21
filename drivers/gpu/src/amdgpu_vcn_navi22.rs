@@ -15,11 +15,12 @@
 //! drained VCN instances after one second. `amdgpu.rdna2_vcn_dpg=0` selects Linux's static path with
 //! `AMD_PG_SUPPORT_VCN` clear instead: every tile powered on through PGFSM
 //! and the registers written directly, clock gating as
-//! `vcn_v3_0_disable_clock_gating` programs it. MM_DPM_PG is outside the
-//! default SMU boot policy, so `PowerUpVcn` is skipped exactly as
-//! `sienna_cichlid_dpm_set_vcn_enable` does; with
-//! `amdgpu.rdna2_vcn_smu_pg=1` the boot sends it first, and a board where it
-//! runs unannounced is refused before any write. Firmware images come from
+//! `vcn_v3_0_disable_clock_gating` programs it. As in Linux the SMU boot
+//! policy allows MM_DPM_PG (`AMD_PG_SUPPORT_VCN`/`_JPEG`), so the boot sends
+//! PowerUpVcn and PowerUpJpeg before any write and the idle gate
+//! PowerDownVcn (`sienna_cichlid_dpm_set_vcn_enable`); with
+//! `amdgpu.rdna2_vcn_smu_pg=0` it stays off and nothing is sent, and a board
+//! where it runs unannounced is refused before any write. Firmware images come from
 //! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Client submissions use lent
 //! MMHUB VMIDs; startup proofs use VMID0.
 use crate::{

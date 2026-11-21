@@ -293,7 +293,7 @@ impl Io for Fake {
                             0
                         }
                         ALLOW_GFXOFF | DISALLOW_GFXOFF => 0,
-                        POWER_UP_VCN | POWER_DOWN_VCN => 0,
+                        POWER_UP_VCN | POWER_DOWN_VCN | POWER_UP_JPEG => 0,
                         SET_SOFT_MIN_BY_FREQ | SET_SOFT_MAX_BY_FREQ => 0,
                         GET_PPT_LIMIT => self.ppt_limit,
                         _ => panic!("unexpected SMU command"),

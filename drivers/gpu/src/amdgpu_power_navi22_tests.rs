@@ -119,7 +119,7 @@ fn navi22_rx6750xt_power_table_retains_board_policy() -> TestResult {
             || payload[BOARD_START..BOARD_END] != vbios[0x204..0x328]
             || payload[BOARD_END..] != sku[DRIVER_BYTES + BOARD_END..]
             || prepared.info().oem_quirk
-            || prepared.boot_policy().unwrap().allowed() != FEATURES & BOOT_ALLOWED
+            || prepared.boot_policy().unwrap().allowed() != FEATURES & (BOOT_ALLOWED | MM_DPM_PG)
         {
             return TestResult::Fail("RX 6750 XT SKU or board power policy changed");
         }
@@ -234,20 +234,24 @@ kernel_test_in!(
 fn navi22_boot_power_policy_preserves_display_and_protection() -> TestResult {
     let policy = BootPolicy::from_features(u64::MAX).unwrap();
     // Independent SMU feature numbers: memory/link/display clocks, deep sleep,
-    // GFXOFF/BACO, multimedia/hub gating and unassigned bits must stay off.
+    // GFXOFF/BACO, hub gating and unassigned bits must stay off. Multimedia
+    // DPM/power gating (22) is Linux's Navi22 default, which the VCN owner
+    // drives through PowerUpVcn/PowerDownVcn.
     let forbidden = (1 << 3)
         | (1 << 4)
         | (1 << 5)
         | (1 << 7)
         | (1 << 8)
         | (0x3ff << 12)
-        | (1 << 22)
         | (1 << 34)
         | (1 << 40)
         | (1 << 41)
         | (1 << 63);
     if policy.allowed() & forbidden != 0 || !policy.validate_enabled(policy.allowed()) {
         return TestResult::Fail("boot policy changes unowned display/memory power state");
+    }
+    if policy.allowed() & (1 << 22) == 0 {
+        return TestResult::Fail("boot policy leaves out Linux's MM_DPM_PG");
     }
     // sienna_cichlid_init_allowed_features always allows RSMU_SMN_CG and
     // DF_CSTATE, and Linux never fails on extra running features such as
@@ -372,6 +376,8 @@ fn navi22_vcn_smu_pg_option_allows_only_the_board_mm_dpm_pg() -> TestResult {
     let absent = BootPolicy::from_features(board & !MM_DPM_PG).unwrap();
     crate::amdgpu_power_navi22::set_vcn_smu_pg(false);
     let off = BootPolicy::from_features(board).unwrap();
+    // Back to the boot default (Linux's media power path).
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(true);
     // The option adds MM_DPM_PG alone, and only where the board has it;
     // its running bit is then no hazard.
     if on.allowed() != off.allowed() | MM_DPM_PG
