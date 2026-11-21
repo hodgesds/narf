@@ -509,6 +509,12 @@ pub struct MediaFirmware {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Phoenix,
+    /// PSP 13.0.5: Linux's generic `psp_v13_0` rather than `psp_v13_0_4`, but
+    /// the same ring create/stop/destroy and write-pointer registers, whose
+    /// `bootloader` wait it skips (`wait_for_bootloader_steady_state` waits
+    /// only on 13.0.6/12/14/15). Every MP0 C2PMSG register sits at the same
+    /// offset on `_BASE_IDX` 0 instead of 1 (`mp_13_0_5_offset.h`).
+    Raphael,
     Navi22,
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
     Navi48(u8),
@@ -784,6 +790,33 @@ impl Layout {
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
             }
+            Kind::Raphael => {
+                // linux-lit: 0=regMP0_SMN_C2PMSG_81_BASE_IDX (mp_13_0_5_offset.h)
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 5)], 0, SOS)?;
+                // REMAP_HDP_MEM_FLUSH_CNTL 0x12d and RCC_CONFIG_MEMSIZE 0xc3 on
+                // _BASE_IDX 2 in both nbio_7_2_0 and nbio_7_7_0. Discovery gives
+                // nbio_v7_2 (which reads nbio_7_2_0_offset.h) NBIO 7.2.0, 7.2.1,
+                // 7.3.0, 7.5.0 and 7.5.1.
+                let nbio = bank(
+                    gpu,
+                    discovery::HW_ID_NBIF,
+                    &[
+                        (7, 2, 0),
+                        (7, 2, 1),
+                        (7, 3, 0),
+                        (7, 5, 0),
+                        (7, 5, 1),
+                        (7, 7, 0),
+                        (7, 7, 1),
+                    ],
+                    2,
+                    0x12d,
+                )?;
+                // regDCN_VM_FB_LOCATION_BASE/TOP and regDCN_VM_FB_OFFSET are
+                // 0x475..0x477 in dcn_3_1_5_offset.h too.
+                let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 5)], 2, 0x477)?;
+                (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
+            }
             Kind::Navi22 | Kind::Rdna2(_) => {
                 let profile = kind.rdna2_profile().ok_or(Error::Unsupported)?;
                 if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile)
@@ -1003,8 +1036,21 @@ impl Psp {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
+        // PSP 13.0.5 is Raphael's, and only with DCN 3.1.5 beside it.
+        let kind = if crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 5)], 0, 0)
+            .is_ok()
+        {
+            if crate::amdgpu_dcn_profile::Profile::resolve(gpu)
+                != Ok(crate::amdgpu_dcn_profile::Profile::Dcn315)
+            {
+                return Err(Error::Unsupported);
+            }
+            Kind::Raphael
+        } else {
+            Kind::Phoenix
+        };
         // SAFETY: forwarded exclusive device/mapping/pool contract.
-        unsafe { Self::with_kind(gpu, authority, pool, Kind::Phoenix) }
+        unsafe { Self::with_kind(gpu, authority, pool, kind) }
     }
     /// Claim the Navi22 PSP11 ring after SOS bootstrap (or verified resident SOS).
     /// Validates GMC10 GPU VRAM addresses against the caller's BAR0 pool.
@@ -1111,7 +1157,7 @@ impl Psp {
     /// Phoenix's standalone authenticated TOC container. Navi22 uses the
     /// embedded TOC from the SOS container through `setup_tmr_navi22`.
     pub async fn setup_tmr(&mut self, toc: &[u8]) -> Result<(), Error> {
-        if self.kind != Kind::Phoenix {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
             return Err(Error::Unsupported);
         }
         self.session
@@ -1200,7 +1246,7 @@ impl Psp {
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.
     pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
-        if self.kind != Kind::Phoenix {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
             return Err(Error::Unsupported);
         }
         self.session

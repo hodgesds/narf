@@ -405,3 +405,73 @@ kernel_test_in!(
 
 #[path = "amdgpu_psp_navi22_tests.rs"]
 mod navi22;
+
+/// A Raphael discovery set: MP0 13.0.5, NBIO 7.7.1, DCN 3.1.5, HDP 5.2.1,
+/// GC 10.3.6. MP0's segments 0 and 1 differ so the base index is observable.
+fn raphael_gpu() -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+        crate::amdgpu::AMD_VENDOR,
+        crate::amdgpu::RAPHAEL,
+    )
+    .unwrap();
+    let template = gpu.ip_blocks[0];
+    let ip = |id, v: (u8, u8, u8), bases: [u32; 3]| {
+        let mut block = template;
+        block.hw_id = id;
+        (block.major, block.minor, block.revision) = v;
+        block.num_bases = 3;
+        block.base_addrs[..3].copy_from_slice(&bases);
+        block
+    };
+    gpu.ip_blocks = vec![
+        ip(d::HW_ID_MP0, (13, 0, 5), [0x1000, 0x2000, 0]),
+        ip(d::HW_ID_NBIF, (7, 7, 1), [0, 0, 0x3000]),
+        ip(d::HW_ID_DCN, (3, 1, 5), [0, 0, 0x4000]),
+        ip(d::HW_ID_HDP, (5, 2, 1), [0x5000, 0, 0]),
+        ip(d::HW_ID_GC, (10, 3, 6), [0, 0, 0]),
+    ];
+    gpu
+}
+
+/// PSP 13.0.5 (`psp_v13_0`): the MP0 C2PMSG registers on `_BASE_IDX` 0
+/// (`mp_13_0_5_offset.h`), NBIO's HDP remap on index 2, and the DCN
+/// framebuffer location at 0x475..0x477 of DCN 3.1.5. The Phoenix layout,
+/// pinned to PSP 13.0.4 on index 1, refuses it, and the reverse.
+fn psp_raphael_layout_uses_mp0_segment_zero_and_dcn315() -> TestResult {
+    let gpu = raphael_gpu();
+    let Ok(layout) = Layout::resolve(&gpu, Kind::Raphael) else {
+        return TestResult::Fail("Raphael PSP layout");
+    };
+    if layout.mp0 != 0x1000 * 4
+        || layout.nbio != 0x3000 * 4
+        || (layout.fb_base, layout.fb_top, layout.fb_offset)
+            != (
+                (0x4000 + 0x475) * 4,
+                (0x4000 + 0x476) * 4,
+                (0x4000 + 0x477) * 4,
+            )
+        || layout.invalidate_reg.is_some()
+    {
+        return TestResult::Fail("Raphael PSP banks");
+    }
+    if Layout::resolve(&gpu, Kind::Phoenix).is_ok() {
+        return TestResult::Fail("PSP 13.0.5 taken by the 13.0.4 layout");
+    }
+    let mut phoenix_mp0 = raphael_gpu();
+    phoenix_mp0.ip_blocks[0].revision = 4;
+    if Layout::resolve(&phoenix_mp0, Kind::Raphael).is_ok() {
+        return TestResult::Fail("PSP 13.0.4 taken by the 13.0.5 layout");
+    }
+    let mut other_dcn = raphael_gpu();
+    other_dcn.ip_blocks[2].revision = 4;
+    if Layout::resolve(&other_dcn, Kind::Raphael).is_ok() {
+        return TestResult::Fail("Raphael PSP beside a DCN 3.1.4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_raphael_layout_uses_mp0_segment_zero_and_dcn315
+);

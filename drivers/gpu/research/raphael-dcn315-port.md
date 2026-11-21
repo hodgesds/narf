@@ -228,7 +228,32 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
 
    The vactive decision above runs on the DET and compressed-buffer sizes
    this plan supplies.
-9. DMUB `dcn_3_1_5_dmcub.bin` with PSP 13.0.5, then the boot-handoff window,
-   then the Late worker arm.
+9. ~~DMUB with PSP 13.0.5, the boot-handoff windows~~ (done).
+   - PSP 13.0.5 is Linux's generic `psp_v13_0`, not `psp_v13_0_4`. The ring
+     create/stop/destroy and write-pointer code is the same. 13.0.5 skips
+     the bootloader wait (`wait_for_bootloader_steady_state` waits only on
+     13.0.6/12/14/15), and every MP0 C2PMSG register keeps its offset on
+     `_BASE_IDX` 0 instead of 1. NBIO 7.2/7.7 put the HDP remap and MEMSIZE
+     where Phoenix's 4.3/7.7 do, and the DCN FB-location registers are
+     0x475..0x477 on both DCNs. The TOC is `psp_13_0_5_toc.bin`.
+   - DMUB: `dmub_srv.c` gives `DMUB_ASIC_DCN315` every `dmub_dcn31_*`
+     function DCN 3.1.4 uses, with only its register table built from the
+     3.1.5 header. Every DMCUB register both define is at the same offset;
+     3.1.5 lacks `DMCUB_EXT_INTERRUPT_STATUS` and `GPINT_DATAIN2..5`, unused.
+     The blob is `dcn_3_1_5_dmcub.bin`, prepared as the same DCN31 combined
+     image.
+   - Boot inventory: DCN 3.1.5 reuses DCN 3.1.4's surface window. GC 10.3.6
+     is `gfxhub_v2_1` (`mmGCVM_CONTEXT0_CNTL` 0x15fc, index 0). MMHUB
+     2.3.0/2.4.0/2.4.1 are `mmhub_v2_3` (`mmMMVM_CONTEXT0_CNTL` 0x0740,
+     index 1). A VBIOS missing from VFCT is read from the APU's VRAM shadow,
+     as on Renoir and Phoenix.
+   - The Late worker (`amdgpu_usbc::start` → `amdgpu_platform::start`)
+     already runs for every probed non-Navi22 GPU, so Raphael now takes the
+     native path; anything refused falls back to attaching to the running
+     firmware.
+
+   Open: Raphael's exact NBIO and MMHUB versions are not confirmed against
+   a real discovery table, so the rows accept each version Linux gives the
+   same functions. Nothing has run on Raphael silicon.
 
 No step has run on Raphael silicon.

@@ -311,11 +311,13 @@ pub(crate) unsafe fn discover(
             // SAFETY: probe owns this device, BAR5 and the ROM index latch.
             unsafe { rom::read_discrete(gpu, device, cap) }
         }
+        // Raphael is an APU in the coarse Navi2 family; its VBIOS shadow sits
+        // in the carve-out like the other APUs'.
         Err(Error::NotFound)
             if matches!(
                 gpu.chip.family,
                 crate::amdgpu::Family::Renoir | crate::amdgpu::Family::Phoenix
-            ) =>
+            ) || gpu.chip.did == crate::amdgpu::RAPHAEL =>
         {
             // SAFETY: the APU framebuffer mapping and exclusive probe ownership
             // are inherited; the copied shadow still requires matching PCIR IDs.

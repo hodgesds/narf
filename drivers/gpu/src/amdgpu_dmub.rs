@@ -26,14 +26,14 @@ pub struct Firmware {
     bytes: Vec<u8>,
 }
 
-struct OpenFirmware;
+struct OpenFirmware(&'static str);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenFirmware {
     type Output = Result<Vec<u8>, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(firmware::DCN314_FIRMWARE, cap) {
+        let blob = match narf_firmware::open(self.0, cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(FirmwareError::Registry(error))),
         };
@@ -68,7 +68,7 @@ impl Firmware {
         &'a self,
         gpu: &'a AmdGpu,
     ) -> Result<firmware::Prepared<'a>, FirmwareError> {
-        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(FirmwareError::VbiosUnavailable)?;
         self.prepare(vbios.bytes())
     }
@@ -78,8 +78,12 @@ impl Firmware {
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
-        let bytes = authority.invoke(OpenFirmware).map_err(|_| {
+        let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let name = match (ip.major, ip.minor, ip.revision) {
+            (3, 1, 5) => firmware::DCN315_FIRMWARE,
+            _ => firmware::DCN314_FIRMWARE,
+        };
+        let bytes = authority.invoke(OpenFirmware(name)).map_err(|_| {
             FirmwareError::Registry(narf_firmware::FirmwareError::AuthorityRevoked)
         })??;
         Ok(Self { bytes })
@@ -102,9 +106,16 @@ impl Firmware {
 /// itself is named per version. Supporting another generation means another
 /// blob and its own `dmub_dcn*` sequence, so this list stays in step with the
 /// firmware this module actually knows how to hand over to.
-const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+///
+/// DCN 3.1.5 (Raphael) is the same sequence: `dmub_srv.c` gives
+/// `DMUB_ASIC_DCN315` every `dmub_dcn31_*` function DCN 3.1.4 uses, with only
+/// the register table (`dmub_srv_dcn315_regs`) built from its own header, and
+/// every DMCUB register both headers define sits at the same offset. DCN 3.1.5
+/// lacks `DMCUB_EXT_INTERRUPT_STATUS` and `DMCUB_GPINT_DATAIN2..5`, which this
+/// module does not use.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4), (3, 1, 5)];
 
-pub(crate) fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
+pub(crate) fn dcn31x_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
@@ -150,7 +161,7 @@ impl Dmub {
     /// Caller exclusively owns the GPU's DMUB mailbox for the returned
     /// object's lifetime, including power management and firmware replacement.
     pub unsafe fn attach(gpu: &AmdGpu) -> Result<Self, Error> {
-        let ip = dcn314_ip(gpu)?;
+        let ip = dcn31x_ip(gpu)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
@@ -550,7 +561,7 @@ pub(crate) mod tests {
             return TestResult::Fail("firmware preparation ignored revoked registry authority");
         }
         gpu.ip_blocks.push(ip);
-        if dcn314_ip(&gpu).is_ok() {
+        if dcn31x_ip(&gpu).is_ok() {
             return TestResult::Fail("ambiguous DCN discovery accepted");
         }
         gpu.ip_blocks.pop();

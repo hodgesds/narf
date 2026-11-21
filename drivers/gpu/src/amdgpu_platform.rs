@@ -51,14 +51,14 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyToc {
         })())
     }
 }
-struct OpenToc;
+struct OpenToc(&'static str);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenToc {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open("amdgpu/psp_13_0_4_toc.bin", cap) {
+        let blob = match narf_firmware::open(self.0, cap) {
             Ok(blob) => blob,
             Err(_) => return Ok(Err(Error::Invalid)),
         };
@@ -144,6 +144,12 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         base_idx: 0,
         ctx0_cntl: 0x15fc,
     },
+    // Raphael: gmc_v10_0.c gives GC 10.3.6 gfxhub_v2_1, gc_10_3_0_offset.h.
+    VmWindow {
+        version: (10, 3, 6),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
     // Navi22, gc_10_3_0_offset.h: CONTEXT0..15 at 0x15fc..0x160b.
     VmWindow {
         version: (10, 3, 2),
@@ -205,6 +211,24 @@ const MMHUB_WINDOWS: &[VmWindow] = &[
         version: (2, 1, 2),
         base_idx: 0,
         ctx0_cntl: 0x06c0,
+    },
+    // Raphael's MMHUB is one of the versions gmc_v10_0.c gives mmhub_v2_3,
+    // which includes mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_CNTL 0x0740 on
+    // _BASE_IDX 1.
+    VmWindow {
+        version: (2, 3, 0),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
+    },
+    VmWindow {
+        version: (2, 4, 0),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
+    },
+    VmWindow {
+        version: (2, 4, 1),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
     },
     // GMC10's MMHUB2.1 uses mmhub_v2_0 / mmhub_2_0_0_offset.h.
     VmWindow {
@@ -314,6 +338,13 @@ const DCN_3_1_4: SurfaceWindow = SurfaceWindow {
     sw_mode_mask: 0x1f,
 };
 
+/// `dcn/dcn_3_1_5_offset.h` — Raphael. Every HUBP, cursor and OTG_CONTROL
+/// register the scan reads keeps its DCN 3.1.4 offset, and every mask agrees.
+const DCN_3_1_5: SurfaceWindow = SurfaceWindow {
+    version: (3, 1, 5),
+    ..DCN_3_1_4
+};
+
 /// `dcn/dcn_3_5_0_offset.h` — Strix / HawkPoint, the other display generation
 /// `amdgpu_dcn` carries a modeset table for.
 ///
@@ -372,7 +403,7 @@ const DCN_3_0_3: SurfaceWindow = SurfaceWindow {
     ..DCN_3_0_0
 };
 const SURFACE_WINDOWS: &[SurfaceWindow] = &[
-    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
+    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_1_5, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
 ];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
@@ -613,9 +644,26 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
             .ok_or(Error::Revoked)
             .and_then(|a| a.derive().map_err(|_| Error::Revoked)),
     )?;
+    // psp_init_toc_microcode: the TOC is named for the PSP's own version.
+    let toc_name = crate::amdgpu::with_controller(|gpu| {
+        let mp0 = crate::amdgpu_discovery::find_ip(
+            &gpu.ip_blocks,
+            crate::amdgpu_discovery::HW_ID_MP0,
+            0,
+        )?;
+        match (mp0.major, mp0.minor, mp0.revision) {
+            (13, 0, 4) => Some("amdgpu/psp_13_0_4_toc.bin"),
+            (13, 0, 5) => Some("amdgpu/psp_13_0_5_toc.bin"),
+            _ => None,
+        }
+    })
+    .flatten();
+    let toc_name = stage_failed("psp-version", toc_name.ok_or(Error::Unsupported))?;
     let toc = stage_failed(
         "psp-toc-open",
-        fw_cap.invoke(OpenToc).map_err(|_| Error::Revoked)?,
+        fw_cap
+            .invoke(OpenToc(toc_name))
+            .map_err(|_| Error::Revoked)?,
     )?;
     crate::amdgpu::with_controller(|gpu| {
         let firmware = stage_failed(
@@ -1041,6 +1089,13 @@ mod tests {
                 base_idx: 0,
                 ctx0_cntl: 0x15fc,
             },
+            // gc_10_3_0_offset.h: mmGCVM_CONTEXT0_CNTL 0x15fc _BASE_IDX 0;
+            // gmc_v10_0.c gives GC 10.3.6 (Raphael) gfxhub_v2_1.
+            VmWindow {
+                version: (10, 3, 6),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
             VmWindow {
                 version: (10, 3, 2),
                 base_idx: 0,
@@ -1089,6 +1144,23 @@ mod tests {
                 version: (2, 1, 2),
                 base_idx: 0,
                 ctx0_cntl: 0x06c0,
+            },
+            // mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_CNTL 0x0740 _BASE_IDX 1;
+            // gmc_v10_0.c gives MMHUB 2.3.0, 2.4.0 and 2.4.1 mmhub_v2_3.
+            VmWindow {
+                version: (2, 3, 0),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (2, 4, 0),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (2, 4, 1),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
             },
             VmWindow {
                 version: (2, 1, 0),
@@ -1185,6 +1257,12 @@ mod tests {
                     ..dcn300_expected
                 },
                 dcn314_expected,
+                // dcn/dcn_3_1_5_offset.h: every id above at the same offset on
+                // _BASE_IDX 2 (HUBP1 0x6c1, OTG1/3_OTG_CONTROL 0x1bc1/0x1cc1).
+                SurfaceWindow {
+                    version: (3, 1, 5),
+                    ..dcn314_expected
+                },
                 dcn350_expected,
                 dcn300_expected,
                 dcn401_expected,

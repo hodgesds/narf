@@ -506,7 +506,7 @@ impl Loader {
         pool: &Pool,
         prepared: &Prepared<'_>,
     ) -> Result<Self, Error> {
-        let ip = amdgpu_dmub::dcn314_ip(gpu).map_err(|_| Error::Unsupported)?;
+        let ip = amdgpu_dmub::dcn31x_ip(gpu).map_err(|_| Error::Unsupported)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
