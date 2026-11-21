@@ -249,6 +249,20 @@ short count when a later chunk fails. `efivarfs` is read-only (EROFS, mounted
 `ro`) under `narf.disks=root-ro`, and under `root-rw` / `boot-only` unless
 `narf.efivars_rw` is given (`efivarfs::efivars_writable`).
 
+### 3.0e Synchronous waits
+
+`wait_sync(fut)` is the one bridge a synchronous filesystem entry point
+uses to wait for an async future. On a user task it parks the task, and on a
+stackful kernel task it yields that task's continuation. Where no task is
+current it spins (`block_on_spin`). Inside a plain (non-stackful) kernel
+task's poll the task cannot sleep. This is Linux's sleeping-in-atomic case:
+the wait is counted (`sync_wait::waits_in_task_poll()`) and reported once
+per call site, and it panics in kernel-test builds unless a test calls
+`__test_expect_task_poll_wait(true)`. While it lasts, the CPU runs its other
+kernel tasks between polls (`poll_one_round_nested`, one level deep), so a
+lock handed to another task on the same CPU is still claimed.
+`spins_with_user_task()` counts spins that happen with a user task current.
+
 ### 3.1 Path and node types
 
 ```rust

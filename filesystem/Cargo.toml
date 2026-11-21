@@ -34,6 +34,10 @@ narf-rcu          = { path = "../rcu" }
 narf-observability = { path = "../observability" }
 
 [features]
+# Kernel-test builds: a wait that would spin inside a plain task's poll
+# panics unless a test expects it (`sync_wait`).
+kernel-test = []
+
 # Linux-shaped mount/bind-mount/overlayfs plumbing.  Stub for Waves 63-67.
 
 # Namespace-aware filesystem and procfs behavior. Enabled transitively by
