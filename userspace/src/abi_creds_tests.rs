@@ -2655,6 +2655,134 @@ kernel_test_in!(
     smoke_abi_userns_unshare_newuser_owns_every_new_namespace
 );
 
+/// `fs/namespace.c::path_pivot_root` attaches the old root mount at put_old
+/// WITH every mount below it — `attach_mnt(root_mnt, old_mnt, old_mp)`
+/// moves the whole `root_mnt` tree — after `umount_mnt(new_mnt)` took the
+/// new root's own subtree out of it. So right after
+/// `pivot_root("/tmp", "oldroot")` the old root's `/proc` is procfs at
+/// `/oldroot/proc`, and the new root's tmpfs is no longer under the old
+/// root's `/tmp`.
+///
+/// This replays the probe of bubblewrap's first steps (make / rslave, a
+/// tmpfs on /tmp, newroot + oldroot, pivot_root, chdir /). NARF attached the
+/// root filesystem alone, so `/oldroot/proc` was an empty directory:
+/// Steam's srt-bwrap died on `readlink(/oldroot/proc/self/fd/N)` ENOENT
+/// ("Can't bind mount /oldroot/ on /newroot/"), and bwrap 0.13 on its bind
+/// of `oldroot/proc`.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_pivot_root_keeps_the_old_roots_mounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const MS_NOSUID: u64 = 0x2;
+        const MS_NODEV: u64 = 0x4;
+        const MS_BIND: u64 = 0x1000;
+        const MS_REC: u64 = 0x4000;
+        const MS_SLAVE: u64 = 1 << 19;
+        const O_PATH: u64 = 0o10_000_000;
+        const ENOENT: i64 = -2;
+        let saved_fd_path = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+        let result = (|| {
+            if !registry().list().iter().any(|mount| mount == "/proc") {
+                return Err("/proc is not mounted in the test image");
+            }
+            narf_filesystem::__test_ensure_mount_target("/tmp");
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            drop_all_caps();
+            let zero = |num: u32, args: SyscallArgs| call(num, args) == Some(0);
+            if !zero(Syscall::Unshare.raw(), a0(CLONE_NEWUSER | CLONE_NEWNS))
+                || !zero(
+                    Syscall::Mount.raw(),
+                    a4(0, c"/".as_ptr() as u64, 0, MS_SLAVE | MS_REC, 0),
+                )
+                || !zero(
+                    Syscall::Mount.raw(),
+                    a4(
+                        c"tmpfs".as_ptr() as u64,
+                        c"/tmp".as_ptr() as u64,
+                        c"tmpfs".as_ptr() as u64,
+                        MS_NOSUID | MS_NODEV,
+                        0,
+                    ),
+                )
+                || !zero(Syscall::Chdir.raw(), a0(c"/tmp".as_ptr() as u64))
+                || !zero(Syscall::Mkdir.raw(), a1(c"newroot".as_ptr() as u64, 0o755))
+                || !zero(Syscall::Mkdir.raw(), a1(c"oldroot".as_ptr() as u64, 0o755))
+            {
+                return Err("the user + mount namespace with a tmpfs on /tmp was not set up");
+            }
+            if !zero(
+                Syscall::PivotRoot.raw(),
+                a1(c"/tmp".as_ptr() as u64, c"oldroot".as_ptr() as u64),
+            ) || !zero(Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64))
+            {
+                return Err("pivot_root(/tmp, oldroot) failed");
+            }
+            let mut sb = [0u8; STAT_SIZE];
+            if call_stat(
+                c"/oldroot/proc/self/status".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(0)
+            {
+                return Err("the old root's /proc is not procfs at /oldroot/proc");
+            }
+            if call_stat(
+                c"/oldroot/tmp/oldroot".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(ENOENT)
+            {
+                return Err("the new root's tmpfs is still mounted under the old root's /tmp");
+            }
+            let newroot = match call_open(c"/newroot".as_ptr() as u64, O_PATH) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open(/newroot, O_PATH) failed"),
+            };
+            let link = alloc::format!("/oldroot/proc/self/fd/{newroot}\0");
+            let mut buf = [0u8; 64];
+            let n = call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            );
+            if n != Some(8) || &buf[..8] != b"/newroot" {
+                return Err("readlink(/oldroot/proc/self/fd/N) did not name /newroot");
+            }
+            if !zero(
+                Syscall::Mount.raw(),
+                a4(
+                    c"/oldroot/".as_ptr() as u64,
+                    c"/newroot/".as_ptr() as u64,
+                    0,
+                    MS_BIND | MS_REC,
+                    0,
+                ),
+            ) {
+                return Err("mount(/oldroot/, /newroot/, MS_BIND|MS_REC) failed");
+            }
+            if call_stat(
+                c"/newroot/proc/self/status".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(0)
+            {
+                return Err("the recursive bind of the old root lost its /proc");
+            }
+            Ok(())
+        })();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(saved_fd_path);
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-pivot",
+    smoke_abi_userns_pivot_root_keeps_the_old_roots_mounts
+);
+
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
     with_setup(|| {
         // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|
