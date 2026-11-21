@@ -1949,7 +1949,7 @@ fn vcn3_idle_gate_attempts_are_traced_with_their_duration() -> TestResult {
     if run(e.idle(&mut pm, 1_000_000_000)).is_ok() {
         return TestResult::Fail("failed power-off reported success");
     }
-    if !idle::last_gate().is_some_and(|t| t.result.is_err()) {
+    if idle::last_gate().is_none_or(|t| t.result.is_ok()) {
         return TestResult::Fail("failed gate attempt not traced");
     }
     let quick = idle::GateTrace {
