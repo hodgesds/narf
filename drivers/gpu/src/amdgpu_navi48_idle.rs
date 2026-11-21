@@ -15,12 +15,22 @@ pub(super) fn set_reader(jpeg: bool, gated: bool) {
 }
 pub(super) fn stop() {
     EPOCH.fetch_add(1, Ordering::AcqRel);
+    // A parked supervisor sees the new epoch and exits.
+    crate::amdgpu_navi48_media_power::media_used();
 }
 pub(super) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    crate::amdgpu_navi48_media_power::media_used();
     narf_scheduler::spawn(async move {
+        // Linux's idle work runs VCN_IDLE_TIMEOUT after a use.
+        let mut delay = 1_000_000_000; // linux: VCN_IDLE_TIMEOUT
         loop {
-            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
+            // Every engine gated or absent: nothing until the next use.
+            if crate::amdgpu_navi48_media_power::idle_parked() {
+                crate::amdgpu_navi48_media_power::media_in_use().await;
+                delay = 1_000_000_000; // linux: VCN_IDLE_TIMEOUT
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ns(delay).as_instant()).await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
@@ -42,6 +52,11 @@ pub(super) fn start() {
                     "amdgpu: rdna4 media idle failed: {error:?}"
                 );
                 return;
+            }
+            match boot.media_idle_recheck(narf_time::monotonic_ns()) {
+                Some(ns) => delay = ns,
+                // Under OWNER, which `begin_media_use` also holds.
+                None => crate::amdgpu_navi48_media_power::park_idle(),
             }
         }
     });

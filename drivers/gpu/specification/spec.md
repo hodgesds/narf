@@ -13973,8 +13973,11 @@ runtime operations, cancellation leaves the mailbox owner busy and terminal
 transport errors forbid reuse. No display/GFX clock policy is changed.
 
 Normal retained VCN5/JPEG5 clients also have independent static-power idle
-paths. A generation-bound 100 ms supervisor uses Linux's 1 s media idle
-delay. Under OWNER it requires each engine's physical fence and complete
+paths. A generation-bound supervisor uses Linux's 1 s media idle
+delay: it looks VCN_IDLE_TIMEOUT after an engine's last use, one timeout later
+while an engine stays awake, and parks with every engine gated or absent until
+`begin_media_use` wakes it (`ColdBoot::media_idle_recheck`,
+`amdgpu_navi48_media_power::next_idle_check`). Under OWNER it requires each engine's physical fence and complete
 RPTR drain, then its VCPU/LMI or JMI clean shutdown before the SMU power-down
 message. VCN idle retains the shared NBIO doorbell range even if JPEG is
 busy; JPEG can sleep while VCN remains active. The same supervisor retains

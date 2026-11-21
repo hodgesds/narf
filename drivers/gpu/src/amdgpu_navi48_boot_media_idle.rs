@@ -111,6 +111,8 @@ impl Hardware {
             return Err(Error::DeviceGone);
         }
         h.media_idle.last_use[usize::from(jpeg)] = Some(narf_time::monotonic_ns());
+        // Linux cancels and re-queues the idle work around each use.
+        crate::amdgpu_navi48_media_power::media_used();
         let asleep = if jpeg {
             h.jpeg
                 .as_ref()
@@ -166,6 +168,24 @@ impl ColdBoot {
     pub(crate) async fn wake_media(&mut self) -> Result<(), Error> {
         self.begin_media_use(false).await?;
         self.begin_media_use(true).await
+    }
+    /// When the media idle supervisor should look again
+    /// (`amdgpu_navi48_media_power::next_idle_check`); `None`: every engine
+    /// is gated or absent, so not until the next use.
+    pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
+        if self.state() != State::MemoryReady {
+            return Some(IDLE_NS);
+        }
+        let h = &self.sequence.backend;
+        let vcn = h.vcn.as_ref().is_some_and(|v| {
+            use crate::amdgpu_vcn_navi48::State as S;
+            !matches!(v.state(), S::Idle | S::Stopped | S::Failed(_))
+        });
+        let jpeg = h.jpeg.as_ref().is_some_and(|j| {
+            use crate::amdgpu_jpeg_navi48::State as S;
+            !matches!(j.state(), S::Idle | S::Stopped | S::Failed(_))
+        });
+        crate::amdgpu_navi48_media_power::next_idle_check(h.media_idle.last_use, [vcn, jpeg], now)
     }
     pub(crate) async fn idle_media(&mut self, now: u64) -> Result<(), Error> {
         if self.state() != State::MemoryReady {
