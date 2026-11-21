@@ -161,6 +161,13 @@ also consult upstream Linux GPL sources.
   bound after the supervisors start gets its own. The interrupt handler
   services every controller. System PM halts/resumes every controller, and
   class resume replays run per controller.
+- Each supervisor waits between cycles in `supervisor_wait::park`, which
+  ends on a kick of its controller: `Xhci::kick_supervisor()` (an API
+  caller with work for the supervisor's pumps), and internally every Port
+  Status Change Event, queued Transfer Event and controller error.
+  `Xhci::supervisor_kicks()` counts kicks and
+  `Xhci::port_status_events()` that controller's Port Status Change
+  Events. The wait also ends every 8 ms on a timer-wheel sleep.
 - Runtime suspend dispatch is
   `class_registry::dispatch_suspend(controller, hub_slot, port)`;
   `UsbSuspendFn` receives the same three coordinates. r8152, CDC-NCM,

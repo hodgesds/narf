@@ -37,6 +37,7 @@ pub mod ohci;
 pub mod r8152;
 pub mod rndis;
 pub mod serial;
+mod supervisor_wait;
 pub mod uac;
 pub mod uac_card;
 pub mod uas;
@@ -907,24 +908,14 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             let _ = irq_vector;
             let cycle_deadline = narf_time::Deadline::after_ms(96);
             let seen_psce = xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire);
+            let mut seen_kicks = c.supervisor_kicks();
             while !cycle_deadline.expired() {
-                let mut fallback_sleep = narf_time::sleep_ms(8);
-                core::future::poll_fn(|cx| {
-                    use core::future::Future as _;
-                    use core::pin::Pin;
-                    use core::task::Poll;
-
-                    c.register_supervisor_waker(cx.waker().clone());
-                    if c.has_pending_transfer_events()
-                        || xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire)
-                            != seen_psce
-                        || cycle_deadline.expired()
-                    {
-                        return Poll::Ready(());
-                    }
-                    Pin::new(&mut fallback_sleep).poll(cx)
-                })
-                .await;
+                let deadline = supervisor_wait::next_deadline(
+                    narf_time::monotonic_ns(),
+                    &supervisor_wait::Needs::default(),
+                );
+                let _ = supervisor_wait::park(c, seen_kicks, deadline).await;
+                seen_kicks = c.supervisor_kicks();
                 pump_bound_devices(c);
                 // A hub's status-change transfer completed: walk its
                 // ports now (Linux `hub_irq` → `kick_hub_wq`).
