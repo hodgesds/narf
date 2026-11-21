@@ -94,6 +94,9 @@ mod isoch_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "root_port_tests.rs"]
+mod root_port_tests;
 pub use bulk_owner::{
     Direction as BulkDirection, Token as BulkToken, Token as IsochToken, ISOCH_PIPELINE_DEPTH,
 };
@@ -2329,6 +2332,21 @@ impl Xhci {
         let off = self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
         // SAFETY: identity-mapped MMIO; port-range checked above.
         Some(unsafe { self.mmio.read32(off) })
+    }
+
+    /// Acknowledge root port `port`'s change bits; returns the bits it
+    /// cleared. See [`root_port_change_ack`].
+    pub fn ack_root_port_changes(&self, port: u8) -> u32 {
+        let Some(v) = self.portsc(port) else {
+            return 0;
+        };
+        let Some(write) = root_port_change_ack(v) else {
+            return 0;
+        };
+        let off = self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
+        // SAFETY: identity-mapped MMIO; `portsc` checked the port range.
+        unsafe { self.mmio.write32(off, write) };
+        write & PORTSC_CHG_MASK
     }
 
     /// `true` if the port currently has a connected device (PORTSC.CCS).
@@ -6301,6 +6319,16 @@ impl Xhci {
 }
 
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// The PORTSC write that acknowledges the change bits set in `portsc`,
+/// or `None` when none needs acknowledging.
+///
+/// Root port changes are not acknowledged yet: the supervisor re-reads
+/// PORTSC on its periodic cycle instead.
+pub(crate) fn root_port_change_ack(portsc: u32) -> Option<u32> {
+    let _ = portsc;
+    None
+}
 
 /// Where a Transfer Event no owner latched goes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
