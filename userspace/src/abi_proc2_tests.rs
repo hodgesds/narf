@@ -4190,95 +4190,98 @@ kernel_test_in!(
 /// `self/fd/` and `self/task/` from that fd. The `self` magic link and the
 /// procfs routing must still apply to a walk that starts outside the root.
 fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
+    with_setup(|| proc_dirfd_chroot_walk(target))
+}
+/// The walk of [`proc_dirfd_survives_chroot_into`] as the current task, for
+/// a test that has placed that task first (in a PID namespace, say).
+fn proc_dirfd_chroot_walk(target: &[u8]) -> Result<(), &'static str> {
     const O_RDONLY: u64 = 0;
     const O_DIRECTORY: u64 = 0o200000;
     const AT_FDCWD: u64 = -100i64 as u64;
     const JAIL: &[u8] = b"/abi-procjail\0";
-    with_setup(|| {
-        let proc_path = b"/proc\0";
-        let proc_fd = match call(
+    let proc_path = b"/proc\0";
+    let proc_fd = match call(
+        Syscall::Openat.raw(),
+        a3(
+            AT_FDCWD,
+            proc_path.as_ptr() as u64,
+            O_RDONLY | O_DIRECTORY,
+            0,
+        ),
+    ) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("fixture: opening /proc failed"),
+    };
+    let jail = SyscallArgs {
+        arg0: c"none".as_ptr() as u64,
+        arg1: JAIL.as_ptr() as u64,
+        arg2: c"tmpfs".as_ptr() as u64,
+        ..Default::default()
+    };
+    if call(Syscall::Mount.raw(), jail) != Some(0) {
+        let _ = call(Syscall::Close.raw(), a0(proc_fd));
+        return Err("fixture: mounting the jail failed");
+    }
+    let result = (|| {
+        if call(Syscall::Chroot.raw(), a0(target.as_ptr() as u64)) != Some(0) {
+            return Err("fixture: chroot into the jail failed");
+        }
+        let mut st = [0u8; 144];
+        let task_dir = b"self/task/\0";
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(proc_fd, task_dir.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("fstatat(proc_fd, \"self/task/\") failed after chroot");
+        }
+        let fd_dir = b"self/fd/\0";
+        let fd_dir_fd = match call(
             Syscall::Openat.raw(),
+            a3(proc_fd, fd_dir.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(proc_fd, \"self/fd/\") failed after chroot"),
+        };
+        // `HasOpenDirectory`'s loop body (proc_util.cc:115): follow the
+        // `/proc/self/fd/<N>` magic link for a descriptor opened before the
+        // chroot. It lands on the open file — here the `/proc` directory —
+        // which the new root can no longer reach by path.
+        let name = alloc::format!("{}\0", proc_fd);
+        let followed = call(
+            Syscall::Newfstatat.raw(),
+            a3(fd_dir_fd, name.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd_dir_fd));
+        if followed != Some(0) {
+            return Err("fstatat(self/fd dirfd, \"<N>\") failed after chroot");
+        }
+        const S_IFMT: u32 = 0o170000;
+        const S_IFDIR: u32 = 0o040000;
+        let mode = stat_mode(&st);
+        if mode & S_IFMT != S_IFDIR {
+            return Err("the followed fd link did not describe the open directory");
+        }
+        // Negative: "/proc" itself is gone from the new root.
+        if call(
+            Syscall::Newfstatat.raw(),
             a3(
                 AT_FDCWD,
                 proc_path.as_ptr() as u64,
-                O_RDONLY | O_DIRECTORY,
+                st.as_mut_ptr() as u64,
                 0,
             ),
-        ) {
-            Some(fd) if fd >= 0 => fd as u64,
-            _ => return Err("fixture: opening /proc failed"),
-        };
-        let jail = SyscallArgs {
-            arg0: c"none".as_ptr() as u64,
-            arg1: JAIL.as_ptr() as u64,
-            arg2: c"tmpfs".as_ptr() as u64,
-            ..Default::default()
-        };
-        if call(Syscall::Mount.raw(), jail) != Some(0) {
-            let _ = call(Syscall::Close.raw(), a0(proc_fd));
-            return Err("fixture: mounting the jail failed");
+        ) == Some(0)
+        {
+            return Err("absolute /proc still resolves inside the new root");
         }
-        let result = (|| {
-            if call(Syscall::Chroot.raw(), a0(target.as_ptr() as u64)) != Some(0) {
-                return Err("fixture: chroot into the jail failed");
-            }
-            let mut st = [0u8; 144];
-            let task_dir = b"self/task/\0";
-            if call(
-                Syscall::Newfstatat.raw(),
-                a3(proc_fd, task_dir.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
-            ) != Some(0)
-            {
-                return Err("fstatat(proc_fd, \"self/task/\") failed after chroot");
-            }
-            let fd_dir = b"self/fd/\0";
-            let fd_dir_fd = match call(
-                Syscall::Openat.raw(),
-                a3(proc_fd, fd_dir.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
-            ) {
-                Some(fd) if fd >= 0 => fd as u64,
-                _ => return Err("openat(proc_fd, \"self/fd/\") failed after chroot"),
-            };
-            // `HasOpenDirectory`'s loop body (proc_util.cc:115): follow the
-            // `/proc/self/fd/<N>` magic link for a descriptor opened before the
-            // chroot. It lands on the open file — here the `/proc` directory —
-            // which the new root can no longer reach by path.
-            let name = alloc::format!("{}\0", proc_fd);
-            let followed = call(
-                Syscall::Newfstatat.raw(),
-                a3(fd_dir_fd, name.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
-            );
-            let _ = call(Syscall::Close.raw(), a0(fd_dir_fd));
-            if followed != Some(0) {
-                return Err("fstatat(self/fd dirfd, \"<N>\") failed after chroot");
-            }
-            const S_IFMT: u32 = 0o170000;
-            const S_IFDIR: u32 = 0o040000;
-            let mode = stat_mode(&st);
-            if mode & S_IFMT != S_IFDIR {
-                return Err("the followed fd link did not describe the open directory");
-            }
-            // Negative: "/proc" itself is gone from the new root.
-            if call(
-                Syscall::Newfstatat.raw(),
-                a3(
-                    AT_FDCWD,
-                    proc_path.as_ptr() as u64,
-                    st.as_mut_ptr() as u64,
-                    0,
-                ),
-            ) == Some(0)
-            {
-                return Err("absolute /proc still resolves inside the new root");
-            }
-            Ok(())
-        })();
-        let _ = call(Syscall::Close.raw(), a0(proc_fd));
-        crate::handlers::__test_root_dir_reset();
-        const MNT_DETACH: u64 = 1 << 1;
-        let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
-        result
-    })
+        Ok(())
+    })();
+    let _ = call(Syscall::Close.raw(), a0(proc_fd));
+    crate::handlers::__test_root_dir_reset();
+    const MNT_DETACH: u64 = 1 << 1;
+    let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
+    result
 }
 fn smoke_abi_proc2_proc_dirfd_survives_chroot() -> TestResult {
     proc_dirfd_survives_chroot_into(b"/abi-procjail\0")
@@ -4297,6 +4300,48 @@ fn smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo() -> TestResult {
 kernel_test_in!(
     "syscall_abi/procfd",
     smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo
+);
+
+/// Chromium's zygote runs that sequence as pid 1 of its own PID namespace,
+/// with `/proc` still the parent's mount. There `self` is the caller's pid in
+/// its own namespace, so the `self/fd/` dirfd it opens after the chroot is
+/// `/proc/<inner pid>/fd`, and following its `<N>` has to resolve that pid in
+/// the caller's namespace (`find_task_by_vpid`). Resolved as a root-namespace
+/// pid it named another process: the zygote got EACCES from the ptrace check
+/// (`proc_util.cc:115`) and Chromium never started. A root-namespace process
+/// at outer pid 2, the caller's inner pid, is the wrong owner it would find.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_proc_dirfd_survives_chroot_in_pid_ns() -> TestResult {
+    const MANAGER_TASK: u64 = 0xB200;
+    const MANAGER_PID: u64 = 0xB210;
+    const VICTIM_TASK: u64 = 0xB201;
+    const VICTIM_PID: u64 = 2; // the caller's inner pid
+    with_setup(|| {
+        crate::pid_ns::__test_reset();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        register(MANAGER_TASK, MANAGER_PID);
+        register(VICTIM_TASK, VICTIM_PID);
+        crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+        let result = match crate::pid_ns::inherit_into_child(MANAGER_TASK, FAKE_TASK, FAKE_TASK) {
+            Some(inner) if inner == VICTIM_PID => proc_dirfd_chroot_walk(b"/proc/self/fdinfo/\0"),
+            _ => Err("fixture: the caller did not get inner pid 2"),
+        };
+        crate::pid_ns::__test_reset();
+        for task in [MANAGER_TASK, VICTIM_TASK] {
+            crate::task::release_task(task);
+        }
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_proc_dirfd_survives_chroot_in_pid_ns
 );
 
 /// Protection keys belong to the address space
