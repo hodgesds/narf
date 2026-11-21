@@ -716,6 +716,14 @@ also consult upstream Linux GPL sources.
   for good (Linux `handle_tx_event` drops an event matching no TD).
   Unlatched interrupt, bulk and isochronous events still queue for their
   pumps.
+- The interrupt handler services each controller in Linux `xhci_irq`
+  order: USBSTS all-ones, HCE or HSE is fatal (no event handled, recovery
+  requested); without USBSTS.EINT the interrupt is not that controller's;
+  otherwise EINT then IMAN.IP are acknowledged before the drain, at most 64
+  events are drained, and ERDP is written once with EHB cleared. Ring
+  pollers in task context write ERDP with EHB when they find the ring
+  empty after consuming events, and every drain updates ERDP (EHB kept)
+  every half segment. Interrupt moderation is 40 µs (IMODI 160).
 - `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
