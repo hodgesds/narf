@@ -11805,7 +11805,13 @@ reports the alert, per-source counters and any shutdown reason.
 
 Hang detection (`amdgpu_navi22_tdr`) follows drm_sched's per-ring job timeout
 with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
-queues all verified, a task samples every 250 ms, under the owner lock,
+queues all verified, a task samples, under the owner lock, only while a job is
+in flight, as drm_sched arms its timeout at job start and cancels it when
+nothing is pending: `Queue::next_seq` (kernel and client job fences) and the
+SDMA kernel-frame path (`submit_kernel`) call `tdr::job_emitted`, which wakes
+the parked task; it samples at once, then
+at the earliest pending job's timeout (`tdr::next_sample`), and with nothing
+pending (or only hangs already reported) arms no timer. Each sample reads
 `Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
 (`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
 after an HDP invalidate; an all-ones read-back is device loss). The sample
