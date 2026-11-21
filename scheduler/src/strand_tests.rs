@@ -2068,39 +2068,102 @@ kernel_test_in!(
     smoke_scheduler_masked_wake_for_stalled_cpu_kicks_an_idle_cpu
 );
 
+/// Hold real CPU `ap` inside its executor: a plain (non-yielding) future
+/// pinned to it spins in its poll until [`release_cpu`]. `false` if the CPU
+/// never started it.
+fn hold_cpu(ap: usize) -> bool {
+    HOLD_STARTED.store(false, Ordering::Release);
+    HOLD_RELEASE.store(false, Ordering::Release);
+    HOLD_DONE.store(false, Ordering::Release);
+    crate::spawn_with_spec(
+        async {
+            HOLD_STARTED.store(true, Ordering::Release);
+            wait_for(HOLD_LIMIT_NS, || HOLD_RELEASE.load(Ordering::Acquire));
+            HOLD_DONE.store(true, Ordering::Release);
+        },
+        TaskSpec {
+            affinity: Affinity::pinned(CpuId(ap as u32)),
+            ..TaskSpec::kernel_any()
+        },
+    );
+    if wait_for(1_000_000_000, || HOLD_STARTED.load(Ordering::Acquire)) {
+        return true;
+    }
+    HOLD_RELEASE.store(true, Ordering::Release);
+    false
+}
+
+/// End a [`hold_cpu`]; `true` once the held poll returned.
+fn release_cpu() -> bool {
+    HOLD_RELEASE.store(true, Ordering::Release);
+    wait_for(1_000_000_000, || HOLD_DONE.load(Ordering::Acquire))
+}
+
+/// A real CPU that came up, other than this one.
+fn live_peer() -> Option<usize> {
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    (0..MAX_CPUS).find(|cpu| *cpu != me && live & (1u64 << cpu) != 0)
+}
+
 /// The stall watchdog's runnable-task probe (Linux `wq_watchdog_timer_fn`
-/// per task): a task runnable on a CPU that never dispatches it is named in
-/// whichever place the CPU holds it, with the instant it became runnable,
-/// and a task that has never run at all is as visible as a woken one. A
-/// parked task nobody woke is not runnable and is never named.
+/// per task) on a CPU stuck inside its executor — in a task poll that does
+/// not return, the real stall: a woken task parked on it is named, with the
+/// instant it became runnable, and the stamp stays put while it waits; a
+/// task that has never run is as visible as a woken one. A parked task
+/// nobody woke is not runnable and is never named.
 fn smoke_scheduler_oldest_runnable_names_stranded_task() -> TestResult {
     use crate::RunnableHold;
     reset_probes();
-    let Some(stuck) = StuckCpu::claim() else {
-        return TestResult::Skip("every CPU index has been online");
+    let Some(ap) = live_peer() else {
+        return TestResult::Skip("needs a second CPU that really came up");
     };
-    let me = narf_lib::percpu::current_cpu();
-    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+    let pinned = TaskSpec {
+        affinity: Affinity::pinned(CpuId(ap as u32)),
+        ..TaskSpec::kernel_any()
+    };
 
-    let Some((parked_id, _cell)) = park_probe_on(0, 1, stuck.0, Some(pinned)) else {
-        stuck.release();
-        return TestResult::Fail("could not park the pinned probe on the stuck CPU");
-    };
-    if crate::dbg_oldest_runnable(stuck.0).is_some() {
-        stuck.release();
-        return TestResult::Fail("a parked task nobody woke was reported runnable");
+    // T runs once on the AP and parks there.
+    let parked_id = crate::spawn_with_spec(Probe { slot: 0, parks: 1 }, pinned);
+    let parked = wait_for(1_000_000_000, || {
+        polls(0) == 1
+            && PROBE_WAKER[0]
+                .lock()
+                .as_ref()
+                .and_then(crate::scheduler_wake_cell)
+                .is_some_and(|cell| {
+                    let token = cell.parked_location.load(Ordering::Acquire);
+                    token != crate::NOT_PARKED && token % MAX_CPUS == ap
+                })
+    });
+    if !parked || !hold_cpu(ap) {
+        let _ = release_cpu();
+        reset_probes();
+        return TestResult::Fail("the AP did not park the probe and enter a held poll");
     }
+    let unwoken = crate::dbg_oldest_runnable(ap);
     let woke_at = narf_time::now_cycles();
-    let Some(waker) = take_waker(0) else {
-        stuck.release();
-        return TestResult::Fail("probe published no waker");
-    };
-    waker.wake();
-    let woken = crate::dbg_oldest_runnable(stuck.0);
+    let woke = take_waker(0).map(Waker::wake).is_some();
+    let woken = crate::dbg_oldest_runnable(ap);
     // Never dispatched: the stamp stays put while time passes.
     narf_time::busy_wait_cycles(narf_time::ns_to_cycles(20_000_000));
-    let later = crate::dbg_oldest_runnable(stuck.0);
-    stuck.release();
+    let later = crate::dbg_oldest_runnable(ap);
+    let released = release_cpu() && wait_for(1_000_000_000, || polls(0) == 2);
+
+    // A task spawned for the held AP, which never runs it.
+    let held = hold_cpu(ap);
+    let spawned_at = narf_time::now_cycles();
+    let queued_id = crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, pinned);
+    let queued = crate::dbg_oldest_runnable(ap);
+    let released_again = release_cpu() && wait_for(1_000_000_000, || polls(1) == 1);
+    reset_probes();
+
+    if unwoken.is_some() {
+        return TestResult::Fail("a parked task nobody woke was reported runnable");
+    }
+    if !woke || !released || !held || !released_again {
+        return TestResult::Fail("the held AP did not run its tasks once released");
+    }
     match woken {
         Some(o) if o.task == parked_id.raw() && o.hold == RunnableHold::ParkedWake => {
             if o.since_cycles < woke_at || !o.allowed {
@@ -2111,15 +2174,56 @@ fn smoke_scheduler_oldest_runnable_names_stranded_task() -> TestResult {
             }
         }
         _ => {
-            return TestResult::Fail("a woken task parked on a CPU that never drains was not named")
+            return TestResult::Fail(
+                "a woken task parked on a CPU stuck in a task poll was not named",
+            )
         }
     }
+    match queued {
+        Some(o)
+            if o.task == queued_id.raw()
+                && matches!(o.hold, RunnableHold::WakeInbox | RunnableHold::Ready)
+                && o.since_cycles >= spawned_at
+                && o.since_cycles <= narf_time::now_cycles() =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("a spawned task that never ran was not named on its held CPU"),
+    }
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_oldest_runnable_names_stranded_task
+);
 
-    // A task spawned and enqueued onto the stuck CPU, which never runs it.
+/// Linux judges a worker pool only once workqueues run; boot work before
+/// that runs in kthreads that do schedule. NARF's equivalent of "not yet
+/// running" is a CPU outside its executor: the boot CPU running initcalls
+/// (or this test harness) synchronously, or a CPU whose executor has never
+/// started. Tasks queued on such a CPU wait by design, so the runnable-task
+/// probe must not name them however long they have waited.
+fn smoke_scheduler_oldest_runnable_skips_cpu_outside_executor() -> TestResult {
+    reset_probes();
+    let me = narf_lib::percpu::current_cpu();
+    // This CPU runs the harness outside its executor, as boot runs
+    // initcalls: a task pinned here cannot run until a round is driven.
+    crate::spawn_with_spec(
+        Probe { slot: 0, parks: 0 },
+        TaskSpec {
+            affinity: Affinity::pinned(CpuId(me as u32)),
+            ..TaskSpec::kernel_any()
+        },
+    );
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(2_000_000));
+    let on_harness_cpu = crate::dbg_oldest_runnable(me);
+    let ran_meanwhile = polls(0) != 0;
+    reset_probes();
+
+    // A CPU whose executor never started, with a task enqueued onto it.
     let Some(stuck) = StuckCpu::claim() else {
         return TestResult::Skip("every CPU index has been online");
     };
-    let spawned_at = narf_time::now_cycles();
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
     let queued_id = crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
     let Some(mut slot) = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front()) else {
         stuck.release();
@@ -2128,21 +2232,23 @@ fn smoke_scheduler_oldest_runnable_names_stranded_task() -> TestResult {
     slot.spec.affinity = pinned;
     slot.affinity_generation = crate::register_task_affinity(queued_id, pinned, false);
     crate::enqueue_on(stuck.0, slot, TaskEnqueueReason::Requeued);
-    let queued = crate::dbg_oldest_runnable(stuck.0);
+    let on_unstarted_cpu = crate::dbg_oldest_runnable(stuck.0);
     stuck.release();
-    match queued {
-        Some(o)
-            if o.task == queued_id.raw()
-                && o.hold == RunnableHold::WakeInbox
-                && o.since_cycles >= spawned_at
-                && o.since_cycles <= narf_time::now_cycles() =>
-        {
-            TestResult::Pass
-        }
-        _ => TestResult::Fail("a spawned task that never ran was not named on its CPU"),
+
+    if ran_meanwhile {
+        return TestResult::Skip("the harness CPU ran its queue meanwhile");
     }
+    if on_harness_cpu.is_some() {
+        return TestResult::Fail(
+            "a task queued on a CPU running synchronous code outside its executor was named",
+        );
+    }
+    if on_unstarted_cpu.is_some() {
+        return TestResult::Fail("a task queued on a CPU whose executor never started was named");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "scheduler/strand",
-    smoke_scheduler_oldest_runnable_names_stranded_task
+    smoke_scheduler_oldest_runnable_skips_cpu_outside_executor
 );

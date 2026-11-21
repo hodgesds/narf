@@ -94,6 +94,12 @@ mod isoch_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "root_port_tests.rs"]
+mod root_port_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "supervisor_wake_tests.rs"]
+mod supervisor_wake_tests;
 pub use bulk_owner::{
     Direction as BulkDirection, Token as BulkToken, Token as IsochToken, ISOCH_PIPELINE_DEPTH,
 };
@@ -600,6 +606,13 @@ pub struct Xhci {
     /// Waker of this controller's USB supervisor, poked by the demux on a
     /// Port Status Change Event.
     supervisor_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Kicks of this controller's supervisor (`wake_supervisor`): its wait
+    /// ends when the count moves past the value it saw.
+    supervisor_kicks: AtomicU64,
+    /// Waits for the next kick (`supervisor_wait::park`).
+    supervisor_waiters: narf_lib::readiness::WaitQueue,
+    /// Port Status Change Events demuxed on this controller.
+    port_events: AtomicU64,
     /// Per-endpoint completion wakers `(slot, dci, waker)`: the demux wakes
     /// an endpoint's owner when a Transfer Event for it arrives, the shape
     /// of a Linux URB completion handler (`btusb_intr_complete`).
@@ -2020,6 +2033,9 @@ impl Xhci {
             id: 0,
             bus_addr: device.addr,
             supervisor_waker: IrqSafeSpinLock::new(None),
+            supervisor_kicks: AtomicU64::new(0),
+            supervisor_waiters: narf_lib::readiness::WaitQueue::new(),
+            port_events: AtomicU64::new(0),
             endpoint_wakers: IrqSafeSpinLock::new(Vec::new()),
             cmd_abort_active: core::sync::atomic::AtomicBool::new(false),
             cmd_last_completion: AtomicU64::new(0),
@@ -2129,10 +2145,51 @@ impl Xhci {
     /// lock is dropped before `wake_by_ref` to keep IRQ-context work
     /// bounded.
     fn wake_supervisor(&self) {
+        // Count first: a wait that registers after this load still sees
+        // the kick in its recheck.
+        self.supervisor_kicks.fetch_add(1, Ordering::SeqCst);
         let w = self.supervisor_waker.lock().clone();
         if let Some(w) = w {
             w.wake_by_ref();
         }
+        self.supervisor_waiters.wake(1);
+    }
+
+    /// Kick this controller's supervisor: an API caller queued work for
+    /// its pumps (Linux `kick_hub_wq`).
+    pub fn kick_supervisor(&self) {
+        self.wake_supervisor();
+    }
+
+    /// Kicks of this controller's supervisor so far.
+    pub fn supervisor_kicks(&self) -> u64 {
+        self.supervisor_kicks.load(Ordering::SeqCst)
+    }
+
+    /// Port Status Change Events demuxed on this controller so far.
+    pub fn port_status_events(&self) -> u64 {
+        self.port_events.load(Ordering::SeqCst)
+    }
+
+    /// Register `waker` under `id` for the next supervisor kick; true when
+    /// a kick newer than `seen` already happened (the registration is
+    /// then dropped).
+    pub(crate) fn arm_supervisor_wait(
+        &self,
+        id: u64,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> bool {
+        self.supervisor_waiters
+            .arm(id, 1, waker, || {
+                u32::from(self.supervisor_kicks.load(Ordering::SeqCst) != seen)
+            })
+            .is_ready()
+    }
+
+    /// Drop the supervisor-kick registration `id`.
+    pub(crate) fn disarm_supervisor_wait(&self, id: u64) {
+        self.supervisor_waiters.disarm(id);
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -2329,6 +2386,21 @@ impl Xhci {
         let off = self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
         // SAFETY: identity-mapped MMIO; port-range checked above.
         Some(unsafe { self.mmio.read32(off) })
+    }
+
+    /// Acknowledge root port `port`'s change bits; returns the bits it
+    /// cleared. See [`root_port_change_ack`].
+    pub fn ack_root_port_changes(&self, port: u8) -> u32 {
+        let Some(v) = self.portsc(port) else {
+            return 0;
+        };
+        let Some(write) = root_port_change_ack(v) else {
+            return 0;
+        };
+        let off = self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
+        // SAFETY: identity-mapped MMIO; `portsc` checked the port range.
+        unsafe { self.mmio.write32(off, write) };
+        write & PORTSC_CHG_MASK
     }
 
     /// `true` if the port currently has a connected device (PORTSC.CCS).
@@ -2801,6 +2873,7 @@ impl Xhci {
         // supervisor waker.
         if ty == TRB_TYPE_PORT_STATUS_CHANGE {
             USB_PSCE_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
+            self.port_events.fetch_add(1, Ordering::SeqCst);
             // The counter publication is ordered already. Invoke arbitrary
             // registered wakers after releasing the demux reservation.
             drop(publication);
@@ -6302,6 +6375,23 @@ impl Xhci {
 
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// The PORTSC write that acknowledges the change bits set in `portsc`,
+/// or `None` when none needs acknowledging.
+///
+/// The controller raises a Port Status Change Event only when a change
+/// bit goes from 0 to 1 (xHCI 1.2 §4.19.2), so every change the
+/// supervisor has seen is cleared — Linux's ClearPortFeature(C_*) →
+/// `xhci_clear_port_change_bit`. The write leaves the port neutral
+/// (`xhci_port_state_to_neutral`): PED and PR are never echoed, and the
+/// link state is not written (LWS stays clear).
+pub(crate) fn root_port_change_ack(portsc: u32) -> Option<u32> {
+    let changes = portsc & PORTSC_CHG_MASK;
+    if changes == 0 {
+        return None;
+    }
+    Some(op::PortStatus::clear_changes_value(portsc, changes) & !op::PORTSC_LWS)
+}
+
 /// Where a Transfer Event no owner latched goes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EventRoute {
@@ -6858,7 +6948,12 @@ fn xhci_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError
     }
     let resumed = controllers().iter().fold(true, |ok, c| {
         // SAFETY: same.
-        (unsafe { c.run_for_resume() }) && ok
+        let running = unsafe { c.run_for_resume() };
+        // The supervisor parks until kicked: after resume it re-checks
+        // its ports and resumes bound hub ports (Linux `hub_resume` →
+        // `hub_activate(HUB_RESUME)` kicks `hub_wq`).
+        c.kick_supervisor();
+        running && ok
     });
     if resumed {
         Ok(())

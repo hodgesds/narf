@@ -684,6 +684,8 @@ impl Queue {
     pub(crate) fn next_seq(&mut self) -> u32 {
         // Zero is the initial writeback and the VMID manager's "no job".
         self.seq = self.seq.wrapping_add(1).max(1);
+        // The job starts: the hang detector times it (drm_sched_job_begin).
+        crate::amdgpu_navi22_tdr::job_emitted();
         self.seq
     }
 }

@@ -25,6 +25,7 @@ pub mod vector;
 pub mod wait;
 pub mod wake;
 
+mod console_lines_tests;
 mod gic_dt_tests;
 mod gic_spi_tests;
 #[cfg(target_arch = "x86_64")]

@@ -893,7 +893,15 @@ impl TtyUsbFile {
                 // are accepted as no-ops.
                 match arg {
                     0 => self.port.lock().tx_stopped = true,
-                    1 => self.port.lock().tx_stopped = false,
+                    1 => {
+                        let index = {
+                            let mut p = self.port.lock();
+                            p.tx_stopped = false;
+                            p.index
+                        };
+                        // Output restarted: queued bytes go out now.
+                        port::kick_tty(index);
+                    }
                     2 | 3 => {}
                     _ => return Err(FsError::InvalidData),
                 }
@@ -957,9 +965,11 @@ impl FileOps for TtyUsbFile {
             (port.tx.push(buf), port.index)
         };
         // A module-owned node has no supervisor pump: tell its driver
-        // (outside the port lock) that bytes are queued.
+        // (outside the port lock) that bytes are queued; a built-in
+        // binding's supervisor pump is kicked the same way.
         if n > 0 {
             crate::module_datapath::serial_kick(index);
+            port::kick_tty(index);
         }
         Box::pin(async move { Ok(n) })
     }

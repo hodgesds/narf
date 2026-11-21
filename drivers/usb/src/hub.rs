@@ -726,18 +726,32 @@ impl UsbHub {
     /// device (PORT_STATUS.CONNECTION = 1), acknowledging each port's
     /// connect / enable / over-current / reset change bits on the way
     /// (Linux `port_event`): the hub reports a port on its status-change
-    /// endpoint for as long as a change bit stays set.
-    pub async fn connected_downstream_ports(&self, xhci_dev: &Xhci) -> Vec<u8> {
-        self.connected_downstream_ports_transport(xhci_dev).await
+    /// endpoint for as long as a change bit stays set. `suspended` holds
+    /// the ports the host has suspended (bit N = port N), whose
+    /// C_PORT_SUSPEND belongs to the remote-wakeup watches.
+    pub async fn connected_downstream_ports(&self, xhci_dev: &Xhci, suspended: u64) -> Vec<u8> {
+        self.connected_downstream_ports_transport(xhci_dev, suspended)
+            .await
     }
 
-    async fn connected_downstream_ports_transport(&self, transport: &impl HubTransport) -> Vec<u8> {
+    async fn connected_downstream_ports_transport(
+        &self,
+        transport: &impl HubTransport,
+        suspended: u64,
+    ) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
         for p in 1..=self.descriptor.num_ports {
             let Ok(s) = self.port_status_transport(transport, p).await else {
                 continue;
             };
-            for (bit, feature) in WALK_ACKED_CHANGES {
+            // On a port the host considers awake, C_PORT_SUSPEND only says
+            // a host resume completed (Linux `port_event` clears it); on a
+            // suspended one it is a remote wakeup, left to the watches.
+            let awake_resume = s & (1 << 18) != 0 && suspended & (1u64 << (p & 63)) == 0;
+            let acked = WALK_ACKED_CHANGES
+                .into_iter()
+                .chain(awake_resume.then_some((1 << 18, C_PORT_SUSPEND)));
+            for (bit, feature) in acked {
                 if s & bit != 0 {
                     let _ = transport
                         .write(

@@ -178,7 +178,15 @@ pub struct HubBinding {
     /// suspended on the next pass" (used as a sentinel after
     /// `port_resume`).
     pub last_activity_tick: [u64; 64],
+    /// The supervisor has to walk this hub's ports: it was just bound,
+    /// its status-change endpoint reported a change, or a port attempt
+    /// failed with retry budget left (Linux `hub->event_bits`).
+    pub walk_pending: bool,
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "attach_walk_tests.rs"]
+mod walk_tests;
 
 /// Registry of bound hubs, one per controller (slot ids are only unique
 /// within a controller), each BFS-ordered (the supervisor walks
@@ -312,9 +320,82 @@ pub async fn hub_status_changed(xhci_dev: &crate::xhci::Xhci) -> bool {
         if bits & 1 != 0 {
             hub.clear_hub_change(xhci_dev).await;
         }
-        changed |= bits != 0;
+        if bits != 0 {
+            changed = true;
+            set_walk_pending(xhci_dev.id(), hub.slot_id, true);
+        }
     }
     changed
+}
+
+/// Whether a hub on `controller` has a port walk pending.
+pub fn hub_walk_pending(controller: u8) -> bool {
+    HUBS.of(controller).lock().iter().any(|h| h.walk_pending)
+}
+
+/// Whether a hub on `controller` has no status-change endpoint, so its
+/// port changes are seen only by walking it.
+pub fn has_hub_without_status(controller: u8) -> bool {
+    HUBS.of(controller)
+        .lock()
+        .iter()
+        .any(|h| h.hub.status.is_none())
+}
+
+/// Monotonic ns at which the earliest bound, awake downstream port's
+/// idle window ends on `controller` — when [`idle_suspend_pass`] next has
+/// work (Linux arms the autosuspend timer for exactly that:
+/// `pm_runtime_autosuspend_expiration`). HID ports, which the pass never
+/// suspends, and ports resumed but not yet active (`u64::MAX`) set none.
+pub fn next_idle_suspend_ns(controller: u8) -> Option<u64> {
+    // HID registries first: the pumps nest their registry lock outside
+    // HUBS, never the other way round.
+    let hid = hid::hub_ports(controller);
+    let g = HUBS.of(controller).lock();
+    next_idle_suspend_at(&g[..], &hid)
+}
+
+/// [`next_idle_suspend_ns`] over a registry snapshot.
+pub(crate) fn next_idle_suspend_at(hubs: &[HubBinding], hid: &[(u8, u8)]) -> Option<u64> {
+    let mut next: Option<u64> = None;
+    for h in hubs {
+        for p in 1..=h.hub.descriptor.num_ports.min(63) {
+            let bit = 1u64 << p;
+            if h.bound_downstream & bit == 0
+                || h.suspended_downstream & bit != 0
+                || hid.contains(&(h.hub.slot_id, p))
+            {
+                continue;
+            }
+            let tick = h.last_activity_tick[usize::from(p)];
+            if tick == u64::MAX {
+                continue;
+            }
+            let at = tick.saturating_add(IDLE_SUSPEND_NS);
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
+    }
+    next
+}
+
+/// Mark (or clear) hub `hub_slot`'s pending port walk.
+pub fn set_walk_pending(controller: u8, hub_slot: u8, pending: bool) {
+    let mut g = HUBS.of(controller).lock();
+    if let Some(h) = g.iter_mut().find(|h| h.hub.slot_id == hub_slot) {
+        h.walk_pending = pending;
+    }
+}
+
+/// Slot ids of the hubs whose ports the supervisor walks this cycle:
+/// those with a walk pending (just bound, a status-change report, a port
+/// to retry — Linux `hub_event` for a hub whose `event_bits` are set),
+/// and hubs without a status-change endpoint, whose changes nothing
+/// reports.
+pub(crate) fn hubs_to_walk(hubs: &[HubBinding]) -> Vec<u8> {
+    hubs.iter()
+        .filter(|h| h.walk_pending || h.hub.status.is_none())
+        .map(|h| h.hub.slot_id)
+        .collect()
 }
 
 /// Pure per-port suspend decision behind [`idle_suspend_pass`]:
@@ -402,6 +483,9 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
         // hook gate exactly as before.
         let report = crate::class_registry::dispatch_suspend(xhci_dev.id(), *slot, *p).await;
         if report.failed > 0 {
+            // Retry after another idle window, not on every pass (Linux
+            // re-arms autosuspend only after the device is busy again).
+            mark_port_activity(xhci_dev.id(), *slot, *p);
             continue;
         }
         // Snapshot the bound hub out of the registry lock so we don't
@@ -420,6 +504,9 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
                 h.suspended_downstream |= 1u64 << (*p as u32 & 63);
             }
             suspended += 1;
+        } else {
+            // A refused suspend waits a new idle window too.
+            mark_port_activity(xhci_dev.id(), *slot, *p);
         }
     }
     suspended
@@ -1114,6 +1201,7 @@ async fn dispatch_after_address(
             bound_downstream: 0,
             suspended_downstream: 0,
             last_activity_tick: [0u64; 64],
+            walk_pending: true,
         });
         return AttachOutcome::Hub;
     }

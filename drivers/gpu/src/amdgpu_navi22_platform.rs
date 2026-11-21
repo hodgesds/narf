@@ -409,6 +409,7 @@ fn start_hotplug(boot: &mut boot::ColdBoot) {
                     crate::amdgpu_navi22_kms::wake();
                 },
             ));
+            HPD_ARMED.store(true, Ordering::Release);
         }
         Err(error) => {
             let _ = writeln!(
@@ -1644,11 +1645,16 @@ pub async unsafe fn modeset_displays(
     unsafe { light(boot, draw) }.await
 }
 
-/// Poll period of the display monitor; DRM requests and recoveries wake it
-/// within `MONITOR_STEP_MS`.
-const MONITOR_MS: u64 = 1000; // linux: n/a (NARF policy)
-const MONITOR_STEP_MS: u64 = 50; // linux: n/a (NARF policy)
+/// The display monitor's pass period while BTR frame insertion runs on a
+/// lit stream (Linux services BTR from each VUPDATE interrupt,
+/// `mod_freesync_handle_v_update`), and before its first pass.
+const MONITOR_MS: u64 = 1000; // linux: n/a (NARF BTR service period)
+/// The output poll of a connector without HPD, or of every connector while
+/// HPD interrupts are unavailable.
+const OUTPUT_POLL_MS: u64 = 10_000; // linux: DRM_OUTPUT_POLL_PERIOD (10*HZ)
 static MONITOR: AtomicBool = AtomicBool::new(false);
+/// HPD reaches the monitor through the IH ring (`start_hotplug`).
+static HPD_ARMED: AtomicBool = AtomicBool::new(false);
 /// Recoveries the display was last lit after.
 static RELIT: AtomicU64 = AtomicU64::new(0);
 
@@ -2077,9 +2083,9 @@ async unsafe fn monitor_pass() {
     alloc::boxed::Box::pin(converge_hdmi_vrr(boot)).await;
     alloc::boxed::Box::pin(converge_crtc_color(boot)).await;
     alloc::boxed::Box::pin(converge_dp_vrr(boot)).await;
-    // The monitor pass is the per-VUPDATE BTR service on Navi22 (50 ms
-    // steps): a missed VUPDATE only resets the BTR cycle, it never
-    // shortens the wrong frame.
+    // The monitor pass is the BTR service on Navi22 (every MONITOR_MS while
+    // frame insertion runs, `monitor_poll`): a missed VUPDATE only resets
+    // the BTR cycle, it never shortens the wrong frame.
     boot.display_lfc_progress();
     // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
     if alloc::boxed::Box::pin(unsafe { converge_group(boot, running) }).await {
@@ -2367,22 +2373,60 @@ pub unsafe fn spawn_display_monitor() {
         Ordering::Release,
     );
     narf_scheduler::spawn(async {
+        let mut poll = Some(MONITOR_MS);
         loop {
-            let mut waited = 0;
-            while waited < MONITOR_MS
-                && !crate::amdgpu_navi22_kms::take_pending()
-                && RELIT.load(Ordering::Acquire) == crate::amdgpu_navi22_recovery::recoveries()
-            {
-                narf_time::SleepUntil::new(
-                    narf_time::Deadline::after_ms(MONITOR_STEP_MS).as_instant(),
-                )
-                .await;
-                waited += MONITOR_STEP_MS;
-            }
+            monitor_wait(poll).await;
             // SAFETY: the monitor's contract, accepted at spawn.
             alloc::boxed::Box::pin(unsafe { monitor_pass() }).await;
+            poll = monitor_poll().await;
         }
     });
+}
+
+/// The display monitor's wait for its next pass: a DRM request or HPD
+/// (`kms::wake`), a recovery, or the `poll` period (`monitor_poll`). With
+/// no poll it arms no timer.
+fn monitor_wait(poll: Option<u64>) -> impl core::future::Future<Output = ()> {
+    use core::{future::Future, pin::Pin, task::Poll};
+    let mut timer =
+        poll.map(|ms| narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()));
+    core::future::poll_fn(move |cx| {
+        let due = || {
+            crate::amdgpu_navi22_kms::take_pending()
+                || RELIT.load(Ordering::Acquire) != crate::amdgpu_navi22_recovery::recoveries()
+        };
+        if due() {
+            return Poll::Ready(());
+        }
+        // Registered before the re-check: `kms::wake` publishes, then wakes.
+        crate::amdgpu_navi22_kms::set_monitor_waker(cx.waker());
+        if due() {
+            return Poll::Ready(());
+        }
+        if let Some(timer) = timer.as_mut() {
+            if Pin::new(timer).poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    })
+}
+
+/// The pass the monitor owes without an event. Linux polls only connectors
+/// without HPD (`drm_kms_helper_poll`, every DRM_OUTPUT_POLL_PERIOD), and
+/// services BTR on every VUPDATE while frame insertion runs; everything else
+/// (hot-plug, HPD-RX link checks, DRM requests, recovery) arrives as an event.
+async fn monitor_poll() -> Option<u64> {
+    let owner = OWNER.lock().await;
+    let boot = owner.as_ref()?;
+    if boot.display_lfc_active() {
+        return Some(MONITOR_MS);
+    }
+    let unsensed = !HPD_ARMED.load(Ordering::Acquire)
+        || boot
+            .display_connectors()
+            .is_some_and(|ports| ports.iter().any(|c| c.hpd.is_none()));
+    unsensed.then_some(OUTPUT_POLL_MS)
 }
 
 /// Called by the recovery path once the new owner runs: the monitor relights
@@ -3885,5 +3929,60 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_variable_refresh_never_extrapolates_hardware_vblanks
+    );
+
+    struct Count(core::sync::atomic::AtomicUsize);
+    impl alloc::task::Wake for Count {
+        fn wake(self: alloc::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    /// Expire hrtimers for `ms`, as executor rounds do while a task parks.
+    fn idle_for(ms: u64) {
+        let deadline = narf_time::Deadline::after_ms(ms);
+        while !deadline.expired() {
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Linux runs display hot-plug from the HPD interrupt (amdgpu_dm's hpd
+    /// handler, then hotplug work) and DRM requests at commit; only a
+    /// connector without HPD is polled, every DRM_OUTPUT_POLL_PERIOD (10 s).
+    /// With no event the monitor's wait arms no short timer, and a request
+    /// (HPD or DRM, both `kms::wake`) ends it at once.
+    fn navi22_display_monitor_sleeps_until_an_event() -> TestResult {
+        use core::{future::Future, task::Context};
+        if amdgpu::pci_device().is_some() {
+            return TestResult::Skip("physical GPU: its monitor consumes requests");
+        }
+        let _ = crate::amdgpu_navi22_kms::take_pending();
+        for poll in [None, Some(10_000)] {
+            let count = alloc::sync::Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
+            let waker = core::task::Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut wait = core::pin::pin!(monitor_wait(poll));
+            if wait.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail("monitor wait ended with no event");
+            }
+            idle_for(150);
+            if count.0.load(Ordering::SeqCst) != 0 {
+                return TestResult::Fail(
+                    "the idle display monitor wakes on a timer (MONITOR_STEP_MS, 20 times a second)",
+                );
+            }
+            crate::amdgpu_navi22_kms::wake();
+            if count.0.load(Ordering::SeqCst) == 0 {
+                return TestResult::Fail("an HPD or DRM request did not wake the monitor at once");
+            }
+            if wait.as_mut().poll(&mut cx).is_pending() {
+                return TestResult::Fail("a woken monitor did not run its pass");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22/monitor",
+        navi22_display_monitor_sleeps_until_an_event
     );
 }

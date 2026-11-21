@@ -161,18 +161,131 @@ pub fn write_str_console_only_level(level: u32, s: &str) {
     write_console_level(level, s);
 }
 
+// ── Console ownership ───────────────────────────────────────────────
+//
+// `CONSOLE.lock` is held for a whole message, so ordinary writers emit whole
+// records. Trap text (the stall watchdog, CPU samples, fatal reports) must
+// not deadlock on it — the CPU it runs on may hold it, mid-write — so it used
+// to skip it and wrote the UART directly, mixing its bytes into whatever
+// another CPU was printing. Linux serialises console output per record and
+// lets an atomic context take a console over only from a holder that is
+// stuck (nbcon ownership; `console_trylock_spinning` hands the lock over from
+// a printing owner instead of failing). Trap text now does the same: it
+// waits for the lock while the holder makes progress, and writes without it
+// only when the holder is this CPU, has made no progress for
+// [`TRAP_CONSOLE_STALL_NS`], or the system is panicking.
+
+/// The CPU holding `CONSOLE.lock`, plus one; 0 while it is free.
+static CONSOLE_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+/// Chunks written to the console by the holder of `CONSOLE.lock`: a waiting
+/// trap writer sees a holder that is still printing.
+static CONSOLE_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// A trap writer's wait expired on a holder that made no progress (one that
+/// died or stopped holding the lock); later trap text only tries the lock
+/// until a writer takes it again, so a stuck holder costs one wait.
+static TRAP_CONSOLE_EXPIRED: AtomicBool = AtomicBool::new(false);
+
+/// The panic path is running: trap text never waits for the console (the
+/// CPUs it stopped may hold it).
+static PANICKING: AtomicBool = AtomicBool::new(false);
+
+/// How long a holder of the console may go without finishing a chunk before
+/// trap text stops waiting for it. A chunk is [`MASKED_CHUNK`] bytes, about
+/// 1.4 ms at 115200 baud.
+const TRAP_CONSOLE_STALL_NS: u64 = 20_000_000;
+
+/// Bound for [`TRAP_CONSOLE_STALL_NS`] before the record clock is installed.
+const TRAP_CONSOLE_STALL_SPINS: u32 = 1 << 22;
+
+/// `CONSOLE.lock`, with its holder published for trap writers.
+struct ConsoleGuard {
+    _lock: narf_lib::sync::IrqSafeSpinLockGuard<'static, ()>,
+}
+
+impl Drop for ConsoleGuard {
+    fn drop(&mut self) {
+        // Runs before the lock field is released.
+        CONSOLE_OWNER.store(0, Ordering::Release);
+    }
+}
+
+fn own_console(lock: narf_lib::sync::IrqSafeSpinLockGuard<'static, ()>) -> ConsoleGuard {
+    CONSOLE_OWNER.store(narf_lib::percpu::current_cpu() + 1, Ordering::Release);
+    if TRAP_CONSOLE_EXPIRED.load(Ordering::Relaxed) {
+        TRAP_CONSOLE_EXPIRED.store(false, Ordering::Relaxed);
+    }
+    ConsoleGuard { _lock: lock }
+}
+
+fn lock_console() -> ConsoleGuard {
+    own_console(CONSOLE.lock.lock())
+}
+
+fn try_lock_console() -> Option<ConsoleGuard> {
+    CONSOLE.lock.try_lock().map(own_console)
+}
+
+/// The console for one record of trap text, or `None` to write without it:
+/// when this CPU holds it (the trap interrupted its own write), when the
+/// system is panicking, or when its holder has finished no chunk for
+/// [`TRAP_CONSOLE_STALL_NS`]. Otherwise waits for it, answering
+/// TLB-shootdown and membarrier requests meanwhile, as `lock()` does.
+fn lock_console_for_trap() -> Option<ConsoleGuard> {
+    if let Some(g) = try_lock_console() {
+        return Some(g);
+    }
+    if PANICKING.load(Ordering::Acquire)
+        || TRAP_CONSOLE_EXPIRED.load(Ordering::Relaxed)
+        || CONSOLE_OWNER.load(Ordering::Acquire) == narf_lib::percpu::current_cpu() + 1
+    {
+        return None;
+    }
+    let mut progress = CONSOLE_PROGRESS.load(Ordering::Relaxed);
+    let mut since = klog::now_ns();
+    let mut spins: u32 = 0;
+    loop {
+        core::hint::spin_loop();
+        if let Some(g) = try_lock_console() {
+            return Some(g);
+        }
+        spins = spins.wrapping_add(1);
+        if spins & 0xFF == 0 {
+            narf_lib::sync::service_masked_work();
+        }
+        let now = CONSOLE_PROGRESS.load(Ordering::Relaxed);
+        if now != progress {
+            progress = now;
+            since = klog::now_ns();
+            spins = 0;
+            continue;
+        }
+        let stalled = if since != 0 {
+            klog::now_ns().saturating_sub(since) >= TRAP_CONSOLE_STALL_NS
+        } else {
+            spins >= TRAP_CONSOLE_STALL_SPINS
+        };
+        if stalled || PANICKING.load(Ordering::Acquire) {
+            TRAP_CONSOLE_EXPIRED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    }
+}
+
 fn write_console_level(level: u32, s: &str) {
     if !klog::console_allows(level) {
         return;
     }
 
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,
         None => return, // pre-init; silently drop
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     write_chunked(s.as_bytes(), |chunk| {
+        uart_tap(chunk);
         // SAFETY: `kind` + `base` were published via Release by `early_init`
         // or `remap_to_virtual`, and we hold the coarse lock; the backend
         // methods themselves uphold the compiler_fence discipline.
@@ -184,6 +297,7 @@ fn write_console_level(level: u32, s: &str) {
 }
 
 mod chunk_tests;
+mod trap_lines_tests;
 
 /// Longest run of bytes written to the UART and the framebuffer between two
 /// [`narf_lib::sync::service_masked_work`] calls. `CONSOLE.lock` masks IRQs,
@@ -219,6 +333,7 @@ fn write_chunked_sinks(bytes: &[u8], mut uart: impl FnMut(&[u8]), fb: bool) {
             .map_or(limit, |i| i + 1);
         let (chunk, tail) = rest.split_at(end);
         uart(chunk);
+        CONSOLE_PROGRESS.fetch_add(1, Ordering::Relaxed);
         // Fan out to the framebuffer-console hook when installed. It parses
         // the stream byte by byte with persistent state, so chunking is
         // invisible to it.
@@ -247,13 +362,14 @@ fn write_chunked_sinks(bytes: &[u8], mut uart: impl FnMut(&[u8]), fb: bool) {
 /// callers that want a klog record pass it themselves; this function does
 /// not record, because CR bytes in the dmesg ring help nobody.
 pub fn write_bytes_raw(bytes: &[u8]) {
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,
         None => return, // pre-init; silently drop
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     write_chunked(bytes, |chunk| {
+        uart_tap(chunk);
         // SAFETY: `kind` + `base` were published via Release by `early_init`
         // or `remap_to_virtual`, and we hold the coarse lock.
         // SAFETY: Valid memory or trusted environment
@@ -268,7 +384,7 @@ pub fn write_bytes_raw(bytes: &[u8]) {
 /// the framebuffer console the VTs draw on, exactly as on Linux, where only
 /// the kernel log (printk) reaches every registered console.
 pub fn write_uart_raw(bytes: &[u8]) {
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,
         None => return, // pre-init; silently drop
@@ -277,6 +393,7 @@ pub fn write_uart_raw(bytes: &[u8]) {
     write_chunked_sinks(
         bytes,
         |chunk| {
+            uart_tap(chunk);
             // SAFETY: `kind` + `base` were published via Release by
             // `early_init` or `remap_to_virtual`, and we hold the coarse lock.
             unsafe {
@@ -292,7 +409,7 @@ pub fn write_uart_raw(bytes: &[u8]) {
 /// the UART, as on Linux. `CONSOLE.lock` still serializes it with printk,
 /// whose text the same framebuffer parser draws.
 pub fn write_fb_raw(bytes: &[u8]) {
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     write_chunked_sinks(bytes, |_| {}, true);
 }
 
@@ -306,7 +423,7 @@ pub fn write_fb_raw(bytes: &[u8]) {
 /// No-op when the console isn't initialised yet.
 #[cfg(target_arch = "x86_64")]
 pub fn enable_rx_irq() {
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,
         None => return,
@@ -334,7 +451,7 @@ pub fn enable_rx_irq() {
 /// doesn't tear against a concurrent TX (only matters when the pump
 /// runs alongside another CPU writing — single-CPU today).
 pub fn try_read_byte() -> Option<u8> {
-    let _g = CONSOLE.lock.lock();
+    let _g = lock_console();
     read_byte_locked()
 }
 
@@ -353,7 +470,7 @@ pub fn try_read_byte() -> Option<u8> {
 /// the IRQ (or the next uncontended park) delivers the byte. Skipping on
 /// contention removes the herd entirely.
 pub fn try_read_byte_uncontended() -> Option<u8> {
-    let _g = CONSOLE.lock.try_lock()?;
+    let _g = try_lock_console()?;
     read_byte_locked()
 }
 
@@ -370,6 +487,34 @@ fn read_byte_locked() -> Option<u8> {
     // no TX side effects.
     // SAFETY: Valid memory or trusted environment
     unsafe { backend::try_read_byte(base, kind) }
+}
+
+/// A kernel test's view of the UART: called with every run of bytes, in the
+/// order the console hands them to the UART, just before they are written
+/// (before `\n` → `\r\n` expansion). Lets a test see what a serial reader
+/// would, for instance whether two CPUs' lines came out whole. Unset outside
+/// tests, which costs each write one load.
+pub type UartTap = fn(&[u8]);
+
+/// Stored as `UartTap as usize`; 0 = none.
+static UART_TAP: AtomicUsize = AtomicUsize::new(0);
+
+/// Install (or with `None` remove) the [`UartTap`]; returns the previous one.
+#[doc(hidden)]
+pub fn __test_set_uart_tap(tap: Option<UartTap>) -> Option<UartTap> {
+    let prev = UART_TAP.swap(tap.map_or(0, |t| t as usize), Ordering::AcqRel);
+    // SAFETY: only this function stores the slot, from a `UartTap`.
+    (prev != 0).then(|| unsafe { core::mem::transmute::<usize, UartTap>(prev) })
+}
+
+#[inline]
+fn uart_tap(bytes: &[u8]) {
+    let t = UART_TAP.load(Ordering::Acquire);
+    if t != 0 {
+        // SAFETY: stored as `UartTap as usize` in `__test_set_uart_tap`.
+        let f: UartTap = unsafe { core::mem::transmute(t) };
+        f(bytes);
+    }
 }
 
 /// Type of the optional framebuffer fan-out callback. Boot-time
@@ -646,6 +791,9 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         // anything new.
         narf_arch::halt_forever();
     }
+    // From here no console output waits for the console lock: the CPUs
+    // stopped below may hold it.
+    PANICKING.store(true, Ordering::Release);
 
     // Stop every other CPU before anything else (Linux `panic()` →
     // `smp_send_stop()`): from here on no other CPU runs a task, so none
@@ -795,21 +943,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     }
     let msg = &buf.bytes[..buf.len];
 
-    // Direct write to UART backend, no lock acquisition.
-    if let Some(kind) = CONSOLE.kind.get() {
-        let base = CONSOLE.base.load(Ordering::Acquire) as usize;
-        if base != 0 {
-            // SAFETY: kind + base published Release; we accept
-            // the risk of interleaving with another CPU's
-            // mid-write — better than deadlocking on the lock.
-            // Real panics are single-CPU events most of the
-            // time anyway.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                backend::write_bytes(base, *kind, msg);
-            }
-        }
-    }
+    panic_uart_emit(msg);
 
     // Direct call into the FB hook, also lock-free.
     let h = FB_HOOK.load(Ordering::Acquire);
@@ -824,6 +958,23 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     run_persist_hook(Some(msg));
 
     narf_arch::halt_forever();
+}
+
+/// The panic report's UART write: direct to the backend, no lock — the
+/// panicking CPU may hold the console lock (it panicked mid-write), and the
+/// CPUs the panic stopped may too. Interleaving with a CPU still printing is
+/// accepted over deadlocking; the panic stops the others first.
+fn panic_uart_emit(msg: &[u8]) {
+    if let Some(kind) = CONSOLE.kind.get() {
+        let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+        if base != 0 {
+            uart_tap(msg);
+            // SAFETY: kind + base published Release; lock-free by design.
+            unsafe {
+                backend::write_bytes(base, *kind, msg);
+            }
+        }
+    }
 }
 
 /// Persistent-log flush callback. `Some(text)` on the panic path (the panic
@@ -888,29 +1039,43 @@ pub fn run_persist_hook(msg: Option<&[u8]>) {
     }
 }
 
-/// Nonblocking string emit used by the CPU trap path. The trap may
-/// have fired while the original code was holding `CONSOLE.lock`
-/// (mid-`write_str`); a blocking re-acquire from the trap handler
-/// would deadlock against itself, which is why every line past
-/// the first one in the exception printer used to vanish. Same
-/// shape as `panic_sink` minus the format-into-stack-buf step
-/// since callers usually want raw writes interleaved with their
-/// own register dumps.
+/// String emit used by the CPU trap path: the stall watchdog, CPU samples,
+/// fatal reports. One call is one record (`TrapWriter` formats a whole
+/// `write!` first), and it reaches the UART whole: it takes the console lock
+/// ordinary writers hold per message, waiting only while the holder makes
+/// progress ([`lock_console_for_trap`]). When this CPU holds the lock (the
+/// trap interrupted its own write), the holder is stuck, or the system is
+/// panicking, it writes without the lock as before — never a deadlock. The
+/// framebuffer hook is not used: it takes its own locks.
 pub fn trap_sink(s: &str) {
     // The normal record path waits for the store lock, which the faulting
     // code may hold. Only try it: serial output must still work if the store
     // is busy, while an available store lets dmesg and persistent capture see
     // watchdogs, CPU samples and fatal reports without a serial connection.
     klog::try_record_trap(s);
-    // The framebuffer hook remains excluded: it takes its own locks.
-    if let Some(kind) = CONSOLE.kind.get() {
-        let base = CONSOLE.base.load(Ordering::Acquire) as usize;
-        if base != 0 {
-            // SAFETY: kind + base were published Release; we accept
-            // the interleave risk versus deadlocking on the lock.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                backend::write_bytes(base, *kind, s.as_bytes());
+    let Some(kind) = CONSOLE.kind.get() else {
+        return;
+    };
+    let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+    if base == 0 {
+        return;
+    }
+    let held = lock_console_for_trap();
+    let mut rest = s.as_bytes();
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(rest.len().min(MASKED_CHUNK));
+        uart_tap(chunk);
+        // SAFETY: kind + base were published Release. Without `held` this
+        // is the lock-free fallback, which accepts interleaving over
+        // deadlocking.
+        unsafe {
+            backend::write_bytes(base, *kind, chunk);
+        }
+        rest = tail;
+        if held.is_some() {
+            CONSOLE_PROGRESS.fetch_add(1, Ordering::Relaxed);
+            if !rest.is_empty() {
+                narf_lib::sync::service_masked_work();
             }
         }
     }

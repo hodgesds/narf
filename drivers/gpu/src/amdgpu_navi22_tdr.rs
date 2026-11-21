@@ -6,7 +6,9 @@
 //! `amdgpu_gpu_recovery`, starts recovery. NARF kernel queues have no job
 //! scheduler, so this watchdog samples each queue's emitted sequence and its
 //! fence writeback: a queue with unsignalled work whose fence has not moved
-//! for the timeout is hung. Detection is always active and logs once per
+//! for the timeout is hung. Like drm_sched it runs only while a job is in
+//! flight: an emitted job wakes it, it samples again at the earliest pending
+//! job's timeout, and with nothing pending it arms no timer. Detection is always active and logs once per
 //! stall. Like Linux's default `amdgpu_gpu_recovery=-1` on a dGPU, a hang
 //! starts recovery (`set_automatic_recovery`, on by default for RX 6000;
 //! `amdgpu.gpu_recovery=0` turns it off), at most
@@ -20,8 +22,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// Linux default lockup timeout for every kernel queue.
 // linux: n/a (literal msecs_to_jiffies(2000) in amdgpu_device.c:amdgpu_device_get_job_timeout_settings)
 pub const TIMEOUT_MS: u64 = 2000;
-/// Sampling period; the detection latency is at most TIMEOUT + PERIOD.
-pub const PERIOD_MS: u64 = 250; // linux: n/a (NARF sampling period)
+/// Retry period while the owner is busy (a sample could not be taken).
+pub const PERIOD_MS: u64 = 250; // linux: n/a (NARF retry period)
 const ENGINES: usize = crate::amdgpu_fence_navi22::ENGINES;
 
 /// One queue's software (emitted) and hardware (signalled) fence sequence.
@@ -191,18 +193,87 @@ pub(crate) fn record(
     hangs
 }
 
+/// When the detector samples next, in ms from `now_ms`: at the earliest
+/// pending job's timeout (drm_sched's `work_tdr`, re-armed by progress);
+/// `None` with nothing pending, or only hangs already reported, until a job
+/// is emitted.
+pub(crate) fn next_sample(watchdog: &Watchdog, now_ms: u64) -> Option<u64> {
+    watchdog
+        .slots
+        .iter()
+        .filter(|s| s.busy && !s.hung)
+        .map(|s| {
+            s.since_ms
+                .saturating_add(watchdog.timeout_ms)
+                .saturating_sub(now_ms)
+        })
+        .min()
+}
+
+/// A job was emitted on a kernel queue since the detector's last sample.
+static JOBS: AtomicBool = AtomicBool::new(false);
+/// The detector while no job is in flight.
+static JOB_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> = IrqSafeSpinLock::new(None);
+
+/// Work was emitted on a kernel queue (`Queue::next_seq`): the job start at
+/// which drm_sched arms its timeout. Wakes a parked detector.
+pub(crate) fn job_emitted() {
+    JOBS.store(true, Ordering::Release);
+    wake_detector();
+}
+
+fn wake_detector() {
+    let waker = JOB_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+/// Resolves after the next [`job_emitted`] (at once if one came since the
+/// last sample).
+fn job_emitted_wait() -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(|cx| {
+        // Registered before the check: `job_emitted` publishes, then wakes.
+        {
+            let mut slot = JOB_WAKER.lock();
+            if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *slot = Some(cx.waker().clone());
+            }
+        }
+        if JOBS.swap(false, Ordering::AcqRel) {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+}
+
 /// Detector task for one owner generation; exits on `stop` or device loss.
 pub(crate) async fn monitor(epoch: u64, generation: u64) {
     use core::fmt::Write;
     let mut watchdog = Watchdog::new(TIMEOUT_MS);
+    // The first sample covers work emitted before the detector started.
+    let mut next = Some(0);
     loop {
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(PERIOD_MS).as_instant()).await;
+        match next {
+            Some(ms) => {
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
+            }
+            // No job in flight: nothing runs until one is emitted.
+            None => job_emitted_wait().await,
+        }
         if EPOCH.load(Ordering::Acquire) != epoch {
             return;
         }
+        // A job emitted from here on is in this sample or wakes the next park.
+        JOBS.store(false, Ordering::Release);
         let samples = match crate::amdgpu_navi22_platform::queue_progress().await {
             Ok(samples) => samples,
-            Err(crate::amdgpu_navi22_boot::Error::Busy) => continue, // owner busy
+            Err(crate::amdgpu_navi22_boot::Error::Busy) => {
+                // Owner busy: try again shortly.
+                next = Some(PERIOD_MS);
+                continue;
+            }
             Err(_) => {
                 crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
                 STATUS.lock().device_lost = true;
@@ -253,17 +324,21 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
                 "amdgpu: navi22 GPU recovery disabled (amdgpu.gpu_recovery=0)"
             );
         }
+        next = next_sample(&watchdog, now_ms);
     }
 }
 
 /// Start a detector for the current owner; any previous one exits.
 pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    wake_detector();
     narf_scheduler::spawn(monitor(epoch, crate::amdgpu_fence_navi22::generation()));
 }
-/// Stop the detector (recovery quiesce or device loss).
+/// Stop the detector (recovery quiesce or device loss); a parked one is
+/// woken to exit.
 pub(crate) fn stop() {
     EPOCH.fetch_add(1, Ordering::AcqRel);
+    wake_detector();
 }
 
 #[cfg(feature = "kernel-test")]
