@@ -2747,6 +2747,8 @@ impl<I: Io> Engine<I> {
         let frame = submit::MediaFrame {
             ring,
             mmhub: client.mmhub,
+            // Layout bounds the HDP bank inside the sub-4 GiB register BAR.
+            hdp: (self.hw.layout.hdp / 4) as u32,
             engine,
             flush: vm.flush.then_some(vm),
             pasid_map: (vm.flush && vm.map_pasid).then_some((

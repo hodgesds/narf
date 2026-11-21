@@ -850,6 +850,8 @@ pub(crate) struct MediaFrame<'a> {
     pub ring: MediaRing,
     /// MMHUB segment-0 dword base (`adev->reg_offset[MMHUB_HWIP][0][0]`).
     pub mmhub: u32,
+    /// HDP segment-0 dword base (`adev->reg_offset[HDP_HWIP][0][0]`).
+    pub hdp: u32,
     pub engine: u32,
     pub flush: Option<VmRef>,
     /// IH LUT write after the flush: (absolute `IH_VMID_<vmid>_LUT_MM`
