@@ -108,10 +108,36 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) 
 }
 
 /// The client media rings (bit `MediaRing::index()`) whose jobs a timeout
-/// on media fence engine `engine` takes down.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-pub(crate) fn media_rings(_engine: crate::amdgpu_fence_navi22::Engine) -> u8 {
-    0
+/// on media fence engine `engine` takes down: every client ring of VCN0's
+/// VCPU (`amdgpu_vcn_reset_engine` resets the instance under its decode and
+/// encode rings), or the JPEG ring.
+pub(crate) fn media_rings(engine: crate::amdgpu_fence_navi22::Engine) -> u8 {
+    use crate::amdgpu_fence_navi22::Engine;
+    use crate::amdgpu_navi22_submit::MediaRing;
+    let rings: &[MediaRing] = match engine {
+        Engine::Vcn0 => &[MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)],
+        Engine::Jpeg => &[MediaRing::Jpeg],
+        _ => &[],
+    };
+    rings.iter().fold(0, |mask, r| mask | 1 << r.index())
+}
+/// A client job on media ring `ring` of `engine` timed out (Linux
+/// `amdgpu_job_timedout` on a video ring): it fails with `-ETIME` and the
+/// other jobs of the engine's rings with `-ECANCELED`; graphics, compute and
+/// SDMA jobs are untouched.
+pub(crate) fn media_hung(
+    engine: crate::amdgpu_fence_navi22::Engine,
+    ring: crate::amdgpu_navi22_submit::MediaRing,
+    generation: u64,
+) {
+    let first = crate::amdgpu_vcn_navi22_cs::FIRST_ID;
+    let rings = u16::from(media_rings(engine)) << first;
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    if let Some(current) = current.filter(|current| current.epoch == generation) {
+        let _ = current.progress();
+        current.jobs.lock().fail_rings(first + ring.index(), rings);
+    }
+    crate::amdgpu_fence_navi22::notify_all();
 }
 
 const RINGS: [Option<Ring>; 10] = [

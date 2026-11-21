@@ -12,6 +12,14 @@ pub(super) struct Jobs {
     completed: [u32; RING_IDS],
     pub terminal: Option<FsError>,
     pending: Vec<(u64, Arc<Health>)>,
+    /// Ticket ring ids (bits) of a media engine that timed out
+    /// (`fail_rings`): their unretired jobs fail, the other rings run on.
+    failed: u16,
+}
+
+/// The ticket's ring id (the low four bits of its ring index).
+fn ring_id(ticket: u64) -> usize {
+    ((ticket >> 32) as u32 & 15) as usize
 }
 
 #[cfg(feature = "kernel-test")]
@@ -145,6 +153,7 @@ impl Jobs {
             completed: [0; RING_IDS],
             terminal: None,
             pending: Vec::new(),
+            failed: 0,
         }
     }
     pub fn retired(&self, ticket: u64) -> bool {
@@ -165,7 +174,7 @@ impl Jobs {
             .retain(|(ticket, _)| !super::job_done(epoch, completed, *ticket));
     }
     pub fn emitted(&mut self, ticket: u64, health: &Arc<Health>) {
-        if self.terminal.is_some() {
+        if self.terminal.is_some() || self.failed & 1 << ring_id(ticket) != 0 {
             health.mark_canceled();
         }
         self.pending.push((ticket, health.clone()));
@@ -180,25 +189,41 @@ impl Jobs {
     }
     pub fn hang(&mut self, ring: usize) {
         if self.terminal.is_none() {
-            if let Some((_, health)) = self
-                .pending
-                .iter()
-                .find(|(ticket, _)| (*ticket >> 32) as u32 & 15 == ring as u32)
-            {
-                health.mark_guilty();
-            }
+            self.mark_guilty(ring);
             self.finish(FsError::Canceled);
         }
     }
-    /// A media engine's job on ring `hung` timed out and no recovery
-    /// follows; `rings` (ticket ring-id bits) are that engine's rings.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    pub fn fail_rings(&mut self, _hung: usize, _rings: u16) {}
+    /// The oldest pending job of ring `ring` timed out (`-ETIME`).
+    fn mark_guilty(&mut self, ring: usize) {
+        if let Some((_, health)) = self.pending.iter().find(|(t, _)| ring_id(*t) == ring) {
+            health.mark_guilty();
+        }
+    }
+    /// A media engine's job on ring `hung` timed out (`amdgpu_job_timedout`
+    /// on a video ring); `rings` (ticket ring-id bits) are every ring of that
+    /// engine. The timed-out job ends with `-ETIME`, the other unretired
+    /// jobs of those rings and any published there later with `-ECANCELED`,
+    /// as Linux's VCN engine reset force-completes them. Other rings keep
+    /// running; unconfirmed media memory stays quarantined until its own
+    /// writeback retires it.
+    pub fn fail_rings(&mut self, hung: usize, rings: u16) {
+        if self.terminal.is_some() {
+            return;
+        }
+        self.mark_guilty(hung);
+        for (ticket, health) in &self.pending {
+            if rings & 1 << ring_id(*ticket) != 0 {
+                health.mark_canceled();
+            }
+        }
+        self.failed |= rings;
+    }
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if self.retired(ticket) {
             return None;
         }
-        self.terminal.map(|error| {
+        let failed = (self.failed & 1 << ring_id(ticket) != 0).then_some(FsError::Canceled);
+        self.terminal.or(failed).map(|error| {
             if error == FsError::Canceled {
                 self.pending
                     .iter()

@@ -11816,9 +11816,28 @@ SDMA kernel-frame path (`submit_kernel`) call `tdr::job_emitted`, which wakes
 the parked task; it samples at once, then
 at the earliest pending job's timeout (`tdr::next_sample`), and with nothing
 pending (or only hangs already reported) arms no timer. Each sample reads
-`Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
-(`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
-after an HDP invalidate; an all-ones read-back is device loss). The sample
+`Progress { engine, media, emitted, signaled }` of GFX, KIQ, compute and SDMA
+(`media: None`) and of every client media ring (`media: Some(MediaRing)`,
+`Media::client_progress`: the VCN0 decode and encode rings and JPEG that
+passed their ring and IB tests; a client media job emitted by
+`Engine::submit_client` also calls `tdr::job_emitted`), each the ring's last
+sequence and its fence writeback after an HDP invalidate
+(`ColdBoot::queue_progress`; an all-ones read-back is device loss). Media
+rings are timed with Linux's `video_timeout` (also 2 s), one timer per ring
+although VCN0's rings share fence engine `Vcn0`. A media timeout is
+`amdgpu_job_timedout` on a video ring: it logs `ring <engine> <ring> timeout,
+signaled seq=…, emitted seq=…` and the VCN register line (or JRBC pointers and
+JPEG power state) of `Media::report_client_timeout`, then
+`amdgpu_navi22_cs::media_hung` fails the oldest pending job of that ring with
+`TimedOut` (`-ETIME`, its context guilty) and the other jobs of that engine's
+rings (`media_rings`: VCN0 decode and both encode rings, or JPEG) with
+`Canceled`, as Linux's `amdgpu_vcn_reset_engine` force-completes them; jobs
+published there later are canceled too. Graphics, compute and SDMA jobs keep
+running. Linux then resets the VCN instance alone (VCN 3.0's per-queue reset);
+NARF has no per-engine VCN reset and does not start a whole-GPU recovery for
+a media timeout: `amdgpu_vcn_navi22_cs::withdraw` removes the engine's rings
+from clients and `AMDGPU_INFO` until the next recovery or boot, while their
+fences stay readable so a late completion still retires its memory. The sample
 reads no GC register, so like Linux's fence timeout it takes no GFXOFF
 reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
@@ -12102,7 +12121,10 @@ a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
 data at the client's VMID; the JPEG fence is `JPEG_FENCE` in the JPEG
 reservation. Two jobs outstanding per ring; frames are bounded to half the
 ring. Not emitted: the post-flush VM fence (Linux bookkeeping; the job's own
-fence stands in, as on the kernel queues).
+fence stands in, as on the kernel queues). A client media job that never
+completes times out after 2 s on its own ring (hang detection,
+`amdgpu_navi22_tdr`): the client sees `-ETIME`/`-ECANCELED` and the engine's
+rings are withdrawn.
 
 `amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
 unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,

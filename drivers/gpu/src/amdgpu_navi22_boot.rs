@@ -1873,7 +1873,8 @@ impl ColdBoot {
                 .and_then(Queues::proof)
                 .is_some()
     }
-    /// TDR sample of every verified kernel queue; empty without queues.
+    /// TDR sample of every verified kernel queue and client media ring;
+    /// empty without queues.
     pub(crate) fn queue_progress(
         &mut self,
     ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
@@ -1893,7 +1894,22 @@ impl ColdBoot {
         samples.push(queues.gfx.progress().map_err(Error::Queues)?);
         samples.extend(queues.compute.progress().map_err(Error::Queues)?);
         samples.extend(queues.sdma.progress().map_err(Error::Queues)?);
+        // The client media rings: Linux's drm_sched `video_timeout`.
+        if let Some(media) = self.sequence.backend.media.as_mut() {
+            samples.extend(media.client_progress().map_err(Error::Media)?);
+        }
         Ok(samples)
+    }
+    /// Timeout-only evidence of a client media job that never completed
+    /// (`Media::report_client_timeout`); nothing without a media owner.
+    pub(crate) fn media_timeout_report(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+        seq: u32,
+    ) {
+        if let Some(media) = self.sequence.backend.media.as_mut() {
+            media.report_client_timeout(ring, seq);
+        }
     }
     /// Timeout-only graphics evidence from the retained verified queue.
     pub(crate) fn gfx_hang_snapshot(
