@@ -261,9 +261,14 @@ impl Model {
             }
         }
         self.regs.insert(v(i, PGFSM_STATUS), status);
+        // UVDM off: the VCPU loses its state, a wedged one included.
+        if status & 3 == 2 {
+            self.wedged[i] = false;
+        }
     }
     fn vcpu(&mut self, i: usize, old: u32, new: u32) {
         if new & VCPU_BLK_RST != 0 {
+            self.wedged[i] = false;
             let status = self.reg(v(i, STATUS)) & !VCPU_REPORT_BOOTED;
             self.regs.insert(v(i, STATUS), status);
             return;
@@ -459,6 +464,12 @@ impl Model {
                 self.dec(i, &words, false);
                 self.rptr[slot] = value;
                 self.regs.insert(v(i, RBC_RB_RPTR), value);
+                if self.dpg(i) {
+                    // The firmware keeps fw_shared rb.rptr, which the DPG
+                    // pause restores into UVD_RBC_RB_RPTR.
+                    let shared = self.dpg_shared(i);
+                    self.put(shared + shared::RB_RPTR, value);
+                }
                 return;
             }
             for j in [0, 1] {
@@ -558,6 +569,18 @@ impl Io for Model {
         let old = self.reg(address);
         self.regs.insert(address, value);
         for i in [0, 1] {
+            // A written read pointer is where the engine fetches next.
+            if address == v(i, RBC_RB_RPTR) {
+                self.rptr[3 * i] = value % RING_DW;
+            }
+            for j in [0, 1] {
+                if address == v(i, RB_RPTR[j]) {
+                    self.rptr[3 * i + 1 + j] = value % RING_DW;
+                }
+            }
+            if i == 0 && address == v(0, JRBC_RB_RPTR) {
+                self.rptr[6] = value % RING_DW;
+            }
             if address == v(i, PGFSM_CONFIG) {
                 self.pgfsm(i, value);
             }
@@ -1885,7 +1908,7 @@ fn vcn_navi22_ring_timeout_snapshot_reads_linux_vcn3_dump() -> TestResult {
     }
     // fw_shared: no ring reset pending, the decode pointers the firmware
     // restores from; then the VCN_ENC_CMD_IB the encoder sits on.
-    if s.shared != [0, 0, 0x50] {
+    if s.shared != [0, 0x50, 0x50] {
         return TestResult::Fail("timeout snapshot fw_shared modes and decode pointers");
     }
     if s.at_rptr != [cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, 13] {
@@ -1947,6 +1970,152 @@ fn runtime_engine(mode: StartMode, gated: bool) -> (Pool, Engine<Model>, Runtime
     run(e.test_ib()).unwrap();
     (pool, e, pm)
 }
+/// A media client over the model's MMHUB, and one 16-dword client IB under
+/// a flushing MMHUB grant.
+fn media_client(pool: &Pool) -> Client {
+    let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
+    jpeg_ibs.publish();
+    Client {
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+        oss: 0x10a0,
+        instances: 1,
+        jpeg_ibs: Some(jpeg_ibs),
+    }
+}
+fn client_job() -> (
+    crate::amdgpu_navi22_submit::VmRef,
+    [crate::amdgpu_navi22_submit::Ib; 1],
+) {
+    (
+        crate::amdgpu_navi22_submit::VmRef {
+            vmid: 3,
+            page_table_base: 0x1_2345_6001,
+            pasid: 0x42,
+            flush: true,
+            map_pasid: true,
+        },
+        [crate::amdgpu_navi22_submit::Ib {
+            va: 0x7000_0010_0000,
+            dwords: 16,
+            flags: 0,
+        }],
+    )
+}
+
+/// `amdgpu_job_timedout` on a VCN 3.0 ring resets the instance alone
+/// (`amdgpu_vcn_ring_reset` -> `amdgpu_vcn_reset_engine`): `vcn_v3_0_reset`
+/// stops it (`vcn_v3_0_stop`, PowerDownVcn), enables clock gating and, with
+/// `AMD_PG_SUPPORT_VCN` (the DPG configuration), static power gating (every
+/// tile off), then starts it (PowerUpVcn, `vcn_v3_0_start`); the decode and
+/// encode rings are ring-tested and every outstanding fence of the instance
+/// is force-completed with `-ECANCELED`. The instance's rings keep serving
+/// clients. The static start restores each encode ring's pointers to the
+/// ring's write pointer, as `vcn_v3_0_start` does, so nothing already run
+/// runs again.
+fn vcn3_timed_out_job_resets_the_instance_like_amdgpu_vcn_reset_engine() -> TestResult {
+    use crate::amdgpu_navi22_submit::MediaRing;
+    for mode in [StartMode::Dpg, StartMode::Static] {
+        let (pool, mut e, mut pm) = runtime_engine(mode, true);
+        let client = media_client(&pool);
+        let (vm, ibs) = client_job();
+        let sessions = |m: &Model| {
+            m.work
+                .iter()
+                .filter(|w| matches!(w, Work::Session(0, ..)))
+                .count()
+        };
+        let ran = sessions(&e.hw.io);
+        // VCN0's VCPU stops: no ring of the instance runs any more.
+        e.hw.io.wedged[0] = true;
+        let dec = e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]);
+        let enc = e.submit_client(&client, MediaRing::Enc(0), vm, &ibs, &[]);
+        if dec != Ok(3) || enc != Ok(3) {
+            return TestResult::Fail("client jobs refused before the hang");
+        }
+        pm.commands.clear();
+        let writes = e.hw.io.writes.len();
+        let mut cancelled = Vec::new();
+        if run(e.reset_instance(&mut pm, 0, |c| cancelled.extend_from_slice(c))).is_err() {
+            return TestResult::Fail("the VCN engine reset failed");
+        }
+        let m = &e.hw.io;
+        if m.wedged[0] || pm.commands != [([true, false], false), ([true, false], true)] {
+            return TestResult::Fail("the reset did not power VCN0 down and up again");
+        }
+        // vcn_v3_0_enable_static_power_gating powers every tile off (DPG).
+        let off = m.writes[writes..]
+            .iter()
+            .any(|&w| w == (v(0, PGFSM_CONFIG), 0x2a2a_aaaa));
+        if (mode == StartMode::Dpg) != off {
+            return TestResult::Fail("static power gating in the reset");
+        }
+        if cancelled != [(MediaRing::Dec, 2, 3), (MediaRing::Enc(0), 2, 3)] {
+            return TestResult::Fail("the reset did not report the outstanding client work");
+        }
+        let inst = e.vcn[0].as_ref().unwrap();
+        let map = inst.memory.mapping();
+        let fences = FENCE.map(|at| m.word(mc(map, at)));
+        if fences != [3, 3, 2] {
+            return TestResult::Fail("the reset did not force-complete the instance's fences");
+        }
+        // Ring tests ran on the restarted rings, and nothing ran twice.
+        let rptr = [
+            m.reg(v(0, RBC_RB_RPTR)),
+            m.reg(v(0, RB_RPTR[0])),
+            m.reg(v(0, RB_RPTR[1])),
+        ];
+        if rptr != [inst.dec.wptr, inst.enc[0].wptr, inst.enc[1].wptr]
+            || m.reg(v(0, SCRATCH9)) != 0xdead_beef
+            || sessions(m) != ran
+        {
+            return TestResult::Fail("ring tests after the reset, or stale commands re-ran");
+        }
+        if e.state != State::Verified
+            || e.runtime.phase != idle::Phase::Awake
+            || MediaRing::ALL.iter().any(|&r| !e.client_ready(r))
+            || (mode == StartMode::Dpg && !e.paused[0])
+        {
+            return TestResult::Fail("the media rings are not offered after the reset");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/engine-reset",
+    vcn3_timed_out_job_resets_the_instance_like_amdgpu_vcn_reset_engine
+);
+
+/// An instance that does not come back from `vcn_v3_0_reset` fails its
+/// ring test: the reset fails (Linux then sets `-ETIME` and recovers the
+/// GPU), nothing is force-completed and the engine is no longer usable.
+fn vcn3_engine_reset_that_does_not_restart_fails() -> TestResult {
+    use crate::amdgpu_navi22_submit::MediaRing;
+    let (pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    let client = media_client(&pool);
+    let (vm, ibs) = client_job();
+    e.hw.io.wedged[0] = true;
+    if e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]) != Ok(3) {
+        return TestResult::Fail("client job refused before the hang");
+    }
+    e.hw.io.never_boot[0] = true;
+    let mut called = false;
+    if run(e.reset_instance(&mut pm, 0, |_| called = true)) != Err(Error::Timeout)
+        || called
+        || e.state != State::Failed
+    {
+        return TestResult::Fail("a reset whose ring test failed did not fail");
+    }
+    let inst = e.vcn[0].as_ref().unwrap();
+    if e.hw.io.word(mc(inst.memory.mapping(), FENCE[0])) != 2 {
+        return TestResult::Fail("a failed reset force-completed fences");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/engine-reset",
+    vcn3_engine_reset_that_does_not_restart_fails
+);
+
 fn vcn3_idle_resume_preserves_context_fences_and_jpeg() -> TestResult {
     for mode in [StartMode::Dpg, StartMode::Static] {
         for gated in [false, true] {

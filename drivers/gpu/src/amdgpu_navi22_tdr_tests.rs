@@ -239,3 +239,33 @@ kernel_test_in!(
     "drivers/gpu/navi22-tdr/media",
     navi22_tdr_times_out_each_media_ring_like_linux_video_rings
 );
+
+/// `amdgpu_job_timedout` on a media ring, bare metal: with
+/// `amdgpu_gpu_recovery` off it only sets `-ETIME` and suspends the timeout
+/// (no reset of any kind); otherwise a VCN 3.0 ring has a per-queue reset
+/// (`vcn.supported_reset` has `AMDGPU_RESET_TYPE_PER_QUEUE`,
+/// `amdgpu_vcn_ring_reset`) and is reset first. NARF has no JPEG ring
+/// reset (Linux's needs ring backup and re-emission), so a JPEG timeout
+/// goes to the `-ETIME` / `amdgpu_device_gpu_recover` branch.
+fn navi22_tdr_media_timeout_follows_amdgpu_job_timedout() -> TestResult {
+    let vcn = [MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)];
+    for ring in vcn.into_iter().chain([MediaRing::Jpeg]) {
+        if media_action(false, ring) != MediaAction::Suspend {
+            return TestResult::Fail("a media timeout with gpu_recovery=0 does more than suspend");
+        }
+    }
+    if vcn
+        .iter()
+        .any(|&ring| media_action(true, ring) != MediaAction::ResetEngine)
+    {
+        return TestResult::Fail("a VCN ring timeout does not reset the VCN instance first");
+    }
+    if media_action(true, MediaRing::Jpeg) != MediaAction::Recover {
+        return TestResult::Fail("a JPEG timeout without a ring reset does not recover the GPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-tdr/media",
+    navi22_tdr_media_timeout_follows_amdgpu_job_timedout
+);

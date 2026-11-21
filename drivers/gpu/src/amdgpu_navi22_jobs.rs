@@ -221,6 +221,90 @@ mod tests {
         "drivers/gpu/navi22-tdr/media",
         rdna2_media_timeout_fails_only_its_engines_rings
     );
+    /// `amdgpu_vcn_reset_engine` force-completes every unsignalled fence of
+    /// the reset instance's rings with `-ECANCELED`
+    /// (`amdgpu_fence_driver_force_completion`), the timed-out job's
+    /// included; nothing is re-emitted and no context is made guilty. The
+    /// error stays with each cancelled job after its fence was forced (the
+    /// memory retires), other rings are untouched, and the ring serves new
+    /// jobs.
+    fn rdna2_vcn_engine_reset_cancels_its_outstanding_jobs() -> TestResult {
+        let mut jobs = Jobs::new(6);
+        let tickets = [
+            ticket(6, 0, 7), // GFX
+            ticket(6, 4, 3), // VCN decode, the timed-out job
+            ticket(6, 4, 4), // VCN decode, queued behind it
+            ticket(6, 5, 9), // VCN encode 0
+            ticket(6, 7, 2), // JPEG
+        ];
+        let health: Vec<Arc<Health>> = tickets.iter().map(|_| Arc::default()).collect();
+        for (t, h) in tickets.iter().zip(&health) {
+            jobs.emitted(*t, h);
+        }
+        jobs.cancel(4, 2, 4);
+        jobs.cancel(5, 8, 9);
+        let canceled = Some(FsError::Canceled);
+        let errors: Vec<_> = tickets.iter().map(|t| jobs.error(*t)).collect();
+        if errors != [None, canceled, canceled, canceled, None]
+            || health[1..4].iter().any(|h| h.error() != canceled)
+            || health[0].error().is_some()
+            || health[4].error().is_some()
+            || jobs.terminal.is_some()
+        {
+            return TestResult::Fail("an engine reset did not cancel exactly its outstanding jobs");
+        }
+        // The forced fences land: the memory retires, the errors remain.
+        let mut completed = [0; RING_IDS];
+        completed[4] = 4;
+        completed[5] = 9;
+        jobs.observe(completed);
+        if !jobs.retired(tickets[1]) || jobs.error(tickets[1]) != canceled {
+            return TestResult::Fail("a force-completed job lost its error");
+        }
+        // The reset ring takes and completes new work.
+        jobs.emitted(ticket(6, 4, 5), &Arc::default());
+        completed[4] = 5;
+        jobs.observe(completed);
+        if jobs.error(ticket(6, 4, 5)).is_some() || !jobs.retired(ticket(6, 4, 5)) {
+            return TestResult::Fail("the reset ring does not serve new jobs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-tdr/media",
+        rdna2_vcn_engine_reset_cancels_its_outstanding_jobs
+    );
+    /// With no reset to follow, `amdgpu_job_timedout` sets `-ETIME` on the
+    /// job's fence and suspends the timeout: the job stays outstanding
+    /// (its waiter keeps waiting) and reports `-ETIME` only if its fence
+    /// ever lands; its context's next submission fails
+    /// (`drm_sched_entity_error`). Nothing else changes.
+    fn rdna2_suspended_media_timeout_keeps_the_job_waiting() -> TestResult {
+        let mut jobs = Jobs::new(6);
+        let (late, other) = (ticket(6, 4, 3), ticket(6, 4, 4));
+        let health = Arc::new(Health::default());
+        jobs.emitted(late, &health);
+        jobs.emitted(other, &Arc::default());
+        jobs.time_out(4);
+        if jobs.error(late).is_some()
+            || jobs.error(other).is_some()
+            || jobs.terminal.is_some()
+            || health.error() != Some(FsError::TimedOut)
+        {
+            return TestResult::Fail("a suspended timeout ended or failed outstanding work");
+        }
+        let mut completed = [0; RING_IDS];
+        completed[4] = 4;
+        jobs.observe(completed);
+        if jobs.error(late) != Some(FsError::TimedOut) || jobs.error(other).is_some() {
+            return TestResult::Fail("a late fence did not report -ETIME on the timed-out job");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-tdr/media",
+        rdna2_suspended_media_timeout_keeps_the_job_waiting
+    );
 }
 impl Jobs {
     pub fn new(epoch: u64) -> Self {
@@ -340,6 +424,14 @@ impl Jobs {
         }
         self.failed_rings |= rings;
     }
+    /// A VCN engine reset force-completed ring `ring`'s sequences after
+    /// `after` up to `upto` (`amdgpu_fence_driver_force_completion`).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub fn cancel(&mut self, _ring: usize, _after: u32, _upto: u32) {}
+    /// Ring `ring`'s oldest job timed out with no reset to follow
+    /// (`drm_sched_suspend_timeout`).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub fn time_out(&mut self, _ring: usize) {}
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if let Some(&(_, error)) = self.failed.iter().find(|(t, _)| *t == ticket) {
             return Some(error);

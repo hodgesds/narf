@@ -247,6 +247,24 @@ impl<I: Io> Engine<I> {
     }
 }
 
+/// One client ring's outstanding work an engine reset force-completes:
+/// (ring, last completed sequence, last emitted sequence).
+pub(crate) type Cancelled = (MediaRing, u32, u32);
+impl<I: Io> Engine<I> {
+    /// `amdgpu_vcn_reset_engine` for VCN instance `i` (VCN 3.0
+    /// `AMDGPU_RESET_TYPE_PER_QUEUE`); `cancel` receives what it
+    /// force-completes.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub(crate) async fn reset_instance(
+        &mut self,
+        _pm: &mut impl Control,
+        _i: usize,
+        _cancel: impl FnOnce(&[Cancelled]),
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+}
+
 /// One idle gate attempt that reached the engine stop and PMFW power-off
 /// (`vcn_v3_0_stop` + `amdgpu_dpm_enable_vcn(false)`): how long it took and
 /// how it ended (`Ok(gated)`: whether PMFW gated the engines).
