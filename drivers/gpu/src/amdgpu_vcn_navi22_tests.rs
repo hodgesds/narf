@@ -90,6 +90,9 @@ struct Model {
     /// Rings that ignore doorbells: dec0, enc0.0, enc0.1, dec1, enc1.0, enc1.1, jpeg.
     stalled: [bool; 7],
     drop_fences: bool,
+    /// Encode rings that run (rptr advances) but never write their fence,
+    /// per instance: an IB test that times out after a passing ring test.
+    drop_enc_fence: [[bool; 2]; 2],
     gone: bool,
     gone_on_vcpu: bool,
     work: Vec<Work>,
@@ -141,6 +144,7 @@ impl Model {
             status_requires_power: false,
             stalled: [false; 7],
             drop_fences: false,
+            drop_enc_fence: [[false; 2]; 2],
             gone: false,
             gone_on_vcpu: false,
             work: Vec::new(),
@@ -352,7 +356,7 @@ impl Model {
                 }
                 cmd::ENC_FENCE => {
                     let address = u64::from(words[k + 1]) | (u64::from(words[k + 2]) << 32);
-                    if !self.drop_fences {
+                    if !self.drop_fences && !self.drop_enc_fence[i][j] {
                         self.put(address, words[k + 3]);
                     }
                     4
@@ -1966,4 +1970,58 @@ fn vcn3_idle_gate_attempts_are_traced_with_their_duration() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22/idle-gate",
     vcn3_idle_gate_attempts_are_traced_with_their_duration
+);
+
+/// Linux `amdgpu_vcn_idle_work_handler` runs VCN_IDLE_TIMEOUT (1 s) after a
+/// ring's last use and re-queues itself a second later while fences are
+/// outstanding; a ring whose IB test failed is not ready
+/// (`ring->sched.ready = false` in `amdgpu_ib_ring_tests`), takes no work
+/// and does not keep the engine awake.
+fn vcn3_idle_gates_past_a_failed_ring_and_rechecks_each_second() -> TestResult {
+    // VCN0 encode ring 0 passes its ring test but its IB fence never lands.
+    let mut model = Model::new();
+    model.drop_enc_fence[0][0] = true;
+    let psp = FakePsp::new(&model);
+    let (_pool, mut e) = engine(model, 3);
+    e.mode = StartMode::Dpg;
+    let mut pm = RuntimePm {
+        psp,
+        commands: Vec::new(),
+        gated: true,
+        stall: None,
+        fail: false,
+    };
+    if run(e.start(firmware(3), None, &mut pm)).is_err() {
+        return TestResult::Fail("start");
+    }
+    let _ = run(e.start_jpeg());
+    if run(e.test_ib()) != Err(Error::Timeout) {
+        return TestResult::Fail("the encode IB test without a fence passed");
+    }
+    if run(e.idle(&mut pm, 0)) != Ok(false) {
+        return TestResult::Fail("gated before VCN_IDLE_TIMEOUT");
+    }
+    if run(e.idle(&mut pm, 1_000_000_000)) != Ok(true)
+        || e.runtime.phase != idle::Phase::Asleep
+        || pm.commands != [([true, true], false)]
+    {
+        return TestResult::Fail("a ring that failed its IB test kept VCN from gating");
+    }
+    // A busy ring: the idle work looks again a second later, not every
+    // 100 ms.
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    e.vcn[0].as_mut().unwrap().dec.seq += 1;
+    if run(e.idle(&mut pm, 0)) != Ok(false) || e.idle_recheck(300_000_000) != Some(700_000_000) {
+        return TestResult::Fail("idle work does not run VCN_IDLE_TIMEOUT after the last use");
+    }
+    if run(e.idle(&mut pm, 1_000_000_000)) != Ok(false)
+        || e.idle_recheck(1_000_000_000) != Some(1_000_000_000)
+    {
+        return TestResult::Fail("busy VCN is re-checked sooner than VCN_IDLE_TIMEOUT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/idle-cadence",
+    vcn3_idle_gates_past_a_failed_ring_and_rechecks_each_second
 );
