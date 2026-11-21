@@ -368,6 +368,8 @@ configuration calls see EBUSY while construction is in progress. Both mount
 APIs attach instances through the caller's mount namespace and report shared
 construction errors (including ENOENT for a missing registered block source).
 Bind, move, remount and propagation operate on existing mount objects.
+`mount_setattr` with `AT_RECURSIVE` applies the attributes to the named mount
+and every mount below it; without it, to the named mount only.
 `open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
 includes its child mounts. A plain bind of the installed root therefore exposes
 the on-disk directory beneath a mounted `/run`.
