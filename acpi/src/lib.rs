@@ -2009,6 +2009,7 @@ fn gpe_byte_ports_valid(block: GpeBlockInfo) -> bool {
 //   68:  PM1B_CNT_BLK     u32  — optional
 //   88:  PM1_EVT_LEN      u8   — byte length of each EVT block
 //   89:  PM1_CNT_LEN      u8   — byte length of each CNT block
+//   112: FLAGS            u32  — fixed feature flags (bit 21 LPS0)
 //   148: X_PM1A_EVT_BLK   GAS  (ACPI 2.0+)
 //   160: X_PM1B_EVT_BLK   GAS
 //   172: X_PM1A_CNT_BLK   GAS
@@ -2039,6 +2040,11 @@ pub struct FadtPm {
     pub reset_reg_addr_space: u8,
     pub reset_reg_addr: u64,
     pub reset_value: u8,
+    /// FADT flags bit 21, `LOW_POWER_S0_IDLE_CAPABLE` (Linux
+    /// `ACPI_FADT_LOW_POWER_S0`): the firmware supports suspend-to-idle
+    /// with S0 low-power idle. Linux's amdgpu takes its s0ix path only
+    /// with it set.
+    pub low_power_s0: bool,
 }
 
 static FADT_PM: IrqSafeSpinLock<Option<FadtPm>> = IrqSafeSpinLock::new(None);
@@ -2129,6 +2135,12 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
     };
 
     let pick = |x: u64, l: u64| if x != 0 { x } else { l };
+    // Flags: u32 at offset 112, present since FADT revision 1.
+    let flags = if total >= 116 {
+        u32::from_le_bytes([body[112], body[113], body[114], body[115]])
+    } else {
+        0
+    };
 
     let pm = FadtPm {
         sci_int,
@@ -2145,6 +2157,7 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
         reset_reg_addr_space,
         reset_reg_addr,
         reset_value,
+        low_power_s0: flags & 1 << 21 != 0, // ACPI 6.5 Table 5.10: LOW_POWER_S0_IDLE_CAPABLE
     };
     *FADT_PM.lock() = Some(pm);
     Ok(pm)
