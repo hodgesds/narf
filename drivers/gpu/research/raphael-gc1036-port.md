@@ -399,11 +399,10 @@ since the submitter is replaced. Raphael's port:
           - the PSP session booted again, which reloads the graphics set and
             runs the RLC autoload;
           - DMUB notifications;
-          - a new graphics coordinator, then media, then client registration;
+          - the graphics coordinator re-armed and run again, then media,
+            then client registration (step 13);
           - the recovery counter (`amdgpu_ctx::recoveries`) moves, so older
             contexts see the reset.
-          The old coordinator is kept, quarantined: each recovery leaks its
-          carve-out, as on Navi22.
        5. The stream put back on its validated mode, as `resume` does. The
           scanout is not cleared: `amdgpu_device_check_vram_lost` reports no
           loss for mode 2.
@@ -431,18 +430,46 @@ since the submitter is replaced. Raphael's port:
     3. Sync resume: unchanged. The PSP session boots again (reloading the
        graphics set and running the RLC autoload), and the stream is
        replayed.
-    4. Async resume: a new coordinator, then media and clients, via the
-       rebuild helper shared with mode 2 recovery. A suspend that aborted
+    4. Async resume: the coordinator re-armed and run again (step 13),
+       then media and clients, via the rebuild helper shared with mode 2
+       recovery. A suspend that aborted
        before the PSP stopped never powered the GPU off, so that resume
        runs the mode 2 reset first.
     Contexts survive: no recovery count, and the rings were drained. Lost
     across S3:
-    - VCN sessions (Linux saves the VCPU buffer; this does not);
-    - each cycle's coordinator reservations, quarantined as a recovery's
-      are. The rebuild logs how much of the carve-out remains. Re-running
-      the owners on their own reservations, as Linux's hw_init does on its
-      BOs, would end the leak, but needs every RDNA2 owner to return to
-      Prepared.
+    - VCN sessions (Linux saves the VCPU buffer; this does not).
+
+## Owner re-init
+
+13. ~~In-place owner re-init~~ (done). Recovery and resume used to retire
+    the spent coordinator, quarantined, and build a new one, leaking its
+    carve-out reservations every cycle. Linux's hw_init after a reset runs
+    again over the BOs it already holds; `ColdBoot::rearm` does the same.
+    Every owner returns to Prepared on its own reservations, and `run` and
+    `run_media` bring the same buffers up again:
+    - GFX, KIQ/compute and both SDMA queues: write pointers and sequences
+      back to 0 (an old sequence against a reset writeback would read as a
+      hang), proofs cleared, the golden settings and MQD backups taken
+      again. Each bring-up step clears its own ring memory.
+    - The SDMA proof ring: proven again.
+    - GMC: both hubs programmed again on the same boot aperture, and the
+      GART re-enabled on the same table (zeroed, boot pages mapped again).
+      A new owner token makes VMIDs lent before useless; registration lends
+      them again. Refused, unchanged, while a VM holds a context or a GTT
+      binding holds GART pages, since the zeroed table would drop their
+      entries (no Raphael path binds either today).
+    - IH: the ring reprogrammed in place on its MSI-X entry (or MSI
+      address), written again, and its vector re-enabled. Subscriptions
+      from before end `Revoked`; slot generations are never reused, so a
+      late drop of one cannot take a new subscriber's slot.
+    - VCN and JPEG: started again on the same instance, JPEG and client
+      buffers; the idle runtime is fresh.
+    - A fresh SMU mailbox; versions, apertures, proof and topology are
+      read again.
+    The client VRAM heap is reserved once and kept across cycles. A
+    coordinator whose re-arm is refused is retired and a new one built, as
+    before. The rebuild logs whether it re-armed, how many owners are
+    retired and how much of the carve-out is free.
 
 ## Open
 

@@ -401,3 +401,40 @@ kernel_test_in!(
     "drivers/gpu/kiq-navi22",
     kiq_navi22_maps_gfx_queues_with_engine_sel_4
 );
+
+/// Re-armed after a reset (a fresh model), the KIQ and compute owner maps
+/// the same two queues again: sequences from zero, the same MQD backed up,
+/// nothing more reserved.
+fn kiq_rearm_maps_the_same_queues_again() -> TestResult {
+    let up = |e: &mut Engine<Model>| {
+        run(e.init_kiq()).is_ok()
+            && run(e.map_compute()).is_ok()
+            && run(e.test_ib()).is_ok()
+            && e.state == State::Verified
+    };
+    let (pool, mut e) = engine(enabled());
+    if !up(&mut e) {
+        return TestResult::Fail("first compute bring-up");
+    }
+    let (seq, free, backup) = (e.compute.seq, pool.available(), e.mqd_backup.clone());
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if e.state != State::Prepared
+        || (e.kiq.seq, e.compute.seq, e.compute.wptr) != (0, 0, 0)
+        || e.mqd_backup.is_some()
+    {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = enabled();
+    if !up(&mut e) {
+        return TestResult::Fail("re-armed compute bring-up");
+    }
+    if e.compute.seq != seq || e.mqd_backup != backup || pool.available() != free {
+        return TestResult::Fail("re-armed compute left its queues or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/kiq-navi22",
+    kiq_rearm_maps_the_same_queues_again
+);

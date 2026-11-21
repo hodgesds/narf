@@ -1254,6 +1254,34 @@ pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
 }
 
 impl<I: Io> Engine<I> {
+    /// See `Media::rearm`.
+    ///
+    /// # Safety
+    /// As `Media::rearm`.
+    pub(crate) unsafe fn rearm(&mut self) {
+        for instance in self.vcn.iter_mut().flatten() {
+            for ring in core::iter::once(&mut instance.dec).chain(instance.enc.iter_mut()) {
+                ring.wptr = 0;
+                ring.seq = 0;
+            }
+        }
+        if let Some(jpeg) = self.jpeg.as_mut() {
+            jpeg.ring.wptr = 0;
+            jpeg.ring.seq = 0;
+        }
+        self.runtime = idle::Runtime::new();
+        self.paused = [false; 2];
+        self.state = State::Prepared;
+        self.jpeg_state = if self.jpeg.is_some() {
+            JpegState::Prepared
+        } else {
+            JpegState::Absent
+        };
+        self.proof = Proof {
+            instances: self.proof.instances,
+            ..Proof::default()
+        };
+    }
     fn active(&self) -> impl Iterator<Item = usize> + '_ {
         (0..2).filter(|&i| self.vcn[i].is_some())
     }
@@ -2482,6 +2510,17 @@ impl Media {
             jpeg: self.engine.jpeg_state,
             proof: self.engine.proof,
         }
+    }
+    /// Return to Prepared on the same instance, JPEG and client buffers, for
+    /// vcn_v3_0_hw_init after a reset: every ring empty with no sequence, the
+    /// idle runtime fresh, no instance paused. `start` clears the memory.
+    ///
+    /// # Safety
+    /// The GPU was reset since this owner last ran, so nothing can still
+    /// reach its memory, and no future of its steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
     }
 }
 

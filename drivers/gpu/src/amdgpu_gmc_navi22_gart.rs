@@ -50,6 +50,19 @@ pub(super) struct Gart {
     enabled: bool,
 }
 impl Gart {
+    /// Whether only the boot pages are in use: no GTT binding is live or
+    /// quarantined, so nothing would lose its entries when `enable_gart`
+    /// zeroes the table again.
+    pub(super) fn only_boot_pages(&self) -> bool {
+        (0..self.used.len() as u64 * 64)
+            .filter(|&page| self.used[(page / 64) as usize] & (1 << (page % 64)) != 0)
+            .all(|page| page < BOOT_PAGES)
+    }
+    /// Disabled on the same table; `enable_gart` zeroes it and maps the boot
+    /// pages again.
+    pub(super) fn rearm(&mut self) {
+        self.enabled = false;
+    }
     pub(super) fn info(&self) -> Option<GartInfo> {
         self.enabled.then_some(self.info)
     }

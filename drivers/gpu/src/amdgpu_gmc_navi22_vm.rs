@@ -318,6 +318,14 @@ pub(super) struct Vms {
     lent: u16,
 }
 impl Vms {
+    /// Whether no VM holds a slot.
+    pub(super) fn idle(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+    /// No VMID lent: a re-armed owner lends them again.
+    pub(super) fn rearm(&mut self) {
+        self.lent = 0;
+    }
     pub(super) fn new() -> Self {
         Self {
             slots: core::array::from_fn(|_| None),

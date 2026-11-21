@@ -347,6 +347,19 @@ impl<I: Io> Engine<I> {
         self.proof.compute_ring = true;
         Ok(())
     }
+    /// Return to Prepared on the same reservations (hw_init after a reset).
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.kiq.rearm();
+        self.compute.rearm();
+        self.state = State::Prepared;
+        self.proof = Proof::default();
+        self.mqd_backup = None;
+    }
     /// `gfx_v10_0_reset_kcq`: reset the compute ring alone.
     /// 1. KIQ UNMAP_QUEUES (RESET_QUEUES), then the KIQ ring test.
     /// 2. The HQD going inactive, in RLC safe mode under GRBM select.
@@ -651,6 +664,14 @@ impl Compute {
         self.engine.proof
     }
     /// Fence progress of the KIQ and the compute queue (hang detection only).
+    /// See `Engine::rearm`.
+    ///
+    /// # Safety
+    /// As `Engine::rearm`.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// See `Engine::reset_compute`.
     pub(crate) async fn reset_compute(&mut self) -> Result<(), Error> {
         self.engine.reset_compute().await

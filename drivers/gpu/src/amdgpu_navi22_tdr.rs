@@ -12,9 +12,10 @@
 //! stall. Like Linux's default `amdgpu_gpu_recovery=-1` on a dGPU, a hang
 //! starts recovery (`set_automatic_recovery`, on by default for RX 6000;
 //! `amdgpu.gpu_recovery=0` turns it off), at most
-//! [`MAX_AUTOMATIC_RECOVERIES`] times per boot: each recovery quarantines
-//! (leaks) the old owners' VRAM, so a card that keeps hanging is left
-//! stopped rather than recovered until VRAM runs out.
+//! [`MAX_AUTOMATIC_RECOVERIES`] times per boot: each Navi22 recovery
+//! quarantines (leaks) the old owners' VRAM, so a card that keeps hanging is
+//! left stopped rather than recovered until VRAM runs out. Raphael re-arms
+//! its owners in place, but keeps the same budget.
 use crate::amdgpu_fence_navi22::{signaled, Engine};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;

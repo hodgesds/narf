@@ -1840,3 +1840,55 @@ kernel_test_in!(
     "drivers/gpu/cp-raphael",
     raphael_port_update_follows_amdgpu_device_pcie_port_wreg
 );
+
+/// Re-armed after a reset (a fresh model), Raphael's GFX owner brings the
+/// same two rings up again: golden settings, configure, start and the IB
+/// test rerun on the reservations it already holds, the sequence from zero
+/// and the MQD backup retaken.
+fn raphael_gfx_rearm_reuses_its_rings() -> TestResult {
+    let reset = || {
+        let mut model = enabled();
+        model.no_read_cache = true;
+        model
+    };
+    let up = |e: &mut GfxEngine<Model>| {
+        e.golden().is_ok()
+            && run(e.configure()).is_ok()
+            && run(e.start()).is_ok()
+            && run(e.test_ib()).is_ok()
+            && e.state == GfxState::Verified
+    };
+    let (pool, mut e) = gfx(reset());
+    e.hw.layout = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    if !up(&mut e) {
+        return TestResult::Fail("first GFX bring-up");
+    }
+    let (seq, free, rings) = (
+        e.queue.seq,
+        pool.available(),
+        [e.queue.address(0), e.pipe1.address(0)],
+    );
+    let backup = e.mqd_backup.clone();
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if e.state != GfxState::Prepared
+        || (e.queue.seq, e.queue.wptr, e.pipe1.wptr) != (0, 0, 0)
+        || e.golden
+        || e.mqd_backup.is_some()
+    {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = reset();
+    if !up(&mut e) {
+        return TestResult::Fail("re-armed GFX bring-up");
+    }
+    if e.queue.seq != seq
+        || e.mqd_backup != backup
+        || [e.queue.address(0), e.pipe1.address(0)] != rings
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed GFX left its rings or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/cp-raphael", raphael_gfx_rearm_reuses_its_rings);

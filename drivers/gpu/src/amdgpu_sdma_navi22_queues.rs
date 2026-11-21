@@ -57,6 +57,17 @@ fn reg(l: Layout, instance: u32, r: Reg) -> u64 {
     l.sdma(instance, r)
 }
 impl<I: Io> Engine<I> {
+    /// See `Sdma::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.queues.iter_mut().for_each(Queue::rearm);
+        self.state = State::Prepared;
+        self.proof = Proof::default();
+    }
     pub(crate) async fn start(&mut self) -> Result<(), Error> {
         if self.state != State::Prepared {
             return Err(Error::Busy);
@@ -415,6 +426,16 @@ pub struct Sdma {
     engine: Engine<Mmio>,
 }
 impl Sdma {
+    /// Return to Prepared on the same reservations (hw_init after a reset).
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve both rings without device I/O.
     ///
     /// # Safety

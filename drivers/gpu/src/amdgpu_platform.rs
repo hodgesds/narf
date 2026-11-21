@@ -730,6 +730,21 @@ async fn graphics_boot(
         }
     };
     // SAFETY: as above, and the RLC autoload has completed.
+    unsafe { run_graphics(&mut boot, firmware) }.await;
+    Some(boot)
+}
+/// Run `boot`'s stages, report them, and publish the loaded firmware's
+/// versions after a completed run.
+///
+/// # Safety
+/// `ColdBoot::run`'s: the owner is new or re-armed, this display owner holds
+/// the whole GPU, and the RLC autoload has completed.
+async unsafe fn run_graphics(
+    boot: &mut crate::amdgpu_raphael_boot::ColdBoot,
+    firmware: Option<crate::amdgpu_info_navi22::Firmware>,
+) {
+    use core::fmt::Write as _;
+    // SAFETY: forwarded.
     match unsafe { boot.run() }.await {
         Ok(report) => {
             let _ = writeln!(
@@ -758,7 +773,6 @@ async fn graphics_boot(
             );
         }
     }
-    Some(boot)
 }
 /// VCN and JPEG on a completed Raphael graphics boot, through the PSP session
 /// that loaded them. Failure is reported and leaves graphics and display be.
@@ -826,9 +840,11 @@ pub(crate) enum RecoveryError {
 ///    - the PSP session booted again, which loads the graphics set and runs
 ///      the RLC autoload;
 ///    - DMUB notifications;
-///    - a new graphics coordinator, then media, then client registration.
+///    - the graphics coordinator re-armed and run again on its own
+///      reservations, then media, then client registration.
 ///
-///    The old coordinator is kept, quarantined.
+///    Only a coordinator that cannot be re-armed is kept, quarantined, and
+///    a new one built.
 /// 5. The stream put back on the mode it was validated for (DM's resume).
 ///    The carve-out survives a mode 2 reset (`amdgpu_device_check_vram_lost`
 ///    reports no loss), so the scanout is not cleared.
@@ -860,7 +876,7 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
         ..
     } = display;
     let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
-    // SAFETY: the client path is withdrawn; `old` is retired below.
+    // SAFETY: the client path is withdrawn; `old` is re-armed below.
     unsafe { old.quiesce_for_reset() }
         .await
         .map_err(RecoveryError::Quiesce)?;
@@ -916,11 +932,13 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
     Ok(())
 }
 /// After the PSP session loaded the graphics set again (a recovery, or the
-/// display's S3 resume): retire the spent coordinator, quarantined, and run
-/// a new one, then media and client registration. `reset` moves the recovery
-/// counter first, so contexts from before see their work cancelled; an S3
-/// resume keeps them (Linux drains the rings before suspending, and the
-/// carve-out survives).
+/// display's S3 resume): bring graphics up again, then media and client
+/// registration. The spent coordinator is re-armed and run on its own
+/// reservations, as Linux's hw_init reuses its buffers. Only if it cannot be
+/// re-armed is it retired, quarantined, and a new one built. `reset` moves
+/// the recovery counter first, so contexts from before see their work
+/// cancelled; an S3 resume keeps them (Linux drains the rings before
+/// suspending, and the carve-out survives).
 async fn rebuild_graphics(
     loader: &mut Loader,
     pool: &Pool,
@@ -929,14 +947,35 @@ async fn rebuild_graphics(
     reset: bool,
 ) -> Result<(), RecoveryError> {
     use core::fmt::Write as _;
-    if let Some(old) = graphics.take() {
-        retired.push(old);
-    }
     if !loader.graphics_booted() {
         return Err(RecoveryError::NoGraphics);
     }
     let firmware = loader.graphics_versions();
-    *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
+    let rearmed = match graphics.as_mut() {
+        // SAFETY: the device was reset (mode 2 or S3) since the coordinator
+        // last ran, it was quiesced, and the PSP has reloaded the set.
+        Some(old) => match unsafe { old.rearm() }.await {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael graphics not re-armed ({error:?}); a new owner"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    if rearmed {
+        let boot = graphics.as_mut().ok_or(RecoveryError::Graphics)?;
+        // SAFETY: re-armed above; this display owner holds the GPU.
+        alloc::boxed::Box::pin(unsafe { run_graphics(boot, firmware) }).await;
+    } else {
+        if let Some(old) = graphics.take() {
+            retired.push(old);
+        }
+        *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
+    }
     let new = graphics
         .as_mut()
         .filter(|g| g.queues_verified())
@@ -946,10 +985,12 @@ async fn rebuild_graphics(
         RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     serve_clients(new);
-    // Each rebuild quarantines the old owners' reservations; say what is left.
+    // A rebuild that could not re-arm quarantined the old owners; say what
+    // is left.
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: raphael graphics rebuilt ({} retired owners, {} MiB of the carve-out free)",
+        "amdgpu: raphael graphics {} ({} retired owners, {} MiB of the carve-out free)",
+        if rearmed { "re-armed" } else { "rebuilt" },
         retired.len(),
         pool.available() >> 20
     );
@@ -1038,8 +1079,8 @@ async fn prepare_graphics_suspend() {
     };
     crate::amdgpu_navi22_cs::unregister();
     crate::amdgpu_navi22_tdr::stop();
-    // SAFETY: the client path is withdrawn; the coordinator is retired at
-    // resume and a new one built.
+    // SAFETY: the client path is withdrawn; the coordinator is re-armed at
+    // resume.
     if let Err(error) = unsafe { graphics.quiesce_for_reset() }.await {
         let _ = writeln!(narf_console::Writer, "amdgpu: raphael IH quiesce {error:?}");
     }

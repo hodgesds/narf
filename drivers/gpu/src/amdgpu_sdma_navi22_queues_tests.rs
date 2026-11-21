@@ -380,3 +380,46 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_sdma_numbered_hardware_ids_are_distinct_engines
 );
+
+/// Re-armed after a reset (a fresh model), both SDMA queues start and pass
+/// their tests again on the rings they already hold, sequences from zero.
+fn sdma_queues_navi22_rearm_restarts_both_rings() -> TestResult {
+    let reset = || {
+        let mut model = enabled();
+        model.regs.insert(sdma(0, SDMA0_GFX_RB_CNTL), 0x0080_1015);
+        for reg in [SDMA0_GFX_RB_RPTR, SDMA0_GFX_RB_WPTR] {
+            model.regs.insert(sdma(0, reg), 128);
+        }
+        model
+    };
+    let up = |e: &mut Engine<Model>| {
+        run(e.start()).is_ok() && run(e.test_ib()).is_ok() && e.state == State::Verified
+    };
+    let (pool, mut e) = engine(reset());
+    if !up(&mut e) {
+        return TestResult::Fail("first SDMA bring-up");
+    }
+    let seqs = [e.queues[0].seq, e.queues[1].seq];
+    let rings = [e.queues[0].address(0), e.queues[1].address(0)];
+    let free = pool.available();
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if e.state != State::Prepared || e.queues.iter().any(|q| q.seq != 0 || q.wptr != 0) {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = reset();
+    if !up(&mut e) {
+        return TestResult::Fail("re-armed SDMA bring-up");
+    }
+    if [e.queues[0].seq, e.queues[1].seq] != seqs
+        || [e.queues[0].address(0), e.queues[1].address(0)] != rings
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed SDMA left its rings or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22-queues",
+    sdma_queues_navi22_rearm_restarts_both_rings
+);

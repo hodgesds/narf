@@ -787,6 +787,13 @@ impl Queue {
     pub(crate) fn map(&self) -> MmioRegion {
         self.memory.mapping()
     }
+    /// Back to a fresh queue for an owner re-armed after a device reset: no
+    /// emitted sequence and an empty ring. The bring-up step clears the
+    /// memory itself; a sequence left behind would read as a stalled queue.
+    pub(crate) fn rearm(&mut self) {
+        self.wptr = 0;
+        self.seq = 0;
+    }
     /// A per-queue reset's `amdgpu_ring_clear_ring` and pointer resets
     /// (`gfx_v10_0_kcq_init_queue(ring, true)`): the ring filled with the
     /// engine's NOP, the read and write pointers and their writebacks zeroed.
@@ -1273,6 +1280,22 @@ fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     Ok(())
 }
 impl<I: Io> GfxEngine<I> {
+    /// Return to Prepared on the same reservations, for Linux's hw_init over
+    /// its existing buffers after a reset. The golden settings are applied
+    /// again (the reset dropped them), and the MQD backup is retaken.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.queue.rearm();
+        self.pipe1.rearm();
+        self.state = GfxState::Prepared;
+        self.proof = GfxProof::default();
+        self.golden = false;
+        self.mqd_backup = None;
+    }
     /// One `gfx_v10_0_ring_soft_recovery`: inside RLC safe mode (entered only
     /// with the RLC running, as `amdgpu_gfx_rlc_enter_safe_mode`; GC 10.3.6
     /// has the CG flags it checks), SQ_CMD kills `vmid`'s waves.
@@ -1809,6 +1832,14 @@ impl Gfx {
         progress(&mut self.engine.hw, &self.engine.queue)
     }
     /// Timeout-only evidence; caller retains the GC power reference.
+    /// See `GfxEngine::rearm`.
+    ///
+    /// # Safety
+    /// As `GfxEngine::rearm`.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// See `GfxEngine::kill_waves`.
     pub(crate) async fn kill_waves(&mut self, vmid: u8) -> Result<(), Error> {
         self.engine.kill_waves(vmid).await

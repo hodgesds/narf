@@ -1028,3 +1028,41 @@ kernel_test_in!(
     "drivers/gpu/ih-raphael",
     raphael_ih_doorbell_and_reads_follow_nbio_7_2
 );
+
+/// A disabled ring re-armed after a reset programs its same memory again:
+/// an old subscription ends `Revoked` (and its drop leaves the new owner of
+/// its source alone), a new one is accepted, the engine starts from rptr 0.
+fn ih_navi22_rearm_reprograms_the_same_ring() -> TestResult {
+    let (pool, shared, handle) = fixture();
+    let mut old = handle.subscribe(source::GFX_EOP).unwrap();
+    enable(&shared, true).unwrap();
+    let (ring, free) = (with(&shared, |e| e.memory.address()), pool.available());
+    with(&shared, |e| e.disable()).unwrap();
+    shared.hub.close(Closed::Disabled);
+    run(shared.rearm());
+    if with(&shared, |e| e.state != State::Prepared || e.rptr != 0)
+        || old.try_next() != Err(Closed::Revoked)
+    {
+        return TestResult::Fail("re-arm kept the ring or the old subscriber");
+    }
+    let Ok(mut new) = handle.subscribe(source::GFX_EOP) else {
+        return TestResult::Fail("re-armed hub refused a subscriber");
+    };
+    if enable(&shared, true).is_err()
+        || with(&shared, |e| {
+            e.state != State::Enabled || e.memory.address() != ring
+        })
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed ring not programmed in place");
+    }
+    drop(old);
+    if new.try_next() != Ok(None) {
+        return TestResult::Fail("the old subscription's drop took the new one's slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih-navi22",
+    ih_navi22_rearm_reprograms_the_same_ring
+);

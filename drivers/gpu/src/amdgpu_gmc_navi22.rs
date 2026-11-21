@@ -624,6 +624,28 @@ impl<I: Io> Engine<I> {
     }
     /// Admit one post-boot operation after its host-only validation and
     /// allocation succeeded. Only `finish` returns the latch to Idle.
+    /// See `Gmc::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) -> Result<(), Error> {
+        if !self.vms.idle() || self.gart.as_ref().is_some_and(|g| !g.only_boot_pages()) {
+            return Err(Error::Busy);
+        }
+        self.vms.rearm();
+        if let Some(gart) = self.gart.as_mut() {
+            gart.rearm();
+        }
+        self.state = State::Prepared;
+        self.runtime = Runtime::Idle;
+        self.aperture = None;
+        self.geometry = None;
+        self.fault_irqs = false;
+        self.token = owner_token();
+        Ok(())
+    }
     fn begin(&mut self) -> Result<(), Error> {
         if self.state != State::Ready || self.runtime != Runtime::Idle {
             return Err(Error::Busy);
@@ -739,6 +761,21 @@ pub struct Gmc {
     engine: Engine<Mmio>,
 }
 impl Gmc {
+    /// Return to Prepared on the same boot aperture and GART table, for
+    /// gmc_v10_0_hw_init over its existing buffers after a reset. The owner
+    /// token changes, so client VMIDs lent before can no longer be used
+    /// against it. Refused (`Busy`), unchanged, while a VM still holds a
+    /// context or a GTT binding holds GART pages: the re-enabled table would
+    /// drop their entries.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) -> Result<(), Error> {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve backing pages without I/O. Only the physical Navi22 PF is supported.
     /// # Safety
     /// Caller owns both hubs, HDP, VRAM and the matching permanent pool,

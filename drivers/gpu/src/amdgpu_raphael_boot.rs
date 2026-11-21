@@ -412,6 +412,39 @@ impl ColdBoot {
         }
         self.gfx.hang_snapshot()
     }
+    /// Every engine owner back to Prepared on its own reservations after a
+    /// reset, so `run` (and `run_media`) bring the same buffers up again:
+    /// Linux's hw_init over its existing BOs, where building a new
+    /// coordinator would quarantine these and leak them each cycle. A fresh
+    /// SMU mailbox; the IH ring keeps its MSI vector.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since these owners last
+    /// ran, `quiesce_for_reset` completed, no future of theirs is alive, and
+    /// the PSP session has loaded the graphics set again.
+    pub(crate) async unsafe fn rearm(&mut self) -> Result<(), Error> {
+        // SAFETY: the coordinator owns the graphics mailbox, as `new`'s
+        // contract gave it; the old handle is dropped here.
+        self.smu = unsafe { smu::Smu::new(&self.gpu, self.authority) }.map_err(Error::Smu)?;
+        // SAFETY: forwarded; every owner was reset with the device.
+        unsafe {
+            self.gmc.rearm().map_err(Error::MemoryHubs)?;
+            self.ih.rearm().await.map_err(Error::Interrupts)?;
+            self.sdma.rearm();
+            self.gfx.rearm();
+            self.compute.rearm();
+            self.queues.rearm();
+            if let Some(media) = self.media.as_mut() {
+                media.rearm();
+            }
+        }
+        self.versions = None;
+        self.aperture = None;
+        self.proof = None;
+        self.topology = None;
+        self.state = State::Prepared;
+        Ok(())
+    }
     /// Recovery's quiesce before a mode 2 reset (Navi22's `quiesce_for_reset`):
     /// the IH ring disabled, so every subscriber ends, and quarantined with
     /// its vector. The engines are left to the reset.
@@ -426,8 +459,9 @@ impl ColdBoot {
             .map_err(Error::Interrupts)
     }
     /// `nv_asic_mode2_reset` through this owner's SMU mailbox and `device`,
-    /// its PCI function. The owner is spent afterwards: keep it (its memory
-    /// stays quarantined) and build a new one.
+    /// its PCI function. The owner is spent afterwards until `rearm`
+    /// returns it to Prepared (or, if that fails, keep it, its memory
+    /// quarantined, and build a new one).
     ///
     /// # Safety
     /// `quiesce_for_reset` completed, the PSP released its TMR, and the
@@ -554,24 +588,31 @@ impl ColdBoot {
         vcn_bytes: usize,
     ) -> Result<vcn::Status, Error> {
         use core::fmt::Write as _;
-        if !matches!(self.state, State::Ready(_)) || self.media.is_some() {
+        if !matches!(self.state, State::Ready(_)) {
             return Err(Error::Busy);
         }
         self.smu.set_vcn_power(true).await.map_err(Error::Smu)?;
         self.smu.set_jpeg_power(true).await.map_err(Error::Smu)?;
-        // SAFETY: forwarded; the VCN image is in the TMR `psp` still holds,
-        // both hubs' VMID0 and the doorbell apertures are up.
-        let media = unsafe {
-            vcn::Media::new_raphael(
-                &self.gpu,
-                self.authority,
-                &self.pool,
-                self.doorbells,
-                vcn_bytes,
-            )
-        }
-        .map_err(Error::Media)?;
-        let media = self.media.insert(Box::new(media));
+        let media = match self.media.as_mut() {
+            // Re-armed after a reset: the same buffers, started again.
+            Some(media) if media.status().state == vcn::State::Prepared => media,
+            Some(_) => return Err(Error::Busy),
+            None => {
+                // SAFETY: forwarded; the VCN image is in the TMR `psp` still
+                // holds, both hubs' VMID0 and the doorbell apertures are up.
+                let media = unsafe {
+                    vcn::Media::new_raphael(
+                        &self.gpu,
+                        self.authority,
+                        &self.pool,
+                        self.doorbells,
+                        vcn_bytes,
+                    )
+                }
+                .map_err(Error::Media)?;
+                self.media.insert(Box::new(media))
+            }
+        };
         // SAFETY: as above; PMFW has powered VCN up.
         unsafe { media.start(firmware, None, psp) }
             .await

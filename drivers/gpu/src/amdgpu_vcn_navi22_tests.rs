@@ -2242,3 +2242,42 @@ kernel_test_in!(
     "drivers/gpu/vcn-raphael",
     media_flush_follows_the_hub_registers
 );
+
+/// Re-armed after a reset (a fresh model), VCN and JPEG start and pass their
+/// tests again on the instance and JPEG buffers they already hold, every
+/// sequence from zero.
+fn vcn_navi22_rearm_restarts_the_same_rings() -> TestResult {
+    let up = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let seqs = |e: &Engine<Model>| {
+        let vcn = e.vcn[0].as_ref().unwrap();
+        let jpeg = e.jpeg.as_ref().unwrap();
+        [vcn.dec.seq, vcn.enc[0].seq, vcn.enc[1].seq, jpeg.ring.seq]
+    };
+    let (pool, mut e) = engine(Model::new(), 1);
+    if !up(&mut e) {
+        return TestResult::Fail("first media bring-up");
+    }
+    let (states, before, free) = ((e.state, e.jpeg_state), seqs(&e), pool.available());
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if (e.state, e.jpeg_state) != (State::Prepared, JpegState::Prepared) || seqs(&e) != [0; 4] {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = Model::new();
+    if !up(&mut e)
+        || (e.state, e.jpeg_state) != states
+        || seqs(&e) != before
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed media differs or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_rearm_restarts_the_same_rings
+);

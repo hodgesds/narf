@@ -271,6 +271,17 @@ struct Engine<I: Io> {
     trapped: bool,
 }
 impl<I: Io> Engine<I> {
+    /// See `Sdma::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.state = State::Prepared;
+        self.proof = None;
+        self.trapped = false;
+    }
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
         let io = &mut self.io;
         self.authority
@@ -554,6 +565,16 @@ pub struct Sdma {
     engine: Engine<Mmio>,
 }
 impl Sdma {
+    /// Return to Prepared on the same ring and writeback page.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve a VRAM ring and writeback page without I/O.
     /// # Safety
     /// Caller owns this physical Navi22 GPU, SDMA0/GC/HDP/PM/reset and the

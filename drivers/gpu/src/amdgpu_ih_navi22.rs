@@ -855,6 +855,15 @@ impl Hub {
         self.interrupts.fetch_add(1, Ordering::Relaxed);
         self.pending.store(true, Ordering::Release);
     }
+    /// Open again after `disable` for a re-armed ring: every subscription
+    /// slot is dropped (their generations are never reused, so an old
+    /// subscription's next poll finds none and ends `Revoked`), then the
+    /// terminal reason is cleared.
+    fn reopen(&self) {
+        self.table.lock().slots.clear();
+        self.pending.store(false, Ordering::Release);
+        self.closed.store(0, Ordering::Release);
+    }
     fn closed(&self) -> Result<(), Closed> {
         match self.closed.load(Ordering::Acquire) {
             0 => Ok(()),
@@ -971,6 +980,19 @@ trait Port: Send + Sync {
 struct Shared<I: Io> {
     hub: Hub,
     engine: Mutex<Engine<I>>,
+}
+impl<I: Io> Shared<I> {
+    /// The engine back to Prepared with its read pointer at 0, and the hub
+    /// reopened with no subscriber (`Ih::rearm`).
+    async fn rearm(&self) {
+        {
+            let mut engine = self.engine.lock().await;
+            engine.state = State::Prepared;
+            engine.rptr = 0;
+            engine.inherited = false;
+        }
+        self.hub.reopen();
+    }
 }
 impl<I: Io> Port for Shared<I> {
     fn hub(&self) -> &Hub {
@@ -1462,8 +1484,13 @@ impl Ih {
             let mut engine = shared.engine.lock().await;
             match engine.preflight() {
                 Ok(()) => {
-                    // SAFETY: forwarded exclusive PCI function ownership.
-                    let delivery = unsafe { self.route() };
+                    let delivery = if matches!(self.route, Route::None) {
+                        // SAFETY: forwarded exclusive PCI function ownership.
+                        unsafe { self.route() }
+                    } else {
+                        // SAFETY: as above, on the route `route` took before.
+                        unsafe { self.reroute() }
+                    };
                     self.shared.hub.set_delivery(delivery);
                     let msi = !matches!(delivery, Delivery::Polling);
                     engine.program(msi).map(|()| delivery).inspect_err(|_| {
@@ -1548,6 +1575,76 @@ impl Ih {
         {
             Delivery::Polling
         }
+    }
+    /// The route an earlier `initialize` took, for a re-armed ring: the same
+    /// vector and handler, its MSI-X entry or MSI address written again (the
+    /// reset may have cleared them) and enabled. Polling if that fails.
+    ///
+    /// # Safety
+    /// As `route`.
+    unsafe fn reroute(&mut self) -> Delivery {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let Some(vector) = self.shared.hub.vector() else {
+                return Delivery::Polling;
+            };
+            let (cap, device) = (&self.authority, &self.device);
+            if narf_bus::pci::set_command(cap, device, narf_bus::pci::cmd::BUS_MASTER).is_err() {
+                return Delivery::Polling;
+            }
+            // SAFETY: APIC initialization precedes device initcalls.
+            let target = unsafe { narf_interrupts::current_cpu_target_id() };
+            if target > 255 {
+                return Delivery::Polling;
+            }
+            let delivery = match &mut self.route {
+                Route::MsiX(table) => {
+                    // SAFETY: owned function and vector; IH sources are disabled.
+                    let programmed = unsafe { table.program_vector(0, target, vector) }.is_ok();
+                    // SAFETY: same owned table, its entry programmed above.
+                    (programmed && unsafe { table.enable() }.is_ok())
+                        .then_some(Delivery::MsiX { vector })
+                }
+                Route::Msi(cfg) => {
+                    // SAFETY: owned config space; the vector's handler stays installed.
+                    let programmed =
+                        unsafe { narf_bus::msi::program_msi(cfg, target, vector) }.is_ok();
+                    // SAFETY: same owned config space.
+                    (programmed && unsafe { narf_bus::msi::enable(cfg) }.is_ok())
+                        .then_some(Delivery::Msi { vector })
+                }
+                Route::None => None,
+            };
+            match delivery {
+                Some(delivery) => {
+                    narf_interrupts::dispatch::enable_irq(vector);
+                    delivery
+                }
+                None => Delivery::Polling,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Delivery::Polling
+        }
+    }
+    /// Re-arm a disabled ring on its own memory and vector, for
+    /// navi10_ih_hw_init after a reset: the engine back to Prepared with its
+    /// read pointer at 0, the hub reopened with no subscriber, so
+    /// `initialize` programs the same ring again and re-enables the same
+    /// vector rather than allocating new ones.
+    ///
+    /// # Safety
+    /// The GPU was reset since the ring was disabled, and no future of this
+    /// owner is alive.
+    pub async unsafe fn rearm(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, State::Disabled | State::Failed) {
+            return Err(Error::Busy);
+        }
+        self.shared.rearm().await;
+        self.state = State::Prepared;
+        self.proof = None;
+        Ok(())
     }
     /// Bounded navi10_ih_irq_disable; every waiter receives `Disabled`.
     /// The ring stays quarantined and the vector stays reserved.

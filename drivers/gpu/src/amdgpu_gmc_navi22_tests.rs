@@ -726,3 +726,58 @@ kernel_test_in!(
     "drivers/gpu/gmc-raphael",
     raphael_nbio_init_follows_nbio_v7_2
 );
+
+/// Re-armed after a reset (the hub registers back to the handoff), the GMC
+/// programs both hubs and enables the same GART table again and lends its
+/// VMIDs under a new owner token. A live VM refuses the re-arm, unchanged.
+fn gmc_navi22_rearm_reuses_the_aperture_and_gart() -> TestResult {
+    // The boot pages, the GART table and its empty root, then a VM's root.
+    let (pool, mut engine) = fixture_sized(BYTES + (1 << 20) + 2 * 4096);
+    engine.vram_size = 12272 << 20;
+    let handoff = engine.io.registers.clone();
+    if run(engine.initialize()).is_err() || engine.prepare_gart().is_err() {
+        return TestResult::Fail("first GMC bring-up");
+    }
+    let Ok(gart) = run(engine.enable_gart()) else {
+        return TestResult::Fail("first GART enable");
+    };
+    let Ok(vmids) = engine.reserve_client_vmids() else {
+        return TestResult::Fail("first VMID lending");
+    };
+    let Ok(vm) = run(engine.create_vm()) else {
+        return TestResult::Fail("VM creation");
+    };
+    // SAFETY: refused below; nothing is reset.
+    if unsafe { engine.rearm() } != Err(Error::Busy) || engine.state != State::Ready {
+        return TestResult::Fail("re-armed under a live VM");
+    }
+    if run(engine.destroy_vm(vm)).is_err() {
+        return TestResult::Fail("VM teardown");
+    }
+    // After the teardown, which may keep the root page quarantined.
+    let free = pool.available();
+    // SAFETY: the registers are put back below, as a reset would.
+    if unsafe { engine.rearm() }.is_err()
+        || engine.state != State::Prepared
+        || engine.aperture.is_some()
+        || engine.gart.as_ref().is_some_and(|g| g.info().is_some())
+    {
+        return TestResult::Fail("re-arm refused or kept the last run");
+    }
+    engine.io.registers = handoff;
+    if run(engine.initialize()).is_err() || run(engine.enable_gart()) != Ok(gart) {
+        return TestResult::Fail("re-armed GMC bring-up or a moved GART");
+    }
+    match engine.reserve_client_vmids() {
+        Ok(again) if again.range() == vmids.range() && again.owner() != vmids.owner() => {}
+        _ => return TestResult::Fail("re-armed GMC did not lend its VMIDs anew"),
+    }
+    if pool.available() != free {
+        return TestResult::Fail("re-armed GMC reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22",
+    gmc_navi22_rearm_reuses_the_aperture_and_gart
+);

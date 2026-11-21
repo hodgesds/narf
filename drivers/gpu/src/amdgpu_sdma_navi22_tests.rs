@@ -669,3 +669,34 @@ kernel_test_in!(
     "drivers/gpu/sdma-raphael",
     raphael_sdma_layout_takes_only_raphaels_blocks
 );
+
+/// Re-armed after a reset (the registers and memory back to their boot
+/// values), the proof owner proves its same ring and writeback page again.
+fn sdma_navi22_rearm_proves_the_same_ring_again() -> TestResult {
+    let (pool, mut engine, aperture, target) = fixture();
+    let boot = engine.io.regs.clone();
+    let Ok(proof) = run(engine.initialize(aperture, target)) else {
+        return TestResult::Fail("first SDMA proof");
+    };
+    let (ring, free) = (engine.memory.address(), pool.available());
+    // SAFETY: the registers and memory are put back below, as a reset would.
+    unsafe { engine.rearm() };
+    if engine.state != State::Prepared || engine.proof.is_some() || engine.trapped {
+        return TestResult::Fail("re-arm kept the last proof");
+    }
+    engine.io.regs = boot;
+    engine.io.memory.fill(0xffff_ffff);
+    engine.io.target.fill(0xffff_ffff);
+    if run(engine.initialize(aperture, target)) != Ok(proof)
+        || engine.state != State::Verified
+        || engine.memory.address() != ring
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed SDMA proof differs or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi22",
+    sdma_navi22_rearm_proves_the_same_ring_again
+);
