@@ -681,6 +681,24 @@ impl Loader {
     pub fn graphics_booted(&self) -> bool {
         self.graphics_booted
     }
+    /// After a graphics boot, what VCN's start needs from the PSP session
+    /// that loaded it: the session itself (for the DPG register lists it
+    /// writes into VCN's SRAM), the VCN TMR addresses it recorded, and the
+    /// VCN container's size, which sizes VCPU cache window 0.
+    pub(crate) fn media(
+        &mut self,
+    ) -> Option<(
+        &mut crate::amdgpu_psp_ring::Psp,
+        crate::amdgpu_psp_ring::MediaFirmware,
+        usize,
+    )> {
+        if !self.graphics_booted {
+            return None;
+        }
+        let size = self.graphics.as_ref()?.vcn_size()?;
+        let firmware = self.psp.as_ref()?.media_firmware();
+        Some((self.psp.as_mut()?, firmware, size))
+    }
     pub async fn boot(&mut self, options: BootOptions) -> Result<(), Error> {
         if self.psp.is_some() {
             if !matches!(self.engine.state, State::Prepared | State::Stopped) {

@@ -32,8 +32,9 @@
 use crate::{
     amdgpu::AmdGpu, amdgpu_cp_navi22 as cp, amdgpu_gmc_navi22 as gmc, amdgpu_ih_navi22 as ih,
     amdgpu_kiq_navi22 as kiq, amdgpu_sdma_navi22 as sdma, amdgpu_sdma_navi22_queues as sdma_queues,
-    amdgpu_smu_raphael as smu, amdgpu_vram::Pool,
+    amdgpu_smu_raphael as smu, amdgpu_vcn_navi22 as vcn, amdgpu_vram::Pool,
 };
+use alloc::boxed::Box;
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 
@@ -99,6 +100,7 @@ pub enum Error {
     Sdma(sdma::Error),
     Queues(cp::Error),
     Topology(crate::amdgpu_gfx10_topology::Error),
+    Media(vcn::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,14 +131,19 @@ pub enum State {
 pub struct ColdBoot {
     gpu: AmdGpu,
     authority: Cap<BusDeviceCap, Write>,
+    pool: Pool,
+    /// VCN and JPEG, once `run_media` has reserved them.
+    media: Option<Box<vcn::Media>>,
     smu: smu::Smu,
-    gmc: gmc::Gmc,
-    ih: ih::Ih,
-    sdma: sdma::Sdma,
+    // Boxed: the owners are large, and a coordinator holding them inline
+    // would put all of them in every frame and future that holds it.
+    gmc: Box<gmc::Gmc>,
+    ih: Box<ih::Ih>,
+    sdma: Box<sdma::Sdma>,
     doorbells: cp::Doorbells,
-    gfx: cp::Gfx,
-    compute: kiq::Compute,
-    queues: sdma_queues::Sdma,
+    gfx: Box<cp::Gfx>,
+    compute: Box<kiq::Compute>,
+    queues: Box<sdma_queues::Sdma>,
     versions: Option<smu::Versions>,
     aperture: Option<gmc::Aperture>,
     proof: Option<sdma::Proof>,
@@ -186,14 +193,16 @@ impl ColdBoot {
             Ok(Self {
                 gpu,
                 authority,
+                pool: pool.clone(),
+                media: None,
                 smu,
-                gmc,
-                ih,
-                sdma,
+                gmc: Box::new(gmc),
+                ih: Box::new(ih),
+                sdma: Box::new(sdma),
                 doorbells,
-                gfx,
-                compute,
-                queues,
+                gfx: Box::new(gfx),
+                compute: Box::new(compute),
+                queues: Box::new(queues),
                 versions: None,
                 aperture: None,
                 proof: None,
@@ -207,7 +216,7 @@ impl ColdBoot {
     }
     /// The live memory-hub owner after a completed boot.
     pub fn memory(&mut self) -> Option<&mut gmc::Gmc> {
-        matches!(self.state, State::Ready(_)).then_some(&mut self.gmc)
+        matches!(self.state, State::Ready(_)).then_some(&mut *self.gmc)
     }
     /// Run every stage once. A failed or cancelled run cannot be replayed:
     /// the state records the stage before it starts.
@@ -232,6 +241,58 @@ impl ColdBoot {
         let report = self.report()?;
         self.state = State::Ready(report);
         Ok(report)
+    }
+    /// Bring VCN and JPEG up after a completed `run`: `smu_hw_init`'s APU
+    /// power-up (`PowerUpVcn`, `PowerUpJpeg`; VCN is power gated by default),
+    /// then `vcn_v3_0_hw_init` in DPG mode with `psp`, the session that loaded
+    /// the VCN image, writing its register lists, then JPEG, then the
+    /// interrupt routes and the decode/encode/JPEG IB tests. Failing here
+    /// leaves the graphics engines and the display as they are.
+    ///
+    /// # Safety
+    /// The contract of `new`, a completed `run`, and `psp` the session that
+    /// loaded `firmware`'s VCN image, still holding its TMR.
+    pub async unsafe fn run_media(
+        &mut self,
+        psp: &mut crate::amdgpu_psp_ring::Psp,
+        firmware: crate::amdgpu_psp_ring::MediaFirmware,
+        vcn_bytes: usize,
+    ) -> Result<vcn::Status, Error> {
+        use core::fmt::Write as _;
+        if !matches!(self.state, State::Ready(_)) || self.media.is_some() {
+            return Err(Error::Busy);
+        }
+        self.smu.set_vcn_power(true).await.map_err(Error::Smu)?;
+        self.smu.set_jpeg_power(true).await.map_err(Error::Smu)?;
+        // SAFETY: forwarded; the VCN image is in the TMR `psp` still holds,
+        // both hubs' VMID0 and the doorbell apertures are up.
+        let media = unsafe {
+            vcn::Media::new_raphael(
+                &self.gpu,
+                self.authority,
+                &self.pool,
+                self.doorbells,
+                vcn_bytes,
+            )
+        }
+        .map_err(Error::Media)?;
+        let media = self.media.insert(Box::new(media));
+        // SAFETY: as above; PMFW has powered VCN up.
+        unsafe { media.start(firmware, None, psp) }
+            .await
+            .map_err(Error::Media)?;
+        if media.status().jpeg == vcn::JpegState::Prepared {
+            // SAFETY: as above; PMFW has powered JPEG up.
+            unsafe { media.start_jpeg() }.await.map_err(Error::Media)?;
+        }
+        if let Err(error) = vcn::route_interrupts(&self.ih.handle(), media.status()) {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael media: polling only {error:?}"
+            );
+        }
+        media.test_ib().await.map_err(Error::Media)?;
+        Ok(media.status())
     }
     fn report(&self) -> Result<Report, Error> {
         let queues = (self.gfx.state() == cp::GfxState::Verified

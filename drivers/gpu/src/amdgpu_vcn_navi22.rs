@@ -342,6 +342,9 @@ pub(crate) mod shared {
     pub const PRESENT_FLAG_0: u64 = 0; // linux: n/a (offsetof amdgpu_fw_shared.present_flag_0)
     pub const RB_RPTR: u64 = 48; // linux: n/a (offsetof amdgpu_fw_shared.rb.rptr = 48)
     pub const RB_WPTR: u64 = 52; // linux: n/a (offsetof amdgpu_fw_shared.rb.wptr = 52)
+    /// `smu_interface_info.smu_interface_type` and its padding, after
+    /// `multi_queue` (57), `sw_ring` (65) and the 4-aligned `fw_log` (72).
+    pub const SMU_INTERFACE_INFO: u64 = 88; // linux: n/a (offsetof amdgpu_fw_shared.smu_interface_info = 88)
     /// Dword holding pad1 and the multi_queue decode/encode-GP/encode-LL
     /// mode bytes (offsets 57, 58, 59).
     pub const QUEUE_MODES: u64 = 56; // linux: n/a (offsetof amdgpu_fw_shared.pad1 = 56)
@@ -409,11 +412,19 @@ pub(crate) struct Layout {
     pub vcn: [Option<[u64; 2]>; 2],
     pub gc: u64,
     pub nbio: u64,
-    pub hdp: u64,
+    /// HDP 5.0's bank; `None` on HDP 5.2.1, which has no read cache.
+    /// Nonzero, so the option costs no space in a layout every register
+    /// access copies.
+    pub hdp: Option<core::num::NonZeroU64>,
+    /// Instance 0's VCN (`UVD_HWIP`) version, which `vcn_v3_0` and
+    /// `jpeg_v3_0` key their 3.1.x differences on.
+    pub vcn_version: (u8, u8, u8),
 }
-fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
-    let profile =
-        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+fn vcn_bases(
+    gpu: &AmdGpu,
+    profile: &crate::amdgpu_rdna2::Profile,
+    instance: u8,
+) -> Result<[u64; 2], Error> {
     let mut found = gpu
         .ip_blocks
         .iter()
@@ -455,11 +466,12 @@ impl Layout {
         let mut vcn = [None; 2];
         for (i, slot) in vcn.iter_mut().enumerate() {
             if instances & (1 << i) != 0 {
-                *slot = Some(vcn_bases(gpu, i as u8)?);
+                *slot = Some(vcn_bases(gpu, profile, i as u8)?);
             }
         }
         Ok(Self {
             vcn,
+            vcn_version: vcn_version(gpu)?,
             gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
             nbio: bank(
                 ip::HW_ID_NBIF,
@@ -475,13 +487,70 @@ impl Layout {
                 2,
                 LAST_NBIO,
             )?,
-            hdp: bank(
-                ip::HW_ID_HDP,
-                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
-                0,
-                0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-            )?,
+            hdp: Some(
+                core::num::NonZeroU64::new(bank(
+                    ip::HW_ID_HDP,
+                    &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                    0,
+                    0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+                )?)
+                .ok_or(Error::Unsupported)?,
+            ),
         })
+    }
+    /// Raphael: its one VCN 3.1.2 (`vcn_v3_0`, `vcn_3_0_0_offset.h` like
+    /// Navi22's), GC 10.3.6, NBIO 7.2 and HDP 5.2.1. NBIO 7.2's banks come
+    /// back beside the layout: its single VCN doorbell range is GDC0's,
+    /// through the PCIe port pair, where NBIO 2.3 has MMSCH ranges.
+    pub(crate) fn resolve_raphael(
+        gpu: &AmdGpu,
+        instances: u8,
+    ) -> Result<(Self, crate::amdgpu_nbio_v7_2::Banks), Error> {
+        let profile = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .filter(|p| *p == &crate::amdgpu_rdna2::RAPHAEL)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 || instances != 1 {
+            return Err(Error::Unsupported);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        bank(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let layout = Self {
+            vcn: [Some(vcn_bases(gpu, profile, 0)?), None],
+            gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
+            nbio: nbio.bif,
+            hdp: None,
+            vcn_version: vcn_version(gpu)?,
+        };
+        Ok((layout, nbio))
+    }
+    /// HDP 5.0's `HDP_READ_CACHE_INVALIDATE`, if this HDP has a read cache.
+    pub(crate) fn hdp_invalidate(&self) -> Option<u64> {
+        // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+        self.hdp.map(|hdp| hdp.get() + 0xd1 * 4)
+    }
+    /// A register whose all-ones read means the device is gone: HDP 5.0's
+    /// invalidate, or NBIO's RCC_CONFIG_MEMSIZE where HDP has no read cache.
+    pub(crate) fn liveness(&self) -> u64 {
+        self.hdp_invalidate()
+            .unwrap_or(self.nbio(NBIO_CONFIG_MEMSIZE))
+    }
+    /// `fw_shared->smu_interface_info.smu_interface_type` (`vcn_v3_0_sw_init`):
+    /// 2 on VCN 3.1.2, 1 on 3.1.1, unset otherwise.
+    pub(crate) fn smu_interface_type(&self) -> Option<u32> {
+        match self.vcn_version {
+            (3, 1, 2) => Some(2),
+            (3, 1, 1) => Some(1),
+            _ => None,
+        }
+    }
+    /// `jpeg_v3_0_early_init` reads `CC_UVD_HARVESTING` except on VCN
+    /// 3.1.1/3.1.2.
+    pub(crate) fn jpeg_reads_harvesting(&self) -> bool {
+        !matches!(self.vcn_version, (3, 1, 1) | (3, 1, 2))
     }
     /// BAR5 byte address of `r` in VCN instance `i`. Instances are validated
     /// at construction; an unresolved instance maps to an unused zero base.
@@ -610,9 +679,61 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
 fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    if let Some(invalidate) = l.hdp_invalidate() {
+        io.write(invalidate, 1);
+        io.read(invalidate);
+    }
     barrier(Ordering::SeqCst);
+}
+/// Instance 0's discovered VCN version.
+fn vcn_version(gpu: &AmdGpu) -> Result<(u8, u8, u8), Error> {
+    gpu.ip_blocks
+        .iter()
+        .find(|b| b.hw_id == ip::HW_ID_VCN && b.instance == 0)
+        .map(|b| (b.major, b.minor, b.revision))
+        .ok_or(Error::Unsupported)
+}
+/// Claim `index`'s doorbells for VCN instance `i` (and JPEG, on instance 0):
+/// `nbio_v2_3_vcn_doorbell_range` on NBIO 2.3's MMSCH range, or on NBIO 7.2
+/// `nbio_v7_2_vcn_doorbell_range`'s single GDC0 range through the port pair,
+/// under the index latch the display clock manager shares. Both claim eight.
+fn vcn_doorbell_range<I: Io>(
+    io: &mut I,
+    l: Layout,
+    nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
+    i: usize,
+    index: u32,
+) -> Result<(), Error> {
+    let Some(banks) = nbio_v7_2 else {
+        // nbio_v2_3_vcn_doorbell_range: OFFSET[11:2] = index, SIZE 8.
+        return update(
+            io,
+            l.nbio(NBIO_MMSCH_DOORBELL_RANGE[i]),
+            // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
+            0x001f_0ffc,
+            // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
+            ((index << 2) & 0xffc) | (doorbell::RANGE << 16),
+        )
+        .map(|_| ());
+    };
+    if i != 0 {
+        return Err(Error::Unsupported);
+    }
+    use crate::amdgpu_nbio_v7_2 as nbio;
+    let address = banks
+        .port_address(nbio::GDC0_VCN0_DOORBELL_RANGE)
+        .ok_or(Error::Invalid)?;
+    let (port_index, data) = banks.port_pair();
+    crate::amdgpu_smn::with_latch(|| {
+        io.write(port_index, address);
+        io.read(port_index);
+        let old = checked(io.read(data))?;
+        io.write(port_index, address);
+        io.read(port_index);
+        io.write(data, nbio::vcn_doorbell_range(old, Some(index)));
+        io.read(data);
+        Ok(())
+    })
 }
 /// `adev->usec_timeout` (100 ms) for register waits and ring tests.
 pub(crate) const REG_TIMEOUT_MS: u64 = 100; // linux: n/a (adev->usec_timeout)
@@ -1023,6 +1144,8 @@ pub(crate) struct Engine<I: Io> {
     pub state: State,
     pub jpeg_state: JpegState,
     pub proof: Proof,
+    /// NBIO 7.2's banks (Raphael), for its single GDC0 VCN doorbell range.
+    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 /// `vcn_v2_0_dec_ring_emit_fence`: context_id = seq, fence then trap.
 pub(crate) fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
@@ -1214,6 +1337,7 @@ impl<I: Io> Engine<I> {
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
         let index = instance.dec.doorbell;
+        let nbio_v7_2 = self.nbio_v7_2;
         self.hw.access(|io, l| {
             // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
@@ -1222,16 +1346,11 @@ impl<I: Io> Engine<I> {
             }
             io.zero_memory(map, 0, INSTANCE_BYTES);
             io.write_memory(map, SHARED + shared::PRESENT_FLAG_0, shared::PRESENT);
+            if let Some(kind) = l.smu_interface_type() {
+                io.write_memory(map, SHARED + shared::SMU_INTERFACE_INFO, kind);
+            }
             flush(io, l);
-            // nbio_v2_3_vcn_doorbell_range: OFFSET[11:2] = index, SIZE 8.
-            update(
-                io,
-                l.nbio(NBIO_MMSCH_DOORBELL_RANGE[i]),
-                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
-                ((index << 2) & 0xffc) | (doorbell::RANGE << 16),
-            )
+            vcn_doorbell_range(io, l, nbio_v7_2, i, index)
         })?;
         // Published before the VCPU can learn any of these addresses.
         instance.memory.publish();
@@ -2022,10 +2141,13 @@ impl<I: Io> Engine<I> {
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let (map, address) = (jpeg.memory.mapping(), jpeg.memory.address());
         let r = |l: Layout, reg: Reg| l.reg(0, reg);
+        let nbio_v7_2 = self.nbio_v7_2;
         let present = self.hw.access(|io, l| {
-            let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
-            if harvest & CC_UVD_DISABLE != 0 {
-                return Ok(false);
+            if l.jpeg_reads_harvesting() {
+                let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
+                if harvest & CC_UVD_DISABLE != 0 {
+                    return Ok(false);
+                }
             }
             // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
@@ -2033,15 +2155,8 @@ impl<I: Io> Engine<I> {
             }
             io.zero_memory(map, 0, JPEG_BYTES);
             flush(io, l);
-            // jpeg_v3_0_hw_init: MMSCH0 range starts at the VCN0 ring base.
-            update(
-                io,
-                l.nbio(NBIO_MMSCH_DOORBELL_RANGE[0]),
-                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
-                ((doorbell::VCN_BASE << 2) & 0xffc) | (doorbell::RANGE << 16),
-            )?;
+            // jpeg_v3_0_hw_init: the VCN0 range starts at the VCN0 ring base.
+            vcn_doorbell_range(io, l, nbio_v7_2, 0, doorbell::VCN_BASE)?;
             // jpeg_v3_0_disable_static_power_gating: power UVDJ on
             io.write(r(l, PGFSM_CONFIG), PGFSM_UVDJ_ON);
             Ok(true)
@@ -2212,11 +2327,60 @@ impl Media {
         instances: u8,
         firmware_bytes: usize,
     ) -> Result<Self, Error> {
+        let layout = Layout::resolve(gpu, instances)?;
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            instances,
+            firmware_bytes,
+            layout,
+            None,
+        )
+    }
+    /// Reserve Raphael's one VCN 3.1.2 instance and its JPEG: the same
+    /// `vcn_v3_0`/`jpeg_v3_0` start, with NBIO 7.2's doorbell range, no HDP
+    /// read cache, `smu_interface_type` 2 and no JPEG harvest read. PMFW must
+    /// have powered VCN and JPEG up (`PowerUpVcn`/`PowerUpJpeg`) before
+    /// `start`.
+    ///
+    /// # Safety
+    /// As `new`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+        firmware_bytes: usize,
+    ) -> Result<Self, Error> {
+        let (layout, nbio) = Layout::resolve_raphael(gpu, 1)?;
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            1,
+            firmware_bytes,
+            layout,
+            Some(nbio),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+        instances: u8,
+        firmware_bytes: usize,
+        layout: Layout,
+        nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
+    ) -> Result<Self, Error> {
         let firmware_bytes = u32::try_from(firmware_bytes).map_err(|_| Error::Invalid)?;
         if firmware_bytes == 0 || firmware_bytes > 4 << 20 {
             return Err(Error::Invalid);
         }
-        let layout = Layout::resolve(gpu, instances)?;
         let mut vcn = [None, None];
         for (i, slot) in vcn.iter_mut().enumerate() {
             if instances & (1 << i) != 0 {
@@ -2268,6 +2432,7 @@ impl Media {
                     instances,
                     ..Proof::default()
                 },
+                nbio_v7_2,
             },
         })
     }
@@ -2392,7 +2557,9 @@ impl Client {
 #[derive(Clone, Copy, Debug)]
 pub struct MediaFenceReader {
     regs: MmioRegion,
-    hdp_invalidate: u64,
+    hdp_invalidate: Option<u64>,
+    /// `Layout::liveness`.
+    liveness: u64,
     slots: [Option<(MmioRegion, u64)>; 4],
     authority: Cap<BusDeviceCap, Write>,
 }
@@ -2402,15 +2569,17 @@ impl MediaFenceReader {
         let Some((slot, offset)) = self.slots[ring.index()] else {
             return Ok(None);
         };
-        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        let (regs, hdp, liveness) = (self.regs, self.hdp_invalidate, self.liveness);
         self.authority
             .invoke(Op(|| {
-                // SAFETY: the HDP register lies in the BAR5 bank Layout
-                // bounded; the slot is a published, permanent ring
+                // SAFETY: the HDP and liveness registers lie in the BAR5 banks
+                // Layout bounded; the slot is a published, permanent ring
                 // reservation whose fence dword is in bounds.
                 unsafe {
-                    regs.write32(hdp, 1);
-                    checked(regs.read32(hdp))?;
+                    if let Some(hdp) = hdp {
+                        regs.write32(hdp, 1);
+                    }
+                    checked(regs.read32(liveness))?;
                     barrier(Ordering::SeqCst);
                     Ok(Some(slot.read32(offset)))
                 }
@@ -2449,7 +2618,7 @@ impl<I: Io> Engine<I> {
         let throttle = r.seq.wrapping_sub(submit::HW_SUBMISSIONS - 1);
         let completed = self.hw.access(|io, l| {
             invalidate(io, l);
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             Ok(io.read_memory(map, fence_at))
         })?;
         Ok((completed, throttle))
@@ -2636,7 +2805,8 @@ impl Media {
         }
         MediaFenceReader {
             regs: self.engine.hw.io.regs,
-            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+            hdp_invalidate: self.engine.hw.layout.hdp_invalidate(),
+            liveness: self.engine.hw.layout.liveness(),
             slots,
             authority: self.engine.hw.authority,
         }

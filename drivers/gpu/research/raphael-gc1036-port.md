@@ -224,7 +224,24 @@ as now.
      it reset, and no Raphael graphics reset or resume exists yet.
    - Not done: publishing acceleration to userspace (INFO/render node), any
      GFXOFF or power-gating policy (GFX stays powered), and suspend/resume.
-9. Media: VCN and JPEG 3.1.2.
+9. ~~Media: VCN and JPEG 3.1.2~~ (done, `ColdBoot::run_media`).
+   - `amdgpu_discovery.c` gives VCN 3.1.2 `vcn_v3_0` and `jpeg_v3_0`,
+     Navi22's drivers, on `vcn_3_0_0_offset.h`. Their 3.1.2 branches are:
+     - `fw_shared->smu_interface_info.smu_interface_type = 2` (byte 88 of
+       `amdgpu_fw_shared`, after the 4-aligned `fw_log`);
+     - no `CC_UVD_HARVESTING` read in `jpeg_v3_0_early_init`;
+     - the Yellow Carp decode table (not published yet).
+   - VCN is power gated until PMFW gets `PowerUpVcn`, and JPEG `PowerUpJpeg`.
+     Linux's APU `smu_hw_init` sends both; `run_media` sends them before VCN
+     starts, so a media failure leaves graphics up.
+   - DPG start as on Navi22 (`AMD_PG_SUPPORT_VCN_DPG` is in 10.3.6's
+     pg_flags). The register lists go through the display loader's PSP
+     session, the one that loaded VCN.
+   - NBIO 7.2's single GDC0 VCN0 doorbell range (SIZE 8) through the port
+     pair serves VCN and JPEG, where NBIO 2.3 has MMSCH ranges.
+   - Frame budget: the layouts every register access copies stay their
+     discrete size (the HDP option is a `NonZeroU64`). NBIO 7.2's banks live
+     in the owners, not the layouts, and the coordinator boxes its owners.
 
 ## Open
 

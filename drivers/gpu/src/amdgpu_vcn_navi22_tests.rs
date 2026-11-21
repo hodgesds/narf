@@ -42,7 +42,8 @@ fn layout(instances: u8) -> Layout {
         ],
         gc: GC,
         nbio: NBIO,
-        hdp: HDP,
+        hdp: core::num::NonZeroU64::new(HDP),
+        vcn_version: (3, 0, 0),
     }
 }
 fn pool(len: u64) -> Pool {
@@ -609,6 +610,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
                 instances,
                 ..Proof::default()
             },
+            nbio_v7_2: None,
         },
     )
 }
@@ -2099,4 +2101,59 @@ fn vcn3_failed_gate_closes_video_not_graphics() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22/gate-failure",
     vcn3_failed_gate_closes_video_not_graphics
+);
+
+/// Raphael's VCN: its one VCN 3.1.2 instance, NBIO 7.2 and no HDP read cache.
+/// `vcn_v3_0`/`jpeg_v3_0` key their 3.1.x rules on that version:
+/// `smu_interface_type` 2 in the firmware-shared block, and no
+/// `CC_UVD_HARVESTING` read before JPEG. Navi22's VCN 3.0 keeps neither.
+fn raphael_vcn_layout_and_3_1_x_rules() -> TestResult {
+    let gpu = || {
+        let mut gpu = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+        let mut b = gpu.ip_blocks[0];
+        b.hw_id = ip::HW_ID_VCN;
+        b.instance = 0;
+        (b.major, b.minor, b.revision) = (3, 1, 2);
+        b.num_bases = 2;
+        b.base_addrs[0] = (VCN[0][0] / 4) as u32;
+        b.base_addrs[1] = (VCN[0][1] / 4) as u32;
+        gpu.ip_blocks.push(b);
+        gpu
+    };
+    let Ok((l, banks)) = Layout::resolve_raphael(&gpu(), 1) else {
+        return TestResult::Fail("Raphael VCN layout refused");
+    };
+    if l.vcn != [Some(VCN[0]), None]
+        || (l.gc, l.nbio) != (GC, NBIO)
+        || l.hdp.is_some()
+        || banks.version != (7, 2, 1)
+        || l.vcn_version != (3, 1, 2)
+        || l.smu_interface_type() != Some(2)
+        || l.jpeg_reads_harvesting()
+        || l.liveness() != NBIO + 0xc3 * 4
+    {
+        return TestResult::Fail("Raphael VCN banks or 3.1.2 rules");
+    }
+    let navi22 = layout(1);
+    if navi22.smu_interface_type().is_some()
+        || !navi22.jpeg_reads_harvesting()
+        || navi22.liveness() != HDP + 0xd1 * 4
+    {
+        return TestResult::Fail("Navi22 VCN took a 3.1.x rule");
+    }
+    let mut vcn30 = gpu();
+    vcn30.ip_blocks.last_mut().unwrap().minor = 0;
+    if Layout::resolve_raphael(&gpu(), 3).is_ok()
+        || Layout::resolve_raphael(&vcn30, 1).is_ok()
+        || Layout::resolve(&gpu(), 1).is_ok()
+    {
+        return TestResult::Fail(
+            "Raphael VCN admitted another shape, or the discrete layout took it",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    raphael_vcn_layout_and_3_1_x_rules
 );

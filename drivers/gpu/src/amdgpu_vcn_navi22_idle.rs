@@ -101,7 +101,7 @@ impl<I: Io> Engine<I> {
         let enc_count = self.enc_count;
         let (all_done, enc_done) = self.hw.access(|io, l| {
             invalidate(io, l);
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             let mut all = true;
             let mut enc = [true; 2];
             for (i, inst) in instances.iter().enumerate() {
@@ -120,7 +120,7 @@ impl<I: Io> Engine<I> {
                 }
                 all &= enc[i];
             }
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             Ok((all, enc))
         })?;
         self.runtime.phase = Phase::Quiescing;

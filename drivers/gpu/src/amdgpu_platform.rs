@@ -744,6 +744,37 @@ async fn graphics_boot(pool: &Pool) -> Option<crate::amdgpu_raphael_boot::ColdBo
     }
     Some(boot)
 }
+/// VCN and JPEG on a completed Raphael graphics boot, through the PSP session
+/// that loaded them. Failure is reported and leaves graphics and display be.
+async fn media_boot(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot, loader: &mut Loader) {
+    use core::fmt::Write as _;
+    if !matches!(
+        graphics.state(),
+        crate::amdgpu_raphael_boot::State::Ready(_)
+    ) {
+        return;
+    }
+    let Some((psp, firmware, vcn_bytes)) = loader.media() else {
+        return;
+    };
+    // SAFETY: the display owner holds the whole GPU; graphics completed and
+    // `psp` is the session that loaded the VCN image, still holding its TMR.
+    match unsafe { graphics.run_media(psp, firmware, vcn_bytes) }.await {
+        Ok(status) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael media up: {:?}",
+                status.state
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael media failed: {error:?}"
+            );
+        }
+    }
+}
 /// On Raphael, hand the loader the graphics set so its PSP session loads every
 /// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
 /// autoload, instead of DMCUB alone; `amdgpu_raphael_boot` then brings the
@@ -1012,7 +1043,12 @@ pub(crate) fn start() -> bool {
                 return;
             }
             if display.loader.graphics_booted() {
-                display.graphics = graphics_boot(&display.pool).await;
+                // Boxed: these futures hold the whole bring-up, which inline
+                // would make this task's own frame and future too large.
+                display.graphics = alloc::boxed::Box::pin(graphics_boot(&display.pool)).await;
+                if let Some(graphics) = display.graphics.as_mut() {
+                    alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
+                }
             }
         }
         crate::amdgpu_usbc::finish_cycle();

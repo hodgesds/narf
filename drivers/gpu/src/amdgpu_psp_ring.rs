@@ -1275,7 +1275,7 @@ impl Psp {
     /// GFX_FW_TYPE_VCN0_RAM / VCN1_RAM, which PSP writes into that
     /// instance's DPG SRAM. The instance's firmware must already be loaded.
     pub async fn load_vcn_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error> {
-        if self.kind.rdna2_profile().is_none() {
+        if self.kind.graphics_profile().is_none() {
             return Err(Error::Unsupported);
         }
         let firmware = self.session.media_firmware;
