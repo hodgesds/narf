@@ -209,6 +209,13 @@ impl<const CPUS: usize> RunnableWatch<CPUS> {
     pub fn observe(&self, cpu: usize, sample: Option<RunnableSample>,
                    now: u64, thresh: u64) -> Option<u64>;   // waited, once per stall
 }
+
+pub const IRQ_TOP_N: usize = 3;
+pub struct IrqShare { pub total: u64, pub top: [(u8, u64); IRQ_TOP_N] }
+impl IrqShare { pub fn add(&mut self, vector: u8, count: u64);
+                pub fn busiest(&self) -> Option<(u8, u64)>; }
+pub fn per_sec(count: u64, elapsed_ns: u64) -> u64;
+pub fn permille(part: u64, whole: u64) -> u64;
 ```
 
 Pure decision logic of Linux's `kernel/watchdog.c` over samples the caller
@@ -236,6 +243,10 @@ previous round saw the same stall (one sighting can catch a wake between its
 runnable bit and its stamp). The task running or leaving ends the stall.
 `thresh == 0` disables it.
 
+`IrqShare` accumulates one CPU's interrupts over a window and keeps the
+`IRQ_TOP_N` busiest vectors (ties keep the earlier vector); `per_sec` and
+`permille` turn counts into the window's rate and hard-IRQ time fraction.
+
 **Reports** (`frame/` stall watchdog, `--features stall-watchdog`, from the
 per-CPU watchdog hrtimer; checks once a second on one CPU; lock-free or
 try-lock reads only):
@@ -255,7 +266,11 @@ the CPU's current task, scheduling-point count and last-tick RIP with its
 symbol; the kernel hung-task report adds the kind of wait
 (`narf_lib::hung_task`: `mutex`, `btrfs txn join`, `btrfs txn close`), the
 waiting call's site, the lock or gate address and the kind's detail (waiter
-id, closing task, operations joined).
+id, closing task, operations joined). Every lockup line and every
+`STALL-WD` dump prints each CPU's hard-IRQ share over the last window:
+`STALL-WD   irq cpu=N rate=R/s hardirq=P% masked_arrivals=M/s window_ms=W
+top=V:R/s(handler) ...`, from the dispatch table's per-CPU fire counts,
+`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters.
 
 ## 4. Invariants & safety properties
 

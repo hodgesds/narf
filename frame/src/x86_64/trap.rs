@@ -86,9 +86,12 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 ///   ready, window after window: a lost wakeup, which no idle system shows.
 ///
 /// A report carries one bounded state dump ([`dump`]): per-CPU state (an
-/// NMI samples the RIP of every awake CPU with work), timer wheel, perf, and
+/// NMI samples the RIP of every awake CPU with work) with each CPU's
+/// hard-IRQ share over the last window (interrupts per second, hard-IRQ
+/// time, soft-masked arrivals, busiest vectors), timer wheel, perf, and
 /// the tasks that are NOT in a healthy interruptible park, at most
-/// [`CENSUS_MAX`] of them.
+/// [`CENSUS_MAX`] of them. Every lockup line is followed by its CPU's
+/// hard-IRQ share.
 ///
 /// Boot parameters keep Linux's names: `watchdog_thresh=N` (0 or
 /// `nowatchdog` disables both lockup detectors), `softlockup_panic=1`,
@@ -105,8 +108,8 @@ mod stall_wd {
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use narf_console::TrapWriter;
     use narf_observability::watchdog::{
-        CpuSample, Lockup, LockupWatch, RunnableSample, RunnableWatch, RUNNABLE_THRESH_SECS,
-        WATCHDOG_THRESH_SECS,
+        per_sec, permille, CpuSample, IrqShare, Lockup, LockupWatch, RunnableSample, RunnableWatch,
+        IRQ_TOP_N, RUNNABLE_THRESH_SECS, WATCHDOG_THRESH_SECS,
     };
 
     const MAXC: usize = 16;
@@ -409,6 +412,7 @@ mod stall_wd {
                 panic!("STALL-WD: RCU quiescent-state timeout");
             }
         }
+        irq_sample();
         lockup_check(now_ns, &p);
         runnable_check(&p);
         long_run_delay_check();
@@ -492,6 +496,117 @@ mod stall_wd {
         }
     }
 
+    // ── per-CPU hard-IRQ share ─────────────────────────────────────────
+    //
+    // Every check window samples each CPU's interrupt counts (the dispatch
+    // table's per-CPU fire counts, which every vector >= 32 passes through:
+    // device MSIs, the local timer, IPIs), its hard-IRQ time and its
+    // soft-masked arrivals, and keeps the window's rates for the dump. An
+    // interrupt storm on one CPU looks like a crawling executor, not a
+    // lockup — the CPU still schedules between interrupts — so every dump
+    // and lockup report says how much of each CPU interrupts are taking.
+
+    const NVEC: usize = narf_interrupts::NUM_VECTORS;
+    /// Each CPU's count of each vector at the last window.
+    static IRQ_BASE: [[AtomicU64; NVEC]; MAXC] =
+        [const { [const { AtomicU64::new(0) }; NVEC] }; MAXC];
+    /// Each vector's all-CPU count at the last window: an unchanged vector
+    /// skips the per-CPU reads.
+    static IRQ_GLOBAL_BASE: [AtomicU64; NVEC] = [const { AtomicU64::new(0) }; NVEC];
+    static IRQ_HARD_BASE: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static IRQ_MASKED_BASE: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    /// Cycle counter at the last window; 0 before the first.
+    static IRQ_LAST_CYC: AtomicU64 = AtomicU64::new(0);
+    /// The last window, per CPU: interrupts per second, hard-IRQ time in
+    /// tenths of a percent, soft-masked arrivals per second, and the
+    /// busiest vectors with their rates.
+    static IRQ_RATE: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static IRQ_HARD_PM: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static IRQ_MASKED_RATE: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static IRQ_TOP: [[AtomicU64; IRQ_TOP_N]; MAXC] =
+        [const { [const { AtomicU64::new(0) }; IRQ_TOP_N] }; MAXC];
+    static IRQ_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Pack a top-vector entry: vector in the top byte, rate below.
+    fn pack_top(vector: u8, rate: u64) -> u64 {
+        ((vector as u64) << 56) | rate.min((1 << 56) - 1)
+    }
+
+    /// Sample every CPU's interrupts over the window just ended.
+    /// Lock-free reads and relaxed stores only; no allocation.
+    fn irq_sample() {
+        let now = narf_scheduler::narf_time::now_cycles();
+        let last = IRQ_LAST_CYC.swap(now, Ordering::Relaxed);
+        let elapsed_cyc = now.saturating_sub(last);
+        let elapsed_ns = narf_scheduler::narf_time::cycles_to_ns(elapsed_cyc);
+        let mut shares = [IrqShare::default(); MAXC];
+        for (v, global) in IRQ_GLOBAL_BASE.iter().enumerate() {
+            let total = narf_interrupts::fire_count(v as u8);
+            if global.swap(total, Ordering::Relaxed) == total {
+                continue;
+            }
+            for (cpu, share) in shares.iter_mut().enumerate() {
+                let count = narf_interrupts::fire_count_on_cpu(v as u8, cpu);
+                let delta = count.wrapping_sub(IRQ_BASE[cpu][v].swap(count, Ordering::Relaxed));
+                share.add(v as u8, delta);
+            }
+        }
+        if last == 0 {
+            // The first window only takes the baseline.
+            return;
+        }
+        IRQ_WINDOW_MS.store(elapsed_ns / 1_000_000, Ordering::Relaxed);
+        for (cpu, share) in shares.iter().enumerate() {
+            if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+                continue;
+            }
+            let hard = narf_scheduler::hardirq_cycles(narf_scheduler::CpuId(cpu as u32));
+            let hard_delta = hard.saturating_sub(IRQ_HARD_BASE[cpu].swap(hard, Ordering::Relaxed));
+            let masked = narf_interrupts::dispatch::masked_arrivals_on_cpu(cpu);
+            let masked_delta =
+                masked.saturating_sub(IRQ_MASKED_BASE[cpu].swap(masked, Ordering::Relaxed));
+            IRQ_RATE[cpu].store(per_sec(share.total, elapsed_ns), Ordering::Relaxed);
+            IRQ_HARD_PM[cpu].store(permille(hard_delta, elapsed_cyc), Ordering::Relaxed);
+            IRQ_MASKED_RATE[cpu].store(per_sec(masked_delta, elapsed_ns), Ordering::Relaxed);
+            for (slot, &(v, count)) in IRQ_TOP[cpu].iter().zip(share.top.iter()) {
+                slot.store(pack_top(v, per_sec(count, elapsed_ns)), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// One CPU's interrupt share over the last window, for the dump and
+    /// the lockup reports.
+    fn irq_line(cpu: usize) {
+        if cpu >= MAXC {
+            return;
+        }
+        let pm = IRQ_HARD_PM[cpu].load(Ordering::Relaxed);
+        let _ = write!(
+            TrapWriter,
+            "STALL-WD   irq cpu={cpu} rate={}/s hardirq={}.{}% masked_arrivals={}/s window_ms={} top=",
+            IRQ_RATE[cpu].load(Ordering::Relaxed),
+            pm / 10,
+            pm % 10,
+            IRQ_MASKED_RATE[cpu].load(Ordering::Relaxed),
+            IRQ_WINDOW_MS.load(Ordering::Relaxed),
+        );
+        let mut any = false;
+        for slot in &IRQ_TOP[cpu] {
+            let packed = slot.load(Ordering::Relaxed);
+            let (v, rate) = ((packed >> 56) as u8, packed & ((1 << 56) - 1));
+            if rate == 0 {
+                continue;
+            }
+            any = true;
+            let _ = write!(
+                TrapWriter,
+                "{v}:{rate}/s({}) ",
+                narf_interrupts::dispatch::handler_name_try(v).unwrap_or("-"),
+            );
+        }
+        let _ = writeln!(TrapWriter, "{}", if any { "" } else { "none" });
+    }
+
     /// Linux's soft/hard-lockup detectors over every CPU (see the module
     /// note). The checking CPU samples the others, like the buddy detector.
     fn lockup_check(now_ns: u64, p: &Params) {
@@ -523,6 +638,7 @@ mod stall_wd {
                         "BUG: soft lockup - CPU#{cpu} stuck for {}s! [{task}]",
                         stuck_ns / 1_000_000_000
                     );
+                    irq_line(cpu);
                     soft = true;
                     dump_due |= first;
                 }
@@ -534,6 +650,7 @@ mod stall_wd {
                         "BUG: executor lockup - CPU#{cpu} idle with runnable work for {}s! [{task}]",
                         stuck_ns / 1_000_000_000
                     );
+                    irq_line(cpu);
                     dump_due |= first;
                 }
                 Some(Lockup::Hard { stuck_ns }) => {
@@ -542,6 +659,7 @@ mod stall_wd {
                         "CPU{reporter}: Watchdog detected hard LOCKUP on cpu {cpu} (no timer interrupt for {}s) [{task}]",
                         stuck_ns / 1_000_000_000
                     );
+                    irq_line(cpu);
                     dump_due = true;
                 }
             }
@@ -631,6 +749,7 @@ mod stall_wd {
                 LAST_RIP[cpu].load(Ordering::Relaxed),
                 Sym(LAST_RIP[cpu].load(Ordering::Relaxed)),
             );
+            irq_line(cpu);
             dump_due = true;
         }
         if dump_due {
@@ -850,6 +969,7 @@ mod stall_wd {
                 Sym(rip),
                 Sym(nmi_rip),
             );
+            irq_line(cpu);
             // The counts above say a halted CPU has runnable work; only the
             // per-slot state says which slot and why it is not running. An
             // awake slot with `allowed=false` is on a queue whose CPU its
