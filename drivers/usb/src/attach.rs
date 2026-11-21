@@ -178,7 +178,15 @@ pub struct HubBinding {
     /// suspended on the next pass" (used as a sentinel after
     /// `port_resume`).
     pub last_activity_tick: [u64; 64],
+    /// The supervisor has to walk this hub's ports: it was just bound,
+    /// its status-change endpoint reported a change, or a port attempt
+    /// failed with retry budget left (Linux `hub->event_bits`).
+    pub walk_pending: bool,
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "attach_walk_tests.rs"]
+mod walk_tests;
 
 /// Registry of bound hubs, one per controller (slot ids are only unique
 /// within a controller), each BFS-ordered (the supervisor walks
@@ -312,9 +320,27 @@ pub async fn hub_status_changed(xhci_dev: &crate::xhci::Xhci) -> bool {
         if bits & 1 != 0 {
             hub.clear_hub_change(xhci_dev).await;
         }
-        changed |= bits != 0;
+        if bits != 0 {
+            changed = true;
+            set_walk_pending(xhci_dev.id(), hub.slot_id, true);
+        }
     }
     changed
+}
+
+/// Mark (or clear) hub `hub_slot`'s pending port walk.
+pub fn set_walk_pending(controller: u8, hub_slot: u8, pending: bool) {
+    let mut g = HUBS.of(controller).lock();
+    if let Some(h) = g.iter_mut().find(|h| h.hub.slot_id == hub_slot) {
+        h.walk_pending = pending;
+    }
+}
+
+/// Slot ids of the hubs whose ports the supervisor walks this cycle.
+///
+/// Every bound hub is walked on every cycle.
+pub(crate) fn hubs_to_walk(hubs: &[HubBinding]) -> Vec<u8> {
+    hubs.iter().map(|h| h.hub.slot_id).collect()
 }
 
 /// Pure per-port suspend decision behind [`idle_suspend_pass`]:
@@ -1114,6 +1140,7 @@ async fn dispatch_after_address(
             bound_downstream: 0,
             suspended_downstream: 0,
             last_activity_tick: [0u64; 64],
+            walk_pending: true,
         });
         return AttachOutcome::Hub;
     }
